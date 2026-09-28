@@ -448,6 +448,8 @@ RenderState extract_render_state(const GpuState& st) {
         target.mip0_depth = PM4_FIELD(attrib3, CB_COLOR0_ATTRIB3, MIP0_DEPTH);
         target.resource_type = PM4_FIELD(attrib3, CB_COLOR0_ATTRIB3, RESOURCE_TYPE);
         target.color_sw_mode = PM4_FIELD(attrib3, CB_COLOR0_ATTRIB3, COLOR_SW_MODE);
+        target.log2_samples = PM4_FIELD(rd(st.cx, P::CB_COLOR0_ATTRIB + slot * kColorRegisterStride),
+                                        CB_COLOR0_ATTRIB, NUM_SAMPLES);
 
         // The CB base is the allocation origin, not necessarily the address of the selected view.
         // GTA V's environment-lighting pass renders a six-level 1024x512 R11G11B10F chain by keeping
@@ -1049,6 +1051,7 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         }
         out.write_mask = (effective_color_mask >> (slot * 4u)) & 0xFu;
         out.disable_rop3 = in.disable_rop3;
+        out.log2_samples = in.log2_samples;
     }
     // Direct/synthetic RenderState callers predate color_targets and still populate the named fields.
     auto& out0 = ps.color_targets[0];

@@ -1239,6 +1239,35 @@ int main(int argc, char** argv) {
                                              &span_batch, &span_source) == Status::Unavailable,
               "layers inside a multi-slice DS view's span are never read from guest bytes");
 
+        // #3906: the span is the widest over EVERY depth-using draw of the pass. A narrow first
+        // draw (SLICE_MAX 0) followed by a whole-array one (SLICE_MAX 3) in the same pass wrote
+        // layers 1-3 too.
+        const uint64_t span2_base = Base + 0x1f00000;
+        std::memset(reinterpret_cast<void*>(span2_base), 0, layer_bytes * Layers);
+        ResolvedPipelineState narrow_state = span_state;
+        narrow_state.depth_read_base = narrow_state.depth_write_base = span2_base;
+        narrow_state.db_depth_view = 0u;               // SLICE_START 0, SLICE_MAX 0
+        ResolvedPipelineState wide_state = narrow_state;
+        wide_state.db_depth_view = 0u | (3u << 13);   // SLICE_START 0, SLICE_MAX 3
+        BackendDraw narrow_producer = producer, wide_producer = producer;
+        narrow_producer.ps = &narrow_state;
+        wide_producer.ps = &wide_state;
+        BackendSubmissionBatch span2_batch;
+        (void)render_draws_rgba({narrow_producer, wide_producer}, W, H, nullptr, nullptr, true,
+                                nullptr, nullptr, nullptr, nullptr, &span2_batch, false, nullptr,
+                                false);
+        {
+            BackendPersistentResourceGuard guard;
+            uint32_t recorded = 0;
+            for (const auto& [key, image] : persistent_ds_cache())
+                if (key.dr == span2_base) recorded = image.programmed_slice_max;
+            check(recorded == 3, "a later, wider draw of the same pass records its SLICE_MAX");
+        }
+        const DepthArrayGuestSource span2_source{0u, layer_bytes, W * sizeof(float)};
+        check(read_persistent_ds_depth_array(span2_base, W, H, 0, Layers, partial, error,
+                                             &span2_batch, &span2_source) == Status::Unavailable,
+              "layers written by a later, wider draw of the pass are never read from guest bytes");
+
         // Rebased planes name the layers their own slices and extents can touch. Layers 0 and 1
         // are retained at the base; a plane rebased to layer 1 with its own slice 1 writes layer 2,
         // and a plane rebased to layer 1 whose extent is two layers tall covers layer 2 too.
@@ -1255,11 +1284,19 @@ int main(int argc, char** argv) {
                                             VK_FORMAT_D32_SFLOAT, 1};
         const PersistentDsKey rebased_tall{layer1, layer1, 0, 0, 0, W, H * 2,
                                            VK_FORMAT_D32_SFLOAT, 0};
+        // #3906: an identity of ANOTHER extent is padded to whole 256x256 texels. A 4x4 plane at
+        // the array base covers 64 bytes unpadded (layer 0, already retained), but its real
+        // tiled surface can reach layers 2-3.
+        const PersistentDsKey small_other{rebased_base, rebased_base, 0, 0, 0, 4, 4,
+                                          VK_FORMAT_D32_SFLOAT, 0};
         for (const auto& [plane, label] :
              {std::pair{rebased_slice,
                         "a rebased plane's own nonzero slice names the layer it actually writes"},
               std::pair{rebased_tall,
-                        "a rebased plane taller than one layer names every layer it covers"}}) {
+                        "a rebased plane taller than one layer names every layer it covers"},
+              std::pair{small_other,
+                        "an other-extent identity is padded to 256x256 texels and names the "
+                        "layers its tiled surface can reach"}}) {
             {
                 BackendPersistentResourceGuard guard;
                 persistent_ds_cache()[plane] = {};
@@ -1281,6 +1318,25 @@ int main(int argc, char** argv) {
         const auto admitted = capture_stderr([&] { (void)render_submit_items({live_draw}, W, H); });
         check(admitted.find("[render-array-reject]") == std::string::npos,
               "control: the two-layer retained array is admitted before any colour target");
+        // #3906: an unresolved MSAA colour target's guest footprint is `samples` times its
+        // single-sample size. A target 512 KiB before layer 2 misses it single-sample (256 KiB
+        // padded footprint) and covers it at 4x.
+        DrawItem msaa_writer;
+        msaa_writer.vs = producer.vs; msaa_writer.fs = producer.fs;
+        msaa_writer.vertex_count = 3; msaa_writer.ps = sample_state;
+        msaa_writer.color0_base = rebased_base + 2 * layer_bytes - 0x80000;
+        msaa_writer.color0_width = W; msaa_writer.color0_height = H;
+        (void)render_submit_items({msaa_writer}, W, H);
+        live_draw.color0_base += 0x10000;
+        const auto single_sample = capture_stderr([&] { (void)render_submit_items({live_draw}, W, H); });
+        check(single_sample.find("[render-array-reject]") == std::string::npos,
+              "control: a single-sample colour target 512 KiB before a guest layer does not overlap it");
+        msaa_writer.ps.color_targets[0].log2_samples = 2;
+        (void)render_submit_items({msaa_writer}, W, H);
+        live_draw.color0_base += 0x10000;
+        const auto four_sample = capture_stderr([&] { (void)render_submit_items({live_draw}, W, H); });
+        check(four_sample.find("overlaps a live color target") != std::string::npos,
+              "a 4x MSAA colour target's sample-scaled footprint overlaps the guest layer");
         DrawItem color_writer;
         color_writer.vs = producer.vs; color_writer.fs = producer.fs;
         color_writer.vertex_count = 3; color_writer.ps = sample_state;

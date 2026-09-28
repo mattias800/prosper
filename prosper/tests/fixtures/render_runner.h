@@ -7216,7 +7216,14 @@ inline bool collect_depth_array_guest_layers(uint64_t base, uint32_t width, uint
     const uint64_t end_addr = first_addr + static_cast<uint64_t>(layer_count) * source.layer_stride;
     for (const auto& [key, image] : persistent_ds_cache()) {
         const uint32_t last_slice = std::max(key.slice, image.programmed_slice_max);
-        const uint64_t plane_bytes = static_cast<uint64_t>(key.w) * key.h * sizeof(float);
+        // #3906: an identity of this array's own extent occupies exactly this array's layer
+        // footprint (tiled padding included). Any other identity's true layout is unknown, so pad
+        // it the way the colour-target check does: whole 256x256 texels, which covers any 64 KiB
+        // swizzle block. Over-naming only keeps the old refusal.
+        const uint64_t plane_bytes = key.w == width && key.h == height
+            ? std::max<uint64_t>(footprint, static_cast<uint64_t>(key.w) * key.h * sizeof(float))
+            : ((static_cast<uint64_t>(key.w) + 255u) & ~255ull) *
+                  ((static_cast<uint64_t>(key.h) + 255u) & ~255ull) * sizeof(float);
         for (const uint64_t plane : {key.dr, key.dw}) {
             if (!plane) continue;
             for (uint64_t slice = key.slice; slice <= last_slice; ++slice) {
@@ -8412,6 +8419,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // the producer image. The logical span is supplied only by the split wrapper below.
     const prosper::gpu::ResolvedPipelineState* identity = nullptr;
     bool logical_use_stencil = false;
+    // #3906: the widest DB_DEPTH_VIEW slice span over EVERY depth-using draw of the pass, not only
+    // the identity draw. Passes group by SLICE_START, so a later draw may program a wider
+    // SLICE_MAX (a narrow draw first, then a whole-array clear); its layers are renderer-written.
+    uint32_t pass_depth_slice_max = 0;
     for (const auto& d : logical_draws) {
         if (d.ps && (d.ps->stencil_enable ||
                      stencil_clear_effective(d.ps->stencil_clear_enable,
@@ -8423,8 +8434,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                      effective_depth_clear(d.ps) ||
                      stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
                                              d.ps->stencil_write_mask[0],
-                                             d.ps->stencil_write_mask[1])) && !identity)
-            identity = d.ps;
+                                             d.ps->stencil_write_mask[1]))) {
+            if (!identity) identity = d.ps;
+            pass_depth_slice_max = std::max(pass_depth_slice_max,
+                                            ds_depth_view_slice_max(d.ps->db_depth_view));
+        }
     }
     if (getenv("PROSPER_NO_STENCIL")) logical_use_stencil = false;
     const bool has_ds_identity = identity && (identity->depth_read_base || identity->depth_write_base ||
@@ -8477,7 +8491,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         ds_key = persistent_ds_key_for(*identity, htile_identity, W, H, (uint32_t)DFMT);
         cached_ds = &persistent_ds_cache()[ds_key];
         cached_ds->programmed_slice_max = std::max({cached_ds->programmed_slice_max, ds_key.slice,
-            ds_depth_view_slice_max(identity->db_depth_view)});
+            pass_depth_slice_max});
         // The key carries the PASS extent, so one guest depth surface reached through two passes of
         // different extent becomes two independent entries -- and the larger one's guest range is
         // sized from that extent, which is how a 512x512 shadow cascade acquires a 33 MB depth range

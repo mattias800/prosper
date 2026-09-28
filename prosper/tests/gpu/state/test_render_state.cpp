@@ -308,6 +308,12 @@ int main() {
                   mrt.color_targets[1].mip0_depth == 7u &&
                   mrt.color_targets[1].resource_type == 1u,
               "MRT1 layered-view registers stay independent of absent MRT0 state");
+        // #3906: CB_COLORn_ATTRIB.NUM_SAMPLES (log2), at the 0xf-register colour slot stride.
+        volume.cx[P::CB_COLOR0_ATTRIB + 0xfu] = 3u << P::CB_COLOR0_ATTRIB_NUM_SAMPLES_SHIFT;
+        volume.cx[P::CB_COLOR0_ATTRIB] = 0u;
+        const RenderState msaa = extract_render_state(volume);
+        CHECK(msaa.color_targets[1].log2_samples == 3u && msaa.color_targets[0].log2_samples == 0u,
+              "MRT1 NUM_SAMPLES decodes from its own CB_COLOR1_ATTRIB (8x), MRT0 stays single-sample");
     }
 
     CHECK(rs.ps_addr == rdna2_addr(0x00ABCDEFu, 0x12u), "PS shader addr = (LO<<8)|(HI<<40)");
