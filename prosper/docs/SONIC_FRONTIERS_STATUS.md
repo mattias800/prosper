@@ -877,6 +877,12 @@ to remember to update it. The last one did not (review of #2820).
   (`read_persistent_ds_depth_array`), exactly 2.00 per flip until gameplay starts. The 64
   `[render-array-reject]` lines that say so print in the first seconds and are then suppressed,
   which is why a run tail never showed them ([#3893](https://github.com/mattias800/prosper/issues/3893)).
+- **"The menu and title screens are slow because of the depth-stage texture-reference cost"
+  (73-117 us/ref in the pre-#3882 census).** Gone: re-measured at 0.8-1.0 us/ref after #3882. The
+  menu cost was ONE 3840x2160 RGBA16F texture (`0x20121f0000`), an identity-only dim-5 RTT shell that
+  renderer authority kept out of the decode cache, so it was re-decoded on every submit (~2.4 ms, ~250
+  refs per 5 s). Now retained behind exact validation, and the menu runs at the guest's 30 flips/s cap
+  (#3873; `RENDERER_ARCHITECTURE_GAPS_2026_09_25.md` § Ruled out).
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |
