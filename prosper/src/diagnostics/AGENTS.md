@@ -174,6 +174,11 @@ prose: a deliberate backend decline (the `PROSPER_COMPUTE_SKIP_PROGRAM` selector
 `note_deliberate_dispatch_decline()`, which `BackendDispatchOutcome` checks), the parent-walk
 diagnostic, indirect-dependency skips after either in the same submit, and every dispatch of a
 process with no compute backend are not counted — each pinned by an arm in `test_gpu_execute`.
+`gpu-memory-off-device` breaks down by renderer allocation class (`classes=depth-target:40`),
+names supplied by `gpu/diagnostics/memory_placement_log.hpp`; it fires on any GPU-only allocation
+placed off device-local memory on a device that has some, and `oom-fallbacks=` in its detail says
+whether that was the #3897 out-of-memory retry or a resource that allowed no device-local type.
+On this project's APU it should never fire; `PROSPER_GPU_MEM_FORCE_OOM` exercises it.
 `host-copy-pressure`'s breakdown is whole MiB per `[transfer-pressure]` category, not a count. A new drop site must pass a reason;
 one that sets `complete = false` directly shows up as `unattributed`, which is the instrument naming
 its own blind spot, not a finding about the title. Re-realizations that are not live execution (an

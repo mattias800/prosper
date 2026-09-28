@@ -14,9 +14,12 @@ Keep the two apart so the instrument stays a pure observer.
 whole formula and why unified-memory devices are capped at the pre-#3873 rule; read it before
 changing a constant, and change the unit test's hand-computed expectations with it.
 
-`memory_type_select` is the other policy here: WHICH Vulkan memory type an allocation takes (#3888).
-Anything only the GPU touches (render targets, depth, sampled/storage images, GPU-only buffers)
-prefers a `DEVICE_LOCAL` type and falls back to any compatible one; memory the CPU maps keeps its
-explicit flags. Do not add another "first compatible type" loop beside a renderer allocation: that
-rule puts images in system memory on a driver that lists a host type first, silently. It is
-header-only because its inputs are Vulkan structs; it still makes no Vulkan call.
+`memory_type_select` is the other policy here: WHICH Vulkan memory type an allocation takes (#3888),
+and in what order to try the rest when the driver runs out (#3897). Anything only the GPU touches
+(render targets, depth, sampled/storage images, GPU-only buffers) prefers a `DEVICE_LOCAL` type and
+falls back to any compatible one; memory the CPU maps keeps its explicit flags. AMD device-coherent
+types are never candidates. Do not add another "first compatible type" loop beside a renderer
+allocation: that rule puts images in system memory on a driver that lists a host type first,
+silently. It is header-only because its inputs are Vulkan structs; it still makes no Vulkan call —
+`allocate_with_memory_type_fallback` takes the allocator as a parameter, and the Vulkan binding,
+logging and alarm counting live in `../diagnostics/memory_placement_log.hpp`.
