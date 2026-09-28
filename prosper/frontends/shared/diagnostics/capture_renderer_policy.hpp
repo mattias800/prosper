@@ -19,8 +19,8 @@ struct LiveColorTargetResidencyInputs {
     bool timeline_capture_permits = true;   // timeline_capture_allows_persistent_targets()
     // PROSPER_GPU_CAPTURE (the one-shot .prgcap). Deliberately NOT an input to the decision below:
     // everything a capsule needs is obtained on demand for the one selected submit -- referenced
-    // targets through the capture RTT-seed reader, which materializes a GPU-resident target, and the
-    // output oracle through gpu_present_allowed_during_capture() -- exactly as the interactive F9
+    // targets through the capture RTT-seed reader, which materializes a GPU-resident target, and
+    // the output oracle through gpu_present_allowed_during_capture() -- as the interactive F9
     // capture has always done on this path. Before #3895 it forced readback from boot, so a
     // PROSPER_GPU_CAPTURE_AFTER run rendered through different code, at a different speed, for its
     // whole length, and a capture of a production-only defect showed a different defect (#3890).
@@ -43,8 +43,8 @@ constexpr bool live_color_targets_enabled(const LiveColorTargetResidencyInputs& 
 // A submit whose one-shot capture is pending needs a CPU copy of its presented frame: the capsule
 // records it as the output oracle (expected_output_hash) and an output-triggered candidate is
 // accepted or rejected on it. prosper-app's GPU present hands the final image to the swapchain
-// without a CPU copy, so for exactly those submits the renderer presents through the CPU path, which
-// materializes the scanout target on demand. Every other submit keeps GPU present.
+// without a CPU copy, so for exactly those submits the renderer presents through the CPU path,
+// which materializes the scanout target on demand. Every other submit keeps GPU present.
 constexpr bool gpu_present_allowed_during_capture(bool gpu_present_active,
                                                   bool capture_needs_cpu_output) {
     return gpu_present_active && !capture_needs_cpu_output;
@@ -53,9 +53,9 @@ constexpr bool gpu_present_allowed_during_capture(bool gpu_present_active,
 // The output oracle is chosen among the submit's publish candidates -- the pass that wrote the
 // flipped buffer, a pass that wrote any registered scanout, the last RGBA8 pass -- and a candidate
 // exists only for a pass whose colour0 was read back. gpu_replay renders a seeded capsule on the
-// readback path (replay RTT seeding keeps live targets off), where every pass is a candidate. So for a capture
-// submit no colour0 readback is deferred: the oracle is selected by the same rule the replay applies,
-// instead of by the live path's on-demand materialization of whatever the flipped buffer holds.
+// readback path (replay RTT seeding keeps live targets off), where every pass is a candidate. So
+// for a capture submit no colour0 readback is deferred: the oracle is selected by the same rule the
+// replay applies, instead of by the live path's on-demand materialization of the flipped buffer.
 constexpr bool pass_readback_deferral_allowed_during_capture(bool capture_needs_cpu_output) {
     return !capture_needs_cpu_output;
 }
