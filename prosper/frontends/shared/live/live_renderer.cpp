@@ -620,6 +620,200 @@ extern "C" int prosper_thread_in_renderer_callback(unsigned long native_tid) {
     return prosper::frontend::tid_is_in_renderer_callback(native_tid) ? 1 : 0;
 }
 
+// ---- Diagnostic shader overrides (#3892) ----------------------------------------------------------
+//
+// The REFVS / TESTPS / FS_SPV / NOPS / SKIP_DRAW setup the submit callback ran before assembling
+// backend draws, moved here verbatim. It returns the same locals as one value, which
+// BackendDrawContext then refers to.
+namespace {
+// The diagnostic shader/state overrides build_backend_draws applies to every draw, loaded once per
+// callback by load_shader_overrides. Each member is the callback local of the same name it replaces.
+// skip_draws_env names load_shader_overrides' process-lifetime static; program_skip and link_scan
+// name the process-wide selectors.
+struct ShaderOverrides {
+    const bool refvs;
+    std::vector<uint32_t> refvs_spv;
+    std::vector<uint32_t> ps_override;
+    bool ps_override_is_file;
+    bool ps_override_is_test;
+    int fs_match_mode;
+    std::vector<uint32_t> fs_match;
+    const char* fs_guest_addr_text;
+    uint64_t fs_guest_addr;
+    const bool fs_guest_addr_valid;
+    const char* fs_target_addr_text;
+    uint64_t fs_target_addr;
+    const bool fs_target_addr_valid;
+    const char* fs_target_dim_text;
+    uint32_t fs_target_width;
+    uint32_t fs_target_height;
+    const bool fs_target_dim_valid;
+    int testps_match_mode;
+    std::vector<uint32_t> testps_match;
+    const bool nops;
+    const char*& skip_draws_env;
+    prosper::gpu::DrawProgramSkipSelector& program_skip;
+    const bool program_skip_armed;
+    const bool program_census;
+    prosper::gpu::DrawLinkScanSelector& link_scan;
+    const bool link_scan_armed;
+};
+
+ShaderOverrides load_shader_overrides() {
+    // Diagnostic shader/state overrides (computed once, applied to EVERY draw item):
+    //   REFVS  -> a known-good fullscreen-triangle VS (isolates the game's real VS).
+    //   TESTPS -> a solid-magenta PS (isolates VS geometry from PS shading). The optional
+    //             TESTPS_MATCH file restricts it to one exact recompiled guest PS.
+    //   FS_SPV -> a caller-supplied PS SPIR-V (e.g. a UV visualizer).
+    //   NOPS   -> bypass the resolved pipeline state (default state).
+    #include "refvs.inc"
+    const bool refvs = PROSPER_ENV_VALUE("PROSPER_RENDER_REFVS");
+    std::vector<uint32_t> refvs_spv(kRefVs, kRefVs + sizeof(kRefVs) / 4);
+    std::vector<uint32_t> ps_override;
+    bool ps_override_is_file = false;   // true only for a valid PROSPER_FS_SPV *file* override
+    bool ps_override_is_test = false;
+    if (PROSPER_ENV_ON("PROSPER_RENDER_TESTPS")) {
+        static const uint32_t kMagentaPs[] = {   // v0=1.0(R) v1=0.0(G) v2=1.0(B) v3=1.0(A); exp mrt0; endpgm
+            0x7E0002F2u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u };
+        ps_override = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
+        ps_override_is_test = true;
+    }
+    // Validated SPIR-V file load: require a complete read of a word-aligned file >= 20 bytes
+    // (5 words: the minimum SPIR-V header). Validate size BEFORE allocating so a failed ftell
+    // (-1 -> huge size_t) cannot trigger a wild allocation, and reject non-word-aligned files
+    // rather than silently dropping trailing bytes. Returns false (out untouched) on any failure.
+    auto load_spv_file = [](const char* path, std::vector<uint32_t>& out) -> bool {
+        FILE* f = fopen(path, "rb");
+        if (!f) return false;
+        bool ok = false;
+        if (fseek(f, 0, SEEK_END) == 0) {
+            long sz = ftell(f);
+            if (sz >= 20 && (sz % 4) == 0 && fseek(f, 0, SEEK_SET) == 0) {
+                std::vector<uint32_t> m(static_cast<size_t>(sz) / 4);
+                if (fread(m.data(), 4, m.size(), f) == m.size()) { out = std::move(m); ok = true; }
+            }
+        }
+        fclose(f);
+        return ok;
+    };
+    if (const char* fsp = PROSPER_ENV_VALUE("PROSPER_FS_SPV")) {
+        std::vector<uint32_t> m;
+        if (load_spv_file(fsp, m)) { ps_override = std::move(m); ps_override_is_file = true; }
+        else fprintf(stderr, "[fs-spv] PROSPER_FS_SPV='%s' invalid/unreadable -> no file override\n", fsp);
+    }
+    // PROSPER_FS_SPV_MATCH=<file>: restrict the PROSPER_FS_SPV *file* override to draws whose
+    // recompiled fragment SPIR-V EXACTLY equals this file (a per-draw A/B substitution that does
+    // not touch draws with a different descriptor contract). FAILS CLOSED: if requested but the
+    // file is missing/short/unaligned/unreadable, NO file override is applied — never a silent
+    // global fallback (that would recreate the exact hazard this gate exists to prevent). Does
+    // NOT gate PROSPER_RENDER_TESTPS, which stays global by design.
+    // mode: 0 = not requested (legacy global file override), 1 = loaded+valid (exact match only),
+    //       2 = requested but invalid (file override disabled).
+    int fs_match_mode = 0;
+    std::vector<uint32_t> fs_match;
+    if (const char* mp = PROSPER_ENV_VALUE("PROSPER_FS_SPV_MATCH")) {
+        fs_match_mode = load_spv_file(mp, fs_match) ? 1 : 2;
+        if (fs_match_mode == 2)
+            fprintf(stderr, "[fs-match] PROSPER_FS_SPV_MATCH='%s' invalid/unreadable -> applying NO "
+                    "fragment file override (fail closed)\n", mp);
+    }
+    // Optional second selector for a live exact-program experiment. A matching SPIR-V
+    // module can be reused by unrelated draws, so a shader-only A/B is not necessarily
+    // an exact draw substitution. Invalid input fails closed.
+    const char* fs_guest_addr_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_GUEST_ADDR");
+    uint64_t fs_guest_addr = 0;
+    const bool fs_guest_addr_valid =
+        parse_diagnostic_address(fs_guest_addr_text, fs_guest_addr);
+    if (!fs_guest_addr_valid) {
+        static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+        if (!warned.test_and_set())
+            std::fprintf(stderr,
+                         "[fs-match] PROSPER_FS_SPV_GUEST_ADDR invalid -> no file override\n");
+    }
+    const char* fs_target_addr_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_TARGET_ADDR");
+    uint64_t fs_target_addr = 0;
+    const bool fs_target_addr_valid =
+        parse_diagnostic_address(fs_target_addr_text, fs_target_addr);
+    if (!fs_target_addr_valid) {
+        static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+        if (!warned.test_and_set())
+            std::fprintf(stderr,
+                         "[fs-match] PROSPER_FS_SPV_TARGET_ADDR invalid -> no file override\n");
+    }
+    const char* fs_target_dim_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_TARGET_DIM");
+    uint32_t fs_target_width = 0, fs_target_height = 0;
+    const bool fs_target_dim_valid =
+        parse_diagnostic_extent(fs_target_dim_text, fs_target_width, fs_target_height);
+    if (!fs_target_dim_valid) {
+        static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+        if (!warned.test_and_set())
+            std::fprintf(stderr,
+                         "[fs-match] PROSPER_FS_SPV_TARGET_DIM invalid -> no file override\n");
+    }
+    // PROSPER_RENDER_TESTPS_MATCH=<file> is the geometry half of a per-shader A/B test: replace
+    // only that exact guest PS with the known solid output while retaining its real VS, indices,
+    // viewport, depth and raster state. As with FS_SPV_MATCH, a bad path fails closed.
+    int testps_match_mode = 0;
+    std::vector<uint32_t> testps_match;
+    if (const char* mp = PROSPER_ENV_VALUE("PROSPER_RENDER_TESTPS_MATCH")) {
+        testps_match_mode = load_spv_file(mp, testps_match) ? 1 : 2;
+        if (testps_match_mode == 2)
+            fprintf(stderr, "[testps-match] PROSPER_RENDER_TESTPS_MATCH='%s' invalid/unreadable -> "
+                    "applying NO test fragment override (fail closed)\n", mp);
+    }
+    const bool nops = PROSPER_ENV_VALUE("PROSPER_RENDER_NOPS");
+    // Assemble backend draws for a subset of the submit's items — one BackendDraw per realized
+    // DrawItem with its own resources + fixed-function state (or the diagnostic overrides above).
+    // build_R reads the CURRENT g_rtt, so calling this AFTER an earlier target-group has been
+    // rendered+stored lets the later group sample that group's pixels (a HIT, not empty memory).
+    // PROSPER_SKIP_DRAW="N[,N...]" (diagnostic): drop these semantic draw_index values from
+    // every pass — isolate whether a specific draw (e.g. a suspected opaque UI backdrop that
+    // hides the composited world) is what corrupts the frame, without touching any state.
+    static const char* skip_draws_env = getenv("PROSPER_SKIP_DRAW");
+    // PROSPER_SKIP_DRAW_PROGRAM / PROSPER_DRAW_PROGRAM_CENSUS: decline draws by shader
+    // PROGRAM identity, and enumerate the programs a title draws with. Both are process
+    // singletons configured once from the environment (see draw_program_skip.hpp for the
+    // contract and the four limits a reader of a skipped run cannot see in the output).
+    // Hoisted here for the same reason descriptor_validate_mode is: the accessor is one
+    // function-local-static test, but calling it per draw on a 2,100-draw submit is a
+    // measurable cost for a variable nobody set.
+    auto& program_skip = prosper::gpu::draw_program_skip_selector();
+    const bool program_skip_armed = program_skip.armed();
+    const bool program_census = prosper::gpu::draw_program_census_enabled();
+    // PROSPER_DRAW_LINKSCAN: the graphics counterpart of PROSPER_COMPUTE_PARENTSCAN.
+    // Hoisted for the same reason as the two above -- disarmed it is one bool.
+    auto& link_scan = prosper::gpu::draw_link_scan_selector();
+    const bool link_scan_armed = prosper::gpu::draw_link_scan_enabled();
+    return ShaderOverrides{
+        .refvs = refvs,
+        .refvs_spv = std::move(refvs_spv),
+        .ps_override = std::move(ps_override),
+        .ps_override_is_file = ps_override_is_file,
+        .ps_override_is_test = ps_override_is_test,
+        .fs_match_mode = fs_match_mode,
+        .fs_match = std::move(fs_match),
+        .fs_guest_addr_text = fs_guest_addr_text,
+        .fs_guest_addr = fs_guest_addr,
+        .fs_guest_addr_valid = fs_guest_addr_valid,
+        .fs_target_addr_text = fs_target_addr_text,
+        .fs_target_addr = fs_target_addr,
+        .fs_target_addr_valid = fs_target_addr_valid,
+        .fs_target_dim_text = fs_target_dim_text,
+        .fs_target_width = fs_target_width,
+        .fs_target_height = fs_target_height,
+        .fs_target_dim_valid = fs_target_dim_valid,
+        .testps_match_mode = testps_match_mode,
+        .testps_match = std::move(testps_match),
+        .nops = nops,
+        .skip_draws_env = skip_draws_env,
+        .program_skip = program_skip,
+        .program_skip_armed = program_skip_armed,
+        .program_census = program_census,
+        .link_scan = link_scan,
+        .link_scan_armed = link_scan_armed};
+}
+} // namespace
+
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested,
                             const std::string& title_id) {
     // Keep the legacy global disable authoritative for every frontend, including callers with their
@@ -2059,130 +2253,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 .depth_array_guest_scan_epoch = depth_array_guest_scan_epoch,
                 .gpu_depth_cube_snapshots = gpu_depth_cube_snapshots,
                 .depth_cube_gpu_snapshots = depth_cube_gpu_snapshots};
-            // Diagnostic shader/state overrides (computed once, applied to EVERY draw item):
-            //   REFVS  -> a known-good fullscreen-triangle VS (isolates the game's real VS).
-            //   TESTPS -> a solid-magenta PS (isolates VS geometry from PS shading). The optional
-            //             TESTPS_MATCH file restricts it to one exact recompiled guest PS.
-            //   FS_SPV -> a caller-supplied PS SPIR-V (e.g. a UV visualizer).
-            //   NOPS   -> bypass the resolved pipeline state (default state).
-            #include "refvs.inc"
-            const bool refvs = PROSPER_ENV_VALUE("PROSPER_RENDER_REFVS");
-            std::vector<uint32_t> refvs_spv(kRefVs, kRefVs + sizeof(kRefVs) / 4);
-            std::vector<uint32_t> ps_override;
-            bool ps_override_is_file = false;   // true only for a valid PROSPER_FS_SPV *file* override
-            bool ps_override_is_test = false;
-            if (PROSPER_ENV_ON("PROSPER_RENDER_TESTPS")) {
-                static const uint32_t kMagentaPs[] = {   // v0=1.0(R) v1=0.0(G) v2=1.0(B) v3=1.0(A); exp mrt0; endpgm
-                    0x7E0002F2u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u };
-                ps_override = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
-                ps_override_is_test = true;
-            }
-            // Validated SPIR-V file load: require a complete read of a word-aligned file >= 20 bytes
-            // (5 words: the minimum SPIR-V header). Validate size BEFORE allocating so a failed ftell
-            // (-1 -> huge size_t) cannot trigger a wild allocation, and reject non-word-aligned files
-            // rather than silently dropping trailing bytes. Returns false (out untouched) on any failure.
-            auto load_spv_file = [](const char* path, std::vector<uint32_t>& out) -> bool {
-                FILE* f = fopen(path, "rb");
-                if (!f) return false;
-                bool ok = false;
-                if (fseek(f, 0, SEEK_END) == 0) {
-                    long sz = ftell(f);
-                    if (sz >= 20 && (sz % 4) == 0 && fseek(f, 0, SEEK_SET) == 0) {
-                        std::vector<uint32_t> m(static_cast<size_t>(sz) / 4);
-                        if (fread(m.data(), 4, m.size(), f) == m.size()) { out = std::move(m); ok = true; }
-                    }
-                }
-                fclose(f);
-                return ok;
-            };
-            if (const char* fsp = PROSPER_ENV_VALUE("PROSPER_FS_SPV")) {
-                std::vector<uint32_t> m;
-                if (load_spv_file(fsp, m)) { ps_override = std::move(m); ps_override_is_file = true; }
-                else fprintf(stderr, "[fs-spv] PROSPER_FS_SPV='%s' invalid/unreadable -> no file override\n", fsp);
-            }
-            // PROSPER_FS_SPV_MATCH=<file>: restrict the PROSPER_FS_SPV *file* override to draws whose
-            // recompiled fragment SPIR-V EXACTLY equals this file (a per-draw A/B substitution that does
-            // not touch draws with a different descriptor contract). FAILS CLOSED: if requested but the
-            // file is missing/short/unaligned/unreadable, NO file override is applied — never a silent
-            // global fallback (that would recreate the exact hazard this gate exists to prevent). Does
-            // NOT gate PROSPER_RENDER_TESTPS, which stays global by design.
-            // mode: 0 = not requested (legacy global file override), 1 = loaded+valid (exact match only),
-            //       2 = requested but invalid (file override disabled).
-            int fs_match_mode = 0;
-            std::vector<uint32_t> fs_match;
-            if (const char* mp = PROSPER_ENV_VALUE("PROSPER_FS_SPV_MATCH")) {
-                fs_match_mode = load_spv_file(mp, fs_match) ? 1 : 2;
-                if (fs_match_mode == 2)
-                    fprintf(stderr, "[fs-match] PROSPER_FS_SPV_MATCH='%s' invalid/unreadable -> applying NO "
-                            "fragment file override (fail closed)\n", mp);
-            }
-            // Optional second selector for a live exact-program experiment. A matching SPIR-V
-            // module can be reused by unrelated draws, so a shader-only A/B is not necessarily
-            // an exact draw substitution. Invalid input fails closed.
-            const char* fs_guest_addr_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_GUEST_ADDR");
-            uint64_t fs_guest_addr = 0;
-            const bool fs_guest_addr_valid =
-                parse_diagnostic_address(fs_guest_addr_text, fs_guest_addr);
-            if (!fs_guest_addr_valid) {
-                static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-                if (!warned.test_and_set())
-                    std::fprintf(stderr,
-                                 "[fs-match] PROSPER_FS_SPV_GUEST_ADDR invalid -> no file override\n");
-            }
-            const char* fs_target_addr_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_TARGET_ADDR");
-            uint64_t fs_target_addr = 0;
-            const bool fs_target_addr_valid =
-                parse_diagnostic_address(fs_target_addr_text, fs_target_addr);
-            if (!fs_target_addr_valid) {
-                static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-                if (!warned.test_and_set())
-                    std::fprintf(stderr,
-                                 "[fs-match] PROSPER_FS_SPV_TARGET_ADDR invalid -> no file override\n");
-            }
-            const char* fs_target_dim_text = PROSPER_ENV_VALUE("PROSPER_FS_SPV_TARGET_DIM");
-            uint32_t fs_target_width = 0, fs_target_height = 0;
-            const bool fs_target_dim_valid =
-                parse_diagnostic_extent(fs_target_dim_text, fs_target_width, fs_target_height);
-            if (!fs_target_dim_valid) {
-                static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-                if (!warned.test_and_set())
-                    std::fprintf(stderr,
-                                 "[fs-match] PROSPER_FS_SPV_TARGET_DIM invalid -> no file override\n");
-            }
-            // PROSPER_RENDER_TESTPS_MATCH=<file> is the geometry half of a per-shader A/B test: replace
-            // only that exact guest PS with the known solid output while retaining its real VS, indices,
-            // viewport, depth and raster state. As with FS_SPV_MATCH, a bad path fails closed.
-            int testps_match_mode = 0;
-            std::vector<uint32_t> testps_match;
-            if (const char* mp = PROSPER_ENV_VALUE("PROSPER_RENDER_TESTPS_MATCH")) {
-                testps_match_mode = load_spv_file(mp, testps_match) ? 1 : 2;
-                if (testps_match_mode == 2)
-                    fprintf(stderr, "[testps-match] PROSPER_RENDER_TESTPS_MATCH='%s' invalid/unreadable -> "
-                            "applying NO test fragment override (fail closed)\n", mp);
-            }
-            const bool nops = PROSPER_ENV_VALUE("PROSPER_RENDER_NOPS");
-            // Assemble backend draws for a subset of the submit's items — one BackendDraw per realized
-            // DrawItem with its own resources + fixed-function state (or the diagnostic overrides above).
-            // build_R reads the CURRENT g_rtt, so calling this AFTER an earlier target-group has been
-            // rendered+stored lets the later group sample that group's pixels (a HIT, not empty memory).
-            // PROSPER_SKIP_DRAW="N[,N...]" (diagnostic): drop these semantic draw_index values from
-            // every pass — isolate whether a specific draw (e.g. a suspected opaque UI backdrop that
-            // hides the composited world) is what corrupts the frame, without touching any state.
-            static const char* skip_draws_env = getenv("PROSPER_SKIP_DRAW");
-            // PROSPER_SKIP_DRAW_PROGRAM / PROSPER_DRAW_PROGRAM_CENSUS: decline draws by shader
-            // PROGRAM identity, and enumerate the programs a title draws with. Both are process
-            // singletons configured once from the environment (see draw_program_skip.hpp for the
-            // contract and the four limits a reader of a skipped run cannot see in the output).
-            // Hoisted here for the same reason descriptor_validate_mode is: the accessor is one
-            // function-local-static test, but calling it per draw on a 2,100-draw submit is a
-            // measurable cost for a variable nobody set.
-            auto& program_skip = prosper::gpu::draw_program_skip_selector();
-            const bool program_skip_armed = program_skip.armed();
-            const bool program_census = prosper::gpu::draw_program_census_enabled();
-            // PROSPER_DRAW_LINKSCAN: the graphics counterpart of PROSPER_COMPUTE_PARENTSCAN.
-            // Hoisted for the same reason as the two above -- disarmed it is one bool.
-            auto& link_scan = prosper::gpu::draw_link_scan_selector();
-            const bool link_scan_armed = prosper::gpu::draw_link_scan_enabled();
+            // Diagnostic shader/state overrides (REFVS, TESTPS, FS_SPV, NOPS, SKIP_DRAW, ...): see
+            // load_shader_overrides. Computed once per callback, applied to every draw item.
+            ShaderOverrides shader_overrides = load_shader_overrides();
             BackendDrawContext backend_draw_ctx{
                 .native_fragment_vote_width = native_fragment_vote_width,
                 .partial_wave_fragment = partial_wave_fragment,
@@ -2193,32 +2266,32 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 .use_direct_index_views = use_direct_index_views,
                 .descriptor_validate_mode = descriptor_validate_mode,
                 .draw_resource_ctx = draw_resource_ctx,
-                .refvs = refvs,
-                .refvs_spv = refvs_spv,
-                .ps_override = ps_override,
-                .ps_override_is_file = ps_override_is_file,
-                .ps_override_is_test = ps_override_is_test,
-                .fs_match_mode = fs_match_mode,
-                .fs_match = fs_match,
-                .fs_guest_addr_text = fs_guest_addr_text,
-                .fs_guest_addr = fs_guest_addr,
-                .fs_guest_addr_valid = fs_guest_addr_valid,
-                .fs_target_addr_text = fs_target_addr_text,
-                .fs_target_addr = fs_target_addr,
-                .fs_target_addr_valid = fs_target_addr_valid,
-                .fs_target_dim_text = fs_target_dim_text,
-                .fs_target_width = fs_target_width,
-                .fs_target_height = fs_target_height,
-                .fs_target_dim_valid = fs_target_dim_valid,
-                .testps_match_mode = testps_match_mode,
-                .testps_match = testps_match,
-                .nops = nops,
-                .skip_draws_env = skip_draws_env,
-                .program_skip = program_skip,
-                .program_skip_armed = program_skip_armed,
-                .program_census = program_census,
-                .link_scan = link_scan,
-                .link_scan_armed = link_scan_armed};
+                .refvs = shader_overrides.refvs,
+                .refvs_spv = shader_overrides.refvs_spv,
+                .ps_override = shader_overrides.ps_override,
+                .ps_override_is_file = shader_overrides.ps_override_is_file,
+                .ps_override_is_test = shader_overrides.ps_override_is_test,
+                .fs_match_mode = shader_overrides.fs_match_mode,
+                .fs_match = shader_overrides.fs_match,
+                .fs_guest_addr_text = shader_overrides.fs_guest_addr_text,
+                .fs_guest_addr = shader_overrides.fs_guest_addr,
+                .fs_guest_addr_valid = shader_overrides.fs_guest_addr_valid,
+                .fs_target_addr_text = shader_overrides.fs_target_addr_text,
+                .fs_target_addr = shader_overrides.fs_target_addr,
+                .fs_target_addr_valid = shader_overrides.fs_target_addr_valid,
+                .fs_target_dim_text = shader_overrides.fs_target_dim_text,
+                .fs_target_width = shader_overrides.fs_target_width,
+                .fs_target_height = shader_overrides.fs_target_height,
+                .fs_target_dim_valid = shader_overrides.fs_target_dim_valid,
+                .testps_match_mode = shader_overrides.testps_match_mode,
+                .testps_match = shader_overrides.testps_match,
+                .nops = shader_overrides.nops,
+                .skip_draws_env = shader_overrides.skip_draws_env,
+                .program_skip = shader_overrides.program_skip,
+                .program_skip_armed = shader_overrides.program_skip_armed,
+                .program_census = shader_overrides.program_census,
+                .link_scan = shader_overrides.link_scan,
+                .link_scan_armed = shader_overrides.link_scan_armed};
             auto build_bds = [&](const std::vector<const prosper::gpu::DrawItem*>& group,
                                  prosper::test::BackendSubmissionBatch* producer_batch = nullptr) {
                 return build_backend_draws(backend_draw_ctx, group, producer_batch);
