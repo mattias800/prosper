@@ -456,14 +456,25 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
             a.value = share * 100.0;
             a.unit = "%presents";
             a.threshold = t.present_fallback_share * 100.0;
-            a.detail = format("cpu-fallback=%llu gpu-scanout=%llu flips=%llu",
+            // WHY the renderer declined to publish (#3915): a bare "gpu-scanout=0" cannot say
+            // which check refused the front buffer, and each names a different next step.
+            const char* names[kPresentDeclineSlots];
+            for (size_t i = 0; i < kPresentDeclineSlots; ++i)
+                names[i] = w.present_decline_names[i] ? w.present_decline_names[i] : "?";
+            a.breakdown = ranked(w.present_declines, names, kPresentDeclineSlots);
+            a.detail = format("cpu-fallback=%llu gpu-scanout=%llu flips=%llu declines=%s",
                               (unsigned long long)fallback, (unsigned long long)gpu,
-                              (unsigned long long)w.flips);
+                              (unsigned long long)w.flips,
+                              a.breakdown.empty() ? "none-recorded"
+                                                  : top_entries(a.breakdown).c_str());
             a.hint = "GPU present is on, but most frames were shown from a CPU readback (a full "
                      "frame read back and re-uploaded each present): live colour targets are off "
-                     "or the GPU publish keeps missing; next: diagnostic-path-active, the [app] "
-                     "fps line's gpu-present cpu-fallback count, PROSPER_PRESENT_HANDOFF_TRACE=1; "
-                     "cf. #1270, #3895";
+                     "or the GPU publish keeps missing; `declines=` names the renderer's reason, "
+                     "counted per final render span rather than per present (the [present] GPU "
+                     "PRESENT DECLINED line has the target's extent/format); "
+                     "none-recorded means the final render span never reached the publish; next: "
+                     "diagnostic-path-active, PROSPER_PRESENT_HANDOFF_TRACE=1; cf. #1270, #3895, "
+                     "#3915";
             out.push_back(std::move(a));
         }
     }

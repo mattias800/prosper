@@ -3112,7 +3112,8 @@ endif()
                                                frontends/shared/live/submit_renderer/backend_timing.cpp
                                                frontends/shared/live/submit_renderer/per_target_passes.cpp
                                                frontends/shared/live/live_compute.cpp
-                                               frontends/shared/present/present_blit.cpp)
+                                               frontends/shared/present/present_blit.cpp
+                                               frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
       target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan
                                                    prosper_performance_capture)
@@ -3429,7 +3430,8 @@ endif()
                                                frontends/shared/live/submit_renderer/backend_timing.cpp
                                                frontends/shared/live/submit_renderer/per_target_passes.cpp
                                                frontends/shared/live/live_compute.cpp
-                                               frontends/shared/present/present_blit.cpp)
+                                               frontends/shared/present/present_blit.cpp
+                                               frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
       target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan
                                                    prosper_performance_capture)
@@ -5189,6 +5191,15 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
   target_include_directories(test_present_blit PRIVATE src tests)
   target_link_libraries(test_present_blit PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
   add_test(NAME present_blit COMMAND test_present_blit)
+
+  # #3915: a display buffer written by a compute storage store is presented through GPU present from
+  # a mirror of the dispatch's own result, byte-identical to the CPU fallback, and never after the
+  # guest bytes change. Real device, real HLE VideoOut registration, real guest write watch.
+  add_executable(test_compute_scanout tests/shared/present/test_compute_scanout.cpp)
+  target_include_directories(test_compute_scanout PRIVATE frontends src tests)
+  target_link_libraries(test_compute_scanout PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+  add_test(NAME compute_scanout_present COMMAND test_compute_scanout)
+  set_tests_properties(compute_scanout_present PROPERTIES TIMEOUT 120)
   add_test(NAME present_blit_trace COMMAND test_present_blit)
   set_tests_properties(present_blit_trace PROPERTIES
     ENVIRONMENT "PROSPER_PRESENT_HANDOFF_TRACE=1")

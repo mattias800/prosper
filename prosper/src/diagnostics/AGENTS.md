@@ -194,7 +194,9 @@ counts the dispatcher's `prosper_on_unimpl` and fires on the FIRST call of an un
 the first flip (boot-time ones are before the engine's baseline); `diagnostic-path-active` is a
 gauge the live renderer sets once, naming the switch that turned GPU-resident colour targets off;
 `present-path-fallback` compares prosper-app's CPU-fallback presents against the GPU presents
-`present-cpu-overhead` already counts; `pipeline-cache-thrash` counts evictions from the pipeline,
+`present-cpu-overhead` already counts, and its `declines=` names WHY the renderer did not publish
+the front buffer (counted per final render span, so not a count of presents) (`no-render-target`, `not-gpu-resident`, `compute-scanout-stale`, ... -- the
+`GpuPresentOutcome` names in `frontends/shared/present/present_blit_policy.hpp`, #3915); `pipeline-cache-thrash` counts evictions from the pipeline,
 pipeline-layout and descriptor-set-layout caches; `texture-validation-churn` counts the guest bytes
 exact decode-cache validations that FAILED actually read (the compare stops at the first differing
 chunk, so a texture rewritten every frame is cheap and quiet; a source changing only near its end is

@@ -536,6 +536,28 @@ void test_present_path_fallback() {
           only(a, "present-path-fallback"));
     check("...with both counts", !a.empty() &&
               a[0].detail.find("cpu-fallback=140 gpu-scanout=10") != std::string::npos);
+    // #3915: the renderer's decline reasons ride in the detail and the breakdown, largest first; a
+    // window with none recorded says so rather than printing an empty list.
+    check("...and says when no renderer decline was recorded", !a.empty() &&
+              a[0].detail.find("declines=none-recorded") != std::string::npos);
+    WindowSample named = bad;
+    named.present_declines[6] = 686; named.present_decline_names[6] = "no-render-target";
+    named.present_declines[12] = 3; named.present_decline_names[12] = "compute-scanout-stale";
+    const auto n = evaluate_rules(named, kDefault);
+    check("...and names the renderer's decline reasons, largest first", !n.empty() &&
+              n[0].detail.find("declines=no-render-target:686,compute-scanout-stale:3") !=
+                  std::string::npos &&
+              n[0].breakdown.size() == 2);
+    {
+        using namespace prosper::diagnostics::perf;
+        const uint64_t total = ledger().counters[static_cast<size_t>(Counter::PresentGpuDeclines)];
+        const uint64_t slot = ledger().present_declines[6];
+        note_present_decline(6, "no-render-target");
+        note_present_decline(kPresentDeclineSlots, "out-of-range");   // ignored, not a crash
+        check("note_present_decline bumps the total and its reason together",
+              ledger().counters[static_cast<size_t>(Counter::PresentGpuDeclines)] == total + 1 &&
+                  ledger().present_declines[6] == slot + 1);
+    }
     WindowSample startup = healthy();
     set_count(startup, Counter::PresentCpuFallbacks, 40);    // 8/s, before the first GPU publish
     set_cost(startup, Cost::PresentCpu, 10.0, 130, 0.2);

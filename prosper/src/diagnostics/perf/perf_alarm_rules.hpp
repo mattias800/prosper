@@ -174,6 +174,9 @@ struct WindowSample {
     // Per-class breakdown of GpuMemoryOffDevice, and each slot's name (nullptr: never recorded).
     uint64_t gpu_memory_off_device[kGpuMemoryClassSlots] = {};
     const char* gpu_memory_class_names[kGpuMemoryClassSlots] = {};
+    // Per-reason breakdown of PresentGpuDeclines (#3915), and each slot's name.
+    uint64_t present_declines[kPresentDeclineSlots] = {};
+    const char* present_decline_names[kPresentDeclineSlots] = {};
     // Host-copy bytes per [transfer-pressure] category (diagnostics::Transfer).
     static constexpr size_t kTransferCount = static_cast<size_t>(Transfer::Count);
     uint64_t transfer_bytes[kTransferCount] = {};
