@@ -111,3 +111,94 @@ reports**: anything that summarises a run when it ends registers there instead o
 skip atexit handlers, and each of them calls `flush_exit_reports()` first. Before #3353 a bare atexit
 report was silent on all of those paths, and the silence read as a zero. SIGTERM and signal-context
 exits are still not covered, so a number that must survive a killed run needs a periodic report too.
+
+`exit_census.{hpp,cpp}` sits on top of that registry and is what a new **census** should use:
+`register_census(disable_env, report)` owns the end-of-run hook and the opt-out variable, and hands
+formatting back to the caller because a per-reason distribution, a bucket series and a per-site
+table are not the same report. The censuses themselves —
+`transfer_pressure`, `readback_reason_census`, `worker_spawn_census`, `persistent_target_census` —
+are separate files rather than one shared counter type on purpose; what was worth de-duplicating is
+the part where a mistake is silent, not the counting.
+
+**Register on first use, never at namespace-scope static initialisation**, and this is the one that
+bites somebody else rather than you. `register_exit_report` installs its `std::atexit` fallback on
+the *first* registration in the process, and `atexit` runs LIFO against `__cxa_atexit`'s static
+destructors — so a census that registers during static init becomes the earliest atexit entry,
+which makes the flush the **latest** thing to run, after the function-local statics that other
+censuses read. Adding one file with a namespace-scope registration took this suite from green to
+eleven failures: a SIGSEGV in `game_compute_exec` *after* its `[storage-materialize]` line printed,
+plus three timeouts, none of them in the new census and none in code it touches. Pair it with the
+other half: any object a report reads should be **never-destroyed** (the no-destroy idiom
+`exit_reports.cpp` uses for its own registry), because no registration site controls that ordering.
+
+The rule that decides whether a census belongs here at all: **it must be able to distinguish "this
+did not happen" from "this was not counted".** Both of those print zero, and the second one reads
+as a finding. `persistent_target_census` exists because a colour-target cache with no entry for a
+key looks identical whether it evicted one or never made one, and the env-var A/B that would
+separate them cannot show its own lever moved (instrument trap 288) — so it reports residency and
+evictions directly instead, and says in one clause which of the two states it is in.
+
+`perf/` is the always-on performance-alarm layer (#3891), and it answers a different question from
+everything above: not "what happened?" but "what is this run paying for, and is that a problem?".
+`perf_ledger.hpp` is the accumulation side and is **header-only on purpose** — render_runner.h is
+compiled straight into dozens of Vulkan tests that name their own translation units, so a ledger
+that needed a `.cpp` would need a CMake edit per test. Hooks feeding it must stay coarse: relaxed
+counters per event, clock reads only around a whole readback, lock wait, present or pass group —
+never per draw (PROSPER_RENDER_TIMING's per-draw clocks cost ~9% of the render thread, which is why
+that census is opt-in and this one is not). `perf_alarm_rules.{hpp,cpp}` is a pure function from one
+window of ledger deltas to the alarms it raises; every threshold is a named constant beside the
+measurement that set it, and every rule has a hand-built positive and negative window in
+`tests/diagnostics/test_perf_alarms.cpp`. `perf_alarms.{hpp,cpp}` is the engine: windowing per guest
+flip (the frame budget is the guest's own SetFlipRate), rate-limited `[perf-alarm]` lines, JSONL and
+the exit summary. A new rule belongs here only if it can name the next instrument to reach for in its
+hint and was validated against a run where the cost really existed; a rule that fires on a healthy
+run gets tuned or removed, because an alarm people learn to ignore is worse than none.
+
+**Reading the alarms** — do this first on any run you did not expect to be slow or wrong. Every run
+log carries them without a flag: `[perf-alarm] #<ordinal> rule=<name> ... value=<v> <unit>
+threshold=<t> <detail> hint=<next instrument>`, rate-limited per rule (the ordinal, not the line
+count, says how many windows fired), then `[perf-alarm] summary` lines at exit: windows fired, the
+worst window, and for a correctness rule the per-reason breakdown summed over the run. A summary's
+`NO DATA` list names rules that could not have fired, which is not the same as quiet. A run killed
+with SIGTERM skips the summary, so `PROSPER_PERF_ALARM_LOG=<path>` (JSONL: every firing plus every
+window's raw quantities, flushed as written) is the record to keep for anything scripted. Under
+`prosper-app --fps` the HUD adds one `! alarm: <rules>` line while a rule is active in the latest
+window.
+
+**Correctness rules carry the SITE, not just a count.** `dropped-draws` names the drop site per
+window (`reasons=render-array-reject/depth-unavailable:276`) from `perf::DropReason`: one code per
+`built.reject(...)` site in the live renderer's resource builder, `contract-mismatch`, and
+`backend/*` mirroring `gpu::DrawDrop` (`draw_disposition.cpp` static_asserts the mirror).
+`skipped-dispatches` does the same with `perf::DispatchSkip`, and its exclusions are code, not
+prose: a deliberate backend decline (the `PROSPER_COMPUTE_SKIP_PROGRAM` selector calls
+`note_deliberate_dispatch_decline()`, which `BackendDispatchOutcome` checks), the parent-walk
+diagnostic, indirect-dependency skips after either in the same submit, and every dispatch of a
+process with no compute backend are not counted — each pinned by an arm in `test_gpu_execute`.
+`gpu-memory-off-device` breaks down by renderer allocation class (`classes=depth-target:40`),
+names supplied by `gpu/diagnostics/memory_placement_log.hpp`; it fires on any GPU-only allocation
+placed off device-local memory on a device that has some, and `oom-fallbacks=` in its detail says
+whether that was the #3897 out-of-memory retry or a resource that allowed no device-local type.
+On this project's APU it should never fire; `PROSPER_GPU_MEM_FORCE_OOM` exercises it.
+`host-copy-pressure`'s breakdown is whole MiB per `[transfer-pressure]` category, not a count. A new drop site must pass a reason;
+one that sets `complete = false` directly shows up as `unattributed`, which is the instrument naming
+its own blind spot, not a finding about the title. Re-realizations that are not live execution (an
+F9 capture) wrap themselves in `SuppressDispatchSkipCounting` so that capturing a frame cannot raise
+the alarm being investigated. `host-copy-pressure` reads the `transfer_pressure` census's totals at
+window close rather than adding hooks of its own — reuse an existing always-on counter that way
+before adding a parallel one.
+
+**The 2026-09-28 queue rules** (#3891) each hang off an event path that already existed, so none
+costs anything on an accepted draw, reference or present: `unaccounted-draws` is the
+`draw_disposition` census's own `UNACCOUNTED` blind spot, added once per pass; `unimplemented-hle-calls`
+counts the dispatcher's `prosper_on_unimpl` and fires on the FIRST call of an unregistered NID after
+the first flip (boot-time ones are before the engine's baseline); `diagnostic-path-active` is a
+gauge the live renderer sets once, naming the switch that turned GPU-resident colour targets off;
+`present-path-fallback` compares prosper-app's CPU-fallback presents against the GPU presents
+`present-cpu-overhead` already counts, and its `declines=` names WHY the renderer did not publish
+the front buffer (counted per final render span, so not a count of presents) (`no-render-target`, `not-gpu-resident`, `compute-scanout-stale`, ... -- the
+`GpuPresentOutcome` names in `frontends/shared/present/present_blit_policy.hpp`, #3915); `pipeline-cache-thrash` counts evictions from the pipeline,
+pipeline-layout and descriptor-set-layout caches; `texture-validation-churn` counts the guest bytes
+exact decode-cache validations that FAILED actually read (the compare stops at the first differing
+chunk, so a texture rewritten every frame is cheap and quiet; a source changing only near its end is
+what it names). Proposals needing a new expensive signal were
+declined on the issue with a reason rather than approximated.

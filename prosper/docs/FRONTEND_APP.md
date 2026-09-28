@@ -735,10 +735,22 @@ supplies a nonzero content-version ID. Cache hits skip image allocation, staging
 copy, transfer commands, and upload barriers. Exact image-view and sampler contracts over a retained
 image remain resident with that image, under a 32-contract per-image bound; set
 `PROSPER_NO_BACKEND_PERSISTENT_TEXTURE_BINDINGS=1` to retain images while restoring callback-local
-bindings for an A/B. Its default byte ceiling is one eighth of the largest device-local heap,
-clamped to 1-2 GiB, with at most 1024 allocations. Set
-`PROSPER_BACKEND_TEXTURE_CACHE_MB=<MiB>` to change the byte budget or
-`PROSPER_NO_BACKEND_PERSISTENT_TEXTURES=1` for a forced-upload A/B. Backend timing reports
+bindings for an A/B. Its default byte ceiling follows the driver's live `VK_EXT_memory_budget`
+figures for the heap the textures allocate from: about 80% of `heapBudget` minus prosper's
+non-texture usage, within [1 GiB, 75% of the heap], and never above the old rule on a non-discrete
+(unified-memory) device; without the extension, or with `PROSPER_NO_VRAM_BUDGET=1`, it is one eighth
+of the largest device-local heap clamped to 1-4 GiB (`src/gpu/memory/texture_cache_budget.hpp`,
+#3873). At most 1024 allocations. `PROSPER_FAKE_HEAP_BUDGET_MB=<MiB>` pretends the heap is a
+discrete card of that size, for this budget and the colour-target budget alike (test-only). Set
+`PROSPER_BACKEND_TEXTURE_CACHE_MB=<MiB>` to change the byte budget absolutely or
+`PROSPER_NO_BACKEND_PERSISTENT_TEXTURES=1` for a forced-upload A/B. When the budget is full, the
+least-recently-used image is evicted even while earlier command buffers of the same ordered batch
+are still pending, provided no pass of that batch has used it; its image, memory, views and
+samplers are destroyed by the batch's completion cleanup, not at eviction (#3873). Before that, a
+pending batch blocked eviction entirely, so a cache filled during a load never admitted another
+texture and every non-resident texture was re-uploaded into a fresh allocation each frame. Set
+`PROSPER_NO_DEFERRED_TEXTURE_EVICTION=1` to restore the old skip-while-pending rule for an A/B.
+Backend timing reports
 `persistent=hits/misses` and the current cache bytes. The frontend decoded-pixel budget and backend
 device-image budget are separate: a hot immutable atlas can occupy space in both, trading bounded
 residency for lower frame time.

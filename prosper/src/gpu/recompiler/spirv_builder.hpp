@@ -39,6 +39,15 @@ enum class Float16DetileOutput { Rgba8, RawUvec4 };
 std::vector<uint32_t> build_compute_detile_float16(
     uint32_t components = 4, Float16DetileOutput output = Float16DetileOutput::Rgba8);
 
+// Quantise D32 float depth to the retained depth-cube bridge's replicated RGBA8 in place.
+// Binding 0: storage buffer of uint32 words (float bits in, packed texels out); push constant:
+// texel count. Each texel becomes q | q<<8 | q<<16 | 0xff000000 with
+// q = trunc(clamp(d, 0, 1) * 255 + 0.5), with both float32 operations rounded to nearest-even
+// by integer arithmetic. This matches depth_cube_quantize.hpp for finite depth on devices whose
+// native float rounding mode differs from the CPU's. NaN deterministically maps to zero; the CPU
+// scalar cast from NaN has no defined result. Local size 128.
+std::vector<uint32_t> build_compute_depth_to_rgba8();
+
 // Reconstruct packed R10G10B10A2 UNORM from canonical RGBA8 bytes in place.
 // Binding 0: storage buffer of uint32 texels; push constant: texel count.
 std::vector<uint32_t> build_compute_rgba8_to_packed10();

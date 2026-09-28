@@ -15,9 +15,17 @@
 #include "buffer_range_plan.h"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
+#include "gpu/memory/texture_cache_budget.hpp"  // #3873: texture budget from live headroom
+#include "gpu/memory/spill_recovery.hpp"        // #3905: rebuild spilled retained resources in VRAM
+#include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only memory prefers VRAM
 #include "gpu/execute/host_read_barrier.hpp"   // the availability half of a readback (#2944/#3249)
 #include "gpu/execute/float_controls_probe.hpp" // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
+#include "gpu/diagnostics/draw_disposition.hpp"  // why a draw did not reach the GPU
+#include "diagnostics/readback_reason_census.hpp"  // why a colour target is copied back
+#include "diagnostics/perf/perf_ledger.hpp"         // #3891: always-on alarm ledger
+#include "diagnostics/exit_census.hpp"       // one-line end-of-run reports
+#include "diagnostics/persistent_target_census.hpp"  // is the colour-target cache at its bound?
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578: name guest shaders for RenderDoc/RGP
 #include "diagnostics/env_cache.hpp"       // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
@@ -218,6 +226,11 @@ struct FrameResource : FrameBufferResource {
     // behavior. >1 lets the backend generate a box-filtered chain — bounded by this declared count —
     // for plain-2D RGBA8 sampled textures, so minification stops point-sampling through dense art.
     uint32_t declared_mip_levels = 1;
+    // Levels ALREADY present in `tex_rgba`, concatenated level 0 first, each tightly packed at its
+    // own extent (backend_texture_bytes). 0/1 = level 0 only, the historical contract. A native BCn
+    // texture carries the guest's own chain this way (#3873) because a block format cannot be
+    // blit-generated; the backend then copies every level instead of running the blit cascade.
+    uint32_t uploaded_mip_levels = 0;
     uint32_t img_dim = 1;             // ShaderResource/MIMG dim (1=2D, 2=3D); depth-1 3D stays 3D
     // #325: the guest T# is one prosper treats as a layered array, as decided by
     // guest_texture_is_uploaded_array(). The view type keys on this IN ADDITION to
@@ -418,7 +431,29 @@ struct BackendMrtOutputs {
     std::array<std::vector<uint8_t>, prosper::gpu::kColorTargetCount> colors;
 };
 
+// Block-compressed sampled formats the backend carries natively: guest BCn blocks are copied
+// straight into the staging buffer instead of being decoded to RGBA8 on the CPU. These are
+// SAMPLED-texture formats only -- never a colour target, storage image or blit destination.
+// Returns the bytes of one 4x4 block, or 0 for every non-block format.
+inline uint32_t backend_block_compressed_bytes(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+        case VK_FORMAT_BC4_UNORM_BLOCK:
+            return 8u;
+        case VK_FORMAT_BC2_UNORM_BLOCK:
+        case VK_FORMAT_BC3_UNORM_BLOCK:
+        case VK_FORMAT_BC5_UNORM_BLOCK:
+        case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+        case VK_FORMAT_BC7_UNORM_BLOCK:
+            return 16u;
+        default:
+            return 0u;
+    }
+}
+
 inline VkFormat backend_color_format(VkFormat format) {
+    if (backend_block_compressed_bytes(format) != 0u)
+        return format;
     if (format == VK_FORMAT_R16_SFLOAT ||
         format == VK_FORMAT_R16G16_SFLOAT ||
         format == VK_FORMAT_R16G16B16A16_SFLOAT ||
@@ -465,8 +500,12 @@ inline std::array<uint32_t, 4> backend_sampled_component_swizzle(
     return result;
 }
 
+// Bytes per TEXEL. A block-compressed format has no per-texel size, so it answers 0: every caller
+// that can see a BC texture must size it with backend_texture_bytes() instead, and a caller that
+// was missed fails closed (its `!bpp` guard) rather than over- or under-running a buffer.
 inline uint32_t backend_color_bytes_per_pixel(VkFormat format) {
     format = backend_color_format(format);
+    if (backend_block_compressed_bytes(format) != 0u) return 0u;
     if (format == VK_FORMAT_R32G32B32A32_UINT ||
         format == VK_FORMAT_R32G32B32A32_SFLOAT) return 16u;
     if (format == VK_FORMAT_R16G16B16A16_SFLOAT) return 8u;
@@ -477,8 +516,43 @@ inline uint32_t backend_color_bytes_per_pixel(VkFormat format) {
     return 4u;
 }
 
+// Bytes of a width x height x depth x layers texture at one mip level, block-granular for a BC
+// format (ceil(w/4) * ceil(h/4) blocks per slice) and texel-granular otherwise. This is exactly the
+// tightly packed buffer layout vkCmdCopyBufferToImage reads with bufferRowLength = 0 and
+// bufferImageHeight = 0. Saturates to UINT64_MAX on overflow so a caller's size check refuses it.
+inline uint64_t backend_texture_bytes(VkFormat format, uint32_t width, uint32_t height,
+                                      uint32_t depth = 1u, uint32_t layers = 1u) {
+    const uint32_t block = backend_block_compressed_bytes(backend_color_format(format));
+    uint64_t result = block ? block : backend_color_bytes_per_pixel(format);
+    const uint64_t factors[4] = {
+        block ? (uint64_t(width) + 3u) / 4u : uint64_t(width),
+        block ? (uint64_t(height) + 3u) / 4u : uint64_t(height),
+        std::max<uint64_t>(depth, 1u), std::max<uint64_t>(layers, 1u)};
+    for (const uint64_t factor : factors) {
+        if (factor && result > UINT64_MAX / factor) return UINT64_MAX;
+        result *= factor;
+    }
+    return result;
+}
+
+// Bytes of levels [0, levels) of a 2D chain, each level tightly packed at max(w>>L,1) x max(h>>L,1)
+// and concatenated level 0 first: the staging layout of FrameResource::uploaded_mip_levels.
+inline uint64_t backend_texture_chain_bytes(VkFormat format, uint32_t width, uint32_t height,
+                                            uint32_t levels) {
+    uint64_t total = 0;
+    for (uint32_t level = 0; level < std::max(levels, 1u); ++level) {
+        const uint64_t bytes = backend_texture_bytes(
+            format, std::max(width >> level, 1u), std::max(height >> level, 1u));
+        if (bytes == UINT64_MAX || total > UINT64_MAX - bytes) return UINT64_MAX;
+        total += bytes;
+    }
+    return total;
+}
+
 inline prosper::gpu::SpirvImageNumericClass backend_image_numeric_class(VkFormat format) {
     using NumericClass = prosper::gpu::SpirvImageNumericClass;
+    if (backend_block_compressed_bytes(backend_color_format(format)) != 0u)
+        return NumericClass::Float;
     switch (backend_color_format(format)) {
         case VK_FORMAT_R8_UINT:
         case VK_FORMAT_R8G8B8A8_UINT:
@@ -526,12 +600,18 @@ inline constexpr uint32_t kBackendMaxArrayLayers = 2048u;
 // is what stands between it and the upload (#325). Mip generation is already excluded for
 // `sample_count > 1`, which is what stops a generated chain bleeding across layer boundaries.
 inline bool backend_texture_array_span_valid(const FrameResource& resource) {
+    // A borrowed GPU image has no CPU span to overrun: its owner created it with exactly
+    // tw x th x sample_count layers (the retained depth-array snapshot,
+    // tests/fixtures/retained_depth_array_gpu.h) and keeps it alive through the lease.
+    const bool borrowed_array = !resource.tex_rgba && resource.borrowed_compute_image &&
+        resource.borrowed_compute_image_lease && !resource.borrowed_compute_vertical_stack_layers;
     if (resource.img_dim != 5u || resource.td != 1u || resource.is_storage_image ||
-        !resource.tex_rgba || !resource.tw || !resource.th || resource.sample_count < 2u ||
-        resource.sample_count > kBackendMaxArrayLayers)
+        (!resource.tex_rgba && !borrowed_array) || !resource.tw || !resource.th ||
+        resource.sample_count < 2u || resource.sample_count > kBackendMaxArrayLayers)
         return false;
     const uint32_t bpp = backend_color_bytes_per_pixel(resource.texture_format);
     if (!bpp) return false;
+    if (borrowed_array) return true;
     const size_t row_bytes = static_cast<size_t>(resource.tw) * bpp;
     if (row_bytes / bpp != resource.tw) return false;
     if (resource.th > SIZE_MAX / row_bytes) return false;
@@ -700,6 +780,10 @@ struct BackendTextureUploadStats {
     size_t persistent_hits = 0;
     size_t persistent_misses = 0;
     uint64_t persistent_cached_bytes = 0;
+    // #3873: resident images evicted while earlier commands of the same ordered batch were still
+    // pending. Their Vulkan objects are destroyed by the batch's completion cleanup, not here.
+    size_t persistent_deferred_evictions = 0;
+    uint64_t persistent_deferred_eviction_bytes = 0;
 };
 
 // thread_local like every other per-call stats storage in this file (#2953). It was the one
@@ -1492,6 +1576,15 @@ struct RenderVkCtx {
     // A 3D image's 2D-array attachment view is core on ordinary Vulkan 1.1+ devices, but
     // portability-subset implementations may decline this particular image-view operation.
     bool image_view_2d_on_3d = true;
+    // VkPhysicalDeviceFeatures::textureCompressionBC, enabled when advertised. Native BCn sampled
+    // uploads additionally require per-format optimal-tiling support; see
+    // backend_native_bc_sampled_supported().
+    bool texture_compression_bc = false;
+    // VK_EXT_memory_budget, enabled when advertised (#3873): lets the texture-cache budget follow the
+    // driver's live heapBudget/heapUsage instead of a fixed fraction of the heap size. `unified_memory`
+    // is true for any device that is not a discrete GPU, whose device-local heap is system RAM.
+    bool memory_budget_enabled = false;
+    bool unified_memory = false;
     VkPhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     PFN_vkCmdDrawMeshTasksEXT cmd_draw_mesh_tasks = nullptr;
@@ -1566,6 +1659,14 @@ inline const RenderVkCtx& render_vk_ctx() {
                 "VK_EXT_metal_surface", "VK_MVK_macos_surface",
 #else
                 "VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_wayland_surface",
+                // SDL's offscreen video driver (SDL_VIDEODRIVER=offscreen, what every headless agent
+                // run uses) creates its surface with this extension. Without it the app cannot make a
+                // surface on THIS instance, falls back to its own device, and never adopts GPU present,
+                // so every offscreen frame takes the CPU readback path: measured 2026-09-27 on Sonic
+                // Frontiers, ~6% fewer flips than a windowed run and an extra core of memmove on the
+                // main thread, and every offscreen F8 capture described the fallback, not the shipped
+                // renderer (#3873).
+                "VK_EXT_headless_surface",
 #endif
             };
             uint32_t nie = 0; vkEnumerateInstanceExtensionProperties(nullptr, &nie, nullptr);
@@ -1740,6 +1841,10 @@ inline const RenderVkCtx& render_vk_ctx() {
                      selection.properties.deviceName,
                      prosper::frontend::vulkan_device_type_name(selection.properties.deviceType));
         prosper::frontend::log_vulkan_runtime_device("render", r.phys, selection.properties);
+        // #3873: the texture-cache budget treats every non-discrete device's device-local heap as
+        // system RAM. See texture_cache_budget.hpp for why this is not read off the memory types.
+        r.unified_memory =
+            selection.properties.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
         // Present unification (#1270): if the graphics family exposes a second queue, dedicate index 1
         // to prosper-app's present so the app's blit/present submits never contend the render queue's
         // external-synchronization. On a single-queue family (RADV STRIX_HALO is queueCount==1) the app
@@ -1778,6 +1883,9 @@ inline const RenderVkCtx& render_vk_ctx() {
         if (supported.independentBlend) feats.independentBlend = VK_TRUE;
         // Dynamic texel offsets on OpImageGather require ImageGatherExtended (#3417).
         feats.shaderImageGatherExtended = supported.shaderImageGatherExtended;
+        // Guest BCn textures upload natively when the device can sample them (lavapipe may not).
+        feats.textureCompressionBC = supported.textureCompressionBC;
+        r.texture_compression_bc = supported.textureCompressionBC;
         VkPhysicalDeviceProperties phys_props{}; vkGetPhysicalDeviceProperties(r.phys, &phys_props);
         r.max_compute_workgroup_size_x = phys_props.limits.maxComputeWorkGroupSize[0];
         r.max_compute_workgroup_invocations = phys_props.limits.maxComputeWorkGroupInvocations;
@@ -1960,6 +2068,12 @@ inline const RenderVkCtx& render_vk_ctx() {
                       // opt-out is a deterministic unsupported-device arm on feature-rich hosts.
                       mesh_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
                   }
+              }
+              // #3873: live per-heap budget/usage for the texture-cache budget. A query-only extension
+              // with no features and no effect on anything else; add-if-available like the rest.
+              if (!strcmp(de[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+                  dev_exts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+                  r.memory_budget_enabled = true;
               }
               // Present unification (#1270): the swapchain device-extension, only when the instance is
               // surface-capable. Enabling it on the headless render device is harmless (no swapchain is
@@ -2182,6 +2296,37 @@ inline const RenderVkCtx& render_vk_ctx() {
     }();
     published_render_cache_context().store(&c, std::memory_order_release);
     return c;
+}
+
+// Can the render device sample `format` (a backend_block_compressed_bytes() format) as an
+// optimal-tiling image filled by a buffer copy, with linear filtering? Probed once per format and
+// cached. Desktop drivers advertise every BCn format; a software rasteriser may advertise none, and
+// then the caller keeps the CPU decoder. The feature bit is checked as well as the format bits:
+// using a BC format on a device that did not enable textureCompressionBC is not portable.
+inline bool backend_native_bc_sampled_supported(VkFormat format) {
+    if (backend_block_compressed_bytes(format) == 0u) return false;
+    static const std::array<std::pair<VkFormat, bool>, 7> support = [] {
+        std::array<std::pair<VkFormat, bool>, 7> table{{
+            {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, false}, {VK_FORMAT_BC2_UNORM_BLOCK, false},
+            {VK_FORMAT_BC3_UNORM_BLOCK, false}, {VK_FORMAT_BC4_UNORM_BLOCK, false},
+            {VK_FORMAT_BC5_UNORM_BLOCK, false}, {VK_FORMAT_BC6H_UFLOAT_BLOCK, false},
+            {VK_FORMAT_BC7_UNORM_BLOCK, false}}};
+        const RenderVkCtx& ctx = render_vk_ctx();
+        if (!ctx.ok || !ctx.phys || !ctx.texture_compression_bc) return table;
+        constexpr VkFormatFeatureFlags required =
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        for (auto& [candidate, supported] : table) {
+            VkFormatProperties properties{};
+            vkGetPhysicalDeviceFormatProperties(ctx.phys, candidate, &properties);
+            supported = (properties.optimalTilingFeatures & required) == required;
+        }
+        return table;
+    }();
+    for (const auto& [candidate, supported] : support)
+        if (candidate == format) return supported;
+    return false;
 }
 
 inline std::shared_ptr<GpuDetileUpload> prepare_render_gpu_detile(
@@ -2812,6 +2957,11 @@ struct PersistentColorTargetImage {
     uint64_t last_use = 0;
     uint32_t pin_count = 0;
     bool valid = false;
+    // #3905: placed off device-local memory by the #3897 fallback; recovery evicts it.
+    bool off_device = false;
+    // Only the compute destination allocator may set this. An unrelated graphics allocation
+    // with UNDEFINED layout must never be mistaken for a completed full-overwrite candidate.
+    bool compute_overwrite_uninitialized = false;
     // A partial volume pass establishes only the slices in its attachment view. Direct 3D
     // sampling requires every slice; an invalidated or discarded pass clears the whole proof.
     std::vector<uint8_t> valid_volume_slices;
@@ -2961,6 +3111,29 @@ inline VkDeviceSize persistent_color_target_limit() {
     return dev ? dev : static_cast<VkDeviceSize>(256ull * 1024ull * 1024ull);
 }
 
+// PROSPER_NO_VRAM_BUDGET=1 keeps the old heap/8 rule even where VK_EXT_memory_budget is available
+// (the A/B arm). PROSPER_FAKE_HEAP_BUDGET_MB=<n> is TEST-ONLY: it pretends the texture heap is a
+// DISCRETE heap of n MiB whose driver budget is also n MiB (usage stays the real figure), so a
+// discrete card's budget can be exercised on a machine without one. With both set, the old rule is
+// evaluated against the faked heap size -- which is what an n-MiB card got before #3873. The fake
+// also sizes the colour-target residency budget (heap / 4), because that cache fills to its own
+// budget and is the largest non-texture consumer the texture budget yields to: leaving it at the
+// real heap's figure would simulate a card whose render targets may hold 4 GiB of an 8 GiB heap.
+inline bool texture_cache_budget_overridden() {
+    static const bool overridden = getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB") != nullptr;
+    return overridden;
+}
+inline bool vram_budget_disabled() {
+    static const bool disabled = getenv("PROSPER_NO_VRAM_BUDGET") != nullptr;
+    return disabled;
+}
+inline uint64_t fake_heap_budget_bytes() {
+    static const uint64_t bytes = prosper::diag::env_u64_or_default_capped(
+        "PROSPER_FAKE_HEAP_BUDGET_MB", getenv("PROSPER_FAKE_HEAP_BUDGET_MB"), 0ull,
+        UINT64_MAX / (1024ull * 1024ull), "MiB") * 1024ull * 1024ull;
+    return bytes;
+}
+
 // Size the default residency budget to a quarter of the largest device-local heap, clamped to
 // [256 MiB, 4 GiB]. On an integrated GPU (shared system RAM, a very large heap) this lands at the 4 GiB
 // ceiling; on a small discrete GPU it stays proportional so we never claim more than ~25% of VRAM.
@@ -2973,6 +3146,7 @@ inline void init_persistent_color_target_device_budget(
     for (uint32_t i = 0; i < memp.memoryHeapCount; i++)
         if (memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
             heap = std::max(heap, memp.memoryHeaps[i].size);
+    if (fake_heap_budget_bytes()) heap = fake_heap_budget_bytes();  // test-only (#3873)
     VkDeviceSize budget = heap / 4;
     budget = std::max<VkDeviceSize>(budget, 256ull * 1024ull * 1024ull);
     budget = std::min<VkDeviceSize>(budget, 4096ull * 1024ull * 1024ull);
@@ -2988,13 +3162,24 @@ inline void init_persistent_color_target_device_budget(
 // expansion), so the historical fixed 1 GiB image budget can continuously evict the rest of a hot
 // set. Keep small GPUs at that old bound while allowing capable devices up to 4 GiB. Unlike an
 // allocation, this is only a ceiling; memory is committed on exact-version cache insertion.
+//
+// That heap-size rule is now only the fallback: with VK_EXT_memory_budget the budget follows the
+// driver's live headroom (refresh_persistent_texture_cache_device_budget below, policy in
+// gpu/memory/texture_cache_budget.hpp, #3873).
 inline VkDeviceSize persistent_texture_cache_budget_for_heap(VkDeviceSize heap) {
-    constexpr VkDeviceSize min_bytes = 1024ull * 1024ull * 1024ull;
-    constexpr VkDeviceSize max_bytes = 4096ull * 1024ull * 1024ull;
-    return std::clamp<VkDeviceSize>(heap / 8u, min_bytes, max_bytes);
+    return prosper::gpu::texture_cache_heuristic_budget(heap);
 }
 
 inline VkDeviceSize& persistent_texture_cache_device_budget() {
+    static VkDeviceSize budget = 0;
+    return budget;
+}
+
+// The value the budget POLICY last wrote into persistent_texture_cache_device_budget(). The live
+// refresh below only ever replaces a value it owns: when anything else has written the device budget
+// (the texture fixtures pin an exact image-requirement budget), the two differ and the refresh leaves
+// it alone until the owner restores it.
+inline VkDeviceSize& persistent_texture_cache_policy_budget() {
     static VkDeviceSize budget = 0;
     return budget;
 }
@@ -3008,11 +3193,144 @@ inline void init_persistent_texture_cache_device_budget(
             heap = std::max(heap, memp.memoryHeaps[i].size);
     persistent_texture_cache_device_budget() =
         persistent_texture_cache_budget_for_heap(heap);
+    persistent_texture_cache_policy_budget() = persistent_texture_cache_device_budget();
     fprintf(stderr, "[render] persistent texture-image residency budget = %llu MiB "
             "(device-local heap %llu MiB)\n",
             (unsigned long long)(persistent_texture_cache_device_budget() /
                                  (1024ull * 1024ull)),
             (unsigned long long)(heap / (1024ull * 1024ull)));
+}
+
+// The heap persistent texture images really allocate from, recorded at the first retained
+// allocation (its memory type's heapIndex). UINT32_MAX until then; the budget uses the largest
+// device-local heap meanwhile, which is also what the pre-#3873 rule always used.
+inline std::atomic<uint32_t>& persistent_texture_heap_index() {
+    static std::atomic<uint32_t> heap{UINT32_MAX};
+    return heap;
+}
+
+// #3905: how many bytes of a retained cache's SPILLED entries (placed off device-local memory by the
+// #3897 fallback) may be evicted now, so their next use recreates them device-local. Policy in
+// gpu/memory/spill_recovery.hpp. Costs one compare per call while nothing is spilled; otherwise at
+// most one vkGetPhysicalDeviceMemoryProperties2 per interval.
+inline uint64_t render_spill_recovery_allowance(const RenderVkCtx& ctx,
+                                                prosper::gpu::SpillRecoveryState& state,
+                                                uint64_t spilled_bytes) {
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (!prosper::gpu::spill_recovery_due(state, now_ms, spilled_bytes)) return 0;
+    prosper::gpu::SpillRecoveryInputs in;
+    in.now_ms = now_ms;
+    in.spilled_bytes = spilled_bytes;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_props{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    if (ctx.memory_budget_enabled) props2.pNext = &budget_props;
+    vkGetPhysicalDeviceMemoryProperties2(ctx.phys, &props2);
+    const VkPhysicalDeviceMemoryProperties& memp = props2.memoryProperties;
+    // The heap device-local allocations use: the texture cache's recorded heap when it is
+    // device-local, else the largest device-local heap.
+    uint32_t heap = persistent_texture_heap_index().load(std::memory_order_relaxed);
+    if (heap >= memp.memoryHeapCount ||
+        !(memp.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) {
+        heap = UINT32_MAX;
+        for (uint32_t i = 0; i < memp.memoryHeapCount && i < VK_MAX_MEMORY_HEAPS; ++i)
+            if ((memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+                (heap == UINT32_MAX || memp.memoryHeaps[i].size > memp.memoryHeaps[heap].size))
+                heap = i;
+    }
+    if (heap != UINT32_MAX && ctx.memory_budget_enabled && !vram_budget_disabled()) {
+        in.have_budget = true;
+        in.heap_budget = budget_props.heapBudget[heap];
+        in.heap_usage = budget_props.heapUsage[heap];
+        if (const uint64_t fake = fake_heap_budget_bytes()) in.heap_budget = fake;
+    }
+    return prosper::gpu::spill_recovery_allowance(in, state);
+}
+
+// Re-derive the texture budget from the driver's live figures, at most every 250 ms (one
+// vkGetPhysicalDeviceMemoryProperties2 call). Called once per backend pass, inside the persistent
+// resource guard, with the cache's current byte total. A budget that SHRINKS takes effect through
+// the pass's ordinary end-of-pass trim, which evicts only images no pending command references and
+// hands them to the batch's completion cleanup -- nothing here waits on the GPU.
+inline void refresh_persistent_texture_cache_device_budget(const RenderVkCtx& ctx,
+                                                           VkDeviceSize texture_bytes) {
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point next_eval{};
+    static bool evaluated = false;
+    VkDeviceSize& applied = persistent_texture_cache_device_budget();
+    if (applied != persistent_texture_cache_policy_budget()) return;  // pinned by someone else
+    const Clock::time_point now = Clock::now();
+    if (evaluated && now < next_eval) return;
+    next_eval = now + std::chrono::milliseconds(250);
+
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_props{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    const bool query_budget = ctx.memory_budget_enabled;
+    if (query_budget) props2.pNext = &budget_props;
+    vkGetPhysicalDeviceMemoryProperties2(ctx.phys, &props2);
+    const VkPhysicalDeviceMemoryProperties& memp = props2.memoryProperties;
+
+    // Only a DEVICE-LOCAL recorded heap is trusted; see texture_cache_budget_heap for why.
+    uint64_t heap_sizes[VK_MAX_MEMORY_HEAPS] = {};
+    bool heap_device_local[VK_MAX_MEMORY_HEAPS] = {};
+    const uint32_t heap_count = std::min<uint32_t>(memp.memoryHeapCount, VK_MAX_MEMORY_HEAPS);
+    for (uint32_t i = 0; i < heap_count; ++i) {
+        heap_sizes[i] = memp.memoryHeaps[i].size;
+        heap_device_local[i] = (memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+    }
+    const uint32_t heap = prosper::gpu::texture_cache_budget_heap(
+        heap_sizes, heap_device_local, heap_count,
+        persistent_texture_heap_index().load(std::memory_order_relaxed));
+    if (heap == UINT32_MAX) return;
+
+    prosper::gpu::TextureCacheBudgetInputs in;
+    in.heap_size = memp.memoryHeaps[heap].size;
+    in.have_budget = query_budget && !vram_budget_disabled();
+    in.heap_budget = query_budget ? budget_props.heapBudget[heap] : 0;
+    in.heap_usage = query_budget ? budget_props.heapUsage[heap] : 0;
+    in.prosper_held = prosper::gpu::device_bytes_held(heap);
+    // A deferred eviction lowers texture_bytes at once while its memory stays in usage/held until
+    // the batch completes, so for up to one period it reads as non-texture usage and can shrink the
+    // next answer a little further. That errs conservative, and the hysteresis bounds it.
+    in.texture_bytes = texture_bytes;
+    in.unified = ctx.unified_memory;
+    const uint64_t fake = fake_heap_budget_bytes();
+    if (fake) {
+        in.heap_size = fake;
+        in.heap_budget = fake;
+        in.unified = false;
+        in.have_budget = !vram_budget_disabled();
+    }
+    const prosper::gpu::TextureCacheBudget chosen = prosper::gpu::texture_cache_budget(in);
+    if (evaluated && !prosper::gpu::texture_cache_budget_changed_materially(applied, chosen.bytes))
+        return;
+    const bool first = !evaluated;
+    evaluated = true;
+    applied = chosen.bytes;
+    persistent_texture_cache_policy_budget() = chosen.bytes;
+    constexpr uint64_t mib = 1024ull * 1024ull;
+    std::fprintf(stderr,
+                 "[vram-budget] texture cache budget %s %llu MiB (%s): heap %u size=%llu MiB "
+                 "budget=%llu MiB usage=%llu MiB prosper=%llu MiB textures=%llu MiB "
+                 "non-texture=%llu MiB target=%llu MiB%s%s%s%s\n",
+                 first ? "=" : "->", (unsigned long long)(chosen.bytes / mib),
+                 prosper::gpu::texture_cache_budget_source_name(chosen.source), heap,
+                 (unsigned long long)(in.heap_size / mib),
+                 (unsigned long long)(in.heap_budget / mib),
+                 (unsigned long long)(in.heap_usage / mib),
+                 (unsigned long long)(in.prosper_held / mib),
+                 (unsigned long long)(texture_bytes / mib),
+                 (unsigned long long)(chosen.non_texture / mib),
+                 (unsigned long long)(chosen.target / mib),
+                 in.unified ? " unified" : " discrete",
+                 query_budget ? "" : " (no VK_EXT_memory_budget)",
+                 fake ? " [FAKED heap: PROSPER_FAKE_HEAP_BUDGET_MB]"
+                      : (vram_budget_disabled() ? " [PROSPER_NO_VRAM_BUDGET]" : ""),
+                 texture_cache_budget_overridden()
+                     ? " -- OVERRIDDEN: PROSPER_BACKEND_TEXTURE_CACHE_MB is enforced instead" : "");
 }
 
 inline VkDeviceSize persistent_texture_cache_limit() {
@@ -3024,9 +3342,27 @@ inline VkDeviceSize persistent_texture_cache_limit() {
             UINT64_MAX / (1024ull * 1024ull), "MiB");
         return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
     }();
-    if (have_env) return env_limit;
-    const VkDeviceSize device_budget = persistent_texture_cache_device_budget();
-    return device_budget ? device_budget : 1024ull * 1024ull * 1024ull;
+    return prosper::gpu::resolve_texture_cache_limit(have_env, env_limit,
+                                                     persistent_texture_cache_device_budget());
+}
+
+// #3873: completion-gated eviction of the persistent texture-image cache while an ordered batch is
+// pending. Before this, eviction was skipped outright whenever an earlier command buffer of the
+// batch had not completed -- and in the live renderer's batched mode one nearly always has. Once
+// the budget filled (during a load, typically), nothing could ever leave the cache again: every
+// texture that was not already resident was uploaded into a fresh image + VkDeviceMemory + staging
+// block on EVERY frame, and freed at completion. Outer Wilds measured ~390 image allocations/s
+// that way, with a cache full of textures no longer drawn.
+//
+// The policy that replaces it: a victim must not have been used by ANY pass of the pending batch
+// (so nothing recorded so far references it), and its image, memory, views and samplers are still
+// handed to the batch's completion cleanup rather than destroyed immediately. The first half keeps
+// a working set that exceeds the budget from thrashing within one batch; the second half is
+// defence in depth for the lifetime rule. PROSPER_NO_DEFERRED_TEXTURE_EVICTION=1 restores the old
+// skip-while-pending behaviour for A/B. CONFIDENCE: HIGH (lifetime is the existing batch cleanup).
+inline bool persistent_texture_deferred_eviction_enabled() {
+    static const bool enabled = getenv("PROSPER_NO_DEFERRED_TEXTURE_EVICTION") == nullptr;
+    return enabled;
 }
 
 // Max number of distinct render targets kept GPU-resident (sampleable) at once. A target that would
@@ -3071,6 +3407,12 @@ inline PersistentColorTargetImage* find_persistent_color_target(
     if (!id) return nullptr;
     format = backend_color_format(format);
     auto& cache = persistent_color_target_cache();
+    // Residency, sampled where the question is actually asked. Two relaxed stores against an
+    // unordered_map lookup, and it is the only reading that is current at the moment a caller is
+    // told "there is no persistent image for this target".
+    prosper::diagnostics::note_persistent_target_residency(
+        cache.size(), persistent_color_target_count_limit(),
+        persistent_color_target_bytes(), persistent_color_target_limit());
     auto found = cache.find({id, width, height, format, volume_depth});
     if (found == cache.end() || (require_valid && !found->second.valid)) return nullptr;
     return &found->second;
@@ -3098,10 +3440,12 @@ inline bool pin_persistent_color_target(uint64_t id, uint32_t width, uint32_t he
 // A full overwrite can use the exact old allocation even after guest-write invalidation. This
 // pin grants no read authority: callers must replace every texel before marking it valid again.
 inline bool pin_persistent_color_target_for_overwrite(
-    uint64_t id, uint32_t width, uint32_t height, VkFormat format) {
+    uint64_t id, uint32_t width, uint32_t height, VkFormat format,
+    bool allow_uninitialized = false) {
     PersistentColorTargetImage* target = find_persistent_color_target(
         id, width, height, backend_color_format(format), false);
-    if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED ||
+    if (!target || !target->image ||
+        (!allow_uninitialized && target->layout == VK_IMAGE_LAYOUT_UNDEFINED) ||
         target->pin_count == UINT32_MAX) return false;
     ++target->pin_count;
     return true;
@@ -3176,11 +3520,21 @@ inline size_t invalidate_persistent_color_target_guest_write(uint64_t addr, uint
 // one borrowed renderer target. Normal guest-write invalidation runs first so every overlapping alias
 // becomes stale; only the image proven to have received that result may then regain authority.
 inline bool restore_persistent_color_target_after_mirrored_write(
-    uint64_t id, uint32_t width, uint32_t height, VkFormat format) {
+    uint64_t id, uint32_t width, uint32_t height, VkFormat format,
+    bool fresh_uninitialized = false) {
     invalidate_persistent_color_target_dimension_aliases(id, width, height, format, 0u);
     PersistentColorTargetImage* target = find_persistent_color_target(
         id, width, height, backend_color_format(format), false);
-    if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED) return false;
+    if (!target || !target->image ||
+        (target->layout == VK_IMAGE_LAYOUT_UNDEFINED &&
+         (!fresh_uninitialized || !target->compute_overwrite_uninitialized))) return false;
+    // The caller reports this only after a completed full buffer-to-image copy and its final
+    // TRANSFER_DST -> GENERAL barrier. Before that point an allocated image has no read authority.
+    if (fresh_uninitialized) {
+        if (target->layout != VK_IMAGE_LAYOUT_UNDEFINED) return false;
+        target->layout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    target->compute_overwrite_uninitialized = false;
     target->valid = true;
     // A mirrored compute write has completed, but this path does not yet carry its own producer
     // identity. It must not inherit a renderer version from the overwritten allocation.
@@ -3212,24 +3566,25 @@ persistent_color_target_evict_sink() {
     return sink;
 }
 
-inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t current_generation) {
-    if (backend_has_unproven_submission()) return false;
+// May this cached target be evicted now? Not the pass's own, not pinned, and not a valid volume.
+inline bool persistent_color_target_evictable(const PersistentColorTargetKey& key,
+                                              const PersistentColorTargetImage& image,
+                                              uint64_t current_generation) {
+    if (image.last_use == current_generation || image.pin_count) return false;
+    // A valid volume may be the only copy of slices never written to guest memory. The
+    // current CPU RTT eviction sink represents one 2D plane; dropping a volume through it
+    // would silently replace later 3D samples with stale guest bytes. Keep the bounded image
+    // resident until invalidation or explicit volume materialization is available.
+    if (key.volume_depth &&
+        std::any_of(image.valid_volume_slices.begin(), image.valid_volume_slices.end(),
+                    [](uint8_t slice) { return slice != 0; })) return false;
+    return true;
+}
+
+// Evict one entry: hand valid pixels to the sink, then destroy. Returns the next iterator.
+template <class It>
+inline It evict_persistent_color_target_entry(const RenderVkCtx& ctx, It victim) {
     auto& cache = persistent_color_target_cache();
-    auto victim = cache.end();
-    for (auto it = cache.begin(); it != cache.end(); ++it) {
-        if (it->second.last_use == current_generation || it->second.pin_count) continue;
-        // A valid volume may be the only copy of slices never written to guest memory. The
-        // current CPU RTT eviction sink represents one 2D plane; dropping a volume through it
-        // would silently replace later 3D samples with stale guest bytes. Keep the bounded image
-        // resident until invalidation or explicit volume materialization is available.
-        if (it->first.volume_depth &&
-            std::any_of(it->second.valid_volume_slices.begin(),
-                        it->second.valid_volume_slices.end(),
-                        [](uint8_t slice) { return slice != 0; })) continue;
-        if (victim == cache.end() || it->second.last_use < victim->second.last_use)
-            victim = it;
-    }
-    if (victim == cache.end()) return false;
     if (victim->second.valid) {
         auto& sink = persistent_color_target_evict_sink();
         if (sink) {
@@ -3243,9 +3598,88 @@ inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t curre
         }
     }
     persistent_color_target_bytes() -= victim->second.bytes;
+    prosper::diagnostics::note_persistent_target_evicted(victim->second.bytes);
     destroy_persistent_color_target(ctx, victim->second);
-    cache.erase(victim);
+    return cache.erase(victim);
+}
+
+inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t current_generation) {
+    prosper::diagnostics::note_persistent_target_eviction_attempt();
+    if (backend_has_unproven_submission()) return false;
+    auto& cache = persistent_color_target_cache();
+    auto victim = cache.end();
+    for (auto it = cache.begin(); it != cache.end(); ++it) {
+        if (!persistent_color_target_evictable(it->first, it->second, current_generation))
+            continue;
+        if (victim == cache.end() || it->second.last_use < victim->second.last_use)
+            victim = it;
+    }
+    if (victim == cache.end()) return false;
+    evict_persistent_color_target_entry(ctx, victim);
     return true;
+}
+
+// #3905: set when a persistent colour target lands off device-local memory; cleared by recovery
+// once no cached target is off-device. Keeps recovery to one load per pass on a healthy run.
+inline bool& persistent_color_target_spill_seen() {
+    static bool seen = false;
+    return seen;
+}
+
+inline void note_persistent_color_target_placement(PersistentColorTargetImage& image,
+                                                   const VkPhysicalDeviceMemoryProperties& memp,
+                                                   uint32_t memory_type) {
+    image.off_device = !prosper::gpu::memory_type_is_device_local(memp, memory_type);
+    if (!image.off_device) return;
+    persistent_color_target_spill_seen() = true;
+    static std::atomic<uint32_t> logs{0};
+    if (logs.fetch_add(1, std::memory_order_relaxed) < 8)
+        std::fprintf(stderr,
+                     "[mem-placement] persistent colour target (%.1f MiB) retained off "
+                     "device-local memory; recovery re-creates it when VRAM has room (#3905)\n",
+                     image.bytes / (1024.0 * 1024.0));
+}
+
+// #3905: a spilled colour target stays in system memory for as long as it is cached. When the
+// device-local heap has room again, evict idle spilled targets through the ordinary eviction path
+// (their pixels go to the eviction sink exactly as a budget eviction's do), so the next use
+// re-creates them device-local.
+inline void recover_spilled_persistent_color_targets(const RenderVkCtx& ctx,
+                                                     uint64_t current_generation) {
+    if (!persistent_color_target_spill_seen() || backend_has_unproven_submission()) return;
+    static prosper::gpu::SpillRecoveryState state;
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (!prosper::gpu::spill_recovery_due(state, now_ms, 1)) return;
+    auto& cache = persistent_color_target_cache();
+    uint64_t spilled = 0;
+    for (const auto& [key, image] : cache)
+        if (image.off_device) spilled += image.bytes;
+    if (!spilled) { persistent_color_target_spill_seen() = false; return; }
+    uint64_t allowance = render_spill_recovery_allowance(ctx, state, spilled);
+    uint64_t reclaimed = 0, entries = 0;
+    for (auto it = cache.begin(); allowance && it != cache.end();) {
+        if (it->second.off_device && it->second.bytes <= allowance &&
+            persistent_color_target_evictable(it->first, it->second, current_generation)) {
+            allowance -= it->second.bytes;
+            reclaimed += it->second.bytes;
+            ++entries;
+            it = evict_persistent_color_target_entry(ctx, it);
+        } else {
+            ++it;
+        }
+    }
+    if (!entries) return;
+    static uint64_t recoveries = 0;
+    ++recoveries;
+    if (recoveries <= 8 || std::has_single_bit(recoveries))
+        std::fprintf(stderr,
+                     "[mem-placement] persistent colour targets: recovery #%llu evicted %llu "
+                     "spilled target(s), %.1f MiB, to be re-created device-local on next use "
+                     "(%.1f MiB still off-device)\n",
+                     (unsigned long long)recoveries, (unsigned long long)entries,
+                     reclaimed / (1024.0 * 1024.0), (spilled - reclaimed) / (1024.0 * 1024.0));
 }
 
 // Transient allocations return to this pool only after their call or explicit submission batch has
@@ -3762,9 +4196,31 @@ inline RenderCommandPoolStats render_command_pool_stats() {
                                   cache.available.size()};
 }
 
-inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDeviceSize bytes,
-                                                       uint32_t memory_type) {
-    if (memory_type == UINT32_MAX) return VK_NULL_HANDLE;
+// Free every idle cached allocation of the render transient pool (#3902); returns how many.
+inline size_t release_idle_render_memory(VkDevice device) {
+    RenderMemoryPool& pool = render_memory_pool();
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    size_t released = 0;
+    for (auto& [key, allocations] : pool.available) {
+        (void)key;
+        for (VkDeviceMemory allocation : allocations) {
+            prosper::gpu::free_device_memory(device, allocation);
+            ++released;
+        }
+    }
+    pool.available.clear();
+    pool.cached_bytes = 0;
+    pool.cached_allocations = 0;
+    pool.discarded += released;
+    return released;
+}
+
+// Pooled device memory of exactly `memory_type`. Returns the driver's result (VK_SUCCESS for a pool
+// hit); `*out` is VK_NULL_HANDLE on any failure.
+inline VkResult allocate_transient_render_memory_status(VkDevice device, VkDeviceSize bytes,
+                                                        uint32_t memory_type, VkDeviceMemory* out) {
+    *out = VK_NULL_HANDLE;
+    if (memory_type == UINT32_MAX) return prosper::gpu::kNoCompatibleMemoryType;
     RenderMemoryKey key{bytes, memory_type};
     if (render_memory_pool_enabled()) {
         RenderMemoryPool& pool = render_memory_pool();
@@ -3778,7 +4234,8 @@ inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDevice
             --pool.cached_allocations;
             ++pool.hits;
             pool.active.emplace(memory, key);
-            return memory;
+            *out = memory;
+            return VK_SUCCESS;
         }
         ++pool.misses;
     }
@@ -3787,12 +4244,53 @@ inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDevice
     allocation.allocationSize = bytes;
     allocation.memoryTypeIndex = memory_type;
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    if (prosper::gpu::allocate_device_memory(device, &allocation, &memory) != VK_SUCCESS) return VK_NULL_HANDLE;
+    // #3902: under real heap pressure the pool's idle allocations are expendable -- release them
+    // and retry this same type once before the #3897 fallback moves on to system memory.
+    const VkResult status = prosper::gpu::allocate_releasing_pool_on_oom(
+        [&] { return prosper::gpu::allocate_device_memory(device, &allocation, &memory); },
+        [&]() -> size_t {
+            if (!render_memory_pool_enabled()) return 0;
+            const size_t released = release_idle_render_memory(device);
+            if (released) {
+                static std::atomic<uint32_t> logs{0};
+                if (logs.fetch_add(1, std::memory_order_relaxed) < 16)
+                    std::fprintf(stderr,
+                                 "[render] allocation of %llu bytes (type %u) ran out of device "
+                                 "memory; released %zu cached allocation(s) and retrying\n",
+                                 (unsigned long long)bytes, memory_type, released);
+            }
+            return released;
+        });
+    if (status != VK_SUCCESS) return status;
     if (render_memory_pool_enabled()) {
         RenderMemoryPool& pool = render_memory_pool();
         std::lock_guard<std::mutex> lock(pool.mutex);
         pool.active.emplace(memory, key);
     }
+    *out = memory;
+    return VK_SUCCESS;
+}
+
+inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDeviceSize bytes,
+                                                       uint32_t memory_type) {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    allocate_transient_render_memory_status(device, bytes, memory_type, &memory);
+    return memory;
+}
+
+// Pooled memory for a resource only the GPU touches: device-local first, and on
+// VK_ERROR_OUT_OF_DEVICE_MEMORY the next type `bits` allows (#3897). Each candidate type checks the
+// pool before asking the driver. VK_NULL_HANDLE when every candidate failed, as before.
+inline VkDeviceMemory allocate_transient_gpu_only_render_memory(
+        VkDevice device, prosper::gpu::GpuOnlyMemoryClass cls,
+        const VkPhysicalDeviceMemoryProperties& props, uint32_t bits, VkDeviceSize bytes) {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    prosper::gpu::allocate_gpu_only(
+        cls, props, bits, bytes,
+        [&](uint32_t type) {
+            return allocate_transient_render_memory_status(device, bytes, type, &memory);
+        },
+        prosper::gpu::force_gpu_only_oom(cls));
     return memory;
 }
 
@@ -3832,14 +4330,116 @@ inline RenderMemoryPoolStats render_memory_pool_stats() {
     return {pool.cached_bytes, pool.cached_allocations, pool.hits, pool.misses, pool.discarded};
 }
 
+// The lowest-indexed allowed type with all of `wanted`: for memory the CPU maps (explicit flags).
 inline uint32_t render_memory_type(VkPhysicalDevice phys, uint32_t bits,
                                    VkMemoryPropertyFlags wanted) {
     VkPhysicalDeviceMemoryProperties properties{};
     vkGetPhysicalDeviceMemoryProperties(phys, &properties);
-    for (uint32_t i = 0; i < properties.memoryTypeCount; ++i)
-        if ((bits & (1u << i)) &&
-            (properties.memoryTypes[i].propertyFlags & wanted) == wanted) return i;
-    return UINT32_MAX;
+    return prosper::gpu::find_memory_type(properties, bits, wanted);
+}
+
+// A resource only the GPU touches: a DEVICE_LOCAL type when one is allowed, retrying the other
+// allowed types on VK_ERROR_OUT_OF_DEVICE_MEMORY (#3888, #3897). `info.memoryTypeIndex` is set to
+// the type used; `*out` is VK_NULL_HANDLE on failure.
+inline VkResult render_allocate_gpu_only_memory(VkPhysicalDevice phys, VkDevice device,
+                                                prosper::gpu::GpuOnlyMemoryClass cls,
+                                                uint32_t bits, VkMemoryAllocateInfo& info,
+                                                VkDeviceMemory* out) {
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(phys, &properties);
+    return prosper::gpu::allocate_gpu_only_memory(device, cls, properties, bits, info, out);
+}
+
+// Reserve a renderer-owned destination for a byte-exact compute overwrite. The old contents are
+// never read. Do not evict here: a graphics batch may still refer to an unpinned target, whereas
+// the ordinary render path knows whether its batch has completed. Budget or allocation refusal
+// simply leaves compute's existing CPU-snapshot path in charge of the pixels.
+inline PersistentColorTargetImage* ensure_persistent_color_target_for_compute_overwrite(
+        uint64_t id, uint32_t width, uint32_t height, VkFormat format) {
+    const BackendPersistentResourceGuard guard;
+    if (!id || !width || !height || backend_has_unproven_submission()) return nullptr;
+    const RenderVkCtx& ctx = render_vk_ctx();
+    if (!ctx.ok) return nullptr;
+    format = backend_color_format(format);
+    const PersistentColorTargetKey key{id, width, height, format};
+    auto& cache = persistent_color_target_cache();
+    auto [found, inserted] = cache.try_emplace(key);
+    PersistentColorTargetImage& target = found->second;
+    if (target.image) return &target;
+    const auto fail = [&]() -> PersistentColorTargetImage* {
+        if (inserted) cache.erase(key);
+        return nullptr;
+    };
+    if (target.pin_count || target.memory || target.view || target.bytes) return fail();
+
+    VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = format;
+    image_info.extent = {width, height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImage image = VK_NULL_HANDLE;
+    if (vkCreateImage(ctx.dev, &image_info, nullptr, &image) != VK_SUCCESS || !image)
+        return fail();
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(ctx.dev, image, &requirements);
+    const VkDeviceSize limit = persistent_color_target_limit();
+    if (requirements.size > limit ||
+        persistent_color_target_bytes() > limit - requirements.size ||
+        cache.size() > persistent_color_target_count_ceiling(false)) {
+        vkDestroyImage(ctx.dev, image, nullptr);
+        return fail();
+    }
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = requirements.size;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (render_allocate_gpu_only_memory(
+            ctx.phys, ctx.dev, prosper::gpu::GpuOnlyMemoryClass::PersistentColorTarget,
+            requirements.memoryTypeBits, allocation, &memory) != VK_SUCCESS || !memory) {
+        vkDestroyImage(ctx.dev, image, nullptr);
+        return fail();
+    }
+    if (vkBindImageMemory(ctx.dev, image, memory, 0) != VK_SUCCESS) {
+        vkDestroyImage(ctx.dev, image, nullptr);
+        prosper::gpu::free_device_memory(ctx.dev, memory);
+        return fail();
+    }
+    VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view_info.image = image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = format;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageView view = VK_NULL_HANDLE;
+    if (vkCreateImageView(ctx.dev, &view_info, nullptr, &view) != VK_SUCCESS || !view) {
+        vkDestroyImage(ctx.dev, image, nullptr);
+        prosper::gpu::free_device_memory(ctx.dev, memory);
+        return fail();
+    }
+    target.image = image;
+    target.memory = memory;
+    target.view = view;
+    target.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    target.valid = false;
+    target.compute_overwrite_uninitialized = true;
+    target.bytes = requirements.size;
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(ctx.phys, &properties);
+    note_persistent_color_target_placement(target, properties, allocation.memoryTypeIndex);
+    target.registration = prosper::frontend::next_producer_identity();
+    target.mutation = 0;
+    target.completed_producer = {};
+    target.planned_batch = nullptr;
+    target.planned_ticket = {};
+    target.planned_producer = {};
+    target.valid_volume_slices.clear();
+    target.volume_guest_bytes = 0;
+    target.last_use = ++persistent_color_target_generation();
+    persistent_color_target_bytes() += requirements.size;
+    return &target;
 }
 
 // Storage-buffer contents are rewritten for every synchronous render call, but their Vulkan object
@@ -4754,6 +5354,25 @@ inline bool consume_render_texture_create_failure_once() {
     return true;
 }
 
+// #3901: one-shot "every memory type failed" for the next sampled-texture or depth-target memory
+// allocation -- since #3897 a real one needs VRAM AND the host types exhausted, which no test can
+// arrange. The site frees what it got and proceeds as if nothing could be allocated. The
+// production path never arms it.
+enum class RenderMemoryFailureSite : uint8_t { Texture, DepthTarget, Count };
+inline bool& render_memory_failure_once_storage(RenderMemoryFailureSite site) {
+    static thread_local bool armed[static_cast<size_t>(RenderMemoryFailureSite::Count)] = {};
+    return armed[static_cast<size_t>(site)];
+}
+inline void inject_render_memory_failure_once(RenderMemoryFailureSite site) {
+    render_memory_failure_once_storage(site) = true;
+}
+inline bool consume_render_memory_failure_once(RenderMemoryFailureSite site) {
+    bool& armed = render_memory_failure_once_storage(site);
+    if (!armed) return false;
+    armed = false;
+    return true;
+}
+
 // #3180: the COLOR-TARGET vkCreateImage sites, the milder siblings of #3045's two.
 //
 // Each of the six already guarded the HANDLE before touching it further (`if (!img) return out;`),
@@ -5220,6 +5839,11 @@ struct PersistentDsImage {
     uint64_t last_depth_write = 0;   // sampled-bridge recency (#1275)
     uint64_t last_depth_command_order = 0;
     uint64_t last_depth_present = UINT64_MAX;
+    // Highest DB_DEPTH_VIEW slice any pass attaching this identity ever programmed (inclusive,
+    // never lowered). The key carries only SLICE_START and the Vulkan image is one layer, so a
+    // guest view with SLICE_MAX > SLICE_START (a whole-array clear, layered rendering) writes
+    // layers no key names; this records that they were written (#3893 review).
+    uint32_t programmed_slice_max = 0;
 };
 
 inline uint64_t& persistent_ds_write_generation() {
@@ -6231,6 +6855,9 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
                                              VkFormat format, std::vector<uint8_t>& output,
                                              std::string& error, uint32_t volume_depth) {
     output.clear(); error.clear();
+    // #3891: a CPU readback of a GPU surface (outermost scope only; nested helpers are one event).
+    const prosper::diagnostics::perf::CostScope perf_readback(
+        prosper::diagnostics::perf::Cost::SurfaceReadback);
     if (backend_has_unproven_submission()) {
         error = "Vulkan submission completion is unproven";
         return false;
@@ -6418,10 +7045,12 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         VkDeviceMemory imem = VK_NULL_HANDLE;
         VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         iai.allocationSize = ir.size;
-        iai.memoryTypeIndex = render_memory_type(ctx.phys, ir.memoryTypeBits, 0);
+        iai.memoryTypeIndex = UINT32_MAX;   // set by the allocation below
         if (ir.size > limit || persistent_color_target_bytes() > limit - ir.size ||
             persistent_color_target_cache().size() > count_ceiling ||
-            prosper::gpu::allocate_device_memory(ctx.dev, &iai, &imem) != VK_SUCCESS || !imem) {
+            render_allocate_gpu_only_memory(
+                ctx.phys, ctx.dev, prosper::gpu::GpuOnlyMemoryClass::PersistentColorTarget,
+                ir.memoryTypeBits, iai, &imem) != VK_SUCCESS || !imem) {
             vkDestroyImage(ctx.dev, img, nullptr);
             persistent_color_target_cache().erase(dst_key);
             char buf[256];
@@ -6460,6 +7089,11 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         dst->mutation = 0;
         dst->completed_producer = {};
         dst->bytes = ir.size;
+        {
+            VkPhysicalDeviceMemoryProperties memp{};
+            vkGetPhysicalDeviceMemoryProperties(ctx.phys, &memp);
+            note_persistent_color_target_placement(*dst, memp, iai.memoryTypeIndex);
+        }
         persistent_color_target_bytes() += ir.size;
         dst->layout = VK_IMAGE_LAYOUT_UNDEFINED;
         src = find_persistent_color_target(src_id, width, height, format);
@@ -6570,6 +7204,7 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         // or LOAD the result. Public producer lineage remains empty until completion proves the copy.
         dst->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         dst->valid = true;
+        dst->compute_overwrite_uninitialized = false;
         queue_color_producer_completion(
             *submission_batch, *dst, copy_ticket, copied_producer);
         submission_batch->add_failure_cleanup(
@@ -6626,6 +7261,7 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
     cleanup();
     dst->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     dst->valid = true;
+    dst->compute_overwrite_uninitialized = false;
     if (color_producer_ticket_matches(*dst, copy_ticket))
         dst->completed_producer = copied_producer;
     return true;
@@ -6661,7 +7297,10 @@ struct PersistentDsDepthReadback {
     }
 
     bool acquire(PersistentDsImage& image, uint32_t width, uint32_t height,
-                 std::string& error) {
+                 VkImageAspectFlags aspects, std::string& error) {
+        // #3891: a CPU readback of a GPU surface (outermost scope only; nested helpers are one event).
+        const prosper::diagnostics::perf::CostScope perf_readback(
+            prosper::diagnostics::perf::Cost::SurfaceReadback);
         error.clear();
         if (!image.image || !image.layout_initialized || !image.depth_valid) {
             error = "retained DS image has no readable depth plane";
@@ -6675,7 +7314,7 @@ struct PersistentDsDepthReadback {
                                            buffer, memory, error))
             return false;
         const BackendSubmissionState transfer = submit_persistent_ds_transfer(
-            ctx, image.image, VK_IMAGE_ASPECT_DEPTH_BIT,
+            ctx, image.image, aspects,
             VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, width, height,
             /*depth=*/true, /*stencil=*/false, false, error);
@@ -6732,10 +7371,11 @@ inline bool mapped_depth_cube_payload_within_limit(uint32_t width, uint32_t heig
 }
 
 inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, uint32_t height,
-                                     std::vector<float>& out, std::string& error) {
+                                     VkImageAspectFlags aspects, std::vector<float>& out,
+                                     std::string& error) {
     out.clear();
     PersistentDsDepthReadback readback;
-    if (!readback.acquire(image, width, height, error)) return false;
+    if (!readback.acquire(image, width, height, aspects, error)) return false;
     out.resize(readback.count);
     std::memcpy(out.data(), readback.mapped, readback.count * sizeof(float));
     return true;
@@ -6743,26 +7383,252 @@ inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, u
 
 enum class PersistentDsDepthArrayStatus { NoIdentity, Ready, Unavailable };
 
+// Guest-authoritative layers of a retained depth array (#3893).
+//
+// A guest shadow-cascade array can have only SOME of its layers rendered as depth. Sonic Frontiers'
+// title and menus render cascade 0 of a 4 x 1024x1024 D32 array every frame and never attach
+// cascades 1-3 (no DS pass of any extent or format names those layers), then sample all four. The
+// bridge used to refuse the whole binding, which dropped two draws per flip.
+//
+// A layer that no retained DS identity can have written -- no identity's programmed slice span
+// (DB_DEPTH_VIEW SLICE_START..SLICE_MAX, see PersistentDsImage::programmed_slice_max) at any extent
+// or format, from this base or a rebased plane, touches its bytes -- has never been written by the
+// depth block in this process. Identities are never evicted (only a failed first creation erases
+// one), so "ever named" is permanent. prosper never writes rendered depth back to guest memory, so
+// for such a layer the only writer the guest can have used is one that does reach guest memory
+// (CPU, DMA, a copy, a compute write-back), and its guest bytes are exactly what the hardware would
+// sample. That is the whole admission rule. A layer that HAS been named -- valid or not -- keeps
+// the old refusal, because its guest bytes are stale relative to renderer-owned pixels.
+// Compressed (HTILE) arrays are excluded by the caller: their guest depth bytes are not the whole
+// story. A layer overlapping a live colour target is refused too (DepthArrayGuestSource::
+// renderer_owned). CONFIDENCE: MED-HIGH -- the rule follows from prosper's own write model. It
+// can be wrong only for a DS pass prosper never executed at all (so it never keyed the identity),
+// which was already wrong before this (the whole draw was dropped). A multi-slice DS view is NOT
+// such a case: its span is recorded even though the backend attaches one layer of it.
+// Guest-layer scans already made in one renderer callback. A binding set can name the same array
+// dozens of times per draw (Sonic Frontiers: ~43 bindings), and every selection and identity check
+// otherwise rescans each 4 MiB layer. The owner clears it whenever queued guest GPU writes drain
+// and at the end of its callback, so an entry never outlives a write prosper has observed.
+struct DepthArrayGuestScanMemo {
+    struct Entry {
+        const uint8_t* bytes = nullptr;
+        size_t size = 0;
+        bool uniform = false;
+        uint32_t word = 0;
+        uint64_t fingerprint = 0;
+    };
+    std::vector<Entry> entries;
+    uint64_t hits = 0, scans = 0;
+};
+
+struct DepthArrayGuestSource {
+    uint32_t tile_mode = 0;
+    uint64_t layer_stride = 0;   // guest bytes between layers; 0 disables guest layers
+    uint32_t row_pitch_bytes = 0;         // linear layers only; 0 = GFX10 sampled row pitch
+    // Captured guest bytes of the whole array starting at its base (replay/fixtures). When set,
+    // they are the guest bytes; guest memory is not consulted.
+    const uint8_t* host_data = nullptr;
+    size_t host_size = 0;
+    DepthArrayGuestScanMemo* memo = nullptr;   // optional; see DepthArrayGuestScanMemo
+    // Optional: true when [addr, addr+bytes) overlaps renderer-owned pixels its guest bytes do not
+    // show (a live colour target). Such a layer is refused rather than read from guest memory.
+    const std::function<bool(uint64_t, size_t)>* renderer_owned = nullptr;
+};
+
+struct DepthArrayGuestLayer {
+    uint32_t layer = 0;          // index relative to first_layer
+    uint64_t addr = 0;           // guest address of the layer
+    const uint8_t* bytes_ptr = nullptr;   // where its guest bytes are read from
+    size_t bytes = 0;            // footprint read
+    bool uniform = false;        // every 32-bit word equals `word`
+    uint32_t word = 0;
+    uint64_t fingerprint = 0;    // content hash, part of the snapshot memo identity
+};
+
+// One pass over a guest layer: a 4-lane content hash plus a uniform-word test. `bytes` is a
+// multiple of 32 for every tiled Float32 footprint (whole 4 KiB micro-tiles) and of 4 otherwise.
+inline uint64_t scan_guest_depth_layer(const uint8_t* p, size_t bytes, bool& uniform,
+                                       uint32_t& word) {
+    uniform = bytes >= 4;
+    word = 0;
+    if (bytes < 4) return 0;
+    std::memcpy(&word, p, 4);
+    const uint64_t splat = (static_cast<uint64_t>(word) << 32) | word;
+    uint64_t h[4] = {0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull,
+                     0x27d4eb2f165667c5ull};
+    uint64_t differ = 0;
+    size_t i = 0;
+    for (; i + 32 <= bytes; i += 32) {
+        uint64_t v[4];
+        std::memcpy(v, p + i, sizeof(v));
+        for (int lane = 0; lane < 4; ++lane) {
+            differ |= v[lane] ^ splat;
+            h[lane] = (h[lane] ^ v[lane]) * 0x100000001b3ull;
+        }
+    }
+    for (; i + 4 <= bytes; i += 4) {
+        uint32_t v;
+        std::memcpy(&v, p + i, 4);
+        differ |= v ^ word;
+        h[0] = (h[0] ^ v) * 0x100000001b3ull;
+    }
+    uniform = differ == 0;
+    return h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7) ^ bytes;
+}
+
+// Which requested layers are guest-authoritative, with their current content. A layer that some
+// retained identity names is never listed. Returns false, with `error` set, when a candidate
+// layer's guest bytes cannot be read. The caller holds BackendPersistentResourceGuard.
+inline bool collect_depth_array_guest_layers(uint64_t base, uint32_t width, uint32_t height,
+                                             uint32_t first_layer, uint32_t layer_count,
+                                             const DepthArrayGuestSource& source,
+                                             std::vector<DepthArrayGuestLayer>& out,
+                                             std::string& error) {
+    out.clear();
+    if (!source.layer_stride || !base || !width || !height || !layer_count) return true;
+    const bool tiled = prosper::gpu::tile_mode_is_tiled(source.tile_mode);
+    const size_t row_bytes = static_cast<size_t>(width) * sizeof(float);
+    const size_t pitch = tiled ? row_bytes
+        : (source.row_pitch_bytes ? source.row_pitch_bytes
+                                  : prosper::gpu::linear_sampled_row_pitch(width, sizeof(float)));
+    const size_t footprint = tiled
+        ? prosper::gpu::tiled_surface_bytes(width, height, source.tile_mode, 0, sizeof(float))
+        : pitch * (height - 1) + row_bytes;
+    // A layer is NAMED -- renderer-owned, never guest-sourced -- when any retained identity's
+    // programmed slice span can have written bytes inside it. Each identity plane P (read or
+    // write base) covers slices [key.slice, programmed_slice_max]; slice s occupies
+    // [P + s*stride, P + s*stride + w*h*4) with this array's stride, the only one known. For the
+    // array's own base that names exactly its programmed layers; a rebased plane, or one at another
+    // extent, names every layer its bytes can touch. Over-naming only keeps the old refusal.
+    std::vector<bool> named(layer_count, false);
+    const uint64_t first_addr = base + static_cast<uint64_t>(first_layer) * source.layer_stride;
+    const uint64_t end_addr = first_addr + static_cast<uint64_t>(layer_count) * source.layer_stride;
+    for (const auto& [key, image] : persistent_ds_cache()) {
+        const uint32_t last_slice = std::max(key.slice, image.programmed_slice_max);
+        // #3906: an identity of this array's own extent occupies exactly this array's layer
+        // footprint (tiled padding included). Any other identity's true layout is unknown, so pad
+        // it the way the colour-target check does: whole 256x256 texels, which covers any 64 KiB
+        // swizzle block. Over-naming only keeps the old refusal.
+        const uint64_t plane_bytes = key.w == width && key.h == height
+            ? std::max<uint64_t>(footprint, static_cast<uint64_t>(key.w) * key.h * sizeof(float))
+            : ((static_cast<uint64_t>(key.w) + 255u) & ~255ull) *
+                  ((static_cast<uint64_t>(key.h) + 255u) & ~255ull) * sizeof(float);
+        for (const uint64_t plane : {key.dr, key.dw}) {
+            if (!plane) continue;
+            for (uint64_t slice = key.slice; slice <= last_slice; ++slice) {
+                const uint64_t lo = plane + slice * source.layer_stride;
+                const uint64_t hi = lo + std::max<uint64_t>(plane_bytes, 1);
+                if (hi <= first_addr) continue;
+                if (lo >= end_addr) break;
+                const uint64_t from = lo <= first_addr ? 0 : (lo - first_addr) / source.layer_stride;
+                const uint64_t to = std::min<uint64_t>(layer_count,
+                    (std::min(hi, end_addr) - first_addr + source.layer_stride - 1) /
+                        source.layer_stride);
+                for (uint64_t layer = from; layer < to; ++layer) named[layer] = true;
+            }
+        }
+    }
+    for (uint32_t layer = 0; layer < layer_count; ++layer) {
+        if (named[layer]) continue;
+        DepthArrayGuestLayer guest;
+        guest.layer = layer;
+        guest.addr = first_addr + static_cast<uint64_t>(layer) * source.layer_stride;
+        guest.bytes = footprint;
+        if (source.renderer_owned && (*source.renderer_owned)(guest.addr, source.layer_stride)) {
+            error = "retained depth array guest layer overlaps a live color target";
+            return false;
+        }
+        if (pitch < row_bytes || !footprint || footprint > source.layer_stride ||
+            footprint > UINT32_MAX) {
+            error = "retained depth array guest layer footprint exceeds its layer stride";
+            return false;
+        }
+        if (source.host_data) {
+            const uint64_t offset = guest.addr - base;
+            if (offset > source.host_size || footprint > source.host_size - offset) {
+                error = "retained depth array guest layer is outside its captured bytes";
+                return false;
+            }
+            guest.bytes_ptr = source.host_data + offset;
+        } else {
+            if (!prosper::gpu::guest_readable(guest.addr, static_cast<uint32_t>(footprint))) {
+                error = "retained depth array guest layer is unreadable";
+                return false;
+            }
+            guest.bytes_ptr = reinterpret_cast<const uint8_t*>(guest.addr);
+        }
+        const DepthArrayGuestScanMemo::Entry* known = nullptr;
+        if (source.memo)
+            for (const auto& entry : source.memo->entries)
+                if (entry.bytes == guest.bytes_ptr && entry.size == footprint) {
+                    known = &entry;
+                    break;
+                }
+        if (known) {
+            guest.uniform = known->uniform;
+            guest.word = known->word;
+            guest.fingerprint = known->fingerprint;
+            ++source.memo->hits;
+        } else {
+            guest.fingerprint = scan_guest_depth_layer(guest.bytes_ptr, footprint, guest.uniform,
+                                                       guest.word);
+            if (source.memo) {
+                ++source.memo->scans;
+                if (source.memo->entries.size() < 64)
+                    source.memo->entries.push_back({guest.bytes_ptr, footprint, guest.uniform,
+                                                    guest.word, guest.fingerprint});
+            }
+        }
+        out.push_back(guest);
+    }
+    return true;
+}
+
+// Linear Float32 values of one guest layer, `width * height` floats at `dst`.
+inline void decode_depth_array_guest_layer(const DepthArrayGuestLayer& guest, uint32_t width,
+                                           uint32_t height, const DepthArrayGuestSource& source,
+                                           float* dst) {
+    const size_t count = static_cast<size_t>(width) * height;
+    if (guest.uniform) {
+        float value;
+        std::memcpy(&value, &guest.word, sizeof(value));
+        std::fill(dst, dst + count, value);
+        return;
+    }
+    if (prosper::gpu::tile_mode_is_tiled(source.tile_mode)) {
+        prosper::gpu::detile_surface(reinterpret_cast<uint8_t*>(dst), guest.bytes_ptr, width,
+                                     height, source.tile_mode, 0, sizeof(float));
+        return;
+    }
+    const size_t row_bytes = static_cast<size_t>(width) * sizeof(float);
+    const size_t pitch = source.row_pitch_bytes
+        ? source.row_pitch_bytes : prosper::gpu::linear_sampled_row_pitch(width, sizeof(float));
+    for (uint32_t y = 0; y < height; ++y)
+        std::memcpy(dst + static_cast<size_t>(y) * width, guest.bytes_ptr + y * pitch, row_bytes);
+}
+
 // Failure injection after N successful layer reads. Consumed by one array attempt only.
 inline int& depth_array_readback_failure_after_layers() {
     static thread_local int count = -1;
     return count;
 }
 
-// Gather a complete Float32 depth array without publishing a partial replacement. This bridge
-// deliberately declines incomplete retained identities; it does not yet combine retained layers
-// with guest-backed layers. A cache placeholder or guest-invalidated entry is not itself proof of
-// renderer authority. NoIdentity permits ordinary decoding when no retained identity is involved.
-// The caller must not already hold BackendPersistentResourceGuard (its mutex is not recursive).
-// Pass the ordered producer batch if it contains unsubmitted writes to these retained images.
-inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
+// Selection half of the retained depth-array bridge, shared by the CPU snapshot below and the
+// GPU-resident copy (tests/fixtures/retained_depth_array_gpu.h) so the two can never disagree about
+// which retained images a binding names or when it must be refused. The caller holds
+// BackendPersistentResourceGuard. `flush_producer` completes a pending producer batch first: the CPU
+// snapshot reads mapped memory after a fence and needs it, while a GPU copy recorded into the same
+// ordered batch is already queue-ordered after that producer and must not wait.
+inline PersistentDsDepthArrayStatus select_persistent_ds_depth_array(
         uint64_t base, uint32_t width, uint32_t height, uint32_t first_layer,
-        uint32_t layer_count, std::vector<float>& output, std::string& error,
-        BackendSubmissionBatch* producer_batch = nullptr) {
-    const BackendPersistentResourceGuard guard;
+        uint32_t layer_count, std::vector<PersistentDsImage*>& selected, uint32_t& format,
+        std::string& error, BackendSubmissionBatch* producer_batch, bool flush_producer,
+        const DepthArrayGuestSource* guest_source = nullptr,
+        std::vector<DepthArrayGuestLayer>* guest_layers = nullptr) {
     error.clear();
-    int fail_after = depth_array_readback_failure_after_layers();
-    depth_array_readback_failure_after_layers() = -1;
+    selected.clear();
+    if (guest_layers) guest_layers->clear();
+    format = VK_FORMAT_UNDEFINED;
     auto unavailable = [&](const char* reason) {
         error = reason;
         return PersistentDsDepthArrayStatus::Unavailable;
@@ -6790,15 +7656,14 @@ inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
         return unavailable("retained depth array exceeds snapshot byte limit");
     if (backend_has_unproven_submission())
         return unavailable("Vulkan submission completion is unproven");
-    if (producer_batch) {
+    if (producer_batch && flush_producer) {
         const auto submitted = producer_batch->submit_and_wait(ctx.dev, ctx.queue, false);
         if (submitted.submit_result != VK_SUCCESS || submitted.wait_result != VK_SUCCESS)
             return unavailable("retained depth array producer did not complete");
     }
 
-    std::vector<PersistentDsImage*> selected(layer_count, nullptr);
+    selected.assign(layer_count, nullptr);
     std::vector<bool> ambiguous(layer_count, false);
-    uint32_t format = VK_FORMAT_UNDEFINED;
     for (auto& [key, image] : persistent_ds_cache()) {
         if ((key.dr != base && key.dw != base) || key.w != width || key.h != height ||
             key.slice < first_layer || key.slice - first_layer >= layer_count)
@@ -6824,17 +7689,114 @@ inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
     }
     for (bool conflict : ambiguous)
         if (conflict) return unavailable("retained depth array has ambiguous layer identities");
-    for (const auto* image : selected)
+    // Layers no retained identity names are served from their guest bytes (#3893); see
+    // DepthArrayGuestSource. Only a caller that supplies both the source and the output opts in.
+    std::vector<DepthArrayGuestLayer> guest;
+    if (guest_source && guest_layers &&
+        std::find(selected.begin(), selected.end(), nullptr) != selected.end() &&
+        !collect_depth_array_guest_layers(base, width, height, first_layer, layer_count,
+                                          *guest_source, guest, error))
+        return PersistentDsDepthArrayStatus::Unavailable;
+    size_t next_guest = 0;
+    for (uint32_t layer = 0; layer < layer_count; ++layer) {
+        const PersistentDsImage* image = selected[layer];
+        if (!image && next_guest < guest.size() && guest[next_guest].layer == layer) {
+            ++next_guest;
+            continue;
+        }
         if (!image || !image->image || !image->layout_initialized || !image->depth_valid)
             return unavailable("retained depth array has missing or invalid layers");
+    }
+    // A guest layer that some identity names cannot be listed (collect excludes it), so every
+    // listed layer is one whose selection is empty; keep exactly those.
+    if (guest_layers) {
+        for (const auto& layer : guest)
+            if (!selected[layer.layer]) guest_layers->push_back(layer);
+    }
+    return PersistentDsDepthArrayStatus::Ready;
+}
+
+// Diagnostic: every retained DS identity naming `base`, whatever its shape, so a declined array
+// says which layers are missing and whether they exist at another extent/format. The caller holds
+// BackendPersistentResourceGuard.
+inline std::string describe_persistent_ds_depth_array_layers(uint64_t base, uint32_t width,
+                                                             uint32_t height,
+                                                             uint32_t layer_count,
+                                                             uint64_t layer_stride = 0) {
+    std::string out;
+    char line[256];
+    std::snprintf(line, sizeof(line), "want %ux%u x%u:", width, height, layer_count);
+    out += line;
+    std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, bool, bool, bool, uint64_t,
+                           uint64_t, uint64_t>> rows;
+    const uint64_t span = layer_stride * layer_count;
+    for (const auto& [key, image] : persistent_ds_cache()) {
+        const bool named = key.dr == base || key.dw == base;
+        const bool inside = span && key.dr > base && key.dr < base + span;
+        if (!named && !inside) continue;
+        rows.emplace_back(key.slice, key.w, key.h, key.fmt, image.image != VK_NULL_HANDLE,
+                          image.layout_initialized, image.depth_valid, image.last_depth_write,
+                          key.dr, key.dw);
+    }
+    std::sort(rows.begin(), rows.end());
+    for (const auto& [slice, w, h, fmt, has_image, init, valid, gen, dr, dw] : rows) {
+        std::snprintf(line, sizeof(line),
+                      " [s%u %ux%u fmt=%u img=%d init=%d valid=%d gen=%llu dr=%+lld dw=%+lld]",
+                      slice, w, h, fmt, int(has_image), int(init), int(valid),
+                      (unsigned long long)gen, (long long)(dr - base), (long long)(dw - base));
+        out += line;
+    }
+    if (rows.empty()) out += " (none)";
+    return out;
+}
+
+// Gather a complete Float32 depth array without publishing a partial replacement. This bridge
+// deliberately declines incomplete retained identities. With `guest_source`, a layer that NO
+// retained identity names is read from its guest bytes (see DepthArrayGuestSource, #3893); a named
+// layer is never. A cache placeholder or guest-invalidated entry is not itself proof of renderer
+// authority. NoIdentity permits ordinary decoding when no retained identity is involved.
+// The caller must not already hold BackendPersistentResourceGuard (its mutex is not recursive).
+// Pass the ordered producer batch if it contains unsubmitted writes to these retained images.
+inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
+        uint64_t base, uint32_t width, uint32_t height, uint32_t first_layer,
+        uint32_t layer_count, std::vector<float>& output, std::string& error,
+        BackendSubmissionBatch* producer_batch = nullptr,
+        const DepthArrayGuestSource* guest_source = nullptr) {
+    const BackendPersistentResourceGuard guard;
+    int fail_after = depth_array_readback_failure_after_layers();
+    // #3891: a CPU readback of a GPU surface (outermost scope only; nested helpers are one event).
+    const prosper::diagnostics::perf::CostScope perf_readback(
+        prosper::diagnostics::perf::Cost::SurfaceReadback);
+    depth_array_readback_failure_after_layers() = -1;
+    std::vector<PersistentDsImage*> selected;
+    std::vector<DepthArrayGuestLayer> guest_layers;
+    uint32_t format = VK_FORMAT_UNDEFINED;
+    const PersistentDsDepthArrayStatus selection = select_persistent_ds_depth_array(
+        base, width, height, first_layer, layer_count, selected, format, error, producer_batch,
+        /*flush_producer=*/true, guest_source, &guest_layers);
+    if (selection != PersistentDsDepthArrayStatus::Ready) return selection;
+    auto unavailable = [&](const char* reason) {
+        error = reason;
+        return PersistentDsDepthArrayStatus::Unavailable;
+    };
 
     const size_t layer_values = static_cast<size_t>(width) * height;
     std::vector<float> snapshot(layer_values * layer_count);
+    size_t next_guest = 0;
     for (uint32_t layer = 0; layer < layer_count; ++layer) {
         if (fail_after == 0)
             return unavailable("injected retained depth array readback failure");
+        if (!selected[layer]) {
+            // Selection guarantees an empty layer is exactly the next listed guest layer.
+            decode_depth_array_guest_layer(guest_layers[next_guest++], width, height,
+                                           *guest_source, snapshot.data() + layer * layer_values);
+            if (fail_after > 0) --fail_after;
+            continue;
+        }
         PersistentDsDepthReadback readback;
-        if (!readback.acquire(*selected[layer], width, height, error))
+        const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT |
+            (format == VK_FORMAT_D32_SFLOAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+        if (!readback.acquire(*selected[layer], width, height, aspects, error))
             return PersistentDsDepthArrayStatus::Unavailable;
         std::memcpy(snapshot.data() + layer * layer_values, readback.mapped,
                     layer_values * sizeof(float));
@@ -6850,6 +7812,7 @@ inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
 // guest memory for every missing face; its generation alone cannot validate a mixed cube.
 struct PersistentDsCubeSelection {
     std::array<PersistentDsImage*, 6> faces{};
+    std::array<VkImageAspectFlags, 6> aspects{};
     uint32_t present_mask = 0;
     uint32_t known_mask = 0;
     uint64_t overlay_version = 0;
@@ -6869,6 +7832,8 @@ inline PersistentDsCubeSelection select_persistent_ds_cube_depth(
             continue;
         if (!selected.faces[key.slice] || image.last_depth_write > recency[key.slice]) {
             selected.faces[key.slice] = &image;
+            selected.aspects[key.slice] = VK_IMAGE_ASPECT_DEPTH_BIT |
+                (key.fmt == VK_FORMAT_D32_SFLOAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
             recency[key.slice] = image.last_depth_write;
             selected.present_mask |= 1u << key.slice;
         }
@@ -6905,7 +7870,8 @@ inline bool acquire_persistent_ds_cube_depth(
             error = "injected later depth cube readback failure";
             return false;
         }
-        if (!faces[slice].acquire(*selected.faces[slice], width, height, error)) return false;
+        if (!faces[slice].acquire(*selected.faces[slice], width, height,
+                                  selected.aspects[slice], error)) return false;
         if (remaining > 0) --remaining;
     }
     // An incomplete selection cannot leave a test-only failure armed for an unrelated callback.
@@ -6954,7 +7920,8 @@ inline bool read_persistent_ds_cube_depth(uint64_t base, uint32_t width, uint32_
     for (uint32_t slice = 0; slice < 6u; ++slice) {
         PersistentDsImage* found = selected.faces[slice];
         if (!found) continue;
-        if (!read_persistent_ds_depth(*found, width, height, faces[slice], error)) return false;
+        if (!read_persistent_ds_depth(*found, width, height, selected.aspects[slice],
+                                      faces[slice], error)) return false;
         ++slices_found;
     }
     return slices_found != 0;
@@ -6981,6 +7948,8 @@ inline PersistentDsCubeSelection select_persistent_ds_cube_depth_after(
             continue;
         if (!selected.faces[key.slice] || image.last_depth_write > recency[key.slice]) {
             selected.faces[key.slice] = &image;
+            selected.aspects[key.slice] = VK_IMAGE_ASPECT_DEPTH_BIT |
+                (key.fmt == VK_FORMAT_D32_SFLOAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
             recency[key.slice] = image.last_depth_write;
             selected.present_mask |= 1u << key.slice;
             selected.overlay_version = std::max(
@@ -7014,7 +7983,7 @@ inline bool read_persistent_ds_cube_depth_after(
     for (uint32_t slice = 0; slice < 6u; ++slice) {
         if (!(present_mask & (1u << slice))) continue;
         if (!read_persistent_ds_depth(*selected.faces[slice], width, height,
-                                      faces[slice], error))
+                                      selected.aspects[slice], faces[slice], error))
             return false;
     }
     return true;
@@ -7131,12 +8100,13 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
         vkGetImageMemoryRequirements(ctx.dev, image.image, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex = render_memory_type(ctx.phys, requirements.memoryTypeBits, 0);
         VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         view_info.image = image.image; view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
         view_info.format = format; view_info.subresourceRange = {aspects, 0, 1, 0, 1};
-        if (allocation.memoryTypeIndex == UINT32_MAX ||
-            prosper::gpu::allocate_device_memory(ctx.dev, &allocation, &image.memory) != VK_SUCCESS ||
+        if (render_allocate_gpu_only_memory(ctx.phys, ctx.dev,
+                                            prosper::gpu::GpuOnlyMemoryClass::RestoredDepthTarget,
+                                            requirements.memoryTypeBits, allocation,
+                                            &image.memory) != VK_SUCCESS ||
             vkBindImageMemory(ctx.dev, image.image, image.memory, 0) != VK_SUCCESS ||
             vkCreateImageView(ctx.dev, &view_info, nullptr, &image.view) != VK_SUCCESS) {
             if (image.view) vkDestroyImageView(ctx.dev, image.view, nullptr);
@@ -7319,6 +8289,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         prosper::frontend::performance_timing_mode(
             timing_log_enabled, prosper::frontend::interactive_performance_timing());
     BackendTexturePathCensus texture_path_census(draws.size());
+    // Declared at the TOP of the body, not next to the draw loop. It reports this pass on every
+    // exit including the early returns below, and it times the pass -- and the first version of
+    // this sat ~2,200 lines lower, so it measured only the tail of each pass and under-reported
+    // the renderer's share of the run. Anything moving it down again silently reintroduces that.
+    const prosper::gpu::DrawDispositionPassScope draw_disposition_scope;
     const bool timing_enabled = timing_mode.measure;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     if (timing_enabled) backend_render_timing_stats_storage() = {};
@@ -7455,10 +8430,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     VkPhysicalDeviceMemoryProperties memp; vkGetPhysicalDeviceMemoryProperties(phys, &memp);
     init_persistent_color_target_device_budget(memp);   // size the residency budget once (#1177)
     init_persistent_texture_cache_device_budget(memp);
+    // Explicit-flags requests only (staging, readback, host-written buffers). GPU-only images go
+    // through prosper::gpu::allocate_gpu_only_memory / allocate_transient_gpu_only_render_memory,
+    // which prefer a DEVICE_LOCAL type and retry other allowed types when VRAM runs out (#3888,
+    // #3897).
     auto pick = [&](uint32_t bits, VkMemoryPropertyFlags want) -> uint32_t {
-        for (uint32_t i = 0; i < memp.memoryTypeCount; i++)
-            if ((bits & (1u << i)) && (memp.memoryTypes[i].propertyFlags & want) == want) return i;
-        return UINT32_MAX; };
+        return prosper::gpu::find_memory_type(memp, bits, want); };
     const bool use_color1 = out_rgba1 != nullptr ||
         (mrt_outputs && mrt_outputs->color_count > 1);
     const uint32_t color_count = mrt_outputs
@@ -7731,6 +8708,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // the producer image. The logical span is supplied only by the split wrapper below.
     const prosper::gpu::ResolvedPipelineState* identity = nullptr;
     bool logical_use_stencil = false;
+    // #3906: the widest DB_DEPTH_VIEW slice span over EVERY depth-using draw of the pass, not only
+    // the identity draw. Passes group by SLICE_START, so a later draw may program a wider
+    // SLICE_MAX (a narrow draw first, then a whole-array clear); its layers are renderer-written.
+    uint32_t pass_depth_slice_max = 0;
     for (const auto& d : logical_draws) {
         if (d.ps && (d.ps->stencil_enable ||
                      stencil_clear_effective(d.ps->stencil_clear_enable,
@@ -7742,8 +8723,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                      effective_depth_clear(d.ps) ||
                      stencil_clear_effective(d.ps->stencil_clear_enable, d.ps->stencil_enable,
                                              d.ps->stencil_write_mask[0],
-                                             d.ps->stencil_write_mask[1])) && !identity)
-            identity = d.ps;
+                                             d.ps->stencil_write_mask[1]))) {
+            if (!identity) identity = d.ps;
+            pass_depth_slice_max = std::max(pass_depth_slice_max,
+                                            ds_depth_view_slice_max(d.ps->db_depth_view));
+        }
     }
     if (getenv("PROSPER_NO_STENCIL")) logical_use_stencil = false;
     const bool has_ds_identity = identity && (identity->depth_read_base || identity->depth_write_base ||
@@ -7795,6 +8779,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             htile_identity = identity->stencil_read_base - 0x10000;
         ds_key = persistent_ds_key_for(*identity, htile_identity, W, H, (uint32_t)DFMT);
         cached_ds = &persistent_ds_cache()[ds_key];
+        cached_ds->programmed_slice_max = std::max({cached_ds->programmed_slice_max, ds_key.slice,
+            pass_depth_slice_max});
         // The key carries the PASS extent, so one guest depth surface reached through two passes of
         // different extent becomes two independent entries -- and the larger one's guest range is
         // sized from that extent, which is how a 512x512 shadow cascade acquires a 33 MB depth range
@@ -7948,6 +8934,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         auto [found, inserted] = persistent_color_target_cache().try_emplace(color_key);
         cached_color = &found->second;
+        cached_color->compute_overwrite_uninitialized = false;
         if (volume_color) {
             const uint64_t guest_bytes = color_target->volume_guest_bytes;
             if (cached_color->volume_guest_bytes && guest_bytes &&
@@ -7993,7 +8980,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         VkMemoryRequirements ir{}; vkGetImageMemoryRequirements(dev, img, &ir);
         VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        iai.allocationSize = ir.size; iai.memoryTypeIndex = pick(ir.memoryTypeBits, 0);
+        iai.allocationSize = ir.size;
         if (persistent_color) {
             const VkDeviceSize limit = persistent_color_target_limit();
             // NOTE: the unsigned `limit - ir.size` below is guarded by short-circuit ordering, not by the
@@ -8007,8 +8994,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (ir.size <= limit && persistent_color_target_cache().size() <=
                     persistent_color_target_count_ceiling(avoid_cache_eviction) &&
                 persistent_color_target_bytes() <= limit - ir.size &&
-                prosper::gpu::allocate_device_memory(dev, &iai, &imem) == VK_SUCCESS) {
+                prosper::gpu::allocate_gpu_only_memory(
+                    dev, prosper::gpu::GpuOnlyMemoryClass::ColorTarget, memp, ir.memoryTypeBits,
+                    iai, &imem) == VK_SUCCESS) {
                 cached_color->bytes = ir.size;
+                note_persistent_color_target_placement(*cached_color, memp, iai.memoryTypeIndex);
                 persistent_color_target_bytes() += ir.size;
             } else {
                 vkDestroyImage(dev, img, nullptr);
@@ -8024,11 +9014,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                               &img) != VK_SUCCESS)
                     return out;
                 vkGetImageMemoryRequirements(dev, img, &ir);
-                iai.allocationSize = ir.size; iai.memoryTypeIndex = pick(ir.memoryTypeBits, 0);
+                iai.allocationSize = ir.size;
             }
         }
         if (!imem)
-            imem = allocate_transient_render_memory(dev, iai.allocationSize, iai.memoryTypeIndex);
+            imem = allocate_transient_gpu_only_render_memory(
+                dev, prosper::gpu::GpuOnlyMemoryClass::ColorTarget, memp, ir.memoryTypeBits,
+                iai.allocationSize);
         VkImageViewCreateInfo ivci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         ivci.image = img;
         ivci.viewType = volume_color ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
@@ -8125,6 +9117,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         color_key1 = {color_target->persistent_id1, W, H, FMT1};
         auto [found, inserted] = persistent_color_target_cache().try_emplace(color_key1);
         cached_color1 = &found->second;
+        cached_color1->compute_overwrite_uninitialized = false;
         cached_color1->last_use = color_target_generation;
     }
 
@@ -8149,7 +9142,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkGetImageMemoryRequirements(dev, img1, &color1_requirements);
         VkMemoryAllocateInfo color1_allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         color1_allocation.allocationSize = color1_requirements.size;
-        color1_allocation.memoryTypeIndex = pick(color1_requirements.memoryTypeBits, 0);
         if (persistent_color1) {
             const VkDeviceSize limit = persistent_color_target_limit();
             while (!avoid_cache_eviction &&
@@ -8162,8 +9154,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_color_target_cache().size() <=
                     persistent_color_target_count_ceiling(avoid_cache_eviction) &&
                 persistent_color_target_bytes() <= limit - color1_requirements.size &&
-                prosper::gpu::allocate_device_memory(dev, &color1_allocation, &imem1) == VK_SUCCESS) {
+                prosper::gpu::allocate_gpu_only_memory(
+                    dev, prosper::gpu::GpuOnlyMemoryClass::ColorTarget1, memp,
+                    color1_requirements.memoryTypeBits, color1_allocation,
+                    &imem1) == VK_SUCCESS) {
                 cached_color1->bytes = color1_requirements.size;
+                note_persistent_color_target_placement(*cached_color1, memp,
+                                                       color1_allocation.memoryTypeIndex);
                 persistent_color_target_bytes() += color1_requirements.size;
             } else {
                 vkDestroyImage(dev, img1, nullptr);
@@ -8180,12 +9177,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     return out;
                 vkGetImageMemoryRequirements(dev, img1, &color1_requirements);
                 color1_allocation.allocationSize = color1_requirements.size;
-                color1_allocation.memoryTypeIndex = pick(color1_requirements.memoryTypeBits, 0);
             }
         }
         if (!imem1)
-            imem1 = allocate_transient_render_memory(
-                dev, color1_allocation.allocationSize, color1_allocation.memoryTypeIndex);
+            imem1 = allocate_transient_gpu_only_render_memory(
+                dev, prosper::gpu::GpuOnlyMemoryClass::ColorTarget1, memp,
+                color1_requirements.memoryTypeBits, color1_allocation.allocationSize);
         VkImageViewCreateInfo color1_view_ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         color1_view_ci.image = img1; color1_view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         color1_view_ci.format = FMT1;
@@ -8237,6 +9234,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             auto [found, inserted] = persistent_color_target_cache().try_emplace(extra_keys[slot]);
             (void)inserted;
             cached_extra[slot] = &found->second;
+            cached_extra[slot]->compute_overwrite_uninitialized = false;
             cached_extra[slot]->last_use = color_target_generation;
             extra_images[slot] = cached_extra[slot]->image;
             extra_memories[slot] = cached_extra[slot]->memory;
@@ -8264,7 +9262,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkGetImageMemoryRequirements(dev, extra_images[slot], &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex = pick(requirements.memoryTypeBits, 0);
         if (cached_extra[slot]) {
             const VkDeviceSize limit = persistent_color_target_limit();
             while (!avoid_cache_eviction &&
@@ -8277,8 +9274,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_color_target_cache().size() <=
                     persistent_color_target_count_ceiling(avoid_cache_eviction) &&
                 persistent_color_target_bytes() <= limit - requirements.size &&
-                prosper::gpu::allocate_device_memory(dev, &allocation, &extra_memories[slot]) == VK_SUCCESS) {
+                prosper::gpu::allocate_gpu_only_memory(
+                    dev, prosper::gpu::GpuOnlyMemoryClass::ExtraColorTarget, memp,
+                    requirements.memoryTypeBits, allocation,
+                    &extra_memories[slot]) == VK_SUCCESS) {
                 cached_extra[slot]->bytes = requirements.size;
+                note_persistent_color_target_placement(*cached_extra[slot], memp,
+                                                       allocation.memoryTypeIndex);
                 persistent_color_target_bytes() += requirements.size;
             } else {
                 // Over budget: drop back to a transient image for this slot, exactly as slot 1 does.
@@ -8294,12 +9296,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     return out;
                 vkGetImageMemoryRequirements(dev, extra_images[slot], &requirements);
                 allocation.allocationSize = requirements.size;
-                allocation.memoryTypeIndex = pick(requirements.memoryTypeBits, 0);
             }
         }
         if (!extra_memories[slot])
-            extra_memories[slot] = allocate_transient_render_memory(
-                dev, allocation.allocationSize, allocation.memoryTypeIndex);
+            extra_memories[slot] = allocate_transient_gpu_only_render_memory(
+                dev, prosper::gpu::GpuOnlyMemoryClass::ExtraColorTarget, memp,
+                requirements.memoryTypeBits, allocation.allocationSize);
         VkImageViewCreateInfo view_ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         view_ci.image = extra_images[slot]; view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         view_ci.format = color_formats[slot];
@@ -8386,11 +9388,49 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         VkMemoryRequirements dr; vkGetImageMemoryRequirements(dev, dimg, &dr);
         VkMemoryAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        dai.allocationSize = dr.size; dai.memoryTypeIndex = pick(dr.memoryTypeBits, 0);
-        if (cached_ds) prosper::gpu::allocate_device_memory(dev, &dai, &dmem);
-        else dmem = allocate_transient_render_memory(dev, dai.allocationSize,
-                                                      dai.memoryTypeIndex);
-        vkBindImageMemory(dev, dimg, dmem, 0);
+        dai.allocationSize = dr.size;
+        if (cached_ds)
+            prosper::gpu::allocate_gpu_only_memory(
+                dev, prosper::gpu::GpuOnlyMemoryClass::DepthTarget, memp, dr.memoryTypeBits, dai,
+                &dmem);
+        else dmem = allocate_transient_gpu_only_render_memory(
+                 dev, prosper::gpu::GpuOnlyMemoryClass::DepthTarget, memp, dr.memoryTypeBits,
+                 dai.allocationSize);
+        // #3901: every allowed memory type failed, or the bind failed. Binding VK_NULL_HANDLE is
+        // invalid usage and the unbound image would reach the framebuffer; drop the pass and tear
+        // the half-created target down, as the #3210 view failure below does.
+        if (dmem && consume_render_memory_failure_once(RenderMemoryFailureSite::DepthTarget)) {
+            if (cached_ds) prosper::gpu::free_device_memory(dev, dmem);
+            else release_transient_render_memory(dev, dmem);
+            dmem = VK_NULL_HANDLE;
+        }
+        const VkResult ds_bind_result = dmem ? vkBindImageMemory(dev, dimg, dmem, 0)
+                                             : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        if (ds_bind_result != VK_SUCCESS) {
+            static std::atomic<uint32_t> ds_memory_failure_logs{0};
+            if (ds_memory_failure_logs.fetch_add(1, std::memory_order_relaxed) < 32)
+                std::fprintf(stderr,
+                    "[ds-create-failed] %s result=%d bytes=%llu extent=%ux%u fmt=%d -- "
+                    "dropping the pass\n",
+                    dmem ? "vkBindImageMemory" : "no memory type could hold the depth target",
+                    (int)ds_bind_result, (unsigned long long)dai.allocationSize, W, H, (int)DFMT);
+            // The pass's draws were never seen by the per-draw loop: count them seen and dropped
+            // together so the census's two routes still agree.
+            prosper::gpu::draw_disposition_census().note_seen(draws.size());
+            for (size_t i = 0; i < draws.size(); ++i)
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::TargetMemory);
+            vkDestroyImage(dev, dimg, nullptr);
+            dimg = VK_NULL_HANDLE;
+            if (cached_ds) {
+                if (dmem) prosper::gpu::free_device_memory(dev, dmem);
+                persistent_ds_cache().erase(ds_key);
+            } else if (dmem) {
+                release_transient_render_memory(dev, dmem);
+            }
+            dmem = VK_NULL_HANDLE;
+            return out;
+        }
         VkImageViewCreateInfo dvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         dvci.image = dimg; dvci.viewType = VK_IMAGE_VIEW_TYPE_2D; dvci.format = DFMT;
         dvci.subresourceRange = {DASPECT, 0, 1, 0, 1};
@@ -8717,6 +9757,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkDeviceSize image_bytes = 0;
         bool persistent_hit = false;
         bool persistent_refresh = false;
+        // The staging buffer holds key.mip_levels guest levels (#3873): copy each, generate none.
+        bool guest_mip_levels = false;
         bool uniform_clear = false;
         VkClearColorValue uniform_color{};
         bool borrowed_target = false;
@@ -8745,6 +9787,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         bool borrowed_ds_feedback = false; // same image is this pass's read-only depth attachment
         VkFormat ds_format = VK_FORMAT_UNDEFINED;
         bool direct_memory = false;
+        bool off_device = false;   // #3905: the retained allocation landed off device-local memory
         std::vector<std::function<void(const uint8_t*, size_t)>> storage_writebacks;
         size_t last_binding_index = SIZE_MAX;
         TextureBindingKey last_binding_key{};
@@ -8781,12 +9824,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         uint64_t last_use = 0;
         uint64_t content_version = 0;
         bool content_valid = true;
+        // #3905: placed off device-local memory by the #3897 fallback; recovery evicts it.
+        bool off_device = false;
         std::unordered_map<TextureBindingKey, PersistentTextureBinding,
                            TextureBindingKeyHash> bindings;
     };
     static std::unordered_map<PersistentTextureKey, PersistentTextureImage,
                               PersistentTextureKeyHash> persistent_texture_images;
     static VkDeviceSize persistent_texture_bytes = 0;
+    // #3905: the subset of persistent_texture_bytes in NON-device-local memory. The budget refresh
+    // subtracts only the device-local share from the heap's usage, and recovery evicts these.
+    static VkDeviceSize persistent_texture_off_device_bytes = 0;
+    static prosper::gpu::SpillRecoveryState persistent_texture_spill_recovery;
     // Exact sum of each retained image's binding count. This domain is protected by the
     // BackendPersistentResourceGuard above; update on successful insertion/erasure, not on
     // content invalidation (which leaves the bindings resident until the image is retired).
@@ -8795,8 +9844,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     static uint64_t persistent_texture_generation = 0;
     constexpr size_t persistent_texture_max_entries = 1024;
     const uint64_t texture_generation = ++persistent_texture_generation;
+    // First generation recorded into the current ordered batch (#3873). Every resident image with
+    // last_use >= this floor may be referenced by a command buffer that has not completed yet.
+    static uint64_t persistent_texture_batch_floor = 0;
+    if (!active_submission.pending()) persistent_texture_batch_floor = texture_generation;
     const bool persistent_textures_enabled =
         getenv("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES") == nullptr;
+    refresh_persistent_texture_cache_device_budget(
+        ctx, persistent_texture_bytes - persistent_texture_off_device_bytes);
     const VkDeviceSize persistent_texture_limit = persistent_texture_cache_limit();
     texture_path_census.cache_before(persistent_texture_images.size(),
                                      persistent_texture_bytes, persistent_texture_limit);
@@ -8868,6 +9923,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (pressure_batch_result.submit_result != VK_SUCCESS ||
                 pressure_batch_result.wait_result != VK_SUCCESS) return out;
             avoid_cache_eviction = false;
+            persistent_texture_batch_floor = texture_generation;
             static std::atomic<uint64_t> pressure_flushes{0};
             const uint64_t count = pressure_flushes.fetch_add(1) + 1;
             if (count <= 16 || std::has_single_bit(count))
@@ -9332,6 +10388,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkDestroyPipelineLayout(dev, victim->second.handle, nullptr);
         persistent_pipeline_layouts.erase(victim);
         ++resource_reuse_stats.persistent_pipeline_layout_evictions;
+        prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::PipelineLayoutEvictions);  // #3891
         return true;
     };
     const bool descriptor_set_layout_cache_enabled = share_backend_resources &&
@@ -9351,6 +10408,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkDestroyDescriptorSetLayout(dev, victim->second.handle, nullptr);
         persistent_descriptor_set_layouts.erase(victim);
         ++resource_reuse_stats.persistent_descriptor_set_layout_evictions;
+        prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::DescriptorSetLayoutEvictions);  // #3891
         return true;
     };
     auto evict_pipeline = [&]() {
@@ -9364,6 +10422,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkDestroyPipeline(dev, victim->second.pipeline, nullptr);
         pipeline_cache.erase(victim);
         ++pipeline_stats.evictions;
+        prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::PipelineEvictions);  // #3891
         return true;
     };
     uint64_t descriptor_sets = 0;
@@ -9513,6 +10572,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     for (size_t di = 0; di < draws.size(); di++) {
         // Denominator: every draw this pass considers, recorded before any skip path can divert it.
         if (wave64_census) wave64_stats.note_draw(W, H);
+        prosper::gpu::draw_disposition_census().note_seen();
         const auto setup_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         const BackendDraw& bd = draws[di];
         const std::vector<uint32_t>& bd_vs = bd.vs_words();
@@ -9545,6 +10605,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 std::fprintf(stderr,
                     "[render] draw=%zu fragment Geometry capability unavailable; skipped\n", di);
                 texture_path_census.skipped_draw();
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::GeometryCapability);
                 continue;
             }
         }
@@ -9562,6 +10624,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     ctx.mesh_shader_properties.maxMeshWorkGroupTotalCount / groups_xy)) {
                 std::fprintf(stderr, "[mesh] draw=%zu unsupported device or group shape; skipped\n", di);
                 texture_path_census.skipped_draw();
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::MeshShape);
                 continue;
             }
             v.mesh_draw = true;
@@ -9820,6 +10884,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 wave64_stats.note_skip(W, H, reason_mask);
             }
             texture_path_census.skipped_draw();
+            prosper::gpu::draw_disposition_census().note_dropped(
+                prosper::gpu::DrawDrop::SubgroupFeatures);
             continue;
         }
         if (uses_internal_gds && !render_internal_gds_buffer().buffer) {
@@ -9829,6 +10895,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                              "[render] skip draw: failed to allocate persistent GDS buffer\n");
             });
             texture_path_census.skipped_draw();
+            prosper::gpu::draw_disposition_census().note_dropped(
+                prosper::gpu::DrawDrop::GdsAllocation);
             continue;
         }
         if (backend_trace) {
@@ -10690,6 +11758,35 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         // (T# extents are rejected above 16384 -> <= 15 levels).
                         if (tex_mip_levels > 16u) tex_mip_levels = 16u;
                     }
+                    // #3873: a native BCn texture brings its own guest levels in tex_rgba; they are
+                    // copied, never generated (a block format is not a blit destination).
+                    // The frontend's level count is not trusted blindly: the chain must fit the
+                    // readable bytes it published (tex_byte_size), or the upload falls back to
+                    // level 0 rather than reading past the end of the pixel buffer (#3883 review).
+                    bool guest_mip_chain = !r.is_storage_image && r.img_dim == 1 &&
+                        r.td == 1 && r.sample_count == 1u && r.tex_rgba &&
+                        !r.persistent_render_target_id && !r.persistent_depth_target_id &&
+                        !r.gpu_detile && !r.has_uniform_color && r.uploaded_mip_levels > 1u;
+                    if (guest_mip_chain) {
+                        uint32_t full = 1;
+                        for (uint32_t m = r.tw > r.th ? r.tw : r.th; m > 1; m >>= 1) full++;
+                        const uint32_t levels = std::min({r.uploaded_mip_levels, full, 16u});
+                        if (r.tex_byte_size >= backend_texture_chain_bytes(
+                                                   r.texture_format, r.tw, r.th, levels)) {
+                            tex_mip_levels = levels;
+                        } else {
+                            guest_mip_chain = false;
+                            static std::atomic<uint32_t> refused{0};
+                            if (refused.fetch_add(1, std::memory_order_relaxed) < 16)
+                                std::fprintf(stderr,
+                                    "[texture-upload] guest mip chain refused: %u levels of "
+                                    "%ux%u need %llu bytes, %zu readable -- uploading level 0\n",
+                                    levels, r.tw, r.th,
+                                    (unsigned long long)backend_texture_chain_bytes(
+                                        r.texture_format, r.tw, r.th, levels),
+                                    r.tex_byte_size);
+                        }
+                    }
                     // A DS-bridged resource shares the id slot: both are guest plane addresses, and
                     // pixels stays null for either direct bind, so distinct surfaces cannot collide.
                     std::array<uint32_t, 4> uniform_color_bits{};
@@ -10863,6 +11960,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 if (cached->second.memory)
                                     prosper::gpu::free_device_memory(dev, cached->second.memory);
                                 persistent_texture_bytes -= cached->second.bytes;
+                                if (cached->second.off_device)
+                                    persistent_texture_off_device_bytes -= cached->second.bytes;
                                 persistent_texture_binding_entries -= cached->second.bindings.size();
                                 persistent_texture_images.erase(cached);
                                 cached = persistent_texture_images.end();
@@ -10917,7 +12016,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                             VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                             (r.is_storage_image
                                                  ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u) |
-                                            (upload.key.mip_levels > 1
+                                            (upload.key.mip_levels > 1 && !guest_mip_chain
                                                  ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
                                 // #3045: the result used to be discarded here, so a device
                                 // rejecting the request (VK_ERROR_OUT_OF_DEVICE_MEMORY, or an
@@ -10946,6 +12045,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                             r.set, r.binding, (int)image_create_result,
                                             tci.extent.width, tci.extent.height, tci.extent.depth,
                                             tci.mipLevels, tci.arrayLayers, (int)tci.format);
+                                    // #3913 review: the upload is already in the pass's sharing
+                                    // index; a later draw of this pass sampling the same texture
+                                    // must retry, not reuse this dead entry.
+                                    if (share_texture_uploads) texture_upload_indices.erase(texture_key);
                                     buffer_resources_ready = false;
                                     break;
                                 }
@@ -10955,21 +12058,79 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 upload.image_bytes = tr.size;
                                 VkMemoryAllocateInfo tai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
                                 tai.allocationSize = tr.size;
-                                tai.memoryTypeIndex = pick(tr.memoryTypeBits, 0);
                                 const bool retain = !r.is_storage_image &&
                                     persistent_textures_enabled && upload.persistent_id &&
                                     tr.size <= persistent_texture_limit;
                                 if (retain &&
-                                    prosper::gpu::allocate_device_memory(dev, &tai, &upload.memory) ==
-                                        VK_SUCCESS)
+                                    prosper::gpu::allocate_gpu_only_memory(
+                                        dev, prosper::gpu::GpuOnlyMemoryClass::SampledTexture,
+                                        memp, tr.memoryTypeBits, tai, &upload.memory) ==
+                                        VK_SUCCESS) {
                                     upload.direct_memory = true;
+                                    upload.off_device = !prosper::gpu::memory_type_is_device_local(
+                                        memp, tai.memoryTypeIndex);
+                                    // #3873: the budget follows THIS heap from now on -- unless
+                                    // the #3897 fallback put this one texture in system memory,
+                                    // which says nothing about where the cache's textures live.
+                                    if (prosper::gpu::memory_type_is_device_local(
+                                            memp, tai.memoryTypeIndex))
+                                        persistent_texture_heap_index().store(
+                                            memp.memoryTypes[tai.memoryTypeIndex].heapIndex,
+                                            std::memory_order_relaxed);
+                                }
                                 if (!upload.memory) {
                                     if (retain) texture_path_census.retention_allocation_failed();
                                     upload.persistent_id = 0;
-                                    upload.memory = allocate_transient_render_memory(
-                                        dev, tai.allocationSize, tai.memoryTypeIndex);
+                                    upload.memory = allocate_transient_gpu_only_render_memory(
+                                        dev, prosper::gpu::GpuOnlyMemoryClass::SampledTexture,
+                                        memp, tr.memoryTypeBits, tai.allocationSize);
                                 }
-                                vkBindImageMemory(dev, upload.image, upload.memory, 0);
+                                // #3901: every allowed memory type failed (VRAM and, since
+                                // #3897, the host types too), or the bind itself failed. Binding
+                                // VK_NULL_HANDLE is invalid usage and the unbound image would reach
+                                // a descriptor; skip the draw like the vkCreateImage failure above.
+                                // The image is destroyed by the ordinary upload teardown.
+                                if (upload.memory && consume_render_memory_failure_once(
+                                        RenderMemoryFailureSite::Texture)) {
+                                    if (upload.direct_memory)
+                                        prosper::gpu::free_device_memory(dev, upload.memory);
+                                    else
+                                        release_transient_render_memory(dev, upload.memory);
+                                    upload.memory = VK_NULL_HANDLE;
+                                }
+                                const VkResult texture_bind_result = upload.memory
+                                    ? vkBindImageMemory(dev, upload.image, upload.memory, 0)
+                                    : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                                if (texture_bind_result != VK_SUCCESS) {
+                                    static std::atomic<uint32_t> texture_memory_failure_logs{0};
+                                    if (texture_memory_failure_logs.fetch_add(
+                                            1, std::memory_order_relaxed) < 32)
+                                        std::fprintf(
+                                            stderr,
+                                            "[texture-upload-failed] set=%u binding=%u %s "
+                                            "result=%d bytes=%llu extent=%ux%ux%u fmt=%d -- "
+                                            "skipping draw\n",
+                                            r.set, r.binding,
+                                            upload.memory ? "vkBindImageMemory"
+                                                          : "no memory type could hold the image",
+                                            (int)texture_bind_result,
+                                            (unsigned long long)tai.allocationSize,
+                                            tci.extent.width, tci.extent.height,
+                                            tci.extent.depth, (int)tci.format);
+                                    if (upload.memory) {
+                                        if (upload.direct_memory)
+                                            prosper::gpu::free_device_memory(dev, upload.memory);
+                                        else
+                                            release_transient_render_memory(dev, upload.memory);
+                                        upload.memory = VK_NULL_HANDLE;
+                                    }
+                                    upload.direct_memory = false;
+                                    upload.persistent_id = 0;
+                                    // Drop the dead upload from the pass's sharing index (above).
+                                    if (share_texture_uploads) texture_upload_indices.erase(texture_key);
+                                    buffer_resources_ready = false;
+                                    break;
+                                }
                             }
 
                             // #1272: staging carries level 0 only; levels 1..N-1 are produced on the
@@ -10992,10 +12153,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                           upload.uniform_color.float32);
                             } else if (!upload.feedback_snapshot &&
                                        !upload.assembled_target_mips && !upload.stacked_compute) {
-                                const VkDeviceSize tbytes =
-                                    static_cast<VkDeviceSize>(r.tw) * r.th * r.td *
-                                    r.sample_count *
-                                    backend_color_bytes_per_pixel(r.texture_format);
+                                // Block-granular for a native BCn texture: the frontend hands
+                                // over ceil(w/4)*ceil(h/4) blocks, which is also the tightly
+                                // packed layout the bufferRowLength=0 copy below reads.
+                                const VkDeviceSize tbytes = guest_mip_chain
+                                    ? backend_texture_chain_bytes(
+                                          r.texture_format, r.tw, r.th, tex_mip_levels)
+                                    : backend_texture_bytes(
+                                          r.texture_format, r.tw, r.th, r.td, r.sample_count);
+                                upload.guest_mip_levels = guest_mip_chain;
                                 VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                                 stci.size = tbytes;
                                 stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -11023,8 +12189,20 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 } else if (r.tex_rgba) {
                                     const auto copy_begin = texture_path_census.active()
                                         ? TimingClock::now() : TimingClock::time_point{};
-                                    parallel_render_memcpy(sp, r.tex_rgba,
-                                                           static_cast<size_t>(tbytes));
+                                    // A native BC texture publishes its readable byte count; never
+                                    // read beyond it (zero-fill instead). Every other path keeps the
+                                    // historical implicit-span contract.
+                                    const size_t readable =
+                                        backend_block_compressed_bytes(
+                                            backend_color_format(r.texture_format)) &&
+                                                r.tex_byte_size
+                                            ? std::min<size_t>(static_cast<size_t>(tbytes),
+                                                               r.tex_byte_size)
+                                            : static_cast<size_t>(tbytes);
+                                    parallel_render_memcpy(sp, r.tex_rgba, readable);
+                                    if (readable < tbytes)
+                                        std::memset(static_cast<uint8_t*>(sp) + readable, 0,
+                                                    static_cast<size_t>(tbytes) - readable);
                                     census_cpu_copy_bytes = tbytes;
                                     if (texture_path_census.active())
                                         census_cpu_copy_ms = std::chrono::duration<double, std::milli>(
@@ -11068,15 +12246,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 TimingClock::now() - census_prepare_begin).count();
                             row.cpu_copy_ms = census_cpu_copy_ms;
                             row.image_created = census_image_created;
-                            uint64_t logical = backend_color_bytes_per_pixel(r.texture_format);
-                            for (const uint64_t factor : {uint64_t(r.tw), uint64_t(r.th),
-                                                          uint64_t(r.td), uint64_t(r.sample_count)}) {
-                                if (factor && logical > UINT64_MAX / factor) {
-                                    row.extent_overflow = true;
-                                    logical = 0;
-                                    break;
-                                }
-                                logical *= factor;
+                            uint64_t logical = backend_texture_bytes(
+                                r.texture_format, r.tw, r.th, r.td, r.sample_count);
+                            if (logical == UINT64_MAX) {
+                                row.extent_overflow = true;
+                                logical = 0;
                             }
                             row.logical_extent = logical;
                             row.path = upload.persistent_hit ? "persistent_hit"
@@ -11510,6 +12684,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
             if (!buffer_resources_ready) {
                 texture_path_census.skipped_draw();
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::BufferResources);
                 continue;
             }
             const ResourcePhaseTimer phase_descriptor(timing_enabled, &res_descriptor_ms);
@@ -11906,6 +13082,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     setup_pipeline_ms += setup_elapsed_ms(
                         setup_resources_ready, setup_pipeline_key_ready);
                 texture_path_census.skipped_draw();
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::ShaderRejected);
                 continue;   // rejected SPIR-V -> skip this draw
             }
             st[0].module = v.vs;
@@ -11918,6 +13096,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
             VkResult pipeline_result;
             {
+                // #3891 shader-compile: one clock pair per pipeline-cache MISS (a hit never gets
+                // here), including the wait for the driver-cache lock, which is part of the stall.
+                const prosper::diagnostics::perf::CostScope perf_pipeline(
+                    prosper::diagnostics::perf::Cost::PipelineCreate);
                 std::lock_guard<std::timed_mutex> cache_lock(graphics_driver_cache_mutex());
                 pipeline_result = vkCreateGraphicsPipelines(
                     dev, ctx.driver_pipeline_cache, 1, &gp, nullptr, &v.pipe);
@@ -11927,6 +13109,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         "[backend-trace] draw=%zu create-pipeline end result=%d pipeline=%p\n",
                         di, (int)pipeline_result, (void*)v.pipe);
                 fflush(stderr);
+            }
+            if (pipeline_result != VK_SUCCESS) {
+                // The only place a draw that survived setup fails to reach the GPU. Disjoint from
+                // the six reasons above by construction: each of those `continue`s before here.
+                prosper::gpu::draw_disposition_census().note_dropped(
+                    prosper::gpu::DrawDrop::PipelineCreation);
             }
             if (pipeline_result == VK_SUCCESS) {
                 v.ok = true;
@@ -12001,20 +13189,30 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             ++texture_stats.gpu_detile_dispatches;
             texture_stats.gpu_detile_source_bytes += upload.gpu_detile->source_bytes;
         }
-        texture_stats.upload_bytes += static_cast<uint64_t>(upload.key.width) * upload.key.height *
-                                      upload.key.depth * upload.key.sample_count *
-                                      backend_color_bytes_per_pixel(upload.key.format);
+        texture_stats.upload_bytes += upload.guest_mip_levels
+            ? backend_texture_chain_bytes(upload.key.format, upload.key.width,
+                                          upload.key.height, upload.key.mip_levels)
+            : backend_texture_bytes(upload.key.format, upload.key.width, upload.key.height,
+                                    upload.key.depth, upload.key.sample_count);
     }
     texture_path_census.reached_resource_phase_end();
 
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     // Each bound color slot has its own readback contract. The caller can decline all CPU
     // color results, including the transient color attachment used by a depth-only live pass.
-    const bool readback_color0_wanted = prosper::frontend::is_color_target_readback_wanted(
-        color_target != nullptr,
+    // Attribute slot 0's effective request, including the caller's colour-result gate. A depth-only
+    // pass has no target object but requests no colour pixels; billing its extent as a readback
+    // would turn a potential copy size into fictitious traffic.
+    const auto readback_color0_reason = prosper::frontend::effective_color_target_readback_reason(
+        want_color_readback, color_target != nullptr,
         color_target ? color_target->persistent_id : 0,
         persistent_color,
         color_target ? color_target->readback : false);
+    prosper::diagnostics::note_readback_reason(
+        static_cast<prosper::diagnostics::ReadbackReasonSlot>(readback_color0_reason),
+        color_bytes[0]);
+    const bool readback_color0_wanted =
+        readback_color0_reason != prosper::frontend::ColorReadbackReason::NotWanted;
     const bool readback_color1_wanted = use_color1 &&
         prosper::frontend::is_color_target_readback_wanted(
             color_target != nullptr,
@@ -12040,7 +13238,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // is wanted, retain commands and resources in the existing submission batch. Persistent
     // attachment state is published speculatively for later LOAD/sample commands in that batch;
     // its failure cleanups invalidate the state if submission fails or the batch is discarded.
-    const bool readback_color0 = want_color_readback && readback_color0_wanted;
+    const bool readback_color0 = readback_color0_wanted;
     const bool readback_color1 = want_color_readback && readback_color1_wanted;
     const bool readback_requested = readback_color0 || readback_color1 ||
                                     (want_color_readback && readback_extra_wanted);
@@ -12397,6 +13595,24 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 0, upload.key.sample_count};
             vkCmdClearColorImage(cmd, upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                  &upload.uniform_color, 1, &range);
+        } else if (upload.guest_mip_levels) {
+            // #3873: one region per guest level, tightly packed and concatenated in the staging
+            // buffer (backend_texture_chain_bytes). bufferRowLength = 0 reads each level at its
+            // own extent, block-rounded for a BC format.
+            std::array<VkBufferImageCopy, 16> regions{};
+            VkDeviceSize offset = 0;
+            const uint32_t levels = std::min(upload.key.mip_levels, 16u);
+            for (uint32_t level = 0; level < levels; ++level) {
+                const uint32_t lw = std::max(upload.key.width >> level, 1u);
+                const uint32_t lh = std::max(upload.key.height >> level, 1u);
+                VkBufferImageCopy& region = regions[level];
+                region.bufferOffset = offset;
+                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+                region.imageExtent = {lw, lh, 1};
+                offset += backend_texture_bytes(upload.key.format, lw, lh);
+            }
+            vkCmdCopyBufferToImage(cmd, upload.staging, upload.image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, levels, regions.data());
         } else if (!upload.assembled_target_mips) {
             VkBufferImageCopy tc{};
             tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
@@ -12479,7 +13695,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // Each source level transitions DST->SRC before feeding the next; the final barrier below
         // then flips the whole chain to shader-read. RGBA8 linear-blit support is mandatory Vulkan.
         for (uint32_t l = 1; !upload.uniform_clear && !upload.assembled_target_mips &&
-             !upload.stacked_compute && !upload.feedback_snapshot &&
+             !upload.stacked_compute && !upload.feedback_snapshot && !upload.guest_mip_levels &&
              l < upload.key.mip_levels; l++) {
             VkImageMemoryBarrier bs{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             bs.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -12507,7 +13723,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                            VK_FILTER_LINEAR);
         }
         if (!upload.uniform_clear && !upload.assembled_target_mips &&
-            !upload.stacked_compute && !upload.feedback_snapshot &&
+            !upload.stacked_compute && !upload.feedback_snapshot && !upload.guest_mip_levels &&
             upload.key.mip_levels > 1) {
             // Levels 0..N-2 sit in TRANSFER_SRC after feeding the cascade; return them to
             // TRANSFER_DST so the single final-layout barrier below covers the whole chain.
@@ -12884,6 +14100,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 (dsc.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT))
                 backend_depth_clear_probe_armed_count().fetch_add(1);
         }
+        // NOT a census site. Every setup-loop drop `continue`s before `v.ok` is set, so those
+        // draws arrive here too and counting them would double-count each one -- once under its
+        // real reason and once as pipeline-creation, which would then absorb every other reason's
+        // population and make the self-validation report a NEGATIVE unaccounted value on a
+        // correctly accounted pass. A genuine pipeline-creation failure is counted where it
+        // happens, at the vkCreateGraphicsPipelines result below.
         if (!v.ok) continue;
         if (ds_active) {
             vkCmdBeginQuery(cmd, ds_stats_pool, static_cast<uint32_t>(di), 0);
@@ -12946,6 +14168,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             std::fprintf(stderr, "\n");
             std::fflush(stderr);
         }
+        prosper::gpu::draw_disposition_census().note_recorded();
         if (v.mesh_draw) {
             ctx.cmd_draw_mesh_tasks(cmd, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);
         } else if (v.icount) {
@@ -13389,25 +14612,64 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Publish newly uploaded exact-version textures before a later command buffer in the same batch
     // is recorded. The image upload and every consumer remain ordered in the eventual queue submit.
     // Do not evict while an earlier command buffer is pending: it may still reference the candidate.
+    // #3873: with earlier commands of this batch still pending, evict only images no pass of the
+    // batch has used, and retire them through the batch's completion cleanup.
+    const bool defer_texture_eviction = avoid_cache_eviction &&
+        persistent_texture_deferred_eviction_enabled() && active_submission.pending() &&
+        !backend_has_unproven_submission();
+    const bool texture_eviction_allowed = !avoid_cache_eviction || defer_texture_eviction;
+    // #3891 perf ledger: per-pass counts, flushed once after admission (texture-cache-thrash).
+    uint64_t perf_texture_evictions = 0, perf_texture_refusals = 0, perf_texture_refused_bytes = 0;
+    const uint64_t texture_protected_from = defer_texture_eviction
+        ? persistent_texture_batch_floor : texture_generation;
+    // `recovery`: a #3905 spill-recovery retirement, not cache pressure -- kept out of the
+    // eviction counters the texture-cache-thrash alarm and census read.
+    auto evict_persistent_texture_entry = [&](auto victim, bool deferred, bool recovery = false) {
+        if (deferred) {
+            std::vector<std::pair<VkImageView, VkSampler>> retired_bindings;
+            retired_bindings.reserve(victim->second.bindings.size());
+            for (const auto& [key, binding] : victim->second.bindings)
+                retired_bindings.emplace_back(binding.view, binding.sampler);
+            active_submission.add_cleanup(
+                [dev, image = victim->second.image, memory = victim->second.memory,
+                 retired_bindings = std::move(retired_bindings)]() {
+                    for (const auto& [view, sampler] : retired_bindings) {
+                        if (sampler) vkDestroySampler(dev, sampler, nullptr);
+                        if (view) vkDestroyImageView(dev, view, nullptr);
+                    }
+                    vkDestroyImage(dev, image, nullptr);
+                    prosper::gpu::free_device_memory(dev, memory);
+                });
+            if (!recovery) {
+                ++texture_stats.persistent_deferred_evictions;
+                texture_stats.persistent_deferred_eviction_bytes += victim->second.bytes;
+            }
+        } else {
+            for (const auto& [key, binding] : victim->second.bindings) {
+                if (binding.sampler) vkDestroySampler(dev, binding.sampler, nullptr);
+                if (binding.view) vkDestroyImageView(dev, binding.view, nullptr);
+            }
+            vkDestroyImage(dev, victim->second.image, nullptr);
+            prosper::gpu::free_device_memory(dev, victim->second.memory);
+        }
+        persistent_texture_bytes -= victim->second.bytes;
+        if (victim->second.off_device) persistent_texture_off_device_bytes -= victim->second.bytes;
+        persistent_texture_binding_entries -= victim->second.bindings.size();
+        persistent_texture_images.erase(victim);
+        if (recovery) return;
+        texture_path_census.evicted();
+        ++perf_texture_evictions;
+    };
     auto evict_persistent_texture = [&]() {
         auto victim = persistent_texture_images.end();
         for (auto it = persistent_texture_images.begin();
              it != persistent_texture_images.end(); ++it) {
-            if (it->second.last_use == texture_generation) continue;
+            if (it->second.last_use >= texture_protected_from) continue;
             if (victim == persistent_texture_images.end() ||
                 it->second.last_use < victim->second.last_use) victim = it;
         }
         if (victim == persistent_texture_images.end()) return false;
-        for (const auto& [key, binding] : victim->second.bindings) {
-            if (binding.sampler) vkDestroySampler(dev, binding.sampler, nullptr);
-            if (binding.view) vkDestroyImageView(dev, binding.view, nullptr);
-        }
-        vkDestroyImage(dev, victim->second.image, nullptr);
-        prosper::gpu::free_device_memory(dev, victim->second.memory);
-        persistent_texture_bytes -= victim->second.bytes;
-        persistent_texture_binding_entries -= victim->second.bindings.size();
-        persistent_texture_images.erase(victim);
-        texture_path_census.evicted();
+        evict_persistent_texture_entry(victim, defer_texture_eviction);
         return true;
     };
     for (auto& upload : texture_uploads) {
@@ -13418,7 +14680,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                        upload.key.depth, upload.key.img_dim,
                                        upload.key.sample_count, upload.key.mip_levels,
                                        upload.key.format};
-        while (!avoid_cache_eviction &&
+        while (texture_eviction_allowed &&
                (persistent_texture_images.size() >= persistent_texture_max_entries ||
                 (upload.image_bytes <= persistent_texture_limit &&
                  persistent_texture_bytes > persistent_texture_limit - upload.image_bytes)) &&
@@ -13430,6 +14692,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 key, PersistentTextureImage{upload.image, upload.memory, upload.image_bytes,
                                             texture_generation, upload.persistent_version, true});
             if (inserted) {
+                cached->second.off_device = upload.off_device;
+                if (upload.off_device) {
+                    persistent_texture_off_device_bytes += upload.image_bytes;
+                    static std::atomic<uint32_t> spill_logs{0};
+                    if (spill_logs.fetch_add(1, std::memory_order_relaxed) < 8)
+                        std::fprintf(stderr,
+                                     "[mem-placement] sampled-texture: retained a %.1f MiB "
+                                     "texture off device-local memory (%.1f MiB spilled in the "
+                                     "cache); recovery re-creates it when VRAM has room (#3905)\n",
+                                     upload.image_bytes / (1024.0 * 1024.0),
+                                     persistent_texture_off_device_bytes / (1024.0 * 1024.0));
+                }
                 texture_path_census.retention_inserted();
                 active_submission.add_failure_cleanup([key]() {
                     auto found = persistent_texture_images.find(key);
@@ -13447,11 +14721,63 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_texture_images.size() >= persistent_texture_max_entries,
                 upload.image_bytes > persistent_texture_limit ||
                 persistent_texture_bytes > persistent_texture_limit - upload.image_bytes);
+            // Refused for lack of ROOM, not for being larger than the whole budget: only the first
+            // is a cache that should have evicted.
+            if (upload.image_bytes <= persistent_texture_limit) {
+                ++perf_texture_refusals;
+                perf_texture_refused_bytes += upload.image_bytes;
+            }
         }
     }
-    if (!avoid_cache_eviction)
+    if (texture_eviction_allowed)
         while (persistent_texture_bytes > persistent_texture_limit &&
                evict_persistent_texture()) {}
+    // #3905: spilled textures do not move back to VRAM by themselves. When the device-local heap
+    // has room again, drop spilled ones from the cache so their next use re-uploads them
+    // device-local. A spilled texture is often a HOT one (used by every batch), which the LRU
+    // protection above would never release, so recovery ignores last_use and always retires the
+    // image through the batch's completion cleanup: this pass and earlier passes of the batch keep
+    // sampling the old image until the batch's fence, and nothing waits on the GPU.
+    // Recovery always retires through the completion cleanup, so it follows the same switch as
+    // deferred eviction (PROSPER_NO_DEFERRED_TEXTURE_EVICTION turns both off).
+    if (persistent_texture_off_device_bytes && !backend_has_unproven_submission() &&
+        persistent_texture_deferred_eviction_enabled()) {
+        uint64_t allowance = render_spill_recovery_allowance(
+            ctx, persistent_texture_spill_recovery, persistent_texture_off_device_bytes);
+        uint64_t reclaimed = 0, reclaimed_entries = 0;
+        for (auto it = persistent_texture_images.begin();
+             allowance && it != persistent_texture_images.end();) {
+            auto next = std::next(it);
+            if (it->second.off_device && it->second.bytes <= allowance) {
+                allowance -= it->second.bytes;
+                reclaimed += it->second.bytes;
+                ++reclaimed_entries;
+                evict_persistent_texture_entry(it, true, true);
+            }
+            it = next;
+        }
+        if (reclaimed_entries) {
+            static std::atomic<uint64_t> recoveries{0};
+            const uint64_t n = recoveries.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 8 || std::has_single_bit(n))
+                std::fprintf(stderr,
+                             "[mem-placement] sampled-texture: recovery #%llu retired %llu spilled "
+                             "texture(s), %.1f MiB, to be re-created device-local on next use "
+                             "(%.1f MiB still off-device)\n",
+                             (unsigned long long)n, (unsigned long long)reclaimed_entries,
+                             reclaimed / (1024.0 * 1024.0),
+                             persistent_texture_off_device_bytes / (1024.0 * 1024.0));
+        }
+    }
+    if (prosper::diagnostics::perf::enabled()) {
+        namespace perf = prosper::diagnostics::perf;
+        perf::add(perf::Counter::TextureCacheMisses, persistent_texture_misses);
+        perf::add(perf::Counter::TextureCacheRefusals, perf_texture_refusals);
+        perf::add(perf::Counter::TextureCacheRefusedBytes, perf_texture_refused_bytes);
+        perf::add(perf::Counter::TextureCacheEvictions, perf_texture_evictions);
+        perf::set(perf::Gauge::TextureCacheBytes, persistent_texture_bytes);
+        perf::set(perf::Gauge::TextureCacheLimit, persistent_texture_limit);
+    }
     texture_path_census.cache_after(persistent_texture_images.size(),
                                     persistent_texture_bytes);
     resource_reuse_stats.persistent_texture_binding_entries = persistent_texture_binding_entries;
@@ -14146,6 +15472,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                    (persistent_color_target_cache().size() > persistent_color_target_count_limit() ||
                     persistent_color_target_bytes() > persistent_color_target_limit()) &&
                    evict_persistent_color_target(*ctx_ptr, color_target_generation)) {}
+            recover_spilled_persistent_color_targets(*ctx_ptr, color_target_generation);
         });
     volume_attachment_view.release();
     if (flush_now) active_submission.complete();

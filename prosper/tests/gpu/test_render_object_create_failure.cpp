@@ -576,6 +576,81 @@ int main() {
         }
     }
 
+    // ---- #3901: no memory type could hold the depth target / the texture ---------------------
+    {
+        using prosper::test::RenderMemoryFailureSite;
+        printf("  -- #3901 depth-target and texture memory exhaustion --\n");
+        auto& census = prosper::gpu::draw_disposition_census();
+        const auto tm = prosper::gpu::DrawDrop::TargetMemory;
+        // Depth target: the pass is dropped (no frame), named, and counted as target-memory drops.
+        std::vector<uint8_t> ds_px;
+        const uint64_t tm_before = census.dropped(tm), seen_before = census.seen();
+        const std::string ds_log = capture_stderr("test_render_object_create_failure_dsmem.log", [&] {
+            prosper::test::BackendDraw d;
+            d.vs = vert; d.fs = red_fs; d.ps = &with_depth; d.vcount = 3;
+            prosper::test::inject_render_memory_failure_once(RenderMemoryFailureSite::DepthTarget);
+            ds_px = prosper::test::render_draws_rgba({d}, W, H, nullptr, black);
+        });
+        CHECK(has(ds_log, "[ds-create-failed] no memory type could hold the depth target "
+                          "result=-2"),
+              "depth-target memory: the failure names the missing memory and the VkResult");
+        CHECK(ds_px.empty(), "depth-target memory: the pass is dropped instead of binding null memory");
+        CHECK(census.dropped(tm) == tm_before + 1 && census.seen() == seen_before + 1,
+              "depth-target memory: the draw is counted seen and dropped as target-memory");
+        std::vector<uint8_t> ds_again;
+        (void)capture_stderr("test_render_object_create_failure_dsmem2.log", [&] {
+            prosper::test::BackendDraw d;
+            d.vs = vert; d.fs = red_fs; d.ps = &with_depth; d.vcount = 3;
+            ds_again = prosper::test::render_draws_rgba({d}, W, H, nullptr, black);
+        });
+        CHECK(center_red(ds_again) > 0xC0, "depth-target memory: one-shot; the next pass renders");
+
+        // Texture: the draw is skipped (the frame keeps its clear), and the failure is named.
+        std::vector<uint8_t> tex_px;
+        const std::string tex_log = capture_stderr("test_render_object_create_failure_texmem.log", [&] {
+            prosper::test::FrameResource r;
+            r.binding = 4; r.set = 1; r.tex_rgba = texels; r.tw = 2; r.th = 2;
+            prosper::test::BackendDraw d;
+            d.vs = vert; d.fs = tex_fs; d.ps = &opaque; d.R = {r}; d.vcount = 3;
+            prosper::test::inject_render_memory_failure_once(RenderMemoryFailureSite::Texture);
+            tex_px = prosper::test::render_draws_rgba({d}, W, H, nullptr, black);
+        });
+        CHECK(has(tex_log, "[texture-upload-failed] set=1 binding=4 no memory type could hold "
+                           "the image result=-2"),
+              "texture memory: the failure names the missing memory and the VkResult");
+        CHECK(tex_px.size() == static_cast<size_t>(W) * H * 4 && center_red(tex_px) < 0x20,
+              "texture memory: the draw is skipped instead of binding null memory");
+
+        // #3913 review: the failed upload was already in the pass's texture-sharing index. A SECOND
+        // draw of the same pass sampling the same texture must retry the upload (and render), not
+        // reuse the dead entry -- an image with no memory bound. Both upload failure paths.
+        for (const bool create_failure : {false, true}) {
+            std::vector<uint8_t> shared_px;
+            const std::string shared_log = capture_stderr(
+                create_failure ? "test_render_object_create_failure_texshare_create.log"
+                               : "test_render_object_create_failure_texshare_mem.log",
+                [&] {
+                    prosper::test::FrameResource r;
+                    r.binding = 4; r.set = 1; r.tex_rgba = texels; r.tw = 2; r.th = 2;
+                    prosper::test::BackendDraw d;
+                    d.vs = vert; d.fs = tex_fs; d.ps = &opaque; d.R = {r}; d.vcount = 3;
+                    if (create_failure)
+                        prosper::test::inject_render_texture_create_failure_once();
+                    else
+                        prosper::test::inject_render_memory_failure_once(
+                            RenderMemoryFailureSite::Texture);
+                    shared_px = prosper::test::render_draws_rgba({d, d}, W, H, nullptr, black);
+                });
+            CHECK(has(shared_log, "[texture-upload-failed]"),
+                  create_failure ? "shared texture (vkCreateImage): the first draw's upload failed"
+                                 : "shared texture (memory): the first draw's upload failed");
+            CHECK(shared_px.size() == static_cast<size_t>(W) * H * 4 && center_red(shared_px) > 0xC0,
+                  create_failure
+                      ? "shared texture (vkCreateImage): the second draw retries the upload and renders"
+                      : "shared texture (memory): the second draw retries the upload and renders");
+        }
+    }
+
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
     return fails ? 1 : 0;
 }

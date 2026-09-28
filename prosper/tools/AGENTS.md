@@ -266,7 +266,8 @@ capture/replay without requiring an importable system Python module.
     separate clock, so the two can be aimed at one phase but do not share a timebase.
     `PROSPER_DUMP_PERSISTENT` is deliberately **not** in the `live_gpu_targets` disable list, so it
     observes the normal persistent-GPU-target path;
-    `PROSPER_GPU_CAPTURE` **is**, so an env-triggered capture run is on the CPU-readback path.
+    since #3895 `PROSPER_GPU_CAPTURE` is not either (it reads back on demand for its one submit;
+    `PROSPER_GPU_CAPTURE_READBACK=1` restores the old whole-run readback path).
 - **`revision/check_build_revision.py`** — **is the binary you are about to quote a measurement from
   actually built from the code you think it is?** The failure it exists for is silent and produces a
   *confident* wrong answer: a lane checks out new work (or rebases onto a master that moved), runs

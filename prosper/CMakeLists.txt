@@ -167,8 +167,14 @@ add_test(NAME compute_authority_census_policy COMMAND test_compute_authority_cen
 # Do NOT read that as race coverage for the eight std::thread workers and their atomic combine:
 # `Host TSan` in .github/workflows/ci.yml configures `-S prosper/tools/doctor`, a separate CMake
 # project that does not build prosper, so this code is not under TSan.
-add_executable(test_compute_buffer_diff_span tests/shared/compute/test_compute_buffer_diff_span.cpp)
-target_include_directories(test_compute_buffer_diff_span PRIVATE frontends)
+# compute_buffer_bytes.hpp counts parallel-worker spawn volume, so it reaches into
+# src/diagnostics; any target including it needs `src` and that translation unit.
+add_executable(test_compute_buffer_diff_span tests/shared/compute/test_compute_buffer_diff_span.cpp
+               src/diagnostics/worker_spawn_census.cpp
+               src/diagnostics/exit_census.cpp
+               src/diagnostics/transfer_pressure.cpp
+               src/diagnostics/exit_reports.cpp)
+target_include_directories(test_compute_buffer_diff_span PRIVATE frontends src)
 find_package(Threads REQUIRED)
 target_link_libraries(test_compute_buffer_diff_span PRIVATE Threads::Threads)
 add_test(NAME compute_buffer_diff_span COMMAND test_compute_buffer_diff_span)
@@ -1422,6 +1428,12 @@ if(TARGET prosper_core)
   if(Python3_Interpreter_FOUND)
     add_test(NAME performance_capture_report_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_performance_capture_report.py")
+    add_test(NAME perf_f8_gap_logic
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_perf_f8_gap.py")
+    add_test(NAME schedstat_f8_logic
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_schedstat_f8.py")
+    add_test(NAME schedstat_probe_logic
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_schedstat_probe.py")
     add_test(NAME compare_capture_pair_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_capture_pair.py")
   endif()
@@ -1481,6 +1493,10 @@ if(TARGET prosper_core)
   add_executable(test_rtt_injection frontends/shared/tests/test_rtt_injection.cpp)
   target_include_directories(test_rtt_injection PRIVATE frontends)
   add_test(NAME rtt_injection COMMAND test_rtt_injection)
+
+  add_executable(test_volume_target_index frontends/shared/tests/test_volume_target_index.cpp)
+  target_include_directories(test_volume_target_index PRIVATE frontends)
+  add_test(NAME volume_target_index COMMAND test_volume_target_index)
 
   add_executable(test_buffer_range_plan frontends/shared/tests/test_buffer_range_plan.cpp)
   target_include_directories(test_buffer_range_plan PRIVATE tests)
@@ -1564,9 +1580,15 @@ if(TARGET prosper_core)
   set_tests_properties(decode_scratch_poisoned PROPERTIES
     ENVIRONMENT "PROSPER_DECODE_SCRATCH_POISON=1")
 
+  # The pool's reuse census reports at end of run through diagnostics/exit_reports, so this
+  # target needs `src` on its include path and that translation unit linked in.
   add_executable(test_cpu_rtt_snapshot_pool
-    frontends/shared/tests/test_cpu_rtt_snapshot_pool.cpp)
-  target_include_directories(test_cpu_rtt_snapshot_pool PRIVATE frontends)
+    frontends/shared/tests/test_cpu_rtt_snapshot_pool.cpp
+    src/diagnostics/exit_reports.cpp)
+  target_include_directories(test_cpu_rtt_snapshot_pool PRIVATE frontends src)
+  target_sources(test_cpu_rtt_snapshot_pool PRIVATE src/diagnostics/worker_spawn_census.cpp
+                                                    src/diagnostics/exit_census.cpp
+                                                    src/diagnostics/transfer_pressure.cpp)
   target_link_libraries(test_cpu_rtt_snapshot_pool PRIVATE Threads::Threads)
   add_test(NAME cpu_rtt_snapshot_pool COMMAND test_cpu_rtt_snapshot_pool)
 
@@ -1777,6 +1799,21 @@ if(TARGET prosper_core)
   add_executable(test_exit_reports tests/diagnostics/test_exit_reports.cpp)
   target_link_libraries(test_exit_reports PRIVATE prosper_core)
   add_test(NAME exit_reports COMMAND test_exit_reports)
+
+  # [perf-alarm] rules and engine (#3891). Every rule gets a window built by hand from the numbers
+  # measured before the fix it was written against (fires) and after it (quiet), plus a boundary
+  # arm; the engine arms pin window closing, per-rule log de-duplication, JSONL and the summary.
+  add_executable(test_perf_alarms tests/diagnostics/test_perf_alarms.cpp)
+  target_link_libraries(test_perf_alarms PRIVATE prosper_core)
+  add_test(NAME perf_alarms COMMAND test_perf_alarms)
+  # The rules' detail strings go through a printf-attributed format() helper; the attribute only
+  # checks anything under -Wformat, which prosper_core does not enable, so make a mismatch an ERROR
+  # for this one translation unit (the gpu_replay precedent below: GCC diagnoses this at plain
+  # -Wformat). Positive control: "%s" given an unsigned long long fails the build.
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(src/diagnostics/perf/perf_alarm_rules.cpp
+                                PROPERTIES COMPILE_OPTIONS "-Werror=format")
+  endif()
 
   # Diagnostics: disabled-path test — verifies stubs are zero-cost (always runs).
   add_executable(test_diagnostics_disabled tests/diagnostics/test_diagnostics_disabled.cpp)
@@ -2032,6 +2069,38 @@ if(TARGET prosper_core)
   target_include_directories(test_diag_ratelimit PRIVATE src)
   add_test(NAME diag_ratelimit COMMAND test_diag_ratelimit)
 
+  # Readback-reason policy: the verdict is expressed in terms of the reason, so a future edit
+  # cannot change what is counted without changing what is decided.
+  target_sources(test_cpu_rtt_snapshot_pool PRIVATE src/diagnostics/readback_reason_census.cpp)
+
+  # Transfer pressure: host bytes/second, default-on. Pins that categories stay separable, that a
+  # zero-byte call is not an event, and that an out-of-range category cannot corrupt a neighbour.
+  add_executable(test_transfer_pressure tests/gpu/diagnostics/test_transfer_pressure.cpp
+                 src/diagnostics/transfer_pressure.cpp
+                 src/diagnostics/exit_census.cpp
+                 src/diagnostics/exit_reports.cpp)
+  target_include_directories(test_transfer_pressure PRIVATE src)
+  add_test(NAME transfer_pressure COMMAND test_transfer_pressure)
+
+  # Classified draw disposition: six involuntary drop paths folded into one counter, two of them
+  # silent. Pins that a healthy pass stays quiet, that a drop names its mechanism, and that the
+  # census reports an unnamed drop path as UNACCOUNTED rather than absorbing it.
+  add_executable(test_draw_disposition tests/gpu/diagnostics/test_draw_disposition.cpp
+                 src/gpu/diagnostics/draw_disposition.cpp
+                 src/diagnostics/exit_census.cpp
+                 src/diagnostics/exit_reports.cpp)
+  target_include_directories(test_draw_disposition PRIVATE src)
+  add_test(NAME draw_disposition COMMAND test_draw_disposition)
+
+  # Pass-break classification: keeps the per-reason distribution separable, because the reason
+  # that ends the most passes is not the reason holding the mean down.
+  add_executable(test_pass_break_census tests/gpu/diagnostics/test_pass_break_census.cpp
+                 src/gpu/diagnostics/pass_break_census.cpp
+                 src/diagnostics/exit_census.cpp
+                 src/diagnostics/exit_reports.cpp)
+  target_include_directories(test_pass_break_census PRIVATE src)
+  add_test(NAME pass_break_census COMMAND test_pass_break_census)
+
   # IME keyboard event delivery (issue #1093): sceImeUpdate must invoke the guest handler
   # per queued key event; the old stub delivered none.
   add_executable(test_ime_input tests/hle/input/test_ime_input.cpp)
@@ -2237,6 +2306,23 @@ if(TARGET prosper_core)
   target_include_directories(test_gpu_memory_budget PRIVATE tests)   # fixtures/test_scratch.h
   target_link_libraries(test_gpu_memory_budget PRIVATE prosper_core)
   add_test(NAME gpu_memory_budget COMMAND test_gpu_memory_budget)
+
+  # #3873: the persistent texture cache's budget from VK_EXT_memory_budget headroom (pure policy).
+  add_executable(test_texture_cache_budget tests/gpu/memory/test_texture_cache_budget.cpp)
+  target_link_libraries(test_texture_cache_budget PRIVATE prosper_core)
+  add_test(NAME texture_cache_budget COMMAND test_texture_cache_budget)
+
+  # #3905: when spilled retained resources may be evicted to be re-created device-local (pure).
+  add_executable(test_spill_recovery tests/gpu/memory/test_spill_recovery.cpp)
+  target_link_libraries(test_spill_recovery PRIVATE prosper_core)
+  add_test(NAME spill_recovery COMMAND test_spill_recovery)
+
+  # #3888: GPU-only images/buffers prefer a DEVICE_LOCAL memory type (pure; Vulkan headers only).
+  if(TARGET Vulkan::Vulkan)
+    add_executable(test_memory_type_select tests/gpu/memory/test_memory_type_select.cpp)
+    target_link_libraries(test_memory_type_select PRIVATE prosper_core Vulkan::Vulkan)
+    add_test(NAME memory_type_select COMMAND test_memory_type_select)
+  endif()
 
   add_executable(test_rdna2_decode tests/gpu/recompiler/test_rdna2_decode.cpp)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
@@ -2538,6 +2624,19 @@ endif()
   add_executable(test_index_size_detect tests/gpu/execute/test_index_size_detect.cpp)
   target_link_libraries(test_index_size_detect PRIVATE prosper_core)
   add_test(NAME index_size_detect COMMAND test_index_size_detect)
+
+  # 16-bit index expansion: equivalence against the retained (uncalled) AVX2 kernel and the
+  # PROT_NONE mapping edge. Header-only, links nothing, and needs no Vulkan — registered here
+  # rather than beside the GPU-execution tests so a host without Vulkan still runs it.
+  add_executable(test_index_expand tests/gpu/execute/test_index_expand.cpp)
+  target_include_directories(test_index_expand PRIVATE src)
+  add_test(NAME index_expand COMMAND test_index_expand)
+
+  # Per-program compute dispatch facts are memoized by exact bytes and replay the probe's diagnostic
+  # side effects; needs prosper_core but no Vulkan device.
+  add_executable(test_compute_program_facts tests/gpu/execute/test_compute_program_facts.cpp)
+  target_link_libraries(test_compute_program_facts PRIVATE prosper_core)
+  add_test(NAME compute_program_facts COMMAND test_compute_program_facts)
 
   # shader_histo: data-driven recompiler-coverage report over the game's real embedded RDNA2 shaders.
   add_executable(shader_histo tools/shader_histo/shader_histo.cpp)
@@ -3007,8 +3106,18 @@ endif()
       target_link_libraries(boot_trace PRIVATE Vulkan::Vulkan)
       target_compile_definitions(boot_trace PRIVATE PROSPER_HAVE_VULKAN=1)
       add_library(prosper_live_renderer STATIC frontends/shared/live/live_renderer.cpp
+                                               frontends/shared/live/submit_renderer/draw_resources.cpp
+                                               frontends/shared/live/submit_renderer/timing_report.cpp
+                                               frontends/shared/live/submit_renderer/backend_draws.cpp
+                                               frontends/shared/live/submit_renderer/backend_timing.cpp
+                                               frontends/shared/live/submit_renderer/per_target_passes.cpp
+                                               frontends/shared/live/submit_renderer/resolve_pass.cpp
+                                               frontends/shared/live/submit_renderer/pass_diagnostics.cpp
+                                               frontends/shared/live/submit_renderer/callback_prelude.cpp
+                                               frontends/shared/live/submit_renderer/callback_diagnostics.cpp
                                                frontends/shared/live/live_compute.cpp
-                                               frontends/shared/present/present_blit.cpp)
+                                               frontends/shared/present/present_blit.cpp
+                                               frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
       target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan
                                                    prosper_performance_capture)
@@ -3053,6 +3162,10 @@ endif()
                COMMAND test_game_compute_rtt_mirror)
       set_tests_properties(game_compute_rtt_destination_mirror_no_rgba16 PROPERTIES
         ENVIRONMENT "PROSPER_NO_RGBA16_COMPUTE_RTT_MIRROR=1")
+      add_test(NAME game_compute_rtt_destination_mirror_no_read_alias
+               COMMAND test_game_compute_rtt_mirror)
+      set_tests_properties(game_compute_rtt_destination_mirror_no_read_alias PROPERTIES
+        ENVIRONMENT "PROSPER_NO_COMPUTE_RTT_READ_ALIAS=1")
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
@@ -3315,8 +3428,18 @@ endif()
       # boot_trace so BOTH boot_trace and prosper-app register the SAME renderer instead of
       # duplicating it. Needs render_runner.h (tests/) and refvs.inc (tools/boot_trace/).
       add_library(prosper_live_renderer STATIC frontends/shared/live/live_renderer.cpp
+                                               frontends/shared/live/submit_renderer/draw_resources.cpp
+                                               frontends/shared/live/submit_renderer/timing_report.cpp
+                                               frontends/shared/live/submit_renderer/backend_draws.cpp
+                                               frontends/shared/live/submit_renderer/backend_timing.cpp
+                                               frontends/shared/live/submit_renderer/per_target_passes.cpp
+                                               frontends/shared/live/submit_renderer/resolve_pass.cpp
+                                               frontends/shared/live/submit_renderer/pass_diagnostics.cpp
+                                               frontends/shared/live/submit_renderer/callback_prelude.cpp
+                                               frontends/shared/live/submit_renderer/callback_diagnostics.cpp
                                                frontends/shared/live/live_compute.cpp
-                                               frontends/shared/present/present_blit.cpp)
+                                               frontends/shared/present/present_blit.cpp
+                                               frontends/shared/present/compute_scanout.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
       target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan
                                                    prosper_performance_capture)
@@ -3410,12 +3533,21 @@ endif()
       add_test(NAME depth_cube_source_snapshot COMMAND test_depth_cube_source_snapshot)
       add_test(NAME depth_cube_source_snapshot_control COMMAND test_depth_cube_source_snapshot --control)
       add_test(NAME depth_cube_source_snapshot_scalar COMMAND test_depth_cube_source_snapshot)
+      # These arms assert the CPU cube bridge's cache and snapshot accounting, so they pin the
+      # CPU route; the GPU route for fully retained cubes has its own test below.
       set_tests_properties(depth_cube_source_snapshot PROPERTIES
-        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1")
+        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_GPU_DEPTH_CUBE=1")
       set_tests_properties(depth_cube_source_snapshot_control PROPERTIES
-        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_CUBE_SOURCE_SNAPSHOT_PRUNING=1")
+        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_CUBE_SOURCE_SNAPSHOT_PRUNING=1;PROSPER_NO_GPU_DEPTH_CUBE=1")
       set_tests_properties(depth_cube_source_snapshot_scalar PROPERTIES
-        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_DEPTH_CUBE_SIMD=1")
+        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_DEPTH_CUBE_SIMD=1;PROSPER_NO_GPU_DEPTH_CUBE=1")
+      # GPU-resident retained depth cube (#3873): bit-exact against the CPU bridge, the conversion's
+      # out-of-range domain, and live-renderer routing; --control pins PROSPER_NO_GPU_DEPTH_CUBE=1.
+      add_executable(test_depth_cube_gpu tests/shared/live/test_depth_cube_gpu.cpp)
+      target_include_directories(test_depth_cube_gpu PRIVATE frontends src tests)
+      target_link_libraries(test_depth_cube_gpu PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME depth_cube_gpu COMMAND test_depth_cube_gpu)
+      add_test(NAME depth_cube_gpu_control COMMAND test_depth_cube_gpu --control)
       add_executable(test_depth_array_source_snapshot tests/shared/live/test_depth_array_source_snapshot.cpp)
       target_include_directories(test_depth_array_source_snapshot PRIVATE frontends src tests)
       target_link_libraries(test_depth_array_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
@@ -3426,6 +3558,15 @@ endif()
         COMMAND test_depth_array_source_snapshot --expanded-control)
       add_test(NAME depth_array_source_snapshot_expanded_per_draw_control
         COMMAND test_depth_array_source_snapshot --expanded-control --per-draw-control)
+      # The same checks through the GPU-resident retained-array copy (#3873): identical sampled
+      # pixels, zero CPU upload, and GPU-copied bytes matching the compact/expanded representation.
+      add_test(NAME depth_array_source_snapshot_gpu COMMAND test_depth_array_source_snapshot --gpu)
+      add_test(NAME depth_array_source_snapshot_gpu_per_draw_control
+        COMMAND test_depth_array_source_snapshot --gpu --per-draw-control)
+      add_test(NAME depth_array_source_snapshot_gpu_expanded_control
+        COMMAND test_depth_array_source_snapshot --gpu --expanded-control)
+      add_test(NAME depth_array_source_snapshot_gpu_expanded_per_draw_control
+        COMMAND test_depth_array_source_snapshot --gpu --expanded-control --per-draw-control)
       add_test(NAME backend_texture_path_census_budget
         COMMAND test_depth_array_source_snapshot --texture-path-census-budget)
       # Windows environment APIs erase a variable assigned the empty string, so this distinct
@@ -3451,15 +3592,27 @@ endif()
       add_executable(test_decoder_source_snapshot tests/shared/live/test_decoder_source_snapshot.cpp)
       target_include_directories(test_decoder_source_snapshot PRIVATE frontends src tests)
       target_link_libraries(test_decoder_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      # This test's BC1 arm pins the CPU DECODER's source-snapshot contract, so it keeps the decoder
+      # even on a device that samples BCn natively (#3873; native BC is test_native_bc_upload's).
       add_test(NAME decoder_source_snapshot COMMAND test_decoder_source_snapshot)
+      set_tests_properties(decoder_source_snapshot PROPERTIES
+        ENVIRONMENT "PROSPER_NO_NATIVE_BC=1")
       add_test(NAME decoder_source_snapshot_control COMMAND test_decoder_source_snapshot --control)
       set_tests_properties(decoder_source_snapshot_control PROPERTIES
-        ENVIRONMENT "PROSPER_NO_DECODE_SOURCE_SNAPSHOT_REUSE=1")
+        ENVIRONMENT "PROSPER_NO_DECODE_SOURCE_SNAPSHOT_REUSE=1;PROSPER_NO_NATIVE_BC=1")
       if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME decoder_source_snapshot_watch COMMAND test_decoder_source_snapshot --watch)
         set_tests_properties(decoder_source_snapshot_watch PROPERTIES
-          ENVIRONMENT "PROSPER_TEXTURE_WRITE_WATCH_MIN_KB=1")
+          ENVIRONMENT "PROSPER_TEXTURE_WRITE_WATCH_MIN_KB=1;PROSPER_NO_NATIVE_BC=1")
       endif()
+      # #3873: native BCn sampled upload against the CPU decoder, with the opt-out as control.
+      add_executable(test_native_bc_upload tests/shared/live/test_native_bc_upload.cpp)
+      target_include_directories(test_native_bc_upload PRIVATE frontends src tests)
+      target_link_libraries(test_native_bc_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME native_bc_upload COMMAND test_native_bc_upload)
+      add_test(NAME native_bc_upload_decoder_control COMMAND test_native_bc_upload --decoder)
+      set_tests_properties(native_bc_upload_decoder_control PROPERTIES
+        ENVIRONMENT "PROSPER_NO_NATIVE_BC=1")
       add_executable(test_texture_preparation tests/shared/live/test_texture_preparation.cpp)
       target_include_directories(test_texture_preparation PRIVATE frontends src tests)
       target_link_libraries(test_texture_preparation PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
@@ -3543,6 +3696,10 @@ endif()
                COMMAND test_game_compute_rtt_mirror)
       set_tests_properties(game_compute_rtt_destination_mirror_no_rgba16 PROPERTIES
         ENVIRONMENT "PROSPER_NO_RGBA16_COMPUTE_RTT_MIRROR=1")
+      add_test(NAME game_compute_rtt_destination_mirror_no_read_alias
+               COMMAND test_game_compute_rtt_mirror)
+      set_tests_properties(game_compute_rtt_destination_mirror_no_read_alias PROPERTIES
+        ENVIRONMENT "PROSPER_NO_COMPUTE_RTT_READ_ALIAS=1")
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
@@ -3811,6 +3968,18 @@ endif()
           --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB
           PROSPER_RENDER_TIMING=1
           $<TARGET_FILE:test_texture_sample_render> --cache-pressure)
+      # #3873: a full resident-texture cache admits a new image while an ordered batch is pending,
+      # retiring the idle victim through the batch completion. The opt-out arm pins the old skip.
+      add_test(NAME backend_texture_deferred_eviction COMMAND ${CMAKE_COMMAND} -E env
+          --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB
+          --unset=PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH
+          --unset=PROSPER_NO_DEFERRED_TEXTURE_EVICTION
+          $<TARGET_FILE:test_texture_sample_render> --deferred-eviction)
+      add_test(NAME backend_texture_deferred_eviction_optout COMMAND ${CMAKE_COMMAND} -E env
+          --unset=PROSPER_BACKEND_TEXTURE_CACHE_MB
+          --unset=PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH
+          PROSPER_NO_DEFERRED_TEXTURE_EVICTION=1
+          $<TARGET_FILE:test_texture_sample_render> --deferred-eviction)
 
       # Multi-draw backend: N draws composited into ONE cleared-once framebuffer (red opaque + green
       # additive -> yellow center proves accumulation into a single target).
@@ -4542,9 +4711,9 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   target_include_directories(test_gpu_detile_render PRIVATE tests frontends)
   target_link_libraries(test_gpu_detile_render PRIVATE prosper_live_renderer Vulkan::Vulkan)
   add_test(NAME gpu_detile_render COMMAND test_gpu_detile_render)
-  set_tests_properties(gpu_detile_render PROPERTIES ENVIRONMENT "PROSPER_GPU_CAPTURE=1")
+  set_tests_properties(gpu_detile_render PROPERTIES ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1")
   add_test(NAME gpu_detile_render_pressure COMMAND test_gpu_detile_render --staging-pressure)
-  set_tests_properties(gpu_detile_render_pressure PROPERTIES ENVIRONMENT "PROSPER_GPU_CAPTURE=1;PROSPER_MAPPED_STAGING_MB=4")
+  set_tests_properties(gpu_detile_render_pressure PROPERTIES ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_MAPPED_STAGING_MB=4")
   add_executable(test_gpu_detile_storage tests/gpu/execute/test_gpu_detile_storage.cpp)
   target_include_directories(test_gpu_detile_storage PRIVATE tests frontends)
   target_link_libraries(test_gpu_detile_storage PRIVATE prosper_live_renderer Vulkan::Vulkan)
@@ -4554,7 +4723,7 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   set_tests_properties(gpu_detile_storage_unshared PROPERTIES ENVIRONMENT "PROSPER_NO_BACKEND_TEXTURE_SHARE=1")
   set_tests_properties(gpu_detile_storage_cpu PROPERTIES ENVIRONMENT "PROSPER_NO_GPU_DETILE_2D=1")
   add_test(NAME gpu_detile_render_cpu_2d COMMAND test_gpu_detile_render)
-  set_tests_properties(gpu_detile_render_cpu_2d PROPERTIES ENVIRONMENT "PROSPER_GPU_CAPTURE=1;PROSPER_NO_GPU_DETILE_2D=1")
+  set_tests_properties(gpu_detile_render_cpu_2d PROPERTIES ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_NO_GPU_DETILE_2D=1")
   add_executable(test_broadcast_htile_clear tests/gpu/execute/test_broadcast_htile_clear.cpp)
   target_include_directories(test_broadcast_htile_clear PRIVATE tests frontends)
   target_link_libraries(test_broadcast_htile_clear PRIVATE prosper_live_renderer Vulkan::Vulkan)
@@ -5033,6 +5202,15 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
   target_include_directories(test_present_blit PRIVATE src tests)
   target_link_libraries(test_present_blit PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
   add_test(NAME present_blit COMMAND test_present_blit)
+
+  # #3915: a display buffer written by a compute storage store is presented through GPU present from
+  # a mirror of the dispatch's own result, byte-identical to the CPU fallback, and never after the
+  # guest bytes change. Real device, real HLE VideoOut registration, real guest write watch.
+  add_executable(test_compute_scanout tests/shared/present/test_compute_scanout.cpp)
+  target_include_directories(test_compute_scanout PRIVATE frontends src tests)
+  target_link_libraries(test_compute_scanout PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
+  add_test(NAME compute_scanout_present COMMAND test_compute_scanout)
+  set_tests_properties(compute_scanout_present PROPERTIES TIMEOUT 120)
   add_test(NAME present_blit_trace COMMAND test_present_blit)
   set_tests_properties(present_blit_trace PROPERTIES
     ENVIRONMENT "PROSPER_PRESENT_HANDOFF_TRACE=1")

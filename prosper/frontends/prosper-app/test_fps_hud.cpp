@@ -150,6 +150,16 @@ int main() {
     CHECK(fps_window_due(10.0, 11.0, 1.0), "the window is due exactly at the boundary");
     CHECK(fps_window_due(10.0, 40.0, 1.0), "a long gap is due");
 
+    // #3891 phase 4: the alarm marker. Present exactly when a rule is active, naming it; absent
+    // otherwise, so a healthy run's HUD is unchanged.
+    CHECK(fps_alarm_line(0, "").empty(), "no active alarm: no marker line");
+    CHECK(fps_alarm_line(0, "dropped-draws").empty(),
+          "a zero count wins over stale text: no marker");
+    CHECK(fps_alarm_line(2, "dropped-draws,host-copy-pressure") ==
+              "! alarm: dropped-draws,host-copy-pressure",
+          "active alarms: one '!' line naming every active rule");
+    CHECK(fps_alarm_line(1, nullptr).empty(), "a null name list is not dereferenced");
+
     std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
     return fails ? 1 : 0;
 }

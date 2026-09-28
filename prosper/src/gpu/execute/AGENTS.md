@@ -15,6 +15,26 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
 - `gpu_execute.hpp` — the shared contracts, including **`SrtUse`**: a descriptor use recovered by the
   const-fold, keyed by the `s_load` immediate byte offset. Read this before assuming prosper cannot
   see a descriptor channel.
+- `index_expand` — the guest's validated 16-bit index range widened to the 32-bit indices the
+  backend uploads, and the maximum that sizes the vertex buffer. Two things about it are easy to
+  get wrong and both are load-bearing. The maximum must be reduced from the **same** loaded values
+  that are stored, because the guest may be rewriting the buffer concurrently and the caller sizes
+  an allocation from the returned maximum. And the read must stop exactly at `count`: the range is
+  validated only as `guest_readable(addr, n * esz)`, so a legitimate draw can end on a mapping
+  edge, which `tests/gpu/execute/test_index_expand.cpp` drives against a `PROT_NONE` page.
+  The AVX2 kernel beside it is **not** an optimization and **nothing in the emulator calls it** —
+  the portable loop is already auto-vectorized, and given the same ISA the compiler produces a
+  wider loop than the intrinsics do. It survives only so that `test_index_expand --bench` keeps
+  the falsifying A/B executable; see `docs/OUTER_WILDS_STATUS.md` § Ruled out before spending any
+  time here. `PROSPER_INDEX_EXPAND_STATS=1` reports the index volume that would have to be large
+  for any of this to matter.
+- `compute_program_facts` — what a compute dispatch needs to know about its PROGRAM (decoded
+  stream, native-multiwave preference, GDS use), memoized per exact program bytes so a program
+  dispatched thousands of times is analyzed once. Anything derived from the dispatch's resource
+  table or registers does not belong here: the cache key is the program alone. The probe's
+  reject-reason records are replayed on every hit, so adding a fact whose derivation has another
+  side effect means capturing and replaying that too. `PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE=1`
+  restores per-dispatch derivation for A/B.
 - `gpu_dependency_graph` — ordering and dependencies between submitted work.
 - `host_read_barrier` — the availability half of a GPU→CPU readback: the `HOST_READ`/`HOST_BIT`
   dependency that a fence wait does **not** perform (#2944/#3249). Header-only and deliberately

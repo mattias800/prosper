@@ -184,10 +184,15 @@ The standing warnings that are **not** title-specific:
   final 76 s after `Media/level2`/`level6` stream in, so 156 is the median of a declining sample.
   Every regime survives the comparison — the slowest third is still several times the July figure —
   and the advice above survives with it: this title is nowhere near being the thing to optimise.
+- **Read the `[perf-alarm]` lines and the `[perf-alarm] summary` at exit before anything else in a
+  run log.** They are always on (#3891, `src/diagnostics/perf/`): each names a cost or a
+  correctness loss (dropped draws and skipped dispatches, with the site that dropped them), its size
+  against the title's own frame budget, and the next instrument to reach for. `--fps` shows
+  `! alarm: <rule>` while one is active. How to read them: `src/diagnostics/AGENTS.md`.
 - **Before quoting an FPS number from this project, check which harness produced it — and when.**
   Three ways to get a wrong one, and a single run can hit all three:
   - **`tools/screenshot` never calls `set_gpu_present_active`** (the sole call site is
-    `frontends/prosper-app/main.cpp:668`), so in that harness the renderer copies every scanout frame
+    `frontends/prosper-app/main.cpp:694`), so in that harness the renderer copies every scanout frame
     back to the CPU. Its rate describes the forced-readback path, not the shipped one. **This applies
     only to figures measured after 2026-07-24** — before #1270 there was no GPU-present path, so
     every harness took the readback and the old figures are honest measurements of what then shipped.

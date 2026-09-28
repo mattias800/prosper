@@ -136,6 +136,18 @@ bool sampled_msaa_fetch_shape_supported(const prosper::gpu::ShaderResource& reso
 // their existing materialization until those shapes have their own upload contracts.
 bool native_r11_sampled_upload_supported(const prosper::gpu::ShaderResource& resource);
 
+// Native BCn sampled upload (#3873): the Vulkan format (as its numeric VkFormat value) a guest BCn
+// texture of this SHAPE uploads as when the device can sample it, or 0 when it keeps the CPU
+// decoder. Only plain single-surface 2D textures qualify: cube, volume, array, compressed (DCC) and
+// non-Texture resources keep decoding. A texture declaring a mip chain qualifies only with
+// `allow_declared_mips`: the backend cannot blit-generate levels for a block format, so the renderer
+// passes it only when the guest's OWN chain can be placed and uploaded
+// (shader_resource_block_mip_chain_plan); any other chain keeps the decoder's generated levels. Views stay UNORM even for sRGB T#s (NOTE(#263) in
+// render_runner.h). BC6H UF16 maps to BC6H_UFLOAT and therefore keeps its HDR range, where the
+// decoder clamps to UNORM8. Signed variants never reach the renderer (gen5_image_format skips them).
+uint32_t native_bc_sampled_format(const prosper::gpu::ShaderResource& resource,
+                                  bool allow_declared_mips);
+
 // Reconstruct the independently addressable CB_COLOR identities belonging to a sampled thin-2D
 // mip chain. Tiled allocations are tail-first/reverse: level zero is generally not the allocation
 // base, while every packed-tail level shares that base. The result describes address layout only;

@@ -14,6 +14,7 @@
 #include "diagnostics/env_cache.hpp"         // PROSPER_ENV_ON / _VALUE: process-lifetime reads
 #include "diagnostics/env_submit.hpp"        // PROSPER_ENV_ON_PER_SUBMIT: re-sampled each submit
 #include "gpu/pm4/command_processor.hpp"   // GpuState
+#include "gpu/execute/index_expand.hpp"    // validated 16-bit index copy and maximum
 #include "gpu/state/render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "gpu/pm4/pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
 #include <cstring>                 // memcpy: aliasing-safe index-buffer fingerprint loads
@@ -1303,6 +1304,41 @@ bool read_live_render_target(uint64_t gpu_addr, LiveTargetSnapshot& snapshot);
 // evicting the entry mid-dispatch. Handles stay opaque so this layer keeps no Vulkan dependency.
 struct LiveTargetImageImport {
     enum class Kind : uint8_t { Color, Depth };
+    // WHY a failed import failed. Every decline in the renderer's importer used to be a bare
+    // `return false`, so a consumer could report only that the renderer "would not hand it over"
+    // -- and the consumer's fallback is a full CPU round trip of the image, per dispatch. Measured
+    // on one title: 7,929 such fallbacks moving 28.2 GiB in 74 s, with no way to tell which of the
+    // importer's twelve declines produced them.
+    //
+    // This rides back on the out-param rather than living in a side census so the reason is exact
+    // per CALL SITE. The importer has two callers with different requests, and a process-wide
+    // counter would mix them.
+    enum class Refusal : uint8_t {
+        None = 0,          // not refused (or never asked)
+        NoImporter,        // no renderer registered an importer at all
+        DirectBindDisabled,// PROSPER_NO_DIRECT_RTT_BIND
+        NoRttEntry,        // this address is not a known render target
+        ZeroExtent,
+        VolumeDepth,       // 3D target; image import is a 2D contract
+        UnmappedFormat,    // backend format has no LiveTargetPixelFormat
+        TexelOverflow,
+        CpuOnlyAuthority,  // the renderer holds these pixels on the CPU, not on the GPU
+        NoAuthority,       // the entry survives with identity/metadata alone
+        NoRenderContext,
+        NoPersistentImage, // no retained GPU allocation for this target, or an undefined layout
+        PinRefused,        // the persistent-target cache would not pin it
+        PinKeyMismatch,
+        ImporterReturnedInvalid,
+        // Destination-borrow only. The borrow never reads the old image, so it has no authority
+        // requirement -- these are the shape checks that stand between a compute result and the
+        // renderer's device image.
+        ExtentMismatch,
+        FormatMismatch,
+        DeviceMismatch, // a compute-only device cannot own a renderer allocation
+        DestinationCreationRefused, // no room or Vulkan allocation/setup failed; CPU path remains
+        Count,
+    };
+    Refusal refusal = Refusal::None;
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
     Kind kind = Kind::Color;
@@ -1311,7 +1347,10 @@ struct LiveTargetImageImport {
     uint32_t native_format = 0;
     void* image = nullptr;    // VkImage owned by the live renderer
     void* device = nullptr;   // VkDevice it belongs to; the caller must be running on that device
-    uint32_t layout = 0;      // VkImageLayout the renderer left it in -- restore it after the dispatch
+    uint32_t layout = 0;      // VkImageLayout to leave after the dispatch
+    // A destination-only borrow may allocate an image whose contents and layout are undefined.
+    // Its full overwrite starts from UNDEFINED and finishes in `layout`; it never grants a read.
+    bool fresh_uninitialized = false;
     // Explicit image-creation contract: a sampled import is not otherwise guaranteed to carry
     // VK_IMAGE_USAGE_TRANSFER_DST_BIT, which the compute-result mirror requires.
     bool transfer_dst = false;
@@ -1319,6 +1358,34 @@ struct LiveTargetImageImport {
     bool transfer_src = false;
     bool valid() const { return image && device && width && height; }
 };
+
+constexpr const char* live_target_import_refusal_name(LiveTargetImageImport::Refusal refusal) {
+    switch (refusal) {
+        case LiveTargetImageImport::Refusal::None: return "none";
+        case LiveTargetImageImport::Refusal::NoImporter: return "no-importer";
+        case LiveTargetImageImport::Refusal::DirectBindDisabled: return "direct-bind-disabled";
+        case LiveTargetImageImport::Refusal::NoRttEntry: return "no-rtt-entry";
+        case LiveTargetImageImport::Refusal::ZeroExtent: return "zero-extent";
+        case LiveTargetImageImport::Refusal::VolumeDepth: return "volume-depth";
+        case LiveTargetImageImport::Refusal::UnmappedFormat: return "unmapped-format";
+        case LiveTargetImageImport::Refusal::TexelOverflow: return "texel-overflow";
+        case LiveTargetImageImport::Refusal::CpuOnlyAuthority: return "cpu-only-authority";
+        case LiveTargetImageImport::Refusal::NoAuthority: return "no-authority";
+        case LiveTargetImageImport::Refusal::NoRenderContext: return "no-render-context";
+        case LiveTargetImageImport::Refusal::NoPersistentImage: return "no-persistent-image";
+        case LiveTargetImageImport::Refusal::PinRefused: return "pin-refused";
+        case LiveTargetImageImport::Refusal::PinKeyMismatch: return "pin-key-mismatch";
+        case LiveTargetImageImport::Refusal::ImporterReturnedInvalid: return "importer-invalid";
+        case LiveTargetImageImport::Refusal::ExtentMismatch: return "extent-mismatch";
+        case LiveTargetImageImport::Refusal::FormatMismatch: return "format-mismatch";
+        case LiveTargetImageImport::Refusal::DeviceMismatch: return "device-mismatch";
+        case LiveTargetImageImport::Refusal::DestinationCreationRefused:
+            return "destination-creation-refused";
+        case LiveTargetImageImport::Refusal::Count: break;   // not a reason
+    }
+    return "unknown";
+}
+
 struct LiveTargetImageRequest {
     uint32_t width = 0, height = 0;
     uint32_t render_scale = 1;
@@ -1333,6 +1400,10 @@ struct LiveTargetImageRequest {
 struct LiveTargetImageDestinationRequest {
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
+    // Only an exact, full-overwrite compute result may create a missing renderer allocation.
+    bool allow_create = false;
+    // The requesting compute VkDevice. A separate device must decline before allocating.
+    void* device = nullptr;
 };
 using LiveTargetImageImportFn = std::function<bool(
     uint64_t gpu_addr, const LiveTargetImageRequest& request, LiveTargetImageImport& import)>;
@@ -1350,6 +1421,9 @@ struct LiveTargetImageWrite {
     // An exact destination mirror names the actual pinned image. The renderer must not restore
     // authority to another allocation that reused the same address/shape before notification.
     void* mirrored_image = nullptr;
+    // Successful full overwrite of an image initially in UNDEFINED. The exact-image check in the
+    // renderer still applies before it grants the newly initialized image read authority.
+    bool fresh_uninitialized = false;
     bool valid() const { return gpu_addr && width && height; }
 };
 using LiveTargetImageWrittenFn = std::function<void(const LiveTargetImageWrite& write)>;
@@ -2775,9 +2849,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         } else {
             out.indices.resize(n);
             uint32_t max_index = 0;
+            index_expand_record(n, esz);
             if (esz == 2) {
                 const uint16_t* src = (const uint16_t*)(uintptr_t)index_addr;
-                for (uint32_t i = 0; i < n; i++) { out.indices[i] = src[i]; max_index = std::max(max_index, out.indices[i]); }
+                max_index = copy_indices_u16_max(out.indices.data(), src, n);
             } else {
                 const uint32_t* src = (const uint32_t*)(uintptr_t)index_addr;
                 for (uint32_t i = 0; i < n; i++) { out.indices[i] = src[i]; max_index = std::max(max_index, out.indices[i]); }

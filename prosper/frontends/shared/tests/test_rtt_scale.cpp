@@ -18,6 +18,7 @@ using prosper::frontend::rtt_scaled_extent_compatible;
 using prosper::frontend::LiveRttAuthority;
 using prosper::frontend::live_rtt_authority;
 using prosper::frontend::live_rtt_compute_authoritative;
+using prosper::frontend::live_rtt_base_slice_blocks_decode_cache;
 using prosper::frontend::live_rtt_cpu_snapshot_matches;
 using prosper::frontend::live_rtt_gpu_importable;
 using prosper::frontend::live_rtt_uniform_uses_cpu_diagnostic_path;
@@ -102,6 +103,15 @@ int main() {
     CHECK(live_rtt_compute_authoritative(true, true));
     CHECK(live_rtt_compute_authoritative(false, true));
     CHECK(!live_rtt_compute_authoritative(false, false));
+    // A dim-5 base-slice view keeps the guest-decode cache closed while its live RTT entry holds
+    // pixels the guest bytes do not see; an identity-only shell (no image, no CPU snapshot, no
+    // uniform colour) is served from guest bytes anyway, so it must not force a per-submit
+    // re-decode (#3873: Sonic Frontiers re-decoded a 64 MiB shell ~24x/s on its menus).
+    CHECK(!live_rtt_base_slice_blocks_decode_cache(false, false, false));
+    CHECK(live_rtt_base_slice_blocks_decode_cache(true, false, false));
+    CHECK(live_rtt_base_slice_blocks_decode_cache(true, true, false));
+    CHECK(live_rtt_base_slice_blocks_decode_cache(false, true, false));
+    CHECK(live_rtt_base_slice_blocks_decode_cache(false, false, true));
     CHECK(live_rtt_uniform_uses_cpu_diagnostic_path(true, true));
     CHECK(!live_rtt_uniform_uses_cpu_diagnostic_path(true, false));
     CHECK(!live_rtt_uniform_uses_cpu_diagnostic_path(false, true));
@@ -160,6 +170,41 @@ int main() {
     // cannot serve either shape until a proven allocation reset or new producer restores it.
     CHECK(!live_rtt_unpublished_volume_blocks_sample(volume_bytes, true, true, false));
     CHECK(live_rtt_unpublished_volume_blocks_sample(volume_bytes, true, false, true));
+    // #3842 regression (GTA V black menus): a volume may claim authority -- and so block samples --
+    // only when the renderer holds a valid image for it. An unproven volume (uncleared draws) or a
+    // refused one must leave guest memory authoritative; a 2D target never claims volume authority.
+    CHECK(prosper::frontend::live_rtt_volume_claims_authority(true, true));
+    CHECK(!prosper::frontend::live_rtt_volume_claims_authority(true, false));
+    CHECK(!prosper::frontend::live_rtt_volume_claims_authority(false, true));
+    CHECK(!prosper::frontend::live_rtt_volume_claims_authority(false, false));
+    // #3890: every producer outcome settles the claim through one rule. A declined producer, a
+    // refused view or a failed admission holds no image, so it must RELEASE an earlier claim rather
+    // than keep or extend it -- GTA V's menus stayed black under PROSPER_GPU_CAPTURE and the
+    // PROSPER_DUMP_* diagnostics because those paths claimed anyway.
+    {
+        using prosper::frontend::LiveRttVolumeFootprint;
+        using prosper::frontend::live_rtt_settle_volume_footprint;
+        constexpr LiveRttVolumeFootprint none{};
+        constexpr LiveRttVolumeFootprint claimed{volume_bytes, true};
+        // Denied with no image: no claim is created, and an earlier one is released.
+        constexpr auto denied_fresh =
+            live_rtt_settle_volume_footprint(none, true, false, volume_bytes, true);
+        CHECK(denied_fresh.bytes == 0 && !denied_fresh.proven);
+        constexpr auto denied_after_claim =
+            live_rtt_settle_volume_footprint(claimed, true, false, volume_bytes, true);
+        CHECK(denied_after_claim.bytes == 0 && !denied_after_claim.proven);
+        // A valid image claims; a later claim merges (larger extent, proven only if both were).
+        constexpr auto first = live_rtt_settle_volume_footprint(none, true, true, 4096u, false);
+        CHECK(first.bytes == 4096u && !first.proven);
+        constexpr auto merged =
+            live_rtt_settle_volume_footprint(first, true, true, volume_bytes, true);
+        CHECK(merged.bytes == volume_bytes && !merged.proven);
+        constexpr auto kept = live_rtt_settle_volume_footprint(claimed, true, true, 4096u, true);
+        CHECK(kept.bytes == volume_bytes && kept.proven);
+        // A 2D target neither claims nor disturbs what it holds.
+        constexpr auto flat = live_rtt_settle_volume_footprint(claimed, false, true, 4096u, false);
+        CHECK(flat.bytes == volume_bytes && flat.proven);
+    }
     CHECK(!live_rtt_unpublished_volume_blocks_sample(volume_bytes, false, false, true));
     CHECK(live_rtt_unpublished_volume_blocks_sample(volume_bytes, false, false, false));
     CHECK(!live_rtt_unpublished_volume_blocks_sample(0, true, false, false));

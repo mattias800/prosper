@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace prosper::gpu::replay_tool {
 
@@ -84,6 +85,14 @@ struct BundleOutputTargetAfterSelection {
     bool applies_to_submit = false;
     OutputTargetAfterSelection selection;
 };
+
+// A tagged submit with no colour writer may still get pixels back from the renderer's retained
+// presentation image. Those pixels are not an output of this submit. Keep execution diagnostics,
+// but remove the unrelated image before hashing or writing a default replay BMP.
+inline void replay_discard_unproven_default_pixels(OutputTargetAfterStatus status,
+                                                   std::vector<uint8_t>& pixels) {
+    if (status != OutputTargetAfterStatus::Selected) pixels.clear();
+}
 
 inline DrawItem::ColorTargetBinding replay_color_binding(const DrawItem& draw, uint32_t slot) {
     auto binding = draw.color_targets[slot];
@@ -172,6 +181,29 @@ inline OutputTargetAfterSelection replay_output_target_after_operation(
     target.slot = selected_slot;
     target.fixed_function_resolve = draw.ps.cb_resolve;
     return {OutputTargetAfterStatus::Selected, target};
+}
+
+// A submit with no scanout-writing draw has no proven presented-frame oracle. For its default
+// replay image, choose the last exact colour target a realized draw wrote, then read that
+// renderer-owned target after the full submit. This does not call it the presented frame.
+inline OutputTargetAfterSelection replay_last_written_output_target(const GpuReplayFrame& replay) {
+    for (size_t next = replay.operations.size(); next > 0; --next) {
+        const size_t operation_index = next - 1;
+        const auto& operation = replay.operations[operation_index];
+        if (!operation.realized || operation.kind != SubmitOperationKind::Draw) continue;
+        const auto found_index = prosper::tools::replay_item_index_for_draw(
+            replay, prosper::tools::DrawIndex{operation.source_index});
+        if (found_index == prosper::tools::kNoItemIndex) continue;
+        const auto& draw = replay.items[prosper::tools::raw(found_index)];
+        for (uint32_t slot = 0; slot < kColorTargetCount; ++slot) {
+            const uint64_t base = replay_color_binding(draw, slot).base;
+            if (!base) continue;
+            const auto selected = replay_output_target_after_operation(
+                replay, prosper::tools::OperationIndex{operation_index}, base);
+            if (selected.status == OutputTargetAfterStatus::Selected) return selected;
+        }
+    }
+    return {OutputTargetAfterStatus::NotWrittenByOperation, {}};
 }
 
 // Bundle operation ordinals are submit-local. Apply an exact selector only to the final submit left

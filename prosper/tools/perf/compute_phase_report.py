@@ -24,7 +24,9 @@ binding, and that loop has no sub-timer on the `[compute-phase]` line -- so on a
 most of `setup` lands in its "unattributed" row. Add `PROSPER_COMPUTE_IMAGE_TIMING=1` to the run and
 this tool will also roll up the resulting `[compute-image]` records, which decompose exactly that
 interval. Sampled cache lookup is a sibling of upload preparation, while storage cache validation is
-nested inside `prepare_ms`; the report preserves that hierarchy and warns when a record violates it.
+nested inside `prepare_ms`. Storage staging allocation is nested there too, while sampled staging
+allocation finishes before prepare starts. The report preserves that hierarchy and warns when a
+record violates it.
 Run both switches together whenever setup is the dominant phase.
 
 WHAT THIS TOOL DOES NOT SEE
@@ -58,12 +60,11 @@ MAX_BINDING_ADDRESSES = 4
 IMAGE_TOP_LEVEL_PHASES = [
     ("query (driver caps)", "query_ms"),
     ("import (renderer RTT)", "import_ms"),
-    ("staging alloc", "staging_ms"),
     ("image allocation", "allocation_ms"),
     ("view", "view_ms"),
     ("sampler", "sampler_ms"),
 ]
-IMAGE_TIMER_KEYS = [key for _, key in IMAGE_TOP_LEVEL_PHASES] + ["cache_ms", "prepare_ms"]
+IMAGE_TIMER_KEYS = [key for _, key in IMAGE_TOP_LEVEL_PHASES] + ["cache_ms", "staging_ms", "prepare_ms"]
 
 # (label, key, parent) -- parent is the phase whose measured interval contains this one.
 # `total_ms` is the root; the top-level five partition it by construction in execute_item().
@@ -125,13 +126,13 @@ def _storage_image(image):
 def _image_root_time(image):
     """Sum only siblings inside one image's `ms` interval.
 
-    Sampled-image cache lookup finishes before prepare starts. Storage-image cache lookup starts after
-    prepare starts, so adding both `cache_ms` and `prepare_ms` double-counts storage bindings.
+    Sampled-image cache lookup and staging allocation finish before prepare starts. Storage-image
+    cache lookup and staging allocation happen inside prepare, so adding them again double-counts.
     """
     total = sum(image.get(key, 0.0) for _, key in IMAGE_TOP_LEVEL_PHASES)
     total += image.get("prepare_ms", 0.0)
     if not _storage_image(image):
-        total += image.get("cache_ms", 0.0)
+        total += image.get("cache_ms", 0.0) + image.get("staging_ms", 0.0)
     return total
 
 
@@ -298,7 +299,8 @@ def main():
     broken_storage_nest = sum(
         1 for image in model_images
         if _storage_image(image) and
-        image.get("cache_ms", 0.0) > image.get("prepare_ms", 0.0) + image_tolerance)
+        image.get("cache_ms", 0.0) + image.get("staging_ms", 0.0) >
+        image.get("prepare_ms", 0.0) + image_tolerance)
     broken_image_root = sum(
         1 for image in model_images
         if _image_root_time(image) > image["ms"] + image_tolerance)
@@ -308,9 +310,9 @@ def main():
     if broken_storage_nest or broken_image_root or negative_image_timers:
         model_warnings.append(
             f"this tool's image model does not match these records ({broken_storage_nest} storage "
-            f"cache intervals exceed prepare_ms, {broken_image_root} where top-level image children "
-            f"exceed ms, {negative_image_timers} with a negative image timer); storage cache must "
-            f"remain nested inside prepare upload")
+            f"storage cache + staging intervals exceed prepare_ms, {broken_image_root} where "
+            f"top-level image children exceed ms, {negative_image_timers} with a negative image "
+            f"timer); storage cache and staging must remain nested inside prepare upload")
     for warning in model_warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
 
@@ -438,21 +440,25 @@ def main():
         }
         storage_cache = sum(
             image.get("cache_ms", 0.0) for image in images if _storage_image(image))
+        storage_staging = sum(
+            image.get("staging_ms", 0.0) for image in images if _storage_image(image))
         sampled_cache = image_totals["cache_ms"] - storage_cache
+        sampled_staging = image_totals["staging_ms"] - storage_staging
 
         image_row("query (driver caps)", image_totals["query_ms"])
         image_row("import (renderer RTT)", image_totals["import_ms"])
         image_row("cache lookup (sampled)", sampled_cache)
-        image_row("staging alloc", image_totals["staging_ms"])
+        image_row("staging alloc (sampled)", sampled_staging)
         image_row("prepare upload (inclusive)", image_totals["prepare_ms"])
         image_row("storage cache (included)", storage_cache, 1)
-        image_row("prepare exclusive", image_totals["prepare_ms"] - storage_cache, 1)
+        image_row("storage staging (included)", storage_staging, 1)
+        image_row("prepare exclusive", image_totals["prepare_ms"] - storage_cache - storage_staging, 1)
         image_row("image allocation", image_totals["allocation_ms"])
         image_row("view", image_totals["view_ms"])
         image_row("sampler", image_totals["sampler_ms"])
 
-        # Only top-level siblings are attributed against the binding interval. Storage cache is a
-        # child of prepare and is printed for attribution without being added a second time.
+        # Only top-level siblings are attributed against the binding interval. Storage cache and
+        # staging are children of prepare and are printed without being added a second time.
         attributed = sum(_image_root_time(image) for image in images)
         rest = image_total - attributed
         image_row("unattributed", rest)

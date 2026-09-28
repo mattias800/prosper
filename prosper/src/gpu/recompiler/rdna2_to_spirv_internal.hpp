@@ -71,8 +71,15 @@ inline std::map<uint64_t, std::string>& terminal_reject_reasons() {
     return reasons;
 }
 
+// While a TerminalRejectCapture (rdna2_to_spirv.hpp) is alive on this thread, every reason recorded
+// is also appended here, so a memoized analysis can replay exactly the records a fresh evaluation
+// would have made (compute_program_facts.cpp).
+inline thread_local std::vector<std::pair<std::string, std::string>>* g_terminal_reject_capture =
+    nullptr;
+
 inline void record_terminal_reject_reason(uint64_t program_address, const char* tag,
                                    const char* payload) {
+    if (g_terminal_reject_capture) g_terminal_reject_capture->emplace_back(tag, payload);
     if (!program_address) return;
     // A cap, because a pathological guest could present unboundedly many distinct programs. Losing
     // late entries is strictly better than a diagnostic that grows without limit.

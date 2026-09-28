@@ -18,18 +18,65 @@ constexpr bool can_defer_scanout_readback(bool phase_allows_defer,
            !cpu_needed_same_batch;
 }
 
-// Determines whether a color target slot wants a CPU readback.
+// WHY a color target slot wants a CPU readback -- the reason, not just the verdict.
+//
+// The reason describes the target policy. The backend's `want_color_readback` is a separate caller
+// gate: a depth-only pass may have no target object and still request no colour bytes at all. Do not
+// bill its target-policy reason as a copy. The old claim that readback dominated shipped rendering
+// was withdrawn after checking that the earlier harnesses did not activate GPU presentation.
+enum class ColorReadbackReason : unsigned char {
+    NotWanted = 0,        // no CPU colour result requested; may also be a depth-only pass
+    NoColorTarget,        // no color target object at all -- the caller passed none
+    ExplicitRequest,      // the caller or a split carrier asked for it
+    BoundNonPersistent,   // a bound target that is not persistent, so its pixels are not retained
+    Count,                // not a reason; pinned against the census's own count -- see below
+};
+
 // When target_readback is true, readback was explicitly requested (by the caller or a split carrier).
 // When target_readback is false, an unbound target (persistent_id == 0) never requests readback,
 // avoiding tens of megabytes of staging copies for unallocated host memory. A bound target
 // (persistent_id != 0) requests readback if it is non-persistent.
+constexpr ColorReadbackReason color_target_readback_reason(bool has_color_target,
+                                                           uint64_t persistent_id,
+                                                           bool persistent_color,
+                                                           bool target_readback) {
+    if (!has_color_target) return ColorReadbackReason::NoColorTarget;
+    if (target_readback) return ColorReadbackReason::ExplicitRequest;
+    return persistent_id != 0 && !persistent_color ? ColorReadbackReason::BoundNonPersistent
+                                                   : ColorReadbackReason::NotWanted;
+}
+
+// Classify the request that will actually reach the backend copy decision. A missing target only
+// requests bytes when the caller wants a colour result; depth-only live passes set this gate false.
+constexpr ColorReadbackReason effective_color_target_readback_reason(
+    bool want_color_readback, bool has_color_target, uint64_t persistent_id,
+    bool persistent_color, bool target_readback) {
+    return want_color_readback
+        ? color_target_readback_reason(has_color_target, persistent_id,
+                                       persistent_color, target_readback)
+        : ColorReadbackReason::NotWanted;
+}
+
+// The verdict, expressed in terms of the reason so the two can never disagree. This used to be the
+// primary definition with the reasons implicit in its control flow; stating the reason first means
+// a future edit to the policy cannot change what is counted without changing what is decided.
 constexpr bool is_color_target_readback_wanted(bool has_color_target,
                                                uint64_t persistent_id,
                                                bool persistent_color,
                                                bool target_readback) {
-    if (!has_color_target) return true;
-    if (target_readback) return true;
-    return persistent_id != 0 && !persistent_color;
+    return color_target_readback_reason(has_color_target, persistent_id, persistent_color,
+                                        target_readback) != ColorReadbackReason::NotWanted;
+}
+
+constexpr const char* color_readback_reason_name(ColorReadbackReason reason) {
+    switch (reason) {
+        case ColorReadbackReason::NotWanted: return "not-wanted";
+        case ColorReadbackReason::NoColorTarget: return "no-color-target";
+        case ColorReadbackReason::ExplicitRequest: return "explicit-request";
+        case ColorReadbackReason::BoundNonPersistent: return "bound-non-persistent";
+        case ColorReadbackReason::Count: break;   // not a reason; falls through to "unknown"
+    }
+    return "unknown";
 }
 
 // Calculates the required staging buffer size covering only the active readback slots (#3276).

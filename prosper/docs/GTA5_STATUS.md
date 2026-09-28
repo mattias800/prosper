@@ -595,6 +595,12 @@ conclusion; it sharpens what "essentially all black" looks like.
   "M0 unsupported"; the exact rejecting path is not located. M0 accounts for 20 of the shader's
   instructions (6 reads, 14 writes); whether all 20 are among the 79 is **not** established.
 
+## Ruled out — serving the colour-grading LUT from a GPU volume image (2026-09-28)
+
+| dead hypothesis | evidence that killed it | ref |
+| --- | --- | --- |
+| GTA V's 32x32x32 colour-grading LUT (`0x2042fa0000` on the perf-story route) is rendered by uncleared raster draws, so after #3889 its GPU-rendered content is ignored and readers decode **stale** guest bytes; a whole-slice coverage proof (or a guest seed before the pass) would let the renderer serve the correct LUT | **Measured false on both halves.** A backend log of every volume pass over a 300 s run that reaches gameplay (landing menu at flip 1600, bank-heist gameplay at flip 5000) saw **one** raster pass on the LUT in the whole run: one 3-vertex draw, 32x32 viewport and scissor, blend off, write mask `0xf`, into a view of **slice 0 only (`0+1` of 32)**, CLEARed. So no raster proof can make the volume complete: 31 of 32 slices are never rendered. The LUT's real producer is compute: program `0x2042f8f200` is the only one that binds the address, as a 32x32x32 storage image of 131,072 bytes (tile mode 27), and its result reaches guest memory as `compute-writeback(image-guest-bytes)`. The run logged **9** such writebacks starting at the LUT base. Their `+2097152` range is the resource's declared tiled footprint, not a count of bytes written; the writeback origin tag does not carry the program address, so the attribution to `0x2042f8f200` rests on it being the only binder. Readers of guest memory therefore see the compute's current output, not stale bytes. Making the volume valid would also be harmful: a valid volume claims its footprint, and `live_compute.cpp` skips a dispatch whose 3D, arrayed or non-renderer-owned image overlaps a claimed volume, which covers this 3D storage write ("renderer volume has no complete guest publication"), so the compute that actually produces the LUT would stop running. | #3890 |
+
 ## Ruled out — HTILE byte-preserving suppression (2026-08-29)
 
 | dead hypothesis | evidence that killed it | ref |
@@ -5294,6 +5300,30 @@ not the domain. Do not cite that zero as evidence about the nine.
 One line per falsified hypothesis, the evidence that killed it, and where. **Read this before forming
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
+
+- **The 61-draw deferred capture at `PROSPER_GPU_CAPTURE_AT=286` can use its last colour target
+  as a pixel oracle.** False on submit 4237 of the 2026-09-28 `reach-performance-story.pad` run:
+  `gpu_replay --inspect-only` reports `cwm=0 cwm1=0` on **all 61 realized draws**, with one
+  interleaved compute dispatch; replay reports `no-color-target` and returns zero pixel bytes.
+  The post-submit presented frame cannot be attributed to these draws; a compute storage alias is
+  not ruled out. This capsule needs a depth/stencil output oracle or a different selected submit,
+  not a guessed colour target. #3908.
+
+- **Native BCn texture upload is a GTA V frame-rate lever** — falsified 2026-09-27 (#3873,
+  native-BC PR). Same binary, `PROSPER_NO_NATIVE_BC=1` as the off arm, interleaved on
+  `reach-performance-story.pad`, last 18 samples: **8.28 / 8.13 / 8.69 / 8.76 fps** (off, on, off,
+  on) — neutral. All 533 BC identities went native with their guest mip chains; their estimated
+  resident size fell ~6x (~0.89 GiB to ~0.15 GiB), but after #3876 they are persistent-cache hits in
+  steady state, so decode and upload are off the frame path. Solid, not void: the census proves the
+  lever moved.
+  **Scope of this falsification:** measured on the dev box's unified-memory APU, where the texture
+  budget (device-local heap / 8, clamped 1-4 GiB) sits at its 4 GiB maximum and an upload is a memcpy.
+  It does not transfer to an 8-16 GB discrete GPU (budget 1-2 GiB, uploads over PCIe), where the
+  4-8x smaller resident size is the point; native BC was merged for that footprint, not for this box's
+  frame rate. Simulating an 8 GB card's budget on this box (`PROSPER_BACKEND_TEXTURE_CACHE_MB=1024`,
+  Outer Wilds, same binary, off/on/off/on) moved it to **6.67 / 9.97 / 7.62 / 10.58 fps**: backend
+  texture upload fell from 1188/1060 ms to 179/141 ms per F8 window, and persistent hit/miss went from
+  5177/1935 and 6396/2645 to 16337/98 and 16107/100 (#3883; the off1 arm exited by itself at 259 s).
 
 - **"#3722 caused the September black-world regression" from a single-run bisect.** Withdrawn
   (#3727 / #3731): a repeat at #3722 rendered the world, and the later investigation found shared

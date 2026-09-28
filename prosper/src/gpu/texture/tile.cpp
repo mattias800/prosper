@@ -1,5 +1,7 @@
 // tile.cpp — see tile.hpp. GFX10 SW_4KB_S de-swizzle, generalized over the element size (#119).
 // GFX10 SW_64KB_S / SW_64KB_R_X de-swizzle from the AMD addrlib swizzle-pattern tables (#288).
+#include "diagnostics/worker_spawn_census.hpp"
+#include "diagnostics/transfer_pressure.hpp"
 #include "gpu/texture/tile.hpp"
 #include <array>
 #include <cstring>
@@ -566,6 +568,13 @@ inline unsigned detile_row_threads(size_t work_bytes, uint32_t eh) {
 template <class Body>
 inline void parallel_rows(uint32_t eh, unsigned nthreads, Body&& body) {
     if (nthreads <= 1 || eh == 0) { if (eh) body(0u, eh); return; }
+    {
+        // Volume only. Per-call thread creation here was measured and found NOT to cost
+        // measurably -- see the status doc's "Ruled out". Kept because the volume is the input to
+        // any future batching question, not because the spawn is known to be a problem.
+        static prosper::diagnostics::WorkerSpawnSite site("detile-rows");
+        site.note(nthreads, uint64_t{eh});
+    }
     const uint32_t chunk = (eh + nthreads - 1) / nthreads;
     // Auto-joining workers keep a partially-created set safe when the OS refuses another thread.
     // Any ranges that could not get a worker are completed synchronously below.
@@ -1442,6 +1451,8 @@ void tile_census_note(const char* op, uint32_t w, uint32_t h, uint32_t bpe, uint
 void detile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
                     uint32_t tile_mode, uint32_t pitch, uint32_t bytes_per_texel) {
     tile_census_note("detile_surface", width, height, bytes_per_texel, tile_mode);
+    prosper::diagnostics::note_transfer(prosper::diagnostics::Transfer::Detile,
+                                        uint64_t(width) * height * bytes_per_texel);
     if (!tile_mode_is_tiled(tile_mode)) { warn_unhandled_tile_mode(tile_mode, width, height);
                                           std::memcpy(dst, src, (size_t)width * height * bytes_per_texel); return; }
     if (tile_mode == (uint32_t)TileMode::Sw256BS) {

@@ -31,6 +31,21 @@ constexpr bool live_rtt_compute_authoritative(bool gpu_valid, bool has_cpu_snaps
     return live_rtt_authority(gpu_valid, has_cpu_snapshot) != LiveRttAuthority::none;
 }
 
+// A dim-5 (2D-array base-slice) view whose live RTT entry could not be served keeps renderer
+// authority over the guest-decode cache: while the renderer holds pixels the guest bytes do not
+// see (a valid image, a CPU snapshot, a uniform fast-clear colour), a retained guest decode must
+// not be revalidated against guest pages the renderer never writes. An entry holding NONE of those
+// is an identity-only shell -- left behind by an invalidation or a declined producer -- and the
+// reference is served by decoding guest bytes either way. Retaining that decode behind exact
+// guest-byte validation then returns the same pixels a fresh decode would, so the shell must not
+// force a full re-decode on every submit (Sonic Frontiers re-read a 64 MiB RGBA16F shell ~24x/s
+// on its title and menu screens, #3873).
+constexpr bool live_rtt_base_slice_blocks_decode_cache(bool gpu_valid, bool has_cpu_snapshot,
+                                                       bool has_uniform_color) {
+    return live_rtt_authority(gpu_valid, has_cpu_snapshot) != LiveRttAuthority::none ||
+        has_uniform_color;
+}
+
 // Pixel-inspection and mutation diagnostics operate on the renderer's owned CPU texture copy.
 // Uniform fast-clears normally bypass that copy, but the opt-in diagnostic contract takes
 // precedence so dumps and override probes observe the same pixels as ordinary RTT snapshots.
@@ -94,6 +109,39 @@ constexpr bool live_rtt_complete_guest_overwrite(uint64_t target_address,
         return false;
     return write_address <= target_address &&
            write_address + write_bytes >= target_address + target_bytes;
+}
+
+// Whether a renderer-produced volume may claim authority over its guest footprint. Only a volume
+// the renderer can actually serve -- a retained image proven complete -- may; otherwise every sample
+// of that address would be refused (see live_rtt_unpublished_volume_blocks_sample) and its draw
+// dropped, with guest memory never allowed to stand in. GTA V's 32x32x32 colour-grading LUT never
+// proves complete -- its only raster pass writes slice 0 of 32, and a compute program writes the
+// LUT back to guest memory -- and blacked out every GTA V menu when this was claimed
+// unconditionally (#3842 regression). Without a servable image, guest memory stays authoritative.
+constexpr bool live_rtt_volume_claims_authority(bool volume_target, bool renderer_image_valid) {
+    return volume_target && renderer_image_valid;
+}
+
+// The guest footprint a renderer-produced volume claims (see live_rtt_volume_claims_authority).
+struct LiveRttVolumeFootprint {
+    uint64_t bytes = 0;   // zero: no claim, guest memory is authoritative for the address
+    bool proven = false;  // the extent came from the producer's native tiled layout
+};
+
+// The claim a target holds after a pass, or a refusal, settles it. Every producer outcome -- a
+// completed pass, a declined producer, a refused view, a failed backend admission -- goes through
+// this ONE rule: a claim needs a valid renderer image, and one without it RELEASES any earlier claim,
+// because the image that claim rested on is gone. GTA V's menus stayed black under
+// PROSPER_GPU_CAPTURE and the PROSPER_DUMP_* diagnostics after #3889 because the decline and
+// invalid-view paths still claimed with no image (#3890). A claim merges with an earlier one: the
+// larger extent wins, and it stays proven only if both were.
+constexpr LiveRttVolumeFootprint live_rtt_settle_volume_footprint(
+    LiveRttVolumeFootprint current, bool volume_target, bool renderer_image_valid,
+    uint64_t claim_bytes, bool claim_proven) {
+    if (!live_rtt_volume_claims_authority(volume_target, renderer_image_valid))
+        return volume_target ? LiveRttVolumeFootprint{} : current;
+    return {current.bytes > claim_bytes ? current.bytes : claim_bytes,
+            current.bytes ? current.proven && claim_proven : claim_proven};
 }
 
 // A 2D alias can have valid current pixels while older renderer-produced volume slices remain

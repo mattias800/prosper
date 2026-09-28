@@ -5,6 +5,7 @@
 #endif
 
 #include "gpu/capture/gpu_capture.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"  // #3891: capture re-realization is not a skip
 
 #include <mutex>
 #include "hle/fs/save_paths.hpp"   // the effective per-title /savedata0 dir (#2734)
@@ -22,8 +23,11 @@
 #include "gpu/texture/tile.hpp"
 #include "gpu/present/videoout_present.hpp"
 
+#include "gpu/capture/capture_compute_policy.hpp"
+
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <string>
 #include <bit>
 #include <cerrno>
@@ -210,6 +214,7 @@ bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
         }
     }
     if (caplog) std::fprintf(stderr, "[cap] realize draws=%zu; realize_compute_dispatches...\n", draws.size());
+    const prosper::diagnostics::perf::SuppressDispatchSkipCounting not_live;  // #3891: re-realization, not a skip
     std::vector<ComputeItem> computes = realize_compute_dispatches(state, submit_no, &compute_failures);
     if (caplog) std::fprintf(stderr, "[cap] realize computes=%zu; plan_submit_operations...\n", computes.size());
     failures.insert(failures.end(), std::make_move_iterator(compute_failures.begin()),
@@ -728,7 +733,9 @@ bool gpu_capture_ds_seed_snapshot_available() {
     return static_cast<bool>(g_ds_seed_snapshot_reader);
 }
 
-bool capture_referenced_gpu_ds_seeds(GpuCaptureFile& capture, std::string& error) {
+bool capture_referenced_gpu_ds_seeds(
+    GpuCaptureFile& capture, std::string& error,
+    const std::vector<GpuCaptureDsSeed>* pre_submit_seeds) {
     error.clear();
     if (!capture.ds_seeds.empty()) {
         error = "capture already contains DS checkpoints";
@@ -755,8 +762,11 @@ bool capture_referenced_gpu_ds_seeds(GpuCaptureFile& capture, std::string& error
     if (!references_ds) return true;
 
     std::vector<GpuCaptureDsSeed> live;
-    if (!read_all_gpu_capture_ds_seeds(live, error)) return false;
-    for (auto& seed : live) {
+    if (!pre_submit_seeds && !read_all_gpu_capture_ds_seeds(live, error)) {
+        return false;
+    }
+    const auto& candidates = pre_submit_seeds ? *pre_submit_seeds : live;
+    for (const auto& seed : candidates) {
         const bool referenced = std::any_of(
             capture.draws.begin(), capture.draws.end(), [&](const GpuCapturedDraw& draw) {
                 const auto& ps = draw.ps;
@@ -771,7 +781,7 @@ bool capture_referenced_gpu_ds_seeds(GpuCaptureFile& capture, std::string& error
                        ps.stencil_write_base == seed.stencil_write_base &&
                        ps.htile_data_base == seed.htile_data_base;
             });
-        if (referenced) capture.ds_seeds.push_back(std::move(seed));
+        if (referenced) capture.ds_seeds.push_back(seed);
     }
     return true;
 }
@@ -802,6 +812,16 @@ namespace {
 std::mutex g_interactive_capture_mx;
 std::string g_interactive_capture_path;
 std::atomic<bool> g_output_capture_claimed{false};
+// Environment one-shot capture window state (#3895): the AFTER invocation counter, the AFTER_MS clock
+// origin (steady-clock ns; 0 = not started), and whether the one-shot has completed.
+std::atomic<uint64_t> g_env_capture_invocations{0};
+std::atomic<int64_t> g_env_capture_clock_start_ns{0};
+std::atomic<bool> g_env_capture_finished{false};
+int64_t steady_now_ns() {
+    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return ns ? ns : 1;
+}
 std::string take_interactive_gpu_capture() {
     std::lock_guard<std::mutex> lk(g_interactive_capture_mx);
     return std::exchange(g_interactive_capture_path, std::string());
@@ -1227,6 +1247,7 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
         std::vector<OperationRealizationFailure> compute_failures;
         (void)realize_gpustate_draws(*semantic_state, 0x10000, 1.0f, 1.0f,
                                      &failures, false, false);
+        const prosper::diagnostics::perf::SuppressDispatchSkipCounting not_live;  // #3891: re-realization, not a skip
         (void)realize_compute_dispatches(*semantic_state, metadata.submit_index,
                                          &compute_failures);
         failures.insert(failures.end(),
@@ -1290,6 +1311,7 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
             diagnostic_state.dispatches.clear();
             diagnostic_state.dispatches.push_back(dispatch);
             std::vector<OperationRealizationFailure> semantic_failures;
+            const prosper::diagnostics::perf::SuppressDispatchSkipCounting not_live;  // #3891: re-realization, not a skip
             std::vector<ComputeItem> semantic_items = realize_compute_dispatches(
                 diagnostic_state, metadata.submit_index, &semantic_failures);
             if (!semantic_items.empty()) {
@@ -1325,17 +1347,97 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
     const std::vector<SubmitOperation>& exact_operations =
         semantic_operations.empty() ? operations : semantic_operations;
     const CaptureMemoryReader reader = pending_capture_reader(pending);
+    // #3908: a deferred capture reads its seeds from the pre-submit snapshot, never from the live
+    // cache, which by now holds this submit's output.
+    const CaptureRttSeedReader pre_submit_rtt_reader =
+        [&pending](uint64_t guest_addr, GpuCaptureRttSeed& seed) {
+            for (const GpuCaptureRttSeed& candidate : pending.pre_submit_rtt_seeds)
+                if (candidate.guest_addr == guest_addr) { seed = candidate; return true; }
+            // Written by this submit but absent before it: no pre-submit pixels exist.
+            if (std::find(pending.pre_submit_rtt_absent.begin(), pending.pre_submit_rtt_absent.end(),
+                          guest_addr) != pending.pre_submit_rtt_absent.end())
+                return false;
+            // Not written by the submit's draws: unchanged, read live.
+            return g_rtt_seed_reader && g_rtt_seed_reader(guest_addr, seed);
+        };
     const bool captured = capture_submit_items(
         draws, snapshot_computes, exact_operations, metadata, reader, pending.capture, error,
-        g_rtt_seed_reader, failures,
+        pending.pre_submit_rtt_seeds_taken ? pre_submit_rtt_reader : g_rtt_seed_reader, failures,
         semantic_state ? semantic_state->dma_copies : std::vector<GpuState::DmaCopy>{}, 0,
         pending.pre_submit_compute_gds.data(), pending.pre_submit_compute_gds.size());
     if (!captured) return false;
     pending.materialized = true;
+    if (!pending.pre_submit_ds_error.empty()) {
+        error = pending.pre_submit_ds_error;
+        return false;
+    }
+    if (pending.pre_submit_ds_seeds_taken)
+        return capture_referenced_gpu_ds_seeds(
+            pending.capture, error, &pending.pre_submit_ds_seeds);
     return !gpu_capture_ds_seed_snapshot_available() ||
            capture_referenced_gpu_ds_seeds(pending.capture, error);
 }
 }  // namespace
+
+namespace {
+std::atomic<uint32_t> g_capture_cpu_output_holds{0};
+}  // namespace
+
+GpuCaptureCpuOutputHold::~GpuCaptureCpuOutputHold() {
+    if (active_) g_capture_cpu_output_holds.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+GpuCaptureCpuOutputHold& GpuCaptureCpuOutputHold::operator=(
+    GpuCaptureCpuOutputHold&& other) noexcept {
+    if (this != &other) {
+        if (active_) g_capture_cpu_output_holds.fetch_sub(1, std::memory_order_acq_rel);
+        active_ = other.active_;
+        other.active_ = false;
+    }
+    return *this;
+}
+
+void GpuCaptureCpuOutputHold::activate() {
+    if (active_) return;
+    active_ = true;
+    g_capture_cpu_output_holds.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool gpu_capture_requires_cpu_output() {
+    return g_capture_cpu_output_holds.load(std::memory_order_acquire) != 0;
+}
+
+uint32_t gpu_capture_cpu_output_hold_count_for_test() {
+    return g_capture_cpu_output_holds.load(std::memory_order_acquire);
+}
+
+bool env_gpu_capture_requires_portable_compute() {
+    static const bool requested = [] {
+        const char* path = std::getenv("PROSPER_GPU_CAPTURE");
+        return path && *path;
+    }();
+    if (!requested) return false;
+    static const bool legacy = std::getenv("PROSPER_GPU_CAPTURE_READBACK") != nullptr;
+    static const uint64_t after = [] {
+        const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER");
+        return v ? std::strtoull(v, nullptr, 0) : 0ull;
+    }();
+    static const uint64_t after_ms = [] {
+        const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER_MS");
+        return v ? std::strtoull(v, nullptr, 0) : 0ull;
+    }();
+    EnvCaptureWindow w;
+    w.requested = true;
+    w.legacy_readback = legacy;
+    w.invocations = g_env_capture_invocations.load(std::memory_order_acquire);
+    w.after = after;
+    const int64_t origin = g_env_capture_clock_start_ns.load(std::memory_order_acquire);
+    w.clock_started = origin != 0;
+    w.elapsed_ms = origin ? static_cast<uint64_t>((steady_now_ns() - origin) / 1000000) : 0;
+    w.after_ms = after_ms;
+    w.finished = g_env_capture_finished.load(std::memory_order_acquire);
+    return env_capture_requires_portable_compute(w);
+}
 
 void snapshot_pending_gpu_capture_compute_gds(PendingGpuCapture* pending,
                                               const uint8_t* data, size_t bytes) {
@@ -1365,16 +1467,17 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     if (output_triggered && g_output_capture_claimed.load(std::memory_order_acquire)) return {};
     uint64_t current = 0;
     if (!interactive) {
-        static std::atomic<uint64_t> invocation_sequence{0};
-        const uint64_t invocation = invocation_sequence.fetch_add(1);
+        const uint64_t invocation = g_env_capture_invocations.fetch_add(1);
         uint64_t after = 0;
         if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER")) after = std::strtoull(v, nullptr, 0);
         if (invocation < after) return {};
-        static const auto capture_started = std::chrono::steady_clock::now();
+        // The AFTER_MS clock starts at the first invocation past AFTER.
+        int64_t expected_origin = 0;
+        g_env_capture_clock_start_ns.compare_exchange_strong(expected_origin, steady_now_ns());
         if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER_MS")) {
             const uint64_t after_ms = std::strtoull(v, nullptr, 0);
-            const uint64_t elapsed_ms = static_cast<uint64_t>(std::chrono::duration_cast<
-                std::chrono::milliseconds>(std::chrono::steady_clock::now() - capture_started).count());
+            const uint64_t elapsed_ms = static_cast<uint64_t>(
+                (steady_now_ns() - g_env_capture_clock_start_ns.load()) / 1000000);
             if (elapsed_ms < after_ms) return {};
         }
         if (const char* value = std::getenv("PROSPER_GPU_CAPTURE_COMPUTE_ADDR")) {
@@ -1476,6 +1579,8 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     }
     auto pending = std::make_unique<PendingGpuCapture>();
     pending->materialized = false;
+    pending->cpu_output_hold.activate();
+    pending->env_capture = !interactive;
     pending->path = interactive ? interactive_path : std::string(env_path);
     if (const char* selector = std::getenv(kGpuCaptureResourceProvenanceEnv);
         selector && *selector) {
@@ -1549,6 +1654,67 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
             snapshot(copy.src, copy.bytes);
         }
     }
+    // #3908: a deferred (ordered) capture materializes after the submit has executed, so the live
+    // RTT cache would hand it post-submit pixels as "seeds" for every target the submit wrote --
+    // and the replay then returns its own expected output unchanged. Read those targets now, while
+    // they are still pre-submit. The set is the colour targets of the submit's draws (render state
+    // per draw): a target this submit's draws never write is identical before and after it, so it
+    // is still read live at finish. Snapshotting the whole cache is not an option: on GTA V it
+    // exceeds the 1 GiB seed limit. Output-triggered candidates are not snapshotted: most are
+    // rejected, and a readback per candidate submit would change the run being captured.
+    if (defer_materialization && !output_triggered && semantic_state && g_rtt_seed_reader) {
+        std::vector<uint64_t> bases;
+        const GpuState* last_state = nullptr;
+        for (const GpuState::Draw& draw : semantic_state->draws) {
+            if (!draw.state || draw.state.get() == last_state) continue;
+            last_state = draw.state.get();
+            const RenderState rs = extract_render_state(*draw.state);
+            for (uint64_t base : {rs.color0_base, rs.color1_base})
+                if (base) bases.push_back(base);
+            for (const ColorTargetState& target : rs.color_targets) {
+                if (target.base) bases.push_back(target.base);
+                if (target.allocation_base) bases.push_back(target.allocation_base);
+            }
+        }
+        std::sort(bases.begin(), bases.end());
+        bases.erase(std::unique(bases.begin(), bases.end()), bases.end());
+        uint64_t total = 0;
+        bool within_limit = true;
+        for (uint64_t base : bases) {
+            GpuCaptureRttSeed seed;
+            if (!g_rtt_seed_reader(base, seed)) {
+                pending->pre_submit_rtt_absent.push_back(base);
+                continue;
+            }
+            if (seed.rgba.size() > kMaxTotalRttSeedBytes - total) { within_limit = false; break; }
+            total += seed.rgba.size();
+            pending->pre_submit_rtt_seeds.push_back(std::move(seed));
+        }
+        if (within_limit) {
+            pending->pre_submit_rtt_seeds_taken = true;
+        } else {
+            pending->pre_submit_rtt_seeds.clear();
+            pending->pre_submit_rtt_absent.clear();
+            std::fprintf(stderr,
+                         "[gpucap] deferred capture: pre-submit RTT seeds exceed the seed limit; "
+                         "seeds will be read after the submit and may hold its own output (#3908)\n");
+        }
+    }
+    // The retained DS cache is read before this submit executes. The existing snapshot reader
+    // exports all layers; materialization later keeps only the planes its realized draws use.
+    // An empty pre-submit cache is meaningful: a new attachment must not be seeded with the
+    // contents it acquired during this submit.
+    if (defer_materialization && !output_triggered && semantic_state &&
+        !semantic_state->draws.empty() && gpu_capture_ds_seed_snapshot_available()) {
+        pending->pre_submit_ds_seeds_taken = read_all_gpu_capture_ds_seeds(
+            pending->pre_submit_ds_seeds, pending->pre_submit_ds_error);
+        if (!pending->pre_submit_ds_seeds_taken) {
+            if (pending->pre_submit_ds_error.empty())
+                pending->pre_submit_ds_error = "deferred pre-submit DS snapshot failed";
+            std::fprintf(stderr, "[gpucap] deferred pre-submit DS snapshot failed: %s\n",
+                         pending->pre_submit_ds_error.c_str());
+        }
+    }
     // Full output-candidate materialization remains deferred until its pixels match. The small
     // pre-submit snapshots above are the deliberate exception: known DMA endpoints cannot be
     // recovered after execution, while every unrelated guest resource and renderer cache remains
@@ -1586,6 +1752,16 @@ bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
                                   const GpuState* semantic_state,
                                   const std::vector<OperationRealizationFailure>* exact_failures) {
     if (!pending) return true;
+    // Close the environment capture window once its one-shot is settled, whichever way this returns:
+    // an AT/selector capture is claimed before begin returns, an output-triggered one only on a match.
+    struct EnvWindowCloser {
+        const PendingGpuCapture& pending;
+        ~EnvWindowCloser() {
+            if (pending.env_capture && (!pending.output_triggered ||
+                                        g_output_capture_claimed.load(std::memory_order_acquire)))
+                g_env_capture_finished.store(true, std::memory_order_release);
+        }
+    } env_window_closer{*pending};
     if (pending->output_triggered) {
         size_t nonzero = 0;
         if (!gpu_capture_output_nonzero_matches(output, pending->output_min_nonzero,
@@ -1642,12 +1818,50 @@ bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
                      pending->capture.operations.size(),
                      pending->capture.failure_diagnostics.size(), pending->path.c_str());
     }
-    pending->capture.expected_output_valid = !output.empty();
-    pending->capture.expected_output_bytes = output.size();
-    pending->capture.expected_output_hash = output.empty() ? 0 : gpu_capture_hash(output);
+    const auto scanout_entry = std::find_if(
+        pending->capture.metadata.renderer_env.begin(),
+        pending->capture.metadata.renderer_env.end(), [](const auto& entry) {
+            return entry.first == kGpuReplayScanoutAddressEnv;
+        });
+    const uint64_t scanout = scanout_entry == pending->capture.metadata.renderer_env.end()
+        ? 0 : parse_gpu_replay_scanout_address(scanout_entry->second.c_str());
+    const bool writes_scanout = scanout && std::any_of(
+        pending->capture.draws.begin(), pending->capture.draws.end(),
+        [scanout](const GpuCapturedDraw& draw) {
+            if (draw.ps.cb_resolve)
+                return (draw.color_targets[1].base ? draw.color_targets[1].base :
+                        draw.color1_base) == scanout;
+            for (size_t slot = 0; slot < kColorTargetCount; ++slot) {
+                const auto& target = draw.color_targets[slot];
+                const uint64_t base = target.base ? target.base :
+                    (slot == 0 ? draw.color0_base : slot == 1 ? draw.color1_base : 0);
+                const auto& ps_target = draw.ps.color_targets[slot];
+                uint32_t mask = ps_target.write_mask;
+                if (!ps_target.format && !target.base && slot == 0)
+                    mask = draw.ps.color_write_mask;
+                else if (!ps_target.format && !target.base && slot == 1)
+                    mask = draw.ps.color1_write_mask;
+                if (base == scanout && mask) return true;
+            }
+            return false;
+        });
+    // Presentation bytes are an oracle only when a graphics draw wrote a known scanout. A missing
+    // scanout identity proves no relationship either. A compute storage alias may also write it,
+    // but this capture path has no proof for that case; fail closed until it does.
+    const bool no_proven_scanout_draw = !writes_scanout;
+    if (no_proven_scanout_draw)
+        pending->capture.metadata.renderer_env.emplace_back(kGpuReplayNoScanoutDrawEnv, "1");
+    pending->capture.expected_output_valid = !output.empty() && !no_proven_scanout_draw;
+    pending->capture.expected_output_bytes = pending->capture.expected_output_valid ? output.size() : 0;
+    pending->capture.expected_output_hash = pending->capture.expected_output_valid
+        ? gpu_capture_hash(output) : 0;
     if (!write_gpu_capture(pending->path, pending->capture, error)) return false;
-    if (output.empty()) {
-        std::fprintf(stderr, "[gpucap] wrote %s without output oracle\n", pending->path.c_str());
+    if (!pending->capture.expected_output_valid) {
+        std::fprintf(stderr, "[gpucap] wrote %s without output oracle%s\n",
+                     pending->path.c_str(),
+                     !output.empty() && !scanout ? " (scanout identity unavailable)" :
+                     !output.empty() && no_proven_scanout_draw
+                         ? " (no graphics draw wrote scanout)" : "");
     } else {
         std::fprintf(stderr, "[gpucap] wrote %s output_bytes=%zu hash=%016llx\n",
                      pending->path.c_str(), output.size(),

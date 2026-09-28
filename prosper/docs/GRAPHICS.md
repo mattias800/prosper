@@ -705,12 +705,18 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   with the `ms:<millis>` form instead (`diagnostic_window.hpp`), whose origin is the same *kind* as
   `PROSPER_GPU_CAPTURE_AFTER_MS`'s — the first armed check on its own path — so the two can be aimed
   at one moment to within the gap between those two lazily-started clocks, not exactly. #1968.
-- **Arming `PROSPER_GPU_CAPTURE` takes the run off the default rendering path.** It is in the
-  `live_gpu_targets` disable list (`live_renderer.cpp`), alongside `PROSPER_DUMP_RTGROUPS` and the
-  rest, so every env-triggered capture run is the CPU-readback path. The guest's own command stream
-  and its resources are unaffected — which is why a capture is still the right instrument for "what
-  did the guest submit" — but do not compare a capture run's *renderer* behaviour, target residency
-  or publish provenance against a default run. #1968.
+- **Arming `PROSPER_GPU_CAPTURE` no longer takes the run off the default rendering path (#3895).**
+  Until #3895 it was in the `live_gpu_targets` disable list (`live_renderer.cpp`), so every
+  env-triggered capture run rendered through the CPU-readback path from boot, even with
+  `PROSPER_GPU_CAPTURE_AFTER` aimed far in the future — which is how #3890's capture-only black UI
+  hid. It now keeps GPU-resident targets: the one selected submit's referenced targets are read back
+  on demand through the capture RTT-seed reader (as the interactive F9 grab always did), that submit
+  alone presents through the CPU path so the capsule keeps its output oracle, and portable compute
+  modules are compiled only inside the capture window (`capture_compute_policy.hpp`).
+  `PROSPER_GPU_CAPTURE_READBACK=1` restores the old whole-run readback as an A/B arm. Records made
+  before #3895 (the #1968 and #2114 entries here among them) describe capture runs on the readback
+  path. `PROSPER_DUMP_RTGROUPS`, `PROSPER_RTTLOG` and the other per-pass pixel diagnostics are still
+  in the disable list.
 - **A `0x0` native pass extent does not occur in practice — do not reach for MRT-prefix truncation to
   explain a missing colour attachment.** The renderer truncated the prefix whenever a bound slot's
   extent differed from MRT0's, and `native_w`/`native_h` are `0` whenever the guest's
@@ -724,7 +730,7 @@ re-deriving — and read it before forming a hypothesis about a frozen, black, o
   *rendered* MRT1 attachments `206 -> 0` under the old predicate, against `206` under the fix.
   Without that arm a census reporting zero is void, not negative.
   **Bound on the instrument, and it is the part worth inheriting:** `PROSPER_RTTLOG` is itself in the
-  `live_gpu_targets` disable list — same family as the `PROSPER_GPU_CAPTURE` entry above — so this
+  `live_gpu_targets` disable list — the family the `PROSPER_GPU_CAPTURE` entry above left in #3895 — so this
   census ran the CPU-render path, not the default persistent-GPU-target route. No input to the
   truncation decision depends on that flag, so the `native=0x0` and truncation counts stand; but the
   forced arm never exercised the GPU-side cost of *keeping* an attachment, which is argued from the

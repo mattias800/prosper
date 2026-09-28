@@ -44,6 +44,9 @@ struct ColorTargetState {
     // a missing register must not be mistaken for a one-slice view.
     bool has_view = false, has_attrib3 = false;
     uint32_t slice_start = 0, slice_max = 0;
+    // CB_COLORn_ATTRIB.NUM_SAMPLES (log2). prosper renders single-sample, but an MSAA target's
+    // guest footprint is `samples` times its single-sample size (#3906 overlap checks).
+    uint32_t log2_samples = 0;
     uint32_t mip0_depth = 0, resource_type = 0;
     bool in_mip_tail = false;
     uint32_t mip_tail_offset = 0, mip_tail_x = 0, mip_tail_y = 0;
@@ -410,6 +413,9 @@ struct ResolvedPipelineState {
         uint32_t alpha_blend_op = 0;
         uint32_t write_mask = 0;
         bool disable_rop3 = false;
+        // CB_COLORn_ATTRIB.NUM_SAMPLES (log2): guest footprint only; prosper renders single-sample.
+        // Not serialized in captures (a replay sees 0, the pre-#3906 single-sample footprint).
+        uint32_t log2_samples = 0;
     };
     // Complete hardware MRT state. Slots 0/1 mirror the legacy named fields above.
     std::array<ColorTarget, kColorTargetCount> color_targets{};

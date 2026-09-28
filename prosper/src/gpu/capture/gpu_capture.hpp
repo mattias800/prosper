@@ -27,6 +27,8 @@ struct GpuCaptureMetadata {
 
 inline constexpr const char* kGpuReplayScanoutAddressEnv =
     "PROSPER_GPU_REPLAY_SCANOUT_ADDR";
+inline constexpr const char* kGpuReplayNoScanoutDrawEnv =
+    "PROSPER_GPU_REPLAY_NO_SCANOUT_DRAW";
 inline constexpr const char* kGpuCaptureSave0Env = "PROSPER_SAVE0";
 inline constexpr const char* kGpuCaptureResourceProvenanceEnv =
     "PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE";
@@ -491,7 +493,9 @@ bool read_all_gpu_capture_ds_seeds(std::vector<GpuCaptureDsSeed>& seeds, std::st
 bool gpu_capture_ds_seed_snapshot_available();
 // Add only live depth/stencil checkpoints referenced by this capsule's realized draws. Standalone
 // pre-render captures otherwise replay a read-only depth pass against a newly-cleared attachment.
-bool capture_referenced_gpu_ds_seeds(GpuCaptureFile& capture, std::string& error);
+bool capture_referenced_gpu_ds_seeds(
+    GpuCaptureFile& capture, std::string& error,
+    const std::vector<GpuCaptureDsSeed>* pre_submit_seeds = nullptr);
 void set_gpu_replay_ds_seed_writer(ReplayDsSeedWriter writer);
 bool restore_gpu_replay_ds_seeds(const std::vector<GpuCaptureDsSeed>& seeds, std::string& error);
 uint64_t gpu_capture_hash(const uint8_t* data, size_t size);
@@ -502,6 +506,33 @@ bool gpu_capture_output_nonzero_matches(const std::vector<uint8_t>& output, size
                                         size_t max_nonzero, size_t* observed = nullptr);
 const char* shader_program_stage_name(ShaderProgramStage stage);
 const char* realization_failure_reason_name(RealizationFailureReason reason);
+
+// While a runtime one-shot capture is pending (from begin_requested_gpu_capture until its
+// PendingGpuCapture is destroyed by finish_requested_gpu_capture), the submit being captured needs
+// its presented frame as CPU pixels: the capsule's output oracle, and the accept/reject input of an
+// output-triggered candidate. The live renderer keeps its targets GPU-resident regardless and only
+// routes that submit's present through the CPU path (#3895). Movable, not copyable; inert unless
+// activated, so hand-built pending captures in tests and tools do not engage it.
+class GpuCaptureCpuOutputHold {
+public:
+    GpuCaptureCpuOutputHold() = default;
+    ~GpuCaptureCpuOutputHold();
+    GpuCaptureCpuOutputHold(const GpuCaptureCpuOutputHold&) = delete;
+    GpuCaptureCpuOutputHold& operator=(const GpuCaptureCpuOutputHold&) = delete;
+    GpuCaptureCpuOutputHold(GpuCaptureCpuOutputHold&& other) noexcept : active_(other.active_) {
+        other.active_ = false;
+    }
+    GpuCaptureCpuOutputHold& operator=(GpuCaptureCpuOutputHold&& other) noexcept;
+    void activate();
+    bool active() const { return active_; }
+private:
+    bool active_ = false;
+};
+bool gpu_capture_requires_cpu_output();
+uint32_t gpu_capture_cpu_output_hold_count_for_test();
+// True while the PROSPER_GPU_CAPTURE window is open (see env_capture_requires_portable_compute):
+// capture-bound compute then compiles device-independent storage paths. False on a normal run.
+bool env_gpu_capture_requires_portable_compute();
 
 // Runtime hook used by execute_and_present. PROSPER_GPU_CAPTURE=<path> captures exactly one realized
 // submit. MIN_DRAWS/MAX_DRAWS, COMPUTE_ADDR, SHADER_ADDR, and TARGET_DIM select a candidate class;
@@ -525,12 +556,29 @@ struct PendingGpuCapture {
     // post-producer operation realization during finish.
     std::vector<MemorySnapshot> pre_submit_memory;
     std::vector<uint8_t> pre_submit_compute_gds;
+    // #3908: the pre-submit contents of every colour target this submit's draws write, read
+    // BEFORE the submit ran. A deferred capture materializes after execution, when the live cache
+    // already holds the submit's own output for exactly those targets; their seeds must come from
+    // here. `pre_submit_rtt_absent` lists targets that did not exist yet (no seed). Every other
+    // address is unchanged by the submit's draws and is still read live.
+    std::vector<GpuCaptureRttSeed> pre_submit_rtt_seeds;
+    std::vector<uint64_t> pre_submit_rtt_absent;
+    bool pre_submit_rtt_seeds_taken = false;
+    // A deferred capture materializes after the submit. Depth/stencil checkpoints must come from
+    // before it, even when the submit writes the same persistent attachment it reads.
+    std::vector<GpuCaptureDsSeed> pre_submit_ds_seeds;
+    bool pre_submit_ds_seeds_taken = false;
+    std::string pre_submit_ds_error;
     bool resource_provenance_armed = false;
     GpuCaptureResourceSelector resource_provenance_selector;
     uint32_t resource_provenance_matches = 0;
     std::string resource_provenance_error;
     GpuCaptureResourceProvenance resource_provenance;
     GpuCaptureBlob resource_provenance_realization_blob;
+    GpuCaptureCpuOutputHold cpu_output_hold;
+    // Created by the PROSPER_GPU_CAPTURE environment path (not an interactive grab or a hand-built
+    // pending capture); its completion closes the environment capture window.
+    bool env_capture = false;
 };
 bool parse_gpu_capture_resource_selector(std::string_view text,
                                          GpuCaptureResourceSelector& selector);

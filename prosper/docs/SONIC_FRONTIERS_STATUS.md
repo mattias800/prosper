@@ -864,12 +864,44 @@ being closed; the rest are this document's own. **Do not restate the row count i
 a stated total is stale as soon as the next lane appends, and every lane that adds a row would have
 to remember to update it. The last one did not (review of #2820).
 
+- **"Every flip goes through the GPU-present CPU fallback because of the 4K scanout's format, its
+  HDR/buffer attributes, or a flip-source mismatch."** False (#3915). The renderer's decline reason,
+  now named, was `no-render-target` on every flip: the renderer holds no target at either display
+  buffer, because program `0x20002fe800` writes both (`0x200a160000`, `0x200c140000`) as tile-27
+  RGBA8_UINT **compute storage images**, not as colour targets (`PROSPER_GUEST_WRITE_WATCH` names
+  `compute-writeback(image-guest-bytes)` as their only writer). The fix mirrors that dispatch's own
+  result into a GPU image and presents it (`frontends/shared/present/compute_scanout.hpp`);
+  `PROSPER_COMPUTE_SCANOUT_VERIFY=1` compared 91 sampled flips across menus and gameplay against the
+  CPU fallback's frame and all were byte-identical.
+- **"The menus' two dropped draws per flip sample a depth layer that was rendered at another shape,
+  invalidated, or written by a pass that does not register it."** False (#3893). Every refusal of
+  the `0x2048a00000` 1024x1024x4 Float32 array now prints every retained DS identity at that base
+  (any extent or format, plus rebased planes inside the 4 x 4 MiB span): there is exactly **one**,
+  slice 0, D32, and nothing else for the whole title/menu phase. `PROSPER_DS_SLICE_CENSUS=1` agrees
+  (slice 0 only, every pass claims a valid depth write; the instrument keys by slice, so it could
+  have shown others). Cascades 1-3 are simply never attached by any DS pass, and their guest bytes
+  read all-zero on every sample over 90 s. The fix reads never-named layers from guest memory
+  instead of dropping the draw; the draw is a 3840x2160 pass (`color0=0x2017f20000`) binding the
+  array ~43 times, and no visible change was found in the menu frames.
 - **"#3731 leaves Sonic untouched because its compute target has no device image."** False:
   `render_draw_pass_rgba` creates a persistent target when the HUD blend pass renders to that base,
   so later publications encounter an existing image. The stale-image restoration defect therefore
   affects Sonic too. The owner confirms the world is visible with the fix, with shader failures
   still present; the earlier uncontrolled non-black percentages are not a comparable measurement
   ([#3731](https://github.com/mattias800/prosper/pull/3731)).
+- **"The ~2 draws per flip dropped on the title and menus (#3893) come from one of the volume-authority
+  sites #3889 instrumented."** False: with per-site drop reasons (#3891 phase 3), 6,864 of 6,864
+  drops on the `reach-gameplay.pad` route are `render-array-reject/depth-unavailable` — a Float32
+  depth array at `0x2048a00000` whose retained layers are "missing or invalid"
+  (`read_persistent_ds_depth_array`), exactly 2.00 per flip until gameplay starts. The 64
+  `[render-array-reject]` lines that say so print in the first seconds and are then suppressed,
+  which is why a run tail never showed them ([#3893](https://github.com/mattias800/prosper/issues/3893)).
+- **"The menu and title screens are slow because of the depth-stage texture-reference cost"
+  (73-117 us/ref in the pre-#3882 census).** Gone: re-measured at 0.8-1.0 us/ref after #3882. The
+  menu cost was ONE 3840x2160 RGBA16F texture (`0x20121f0000`), an identity-only dim-5 RTT shell that
+  renderer authority kept out of the decode cache, so it was re-decoded on every submit (~2.4 ms, ~250
+  refs per 5 s). Now retained behind exact validation, and the menu runs at the guest's 30 flips/s cap
+  (#3873; `RENDERER_ARCHITECTURE_GAPS_2026_09_25.md` § Ruled out).
 
 | Hypothesis | Verdict and evidence |
 | --- | --- |

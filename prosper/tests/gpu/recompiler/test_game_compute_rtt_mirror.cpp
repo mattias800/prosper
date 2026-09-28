@@ -887,9 +887,8 @@ static int run_destination_mirror_regression() {
               tiled_target->pin_count == tiled_renderer_pins,
           "tiled R11 destination retains image and layout and releases compute leases");
 
-    // A different binding importing the same renderer image must keep the destination lease
-    // collision closed. The storage binding's own packed seed is allowed, but this sampled import
-    // is a second reader whose ordering and layout cannot be justified by the self-seed exception.
+    // The sampled binding reads the old renderer image during the dispatch. The separate output
+    // lease may publish into that same image only after the shader and readback staging are done.
     std::vector<uint32_t> collision_words(W * H, 0xdeadbeefu);
     const uint64_t collision_address = reinterpret_cast<uint64_t>(collision_words.data());
     DrawItem collision_producer = r11_producer;
@@ -927,6 +926,7 @@ static int run_destination_mirror_regression() {
     static const uint32_t image_copy_r11[] = {
         0x7E080300u, 0x7E0A0280u, // v4=x, v5=0
         0xF0000F08u, 0x00000004u, 0xBF8C3F70u, // load sampled binding 4
+        0x100000FFu, 0x3F000000u, // red = sampled red * 0.5, unlike the old image
         0xF0200F08u, 0x00020004u, 0xBF810000u, // store binding 5
     };
     const auto collision_spirv = recompile_compute(
@@ -938,27 +938,432 @@ static int run_destination_mirror_regression() {
     collision_item.code_addr = 0x37310015u;
     const auto collision_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
     CHECK(!collision_spirv.empty() && prosper::frontend::execute_live_compute_items({collision_item}),
-          "packed R11 sampled/storage collision completes through fallback");
+          "packed R11 sampled/storage alias completes");
     const auto collision_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    const bool read_alias_disabled = std::getenv("PROSPER_NO_COMPUTE_RTT_READ_ALIAS") != nullptr;
     CHECK(collision_after.r11_source_seed_recorded ==
                   collision_before.r11_source_seed_recorded + 1 &&
               collision_after.candidates == collision_before.candidates + 1 &&
-              collision_after.borrowed == collision_before.borrowed &&
-              collision_after.recorded == collision_before.recorded &&
-              collision_after.published == collision_before.published,
-          "second imported R11 binding rejects an otherwise borrowable destination");
-    CHECK(collision_seed.size() == W * H * sizeof(uint32_t) &&
-              std::memcmp(collision_words.data(), collision_seed.data(),
-                          collision_seed.size()) == 0,
-          "sampled R11 binding uses renderer pixels while guest fallback writes exact words");
-    CHECK(!import_live_render_target_image(collision_address, source_request, r11_source),
-          "rejected R11 destination does not restore strict renderer authority");
+              collision_after.borrowed == collision_before.borrowed + !read_alias_disabled &&
+              collision_after.recorded == collision_before.recorded + !read_alias_disabled &&
+              collision_after.published == collision_before.published + !read_alias_disabled,
+          "read-only R11 alias mirrors after shader use; explicit control declines it");
+    std::vector<uint32_t> collision_expected(W * H);
+    if (collision_seed.size() == collision_expected.size() * sizeof(uint32_t))
+        std::memcpy(collision_expected.data(), collision_seed.data(), collision_seed.size());
+    CHECK(std::all_of(collision_expected.begin(), collision_expected.begin() + W,
+                      [](uint32_t word) { return (word & 0x7ffu) == 0x3c0u; }),
+          "R11 sampled seed has unit red before the shader halves it");
+    for (size_t x = 0; x < W; ++x)
+        collision_expected[x] = (collision_expected[x] & ~0x7ffu) | 0x380u;
+    CHECK(collision_words == collision_expected,
+          "R11 sampled old pixels produce a distinct exact guest result");
+    const bool collision_importable = import_live_render_target_image(
+        collision_address, source_request, r11_source);
+    CHECK(collision_importable == !read_alias_disabled,
+          "successful R11 alias publication restores strict renderer authority");
+    if (collision_importable) release_live_render_target_image(collision_address);
+    if (!read_alias_disabled) {
+        std::vector<uint8_t> mirrored;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  collision_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+                  mirrored, r11_readback_error) &&
+                  mirrored.size() == collision_words.size() * sizeof(uint32_t) &&
+                  std::memcmp(mirrored.data(), collision_expected.data(), mirrored.size()) == 0,
+              "read-only R11 alias copies the changed completed result into the renderer image");
+    }
     collision_target = prosper::test::find_persistent_color_target(
         collision_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32, false);
     CHECK(collision_target && collision_target->image == collision_image &&
               collision_target->layout == collision_layout &&
               collision_target->pin_count == collision_renderer_pins,
-          "rejected R11 destination releases imports and preserves image layout");
+          "R11 read alias releases all three leases and preserves the renderer layout");
+
+    // Astro's resource order is the opposite: the output's seed is prepared before the sampled
+    // alias transitions their shared renderer image. A fresh draw makes guest bytes stale again.
+    CHECK(!render(collision_producer).empty(),
+          "reverse-order R11 source is repainted independently of the prior guest result");
+    std::vector<uint8_t> reverse_seed;
+    CHECK(prosper::test::readback_persistent_color_target(
+              collision_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+              reverse_seed, r11_readback_error) && reverse_seed == collision_seed,
+          "reverse-order R11 arm starts from the same distinct old renderer pixels");
+    ShaderResourceTable reverse_table;
+    ShaderResource reverse_output = collision_output;
+    ShaderResource reverse_sampled = collision_sampled;
+    reverse_output.binding = 4;  // output is now the first reflected descriptor
+    reverse_sampled.binding = 5; // shader SGPR bases still address their original resources
+    reverse_table.resources = {reverse_output, reverse_sampled};
+    const auto reverse_spirv = recompile_compute(
+        image_copy_r11, std::size(image_copy_r11), &reverse_table, r11_config);
+    const auto reverse_reflection = validate_spirv_descriptor_interface(
+        reverse_spirv, &reverse_table, 0, SpirvShaderStage::Compute, false);
+    const auto* reverse_write = find_spirv_descriptor_binding(reverse_reflection, 0, 4);
+    const auto* reverse_read = find_spirv_descriptor_binding(reverse_reflection, 0, 5);
+    CHECK(!reverse_spirv.empty() && reverse_reflection.ok() && reverse_write &&
+              reverse_read && reverse_write->writable && !reverse_read->writable,
+          "reverse-order R11 fixture reflects output before sampled input");
+    ComputeItem reverse_item = collision_item;
+    reverse_item.spirv = reverse_spirv;
+    reverse_item.resources = std::make_shared<ShaderResourceTable>(reverse_table);
+    reverse_item.code_addr = 0x3731001bu;
+    const auto reverse_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(!reverse_spirv.empty() &&
+              prosper::frontend::execute_live_compute_items({reverse_item}),
+          "reverse-order R11 alias dispatch completes");
+    const auto reverse_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(reverse_after.r11_source_seed_recorded ==
+                  reverse_before.r11_source_seed_recorded + 1 &&
+              reverse_after.candidates == reverse_before.candidates + 1 &&
+              reverse_after.borrowed == reverse_before.borrowed + !read_alias_disabled &&
+              reverse_after.recorded == reverse_before.recorded + !read_alias_disabled &&
+              reverse_after.published == reverse_before.published + !read_alias_disabled,
+          "output-before-sampled R11 alias obeys the same controlled admission");
+    CHECK(collision_words == collision_expected,
+          "reverse-order alias reads repainted old pixels and writes the distinct expected result");
+    if (!read_alias_disabled) {
+        std::vector<uint8_t> mirrored;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  collision_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+                  mirrored, r11_readback_error) &&
+                  mirrored.size() == collision_expected.size() * sizeof(uint32_t) &&
+                  std::memcmp(mirrored.data(), collision_expected.data(), mirrored.size()) == 0,
+              "reverse-order R11 mirror contains the changed output");
+    }
+    collision_target = prosper::test::find_persistent_color_target(
+        collision_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32, false);
+    CHECK(collision_target && collision_target->image == collision_image &&
+              collision_target->layout == collision_layout &&
+              collision_target->pin_count == collision_renderer_pins,
+          "reverse-order R11 alias restores the original renderer ownership");
+
+    std::vector<uint16_t> alias16_words;
+    if (!rgba16_mirror_disabled) {
+        alias16_words.assign(W * H * 4, 0x7777u);
+        const uint64_t alias16_address = reinterpret_cast<uint64_t>(alias16_words.data());
+        DrawItem alias16_producer = rgba16_producer;
+        alias16_producer.color0_base = alias16_address;
+        CHECK(!render(alias16_producer).empty(),
+              "RGBA16F read-alias fixture creates a renderer source");
+        std::vector<uint8_t> alias16_seed;
+        std::string alias16_error;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  alias16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+                  alias16_seed, alias16_error) &&
+                  alias16_seed.size() == alias16_words.size() * sizeof(uint16_t),
+              "RGBA16F read alias starts from known renderer pixels");
+        std::vector<uint16_t> alias16_expected(alias16_words.size());
+        if (alias16_seed.size() == alias16_expected.size() * sizeof(uint16_t))
+            std::memcpy(alias16_expected.data(), alias16_seed.data(), alias16_seed.size());
+        CHECK(std::all_of(alias16_expected.begin(), alias16_expected.begin() + W * 4,
+                          [channel = size_t{0}](uint16_t word) mutable {
+                              constexpr uint16_t expected[] = {0x4000u, 0xbc00u, 0x3800u, 0x3c00u};
+                              return word == expected[(channel++) % 4];
+                          }),
+              "RGBA16F sampled seed has the expected nonuniform channel values");
+        for (size_t x = 0; x < W; ++x) alias16_expected[x * 4] = 0x3c00u;
+        const auto* alias16_target = prosper::test::find_persistent_color_target(
+            alias16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT);
+        const VkImage alias16_image = alias16_target ? alias16_target->image : VK_NULL_HANDLE;
+        const VkImageLayout alias16_layout = alias16_target
+            ? alias16_target->layout : VK_IMAGE_LAYOUT_UNDEFINED;
+        const uint32_t alias16_pins = alias16_target ? alias16_target->pin_count : 0;
+        ShaderResource alias16_sampled = rgba16_output;
+        alias16_sampled.cls = ResourceClass::Texture;
+        alias16_sampled.binding = 4;
+        alias16_sampled.sgpr_base = 0;
+        alias16_sampled.gpu_addr = alias16_address;
+        ShaderResource alias16_output = rgba16_output;
+        alias16_output.gpu_addr = alias16_address;
+        alias16_output.binding = 4;
+        alias16_sampled.binding = 5;
+        ShaderResourceTable alias16_table;
+        // Reflection sorts by descriptor binding, not resource-table insertion. Output-first is
+        // the missing path: sampled-first uses the older seed_from_imported mirror, whereas Astro
+        // prepares its standalone seed before importing the sampled binding.
+        alias16_table.resources = {alias16_output, alias16_sampled};
+        const auto alias16_spirv = recompile_compute(
+            image_copy_r11, std::size(image_copy_r11), &alias16_table, rgba16_config);
+        const auto alias16_reflection = validate_spirv_descriptor_interface(
+            alias16_spirv, &alias16_table, 0, SpirvShaderStage::Compute, false);
+        const auto* alias16_write = find_spirv_descriptor_binding(alias16_reflection, 0, 4);
+        const auto* alias16_read = find_spirv_descriptor_binding(alias16_reflection, 0, 5);
+        CHECK(!alias16_spirv.empty() && alias16_reflection.ok() && alias16_write &&
+                  alias16_read && alias16_write->writable && !alias16_read->writable,
+              "RGBA16F fixture reflects output before sampled input");
+        ComputeItem alias16_item = rgba16_full;
+        alias16_item.spirv = alias16_spirv;
+        alias16_item.resources = std::make_shared<ShaderResourceTable>(alias16_table);
+        alias16_item.launch.threads_y = alias16_item.launch.local_y = 1;
+        alias16_item.code_addr = 0x3731001au;
+        const auto alias16_before =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(!alias16_spirv.empty() &&
+                  prosper::frontend::execute_live_compute_items({alias16_item}),
+              "RGBA16F read alias executes with old sampled pixels and partial output");
+        const auto alias16_after =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(alias16_after.rgba16_source_seed_recorded ==
+                  alias16_before.rgba16_source_seed_recorded + 1 &&
+                  alias16_after.candidates == alias16_before.candidates + 1 &&
+                  alias16_after.borrowed == alias16_before.borrowed + !read_alias_disabled &&
+                  alias16_after.recorded == alias16_before.recorded + !read_alias_disabled &&
+                  alias16_after.published == alias16_before.published + !read_alias_disabled,
+              "RGBA16F read alias mirrors after shader use; control keeps CPU authority");
+        CHECK(alias16_words == alias16_expected,
+              "RGBA16F sampled old pixels produce a distinct exact guest result");
+        LiveTargetImageImport alias16_import;
+        const bool alias16_gpu_valid = import_live_render_target_image(
+            alias16_address, source_request, alias16_import);
+        CHECK(alias16_gpu_valid == !read_alias_disabled,
+              "RGBA16F read alias publishes strict GPU authority only when enabled");
+        if (alias16_gpu_valid) release_live_render_target_image(alias16_address);
+        if (!read_alias_disabled) {
+            std::vector<uint8_t> mirrored;
+            CHECK(prosper::test::readback_persistent_color_target(
+                      alias16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+                      mirrored, alias16_error) &&
+                      mirrored.size() == alias16_expected.size() * sizeof(uint16_t) &&
+                      std::memcmp(mirrored.data(), alias16_expected.data(), mirrored.size()) == 0,
+                  "RGBA16F mirror contains the changed sampled result");
+        }
+        alias16_target = prosper::test::find_persistent_color_target(
+            alias16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT, false);
+        // This is the renderer owner's bookkeeping, not a query of VkImage's actual layout.
+        // The preceding readback is also exercised under strict Vulkan validation, which checks
+        // the compute submit's final GENERAL -> saved-layout transition before that readback.
+        CHECK(alias16_target && alias16_target->image == alias16_image &&
+                  alias16_target->layout == alias16_layout &&
+                  alias16_target->pin_count == alias16_pins,
+              "RGBA16F read alias retains renderer image ownership and layout bookkeeping");
+    }
+
+    // A compute-owned output can reach the renderer first as CPU pixels, without any graphics
+    // pass having allocated its image. A full overwrite must be able to create that destination;
+    // failure must leave it unreadable, and only completed guest writeback may publish it.
+    std::vector<uint8_t> cold_guest(W * H * 4, 0x39);
+    const uint64_t cold_address = reinterpret_cast<uint64_t>(cold_guest.data());
+    auto cold_cpu = std::make_shared<std::vector<uint8_t>>(cold_guest);
+    notify_live_render_target_image_written(
+        {cold_address, W, H, LiveTargetPixelFormat::Rgba8Unorm, std::move(cold_cpu)});
+    CHECK(!prosper::test::find_persistent_color_target(
+              cold_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false),
+          "CPU-only RTT has no renderer image before compute destination admission");
+    LiveTargetImageImport cold_borrow;
+    CHECK(!borrow_live_render_target_image_destination(
+              cold_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm}, cold_borrow) &&
+              cold_borrow.refusal == LiveTargetImageImport::Refusal::NoPersistentImage,
+          "ordinary destination request cannot create an image implicitly");
+    ShaderResourceTable cold_table = table;
+    cold_table.resources[0].gpu_addr = cold_address;
+    ComputeItem cold_item = item;
+    cold_item.resources = std::make_shared<ShaderResourceTable>(cold_table);
+    cold_item.code_addr = 0x37310016u;
+    prosper::frontend::live_compute_fail_next_storage_readback_for_test();
+    const auto cold_failed_before =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(!prosper::frontend::execute_live_compute_items({cold_item}),
+          "newly allocated destination reports failed compute completion");
+    const auto cold_failed_after =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    const auto* cold_target = prosper::test::find_persistent_color_target(
+        cold_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false);
+    CHECK(cold_failed_after.recorded == cold_failed_before.recorded + 1 &&
+              cold_failed_after.published == cold_failed_before.published &&
+              cold_target && cold_target->image && !cold_target->valid &&
+              cold_target->layout == VK_IMAGE_LAYOUT_UNDEFINED && !cold_target->pin_count &&
+              !import_live_render_target_image(cold_address, source_request, source_import),
+          "failed first overwrite retains no GPU read authority or lease");
+    CHECK(cold_target && cold_target->compute_overwrite_uninitialized,
+          "only the compute allocator tags its uninitialized destination for retry");
+    if (cold_target) {
+        auto* mutable_target = prosper::test::find_persistent_color_target(
+            cold_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false);
+        mutable_target->compute_overwrite_uninitialized = false;
+        LiveTargetImageImport unrelated_undefined;
+        CHECK(!borrow_live_render_target_image_destination(
+                  cold_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm, true,
+                                 static_cast<void*>(prosper::test::render_vk_ctx().dev)},
+                  unrelated_undefined) &&
+                  unrelated_undefined.refusal ==
+                      LiveTargetImageImport::Refusal::NoPersistentImage,
+              "creation permission does not borrow an unrelated undefined-layout image");
+        mutable_target->compute_overwrite_uninitialized = true;
+    }
+    const VkImage cold_image = cold_target ? cold_target->image : VK_NULL_HANDLE;
+    const auto cold_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(prosper::frontend::execute_live_compute_items({cold_item}),
+          "retry overwrites the reserved renderer image from UNDEFINED");
+    const auto cold_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    cold_target = prosper::test::find_persistent_color_target(
+        cold_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false);
+    CHECK(cold_after.recorded == cold_before.recorded + 1 &&
+              cold_after.published == cold_before.published + 1 &&
+              cold_target && cold_target->image == cold_image && cold_target->valid &&
+              cold_target->layout == VK_IMAGE_LAYOUT_GENERAL && !cold_target->pin_count &&
+              import_live_render_target_image(cold_address, source_request, source_import),
+          "completed first overwrite publishes the exact device image and releases its lease");
+    if (source_import.valid()) release_live_render_target_image(cold_address);
+    std::vector<uint8_t> cold_pixels;
+    std::string cold_error;
+    CHECK(prosper::test::readback_persistent_color_target(
+              cold_address, W, H, VK_FORMAT_R8G8B8A8_UNORM,
+              cold_pixels, cold_error) && cold_pixels == cold_guest,
+          "new renderer image has the same completed texels as guest writeback");
+
+    std::vector<uint8_t> budget_guest(W * H * 4, 0x62);
+    const uint64_t budget_address = reinterpret_cast<uint64_t>(budget_guest.data());
+    auto budget_cpu = std::make_shared<std::vector<uint8_t>>(budget_guest);
+    notify_live_render_target_image_written(
+        {budget_address, W, H, LiveTargetPixelFormat::Rgba8Unorm, std::move(budget_cpu)});
+    ShaderResourceTable budget_table = table;
+    budget_table.resources[0].gpu_addr = budget_address;
+    ComputeItem budget_item = item;
+    budget_item.resources = std::make_shared<ShaderResourceTable>(budget_table);
+    budget_item.code_addr = 0x37310017u;
+    LiveTargetImageImport wrong_device_borrow;
+    CHECK(!borrow_live_render_target_image_destination(
+              budget_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm, true,
+                               reinterpret_cast<void*>(uintptr_t{1})},
+              wrong_device_borrow) &&
+              wrong_device_borrow.refusal == LiveTargetImageImport::Refusal::DeviceMismatch &&
+              !prosper::test::find_persistent_color_target(
+                  budget_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false),
+          "separate compute device refuses before allocating renderer residency");
+    VkDeviceSize& resident_bytes = prosper::test::persistent_color_target_bytes();
+    const VkDeviceSize actual_resident_bytes = resident_bytes;
+    resident_bytes = prosper::test::persistent_color_target_limit();
+    LiveTargetImageImport budget_borrow;
+    CHECK(!borrow_live_render_target_image_destination(
+              budget_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm, true,
+                               static_cast<void*>(prosper::test::render_vk_ctx().dev)},
+              budget_borrow) &&
+              budget_borrow.refusal ==
+                  LiveTargetImageImport::Refusal::DestinationCreationRefused,
+          "budget refusal identifies image creation as the fallback gate");
+    const auto budget_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    const bool budget_completed = prosper::frontend::execute_live_compute_items({budget_item});
+    const auto budget_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    resident_bytes = actual_resident_bytes;
+    CHECK(budget_completed, "residency refusal retains successful compute execution");
+    CHECK(std::equal(budget_guest.begin(), budget_guest.begin() + W * 4,
+                     cold_guest.begin()) &&
+              std::all_of(budget_guest.begin() + W * 4, budget_guest.end(),
+                          [](uint8_t value) { return value == 0x62; }),
+          "residency refusal writes the covered row and preserves untouched guest rows");
+    CHECK(budget_after.candidates == budget_before.candidates + 1,
+          "residency refusal still reaches the destination admission check");
+    CHECK(budget_after.borrowed == budget_before.borrowed,
+          "residency refusal does not borrow a destination image");
+    CHECK(!prosper::test::find_persistent_color_target(
+              budget_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false),
+          "residency refusal leaves no renderer image");
+    LiveTargetSnapshot budget_snapshot;
+    CHECK(read_live_render_target(budget_address, budget_snapshot) &&
+              budget_snapshot.pixels &&
+              *budget_snapshot.pixels == budget_guest,
+          "residency refusal publishes the exact final guest bytes as a CPU RTT");
+
+    // Count admission is independent of the byte gauge. Occupy only this test's cache keys so
+    // reverting to deferred-graphics headroom would incorrectly admit the next compute image.
+    std::vector<uint8_t> count_guest(W * H * 4, 0x42);
+    const uint64_t count_address = reinterpret_cast<uint64_t>(count_guest.data());
+    notify_live_render_target_image_written(
+        {count_address, W, H, LiveTargetPixelFormat::Rgba8Unorm,
+         std::make_shared<std::vector<uint8_t>>(count_guest)});
+    auto& color_cache = prosper::test::persistent_color_target_cache();
+    std::vector<prosper::test::PersistentColorTargetKey> count_keys;
+    const size_t count_limit = prosper::test::persistent_color_target_count_limit();
+    CHECK(resident_bytes < prosper::test::persistent_color_target_limit() / 2,
+          "count refusal fixture has independent renderer byte-budget headroom");
+    CHECK(count_limit <= 4096, "focused count-bound fixture needs a bounded configured limit");
+    if (count_limit <= 4096) {
+        for (uint64_t i = 0; color_cache.size() < count_limit; ++i) {
+            const prosper::test::PersistentColorTargetKey key{
+                0xf000000000000000ull + i, W, H, VK_FORMAT_R8G8B8A8_UNORM};
+            if (color_cache.try_emplace(key).second) count_keys.push_back(key);
+        }
+        LiveTargetImageImport count_borrow;
+        CHECK(!borrow_live_render_target_image_destination(
+                  count_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm, true,
+                                  static_cast<void*>(prosper::test::render_vk_ctx().dev)},
+                  count_borrow) &&
+                  count_borrow.refusal ==
+                      LiveTargetImageImport::Refusal::DestinationCreationRefused &&
+                  !prosper::test::find_persistent_color_target(
+                      count_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false),
+              "compute-only destination obeys the nominal image count without batch headroom");
+        for (const auto& key : count_keys) color_cache.erase(key);
+    }
+
+    if (!rgba16_mirror_disabled) {
+        // This is the 4K Outer Wilds format: a compute-written RGBA16F surface with no prior
+        // graphics allocation. The next partial dispatch must import the newly created image.
+        std::vector<uint16_t> cold16_words(W * H * 4, 0x5555u);
+        const uint64_t cold16_address = reinterpret_cast<uint64_t>(cold16_words.data());
+        auto cold16_cpu = std::make_shared<std::vector<uint8_t>>(
+            cold16_words.size() * sizeof(uint16_t), 0x55);
+        notify_live_render_target_image_written(
+            {cold16_address, W, H, LiveTargetPixelFormat::Rgba16Float,
+             std::move(cold16_cpu)});
+        ShaderResourceTable cold16_table = rgba16_table;
+        cold16_table.resources[0].gpu_addr = cold16_address;
+        ComputeItem cold16_full = rgba16_full;
+        cold16_full.spirv = recompile_compute(
+            store_red_r11, std::size(store_red_r11), &cold16_table, rgba16_config);
+        CHECK(!cold16_full.spirv.empty(), "nonuniform cold RGBA16F producer recompiles");
+        cold16_full.resources = std::make_shared<ShaderResourceTable>(cold16_table);
+        cold16_full.code_addr = 0x37310018u;
+        const auto cold16_before =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(prosper::frontend::execute_live_compute_items({cold16_full}),
+              "cold RGBA16F storage output completes");
+        const auto cold16_after =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        const auto* cold16_target = prosper::test::find_persistent_color_target(
+            cold16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT, false);
+        CHECK(cold16_after.recorded == cold16_before.recorded + 1 &&
+                  cold16_after.published == cold16_before.published + 1 &&
+                  cold16_target && cold16_target->valid &&
+                  cold16_target->layout == VK_IMAGE_LAYOUT_GENERAL &&
+                  import_live_render_target_image(
+                      cold16_address, source_request, rgba16_source),
+              "cold RGBA16F result becomes a readable exact renderer image");
+        if (rgba16_source.valid()) release_live_render_target_image(cold16_address);
+        std::vector<uint16_t> cold16_expected(W * H * 4);
+        for (size_t pixel = 0; pixel < W * H; ++pixel) {
+            cold16_expected[pixel * 4] = 0x3c00u; // red=1 from the complete first dispatch
+            cold16_expected[pixel * 4 + 3] = 0x3c00u;
+        }
+        CHECK(cold16_words == cold16_expected,
+              "cold RGBA16F first write establishes distinct untouched rows");
+        ComputeItem cold16_partial = cold16_full;
+        cold16_partial.spirv = rgba16_partial_spirv;
+        cold16_partial.launch.threads_y = cold16_partial.launch.local_y = 1;
+        cold16_partial.code_addr = 0x37310019u;
+        const auto cold16_seed_before =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(prosper::frontend::execute_live_compute_items({cold16_partial}),
+              "partial RGBA16F writer consumes the newly created renderer image");
+        const auto cold16_seed_after =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(cold16_seed_after.rgba16_source_seed_recorded ==
+                  cold16_seed_before.rgba16_source_seed_recorded + 1 &&
+                  cold16_seed_after.published == cold16_seed_before.published + 1,
+              "cold RGBA16F target completes the GPU seed and destination publication loop");
+        for (size_t x = 0; x < W; ++x) cold16_expected[x * 4] = 0;
+        CHECK(cold16_words == cold16_expected,
+              "cold RGBA16F partial write preserves the completed red rows below row zero");
+        std::vector<uint8_t> cold16_pixels;
+        std::string cold16_error;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  cold16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+                  cold16_pixels, cold16_error) &&
+                  cold16_pixels.size() == cold16_expected.size() * sizeof(uint16_t) &&
+                  std::memcmp(cold16_pixels.data(), cold16_expected.data(),
+                              cold16_pixels.size()) == 0,
+              "cold RGBA16F renderer image retains the exact nonuniform partial result");
+    }
     return fails ? 1 : 0;
 }
 

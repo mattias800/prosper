@@ -9,6 +9,11 @@ found Vulkan.
   present. It is a *driver* for the offscreen backend rather than the backend itself; the pipeline,
   pass and readback code it calls lives in `tests/fixtures/render_runner.h` (whose directory name is
   a trap — see that folder's `AGENTS.md`).
+  Its submit callback is being carved into named pieces (#3892); those pieces live in
+  `submit_renderer/` (see its `AGENTS.md`), and `live_renderer_internal.hpp` holds the file's
+  former anonymous-namespace helpers that the pieces share (RTT cache types, texture-decode cache
+  keys, the guest-write drain). Include that header only from `live_renderer.cpp` and
+  `submit_renderer/`; it is not an API.
 - `live_compute.cpp` — the compute half, and a **separate Vulkan backend**, not a caller of the
   render one. It builds its own device (or adopts the renderer's when one is published), its own
   pipeline cache, descriptor pools, memory pool and command buffers, and does not include
@@ -96,6 +101,20 @@ and replaced hash buckets remain until arena destruction. Every map dies before 
 the arena never enters submission cleanup callbacks. `PROSPER_NO_BUFFER_LOOKUP_ARENA` selects
 direct PMR heap allocation; unsupported PMR deployment targets retain ordinary standard maps.
 Allocation observations count upstream heap requests/bytes, not nodes or GPU buffer traffic.
+
+## Native BCn textures
+
+A plain 2D sampled BC texture reaches Vulkan as its detiled 4x4 blocks (`VK_FORMAT_BC*`) when the
+device samples BC, instead of being CPU-decoded to RGBA8 (#3873). A declared mip chain goes native
+only when `shader_resource_block_mip_chain_plan` can place every guest level (tiled, power-of-two,
+live guest memory); the backend then copies those levels rather than blit-generating them, and the
+persistent cache validates and watches the WHOLE chain allocation, which starts below the level-0
+address. Everything else -- cube, volume, array, an unmodelled chain, capture replay of a chain,
+compute -- keeps `bc_decode`. Because the decoded path is still the fallback, a native texture's
+bytes are blocks: diagnostics that read texels must go through `inspection_rgba8`, which decodes
+them. `PROSPER_NO_NATIVE_BC=1` restores the decoder everywhere; `PROSPER_NO_NATIVE_BC_MIP_CHAIN=1`
+only for chains. `PROSPER_NATIVE_BC_LOG=1` prints one coverage line per BC identity and
+`PROSPER_NATIVE_BC_CHAIN_AUDIT=1` checks that level 1 really is the 2x2 box of level 0.
 
 ## Encoded decoder snapshots
 
@@ -347,6 +366,23 @@ returns to its incoming layout (or an earlier sampled borrower's GENERAL layout)
 destination still writes back guest bytes. Release every acquired pin, including folded aliases,
 only after completion is established. `PROSPER_NO_STANDALONE_RTT_SEED` selects the CPU control;
 F8-gated `compute-rtt-seed` rows distinguish admission from recorded copies.
+
+An exact 2D native RGBA8, RGBA16F or packed R11 storage result may also create a missing
+renderer-owned destination when a matching CPU RTT entry exists. The destination lease never
+authorizes reading old pixels: the private compute/staging path seeds partial writes as before,
+then copies the complete canonical image into the pinned allocation. Creation uses the renderer's
+bounded color-target budget without evicting a possibly pending graphics batch. Only images tagged
+for the same VkDevice may be created; a separate compute device declines before charging renderer
+residency. Compute-only creation obeys the nominal image-count limit, without the 64-entry
+headroom reserved for an open graphics batch. Only images tagged as compute reservations may enter
+from `UNDEFINED`; a completed copy restores `GENERAL`, and only
+successful ordinary guest writeback grants GPU read authority. Optional creation failure, budget
+refusal, alias collision and incompatible format/extent retain CPU publication; a failed dispatch
+revokes the lease without publishing. `PROSPER_NO_COMPUTE_RTT_DEST_CREATE=1`
+restores the no-creation policy; `=0` is the equal-length enabled arm for same-binary comparisons.
+The cold destination cases in
+`test_game_compute_rtt_mirror.cpp` cover first-write failure/retry, read authority, RGBA16F reseeding
+and budget fallback.
 
 A completed private renderer-seeded native RGBA8 image may be retained under the existing image
 budget for validated storage-to-sampled transfers. This new result does not authorize graphics

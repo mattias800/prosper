@@ -19,6 +19,8 @@
 #include "gpu/execute/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
 #include "gpu/capture/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
+#include "diagnostics/perf/perf_alarms.hpp"  // #3891: --fps alarm marker
+#include "diagnostics/perf/perf_ledger.hpp"  // #3891: present-cpu-overhead alarm
 #include "gpu/timeline/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
 #include "capture_schedule.hpp"        // exact host-frame screenshot calibration trigger
 #include "shared/present/present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
@@ -436,8 +438,17 @@ bool ensure_fps_sample(Vk& vk) {
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vk.device, vk.sampleBuf, &mr);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = mr.size;
+    // HOST_CACHED first: the CPU reads and hashes all 147 KB of this buffer on EVERY present. From
+    // uncached (write-combined) memory those reads crawl -- measured 2026-09-27 at ~3 ms per present
+    // on the Radeon 8060S, which was 65% of process CPU on a static Messenger screen and 1.2-1.4% of
+    // the heavy titles, so --fps was capping the very rate it reported (#3873). Coherent is kept, so
+    // no invalidate is needed; fall back to plain host-visible memory where no cached type exists.
     ai.memoryTypeIndex = find_mem(vk.phys, mr.memoryTypeBits,
-                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                  VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX)
+        ai.memoryTypeIndex = find_mem(vk.phys, mr.memoryTypeBits,
+                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (prosper::gpu::allocate_device_memory(vk.device, &ai, &vk.sampleMem) != VK_SUCCESS) goto fail;
     vkBindBufferMemory(vk.device, vk.sampleBuf, vk.sampleMem, 0);
     if (vkMapMemory(vk.device, vk.sampleMem, 0, kFpsSampleBytes, 0, &vk.sampleMapped) != VK_SUCCESS)
@@ -725,6 +736,12 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
     // The wait above is the same fence that guarded last present's sample copy, so the sample is
     // readable here at no cost. Signing it one frame late is invisible in a rate: the counter needs
     // the interval between distinct frames, not the frame's own timestamp.
+    // #3891 present-cpu-overhead: the present thread's CPU work outside its waits, measured on
+    // every present (not only under --fps): this span (content signature, slot release, staging)
+    // plus command recording below. The fence wait, the acquire and the queue lock are excluded.
+    namespace perf = prosper::diagnostics::perf;
+    const bool perf_on = perf::enabled();
+    const uint64_t perf_span_begin = perf_on ? perf::now_ns() : 0;
     if (vk.samplePending) {
         vk.samplePending = false;
         gpu::note_present_publication_signature(
@@ -738,6 +755,7 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
         return prosper::frontend::PresentAttempt::failed;
     }
 
+    const uint64_t perf_pre_acquire_ns = perf_on ? perf::now_ns() - perf_span_begin : 0;
     uint32_t imgIndex = 0;
     constexpr uint64_t kAcquireTimeoutNs = 100ull * 1000 * 1000;
     const auto acquire_begin = trace.now();
@@ -753,6 +771,7 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
         prosper::frontend::present_blit_release(gf.slot); return prosper::frontend::PresentAttempt::failed;
     case prosper::frontend::AcquireAction::proceed: break;
     }
+    const uint64_t perf_record_begin = perf_on ? perf::now_ns() : 0;
     vkResetFences(vk.device, 1, &vk.inFlight);
     vkResetCommandBuffer(vk.cmd, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -842,6 +861,9 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &vk.presentSem;
     pi.swapchainCount = 1; pi.pSwapchains = &vk.swapchain; pi.pImageIndices = &imgIndex;
+    if (perf_on)
+        perf::add_cost(perf::Cost::PresentCpu,
+                       perf_pre_acquire_ns + (perf::now_ns() - perf_record_begin));
     VkResult submitResult;
     VkResult pr = VK_SUCCESS;
     {
@@ -3202,6 +3224,13 @@ int main(int argc, char** argv) {
                     gpuPresentedW ? gpuPresentedW : gpu::present_frame_width(),
                     gpuPresentedH ? gpuPresentedH : gpu::present_frame_height(),
                     now);
+                // #3891: mark an active [perf-alarm] rule, so a slow or wrong-looking frame on
+                // screen points at the log line that explains it.
+                char alarms[160];
+                const size_t active =
+                    prosper::diagnostics::perf::active_alarm_summary(alarms, sizeof alarms);
+                const std::string alarm_line = prosper::frontend::fps_alarm_line(active, alarms);
+                if (!alarm_line.empty()) fpsLines.push_back(alarm_line);
             }
         }
         // Only a HUD that has something to say is passed down; an empty list leaves both present
@@ -3368,7 +3397,27 @@ int main(int argc, char** argv) {
                         lastFrameSeq = cf.frame_seq;
                         shown.record(
                             prosper::frontend::PresentedFrameSource::GpuCpuFallback, running);
+                        // #3891 present-path-fallback: GPU scanouts are counted by PresentCpu.
+                        prosper::diagnostics::perf::add(
+                            prosper::diagnostics::perf::Counter::PresentCpuFallbacks);
                         trace.emit(prosper::perf::PresentHandoffEvent::CpuShown);
+                        // Present-rate log for this branch too. Without it a run whose every frame
+                        // takes the CPU fallback -- any run with live GPU targets off, e.g.
+                        // PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS or a per-pass dump diagnostic --
+                        // printed no [app] fps line at all, indistinguishable from presenting nothing
+                        // (#3895). Counts this branch's own presents, so a mixed run is not misread.
+                        static auto fallback_t0 = std::chrono::steady_clock::now();
+                        static uint64_t fallback_shown = 0, fallback_mark = 0;
+                        if (++fallback_shown - fallback_mark >= 60) {
+                            const auto now = std::chrono::steady_clock::now();
+                            const double s =
+                                std::chrono::duration<double>(now - fallback_t0).count();
+                            fprintf(stderr,
+                                    "[app] %.1f fps (%llu frames, gpu-present cpu-fallback)\n",
+                                    (fallback_shown - fallback_mark) / (s > 0 ? s : 1),
+                                    (unsigned long long)fallback_shown);
+                            fallback_t0 = now; fallback_mark = fallback_shown;
+                        }
                         lastFrameProgress = std::chrono::steady_clock::now();
                         havePresentedGuestFlip = true;
                         lastPresentedGuestFlip = cf.guest_present_count;

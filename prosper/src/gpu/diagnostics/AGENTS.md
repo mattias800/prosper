@@ -42,7 +42,19 @@ switched on for the run that mattered (#3533). `PROSPER_GPU_MEM_LOG=0` silences 
   Read the header's caveat before quoting a number: it sees **prosper's own allocations only**, not
   other processes, the compositor, or driver overhead, so on an integrated GPU — where the desktop
   shares these heaps — "prosper holds far less than the heap" is not evidence that an allocation will
-  succeed. `VK_EXT_memory_budget` is the honest upgrade and is not enabled on the device today.
+  succeed. `VK_EXT_memory_budget` is the honest upgrade; since #3873 it is enabled when advertised
+  and the texture-cache budget (`src/gpu/memory/`) reads it, but this instrument still counts only
+  prosper's own allocations.
+- `memory_placement_log` — `allocate_gpu_only_memory` / `allocate_gpu_only`, the call every
+  GPU-only renderer allocation makes: gpu/memory/memory_type_select's candidates in order, retried
+  on `VK_ERROR_OUT_OF_DEVICE_MEMORY` (#3897), plus default-on `[mem-placement]` lines — one per
+  allocation class and memory type (so a class that later lands elsewhere is visible), a `FELL
+  BACK` line when VRAM ran out, an `ALLOCATION FAILED` line when every type did — and the
+  `gpu-memory-off-device` perf-alarm counter. The lines are observation; the choice and the retry
+  are not. `NOT DEVICE_LOCAL` there is a discrete-GPU performance problem worth an issue. Its
+  gated `PROSPER_GPU_MEM_FORCE_OOM` fails device-local attempts without calling the driver — like
+  `draw_program_skip`, an armed run is not merely observing. Do not allocate a GPU-only resource
+  any other way: a site that calls `allocate_device_memory` directly gets no fallback.
 - `geometry_probe_arming` — whether `PROSPER_GEOM_PROBE` may answer at all: does the module the
   backend is about to hand Vulkan actually declare the transform-feedback capture? It is the
   worked example of the first standing caution below. Without it the probe armed on a shader it

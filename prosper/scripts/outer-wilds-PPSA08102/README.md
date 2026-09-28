@@ -78,3 +78,22 @@ steady-state speed only
 after identifying a stable scene, in an uncontended GPU window at native resolution, and compare
 that scene's guest flip rate with PS5 hardware; the `--seconds 2` screenshot interval is only a
 sampling cadence and is not a speed measurement.
+
+## Current-main first-person route (2026-09-25)
+
+The earlier `probe-wake-up.pad` remains the exact historical route for `b77cffc831de`.
+On main after #3863, its Square press at 110 seconds landed before the Wake Up prompt:
+a scheduled 119-second screenshot still showed the centered prompt over black. The new
+`reach-first-person.pad` preserves that press and retries Square at 135–137 seconds.
+On the #3864 source-equivalent binary with the opt-in
+`PROSPER_BACKEND_TEXTURE_PRESSURE_FLUSH=1` setting, a scheduled 200-second native F9 screenshot showed
+trees, the planet, and the Look Around / Move prompts in first person. The known
+foreground-star defect remains. This validates the route at that checkpoint; it does not
+prove the same timing will work on every machine or future build.
+
+Performance comparisons should use the new route with a fresh save/cache root and verify
+the in-world visual checkpoint before interpreting F8 records as gameplay. A quiet,
+same-binary control/candidate pair on this route with that setting held constant at a
+230-second F8 trigger retained
+48 renderer records and 47 known-new deliveries in each roughly five-second window.
+That is a short completed-version count, not whole-game or simulation FPS.

@@ -1,9 +1,12 @@
 #include "shared/live/live_compute.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"   // #3891: shader-compile alarm
 #include "shared/compute/storage_write_mask_spirv.hpp"
 #include "shared/diagnostics/trip_bound_witness.hpp"
 #include "shared/compute/compute_authority_live_census.hpp"
 #include "shared/compute/compute_image_borrow_census.hpp"
 #include "shared/compute/compute_timing_selector.hpp"
+#include "diagnostics/exit_census.hpp"
+#include "diagnostics/transfer_pressure.hpp"
 #include "shared/compute/compute_phase_attribution.hpp"
 #include "shared/compute/compute_buffer_timing.hpp"
 #include "shared/compute/compute_transfer_gate_census.hpp"
@@ -13,6 +16,7 @@
 #include "shared/live/live_target_format.hpp"
 #include "shared/live/packed_rtt_conversion.hpp"
 #include "shared/live/gpu_retile.hpp"
+#include "shared/present/compute_scanout.hpp"   // #3915: GPU-present mirror of a compute-written display buffer
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
 #include "shared/device/pipeline_cache_file.hpp"  // #3425: one checked envelope for both stages
@@ -26,8 +30,11 @@
 
 #include "gpu/texture/bc_decode.hpp"
 #include "gpu/diagnostics/vk_object_names.hpp"   // #3578
+#include "gpu/diagnostics/watch_list.hpp"        // strict opt-in address trace
+#include "gpu/diagnostics/diag_ratelimit.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: how much of the heap does prosper hold?
+#include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only images prefer VRAM
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
 #include "gpu/execute/float_controls_probe.hpp"  // #3479: the device gate on SignedZeroInfNanPreserve
@@ -78,6 +85,11 @@
 #define PROSPER_HAVE_TARGET_F16C 1
 #endif
 #include "shared/compute/compute_buffer_bytes.hpp"
+
+
+// The VideoOut buffer registry (hle_graphics.cpp). #3915 asks whether a storage result is a display buffer.
+extern "C" int prosper_vo_buffer_count();
+extern "C" uint64_t prosper_vo_buffer_addr(int i);
 
 namespace prosper::frontend {
 
@@ -482,6 +494,69 @@ struct RttMirrorCounter {
     uint64_t add() { return count.fetch_add(1, std::memory_order_relaxed) + 1; }
     uint64_t value() const { return count.load(std::memory_order_relaxed); }
 };
+// WHY a path that could have stayed on the GPU refused, counted WHERE THE HOST COPY HAPPENS and
+// weighted by the bytes that copy moves.
+//
+// Two sites use this, and they answer two halves of one question: why a compute dispatch could not
+// SEED from the renderer's device image, and why its result could not go BACK into one. Both
+// already named the reason on a per-binding trace line, and neither had an aggregate -- which is
+// the difference between knowing a path is narrow and knowing WHICH of its conditions to widen.
+//
+// Weighted by bytes rather than by count on purpose: a reason that refuses many small bindings is
+// not the one to widen, and a count-only histogram cannot tell the two apart.
+struct RefusalCensus {
+    // Bounded so an unexpected flood of distinct reasons cannot turn a census into an unbounded
+    // allocation. Reasons come from a fixed set of string literals; the cap is a backstop.
+    static constexpr size_t kMaxReasons = 64;
+
+    std::mutex mutex;
+    std::map<std::string, std::pair<uint64_t, uint64_t>> rows;   // reason -> {copies, bytes}
+
+    void note(const char* reason, uint64_t bytes) {
+        const std::string key = reason ? reason : "null";
+        std::lock_guard<std::mutex> lock(mutex);
+        if (rows.size() >= kMaxReasons && rows.find(key) == rows.end()) return;
+        auto& row = rows[key];
+        row.first += 1;
+        row.second += bytes;
+    }
+
+    // Biggest first, because that is the order somebody acts in. Prints nothing when empty, so a
+    // run that never reached the path stays silent instead of reporting a zero.
+    void report(const char* headline) {
+        std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            snapshot.assign(rows.begin(), rows.end());
+        }
+        if (snapshot.empty()) return;
+        std::sort(snapshot.begin(), snapshot.end(),
+                  [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+        std::fputs(headline, stderr);
+        for (const auto& row : snapshot)
+            std::fprintf(stderr, "  %s=%.1fMiB/%lluc", row.first.c_str(),
+                         row.second.second / (1024.0 * 1024.0),
+                         (unsigned long long)row.second.first);
+        std::fputc('\n', stderr);
+    }
+};
+
+// Never destroyed, deliberately, and this is a contract rather than a preference. `exit_census.hpp`
+// requires that a report not read an object with a non-trivial destructor: the flush runs from
+// `std::atexit`, which interleaves with `__cxa_atexit` static destruction in an order no
+// registration site controls. One `std::map` member is enough to register a destructor for the
+// whole object, and the report then reads a destroyed container. Leaking one fixed-size object per
+// process is the no-destroy idiom the exit-report registry itself uses.
+inline RefusalCensus& seed_refusal_census() {
+    static RefusalCensus* census = new RefusalCensus();
+    return *census;
+}
+
+inline RefusalCensus& destination_refusal_census() {
+    static RefusalCensus* census = new RefusalCensus();
+    return *census;
+}
+
 struct RttDestinationCensus {
     RttMirrorCounter candidates, borrowed, recorded, published, failed;
     RttMirrorCounter r11_source_seed_recorded, rgba16_source_seed_recorded;
@@ -493,6 +568,30 @@ struct RttDestinationCensus {
 };
 RttDestinationCensus& rtt_destination_census() {
     static constinit RttDestinationCensus census{};
+    // The destination borrow is the ONLY way a render target that has fallen to CPU-only authority
+    // regains GPU authority: the seed import requires `gpu_valid`, and the mirror-back that would
+    // set it requires the seed import, so without this path the state is a latch. Its counters
+    // existed already but printed only under an active F8 perf capture, every sixteenth candidate
+    // -- so on an ordinary run nothing could say whether the escape hatch was ever attempted.
+    static const bool once = [] {
+        prosper::diagnostics::register_census("PROSPER_NO_RTT_DESTINATION_CENSUS", [] {
+            const auto t = rtt_destination_census().snapshot();
+            if (!t.candidates) return false;
+            std::fprintf(stderr,
+                "[rtt-destination] RUN TOTAL candidates=%llu borrowed=%llu recorded=%llu "
+                "published=%llu failed=%llu\n",
+                (unsigned long long)t.candidates, (unsigned long long)t.borrowed,
+                (unsigned long long)t.recorded, (unsigned long long)t.published,
+                (unsigned long long)t.failed);
+            destination_refusal_census().report(
+                "[rtt-destination-refused] RUN TOTAL why a compute result could not go back "
+                "into the renderer's device image:");
+            std::fflush(stderr);
+            return true;
+        });
+        return true;
+    }();
+    (void)once;
     return census;
 }
 thread_local uint64_t g_perf_compute_gpu_timestamp_samples = 0;
@@ -1989,12 +2088,18 @@ struct VulkanComputeContext {
         return released;
     }
 
+    // `allocation_status`, when given, receives the ALLOCATION's result only (VK_SUCCESS for a pool
+    // hit) -- unlike `setup_status` it arms no test fault injection and ignores the mapping, so a
+    // caller can tell VK_ERROR_OUT_OF_DEVICE_MEMORY apart and retry another type (#3897).
     VkDeviceMemory allocate_memory(VkDeviceSize bytes, uint32_t memory_type,
                                    bool persistently_map = false,
-                                   VkResult* setup_status = nullptr) {
+                                   VkResult* setup_status = nullptr,
+                                   VkResult* allocation_status = nullptr) {
         if (setup_status) *setup_status = VK_SUCCESS;
+        if (allocation_status) *allocation_status = VK_SUCCESS;
         if (memory_type == UINT32_MAX) {
             if (setup_status) *setup_status = VK_ERROR_FEATURE_NOT_PRESENT;
+            if (allocation_status) *allocation_status = VK_ERROR_FEATURE_NOT_PRESENT;
             return VK_NULL_HANDLE;
         }
         // Fault controls are scoped to the caller requesting exact setup errors
@@ -2080,6 +2185,7 @@ struct VulkanComputeContext {
             }
         }
         if (setup_status) *setup_status = allocation_result;
+        if (allocation_status) *allocation_status = allocation_result;
         // The budget reports the failure from inside allocate_device_memory, which is the only
         // place that sees every one of them (#3533).
         if (allocation_result != VK_SUCCESS) return VK_NULL_HANDLE;
@@ -2839,18 +2945,30 @@ struct VulkanComputeContext {
     // was evicted or invalidated between writeback and here leaves the consumer with nothing to
     // borrow, and that is a different failure from an ineligible binding (#3307).
     bool authorize_cached_image_export(const ComputeImageCacheKey& key,
-                                       uint64_t producer_command_order) {
+                                       uint64_t producer_command_order,
+                                       double* watch_ms = nullptr,
+                                       bool* watch_had = nullptr,
+                                       bool* watch_rearmed = nullptr) {
         const auto found = image_cache.find(key);
         if (found == image_cache.end() || !found->second.content_valid || !found->second.image)
             return false;
         found->second.graphics_export_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         found->second.graphics_export_command_order = producer_command_order;
         found->second.graphics_export_valid = true;
-        if (found->second.write_watch && !found->second.write_watch.rearm())
+        const auto watch_start = watch_ms ? std::chrono::steady_clock::now() :
+            std::chrono::steady_clock::time_point{};
+        const bool had_watch = static_cast<bool>(found->second.write_watch);
+        const bool rearmed = had_watch && found->second.write_watch.rearm();
+        if (had_watch && !rearmed)
             found->second.write_watch.reset();
         if (!found->second.write_watch)
             found->second.write_watch = prosper::host::GuestWriteWatch::create(
                 key.gpu_addr, key.guest_bytes);
+        if (watch_had) *watch_had = had_watch;
+        if (watch_rearmed) *watch_rearmed = rearmed;
+        if (watch_ms)
+            *watch_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - watch_start).count();
         return true;
     }
 
@@ -3759,14 +3877,8 @@ struct VulkanComputeContext {
     uint32_t host_memory_type(uint32_t bits) const {
         const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        const VkMemoryPropertyFlags cached = wanted | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-        for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
-            if ((bits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & cached) == cached)
-                return i;
-        for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
-            if ((bits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & wanted) == wanted)
-                return i;
-        return UINT32_MAX;
+        return prosper::gpu::select_memory_type(memory, bits, wanted,
+                                                VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
     }
 
 };
@@ -3964,6 +4076,13 @@ struct BoundImage {
     prosper::gpu::LiveTargetImageImport mirror_destination{};
     bool mirror_destination_revoked = false;
     bool mirror_destination_recorded = false;
+    // A read-only imported binding can sample the old image during this dispatch. The result copy
+    // then leaves that image in GENERAL for the import owner's ordinary layout restoration.
+    bool mirror_destination_shared_import = false;
+    // #3915: GPU-present mirror of a complete display-buffer result (compute_scanout.hpp).
+    prosper::frontend::ComputeScanoutTarget scanout_mirror{};
+    bool scanout_mirror_recorded = false;
+    bool scanout_mirror_committed = false;
     bool has_renderer_seed() const {
         return seed_from_imported != SIZE_MAX || standalone_seed.valid();
     }
@@ -4084,6 +4203,33 @@ void storage_unpack_texel(const uint8_t* src, prosper::gpu::DataFormat f, uint32
 // Every specialized path is bit-identical to storage_unpack_texel by construction; formats without a
 // specialization fall through to the per-texel helper, and PROSPER_VERIFY_UNPACK=1 checks the two
 // against each other at runtime.
+struct StorageMaterializeCounters {
+    std::atomic<uint64_t> exact_n{0}, exact_b{0}, unpack_n{0}, unpack_b{0}, seed_n{0}, seed_b{0};
+    // Bounded so a streaming title cannot turn a census into an unbounded allocation.
+    std::atomic<uint64_t> not_persistent{0}, persistent_not_skipped{0};
+    std::atomic<uint64_t> not_candidate{0}, candidate_refused{0}, not_candidate_owned{0};
+    std::mutex distinct_mutex;
+    std::set<std::pair<uint64_t, uint64_t>> distinct;
+};
+// Never destroyed, for the reason `exit_reports.hpp` states and this file's own report proves:
+// the `[storage-materialize]` report takes `distinct_mutex` and reads `distinct` at exit, and the
+// flush runs from `std::atexit`, which is LIFO against the `__cxa_atexit` entry this static
+// registers.
+//
+// It is the `std::set` specifically, not the whole struct: the atomics are trivially destructible
+// and `std::mutex`'s destructor is trivial too, so a struct holding only those registers no
+// destructor at all. One member with a non-trivial destructor registers one for the object, and
+// then the report reads a destroyed container. It survives today only because the report happens
+// to touch `size()` and libstdc++ leaves the node count intact -- which stops being true the
+// moment the report iterates, or the build defines `_GLIBCXX_ASSERTIONS`.
+//
+// Lazy registration alone does NOT fix this. It changes which report runs after which destructor,
+// and no registration site controls that ordering. (#3872 review.)
+inline StorageMaterializeCounters& storage_materialize_counters() {
+    static StorageMaterializeCounters* c = new StorageMaterializeCounters();
+    return *c;
+}
+
 void storage_unpack_range(const uint8_t* src, size_t src_stride, prosper::gpu::DataFormat f,
                           uint32_t ncomp, size_t count, uint32_t* out) {
     using DF = prosper::gpu::DataFormat;
@@ -6534,8 +6680,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     // the other instruments, so a run can answer "what would this program have been?" without also
     // running the dispatch that is under suspicion. That combination — dump the module, skip the
     // dispatch — is what lets a recompiler change be checked against a program that hangs the GPU.
-    if (!compute_skip_programs().empty() && compute_skip_programs().count(item.code_addr))
+    if (!compute_skip_programs().empty() && compute_skip_programs().count(item.code_addr)) {
+        // #3891: an experiment, not a refusal -- skipped-dispatches must not count it.
+        prosper::diagnostics::perf::note_deliberate_dispatch_decline();
         return decline("skipped-by-selector");
+    }
     if (item.required_subgroup_size &&
         (!ctx.borrowed || !ctx.native_subgroup_contract ||
          item.required_subgroup_size < ctx.min_native_subgroup_size ||
@@ -6993,6 +7142,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (buffer.memory) ctx.release_memory(buffer.memory);
         }
         for (size_t i = 0; i < images.size(); i++) {
+            if (images[i].scanout_mirror.valid() && !images[i].scanout_mirror_committed)
+                prosper::frontend::compute_scanout_abort(images[i].scanout_mirror);
             // A pin is taken per successful import, so it is released per import -- including for a
             // binding that a later alias check folded into an earlier one (#1095).
             if (images[i].mirror_destination.valid()) {
@@ -7406,15 +7557,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // exact native-width paths are selected from reflected SPIR-V. Everything not provably correct
         // skips LOUDLY. ---
         bool images_ready = !ctx.device ? false : true;
-        auto device_memory_type = [&](uint32_t bits) -> uint32_t {
-            for (uint32_t i = 0; i < ctx.memory.memoryTypeCount; i++)
-                if ((bits & (1u << i)) &&
-                    (ctx.memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
-                    return i;
-            for (uint32_t i = 0; i < ctx.memory.memoryTypeCount; i++)
-                if (bits & (1u << i)) return i;
-            return UINT32_MAX;
-        };
         // The SHADER-declared side of every image decision below, reported alongside the guest
         // resource whenever a binding declines. Without it a decline prints only the resource --
         // and most accept conditions here are a conjunction of the two, so the message names one
@@ -7866,12 +8008,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     std::fprintf(stderr,
                                  "[compute]   direct RTT candidate binding=%u addr=0x%llx "
                                  "requested=f%u/c%u dim=%u extent=%ux%u available=%u "
+                                 "refusal=%s "
                                  "imported=%ux%u/%u kind=%s native=%u "
                                  "same-device=%u transfer-src=%u layout=%u "
                                  "code=0x%llx hash=0x%016llx\n",
                                  bi.binding, (unsigned long long)r->gpu_addr,
                                  (unsigned)r->format, r->num_components, r->img_dim,
                                  r->width, r->height, import_available ? 1u : 0u,
+                                 prosper::gpu::live_target_import_refusal_name(import.refusal),
                                  import.width, import.height, (unsigned)import.format,
                                  import.kind == LiveTargetImageImport::Kind::Depth
                                      ? "depth" : "color",
@@ -8070,7 +8214,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         if (time_seed)
                             import_ms += std::chrono::duration<double, std::milli>(
                                 ComputeClock::now() - seed_start).count();
-                        bi.standalone_seed_decision = "import-unavailable";
+                        // Not a flat "the renderer said no": the importer now reports WHICH of its
+                        // declines fired, and the consumer's fallback for any of them is a full CPU
+                        // round trip of the image. A bare reason here cost a measurement pass.
+                        bi.standalone_seed_decision =
+                            prosper::gpu::live_target_import_refusal_name(source.refusal);
                         if (available) {
                             const char* reason = !source.valid() ? "invalid-import"
                                 : source.kind != LiveTargetImageImport::Kind::Color ? "not-color"
@@ -9302,6 +9450,140 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     unpack_source = src;
                 }
                 if (!bi.has_renderer_seed()) {
+                    // Which of the two host-side materialisation paths a storage binding takes,
+                    // and how many bytes each moves. The expensive one is the per-texel unpack to
+                    // RGBA32; the cheap one is a straight copy. live_compute.cpp already prices an
+                    // image-bearing dispatch at ~56 ms against 0.39 ms of actual GPU dispatch, and
+                    // compute-item execution is 74.9% of wall on a slow title -- but nothing said
+                    // how the population splits between the two, so "teach the cheap path more
+                    // formats" and "stop materialising at all" could not be ranked against each
+                    // other. The seed copy is counted separately because it is unconditional on
+                    // the write-mask path and nobody counts it at all.
+                    {
+                        static const bool once = [] {
+                            prosper::diagnostics::register_census(
+                                "PROSPER_NO_STORAGE_MATERIALIZE_CENSUS", [] {
+                                auto& c = storage_materialize_counters();
+                                const uint64_t en = c.exact_n.load(std::memory_order_relaxed);
+                                const uint64_t un = c.unpack_n.load(std::memory_order_relaxed);
+                                if (!(en + un)) return false;
+                                const double MiB = 1024.0 * 1024.0;
+                                std::fprintf(stderr,
+                                    "[storage-materialize] RUN TOTAL bindings=%llu "
+                                    "exact-copy=%llu (%.1f%%, %.1f MiB) "
+                                    "texel-unpack=%llu (%.1f%%, %.1f MiB) "
+                                    "seed-copy=%llu (%.1f MiB) distinct-sources=%llu "
+                                    "not-persistent=%llu (never-asked=%llu of which renderer-owned=%llu, "
+                                    "cache-refused=%llu) "
+                                    "persistent-not-skipped=%llu\n",
+                                    (unsigned long long)(en + un),
+                                    (unsigned long long)en, 100.0 * en / (en + un),
+                                    c.exact_b.load(std::memory_order_relaxed) / MiB,
+                                    (unsigned long long)un, 100.0 * un / (en + un),
+                                    c.unpack_b.load(std::memory_order_relaxed) / MiB,
+                                    (unsigned long long)c.seed_n.load(std::memory_order_relaxed),
+                                    c.seed_b.load(std::memory_order_relaxed) / MiB,
+                                    (unsigned long long)[&]{
+                                        std::lock_guard<std::mutex> lock(c.distinct_mutex);
+                                        return c.distinct.size();
+                                    }(),
+                                    (unsigned long long)c.not_persistent.load(std::memory_order_relaxed),
+                                    (unsigned long long)c.not_candidate.load(std::memory_order_relaxed),
+                                    (unsigned long long)c.not_candidate_owned.load(std::memory_order_relaxed),
+                                    (unsigned long long)c.candidate_refused.load(std::memory_order_relaxed),
+                                    (unsigned long long)c.persistent_not_skipped.load(
+                                        std::memory_order_relaxed));
+                                // Name WHY the GPU seed path refused, biggest first. This is the
+                                // actionable half: the line above says how much is copied, this
+                                // one says which condition to widen to stop copying it.
+                                seed_refusal_census().report(
+                                    "[gpu-seed-refused] RUN TOTAL why the renderer-owned bindings took a "
+                                    "CPU round trip:");
+                                std::fflush(stderr);
+                                return true;
+                            });
+                            return true;
+                        }();
+                        (void)once;
+                        auto& c = storage_materialize_counters();
+                        if (bi.storage_write_mask) {
+                            c.seed_n.fetch_add(1, std::memory_order_relaxed);
+                            c.seed_b.fetch_add(linear_guest_bytes, std::memory_order_relaxed);
+                        }
+                        prosper::diagnostics::note_transfer(
+                            prosper::diagnostics::Transfer::StorageMaterialize,
+                            static_cast<uint64_t>(texels) * guest_texel);
+                        // How much of this copying is REPEAT copying of the same source. The copy
+                        // is legitimate the first time a guest-owned image is materialised; every
+                        // later copy of an unchanged source is pure waste, and nothing here has a
+                        // write-watch to tell the difference (the buffer path reports
+                        // total-watch-chunks=0 on every binding). Distinct (address, size) pairs
+                        // against total copies sizes the headroom without paying for a hash.
+                        {
+                            auto& d = storage_materialize_counters();
+                            std::lock_guard<std::mutex> lock(d.distinct_mutex);
+                            if (d.distinct.size() < 200000)
+                                d.distinct.insert({r->gpu_addr,
+                                                   static_cast<uint64_t>(texels) * guest_texel});
+                        }
+                        // WHY the cache did not skip this copy. The guard above is
+                        // `!(bi.persistent && bi.upload_skipped)`, and those two terms have
+                        // completely different fixes: not-persistent is a cache-admission problem
+                        // (key, eligibility, capacity), while persistent-but-not-skipped is a
+                        // write-watch problem (the watch says dirty or unknown for data that has
+                        // not changed). 8,993 copies from 84 distinct sources means ~99% of this
+                        // traffic is repeat copying, so which of the two terms fails decides the
+                        // entire fix.
+                        {
+                            auto& d = storage_materialize_counters();
+                            if (!bi.persistent) {
+                                d.not_persistent.fetch_add(1, std::memory_order_relaxed);
+                                // Split the 76%: never asked (an eligibility predicate refused
+                                // before the cache was consulted) against asked-and-refused (the
+                                // cache did not hold it, or held it unusably). These have
+                                // different fixes -- widen a predicate, or raise capacity / fix a
+                                // key -- and the aggregate cannot tell them apart.
+                                if (!bi.cache_candidate) {
+                                    d.not_candidate.fetch_add(1, std::memory_order_relaxed);
+                                    // `!renderer_owned` is one of the candidate gate's six terms,
+                                    // and the gate census says it is the one that refuses most
+                                    // often. Counting it HERE, at the copy, is what turns that
+                                    // into a claim about the traffic: the gate census evaluates
+                                    // every binding, while only some of them reach a copy. This
+                                    // arm is reached from inside `!bi.has_renderer_seed()`, so a
+                                    // hit means the renderer owns the image and supplied no seed
+                                    // -- excluded from the compute cache on the assumption the
+                                    // renderer would provide it, then copied from guest memory
+                                    // anyway, every dispatch.
+                                    if (renderer_owned) {
+                                        d.not_candidate_owned.fetch_add(1, std::memory_order_relaxed);
+                                        // Name the condition. This arm is renderer-owned WITHOUT a
+                                        // renderer seed, so the bytes below came off a CPU render
+                                        // target snapshot and are about to be uploaded back to the
+                                        // same device they were read from. `standalone_seed_decision`
+                                        // says which term of the GPU seed path refused to keep them
+                                        // there.
+                                        seed_refusal_census().note(
+                                            bi.standalone_seed_decision,
+                                            static_cast<uint64_t>(texels) * guest_texel);
+                                    }
+                                } else {
+                                    d.candidate_refused.fetch_add(1, std::memory_order_relaxed);
+                                }
+                            } else {
+                                d.persistent_not_skipped.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                        if (bi.exact_storage_bytes()) {
+                            c.exact_n.fetch_add(1, std::memory_order_relaxed);
+                            c.exact_b.fetch_add(static_cast<uint64_t>(texels) * guest_texel,
+                                                std::memory_order_relaxed);
+                        } else {
+                            c.unpack_n.fetch_add(1, std::memory_order_relaxed);
+                            c.unpack_b.fetch_add(static_cast<uint64_t>(texels) * guest_texel,
+                                                 std::memory_order_relaxed);
+                        }
+                    }
                     if (bi.storage_write_mask)
                         bi.untouched_seed.assign(unpack_source, unpack_source + linear_guest_bytes);
                     if (bi.exact_storage_bytes()) {
@@ -9964,8 +10246,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 VkMemoryRequirements ireq{};
                 vkGetImageMemoryRequirements(ctx.device, bi.image, &ireq);
                 bi.allocation_bytes = ireq.size;
-                const uint32_t image_memory_type = device_memory_type(ireq.memoryTypeBits);
-                bi.memory = ctx.allocate_memory(ireq.size, image_memory_type);
+                // #3897: device-local first; on VK_ERROR_OUT_OF_DEVICE_MEMORY (after the pool has
+                // released its cached allocations) the next type the image allows.
+                VkDeviceMemory image_memory = VK_NULL_HANDLE;
+                prosper::gpu::allocate_gpu_only(
+                    prosper::gpu::GpuOnlyMemoryClass::ComputeImage, ctx.memory,
+                    ireq.memoryTypeBits, ireq.size,
+                    [&](uint32_t type) {
+                        VkResult status = VK_SUCCESS;
+                        image_memory = ctx.allocate_memory(ireq.size, type, false, nullptr, &status);
+                        return status;
+                    },
+                    prosper::gpu::force_gpu_only_oom(prosper::gpu::GpuOnlyMemoryClass::ComputeImage));
+                bi.memory = image_memory;
                 if (!vk_handle_ok(bi.memory, "image-memory") ||
                     !vk_ok(vkBindImageMemory(ctx.device, bi.image, bi.memory, 0), "image-bind")) {
                     images_ready = false; break; }
@@ -10659,6 +10952,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                               low_latency_compile ? "disabled-for-cold-latency" : "driver-default");
             VkResult pipeline_result = VK_SUCCESS;
             {
+                // #3891 shader-compile: one clock pair per compute pipeline built (a cached one
+                // never gets here) -- including when the cache is full and it is not retained.
+                const prosper::diagnostics::perf::CostScope perf_pipeline(
+                    prosper::diagnostics::perf::Cost::PipelineCreate);
                 std::lock_guard<std::timed_mutex> cache_lock(ctx.pipeline_cache_mutex);
                 pipeline_result = vkCreateComputePipelines(
                     ctx.device, ctx.pipeline_cache, 1, &cpci, nullptr, &pipeline);
@@ -10870,10 +11167,29 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         static const bool destination_mirror_disabled =
             std::getenv("PROSPER_NO_COMPUTE_RTT_DEST_MIRROR") != nullptr ||
             std::getenv("PROSPER_NO_STANDALONE_RTT_SEED") != nullptr;
-        if (!destination_mirror_disabled) for (size_t i = 0; i < images.size(); ++i) {
-            BoundImage& bi = images[i];
+        static const bool destination_creation_enabled =
+            [] {
+                const char* control = std::getenv("PROSPER_NO_COMPUTE_RTT_DEST_CREATE");
+                return !control || std::strcmp(control, "0") == 0;
+            }();
+        static const bool read_alias_mirror_disabled =
+            std::getenv("PROSPER_NO_COMPUTE_RTT_READ_ALIAS") != nullptr;
+        static const std::vector<uint64_t> destination_trace_targets = [] {
+            std::vector<uint64_t> addresses;
+            const char* spec = std::getenv("PROSPER_COMPUTE_DEST_TRACE_ADDR");
+            if (spec && *spec && !prosper::gpu::parse_hex_watch_list(spec, addresses)) {
+                std::fprintf(stderr, "[compute-dest-target] malformed address selector\n");
+                addresses.clear();
+            }
+            return addresses;
+        }();
+        // The whole, exact, single-level 2D result of this dispatch for one guest address: the
+        // shape proof both the renderer destination mirror and the GPU-present scanout mirror
+        // (#3915) need before a staging result may stand in for the guest bytes.
+        const auto exact_full_result = [&](size_t i) {
+            const BoundImage& bi = images[i];
             const ShaderResource* r = bi.resource;
-            const bool basic_candidate = r && r->gpu_addr && !r->host_data &&
+            return r && r->gpu_addr && !r->host_data &&
                 bi.storage_writeback &&
                 bi.alias_of == SIZE_MAX && bi.exact_storage_bytes() &&
                 !bi.storage_write_mask && !bi.mirror_result_to_imported &&
@@ -10883,6 +11199,33 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 !r->in_mip_tail && !r->mip_chain_base_level && !r->layer_mip_offset_bytes &&
                 !r->linear_row_pitch_bytes && !r->layer_stride_bytes &&
                 r->width && r->height && staging[i];
+        };
+        if (!destination_mirror_disabled) for (size_t i = 0; i < images.size(); ++i) {
+            BoundImage& bi = images[i];
+            const ShaderResource* r = bi.resource;
+            const bool trace_destination = r &&
+                std::find(destination_trace_targets.begin(), destination_trace_targets.end(),
+                          r->gpu_addr) != destination_trace_targets.end();
+            const bool basic_candidate = exact_full_result(i);
+            if (trace_destination)
+                std::fprintf(stderr,
+                    "[compute-dest-target] code=0x%llx submit=%llu dispatch=%llu binding=%u "
+                    "addr=0x%llx basic=%u storage-writeback=%u host=%u alias=%u "
+                    "exact=%u mask=%u prior-conflict=%u final-conflict=%u "
+                    "format=%u comps=%u native-float=%u packed-r11=%u staging=%zu\n",
+                    (unsigned long long)item.code_addr,
+                    (unsigned long long)item.submit_no,
+                    (unsigned long long)item.dispatch_index, bi.binding,
+                    (unsigned long long)r->gpu_addr, basic_candidate ? 1u : 0u,
+                    bi.storage_writeback ? 1u : 0u, r->host_data ? 1u : 0u,
+                    bi.alias_of == SIZE_MAX ? 0u : 1u,
+                    bi.exact_storage_bytes() ? 1u : 0u,
+                    bi.storage_write_mask ? 1u : 0u,
+                    bi.prior_output_conflict ? 1u : 0u,
+                    bi.final_output_conflict ? 1u : 0u,
+                    static_cast<unsigned>(r->format), r->num_components,
+                    bi.native_float_storage ? 1u : 0u,
+                    bi.packed_r11_storage ? 1u : 0u, staging_bytes[i]);
             if (image_timing && perf_capture_timing && r && bi.storage_writeback)
                 std::fprintf(stderr,
                     "[compute-rtt-destination-check] code=0x%llx binding=%u "
@@ -10928,17 +11271,31 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     (unsigned long long)totals.rgba16_source_seed_recorded);
             }
             const prosper::gpu::LiveTargetImageDestinationRequest request{
-                r->width, r->height, *format};
+                r->width, r->height, *format, destination_creation_enabled,
+                static_cast<void*>(ctx.device)};
             prosper::gpu::LiveTargetImageImport destination;
-            if (!borrow_live_render_target_image_destination(r->gpu_addr, request, destination))
+            if (!borrow_live_render_target_image_destination(r->gpu_addr, request, destination)) {
+                if (trace_destination)
+                    std::fprintf(stderr, "[compute-dest-target] binding=%u decline=%s\n",
+                                 bi.binding,
+                                 prosper::gpu::live_target_import_refusal_name(
+                                     destination.refusal));
+                // The census's `failed` counter never saw these: the old `continue` left before
+                // anything was recorded, so 8,268 of 11,621 candidates on one title vanished
+                // between "candidate" and "borrowed" with no reason and no count.
+                destination_refusal_census().note(
+                    prosper::gpu::live_target_import_refusal_name(destination.refusal),
+                    static_cast<uint64_t>(staging_bytes[i]));
                 continue;
+            }
             const VkFormat expected = live_target_pixel_format_vk(*format);
             // One dispatch may first seed its private writable image from the current renderer
             // target, then copy its completed result back into that SAME target. Keep two leases:
             // the source pin protects old pixels until the seed copy, and the destination pin
             // protects the allocation until guest writeback and final publication complete.
-            // Only exact native RGBA and packed R11 self-seeds are admitted here; unrelated
-            // sampled/imported aliases still cannot share a destination allocation.
+            // Only exact native RGBA and packed R11 self-seeds are admitted here. A separate
+            // read-only sampled import can share the destination only if it names this same
+            // allocation and its access ends before the result copy below.
             const bool own_seed_destination =
                 (*format == LiveTargetPixelFormat::Rgba8Unorm ||
                  *format == LiveTargetPixelFormat::Rgba16Float ||
@@ -10951,8 +11308,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 bi.standalone_seed.native_format == destination.native_format &&
                 bi.standalone_seed.layout == destination.layout;
             bool collides_with_source = false;
+            size_t colliding_index = SIZE_MAX;
+            bool shares_read_only_import = false;
             for (size_t other_index = 0; other_index < images.size(); ++other_index) {
                 const BoundImage& other = images[other_index];
+                if (other.imported && other.image == static_cast<VkImage>(destination.image)) {
+                    const bool ordered_read_alias = !read_alias_mirror_disabled &&
+                        own_seed_destination &&
+                        !destination.fresh_uninitialized && other_index != i &&
+                        other.alias_of == SIZE_MAX && !other.storage && !other.imported_depth &&
+                        other.imported_addr == r->gpu_addr &&
+                        other.imported_width == destination.width &&
+                        other.imported_height == destination.height &&
+                        other.imported_pixel_format == destination.format &&
+                        other.imported_saved_layout == destination.layout;
+                    if (ordered_read_alias) {
+                        shares_read_only_import = true;
+                        continue;
+                    }
+                }
                 if ((other.imported && other.image == static_cast<VkImage>(destination.image)) ||
                     (other.standalone_seed.valid() &&
                      other.standalone_seed.image == destination.image &&
@@ -10960,9 +11334,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     (other.mirror_destination.valid() &&
                      other.mirror_destination.image == destination.image)) {
                     collides_with_source = true;
+                    colliding_index = other_index;
                     break;
                 }
             }
+            if (trace_destination)
+                std::fprintf(stderr,
+                    "[compute-dest-target] binding=%u borrowed=1 own-seed=%u collision=%u "
+                    "other-binding=%u other-imported=%u other-seed=%u\n",
+                    bi.binding, own_seed_destination ? 1u : 0u,
+                    collides_with_source ? 1u : 0u,
+                    colliding_index == SIZE_MAX ? UINT32_MAX : images[colliding_index].binding,
+                    colliding_index != SIZE_MAX && images[colliding_index].imported ? 1u : 0u,
+                    colliding_index != SIZE_MAX &&
+                        images[colliding_index].standalone_seed.valid() ? 1u : 0u);
             if (image_timing && perf_capture_timing)
                 std::fprintf(stderr,
                     "[compute-rtt-destination-check] code=0x%llx binding=%u "
@@ -10981,7 +11366,57 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 continue;
             }
             bi.mirror_destination = destination;
+            bi.mirror_destination_shared_import = shares_read_only_import;
             mirror_census.borrowed.add();
+        }
+
+        // #3915: a complete result for a registered VideoOut buffer also goes to a GPU-present
+        // mirror, so its flip can be presented without reading the buffer back out of guest memory.
+        // Inert unless prosper-app's GPU present is active.
+        if (prosper::gpu::gpu_present_active() && prosper::frontend::compute_scanout_enabled() &&
+            std::any_of(images.begin(), images.end(),
+                        [](const BoundImage& image) { return image.storage_writeback; })) {
+            // One registry snapshot per dispatch (each accessor takes the VideoOut mutex).
+            uint64_t vo_bases[16];
+            size_t vo_count = 0;
+            const int registered_count = prosper_vo_buffer_count();
+            for (int vo = 0; vo < registered_count && vo_count < 16; ++vo)
+                if (const uint64_t base = prosper_vo_buffer_addr(vo)) vo_bases[vo_count++] = base;
+            prosper::frontend::compute_scanout_retain_registered(vo_bases, vo_count);
+            for (size_t i = 0; i < images.size(); ++i) {
+                BoundImage& bi = images[i];
+                const ShaderResource* r = bi.resource;
+                if (!r || !r->gpu_addr || !bi.storage_writeback || bi.imported) continue;
+                if (std::find(vo_bases, vo_bases + vo_count, r->gpu_addr) == vo_bases + vo_count)
+                    continue;
+                prosper::frontend::ComputeScanoutCandidate candidate;
+                candidate.gpu_present_active = true;
+                candidate.registered_scanout = true;
+                candidate.exact_full_result = exact_full_result(i);
+                candidate.width = r->width;
+                candidate.height = r->height;
+                candidate.linear_bytes = staging_bytes[i];
+                candidate.shared_device = prosper::frontend::compute_scanout_device_shared(ctx.device);
+                const auto eligibility = prosper::frontend::compute_scanout_eligible(candidate);
+                if (eligibility != prosper::frontend::ComputeScanoutEligibility::Eligible) {
+                    // A dispatch replacing a display buffer's bytes that cannot carry a mirror still
+                    // retires any older one (its guest writeback would also dirty the watch).
+                    prosper::frontend::compute_scanout_begin(VK_NULL_HANDLE, r->gpu_addr, 0, 0);
+                    static std::atomic<uint64_t> declines[8]{};
+                    const size_t slot = static_cast<size_t>(eligibility) & 7u;
+                    if (prosper::diag_should_print(declines[slot].fetch_add(1) + 1))
+                        std::fprintf(stderr,
+                            "[compute-scanout] no GPU-present mirror for display buffer 0x%llx: %s "
+                            "(program 0x%llx binding=%u %ux%u linear=%zu)\n",
+                            (unsigned long long)r->gpu_addr,
+                            prosper::frontend::compute_scanout_eligibility_name(eligibility),
+                            (unsigned long long)item.code_addr, bi.binding, r->width, r->height,
+                            (size_t)staging_bytes[i]);
+                    continue;
+                }
+                bi.scanout_mirror = prosper::frontend::compute_scanout_begin(
+                    ctx.device, r->gpu_addr, r->width, r->height);
+            }
         }
 
         if (!ctx.prepare_dispatch_commands()) {
@@ -11609,14 +12044,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linear_ready, 0, nullptr);
                 VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                to_dst.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                to_dst.srcAccessMask = bi.mirror_destination.fresh_uninitialized
+                    ? 0u : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
                 to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                to_dst.oldLayout = static_cast<VkImageLayout>(bi.mirror_destination.layout);
+                to_dst.oldLayout = bi.mirror_destination.fresh_uninitialized
+                    ? VK_IMAGE_LAYOUT_UNDEFINED
+                    : bi.mirror_destination_shared_import
+                        ? VK_IMAGE_LAYOUT_GENERAL
+                        : static_cast<VkImageLayout>(bi.mirror_destination.layout);
                 to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
                 to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 to_dst.image = static_cast<VkImage>(bi.mirror_destination.image);
                 to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                vkCmdPipelineBarrier(command,
+                                     bi.mirror_destination.fresh_uninitialized
+                                         ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                         : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
                                      1, &to_dst);
                 VkBufferImageCopy region{};
@@ -11629,12 +12072,21 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 restore.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
                 restore.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
                 restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                restore.newLayout = static_cast<VkImageLayout>(bi.mirror_destination.layout);
+                restore.newLayout = bi.mirror_destination_shared_import
+                    ? VK_IMAGE_LAYOUT_GENERAL
+                    : static_cast<VkImageLayout>(bi.mirror_destination.layout);
                 vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
                                      1, &restore);
                 bi.mirror_destination_recorded = true;
                 rtt_destination_census().recorded.add();
+            }
+            if (bi.scanout_mirror.valid()) {
+                // staging[i] holds the canonical row-major result, the same bytes the writeback
+                // below retiles into guest memory (#3915).
+                prosper::frontend::compute_scanout_record_copy(command, staging[i],
+                                                               bi.scanout_mirror);
+                bi.scanout_mirror_recorded = true;
             }
             // Promotion is decided after host writeback, but a possible retained result must
             // already have the GENERAL layout promised to both compute and graphics consumers.
@@ -12911,13 +13363,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // also be exported directly to graphics. Raw interchange images are compatible with neither.
         for (const BoundImage& image : images) {
             if (!image.storage_writeback || image.final_output_conflict) continue;
+            const auto image_publish_start = image_timing ? ComputeClock::now() : ComputeClock::time_point{};
             const bool unique = image.alias_of == SIZE_MAX;
             const bool native_exact_storage = image.native_float_storage ||
                 image.native_uint_storage || image.packed_r11_storage;
             const bool publish_eligible = native_exact_storage && unique &&
                 image.cache_candidate && image.persistent;
+            const auto transfer_start = image_timing ? ComputeClock::now() : ComputeClock::time_point{};
             const bool authorized = publish_eligible &&
                 ctx.authorize_cached_image_compute_transfer(image.cache_key);
+            const double transfer_ms = image_timing
+                ? std::chrono::duration<double, std::milli>(ComputeClock::now() - transfer_start).count()
+                : 0.0;
             transfer_gate_census.record_storage_publish(
                 transfer_gate_observation.role, native_exact_storage, unique,
                 image.cache_candidate, image.persistent, authorized);
@@ -12933,9 +13390,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // every dispatch, exceeding the avoided conversion cost in the measured workload. Keep that path
             // disabled here: compute uses the existing journal (or Windows exact mirror), and
             // a borrower without current authority falls back to ordinary guest preparation.
+            const auto export_start = image_timing ? ComputeClock::now() : ComputeClock::time_point{};
+            double export_watch_ms = 0.0;
+            bool export_watch_had = false;
+            bool export_watch_rearmed = false;
             const bool graphics_export_authorized = publish_eligible &&
                 !image.renderer_seeded_result_candidate && image.graphics_sampled_usage &&
-                ctx.authorize_cached_image_export(image.cache_key, item.command_order);
+                ctx.authorize_cached_image_export(
+                    image.cache_key, item.command_order,
+                    image_timing ? &export_watch_ms : nullptr,
+                    image_timing ? &export_watch_had : nullptr,
+                    image_timing ? &export_watch_rearmed : nullptr);
+            const double export_ms = image_timing
+                ? std::chrono::duration<double, std::milli>(ComputeClock::now() - export_start).count()
+                : 0.0;
             // #3307: the producer half of the borrow partition. Without it, a consumer that finds
             // no cache entry cannot tell a producer that declined to publish from a producer that
             // published under a different key.
@@ -12948,6 +13416,22 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             publish_gates.export_authorized = graphics_export_authorized;
             g_image_borrow_census.record_publish(
                 prosper::frontend::classify_compute_image_publish(publish_gates));
+            if (image_timing && image.resource)
+                std::fprintf(stderr,
+                             "[compute-publish] code=0x%llx hash=0x%016llx binding=%u "
+                             "addr=0x%llx bytes=%zu eligible=%u transfer=%u export=%u "
+                             "transfer_ms=%.3f export_ms=%.3f export_watch_ms=%.3f "
+                             "watch-had=%u watch-rearmed=%u total_ms=%.3f\n",
+                             (unsigned long long)item.code_addr,
+                             (unsigned long long)timing_program_hash, image.binding,
+                             (unsigned long long)image.resource->gpu_addr, image.guest_bytes,
+                             publish_eligible ? 1u : 0u, authorized ? 1u : 0u,
+                             graphics_export_authorized ? 1u : 0u,
+                             transfer_ms, export_ms, export_watch_ms,
+                             export_watch_had ? 1u : 0u,
+                             export_watch_rearmed ? 1u : 0u,
+                             std::chrono::duration<double, std::milli>(
+                                 ComputeClock::now() - image_publish_start).count());
         }
         // Only completed architectural writebacks can authorize the destination image. This
         // includes exact GPU/CPU repeated-result branches: their guest bytes were already current,
@@ -12965,7 +13449,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             notify_live_render_target_image_written({
                 r.gpu_addr, image.mirror_destination.width,
                 image.mirror_destination.height, image.mirror_destination.format, {},
-                image.mirror_destination.image});
+                image.mirror_destination.image,
+                image.mirror_destination.fresh_uninitialized});
             rtt_destination_census().published.add();
             if (trace)
                 std::fprintf(stderr,
@@ -12974,6 +13459,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              image.binding, (unsigned long long)r.gpu_addr,
                              image.mirror_destination.width, image.mirror_destination.height,
                              static_cast<unsigned>(image.mirror_destination.format));
+        }
+        // #3915: the guest writeback is complete, so the display-buffer mirror now holds exactly
+        // the bytes in guest memory. Same compressed-metadata rule as the destination mirror above:
+        // a buffer whose DCC metadata still says compressed does not hold these linear bytes.
+        for (BoundImage& image : images) {
+            if (!image.scanout_mirror_recorded || image.final_output_conflict || !image.resource)
+                continue;
+            const ShaderResource& r = *image.resource;
+            if (r.compression_enabled &&
+                (!image.dcc_metadata || !image.dcc_metadata_bytes ||
+                 !std::all_of(image.dcc_metadata,
+                              image.dcc_metadata + image.dcc_metadata_bytes,
+                              [](uint8_t value) { return value == 0xff; })))
+                continue;
+            prosper::frontend::compute_scanout_commit(image.scanout_mirror, image.guest_bytes,
+                                                      r.tile_mode, item.submit_no);
+            image.scanout_mirror_committed = true;
         }
         writeback_publish_ms = std::chrono::duration<double, std::milli>(
             ComputeClock::now() - writeback_publish_start).count();
@@ -13575,6 +14077,24 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
                                        uint64_t guest_bytes,
                                        LiveComputeImageImport& import) {
     import = {};
+    static const std::vector<uint64_t> borrow_trace_targets = [] {
+        std::vector<uint64_t> addresses;
+        const char* spec = std::getenv("PROSPER_COMPUTE_BORROW_TARGET");
+        if (!spec || !*spec) return addresses;
+        if (!prosper::gpu::parse_hex_watch_list(spec, addresses)) {
+            std::fprintf(stderr,
+                         "[compute-borrow-target] malformed selector: expected nonzero "
+                         "0x-prefixed addresses; trace is NOT armed\n");
+            addresses.clear();
+        } else {
+            std::fprintf(stderr, "[compute-borrow-target] tracing %zu address(es)\n",
+                         addresses.size());
+        }
+        return addresses;
+    }();
+    const bool trace_borrow = !borrow_trace_targets.empty() &&
+        std::find(borrow_trace_targets.begin(), borrow_trace_targets.end(),
+                  sampled_resource.gpu_addr) != borrow_trace_targets.end();
     VulkanComputeContext* context = g_live_compute_context.load(std::memory_order_acquire);
     const bool ordinary_shape =
         ((sampled_resource.img_dim == 1 || sampled_resource.img_dim == 5) &&
@@ -13615,6 +14135,12 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
     const prosper::frontend::ComputeImageImportDecline decline =
         prosper::frontend::classify_compute_image_import(gates);
     g_image_borrow_census.record_import(decline);
+    if (trace_borrow && decline != prosper::frontend::ComputeImageImportDecline::None)
+        std::fprintf(stderr,
+                     "[compute-borrow-target] addr=0x%llx bytes=%llu decline=%s\n",
+                     (unsigned long long)sampled_resource.gpu_addr,
+                     (unsigned long long)guest_bytes,
+                     prosper::frontend::compute_image_import_decline_name(decline));
     if (decline != prosper::frontend::ComputeImageImportDecline::None) return false;
     prosper::gpu::ShaderResource storage_identity = sampled_resource;
     if (cube_array_alias) storage_identity.img_dim = 5u; // exact producer DIM=2D_ARRAY identity
@@ -13680,6 +14206,18 @@ bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampl
             key, sampled_resource, image, producer_command_order, &observation, /*scan_near_miss=*/false);
     }
     g_image_borrow_census.record_outcome(observation, guest_bytes);
+    if (trace_borrow)
+        std::fprintf(stderr,
+                     "[compute-borrow-target] addr=0x%llx bytes=%llu exact=%s final=%s "
+                     "borrowed=%u journal=%u submit-query=%u watch=%u watch-query=%u\n",
+                     (unsigned long long)sampled_resource.gpu_addr,
+                     (unsigned long long)guest_bytes,
+                     prosper::frontend::compute_image_borrow_outcome_name(
+                         exact_key_observation.outcome),
+                     prosper::frontend::compute_image_borrow_outcome_name(observation.outcome),
+                     borrowed ? 1u : 0u, observation.journal_armed ? 1u : 0u,
+                     observation.submit_query, observation.watch_present ? 1u : 0u,
+                     observation.watch_query);
     // Recorded after the retry, because whether the alias RESCUED this lookup decides whether its
     // fields belong in the census's field list at all. A rescued scan's mask necessarily names
     // `format` and `vk_format` -- that is the difference the retry exists to bridge -- so counting
@@ -14021,7 +14559,76 @@ void sampled_float16_to_unorm8_range(const uint8_t* source, uint32_t components,
 // TripBoundWitnessScope lives in trip_bound_witness.hpp so its save/restore contract can be
 // exercised by a regression test rather than only by a routed run.
 
+// Wall time spent executing compute items, against wall time overall.
+//
+// This exists because the two instruments that already measure the render path DISAGREE about how
+// much of a run it accounts for, and the gap is this function. On a windowed Astro Bot run the
+// per-submit report gives backend=35.30 of total=35.36 ms -- about 58% of wall -- while the
+// pass-cost census puts time inside render_draw_pass_rgba at 8.5%. Both are right: roughly half
+// the run is in backend code that is not drawing, and compute-item execution is the candidate.
+// Nothing measured it, so the share was inferred from profile leaves (parallel_compute_texels,
+// half_to_float, the retile binds) rather than counted. This counts it.
+//
+// Reports wall time and call count at end of run, on by default, silent when no item ever ran.
+// `PROSPER_NO_COMPUTE_ITEMS_CENSUS=1` silences it.
+namespace {
+struct ComputeItemsCensus {
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> items{0};
+    std::atomic<uint64_t> nanoseconds{0};
+    std::atomic<uint64_t> first_ns{0};
+    std::atomic<uint64_t> last_ns{0};
+};
+ComputeItemsCensus& compute_items_census() {
+    static ComputeItemsCensus census;
+    static const bool once = [] {
+        prosper::diagnostics::register_census("PROSPER_NO_COMPUTE_ITEMS_CENSUS", [] {
+            auto& c = compute_items_census();
+            const uint64_t calls = c.calls.load(std::memory_order_relaxed);
+            if (!calls) return false;
+            const uint64_t first = c.first_ns.load(std::memory_order_relaxed);
+            const uint64_t last = c.last_ns.load(std::memory_order_relaxed);
+            const double busy_ms = c.nanoseconds.load(std::memory_order_relaxed) / 1e6;
+            const double span_ms = last > first ? (last - first) / 1e6 : 0.0;
+            std::fprintf(stderr,
+                         "[compute-items] RUN TOTAL calls=%llu items=%llu in-compute=%.1fms "
+                         "span=%.1fms (%.1f%% of span) mean=%.3fms/call\n",
+                         static_cast<unsigned long long>(calls),
+                         static_cast<unsigned long long>(c.items.load(std::memory_order_relaxed)),
+                         busy_ms, span_ms, span_ms > 0 ? 100.0 * busy_ms / span_ms : 0.0,
+                         busy_ms / static_cast<double>(calls));
+            std::fflush(stderr);
+            return true;
+        });
+        return true;
+    }();
+    (void)once;
+    return census;
+}
+uint64_t compute_items_now_ns() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+// Reports on every exit, including the fail-closed returns below.
+struct ComputeItemsScope {
+    uint64_t start = compute_items_now_ns();
+    size_t count = 0;
+    explicit ComputeItemsScope(size_t n) : count(n) {}
+    ~ComputeItemsScope() {
+        auto& c = compute_items_census();
+        const uint64_t end = compute_items_now_ns();
+        c.calls.fetch_add(1, std::memory_order_relaxed);
+        c.items.fetch_add(count, std::memory_order_relaxed);
+        c.nanoseconds.fetch_add(end - start, std::memory_order_relaxed);
+        uint64_t expected = 0;
+        c.first_ns.compare_exchange_strong(expected, start, std::memory_order_relaxed);
+        c.last_ns.store(end, std::memory_order_relaxed);
+    }
+};
+}  // namespace
+
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {
+    const ComputeItemsScope compute_items_scope(items.size());
     const prosper::gpu::TileCensusScope tile_census_scope("compute");
     auto fail_closed_items = [&]() {
         for (const auto& item : items)

@@ -7,7 +7,9 @@
 #include "gpu/resources/fold_control_plan.hpp"
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/execute/compute_program_facts.hpp"
 #include "diagnostics/env_submit.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"   // #3891: skipped-dispatches, shader-compile alarms
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // first-N-then-powers-of-two report throttling
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not silently drop an operator-set cap
@@ -1669,6 +1671,12 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
     const auto end = std::chrono::steady_clock::now();
     ++cache.stats.misses;
     cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();
+    // #3891 shader-compile: the same span, into the always-on ledger (the clock reads above
+    // already exist; this adds two relaxed atomics per recompile, and hits pay nothing).
+    prosper::diagnostics::perf::add_cost(
+        prosper::diagnostics::perf::Cost::ShaderCompile,
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
 
     scratch.prepare_for_cache();
     constexpr size_t max_entries = 4096;
@@ -2062,6 +2070,12 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     const auto end = std::chrono::steady_clock::now();
     ++cache.stats.misses;
     cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();
+    // #3891 shader-compile: the same span, into the always-on ledger (the clock reads above
+    // already exist; this adds two relaxed atomics per recompile, and hits pay nothing).
+    prosper::diagnostics::perf::add_cost(
+        prosper::diagnostics::perf::Cost::ShaderCompile,
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
 
     scratch.prepare_for_cache();
     constexpr size_t max_entries = 4096;
@@ -7903,6 +7917,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
             prosper_agc_shader_header_for_code(code_addr));
         if (!header || !code_addr || !guest_readable(code_addr, sizeof(uint32_t))) {
             record_failure(RealizationFailureReason::MissingProgram, {}, {});
+            prosper::diagnostics::perf::skip_dispatch(
+                prosper::diagnostics::perf::DispatchSkip::MissingProgram);
             static std::set<uint64_t> logged;
             if (logged.insert(code_addr).second)
                 std::fprintf(stderr, "[compute] skip unregistered/unreadable program 0x%llx\n",
@@ -8192,18 +8208,26 @@ std::vector<ComputeItem> realize_compute_dispatches(
         const RecompileDiagnosticContext recompile_diagnostic{
             RecompileDiagnosticStage::Compute, code_addr};
         {
-            std::vector<Rdna2Inst> decoded;
-            rdna2_walk(reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                       shader_dwords, decoded);
+            // Decode, the native-multiwave probe and the GDS scan depend only on the program's
+            // bytes; compute_program_facts memoizes them per exact program (see its header).
+            const std::shared_ptr<const ComputeProgramFacts> facts = compute_program_facts(
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                shader_dwords, recompile_diagnostic);
             // Keep dispatch-scoped resource discovery and translation on the same specialized
             // instruction stream. A proven-null BVH can collapse only the exact no-hit exit and a
             // fully matched empty-stack traversal cycle; shader-byte constant folding may then
             // remove any remaining unreachable arm.
             // Drop only instruction-scoped resources whose consumers disappeared. Direct resources
             // (fetch_pc == UINT32_MAX) remain available to every surviving use of their SGPR/SRT key.
-            std::vector<Rdna2Inst> resource_paths = decoded;
-            const ComputeResourcePathSpecializationReport path_report =
-                specialize_compute_resource_paths(resource_paths, *table, compute_wave_size);
+            // Without a proven-null BVH or zero-record resource neither specializer can change the
+            // stream or the table, so the scratch copy is skipped.
+            ComputeResourcePathSpecializationReport path_report;
+            if (!compute_program_facts_cache_enabled() ||
+                compute_resource_paths_may_specialize(*table, compute_wave_size)) {
+                std::vector<Rdna2Inst> resource_paths = facts->decoded;
+                path_report =
+                    specialize_compute_resource_paths(resource_paths, *table, compute_wave_size);
+            }
             if (std::getenv("PROSPER_DBG") &&
                 (path_report.proven_null_exits || path_report.zero_record_execz_exits)) {
                 std::fprintf(stderr,
@@ -8219,13 +8243,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                  path_report.removed_pcs[index]);
                 std::fprintf(stderr, "\n");
             }
-            native_multiwave_wave_work = compute_shader_prefers_native_multiwave(
-                decoded, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                shader_dwords, recompile_diagnostic);
-            const bool uses_gds = std::any_of(decoded.begin(), decoded.end(), [](const auto& in) {
-                return in.fmt == Rdna2Format::DS && in.ds_gds &&
-                       (in.opcode == 0x0d || in.opcode == 0x3d || in.opcode == 0x3e);
-            });
+            native_multiwave_wave_work = facts->prefers_native_multiwave;
+            const bool uses_gds = facts->uses_gds;
             // A bounded dispatcher needs the internal GDS buffer as its witness destination even when
             // the guest program never touches GDS — see kComputeTripWitnessDword.
             //
@@ -8291,7 +8310,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
         const bool timeline_capture_bound = timeline_capture_requires_portable_compute(
             timeline_capture_requested, timeline_capture_after_compute_gated,
             timeline_capture_after_compute_armed);
-        const bool capture_bound = std::getenv("PROSPER_GPU_CAPTURE") ||
+        const bool capture_bound = env_gpu_capture_requires_portable_compute() ||
             timeline_capture_bound ||
             interactive_gpu_capture_armed() || interactive_capture_bundle_active();
         if (capture_bound)
@@ -8731,6 +8750,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
             }
             note_compute_program_outcome(code_addr, false, launch.groups_x, launch.groups_y,
                                         launch.groups_z, launch.local_x, launch.local_y);
+            prosper::diagnostics::perf::skip_dispatch(
+                prosper::diagnostics::perf::DispatchSkip::ShaderRecompile);
             continue;
         }
         const DescriptorValidationReport report = validate_spirv_descriptor_interface(
@@ -8783,6 +8804,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
             }
             note_compute_program_outcome(code_addr, false, launch.groups_x, launch.groups_y,
                                         launch.groups_z, launch.local_x, launch.local_y);
+            prosper::diagnostics::perf::skip_dispatch(
+                prosper::diagnostics::perf::DispatchSkip::DescriptorContract);
             report_compute_binding_watch(code_addr, item.resources.get(), ComputeBindOutcome::SkippedDescriptors);
             continue;
         }
@@ -9341,7 +9364,12 @@ OrderedSubmitResult execute_ordered_items_impl(const std::vector<SubmitOperation
             span.push_back(draws[operation.item]);
         } else if (operation.kind == ExecutableKind::Dispatch) {
             flush_span();
-            result.compute_executed |= compute && compute({computes[operation.item]});
+            if (compute) {
+                const prosper::diagnostics::perf::BackendDispatchOutcome outcome;
+                const bool executed = compute({computes[operation.item]});
+                outcome.finish(executed);
+                result.compute_executed |= executed;
+            }
         } else {
             flush_span(true);
             execute_dma(dma_copies[operation.item]);
@@ -10741,6 +10769,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     const float scale_y = full_height ? static_cast<float>(height) / full_height : 1.0f;
     OrderedSubmitResult result;
     bool producer_epoch_ok = true;
+    // #3891: set for the rest of the submit once a DELIBERATE decline (selector, parent walk) broke
+    // a producer epoch, so the indirect dispatches it strands are not counted as skipped-dispatches.
+    bool epoch_broken_deliberately = false;
     bool indirect_dependencies_ok = true;
     bool final_callback_sent = false;
     uint64_t previous_compute_code = 0;
@@ -11092,6 +11123,13 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     notify_compute_authority_unknown(
                         ComputeAuthorityBoundaryKind::Compute,
                         submit_no, operation.command_order);
+                    // #3891: not counted when there is no compute backend at all, nor after a
+                    // DELIBERATE decline earlier in this submit (the selector, the parent walk):
+                    // the poison carries through parser stalls, so from here the two causes cannot
+                    // be told apart, and an experiment must not raise a correctness alarm.
+                    if (compute && !epoch_broken_deliberately)
+                        prosper::diagnostics::perf::skip_dispatch(
+                            prosper::diagnostics::perf::DispatchSkip::IndirectDependencies);
                     if (capture_trace) {
                         capture_trace->failures.push_back({
                             SubmitOperationKind::Dispatch, operation.index,
@@ -11121,6 +11159,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     notify_compute_authority_unknown(
                         ComputeAuthorityBoundaryKind::Compute,
                         submit_no, operation.command_order);
+                    if (compute)   // #3891: no backend, nothing prosper wanted to run
+                        prosper::diagnostics::perf::skip_dispatch(
+                            prosper::diagnostics::perf::DispatchSkip::IndirectArguments);
                     if (capture_trace) {
                         // A dispatch's indirect arguments fail exactly as a draw's do; recording it
                         // as Unknown was the documented gap in the reason enum, not a distinct case.
@@ -11283,6 +11324,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                                 RealizationFailureReason::SuspiciousDispatchSkipped});
                         }
                         producer_epoch_ok = false;
+                        epoch_broken_deliberately = true;
                         previous_compute_code = current_compute_code;
                         previous_compute_realized = true;
                         previous_compute_executed = false;
@@ -11349,8 +11391,10 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     const std::vector<uint32_t> tree_watch_pre =
                         observe_compute_tree_watch_pre(item, submit_no, operation.index,
                                                        operation.command_order, tree_watch_touch);
+                    const prosper::diagnostics::perf::BackendDispatchOutcome outcome;
                     const bool executed = capture_trace
                         ? compute({item}) : compute({std::move(item)});
+                    epoch_broken_deliberately |= outcome.finish(executed);
                     log_compute_dispatch(tree_watch_program, submit_no, operation.index,
                                          operation.command_order,
                                          executed ? "executed" : "backend-declined",
@@ -11596,9 +11640,17 @@ CompressionMetadataKind classify_compression_metadata_kind(const MetadataKindReq
 bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageRequest& request,
                                      LiveTargetImageImport& import) {
     import = LiveTargetImageImport{};
-    if (!g_live_target_image_import) return false;
+    if (!g_live_target_image_import) {
+        import.refusal = LiveTargetImageImport::Refusal::NoImporter;
+        return false;
+    }
     if (!g_live_target_image_import(gpu_addr, request, import)) {
+        // Reset the handles but KEEP the reason. Clearing the whole struct here is what made every
+        // decline indistinguishable at the call site; the caller's fallback for a refused import is
+        // a full CPU round trip, so the reason is the only thing that says which one to fix.
+        const auto refusal = import.refusal;
         import = LiveTargetImageImport{};
+        import.refusal = refusal;
         return false;
     }
     if (!import.valid()) {
@@ -11606,6 +11658,7 @@ bool import_live_render_target_image(uint64_t gpu_addr, const LiveTargetImageReq
         // permanently un-evictable cache entry if a future importer breaks the contract.
         release_live_render_target_image(gpu_addr);
         import = LiveTargetImageImport{};
+        import.refusal = LiveTargetImageImport::Refusal::ImporterReturnedInvalid;
         return false;
     }
     return true;
@@ -11614,14 +11667,21 @@ bool borrow_live_render_target_image_destination(
     uint64_t gpu_addr, const LiveTargetImageDestinationRequest& request,
     LiveTargetImageImport& destination) {
     destination = LiveTargetImageImport{};
-    if (!g_live_target_image_destination) return false;
+    if (!g_live_target_image_destination) {
+        destination.refusal = LiveTargetImageImport::Refusal::NoImporter;
+        return false;
+    }
     if (!g_live_target_image_destination(gpu_addr, request, destination)) {
+        // Same contract as the source import above: reset the handles, keep the reason.
+        const auto refusal = destination.refusal;
         destination = LiveTargetImageImport{};
+        destination.refusal = refusal;
         return false;
     }
     if (!destination.valid()) {
         release_live_render_target_image(gpu_addr);
         destination = LiveTargetImageImport{};
+        destination.refusal = LiveTargetImageImport::Refusal::ImporterReturnedInvalid;
         return false;
     }
     return true;

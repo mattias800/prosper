@@ -4427,6 +4427,258 @@ int main(int argc, char** argv) {
     { DrawItem d; (void)begin_requested_gpu_capture({d}, {}, {}, 64, 64); }
     CHECK(!interactive_gpu_capture_armed(), "the re-armed grab is consumed by the next drawing invocation");
 
+    // #3895: a pending runtime capture asks the live renderer for a CPU copy of the captured submit's
+    // presented frame (its output oracle) for exactly as long as the pending capture lives, while a
+    // hand-built pending capture (tests, tools) never does. Counted relative to a baseline because
+    // pending captures created earlier in this function are still alive.
+    const uint32_t holds_before = gpu_capture_cpu_output_hold_count_for_test();
+    { PendingGpuCapture hand_built;
+      CHECK(gpu_capture_cpu_output_hold_count_for_test() == holds_before,
+            "a hand-built pending capture does not engage the hold"); }
+    request_interactive_gpu_capture(prosper_test::test_scratch_file("prosper_interactive_grab3.prgcap"));
+    {
+        DrawItem d;
+        auto held = begin_requested_gpu_capture({d}, {}, {}, 64, 64, nullptr, 0, UINT64_MAX,
+                                                nullptr, /*defer_materialization=*/true);
+        CHECK(held != nullptr, "a deferred interactive capture is pending");
+        CHECK(gpu_capture_cpu_output_hold_count_for_test() == holds_before + 1 &&
+                  gpu_capture_requires_cpu_output(),
+              "a pending runtime capture requires the captured submit's CPU output (#3895)");
+        held.reset();
+        CHECK(gpu_capture_cpu_output_hold_count_for_test() == holds_before,
+              "destroying the pending capture releases the hold");
+    }
+
+    // #3908: a DEFERRED capture materializes after its submit has run, when the live RTT cache
+    // already holds the submit's own output for every target its draws wrote. Those targets' seeds
+    // must be read at begin (pre-submit); a target the submit's draws never write is unchanged and
+    // is still read live at finish.
+    {
+        const std::vector<uint8_t> pre(16, 0x11), post(16, 0x22), untouched(16, 0x33);
+        bool submit_ran = false;
+        GpuCaptureDsSeed pre_ds = ds_seed;
+        pre_ds.depth_read_base = pre_ds.depth_write_base = 0xb10000;
+        pre_ds.stencil_read_base = pre_ds.stencil_write_base = 0xb20000;
+        pre_ds.htile_data_base = 0xb30000;
+        pre_ds.depth.assign(16, 0x41);
+        GpuCaptureDsSeed post_ds = pre_ds;
+        post_ds.depth.assign(16, 0x72);
+        unsigned ds_snapshot_calls = 0;
+        set_gpu_capture_ds_seed_snapshot_reader(
+            [&](std::vector<GpuCaptureDsSeed>& seeds, std::string&) {
+                ++ds_snapshot_calls;
+                seeds.push_back(submit_ran ? post_ds : pre_ds);
+                return true;
+            });
+        set_gpu_capture_rtt_seed_reader([&](uint64_t addr, GpuCaptureRttSeed& seed) {
+            if (addr != 0x9000 && addr != 0xa000) return false;
+            seed.guest_addr = addr; seed.width = 2; seed.height = 2;
+            seed.rgba = addr == 0xa000 ? untouched : (submit_ran ? post : pre);
+            return true;
+        });
+        // The submit's semantic state: one draw whose CB_COLOR0 is 0x9000.
+        auto draw_state = std::make_shared<GpuState>();
+        draw_state->cx[P::CB_COLOR0_BASE] = 0x9000u >> 8;
+        draw_state->cx[P::DB_DEPTH_CONTROL] = 0x2u; // Z_ENABLE
+        GpuState submit_state;
+        GpuState::Draw semantic_draw;
+        semantic_draw.state = draw_state;
+        semantic_draw.index_count = 3;
+        submit_state.draws.push_back(semantic_draw);
+        const std::string deferred_path =
+            prosper_test::test_scratch_file("prosper_deferred_seed_3908.prgcap");
+        request_interactive_gpu_capture(deferred_path);
+        DrawItem d;
+        d.color0_base = 0x9000; d.color0_width = 2; d.color0_height = 2;
+        d.color1_base = 0xa000;   // referenced, but not written by the submit's draws
+        d.ps.depth_test_enable = true;
+        d.ps.depth_read_base = d.ps.depth_write_base = pre_ds.depth_read_base;
+        d.ps.stencil_read_base = d.ps.stencil_write_base = pre_ds.stencil_read_base;
+        d.ps.htile_data_base = pre_ds.htile_data_base;
+        const std::vector<DrawItem> deferred_draws{d};
+        auto pending = begin_requested_gpu_capture(deferred_draws, {}, {}, 2, 2, &submit_state, 0,
+                                                   UINT64_MAX, nullptr,
+                                                   /*defer_materialization=*/true);
+        CHECK(pending && pending->pre_submit_rtt_seeds_taken &&
+                  pending->pre_submit_rtt_seeds.size() == 1 &&
+                  pending->pre_submit_rtt_seeds[0].guest_addr == 0x9000,
+              "a deferred capture reads the submit's colour targets at begin (pre-submit)");
+        CHECK(pending && pending->pre_submit_ds_seeds_taken &&
+                  pending->pre_submit_ds_seeds.size() == 1 &&
+                  pending->pre_submit_ds_seeds[0].depth == pre_ds.depth &&
+                  ds_snapshot_calls == 1,
+              "a deferred capture reads persistent depth before the submit");
+        submit_ran = true;   // the live cache now holds the submit's output at 0x9000
+        const std::vector<ComputeItem> no_computes;
+        const std::vector<SubmitOperation> no_operations;
+        std::string finish_error;
+        const bool finished = finish_requested_gpu_capture(
+            std::move(pending), {}, finish_error, &deferred_draws, &no_computes, &no_operations);
+        GpuCaptureFile loaded;
+        std::string load_error;
+        const bool read = finished && read_gpu_capture(deferred_path, loaded, load_error);
+        CHECK(read, finished ? "the deferred capsule reads back" : finish_error.c_str());
+        const auto seed_at = [&](uint64_t addr) -> const GpuCaptureRttSeed* {
+            for (const auto& seed : loaded.rtt_seeds) if (seed.guest_addr == addr) return &seed;
+            return nullptr;
+        };
+        CHECK(read && seed_at(0x9000) && seed_at(0x9000)->rgba == pre,
+              "a target the submit wrote is seeded with its PRE-submit pixels, not the live output");
+        CHECK(read && seed_at(0xa000) && seed_at(0xa000)->rgba == untouched,
+              "a referenced target the submit's draws never write is still read live");
+        CHECK(read && loaded.ds_seeds.size() == 1 &&
+                  loaded.ds_seeds[0].depth == pre_ds.depth && ds_snapshot_calls == 1,
+              "deferred materialization uses only pre-submit depth, never the post-submit cache");
+        // A newly created depth attachment has no pre-submit checkpoint. Materialization must not
+        // turn the attachment produced by this submit into its own seed.
+        submit_ran = false;
+        set_gpu_capture_ds_seed_snapshot_reader(
+            [&](std::vector<GpuCaptureDsSeed>& seeds, std::string&) {
+                if (submit_ran) seeds.push_back(post_ds);
+                return true;
+            });
+        const std::string absent_path =
+            prosper_test::test_scratch_file("prosper_deferred_absent_ds_3908.prgcap");
+        request_interactive_gpu_capture(absent_path);
+        pending = begin_requested_gpu_capture(deferred_draws, {}, {}, 2, 2, &submit_state, 0,
+                                              UINT64_MAX, nullptr,
+                                              /*defer_materialization=*/true);
+        CHECK(pending && pending->pre_submit_ds_seeds_taken &&
+                  pending->pre_submit_ds_seeds.empty(),
+              "deferred capture records an absent pre-submit depth attachment");
+        submit_ran = true;
+        finish_error.clear();
+        const bool absent_finished = finish_requested_gpu_capture(
+            std::move(pending), {}, finish_error, &deferred_draws, &no_computes, &no_operations);
+        GpuCaptureFile absent_loaded;
+        CHECK(absent_finished && read_gpu_capture(absent_path, absent_loaded, load_error) &&
+                  absent_loaded.ds_seeds.empty(),
+              "new depth attachment is not seeded from its post-submit pixels");
+
+        set_gpu_capture_rtt_seed_reader([&](uint64_t addr, GpuCaptureRttSeed& seed) {
+            if (addr == 0x9000 && !submit_ran) return false;
+            if (addr != 0x9000 && addr != 0xa000) return false;
+            seed.guest_addr = addr; seed.width = 2; seed.height = 2;
+            seed.rgba = addr == 0xa000 ? untouched : post;
+            return true;
+        });
+        submit_ran = false;
+        const std::string absent_colour_path =
+            prosper_test::test_scratch_file("prosper_deferred_absent_colour_3908.prgcap");
+        request_interactive_gpu_capture(absent_colour_path);
+        pending = begin_requested_gpu_capture(deferred_draws, {}, {}, 2, 2, &submit_state, 0,
+                                              UINT64_MAX, nullptr,
+                                              /*defer_materialization=*/true);
+        CHECK(pending && pending->pre_submit_rtt_seeds_taken &&
+                  pending->pre_submit_rtt_absent == std::vector<uint64_t>{0x9000},
+              "deferred capture records a colour target absent before the submit");
+        submit_ran = true;
+        finish_error.clear();
+        const bool absent_colour_finished = finish_requested_gpu_capture(
+            std::move(pending), {}, finish_error, &deferred_draws, &no_computes, &no_operations);
+        GpuCaptureFile absent_colour_loaded;
+        CHECK(absent_colour_finished &&
+                  read_gpu_capture(absent_colour_path, absent_colour_loaded, load_error) &&
+                  std::none_of(absent_colour_loaded.rtt_seeds.begin(),
+                               absent_colour_loaded.rtt_seeds.end(),
+                               [](const auto& seed) { return seed.guest_addr == 0x9000; }),
+              "new colour target is not seeded from its post-submit pixels");
+
+        // An unavailable pre-submit snapshot cannot silently fall back to the now-mutated cache.
+        unsigned failed_snapshot_calls = 0;
+        set_gpu_capture_ds_seed_snapshot_reader(
+            [&](std::vector<GpuCaptureDsSeed>&, std::string&) {
+                ++failed_snapshot_calls;
+                return false; // deliberately leaves the error string empty
+            });
+        request_interactive_gpu_capture(
+            prosper_test::test_scratch_file("prosper_deferred_failed_ds_3908.prgcap"));
+        pending = begin_requested_gpu_capture(deferred_draws, {}, {}, 2, 2, &submit_state, 0,
+                                              UINT64_MAX, nullptr,
+                                              /*defer_materialization=*/true);
+        CHECK(pending && !pending->pre_submit_ds_seeds_taken &&
+                  !pending->pre_submit_ds_error.empty(),
+              "failed pre-submit depth snapshot records an explicit capture error");
+        finish_error.clear();
+        CHECK(!finish_requested_gpu_capture(
+                  std::move(pending), {}, finish_error, &deferred_draws, &no_computes,
+                  &no_operations) && failed_snapshot_calls == 1 &&
+                  finish_error == "deferred pre-submit DS snapshot failed",
+              "deferred capture fails closed instead of reading post-submit depth");
+
+        // A presented frame is an oracle only when this submit actually writes the registered
+        // scanout. Use the same valid captured submit with two scanout identities so the target
+        // relation, rather than the output bytes, is the discriminating variable.
+        auto write_oracle_case = [&](uint64_t scanout_addr, bool colour_write, const char* path,
+                                     GpuCaptureFile& result, bool empty_output = false) {
+            auto oracle_pending = std::make_unique<PendingGpuCapture>();
+            oracle_pending->path = prosper_test::test_scratch_file(path);
+            oracle_pending->capture = loaded;
+            if (!colour_write) {
+                oracle_pending->capture.draws[0].ps.color_write_mask = 0;
+                oracle_pending->capture.draws[0].ps.color_targets[0].write_mask = 0;
+            }
+            if (scanout_addr)
+                oracle_pending->capture.metadata.renderer_env.emplace_back(
+                    kGpuReplayScanoutAddressEnv,
+                    scanout_addr == 0x9000 ? "0x9000" : "0x7777");
+            std::string write_error;
+            return finish_requested_gpu_capture(
+                       std::move(oracle_pending), empty_output ? std::vector<uint8_t>{} : pre,
+                       write_error) &&
+                   read_gpu_capture(prosper_test::test_scratch_file(path), result, write_error);
+        };
+        GpuCaptureFile offscreen_oracle, scanout_oracle;
+        CHECK(write_oracle_case(0x7777, true, "prosper_offscreen_oracle_3908.prgcap",
+                                offscreen_oracle) &&
+                  !offscreen_oracle.expected_output_valid &&
+                  offscreen_oracle.expected_output_bytes == 0 &&
+                  offscreen_oracle.expected_output_hash == 0 &&
+                  std::any_of(offscreen_oracle.metadata.renderer_env.begin(),
+                              offscreen_oracle.metadata.renderer_env.end(),
+                              [](const auto& entry) {
+                                  return entry.first == kGpuReplayNoScanoutDrawEnv &&
+                                         entry.second == "1";
+                              }),
+              "offscreen submit does not claim the unrelated presented frame as its oracle");
+        CHECK(write_oracle_case(0x9000, true, "prosper_scanout_oracle_3908.prgcap",
+                                scanout_oracle) &&
+                  scanout_oracle.expected_output_valid &&
+                  scanout_oracle.expected_output_bytes == pre.size() &&
+                  scanout_oracle.expected_output_hash == gpu_capture_hash(pre),
+              "same submit retains its pixel oracle when the draw writes scanout");
+        GpuCaptureFile unknown_scanout_oracle;
+        CHECK(write_oracle_case(0, true, "prosper_unknown_scanout_oracle_3908.prgcap",
+                                unknown_scanout_oracle) &&
+                  !unknown_scanout_oracle.expected_output_valid &&
+                  unknown_scanout_oracle.expected_output_bytes == 0 &&
+                  unknown_scanout_oracle.expected_output_hash == 0 &&
+                  std::any_of(unknown_scanout_oracle.metadata.renderer_env.begin(),
+                              unknown_scanout_oracle.metadata.renderer_env.end(),
+                              [](const auto& entry) {
+                                  return entry.first == kGpuReplayNoScanoutDrawEnv &&
+                                         entry.second == "1";
+                              }),
+              "presented pixels without a registered scanout cannot prove a submit output");
+        GpuCaptureFile masked_oracle;
+        CHECK(write_oracle_case(0x9000, false, "prosper_masked_oracle_3908.prgcap",
+                                masked_oracle) && !masked_oracle.expected_output_valid,
+              "binding scanout with all colour writes masked does not make an output oracle");
+        GpuCaptureFile empty_depth_only;
+        CHECK(write_oracle_case(0x9000, false, "prosper_empty_depth_only_3908.prgcap",
+                                empty_depth_only, true) &&
+                  !empty_depth_only.expected_output_valid &&
+                  std::any_of(empty_depth_only.metadata.renderer_env.begin(),
+                              empty_depth_only.metadata.renderer_env.end(),
+                              [](const auto& entry) {
+                                  return entry.first == kGpuReplayNoScanoutDrawEnv &&
+                                         entry.second == "1";
+                              }),
+              "empty-output depth-only submit still tags replay to discard retained pixels");
+        set_gpu_capture_ds_seed_snapshot_reader({});
+        set_gpu_capture_rtt_seed_reader({});
+    }
+
     // --- PROSPER_CAPTURE_BLOB_MAX_MB parse/clamp rules (#2440) ------------------------------------
     // The per-resource ceiling is a runtime value because GTA V gameplay binds a 1,105,723,396-byte
     // buffer -- 1.0298x over the 1 GiB default -- and one resource over the line aborts the whole

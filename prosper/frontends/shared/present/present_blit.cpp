@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
+#include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: present slots prefer VRAM
 
 namespace prosper::frontend {
 namespace {
@@ -47,14 +48,6 @@ struct PresentBlitState {
 };
 
 PresentBlitState& S() { static PresentBlitState s; return s; }
-
-uint32_t find_mem_type(VkPhysicalDevice phys, uint32_t bits, VkMemoryPropertyFlags want) {
-    VkPhysicalDeviceMemoryProperties mp{};
-    vkGetPhysicalDeviceMemoryProperties(phys, &mp);
-    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
-        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
-    return UINT32_MAX;
-}
 
 // #1270: an optimal-tiling image can only be blit source/dest if the driver advertises the feature for
 // that format. On any conformant driver RGBA8/RGBA16F/BGRA8 all support BLIT_SRC/BLIT_DST, so this is
@@ -106,11 +99,15 @@ bool ensure_slot_image(PresentBlitState& s, Slot& sl, uint32_t w, uint32_t h) {
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(s.dev, &ici, nullptr, &sl.image) != VK_SUCCESS) { sl.image = VK_NULL_HANDLE; return false; }
     VkMemoryRequirements req{}; vkGetImageMemoryRequirements(s.dev, sl.image, &req);
-    uint32_t mt = find_mem_type(s.phys, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (mt == UINT32_MAX) { destroy_slot_image(s, sl); return false; }
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(s.phys, &mp);
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    mai.allocationSize = req.size; mai.memoryTypeIndex = mt;
-    if (prosper::gpu::allocate_device_memory(s.dev, &mai, &sl.memory) != VK_SUCCESS) { destroy_slot_image(s, sl); return false; }
+    mai.allocationSize = req.size;
+    if (prosper::gpu::allocate_gpu_only_memory(s.dev, prosper::gpu::GpuOnlyMemoryClass::PresentSlot,
+                                               mp, req.memoryTypeBits, mai,
+                                               &sl.memory) != VK_SUCCESS) {
+        destroy_slot_image(s, sl); return false;
+    }
     if (vkBindImageMemory(s.dev, sl.image, sl.memory, 0) != VK_SUCCESS) { destroy_slot_image(s, sl); return false; }
     sl.w = w; sl.h = h;
     return true;

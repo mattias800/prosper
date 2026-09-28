@@ -394,10 +394,29 @@ static uint64_t psv_old(const char* t) {
     return t ? (uint64_t)(int64_t)(int)std::strtol(t, nullptr, 0) : kTriStateUnset;
 }
 
+// --- src/diagnostics/perf/perf_alarms.cpp : PROSPER_PERF_ALARM_WINDOW_MS / _THRESHOLD_PCT (#3891)
+// New knobs, strict from the start. The naive spelling would read `5s` as 5 ms (a window that
+// closes on every flip) and `50%` as 50; both must keep the default instead. 0 also keeps it: a
+// zero window or a zero percentage is never a meaningful experiment.
+static uint64_t alarm_window_new(const char* n, const char* t) {
+    const uint64_t v = env_u64_or_default(n, t, 5000, "milliseconds");
+    return v ? v : 5000;
+}
+static uint64_t alarm_window_old(const char* t) { return t ? std::strtoull(t, nullptr, 10) : 5000; }
+static uint64_t alarm_pct_new(const char* n, const char* t) {
+    const uint64_t v = env_u64_or_default(n, t, 100, "percent");
+    return v ? v : 100;
+}
+static uint64_t alarm_pct_old(const char* t) { return t ? std::strtoull(t, nullptr, 10) : 100; }
+
 static const uint64_t kMiB = 1024ull * 1024ull;
 static const uint64_t kGiB = 1024ull * kMiB;
 
 static const Site kSites[] = {
+    {"perf_alarms.cpp PROSPER_PERF_ALARM_WINDOW_MS", "PROSPER_PERF_ALARM_WINDOW_MS",
+     alarm_window_new, alarm_window_old, "5s", 5000, "2000", 2000},
+    {"perf_alarms.cpp PROSPER_PERF_ALARM_THRESHOLD_PCT", "PROSPER_PERF_ALARM_THRESHOLD_PCT",
+     alarm_pct_new, alarm_pct_old, "50%", 100, "25", 25},
     {"render_runner.h PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS (lower cap)",
      "PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS", buffer_owners_new,
      buffer_owners_permissive, "256owners", 4096, "256", 256},
@@ -466,6 +485,10 @@ static const Site kSites[] = {
      mib_cap_new<256>, mib_cap_old<256>, "1gb", 256ull * kMiB, "128", 128ull * kMiB},
     {"render_runner.h PROSPER_BACKEND_TEXTURE_CACHE_MB", "PROSPER_BACKEND_TEXTURE_CACHE_MB",
      mib_cap_new<1024>, mib_cap_old<1024>, "eight", 1024ull * kMiB, "2048", 2048ull * kMiB},
+    // #3873: test-only fake discrete heap for the texture-cache budget. 0 means OFF, so a malformed
+    // value must keep it off rather than wrap to an effectively infinite fake heap.
+    {"render_runner.h PROSPER_FAKE_HEAP_BUDGET_MB", "PROSPER_FAKE_HEAP_BUDGET_MB",
+     mib_cap_new<0>, mib_cap_old<0>, "-1", 0ull, "8192", 8192ull * kMiB},
     {"render_runner.h PROSPER_MEMORY_POOL_MB", "PROSPER_MEMORY_POOL_MB",
      mib_cap_new<512>, mib_cap_old<512>, "-1", 512ull * kMiB, "256", 256ull * kMiB},
     // #3405: the mapped-staging cache's own budget, accounted separately from the transient pool
