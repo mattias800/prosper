@@ -507,9 +507,10 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
             a.detail = format("failed-validations=%llu validated=%.0fMiB flips=%llu",
                               (unsigned long long)w.count(Counter::TextureValidationFailures),
                               bytes / kMiB, (unsigned long long)w.flips);
-            a.hint = "persistent decode-cache entries are compared byte-for-byte against guest "
-                     "memory and found changed every time (a movie plane, a streamed atlas): the "
-                     "compare is certain to fail and is paid on top of the re-decode; next: "
+            a.hint = "persistent decode-cache entries keep failing their byte-for-byte compare "
+                     "only after reading most of the source (a partially streamed atlas, a surface "
+                     "whose tail is rewritten), so the compare's cost is paid on top of the "
+                     "re-decode; next: "
                      "PROSPER_TEXREF_CENSUS=1 persist_invalid class, PROSPER_DETILE_STATS; treat "
                      "such an entry as volatile and skip the compare; cf. #3900";
             out.push_back(std::move(a));

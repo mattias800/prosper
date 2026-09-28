@@ -4449,6 +4449,62 @@ int main(int argc, char** argv) {
               "destroying the pending capture releases the hold");
     }
 
+    // #3908: a DEFERRED capture materializes after its submit has run, when the live RTT cache
+    // already holds the submit's own output for every target its draws wrote. Those targets' seeds
+    // must be read at begin (pre-submit); a target the submit's draws never write is unchanged and
+    // is still read live at finish.
+    {
+        const std::vector<uint8_t> pre(16, 0x11), post(16, 0x22), untouched(16, 0x33);
+        bool submit_ran = false;
+        set_gpu_capture_rtt_seed_reader([&](uint64_t addr, GpuCaptureRttSeed& seed) {
+            if (addr != 0x9000 && addr != 0xa000) return false;
+            seed.guest_addr = addr; seed.width = 2; seed.height = 2;
+            seed.rgba = addr == 0xa000 ? untouched : (submit_ran ? post : pre);
+            return true;
+        });
+        // The submit's semantic state: one draw whose CB_COLOR0 is 0x9000.
+        auto draw_state = std::make_shared<GpuState>();
+        draw_state->cx[P::CB_COLOR0_BASE] = 0x9000u >> 8;
+        GpuState submit_state;
+        GpuState::Draw semantic_draw;
+        semantic_draw.state = draw_state;
+        semantic_draw.index_count = 3;
+        submit_state.draws.push_back(semantic_draw);
+        const std::string deferred_path =
+            prosper_test::test_scratch_file("prosper_deferred_seed_3908.prgcap");
+        request_interactive_gpu_capture(deferred_path);
+        DrawItem d;
+        d.color0_base = 0x9000; d.color0_width = 2; d.color0_height = 2;
+        d.color1_base = 0xa000;   // referenced, but not written by the submit's draws
+        const std::vector<DrawItem> deferred_draws{d};
+        auto pending = begin_requested_gpu_capture(deferred_draws, {}, {}, 2, 2, &submit_state, 0,
+                                                   UINT64_MAX, nullptr,
+                                                   /*defer_materialization=*/true);
+        CHECK(pending && pending->pre_submit_rtt_seeds_taken &&
+                  pending->pre_submit_rtt_seeds.size() == 1 &&
+                  pending->pre_submit_rtt_seeds[0].guest_addr == 0x9000,
+              "a deferred capture reads the submit's colour targets at begin (pre-submit)");
+        submit_ran = true;   // the live cache now holds the submit's output at 0x9000
+        const std::vector<ComputeItem> no_computes;
+        const std::vector<SubmitOperation> no_operations;
+        std::string finish_error;
+        const bool finished = finish_requested_gpu_capture(
+            std::move(pending), {}, finish_error, &deferred_draws, &no_computes, &no_operations);
+        GpuCaptureFile loaded;
+        std::string load_error;
+        const bool read = finished && read_gpu_capture(deferred_path, loaded, load_error);
+        CHECK(read, finished ? "the deferred capsule reads back" : finish_error.c_str());
+        const auto seed_at = [&](uint64_t addr) -> const GpuCaptureRttSeed* {
+            for (const auto& seed : loaded.rtt_seeds) if (seed.guest_addr == addr) return &seed;
+            return nullptr;
+        };
+        CHECK(read && seed_at(0x9000) && seed_at(0x9000)->rgba == pre,
+              "a target the submit wrote is seeded with its PRE-submit pixels, not the live output");
+        CHECK(read && seed_at(0xa000) && seed_at(0xa000)->rgba == untouched,
+              "a referenced target the submit's draws never write is still read live");
+        set_gpu_capture_rtt_seed_reader({});
+    }
+
     // --- PROSPER_CAPTURE_BLOB_MAX_MB parse/clamp rules (#2440) ------------------------------------
     // The per-resource ceiling is a runtime value because GTA V gameplay binds a 1,105,723,396-byte
     // buffer -- 1.0298x over the 1 GiB default -- and one resource over the line aborts the whole

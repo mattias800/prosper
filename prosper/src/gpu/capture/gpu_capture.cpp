@@ -1342,9 +1342,22 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
     const std::vector<SubmitOperation>& exact_operations =
         semantic_operations.empty() ? operations : semantic_operations;
     const CaptureMemoryReader reader = pending_capture_reader(pending);
+    // #3908: a deferred capture reads its seeds from the pre-submit snapshot, never from the live
+    // cache, which by now holds this submit's output.
+    const CaptureRttSeedReader pre_submit_rtt_reader =
+        [&pending](uint64_t guest_addr, GpuCaptureRttSeed& seed) {
+            for (const GpuCaptureRttSeed& candidate : pending.pre_submit_rtt_seeds)
+                if (candidate.guest_addr == guest_addr) { seed = candidate; return true; }
+            // Written by this submit but absent before it: no pre-submit pixels exist.
+            if (std::find(pending.pre_submit_rtt_absent.begin(), pending.pre_submit_rtt_absent.end(),
+                          guest_addr) != pending.pre_submit_rtt_absent.end())
+                return false;
+            // Not written by the submit's draws: unchanged, read live.
+            return g_rtt_seed_reader && g_rtt_seed_reader(guest_addr, seed);
+        };
     const bool captured = capture_submit_items(
         draws, snapshot_computes, exact_operations, metadata, reader, pending.capture, error,
-        g_rtt_seed_reader, failures,
+        pending.pre_submit_rtt_seeds_taken ? pre_submit_rtt_reader : g_rtt_seed_reader, failures,
         semantic_state ? semantic_state->dma_copies : std::vector<GpuState::DmaCopy>{}, 0,
         pending.pre_submit_compute_gds.data(), pending.pre_submit_compute_gds.size());
     if (!captured) return false;
@@ -1627,6 +1640,52 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
         for (const auto& copy : semantic_state->dma_copies) {
             snapshot(copy.dst, copy.bytes);
             snapshot(copy.src, copy.bytes);
+        }
+    }
+    // #3908: a deferred (ordered) capture materializes after the submit has executed, so the live
+    // RTT cache would hand it post-submit pixels as "seeds" for every target the submit wrote --
+    // and the replay then returns its own expected output unchanged. Read those targets now, while
+    // they are still pre-submit. The set is the colour targets of the submit's draws (render state
+    // per draw): a target this submit's draws never write is identical before and after it, so it
+    // is still read live at finish. Snapshotting the whole cache is not an option: on GTA V it
+    // exceeds the 1 GiB seed limit. Output-triggered candidates are not snapshotted: most are
+    // rejected, and a readback per candidate submit would change the run being captured.
+    if (defer_materialization && !output_triggered && semantic_state && g_rtt_seed_reader) {
+        std::vector<uint64_t> bases;
+        const GpuState* last_state = nullptr;
+        for (const GpuState::Draw& draw : semantic_state->draws) {
+            if (!draw.state || draw.state.get() == last_state) continue;
+            last_state = draw.state.get();
+            const RenderState rs = extract_render_state(*draw.state);
+            for (uint64_t base : {rs.color0_base, rs.color1_base})
+                if (base) bases.push_back(base);
+            for (const ColorTargetState& target : rs.color_targets) {
+                if (target.base) bases.push_back(target.base);
+                if (target.allocation_base) bases.push_back(target.allocation_base);
+            }
+        }
+        std::sort(bases.begin(), bases.end());
+        bases.erase(std::unique(bases.begin(), bases.end()), bases.end());
+        uint64_t total = 0;
+        bool within_limit = true;
+        for (uint64_t base : bases) {
+            GpuCaptureRttSeed seed;
+            if (!g_rtt_seed_reader(base, seed)) {
+                pending->pre_submit_rtt_absent.push_back(base);
+                continue;
+            }
+            if (seed.rgba.size() > kMaxTotalRttSeedBytes - total) { within_limit = false; break; }
+            total += seed.rgba.size();
+            pending->pre_submit_rtt_seeds.push_back(std::move(seed));
+        }
+        if (within_limit) {
+            pending->pre_submit_rtt_seeds_taken = true;
+        } else {
+            pending->pre_submit_rtt_seeds.clear();
+            pending->pre_submit_rtt_absent.clear();
+            std::fprintf(stderr,
+                         "[gpucap] deferred capture: pre-submit RTT seeds exceed the seed limit; "
+                         "seeds will be read after the submit and may hold its own output (#3908)\n");
         }
     }
     // Full output-candidate materialization remains deferred until its pixels match. The small

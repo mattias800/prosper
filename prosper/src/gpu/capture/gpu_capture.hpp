@@ -552,6 +552,14 @@ struct PendingGpuCapture {
     // post-producer operation realization during finish.
     std::vector<MemorySnapshot> pre_submit_memory;
     std::vector<uint8_t> pre_submit_compute_gds;
+    // #3908: the pre-submit contents of every colour target this submit's draws write, read
+    // BEFORE the submit ran. A deferred capture materializes after execution, when the live cache
+    // already holds the submit's own output for exactly those targets; their seeds must come from
+    // here. `pre_submit_rtt_absent` lists targets that did not exist yet (no seed). Every other
+    // address is unchanged by the submit's draws and is still read live.
+    std::vector<GpuCaptureRttSeed> pre_submit_rtt_seeds;
+    std::vector<uint64_t> pre_submit_rtt_absent;
+    bool pre_submit_rtt_seeds_taken = false;
     bool resource_provenance_armed = false;
     GpuCaptureResourceSelector resource_provenance_selector;
     uint32_t resource_provenance_matches = 0;
