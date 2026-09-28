@@ -4060,9 +4060,12 @@ inline RenderCommandPoolStats render_command_pool_stats() {
                                   cache.available.size()};
 }
 
-inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDeviceSize bytes,
-                                                       uint32_t memory_type) {
-    if (memory_type == UINT32_MAX) return VK_NULL_HANDLE;
+// Pooled device memory of exactly `memory_type`. Returns the driver's result (VK_SUCCESS for a pool
+// hit); `*out` is VK_NULL_HANDLE on any failure.
+inline VkResult allocate_transient_render_memory_status(VkDevice device, VkDeviceSize bytes,
+                                                        uint32_t memory_type, VkDeviceMemory* out) {
+    *out = VK_NULL_HANDLE;
+    if (memory_type == UINT32_MAX) return prosper::gpu::kNoCompatibleMemoryType;
     RenderMemoryKey key{bytes, memory_type};
     if (render_memory_pool_enabled()) {
         RenderMemoryPool& pool = render_memory_pool();
@@ -4076,7 +4079,8 @@ inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDevice
             --pool.cached_allocations;
             ++pool.hits;
             pool.active.emplace(memory, key);
-            return memory;
+            *out = memory;
+            return VK_SUCCESS;
         }
         ++pool.misses;
     }
@@ -4085,12 +4089,37 @@ inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDevice
     allocation.allocationSize = bytes;
     allocation.memoryTypeIndex = memory_type;
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    if (prosper::gpu::allocate_device_memory(device, &allocation, &memory) != VK_SUCCESS) return VK_NULL_HANDLE;
+    const VkResult status = prosper::gpu::allocate_device_memory(device, &allocation, &memory);
+    if (status != VK_SUCCESS) return status;
     if (render_memory_pool_enabled()) {
         RenderMemoryPool& pool = render_memory_pool();
         std::lock_guard<std::mutex> lock(pool.mutex);
         pool.active.emplace(memory, key);
     }
+    *out = memory;
+    return VK_SUCCESS;
+}
+
+inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDeviceSize bytes,
+                                                       uint32_t memory_type) {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    allocate_transient_render_memory_status(device, bytes, memory_type, &memory);
+    return memory;
+}
+
+// Pooled memory for a resource only the GPU touches: device-local first, and on
+// VK_ERROR_OUT_OF_DEVICE_MEMORY the next type `bits` allows (#3897). Each candidate type checks the
+// pool before asking the driver. VK_NULL_HANDLE when every candidate failed, as before.
+inline VkDeviceMemory allocate_transient_gpu_only_render_memory(
+        VkDevice device, prosper::gpu::GpuOnlyMemoryClass cls,
+        const VkPhysicalDeviceMemoryProperties& props, uint32_t bits, VkDeviceSize bytes) {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    prosper::gpu::allocate_gpu_only(
+        cls, props, bits, bytes,
+        [&](uint32_t type) {
+            return allocate_transient_render_memory_status(device, bytes, type, &memory);
+        },
+        prosper::gpu::force_gpu_only_oom(cls));
     return memory;
 }
 
@@ -4138,12 +4167,16 @@ inline uint32_t render_memory_type(VkPhysicalDevice phys, uint32_t bits,
     return prosper::gpu::find_memory_type(properties, bits, wanted);
 }
 
-// A resource only the GPU touches: a DEVICE_LOCAL type when one is allowed, else any (#3888).
-inline uint32_t render_gpu_only_memory_type(VkPhysicalDevice phys,
-                                            prosper::gpu::GpuOnlyMemoryClass cls, uint32_t bits) {
+// A resource only the GPU touches: a DEVICE_LOCAL type when one is allowed, retrying the other
+// allowed types on VK_ERROR_OUT_OF_DEVICE_MEMORY (#3888, #3897). `info.memoryTypeIndex` is set to
+// the type used; `*out` is VK_NULL_HANDLE on failure.
+inline VkResult render_allocate_gpu_only_memory(VkPhysicalDevice phys, VkDevice device,
+                                                prosper::gpu::GpuOnlyMemoryClass cls,
+                                                uint32_t bits, VkMemoryAllocateInfo& info,
+                                                VkDeviceMemory* out) {
     VkPhysicalDeviceMemoryProperties properties{};
     vkGetPhysicalDeviceMemoryProperties(phys, &properties);
-    return prosper::gpu::choose_gpu_only_memory_type(cls, properties, bits);
+    return prosper::gpu::allocate_gpu_only_memory(device, cls, properties, bits, info, out);
 }
 
 // Storage-buffer contents are rewritten for every synchronous render call, but their Vulkan object
@@ -6725,11 +6758,12 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
         VkDeviceMemory imem = VK_NULL_HANDLE;
         VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         iai.allocationSize = ir.size;
-        iai.memoryTypeIndex = render_gpu_only_memory_type(
-            ctx.phys, prosper::gpu::GpuOnlyMemoryClass::PersistentColorTarget, ir.memoryTypeBits);
+        iai.memoryTypeIndex = UINT32_MAX;   // set by the allocation below
         if (ir.size > limit || persistent_color_target_bytes() > limit - ir.size ||
             persistent_color_target_cache().size() > count_ceiling ||
-            prosper::gpu::allocate_device_memory(ctx.dev, &iai, &imem) != VK_SUCCESS || !imem) {
+            render_allocate_gpu_only_memory(
+                ctx.phys, ctx.dev, prosper::gpu::GpuOnlyMemoryClass::PersistentColorTarget,
+                ir.memoryTypeBits, iai, &imem) != VK_SUCCESS || !imem) {
             vkDestroyImage(ctx.dev, img, nullptr);
             persistent_color_target_cache().erase(dst_key);
             char buf[256];
@@ -7469,14 +7503,13 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
         vkGetImageMemoryRequirements(ctx.dev, image.image, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex = render_gpu_only_memory_type(
-            ctx.phys, prosper::gpu::GpuOnlyMemoryClass::RestoredDepthTarget,
-            requirements.memoryTypeBits);
         VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         view_info.image = image.image; view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
         view_info.format = format; view_info.subresourceRange = {aspects, 0, 1, 0, 1};
-        if (allocation.memoryTypeIndex == UINT32_MAX ||
-            prosper::gpu::allocate_device_memory(ctx.dev, &allocation, &image.memory) != VK_SUCCESS ||
+        if (render_allocate_gpu_only_memory(ctx.phys, ctx.dev,
+                                            prosper::gpu::GpuOnlyMemoryClass::RestoredDepthTarget,
+                                            requirements.memoryTypeBits, allocation,
+                                            &image.memory) != VK_SUCCESS ||
             vkBindImageMemory(ctx.dev, image.image, image.memory, 0) != VK_SUCCESS ||
             vkCreateImageView(ctx.dev, &view_info, nullptr, &image.view) != VK_SUCCESS) {
             if (image.view) vkDestroyImageView(ctx.dev, image.view, nullptr);
@@ -7800,8 +7833,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     VkPhysicalDeviceMemoryProperties memp; vkGetPhysicalDeviceMemoryProperties(phys, &memp);
     init_persistent_color_target_device_budget(memp);   // size the residency budget once (#1177)
     init_persistent_texture_cache_device_budget(memp);
-    // Explicit-flags requests only (staging, readback, host-written buffers). GPU-only images take
-    // prosper::gpu::choose_gpu_only_memory_type, which prefers a DEVICE_LOCAL type (#3888).
+    // Explicit-flags requests only (staging, readback, host-written buffers). GPU-only images go
+    // through prosper::gpu::allocate_gpu_only_memory / allocate_transient_gpu_only_render_memory,
+    // which prefer a DEVICE_LOCAL type and retry other allowed types when VRAM runs out (#3888,
+    // #3897).
     auto pick = [&](uint32_t bits, VkMemoryPropertyFlags want) -> uint32_t {
         return prosper::gpu::find_memory_type(memp, bits, want); };
     const bool use_color1 = out_rgba1 != nullptr ||
@@ -8338,7 +8373,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         VkMemoryRequirements ir{}; vkGetImageMemoryRequirements(dev, img, &ir);
         VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        iai.allocationSize = ir.size; iai.memoryTypeIndex = prosper::gpu::choose_gpu_only_memory_type(prosper::gpu::GpuOnlyMemoryClass::ColorTarget, memp, ir.memoryTypeBits);
+        iai.allocationSize = ir.size;
         if (persistent_color) {
             const VkDeviceSize limit = persistent_color_target_limit();
             // NOTE: the unsigned `limit - ir.size` below is guarded by short-circuit ordering, not by the
@@ -8352,7 +8387,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             if (ir.size <= limit && persistent_color_target_cache().size() <=
                     persistent_color_target_count_ceiling(avoid_cache_eviction) &&
                 persistent_color_target_bytes() <= limit - ir.size &&
-                prosper::gpu::allocate_device_memory(dev, &iai, &imem) == VK_SUCCESS) {
+                prosper::gpu::allocate_gpu_only_memory(
+                    dev, prosper::gpu::GpuOnlyMemoryClass::ColorTarget, memp, ir.memoryTypeBits,
+                    iai, &imem) == VK_SUCCESS) {
                 cached_color->bytes = ir.size;
                 persistent_color_target_bytes() += ir.size;
             } else {
@@ -8369,11 +8406,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                               &img) != VK_SUCCESS)
                     return out;
                 vkGetImageMemoryRequirements(dev, img, &ir);
-                iai.allocationSize = ir.size; iai.memoryTypeIndex = prosper::gpu::choose_gpu_only_memory_type(prosper::gpu::GpuOnlyMemoryClass::ColorTarget, memp, ir.memoryTypeBits);
+                iai.allocationSize = ir.size;
             }
         }
         if (!imem)
-            imem = allocate_transient_render_memory(dev, iai.allocationSize, iai.memoryTypeIndex);
+            imem = allocate_transient_gpu_only_render_memory(
+                dev, prosper::gpu::GpuOnlyMemoryClass::ColorTarget, memp, ir.memoryTypeBits,
+                iai.allocationSize);
         VkImageViewCreateInfo ivci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         ivci.image = img;
         ivci.viewType = volume_color ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
@@ -8494,8 +8533,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkGetImageMemoryRequirements(dev, img1, &color1_requirements);
         VkMemoryAllocateInfo color1_allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         color1_allocation.allocationSize = color1_requirements.size;
-        color1_allocation.memoryTypeIndex = prosper::gpu::choose_gpu_only_memory_type(
-            prosper::gpu::GpuOnlyMemoryClass::ColorTarget1, memp, color1_requirements.memoryTypeBits);
         if (persistent_color1) {
             const VkDeviceSize limit = persistent_color_target_limit();
             while (!avoid_cache_eviction &&
@@ -8508,7 +8545,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_color_target_cache().size() <=
                     persistent_color_target_count_ceiling(avoid_cache_eviction) &&
                 persistent_color_target_bytes() <= limit - color1_requirements.size &&
-                prosper::gpu::allocate_device_memory(dev, &color1_allocation, &imem1) == VK_SUCCESS) {
+                prosper::gpu::allocate_gpu_only_memory(
+                    dev, prosper::gpu::GpuOnlyMemoryClass::ColorTarget1, memp,
+                    color1_requirements.memoryTypeBits, color1_allocation,
+                    &imem1) == VK_SUCCESS) {
                 cached_color1->bytes = color1_requirements.size;
                 persistent_color_target_bytes() += color1_requirements.size;
             } else {
@@ -8526,13 +8566,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     return out;
                 vkGetImageMemoryRequirements(dev, img1, &color1_requirements);
                 color1_allocation.allocationSize = color1_requirements.size;
-                color1_allocation.memoryTypeIndex = prosper::gpu::choose_gpu_only_memory_type(
-                    prosper::gpu::GpuOnlyMemoryClass::ColorTarget1, memp, color1_requirements.memoryTypeBits);
             }
         }
         if (!imem1)
-            imem1 = allocate_transient_render_memory(
-                dev, color1_allocation.allocationSize, color1_allocation.memoryTypeIndex);
+            imem1 = allocate_transient_gpu_only_render_memory(
+                dev, prosper::gpu::GpuOnlyMemoryClass::ColorTarget1, memp,
+                color1_requirements.memoryTypeBits, color1_allocation.allocationSize);
         VkImageViewCreateInfo color1_view_ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         color1_view_ci.image = img1; color1_view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         color1_view_ci.format = FMT1;
@@ -8611,8 +8650,6 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         vkGetImageMemoryRequirements(dev, extra_images[slot], &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex = prosper::gpu::choose_gpu_only_memory_type(
-            prosper::gpu::GpuOnlyMemoryClass::ExtraColorTarget, memp, requirements.memoryTypeBits);
         if (cached_extra[slot]) {
             const VkDeviceSize limit = persistent_color_target_limit();
             while (!avoid_cache_eviction &&
@@ -8625,7 +8662,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 persistent_color_target_cache().size() <=
                     persistent_color_target_count_ceiling(avoid_cache_eviction) &&
                 persistent_color_target_bytes() <= limit - requirements.size &&
-                prosper::gpu::allocate_device_memory(dev, &allocation, &extra_memories[slot]) == VK_SUCCESS) {
+                prosper::gpu::allocate_gpu_only_memory(
+                    dev, prosper::gpu::GpuOnlyMemoryClass::ExtraColorTarget, memp,
+                    requirements.memoryTypeBits, allocation,
+                    &extra_memories[slot]) == VK_SUCCESS) {
                 cached_extra[slot]->bytes = requirements.size;
                 persistent_color_target_bytes() += requirements.size;
             } else {
@@ -8642,13 +8682,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     return out;
                 vkGetImageMemoryRequirements(dev, extra_images[slot], &requirements);
                 allocation.allocationSize = requirements.size;
-                allocation.memoryTypeIndex = prosper::gpu::choose_gpu_only_memory_type(
-                    prosper::gpu::GpuOnlyMemoryClass::ExtraColorTarget, memp, requirements.memoryTypeBits);
             }
         }
         if (!extra_memories[slot])
-            extra_memories[slot] = allocate_transient_render_memory(
-                dev, allocation.allocationSize, allocation.memoryTypeIndex);
+            extra_memories[slot] = allocate_transient_gpu_only_render_memory(
+                dev, prosper::gpu::GpuOnlyMemoryClass::ExtraColorTarget, memp,
+                requirements.memoryTypeBits, allocation.allocationSize);
         VkImageViewCreateInfo view_ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         view_ci.image = extra_images[slot]; view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         view_ci.format = color_formats[slot];
@@ -8735,11 +8774,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         VkMemoryRequirements dr; vkGetImageMemoryRequirements(dev, dimg, &dr);
         VkMemoryAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        dai.allocationSize = dr.size; dai.memoryTypeIndex = prosper::gpu::choose_gpu_only_memory_type(
-            prosper::gpu::GpuOnlyMemoryClass::DepthTarget, memp, dr.memoryTypeBits);
-        if (cached_ds) prosper::gpu::allocate_device_memory(dev, &dai, &dmem);
-        else dmem = allocate_transient_render_memory(dev, dai.allocationSize,
-                                                      dai.memoryTypeIndex);
+        dai.allocationSize = dr.size;
+        if (cached_ds)
+            prosper::gpu::allocate_gpu_only_memory(
+                dev, prosper::gpu::GpuOnlyMemoryClass::DepthTarget, memp, dr.memoryTypeBits, dai,
+                &dmem);
+        else dmem = allocate_transient_gpu_only_render_memory(
+                 dev, prosper::gpu::GpuOnlyMemoryClass::DepthTarget, memp, dr.memoryTypeBits,
+                 dai.allocationSize);
         vkBindImageMemory(dev, dimg, dmem, 0);
         VkImageViewCreateInfo dvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         dvci.image = dimg; dvci.viewType = VK_IMAGE_VIEW_TYPE_2D; dvci.format = DFMT;
@@ -11345,13 +11387,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 upload.image_bytes = tr.size;
                                 VkMemoryAllocateInfo tai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
                                 tai.allocationSize = tr.size;
-                                tai.memoryTypeIndex = prosper::gpu::choose_gpu_only_memory_type(
-                                    prosper::gpu::GpuOnlyMemoryClass::SampledTexture, memp, tr.memoryTypeBits);
                                 const bool retain = !r.is_storage_image &&
                                     persistent_textures_enabled && upload.persistent_id &&
                                     tr.size <= persistent_texture_limit;
                                 if (retain &&
-                                    prosper::gpu::allocate_device_memory(dev, &tai, &upload.memory) ==
+                                    prosper::gpu::allocate_gpu_only_memory(
+                                        dev, prosper::gpu::GpuOnlyMemoryClass::SampledTexture,
+                                        memp, tr.memoryTypeBits, tai, &upload.memory) ==
                                         VK_SUCCESS) {
                                     upload.direct_memory = true;
                                     // #3873: the budget follows THIS heap from now on.
@@ -11363,8 +11405,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 if (!upload.memory) {
                                     if (retain) texture_path_census.retention_allocation_failed();
                                     upload.persistent_id = 0;
-                                    upload.memory = allocate_transient_render_memory(
-                                        dev, tai.allocationSize, tai.memoryTypeIndex);
+                                    upload.memory = allocate_transient_gpu_only_render_memory(
+                                        dev, prosper::gpu::GpuOnlyMemoryClass::SampledTexture,
+                                        memp, tr.memoryTypeBits, tai.allocationSize);
                                 }
                                 vkBindImageMemory(dev, upload.image, upload.memory, 0);
                             }

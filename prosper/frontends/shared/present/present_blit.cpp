@@ -101,12 +101,13 @@ bool ensure_slot_image(PresentBlitState& s, Slot& sl, uint32_t w, uint32_t h) {
     VkMemoryRequirements req{}; vkGetImageMemoryRequirements(s.dev, sl.image, &req);
     VkPhysicalDeviceMemoryProperties mp{};
     vkGetPhysicalDeviceMemoryProperties(s.phys, &mp);
-    const uint32_t mt = prosper::gpu::choose_gpu_only_memory_type(
-        prosper::gpu::GpuOnlyMemoryClass::PresentSlot, mp, req.memoryTypeBits);
-    if (mt == UINT32_MAX) { destroy_slot_image(s, sl); return false; }
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    mai.allocationSize = req.size; mai.memoryTypeIndex = mt;
-    if (prosper::gpu::allocate_device_memory(s.dev, &mai, &sl.memory) != VK_SUCCESS) { destroy_slot_image(s, sl); return false; }
+    mai.allocationSize = req.size;
+    if (prosper::gpu::allocate_gpu_only_memory(s.dev, prosper::gpu::GpuOnlyMemoryClass::PresentSlot,
+                                               mp, req.memoryTypeBits, mai,
+                                               &sl.memory) != VK_SUCCESS) {
+        destroy_slot_image(s, sl); return false;
+    }
     if (vkBindImageMemory(s.dev, sl.image, sl.memory, 0) != VK_SUCCESS) { destroy_slot_image(s, sl); return false; }
     sl.w = w; sl.h = h;
     return true;
