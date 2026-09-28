@@ -1849,7 +1849,7 @@ bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
     // scanout identity proves no relationship either. A compute storage alias may also write it,
     // but this capture path has no proof for that case; fail closed until it does.
     const bool no_proven_scanout_draw = !writes_scanout;
-    if (!output.empty() && no_proven_scanout_draw)
+    if (no_proven_scanout_draw)
         pending->capture.metadata.renderer_env.emplace_back(kGpuReplayNoScanoutDrawEnv, "1");
     pending->capture.expected_output_valid = !output.empty() && !no_proven_scanout_draw;
     pending->capture.expected_output_bytes = pending->capture.expected_output_valid ? output.size() : 0;

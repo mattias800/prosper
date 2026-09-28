@@ -4610,7 +4610,7 @@ int main(int argc, char** argv) {
         // scanout. Use the same valid captured submit with two scanout identities so the target
         // relation, rather than the output bytes, is the discriminating variable.
         auto write_oracle_case = [&](uint64_t scanout_addr, bool colour_write, const char* path,
-                                     GpuCaptureFile& result) {
+                                     GpuCaptureFile& result, bool empty_output = false) {
             auto oracle_pending = std::make_unique<PendingGpuCapture>();
             oracle_pending->path = prosper_test::test_scratch_file(path);
             oracle_pending->capture = loaded;
@@ -4623,7 +4623,9 @@ int main(int argc, char** argv) {
                     kGpuReplayScanoutAddressEnv,
                     scanout_addr == 0x9000 ? "0x9000" : "0x7777");
             std::string write_error;
-            return finish_requested_gpu_capture(std::move(oracle_pending), pre, write_error) &&
+            return finish_requested_gpu_capture(
+                       std::move(oracle_pending), empty_output ? std::vector<uint8_t>{} : pre,
+                       write_error) &&
                    read_gpu_capture(prosper_test::test_scratch_file(path), result, write_error);
         };
         GpuCaptureFile offscreen_oracle, scanout_oracle;
@@ -4662,6 +4664,17 @@ int main(int argc, char** argv) {
         CHECK(write_oracle_case(0x9000, false, "prosper_masked_oracle_3908.prgcap",
                                 masked_oracle) && !masked_oracle.expected_output_valid,
               "binding scanout with all colour writes masked does not make an output oracle");
+        GpuCaptureFile empty_depth_only;
+        CHECK(write_oracle_case(0x9000, false, "prosper_empty_depth_only_3908.prgcap",
+                                empty_depth_only, true) &&
+                  !empty_depth_only.expected_output_valid &&
+                  std::any_of(empty_depth_only.metadata.renderer_env.begin(),
+                              empty_depth_only.metadata.renderer_env.end(),
+                              [](const auto& entry) {
+                                  return entry.first == kGpuReplayNoScanoutDrawEnv &&
+                                         entry.second == "1";
+                              }),
+              "empty-output depth-only submit still tags replay to discard retained pixels");
         set_gpu_capture_ds_seed_snapshot_reader({});
         set_gpu_capture_rtt_seed_reader({});
     }
