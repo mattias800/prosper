@@ -9,6 +9,11 @@ found Vulkan.
   present. It is a *driver* for the offscreen backend rather than the backend itself; the pipeline,
   pass and readback code it calls lives in `tests/fixtures/render_runner.h` (whose directory name is
   a trap — see that folder's `AGENTS.md`).
+  Its submit callback is being carved into named pieces (#3892); those pieces live in
+  `submit_renderer/` (see its `AGENTS.md`), and `live_renderer_internal.hpp` holds the file's
+  former anonymous-namespace helpers that the pieces share (RTT cache types, texture-decode cache
+  keys, the guest-write drain). Include that header only from `live_renderer.cpp` and
+  `submit_renderer/`; it is not an API.
 - `live_compute.cpp` — the compute half, and a **separate Vulkan backend**, not a caller of the
   render one. It builds its own device (or adopts the renderer's when one is published), its own
   pipeline cache, descriptor pools, memory pool and command buffers, and does not include
