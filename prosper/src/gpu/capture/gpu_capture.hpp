@@ -27,6 +27,8 @@ struct GpuCaptureMetadata {
 
 inline constexpr const char* kGpuReplayScanoutAddressEnv =
     "PROSPER_GPU_REPLAY_SCANOUT_ADDR";
+inline constexpr const char* kGpuReplayNoScanoutDrawEnv =
+    "PROSPER_GPU_REPLAY_NO_SCANOUT_DRAW";
 inline constexpr const char* kGpuCaptureSave0Env = "PROSPER_SAVE0";
 inline constexpr const char* kGpuCaptureResourceProvenanceEnv =
     "PROSPER_GPU_CAPTURE_RESOURCE_PROVENANCE";
@@ -491,7 +493,9 @@ bool read_all_gpu_capture_ds_seeds(std::vector<GpuCaptureDsSeed>& seeds, std::st
 bool gpu_capture_ds_seed_snapshot_available();
 // Add only live depth/stencil checkpoints referenced by this capsule's realized draws. Standalone
 // pre-render captures otherwise replay a read-only depth pass against a newly-cleared attachment.
-bool capture_referenced_gpu_ds_seeds(GpuCaptureFile& capture, std::string& error);
+bool capture_referenced_gpu_ds_seeds(
+    GpuCaptureFile& capture, std::string& error,
+    const std::vector<GpuCaptureDsSeed>* pre_submit_seeds = nullptr);
 void set_gpu_replay_ds_seed_writer(ReplayDsSeedWriter writer);
 bool restore_gpu_replay_ds_seeds(const std::vector<GpuCaptureDsSeed>& seeds, std::string& error);
 uint64_t gpu_capture_hash(const uint8_t* data, size_t size);
@@ -560,6 +564,11 @@ struct PendingGpuCapture {
     std::vector<GpuCaptureRttSeed> pre_submit_rtt_seeds;
     std::vector<uint64_t> pre_submit_rtt_absent;
     bool pre_submit_rtt_seeds_taken = false;
+    // A deferred capture materializes after the submit. Depth/stencil checkpoints must come from
+    // before it, even when the submit writes the same persistent attachment it reads.
+    std::vector<GpuCaptureDsSeed> pre_submit_ds_seeds;
+    bool pre_submit_ds_seeds_taken = false;
+    std::string pre_submit_ds_error;
     bool resource_provenance_armed = false;
     GpuCaptureResourceSelector resource_provenance_selector;
     uint32_t resource_provenance_matches = 0;

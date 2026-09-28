@@ -4086,11 +4086,35 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[gpureplay] executing through mixed operation %d\n", through_operation);
     }
     prosper::gpu::replay_tool::OutputTargetAfterOperation exact_output_target;
+    bool automatic_intermediate_output = false;
+    auto automatic_output_status = prosper::gpu::replay_tool::OutputTargetAfterStatus::Selected;
     if (output_target_after_operation != SIZE_MAX) {
         if (!plan_exact_output_target(replay, output_target_after_operation,
                                       output_target_after_addr, exact_output_target))
             return 2;
         allow_mismatch = true;
+    } else if (!draw_selected && through_operation < 0 && selected_operation_limit == SIZE_MAX &&
+               !replay.expected_output_valid &&
+               std::any_of(replay.metadata.renderer_env.begin(), replay.metadata.renderer_env.end(),
+                           [](const auto& entry) {
+                               return entry.first == prosper::gpu::kGpuReplayNoScanoutDrawEnv &&
+                                      entry.second == "1";
+                           })) {
+        const auto selected =
+            prosper::gpu::replay_tool::replay_last_written_output_target(replay);
+        automatic_output_status = selected.status;
+        if (selected.status == prosper::gpu::replay_tool::OutputTargetAfterStatus::Selected) {
+            exact_output_target = selected.target;
+            automatic_intermediate_output = true;
+            std::fprintf(stderr,
+                         "[gpureplay] no scanout draw: showing last written target %016llx "
+                         "after the full submit; no presented-frame oracle\n",
+                         static_cast<unsigned long long>(exact_output_target.guest_addr));
+        } else {
+            std::fprintf(stderr,
+                         "[gpureplay] no proven scanout draw and no realized colour writer; "
+                         "no pixel image or presented-frame oracle is available\n");
+        }
     }
     const auto& m = replay.metadata;
     std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu computes=%zu "
@@ -4220,7 +4244,7 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
-    const size_t operation_limit = exact_output_target
+    const size_t operation_limit = exact_output_target && !automatic_intermediate_output
         ? prosper::tools::raw(exact_output_target.operation_index) + 1
         : through_operation >= 0
             ? static_cast<size_t>(through_operation) + 1 : selected_operation_limit;
@@ -4228,6 +4252,8 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> pixels = execute_frame(
         replay, selected_draws_only, operation_limit, post_compute_dump_ptr);
     if (exact_output_target && !read_exact_output_target(exact_output_target, pixels)) return 2;
+    prosper::gpu::replay_tool::replay_discard_unproven_default_pixels(
+        automatic_output_status, pixels);
     if (post_compute_dump_ptr) {
         if (post_compute_dump.execution_count != 1) {
             std::fprintf(stderr,
@@ -4405,20 +4431,26 @@ int main(int argc, char** argv) {
            (draw_selected && draw_with_compute_prefix))
             ? prosper::gpu::replay_tool::OutputExtentMode::OrderedPrefix
             : prosper::gpu::replay_tool::OutputExtentMode::Capture;
-    const auto output_extent = exact_output_target
-        ? prosper::gpu::replay_tool::OutputExtent{
-              exact_output_target.width, exact_output_target.height,
-              exact_output_target.guest_addr, exact_output_target.draw_index}
-        : prosper::gpu::replay_tool::replay_output_extent(
-              replay, extent_mode, pixels.size(), operation_limit);
+    const bool no_default_pixel_image =
+        automatic_output_status != prosper::gpu::replay_tool::OutputTargetAfterStatus::Selected;
+    const auto output_extent = no_default_pixel_image
+        ? prosper::gpu::replay_tool::OutputExtent{}
+        : exact_output_target
+            ? prosper::gpu::replay_tool::OutputExtent{
+                  exact_output_target.width, exact_output_target.height,
+                  exact_output_target.guest_addr, exact_output_target.draw_index}
+            : prosper::gpu::replay_tool::replay_output_extent(
+                  replay, extent_mode, pixels.size(), operation_limit);
     const uint32_t output_width = output_extent.width;
     const uint32_t output_height = output_extent.height;
-    uint64_t hash = prosper::gpu::gpu_capture_hash(pixels);
+    uint64_t hash = no_default_pixel_image ? 0 : prosper::gpu::gpu_capture_hash(pixels);
     // Name the surface, not just its size. A prefix replay renders the LAST EXECUTED DRAW TARGET, so
     // adjacent `--through-operation` cutoffs can report two different buffers; without the address that
     // reads as one surface changing. `target=` makes such a comparison self-invalidating.
     char target_tag[192] = " target=capture";
-    if (exact_output_target)
+    if (no_default_pixel_image)
+        std::snprintf(target_tag, sizeof target_tag, " target=none");
+    else if (exact_output_target)
         std::snprintf(target_tag, sizeof target_tag,
                       " target=%016llx op=%zu draw=%llu slot=%u format=%u",
                       static_cast<unsigned long long>(exact_output_target.guest_addr),
