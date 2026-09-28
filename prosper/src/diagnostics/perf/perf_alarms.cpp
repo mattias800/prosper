@@ -93,6 +93,9 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
             prev_drop_reasons_[i] = ledger.drop_reasons[i].load(std::memory_order_relaxed);
         for (size_t i = 0; i < kDispatchSkipCount; ++i)
             prev_dispatch_skips_[i] = ledger.dispatch_skips[i].load(std::memory_order_relaxed);
+        for (size_t i = 0; i < kGpuMemoryClassSlots; ++i)
+            prev_gpu_memory_off_device_[i] =
+                ledger.gpu_memory_off_device[i].load(std::memory_order_relaxed);
         for (size_t i = 0; i < WindowSample::kTransferCount; ++i)
             prev_transfer_bytes_[i] = ext.transfer_bytes[i];
         return {};
@@ -130,6 +133,12 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
         const uint64_t v = ledger.dispatch_skips[i].load(std::memory_order_relaxed);
         w.dispatch_skips[i] = v - prev_dispatch_skips_[i];
         prev_dispatch_skips_[i] = v;
+    }
+    for (size_t i = 0; i < kGpuMemoryClassSlots; ++i) {
+        const uint64_t v = ledger.gpu_memory_off_device[i].load(std::memory_order_relaxed);
+        w.gpu_memory_off_device[i] = v - prev_gpu_memory_off_device_[i];
+        prev_gpu_memory_off_device_[i] = v;
+        w.gpu_memory_class_names[i] = ledger.gpu_memory_class_names[i].load(std::memory_order_relaxed);
     }
     for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {
         // A total that went BACKWARDS (a test's fresh source) is a new baseline, not a huge delta.
@@ -255,6 +264,14 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
         json_counts(jsonl_, ranked(w.drop_reasons, kDropReasonNames, kDropReasonCount));
         std::fputs(",\"dispatch_skips\":", jsonl_);
         json_counts(jsonl_, ranked(w.dispatch_skips, kDispatchSkipNames, kDispatchSkipCount));
+        {
+            const char* names[kGpuMemoryClassSlots];
+            for (size_t i = 0; i < kGpuMemoryClassSlots; ++i)
+                names[i] = w.gpu_memory_class_names[i] ? w.gpu_memory_class_names[i] : "?";
+            std::fprintf(jsonl_, ",\"gpu_memory_fallbacks\":%llu,\"gpu_memory_off_device\":",
+                         n(Counter::GpuMemoryFallbacks));
+            json_counts(jsonl_, ranked(w.gpu_memory_off_device, names, kGpuMemoryClassSlots));
+        }
         std::fputs(",\"host_copy_mib_by_site\":{", jsonl_);
         bool first = true;
         for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {
