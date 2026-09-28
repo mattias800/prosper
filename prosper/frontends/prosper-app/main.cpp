@@ -3398,6 +3398,23 @@ int main(int argc, char** argv) {
                         shown.record(
                             prosper::frontend::PresentedFrameSource::GpuCpuFallback, running);
                         trace.emit(prosper::perf::PresentHandoffEvent::CpuShown);
+                        // Present-rate log for this branch too. Without it a run whose every frame
+                        // takes the CPU fallback -- any run with live GPU targets off, e.g.
+                        // PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS or a per-pass dump diagnostic --
+                        // printed no [app] fps line at all, indistinguishable from presenting nothing
+                        // (#3895). Counts this branch's own presents, so a mixed run is not misread.
+                        static auto fallback_t0 = std::chrono::steady_clock::now();
+                        static uint64_t fallback_shown = 0, fallback_mark = 0;
+                        if (++fallback_shown - fallback_mark >= 60) {
+                            const auto now = std::chrono::steady_clock::now();
+                            const double s =
+                                std::chrono::duration<double>(now - fallback_t0).count();
+                            fprintf(stderr,
+                                    "[app] %.1f fps (%llu frames, gpu-present cpu-fallback)\n",
+                                    (fallback_shown - fallback_mark) / (s > 0 ? s : 1),
+                                    (unsigned long long)fallback_shown);
+                            fallback_t0 = now; fallback_mark = fallback_shown;
+                        }
                         lastFrameProgress = std::chrono::steady_clock::now();
                         havePresentedGuestFlip = true;
                         lastPresentedGuestFlip = cf.guest_present_count;

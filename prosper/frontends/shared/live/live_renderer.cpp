@@ -11246,13 +11246,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // final callback, where the cache is materialized on demand if no later scanout
                     // pass already requested CPU pixels. A same-submit DMA asks its producer span for
                     // authoritative readback, and compute consumers use the lazy target reader above.
+                    // A pending one-shot capture reads back every pass's colour0 for its one
+                    // submit, so the publish candidates (front / scanout / last) that become the
+                    // capsule's output oracle are exactly the readback path's (#3895).
+                    const bool capture_cpu_output = prosper::gpu::gpu_capture_requires_cpu_output();
                     const bool final_gpu_present = phase.final_span &&
                         !phase.authoritative_readback &&
                         prosper::frontend::gpu_present_allowed_during_capture(
-                            prosper::gpu::gpu_present_active(),
-                            prosper::gpu::gpu_capture_requires_cpu_output());
+                            prosper::gpu::gpu_present_active(), capture_cpu_output);
                     const bool defer_readback = live_gpu_targets && vo_n > 0 && base &&
                         !phase.authoritative_readback &&
+                        prosper::frontend::pass_readback_deferral_allowed_during_capture(
+                            capture_cpu_output) &&
                         ((is_vo && can_defer_scanout_readback(
                                        phase.allows_deferred_scanout_readback(),
                                        final_gpu_present,

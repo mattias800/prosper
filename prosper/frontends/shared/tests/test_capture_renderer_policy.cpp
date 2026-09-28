@@ -5,6 +5,7 @@
 using prosper::frontend::gpu_present_allowed_during_capture;
 using prosper::frontend::live_color_targets_enabled;
 using prosper::frontend::LiveColorTargetResidencyInputs;
+using prosper::frontend::pass_readback_deferral_allowed_during_capture;
 using prosper::frontend::timeline_capture_allows_persistent_targets;
 
 int main() {
@@ -55,5 +56,9 @@ int main() {
           "a capture submit presents through the CPU path so it has an output oracle");
     check(!gpu_present_allowed_during_capture(false, false), "no GPU present when inactive");
     check(!gpu_present_allowed_during_capture(false, true), "no GPU present when inactive (capture)");
+    check(pass_readback_deferral_allowed_during_capture(false),
+          "outside a capture submit colour0 readback may be deferred");
+    check(!pass_readback_deferral_allowed_during_capture(true),
+          "a capture submit reads back colour0 so its output oracle is the readback path's");
     return failures ? 1 : 0;
 }
