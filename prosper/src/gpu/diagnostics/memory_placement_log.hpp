@@ -66,7 +66,7 @@ enum class GpuOnlyMemoryClass : uint8_t {
     PersistentColorTarget,   // render_runner: retained render-to-texture colour targets
     RestoredDepthTarget,     // render_runner: a retained depth target recreated from a seed
     SampledTexture,          // render_runner: sampled/storage textures, incl. the persistent cache
-    RetainedDepthArray,      // retained_depth_array_gpu: GPU-resident depth-array snapshots
+    RetainedDepthArray,      // retained_depth_{array,cube}_gpu: GPU-resident depth snapshots
     ComputeImage,            // live_compute: compute-bound sampled/storage images
     DetileOutput,            // gpu_detile_upload: the compute detiler's output buffer
     PresentSlot,             // present_blit: the GPU-present slot images

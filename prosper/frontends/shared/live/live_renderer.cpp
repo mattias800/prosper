@@ -59,6 +59,7 @@
 #include "fixtures/render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
 #include "diagnostics/perf/perf_ledger.hpp"       // #3891: always-on alarm ledger
 #include "fixtures/retained_depth_array_gpu.h"   // GPU-resident retained depth-array snapshots
+#include "fixtures/retained_depth_cube_gpu.h"    // GPU-resident retained depth-cube snapshots
 
 #include <atomic>
 #include <cerrno>
@@ -3524,6 +3525,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             prosper::test::DepthArrayGuestScanMemo depth_array_guest_scans;
             uint64_t depth_array_guest_scan_epoch =
                 guest_gpu_write_drain_epoch().load(std::memory_order_relaxed);
+            // PROSPER_NO_GPU_DEPTH_CUBE=1 restores the CPU readback + quantise + re-upload bridge
+            // for fully renderer-owned depth cubes (tests/fixtures/retained_depth_cube_gpu.h).
+            // PROSPER_DS_UNBRIDGED_FAR is a diagnostic that fills unbridged retained planes in
+            // the decode path; keep its cubes on that path so the lever keeps its meaning.
+            const bool gpu_depth_cube_snapshots =
+                prosper::test::gpu_depth_cube_snapshots_enabled() &&
+                !PROSPER_ENV_VALUE("PROSPER_DS_UNBRIDGED_FAR");
+            // Callback-local like depth_array_snapshots: a snapshot is served again only to a
+            // consumer recorded into the batch that carries its gather, and only while the exact
+            // six retained images and their depth-write generations are unchanged.
+            struct DepthCubeGpuSnapshot {
+                uint64_t base;
+                uint32_t width, height;
+                std::shared_ptr<prosper::test::PersistentDsDepthCubeGpuImage> gpu;
+            };
+            std::vector<DepthCubeGpuSnapshot> depth_cube_gpu_snapshots;
+            constexpr size_t kDepthCubeGpuSnapshotEntries = 8;
             auto build_R = [&](const prosper::gpu::DrawItem& draw,
                                const prosper::gpu::ShaderResourceTable* vrt,
                                const prosper::gpu::ShaderResourceTable* prt,
@@ -5500,6 +5518,52 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                         if (texref_census)
                             texref_census->mark(prosper::frontend::TextureReferenceCensus::kComputeProbe);
+                        // GPU route for a fully renderer-owned depth cube: gather, quantise and
+                        // restack the six retained faces inside this callback's ordered batch
+                        // instead of the CPU bridge below. Decided after the compute probe: an
+                        // exact compute cube, or the compute/DS hybrid (GTA V), must win over
+                        // older retained faces, and both stay on their existing paths. A mixed
+                        // cube (fewer than six retained faces) keeps the CPU path, which decodes
+                        // the missing faces from guest bytes.
+                        std::shared_ptr<prosper::test::PersistentDsDepthCubeGpuImage>
+                            retained_depth_cube_gpu;
+                        if (gpu_depth_cube_snapshots && producer_batch &&
+                            retained_depth_cube_cache_candidate &&
+                            retained_depth_cube.present_mask == 0x3fu &&
+                            !resource_compute_image_hit && !resource_compute_depth_hybrid) {
+                            using TexCensus = prosper::frontend::TextureReferenceCensus;
+                            for (const auto& cached : depth_cube_gpu_snapshots) {
+                                if (cached.base == r.gpu_addr && cached.width == tw &&
+                                    cached.height == th && cached.gpu->servable_to(producer_batch) &&
+                                    prosper::test::persistent_ds_cube_identity_matches(
+                                        r.gpu_addr, tw, th, *cached.gpu)) {
+                                    retained_depth_cube_gpu = cached.gpu;
+                                    if (texref_census) ++texref_census->cube_gpu_reuses;
+                                    break;
+                                }
+                            }
+                            if (!retained_depth_cube_gpu) {
+                                const uint64_t census_cube_read_start =
+                                    texref_census ? TexCensus::aux_begin() : 0;
+                                const auto result = prosper::test::copy_persistent_ds_cube_depth_gpu(
+                                    r.gpu_addr, tw, th, *producer_batch, retained_depth_cube_gpu);
+                                if (texref_census)
+                                    texref_census->aux_end(TexCensus::kAuxCubeGpu, census_cube_read_start);
+                                if (result == prosper::test::DepthCubeGpuResult::Ready) {
+                                    if (depth_cube_gpu_snapshots.size() >= kDepthCubeGpuSnapshotEntries)
+                                        depth_cube_gpu_snapshots.erase(depth_cube_gpu_snapshots.begin());
+                                    depth_cube_gpu_snapshots.push_back(
+                                        {r.gpu_addr, tw, th, retained_depth_cube_gpu});
+                                }
+                            }
+                            if (retained_depth_cube_gpu) {
+                                // Renderer authority is now carried by the snapshot. Neither the
+                                // renderer-generation cube cache nor the guest-byte decode cache
+                                // may take part: there are no decoded pixels to publish.
+                                retained_depth_cube_cache_candidate = false;
+                                resource_persistent_candidate = false;
+                            }
+                        }
                         DepthCubeSourceLayout depth_cube_source_layout;
                         if (retained_depth_cube_cache_candidate) {
                             const size_t face_bytes = persistent_source_is_tiled
@@ -5521,7 +5585,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         };
                         const bool guest_persistent_cache_eligible =
                             persistent_texture_decode_cache_eligible(
-                                persistent_sampled_texture,
+                                persistent_sampled_texture && !retained_depth_cube_gpu,
                                 resource_compute_image_hit || resource_compute_depth_hybrid,
                                 fr.is_storage_image,
                                 PROSPER_ENV_VALUE("PROSPER_NO_TEXTURE_DECODE_CACHE") != nullptr,
@@ -5872,6 +5936,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     cached->second.depth_cube_source.renderer_mask == 0x3fu;
                                 bool content_matches = renderer_only_cube;
                                 if (renderer_only_cube) {
+                                    if (texref_census) ++texref_census->cube_cache_hits;
                                     // The key carries the newest selected retained-depth write.
                                     // Finding this entry is the exact renderer-authority proof;
                                     // there are intentionally no guest bytes to compare.
@@ -6156,6 +6221,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             fr.img_dim = r.img_dim;
                             fr.guest_array = true;
                             fr.sample_count = r.depth;
+                            resource_rtt_hit = true;
+                        } else if (retained_depth_cube_gpu) {
+                            // GPU-gathered vertical stack of all six retained faces, filled by a
+                            // command buffer queued earlier in this callback's ordered batch. Same
+                            // representation the CPU cube bridge uploads: R8G8B8A8_UNORM,
+                            // tw x 6th, face-major. Never entered into a guest-byte cache.
+                            fr.borrowed_compute_image = retained_depth_cube_gpu->image();
+                            fr.borrowed_compute_device = prosper::test::render_vk_ctx().dev;
+                            fr.borrowed_compute_image_layout =
+                                static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                            fr.borrowed_compute_image_lease = retained_depth_cube_gpu;
+                            fr.texture_format = VK_FORMAT_R8G8B8A8_UNORM;
+                            fr.tw = tw;
+                            fr.th = th * 6u;
+                            fr.td = 1;
+                            fr.img_dim = r.img_dim;
                             resource_rtt_hit = true;
                         } else if (retained_depth_array) {
                             // Owned CPU snapshot spans every requested layer; it is never entered
@@ -7282,6 +7363,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // Selection above is metadata-only. Read every selected renderer face;
                             // missing faces retain the independent guest fallback below. A failure
                             // must not publish a cache entry under the selected renderer generation.
+                            using TexCensus = prosper::frontend::TextureReferenceCensus;
+                            const uint64_t census_cube_read_start =
+                                texref_census ? TexCensus::aux_begin() : 0;
                             const bool readback_ok = retained_depth_cube_cache_candidate &&
                                 (use_mapped_depth_cube
                                     ? prosper::test::read_persistent_ds_cube_depth_mapped(
@@ -7290,6 +7374,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     : prosper::test::read_persistent_ds_cube_depth(
                                           r.gpu_addr, tw, th, faces, slices_found, cube_error,
                                           &present_mask, &known_mask));
+                            if (texref_census && retained_depth_cube_cache_candidate)
+                                texref_census->aux_end(TexCensus::kAuxCubeRead, census_cube_read_start);
                             // Residency DISTRIBUTION, not a first-sight snapshot. "1 of 6 faces"
                             // seen once is consistent with three different worlds: the guest
                             // amortises faces across frames, prosper's invalidation evicts them
@@ -7337,6 +7423,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             (void)cube_error;
                             if (readback_ok && texture_pixels.size() >=
                                     static_cast<size_t>(tw) * th * 6u * 4u) {
+                                const uint64_t census_cube_fill_start =
+                                    texref_census ? TexCensus::aux_begin() : 0;
                                 const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
                                     !PROSPER_ENV_VALUE("PROSPER_NODETILE");
                                 auto face_base = [&](uint32_t face, size_t selected_span) {
@@ -7402,6 +7490,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     renderer_cube_snapshot_ready &= (use_mapped_depth_cube
                                         ? mapped_faces[face].count : faces[face].size()) ==
                                         ((present_mask & (1u << face)) ? static_cast<size_t>(tw) * th : 0);
+                                if (texref_census)
+                                    texref_census->aux_end(TexCensus::kAuxCubeFill, census_cube_fill_start);
                                 cube_depth_bridged = true;
                                 rtt_hit = true;          // do not overwrite with a guest-byte decode
                                 resource_rtt_hit = true;

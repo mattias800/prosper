@@ -11,7 +11,9 @@ Two kinds live here and they are worth telling apart:
 - **Harnesses** — `render_runner.h`, `compute_runner.h`, `image_compute_runner.h`, `test_scratch.h`,
   `mapped_staging.h` (renderer-owned persistent mappings), `retained_depth_array_gpu.h` (a
   companion of `render_runner.h` that the live frontend also compiles: it gathers retained depth
-  layers into one sampled array image on the GPU instead of reading them back).
+  layers into one sampled array image on the GPU instead of reading them back), and its sibling
+  `retained_depth_cube_gpu.h` (the same for a fully retained depth cube: six faces gathered,
+  quantised to the cube lowering's stacked RGBA8 by a compute pass, and restacked on the GPU).
   These *do* things: bring up a device, record commands, read pixels back.
 - **Fixtures proper** — `at9_testvec.h`, `handmade_prx.h`, `synth_prx.h`, `spirv_*.h`, `test_data.h`,
   `gta5_*_fixture.hpp`. These are data, frozen at a known-good state so an assertion has something
