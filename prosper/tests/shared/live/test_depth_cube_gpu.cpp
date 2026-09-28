@@ -11,6 +11,8 @@
 //   3. ROUTING. Through the live renderer, a fully renderer-owned cube is served by the GPU route
 //      (one gather per ordered batch, zero CPU decodes, same pixels), while a mixed cube, a forced
 //      fallback and the PROSPER_NO_GPU_DEPTH_CUBE control stay on the CPU bridge with identical output.
+//      A separate D32S8 arm proves that the combined depth/stencil images, not stale D32 entries,
+//      are selected and gathered through the same live route.
 // `--control` runs with PROSPER_NO_GPU_DEPTH_CUBE=1 and inverts the routing expectations.
 #include "fixtures/retained_depth_cube_gpu.h"
 #include "gpu/capture/gpu_capture.hpp"
@@ -163,7 +165,8 @@ int main(int argc, char** argv) {
 
     // Seed `count` faces; face f's texel i takes value(f, i). Marks each seeded face's depth-write
     // generation the way an ordinary producer draw does, so the renderer-owned cube is eligible.
-    auto seed_faces = [&](unsigned count, auto value) {
+    auto seed_faces = [&](unsigned count, auto value,
+                          GpuCaptureDsFormat format = GpuCaptureDsFormat::D32Float) {
         BackendPersistentResourceGuard guard;
         invalidate_persistent_ds_guest_write(guest, 6 * stride);
         std::vector<GpuCaptureDsSeed> seeds;
@@ -171,7 +174,12 @@ int main(int argc, char** argv) {
             GpuCaptureDsSeed seed;
             seed.depth_read_base = seed.depth_write_base = guest;
             seed.width = W; seed.height = H; seed.slice = face;
-            seed.format = GpuCaptureDsFormat::D32Float; seed.depth_valid = true;
+            seed.format = format; seed.depth_valid = true;
+            if (format == GpuCaptureDsFormat::D32FloatS8) {
+                seed.stencil_read_base = seed.stencil_write_base = guest + 0x80000;
+                seed.stencil_valid = true;
+                seed.stencil.assign(W * H, static_cast<uint8_t>(face + 1));
+            }
             seed.depth.resize(W * H * sizeof(float));
             for (size_t i = 0; i < W * H; ++i) {
                 const float v = value(face, i);
@@ -183,8 +191,17 @@ int main(int argc, char** argv) {
         const bool restored = restore_gpu_replay_ds_seeds(seeds, error);
         if (!restored) std::fprintf(stderr, "DS restore: %s\n", error.c_str());
         check(restored, "real Vulkan depth faces restore");
+        const uint64_t stencil_base = format == GpuCaptureDsFormat::D32FloatS8
+            ? guest + 0x80000 : 0;
+        const uint32_t vk_format = format == GpuCaptureDsFormat::D32FloatS8
+            ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
+        // Only advance the six identities restored above. Advancing an older entry with the same
+        // depth base but another format could make cube selection choose stale faces by recency.
         for (auto& [key, image] : persistent_ds_cache())
-            if (key.dr == guest && key.slice < count && image.depth_valid)
+            if (key.dr == guest && key.dw == guest &&
+                key.sr == stencil_base && key.sw == stencil_base && !key.htile &&
+                key.w == W && key.h == H && key.fmt == vk_format &&
+                key.slice < count && image.depth_valid)
                 note_persistent_ds_depth_write(image, true, true);
     };
 
@@ -202,7 +219,10 @@ int main(int argc, char** argv) {
         values.push_back(std::nextafter(mid, 0.0f));
         values.push_back(std::nextafter(mid, 1.0f));
     }
-    for (float v : {0.0f, 1.0f, std::bit_cast<float>(0x3f010101u), 1e-40f,
+    // At this bit pattern separate float32 multiply and add round to q=1, while evaluating the
+    // real-number expression in wider precision and truncating gives q=0.
+    for (float v : {0.0f, 1.0f, std::bit_cast<float>(0x3f010101u),
+                    std::bit_cast<float>(0x3b008080u), 1e-40f,
                     std::numeric_limits<float>::denorm_min(), 0.49f / 255.0f, 0.5f / 255.0f})
         values.push_back(v);
     uint32_t state = 0x1234567u;
@@ -366,11 +386,36 @@ int main(int argc, char** argv) {
     // ---- 3. ROUTING through the live renderer. ----
     auto face_value = [](unsigned face, size_t) { return (face + 1) / 8.0f; };
     const auto copies = [] { return depth_cube_gpu_copy_stats().copies; };
-    seed_faces(6, face_value);
+    // The combined depth/stencil format needs both aspects in each layout transition even though
+    // the gather copies only depth. Verify that this arm selects six D32S8 images before rendering;
+    // a stale D32 entry from the earlier exactness arm must not satisfy the check.
+    seed_faces(6, face_value, GpuCaptureDsFormat::D32FloatS8);
+    {
+        BackendPersistentResourceGuard guard;
+        const auto selected = select_persistent_ds_cube_depth(guest, W, H);
+        unsigned combined_faces = 0;
+        for (unsigned face = 0; face < 6; ++face)
+            for (const auto& [key, image] : persistent_ds_cache())
+                if (selected.faces[face] == &image &&
+                    key.fmt == static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT))
+                    ++combined_faces;
+        check(selected.present_mask == 0x3fu && combined_faces == 6,
+              "all six selected faces use combined D32S8 images");
+    }
     select_face(5);
     reset_texture_decode_scope_stats();
     uint64_t before = copies();
     int pixel = center(render_submit_items({draw}, TW, TH));
+    check(pixel == 191 &&
+              (control ? copies() == before && texture_decode_scope_stats().decodes == 1
+                       : copies() == before + 1 && texture_decode_scope_stats().decodes == 0),
+          "combined D32S8 faces gather and sample through the selected route");
+
+    seed_faces(6, face_value);
+    select_face(5);
+    reset_texture_decode_scope_stats();
+    before = copies();
+    pixel = center(render_submit_items({draw}, TW, TH));
     check(pixel == 191, "fully retained cube samples face 5 at 0.75 -> 191");
     check(control ? copies() == before && texture_decode_scope_stats().decodes == 1
                   : copies() == before + 1 && texture_decode_scope_stats().decodes == 0,

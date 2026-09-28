@@ -7008,7 +7008,7 @@ struct PersistentDsDepthReadback {
     }
 
     bool acquire(PersistentDsImage& image, uint32_t width, uint32_t height,
-                 std::string& error) {
+                 VkImageAspectFlags aspects, std::string& error) {
         // #3891: a CPU readback of a GPU surface (outermost scope only; nested helpers are one event).
         const prosper::diagnostics::perf::CostScope perf_readback(
             prosper::diagnostics::perf::Cost::SurfaceReadback);
@@ -7025,7 +7025,7 @@ struct PersistentDsDepthReadback {
                                            buffer, memory, error))
             return false;
         const BackendSubmissionState transfer = submit_persistent_ds_transfer(
-            ctx, image.image, VK_IMAGE_ASPECT_DEPTH_BIT,
+            ctx, image.image, aspects,
             VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, width, height,
             /*depth=*/true, /*stencil=*/false, false, error);
@@ -7082,10 +7082,11 @@ inline bool mapped_depth_cube_payload_within_limit(uint32_t width, uint32_t heig
 }
 
 inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, uint32_t height,
-                                     std::vector<float>& out, std::string& error) {
+                                     VkImageAspectFlags aspects, std::vector<float>& out,
+                                     std::string& error) {
     out.clear();
     PersistentDsDepthReadback readback;
-    if (!readback.acquire(image, width, height, error)) return false;
+    if (!readback.acquire(image, width, height, aspects, error)) return false;
     out.resize(readback.count);
     std::memcpy(out.data(), readback.mapped, readback.count * sizeof(float));
     return true;
@@ -7497,7 +7498,9 @@ inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
             continue;
         }
         PersistentDsDepthReadback readback;
-        if (!readback.acquire(*selected[layer], width, height, error))
+        const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT |
+            (format == VK_FORMAT_D32_SFLOAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+        if (!readback.acquire(*selected[layer], width, height, aspects, error))
             return PersistentDsDepthArrayStatus::Unavailable;
         std::memcpy(snapshot.data() + layer * layer_values, readback.mapped,
                     layer_values * sizeof(float));
@@ -7513,6 +7516,7 @@ inline PersistentDsDepthArrayStatus read_persistent_ds_depth_array(
 // guest memory for every missing face; its generation alone cannot validate a mixed cube.
 struct PersistentDsCubeSelection {
     std::array<PersistentDsImage*, 6> faces{};
+    std::array<VkImageAspectFlags, 6> aspects{};
     uint32_t present_mask = 0;
     uint32_t known_mask = 0;
     uint64_t overlay_version = 0;
@@ -7532,6 +7536,8 @@ inline PersistentDsCubeSelection select_persistent_ds_cube_depth(
             continue;
         if (!selected.faces[key.slice] || image.last_depth_write > recency[key.slice]) {
             selected.faces[key.slice] = &image;
+            selected.aspects[key.slice] = VK_IMAGE_ASPECT_DEPTH_BIT |
+                (key.fmt == VK_FORMAT_D32_SFLOAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
             recency[key.slice] = image.last_depth_write;
             selected.present_mask |= 1u << key.slice;
         }
@@ -7568,7 +7574,8 @@ inline bool acquire_persistent_ds_cube_depth(
             error = "injected later depth cube readback failure";
             return false;
         }
-        if (!faces[slice].acquire(*selected.faces[slice], width, height, error)) return false;
+        if (!faces[slice].acquire(*selected.faces[slice], width, height,
+                                  selected.aspects[slice], error)) return false;
         if (remaining > 0) --remaining;
     }
     // An incomplete selection cannot leave a test-only failure armed for an unrelated callback.
@@ -7617,7 +7624,8 @@ inline bool read_persistent_ds_cube_depth(uint64_t base, uint32_t width, uint32_
     for (uint32_t slice = 0; slice < 6u; ++slice) {
         PersistentDsImage* found = selected.faces[slice];
         if (!found) continue;
-        if (!read_persistent_ds_depth(*found, width, height, faces[slice], error)) return false;
+        if (!read_persistent_ds_depth(*found, width, height, selected.aspects[slice],
+                                      faces[slice], error)) return false;
         ++slices_found;
     }
     return slices_found != 0;
@@ -7644,6 +7652,8 @@ inline PersistentDsCubeSelection select_persistent_ds_cube_depth_after(
             continue;
         if (!selected.faces[key.slice] || image.last_depth_write > recency[key.slice]) {
             selected.faces[key.slice] = &image;
+            selected.aspects[key.slice] = VK_IMAGE_ASPECT_DEPTH_BIT |
+                (key.fmt == VK_FORMAT_D32_SFLOAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
             recency[key.slice] = image.last_depth_write;
             selected.present_mask |= 1u << key.slice;
             selected.overlay_version = std::max(
@@ -7677,7 +7687,7 @@ inline bool read_persistent_ds_cube_depth_after(
     for (uint32_t slice = 0; slice < 6u; ++slice) {
         if (!(present_mask & (1u << slice))) continue;
         if (!read_persistent_ds_depth(*selected.faces[slice], width, height,
-                                      faces[slice], error))
+                                      selected.aspects[slice], faces[slice], error))
             return false;
     }
     return true;
