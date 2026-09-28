@@ -84,9 +84,19 @@ struct TextureReferenceCensus {
     PerClass cls[kClasses];
     // Named sub-steps inside a stage, timed by the caller with aux_begin()/aux_end(). Counted
     // across all classes; they explain a stage, they are not a partition of it.
-    enum Aux : int { kAuxDsFlush = 0, kAuxDsIdentity, kAuxDsRead, kAuxDsScan, kAux };
+    // kAuxCubeRead / kAuxCubeFill split the retained depth-cube CPU bridge: the six-face readback
+    // and the CPU quantise into the stacked RGBA8 payload. kAuxCubeGpu is the GPU route's
+    // recording of the same gather (tests/fixtures/retained_depth_cube_gpu.h).
+    enum Aux : int {
+        kAuxDsFlush = 0, kAuxDsIdentity, kAuxDsRead, kAuxDsScan, kAuxCubeRead, kAuxCubeFill,
+        kAuxCubeGpu, kAux
+    };
     uint64_t aux_cycles[kAux] = {};
     uint64_t aux_count[kAux] = {};
+    // Retained depth-cube references served by the persistent decode cache without a bridge.
+    uint64_t cube_cache_hits = 0;
+    // GPU-route cube snapshots served again inside their owning batch.
+    uint64_t cube_gpu_reuses = 0;
     static uint64_t aux_begin() { return enabled() ? __rdtsc() : 0; }
     void aux_end(int which, uint64_t start) {
         if (!start) return;
@@ -183,16 +193,21 @@ struct TextureReferenceCensus {
                              pc.cycles[s] / tsc_per_us / pc.refs);
             std::fprintf(stderr, "\n");
         }
-        static const char* aux_names[kAux] = {"ds_flush", "ds_identity", "ds_read", "ds_scan"};
+        static const char* aux_names[kAux] = {"ds_flush", "ds_identity", "ds_read", "ds_scan",
+                                             "cube_read", "cube_fill", "cube_gpu"};
         bool any_aux = false;
         for (int a = 0; a < kAux; ++a) any_aux |= aux_count[a] != 0;
+        any_aux |= cube_cache_hits != 0 || cube_gpu_reuses != 0;
         if (any_aux) {
             std::fprintf(stderr, "[texref-census]   aux:");
             for (int a = 0; a < kAux; ++a)
                 std::fprintf(stderr, " %s=%llu/%.1fms", aux_names[a],
                              (unsigned long long)aux_count[a], aux_cycles[a] / tsc_per_us / 1000.0);
-            std::fprintf(stderr, "\n");
+            std::fprintf(stderr, " cube_cache_hits=%llu cube_gpu_reuses=%llu\n",
+                         (unsigned long long)cube_cache_hits, (unsigned long long)cube_gpu_reuses);
         }
+        cube_cache_hits = 0;
+        cube_gpu_reuses = 0;
         for (auto& c : aux_cycles) c = 0;
         for (auto& c : aux_count) c = 0;
         for (auto& pc : cls) pc = PerClass{};

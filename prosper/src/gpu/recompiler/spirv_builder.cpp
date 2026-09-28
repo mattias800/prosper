@@ -14,7 +14,8 @@ enum : uint32_t {
     Op_TypeImage=25, Op_TypeArray=28, Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
     Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
-    Op_CompositeConstruct=80, Op_CompositeExtract=81, Op_ImageRead=98, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_IMul=132,
+    Op_CompositeConstruct=80, Op_CompositeExtract=81, Op_ImageRead=98, Op_ConvertFToU=109,
+    Op_Bitcast=124, Op_IsNan=156, Op_FOrdLessThan=184, Op_FOrdGreaterThan=186, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_IMul=132,
     Op_FMul=133, Op_UDiv=134, Op_UMod=137, Op_Any=154, Op_LogicalAnd=167, Op_Select=169, Op_INotEqual=171,
     Op_ShiftRightLogical=194, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
     Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_BitCount=205,
@@ -25,7 +26,7 @@ enum : uint32_t {
 enum : uint32_t {
     Cap_Shader=1, Addr_Logical=0, Mem_GLSL450=1, Exec_GLCompute=5, EM_LocalSize=17,
     SC_UniformConstant=0, SC_Input=1, SC_PushConstant=9, SC_StorageBuffer=12, FC_None=0,
-    Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Binding=33, Dec_DescriptorSet=34, Dec_Offset=35,
+    Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_NoContraction=42, Dec_Binding=33, Dec_DescriptorSet=34, Dec_Offset=35,
     BI_GlobalInvocationId=28,
 };
 
@@ -727,6 +728,111 @@ std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind,
     Emitter::put(e.code, Op_Phi, {uint_t, value, loaded, pixel_predecessor, constant(0), body});
     Emitter::put(e.code, Op_AccessChain, {word_ptr, destination, output, constant(0), address});
     Emitter::put(e.code, Op_Store, {destination, value});
+    Emitter::put(e.code, Op_Branch, {done});
+    Emitter::put(e.code, Op_Label, {done});
+    Emitter::put(e.code, Op_Return, {});
+    Emitter::put(e.code, Op_FunctionEnd, {});
+    return e.assemble();
+}
+
+std::vector<uint32_t> build_compute_depth_to_rgba8() {
+    Emitter e;
+    const auto void_t = e.id(), fn_t = e.id(), uint_t = e.id(), float_t = e.id(), bool_t = e.id();
+    const auto vec_t = e.id(), input_ptr = e.id(), gid = e.id();
+    const auto array_t = e.id(), block_t = e.id(), block_ptr = e.id(), word_ptr = e.id();
+    const auto words = e.id(), push_t = e.id(), push_ptr = e.id(), push_word = e.id();
+    const auto push = e.id(), main = e.id(), entry = e.id(), body = e.id(), done = e.id();
+    const auto scaled = e.id(), rounded = e.id();
+    Emitter::put(e.caps, Op_Capability, {Cap_Shader});
+    Emitter::put(e.mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
+    std::vector<uint32_t> ep{Exec_GLCompute, main};
+    push_string(ep, "main"); ep.push_back(gid);
+    Emitter::putv(e.entry, Op_EntryPoint, ep);
+    Emitter::put(e.exec, Op_ExecutionMode, {main, EM_LocalSize, 128, 1, 1});
+    Emitter::put(e.deco, Op_Decorate, {gid, Dec_BuiltIn, BI_GlobalInvocationId});
+    Emitter::put(e.deco, Op_Decorate, {array_t, Dec_ArrayStride, 4});
+    for (auto block : {block_t, push_t}) {
+        Emitter::put(e.deco, Op_Decorate, {block, Dec_Block});
+        Emitter::put(e.deco, Op_MemberDecorate, {block, 0, Dec_Offset, 0});
+    }
+    Emitter::put(e.deco, Op_Decorate, {words, Dec_DescriptorSet, 0});
+    Emitter::put(e.deco, Op_Decorate, {words, Dec_Binding, 0});
+    // The CPU reference rounds the product before adding 0.5 (SSE mul then add, no FMA). Keep the
+    // GPU to the same two roundings. A search of every float within 64 ulps of each (k+0.5)/255
+    // found no input in [0, 1] where one fused rounding changes the truncated result, so this is
+    // defensive rather than load-bearing today; it keeps the contract literal if the math changes.
+    Emitter::put(e.deco, Op_Decorate, {scaled, Dec_NoContraction});
+    Emitter::put(e.deco, Op_Decorate, {rounded, Dec_NoContraction});
+    Emitter::put(e.types, Op_TypeVoid, {void_t});
+    Emitter::put(e.types, Op_TypeFunction, {fn_t, void_t});
+    Emitter::put(e.types, Op_TypeInt, {uint_t, 32, 0});
+    Emitter::put(e.types, Op_TypeFloat, {float_t, 32});
+    Emitter::put(e.types, Op_TypeBool, {bool_t});
+    Emitter::put(e.types, Op_TypeVector, {vec_t, uint_t, 3});
+    Emitter::put(e.types, Op_TypePointer, {input_ptr, SC_Input, vec_t});
+    Emitter::put(e.types, Op_Variable, {input_ptr, gid, SC_Input});
+    Emitter::put(e.types, Op_TypeRuntimeArray, {array_t, uint_t});
+    Emitter::put(e.types, Op_TypeStruct, {block_t, array_t});
+    Emitter::put(e.types, Op_TypePointer, {block_ptr, SC_StorageBuffer, block_t});
+    Emitter::put(e.types, Op_TypePointer, {word_ptr, SC_StorageBuffer, uint_t});
+    Emitter::put(e.types, Op_Variable, {block_ptr, words, SC_StorageBuffer});
+    Emitter::put(e.types, Op_TypeStruct, {push_t, uint_t});
+    Emitter::put(e.types, Op_TypePointer, {push_ptr, SC_PushConstant, push_t});
+    Emitter::put(e.types, Op_TypePointer, {push_word, SC_PushConstant, uint_t});
+    Emitter::put(e.types, Op_Variable, {push_ptr, push, SC_PushConstant});
+    // Constants must be unique per value and type.
+    std::vector<std::pair<uint32_t, uint32_t>> uints, floats;
+    auto constant = [&](uint32_t value) {
+        for (auto [v, id] : uints) if (v == value) return id;
+        const auto id = e.id();
+        uints.emplace_back(value, id);
+        Emitter::put(e.types, Op_Constant, {uint_t, id, value});
+        return id;
+    };
+    auto fconstant = [&](float value) {
+        const uint32_t bits = fbits(value);
+        for (auto [v, id] : floats) if (v == bits) return id;
+        const auto id = e.id();
+        floats.emplace_back(bits, id);
+        Emitter::put(e.types, Op_Constant, {float_t, id, bits});
+        return id;
+    };
+    auto binary = [&](uint32_t op, uint32_t a, uint32_t b) {
+        auto id = e.id();
+        Emitter::put(e.code, op, {uint_t, id, a, b});
+        return id;
+    };
+    Emitter::put(e.code, Op_Function, {void_t, main, FC_None, fn_t});
+    Emitter::put(e.code, Op_Label, {entry});
+    const auto xyz = e.id(), index = e.id(), count_ptr = e.id(), count = e.id(), valid = e.id();
+    Emitter::put(e.code, Op_Load, {vec_t, xyz, gid});
+    Emitter::put(e.code, Op_CompositeExtract, {uint_t, index, xyz, 0});
+    Emitter::put(e.code, Op_AccessChain, {push_word, count_ptr, push, constant(0)});
+    Emitter::put(e.code, Op_Load, {uint_t, count, count_ptr});
+    Emitter::put(e.code, Op_ULessThan, {bool_t, valid, index, count});
+    Emitter::put(e.code, Op_SelectionMerge, {done, 0});
+    Emitter::put(e.code, Op_BranchConditional, {valid, body, done});
+    Emitter::put(e.code, Op_Label, {body});
+    const auto texel_ptr = e.id(), bits = e.id(), depth = e.id();
+    Emitter::put(e.code, Op_AccessChain, {word_ptr, texel_ptr, words, constant(0), index});
+    Emitter::put(e.code, Op_Load, {uint_t, bits, texel_ptr});
+    Emitter::put(e.code, Op_Bitcast, {float_t, depth, bits});
+    // depth < 0 ? 0 : (depth > 1 ? 1 : depth) -- the CPU spelling, ordered compares so NaN
+    // passes through both and is replaced below.
+    const auto below = e.id(), above = e.id(), upper = e.id(), clamped = e.id();
+    Emitter::put(e.code, Op_FOrdGreaterThan, {bool_t, above, depth, fconstant(1.0f)});
+    Emitter::put(e.code, Op_Select, {float_t, upper, above, fconstant(1.0f), depth});
+    Emitter::put(e.code, Op_FOrdLessThan, {bool_t, below, depth, fconstant(0.0f)});
+    Emitter::put(e.code, Op_Select, {float_t, clamped, below, fconstant(0.0f), upper});
+    Emitter::put(e.code, Op_FMul, {float_t, scaled, clamped, fconstant(255.0f)});
+    Emitter::put(e.code, Op_FAdd, {float_t, rounded, scaled, fconstant(0.5f)});
+    const auto truncated = e.id(), nan = e.id(), q = e.id();
+    Emitter::put(e.code, Op_ConvertFToU, {uint_t, truncated, rounded});
+    Emitter::put(e.code, Op_IsNan, {bool_t, nan, depth});
+    Emitter::put(e.code, Op_Select, {uint_t, q, nan, constant(0), truncated});
+    const auto packed = binary(Op_BitwiseOr, binary(Op_IMul, q, constant(0x010101u)),
+                               constant(0xff000000u));
+    Emitter::put(e.code, Op_Store, {texel_ptr, packed});
     Emitter::put(e.code, Op_Branch, {done});
     Emitter::put(e.code, Op_Label, {done});
     Emitter::put(e.code, Op_Return, {});

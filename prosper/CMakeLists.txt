@@ -3504,12 +3504,21 @@ endif()
       add_test(NAME depth_cube_source_snapshot COMMAND test_depth_cube_source_snapshot)
       add_test(NAME depth_cube_source_snapshot_control COMMAND test_depth_cube_source_snapshot --control)
       add_test(NAME depth_cube_source_snapshot_scalar COMMAND test_depth_cube_source_snapshot)
+      # These arms assert the CPU cube bridge's cache and snapshot accounting, so they pin the
+      # CPU route; the GPU route for fully retained cubes has its own test below.
       set_tests_properties(depth_cube_source_snapshot PROPERTIES
-        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1")
+        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_GPU_DEPTH_CUBE=1")
       set_tests_properties(depth_cube_source_snapshot_control PROPERTIES
-        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_CUBE_SOURCE_SNAPSHOT_PRUNING=1")
+        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_CUBE_SOURCE_SNAPSHOT_PRUNING=1;PROSPER_NO_GPU_DEPTH_CUBE=1")
       set_tests_properties(depth_cube_source_snapshot_scalar PROPERTIES
-        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_DEPTH_CUBE_SIMD=1")
+        ENVIRONMENT "PROSPER_GPU_REPLAY_DS_SEEDS=1;PROSPER_NO_DEPTH_CUBE_SIMD=1;PROSPER_NO_GPU_DEPTH_CUBE=1")
+      # GPU-resident retained depth cube (#3873): bit-exact against the CPU bridge, the conversion's
+      # out-of-range domain, and live-renderer routing; --control pins PROSPER_NO_GPU_DEPTH_CUBE=1.
+      add_executable(test_depth_cube_gpu tests/shared/live/test_depth_cube_gpu.cpp)
+      target_include_directories(test_depth_cube_gpu PRIVATE frontends src tests)
+      target_link_libraries(test_depth_cube_gpu PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME depth_cube_gpu COMMAND test_depth_cube_gpu)
+      add_test(NAME depth_cube_gpu_control COMMAND test_depth_cube_gpu --control)
       add_executable(test_depth_array_source_snapshot tests/shared/live/test_depth_array_source_snapshot.cpp)
       target_include_directories(test_depth_array_source_snapshot PRIVATE frontends src tests)
       target_link_libraries(test_depth_array_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
