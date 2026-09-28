@@ -737,13 +737,60 @@ std::vector<uint32_t> build_compute_retile_words(RetileShaderKind kind,
     return e.assemble();
 }
 
-std::vector<uint32_t> build_compute_depth_to_rgba8() {
-    Emitter e;
-    const auto void_t = e.id(), fn_t = e.id(), uint_t = e.id(), bool_t = e.id();
-    const auto vec_t = e.id(), input_ptr = e.id(), gid = e.id();
-    const auto array_t = e.id(), block_t = e.id(), block_ptr = e.id(), word_ptr = e.id();
-    const auto words = e.id(), push_t = e.id(), push_ptr = e.id(), push_word = e.id();
-    const auto push = e.id(), main = e.id(), entry = e.id(), body = e.id(), done = e.id();
+// Both in-place word converters use the same one-buffer compute module prelude. Keep its
+// interface and type IDs together so their SPIR-V declarations cannot drift apart.
+struct InPlaceWordComputeIds {
+    uint32_t void_t;
+    uint32_t fn_t;
+    uint32_t uint_t;
+    uint32_t bool_t;
+    uint32_t vec_t;
+    uint32_t input_ptr;
+    uint32_t gid;
+    uint32_t array_t;
+    uint32_t block_t;
+    uint32_t block_ptr;
+    uint32_t word_ptr;
+    uint32_t words;
+    uint32_t push_t;
+    uint32_t push_ptr;
+    uint32_t push_word;
+    uint32_t push;
+    uint32_t main;
+    uint32_t entry;
+    uint32_t body;
+    uint32_t done;
+};
+
+InPlaceWordComputeIds make_in_place_word_compute_ids(Emitter& e) {
+    return {
+        e.id(), // void_t
+        e.id(), // fn_t
+        e.id(), // uint_t
+        e.id(), // bool_t
+        e.id(), // vec_t
+        e.id(), // input_ptr
+        e.id(), // gid
+        e.id(), // array_t
+        e.id(), // block_t
+        e.id(), // block_ptr
+        e.id(), // word_ptr
+        e.id(), // words
+        e.id(), // push_t
+        e.id(), // push_ptr
+        e.id(), // push_word
+        e.id(), // push
+        e.id(), // main
+        e.id(), // entry
+        e.id(), // body
+        e.id(), // done
+    };
+}
+
+void emit_in_place_word_compute_header(Emitter& e, const InPlaceWordComputeIds& ids) {
+    const auto& [void_t, fn_t, uint_t, bool_t, vec_t, input_ptr, gid,
+                 array_t, block_t, block_ptr, word_ptr, words, push_t, push_ptr,
+                 push_word, push, main, entry, body, done] = ids;
     Emitter::put(e.caps, Op_Capability, {Cap_Shader});
     Emitter::put(e.mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
     std::vector<uint32_t> ep{Exec_GLCompute, main};
@@ -774,6 +821,15 @@ std::vector<uint32_t> build_compute_depth_to_rgba8() {
     Emitter::put(e.types, Op_TypePointer, {push_ptr, SC_PushConstant, push_t});
     Emitter::put(e.types, Op_TypePointer, {push_word, SC_PushConstant, uint_t});
     Emitter::put(e.types, Op_Variable, {push_ptr, push, SC_PushConstant});
+}
+
+std::vector<uint32_t> build_compute_depth_to_rgba8() {
+    Emitter e;
+    const InPlaceWordComputeIds ids = make_in_place_word_compute_ids(e);
+    const auto& [void_t, fn_t, uint_t, bool_t, vec_t, input_ptr, gid,
+                 array_t, block_t, block_ptr, word_ptr, words, push_t, push_ptr,
+                 push_word, push, main, entry, body, done] = ids;
+    emit_in_place_word_compute_header(e, ids);
     // Constants must be unique per value and type.
     std::vector<std::pair<uint32_t, uint32_t>> uints;
     auto constant = [&](uint32_t value) {
@@ -890,41 +946,11 @@ std::vector<uint32_t> build_compute_depth_to_rgba8() {
 
 std::vector<uint32_t> build_compute_rgba8_to_packed10() {
     Emitter e;
-    const auto void_t = e.id(), fn_t = e.id(), uint_t = e.id(), bool_t = e.id();
-    const auto vec_t = e.id(), input_ptr = e.id(), gid = e.id();
-    const auto array_t = e.id(), block_t = e.id(), block_ptr = e.id(), word_ptr = e.id();
-    const auto words = e.id(), push_t = e.id(), push_ptr = e.id(), push_word = e.id();
-    const auto push = e.id(), main = e.id(), entry = e.id(), body = e.id(), done = e.id();
-    Emitter::put(e.caps, Op_Capability, {Cap_Shader});
-    Emitter::put(e.mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
-    std::vector<uint32_t> ep{Exec_GLCompute, main};
-    push_string(ep, "main"); ep.push_back(gid);
-    Emitter::putv(e.entry, Op_EntryPoint, ep);
-    Emitter::put(e.exec, Op_ExecutionMode, {main, EM_LocalSize, 128, 1, 1});
-    Emitter::put(e.deco, Op_Decorate, {gid, Dec_BuiltIn, BI_GlobalInvocationId});
-    Emitter::put(e.deco, Op_Decorate, {array_t, Dec_ArrayStride, 4});
-    for (auto block : {block_t, push_t}) {
-        Emitter::put(e.deco, Op_Decorate, {block, Dec_Block});
-        Emitter::put(e.deco, Op_MemberDecorate, {block, 0, Dec_Offset, 0});
-    }
-    Emitter::put(e.deco, Op_Decorate, {words, Dec_DescriptorSet, 0});
-    Emitter::put(e.deco, Op_Decorate, {words, Dec_Binding, 0});
-    Emitter::put(e.types, Op_TypeVoid, {void_t});
-    Emitter::put(e.types, Op_TypeFunction, {fn_t, void_t});
-    Emitter::put(e.types, Op_TypeInt, {uint_t, 32, 0});
-    Emitter::put(e.types, Op_TypeBool, {bool_t});
-    Emitter::put(e.types, Op_TypeVector, {vec_t, uint_t, 3});
-    Emitter::put(e.types, Op_TypePointer, {input_ptr, SC_Input, vec_t});
-    Emitter::put(e.types, Op_Variable, {input_ptr, gid, SC_Input});
-    Emitter::put(e.types, Op_TypeRuntimeArray, {array_t, uint_t});
-    Emitter::put(e.types, Op_TypeStruct, {block_t, array_t});
-    Emitter::put(e.types, Op_TypePointer, {block_ptr, SC_StorageBuffer, block_t});
-    Emitter::put(e.types, Op_TypePointer, {word_ptr, SC_StorageBuffer, uint_t});
-    Emitter::put(e.types, Op_Variable, {block_ptr, words, SC_StorageBuffer});
-    Emitter::put(e.types, Op_TypeStruct, {push_t, uint_t});
-    Emitter::put(e.types, Op_TypePointer, {push_ptr, SC_PushConstant, push_t});
-    Emitter::put(e.types, Op_TypePointer, {push_word, SC_PushConstant, uint_t});
-    Emitter::put(e.types, Op_Variable, {push_ptr, push, SC_PushConstant});
+    const InPlaceWordComputeIds ids = make_in_place_word_compute_ids(e);
+    const auto& [void_t, fn_t, uint_t, bool_t, vec_t, input_ptr, gid,
+                 array_t, block_t, block_ptr, word_ptr, words, push_t, push_ptr,
+                 push_word, push, main, entry, body, done] = ids;
+    emit_in_place_word_compute_header(e, ids);
     auto constant = [&](uint32_t value) {
         auto id = e.id();
         Emitter::put(e.types, Op_Constant, {uint_t, id, value});

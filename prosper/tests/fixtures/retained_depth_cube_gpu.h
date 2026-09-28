@@ -185,16 +185,21 @@ struct PersistentDsDepthCubeGpuImage {
         return consumer_batch && consumer_batch == owner && valid.load();
     }
     VkImage image() const { return slot ? slot->image : VK_NULL_HANDLE; }
-    ~PersistentDsDepthCubeGpuImage() {
+    ~PersistentDsDepthCubeGpuImage() noexcept {
         if (!slot) return;
-        DepthCubeGpuPool& pool = depth_cube_gpu_pool();
-        std::lock_guard lock(pool.mutex);
-        // Contents are reinitialised from UNDEFINED on reuse, so even a failed batch's slot is
-        // safe to recycle once its last owner (including the backend lease) has let go.
-        if (pool.free.size() < DepthCubeGpuPool::kMaxFreeSlots &&
-            slot->bytes <= DepthCubeGpuPool::kMaxFreeBytes - pool.free_bytes) {
-            pool.free_bytes += slot->bytes;
-            pool.free.push_back(std::move(slot));
+        try {
+            DepthCubeGpuPool& pool = depth_cube_gpu_pool();
+            std::lock_guard lock(pool.mutex);
+            // Contents are reinitialised from UNDEFINED on reuse, so even a failed batch's slot
+            // is safe to recycle once its last owner (including the backend lease) has let go.
+            if (pool.free.size() < DepthCubeGpuPool::kMaxFreeSlots &&
+                slot->bytes <= DepthCubeGpuPool::kMaxFreeBytes - pool.free_bytes) {
+                const size_t bytes = slot->bytes;
+                pool.free.push_back(std::move(slot));
+                pool.free_bytes += bytes;
+            }
+        } catch (...) {
+            // The free list is optional; destroy the slot if recycling fails.
         }
     }
 };
