@@ -1210,6 +1210,87 @@ int main(int argc, char** argv) {
             check(materialized_is(1) && payload_is(Pixels * Layers * snapshot_bpp),
                   "uniform guest layers stay on the GPU route (fill, no CPU upload)");
         expected = saved_expected;
+
+        // #3893 review (blocking): a DS view with SLICE_MAX > SLICE_START -- one clear over the
+        // whole shadow array, or layered rendering -- writes layers the key (SLICE_START only)
+        // never names. Through the production DS path, attach slice 0 with SLICE_MAX = 3: layers
+        // 1-3 were written by the renderer and their guest bytes are stale, so the array must keep
+        // refusing rather than read them from guest memory.
+        const uint64_t span_base = Base + 0x1e00000;
+        std::memset(reinterpret_cast<void*>(span_base), 0, layer_bytes * Layers);
+        ResolvedPipelineState span_state = producer_state;
+        span_state.depth_read_base = span_state.depth_write_base = span_base;
+        span_state.db_depth_view = 0u | (3u << 13);   // SLICE_START 0, SLICE_MAX 3
+        span_state.min_depth = span_state.max_depth = 0.75f;
+        BackendDraw span_producer = producer;
+        span_producer.ps = &span_state;
+        BackendSubmissionBatch span_batch;
+        (void)render_draws_rgba({span_producer}, W, H, nullptr, nullptr, true, nullptr,
+                                nullptr, nullptr, nullptr, &span_batch, false, nullptr, false);
+        {
+            BackendPersistentResourceGuard guard;
+            uint32_t recorded = 0;
+            for (const auto& [key, image] : persistent_ds_cache())
+                if (key.dr == span_base) recorded = image.programmed_slice_max;
+            check(recorded == 3, "a multi-slice DS view records its programmed SLICE_MAX");
+        }
+        const DepthArrayGuestSource span_source{0u, layer_bytes, W * sizeof(float)};
+        check(read_persistent_ds_depth_array(span_base, W, H, 0, Layers, partial, error,
+                                             &span_batch, &span_source) == Status::Unavailable,
+              "layers inside a multi-slice DS view's span are never read from guest bytes");
+
+        // Rebased planes name the layers their own slices and extents can touch. Layers 0 and 1
+        // are retained at the base; a plane rebased to layer 1 with its own slice 1 writes layer 2,
+        // and a plane rebased to layer 1 whose extent is two layers tall covers layer 2 too.
+        const uint64_t rebased_base = Base + 0x1e80000;
+        std::memset(reinterpret_cast<void*>(rebased_base), 0, layer_bytes * Layers);
+        seed_base = rebased_base;
+        if (!seed_layer(0, 0.25f) || !seed_layer(1, 0.5f)) return 1;
+        const DepthArrayGuestSource rebased_source{0u, layer_bytes, W * sizeof(float)};
+        check(read_persistent_ds_depth_array(rebased_base, W, H, 0, Layers, partial, error,
+                                             nullptr, &rebased_source) == Status::Ready,
+              "control: layers 2-3 of a two-layer retained array are admitted from guest bytes");
+        const uint64_t layer1 = rebased_base + layer_bytes;
+        const PersistentDsKey rebased_slice{layer1, layer1, 0, 0, 0, W, H,
+                                            VK_FORMAT_D32_SFLOAT, 1};
+        const PersistentDsKey rebased_tall{layer1, layer1, 0, 0, 0, W, H * 2,
+                                           VK_FORMAT_D32_SFLOAT, 0};
+        for (const auto& [plane, label] :
+             {std::pair{rebased_slice,
+                        "a rebased plane's own nonzero slice names the layer it actually writes"},
+              std::pair{rebased_tall,
+                        "a rebased plane taller than one layer names every layer it covers"}}) {
+            {
+                BackendPersistentResourceGuard guard;
+                persistent_ds_cache()[plane] = {};
+            }
+            check(read_persistent_ds_depth_array(rebased_base, W, H, 0, Layers, partial, error,
+                                                 nullptr, &rebased_source) ==
+                      Status::Unavailable, label);
+            {
+                BackendPersistentResourceGuard guard;
+                persistent_ds_cache().erase(plane);
+            }
+        }
+
+        // A guest layer whose bytes are a live COLOR target (renderer-owned pixels) is refused,
+        // including layer 0 and a target that starts inside a layer rather than at its start.
+        live_table->resources[0].gpu_addr = rebased_base;
+        live_shader(0);
+        live_draw.color0_base += 0x10000;
+        const auto admitted = capture_stderr([&] { (void)render_submit_items({live_draw}, W, H); });
+        check(admitted.find("[render-array-reject]") == std::string::npos,
+              "control: the two-layer retained array is admitted before any colour target");
+        DrawItem color_writer;
+        color_writer.vs = producer.vs; color_writer.fs = producer.fs;
+        color_writer.vertex_count = 3; color_writer.ps = sample_state;
+        color_writer.color0_base = rebased_base + 2 * layer_bytes + 64;
+        color_writer.color0_width = W; color_writer.color0_height = H;
+        (void)render_submit_items({color_writer}, W, H);
+        live_draw.color0_base += 0x10000;
+        const auto overlapped = capture_stderr([&] { (void)render_submit_items({live_draw}, W, H); });
+        check(overlapped.find("overlaps a live color target") != std::string::npos,
+              "a guest layer overlapping a live colour target keeps the refusal");
     }
 
     const auto gpu_stats = depth_array_gpu_copy_stats();

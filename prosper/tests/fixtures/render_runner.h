@@ -5557,6 +5557,11 @@ struct PersistentDsImage {
     uint64_t last_depth_write = 0;   // sampled-bridge recency (#1275)
     uint64_t last_depth_command_order = 0;
     uint64_t last_depth_present = UINT64_MAX;
+    // Highest DB_DEPTH_VIEW slice any pass attaching this identity ever programmed (inclusive,
+    // never lowered). The key carries only SLICE_START and the Vulkan image is one layer, so a
+    // guest view with SLICE_MAX > SLICE_START (a whole-array clear, layered rendering) writes
+    // layers no key names; this records that they were written (#3893 review).
+    uint32_t programmed_slice_max = 0;
 };
 
 inline uint64_t& persistent_ds_write_generation() {
@@ -7095,19 +7100,23 @@ enum class PersistentDsDepthArrayStatus { NoIdentity, Ready, Unavailable };
 // cascades 1-3 (no DS pass of any extent or format names those layers), then sample all four. The
 // bridge used to refuse the whole binding, which dropped two draws per flip.
 //
-// A layer that no retained DS identity has ever named -- neither this base at that slice, at any
-// extent or format, nor a rebased plane inside the layer's byte range -- has never been written by
-// the depth block in this process. prosper never writes rendered depth back to guest memory, so for
-// such a layer the only writer the guest can have used is one that does reach guest memory (CPU,
-// DMA, a copy), and its guest bytes are exactly what the hardware would sample. That is the whole
-// admission rule. A layer that HAS an identity -- valid or not, at this extent or another -- keeps
+// A layer that no retained DS identity can have written -- no identity's programmed slice span
+// (DB_DEPTH_VIEW SLICE_START..SLICE_MAX, see PersistentDsImage::programmed_slice_max) at any extent
+// or format, from this base or a rebased plane, touches its bytes -- has never been written by the
+// depth block in this process. Identities are never evicted (only a failed first creation erases
+// one), so "ever named" is permanent. prosper never writes rendered depth back to guest memory, so
+// for such a layer the only writer the guest can have used is one that does reach guest memory
+// (CPU, DMA, a copy, a compute write-back), and its guest bytes are exactly what the hardware would
+// sample. That is the whole admission rule. A layer that HAS been named -- valid or not -- keeps
 // the old refusal, because its guest bytes are stale relative to renderer-owned pixels.
 // Compressed (HTILE) arrays are excluded by the caller: their guest depth bytes are not the whole
-// story. CONFIDENCE: MED-HIGH -- the rule follows from prosper's own write model; the one way it can
-// be wrong is a DS pass the renderer never executed at all (so it never keyed the layer), which was
-// already wrong before this (the whole draw was dropped).
+// story. A layer overlapping a live colour target is refused too (DepthArrayGuestSource::
+// renderer_owned). CONFIDENCE: MED-HIGH -- the rule follows from prosper's own write model. It
+// can be wrong only for a DS pass prosper never executed at all (so it never keyed the identity),
+// which was already wrong before this (the whole draw was dropped). A multi-slice DS view is NOT
+// such a case: its span is recorded even though the backend attaches one layer of it.
 // Guest-layer scans already made in one renderer callback. A binding set can name the same array
-// dozens of times per draw (Sonic Frontiers: ~20 bindings), and every selection and identity check
+// dozens of times per draw (Sonic Frontiers: ~43 bindings), and every selection and identity check
 // otherwise rescans each 4 MiB layer. The owner clears it whenever queued guest GPU writes drain
 // and at the end of its callback, so an entry never outlives a write prosper has observed.
 struct DepthArrayGuestScanMemo {
@@ -7131,6 +7140,9 @@ struct DepthArrayGuestSource {
     const uint8_t* host_data = nullptr;
     size_t host_size = 0;
     DepthArrayGuestScanMemo* memo = nullptr;   // optional; see DepthArrayGuestScanMemo
+    // Optional: true when [addr, addr+bytes) overlaps renderer-owned pixels its guest bytes do not
+    // show (a live colour target). Such a layer is refused rather than read from guest memory.
+    const std::function<bool(uint64_t, size_t)>* renderer_owned = nullptr;
 };
 
 struct DepthArrayGuestLayer {
@@ -7192,17 +7204,31 @@ inline bool collect_depth_array_guest_layers(uint64_t base, uint32_t width, uint
     const size_t footprint = tiled
         ? prosper::gpu::tiled_surface_bytes(width, height, source.tile_mode, 0, sizeof(float))
         : pitch * (height - 1) + row_bytes;
+    // A layer is NAMED -- renderer-owned, never guest-sourced -- when any retained identity's
+    // programmed slice span can have written bytes inside it. Each identity plane P (read or
+    // write base) covers slices [key.slice, programmed_slice_max]; slice s occupies
+    // [P + s*stride, P + s*stride + w*h*4) with this array's stride, the only one known. For the
+    // array's own base that names exactly its programmed layers; a rebased plane, or one at another
+    // extent, names every layer its bytes can touch. Over-naming only keeps the old refusal.
     std::vector<bool> named(layer_count, false);
     const uint64_t first_addr = base + static_cast<uint64_t>(first_layer) * source.layer_stride;
     const uint64_t end_addr = first_addr + static_cast<uint64_t>(layer_count) * source.layer_stride;
     for (const auto& [key, image] : persistent_ds_cache()) {
-        (void)image;
-        if ((key.dr == base || key.dw == base) && key.slice >= first_layer &&
-            key.slice - first_layer < layer_count)
-            named[key.slice - first_layer] = true;
+        const uint32_t last_slice = std::max(key.slice, image.programmed_slice_max);
+        const uint64_t plane_bytes = static_cast<uint64_t>(key.w) * key.h * sizeof(float);
         for (const uint64_t plane : {key.dr, key.dw}) {
-            if (!plane || plane == base || plane < first_addr || plane >= end_addr) continue;
-            named[(plane - first_addr) / source.layer_stride] = true;
+            if (!plane) continue;
+            for (uint64_t slice = key.slice; slice <= last_slice; ++slice) {
+                const uint64_t lo = plane + slice * source.layer_stride;
+                const uint64_t hi = lo + std::max<uint64_t>(plane_bytes, 1);
+                if (hi <= first_addr) continue;
+                if (lo >= end_addr) break;
+                const uint64_t from = lo <= first_addr ? 0 : (lo - first_addr) / source.layer_stride;
+                const uint64_t to = std::min<uint64_t>(layer_count,
+                    (std::min(hi, end_addr) - first_addr + source.layer_stride - 1) /
+                        source.layer_stride);
+                for (uint64_t layer = from; layer < to; ++layer) named[layer] = true;
+            }
         }
     }
     for (uint32_t layer = 0; layer < layer_count; ++layer) {
@@ -7211,6 +7237,10 @@ inline bool collect_depth_array_guest_layers(uint64_t base, uint32_t width, uint
         guest.layer = layer;
         guest.addr = first_addr + static_cast<uint64_t>(layer) * source.layer_stride;
         guest.bytes = footprint;
+        if (source.renderer_owned && (*source.renderer_owned)(guest.addr, source.layer_stride)) {
+            error = "retained depth array guest layer overlaps a live color target";
+            return false;
+        }
         if (pitch < row_bytes || !footprint || footprint > source.layer_stride ||
             footprint > UINT32_MAX) {
             error = "retained depth array guest layer footprint exceeds its layer stride";
@@ -8436,6 +8466,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             htile_identity = identity->stencil_read_base - 0x10000;
         ds_key = persistent_ds_key_for(*identity, htile_identity, W, H, (uint32_t)DFMT);
         cached_ds = &persistent_ds_cache()[ds_key];
+        cached_ds->programmed_slice_max = std::max({cached_ds->programmed_slice_max, ds_key.slice,
+            ds_depth_view_slice_max(identity->db_depth_view)});
         // The key carries the PASS extent, so one guest depth surface reached through two passes of
         // different extent becomes two independent entries -- and the larger one's guest range is
         // sized from that extent, which is how a 512x512 shadow cascade acquires a 33 MB depth range

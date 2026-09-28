@@ -4673,19 +4673,36 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     depth_array_guest_scans.entries.clear();
                                     depth_array_guest_scan_epoch = scan_epoch;
                                 }
+                                // A guest-sourced layer whose bytes overlap a live COLOR target
+                                // has renderer-owned pixels its guest bytes do not show. The
+                                // footprint is an upper bound -- extent padded to whole 256x256
+                                // texels (covers any 64 KiB swizzle block), 16 bytes per texel for
+                                // a format without a per-texel size, or the proven volume span --
+                                // so an uncertain overlap keeps the old refusal.
+                                const std::function<bool(uint64_t, size_t)> overlaps_color_target =
+                                    [&](uint64_t addr, size_t bytes) {
+                                        for (const auto& [color_base, surf] : g_rtt) {
+                                            uint32_t bpp = prosper::test::backend_color_bytes_per_pixel(
+                                                surf.format);
+                                            if (!bpp) bpp = 16u;
+                                            const uint64_t padded =
+                                                ((static_cast<uint64_t>(surf.w) + 255u) & ~255ull) *
+                                                ((static_cast<uint64_t>(surf.h) + 255u) & ~255ull) * bpp;
+                                            const uint64_t span =
+                                                std::max<uint64_t>(padded, surf.volume_guest_bytes);
+                                            if (color_base < addr + bytes &&
+                                                addr < color_base + std::max<uint64_t>(span, 1))
+                                                return true;
+                                        }
+                                        return false;
+                                    };
                                 prosper::test::DepthArrayGuestSource guest_source_storage{
                                     r.tile_mode, r.layer_stride_bytes, r.linear_row_pitch_bytes,
                                     r.host_data, static_cast<size_t>(r.host_data_size),
-                                    &depth_array_guest_scans};
-                                // A layer whose address is a live COLOR target has renderer-owned
-                                // pixels its guest bytes do not show; keep the old refusal there.
-                                bool layer_is_color_target = false;
-                                for (uint32_t layer = 1; layer < r.depth && r.layer_stride_bytes; ++layer)
-                                    layer_is_color_target |= g_rtt.count(
-                                        r.gpu_addr + static_cast<uint64_t>(layer) * r.layer_stride_bytes) != 0;
+                                    &depth_array_guest_scans, &overlaps_color_target};
                                 const prosper::test::DepthArrayGuestSource* guest_source =
                                     retained_exact && !r.compression_enabled && r.layer_stride_bytes &&
-                                        !layer_is_color_target && !disable_guest_depth_layers
+                                        !disable_guest_depth_layers
                                         ? &guest_source_storage : nullptr;
                                 const auto source_identity = [&] {
                                     const prosper::test::BackendPersistentResourceGuard guard;
