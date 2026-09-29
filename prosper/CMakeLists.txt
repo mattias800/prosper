@@ -3645,7 +3645,7 @@ endif()
       target_link_libraries(test_live_renderer_registration_statics PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME live_renderer_registration_statics COMMAND test_live_renderer_registration_statics)
       set_tests_properties(live_renderer_registration_statics PROPERTIES ENVIRONMENT_MODIFICATION
-        "PROSPER_RENDER_DELAY_MS=unset:;PROSPER_TEXTURE_DECODE_CACHE_MB=unset:")
+        "PROSPER_RENDER_DELAY_MS=unset:;PROSPER_TEXTURE_DECODE_CACHE_MB=unset:;PROSPER_RENDER_FIRST=unset:;PROSPER_RENDER_LAST=unset:")
       add_executable(test_float32_array_upload tests/shared/live/test_float32_array_upload.cpp)
       target_include_directories(test_float32_array_upload PRIVATE frontends src tests)
       target_link_libraries(test_float32_array_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)

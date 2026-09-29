@@ -310,6 +310,16 @@ Partial machinery already exists (`rtt_gpu_seed_import_extent_compatible`,
 
 ## Ruled out
 
+**RULED OUT (2026-09-30): an absent decode-budget announcement proves its environment value has
+not been read yet.** The original `live_renderer_registration_statics` harness passed with the
+budget read moved above the warmup return and its report left below it: both callbacks saw the
+same 77 MiB setting. Changing the setting from 55 to 77 MiB between the skipped and in-window
+callbacks makes that mutation fail one assertion while the restored renderer passes. The report's
+placement alone cannot pin the read's placement. This guard samples the process gates and budget;
+it does not directly prove decoded-cache, texture-identity or thread-local-cache preservation.
+See [#3968](https://github.com/mattias800/prosper/pull/3968) and
+[#3892](https://github.com/mattias800/prosper/issues/3892).
+
 **RULED OUT as the first visibility boundary for Astro Bot's observed opening route (2026-09-29):
 the CPU read of the next indirect dispatch's argument triplet.** An exact argument-read observer
 and binding-60 output selector found the first read at `0x5074063e0+12`, disjoint from the pending
