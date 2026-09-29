@@ -46,7 +46,56 @@ static bool has_depth_key(uint64_t base, uint32_t width, uint32_t height) {
     return false;
 }
 
-int main() {
+// #3907: the CPU readback path (live colour targets off). A depth-only pass whose disabled colour
+// register names an established colour target at ANOTHER extent must not replace that target's CPU
+// copy: it writes no colour, so its readback is only the unseeded clear. GTA V's depth-only
+// 3840x2160 pass over its 2560x1440 HDR target blacked out the world this way.
+static int readback_path_main(uint64_t guest, const std::vector<uint32_t>& vs,
+                              const std::vector<uint32_t>& fs) {
+    constexpr uint32_t ColorW = 64, ColorH = 64, AliasW = 32, AliasH = 32;
+    const uint64_t Color = guest + 0x100000;
+    const uint64_t Depth = guest;
+    DrawItem producer;
+    producer.vs = vs; producer.fs = fs; producer.vertex_count = 3;
+    producer.ps.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    producer.ps.color_write_mask = 0xf;
+    producer.color0_base = Color; producer.color0_width = ColorW; producer.color0_height = ColorH;
+    (void)render_submit_items({producer}, ColorW, ColorH);
+
+    DrawItem depth_only;
+    depth_only.vs = vs; depth_only.fs = fs; depth_only.vertex_count = 3;
+    depth_only.ps.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    depth_only.ps.color_write_mask = 0;          // writes no colour
+    depth_only.ps.depth_test_enable = depth_only.ps.depth_write_enable = true;
+    depth_only.ps.depth_compare_op = VK_COMPARE_OP_ALWAYS;
+    depth_only.ps.depth_read_base = depth_only.ps.depth_write_base = Depth;
+    // Raw zero DB size (unproven, as a captured GTA V submit carries it), so the pass keeps its
+    // colour identity instead of taking the explicit-depth-extent route that zeroes it.
+    depth_only.ps.db_depth_size_xy = 0;
+    depth_only.ps.has_viewport = true;
+    depth_only.ps.viewport_w = float(AliasW); depth_only.ps.viewport_h = float(AliasH);
+    // The colour register still names the target, at another extent, in the MRT array form a
+    // live guest submit carries (format set, write mask 0) -- the GTA V shape.
+    depth_only.color0_base = Color;
+    depth_only.color0_width = AliasW; depth_only.color0_height = AliasH;
+    depth_only.color_targets[0] = {Color, AliasW, AliasH};
+    depth_only.ps.color_targets[0].format = VK_FORMAT_R8G8B8A8_UNORM;
+    depth_only.ps.color_targets[0].write_mask = 0;
+    (void)render_submit_items({depth_only}, ColorW, ColorH);
+
+    prosper::gpu::LiveTargetSnapshot snapshot;
+    const bool read = prosper::gpu::read_live_render_target(Color, snapshot);
+    check(read && snapshot.width == ColorW && snapshot.height == ColorH && snapshot.pixels &&
+              snapshot.pixels->size() == size_t(ColorW) * ColorH * 4 &&
+              (*snapshot.pixels)[0] == 255 && (*snapshot.pixels)[1] == 0 &&
+              (*snapshot.pixels)[2] == 0,
+          "readback path: a depth-only pass keeps the colour target's 64x64 CPU copy");
+    std::printf("depth-only attachment extent (readback path): %d failures\n", failures);
+    return failures ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+    const bool readback_path = argc > 1 && std::strcmp(argv[1], "--readback-path") == 0;
     prosper::register_builtin_hle();
     auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
     auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
@@ -76,6 +125,11 @@ int main() {
     check(!vs.empty() && !fs.empty(), "fullscreen depth shaders compile");
     if (vs.empty() || fs.empty()) return 1;
     prosper::frontend::register_live_renderer(".", false);
+    if (readback_path) {
+        const int result = readback_path_main(guest, vs, fs);
+        unmap(guest, GuestBytes, 0, 0, 0, 0);
+        return result;
+    }
 
     auto depth_draw = [&](uint64_t base, uint32_t raw_extent, float z) {
         DrawItem draw;
