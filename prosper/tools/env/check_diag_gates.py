@@ -95,7 +95,8 @@ silently stops describing the tree, which is the same failure class this tool ex
   - Cached reference getters are followed only for a unique class with a native `instance()`
     singleton, a const pointer receiver, and a complete const-reference getter consisting of one
     cached declaration and return of the same local. An optional slot's emplacement is read as
-    its value initializer. Only a declaration initialized by that receiver's zero-argument getter
+    its value initializer only for an immobile owner and a slot mentioned solely in its declaration
+    and initializer. Only a declaration initialized by that receiver's zero-argument getter
     is bridged; arbitrary member calls, mutable returns, unknown types and receiver shadows are
     invisible. Plain by-value lambda captures preserve the receiver; uncertain mentions retire it.
 
@@ -783,10 +784,13 @@ def collect_cached_getters(files: dict[Path, list[str]]) -> dict[tuple[str, str]
     unambiguous class with a native singleton and a complete, const-reference getter consisting
     of ONE cached declaration and return of that same local is recognised. An optional slot's
     emplace argument is its value initializer; apply the existing polarity/default/lambda rules
-    to that argument, exactly as before relocation. Mutable state and other method bodies remain
+    to that argument, exactly as before relocation. Optional owners must be immobile and the slot
+    may be mentioned only at declaration and emplacement. Mutable state and other method bodies remain
     invisible. Duplicate classes or definitions retire the bridge rather than guessing a type.
     """
     texts = ["\n".join(lines) for lines in files.values()]
+    from collections import Counter
+    mentions = Counter(word for text in texts for word in IDENT_RE.findall(text))
     classes: dict[str, list[str]] = {}
     for text in texts:
         for m in CLASS_DEF_RE.finditer(text):
@@ -810,7 +814,20 @@ def collect_cached_getters(files: dict[Path, list[str]]) -> dict[tuple[str, str]
                     slot = re.escape(emplace.group(1))
                     optional = re.search(r"\bstd::optional\s*<[^;]+>\s+" + slot
                                          + r"\s*;", definitions[0])
-                    if close != len(rhs) - 1 or not optional:
+                    # Whole-owner assignment can alter the slot without mentioning its name.
+                    # The process owner is immobile; require that contract for an optional bridge.
+                    owner_name = re.escape(owner)
+                    deleted_copy = re.search(owner_name + r"\s*\(\s*const\s+" + owner_name
+                                             + r"\s*&\s*\)\s*=\s*delete\s*;", definitions[0])
+                    deleted_assignment = re.search(
+                        r"\boperator\s*=\s*\(\s*const\s+" + owner_name
+                        + r"\s*&\s*\)\s*=\s*delete\s*;", definitions[0])
+                    immobile = deleted_copy and deleted_assignment \
+                        and len(re.findall(r"\boperator\s*=", definitions[0])) == 1
+                    # Besides the declaration and this emplacement, any mention might expose or
+                    # mutate the slot. Unsure means retire, including a same-named unrelated slot.
+                    if close != len(rhs) - 1 or not optional or not immobile \
+                            or mentions[emplace.group(1)] != 2:
                         rhs = ""                  # unknown emplacement is not value provenance
                     else:
                         rhs = rhs[emplace.end():close]
@@ -2514,7 +2531,10 @@ class GetterState {
 public:
     static GetterState& instance();
     const int& threshold();
+    GetterState(const GetterState&) = delete;
+    GetterState& operator=(const GetterState&) = delete;
 private:
+    GetterState() = default;
     std::optional<int> threshold_;
 };
 struct GetterCtx { const int& threshold; };
@@ -2572,6 +2592,15 @@ void consume(const GetterCtx& ctx) {
             "const int& GetterState::threshold()", "int& GetterState::threshold()")}, False),
         ("unknown emplacement is not optional value provenance", {"header": header.replace(
             "std::optional<int> threshold_;", "CustomSlot threshold_;")}, False),
+        ("optional slot used outside its initializer", {"definition": definition + """
+void GetterState::reset() {
+    threshold_.reset();
+}
+"""}, False),
+        ("assignable optional owner is not immutable config", {"header": header.replace(
+            "GetterState& operator=(const GetterState&) = delete;", "")}, False),
+        ("additional assignment overload retires optional owner", {"header": header.replace(
+            "private:", "GetterState& operator=(GetterState&&);\nprivate:")}, False),
         ("unknown receiver type", {"caller": caller.replace(
             "auto* const state = &GetterState::instance();", "auto* const state = lookup();")}, False),
         ("mutable pointer receiver", {"caller": caller.replace(
