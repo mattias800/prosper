@@ -1155,11 +1155,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             auto* target = prosper::test::find_persistent_color_target(
                 addr, request.width, request.height, format, false);
             if ((!target || !target->image) && request.allow_create) {
+                bool allocation_failed = false;
                 target = prosper::test::ensure_persistent_color_target_for_compute_overwrite(
-                    addr, request.width, request.height, format);
+                    addr, request.width, request.height, format, &allocation_failed);
                 if (!target) {
-                    destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::
-                        DestinationCreationRefused;
+                    destination.refusal = allocation_failed
+                        ? prosper::gpu::LiveTargetImageImport::Refusal::DestinationAllocationFailed
+                        : prosper::gpu::LiveTargetImageImport::Refusal::DestinationCreationRefused;
                     return false;
                 }
             }

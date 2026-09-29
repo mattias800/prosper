@@ -73,6 +73,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <tuple>
@@ -11451,6 +11452,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 static_assert(static_cast<size_t>(prosper::gpu::LiveTargetImageImport::Refusal::Count) <=
                                   prosper::diagnostics::perf::kRttDestinationRefusalSlots,
                               "every destination refusal needs its own perf ledger slot");
+                // color-target-count-ceiling matches this reason BY NAME in the window sample.
+                static_assert(std::string_view(prosper::gpu::live_target_import_refusal_name(
+                                  prosper::gpu::LiveTargetImageImport::Refusal::
+                                      DestinationCreationRefused)) ==
+                                  prosper::diagnostics::perf::kDestinationCreationRefused,
+                              "the ceiling rule's refusal name must match the recorder's");
                 prosper::diagnostics::perf::note_rtt_destination_refusal(
                     static_cast<size_t>(destination.refusal),
                     prosper::gpu::live_target_import_refusal_name(destination.refusal),

@@ -18,6 +18,7 @@
 #include "gpu/diagnostics/draw_disposition.hpp"
 #include "hle/dispatch/dispatch.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -1108,10 +1109,11 @@ void test_engine() {
     const std::string quiet = slurp(logp);
     check("...saying no rule fired", quiet.find("no rule fired in 1 windows") != std::string::npos);
     check("...and listing the rules that had no data as NOT quiet",
-          quiet.find("15 of 21 rules had data") != std::string::npos &&
+          quiet.find("15 of 22 rules had data") != std::string::npos &&
               quiet.find("NO DATA (not measured in any window, so not quiet): "
                          "texture-reference-cost,present-cpu-overhead,present-path-fallback,"
-                         "present-slot-trouble,color-target-count-ceiling,gpu-sync-wait") != std::string::npos);
+                         "present-slot-trouble,color-target-count-ceiling,gpu-sync-wait,"
+                         "gpu-present-stalled") != std::string::npos);
     std::fclose(s);
     std::remove(jsonl.c_str());
     std::remove(logp.c_str());
@@ -1308,6 +1310,7 @@ void test_engine_host_copy_alternating() {
 void add_refusal(WindowSample& w, size_t slot, const char* name, uint64_t n, uint64_t bytes_each) {
     w.rtt_destination_refusal_names[slot] = name;
     w.rtt_destination_refused_bytes[slot] += n * bytes_each;
+    w.rtt_destination_refusals[slot] += n;
     w.counters[static_cast<size_t>(Counter::RttDestinationRefusals)] += n;
     w.counters[static_cast<size_t>(Counter::RttDestinationRefusedBytes)] += n * bytes_each;
 }
@@ -1409,6 +1412,16 @@ void test_color_target_count_ceiling() {
               "rtt-destination-refused",
               r.size() == 2 && fired(r, "color-target-count-ceiling") &&
                   fired(r, "rtt-destination-refused"));
+        // The refusal arm reports the refusal COUNT, not a 0.00 evictions/s (#3891 review).
+        const AlarmFiring* c = nullptr;
+        for (const auto& x : r) if (std::string(x.rule) == "color-target-count-ceiling") c = &x;
+        check("...and, firing on the refusal arm, reports 48 creation-refusals rather than "
+              "evictions/s",
+              c && std::string(c->unit) == "creation-refusals" && c->value == 48.0 &&
+                  c->detail.find("compute-creation-refused=48 (") != std::string::npos);
+        const auto churn = evaluate_rules(gta_color_target_window(320, 1150, 30), kDefault);
+        check("...while the eviction arm still reports evictions/s",
+              !churn.empty() && std::string(churn[0].unit) == "evictions/s");
         WindowSample other = gta_color_target_window(256, 988, 0);
         other.flips = 48;
         add_refusal(other, 15, "extent-mismatch", 48, 2560ull * 1440 * 4);
@@ -1423,6 +1436,51 @@ void test_color_target_count_ceiling() {
     check("a run that never consulted the cache (no entry bound) has no data",
           !rule_has_data("color-target-count-ceiling", healthy()) &&
               rule_has_data("color-target-count-ceiling", gta_color_target_window(0, 0, 0)));
+}
+
+// gpu-present-stalled (#3891, #3951): a GPU-present frontend that presented nothing while the guest
+// flipped. GTA V on the #3951 regression: ~30 guest flips/s, no [app] fps line in 60+ s.
+void test_gpu_present_stalled() {
+    std::puts("gpu-present-stalled");
+    WindowSample stalled = healthy();                    // 150 flips, no presents of either kind
+    set_gauge(stalled, Gauge::GpuPresentActive, 1);
+    const auto a = evaluate_rules(stalled, kDefault);
+    check("GPU present on, 150 guest flips, 0 presents fires gpu-present-stalled alone",
+          only(a, "gpu-present-stalled"));
+    check("...as guest flips per second, saying no decline was recorded",
+          !a.empty() && std::string(a[0].unit) == "guest-flips/s" && a[0].value == 30.0 &&
+              a[0].detail.find("declines=none-recorded") != std::string::npos);
+    WindowSample named = stalled;
+    named.present_declines[6] = 150; named.present_decline_names[6] = "no-render-target";
+    const auto n = evaluate_rules(named, kDefault);
+    check("...and names the renderer's decline reasons when there are some",
+          fired(n, "gpu-present-stalled") &&
+              n[0].detail.find("declines=no-render-target:150") != std::string::npos);
+    WindowSample presenting = stalled;
+    set_cost(presenting, Cost::PresentCpu, 5.0, 1, 5.0);  // a single GPU present
+    check("one GPU present in the window is quiet (a slow title is not a stalled one)",
+          !fired(evaluate_rules(presenting, kDefault), "gpu-present-stalled"));
+    WindowSample fallback = stalled;
+    set_count(fallback, Counter::PresentCpuFallbacks, 1);
+    check("a CPU-fallback present is a present too",
+          !fired(evaluate_rules(fallback, kDefault), "gpu-present-stalled"));
+    WindowSample no_consumer = healthy();                 // tools/screenshot: never presents
+    check("no GPU-present consumer: no data, and quiet",
+          !rule_has_data("gpu-present-stalled", no_consumer) &&
+              evaluate_rules(no_consumer, kDefault).empty());
+    WindowSample loading = stalled;
+    loading.flips = kGpuPresentStalledMinFlips - 1;       // the guest itself is not flipping
+    check("below the flip floor (a loading pause): no data, and quiet",
+          !rule_has_data("gpu-present-stalled", loading) &&
+              !fired(evaluate_rules(loading, kDefault), "gpu-present-stalled"));
+    loading.flips = kGpuPresentStalledMinFlips;
+    check("at the flip floor it fires", fired(evaluate_rules(loading, kDefault),
+                                             "gpu-present-stalled"));
+    check("performance sustain (2 windows, one long hitch is not a stall)",
+          sustain_windows("gpu-present-stalled") == 2);
+    check("the rule is in the summary's list",
+          std::count_if(rule_names().begin(), rule_names().end(), [](const char* r) {
+              return std::string(r) == "gpu-present-stalled"; }) == 1);
 }
 
 // The exact full-overwrite shape census: one verdict per tested compute result.
@@ -1618,14 +1676,15 @@ int main() {
     test_engine_host_copy_alternating();
     test_rtt_destination_refused();
     test_color_target_count_ceiling();
+    test_gpu_present_stalled();
     test_exact_result_census();
     test_engine_2026_09_29_censuses();
     test_gpu_sync_wait();
     check("rule_names lists the six phase-2 rules, the three added with phase 3, "
           "gpu-memory-off-device (#3897), the six 2026-09-28 queue rules and the two "
           "2026-09-29 ones (host-copy-per-flip, present-slot-trouble, rtt-destination-refused, "
-          "color-target-count-ceiling) and gpu-sync-wait (#3948)",
-          rule_names().size() == 21);
+          "color-target-count-ceiling), gpu-sync-wait (#3948) and gpu-present-stalled (#3951)",
+          rule_names().size() == 22);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ok", g_failures);
     return g_failures ? 1 : 0;
 }

@@ -1299,7 +1299,8 @@ struct LiveTargetImageImport {
         ExtentMismatch,
         FormatMismatch,
         DeviceMismatch, // a compute-only device cannot own a renderer allocation
-        DestinationCreationRefused, // no room or Vulkan allocation/setup failed; CPU path remains
+        DestinationCreationRefused, // the persistent colour-target cache had no room; CPU path remains
+        DestinationAllocationFailed, // Vulkan image creation/allocation/bind/view failed; CPU path remains
         Count,
     };
     Refusal refusal = Refusal::None;
@@ -1345,6 +1346,8 @@ constexpr const char* live_target_import_refusal_name(LiveTargetImageImport::Ref
         case LiveTargetImageImport::Refusal::DeviceMismatch: return "device-mismatch";
         case LiveTargetImageImport::Refusal::DestinationCreationRefused:
             return "destination-creation-refused";
+        case LiveTargetImageImport::Refusal::DestinationAllocationFailed:
+            return "destination-allocation-failed";
         case LiveTargetImageImport::Refusal::Count: break;   // not a reason
     }
     return "unknown";

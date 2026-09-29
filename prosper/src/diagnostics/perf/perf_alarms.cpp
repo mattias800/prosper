@@ -101,6 +101,9 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
         for (size_t i = 0; i < kRttDestinationRefusalSlots; ++i)
             prev_rtt_destination_refused_bytes_[i] =
                 ledger.rtt_destination_refused_bytes[i].load(std::memory_order_relaxed);
+        for (size_t i = 0; i < kRttDestinationRefusalSlots; ++i)
+            prev_rtt_destination_refusals_[i] =
+                ledger.rtt_destination_refusals[i].load(std::memory_order_relaxed);
         for (size_t i = 0; i < kExactResultDeclineCount; ++i)
             prev_exact_result_declines_[i] =
                 ledger.exact_result_declines[i].load(std::memory_order_relaxed);
@@ -163,6 +166,9 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
         const uint64_t v = ledger.rtt_destination_refused_bytes[i].load(std::memory_order_relaxed);
         w.rtt_destination_refused_bytes[i] = v - prev_rtt_destination_refused_bytes_[i];
         prev_rtt_destination_refused_bytes_[i] = v;
+        const uint64_t n = ledger.rtt_destination_refusals[i].load(std::memory_order_relaxed);
+        w.rtt_destination_refusals[i] = n - prev_rtt_destination_refusals_[i];
+        prev_rtt_destination_refusals_[i] = n;
         w.rtt_destination_refusal_names[i] =
             ledger.rtt_destination_refusal_names[i].load(std::memory_order_relaxed);
         if (w.rtt_destination_refusal_names[i]) rtt_destination_refusal_names_[i] =

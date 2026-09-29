@@ -208,8 +208,15 @@ constexpr uint64_t kRttDestinationRefusedMinFlips = 10;
 // have missed the costly state; evictions are the load-time form (up to 392 per window).
 constexpr double kColorTargetCeilingByteShare = 0.5;
 constexpr double kColorTargetCeilingEvictionsPerSecond = 2.0;   // > 10 per 5 s window
-// The destination refusal name (live_target_import_refusal_name) that means "no room".
-constexpr const char* kDestinationCreationRefused = "destination-creation-refused";
+// kDestinationCreationRefused (perf_ledger.hpp) is the refusal name that means "no room".
+
+// gpu-present-stalled: a GPU-present frontend presented NOTHING -- neither a GPU scanout nor a CPU
+// fallback -- for a whole window while the guest kept flipping. The window on screen is frozen or
+// was never shown. #3951 is the case that needed it: a recompiler refusal dropped ~99.7% of GTA V's
+// draws, the guest flipped at ~30/s, prosper-app printed no `[app] fps` line in 60+ s, and the
+// only alarm that fired was a downstream host-copy-per-flip. The flip floor keeps a boot or a
+// loading pause (the guest is not flipping) out of it; sustain 2 keeps one long hitch out.
+constexpr uint64_t kGpuPresentStalledMinFlips = 20;   // per window (4/s over 5 s)
 
 // gpu-sync-wait: SHARE of the frame budget (#3948 stage 0). The executor thread blocked on the fence
 // of work it had just submitted -- each compute dispatch's, each graphics batch's -- summed per guest
@@ -278,6 +285,7 @@ struct WindowSample {
     // Per-reason breakdown of RttDestinationRefusedBytes, and each slot's name.
     uint64_t rtt_destination_refused_bytes[kRttDestinationRefusalSlots] = {};
     const char* rtt_destination_refusal_names[kRttDestinationRefusalSlots] = {};
+    uint64_t rtt_destination_refusals[kRttDestinationRefusalSlots] = {};   // results per slot
     // Verdicts of the exact full-overwrite shape test (ExactResultDecline), one per tested result.
     uint64_t exact_result_declines[kExactResultDeclineCount] = {};
 
@@ -312,6 +320,7 @@ struct RuleThresholds {
     uint64_t host_copy_per_flip_min_flips = kHostCopyPerFlipMinFlips;
     double present_slot_trouble_share = kPresentSlotTroubleShare;
     uint64_t present_slot_trouble_min_flips = kPresentSlotTroubleMinFlips;
+    uint64_t gpu_present_stalled_min_flips = kGpuPresentStalledMinFlips;
     double shader_compile_budget_share = kShaderCompileBudgetShare;
     double shader_compile_min_per_s = kShaderCompileMinPerSecond;
     uint64_t unaccounted_draws = kUnaccountedDrawsPerWindow;
@@ -380,6 +389,8 @@ std::vector<std::pair<const char*, uint64_t>> rtt_destination_refused_mib(const 
 bool gpu_sync_wait_has_data(const WindowSample& w);
 // The window's refused bytes whose reason is kDestinationCreationRefused.
 uint64_t destination_creation_refused_bytes(const WindowSample& w);
+// ...and how many results that was.
+uint64_t destination_creation_refused_count(const WindowSample& w);
 
 std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresholds& t);
 

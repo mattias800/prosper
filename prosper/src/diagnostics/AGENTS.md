@@ -230,8 +230,11 @@ the rule that names it live. `color-target-count-ceiling` reads the persistent c
 cache's per-window PEAKS (`Peak`, raised where `persistent_target_census` already samples residency,
 reset at every window close) against its two bounds: at the entry-count bound, under half the byte
 budget, and either evicting or refusing a compute creation. The refusal arm is not optional: GTA V's
-costly state sits at exactly 256 of 256 entries with zero evictions, because compute creation never
-evicts. The exit summary also prints a census line (not a rule): each tested compute result's
+costly state sits at exactly 256 of 256 entries with zero evictions. When it fires on that arm it
+reports `creation-refusals`, not a 0.00 evictions/s. The refusal it counts is matched by name
+(`kDestinationCreationRefused`, which `live_compute.cpp` static_asserts against
+`live_target_import_refusal_name`). A Vulkan failure to create the image is a separate reason,
+`destination-allocation-failed`, and does not count toward the ceiling. The exit summary also prints a census line (not a rule): each tested compute result's
 FIRST failing field of the exact full-overwrite shape test (`ExactResultDecline`, in
 `exact_full_result`'s order), then the post-shape format declines, then `accepted`; the JSONL window
 carries it as `exact_result_verdicts`. `exact_full_result` is defined as "the verdict is accepted",
@@ -250,3 +253,11 @@ behind other submissions on the shared queue (present blits), not only submissio
 signal of the synchronous architecture, not a defect of those runs, and the general rule that a
 rule firing on a healthy run gets tuned or removed does not apply to it until #3948's later stages
 land. Retune or retire it then; do not "fix" it before.
+
+**A window nobody saw** (#3891, #3951). `gpu-present-stalled` fires when a GPU-present frontend
+(`Gauge::GpuPresentActive`, set by `set_gpu_present_active`) presented nothing in a window, neither
+a GPU scanout (`Cost::PresentCpu` events) nor a CPU fallback, while the guest flipped at least 20
+times. That is a frozen or black window whatever the other rules say. #3951's recompiler regression
+is the case: the guest flipped at ~30/s with no `[app] fps` line, and only a downstream
+host-copy-per-flip fired. It has no data in `tools/screenshot`/`boot_trace` (no consumer) or in a
+window where the guest barely flips (boot, loading), and it needs two windows.

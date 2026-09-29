@@ -121,6 +121,7 @@ private:
     // Also the RUN totals (as of the last window close) the exit summary's census line prints.
     uint64_t prev_rtt_destination_refused_bytes_[kRttDestinationRefusalSlots] = {};
     const char* rtt_destination_refusal_names_[kRttDestinationRefusalSlots] = {};
+    uint64_t prev_rtt_destination_refusals_[kRttDestinationRefusalSlots] = {};
     uint64_t prev_exact_result_declines_[kExactResultDeclineCount] = {};
     uint64_t prev_transfer_bytes_[WindowSample::kTransferCount] = {};
     uint64_t prev_transfer_calls_[WindowSample::kTransferCount] = {};
