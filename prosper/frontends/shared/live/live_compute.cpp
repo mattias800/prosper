@@ -475,6 +475,7 @@ std::atomic<uint64_t> g_dcc_forced_seed_allocation_reuses{0};
 std::atomic<uint64_t> g_dcc_post_writeback_replacements{0};
 std::atomic<bool> g_fail_next_storage_readback_for_test{false};
 std::function<void(uint32_t, const uint8_t*, size_t)> g_image_readback_observer_for_test;
+std::function<void()> g_before_image_publish_observer_for_test;
 std::atomic<bool> g_fail_next_buffer_readback_for_test{false};
 std::atomic<bool> g_leave_next_dcc_metadata_compressed_for_test{false};
 std::atomic<bool> g_disable_next_dcc_allocation_reuse_for_test{false};
@@ -2953,18 +2954,29 @@ struct VulkanComputeContext {
                                        uint64_t producer_command_order,
                                        double* watch_ms = nullptr,
                                        bool* watch_had = nullptr,
-                                       bool* watch_rearmed = nullptr) {
+                                       bool* watch_rearmed = nullptr,
+                                       bool require_prearmed_watch = false) {
         const auto found = image_cache.find(key);
         if (found == image_cache.end() || !found->second.content_valid || !found->second.image)
             return false;
+        if (require_prearmed_watch &&
+            (!found->second.write_watch ||
+             found->second.write_watch.query() != prosper::host::GuestWriteWatchQuery::Unchanged)) {
+            // This image's completed writeback armed the retained watch. A later guest writer or
+            // remap must not be blessed by a second rearm at publication: the VkImage still holds
+            // the earlier result. Decline all retained authority and let the next use reseed.
+            invalidate_cached_image_source(key);
+            return false;
+        }
         found->second.graphics_export_snapshot = prosper::gpu::guest_gpu_write_snapshot();
         found->second.graphics_export_command_order = producer_command_order;
         found->second.graphics_export_valid = true;
         const auto watch_start = watch_ms ? std::chrono::steady_clock::now() :
             std::chrono::steady_clock::time_point{};
         const bool had_watch = static_cast<bool>(found->second.write_watch);
-        const bool rearmed = had_watch && found->second.write_watch.rearm();
-        if (had_watch && !rearmed)
+        const bool rearmed = had_watch && !require_prearmed_watch &&
+            found->second.write_watch.rearm();
+        if (had_watch && !rearmed && !require_prearmed_watch)
             found->second.write_watch.reset();
         if (!found->second.write_watch)
             found->second.write_watch = prosper::host::GuestWriteWatch::create(
@@ -3361,8 +3373,12 @@ struct VulkanComputeContext {
                                       uint32_t array_depth = 1,
                                       uint64_t written_layers_mask = ~0ULL,
                                       size_t layer_stride = 0,
-                                      size_t slice_bytes = 0) {
+                                      size_t slice_bytes = 0,
+                                      bool* watch_backed_forced_repair = nullptr) {
         auto found = image_cache.find(key);
+        const bool forced_repair_requested = watch_backed_forced_repair &&
+            *watch_backed_forced_repair;
+        if (watch_backed_forced_repair) *watch_backed_forced_repair = false;
         if (found == image_cache.end()) return;
         CachedComputeImage& cached = found->second;
         const bool source_was_valid = cached.content_valid;
@@ -3427,15 +3443,21 @@ struct VulkanComputeContext {
             cached.write_watch.reset();
         }
         // Export authority is revoked before dispatch, independently of the watch's lifetime.
-        // A successful exportable full writer can retain its registration until publication rearms
-        // it against the completed guest writeback. Resetting it here only makes publication rebuild
-        // the same page registration. Do not rearm early or restore export authority here; failure
-        // cleanup still invalidates the content and discards the watch.
+        // A successful exportable full writer can retain its registration through the dispatch.
+        // Ordinary results rearm at publication; a forced DCC repair rearms immediately after its
+        // own writeback and checks again at publication. Failure cleanup discards the watch.
         if (!source_was_valid) {
             // A failed dispatch/readback may have advanced the retained GPU result while leaving
             // guest memory at the old baseline. The successful repair must replace that invalidated
-            // authority even when the GPU comparator calls the retried result "unchanged".
-            if (current_source)
+            // authority even when the GPU comparator calls the retried result "unchanged". A
+            // retained registration may replace the large exact snapshot only when it rearms
+            // immediately after this image's completed guest writeback. Publication later queries
+            // it without rearming, so intervening writes revoke this image's cache authority.
+            const bool watch_rearmed = forced_repair_requested && cached.write_watch &&
+                cached.write_watch.rearm();
+            if (watch_backed_forced_repair) *watch_backed_forced_repair = watch_rearmed;
+            if (forced_repair_requested && !watch_rearmed) cached.write_watch.reset();
+            if (current_source && !watch_rearmed)
                 remember_image_source_snapshot(
                     cached, current_source, key.guest_bytes, true);
         } else if (result_unchanged) {
@@ -4055,6 +4077,7 @@ struct BoundImage {
     // Exact cached allocation leased for a DCC-unsafe producer. Source authority was invalidated,
     // upload_skipped remains false, and cache publication still waits for post-writeback metadata.
     bool forced_seed_allocation_reused = false;
+    bool watch_backed_snapshot_skip_requested = false;
     bool upload_skipped = false;         // write watch proved the cached source unchanged
     VkDeviceSize allocation_bytes = 0;
     VkDeviceSize staging_allocation_bytes = 0;
@@ -13198,6 +13221,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool final_dcc_cache_safe = bi.dcc_metadata && bi.dcc_metadata_bytes &&
                 std::all_of(bi.dcc_metadata, bi.dcc_metadata + bi.dcc_metadata_bytes,
                             [](uint8_t value) { return value == 0xff; });
+            const auto cache_scan_done = ComputeClock::now();
+            auto cache_before_result = cache_scan_done;
             if (bi.renderer_seeded_result_candidate &&
                 (!r->compression_enabled || final_dcc_cache_safe) &&
                 bi.image && bi.memory && bi.allocation_bytes &&
@@ -13271,12 +13296,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         : 0;
                     const size_t layer_stride = (array_image && r->depth > 1)
                         ? (r->layer_stride_bytes ? r->layer_stride_bytes : selected_slice) : 0;
+                    static const bool watch_backed_snapshot_skip_enabled =
+                        std::getenv("PROSPER_NO_DCC_WATCH_BACKED_SNAPSHOT_SKIP") == nullptr;
+                    bi.watch_backed_snapshot_skip_requested =
+                        bi.forced_seed_allocation_reused &&
+                        watch_backed_snapshot_skip_enabled;
                     ctx.validate_cached_image_source(
                         bi.cache_key, destination, bi.gpu_result_unchanged, !bi.storage_write_only,
                         bi.storage_write_only && bi.native_float_storage && r->img_dim == 2 &&
                             native_3d_transfer_enabled(),
                         bi.graphics_sampled_usage && bi.exact_storage_bytes(),
-                        r->depth, ~0ULL, layer_stride, selected_slice);
+                        r->depth, ~0ULL, layer_stride, selected_slice,
+                        &bi.watch_backed_snapshot_skip_requested);
                 } else if (!bi.persistent && bi.image && bi.memory && bi.allocation_bytes &&
                            ctx.retain_image(bi.cache_key, bi.image, bi.memory,
                                             bi.allocation_bytes,
@@ -13299,6 +13330,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // transfer is pure churn (66.4 MiB for a native 4K RGBA16F target). Unavailable GPU
                 // setup keeps the exact current host fallback; a failed ownership attempt invalidates
                 // any older fallback so the next dispatch takes the ordinary writeback path.
+                cache_before_result = ComputeClock::now();
                 const bool force_host_result_fallback =
                     !renderer_result_retained && bi.persistent &&
                     !bi.result_baseline && bi.exact_result_bytes &&
@@ -13352,6 +13384,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              "in-tail=%u tail-x=%u tail-y=%u tail-bytes=%llu "
                              "map_ms=%.3f prepare_ms=%.3f watch_ms=%.3f "
                              "pack_ms=%.3f layout_ms=%.3f notify_ms=%.3f cache_ms=%.3f "
+                             "cache_dcc_scan_ms=%.3f cache_authority_ms=%.3f cache_result_ms=%.3f "
                              "total_ms=%.3f\n",
                              (unsigned long long)item.code_addr,
                              (unsigned long long)timing_program_hash, bi.binding,
@@ -13369,12 +13402,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              image_milliseconds(pack_done, layout_done),
                              image_milliseconds(notify_start, notify_done),
                              image_milliseconds(notify_done, cache_done),
+                             image_milliseconds(notify_done, cache_scan_done),
+                             image_milliseconds(cache_scan_done, cache_before_result),
+                             image_milliseconds(cache_before_result, cache_done),
                              image_milliseconds(image_writeback_start, image_writeback_done));
         }
         writeback_images_ms = std::chrono::duration<double, std::milli>(
             ComputeClock::now() - writeback_images_start).count();
         if (!readback_ok) break;
         const auto writeback_publish_start = ComputeClock::now();
+        if (g_before_image_publish_observer_for_test)
+            g_before_image_publish_observer_for_test();
         // Every storage image is back in GENERAL, all exact guest writebacks/notifications have
         // completed, and a failed dispatch cannot reach here. Native results may seed a later
         // sampled cache with a device-local copy; exact 2D/3D images created with SAMPLED usage may
@@ -13388,10 +13426,38 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool publish_eligible = native_exact_storage && unique &&
                 image.cache_candidate && image.persistent;
             const auto transfer_start = image_timing ? ComputeClock::now() : ComputeClock::time_point{};
-            const bool authorized = publish_eligible &&
+            const bool graphics_export_candidate = publish_eligible &&
+                !image.renderer_seeded_result_candidate && image.graphics_sampled_usage;
+            if (image.watch_backed_snapshot_skip_requested && !graphics_export_candidate)
+                ctx.invalidate_cached_image_source(image.cache_key);
+            bool authorized = publish_eligible &&
                 ctx.authorize_cached_image_compute_transfer(image.cache_key);
             const double transfer_ms = image_timing
                 ? std::chrono::duration<double, std::milli>(ComputeClock::now() - transfer_start).count()
+                : 0.0;
+            // Renderer-result retention serves the ordered compute handoff. Exporting these
+            // freshly replaced entries to graphics creates/destroys a full guest-page watch on
+            // every dispatch, exceeding the avoided conversion cost in the measured workload. Keep that path
+            // disabled here: compute uses the existing journal (or Windows exact mirror), and
+            // a borrower without current authority falls back to ordinary guest preparation.
+            const auto export_start = image_timing ? ComputeClock::now() : ComputeClock::time_point{};
+            double export_watch_ms = 0.0;
+            bool export_watch_had = false;
+            bool export_watch_rearmed = false;
+            const bool graphics_export_authorized = graphics_export_candidate &&
+                ctx.authorize_cached_image_export(
+                    image.cache_key, item.command_order,
+                    image_timing ? &export_watch_ms : nullptr,
+                    image_timing ? &export_watch_had : nullptr,
+                    image_timing || image.watch_backed_snapshot_skip_requested
+                        ? &export_watch_rearmed : nullptr,
+                    image.watch_backed_snapshot_skip_requested);
+            if (image.watch_backed_snapshot_skip_requested && !graphics_export_authorized) {
+                ctx.invalidate_cached_image_source(image.cache_key);
+                authorized = false;
+            }
+            const double export_ms = image_timing
+                ? std::chrono::duration<double, std::milli>(ComputeClock::now() - export_start).count()
                 : 0.0;
             transfer_gate_census.record_storage_publish(
                 transfer_gate_observation.role, native_exact_storage, unique,
@@ -13403,25 +13469,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         image.resource->gpu_addr, image.guest_bytes),
                     authorized);
             }
-            // Renderer-result retention serves the ordered compute handoff. Exporting these
-            // freshly replaced entries to graphics creates/destroys a full guest-page watch on
-            // every dispatch, exceeding the avoided conversion cost in the measured workload. Keep that path
-            // disabled here: compute uses the existing journal (or Windows exact mirror), and
-            // a borrower without current authority falls back to ordinary guest preparation.
-            const auto export_start = image_timing ? ComputeClock::now() : ComputeClock::time_point{};
-            double export_watch_ms = 0.0;
-            bool export_watch_had = false;
-            bool export_watch_rearmed = false;
-            const bool graphics_export_authorized = publish_eligible &&
-                !image.renderer_seeded_result_candidate && image.graphics_sampled_usage &&
-                ctx.authorize_cached_image_export(
-                    image.cache_key, item.command_order,
-                    image_timing ? &export_watch_ms : nullptr,
-                    image_timing ? &export_watch_had : nullptr,
-                    image_timing ? &export_watch_rearmed : nullptr);
-            const double export_ms = image_timing
-                ? std::chrono::duration<double, std::milli>(ComputeClock::now() - export_start).count()
-                : 0.0;
             // #3307: the producer half of the borrow partition. Without it, a consumer that finds
             // no cache entry cannot tell a producer that declined to publish from a producer that
             // published under a different key.
@@ -14360,6 +14407,11 @@ void live_compute_fail_next_buffer_readback_for_test() {
 void live_compute_set_image_readback_observer_for_test(
     std::function<void(uint32_t, const uint8_t*, size_t)> observer) {
     g_image_readback_observer_for_test = std::move(observer);
+}
+
+void live_compute_set_before_image_publish_observer_for_test(
+    std::function<void()> observer) {
+    g_before_image_publish_observer_for_test = std::move(observer);
 }
 
 void live_compute_fail_next_storage_readback_for_test() {

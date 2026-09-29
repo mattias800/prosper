@@ -3858,6 +3858,8 @@ int main() {
                   "first mapped DCC result establishes cross-submit export authority");
             watch_import = {};
             const auto watch_before = prosper::host::guest_write_watch_stats();
+            const uint64_t warm_snapshots_before =
+                prosper::frontend::live_compute_storage_result_snapshot_bytes();
             std::fill(watch_metadata.begin(), watch_metadata.end(), 0x40);
             CHECK(prosper::frontend::execute_live_compute_items({watch_item}),
                   "warm mapped DCC result completes forced seed and writeback");
@@ -3886,9 +3888,52 @@ int main() {
             CHECK(watch_after.registrations == watch_before.registrations &&
                       watch_after.rearms >= watch_before.rearms + 1,
                   "forced DCC reuse rearms its retained export watch without registering again");
+            CHECK(prosper::frontend::live_compute_storage_result_snapshot_bytes() ==
+                      warm_snapshots_before,
+                  "a clean retained watch replaces the warm forced-DCC source snapshot");
             CHECK(prosper::frontend::import_live_compute_storage_image(
                       watch_sampled, tiled_bytes, watch_import) && watch_import.valid(),
                   "warm mapped DCC export is valid after completed writeback");
+            watch_import = {};
+            bool intervening_store_ran = false;
+            prosper::frontend::live_compute_set_before_image_publish_observer_for_test([&] {
+                intervening_store_ran = true;
+                watch_guest[0] ^= 0xff;
+            });
+            std::fill(watch_metadata.begin(), watch_metadata.end(), 0x40);
+            CHECK(prosper::frontend::execute_live_compute_items({watch_item}) &&
+                      intervening_store_ran,
+                  "direct guest store lands after DCC writeback and before publication");
+            prosper::frontend::live_compute_set_before_image_publish_observer_for_test({});
+            CHECK(!prosper::frontend::import_live_compute_storage_image(
+                      watch_sampled, tiled_bytes, watch_import),
+                  "intervening direct store revokes the older retained DCC result");
+            std::fill(watch_metadata.begin(), watch_metadata.end(), 0x40);
+            CHECK(prosper::frontend::execute_live_compute_items({watch_item}),
+                  "DCC writer repairs authority after intervening direct store");
+            CHECK(prosper::frontend::import_live_compute_storage_image(
+                      watch_sampled, tiled_bytes, watch_import) && watch_import.valid(),
+                  "repaired DCC output may be borrowed across submits");
+            watch_import = {};
+            bool intervening_alias_ran = false;
+            prosper::frontend::live_compute_set_before_image_publish_observer_for_test([&] {
+                intervening_alias_ran = true;
+                prosper::host::guest_write_watch_notify_physical_write(0x719dcc0000ull, 1);
+            });
+            std::fill(watch_metadata.begin(), watch_metadata.end(), 0x40);
+            CHECK(prosper::frontend::execute_live_compute_items({watch_item}) &&
+                      intervening_alias_ran,
+                  "physical-alias notice lands after DCC writeback and before publication");
+            prosper::frontend::live_compute_set_before_image_publish_observer_for_test({});
+            CHECK(!prosper::frontend::import_live_compute_storage_image(
+                      watch_sampled, tiled_bytes, watch_import),
+                  "intervening physical-alias notification revokes the retained DCC result");
+            std::fill(watch_metadata.begin(), watch_metadata.end(), 0x40);
+            CHECK(prosper::frontend::execute_live_compute_items({watch_item}),
+                  "DCC writer repairs authority after physical-alias notification");
+            CHECK(prosper::frontend::import_live_compute_storage_image(
+                      watch_sampled, tiled_bytes, watch_import) && watch_import.valid(),
+                  "alias-notified DCC result can be borrowed after repair");
             watch_import = {};
             watch_guest[0] ^= 0xff;
             CHECK(!prosper::frontend::import_live_compute_storage_image(
@@ -3907,6 +3952,8 @@ int main() {
                     0x3 /* SCE CPU_READ|CPU_WRITE */);
                 std::fill(watch_metadata.begin(), watch_metadata.end(), 0x40);
                 const auto remap_before = prosper::host::guest_write_watch_stats();
+                const uint64_t remap_snapshots_before =
+                    prosper::frontend::live_compute_storage_result_snapshot_bytes();
                 CHECK(prosper::frontend::execute_live_compute_items({watch_item}),
                       "DCC producer repairs the replacement guest mapping");
                 const auto remap_after = prosper::host::guest_write_watch_stats();
@@ -3914,6 +3961,9 @@ int main() {
                 CHECK(watch_linear == img_src &&
                           remap_after.registrations == remap_before.registrations + 1,
                       "remapped DCC target gets exact bytes and a fresh watch registration");
+                CHECK(prosper::frontend::live_compute_storage_result_snapshot_bytes() >=
+                          remap_snapshots_before + tiled_bytes,
+                      "remapped DCC target keeps exact-snapshot fallback after watch refusal");
                 CHECK(prosper::frontend::import_live_compute_storage_image(
                           watch_sampled, tiled_bytes, watch_import) && watch_import.valid(),
                       "replacement DCC mapping authorizes only its completed output");
