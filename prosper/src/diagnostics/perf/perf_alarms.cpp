@@ -98,6 +98,13 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
                 ledger.gpu_memory_off_device[i].load(std::memory_order_relaxed);
         for (size_t i = 0; i < kPresentDeclineSlots; ++i)
             prev_present_declines_[i] = ledger.present_declines[i].load(std::memory_order_relaxed);
+        for (size_t i = 0; i < kRttDestinationRefusalSlots; ++i)
+            prev_rtt_destination_refused_bytes_[i] =
+                ledger.rtt_destination_refused_bytes[i].load(std::memory_order_relaxed);
+        for (size_t i = 0; i < kExactResultDeclineCount; ++i)
+            prev_exact_result_declines_[i] =
+                ledger.exact_result_declines[i].load(std::memory_order_relaxed);
+        for (size_t i = 0; i < kPeakCount; ++i) ledger.peaks[i].store(0, std::memory_order_relaxed);
         for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {
             prev_transfer_bytes_[i] = ext.transfer_bytes[i];
             prev_transfer_calls_[i] = ext.transfer_calls[i];
@@ -149,6 +156,22 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
         w.present_declines[i] = v - prev_present_declines_[i];
         prev_present_declines_[i] = v;
         w.present_decline_names[i] = ledger.present_decline_names[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < kPeakCount; ++i)
+        w.peaks[i] = ledger.peaks[i].exchange(0, std::memory_order_relaxed);
+    for (size_t i = 0; i < kRttDestinationRefusalSlots; ++i) {
+        const uint64_t v = ledger.rtt_destination_refused_bytes[i].load(std::memory_order_relaxed);
+        w.rtt_destination_refused_bytes[i] = v - prev_rtt_destination_refused_bytes_[i];
+        prev_rtt_destination_refused_bytes_[i] = v;
+        w.rtt_destination_refusal_names[i] =
+            ledger.rtt_destination_refusal_names[i].load(std::memory_order_relaxed);
+        if (w.rtt_destination_refusal_names[i]) rtt_destination_refusal_names_[i] =
+            w.rtt_destination_refusal_names[i];
+    }
+    for (size_t i = 0; i < kExactResultDeclineCount; ++i) {
+        const uint64_t v = ledger.exact_result_declines[i].load(std::memory_order_relaxed);
+        w.exact_result_declines[i] = v - prev_exact_result_declines_[i];
+        prev_exact_result_declines_[i] = v;
     }
     for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {
         // A total that went BACKWARDS (a test's fresh source) is a new baseline, not a huge delta.
@@ -336,8 +359,31 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
             json_string(jsonl_, transfer_name(static_cast<Transfer>(i)));
             std::fprintf(jsonl_, ":%llu", (unsigned long long)w.transfer_calls[i]);
         }
-        std::fprintf(jsonl_, "},\"present_slot_trouble_declines\":%llu}\n",
+        std::fprintf(jsonl_, "},\"present_slot_trouble_declines\":%llu",
                      (unsigned long long)present_slot_trouble_declines(w));
+        // 2026-09-29 queue: compute destination refusals (MiB by reason), the colour-target
+        // cache's bounds and window peaks, and the exact full-overwrite shape census.
+        std::fprintf(jsonl_, ",\"rtt_destination_refusals\":%llu,"
+                             "\"rtt_destination_refused_mib\":%.1f,\"rtt_destination_refused_mib_by_reason\":",
+                     n(Counter::RttDestinationRefusals),
+                     n(Counter::RttDestinationRefusedBytes) / (1024.0 * 1024.0));
+        json_counts(jsonl_, rtt_destination_refused_mib(w));
+        std::fprintf(jsonl_, ",\"persistent_target_peak_entries\":%llu,"
+                             "\"persistent_target_entry_limit\":%llu,"
+                             "\"persistent_target_peak_mib\":%.1f,\"persistent_target_limit_mib\":%.1f,"
+                             "\"persistent_target_evictions\":%llu,"
+                             "\"persistent_target_evicted_mib\":%.1f,"
+                             "\"exact_result_candidates\":%llu,\"exact_result_verdicts\":",
+                     (unsigned long long)w.peak(Peak::PersistentTargetEntries),
+                     (unsigned long long)w.gauge(Gauge::PersistentTargetEntryLimit),
+                     w.peak(Peak::PersistentTargetBytes) / (1024.0 * 1024.0),
+                     w.gauge(Gauge::PersistentTargetByteLimit) / (1024.0 * 1024.0),
+                     n(Counter::PersistentTargetEvictions),
+                     n(Counter::PersistentTargetEvictedBytes) / (1024.0 * 1024.0),
+                     n(Counter::ExactResultCandidates));
+        json_counts(jsonl_, ranked(w.exact_result_declines, kExactResultDeclineNames,
+                                   kExactResultDeclineCount));
+        std::fputs("}\n", jsonl_);
         std::fflush(jsonl_);
     }
     return fired;
@@ -374,6 +420,25 @@ bool AlarmEngine::write_summary(FILE* out) const {
         std::fprintf(out, "[perf-alarm] summary: no rule fired in %llu windows of %.1fs "
                           "(%zu of %zu rules had data)\n",
                      (unsigned long long)windows_, config_.window_ns / 1e9, with_data, rules_.size());
+    // Not a rule: the exact full-overwrite shape census over the run (to the last window close),
+    // and the destination refusals behind it -- the funnel a compute result takes to reach the
+    // renderer's device image, printed whether or not anything fired.
+    {
+        const auto verdicts =
+            ranked(prev_exact_result_declines_, kExactResultDeclineNames, kExactResultDeclineCount);
+        const char* names[kRttDestinationRefusalSlots];
+        uint64_t mib[kRttDestinationRefusalSlots];
+        for (size_t i = 0; i < kRttDestinationRefusalSlots; ++i) {
+            names[i] = rtt_destination_refusal_names_[i] ? rtt_destination_refusal_names_[i] : "?";
+            mib[i] = prev_rtt_destination_refused_bytes_[i] >> 20;
+        }
+        const auto refused = ranked(mib, names, kRttDestinationRefusalSlots);
+        if (!verdicts.empty() || !refused.empty())
+            std::fprintf(out, "[perf-alarm] summary: compute results tested for the exact "
+                              "full-overwrite shape, first failing field: %s; destination "
+                              "refusals of accepted results (MiB): %s\n",
+                         top_entries(verdicts, 8).c_str(), top_entries(refused, 6).c_str());
+    }
     if (!no_data.empty())
         std::fprintf(out, "[perf-alarm] summary: NO DATA (not measured in any window, so not "
                           "quiet): %s\n", no_data.c_str());

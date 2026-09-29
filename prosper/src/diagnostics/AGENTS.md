@@ -221,3 +221,18 @@ de-swizzle goes through `detile_surface`, which would otherwise report it as `de
 failed (`publish-failed`, `compute-scanout-unwatched`), per guest flip -- the ledger has no count of
 spans that published, so a flip is the denominator; `test_present_blit_policy` pins the names it
 matches.
+
+**Compute results that miss the renderer image** (#3891, 2026-09-29). `rtt-destination-refused`
+counts `live_compute`'s one destination-borrow refusal site (the same site the exit-only
+`[rtt-destination-refused]` census notes) per guest flip, with MiB by refusal reason: GTA V's heavy
+host-copy regime is one 14 MiB result refused `destination-creation-refused` per flip, and this is
+the rule that names it live. `color-target-count-ceiling` reads the persistent colour-target
+cache's per-window PEAKS (`Peak`, raised where `persistent_target_census` already samples residency,
+reset at every window close) against its two bounds: at the entry-count bound, under half the byte
+budget, and either evicting or refusing a compute creation. The refusal arm is not optional: GTA V's
+costly state sits at exactly 256 of 256 entries with zero evictions, because compute creation never
+evicts. The exit summary also prints a census line (not a rule): each tested compute result's
+FIRST failing field of the exact full-overwrite shape test (`ExactResultDecline`, in
+`exact_full_result`'s order), then the post-shape format declines, then `accepted`; the JSONL window
+carries it as `exact_result_verdicts`. `exact_full_result` is defined as "the verdict is accepted",
+so a new condition in the shape test is added to `exact_result_verdict` with a verdict of its own.

@@ -21,6 +21,9 @@
 //     line's `reasons=` names the top sites, the JSONL alarm record has a `breakdown` object, every
 //     JSONL window has `drop_reasons` / `dispatch_skips` / `host_copy_mib_by_site`, and the exit
 //     summary adds the breakdown summed over every window the rule fired in.
+//   * at exit, also one census line (not a rule): the first failing field of the exact
+//     full-overwrite shape test over every tested compute result, and the destination refusals of
+//     the results that passed it -- printed only when a compute result was ever tested.
 //   * at exit (register_exit_report): one summary line per rule that fired (windows fired, worst
 //     value, when), or a line saying no rule fired in N evaluated windows. The second form exists so
 //     "nothing fired" cannot be confused with "the engine never ran": the latter prints nothing.
@@ -115,6 +118,10 @@ private:
     uint64_t prev_dispatch_skips_[kDispatchSkipCount] = {};
     uint64_t prev_gpu_memory_off_device_[kGpuMemoryClassSlots] = {};
     uint64_t prev_present_declines_[kPresentDeclineSlots] = {};
+    // Also the RUN totals (as of the last window close) the exit summary's census line prints.
+    uint64_t prev_rtt_destination_refused_bytes_[kRttDestinationRefusalSlots] = {};
+    const char* rtt_destination_refusal_names_[kRttDestinationRefusalSlots] = {};
+    uint64_t prev_exact_result_declines_[kExactResultDeclineCount] = {};
     uint64_t prev_transfer_bytes_[WindowSample::kTransferCount] = {};
     uint64_t prev_transfer_calls_[WindowSample::kTransferCount] = {};
     std::vector<const char*> active_;   // rules REPORTED in the most recent window

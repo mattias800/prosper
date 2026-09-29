@@ -95,6 +95,14 @@ enum class Counter : uint8_t {
     TextureValidationFailedBytes,  // guest bytes those failed validations actually read (the
                                    // compare stops at the first differing chunk, so this is the
                                    // compare's cost, not the texture's size)
+    // #3891 queue (2026-09-29), all on event paths:
+    RttDestinationRefusals,        // compute results whose renderer-image destination borrow was
+                                   // refused, so the result went back through a CPU snapshot
+    RttDestinationRefusedBytes,    // staging bytes of those results
+    PersistentTargetEvictions,     // persistent colour targets evicted (census twin, #3872)
+    PersistentTargetEvictedBytes,
+    ExactResultCandidates,         // compute storage-writeback results tested for the exact
+                                   // full-overwrite shape (live_compute's exact_full_result)
     Count
 };
 
@@ -105,6 +113,17 @@ enum class Gauge : uint8_t {
     // Bitmask of DiagnosticPathSwitch: the switches that turned the live renderer's production path
     // (GPU-resident colour targets) off for this run. 0 = production path.
     DiagnosticPathSwitches,
+    // The persistent colour-target cache's two admission bounds (persistent_target_census.hpp).
+    PersistentTargetEntryLimit,
+    PersistentTargetByteLimit,
+    Count
+};
+
+// Per-window HIGH-WATER marks: raised with raise(), taken and reset by the engine at each window
+// close. A last-written gauge cannot say whether a cache touched its bound during a window.
+enum class Peak : uint8_t {
+    PersistentTargetEntries = 0,
+    PersistentTargetBytes,
     Count
 };
 
@@ -230,9 +249,60 @@ constexpr size_t kGpuMemoryClassSlots = 16;
 // must not include; the recorder passes each reason's name as a string literal, stored by pointer.
 constexpr size_t kPresentDeclineSlots = 24;
 
+// Per-reason breakdown of Counter::RttDestinationRefusedBytes: the renderer-image destination
+// borrow's refusal (prosper::gpu::LiveTargetImageImport::Refusal, which this header must not
+// include). The recorder passes the reason's name as a string literal, stored by pointer, and
+// static_asserts that the enum fits.
+constexpr size_t kRttDestinationRefusalSlots = 24;
+
+// WHY a compute storage-writeback result is not an exact, whole, single-level 2D overwrite -- the
+// FIRST failing field of live_compute's exact_full_result, in the order it tests them -- or, for a
+// result of that shape, why it still did not reach the renderer-image destination borrow. One
+// relaxed add per tested result per dispatch. Sonic Frontiers' one-layer 2D_ARRAY decline (#3929,
+// img-dim) and GTA V's R8 snapshots (format-no-seed-path, #3873) were invisible to every census
+// until somebody traced a single address.
+enum class ExactResultDecline : uint8_t {
+    Accepted = 0,          // reached the destination borrow (its refusals: RttDestinationRefused*)
+    AliasedBinding,
+    InexactStorageBytes,
+    PartialWriteMask,
+    MirrorToImported,
+    PriorOutputConflict,
+    FinalOutputConflict,
+    ImageDim,
+    Depth,
+    ArrayLayers,
+    TexelDepth,
+    MipLevels,
+    Samples,
+    MipTail,
+    MipBaseLevel,
+    LayerMipOffset,
+    LinearPitch,
+    LayerStride,
+    ZeroExtent,
+    NoStaging,
+    // Exact shape, but no renderer-image path for the result:
+    FormatUnmapped,        // storage format has no LiveTargetPixelFormat
+    FormatNoSeedPath,      // mapped, but not one of the formats with a storage seed path
+    FormatNotNative,       // RGBA16F not stored natively, or R11G11B10 not packed
+    StagingSizeMismatch,
+    Count
+};
+constexpr size_t kExactResultDeclineCount = static_cast<size_t>(ExactResultDecline::Count);
+// Stable, grepped: never reword casually.
+constexpr const char* kExactResultDeclineNames[kExactResultDeclineCount] = {
+    "accepted", "aliased-binding", "inexact-storage-bytes", "partial-write-mask",
+    "mirror-to-imported", "prior-output-conflict", "final-output-conflict", "img-dim", "depth",
+    "array-layers", "texel-depth", "mip-levels", "samples", "mip-tail", "mip-base-level",
+    "layer-mip-offset", "linear-pitch", "layer-stride", "zero-extent", "no-staging",
+    "format-unmapped", "format-no-seed-path", "format-not-native", "staging-size-mismatch",
+};
+
 constexpr size_t kCostCount = static_cast<size_t>(Cost::Count);
 constexpr size_t kCounterCount = static_cast<size_t>(Counter::Count);
 constexpr size_t kGaugeCount = static_cast<size_t>(Gauge::Count);
+constexpr size_t kPeakCount = static_cast<size_t>(Peak::Count);
 
 struct Ledger {
     std::atomic<uint64_t> cost_ns[kCostCount] = {};
@@ -241,12 +311,16 @@ struct Ledger {
     std::atomic<uint64_t> cost_max_ns[kCostCount] = {};
     std::atomic<uint64_t> counters[kCounterCount] = {};
     std::atomic<uint64_t> gauges[kGaugeCount] = {};
+    std::atomic<uint64_t> peaks[kPeakCount] = {};
     std::atomic<uint64_t> drop_reasons[kDropReasonCount] = {};
     std::atomic<uint64_t> dispatch_skips[kDispatchSkipCount] = {};
     std::atomic<uint64_t> gpu_memory_off_device[kGpuMemoryClassSlots] = {};
     std::atomic<const char*> gpu_memory_class_names[kGpuMemoryClassSlots] = {};
     std::atomic<uint64_t> present_declines[kPresentDeclineSlots] = {};
     std::atomic<const char*> present_decline_names[kPresentDeclineSlots] = {};
+    std::atomic<uint64_t> rtt_destination_refused_bytes[kRttDestinationRefusalSlots] = {};
+    std::atomic<const char*> rtt_destination_refusal_names[kRttDestinationRefusalSlots] = {};
+    std::atomic<uint64_t> exact_result_declines[kExactResultDeclineCount] = {};
     // The one attribution string a cost may carry: which HLE lock blocked, for instance. A pointer
     // to a string literal, stored without copying.
     std::atomic<const char*> cost_label[kCostCount] = {};
@@ -284,6 +358,41 @@ inline void add(Counter c, uint64_t n = 1) {
 
 inline void set(Gauge g, uint64_t v) {
     ledger().gauges[static_cast<size_t>(g)].store(v, std::memory_order_relaxed);
+}
+
+// Raise a per-window high-water mark. A load and a compare when `v` is not a new peak, so it is
+// cheap enough for a site sampled on every cache lookup.
+inline void raise(Peak p, uint64_t v) {
+    std::atomic<uint64_t>& peak = ledger().peaks[static_cast<size_t>(p)];
+    uint64_t seen = peak.load(std::memory_order_relaxed);
+    while (v > seen && !peak.compare_exchange_weak(seen, v, std::memory_order_relaxed)) {}
+}
+
+// A gauge that changes rarely (a configured bound), written only when it changed so a hot caller
+// does not dirty the cache line on every call.
+inline void set_if_changed(Gauge g, uint64_t v) {
+    std::atomic<uint64_t>& gauge = ledger().gauges[static_cast<size_t>(g)];
+    if (gauge.load(std::memory_order_relaxed) != v) gauge.store(v, std::memory_order_relaxed);
+}
+
+// One compute result whose renderer-image destination borrow was refused, with the refusal's name
+// (a string literal) and the result's staging bytes. Bumps both totals, so they and the breakdown
+// can never disagree.
+inline void note_rtt_destination_refusal(size_t slot, const char* name, uint64_t bytes) {
+    if (slot >= kRttDestinationRefusalSlots) return;
+    Ledger& l = ledger();
+    l.rtt_destination_refusal_names[slot].store(name, std::memory_order_relaxed);
+    l.rtt_destination_refused_bytes[slot].fetch_add(bytes, std::memory_order_relaxed);
+    add(Counter::RttDestinationRefusals);
+    add(Counter::RttDestinationRefusedBytes, bytes);
+}
+
+// One compute storage-writeback result tested for the exact full-overwrite shape, with its verdict.
+inline void note_exact_result(ExactResultDecline verdict) {
+    const size_t i = static_cast<size_t>(verdict);
+    if (i >= kExactResultDeclineCount) return;
+    add(Counter::ExactResultCandidates);
+    ledger().exact_result_declines[i].fetch_add(1, std::memory_order_relaxed);
 }
 
 // One dropped draw, with the site's reason. Also bumps the matching coarse counter (frontend,

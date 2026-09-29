@@ -1,6 +1,7 @@
 #include "diagnostics/persistent_target_census.hpp"
 
 #include "diagnostics/exit_census.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"   // color-target-count-ceiling alarm (#3891)
 
 #include <atomic>
 #include <cstdio>
@@ -83,6 +84,8 @@ void note_persistent_target_eviction_attempt() {
 void note_persistent_target_evicted(uint64_t bytes) {
     g_evicted.fetch_add(1, std::memory_order_relaxed);
     g_evicted_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    perf::add(perf::Counter::PersistentTargetEvictions);
+    perf::add(perf::Counter::PersistentTargetEvictedBytes, bytes);
 }
 
 void note_persistent_target_residency(uint64_t entries, uint64_t entry_limit,
@@ -92,6 +95,12 @@ void note_persistent_target_residency(uint64_t entries, uint64_t entry_limit,
     raise_to(g_resident_bytes, bytes);
     g_entry_limit.store(entry_limit, std::memory_order_relaxed);
     g_limit_bytes.store(limit_bytes, std::memory_order_relaxed);
+    // The same sample, per alarm window: the run's high-water mark above cannot say WHEN the
+    // cache sat at its bound, nor whether it was churning then.
+    perf::raise(perf::Peak::PersistentTargetEntries, entries);
+    perf::raise(perf::Peak::PersistentTargetBytes, bytes);
+    perf::set_if_changed(perf::Gauge::PersistentTargetEntryLimit, entry_limit);
+    perf::set_if_changed(perf::Gauge::PersistentTargetByteLimit, limit_bytes);
 }
 
 }  // namespace prosper::diagnostics
