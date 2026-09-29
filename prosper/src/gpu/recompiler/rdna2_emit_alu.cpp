@@ -5585,7 +5585,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                     ? "none"
                                     : ("0x" + std::to_string(srt_it->second)).c_str());
                     }
-                    for (uint32_t k = 0; k < n; k++) rs.sreg[in.dst.value + (int)k] = b.uconst(0);
+                    for (uint32_t k = 0; k < n; k++) {
+                        const int dst = in.dst.value + static_cast<int>(k);
+                        rs.sreg[dst] = b.uconst(0);
+                        rs.sreg_srt.erase(dst); // a new descriptor cannot inherit an older tag
+                    }
                     return true;
                 }
                 bool tracked = false;

@@ -1206,6 +1206,22 @@ int main() {
                              raw_x4_register_numeric.size(), 1, 0,
                              &raw_x4_numeric_rt).empty(),
           "exact-PC register-offset descriptor shader compiles but a numeric reader still rejects");
+    const std::array<uint32_t, 9> raw_x4_register_stale_tag = {
+        0xf4080600u, 0xfa000020u, // pc0: immediate x4 tags s[24:27] with SRT offset 0x20
+        0xbe940380u,              // pc2: s20=0, register SOFFSET
+        0xf4080600u, 0x28000000u, // pc3: reload s[24:27] from a different descriptor
+        0x8f1c8118u,              // pc5: dead s28=s24<<1 makes the old lifetime need proof
+        0xe0302000u, 0x80060404u, // pc6: no exact-PC resource for this buffer fetch
+        0xbf810000u,
+    };
+    ShaderResourceTable raw_x4_stale_tag_rt = raw_x4_register_rt;
+    raw_x4_stale_tag_rt.resources[0].fetch_pc = UINT32_MAX;
+    raw_x4_stale_tag_rt.resources[0].srt_offset = 0x20u;
+    CHECK(raw_wide_data_pcs(raw_x4_register_stale_tag).empty() &&
+              recompile_valu(raw_x4_register_stale_tag.data(),
+                             raw_x4_register_stale_tag.size(), 1, 0,
+                             &raw_x4_stale_tag_rt).empty(),
+          "register-offset reload clears stale SRT tags; missing exact-PC resource rejects");
     const std::array<uint32_t, 7> raw_x4_copy_bypass_clobber = {
         0xf4080100u, 0xfa000020u, // x4 s[4:7]
         0xbe940304u,              // s_mov_b32 s20,s4
