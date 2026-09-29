@@ -3,6 +3,7 @@
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/capture/gpu_capture.hpp"
+#include "diagnostics/env_cache.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/resources/image_identity.hpp"
@@ -3788,6 +3789,8 @@ int main() {
         // Exact current inputs are preserved on the first dispatch too. Completed writeback can
         // immediately promote its exact image; compressed metadata on the next dispatch still
         // forces a fresh seed before re-publishing authority.
+        const bool direct_detile_opt_out =
+            PROSPER_ENV_ON("PROSPER_NO_DIRECT_STORAGE_DETILE");
         const uint64_t promotions_before =
             prosper::frontend::live_compute_dcc_post_writeback_promotions();
         const uint64_t direct_detile_before =
@@ -3805,7 +3808,7 @@ int main() {
               "successful exact DCC writeback re-publishes its forcibly seeded image");
         const uint64_t direct_detile_after =
             prosper::frontend::live_compute_direct_storage_detile_bytes();
-        if (std::getenv("PROSPER_NO_DIRECT_STORAGE_DETILE"))
+        if (direct_detile_opt_out)
             CHECK(direct_detile_after == direct_detile_before,
                   "storage direct-detile opt-out keeps the staging-copy control");
         else
@@ -3845,7 +3848,7 @@ int main() {
               "half-width DCC writer executes after guest seed changes");
         const uint64_t partial_direct_after =
             prosper::frontend::live_compute_direct_storage_detile_bytes();
-        if (std::getenv("PROSPER_NO_DIRECT_STORAGE_DETILE"))
+        if (direct_detile_opt_out)
             CHECK(partial_direct_after == partial_direct_before,
                   "half-width writer honors direct-detile opt-out");
         else
