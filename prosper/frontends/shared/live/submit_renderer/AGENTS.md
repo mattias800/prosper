@@ -22,11 +22,20 @@ itself still lives in `live_renderer.cpp` and still owns all the state.
   into the submit's `RenderTiming`) and the `PROSPER_RTT_TIMING` record formatters.
 - `per_target_passes.{hpp,cpp}` — `render_per_target_passes`: the `PROSPER_RTT` per-target pass
   loop (pass grouping, MRT, RTT publication, and choosing the present candidate among its passes).
-  The scanout resolution and GPU scanout publish that follow it still live in the callback.
+- `mrt_slots.hpp` — the pass loop's MRT slot queries (`color_binding`, `active_format`,
+  `active_color`, `active_color_count`), shared by the loop and the MRT census.
+- `final_span_present.{hpp,cpp}` — `select_final_span_present`: at a submit's final render span,
+  GPU-present the flipped front buffer (or its compute-scanout mirror) and name any decline, else
+  choose the CPU fallback frame (a cached scanout target, the guest's own display buffer, or the
+  retained frame) and report a present-extent shortfall. It orchestrates the pieces in
+  `../../present/` over the renderer's state; the present decisions themselves live there.
+- `single_framebuffer.{hpp,cpp}` — `render_single_framebuffer`: the non-`PROSPER_RTT` path, every
+  draw into one framebuffer. The RTT store after it stays in the callback.
 - `resolve_pass.{hpp,cpp}` — `resolve_pass`: one `CB_COLOR_CONTROL.MODE=RESOLVE` pass, a copy of
   colour0 into colour1's retained target. The pass loop's `continue` stays at the call site.
 - `pass_diagnostics.{hpp,cpp}` — the pass loop's `PROSPER_*` diagnostic blocks (readback reasons,
-  resource and draw-step hashes, pass/RT-group/persistent-target dumps, the pass logs).
+  resource and draw-step hashes, pass/RT-group/persistent-target dumps, the pass logs, the MRT
+  census).
 - `callback_prelude.{hpp,cpp}` — per-callback setup work: `load_shader_overrides` (the REFVS /
   TESTPS / FS_SPV / SKIP_DRAW overrides, one `ShaderOverrides` value that `BackendDrawContext`
   refers to) and `materialize_dirty_dcc_clears`.
@@ -37,7 +46,10 @@ itself still lives in `live_renderer.cpp` and still owns all the state.
 that is a `PROSPER_*` test moves with it, so `tools/env/check_diag_gates.py` still sees the gate
 next to the report it arms (the scanner is per-file and lexical, and does not follow a gate across
 a call). A gate that is a value of the calling code (`rtt_log`, a hash extent) stays at the call
-site, so a false gate builds no context and makes no call.
+site, so a false gate builds no context and makes no call. When such a gate sits inside the region
+being moved, end the region before it: the scanner does not follow `auto& x = ctx.x` (#3919), so
+moving a `rtt_log` report makes its row vanish. That is why the single-framebuffer RTT store and
+its `PROSPER_RTTLOG` report stay in the callback.
 
 **How a piece talks to the callback.** Each extracted function takes a `*Context` struct of
 references, one per callback object it touches. The callback builds it once per callback, so the

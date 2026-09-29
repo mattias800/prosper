@@ -371,6 +371,9 @@ uint64_t live_compute_dcc_post_writeback_promotions();
 // Monotonic witnesses for the compressed-producer allocation path. An exact unpinned entry can be
 // forcibly reseeded in place; all other cases retain the post-writeback replacement fallback.
 uint64_t live_compute_dcc_forced_seed_allocation_reuses();
+// Monotonic guest-linear bytes detiled directly into mapped storage-image staging. The next
+// Vulkan upload still occurs; only the intermediate CPU scratch-to-staging copy is omitted.
+uint64_t live_compute_direct_storage_detile_bytes();
 uint64_t live_compute_dcc_post_writeback_replacements();
 // Query the initialized live backend for the exact typed 3D storage+transfer image contract. Tests
 // use this to exercise native-volume execution only on devices that can create the Vulkan image.
@@ -401,6 +404,9 @@ void live_compute_fail_next_storage_readback_for_test();
 // the callback cannot change ownership or authorize guest content and must not retain the pointer.
 void live_compute_set_image_readback_observer_for_test(
     std::function<void(uint32_t, const uint8_t*, size_t)> observer);
+// Quiescent test fixture only. Runs after completed image writebacks and before cache publication,
+// so a guest write in this interval must revoke retained image authority.
+void live_compute_set_before_image_publish_observer_for_test(std::function<void()> observer);
 // Consume only after a writable-buffer GPU dispatch completes, before guest publication.
 void live_compute_fail_next_buffer_readback_for_test();
 // Inject an optional conversion-admission result; does not fail an actual driver call.

@@ -531,8 +531,111 @@ int main() {
     // A physical-write notification (GPU write) invalidates too.
     CHECK(watch.rearm(), "rearm before physical-write test");
     CHECK(watch.query() == GuestWriteWatchQuery::Unchanged, "clean before physical write");
+    GuestWriteWatch adjacent_physical = GuestWriteWatch::create(
+        reinterpret_cast<uint64_t>(a), page);
+    CHECK(adjacent_physical && adjacent_physical.query() == GuestWriteWatchQuery::Unchanged,
+          "adjacent physical page watch starts clean");
+    const auto physical_before = prosper::host::guest_write_watch_stats();
     prosper::host::guest_write_watch_notify_physical_write(kPhys + page, page);
+    const auto physical_after = prosper::host::guest_write_watch_stats();
     CHECK(watch.query() == GuestWriteWatchQuery::Dirty, "physical write marks the watch Dirty");
+    CHECK(adjacent_physical.query() == GuestWriteWatchQuery::Unchanged,
+          "half-open physical notification leaves adjacent page clean");
+    adjacent_physical.reset();
+    const bool force_physical_scan = std::getenv("PROSPER_WATCH_FORCE_PHYSICAL_SCAN") != nullptr;
+    CHECK(physical_after.phys_pages_hit - physical_before.phys_pages_hit == 1,
+          "physical notification keeps the exact one-page overlap");
+    CHECK(physical_after.phys_index_calls - physical_before.phys_index_calls ==
+              static_cast<uint64_t>(!force_physical_scan) &&
+          physical_after.phys_scan_calls - physical_before.phys_scan_calls ==
+              static_cast<uint64_t>(force_physical_scan),
+          "bounded physical notification takes the selected lookup policy");
+    CHECK(force_physical_scan
+              ? physical_after.phys_scan_pages - physical_before.phys_scan_pages >= 4
+              : physical_after.phys_index_pages - physical_before.phys_index_pages == 1,
+          "selected physical path counts its actual candidate pages");
+
+    // A diagnostic mapping may declare an unaligned physical key. The page-step lookup cannot
+    // find it, so it must fall back to the original exact walk; removal must restore admission.
+    const int unaligned_fd = memfd_create("prosper-ww-unaligned-phys", 0);
+    const bool unaligned_sized =
+        unaligned_fd >= 0 && ftruncate(unaligned_fd, static_cast<off_t>(page)) == 0;
+    CHECK(unaligned_sized, "unaligned-physical fixture sized");
+    if (unaligned_sized) {
+        auto* unaligned = static_cast<uint8_t*>(mmap(
+            nullptr, page, PROT_READ | PROT_WRITE, MAP_SHARED, unaligned_fd, 0));
+        CHECK(unaligned != MAP_FAILED, "unaligned-physical fixture mapped");
+        if (unaligned != MAP_FAILED) {
+            constexpr uint64_t kUnalignedPhys = 0x90001;
+            const uint64_t unaligned_va = reinterpret_cast<uint64_t>(unaligned);
+            prosper::host::guest_write_watch_notify_direct_mapping_added(
+                unaligned_va, page, kUnalignedPhys, kCpuRw);
+            GuestWriteWatch unaligned_watch = GuestWriteWatch::create(unaligned_va, page);
+            CHECK(static_cast<bool>(unaligned_watch), "unaligned-physical watch created");
+            if (unaligned_watch) {
+                const auto before = prosper::host::guest_write_watch_stats();
+                prosper::host::guest_write_watch_notify_physical_write(
+                    kUnalignedPhys + 16, 1);
+                const auto after = prosper::host::guest_write_watch_stats();
+                CHECK(unaligned_watch.query() == GuestWriteWatchQuery::Dirty &&
+                      after.phys_scan_calls > before.phys_scan_calls &&
+                      after.phys_pages_hit > before.phys_pages_hit,
+                      "unaligned physical key is found by the exact fallback");
+                unaligned_watch.reset();
+            }
+            prosper::host::guest_write_watch_notify_direct_mapping_removed(unaligned_va, page);
+            munmap(unaligned, page);
+        }
+    }
+    if (unaligned_fd >= 0) close(unaligned_fd);
+    CHECK(watch.rearm(), "rearm after unaligned physical fixture removal");
+    const auto restored_before = prosper::host::guest_write_watch_stats();
+    prosper::host::guest_write_watch_notify_physical_write(kPhys + page, 1);
+    const auto restored_after = prosper::host::guest_write_watch_stats();
+    CHECK(restored_after.phys_index_calls - restored_before.phys_index_calls ==
+              static_cast<uint64_t>(!force_physical_scan),
+          "releasing unaligned key restores bounded lookup admission");
+
+    // Cross a physical page boundary by two bytes. Both touched pages must be found by the
+    // bounded lookup, while a watch on the next page must remain clean.
+    CHECK(watch.rearm(), "rearm before two-page physical notification");
+    GuestWriteWatch physical_left = GuestWriteWatch::create(
+        reinterpret_cast<uint64_t>(a + page), page);
+    GuestWriteWatch physical_right = GuestWriteWatch::create(
+        reinterpret_cast<uint64_t>(a + page * 2), page);
+    GuestWriteWatch physical_outside = GuestWriteWatch::create(
+        reinterpret_cast<uint64_t>(a + page * 3), page);
+    CHECK(physical_left && physical_right && physical_outside,
+          "two-page physical fixture watches created");
+    CHECK(physical_left.query() == GuestWriteWatchQuery::Unchanged &&
+              physical_right.query() == GuestWriteWatchQuery::Unchanged &&
+              physical_outside.query() == GuestWriteWatchQuery::Unchanged,
+          "two-page physical fixture starts clean");
+    const auto two_page_before = prosper::host::guest_write_watch_stats();
+    prosper::host::guest_write_watch_notify_physical_write(kPhys + page * 2 - 1, 2);
+    const auto two_page_after = prosper::host::guest_write_watch_stats();
+    CHECK(physical_left.query() == GuestWriteWatchQuery::Dirty &&
+              physical_right.query() == GuestWriteWatchQuery::Dirty &&
+              physical_outside.query() == GuestWriteWatchQuery::Unchanged,
+          "two-page notification dirties both touched pages but not the next page");
+    CHECK(two_page_after.phys_pages_hit - two_page_before.phys_pages_hit == 2,
+          "two-page notification preserves exact half-open overlap");
+    CHECK(force_physical_scan
+              ? two_page_after.phys_scan_calls - two_page_before.phys_scan_calls == 1
+              : two_page_after.phys_index_calls - two_page_before.phys_index_calls == 1 &&
+                    two_page_after.phys_index_pages - two_page_before.phys_index_pages == 2,
+          "two-page notification takes the selected lookup policy over both pages");
+    physical_left.reset();
+    physical_right.reset();
+    physical_outside.reset();
+    CHECK(watch.rearm(), "rearm before broad physical notification");
+    const auto broad_before = prosper::host::guest_write_watch_stats();
+    prosper::host::guest_write_watch_notify_physical_write(kPhys, 512ull * 1024 * 1024);
+    const auto broad_after = prosper::host::guest_write_watch_stats();
+    CHECK(watch.query() == GuestWriteWatchQuery::Dirty &&
+          broad_after.phys_scan_calls > broad_before.phys_scan_calls &&
+          broad_after.phys_pages_hit - broad_before.phys_pages_hit >= 4,
+          "broad physical notification retains the exact full-scan fallback");
 
     // B2: an alias mapped AFTER the watch is armed must be armed too, or a write through it would not
     // fault and the watch would wrongly read Unchanged (stale texture). notify_direct_mapping_added must

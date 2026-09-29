@@ -3,6 +3,7 @@
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/capture/gpu_capture.hpp"
+#include "diagnostics/env_cache.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/resources/image_identity.hpp"
@@ -3788,8 +3789,12 @@ int main() {
         // Exact current inputs are preserved on the first dispatch too. Completed writeback can
         // immediately promote its exact image; compressed metadata on the next dispatch still
         // forces a fresh seed before re-publishing authority.
+        const bool direct_detile_opt_out =
+            PROSPER_ENV_ON("PROSPER_NO_DIRECT_STORAGE_DETILE");
         const uint64_t promotions_before =
             prosper::frontend::live_compute_dcc_post_writeback_promotions();
+        const uint64_t direct_detile_before =
+            prosper::frontend::live_compute_direct_storage_detile_bytes();
         CHECK(prosper::frontend::execute_live_compute_items({dcc_item}),
               "live backend preserves inputs while writing the tiled DCC storage image");
         CHECK(prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
@@ -3801,6 +3806,14 @@ int main() {
         CHECK(prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
                   promotions_before + 2,
               "successful exact DCC writeback re-publishes its forcibly seeded image");
+        const uint64_t direct_detile_after =
+            prosper::frontend::live_compute_direct_storage_detile_bytes();
+        if (direct_detile_opt_out)
+            CHECK(direct_detile_after == direct_detile_before,
+                  "storage direct-detile opt-out keeps the staging-copy control");
+        else
+            CHECK(direct_detile_after >= direct_detile_before + 2u * W * 4u,
+                  "exact tiled storage output detiles directly into mapped staging");
         std::vector<uint8_t> dcc_linear(W * 4, 0);
         detile_surface(dcc_linear.data(), tiled_dst.data(), W, 1, dcc_tile, 0, 4);
         CHECK(dcc_linear == img_src,
@@ -3808,6 +3821,225 @@ int main() {
         CHECK(std::all_of(dcc_metadata.begin(), dcc_metadata.end(),
                           [](uint8_t code) { return code == 0xff; }),
               "DCC storage writeback publishes uniform uncompressed metadata");
+
+        // A full-width copy proves the direct path ran, but cannot prove its staged seed was
+        // correct: the shader overwrites every texel. Launch only half a row with the same
+        // writable descriptor, then check that the untouched half survives guest writeback.
+        // This catches both an omitted detile and a detile into the wrong staging allocation.
+        std::vector<uint8_t> partial_seed(W * 4);
+        for (size_t i = 0; i < partial_seed.size(); ++i)
+            partial_seed[i] = static_cast<uint8_t>(i * 19u + 17u);
+        tile_surface(tiled_dst.data(), partial_seed.data(), W, 1, dcc_tile, 0, 4);
+        std::fill(dcc_metadata.begin(), dcc_metadata.end(), 0x40);
+        ComputeShaderConfig partial_config = dcc_config;
+        partial_config.local_x = W / 2;
+        partial_config.threads_x = W / 2;
+        ComputeItem partial_item = dcc_item;
+        partial_item.spirv = recompile_compute(
+            image_copy_2d, std::size(image_copy_2d), &dcc_rt, partial_config);
+        partial_item.launch.local_x = W / 2;
+        partial_item.launch.threads_x = W / 2;
+        partial_item.code_addr = 0x719dce;
+        CHECK(!partial_item.spirv.empty(),
+              "half-width DCC writer recompiles with the same exact storage binding");
+        const uint64_t partial_direct_before =
+            prosper::frontend::live_compute_direct_storage_detile_bytes();
+        CHECK(prosper::frontend::execute_live_compute_items({partial_item}),
+              "half-width DCC writer executes after guest seed changes");
+        const uint64_t partial_direct_after =
+            prosper::frontend::live_compute_direct_storage_detile_bytes();
+        if (direct_detile_opt_out)
+            CHECK(partial_direct_after == partial_direct_before,
+                  "half-width writer honors direct-detile opt-out");
+        else
+            CHECK(partial_direct_after >= partial_direct_before + W * 4u,
+                  "half-width writer exercises direct detile into staging");
+        detile_surface(dcc_linear.data(), tiled_dst.data(), W, 1, dcc_tile, 0, 4);
+        std::vector<uint8_t> partial_expected = partial_seed;
+        std::copy_n(img_src.begin(), W / 2 * 4u, partial_expected.begin());
+        CHECK(dcc_linear == partial_expected,
+              "half-width DCC write preserves guest-seeded texels outside the dispatch");
+
+#if defined(__linux__)
+        // The vector-backed DCC checks below cannot arm a guest page watch. Use an exact mapped
+        // target to exercise the Astro shape: an old, exported DCC result is forcibly seeded into
+        // its own allocation before the next producer, then exported after completed writeback.
+        const size_t watch_mapping_bytes = (tiled_bytes + 4095u) & ~size_t{4095u};
+        auto* watch_guest = static_cast<uint8_t*>(mmap(
+            nullptr, watch_mapping_bytes, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        CHECK(watch_guest != MAP_FAILED, "allocate mapped DCC export target");
+        if (watch_guest != MAP_FAILED) {
+            std::memset(watch_guest, 0x73, watch_mapping_bytes);
+            prosper::host::guest_write_watch_set_fault_onstack(true);
+            const uint64_t watch_addr = reinterpret_cast<uint64_t>(watch_guest);
+            prosper::host::guest_write_watch_notify_direct_mapping_added(
+                watch_addr, watch_mapping_bytes, 0x719dcc0000ull,
+                0x3 /* SCE CPU_READ|CPU_WRITE */);
+            std::vector<uint8_t> watch_metadata(metadata_bytes, 0x40);
+            ShaderResourceTable watch_rt = dcc_rt;
+            ShaderResource watch_sampled;
+            for (ShaderResource& resource : watch_rt.resources) {
+                if (resource.binding != 5) continue;
+                resource.gpu_addr = watch_addr;
+                resource.dcc_metadata_host_data = watch_metadata.data();
+                watch_sampled = resource;
+            }
+            watch_sampled.cls = ResourceClass::Texture;
+            ComputeItem watch_item = dcc_item;
+            watch_item.resources = std::make_shared<ShaderResourceTable>(watch_rt);
+            watch_item.code_addr = 0x719dcf;
+            set_metadata_kind_query([&](const MetadataKindRequest& request) {
+                for (const ShaderResource& resource : watch_rt.resources)
+                    if (resource.binding == 5 && request.resource_addr == resource.gpu_addr &&
+                        request.metadata_addr == resource.metadata_addr &&
+                        request.format == resource.format &&
+                        request.num_components == resource.num_components &&
+                        request.img_dim == resource.img_dim)
+                        return CompressionMetadataKind::Dcc;
+                return CompressionMetadataKind::Unknown;
+            });
+            const uint64_t watch_reuses_before =
+                prosper::frontend::live_compute_dcc_forced_seed_allocation_reuses();
+            CHECK(prosper::frontend::execute_live_compute_items({watch_item}),
+                  "first mapped DCC result completes guest and metadata writeback");
+            prosper::frontend::LiveComputeImageImport watch_import;
+            CHECK(prosper::frontend::import_live_compute_storage_image(
+                      watch_sampled, tiled_bytes, watch_import) && watch_import.valid(),
+                  "first mapped DCC result establishes cross-submit export authority");
+            watch_import = {};
+            const auto watch_before = prosper::host::guest_write_watch_stats();
+            const uint64_t warm_snapshots_before =
+                prosper::frontend::live_compute_storage_result_snapshot_bytes();
+            std::fill(watch_metadata.begin(), watch_metadata.end(), 0x40);
+            CHECK(prosper::frontend::execute_live_compute_items({watch_item}),
+                  "warm mapped DCC result completes forced seed and writeback");
+            const auto watch_after = prosper::host::guest_write_watch_stats();
+            std::vector<uint8_t> watch_linear(W * 4, 0);
+            detile_surface(watch_linear.data(), watch_guest, W, 1, dcc_tile, 0, 4);
+            CHECK(watch_linear == img_src &&
+                      std::all_of(watch_metadata.begin(), watch_metadata.end(),
+                                  [](uint8_t code) { return code == 0xff; }),
+                  "warm mapped DCC result preserves exact guest data and resolved metadata");
+            CHECK(prosper::frontend::live_compute_dcc_forced_seed_allocation_reuses() ==
+                      watch_reuses_before + 1,
+                  "mapped DCC test reaches forced exact-key allocation reuse");
+            // The sampled vector input can attempt its own unwatchable registration during this
+            // dispatch. Count successful registrations instead of process-wide attempts.
+            if (watch_after.registrations != watch_before.registrations ||
+                watch_after.rearms < watch_before.rearms + 1)
+                std::printf("mapped DCC watch: create %llu -> %llu, rearm %llu -> %llu, "
+                            "registrations %llu -> %llu\n",
+                            static_cast<unsigned long long>(watch_before.create_attempts),
+                            static_cast<unsigned long long>(watch_after.create_attempts),
+                            static_cast<unsigned long long>(watch_before.rearms),
+                            static_cast<unsigned long long>(watch_after.rearms),
+                            static_cast<unsigned long long>(watch_before.registrations),
+                            static_cast<unsigned long long>(watch_after.registrations));
+            CHECK(watch_after.registrations == watch_before.registrations &&
+                      watch_after.rearms >= watch_before.rearms + 1,
+                  "forced DCC reuse rearms its retained export watch without registering again");
+            if (adaptive_storage_result_validation_enabled)
+                CHECK(prosper::frontend::live_compute_storage_result_snapshot_bytes() ==
+                          warm_snapshots_before,
+                      "a clean retained watch replaces the warm forced-DCC source snapshot");
+            CHECK(prosper::frontend::import_live_compute_storage_image(
+                      watch_sampled, tiled_bytes, watch_import) && watch_import.valid(),
+                  "warm mapped DCC export is valid after completed writeback");
+            watch_import = {};
+            if (adaptive_storage_result_validation_enabled) {
+                bool intervening_store_ran = false;
+                prosper::frontend::live_compute_set_before_image_publish_observer_for_test([&] {
+                    intervening_store_ran = true;
+                    watch_guest[0] ^= 0xff;
+                });
+                std::fill(watch_metadata.begin(), watch_metadata.end(), 0x40);
+                CHECK(prosper::frontend::execute_live_compute_items({watch_item}) &&
+                          intervening_store_ran,
+                      "direct guest store lands after DCC writeback and before publication");
+                prosper::frontend::live_compute_set_before_image_publish_observer_for_test({});
+                CHECK(!prosper::frontend::import_live_compute_storage_image(
+                          watch_sampled, tiled_bytes, watch_import),
+                      "intervening direct store revokes the older retained DCC result");
+                std::fill(watch_metadata.begin(), watch_metadata.end(), 0x40);
+                CHECK(prosper::frontend::execute_live_compute_items({watch_item}),
+                      "DCC writer repairs authority after intervening direct store");
+                CHECK(prosper::frontend::import_live_compute_storage_image(
+                          watch_sampled, tiled_bytes, watch_import) && watch_import.valid(),
+                      "repaired DCC output may be borrowed across submits");
+                watch_import = {};
+                bool intervening_alias_ran = false;
+                prosper::frontend::live_compute_set_before_image_publish_observer_for_test([&] {
+                    intervening_alias_ran = true;
+                    prosper::host::guest_write_watch_notify_physical_write(0x719dcc0000ull, 1);
+                });
+                std::fill(watch_metadata.begin(), watch_metadata.end(), 0x40);
+                CHECK(prosper::frontend::execute_live_compute_items({watch_item}) &&
+                          intervening_alias_ran,
+                      "physical-alias notice lands after DCC writeback and before publication");
+                prosper::frontend::live_compute_set_before_image_publish_observer_for_test({});
+                CHECK(!prosper::frontend::import_live_compute_storage_image(
+                          watch_sampled, tiled_bytes, watch_import),
+                      "intervening physical-alias notification revokes the retained DCC result");
+                std::fill(watch_metadata.begin(), watch_metadata.end(), 0x40);
+                CHECK(prosper::frontend::execute_live_compute_items({watch_item}),
+                      "DCC writer repairs authority after physical-alias notification");
+                CHECK(prosper::frontend::import_live_compute_storage_image(
+                          watch_sampled, tiled_bytes, watch_import) && watch_import.valid(),
+                      "alias-notified DCC result can be borrowed after repair");
+                watch_import = {};
+            }
+            watch_guest[0] ^= 0xff;
+            CHECK(!prosper::frontend::import_live_compute_storage_image(
+                      watch_sampled, tiled_bytes, watch_import),
+                  "CPU store revokes the warm DCC export after watch retention");
+            prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                watch_addr, watch_mapping_bytes);
+            void* replacement = mmap(watch_guest, watch_mapping_bytes,
+                                     PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            CHECK(replacement == watch_guest,
+                  "replace mapped DCC target at the same guest address");
+            if (replacement == watch_guest) {
+                prosper::host::guest_write_watch_notify_direct_mapping_added(
+                    watch_addr, watch_mapping_bytes, 0x719dce0000ull,
+                    0x3 /* SCE CPU_READ|CPU_WRITE */);
+                std::fill(watch_metadata.begin(), watch_metadata.end(), 0x40);
+                const auto remap_before = prosper::host::guest_write_watch_stats();
+                const uint64_t remap_snapshots_before =
+                    prosper::frontend::live_compute_storage_result_snapshot_bytes();
+                CHECK(prosper::frontend::execute_live_compute_items({watch_item}),
+                      "DCC producer repairs the replacement guest mapping");
+                const auto remap_after = prosper::host::guest_write_watch_stats();
+                detile_surface(watch_linear.data(), watch_guest, W, 1, dcc_tile, 0, 4);
+                CHECK(watch_linear == img_src &&
+                          remap_after.registrations == remap_before.registrations + 1,
+                      "remapped DCC target gets exact bytes and a fresh watch registration");
+                CHECK(prosper::frontend::live_compute_storage_result_snapshot_bytes() >=
+                          remap_snapshots_before + tiled_bytes,
+                      "remapped DCC target keeps exact-snapshot fallback after watch refusal");
+                CHECK(prosper::frontend::import_live_compute_storage_image(
+                          watch_sampled, tiled_bytes, watch_import) && watch_import.valid(),
+                      "replacement DCC mapping authorizes only its completed output");
+                watch_import = {};
+                prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                    watch_addr, watch_mapping_bytes);
+            }
+            CHECK(munmap(watch_guest, watch_mapping_bytes) == 0,
+                  "release mapped DCC export target");
+            prosper::host::guest_write_watch_set_fault_onstack(false);
+            set_metadata_kind_query([&](const MetadataKindRequest& request) {
+                for (const ShaderResource& resource : dcc_rt.resources)
+                    if (resource.binding == 5 && request.resource_addr == resource.gpu_addr &&
+                        request.metadata_addr == resource.metadata_addr &&
+                        request.format == resource.format &&
+                        request.num_components == resource.num_components &&
+                        request.img_dim == resource.img_dim)
+                        return CompressionMetadataKind::Dcc;
+                return CompressionMetadataKind::Unknown;
+            });
+        }
+#endif
 
         // Consume the just-published target through an ordinary sampled descriptor.  Guest bytes
         // are the correctness oracle; the monotonic seed counter independently proves that the

@@ -2577,7 +2577,12 @@ endif()
   if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_guest_write_watch tests/host/memory/test_guest_write_watch.cpp)
     target_link_libraries(test_guest_write_watch PRIVATE prosper_core)
-    add_test(NAME guest_write_watch COMMAND test_guest_write_watch)
+    add_test(NAME guest_write_watch
+             COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_FORCE_PHYSICAL_SCAN
+                     $<TARGET_FILE:test_guest_write_watch>)
+    add_test(NAME guest_write_watch_forced_physical_scan
+             COMMAND ${CMAKE_COMMAND} -E env PROSPER_WATCH_FORCE_PHYSICAL_SCAN=1
+                     $<TARGET_FILE:test_guest_write_watch>)
     add_executable(test_guest_write_watch_index tests/host/memory/test_guest_write_watch_index.cpp)
     target_link_libraries(test_guest_write_watch_index PRIVATE prosper_core)
     # Two arms, and the environment is armed HERE rather than by a setenv inside main():
@@ -2592,9 +2597,11 @@ endif()
     add_test(NAME guest_write_watch_index
              COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_QUERY_AUDIT
                      --unset=PROSPER_WATCH_LEGACY_SCAN
+                     --unset=PROSPER_WATCH_FORCE_ALIAS_SCAN
                      $<TARGET_FILE:test_guest_write_watch_index>)
     add_test(NAME guest_write_watch_index_audit
              COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_LEGACY_SCAN
+                     --unset=PROSPER_WATCH_FORCE_ALIAS_SCAN
                      PROSPER_WATCH_QUERY_AUDIT=1
                      $<TARGET_FILE:test_guest_write_watch_index>)
     # Third arm (#3681): the complete scan the index replaced. Until this existed the fallback had no
@@ -2605,7 +2612,13 @@ endif()
     # assertions, opposite assertions about registrations visited.
     add_test(NAME guest_write_watch_index_legacy_scan
              COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_QUERY_AUDIT
+                     --unset=PROSPER_WATCH_FORCE_ALIAS_SCAN
                      PROSPER_WATCH_LEGACY_SCAN=1
+                     $<TARGET_FILE:test_guest_write_watch_index>)
+    add_test(NAME guest_write_watch_index_forced_alias_scan
+             COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_QUERY_AUDIT
+                     --unset=PROSPER_WATCH_LEGACY_SCAN
+                     PROSPER_WATCH_FORCE_ALIAS_SCAN=1
                      $<TARGET_FILE:test_guest_write_watch_index>)
   endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -3123,6 +3136,8 @@ endif()
                                                frontends/shared/live/submit_renderer/pass_diagnostics.cpp
                                                frontends/shared/live/submit_renderer/callback_prelude.cpp
                                                frontends/shared/live/submit_renderer/callback_diagnostics.cpp
+                                               frontends/shared/live/submit_renderer/single_framebuffer.cpp
+                                               frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
@@ -3449,6 +3464,8 @@ endif()
                                                frontends/shared/live/submit_renderer/pass_diagnostics.cpp
                                                frontends/shared/live/submit_renderer/callback_prelude.cpp
                                                frontends/shared/live/submit_renderer/callback_diagnostics.cpp
+                                               frontends/shared/live/submit_renderer/single_framebuffer.cpp
+                                               frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)

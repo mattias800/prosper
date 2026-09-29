@@ -179,4 +179,12 @@ struct PersistentTargetDumpContext {
 };
 void dump_persistent_targets(PersistentTargetDumpContext& ctx);
 
+// ---- PROSPER_MRT_CENSUS (#3892) ----------------------------------------------------------------
+// The pass loop's state that note_mrt_census reads, one reference per object.
+struct MrtCensusContext {
+    const std::vector<prosper::gpu::DrawItem> & items;
+    size_t& pass_i;
+};
+void note_mrt_census(MrtCensusContext& ctx);
+
 } // namespace prosper::frontend::submit_renderer

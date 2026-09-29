@@ -80,6 +80,15 @@ struct GuestWriteWatchStats {
     uint64_t gpu_write_alias_pages = 0;
     uint64_t gpu_write_alias_registrations_visited = 0;
     uint64_t gpu_write_alias_overlaps = 0;
+    uint64_t gpu_write_alias_single_va_skips = 0;
+    // Physical invalidation candidate cost, including guest protection changes and physical
+    // writes. Indexed probes and full-map visits are distinct; hits are authoritative pages.
+    uint64_t phys_index_calls = 0;
+    uint64_t phys_scan_calls = 0;
+    uint64_t phys_index_pages = 0;
+    uint64_t phys_scan_pages = 0;
+    uint64_t phys_pages_hit = 0;
+    uint64_t phys_search_ns = 0; // opt-in PROSPER_WATCH_PHYS_TIMING; excludes mprotect and lock
 };
 
 // Bounded, diagnostic-only provenance overlay for direct-memory CPU writes.  Unlike GuestWriteWatch,

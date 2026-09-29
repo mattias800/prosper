@@ -149,7 +149,9 @@ HOT_SITES = {
         "PROSPER_CAPTION_DIAG", "PROSPER_PROLOGLOG", "PROSPER_VS_DUMP", "PROSPER_SHADER_DUMP",
         "PROSPER_DRAWMAP",
     ],
-    "frontends/shared/live/live_renderer.cpp": [
+    # #3892 part 4 moved the final-span present selection, and its PROSPER_UNIFORMLOG read, out of
+    # the callback into select_final_span_present.
+    "frontends/shared/live/submit_renderer/final_span_present.cpp": [
         "PROSPER_UNIFORMLOG",
     ],
     # #3892 part 3 moved the dirty-DCC materialization, and its PROSPER_DCCLOG read, out of the
