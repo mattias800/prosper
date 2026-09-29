@@ -105,13 +105,6 @@
 #include <unistd.h>
 #endif
 
-// The guest-flip publish bridge. Core reaches the frontend through a REGISTERED pointer, never by
-// naming this symbol: prosper_core links into tools that have no frontend at all, and on Mach-O a
-// weak declaration with no definition is still an undefined symbol (`nid_census` failed to link on
-// the macOS x86_64 job for exactly that reason, while ELF accepted it).
-extern "C" void prosper_vo_set_flip_publish_hook(void (*fn)(uint64_t));
-extern "C" void prosper_frontend_flip_publish_guest_scanout(uint64_t flip);
-
 // Classify a guest address: 0 => not within a reserved/committed guest mapping (see hle_kernel_mem).
 extern "C" int prosper_reserved_range_state(uint64_t addr);
 // VideoOut scanout registry (hle_graphics.cpp) — which guest buffer the game most recently FLIPPED
@@ -2334,7 +2327,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
 // REGISTERED with core rather than named by it: core must not reference a frontend symbol, or every
 // tool that links prosper_core without a frontend fails to link (it did, on Mach-O, where a weak
 // declaration with no definition is still an undefined symbol).
-extern "C" void prosper_vo_set_flip_publish_hook(void (*fn)(uint64_t));
 extern "C" void prosper_frontend_flip_publish_guest_scanout(uint64_t flip) {
     if (prosper::frontend::g_flip_scanout_hook) prosper::frontend::g_flip_scanout_hook(flip);
 }
