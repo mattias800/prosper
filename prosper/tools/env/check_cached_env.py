@@ -19,7 +19,8 @@ So this compares two sets over the whole tree:
 and fails if any name is in both. The check is deliberately CONSERVATIVE: it does not try to prove
 the write happens before the read. Ordering arguments are exactly what went wrong in #2214, where
 the reasoning was correct for the site being examined and there was a second site nobody looked at.
-If a name lands here, make it a live getenv or hoist it -- do not add an exception.
+If a name lands here, make it a live getenv or hoist it -- do not add an exception. The one
+exception class is CACHED_ONCE_PINS below: a test whose assertion IS that the arm is not observed.
 
 Run standalone against a checkout, or via ctest as cached_env_arming_logic.
 """
@@ -358,8 +359,68 @@ PER_SUBMIT_SELF_TESTS = [
 ]
 
 
+# --- cached-once pins ---------------------------------------------------------------------------
+# A test that arms a cached name in order to prove the arm is NOT observed is not the #2214 defect:
+# it cannot go vacuous, because the stale value is exactly what it asserts on (and a live getenv
+# would redden it). Each entry is scoped to ONE test file and ONE name, and carries its reason. An
+# arm of the same name from any other test file still fails, and a pin whose file no longer arms
+# its name fails as stale, so an entry cannot outlive its purpose.
+CACHED_ONCE_PINS = {
+    ("tests/shared/live/test_live_renderer_registration_statics.cpp", "PROSPER_RENDER_DELAY_MS"):
+        "pins cached-once semantics for #3892: the delay is read at the first callback and never "
+        "again, across a second registration",
+    ("tests/shared/live/test_live_renderer_registration_statics.cpp",
+     "PROSPER_TEXTURE_DECODE_CACHE_MB"):
+        "pins cached-once semantics for #3892: the decode budget is read on the first in-window "
+        "submit and never again, across a second registration",
+}
+
+
+def unpinned_test_arms(name, test_wheres, pins=None):
+    """The test arm sites of `name` that no CACHED_ONCE_PINS entry covers."""
+    pins = CACHED_ONCE_PINS if pins is None else pins
+    return [w for w in test_wheres if (w.rsplit(":", 1)[0], name) not in pins]
+
+
+def stale_pins(cached, armed, pins=None):
+    """Pins whose name is no longer cached, or whose file no longer arms that name."""
+    pins = CACHED_ONCE_PINS if pins is None else pins
+    stale = []
+    for (path, name) in sorted(pins):
+        files = {w.rsplit(":", 1)[0] for w in armed.get(name, [])}
+        if name not in cached or path not in files:
+            stale.append((path, name))
+    return stale
+
+
+PIN_SELF_TEST_PINS = {("tests/a.cpp", "PROSPER_X"): "self-test"}
+PIN_SELF_TESTS = [
+    # (name, test arm sites, want unpinned)
+    ("PROSPER_X", ["tests/a.cpp:3", "tests/a.cpp:9"], []),                    # pinned file only
+    ("PROSPER_X", ["tests/a.cpp:3", "tests/b.cpp:4"], ["tests/b.cpp:4"]),     # another test arms it
+    ("PROSPER_Y", ["tests/a.cpp:3"], ["tests/a.cpp:3"]),                       # pin is per name
+]
+STALE_PIN_SELF_TESTS = [
+    # (cached, armed, want stale)
+    ({"PROSPER_X": ["src/x.cpp:1"]}, {"PROSPER_X": ["tests/a.cpp:3"]}, []),
+    ({"PROSPER_X": ["src/x.cpp:1"]}, {"PROSPER_X": ["tests/b.cpp:3"]},
+     [("tests/a.cpp", "PROSPER_X")]),                                       # file no longer arms it
+    ({}, {"PROSPER_X": ["tests/a.cpp:3"]}, [("tests/a.cpp", "PROSPER_X")]),  # no longer cached
+]
+
+
 def self_test() -> int:
     bad = 0
+    for name, wheres, want in PIN_SELF_TESTS:
+        got = unpinned_test_arms(name, wheres, PIN_SELF_TEST_PINS)
+        if got != want:
+            print(f"  [FAIL] pin self-test: {name} {wheres} want={want} got={got}")
+            bad += 1
+    for cached_case, armed_case, want in STALE_PIN_SELF_TESTS:
+        got = stale_pins(cached_case, armed_case, PIN_SELF_TEST_PINS)
+        if got != want:
+            print(f"  [FAIL] stale-pin self-test: want={want} got={got}")
+            bad += 1
     import io, contextlib
     for cached, per_submit, want in PER_SUBMIT_SELF_TESTS:
         with contextlib.redirect_stdout(io.StringIO()):
@@ -385,7 +446,7 @@ def self_test() -> int:
         print(f"  the scanner's own patterns are broken -- a tree scan would report a false CLEAN")
     else:
         print(f"  [ok]   scanner self-test: "
-              f"{len(SELF_TESTS) + len(HOT_SELF_TESTS) + len(PER_SUBMIT_SELF_TESTS)} cases")
+              f"{len(SELF_TESTS) + len(HOT_SELF_TESTS) + len(PER_SUBMIT_SELF_TESTS) + len(PIN_SELF_TESTS) + len(STALE_PIN_SELF_TESTS)} cases")
     return bad
 
 
@@ -420,7 +481,26 @@ def main() -> int:
 
     fails, notes = {}, {}
     for name in sorted(set(cached) & set(armed)):
-        (fails if from_tests(armed[name]) else notes)[name] = armed[name]
+        test_arms = from_tests(armed[name])
+        unpinned = unpinned_test_arms(name, test_arms)
+        if unpinned:
+            fails[name] = unpinned
+        elif not test_arms:
+            notes[name] = armed[name]
+        else:
+            path = test_arms[0].rsplit(":", 1)[0]
+            print(f"  [pin]  {name}: armed by a test only in {path} -- "
+                  f"{CACHED_ONCE_PINS[(path, name)]}")
+            others = [w for w in armed[name] if w not in test_arms]
+            if others:
+                notes[name] = others     # the non-test arms keep their ordering note
+    stale = stale_pins(cached, armed)
+    for path, name in stale:
+        print(f"  [FAIL] stale CACHED_ONCE_PINS entry: {path} no longer arms cached {name} -- "
+              f"remove the entry")
+    if stale:
+        print(f"== {len(stale)} failure(s) ==")
+        return 1
 
     for name, where in notes.items():
         print(f"  [note] {name}: cached, and armed outside tests/ -- safe only if the write precedes")
