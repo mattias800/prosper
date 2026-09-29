@@ -78,6 +78,11 @@ silently stops describing the tree, which is the same failure class this tool ex
     clause, which is the understating direction for TWO-GATE.
   - A braceless `if` body is not scoped: `if (a) if (b) x = c;` attributes `x` to the enclosing
     block. LITERAL_RHS_RE exists because of this -- see the defaulted-alias rule in run().
+  - A gate carried through a CONTEXT STRUCT (`Ctx{.x = x}` handed to a callee that reads `ctx.x`)
+    is followed by member NAME only (#3919): a member counts when every data member of that name
+    in the tree is a REFERENCE member and every designated initialiser of it is env-derived. A
+    same-named value member anywhere retires the name, which also hides a genuine context gate. One hop -- a context forwarded into a second context is
+    not followed -- and a member initialised positionally, or from a non-alias value, is invisible.
   - `#if`-gated code is scanned as if it were live.
   - A diagnostic gated by something other than an environment variable (a build flag, a member
     field, a runtime setting) is out of scope by construction.
@@ -185,6 +190,13 @@ LAMBDA_INTRO_RE = re.compile(r"^\s*\[[^\]\[]*\]\s*(?:\(|\{|mutable\b|constexpr\b
 # `name =` with the compound and comparison forms excluded: `+=`/`!=`/`<=`/`==` all fail to match
 # because the character before `=` is then not part of the identifier and not whitespace.
 ASSIGN_TO_NAME_RE = re.compile(r"\b([A-Za-z_]\w*)\s*=(?!=)")
+
+# A DESIGNATED INITIALISER, `.name = value`, at the start of an initialiser element. This is where a
+# context struct of references meets the scope that owns the values (#3919): the callback builds
+# `Ctx{.rtt_log = rtt_log, ...}` and the callee rebinds `auto& rtt_log = ctx.rtt_log;`.
+DESIGNATED_INIT_RE = re.compile(r"(?:^|[{,(])\s*\.([A-Za-z_]\w*)\s*=(?!=)\s*([^,}]+)")
+# `obj.name` / `obj->name` / `ptr->name`: a member READ that may stand for a context member.
+MEMBER_READ_RE = re.compile(r"(?:(?<=[\w\)\]])\.|->)([A-Za-z_]\w*)\b")
 
 # A COMPILED-IN CONSTANT -- the thing a "supply a default" statement assigns. Deliberately narrower
 # than "any value not derived from the environment": a computed RHS (`resdump = strtoull(fa, ...) ==
@@ -760,7 +772,9 @@ class FileScanner:
                  call_sites: dict[str, list[tuple[str, frozenset]]],
                  printing: set[str] | None = None,
                  flags: dict[str, frozenset] | None = None,
-                 flag_writes: dict[str, list[frozenset]] | None = None):
+                 flag_writes: dict[str, list[frozenset]] | None = None,
+                 members: dict[str, frozenset] | None = None,
+                 member_writes: dict[str, list[frozenset]] | None = None):
         self.rel = rel
         self.lines = lines
         self.preds = preds
@@ -768,6 +782,8 @@ class FileScanner:
         self.printing = printing or set()
         self.flags = flags or {}
         self.flag_writes = flag_writes
+        self.members = members or {}
+        self.member_writes = member_writes
         self.findings: list[Finding] = []
         self.stack: list[Scope] = [Scope(set())]
 
@@ -788,6 +804,16 @@ class FileScanner:
         shape; substituting a bare list would turn `if (udprov_enabled())` into a demand for both
         of its alternatives.
         """
+        if self.members:
+            # A context member stands for what its designated initialisers held (#3919). Replace
+            # the whole `.name` / `->name` so the object expression is left as an ordinary ident.
+            def sub_member(m):
+                ctx = self.members.get(m.group(1))
+                if not ctx:
+                    return m.group(0)
+                return " " + self.render_ctx(ctx)
+            expr = MEMBER_READ_RE.sub(sub_member, expr)
+
         def sub(m):
             ident = m.group(0)
             ctx = self.preds.get(ident)
@@ -800,10 +826,15 @@ class FileScanner:
                         break
             if not ctx:
                 return ident
-            return "(" + " && ".join(
-                "(" + " || ".join(f'getenv("{n}")' for n in sorted(cl)) + ")"
-                for cl in sorted(ctx, key=lambda c: sorted(c))) + ")"
+            return self.render_ctx(ctx)
         return re.sub(r"\b[A-Za-z_]\w*\b", sub, expr)
+
+    @staticmethod
+    def render_ctx(ctx) -> str:
+        """A gate context as the getenv() expression clauses_of() reads back."""
+        return "(" + " && ".join(
+            "(" + " || ".join(f'getenv("{n}")' for n in sorted(cl)) + ")"
+            for cl in sorted(ctx, key=lambda c: sorted(c))) + ")"
 
     @staticmethod
     def alias_is_a_gate(rhs: str) -> bool:
@@ -1018,6 +1049,14 @@ class FileScanner:
                         # express: the alias no longer stands for an env switch.
                         del s.aliases[name]
                     break
+
+            # ---- designated initialisers of a context struct (#3919) ------------------------
+            # Pass 1 records what each `.name = value` held; resolve_members() keeps the names
+            # whose EVERY initialiser was env-derived, and pass 2 lets `ctx.name` stand for that.
+            if self.member_writes is not None and not is_def:
+                for dm3 in DESIGNATED_INIT_RE.finditer(line):
+                    self.member_writes.setdefault(dm3.group(1), []).append(
+                        clauses_of(self.expand(dm3.group(2))))
 
             # ---- scoped alias declaration --------------------------------------------------
             if cond is None:
@@ -1236,7 +1275,152 @@ def resolve_flags(flag_writes: dict[str, list[frozenset]]) -> dict[str, frozense
     return out
 
 
-def scan_tree(root: Path):
+# The text before a `{` that opens a struct/class/union body -- named, anonymous, or with an
+# attribute such as `alignas(64)` in the head. `enum class` bodies hold enumerators, not members.
+STRUCT_HEAD_RE = re.compile(r"(?:^|[\s;{}])(?:struct|class|union)\b(?![^<>]*>)")
+ENUM_HEAD_RE = re.compile(r"\benum\s+(?:class|struct)\b")
+TRAILING_QUALIFIERS_RE = re.compile(r"(?:\s*\b(?:const|override|final|noexcept|volatile)\b)+\s*$")
+LAST_IDENT_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])*\s*$")
+
+
+def _top_level_split(text: str, sep: str) -> list[str]:
+    parts, depth, cur = [], 0, []
+    for ch in text:
+        if ch in "(<[{":
+            depth += 1
+        elif ch in ")>]}":
+            depth = max(0, depth - 1)
+        if ch == sep and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+def member_declarations(text: str) -> list[tuple[str, str]]:
+    """(name, "ref"|"value") for one struct-scope statement. UNSURE MEANS VALUE (#3940 review).
+
+    A value record can only RETIRE a name from the context-member join, which is the safe
+    direction, so any shape this does not fully understand -- an initialiser with a call, a
+    function-typed member, a method declaration, several declarators -- is recorded as value.
+    Only the plain `T& name;` / `const T& name;` shape is ever a reference.
+    """
+    text = re.sub(r"^(?:(?:public|private|protected)\s*:\s*)+", "", text.strip())
+    if not text:
+        return []
+    first = text.split()[0]
+    if first in ("using", "typedef", "friend", "template", "return", "static_assert"):
+        return []
+    # The initialiser is not part of the declarator: `x = compute()`, `x{}`, `x = {1, 2}`.
+    pre = _top_level_split(text, "=")[0]
+    pre = re.sub(r"\{\}\s*$", "", pre)
+    declarators = _top_level_split(pre, ",")
+    unsure = "(" in text or len(declarators) > 1
+    out = []
+    for index, decl in enumerate(declarators):
+        decl = re.sub(r"\s*:\s*\d+\s*$", "", decl)          # bitfield width
+        decl = TRAILING_QUALIFIERS_RE.sub("", decl)
+        while decl.rstrip().endswith(")"):                  # a method or function-typed member
+            depth, cut = 0, None
+            for i in range(len(decl.rstrip()) - 1, -1, -1):
+                depth += {")": 1, "(": -1}.get(decl[i], 0)
+                if depth == 0:
+                    cut = i
+                    break
+            if cut is None:
+                break
+            decl = TRAILING_QUALIFIERS_RE.sub("", decl[:cut])
+        m = LAST_IDENT_RE.search(decl)
+        # A lone word is not a declaration -- except after the first declarator (`int a, b;`).
+        if not m or (index == 0 and not decl[:m.start(1)].strip()):
+            continue
+        before = decl[:m.start(1)].rstrip()
+        is_ref = before.endswith("&") and not before.endswith("&&")
+        out.append((m.group(1), "ref" if is_ref and not unsure else "value"))
+    return out
+
+
+def collect_member_kinds(files: dict[Path, list[str]]) -> dict[str, set[str]]:
+    """Every DATA MEMBER declared at struct/class/union scope, by name: {"ref"} / {"value"} / both.
+
+    The context-member join (#3919) is only sound for names that are reference members EVERYWHERE.
+    A reference member is bound once, at construction, from the initialiser that names it, so the
+    designated initialiser really is the whole story. A value member can be written after
+    construction (`stats.detail += 1`), default-initialised, or filled positionally, none of which
+    the designated-initialiser record sees -- and because the join is by name, one such member in an
+    UNRELATED struct would hand its reads a gate they do not have and hide a real finding (the
+    review of #3940). Lexical: tracks which open brace is a struct/class/union body. Whatever it is
+    unsure about is recorded as a VALUE member (see member_declarations), because that can only
+    retire a name.
+    """
+    kinds: dict[str, set[str]] = {}
+    for _path, lines in files.items():
+        stack: list[str] = []          # "struct" or "other" per open brace
+        stmt: list[str] = [""]         # statement accumulated at each depth (index 0 = file)
+        for ch in "\n".join(lines):
+            if ch == "{":
+                head = stmt[-1]
+                is_struct = bool(STRUCT_HEAD_RE.search(head)) and not ENUM_HEAD_RE.search(head)
+                stack.append("struct" if is_struct else "other")
+                stmt.append("")
+            elif ch == "}":
+                if stack:
+                    closed = stack.pop()
+                    stmt.pop()
+                    if closed == "other" and stack and stack[-1] == "struct" \
+                            and stmt[-1].rstrip().endswith(")"):
+                        stmt[-1] = ""  # a method body ended; no `;` follows it
+                    elif closed == "struct":
+                        # `struct { ... } s;` / `union { ... } u;`: keep only the declarator part.
+                        stmt[-1] = "__anon_type "
+                    else:
+                        stmt[-1] += "{}"
+            elif ch == ";":
+                text = stmt[-1]
+                stmt[-1] = ""
+                if not stack or stack[-1] != "struct":
+                    continue
+                for name, kind in member_declarations(text):
+                    kinds.setdefault(name, set()).add(kind)
+            else:
+                stmt[-1] += ch
+    return kinds
+
+
+def resolve_members(member_writes: dict[str, list[frozenset]],
+                    member_kinds: dict[str, set[str]] | None = None) -> dict[str, frozenset]:
+    """Context-struct members that ONLY ever receive an env-derived value (#3919).
+
+    The join is lexical, on the member NAME, and needs no types: the designated initialiser
+    `.rtt_log = rtt_log` is where the callback's alias meets the callee's `auto& rtt_log =
+    ctx.rtt_log;`. Because names are not qualified by struct, one ungated initialiser anywhere in
+    the tree disqualifies the name -- `.width = w` must never make every `x.width` a gate. Several
+    gated initialisers that disagree widen to one any-of clause, as resolve_flags() does, which is
+    the understating direction.
+    """
+    out = {}
+    for name, contexts in member_writes.items():
+        if not contexts or any(not c for c in contexts):
+            continue
+        # Only names declared as REFERENCE members, and nowhere as a value member. See
+        # collect_member_kinds(): a value member of the same name anywhere can be written in ways
+        # the designated-initialiser record never sees.
+        if member_kinds is not None and member_kinds.get(name) != {"ref"}:
+            continue
+        if all(c == contexts[0] for c in contexts):
+            out[name] = contexts[0]
+            continue
+        union: set[str] = set()
+        for ctx in contexts:
+            for clause in ctx:
+                union |= set(clause)
+        out[name] = frozenset({frozenset(union)})
+    return out
+
+
+def scan_tree(root: Path, follow_members: bool = True):
     files = collect_files(root)
     preds = collect_predicates(files)
     printing = collect_printing(files)
@@ -1245,16 +1429,20 @@ def scan_tree(root: Path):
     # Pass 1 discovers which `g_*` flags only an env gate can set. Its findings are discarded --
     # they are computed without those flags and would understate.
     flag_writes: dict[str, list[frozenset]] = {}
+    member_writes: dict[str, list[frozenset]] = {}
     for path, lines in files.items():
         FileScanner(str(path.relative_to(root)), lines, preds, {}, printing,
-                    None, flag_writes).run()
+                    None, flag_writes, None, member_writes).run()
     flags = resolve_flags(flag_writes)
+    members = (resolve_members(member_writes, collect_member_kinds(files))
+               if follow_members else {})
 
     call_sites: dict[str, list[tuple[str, frozenset]]] = {}
     findings: list[Finding] = []
     for path, lines in files.items():
         rel = str(path.relative_to(root))
-        findings += FileScanner(rel, lines, preds, call_sites, printing, flags).run()
+        findings += FileScanner(rel, lines, preds, call_sites, printing, flags, None,
+                                members).run()
     findings += split_call_findings(call_sites, defined)
     return files, preds, findings
 
@@ -1369,7 +1557,72 @@ void trace_probe(uint64_t p) {
 # tree scan: a control built by the same machinery as the null inherits the null's blind spots and
 # so tests the discriminator rather than the domain.
 # --------------------------------------------------------------------------------------------
+# #3919: a gate carried through a CONTEXT STRUCT OF REFERENCES. The callback owns the env-derived
+# alias, hands it over with a designated initialiser, and the callee rebinds it by name -- #3892's
+# idiom for moving a callback body out verbatim. The report inside needs a second switch.
+_CONTEXT_MEMBER_FIXTURE = """
+struct DetailCtx { const bool& detail; };
+void callee(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    if (detail) {
+        if (getenv("PROSPER_CTX_SECOND")) fprintf(stderr, "[ctx] n=%u\\n", n);
+    }
+}
+void callback() {
+    static const bool detail = getenv("PROSPER_CTX_FIRST") != nullptr;
+    callee(DetailCtx{
+        .detail = detail,
+    });
+}
+"""
+
+# The #3940 review's counter-example: an UNRELATED struct with a VALUE member of the same name,
+# written with `+=` after construction. With a name-only join its read inherited PROSPER_CTX_FIRST
+# -- the very switch `fresh` is filled under -- so the genuine SPLIT-LOCAL below (printed under a
+# test of `stats.detail`, which no env switch gates) vanished.
+_MEMBER_COLLISION_FIXTURE = _CONTEXT_MEMBER_FIXTURE + """
+struct Stats { uint64_t detail = 0; };
+void tally(Stats& stats) {
+    uint32_t fresh = 0;
+    if (getenv("PROSPER_CTX_FIRST")) {
+        fresh = 7;
+    }
+    stats.detail += 1;
+    if (stats.detail) {
+        fprintf(stderr, "[stats] fresh=%u\\n", fresh);
+    }
+}
+"""
+
+# Second review of #3940: value-member shapes the collector must not SKIP. Each unrelated struct
+# declares a VALUE `detail`, which must retire the name, so the context fixture's TWO-GATE (which
+# rides on `detail` resolving) must disappear. A collector that records nothing for the shape
+# leaves the name resolvable and the TWO-GATE reported -- the unsafe direction.
+_VALUE_MEMBER_SHAPES = [
+    ("an initialiser with a call", "struct Stats { uint64_t detail = compute(); };"),
+    ("a function-typed member", "struct Hooks { std::function<void(int)> detail; };"),
+    ("a union member", "union Bits { uint32_t detail; float f; };"),
+    ("an alignas(...) struct head", "struct alignas(64) Padded { uint64_t detail; };"),
+    ("an anonymous struct", "struct Outer { struct { int detail; } inner; };"),
+    ("a bitfield", "struct Flags { unsigned detail : 4; };"),
+    ("a second declarator", "struct Pair { int first, detail; };"),
+]
+
 SELF_TESTS: list[tuple[str, str, list[str]]] = [
+    *[(f"context member (#3940 review 2): a same-named value member declared through {what} "
+       f"retires the name", _CONTEXT_MEMBER_FIXTURE + "\n" + decl + "\n", [])
+      for what, decl in _VALUE_MEMBER_SHAPES],
+    ("context member (#3940 review): a same-named VALUE member in an unrelated struct retires the "
+     "name, so its reads keep their real (absent) gate and the SPLIT-LOCAL stays visible",
+     _MEMBER_COLLISION_FIXTURE, ["SPLIT-LOCAL:fresh"]),
+    ("context member (#3919): an alias handed over as `.x = x` and rebound as `ctx.x` keeps its "
+     "gate", _CONTEXT_MEMBER_FIXTURE, ["TWO-GATE:PROSPER_CTX_FIRST+PROSPER_CTX_SECOND"]),
+    ("context member (#3919): one UNGATED initialiser anywhere retires the name, so `.x = true` "
+     "cannot make every `obj.x` a gate", _CONTEXT_MEMBER_FIXTURE + """
+void other() {
+    callee(DetailCtx{ .detail = true });
+}
+""", []),
     ("fresh_extent (#2132): filled only under PROSPER_UDPROV, printed regardless", """
 bool udprov_enabled() {
     static const bool on = std::getenv("PROSPER_UDPROV") != nullptr;
@@ -1844,6 +2097,35 @@ def run_self_test(verbose: bool = False) -> int:
     return bad
 
 
+def run_member_resolution_test(verbose: bool = False) -> int:
+    """The context-member finding must VANISH with member resolution off (#3919).
+
+    Without this arm the positive SELF_TESTS case could be satisfied by some other path that
+    happens to see through `ctx.detail` -- a passing test proves the finding exists, not that the
+    new resolution is what found it.
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "src").mkdir()
+        (root / "src" / "fixture.cpp").write_text(_CONTEXT_MEMBER_FIXTURE, encoding="utf-8")
+        files_on, _p, on = scan_tree(root, follow_members=True)
+        files_off, _p, off = scan_tree(root, follow_members=False)
+    if not files_on or not files_off:
+        _apparatus_failure("the context-member arm")
+        return 1
+    key = "PROSPER_CTX_FIRST+PROSPER_CTX_SECOND"
+    has_on = any(f.kind == "TWO-GATE" and Finding.render(f.gates) == key for f in on)
+    has_off = any(f.kind == "TWO-GATE" and Finding.render(f.gates) == key for f in off)
+    if not has_on or has_off:
+        print(f"  [FAIL] context-member resolution: on={has_on} (want True) "
+              f"off={has_off} (want False)")
+        return 1
+    if verbose:
+        print("  [ok]   context-member finding appears with resolution and vanishes without it")
+    return 0
+
+
 def load_baseline(path: Path) -> dict[str, str]:
     entries = {}
     if not path.is_file():
@@ -2056,6 +2338,7 @@ def main() -> int:
             return 1
         print(f"  [ok]   temp root {tmp} is a build-tree path -- the #2658 arm is live")
     if (run_exclusion_test(args.verbose) or run_self_test(args.verbose)
+            or run_member_resolution_test(args.verbose)
             or run_key_stability_test(args.verbose)
             or run_baseline_integrity_test(args.verbose)):
         return 1
