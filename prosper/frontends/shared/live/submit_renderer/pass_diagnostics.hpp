@@ -187,4 +187,35 @@ struct MrtCensusContext {
 };
 void note_mrt_census(MrtCensusContext& ctx);
 
+// ---- PROSPER_MRT_ALIAS_LOG (#3892) --------------------------------------------------------------
+// The pass loop's state that note_mrt_alias_mirrors reads, one reference per object.
+struct MrtAliasMirrorContext {
+    const std::vector<prosper::gpu::DrawItem> & items;
+};
+void note_mrt_alias_mirrors(MrtAliasMirrorContext& ctx);
+
+// ---- PROSPER_DSLOG (#3892) ----------------------------------------------------------------------
+// The pass loop's state that note_ds_viewport_extent reads, one reference per object.
+struct DsViewportExtentContext {
+    std::vector<const prosper::gpu::DrawItem *>& pass;
+    const uint32_t& max_native_w;
+    const uint32_t& max_native_h;
+    const uint64_t& viewport_native_w;
+    const uint64_t& viewport_native_h;
+    const bool& viewport_extent_valid;
+};
+void note_ds_viewport_extent(DsViewportExtentContext& ctx);
+
+// ---- PROSPER_PREFIX_INSPECT publication (#3892) -------------------------------------------------
+// The pass loop's state that publish_prefix_inspection reads, one reference per object.
+struct PrefixInspectionContext {
+    const std::vector<uint8_t> & rendered_pixels;
+    uint32_t& gw;
+    uint32_t& gh;
+    const VkFormat& pass_format;
+    std::shared_ptr<const std::vector<uint8_t>>& px_last;
+    uint64_t& px_last_source_submit;
+};
+void publish_prefix_inspection(PrefixInspectionContext& ctx);
+
 } // namespace prosper::frontend::submit_renderer

@@ -35,7 +35,8 @@ itself still lives in `live_renderer.cpp` and still owns all the state.
   colour0 into colour1's retained target. The pass loop's `continue` stays at the call site.
 - `pass_diagnostics.{hpp,cpp}` — the pass loop's `PROSPER_*` diagnostic blocks (readback reasons,
   resource and draw-step hashes, pass/RT-group/persistent-target dumps, the pass logs, the MRT
-  census).
+  census, the `[mrt-alias]` mirror check, the `PROSPER_DSLOG` viewport-extent line) and the
+  `PROSPER_PREFIX_INSPECT` publication `gpu_replay`'s prefix modes rely on.
 - `callback_prelude.{hpp,cpp}` — per-callback setup work: `load_shader_overrides` (the REFVS /
   TESTPS / FS_SPV / SKIP_DRAW overrides, one `ShaderOverrides` value that `BackendDrawContext`
   refers to) and `materialize_dirty_dcc_clears`.
