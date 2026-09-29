@@ -3,6 +3,7 @@
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/capture/gpu_capture.hpp"
+#include "diagnostics/env_cache.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/resources/image_identity.hpp"
@@ -3788,8 +3789,12 @@ int main() {
         // Exact current inputs are preserved on the first dispatch too. Completed writeback can
         // immediately promote its exact image; compressed metadata on the next dispatch still
         // forces a fresh seed before re-publishing authority.
+        const bool direct_detile_opt_out =
+            PROSPER_ENV_ON("PROSPER_NO_DIRECT_STORAGE_DETILE");
         const uint64_t promotions_before =
             prosper::frontend::live_compute_dcc_post_writeback_promotions();
+        const uint64_t direct_detile_before =
+            prosper::frontend::live_compute_direct_storage_detile_bytes();
         CHECK(prosper::frontend::execute_live_compute_items({dcc_item}),
               "live backend preserves inputs while writing the tiled DCC storage image");
         CHECK(prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
@@ -3801,6 +3806,14 @@ int main() {
         CHECK(prosper::frontend::live_compute_dcc_post_writeback_promotions() ==
                   promotions_before + 2,
               "successful exact DCC writeback re-publishes its forcibly seeded image");
+        const uint64_t direct_detile_after =
+            prosper::frontend::live_compute_direct_storage_detile_bytes();
+        if (direct_detile_opt_out)
+            CHECK(direct_detile_after == direct_detile_before,
+                  "storage direct-detile opt-out keeps the staging-copy control");
+        else
+            CHECK(direct_detile_after >= direct_detile_before + 2u * W * 4u,
+                  "exact tiled storage output detiles directly into mapped staging");
         std::vector<uint8_t> dcc_linear(W * 4, 0);
         detile_surface(dcc_linear.data(), tiled_dst.data(), W, 1, dcc_tile, 0, 4);
         CHECK(dcc_linear == img_src,
@@ -3808,6 +3821,44 @@ int main() {
         CHECK(std::all_of(dcc_metadata.begin(), dcc_metadata.end(),
                           [](uint8_t code) { return code == 0xff; }),
               "DCC storage writeback publishes uniform uncompressed metadata");
+
+        // A full-width copy proves the direct path ran, but cannot prove its staged seed was
+        // correct: the shader overwrites every texel. Launch only half a row with the same
+        // writable descriptor, then check that the untouched half survives guest writeback.
+        // This catches both an omitted detile and a detile into the wrong staging allocation.
+        std::vector<uint8_t> partial_seed(W * 4);
+        for (size_t i = 0; i < partial_seed.size(); ++i)
+            partial_seed[i] = static_cast<uint8_t>(i * 19u + 17u);
+        tile_surface(tiled_dst.data(), partial_seed.data(), W, 1, dcc_tile, 0, 4);
+        std::fill(dcc_metadata.begin(), dcc_metadata.end(), 0x40);
+        ComputeShaderConfig partial_config = dcc_config;
+        partial_config.local_x = W / 2;
+        partial_config.threads_x = W / 2;
+        ComputeItem partial_item = dcc_item;
+        partial_item.spirv = recompile_compute(
+            image_copy_2d, std::size(image_copy_2d), &dcc_rt, partial_config);
+        partial_item.launch.local_x = W / 2;
+        partial_item.launch.threads_x = W / 2;
+        partial_item.code_addr = 0x719dce;
+        CHECK(!partial_item.spirv.empty(),
+              "half-width DCC writer recompiles with the same exact storage binding");
+        const uint64_t partial_direct_before =
+            prosper::frontend::live_compute_direct_storage_detile_bytes();
+        CHECK(prosper::frontend::execute_live_compute_items({partial_item}),
+              "half-width DCC writer executes after guest seed changes");
+        const uint64_t partial_direct_after =
+            prosper::frontend::live_compute_direct_storage_detile_bytes();
+        if (direct_detile_opt_out)
+            CHECK(partial_direct_after == partial_direct_before,
+                  "half-width writer honors direct-detile opt-out");
+        else
+            CHECK(partial_direct_after >= partial_direct_before + W * 4u,
+                  "half-width writer exercises direct detile into staging");
+        detile_surface(dcc_linear.data(), tiled_dst.data(), W, 1, dcc_tile, 0, 4);
+        std::vector<uint8_t> partial_expected = partial_seed;
+        std::copy_n(img_src.begin(), W / 2 * 4u, partial_expected.begin());
+        CHECK(dcc_linear == partial_expected,
+              "half-width DCC write preserves guest-seeded texels outside the dispatch");
 
 #if defined(__linux__)
         // The vector-backed DCC checks below cannot arm a guest page watch. Use an exact mapped
