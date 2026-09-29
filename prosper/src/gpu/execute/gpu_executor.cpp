@@ -12004,6 +12004,9 @@ bool shared_present_active() {
 static std::atomic<bool> g_gpu_present_active{false};
 void set_gpu_present_active(bool active) {
     g_gpu_present_active.store(active, std::memory_order_release);
+    // gpu-present-stalled only has data while a GPU-present consumer exists (#3891).
+    prosper::diagnostics::perf::set(prosper::diagnostics::perf::Gauge::GpuPresentActive,
+                                    active ? 1u : 0u);
 }
 bool gpu_present_active() {
     return g_gpu_present_active.load(std::memory_order_acquire);

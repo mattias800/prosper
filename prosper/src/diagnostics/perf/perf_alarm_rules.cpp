@@ -93,6 +93,7 @@ const std::vector<const char*>& rule_names() {
         "diagnostic-path-active", "present-path-fallback", "pipeline-cache-thrash",
         "texture-validation-churn", "host-copy-per-flip", "present-slot-trouble",
         "rtt-destination-refused", "color-target-count-ceiling", "gpu-sync-wait",
+        "gpu-present-stalled",
     };
     return names;
 }
@@ -113,6 +114,10 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
         return w.events(Cost::PresentCpu) != 0 || w.count(Counter::PresentCpuFallbacks) != 0;
     if (r == "rtt-destination-refused") return w.flips >= kRttDestinationRefusedMinFlips;
     if (r == "gpu-sync-wait") return gpu_sync_wait_has_data(w);
+    // Only a frontend with a GPU-present consumer is expected to present at all; a window without
+    // enough guest flips cannot say whether presents SHOULD have happened.
+    if (r == "gpu-present-stalled")
+        return w.gauge(Gauge::GpuPresentActive) != 0 && w.flips >= kGpuPresentStalledMinFlips;
     // A run whose renderer never consulted the persistent colour-target cache has no bound to be at.
     if (r == "color-target-count-ceiling") return w.gauge(Gauge::PersistentTargetEntryLimit) != 0;
     // The others measure events whose ABSENCE is the healthy answer: no readback, no contended
@@ -165,6 +170,15 @@ bool gpu_sync_wait_has_data(const WindowSample& w) {
                              w.count(Counter::GpuDeviceSamplesGraphics);
     return w.flips >= kGpuSyncWaitMinFlips && waits &&
            static_cast<double>(samples) >= kGpuSyncWaitMinDeviceCoverage * static_cast<double>(waits);
+}
+
+uint64_t destination_creation_refused_count(const WindowSample& w) {
+    uint64_t n = 0;
+    for (size_t i = 0; i < kRttDestinationRefusalSlots; ++i)
+        if (w.rtt_destination_refusal_names[i] &&
+            std::strcmp(w.rtt_destination_refusal_names[i], kDestinationCreationRefused) == 0)
+            n += w.rtt_destination_refusals[i];
+    return n;
 }
 
 uint64_t destination_creation_refused_bytes(const WindowSample& w) {
@@ -722,9 +736,10 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                      "image were refused a destination, so each is snapshotted to the CPU and its "
                      "consumers re-materialize it from guest bytes (host-copy-per-flip usually "
                      "fires beside this). destination-creation-refused = the persistent "
-                     "colour-target cache had no room (see color-target-count-ceiling; compute "
-                     "creation never evicts); extent/format/device-mismatch = the renderer image "
-                     "has another shape. next: the [rtt-destination-refused] exit line, "
+                     "colour-target cache had no room (see color-target-count-ceiling); "
+                     "destination-allocation-failed = Vulkan could not create/allocate/bind the "
+                     "image (device memory, not the cache bound); extent/format/device-mismatch = "
+                     "the renderer image has another shape. next: the [rtt-destination-refused] exit line, "
                      "PROSPER_COMPUTE_DEST_TRACE_ADDR=<addr> for one target, "
                      "[persistent-targets] PEAK residency; cf. #3873";
             out.push_back(std::move(a));
@@ -742,21 +757,32 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
         const double byte_share =
             byte_limit ? static_cast<double>(bytes) / static_cast<double>(byte_limit) : 1.0;
         const uint64_t creation_refused = destination_creation_refused_bytes(w);
+        const uint64_t creation_refusals = destination_creation_refused_count(w);
+        const bool churning = eviction_rate > t.color_target_ceiling_evictions_per_s;
         if (entry_limit && byte_limit && entries >= entry_limit &&
-            byte_share < t.color_target_ceiling_byte_share &&
-            (eviction_rate > t.color_target_ceiling_evictions_per_s || creation_refused)) {
+            byte_share < t.color_target_ceiling_byte_share && (churning || creation_refused)) {
             AlarmFiring a;
             a.rule = "color-target-count-ceiling";
-            a.value = eviction_rate;
-            a.unit = "evictions/s";
-            a.threshold = t.color_target_ceiling_evictions_per_s;
+            // Report the arm that fired. In the steady gameplay state the cache evicts nothing and
+            // the cost is compute results refused a destination, so evictions/s would read 0.00.
+            if (churning) {
+                a.value = eviction_rate;
+                a.unit = "evictions/s";
+                a.threshold = t.color_target_ceiling_evictions_per_s;
+            } else {
+                a.value = static_cast<double>(creation_refusals);
+                a.unit = "creation-refusals";
+                a.threshold = 1.0;
+            }
             a.detail = format("peak-entries=%llu/%llu peak-bytes=%.0f/%.0fMiB (%.0f%% of budget) "
-                              "evictions=%llu (%.0fMiB) compute-creation-refused=%.0fMiB flips=%llu",
+                              "evictions=%llu (%.0fMiB) compute-creation-refused=%llu (%.0fMiB) "
+                              "flips=%llu",
                               (unsigned long long)entries, (unsigned long long)entry_limit,
                               bytes / kMiB, byte_limit / kMiB, byte_share * 100.0,
                               (unsigned long long)evictions,
                               w.count(Counter::PersistentTargetEvictedBytes) / kMiB,
-                              creation_refused / kMiB, (unsigned long long)w.flips);
+                              (unsigned long long)creation_refusals, creation_refused / kMiB,
+                              (unsigned long long)w.flips);
             a.hint = "the persistent colour-target cache is bound by its ENTRY COUNT while most of "
                      "its byte budget is free: it evicts targets it has memory for (each a CPU "
                      "readback through the eviction sink, then a re-creation), and compute "
@@ -764,6 +790,37 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                      "rtt-destination-refused). next: the [persistent-targets] PEAK residency exit "
                      "line; A/B PROSPER_BACKEND_TARGET_CACHE_COUNT (its `of N entries` proves the "
                      "lever moved); cf. #3873, #1177";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // gpu-present-stalled (STATE: guest flips, host presents nothing).
+    if (w.gauge(Gauge::GpuPresentActive) != 0 && w.flips >= t.gpu_present_stalled_min_flips) {
+        const uint64_t gpu = w.events(Cost::PresentCpu);
+        const uint64_t fallback = w.count(Counter::PresentCpuFallbacks);
+        if (gpu + fallback == 0) {
+            AlarmFiring a;
+            a.rule = "gpu-present-stalled";
+            a.value = per_second(w.flips, w.seconds);
+            a.unit = "guest-flips/s";
+            a.threshold = per_second(t.gpu_present_stalled_min_flips, w.seconds);
+            const char* names[kPresentDeclineSlots];
+            for (size_t i = 0; i < kPresentDeclineSlots; ++i)
+                names[i] = w.present_decline_names[i] ? w.present_decline_names[i] : "?";
+            a.breakdown = ranked(w.present_declines, names, kPresentDeclineSlots);
+            const uint64_t dropped = w.count(Counter::DroppedDrawsBackend) +
+                w.count(Counter::DroppedDrawsFrontend) + w.count(Counter::DroppedDrawsContract);
+            a.detail = format("presents=0 (gpu-scanout=0 cpu-fallback=0) guest-flips=%llu "
+                              "dropped-draws=%llu declines=%s",
+                              (unsigned long long)w.flips, (unsigned long long)dropped,
+                              a.breakdown.empty() ? "none-recorded"
+                                                  : top_entries(a.breakdown).c_str());
+            a.hint = "the guest keeps flipping but prosper-app presented no frame at all this "
+                     "window (no [app] fps line): the window is frozen or black, whatever the "
+                     "other numbers say. `declines=` names why the renderer refused GPU present "
+                     "(none-recorded: the final span never reached the publish, e.g. its draws "
+                     "were dropped); next: dropped-draws and its reasons, the [present] GPU "
+                     "PRESENT DECLINED line, PROSPER_PRESENT_HANDOFF_TRACE=1; cf. #3951";
             out.push_back(std::move(a));
         }
     }

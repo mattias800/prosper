@@ -128,6 +128,10 @@ enum class Gauge : uint8_t {
     // The persistent colour-target cache's two admission bounds (persistent_target_census.hpp).
     PersistentTargetEntryLimit,
     PersistentTargetByteLimit,
+    // 1 while a GPU-present consumer (prosper-app's swapchain) is attached: set_gpu_present_active.
+    // Frontends without one (tools/screenshot, boot_trace) present nothing by design, so a window
+    // with no presents there is not a stall (gpu-present-stalled).
+    GpuPresentActive,
     Count
 };
 
@@ -275,6 +279,10 @@ constexpr size_t kPresentDeclineSlots = 24;
 // include). The recorder passes the reason's name as a string literal, stored by pointer, and
 // static_asserts that the enum fits.
 constexpr size_t kRttDestinationRefusalSlots = 24;
+// The refusal name (prosper::gpu::live_target_import_refusal_name) that means "the persistent
+// colour-target cache had no room". live_compute.cpp static_asserts the two spellings agree, so a
+// rename on either side fails to compile instead of silently muting color-target-count-ceiling.
+constexpr const char* kDestinationCreationRefused = "destination-creation-refused";
 
 // WHY a compute storage-writeback result is not an exact, whole, single-level 2D overwrite -- the
 // FIRST failing field of live_compute's exact_full_result, in the order it tests them -- or, for a
@@ -341,6 +349,7 @@ struct Ledger {
     std::atomic<const char*> present_decline_names[kPresentDeclineSlots] = {};
     std::atomic<uint64_t> rtt_destination_refused_bytes[kRttDestinationRefusalSlots] = {};
     std::atomic<const char*> rtt_destination_refusal_names[kRttDestinationRefusalSlots] = {};
+    std::atomic<uint64_t> rtt_destination_refusals[kRttDestinationRefusalSlots] = {};
     std::atomic<uint64_t> exact_result_declines[kExactResultDeclineCount] = {};
     // The one attribution string a cost may carry: which HLE lock blocked, for instance. A pointer
     // to a string literal, stored without copying.
@@ -404,6 +413,7 @@ inline void note_rtt_destination_refusal(size_t slot, const char* name, uint64_t
     Ledger& l = ledger();
     l.rtt_destination_refusal_names[slot].store(name, std::memory_order_relaxed);
     l.rtt_destination_refused_bytes[slot].fetch_add(bytes, std::memory_order_relaxed);
+    l.rtt_destination_refusals[slot].fetch_add(1, std::memory_order_relaxed);
     add(Counter::RttDestinationRefusals);
     add(Counter::RttDestinationRefusedBytes, bytes);
 }

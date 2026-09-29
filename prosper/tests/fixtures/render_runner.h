@@ -4443,8 +4443,13 @@ inline bool compute_overwrite_destination_eviction_enabled() {
     static const bool enabled = std::getenv("PROSPER_NO_COMPUTE_RTT_DEST_EVICT") == nullptr;
     return enabled;
 }
+// `allocation_failed` (optional) is set when the refusal was Vulkan's, not the cache bound's, so the
+// caller can report the two differently (destination-allocation-failed vs -creation-refused).
 inline PersistentColorTargetImage* ensure_persistent_color_target_for_compute_overwrite(
-        uint64_t id, uint32_t width, uint32_t height, VkFormat format) {
+        uint64_t id, uint32_t width, uint32_t height, VkFormat format,
+        bool* allocation_failed = nullptr) {
+    if (allocation_failed) *allocation_failed = false;
+    const auto vulkan_failed = [&]() { if (allocation_failed) *allocation_failed = true; };
     const BackendPersistentResourceGuard guard;
     if (!id || !width || !height || backend_has_unproven_submission()) return nullptr;
     const RenderVkCtx& ctx = render_vk_ctx();
@@ -4472,8 +4477,10 @@ inline PersistentColorTargetImage* ensure_persistent_color_target_for_compute_ov
     image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     VkImage image = VK_NULL_HANDLE;
-    if (vkCreateImage(ctx.dev, &image_info, nullptr, &image) != VK_SUCCESS || !image)
+    if (vkCreateImage(ctx.dev, &image_info, nullptr, &image) != VK_SUCCESS || !image) {
+        vulkan_failed();
         return fail();
+    }
     VkMemoryRequirements requirements{};
     vkGetImageMemoryRequirements(ctx.dev, image, &requirements);
     const VkDeviceSize limit = persistent_color_target_limit();
@@ -4500,11 +4507,13 @@ inline PersistentColorTargetImage* ensure_persistent_color_target_for_compute_ov
             ctx.phys, ctx.dev, prosper::gpu::GpuOnlyMemoryClass::PersistentColorTarget,
             requirements.memoryTypeBits, allocation, &memory) != VK_SUCCESS || !memory) {
         vkDestroyImage(ctx.dev, image, nullptr);
+        vulkan_failed();
         return fail();
     }
     if (vkBindImageMemory(ctx.dev, image, memory, 0) != VK_SUCCESS) {
         vkDestroyImage(ctx.dev, image, nullptr);
         prosper::gpu::free_device_memory(ctx.dev, memory);
+        vulkan_failed();
         return fail();
     }
     VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -4516,6 +4525,7 @@ inline PersistentColorTargetImage* ensure_persistent_color_target_for_compute_ov
     if (vkCreateImageView(ctx.dev, &view_info, nullptr, &view) != VK_SUCCESS || !view) {
         vkDestroyImage(ctx.dev, image, nullptr);
         prosper::gpu::free_device_memory(ctx.dev, memory);
+        vulkan_failed();
         return fail();
     }
     target.image = image;
