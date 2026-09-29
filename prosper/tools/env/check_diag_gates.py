@@ -83,7 +83,9 @@ silently stops describing the tree, which is the same failure class this tool ex
     in the tree is a REFERENCE member and every designated initialiser of it is env-derived. A
     same-named value member anywhere retires the name, which also hides a genuine context gate. A
     context forwarded into a second context is followed only as a SAME-NAME pass-through
-    (`auto& x = ctx.x;` then `Inner{.x = x}`), which is not counted as a new initialiser; any other
+    (`auto& x = ctx.x;` then `Inner{.x = x}`), which is not counted as a new initialiser, and only
+    while that rebind is the innermost declaration of `x` -- a nested local or a lambda/function
+    parameter of the same name shadows it and counts as an ordinary initialiser. Any other
     forwarding (`.x = y`) retires the name. A member initialised positionally, or from a non-alias
     value, is invisible.
   - `#if`-gated code is scanned as if it were live.
@@ -199,6 +201,33 @@ ASSIGN_TO_NAME_RE = re.compile(r"\b([A-Za-z_]\w*)\s*=(?!=)")
 # `Ctx{.rtt_log = rtt_log, ...}` and the callee rebinds `auto& rtt_log = ctx.rtt_log;`.
 DESIGNATED_INIT_RE = re.compile(r"(?:^|[{,(])\s*\.([A-Za-z_]\w*)\s*=(?!=)\s*([^,}]+)")
 # `obj.name` / `obj->name` / `ptr->name`: a member READ that may stand for a context member.
+# The parenthesised list directly before a `{`: a function/lambda parameter list, or a control
+# header. Used only to find names a new scope DECLARES (#3954 review: shadowing).
+PARAM_LIST_RE = re.compile(
+    r"(\]|\b[A-Za-z_]\w*)\s*\(([^()]*)\)\s*"
+    r"(?:(?:mutable|noexcept|const|override|final)\s*|->\s*[\w:<>,\*&\s]+?\s*)*$")
+
+
+def declared_params(prefix: str) -> set[str]:
+    """Names the scope opened right after `prefix` declares in its header (a lambda or function
+    parameter list, a range-for or classic-for variable, a catch parameter). An `if`/`while`/
+    `switch` condition declares nothing. Over-reporting only makes the pass-through exemption
+    rarer, which retires a name (hides findings) rather than inventing a gate."""
+    m = PARAM_LIST_RE.search(prefix)
+    if not m or m.group(1) in ("if", "while", "switch", "return", "sizeof", "decltype"):
+        return set()
+    body = m.group(2)
+    if m.group(1) == "for":
+        body = re.split(r"[:;]", body, maxsplit=1)[0]
+    names = set()
+    for param in body.split(","):
+        param = param.split("=", 1)[0]
+        idents = re.findall(r"[A-Za-z_]\w*", param)
+        if idents:
+            names.add(idents[-1])
+    return names
+
+
 MEMBER_READ_RE = re.compile(r"(?:(?<=[\w\)\]])\.|->)([A-Za-z_]\w*)\b")
 
 # A COMPILED-IN CONSTANT -- the thing a "supply a default" statement assigns. Deliberately narrower
@@ -701,6 +730,9 @@ class Scope:
         # Names rebound from a same-named context member (`auto& x = ctx.x;`): handing `x` on as
         # `.x = x` is a pass-through of that member, not a new initialiser (#3892).
         self.member_rebinds: set[str] = set()
+        # Every other name DECLARED in this scope: locals, and the parameters of the function,
+        # lambda or `for`/`catch` header that opened it. One of these shadows an outer rebind.
+        self.declared: set[str] = set()
         # var -> (decl line, [(line, gates)] writes, [(line, gates)] prints)
         self.decls: dict[str, tuple] = {}
 
@@ -841,6 +873,25 @@ class FileScanner:
         return "(" + " && ".join(
             "(" + " || ".join(f'getenv("{n}")' for n in sorted(cl)) + ")"
             for cl in sorted(ctx, key=lambda c: sorted(c))) + ")"
+
+    def is_member_pass_through(self, name: str, line_prefix: str) -> bool:
+        """`.name = name` hands on the SAME context member only when the `name` in scope IS the
+        rebind (`auto& name = ctx.name;`): the innermost scope declaring `name` must be one that
+        rebound it. A nested local or a lambda/function parameter of that name shadows the rebind,
+        and its value is an ordinary initialiser (#3954 review, the #3940 bug class). Declarations
+        earlier on the initialiser's OWN line are not on the scope stack yet, so the line prefix is
+        checked for them too."""
+        for pos, ch in enumerate(line_prefix):
+            if ch == "{" and name in declared_params(line_prefix[:pos]):
+                return False
+        if re.search(r"(?<![\.\w>])" + re.escape(name) + r"\s*=(?!=)", line_prefix):
+            return False
+        for sc in reversed(self.stack):
+            if name in sc.member_rebinds:
+                return True
+            if name in sc.declared:
+                return False
+        return False
 
     @staticmethod
     def alias_is_a_gate(rhs: str) -> bool:
@@ -1064,8 +1115,8 @@ class FileScanner:
                     # A context handed on (`auto& x = ctx.x;` then `Inner{.x = x}`, #3892's
                     # buffer branch) passes the SAME member through; it is not a second, ungated
                     # initialiser that would retire the name for both contexts.
-                    if dm3.group(2).strip() == dm3.group(1) and any(
-                            dm3.group(1) in sc.member_rebinds for sc in self.stack):
+                    if dm3.group(2).strip() == dm3.group(1) and \
+                            self.is_member_pass_through(dm3.group(1), raw[:dm3.start()]):
                         continue
                     self.member_writes.setdefault(dm3.group(1), []).append(
                         clauses_of(self.expand(dm3.group(2))))
@@ -1076,9 +1127,25 @@ class FileScanner:
                 if dm2:
                     eq = raw.find("=", raw.find(dm2.group(1)) + len(dm2.group(1)))
                     rhs, used = self.gather_statement(i, eq + 1) if eq >= 0 else (dm2.group(2), 1)
+                    # A multi-line initialiser (a lambda, a braced aggregate) is consumed whole,
+                    # so the designated initialisers on its LATER lines never reach the per-line
+                    # record above. Record them here, with the statement so far as the prefix a
+                    # lambda parameter would shadow from (#3954 review).
+                    if self.member_writes is not None and used > 1 and not is_def:
+                        for k in range(i + 1, i + used):
+                            later = self.lines[k]
+                            for dm4 in DESIGNATED_INIT_RE.finditer(later):
+                                prefix = " ".join(self.lines[i:k]) + " " + later[:dm4.start()]
+                                if dm4.group(2).strip() == dm4.group(1) and \
+                                        self.is_member_pass_through(dm4.group(1), prefix):
+                                    continue
+                                self.member_writes.setdefault(dm4.group(1), []).append(
+                                    clauses_of(self.expand(dm4.group(2))))
                     if re.fullmatch(r"\s*[A-Za-z_]\w*\s*(?:\.|->)\s*" + re.escape(dm2.group(1))
                                     + r"\s*;?\s*", rhs):
                         self.stack[-1].member_rebinds.add(dm2.group(1))
+                    else:
+                        self.stack[-1].declared.add(dm2.group(1))
                     consumed = max(consumed, used)
                     ctx = clauses_of(self.expand(rhs))
                     if ctx and self.alias_is_a_gate(rhs):
@@ -1101,11 +1168,12 @@ class FileScanner:
             # empty one, discarding every alias and gate declared in it. That silently unarmed the
             # `interval` alias two lines after it was declared.
             first_open = True
-            for ch in text:
+            for pos, ch in enumerate(text):
                 if ch == "{":
                     gates = cond_gates if (first_open and cond is not None and not is_else) \
                         else frozenset()
                     self.stack.append(Scope(gates))
+                    self.stack[-1].declared |= declared_params(text[:pos])
                     first_open = False
                 elif ch == "}":
                     if len(self.stack) > 1:
@@ -1655,6 +1723,39 @@ void middle(const DetailCtx& ctx) {
 void middle2(const DetailCtx& ctx) {
     auto& detail = ctx.detail;
     callee(DetailCtx{ .detail = true });
+}
+""", []),
+    ("context member (#3954 review): a block-scope local that SHADOWS the rebind is an ordinary "
+     "initialiser, so `.detail = detail` from it retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void middle3(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    {
+        const bool detail = compute_something();
+        callee(DetailCtx{ .detail = detail });
+    }
+}
+""", []),
+    ("context member (#3954 review): a LAMBDA PARAMETER that shadows the rebind is an ordinary "
+     "initialiser, so `.detail = detail` from it retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void middle4(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    auto f = [](bool detail) { callee(DetailCtx{ .detail = detail }); };
+    f(true);
+}
+""", []),
+    ("context member (#3954 review): a multi-line lambda parameter shadows the rebind as well",
+     _CONTEXT_MEMBER_FIXTURE + """
+void middle5(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    auto f = [&](bool detail) {
+        callee(DetailCtx{ .detail = detail });
+    };
+    f(true);
 }
 """, []),
     ("context member (#3919): one UNGATED initialiser anywhere retires the name, so `.x = true` "
