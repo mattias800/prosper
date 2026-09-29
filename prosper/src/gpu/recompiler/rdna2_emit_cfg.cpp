@@ -1525,6 +1525,8 @@ void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& in
     rs.smem_pointer_loads = proven_smem_pointer_loads(ins);
     const auto raw_x2_data = proven_raw_x2_data_loads_impl(ins);
     rs.smem_raw_x2_data_loads.insert(raw_x2_data.begin(), raw_x2_data.end());
+    const auto raw_wide_data = rdna2_raw_wide_data_loads(ins);
+    rs.smem_raw_wide_data_loads.insert(raw_wide_data.begin(), raw_wide_data.end());
     rs.smem_pointer_analysis_done = true;
 }
 
@@ -4130,6 +4132,7 @@ bool emit_cfg_state_machine(
         state.smem_x16_descriptor_analysis_done = initial.smem_x16_descriptor_analysis_done;
         state.smem_pointer_loads = initial.smem_pointer_loads;
         state.smem_raw_x2_data_loads = initial.smem_raw_x2_data_loads;
+        state.smem_raw_wide_data_loads = initial.smem_raw_wide_data_loads;
         state.smem_pointer_analysis_done = initial.smem_pointer_analysis_done;
         state.smem_x2_descriptor_fragment_loads =
             initial.smem_x2_descriptor_fragment_loads;

@@ -200,6 +200,9 @@ struct Rdna2Inst;
 // supported B32 scalar operations before control transfer. This proves that the emitted
 // shader needs actual current bytes; it does not classify all later derived values.
 std::vector<uint32_t> rdna2_proven_raw_x2_data_loads(const std::vector<Rdna2Inst>& instructions);
+// Non-null raw x4/x8 SMEM loads whose words have an ordinary scalar/vector data reader before
+// replacement. Such loads cannot use the descriptor-only zero-placeholder lowering.
+std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& instructions);
 
 // Per-invocation provenance for fail-visible shader diagnostics. This is observation-only metadata:
 // it must travel beside the translation inputs rather than participate in compiled-module identity,

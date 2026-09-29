@@ -7,8 +7,10 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/texture/tile.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstdio>
+#include <iterator>
 #include <string>
 #include <vector>
 #ifdef _WIN32
@@ -884,6 +886,83 @@ int main() {
     CHECK(recompile_valu(smem_x16_data, std::size(smem_x16_data), 2, 0,
                          &smem_x16_data_rt).empty(),
           "x16 load with an ordinary scalar/vector consumer remains fail-visible");
+
+    // A non-null raw x4/x8 load is not automatically a descriptor. The old lowering replaced
+    // every word by zero, even when vector arithmetic consumed the loaded bytes as data.
+    const std::array<uint32_t, 5> raw_x8_data = {
+        0xbe940380u,                 // s_mov_b32 s20, 0 (register SOFFSET)
+        0xf40c0100u, 0x28000000u,   // s_load_dwordx8 s[4:11], s[0:1], s20
+        0x7e000204u,                 // v_mov_b32 v0, s4: ordinary data observation
+        0xbf810000u,
+    };
+    const std::array<uint32_t, 5> raw_x4_data = {
+        0xbe940380u,
+        0xf4080100u, 0x28000000u,   // s_load_dwordx4 s[4:7], s[0:1], s20
+        0x7e000206u,                 // v_mov_b32 v0, s6
+        0xbf810000u,
+    };
+    ShaderResourceTable raw_wide_table;
+    auto raw_wide_data_pcs = [](const auto& code) {
+        std::vector<Rdna2Inst> decoded;
+        rdna2_walk(std::data(code), std::size(code), decoded);
+        return rdna2_raw_wide_data_loads(decoded);
+    };
+    CHECK(raw_wide_data_pcs(raw_x8_data) == std::vector<uint32_t>{1u} &&
+              raw_wide_data_pcs(raw_x4_data) == std::vector<uint32_t>{1u} &&
+              recompile_valu(raw_x8_data.data(), std::size(raw_x8_data), 1, 0,
+                             &raw_wide_table).empty() &&
+              recompile_valu(raw_x4_data.data(), std::size(raw_x4_data), 1, 0,
+                             &raw_wide_table).empty(),
+          "raw register-offset wide data loads reject instead of silently substituting zero");
+    const std::array<uint32_t, 6> raw_x4_overwritten = {
+        0xbe940380u,
+        0xf4080100u, 0x28000000u,
+        0xbe860380u,                 // replace s6 before its ordinary use
+        0x7e000206u,
+        0xbf810000u,
+    };
+    CHECK(raw_wide_data_pcs(raw_x4_overwritten).empty() &&
+              !recompile_valu(raw_x4_overwritten.data(), std::size(raw_x4_overwritten), 1, 0,
+                              &raw_wide_table).empty(),
+          "a replaced word cannot make an earlier raw descriptor load look like data");
+    const std::array<uint32_t, 6> raw_x8_branch_data = {
+        0xbe940380u,
+        0xf40c0100u, 0x28000000u,
+        0xbf840001u,                 // conditional branch around the data reader
+        0x7e000204u,
+        0xbf810000u,
+    };
+    const std::array<uint32_t, 6> raw_x8_skipped_data = {
+        0xbe940380u,
+        0xf40c0100u, 0x28000000u,
+        0xbf820001u,                 // unconditional branch around the same reader
+        0x7e000204u,
+        0xbf810000u,
+    };
+    CHECK(raw_wide_data_pcs(raw_x8_branch_data) == std::vector<uint32_t>{1u} &&
+              raw_wide_data_pcs(raw_x8_skipped_data).empty(),
+          "control-flow walk includes possible data reads and excludes unreachable ones");
+    const std::array<uint32_t, 7> raw_x4_vopc_high_data = {
+        0xbe940380u,
+        0xf4080100u, 0x28000000u, // raw x4 writes s[4:7]
+        0xbe840380u,               // overwrite only s4
+        0xd4a2006au, 0x00010004u, // v_cmp_eq_i64_e64 vcc,s[4:5],0 still reads s5
+        0xbf810000u,
+    };
+    CHECK(raw_wide_data_pcs(raw_x4_vopc_high_data) == std::vector<uint32_t>{1u} &&
+              recompile_valu(raw_x4_vopc_high_data.data(), std::size(raw_x4_vopc_high_data), 1, 0,
+                             &raw_wide_table).empty(),
+          "a 64-bit VOPC reads the live high half after its low half is overwritten");
+    const std::array<uint32_t, 7> raw_x8_no_effect_sopp = {
+        0xbe940380u,
+        0xf40c0100u, 0x28000000u,
+        0xbf900000u,               // s_sendmsg
+        0xbf960000u,               // s_ttracedata
+        0xbf970001u,               // s_cbranch_cdbgsys (debugger absent, falls through)
+        0xbf810000u,
+    };
+    CHECK(raw_wide_data_pcs(raw_x8_no_effect_sopp).empty(),
+          "no-effect SOPP instructions preserve descriptor-only raw wide admission");
 
     ShaderResourceTable smem_x16_missing_rt;
     smem_x16_missing_rt.resources.push_back(x16_texture(4, 2));
