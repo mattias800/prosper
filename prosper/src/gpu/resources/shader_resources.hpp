@@ -331,6 +331,10 @@ struct ShaderResource {
     //     metadata provenance; MTBUF requires this validated live-V# identity so FORMAT=INVALID cannot be
     //     resurrected through an older metadata resource. 0xFFFFFFFF = unset.
     uint32_t      fetch_pc      = 0xFFFFFFFFu;
+    // Only the live one-hop raw-data gate sets this after owning both parent and child bytes and
+    // proving the full write set physically disjoint. The compiler key partitions on the admitted
+    // byte count, so a later refused dispatch cannot reuse its emitted numeric SMEM module.
+    bool          nested_raw_snapshot_admitted = false;
     VertexFetchIndexMode fetch_index_mode = VertexFetchIndexMode::Automatic;
 
     // BVH descriptor BOX_GROW (bits 62:55). IMAGE_BVH_INTERSECT_RAY expands box intervals by

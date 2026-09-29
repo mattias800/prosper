@@ -1145,6 +1145,61 @@ int main() {
               recompile_valu(nested_x4_numeric.data(), nested_x4_numeric.size(),
                              1, 0, &nested_x4_parent_table).empty(),
           "unbacked nested x4 numeric load refuses the parent's unrelated buffer");
+    std::vector<Rdna2Inst> nested_decoded;
+    rdna2_walk(nested_x4_numeric.data(), nested_x4_numeric.size(), nested_decoded);
+    CHECK(rdna2_proven_raw_nested_wide_data_loads(nested_decoded) ==
+              std::vector<uint32_t>{2u},
+          "one-hop child has a single dominating current-byte parent");
+    std::array<uint8_t, 64> nested_owned_bytes{};
+    ShaderResourceTable nested_backed_table = nested_x4_parent_table;
+    ShaderResource nested_child{};
+    nested_child.cls = ResourceClass::ConstantBuffer;
+    nested_child.binding = 3;
+    nested_child.fetch_pc = 2;
+    nested_child.size = nested_owned_bytes.size();
+    nested_child.host_data = nested_owned_bytes.data();
+    nested_child.host_data_size = nested_owned_bytes.size();
+    nested_child.nested_raw_snapshot_admitted = true;
+    nested_backed_table.resources.push_back(nested_child);
+    CHECK(!recompile_valu(nested_x4_numeric.data(), nested_x4_numeric.size(),
+                          1, 0, &nested_backed_table).empty(),
+          "exact child PC with owned bytes enters the numeric SMEM path");
+    nested_backed_table.resources.back().host_data = nullptr;
+    CHECK(recompile_valu(nested_x4_numeric.data(), nested_x4_numeric.size(),
+                         1, 0, &nested_backed_table).empty(),
+          "unowned child bytes cannot use the new backing path");
+    const std::array<uint32_t, 7> nested_clobbered = {
+        nested_x4_numeric[0], nested_x4_numeric[1],
+        0xbea80300u, // overwrite s40 after the parent
+        nested_x4_numeric[2], nested_x4_numeric[3],
+        nested_x4_numeric[4], nested_x4_numeric[5],
+    };
+    std::vector<Rdna2Inst> nested_clobbered_decoded;
+    rdna2_walk(nested_clobbered.data(), nested_clobbered.size(),
+               nested_clobbered_decoded);
+    CHECK(rdna2_proven_raw_nested_wide_data_loads(nested_clobbered_decoded).empty(),
+          "one-hop child refuses a shader-clobbered pointer word");
+    const std::array<uint32_t, 7> nested_bypassed = {
+        0xbf840002u, // one edge jumps around the parent to the child
+        nested_x4_numeric[0], nested_x4_numeric[1],
+        nested_x4_numeric[2], nested_x4_numeric[3],
+        nested_x4_numeric[4], nested_x4_numeric[5],
+    };
+    std::vector<Rdna2Inst> nested_bypassed_decoded;
+    rdna2_walk(nested_bypassed.data(), nested_bypassed.size(), nested_bypassed_decoded);
+    CHECK(rdna2_proven_raw_nested_wide_data_loads(nested_bypassed_decoded).empty(),
+          "one-hop child refuses a path that bypasses its pointer producer");
+    const std::array<uint32_t, 7> nested_child_bypassed = {
+        nested_x4_numeric[0], nested_x4_numeric[1],
+        0xbf840002u, // branch from pc2 around child at pc3 to numeric reader pc5
+        nested_x4_numeric[2], nested_x4_numeric[3],
+        nested_x4_numeric[4], nested_x4_numeric[5],
+    };
+    std::vector<Rdna2Inst> nested_child_bypassed_decoded;
+    rdna2_walk(nested_child_bypassed.data(), nested_child_bypassed.size(),
+               nested_child_bypassed_decoded);
+    CHECK(rdna2_proven_raw_nested_wide_data_loads(nested_child_bypassed_decoded).empty(),
+          "one-hop child refuses a branch that bypasses its own definition");
     auto nested_x8_numeric = nested_x4_numeric;
     nested_x8_numeric[2] = 0xf40c0b14u; // child x8 s[44:51], same numeric s46 use
     CHECK(raw_wide_data_pcs(nested_x8_numeric) ==

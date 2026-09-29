@@ -2608,6 +2608,48 @@ int main(int argc, char** argv) {
         std::filesystem::remove_all(address_dir, address_ec);
     }
 
+    // A later dispatch can resolve the same exact child PC but fail the mapping/alias admission.
+    // Its table still carries the child resource for diagnostics; only the admitted snapshot
+    // marker partitions the compiled numeric load from the fail-visible refusal. Keep this
+    // intentionally rejected compile after diagnostic-identity tests: terminal reject records
+    // are process-global and change those tests' once-per-address expectations.
+    clear_shader_recompile_cache();
+    static const uint32_t kNestedRaw[] = {
+        0xf4080a00u, 0xfa000000u, // parent x4 s40 from entry s0
+        0xf4080b14u, 0xfa000010u, // child x4 s44 from s40
+        0x7e00022eu,              // numeric use of s46
+        0xbf810000u,
+    };
+    std::array<uint8_t, 64> nested_bytes{};
+    ShaderResource nested_parent;
+    nested_parent.cls = ResourceClass::ConstantBuffer;
+    nested_parent.binding = 2;
+    nested_parent.fetch_pc = 0;
+    nested_parent.size = 64;
+    ShaderResource nested_child = nested_parent;
+    nested_child.binding = 3;
+    nested_child.fetch_pc = 2;
+    nested_child.host_data = nested_bytes.data();
+    nested_child.host_data_size = nested_bytes.size();
+    nested_child.nested_raw_snapshot_admitted = true;
+    ShaderResourceTable admitted_nested;
+    admitted_nested.resources = {nested_parent, nested_child};
+    const auto nested_positive = recompile_compute_shader_cached(
+        kNestedRaw, std::size(kNestedRaw), &admitted_nested, compute_config);
+    ShaderResourceTable refused_nested = admitted_nested;
+    refused_nested.resources[1].nested_raw_snapshot_admitted = false;
+    refused_nested.resources[1].host_data = nullptr;
+    refused_nested.resources[1].host_data_size = 0;
+    const auto nested_refused = recompile_compute_shader_cached(
+        kNestedRaw, std::size(kNestedRaw), &refused_nested, compute_config);
+    const auto nested_positive_again = recompile_compute_shader_cached(
+        kNestedRaw, std::size(kNestedRaw), &admitted_nested, compute_config);
+    stats = shader_recompile_cache_stats();
+    CHECK(!nested_positive.empty() && nested_refused.empty() &&
+              nested_positive_again == nested_positive &&
+              stats.misses >= 2 && stats.hits >= 1,
+          "admitted numeric child cannot warm-hit a later refused dispatch");
+
     // Concurrent cache scaling: multiple threads querying the cache concurrently under shared_lock
     {
         // Prime the cache with one entry so all worker lookups are warm hits under shared_lock

@@ -465,4 +465,83 @@ std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
     return proven;
 }
 
+std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(
+        const std::vector<Rdna2Inst>& ins) {
+    std::vector<uint32_t> proven;
+    if (ins.empty()) return proven;
+    const auto parents = rdna2_proven_raw_immediate_wide_data_loads(ins);
+    const auto needs_backing = rdna2_raw_wide_data_loads(ins);
+    if (parents.empty() || needs_backing.empty()) return proven;
+    std::unordered_map<uint32_t, size_t> by_pc;
+    for (size_t i = 0; i < ins.size(); ++i) {
+        if (ins[i].fmt == Rdna2Format::Unknown || !ins[i].len_dwords ||
+            !by_pc.emplace(ins[i].pc, i).second) return {};
+    }
+    for (const Rdna2Inst& in : ins) {
+        if (in.fmt != Rdna2Format::SOPP || in.is_end) continue;
+        if (sopp_opcode_is_direct_branch(in.opcode)) {
+            const int64_t target = static_cast<int64_t>(in.pc) +
+                in.len_dwords + in.simm16;
+            if (target <= static_cast<int64_t>(in.pc) || target > UINT32_MAX ||
+                !by_pc.contains(static_cast<uint32_t>(target))) return {};
+        } else if (!sopp_is_noop(in) && in.opcode != kSoppOpcodeBarrier) {
+            return {};
+        }
+    }
+    for (size_t child_index = 0; child_index < ins.size(); ++child_index) {
+        const Rdna2Inst& child = ins[child_index];
+        if (child.fmt != Rdna2Format::SMEM ||
+            (child.opcode != 0x2u && child.opcode != 0x3u) ||
+            child.dst.kind != OperandKind::SGPR ||
+            child.src[0].kind != OperandKind::SGPR ||
+            child.src[0].value < 0 || child.src[0].value + 1 >= 106 ||
+            child.src[1].kind != OperandKind::Special || child.src[1].value != 125 ||
+            static_cast<int32_t>(child.literal) < 0 || (child.literal & 3u) ||
+            !std::binary_search(needs_backing.begin(), needs_backing.end(), child.pc))
+            continue;
+        size_t parent_index = ins.size();
+        for (size_t i = 0; i < child_index; ++i) {
+            const Rdna2Inst& candidate = ins[i];
+            if (candidate.fmt == Rdna2Format::SMEM &&
+                (candidate.opcode == 0x2u || candidate.opcode == 0x3u) &&
+                candidate.dst.kind == OperandKind::SGPR &&
+                candidate.dst.value == child.src[0].value &&
+                std::binary_search(parents.begin(), parents.end(), candidate.pc))
+                parent_index = i;
+        }
+        if (parent_index == ins.size()) continue;
+        bool stable = true;
+        const RawWideLifetime child_lifetime(ins, by_pc, child_index,
+                                             child.opcode == 0x2u ? 4u : 8u);
+        for (size_t i = 0; i < child_index && stable; ++i) {
+            const Rdna2Inst& preceding = ins[i];
+            if (i > parent_index)
+                for_each_scalar_write(preceding, [&](int base, uint32_t width) {
+                    if (base >= 0 && base < child.src[0].value + 2 &&
+                        base + static_cast<int>(width) > child.src[0].value)
+                        stable = false;
+                });
+            if (i < parent_index && preceding.fmt == Rdna2Format::SOPP &&
+                sopp_opcode_is_direct_branch(preceding.opcode)) {
+                const int64_t target = static_cast<int64_t>(preceding.pc) +
+                    preceding.len_dwords + preceding.simm16;
+                if (target > static_cast<int64_t>(ins[parent_index].pc) &&
+                    target <= static_cast<int64_t>(child.pc)) stable = false;
+            }
+            // A branch around the child can join a numeric reader with no child definition.
+            // The parent-dominance check above does not cover this second edge.
+            if (preceding.fmt == Rdna2Format::SOPP &&
+                sopp_opcode_is_direct_branch(preceding.opcode)) {
+                const int64_t target = static_cast<int64_t>(preceding.pc) +
+                    preceding.len_dwords + preceding.simm16;
+                if (target > static_cast<int64_t>(child.pc) &&
+                    child_lifetime.has_reader_after_bypassed_load(
+                        by_pc.at(static_cast<uint32_t>(target)))) stable = false;
+            }
+        }
+        if (stable) proven.push_back(child.pc);
+    }
+    return proven;
+}
+
 } // namespace prosper::gpu

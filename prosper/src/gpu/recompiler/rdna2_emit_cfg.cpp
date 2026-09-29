@@ -1765,6 +1765,9 @@ void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& in
     const auto raw_immediate_wide_data = rdna2_proven_raw_immediate_wide_data_loads(ins);
     rs.smem_raw_immediate_wide_data_loads.insert(raw_immediate_wide_data.begin(),
                                                 raw_immediate_wide_data.end());
+    const auto raw_nested_wide_data = rdna2_proven_raw_nested_wide_data_loads(ins);
+    rs.smem_raw_nested_wide_data_loads.insert(raw_nested_wide_data.begin(),
+                                              raw_nested_wide_data.end());
     const auto raw_wide_data = rdna2_raw_wide_data_loads(ins);
     rs.smem_raw_wide_data_loads.insert(raw_wide_data.begin(), raw_wide_data.end());
     rs.smem_pointer_analysis_done = true;

@@ -43,9 +43,11 @@ extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr);
 extern "C" const void* prosper_agc_fused_back_header_for_front(uint64_t front_code_addr);
 extern "C" uint64_t prosper_agc_shader_continuation_for_code(uint64_t code_addr);
 
+namespace prosper { class GuestMappingLease; }
 namespace prosper::gpu {
 
 struct ShaderResourceTable;   // fwd (shader_resources.hpp); passed to the backend so it can bind resources
+struct Rdna2Inst;
 
 // Generation-scoped host-readability guard used while a synchronous GPU submit is active. Positive
 // mapping ranges are cached for that submit only and discarded before guest code can reuse an address.
@@ -274,7 +276,9 @@ struct SrtUse {
     // Exact mapped source of the eight live T# dwords, when every word still descends from the
     // same contiguous mapped range, possibly via adjacent scalar loads. Zero means the live
     // descriptor was seeded directly, assembled from unrelated loads, or modified by scalar ALU.
-    // This is diagnostic provenance only; resource lookup and materialization never consume it.
+    // Resource lookup and materialization do not consume it. The guarded nested-wide admission
+    // additionally verifies these current bytes against t8 before using the range for a physical
+    // write-alias proof; absent or changed provenance refuses that admission.
     uint64_t descriptor_source_addr = 0;
     std::array<uint32_t, 4> v4{};    // V# dwords as loaded (kind 1)
     // RUNTIME-SELECTED descriptor table (#2481). Non-zero record count means this consumer's SRSRC
@@ -396,6 +400,14 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                                                  uint32_t tgid_x_sgpr = UINT32_MAX,
                                                  const ComputeResourceDispatchContext*
                                                      dispatch_context = nullptr);
+
+// Called after a live dispatch's exact resources are built, under its HLE mapping lease. On
+// success, binds owned parent/child snapshots for structurally proven one-hop raw data loads.
+// A refusal leaves the table unchanged so the recompiler's missing-backing guard still rejects.
+bool admit_compute_nested_wide_data(const prosper::GuestMappingLease* mapping_lease,
+                                    const std::vector<Rdna2Inst>& decoded,
+                                    const std::vector<SrtUse>& uses,
+                                    ShaderResourceTable& table);
 
 // Apply the exact dispatch-scoped resource-path specialization used by the live compute executor.
 // The report makes the production decision observable to tests and diagnostics: callers can verify
@@ -1521,7 +1533,8 @@ LiveTargetByteReadResult read_live_render_target_bytes(uint64_t gpu_addr, uint32
                                                        std::vector<uint8_t>& output);
 std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st,
                                                      uint64_t submit_no = 0,
-                                                     std::vector<OperationRealizationFailure>* failures = nullptr);
+                                                     std::vector<OperationRealizationFailure>* failures = nullptr,
+                                                     std::unique_ptr<prosper::GuestMappingLease>* mapping_lease = nullptr);
 // Execute retained dispatches and address-backed DMA copies in PM4 order when graphics rendering is
 // intentionally skipped or unavailable. Draw operations are omitted, but still delimit ordering.
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no = 0);
