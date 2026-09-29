@@ -203,6 +203,66 @@ def canonical_include(source_rel: str, header_name: str) -> str:
     return header_name
 
 
+QUOTED_INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"')
+
+
+def include_target(line: str) -> str | None:
+    """The path of a quoted `#include "..."` line, else None (angle includes never name ours)."""
+    m = QUOTED_INCLUDE.match(line)
+    return m.group(1) if m else None
+
+
+def names_header(path: str, header_full: str) -> bool:
+    """Does an include PATH name the destination header, whose repo path is HEADER_FULL?
+
+    The same header is spelled several ways across this tree: bare beside its source
+    (`live_renderer_internal.hpp`), from a source root (`shared/live/live_renderer_internal.hpp`,
+    `gpu/recompiler/x.hpp`), or any other trailing run of its directories. All of them are the
+    header; a file with the same basename in some other directory is not, so a plain basename
+    match is deliberately not enough (#3922).
+    """
+    return path == pathlib.PurePosixPath(header_full).name or header_full.endswith("/" + path)
+
+
+def text_includes_header(text: str, header_full: str) -> bool:
+    return any((t := include_target(line)) is not None and names_header(t, header_full)
+               for line in text.splitlines())
+
+
+def header_repo_path(source_rel: str, header_rel: str) -> str:
+    """The destination header's repo-relative path: it is written beside its source."""
+    return str(pathlib.PurePosixPath(source_rel).parent / header_rel)
+
+
+def cyclic_includes(preamble: str, source_dir: pathlib.Path, roots: list[pathlib.Path],
+                    header_full: str) -> set[str]:
+    """Preamble includes whose file itself includes the destination header.
+
+    The preamble is copied into the header, and a source file that already uses the header it is
+    promoting into typically includes headers that include it back -- #3892 part 2 copied
+    `draw_resources.hpp` and `timing_report.hpp` into `live_renderer_internal.hpp`, both of which
+    include `live_renderer_internal.hpp`. `#pragma once` hides the cycle, so it builds, but the
+    header can no longer be included first on its own. One level deep: a longer cycle needs a real
+    include graph, and this tool only needs to stop CREATING the direct ones.
+    """
+    found: set[str] = set()
+    for line in preamble.splitlines():
+        target = include_target(line)
+        if target is None or names_header(target, header_full):
+            continue
+        for base in (source_dir, *roots):
+            candidate = base / target
+            if candidate.is_file():
+                try:
+                    text = candidate.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    break
+                if text_includes_header(text, header_full):
+                    found.add(target)
+                break
+    return found
+
+
 def preprocessor_depth_after(text: str) -> int:
     """Net `#if` nesting left open by TEXT. Zero means the text is balanced on its own."""
     # COND_OPEN/COND_CLOSE, not str.startswith: `#  if` with spaces after the hash is legal and is
@@ -275,8 +335,12 @@ ANON_NAMESPACE_DECL = re.compile(r"^namespace\s*\{")
 
 def build(map_data: dict, original: str, promote: list[int], header_rel: str,
           namespace: str, guard_note: str, include_spelling: str = "",
-          forward_decls: list[str] | None = None) -> tuple[str, str, list[str]]:
-    """Returns (header_text, new_source_text, inlined). Pure, so --selftest can drive it."""
+          forward_decls: list[str] | None = None,
+          exclude_includes: set[str] | frozenset[str] = frozenset()) -> tuple[str, str, list[str]]:
+    """Returns (header_text, new_source_text, inlined). Pure, so --selftest can drive it.
+
+    EXCLUDE_INCLUDES names preamble include paths that must not be copied into the header (the
+    caller computes the ones that would form an include cycle; see cyclic_includes)."""
     regions = {r["index"]: r for r in map_data["regions"]}
     lines = original.splitlines(keepends=True)
 
@@ -287,7 +351,17 @@ def build(map_data: dict, original: str, promote: list[int], header_rel: str,
     preamble = [r for r in map_data["regions"] if r.get("role") == "preamble"]
     head = ["#pragma once\n", "\n", guard_note, "\n"]
     pre_text = "".join("".join(lines[r["start"] - 1:r["end"]]) for r in preamble)
-    head.append(pre_text)
+    # #3922: never copy the source's own include of the destination header (a self-include), nor
+    # an include the caller found to include the destination back (a cycle).
+    header_full = header_repo_path(map_data["file"], header_rel)
+    kept_pre = []
+    for raw in pre_text.splitlines(keepends=True):
+        target = include_target(raw)
+        if target is not None and (names_header(target, header_full)
+                                   or target in exclude_includes):
+            continue
+        kept_pre.append(raw)
+    head.append("".join(kept_pre))
     # The preamble is COPIED, and a copy can end inside a conditional the original closes later.
     # gpu_capture.cpp opens `#if defined(__linux__) || defined(__APPLE__)` among its includes and
     # closes it on the very next line, outside any preamble region -- so the verbatim copy
@@ -369,7 +443,10 @@ def build(map_data: dict, original: str, promote: list[int], header_rel: str,
     for i in sorted(promote):
         if regions[i]["start"] - 1 < insert_at:
             insert_at -= (regions[i]["end"] - regions[i]["start"] + 1)
-    out_lines.insert(insert_at, f'#include "{include_spelling}"\n')
+    # #3922: a source that already includes the header (the merge path's normal case) keeps its
+    # one include; a second identical line is noise that reviewers then remove by hand.
+    if not text_includes_header("".join(out_lines), header_full):
+        out_lines.insert(insert_at, f'#include "{include_spelling}"\n')
     return header_text, "".join(out_lines), inlined
 
 
@@ -415,8 +492,11 @@ def verify(original: str, map_data: dict, promote: list[int], header_text: str,
         if text not in header_text:
             problems.append(f"region {i} ({r['name']}) is not present verbatim in the header")
 
-    # The source must be the original with exactly those spans removed, plus one include line.
-    rebuilt = new_source.replace(f'#include "{header_rel}"\n', "", 1)
+    # The source must be the original with exactly those spans removed, plus one include line --
+    # or plus none, when the original already included the header (#3922).
+    header_full = header_repo_path(map_data["file"], pathlib.PurePosixPath(header_rel).name)
+    rebuilt = (new_source if text_includes_header(original, header_full)
+               else new_source.replace(f'#include "{header_rel}"\n', "", 1))
     expected = original
     for text in spans:
         if text not in expected:
@@ -662,6 +742,55 @@ def selftest() -> int:
     check(verify(SELF_SRC, SELF_MAP, [3, 4], hdr, src.replace("void user() { Shared s; helper(); }", ""),
                  "s_internal.hpp"),
           "verification FAILS when the source loses something it should have kept")
+
+    # #3922: MERGING INTO A HEADER THE SOURCE ALREADY INCLUDES. The second promotion out of one
+    # source copies that source's preamble, and the preamble includes the destination header and
+    # headers that include it back. Measured on #3892 part 2: a self-include, two cyclic includes,
+    # and a duplicate include line in the source -- and verification passed, because it checks the
+    # promoted bytes, not the include block.
+    merge_src = SELF_SRC.replace(
+        "#include <a>\n",
+        '#include <a>\n#include "s_internal.hpp"\n#include "cyc.hpp"\n#include "other.hpp"\n')
+    merge_map = json.loads(json.dumps(SELF_MAP))
+    for r in merge_map["regions"]:
+        if r["index"] == 0:
+            r["end"] = 5
+        else:
+            r["start"] += 3
+            r["end"] += 3
+            if "decl_line" in r:
+                r["decl_line"] += 3
+    hdr_m, src_m, _ = build(merge_map, merge_src, [3, 4], "s_internal.hpp", "ns", "// n\n",
+                            "s_internal.hpp", None, {"cyc.hpp"})
+    check('#include "s_internal.hpp"' not in hdr_m, "the header never includes itself")
+    check('#include "cyc.hpp"' not in hdr_m,
+          "an include the caller found to include the header back is not copied")
+    check('#include "other.hpp"' in hdr_m and "#include <a>" in hdr_m,
+          "every other preamble include is still copied")
+    check(src_m.count('#include "s_internal.hpp"') == 1,
+          f"the source keeps exactly one include of the header "
+          f"(got {src_m.count(chr(35) + 'include ' + chr(34) + 's_internal.hpp' + chr(34))})")
+    check(not verify(merge_src, merge_map, [3, 4], hdr_m, src_m, "s_internal.hpp"),
+          "verification accepts a promotion that adds no include because one was present")
+    # A same-basename header in another directory is a different header: do not drop it.
+    full = "prosper/src/gpu/x/s_internal.hpp"
+    check(names_header("s_internal.hpp", full) and names_header("gpu/x/s_internal.hpp", full)
+          and names_header("x/s_internal.hpp", full)
+          and not names_header("y/s_internal.hpp", full)
+          and not names_header("other.hpp", full),
+          "header identity accepts bare and canonical-suffix spellings, not a same-named stranger")
+    # cyclic_includes reads the included files: one includes the header back, one does not.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        base = pathlib.Path(tmp)
+        # Spelled from a source root, as the real back-includer (draw_resources.hpp) spells it.
+        (base / "cyc.hpp").write_text('#pragma once\n#include "live/s_internal.hpp"\n')
+        (base / "other.hpp").write_text('#pragma once\n#include <vector>\n')
+        found = cyclic_includes('#include "cyc.hpp"\n#include "other.hpp"\n'
+                                '#include "missing.hpp"\n#include "s_internal.hpp"\n',
+                                base, [], "prosper/frontends/shared/live/s_internal.hpp")
+        check(found == {"cyc.hpp"}, f"cyclic_includes names exactly the back-including header "
+                                    f"(got {sorted(found)})")
 
     if bad:
         print("  the promotion tool's own guarantees are broken; it must not be run")
@@ -1077,8 +1206,20 @@ def main() -> int:
     note = header_banner(map_data["file"], args.note)
     spelling = canonical_include(map_data["file"], args.header)
     try:
+        preamble_text = "".join(
+            "".join(original.splitlines(keepends=True)[r["start"] - 1:r["end"]])
+            for r in map_data["regions"] if r.get("role") == "preamble")
+        prosper_root = root / "prosper"
+        cycles = cyclic_includes(preamble_text, source.parent,
+                                 [prosper_root / "src", prosper_root / "frontends",
+                                  prosper_root / "tests", prosper_root],
+                                 header_repo_path(map_data["file"], args.header))
+        for target in sorted(cycles):
+            print(f"  [note] not copying #include \"{target}\" into the header: it includes "
+                  f"{args.header} itself, so copying it would create an include cycle")
         header_text, new_source, inlined = build(map_data, original, promote, args.header,
-                                                 args.namespace, note, spelling, forward_decls)
+                                                 args.namespace, note, spelling, forward_decls,
+                                                 cycles)
     except Refuse as refusal:
         print(f"  [REFUSED] {refusal}")
         return 1
@@ -1090,7 +1231,7 @@ def main() -> int:
         return 1
     promoted_lines = sum(regions[i]["end"] - regions[i]["start"] + 1 for i in promote)
     print(f"  [ok]   reconstruction: header carries {promoted_lines} line(s); the source is the "
-          f"original minus exactly those spans plus one include")
+          f"original minus exactly those spans plus at most one include")
     print(f"  [note] {len(inlined)} function definition(s) gained `inline`, which is required once "
           f"more than one translation unit includes the header: "
           f"{', '.join(inlined[:6])}{' ...' if len(inlined) > 6 else ''}")
