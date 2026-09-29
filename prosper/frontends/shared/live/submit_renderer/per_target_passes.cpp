@@ -1060,7 +1060,11 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             }
         } else if (base && !pass_pixels->empty() &&
                    std::any_of(pass.begin(), pass.end(), [](const prosper::gpu::DrawItem* d) {
-                       return prosper::frontend::mrt_write_mask(*d, 0) != 0;
+                       // Either representation of the slot-0 mask. Live decode keeps them equal;
+                       // direct/replayed items may carry only the named mask beside a stale array
+                       // entry, and those passes do write colour.
+                       return prosper::frontend::mrt_write_mask(*d, 0) != 0 ||
+                              d->ps.color_write_mask != 0;
                    })) {
             // #3907: a pass none of whose draws writes colour slot 0 (CB target mask 0 --
             // GTA V's depth-only 3840x2160 pass whose colour register still names its
