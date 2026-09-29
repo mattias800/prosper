@@ -83,10 +83,11 @@ silently stops describing the tree, which is the same failure class this tool ex
     in the tree is a REFERENCE member and every designated initialiser of it is env-derived. A
     same-named value member anywhere retires the name, which also hides a genuine context gate. A
     context forwarded into a second context is followed only as a SAME-NAME pass-through
-    (`auto& x = ctx.x;` then `Inner{.x = x}`), which is not counted as a new initialiser, and only
-    while that rebind is the innermost declaration of `x` -- a nested local or a lambda/function
-    parameter of the same name shadows it and counts as an ordinary initialiser. Any other
-    forwarding (`.x = y`) retires the name. A member initialised positionally, or from a non-alias
+    (`auto& x = ctx.x;` then `Inner{.x = x}`), which is not counted as a new initialiser -- and only
+    when every mention of `x` between the rebind and the initialiser is clearly a READ. Any other
+    mention (after a type, inside `[...]`, in a declarator list, before `=`/`{`) may declare a
+    shadow and retires the name: unsure means declared. Any other forwarding (`.x = y`) retires
+    the name too. A member initialised positionally, or from a non-alias
     value, is invisible.
   - `#if`-gated code is scanned as if it were live.
   - A diagnostic gated by something other than an environment variable (a build flag, a member
@@ -201,31 +202,56 @@ ASSIGN_TO_NAME_RE = re.compile(r"\b([A-Za-z_]\w*)\s*=(?!=)")
 # `Ctx{.rtt_log = rtt_log, ...}` and the callee rebinds `auto& rtt_log = ctx.rtt_log;`.
 DESIGNATED_INIT_RE = re.compile(r"(?:^|[{,(])\s*\.([A-Za-z_]\w*)\s*=(?!=)\s*([^,}]+)")
 # `obj.name` / `obj->name` / `ptr->name`: a member READ that may stand for a context member.
-# The parenthesised list directly before a `{`: a function/lambda parameter list, or a control
-# header. Used only to find names a new scope DECLARES (#3954 review: shadowing).
-PARAM_LIST_RE = re.compile(
-    r"(\]|\b[A-Za-z_]\w*)\s*\(([^()]*)\)\s*"
-    r"(?:(?:mutable|noexcept|const|override|final)\s*|->\s*[\w:<>,\*&\s]+?\s*)*$")
+# `.x = x` hands on a rebound context member only if, between the rebind and the initialiser,
+# `x` appears ONLY where it is clearly READ (#3954 review, round 2). Anything else -- a mention after
+# a type or `auto`, inside `[...]`, in a declarator list, before `{`/`=`/`[`/`(` -- might declare a
+# shadow, and is treated as one: retiring the name is always the safe direction.
+_READ_PREV_CHARS = set("(!=|?:+-/%^~")
+_READ_NEXT_CHARS = set(");?:|+-*/%<>!^.")
+_STRING_OR_COMMENT_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*')
 
 
-def declared_params(prefix: str) -> set[str]:
-    """Names the scope opened right after `prefix` declares in its header (a lambda or function
-    parameter list, a range-for or classic-for variable, a catch parameter). An `if`/`while`/
-    `switch` condition declares nothing. Over-reporting only makes the pass-through exemption
-    rarer, which retires a name (hides findings) rather than inventing a gate."""
-    m = PARAM_LIST_RE.search(prefix)
-    if not m or m.group(1) in ("if", "while", "switch", "return", "sizeof", "decltype"):
-        return set()
-    body = m.group(2)
-    if m.group(1) == "for":
-        body = re.split(r"[:;]", body, maxsplit=1)[0]
-    names = set()
-    for param in body.split(","):
-        param = param.split("=", 1)[0]
-        idents = re.findall(r"[A-Za-z_]\w*", param)
-        if idents:
-            names.add(idents[-1])
-    return names
+def only_read_mentions(name: str, text: str) -> bool:
+    # Strings and comments carry brackets and names that are not code.
+    text = _STRING_OR_COMMENT_RE.sub(lambda m: " " * len(m.group(0)), text)
+    word = re.compile(r"(?<![\w])" + re.escape(name) + r"(?!\w)")
+    mentions = [m.span() for m in word.finditer(text)]
+    if not mentions:
+        return True
+    # One pass: for each mention, is the innermost open bracket a parenthesis or a braced
+    # initialiser (where a `,` separates VALUES) rather than a block (where it separates
+    # declarators)?
+    stack: list[tuple[str, bool]] = []
+    listy_at: dict[int, bool] = {}
+    targets = {start for start, _ in mentions}
+    for pos, ch in enumerate(text):
+        if pos in targets:
+            listy_at[pos] = bool(stack) and stack[-1][1]
+        if ch in "([{":
+            if ch == "{":
+                prev = text[:pos].rstrip()[-1:]
+                listy = bool(prev) and (prev.isalnum() or prev in "_>=(,")
+            else:
+                listy = ch == "("
+            stack.append((ch, listy))
+        elif ch in ")]}" and stack:
+            stack.pop()
+    for start, end in mentions:
+        before = text[:start].rstrip()
+        if before.endswith((".", "->", "::")):
+            continue                       # some object's member, not the local `name`
+        after = text[end:].lstrip()
+        pc, nc = before[-1:], after[:1]
+        listy = listy_at.get(start, False)
+        read_prev = (pc in _READ_PREV_CHARS or before.endswith(("&&", "return"))
+                     or (pc == "," and listy))
+        read_next = (nc in _READ_NEXT_CHARS or after.startswith(("&&", "==", "!="))
+                     or (nc == "," and listy) or (nc == "}" and listy))
+        if nc == "=" and not after.startswith("=="):
+            read_next = False
+        if not (read_prev and read_next):
+            return False
+    return True
 
 
 MEMBER_READ_RE = re.compile(r"(?:(?<=[\w\)\]])\.|->)([A-Za-z_]\w*)\b")
@@ -729,10 +755,8 @@ class Scope:
         self.aliases: dict[str, frozenset] = {}
         # Names rebound from a same-named context member (`auto& x = ctx.x;`): handing `x` on as
         # `.x = x` is a pass-through of that member, not a new initialiser (#3892).
-        self.member_rebinds: set[str] = set()
-        # Every other name DECLARED in this scope: locals, and the parameters of the function,
-        # lambda or `for`/`catch` header that opened it. One of these shadows an outer rebind.
-        self.declared: set[str] = set()
+        # name -> index of the first line AFTER its rebind statement.
+        self.member_rebinds: dict[str, int] = {}
         # var -> (decl line, [(line, gates)] writes, [(line, gates)] prints)
         self.decls: dict[str, tuple] = {}
 
@@ -874,23 +898,18 @@ class FileScanner:
             "(" + " || ".join(f'getenv("{n}")' for n in sorted(cl)) + ")"
             for cl in sorted(ctx, key=lambda c: sorted(c))) + ")"
 
-    def is_member_pass_through(self, name: str, line_prefix: str) -> bool:
-        """`.name = name` hands on the SAME context member only when the `name` in scope IS the
-        rebind (`auto& name = ctx.name;`): the innermost scope declaring `name` must be one that
-        rebound it. A nested local or a lambda/function parameter of that name shadows the rebind,
-        and its value is an ordinary initialiser (#3954 review, the #3940 bug class). Declarations
-        earlier on the initialiser's OWN line are not on the scope stack yet, so the line prefix is
-        checked for them too."""
-        for pos, ch in enumerate(line_prefix):
-            if ch == "{" and name in declared_params(line_prefix[:pos]):
-                return False
-        if re.search(r"(?<![\.\w>])" + re.escape(name) + r"\s*=(?!=)", line_prefix):
-            return False
+    def is_member_pass_through(self, name: str, line_index: int, prefix: str) -> bool:
+        """`.name = name` hands on the SAME context member only when the innermost enclosing
+        scope rebound `name` from a member (`auto& name = ctx.name;`) AND every mention of `name`
+        between that rebind and this initialiser is clearly a read (only_read_mentions). Any other
+        mention may declare a shadow -- a brace-init local, a second declarator, a structured
+        binding, an if-init, a lambda parameter -- so it retires the name instead (#3954 review).
+        `prefix` is the text before the initialiser from `line_index` on."""
         for sc in reversed(self.stack):
             if name in sc.member_rebinds:
-                return True
-            if name in sc.declared:
-                return False
+                start = sc.member_rebinds[name]
+                between = " ".join(self.lines[start:line_index]) if start < line_index else ""
+                return only_read_mentions(name, between + " " + prefix)
         return False
 
     @staticmethod
@@ -1116,7 +1135,7 @@ class FileScanner:
                     # buffer branch) passes the SAME member through; it is not a second, ungated
                     # initialiser that would retire the name for both contexts.
                     if dm3.group(2).strip() == dm3.group(1) and \
-                            self.is_member_pass_through(dm3.group(1), raw[:dm3.start()]):
+                            self.is_member_pass_through(dm3.group(1), i, line[:dm3.start()]):
                         continue
                     self.member_writes.setdefault(dm3.group(1), []).append(
                         clauses_of(self.expand(dm3.group(2))))
@@ -1137,15 +1156,13 @@ class FileScanner:
                             for dm4 in DESIGNATED_INIT_RE.finditer(later):
                                 prefix = " ".join(self.lines[i:k]) + " " + later[:dm4.start()]
                                 if dm4.group(2).strip() == dm4.group(1) and \
-                                        self.is_member_pass_through(dm4.group(1), prefix):
+                                        self.is_member_pass_through(dm4.group(1), i, prefix):
                                     continue
                                 self.member_writes.setdefault(dm4.group(1), []).append(
                                     clauses_of(self.expand(dm4.group(2))))
                     if re.fullmatch(r"\s*[A-Za-z_]\w*\s*(?:\.|->)\s*" + re.escape(dm2.group(1))
                                     + r"\s*;?\s*", rhs):
-                        self.stack[-1].member_rebinds.add(dm2.group(1))
-                    else:
-                        self.stack[-1].declared.add(dm2.group(1))
+                        self.stack[-1].member_rebinds[dm2.group(1)] = i + used
                     consumed = max(consumed, used)
                     ctx = clauses_of(self.expand(rhs))
                     if ctx and self.alias_is_a_gate(rhs):
@@ -1168,12 +1185,11 @@ class FileScanner:
             # empty one, discarding every alias and gate declared in it. That silently unarmed the
             # `interval` alias two lines after it was declared.
             first_open = True
-            for pos, ch in enumerate(text):
+            for ch in text:
                 if ch == "{":
                     gates = cond_gates if (first_open and cond is not None and not is_else) \
                         else frozenset()
                     self.stack.append(Scope(gates))
-                    self.stack[-1].declared |= declared_params(text[:pos])
                     first_open = False
                 elif ch == "}":
                     if len(self.stack) > 1:
@@ -1756,6 +1772,63 @@ void middle5(const DetailCtx& ctx) {
         callee(DetailCtx{ .detail = detail });
     };
     f(true);
+}
+""", []),
+    ("context member (#3954 review 2): a brace-init local shadowing the rebind retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void shadow0(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    {
+        const bool detail{compute_something()};
+        callee(DetailCtx{ .detail = detail });
+    }
+}
+""", []),
+    ("context member (#3954 review 2): a second declarator shadowing the rebind retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void shadow1(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    {
+        bool a = true, detail = compute_something();
+        callee(DetailCtx{ .detail = detail });
+    }
+}
+""", []),
+    ("context member (#3954 review 2): a structured binding shadowing the rebind retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void shadow2(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    {
+        auto [a, detail] = compute_pair();
+        callee(DetailCtx{ .detail = detail });
+    }
+}
+""", []),
+    ("context member (#3954 review 2): an if-init declaration shadowing the rebind retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void shadow3(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    {
+        if (const bool detail = compute_something(); detail) {
+            callee(DetailCtx{ .detail = detail });
+        }
+    }
+}
+""", []),
+    ("context member (#3954 review 2): a condition declaration shadowing the rebind retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void shadow4(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    {
+        if (bool detail = compute_something()) {
+            callee(DetailCtx{ .detail = detail });
+        }
+    }
 }
 """, []),
     ("context member (#3919): one UNGATED initialiser anywhere retires the name, so `.x = true` "
