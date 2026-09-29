@@ -2138,6 +2138,14 @@ if(TARGET prosper_core)
   add_executable(test_guest_memory_topology tests/hle/memory/test_guest_memory_topology.cpp)
   target_link_libraries(test_guest_memory_topology PRIVATE prosper_core)
   add_test(NAME guest_memory_topology COMMAND test_guest_memory_topology)
+  add_executable(test_guest_mapping_lease tests/hle/memory/test_guest_mapping_lease.cpp)
+  target_link_libraries(test_guest_mapping_lease PRIVATE prosper_core)
+  add_test(NAME guest_mapping_lease COMMAND test_guest_mapping_lease)
+  set_tests_properties(guest_mapping_lease PROPERTIES TIMEOUT 20)
+  add_executable(test_nested_wide_data_admission
+                 tests/gpu/execute/test_nested_wide_data_admission.cpp)
+  target_link_libraries(test_nested_wide_data_admission PRIVATE prosper_core)
+  add_test(NAME nested_wide_data_admission COMMAND test_nested_wide_data_admission)
 
   # Hinted map must not clobber a live mapping (#137): MAP_FIXED_NOREPLACE unless the hint is our
   # own uncommitted reservation. Drives the real map HLE handlers. Linux-only (mmap semantics).

@@ -205,6 +205,11 @@ std::vector<uint32_t> rdna2_proven_raw_x2_data_loads(const std::vector<Rdna2Inst
 std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& instructions);
 std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
     const std::vector<Rdna2Inst>& instructions);
+// One-hop raw x4/x8 data loads through a pointer from an earlier proven immediate load.
+// A dispatch must additionally own the parent/child bytes and exclude writable aliases.
+std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(
+    const std::vector<Rdna2Inst>& instructions);
+bool rdna2_may_write_guest_memory(const Rdna2Inst& instruction);
 
 // Per-invocation provenance for fail-visible shader diagnostics. This is observation-only metadata:
 // it must travel beside the translation inputs rather than participate in compiled-module identity,

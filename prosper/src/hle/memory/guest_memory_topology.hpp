@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <shared_mutex>
 
 namespace prosper {
 
@@ -15,9 +16,36 @@ enum class GuestMemoryTopologyRelation : uint8_t {
     Overlap,
 };
 
+// Keeps HLE mapping transactions from replacing or protecting guest backing while synchronous
+// compute work reads its sources, executes, and publishes its completed result. This does not
+// exclude fault-handler/VEH lazy commits or guest byte writes. Callers admitting a borrowed source
+// must separately prove fault safety, physical alias isolation and current-byte visibility.
+// Acquire before inspecting topology or guest bytes; release only after final writeback.
+class GuestMappingLease {
+public:
+    GuestMappingLease();
+    GuestMappingLease(const GuestMappingLease&) = delete;
+    GuestMappingLease& operator=(const GuestMappingLease&) = delete;
+
+private:
+    std::shared_lock<std::shared_mutex> lock_;
+};
+
+// Test-only observation after an exclusive mapping attempt has actually found a held reader.
+// Null in production; the callback must not call HLE mapping functions.
+void set_guest_mapping_mutation_contention_observer_for_test(void (*observer)());
+
 GuestMemoryTopologyRelation guest_memory_topology_relation(
     uint64_t first_address, uint64_t first_size,
     uint64_t second_address, uint64_t second_size);
+
+// Linux's guest fault handler may replace a whole 64 KiB reservation granule on first touch.
+// Admission under a GuestMappingLease must require each granule intersecting a source or writable
+// destination to be fully backed by committed direct mappings, or a fault in an adjacent reserved
+// slice could replace already leased bytes. Other platforms return false until their lazy/sparse
+// commitment paths have an equivalent proof. The caller still checks access and physical aliases.
+bool guest_memory_direct_range_fault_safe(const GuestMappingLease& lease,
+                                          uint64_t address, uint64_t size);
 
 // Copy host bytes into a fully committed direct-memory mapping through prosper's authoritative
 // physical backing. This models a device write without weakening the guest VA's CPU protection.

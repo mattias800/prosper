@@ -5565,7 +5565,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     exact->fetch_pc == in.pc && exact->cls == ResourceClass::ConstantBuffer &&
                     shader_resource_buffer_binding_bytes(*exact) >=
                         static_cast<uint64_t>(in.literal) + n * sizeof(uint32_t);
-                if (!backed_immediate_wide) {
+                const bool backed_nested_wide = nested_raw_wide_data &&
+                    rs.smem_raw_nested_wide_data_loads.contains(in.pc) && exact &&
+                    exact->fetch_pc == in.pc && exact->cls == ResourceClass::ConstantBuffer &&
+                    exact->nested_raw_snapshot_admitted &&
+                    exact->host_data && exact->host_data_size >= exact->size &&
+                    shader_resource_buffer_binding_bytes(*exact) >=
+                        static_cast<uint64_t>(in.literal) + n * sizeof(uint32_t);
+                if (!backed_immediate_wide && !backed_nested_wide) {
                     if (getenv("PROSPER_DBG"))
                         fprintf(stderr,
                                 "[smem-reject] pc=%u reason=raw-wide-data-requires-backing "

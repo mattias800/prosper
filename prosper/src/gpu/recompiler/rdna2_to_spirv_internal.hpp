@@ -2789,6 +2789,7 @@ struct RegState {
     // unrelated unresolved scalar load into a binding-2 fallback success.
     std::unordered_set<uint32_t> smem_raw_x2_data_loads;
     std::unordered_set<uint32_t> smem_raw_immediate_wide_data_loads;
+    std::unordered_set<uint32_t> smem_raw_nested_wide_data_loads;
     std::unordered_set<uint32_t> smem_raw_wide_data_loads;
     bool smem_pointer_analysis_done = false;
     // Register-offset S_LOAD_DWORDX2 is likewise typeless. GTA V uses it to fetch the first two

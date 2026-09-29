@@ -111,6 +111,7 @@ struct ShaderResourceCompileKey {
     uint32_t srt_offset = 0;
     uint32_t sgpr_base = 0;
     uint32_t fetch_pc = 0;
+    uint32_t nested_raw_snapshot_bytes = 0;
     uint32_t fetch_index_mode = 0;
     uint32_t table_index_count = 0;
     uint32_t table_entry_stride = 0;
@@ -364,6 +365,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.srt_offset);
             hash = hash_mix(hash, resource.sgpr_base);
             hash = hash_mix(hash, resource.fetch_pc);
+            hash = hash_mix(hash, resource.nested_raw_snapshot_bytes);
             hash = hash_mix(hash, resource.fetch_index_mode);
             hash = hash_mix(hash, resource.table_index_count);
             hash = hash_mix(hash, resource.table_entry_stride);
@@ -495,6 +497,7 @@ struct DecodedShader {
     // Code-byte-only proof, computed on the full decoded stream before fold compaction.
     std::vector<uint32_t> raw_x2_data_load_pcs;
     std::vector<uint32_t> raw_immediate_wide_data_load_pcs;
+    std::vector<uint32_t> raw_nested_wide_data_load_pcs;
     // Full-stream inventory: specialization may remove a spill but cannot introduce one.
     std::bitset<256> scalar_spill_written_vgprs;
     size_t source_dwords = 0;
