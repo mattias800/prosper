@@ -368,7 +368,9 @@ struct CaptureConfig {
     uint64_t post_window_ns = 5'000'000'000ull;
     uint64_t sample_interval_ns = 250'000'000ull;
     size_t max_renderer_records = 4096;
-    size_t max_compute_records = 4096;
+    // Five-second windows in compute-heavy titles can exceed 4096 records. Keep the capture
+    // bounded while retaining a complete window for those workloads.
+    size_t max_compute_records = 8192;
     bool present_handoffs = false;
     size_t max_present_records = 8192;
 };
