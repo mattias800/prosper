@@ -2569,7 +2569,12 @@ endif()
   if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_guest_write_watch tests/host/memory/test_guest_write_watch.cpp)
     target_link_libraries(test_guest_write_watch PRIVATE prosper_core)
-    add_test(NAME guest_write_watch COMMAND test_guest_write_watch)
+    add_test(NAME guest_write_watch
+             COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_FORCE_PHYSICAL_SCAN
+                     $<TARGET_FILE:test_guest_write_watch>)
+    add_test(NAME guest_write_watch_forced_physical_scan
+             COMMAND ${CMAKE_COMMAND} -E env PROSPER_WATCH_FORCE_PHYSICAL_SCAN=1
+                     $<TARGET_FILE:test_guest_write_watch>)
     add_executable(test_guest_write_watch_index tests/host/memory/test_guest_write_watch_index.cpp)
     target_link_libraries(test_guest_write_watch_index PRIVATE prosper_core)
     # Two arms, and the environment is armed HERE rather than by a setenv inside main():

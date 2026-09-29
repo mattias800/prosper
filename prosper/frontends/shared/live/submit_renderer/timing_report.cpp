@@ -1,6 +1,7 @@
 // report_render_timing_aggregates -- see timing_report.hpp. Moved verbatim out of live_renderer.cpp (#3892).
 #include "shared/live/submit_renderer/timing_report.hpp"
 #include "shared/live/submit_renderer/guest_reads.hpp"
+#include "diagnostics/env_cache.hpp"
 
 namespace prosper::frontend::submit_renderer {
 
@@ -816,6 +817,17 @@ void report_render_timing_aggregates(RenderTimingReportContext& ctx) {
                 (unsigned long long)write_watch.rearms,
                 (unsigned long long)write_watch.query_audit_stale,
                 (unsigned long long)write_watch.query_audit_conservative);
+        // These counters cover the process lifetime, not just this timing window or thread.
+        fprintf(stderr,
+                "[render-timing] write_watch_phys indexed=%llu calls/%llu page-probes "
+                "full_scan=%llu calls/%llu pages visited hits=%llu search_ms=%.3f(%s)\n",
+                (unsigned long long)write_watch.phys_index_calls,
+                (unsigned long long)write_watch.phys_index_pages,
+                (unsigned long long)write_watch.phys_scan_calls,
+                (unsigned long long)write_watch.phys_scan_pages,
+                (unsigned long long)write_watch.phys_pages_hit,
+                write_watch.phys_search_ns / 1.0e6,
+                PROSPER_ENV_ON("PROSPER_WATCH_PHYS_TIMING") ? "timed" : "off");
         const double wn = static_cast<double>(window.submits);
         const double window_pass_control = window.pass_ms -
             window.build_resources_ms - window.backend_ms;

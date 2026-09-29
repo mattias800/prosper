@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <utility>
 
 namespace prosper::host {
@@ -707,6 +708,9 @@ struct WatchState {
     // Only pages with multiple VAs need the physical-alias pass in notify_gpu_write(). Keep this
     // count with the authoritative page alias vectors, under the same mutex.
     uint64_t multi_alias_pages = 0;
+    // The physical map can contain non-page-aligned keys from diagnostic/test mappings. Those
+    // cannot be found by stepping page-aligned physical addresses; retain the exact walk for them.
+    uint64_t unaligned_phys_pages = 0;
     // #3681: how many entries of `pages_by_addr` fall in each kIndexChunk-aligned VA chunk. Lets a
     // host-write notification skip a whole 2 MiB of unwatched address space with one lookup instead
     // of 512 misses. Kept exactly in step with pages_by_addr through index_page_addr_locked() /
@@ -767,7 +771,9 @@ struct AtomicStats {
         gpu_write_registrations_visited{0}, gpu_write_overlaps{0},
         query_audit_stale{0}, query_audit_conservative{0}, rearm_fast{0},
         gpu_write_alias_pages{0}, gpu_write_alias_registrations_visited{0},
-        gpu_write_alias_overlaps{0}, gpu_write_alias_single_va_skips{0};
+        gpu_write_alias_overlaps{0}, gpu_write_alias_single_va_skips{0},
+        phys_index_calls{0}, phys_scan_calls{0},
+        phys_index_pages{0}, phys_scan_pages{0}, phys_pages_hit{0}, phys_search_ns{0};
 };
 AtomicStats& stats() { static AtomicStats* value = new AtomicStats; return *value; }
 inline void bump(std::atomic<uint64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); }
@@ -1014,6 +1020,7 @@ void erase_released_pages_locked(WatchState& w, const std::vector<WatchedPage*>&
         if (page->references || page->armed || page->coverage_incomplete) continue;
         for (const PageAlias& alias : page->aliases) unindex_page_addr_locked(w, alias.addr);
         update_multi_alias_pages(w, page->aliases.size(), 0);
+        if (page->phys & (kPage - 1)) --w.unaligned_phys_pages;
         w.pages_by_phys.erase(page->phys);
     }
 }
@@ -1044,8 +1051,43 @@ void release_registration_locked(WatchState& w,
 // address index while registrations or failed-restoration recovery still need it. Called locked.
 void invalidate_phys_range_locked(WatchState& w, uint64_t phys_begin, uint64_t phys_end) {
     std::vector<WatchedPage*> hit;
-    for (auto& [phys, page] : w.pages_by_phys)
-        if (phys < phys_end && phys + kPage > phys_begin) hit.push_back(page.get());
+    // Opt-in elapsed search cost, excluding protection changes and lock acquisition. Candidate
+    // counts alone cannot say whether these notifications delay the caller's critical path.
+    const bool time_search = PROSPER_ENV_ON("PROSPER_WATCH_PHYS_TIMING");
+    const auto search_start = time_search ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
+    // The authoritative map is keyed by physical page. For a bounded range, find only the keys
+    // that could overlap it, then retain the original half-open predicate. The full walk remains
+    // for unaligned keys, wrapped ranges and spans where hash probes would cost more than a walk.
+    const bool ordered_range = phys_begin < phys_end;
+    const uint64_t first_page = phys_begin / kPage;
+    const uint64_t last_page = ordered_range ? (phys_end - 1) / kPage : first_page;
+    const uint64_t candidate_pages = last_page - first_page + 1;
+    const bool use_index = ordered_range && !w.unaligned_phys_pages &&
+        candidate_pages <= w.pages_by_phys.size() / 2 &&
+        !PROSPER_ENV_ON("PROSPER_WATCH_FORCE_PHYSICAL_SCAN");
+    if (use_index) {
+        bump(stats().phys_index_calls);
+        stats().phys_index_pages.fetch_add(candidate_pages, std::memory_order_relaxed);
+        for (uint64_t page_index = first_page; page_index <= last_page; ++page_index) {
+            const uint64_t phys = page_index * kPage;
+            const auto found = w.pages_by_phys.find(phys);
+            if (found != w.pages_by_phys.end() && phys < phys_end &&
+                phys + kPage > phys_begin) hit.push_back(found->second.get());
+        }
+    } else {
+        bump(stats().phys_scan_calls);
+        stats().phys_scan_pages.fetch_add(w.pages_by_phys.size(), std::memory_order_relaxed);
+        for (auto& [phys, page] : w.pages_by_phys)
+            if (phys < phys_end && phys + kPage > phys_begin) hit.push_back(page.get());
+    }
+    if (time_search) {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - search_start).count();
+        stats().phys_search_ns.fetch_add(static_cast<uint64_t>(ns),
+                                         std::memory_order_relaxed);
+    }
+    stats().phys_pages_hit.fetch_add(hit.size(), std::memory_order_relaxed);
     set_pages_armed(w, hit, false);
     // No mark pass here: set_pages_armed(arm=false) already marked every registration covering these
     // pages, on both its success and its failure path, and pages_dirty is sticky -- nothing can clear
@@ -1550,6 +1592,7 @@ GuestWriteWatch GuestWriteWatch::create(uint64_t addr, uint64_t size) {
             up->phys = r.phys;
             up->aliases = std::move(aliases_by_phys[r.phys].aliases);
             update_multi_alias_pages(w, 0, up->aliases.size());
+            if (r.phys & (kPage - 1)) ++w.unaligned_phys_pages;
             page = up.get();
             w.pages_by_phys.emplace(r.phys, std::move(up));
             for (const PageAlias& al : page->aliases)
@@ -1698,7 +1741,10 @@ GuestWriteWatchStats guest_write_watch_stats() {
             v.gpu_write_overlaps.load(), v.query_audit_stale.load(),
             v.query_audit_conservative.load(), v.rearm_fast.load(),
             v.gpu_write_alias_pages.load(), v.gpu_write_alias_registrations_visited.load(),
-            v.gpu_write_alias_overlaps.load(), v.gpu_write_alias_single_va_skips.load()};
+            v.gpu_write_alias_overlaps.load(), v.gpu_write_alias_single_va_skips.load(),
+            v.phys_index_calls.load(),
+            v.phys_scan_calls.load(), v.phys_index_pages.load(),
+            v.phys_scan_pages.load(), v.phys_pages_hit.load(), v.phys_search_ns.load()};
 }
 
 bool guest_dmem_write_trace_configure(const GuestDmemWriteTraceConfig& config) {
