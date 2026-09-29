@@ -2929,7 +2929,12 @@ struct VulkanComputeContext {
         allocation_bytes = cached.allocation_bytes;
         // A zero-sized snapshot carries no authority, but retaining its capacity lets successful
         // writeback refresh the exact bytes without a second large allocation in the hot path.
-        invalidate_cached_image_source(key, true);
+        // The forced seed revokes all source/export authority, but the previous graphics
+        // export's page registration still names this exact guest range. Keep that registration
+        // until completed writeback can rearm it; failure and unresolved DCC cleanup reset it.
+        static const bool retain_export_watch =
+            std::getenv("PROSPER_NO_DCC_FORCED_EXPORT_WATCH_RETENTION") == nullptr;
+        invalidate_cached_image_source(key, true, retain_export_watch);
         g_dcc_forced_seed_allocation_reuses.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -3312,14 +3317,17 @@ struct VulkanComputeContext {
     }
 
     void invalidate_cached_image_source(const ComputeImageCacheKey& key,
-                                        bool preserve_snapshot_capacity = false) {
+                                        bool preserve_snapshot_capacity = false,
+                                        bool preserve_export_watch_registration = false) {
         const auto found = image_cache.find(key);
         if (found == image_cache.end()) return;
         CachedComputeImage& cached = found->second;
+        const bool retain_watch = preserve_export_watch_registration &&
+            cached.content_valid && cached.graphics_export_valid && !key.host_data;
         cached.content_valid = false;
         cached.graphics_export_valid = false;
         cached.compute_transfer_valid = false;
-        cached.write_watch.reset();
+        if (!retain_watch) cached.write_watch.reset();
         if (preserve_snapshot_capacity)
             cached.source_snapshot.clear();
         else if (!cached.source_snapshot.empty())
