@@ -61,7 +61,8 @@ public:
         last_id = id;
         last_au_bytes = bytes;
         last_au_first = (au && bytes) ? au[0] : 0;
-        decoded_heads.push_back(last_au_first);
+        decoded_tags.push_back(bytes >= 2 ? static_cast<uint16_t>(au[0] | (au[1] << 8)) :
+                                       static_cast<uint16_t>(last_au_first));
 
         out.width = kWidth;
         out.height = kHeight;
@@ -96,7 +97,7 @@ public:
     uint32_t last_codec = 0;
     size_t last_au_bytes = 0;
     uint8_t last_au_first = 0;
-    std::vector<uint8_t> decoded_heads;
+    std::vector<uint16_t> decoded_tags;
 };
 
 // Error constants matching videodec2.cpp
@@ -303,26 +304,27 @@ int main() {
 
     // A real title stages more than 64 AUs before its first output poll. Preserve every accepted
     // unit, including a possible SPS/PPS at the head, and retain their order through decoding.
-    std::vector<std::vector<uint8_t>> burst(128, std::vector<uint8_t>(4));
-    std::vector<uint8_t> expected_heads;
+    std::vector<std::vector<uint8_t>> burst(512, std::vector<uint8_t>(4));
+    std::vector<uint16_t> expected_tags;
     bool burst_accepted = true;
     for (size_t i = 0; i < burst.size(); ++i) {
         burst[i][0] = i ? static_cast<uint8_t>(i) : 0x67;
-        expected_heads.push_back(burst[i][0]);
+        burst[i][1] = i ? static_cast<uint8_t>(i >> 8) : 0xFF;
+        expected_tags.push_back(static_cast<uint16_t>(burst[i][0] | (burst[i][1] << 8)));
         VdecInput item{sizeof(VdecInput), (uint64_t)(uintptr_t)burst[i].data(),
                        burst[i].size(), i, 0, 0};
         burst_accepted &= set_input(handle, (uint64_t)(uintptr_t)&item, 0, 0, 0, 0) == 0;
     }
     CHECK(burst_accepted, "a burst above 64 access units is accepted without loss");
-    const size_t decoded_before_burst = mock.decoded_heads.size();
+    const size_t decoded_before_burst = mock.decoded_tags.size();
     bool burst_drained = true;
     for (size_t i = 0; i < burst.size(); ++i)
         burst_drained &= sync_output(handle, (uint64_t)(uintptr_t)&out, 0, 0, 0, 0) == 0;
-    CHECK(burst_drained && mock.decoded_heads.size() == decoded_before_burst + burst.size(),
+    CHECK(burst_drained && mock.decoded_tags.size() == decoded_before_burst + burst.size(),
           "each accepted burst access unit is decoded exactly once");
-    bool fifo = mock.decoded_heads.size() == decoded_before_burst + burst.size();
+    bool fifo = mock.decoded_tags.size() == decoded_before_burst + burst.size();
     for (size_t i = 0; fifo && i < burst.size(); ++i)
-        fifo &= mock.decoded_heads[decoded_before_burst + i] == expected_heads[i];
+        fifo &= mock.decoded_tags[decoded_before_burst + i] == expected_tags[i];
     CHECK(fifo, "burst decoding preserves independent access-unit order");
 
     // Tiny AUs must not bypass the count guard. Refusal leaves the original head intact, and
