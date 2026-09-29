@@ -901,6 +901,73 @@ int main() {
               find_spirv_descriptor_binding(branched_x16_report, 0, 5) &&
               !find_spirv_descriptor_binding(branched_x16_report, 0, 2),
           "branch between image consumers routes both exact resources without fallback cbuf");
+    // A full Wave64 VOPC compare replaces both physical SGPR mask words. The x16 descriptor
+    // snapshot has already supplied both exact image consumers; a subsequent read of s5 observes
+    // the new mask's upper word. On Wave32, the same compare only replaces s4, so s5 still holds
+    // descriptor data and the raw load must reject. The branch selects the path-sensitive proof.
+    const std::array<uint32_t, 12> x16_wave_mask_lifetime = {
+        0xf4100100u, 0xfa000000u,   // pc0: x16 s[4:19]
+        0xf0000108u, 0x00010704u,   // pc2: image_load through s[4:11]
+        0xf0000108u, 0x00030604u,   // pc4: image_load through s[12:19]
+        0xbf840001u,                 // pc6: conditional skip of pc7
+        0xbf800000u,                 // pc7: no-op
+        0x7d0424f9u, 0x0606840au,   // pc8: v_cmp_* s[4:5], v10, v18
+        0x7e020205u,                 // pc10: v_mov_b32 v1,s5
+        0xbf810000u,
+    };
+    ShaderResourceTable x16_wave_mask_rt;
+    x16_wave_mask_rt.resources.push_back(x16_texture(4, 2));
+    x16_wave_mask_rt.resources.push_back(x16_texture(5, 4));
+    ComputeShaderConfig x16_wave64_config;
+    x16_wave64_config.local_x = 64;
+    x16_wave64_config.threads_x = 64;
+    x16_wave64_config.wave_size = 64;
+    x16_wave64_config.native_subgroup_size = 64;
+    x16_wave64_config.user_sgprs.resize(20);
+    const auto x16_wave64_spv = recompile_compute(
+        x16_wave_mask_lifetime.data(), x16_wave_mask_lifetime.size(),
+        &x16_wave_mask_rt, x16_wave64_config);
+    const auto x16_wave64_report = validate_spirv_descriptor_interface(
+        x16_wave64_spv, &x16_wave_mask_rt, 0, SpirvShaderStage::Compute, false);
+    CHECK(!x16_wave64_spv.empty() && x16_wave64_report.ok() &&
+              find_spirv_descriptor_binding(x16_wave64_report, 0, 4) &&
+              find_spirv_descriptor_binding(x16_wave64_report, 0, 5),
+          "Wave64 pair mask kill admits both exact images before a new high-word read");
+    ComputeShaderConfig x16_wave32_config = x16_wave64_config;
+    x16_wave32_config.wave_size = 32;
+    x16_wave32_config.native_subgroup_size = 32;
+    CHECK(recompile_compute(x16_wave_mask_lifetime.data(), x16_wave_mask_lifetime.size(),
+                            &x16_wave_mask_rt, x16_wave32_config).empty(),
+          "Wave32 one-word mask write leaves descriptor high word observable");
+    std::vector<uint32_t> x16_wave32_replaced_high(
+        x16_wave_mask_lifetime.begin(), x16_wave_mask_lifetime.end());
+    x16_wave32_replaced_high.insert(x16_wave32_replaced_high.begin() + 10,
+                                    0xbe850380u); // s_mov_b32 s5,0 before the read
+    CHECK(!recompile_compute(x16_wave32_replaced_high.data(),
+                             x16_wave32_replaced_high.size(), &x16_wave_mask_rt,
+                             x16_wave32_config).empty(),
+          "Wave32 explicit high-word replacement restores descriptor-only lifetime");
+    auto x16_linear_wave_mask_lifetime = x16_wave_mask_lifetime;
+    x16_linear_wave_mask_lifetime[6] = 0xbf800000u; // remove the only branch
+    CHECK(!recompile_compute(x16_linear_wave_mask_lifetime.data(),
+                             x16_linear_wave_mask_lifetime.size(), &x16_wave_mask_rt,
+                             x16_wave64_config).empty() &&
+              recompile_compute(x16_linear_wave_mask_lifetime.data(),
+                                x16_linear_wave_mask_lifetime.size(), &x16_wave_mask_rt,
+                                x16_wave32_config).empty(),
+          "branch-free x16 lifetime applies the same Wave64 pair and Wave32 word widths");
+    auto x16_b32_mask_lifetime = x16_wave_mask_lifetime;
+    x16_b32_mask_lifetime[8] = 0xbe840380u; // s_mov_b32 s4,0, not a pair write
+    x16_b32_mask_lifetime[9] = 0xbf800000u;
+    CHECK(recompile_compute(x16_b32_mask_lifetime.data(), x16_b32_mask_lifetime.size(),
+                            &x16_wave_mask_rt, x16_wave64_config).empty(),
+          "Wave64 B32 overwrite cannot hide a later descriptor high-word read");
+    auto x16_bypassed_mask_lifetime = x16_wave_mask_lifetime;
+    x16_bypassed_mask_lifetime[6] = 0xbf820003u; // s_branch pc10, past the pair write
+    CHECK(recompile_compute(x16_bypassed_mask_lifetime.data(),
+                            x16_bypassed_mask_lifetime.size(), &x16_wave_mask_rt,
+                            x16_wave64_config).empty(),
+          "Wave64 path bypassing the mask write cannot read a stale descriptor high word");
     const std::array<uint32_t, 11> bypassed_x16_pair = {
         0xbf060000u,                 // pc0: independent SCC
         0xbf850002u,                 // pc1: skip the x16 producer, join at first image
