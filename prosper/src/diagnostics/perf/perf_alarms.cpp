@@ -98,8 +98,10 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
                 ledger.gpu_memory_off_device[i].load(std::memory_order_relaxed);
         for (size_t i = 0; i < kPresentDeclineSlots; ++i)
             prev_present_declines_[i] = ledger.present_declines[i].load(std::memory_order_relaxed);
-        for (size_t i = 0; i < WindowSample::kTransferCount; ++i)
+        for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {
             prev_transfer_bytes_[i] = ext.transfer_bytes[i];
+            prev_transfer_calls_[i] = ext.transfer_calls[i];
+        }
         return {};
     }
     ++flips_in_window_;
@@ -153,6 +155,9 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
         const uint64_t v = ext.transfer_bytes[i];
         w.transfer_bytes[i] = v >= prev_transfer_bytes_[i] ? v - prev_transfer_bytes_[i] : 0;
         prev_transfer_bytes_[i] = v;
+        const uint64_t c = ext.transfer_calls[i];
+        w.transfer_calls[i] = c >= prev_transfer_calls_[i] ? c - prev_transfer_calls_[i] : 0;
+        prev_transfer_calls_[i] = c;
     }
     window_start_ns_ = now_ns;
     flips_in_window_ = 0;
@@ -177,6 +182,8 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
             }
         if (!held) state.streak = 0;
     }
+    // After the streaks: a deferral changes what is printed, never what is counted.
+    apply_reporting_deferrals(fired);
     active_.clear();
     for (const AlarmFiring& a : fired) active_.push_back(a.rule);
     for (const AlarmFiring& a : fired) {
@@ -311,7 +318,26 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
             json_string(jsonl_, transfer_name(static_cast<Transfer>(i)));
             std::fprintf(jsonl_, ":%.1f", w.transfer_bytes[i] / (1024.0 * 1024.0));
         }
-        std::fputs("}}\n", jsonl_);
+        // host-copy-per-flip's inputs: the per-flip figure (null below the flip floor, where the
+        // rule has no data), the per-second figure host-copy-pressure reads (kept visible even
+        // when that rule is not reported in favour of the per-flip one), and calls per site.
+        std::fputs("},\"host_copy_mib_per_flip\":", jsonl_);
+        if (w.flips >= kHostCopyPerFlipMinFlips)
+            std::fprintf(jsonl_, "%.2f", host_copy_mib(w) / static_cast<double>(w.flips));
+        else
+            std::fputs("null", jsonl_);
+        std::fprintf(jsonl_, ",\"host_copy_mib_per_s\":%.1f,\"host_copy_calls_by_site\":{",
+                     w.seconds > 0 ? host_copy_mib(w) / w.seconds : 0.0);
+        first = true;
+        for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {
+            if (!w.transfer_calls[i]) continue;
+            if (!first) std::fputc(',', jsonl_);
+            first = false;
+            json_string(jsonl_, transfer_name(static_cast<Transfer>(i)));
+            std::fprintf(jsonl_, ":%llu", (unsigned long long)w.transfer_calls[i]);
+        }
+        std::fprintf(jsonl_, "},\"present_slot_trouble_declines\":%llu}\n",
+                     (unsigned long long)present_slot_trouble_declines(w));
         std::fflush(jsonl_);
     }
     return fired;
@@ -407,8 +433,10 @@ void on_guest_flip() {
     AlarmEngine& engine = process_engine();
     const uint64_t before = engine.windows_evaluated();
     AlarmEngine::ExternalTotals external;
-    for (size_t i = 0; i < WindowSample::kTransferCount; ++i)
+    for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {
         external.transfer_bytes[i] = transfer_bytes(static_cast<Transfer>(i));
+        external.transfer_calls[i] = transfer_calls(static_cast<Transfer>(i));
+    }
     engine.on_flip(now_ns(), ledger(), g_target_hz.load(std::memory_order_relaxed), &external);
     if (engine.windows_evaluated() == before) return;   // no window closed on this flip
     uint32_t mask = 0;

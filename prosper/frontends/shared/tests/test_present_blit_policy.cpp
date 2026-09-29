@@ -1,7 +1,9 @@
 #include "shared/present/present_blit_policy.hpp"
 #include "shared/present/compute_scanout.hpp"
+#include "diagnostics/perf/perf_alarm_rules.hpp"   // kPresentSlotTroubleReasons (header-only use)
 
 #include <cstdio>
+#include <cstring>
 
 using prosper::frontend::present_blit_wait_completed;
 using prosper::frontend::present_blit_has_new_flip;
@@ -45,6 +47,17 @@ int main() {
          o < static_cast<int>(GpuPresentOutcome::Count); ++o) {
         CHECK(gpu_present_outcome_is_decline(static_cast<GpuPresentOutcome>(o)));
         CHECK(prosper::frontend::gpu_present_outcome_name(static_cast<GpuPresentOutcome>(o))[0] != '?');
+    }
+
+    // #3891: present-slot-trouble matches decline slots by NAME (the diagnostics layer cannot
+    // include this header). A renamed outcome would silence that alarm, so pin each spelling here.
+    for (const char* reason : prosper::diagnostics::perf::kPresentSlotTroubleReasons) {
+        bool named = false;
+        for (int o = 0; o < static_cast<int>(GpuPresentOutcome::Count); ++o)
+            named |= std::strcmp(reason, prosper::frontend::gpu_present_outcome_name(
+                                             static_cast<GpuPresentOutcome>(o))) == 0 &&
+                     gpu_present_outcome_is_decline(static_cast<GpuPresentOutcome>(o));
+        CHECK(named);
     }
 
     // #3915: which compute results may carry a GPU-present mirror.

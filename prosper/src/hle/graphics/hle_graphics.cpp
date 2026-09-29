@@ -23,6 +23,7 @@
 #include "hle/graphics/display_mode.hpp"      // #3017: the one derived answer for "which display is this?"
 #include "diagnostics/env_numeric.hpp"  // #3379: a typo must not silently unpace the guest
 #include "diagnostics/perf/perf_alarms.hpp"  // #3891: per-flip alarm window, blocked-lock ledger
+#include "diagnostics/transfer_pressure.hpp"  // #3891: the guest-scanout host-copy site
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
@@ -810,6 +811,7 @@ bool videoout_read_front_linear(VideoOutLinearRead& out) {
 
     std::vector<uint8_t> raw(footprint, 0);
 
+    size_t read_bytes = linear_bytes;
     {
         std::lock_guard<std::mutex> lk(g_display_mx);
         VideoOutBufferSnapshot current;
@@ -817,7 +819,6 @@ bool videoout_read_front_linear(VideoOutLinearRead& out) {
             current.generation != meta.generation || current.width != meta.width ||
             current.height != meta.height || current.tiling_mode != meta.tiling_mode)
             return false;
-        size_t read_bytes = linear_bytes;
         if (footprint > linear_bytes && videoout_footprint_provable_locked(current, footprint)) {
             read_bytes = footprint;
             out.padded_footprint = true;
@@ -826,6 +827,11 @@ bool videoout_read_front_linear(VideoOutLinearRead& out) {
                     read_bytes);
         out.guest_authored = videoout_buffer_authored_locked(current, linear_bytes);
     }
+    // Host-copy accounting (#3891): the read out of guest memory and, below, its de-swizzle are
+    // both the guest-scanout site, not `detile`, so a host-copy alarm raised by the CPU present
+    // fallback names the present path. Noted outside the registry lock (the clock read is the
+    // census's cost, and the guest's flip path waits on that lock).
+    diagnostics::note_transfer(diagnostics::Transfer::GuestScanout, read_bytes);
 
     out.metadata = meta;
     if (!tiled) {
@@ -834,7 +840,10 @@ bool videoout_read_front_linear(VideoOutLinearRead& out) {
         return true;
     }
     out.pixels.assign(linear_bytes, 0);
-    gpu::detile_surface(out.pixels.data(), raw.data(), meta.width, meta.height, tile_mode, 0, 4);
+    {
+        const diagnostics::TransferAttributionScope as_scanout(diagnostics::Transfer::GuestScanout);
+        gpu::detile_surface(out.pixels.data(), raw.data(), meta.width, meta.height, tile_mode, 0, 4);
+    }
     return true;
 }
 

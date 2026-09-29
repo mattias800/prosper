@@ -202,3 +202,22 @@ exact decode-cache validations that FAILED actually read (the compare stops at t
 chunk, so a texture rewritten every frame is cheap and quiet; a source changing only near its end is
 what it names). Proposals needing a new expensive signal were
 declined on the issue with a reason rather than approximated.
+
+**Host copy has two denominators** (#3891, 2026-09-29). `host-copy-per-flip` divides the
+`transfer_pressure` bytes by guest flips and leads; `host-copy-pressure` (per second) reports only
+what the per-flip form cannot see -- a window with fewer flips than the per-flip floor (a stall, a
+load), or a small per-frame copy at a high frame rate -- and is not reported in a window where the
+per-flip rule is, so one cause raises one line. That deferral is applied at REPORT time
+(`apply_reporting_deferrals`, after the engine's sustain streaks), never by withholding the
+candidate: a rule with no candidate has its streak reset, and a per-flip value alternating across
+its threshold then reset both rules' streaks so that neither ever printed (the review of #3928). The per-second form is the one that moves with the frame rate (an A/B that changed only
+the fps flipped its verdict), which is why it does not lead; the JSONL window keeps both figures
+(`host_copy_mib_per_flip`, `host_copy_mib_per_s`) and `host_copy_calls_by_site`, and the per-flip
+line names each top site's MiB per call, because "bigger copies" and "more copies" are different
+defects. `guest-scanout` is its own `Transfer` site: `videoout_read_front_linear` charges both its
+read out of guest memory and its de-swizzle there through a `TransferAttributionScope` (the
+de-swizzle goes through `detile_surface`, which would otherwise report it as `detile`).
+`present-slot-trouble` counts only the two GPU-present declines that mean the scanout path itself
+failed (`publish-failed`, `compute-scanout-unwatched`), per guest flip -- the ledger has no count of
+spans that published, so a flip is the denominator; `test_present_blit_policy` pins the names it
+matches.

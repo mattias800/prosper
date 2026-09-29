@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 
 namespace prosper::diagnostics::perf {
 
@@ -68,6 +69,9 @@ RuleThresholds RuleThresholds::scaled(double percent) {
     t.present_fallback_min_per_s *= k;
     t.pipeline_cache_evictions_per_s *= k;
     t.texture_validation_failed_mib_per_s *= k;
+    t.host_copy_mib_per_flip *= k;
+    t.present_slot_trouble_share *= k;
+    // The flip floors are sample sizes, not sensitivities: they do not scale.
     // dropped_draws, skipped_dispatches, gpu_memory_off_device, unaccounted_draws and
     // unimplemented_first_calls stay at "any": a correctness alarm has no sensitivity to lower.
     // diagnostic-path-active is a state and has no threshold.
@@ -81,7 +85,7 @@ const std::vector<const char*>& rule_names() {
         "skipped-dispatches",   "host-copy-pressure",   "shader-compile",
         "gpu-memory-off-device", "unaccounted-draws",   "unimplemented-hle-calls",
         "diagnostic-path-active", "present-path-fallback", "pipeline-cache-thrash",
-        "texture-validation-churn",
+        "texture-validation-churn", "host-copy-per-flip", "present-slot-trouble",
     };
     return names;
 }
@@ -91,6 +95,13 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
     if (r == "present-cpu-overhead") return w.events(Cost::PresentCpu) != 0;
     if (r == "texture-reference-cost") return w.events(Cost::TextureRefSample) != 0;
     // Presents of either kind: a frontend without GPU present has no data for this rule.
+    // A window with fewer flips than the floor cannot form a per-frame mean; host-copy-pressure
+    // covers it. Zero copied bytes over enough flips IS data (the healthy answer).
+    if (r == "host-copy-per-flip") return w.flips >= kHostCopyPerFlipMinFlips;
+    // Declines are counted only while a GPU-present consumer exists (Inactive is not a decline), so
+    // a frontend without GPU present has no data here, not a quiet present path.
+    if (r == "present-slot-trouble")
+        return w.events(Cost::PresentCpu) != 0 || w.count(Counter::PresentGpuDeclines) != 0;
     if (r == "present-path-fallback")
         return w.events(Cost::PresentCpu) != 0 || w.count(Counter::PresentCpuFallbacks) != 0;
     // The others measure events whose ABSENCE is the healthy answer: no readback, no contended
@@ -107,6 +118,36 @@ uint32_t sustain_windows(const char* rule) {
     if (r == "shader-compile") return kShaderCompileSustainWindows;
     if (r == "texture-reference-cost") return kTextureReferenceSustainWindows;
     return kSustainWindows;
+}
+
+bool host_copy_per_flip_holds(const WindowSample& w, const RuleThresholds& t) {
+    if (w.flips < t.host_copy_per_flip_min_flips || w.flips == 0) return false;
+    uint64_t bytes = 0;
+    for (uint64_t b : w.transfer_bytes) bytes += b;
+    return bytes && bytes / kMiB / static_cast<double>(w.flips) >= t.host_copy_mib_per_flip;
+}
+
+uint64_t present_slot_trouble_declines(const WindowSample& w) {
+    uint64_t n = 0;
+    for (size_t i = 0; i < kPresentDeclineSlots; ++i) {
+        const char* name = w.present_decline_names[i];
+        if (!name || !w.present_declines[i]) continue;
+        for (const char* trouble : kPresentSlotTroubleReasons)
+            if (std::strcmp(name, trouble) == 0) n += w.present_declines[i];
+    }
+    return n;
+}
+
+void apply_reporting_deferrals(std::vector<AlarmFiring>& reported) {
+    const auto is = [](const AlarmFiring& a, const char* rule) {
+        return std::strcmp(a.rule, rule) == 0;
+    };
+    bool per_flip = false;
+    for (const AlarmFiring& a : reported) per_flip |= is(a, "host-copy-per-flip");
+    if (!per_flip) return;
+    reported.erase(std::remove_if(reported.begin(), reported.end(),
+                                  [&](const AlarmFiring& a) { return is(a, "host-copy-pressure"); }),
+                   reported.end());
 }
 
 std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresholds& t) {
@@ -318,10 +359,61 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
         }
     }
 
-    // host-copy-pressure (RATE).
+    // host-copy-per-flip (RATE per guest flip) and host-copy-pressure (RATE per second): one
+    // quantity, two denominators. Per flip is the frame-rate-independent form and leads; the
+    // per-second form is still EVALUATED every window, so its sustain streak counts; it is dropped
+    // only at report time, in a window where host-copy-per-flip is itself reported
+    // (apply_reporting_deferrals). Deferring at evaluation instead reset its streak whenever the
+    // per-flip form held, so a per-flip value alternating across the threshold silenced both.
+    uint64_t copy_bytes = 0;
+    for (uint64_t b : w.transfer_bytes) copy_bytes += b;
+    if (host_copy_per_flip_holds(w, t)) {
+        const double mib_per_flip = copy_bytes / kMiB / static_cast<double>(w.flips);
+        AlarmFiring a;
+        a.rule = "host-copy-per-flip";
+        a.value = mib_per_flip;
+        a.unit = "MiB/flip";
+        a.threshold = t.host_copy_mib_per_flip;
+        const char* names[WindowSample::kTransferCount];
+        uint64_t mib[WindowSample::kTransferCount];
+        for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {
+            names[i] = transfer_name(static_cast<Transfer>(i));
+            mib[i] = static_cast<uint64_t>(w.transfer_bytes[i] / kMiB + 0.5);
+        }
+        a.breakdown = ranked(mib, names, WindowSample::kTransferCount);
+        // The top sites with their share of a flip and their bytes PER CALL: GTA V's two regimes
+        // on one binary differ in bytes per call at a near-identical call count, so "bigger
+        // copies" and "more copies" must be told apart in the line itself.
+        std::string sites;
+        size_t shown = 0;
+        for (size_t rank = 0; rank < a.breakdown.size() && shown < 3; ++rank) {
+            for (size_t i = 0; i < WindowSample::kTransferCount; ++i) {
+                if (names[i] != a.breakdown[rank].first) continue;
+                const uint64_t calls = w.transfer_calls[i];
+                if (!sites.empty()) sites += ',';
+                sites += format("%s:%.1fMiB/flip@%.2fMiB/call(%llu calls)", names[i],
+                                w.transfer_bytes[i] / kMiB / static_cast<double>(w.flips),
+                                calls ? w.transfer_bytes[i] / kMiB / static_cast<double>(calls)
+                                      : 0.0,
+                                (unsigned long long)calls);
+                ++shown;
+                break;
+            }
+        }
+        a.detail = format("copied=%.0fMiB flips=%llu rate=%.0fMiB/s sites=%s",
+                          copy_bytes / kMiB, (unsigned long long)w.flips,
+                          per_second(copy_bytes, w.seconds) / kMiB, sites.c_str());
+        a.hint = "every guest frame costs this many bytes of CPU copying, independent of frame "
+                 "rate: usually a residency or dirty-tracking gap re-copying what did not change "
+                 "(storage-materialize: storage images re-staged per dispatch; rtt-snapshot: "
+                 "render targets re-read to the CPU; guest-scanout: the CPU present fallback). "
+                 "@MiB/call separates bigger copies from more copies; next: the "
+                 "[transfer-pressure] exit line, [storage-materialize]/[gpu-seed-refused], "
+                 "[tile-census] for detile; cf. #3871, #3926";
+        out.push_back(std::move(a));
+    }
     {
-        uint64_t bytes = 0;
-        for (uint64_t b : w.transfer_bytes) bytes += b;
+        const uint64_t bytes = copy_bytes;
         const double mib_per_s = per_second(bytes, w.seconds) / kMiB;
         if (bytes && mib_per_s >= t.host_copy_mib_per_s) {
             AlarmFiring a;
@@ -475,6 +567,45 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                      "none-recorded means the final render span never reached the publish; next: "
                      "diagnostic-path-active, PROSPER_PRESENT_HANDOFF_TRACE=1; cf. #1270, #3895, "
                      "#3915";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // present-slot-trouble (SHARE of guest flips).
+    {
+        const uint64_t trouble = present_slot_trouble_declines(w);
+        const double share = w.flips ? static_cast<double>(trouble) / static_cast<double>(w.flips)
+                                     : 0.0;
+        if (trouble && w.flips >= t.present_slot_trouble_min_flips &&
+            share > t.present_slot_trouble_share) {
+            AlarmFiring a;
+            a.rule = "present-slot-trouble";
+            a.value = share * 100.0;
+            a.unit = "%flips";
+            a.threshold = t.present_slot_trouble_share * 100.0;
+            const char* names[kPresentDeclineSlots];
+            uint64_t counts[kPresentDeclineSlots] = {};
+            for (size_t i = 0; i < kPresentDeclineSlots; ++i) {
+                names[i] = w.present_decline_names[i] ? w.present_decline_names[i] : "?";
+                for (const char* r : kPresentSlotTroubleReasons)
+                    if (w.present_decline_names[i] && std::strcmp(names[i], r) == 0)
+                        counts[i] = w.present_declines[i];
+            }
+            a.breakdown = ranked(counts, names, kPresentDeclineSlots);
+            a.detail = format("slot-declines=%llu flips=%llu all-declines=%llu gpu-presents=%llu "
+                              "cpu-fallback=%llu reasons=%s",
+                              (unsigned long long)trouble, (unsigned long long)w.flips,
+                              (unsigned long long)w.count(Counter::PresentGpuDeclines),
+                              (unsigned long long)w.events(Cost::PresentCpu),
+                              (unsigned long long)w.count(Counter::PresentCpuFallbacks),
+                              top_entries(a.breakdown).c_str());
+            a.hint = "the GPU-present path itself keeps failing on frames it could have shown: "
+                     "publish-failed = present_blit_publish refused a publishable front image (no "
+                     "free scanout slot / a slot that never retired); compute-scanout-unwatched = "
+                     "a compute-written front buffer with no guest write watch, so it can never be "
+                     "proven current. Each such span's frame goes through the CPU fallback. next: "
+                     "the [present] GPU PRESENT DECLINED line (extent/format/flip), "
+                     "PROSPER_PRESENT_HANDOFF_TRACE=1 for the slot events; cf. #3915, #3924";
             out.push_back(std::move(a));
         }
     }

@@ -109,7 +109,7 @@ enum class ComputeScanoutPresent : uint8_t {
     ScaledPresent,      // PROSPER_RENDER_SCALE: the present extent is not the display extent
 };
 
-static_assert(static_cast<int>(ComputeScanoutPresent::RendererOwnsTarget) < 16,
+static_assert(static_cast<int>(ComputeScanoutPresent::ScaledPresent) < 16,   // the LAST value
               "compute_scanout.cpp's census keeps sixteen decision slots");
 
 constexpr const char* compute_scanout_present_name(ComputeScanoutPresent p) {

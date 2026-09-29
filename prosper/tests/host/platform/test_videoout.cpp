@@ -3,6 +3,7 @@
 // (swapchain scaffolding) must record the surface the game set up. Drives the functions through the
 // NID registry exactly as the guest does, then asserts the reported display + recorded buffers.
 #include "hle/dispatch/dispatch.hpp"
+#include "diagnostics/transfer_pressure.hpp"  // #3891: the guest-scanout host-copy site
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/texture/tile.hpp"              // tile/detile round trip for the flipped-buffer image
 #include "host/memory/guest_memory_map.hpp" // the registered-mapping proof for the padded read
@@ -687,8 +688,23 @@ int main() {
         // full of non-zero bytes and has NOT been written since it was registered, so the predicate
         // that reverted the first attempt — "not all bytes are zero" — would call this authored.
         VideoOutLinearRead read;
+        using prosper::diagnostics::Transfer;
+        const uint64_t detile_before = prosper::diagnostics::transfer_bytes(Transfer::Detile);
+        const uint64_t scanout_before = prosper::diagnostics::transfer_bytes(Transfer::GuestScanout);
+        const uint64_t scanout_calls_before =
+            prosper::diagnostics::transfer_calls(Transfer::GuestScanout);
         CHECK(videoout_read_front_linear(read) && read.pixels == reference,
               "the image reader returns the same de-swizzled frame as the present snapshot");
+        // #3891: the scanout read is its own host-copy site. Both of its copies -- out of guest
+        // memory, then the de-swizzle -- are charged to guest-scanout and NONE to detile, so a
+        // host-copy alarm on the CPU present fallback names the present path.
+        CHECK(prosper::diagnostics::transfer_bytes(Transfer::GuestScanout) - scanout_before ==
+                      2 * reference.size() &&
+                  prosper::diagnostics::transfer_calls(Transfer::GuestScanout) -
+                          scanout_calls_before == 2,
+              "a TILE-mode scanout read charges its read and its de-swizzle to guest-scanout");
+        CHECK(prosper::diagnostics::transfer_bytes(Transfer::Detile) == detile_before,
+              "...and nothing to detile, although the de-swizzle goes through detile_surface");
         CHECK(!read.guest_authored,
               "a registered-but-unwritten buffer is NOT authored, however non-zero its bytes are");
 
