@@ -63,6 +63,17 @@ int main() {
 
     // GPU presentation is the normal game policy because adoption has a safe CPU fallback. Keep the
     // explicit zero override for driver diagnosis and never request it without a renderer-owned game.
+    // #3891: only the window system's state silences gpu-present-stalled. A visible window whose
+    // present came back skipped or out-of-date (every-frame staging failure, failed submit, acquire
+    // timeouts) must NOT count as unavailable, or the rule goes quiet exactly when it should fire.
+    CHECK_NAMED(!present_window_unavailable(false, false, false, false),
+                "visible window + out-of-date/skipped present does not suppress the stall rule");
+    CHECK_NAMED(present_window_unavailable(true, false, false, false),
+                "zero-extent surface counts as unavailable");
+    CHECK_NAMED(present_window_unavailable(false, true, false, false) &&
+                    present_window_unavailable(false, false, true, false) &&
+                    present_window_unavailable(false, false, false, true),
+                "minimized, hidden or occluded counts as unavailable");
     CHECK(request_gpu_present(nullptr, false, true));
     CHECK(request_gpu_present("1", false, true));
     CHECK(!request_gpu_present("0", false, true));

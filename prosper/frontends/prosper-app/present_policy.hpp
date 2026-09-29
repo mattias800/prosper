@@ -87,6 +87,17 @@ private:
 // What present_frame should do after a BOUNDED vkAcquireNextImageKHR.
 enum class AcquireAction { proceed, skip, recreate, fail };
 
+// #3891: may a present attempt that did not reach the window count as "the window could not be
+// presented" (Counter::PresentWindowUnavailable, which silences gpu-present-stalled)? Only when the
+// window system says so: a zero-extent surface, or the window minimized, hidden or occluded. A
+// skipped or out-of-date result on a VISIBLE window -- a failed staging allocation, a failed
+// submit, acquire timeouts the bounded acquire says are never hit while visible -- is a broken
+// present path, and it must stay visible to the rule.
+constexpr bool present_window_unavailable(bool zero_extent, bool minimized, bool hidden,
+                                          bool occluded) {
+    return zero_extent || minimized || hidden || occluded;
+}
+
 // Select the extent Vulkan will use for a swapchain. Win32 surfaces normally publish a fixed
 // currentExtent, but can transiently report 0x0 while a minimize/fullscreen/DPI transition is in
 // flight even after SDL has already observed a non-zero pixel size. That is an unavailable surface,

@@ -367,6 +367,8 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
         }
         std::fprintf(jsonl_, "},\"present_slot_trouble_declines\":%llu",
                      (unsigned long long)present_slot_trouble_declines(w));
+        std::fprintf(jsonl_, ",\"present_window_unavailable\":%llu",
+                     (unsigned long long)w.count(Counter::PresentWindowUnavailable));
         // #3948 stage 0: executor fence waits and the GPU device time inside them.
         std::fprintf(jsonl_, ",\"gpu_wait_compute_ms\":%.3f,\"gpu_wait_compute_n\":%llu,"
                              "\"gpu_device_compute_ms\":%.3f,\"gpu_device_compute_n\":%llu,"

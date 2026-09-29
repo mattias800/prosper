@@ -264,7 +264,9 @@ a GPU scanout (`Cost::PresentCpu` events) nor a CPU fallback, while the guest fl
 times. The window then keeps showing its last frame (or black), whatever the other rules say.
 #3951's recompiler regression is the case: the guest flipped at ~30/s with no `[app] fps` line, and
 only a downstream host-copy-per-flip fired. It has no data in `tools/screenshot`/`boot_trace` (no
-consumer), in a window where the guest barely flips (boot, loading), or in a window where the app
-could not present at all (`Counter::PresentWindowUnavailable`: minimized, occluded, swapchain
-being recreated -- the gauge stays set across those, so without this it read a hidden window as a
-stall), and it needs two windows.
+consumer), in a window where the guest barely flips (boot, loading), or in a window the window
+system made unpresentable (`Counter::PresentWindowUnavailable`: a zero-extent surface, or SDL
+reporting the window minimized, hidden or occluded -- the gauge stays set across those, so without
+this it read a hidden window as a stall), and it needs two windows. A skipped or out-of-date present
+on a VISIBLE window deliberately does not count: that is a broken present path, which is exactly
+what the rule is for.
