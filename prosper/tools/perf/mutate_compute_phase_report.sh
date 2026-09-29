@@ -128,8 +128,30 @@ run_mutation "retain bounded address variants" \
   '            if "addr" in image:' '            if False and "addr" in image:' || bad=1
 run_mutation "warn on impossible image model" \
   "impossible image model warns on stdout and stderr" \
-  '    if broken_storage_nest or broken_image_root or negative_image_timers:' \
+  '    if broken_storage_nest or broken_detile_nest or broken_image_root or negative_image_timers:' \
   '    if False:' || bad=1
+run_mutation "rank detiles by measured time" \
+  "detile table ranks elapsed work, not total image setup" \
+  'detile_groups.items(), key=lambda item: -sum(item[1]))' \
+  'detile_groups.items(), key=lambda item: sum(item[1]))' || bad=1
+run_mutation "keep detile nested in prepare" \
+  "detile stays nested in prepare" \
+  'image_row("storage detile (included)", storage_detile, 2)' \
+  'image_row("storage detile (included)", storage_detile * 2, 2)' || bad=1
+run_mutation "name absent detile timers" \
+  "missing and measured-zero detile rows remain distinct" \
+  'untimed_storage = sum(_storage_image(image) and "detile_ms" not in image' \
+  'untimed_storage = sum(_storage_image(image) and "detile_ms" in image' || bad=1
+run_mutation "keep sampled timing out of storage detile" \
+  "sampled timing does not enter the storage-only ranking" \
+  '        timed_storage = [image for image in images
+                         if _storage_image(image) and "detile_ms" in image]' \
+  '        timed_storage = [image for image in images
+                         if "detile_ms" in image]' || bad=1
+run_mutation "warn on detile outside prepare" \
+  "impossible detile nesting fails visibly in both outputs" \
+  'if _storage_image(image) and "detile_ms" in image and' \
+  'if False and "detile_ms" in image and' || bad=1
 
 cp "$PRISTINE" "$TOOL"
 if python3 "$WORK/test_compute_phase_report.py" >/dev/null 2>&1; then

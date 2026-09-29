@@ -110,6 +110,23 @@ def binding_rows(out):
     return rows
 
 
+def detile_rows(out):
+    """Parse only the measured-detile table, never the setup-cost table above it."""
+    sections = out.split("measured ordinary 2D storage-seed detile")
+    if len(sections) < 2:
+        return []
+    rows = []
+    for line in sections[1].splitlines():
+        match = re.match(
+            r"^\s+(hash:0x[0-9a-f]+|code:0x[0-9a-f]+)\s+(\d+)\s+(\S+)\s+"
+            r"([01?])\s+(\d+)\s+([\d.]+)\s+([\d.]+)$", line)
+        if match:
+            shader, binding, extent, direct, calls, total, mean = match.groups()
+            rows.append((shader, int(binding), extent, direct, int(calls),
+                         float(total), float(mean)))
+    return rows
+
+
 FAILURES = []
 
 
@@ -323,6 +340,50 @@ def main():
     rows = binding_rows(out)
     check("aliases are excluded from the per-binding rollup",
           len(rows) == 1 and rows[0]["shader"] == "hash:0x00000000000000f0", rows)
+
+    # A binding's total setup cost is not its detile cost. The expensive binding here has the
+    # cheaper detile; ranking by setup would invert the intended result. The nested row must not
+    # change the parent/root arithmetic.
+    log = (phase(setup_ms=8) +
+           image(shader_hash=0xA1, binding=7, image_class="storage",
+                 ms=5, prepare_ms=5, detile_ms=0.2, direct_detile=1) +
+           image(shader_hash=0xB2, binding=8, image_class="storage",
+                 ms=3, prepare_ms=3, detile_ms=2.0, direct_detile=1))
+    code, out, err = run(log)
+    detiles = detile_rows(out)
+    check("detile table ranks elapsed work, not total image setup",
+          code == 0 and len(detiles) == 2 and
+          [row[1] for row in detiles] == [8, 7] and
+          [row[5] for row in detiles] == [2.0, 0.2], detiles)
+    check("detile stays nested in prepare",
+          image_row(out, "storage detile (included)")[0] == 2.2 and
+          image_row(out, "unattributed")[0] == 0.0 and
+          "NOT TRUSTWORTHY" not in out, out)
+
+    # Old logs omit the timer; zero is an observed value in current logs. Both cases must be
+    # distinct so a missing instrument cannot be mistaken for a cheap workload.
+    code, out, err = run(phase(setup_ms=3) +
+                         image(image_class="storage", ms=1, prepare_ms=1) +
+                         image(image_class="storage", ms=1, prepare_ms=1) +
+                         image(image_class="storage", ms=1, prepare_ms=1,
+                               detile_ms=0.0))
+    check("missing and measured-zero detile rows remain distinct",
+          "1 storage bindings with detile_ms, 2 without it; 0 positive calls" in out and
+          not detile_rows(out), out)
+
+    # The emitter currently times only the ordinary storage-seed branch. A sampled image carrying
+    # a future field must not silently enter a table whose coverage label says storage-only.
+    code, out, err = run(phase(setup_ms=4) +
+                         image(image_class="sampled", ms=4, prepare_ms=4,
+                               detile_ms=3))
+    check("sampled timing does not enter the storage-only ranking",
+          "0 storage bindings with detile_ms" in out and not detile_rows(out), out)
+
+    code, out, err = run(phase(setup_ms=6) +
+                         image(image_class="storage", ms=6, prepare_ms=1,
+                               detile_ms=5))
+    check("impossible detile nesting fails visibly in both outputs",
+          "detile exceeds prepare" in err and "NOT TRUSTWORTHY" in out, out + err)
 
     # Impossible image timing must mark both the terminal and redirected table. Here storage cache
     # cannot be six ms inside a four-ms prepare interval, even though every value is non-negative.
