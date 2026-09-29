@@ -7,16 +7,17 @@
 // the live renderer twice in ONE process and pins the current contract:
 //   1. The PROSPER_RENDER_DELAY_MS clock starts at the FIRST CALLBACK, not at registration, and the
 //      variable is read there (set after registration, it still applies).
-//   2. Statics declared after the callback's early returns initialise on the first submit INSIDE
-//      the render window: the decoded-texture budget reads PROSPER_TEXTURE_DECODE_CACHE_MB then,
-//      and prints its line then, not on a skipped submit.
-//   3. A second registration reuses every process-lifetime static: the delay clock is not
+//   2. The decode-budget static declared after the warmup return initialises on the first submit
+//      INSIDE the render window: it reads PROSPER_TEXTURE_DECODE_CACHE_MB then, and prints its line
+//      then, not on a skipped submit. The budget changes between those callbacks.
+//   3. A second registration reuses the sampled process-lifetime state: the delay clock is not
 //      restarted, neither variable is re-read, and neither the budget line nor the warmup
 //      announcement prints again.
 //   4. A callback on a new thread (whose `static thread_local` prelude state is fresh) still shares
 //      the process-lifetime statics above: the gates are open and nothing initialises twice.
-// A change that keeps these arms green keeps the behaviour the prelude has today. Needs its own
-// process: every arm depends on the statics being untouched when it starts.
+// These arms constrain the sampled gates, budget and announcement. They do not directly observe
+// decoded-cache entries, texture identities or thread-local cache preservation. Needs its own
+// process: every arm depends on the sampled statics being untouched when it starts.
 #include "fixtures/render_runner.h"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -132,7 +133,7 @@ int main() {
     // callback, not register_live_renderer, reads it.
     prosper::frontend::register_live_renderer(".", false);
     set_env("PROSPER_RENDER_DELAY_MS", "400");
-    set_env("PROSPER_TEXTURE_DECODE_CACHE_MB", "77");
+    set_env("PROSPER_TEXTURE_DECODE_CACHE_MB", "55");
     // Longer than the delay: if registration started the clock, the first callback would render.
     std::this_thread::sleep_for(std::chrono::milliseconds(600));
     {
@@ -143,8 +144,11 @@ int main() {
               "1: the delay clock starts at the first callback, not at registration "
               "(600 ms after registering, the first submit is still inside a 400 ms warmup)");
         check(count(log, "decoded texture cache budget") == 0,
-              "2: a submit skipped by the warmup gate does not initialise the post-gate statics");
+              "2: a submit skipped by the warmup gate does not print the budget announcement");
     }
+    // Distinguish first-callback initialization from first-in-window initialization even if a
+    // refactor leaves the budget report below the warmup gate while moving its read above it.
+    set_env("PROSPER_TEXTURE_DECODE_CACHE_MB", "77");
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     {
         StderrCapture capture(log_dir + "/registration_statics_first.log");
