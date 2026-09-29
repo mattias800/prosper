@@ -103,6 +103,7 @@ constexpr uint64_t kVdecErrArg       = 0x811d0102ull;
 constexpr uint64_t kVdecErrDecoder   = 0x811d0103ull;
 constexpr uint64_t kVdecErrFrameSize = 0x811d0106ull;
 constexpr uint64_t kVdecErrFramePtr  = 0x811d0107ull;
+constexpr uint64_t kVdecErrInputDepth = 0x811d0206ull;
 
 } // namespace
 
@@ -297,6 +298,22 @@ int main() {
           "TrySyncDecodeOutput succeeds after Reset and output re-registration");
     CHECK(out.pictures == 0 && out.pictureCount == 0,
           "Staged AU 4 was discarded on Reset (no pictures decoded)");
+
+    // The bounded queue must reject excess input without losing its head. The first AU can carry
+    // the only SPS/PPS for a stream; silently popping it while reporting success poisons decoding.
+    std::vector<uint8_t> queue_head(4, 0x51), queue_tail(4, 0x52), queue_extra(4, 0xEE);
+    VdecInput head_in{sizeof(VdecInput), (uint64_t)(uintptr_t)queue_head.data(), queue_head.size(), 0, 0, 0};
+    VdecInput tail_in{sizeof(VdecInput), (uint64_t)(uintptr_t)queue_tail.data(), queue_tail.size(), 0, 0, 0};
+    VdecInput extra_in{sizeof(VdecInput), (uint64_t)(uintptr_t)queue_extra.data(), queue_extra.size(), 0, 0, 0};
+    bool filled = set_input(handle, (uint64_t)(uintptr_t)&head_in, 0, 0, 0, 0) == 0;
+    for (int i = 1; i < 64; ++i)
+        filled &= set_input(handle, (uint64_t)(uintptr_t)&tail_in, 0, 0, 0, 0) == 0;
+    CHECK(filled, "the bounded queue accepts its first 64 access units");
+    CHECK(set_input(handle, (uint64_t)(uintptr_t)&extra_in, 0, 0, 0, 0) == kVdecErrInputDepth,
+          "a full queue rejects new input instead of silently discarding the head");
+    CHECK(sync_output(handle, (uint64_t)(uintptr_t)&out, 0, 0, 0, 0) == 0 &&
+          mock.last_au_first == 0x51 && mock.last_au_bytes == queue_head.size(),
+          "the first access unit remains next after queue overflow");
 
     // ---- 8. DeleteDecoder Teardown & Cleanup ----------------------------------------------------
     CHECK(destroy(handle, 0, 0, 0, 0, 0) == 0, "DeleteDecoder succeeds");

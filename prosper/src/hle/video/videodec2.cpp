@@ -1001,11 +1001,17 @@ HLE(s_vdecsw_set_decode_input) {
         it = g_vdecsw.emplace(a0, VdecswPending{}).first;
     }
     auto& p = it->second;
-    // Bounded: a title that stages without ever polling must not grow this without limit. The cap is
-    // generous against any plausible decode depth (the config asks for input_depth=3) and dropping
-    // the OLDEST keeps the stream's head, which is where the parameter sets live.
+    // Bounded: a title that stages without ever polling must not grow this without limit. Refuse
+    // overflow instead of silently discarding the oldest AU: it may contain the stream's only
+    // parameter sets, and reporting success would make the later decode fail for the wrong reason.
     constexpr size_t kMaxStaged = 64;
-    if (p.inputs.size() >= kMaxStaged) p.inputs.pop_front();
+    if (p.inputs.size() >= kMaxStaged) {
+        static std::atomic<unsigned> reported{0};
+        if (reported.fetch_add(1) < 4)
+            fprintf(stderr, "[vdecsw] staged input queue full (%zu AUs); refusing new input\n",
+                    kMaxStaged);
+        return VDEC_ERR_INPUT_DEPTH;
+    }
     VdecswInput staged;
     if (in[1] && in[2]) {
         const auto* src = (const uint8_t*)PW(in[1]);
