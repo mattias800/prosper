@@ -11255,6 +11255,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             return addresses;
         }();
+        // #3929: a one-layer 2D_ARRAY T# (img_dim 5, depth 1) is the same single subresource as a
+        // plain 2D surface: identical tiling, staging bytes and transfer extent (see
+        // shader_resource_uses_native_2d_storage_image). The CPU snapshot publication below already
+        // publishes it as an ordinary 2D renderer target; the device mirror must accept the same
+        // shape or every such result is re-read to the CPU instead. Sonic Frontiers' two 4K RGBA8
+        // post-process outputs are this shape: 63 MiB of CPU snapshots per flip without it.
+        // `PROSPER_NO_COMPUTE_RTT_ONE_LAYER_ARRAY_DEST=1` restores the 2D-only shape rule.
+        static const bool one_layer_array_destination_disabled =
+            std::getenv("PROSPER_NO_COMPUTE_RTT_ONE_LAYER_ARRAY_DEST") != nullptr;
         // The whole, exact, single-level 2D result of this dispatch for one guest address: the
         // shape proof both the renderer destination mirror and the GPU-present scanout mirror
         // (#3915) need before a staging result may stand in for the guest bytes.
@@ -11266,7 +11275,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 bi.alias_of == SIZE_MAX && bi.exact_storage_bytes() &&
                 !bi.storage_write_mask && !bi.mirror_result_to_imported &&
                 !bi.prior_output_conflict && !bi.final_output_conflict &&
-                r->img_dim == 1 && r->depth == 1 && bi.array_layers == 1 &&
+                (r->img_dim == 1 ||
+                 (r->img_dim == 5 && !one_layer_array_destination_disabled)) &&
+                r->depth == 1 && bi.array_layers == 1 &&
                 bi.texel_depth == 1 && bi.mip_levels == 1 && r->sample_count == 1 &&
                 !r->in_mip_tail && !r->mip_chain_base_level && !r->layer_mip_offset_bytes &&
                 !r->linear_row_pitch_bytes && !r->layer_stride_bytes &&
@@ -11284,7 +11295,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     "[compute-dest-target] code=0x%llx submit=%llu dispatch=%llu binding=%u "
                     "addr=0x%llx basic=%u storage-writeback=%u host=%u alias=%u "
                     "exact=%u mask=%u prior-conflict=%u final-conflict=%u "
-                    "format=%u comps=%u native-float=%u packed-r11=%u staging=%zu\n",
+                    "format=%u comps=%u native-float=%u packed-r11=%u staging=%zu "
+                    "to-imported=%u dim=%u depth=%u layers=%u texel-depth=%u mips=%u "
+                    "samples=%u mip-tail=%u mip-base=%u layer-mip-off=%llu pitch=%llu "
+                    "layer-stride=%llu staged=%u\n",
                     (unsigned long long)item.code_addr,
                     (unsigned long long)item.submit_no,
                     (unsigned long long)item.dispatch_index, bi.binding,
@@ -11297,7 +11311,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     bi.final_output_conflict ? 1u : 0u,
                     static_cast<unsigned>(r->format), r->num_components,
                     bi.native_float_storage ? 1u : 0u,
-                    bi.packed_r11_storage ? 1u : 0u, staging_bytes[i]);
+                    bi.packed_r11_storage ? 1u : 0u, staging_bytes[i],
+                    bi.mirror_result_to_imported ? 1u : 0u, r->img_dim, r->depth,
+                    bi.array_layers, bi.texel_depth, bi.mip_levels, r->sample_count,
+                    r->in_mip_tail ? 1u : 0u, r->mip_chain_base_level,
+                    (unsigned long long)r->layer_mip_offset_bytes,
+                    (unsigned long long)r->linear_row_pitch_bytes,
+                    (unsigned long long)r->layer_stride_bytes, staging[i] ? 1u : 0u);
             if (image_timing && perf_capture_timing && r && bi.storage_writeback)
                 std::fprintf(stderr,
                     "[compute-rtt-destination-check] code=0x%llx binding=%u "

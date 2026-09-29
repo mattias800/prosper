@@ -383,6 +383,11 @@ revokes the lease without publishing. `PROSPER_NO_COMPUTE_RTT_DEST_CREATE=1`
 restores the no-creation policy; `=0` is the equal-length enabled arm for same-binary comparisons.
 `PROSPER_NO_COMPUTE_RTT_UNREGISTERED_DEST=1` disables only first-producer admission for a
 same-binary comparison while retaining creation for known CPU RTT entries.
+A one-layer 2D_ARRAY descriptor (`img_dim` 5, depth 1) counts as exact 2D here: its sole
+subresource has the same tiling, staging bytes and transfer extent, and CPU publication already
+treated it as an ordinary 2D target. Sonic Frontiers' two 4K RGBA8 post-process outputs have this
+shape and cost 63 MiB of CPU snapshots per flip before it was admitted (#3929).
+`PROSPER_NO_COMPUTE_RTT_ONE_LAYER_ARRAY_DEST=1` restores the 2D-only rule.
 The cold destination cases in
 `test_game_compute_rtt_mirror.cpp` cover registered and unregistered first-write failure/retry,
 read authority, RGBA16F reseeding and budget fallback.
