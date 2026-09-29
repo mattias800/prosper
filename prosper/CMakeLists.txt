@@ -4450,6 +4450,16 @@ endif()
 endif()
 
 if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
+  # A compute full-overwrite destination at the colour-target COUNT bound evicts under the graphics
+  # admission predicate instead of refusing (#3873).
+  add_executable(test_compute_overwrite_eviction tests/gpu/state/test_compute_overwrite_eviction.cpp)
+  target_include_directories(test_compute_overwrite_eviction PRIVATE tests frontends)
+  target_link_libraries(test_compute_overwrite_eviction PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME compute_overwrite_eviction COMMAND ${CMAKE_COMMAND} -E env
+    PROSPER_BACKEND_TARGET_CACHE_COUNT=4 --unset=PROSPER_NO_COMPUTE_RTT_DEST_EVICT
+    --unset=PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS
+    $<TARGET_FILE:test_compute_overwrite_eviction>)
+  set_tests_properties(compute_overwrite_eviction PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(test_render_buffer_residency tests/gpu/state/test_render_buffer_residency.cpp)
   target_include_directories(test_render_buffer_residency PRIVATE tests frontends)
   target_link_libraries(test_render_buffer_residency PRIVATE prosper_core Vulkan::Vulkan)
