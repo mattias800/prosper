@@ -141,8 +141,9 @@ int main() {
         "BatchMap cannot finish under shared lease");
     expect(batch_done == 1, "BatchMap completes its entry after lease release");
 
-    // The production compute submit must own the lease until its synchronous backend returns.
-    // The shader has no resources: this isolates the lifetime boundary from descriptor handling.
+    // A descriptor-free production compute has no nested candidate and must not hold a mapping
+    // lease through an unrelated backend wait. The admission tests exercise the positive gate;
+    // the held-lease HLE tests above and below exercise the mutation boundary itself.
     const auto create_shader = Hle::lookup("f3dg2CSgRKY");
     gpu::ShaderReg registers[2] = {{P::COMPUTE_PGM_LO, 0}, {P::COMPUTE_PGM_HI, 0}};
     gpu::AgcShaderHeader shader_header{};
@@ -182,7 +183,7 @@ int main() {
             return gpu::execute_nonrender_submit_work(submit_state, 1);
         });
         const bool reached_backend = entered.wait_for(5s) == std::future_status::ready;
-        expect(reached_backend, "production compute submit reaches backend under lease");
+        expect(reached_backend, "descriptor-free production compute reaches backend");
         if (reached_backend) {
             std::promise<void> contended;
             auto attempted = contended.get_future();
@@ -191,16 +192,16 @@ int main() {
             auto deferred_unmap = std::async(std::launch::async, [&] {
                 return unmap(ephemeral, page, 0, 0, 0, 0);
             });
-            expect(attempted.wait_for(5s) == std::future_status::ready,
-                   "production unmap reaches the held mapping lease");
+            expect(deferred_unmap.wait_for(5s) == std::future_status::ready,
+                   "noncandidate submit does not block an unrelated guest unmap");
             set_guest_mapping_mutation_contention_observer_for_test(nullptr);
             g_contention_promise.store(nullptr);
-            expect(deferred_unmap.wait_for(100ms) == std::future_status::timeout,
-                   "guest unmap waits for active production compute submit");
+            expect(attempted.wait_for(0ms) == std::future_status::timeout,
+                   "noncandidate submit never acquires the admission lease");
             finish_backend.set_value();
             expect(submit.get(), "compute submit finishes after backend release");
             expect(deferred_unmap.get() == 0,
-                   "guest unmap resumes after production submit completion");
+                   "unrelated guest unmap completes during noncandidate compute");
         } else {
             finish_backend.set_value();
             (void)submit.get();

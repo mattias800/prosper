@@ -1189,6 +1189,17 @@ int main() {
     rdna2_walk(nested_bypassed.data(), nested_bypassed.size(), nested_bypassed_decoded);
     CHECK(rdna2_proven_raw_nested_wide_data_loads(nested_bypassed_decoded).empty(),
           "one-hop child refuses a path that bypasses its pointer producer");
+    const std::array<uint32_t, 7> nested_child_bypassed = {
+        nested_x4_numeric[0], nested_x4_numeric[1],
+        0xbf840002u, // branch from pc2 around child at pc3 to numeric reader pc5
+        nested_x4_numeric[2], nested_x4_numeric[3],
+        nested_x4_numeric[4], nested_x4_numeric[5],
+    };
+    std::vector<Rdna2Inst> nested_child_bypassed_decoded;
+    rdna2_walk(nested_child_bypassed.data(), nested_child_bypassed.size(),
+               nested_child_bypassed_decoded);
+    CHECK(rdna2_proven_raw_nested_wide_data_loads(nested_child_bypassed_decoded).empty(),
+          "one-hop child refuses a branch that bypasses its own definition");
     auto nested_x8_numeric = nested_x4_numeric;
     nested_x8_numeric[2] = 0xf40c0b14u; // child x8 s[44:51], same numeric s46 use
     CHECK(raw_wide_data_pcs(nested_x8_numeric) ==

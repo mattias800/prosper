@@ -1534,7 +1534,7 @@ LiveTargetByteReadResult read_live_render_target_bytes(uint64_t gpu_addr, uint32
 std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st,
                                                      uint64_t submit_no = 0,
                                                      std::vector<OperationRealizationFailure>* failures = nullptr,
-                                                     const prosper::GuestMappingLease* mapping_lease = nullptr);
+                                                     std::unique_ptr<prosper::GuestMappingLease>* mapping_lease = nullptr);
 // Execute retained dispatches and address-backed DMA copies in PM4 order when graphics rendering is
 // intentionally skipped or unavailable. Draw operations are omitted, but still delimit ordering.
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no = 0);

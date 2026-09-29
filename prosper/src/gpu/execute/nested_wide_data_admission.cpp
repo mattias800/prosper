@@ -109,6 +109,7 @@ bool admit_compute_nested_wide_data(const GuestMappingLease* lease,
         });
         if (use == uses.end() || !use->descriptor_source_addr ||
             use->descriptor_source_addr > UINT64_MAX - 32u ||
+            !guest_memory_direct_range_fault_safe(*lease, use->descriptor_source_addr, 32u) ||
             !guest_readable(use->descriptor_source_addr, 32u) ||
             std::memcmp(reinterpret_cast<const void*>(
                             static_cast<uintptr_t>(use->descriptor_source_addr)),

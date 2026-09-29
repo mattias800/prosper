@@ -8105,7 +8105,7 @@ uint64_t compute_dispatch_code_addr(const GpuState& submit, const GpuState::Disp
 std::vector<ComputeItem> realize_compute_dispatches(
     const GpuState& st, uint64_t submit_no,
     std::vector<OperationRealizationFailure>* failures,
-    const GuestMappingLease* mapping_lease) {
+    std::unique_ptr<GuestMappingLease>* mapping_lease) {
     if (failures) failures->clear();
     if (st.dispatches.empty()) return {};
     namespace P = prosper::agc::Pm4;
@@ -8177,6 +8177,15 @@ std::vector<ComputeItem> realize_compute_dispatches(
             continue;
         }
         const size_t shader_dwords = registered_shader_dwords(*header, code_addr);
+        if (mapping_lease && shader_dwords &&
+            !decode_shader_cached(reinterpret_cast<const uint32_t*>(
+                                      static_cast<uintptr_t>(code_addr)), shader_dwords)
+                 ->raw_nested_wide_data_load_pcs.empty()) {
+            // Decode is exact-byte validated and reused by the fold below. Ordinary compute
+            // dispatches do not hold a lease across their Vulkan wait. A newly nested fold
+            // after code mutation has no lease and therefore cannot gain admission.
+            *mapping_lease = std::make_unique<GuestMappingLease>();
+        }
 
         uint32_t range_start = 0;
         if (header->specials && guest_readable((uint64_t)(uintptr_t)header->specials,
@@ -8469,8 +8478,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
             // The fold already resolved each child's exact current pointer. Only the ordered
             // live path carries a mapping lease; offline realization remains fail-closed. The
             // admission helper freezes parent/child bytes and rejects any possible write alias.
-            (void)admit_compute_nested_wide_data(mapping_lease, facts->decoded,
-                                                 compute_srt_uses, *table);
+            (void)admit_compute_nested_wide_data(
+                mapping_lease ? mapping_lease->get() : nullptr,
+                facts->decoded, compute_srt_uses, *table);
             // Keep dispatch-scoped resource discovery and translation on the same specialized
             // instruction stream. A proven-null BVH can collapse only the exact no-hit exit and a
             // fully matched empty-stack traversal cycle; shader-byte constant folding may then
@@ -10422,7 +10432,7 @@ RetainedComputeRealization realize_retained_compute(
         const GpuState& st, size_t index, const GpuState::Dispatch& resolved_dispatch,
         uint64_t submit_no, ComputeItem& item,
         OperationRealizationFailure* failure = nullptr,
-        const GuestMappingLease* mapping_lease = nullptr) {
+        std::unique_ptr<GuestMappingLease>* mapping_lease = nullptr) {
     if (index >= st.dispatches.size()) return RetainedComputeRealization::Failed;
     // DMA-bearing submits are uncommon. A one-dispatch state keeps the mature realization path
     // intact while ensuring it runs only after every preceding ordered producer has landed.
@@ -11481,10 +11491,15 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 // admission, owned snapshot construction and this dispatch's completion. Keep the
                 // lease local to the ordered dispatch, so unrelated draws, DMA and presentation
                 // do not hold it. Byte stores and lazy faults have separate admission checks.
-                GuestMappingLease mapping_lease;
+                std::unique_ptr<GuestMappingLease> mapping_lease;
                 const RetainedComputeRealization realization = realize_retained_compute(
                     st, operation.index, resolved_dispatch, submit_no, item,
-                    capture_trace ? &failure : nullptr, &mapping_lease);
+                    capture_trace ? &failure : nullptr,
+                    // A deferred graphics producer may still be writing a guest source. Its
+                    // bridge establishes backend ordering, but a CPU snapshot taken during
+                    // realization bypasses that bridge. Keep this opt-in mode on the existing
+                    // unresolved path until such a snapshot can await the precise producer.
+                    defer_graphics_wait ? nullptr : &mapping_lease);
                 if (realization == RetainedComputeRealization::Realized) {
                     // `resolved_dispatch.indirect` is false after its argument dwords were read.
                     // Preserve the source form beside the resolved dimensions for bounded F8

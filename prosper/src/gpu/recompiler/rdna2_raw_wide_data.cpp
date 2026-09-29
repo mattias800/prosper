@@ -511,6 +511,8 @@ std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(
         }
         if (parent_index == ins.size()) continue;
         bool stable = true;
+        const RawWideLifetime child_lifetime(ins, by_pc, child_index,
+                                             child.opcode == 0x2u ? 4u : 8u);
         for (size_t i = 0; i < child_index && stable; ++i) {
             const Rdna2Inst& preceding = ins[i];
             if (i > parent_index)
@@ -525,6 +527,16 @@ std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(
                     preceding.len_dwords + preceding.simm16;
                 if (target > static_cast<int64_t>(ins[parent_index].pc) &&
                     target <= static_cast<int64_t>(child.pc)) stable = false;
+            }
+            // A branch around the child can join a numeric reader with no child definition.
+            // The parent-dominance check above does not cover this second edge.
+            if (preceding.fmt == Rdna2Format::SOPP &&
+                sopp_opcode_is_direct_branch(preceding.opcode)) {
+                const int64_t target = static_cast<int64_t>(preceding.pc) +
+                    preceding.len_dwords + preceding.simm16;
+                if (target > static_cast<int64_t>(child.pc) &&
+                    child_lifetime.has_reader_after_bypassed_load(
+                        by_pc.at(static_cast<uint32_t>(target)))) stable = false;
             }
         }
         if (stable) proven.push_back(child.pc);
