@@ -94,6 +94,10 @@ enum class Counter : uint8_t {
     PresentCpuFallbacks,       // GPU-present iterations that showed a CPU-read-back frame instead
     PresentGpuDeclines,        // final render spans that declined to publish the front to GPU
                                // present, by reason in Ledger::present_declines (#3915)
+    // Host present attempts that could not reach the window at all: a minimized / zero-extent
+    // window waiting for its swapchain, an occluded acquire that timed out, or an out-of-date
+    // swapchain being recreated. gpu-present-stalled stays silent in a window that has any.
+    PresentWindowUnavailable,
     PipelineEvictions,         // graphics pipelines evicted from the full pipeline cache
     PipelineLayoutEvictions,   // pipeline layouts evicted from their full cache
     DescriptorSetLayoutEvictions,  // descriptor-set layouts evicted from their full cache

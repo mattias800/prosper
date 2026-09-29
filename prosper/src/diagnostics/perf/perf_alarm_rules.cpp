@@ -117,7 +117,8 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
     // Only a frontend with a GPU-present consumer is expected to present at all; a window without
     // enough guest flips cannot say whether presents SHOULD have happened.
     if (r == "gpu-present-stalled")
-        return w.gauge(Gauge::GpuPresentActive) != 0 && w.flips >= kGpuPresentStalledMinFlips;
+        return w.gauge(Gauge::GpuPresentActive) != 0 && w.flips >= kGpuPresentStalledMinFlips &&
+               w.count(Counter::PresentWindowUnavailable) == 0;
     // A run whose renderer never consulted the persistent colour-target cache has no bound to be at.
     if (r == "color-target-count-ceiling") return w.gauge(Gauge::PersistentTargetEntryLimit) != 0;
     // The others measure events whose ABSENCE is the healthy answer: no readback, no contended
@@ -795,7 +796,10 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
     }
 
     // gpu-present-stalled (STATE: guest flips, host presents nothing).
-    if (w.gauge(Gauge::GpuPresentActive) != 0 && w.flips >= t.gpu_present_stalled_min_flips) {
+    // A window the frontend could not present to (minimized, occluded, swapchain being recreated)
+    // shows nothing whatever prosper renders; that is the window system's state, not a stall.
+    if (w.gauge(Gauge::GpuPresentActive) != 0 && w.flips >= t.gpu_present_stalled_min_flips &&
+        w.count(Counter::PresentWindowUnavailable) == 0) {
         const uint64_t gpu = w.events(Cost::PresentCpu);
         const uint64_t fallback = w.count(Counter::PresentCpuFallbacks);
         if (gpu + fallback == 0) {
@@ -816,7 +820,8 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                               a.breakdown.empty() ? "none-recorded"
                                                   : top_entries(a.breakdown).c_str());
             a.hint = "the guest keeps flipping but prosper-app presented no frame at all this "
-                     "window (no [app] fps line): the window is frozen or black, whatever the "
+                     "window (no [app] fps line), although the window was presentable: it still "
+                     "shows the last frame it got (or black if it never got one), whatever the "
                      "other numbers say. `declines=` names why the renderer refused GPU present "
                      "(none-recorded: the final span never reached the publish, e.g. its draws "
                      "were dropped); next: dropped-draws and its reasons, the [present] GPU "

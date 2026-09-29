@@ -1464,6 +1464,14 @@ void test_gpu_present_stalled() {
     set_count(fallback, Counter::PresentCpuFallbacks, 1);
     check("a CPU-fallback present is a present too",
           !fired(evaluate_rules(fallback, kDefault), "gpu-present-stalled"));
+    WindowSample hidden = stalled;                        // minimized / occluded / recreating
+    set_count(hidden, Counter::PresentWindowUnavailable, 40);
+    check("a window the frontend could not present to: no data, and quiet",
+          !rule_has_data("gpu-present-stalled", hidden) &&
+              !fired(evaluate_rules(hidden, kDefault), "gpu-present-stalled"));
+    check("...and the hint does not claim a frozen or black window outright",
+          !a.empty() && std::string(a[0].hint).find("frozen or black") == std::string::npos &&
+              std::string(a[0].hint).find("presentable") != std::string::npos);
     WindowSample no_consumer = healthy();                 // tools/screenshot: never presents
     check("no GPU-present consumer: no data, and quiet",
           !rule_has_data("gpu-present-stalled", no_consumer) &&
