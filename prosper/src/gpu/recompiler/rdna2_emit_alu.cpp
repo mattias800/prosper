@@ -5524,7 +5524,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool soff_null = (in.src[1].kind == OperandKind::Special && in.src[1].value == 125);
             uint32_t soff_bits = 0; bool soff_dyn = false;
             if (rt && (in.opcode == 0x2 || in.opcode == 0x3) &&
-                rs.smem_raw_wide_data_loads.contains(in.pc)) {
+                rs.smem_raw_wide_data_loads.contains(in.pc) &&
+                (!soff_null || rs.smem_raw_immediate_wide_data_loads.contains(in.pc))) {
+                // Keep the existing immediate descriptor route for loads outside the bounded
+                // current-byte proof. Some established routed tables carry only the resulting
+                // resource, without a source binding at this load PC. The may-use census still
+                // reports numeric/uncertain reads; it cannot turn that legacy route into a
+                // current-byte observation. Register-offset data retains its prior refusal.
                 const ShaderResource* exact = rt->by_fetch_pc(in.pc);
                 const bool backed_immediate_wide = soff_null && (n == 4u || n == 8u) &&
                     rs.smem_raw_immediate_wide_data_loads.contains(in.pc) && exact &&

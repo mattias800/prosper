@@ -294,11 +294,12 @@ private:
             return 4;
         if (in.fmt == Rdna2Format::SMEM && source == 0)
             return in.opcode >= 8u ? 4u : 2u;
-        // VOPC includes two-word integer compares. Over-approximating its other forms can only
-        // refuse a placeholder, never hide a live high half.
         if (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
             in.fmt == Rdna2Format::SOPC || in.fmt == Rdna2Format::VOP3 ||
-            in.fmt == Rdna2Format::VOPC) return 2;
+            in.fmt == Rdna2Format::VOPC) {
+            const uint32_t width = scalar_alu_source_words(in, source);
+            return width == UINT32_MAX ? 0u : width;
+        }
         return 1;
     }
 
