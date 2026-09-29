@@ -6,4 +6,8 @@ sustain, logs and summaries. These observers must not change guest or renderer b
 
 Reuse existing counters at window close before adding event hooks. Rule tests construct both a
 failing population and an independent healthy control; an absent signal is NO DATA, not quiet.
+
+`rtt-seed-extent-churn` consumes CPU-readback seed decisions and reversed extent-miss pairs from
+the per-target pass loop. A pair is the #3907 signature; legitimate colour aliasing can also cause
+it, so the hint asks for publication/write-mask inspection. No CPU seed decisions means NO DATA.
 See the parent `AGENTS.md` for each rule's meaning and the evidence behind its thresholds.

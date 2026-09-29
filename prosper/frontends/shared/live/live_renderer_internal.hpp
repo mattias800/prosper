@@ -20,6 +20,7 @@
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/mrt_extent.hpp"
 #include "shared/rtt/mrt_binding.hpp"               // which MRT slot may join a pass (measured extents only)
+#include "shared/rtt/seed_extent_history.hpp"        // bounded CPU RTT seed-miss observation
 #include "shared/present/readback_policy.hpp"
 #include "shared/present/selected_source_identity.hpp"
 #include "shared/diagnostics/capture_renderer_policy.hpp"
@@ -152,6 +153,9 @@ struct RttSurf {
     uint64_t dcc_metadata_addr = 0;
     uint64_t dcc_metadata_bytes = 0;
     bool dcc_metadata_dirty = false;
+    // Address is authenticated again when an entry is copied by a resolve; no history transfers
+    // to an unrelated target. Matching seeds clear the previous mismatch.
+    prosper::frontend::SeedExtentHistory seed_extent_history;
 };
 // Keeps the per-resource overlap scan entirely off the ordinary 2D-only execution path.
 inline bool g_ever_volume_target = false;

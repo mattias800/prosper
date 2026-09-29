@@ -585,6 +585,20 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                 sit->second.format == pass_format &&
                 sit->second.has_uniform_color)
                 retained_uniform_clear = sit->second.uniform_color.data();
+            if (!live_gpu_targets && prosper::diagnostics::perf::enabled()) {
+                using prosper::diagnostics::perf::Counter;
+                if (!producer_volume_depth)
+                    prosper::diagnostics::perf::add(Counter::CpuRttSeedChecks);
+                if (sit != g_rtt.end()) {
+                    auto& history = sit->second.seed_extent_history;
+                    if (producer_volume_depth || sit->second.volume_depth)
+                        history.reset();
+                    else if (history.observe(base,
+                            {sit->second.w, sit->second.h, static_cast<uint32_t>(sit->second.format)},
+                            {gw, gh, static_cast<uint32_t>(pass_format)}))
+                        prosper::diagnostics::perf::add(Counter::CpuRttSeedExtentReversals);
+                }
+            }
             // Gated seed-decision diagnostic: a pass that should LOAD prior target
             // content but silently falls back to its clear color erases everything the
             // earlier pass produced (an opaque-black clear wipes a transparent UI RT —

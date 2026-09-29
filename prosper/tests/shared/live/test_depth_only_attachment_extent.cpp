@@ -1,5 +1,6 @@
 // A depth-only pass's attachment extent comes from DB_DEPTH_SIZE_XY, not a disabled color target.
 #include "fixtures/render_runner.h"
+#include "diagnostics/perf/perf_ledger.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "hle/dispatch/dispatch.hpp"
@@ -52,6 +53,13 @@ static bool has_depth_key(uint64_t base, uint32_t width, uint32_t height) {
 // 3840x2160 pass over its 2560x1440 HDR target blacked out the world this way.
 static int readback_path_main(uint64_t guest, const std::vector<uint32_t>& vs,
                               const std::vector<uint32_t>& fs) {
+    using prosper::diagnostics::perf::Counter;
+    const auto count = [](Counter counter) {
+        return prosper::diagnostics::perf::ledger()
+            .counters[static_cast<size_t>(counter)].load(std::memory_order_relaxed);
+    };
+    const auto checks_before = count(Counter::CpuRttSeedChecks);
+    const auto reversals_before = count(Counter::CpuRttSeedExtentReversals);
     constexpr uint32_t ColorW = 64, ColorH = 64, AliasW = 32, AliasH = 32;
     const uint64_t Color = guest + 0x100000;
     const uint64_t Depth = guest;
@@ -90,6 +98,22 @@ static int readback_path_main(uint64_t guest, const std::vector<uint32_t>& vs,
               (*snapshot.pixels)[0] == 255 && (*snapshot.pixels)[1] == 0 &&
               (*snapshot.pixels)[2] == 0,
           "readback path: a depth-only pass keeps the colour target's 64x64 CPU copy");
+    (void)render_submit_items({producer}, ColorW, ColorH);
+    check(count(Counter::CpuRttSeedChecks) - checks_before >= 3 &&
+              count(Counter::CpuRttSeedExtentReversals) == reversals_before,
+          "fixed depth-only alias and return to colour measure seed decisions without reversals");
+
+    // Real colour writers can also change an address's extent. Exercise the production observer
+    // with that valid alias, so deleting the hook cannot leave all quiet controls green. The alarm
+    // names extent misses and leaves the cause to inspection; it must not call every alias a clobber.
+    DrawItem colour_alias = producer;
+    colour_alias.color0_width = AliasW; colour_alias.color0_height = AliasH;
+    colour_alias.ps.has_viewport = true;
+    colour_alias.ps.viewport_w = float(AliasW); colour_alias.ps.viewport_h = float(AliasH);
+    (void)render_submit_items({colour_alias}, ColorW, ColorH);
+    (void)render_submit_items({producer}, ColorW, ColorH);
+    check(count(Counter::CpuRttSeedExtentReversals) == reversals_before + 1,
+          "real opposite-extent colour writers exercise the seed-reversal hook");
     std::printf("depth-only attachment extent (readback path): %d failures\n", failures);
     return failures ? 1 : 0;
 }

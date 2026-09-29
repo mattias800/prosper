@@ -229,12 +229,14 @@ matches.
 **Compute results that miss the renderer image** (#3891, 2026-09-29). `rtt-destination-refused`
 counts `live_compute`'s one destination-borrow refusal site (the same site the exit-only
 `[rtt-destination-refused]` census notes) per guest flip, with MiB by refusal reason: GTA V's heavy
-host-copy regime is one 14 MiB result refused `destination-creation-refused` per flip, and this is
+pre-#3949 host-copy regime was one 14 MiB result refused `destination-creation-refused` per flip, and this is
 the rule that names it live. `color-target-count-ceiling` reads the persistent colour-target
 cache's per-window PEAKS (`Peak`, raised where `persistent_target_census` already samples residency,
 reset at every window close) against its two bounds: at the entry-count bound, under half the byte
 budget, and either evicting or refusing a compute creation. The refusal arm is not optional: GTA V's
-costly state sits at exactly 256 of 256 entries with zero evictions. When it fires on that arm it
+pre-fix costly state sat at exactly 256 of 256 entries with zero evictions. Compute creation now
+evicts eligible idle targets (#3949), and a count-bound cache can churn without refusing it.
+When the rule fires on the refusal arm it
 reports `creation-refusals`, not a 0.00 evictions/s. The refusal it counts is matched by name
 (`kDestinationCreationRefused`, which `live_compute.cpp` static_asserts against
 `live_target_import_refusal_name`). A Vulkan failure to create the image is a separate reason,
@@ -265,6 +267,16 @@ Complete compute samples cannot hide missing graphics envelopes. Corrected #3964
 windows cover about 89% of graphics waits; the broken deferred-envelope arms cover about
 68-71%. This uses the existing counters at window close and adds no event hook. Check timestamp
 support, query results and envelope closure before drawing performance conclusions from it.
+
+**CPU attachment seed extent churn** (#3891, #3907). `rtt-seed-extent-churn` counts opposite
+extent misses at the same CPU RTT address: A-to-B followed by B-to-A. One observed pair is enough
+to report, independent of sensitivity, because it already contains two misses. The fixed
+depth-only pass still requests B from A but never publishes B, so a single mismatch or repeated
+one-way misses are quiet. The bounded history lives in each existing RTT entry and resets on a
+matching seed, format change or volume target; it rechecks the address after a resolve copies an
+entry. The observer changes no seed or publication policy and adds no guest reads or clocks.
+Legitimate colour writers can produce the same alias pattern, so inspect `PROSPER_RTTLOG` and
+write masks before diagnosing a clobber. No CPU seed decisions in a window means **NO DATA**.
 
 **A window nobody saw** (#3891, #3951). `gpu-present-stalled` fires when a GPU-present frontend
 (`Gauge::GpuPresentActive`, set by `set_gpu_present_active`) presented nothing in a window, neither

@@ -124,6 +124,8 @@ enum class Counter : uint8_t {
     // (and so blocked, in Cost::GpuWaitGraphics).
     GpuGraphicsDeferred,
     GpuGraphicsDeferredBlocked,
+    CpuRttSeedChecks,          // 2D attachment seed decisions on the CPU readback path
+    CpuRttSeedExtentReversals, // opposite extent misses at the same CPU RTT address (#3907)
     Count
 };
 

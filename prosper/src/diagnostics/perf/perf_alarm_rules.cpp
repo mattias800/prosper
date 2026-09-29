@@ -107,6 +107,7 @@ const std::vector<const char*>& rule_names() {
         "rtt-destination-refused", "color-target-count-ceiling", "gpu-sync-wait",
         "gpu-present-stalled",
         "gpu-device-time-coverage",
+        "rtt-seed-extent-churn",
     };
     return names;
 }
@@ -130,6 +131,7 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
     if (r == "gpu-device-time-coverage")
         return w.events(Cost::GpuWaitCompute) >= kGpuDeviceTimeCoverageMinWaits ||
                w.events(Cost::GpuWaitGraphics) >= kGpuDeviceTimeCoverageMinWaits;
+    if (r == "rtt-seed-extent-churn") return w.count(Counter::CpuRttSeedChecks) != 0;
     // Only a frontend with a GPU-present consumer is expected to present at all; a window without
     // enough guest flips cannot say whether presents SHOULD have happened.
     if (r == "gpu-present-stalled")
@@ -144,6 +146,7 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
 
 uint32_t sustain_windows(const char* rule) {
     const std::string r = rule ? rule : "";
+    if (r == "rtt-seed-extent-churn") return kRttSeedExtentSustainWindows;
     if (r == "dropped-draws" || r == "skipped-dispatches" || r == "gpu-memory-off-device" ||
         r == "unaccounted-draws" || r == "unimplemented-hle-calls" ||
         r == "diagnostic-path-active")
@@ -780,8 +783,8 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
             byte_share < t.color_target_ceiling_byte_share && (churning || creation_refused)) {
             AlarmFiring a;
             a.rule = "color-target-count-ceiling";
-            // Report the arm that fired. In the steady gameplay state the cache evicts nothing and
-            // the cost is compute results refused a destination, so evictions/s would read 0.00.
+            // Report the arm that fired. A creation refusal without churn must not read as
+            // 0.00 evictions/s, even though compute creation now tries eligible eviction (#3949).
             if (churning) {
                 a.value = eviction_rate;
                 a.unit = "evictions/s";
@@ -801,10 +804,10 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                               (unsigned long long)creation_refusals, creation_refused / kMiB,
                               (unsigned long long)w.flips);
             a.hint = "the persistent colour-target cache is bound by its ENTRY COUNT while most of "
-                     "its byte budget is free: it evicts targets it has memory for (each a CPU "
-                     "readback through the eviction sink, then a re-creation), and compute "
-                     "destination creation at the ceiling is refused outright, never evicting (see "
-                     "rtt-destination-refused). next: the [persistent-targets] PEAK residency exit "
+                     "its byte budget is free: valid evicted targets may be read back through the "
+                     "CPU eviction sink and later re-created. Compute destination creation also "
+                     "tries eligible idle-target eviction (#3949); if it still cannot make room, "
+                     "inspect rtt-destination-refused. next: the [persistent-targets] PEAK residency exit "
                      "line; A/B PROSPER_BACKEND_TARGET_CACHE_COUNT (its `of N entries` proves the "
                      "lever moved); cf. #3873, #1177";
             out.push_back(std::move(a));
@@ -844,6 +847,24 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                      "PRESENT DECLINED line, PROSPER_PRESENT_HANDOFF_TRACE=1; cf. #3951";
             out.push_back(std::move(a));
         }
+    }
+
+    // CPU RTT attachment seeds missed in both directions between two extents at one address.
+    // This identifies the #3907 publication signature without asserting a black-frame cause.
+    if (w.count(Counter::CpuRttSeedChecks) != 0 &&
+        w.count(Counter::CpuRttSeedExtentReversals) >= kRttSeedExtentReversalsPerWindow) {
+        AlarmFiring a;
+        a.rule = "rtt-seed-extent-churn";
+        a.value = static_cast<double>(w.count(Counter::CpuRttSeedExtentReversals));
+        a.unit = "extent reversals";
+        a.threshold = kRttSeedExtentReversalsPerWindow;
+        a.detail = format("cpu-seed-checks=%llu",
+                          (unsigned long long)w.count(Counter::CpuRttSeedChecks));
+        a.hint = "CPU RTT seeds missed in both directions between extents at the same address; "
+                 "inspect PROSPER_RTTLOG seed misses and colour-write masks for depth-only "
+                 "readbacks replacing colour (#3907). Intentional colour aliases can also "
+                 "produce this signature";
+        out.push_back(std::move(a));
     }
 
     // Instrument validity: a partial device-time ledger must not imply GPU headroom. One

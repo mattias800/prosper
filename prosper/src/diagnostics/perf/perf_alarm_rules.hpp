@@ -251,6 +251,11 @@ constexpr double kGpuSyncWaitMinDeviceCoverage = 0.5;
 constexpr double kGpuDeviceTimeMinCoverage = 0.8;
 constexpr uint64_t kGpuDeviceTimeCoverageMinWaits = 100;
 
+// #3907: one reversed pair already contains two opposite extent misses at one CPU RTT address.
+// Report that observed extent churn immediately; it can also be deliberate colour aliasing.
+constexpr uint64_t kRttSeedExtentReversalsPerWindow = 1;
+constexpr uint32_t kRttSeedExtentSustainWindows = 1;
+
 // SUSTAIN: consecutive windows a rule's condition must hold before the engine reports it. A cost
 // that lasts one window is usually a load, and a steady-state alarm should not fire on it; a
 // correctness alarm fires on the first window.
