@@ -3115,6 +3115,8 @@ endif()
                                                frontends/shared/live/submit_renderer/pass_diagnostics.cpp
                                                frontends/shared/live/submit_renderer/callback_prelude.cpp
                                                frontends/shared/live/submit_renderer/callback_diagnostics.cpp
+                                               frontends/shared/live/submit_renderer/single_framebuffer.cpp
+                                               frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
@@ -3441,6 +3443,8 @@ endif()
                                                frontends/shared/live/submit_renderer/pass_diagnostics.cpp
                                                frontends/shared/live/submit_renderer/callback_prelude.cpp
                                                frontends/shared/live/submit_renderer/callback_diagnostics.cpp
+                                               frontends/shared/live/submit_renderer/single_framebuffer.cpp
+                                               frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
                                                frontends/shared/present/present_blit.cpp
                                                frontends/shared/present/compute_scanout.cpp)
