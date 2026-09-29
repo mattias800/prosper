@@ -4,6 +4,269 @@
 
 namespace prosper::frontend::submit_renderer {
 
+namespace {
+
+// ---- One buffer resource of one draw (#3892) ----------------------------------------------------
+//
+// The per-resource loop's buffer branch: materialize one V#/storage/constant buffer into its
+// FrameBufferResource (a direct guest view, a copy, or the all-zero fallback). Moved out of
+// build_draw_frame_resources verbatim, except that its two `continue` statements -- the
+// materialization rejects, which leave the resource out of the draw -- became `return
+// ResourceOutcome::Skip`. The caller turns Skip back into `continue`, so the loop tail (census,
+// timing, emplace) is skipped exactly as before.
+enum class ResourceOutcome { Keep, Skip };
+
+// The per-resource loop's state that materialize_buffer_resource reads and writes, one reference per object.
+struct BufferResourceContext {
+    const prosper::gpu::DrawItem & draw;
+    int & g_this_submit;
+    RenderTiming & pending_timing;
+    const bool & timing_enabled;
+    const bool & render_timing_detail;
+    const bool & use_direct_buffer_views;
+    const bool & use_tracked_buffer_membership_cache;
+    uint32_t& set;
+    const prosper::gpu::ShaderResource & r;
+    const prosper::gpu::SpirvDescriptorBinding *& reflected_binding;
+    const RenderClock::time_point& resource_timing_start;
+    bool& resource_buffer_view;
+    double& resource_buffer_probe_ms;
+    double& resource_buffer_copy_ms;
+    prosper::test::FrameBufferResource & buffer_resource;
+};
+
+template <class CopyResource, class DirectResource>
+ResourceOutcome materialize_buffer_resource(BufferResourceContext& ctx,
+                                            CopyResource& copy_resource,
+                                            DirectResource& direct_resource) {
+    // Every name the moved body used from build_draw_frame_resources, bound once to the same object.
+    auto& draw = ctx.draw;
+    auto& g_this_submit = ctx.g_this_submit;
+    auto& pending_timing = ctx.pending_timing;
+    auto& timing_enabled = ctx.timing_enabled;
+    auto& render_timing_detail = ctx.render_timing_detail;
+    auto& use_direct_buffer_views = ctx.use_direct_buffer_views;
+    auto& use_tracked_buffer_membership_cache = ctx.use_tracked_buffer_membership_cache;
+    auto& set = ctx.set;
+    auto& r = ctx.r;
+    auto& reflected_binding = ctx.reflected_binding;
+    auto& resource_timing_start = ctx.resource_timing_start;
+    auto& resource_buffer_view = ctx.resource_buffer_view;
+    auto& resource_buffer_probe_ms = ctx.resource_buffer_probe_ms;
+    auto& resource_buffer_copy_ms = ctx.resource_buffer_copy_ms;
+    auto& buffer_resource = ctx.buffer_resource;
+    auto& fr = buffer_resource;
+    fr.buffer_identity = r.gpu_addr;
+    const prosper::gpu::StorageBufferMaterializationPlan materialization =
+        prosper::gpu::plan_storage_buffer_materialization(
+            *reflected_binding, r);
+    if (!materialization.valid) {
+        fprintf(stderr,
+                "[buffer-materialization-reject] set=%u binding=%u addr=%llx "
+                "declared=%u\n",
+                set, r.binding, (unsigned long long)r.gpu_addr, r.size);
+        // Name the sub-condition, once per (set,binding,address). The line above
+        // collapses every reason into one string, and an investigation cannot act
+        // on that: "the descriptor carries a partial zero-pad marker set" and
+        // "the resource is the wrong class" are different pieces of work. Same
+        // shape and the same justification as [mimg-mip] in rdna2_emit_alu.cpp.
+        //
+        // Deduped rather than gated, because the volume is the whole problem:
+        // Dragon Quest VII emits 549,623 of the line above in one routed run,
+        // ALL of them for a single address (0x20013f1bc0, set 0 binding 10) with
+        // 257 different declared sizes -- so the useful signal is one line
+        // describing that binding, not half a million repetitions of it (#1486).
+        {
+            static std::mutex why_mutex;
+            static std::set<std::tuple<uint32_t, uint32_t, uint64_t>> why_seen;
+            bool first_why = false;
+            {
+                std::lock_guard<std::mutex> lock(why_mutex);
+                first_why = why_seen.emplace(set, r.binding,
+                                             (uint64_t)r.gpu_addr).second;
+            }
+            if (first_why) {
+                const auto& d = *reflected_binding;
+                const bool has_logical = d.zero_pad_logical_bytes != 0;
+                const bool has_binding_pad = d.zero_pad_binding_bytes != 0;
+                const bool has_semantic =
+                    d.zero_pad_semantic !=
+                    prosper::gpu::StorageBufferTailSemantic::None;
+                fprintf(stderr,
+                        "[buffer-why] set=%u binding=%u addr=%llx declared=%u "
+                        "markers=%d/%d/%d kind=%d readable=%d writable=%d "
+                        "atomic=%d dynamic=%d required=%llu "
+                        "pad_logical=%u pad_binding=%u semantic=%d "
+                        "res_cls=%d fmt=%d ncomp=%u stride=%u size=%u "
+                        "scalar_dwords=%u\n",
+                        set, r.binding, (unsigned long long)r.gpu_addr, r.size,
+                        (int)has_logical, (int)has_binding_pad,
+                        (int)has_semantic,
+                        (int)d.kind, (int)d.readable, (int)d.writable,
+                        (int)d.atomic_access, (int)d.dynamic_access,
+                        (unsigned long long)d.required_bytes,
+                        d.zero_pad_logical_bytes, d.zero_pad_binding_bytes,
+                        (int)d.zero_pad_semantic,
+                        (int)r.cls, (int)r.format, r.num_components,
+                        r.stride, r.size, r.scalar_buffer_dword_count);
+            }
+        }
+        return ResourceOutcome::Skip;
+    }
+    // #1427: the guest's declared V#/V-buffer size is the real requirement — a
+    // vertex fetch indexes anywhere inside it. The old 1 MiB clamp silently
+    // truncated larger buffers, so every element past the cap read ZEROS: those
+    // vertices all transformed to the same clip point (the MVP translation
+    // column) and the primitive died as degenerate, with no reject and no log.
+    // On Blue Prince's entrance hall that erased 44 of 248 scene draws —
+    // the tile floor, the far table, most of the room — and read as a shading
+    // defect for weeks. Upload the declared range under a ceiling that exists
+    // only to bound a corrupt descriptor (a 64 MiB read also costs ~16K
+    // guest_readable page probes, so it must stay bounded), and make any
+    // truncation that does happen FAIL-VISIBLE. PROSPER_MAX_BUFFER_UPLOAD_MB
+    // lowers the ceiling for a same-build A/B of this exact defect.
+    const uint32_t requested_bytes = materialization.binding_bytes
+        ? static_cast<uint32_t>(materialization.binding_bytes) : 256u;
+    uint32_t nb = materialization.zero_padded_tail
+        ? static_cast<uint32_t>(materialization.binding_bytes)
+        : prosper::frontend::buffer_upload_bytes(requested_bytes);
+    if (nb < (requested_bytes & ~3u)) {
+        static std::set<uint64_t> truncated_reported;
+        if (truncated_reported.size() < 32 &&
+            truncated_reported.insert(r.gpu_addr).second)
+            fprintf(stderr,
+                    "[buffer-truncated] set=%u binding=%u addr=%llx declared=%u "
+                    "uploaded=%u — fetches past the uploaded range read zeros and "
+                    "collapse geometry (#1427)\n",
+                    set, r.binding, (unsigned long long)r.gpu_addr,
+                    requested_bytes, nb);
+    }
+    // A definitely unmapped source cannot contribute a byte. Preserve the
+    // renderer's established all-zero fallback without allocating/probing the
+    // descriptor's potentially corrupt declared size; robust buffer access makes
+    // accesses beyond this minimum zero as well. Static reflection tells us how
+    // much in-bounds storage the shader can definitely address.
+    const BufferSourceGateResult source_gate = classify_buffer_source(
+        r.host_data != nullptr, r.gpu_addr,
+        use_tracked_buffer_membership_cache,
+        prosper_renderer_guest_address_tracked,
+        prosper_reserved_range_state);
+    const bool unavailable_guest_buffer = source_gate.unavailable;
+    if (timing_enabled)
+        pending_timing.buffer_source_gate.record(source_gate);
+    if (materialization.zero_padded_tail) {
+        uint8_t logical[2] = {};
+        const uint8_t* logical_source = nullptr;
+        if (r.host_data && r.host_data_size >= sizeof(logical)) {
+            logical_source = r.host_data;
+        } else if (!r.host_data && !unavailable_guest_buffer &&
+                   copy_resource(logical, r.gpu_addr, sizeof(logical)) ==
+                       sizeof(logical)) {
+            logical_source = logical;
+        }
+        fr.dwords.assign(1, 0);
+        if (!logical_source ||
+            !prosper::gpu::materialize_storage_buffer_bytes(
+                materialization, logical_source, sizeof(logical),
+                reinterpret_cast<uint8_t*>(fr.dwords.data()),
+                sizeof(uint32_t))) {
+            fprintf(stderr,
+                    "[buffer-materialization-reject] set=%u binding=%u "
+                    "two-byte source unavailable\n",
+                    set, r.binding);
+            return ResourceOutcome::Skip;
+        }
+    } else if (unavailable_guest_buffer) {
+        const uint64_t minimum_bytes = std::min<uint64_t>(
+            std::max<uint64_t>(reflected_binding->required_bytes, 256u),
+            kMaxBufferUploadBytes);
+        fr.dwords.assign(static_cast<size_t>((minimum_bytes + 3u) / 4u), 0);
+    } else if (use_direct_buffer_views && nb >= 4) {
+        const auto probe_start = timing_enabled
+            ? RenderClock::now() : RenderClock::time_point{};
+        if (const uint8_t* source = direct_resource(r.gpu_addr, nb)) {
+            fr.dwords_view = reinterpret_cast<const uint32_t*>(source);
+            fr.dwords_view_count = nb / sizeof(uint32_t);
+            // Hosted/capture views can advertise the same guest identity while
+            // supplying different bytes. Only this actual guest mapping may
+            // authorize write-watch validation in the retained-upload backend.
+            if (!r.host_data && reinterpret_cast<uintptr_t>(source) == r.gpu_addr)
+                fr.direct_guest_buffer_addr = r.gpu_addr;
+            resource_buffer_view = true;
+        }
+        if (timing_enabled)
+            resource_buffer_probe_ms =
+                std::chrono::duration<double, std::milli>(
+                    RenderClock::now() - probe_start).count();
+    }
+    const auto copy_start = timing_enabled
+        ? RenderClock::now() : RenderClock::time_point{};
+    if (!materialization.zero_padded_tail &&
+        !unavailable_guest_buffer && !fr.dwords_view_count &&
+        use_direct_buffer_views) {
+        if (nb >= 4) {
+            fr.dwords.assign(nb / sizeof(uint32_t), 0);
+            if (!copy_resource(reinterpret_cast<uint8_t*>(fr.dwords.data()),
+                               r.gpu_addr, nb))
+                fr.dwords.clear();
+        }
+        if (fr.dwords.empty()) fr.dwords.assign(64, 0);
+    } else if (!materialization.zero_padded_tail &&
+               !unavailable_guest_buffer && !use_direct_buffer_views) {
+        if (nb >= 4) {
+            std::vector<uint8_t> tmp(nb, 0);
+            if (copy_resource(tmp.data(), r.gpu_addr, nb) > 0)
+                fr.dwords.assign(
+                    reinterpret_cast<const uint32_t*>(tmp.data()),
+                    reinterpret_cast<const uint32_t*>(tmp.data() + nb));
+        }
+        if (fr.dwords.empty()) fr.dwords.assign(64, 0);
+    }
+    if (timing_enabled)
+        resource_buffer_copy_ms = std::chrono::duration<double, std::milli>(
+            RenderClock::now() - copy_start).count();
+    if (render_timing_detail) {
+        const uint64_t detail_min_submit =
+            PROSPER_ENV_VALUE("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT")
+                ? strtoull(getenv(
+                      "PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT"), nullptr, 0)
+                : 0;
+        const double elapsed = std::chrono::duration<double, std::milli>(
+            RenderClock::now() - resource_timing_start).count();
+        static uint64_t detail_buffer_lines = 0;
+        if (static_cast<uint64_t>(g_this_submit) >= detail_min_submit &&
+            elapsed >= 0.5 && detail_buffer_lines++ < 250) {
+            fprintf(stderr,
+                    "[render-timing] buffer draw=%llu set=%u binding=%u "
+                    "addr=0x%llx declared=%u uploaded=%u class=%u direct=%d "
+                    "probe=%.2f copy=%.2f total=%.2f ms\n",
+                    (unsigned long long)draw.draw_index, set, r.binding,
+                    (unsigned long long)r.gpu_addr, requested_bytes, nb,
+                    static_cast<unsigned>(r.cls),
+                    static_cast<int>(resource_buffer_view),
+                    resource_buffer_probe_ms, resource_buffer_copy_ms, elapsed);
+        }
+    }
+    // PROSPER_CBLOG: log each constant buffer's first 4 dwords as floats, once per
+    // address. If a scene draw's color/tint CB is (0,0,0,0), the PS outputs black
+    // regardless of the (correctly-decoded) texture — the #300 black-scene suspect.
+    if (PROSPER_ENV_ON("PROSPER_CBLOG") && r.cls == RC::ConstantBuffer) {
+        static std::set<uint64_t> cbseen;
+        if (cbseen.insert(r.gpu_addr).second) {
+            const uint32_t* words = fr.buffer_words_data();
+            size_t n = fr.buffer_word_count();
+            const float* fp = reinterpret_cast<const float*>(words);
+            fprintf(stderr, "[cb] bind=%u addr=0x%llx size=%u dw=%08x %08x %08x %08x  f=%.3f %.3f %.3f %.3f\n",
+                    r.binding, (unsigned long long)r.gpu_addr, (unsigned)r.size,
+                    n>0?words[0]:0, n>1?words[1]:0, n>2?words[2]:0, n>3?words[3]:0,
+                    n>0?fp[0]:0.f, n>1?fp[1]:0.f, n>2?fp[2]:0.f, n>3?fp[3]:0.f);
+        }
+    }
+    return ResourceOutcome::Keep;
+}
+
+} // namespace
+
 BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                                                const prosper::gpu::DrawItem& draw,
                                                const prosper::gpu::ShaderResourceTable* vrt,
@@ -5677,213 +5940,25 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
               if (PROSPER_ENV_ON("PROSPER_ALPHA1")) fr.swizzle[3] = 1;
               }
           } else {
-              auto& fr = buffer_resource;
-              fr.buffer_identity = r.gpu_addr;
-              const prosper::gpu::StorageBufferMaterializationPlan materialization =
-                  prosper::gpu::plan_storage_buffer_materialization(
-                      *reflected_binding, r);
-              if (!materialization.valid) {
-                  fprintf(stderr,
-                          "[buffer-materialization-reject] set=%u binding=%u addr=%llx "
-                          "declared=%u\n",
-                          set, r.binding, (unsigned long long)r.gpu_addr, r.size);
-                  // Name the sub-condition, once per (set,binding,address). The line above
-                  // collapses every reason into one string, and an investigation cannot act
-                  // on that: "the descriptor carries a partial zero-pad marker set" and
-                  // "the resource is the wrong class" are different pieces of work. Same
-                  // shape and the same justification as [mimg-mip] in rdna2_emit_alu.cpp.
-                  //
-                  // Deduped rather than gated, because the volume is the whole problem:
-                  // Dragon Quest VII emits 549,623 of the line above in one routed run,
-                  // ALL of them for a single address (0x20013f1bc0, set 0 binding 10) with
-                  // 257 different declared sizes -- so the useful signal is one line
-                  // describing that binding, not half a million repetitions of it (#1486).
-                  {
-                      static std::mutex why_mutex;
-                      static std::set<std::tuple<uint32_t, uint32_t, uint64_t>> why_seen;
-                      bool first_why = false;
-                      {
-                          std::lock_guard<std::mutex> lock(why_mutex);
-                          first_why = why_seen.emplace(set, r.binding,
-                                                       (uint64_t)r.gpu_addr).second;
-                      }
-                      if (first_why) {
-                          const auto& d = *reflected_binding;
-                          const bool has_logical = d.zero_pad_logical_bytes != 0;
-                          const bool has_binding_pad = d.zero_pad_binding_bytes != 0;
-                          const bool has_semantic =
-                              d.zero_pad_semantic !=
-                              prosper::gpu::StorageBufferTailSemantic::None;
-                          fprintf(stderr,
-                                  "[buffer-why] set=%u binding=%u addr=%llx declared=%u "
-                                  "markers=%d/%d/%d kind=%d readable=%d writable=%d "
-                                  "atomic=%d dynamic=%d required=%llu "
-                                  "pad_logical=%u pad_binding=%u semantic=%d "
-                                  "res_cls=%d fmt=%d ncomp=%u stride=%u size=%u "
-                                  "scalar_dwords=%u\n",
-                                  set, r.binding, (unsigned long long)r.gpu_addr, r.size,
-                                  (int)has_logical, (int)has_binding_pad,
-                                  (int)has_semantic,
-                                  (int)d.kind, (int)d.readable, (int)d.writable,
-                                  (int)d.atomic_access, (int)d.dynamic_access,
-                                  (unsigned long long)d.required_bytes,
-                                  d.zero_pad_logical_bytes, d.zero_pad_binding_bytes,
-                                  (int)d.zero_pad_semantic,
-                                  (int)r.cls, (int)r.format, r.num_components,
-                                  r.stride, r.size, r.scalar_buffer_dword_count);
-                      }
-                  }
+              BufferResourceContext materialize_buffer_resource_ctx{
+                  .draw = draw,
+                  .g_this_submit = g_this_submit,
+                  .pending_timing = pending_timing,
+                  .timing_enabled = timing_enabled,
+                  .render_timing_detail = render_timing_detail,
+                  .use_direct_buffer_views = use_direct_buffer_views,
+                  .use_tracked_buffer_membership_cache = use_tracked_buffer_membership_cache,
+                  .set = set,
+                  .r = r,
+                  .reflected_binding = reflected_binding,
+                  .resource_timing_start = resource_timing_start,
+                  .resource_buffer_view = resource_buffer_view,
+                  .resource_buffer_probe_ms = resource_buffer_probe_ms,
+                  .resource_buffer_copy_ms = resource_buffer_copy_ms,
+                  .buffer_resource = buffer_resource};
+              if (materialize_buffer_resource(materialize_buffer_resource_ctx, copy_resource,
+                                              direct_resource) == ResourceOutcome::Skip)
                   continue;
-              }
-              // #1427: the guest's declared V#/V-buffer size is the real requirement — a
-              // vertex fetch indexes anywhere inside it. The old 1 MiB clamp silently
-              // truncated larger buffers, so every element past the cap read ZEROS: those
-              // vertices all transformed to the same clip point (the MVP translation
-              // column) and the primitive died as degenerate, with no reject and no log.
-              // On Blue Prince's entrance hall that erased 44 of 248 scene draws —
-              // the tile floor, the far table, most of the room — and read as a shading
-              // defect for weeks. Upload the declared range under a ceiling that exists
-              // only to bound a corrupt descriptor (a 64 MiB read also costs ~16K
-              // guest_readable page probes, so it must stay bounded), and make any
-              // truncation that does happen FAIL-VISIBLE. PROSPER_MAX_BUFFER_UPLOAD_MB
-              // lowers the ceiling for a same-build A/B of this exact defect.
-              const uint32_t requested_bytes = materialization.binding_bytes
-                  ? static_cast<uint32_t>(materialization.binding_bytes) : 256u;
-              uint32_t nb = materialization.zero_padded_tail
-                  ? static_cast<uint32_t>(materialization.binding_bytes)
-                  : prosper::frontend::buffer_upload_bytes(requested_bytes);
-              if (nb < (requested_bytes & ~3u)) {
-                  static std::set<uint64_t> truncated_reported;
-                  if (truncated_reported.size() < 32 &&
-                      truncated_reported.insert(r.gpu_addr).second)
-                      fprintf(stderr,
-                              "[buffer-truncated] set=%u binding=%u addr=%llx declared=%u "
-                              "uploaded=%u — fetches past the uploaded range read zeros and "
-                              "collapse geometry (#1427)\n",
-                              set, r.binding, (unsigned long long)r.gpu_addr,
-                              requested_bytes, nb);
-              }
-              // A definitely unmapped source cannot contribute a byte. Preserve the
-              // renderer's established all-zero fallback without allocating/probing the
-              // descriptor's potentially corrupt declared size; robust buffer access makes
-              // accesses beyond this minimum zero as well. Static reflection tells us how
-              // much in-bounds storage the shader can definitely address.
-              const BufferSourceGateResult source_gate = classify_buffer_source(
-                  r.host_data != nullptr, r.gpu_addr,
-                  use_tracked_buffer_membership_cache,
-                  prosper_renderer_guest_address_tracked,
-                  prosper_reserved_range_state);
-              const bool unavailable_guest_buffer = source_gate.unavailable;
-              if (timing_enabled)
-                  pending_timing.buffer_source_gate.record(source_gate);
-              if (materialization.zero_padded_tail) {
-                  uint8_t logical[2] = {};
-                  const uint8_t* logical_source = nullptr;
-                  if (r.host_data && r.host_data_size >= sizeof(logical)) {
-                      logical_source = r.host_data;
-                  } else if (!r.host_data && !unavailable_guest_buffer &&
-                             copy_resource(logical, r.gpu_addr, sizeof(logical)) ==
-                                 sizeof(logical)) {
-                      logical_source = logical;
-                  }
-                  fr.dwords.assign(1, 0);
-                  if (!logical_source ||
-                      !prosper::gpu::materialize_storage_buffer_bytes(
-                          materialization, logical_source, sizeof(logical),
-                          reinterpret_cast<uint8_t*>(fr.dwords.data()),
-                          sizeof(uint32_t))) {
-                      fprintf(stderr,
-                              "[buffer-materialization-reject] set=%u binding=%u "
-                              "two-byte source unavailable\n",
-                              set, r.binding);
-                      continue;
-                  }
-              } else if (unavailable_guest_buffer) {
-                  const uint64_t minimum_bytes = std::min<uint64_t>(
-                      std::max<uint64_t>(reflected_binding->required_bytes, 256u),
-                      kMaxBufferUploadBytes);
-                  fr.dwords.assign(static_cast<size_t>((minimum_bytes + 3u) / 4u), 0);
-              } else if (use_direct_buffer_views && nb >= 4) {
-                  const auto probe_start = timing_enabled
-                      ? RenderClock::now() : RenderClock::time_point{};
-                  if (const uint8_t* source = direct_resource(r.gpu_addr, nb)) {
-                      fr.dwords_view = reinterpret_cast<const uint32_t*>(source);
-                      fr.dwords_view_count = nb / sizeof(uint32_t);
-                      // Hosted/capture views can advertise the same guest identity while
-                      // supplying different bytes. Only this actual guest mapping may
-                      // authorize write-watch validation in the retained-upload backend.
-                      if (!r.host_data && reinterpret_cast<uintptr_t>(source) == r.gpu_addr)
-                          fr.direct_guest_buffer_addr = r.gpu_addr;
-                      resource_buffer_view = true;
-                  }
-                  if (timing_enabled)
-                      resource_buffer_probe_ms =
-                          std::chrono::duration<double, std::milli>(
-                              RenderClock::now() - probe_start).count();
-              }
-              const auto copy_start = timing_enabled
-                  ? RenderClock::now() : RenderClock::time_point{};
-              if (!materialization.zero_padded_tail &&
-                  !unavailable_guest_buffer && !fr.dwords_view_count &&
-                  use_direct_buffer_views) {
-                  if (nb >= 4) {
-                      fr.dwords.assign(nb / sizeof(uint32_t), 0);
-                      if (!copy_resource(reinterpret_cast<uint8_t*>(fr.dwords.data()),
-                                         r.gpu_addr, nb))
-                          fr.dwords.clear();
-                  }
-                  if (fr.dwords.empty()) fr.dwords.assign(64, 0);
-              } else if (!materialization.zero_padded_tail &&
-                         !unavailable_guest_buffer && !use_direct_buffer_views) {
-                  if (nb >= 4) {
-                      std::vector<uint8_t> tmp(nb, 0);
-                      if (copy_resource(tmp.data(), r.gpu_addr, nb) > 0)
-                          fr.dwords.assign(
-                              reinterpret_cast<const uint32_t*>(tmp.data()),
-                              reinterpret_cast<const uint32_t*>(tmp.data() + nb));
-                  }
-                  if (fr.dwords.empty()) fr.dwords.assign(64, 0);
-              }
-              if (timing_enabled)
-                  resource_buffer_copy_ms = std::chrono::duration<double, std::milli>(
-                      RenderClock::now() - copy_start).count();
-              if (render_timing_detail) {
-                  const uint64_t detail_min_submit =
-                      PROSPER_ENV_VALUE("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT")
-                          ? strtoull(getenv(
-                                "PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT"), nullptr, 0)
-                          : 0;
-                  const double elapsed = std::chrono::duration<double, std::milli>(
-                      RenderClock::now() - resource_timing_start).count();
-                  static uint64_t detail_buffer_lines = 0;
-                  if (static_cast<uint64_t>(g_this_submit) >= detail_min_submit &&
-                      elapsed >= 0.5 && detail_buffer_lines++ < 250) {
-                      fprintf(stderr,
-                              "[render-timing] buffer draw=%llu set=%u binding=%u "
-                              "addr=0x%llx declared=%u uploaded=%u class=%u direct=%d "
-                              "probe=%.2f copy=%.2f total=%.2f ms\n",
-                              (unsigned long long)draw.draw_index, set, r.binding,
-                              (unsigned long long)r.gpu_addr, requested_bytes, nb,
-                              static_cast<unsigned>(r.cls),
-                              static_cast<int>(resource_buffer_view),
-                              resource_buffer_probe_ms, resource_buffer_copy_ms, elapsed);
-                  }
-              }
-              // PROSPER_CBLOG: log each constant buffer's first 4 dwords as floats, once per
-              // address. If a scene draw's color/tint CB is (0,0,0,0), the PS outputs black
-              // regardless of the (correctly-decoded) texture — the #300 black-scene suspect.
-              if (PROSPER_ENV_ON("PROSPER_CBLOG") && r.cls == RC::ConstantBuffer) {
-                  static std::set<uint64_t> cbseen;
-                  if (cbseen.insert(r.gpu_addr).second) {
-                      const uint32_t* words = fr.buffer_words_data();
-                      size_t n = fr.buffer_word_count();
-                      const float* fp = reinterpret_cast<const float*>(words);
-                      fprintf(stderr, "[cb] bind=%u addr=0x%llx size=%u dw=%08x %08x %08x %08x  f=%.3f %.3f %.3f %.3f\n",
-                              r.binding, (unsigned long long)r.gpu_addr, (unsigned)r.size,
-                              n>0?words[0]:0, n>1?words[1]:0, n>2?words[2]:0, n>3?words[3]:0,
-                              n>0?fp[0]:0.f, n>1?fp[1]:0.f, n>2?fp[2]:0.f, n>3?fp[3]:0.f);
-                  }
-              }
           }
           if (texref_census && full_resource) {
               using Census = prosper::frontend::TextureReferenceCensus;
