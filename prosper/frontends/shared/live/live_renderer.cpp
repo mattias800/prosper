@@ -2317,6 +2317,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         gpu_outcome = GpuPresentOutcome::ComputeScanoutRendererSource; break;
                     case ComputeScanoutPresent::ScaledPresent:
                         gpu_outcome = GpuPresentOutcome::ComputeScanoutScaled; break;
+                    case ComputeScanoutPresent::Count: break;          // never a decision
                     }
                     if (compute.published) {
                         published_gpu = true;

@@ -107,9 +107,10 @@ enum class ComputeScanoutPresent : uint8_t {
     RendererOwnsTarget, // the renderer holds an entry at the front address (even a pixel-less
                         // tombstone): the CPU path would keep the previous frame, not guest bytes
     ScaledPresent,      // PROSPER_RENDER_SCALE: the present extent is not the display extent
+    Count,              // not a decision: the number of decisions, for the census bound below
 };
 
-static_assert(static_cast<int>(ComputeScanoutPresent::ScaledPresent) < 16,   // the LAST value
+static_assert(static_cast<size_t>(ComputeScanoutPresent::Count) <= 16,
               "compute_scanout.cpp's census keeps sixteen decision slots");
 
 constexpr const char* compute_scanout_present_name(ComputeScanoutPresent p) {
@@ -123,6 +124,7 @@ constexpr const char* compute_scanout_present_name(ComputeScanoutPresent p) {
     case ComputeScanoutPresent::RendererSource: return "renderer-source";
     case ComputeScanoutPresent::RendererOwnsTarget: return "renderer-owns-target";
     case ComputeScanoutPresent::ScaledPresent: return "scaled-present";
+    case ComputeScanoutPresent::Count: break;
     }
     return "?";
 }
