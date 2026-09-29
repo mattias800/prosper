@@ -1027,6 +1027,14 @@ if(TARGET prosper_core)
   add_test(NAME videodec2_decode_optout COMMAND test_videodec2_decode --no-decode)
   add_test(NAME videodec2_decode_format COMMAND test_videodec2_decode --format-probe)
 
+  # #3669. libSceVdecsw software video decoder test. Verifies 0x50 config adaptation,
+  # asynchronous FIFO AU staging, staging-time memory copying, pictureCount offset (+0x0B),
+  # TrySyncDecodeInput zeroing, and lifecycle management (Reset / DeleteDecoder).
+  add_executable(test_vdecsw_decode tests/hle/video/test_vdecsw_decode.cpp)
+  target_include_directories(test_vdecsw_decode PRIVATE tests)
+  target_link_libraries(test_vdecsw_decode PRIVATE prosper_core)
+  add_test(NAME vdecsw_decode COMMAND test_vdecsw_decode)
+
   # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
   # against hand-built SPS bitstreams written by an independent bit-writer in the test.
   # The fill layout asserts every offset the guest has been observed reading, and carries
