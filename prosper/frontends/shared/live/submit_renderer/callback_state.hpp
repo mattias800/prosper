@@ -43,6 +43,7 @@ public:
 
 private:
     CallbackState() = default;
+    ~CallbackState() = default;
 
     std::optional<size_t> write_watch_promotion_budget_bytes_;
     std::optional<std::atomic<int>> g_submit_idx_;

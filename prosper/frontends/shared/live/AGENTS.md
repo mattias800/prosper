@@ -14,6 +14,9 @@ found Vulkan.
   former anonymous-namespace helpers that the pieces share (RTT cache types, texture-decode cache
   keys, the guest-write drain). Include that header only from `live_renderer.cpp` and
   `submit_renderer/`; it is not an API.
+  Registrations share the process prelude through `submit_renderer/callback_state.hpp`; its values
+  initialize at their original callback binding sites. Thread-local prelude state stays in the
+  callback and survives re-registration on the same thread.
 - `live_compute.cpp` — the compute half, and a **separate Vulkan backend**, not a caller of the
   render one. It builds its own device (or adopts the renderer's when one is published), its own
   pipeline cache, descriptor pools, memory pool and command buffers, and does not include
