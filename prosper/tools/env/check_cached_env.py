@@ -132,6 +132,8 @@ def scan(root: Path):
 # Adding a name is cheap; removing one needs a reason. A name here must ALSO survive the tier-1 and
 # tier-2 checks above -- being hot is never a licence to cache something that is armed at runtime.
 HOT_SITES = {
+    "src/gpu/execute/gpu_executor.cpp": ["PROSPER_INDIRECTLOG"],
+    "src/gpu/pm4/command_processor.cpp": ["PROSPER_INDIRECTLOG"],
     "tests/fixtures/render_runner.h": [
         "PROSPER_BACKEND_LOAD_LOG", "PROSPER_GEOM_PROBE", "PROSPER_DSLOG",
         "PROSPER_RENDER_DROP_UNPROVEN_DRAW", "PROSPER_DRAW_STATS", "PROSPER_DEPTH_CLEAR",

@@ -310,6 +310,18 @@ Partial machinery already exists (`rtt_gpu_seed_import_extent_compatible`,
 
 ## Ruled out
 
+**RULED OUT as the first visibility boundary for Astro Bot's observed opening route (2026-09-29):
+the CPU read of the next indirect dispatch's argument triplet.** An exact argument-read observer
+and binding-60 output selector found the first read at `0x5074063e0+12`, disjoint from the pending
+result at `0x514080000+16711680`. In the bounded trace, none of 306 retained selected results were
+*first materialized while pending* by a raw-buffer read; all 306 first materializations were
+ordered memory effects. The first sampled overlap was the next dispatch's image output to the same
+guest range, across a parser stall. The census no longer checks overlap after an earlier event
+materializes a result, so this says nothing about later raw-buffer reads. The process exited
+mid-submit, making the summary verdict invalid. This is a complete-prefix observation, not a
+deferral authorization. Physical aliases and image ownership remain unproved. See
+[#3157](https://github.com/mattias800/prosper/issues/3157).
+
 **FALSIFIED: "small render passes are what make heavy titles slow."** This document's own § 1-2
 motivated a pass-batching change. The pass-cost census measured it instead: Astro Bot spends
 **7.8% of its wall clock inside `render_draw_pass_rgba` at all**, so collapsing passes could not

@@ -8,21 +8,41 @@
 
 namespace prosper::frontend {
 
-// Process-start selector for the live, behavior-neutral authority census.  The stable SPIR-V hash
-// names only the producer whose retained storage results are admitted.  Every later compute input,
-// write, draw, DMA, capture, and submit boundary is still observed while one result is pending.
+// Process-start selector for the live, behavior-neutral authority census. The stable SPIR-V hash
+// names the producer; an optional exact binding isolates one result when that producer writes
+// several. Every later compute input, sibling output, draw, DMA, capture, and submit boundary is
+// still observed while that result is pending.
 struct ComputeAuthorityLiveSelector {
     bool requested = false;
     bool valid = false;
     uint64_t producer_hash = 0;
     ComputeTimingSelectorParseError error = ComputeTimingSelectorParseError::Unset;
+    bool binding_requested = false;
+    uint32_t binding = 0;
+    ComputeTimingSelectorParseError binding_error = ComputeTimingSelectorParseError::Unset;
 };
 
-inline ComputeAuthorityLiveSelector parse_compute_authority_live_selector(const char* text) {
-    if (!text) return {};
-    const ComputeTimingSelectorParseResult parsed =
-        parse_compute_timing_selector_u64(text);
-    return {true, parsed.accepted(), parsed.value, parsed.error};
+inline ComputeAuthorityLiveSelector parse_compute_authority_live_selector(
+    const char* hash_text, const char* binding_text = nullptr) {
+    if (!hash_text && !binding_text) return {};
+    const ComputeTimingSelectorParseResult hash =
+        parse_compute_timing_selector_u64(hash_text);
+    ComputeAuthorityLiveSelector selector;
+    selector.requested = true;
+    selector.valid = hash.accepted();
+    selector.producer_hash = hash.value;
+    selector.error = hash.error;
+    if (binding_text) {
+        const ComputeTimingSelectorParseResult binding =
+            parse_compute_timing_selector_u64(binding_text);
+        selector.binding_requested = true;
+        selector.binding_error =
+            binding.value > std::numeric_limits<uint32_t>::max()
+            ? ComputeTimingSelectorParseError::Overflow : binding.error;
+        selector.valid &= selector.binding_error == ComputeTimingSelectorParseError::None;
+        if (selector.valid) selector.binding = static_cast<uint32_t>(binding.value);
+    }
+    return selector;
 }
 
 struct ComputeAuthorityLiveObservation {
@@ -38,6 +58,7 @@ struct ComputeAuthorityLiveCounters {
     uint64_t interrupted_submits = 0;
     uint64_t observations_without_submit = 0;
     uint64_t selected_storage_outputs = 0;
+    uint64_t filtered_storage_outputs = 0;
     uint64_t retained_storage_outputs = 0;
     uint64_t synchronous_storage_outputs = 0;
     uint64_t pending_before_submit_end = 0;
@@ -234,8 +255,16 @@ public:
     }
 
     ShadowComputeAuthorityTransition record_selected_storage_output(
-        const ShadowComputeAuthorityRange& range, bool retained) {
+        uint32_t binding, const ShadowComputeAuthorityRange& range, bool retained) {
         if (!selector_.requested) return {};
+        if (!selector_.valid) return {};
+        if (selector_.binding_requested && binding != selector_.binding) {
+            counters_.filtered_storage_outputs = shadow_compute_authority_increment(
+                counters_.filtered_storage_outputs);
+            // A sibling output still writes guest memory. Observe its range so an overlapping
+            // sibling cannot make the selected result appear to survive when it did not.
+            return observe(ShadowComputeAuthorityConsumerKind::OrderedMemoryEffect, range);
+        }
         counters_.selected_storage_outputs = shadow_compute_authority_increment(
             counters_.selected_storage_outputs);
         if (!active_) {

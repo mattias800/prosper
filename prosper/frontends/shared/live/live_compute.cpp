@@ -5244,6 +5244,7 @@ const char* compute_authority_boundary_name(
         case Kind::Capture: return "capture";
         case Kind::SubmitEnd: return "submit-end";
         case Kind::Compute: return "compute";
+        case Kind::IndirectArgumentRead: return "indirect-argument-read";
     }
     return "unknown";
 }
@@ -5252,19 +5253,24 @@ class RuntimeComputeAuthorityCensus {
 public:
     RuntimeComputeAuthorityCensus()
         : census_(parse_compute_authority_live_selector(
-              std::getenv("PROSPER_COMPUTE_AUTHORITY_HASH"))) {
+              std::getenv("PROSPER_COMPUTE_AUTHORITY_HASH"),
+              std::getenv("PROSPER_COMPUTE_AUTHORITY_BINDING"))) {
         const ComputeAuthorityLiveSelector& selector = census_.selector();
         if (!selector.requested) return;
         if (selector.valid) {
             std::fprintf(stderr,
                          "[compute-authority] PROSPER_COMPUTE_AUTHORITY_HASH accepted "
-                         "producer=0x%016llx mode=exact-stable-hash shadow-only\n",
-                         static_cast<unsigned long long>(selector.producer_hash));
+                         "producer=0x%016llx binding=%s%u "
+                         "mode=exact-stable-hash shadow-only\n",
+                         static_cast<unsigned long long>(selector.producer_hash),
+                         selector.binding_requested ? "" : "any:",
+                         selector.binding_requested ? selector.binding : 0u);
         } else {
             std::fprintf(stderr,
                          "[compute-authority] PROSPER_COMPUTE_AUTHORITY_HASH ignored "
-                         "reason=%s; selector fails closed\n",
-                         compute_timing_selector_parse_error_name(selector.error));
+                         "hash-reason=%s binding-reason=%s; selector fails closed\n",
+                         compute_timing_selector_parse_error_name(selector.error),
+                         compute_timing_selector_parse_error_name(selector.binding_error));
         }
     }
 
@@ -5333,9 +5339,12 @@ public:
         std::lock_guard lock(mutex_);
         verify_submit_locked(item.submit_no, "storage-output");
         const ShadowComputeAuthorityTransition transition =
-            census_.record_selected_storage_output(range, retained);
-        record_detail_locked(retained ? "retained-storage-output" :
-                                      "synchronous-storage-output",
+            census_.record_selected_storage_output(binding, range, retained);
+        const bool selected_binding = !census_.selector().binding_requested ||
+            binding == census_.selector().binding;
+        record_detail_locked(!selected_binding ? "sibling-storage-output" :
+                             retained ? "retained-storage-output" :
+                                        "synchronous-storage-output",
                              item.submit_no, item.command_order, binding,
                              range, transition);
     }
@@ -5460,6 +5469,10 @@ public:
                     : census_.observe(
                           ShadowComputeAuthorityConsumerKind::Unknown);
                 break;
+            case BoundaryKind::IndirectArgumentRead:
+                transition = census_.observe(
+                    ShadowComputeAuthorityConsumerKind::RawBuffer, range);
+                break;
             case BoundaryKind::DrawResource:
             case BoundaryKind::DrawResourceEnd:
             case BoundaryKind::SubmitBegin:
@@ -5489,12 +5502,17 @@ public:
             c.pending_after_submit_end != 0 ? "INVALID-pending-after-submit" : "matched";
         std::fprintf(stderr,
                      "[compute-authority] summary producer=0x%016llx reason=%s "
+                     "binding=%s%u binding-reason=%s "
                      "seen=%llu matched=%llu submits=%llu/%llu interrupted=%llu "
-                     "outside-submit=%llu active=%u selected-outputs=%llu retained=%llu "
+                     "outside-submit=%llu active=%u selected-outputs=%llu "
+                     "filtered-outputs=%llu retained=%llu "
                      "synchronous=%llu pending-before-end=%llu pending-after-end=%llu "
                      "verdict=%s\n",
                      static_cast<unsigned long long>(selector.producer_hash),
                      compute_timing_selector_parse_error_name(selector.error),
+                     selector.binding_requested ? "" : "any:",
+                     selector.binding_requested ? selector.binding : 0u,
+                     compute_timing_selector_parse_error_name(selector.binding_error),
                      static_cast<unsigned long long>(c.programs_seen),
                      static_cast<unsigned long long>(c.programs_matched),
                      static_cast<unsigned long long>(c.submits_completed),
@@ -5503,6 +5521,7 @@ public:
                      static_cast<unsigned long long>(c.observations_without_submit),
                      census_.active_submit() ? 1u : 0u,
                      static_cast<unsigned long long>(c.selected_storage_outputs),
+                     static_cast<unsigned long long>(c.filtered_storage_outputs),
                      static_cast<unsigned long long>(c.retained_storage_outputs),
                      static_cast<unsigned long long>(c.synchronous_storage_outputs),
                      static_cast<unsigned long long>(c.pending_before_submit_end),
@@ -5536,6 +5555,7 @@ public:
                      "[compute-authority] summary boundaries begin=%llu draw=%llu "
                      "draw-resource=%llu draw-resource-end=%llu dma=%llu "
                      "memory-effect=%llu capture=%llu end=%llu compute=%llu "
+                     "indirect-argument-read=%llu "
                      "detail-events=%llu\n",
                      static_cast<unsigned long long>(boundary_counts_[
                          static_cast<size_t>(BoundaryKind::SubmitBegin)]),
@@ -5555,6 +5575,8 @@ public:
                          static_cast<size_t>(BoundaryKind::SubmitEnd)]),
                      static_cast<unsigned long long>(boundary_counts_[
                          static_cast<size_t>(BoundaryKind::Compute)]),
+                     static_cast<unsigned long long>(boundary_counts_[
+                         static_cast<size_t>(BoundaryKind::IndirectArgumentRead)]),
                      static_cast<unsigned long long>(detail_events_));
         const ShadowComputeAuthorityDrawProbeCounters& draw_probe =
             draw_probe_.counters();
@@ -5728,7 +5750,7 @@ private:
     ComputeAuthorityLiveCensus census_;
     std::array<uint64_t,
                static_cast<size_t>(
-                   prosper::gpu::ComputeAuthorityBoundaryKind::Compute) + 1>
+                   prosper::gpu::ComputeAuthorityBoundaryKind::IndirectArgumentRead) + 1>
         boundary_counts_{};
     ShadowComputeAuthorityDrawProbe draw_probe_;
     ShadowComputeAuthoritySubmitDrawProbe submit_draw_probe_;

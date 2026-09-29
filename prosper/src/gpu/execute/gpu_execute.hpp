@@ -1101,6 +1101,10 @@ enum class ComputeAuthorityBoundaryKind : uint8_t {
     // observations, or an exact CPU-fast write range. Unknown range fails closed; a known range is
     // treated as an ordered compute memory effect.
     Compute,
+    // The ordered executor reads indirect dispatch dimensions from these exact guest bytes on
+    // the CPU before realizing the compute item. A pending GPU result covering them must become
+    // guest-visible first, even if the dimensions turn out to describe a no-op dispatch.
+    IndirectArgumentRead,
 };
 struct ComputeAuthorityBoundary {
     ComputeAuthorityBoundaryKind kind = ComputeAuthorityBoundaryKind::SubmitBegin;

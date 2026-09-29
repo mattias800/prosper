@@ -4602,7 +4602,7 @@ void GpuState::apply(const Pm4Command& c) {
                 // truncated, the executor then rejects the argument buffer as unreadable, and the
                 // indirect dispatch is skipped — with nothing in any log connecting the skip to the
                 // packet that caused it.
-                if (getenv("PROSPER_INDIRECTLOG")) {
+                if (PROSPER_ENV_ON("PROSPER_INDIRECTLOG")) {
                     static std::atomic<int> logged{0};
                     if (logged.fetch_add(1) < 64)
                         fprintf(stderr,
@@ -5083,7 +5083,7 @@ void GpuState::apply(const Pm4Command& c) {
             // "unreadable arguments at 0x…" message prints only the sum, which cannot distinguish a
             // bad offset from a base that was never set on this queue — and `indirect_compute_base`
             // is one field shared by every queue the processor folds.
-            if (getenv("PROSPER_INDIRECTLOG")) {
+            if (PROSPER_ENV_ON("PROSPER_INDIRECTLOG")) {
                 static std::atomic<int> logged{0};
                 if (logged.fetch_add(1) < 64)
                     fprintf(stderr,
