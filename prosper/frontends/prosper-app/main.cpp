@@ -76,8 +76,10 @@
 // a release: the AppImage and the tarball carry this value, and a user who finds prosper quieter
 // than their console has no way to know we chose that for them. Attenuation during bring-up belongs
 // on the command line (`--volume 25`), not in the default every user inherits.
+
 static constexpr int kDefaultVolumePercent = 100;
 static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before backends install
+
 #include "snap_author.hpp"            // human-authored render snapshots (F6/F7), always available
 #ifdef PROSPER_AUDIO_FFMPEG
 #include "ajm_ffmpeg.hpp"              // install AJM MP3 decoder before guest instance creation
@@ -117,6 +119,19 @@ static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before
 #include <mutex>
 #include <sys/stat.h>                  // the host filesystem probe behind resolve_app0_root()
 #include <filesystem>                  // directory listing behind the library scan
+
+
+// #3891: a present attempt that could not reach the window. Counted only when the window system
+// says the window is not presentable (present_window_unavailable); gpu-present-stalled reads this so
+// a hidden window is not reported as frozen, while a broken present path on a visible window still is.
+static void note_present_window_unavailable(SDL_Window* win, bool zero_extent = false) {
+    const SDL_WindowFlags flags = win ? SDL_GetWindowFlags(win) : SDL_WindowFlags{0};
+    if (prosper::frontend::present_window_unavailable(
+            zero_extent, (flags & SDL_WINDOW_MINIMIZED) != 0, (flags & SDL_WINDOW_HIDDEN) != 0,
+            (flags & SDL_WINDOW_OCCLUDED) != 0))
+        prosper::diagnostics::perf::add(
+            prosper::diagnostics::perf::Counter::PresentWindowUnavailable);
+}
 
 // Starting the replacement process for a second title (#1469): CreateProcess on Windows,
 // posix_spawn elsewhere. Guarded the same way as the rest of the tree so windows.h cannot
@@ -2979,6 +2994,7 @@ int main(int argc, char** argv) {
             int dw = 0, dh = 0;
             SDL_GetWindowSizeInPixels(win, &dw, &dh);
             if (dw <= 0 || dh <= 0) {
+                note_present_window_unavailable(win, /*zero_extent=*/true);
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 continue;   // minimized or between fullscreen modes; retry after the next event
             }
@@ -3276,8 +3292,10 @@ int main(int argc, char** argv) {
                 trace.emit(prosper::perf::PresentHandoffEvent::GpuAttemptResult, static_cast<int>(attempt));
                 gpuPresentedW = gf.width; gpuPresentedH = gf.height;
                 if (attempt == PresentAttempt::out_of_date) {
+                    note_present_window_unavailable(win);
                     swapchainDirty = true;
                 } else if (attempt == PresentAttempt::skipped) {
+                    note_present_window_unavailable(win);
                     std::this_thread::sleep_for(std::chrono::milliseconds(4));
                 } else if (attempt == PresentAttempt::failed) {
                     running = false;
@@ -3390,8 +3408,13 @@ int main(int argc, char** argv) {
                         a == PresentAttempt::presented, {});
                     trace.emit(prosper::perf::PresentHandoffEvent::CpuAttemptResult, static_cast<int>(a));
                     if (gpuPrevSlot >= 0) { prosper::frontend::present_blit_release(gpuPrevSlot); gpuPrevSlot = -1; }
-                    if (a == PresentAttempt::out_of_date) swapchainDirty = true;
-                    else if (a == PresentAttempt::skipped) std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                    if (a == PresentAttempt::out_of_date) {
+                        note_present_window_unavailable(win);
+                        swapchainDirty = true;
+                    } else if (a == PresentAttempt::skipped) {
+                        note_present_window_unavailable(win);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                    }
                     else if (a == PresentAttempt::failed) running = false;
                     else {
                         lastFrameSeq = cf.frame_seq;
