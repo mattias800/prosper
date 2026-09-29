@@ -697,6 +697,60 @@ static int run_destination_mirror_regression() {
     r11_full.spirv = r11_full_spirv;
     r11_full.resources = std::make_shared<ShaderResourceTable>(r11_table);
     r11_full.code_addr = 0x37310011u;
+    // This is Astro's hot shape: compute writes the packed image before any graphics pass
+    // registers the address. A full overwrite may reserve an image, but an ordinary borrow or
+    // failed completion must never make its uninitialized pixels readable.
+    std::vector<uint32_t> first_compute_r11(W * H, 0xdeadbeefu);
+    const uint64_t first_compute_address =
+        reinterpret_cast<uint64_t>(first_compute_r11.data());
+    ShaderResourceTable first_compute_table = r11_table;
+    first_compute_table.resources[0].gpu_addr = first_compute_address;
+    ComputeItem first_compute_full = r11_full;
+    first_compute_full.resources =
+        std::make_shared<ShaderResourceTable>(first_compute_table);
+    first_compute_full.code_addr = 0x37310018u;
+    LiveTargetImageImport first_compute_borrow;
+    CHECK(!borrow_live_render_target_image_destination(
+              first_compute_address,
+              {W, H, LiveTargetPixelFormat::R11G11B10Float}, first_compute_borrow) &&
+              first_compute_borrow.refusal == LiveTargetImageImport::Refusal::NoRttEntry,
+          "unregistered packed R11 address rejects an ordinary destination borrow");
+    const auto first_compute_failed_before =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    prosper::frontend::live_compute_fail_next_storage_readback_for_test();
+    CHECK(!prosper::frontend::execute_live_compute_items({first_compute_full}),
+          "unregistered packed R11 destination reports failed completion");
+    const auto first_compute_failed_after =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(first_compute_failed_after.borrowed == first_compute_failed_before.borrowed + 1 &&
+              first_compute_failed_after.failed == first_compute_failed_before.failed + 1 &&
+              first_compute_failed_after.published == first_compute_failed_before.published &&
+              !import_live_render_target_image(first_compute_address, source_request,
+                                               first_compute_borrow) &&
+              std::all_of(first_compute_r11.begin(), first_compute_r11.end(),
+                          [](uint32_t word) { return word == 0xdeadbeefu; }),
+          "failed first producer grants no authority and leaves guest bytes untouched");
+    const auto first_compute_before =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(prosper::frontend::execute_live_compute_items({first_compute_full}),
+          "unregistered packed R11 full overwrite completes");
+    const auto first_compute_after =
+        prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    CHECK(first_compute_after.borrowed == first_compute_before.borrowed + 1 &&
+              first_compute_after.published == first_compute_before.published + 1 &&
+              import_live_render_target_image(first_compute_address, source_request,
+                                              first_compute_borrow),
+          "completed first producer publishes a readable packed renderer image");
+    if (first_compute_borrow.valid()) release_live_render_target_image(first_compute_address);
+    std::vector<uint8_t> first_compute_pixels;
+    std::string first_compute_error;
+    CHECK(prosper::test::readback_persistent_color_target(
+              first_compute_address, W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+              first_compute_pixels, first_compute_error) &&
+              first_compute_pixels.size() == first_compute_r11.size() * sizeof(uint32_t) &&
+              std::memcmp(first_compute_pixels.data(), first_compute_r11.data(),
+                          first_compute_pixels.size()) == 0,
+          "first compute image equals completed packed guest words bit for bit");
     CHECK(!r11_full_spirv.empty() && prosper::frontend::execute_live_compute_items({r11_full}),
           "packed R11 first dispatch mirrors its exact words and removes CPU fallback authority");
     const std::vector<uint32_t> first_r11 = r11_words;
