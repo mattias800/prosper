@@ -3004,7 +3004,12 @@ inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
     std::vector<DrawItem> items;
     if (perdraw) {
         bool parallel_attempted = false;
-        if (allow_parallel && !failures)
+        // SuppressDrawDropCounting is thread-local, and a capture's re-realization must not
+        // count its drops again (#3951). The worker pool would count them on other threads, so a
+        // suppressed realization runs serially on the thread that holds the guard. Captures are
+        // rare, so the lost parallelism is irrelevant.
+        if (allow_parallel && !failures &&
+            !prosper::diagnostics::perf::thread_draw_drop_suppression())
             items = realize_gpustate_draws_parallel(
                 st, max_shader_dwords, log, retain_shared_shader_words,
                 &parallel_attempted);

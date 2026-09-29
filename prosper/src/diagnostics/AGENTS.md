@@ -169,7 +169,9 @@ window.
 window (`reasons=render-array-reject/depth-unavailable:276`) from `perf::DropReason`: one code per
 `built.reject(...)` site in the live renderer's resource builder, `contract-mismatch`,
 `shader-recompile/{vertex,fragment,geometry}` from `realize_draw_item` (a stage with no SPIR-V: the
-draw never reaches the pass loop, so nothing downstream could see it -- #3951), and
+draw never reaches the pass loop, so nothing downstream could see it -- #3951; realize_draw_item's
+other exits -- missing program, no-effect, indirect arguments, zero vertex count -- are still NOT
+counted), and
 `backend/*` mirroring `gpu::DrawDrop` (`draw_disposition.cpp` static_asserts the mirror).
 `skipped-dispatches` does the same with `perf::DispatchSkip`, and its exclusions are code, not
 prose: a deliberate backend decline (the `PROSPER_COMPUTE_SKIP_PROGRAM` selector calls

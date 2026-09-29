@@ -5535,7 +5535,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool raw_wide_register_offset_data =
                 rt && (in.opcode == 0x2 || in.opcode == 0x3) && !soff_null &&
                 rs.smem_raw_wide_data_loads.contains(in.pc);
-            if (raw_wide_register_offset_data && !b.is_compute && getenv("PROSPER_DBG"))
+            static std::atomic<uint32_t> raw_wide_placeholder_logs{0};
+            if (raw_wide_register_offset_data && !b.is_compute && getenv("PROSPER_DBG") &&
+                raw_wide_placeholder_logs.fetch_add(1, std::memory_order_relaxed) < 64)
                 fprintf(stderr,
                         "[smem-placeholder] pc=%u reason=raw-wide-data-graphics-placeholder "
                         "op=0x%x (#3951: register-offset data words lowered as zero)\n",

@@ -987,6 +987,25 @@ int main() {
                 CHECK(!again_made && vertex_drops() == v1,
                       "#3951: a suppressed (capture) re-realization does not count the drop again");
             }
+            // The guard is thread-local, and realize_gpustate_draws fans a submit of >= 32 draws
+            // out to worker threads. A suppressed capture must still count nothing; the unguarded
+            // control proves the same submit does count every drop through that path.
+            {
+                GpuState many_bad = bad_vs;
+                many_bad.draws.clear();
+                for (int i = 0; i < 40; ++i) many_bad.draws.push_back(st.draws.front());
+                const uint64_t c0 = vertex_drops();
+                const auto unguarded = realize_gpustate_draws(many_bad);
+                const uint64_t c1 = vertex_drops();
+                CHECK(unguarded.empty() && c1 - c0 == 40,
+                      "#3951: 40 failing draws realized together count 40 vertex drops (control)");
+                {
+                    const perf::SuppressDrawDropCounting not_live;
+                    const auto guarded = realize_gpustate_draws(many_bad);
+                    CHECK(guarded.empty() && vertex_drops() == c1,
+                          "#3951: a suppressed multi-draw realization counts nothing on any thread");
+                }
+            }
         }
 
         // #2287: realize_draw_item resolves PROSPER_DESCRIPTOR_VALIDATE from the caller's hoisted
