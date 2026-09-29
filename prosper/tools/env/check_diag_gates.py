@@ -81,8 +81,11 @@ silently stops describing the tree, which is the same failure class this tool ex
   - A gate carried through a CONTEXT STRUCT (`Ctx{.x = x}` handed to a callee that reads `ctx.x`)
     is followed by member NAME only (#3919): a member counts when every data member of that name
     in the tree is a REFERENCE member and every designated initialiser of it is env-derived. A
-    same-named value member anywhere retires the name, which also hides a genuine context gate. One hop -- a context forwarded into a second context is
-    not followed -- and a member initialised positionally, or from a non-alias value, is invisible.
+    same-named value member anywhere retires the name, which also hides a genuine context gate. A
+    context forwarded into a second context is followed only as a SAME-NAME pass-through
+    (`auto& x = ctx.x;` then `Inner{.x = x}`), which is not counted as a new initialiser; any other
+    forwarding (`.x = y`) retires the name. A member initialised positionally, or from a non-alias
+    value, is invisible.
   - `#if`-gated code is scanned as if it were live.
   - A diagnostic gated by something other than an environment variable (a build flag, a member
     field, a runtime setting) is out of scope by construction.
@@ -695,6 +698,9 @@ class Scope:
     def __init__(self, gates: set[str]):
         self.gates = set(gates)
         self.aliases: dict[str, frozenset] = {}
+        # Names rebound from a same-named context member (`auto& x = ctx.x;`): handing `x` on as
+        # `.x = x` is a pass-through of that member, not a new initialiser (#3892).
+        self.member_rebinds: set[str] = set()
         # var -> (decl line, [(line, gates)] writes, [(line, gates)] prints)
         self.decls: dict[str, tuple] = {}
 
@@ -1055,6 +1061,12 @@ class FileScanner:
             # whose EVERY initialiser was env-derived, and pass 2 lets `ctx.name` stand for that.
             if self.member_writes is not None and not is_def:
                 for dm3 in DESIGNATED_INIT_RE.finditer(line):
+                    # A context handed on (`auto& x = ctx.x;` then `Inner{.x = x}`, #3892's
+                    # buffer branch) passes the SAME member through; it is not a second, ungated
+                    # initialiser that would retire the name for both contexts.
+                    if dm3.group(2).strip() == dm3.group(1) and any(
+                            dm3.group(1) in sc.member_rebinds for sc in self.stack):
+                        continue
                     self.member_writes.setdefault(dm3.group(1), []).append(
                         clauses_of(self.expand(dm3.group(2))))
 
@@ -1064,6 +1076,9 @@ class FileScanner:
                 if dm2:
                     eq = raw.find("=", raw.find(dm2.group(1)) + len(dm2.group(1)))
                     rhs, used = self.gather_statement(i, eq + 1) if eq >= 0 else (dm2.group(2), 1)
+                    if re.fullmatch(r"\s*[A-Za-z_]\w*\s*(?:\.|->)\s*" + re.escape(dm2.group(1))
+                                    + r"\s*;?\s*", rhs):
+                        self.stack[-1].member_rebinds.add(dm2.group(1))
                     consumed = max(consumed, used)
                     ctx = clauses_of(self.expand(rhs))
                     if ctx and self.alias_is_a_gate(rhs):
@@ -1617,6 +1632,31 @@ SELF_TESTS: list[tuple[str, str, list[str]]] = [
      _MEMBER_COLLISION_FIXTURE, ["SPLIT-LOCAL:fresh"]),
     ("context member (#3919): an alias handed over as `.x = x` and rebound as `ctx.x` keeps its "
      "gate", _CONTEXT_MEMBER_FIXTURE, ["TWO-GATE:PROSPER_CTX_FIRST+PROSPER_CTX_SECOND"]),
+    ("context member (#3892 buffer branch): a context handed on to a second context "
+     "(`Outer{.detail = detail}` -> `auto& detail = ctx.detail;` -> `Inner{.detail = detail}`) "
+     "keeps the gate through both hops", _CONTEXT_MEMBER_FIXTURE + """
+struct InnerCtx { const bool& detail; };
+void inner(const InnerCtx& ictx) {
+    auto& detail = ictx.detail;
+    if (detail) {
+        if (getenv("PROSPER_CTX_THIRD")) fprintf(stderr, "[inner] n=%u\\n", n);
+    }
+}
+void middle(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    inner(InnerCtx{ .detail = detail });
+}
+""", ["TWO-GATE:PROSPER_CTX_FIRST+PROSPER_CTX_SECOND",
+      "TWO-GATE:PROSPER_CTX_FIRST+PROSPER_CTX_THIRD"]),
+    ("context member (#3892 buffer branch): the pass-through exemption covers `.x = x` only -- "
+     "in a scope that rebinds `detail`, `.detail = true` is still an ungated initialiser and "
+     "retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void middle2(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    callee(DetailCtx{ .detail = true });
+}
+""", []),
     ("context member (#3919): one UNGATED initialiser anywhere retires the name, so `.x = true` "
      "cannot make every `obj.x` a gate", _CONTEXT_MEMBER_FIXTURE + """
 void other() {
