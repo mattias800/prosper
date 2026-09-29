@@ -311,10 +311,10 @@ Partial machinery already exists (`rtt_gpu_seed_import_extent_compatible`,
 ## Ruled out
 
 **RULED OUT (2026-09-29): Stage 2 deferred graphics waits are necessary for GTA V's observed
-3.6 fps collapse.** On main `5680c4255ef1`, a sustained eight-compiler load reproduces 3.43 fps
-with deferred wait OFF, against 9.38 fps before the load; the matched quiet ON control reaches
-9.20 fps. Normalized readbacks and frontend work remain steady, while frontend build and readback
-time rise to the historical outlier's profile. Completed windows have no target eviction,
+3.6 guest flips/s collapse.** On main `5680c4255ef1`, a sustained eight-compiler load reproduces
+3.43 guest flips/s with deferred wait OFF, against 9.38 before the load; the matched quiet ON
+control reaches 9.20 guest flips/s. Normalized readbacks and frontend work remain steady, while
+frontend build and readback time rise to the historical outlier's profile. Completed windows have no target eviction,
 destination refusal, allocation fallback or draw-accounting gap, and all audited readbacks
 complete. Menu and gameplay/HUD frames remain intact. The original arm's endpoint had eight
 compiler processes but its full worker-overlap history was not retained, so this is a reproduced
