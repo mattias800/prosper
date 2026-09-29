@@ -1119,18 +1119,30 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             if (!direct_bind) { destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::DirectBindDisabled; return false; }
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             auto it = g_rtt.find(addr);
-            if (it == g_rtt.end()) { destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::NoRttEntry; return false; }
+            // A complete compute overwrite can be the first producer of this address. Its
+            // destination lease does not read old pixels, and the completion notifier creates
+            // the registry entry only after the device copy and guest writeback succeed. Keep
+            // the existing-entry requirement for ordinary borrows, which have no such proof.
+            static const bool unregistered_destination_disabled =
+                std::getenv("PROSPER_NO_COMPUTE_RTT_UNREGISTERED_DEST") != nullptr;
+            if (it == g_rtt.end() &&
+                (!request.allow_create || unregistered_destination_disabled)) {
+                destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::NoRttEntry;
+                return false;
+            }
             if (!request.width || !request.height) {
                 destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::ZeroExtent;
                 return false;
             }
-            if (it->second.w != request.width || it->second.h != request.height) {
+            if (it != g_rtt.end() &&
+                (it->second.w != request.width || it->second.h != request.height)) {
                 destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::ExtentMismatch;
                 return false;
             }
             const VkFormat format = prosper::frontend::live_target_pixel_format_vk(request.format);
             if (format == VK_FORMAT_UNDEFINED ||
-                prosper::test::backend_color_format(it->second.format) != format) {
+                (it != g_rtt.end() &&
+                 prosper::test::backend_color_format(it->second.format) != format)) {
                 destination.refusal = prosper::gpu::LiveTargetImageImport::Refusal::FormatMismatch;
                 return false;
             }
