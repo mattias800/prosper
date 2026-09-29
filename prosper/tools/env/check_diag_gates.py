@@ -79,8 +79,9 @@ silently stops describing the tree, which is the same failure class this tool ex
   - A braceless `if` body is not scoped: `if (a) if (b) x = c;` attributes `x` to the enclosing
     block. LITERAL_RHS_RE exists because of this -- see the defaulted-alias rule in run().
   - A gate carried through a CONTEXT STRUCT (`Ctx{.x = x}` handed to a callee that reads `ctx.x`)
-    is followed by member NAME only (#3919): a member counts when every designated initialiser of
-    that name in the tree is env-derived. One hop -- a context forwarded into a second context is
+    is followed by member NAME only (#3919): a member counts when every data member of that name
+    in the tree is a REFERENCE member and every designated initialiser of it is env-derived. A
+    same-named value member anywhere retires the name, which also hides a genuine context gate. One hop -- a context forwarded into a second context is
     not followed -- and a member initialised positionally, or from a non-alias value, is invisible.
   - `#if`-gated code is scanned as if it were live.
   - A diagnostic gated by something other than an environment variable (a build flag, a member
@@ -1274,7 +1275,63 @@ def resolve_flags(flag_writes: dict[str, list[frozenset]]) -> dict[str, frozense
     return out
 
 
-def resolve_members(member_writes: dict[str, list[frozenset]]) -> dict[str, frozenset]:
+STRUCT_HEAD_RE = re.compile(r"(?<!enum)\s\b(?:struct|class)\s+[A-Za-z_][\w:]*[^;{}()]*$")
+MEMBER_NAME_RE = re.compile(
+    r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:=[^;]*|\{\})?\s*$")
+
+
+def collect_member_kinds(files: dict[Path, list[str]]) -> dict[str, set[str]]:
+    """Every DATA MEMBER declared at struct/class scope, by name: {"ref"} / {"value"} / both.
+
+    The context-member join (#3919) is only sound for names that are reference members EVERYWHERE.
+    A reference member is bound once, at construction, from the initialiser that names it, so the
+    designated initialiser really is the whole story. A value member can be written after
+    construction (`stats.detail += 1`), default-initialised, or filled positionally, none of which
+    the designated-initialiser record sees -- and because the join is by name, one such member in an
+    UNRELATED struct would hand its reads a gate they do not have and hide a real finding (the
+    review of #3940). Lexical: tracks which open brace is a struct/class body; a declaration whose
+    statement contains `(` (a method, a function-typed member) is skipped, never guessed.
+    """
+    kinds: dict[str, set[str]] = {}
+    for _path, lines in files.items():
+        stack: list[str] = []          # "struct" or "other" per open brace
+        stmt: list[str] = [""]         # statement accumulated at each depth (index 0 = file)
+        for ch in "\n".join(lines):
+            if ch == "{":
+                head = stmt[-1]
+                stack.append("struct" if STRUCT_HEAD_RE.search(" " + head) else "other")
+                stmt.append("")
+            elif ch == "}":
+                if stack:
+                    stack.pop()
+                    stmt.pop()
+                    if stack and stack[-1] == "struct" and "(" in stmt[-1]:
+                        stmt[-1] = ""  # a method body ended; no `;` follows it
+                    else:
+                        stmt[-1] += "{}"
+            elif ch == ";":
+                text = stmt[-1].strip()
+                stmt[-1] = ""
+                if not stack or stack[-1] != "struct" or not text or "(" in text:
+                    continue
+                first = text.split()[0]
+                if first in ("using", "typedef", "friend", "static", "template", "public:",
+                             "private:", "protected:", "enum", "struct", "class", "return"):
+                    continue
+                text = re.sub(r"^(?:public|private|protected)\s*:\s*", "", text)
+                m = MEMBER_NAME_RE.search(text)
+                if not m or m.start(1) == 0:
+                    continue           # a lone identifier is not a declaration
+                before = text[:m.start(1)].rstrip()
+                kind = "ref" if before.endswith("&") and not before.endswith("&&") else "value"
+                kinds.setdefault(m.group(1), set()).add(kind)
+            else:
+                stmt[-1] += ch
+    return kinds
+
+
+def resolve_members(member_writes: dict[str, list[frozenset]],
+                    member_kinds: dict[str, set[str]] | None = None) -> dict[str, frozenset]:
     """Context-struct members that ONLY ever receive an env-derived value (#3919).
 
     The join is lexical, on the member NAME, and needs no types: the designated initialiser
@@ -1287,6 +1344,11 @@ def resolve_members(member_writes: dict[str, list[frozenset]]) -> dict[str, froz
     out = {}
     for name, contexts in member_writes.items():
         if not contexts or any(not c for c in contexts):
+            continue
+        # Only names declared as REFERENCE members, and nowhere as a value member. See
+        # collect_member_kinds(): a value member of the same name anywhere can be written in ways
+        # the designated-initialiser record never sees.
+        if member_kinds is not None and member_kinds.get(name) != {"ref"}:
             continue
         if all(c == contexts[0] for c in contexts):
             out[name] = contexts[0]
@@ -1313,7 +1375,8 @@ def scan_tree(root: Path, follow_members: bool = True):
         FileScanner(str(path.relative_to(root)), lines, preds, {}, printing,
                     None, flag_writes, None, member_writes).run()
     flags = resolve_flags(flag_writes)
-    members = resolve_members(member_writes) if follow_members else {}
+    members = (resolve_members(member_writes, collect_member_kinds(files))
+               if follow_members else {})
 
     call_sites: dict[str, list[tuple[str, frozenset]]] = {}
     findings: list[Finding] = []
@@ -1454,7 +1517,28 @@ void callback() {
 }
 """
 
+# The #3940 review's counter-example: an UNRELATED struct with a VALUE member of the same name,
+# written with `+=` after construction. With a name-only join its read inherited PROSPER_CTX_FIRST
+# -- the very switch `fresh` is filled under -- so the genuine SPLIT-LOCAL below (printed under a
+# test of `stats.detail`, which no env switch gates) vanished.
+_MEMBER_COLLISION_FIXTURE = _CONTEXT_MEMBER_FIXTURE + """
+struct Stats { uint64_t detail = 0; };
+void tally(Stats& stats) {
+    uint32_t fresh = 0;
+    if (getenv("PROSPER_CTX_FIRST")) {
+        fresh = 7;
+    }
+    stats.detail += 1;
+    if (stats.detail) {
+        fprintf(stderr, "[stats] fresh=%u\\n", fresh);
+    }
+}
+"""
+
 SELF_TESTS: list[tuple[str, str, list[str]]] = [
+    ("context member (#3940 review): a same-named VALUE member in an unrelated struct retires the "
+     "name, so its reads keep their real (absent) gate and the SPLIT-LOCAL stays visible",
+     _MEMBER_COLLISION_FIXTURE, ["SPLIT-LOCAL:fresh"]),
     ("context member (#3919): an alias handed over as `.x = x` and rebound as `ctx.x` keeps its "
      "gate", _CONTEXT_MEMBER_FIXTURE, ["TWO-GATE:PROSPER_CTX_FIRST+PROSPER_CTX_SECOND"]),
     ("context member (#3919): one UNGATED initialiser anywhere retires the name, so `.x = true` "
