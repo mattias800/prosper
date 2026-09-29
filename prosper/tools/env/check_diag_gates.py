@@ -81,8 +81,14 @@ silently stops describing the tree, which is the same failure class this tool ex
   - A gate carried through a CONTEXT STRUCT (`Ctx{.x = x}` handed to a callee that reads `ctx.x`)
     is followed by member NAME only (#3919): a member counts when every data member of that name
     in the tree is a REFERENCE member and every designated initialiser of it is env-derived. A
-    same-named value member anywhere retires the name, which also hides a genuine context gate. One hop -- a context forwarded into a second context is
-    not followed -- and a member initialised positionally, or from a non-alias value, is invisible.
+    same-named value member anywhere retires the name, which also hides a genuine context gate. A
+    context forwarded into a second context is followed only as a SAME-NAME pass-through
+    (`auto& x = ctx.x;` then `Inner{.x = x}`), which is not counted as a new initialiser -- and only
+    when every mention of `x` between the rebind and the initialiser is clearly a READ. Any other
+    mention (after a type, inside `[...]`, in a declarator list, before `=`/`{`) may declare a
+    shadow and retires the name: unsure means declared. Any other forwarding (`.x = y`) retires
+    the name too. A member initialised positionally, or from a non-alias
+    value, is invisible.
   - `#if`-gated code is scanned as if it were live.
   - A diagnostic gated by something other than an environment variable (a build flag, a member
     field, a runtime setting) is out of scope by construction.
@@ -196,6 +202,58 @@ ASSIGN_TO_NAME_RE = re.compile(r"\b([A-Za-z_]\w*)\s*=(?!=)")
 # `Ctx{.rtt_log = rtt_log, ...}` and the callee rebinds `auto& rtt_log = ctx.rtt_log;`.
 DESIGNATED_INIT_RE = re.compile(r"(?:^|[{,(])\s*\.([A-Za-z_]\w*)\s*=(?!=)\s*([^,}]+)")
 # `obj.name` / `obj->name` / `ptr->name`: a member READ that may stand for a context member.
+# `.x = x` hands on a rebound context member only if, between the rebind and the initialiser,
+# `x` appears ONLY where it is clearly READ (#3954 review, round 2). Anything else -- a mention after
+# a type or `auto`, inside `[...]`, in a declarator list, before `{`/`=`/`[`/`(` -- might declare a
+# shadow, and is treated as one: retiring the name is always the safe direction.
+_READ_PREV_CHARS = set("(!=|?:+-/%^~")
+_READ_NEXT_CHARS = set(");?:|+-*/%<>!^.")
+_STRING_OR_COMMENT_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*')
+
+
+def only_read_mentions(name: str, text: str) -> bool:
+    # Strings and comments carry brackets and names that are not code.
+    text = _STRING_OR_COMMENT_RE.sub(lambda m: " " * len(m.group(0)), text)
+    word = re.compile(r"(?<![\w])" + re.escape(name) + r"(?!\w)")
+    mentions = [m.span() for m in word.finditer(text)]
+    if not mentions:
+        return True
+    # One pass: for each mention, is the innermost open bracket a parenthesis or a braced
+    # initialiser (where a `,` separates VALUES) rather than a block (where it separates
+    # declarators)?
+    stack: list[tuple[str, bool]] = []
+    listy_at: dict[int, bool] = {}
+    targets = {start for start, _ in mentions}
+    for pos, ch in enumerate(text):
+        if pos in targets:
+            listy_at[pos] = bool(stack) and stack[-1][1]
+        if ch in "([{":
+            if ch == "{":
+                prev = text[:pos].rstrip()[-1:]
+                listy = bool(prev) and (prev.isalnum() or prev in "_>=(,")
+            else:
+                listy = ch == "("
+            stack.append((ch, listy))
+        elif ch in ")]}" and stack:
+            stack.pop()
+    for start, end in mentions:
+        before = text[:start].rstrip()
+        if before.endswith((".", "->", "::")):
+            continue                       # some object's member, not the local `name`
+        after = text[end:].lstrip()
+        pc, nc = before[-1:], after[:1]
+        listy = listy_at.get(start, False)
+        read_prev = (pc in _READ_PREV_CHARS or before.endswith(("&&", "return"))
+                     or (pc == "," and listy))
+        read_next = (nc in _READ_NEXT_CHARS or after.startswith(("&&", "==", "!="))
+                     or (nc == "," and listy) or (nc == "}" and listy))
+        if nc == "=" and not after.startswith("=="):
+            read_next = False
+        if not (read_prev and read_next):
+            return False
+    return True
+
+
 MEMBER_READ_RE = re.compile(r"(?:(?<=[\w\)\]])\.|->)([A-Za-z_]\w*)\b")
 
 # A COMPILED-IN CONSTANT -- the thing a "supply a default" statement assigns. Deliberately narrower
@@ -695,6 +753,10 @@ class Scope:
     def __init__(self, gates: set[str]):
         self.gates = set(gates)
         self.aliases: dict[str, frozenset] = {}
+        # Names rebound from a same-named context member (`auto& x = ctx.x;`): handing `x` on as
+        # `.x = x` is a pass-through of that member, not a new initialiser (#3892).
+        # name -> index of the first line AFTER its rebind statement.
+        self.member_rebinds: dict[str, int] = {}
         # var -> (decl line, [(line, gates)] writes, [(line, gates)] prints)
         self.decls: dict[str, tuple] = {}
 
@@ -835,6 +897,20 @@ class FileScanner:
         return "(" + " && ".join(
             "(" + " || ".join(f'getenv("{n}")' for n in sorted(cl)) + ")"
             for cl in sorted(ctx, key=lambda c: sorted(c))) + ")"
+
+    def is_member_pass_through(self, name: str, line_index: int, prefix: str) -> bool:
+        """`.name = name` hands on the SAME context member only when the innermost enclosing
+        scope rebound `name` from a member (`auto& name = ctx.name;`) AND every mention of `name`
+        between that rebind and this initialiser is clearly a read (only_read_mentions). Any other
+        mention may declare a shadow -- a brace-init local, a second declarator, a structured
+        binding, an if-init, a lambda parameter -- so it retires the name instead (#3954 review).
+        `prefix` is the text before the initialiser from `line_index` on."""
+        for sc in reversed(self.stack):
+            if name in sc.member_rebinds:
+                start = sc.member_rebinds[name]
+                between = " ".join(self.lines[start:line_index]) if start < line_index else ""
+                return only_read_mentions(name, between + " " + prefix)
+        return False
 
     @staticmethod
     def alias_is_a_gate(rhs: str) -> bool:
@@ -1055,6 +1131,12 @@ class FileScanner:
             # whose EVERY initialiser was env-derived, and pass 2 lets `ctx.name` stand for that.
             if self.member_writes is not None and not is_def:
                 for dm3 in DESIGNATED_INIT_RE.finditer(line):
+                    # A context handed on (`auto& x = ctx.x;` then `Inner{.x = x}`, #3892's
+                    # buffer branch) passes the SAME member through; it is not a second, ungated
+                    # initialiser that would retire the name for both contexts.
+                    if dm3.group(2).strip() == dm3.group(1) and \
+                            self.is_member_pass_through(dm3.group(1), i, line[:dm3.start()]):
+                        continue
                     self.member_writes.setdefault(dm3.group(1), []).append(
                         clauses_of(self.expand(dm3.group(2))))
 
@@ -1064,6 +1146,23 @@ class FileScanner:
                 if dm2:
                     eq = raw.find("=", raw.find(dm2.group(1)) + len(dm2.group(1)))
                     rhs, used = self.gather_statement(i, eq + 1) if eq >= 0 else (dm2.group(2), 1)
+                    # A multi-line initialiser (a lambda, a braced aggregate) is consumed whole,
+                    # so the designated initialisers on its LATER lines never reach the per-line
+                    # record above. Record them here, with the statement so far as the prefix a
+                    # lambda parameter would shadow from (#3954 review).
+                    if self.member_writes is not None and used > 1 and not is_def:
+                        for k in range(i + 1, i + used):
+                            later = self.lines[k]
+                            for dm4 in DESIGNATED_INIT_RE.finditer(later):
+                                prefix = " ".join(self.lines[i:k]) + " " + later[:dm4.start()]
+                                if dm4.group(2).strip() == dm4.group(1) and \
+                                        self.is_member_pass_through(dm4.group(1), i, prefix):
+                                    continue
+                                self.member_writes.setdefault(dm4.group(1), []).append(
+                                    clauses_of(self.expand(dm4.group(2))))
+                    if re.fullmatch(r"\s*[A-Za-z_]\w*\s*(?:\.|->)\s*" + re.escape(dm2.group(1))
+                                    + r"\s*;?\s*", rhs):
+                        self.stack[-1].member_rebinds[dm2.group(1)] = i + used
                     consumed = max(consumed, used)
                     ctx = clauses_of(self.expand(rhs))
                     if ctx and self.alias_is_a_gate(rhs):
@@ -1617,6 +1716,121 @@ SELF_TESTS: list[tuple[str, str, list[str]]] = [
      _MEMBER_COLLISION_FIXTURE, ["SPLIT-LOCAL:fresh"]),
     ("context member (#3919): an alias handed over as `.x = x` and rebound as `ctx.x` keeps its "
      "gate", _CONTEXT_MEMBER_FIXTURE, ["TWO-GATE:PROSPER_CTX_FIRST+PROSPER_CTX_SECOND"]),
+    ("context member (#3892 buffer branch): a context handed on to a second context "
+     "(`Outer{.detail = detail}` -> `auto& detail = ctx.detail;` -> `Inner{.detail = detail}`) "
+     "keeps the gate through both hops", _CONTEXT_MEMBER_FIXTURE + """
+struct InnerCtx { const bool& detail; };
+void inner(const InnerCtx& ictx) {
+    auto& detail = ictx.detail;
+    if (detail) {
+        if (getenv("PROSPER_CTX_THIRD")) fprintf(stderr, "[inner] n=%u\\n", n);
+    }
+}
+void middle(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    inner(InnerCtx{ .detail = detail });
+}
+""", ["TWO-GATE:PROSPER_CTX_FIRST+PROSPER_CTX_SECOND",
+      "TWO-GATE:PROSPER_CTX_FIRST+PROSPER_CTX_THIRD"]),
+    ("context member (#3892 buffer branch): the pass-through exemption covers `.x = x` only -- "
+     "in a scope that rebinds `detail`, `.detail = true` is still an ungated initialiser and "
+     "retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void middle2(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    callee(DetailCtx{ .detail = true });
+}
+""", []),
+    ("context member (#3954 review): a block-scope local that SHADOWS the rebind is an ordinary "
+     "initialiser, so `.detail = detail` from it retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void middle3(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    {
+        const bool detail = compute_something();
+        callee(DetailCtx{ .detail = detail });
+    }
+}
+""", []),
+    ("context member (#3954 review): a LAMBDA PARAMETER that shadows the rebind is an ordinary "
+     "initialiser, so `.detail = detail` from it retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void middle4(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    auto f = [](bool detail) { callee(DetailCtx{ .detail = detail }); };
+    f(true);
+}
+""", []),
+    ("context member (#3954 review): a multi-line lambda parameter shadows the rebind as well",
+     _CONTEXT_MEMBER_FIXTURE + """
+void middle5(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    auto f = [&](bool detail) {
+        callee(DetailCtx{ .detail = detail });
+    };
+    f(true);
+}
+""", []),
+    ("context member (#3954 review 2): a brace-init local shadowing the rebind retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void shadow0(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    {
+        const bool detail{compute_something()};
+        callee(DetailCtx{ .detail = detail });
+    }
+}
+""", []),
+    ("context member (#3954 review 2): a second declarator shadowing the rebind retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void shadow1(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    {
+        bool a = true, detail = compute_something();
+        callee(DetailCtx{ .detail = detail });
+    }
+}
+""", []),
+    ("context member (#3954 review 2): a structured binding shadowing the rebind retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void shadow2(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    {
+        auto [a, detail] = compute_pair();
+        callee(DetailCtx{ .detail = detail });
+    }
+}
+""", []),
+    ("context member (#3954 review 2): an if-init declaration shadowing the rebind retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void shadow3(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    {
+        if (const bool detail = compute_something(); detail) {
+            callee(DetailCtx{ .detail = detail });
+        }
+    }
+}
+""", []),
+    ("context member (#3954 review 2): a condition declaration shadowing the rebind retires the name",
+     _CONTEXT_MEMBER_FIXTURE + """
+void shadow4(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    use(detail);
+    {
+        if (bool detail = compute_something()) {
+            callee(DetailCtx{ .detail = detail });
+        }
+    }
+}
+""", []),
     ("context member (#3919): one UNGATED initialiser anywhere retires the name, so `.x = true` "
      "cannot make every `obj.x` a gate", _CONTEXT_MEMBER_FIXTURE + """
 void other() {
