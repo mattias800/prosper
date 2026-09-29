@@ -1259,6 +1259,11 @@ int main() {
                 CHECK(std::memcmp(tiled_avx2.data(), tiled_scalar.data(), tb) == 0,
                       "AVX2 tile_surface matches scalar tile_surface byte-for-byte");
 
+                std::vector<uint8_t> linear_detiled(lin.size());
+                detile_surface(linear_detiled.data(), tiled_scalar.data(), W, H, M, 0, bpe);
+                CHECK(linear_detiled == lin,
+                      "detile restores every texel from scalar-tiled 64KB input");
+
                 // Mutation arm: verify the comparison is strictly discriminating by mutating
                 // a byte in the tiled buffer and asserting a mismatch against the scalar baseline.
                 tiled_avx2[tb / 2 + 13] ^= 0xa5;

@@ -1,0 +1,16 @@
+threads=default arm=paired detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=1.561323
+threads=default arm=gather detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=2.235317
+threads=default arm=gather detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=2.081687
+threads=default arm=paired detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=1.504528
+threads=default arm=paired detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=1.529179
+threads=default arm=gather detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=2.158833
+threads=default arm=gather detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=2.049208
+threads=default arm=paired detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=1.565547
+threads=single arm=paired detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=10.656174
+threads=single arm=gather detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=13.622234
+threads=single arm=gather detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=13.962681
+threads=single arm=paired detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=10.846713
+threads=single arm=paired detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=10.704242
+threads=single arm=gather detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=13.583691
+threads=single arm=gather detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=13.739485
+threads=single arm=paired detile mode=27 extent=3840x2160 bpe=8 rounds=100 ms_per_call=10.650512

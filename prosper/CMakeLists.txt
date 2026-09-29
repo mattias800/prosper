@@ -1689,6 +1689,12 @@ if(TARGET prosper_core)
   add_executable(test_tile tests/gpu/texture/test_tile.cpp)
   target_link_libraries(test_tile PRIVATE prosper_core)
   add_test(NAME gpu_surface_detile COMMAND test_tile)
+  add_test(NAME gpu_surface_detile_gather COMMAND test_tile)
+  set_tests_properties(gpu_surface_detile_gather PROPERTIES
+                       ENVIRONMENT "PROSPER_NO_PAIRED_AVX2_DETILE=1")
+  # Explicit CPU microbenchmark for the recurring 4K, eight-byte Astro storage seed.
+  add_executable(bench_detile tests/gpu/texture/bench_detile.cpp)
+  target_link_libraries(bench_detile PRIVATE prosper_core)
   add_executable(test_mip_tail tests/gpu/texture/test_mip_tail.cpp)
   target_link_libraries(test_mip_tail PRIVATE prosper_core)
   add_test(NAME gpu_mip_tail_oracle COMMAND test_mip_tail --check)
