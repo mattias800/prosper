@@ -993,6 +993,11 @@ class FileScanner:
             # A context member stands for what its designated initialisers held (#3919). Replace
             # the whole `.name` / `->name` so the object expression is left as an ordinary ident.
             def sub_member(m):
+                # A same-named METHOD is not this context's reference data member. Let only the
+                # receiver-aware getter bridge resolve calls, even after pass 1 found a real
+                # `.name = alias` context elsewhere (#3892).
+                if re.match(r"\s*\(", expr[m.end():]):
+                    return m.group(0)
                 ctx = self.members.get(m.group(1))
                 if not ctx:
                     return m.group(0)
@@ -2624,8 +2629,41 @@ const int& GetterState::threshold() const {
                 if any(f.kind == "TWO-GATE" and Finding.render(f.gates) == key for f in disabled):
                     bad += 1
                     print("  [FAIL] cached getter: positive must vanish with the bridge disabled")
+    # Seed the valid member join AND call a same-named getter through an unknown owner in the
+    # same tree. Without this arm the negative receiver cases are also satisfied by retiring
+    # `threshold` globally, and do not exercise pass 2's now-live member-data expansion.
+    for label, receiver in [("unknown", "lookup()"), ("other owner", "&OtherState::instance()")]:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "src").mkdir()
+            for name, text in {
+                    "config.hpp": header + "class OtherState {};\n",
+                    "config.cpp": definition.replace("INITIALIZER", initializer),
+                    "callback.cpp": caller,
+                    "consumer.cpp": consumer,
+                    "unrelated.cpp": """
+void unrelated() {
+    auto* const state = RECEIVER;
+    const auto& local = state->threshold();
+    if (local) {
+        if (getenv("PROSPER_GETTER_PRINT")) fprintf(stderr, "x");
+    }
+}
+""".replace("RECEIVER", receiver)}.items():
+                (root / "src" / name).write_text(text, encoding="utf-8")
+            files, _preds, findings = scan_tree(root)
+        positive = any(f.kind == "TWO-GATE" and f.where.startswith("src/consumer.cpp:")
+                       and Finding.render(f.gates) == key for f in findings)
+        leaked = any(f.kind == "TWO-GATE" and f.where.startswith("src/unrelated.cpp:")
+                     for f in findings)
+        if len(files) != 5 or not positive or leaked:
+            bad += 1
+            print(f"  [FAIL] cached getter: seeded-context {label} receiver: "
+                  f"positive={positive}, leaked={leaked}, files={len(files)}")
+        elif verbose:
+            print(f"  [ok]   cached getter: seeded-context {label} receiver stays unknown")
     if not bad:
-        print(f"  [ok]   cached-getter resolution: {len(cases)} cross-file arms, bridge-off control")
+        print(f"  [ok]   cached-getter resolution: {len(cases) + 2} cross-file arms, bridge-off control")
     return bad
 
 
