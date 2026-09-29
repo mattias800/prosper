@@ -1501,6 +1501,65 @@ static int run_destination_mirror_regression() {
                               cold16_pixels.size()) == 0,
               "cold RGBA16F renderer image retains the exact nonuniform partial result");
     }
+    {
+        // #3929: a one-layer 2D_ARRAY T# (img_dim 5, depth 1) is Sonic Frontiers' post-process
+        // output shape. Its single subresource is byte-identical to a plain 2D surface, so a full
+        // overwrite must reach the renderer's device image instead of a CPU snapshot. This is a
+        // first producer at a fresh address, so admission also exercises destination creation.
+        const bool one_layer_array_disabled =
+            std::getenv("PROSPER_NO_COMPUTE_RTT_ONE_LAYER_ARRAY_DEST") != nullptr;
+        std::vector<uint8_t> array1(W * H * 4, 0x5a);
+        const uint64_t array1_address = reinterpret_cast<uint64_t>(array1.data());
+        ShaderResource array1_output = output;
+        array1_output.img_dim = 5;
+        array1_output.gpu_addr = array1_address;
+        ShaderResourceTable array1_table;
+        array1_table.resources.push_back(array1_output);
+        ComputeShaderConfig array1_config = config;
+        array1_config.local_y = H;  // every row: a full overwrite, not the one-row partial shape
+        const auto array1_spirv = recompile_compute(
+            store_black_array, std::size(store_black_array), &array1_table, array1_config);
+        CHECK(!array1_spirv.empty(), "one-layer 2D_ARRAY RGBA8 storage writer recompiles");
+        ComputeItem array1_item = item;
+        array1_item.spirv = array1_spirv;
+        array1_item.resources = std::make_shared<ShaderResourceTable>(array1_table);
+        array1_item.code_addr = 0x3731002au;
+        const auto array1_before =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(!array1_spirv.empty() &&
+                  prosper::frontend::execute_live_compute_items({array1_item}),
+              "one-layer 2D_ARRAY RGBA8 full overwrite completes");
+        const auto array1_after =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        bool array1_black = true;
+        for (size_t i = 0; i < array1.size(); i += 4)
+            array1_black &= array1[i] == 0 && array1[i + 1] == 0 && array1[i + 2] == 0 &&
+                            array1[i + 3] == 255;
+        if (!array1_black)
+            std::printf("  one-layer array guest texel0=%u,%u,%u,%u last=%u,%u,%u,%u\n",
+                        array1[0], array1[1], array1[2], array1[3], array1[array1.size() - 4],
+                        array1[array1.size() - 3], array1[array1.size() - 2], array1.back());
+        CHECK(array1_black, "one-layer 2D_ARRAY writer still writes back exact guest bytes");
+        if (!one_layer_array_disabled) {
+            CHECK(array1_after.candidates == array1_before.candidates + 1 &&
+                      array1_after.borrowed == array1_before.borrowed + 1 &&
+                      array1_after.recorded == array1_before.recorded + 1 &&
+                      array1_after.published == array1_before.published + 1 &&
+                      array1_after.failed == array1_before.failed,
+                  "one-layer 2D_ARRAY result publishes through the renderer device mirror");
+            std::vector<uint8_t> array1_pixels;
+            std::string array1_error;
+            CHECK(prosper::test::readback_persistent_color_target(
+                      array1_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, array1_pixels,
+                      array1_error) &&
+                      array1_pixels == array1,
+                  "one-layer 2D_ARRAY mirror pixels equal the exact guest writeback");
+        } else {
+            CHECK(array1_after.candidates == array1_before.candidates &&
+                      array1_after.published == array1_before.published,
+                  "control: the 2D-only shape rule keeps one-layer arrays on CPU publication");
+        }
+    }
     return fails ? 1 : 0;
 }
 

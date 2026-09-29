@@ -3193,6 +3193,10 @@ endif()
                COMMAND test_game_compute_rtt_mirror)
       set_tests_properties(game_compute_rtt_destination_mirror_no_folded_read_alias PROPERTIES
         ENVIRONMENT "PROSPER_NO_FOLDED_COMPUTE_RTT_READ_ALIAS=1")
+      add_test(NAME game_compute_rtt_destination_mirror_no_one_layer_array
+               COMMAND test_game_compute_rtt_mirror)
+      set_tests_properties(game_compute_rtt_destination_mirror_no_one_layer_array PROPERTIES
+        ENVIRONMENT "PROSPER_NO_COMPUTE_RTT_ONE_LAYER_ARRAY_DEST=1")
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
@@ -3733,6 +3737,10 @@ endif()
                COMMAND test_game_compute_rtt_mirror)
       set_tests_properties(game_compute_rtt_destination_mirror_no_folded_read_alias PROPERTIES
         ENVIRONMENT "PROSPER_NO_FOLDED_COMPUTE_RTT_READ_ALIAS=1")
+      add_test(NAME game_compute_rtt_destination_mirror_no_one_layer_array
+               COMMAND test_game_compute_rtt_mirror)
+      set_tests_properties(game_compute_rtt_destination_mirror_no_one_layer_array PROPERTIES
+        ENVIRONMENT "PROSPER_NO_COMPUTE_RTT_ONE_LAYER_ARRAY_DEST=1")
       add_test(NAME game_compute_exec_no_adaptive_storage_result COMMAND test_game_compute)
       set_tests_properties(game_compute_exec_no_adaptive_storage_result PROPERTIES
         ENVIRONMENT "PROSPER_NO_ADAPTIVE_STORAGE_RESULT_VALIDATION=1")
