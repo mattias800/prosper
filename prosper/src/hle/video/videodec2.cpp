@@ -638,6 +638,8 @@ static_assert(sizeof(VdecswFrame) == 0x18, "libSceVdecsw frame struct is 0x18 by
 struct VdecswInput { std::vector<uint8_t> au; uint64_t pts = 0; };
 struct VdecswPending {
     std::deque<VdecswInput> inputs;               // staged access units, in order, owned
+    uint64_t queued_bytes = 0;
+    bool backlog_reported = false;
     uint64_t out_data = 0, out_bytes = 0;
     bool out_set = false;
 };
@@ -1001,15 +1003,16 @@ HLE(s_vdecsw_set_decode_input) {
         it = g_vdecsw.emplace(a0, VdecswPending{}).first;
     }
     auto& p = it->second;
-    // Bounded: a title that stages without ever polling must not grow this without limit. Refuse
-    // overflow instead of silently discarding the oldest AU: it may contain the stream's only
-    // parameter sets, and reporting success would make the later decode fail for the wrong reason.
-    constexpr size_t kMaxStaged = 64;
-    if (p.inputs.size() >= kMaxStaged) {
+    // A title can stage more than 64 AUs before its first output poll. Bound retained guest bytes
+    // and empty/tiny AUs separately; these are host resource limits, not measured console limits.
+    // Refuse exhaustion without discarding an earlier AU (possibly the only SPS/PPS).
+    constexpr size_t kMaxStaged = 4096;
+    constexpr uint64_t kMaxStagedBytes = 64ull * 1024 * 1024;
+    if (p.inputs.size() >= kMaxStaged || in[2] > kMaxStagedBytes - p.queued_bytes) {
         static std::atomic<unsigned> reported{0};
         if (reported.fetch_add(1) < 4)
-            fprintf(stderr, "[vdecsw] staged input queue full (%zu AUs); refusing new input\n",
-                    kMaxStaged);
+            fprintf(stderr, "[vdecsw] staged input budget full (%zu AUs, %llu bytes); refusing new input\n",
+                    p.inputs.size(), (unsigned long long)p.queued_bytes);
         return VDEC_ERR_INPUT_DEPTH;
     }
     VdecswInput staged;
@@ -1019,6 +1022,7 @@ HLE(s_vdecsw_set_decode_input) {
     }
     staged.pts = in[3];
     p.inputs.push_back(std::move(staged));
+    p.queued_bytes += in[2];
     return 0;
 }
 HLE(s_vdecsw_set_decode_output) {
@@ -1109,8 +1113,16 @@ HLE(s_vdecsw_try_sync_decode_output) {
         out_data = it->second.out_data;
         out_bytes = it->second.out_bytes;
         if (!it->second.inputs.empty()) {
+            if (!it->second.backlog_reported && it->second.inputs.size() >= 64 &&
+                getenv("PROSPER_VDEC2_CONTRACT")) {
+                fprintf(stderr, "[vdecsw] first output poll backlog: %zu AUs, %llu bytes\n",
+                        it->second.inputs.size(),
+                        (unsigned long long)it->second.queued_bytes);
+                it->second.backlog_reported = true;
+            }
             has_input = true;
             staged = std::move(it->second.inputs.front());
+            it->second.queued_bytes -= staged.au.size();
             it->second.inputs.pop_front();
         }
     }
@@ -1232,6 +1244,8 @@ HLE(s_videodec2_reset) {
         auto it = g_vdecsw.find(a0);
         if (it != g_vdecsw.end()) {
             it->second.inputs.clear();
+            it->second.queued_bytes = 0;
+            it->second.backlog_reported = false;
             it->second.out_set = false;
             it->second.out_data = 0;
             it->second.out_bytes = 0;
