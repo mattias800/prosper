@@ -179,6 +179,22 @@ renders silently wrong texels, which is worse than declining. **Tried and revert
 recorded as untested:** a `proven_smem_descriptor_bundle_loads` written exactly that way changed
 nothing on this title, for that reason. The answer has to be per-word, not per-load.
 
+### Nested scalar follow-up (2026-09-29)
+
+The compute path can now snapshot a one-hop raw x4/x8 child under a dispatch-owned mapping lease
+when its parent pointer, exact child binding, complete direct-memory mappings, and every known
+image-write footprint are proved disjoint. A child skipped by a branch, a remap, or an unproved
+write keeps the existing refusal. This is a general admission rule; it does not select this title.
+
+The 30-second native capture on this revision still rejected the recurring 235-instruction
+2560x1440 writer at child pc12. Its table contained parent pc9 and child pcs12/16/35/48/56, but
+the later image descriptors were not all resolved to exact byte sources, so the whole-dispatch
+admission did not fire. The capture recorded 1,255 guest presents, zero published renderer frames,
+and a one-colour black raw scanout. The next question is how to resolve those descriptor sources
+without making a pre-dispatch CPU snapshot authoritative over a shader write from another wave;
+GLOBAL pc20 and other skipped producers remain separate blockers. This change establishes no
+title-screen or performance gain.
+
 ## History: five game-loop iterations, then a job that never completes
 
 Solved by the flip-event data layout, first as the opt-in `PROSPER_FLIP_EVENT_DATA_SHIFT=1`
