@@ -1275,13 +1275,75 @@ def resolve_flags(flag_writes: dict[str, list[frozenset]]) -> dict[str, frozense
     return out
 
 
-STRUCT_HEAD_RE = re.compile(r"(?<!enum)\s\b(?:struct|class)\s+[A-Za-z_][\w:]*[^;{}()]*$")
-MEMBER_NAME_RE = re.compile(
-    r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:=[^;]*|\{\})?\s*$")
+# The text before a `{` that opens a struct/class/union body -- named, anonymous, or with an
+# attribute such as `alignas(64)` in the head. `enum class` bodies hold enumerators, not members.
+STRUCT_HEAD_RE = re.compile(r"(?:^|[\s;{}])(?:struct|class|union)\b(?![^<>]*>)")
+ENUM_HEAD_RE = re.compile(r"\benum\s+(?:class|struct)\b")
+TRAILING_QUALIFIERS_RE = re.compile(r"(?:\s*\b(?:const|override|final|noexcept|volatile)\b)+\s*$")
+LAST_IDENT_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])*\s*$")
+
+
+def _top_level_split(text: str, sep: str) -> list[str]:
+    parts, depth, cur = [], 0, []
+    for ch in text:
+        if ch in "(<[{":
+            depth += 1
+        elif ch in ")>]}":
+            depth = max(0, depth - 1)
+        if ch == sep and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+def member_declarations(text: str) -> list[tuple[str, str]]:
+    """(name, "ref"|"value") for one struct-scope statement. UNSURE MEANS VALUE (#3940 review).
+
+    A value record can only RETIRE a name from the context-member join, which is the safe
+    direction, so any shape this does not fully understand -- an initialiser with a call, a
+    function-typed member, a method declaration, several declarators -- is recorded as value.
+    Only the plain `T& name;` / `const T& name;` shape is ever a reference.
+    """
+    text = re.sub(r"^(?:(?:public|private|protected)\s*:\s*)+", "", text.strip())
+    if not text:
+        return []
+    first = text.split()[0]
+    if first in ("using", "typedef", "friend", "template", "return", "static_assert"):
+        return []
+    # The initialiser is not part of the declarator: `x = compute()`, `x{}`, `x = {1, 2}`.
+    pre = _top_level_split(text, "=")[0]
+    pre = re.sub(r"\{\}\s*$", "", pre)
+    declarators = _top_level_split(pre, ",")
+    unsure = "(" in text or len(declarators) > 1
+    out = []
+    for index, decl in enumerate(declarators):
+        decl = re.sub(r"\s*:\s*\d+\s*$", "", decl)          # bitfield width
+        decl = TRAILING_QUALIFIERS_RE.sub("", decl)
+        while decl.rstrip().endswith(")"):                  # a method or function-typed member
+            depth, cut = 0, None
+            for i in range(len(decl.rstrip()) - 1, -1, -1):
+                depth += {")": 1, "(": -1}.get(decl[i], 0)
+                if depth == 0:
+                    cut = i
+                    break
+            if cut is None:
+                break
+            decl = TRAILING_QUALIFIERS_RE.sub("", decl[:cut])
+        m = LAST_IDENT_RE.search(decl)
+        # A lone word is not a declaration -- except after the first declarator (`int a, b;`).
+        if not m or (index == 0 and not decl[:m.start(1)].strip()):
+            continue
+        before = decl[:m.start(1)].rstrip()
+        is_ref = before.endswith("&") and not before.endswith("&&")
+        out.append((m.group(1), "ref" if is_ref and not unsure else "value"))
+    return out
 
 
 def collect_member_kinds(files: dict[Path, list[str]]) -> dict[str, set[str]]:
-    """Every DATA MEMBER declared at struct/class scope, by name: {"ref"} / {"value"} / both.
+    """Every DATA MEMBER declared at struct/class/union scope, by name: {"ref"} / {"value"} / both.
 
     The context-member join (#3919) is only sound for names that are reference members EVERYWHERE.
     A reference member is bound once, at construction, from the initialiser that names it, so the
@@ -1289,8 +1351,9 @@ def collect_member_kinds(files: dict[Path, list[str]]) -> dict[str, set[str]]:
     construction (`stats.detail += 1`), default-initialised, or filled positionally, none of which
     the designated-initialiser record sees -- and because the join is by name, one such member in an
     UNRELATED struct would hand its reads a gate they do not have and hide a real finding (the
-    review of #3940). Lexical: tracks which open brace is a struct/class body; a declaration whose
-    statement contains `(` (a method, a function-typed member) is skipped, never guessed.
+    review of #3940). Lexical: tracks which open brace is a struct/class/union body. Whatever it is
+    unsure about is recorded as a VALUE member (see member_declarations), because that can only
+    retire a name.
     """
     kinds: dict[str, set[str]] = {}
     for _path, lines in files.items():
@@ -1299,32 +1362,28 @@ def collect_member_kinds(files: dict[Path, list[str]]) -> dict[str, set[str]]:
         for ch in "\n".join(lines):
             if ch == "{":
                 head = stmt[-1]
-                stack.append("struct" if STRUCT_HEAD_RE.search(" " + head) else "other")
+                is_struct = bool(STRUCT_HEAD_RE.search(head)) and not ENUM_HEAD_RE.search(head)
+                stack.append("struct" if is_struct else "other")
                 stmt.append("")
             elif ch == "}":
                 if stack:
-                    stack.pop()
+                    closed = stack.pop()
                     stmt.pop()
-                    if stack and stack[-1] == "struct" and "(" in stmt[-1]:
+                    if closed == "other" and stack and stack[-1] == "struct" \
+                            and stmt[-1].rstrip().endswith(")"):
                         stmt[-1] = ""  # a method body ended; no `;` follows it
+                    elif closed == "struct":
+                        # `struct { ... } s;` / `union { ... } u;`: keep only the declarator part.
+                        stmt[-1] = "__anon_type "
                     else:
                         stmt[-1] += "{}"
             elif ch == ";":
-                text = stmt[-1].strip()
+                text = stmt[-1]
                 stmt[-1] = ""
-                if not stack or stack[-1] != "struct" or not text or "(" in text:
+                if not stack or stack[-1] != "struct":
                     continue
-                first = text.split()[0]
-                if first in ("using", "typedef", "friend", "static", "template", "public:",
-                             "private:", "protected:", "enum", "struct", "class", "return"):
-                    continue
-                text = re.sub(r"^(?:public|private|protected)\s*:\s*", "", text)
-                m = MEMBER_NAME_RE.search(text)
-                if not m or m.start(1) == 0:
-                    continue           # a lone identifier is not a declaration
-                before = text[:m.start(1)].rstrip()
-                kind = "ref" if before.endswith("&") and not before.endswith("&&") else "value"
-                kinds.setdefault(m.group(1), set()).add(kind)
+                for name, kind in member_declarations(text):
+                    kinds.setdefault(name, set()).add(kind)
             else:
                 stmt[-1] += ch
     return kinds
@@ -1535,7 +1594,24 @@ void tally(Stats& stats) {
 }
 """
 
+# Second review of #3940: value-member shapes the collector must not SKIP. Each unrelated struct
+# declares a VALUE `detail`, which must retire the name, so the context fixture's TWO-GATE (which
+# rides on `detail` resolving) must disappear. A collector that records nothing for the shape
+# leaves the name resolvable and the TWO-GATE reported -- the unsafe direction.
+_VALUE_MEMBER_SHAPES = [
+    ("an initialiser with a call", "struct Stats { uint64_t detail = compute(); };"),
+    ("a function-typed member", "struct Hooks { std::function<void(int)> detail; };"),
+    ("a union member", "union Bits { uint32_t detail; float f; };"),
+    ("an alignas(...) struct head", "struct alignas(64) Padded { uint64_t detail; };"),
+    ("an anonymous struct", "struct Outer { struct { int detail; } inner; };"),
+    ("a bitfield", "struct Flags { unsigned detail : 4; };"),
+    ("a second declarator", "struct Pair { int first, detail; };"),
+]
+
 SELF_TESTS: list[tuple[str, str, list[str]]] = [
+    *[(f"context member (#3940 review 2): a same-named value member declared through {what} "
+       f"retires the name", _CONTEXT_MEMBER_FIXTURE + "\n" + decl + "\n", [])
+      for what, decl in _VALUE_MEMBER_SHAPES],
     ("context member (#3940 review): a same-named VALUE member in an unrelated struct retires the "
      "name, so its reads keep their real (absent) gate and the SPLIT-LOCAL stays visible",
      _MEMBER_COLLISION_FIXTURE, ["SPLIT-LOCAL:fresh"]),
