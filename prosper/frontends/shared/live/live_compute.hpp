@@ -371,6 +371,9 @@ uint64_t live_compute_dcc_post_writeback_promotions();
 // Monotonic witnesses for the compressed-producer allocation path. An exact unpinned entry can be
 // forcibly reseeded in place; all other cases retain the post-writeback replacement fallback.
 uint64_t live_compute_dcc_forced_seed_allocation_reuses();
+// Monotonic guest-linear bytes detiled directly into mapped storage-image staging. The next
+// Vulkan upload still occurs; only the intermediate CPU scratch-to-staging copy is omitted.
+uint64_t live_compute_direct_storage_detile_bytes();
 uint64_t live_compute_dcc_post_writeback_replacements();
 // Query the initialized live backend for the exact typed 3D storage+transfer image contract. Tests
 // use this to exercise native-volume execution only on devices that can create the Vulkan image.
