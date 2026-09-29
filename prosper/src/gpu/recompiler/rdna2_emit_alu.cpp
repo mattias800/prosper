@@ -5542,17 +5542,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         "[smem-placeholder] pc=%u reason=raw-wide-data-graphics-placeholder "
                         "op=0x%x (#3951: register-offset data words lowered as zero)\n",
                         in.pc, in.opcode);
+            // The bounded current-byte proof below covers an unchanged ENTRY pointer. A pointer
+            // loaded into SGPRs by this shader can still name numeric x4/x8 data, but its load is
+            // absent from that proof. In the compute shell, do not let the descriptor-only route
+            // turn those bytes into zero. Graphics retains #3951's compatibility placeholder.
+            const bool nested_raw_wide_data = b.is_compute && soff_null &&
+                sreg_range_written(rs, in.src[0].value, 2);
             if (rt && (in.opcode == 0x2 || in.opcode == 0x3) &&
                 rs.smem_raw_wide_data_loads.contains(in.pc) &&
                 ((!soff_null && b.is_compute) ||
-                 (soff_null && rs.smem_raw_immediate_wide_data_loads.contains(in.pc)))) {
+                 (soff_null && rs.smem_raw_immediate_wide_data_loads.contains(in.pc)) ||
+                 nested_raw_wide_data)) {
                 // Keep the existing immediate descriptor route for loads outside the bounded
                 // current-byte proof. Some established routed tables carry only the resulting
                 // resource, without a source binding at this load PC. The may-use census still
                 // reports numeric/uncertain reads; it cannot turn that legacy route into a
                 // current-byte observation. Register-offset data retains its prior refusal.
                 const ShaderResource* exact = rt->by_fetch_pc(in.pc);
-                const bool backed_immediate_wide = soff_null && (n == 4u || n == 8u) &&
+                const bool backed_immediate_wide = soff_null && !nested_raw_wide_data &&
+                    (n == 4u || n == 8u) &&
                     rs.smem_raw_immediate_wide_data_loads.contains(in.pc) && exact &&
                     exact->fetch_pc == in.pc && exact->cls == ResourceClass::ConstantBuffer &&
                     shader_resource_buffer_binding_bytes(*exact) >=

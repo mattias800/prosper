@@ -1123,6 +1123,44 @@ int main() {
                              raw_x8_copied_scalar_data.size(), 1, 0,
                              &raw_wide_table).empty(),
           "scalar arithmetic after direct or B64-copied wide load cannot use zero placeholders");
+    // A nested raw pointer can be folded by the front end without acquiring a runtime buffer at
+    // the child load. The parent binding at pc0 must never authorize zero placeholders at pc2:
+    // s46 is ordinary numeric data, not descriptor provenance.
+    const std::array<uint32_t, 6> nested_x4_numeric = {
+        0xf4080a00u, 0xfa000000u, // pc0: parent x4 s[40:43], entry s[0:1]
+        0xf4080b14u, 0xfa000010u, // pc2: child x4 s[44:47], loaded s[40:41]
+        0x7e00022eu,              // pc4: v_mov_b32 v0,s46
+        0xbf810000u,
+    };
+    ShaderResourceTable nested_x4_parent_table;
+    ShaderResource nested_x4_parent{};
+    nested_x4_parent.cls = ResourceClass::ConstantBuffer;
+    nested_x4_parent.binding = 2;
+    nested_x4_parent.fetch_pc = 0;
+    nested_x4_parent.size = 64;
+    nested_x4_parent_table.resources.push_back(nested_x4_parent);
+    CHECK(raw_wide_data_pcs(nested_x4_numeric) ==
+                  (std::vector<uint32_t>{0u, 2u}) &&
+              proven_raw_wide_pcs(nested_x4_numeric) == std::vector<uint32_t>{0u} &&
+              recompile_valu(nested_x4_numeric.data(), nested_x4_numeric.size(),
+                             1, 0, &nested_x4_parent_table).empty(),
+          "unbacked nested x4 numeric load refuses the parent's unrelated buffer");
+    auto nested_x8_numeric = nested_x4_numeric;
+    nested_x8_numeric[2] = 0xf40c0b14u; // child x8 s[44:51], same numeric s46 use
+    CHECK(raw_wide_data_pcs(nested_x8_numeric) ==
+                  (std::vector<uint32_t>{0u, 2u}) &&
+              recompile_valu(nested_x8_numeric.data(), nested_x8_numeric.size(),
+                             1, 0, &nested_x4_parent_table).empty(),
+          "unbacked nested x8 numeric load also refuses the parent's buffer");
+    const std::array<uint32_t, 8> nested_x4_graphics = {
+        nested_x4_numeric[0], nested_x4_numeric[1],
+        nested_x4_numeric[2], nested_x4_numeric[3], nested_x4_numeric[4],
+        0xf80008cfu, 0x00000000u, // exp pos0, v0, v0, v0, v0
+        0xbf810000u,
+    };
+    CHECK(!recompile_vertex(nested_x4_graphics.data(), nested_x4_graphics.size(),
+                            &nested_x4_parent_table).empty(),
+          "graphics keeps #3951's compatibility placeholder for nested numeric loads");
     const std::array<uint32_t, 6> raw_x4_after_store = {
         0xe0700000u, 0x80000100u, // pc0: buffer_store_dword may alias raw source
         0xf4080100u, 0xfa000020u, // pc2: x4 s[4:7] from dispatch-time snapshot
