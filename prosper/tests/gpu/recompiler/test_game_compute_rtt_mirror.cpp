@@ -1370,6 +1370,12 @@ static int run_destination_mirror_regression() {
     VkDeviceSize& resident_bytes = prosper::test::persistent_color_target_bytes();
     const VkDeviceSize actual_resident_bytes = resident_bytes;
     resident_bytes = prosper::test::persistent_color_target_limit();
+    // Creation at a bound now evicts under the graphics admission predicate (#3873), which would
+    // make room here by evicting this test's real targets against the forced byte gauge. A pending
+    // graphics batch is the state in which refusal remains the contract, so hold one: this arm is
+    // about what compute does AFTER a refusal. Recorded, never submitted, discarded below.
+    prosper::test::BackendSubmissionBatch budget_pending_batch;
+    budget_pending_batch.enqueue(VK_NULL_HANDLE);
     LiveTargetImageImport budget_borrow;
     CHECK(!borrow_live_render_target_image_destination(
               budget_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm, true,
@@ -1381,6 +1387,7 @@ static int run_destination_mirror_regression() {
     const auto budget_before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
     const bool budget_completed = prosper::frontend::execute_live_compute_items({budget_item});
     const auto budget_after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+    budget_pending_batch.discard();
     resident_bytes = actual_resident_bytes;
     CHECK(budget_completed, "residency refusal retains successful compute execution");
     CHECK(std::equal(budget_guest.begin(), budget_guest.begin() + W * 4,
@@ -1420,16 +1427,40 @@ static int run_destination_mirror_regression() {
                 0xf000000000000000ull + i, W, H, VK_FORMAT_R8G8B8A8_UNORM};
             if (color_cache.try_emplace(key).second) count_keys.push_back(key);
         }
+        {
+            // While a graphics batch is pending nothing may be evicted, so the nominal count
+            // (no deferred-graphics headroom) still refuses.
+            prosper::test::BackendSubmissionBatch count_pending_batch;
+            count_pending_batch.enqueue(VK_NULL_HANDLE);
+            LiveTargetImageImport count_borrow;
+            CHECK(!borrow_live_render_target_image_destination(
+                      count_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm, true,
+                                      static_cast<void*>(prosper::test::render_vk_ctx().dev)},
+                      count_borrow) &&
+                      count_borrow.refusal ==
+                          LiveTargetImageImport::Refusal::DestinationCreationRefused &&
+                      !prosper::test::find_persistent_color_target(
+                          count_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false) &&
+                      color_cache.size() == count_limit,
+                  "compute-only destination obeys the nominal image count without batch headroom "
+                  "while a graphics batch is pending, and evicts nothing");
+            count_pending_batch.discard();
+        }
+        // With nothing pending, the same creation evicts the least recently used target -- one
+        // of this fixture's never-used keys -- and stays within the nominal count (#3873).
         LiveTargetImageImport count_borrow;
-        CHECK(!borrow_live_render_target_image_destination(
-                  count_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm, true,
-                                  static_cast<void*>(prosper::test::render_vk_ctx().dev)},
-                  count_borrow) &&
-                  count_borrow.refusal ==
-                      LiveTargetImageImport::Refusal::DestinationCreationRefused &&
-                  !prosper::test::find_persistent_color_target(
-                      count_address, W, H, VK_FORMAT_R8G8B8A8_UNORM, false),
-              "compute-only destination obeys the nominal image count without batch headroom");
+        const bool count_created = borrow_live_render_target_image_destination(
+            count_address, {W, H, LiveTargetPixelFormat::Rgba8Unorm, true,
+                            static_cast<void*>(prosper::test::render_vk_ctx().dev)},
+            count_borrow);
+        size_t fixture_keys_left = 0;
+        for (const auto& key : count_keys) fixture_keys_left += color_cache.count(key);
+        CHECK(count_created && count_borrow.valid() &&
+                  fixture_keys_left + 1 == count_keys.size() &&
+                  color_cache.size() == count_limit,
+              "with no batch pending, a compute destination at the count bound evicts one "
+              "least-recently-used entry instead of refusing");
+        if (count_created) release_live_render_target_image(count_address);
         for (const auto& key : count_keys) color_cache.erase(key);
     }
 

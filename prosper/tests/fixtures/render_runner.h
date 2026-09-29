@@ -2608,6 +2608,16 @@ inline std::atomic<bool>& backend_unproven_submission_storage() {
     return pending;
 }
 
+// Graphics submission batches that currently hold recorded, unsubmitted command buffers. A
+// graphics admission path defers eviction while ITS batch is pending (`avoid_cache_eviction`); a
+// caller outside the ordered render call -- the compute full-overwrite destination -- has no batch
+// of its own to ask, so it reads this process-wide count instead (#3873). Updated only on the
+// empty <-> non-empty transitions of BackendSubmissionBatch's command list.
+inline std::atomic<int>& backend_pending_submission_batches() {
+    static std::atomic<int> pending{0};
+    return pending;
+}
+
 inline bool backend_has_unproven_submission() {
     return backend_unproven_submission_storage().load(std::memory_order_acquire);
 }
@@ -2653,8 +2663,10 @@ public:
     bool retains_pending_resources() const { return pending_resources_abandoned_; }
 
     void enqueue(VkCommandBuffer command) {
-        if (!pending_resources_abandoned_)
-            commands_.push_back(command);
+        if (pending_resources_abandoned_) return;
+        if (commands_.empty())
+            backend_pending_submission_batches().fetch_add(1, std::memory_order_acq_rel);
+        commands_.push_back(command);
     }
 
     void begin_gpu_timestamp(VkDevice dev, VkCommandBuffer command,
@@ -2724,7 +2736,7 @@ public:
     }
 
     void discard() {
-        commands_.clear();
+        clear_commands();
         release_gpu_timestamp();
         finish_persistent_state(false);
         completed_observer_ = {};
@@ -2738,7 +2750,7 @@ public:
     // The sticky flag also rejects callbacks registered later in the current renderer call
     // (registration follows diagnostics).
     void abandon_pending_resources() {
-        commands_.clear();
+        clear_commands();
         // Vulkan may still own this query pool. Deliberately leak it with the other submitted
         // resources; destroying it after unproven completion would violate object lifetime.
         gpu_timestamp_ = {};
@@ -2856,7 +2868,7 @@ public:
             backend_pass_timing_report(state == BackendSubmissionState::Complete,
                                        result.gpu_timestamp_samples ? result.gpu_device_ms : -1.0);
             vkDestroyFence(dev, fence, nullptr);
-            commands_.clear();
+            clear_commands();
             finish_persistent_state(state == BackendSubmissionState::Complete);
             if (state == BackendSubmissionState::Complete && completed_observer_) {
                 auto observer = std::move(completed_observer_);
@@ -2871,6 +2883,14 @@ public:
             abandon_pending_resources();
         }
         return result;
+    }
+
+    // Every path that empties the command list comes through here, so the process-wide pending
+    // count cannot drift from pending().
+    void clear_commands() {
+        if (commands_.empty()) return;
+        commands_.clear();
+        backend_pending_submission_batches().fetch_sub(1, std::memory_order_acq_rel);
     }
 
     void complete() {
@@ -4351,9 +4371,22 @@ inline VkResult render_allocate_gpu_only_memory(VkPhysicalDevice phys, VkDevice 
 }
 
 // Reserve a renderer-owned destination for a byte-exact compute overwrite. The old contents are
-// never read. Do not evict here: a graphics batch may still refer to an unpinned target, whereas
-// the ordinary render path knows whether its batch has completed. Budget or allocation refusal
-// simply leaves compute's existing CPU-snapshot path in charge of the pixels.
+// never read. Budget or allocation refusal leaves compute's existing CPU-snapshot path in charge of
+// the pixels.
+//
+// At the count or byte bound this evicts least-recently-used targets under the SAME predicate the
+// graphics admission paths use: never while any graphics submission batch holds unsubmitted
+// commands (backend_pending_submission_batches, the process-wide form of `avoid_cache_eviction`)
+// or any submission is unproven, never a pinned target, never the most recently used one, never a
+// valid volume. It used to refuse outright, on the grounds that only the render path knew whether
+// its batch had completed. GTA V's colour-target cache sits at its 256-entry count bound, so one
+// refusal at gameplay entry latched a 2560x1440 RGBA8 compute result onto the CPU path for the
+// whole run: ~14 MiB snapshotted and re-materialized per flip, the heavy host-copy regime (#3873).
+// `PROSPER_NO_COMPUTE_RTT_DEST_EVICT=1` restores the refusal.
+inline bool compute_overwrite_destination_eviction_enabled() {
+    static const bool enabled = std::getenv("PROSPER_NO_COMPUTE_RTT_DEST_EVICT") == nullptr;
+    return enabled;
+}
 inline PersistentColorTargetImage* ensure_persistent_color_target_for_compute_overwrite(
         uint64_t id, uint32_t width, uint32_t height, VkFormat format) {
     const BackendPersistentResourceGuard guard;
@@ -4388,6 +4421,16 @@ inline PersistentColorTargetImage* ensure_persistent_color_target_for_compute_ov
     VkMemoryRequirements requirements{};
     vkGetImageMemoryRequirements(ctx.dev, image, &requirements);
     const VkDeviceSize limit = persistent_color_target_limit();
+    if (requirements.size <= limit && compute_overwrite_destination_eviction_enabled() &&
+        backend_pending_submission_batches().load(std::memory_order_acquire) == 0) {
+        // The new, still image-less entry is the least recently used of all (last_use 0), so pin
+        // it while making room or it would be chosen as the first victim and erased under us.
+        ++target.pin_count;
+        while ((cache.size() > persistent_color_target_count_limit() ||
+                persistent_color_target_bytes() > limit - requirements.size) &&
+               evict_persistent_color_target(ctx, persistent_color_target_generation())) {}
+        --target.pin_count;
+    }
     if (requirements.size > limit ||
         persistent_color_target_bytes() > limit - requirements.size ||
         cache.size() > persistent_color_target_count_ceiling(false)) {
