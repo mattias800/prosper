@@ -29,6 +29,12 @@ allocation finishes before prepare starts. The report preserves that hierarchy a
 record violates it.
 Run both switches together whenever setup is the dominant phase.
 
+The `detile_ms` field times the single-surface tiled storage-seed branch, including tiled 1D and
+one-layer array views that reach it. This report ranks those measured calls separately from total
+image setup. Sampled-image detiles, multi-layer array/volume and mip-tail branches are not timed by
+that field; a zero here never proves that all CPU tiling was absent. The
+`[tilecensus]` byte ranking answers a different question and must not be read as elapsed cost.
+
 WHAT THIS TOOL DOES NOT SEE
 ---------------------------
 `[compute-phase]` is emitted from `execute_item`, so it covers **backend-executed dispatches only**.
@@ -301,18 +307,25 @@ def main():
         if _storage_image(image) and
         image.get("cache_ms", 0.0) + image.get("staging_ms", 0.0) >
         image.get("prepare_ms", 0.0) + image_tolerance)
+    broken_detile_nest = sum(
+        1 for image in model_images
+        if _storage_image(image) and "detile_ms" in image and
+        image.get("cache_ms", 0.0) + image.get("staging_ms", 0.0) +
+        image["detile_ms"] > image.get("prepare_ms", 0.0) + image_tolerance)
     broken_image_root = sum(
         1 for image in model_images
         if _image_root_time(image) > image["ms"] + image_tolerance)
     negative_image_timers = sum(
         1 for image in model_images
-        if any(image.get(key, 0.0) < -image_tolerance for key in IMAGE_TIMER_KEYS))
-    if broken_storage_nest or broken_image_root or negative_image_timers:
+        if any(image.get(key, 0.0) < -image_tolerance
+               for key in IMAGE_TIMER_KEYS + ["detile_ms"]))
+    if broken_storage_nest or broken_detile_nest or broken_image_root or negative_image_timers:
         model_warnings.append(
-            f"this tool's image model does not match these records ({broken_storage_nest} storage "
-            f"storage cache + staging intervals exceed prepare_ms, {broken_image_root} where "
+            f"this tool's image model does not match these records ({broken_storage_nest} where "
+            f"storage cache + staging intervals exceed prepare_ms, {broken_detile_nest} where "
+            f"storage cache + staging + detile intervals exceed prepare_ms, {broken_image_root} where "
             f"top-level image children exceed ms, {negative_image_timers} with a negative image "
-            f"timer); storage cache and staging must remain nested inside prepare upload")
+            f"timer); storage cache, staging and detile must remain nested inside prepare upload")
     for warning in model_warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
 
@@ -453,6 +466,12 @@ def main():
         image_row("storage cache (included)", storage_cache, 1)
         image_row("storage staging (included)", storage_staging, 1)
         image_row("prepare exclusive", image_totals["prepare_ms"] - storage_cache - storage_staging, 1)
+        # execute_item times the single-surface storage-seed detile inside prepare_ms. Keep it nested:
+        # adding it to root image time would count the same interval twice.
+        storage_detile = sum(
+            image.get("detile_ms", 0.0) for image in images if _storage_image(image))
+        if any("detile_ms" in image for image in images if _storage_image(image)):
+            image_row("storage detile (included)", storage_detile, 2)
         image_row("image allocation", image_totals["allocation_ms"])
         image_row("view", image_totals["view_ms"])
         image_row("sampler", image_totals["sampler_ms"])
@@ -552,6 +571,41 @@ def main():
                   f"{_known_gib(group['guest'], group['guest_known'], group['n']):>11}"
                   f"{_known_gib(group['staging'], group['staging_known'], group['n']):>11}  "
                   f"{address_text}")
+
+        timed_storage = [image for image in images
+                         if _storage_image(image) and "detile_ms" in image]
+        untimed_storage = sum(_storage_image(image) and "detile_ms" not in image
+                              for image in images)
+        detile_groups = defaultdict(list)
+        for image in timed_storage:
+            elapsed = image["detile_ms"]
+            if elapsed <= 0:
+                continue
+            identity = ("hash", int(image["hash"])) if "hash" in image else (
+                "code", int(image.get("code", 0)))
+            key = (identity, int(image.get("binding", -1)),
+                   str(image.get("extent", "?")), int(image.get("direct_detile", -1)))
+            detile_groups[key].append(elapsed)
+        print()
+        print("  measured single-surface storage-seed detile (inside prepare; sampled/"
+              "multi-layer array/volume/mip-tail branches excluded)")
+        print(f"  {len(timed_storage)} storage bindings with detile_ms, "
+              f"{untimed_storage} without it; "
+              f"{sum(len(times) for times in detile_groups.values())} positive calls, "
+              f"{sum(sum(times) for times in detile_groups.values()):.3f} ms measured")
+        if detile_groups:
+            print(f"  {'shader':<23}{'bind':>6} {'extent':>14}{'direct':>8}"
+                  f"{'calls':>8}{'ms':>11}{'mean':>9}")
+            print("  " + "-" * 79)
+            for (identity, binding, extent, direct), times in sorted(
+                    detile_groups.items(), key=lambda item: -sum(item[1]))[:args.top]:
+                identity_kind, identity_value = identity
+                shader = (f"hash:0x{identity_value:016x}" if identity_kind == "hash"
+                          else f"code:0x{identity_value:x}")
+                direct_text = str(direct) if direct >= 0 else "?"
+                print(f"  {shader:<23}{binding:>6} {extent:>14}{direct_text:>8}"
+                      f"{len(times):>8}{sum(times):>11.3f}"
+                      f"{sum(times) / len(times):>9.3f}")
 
     # Which program to attack, and which leaf inside it. Ranking programs by *total* cost (not mean)
     # is deliberate: a cheap kernel dispatched thousands of times outranks an expensive rare one.

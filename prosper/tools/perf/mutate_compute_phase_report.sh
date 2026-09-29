@@ -128,8 +128,43 @@ run_mutation "retain bounded address variants" \
   '            if "addr" in image:' '            if False and "addr" in image:' || bad=1
 run_mutation "warn on impossible image model" \
   "impossible image model warns on stdout and stderr" \
-  '    if broken_storage_nest or broken_image_root or negative_image_timers:' \
+  '    if broken_storage_nest or broken_detile_nest or broken_image_root or negative_image_timers:' \
   '    if False:' || bad=1
+run_mutation "rank detiles by measured time" \
+  "detile table ranks elapsed work, not total image setup" \
+  'detile_groups.items(), key=lambda item: -sum(item[1]))' \
+  'detile_groups.items(), key=lambda item: sum(item[1]))' || bad=1
+run_mutation "keep detile nested in prepare" \
+  "detile stays nested in prepare" \
+  '    total += image.get("prepare_ms", 0.0)' \
+  '    total += image.get("prepare_ms", 0.0) + image.get("detile_ms", 0.0)' || bad=1
+run_mutation "retain extent in detile groups" \
+  "detile groups retain distinct extents" \
+  'str(image.get("extent", "?")), int(image.get("direct_detile", -1)))' \
+  '"?", int(image.get("direct_detile", -1)))' || bad=1
+run_mutation "retain direct path in detile groups" \
+  "detile groups retain direct-path identity" \
+  'str(image.get("extent", "?")), int(image.get("direct_detile", -1)))' \
+  'str(image.get("extent", "?")), -1)' || bad=1
+run_mutation "name absent detile timers" \
+  "missing and measured-zero detile rows remain distinct" \
+  'untimed_storage = sum(_storage_image(image) and "detile_ms" not in image' \
+  'untimed_storage = sum(_storage_image(image) and "detile_ms" in image' || bad=1
+run_mutation "keep sampled timing out of storage detile" \
+  "sampled timing does not enter the storage-only ranking" \
+  '        timed_storage = [image for image in images
+                         if _storage_image(image) and "detile_ms" in image]' \
+  '        timed_storage = [image for image in images
+                         if "detile_ms" in image]' || bad=1
+run_mutation "warn on detile outside prepare" \
+  "impossible detile nesting fails visibly in both outputs" \
+  'if _storage_image(image) and "detile_ms" in image and' \
+  'if False and "detile_ms" in image and' || bad=1
+run_mutation "sum disjoint storage children" \
+  "combined storage children fit prepare" \
+  'image.get("cache_ms", 0.0) + image.get("staging_ms", 0.0) +
+        image["detile_ms"] > image.get("prepare_ms", 0.0) + image_tolerance)' \
+  'image["detile_ms"] > image.get("prepare_ms", 0.0) + image_tolerance)' || bad=1
 
 cp "$PRISTINE" "$TOOL"
 if python3 "$WORK/test_compute_phase_report.py" >/dev/null 2>&1; then
