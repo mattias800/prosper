@@ -981,7 +981,7 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
     return proven;
 }
 
-// Prove the narrow S_LOAD_DWORDX16 descriptor-bundle shape used by GTA V compute kernels. A wide
+// Prove the narrow S_LOAD_DWORDX16 descriptor-bundle shape used by compute kernels. A wide
 // scalar load is not intrinsically a descriptor fetch: accepting every x16 as two T#s would replace
 // real scalar data with zero placeholders. For each candidate, follow all sixteen loaded words to
 // overwrite/end and require BOTH aligned eight-word halves to be consumed as MIMG SRSRCs. Every such
@@ -1016,7 +1016,8 @@ bool smem_x16_patch_gap_reads_implicit_state(const Rdna2Inst& in, int temporary)
 // owns the word3 patch shape; a branch through that patch needs a distinct path-sensitive proof.
 bool smem_x16_branch_lifetime_is_descriptors(const std::vector<Rdna2Inst>& ins,
                                              const std::unordered_map<uint32_t, size_t>& by_pc,
-                                             size_t start, const ShaderResourceTable& rt) {
+                                             size_t start, const ShaderResourceTable& rt,
+                                             uint32_t wave_size) {
     // The exact-PC image resources describe dispatch-time CPU bytes. A preceding shader write
     // could change the descriptor before this scalar load observes it, even when the load
     // dominates every image use. Unknown aliases keep the ordinary unresolved path.
@@ -1096,7 +1097,7 @@ bool smem_x16_branch_lifetime_is_descriptors(const std::vector<Rdna2Inst>& ins,
                 if (first <= base + static_cast<int>(word) &&
                     base + static_cast<int>(word) < first + static_cast<int>(width))
                     live &= static_cast<uint16_t>(~(1u << word));
-        }, /*wave32_one_word_masks*/true);
+        }, /*wave32_one_word_masks*/wave_size == 32);
         if (!live) continue;
         if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
             const int64_t target = static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
@@ -1139,7 +1140,8 @@ bool smem_x16_branch_lifetime_is_descriptors(const std::vector<Rdna2Inst>& ins,
 }
 
 std::unordered_set<uint32_t> proven_smem_x16_descriptor_loads(
-        const std::vector<Rdna2Inst>& ins, const ShaderResourceTable* rt) {
+        const std::vector<Rdna2Inst>& ins, const ShaderResourceTable* rt,
+        uint32_t wave_size) {
     std::unordered_set<uint32_t> proven;
     if (!rt || ins.empty()) return proven;
 
@@ -1170,7 +1172,7 @@ std::unordered_set<uint32_t> proven_smem_x16_descriptor_loads(
                 load.dst.value + 15 > 105 || load.src[1].kind != OperandKind::Special ||
                 load.src[1].value != 125 || static_cast<int32_t>(load.literal) < 0)
                 continue;
-            if (smem_x16_branch_lifetime_is_descriptors(ins, by_pc, i, *rt))
+            if (smem_x16_branch_lifetime_is_descriptors(ins, by_pc, i, *rt, wave_size))
                 proven.insert(load.pc);
         }
         return proven;
@@ -1354,9 +1356,10 @@ std::unordered_set<uint32_t> proven_smem_x16_descriptor_loads(
                 valid = false;
                 break;
             }
-            // The write inventory defaults to a Wave64 pair for VOPC masks. Killing that
-            // extra word on a Wave32 path could hide a later raw high-word observation.
-            for_each_scalar_write(in, clear_written, /*wave32_one_word_masks*/true);
+            // A VOPC mask replaces both scalar words in Wave64 and only the low word in
+            // Wave32. Keep a surviving Wave32 high word live for later observations.
+            for_each_scalar_write(in, clear_written,
+                                  /*wave32_one_word_masks*/wave_size == 32);
         }
         if (valid && consumed[0] && consumed[1]) proven.insert(load.pc);
     }
@@ -6851,7 +6854,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         b.structured_wave64_mask_reduction_analysis_done = true;
     }
     if (!rs.smem_x16_descriptor_analysis_done) {
-        rs.smem_x16_descriptor_loads = proven_smem_x16_descriptor_loads(ins, rt);
+        rs.smem_x16_descriptor_loads = proven_smem_x16_descriptor_loads(ins, rt, b.wave_size);
         rs.smem_x16_descriptor_analysis_done = true;
     }
     seed_smem_pointer_provenance(rs, ins);
