@@ -78,6 +78,10 @@ silently stops describing the tree, which is the same failure class this tool ex
     clause, which is the understating direction for TWO-GATE.
   - A braceless `if` body is not scoped: `if (a) if (b) x = c;` attributes `x` to the enclosing
     block. LITERAL_RHS_RE exists because of this -- see the defaulted-alias rule in run().
+  - A gate carried through a CONTEXT STRUCT (`Ctx{.x = x}` handed to a callee that reads `ctx.x`)
+    is followed by member NAME only (#3919): a member counts when every designated initialiser of
+    that name in the tree is env-derived. One hop -- a context forwarded into a second context is
+    not followed -- and a member initialised positionally, or from a non-alias value, is invisible.
   - `#if`-gated code is scanned as if it were live.
   - A diagnostic gated by something other than an environment variable (a build flag, a member
     field, a runtime setting) is out of scope by construction.
@@ -185,6 +189,13 @@ LAMBDA_INTRO_RE = re.compile(r"^\s*\[[^\]\[]*\]\s*(?:\(|\{|mutable\b|constexpr\b
 # `name =` with the compound and comparison forms excluded: `+=`/`!=`/`<=`/`==` all fail to match
 # because the character before `=` is then not part of the identifier and not whitespace.
 ASSIGN_TO_NAME_RE = re.compile(r"\b([A-Za-z_]\w*)\s*=(?!=)")
+
+# A DESIGNATED INITIALISER, `.name = value`, at the start of an initialiser element. This is where a
+# context struct of references meets the scope that owns the values (#3919): the callback builds
+# `Ctx{.rtt_log = rtt_log, ...}` and the callee rebinds `auto& rtt_log = ctx.rtt_log;`.
+DESIGNATED_INIT_RE = re.compile(r"(?:^|[{,(])\s*\.([A-Za-z_]\w*)\s*=(?!=)\s*([^,}]+)")
+# `obj.name` / `obj->name` / `ptr->name`: a member READ that may stand for a context member.
+MEMBER_READ_RE = re.compile(r"(?:(?<=[\w\)\]])\.|->)([A-Za-z_]\w*)\b")
 
 # A COMPILED-IN CONSTANT -- the thing a "supply a default" statement assigns. Deliberately narrower
 # than "any value not derived from the environment": a computed RHS (`resdump = strtoull(fa, ...) ==
@@ -760,7 +771,9 @@ class FileScanner:
                  call_sites: dict[str, list[tuple[str, frozenset]]],
                  printing: set[str] | None = None,
                  flags: dict[str, frozenset] | None = None,
-                 flag_writes: dict[str, list[frozenset]] | None = None):
+                 flag_writes: dict[str, list[frozenset]] | None = None,
+                 members: dict[str, frozenset] | None = None,
+                 member_writes: dict[str, list[frozenset]] | None = None):
         self.rel = rel
         self.lines = lines
         self.preds = preds
@@ -768,6 +781,8 @@ class FileScanner:
         self.printing = printing or set()
         self.flags = flags or {}
         self.flag_writes = flag_writes
+        self.members = members or {}
+        self.member_writes = member_writes
         self.findings: list[Finding] = []
         self.stack: list[Scope] = [Scope(set())]
 
@@ -788,6 +803,16 @@ class FileScanner:
         shape; substituting a bare list would turn `if (udprov_enabled())` into a demand for both
         of its alternatives.
         """
+        if self.members:
+            # A context member stands for what its designated initialisers held (#3919). Replace
+            # the whole `.name` / `->name` so the object expression is left as an ordinary ident.
+            def sub_member(m):
+                ctx = self.members.get(m.group(1))
+                if not ctx:
+                    return m.group(0)
+                return " " + self.render_ctx(ctx)
+            expr = MEMBER_READ_RE.sub(sub_member, expr)
+
         def sub(m):
             ident = m.group(0)
             ctx = self.preds.get(ident)
@@ -800,10 +825,15 @@ class FileScanner:
                         break
             if not ctx:
                 return ident
-            return "(" + " && ".join(
-                "(" + " || ".join(f'getenv("{n}")' for n in sorted(cl)) + ")"
-                for cl in sorted(ctx, key=lambda c: sorted(c))) + ")"
+            return self.render_ctx(ctx)
         return re.sub(r"\b[A-Za-z_]\w*\b", sub, expr)
+
+    @staticmethod
+    def render_ctx(ctx) -> str:
+        """A gate context as the getenv() expression clauses_of() reads back."""
+        return "(" + " && ".join(
+            "(" + " || ".join(f'getenv("{n}")' for n in sorted(cl)) + ")"
+            for cl in sorted(ctx, key=lambda c: sorted(c))) + ")"
 
     @staticmethod
     def alias_is_a_gate(rhs: str) -> bool:
@@ -1018,6 +1048,14 @@ class FileScanner:
                         # express: the alias no longer stands for an env switch.
                         del s.aliases[name]
                     break
+
+            # ---- designated initialisers of a context struct (#3919) ------------------------
+            # Pass 1 records what each `.name = value` held; resolve_members() keeps the names
+            # whose EVERY initialiser was env-derived, and pass 2 lets `ctx.name` stand for that.
+            if self.member_writes is not None and not is_def:
+                for dm3 in DESIGNATED_INIT_RE.finditer(line):
+                    self.member_writes.setdefault(dm3.group(1), []).append(
+                        clauses_of(self.expand(dm3.group(2))))
 
             # ---- scoped alias declaration --------------------------------------------------
             if cond is None:
@@ -1236,7 +1274,32 @@ def resolve_flags(flag_writes: dict[str, list[frozenset]]) -> dict[str, frozense
     return out
 
 
-def scan_tree(root: Path):
+def resolve_members(member_writes: dict[str, list[frozenset]]) -> dict[str, frozenset]:
+    """Context-struct members that ONLY ever receive an env-derived value (#3919).
+
+    The join is lexical, on the member NAME, and needs no types: the designated initialiser
+    `.rtt_log = rtt_log` is where the callback's alias meets the callee's `auto& rtt_log =
+    ctx.rtt_log;`. Because names are not qualified by struct, one ungated initialiser anywhere in
+    the tree disqualifies the name -- `.width = w` must never make every `x.width` a gate. Several
+    gated initialisers that disagree widen to one any-of clause, as resolve_flags() does, which is
+    the understating direction.
+    """
+    out = {}
+    for name, contexts in member_writes.items():
+        if not contexts or any(not c for c in contexts):
+            continue
+        if all(c == contexts[0] for c in contexts):
+            out[name] = contexts[0]
+            continue
+        union: set[str] = set()
+        for ctx in contexts:
+            for clause in ctx:
+                union |= set(clause)
+        out[name] = frozenset({frozenset(union)})
+    return out
+
+
+def scan_tree(root: Path, follow_members: bool = True):
     files = collect_files(root)
     preds = collect_predicates(files)
     printing = collect_printing(files)
@@ -1245,16 +1308,19 @@ def scan_tree(root: Path):
     # Pass 1 discovers which `g_*` flags only an env gate can set. Its findings are discarded --
     # they are computed without those flags and would understate.
     flag_writes: dict[str, list[frozenset]] = {}
+    member_writes: dict[str, list[frozenset]] = {}
     for path, lines in files.items():
         FileScanner(str(path.relative_to(root)), lines, preds, {}, printing,
-                    None, flag_writes).run()
+                    None, flag_writes, None, member_writes).run()
     flags = resolve_flags(flag_writes)
+    members = resolve_members(member_writes) if follow_members else {}
 
     call_sites: dict[str, list[tuple[str, frozenset]]] = {}
     findings: list[Finding] = []
     for path, lines in files.items():
         rel = str(path.relative_to(root))
-        findings += FileScanner(rel, lines, preds, call_sites, printing, flags).run()
+        findings += FileScanner(rel, lines, preds, call_sites, printing, flags, None,
+                                members).run()
     findings += split_call_findings(call_sites, defined)
     return files, preds, findings
 
@@ -1369,7 +1435,34 @@ void trace_probe(uint64_t p) {
 # tree scan: a control built by the same machinery as the null inherits the null's blind spots and
 # so tests the discriminator rather than the domain.
 # --------------------------------------------------------------------------------------------
+# #3919: a gate carried through a CONTEXT STRUCT OF REFERENCES. The callback owns the env-derived
+# alias, hands it over with a designated initialiser, and the callee rebinds it by name -- #3892's
+# idiom for moving a callback body out verbatim. The report inside needs a second switch.
+_CONTEXT_MEMBER_FIXTURE = """
+struct DetailCtx { const bool& detail; };
+void callee(const DetailCtx& ctx) {
+    auto& detail = ctx.detail;
+    if (detail) {
+        if (getenv("PROSPER_CTX_SECOND")) fprintf(stderr, "[ctx] n=%u\\n", n);
+    }
+}
+void callback() {
+    static const bool detail = getenv("PROSPER_CTX_FIRST") != nullptr;
+    callee(DetailCtx{
+        .detail = detail,
+    });
+}
+"""
+
 SELF_TESTS: list[tuple[str, str, list[str]]] = [
+    ("context member (#3919): an alias handed over as `.x = x` and rebound as `ctx.x` keeps its "
+     "gate", _CONTEXT_MEMBER_FIXTURE, ["TWO-GATE:PROSPER_CTX_FIRST+PROSPER_CTX_SECOND"]),
+    ("context member (#3919): one UNGATED initialiser anywhere retires the name, so `.x = true` "
+     "cannot make every `obj.x` a gate", _CONTEXT_MEMBER_FIXTURE + """
+void other() {
+    callee(DetailCtx{ .detail = true });
+}
+""", []),
     ("fresh_extent (#2132): filled only under PROSPER_UDPROV, printed regardless", """
 bool udprov_enabled() {
     static const bool on = std::getenv("PROSPER_UDPROV") != nullptr;
@@ -1844,6 +1937,35 @@ def run_self_test(verbose: bool = False) -> int:
     return bad
 
 
+def run_member_resolution_test(verbose: bool = False) -> int:
+    """The context-member finding must VANISH with member resolution off (#3919).
+
+    Without this arm the positive SELF_TESTS case could be satisfied by some other path that
+    happens to see through `ctx.detail` -- a passing test proves the finding exists, not that the
+    new resolution is what found it.
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "src").mkdir()
+        (root / "src" / "fixture.cpp").write_text(_CONTEXT_MEMBER_FIXTURE, encoding="utf-8")
+        files_on, _p, on = scan_tree(root, follow_members=True)
+        files_off, _p, off = scan_tree(root, follow_members=False)
+    if not files_on or not files_off:
+        _apparatus_failure("the context-member arm")
+        return 1
+    key = "PROSPER_CTX_FIRST+PROSPER_CTX_SECOND"
+    has_on = any(f.kind == "TWO-GATE" and Finding.render(f.gates) == key for f in on)
+    has_off = any(f.kind == "TWO-GATE" and Finding.render(f.gates) == key for f in off)
+    if not has_on or has_off:
+        print(f"  [FAIL] context-member resolution: on={has_on} (want True) "
+              f"off={has_off} (want False)")
+        return 1
+    if verbose:
+        print("  [ok]   context-member finding appears with resolution and vanishes without it")
+    return 0
+
+
 def load_baseline(path: Path) -> dict[str, str]:
     entries = {}
     if not path.is_file():
@@ -2056,6 +2178,7 @@ def main() -> int:
             return 1
         print(f"  [ok]   temp root {tmp} is a build-tree path -- the #2658 arm is live")
     if (run_exclusion_test(args.verbose) or run_self_test(args.verbose)
+            or run_member_resolution_test(args.verbose)
             or run_key_stability_test(args.verbose)
             or run_baseline_integrity_test(args.verbose)):
         return 1
