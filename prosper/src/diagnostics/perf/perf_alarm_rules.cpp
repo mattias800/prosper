@@ -71,6 +71,10 @@ RuleThresholds RuleThresholds::scaled(double percent) {
     t.texture_validation_failed_mib_per_s *= k;
     t.host_copy_mib_per_flip *= k;
     t.present_slot_trouble_share *= k;
+    t.rtt_destination_refused_mib_per_flip *= k;
+    t.color_target_ceiling_evictions_per_s *= k;
+    // color_target_ceiling_byte_share is a STATE bound ("the budget is mostly free"), not a
+    // sensitivity: lowering it would make the rule harder to fire, the opposite of the knob's intent.
     // The flip floors are sample sizes, not sensitivities: they do not scale.
     // dropped_draws, skipped_dispatches, gpu_memory_off_device, unaccounted_draws and
     // unimplemented_first_calls stay at "any": a correctness alarm has no sensitivity to lower.
@@ -86,6 +90,7 @@ const std::vector<const char*>& rule_names() {
         "gpu-memory-off-device", "unaccounted-draws",   "unimplemented-hle-calls",
         "diagnostic-path-active", "present-path-fallback", "pipeline-cache-thrash",
         "texture-validation-churn", "host-copy-per-flip", "present-slot-trouble",
+        "rtt-destination-refused", "color-target-count-ceiling",
     };
     return names;
 }
@@ -104,6 +109,9 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
         return w.events(Cost::PresentCpu) != 0 || w.count(Counter::PresentGpuDeclines) != 0;
     if (r == "present-path-fallback")
         return w.events(Cost::PresentCpu) != 0 || w.count(Counter::PresentCpuFallbacks) != 0;
+    if (r == "rtt-destination-refused") return w.flips >= kRttDestinationRefusedMinFlips;
+    // A run whose renderer never consulted the persistent colour-target cache has no bound to be at.
+    if (r == "color-target-count-ceiling") return w.gauge(Gauge::PersistentTargetEntryLimit) != 0;
     // The others measure events whose ABSENCE is the healthy answer: no readback, no contended
     // lock, no refusal, no dropped draw. Zero there is data.
     return true;
@@ -136,6 +144,25 @@ uint64_t present_slot_trouble_declines(const WindowSample& w) {
             if (std::strcmp(name, trouble) == 0) n += w.present_declines[i];
     }
     return n;
+}
+
+std::vector<std::pair<const char*, uint64_t>> rtt_destination_refused_mib(const WindowSample& w) {
+    const char* names[kRttDestinationRefusalSlots];
+    uint64_t mib[kRttDestinationRefusalSlots];
+    for (size_t i = 0; i < kRttDestinationRefusalSlots; ++i) {
+        names[i] = w.rtt_destination_refusal_names[i] ? w.rtt_destination_refusal_names[i] : "?";
+        mib[i] = static_cast<uint64_t>(w.rtt_destination_refused_bytes[i] / kMiB + 0.5);
+    }
+    return ranked(mib, names, kRttDestinationRefusalSlots);
+}
+
+uint64_t destination_creation_refused_bytes(const WindowSample& w) {
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < kRttDestinationRefusalSlots; ++i)
+        if (w.rtt_destination_refusal_names[i] &&
+            std::strcmp(w.rtt_destination_refusal_names[i], kDestinationCreationRefused) == 0)
+            bytes += w.rtt_destination_refused_bytes[i];
+    return bytes;
 }
 
 void apply_reporting_deferrals(std::vector<AlarmFiring>& reported) {
@@ -655,6 +682,75 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                      "re-decode; next: "
                      "PROSPER_TEXREF_CENSUS=1 persist_invalid class, PROSPER_DETILE_STATS; treat "
                      "such an entry as volatile and skip the compare; cf. #3900";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // rtt-destination-refused (RATE per guest flip, by refusal reason).
+    {
+        const uint64_t bytes = w.count(Counter::RttDestinationRefusedBytes);
+        const double mib_per_flip =
+            w.flips ? bytes / kMiB / static_cast<double>(w.flips) : 0.0;
+        if (bytes && w.flips >= t.rtt_destination_refused_min_flips &&
+            mib_per_flip >= t.rtt_destination_refused_mib_per_flip) {
+            AlarmFiring a;
+            a.rule = "rtt-destination-refused";
+            a.value = mib_per_flip;
+            a.unit = "MiB/flip";
+            a.threshold = t.rtt_destination_refused_mib_per_flip;
+            a.breakdown = rtt_destination_refused_mib(w);
+            const uint64_t n = w.count(Counter::RttDestinationRefusals);
+            a.detail = format("refused=%llu refused-bytes=%.0fMiB (%.2fMiB/result) flips=%llu "
+                              "MiB-by-reason=%s",
+                              (unsigned long long)n, bytes / kMiB,
+                              n ? bytes / kMiB / static_cast<double>(n) : 0.0,
+                              (unsigned long long)w.flips, top_entries(a.breakdown).c_str());
+            a.hint = "compute results that should have gone straight into the renderer's device "
+                     "image were refused a destination, so each is snapshotted to the CPU and its "
+                     "consumers re-materialize it from guest bytes (host-copy-per-flip usually "
+                     "fires beside this). destination-creation-refused = the persistent "
+                     "colour-target cache had no room (see color-target-count-ceiling; compute "
+                     "creation never evicts); extent/format/device-mismatch = the renderer image "
+                     "has another shape. next: the [rtt-destination-refused] exit line, "
+                     "PROSPER_COMPUTE_DEST_TRACE_ADDR=<addr> for one target, "
+                     "[persistent-targets] PEAK residency; cf. #3873";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // color-target-count-ceiling (STATE: at the count bound, byte budget mostly free, churning).
+    {
+        const uint64_t entry_limit = w.gauge(Gauge::PersistentTargetEntryLimit);
+        const uint64_t byte_limit = w.gauge(Gauge::PersistentTargetByteLimit);
+        const uint64_t entries = w.peak(Peak::PersistentTargetEntries);
+        const uint64_t bytes = w.peak(Peak::PersistentTargetBytes);
+        const uint64_t evictions = w.count(Counter::PersistentTargetEvictions);
+        const double eviction_rate = per_second(evictions, w.seconds);
+        const double byte_share =
+            byte_limit ? static_cast<double>(bytes) / static_cast<double>(byte_limit) : 1.0;
+        const uint64_t creation_refused = destination_creation_refused_bytes(w);
+        if (entry_limit && byte_limit && entries >= entry_limit &&
+            byte_share < t.color_target_ceiling_byte_share &&
+            (eviction_rate > t.color_target_ceiling_evictions_per_s || creation_refused)) {
+            AlarmFiring a;
+            a.rule = "color-target-count-ceiling";
+            a.value = eviction_rate;
+            a.unit = "evictions/s";
+            a.threshold = t.color_target_ceiling_evictions_per_s;
+            a.detail = format("peak-entries=%llu/%llu peak-bytes=%.0f/%.0fMiB (%.0f%% of budget) "
+                              "evictions=%llu (%.0fMiB) compute-creation-refused=%.0fMiB flips=%llu",
+                              (unsigned long long)entries, (unsigned long long)entry_limit,
+                              bytes / kMiB, byte_limit / kMiB, byte_share * 100.0,
+                              (unsigned long long)evictions,
+                              w.count(Counter::PersistentTargetEvictedBytes) / kMiB,
+                              creation_refused / kMiB, (unsigned long long)w.flips);
+            a.hint = "the persistent colour-target cache is bound by its ENTRY COUNT while most of "
+                     "its byte budget is free: it evicts targets it has memory for (each a CPU "
+                     "readback through the eviction sink, then a re-creation), and compute "
+                     "destination creation at the ceiling is refused outright, never evicting (see "
+                     "rtt-destination-refused). next: the [persistent-targets] PEAK residency exit "
+                     "line; A/B PROSPER_BACKEND_TARGET_CACHE_COUNT (its `of N entries` proves the "
+                     "lever moved); cf. #3873, #1177";
             out.push_back(std::move(a));
         }
     }

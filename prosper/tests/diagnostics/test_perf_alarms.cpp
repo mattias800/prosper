@@ -1108,10 +1108,10 @@ void test_engine() {
     const std::string quiet = slurp(logp);
     check("...saying no rule fired", quiet.find("no rule fired in 1 windows") != std::string::npos);
     check("...and listing the rules that had no data as NOT quiet",
-          quiet.find("14 of 18 rules had data") != std::string::npos &&
+          quiet.find("15 of 20 rules had data") != std::string::npos &&
               quiet.find("NO DATA (not measured in any window, so not quiet): "
                          "texture-reference-cost,present-cpu-overhead,present-path-fallback,"
-                         "present-slot-trouble") != std::string::npos);
+                         "present-slot-trouble,color-target-count-ceiling") != std::string::npos);
     std::fclose(s);
     std::remove(jsonl.c_str());
     std::remove(logp.c_str());
@@ -1301,6 +1301,243 @@ void test_engine_host_copy_alternating() {
     }
 }
 
+
+// rtt-destination-refused (#3891, 2026-09-29): GTA V's heavy host-copy regime refuses one
+// 2560x1440 RGBA8 result (14.06 MiB) destination-creation-refused on every other flip (#3873);
+// the light regime refuses nothing.
+void add_refusal(WindowSample& w, size_t slot, const char* name, uint64_t n, uint64_t bytes_each) {
+    w.rtt_destination_refusal_names[slot] = name;
+    w.rtt_destination_refused_bytes[slot] += n * bytes_each;
+    w.counters[static_cast<size_t>(Counter::RttDestinationRefusals)] += n;
+    w.counters[static_cast<size_t>(Counter::RttDestinationRefusedBytes)] += n * bytes_each;
+}
+
+void test_rtt_destination_refused() {
+    std::puts("rtt-destination-refused");
+    constexpr uint64_t kResult = 2560ull * 1440 * 4;   // 14.06 MiB
+    constexpr size_t kCreation = 18, kExtent = 15;
+    WindowSample heavy = healthy();
+    heavy.flips = 40;   // 8 fps
+    add_refusal(heavy, kCreation, "destination-creation-refused", 20, kResult);
+    const auto a = evaluate_rules(heavy, kDefault);
+    check("GTA V's heavy regime (14 MiB every other flip, ~7 MiB/flip) fires "
+          "rtt-destination-refused alone", only(a, "rtt-destination-refused"));
+    check("...value is MiB per flip", !a.empty() && a[0].value > 7.0 && a[0].value < 7.1);
+    check("...and the line names the reason and bytes per result",
+          !a.empty() && a[0].detail.find("destination-creation-refused:281") != std::string::npos &&
+              a[0].detail.find("(14.06MiB/result)") != std::string::npos);
+    check("...breakdown carries MiB by reason for the JSONL",
+          !a.empty() && a[0].breakdown.size() == 1 && a[0].breakdown[0].second == 281);
+    check("the light regime (no refusals) is quiet", evaluate_rules(healthy(), kDefault).empty());
+    {
+        WindowSample edge = healthy();   // 150 flips
+        add_refusal(edge, kExtent, "extent-mismatch", 1, 599ull << 20);   // 3.99 MiB/flip
+        check("3.99 MiB/flip is quiet", evaluate_rules(edge, kDefault).empty());
+        add_refusal(edge, kExtent, "extent-mismatch", 1, 1ull << 20);     // 4.00 MiB/flip
+        check("4.00 MiB/flip fires", fired(evaluate_rules(edge, kDefault), "rtt-destination-refused"));
+    }
+    {
+        WindowSample load = healthy();
+        load.flips = 9;   // a load hitch: under the flip floor
+        add_refusal(load, kCreation, "destination-creation-refused", 9, kResult);
+        check("a window under the 10-flip floor is quiet and has no data",
+              evaluate_rules(load, kDefault).empty() &&
+                  !rule_has_data("rtt-destination-refused", load));
+    }
+    check("its sustain is two windows (a performance rule)",
+          sustain_windows("rtt-destination-refused") == 2);
+    // The ledger hook bumps both totals and the per-reason slot together.
+    Ledger& l = ledger();
+    const uint64_t before_n = l.counters[static_cast<size_t>(Counter::RttDestinationRefusals)].load();
+    const uint64_t before_b = l.counters[static_cast<size_t>(Counter::RttDestinationRefusedBytes)].load();
+    note_rtt_destination_refusal(kCreation, "destination-creation-refused", 1000);
+    note_rtt_destination_refusal(kRttDestinationRefusalSlots, "out-of-range", 5);   // ignored
+    check("note_rtt_destination_refusal counts once, adds bytes, names its slot, and ignores an "
+          "out-of-range slot",
+          l.counters[static_cast<size_t>(Counter::RttDestinationRefusals)].load() == before_n + 1 &&
+              l.counters[static_cast<size_t>(Counter::RttDestinationRefusedBytes)].load() ==
+                  before_b + 1000 &&
+              l.rtt_destination_refused_bytes[kCreation].load() >= 1000 &&
+              std::string(l.rtt_destination_refusal_names[kCreation].load()) ==
+                  "destination-creation-refused");
+}
+
+// color-target-count-ceiling (#3891, 2026-09-29): GTA V's persistent colour-target cache peaks at
+// 320 of 256 entries at 27-29% of its 4 GiB budget, evicting ~665 targets per run (#3873).
+WindowSample gta_color_target_window(uint64_t peak_entries, uint64_t peak_mib, uint64_t evictions) {
+    WindowSample w = healthy();
+    set_gauge(w, Gauge::PersistentTargetEntryLimit, 256);
+    set_gauge(w, Gauge::PersistentTargetByteLimit, 4096ull << 20);
+    w.peaks[static_cast<size_t>(Peak::PersistentTargetEntries)] = peak_entries;
+    w.peaks[static_cast<size_t>(Peak::PersistentTargetBytes)] = peak_mib << 20;
+    set_count(w, Counter::PersistentTargetEvictions, evictions);
+    set_count(w, Counter::PersistentTargetEvictedBytes, evictions * (3ull << 20));
+    return w;
+}
+
+void test_color_target_count_ceiling() {
+    std::puts("color-target-count-ceiling");
+    const auto a = evaluate_rules(gta_color_target_window(320, 1150, 30), kDefault);
+    check("GTA V (320 of 256 entries at 28% of the byte budget, 30 evictions) fires "
+          "color-target-count-ceiling alone", only(a, "color-target-count-ceiling"));
+    check("...naming the peak against both bounds",
+          !a.empty() && a[0].detail.find("peak-entries=320/256") != std::string::npos &&
+              a[0].detail.find("(28% of budget)") != std::string::npos);
+    check("exactly at the count bound (256 of 256) fires",
+          fired(evaluate_rules(gta_color_target_window(256, 1150, 30), kDefault),
+                "color-target-count-ceiling"));
+    check("one under the count bound (255) is quiet",
+          evaluate_rules(gta_color_target_window(255, 1150, 30), kDefault).empty());
+    check("at the count bound with the byte budget half used is quiet (memory binds too)",
+          evaluate_rules(gta_color_target_window(320, 2048, 30), kDefault).empty());
+    check("...49.9% of the byte budget fires",
+          fired(evaluate_rules(gta_color_target_window(320, 2044, 30), kDefault),
+                "color-target-count-ceiling"));
+    check("10 evictions in 5 s (2/s) and no refusal is quiet: at the bound but costing nothing",
+          evaluate_rules(gta_color_target_window(320, 1150, 10), kDefault).empty());
+    check("11 evictions in 5 s fires",
+          fired(evaluate_rules(gta_color_target_window(320, 1150, 11), kDefault),
+                "color-target-count-ceiling"));
+    {
+        // GTA V gameplay as measured: exactly at 256 of 256, no evictions, one 14 MiB compute
+        // result refused destination-creation-refused per flip.
+        WindowSample g = gta_color_target_window(256, 988, 0);
+        g.flips = 48;
+        add_refusal(g, 18, "destination-creation-refused", 48, 2560ull * 1440 * 4);
+        const auto r = evaluate_rules(g, kDefault);
+        check("GTA V gameplay (256/256, 0 evictions, compute creation refused) fires it, beside "
+              "rtt-destination-refused",
+              r.size() == 2 && fired(r, "color-target-count-ceiling") &&
+                  fired(r, "rtt-destination-refused"));
+        WindowSample other = gta_color_target_window(256, 988, 0);
+        other.flips = 48;
+        add_refusal(other, 15, "extent-mismatch", 48, 2560ull * 1440 * 4);
+        check("...a refusal for another reason (a shape mismatch) does not make the COUNT bind",
+              !fired(evaluate_rules(other, kDefault), "color-target-count-ceiling"));
+        WindowSample full = gta_color_target_window(256, 2500, 0);
+        full.flips = 48;
+        add_refusal(full, 18, "destination-creation-refused", 48, 2560ull * 1440 * 4);
+        check("...and creation refused with the byte budget over half used is memory, not count",
+              !fired(evaluate_rules(full, kDefault), "color-target-count-ceiling"));
+    }
+    check("a run that never consulted the cache (no entry bound) has no data",
+          !rule_has_data("color-target-count-ceiling", healthy()) &&
+              rule_has_data("color-target-count-ceiling", gta_color_target_window(0, 0, 0)));
+}
+
+// The exact full-overwrite shape census: one verdict per tested compute result.
+void test_exact_result_census() {
+    std::puts("exact-full-result census");
+    std::set<std::string> names;
+    bool all_named = true;
+    for (const char* n : kExactResultDeclineNames) {
+        all_named &= n && *n;
+        if (n) names.insert(n);
+    }
+    check("every exact-result verdict has a distinct non-empty name",
+          all_named && names.size() == kExactResultDeclineCount);
+    check("Accepted is \"accepted\" and img-dim names Sonic's #3929 decline",
+          std::string(kExactResultDeclineNames[0]) == "accepted" &&
+              std::string(kExactResultDeclineNames[static_cast<size_t>(
+                  ExactResultDecline::ImageDim)]) == "img-dim");
+    Ledger& l = ledger();
+    const size_t dim = static_cast<size_t>(ExactResultDecline::ImageDim);
+    const uint64_t before = l.counters[static_cast<size_t>(Counter::ExactResultCandidates)].load();
+    const uint64_t before_dim = l.exact_result_declines[dim].load();
+    note_exact_result(ExactResultDecline::ImageDim);
+    note_exact_result(ExactResultDecline::Accepted);
+    note_exact_result(ExactResultDecline::Count);   // not a verdict: ignored
+    check("note_exact_result counts candidates and the verdict, and ignores Count",
+          l.counters[static_cast<size_t>(Counter::ExactResultCandidates)].load() == before + 2 &&
+              l.exact_result_declines[dim].load() == before_dim + 1);
+}
+
+// The engine half: per-window deltas of the refusals and verdicts, per-window PEAKS that reset,
+// the JSONL fields, and the exit census line.
+void test_engine_2026_09_29_censuses() {
+    std::puts("engine 2026-09-29 censuses");
+    const std::string dir = std::getenv("TMPDIR") ? std::getenv("TMPDIR") : ".";
+    const std::string tag = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()) + "_c" +
+        std::to_string(reinterpret_cast<uintptr_t>(&dir) & 0xffffff);
+    const std::string jsonl = dir + "/test_perf_alarms_" + tag + ".jsonl";
+    const std::string logp = dir + "/test_perf_alarms_" + tag + ".log";
+    FILE* log = std::fopen(logp.c_str(), "w+");
+    std::vector<AlarmFiring> w1, w2, w3;
+    constexpr size_t kCreation = 18;
+    const size_t dim = static_cast<size_t>(ExactResultDecline::ImageDim);
+    const size_t accepted = static_cast<size_t>(ExactResultDecline::Accepted);
+    {
+        EngineConfig config;
+        config.window_ns = 1'000'000'000ull;
+        config.jsonl_path = jsonl;
+        config.log = log;
+        AlarmEngine engine(std::move(config));
+        Ledger l;
+        AlarmEngine::ExternalTotals ext;
+        // Pre-baseline residue: refusals and a peak from boot must not reach window 1.
+        l.rtt_destination_refused_bytes[kCreation] = 9ull << 30;
+        l.peaks[static_cast<size_t>(Peak::PersistentTargetEntries)] = 999;
+        l.exact_result_declines[dim] = 7;
+        uint64_t t = 1'000'000'000ull;
+        engine.on_flip(t, l, 30, &ext);
+        const uint64_t flip_ns = 1'000'000'000ull / 30;
+        const auto run_window = [&](std::vector<AlarmFiring>& out, uint64_t refuse_every,
+                                    uint64_t peak_entries) {
+            l.gauges[static_cast<size_t>(Gauge::PersistentTargetEntryLimit)] = 256;
+            l.gauges[static_cast<size_t>(Gauge::PersistentTargetByteLimit)] = 4096ull << 20;
+            for (int f = 0; f < 30; ++f) {
+                if (refuse_every && f % refuse_every == 0) {
+                    l.rtt_destination_refusal_names[kCreation] = "destination-creation-refused";
+                    l.rtt_destination_refused_bytes[kCreation] += 14ull << 20;
+                    l.counters[static_cast<size_t>(Counter::RttDestinationRefusals)] += 1;
+                    l.counters[static_cast<size_t>(Counter::RttDestinationRefusedBytes)] += 14ull << 20;
+                }
+                l.exact_result_declines[dim] += 1;
+                l.exact_result_declines[accepted] += 2;
+                l.counters[static_cast<size_t>(Counter::ExactResultCandidates)] += 3;
+                std::atomic<uint64_t>& peak = l.peaks[static_cast<size_t>(Peak::PersistentTargetEntries)];
+                if (peak.load() < peak_entries) peak.store(peak_entries);
+                t += flip_ns + 1;
+                auto fired_now = engine.on_flip(t, l, 30, &ext);
+                if (!fired_now.empty() || f == 29) out = std::move(fired_now);
+            }
+        };
+        run_window(w1, 2, 300);   // 15 x 14 MiB over 30 flips = 7 MiB/flip
+        run_window(w2, 2, 300);
+        run_window(w3, 0, 100);   // quiet, and the peak must have reset to this window's
+        std::rewind(log);
+        engine.write_summary(log);
+    }
+    std::fflush(log);
+    check("window 1 holds rtt-destination-refused but is not reported (sustain 2)", w1.empty());
+    check("window 2 reports rtt-destination-refused at the WINDOW's 7 MiB/flip, not the residue",
+          fired(w2, "rtt-destination-refused") && w2[0].value > 6.9 && w2[0].value < 7.1);
+    check("window 3 (no refusals) is quiet", w3.empty());
+    const std::string j = slurp(jsonl);
+    check("every JSONL window carries the refusal MiB by reason",
+          count_of(j, "\"rtt_destination_refused_mib_by_reason\":{") == 3 &&
+              j.find("\"rtt_destination_refused_mib_by_reason\":{\"destination-creation-refused\":210}") !=
+                  std::string::npos);
+    check("...the colour-target peaks per window, reset between windows (300 then 100, never the "
+          "999 boot residue)",
+          count_of(j, "\"persistent_target_peak_entries\":300,") == 2 &&
+              count_of(j, "\"persistent_target_peak_entries\":100,") == 1 &&
+              j.find("\"persistent_target_peak_entries\":999") == std::string::npos &&
+              count_of(j, "\"persistent_target_entry_limit\":256,") == 3);
+    check("...and the window's exact-result verdicts",
+          count_of(j, "\"exact_result_verdicts\":{\"accepted\":60,\"img-dim\":30}") == 3 &&
+              count_of(j, "\"exact_result_candidates\":90,") == 3);
+    const std::string summary = slurp(logp);
+    check("the exit summary prints the run's exact-result census and refusals (incl. residue)",
+          summary.find("first failing field: accepted:180,img-dim:97; destination refusals of "
+                       "accepted results (MiB): destination-creation-refused:9636") !=
+              std::string::npos);
+    std::fclose(log);
+    std::remove(jsonl.c_str());
+    std::remove(logp.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -1333,10 +1570,15 @@ int main() {
     test_engine_breakdowns();
     test_engine_host_copy_per_flip();
     test_engine_host_copy_alternating();
+    test_rtt_destination_refused();
+    test_color_target_count_ceiling();
+    test_exact_result_census();
+    test_engine_2026_09_29_censuses();
     check("rule_names lists the six phase-2 rules, the three added with phase 3, "
           "gpu-memory-off-device (#3897), the six 2026-09-28 queue rules and the two "
-          "2026-09-29 ones (host-copy-per-flip, present-slot-trouble)",
-          rule_names().size() == 18);
+          "2026-09-29 ones (host-copy-per-flip, present-slot-trouble, rtt-destination-refused, "
+          "color-target-count-ceiling)",
+          rule_names().size() == 20);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ok", g_failures);
     return g_failures ? 1 : 0;
 }

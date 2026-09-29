@@ -11268,21 +11268,39 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // The whole, exact, single-level 2D result of this dispatch for one guest address: the
         // shape proof both the renderer destination mirror and the GPU-present scanout mirror
         // (#3915) need before a staging result may stand in for the guest bytes.
-        const auto exact_full_result = [&](size_t i) {
+        //
+        // A guest-backed storage-writeback result is a CANDIDATE; exact_result_verdict names the
+        // first field that disqualifies it (in the order tested), or Accepted. Anything else is not
+        // a candidate at all (std::nullopt), so the perf census counts results, not every binding.
+        using ExactResultDecline = prosper::diagnostics::perf::ExactResultDecline;
+        const auto exact_result_verdict = [&](size_t i) -> std::optional<ExactResultDecline> {
             const BoundImage& bi = images[i];
             const ShaderResource* r = bi.resource;
-            return r && r->gpu_addr && !r->host_data &&
-                bi.storage_writeback &&
-                bi.alias_of == SIZE_MAX && bi.exact_storage_bytes() &&
-                !bi.storage_write_mask && !bi.mirror_result_to_imported &&
-                !bi.prior_output_conflict && !bi.final_output_conflict &&
-                (r->img_dim == 1 ||
-                 (r->img_dim == 5 && !one_layer_array_destination_disabled)) &&
-                r->depth == 1 && bi.array_layers == 1 &&
-                bi.texel_depth == 1 && bi.mip_levels == 1 && r->sample_count == 1 &&
-                !r->in_mip_tail && !r->mip_chain_base_level && !r->layer_mip_offset_bytes &&
-                !r->linear_row_pitch_bytes && !r->layer_stride_bytes &&
-                r->width && r->height && staging[i];
+            if (!r || !r->gpu_addr || r->host_data || !bi.storage_writeback) return std::nullopt;
+            if (bi.alias_of != SIZE_MAX) return ExactResultDecline::AliasedBinding;
+            if (!bi.exact_storage_bytes()) return ExactResultDecline::InexactStorageBytes;
+            if (bi.storage_write_mask) return ExactResultDecline::PartialWriteMask;
+            if (bi.mirror_result_to_imported) return ExactResultDecline::MirrorToImported;
+            if (bi.prior_output_conflict) return ExactResultDecline::PriorOutputConflict;
+            if (bi.final_output_conflict) return ExactResultDecline::FinalOutputConflict;
+            if (!(r->img_dim == 1 || (r->img_dim == 5 && !one_layer_array_destination_disabled)))
+                return ExactResultDecline::ImageDim;
+            if (r->depth != 1) return ExactResultDecline::Depth;
+            if (bi.array_layers != 1) return ExactResultDecline::ArrayLayers;
+            if (bi.texel_depth != 1) return ExactResultDecline::TexelDepth;
+            if (bi.mip_levels != 1) return ExactResultDecline::MipLevels;
+            if (r->sample_count != 1) return ExactResultDecline::Samples;
+            if (r->in_mip_tail) return ExactResultDecline::MipTail;
+            if (r->mip_chain_base_level) return ExactResultDecline::MipBaseLevel;
+            if (r->layer_mip_offset_bytes) return ExactResultDecline::LayerMipOffset;
+            if (r->linear_row_pitch_bytes) return ExactResultDecline::LinearPitch;
+            if (r->layer_stride_bytes) return ExactResultDecline::LayerStride;
+            if (!r->width || !r->height) return ExactResultDecline::ZeroExtent;
+            if (!staging[i]) return ExactResultDecline::NoStaging;
+            return ExactResultDecline::Accepted;
+        };
+        const auto exact_full_result = [&](size_t i) {
+            return exact_result_verdict(i) == ExactResultDecline::Accepted;
         };
         if (!destination_mirror_disabled) for (size_t i = 0; i < images.size(); ++i) {
             BoundImage& bi = images[i];
@@ -11290,7 +11308,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const bool trace_destination = r &&
                 std::find(destination_trace_targets.begin(), destination_trace_targets.end(),
                           r->gpu_addr) != destination_trace_targets.end();
-            const bool basic_candidate = exact_full_result(i);
+            const std::optional<ExactResultDecline> verdict = exact_result_verdict(i);
+            const bool basic_candidate = verdict == ExactResultDecline::Accepted;
+            // Shape declines are counted here; the post-shape ones below count their own reason,
+            // and a result that reaches the borrow counts Accepted there.
+            if (verdict && !basic_candidate) prosper::diagnostics::perf::note_exact_result(*verdict);
             if (trace_destination)
                 std::fprintf(stderr,
                     "[compute-dest-target] code=0x%llx submit=%llu dispatch=%llu binding=%u "
@@ -11332,21 +11354,33 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     (unsigned long long)r->linear_row_pitch_bytes,
                     (unsigned long long)r->layer_stride_bytes);
             if (!basic_candidate) continue;
+            const auto decline = [](ExactResultDecline why) {
+                prosper::diagnostics::perf::note_exact_result(why);
+            };
             const auto format = storage_target_format(*r);
-            if (!format) continue;
+            if (!format) { decline(ExactResultDecline::FormatUnmapped); continue; }
             // A GPU-authoritative result must remain readable by the next partial writer.
             // Only these exact formats currently have a renderer-image storage seed path.
             if (*format != LiveTargetPixelFormat::Rgba8Unorm &&
                 *format != LiveTargetPixelFormat::Rgba16Float &&
-                *format != LiveTargetPixelFormat::R11G11B10Float) continue;
-            if (*format == LiveTargetPixelFormat::Rgba16Float &&
-                (!bi.native_float_storage || rgba16_compute_rtt_mirror_disabled)) continue;
-            if (*format == LiveTargetPixelFormat::R11G11B10Float &&
-                !bi.packed_r11_storage) continue;
+                *format != LiveTargetPixelFormat::R11G11B10Float) {
+                decline(ExactResultDecline::FormatNoSeedPath);
+                continue;
+            }
+            if ((*format == LiveTargetPixelFormat::Rgba16Float &&
+                 (!bi.native_float_storage || rgba16_compute_rtt_mirror_disabled)) ||
+                (*format == LiveTargetPixelFormat::R11G11B10Float && !bi.packed_r11_storage)) {
+                decline(ExactResultDecline::FormatNotNative);
+                continue;
+            }
             const size_t texel_bytes = live_target_pixel_format_bytes(*format);
             const uint64_t texels = static_cast<uint64_t>(r->width) * r->height;
             if (!texel_bytes || texels > SIZE_MAX / texel_bytes ||
-                static_cast<size_t>(texels * texel_bytes) != staging_bytes[i]) continue;
+                static_cast<size_t>(texels * texel_bytes) != staging_bytes[i]) {
+                decline(ExactResultDecline::StagingSizeMismatch);
+                continue;
+            }
+            decline(ExactResultDecline::Accepted);
             RttDestinationCensus& mirror_census = rtt_destination_census();
             const uint64_t candidates = mirror_census.candidates.add();
             if (perf_capture_timing && candidates % 16 == 0) {
@@ -11377,6 +11411,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 // anything was recorded, so 8,268 of 11,621 candidates on one title vanished
                 // between "candidate" and "borrowed" with no reason and no count.
                 destination_refusal_census().note(
+                    prosper::gpu::live_target_import_refusal_name(destination.refusal),
+                    static_cast<uint64_t>(staging_bytes[i]));
+                // ...and per alarm window, so rtt-destination-refused names the regime live
+                // rather than only in the exit line above (#3891).
+                static_assert(static_cast<size_t>(prosper::gpu::LiveTargetImageImport::Refusal::Count) <=
+                                  prosper::diagnostics::perf::kRttDestinationRefusalSlots,
+                              "every destination refusal needs its own perf ledger slot");
+                prosper::diagnostics::perf::note_rtt_destination_refusal(
+                    static_cast<size_t>(destination.refusal),
                     prosper::gpu::live_target_import_refusal_name(destination.refusal),
                     static_cast<uint64_t>(staging_bytes[i]));
                 continue;

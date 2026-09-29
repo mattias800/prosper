@@ -185,6 +185,32 @@ constexpr double kPresentSlotTroubleShare = 0.10;
 constexpr const char* kPresentSlotTroubleReasons[] = {"publish-failed", "compute-scanout-unwatched"};
 constexpr uint64_t kPresentSlotTroubleMinFlips = 20;
 
+// rtt-destination-refused: RATE per guest flip. Staging bytes of compute results whose renderer
+// image destination borrow was refused (live_compute's destination_refusal_census() note site), so
+// the result went back to the renderer through a CPU snapshot and its consumers re-materialized it
+// from guest bytes. GTA V's heavy host-copy regime (#3873) is exactly this: one 2560x1440 RGBA8
+// result refused with destination-creation-refused on every other flip (12.4 GiB / 869 calls in
+// one run, ~7 MiB/flip), while the light regime refuses nothing; the reason was printed only at
+// exit. The threshold sits under half the heavy regime and far above the light regime's zero.
+constexpr double kRttDestinationRefusedMiBPerFlip = 4.0;
+// ...over enough flips for a per-frame mean (as host-copy-per-flip).
+constexpr uint64_t kRttDestinationRefusedMinFlips = 10;
+
+// color-target-count-ceiling: STATE. The persistent colour-target cache peaked at its ENTRY-count
+// bound in the window while its BYTE budget stayed under half used, AND the bound cost something:
+// it kept evicting (each eviction a readback through the CPU sink, then a re-creation), or a
+// compute destination creation was refused (compute creation never evicts, so a full cache latches
+// that result onto the CPU path). The count, not memory, is what binds. GTA V (#3873): `PEAK
+// residency 320 of 256 entries` at 27-29% of the 4 GiB budget in every run. Measured 2026-09-29 with
+// this rule's JSONL: through gameplay the cache sits at EXACTLY 256 entries with ZERO evictions
+// in every window -- the graphics working set is steady -- while every flip refuses one 14 MiB
+// compute result (destination-creation-refused). So eviction churn alone, as first proposed, would
+// have missed the costly state; evictions are the load-time form (up to 392 per window).
+constexpr double kColorTargetCeilingByteShare = 0.5;
+constexpr double kColorTargetCeilingEvictionsPerSecond = 2.0;   // > 10 per 5 s window
+// The destination refusal name (live_target_import_refusal_name) that means "no room".
+constexpr const char* kDestinationCreationRefused = "destination-creation-refused";
+
 // SUSTAIN: consecutive windows a rule's condition must hold before the engine reports it. A cost
 // that lasts one window is usually a load, and a steady-state alarm should not fire on it; a
 // correctness alarm fires on the first window.
@@ -223,12 +249,20 @@ struct WindowSample {
     uint64_t transfer_bytes[kTransferCount] = {};
     // ...and the note_transfer calls that carried them, for bytes per call.
     uint64_t transfer_calls[kTransferCount] = {};
+    // Per-window high-water marks (Ledger::peaks).
+    uint64_t peaks[kPeakCount] = {};
+    // Per-reason breakdown of RttDestinationRefusedBytes, and each slot's name.
+    uint64_t rtt_destination_refused_bytes[kRttDestinationRefusalSlots] = {};
+    const char* rtt_destination_refusal_names[kRttDestinationRefusalSlots] = {};
+    // Verdicts of the exact full-overwrite shape test (ExactResultDecline), one per tested result.
+    uint64_t exact_result_declines[kExactResultDeclineCount] = {};
 
     double budget_ms() const { return target_hz ? 1000.0 / target_hz : 1000.0 / 60.0; }
     double ms(Cost c) const { return cost_ns[static_cast<size_t>(c)] / 1e6; }
     uint64_t events(Cost c) const { return cost_events[static_cast<size_t>(c)]; }
     uint64_t count(Counter c) const { return counters[static_cast<size_t>(c)]; }
     uint64_t gauge(Gauge g) const { return gauges[static_cast<size_t>(g)]; }
+    uint64_t peak(Peak p) const { return peaks[static_cast<size_t>(p)]; }
     // A category's time per guest flip, as a fraction of the title's frame budget.
     double budget_share(Cost c) const {
         return flips ? ms(c) / static_cast<double>(flips) / budget_ms() : 0.0;
@@ -262,6 +296,10 @@ struct RuleThresholds {
     double present_fallback_min_per_s = kPresentFallbackMinPerSecond;
     double pipeline_cache_evictions_per_s = kPipelineCacheEvictionsPerSecond;
     double texture_validation_failed_mib_per_s = kTextureValidationFailedMiBPerSecond;
+    double rtt_destination_refused_mib_per_flip = kRttDestinationRefusedMiBPerFlip;
+    uint64_t rtt_destination_refused_min_flips = kRttDestinationRefusedMinFlips;
+    double color_target_ceiling_byte_share = kColorTargetCeilingByteShare;
+    double color_target_ceiling_evictions_per_s = kColorTargetCeilingEvictionsPerSecond;
 
     static RuleThresholds scaled(double percent);
 };
@@ -310,6 +348,10 @@ bool host_copy_per_flip_holds(const WindowSample& w, const RuleThresholds& t);
 void apply_reporting_deferrals(std::vector<AlarmFiring>& reported);
 // The window's `publish-failed` + `compute-scanout-unwatched` GPU-present declines.
 uint64_t present_slot_trouble_declines(const WindowSample& w);
+// The window's rtt-destination-refused breakdown in whole MiB per refusal reason, largest first.
+std::vector<std::pair<const char*, uint64_t>> rtt_destination_refused_mib(const WindowSample& w);
+// The window's refused bytes whose reason is kDestinationCreationRefused.
+uint64_t destination_creation_refused_bytes(const WindowSample& w);
 
 std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresholds& t);
 
