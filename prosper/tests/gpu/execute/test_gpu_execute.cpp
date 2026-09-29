@@ -1657,6 +1657,15 @@ int main() {
             [](const ComputeAuthorityBoundary& boundary) {
                 return boundary.kind == ComputeAuthorityBoundaryKind::Compute;
             });
+        const bool backendless_zero_argument_read =
+            backendless_boundaries.size() == 3 &&
+            backendless_boundaries[1].kind ==
+                ComputeAuthorityBoundaryKind::IndirectArgumentRead &&
+            backendless_boundaries[1].range_known &&
+            backendless_boundaries[1].address ==
+                reinterpret_cast<uint64_t>(zero_indirect_args) &&
+            backendless_boundaries[1].bytes == sizeof(zero_indirect_args) &&
+            backendless_boundaries[1].command_order == indirect_zero.command_order;
         zero_indirect_args[0] = 1;
         backendless_boundaries.clear();
         const bool backendless_one_executed =
@@ -1667,12 +1676,49 @@ int main() {
             [](const ComputeAuthorityBoundary& boundary) {
                 return boundary.kind == ComputeAuthorityBoundaryKind::Compute;
             });
+        const bool backendless_one_argument_read =
+            backendless_boundaries.size() == 4 &&
+            backendless_boundaries[1].kind ==
+                ComputeAuthorityBoundaryKind::IndirectArgumentRead &&
+            backendless_boundaries[1].range_known &&
+            backendless_boundaries[1].address ==
+                reinterpret_cast<uint64_t>(zero_indirect_args) &&
+            backendless_boundaries[1].bytes == sizeof(zero_indirect_args) &&
+            backendless_boundaries[2].kind == ComputeAuthorityBoundaryKind::Compute;
+
+        // The boundary must precede the actual CPU memcpy, not merely precede the later
+        // classification event. Turn a no-op into a ready dispatch inside the observer; with no
+        // backend, only the newly read value can produce the unknown Compute boundary.
+        zero_indirect_args[0] = 0;
+        backendless_boundaries.clear();
+        bool argument_observer_changed_bytes = false;
+        set_compute_authority_boundary_observer(
+            [&](const ComputeAuthorityBoundary& boundary) {
+                backendless_boundaries.push_back(boundary);
+                if (boundary.kind == ComputeAuthorityBoundaryKind::IndirectArgumentRead &&
+                    boundary.address == reinterpret_cast<uint64_t>(zero_indirect_args) &&
+                    boundary.bytes == sizeof(zero_indirect_args)) {
+                    zero_indirect_args[0] = 1;
+                    argument_observer_changed_bytes = true;
+                }
+            });
+        const bool observer_mutation_executed =
+            execute_ordered_and_present(
+                backendless_indirect, W, H, 1440, /*publish=*/false);
+        const bool observer_mutation_changed_resolution =
+            backendless_boundaries.size() == 4 &&
+            backendless_boundaries[1].kind ==
+                ComputeAuthorityBoundaryKind::IndirectArgumentRead &&
+            backendless_boundaries[2].kind == ComputeAuthorityBoundaryKind::Compute;
         set_compute_authority_boundary_observer({});
         set_submit_renderer({});
         zero_indirect_args[0] = 0;
         CHECK(!backendless_zero_executed && !backendless_zero_unknown &&
-                  !backendless_one_executed && backendless_one_unknown,
-              "indirect no-op classification precedes the compute-backend requirement");
+                  backendless_zero_argument_read &&
+                  !backendless_one_executed && backendless_one_unknown &&
+                  backendless_one_argument_read && !observer_mutation_executed &&
+                  argument_observer_changed_bytes && observer_mutation_changed_resolution,
+              "indirect CPU argument read precedes the actual memcpy and backend classification");
 
         // #3891 skipped-dispatches: each documented exclusion, with the positive control that
         // shows the same submit IS counted once the excluded condition is removed.
@@ -1847,28 +1893,42 @@ int main() {
                       std::vector<uint32_t>(std::begin(kNoopCs), std::end(kNoopCs)) &&
                   !captured.expected_output_valid,
               "ordered capture omits an indirect no-op and retains its nonzero mutation");
-        CHECK(nonrender_authority_boundaries.size() == 5 &&
+        CHECK(nonrender_authority_boundaries.size() == 7 &&
                   nonrender_authority_boundaries[0].kind ==
                       ComputeAuthorityBoundaryKind::SubmitBegin &&
                   nonrender_authority_boundaries[0].submit_no == 1441 &&
                   nonrender_authority_boundaries[1].kind ==
-                      ComputeAuthorityBoundaryKind::OrderedMemoryEffect &&
+                      ComputeAuthorityBoundaryKind::IndirectArgumentRead &&
                   nonrender_authority_boundaries[1].range_known &&
                   nonrender_authority_boundaries[1].address ==
                       reinterpret_cast<uint64_t>(zero_indirect_args) &&
-                  nonrender_authority_boundaries[1].bytes == sizeof(uint32_t) &&
-                  nonrender_authority_boundaries[1].command_order == 18 &&
-                  zero_indirect_args[0] == authority_effect_value &&
+                  nonrender_authority_boundaries[1].bytes == sizeof(zero_indirect_args) &&
+                  nonrender_authority_boundaries[1].command_order ==
+                      captured_zero_dispatch.command_order &&
                   nonrender_authority_boundaries[2].kind ==
-                      ComputeAuthorityBoundaryKind::Compute &&
-                  !nonrender_authority_boundaries[2].range_known &&
-                  nonrender_authority_boundaries[2].command_order ==
-                      unresolved_dispatch.command_order &&
+                      ComputeAuthorityBoundaryKind::OrderedMemoryEffect &&
+                  nonrender_authority_boundaries[2].range_known &&
+                  nonrender_authority_boundaries[2].address ==
+                      reinterpret_cast<uint64_t>(zero_indirect_args) &&
+                  nonrender_authority_boundaries[2].bytes == sizeof(uint32_t) &&
+                  nonrender_authority_boundaries[2].command_order == 18 &&
+                  zero_indirect_args[0] == authority_effect_value &&
                   nonrender_authority_boundaries[3].kind ==
-                      ComputeAuthorityBoundaryKind::Capture &&
+                      ComputeAuthorityBoundaryKind::IndirectArgumentRead &&
+                  nonrender_authority_boundaries[3].address ==
+                      reinterpret_cast<uint64_t>(zero_indirect_args) &&
+                  nonrender_authority_boundaries[3].command_order ==
+                      captured_one_dispatch.command_order &&
                   nonrender_authority_boundaries[4].kind ==
+                      ComputeAuthorityBoundaryKind::Compute &&
+                  !nonrender_authority_boundaries[4].range_known &&
+                  nonrender_authority_boundaries[4].command_order ==
+                      unresolved_dispatch.command_order &&
+                  nonrender_authority_boundaries[5].kind ==
+                      ComputeAuthorityBoundaryKind::Capture &&
+                  nonrender_authority_boundaries[6].kind ==
                       ComputeAuthorityBoundaryKind::SubmitEnd,
-              "non-render authority hook fail-closes unrealized compute before capture and end");
+              "ordered authority records actual indirect CPU reads, then fail-closes unreadable args");
         zero_indirect_args[0] = 0;
         std::filesystem::remove(path, filesystem_error);
 

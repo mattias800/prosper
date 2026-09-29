@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 #include <limits>
 
 using namespace prosper::frontend;
@@ -478,7 +479,7 @@ int main() {
     live.begin_submit(41);
     const auto wrong_program = live.observe_program(0xee8584cf839a5b44ull);
     const auto producer = live.observe_program(0x45e5d145e1a35af9ull);
-    const auto selected_output = live.record_selected_storage_output(atlas, true);
+    const auto selected_output = live.record_selected_storage_output(60, atlas, true);
     const auto gpu_consumer = live.observe(
         ShadowComputeAuthorityConsumerKind::ProvenGpuImage, atlas);
     const auto capture_boundary = live.observe(
@@ -501,10 +502,56 @@ int main() {
               live.counters().pending_after_submit_end == 0 && live.summary_valid(),
           "live exact-hash chain closes at capture and ends with zero pending authority");
 
+    const ComputeAuthorityLiveSelector binding_selector =
+        parse_compute_authority_live_selector("0x45e5d145e1a35af9", "60");
+    ComputeAuthorityLiveCensus selected_binding(binding_selector);
+    selected_binding.begin_submit(410);
+    (void)selected_binding.observe_program(binding_selector.producer_hash);
+    const auto earlier_sibling = selected_binding.record_selected_storage_output(
+        61, unrelated, true);
+    const auto selected_binding_output = selected_binding.record_selected_storage_output(
+        60, atlas, true);
+    const auto later_sibling = selected_binding.record_selected_storage_output(
+        61, unrelated, true);
+    const auto argument_read = selected_binding.observe(
+        ShadowComputeAuthorityConsumerKind::RawBuffer, atlas_tail);
+    (void)selected_binding.end_submit();
+    CHECK(binding_selector.valid && binding_selector.binding_requested &&
+              binding_selector.binding == 60 &&
+              earlier_sibling.action == ShadowComputeAuthorityAction::NoPendingResult &&
+              selected_binding_output.action ==
+                  ShadowComputeAuthorityAction::TrackPendingResult &&
+              later_sibling.action == ShadowComputeAuthorityAction::KeepGpuAuthority &&
+              argument_read.action ==
+                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              argument_read.reason ==
+                  ShadowComputeAuthorityReason::OverlappingRawBufferConsumer &&
+              selected_binding.counters().selected_storage_outputs == 1 &&
+              selected_binding.counters().filtered_storage_outputs == 2 &&
+              selected_binding.counters().authority.unrelated_keeps == 1 &&
+              selected_binding.counters().authority.raw_buffer_materializations == 1 &&
+              selected_binding.summary_valid(),
+          "exact binding isolates one output while sibling writes and CPU reads stay visible");
+
+    ComputeAuthorityLiveCensus overlapping_sibling(binding_selector);
+    overlapping_sibling.begin_submit(411);
+    (void)overlapping_sibling.observe_program(binding_selector.producer_hash);
+    (void)overlapping_sibling.record_selected_storage_output(60, atlas, true);
+    const auto sibling_overwrite = overlapping_sibling.record_selected_storage_output(
+        61, atlas_tail, true);
+    (void)overlapping_sibling.end_submit();
+    CHECK(sibling_overwrite.action ==
+                  ShadowComputeAuthorityAction::MaterializeGuestMirror &&
+              sibling_overwrite.reason ==
+                  ShadowComputeAuthorityReason::OverlappingOrderedMemoryEffectConsumer &&
+              overlapping_sibling.counters().authority.ordered_memory_effect_materializations == 1 &&
+              overlapping_sibling.summary_valid(),
+          "an overlapping sibling output cannot silently retain selected GPU authority");
+
     ComputeAuthorityLiveCensus ordered(selector);
     ordered.begin_submit(42);
     (void)ordered.observe_program(selector.producer_hash);
-    (void)ordered.record_selected_storage_output(atlas, true);
+    (void)ordered.record_selected_storage_output(60, atlas, true);
     const auto disjoint_dma_source = ordered.observe(
         ShadowComputeAuthorityConsumerKind::Dma, unrelated);
     const auto overlapping_dma_destination = ordered.observe(
@@ -526,7 +573,7 @@ int main() {
     ComputeAuthorityLiveCensus submit_only(selector);
     submit_only.begin_submit(420);
     (void)submit_only.observe_program(selector.producer_hash);
-    (void)submit_only.record_selected_storage_output(atlas, true);
+    (void)submit_only.record_selected_storage_output(60, atlas, true);
     const auto mandatory_submit_end = submit_only.end_submit();
     CHECK(mandatory_submit_end.action ==
                   ShadowComputeAuthorityAction::MaterializeGuestMirror &&
@@ -541,7 +588,7 @@ int main() {
     ComputeAuthorityLiveCensus unknown_draw(selector);
     unknown_draw.begin_submit(43);
     (void)unknown_draw.observe_program(selector.producer_hash);
-    (void)unknown_draw.record_selected_storage_output(atlas, true);
+    (void)unknown_draw.record_selected_storage_output(60, atlas, true);
     const auto draw_boundary = unknown_draw.observe(
         ShadowComputeAuthorityConsumerKind::Draw);
     (void)unknown_draw.end_submit();
@@ -556,9 +603,9 @@ int main() {
     ComputeAuthorityLiveCensus sync_output(selector);
     sync_output.begin_submit(44);
     (void)sync_output.observe_program(selector.producer_hash);
-    (void)sync_output.record_selected_storage_output(atlas, true);
+    (void)sync_output.record_selected_storage_output(60, atlas, true);
     const auto synchronous_replacement =
-        sync_output.record_selected_storage_output(atlas_tail, false);
+        sync_output.record_selected_storage_output(60, atlas_tail, false);
     (void)sync_output.end_submit();
     CHECK(synchronous_replacement.action ==
                   ShadowComputeAuthorityAction::MaterializeGuestMirror &&
@@ -595,10 +642,38 @@ int main() {
     CHECK(!invalid_selector.summary_valid(),
           "an invalid live selector cannot produce a valid census verdict");
 
+    for (const char* invalid_binding : {"60oops", "4294967296", "-60", ""}) {
+        const auto rejected = parse_compute_authority_live_selector(
+            "0x45e5d145e1a35af9", invalid_binding);
+        ComputeAuthorityLiveCensus invalid_filter(rejected);
+        invalid_filter.begin_submit(461);
+        const auto observation = invalid_filter.observe_program(selector.producer_hash);
+        (void)invalid_filter.end_submit();
+        CHECK(rejected.requested && !rejected.valid && !observation.selected &&
+                  !invalid_filter.summary_valid(),
+              "malformed binding selector fails closed instead of widening the census");
+    }
+    const auto missing_hash = parse_compute_authority_live_selector(nullptr, "60");
+    CHECK(missing_hash.requested && !missing_hash.valid,
+          "binding without a producer hash fails closed");
+
+    const auto absent_binding_selector = parse_compute_authority_live_selector(
+        "0x45e5d145e1a35af9", "62");
+    ComputeAuthorityLiveCensus absent_binding(absent_binding_selector);
+    absent_binding.begin_submit(462);
+    (void)absent_binding.observe_program(selector.producer_hash);
+    (void)absent_binding.record_selected_storage_output(60, atlas, true);
+    (void)absent_binding.end_submit();
+    CHECK(absent_binding.counters().programs_matched == 1 &&
+              absent_binding.counters().selected_storage_outputs == 0 &&
+              absent_binding.counters().filtered_storage_outputs == 1 &&
+              !absent_binding.summary_valid(),
+          "a valid binding selector with no matching output is an invalid measurement");
+
     ComputeAuthorityLiveCensus interrupted(selector);
     interrupted.begin_submit(47);
     (void)interrupted.observe_program(selector.producer_hash);
-    (void)interrupted.record_selected_storage_output(atlas, true);
+    (void)interrupted.record_selected_storage_output(60, atlas, true);
     interrupted.begin_submit(48);
     (void)interrupted.end_submit();
     CHECK(interrupted.counters().interrupted_submits == 1 &&

@@ -10094,7 +10094,7 @@ bool resolve_indirect_draw_arguments(const GpuState& submit, const GpuState::Dra
         resolved.indirect_vertex_offset = static_cast<int32_t>(first_vertex);
         resolved.has_vertex_offset_override = true;
         resolved.indirect = false;
-        if (std::getenv("PROSPER_INDIRECTLOG")) {
+        if (PROSPER_ENV_ON("PROSPER_INDIRECTLOG")) {
             static std::atomic<int> logged{0};
             if (logged.fetch_add(1) < 256)
                 std::fprintf(stderr,
@@ -10147,7 +10147,7 @@ bool resolve_indirect_draw_arguments(const GpuState& submit, const GpuState::Dra
     resolved.indirect_vertex_offset = vertex_offset;
     resolved.has_vertex_offset_override = true;
     resolved.indirect = false;
-    if (std::getenv("PROSPER_INDIRECTLOG")) {
+    if (PROSPER_ENV_ON("PROSPER_INDIRECTLOG")) {
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1) < 256)
             std::fprintf(stderr,
@@ -10182,7 +10182,7 @@ struct IndirectDispatchCensus {
     std::atomic<uint64_t> direct_noop{0};
     ~IndirectDispatchCensus() {
         const uint64_t seen = total.load(std::memory_order_relaxed);
-        if (!seen || !std::getenv("PROSPER_INDIRECTLOG")) return;
+        if (!seen || !PROSPER_ENV_ON("PROSPER_INDIRECTLOG")) return;
         std::fprintf(stderr,
                      "[agc-indirect-census] indirect dispatches=%llu ready=%llu zero-args=%llu "
                      "zero-groups=%llu unreadable=%llu (direct no-ops=%llu)\n",
@@ -10199,7 +10199,8 @@ IndirectDispatchCensus& indirect_dispatch_census() {
 }
 
 DispatchArgumentResolution resolve_indirect_dispatch_arguments(
-        const GpuState::Dispatch& source, GpuState::Dispatch& resolved) {
+        const GpuState::Dispatch& source, GpuState::Dispatch& resolved,
+        uint64_t submit_no, uint64_t command_order) {
     resolved = source;
     if (!source.indirect) {
         const bool noop = direct_compute_dispatch_is_noop(source);
@@ -10218,10 +10219,15 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
         census.unreadable.fetch_add(1, std::memory_order_relaxed);
         return DispatchArgumentResolution::Invalid;
     }
+    // The exact CPU visibility boundary is after validation and before the memcpy. An invalid
+    // pointer never becomes a falsely observed read; its caller still emits Unknown on refusal.
+    notify_compute_authority_range(
+        ComputeAuthorityBoundaryKind::IndirectArgumentRead,
+        submit_no, command_order, source.indirect_args_addr, kArgumentBytes);
     uint32_t args[3] = {};
     std::memcpy(args, reinterpret_cast<const void*>(source.indirect_args_addr), sizeof(args));
     const auto log_resolution = [&](const char* outcome, const ComputeLaunchDimensions* launch) {
-        if (!std::getenv("PROSPER_INDIRECTLOG")) return;
+        if (!PROSPER_ENV_ON("PROSPER_INDIRECTLOG")) return;
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1) >= 256) return;
         const uint64_t code_addr = source.state
@@ -11324,7 +11330,8 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 GpuState::Dispatch resolved_dispatch;
                 const DispatchArgumentResolution argument_resolution =
                     resolve_indirect_dispatch_arguments(
-                        st.dispatches[operation.index], resolved_dispatch);
+                        st.dispatches[operation.index], resolved_dispatch,
+                        submit_no, operation.command_order);
                 if (argument_resolution == DispatchArgumentResolution::Noop) {
                     // Argument memory is readable and proves that no wave launches. This is neutral
                     // even when no compute backend is installed: there is no producer to execute.
