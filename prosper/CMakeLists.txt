@@ -4452,6 +4452,12 @@ endif()
 if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
   # A compute full-overwrite destination at the colour-target COUNT bound evicts under the graphics
   # admission predicate instead of refusing (#3873).
+  # BackendSubmissionBatch's timestamp envelope reuses one query pool across batches (#3948).
+  add_executable(test_backend_timestamp_pool tests/gpu/state/test_backend_timestamp_pool.cpp)
+  target_include_directories(test_backend_timestamp_pool PRIVATE tests frontends)
+  target_link_libraries(test_backend_timestamp_pool PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME backend_timestamp_pool COMMAND test_backend_timestamp_pool)
+  set_tests_properties(backend_timestamp_pool PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(test_compute_overwrite_eviction tests/gpu/state/test_compute_overwrite_eviction.cpp)
   target_include_directories(test_compute_overwrite_eviction PRIVATE tests frontends)
   target_link_libraries(test_compute_overwrite_eviction PRIVATE prosper_core Vulkan::Vulkan)

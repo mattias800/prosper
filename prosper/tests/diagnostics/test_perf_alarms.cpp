@@ -1108,10 +1108,10 @@ void test_engine() {
     const std::string quiet = slurp(logp);
     check("...saying no rule fired", quiet.find("no rule fired in 1 windows") != std::string::npos);
     check("...and listing the rules that had no data as NOT quiet",
-          quiet.find("15 of 20 rules had data") != std::string::npos &&
+          quiet.find("15 of 21 rules had data") != std::string::npos &&
               quiet.find("NO DATA (not measured in any window, so not quiet): "
                          "texture-reference-cost,present-cpu-overhead,present-path-fallback,"
-                         "present-slot-trouble,color-target-count-ceiling") != std::string::npos);
+                         "present-slot-trouble,color-target-count-ceiling,gpu-sync-wait") != std::string::npos);
     std::fclose(s);
     std::remove(jsonl.c_str());
     std::remove(logp.c_str());
@@ -1538,6 +1538,52 @@ void test_engine_2026_09_29_censuses() {
     std::remove(logp.c_str());
 }
 
+// gpu-sync-wait (#3948 stage 0): executor fence waits as a share of the budget, GPU headroom.
+WindowSample sync_wait_window(double compute_wait_ms, uint64_t dispatches, double graphics_wait_ms,
+                              uint64_t batches, double device_ms, uint64_t samples) {
+    WindowSample w = healthy();
+    w.flips = 46;
+    w.target_hz = 60;
+    set_cost(w, Cost::GpuWaitCompute, compute_wait_ms, dispatches, 1.0);
+    set_cost(w, Cost::GpuWaitGraphics, graphics_wait_ms, batches, 1.0);
+    set_count(w, Counter::GpuDeviceNsCompute, static_cast<uint64_t>(device_ms * 0.5 * 1e6));
+    set_count(w, Counter::GpuDeviceNsGraphics, static_cast<uint64_t>(device_ms * 0.5 * 1e6));
+    set_count(w, Counter::GpuDeviceSamplesCompute, samples / 2);
+    set_count(w, Counter::GpuDeviceSamplesGraphics, samples - samples / 2);
+    return w;
+}
+
+void test_gpu_sync_wait() {
+    std::puts("gpu-sync-wait");
+    // GTA V gameplay as measured: 1,059 ms of waits (513 + 546) over 46 flips at 60 Hz, 859 ms of
+    // device time inside, 3,729 of 4,005 waits sampled.
+    const auto a = evaluate_rules(sync_wait_window(513, 1520, 546, 2485, 859, 3729), kDefault);
+    check("GTA V gameplay (138% of the budget, GPU 17% busy) fires gpu-sync-wait alone",
+          only(a, "gpu-sync-wait"));
+    check("...value is %budget and the line names idle-in-wait and gpu-busy",
+          !a.empty() && a[0].value > 137 && a[0].value < 139 &&
+              a[0].detail.find("idle-in-wait=19%") != std::string::npos &&
+              a[0].detail.find("gpu-busy=17%") != std::string::npos);
+    check("its cost is the whole wait (what overlap could recover)",
+          !a.empty() && a[0].cost_ms > 1058 && a[0].cost_ms < 1060);
+    // 74% vs 75% of a 16.67 ms budget over 46 flips: 567.3 vs 575.0 ms of waits.
+    check("74% of the budget (Sonic's menus sit near 50%) is quiet",
+          evaluate_rules(sync_wait_window(284, 800, 283, 800, 300, 1600), kDefault).empty());
+    check("75% of the budget fires",
+          fired(evaluate_rules(sync_wait_window(288, 800, 288, 800, 300, 1600), kDefault),
+                "gpu-sync-wait"));
+    check("a GPU-saturated window (device time over half of wall) is quiet: overlap cannot help",
+          evaluate_rules(sync_wait_window(1500, 1500, 1500, 2500, 2600, 4000), kDefault).empty());
+    const WindowSample unsampled = sync_wait_window(513, 1520, 546, 2485, 0, 1000);
+    check("with device time on under half of the waits there is no data, and no firing",
+          !rule_has_data("gpu-sync-wait", unsampled) &&
+              evaluate_rules(unsampled, kDefault).empty());
+    WindowSample few = sync_wait_window(513, 1520, 546, 2485, 859, 3729);
+    few.flips = 9;
+    check("under the 10-flip floor there is no data", !rule_has_data("gpu-sync-wait", few));
+    check("its sustain is two windows", sustain_windows("gpu-sync-wait") == 2);
+}
+
 }  // namespace
 
 int main() {
@@ -1574,11 +1620,12 @@ int main() {
     test_color_target_count_ceiling();
     test_exact_result_census();
     test_engine_2026_09_29_censuses();
+    test_gpu_sync_wait();
     check("rule_names lists the six phase-2 rules, the three added with phase 3, "
           "gpu-memory-off-device (#3897), the six 2026-09-28 queue rules and the two "
           "2026-09-29 ones (host-copy-per-flip, present-slot-trouble, rtt-destination-refused, "
-          "color-target-count-ceiling)",
-          rule_names().size() == 20);
+          "color-target-count-ceiling) and gpu-sync-wait (#3948)",
+          rule_names().size() == 21);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ok", g_failures);
     return g_failures ? 1 : 0;
 }

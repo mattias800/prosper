@@ -236,3 +236,17 @@ FIRST failing field of the exact full-overwrite shape test (`ExactResultDecline`
 `exact_full_result`'s order), then the post-shape format declines, then `accepted`; the JSONL window
 carries it as `exact_result_verdicts`. `exact_full_result` is defined as "the verdict is accepted",
 so a new condition in the shape test is added to `exact_result_verdict` with a verdict of its own.
+
+**Synchronous GPU waits** (#3948 stage 0). `Cost::GpuWaitCompute` / `GpuWaitGraphics` are one clock
+pair around each executor fence wait (a compute dispatch's, a graphics submission batch's), and
+`Counter::GpuDevice*` carry the GPU time inside them from one timestamp pair per dispatch or batch,
+armed whenever the ledger is (per dispatch/batch, never per draw; the graphics envelope's query
+pools are reused through a free list, not created per batch). `gpu-sync-wait` fires when the waits
+exceed 75% of the frame budget per flip while prosper's own GPU work is under half of wall time:
+the cost asynchronous submission would recover. `gpu-busy` counts only the work prosper submitted,
+so a GPU saturated by something else reads as headroom, and wait minus device includes time queued
+behind other submissions on the shared queue (present blits), not only submission latency.
+**It deliberately fires on every GTA V and Sonic Frontiers gameplay window**: it is a standing
+signal of the synchronous architecture, not a defect of those runs, and the general rule that a
+rule firing on a healthy run gets tuned or removed does not apply to it until #3948's later stages
+land. Retune or retire it then; do not "fix" it before.

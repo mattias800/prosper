@@ -361,6 +361,15 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
         }
         std::fprintf(jsonl_, "},\"present_slot_trouble_declines\":%llu",
                      (unsigned long long)present_slot_trouble_declines(w));
+        // #3948 stage 0: executor fence waits and the GPU device time inside them.
+        std::fprintf(jsonl_, ",\"gpu_wait_compute_ms\":%.3f,\"gpu_wait_compute_n\":%llu,"
+                             "\"gpu_device_compute_ms\":%.3f,\"gpu_device_compute_n\":%llu,"
+                             "\"gpu_wait_graphics_ms\":%.3f,\"gpu_wait_graphics_n\":%llu,"
+                             "\"gpu_device_graphics_ms\":%.3f,\"gpu_device_graphics_n\":%llu",
+                     ms(Cost::GpuWaitCompute), ev(Cost::GpuWaitCompute),
+                     n(Counter::GpuDeviceNsCompute) / 1e6, n(Counter::GpuDeviceSamplesCompute),
+                     ms(Cost::GpuWaitGraphics), ev(Cost::GpuWaitGraphics),
+                     n(Counter::GpuDeviceNsGraphics) / 1e6, n(Counter::GpuDeviceSamplesGraphics));
         // 2026-09-29 queue: compute destination refusals (MiB by reason), the colour-target
         // cache's bounds and window peaks, and the exact full-overwrite shape census.
         std::fprintf(jsonl_, ",\"rtt_destination_refusals\":%llu,"

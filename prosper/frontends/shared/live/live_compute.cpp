@@ -612,6 +612,17 @@ thread_local double g_perf_compute_dispatch_wait_ms = 0.0;
 thread_local double g_perf_compute_writeback_ms = 0.0;
 thread_local double g_perf_compute_cleanup_ms = 0.0;
 
+// #3948 stage 0: one dispatch's GPU device time into the perf ledger. `raw_ticks` is end - start
+// before masking to the queue's valid timestamp bits.
+void note_ledger_compute_device_ticks(uint64_t raw_ticks, uint32_t valid_bits, float period_ns) {
+    if (!valid_bits || period_ns <= 0.0f) return;
+    const uint64_t mask = valid_bits >= 64 ? UINT64_MAX : ((uint64_t{1} << valid_bits) - 1u);
+    prosper::diagnostics::perf::add(
+        prosper::diagnostics::perf::Counter::GpuDeviceNsCompute,
+        static_cast<uint64_t>(static_cast<double>(raw_ticks & mask) * period_ns));
+    prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::GpuDeviceSamplesCompute);
+}
+
 VkFormat native_storage_vk_format(prosper::gpu::DataFormat format, uint32_t components) {
     using prosper::gpu::DataFormat;
     switch (format) {
@@ -11595,6 +11606,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // Never request results for unwritten queries.
         const bool perf_gpu_timing = perf_capture_timing && images.size() <= (UINT32_MAX - 6) / 4 &&
             ctx.prepare_dispatch_timestamps(6 + uint32_t(images.size()) * 4);
+        // #3948 stage 0: outside an F8 capture, one timestamp pair around the whole dispatch so the
+        // perf ledger can set the fence wait below against the GPU time inside it. Two writes and
+        // one small query read per dispatch; the F8 path's six brackets supersede it.
+        const bool ledger_gpu_timing = !perf_gpu_timing &&
+            prosper::diagnostics::perf::enabled() && ctx.prepare_dispatch_timestamps(2);
         uint32_t timestamp_count = 6;
         std::vector<std::pair<uint32_t, bool>> storage_timestamp_spans;
         const VkCommandBuffer command = ctx.command_buffer;
@@ -11611,6 +11627,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (perf_gpu_timing) {
             vkCmdResetQueryPool(command, ctx.dispatch_timestamp_pool, 0,
                                 6 + uint32_t(images.size()) * 4);
+            vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                ctx.dispatch_timestamp_pool, 0);
+        } else if (ledger_gpu_timing) {
+            vkCmdResetQueryPool(command, ctx.dispatch_timestamp_pool, 0, 2);
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                 ctx.dispatch_timestamp_pool, 0);
         }
@@ -12432,6 +12452,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (perf_gpu_timing)
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                 ctx.dispatch_timestamp_pool, 5);
+        else if (ledger_gpu_timing)
+            vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                ctx.dispatch_timestamp_pool, 1);
         if (!vk_ok(vkEndCommandBuffer(command), "command-end")) break;
         if (alias_census_enabled()) {
             // Storage buffers alias through guest memory exactly as images do, so a guard that
@@ -12536,8 +12559,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // microseconds — with the loss surfacing only at the NEXT submit. Duration is what separates
         // them: a killed job sits at roughly the kernel's timeout (~10 s), a real one is sub-millisecond.
         {
+            const auto fence_wait_end = ComputeClock::now();
             const double waited_ms = std::chrono::duration<double, std::milli>(
-                ComputeClock::now() - fence_wait_start).count();
+                fence_wait_end - fence_wait_start).count();
+            prosper::diagnostics::perf::add_cost(
+                prosper::diagnostics::perf::Cost::GpuWaitCompute,
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    fence_wait_end - fence_wait_start).count()));
             if (waited_ms >= 100.0) {
                 static std::atomic<int> slow{0};
                 const int n = slow.fetch_add(1);
@@ -12583,6 +12611,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             break;
         }
         completion_proven = true;
+        if (ledger_gpu_timing) {
+            uint64_t pair[2]{};
+            if (vkGetQueryPoolResults(ctx.device, ctx.dispatch_timestamp_pool, 0, 2, sizeof(pair),
+                                      pair, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+                note_ledger_compute_device_ticks(pair[1] - pair[0], ctx.timestamp_valid_bits,
+                                                 ctx.timestamp_period_ns);
+        }
         if (perf_gpu_timing) {
             std::vector<uint64_t> timestamps(timestamp_count);
             if (vkGetQueryPoolResults(ctx.device, ctx.dispatch_timestamp_pool, 0, timestamp_count,
@@ -12596,6 +12631,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     (retile ? g_perf_compute_gpu_retile_ms : g_perf_compute_gpu_image_transfer_ms) += ms;
                 }
                 const uint64_t device_ticks = (timestamps[5] - timestamps[0]) & mask;
+                note_ledger_compute_device_ticks(timestamps[5] - timestamps[0],
+                                                 ctx.timestamp_valid_bits, ctx.timestamp_period_ns);
                 const uint64_t shader_ticks = (timestamps[2] - timestamps[1]) & mask;
                 ++g_perf_compute_gpu_timestamp_samples;
                 g_perf_compute_gpu_device_ms +=

@@ -2644,6 +2644,55 @@ inline void discard_color_producer_completion(const ColorProducerCompletion& com
 // target producer/consumer dependencies; one fence on the final submission is enough to retain every
 // referenced object until the complete callback has finished. Direct test callers keep the established
 // synchronous behavior by omitting this object.
+// Two-query timestamp pools for BackendSubmissionBatch's envelope, reused across batches instead of
+// created and destroyed per batch (#3948 stage 0 arms the envelope on every default run, ~500
+// batches per second on GTA V). A pool is reset inside the command buffer that uses it
+// (vkCmdResetQueryPool), so a returned pool needs no host-side reset. Only pools whose batch
+// completed, or never reached the queue, come back; a batch with unproven completion leaks its
+// pool with the rest of its resources. Never destroyed: process-lifetime, like the render context.
+struct BackendTimestampPoolCache {
+    std::mutex mutex;
+    std::vector<std::pair<VkDevice, VkQueryPool>> free;
+    uint64_t created = 0;   // tests read this to prove reuse
+};
+inline BackendTimestampPoolCache& backend_timestamp_pool_cache() {
+    static BackendTimestampPoolCache* cache = new BackendTimestampPoolCache();
+    return *cache;
+}
+inline VkQueryPool acquire_backend_timestamp_pool(VkDevice dev) {
+    auto& cache = backend_timestamp_pool_cache();
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        for (auto it = cache.free.rbegin(); it != cache.free.rend(); ++it) {
+            if (it->first != dev) continue;
+            const VkQueryPool pool = it->second;
+            cache.free.erase(std::next(it).base());
+            return pool;
+        }
+    }
+    VkQueryPoolCreateInfo query_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    query_info.queryCount = 2;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    if (vkCreateQueryPool(dev, &query_info, nullptr, &pool) != VK_SUCCESS) return VK_NULL_HANDLE;
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    ++cache.created;
+    return pool;
+}
+inline void return_backend_timestamp_pool(VkDevice dev, VkQueryPool pool) {
+    if (!dev || !pool) return;
+    constexpr size_t kMaxFreePools = 16;   // batches are waited synchronously; a few suffice
+    auto& cache = backend_timestamp_pool_cache();
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.free.size() < kMaxFreePools) {
+            cache.free.emplace_back(dev, pool);
+            return;
+        }
+    }
+    vkDestroyQueryPool(dev, pool, nullptr);
+}
+
 class BackendSubmissionBatch {
 public:
     BackendSubmissionBatch() = default;
@@ -2674,12 +2723,8 @@ public:
         if (pending_resources_abandoned_ || !commands_.empty() || gpu_timestamp_.pool ||
             !dev || !command || period_ns <= 0.0 || !valid_bits)
             return;
-        VkQueryPoolCreateInfo query_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-        query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        query_info.queryCount = 2;
-        VkQueryPool pool = VK_NULL_HANDLE;
-        if (vkCreateQueryPool(dev, &query_info, nullptr, &pool) != VK_SUCCESS || !pool)
-            return;
+        const VkQueryPool pool = acquire_backend_timestamp_pool(dev);
+        if (!pool) return;
         gpu_timestamp_ = {dev, pool, period_ns, valid_bits, false};
         vkCmdResetQueryPool(command, pool, 0, 2);
         vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0);
@@ -2807,9 +2852,15 @@ public:
             std::fflush(stderr);
         }
         if (result.submit_result == VK_SUCCESS) {
+            const uint64_t wait_start_ns = prosper::diagnostics::perf::enabled()
+                ? prosper::diagnostics::perf::now_ns() : 0;
             result.wait_result = vkWaitForFences(
                 dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
             result.fence_waits = 1;
+            if (wait_start_ns)   // #3948 stage 0
+                prosper::diagnostics::perf::add_cost(
+                    prosper::diagnostics::perf::Cost::GpuWaitGraphics,
+                    prosper::diagnostics::perf::now_ns() - wait_start_ns);
             // Preserve lifetime safety even if the bounded diagnostic wait expires.
             if (result.wait_result != VK_SUCCESS)
                 result.wait_result = render_locked_queue_wait_idle(queue);
@@ -2860,6 +2911,12 @@ public:
                     result.gpu_device_ms =
                         static_cast<double>(ticks) * gpu_timestamp_.period_ns / 1'000'000.0;
                     result.gpu_timestamp_samples = 1;
+                    prosper::diagnostics::perf::add(
+                        prosper::diagnostics::perf::Counter::GpuDeviceNsGraphics,
+                        static_cast<uint64_t>(static_cast<double>(ticks) *
+                                              gpu_timestamp_.period_ns));
+                    prosper::diagnostics::perf::add(
+                        prosper::diagnostics::perf::Counter::GpuDeviceSamplesGraphics);
                 }
             }
             release_gpu_timestamp();
@@ -2910,8 +2967,7 @@ private:
     };
 
     void release_gpu_timestamp() {
-        if (gpu_timestamp_.pool)
-            vkDestroyQueryPool(gpu_timestamp_.dev, gpu_timestamp_.pool, nullptr);
+        if (gpu_timestamp_.pool) return_backend_timestamp_pool(gpu_timestamp_.dev, gpu_timestamp_.pool);
         gpu_timestamp_ = {};
     }
 
@@ -13340,7 +13396,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     VkCommandBuffer cmd = command_pool_lease.lease.command;   // see RenderCommandPoolEntry
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cbbi);
-    if (timing_enabled)
+    // The batch envelope also feeds the perf ledger's GPU-wait split (#3948 stage 0), so it is
+    // armed whenever the ledger is: one 2-query pool per batch, not per draw.
+    const bool batch_gpu_timestamp = timing_enabled || prosper::diagnostics::perf::enabled();
+    if (batch_gpu_timestamp)
         active_submission.begin_gpu_timestamp(
             dev, cmd, ctx.timestamp_period_ns, ctx.timestamp_valid_bits);
     if (transition_cached_color) {
@@ -14522,7 +14581,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 cached_extra[slot] != nullptr,
                 !color_target || color_target->readback_slots[slot], extra_images[slot]);
     }
-    if (timing_enabled && flush_now)
+    if (batch_gpu_timestamp && flush_now)
         active_submission.end_gpu_timestamp(cmd);
     if (buffer_verify_enabled) {
         // Compare the mapped allocation against the source words. A mismatch names the first
