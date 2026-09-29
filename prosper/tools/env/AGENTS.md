@@ -21,7 +21,9 @@ are actually hot. This folder is about the switch surface itself.
 - **`check_diag_gates.py`** + `diag_gate_baseline.txt` — finds a diagnostic whose *producer* and
   whose *printer* are armed by different switches, so arming the one whose name matches your
   question yields a zero that reads as data. The baseline is a classification, not a suppression
-  list: a row has to carry a mechanism at a `file:line` the next reader can open.
+  list: a row has to carry a mechanism at a `file:line` the next reader can open. Its narrow cached
+  reference-getter bridge preserves config provenance through an identified singleton receiver;
+  cross-file positive, bridge-off and adversarial controls run with `--selftest`.
 - **`check_env_numeric_arms.py`** — every knob parsed through `diagnostics/env_numeric.hpp` has a
   matching arm in `tests/diagnostics/test_env_numeric_sites.cpp`, and vice versa. Run it from
   `prosper/`, not the checkout root.
@@ -40,3 +42,17 @@ Caching a switch is a semantic change, and the direction it fails in is silence 
 So the order is always: **census first** (which name is hot), **gate second** (may that name be
 cached at all), conversion third. Picking sites by reading the source instead measures nothing and
 has, historically, converted names no route ever reached.
+
+## Ruled out
+
+- **A source-preserving config relocation does not preserve a lexical scanner's visibility by
+  itself.** On #3892's process-owner candidate `df8439ff5543`, the unmodified diagnostic scanner
+  produced 2 new and 12 stale findings after cached values became reference-getter calls. The
+  producer/printer gates had not changed; their provenance disappeared at the accessor boundary.
+  A receiver-aware bridge restores all 122 findings on both main and that candidate with the
+  same 65 classified baseline keys. Removing the stale rows would conceal the unchanged gates.
+- **A reference getter is not a global scalar predicate.** The mutable-reference negative in the
+  getter controls initially still found a gate because the old `bool|int` return matcher accepted
+  `int&`. That joined the method's local config to every same-named identifier, bypassing receiver
+  checks. Scalar predicates now exclude pointer/reference returns; cached const-reference values
+  use the identified receiver, and unknown or shadowed receivers contribute no alias (#3892).
