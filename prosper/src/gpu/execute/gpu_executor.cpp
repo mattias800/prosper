@@ -958,6 +958,8 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         result->raw_x2_data_load_pcs = rdna2_proven_raw_x2_data_loads(decoded);
         result->raw_immediate_wide_data_load_pcs =
             rdna2_proven_raw_immediate_wide_data_loads(decoded);
+        result->raw_register_wide_data_load_pcs =
+            rdna2_proven_raw_register_wide_data_loads(decoded);
         result->raw_nested_wide_data_load_pcs =
             rdna2_proven_raw_nested_wide_data_loads(decoded);
         retain_fold_instructions(decoded, result->instructions);
@@ -981,6 +983,7 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                         result->shader_constant_control_plan.allocated_bytes() +
                         (result->raw_x2_data_load_pcs.capacity() +
                          result->raw_immediate_wide_data_load_pcs.capacity() +
+                         result->raw_register_wide_data_load_pcs.capacity() +
                          result->raw_nested_wide_data_load_pcs.capacity()) * sizeof(uint32_t);
         return result;
     };
@@ -1396,6 +1399,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                 stage == ShaderProgramStage::Compute &&
                 resource.nested_raw_snapshot_admitted && resource.host_data &&
                 resource.host_data_size >= resource.size ? resource.size : 0u;
+            compiled.raw_register_snapshot_bytes = !resource.raw_register_snapshot ? 0u :
+                valid_raw_register_snapshot_resource(resource) ? resource.size : UINT32_MAX;
             compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
             compiled.table_index_count = resource.table_index_count;
             compiled.table_entry_stride = resource.table_entry_stride;
@@ -4833,6 +4838,24 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                           }
                                       }
                                       break; }
+                // Current-byte Route A: the complete stream proves a scalar-data offset chain.
+                // Bind only the effective 16/32 bytes, rather than uploading a potentially large
+                // prefix or asking the shader shell to invent numeric values for entry SGPRs.
+                if (srt_uses && !is_buffer && (n == 4u || n == 8u) &&
+                    soff_field != 125u && (soff_val & 3u) == 0u && (base & 3u) == 0u &&
+                    byte_off >= 0 && base <= UINT64_MAX - static_cast<uint64_t>(byte_off) &&
+                    addr <= UINT64_MAX - n * sizeof(uint32_t) &&
+                    std::binary_search(decoded->raw_register_wide_data_load_pcs.begin(),
+                                       decoded->raw_register_wide_data_load_pcs.end(), in.pc)) {
+                    SrtUse snapshot;
+                    snapshot.kind = 4;
+                    snapshot.key = UINT32_MAX;
+                    snapshot.v4[0] = static_cast<uint32_t>(addr);
+                    snapshot.v4[1] = static_cast<uint32_t>(addr >> 32u);
+                    snapshot.required_size = n * sizeof(uint32_t);
+                    snapshot.use_pc = in.pc;
+                    srt_uses->push_back(snapshot);
+                }
                 if (trc && writer_provenance_enabled()) {
                     const uint32_t observed_bytes = is_buffer
                         ? scalar_in_range_dwords * 4u : n * 4u;
@@ -6081,6 +6104,34 @@ static bool gta_optional_null_linear_load_launch(
     return true;
 }
 
+static std::optional<ShaderResource> raw_register_snapshot_resource(
+        const SrtUse& use, const uint32_t* code, size_t dwords) {
+    if (use.kind != 4 || use.key != UINT32_MAX || use.use_pc >= dwords ||
+        use.v4[2] || use.v4[3] || use.scalar_buffer_dword_count ||
+        use.zero_record_raw || use.table_record_count || use.instruction_format != UINT32_MAX)
+        return std::nullopt;
+    const auto decoded = decode_shader_cached(code, dwords);
+    if (!std::binary_search(decoded->raw_register_wide_data_load_pcs.begin(),
+                           decoded->raw_register_wide_data_load_pcs.end(), use.use_pc))
+        return std::nullopt;
+    const auto load = rdna2_decode_one(code + use.use_pc, dwords - use.use_pc);
+    const uint32_t bytes = load.opcode == 0x2u ? 16u : 32u;
+    const uint64_t address = static_cast<uint64_t>(use.v4[0]) |
+                             (static_cast<uint64_t>(use.v4[1]) << 32u);
+    if (use.required_size != bytes || address <= 0x10000u || (address & 3u) ||
+        address > UINT64_MAX - bytes || !guest_readable(address, bytes))
+        return std::nullopt;
+    ShaderResource result;
+    result.cls = ResourceClass::ConstantBuffer;
+    result.format = DataFormat::Uint32;
+    result.num_components = 1;
+    result.gpu_addr = address;
+    result.size = bytes;
+    result.fetch_pc = use.use_pc;
+    result.raw_register_snapshot = true;
+    return result;
+}
+
 bool shader_resource_allows_zero_mip_specialization(
     const SrtUse& use, const DecodedImageDescriptor& descriptor,
     const DecodedImageView& view) {
@@ -6244,6 +6295,11 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
 
     std::set<uint64_t> seen;
     for (const auto& u : srt_uses) {
+        if (u.kind == 4) {
+            if (auto snapshot = raw_register_snapshot_resource(u, code, dwords))
+                table.resources.push_back(*snapshot);
+            continue;
+        }
         if (u.kind == 3) {
             const uint64_t dk = 0x8000000300000000ull | u.use_pc;
             if (!seen.insert(dk).second) continue;
@@ -7525,6 +7581,13 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                 bool clash = exact_mtbuf || u.key == 0xFFFFFFFFu;
                 if (!clash)
                     for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
+                if (u.kind == 4) {
+                    if (auto snapshot = raw_register_snapshot_resource(u,
+                            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                            shader_dwords))
+                        t.resources.push_back(*snapshot);
+                    continue;
+                }
                 if (u.kind == 1) {                       // constant buffer / structured-buffer V#
                     DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
                     if (u.instruction_format != UINT32_MAX &&

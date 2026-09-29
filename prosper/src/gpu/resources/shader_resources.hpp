@@ -532,7 +532,22 @@ struct ShaderResource {
     // scalar-buffer addresses advance four bytes and use NUM_RECORDS only as their dword bound.
     // Appended so historical positional aggregate initializers retain their field mapping.
     uint32_t scalar_buffer_dword_count = 0;
+    // A fold-proven raw register-offset x4/x8 load bound to exactly the effective source bytes.
+    // The recompiler reads at index zero, after independently proving this load and wave contract.
+    bool raw_register_snapshot = false;
 };
+
+inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource) {
+    return resource.raw_register_snapshot && resource.cls == ResourceClass::ConstantBuffer &&
+        resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
+        (resource.size == 16u || resource.size == 32u) && resource.stride == 0u &&
+        resource.fetch_pc != UINT32_MAX && resource.srt_offset == UINT32_MAX &&
+        resource.sgpr_base == UINT32_MAX && resource.table_index_count == 0u &&
+        resource.scalar_buffer_dword_count == 0u && !resource.nested_raw_snapshot_admitted &&
+        (resource.gpu_addr & 3u) == 0u &&
+        (resource.host_data ? resource.host_data_size >= resource.size :
+                              resource.host_data_size == 0u);
+}
 
 // Decode the exact SQ_IMG_SAMP state consumed by one MIMG instruction. Metadata describes a
 // texture's usual paired sampler, but shaders may load or patch a different S# before the sample.

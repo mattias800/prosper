@@ -5535,8 +5535,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool raw_wide_register_offset_data =
                 rt && (in.opcode == 0x2 || in.opcode == 0x3) && !soff_null &&
                 rs.smem_raw_wide_data_loads.contains(in.pc);
+            const ShaderResource* register_source = rt ? rt->by_fetch_pc(in.pc) : nullptr;
+            const bool vcc_offset = in.src[1].kind == OperandKind::Special &&
+                (in.src[1].value == 106 || in.src[1].value == 107);
+            const bool backed_register_wide = raw_wide_register_offset_data &&
+                rs.smem_raw_register_wide_data_loads.contains(in.pc) &&
+                (!vcc_offset || b.wave_size == 32u) && register_source &&
+                valid_raw_register_snapshot_resource(*register_source) &&
+                register_source->fetch_pc == in.pc && register_source->size == n * 4u &&
+                shader_resource_buffer_binding_bytes(*register_source) >= n * 4u;
             static std::atomic<uint32_t> raw_wide_placeholder_logs{0};
-            if (raw_wide_register_offset_data && !b.is_compute && getenv("PROSPER_DBG") &&
+            if (raw_wide_register_offset_data && !backed_register_wide && !b.is_compute && getenv("PROSPER_DBG") &&
                 raw_wide_placeholder_logs.fetch_add(1, std::memory_order_relaxed) < 64)
                 fprintf(stderr,
                         "[smem-placeholder] pc=%u reason=raw-wide-data-graphics-placeholder "
@@ -5550,7 +5559,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 sreg_range_written(rs, in.src[0].value, 2);
             if (rt && (in.opcode == 0x2 || in.opcode == 0x3) &&
                 rs.smem_raw_wide_data_loads.contains(in.pc) &&
-                ((!soff_null && b.is_compute) ||
+                ((!soff_null && (b.is_compute || backed_register_wide ||
+                               (register_source && register_source->raw_register_snapshot &&
+                                (!vcc_offset || b.wave_size == 32u)))) ||
                  (soff_null && rs.smem_raw_immediate_wide_data_loads.contains(in.pc)) ||
                  nested_raw_wide_data)) {
                 // Keep the existing immediate descriptor route for loads outside the bounded
@@ -5572,7 +5583,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     exact->host_data && exact->host_data_size >= exact->size &&
                     shader_resource_buffer_binding_bytes(*exact) >=
                         static_cast<uint64_t>(in.literal) + n * sizeof(uint32_t);
-                if (!backed_immediate_wide && !backed_nested_wide) {
+                if (!backed_immediate_wide && !backed_nested_wide && !backed_register_wide) {
                     if (getenv("PROSPER_DBG"))
                         fprintf(stderr,
                                 "[smem-reject] pc=%u reason=raw-wide-data-requires-backing "
@@ -5581,7 +5592,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
             }
-            if (!soff_null) {
+            if (!soff_null && !backed_register_wide) {
                 if (rt && (in.opcode == 0x2 || in.opcode == 0x3)) {
                     // An x4/x8 DESCRIPTOR load with a non-null soffset leaves here with placeholders
                     // and NO SRT tag, so every MIMG that consumes one of its descriptors reports
@@ -5662,7 +5673,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 soff_dyn = true;
             } else if ((int32_t)in.literal < 0) { ok = false; return true; }   // negative imm-only would wrap
-            uint32_t base_idx = soff_dyn ? 0 : in.literal >> 2;    // immediate byte offset -> dword index
+            uint32_t base_idx = (soff_dyn || backed_register_wide) ? 0 : in.literal >> 2;
             // Descriptor provenance: pick which bound constant buffer via the resource table, routing this
             // load to that buffer's OWN binding (N-buffer model) — so Unity's several constant buffers
             // (per-draw transform, per-frame, …) don't collapse onto one. For s_buffer_load, SBASE
@@ -5738,6 +5749,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                // borrowing it here would silently make an unrelated load succeed.
                                (resource.fetch_pc == in.pc ||
                                !rs.smem_raw_x2_data_loads.contains(resource.fetch_pc) &&
+                               !rs.smem_raw_register_wide_data_loads.contains(resource.fetch_pc) &&
                                !rs.smem_raw_immediate_wide_data_loads.contains(resource.fetch_pc)) &&
                                (resource.cls == ResourceClass::ConstantBuffer ||
                                 resource.cls == ResourceClass::VertexBuffer);

@@ -1554,6 +1554,47 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             }
         }
     }
+    if (version >= 62u) {
+        size_t expected = 0;
+        for (const auto& draw : c.draws)
+            expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected += compute.resources.resources.size();
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid raw register snapshot resource count";
+            return false;
+        }
+        auto read_raw_register_snapshots = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                uint8_t marker = 0;
+                if (!r.u8(marker) || marker > 1u) return false;
+                captured.resource.raw_register_snapshot = marker != 0u;
+                if (marker && (!valid_raw_register_snapshot_resource(captured.resource) ||
+                               captured.captured_size < captured.resource.size)) return false;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_raw_register_snapshots(draw.vrt) || !read_raw_register_snapshots(draw.prt)) {
+                error = "invalid raw register snapshot state";
+                return false;
+            }
+        for (auto& compute : c.computes)
+            if (!read_raw_register_snapshots(compute.resources)) {
+                error = "invalid raw register snapshot state";
+                return false;
+            }
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_raw_register_snapshots(stage.resource_table)) {
+                    error = "invalid raw register snapshot state";
+                    return false;
+                }
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.

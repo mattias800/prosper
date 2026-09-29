@@ -180,7 +180,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // silently recompiling a retained shader under default graphics settings.
 // v61: failed graphics draws also carry the fragment system-input mapping and wave width. The
 // existing v60 pixel-input mapping supplies the remaining interpolation dependency.
-constexpr uint32_t kVersion = 61;
+// v62: exact-PC raw register-offset scalar snapshots. Older resources retain false and cannot
+// authorize the rebased numeric load path.
+constexpr uint32_t kVersion = 62;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;

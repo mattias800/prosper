@@ -139,6 +139,9 @@ static const NotAnEmitter kNotEmitters[] = {
     {"rdna2_proven_raw_immediate_wide_data_loads",
      "returns decoded instruction PCs, not SPIR-V; dynfetch_fold covers admission and refusal "
      "paths, and rdna2_to_spirv_exec validates a consuming module"},
+    {"rdna2_proven_raw_register_wide_data_loads",
+     "returns decoded instruction PCs, not SPIR-V; raw_register_wide_data covers complete "
+     "scalar-offset provenance and raw_register_wide_exec executes changed source bytes"},
     {"rdna2_proven_raw_nested_wide_data_loads",
      "returns decoded instruction PCs, not SPIR-V; recompile_coverage covers admitted numeric "
      "children and bypass refusals, and rdna2_to_spirv_exec validates consuming modules"},
@@ -339,6 +342,20 @@ int main(int argc, char** argv) {
 
 
     // Compute ALU (float chain).
+    { const uint32_t c[] = {0x8f148402u, 0xf4080200u, 0x28000010u,
+                           0x7e000c09u, 0xbf810000u};
+      ShaderResourceTable table;
+      ShaderResource source;
+      source.cls = ResourceClass::ConstantBuffer;
+      source.format = DataFormat::Uint32;
+      source.num_components = 1u;
+      source.binding = 2u;
+      source.size = 16u;
+      source.fetch_pc = 1u;
+      source.raw_register_snapshot = true;
+      table.resources.push_back(source);
+      dump(dir, "raw_register_wide_data", recompile_valu(c, std::size(c), 1, 0, &table),
+           "recompile_valu"); }
     { const uint32_t c[] = {0x06000300u, 0x10000500u, 0xBF810000u};
       dump(dir, "compute_alu", recompile_valu(c, 3, 3, 0), "recompile_valu"); }
     // GTA V's exact literal-bearing V_ALIGNBYTE_B32 packet.  Strict validation guards the

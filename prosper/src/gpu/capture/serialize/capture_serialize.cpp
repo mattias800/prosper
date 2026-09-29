@@ -1135,6 +1135,29 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
             w.u32(diagnostic.system_inputs.addr);
         }
     }
+    // v62: one authenticated rebased raw-scalar snapshot marker per resource.
+    w.u32(static_cast<uint32_t>(sample_resource_count));
+    auto write_raw_register_snapshots = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources) {
+            const auto& resource = captured.resource;
+            if (resource.raw_register_snapshot &&
+                (!valid_raw_register_snapshot_resource(resource) ||
+                 captured.captured_size < resource.size)) {
+                error = "invalid raw register snapshot resource";
+                return false;
+            }
+            w.u8(resource.raw_register_snapshot ? 1u : 0u);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_raw_register_snapshots(draw.vrt) ||
+            !write_raw_register_snapshots(draw.prt)) return false;
+    for (const auto& compute : c.computes)
+        if (!write_raw_register_snapshots(compute.resources)) return false;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (!write_raw_register_snapshots(stage.resource_table)) return false;
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces
