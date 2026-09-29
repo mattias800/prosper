@@ -3169,11 +3169,30 @@ struct LiveRenderPhase {
     // must synchronously read back this span instead of deferring their authoritative pixels.
     bool authoritative_readback = false;
     uint64_t source_submit = 0; // zero for direct/replay callbacks without a live guest submit
+    // #3948 stage 2 (PROSPER_GRAPHICS_DEFERRED_WAIT=1): the next ordered operation is a compute
+    // dispatch. The renderer may submit this span's graphics batch and return WITHOUT waiting for
+    // its fence; the executor retires it (wait + completion bookkeeping) at the next non-dispatch
+    // operation, the next render callback, or the end of the submit (retire_deferred_graphics).
+    // Never set for the final span or an authoritative-readback span. Declared last so the
+    // positional initializers above keep their meaning.
+    bool defer_batch_completion = false;
 
     bool allows_deferred_scanout_readback() const {
         return !final_span && !authoritative_readback;
     }
 };
+
+// #3948 stage 2. The live renderer registers the function that retires a graphics batch whose
+// fence wait it deferred (see LiveRenderPhase::defer_batch_completion). retire_deferred_graphics()
+// is a no-op when nothing is registered or nothing is pending; the executor calls it wherever a
+// later operation may observe the batch's completion from the CPU. Executor thread only.
+void set_deferred_graphics_retirer(void (*fn)());
+void retire_deferred_graphics();
+// Same-binary switch, fixed at first use: PROSPER_GRAPHICS_DEFERRED_WAIT=1 lets the ordered
+// executor ask for deferral before a dispatch. Default OFF.
+bool graphics_deferred_wait_enabled();
+// Tests: -1 follows the environment (the default), 0 forces off, 1 forces on.
+void set_graphics_deferred_wait_for_test(int enabled);
 LiveRenderPhase live_render_phase();
 
 // Invoke the registered live backend directly with already-realized draws. Used by the local capture

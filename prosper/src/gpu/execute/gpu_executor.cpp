@@ -11023,12 +11023,25 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     bool previous_compute_realized = false;
     bool previous_compute_executed = false;
     std::vector<DrawItem> span;
-    auto flush_span = [&](bool authoritative_readback = false) {
+    // #3948 stage 2: a graphics batch left pending by a span that preceded a dispatch is retired
+    // before this submit returns, even on a path that leaves the loop early (declared after the
+    // guest-write scope, so it runs first).
+    struct DeferredGraphicsRetireGuard {
+        ~DeferredGraphicsRetireGuard() { retire_deferred_graphics(); }
+    } deferred_graphics_retire_guard;
+    const bool defer_graphics_wait = graphics_deferred_wait_enabled();
+    auto flush_span = [&](bool authoritative_readback = false, bool before_dispatch = false) {
         if (span.empty() || !render) return;
         LiveRenderPhase saved = g_live_phase;
         const bool final_span = result.render_spans + 1 == total_spans;
         g_live_phase = {result.render_spans == 0, final_span, authoritative_readback};
         g_live_phase.source_submit = submit_no;
+        // Only a span whose NEXT operation is a dispatch: the dispatch reaches renderer state
+        // through the live-target bridge, whose CPU reads submit and wait their own fence on the
+        // same queue (which covers this batch), and its GPU reads are ordered by queue submission
+        // plus the batch's trailing barrier. Every other operation retires first.
+        g_live_phase.defer_batch_completion = defer_graphics_wait && before_dispatch &&
+                                              !final_span && !authoritative_readback;
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
         if (!rendered.empty()) result.frame = std::move(rendered);
@@ -11360,7 +11373,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 break;
             }
             case RetainedSubmitKind::Dispatch: {
-                flush_span();
+                flush_span(false, /*before_dispatch=*/true);
                 const uint64_t current_compute_code = compute_dispatch_code_addr(
                     st, st.dispatches[operation.index]);
                 const bool indirect = st.dispatches[operation.index].indirect;
@@ -11687,6 +11700,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
             }
             case RetainedSubmitKind::DmaCopy: {
                 flush_span(true);
+                retire_deferred_graphics();   // #3948 stage 2: CPU reads of target bytes follow
                 const GpuState::DmaCopy& copy = st.dma_copies[operation.index];
                 // Source and destination are distinct ordered consumers: a disjoint source must not
                 // hide an overlapping destination (or vice versa).
@@ -11730,6 +11744,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
             }
             case RetainedSubmitKind::ParserStall:
                 flush_span();
+                retire_deferred_graphics();   // #3948 stage 2
                 // Once an argument-producing epoch fails, a later empty/redundant stall cannot
                 // make the stale bytes trustworthy again. Keep the submit poisoned until it ends.
                 indirect_dependencies_ok &= producer_epoch_ok;
@@ -11737,6 +11752,9 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 break;
             case RetainedSubmitKind::MemoryEffect:
                 flush_span();
+                // #3948 stage 2: a label/EOP/WRITE_DATA write tells the guest everything before it
+                // is done, so no graphics batch may still be pending when it lands.
+                retire_deferred_graphics();
                 {
                     const GpuState::MemoryEffect& effect =
                         st.ordered_memory_effects[operation.index];
@@ -11805,6 +11823,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
         }
     }
     flush_span();
+    retire_deferred_graphics();   // #3948 stage 2 (the guard above covers early exits)
     // A semantic draw record can fail only when lazily realized at its ordered position. If that
     // record was counted as a later span, the last successful callback was intentionally marked
     // intermediate. Send an empty terminal callback so the frontend can recover cached scanout,
@@ -12134,6 +12153,32 @@ GuestGpuWriteQuery guest_gpu_writes_since(const GuestGpuWriteSnapshot& snapshot,
     return GuestGpuWriteQuery::Unchanged;
 }
 LiveRenderPhase live_render_phase()       { return g_live_phase; }
+
+// #3948 stage 2: see LiveRenderPhase::defer_batch_completion.
+namespace {
+std::atomic<void (*)()> g_deferred_graphics_retirer{nullptr};
+}
+void set_deferred_graphics_retirer(void (*fn)()) {
+    g_deferred_graphics_retirer.store(fn, std::memory_order_release);
+}
+void retire_deferred_graphics() {
+    if (auto* fn = g_deferred_graphics_retirer.load(std::memory_order_acquire)) fn();
+}
+namespace {
+std::atomic<int> g_graphics_deferred_wait_override{-1};
+}
+void set_graphics_deferred_wait_for_test(int enabled) {
+    g_graphics_deferred_wait_override.store(enabled, std::memory_order_relaxed);
+}
+bool graphics_deferred_wait_enabled() {
+    const int forced = g_graphics_deferred_wait_override.load(std::memory_order_relaxed);
+    if (forced >= 0) return forced != 0;
+    static const bool enabled = [] {
+        const char* v = std::getenv("PROSPER_GRAPHICS_DEFERRED_WAIT");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return enabled;
+}
 
 // See PresentSubmitScope in gpu_execute.hpp. Thread-local and counted: the renderer callback runs
 // synchronously on the submitting thread, and a nested scope must not end its parent's.

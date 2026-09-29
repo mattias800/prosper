@@ -1487,6 +1487,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 replay_live_targets ? ", replay parity" : "");
     if (batch_backend_submits)
         fprintf(stderr, "[render] backend target-submit batching enabled (experimental)\n");
+    prosper::gpu::set_deferred_graphics_retirer(
+        [] { (void)prosper::test::retire_deferred_backend_submission(); });
     prosper::gpu::set_submit_renderer(
         [frame_dir, dump_bmps, invalidate_ds, native_fragment_vote_width,
          partial_wave_fragment](const std::vector<prosper::gpu::DrawItem>& items,
@@ -1510,6 +1512,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // would overwrite it, so the reader treats a mismatch as "outside" rather than
             // asserting -- a wrong attribution is better than a crash in a diagnostic.
             prosper::frontend::ScopedRendererCallbackTid scoped_renderer_tid;
+            // #3948 stage 2: a previous span's graphics batch may still be pending (its wait was
+            // deferred past a dispatch). Everything below reads or mutates renderer state its
+            // completion publishes, so retire it first.
+            prosper::test::retire_deferred_backend_submission();
             // Compute fast-clears update a target's DCC metadata between graphics spans. Associate
             // those ranges before draining the ordered guest-write notifications so a metadata write
             // cannot leave the previous frame's retained target authoritative.

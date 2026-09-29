@@ -22,6 +22,9 @@ itself still lives in `live_renderer.cpp` and still owns all the state.
   into the submit's `RenderTiming`) and the `PROSPER_RTT_TIMING` record formatters.
 - `per_target_passes.{hpp,cpp}` — `render_per_target_passes`: the `PROSPER_RTT` per-target pass
   loop (pass grouping, MRT, RTT publication, and choosing the present candidate among its passes).
+  It owns the callback's submission batch; when the executor marks the span
+  `defer_batch_completion` (#3948 stage 2, a span followed by a dispatch) the batch is submitted
+  without a wait and retired later by the executor, not at the end of the call.
 - `mrt_slots.hpp` — the pass loop's MRT slot queries (`color_binding`, `active_format`,
   `active_color`, `active_color_count`), shared by the loop and the MRT census.
 - `final_span_present.{hpp,cpp}` — `select_final_span_present`: at a submit's final render span,
