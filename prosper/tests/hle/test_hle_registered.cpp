@@ -66,7 +66,10 @@ int main() {
         // than none -- it would pass while proving nothing about the real NID.
         "sceVideodec2CreateDecoder", "sceVideodec2DeleteDecoder", "sceVideodec2Decode",
         "sceVideodec2Flush", "sceVideodec2Reset", "sceVideodec2GetPictureInfo",
-        "sceVdecswCreateDecoder", "sceVdecswSetDecodeInput", "sceVdecswSetDecodeOutput",
+        "sceVdecswQueryComputeMemoryInfo", "sceVdecswAllocateComputeQueue",
+        "sceVdecswQueryDecoderMemoryInfo", "sceVdecswCreateDecoder",
+        "sceVdecswSetDecodeInput", "sceVdecswSetDecodeOutput",
+        "sceVdecswTrySyncDecodeInput", "sceVdecswTrySyncDecodeOutput",
         // libSceIme + libSceImeDialog (register_ime_hle, src/hle/input/ime.cpp). sceImeUpdate is
         // registered from inside an #ifdef _WIN32 / #else pair -- both arms bind the same NID to a
         // different handler, so this asserts the NID is bound on whichever platform is building.

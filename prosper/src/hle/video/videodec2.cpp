@@ -612,6 +612,38 @@ static bool vdecsw_adapt_config(uint64_t guest_config, VdecConfig* out) {
     out->reserved0 = 0; out->reserved1 = 0;
     return true;
 }
+
+struct VdecswFrame { uint64_t size, data, data_size; };
+static_assert(sizeof(VdecswFrame) == 0x18, "libSceVdecsw frame struct is 0x18 bytes");
+
+// The input side is a QUEUE, not a slot, and that is a correction rather than a refinement.
+//
+// Vdecsw is asynchronous: nothing stops the title staging several access units before it polls for a
+// picture, and a single slot silently keeps only the last of them. Measured with a slot: the first
+// access unit prosper ever saw already carried nal_unit_type 1 exclusively -- no SPS, no PPS, no IDR
+// in any unit, for the whole movie -- which reads as "this stream has no parameter sets" and is a
+// conclusion about our own dropped writes. A queue keeps every staged unit in order, so what the
+// decoder sees is what the title sent.
+//
+// The staged access unit is COPIED, not pointed at, and that is the difference between an
+// asynchronous API and a synchronous one.
+//
+// sceVideodec2Decode consumes its bitstream inside the call, so holding the guest's pointer is safe
+// there. Vdecsw's SetDecodeInput returns immediately and the picture arrives at a later poll, which
+// means the guest is free to refill its staging buffer in between -- and it does. Measured: the
+// access unit prosper logged at SetDecodeInput time carried `7 8 6 5 5 ...` (SPS, PPS, SEI, IDR
+// slices), and the SAME pointer read microseconds later inside the decoder backend carried nothing
+// but type 1. Every parameter set in the movie was overwritten before the decoder saw it, which
+// libavcodec then reported, correctly, as "non-existing PPS 0 referenced".
+struct VdecswInput { std::vector<uint8_t> au; uint64_t pts = 0; };
+struct VdecswPending {
+    std::deque<VdecswInput> inputs;               // staged access units, in order, owned
+    uint64_t out_data = 0, out_bytes = 0;
+    bool out_set = false;
+};
+std::mutex g_vdecsw_mx;
+std::unordered_map<uint64_t, VdecswPending> g_vdecsw;
+
 HLE(s_vdecsw_query_decoder_memory) {
     VdecConfig cfg{};
     if (!vdecsw_adapt_config(a0, &cfg)) return VDEC_ERR_STRUCT;
@@ -620,7 +652,14 @@ HLE(s_vdecsw_query_decoder_memory) {
 HLE(s_vdecsw_create_decoder) {
     VdecConfig cfg{};
     if (!vdecsw_adapt_config(a0, &cfg)) return VDEC_ERR_STRUCT;
-    return s_videodec2_create_decoder((uint64_t)(uintptr_t)&cfg, a1, a2, a3, a4, a5);
+    const uint64_t rc = s_videodec2_create_decoder((uint64_t)(uintptr_t)&cfg, a1, a2, a3, a4, a5);
+    if (rc == 0 && a2) {
+        if (auto* out = (const uint64_t*)PW(a2)) {
+            std::lock_guard<std::mutex> lk(g_vdecsw_mx);
+            g_vdecsw[*out] = VdecswPending{};
+        }
+    }
+    return rc;
 }
 HLE(s_videodec2_delete_decoder) {
     // Tear the access-unit decoder down with the guest's decoder (#2270). Without this every
@@ -640,6 +679,10 @@ HLE(s_videodec2_delete_decoder) {
         if (!g_vdec_codecs.erase(a0)) return VDEC_ERR_DECODER;
         auto it = g_vdec_au.find(a0);
         if (it != g_vdec_au.end()) { au_id = it->second.id; g_vdec_au.erase(it); }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_vdecsw_mx);
+        g_vdecsw.erase(a0);
     }
     if (au_id >= 0)
         if (auto* vb = prosper::video::backend()) vb->close_decoder(au_id);
@@ -919,36 +962,6 @@ HLE(s_videodec2_decode) {
 // What is NOT yet measured is logged rather than guessed: the declared size of SetDecodeInput's
 // struct, and whatever TrySyncDecodeInput writes through its second argument. Both are printed under
 // PROSPER_SVCLOG so the next run reads them off a real call.
-struct VdecswFrame { uint64_t size, data, data_size; };
-static_assert(sizeof(VdecswFrame) == 0x18, "libSceVdecsw frame struct is 0x18 bytes");
-
-// The input side is a QUEUE, not a slot, and that is a correction rather than a refinement.
-//
-// Vdecsw is asynchronous: nothing stops the title staging several access units before it polls for a
-// picture, and a single slot silently keeps only the last of them. Measured with a slot: the first
-// access unit prosper ever saw already carried nal_unit_type 1 exclusively -- no SPS, no PPS, no IDR
-// in any unit, for the whole movie -- which reads as "this stream has no parameter sets" and is a
-// conclusion about our own dropped writes. A queue keeps every staged unit in order, so what the
-// decoder sees is what the title sent.
-// The staged access unit is COPIED, not pointed at, and that is the difference between an
-// asynchronous API and a synchronous one.
-//
-// sceVideodec2Decode consumes its bitstream inside the call, so holding the guest's pointer is safe
-// there. Vdecsw's SetDecodeInput returns immediately and the picture arrives at a later poll, which
-// means the guest is free to refill its staging buffer in between -- and it does. Measured: the
-// access unit prosper logged at SetDecodeInput time carried `7 8 6 5 5 ...` (SPS, PPS, SEI, IDR
-// slices), and the SAME pointer read microseconds later inside the decoder backend carried nothing
-// but type 1. Every parameter set in the movie was overwritten before the decoder saw it, which
-// libavcodec then reported, correctly, as "non-existing PPS 0 referenced".
-struct VdecswInput { std::vector<uint8_t> au; uint64_t pts = 0; };
-struct VdecswPending {
-    std::deque<VdecswInput> inputs;               // staged access units, in order, owned
-    uint64_t out_data = 0, out_bytes = 0;
-    bool out_set = false;
-};
-std::mutex g_vdecsw_mx;
-std::unordered_map<uint64_t, VdecswPending> g_vdecsw;
-
 // Report an unknown struct ONCE per call site with its declared size, so an ABI mismatch is a named
 // finding in the log rather than a silent mis-parse. Rate-limited like vdec_reject for the same
 // reason: these sit in a per-frame loop.
@@ -981,7 +994,13 @@ HLE(s_vdecsw_set_decode_input) {
     if (in[0] != sizeof(VdecInput)) return vdec_reject("vdecsw.input.size", in[0], VDEC_ERR_STRUCT);
     if (in[2] && !in[1]) return VDEC_ERR_ARG;
     std::lock_guard<std::mutex> lk(g_vdecsw_mx);
-    auto& p = g_vdecsw[a0];
+    auto it = g_vdecsw.find(a0);
+    if (it == g_vdecsw.end()) {
+        std::lock_guard<std::mutex> lk2(g_vdec_mx);
+        if (!g_vdec_codecs.count(a0)) return VDEC_ERR_DECODER;
+        it = g_vdecsw.emplace(a0, VdecswPending{}).first;
+    }
+    auto& p = it->second;
     // Bounded: a title that stages without ever polling must not grow this without limit. The cap is
     // generous against any plausible decode depth (the config asks for input_depth=3) and dropping
     // the OLDEST keeps the stream's head, which is where the parameter sets live.
@@ -1003,7 +1022,13 @@ HLE(s_vdecsw_set_decode_output) {
     if (!f->data) return VDEC_ERR_FRAME_PTR;
     if (!f->data_size) return VDEC_ERR_FRAME_SIZE;
     std::lock_guard<std::mutex> lk(g_vdecsw_mx);
-    auto& p = g_vdecsw[a0];
+    auto it = g_vdecsw.find(a0);
+    if (it == g_vdecsw.end()) {
+        std::lock_guard<std::mutex> lk2(g_vdec_mx);
+        if (!g_vdec_codecs.count(a0)) return VDEC_ERR_DECODER;
+        it = g_vdecsw.emplace(a0, VdecswPending{}).first;
+    }
+    auto& p = it->second;
     p.out_data = f->data; p.out_bytes = f->data_size; p.out_set = true;
     return 0;
 }
@@ -1063,12 +1088,25 @@ static void vdecsw_place_picture_count(VdecOutput* out) {
     ((uint8_t*)out)[0x0B] = out->pictures;
 }
 HLE(s_vdecsw_try_sync_decode_output) {
-    VdecswPending p;
+    auto* out = (VdecOutput*)PW(a1);
+    if (!out) return VDEC_ERR_ARG;
+    if (out->size != sizeof(*out)) return vdec_reject("vdecsw.output.size", out->size, VDEC_ERR_STRUCT);
+
+    uint64_t out_data = 0, out_bytes = 0;
+    bool has_input = false;
+    VdecswInput staged;
     {
         std::lock_guard<std::mutex> lk(g_vdecsw_mx);
         auto it = g_vdecsw.find(a0);
         if (it == g_vdecsw.end()) return VDEC_ERR_DECODER;
-        p = it->second;
+        if (!it->second.out_set) return VDEC_ERR_FRAME_PTR;
+        out_data = it->second.out_data;
+        out_bytes = it->second.out_bytes;
+        if (!it->second.inputs.empty()) {
+            has_input = true;
+            staged = std::move(it->second.inputs.front());
+            it->second.inputs.pop_front();
+        }
     }
     // A POLL IS NOT AN ACCESS UNIT. This is the one place the async shape differs from
     // sceVideodec2Decode in a way that matters: the title calls this repeatedly until a picture
@@ -1079,25 +1117,18 @@ HLE(s_vdecsw_try_sync_decode_output) {
     //
     // So the staged input is CONSUMED here. A poll with nothing staged is answered honestly as "no
     // picture", which is a state the Videodec2 path already knows how to express.
-    if (!p.out_set) return VDEC_ERR_FRAME_PTR;
-    auto* out = (VdecOutput*)PW(a1);
-    if (!out) return VDEC_ERR_ARG;
-    if (out->size != sizeof(*out)) return vdec_reject("vdecsw.output.size", out->size, VDEC_ERR_STRUCT);
-    if (p.inputs.empty()) {
+    if (!has_input) {
         uint32_t codec = 0;
-        { std::lock_guard<std::mutex> lk(g_vdec_mx); auto it = g_vdec_codecs.find(a0);
-          if (it == g_vdec_codecs.end()) return VDEC_ERR_DECODER; codec = it->second; }
-        VdecFrame fr{}; fr.size = sizeof(fr); fr.data = p.out_data; fr.data_size = p.out_bytes;
+        {
+            std::lock_guard<std::mutex> lk(g_vdec_mx);
+            auto it = g_vdec_codecs.find(a0);
+            if (it == g_vdec_codecs.end()) return VDEC_ERR_DECODER;
+            codec = it->second;
+        }
+        VdecFrame fr{}; fr.size = sizeof(fr); fr.data = out_data; fr.data_size = out_bytes;
         vdec_no_picture(&fr, out, codec);
         vdecsw_place_picture_count(out);
         return 0;
-    }
-    VdecswInput staged;
-    {
-        std::lock_guard<std::mutex> lk(g_vdecsw_mx);
-        auto& q = g_vdecsw[a0].inputs;
-        if (q.empty()) return VDEC_ERR_ARG;   // raced another poller; nothing to do
-        staged = std::move(q.front()); q.pop_front();
     }
     // Hand the staged pieces to the SAME decode the Videodec2 path uses -- struct checks, backend
     // call, NV12 write and VdecOutput fill all included -- rather than reimplementing any of it.
@@ -1105,7 +1136,7 @@ HLE(s_vdecsw_try_sync_decode_output) {
     VdecInput in{}; in.size = sizeof(in);
     in.data = (uint64_t)(uintptr_t)staged.au.data(); in.data_size = staged.au.size();
     in.pts = staged.pts;
-    VdecFrame fr{}; fr.size = sizeof(fr); fr.data = p.out_data; fr.data_size = p.out_bytes;
+    VdecFrame fr{}; fr.size = sizeof(fr); fr.data = out_data; fr.data_size = out_bytes;
     const uint64_t rc = s_videodec2_decode(a0, (uint64_t)(uintptr_t)&in,
                                            (uint64_t)(uintptr_t)&fr, a1, 0, 0);
     vdecsw_place_picture_count(out);
@@ -1188,6 +1219,16 @@ HLE(s_videodec2_reset) {
             // re-arm: it is about to be flushed in place and never closes, so re-arming would open a
             // second decoder and strand the first.
             if (au_id < 0) it->second.opened = false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_vdecsw_mx);
+        auto it = g_vdecsw.find(a0);
+        if (it != g_vdecsw.end()) {
+            it->second.inputs.clear();
+            it->second.out_set = false;
+            it->second.out_data = 0;
+            it->second.out_bytes = 0;
         }
     }
     if (au_id < 0) return 0;
@@ -1435,15 +1476,17 @@ void register_videodec_hle() {
     //                                                    rdx = &[rbx+0x168] (the queue handle)
     //   QueryDecoderMemoryInfo(config*, info*)        <- rdi, rsi: two eboot .data structs
     //   CreateDecoder(config*, memory*, out*)         <- the same two, plus the handle output
+    //   SetDecodeInput(decoder, input*)               <- rdi = handle, rsi = &{size=0x30,...}
+    //   SetDecodeOutput(decoder, frame*)              <- rdi = handle, rsi = &{size=0x18,...}
+    //   TrySyncDecodeInput(decoder, syncInput*)       <- rdi = handle, rsi = &{size=0x18,...}
+    //   TrySyncDecodeOutput(decoder, out*)            <- rdi = handle, rsi = &{size=0x38,...}
     //
-    // Only the four SET-UP calls are registered here. The decode loop (SetDecodeInput /
-    // SetDecodeOutput / TrySyncDecodeInput / TrySyncDecodeOutput) is libSceVdecsw's own ASYNCHRONOUS
-    // shape and has no Videodec2 equivalent -- sceVideodec2Decode does all four in one synchronous
-    // call -- so mapping it onto these handlers would be an invention, and its live argument layout
-    // cannot be read until CreateDecoder hands back a decoder (every one of those four is currently
-    // entered with a null handle, which is the bug, not the ABI). Those stay unregistered, and the
-    // title keeps failing VISIBLY at TryFetchDecodedFrame rather than being told a decode succeeded.
-    // CONFIDENCE: HIGH on the four registered here (size-checked structs plus live argument capture).
+    // All eight libSceVdecsw calls are registered here. The set-up calls share layouts with
+    // Videodec2 (adapted for Vdecsw's 0x50 config struct); the asynchronous decode loop
+    // (SetDecodeInput / SetDecodeOutput / TrySyncDecodeInput / TrySyncDecodeOutput) stages access
+    // units in FIFO order and routes the decode to the shared Videodec2 backend, adjusting pictureCount
+    // to byte offset +0x0B in the guest's output struct.
+    // CONFIDENCE: HIGH on all eight registered here (size-checked structs plus live argument capture).
     Hle::register_fn("0moTubWCsTM", (HleFn)s_videodec2_query_compute_memory,
                      "sceVdecswQueryComputeMemoryInfo");
     Hle::register_fn("hIgrg5h4V6s", (HleFn)s_videodec2_allocate_compute_queue,
