@@ -5512,11 +5512,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             // SOFFSET handling. Immediate-only loads encode SOFFSET = SGPR_NULL (125). A register
             // SOFFSET adds an SGPR-computed byte offset:
-            //  * a DESCRIPTOR s_load (x4/x8 = V#/T#) with a computed offset is the bindless fetch's
-            //    V#-table read (`s_load_dwordx4 s[8:11],s[24:25],vcc_hi`) — the const-fold
-            //    (resolve_dynamic_fetch -> by_fetch_pc) resolves the fetch through that V#, so the
-            //    SGPR result is unused per-invocation — no-op it (placeholder 0) so the VS still
-            //    recompiles (the "mask=0xF draws never render" gap on PPSA01885). CONFIDENCE: HIGH.
+            //  * a descriptor-only s_load (x4/x8 = V#/T#) with a computed offset can be resolved
+            //    by the front end at the exact fetch PC, leaving placeholder words here. Typeless
+            //    x4/x8 loads whose words also feed ordinary ALU require real backing and reject
+            //    below; Uncharted's full-resolution compute writer has several such loads.
             //  * an s_buffer_load (0x8..0xC) with a TRACKED scalar offset is a computed constant-
             //    buffer read (DOLL's bloom-combine PS: per-tap weights at `vcc_lo = 16*(tap/2)`
             //    inside its counted loop, #273) — model it as a DYNAMIC dword index into the
@@ -5526,6 +5525,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             uint32_t soff_bits = 0; bool soff_dyn = false;
             if (!soff_null) {
                 if (rt && (in.opcode == 0x2 || in.opcode == 0x3)) {
+                    if (rs.smem_raw_wide_data_loads.contains(in.pc)) {
+                        if (getenv("PROSPER_DBG"))
+                            fprintf(stderr,
+                                    "[smem-reject] pc=%u reason=raw-wide-data-requires-backing "
+                                    "op=0x%x\n", in.pc, in.opcode);
+                        ok = false;
+                        return true;
+                    }
                     // An x4/x8 DESCRIPTOR load with a non-null soffset leaves here with placeholders
                     // and NO SRT tag, so every MIMG that consumes one of its descriptors reports
                     // srt_tag=NONE and cannot resolve. Say so when asked: whether the soffset is a

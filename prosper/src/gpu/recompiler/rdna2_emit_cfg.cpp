@@ -514,6 +514,125 @@ std::vector<uint32_t> proven_raw_x2_data_loads_impl(const std::vector<Rdna2Inst>
     return proven;
 }
 
+// A register-offset raw x4/x8 load is typeless. The legacy emitter treated every such load as
+// descriptor provenance and substituted zero for all of its words. That is wrong when even one
+// word feeds ordinary ALU (the full-resolution Uncharted compute writer does exactly this).
+// This inventory is deliberately conservative: an apparent data read on an alternate path can
+// cause a refusal, never a wrong zero. This inventory does not certify descriptor provenance;
+// the existing resource resolution still decides whether those consumers are supported.
+std::vector<uint32_t> raw_wide_data_loads_impl(const std::vector<Rdna2Inst>& ins) {
+    std::vector<uint32_t> data_loads;
+    std::unordered_map<uint32_t, size_t> by_pc;
+    for (size_t index = 0; index < ins.size(); ++index)
+        by_pc.emplace(ins[index].pc, index);
+    for (size_t load_index = 0; load_index < ins.size(); ++load_index) {
+        const Rdna2Inst& load = ins[load_index];
+        if (load.fmt != Rdna2Format::SMEM ||
+            (load.opcode != 0x2u && load.opcode != 0x3u) ||
+            (load.src[1].kind == OperandKind::Special && load.src[1].value == 125) ||
+            load.dst.kind != OperandKind::SGPR || load.dst.value < 0 ||
+            load.dst.value + (load.opcode == 0x2u ? 4 : 8) > 128)
+            continue;
+        const int first = load.dst.value;
+        const uint32_t words = load.opcode == 0x2u ? 4u : 8u;
+        bool data_read = first + static_cast<int>(words) > 106;
+        struct State { size_t index; uint16_t live; };
+        std::vector<State> pending;
+        std::unordered_set<uint64_t> visited;
+        if (load_index + 1 < ins.size())
+            pending.push_back({load_index + 1, static_cast<uint16_t>((1u << words) - 1u)});
+        while (!pending.empty() && !data_read) {
+            const State state = pending.back();
+            pending.pop_back();
+            if (!state.live || state.index >= ins.size() || state.index == load_index) continue;
+            const uint64_t key = (static_cast<uint64_t>(state.index) << 8u) | state.live;
+            if (!visited.insert(key).second) continue;
+            const Rdna2Inst& in = ins[state.index];
+            if (in.fmt == Rdna2Format::Unknown || !in.len_dwords ||
+                (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u)) {
+                data_read = true;
+                break;
+            }
+            if (in.is_end) continue;
+            uint16_t live = state.live;
+            auto overlaps_live = [&](int base, uint32_t width) {
+                if (base < 0) return false;
+                for (uint32_t word = 0; word < words; ++word)
+                    if ((live & (1u << word)) && base <= first + static_cast<int>(word) &&
+                        first + static_cast<int>(word) < base + static_cast<int>(width))
+                        return true;
+                return false;
+            };
+            if (scalar_implicit_destination_read_width(in) &&
+                overlaps_live(in.dst.value, scalar_implicit_destination_read_width(in)))
+                data_read = true;
+            for (uint32_t source = 0; source < in.n_src && !data_read; ++source) {
+                const Operand& operand = in.src[source];
+                if (operand.kind != OperandKind::SGPR &&
+                    !(operand.kind == OperandKind::Special &&
+                      operand.value >= 106 && operand.value <= 124)) continue;
+                const uint32_t width =
+                    in.fmt == Rdna2Format::MIMG && source == 1 ? 8u :
+                    in.fmt == Rdna2Format::MIMG && source == 2 ? 4u :
+                    (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) &&
+                        source == 1 ? 4u :
+                    in.fmt == Rdna2Format::SMEM && source == 0 ?
+                        (in.opcode >= 8u ? 4u : 2u) :
+                    // VOPC includes two-word integer compares; over-approximating its other
+                    // forms can only refuse a placeholder, never hide a live high half.
+                    (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
+                     in.fmt == Rdna2Format::SOPC || in.fmt == Rdna2Format::VOP3 ||
+                     in.fmt == Rdna2Format::VOPC) ? 2u : 1u;
+                if (!overlaps_live(operand.value, width)) continue;
+                const bool descriptor_read =
+                    (in.fmt == Rdna2Format::MIMG && (source == 1 || source == 2)) ||
+                    ((in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) &&
+                     source == 1) ||
+                    (in.fmt == Rdna2Format::SMEM && in.opcode >= 8u && source == 0);
+                if (!descriptor_read) data_read = true;
+            }
+            for_each_scalar_write(in, [&](int base, uint32_t width) {
+                if (base < 0) return;
+                for (uint32_t word = 0; word < words; ++word)
+                    if (base <= first + static_cast<int>(word) &&
+                        first + static_cast<int>(word) < base + static_cast<int>(width))
+                        live &= static_cast<uint16_t>(~(1u << word));
+            });
+            if (!live) continue;
+            if (in.fmt == Rdna2Format::SOPP &&
+                sopp_opcode_is_direct_branch(in.opcode)) {
+                const int64_t target_pc = static_cast<int64_t>(in.pc) +
+                    static_cast<int64_t>(in.len_dwords) + in.simm16;
+                if (target_pc < 0 || target_pc > UINT32_MAX) {
+                    data_read = true;
+                    break;
+                }
+                const auto target = by_pc.find(static_cast<uint32_t>(target_pc));
+                if (target == by_pc.end()) {
+                    // A valid branch beyond the decoded program terminates this path. A target
+                    // inside it which did not decode is unproven and cannot keep placeholders.
+                    if (target_pc <= ins.back().pc) data_read = true;
+                } else {
+                    pending.push_back({target->second, live});
+                }
+                if (in.opcode == kSoppOpcodeBranch) continue;
+            } else if (in.fmt == Rdna2Format::SOPP &&
+                       !sopp_is_noop(in) && in.opcode != 0x0au &&
+                       // These have no register or control effect in the emitter.
+                       in.opcode != 0x10u && in.opcode != 0x16u &&
+                       in.opcode != 0x17u) {
+                // An unclassified control transfer might enter a data reader omitted above.
+                data_read = true;
+                break;
+            }
+            if (state.index + 1 < ins.size())
+                pending.push_back({state.index + 1, live});
+        }
+        if (data_read) data_loads.push_back(load.pc);
+    }
+    return data_loads;
+}
+
 // Prove S_LOAD_DWORDX2 descriptor-fragment shapes. The load supplies one or two live words of a
 // four-dword V#; scalar code fills or replaces the other words before MUBUF, MTBUF, or S_BUFFER_LOAD
 // consumes the complete live descriptor. The front half has already read the guest words and
@@ -1191,6 +1310,10 @@ std::vector<uint32_t> rdna2_proven_raw_x2_data_loads(const std::vector<Rdna2Inst
     return proven_raw_x2_data_loads_impl(ins);
 }
 
+std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& ins) {
+    return raw_wide_data_loads_impl(ins);
+}
+
 int shader_max_vgpr(const std::vector<Rdna2Inst>& ins) {
     int highest = 0;
     for (const auto& in : ins) {
@@ -1525,6 +1648,8 @@ void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& in
     rs.smem_pointer_loads = proven_smem_pointer_loads(ins);
     const auto raw_x2_data = proven_raw_x2_data_loads_impl(ins);
     rs.smem_raw_x2_data_loads.insert(raw_x2_data.begin(), raw_x2_data.end());
+    const auto raw_wide_data = raw_wide_data_loads_impl(ins);
+    rs.smem_raw_wide_data_loads.insert(raw_wide_data.begin(), raw_wide_data.end());
     rs.smem_pointer_analysis_done = true;
 }
 
@@ -4130,6 +4255,7 @@ bool emit_cfg_state_machine(
         state.smem_x16_descriptor_analysis_done = initial.smem_x16_descriptor_analysis_done;
         state.smem_pointer_loads = initial.smem_pointer_loads;
         state.smem_raw_x2_data_loads = initial.smem_raw_x2_data_loads;
+        state.smem_raw_wide_data_loads = initial.smem_raw_wide_data_loads;
         state.smem_pointer_analysis_done = initial.smem_pointer_analysis_done;
         state.smem_x2_descriptor_fragment_loads =
             initial.smem_x2_descriptor_fragment_loads;

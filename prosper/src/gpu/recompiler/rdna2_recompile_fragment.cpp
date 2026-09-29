@@ -374,6 +374,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // PC-relative specialization removes its direct uses. Keep that binding out of an
     // unrelated scalar load's fallback even when the selected stream omits the load.
     const auto original_raw_x2_data = rdna2_proven_raw_x2_data_loads(ins);
+    const auto original_raw_wide_data = rdna2_raw_wide_data_loads(ins);
     if (pcrel_dispatch_target != UINT32_MAX) {
         const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(code, dwords);
         if (!specialize_pcrel_dispatch(ins, dispatch, pcrel_dispatch_target)) {
@@ -470,6 +471,8 @@ static std::vector<uint32_t> recompile_fragment_impl(
     seed_smem_pointer_provenance(rs, ins);
     rs.smem_raw_x2_data_loads.insert(original_raw_x2_data.begin(),
                                      original_raw_x2_data.end());
+    rs.smem_raw_wide_data_loads.insert(original_raw_wide_data.begin(),
+                                       original_raw_wide_data.end());
     // #2418: a static property of the decoded stream, set once and never mutated during emission.
     // Gates the fragment SCC re-arm after mask ops so only shaders that actually consume SCC pay the
     // exact-wave-vote's subgroup-size requirement.
