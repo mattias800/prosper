@@ -29,6 +29,7 @@ int main() { return 0; }
 
 #include "host/memory/guest_write_watch.hpp"
 #include "host/image/exec_image.hpp"
+#include "diagnostics/env_cache.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -485,6 +486,80 @@ int main() {
     munmap(a, span);
     munmap(b, span);
     close(fd);
+
+    // A single-VA watched page needs only the exact logical-range test. Prove the fast arm really
+    // skips the alias walk, then add a second VA to the SAME physical page and prove that the
+    // alias walk resumes. Removing it must restore the fast arm; a stale alias-count index would
+    // pass the content checks but silently forfeit the work reduction.
+    const size_t single_bytes = page * 2;
+    const int single_fd = make_memfd("prosper-ww-single-alias", single_bytes);
+    CHECK(single_fd >= 0, "single-alias memfd created");
+    if (single_fd >= 0) {
+        auto* single = static_cast<uint8_t*>(mmap(
+            nullptr, single_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, single_fd, 0));
+        CHECK(single != MAP_FAILED, "single-VA range mapped");
+        if (single != MAP_FAILED) {
+            const uint64_t single_va = reinterpret_cast<uint64_t>(single);
+            const uint64_t single_phys = kPhys + span * 3;
+            guest_write_watch_notify_direct_mapping_added(
+                single_va, single_bytes, single_phys, kCpuRw);
+            GuestWriteWatch on_single = GuestWriteWatch::create(single_va + 128, 64);
+            CHECK(static_cast<bool>(on_single), "single-VA watch created");
+            const bool force_alias_scan =
+                PROSPER_ENV_ON("PROSPER_WATCH_FORCE_ALIAS_SCAN");
+            if (on_single) {
+                const auto before = guest_write_watch_stats();
+                guest_write_watch_notify_gpu_write(single_va + 128, 64);
+                const auto after = guest_write_watch_stats();
+                CHECK(on_single.query() == GuestWriteWatchQuery::Dirty,
+                      "logical GPU write still dirties a single-VA watch");
+                CHECK(after.gpu_write_alias_single_va_skips -
+                          before.gpu_write_alias_single_va_skips ==
+                          static_cast<uint64_t>(!force_alias_scan),
+                      "single-VA alias walk follows the selected policy");
+                CHECK((after.gpu_write_alias_pages > before.gpu_write_alias_pages) ==
+                          force_alias_scan,
+                      "forced alias scan visits the watched page; fast arm does not");
+                CHECK(on_single.rearm(), "single-VA watch rearms");
+
+                auto* sibling = static_cast<uint8_t*>(mmap(
+                    nullptr, page, PROT_READ | PROT_WRITE, MAP_SHARED, single_fd, 0));
+                CHECK(sibling != MAP_FAILED, "late sibling alias mapped");
+                if (sibling != MAP_FAILED) {
+                    const uint64_t sibling_va = reinterpret_cast<uint64_t>(sibling);
+                    guest_write_watch_notify_direct_mapping_added(
+                        sibling_va, page, single_phys, kCpuRw);
+                    const auto aliased_before = guest_write_watch_stats();
+                    guest_write_watch_notify_gpu_write(sibling_va + 128, 64);
+                    const auto aliased_after = guest_write_watch_stats();
+                    CHECK(on_single.query() == GuestWriteWatchQuery::Dirty,
+                          "late sibling GPU write dirties the original VA watch");
+                    CHECK(aliased_after.gpu_write_alias_single_va_skips ==
+                              aliased_before.gpu_write_alias_single_va_skips &&
+                          aliased_after.gpu_write_alias_pages >
+                              aliased_before.gpu_write_alias_pages,
+                          "second VA restores the physical-alias scan");
+                    CHECK(on_single.rearm(), "watch rearms after sibling write");
+                    guest_write_watch_notify_direct_mapping_removed(sibling_va, page);
+                    munmap(sibling, page);
+                    CHECK(on_single.rearm(), "watch rearms after sibling removal");
+                    const auto removed_before = guest_write_watch_stats();
+                    guest_write_watch_notify_gpu_write(single_va + 128, 64);
+                    const auto removed_after = guest_write_watch_stats();
+                    CHECK(on_single.query() == GuestWriteWatchQuery::Dirty,
+                          "original VA still dirties after sibling removal");
+                    CHECK(removed_after.gpu_write_alias_single_va_skips -
+                              removed_before.gpu_write_alias_single_va_skips ==
+                              static_cast<uint64_t>(!force_alias_scan),
+                          "sibling removal restores the single-VA fast arm");
+                }
+                on_single.reset();
+            }
+            guest_write_watch_notify_direct_mapping_removed(single_va, single_bytes);
+            munmap(single, single_bytes);
+        }
+        close(single_fd);
+    }
 
     if (failures) return 1;
     std::puts("== PASS ==");
