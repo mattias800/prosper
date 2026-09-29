@@ -1159,6 +1159,53 @@ int main() {
               raw_wide_data_pcs(raw_x4_stale_scc_descriptor) ==
                   std::vector<uint32_t>{0u},
           "fresh SCC replacement preserves descriptor-only use; stale SCC branch requires data");
+    const std::array<uint32_t, 7> raw_x4_register_descriptor_patch = {
+        0xbe940380u,              // pc0: s20=0, register SOFFSET
+        0xf4080600u, 0x28000000u, // pc1: x4 s[24:27] from s[0:1],s20
+        0x8f188118u,              // pc3: patch s24 and SCC
+        0xe0302000u, 0x80060404u, // pc4: only consumer is a buffer descriptor
+        0xbf810000u,
+    };
+    const std::array<uint32_t, 8> raw_x4_register_numeric = {
+        0xbe940380u,
+        0xf4080600u, 0x28000000u,
+        0x8f188118u,
+        0x7e000218u,              // pc4: v_mov_b32 v0,s24 observes the loaded value
+        0xe0302000u, 0x80060404u,
+        0xbf810000u,
+    };
+    CHECK(raw_wide_data_pcs(raw_x4_register_descriptor_patch).empty() &&
+              raw_wide_data_pcs(raw_x4_register_numeric) ==
+                  std::vector<uint32_t>{1u},
+          "register-offset descriptor patch admits while an ordinary data reader still rejects");
+    const std::array<uint32_t, 9> raw_x4_register_after_store = {
+        0xe0700000u, 0x80000100u, // pc0: buffer_store_dword may alias descriptor bytes
+        0xbe940380u,
+        0xf4080600u, 0x28000000u, // pc3: computed-offset x4
+        0x8f188118u,
+        0xe0302000u, 0x80060404u,
+        0xbf810000u,
+    };
+    CHECK(raw_wide_data_pcs(raw_x4_register_after_store) ==
+              std::vector<uint32_t>{3u},
+          "shader writes revoke register-offset descriptor snapshot admission");
+    ShaderResourceTable raw_x4_register_rt;
+    ShaderResource raw_x4_register_buffer{};
+    raw_x4_register_buffer.cls = ResourceClass::VertexBuffer;
+    raw_x4_register_buffer.binding = 4;
+    raw_x4_register_buffer.fetch_pc = 4;
+    raw_x4_register_buffer.gpu_addr = 0x240000u;
+    raw_x4_register_buffer.size = 128;
+    raw_x4_register_rt.resources.push_back(raw_x4_register_buffer);
+    auto raw_x4_numeric_rt = raw_x4_register_rt;
+    raw_x4_numeric_rt.resources[0].fetch_pc = 5;
+    CHECK(!recompile_valu(raw_x4_register_descriptor_patch.data(),
+                          raw_x4_register_descriptor_patch.size(), 1, 0,
+                          &raw_x4_register_rt).empty() &&
+              recompile_valu(raw_x4_register_numeric.data(),
+                             raw_x4_register_numeric.size(), 1, 0,
+                             &raw_x4_numeric_rt).empty(),
+          "exact-PC register-offset descriptor shader compiles but a numeric reader still rejects");
     const std::array<uint32_t, 7> raw_x4_copy_bypass_clobber = {
         0xf4080100u, 0xfa000020u, // x4 s[4:7]
         0xbe940304u,              // s_mov_b32 s20,s4
