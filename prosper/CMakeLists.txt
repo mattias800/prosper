@@ -3637,6 +3637,15 @@ endif()
                COMMAND test_depth_only_attachment_extent --readback-path)
       set_tests_properties(depth_only_attachment_extent_readback PROPERTIES
                            ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1")
+      # #3892: when the live renderer callback's prelude statics initialise, across two
+      # registrations in one process. Own process: every arm needs untouched statics.
+      add_executable(test_live_renderer_registration_statics
+        tests/shared/live/test_live_renderer_registration_statics.cpp)
+      target_include_directories(test_live_renderer_registration_statics PRIVATE frontends src tests)
+      target_link_libraries(test_live_renderer_registration_statics PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME live_renderer_registration_statics COMMAND test_live_renderer_registration_statics)
+      set_tests_properties(live_renderer_registration_statics PROPERTIES ENVIRONMENT_MODIFICATION
+        "PROSPER_RENDER_DELAY_MS=unset:;PROSPER_TEXTURE_DECODE_CACHE_MB=unset:")
       add_executable(test_float32_array_upload tests/shared/live/test_float32_array_upload.cpp)
       target_include_directories(test_float32_array_upload PRIVATE frontends src tests)
       target_link_libraries(test_float32_array_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)

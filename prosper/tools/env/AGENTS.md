@@ -15,7 +15,9 @@ are actually hot. This folder is about the switch surface itself.
   sampled once at first use, so a test that arms a diagnostic and then asserts on it does not fail
   when the read is cached: it goes **vacuous** and keeps printing `[ok]`. Run this before converting
   any `getenv` to `PROSPER_ENV_ON` / `PROSPER_ENV_VALUE`. The macros, and the reasoning behind the
-  whole scheme, live in `src/diagnostics/env_cache.hpp`.
+  whole scheme, live in `src/diagnostics/env_cache.hpp`. Its only exception list, `CACHED_ONCE_PINS`,
+  is for a test whose assertion is that the arm is NOT observed (#3892's registration-statics
+  harness). Each entry is one file and one name with a reason, and a stale entry fails the gate.
 - **`check_diag_gates.py`** + `diag_gate_baseline.txt` — finds a diagnostic whose *producer* and
   whose *printer* are armed by different switches, so arming the one whose name matches your
   question yields a zero that reads as data. The baseline is a classification, not a suppression
