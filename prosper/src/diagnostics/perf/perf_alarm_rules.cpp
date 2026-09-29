@@ -73,6 +73,8 @@ RuleThresholds RuleThresholds::scaled(double percent) {
     t.present_slot_trouble_share *= k;
     t.rtt_destination_refused_mib_per_flip *= k;
     t.color_target_ceiling_evictions_per_s *= k;
+    t.gpu_sync_wait_budget_share *= k;
+    // gpu_sync_wait_max_gpu_busy is a STATE bound (GPU headroom), like the byte share above.
     // color_target_ceiling_byte_share is a STATE bound ("the budget is mostly free"), not a
     // sensitivity: lowering it would make the rule harder to fire, the opposite of the knob's intent.
     // The flip floors are sample sizes, not sensitivities: they do not scale.
@@ -90,7 +92,7 @@ const std::vector<const char*>& rule_names() {
         "gpu-memory-off-device", "unaccounted-draws",   "unimplemented-hle-calls",
         "diagnostic-path-active", "present-path-fallback", "pipeline-cache-thrash",
         "texture-validation-churn", "host-copy-per-flip", "present-slot-trouble",
-        "rtt-destination-refused", "color-target-count-ceiling",
+        "rtt-destination-refused", "color-target-count-ceiling", "gpu-sync-wait",
     };
     return names;
 }
@@ -110,6 +112,7 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
     if (r == "present-path-fallback")
         return w.events(Cost::PresentCpu) != 0 || w.count(Counter::PresentCpuFallbacks) != 0;
     if (r == "rtt-destination-refused") return w.flips >= kRttDestinationRefusedMinFlips;
+    if (r == "gpu-sync-wait") return gpu_sync_wait_has_data(w);
     // A run whose renderer never consulted the persistent colour-target cache has no bound to be at.
     if (r == "color-target-count-ceiling") return w.gauge(Gauge::PersistentTargetEntryLimit) != 0;
     // The others measure events whose ABSENCE is the healthy answer: no readback, no contended
@@ -154,6 +157,14 @@ std::vector<std::pair<const char*, uint64_t>> rtt_destination_refused_mib(const 
         mib[i] = static_cast<uint64_t>(w.rtt_destination_refused_bytes[i] / kMiB + 0.5);
     }
     return ranked(mib, names, kRttDestinationRefusalSlots);
+}
+
+bool gpu_sync_wait_has_data(const WindowSample& w) {
+    const uint64_t waits = w.events(Cost::GpuWaitCompute) + w.events(Cost::GpuWaitGraphics);
+    const uint64_t samples = w.count(Counter::GpuDeviceSamplesCompute) +
+                             w.count(Counter::GpuDeviceSamplesGraphics);
+    return w.flips >= kGpuSyncWaitMinFlips && waits &&
+           static_cast<double>(samples) >= kGpuSyncWaitMinDeviceCoverage * static_cast<double>(waits);
 }
 
 uint64_t destination_creation_refused_bytes(const WindowSample& w) {
@@ -751,6 +762,42 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                      "rtt-destination-refused). next: the [persistent-targets] PEAK residency exit "
                      "line; A/B PROSPER_BACKEND_TARGET_CACHE_COUNT (its `of N entries` proves the "
                      "lever moved); cf. #3873, #1177";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // gpu-sync-wait (SHARE of the budget, idle part of the wait).
+    if (gpu_sync_wait_has_data(w)) {
+        const double wait_ms = w.ms(Cost::GpuWaitCompute) + w.ms(Cost::GpuWaitGraphics);
+        const double device_ms = (w.count(Counter::GpuDeviceNsCompute) +
+                                  w.count(Counter::GpuDeviceNsGraphics)) / 1e6;
+        const double share = wait_ms / static_cast<double>(w.flips) / budget;
+        const double idle = wait_ms > 0 ? std::max(0.0, 1.0 - device_ms / wait_ms) : 0.0;
+        const double gpu_busy = device_ms / (w.seconds * 1000.0);
+        if (share >= t.gpu_sync_wait_budget_share && gpu_busy <= t.gpu_sync_wait_max_gpu_busy) {
+            AlarmFiring a;
+            a.rule = "gpu-sync-wait";
+            a.value = share * 100.0;
+            a.unit = "%budget";
+            a.threshold = t.gpu_sync_wait_budget_share * 100.0;
+            a.cost_ms = wait_ms;
+            a.detail = format("wait=%.0fms (compute %.0fms/%llu, graphics %.0fms/%llu) "
+                              "gpu-device=%.0fms (%llu+%llu samples) idle-in-wait=%.0f%% "
+                              "gpu-busy=%.0f%% flips=%llu budget=%.1fms(%uHz)",
+                              wait_ms, w.ms(Cost::GpuWaitCompute),
+                              (unsigned long long)w.events(Cost::GpuWaitCompute),
+                              w.ms(Cost::GpuWaitGraphics),
+                              (unsigned long long)w.events(Cost::GpuWaitGraphics), device_ms,
+                              (unsigned long long)w.count(Counter::GpuDeviceSamplesCompute),
+                              (unsigned long long)w.count(Counter::GpuDeviceSamplesGraphics),
+                              idle * 100.0, gpu_busy * 100.0, (unsigned long long)w.flips,
+                              budget, w.target_hz);
+            a.hint = "the executor thread spends this share of every frame blocked on fences of "
+                     "work it just submitted while the GPU has headroom: the renderer runs "
+                     "synchronously inside the guest's submit, so CPU and GPU work never overlap "
+                     "(cost~ is the whole wait, the most overlap could recover; idle-in-wait is the "
+                     "part batching submits would save). next: F8 compute wait/wb and "
+                     "gpu-wait-overhead; the staged fix is #3948";
             out.push_back(std::move(a));
         }
     }

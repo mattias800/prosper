@@ -236,3 +236,10 @@ FIRST failing field of the exact full-overwrite shape test (`ExactResultDecline`
 `exact_full_result`'s order), then the post-shape format declines, then `accepted`; the JSONL window
 carries it as `exact_result_verdicts`. `exact_full_result` is defined as "the verdict is accepted",
 so a new condition in the shape test is added to `exact_result_verdict` with a verdict of its own.
+
+**Synchronous GPU waits** (#3948 stage 0). `Cost::GpuWaitCompute` / `GpuWaitGraphics` are one clock
+pair around each executor fence wait (a compute dispatch's, a graphics submission batch's), and
+`Counter::GpuDevice*` carry the GPU time inside them from one timestamp pair per dispatch or batch,
+armed whenever the ledger is (per dispatch/batch, never per draw). `gpu-sync-wait` fires when the
+waits exceed 75% of the frame budget per flip while the GPU is under half busy: the cost
+asynchronous submission would recover. `idle-in-wait` in its line is the part batching would save.

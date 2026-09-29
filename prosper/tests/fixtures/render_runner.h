@@ -2807,9 +2807,15 @@ public:
             std::fflush(stderr);
         }
         if (result.submit_result == VK_SUCCESS) {
+            const uint64_t wait_start_ns = prosper::diagnostics::perf::enabled()
+                ? prosper::diagnostics::perf::now_ns() : 0;
             result.wait_result = vkWaitForFences(
                 dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
             result.fence_waits = 1;
+            if (wait_start_ns)   // #3948 stage 0
+                prosper::diagnostics::perf::add_cost(
+                    prosper::diagnostics::perf::Cost::GpuWaitGraphics,
+                    prosper::diagnostics::perf::now_ns() - wait_start_ns);
             // Preserve lifetime safety even if the bounded diagnostic wait expires.
             if (result.wait_result != VK_SUCCESS)
                 result.wait_result = render_locked_queue_wait_idle(queue);
@@ -2860,6 +2866,12 @@ public:
                     result.gpu_device_ms =
                         static_cast<double>(ticks) * gpu_timestamp_.period_ns / 1'000'000.0;
                     result.gpu_timestamp_samples = 1;
+                    prosper::diagnostics::perf::add(
+                        prosper::diagnostics::perf::Counter::GpuDeviceNsGraphics,
+                        static_cast<uint64_t>(static_cast<double>(ticks) *
+                                              gpu_timestamp_.period_ns));
+                    prosper::diagnostics::perf::add(
+                        prosper::diagnostics::perf::Counter::GpuDeviceSamplesGraphics);
                 }
             }
             release_gpu_timestamp();
@@ -13340,7 +13352,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     VkCommandBuffer cmd = command_pool_lease.lease.command;   // see RenderCommandPoolEntry
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cbbi);
-    if (timing_enabled)
+    // The batch envelope also feeds the perf ledger's GPU-wait split (#3948 stage 0), so it is
+    // armed whenever the ledger is: one 2-query pool per batch, not per draw.
+    const bool batch_gpu_timestamp = timing_enabled || prosper::diagnostics::perf::enabled();
+    if (batch_gpu_timestamp)
         active_submission.begin_gpu_timestamp(
             dev, cmd, ctx.timestamp_period_ns, ctx.timestamp_valid_bits);
     if (transition_cached_color) {
@@ -14522,7 +14537,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 cached_extra[slot] != nullptr,
                 !color_target || color_target->readback_slots[slot], extra_images[slot]);
     }
-    if (timing_enabled && flush_now)
+    if (batch_gpu_timestamp && flush_now)
         active_submission.end_gpu_timestamp(cmd);
     if (buffer_verify_enabled) {
         // Compare the mapped allocation against the source words. A mismatch names the first

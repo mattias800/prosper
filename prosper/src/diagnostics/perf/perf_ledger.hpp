@@ -62,6 +62,12 @@ enum class Cost : uint8_t {
     // creation is NOT inside it). The driver's own compile lives here. Summed thread time, so
     // threads queued on that lock each count their wait.
     PipelineCreate,
+    // #3948 stage 0: the executor thread blocked on a GPU fence it just submitted -- one compute
+    // dispatch's fence, or one graphics submission batch's fence. The GPU device time INSIDE those
+    // waits is counted separately (Counter::GpuDevice*Ns), so wait minus device is what the
+    // synchronous design costs beyond the GPU's own work: submission latency plus idle GPU.
+    GpuWaitCompute,
+    GpuWaitGraphics,
     Count
 };
 
@@ -103,6 +109,12 @@ enum class Counter : uint8_t {
     PersistentTargetEvictedBytes,
     ExactResultCandidates,         // compute storage-writeback results tested for the exact
                                    // full-overwrite shape (live_compute's exact_full_result)
+    // #3948 stage 0: GPU device time (timestamp pair) of the work inside the waits above, and how
+    // many waits carried a readable pair. A wait without one counts in Cost::GpuWait* only.
+    GpuDeviceNsCompute,
+    GpuDeviceSamplesCompute,
+    GpuDeviceNsGraphics,
+    GpuDeviceSamplesGraphics,
     Count
 };
 

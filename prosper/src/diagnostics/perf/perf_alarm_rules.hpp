@@ -211,6 +211,28 @@ constexpr double kColorTargetCeilingEvictionsPerSecond = 2.0;   // > 10 per 5 s 
 // The destination refusal name (live_target_import_refusal_name) that means "no room".
 constexpr const char* kDestinationCreationRefused = "destination-creation-refused";
 
+// gpu-sync-wait: SHARE of the frame budget (#3948 stage 0). The executor thread blocked on the fence
+// of work it had just submitted -- each compute dispatch's, each graphics batch's -- summed per guest
+// flip, while the GPU had headroom: the device time measured inside those waits (a timestamp pair per
+// dispatch/batch) is under half of wall time. Overlapping CPU work with that GPU work is what
+// asynchronous submission recovers, so the whole wait is the recoverable cost -- unless the GPU is
+// saturated, which is the case this rule must stay quiet on. Measured 2026-09-29 (prosper-app, GPU
+// present, routed gameplay, this rule's JSONL):
+//   * GTA V perf-story gameplay: waits ~1,060 ms per 5 s window (compute ~510 ms over ~1,520
+//     dispatches, graphics ~550 ms over ~2,490 batches) = 120-140% of the budget per flip; device
+//     time inside ~860 ms, so the GPU runs prosper's work ~17% of wall time and ~19% of each wait
+//     is idle/latency. Fired in 37 of 58 windows, every gameplay window, never before gameplay.
+//   * Sonic Frontiers: menus 49-51% of the budget; gameplay 150-163%, GPU ~25% busy, 13-24% idle.
+// 75% sits above Sonic's ~50% menus (which would flicker at a 50% bar) and well below both titles'
+// gameplay. The idle share is reported, not thresholded: it is what BATCHING submits would save,
+// while the device part is what OVERLAP saves.
+constexpr double kGpuSyncWaitBudgetShare = 0.75;
+constexpr double kGpuSyncWaitMaxGpuBusy = 0.5;
+// ...over enough flips for a per-frame mean, and with device time sampled on at least half the waits
+// (without samples the rule cannot tell a saturated GPU from an idle one, so it has no data).
+constexpr uint64_t kGpuSyncWaitMinFlips = 10;
+constexpr double kGpuSyncWaitMinDeviceCoverage = 0.5;
+
 // SUSTAIN: consecutive windows a rule's condition must hold before the engine reports it. A cost
 // that lasts one window is usually a load, and a steady-state alarm should not fire on it; a
 // correctness alarm fires on the first window.
@@ -300,6 +322,8 @@ struct RuleThresholds {
     uint64_t rtt_destination_refused_min_flips = kRttDestinationRefusedMinFlips;
     double color_target_ceiling_byte_share = kColorTargetCeilingByteShare;
     double color_target_ceiling_evictions_per_s = kColorTargetCeilingEvictionsPerSecond;
+    double gpu_sync_wait_budget_share = kGpuSyncWaitBudgetShare;
+    double gpu_sync_wait_max_gpu_busy = kGpuSyncWaitMaxGpuBusy;
 
     static RuleThresholds scaled(double percent);
 };
@@ -350,6 +374,8 @@ void apply_reporting_deferrals(std::vector<AlarmFiring>& reported);
 uint64_t present_slot_trouble_declines(const WindowSample& w);
 // The window's rtt-destination-refused breakdown in whole MiB per refusal reason, largest first.
 std::vector<std::pair<const char*, uint64_t>> rtt_destination_refused_mib(const WindowSample& w);
+// gpu-sync-wait's inputs: whether the window's device-time samples cover enough of its waits.
+bool gpu_sync_wait_has_data(const WindowSample& w);
 // The window's refused bytes whose reason is kDestinationCreationRefused.
 uint64_t destination_creation_refused_bytes(const WindowSample& w);
 
