@@ -242,6 +242,15 @@ constexpr double kGpuSyncWaitMaxGpuBusy = 0.5;
 constexpr uint64_t kGpuSyncWaitMinFlips = 10;
 constexpr double kGpuSyncWaitMinDeviceCoverage = 0.5;
 
+// gpu-device-time-coverage: instrument validity (#3891). Missing batch timestamp envelopes
+// hid roughly a third of graphics device time in #3964's first ON arms. Corrected GTA windows
+// cover about 88-89% of graphics waits; 80% separates those populations. Check each stream
+// independently: complete compute samples must not mask missing graphics samples. A 100-wait
+// floor and two-window sustain tolerate a few timestamps crossing a window boundary. This is
+// a sampling bound, not a performance sensitivity, so the threshold scale does not change it.
+constexpr double kGpuDeviceTimeMinCoverage = 0.8;
+constexpr uint64_t kGpuDeviceTimeCoverageMinWaits = 100;
+
 // SUSTAIN: consecutive windows a rule's condition must hold before the engine reports it. A cost
 // that lasts one window is usually a load, and a steady-state alarm should not fire on it; a
 // correctness alarm fires on the first window.

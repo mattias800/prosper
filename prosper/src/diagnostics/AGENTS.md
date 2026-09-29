@@ -258,6 +258,14 @@ signal of the synchronous architecture, not a defect of those runs, and the gene
 rule firing on a healthy run gets tuned or removed does not apply to it until #3948's later stages
 land. Retune or retire it then; do not "fix" it before.
 
+`gpu-device-time-coverage` checks timestamp samples against fence waits separately for compute
+and graphics. Fewer than 80% sampled over at least 100 waits in either stream, sustained over
+two windows, means the GPU-busy estimate is incomplete; `gpu-sync-wait` then has **NO DATA**.
+Complete compute samples cannot hide missing graphics envelopes. Corrected #3964 gameplay
+windows cover about 89% of graphics waits; the broken deferred-envelope arms cover about
+68-71%. This uses the existing counters at window close and adds no event hook. Check timestamp
+support, query results and envelope closure before drawing performance conclusions from it.
+
 **A window nobody saw** (#3891, #3951). `gpu-present-stalled` fires when a GPU-present frontend
 (`Gauge::GpuPresentActive`, set by `set_gpu_present_active`) presented nothing in a window, neither
 a GPU scanout (`Cost::PresentCpu` events) nor a CPU fallback, while the guest flipped at least 20

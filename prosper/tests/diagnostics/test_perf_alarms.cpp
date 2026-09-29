@@ -1109,11 +1109,11 @@ void test_engine() {
     const std::string quiet = slurp(logp);
     check("...saying no rule fired", quiet.find("no rule fired in 1 windows") != std::string::npos);
     check("...and listing the rules that had no data as NOT quiet",
-          quiet.find("15 of 22 rules had data") != std::string::npos &&
+          quiet.find("15 of 23 rules had data") != std::string::npos &&
               quiet.find("NO DATA (not measured in any window, so not quiet): "
                          "texture-reference-cost,present-cpu-overhead,present-path-fallback,"
                          "present-slot-trouble,color-target-count-ceiling,gpu-sync-wait,"
-                         "gpu-present-stalled") != std::string::npos);
+                         "gpu-present-stalled,gpu-device-time-coverage") != std::string::npos);
     std::fclose(s);
     std::remove(jsonl.c_str());
     std::remove(logp.c_str());
@@ -1614,8 +1614,9 @@ WindowSample sync_wait_window(double compute_wait_ms, uint64_t dispatches, doubl
     set_cost(w, Cost::GpuWaitGraphics, graphics_wait_ms, batches, 1.0);
     set_count(w, Counter::GpuDeviceNsCompute, static_cast<uint64_t>(device_ms * 0.5 * 1e6));
     set_count(w, Counter::GpuDeviceNsGraphics, static_cast<uint64_t>(device_ms * 0.5 * 1e6));
-    set_count(w, Counter::GpuDeviceSamplesCompute, samples / 2);
-    set_count(w, Counter::GpuDeviceSamplesGraphics, samples - samples / 2);
+    const uint64_t compute_samples = samples * dispatches / (dispatches + batches);
+    set_count(w, Counter::GpuDeviceSamplesCompute, compute_samples);
+    set_count(w, Counter::GpuDeviceSamplesGraphics, samples - compute_samples);
     return w;
 }
 
@@ -1643,11 +1644,80 @@ void test_gpu_sync_wait() {
     const WindowSample unsampled = sync_wait_window(513, 1520, 546, 2485, 0, 1000);
     check("with device time on under half of the waits there is no data, and no firing",
           !rule_has_data("gpu-sync-wait", unsampled) &&
-              evaluate_rules(unsampled, kDefault).empty());
+              !fired(evaluate_rules(unsampled, kDefault), "gpu-sync-wait"));
     WindowSample few = sync_wait_window(513, 1520, 546, 2485, 859, 3729);
     few.flips = 9;
     check("under the 10-flip floor there is no data", !rule_has_data("gpu-sync-wait", few));
     check("its sustain is two windows", sustain_windows("gpu-sync-wait") == 2);
+}
+
+void test_gpu_device_time_coverage() {
+    std::puts("gpu-device-time-coverage");
+    // #3964's missing deferred envelope: graphics coverage stayed near 68-71% for
+    // 38 gameplay windows. Corrected arms stay near 88-89%. Construct both populations
+    // independently of the rule, including the all-compute masking case below.
+    WindowSample broken = sync_wait_window(513, 1500, 546, 2500, 600, 4000);
+    set_count(broken, Counter::GpuDeviceSamplesCompute, 1500);
+    set_count(broken, Counter::GpuDeviceSamplesGraphics, 1750);
+    const auto a = evaluate_rules(broken, kDefault);
+    check("the missing-envelope population fires coverage alone, withholding headroom",
+          only(a, "gpu-device-time-coverage") && !rule_has_data("gpu-sync-wait", broken));
+    check("...the value is the worst stream's missing share and detail names both streams",
+          !a.empty() && a[0].value > 29.9 && a[0].value < 30.1 &&
+              std::string(a[0].unit) == "%unsampled" &&
+              a[0].detail.find("compute=1500/1500 graphics=1750/2500") != std::string::npos);
+    WindowSample fixed = broken;
+    set_count(fixed, Counter::GpuDeviceSamplesGraphics, 2225);
+    check("corrected 89% graphics coverage is quiet and restores gpu-sync-wait data",
+          !fired(evaluate_rules(fixed, kDefault), "gpu-device-time-coverage") &&
+              rule_has_data("gpu-sync-wait", fixed));
+
+    WindowSample masked = sync_wait_window(513, 10000, 546, 1000, 600, 11000);
+    set_count(masked, Counter::GpuDeviceSamplesCompute, 10000);
+    set_count(masked, Counter::GpuDeviceSamplesGraphics, 0);
+    check("91% aggregate coverage cannot mask completely missing graphics timestamps",
+          only(evaluate_rules(masked, kDefault), "gpu-device-time-coverage") &&
+              !rule_has_data("gpu-sync-wait", masked));
+    WindowSample compute_gap = broken;
+    set_count(compute_gap, Counter::GpuDeviceSamplesCompute, 0);
+    set_count(compute_gap, Counter::GpuDeviceSamplesGraphics, 2500);
+    check("a missing compute stream is caught independently too",
+          only(evaluate_rules(compute_gap, kDefault), "gpu-device-time-coverage"));
+
+    WindowSample boundary = healthy();
+    set_cost(boundary, Cost::GpuWaitGraphics, 10, 100, 1);
+    set_count(boundary, Counter::GpuDeviceSamplesGraphics, 80);
+    check("80% coverage at the wait floor is data and quiet",
+          rule_has_data("gpu-device-time-coverage", boundary) &&
+              evaluate_rules(boundary, kDefault).empty());
+    set_count(boundary, Counter::GpuDeviceSamplesGraphics, 79);
+    check("79% at the wait floor fires", only(evaluate_rules(boundary, kDefault),
+                                            "gpu-device-time-coverage"));
+    check("threshold sensitivity does not change the instrument-validity bound",
+          only(evaluate_rules(boundary, RuleThresholds::scaled(25)),
+               "gpu-device-time-coverage"));
+    set_cost(boundary, Cost::GpuWaitGraphics, 10, 99, 1);
+    set_count(boundary, Counter::GpuDeviceSamplesGraphics, 0);
+    check("a small unmatched population below the wait floor has no coverage data",
+          !rule_has_data("gpu-device-time-coverage", boundary) &&
+              evaluate_rules(boundary, kDefault).empty());
+    check("a GPU-free window is NO DATA, not measured quiet",
+          !rule_has_data("gpu-device-time-coverage", healthy()));
+    WindowSample extra = fixed;
+    set_count(extra, Counter::GpuDeviceSamplesGraphics, 2501);
+    check("an extra sample across a window boundary does not imply missing coverage",
+          !fired(evaluate_rules(extra, kDefault), "gpu-device-time-coverage"));
+
+    EngineConfig config;
+    config.log = nullptr;
+    AlarmEngine engine(std::move(config));
+    check("one incomplete window is not reported", engine.close_window(broken, 5).empty());
+    check("two incomplete windows report the validity alarm",
+          only(engine.close_window(broken, 10), "gpu-device-time-coverage"));
+    engine.close_window(healthy(), 15);
+    check("a no-data window resets its sustain",
+          engine.close_window(broken, 20).empty() &&
+              engine.times_fired("gpu-device-time-coverage") == 1);
 }
 
 }  // namespace
@@ -1688,11 +1758,13 @@ int main() {
     test_exact_result_census();
     test_engine_2026_09_29_censuses();
     test_gpu_sync_wait();
+    test_gpu_device_time_coverage();
     check("rule_names lists the six phase-2 rules, the three added with phase 3, "
           "gpu-memory-off-device (#3897), the six 2026-09-28 queue rules and the two "
           "2026-09-29 ones (host-copy-per-flip, present-slot-trouble, rtt-destination-refused, "
-          "color-target-count-ceiling), gpu-sync-wait (#3948) and gpu-present-stalled (#3951)",
-          rule_names().size() == 22);
+          "color-target-count-ceiling), gpu-sync-wait (#3948), gpu-present-stalled (#3951) "
+          "and gpu-device-time-coverage (#3891)",
+          rule_names().size() == 23);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ok", g_failures);
     return g_failures ? 1 : 0;
 }

@@ -26,6 +26,18 @@ double per_second(uint64_t n, double seconds) {
 
 constexpr double kMiB = 1024.0 * 1024.0;
 
+bool device_time_coverage_gap(uint64_t waits, uint64_t samples) {
+    return waits >= kGpuDeviceTimeCoverageMinWaits &&
+           static_cast<double>(samples) < kGpuDeviceTimeMinCoverage * static_cast<double>(waits);
+}
+
+bool device_time_coverage_gap(const WindowSample& w) {
+    return device_time_coverage_gap(w.events(Cost::GpuWaitCompute),
+                                   w.count(Counter::GpuDeviceSamplesCompute)) ||
+           device_time_coverage_gap(w.events(Cost::GpuWaitGraphics),
+                                   w.count(Counter::GpuDeviceSamplesGraphics));
+}
+
 }  // namespace
 
 std::vector<std::pair<const char*, uint64_t>> ranked(const uint64_t* counts,
@@ -94,6 +106,7 @@ const std::vector<const char*>& rule_names() {
         "texture-validation-churn", "host-copy-per-flip", "present-slot-trouble",
         "rtt-destination-refused", "color-target-count-ceiling", "gpu-sync-wait",
         "gpu-present-stalled",
+        "gpu-device-time-coverage",
     };
     return names;
 }
@@ -114,6 +127,9 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
         return w.events(Cost::PresentCpu) != 0 || w.count(Counter::PresentCpuFallbacks) != 0;
     if (r == "rtt-destination-refused") return w.flips >= kRttDestinationRefusedMinFlips;
     if (r == "gpu-sync-wait") return gpu_sync_wait_has_data(w);
+    if (r == "gpu-device-time-coverage")
+        return w.events(Cost::GpuWaitCompute) >= kGpuDeviceTimeCoverageMinWaits ||
+               w.events(Cost::GpuWaitGraphics) >= kGpuDeviceTimeCoverageMinWaits;
     // Only a frontend with a GPU-present consumer is expected to present at all; a window without
     // enough guest flips cannot say whether presents SHOULD have happened.
     if (r == "gpu-present-stalled")
@@ -169,7 +185,7 @@ bool gpu_sync_wait_has_data(const WindowSample& w) {
     const uint64_t waits = w.events(Cost::GpuWaitCompute) + w.events(Cost::GpuWaitGraphics);
     const uint64_t samples = w.count(Counter::GpuDeviceSamplesCompute) +
                              w.count(Counter::GpuDeviceSamplesGraphics);
-    return w.flips >= kGpuSyncWaitMinFlips && waits &&
+    return w.flips >= kGpuSyncWaitMinFlips && waits && !device_time_coverage_gap(w) &&
            static_cast<double>(samples) >= kGpuSyncWaitMinDeviceCoverage * static_cast<double>(waits);
 }
 
@@ -828,6 +844,36 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                      "PRESENT DECLINED line, PROSPER_PRESENT_HANDOFF_TRACE=1; cf. #3951";
             out.push_back(std::move(a));
         }
+    }
+
+    // Instrument validity: a partial device-time ledger must not imply GPU headroom. One
+    // well-covered stream cannot compensate for the other, even if the aggregate ratio is high.
+    if (device_time_coverage_gap(w)) {
+        const uint64_t compute_waits = w.events(Cost::GpuWaitCompute);
+        const uint64_t graphics_waits = w.events(Cost::GpuWaitGraphics);
+        const uint64_t compute_samples = w.count(Counter::GpuDeviceSamplesCompute);
+        const uint64_t graphics_samples = w.count(Counter::GpuDeviceSamplesGraphics);
+        double missing_share = 0;
+        if (compute_waits >= kGpuDeviceTimeCoverageMinWaits)
+            missing_share = std::max(missing_share,
+                1.0 - static_cast<double>(compute_samples) / static_cast<double>(compute_waits));
+        if (graphics_waits >= kGpuDeviceTimeCoverageMinWaits)
+            missing_share = std::max(missing_share,
+                1.0 - static_cast<double>(graphics_samples) / static_cast<double>(graphics_waits));
+        AlarmFiring a;
+        a.rule = "gpu-device-time-coverage";
+        a.value = missing_share * 100.0;
+        a.unit = "%unsampled";
+        a.threshold = (1.0 - kGpuDeviceTimeMinCoverage) * 100.0;
+        a.detail = format("timestamp-samples/waits compute=%llu/%llu graphics=%llu/%llu; "
+                          "gpu-sync-wait has no data",
+                          (unsigned long long)compute_samples, (unsigned long long)compute_waits,
+                          (unsigned long long)graphics_samples, (unsigned long long)graphics_waits);
+        a.hint = "device-time timestamps cover fewer than 80% of fence waits in at least one "
+                 "stream: GPU busy and idle-in-wait estimates are incomplete. Check timestamp "
+                 "support and query results, and that every graphics batch closes its timestamp "
+                 "envelope before submission, including deferred batches; cf. #3948 and #3891";
+        out.push_back(std::move(a));
     }
 
     // gpu-sync-wait (SHARE of the budget, idle part of the wait).
