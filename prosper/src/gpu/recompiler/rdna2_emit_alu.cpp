@@ -5515,7 +5515,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             //  * a descriptor-only s_load (x4/x8 = V#/T#) with a computed offset can be resolved
             //    by the front end at the exact fetch PC, leaving placeholder words here. Typeless
             //    x4/x8 loads whose words also feed ordinary ALU require real backing and reject
-            //    below; Uncharted's full-resolution compute writer has several such loads.
+            //    below IN THE COMPUTE SHELL; Uncharted's full-resolution compute writer has several
+            //    such loads. Graphics stages keep the placeholder for now (#3951).
             //  * an s_buffer_load (0x8..0xC) with a TRACKED scalar offset is a computed constant-
             //    buffer read (DOLL's bloom-combine PS: per-tap weights at `vcc_lo = 16*(tap/2)`
             //    inside its counted loop, #273) — model it as a DYNAMIC dword index into the
@@ -5523,9 +5524,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             //    (a runtime user-SGPR we have no value for) still rejects — never fold as 0.
             const bool soff_null = (in.src[1].kind == OperandKind::Special && in.src[1].value == 125);
             uint32_t soff_bits = 0; bool soff_dyn = false;
+            // #3951: the register-offset refusal is scoped to the COMPUTE shell, which is where it
+            // was established (#3944: Uncharted's full-resolution compute writer). Vertex and pixel
+            // stages keep their long-standing placeholder lowering for register-offset x4/x8 loads
+            // until those loads have real backing: refusing them dropped every draw that used them
+            // (GTA V gameplay 1.27M -> 4.3k draws per run; Blue Prince's title and Astro Bot went
+            // black). The placeholder is still WRONG for a word read as data -- it is the prior
+            // behaviour restored, not a proof -- so it stays visible under PROSPER_DBG below.
+            // The bounded immediate current-byte proof (#3956) is stage-independent and unchanged.
+            const bool raw_wide_register_offset_data =
+                rt && (in.opcode == 0x2 || in.opcode == 0x3) && !soff_null &&
+                rs.smem_raw_wide_data_loads.contains(in.pc);
+            static std::atomic<uint32_t> raw_wide_placeholder_logs{0};
+            if (raw_wide_register_offset_data && !b.is_compute && getenv("PROSPER_DBG") &&
+                raw_wide_placeholder_logs.fetch_add(1, std::memory_order_relaxed) < 64)
+                fprintf(stderr,
+                        "[smem-placeholder] pc=%u reason=raw-wide-data-graphics-placeholder "
+                        "op=0x%x (#3951: register-offset data words lowered as zero)\n",
+                        in.pc, in.opcode);
             if (rt && (in.opcode == 0x2 || in.opcode == 0x3) &&
                 rs.smem_raw_wide_data_loads.contains(in.pc) &&
-                (!soff_null || rs.smem_raw_immediate_wide_data_loads.contains(in.pc))) {
+                ((!soff_null && b.is_compute) ||
+                 (soff_null && rs.smem_raw_immediate_wide_data_loads.contains(in.pc)))) {
                 // Keep the existing immediate descriptor route for loads outside the bounded
                 // current-byte proof. Some established routed tables carry only the resulting
                 // resource, without a source binding at this load PC. The may-use census still

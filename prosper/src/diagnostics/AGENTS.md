@@ -167,7 +167,11 @@ window.
 
 **Correctness rules carry the SITE, not just a count.** `dropped-draws` names the drop site per
 window (`reasons=render-array-reject/depth-unavailable:276`) from `perf::DropReason`: one code per
-`built.reject(...)` site in the live renderer's resource builder, `contract-mismatch`, and
+`built.reject(...)` site in the live renderer's resource builder, `contract-mismatch`,
+`shader-recompile/{vertex,fragment,geometry}` from `realize_draw_item` (a stage with no SPIR-V: the
+draw never reaches the pass loop, so nothing downstream could see it -- #3951; realize_draw_item's
+other exits -- missing program, no-effect, indirect arguments, zero vertex count -- are still NOT
+counted), and
 `backend/*` mirroring `gpu::DrawDrop` (`draw_disposition.cpp` static_asserts the mirror).
 `skipped-dispatches` does the same with `perf::DispatchSkip`, and its exclusions are code, not
 prose: a deliberate backend decline (the `PROSPER_COMPUTE_SKIP_PROGRAM` selector calls
@@ -182,8 +186,8 @@ On this project's APU it should never fire; `PROSPER_GPU_MEM_FORCE_OOM` exercise
 `host-copy-pressure`'s breakdown is whole MiB per `[transfer-pressure]` category, not a count. A new drop site must pass a reason;
 one that sets `complete = false` directly shows up as `unattributed`, which is the instrument naming
 its own blind spot, not a finding about the title. Re-realizations that are not live execution (an
-F9 capture) wrap themselves in `SuppressDispatchSkipCounting` so that capturing a frame cannot raise
-the alarm being investigated. `host-copy-pressure` reads the `transfer_pressure` census's totals at
+F9 capture) wrap themselves in `SuppressDispatchSkipCounting` (and, for draws, `SuppressDrawDropCounting`)
+so that capturing a frame cannot raise the alarm being investigated. `host-copy-pressure` reads the `transfer_pressure` census's totals at
 window close rather than adding hooks of its own — reuse an existing always-on counter that way
 before adding a parallel one.
 

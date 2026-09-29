@@ -18,6 +18,7 @@
 #include "gpu/state/render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "gpu/pm4/pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
 #include <cstring>                 // memcpy: aliasing-safe index-buffer fingerprint loads
+#include "diagnostics/perf/perf_ledger.hpp"   // #3951: shader-recompile draw drops
 #include "gpu/recompiler/rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
 #include "gpu/resources/shader_resources.hpp"    // ShaderResourceTable
 #include "gpu/resources/compressed_source_authority.hpp"  // CompressionMetadataKind
@@ -2454,6 +2455,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
         report_dropped_draw_target(rs.color0_base, "shader-recompile", rs.cb_target_mask,
                                    rs.cb_shader_mask);
+        // #3951: a draw lost here never reaches the renderer's pass loop, so neither the frontend
+        // drop sites nor [draw-disposition] could see it and `dropped-draws` stayed at 0 while a
+        // recompiler refusal removed ~99.7% of GTA V's gameplay draws. Name the failing stage.
+        prosper::diagnostics::perf::drop_draw_at_realization(
+            vs_words.empty()   ? prosper::diagnostics::perf::DropReason::ShaderRecompileVertex
+            : fs_words.empty() ? prosper::diagnostics::perf::DropReason::ShaderRecompileFragment
+                               : prosper::diagnostics::perf::DropReason::ShaderRecompileGeometry);
         if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
         // PROSPER_DYNTRACE_FAIL=1: replay the FAILED vertex stage's resource build with the
         // dynamic-fetch walk trace + user-data block dump forced on (once per distinct VS), so the
@@ -2549,6 +2557,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                                               validate_mode)) {
         report_dropped_draw_target(rs.color0_base, "descriptor-contract", rs.cb_target_mask,
                                    rs.cb_shader_mask);
+        prosper::diagnostics::perf::drop_draw_at_realization(
+            prosper::diagnostics::perf::DropReason::ContractMismatch);
         if (failure) failure->reason = RealizationFailureReason::DescriptorContract;
         if (log) fprintf(stderr, "[exec] skip draw: strict descriptor contract failed "
                                 "(es=0x%llx ps=0x%llx color0=0x%llx)\n",
@@ -2994,7 +3004,12 @@ inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
     std::vector<DrawItem> items;
     if (perdraw) {
         bool parallel_attempted = false;
-        if (allow_parallel && !failures)
+        // SuppressDrawDropCounting is thread-local, and a capture's re-realization must not
+        // count its drops again (#3951). The worker pool would count them on other threads, so a
+        // suppressed realization runs serially on the thread that holds the guard. Captures are
+        // rare, so the lost parallelism is irrelevant.
+        if (allow_parallel && !failures &&
+            !prosper::diagnostics::perf::thread_draw_drop_suppression())
             items = realize_gpustate_draws_parallel(
                 st, max_shader_dwords, log, retain_shared_shader_words,
                 &parallel_attempted);

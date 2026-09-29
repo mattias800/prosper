@@ -554,6 +554,7 @@ public:
             decline(MenuCaptureRefusal::AmbiguousDraw, "multiple matching semantic draws");
             return;
         }
+        const prosper::diagnostics::perf::SuppressDrawDropCounting not_live_draws;  // #3951
         std::vector<DrawItem> draws = realize_gpustate_draws(state);
         const auto it = std::find_if(draws.begin(), draws.end(), [&](const DrawItem& draw) {
             return draw.draw_index == matches.front();
