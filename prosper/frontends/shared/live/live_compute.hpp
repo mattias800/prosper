@@ -401,6 +401,9 @@ void live_compute_fail_next_storage_readback_for_test();
 // the callback cannot change ownership or authorize guest content and must not retain the pointer.
 void live_compute_set_image_readback_observer_for_test(
     std::function<void(uint32_t, const uint8_t*, size_t)> observer);
+// Quiescent test fixture only. Runs after completed image writebacks and before cache publication,
+// so a guest write in this interval must revoke retained image authority.
+void live_compute_set_before_image_publish_observer_for_test(std::function<void()> observer);
 // Consume only after a writable-buffer GPU dispatch completes, before guest publication.
 void live_compute_fail_next_buffer_readback_for_test();
 // Inject an optional conversion-admission result; does not fail an actual driver call.
