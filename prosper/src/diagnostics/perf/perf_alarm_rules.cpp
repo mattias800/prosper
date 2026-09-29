@@ -793,10 +793,13 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                               idle * 100.0, gpu_busy * 100.0, (unsigned long long)w.flips,
                               budget, w.target_hz);
             a.hint = "the executor thread spends this share of every frame blocked on fences of "
-                     "work it just submitted while the GPU has headroom: the renderer runs "
+                     "work it just submitted while prosper's own GPU work (gpu-busy; other GPU "
+                     "users are not counted) leaves headroom: the renderer runs "
                      "synchronously inside the guest's submit, so CPU and GPU work never overlap "
-                     "(cost~ is the whole wait, the most overlap could recover; idle-in-wait is the "
-                     "part batching submits would save). next: F8 compute wait/wb and "
+                     "(cost~ is the whole wait, the most overlap could recover; idle-in-wait is "
+                     "submission latency plus time queued behind other work on the shared queue, "
+                     "e.g. present blits). This fires on every GTA V / Sonic gameplay window by "
+                     "design until #3948's later stages land. next: F8 compute wait/wb and "
                      "gpu-wait-overhead; the staged fix is #3948";
             out.push_back(std::move(a));
         }

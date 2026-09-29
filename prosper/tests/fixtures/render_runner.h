@@ -2644,6 +2644,55 @@ inline void discard_color_producer_completion(const ColorProducerCompletion& com
 // target producer/consumer dependencies; one fence on the final submission is enough to retain every
 // referenced object until the complete callback has finished. Direct test callers keep the established
 // synchronous behavior by omitting this object.
+// Two-query timestamp pools for BackendSubmissionBatch's envelope, reused across batches instead of
+// created and destroyed per batch (#3948 stage 0 arms the envelope on every default run, ~500
+// batches per second on GTA V). A pool is reset inside the command buffer that uses it
+// (vkCmdResetQueryPool), so a returned pool needs no host-side reset. Only pools whose batch
+// completed, or never reached the queue, come back; a batch with unproven completion leaks its
+// pool with the rest of its resources. Never destroyed: process-lifetime, like the render context.
+struct BackendTimestampPoolCache {
+    std::mutex mutex;
+    std::vector<std::pair<VkDevice, VkQueryPool>> free;
+    uint64_t created = 0;   // tests read this to prove reuse
+};
+inline BackendTimestampPoolCache& backend_timestamp_pool_cache() {
+    static BackendTimestampPoolCache* cache = new BackendTimestampPoolCache();
+    return *cache;
+}
+inline VkQueryPool acquire_backend_timestamp_pool(VkDevice dev) {
+    auto& cache = backend_timestamp_pool_cache();
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        for (auto it = cache.free.rbegin(); it != cache.free.rend(); ++it) {
+            if (it->first != dev) continue;
+            const VkQueryPool pool = it->second;
+            cache.free.erase(std::next(it).base());
+            return pool;
+        }
+    }
+    VkQueryPoolCreateInfo query_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    query_info.queryCount = 2;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    if (vkCreateQueryPool(dev, &query_info, nullptr, &pool) != VK_SUCCESS) return VK_NULL_HANDLE;
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    ++cache.created;
+    return pool;
+}
+inline void return_backend_timestamp_pool(VkDevice dev, VkQueryPool pool) {
+    if (!dev || !pool) return;
+    constexpr size_t kMaxFreePools = 16;   // batches are waited synchronously; a few suffice
+    auto& cache = backend_timestamp_pool_cache();
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.free.size() < kMaxFreePools) {
+            cache.free.emplace_back(dev, pool);
+            return;
+        }
+    }
+    vkDestroyQueryPool(dev, pool, nullptr);
+}
+
 class BackendSubmissionBatch {
 public:
     BackendSubmissionBatch() = default;
@@ -2674,12 +2723,8 @@ public:
         if (pending_resources_abandoned_ || !commands_.empty() || gpu_timestamp_.pool ||
             !dev || !command || period_ns <= 0.0 || !valid_bits)
             return;
-        VkQueryPoolCreateInfo query_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-        query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        query_info.queryCount = 2;
-        VkQueryPool pool = VK_NULL_HANDLE;
-        if (vkCreateQueryPool(dev, &query_info, nullptr, &pool) != VK_SUCCESS || !pool)
-            return;
+        const VkQueryPool pool = acquire_backend_timestamp_pool(dev);
+        if (!pool) return;
         gpu_timestamp_ = {dev, pool, period_ns, valid_bits, false};
         vkCmdResetQueryPool(command, pool, 0, 2);
         vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0);
@@ -2922,8 +2967,7 @@ private:
     };
 
     void release_gpu_timestamp() {
-        if (gpu_timestamp_.pool)
-            vkDestroyQueryPool(gpu_timestamp_.dev, gpu_timestamp_.pool, nullptr);
+        if (gpu_timestamp_.pool) return_backend_timestamp_pool(gpu_timestamp_.dev, gpu_timestamp_.pool);
         gpu_timestamp_ = {};
     }
 

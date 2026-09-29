@@ -213,8 +213,10 @@ constexpr const char* kDestinationCreationRefused = "destination-creation-refuse
 
 // gpu-sync-wait: SHARE of the frame budget (#3948 stage 0). The executor thread blocked on the fence
 // of work it had just submitted -- each compute dispatch's, each graphics batch's -- summed per guest
-// flip, while the GPU had headroom: the device time measured inside those waits (a timestamp pair per
-// dispatch/batch) is under half of wall time. Overlapping CPU work with that GPU work is what
+// flip, while the GPU had headroom: the device time of prosper's OWN work measured inside those
+// waits (a timestamp pair per dispatch/batch; other GPU users are invisible to it) is under half of
+// wall time. It fires on every GTA V / Sonic gameplay window by design, a standing signal until
+// #3948's later stages land (src/diagnostics/AGENTS.md). Overlapping CPU work with that GPU work is what
 // asynchronous submission recovers, so the whole wait is the recoverable cost -- unless the GPU is
 // saturated, which is the case this rule must stay quiet on. Measured 2026-09-29 (prosper-app, GPU
 // present, routed gameplay, this rule's JSONL):
