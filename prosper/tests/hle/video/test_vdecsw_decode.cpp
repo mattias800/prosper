@@ -61,8 +61,9 @@ public:
         last_id = id;
         last_au_bytes = bytes;
         last_au_first = (au && bytes) ? au[0] : 0;
-        decoded_tags.push_back(bytes >= 2 ? static_cast<uint16_t>(au[0] | (au[1] << 8)) :
-                                       static_cast<uint16_t>(last_au_first));
+        decoded_tags.push_back(au && bytes >= 2 ?
+                                   static_cast<uint16_t>(au[0] | (au[1] << 8)) :
+                                   static_cast<uint16_t>(last_au_first));
 
         out.width = kWidth;
         out.height = kHeight;
