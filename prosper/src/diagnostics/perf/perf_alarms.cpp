@@ -376,6 +376,8 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
                      n(Counter::GpuDeviceNsCompute) / 1e6, n(Counter::GpuDeviceSamplesCompute),
                      ms(Cost::GpuWaitGraphics), ev(Cost::GpuWaitGraphics),
                      n(Counter::GpuDeviceNsGraphics) / 1e6, n(Counter::GpuDeviceSamplesGraphics));
+        std::fprintf(jsonl_, ",\"gpu_graphics_deferred\":%llu,\"gpu_graphics_deferred_blocked\":%llu",
+                     n(Counter::GpuGraphicsDeferred), n(Counter::GpuGraphicsDeferredBlocked));
         // 2026-09-29 queue: compute destination refusals (MiB by reason), the colour-target
         // cache's bounds and window peaks, and the exact full-overwrite shape census.
         std::fprintf(jsonl_, ",\"rtt_destination_refusals\":%llu,"

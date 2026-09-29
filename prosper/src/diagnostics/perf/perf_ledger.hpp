@@ -115,6 +115,11 @@ enum class Counter : uint8_t {
     GpuDeviceSamplesCompute,
     GpuDeviceNsGraphics,
     GpuDeviceSamplesGraphics,
+    // #3948 stage 2 (PROSPER_GRAPHICS_DEFERRED_WAIT=1): graphics batches submitted without a wait
+    // before a dispatch, and how many of their later retirements still found the fence unsignalled
+    // (and so blocked, in Cost::GpuWaitGraphics).
+    GpuGraphicsDeferred,
+    GpuGraphicsDeferredBlocked,
     Count
 };
 

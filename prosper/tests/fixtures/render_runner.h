@@ -2700,7 +2700,9 @@ public:
     BackendSubmissionBatch& operator=(const BackendSubmissionBatch&) = delete;
 
     ~BackendSubmissionBatch() {
-        if (!commands_.empty()) {
+        if (deferred_.fence) {
+            (void)retire_deferred();
+        } else if (!commands_.empty()) {
             const RenderVkCtx& ctx = render_vk_ctx();
             if (ctx.ok) (void)submit_and_wait(ctx.dev, ctx.queue, false);
             else discard();
@@ -2708,11 +2710,22 @@ public:
         if (commands_.empty()) complete();
     }
 
+    // True while commands are recorded and not yet proven complete -- including a batch that was
+    // submitted by submit_deferred() and not yet retired (#3948 stage 2), so eviction gates that
+    // read pending() or backend_pending_submission_batches() keep treating its objects as in use.
     bool pending() const { return !commands_.empty(); }
     bool retains_pending_resources() const { return pending_resources_abandoned_; }
 
+    // #3948 stage 2: submitted to the queue, completion (fence wait, producer publication,
+    // cleanups) not yet retired.
+    bool deferred_submitted() const { return deferred_.fence != VK_NULL_HANDLE; }
+    bool deferred_fence_signaled() const {
+        return deferred_.fence &&
+               vkGetFenceStatus(deferred_.dev, deferred_.fence) == VK_SUCCESS;
+    }
+
     void enqueue(VkCommandBuffer command) {
-        if (pending_resources_abandoned_) return;
+        if (pending_resources_abandoned_ || deferred_.fence) return;
         if (commands_.empty())
             backend_pending_submission_batches().fetch_add(1, std::memory_order_acq_rel);
         commands_.push_back(command);
@@ -2810,12 +2823,50 @@ public:
 
     BackendSubmissionBatchResult submit_and_wait(VkDevice dev, VkQueue queue,
                                                   bool backend_trace) {
+        if (deferred_.fence) return retire_deferred();
         BackendSubmissionBatchResult result;
+        VkFence fence = VK_NULL_HANDLE;
+        if (!submit_commands(dev, queue, backend_trace, result, fence)) return result;
+        wait_and_finish(dev, queue, backend_trace, result, fence);
+        return result;
+    }
+
+    // #3948 stage 2: submit the recorded commands with a fence and return without waiting.
+    // The batch keeps its command list, pending count, cleanups and producer completions until
+    // retire_deferred() (or the destructor) waits and publishes them in the usual order. Returns
+    // false when nothing was left pending: the batch was empty, poisoned, discarded, or its submit
+    // failed (that failure is already finished exactly as submit_and_wait finishes it).
+    bool submit_deferred(VkDevice dev, VkQueue queue) {
+        if (deferred_.fence) return true;
+        BackendSubmissionBatchResult result;
+        VkFence fence = VK_NULL_HANDLE;
+        if (!submit_commands(dev, queue, false, result, fence)) return false;
+        if (result.submit_result != VK_SUCCESS) {
+            wait_and_finish(dev, queue, false, result, fence);
+            return false;
+        }
+        deferred_ = {dev, queue, fence, result};
+        return true;
+    }
+
+    BackendSubmissionBatchResult retire_deferred() {
+        if (!deferred_.fence) return {};
+        DeferredSubmission deferred = deferred_;
+        deferred_ = {};
+        wait_and_finish(deferred.dev, deferred.queue, false, deferred.result, deferred.fence);
+        return deferred.result;
+    }
+
+private:
+    // Returns false when the batch returned early (nothing to wait for): poisoned, empty, or no
+    // fence. Otherwise the submit was attempted and wait_and_finish() must run.
+    bool submit_commands(VkDevice dev, VkQueue queue, bool backend_trace,
+                         BackendSubmissionBatchResult& result, VkFence& fence) {
         result.command_buffers = commands_.size();
         if (pending_resources_abandoned_) {
             result.submit_result = VK_ERROR_DEVICE_LOST;
             result.wait_result = VK_ERROR_DEVICE_LOST;
-            return result;
+            return false;
         }
         if (backend_has_unproven_submission()) {
             // Another batch/helper has unproven submitted work. These commands never reached the
@@ -2824,19 +2875,19 @@ public:
             result.submit_result = VK_ERROR_DEVICE_LOST;
             result.wait_result = VK_ERROR_DEVICE_LOST;
             discard();
-            return result;
+            return false;
         }
-        if (commands_.empty()) return result;
+        if (commands_.empty()) return false;
 
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = static_cast<uint32_t>(commands_.size());
         submit.pCommandBuffers = commands_.data();
         VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        VkFence fence = VK_NULL_HANDLE;
+        fence = VK_NULL_HANDLE;
         if (vkCreateFence(dev, &fence_info, nullptr, &fence) != VK_SUCCESS || !fence) {
             result.submit_result = VK_ERROR_INITIALIZATION_FAILED;
             discard();
-            return result;
+            return false;
         }
         if (backend_trace) {
             std::fprintf(stderr, "[backend-trace] queue-submit begin command_buffers=%zu\n",
@@ -2851,6 +2902,11 @@ public:
                          static_cast<int>(result.submit_result));
             std::fflush(stderr);
         }
+        return true;
+    }
+
+    void wait_and_finish(VkDevice dev, VkQueue queue, bool backend_trace,
+                         BackendSubmissionBatchResult& result, VkFence fence) {
         if (result.submit_result == VK_SUCCESS) {
             const uint64_t wait_start_ns = prosper::diagnostics::perf::enabled()
                 ? prosper::diagnostics::perf::now_ns() : 0;
@@ -2939,9 +2995,9 @@ public:
             // is the only valid last-resort action on an effectively lost device.
             abandon_pending_resources();
         }
-        return result;
     }
 
+public:
     // Every path that empties the command list comes through here, so the process-wide pending
     // count cannot drift from pending().
     void clear_commands() {
@@ -2965,6 +3021,13 @@ private:
         uint32_t valid_bits = 0;
         bool ended = false;
     };
+    struct DeferredSubmission {
+        VkDevice dev = VK_NULL_HANDLE;
+        VkQueue queue = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        BackendSubmissionBatchResult result;
+    };
+    DeferredSubmission deferred_;
 
     void release_gpu_timestamp() {
         if (gpu_timestamp_.pool) return_backend_timestamp_pool(gpu_timestamp_.dev, gpu_timestamp_.pool);
@@ -4272,6 +4335,80 @@ inline RenderCommandPoolStats render_command_pool_stats() {
                                   cache.available.size()};
 }
 
+// #3948 stage 2: at most one graphics batch whose fence wait was deferred past the render
+// callback. Heap-owned so the batch keeps its address, which ColorProducerCompletion and
+// planned_batch compare by identity. Never destroyed at process exit (a static destructor would
+// wait on a fence of a device that may already be gone); the ordered executor retires it before
+// every submit returns, so it is empty between submits.
+inline std::atomic<BackendSubmissionBatch*>& deferred_backend_submission_slot() {
+    static std::atomic<BackendSubmissionBatch*> slot{nullptr};
+    return slot;
+}
+
+inline bool backend_submission_deferred() {
+    return deferred_backend_submission_slot().load(std::memory_order_acquire) != nullptr;
+}
+
+// Wait for the deferred batch, then publish and release exactly as a synchronous batch does at
+// destruction (producer completions, cleanups, timestamp, failure handling). Returns whether a
+// batch was pending. Usually free: the dispatch that followed the batch waited for its own fence,
+// which covers every earlier submission on the queue.
+inline bool retire_deferred_backend_submission() {
+    BackendSubmissionBatch* batch =
+        deferred_backend_submission_slot().exchange(nullptr, std::memory_order_acq_rel);
+    if (!batch) return false;
+    if (prosper::diagnostics::perf::enabled() && !batch->deferred_fence_signaled())
+        prosper::diagnostics::perf::add(
+            prosper::diagnostics::perf::Counter::GpuGraphicsDeferredBlocked);
+    delete batch;   // ~BackendSubmissionBatch retires the deferred submission
+    return true;
+}
+
+// Submit `batch` and return without waiting for it. A trailing global memory barrier is appended
+// so every later command on the queue -- the dispatch that follows, a readback's copy -- is
+// ordered after, and sees the writes of, the whole batch: the dependency the CPU fence wait used
+// to provide implicitly. Returns false when the batch was not deferred; it has then been completed
+// synchronously (or finished as a failure) exactly as before, by its destructor.
+inline bool defer_backend_submission_batch(std::unique_ptr<BackendSubmissionBatch> batch) {
+    retire_deferred_backend_submission();   // at most one outstanding
+    if (!batch || !batch->pending() || batch->retains_pending_resources() ||
+        backend_has_unproven_submission())
+        return false;
+    const RenderVkCtx& ctx = render_vk_ctx();
+    if (!ctx.ok) return false;
+    const RenderCommandPoolLease lease = acquire_render_command_pool(ctx.dev, ctx.qfi);
+    if (!lease) return false;
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    bool recorded = vkBeginCommandBuffer(lease.command, &begin) == VK_SUCCESS;
+    if (recorded) {
+        // The last pass did not flush, so it did not close the batch's device envelope either
+        // (the backend writes the end timestamp only into a flushing command). Close it here so
+        // the gpu-sync-wait ledger keeps its device-time figure for deferred batches.
+        batch->end_gpu_timestamp(lease.command);
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(lease.command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier,
+                             0, nullptr, 0, nullptr);
+        recorded = vkEndCommandBuffer(lease.command) == VK_SUCCESS;
+    }
+    if (!recorded) {
+        release_render_command_pool(ctx.dev, ctx.qfi, lease);
+        return false;
+    }
+    batch->enqueue(lease.command);
+    batch->add_cleanup([dev = ctx.dev, qfi = ctx.qfi, lease]() {
+        release_render_command_pool(dev, qfi, lease);
+    });
+    if (!batch->submit_deferred(ctx.dev, ctx.queue)) return false;
+    if (prosper::diagnostics::perf::enabled())
+        prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::GpuGraphicsDeferred);
+    deferred_backend_submission_slot().store(batch.release(), std::memory_order_release);
+    return true;
+}
+
 // Free every idle cached allocation of the render transient pool (#3902); returns how many.
 inline size_t release_idle_render_memory(VkDevice device) {
     RenderMemoryPool& pool = render_memory_pool();
@@ -4450,6 +4587,11 @@ inline PersistentColorTargetImage* ensure_persistent_color_target_for_compute_ov
         bool* allocation_failed = nullptr) {
     if (allocation_failed) *allocation_failed = false;
     const auto vulkan_failed = [&]() { if (allocation_failed) *allocation_failed = true; };
+    // #3948 stage 2: this path may evict (destroy) colour targets, and a deferred graphics batch
+    // both counts as pending (refusing that eviction) and still owes its own completion-time
+    // eviction. Retire it first -- before the resource guard (its cleanups may take it) and before
+    // any entry of this call exists for those cleanups to touch.
+    retire_deferred_backend_submission();
     const BackendPersistentResourceGuard guard;
     if (!id || !width || !height || backend_has_unproven_submission()) return nullptr;
     const RenderVkCtx& ctx = render_vk_ctx();

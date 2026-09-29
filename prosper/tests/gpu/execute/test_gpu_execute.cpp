@@ -2224,6 +2224,84 @@ int main() {
               "terminal finalization preserves the prior span's readback requirement");
     }
 
+    // #3948 stage 2: only a span whose next ordered operation is a dispatch may leave its graphics
+    // batch wait pending, and the executor must retire it before any later non-dispatch operation
+    // (here a WRITE_DATA label, which tells the guest everything before it is done) and before
+    // the submit returns. With the switch off nothing is ever deferred.
+    for (int enabled : {0, 1}) {
+        alignas(4) static uint32_t label = 0;
+        label = 0;
+        const uint32_t label_value = 0x3948u;
+        GpuState ordered = st;
+        ordered.draws.clear();
+        ordered.dispatches.clear();
+        ordered.dma_copies.clear();
+        ordered.parser_stalls.clear();
+        ordered.ordered_memory_effects.clear();
+        GpuState::Draw first{3}, second{3}, third{3};
+        first.command_order = 100;
+        second.command_order = 300;
+        third.command_order = 500;
+        ordered.draws = {first, second, third};
+        GpuState::Dispatch dispatch;
+        dispatch.threads_x = dispatch.threads_y = dispatch.threads_z = 1;
+        dispatch.command_order = 200;
+        ordered.dispatches.push_back(dispatch);
+        Pm4Command write;
+        write.kind = Pm4Command::Kind::WriteData;
+        write.wd_addr = reinterpret_cast<uint64_t>(&label);
+        write.wd_declared_num = 1;
+        write.wd_num = 1;
+        write.wd_data = &label_value;
+        write.wd_valid = true;
+        ordered.ordered_memory_effects.emplace_back(write, 400);
+        // Events: 'R' + defer flag + final flag per render callback; 'X' + label seen per retire.
+        static std::vector<std::string> events;
+        events.clear();
+        set_graphics_deferred_wait_for_test(enabled);
+        set_deferred_graphics_retirer(+[] {
+            events.push_back(label == 0 ? "X0" : "X1");
+        });
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            const LiveRenderPhase phase = live_render_phase();
+            if (!items.empty())
+                events.push_back(std::string("R") + (phase.defer_batch_completion ? "d" : "-") +
+                                 (phase.final_span ? "f" : "-"));
+            return RenderedFrame{};
+        });
+        execute_ordered_and_present(ordered, W, H, 3948, /*publish=*/false);
+        set_submit_renderer({});
+        set_deferred_graphics_retirer(nullptr);
+        set_graphics_deferred_wait_for_test(-1);
+        std::string trace;
+        for (const std::string& event : events) trace += event + " ";
+        const auto at = [&](const char* event) {
+            return std::find(events.begin(), events.end(), event) - events.begin();
+        };
+        const long renders = std::count_if(events.begin(), events.end(),
+                                           [](const std::string& e) { return e[0] == 'R'; });
+        const long deferred = std::count_if(events.begin(), events.end(),
+                                            [](const std::string& e) { return e == "Rd-"; });
+        CHECK(renders == 3 && label == label_value,
+              "deferred-wait fixture renders three spans and lands its label");
+        CHECK(deferred == (enabled ? 1 : 0),
+              enabled ? "the span before a dispatch requests deferred completion"
+                      : "with the switch off no span requests deferred completion");
+        if (enabled) {
+            const long first_render = at("Rd-");
+            const long label_retire = at("X0");
+            const long final_render = at("R-f");
+            CHECK(first_render == 0 && label_retire > first_render &&
+                      label_retire < final_render,
+                  "a deferred batch is retired before the ordered label write lands");
+            CHECK(!events.empty() && events.back() == "X1" && at("X1") > final_render,
+                  "a deferred batch is retired again before the submit returns");
+        }
+        if (!(renders == 3 && deferred == (enabled ? 1 : 0)))
+            std::fprintf(stderr, "  deferred-wait trace (enabled=%d): %s\n", enabled,
+                         trace.c_str());
+    }
+
     CHECK(!have_submit_renderer(), "no live renderer registered by default (game path stays inert)");
     CHECK(!execute_and_present(st, W, H), "execute_and_present is a no-op with no renderer registered");
     std::shared_ptr<const std::vector<uint8_t>> live_storage;

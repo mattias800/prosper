@@ -1104,6 +1104,70 @@ int main(int argc, char** argv) {
               "borrowed compute-image lease releases only after graphics completion");
         prosper::test::invalidate_persistent_color_target(pending_target_id);
 
+        // #3948 stage 2: a deferred batch is on the queue but not complete. Until it is retired it
+        // must keep its cleanups, its pending count (eviction gates read it) and unpublished
+        // producer lineage; a CPU readback in between waits its own fence, which covers the batch;
+        // retirement then publishes lineage and releases resources exactly once.
+        {
+            constexpr uint64_t deferred_target_id = 0x3948000000000001ull;
+            prosper::test::BackendColorTarget deferred_target{deferred_target_id, false, false};
+            prosper::test::BackendDraw deferred_producer = producer;
+            deferred_producer.source_submit = 3948;
+            auto deferred_batch = std::make_unique<prosper::test::BackendSubmissionBatch>();
+            const std::vector<uint8_t> deferred_result = prosper::test::render_draws_rgba(
+                {deferred_producer}, W, H, nullptr, nullptr, false, &deferred_target,
+                nullptr, nullptr, nullptr, deferred_batch.get(), false);
+            bool deferred_cleaned = false;
+            deferred_batch->add_cleanup([&deferred_cleaned] { deferred_cleaned = true; });
+            const int pending_before =
+                prosper::test::backend_pending_submission_batches().load();
+            auto* deferred_image = prosper::test::find_persistent_color_target(
+                deferred_target_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+            const bool deferred = prosper::test::defer_backend_submission_batch(
+                std::move(deferred_batch));
+            CHECK(deferred_result.empty() && deferred && deferred_image &&
+                      prosper::test::backend_submission_deferred() && !deferred_cleaned &&
+                      prosper::test::backend_pending_submission_batches().load() ==
+                          pending_before &&
+                      !prosper::test::persistent_color_producer_source(*deferred_image).known(),
+                  "deferred batch keeps cleanups, pending count and unpublished lineage");
+            std::vector<uint8_t> deferred_pixels;
+            std::string deferred_error;
+            CHECK(prosper::test::readback_persistent_color_target(
+                      deferred_target_id, W, H, VK_FORMAT_R8G8B8A8_UNORM, deferred_pixels,
+                      deferred_error) &&
+                      deferred_pixels == first && !deferred_cleaned,
+                  "a readback after a deferred batch sees its pixels without retiring it");
+            CHECK(prosper::test::retire_deferred_backend_submission() && deferred_cleaned &&
+                      !prosper::test::backend_submission_deferred() &&
+                      prosper::test::backend_pending_submission_batches().load() ==
+                          pending_before - 1 &&
+                      deferred_image->completed_producer.known() &&
+                      deferred_image->completed_producer.source_submit == 3948,
+                  "retiring the deferred batch publishes lineage and runs its cleanups");
+            CHECK(!prosper::test::retire_deferred_backend_submission(),
+                  "retiring with nothing deferred is a no-op");
+
+            // A compute full-overwrite destination may evict renderer targets, which a pending
+            // batch forbids; it must retire the deferred batch rather than refuse or evict under it.
+            auto overwrite_batch = std::make_unique<prosper::test::BackendSubmissionBatch>();
+            (void)prosper::test::render_draws_rgba(
+                {deferred_producer}, W, H, nullptr, nullptr, false, &deferred_target,
+                nullptr, nullptr, nullptr, overwrite_batch.get(), false);
+            CHECK(prosper::test::defer_backend_submission_batch(std::move(overwrite_batch)) &&
+                      prosper::test::backend_submission_deferred(),
+                  "second deferred batch is outstanding before the compute overwrite");
+            constexpr uint64_t overwrite_id = 0x3948000000000002ull;
+            auto* overwrite = prosper::test::ensure_persistent_color_target_for_compute_overwrite(
+                overwrite_id, W, H, VK_FORMAT_R8G8B8A8_UNORM);
+            CHECK(overwrite && !prosper::test::backend_submission_deferred() &&
+                      prosper::test::backend_pending_submission_batches().load() ==
+                          pending_before - 1,
+                  "compute overwrite destination retires the deferred batch first");
+            prosper::test::invalidate_persistent_color_target(deferred_target_id);
+            prosper::test::invalidate_persistent_color_target(overwrite_id);
+        }
+
         // Multiple ordered target calls may record into one queue submission. The producer returns no
         // CPU pixels; the consumer samples that not-yet-submitted target, then its requested readback
         // flushes both command buffers behind one fence.

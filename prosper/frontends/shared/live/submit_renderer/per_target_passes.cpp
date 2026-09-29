@@ -184,7 +184,11 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
         .items = items};
     note_mrt_alias_mirrors(note_mrt_alias_mirrors_ctx);
     size_t pass_i = 0;
-    prosper::test::BackendSubmissionBatch backend_submission;
+    // Heap-owned so that, under #3948 stage 2, the batch can outlive this call at the same
+    // address (producer completions compare batches by identity). Otherwise it is destroyed --
+    // submitted and waited -- at the end of this function exactly like the former local.
+    auto backend_submission_owner = std::make_unique<prosper::test::BackendSubmissionBatch>();
+    prosper::test::BackendSubmissionBatch& backend_submission = *backend_submission_owner;
     if (timing_enabled)
         pending_timing.pass_head_ms += std::chrono::duration<double, std::milli>(
             RenderClock::now() - pass_timing_start).count();
@@ -909,7 +913,10 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                 : (use_color1 ? render_pass.front()->ps.clear_color1 : nullptr),
             nullptr,
             batch_backend_submits ? &backend_submission : nullptr,
-            pass_i == items.size(), &mrt_outputs,
+            // The last pass closes (submits and waits) the batch -- unless #3948 stage 2
+            // deferral was asked for, in which case the batch stays open and is submitted
+            // without a wait at the end of this function.
+            pass_i == items.size() && !phase.defer_batch_completion, &mrt_outputs,
             // #2283: only ask for colour pixels when something will read them.
             //
             // Keyed on the UNION of every bound slot, not on colour-0 alone. Review
@@ -1486,6 +1493,10 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
         .vo_front = vo_front,
         .front_va = front_va};
     dump_persistent_targets(dump_persistent_targets_ctx);
+    // #3948 stage 2: the executor asked for this span's completion to be deferred because the next
+    // ordered operation is a dispatch. Submit without waiting; the executor retires the batch.
+    if (phase.defer_batch_completion)
+        (void)prosper::test::defer_backend_submission_batch(std::move(backend_submission_owner));
 }
 
 } // namespace prosper::frontend::submit_renderer
