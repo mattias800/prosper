@@ -670,6 +670,18 @@ void detile_full_block_row_avx2(uint8_t* dst, const uint8_t* tiled_block,
             _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + static_cast<size_t>(x) * 4),
                                 values);
         }
+    } else if (bpe == 8 && paired_gathers) {
+        // The low x bit is the byte-8 bit in every supported 64KB pattern. Fetching each
+        // adjacent pair as one 16-byte load avoids a four-lane 64-bit gather.
+        for (; x + 4 <= columns; x += 4) {
+            uint64_t packed_offsets{};
+            std::memcpy(&packed_offsets, x_offsets + x, sizeof(packed_offsets));
+            const auto offsets16 = _mm_xor_si128(_mm_cvtsi64_si128(packed_offsets), y);
+            const auto off0 = static_cast<uint16_t>(_mm_extract_epi16(offsets16, 0));
+            const auto off1 = static_cast<uint16_t>(_mm_extract_epi16(offsets16, 2));
+            std::memcpy(dst + static_cast<size_t>(x) * 8, tiled_block + off0, 16);
+            std::memcpy(dst + static_cast<size_t>(x) * 8 + 16, tiled_block + off1, 16);
+        }
     } else if (bpe == 8) {
         for (; x + 4 <= columns; x += 4) {
             const __m128i offsets16 = _mm_xor_si128(
