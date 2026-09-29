@@ -4360,6 +4360,10 @@ inline bool retire_deferred_backend_submission() {
     if (prosper::diagnostics::perf::enabled() && !batch->deferred_fence_signaled())
         prosper::diagnostics::perf::add(
             prosper::diagnostics::perf::Counter::GpuGraphicsDeferredBlocked);
+    // The pass cleanups (colour-target eviction, spill recovery) and failure cleanups touch the
+    // persistent-resource domain; the synchronous path runs them inside the render call's guard.
+    // Callers must not hold the guard (its mutex is not recursive).
+    const BackendPersistentResourceGuard guard;
     delete batch;   // ~BackendSubmissionBatch retires the deferred submission
     return true;
 }
@@ -4402,7 +4406,15 @@ inline bool defer_backend_submission_batch(std::unique_ptr<BackendSubmissionBatc
     batch->add_cleanup([dev = ctx.dev, qfi = ctx.qfi, lease]() {
         release_render_command_pool(dev, qfi, lease);
     });
-    if (!batch->submit_deferred(ctx.dev, ctx.queue)) return false;
+    {
+        // A refused or failed submit finishes the batch here, and its failure cleanups touch the
+        // persistent-resource domain. Same guard as retirement.
+        const BackendPersistentResourceGuard guard;
+        if (!batch->submit_deferred(ctx.dev, ctx.queue)) {
+            batch.reset();   // completes (runs cleanups) inside the guard
+            return false;
+        }
+    }
     if (prosper::diagnostics::perf::enabled())
         prosper::diagnostics::perf::add(prosper::diagnostics::perf::Counter::GpuGraphicsDeferred);
     deferred_backend_submission_slot().store(batch.release(), std::memory_order_release);

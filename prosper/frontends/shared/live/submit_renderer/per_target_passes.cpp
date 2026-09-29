@@ -1054,7 +1054,15 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                     } else {
                         // Pinning is expected to succeed for the target just written. If
                         // cache state is inconsistent, preserve correctness by immediately
-                        // restoring the authoritative CPU fallback.
+                        // restoring the authoritative CPU fallback. This pass's commands may
+                        // still sit unsubmitted in the batch (batched mode, and always under
+                        // #3948 stage 2 deferral), so submit them first: a readback submitted
+                        // before its producer would read the previous contents.
+                        const prosper::test::RenderVkCtx& flush_ctx =
+                            prosper::test::render_vk_ctx();
+                        if (flush_ctx.ok && backend_submission.pending())
+                            backend_submission.submit_and_wait(flush_ctx.dev, flush_ctx.queue,
+                                                               false);
                         std::vector<uint8_t> materialized;
                         std::string error;
                         if (prosper::test::readback_persistent_color_target(
@@ -1483,6 +1491,12 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
     // wall time, because the ordinal below is a renderer-internal counter with no
     // published rate and the states worth censusing are named in seconds
     // (diagnostic_window.hpp).
+    // #3948 stage 2: the executor asked for this span's completion to be deferred because the next
+    // ordered operation is a dispatch. Submit without waiting; the executor retires the batch.
+    // Submitted BEFORE the persistent-target dump below: that dump reads targets back, and a
+    // readback submitted ahead of its producer batch would read the previous contents.
+    if (phase.defer_batch_completion)
+        (void)prosper::test::defer_backend_submission_batch(std::move(backend_submission_owner));
     PersistentTargetDumpContext dump_persistent_targets_ctx{
         .g_persist_window = g_persist_window,
         .g_persist_filter = g_persist_filter,
@@ -1493,10 +1507,6 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
         .vo_front = vo_front,
         .front_va = front_va};
     dump_persistent_targets(dump_persistent_targets_ctx);
-    // #3948 stage 2: the executor asked for this span's completion to be deferred because the next
-    // ordered operation is a dispatch. Submit without waiting; the executor retires the batch.
-    if (phase.defer_batch_completion)
-        (void)prosper::test::defer_backend_submission_batch(std::move(backend_submission_owner));
 }
 
 } // namespace prosper::frontend::submit_renderer
