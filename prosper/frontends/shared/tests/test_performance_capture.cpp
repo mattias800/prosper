@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace {
 int failures = 0;
@@ -589,6 +590,37 @@ int main() {
         check(text.find("\"type\":\"present-handoff\"") == std::string::npos &&
               text.find("\"present_handoffs_enabled\":false") != std::string::npos,
               "ordinary F8 explicitly reports tracing disabled and stores no handoff events");
+    }
+
+    // A real five-second high-dispatch window exceeded the former 4096-row cap. Exercise the
+    // default through the completed artifact, not just the configuration value: a smaller cap
+    // would silently truncate the detailed work population while the process counters remain full.
+    {
+        const fs::path busy_dir = dir / "high-dispatch";
+        fs::create_directories(busy_dir, ec);
+        check(!ec, "high-dispatch capture directory is available");
+        CaptureConfig busy_config;
+        busy_config.pre_window_ns = 0;
+        busy_config.post_window_ns = 5000;
+        InteractivePerformanceCapture busy(busy_config);
+        check(busy.arm(busy_dir.string(), "high-dispatch", "high-dispatch", "test",
+                       10000, wall).ok,
+              "high-dispatch capture arms with default limits");
+        for (uint64_t i = 0; i < 4300; ++i) {
+            prosper::perf::ComputeTimingRecord record;
+            record.monotonic_ns = 10001 + i;
+            record.dispatches = 1;
+            busy.record_compute(std::move(record));
+        }
+        busy.observe_sample(sample(15000, 1));
+        prosper::perf::CaptureOutcome busy_outcome;
+        check(busy.take_outcome(busy_outcome) && busy_outcome.ok &&
+                  busy_outcome.compute_records == 4300 && busy_outcome.compute_dropped == 0,
+              "default F8 cap retains a complete high-dispatch five-second window");
+        std::ifstream busy_input(busy_outcome.path);
+        const std::string busy_text((std::istreambuf_iterator<char>(busy_input)), {});
+        check(count_text(busy_text, "\"type\":\"compute\"") == 4300,
+              "completed high-dispatch artifact contains every retained compute record");
     }
 
     fs::remove_all(dir, ec);
