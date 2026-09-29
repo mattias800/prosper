@@ -45,6 +45,7 @@ inline constexpr uint64_t kHugeReserveLen = 0x2000000000ull;   // 128 GiB
 
 namespace {
 std::atomic<uint64_t> g_guest_memory_gpu_write_successes{0};
+std::atomic<uint64_t> g_guest_memory_gpu_alias_write_successes{0};
 
 // Renderer reads must stop at the first reserved or unreadable guest byte. Mapping records can
 // split at a 16 KiB guest page, so sampling one address per 64 KiB can silently cross a hole.
@@ -153,6 +154,10 @@ GuestMemoryTopologyRelation checked_topology_relation(
 
 uint64_t guest_memory_gpu_write_successes_for_test() {
     return g_guest_memory_gpu_write_successes.load(std::memory_order_relaxed);
+}
+
+uint64_t guest_memory_gpu_alias_write_successes_for_test() {
+    return g_guest_memory_gpu_alias_write_successes.load(std::memory_order_relaxed);
 }
 
 // The APR read chain a command buffer carries (which file its …ReadFileGatherScatter segments read
@@ -1546,6 +1551,77 @@ namespace {
         }();
         return fd;
     }
+#ifdef __linux__
+    // The private writer aliases are deliberately bounded. Mapping the whole sparse 16 GiB
+    // backing once was fast in a microbenchmark but could occupy a future guest VA reservation;
+    // mapping/unmapping 66.8 MiB on every write was slower than the protected guest copy. These
+    // four reusable windows cost at most 256 MiB of VA and are serialized by the caller's g_mx.
+    uint8_t* dmem_writer_alias(uint64_t physical, size_t bytes) {
+        constexpr size_t kMaxMapped = 256u << 20;
+        constexpr size_t kWindows = 4;
+        struct Window {
+            uint64_t offset = 0;
+            size_t length = 0;
+            uint8_t* view = nullptr;
+            uint64_t used = 0;
+        };
+        struct Cache {
+            Window windows[kWindows];
+            size_t mapped = 0;
+            uint64_t clock = 0;
+        };
+        static Cache cache;
+        static const size_t page = [] {
+            const long queried = sysconf(_SC_PAGESIZE);
+            return queried > 0 ? static_cast<size_t>(queried) : size_t{0};
+        }();
+        if (!page || !bytes || physical > UINT64_MAX - bytes) return nullptr;
+        const uint64_t offset = physical - physical % page;
+        const size_t delta = static_cast<size_t>(physical - offset);
+        if (bytes > SIZE_MAX - delta) return nullptr;
+        const size_t needed = bytes + delta;
+        if (needed > SIZE_MAX - (page - 1)) return nullptr;
+        const size_t length = ((needed + page - 1) / page) * page;
+        if (length > kMaxMapped) return nullptr;
+        for (Window& window : cache.windows) {
+            if (window.view && physical >= window.offset &&
+                physical - window.offset <= window.length &&
+                bytes <= window.length - (physical - window.offset)) {
+                window.used = ++cache.clock;
+                return window.view + (physical - window.offset);
+            }
+        }
+        const auto oldest = [&]() -> Window* {
+            Window* selected = nullptr;
+            for (Window& window : cache.windows)
+                if (window.view && (!selected || window.used < selected->used))
+                    selected = &window;
+            return selected;
+        };
+        while (cache.mapped + length > kMaxMapped ||
+               std::all_of(std::begin(cache.windows), std::end(cache.windows),
+                           [](const Window& window) { return window.view != nullptr; })) {
+            Window* victim = oldest();
+            if (!victim) return nullptr;
+            if (munmap(victim->view, victim->length) != 0) return nullptr;
+            cache.mapped -= victim->length;
+            *victim = {};
+        }
+        const int fd = dmem_fd();
+        if (fd < 0 || offset > static_cast<uint64_t>(INT64_MAX)) return nullptr;
+        void* mapped = mmap(nullptr, length, PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_NORESERVE, fd, static_cast<off_t>(offset));
+        if (mapped == MAP_FAILED) return nullptr;
+        for (Window& window : cache.windows) {
+            if (window.view) continue;
+            window = {offset, length, static_cast<uint8_t*>(mapped), ++cache.clock};
+            cache.mapped += length;
+            return window.view + delta;
+        }
+        munmap(mapped, length);
+        return nullptr;
+    }
+#endif
     // Zero a phys range in the memfd — real hardware hands out ZEROED pages on a fresh direct-memory
     // allocation, but our memfd RETAINS bytes across release/reuse (a released phys re-allocated to a
     // new buffer would otherwise expose stale content). Punch a hole (reads back as zeros, keeps the
@@ -3711,25 +3787,32 @@ HLE(k_batch_map) {
     return ret;
 }
 
+// Call only while holding g_mx. Both GPU writeback paths must prove the same complete direct
+// mapping before touching the shared backing; a remap cannot change this answer mid-copy.
+static bool resolve_gpu_write_direct_locked(uint64_t destination, size_t bytes,
+                                            uint64_t& physical) {
+    // g_maps is ordered by base; select the last mapping that could contain destination.
+    const auto after = std::partition_point(g_maps.begin(), g_maps.end(),
+        [destination](const Mapping& mapping) { return mapping.base <= destination; });
+    if (after == g_maps.begin()) return false;
+    const Mapping& mapping = *std::prev(after);
+    if (!mapping.committed || !(mapping.query_flags & kVirtualQueryDirect)) return false;
+    if (destination < mapping.base) return false;
+    const uint64_t delta = destination - mapping.base;
+    if (delta >= mapping.size || bytes > mapping.size - delta) return false;
+    if (mapping.offset > UINT64_MAX - delta) return false;
+    physical = mapping.offset + delta;
+    if (physical < kDmemBase) return false;
+    const uint64_t pool_offset = physical - kDmemBase;
+    return pool_offset <= kDmemTotal && bytes <= kDmemTotal - pool_offset;
+}
+
 bool guest_memory_gpu_write_supported(uint64_t destination, size_t bytes) {
     if (!destination || !bytes || destination > UINT64_MAX - bytes)
         return false;
     std::lock_guard<std::mutex> lock(g_mx);
-    const auto after = std::upper_bound(
-        g_maps.begin(), g_maps.end(), destination,
-        [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
-    if (after == g_maps.begin()) return false;
-    const Mapping& mapping = *std::prev(after);
-    if (!mapping.committed || !(mapping.query_flags & kVirtualQueryDirect) ||
-        destination < mapping.base || destination - mapping.base >= mapping.size ||
-        bytes > mapping.size - (destination - mapping.base))
-        return false;
-    const uint64_t delta = destination - mapping.base;
-    if (mapping.offset > UINT64_MAX - delta) return false;
-    const uint64_t physical = mapping.offset + delta;
-    return dmem_fd() >= 0 && physical >= kDmemBase &&
-           physical - kDmemBase <= kDmemTotal &&
-           bytes <= kDmemTotal - (physical - kDmemBase);
+    uint64_t physical = 0;
+    return resolve_gpu_write_direct_locked(destination, bytes, physical) && dmem_fd() >= 0;
 }
 
 bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t bytes) {
@@ -3752,27 +3835,10 @@ bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t byt
         }
     }
 
-    auto resolve_direct = [](uint64_t address, size_t size, uint64_t& physical) {
-        const auto after = std::upper_bound(
-            g_maps.begin(), g_maps.end(), address,
-            [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
-        if (after == g_maps.begin()) return false;
-        const Mapping& mapping = *std::prev(after);
-        if (!mapping.committed || !(mapping.query_flags & kVirtualQueryDirect) ||
-            address < mapping.base || address - mapping.base >= mapping.size ||
-            size > mapping.size - (address - mapping.base))
-            return false;
-        const uint64_t delta = address - mapping.base;
-        if (mapping.offset > UINT64_MAX - delta) return false;
-        physical = mapping.offset + delta;
-        return physical >= kDmemBase && physical - kDmemBase <= kDmemTotal &&
-               size <= kDmemTotal - (physical - kDmemBase);
-    };
-
     uint64_t physical = 0;
     {
         std::lock_guard<std::mutex> lock(g_mx);
-        if (!resolve_direct(destination, bytes, physical)) return false;
+        if (!resolve_gpu_write_direct_locked(destination, bytes, physical)) return false;
     }
     const int fd = dmem_fd();
     if (fd < 0 || physical > static_cast<uint64_t>(INT64_MAX) ||
@@ -3791,7 +3857,8 @@ bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t byt
         // follow after this lock is released.
         std::lock_guard<std::mutex> lock(g_mx);
         uint64_t current_physical = 0;
-        if (!resolve_direct(destination, bytes, current_physical) || current_physical != physical)
+        if (!resolve_gpu_write_direct_locked(destination, bytes, current_physical) ||
+            current_physical != physical)
             return false;
 
         const auto write_span = [&](size_t offset, const uint8_t* span, size_t span_size) {
@@ -3841,7 +3908,7 @@ bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t byt
         };
 
         uint64_t source_physical = 0;
-        const bool source_is_direct = resolve_direct(
+        const bool source_is_direct = resolve_gpu_write_direct_locked(
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source)), bytes,
             source_physical);
         const bool physical_overlap = source_is_direct &&
@@ -3886,6 +3953,59 @@ bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t byt
     if (complete)
         g_guest_memory_gpu_write_successes.fetch_add(1, std::memory_order_relaxed);
     return complete;
+}
+
+bool guest_memory_gpu_write_alias(uint64_t destination, const void* source, size_t bytes,
+                                  GuestMemoryByteCopy copy) {
+#ifdef __linux__
+    if (!destination || !source || !bytes || !copy || destination > UINT64_MAX - bytes)
+        return false;
+    // Keep the mapping stable through the callback. Mapping paths acquire g_mx before the
+    // write-watch lock, so pre-announcing the device write in that order cannot deadlock them.
+    std::lock_guard<std::mutex> lock(g_mx);
+    uint64_t physical = 0;
+    if (!resolve_gpu_write_direct_locked(destination, bytes, physical)) return false;
+    // A guest-direct source might overlap physically even when its VA is unrelated, and a
+    // source spanning two mappings defeats a single-map overlap test. The intended source is
+    // host staging; reject ANY direct guest source instead of guessing memmove direction.
+    const uint64_t source_begin = reinterpret_cast<uintptr_t>(source);
+    if (source_begin > UINT64_MAX - bytes) return false;
+    const uint64_t source_end = source_begin + bytes;
+    auto source_map = std::lower_bound(
+        g_maps.begin(), g_maps.end(), source_begin,
+        [](const Mapping& mapping, uint64_t value) { return mapping.base < value; });
+    if (source_map != g_maps.begin()) --source_map;
+    for (; source_map != g_maps.end() && source_map->base < source_end; ++source_map) {
+        if (source_map->committed && (source_map->query_flags & kVirtualQueryDirect) &&
+            (source_begin <= source_map->base ||
+             source_begin - source_map->base < source_map->size))
+            return false;
+    }
+    uint8_t* alias = dmem_writer_alias(physical, bytes);
+    if (!alias) return false;
+    const uint64_t alias_begin = reinterpret_cast<uintptr_t>(alias);
+    if (alias_begin > UINT64_MAX - bytes ||
+        (source_begin < alias_begin + bytes && alias_begin < source_end))
+        return false;
+
+    try {
+        // A rearm between an early dirty mark and this private-alias copy could clear the mark
+        // while the write bypasses guest page protection. Serialize both with watch queries and
+        // rearms; mapping -> watch remains the global lock order.
+        host::guest_write_watch_gpu_copy(destination, alias, source, bytes, copy);
+    } catch (...) {
+        // The caller's ordinary writeback will replace any partial bytes and publish once complete.
+        return false;
+    }
+    g_guest_memory_gpu_alias_write_successes.fetch_add(1, std::memory_order_relaxed);
+    return true;
+#else
+    (void)destination;
+    (void)source;
+    (void)bytes;
+    (void)copy;
+    return false;
+#endif
 }
 
 // POSIX ARM. There are TWO definitions of this function in this file, ~3,200 lines apart,
@@ -8106,6 +8226,10 @@ bool guest_memory_gpu_write(uint64_t destination, const void* source, size_t byt
         g_guest_memory_gpu_write_successes.fetch_add(1, std::memory_order_relaxed);
     }
     return written;
+}
+
+bool guest_memory_gpu_write_alias(uint64_t, const void*, size_t, GuestMemoryByteCopy) {
+    return false;
 }
 
 // WINDOWS ARM. There are TWO definitions of this function in this file, ~3,200 lines apart,

@@ -51,6 +51,7 @@
 #include "gpu/texture/tile.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "host/memory/guest_write_watch.hpp"
+#include "hle/memory/guest_memory_topology.hpp"
 #include "host/platform/gpu_submit_gate.hpp"  // #3225: refuse submits once the frontend shuts down
 
 #include <vulkan/vulkan.h>
@@ -13008,8 +13009,31 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Notify page-based dirty trackers only when bytes will actually be written. Doing this
             // before the exact repeated-output check dirtied and rearmed tens of thousands of pages
             // even on the no-write path, defeating the validation that made that path safe.
-            prosper::host::guest_write_watch_notify_host_write(
-                reinterpret_cast<uintptr_t>(destination), bi.guest_bytes);
+            // Private-alias mapping pays only for recurring, large, exact guest outputs. Three
+            // observations of the same range admit it, so one-off large surfaces keep the old
+            // copy and a title with several repeating ranges can use up to four history slots.
+            // This is a per-render-thread performance hint only: HLE still proves the live
+            // physical mapping and watch contract on EVERY admitted copy.
+            const bool large_exact_retile = bi.retile_buffer && !bi.storage_write_mask &&
+                !r->host_data && r->gpu_addr && bi.guest_bytes >= (32u << 20);
+            bool alias_writeback_candidate = false;
+            if (large_exact_retile && !PROSPER_ENV_ON("PROSPER_NO_COMPUTE_ALIAS_WRITEBACK")) {
+                struct RecentRange { uint64_t address = 0; size_t bytes = 0; unsigned seen = 0; };
+                static thread_local std::array<RecentRange, 4> recent{};
+                static thread_local size_t replace = 0;
+                auto found = std::find_if(recent.begin(), recent.end(), [&](const RecentRange& entry) {
+                    return entry.address == r->gpu_addr && entry.bytes == bi.guest_bytes;
+                });
+                if (found != recent.end()) {
+                    alias_writeback_candidate = found->seen >= 2;
+                    if (found->seen < 2) ++found->seen;
+                } else {
+                    recent[replace++ % recent.size()] = {r->gpu_addr, bi.guest_bytes, 1};
+                }
+            }
+            if (!alias_writeback_candidate)
+                prosper::host::guest_write_watch_notify_host_write(
+                    reinterpret_cast<uintptr_t>(destination), bi.guest_bytes);
             const auto watch_done = ComputeClock::now();
             if (trace) {
                 if (bi.exact_storage_bytes()) {
@@ -13091,9 +13115,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  first_bad);
             }
             const uint8_t* layout_source = tile_mapped_bytes ? native_texels : packed;
+            bool alias_writeback_used = false;
             if (bi.retile_buffer) {
                 const auto retile_copy_start = ComputeClock::now();
-                copy_compute_buffer(destination, tiled_mapping.data, bi.guest_bytes);
+                if (alias_writeback_candidate)
+                    alias_writeback_used = prosper::guest_memory_gpu_write_alias(
+                        r->gpu_addr, tiled_mapping.data, bi.guest_bytes, &copy_compute_buffer);
+                // The alias path pre-dirties only guest watches. Renderer/journal publication
+                // remains below, after the complete copy; a refusal takes the original path.
+                if (!alias_writeback_used) {
+                    if (alias_writeback_candidate)
+                        prosper::host::guest_write_watch_notify_host_write(
+                            reinterpret_cast<uintptr_t>(destination), bi.guest_bytes);
+                    copy_compute_buffer(destination, tiled_mapping.data, bi.guest_bytes);
+                }
                 retile_copy_ms += std::chrono::duration<double, std::milli>(
                     ComputeClock::now() - retile_copy_start).count();
             } else if (r->tile_mode && r->img_dim == 2 && r->depth > 1) {
@@ -13437,7 +13472,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 std::fprintf(stderr,
                              "[compute-image-writeback] code=0x%llx hash=0x%016llx "
                              "binding=%u addr=0x%llx skipped=0 "
-                             "fmt=%u comps=%u tile=%u bytes=%zu cache-hit=%u write-only=%u "
+                             "fmt=%u comps=%u tile=%u bytes=%zu alias-admitted=%u alias-writeback=%u cache-hit=%u write-only=%u "
                              "poison=%u gpu-retile=%u direct-retile=%u dim=%u layers=%u texel-depth=%u "
                              "renderer-result-retained=%u "
                              "in-tail=%u tail-x=%u tail-y=%u tail-bytes=%llu "
@@ -13448,7 +13483,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                              (unsigned long long)item.code_addr,
                              (unsigned long long)timing_program_hash, bi.binding,
                              (unsigned long long)r->gpu_addr, (unsigned)r->format, nc,
-                             r->tile_mode, bi.guest_bytes, image_cache_hit ? 1u : 0u,
+                             r->tile_mode, bi.guest_bytes,
+                             alias_writeback_candidate ? 1u : 0u, alias_writeback_used ? 1u : 0u,
+                             image_cache_hit ? 1u : 0u,
                              bi.storage_write_only ? 1u : 0u, 0u, bi.retile_buffer ? 1u : 0u, bi.direct_retile ? 1u : 0u,
                              r->img_dim, bi.array_layers, bi.texel_depth,
                              renderer_result_retained ? 1u : 0u,
