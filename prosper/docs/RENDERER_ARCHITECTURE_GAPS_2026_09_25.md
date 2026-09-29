@@ -310,6 +310,17 @@ Partial machinery already exists (`rtt_gpu_seed_import_extent_compatible`,
 
 ## Ruled out
 
+**RULED OUT (2026-09-29): Stage 2 deferred graphics waits are necessary for GTA V's observed
+3.6 guest flips/s collapse.** On main `5680c4255ef1`, a sustained eight-compiler load reproduces
+3.43 guest flips/s with deferred wait OFF, against 9.38 before the load; the matched quiet ON
+control reaches 9.20 guest flips/s. Normalized readbacks and frontend work remain steady, while
+frontend build and readback time rise to the historical outlier's profile. Completed windows have no target eviction,
+destination refusal, allocation fallback or draw-accounting gap, and all audited readbacks
+complete. Menu and gameplay/HUD frames remain intact. The original arm's endpoint had eight
+compiler processes but its full worker-overlap history was not retained, so this is a reproduced
+contention mechanism, not proof of its exact schedule. Stage 2 stays default-off pending the
+larger title matrix. See [#3948](https://github.com/mattias800/prosper/issues/3948#issuecomment-5901138310).
+
 **RULED OUT (2026-09-30): an absent decode-budget announcement proves its environment value has
 not been read yet.** The original `live_renderer_registration_statics` harness passed with the
 budget read moved above the warmup return and its report left below it: both callbacks saw the

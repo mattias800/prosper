@@ -5302,6 +5302,27 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **An increased SurfaceReadback count caused the 3.67 guest flips/s deferred-wait outlier** — falsified
+  for the retained late gameplay windows of #3948 (2026-09-29): normal OFF/ON arms and the
+  collapsed ON arm all performed **11.028–11.032 readbacks per flip**. Frontend groups, texture
+  references, allocations, compute/graphics waits and host-copy bytes per flip also stayed flat.
+  The old logs retained attempts, not completion verdicts; this does not establish that every
+  historical readback succeeded. The final audited control pair completed every readback. See
+  [the retained-log correction](https://github.com/mattias800/prosper/issues/3948#issuecomment-5900210823)
+  and [the causal controls](https://github.com/mattias800/prosper/issues/3948#issuecomment-5901138310).
+
+- **A persistent-target spill/recovery eviction storm explains that outlier** — falsified for
+  those recorded late windows: persistent-target evictions, allocation fallbacks and destination
+  refusals were all zero. This rules out the measured eviction/refusal storm, not every possible
+  driver migration. The original endpoint had eight `cc1plus` processes, with their exact overlap
+  unretained. On main `5680c4255ef1`, eight sustained compiler workers reproduce **3.43 guest
+  flips/s with deferred wait OFF**, versus 9.38 before the load: frontend build rises
+  13.19→34.73 ms/flip and
+  readback rises 2.04→4.72 ms/flip without more work per flip, closely matching the original
+  34.60/4.55 ms profile. A matched quiet ON control runs at 9.20 guest flips/s; both menu and bank
+  gameplay with HUD remain intact. This proves a compiler-contention mechanism, not the precise historical
+  worker schedule. [#3948 causal controls](https://github.com/mattias800/prosper/issues/3948#issuecomment-5901138310).
+
 - **The 61-draw deferred capture at `PROSPER_GPU_CAPTURE_AT=286` can use its last colour target
   as a pixel oracle.** False on submit 4237 of the 2026-09-28 `reach-performance-story.pad` run:
   `gpu_replay --inspect-only` reports `cwm=0 cwm1=0` on **all 61 realized draws**, with one
