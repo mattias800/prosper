@@ -3624,6 +3624,11 @@ endif()
       target_include_directories(test_depth_only_attachment_extent PRIVATE frontends src tests)
       target_link_libraries(test_depth_only_attachment_extent PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME depth_only_attachment_extent COMMAND test_depth_only_attachment_extent)
+      # #3907: the same binary on the CPU readback path (live colour targets off).
+      add_test(NAME depth_only_attachment_extent_readback
+               COMMAND test_depth_only_attachment_extent --readback-path)
+      set_tests_properties(depth_only_attachment_extent_readback PROPERTIES
+                           ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1")
       add_executable(test_float32_array_upload tests/shared/live/test_float32_array_upload.cpp)
       target_include_directories(test_float32_array_upload PRIVATE frontends src tests)
       target_link_libraries(test_float32_array_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)

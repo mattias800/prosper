@@ -1058,7 +1058,15 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                     }
                 }
             }
-        } else if (base && !pass_pixels->empty()) {
+        } else if (base && !pass_pixels->empty() &&
+                   std::any_of(pass.begin(), pass.end(), [](const prosper::gpu::DrawItem* d) {
+                       return prosper::frontend::mrt_write_mask(*d, 0) != 0;
+                   })) {
+            // #3907: a pass none of whose draws writes colour slot 0 (CB target mask 0 --
+            // GTA V's depth-only 3840x2160 pass whose colour register still names its
+            // 2560x1440 HDR target) produced no colour. Publishing its readback -- the
+            // unseeded clear, at the other extent -- replaced the HDR scene in the CPU
+            // cache, the next 2560x1440 pass then missed its seed, and the world went black.
             RttSurf& surface = g_rtt[base];
             surface.rgba = pass_pixels;
             surface.w = gw;
