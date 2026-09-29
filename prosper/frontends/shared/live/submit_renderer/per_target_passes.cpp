@@ -180,46 +180,9 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
         return seed_rtt && !(no_seed_targets.configured &&
             no_seed_targets.includes(target));
     };
-    // #3026 -- the slot-0/1 alias mirror, checked HERE, at the consumer.
-    //
-    // `DrawItem::color_targets[0]`/`[1]` mirror the named `color0_*`/`color1_*` triples
-    // or are absent; every producer honours that and nothing enforced it. The moment
-    // one does not, the readers below answer differently: this loop's pass target is
-    // the RAW named field (`base`, and `native_w`/`native_h` for the framebuffer
-    // extent), grouping is named-first (`mrt_pass_color_binding`), and the
-    // active-binding rule behind the attachment count and feedback detection is
-    // array-first (`mrt_color_binding`). #3023 is what one such disagreement cost: two
-    // draws rendering to different addresses grouped into one pass, and the second
-    // draw's surface was discarded with no pass, no published pixels and no diagnostic.
-    //
-    // It is checked here and not beside the assignments that establish it because an
-    // assertion at `realize_draw_item`'s success exit would sit two lines below its own
-    // mirror and could never fail. This is the place a divergence would have had to
-    // survive to matter.
-    //
-    // Report-only, deliberately. Which representation should win is undecided, and
-    // deciding it here would change the surface the renderer renders to.
-    for (const auto& alias_draw : items) {
-        prosper::frontend::mrt_check_color_alias_mirror(
-            alias_draw,
-            [](uint32_t slot,
-               const prosper::gpu::DrawItem::ColorTargetBinding& carried,
-               const prosper::gpu::DrawItem::ColorTargetBinding& named,
-               uint64_t ordinal) {
-                static const bool alias_log =
-                    PROSPER_ENV_VALUE("PROSPER_MRT_ALIAS_LOG") != nullptr;
-                if (ordinal > 8 && !alias_log) return;
-                fprintf(stderr,
-                        "[mrt-alias] c%u array=0x%llx %ux%u vs named=0x%llx %ux%u -- "
-                        "the pass renders to the NAMED surface; grouping, feedback and "
-                        "the attachment count may read the other one (#3026) x%llu%s\n",
-                        slot, (unsigned long long)carried.base, carried.width,
-                        carried.height, (unsigned long long)named.base, named.width,
-                        named.height, (unsigned long long)ordinal,
-                        ordinal == 8 && !alias_log
-                            ? "  (further reports need PROSPER_MRT_ALIAS_LOG=1)" : "");
-            });
-    }
+    MrtAliasMirrorContext note_mrt_alias_mirrors_ctx{
+        .items = items};
+    note_mrt_alias_mirrors(note_mrt_alias_mirrors_ctx);
     size_t pass_i = 0;
     prosper::test::BackendSubmissionBatch backend_submission;
     if (timing_enabled)
@@ -480,26 +443,14 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             const bool viewport_extent_valid = viewport_native_w && viewport_native_h &&
                 viewport_native_w <= std::max<uint64_t>(4096u, max_native_w) &&
                 viewport_native_h <= std::max<uint64_t>(4096u, max_native_h);
-            // Log the UNDECIDABLE case too. Gating this on a non-zero derived extent hid
-            // the only outcome that silently changes the DS identity: a depth-only pass
-            // whose draws carry no viewport register derives 0x0, falls through to the
-            // global frame extent, and mints a second cache entry for a surface that
-            // already has a correctly-sized one. A diagnostic that prints only when the
-            // inference succeeded cannot report the inference not happening.
-            if (PROSPER_ENV_ON("PROSPER_DSLOG")) {
-                const size_t with_viewport = static_cast<size_t>(std::count_if(
-                    pass.begin(), pass.end(),
-                    [](const auto* draw) { return draw->ps.has_viewport; }));
-                fprintf(stderr,
-                        "[ds] viewport-derived extent %llux%llu (presentation %ux%u, "
-                        "%zu/%zu draws with viewport) -> %s\n",
-                        (unsigned long long)viewport_native_w,
-                        (unsigned long long)viewport_native_h,
-                        max_native_w, max_native_h, with_viewport, pass.size(),
-                        viewport_extent_valid ? "accept"
-                            : (viewport_native_w || viewport_native_h) ? "reject"
-                                                                       : "undecidable");
-            }
+            DsViewportExtentContext note_ds_viewport_extent_ctx{
+                .pass = pass,
+                .max_native_w = max_native_w,
+                .max_native_h = max_native_h,
+                .viewport_native_w = viewport_native_w,
+                .viewport_native_h = viewport_native_h,
+                .viewport_extent_valid = viewport_extent_valid};
+            note_ds_viewport_extent(note_ds_viewport_extent_ctx);
             if (viewport_extent_valid) {
                 native_w = std::max(native_w, static_cast<uint32_t>(viewport_native_w));
                 native_h = std::max(native_h, static_cast<uint32_t>(viewport_native_h));
@@ -1370,17 +1321,14 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             px_last_source_submit = pass_source_submit;
         } else if (!explicit_depth_extent && !rendered_pixels.empty() &&
                    prefix_inspect_publish()) {
-            // #1330: under gpu_replay's ordered-prefix inspection (--draw/--draw-steps/
-            // --through-operation set PROSPER_PREFIX_INSPECT), a prefix ending on a
-            // non-RGBA8 pass (an FP16 HDR scene target) must return THAT surface, not
-            // whatever stale RGBA8 pass ran earlier. Publish an inspection-converted copy
-            // as the weakest fallback: any RGBA8 pass afterwards still overwrites it, and
-            // with the env unset (every live/normal replay run) behavior is byte-identical.
-            std::vector<uint8_t> converted =
-                inspection_rgba8(rendered_pixels, gw, gh, pass_format);
-            if (!converted.empty())
-                px_last = std::make_shared<const std::vector<uint8_t>>(std::move(converted));
-            px_last_source_submit = 0; // inspection conversion is not the native pixels
+            PrefixInspectionContext publish_prefix_inspection_ctx{
+                .rendered_pixels = rendered_pixels,
+                .gw = gw,
+                .gh = gh,
+                .pass_format = pass_format,
+                .px_last = px_last,
+                .px_last_source_submit = px_last_source_submit};
+            publish_prefix_inspection(publish_prefix_inspection_ctx);
         }
         // PROSPER_PASS_LOG=<min-submit>|ms:<millis>: per-pass publish provenance for 3
         // submits — which pass produced pixels, its target identity, and the defer
