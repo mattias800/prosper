@@ -5523,16 +5523,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             //    (a runtime user-SGPR we have no value for) still rejects — never fold as 0.
             const bool soff_null = (in.src[1].kind == OperandKind::Special && in.src[1].value == 125);
             uint32_t soff_bits = 0; bool soff_dyn = false;
+            if (!soff_null && rt && (in.opcode == 0x2 || in.opcode == 0x3) &&
+                rs.smem_raw_wide_data_loads.contains(in.pc)) {
+                if (getenv("PROSPER_DBG"))
+                    fprintf(stderr,
+                            "[smem-reject] pc=%u reason=raw-wide-data-requires-backing "
+                            "op=0x%x\n", in.pc, in.opcode);
+                ok = false;
+                return true;
+            }
             if (!soff_null) {
                 if (rt && (in.opcode == 0x2 || in.opcode == 0x3)) {
-                    if (rs.smem_raw_wide_data_loads.contains(in.pc)) {
-                        if (getenv("PROSPER_DBG"))
-                            fprintf(stderr,
-                                    "[smem-reject] pc=%u reason=raw-wide-data-requires-backing "
-                                    "op=0x%x\n", in.pc, in.opcode);
-                        ok = false;
-                        return true;
-                    }
                     // An x4/x8 DESCRIPTOR load with a non-null soffset leaves here with placeholders
                     // and NO SRT tag, so every MIMG that consumes one of its descriptors reports
                     // srt_tag=NONE and cannot resolve. Say so when asked: whether the soffset is a
