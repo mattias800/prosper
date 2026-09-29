@@ -369,6 +369,8 @@ std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& in
     std::unordered_map<uint32_t, size_t> by_pc;
     for (size_t index = 0; index < ins.size(); ++index)
         by_pc.emplace(ins[index].pc, index);
+    const bool has_guest_write = std::any_of(ins.begin(), ins.end(),
+                                             rdna2_may_write_guest_memory);
     for (size_t index = 0; index < ins.size(); ++index) {
         const Rdna2Inst& load = ins[index];
         if (load.fmt != Rdna2Format::SMEM ||
@@ -378,13 +380,17 @@ std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& in
             continue;
         const uint32_t words = load.opcode == 0x2u ? 4u : 8u;
         const RawWideLifetime lifetime(ins, by_pc, index, words);
-        const bool immediate = load.src[1].kind == OperandKind::Special &&
-            load.src[1].value == 125;
-        // Preserve descriptor-fragment relocation in the established immediate path. The new
-        // immediate guard targets words read by scalar or vector arithmetic/comparison; plain
-        // scalar copies alone do not distinguish data from descriptor assembly.
+        const bool register_offset = load.src[1].kind != OperandKind::Special ||
+            load.src[1].value != 125;
+        // Scalar arithmetic may assemble a descriptor even when SOFFSET is a register.
+        // The derived-use proof must find an actual non-descriptor observer before forbidding
+        // the established exact-fetch-PC descriptor route. Copies and descriptor patches alone
+        // are provenance, not scalar data observed by the emitted module. A shader-side memory
+        // write could invalidate the front half's dispatch-time descriptor snapshot, so keep
+        // newly admitted register-offset patches fail-visible until an alias proof exists.
         if (lifetime.requires_backing() &&
-            (!immediate || lifetime.has_numeric_reader_or_uncertain_path()))
+            (lifetime.has_numeric_reader_or_uncertain_path() ||
+             (register_offset && has_guest_write)))
             data_loads.push_back(load.pc);
     }
     return data_loads;
