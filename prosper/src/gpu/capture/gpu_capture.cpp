@@ -190,6 +190,7 @@ bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
     const bool caplog = std::getenv("PROSPER_GPU_CAPTURE_LOG") != nullptr;
     std::vector<OperationRealizationFailure> failures, compute_failures;
     if (caplog) std::fprintf(stderr, "[cap] realize_gpustate_draws...\n");
+    const prosper::diagnostics::perf::SuppressDrawDropCounting not_live_draws;  // #3951: re-realization
     std::vector<DrawItem> draws = realize_gpustate_draws(state, 0x10000, 1.0f, 1.0f, &failures);
     // Menu full-submit capture reconstructs the failed draws in this callback rather than using
     // the ordered executor's capture trace. Sample immediately after that realization, with a
@@ -239,6 +240,7 @@ bool capture_gpustate_target_submit(const GpuState& state, uint64_t submit_no,
                                     uint32_t target_width, uint32_t target_height,
                                     const GpuCaptureMetadata& metadata,
                                     GpuCaptureFile& out, std::string& error) {
+    const prosper::diagnostics::perf::SuppressDrawDropCounting not_live_draws;  // #3951: re-realization
     std::vector<DrawItem> draws = realize_gpustate_draws(state);
     draws.erase(std::remove_if(draws.begin(), draws.end(), [&](const DrawItem& draw) {
         return draw.color0_width != target_width || draw.color0_height != target_height;
@@ -1245,6 +1247,7 @@ bool materialize_pending_gpu_capture(PendingGpuCapture& pending,
         ? *exact_failures : std::vector<OperationRealizationFailure>{};
     if (semantic_state && !exact_failures) {
         std::vector<OperationRealizationFailure> compute_failures;
+        const prosper::diagnostics::perf::SuppressDrawDropCounting not_live_draws;  // #3951
         (void)realize_gpustate_draws(*semantic_state, 0x10000, 1.0f, 1.0f,
                                      &failures, false, false);
         const prosper::diagnostics::perf::SuppressDispatchSkipCounting not_live;  // #3891: re-realization, not a skip

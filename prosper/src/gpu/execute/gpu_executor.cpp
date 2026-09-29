@@ -9464,6 +9464,7 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
                     static std::set<uint64_t> probed;
                     if (probed.insert(r.gpu_addr).second && w.draw_record.state) {
                         DrawItem candidate_draw;
+                        const prosper::diagnostics::perf::SuppressDrawDropCounting diagnostic_only;
                         bool realized = realize_draw_item(*w.draw_record.state, &w.draw_record,
                                                          w.draw_record.index_count, 0x10000, true,
                                                          candidate_draw);

@@ -185,6 +185,12 @@ enum class DropReason : uint8_t {
     ArrayCompressedNoDepth,    // compressed Float32 array with no retained depth
     ArrayCompressedGuest,      // compressed Float32 array would decode guest backing
     ArrayShortBacking,         // Float32 array guest backing shorter than its slices
+    // realize_draw_item (src/gpu/execute/gpu_execute.hpp): a stage produced no SPIR-V, so the draw
+    // never reaches the renderer's pass loop at all. Without these a recompiler refusal was the one
+    // way to lose nearly every draw with the alarm silent (#3951: GTA V 1.27M -> 4.3k draws/run).
+    ShaderRecompileVertex,     // the vertex (or linked ES+VS chain) stage failed to recompile
+    ShaderRecompileFragment,   // the pixel stage failed to recompile
+    ShaderRecompileGeometry,   // the synthesized interpolation/rect-list geometry stage failed
     BackendGeometryCapability,
     BackendMeshShape,
     BackendSubgroupFeatures,
@@ -216,6 +222,9 @@ constexpr const char* kDropReasonNames[kDropReasonCount] = {
     "render-array-reject/compressed-no-depth",
     "render-array-reject/compressed-guest",
     "render-array-reject/short-backing",
+    "shader-recompile/vertex",
+    "shader-recompile/fragment",
+    "shader-recompile/geometry",
     "backend/geometry-capability",
     "backend/mesh-shape",
     "backend/subgroup-features",
@@ -454,6 +463,27 @@ public:
     SuppressDispatchSkipCounting(const SuppressDispatchSkipCounting&) = delete;
     SuppressDispatchSkipCounting& operator=(const SuppressDispatchSkipCounting&) = delete;
 };
+
+// The draw half of the same contract (#3951): realize_draw_item counts a draw it cannot realize
+// (a stage that failed to recompile, a strict descriptor-contract failure), and an F9 capture or a
+// menu capture re-realizes the submit's draws for its bundle. Those re-realizations are not live
+// drops and must not raise `dropped-draws` a second time.
+inline uint32_t& thread_draw_drop_suppression() {
+    static thread_local uint32_t depth = 0;
+    return depth;
+}
+class SuppressDrawDropCounting {
+public:
+    SuppressDrawDropCounting() { ++thread_draw_drop_suppression(); }
+    ~SuppressDrawDropCounting() { --thread_draw_drop_suppression(); }
+    SuppressDrawDropCounting(const SuppressDrawDropCounting&) = delete;
+    SuppressDrawDropCounting& operator=(const SuppressDrawDropCounting&) = delete;
+};
+// A draw realize_draw_item could not realize. Counted unless a re-realization suppressed it.
+inline void drop_draw_at_realization(DropReason reason) {
+    if (thread_draw_drop_suppression()) return;
+    drop_draw(reason);
+}
 
 // One compute dispatch prosper wanted to run and did not, with its reason.
 inline void skip_dispatch(DispatchSkip reason) {

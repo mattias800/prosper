@@ -343,7 +343,9 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                      "[draw-disposition] lines (PROSPER_DRAW_DISPOSITION_VERBOSE=1); for "
                      "render-array-reject/*, [render-array-reject] lines "
                      "(PROSPER_ARRAY_REJECT_LOG_ALL=1); for volume-*, [volume-sample-drop] lines; "
-                     "for contract-mismatch, PROSPER_DESCRIPTOR_VALIDATE; cf. #3889";
+                     "for contract-mismatch, PROSPER_DESCRIPTOR_VALIDATE; for shader-recompile/*, "
+                     "PROSPER_DBG=1 [recompile-reject]/[vertex-recompile-reject] lines name the "
+                     "program and pc; cf. #3889, #3951";
             out.push_back(std::move(a));
         }
     }
