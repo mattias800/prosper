@@ -1136,6 +1136,89 @@ static int run_destination_mirror_regression() {
                   alias16_target->layout == alias16_layout &&
                   alias16_target->pin_count == alias16_pins,
               "RGBA16F read alias retains renderer image ownership and layout bookkeeping");
+
+        // Astro binds the same sampled renderer image twice after its writable destination.
+        // Both descriptors acquire pins, but the second is folded onto the first Vulkan view.
+        // The result copy follows the sampled dispatch and must restore GPU authority.
+        CHECK(!render(alias16_producer).empty(),
+              "folded read-alias fixture restores known renderer pixels");
+        ShaderResource folded_sampled = alias16_sampled;
+        folded_sampled.binding = 6;
+        folded_sampled.sgpr_base = 16;
+        ShaderResourceTable folded_table;
+        folded_table.resources = {alias16_output, alias16_sampled, folded_sampled};
+        static const uint32_t two_sampled_reads[] = {
+            0x7E080300u, 0x7E0A0280u,                    // v4=x, v5=0
+            0xF0000F08u, 0x00000004u, 0xBF8C3F70u,      // first sampled descriptor
+            0xF0000F08u, 0x00040004u, 0xBF8C3F70u,      // duplicate sampled descriptor
+            0x100000FFu, 0x3F000000u,                    // red *= 0.5
+            0xF0200F08u, 0x00020004u, 0xBF810000u,      // store to renderer image
+        };
+        ComputeShaderConfig folded_config = rgba16_config;
+        folded_config.user_sgprs.resize(24);
+        const auto folded_spirv = recompile_compute(
+            two_sampled_reads, std::size(two_sampled_reads), &folded_table, folded_config);
+        const auto folded_reflection = validate_spirv_descriptor_interface(
+            folded_spirv, &folded_table, 0, SpirvShaderStage::Compute, false);
+        const auto* folded_write = find_spirv_descriptor_binding(folded_reflection, 0, 4);
+        const auto* folded_read_a = find_spirv_descriptor_binding(folded_reflection, 0, 5);
+        const auto* folded_read_b = find_spirv_descriptor_binding(folded_reflection, 0, 6);
+        CHECK(!folded_spirv.empty() && folded_reflection.ok() && folded_write &&
+                  folded_read_a && folded_read_b && folded_write->writable &&
+                  !folded_read_a->writable && !folded_read_b->writable,
+              "folded fixture retains both read-only sampled descriptors");
+        ComputeItem folded_item = alias16_item;
+        folded_item.spirv = folded_spirv;
+        folded_item.resources = std::make_shared<ShaderResourceTable>(folded_table);
+        folded_item.code_addr = 0x3731001bu;
+        std::vector<uint8_t> folded_seed;
+        CHECK(prosper::test::readback_persistent_color_target(
+                  alias16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+                  folded_seed, alias16_error) &&
+                  folded_seed.size() == alias16_words.size() * sizeof(uint16_t),
+              "folded read alias starts from completed renderer pixels");
+        std::vector<uint16_t> folded_expected(alias16_words.size());
+        if (folded_seed.size() == folded_expected.size() * sizeof(uint16_t))
+            std::memcpy(folded_expected.data(), folded_seed.data(), folded_seed.size());
+        for (size_t x = 0; x < W; ++x) folded_expected[x * 4] = 0x3c00u;
+        const auto folded_before =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        CHECK(!folded_spirv.empty() &&
+                  prosper::frontend::execute_live_compute_items({folded_item}),
+              "folded sampled aliases execute before destination copy");
+        const auto folded_after =
+            prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        const bool folded_read_alias_disabled = read_alias_disabled ||
+            std::getenv("PROSPER_NO_FOLDED_COMPUTE_RTT_READ_ALIAS") != nullptr;
+        CHECK(folded_after.candidates == folded_before.candidates + 1 &&
+                  folded_after.borrowed == folded_before.borrowed + !folded_read_alias_disabled &&
+                  folded_after.recorded == folded_before.recorded + !folded_read_alias_disabled &&
+                  folded_after.published == folded_before.published + !folded_read_alias_disabled,
+              "folded sampled aliases publish GPU authority after the sampled dispatch");
+        CHECK(alias16_words == folded_expected,
+              "folded sampled aliases preserve the exact guest writeback");
+        LiveTargetImageImport folded_import;
+        const bool folded_gpu_valid = import_live_render_target_image(
+            alias16_address, source_request, folded_import);
+        CHECK(folded_gpu_valid == !folded_read_alias_disabled,
+              "folded sampled aliases retain strict GPU authority only when enabled");
+        if (folded_gpu_valid) release_live_render_target_image(alias16_address);
+        if (!folded_read_alias_disabled) {
+            std::vector<uint8_t> folded_pixels;
+            CHECK(prosper::test::readback_persistent_color_target(
+                      alias16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT,
+                      folded_pixels, alias16_error) &&
+                      folded_pixels.size() == folded_seed.size() &&
+                      std::memcmp(folded_pixels.data(), folded_expected.data(),
+                                  folded_pixels.size()) == 0,
+                  "folded sampled aliases mirror their completed result exactly");
+        }
+        alias16_target = prosper::test::find_persistent_color_target(
+            alias16_address, W, H, VK_FORMAT_R16G16B16A16_SFLOAT, false);
+        CHECK(alias16_target && alias16_target->image == alias16_image &&
+                  alias16_target->layout == alias16_layout &&
+                  alias16_target->pin_count == alias16_pins,
+              "folded sampled aliases release every renderer pin");
     }
 
     // A compute-owned output can reach the renderer first as CPU pixels, without any graphics
