@@ -1,5 +1,6 @@
 #include "host/memory/guest_write_watch.hpp"
 #include "host/memory/guest_memory_map.hpp"   // #2393: the guest-page-protection generation invariant
+#include "diagnostics/env_cache.hpp"
 #include "diagnostics/env_numeric.hpp"        // #3267: a typo must not silently unbound this limit
 
 #include <algorithm>
@@ -702,6 +703,10 @@ struct WatchState {
     std::vector<AliasRange> aliases;                                       // live dmem topology
     std::unordered_map<uint64_t, std::unique_ptr<WatchedPage>> pages_by_phys;
     std::unordered_map<uint64_t, WatchedPage*> pages_by_addr;              // page-aligned VA -> page
+    // A GPU write through a page's sole VA is already handled by the registration range index.
+    // Only pages with multiple VAs need the physical-alias pass in notify_gpu_write(). Keep this
+    // count with the authoritative page alias vectors, under the same mutex.
+    uint64_t multi_alias_pages = 0;
     // #3681: how many entries of `pages_by_addr` fall in each kIndexChunk-aligned VA chunk. Lets a
     // host-write notification skip a whole 2 MiB of unwatched address space with one lookup instead
     // of 512 misses. Kept exactly in step with pages_by_addr through index_page_addr_locked() /
@@ -740,6 +745,10 @@ struct WatchState {
 static_assert(std::atomic<int64_t>::is_always_lock_free,
               "the signal-path pending-step discriminator must be lock-free");
 WatchState& state() { static WatchState* value = new WatchState; return *value; }
+void update_multi_alias_pages(WatchState& w, size_t before, size_t after) {
+    if (before <= 1 && after > 1) ++w.multi_alias_pages;
+    else if (before > 1 && after <= 1) --w.multi_alias_pages;
+}
 std::atomic<GuestDmemWriteTraceContentionHookForTest> trace_contention_hook_for_test{nullptr};
 std::atomic<GuestDmemWriteTraceDynamicProtectionHookForTest>
     trace_dynamic_protection_hook_for_test{nullptr};
@@ -758,7 +767,7 @@ struct AtomicStats {
         gpu_write_registrations_visited{0}, gpu_write_overlaps{0},
         query_audit_stale{0}, query_audit_conservative{0}, rearm_fast{0},
         gpu_write_alias_pages{0}, gpu_write_alias_registrations_visited{0},
-        gpu_write_alias_overlaps{0};
+        gpu_write_alias_overlaps{0}, gpu_write_alias_single_va_skips{0};
 };
 AtomicStats& stats() { static AtomicStats* value = new AtomicStats; return *value; }
 inline void bump(std::atomic<uint64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); }
@@ -1004,6 +1013,7 @@ void erase_released_pages_locked(WatchState& w, const std::vector<WatchedPage*>&
         // even after the last registration goes away; normal mapping removal retries cleanup.
         if (page->references || page->armed || page->coverage_incomplete) continue;
         for (const PageAlias& alias : page->aliases) unindex_page_addr_locked(w, alias.addr);
+        update_multi_alias_pages(w, page->aliases.size(), 0);
         w.pages_by_phys.erase(page->phys);
     }
 }
@@ -1066,6 +1076,7 @@ void purge_va_range_locked(WatchState& w, uint64_t begin, uint64_t end, bool rem
     for (auto& [phys, pageptr] : w.pages_by_phys) {
         (void)phys;
         WatchedPage* page = pageptr.get();
+        const size_t aliases_before = page->aliases.size();
         bool changed = false;
         for (auto ai = page->aliases.begin(); ai != page->aliases.end();) {
             const uint64_t apage = ai->addr & ~(kPage - 1);
@@ -1078,6 +1089,7 @@ void purge_va_range_locked(WatchState& w, uint64_t begin, uint64_t end, bool rem
             }
         }
         if (changed) {
+            update_multi_alias_pages(w, aliases_before, page->aliases.size());
             page->generation++;
             mark_page_changed_locked(w, page);
             if (!page->references) recovery.push_back(page);
@@ -1537,6 +1549,7 @@ GuestWriteWatch GuestWriteWatch::create(uint64_t addr, uint64_t size) {
             auto up = std::make_unique<WatchedPage>();
             up->phys = r.phys;
             up->aliases = std::move(aliases_by_phys[r.phys].aliases);
+            update_multi_alias_pages(w, 0, up->aliases.size());
             page = up.get();
             w.pages_by_phys.emplace(r.phys, std::move(up));
             for (const PageAlias& al : page->aliases)
@@ -1685,7 +1698,7 @@ GuestWriteWatchStats guest_write_watch_stats() {
             v.gpu_write_overlaps.load(), v.query_audit_stale.load(),
             v.query_audit_conservative.load(), v.rearm_fast.load(),
             v.gpu_write_alias_pages.load(), v.gpu_write_alias_registrations_visited.load(),
-            v.gpu_write_alias_overlaps.load()};
+            v.gpu_write_alias_overlaps.load(), v.gpu_write_alias_single_va_skips.load()};
 }
 
 bool guest_dmem_write_trace_configure(const GuestDmemWriteTraceConfig& config) {
@@ -1982,7 +1995,9 @@ void guest_write_watch_notify_direct_mapping_added(uint64_t addr, uint64_t size,
         if (it == w.pages_by_phys.end()) continue;
         WatchedPage* page = it->second.get();
         const uint64_t va = (addr + off) & ~(kPage - 1);
+        const size_t aliases_before = page->aliases.size();
         page->aliases.push_back({va, protection});
+        update_multi_alias_pages(w, aliases_before, page->aliases.size());
         index_page_addr_locked(w, va, page);
         if (page->armed && cpu_writable(protection) &&
             watch_mprotect(reinterpret_cast<void*>(static_cast<uintptr_t>(va)), kPage,
@@ -2440,6 +2455,14 @@ void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size) {
     }
     stats().gpu_write_registrations_visited.fetch_add(visited, std::memory_order_relaxed);
     stats().gpu_write_overlaps.fetch_add(overlaps, std::memory_order_relaxed);
+
+    // With one VA per watched physical page, the exact registration-range predicate above has
+    // already considered every possible overlap. A second VA can appear after registration, so
+    // the authoritative alias vectors maintain this gate under the same mutex.
+    if (!w.multi_alias_pages && !PROSPER_ENV_ON("PROSPER_WATCH_FORCE_ALIAS_SCAN")) {
+        bump(stats().gpu_write_alias_single_va_skips);
+        return;
+    }
 
     // A device can write through a different guest VA of the same physical dmem. Logical interval
     // buckets above cannot see that alias. The watched-page address index already resolves every

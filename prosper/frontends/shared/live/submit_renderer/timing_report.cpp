@@ -796,14 +796,19 @@ void report_render_timing_aggregates(RenderTimingReportContext& ctx) {
         fprintf(stderr,
                 "[render-timing] write_watch_scan query_pages=%s/%llu queries "
                 "host_write_pages=%llu scanned/%llu hit "
-                "gpu_write=%llu notifies/%llu visited/%llu overlaps\n",
+                "gpu_write=%llu notifies/%llu visited/%llu overlaps "
+                "gpu_alias=%llu pages/%llu registrations/%llu overlaps/%llu single_va_skips\n",
                 query_pages,
                 (unsigned long long)write_watch.queries,
                 (unsigned long long)write_watch.host_write_pages_scanned,
                 (unsigned long long)write_watch.host_write_pages_hit,
                 (unsigned long long)write_watch.gpu_write_notifies,
                 (unsigned long long)write_watch.gpu_write_registrations_visited,
-                (unsigned long long)write_watch.gpu_write_overlaps);
+                (unsigned long long)write_watch.gpu_write_overlaps,
+                (unsigned long long)write_watch.gpu_write_alias_pages,
+                (unsigned long long)write_watch.gpu_write_alias_registrations_visited,
+                (unsigned long long)write_watch.gpu_write_alias_overlaps,
+                (unsigned long long)write_watch.gpu_write_alias_single_va_skips);
         fprintf(stderr,
                 "[render-timing] write_watch_index rearm_fast=%llu/%llu rearms "
                 "audit_stale=%llu audit_conservative=%llu\n",

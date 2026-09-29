@@ -80,6 +80,7 @@ struct GuestWriteWatchStats {
     uint64_t gpu_write_alias_pages = 0;
     uint64_t gpu_write_alias_registrations_visited = 0;
     uint64_t gpu_write_alias_overlaps = 0;
+    uint64_t gpu_write_alias_single_va_skips = 0;
 };
 
 // Bounded, diagnostic-only provenance overlay for direct-memory CPU writes.  Unlike GuestWriteWatch,

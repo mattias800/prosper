@@ -2584,9 +2584,11 @@ endif()
     add_test(NAME guest_write_watch_index
              COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_QUERY_AUDIT
                      --unset=PROSPER_WATCH_LEGACY_SCAN
+                     --unset=PROSPER_WATCH_FORCE_ALIAS_SCAN
                      $<TARGET_FILE:test_guest_write_watch_index>)
     add_test(NAME guest_write_watch_index_audit
              COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_LEGACY_SCAN
+                     --unset=PROSPER_WATCH_FORCE_ALIAS_SCAN
                      PROSPER_WATCH_QUERY_AUDIT=1
                      $<TARGET_FILE:test_guest_write_watch_index>)
     # Third arm (#3681): the complete scan the index replaced. Until this existed the fallback had no
@@ -2597,7 +2599,13 @@ endif()
     # assertions, opposite assertions about registrations visited.
     add_test(NAME guest_write_watch_index_legacy_scan
              COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_QUERY_AUDIT
+                     --unset=PROSPER_WATCH_FORCE_ALIAS_SCAN
                      PROSPER_WATCH_LEGACY_SCAN=1
+                     $<TARGET_FILE:test_guest_write_watch_index>)
+    add_test(NAME guest_write_watch_index_forced_alias_scan
+             COMMAND ${CMAKE_COMMAND} -E env --unset=PROSPER_WATCH_QUERY_AUDIT
+                     --unset=PROSPER_WATCH_LEGACY_SCAN
+                     PROSPER_WATCH_FORCE_ALIAS_SCAN=1
                      $<TARGET_FILE:test_guest_write_watch_index>)
   endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
