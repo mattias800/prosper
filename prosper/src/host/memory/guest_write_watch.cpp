@@ -505,6 +505,10 @@ void guest_write_watch_invalidate_all() {
 void guest_write_watch_notify_host_write(uint64_t, uint64_t) {}
 void guest_write_watch_notify_host_write_done(uint64_t, uint64_t) {}
 void guest_write_watch_notify_gpu_write(uint64_t, uint64_t) {}
+void guest_write_watch_gpu_copy(uint64_t, void* destination, const void* source,
+                                size_t bytes, GuestWriteWatchByteCopy copy) {
+    if (copy) copy(destination, source, bytes);
+}
 bool guest_write_watch_desynchronize_for_test(uint64_t) { return false; }
 
 bool guest_write_watch_handle_fault(uint64_t addr) {
@@ -2439,12 +2443,8 @@ void guest_write_watch_notify_host_write_done(uint64_t addr, uint64_t size) {
     }
 }
 
-void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size) {
-    if (!addr || !size || addr > UINT64_MAX - size) return;
-    WatchState& w = state();
-    if (!w.fault_onstack.load(std::memory_order_acquire)) return;
+static void guest_write_watch_notify_gpu_write_locked(WatchState& w, uint64_t addr, uint64_t size) {
     const uint64_t end = addr + size;
-    std::lock_guard lock(w.mutex);
     if (w.trace.status == GuestDmemWriteTraceStatus::Armed ||
         w.trace.status == GuestDmemWriteTraceStatus::Stepping) {
         bool overlap = false;
@@ -2563,6 +2563,28 @@ void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size) {
     stats().gpu_write_alias_overlaps.fetch_add(alias_overlaps, std::memory_order_relaxed);
 }
 
+void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size) {
+    if (!addr || !size || addr > UINT64_MAX - size) return;
+    WatchState& w = state();
+    if (!w.fault_onstack.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(w.mutex);
+    guest_write_watch_notify_gpu_write_locked(w, addr, size);
+}
+
+void guest_write_watch_gpu_copy(uint64_t addr, void* destination, const void* source,
+                                size_t bytes, GuestWriteWatchByteCopy copy) {
+    if (!copy) return;
+    WatchState& w = state();
+    if (!addr || !bytes || addr > UINT64_MAX - bytes) {
+        copy(destination, source, bytes);
+        return;
+    }
+    std::lock_guard lock(w.mutex);
+    if (w.fault_onstack.load(std::memory_order_acquire))
+        guest_write_watch_notify_gpu_write_locked(w, addr, bytes);
+    copy(destination, source, bytes);
+}
+
 bool guest_write_watch_desynchronize_for_test(uint64_t addr) {
     WatchState& w = state();
     std::lock_guard lock(w.mutex);
@@ -2601,9 +2623,10 @@ static GuestWriteWatchFaultAction guest_write_watch_handle_fault_impl(
         // returning false here would fall through the caller's fault handler to a fatal _exit — even
         // though this may well be a watched page whose store just raced an arm/rearm. Instead resume:
         // the page is still read-only, so the store re-executes and re-faults, retrying until the lock
-        // frees. The lock is only ever held for bounded, non-blocking work (create/rearm/query/notify),
-        // so it always frees; a genuine (non-watched) fault then re-enters, wins the lock, and takes the
-        // false path below into the real fault handler. sched_yield keeps the retry from spinning hot.
+        // frees. The private-alias GPU copy can also hold this lock during a bounded byte transfer;
+        // its workers touch only host staging and a private mapping, never watched guest pages or
+        // this mutex. A genuine (non-watched) fault then re-enters, wins the lock, and takes the false
+        // path below into the real fault handler. sched_yield keeps the retry from spinning hot.
         sched_yield();
         return GuestWriteWatchFaultAction::Resume;
     }

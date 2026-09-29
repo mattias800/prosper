@@ -11,11 +11,14 @@
 #include "gpu/pm4/pm4_decode.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
+#include "host/memory/guest_write_watch.hpp"
+#include "host/image/exec_image.hpp"
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>   // setenv/_putenv_s: arm the #1226-retired suppression guards for this test
 #include <cstring>
+#include <atomic>
 #include <chrono>
 #include <initializer_list>
 #include <future>
@@ -1452,6 +1455,216 @@ int main() {
             CHECK(prosper::guest_memory_gpu_write_successes_for_test() ==
                       backing_writes_before + 2,
                   "writable physical aliases prove both copies used the backing-aware path");
+
+#ifdef __linux__
+            // The private writer alias must update both direct VAs while leaving the watched
+            // guest page read-only. Replacing its pre-notification with the ordinary physical
+            // notifier dirties the watch too, but this protection assertion catches the regression.
+            // This test mapped direct memory before installing the fault handler, so publish its
+            // already-existing aliases to the watch table after enabling the real on-stack handler.
+            prosper::install_trap_handler();
+            prosper::host::guest_write_watch_set_fault_onstack(true);
+            prosper::host::guest_write_watch_notify_direct_mapping_added(
+                first_view, direct_len, physical, 0x3);
+            prosper::host::guest_write_watch_notify_direct_mapping_added(
+                second_view, direct_len, physical, 0x3);
+            const uint64_t alias_copy_dst = second_view + 0x9000;
+            auto alias_copy_watch = prosper::host::GuestWriteWatch::create(
+                first_view + 0x9000, 0x1000);
+            CHECK(static_cast<bool>(alias_copy_watch),
+                  "private-alias copy has a complete watched physical alias");
+            if (alias_copy_watch) {
+                const auto host_page_read_only = [](uint64_t address) {
+                    FILE* maps = std::fopen("/proc/self/maps", "r");
+                    if (!maps) return false;
+                    char line[512], permissions[5] = {};
+                    unsigned long long begin = 0, end = 0;
+                    bool read_only = false;
+                    while (std::fgets(line, sizeof(line), maps)) {
+                        if (std::sscanf(line, "%llx-%llx %4s", &begin, &end, permissions) == 3 &&
+                            address >= begin && address < end) {
+                            read_only = permissions[0] == 'r' && permissions[1] != 'w';
+                            break;
+                        }
+                    }
+                    std::fclose(maps);
+                    return read_only;
+                };
+                CHECK(host_page_read_only(first_view + 0x9000) &&
+                          host_page_read_only(alias_copy_dst),
+                      "the direct aliases start host-read-only under the watch");
+                uint8_t alias_copy_payload[64];
+                for (size_t i = 0; i < sizeof(alias_copy_payload); ++i)
+                    alias_copy_payload[i] = static_cast<uint8_t>(i * 7u + 3u);
+                const auto before_alias_copy =
+                    prosper::guest_memory_gpu_alias_write_successes_for_test();
+                const bool alias_copied = prosper::guest_memory_gpu_write_alias(
+                    alias_copy_dst, alias_copy_payload, sizeof(alias_copy_payload),
+                    [](void* dst, const void* src, size_t length) {
+                        std::memcpy(dst, src, length);
+                    });
+                CHECK(alias_copied &&
+                          prosper::guest_memory_gpu_alias_write_successes_for_test() ==
+                              before_alias_copy + 1 &&
+                          std::memcmp(reinterpret_cast<const void*>(first_view + 0x9000),
+                                      alias_copy_payload, sizeof(alias_copy_payload)) == 0 &&
+                          std::memcmp(reinterpret_cast<const void*>(alias_copy_dst),
+                                      alias_copy_payload, sizeof(alias_copy_payload)) == 0,
+                      "private-alias copy publishes exact bytes to both direct VAs");
+                CHECK(alias_copy_watch.query() == prosper::host::GuestWriteWatchQuery::Dirty &&
+                          host_page_read_only(first_view + 0x9000) &&
+                          host_page_read_only(alias_copy_dst),
+                      "device copy marks physical watches dirty without disarming guest pages");
+                CHECK(alias_copy_watch.rearm() &&
+                          alias_copy_watch.query() ==
+                              prosper::host::GuestWriteWatchQuery::Unchanged,
+                      "private-alias result can be revalidated without losing protection");
+                // A byte-correct snapshot alone cannot catch a rearm landing between the dirty
+                // announcement and the private-alias write: that leaves a protected Clean watch
+                // over changed physical bytes. The control uses the guest VA, so it proves the
+                // timing gap, while the first arm proves the alias path excludes that gap.
+                struct RearmRace {
+                    uint8_t bytes[64]{};
+                    std::atomic<bool> copy_entered{false};
+                    std::atomic<bool> rearm_attempted{false};
+                    std::atomic<bool> rearm_done{false};
+                    std::atomic<bool> done_during_copy{false};
+                    bool rearm_ok = false;
+                } race;
+                std::memcpy(race.bytes, alias_copy_payload, sizeof(race.bytes));
+                const auto delayed_copy = [](void* dst, const void* src, size_t length) {
+                    auto* state = const_cast<RearmRace*>(static_cast<const RearmRace*>(src));
+                    state->copy_entered.store(true, std::memory_order_release);
+                    const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(2);
+                    while (!state->rearm_attempted.load(std::memory_order_acquire) &&
+                           std::chrono::steady_clock::now() < deadline)
+                        std::this_thread::yield();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                    state->done_during_copy.store(
+                        state->rearm_done.load(std::memory_order_acquire),
+                        std::memory_order_release);
+                    std::memcpy(dst, state->bytes, length);
+                };
+                const auto run_rearm_race = [&](bool locked_copy) {
+                    race.copy_entered = false;
+                    race.rearm_attempted = false;
+                    race.rearm_done = false;
+                    race.done_during_copy = false;
+                    race.rearm_ok = false;
+                    std::thread rearm_worker([&] {
+                        const auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(2);
+                        while (!race.copy_entered.load(std::memory_order_acquire) &&
+                               std::chrono::steady_clock::now() < deadline)
+                            std::this_thread::yield();
+                        if (!race.copy_entered.load(std::memory_order_acquire)) return;
+                        race.rearm_attempted.store(true, std::memory_order_release);
+                        race.rearm_ok = alias_copy_watch.rearm();
+                        race.rearm_done.store(true, std::memory_order_release);
+                    });
+                    bool copied = false;
+                    if (locked_copy)
+                        copied = prosper::guest_memory_gpu_write_alias(
+                            alias_copy_dst, &race, sizeof(race.bytes), delayed_copy);
+                    else {
+                        prosper::host::guest_write_watch_notify_gpu_write(
+                            alias_copy_dst, sizeof(race.bytes));
+                        delayed_copy(reinterpret_cast<void*>(alias_copy_dst), &race,
+                                     sizeof(race.bytes));
+                        copied = true;
+                    }
+                    rearm_worker.join();
+                    return copied && race.rearm_attempted.load(std::memory_order_acquire) &&
+                           race.rearm_ok &&
+                           std::memcmp(reinterpret_cast<const void*>(alias_copy_dst),
+                                       race.bytes, sizeof(race.bytes)) == 0;
+                };
+                CHECK(run_rearm_race(true) &&
+                          !race.done_during_copy.load(std::memory_order_acquire),
+                      "private-alias copy excludes a competing watch rearm until bytes land");
+                CHECK(run_rearm_race(false) &&
+                          race.done_during_copy.load(std::memory_order_acquire),
+                      "control: early dirty mark alone lets rearm race the copy");
+                CHECK(alias_copy_watch.rearm() && host_page_read_only(alias_copy_dst),
+                      "race control restores watched guest protection for subsequent refusals");
+                // Five distinct page windows force the four-entry alias cache to evict. Returning
+                // to the watched original page then proves the remap still reaches the same backing.
+                const auto before_cache_eviction =
+                    prosper::guest_memory_gpu_alias_write_successes_for_test();
+                bool evicted_copy_exact = true;
+                uint8_t eviction_payload[64];
+                for (uint64_t page = 1; page <= 5; ++page) {
+                    std::memset(eviction_payload, static_cast<int>(page * 17u),
+                                sizeof(eviction_payload));
+                    const uint64_t offset = page * 0x1000;
+                    evicted_copy_exact &= prosper::guest_memory_gpu_write_alias(
+                        second_view + offset, eviction_payload, sizeof(eviction_payload),
+                        [](void* dst, const void* src, size_t length) {
+                            std::memcpy(dst, src, length);
+                        });
+                    evicted_copy_exact &=
+                        std::memcmp(reinterpret_cast<const void*>(first_view + offset),
+                                    eviction_payload, sizeof(eviction_payload)) == 0;
+                }
+                evicted_copy_exact &= alias_copy_watch.query() ==
+                    prosper::host::GuestWriteWatchQuery::Unchanged;
+                evicted_copy_exact &= prosper::guest_memory_gpu_write_alias(
+                    alias_copy_dst, alias_copy_payload, sizeof(alias_copy_payload),
+                    [](void* dst, const void* src, size_t length) {
+                        std::memcpy(dst, src, length);
+                    });
+                CHECK(evicted_copy_exact &&
+                          prosper::guest_memory_gpu_alias_write_successes_for_test() ==
+                              before_cache_eviction + 6 &&
+                          std::memcmp(reinterpret_cast<const void*>(first_view + 0x9000),
+                                      alias_copy_payload, sizeof(alias_copy_payload)) == 0 &&
+                          alias_copy_watch.query() ==
+                              prosper::host::GuestWriteWatchQuery::Dirty,
+                      "writer-alias eviction and remap preserve exact backing and watch scope");
+                const auto before_overlap_refusal =
+                    prosper::guest_memory_gpu_alias_write_successes_for_test();
+                CHECK(!prosper::guest_memory_gpu_write_alias(
+                          alias_copy_dst + 1,
+                          reinterpret_cast<const void*>(first_view + 0x9000),
+                          sizeof(alias_copy_payload) - 1,
+                          [](void* dst, const void* src, size_t length) {
+                              std::memcpy(dst, src, length);
+                          }) &&
+                          prosper::guest_memory_gpu_alias_write_successes_for_test() ==
+                              before_overlap_refusal &&
+                          host_page_read_only(alias_copy_dst),
+                      "overlapping physical source declines before touching watched backing");
+                const auto before_partial_copy =
+                    prosper::guest_memory_gpu_alias_write_successes_for_test();
+                CHECK(!prosper::guest_memory_gpu_write_alias(
+                          alias_copy_dst, alias_copy_payload, sizeof(alias_copy_payload),
+                          [](void* dst, const void*, size_t) {
+                              *static_cast<uint8_t*>(dst) = 0xe7;
+                              throw 1;
+                          }) &&
+                          *reinterpret_cast<const uint8_t*>(first_view + 0x9000) == 0xe7 &&
+                          prosper::guest_memory_gpu_alias_write_successes_for_test() ==
+                              before_partial_copy &&
+                          alias_copy_watch.query() ==
+                              prosper::host::GuestWriteWatchQuery::Dirty &&
+                          host_page_read_only(alias_copy_dst),
+                      "partial alias copy stays dirty and unclaimed for caller fallback");
+                CHECK(alias_copy_watch.rearm(),
+                      "partial-copy control rearms before the disarming-notifier control");
+                prosper::host::guest_write_watch_notify_physical_write(
+                    physical + 0x9000, sizeof(alias_copy_payload));
+                CHECK(!host_page_read_only(first_view + 0x9000) &&
+                          !host_page_read_only(alias_copy_dst),
+                      "control: disarming physical notifier visibly differs from alias copy");
+                alias_copy_watch.reset();
+            }
+            prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                second_view, direct_len);
+            prosper::host::guest_write_watch_notify_direct_mapping_removed(
+                first_view, direct_len);
+            prosper::host::guest_write_watch_set_fault_onstack(false);
+#endif
 
             // A GPU can write direct memory whose guest VA is CPU-read-only. Preserve that CPU
             // protection and update the shared physical backing instead of weakening mprotect or

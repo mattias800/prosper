@@ -307,6 +307,14 @@ void guest_write_watch_notify_host_write_done(uint64_t addr, uint64_t size);
 // fault, an adjacent write on the same host page need not create a false dirty result.
 void guest_write_watch_notify_gpu_write(uint64_t addr, uint64_t size);
 
+// Keep a device/DMA byte copy and its dirty announcement indivisible to query/rearm. The
+// callback must only copy the supplied host-staging bytes; it runs while the watch lock is held.
+// This prevents a rearm between the dirty announcement and a write through a private backing
+// alias, which bypasses the guest page protection.
+using GuestWriteWatchByteCopy = void (*)(void* destination, const void* source, size_t bytes);
+void guest_write_watch_gpu_copy(uint64_t addr, void* destination, const void* source,
+                                size_t bytes, GuestWriteWatchByteCopy copy);
+
 // Retained for callers that can only resume a handled fault and cannot own a TF completion. On Linux
 // it preserves production dirty-watch behavior but fail-visibly invalidates/opens an overlapping dmem
 // diagnostic rather than publishing a step nobody can complete. Windows returns false because
