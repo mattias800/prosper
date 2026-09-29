@@ -78,6 +78,15 @@ void set_gauge(WindowSample& w, Gauge g, uint64_t v) {
 
 const RuleThresholds kDefault{};
 
+// What one window REPORTS once every rule's sustain has held: the candidates after the engine's
+// reporting deferrals. evaluate_rules alone returns every candidate, deferred or not, because a
+// deferred rule must still count its streak.
+std::vector<AlarmFiring> reported(const WindowSample& w, const RuleThresholds& t = kDefault) {
+    std::vector<AlarmFiring> out = evaluate_rules(w, t);
+    apply_reporting_deferrals(out);
+    return out;
+}
+
 void test_quiet_baseline() {
     std::puts("baseline");
     check("an empty healthy window raises nothing", evaluate_rules(healthy(), kDefault).empty());
@@ -634,11 +643,15 @@ void test_host_copy_pressure() {
     set_transfer(sonic, Transfer::Detile, 1183.0);
     set_transfer(sonic, Transfer::RenderTargetSnapshot, 241.0);
     set_transfer(sonic, Transfer::StorageMaterialize, 2.0);
-    // 47.5 MiB per flip at 30 fps: the per-flip form holds, so the per-second form defers to it
-    // (one cause, one line).
-    const auto a = evaluate_rules(sonic, kDefault);
-    check("Sonic's 1,426 MiB/s at 30 fps is reported by host-copy-per-flip alone (the rate form "
-          "defers)", only(a, "host-copy-per-flip"));
+    // 47.5 MiB per flip at 30 fps: both forms hold. Both are CANDIDATES (so both streaks count),
+    // and only the per-flip one is REPORTED (one cause, one line).
+    const auto candidates = evaluate_rules(sonic, kDefault);
+    check("Sonic's 1,426 MiB/s at 30 fps: both host-copy forms are candidates",
+          candidates.size() == 2 && fired(candidates, "host-copy-per-flip") &&
+              fired(candidates, "host-copy-pressure"));
+    const auto a = reported(sonic);
+    check("...and host-copy-per-flip alone is reported (the rate form defers at report time)",
+          only(a, "host-copy-per-flip"));
     // The same bytes over too few flips to form a per-frame figure (a stall): the rate form is
     // the only one that can see it, and it names the site.
     WindowSample stalled = sonic;
@@ -715,7 +728,7 @@ void test_host_copy_per_flip() {
     for (double fps : {5.0, 9.0, 30.0, 60.0}) {
         WindowSample w = at_fps(fps);
         set_transfer_per_flip(w, Transfer::StorageMaterialize, 27.0, 100);
-        same_verdict &= only(evaluate_rules(w, kDefault), "host-copy-per-flip");
+        same_verdict &= only(reported(w), "host-copy-per-flip");
     }
     check("27 MiB/flip fires host-copy-per-flip alone at 5, 9, 30 and 60 fps", same_verdict);
     bool quiet_everywhere = true;
@@ -757,7 +770,14 @@ void test_host_copy_per_flip() {
     WindowSample fast = at_fps(120.0);
     set_transfer_per_flip(fast, Transfer::Detile, 3.0, 600);
     check("a small per-flip copy at a high frame rate is left to host-copy-pressure",
-          only(evaluate_rules(fast, kDefault), "host-copy-pressure"));
+          only(reported(fast), "host-copy-pressure"));
+    check("apply_reporting_deferrals keeps host-copy-pressure when host-copy-per-flip is absent",
+          [] {
+              std::vector<AlarmFiring> v(1);
+              v[0].rule = "host-copy-pressure";
+              apply_reporting_deferrals(v);
+              return v.size() == 1;
+          }());
     check("...host_copy_per_flip_holds agrees with the rule on each window",
           host_copy_per_flip_holds(heavy, kDefault) && !host_copy_per_flip_holds(fast, kDefault) &&
               !host_copy_per_flip_holds(few, kDefault) && !host_copy_per_flip_holds(under, kDefault));
@@ -1233,6 +1253,54 @@ void test_engine_host_copy_per_flip() {
     std::remove(jsonl.c_str());
 }
 
+// The review blocker on #3928: a deferral decided at EVALUATION withheld host-copy-pressure's
+// candidate whenever the per-flip form held, and the engine resets a rule's streak when it has no
+// candidate. A per-flip value alternating across the threshold (25 / 15 MiB per flip at 30 fps --
+// 750 / 450 MiB/s, both far above 256) then reset BOTH streaks every window and neither rule ever
+// printed, where main reported host-copy-pressure from the second window. The deferral is a
+// reporting decision only.
+void test_engine_host_copy_alternating() {
+    std::puts("engine host-copy deferral");
+    using prosper::diagnostics::Transfer;
+    const auto window = [](double mib_per_flip) {
+        WindowSample w = healthy();              // 150 flips in 5 s
+        set_transfer_per_flip(w, Transfer::StorageMaterialize, mib_per_flip, 1000);
+        return w;
+    };
+    {
+        EngineConfig config;
+        config.log = nullptr;
+        AlarmEngine engine(std::move(config));
+        size_t reported_windows = 0, pressure = 0, per_flip = 0;
+        for (int i = 0; i < 8; ++i) {
+            const auto r = engine.close_window(window(i % 2 ? 15.0 : 25.0), 5.0 * (i + 1));
+            reported_windows += !r.empty();
+            pressure += fired(r, "host-copy-pressure");
+            per_flip += fired(r, "host-copy-per-flip");
+        }
+        check("a per-flip value alternating 25/15 MiB/flip at 450-750 MiB/s is still reported",
+              reported_windows > 0);
+        check("...by host-copy-pressure in every window from the second (7 of 8), as on main",
+              pressure == 7 && per_flip == 0);
+    }
+    {
+        EngineConfig config;
+        config.log = nullptr;
+        AlarmEngine engine(std::move(config));
+        std::vector<AlarmFiring> r1 = engine.close_window(window(25.0), 5.0);
+        std::vector<AlarmFiring> r2 = engine.close_window(window(25.0), 10.0);
+        check("a steady 25 MiB/flip reports host-copy-per-flip alone from the second window",
+              r1.empty() && only(r2, "host-copy-per-flip"));
+        // The per-flip value drops under threshold in window 3 at the same high rate: the rate
+        // form's streak kept counting through the deferred windows, so it reports at once.
+        std::vector<AlarmFiring> r3 = engine.close_window(window(15.0), 15.0);
+        check("...and when it dips under, host-copy-pressure reports in that same window "
+              "(its streak counted while deferred)", only(r3, "host-copy-pressure"));
+        check("...deferred windows are not counted as fired",
+              engine.times_fired("host-copy-pressure") == 1);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1264,6 +1332,7 @@ int main() {
     test_engine();
     test_engine_breakdowns();
     test_engine_host_copy_per_flip();
+    test_engine_host_copy_alternating();
     check("rule_names lists the six phase-2 rules, the three added with phase 3, "
           "gpu-memory-off-device (#3897), the six 2026-09-28 queue rules and the two "
           "2026-09-29 ones (host-copy-per-flip, present-slot-trouble)",

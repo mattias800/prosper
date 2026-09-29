@@ -182,6 +182,8 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
             }
         if (!held) state.streak = 0;
     }
+    // After the streaks: a deferral changes what is printed, never what is counted.
+    apply_reporting_deferrals(fired);
     active_.clear();
     for (const AlarmFiring& a : fired) active_.push_back(a.rule);
     for (const AlarmFiring& a : fired) {
@@ -318,7 +320,7 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
         }
         // host-copy-per-flip's inputs: the per-flip figure (null below the flip floor, where the
         // rule has no data), the per-second figure host-copy-pressure reads (kept visible even
-        // when that rule defers to the per-flip one), and calls per site for bytes per call.
+        // when that rule is not reported in favour of the per-flip one), and calls per site.
         std::fputs("},\"host_copy_mib_per_flip\":", jsonl_);
         if (w.flips >= kHostCopyPerFlipMinFlips)
             std::fprintf(jsonl_, "%.2f", host_copy_mib(w) / static_cast<double>(w.flips));

@@ -138,6 +138,18 @@ uint64_t present_slot_trouble_declines(const WindowSample& w) {
     return n;
 }
 
+void apply_reporting_deferrals(std::vector<AlarmFiring>& reported) {
+    const auto is = [](const AlarmFiring& a, const char* rule) {
+        return std::strcmp(a.rule, rule) == 0;
+    };
+    bool per_flip = false;
+    for (const AlarmFiring& a : reported) per_flip |= is(a, "host-copy-per-flip");
+    if (!per_flip) return;
+    reported.erase(std::remove_if(reported.begin(), reported.end(),
+                                  [&](const AlarmFiring& a) { return is(a, "host-copy-pressure"); }),
+                   reported.end());
+}
+
 std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresholds& t) {
     std::vector<AlarmFiring> out;
     if (w.seconds <= 0) return out;
@@ -349,11 +361,13 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
 
     // host-copy-per-flip (RATE per guest flip) and host-copy-pressure (RATE per second): one
     // quantity, two denominators. Per flip is the frame-rate-independent form and leads; the
-    // per-second form reports only what the per-flip form cannot see (see host_copy_per_flip_holds).
+    // per-second form is still EVALUATED every window, so its sustain streak counts; it is dropped
+    // only at report time, in a window where host-copy-per-flip is itself reported
+    // (apply_reporting_deferrals). Deferring at evaluation instead reset its streak whenever the
+    // per-flip form held, so a per-flip value alternating across the threshold silenced both.
     uint64_t copy_bytes = 0;
     for (uint64_t b : w.transfer_bytes) copy_bytes += b;
-    const bool per_flip_holds = host_copy_per_flip_holds(w, t);
-    if (per_flip_holds) {
+    if (host_copy_per_flip_holds(w, t)) {
         const double mib_per_flip = copy_bytes / kMiB / static_cast<double>(w.flips);
         AlarmFiring a;
         a.rule = "host-copy-per-flip";
@@ -401,7 +415,7 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
     {
         const uint64_t bytes = copy_bytes;
         const double mib_per_s = per_second(bytes, w.seconds) / kMiB;
-        if (bytes && !per_flip_holds && mib_per_s >= t.host_copy_mib_per_s) {
+        if (bytes && mib_per_s >= t.host_copy_mib_per_s) {
             AlarmFiring a;
             a.rule = "host-copy-pressure";
             a.value = mib_per_s;

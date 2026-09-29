@@ -86,9 +86,8 @@ constexpr uint64_t kGpuMemoryOffDevicePerWindow = 1;
 // its summary "breakdown over fired windows" is MiB too. 256 MiB/s is that census's own HIGH line, which healthy titles sit
 // far below (GTA V on main: ~80 MiB/s over a whole route) and every defect it was written against
 // far above (a static splash copying 770 MiB/s; Astro Bot's compute round trip at ~2 GiB/s, #3871).
-// Since host-copy-per-flip (below) it DEFERS to that rule in any window where the per-flip form
-// holds: it now reports only what the per-flip form cannot see -- too few flips to form a per-frame
-// figure (a stall, a load, a title under 2 fps), or a small per-frame copy at a high frame rate.
+// Since host-copy-per-flip (below) it is not REPORTED in a window where that rule is reported
+// (apply_reporting_deferrals); it is still evaluated, and its streak still counts, every window.
 constexpr double kHostCopyMiBPerSecond = 256.0;
 
 // host-copy-per-flip: the same bytes as host-copy-pressure, per GUEST FLIP instead of per second, so
@@ -298,10 +297,17 @@ bool rule_has_data(const char* rule, const WindowSample& w);
 // Consecutive windows `rule` must hold before it is reported (see kSustainWindows).
 uint32_t sustain_windows(const char* rule);
 
-// host-copy-per-flip's condition, exposed because host-copy-pressure defers to it: when a window
-// has enough flips to form a per-frame figure and that figure is over threshold, the per-second
-// form would only restate it (and is the one that moves with the frame rate).
+// host-copy-per-flip's condition.
 bool host_copy_per_flip_holds(const WindowSample& w, const RuleThresholds& t);
+
+// REPORTING deferrals, applied by the engine to the rules that passed their sustain in one window
+// (never to evaluate_rules' candidates, so every rule's streak keeps counting): host-copy-pressure
+// is dropped when host-copy-per-flip is reported in the same window, because it would restate the
+// same bytes with the denominator that moves with the frame rate. In a window where the per-flip
+// rule is not reported -- too few flips, a small per-frame copy at a high frame rate, or a per-flip
+// value that dips under its threshold and breaks that rule's streak -- host-copy-pressure reports
+// as it always did.
+void apply_reporting_deferrals(std::vector<AlarmFiring>& reported);
 // The window's `publish-failed` + `compute-scanout-unwatched` GPU-present declines.
 uint64_t present_slot_trouble_declines(const WindowSample& w);
 
