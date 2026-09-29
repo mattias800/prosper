@@ -2788,6 +2788,7 @@ struct RegState {
     // Raw x2 loads with direct scalar observations. Their exact-PC resource must not turn an
     // unrelated unresolved scalar load into a binding-2 fallback success.
     std::unordered_set<uint32_t> smem_raw_x2_data_loads;
+    std::unordered_set<uint32_t> smem_raw_immediate_wide_data_loads;
     std::unordered_set<uint32_t> smem_raw_wide_data_loads;
     bool smem_pointer_analysis_done = false;
     // Register-offset S_LOAD_DWORDX2 is likewise typeless. GTA V uses it to fetch the first two
@@ -2953,6 +2954,7 @@ inline bool sopk_writes_scalar_data(uint32_t opcode) {
            opcode == 0x10 || opcode == 0x12;
 }
 uint32_t scalar_write_width(const Rdna2Inst& in);
+bool rdna2_may_write_guest_memory(const Rdna2Inst& in);
 
 // VOP3B add/subtract without carry-in produces a fresh carry/borrow mask in SDST. Unlike the
 // 0x128-0x12a family, this mask does not depend on a tracked src2 mask. Keep this exact predicate

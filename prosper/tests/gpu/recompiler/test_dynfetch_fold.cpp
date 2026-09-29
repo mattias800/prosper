@@ -881,6 +881,51 @@ int main() {
               ngg_wide_texture_uses[0].s4[0] == ngg_mixed_stage_data[12],
           "fused NGG x16 mixed stage-data load publishes its T# and paired S# by consuming pc");
 
+    // The scalar fold walks instructions linearly. A branch in an x16 shader may retain the
+    // snapshot only when the mapped producer executes on every path to this exact image use.
+    const uint32_t branched_x16_use[] = {
+        0xF4100200u, 0xFA000000u,   // pc0: x16 s[8:23]
+        0xBF840001u,                 // pc2: either edge reaches the use
+        0xBF800000u,                 // pc3: s_nop
+        0xF0800F08u, 0x00A20000u,   // pc4: image_sample, T# s[8:15]
+        0xBF810000u,
+    };
+    std::vector<SrtUse> branched_x16_uses;
+    resolve_dynamic_fetch(
+        branched_x16_use, std::size(branched_x16_use), ngg_mixed_system_sgprs,
+        std::size(ngg_mixed_system_sgprs), 0, &branched_x16_uses);
+    CHECK(branched_x16_uses.size() == 1 && branched_x16_uses[0].use_pc == 4 &&
+              std::equal(branched_x16_uses[0].t8.begin(), branched_x16_uses[0].t8.end(),
+                         std::begin(ngg_mixed_stage_data)),
+          "branched x16 use publishes the current mapped descriptor after load dominance");
+
+    const uint32_t skipped_x16_load[] = {
+        0xBF840002u,                 // pc0: one edge skips the x16 load
+        0xF4100200u, 0xFA000000u,   // pc1: x16 s[8:23]
+        0xF0800F08u, 0x00A20000u,   // pc3: joined image_sample
+        0xBF810000u,
+    };
+    std::vector<SrtUse> skipped_x16_uses;
+    resolve_dynamic_fetch(
+        skipped_x16_load, std::size(skipped_x16_load), ngg_mixed_system_sgprs,
+        std::size(ngg_mixed_system_sgprs), 0, &skipped_x16_uses);
+    CHECK(skipped_x16_uses.empty(),
+          "a branch that bypasses an x16 load cannot publish its linear-fold snapshot");
+
+    const uint32_t patched_branch_x16[] = {
+        0xF4100200u, 0xFA000000u,
+        0xBF840001u,                 // pc2: only one edge patches T#.word2
+        0xBE8A0381u,                // pc3: s_mov_b32 s10, 1
+        0xF0800F08u, 0x00A20000u,   // pc4: joined image_sample
+        0xBF810000u,
+    };
+    std::vector<SrtUse> patched_branch_uses;
+    resolve_dynamic_fetch(
+        patched_branch_x16, std::size(patched_branch_x16), ngg_mixed_system_sgprs,
+        std::size(ngg_mixed_system_sgprs), 0, &patched_branch_uses);
+    CHECK(patched_branch_uses.empty(),
+          "branch-dependent descriptor patch cannot borrow unmodified x16 provenance");
+
     // The x16 snapshot is only provenance. A modeled scalar patch changes the physical T# word
     // consumed by MIMG, so the emitted use must carry the live descriptor rather than stale load-time
     // bytes. (An unmodeled write makes that word unknown and suppresses the use instead.)
@@ -2558,6 +2603,85 @@ int main() {
               reordered_image_uses[0].t8[1] == reordered_image_uses[0].t8[0] &&
               reordered_image_uses[0].descriptor_source_addr == 0,
           "same-window lane reorder drops contiguous image-source provenance");
+
+    // A full-resolution producer loads the low and high halves of its storage T# from
+    // adjacent table ranges, then moves the high words into place one B32 lane at a time.
+    // The intervening sample reads a different image and must not revoke this source.
+    alignas(16) uint32_t split_image_table[64]{};
+    std::copy(std::begin(atomic_image_seed), std::end(atomic_image_seed),
+              split_image_table + 12);
+    std::copy(std::begin(atomic_image_seed), std::end(atomic_image_seed),
+              split_image_table + 52);
+    const uint64_t split_table_addr = reinterpret_cast<uint64_t>(split_image_table);
+    uint32_t split_table_seed[2] = {static_cast<uint32_t>(split_table_addr),
+                                    static_cast<uint32_t>(split_table_addr >> 32)};
+    const std::vector<uint32_t> split_image_code = {
+        0xf40c0100u, 0xfa0000d0u, // x8 sampled T# at +0xd0
+        0xf4080500u, 0xfa0000f0u, // x4 sampler at +0xf0
+        0xf40c0300u, 0xfa000020u, // x8 intermediate T# at +0x20
+        0xbe980310u, 0xbe990311u, 0xbe9a0312u, 0xbe9b0313u, // s[24:27] <- s[16:19]
+        0xf4080700u, 0xfa000040u, // x4 upper T# at +0x40 -> s[28:31]
+        0xf09c0f08u, 0x00a1000bu, // image_sample, read-only
+        0xf0200f08u, 0x00060004u, // image_store s[24:31]
+        0xbf810000u,
+    };
+    auto split_store = [&](const std::vector<uint32_t>& code, uint32_t store_pc,
+                           const std::array<uint32_t, 8>& expected) {
+        std::vector<SrtUse> uses;
+        resolve_dynamic_fetch(code.data(), code.size(), split_table_seed,
+                              std::size(split_table_seed), 0, &uses);
+        return std::any_of(uses.begin(), uses.end(), [&](const SrtUse& use) {
+            return use.kind == 0 && use.use_pc == store_pc && use.is_storage_image &&
+                use.descriptor_source_addr == split_table_addr + 0x30 &&
+                use.t8 == expected;
+        });
+    };
+    CHECK(split_store(split_image_code, 14, expected_atomic_t8),
+          "split T# copied into image_store retains exact composite source");
+    split_image_table[12] ^= 1u;
+    auto refreshed_split_t8 = expected_atomic_t8;
+    refreshed_split_t8[0] ^= 1u;
+    CHECK(split_store(split_image_code, 14, refreshed_split_t8),
+          "split T# reads current descriptor bytes from the exact table");
+    split_image_table[12] ^= 1u;
+    auto split_wrong_lane = split_image_code;
+    split_wrong_lane[6] = 0xbe980311u; // s24 <- s17 duplicates the next source lane
+    CHECK(!split_store(split_wrong_lane, 14, expected_atomic_t8),
+          "wrong copied lane cannot claim exact composite source");
+    auto split_prior_store = split_image_code;
+    split_prior_store[12] = 0xf0200f08u; // preceding sample becomes a possible image write
+    CHECK(!split_store(split_prior_store, 14, expected_atomic_t8),
+          "prior image write revokes composite backing proof");
+    auto split_pre_copy_clobber = split_image_code;
+    split_pre_copy_clobber.insert(split_pre_copy_clobber.begin() + 6,
+                                 0xbe900380u); // s16 <- 0 before s24 <- s16
+    CHECK(!split_store(split_pre_copy_clobber, 15, expected_atomic_t8),
+          "source clobber before copying cannot retain composite provenance");
+    auto split_post_copy_clobber = split_image_code;
+    split_post_copy_clobber.insert(split_post_copy_clobber.begin() + 7,
+                                  0xbe980380u); // s24 <- 0 after copy
+    CHECK(!split_store(split_post_copy_clobber, 15, expected_atomic_t8),
+          "destination clobber after copying revokes composite provenance");
+    auto split_source_after_copy = split_image_code;
+    split_source_after_copy.insert(split_source_after_copy.begin() + 7,
+                                   0xbe900380u); // s16 <- 0 after s24 captured it
+    CHECK(split_store(split_source_after_copy, 15, expected_atomic_t8),
+          "source may change after a proven copy without changing the copied descriptor");
+    auto split_skipped_copy = split_image_code;
+    split_skipped_copy.insert(split_skipped_copy.begin() + 6,
+                              0xbf840001u); // conditional edge skips s24 <- s16
+    CHECK(!split_store(split_skipped_copy, 15, expected_atomic_t8),
+          "branch that skips a copied lane cannot publish composite provenance");
+    auto split_skipped_load = split_image_code;
+    split_skipped_load.insert(split_skipped_load.begin() + 4,
+                              0xbf840002u); // skip the x8 source load at new pc5
+    CHECK(!split_store(split_skipped_load, 15, expected_atomic_t8),
+          "branch that skips the descriptor producer cannot publish its provenance");
+    auto split_replayed_copy = split_image_code;
+    split_replayed_copy.insert(split_replayed_copy.begin() + 10,
+                                0xbf84fff9u); // conditional backedge to the x8 source load
+    CHECK(!split_store(split_replayed_copy, 15, expected_atomic_t8),
+          "backedge that can replay descriptor construction remains unresolved");
 
     // Astro's title PS consumes a V# placed directly in s[24:27] with a scalar offset computed in
     // VCC_LO. No s_load gives that descriptor an SRT key, and AGC metadata need not publish a sharp
@@ -6330,6 +6454,305 @@ int main() {
               !recompile_compute(raw_x2_data, std::size(raw_x2_data), &raw_x2_table,
                                  raw_x2_config).empty(),
           "production resource handoff binds the exact x2 range and compiled scalar load");
+
+    // A pair observed by ordinary one-word vector arithmetic before a forward branch also
+    // requires real backing. The branch may choose either continuation; the exact load-PC buffer
+    // supplies current guest bytes instead of replacing either scalar word with a constant.
+    alignas(8) static uint32_t raw_x2_vector_backing[6] = {
+        0x11u, 0x22u, 0x33u, 0x44u, 0x12345678u, 0x9abcdef0u};
+    const uint64_t raw_x2_vector_ptr =
+        reinterpret_cast<uint64_t>(raw_x2_vector_backing);
+    const uint32_t raw_x2_vector_seed[2] = {
+        static_cast<uint32_t>(raw_x2_vector_ptr),
+        static_cast<uint32_t>(raw_x2_vector_ptr >> 32)};
+    const uint32_t raw_x2_vector[] = {
+        smem(1, 20, 0), 0xfa000010u, // pc0: s_load_dwordx2 s[20:21], s[0:1], 0x10
+        0x0a0e0e15u,                // pc2: v_subrev_f32 v7, s21, v7
+        0x10200c14u,                // pc3: v_mul_f32 v16, s20, v6
+        0xbf840001u,                // pc4: forward conditional branch to end
+        0xbf800000u,                // pc5: s_nop
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x2_vector_decoded;
+    rdna2_walk(raw_x2_vector, std::size(raw_x2_vector), raw_x2_vector_decoded);
+    std::vector<SrtUse> raw_x2_vector_uses;
+    resolve_dynamic_fetch(raw_x2_vector, std::size(raw_x2_vector),
+                          raw_x2_vector_seed, std::size(raw_x2_vector_seed), 0,
+                          &raw_x2_vector_uses);
+    ShaderResourceTable raw_x2_vector_table;
+    add_compute_buffer_resources(raw_x2_vector_table, raw_x2_vector,
+                                 std::size(raw_x2_vector), raw_x2_vector_seed,
+                                 std::size(raw_x2_vector_seed));
+    assign_convention_bindings(raw_x2_vector_table, 2);
+    ComputeShaderConfig raw_x2_vector_config = raw_x2_config;
+    raw_x2_vector_config.user_sgprs.assign(std::begin(raw_x2_vector_seed),
+                                           std::end(raw_x2_vector_seed));
+    const ShaderResource* raw_x2_vector_resource = raw_x2_vector_table.by_fetch_pc(0);
+    CHECK(rdna2_proven_raw_x2_data_loads(raw_x2_vector_decoded) == data_proof &&
+              raw_x2_vector_uses.size() == 1 && raw_x2_vector_uses[0].use_pc == 0 &&
+              raw_x2_vector_uses[0].required_size == 24 &&
+              raw_x2_vector_resource && raw_x2_vector_resource->gpu_addr == raw_x2_vector_ptr &&
+              raw_x2_vector_resource->size == 24 &&
+              !recompile_compute(raw_x2_vector, std::size(raw_x2_vector),
+                                 &raw_x2_vector_table, raw_x2_vector_config).empty(),
+          "vector-observed x2 pair binds its exact current guest range across a forward branch");
+    ShaderResourceTable raw_x2_vector_missing_table;
+    CHECK(recompile_compute(raw_x2_vector, std::size(raw_x2_vector),
+                            &raw_x2_vector_missing_table,
+                            raw_x2_vector_config).empty(),
+          "vector-observed x2 cannot borrow a missing exact-PC data binding");
+    const uint32_t raw_x2_vector_early_branch[] = {
+        smem(1, 20, 0), 0xfa000010u,
+        0x0a0e0e15u,
+        0xbf840001u,                // one path skips s20's observation
+        0x10200c14u,
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x2_vector_early_decoded;
+    rdna2_walk(raw_x2_vector_early_branch, std::size(raw_x2_vector_early_branch),
+               raw_x2_vector_early_decoded);
+    CHECK(rdna2_proven_raw_x2_data_loads(raw_x2_vector_early_decoded).empty(),
+          "branch before both vector observations does not admit raw x2 backing");
+    const uint32_t raw_x2_vector_reentry[] = {
+        smem(1, 20, 0), 0xfa000010u,
+        0x0a0e0e15u, 0x10200c14u,
+        0xbf82fffbu,                // pc4: branch back to load at pc0
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x2_vector_reentry_decoded;
+    rdna2_walk(raw_x2_vector_reentry, std::size(raw_x2_vector_reentry),
+               raw_x2_vector_reentry_decoded);
+    CHECK(rdna2_proven_raw_x2_data_loads(raw_x2_vector_reentry_decoded).empty(),
+          "a replay edge into the raw x2 load cannot retain one invocation binding");
+    const uint32_t raw_x2_vector_pointer_write[] = {
+        0xbe800380u,                // pc0: overwrite SBASE low word before the raw load
+        smem(1, 20, 0), 0xfa000010u,
+        0x0a0e0e15u, 0x10200c14u,
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x2_vector_pointer_decoded;
+    rdna2_walk(raw_x2_vector_pointer_write, std::size(raw_x2_vector_pointer_write),
+               raw_x2_vector_pointer_decoded);
+    CHECK(rdna2_proven_raw_x2_data_loads(raw_x2_vector_pointer_decoded).empty(),
+          "vector-backed raw x2 requires an unchanged entry pointer at its load");
+    const uint32_t raw_x2_vector_partial_write[] = {
+        smem(1, 20, 0), 0xfa000010u,
+        0xbe950380u,                // replace s21 before its vector read
+        0x0a0e0e15u,
+        0x10200c14u,
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x2_vector_partial_decoded;
+    rdna2_walk(raw_x2_vector_partial_write, std::size(raw_x2_vector_partial_write),
+               raw_x2_vector_partial_decoded);
+    CHECK(rdna2_proven_raw_x2_data_loads(raw_x2_vector_partial_decoded).empty(),
+          "one surviving raw x2 word is insufficient for pair-backed admission");
+
+    // VCC is both a physical scalar pair and a predicate. A raw pair loaded there may publish
+    // data backing only when both halves feed plain scalar-to-float conversions and a later fresh
+    // compare replaces the old predicate before any mask consumer can observe it.
+    alignas(8) static uint32_t raw_vcc_backing[4] = {0, 0, 17, 257};
+    const uint64_t raw_vcc_ptr = reinterpret_cast<uint64_t>(raw_vcc_backing);
+    const uint32_t raw_vcc_seed[2] = {
+        static_cast<uint32_t>(raw_vcc_ptr), static_cast<uint32_t>(raw_vcc_ptr >> 32)};
+    const uint32_t raw_vcc_data[] = {
+        0x7da80484u,                 // pc0: establish an older VCC predicate
+        0xf4041a80u, 0xfa000008u,   // pc1: s_load_dwordx2 vcc, s[0:1], 0x08
+        0x7e000c6au,                 // pc3: v_cvt_f32_u32 v0, vcc_lo
+        0x7e020c6bu,                 // pc4: v_cvt_f32_u32 v1, vcc_hi
+        0x7d042509u,                 // pc5: fresh VOPC replaces the predicate
+        0x06000300u,                 // pc6: v_add_f32 v0, v0, v1
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_vcc_decoded;
+    rdna2_walk(raw_vcc_data, std::size(raw_vcc_data), raw_vcc_decoded);
+    std::vector<SrtUse> raw_vcc_uses;
+    resolve_dynamic_fetch(raw_vcc_data, std::size(raw_vcc_data), raw_vcc_seed,
+                          std::size(raw_vcc_seed), 0, &raw_vcc_uses);
+    ShaderResourceTable raw_vcc_table;
+    add_compute_buffer_resources(raw_vcc_table, raw_vcc_data, std::size(raw_vcc_data),
+                                 raw_vcc_seed, std::size(raw_vcc_seed));
+    assign_convention_bindings(raw_vcc_table, 2);
+    ComputeShaderConfig raw_vcc_config = raw_x2_config;
+    raw_vcc_config.user_sgprs.assign(std::begin(raw_vcc_seed), std::end(raw_vcc_seed));
+    raw_vcc_config.wave_size = 64;
+    const ShaderResource* raw_vcc_resource = raw_vcc_table.by_fetch_pc(1);
+    CHECK(rdna2_proven_raw_x2_data_loads(raw_vcc_decoded) ==
+              std::vector<uint32_t>{1u} && raw_vcc_uses.size() == 1 &&
+              raw_vcc_uses[0].use_pc == 1 && raw_vcc_uses[0].required_size == 16 &&
+              raw_vcc_resource && raw_vcc_resource->gpu_addr == raw_vcc_ptr &&
+              raw_vcc_resource->size == 16 &&
+              !recompile_compute(raw_vcc_data, std::size(raw_vcc_data),
+                                 &raw_vcc_table, raw_vcc_config).empty(),
+          "raw VCC pair binds exact scalar data until a fresh predicate replaces its mask view");
+    const uint32_t raw_vcc_stale_mask[] = {
+        0x7da80484u,
+        0xf4041a80u, 0xfa000008u,
+        0x7e000c6au, 0x7e020c6bu,
+        0x02020100u,                 // cndmask reads stale VCC before the fresh compare
+        0x7d042509u,
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_vcc_stale_decoded;
+    rdna2_walk(raw_vcc_stale_mask, std::size(raw_vcc_stale_mask),
+               raw_vcc_stale_decoded);
+    ShaderResourceTable raw_vcc_stale_table;
+    add_compute_buffer_resources(raw_vcc_stale_table, raw_vcc_stale_mask,
+                                 std::size(raw_vcc_stale_mask), raw_vcc_seed,
+                                 std::size(raw_vcc_seed));
+    CHECK(rdna2_proven_raw_x2_data_loads(raw_vcc_stale_decoded).empty() &&
+              !raw_vcc_stale_table.by_fetch_pc(1),
+          "an implicit VCC-mask read before replacement refuses raw scalar backing");
+    const uint32_t raw_vcc_one_half[] = {
+        0xf4041a80u, 0xfa000008u,
+        0x7e000c6au,                 // only VCC_LO is observed
+        0x7d042509u,
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_vcc_one_half_decoded;
+    rdna2_walk(raw_vcc_one_half, std::size(raw_vcc_one_half),
+               raw_vcc_one_half_decoded);
+    CHECK(rdna2_proven_raw_x2_data_loads(raw_vcc_one_half_decoded).empty(),
+          "a raw VCC load needs both data halves observed before predicate replacement");
+    alignas(8) static uint32_t raw_x8_immediate_backing[16] = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    const uint64_t raw_x8_immediate_ptr =
+        reinterpret_cast<uint64_t>(raw_x8_immediate_backing);
+    const uint32_t raw_x8_immediate_seed[2] = {
+        static_cast<uint32_t>(raw_x8_immediate_ptr),
+        static_cast<uint32_t>(raw_x8_immediate_ptr >> 32)};
+    const uint32_t raw_x8_immediate_data[] = {
+        0xf40c0300u, 0xfa000020u,  // pc0: s_load_dwordx8 s[12:19], s[0:1], 0x20
+        0x7e00020fu,                // pc2: ordinary data read of s15
+        0xbe980310u,                // pc3: copy s16 into a later descriptor fragment
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x8_immediate_decoded;
+    rdna2_walk(raw_x8_immediate_data, std::size(raw_x8_immediate_data),
+               raw_x8_immediate_decoded);
+    std::vector<SrtUse> raw_x8_immediate_uses;
+    resolve_dynamic_fetch(raw_x8_immediate_data, std::size(raw_x8_immediate_data),
+                          raw_x8_immediate_seed, std::size(raw_x8_immediate_seed), 0,
+                          &raw_x8_immediate_uses);
+    ShaderResourceTable raw_x8_immediate_table;
+    add_compute_buffer_resources(raw_x8_immediate_table, raw_x8_immediate_data,
+                                 std::size(raw_x8_immediate_data), raw_x8_immediate_seed,
+                                 std::size(raw_x8_immediate_seed));
+    assign_convention_bindings(raw_x8_immediate_table, 2);
+    ComputeShaderConfig raw_x8_immediate_config = raw_x2_config;
+    raw_x8_immediate_config.user_sgprs.assign(std::begin(raw_x8_immediate_seed),
+                                              std::end(raw_x8_immediate_seed));
+    const ShaderResource* raw_x8_immediate_resource =
+        raw_x8_immediate_table.by_fetch_pc(0);
+    CHECK(rdna2_proven_raw_immediate_wide_data_loads(raw_x8_immediate_decoded) ==
+              std::vector<uint32_t>{0u} && raw_x8_immediate_uses.size() == 1 &&
+              raw_x8_immediate_uses[0].required_size == 64 &&
+              raw_x8_immediate_resource &&
+              raw_x8_immediate_resource->gpu_addr == raw_x8_immediate_ptr &&
+              raw_x8_immediate_resource->size == 64 &&
+              !recompile_compute(raw_x8_immediate_data,
+                                 std::size(raw_x8_immediate_data),
+                                 &raw_x8_immediate_table, raw_x8_immediate_config).empty(),
+          "immediate x8 mixed data binds current bytes by exact load PC");
+    ShaderResourceTable raw_x8_immediate_missing;
+    CHECK(recompile_compute(raw_x8_immediate_data,
+                            std::size(raw_x8_immediate_data),
+                            &raw_x8_immediate_missing, raw_x8_immediate_config).empty(),
+          "immediate x8 data cannot borrow an unrelated fallback buffer");
+    ShaderResourceTable raw_x8_immediate_short = raw_x8_immediate_table;
+    raw_x8_immediate_short.resources[0].size = 60;
+    CHECK(recompile_compute(raw_x8_immediate_data,
+                            std::size(raw_x8_immediate_data),
+                            &raw_x8_immediate_short, raw_x8_immediate_config).empty(),
+          "immediate x8 data refuses an exact-PC buffer shorter than its accessed span");
+    const uint32_t raw_x8_immediate_pointer_change[] = {
+        0xbe800380u,                // clobber SBASE low word
+        0xf40c0300u, 0xfa000020u,
+        0x7e00020fu,
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x8_pointer_decoded;
+    rdna2_walk(raw_x8_immediate_pointer_change,
+               std::size(raw_x8_immediate_pointer_change), raw_x8_pointer_decoded);
+    CHECK(rdna2_proven_raw_immediate_wide_data_loads(raw_x8_pointer_decoded).empty(),
+          "immediate x8 data refuses a shader-mutated entry pointer");
+    const uint32_t raw_x8_immediate_skipped_load[] = {
+        0xbf840002u,                // one edge enters the ordinary reader after the load
+        0xf40c0300u, 0xfa000020u,
+        0x7e00020fu,
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x8_skipped_decoded;
+    rdna2_walk(raw_x8_immediate_skipped_load,
+               std::size(raw_x8_immediate_skipped_load), raw_x8_skipped_decoded);
+    CHECK(rdna2_proven_raw_immediate_wide_data_loads(raw_x8_skipped_decoded).empty(),
+          "immediate x8 data refuses a predecessor that bypasses its load");
+    const uint32_t raw_x8_copied_numeric[] = {
+        0xf40c0300u, 0xfa000020u,
+        0xbe94030fu,                // s_mov_b32 s20, s15
+        0x7e000c14u,                // v_cvt_f32_u32 v0, s20
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x8_copied_decoded;
+    rdna2_walk(raw_x8_copied_numeric, std::size(raw_x8_copied_numeric),
+               raw_x8_copied_decoded);
+    CHECK(rdna2_proven_raw_immediate_wide_data_loads(raw_x8_copied_decoded) ==
+              std::vector<uint32_t>{0u} &&
+              !recompile_compute(raw_x8_copied_numeric, std::size(raw_x8_copied_numeric),
+                                 &raw_x8_immediate_table,
+                                 raw_x8_immediate_config).empty(),
+          "copied raw x8 word later used numerically still requires current-byte backing");
+    const uint32_t raw_x8_immediate_replay[] = {
+        0xf40c0300u, 0xfa000020u,
+        0x7e00020fu,
+        0xbf82fffcu,                // branch back to the load
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x8_replay_decoded;
+    rdna2_walk(raw_x8_immediate_replay, std::size(raw_x8_immediate_replay),
+               raw_x8_replay_decoded);
+    CHECK(rdna2_proven_raw_immediate_wide_data_loads(raw_x8_replay_decoded).empty(),
+          "immediate x8 data refuses replay across a backedge");
+    const uint32_t raw_x4_immediate_data[] = {
+        0xf4080100u, 0xfa000020u,  // pc0: x4 s[4:7] from the same raw pointer
+        0x7e000c04u,                // pc2: v_cvt_f32_u32 v0, s4
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x4_immediate_decoded;
+    rdna2_walk(raw_x4_immediate_data, std::size(raw_x4_immediate_data),
+               raw_x4_immediate_decoded);
+    std::vector<SrtUse> raw_x4_immediate_uses;
+    resolve_dynamic_fetch(raw_x4_immediate_data, std::size(raw_x4_immediate_data),
+                          raw_x8_immediate_seed, std::size(raw_x8_immediate_seed), 0,
+                          &raw_x4_immediate_uses);
+    ShaderResourceTable raw_x4_immediate_table;
+    add_compute_buffer_resources(raw_x4_immediate_table, raw_x4_immediate_data,
+                                 std::size(raw_x4_immediate_data), raw_x8_immediate_seed,
+                                 std::size(raw_x8_immediate_seed));
+    assign_convention_bindings(raw_x4_immediate_table, 2);
+    const ShaderResource* raw_x4_immediate_resource =
+        raw_x4_immediate_table.by_fetch_pc(0);
+    CHECK(rdna2_proven_raw_immediate_wide_data_loads(raw_x4_immediate_decoded) ==
+              std::vector<uint32_t>{0u} && raw_x4_immediate_uses.size() == 1 &&
+              raw_x4_immediate_uses[0].required_size == 48 &&
+              raw_x4_immediate_resource && raw_x4_immediate_resource->size == 48 &&
+              !recompile_compute(raw_x4_immediate_data, std::size(raw_x4_immediate_data),
+                                 &raw_x4_immediate_table, raw_x8_immediate_config).empty(),
+          "immediate x4 numeric data binds its complete current guest span");
+    const uint32_t raw_x4_bypassed_region[] = {
+        0xbf840004u,                // pc0: branch to pc5, where s4 is replaced
+        0xf4080100u, 0xfa000020u,  // pc1: original x4 load
+        0x7e000c04u,                // pc3: numeric use only on load path
+        0xbf800000u,                // pc4: nop
+        0xf4080100u, 0xfa000040u,  // pc5: overwrite all four words
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x4_bypassed_decoded;
+    rdna2_walk(raw_x4_bypassed_region, std::size(raw_x4_bypassed_region),
+               raw_x4_bypassed_decoded);
+    CHECK(rdna2_proven_raw_immediate_wide_data_loads(raw_x4_bypassed_decoded) ==
+              std::vector<uint32_t>{1u},
+          "a bypass that overwrites the skipped x4 value before every read remains safe");
     const uint32_t raw_x2_unrelated_load[] = {
         smem(1, 20, 0), 0xfa000000u,
         sop2(0x27, 22, 20, 128),

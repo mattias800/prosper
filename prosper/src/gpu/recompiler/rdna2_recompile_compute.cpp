@@ -411,6 +411,8 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     rdna2_walk(code, dwords, ins);
     const auto original_raw_x2_data = rdna2_proven_raw_x2_data_loads(ins);
     const auto original_raw_wide_data = rdna2_raw_wide_data_loads(ins);
+    const auto original_raw_immediate_wide_data =
+        rdna2_proven_raw_immediate_wide_data_loads(ins);
     // This shell publishes register state after the structured region, so both terminal arms can
     // converge in the host SPIR-V without inventing further guest execution. Graphics exports keep
     // separate side-effect bookkeeping and remain on the conservative reject path for this shape.
@@ -439,6 +441,8 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      original_raw_x2_data.end());
     rs.smem_raw_wide_data_loads.insert(original_raw_wide_data.begin(),
                                        original_raw_wide_data.end());
+    rs.smem_raw_immediate_wide_data_loads.insert(
+        original_raw_immediate_wide_data.begin(), original_raw_immediate_wide_data.end());
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
     for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
@@ -655,6 +659,8 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     rdna2_walk(code, dwords, ins);
     const auto original_raw_x2_data = rdna2_proven_raw_x2_data_loads(ins);
     const auto original_raw_wide_data = rdna2_raw_wide_data_loads(ins);
+    const auto original_raw_immediate_wide_data =
+        rdna2_proven_raw_immediate_wide_data_loads(ins);
     // A dispatch-scoped proven-null BVH can collapse an exact no-hit exit and fully matched empty-stack
     // traversal cycle before generic shader-byte constant folding. Resource identity (including null
     // marker + fetch PC) is already part of the compute module cache key, so a later non-null dispatch
@@ -860,6 +866,8 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                      original_raw_x2_data.end());
     rs.smem_raw_wide_data_loads.insert(original_raw_wide_data.begin(),
                                        original_raw_wide_data.end());
+    rs.smem_raw_immediate_wide_data_loads.insert(
+        original_raw_immediate_wide_data.begin(), original_raw_immediate_wide_data.end());
     // Inline descriptors are represented by the resource table, not scalar SSA values. Leaving
     // their SGPR range absent also preserves the existing direct-provenance rule: a format MUBUF may
     // fall back to by_sgpr_base only while its SRSRC has not been overwritten by shader code.

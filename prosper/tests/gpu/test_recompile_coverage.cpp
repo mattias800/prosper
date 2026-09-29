@@ -871,6 +871,112 @@ int main() {
               !find_spirv_descriptor_binding(smem_x16_pair_report, 0, 2),
           "x16 descriptor bundle routes its two T# halves by exact PC without fallback cbuf");
 
+    // A direct branch between the two sampled halves must not globally veto an otherwise
+    // descriptor-only load. The two exact-PC resources remain independent at the branch join.
+    const std::array<uint32_t, 10> branched_x16_pair = {
+        0xf4100300u, 0xfa000000u,   // pc0: x16 s[12:27]
+        0xf0800f08u, 0x01630000u,   // pc2: first T#
+        0xbf840001u,                 // pc4: conditional skip of the no-op at pc5
+        0xbf800000u,                 // pc5: s_nop
+        0xf0800f08u, 0x01850000u,   // pc6: second T#
+        0xbf810000u,
+        0xbf800000u,
+    };
+    ShaderResourceTable branched_x16_rt;
+    branched_x16_rt.resources.push_back(x16_texture(4, 2));
+    branched_x16_rt.resources.push_back(x16_texture(5, 6));
+    const auto branched_x16_spv = recompile_valu(
+        branched_x16_pair.data(), branched_x16_pair.size(), 2, 0, &branched_x16_rt);
+    ShaderResourceTable branched_x16_validation_rt = branched_x16_rt;
+    for (uint32_t binding = 0; binding < 2; ++binding) {
+        ShaderResource io{};
+        io.cls = ResourceClass::VertexBuffer;
+        io.binding = binding;
+        branched_x16_validation_rt.resources.push_back(io);
+    }
+    const auto branched_x16_report = validate_spirv_descriptor_interface(
+        branched_x16_spv, &branched_x16_validation_rt, 0, SpirvShaderStage::Compute, false);
+    CHECK(!branched_x16_spv.empty() && branched_x16_report.ok() &&
+              find_spirv_descriptor_binding(branched_x16_report, 0, 4) &&
+              find_spirv_descriptor_binding(branched_x16_report, 0, 5) &&
+              !find_spirv_descriptor_binding(branched_x16_report, 0, 2),
+          "branch between image consumers routes both exact resources without fallback cbuf");
+    const std::array<uint32_t, 11> bypassed_x16_pair = {
+        0xbf060000u,                 // pc0: independent SCC
+        0xbf850002u,                 // pc1: skip the x16 producer, join at first image
+        0xf4100300u, 0xfa000000u,   // pc2: x16 s[12:27]
+        0xf0800f08u, 0x01630000u,   // pc4: first T#
+        0xf0800f08u, 0x01850000u,   // pc6: second T#
+        0xbf810000u,
+        0xbf800000u, 0xbf800000u,
+    };
+    ShaderResourceTable bypassed_x16_rt;
+    bypassed_x16_rt.resources.push_back(x16_texture(4, 4));
+    bypassed_x16_rt.resources.push_back(x16_texture(5, 6));
+    CHECK(recompile_valu(bypassed_x16_pair.data(), bypassed_x16_pair.size(),
+                         2, 0, &bypassed_x16_rt).empty(),
+          "x16 exact-PC images reject an entry path that bypasses their scalar producer");
+    const std::array<uint32_t, 12> x16_after_buffer_store = {
+        0xe0700000u, 0x80020100u, // pc0: buffer_store_dword through s[8:11]
+        0xf4100300u, 0xfa000000u, // pc2: x16 s[12:27] from the entry pointer
+        0xf0800f08u, 0x01630000u, // pc4: first exact-PC image
+        0xbf840001u,               // pc6: branch across the no-op
+        0xbf800000u,
+        0xf0800f08u, 0x01850000u, // pc8: second exact-PC image
+        0xbf810000u, 0xbf800000u,
+    };
+    ShaderResourceTable x16_after_buffer_store_rt;
+    x16_after_buffer_store_rt.resources.push_back(x16_texture(4, 4));
+    x16_after_buffer_store_rt.resources.push_back(x16_texture(5, 8));
+    ShaderResource x16_prefix_buffer{};
+    x16_prefix_buffer.cls = ResourceClass::ConstantBuffer;
+    x16_prefix_buffer.format = DataFormat::Uint32;
+    x16_prefix_buffer.num_components = 1;
+    x16_prefix_buffer.binding = 6;
+    x16_prefix_buffer.sgpr_base = 8;
+    x16_prefix_buffer.size = 64;
+    x16_prefix_buffer.stride = 4;
+    x16_after_buffer_store_rt.resources.push_back(x16_prefix_buffer);
+    auto x16_after_buffer_read = x16_after_buffer_store;
+    x16_after_buffer_read[0] = 0xe0300000u; // read-only buffer_load_dword
+    CHECK(recompile_valu(x16_after_buffer_store.data(),
+                         x16_after_buffer_store.size(), 2, 0,
+                         &x16_after_buffer_store_rt).empty() &&
+              !recompile_valu(x16_after_buffer_read.data(),
+                              x16_after_buffer_read.size(), 2, 0,
+                              &x16_after_buffer_store_rt).empty(),
+          "x16 snapshot refuses a possible pre-load aliasing store but admits a read-only prefix");
+    auto x16_linear_after_store = x16_after_buffer_store;
+    auto x16_linear_after_read = x16_after_buffer_read;
+    x16_linear_after_store[6] = x16_linear_after_read[6] = 0xbf800000u;
+    CHECK(recompile_valu(x16_linear_after_store.data(),
+                         x16_linear_after_store.size(), 2, 0,
+                         &x16_after_buffer_store_rt).empty() &&
+              !recompile_valu(x16_linear_after_read.data(),
+                              x16_linear_after_read.size(), 2, 0,
+                              &x16_after_buffer_store_rt).empty(),
+          "branch-free x16 admission applies the same snapshot writer guard");
+    ShaderResourceTable branched_x16_missing_rt;
+    branched_x16_missing_rt.resources.push_back(x16_texture(4, 2));
+    CHECK(recompile_valu(branched_x16_pair.data(), branched_x16_pair.size(),
+                         2, 0, &branched_x16_missing_rt).empty(),
+          "branched x16 cannot infer a second image without its exact-PC resource");
+    const std::array<uint32_t, 11> branched_x16_data = {
+        0xf4100300u, 0xfa000000u,
+        0xf0800f08u, 0x01630000u,
+        0xf0800f08u, 0x01850000u,
+        0xbf840001u,                 // branch may skip the later ordinary read
+        0x7e040214u,                 // v_mov_b32 v2, s20 (high half still live)
+        0xbf810000u,
+        0xbf800000u, 0xbf800000u,
+    };
+    ShaderResourceTable branched_x16_data_rt;
+    branched_x16_data_rt.resources.push_back(x16_texture(4, 2));
+    branched_x16_data_rt.resources.push_back(x16_texture(5, 4));
+    CHECK(recompile_valu(branched_x16_data.data(), branched_x16_data.size(),
+                         2, 0, &branched_x16_data_rt).empty(),
+          "later branch-dependent ordinary read revokes both descriptor-only halves");
+
     // Ordinary data use makes the x16 typeless again. Replacing that SGPR read with a descriptor-only
     // admission would silently substitute zero for real scalar data.
     const uint32_t smem_x16_data[] = {
@@ -887,7 +993,7 @@ int main() {
                          &smem_x16_data_rt).empty(),
           "x16 load with an ordinary scalar/vector consumer remains fail-visible");
 
-    // A non-null raw x4/x8 load is not automatically a descriptor. The old lowering replaced
+    // A raw x4/x8 load is not automatically a descriptor. The old lowering replaced
     // every word by zero, even when vector arithmetic consumed the loaded bytes as data.
     const std::array<uint32_t, 5> raw_x8_data = {
         0xbe940380u,                 // s_mov_b32 s20, 0 (register SOFFSET)
@@ -907,6 +1013,11 @@ int main() {
         rdna2_walk(std::data(code), std::size(code), decoded);
         return rdna2_raw_wide_data_loads(decoded);
     };
+    auto proven_raw_wide_pcs = [](const auto& code) {
+        std::vector<Rdna2Inst> decoded;
+        rdna2_walk(std::data(code), std::size(code), decoded);
+        return rdna2_proven_raw_immediate_wide_data_loads(decoded);
+    };
     CHECK(raw_wide_data_pcs(raw_x8_data) == std::vector<uint32_t>{1u} &&
               raw_wide_data_pcs(raw_x4_data) == std::vector<uint32_t>{1u} &&
               recompile_valu(raw_x8_data.data(), std::size(raw_x8_data), 1, 0,
@@ -914,6 +1025,111 @@ int main() {
               recompile_valu(raw_x4_data.data(), std::size(raw_x4_data), 1, 0,
                              &raw_wide_table).empty(),
           "raw register-offset wide data loads reject instead of silently substituting zero");
+    const std::array<uint32_t, 4> raw_x8_immediate_data = {
+        0xf40c0300u, 0xfa000020u,   // s_load_dwordx8 s[12:19], s[0:1], 0x20
+        0x7e00020fu,                 // v_mov_b32 v0, s15: loaded ordinary data
+        0xbf810000u,
+    };
+    CHECK(raw_wide_data_pcs(raw_x8_immediate_data) == std::vector<uint32_t>{0u} &&
+              recompile_valu(raw_x8_immediate_data.data(), raw_x8_immediate_data.size(),
+                             1, 0, &raw_wide_table).empty(),
+          "immediate raw x8 data also rejects instead of using descriptor placeholders");
+    const std::array<uint32_t, 5> raw_x4_scalar_data = {
+        0xf4080100u, 0xfa000020u, // x4 s[4:7] from entry pointer +0x20
+        0x80140481u,              // s_add_u32 s20,s4,1: numeric use before the vector read
+        0x7e000214u,              // v_mov_b32 v0,s20
+        0xbf810000u,
+    };
+    const std::array<uint32_t, 6> raw_x8_copied_scalar_data = {
+        0xf40c0300u, 0xfa000020u, // x8 s[12:19]
+        0xbe98040cu,              // s_mov_b64 s[24:25],s[12:13]
+        0x80141981u,              // s_add_u32 s20,s25,1
+        0x7e000214u,              // v_mov_b32 v0,s20
+        0xbf810000u,
+    };
+    CHECK(raw_wide_data_pcs(raw_x4_scalar_data) == std::vector<uint32_t>{0u} &&
+              raw_wide_data_pcs(raw_x8_copied_scalar_data) ==
+                  std::vector<uint32_t>{0u} &&
+              recompile_valu(raw_x4_scalar_data.data(), raw_x4_scalar_data.size(),
+                             1, 0, &raw_wide_table).empty() &&
+              recompile_valu(raw_x8_copied_scalar_data.data(),
+                             raw_x8_copied_scalar_data.size(), 1, 0,
+                             &raw_wide_table).empty(),
+          "scalar arithmetic after direct or B64-copied wide load cannot use zero placeholders");
+    const std::array<uint32_t, 6> raw_x4_after_store = {
+        0xe0700000u, 0x80000100u, // pc0: buffer_store_dword may alias raw source
+        0xf4080100u, 0xfa000020u, // pc2: x4 s[4:7] from dispatch-time snapshot
+        0x7e000204u, 0xbf810000u,
+    };
+    auto raw_x4_after_read = raw_x4_after_store;
+    raw_x4_after_read[0] = 0xe0300000u; // buffer_load_dword is read-only
+    CHECK(raw_wide_data_pcs(raw_x4_after_store) == std::vector<uint32_t>{2u} &&
+              proven_raw_wide_pcs(raw_x4_after_store).empty() &&
+              proven_raw_wide_pcs(raw_x4_after_read) == std::vector<uint32_t>{2u},
+          "same-dispatch buffer store revokes CPU-snapshot admission; read-only prefix remains valid");
+    const std::array<uint32_t, 5> raw_x4_scc_data = {
+        0xf4080100u, 0xfa000020u, // x4 s[4:7]
+        0xbf060480u,              // s_cmp_eq_u32 s4,0: SCC depends on loaded bytes
+        0x7e0002fdu,              // v_mov_b32 v0,scc: ordinary data observation
+        0xbf810000u,
+    };
+    CHECK(raw_wide_data_pcs(raw_x4_scc_data) == std::vector<uint32_t>{0u} &&
+              recompile_valu(raw_x4_scc_data.data(), raw_x4_scc_data.size(),
+                             1, 0, &raw_wide_table).empty(),
+          "SCC observed as scalar data cannot derive from zero placeholders");
+    const std::array<uint32_t, 9> raw_x4_fresh_scc_descriptor = {
+        0xf4080600u, 0xfa000020u, // x4 s[24:27] descriptor fragment
+        0x8f188118u,              // s_lshl_b32 s24,s24,1: patches descriptor and SCC
+        0xbf060000u,              // independent s_cmp_eq_u32 s0,s0 replaces SCC
+        0xbf840001u,              // branch observes fresh SCC, skipping only the nop
+        0xbf800000u,
+        0xe0302000u, 0x80060404u, // buffer_load_dword with s[24:27] descriptor
+        0xbf810000u,
+    };
+    auto raw_x4_stale_scc_descriptor = raw_x4_fresh_scc_descriptor;
+    raw_x4_stale_scc_descriptor[3] = 0xbf800000u; // no fresh compare before SCC branch
+    CHECK(raw_wide_data_pcs(raw_x4_fresh_scc_descriptor).empty() &&
+              raw_wide_data_pcs(raw_x4_stale_scc_descriptor) ==
+                  std::vector<uint32_t>{0u},
+          "fresh SCC replacement preserves descriptor-only use; stale SCC branch requires data");
+    const std::array<uint32_t, 7> raw_x4_copy_bypass_clobber = {
+        0xf4080100u, 0xfa000020u, // x4 s[4:7]
+        0xbe940304u,              // s_mov_b32 s20,s4
+        0xbf840001u,              // possible branch past the following overwrite
+        0xbe940380u,              // s_mov_b32 s20,0
+        0x7e000214u,              // v_mov_b32 v0,s20
+        0xbf810000u,
+    };
+    CHECK(raw_wide_data_pcs(raw_x4_copy_bypass_clobber) ==
+              std::vector<uint32_t>{0u} &&
+              recompile_valu(raw_x4_copy_bypass_clobber.data(),
+                             raw_x4_copy_bypass_clobber.size(), 1, 0,
+                             &raw_wide_table).empty(),
+          "branch that bypasses an alias clobber keeps the original bytes observable");
+    const std::array<uint32_t, 9> raw_x4_copy_both_clobber = {
+        0xf4080100u, 0xfa000020u,
+        0xbe940304u,              // s20 <- loaded s4
+        0xbf840002u,              // branch to the second overwrite
+        0xbe940380u,              // first arm: s20 <- 0
+        0xbf820001u,              // join after the second arm
+        0xbe940381u,              // second arm: s20 <- 1
+        0x7e000214u,              // both arms read only an overwritten value
+        0xbf810000u,
+    };
+    CHECK(raw_wide_data_pcs(raw_x4_copy_both_clobber).empty(),
+          "both-arm alias overwrite retires the loaded words before observation");
+    const std::array<uint32_t, 5> raw_x8_indirect_data = {
+        0xf40c0300u, 0xfa000020u,
+        0xbe802028u,                 // s_setpc_b64 s[40:41]: uncertain successor
+        0x7e00020fu,                 // potential vector data reader
+        0xbf810000u,
+    };
+    std::vector<Rdna2Inst> raw_x8_indirect_decoded;
+    rdna2_walk(raw_x8_indirect_data.data(), raw_x8_indirect_data.size(),
+               raw_x8_indirect_decoded);
+    CHECK(raw_wide_data_pcs(raw_x8_indirect_data) == std::vector<uint32_t>{0u} &&
+              rdna2_proven_raw_immediate_wide_data_loads(raw_x8_indirect_decoded).empty(),
+          "uncertain control before a possible numeric read remains fail-visible");
     const std::array<uint32_t, 6> raw_x4_overwritten = {
         0xbe940380u,
         0xf4080100u, 0x28000000u,
