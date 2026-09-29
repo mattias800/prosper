@@ -13,6 +13,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/fold_reader.hpp"
 #include "fixtures/gta5_nullable_output_fixture.hpp"
 #include "fixtures/gta5_zero_record_execz_fixture.hpp"
 #include <algorithm>
@@ -605,6 +606,161 @@ int main() {
     CHECK(samp_ok,   "kernel 5 paired SSAMP S# resolved alongside the T#");
     CHECK(have_cbuf, "kernel 5 s_buffer_load reports a ConstantBuffer table-use keyed by the V# load imm");
     CHECK(cbuf_ok,   "kernel 5 V# dwords match the table as loaded");
+
+    // A T# may straddle adjacent scalar loads: x8 into s4..s11 supplies its first half at
+    // s8..s11, then x4 into s12..s15 supplies the rest. The image_store names s8, not the
+    // first load's s4 snapshot. Each exact mapped word is independent proof; a coincidental
+    // eight-word value or an address-only key is not.
+    alignas(16) static uint32_t split_table[16];
+    for (uint32_t i = 0; i < 16; ++i) split_table[i] = 0xD1000000u + i;
+    const uint64_t split_base = reinterpret_cast<uint64_t>(split_table);
+    const uint32_t split_seed[2] = {
+        static_cast<uint32_t>(split_base), static_cast<uint32_t>(split_base >> 32u),
+    };
+    const uint32_t split_t8[] = {
+        0xF40C0100u, 0xFA000000u, // s_load_dwordx8 s[4:11], s[0:1], 0
+        0xF4080300u, 0xFA000020u, // s_load_dwordx4 s[12:15], s[0:1], 0x20
+        0xF0200108u, 0x00020009u, // image_store v0, v[9:10], s[8:15]
+        0xBF810000u,
+    };
+    auto split_uses = [&](const uint32_t* code, size_t words) {
+        std::vector<SrtUse> result;
+        resolve_dynamic_fetch(code, words, split_seed, 2, 0, &result);
+        return result;
+    };
+    const auto split_positive = split_uses(split_t8, std::size(split_t8));
+    const auto find_split = [](const std::vector<SrtUse>& result, uint32_t pc) {
+        return std::find_if(result.begin(), result.end(), [pc](const SrtUse& use) {
+            return use.kind == 0 && use.use_pc == pc;
+        });
+    };
+    const auto split_hit = find_split(split_positive, 4u);
+    CHECK(split_hit != split_positive.end() &&
+              split_hit->key == UINT32_MAX &&
+              split_hit->is_storage_image &&
+              split_hit->descriptor_source_addr == split_base + 16u &&
+              std::equal(split_hit->t8.begin(), split_hit->t8.end(), split_table + 4),
+          "adjacent x8/x4 mapped loads publish the live split T# at its image-store pc");
+    split_table[9] ^= 0x01010000u;
+    const auto split_mutated = split_uses(split_t8, std::size(split_t8));
+    const auto split_mutation_hit = find_split(split_mutated, 4u);
+    CHECK(split_mutation_hit != split_mutated.end() &&
+              split_mutation_hit->t8[5] == split_table[9] &&
+              split_mutation_hit->t8[5] != split_hit->t8[5],
+          "split T# reads current mapped bytes on each invocation");
+    // Equal values cannot replace source identity. Make the two possible second halves and the
+    // scalar overwrite byte-identical, then vary only their origins.
+    for (uint32_t i = 8; i <= 12; ++i) split_table[i] = 1u;
+    const auto equal_positive = split_uses(split_t8, std::size(split_t8));
+    const auto equal_hit = find_split(equal_positive, 4u);
+    CHECK(equal_hit != equal_positive.end() &&
+              std::all_of(equal_hit->t8.begin() + 4, equal_hit->t8.end(),
+                          [](uint32_t word) { return word == 1u; }),
+          "identical descriptor words still admit an exact contiguous mapped source");
+    uint32_t split_gap[std::size(split_t8)];
+    std::copy(std::begin(split_t8), std::end(split_t8), split_gap);
+    split_gap[3] = 0xFA000024u; // second half starts one dword too late
+    const auto gap_uses = split_uses(split_gap, std::size(split_gap));
+    CHECK(find_split(gap_uses, 4u) == gap_uses.end(),
+          "byte-identical halves with a source-address gap cannot establish one T#");
+    const uint32_t split_overwritten[] = {
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        0xBE8C0381u,             // s_mov_b32 s12, 1 loses the mapped source identity
+        split_t8[4], split_t8[5], split_t8[6],
+    };
+    const auto overwritten_uses = split_uses(split_overwritten, std::size(split_overwritten));
+    CHECK(find_split(overwritten_uses, 5u) == overwritten_uses.end(),
+          "a same-value scalar write to one T# word revokes split-load provenance");
+    const uint32_t split_skip[] = {
+        split_t8[0], split_t8[1],
+        0xBF840002u,             // s_cbranch_scc0 +2: skip the x4 load
+        split_t8[2], split_t8[3], split_t8[4], split_t8[5], split_t8[6],
+    };
+    const auto skip_uses = split_uses(split_skip, std::size(split_skip));
+    CHECK(find_split(skip_uses, 5u) == skip_uses.end(),
+          "a path bypassing one descriptor-half load cannot publish a split T#");
+    const uint32_t split_loop[] = {
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        0xBE900381u,             // s_mov_b32 s16, 1
+        0xBF84FFFEu,             // s_cbranch_scc0 -2: loop over s16 only
+        split_t8[4], split_t8[5], split_t8[6],
+    };
+    const auto loop_uses = split_uses(split_loop, std::size(split_loop));
+    CHECK(find_split(loop_uses, 6u) != loop_uses.end(),
+          "a loop after both loads that preserves descriptor words retains their proof");
+    const uint32_t split_backedge[] = {
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        0xBF84FFFDu,             // s_cbranch_scc0 -3: re-enter the x4 producer
+        split_t8[4], split_t8[5], split_t8[6],
+    };
+    const auto backedge_uses = split_uses(split_backedge, std::size(split_backedge));
+    CHECK(find_split(backedge_uses, 5u) == backedge_uses.end(),
+          "a backedge re-entering a descriptor producer stays unresolved");
+    const uint32_t split_pointer_write[] = {
+        0xBE800300u,             // s_mov_b32 s0, s0: same value, lost entry-root identity
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        split_t8[4], split_t8[5], split_t8[6],
+    };
+    const auto pointer_uses = split_uses(split_pointer_write, std::size(split_pointer_write));
+    CHECK(find_split(pointer_uses, 5u) == pointer_uses.end(),
+          "a same-value pointer write before the loads loses entry-root proof");
+    const uint32_t split_vop3b_write[] = {
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        0xD5280C02u, 0x01AA0300u, // v_add_co_ci_u32_e64 v2, s12, v0, v1, vcc_lo
+        split_t8[4], split_t8[5], split_t8[6],
+    };
+    const auto vop3b_uses = split_uses(split_vop3b_write, std::size(split_vop3b_write));
+    CHECK(find_split(vop3b_uses, 6u) == vop3b_uses.end(),
+          "a VOP3B carry output cannot preserve a stale mapped T# word");
+    const uint32_t split_consumer_loop[] = {
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        split_t8[4], split_t8[5],
+        0xBE8C0381u,             // s_mov_b32 s12, 1 after the first image_store
+        0xBF84FFFCu,             // s_cbranch_scc0 -4: re-enter that image_store
+        split_t8[6],
+    };
+    const auto consumer_loop_uses = split_uses(split_consumer_loop,
+                                               std::size(split_consumer_loop));
+    CHECK(find_split(consumer_loop_uses, 4u) == consumer_loop_uses.end(),
+          "a post-consumer clobber and backedge cannot reuse the first image binding");
+    const uint32_t split_scalar_load[] = {
+        split_t8[0], split_t8[1],
+        0xF40C0400u, 0xFA000020u, // s_load_dwordx8 s[16:23] from the same table
+        split_t8[2], split_t8[3], split_t8[4], split_t8[5], split_t8[6],
+    };
+    const auto extra_load_uses = split_uses(split_scalar_load, std::size(split_scalar_load));
+    CHECK(find_split(extra_load_uses, 6u) != extra_load_uses.end(),
+          "an unrelated scalar read between descriptor halves preserves their proof");
+    uint32_t split_scalar_store[std::size(split_scalar_load)];
+    std::copy(std::begin(split_scalar_load), std::end(split_scalar_load), split_scalar_store);
+    split_scalar_store[2] = 0xF4400400u; // SMEM opcode 0x10, scalar store to table +0x20
+    const auto scalar_store_uses = split_uses(split_scalar_store,
+                                              std::size(split_scalar_store));
+    CHECK(find_split(scalar_store_uses, 6u) == scalar_store_uses.end(),
+          "an SMEM write that may alias descriptor backing cannot authorize a split T#");
+    struct CodeRewriteReader final : FoldReader {
+        uint32_t* code;
+        bool rewrote = false;
+        explicit CodeRewriteReader(uint32_t* p) : code(p) {}
+        bool probe(FoldProbe, uint32_t, uint64_t addr, uint32_t bytes) override {
+            if (!rewrote) { code[0] ^= 1u; rewrote = true; }
+            return guest_readable(addr, bytes);
+        }
+        uint32_t word(uint32_t, uint64_t addr) override {
+            return *reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(addr));
+        }
+        void prefix(uint32_t, uint64_t addr, void* dst, uint32_t bytes) override {
+            std::memcpy(dst, reinterpret_cast<const void*>(static_cast<uintptr_t>(addr)), bytes);
+        }
+    };
+    uint32_t rewritten_code[std::size(split_t8)];
+    std::copy(std::begin(split_t8), std::end(split_t8), rewritten_code);
+    CodeRewriteReader rewrite_reader(rewritten_code);
+    std::vector<SrtUse> rewritten_uses;
+    resolve_dynamic_fetch(rewritten_code, std::size(rewritten_code), split_seed, 2, 0,
+                          &rewritten_uses, UINT32_MAX, nullptr, nullptr, 0, &rewrite_reader);
+    CHECK(rewrite_reader.rewrote && find_split(rewritten_uses, 4u) == rewritten_uses.end(),
+          "code rewritten after decode cannot authorize a split-descriptor publication");
 
     // #3577: the CONSUMING MIMG's dim must reach the SrtUse, because that is the only authority for
     // the shape a null T# should take. `rdna2_emit_alu` derives OpTypeImage's Dim from the

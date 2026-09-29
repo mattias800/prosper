@@ -271,8 +271,8 @@ struct SrtUse {
                                      // negative-imm load; resolve by the exact instruction pc instead)
     std::array<uint32_t, 8> t8{};    // T# dwords as loaded (kind 0)
     // Exact mapped source of the eight live T# dwords, when every word still descends from the
-    // same successful x8/x16 scalar load. Zero means the live descriptor was seeded directly,
-    // assembled from unrelated loads, or modified by scalar ALU, so no source identity is claimed.
+    // same contiguous mapped range, possibly via adjacent scalar loads. Zero means the live
+    // descriptor was seeded directly, assembled from unrelated loads, or modified by scalar ALU.
     // This is diagnostic provenance only; resource lookup and materialization never consume it.
     uint64_t descriptor_source_addr = 0;
     std::array<uint32_t, 4> v4{};    // V# dwords as loaded (kind 1)
