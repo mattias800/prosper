@@ -36,7 +36,8 @@ def phase(submit=1, code=0x1, ok=1, **over):
 
 
 def image(code=0x1, shader_hash=0xA, binding=1, image_class="sampled", alias=False,
-          ms=1.0, addr=0x1000, persistent=0, upload_skipped=0, legacy=False, **over):
+          ms=1.0, addr=0x1000, persistent=0, upload_skipped=0, legacy=False,
+          extent="8x8x1", **over):
     identity = f"code=0x{code:x}"
     if shader_hash is not None:
         identity += f" hash=0x{shader_hash:016x}"
@@ -44,13 +45,13 @@ def image(code=0x1, shader_hash=0xA, binding=1, image_class="sampled", alias=Fal
         f"addr=0x{addr:x} persistent={persistent} upload-skipped={upload_skipped} ")
     if alias:
         return (f"[compute-image] {identity} binding={binding} class={image_class} alias=1 "
-                f"{state}extent=8x8x1 ms={ms:.3f}\n")
+                f"{state}extent={extent} ms={ms:.3f}\n")
     fields = {"query_ms": 0, "import_ms": 0, "cache_ms": 0, "staging_ms": 0, "prepare_ms": 0,
               "allocation_ms": 0, "view_ms": 0, "sampler_ms": 0}
     fields.update(over)
     body = " ".join(f"{k}={v:.3f}" for k, v in fields.items())
     return (f"[compute-image] {identity} binding={binding} class={image_class} imported=0 "
-            f"{state}extent=8x8x1 "
+            f"{state}extent={extent} "
             f"guest=1024 staging=1024 normalized=0 texel=0 sampled-float=0 rgba8-reuse=0 "
             f"{body} ms={ms:.3f}\n")
 
@@ -112,7 +113,7 @@ def binding_rows(out):
 
 def detile_rows(out):
     """Parse only the measured-detile table, never the setup-cost table above it."""
-    sections = out.split("measured ordinary 2D storage-seed detile")
+    sections = out.split("measured single-surface storage-seed detile")
     if len(sections) < 2:
         return []
     rows = []
@@ -360,6 +361,28 @@ def main():
           image_row(out, "unattributed")[0] == 0.0 and
           "NOT TRUSTWORTHY" not in out, out)
 
+    code, out, err = run(phase(setup_ms=2) +
+                         image(shader_hash=0xC3, binding=9, image_class="storage",
+                               extent="8x1x1", ms=1, prepare_ms=1,
+                               detile_ms=0.2, direct_detile=1) +
+                         image(shader_hash=0xC3, binding=9, image_class="storage",
+                               extent="16x1x1", ms=1, prepare_ms=1,
+                               detile_ms=0.3, direct_detile=1))
+    detiles = detile_rows(out)
+    check("detile groups retain distinct extents",
+          code == 0 and len(detiles) == 2 and
+          {row[2] for row in detiles} == {"8x1x1", "16x1x1"}, detiles)
+
+    code, out, err = run(phase(setup_ms=2) +
+                         image(shader_hash=0xC3, binding=9, image_class="storage",
+                               ms=1, prepare_ms=1, detile_ms=0.2, direct_detile=0) +
+                         image(shader_hash=0xC3, binding=9, image_class="storage",
+                               ms=1, prepare_ms=1, detile_ms=0.3, direct_detile=1))
+    detiles = detile_rows(out)
+    check("detile groups retain direct-path identity",
+          code == 0 and len(detiles) == 2 and
+          {row[3] for row in detiles} == {"0", "1"}, detiles)
+
     # Old logs omit the timer; zero is an observed value in current logs. Both cases must be
     # distinct so a missing instrument cannot be mistaken for a cheap workload.
     code, out, err = run(phase(setup_ms=3) +
@@ -383,7 +406,18 @@ def main():
                          image(image_class="storage", ms=6, prepare_ms=1,
                                detile_ms=5))
     check("impossible detile nesting fails visibly in both outputs",
-          "detile exceeds prepare" in err and "NOT TRUSTWORTHY" in out, out + err)
+          "1 where storage cache + staging + detile intervals exceed prepare_ms" in err and
+          "NOT TRUSTWORTHY" in out, out + err)
+
+    # Cache lookup, staging allocation, and detile are disjoint intervals inside storage prepare.
+    # Each child alone fits, but their combined duration cannot exceed the parent.
+    code, out, err = run(phase(setup_ms=1) +
+                         image(image_class="storage", ms=1, prepare_ms=1,
+                               cache_ms=0.3, staging_ms=0.2, detile_ms=0.6))
+    check("combined storage children fit prepare",
+          "0 where storage cache + staging intervals exceed prepare_ms" in err and
+          "1 where storage cache + staging + detile intervals exceed prepare_ms" in err and
+          "NOT TRUSTWORTHY" in out, out + err)
 
     # Impossible image timing must mark both the terminal and redirected table. Here storage cache
     # cannot be six ms inside a four-ms prepare interval, even though every value is non-negative.

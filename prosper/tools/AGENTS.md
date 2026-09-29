@@ -777,8 +777,9 @@ capture/replay without requiring an importable system Python module.
   only — CPU-fast-path fills emit no record, so add
   `[render-timing] compute_cpu_fast fills=N` before quoting a rate.
   The separate detile ranking uses elapsed `detile_ms`, not the `[tilecensus]` byte ranking. It is
-  nested inside image preparation and currently covers only ordinary 2D storage-seed detiles;
-  sampled uploads, arrays, volumes and mip tails are not timed by that field. A zero there is not
+  nested inside image preparation and currently covers the single-surface tiled storage-seed branch,
+  including tiled 1D and one-layer array views; sampled uploads, multi-layer array/volume branches
+  and mip tails are not timed by that field. A zero there is not
   evidence that those other tiling paths cost nothing. Run both timing switches in the same bounded
   window before using the ranking, and keep its dispatch-wall denominator distinct from game FPS.
   Restrict a rerun by the F8 report's cross-run SPIR-V identity with

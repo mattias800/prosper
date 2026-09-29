@@ -29,9 +29,10 @@ allocation finishes before prepare starts. The report preserves that hierarchy a
 record violates it.
 Run both switches together whenever setup is the dominant phase.
 
-The `detile_ms` field times only the ordinary 2D storage-seed detile branch. This report ranks those
-measured calls separately from total image setup. Sampled-image detiles, array/volume and mip-tail
-paths are not timed by that field; a zero here never proves that all CPU tiling was absent. The
+The `detile_ms` field times the single-surface tiled storage-seed branch, including tiled 1D and
+one-layer array views that reach it. This report ranks those measured calls separately from total
+image setup. Sampled-image detiles, multi-layer array/volume and mip-tail branches are not timed by
+that field; a zero here never proves that all CPU tiling was absent. The
 `[tilecensus]` byte ranking answers a different question and must not be read as elapsed cost.
 
 WHAT THIS TOOL DOES NOT SEE
@@ -309,6 +310,7 @@ def main():
     broken_detile_nest = sum(
         1 for image in model_images
         if _storage_image(image) and "detile_ms" in image and
+        image.get("cache_ms", 0.0) + image.get("staging_ms", 0.0) +
         image["detile_ms"] > image.get("prepare_ms", 0.0) + image_tolerance)
     broken_image_root = sum(
         1 for image in model_images
@@ -321,7 +323,7 @@ def main():
         model_warnings.append(
             f"this tool's image model does not match these records ({broken_storage_nest} where "
             f"storage cache + staging intervals exceed prepare_ms, {broken_detile_nest} where "
-            f"detile exceeds prepare, {broken_image_root} where "
+            f"storage cache + staging + detile intervals exceed prepare_ms, {broken_image_root} where "
             f"top-level image children exceed ms, {negative_image_timers} with a negative image "
             f"timer); storage cache, staging and detile must remain nested inside prepare upload")
     for warning in model_warnings:
@@ -464,7 +466,7 @@ def main():
         image_row("storage cache (included)", storage_cache, 1)
         image_row("storage staging (included)", storage_staging, 1)
         image_row("prepare exclusive", image_totals["prepare_ms"] - storage_cache - storage_staging, 1)
-        # execute_item times the ordinary 2D storage-seed detile inside prepare_ms. Keep it nested:
+        # execute_item times the single-surface storage-seed detile inside prepare_ms. Keep it nested:
         # adding it to root image time would count the same interval twice.
         storage_detile = sum(
             image.get("detile_ms", 0.0) for image in images if _storage_image(image))
@@ -585,8 +587,8 @@ def main():
                    str(image.get("extent", "?")), int(image.get("direct_detile", -1)))
             detile_groups[key].append(elapsed)
         print()
-        print("  measured ordinary 2D storage-seed detile (inside prepare; sampled/array/"
-              "volume/mip-tail paths excluded)")
+        print("  measured single-surface storage-seed detile (inside prepare; sampled/"
+              "multi-layer array/volume/mip-tail branches excluded)")
         print(f"  {len(timed_storage)} storage bindings with detile_ms, "
               f"{untimed_storage} without it; "
               f"{sum(len(times) for times in detile_groups.values())} positive calls, "
