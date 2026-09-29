@@ -52,6 +52,7 @@
 #include "shared/media/avplayer_plane_policy.hpp"    // which sampled resource is AvPlayer's NV12 chroma plane
 #include "shared/live/texture_reference_census.hpp"  // PROSPER_TEXREF_CENSUS (#3873)
 #include "shared/live/submit_renderer/callback_types.hpp" // the callback's own types (#3892)
+#include "shared/live/submit_renderer/callback_state.hpp" // process prelude owner (#3892)
 #include "shared/live/submit_renderer/guest_reads.hpp"    // safe_span / safe_copy / safe_equal
 #include "shared/live/submit_renderer/draw_resources.hpp" // build_draw_frame_resources (#3892)
 #include "shared/live/submit_renderer/timing_report.hpp"  // report_render_timing_aggregates (#3892)
@@ -596,6 +597,152 @@ ScopedRendererCallbackTid::~ScopedRendererCallbackTid() {
 extern "C" int prosper_thread_in_renderer_callback(unsigned long native_tid) {
     return prosper::frontend::tid_is_in_renderer_callback(native_tid) ? 1 : 0;
 }
+
+namespace submit_renderer {
+
+CallbackState& CallbackState::instance() {
+    static CallbackState state;
+    return state;
+}
+
+const size_t& CallbackState::write_watch_promotion_budget_bytes() {
+    static const auto& value = write_watch_promotion_budget_bytes_.emplace([] {
+        // 0 is not "off": an empty budget makes WriteWatchPromotionBudget::try_consume
+        // return true unconditionally, i.e. unbounded arming per submit. A typo must keep
+        // the default rather than select that (#3253).
+        const char* value = PROSPER_ENV_VALUE("PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB");
+        const uint64_t mib = prosper::diag::env_u64_or_default_capped(
+            "PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB", value, 8ull,
+            SIZE_MAX / (1024ull * 1024ull), "MiB");
+        return static_cast<size_t>(mib * (1024ull * 1024ull));
+    }());
+    return value;
+}
+
+std::atomic<int>& CallbackState::g_submit_idx() {
+    static auto& value = g_submit_idx_.emplace(0);
+    return value;
+}
+
+int& CallbackState::g_render_first() {
+    static auto& value = g_render_first_.emplace(getenv("PROSPER_RENDER_FIRST") ? atoi(getenv("PROSPER_RENDER_FIRST")) : 0);
+    return value;
+}
+
+const int64_t& CallbackState::g_render_delay_ms() {
+    static const auto& value = g_render_delay_ms_.emplace(getenv("PROSPER_RENDER_DELAY_MS")
+        ? std::max<int64_t>(0, atoll(PROSPER_ENV_VALUE("PROSPER_RENDER_DELAY_MS"))) : 0);
+    return value;
+}
+
+const std::chrono::steady_clock::time_point& CallbackState::g_render_delay_start() {
+    static const auto& value = g_render_delay_start_.emplace(std::chrono::steady_clock::now());
+    return value;
+}
+
+std::atomic<bool>& CallbackState::g_render_delay_announced() {
+    static auto& value = g_render_delay_announced_.emplace(false);
+    return value;
+}
+
+int& CallbackState::g_render_last() {
+    static auto& value = g_render_last_.emplace(getenv("PROSPER_RENDER_LAST") ? atoi(getenv("PROSPER_RENDER_LAST")) : INT_MAX);
+    return value;
+}
+
+const int& CallbackState::g_rttlog_min_submit() {
+    static const auto& value = g_rttlog_min_submit_.emplace(getenv("PROSPER_RTTLOG_MIN_SUBMIT")
+        ? std::max(0, atoi(PROSPER_ENV_VALUE("PROSPER_RTTLOG_MIN_SUBMIT"))) : 0);
+    return value;
+}
+
+const int& CallbackState::g_rttlog_max_submit() {
+    static const auto& value = g_rttlog_max_submit_.emplace(getenv("PROSPER_RTTLOG_MAX_SUBMIT")
+        ? std::max(0, atoi(PROSPER_ENV_VALUE("PROSPER_RTTLOG_MAX_SUBMIT"))) : INT_MAX);
+    return value;
+}
+
+const bool& CallbackState::validation_census_requested() {
+    static const auto& value = validation_census_requested_.emplace(PROSPER_ENV_VALUE("PROSPER_TEXTURE_VALIDATION_CENSUS") != nullptr);
+    return value;
+}
+
+const uint64_t& CallbackState::rtt_timing_min_draws() {
+    static const auto& value = rtt_timing_min_draws_.emplace(getenv("PROSPER_RTT_TIMING_MIN_DRAWS")
+        ? strtoull(PROSPER_ENV_VALUE("PROSPER_RTT_TIMING_MIN_DRAWS"), nullptr, 0) : 0);
+    return value;
+}
+
+const bool& CallbackState::submit_decode_scope_disabled() {
+    static const auto& value = submit_decode_scope_disabled_.emplace(PROSPER_ENV_VALUE("PROSPER_NO_SUBMIT_TEXTURE_DECODE_SCOPE") != nullptr ||
+        PROSPER_ENV_VALUE("PROSPER_RESOURCE_HASH_DIM") != nullptr);
+    return value;
+}
+
+const bool& CallbackState::use_tracked_buffer_membership_cache() {
+    static const auto& value = use_tracked_buffer_membership_cache_.emplace(PROSPER_ENV_VALUE("PROSPER_NO_TRACKED_BUFFER_GATE") == nullptr);
+    return value;
+}
+
+std::unordered_map<TextureDecodeKey, PersistentDecodedTexture, TextureDecodeKeyHash>& CallbackState::persistent_decoded_textures() {
+    static auto& value = persistent_decoded_textures_.emplace();
+    return value;
+}
+
+size_t& CallbackState::persistent_decoded_texture_bytes() {
+    static auto& value = persistent_decoded_texture_bytes_.emplace(0);
+    return value;
+}
+
+uint64_t& CallbackState::persistent_decode_generation() {
+    static auto& value = persistent_decode_generation_.emplace(0);
+    return value;
+}
+
+size_t& CallbackState::retired_submit_bytes() {
+    static auto& value = retired_submit_bytes_.emplace(0);
+    return value;
+}
+
+uint64_t& CallbackState::persistent_texture_id() {
+    static auto& value = persistent_texture_id_.emplace(0);
+    return value;
+}
+
+std::vector<uint8_t>& CallbackState::persistent_validation_scratch() {
+    static auto& value = persistent_validation_scratch_.emplace();
+    return value;
+}
+
+const size_t& CallbackState::persistent_decode_limit() {
+    static const auto& value = persistent_decode_limit_.emplace([] {
+        const uint64_t physical_bytes = host_physical_memory_bytes();
+        const size_t limit = texture_decode_cache_limit_bytes(
+            PROSPER_ENV_VALUE("PROSPER_TEXTURE_DECODE_CACHE_MB"), physical_bytes);
+        fprintf(stderr,
+                "[render] decoded texture cache budget = %.1f MiB "
+                "(host physical %.1f GiB)\n",
+                limit / (1024.0 * 1024.0),
+                physical_bytes / (1024.0 * 1024.0 * 1024.0));
+        return limit;
+    }());
+    return value;
+}
+
+const bool& CallbackState::reserve_frame_resources() {
+    static const auto& value = reserve_frame_resources_.emplace([] {
+        const char* setting = std::getenv("PROSPER_FRAME_RESOURCE_RESERVE");
+        return !setting || std::strcmp(setting, "0") != 0;
+    }());
+    return value;
+}
+
+const bool& CallbackState::disable_guest_depth_layers() {
+    static const auto& value = disable_guest_depth_layers_.emplace(std::getenv("PROSPER_NO_GUEST_DEPTH_LAYERS") != nullptr);
+    return value;
+}
+
+} // namespace submit_renderer
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested,
                             const std::string& title_id) {
@@ -1489,9 +1636,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         fprintf(stderr, "[render] backend target-submit batching enabled (experimental)\n");
     prosper::gpu::set_deferred_graphics_retirer(
         [] { (void)prosper::test::retire_deferred_backend_submission(); });
+    // Every registration shares process state; taking this reference initializes only empty slots.
+    auto* const callback_state = &CallbackState::instance();
     prosper::gpu::set_submit_renderer(
         [frame_dir, dump_bmps, invalidate_ds, native_fragment_vote_width,
-         partial_wave_fragment](const std::vector<prosper::gpu::DrawItem>& items,
+         partial_wave_fragment, callback_state](const std::vector<prosper::gpu::DrawItem>& items,
                                uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             const uint64_t callback_capture_generation =
                 prosper::perf::interactive_performance_capture().active_generation();
@@ -1522,16 +1671,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             register_cpu_rtt_dcc_metadata(g_rtt, items);
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             const prosper::gpu::LiveRenderPhase phase = prosper::gpu::live_render_phase();
-            static const size_t write_watch_promotion_budget_bytes = [] {
-                // 0 is not "off": an empty budget makes WriteWatchPromotionBudget::try_consume
-                // return true unconditionally, i.e. unbounded arming per submit. A typo must keep
-                // the default rather than select that (#3253).
-                const char* value = PROSPER_ENV_VALUE("PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB");
-                const uint64_t mib = prosper::diag::env_u64_or_default_capped(
-                    "PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_MB", value, 8ull,
-                    SIZE_MAX / (1024ull * 1024ull), "MiB");
-                return static_cast<size_t>(mib * (1024ull * 1024ull));
-            }();
+            static const auto& write_watch_promotion_budget_bytes = callback_state->write_watch_promotion_budget_bytes();
             static thread_local prosper::frontend::WriteWatchPromotionBudget
                 write_watch_promotion_budget;
             if (phase.first_span)
@@ -1567,19 +1707,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // ~5000 title-loop submits) at native speed before we begin rendering/dumping. Returning {}
             // means "not rendered this submit". Without this, rendering from boot is far too slow to ever
             // reach a post-loading-screen scene.
-            static std::atomic<int> g_submit_idx{0};
-            static int g_render_first = getenv("PROSPER_RENDER_FIRST") ? atoi(getenv("PROSPER_RENDER_FIRST")) : 0;
+            static auto& g_submit_idx = callback_state->g_submit_idx();
+            static auto& g_render_first = callback_state->g_render_first();
             // PROSPER_RENDER_DELAY_MS=<N>: wall-clock warmup for titles whose useful scene begins after
             // a variable number of submits. The guest and command decoder keep running at native speed;
             // only the synchronous Vulkan work is skipped. The clock starts at the first GPU submit.
-            static const int64_t g_render_delay_ms = getenv("PROSPER_RENDER_DELAY_MS")
-                ? std::max<int64_t>(0, atoll(PROSPER_ENV_VALUE("PROSPER_RENDER_DELAY_MS"))) : 0;
-            static const auto g_render_delay_start = std::chrono::steady_clock::now();
-            static std::atomic<bool> g_render_delay_announced{false};
+            static const auto& g_render_delay_ms = callback_state->g_render_delay_ms();
+            static const auto& g_render_delay_start = callback_state->g_render_delay_start();
+            static auto& g_render_delay_announced = callback_state->g_render_delay_announced();
             // PROSPER_RENDER_LAST=<N>: stop rendering after submit N (default: unbounded). Bounds the render
             // window so a diagnostic slice at a late stall (RENDER_FIRST..RENDER_LAST) does not accumulate
             // unbounded RTT/GPU resources across tens of thousands of submits (which OOM-kills the process).
-            static int g_render_last = getenv("PROSPER_RENDER_LAST") ? atoi(getenv("PROSPER_RENDER_LAST")) : INT_MAX;
+            static auto& g_render_last = callback_state->g_render_last();
             static thread_local int g_this_submit = -1;
             static thread_local bool g_force_this_submit = false;
             if (phase.first_span || g_this_submit < 0) {
@@ -1587,10 +1726,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 g_force_this_submit = false;
             }
             if (g_this_submit > g_render_last) return {};
-            static const int g_rttlog_min_submit = getenv("PROSPER_RTTLOG_MIN_SUBMIT")
-                ? std::max(0, atoi(PROSPER_ENV_VALUE("PROSPER_RTTLOG_MIN_SUBMIT"))) : 0;
-            static const int g_rttlog_max_submit = getenv("PROSPER_RTTLOG_MAX_SUBMIT")
-                ? std::max(0, atoi(PROSPER_ENV_VALUE("PROSPER_RTTLOG_MAX_SUBMIT"))) : INT_MAX;
+            static const auto& g_rttlog_min_submit = callback_state->g_rttlog_min_submit();
+            static const auto& g_rttlog_max_submit = callback_state->g_rttlog_max_submit();
             scan_for_descriptors_once(static_cast<uint64_t>(g_this_submit < 0 ? 0 : g_this_submit));
             const bool rtt_log_in_range =
                 g_this_submit >= g_rttlog_min_submit && g_this_submit <= g_rttlog_max_submit;
@@ -1602,8 +1739,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // The timing bool is sampled per callback, not a capture ID or completion proof.
             // Keep cumulative per-thread populations across captures; a falling edge is only
             // an observed inactive callback. This diagnostic does not change realization policy.
-            static const bool validation_census_requested =
-                PROSPER_ENV_VALUE("PROSPER_TEXTURE_VALIDATION_CENSUS") != nullptr;
+            static const auto& validation_census_requested = callback_state->validation_census_requested();
             ValidationCensusLog* validation_census = nullptr;
             if (validation_census_requested) {
                 static thread_local ValidationCensusLog log;
@@ -1648,8 +1784,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             prosper::frontend::ScopedInteractivePerformanceTiming scoped_perf_timing(
                 perf_capture_timing);
             const bool lightweight_rtt_timing = timing_mode.log && PROSPER_ENV_VALUE("PROSPER_RTT_TIMING");
-            static const uint64_t rtt_timing_min_draws = getenv("PROSPER_RTT_TIMING_MIN_DRAWS")
-                ? strtoull(PROSPER_ENV_VALUE("PROSPER_RTT_TIMING_MIN_DRAWS"), nullptr, 0) : 0;
+            static const auto& rtt_timing_min_draws = callback_state->rtt_timing_min_draws();
             if (phase.first_span) {
                 pending_capture_generation = timing_enabled ? callback_capture_generation : 0;
                 pending_span_start_ns = pending_capture_generation ? callback_entry_ns : 0;
@@ -1719,9 +1854,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // correlation points a previous build emitted, which would make the instrument disagree
             // with itself across builds while investigating exactly the kind of question it exists
             // for. Keep its output identical to pre-#1691 rather than make it cheaper.
-            static const bool submit_decode_scope_disabled =
-                PROSPER_ENV_VALUE("PROSPER_NO_SUBMIT_TEXTURE_DECODE_SCOPE") != nullptr ||
-                PROSPER_ENV_VALUE("PROSPER_RESOURCE_HASH_DIM") != nullptr;
+            static const auto& submit_decode_scope_disabled = callback_state->submit_decode_scope_disabled();
             static thread_local std::unordered_map<TextureDecodeKey, DecodedTexture,
                                                    TextureDecodeKeyHash> decoded_textures;
             static thread_local uint64_t decode_span_ordinal = 0;
@@ -1746,12 +1879,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // owned-vector route as a same-binary control and compatibility fallback.
             const bool use_direct_index_views =
                 PROSPER_ENV_VALUE("PROSPER_NO_DIRECT_INDEX_VIEW") == nullptr;
-            static const bool use_tracked_buffer_membership_cache =
-                PROSPER_ENV_VALUE("PROSPER_NO_TRACKED_BUFFER_GATE") == nullptr;
-            static std::unordered_map<TextureDecodeKey, PersistentDecodedTexture, TextureDecodeKeyHash>
-                persistent_decoded_textures;
-            static size_t persistent_decoded_texture_bytes = 0;
-            static uint64_t persistent_decode_generation = 0;
+            static const auto& use_tracked_buffer_membership_cache = callback_state->use_tracked_buffer_membership_cache();
+            static auto& persistent_decoded_textures = callback_state->persistent_decoded_textures();
+            static auto& persistent_decoded_texture_bytes = callback_state->persistent_decoded_texture_bytes();
+            static auto& persistent_decode_generation = callback_state->persistent_decode_generation();
             // The persistent cache's LRU generation now advances per SUBMIT rather than per span. That
             // is what keeps a submit-scoped identity entry safe: an entry whose `last_use` equals the
             // current generation is skipped by the eviction scan, so persistent-cache storage a
@@ -1760,26 +1891,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             const uint64_t decode_generation = persistent_decode_generation;
             static thread_local std::vector<std::shared_ptr<const std::vector<uint8_t>>>
                 retired_submit_pixels;
-            static size_t retired_submit_bytes = 0;
+            static auto& retired_submit_bytes = callback_state->retired_submit_bytes();
             if (rebuild_decode_scope) {
                 decoded_textures.clear();
                 texstore_pinned.assign(texstore.size(), false);
                 retired_submit_pixels.clear();
                 retired_submit_bytes = 0;
             }
-            static uint64_t persistent_texture_id = 0;
-            static std::vector<uint8_t> persistent_validation_scratch;
-            static const size_t persistent_decode_limit = [] {
-                const uint64_t physical_bytes = host_physical_memory_bytes();
-                const size_t limit = texture_decode_cache_limit_bytes(
-                    PROSPER_ENV_VALUE("PROSPER_TEXTURE_DECODE_CACHE_MB"), physical_bytes);
-                fprintf(stderr,
-                        "[render] decoded texture cache budget = %.1f MiB "
-                        "(host physical %.1f GiB)\n",
-                        limit / (1024.0 * 1024.0),
-                        physical_bytes / (1024.0 * 1024.0 * 1024.0));
-                return limit;
-            }();
+            static auto& persistent_texture_id = callback_state->persistent_texture_id();
+            static auto& persistent_validation_scratch = callback_state->persistent_validation_scratch();
+            static const auto& persistent_decode_limit = callback_state->persistent_decode_limit();
             uint32_t resource_hash_w = 0, resource_hash_h = 0;
             if (const char* dim = PROSPER_ENV_VALUE("PROSPER_RESOURCE_HASH_DIM"))
                 if (sscanf(dim, "%ux%u", &resource_hash_w, &resource_hash_h) != 2)
@@ -1839,10 +1960,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // These vectors are rebuilt for every draw. A bounded hint avoids repeated
             // growth for ordinary reflected resource sets without allocating for draws
             // that have no accepted resources. The control permits same-binary timing.
-            static const bool reserve_frame_resources = [] {
-                const char* setting = std::getenv("PROSPER_FRAME_RESOURCE_RESERVE");
-                return !setting || std::strcmp(setting, "0") != 0;
-            }();
+            static const auto& reserve_frame_resources = callback_state->reserve_frame_resources();
             // Immutable CPU snapshots live only for this renderer callback (not later spans or
             // frames). Every lookup still proves the exact retained images/generations. Sharing the
             // owner across draws also lets one backend group deduplicate its uploads by pointer.
@@ -1859,8 +1977,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 prosper::test::gpu_depth_array_snapshots_enabled();
             // PROSPER_NO_GUEST_DEPTH_LAYERS=1 restores the pre-#3893 refusal of a retained depth
             // array with never-rendered layers (same-binary A/B).
-            static const bool disable_guest_depth_layers =
-                std::getenv("PROSPER_NO_GUEST_DEPTH_LAYERS") != nullptr;
+            static const auto& disable_guest_depth_layers = callback_state->disable_guest_depth_layers();
             // Callback-scoped guest-layer scans (#3893), dropped when a guest GPU write drains.
             prosper::test::DepthArrayGuestScanMemo depth_array_guest_scans;
             uint64_t depth_array_guest_scan_epoch =
