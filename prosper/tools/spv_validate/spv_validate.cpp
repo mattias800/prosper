@@ -136,6 +136,9 @@ static const NotAnEmitter kNotEmitters[] = {
     {"rdna2_proven_raw_x2_data_loads",
      "returns decoded instruction PCs, not SPIR-V; dynfetch_fold covers positive, branch, "
      "pointer-only and SGPR-lifetime cases, and rdna2_to_spirv_exec validates a consuming module"},
+    {"rdna2_proven_raw_immediate_wide_data_loads",
+     "returns decoded instruction PCs, not SPIR-V; dynfetch_fold covers admission and refusal "
+     "paths, and rdna2_to_spirv_exec validates a consuming module"},
     {"rdna2_raw_wide_data_loads",
      "returns decoded instruction PCs, not SPIR-V; recompile_coverage covers numeric reads, "
      "overwrites, branches and no-effect instructions, and validates consuming modules"},

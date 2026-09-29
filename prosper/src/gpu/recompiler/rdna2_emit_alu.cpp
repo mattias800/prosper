@@ -5523,14 +5523,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             //    (a runtime user-SGPR we have no value for) still rejects — never fold as 0.
             const bool soff_null = (in.src[1].kind == OperandKind::Special && in.src[1].value == 125);
             uint32_t soff_bits = 0; bool soff_dyn = false;
-            if (!soff_null && rt && (in.opcode == 0x2 || in.opcode == 0x3) &&
-                rs.smem_raw_wide_data_loads.contains(in.pc)) {
-                if (getenv("PROSPER_DBG"))
-                    fprintf(stderr,
-                            "[smem-reject] pc=%u reason=raw-wide-data-requires-backing "
-                            "op=0x%x\n", in.pc, in.opcode);
-                ok = false;
-                return true;
+            if (rt && (in.opcode == 0x2 || in.opcode == 0x3) &&
+                rs.smem_raw_wide_data_loads.contains(in.pc) &&
+                (!soff_null || rs.smem_raw_immediate_wide_data_loads.contains(in.pc))) {
+                // Keep the existing immediate descriptor route for loads outside the bounded
+                // current-byte proof. Some established routed tables carry only the resulting
+                // resource, without a source binding at this load PC. The may-use census still
+                // reports numeric/uncertain reads; it cannot turn that legacy route into a
+                // current-byte observation. Register-offset data retains its prior refusal.
+                const ShaderResource* exact = rt->by_fetch_pc(in.pc);
+                const bool backed_immediate_wide = soff_null && (n == 4u || n == 8u) &&
+                    rs.smem_raw_immediate_wide_data_loads.contains(in.pc) && exact &&
+                    exact->fetch_pc == in.pc && exact->cls == ResourceClass::ConstantBuffer &&
+                    shader_resource_buffer_binding_bytes(*exact) >=
+                        static_cast<uint64_t>(in.literal) + n * sizeof(uint32_t);
+                if (!backed_immediate_wide) {
+                    if (getenv("PROSPER_DBG"))
+                        fprintf(stderr,
+                                "[smem-reject] pc=%u reason=raw-wide-data-requires-backing "
+                                "op=0x%x\n", in.pc, in.opcode);
+                    ok = false;
+                    return true;
+                }
             }
             if (!soff_null) {
                 if (rt && (in.opcode == 0x2 || in.opcode == 0x3)) {
@@ -5684,7 +5698,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                // A newly admitted raw x2 data resource belongs to its own load;
                                // borrowing it here would silently make an unrelated load succeed.
                                (resource.fetch_pc == in.pc ||
-                                !rs.smem_raw_x2_data_loads.contains(resource.fetch_pc)) &&
+                               !rs.smem_raw_x2_data_loads.contains(resource.fetch_pc) &&
+                               !rs.smem_raw_immediate_wide_data_loads.contains(resource.fetch_pc)) &&
                                (resource.cls == ResourceClass::ConstantBuffer ||
                                 resource.cls == ResourceClass::VertexBuffer);
                     });
@@ -5727,6 +5742,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t loaded = b.cbuf_load(safe_index, binding);
                 return b.sel(in_bounds, loaded, b.uconst(0u));
             };
+            auto end_vcc_mask_for_data_load = [&]() {
+                if (n != 2u || in.dst.value != 106 ||
+                    !rs.smem_raw_x2_data_loads.contains(in.pc)) return;
+                // This raw load writes physical VCC_LO/HI as scalar DATA. The preceding VCC
+                // predicate is no longer the register's mask, and keeping its Bool view would
+                // let an implicit cndmask/branch consume stale bits. Ordinary data reads use the
+                // two newly loaded rs.sreg words; an unproved mask use now fails visibly.
+                rs.vcc = 0;
+                rs.vcc_wave_uniform = 0;
+                for (int reg = 106; reg <= 107; ++reg) {
+                    rs.sreg_bool.erase(reg);
+                    rs.sreg_bool_b32.erase(reg);
+                    rs.sreg_bool_narrowed.erase(reg);
+                }
+            };
             // #2481: this exact instruction is the producer of a runtime-selected descriptor table.
             // Its SOFFSET is the byte offset of the chosen record, so the element index is
             // SOFFSET / record-stride. Publish it as the live selector for that array binding before
@@ -5760,6 +5790,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg[in.dst.value + (int)k] = bounded_cbuf_load(kidx);
                     rs.sreg_srt.erase(in.dst.value + (int)k);   // data load: drop any stale descriptor tag
                 }
+                end_vcc_mask_for_data_load();
                 return true;
             }
             for (uint32_t k = 0; k < n; k++)
@@ -5768,12 +5799,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // A wide scalar load is a descriptor fetch — tag its dest SGPRs with the SRT offset so a
             // later buffer/image op using them resolves to the right resource (provenance). x4 = V#/S#
             // (buffers, samplers), x8 = T# (textures, 8 dwords).
-            if (rt && (in.opcode == 0x2 || in.opcode == 0x3)) {
+            if (rt && (in.opcode == 0x2 || in.opcode == 0x3) &&
+                !rs.smem_raw_immediate_wide_data_loads.contains(in.pc)) {
                 for (uint32_t k = 0; k < n; k++) rs.sreg_srt[in.dst.value + (int)k] = in.literal;
             } else {
                 // Scalar data loads overwrite the destination; they do not carry descriptor identity.
                 for (uint32_t k = 0; k < n; k++) rs.sreg_srt.erase(in.dst.value + (int)k);
             }
+            end_vcc_mask_for_data_load();
             return true;
         }
         case Rdna2Format::FLAT: {

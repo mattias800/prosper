@@ -954,6 +954,8 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         // stream first: the compact fold stream intentionally omits most VALU, including implicit
         // VCC writers that must invalidate a scalar-data proof through s106:s107.
         result->raw_x2_data_load_pcs = rdna2_proven_raw_x2_data_loads(decoded);
+        result->raw_immediate_wide_data_load_pcs =
+            rdna2_proven_raw_immediate_wide_data_loads(decoded);
         retain_fold_instructions(decoded, result->instructions);
         std::vector<Rdna2Inst> shader_constant_decoded = decoded;
         result->shader_constant_specialized =
@@ -973,7 +975,8 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                             sizeof(Rdna2Inst) + sizeof(result->scalar_spill_written_vgprs) +
                         result->control_plan.allocated_bytes() +
                         result->shader_constant_control_plan.allocated_bytes() +
-                        result->raw_x2_data_load_pcs.capacity() * sizeof(uint32_t);
+                        (result->raw_x2_data_load_pcs.capacity() +
+                         result->raw_immediate_wide_data_load_pcs.capacity()) * sizeof(uint32_t);
         return result;
     };
 
@@ -2900,6 +2903,11 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         // Unknown relative SGPR destinations cannot be excluded by comparing the decoded base.
         if ((in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20) ||
             (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCallB64)) return true;
+        // A plain B32 move writes only its named word. Treating it as a pair incorrectly
+        // clobbers the adjacent destination while assembling a T# one lane at a time.
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32 &&
+            in.dst.kind == OperandKind::SGPR)
+            return in.dst.value == reg;
         auto overlaps = [reg](const Operand& dst, uint32_t width) {
             return dst.kind == OperandKind::SGPR && reg >= dst.value &&
                    static_cast<uint32_t>(reg - dst.value) < width;
@@ -2924,7 +2932,10 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         const auto& in = full[i];
         if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF ||
             in.fmt == Rdna2Format::FLAT ||
-            (in.fmt == Rdna2Format::MIMG && in.opcode != 0x00u) ||
+            // IMAGE_LOAD and the supported IMAGE_SAMPLE opcode only read their source image.
+            // A prior store/atomic could rewrite these descriptor bytes through an alias.
+            (in.fmt == Rdna2Format::MIMG && in.opcode != 0x00u &&
+             in.opcode != 0x27u) ||
             (in.fmt == Rdna2Format::SMEM && in.opcode >= 0x10u)) return false;
     }
     for (int lane = 0; lane < 8; ++lane) {
@@ -2939,8 +2950,6 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
             ((load.words[1] >> 25u) & 0x7fu) != 125u ||
             static_cast<int32_t>(load.literal) < 0) return false;
         const uint32_t width = load.opcode == 2u ? 4u : load.opcode == 3u ? 8u : 16u;
-        if (reg < load.dst.value || static_cast<uint32_t>(reg - load.dst.value) >= width)
-            return false;
         const int base_reg = load.src[0].value;
         if (base_reg < static_cast<int>(user_sgpr_base) ||
             base_reg + 1 >= static_cast<int>(user_sgpr_base + nsgpr) ||
@@ -2950,16 +2959,34 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         const size_t seed = static_cast<size_t>(base_reg - static_cast<int>(user_sgpr_base));
         const uint64_t base = static_cast<uint64_t>(user_sgprs[seed]) |
                               (static_cast<uint64_t>(user_sgprs[seed + 1]) << 32u);
-        const uint64_t offset = static_cast<uint64_t>(load.literal) +
-                                static_cast<uint64_t>(reg - load.dst.value) * 4u;
-        if (base > UINT64_MAX - offset || source_addr[static_cast<size_t>(lane)] != base + offset)
+        if (base > UINT64_MAX - load.literal) return false;
+        const uint64_t first_addr = base + load.literal;
+        const uint64_t addr = source_addr[static_cast<size_t>(lane)];
+        if (addr < first_addr || addr - first_addr >= width * sizeof(uint32_t) ||
+            ((addr - first_addr) & 3u)) return false;
+        const int original_reg = load.dst.value +
+            static_cast<int>((addr - first_addr) / sizeof(uint32_t));
+        if (original_reg < 0 || original_reg >= 106)
             return false;
         if (reaches_use(producer)) return false; // a path bypasses this load
+        bool copied = original_reg == reg;
         for (size_t i = producer + 1; i < use; ++i) {
-            if (may_write(full[i], reg)) return false;
-            if (sopp_is_branch(full[i]) && sopp_branch_target(full[i]) <=
-                                               static_cast<int64_t>(load.pc)) return false;
+            const Rdna2Inst& step = full[i];
+            // A copied lane needs one unconditional scalar move. No branch in this local span
+            // may skip or replay it; the earlier producer-dominance check handles entry edges.
+            if (original_reg != reg && sopp_is_branch(step)) return false;
+            if (sopp_is_branch(step) && sopp_branch_target(step) <=
+                                            static_cast<int64_t>(load.pc)) return false;
+            const bool exact_copy = original_reg != reg && !copied &&
+                step.fmt == Rdna2Format::SOP1 && step.opcode == kSop1OpcodeMovB32 &&
+                step.dst.kind == OperandKind::SGPR && step.dst.value == reg &&
+                step.src[0].kind == OperandKind::SGPR &&
+                step.src[0].value == original_reg;
+            if (!copied && may_write(step, original_reg)) return false;
+            if (copied && may_write(step, reg)) return false;
+            if (exact_copy) copied = true;
         }
+        if (!copied) return false;
     }
     return true;
 }
@@ -3189,6 +3216,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     if (fold_instructions == &decoded->instructions && decoded->shader_constant_specialized)
         fold_instructions = &decoded->shader_constant_instructions;
     const auto& ins = *fold_instructions;
+    bool branched_descriptor_fold = false;
+    bool branched_descriptor_fold_scanned = false;
     if (reader) reader->shader_constant_specialized =
         fold_instructions == &decoded->shader_constant_instructions;
     // Specialization selects a different stream. Keep PC-relative plans invocation-local until
@@ -3290,6 +3319,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::bitset<kFoldSgprs> descr_key_known;
     std::array<std::array<uint32_t, 8>, kFoldSgprs> descr8{};  // load-time T# snapshots by base SGPR
     std::bitset<kFoldSgprs> descr8_known;
+    std::bitset<kFoldSgprs> descr8_from_x16;
     std::array<uint32_t, kFoldSgprs> descr8_key{};
     std::bitset<kFoldSgprs> descr8_key_known;
     // Exact source address and producer PC of each CURRENT scalar word from a mapped x4/x8/x16 load. The
@@ -3559,6 +3589,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         std::bitset<kFoldSgprs> descr_key_known;
         std::array<std::array<uint32_t, 8>, kFoldSgprs> descr8;
         std::bitset<kFoldSgprs> descr8_known;
+        std::bitset<kFoldSgprs> descr8_from_x16;
         std::array<uint32_t, kFoldSgprs> descr8_key;
         std::bitset<kFoldSgprs> descr8_key_known;
         std::array<uint64_t, kFoldSgprs> descriptor_word_source_addr;
@@ -3590,6 +3621,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         s.table_source = table_source; s.table_source_known = table_source_known;
         s.descr_key = descr_key; s.descr_key_known = descr_key_known;
         s.descr8 = descr8; s.descr8_known = descr8_known;
+        s.descr8_from_x16 = descr8_from_x16;
         s.descr8_key = descr8_key; s.descr8_key_known = descr8_key_known;
         s.descriptor_word_source_addr = descriptor_word_source_addr;
         s.descriptor_word_source_pc = descriptor_word_source_pc;
@@ -3612,6 +3644,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
         table_source = s.table_source; table_source_known = s.table_source_known;
         descr_key = s.descr_key; descr_key_known = s.descr_key_known;
         descr8 = s.descr8; descr8_known = s.descr8_known;
+        descr8_from_x16 = s.descr8_from_x16;
         descr8_key = s.descr8_key; descr8_key_known = s.descr8_key_known;
         descriptor_word_source_addr = s.descriptor_word_source_addr;
         descriptor_word_source_pc = s.descriptor_word_source_pc;
@@ -4566,13 +4599,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // offset and guest bytes for the exact invocation.
                 const bool raw_scalar_data = n == 1 ||
                     (n == 2 && std::binary_search(decoded->raw_x2_data_load_pcs.begin(),
-                                                   decoded->raw_x2_data_load_pcs.end(), in.pc));
+                                                   decoded->raw_x2_data_load_pcs.end(), in.pc)) ||
+                    ((n == 4 || n == 8) && std::binary_search(
+                        decoded->raw_immediate_wide_data_load_pcs.begin(),
+                        decoded->raw_immediate_wide_data_load_pcs.end(), in.pc));
                 if (srt_uses && !is_buffer && raw_scalar_data &&
                     valid_reg(sbase) && valid_reg(sbase + 1) &&
                     val_known.test((size_t)sbase) && val_known.test((size_t)(sbase + 1))) {
                     const uint64_t ptr = (uint64_t)val[(size_t)sbase] |
                                          ((uint64_t)val[(size_t)(sbase + 1)] << 32);
-                    if (ptr > 0x10000) {   // matches the consumer's own null/low-pointer guard
+                    const uint64_t wide_span =
+                        static_cast<uint64_t>(in.literal) + n * sizeof(uint32_t);
+                    const bool wide_address_valid = n < 4 ||
+                        (static_cast<int32_t>(in.literal) >= 0 &&
+                         (in.literal & 3u) == 0u && (ptr & 3u) == 0u &&
+                         ptr <= UINT64_MAX - wide_span && wide_span <= UINT32_MAX &&
+                         guest_readable(ptr, static_cast<uint32_t>(wide_span)));
+                    if (ptr > 0x10000 && wide_address_valid) {
                         pending_srt_use = SrtUse{};
                         pending_srt_use.kind = 1;
                         pending_srt_use.key = 0xFFFFFFFFu;         // no SRT tag: resolved by use_pc
@@ -5023,6 +5066,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                               descr8[(size_t)sdst] = {
                                   mem[0], mem[1], mem[2], mem[3], mem[4], mem[5], mem[6], mem[7] };
                               descr8_known.set((size_t)sdst);
+                              descr8_from_x16.reset((size_t)sdst);
                               descr8_key[(size_t)sdst] = (imm_only && !is_buffer)
                                   ? in.literal : 0xFFFFFFFFu;
                               descr8_key_known.set((size_t)sdst);
@@ -5048,6 +5092,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             mem[first], mem[first + 1], mem[first + 2], mem[first + 3],
                             mem[first + 4], mem[first + 5], mem[first + 6], mem[first + 7] };
                         descr8_known.set((size_t)base_reg);
+                        descr8_from_x16.set((size_t)base_reg);
                         descr8_key[(size_t)base_reg] = 0xFFFFFFFFu;
                         descr8_key_known.set((size_t)base_reg);
                     }
@@ -5164,6 +5209,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     const int tbase = in.src[1].value;
                     const int samp_base = in.src[2].value;
                     const bool have_t8 = valid_reg(tbase) && descr8_known.test((size_t)tbase);
+                    // Most shaders have no x16 image bundle. Scan their control flow only when a
+                    // current x16 snapshot first reaches an image use.
+                    if (have_t8 && descr8_from_x16.test((size_t)tbase) &&
+                        !branched_descriptor_fold_scanned) {
+                        branched_descriptor_fold = std::any_of(
+                            decoded->instructions.begin(), decoded->instructions.end(),
+                            [](const Rdna2Inst& candidate) {
+                                return candidate.fmt == Rdna2Format::SOPP &&
+                                       sopp_is_branch(candidate);
+                            });
+                        branched_descriptor_fold_scanned = true;
+                    }
+                    const bool branchy_x16 = have_t8 && branched_descriptor_fold &&
+                        descr8_from_x16.test((size_t)tbase);
                     const bool have_key = valid_reg(tbase) && descr8_key_known.test((size_t)tbase);
                     // MIMG itself proves that its eight SRSRC words are a T#. A table snapshot or
                     // direct user-data range establishes provenance, but the RESOURCE MUST use the
@@ -5220,7 +5279,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             mapped_t8 = false;
                     }
                     mapped_t8 &= mapped_t8_source != 0;
-                    if (mapped_t8 && !have_t8) {
+                    if (mapped_t8 && (!have_t8 || branchy_x16)) {
                         // A guest may rewrite shader code at the same address. The decoded owner
                         // is internally consistent; decline this new admission if its bytes no
                         // longer match the currently mapped program at publication time.
@@ -5233,7 +5292,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             user_sgprs, nsgpr, user_sgpr_base);
                     }
                     const std::array<uint32_t, 8>* t8 =
-                        live_t8_known &&
+                        live_t8_known && (!branchy_x16 || mapped_t8) &&
                                 (have_t8 || mapped_t8 || (seed_provenance &&
                                              (plausible_seed || exact_null_seed)))
                             ? &live_t8 : nullptr;

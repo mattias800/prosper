@@ -270,6 +270,116 @@ int main() {
     printf("  N=%u mismatches=%u worst=%g (out[50]=%g expect=%g)\n", N, bad, worst, got[50], expect[50]);
     CHECK(bad == 0, "recompiled RDNA2 kernel computes ((a0+a1)*a2)*a3+a1 correctly");
 
+    // Raw scalar data may occupy the physical VCC pair. Its old predicate must be discarded,
+    // while v_cvt_f32_u32 reads the two current buffer words. Two independent byte inputs make
+    // constant/zero substitution fail this actual GPU execution check.
+    const uint32_t raw_vcc_data[] = {
+        0x7da80484u,                 // old VCC compare
+        0xf4041a80u, 0xfa000008u,   // s_load_dwordx2 vcc, s[0:1], 0x08
+        0x7e000c6au,                 // v_cvt_f32_u32 v0, vcc_lo
+        0x7e020c6bu,                 // v_cvt_f32_u32 v1, vcc_hi
+        0x7d042509u,                 // new VCC compare
+        0x06000300u,                 // v_add_f32 v0, v0, v1
+        0xbf810000u,
+    };
+    ShaderResourceTable raw_vcc_table;
+    ShaderResource raw_vcc_resource{};
+    raw_vcc_resource.cls = ResourceClass::ConstantBuffer;
+    raw_vcc_resource.binding = 2;
+    raw_vcc_resource.fetch_pc = 1;
+    raw_vcc_resource.size = 16;
+    raw_vcc_table.resources.push_back(raw_vcc_resource);
+    const auto raw_vcc_spv = recompile_valu(raw_vcc_data, std::size(raw_vcc_data),
+                                            1, 0, &raw_vcc_table);
+    CHECK(!raw_vcc_spv.empty(), "raw VCC scalar pair recompiles with exact-PC data backing");
+    if (!raw_vcc_spv.empty()) {
+        const auto first = prosper::test::run_compute(
+            raw_vcc_spv, {0.0f}, 1, 1, {0u, 0u, 17u, 257u});
+        const auto second = prosper::test::run_compute(
+            raw_vcc_spv, {0.0f}, 1, 1, {0u, 0u, 23u, 511u});
+        CHECK(first.size() == 1 && second.size() == 1 &&
+                  first[0] == 274.0f && second[0] == 534.0f,
+              "raw VCC conversions use both current scalar words on the GPU");
+    }
+
+    const uint32_t raw_x8_data[] = {
+        0xf40c0300u, 0xfa000020u,  // s_load_dwordx8 s[12:19], s[0:1], 0x20
+        0xbe94030fu,                // s_mov_b32 s20, s15
+        0x7e000c14u,                // v_cvt_f32_u32 v0, s20
+        0xbf810000u,
+    };
+    ShaderResourceTable raw_x8_table;
+    ShaderResource raw_x8_resource{};
+    raw_x8_resource.cls = ResourceClass::ConstantBuffer;
+    raw_x8_resource.binding = 2;
+    raw_x8_resource.fetch_pc = 0;
+    raw_x8_resource.size = 64;
+    raw_x8_table.resources.push_back(raw_x8_resource);
+    const auto raw_x8_spv = recompile_valu(raw_x8_data, std::size(raw_x8_data),
+                                           1, 0, &raw_x8_table);
+    CHECK(!raw_x8_spv.empty(), "immediate raw x8 data recompiles with exact backing");
+    if (!raw_x8_spv.empty()) {
+        const auto first = prosper::test::run_compute(
+            raw_x8_spv, {0.0f}, 1, 1,
+            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16});
+        const auto second = prosper::test::run_compute(
+            raw_x8_spv, {0.0f}, 1, 1,
+            {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 33, 13, 14, 15, 16});
+        CHECK(first.size() == 1 && second.size() == 1 &&
+                  first[0] == 12.0f && second[0] == 33.0f,
+              "immediate x8 load reads changed current bytes beyond its base offset");
+    }
+
+    const uint32_t raw_x4_scalar_data[] = {
+        0xf4080100u, 0xfa000020u, // x4 s[4:7] from exact table offset 0x20
+        0x80140481u,              // s_add_u32 s20,s4,1
+        0x7e000c14u,              // v_cvt_f32_u32 v0,s20
+        0xbf810000u,
+    };
+    ShaderResourceTable raw_x4_scalar_table;
+    ShaderResource raw_x4_scalar_resource{};
+    raw_x4_scalar_resource.cls = ResourceClass::ConstantBuffer;
+    raw_x4_scalar_resource.binding = 2;
+    raw_x4_scalar_resource.fetch_pc = 0;
+    raw_x4_scalar_resource.size = 64;
+    raw_x4_scalar_table.resources.push_back(raw_x4_scalar_resource);
+    const auto raw_x4_scalar_spv = recompile_valu(raw_x4_scalar_data,
+        std::size(raw_x4_scalar_data), 1, 0, &raw_x4_scalar_table);
+    CHECK(!raw_x4_scalar_spv.empty(),
+          "immediate raw x4 scalar arithmetic has current-byte backing");
+    if (!raw_x4_scalar_spv.empty()) {
+        const auto first = prosper::test::run_compute(
+            raw_x4_scalar_spv, {0.0f}, 1, 1,
+            {1, 2, 3, 4, 5, 6, 7, 8, 11, 10, 11, 12, 13, 14, 15, 16});
+        const auto second = prosper::test::run_compute(
+            raw_x4_scalar_spv, {0.0f}, 1, 1,
+            {1, 2, 3, 4, 5, 6, 7, 8, 23, 10, 11, 12, 13, 14, 15, 16});
+        CHECK(first.size() == 1 && second.size() == 1 &&
+                  first[0] == 12.0f && second[0] == 24.0f,
+              "scalar arithmetic observes changed x4 bytes instead of zero placeholders");
+    }
+
+    const uint32_t raw_x4_scc_data[] = {
+        0xf4080100u, 0xfa000020u, // x4 s[4:7] from the same current-byte table
+        0xbf060480u,              // s_cmp_eq_u32 s4,0
+        0x7e000cfdu,              // v_cvt_f32_u32 v0,scc
+        0xbf810000u,
+    };
+    const auto raw_x4_scc_spv = recompile_valu(raw_x4_scc_data,
+        std::size(raw_x4_scc_data), 1, 0, &raw_x4_scalar_table);
+    CHECK(!raw_x4_scc_spv.empty(), "immediate raw x4 SCC observation has data backing");
+    if (!raw_x4_scc_spv.empty()) {
+        const auto zero = prosper::test::run_compute(
+            raw_x4_scc_spv, {0.0f}, 1, 1,
+            {1, 2, 3, 4, 5, 6, 7, 8, 0, 10, 11, 12, 13, 14, 15, 16});
+        const auto nonzero = prosper::test::run_compute(
+            raw_x4_scc_spv, {0.0f}, 1, 1,
+            {1, 2, 3, 4, 5, 6, 7, 8, 23, 10, 11, 12, 13, 14, 15, 16});
+        CHECK(zero.size() == 1 && nonzero.size() == 1 &&
+                  zero[0] == 1.0f && nonzero[0] == 0.0f,
+              "SCC observes current x4 bytes for two independent input values");
+    }
+
     // Kernel 2: transcendental/min/max ops. v0=min(a0,a1); v0=max(v0,a2); v0=sqrt(v0). (a2>=0 => arg>=0)
     //   v_min_f32 v0,v0,v1 | v_max_f32 v0,v0,v2 | v_sqrt_f32 v0,v0 | s_endpgm
     const uint32_t code2[] = { 0x1E000300u, 0x20000500u, 0x7E006700u, 0xBF810000u };

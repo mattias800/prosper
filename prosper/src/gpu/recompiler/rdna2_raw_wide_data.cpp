@@ -2,12 +2,30 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include <algorithm>
+#include <array>
+#include <bitset>
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 namespace prosper::gpu {
+// A raw wide load backed by a dispatch-time CPU snapshot cannot observe an earlier shader write
+// to that same guest allocation. Without an alias proof, keep potentially writing instructions
+// on the ordinary unresolved route. Read-only operations remain eligible.
+bool rdna2_may_write_guest_memory(const Rdna2Inst& in) {
+    if (in.fmt == Rdna2Format::FLAT) return true;
+    if (in.fmt == Rdna2Format::SMEM) return in.opcode >= 0x10u;
+    if (in.fmt == Rdna2Format::MTBUF) return in.opcode > 0x03u;
+    if (in.fmt == Rdna2Format::MUBUF)
+        return !(in.opcode <= 0x03u ||
+                 (in.opcode >= 0x08u && in.opcode <= 0x0fu));
+    if (in.fmt == Rdna2Format::MIMG)
+        return in.opcode != 0x00u && in.opcode != 0x0eu && in.opcode != 0x27u;
+    return false;
+}
+
 namespace {
 
 struct RawWideState {
@@ -50,6 +68,206 @@ public:
         return false;
     }
 
+    bool has_numeric_reader_or_uncertain_path() const {
+        // May-provenance, not a value proof: a read on ANY reachable path needs the actual
+        // bytes. Merge arriving register/SCC origins with OR and reprocess when they grow.
+        // Scalar descriptor assembly remains provenance-only until a non-descriptor consumer.
+        struct State {
+            size_t index;
+            std::bitset<128> regs;
+            bool scc;
+        };
+        if (start + 1 >= ins.size()) return false;
+        State initial{start + 1, {}, false};
+        for (uint32_t word = 0; word < words; ++word)
+            initial.regs.set(static_cast<size_t>(first + static_cast<int>(word)));
+        std::vector<State> pending{initial};
+        std::vector<std::array<std::bitset<128>, 2>> seen(ins.size());
+        std::vector<std::array<bool, 2>> seen_any(ins.size());
+        auto writes_scc = [](const Rdna2Inst& in) {
+            if (in.fmt == Rdna2Format::SOPC) return true;
+            if (in.fmt == Rdna2Format::SOP1)
+                return !sop1_opcode_leaves_scc_unmodified(in.opcode);
+            if (in.fmt == Rdna2Format::SOPK)
+                return (in.opcode >= kSopkOpcodeCmpkFirst &&
+                        in.opcode <= kSopkOpcodeCmpkLast) ||
+                       in.opcode == kSopkOpcodeAddkI32;
+            if (in.fmt == Rdna2Format::SOP2)
+                return in.opcode != 0x0au && in.opcode != 0x0bu &&
+                       in.opcode != kSop2OpcodeBfmB32 &&
+                       in.opcode != kSop2OpcodeBfmB64 &&
+                       in.opcode != 0x26u &&
+                       in.opcode != kSop2OpcodePackLlB32B16 &&
+                       in.opcode != 0x35u && in.opcode != 0x36u;
+            return false;
+        };
+        size_t processed = 0;
+        while (!pending.empty()) {
+            State state = std::move(pending.back());
+            pending.pop_back();
+            if ((!state.regs.any() && !state.scc) || state.index >= ins.size()) continue;
+            if (state.index == start) return true; // a replayed load needs a new byte observation
+            const size_t slot = state.scc ? 1u : 0u;
+            if (seen_any[state.index][slot] &&
+                (state.regs & ~seen[state.index][slot]).none()) continue;
+            seen_any[state.index][slot] = true;
+            seen[state.index][slot] |= state.regs;
+            state.regs = seen[state.index][slot];
+            if (++processed > 32768) return true;
+            const Rdna2Inst& in = ins[state.index];
+            if (in.fmt == Rdna2Format::Unknown || !in.len_dwords) return true;
+            if (in.is_end) continue;
+            if ((in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u &&
+                 in.opcode <= 0x22u) ||
+                (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCallB64) ||
+                (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x28u &&
+                 in.opcode <= 0x2au)) return true; // indirect control/relative SGPR write
+
+            if (state.scc && in.fmt == Rdna2Format::SOPP &&
+                (in.opcode == 0x04u || in.opcode == 0x05u)) return true;
+            const bool implicit_scc_read = state.scc &&
+                ((in.fmt == Rdna2Format::SOP2 &&
+                  (in.opcode == 0x04u || in.opcode == 0x05u ||
+                   in.opcode == 0x0au || in.opcode == 0x0bu)) ||
+                 (in.fmt == Rdna2Format::SOP1 &&
+                  (in.opcode == kSop1OpcodeCmovB32 ||
+                   in.opcode == kSop1OpcodeCmovB64)) ||
+                 (in.fmt == Rdna2Format::SOPK &&
+                  in.opcode == kSopkOpcodeCmovkI32));
+            const uint32_t copy_words = in.fmt == Rdna2Format::SOP1 &&
+                in.opcode == kSop1OpcodeMovB32 ? 1u :
+                in.fmt == Rdna2Format::SOP1 &&
+                in.opcode == kSop1OpcodeMovB64 ? 2u : 0u;
+            const bool plain_copy = copy_words && in.dst.kind == OperandKind::SGPR &&
+                (in.src[0].kind == OperandKind::SGPR ||
+                 in.src[0].kind == OperandKind::Special);
+            bool derived_read = implicit_scc_read;
+            if (!plain_copy) {
+                const uint32_t implicit = scalar_implicit_destination_read_width(in);
+                for (uint32_t k = 0; k < implicit; ++k)
+                    if (in.dst.value >= 0 && in.dst.value + static_cast<int>(k) < 128 &&
+                        state.regs.test(static_cast<size_t>(in.dst.value + k)))
+                        derived_read = true;
+                for (uint32_t source = 0; source < in.n_src; ++source) {
+                    const Operand& operand = in.src[source];
+                    if (operand.kind == OperandKind::Special && operand.value == 253) {
+                        derived_read |= state.scc;
+                        continue;
+                    }
+                    if ((operand.kind != OperandKind::SGPR &&
+                         !(operand.kind == OperandKind::Special &&
+                           operand.value >= 106 && operand.value <= 124)) ||
+                        descriptor_source(in, source)) continue;
+                    for (uint32_t k = 0; k < source_width(in, source); ++k)
+                        if (operand.value >= 0 &&
+                            operand.value + static_cast<int>(k) < 128 &&
+                            state.regs.test(static_cast<size_t>(operand.value + k)))
+                            derived_read = true;
+                }
+            }
+            const bool scalar_result = in.fmt == Rdna2Format::SOP1 ||
+                in.fmt == Rdna2Format::SOP2 || in.fmt == Rdna2Format::SOPK;
+            if (derived_read && !scalar_result && in.fmt != Rdna2Format::SOPC) return true;
+            if (derived_read && scalar_result &&
+                (in.dst.kind != OperandKind::SGPR ||
+                 (in.fmt == Rdna2Format::SOPK &&
+                  in.opcode == kSopkOpcodeSetregB32) ||
+                 rdna2_instruction_may_change_exec(in))) return true;
+
+            std::array<bool, 2> copied{};
+            if (plain_copy)
+                for (uint32_t k = 0; k < copy_words; ++k)
+                    copied[k] = (k == 0 && state.scc &&
+                                 in.src[0].kind == OperandKind::Special &&
+                                 in.src[0].value == 253) ||
+                        (in.src[0].value >= 0 &&
+                         in.src[0].value + static_cast<int>(k) < 128 &&
+                         state.regs.test(static_cast<size_t>(in.src[0].value + k)));
+            std::bitset<128> produced;
+            const bool conditional_write =
+                (in.fmt == Rdna2Format::SOP1 &&
+                 (in.opcode == kSop1OpcodeCmovB32 ||
+                  in.opcode == kSop1OpcodeCmovB64)) ||
+                (in.fmt == Rdna2Format::SOPK &&
+                 in.opcode == kSopkOpcodeCmovkI32);
+            const bool definite_scalar_write = !conditional_write &&
+                (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
+                 in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SMEM);
+            for_each_scalar_write(in, [&](int base, uint32_t width) {
+                for (uint32_t k = 0; k < width; ++k) {
+                    const int reg = base + static_cast<int>(k);
+                    if (reg < 0 || reg >= 128) continue;
+                    if (definite_scalar_write)
+                        state.regs.reset(static_cast<size_t>(reg));
+                    if (derived_read && scalar_result &&
+                        in.dst.kind == OperandKind::SGPR &&
+                        base == in.dst.value)
+                        produced.set(static_cast<size_t>(reg));
+                }
+            }, /*wave32_one_word_masks*/true);
+            state.regs |= produced;
+            if (plain_copy)
+                for (uint32_t k = 0; k < copy_words; ++k)
+                    if (copied[k] && in.dst.value >= 0 &&
+                        in.dst.value + static_cast<int>(k) < 128)
+                        state.regs.set(static_cast<size_t>(in.dst.value + k));
+            if (writes_scc(in)) state.scc = derived_read;
+            if (!state.regs.any() && !state.scc) continue;
+
+            auto enqueue = [&](size_t next) {
+                if (next <= start) return false; // unsupported re-entry to producer or prefix
+                pending.push_back({next, state.regs, state.scc});
+                return true;
+            };
+            if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
+                const int64_t target_pc = static_cast<int64_t>(in.pc) +
+                    in.len_dwords + in.simm16;
+                if (target_pc < 0 || target_pc > UINT32_MAX) return true;
+                const auto target = by_pc.find(static_cast<uint32_t>(target_pc));
+                if (target == by_pc.end()) {
+                    if (target_pc <= ins.back().pc) return true;
+                } else if (!enqueue(target->second)) return true;
+                if (in.opcode == kSoppOpcodeBranch) continue;
+            } else if (in.fmt == Rdna2Format::SOPP && !sopp_is_noop(in) &&
+                       in.opcode != 0x0au && in.opcode != 0x10u &&
+                       in.opcode != 0x16u && in.opcode != 0x17u) {
+                return true;
+            }
+            if (state.index + 1 < ins.size() && !enqueue(state.index + 1)) return true;
+        }
+        return false;
+    }
+
+    bool has_reader_after_bypassed_load(size_t entry) const {
+        std::vector<RawWideState> pending{{entry,
+            static_cast<uint16_t>((1u << words) - 1u)}};
+        std::unordered_set<uint64_t> visited;
+        while (!pending.empty()) {
+            const RawWideState state = pending.back();
+            pending.pop_back();
+            if (!state.live || state.index >= ins.size()) continue;
+            const uint64_t key = (static_cast<uint64_t>(state.index) << 8u) | state.live;
+            if (!visited.insert(key).second) continue;
+            if (visited.size() > 8192) return true;
+            const Rdna2Inst& in = ins[state.index];
+            if (in.fmt == Rdna2Format::Unknown || !in.len_dwords) return true;
+            if (in.is_end) continue;
+            const uint32_t implicit = scalar_implicit_destination_read_width(in);
+            if (implicit && overlaps(in.dst.value, implicit, state.live)) return true;
+            for (uint32_t source = 0; source < in.n_src; ++source) {
+                const Operand& operand = in.src[source];
+                if ((operand.kind == OperandKind::SGPR ||
+                     (operand.kind == OperandKind::Special &&
+                      operand.value >= 106 && operand.value <= 124)) &&
+                    overlaps(operand.value, source_width(in, source), state.live))
+                    return true;
+            }
+            const uint16_t live = kill_written_words(in, state.live);
+            if (live && !enqueue_successors(in, state.index, live, pending)) return true;
+        }
+        return false;
+    }
+
 private:
     const std::vector<Rdna2Inst>& ins;
     const std::unordered_map<uint32_t, size_t>& by_pc;
@@ -76,11 +294,12 @@ private:
             return 4;
         if (in.fmt == Rdna2Format::SMEM && source == 0)
             return in.opcode >= 8u ? 4u : 2u;
-        // VOPC includes two-word integer compares. Over-approximating its other forms can only
-        // refuse a placeholder, never hide a live high half.
         if (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
             in.fmt == Rdna2Format::SOPC || in.fmt == Rdna2Format::VOP3 ||
-            in.fmt == Rdna2Format::VOPC) return 2;
+            in.fmt == Rdna2Format::VOPC) {
+            const uint32_t width = scalar_alu_source_words(in, source);
+            return width == UINT32_MAX ? 0u : width;
+        }
         return 1;
     }
 
@@ -154,15 +373,90 @@ std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& in
         const Rdna2Inst& load = ins[index];
         if (load.fmt != Rdna2Format::SMEM ||
             (load.opcode != 0x2u && load.opcode != 0x3u) ||
-            (load.src[1].kind == OperandKind::Special && load.src[1].value == 125) ||
             load.dst.kind != OperandKind::SGPR || load.dst.value < 0 ||
             load.dst.value + (load.opcode == 0x2u ? 4 : 8) > 128)
             continue;
         const uint32_t words = load.opcode == 0x2u ? 4u : 8u;
-        if (RawWideLifetime(ins, by_pc, index, words).requires_backing())
+        const RawWideLifetime lifetime(ins, by_pc, index, words);
+        const bool immediate = load.src[1].kind == OperandKind::Special &&
+            load.src[1].value == 125;
+        // Preserve descriptor-fragment relocation in the established immediate path. The new
+        // immediate guard targets words read by scalar or vector arithmetic/comparison; plain
+        // scalar copies alone do not distinguish data from descriptor assembly.
+        if (lifetime.requires_backing() &&
+            (!immediate || lifetime.has_numeric_reader_or_uncertain_path()))
             data_loads.push_back(load.pc);
     }
     return data_loads;
+}
+
+// A small, deliberately stricter subset of the above refusal population can use a current-byte
+// buffer. The predicate above reports uncertainty as "needs backing"; it must never itself grant
+// admission. Here the entire decoded program has only valid forward edges, and the raw pointer is
+// an unchanged entry pair. A load then observes one dispatch-local upload on every visit.
+std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
+        const std::vector<Rdna2Inst>& ins) {
+    std::vector<uint32_t> proven;
+    if (ins.empty()) return proven;
+    std::unordered_map<uint32_t, size_t> by_pc;
+    for (size_t i = 0; i < ins.size(); ++i)
+        if (ins[i].fmt == Rdna2Format::Unknown || !ins[i].len_dwords ||
+            !by_pc.emplace(ins[i].pc, i).second) return proven;
+    for (const Rdna2Inst& in : ins) {
+        if ((in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u) ||
+            (in.fmt == Rdna2Format::SOPK && in.opcode == 0x16u)) return proven;
+        if (in.fmt != Rdna2Format::SOPP || in.is_end) continue;
+        if (sopp_opcode_is_direct_branch(in.opcode)) {
+            const int64_t target = static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
+            if (target <= static_cast<int64_t>(in.pc) || target > UINT32_MAX ||
+                !by_pc.contains(static_cast<uint32_t>(target))) return proven;
+        } else if (!sopp_is_noop(in) && in.opcode != kSoppOpcodeBarrier)
+            return proven;
+    }
+    const auto needs_backing = rdna2_raw_wide_data_loads(ins);
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const Rdna2Inst& load = ins[i];
+        const uint32_t words = load.opcode == 0x2u ? 4u : 8u;
+        if (load.fmt != Rdna2Format::SMEM ||
+            (load.opcode != 0x2u && load.opcode != 0x3u) ||
+            load.dst.kind != OperandKind::SGPR || load.dst.value < 0 ||
+            load.dst.value + static_cast<int>(words) > 106 ||
+            load.src[0].kind != OperandKind::SGPR || load.src[0].value < 0 ||
+            load.src[0].value + 1 > 105 ||
+            load.src[1].kind != OperandKind::Special || load.src[1].value != 125 ||
+            static_cast<int32_t>(load.literal) < 0 || (load.literal & 3u) ||
+            !std::binary_search(needs_backing.begin(), needs_backing.end(), load.pc))
+            continue;
+        bool stable_entry_pointer = true;
+        const RawWideLifetime lifetime(ins, by_pc, i, words);
+        for (const Rdna2Inst& in : ins) {
+            // Forward-only control permits a textual prefix scan: any earlier global/image
+            // store might alias the raw source after the CPU upload was captured.
+            if (in.pc < load.pc && rdna2_may_write_guest_memory(in))
+                stable_entry_pointer = false;
+            // A predecessor may bypass the load only if every bypass path overwrites all
+            // would-be loaded words before reading them. This admits branch-to-after-region
+            // shapes without allowing a joined reader to see a fabricated definition.
+            if (in.pc < load.pc && in.fmt == Rdna2Format::SOPP &&
+                sopp_opcode_is_direct_branch(in.opcode)) {
+                const int64_t target = static_cast<int64_t>(in.pc) +
+                    in.len_dwords + in.simm16;
+                if (target > static_cast<int64_t>(load.pc) &&
+                    lifetime.has_reader_after_bypassed_load(
+                        by_pc.at(static_cast<uint32_t>(target))))
+                    stable_entry_pointer = false;
+            }
+            for_each_scalar_write(in, [&](int base, uint32_t width) {
+                if (base >= 0 && base <= load.src[0].value + 1 &&
+                    base + static_cast<int>(width) > load.src[0].value)
+                    stable_entry_pointer = false;
+            });
+            if (!stable_entry_pointer) break;
+        }
+        if (stable_entry_pointer && lifetime.has_numeric_reader_or_uncertain_path())
+            proven.push_back(load.pc);
+    }
+    return proven;
 }
 
 } // namespace prosper::gpu
