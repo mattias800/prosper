@@ -732,8 +732,11 @@ def collect_predicates(files: dict[Path, list[str]]) -> dict[str, frozenset]:
             m = is_func_def(line.strip())
             if not m:
                 continue
-            if not re.match(r"^\s*(?:static\s+|inline\s+|constexpr\s+)*(?:bool|int)"
-                            r"\b(?!\s*[*&])", line):
+            # Match the COMPLETE plain scalar return/name prefix. Looking only immediately
+            # after `int` missed the legal `int const&` / `bool const*` spellings and exported
+            # their config through a global method-name alias (#3892 independent review).
+            if not re.match(r"^\s*(?:static\s+|inline\s+|constexpr\s+)*(?:bool|int)\s+"
+                            r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*\s*\(", line):
                 continue
             body, depth, closed = [], 0, False
             for probe in lines[idx:idx + PRED_MAX_LINES]:
@@ -2590,6 +2593,24 @@ void consume(const GetterCtx& ctx) {
             "return value;", "mutate(); return value;")}, False),
         ("mutable reference is not cached configuration", {"definition": definition.replace(
             "const int& GetterState::threshold()", "int& GetterState::threshold()")}, False),
+        ("alternate-CV reference is not a global scalar predicate", {"header": header.replace(
+            "const int& threshold();", "int const& threshold();"), "definition": definition.replace(
+            "const int& GetterState::threshold()", "int const& GetterState::threshold()")}, False),
+        ("alternate-CV pointer is not a global scalar predicate", {"header": header.replace(
+            "const int& threshold();", "bool const* threshold();"), "definition": """
+GetterState& GetterState::instance() {
+    static GetterState state;
+    return state;
+}
+bool const* GetterState::threshold() {
+    static const bool value = getenv("PROSPER_GETTER_THRESHOLD") != nullptr;
+    return &value;
+}
+""", "caller": caller.replace("consume(GetterCtx{ .threshold = threshold });", """
+if (threshold) {
+    if (getenv("PROSPER_GETTER_PRINT")) fprintf(stderr, "x");
+}
+""")}, False),
         ("unknown emplacement is not optional value provenance", {"header": header.replace(
             "std::optional<int> threshold_;", "CustomSlot threshold_;")}, False),
         ("optional slot used outside its initializer", {"definition": definition + """

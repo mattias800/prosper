@@ -56,3 +56,7 @@ has, historically, converted names no route ever reached.
   `int&`. That joined the method's local config to every same-named identifier, bypassing receiver
   checks. Scalar predicates now exclude pointer/reference returns; cached const-reference values
   use the identified receiver, and unknown or shadowed receivers contribute no alias (#3892).
+  Independent review then caught alternate CV spellings (`int const&`, `bool const*`) bypassing
+  an immediate pointer/reference lookahead. Both cross-file negatives reproduced that leakage;
+  matching the complete plain scalar return/name prefix rejects them while preserving the tree's
+  existing findings.
