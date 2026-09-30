@@ -27,7 +27,10 @@ reference binding sites.
 - `guest_reads.hpp` — `safe_span` / `safe_copy` / `safe_equal`, the bounds-checked guest reads.
 - `draw_resources.{hpp,cpp}` — `build_draw_frame_resources`: one draw's VS/PS resource tables to
   backend frame resources (the texture- and buffer-reference resolution chain; the hottest code in
-  the renderer). Formerly the `build_R` lambda.
+  the renderer). Formerly the `build_R` lambda. The image branch currently returns plain
+  Keep/Skip/Reject(reason) in the same file; its caller preserves first-rejection accounting and
+  continues the original resource loop. Inner-loop control and the successful census/timing/emplace
+  tail stay in place until the separate pure extraction.
 - `timing_report.{hpp,cpp}` — `report_render_timing_aggregates`: the `PROSPER_RENDER_TIMING`
   lifetime/window summaries; and `publish_renderer_timing_record`, the F8 capture's per-submit
   `RendererTimingRecord`.
