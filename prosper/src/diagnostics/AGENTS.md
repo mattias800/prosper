@@ -285,6 +285,25 @@ windows cover about 89% of graphics waits; the broken deferred-envelope arms cov
 68-71%. This uses the existing counters at window close and adds no event hook. Check timestamp
 support, query results and envelope closure before drawing performance conclusions from it.
 
+**Fresh direct-fold WaitRegMem observations** (#3891) retain the predicate's existing raw and
+pending-overlay value before the warning's later raw reread. The decision sample carries value
+validity, overlay-touched status and comparison support; invalid sample values are placeholders,
+not measured zeroes. Its mask applies only to the effective value, not the reference. The six
+`wait_regmem_direct_*` JSONL quantities count only actual direct evaluations and their false
+reason/action. Ordered retained-effect evaluations, waits queued without evaluation, invalid
+packets and deferred rechecks are outside that denominator. Warning suppression does not suppress
+counting. The q label is the submit entry, not a physical Vulkan queue identity.
+
+This is a non-rule observer without a chosen threshold or HUD alarm. The summary covers closed
+windows after the first-flip baseline, excluding boot and the trailing partial window. Zero
+evaluations and zero reason/action samples means NO DATA; positive reason/action counts with no
+evaluation in a relaxed snapshot means PARTIAL. Observed direct evaluations without false samples
+describe quiet only in this scope. Separate relaxed counter loads do not form a coherent partition
+or prove guest quiescence. Existing no-engine/no-window reporting behavior is preserved. Neither
+a false predicate nor a later matching printed value identifies writer causality, a hardware
+timeout or an ordering regression. Real packet-route calibration is required separately from the
+native sampler/ledger/window controls.
+
 **Colourless CPU pass publication** (#3891, #3907). `rtt-colorless-publication` counts an
 actual slot-0 CPU pass-readback publication without any colour-write mask. A single violation
 reports immediately, independent of sensitivity. The candidate count covers guarded decisions,

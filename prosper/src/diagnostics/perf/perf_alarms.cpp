@@ -200,6 +200,8 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
     std::vector<AlarmFiring> candidates = evaluate_rules(w, config_.thresholds);
     std::lock_guard<std::mutex> lock(mutex_);
     ++windows_;
+    for (size_t i = 0; i < kWaitRegMemDirectCounterCount; ++i)
+        wait_regmem_direct_totals_[i] += w.count(kWaitRegMemDirectCounters[i]);
     std::vector<AlarmFiring> fired;
     for (auto& [name, state] : rules_) {
         if (rule_has_data(name, w)) ++state.windows_with_data;
@@ -396,6 +398,21 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
                      n(Counter::GpuGraphicsDeferred), n(Counter::GpuGraphicsDeferredBlocked));
         std::fprintf(jsonl_, ",\"cpu_rtt_publication_checks\":%llu,\"cpu_rtt_colorless_publications\":%llu",
                      n(Counter::CpuRttPublicationChecks), n(Counter::CpuRttColorlessPublications));
+        {
+            uint64_t counts[kWaitRegMemDirectCounterCount];
+            for (size_t i = 0; i < kWaitRegMemDirectCounterCount; ++i)
+                counts[i] = w.count(kWaitRegMemDirectCounters[i]);
+            std::fprintf(jsonl_, ",\"wait_regmem_direct_evaluations\":%llu,"
+                         "\"wait_regmem_direct_compare_false\":%llu,"
+                         "\"wait_regmem_direct_unreadable\":%llu,"
+                         "\"wait_regmem_direct_unsupported\":%llu,"
+                         "\"wait_regmem_direct_false_proceed\":%llu,"
+                         "\"wait_regmem_direct_false_defer\":%llu,\"wait_regmem_direct_data\":",
+                         (unsigned long long)counts[0], (unsigned long long)counts[1],
+                         (unsigned long long)counts[2], (unsigned long long)counts[3],
+                         (unsigned long long)counts[4], (unsigned long long)counts[5]);
+            json_string(jsonl_, wait_regmem_direct_data_status(counts));
+        }
         // 2026-09-29 queue: compute destination refusals (MiB by reason), the colour-target
         // cache's bounds and window peaks, and the exact full-overwrite shape census.
         std::fprintf(jsonl_, ",\"rtt_destination_refusals\":%llu,"
@@ -455,6 +472,20 @@ bool AlarmEngine::write_summary(FILE* out) const {
         std::fprintf(out, "[perf-alarm] summary: no rule fired in %llu windows of %.1fs "
                           "(%zu of %zu rules had data)\n",
                      (unsigned long long)windows_, config_.window_ns / 1e9, with_data, rules_.size());
+    // Observation, not an alarm. This narrow scope neither detects hardware timeouts nor proves
+    // completion order; independent relaxed inputs do not certify counter balance/quiescence.
+    std::fprintf(out, "[perf-alarm] summary observer=wait-regmem-direct-fold "
+                 "completed-windows=%llu snapshot=relaxed data=%s evaluations=%llu "
+                 "compare-false=%llu unreadable=%llu unsupported=%llu "
+                 "false-proceed=%llu false-defer=%llu\n",
+                 (unsigned long long)windows_,
+                 wait_regmem_direct_data_status(wait_regmem_direct_totals_),
+                 (unsigned long long)wait_regmem_direct_totals_[0],
+                 (unsigned long long)wait_regmem_direct_totals_[1],
+                 (unsigned long long)wait_regmem_direct_totals_[2],
+                 (unsigned long long)wait_regmem_direct_totals_[3],
+                 (unsigned long long)wait_regmem_direct_totals_[4],
+                 (unsigned long long)wait_regmem_direct_totals_[5]);
     // Not a rule: the exact full-overwrite shape census over the run (to the last window close),
     // and the destination refusals behind it -- the funnel a compute result takes to reach the
     // renderer's device image, printed whether or not anything fired.

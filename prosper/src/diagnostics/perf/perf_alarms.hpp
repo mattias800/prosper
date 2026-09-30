@@ -114,6 +114,9 @@ private:
     uint64_t window_start_ns_ = 0;
     uint64_t flips_in_window_ = 0;
     uint64_t windows_ = 0;
+    // Sum of closed-window deltas, excluding the boot baseline and trailing partial window.
+    // Each input is an independent relaxed snapshot; these are not a coherent partition.
+    uint64_t wait_regmem_direct_totals_[kWaitRegMemDirectCounterCount] = {};
     uint64_t prev_cost_ns_[kCostCount] = {};
     uint64_t prev_cost_events_[kCostCount] = {};
     uint64_t prev_counters_[kCounterCount] = {};

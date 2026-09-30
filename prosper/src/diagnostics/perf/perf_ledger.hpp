@@ -136,6 +136,14 @@ enum class Counter : uint8_t {
     Wave64UnidentifiedRefusals, // uses with neither a compile identity nor a program address
     Wave64InventoryOverflow,   // uses whose identity could not enter the full inventory
     Wave64ShaderChecks,        // known-Wave64 observations at realization/backend boundaries
+    // Fresh direct-fold WAIT_REG_MEM predicate evaluations only. Ordered-effect acceptance,
+    // queued-without-evaluation waits and deferred rechecks do not enter this denominator.
+    WaitRegMemDirectEvaluations,
+    WaitRegMemDirectCompareFalse,
+    WaitRegMemDirectUnreadable,
+    WaitRegMemDirectUnsupported,
+    WaitRegMemDirectFalseProceed,
+    WaitRegMemDirectFalseDefer,
     Count
 };
 
@@ -406,6 +414,39 @@ inline void add_cost(Cost c, uint64_t ns, uint64_t events = 1, const char* label
 
 inline void add(Counter c, uint64_t n = 1) {
     if (n) ledger().counters[static_cast<size_t>(c)].fetch_add(n, std::memory_order_relaxed);
+}
+
+// Called at the actual direct site, before its warning rate limit. An unreadable sample takes
+// precedence over an unsupported comparison, matching the predicate's existing early return.
+inline void note_wait_regmem_direct_evaluation(bool readable, bool supported, bool satisfied) {
+    if (!enabled()) return;
+    add(Counter::WaitRegMemDirectEvaluations);
+    if (satisfied) return;
+    add(!readable ? Counter::WaitRegMemDirectUnreadable :
+        !supported ? Counter::WaitRegMemDirectUnsupported : Counter::WaitRegMemDirectCompareFalse);
+}
+
+// Called after the existing policy branch has selected an action, without rereading its gate.
+inline void note_wait_regmem_direct_false_action(bool deferred) {
+    if (!enabled()) return;
+    add(deferred ? Counter::WaitRegMemDirectFalseDefer : Counter::WaitRegMemDirectFalseProceed);
+}
+
+inline constexpr Counter kWaitRegMemDirectCounters[] = {
+    Counter::WaitRegMemDirectEvaluations, Counter::WaitRegMemDirectCompareFalse,
+    Counter::WaitRegMemDirectUnreadable, Counter::WaitRegMemDirectUnsupported,
+    Counter::WaitRegMemDirectFalseProceed, Counter::WaitRegMemDirectFalseDefer
+};
+inline constexpr size_t kWaitRegMemDirectCounterCount =
+    sizeof(kWaitRegMemDirectCounters) / sizeof(kWaitRegMemDirectCounters[0]);
+
+// Independent relaxed loads can straddle an observation. Positive reason/action counts without
+// an evaluation in this snapshot are partial data, never a clean zero or an accounting verdict.
+inline const char* wait_regmem_direct_data_status(const uint64_t* counts) {
+    if (counts[0]) return "OBSERVED";
+    for (size_t i = 1; i < kWaitRegMemDirectCounterCount; ++i)
+        if (counts[i]) return "PARTIAL";
+    return "NO DATA";
 }
 
 inline void set(Gauge g, uint64_t v) {
