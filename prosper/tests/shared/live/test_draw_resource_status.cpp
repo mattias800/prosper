@@ -1,7 +1,7 @@
 // Exercise the shipping resource builder's rejection/skip/continuation contract before extraction.
 // These are seeded reflection-memo metadata arms: they observe real builder outputs and census/
 // timing hooks, not shader reflection, rendered pixels or GPU completion.
-#include "shared/live/submit_renderer/draw_resources.hpp"
+#include "shared/live/submit_renderer/image_resources.hpp"
 
 #include <array>
 #include <cstdio>
@@ -287,6 +287,16 @@ int main() {
     check(prosper::frontend::TextureReferenceCensus::enabled(), "setup",
           "the census is armed before its first cached read");
     static FixtureState state;
+    state.texstore.resize(2);
+    state.texstore_pinned = {false, true};
+    auto slot_context = state.context();
+    check(acquire_image_texstore_slot(slot_context) == 0 && state.texstore_used == 1,
+          "slot-counter", "the returned old index advances the referenced caller counter");
+    check(acquire_image_texstore_slot(slot_context) == 2 && state.texstore_used == 3,
+          "slot-counter", "the next acquisition skips a pinned slot and advances past its result");
+    check(state.texstore.size() == 3 && state.texstore_pinned.size() == 3 &&
+              state.texstore_pinned[1] && !state.texstore_pinned[2],
+          "slot-counter", "pool growth preserves the existing pin and initializes the new slot");
     const auto buffer = ordinary_buffer();
     const auto image = ordinary_image();
 
