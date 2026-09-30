@@ -331,6 +331,13 @@ it does not directly prove decoded-cache, texture-identity or thread-local-cache
 See [#3968](https://github.com/mattias800/prosper/pull/3968) and
 [#3892](https://github.com/mattias800/prosper/issues/3892).
 
+**RULED OUT (2026-09-30): unchanged pixels after renderer re-registration prove the decoded
+cache survived.** A private registration-clears-cache mutation preserves exact pixels but fails
+the new no-redecode assertion in all three decoder fixture modes (normal, eager snapshot control
+and write-watch). The restored renderer passes all four registration/decoder fixtures. Cache
+persistence requires observing decode work as well as pixels; this does not prove every cache or
+thread-local payload's lifetime. See [#3974](https://github.com/mattias800/prosper/pull/3974).
+
 **RULED OUT (2026-09-30): every prelude setting below the render-last return is first reached
 inside the warmup window.** The RTT-log submit bounds, validation-census setting and minimum RTT
 timing draw count are initialized after the render-last return but before the warmup return.
