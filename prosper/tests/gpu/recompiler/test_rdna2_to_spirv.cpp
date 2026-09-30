@@ -3414,9 +3414,9 @@ int main() {
                              native_cfg17d1b).empty(),
           "exact Wave64 s_ff1 resolves a complete VCC source to scalar data");
 
-    // Fail-visible domain/width arms.  They mutate the same op0x14 production gate and mask
-    // resolver as the positive packets: mismatched/unknown subgroups, plain scalar B64 data,
-    // mask+data ambiguity, an absent saved pair, and either EXEC-half destination must all reject.
+    // Complete Wave64 launches now have a portable reduction service when the native host
+    // contract is missing or narrower. Wave32 and unproven source/destination domains below
+    // retain their existing fail-visible boundaries.
     ComputeShaderConfig native32_cfg17d1b = native_cfg17d1b;
     native32_cfg17d1b.native_subgroup_size = 32;
     ComputeShaderConfig unknown_cfg17d1b = native_cfg17d1b;
@@ -3429,13 +3429,17 @@ int main() {
         0x7e040204u,              // v_mov_b32 v2, s4
         0xbf810000u,
     };
+    const auto narrow_spv17d1b_ff1 = recompile_compute(
+        code17d1b_exec_scalar, std::size(code17d1b_exec_scalar), nullptr, native32_cfg17d1b);
+    const auto portable_spv17d1b_ff1 = recompile_compute(
+        code17d1b_exec_scalar, std::size(code17d1b_exec_scalar), nullptr, unknown_cfg17d1b);
+    CHECK(!narrow_spv17d1b_ff1.empty() && !portable_spv17d1b_ff1.empty() &&
+              count_spirv_opcode(narrow_spv17d1b_ff1, 224) > 0 &&
+              count_spirv_opcode(portable_spv17d1b_ff1, 224) > 0,
+          "S_FF1_I32_B64 uses common barriers for narrow/unknown native Wave64 contracts");
     CHECK(recompile_compute(code17d1b_exec_scalar, std::size(code17d1b_exec_scalar), nullptr,
-                            native32_cfg17d1b).empty() &&
-              recompile_compute(code17d1b_exec_scalar, std::size(code17d1b_exec_scalar), nullptr,
-                                unknown_cfg17d1b).empty() &&
-              recompile_compute(code17d1b_exec_scalar, std::size(code17d1b_exec_scalar), nullptr,
-                                wave32_cfg17d1b).empty(),
-          "S_FF1_I32_B64 rejects native32, unknown-width, and Wave32 execution");
+                            wave32_cfg17d1b).empty(),
+          "S_FF1_I32_B64 retains the Wave32 rejection");
     const uint32_t code17d1b_unknown_pair[] = {
         0xbe841410u,              // s_ff1_i32_b64 s4, untracked s[16:17]
         0xbf810000u,

@@ -122,6 +122,14 @@ int main(int argc, char** argv) {
     config.local_x = kLanes;
     const uint32_t exec_count[] = {0xbe84107eu, 0x7e020204u, 0xbf810000u};
     CHECK(!prosper::gpu::recompile_compute(exec_count, std::size(exec_count), nullptr, config).empty());
+    const uint32_t exec_first[] = {0xbe84147eu, 0x7e040204u, 0xbf810000u};
+    CHECK(!prosper::gpu::recompile_compute(exec_first, std::size(exec_first), nullptr, config).empty());
+    config.native_subgroup_size = 32;
+    CHECK(!prosper::gpu::recompile_compute(exec_first, std::size(exec_first), nullptr, config).empty());
+    config.wave_size = 32;
+    CHECK(prosper::gpu::recompile_compute(exec_first, std::size(exec_first), nullptr, config).empty());
+    config.wave_size = 64;
+    config.native_subgroup_size = 0;
     config.local_x = 16;
     CHECK(prosper::gpu::recompile_compute(exec_count, std::size(exec_count), nullptr, config).empty());
     // A padded 64-invocation host workgroup is not a complete 64-lane guest wave. The
