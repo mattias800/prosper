@@ -53,6 +53,22 @@
 namespace prosper::gpu {
 namespace {
 
+// Resource folding owns a four-byte scalar when that exact observation selected a later
+// register-offset load. Preserve each draw's observation independently, including when another
+// draw uses the same guest address after it changes. Ordinary guest-backed buffers keep their
+// shared allocation intervals.
+bool owns_scalar_word(const ShaderResourceTable& table, const ShaderResource& resource) {
+    return resource.cls == ResourceClass::ConstantBuffer &&
+        resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
+        resource.size == sizeof(uint32_t) && resource.host_data_size == sizeof(uint32_t) &&
+        resource.host_data && !resource.host_data_prefix_bytes && !resource.table_index_count &&
+        !resource.metadata_addr && resource.fetch_pc != UINT32_MAX &&
+        std::any_of(table.owned_host_data.begin(), table.owned_host_data.end(),
+            [&](const auto& owner) {
+                return owner && owner->size() == sizeof(uint32_t) &&
+                    owner->data() == resource.host_data;
+            });
+}
 
 // `own_mip_chain_allocations` extends a materializable mip chain's range to the WHOLE guest
 // allocation (#3202). A tiled chain stores level zero last, so the other levels sit BELOW the
@@ -64,7 +80,8 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
                        const std::vector<ComputeItem>& computes,
                        const std::vector<GpuState::DmaCopy>& dma_copies,
                        uint64_t resource_limit_bytes, bool own_mip_chain_allocations,
-                       std::vector<Interval>& intervals, std::string& error) {
+                       std::vector<Interval>& intervals, std::string& error,
+                       uint64_t* planned_bytes = nullptr) {
     uint64_t total = 0;
     auto add_table = [&](const ShaderResourceTable* t,
                          const std::set<uint32_t>* used_bindings) -> bool {
@@ -85,6 +102,14 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
             if (used_bindings && !used_bindings->contains(r.binding) &&
                 !capture_authority_requires_backing(t, r))
                 continue;
+            if (owns_scalar_word(*t, r)) {
+                if (total > kMaxTotalBlobBytes - sizeof(uint32_t)) {
+                    error = "capture resource data exceeds 3 GiB";
+                    return false;
+                }
+                total += sizeof(uint32_t);
+                continue;
+            }
             if (r.table_index_count) {
                 for (const ShaderBufferTableEntry& entry : r.table_entries) {
                     const uint64_t n = entry.size;
@@ -217,13 +242,15 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
                 "PROSPER_GPU_CAPTURE_METADATA_ONLY=1)";
         return false;
     }
+    if (planned_bytes) *planned_bytes = total;
     intervals = std::move(merged); return true;
 }
 
 bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& intervals,
                    bool include_resource_data, bool allow_packed_pointer,
                    GpuCapturedTable& dst, std::string& error,
-                   const std::set<uint32_t>* used_bindings = nullptr) {
+                   const std::set<uint32_t>* used_bindings = nullptr,
+                   GpuCaptureFile* capture = nullptr) {
     dst.present = src != nullptr;
     if (!src) return true;
     for (const auto& r : src->resources) {
@@ -289,7 +316,19 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
         c.resource.dcc_metadata_size = c.metadata_size;
         uint64_t n = resource_footprint(r);
         c.captured_size = n;
-        if ((is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r) ||
+        if (owns_scalar_word(*src, r) && include_resource_data && capture_backing) {
+            if (!capture || capture->blobs.size() >= kMaxResources) {
+                error = "owned scalar input exceeds the capture blob count";
+                return false;
+            }
+            GpuCaptureBlob blob;
+            blob.guest_addr = r.gpu_addr;
+            blob.bytes_read = sizeof(uint32_t);
+            blob.bytes.assign(r.host_data, r.host_data + sizeof(uint32_t));
+            blob.content_hash = gpu_capture_hash(blob.bytes);
+            c.blob_index = static_cast<uint32_t>(capture->blobs.size());
+            capture->blobs.push_back(std::move(blob));
+        } else if ((is_compute_internal_gds(r) || is_gta5_packed_pointer_resource(r) ||
              is_indirect_pointer_relocation_resource(r)) &&
             include_resource_data) {
             const uint64_t internal_size = is_compute_internal_gds(r) ? n : r.host_data_size;
@@ -500,14 +539,14 @@ bool preflight_gpu_capture_draw_resources(const DrawItem& draw, uint64_t resourc
     std::vector<Interval> intervals;
     std::string chain_error;
     if (!collect_intervals({draw}, {}, {}, effective_limit,
-                           /*own_mip_chain_allocations=*/true, intervals, chain_error)) {
+                           /*own_mip_chain_allocations=*/true, intervals, chain_error,
+                           &planned_bytes)) {
         intervals.clear();
         if (!collect_intervals({draw}, {}, {}, effective_limit,
-                               /*own_mip_chain_allocations=*/false, intervals, error))
+                               /*own_mip_chain_allocations=*/false, intervals, error,
+                               &planned_bytes))
             return false;
     }
-    for (const Interval& interval : intervals)
-        planned_bytes += interval.end - interval.begin;
     return true;
 }
 
@@ -601,9 +640,9 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.has_pixel_inputs = d.has_pixel_inputs;
         c.has_system_inputs = d.has_system_inputs;
         if (!capture_table(d.vrt.get(), intervals, include_resource_data, false,
-                           c.vrt, error) ||
+                           c.vrt, error, nullptr, &out) ||
             !capture_table(d.prt.get(), intervals, include_resource_data, false,
-                           c.prt, error))
+                           c.prt, error, nullptr, &out))
             return false;
         out.draws.push_back(std::move(c));
     }
@@ -628,7 +667,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
             SpirvShaderStage::Compute, compute_bindings);
         if (!capture_table(compute.resources.get(), intervals, include_resource_data, true,
                            c.resources, error,
-                           compute_reflected ? &compute_bindings : nullptr))
+                           compute_reflected ? &compute_bindings : nullptr, &out))
             return false;
         out.computes.push_back(std::move(c));
     }

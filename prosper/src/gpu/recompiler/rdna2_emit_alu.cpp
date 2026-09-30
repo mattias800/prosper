@@ -5536,11 +5536,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rt && (in.opcode == 0x2 || in.opcode == 0x3) && !soff_null &&
                 rs.smem_raw_wide_data_loads.contains(in.pc);
             const ShaderResource* register_source = rt ? rt->by_fetch_pc(in.pc) : nullptr;
-            const bool vcc_offset = in.src[1].kind == OperandKind::Special &&
-                (in.src[1].value == 106 || in.src[1].value == 107);
+            // A source word admitted by the wide-offset proof belongs to this exact realization.
+            // A malformed replay table must fail before ordinary scalar-load resource fallback.
+            if (rs.smem_raw_offset_scalar_source_pcs.contains(in.pc) &&
+                (!register_source || register_source->fetch_pc != in.pc ||
+                 !valid_raw_offset_scalar_snapshot_resource(*register_source))) {
+                if (getenv("PROSPER_DBG"))
+                    fprintf(stderr,
+                            "[smem-reject] pc=%u reason=raw-offset-scalar-requires-owned-backing\n",
+                            in.pc);
+                ok = false;
+                return true;
+            }
+            // This is scalar-address data at Wave32 or Wave64: the full-stream proof requires
+            // explicit reaching scalar definitions and excludes intervening implicit VCC writers.
+            // No lane-mask projection or uninitialized VCC value supplies the selected address.
             const bool backed_register_wide = raw_wide_register_offset_data &&
                 rs.smem_raw_register_wide_data_loads.contains(in.pc) &&
-                (!vcc_offset || b.wave_size == 32u) && register_source &&
+                register_source &&
                 valid_raw_register_snapshot_resource(*register_source) &&
                 register_source->fetch_pc == in.pc && register_source->size == n * 4u &&
                 shader_resource_buffer_binding_bytes(*register_source) >= n * 4u;
@@ -5560,8 +5573,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (rt && (in.opcode == 0x2 || in.opcode == 0x3) &&
                 rs.smem_raw_wide_data_loads.contains(in.pc) &&
                 ((!soff_null && (b.is_compute || backed_register_wide ||
-                               (register_source && register_source->raw_register_snapshot &&
-                                (!vcc_offset || b.wave_size == 32u)))) ||
+                               (register_source && register_source->raw_register_snapshot))) ||
                  (soff_null && rs.smem_raw_immediate_wide_data_loads.contains(in.pc)) ||
                  nested_raw_wide_data)) {
                 // Keep the existing immediate descriptor route for loads outside the bounded
@@ -5749,6 +5761,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                // borrowing it here would silently make an unrelated load succeed.
                                (resource.fetch_pc == in.pc ||
                                !rs.smem_raw_x2_data_loads.contains(resource.fetch_pc) &&
+                               !rs.smem_raw_offset_scalar_source_pcs.contains(resource.fetch_pc) &&
                                !rs.smem_raw_register_wide_data_loads.contains(resource.fetch_pc) &&
                                !rs.smem_raw_immediate_wide_data_loads.contains(resource.fetch_pc)) &&
                                (resource.cls == ResourceClass::ConstantBuffer ||

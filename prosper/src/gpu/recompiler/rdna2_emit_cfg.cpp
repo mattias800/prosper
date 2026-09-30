@@ -1765,7 +1765,11 @@ void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& in
     const auto raw_immediate_wide_data = rdna2_proven_raw_immediate_wide_data_loads(ins);
     rs.smem_raw_immediate_wide_data_loads.insert(raw_immediate_wide_data.begin(),
                                                 raw_immediate_wide_data.end());
-    const auto raw_register_wide_data = rdna2_proven_raw_register_wide_data_loads(ins);
+    std::vector<uint32_t> raw_offset_scalar_sources;
+    const auto raw_register_wide_data =
+        rdna2_proven_raw_register_wide_data_loads(ins, &raw_offset_scalar_sources);
+    rs.smem_raw_offset_scalar_source_pcs.insert(raw_offset_scalar_sources.begin(),
+                                               raw_offset_scalar_sources.end());
     rs.smem_raw_register_wide_data_loads.insert(raw_register_wide_data.begin(),
                                                raw_register_wide_data.end());
     const auto raw_nested_wide_data = rdna2_proven_raw_nested_wide_data_loads(ins);
@@ -4380,6 +4384,7 @@ bool emit_cfg_state_machine(
         state.smem_raw_x2_data_loads = initial.smem_raw_x2_data_loads;
         state.smem_raw_immediate_wide_data_loads = initial.smem_raw_immediate_wide_data_loads;
         state.smem_raw_register_wide_data_loads = initial.smem_raw_register_wide_data_loads;
+        state.smem_raw_offset_scalar_source_pcs = initial.smem_raw_offset_scalar_source_pcs;
         state.smem_raw_wide_data_loads = initial.smem_raw_wide_data_loads;
         state.smem_pointer_analysis_done = initial.smem_pointer_analysis_done;
         state.smem_x2_descriptor_fragment_loads =

@@ -416,7 +416,11 @@ std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
             const int64_t target = static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
             if (target <= static_cast<int64_t>(in.pc) || target > UINT32_MAX ||
                 !by_pc.contains(static_cast<uint32_t>(target))) return proven;
-        } else if (!sopp_is_noop(in) && in.opcode != kSoppOpcodeBarrier)
+        } else if (!sopp_is_noop(in) && in.opcode != kSoppOpcodeBarrier &&
+                   // GS_ALLOC_REQ reads M0 to request parameter-cache space; it changes no
+                   // scalar value or guest source bytes (RDNA2 ISA 12.5.1). The emitter already
+                   // supports this NGG prelude. Other messages remain outside this proof.
+                   !(in.opcode == 0x10u && in.simm16 == 9))
             return proven;
     }
     const auto needs_backing = rdna2_raw_wide_data_loads(ins);
@@ -466,7 +470,8 @@ std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
 }
 
 std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
-        const std::vector<Rdna2Inst>& ins) {
+        const std::vector<Rdna2Inst>& ins, std::vector<uint32_t>* scalar_source_pcs) {
+    if (scalar_source_pcs) scalar_source_pcs->clear();
     // Reuse the entry-pointer, forward-CFG, bypass-reader and guest-write proofs. Only the
     // candidate's addressing mode changes here; its loaded-word lifetime is unchanged.
     auto immediate = ins;
@@ -491,6 +496,7 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
         std::bitset<128> needed;
         needed.set(static_cast<size_t>(offset.value));
         bool scalar_prefix = true;
+        std::vector<uint32_t> sources;
         for (size_t j = i; j-- > 0;) {
             const auto& writer = ins[j];
             // This first subset does not select between incoming scalar definitions. A later
@@ -518,6 +524,44 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                         writes.set(static_cast<size_t>(base + static_cast<int>(k)));
             });
             if ((writes & needed).none()) continue;
+            // A bounded immediate raw x1 fetch is a latched scalar value. Its entry pointer
+            // needs to survive only UNTIL this read, unlike the wide source pointer, whose
+            // full-program lifetime is authenticated above. GTA overwrites this source pair
+            // after the read while preserving the loaded scalar that supplies SOFFSET.
+            const bool immediate_scalar_read = writer.fmt == Rdna2Format::SMEM &&
+                writer.opcode == 0u && writer.dst.kind == OperandKind::SGPR &&
+                writer.dst.value >= 0 && writer.dst.value <= 105 &&
+                writer.src[0].kind == OperandKind::SGPR && writer.src[0].value >= 0 &&
+                writer.src[0].value < 105 && writer.src[1].kind == OperandKind::Special &&
+                writer.src[1].value == 125 && writer.literal == 0u;
+            if (immediate_scalar_read) {
+                bool entry_at_read = true;
+                for (size_t prefix = 0; prefix < j && entry_at_read; ++prefix) {
+                    const auto& before = ins[prefix];
+                    if (rdna2_may_write_guest_memory(before) ||
+                        (before.fmt == Rdna2Format::SOPP &&
+                         sopp_opcode_is_direct_branch(before.opcode)) ||
+                        (before.fmt == Rdna2Format::SOP1 && before.opcode >= 0x28u &&
+                         before.opcode <= 0x2au)) {
+                        entry_at_read = false;
+                        break;
+                    }
+                    for_each_scalar_write(before, [&](int base, uint32_t width) {
+                        if (base >= 0 && base <= writer.src[0].value + 1 &&
+                            base + static_cast<int>(width) > writer.src[0].value)
+                            entry_at_read = false;
+                    });
+                }
+                if (!entry_at_read) {
+                    scalar_prefix = false;
+                    break;
+                }
+                // The existing exact-PC x1 resource supplies the emitted numeric value;
+                // realization still requires mapped current bytes for this draw's pointer.
+                needed &= ~writes;
+                sources.push_back(writer.pc);
+                continue;
+            }
             // Scalar moves and B32 arithmetic are per-draw data, rather than masks or conditional
             // definitions. Concrete operands/opcode support are checked again by the live fold.
             const bool scalar_writer =
@@ -546,8 +590,16 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
         }
         // Ordinary entry SGPRs are resolved from this draw. VCC cannot be an uninitialized entry
         // value: its complete scalar definition must have been found above.
-        if (scalar_prefix && !needed.test(106) && !needed.test(107))
+        if (scalar_prefix && !needed.test(106) && !needed.test(107)) {
             proven.push_back(load.pc);
+            if (scalar_source_pcs)
+                scalar_source_pcs->insert(scalar_source_pcs->end(), sources.begin(), sources.end());
+        }
+    }
+    if (scalar_source_pcs) {
+        std::sort(scalar_source_pcs->begin(), scalar_source_pcs->end());
+        scalar_source_pcs->erase(std::unique(scalar_source_pcs->begin(), scalar_source_pcs->end()),
+                                scalar_source_pcs->end());
     }
     return proven;
 }

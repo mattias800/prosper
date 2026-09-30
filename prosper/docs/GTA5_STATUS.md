@@ -618,6 +618,20 @@ code comment since long before this — remains the actual fix.
 
 ## Ruled out (2026-08-19)
 
+- **The captured GTA V vertex program `0x2042f6a600` still needs numeric raw-wide backing after
+  #3960:** falsified by the full 89-dword / 61-instruction program. Its pc34 raw x4 feeds scalar
+  descriptor assembly and the MUBUF descriptor at pc60, with no later non-descriptor observer.
+  The current detector therefore returns no data load. The live witness reports `smem-untagged`
+  at pc34, then `descriptor-resolved` at pc60 with a 4096-byte, stride-4 resource at
+  `0x203ed9c400`. #3960 changed register-offset classification to follow derived descriptor
+  uses; a raw descriptor placeholder is not evidence that this program lacks numeric backing.
+  This instance establishes no GTA rendering improvement from the later generic memory-fed
+  numeric subset. Its live stage controls also falsify the inherited Wave32 assumption:
+  `RSRC2_GS=0x30014`, `VGT_SHADER_STAGES_EN=0x02002000`. The selector's source pointer is
+  overwritten at pc25 after its x1 read at pc17, so that lifetime alone is not a refusal reason.
+  Evidence: #3951, #3959, #3960. The focused `memory_fed_raw_wide` controls distinguish descriptor
+  assembly from a genuine scalar data observer. Astro Bot's x2 source remains a separate case.
+
 - **Retired-write admission can retain the extra modern 1 ms grace without affecting throughput:**
   falsified by matched Performance Story text-query captures: guest/host counters fell from
   5.574/s before admission to 4.175/s with it. Completed admission waits then measured 1,672 ms

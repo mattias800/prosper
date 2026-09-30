@@ -95,8 +95,8 @@ int main(int argc, char** argv) {
           !recompile_compute(vcc.data(), vcc.size(), &vcc_table, config).empty(),
           "Wave32 VCC_HI scalar offset has real current-byte backing");
     config.wave_size = 64u;
-    CHECK(recompile_compute(vcc.data(), vcc.size(), &vcc_table, config).empty(),
-          "Wave64 VCC offset is outside this admission contract");
+    CHECK(!recompile_compute(vcc.data(), vcc.size(), &vcc_table, config).empty(),
+          "Wave64 explicitly scalar-defined VCC offset has the same real backing");
     auto compare = vcc;
     compare.insert(compare.begin() + 1, 0x7da80484u); // implicit VCC writer after scalar definition
     CHECK(proof(compare).empty() && !table_for(compare).by_fetch_pc(2),

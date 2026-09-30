@@ -549,6 +549,22 @@ inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource)
                               resource.host_data_size == 0u);
 }
 
+// The immediate x1 source of a fold-proven wide offset owns the four bytes observed during
+// realization. Code-side provenance identifies its PC; replay must supply a complete hosted word
+// at that PC instead of borrowing current guest memory or a legacy binding-2 buffer.
+inline bool valid_raw_offset_scalar_snapshot_resource(const ShaderResource& resource) {
+    return resource.cls == ResourceClass::ConstantBuffer &&
+        resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
+        resource.size == sizeof(uint32_t) && resource.stride == 0u &&
+        resource.fetch_pc != UINT32_MAX && resource.srt_offset == UINT32_MAX &&
+        resource.sgpr_base == UINT32_MAX && resource.table_index_count == 0u &&
+        resource.scalar_buffer_dword_count == 0u && !resource.nested_raw_snapshot_admitted &&
+        !resource.raw_register_snapshot && resource.gpu_addr > 0x10000u &&
+        (resource.gpu_addr & 3u) == 0u &&
+        resource.gpu_addr <= UINT64_MAX - sizeof(uint32_t) && resource.host_data &&
+        resource.host_data_size >= sizeof(uint32_t) && resource.host_data_prefix_bytes == 0u;
+}
+
 // Decode the exact SQ_IMG_SAMP state consumed by one MIMG instruction. Metadata describes a
 // texture's usual paired sampler, but shaders may load or patch a different S# before the sample.
 // In that case instruction-time descriptor folding is authoritative.

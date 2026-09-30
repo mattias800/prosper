@@ -959,7 +959,7 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         result->raw_immediate_wide_data_load_pcs =
             rdna2_proven_raw_immediate_wide_data_loads(decoded);
         result->raw_register_wide_data_load_pcs =
-            rdna2_proven_raw_register_wide_data_loads(decoded);
+            rdna2_proven_raw_register_wide_data_loads(decoded, &result->raw_offset_scalar_source_pcs);
         result->raw_nested_wide_data_load_pcs =
             rdna2_proven_raw_nested_wide_data_loads(decoded);
         retain_fold_instructions(decoded, result->instructions);
@@ -984,6 +984,7 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                         (result->raw_x2_data_load_pcs.capacity() +
                          result->raw_immediate_wide_data_load_pcs.capacity() +
                          result->raw_register_wide_data_load_pcs.capacity() +
+                         result->raw_offset_scalar_source_pcs.capacity() +
                          result->raw_nested_wide_data_load_pcs.capacity()) * sizeof(uint32_t);
         return result;
     };
@@ -1340,6 +1341,10 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         }
     }
     if (resources) {
+        // Resolve the source-PC proof lazily: ordinary resources do not need another cached
+        // decode lookup. Only a complete hosted x1 candidate can be admitted; every malformed
+        // form stays in the rejected partition, distinct from a previously admitted module.
+        std::shared_ptr<const DecodedShader> scalar_source_proof;
         key.resources.reserve(resources->resources.size());
         for (const auto& resource : resources->resources) {
             const bool texture = resource.cls == ResourceClass::Texture;
@@ -1401,6 +1406,15 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                 resource.host_data_size >= resource.size ? resource.size : 0u;
             compiled.raw_register_snapshot_bytes = !resource.raw_register_snapshot ? 0u :
                 valid_raw_register_snapshot_resource(resource) ? resource.size : UINT32_MAX;
+            if (valid_raw_offset_scalar_snapshot_resource(resource)) {
+                if (!scalar_source_proof && key.code && !key.code->empty())
+                    scalar_source_proof = decode_shader_cached(key.code->data(), key.code->size());
+                if (scalar_source_proof &&
+                    std::binary_search(scalar_source_proof->raw_offset_scalar_source_pcs.begin(),
+                                       scalar_source_proof->raw_offset_scalar_source_pcs.end(),
+                                       resource.fetch_pc))
+                    compiled.raw_offset_scalar_snapshot_bytes = sizeof(uint32_t);
+            }
             compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
             compiled.table_index_count = resource.table_index_count;
             compiled.table_entry_stride = resource.table_entry_stride;
@@ -4620,7 +4634,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     ((n == 4 || n == 8) && std::binary_search(
                         decoded->raw_nested_wide_data_load_pcs.begin(),
                         decoded->raw_nested_wide_data_load_pcs.end(), in.pc));
-                if (srt_uses && !is_buffer && raw_scalar_data &&
+                const bool latched_offset_source = !is_buffer && n == 1u &&
+                    soff_field == 125u && in.literal == 0u &&
+                    std::binary_search(decoded->raw_offset_scalar_source_pcs.begin(),
+                                       decoded->raw_offset_scalar_source_pcs.end(), in.pc);
+                if (srt_uses && !is_buffer && raw_scalar_data && !latched_offset_source &&
                     valid_reg(sbase) && valid_reg(sbase + 1) &&
                     val_known.test((size_t)sbase) && val_known.test((size_t)(sbase + 1))) {
                     const uint64_t ptr = (uint64_t)val[(size_t)sbase] |
@@ -4954,7 +4972,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 std::array<uint32_t, 16> bounded_scalar_words{};
                 FoldWords mem(reader, in.pc, addr);
-                if (is_buffer && scalar_in_range_dwords < n)
+                if (latched_offset_source || (is_buffer && scalar_in_range_dwords < n))
                     mem.snapshot_prefix(bounded_scalar_words.data(),
                                         scalar_in_range_dwords * sizeof(uint32_t));
                 const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
@@ -4980,6 +4998,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         bvh_build_origin[(size_t)(sbase + 1)])
                     bvh_count_origin = bvh_build_origin[(size_t)sbase];
                 for (uint32_t k = 0; k < n; k++) set_value(sdst + (int)k, mem[k]);
+                if (srt_uses && latched_offset_source) {
+                    SrtUse source;
+                    source.kind = 5;
+                    source.key = UINT32_MAX;
+                    source.v4 = {static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u),
+                                 bounded_scalar_words[0], 0u};
+                    source.required_size = sizeof(uint32_t);
+                    source.use_pc = in.pc;
+                    srt_uses->push_back(source);
+                }
                 if (bvh_count_origin) {
                     mark_bvh_build(sdst, bvh_count_origin, BvhBuildRole::CountLo);
                     mark_bvh_build(sdst + 1, bvh_count_origin, BvhBuildRole::CountHi);
@@ -6132,6 +6160,39 @@ static std::optional<ShaderResource> raw_register_snapshot_resource(
     return result;
 }
 
+// A memory-fed register offset must use the exact x1 word observed by the fold. Re-reading
+// the guest pointer during upload could select one wide range on the CPU and another on the
+// GPU. The proof authenticates this immediate-zero x1 read point; the table owns its four bytes.
+static void add_raw_offset_scalar_snapshot(ShaderResourceTable& table, const SrtUse& use,
+                                           const uint32_t* code, size_t dwords) {
+    if (use.kind != 5 || use.key != UINT32_MAX || use.use_pc >= dwords ||
+        use.required_size != sizeof(uint32_t) || use.v4[3] ||
+        use.scalar_buffer_dword_count || use.zero_record_raw || use.table_record_count ||
+        use.instruction_format != UINT32_MAX)
+        return;
+    const auto decoded = decode_shader_cached(code, dwords);
+    if (!std::binary_search(decoded->raw_offset_scalar_source_pcs.begin(),
+                           decoded->raw_offset_scalar_source_pcs.end(), use.use_pc))
+        return;
+    const uint64_t address = static_cast<uint64_t>(use.v4[0]) |
+                             (static_cast<uint64_t>(use.v4[1]) << 32u);
+    if (address <= 0x10000u || (address & 3u) || address > UINT64_MAX - sizeof(uint32_t))
+        return;
+    auto bytes = std::make_shared<std::vector<uint8_t>>(sizeof(uint32_t));
+    std::memcpy(bytes->data(), &use.v4[2], sizeof(uint32_t));
+    ShaderResource resource;
+    resource.cls = ResourceClass::ConstantBuffer;
+    resource.format = DataFormat::Uint32;
+    resource.num_components = 1;
+    resource.gpu_addr = address;
+    resource.size = sizeof(uint32_t);
+    resource.fetch_pc = use.use_pc;
+    resource.host_data = bytes->data();
+    resource.host_data_size = bytes->size();
+    table.owned_host_data.push_back(std::move(bytes));
+    table.resources.push_back(resource);
+}
+
 bool shader_resource_allows_zero_mip_specialization(
     const SrtUse& use, const DecodedImageDescriptor& descriptor,
     const DecodedImageView& view) {
@@ -6295,6 +6356,10 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
 
     std::set<uint64_t> seen;
     for (const auto& u : srt_uses) {
+        if (u.kind == 5) {
+            add_raw_offset_scalar_snapshot(table, u, code, dwords);
+            continue;
+        }
         if (u.kind == 4) {
             if (auto snapshot = raw_register_snapshot_resource(u, code, dwords))
                 table.resources.push_back(*snapshot);
@@ -7581,6 +7646,12 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                 bool clash = exact_mtbuf || u.key == 0xFFFFFFFFu;
                 if (!clash)
                     for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
+                if (u.kind == 5) {
+                    add_raw_offset_scalar_snapshot(t, u,
+                        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                        shader_dwords);
+                    continue;
+                }
                 if (u.kind == 4) {
                     if (auto snapshot = raw_register_snapshot_resource(u,
                             reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),

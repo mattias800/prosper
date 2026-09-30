@@ -356,6 +356,32 @@ int main(int argc, char** argv) {
       table.resources.push_back(source);
       dump(dir, "raw_register_wide_data", recompile_valu(c, std::size(c), 1, 0, &table),
            "recompile_valu"); }
+    { const uint32_t c[] = {0xf4000101u, 0xfa000000u, 0xbe820380u, 0xbe830380u,
+                           0x8f6b8404u, 0x876bff6bu, 0x000001f0u,
+                           0xf4080200u, 0xd6000000u, 0x7e000c0bu, 0xbf810000u};
+      ShaderResourceTable table;
+      ShaderResource scalar;
+      scalar.cls = ResourceClass::ConstantBuffer;
+      scalar.format = DataFormat::Uint32;
+      scalar.num_components = 1u;
+      scalar.binding = 2u;
+      scalar.size = 4u;
+      scalar.fetch_pc = 0u;
+      uint32_t selector = 2u;
+      scalar.gpu_addr = 0x20000u;
+      scalar.host_data = reinterpret_cast<uint8_t*>(&selector);
+      scalar.host_data_size = sizeof(selector);
+      table.resources.push_back(scalar);
+      ShaderResource wide = scalar;
+      wide.binding = 3u;
+      wide.size = 16u;
+      wide.fetch_pc = 7u;
+      wide.raw_register_snapshot = true;
+      wide.host_data = nullptr;
+      wide.host_data_size = 0u;
+      table.resources.push_back(wide);
+      dump(dir, "memory_fed_raw_wide", recompile_valu(c, std::size(c), 1u, 0u, &table),
+           "recompile_valu"); }
     { const uint32_t c[] = {0x06000300u, 0x10000500u, 0xBF810000u};
       dump(dir, "compute_alu", recompile_valu(c, 3, 3, 0), "recompile_valu"); }
     // GTA V's exact literal-bearing V_ALIGNBYTE_B32 packet.  Strict validation guards the
