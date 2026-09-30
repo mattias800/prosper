@@ -1,4 +1,5 @@
 #include "diagnostics/perf/perf_alarm_rules.hpp"
+#include "diagnostics/perf/wave64_refusal.hpp"
 
 #include <algorithm>
 #include <cstdarg>
@@ -108,12 +109,19 @@ const std::vector<const char*>& rule_names() {
         "gpu-present-stalled",
         "gpu-device-time-coverage",
         "rtt-colorless-publication",
+        "unsupported-wave64-shaders",
     };
     return names;
 }
 
 bool rule_has_data(const char* rule, const WindowSample& w) {
     const std::string r = rule ? rule : "";
+    if (r == "unsupported-wave64-shaders") {
+        if (w.count(Counter::Wave64ShaderChecks)) return true;
+        for (Counter counter : kWave64RefusalCounters)
+            if (w.count(counter)) return true;
+        return false;
+    }
     if (r == "present-cpu-overhead") return w.events(Cost::PresentCpu) != 0;
     if (r == "texture-reference-cost") return w.events(Cost::TextureRefSample) != 0;
     // Presents of either kind: a frontend without GPU present has no data for this rule.
@@ -151,7 +159,7 @@ uint32_t sustain_windows(const char* rule) {
     if (r == "rtt-colorless-publication") return kRttColorlessPublicationSustainWindows;
     if (r == "dropped-draws" || r == "skipped-dispatches" || r == "gpu-memory-off-device" ||
         r == "unaccounted-draws" || r == "unimplemented-hle-calls" ||
-        r == "diagnostic-path-active")
+        r == "diagnostic-path-active" || r == "unsupported-wave64-shaders")
         return kCorrectnessSustainWindows;
     if (r == "shader-compile") return kShaderCompileSustainWindows;
     if (r == "texture-reference-cost") return kTextureReferenceSustainWindows;
@@ -387,6 +395,38 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                      "for contract-mismatch, PROSPER_DESCRIPTOR_VALIDATE; for shader-recompile/*, "
                      "PROSPER_DBG=1 [recompile-reject]/[vertex-recompile-reject] lines name the "
                      "program and pc; cf. #3889, #3951";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // Proven Wave64 failures on EVERY platform, including translation refusals on native-Wave64
+    // devices. Counts are shader uses, not distinct shaders and not exclusively width failures.
+    {
+        const uint64_t counts[] = {
+            w.count(Counter::Wave64FragmentRecompile), w.count(Counter::Wave64ComputeRecompile),
+            w.count(Counter::Wave64FragmentSubgroup), w.count(Counter::Wave64ComputeSubgroup)};
+        uint64_t total = 0;
+        for (uint64_t count : counts) total += count;
+        if (total >= kUnsupportedWave64UsesPerWindow) {
+            AlarmFiring a;
+            a.rule = "unsupported-wave64-shaders";
+            a.value = static_cast<double>(total);
+            a.unit = "refused-shader-uses";
+            a.threshold = kUnsupportedWave64UsesPerWindow;
+            a.breakdown = ranked(counts, kWave64RefusalNames, kWave64RefusalCount);
+            a.detail = format("uses=%llu new-refusal-identities=%llu unidentified-uses=%llu "
+                              "inventory-overflow-uses=%llu reasons=%s",
+                              (unsigned long long)total,
+                              (unsigned long long)w.count(Counter::Wave64NewRefusalIdentities),
+                              (unsigned long long)w.count(Counter::Wave64UnidentifiedRefusals),
+                              (unsigned long long)w.count(Counter::Wave64InventoryOverflow),
+                              top_entries(a.breakdown, 4).c_str());
+            a.hint = "Wave64 shader work was refused: native Wave64 support does not guarantee "
+                     "translation or backend support. Default-on [wave64-unsupported] lines name "
+                     "stage/program/refusal; subgroup-contract failures also name host sizes and "
+                     "wave reason bits. Counts are repeated shader uses, not unique shaders. "
+                     "Known guest widths only; unplumbed vertex wave width is not guessed. "
+                     "Supported native or faithful lowered uses do not count; cf. #3992";
             out.push_back(std::move(a));
         }
     }

@@ -24,6 +24,7 @@
 #include "gpu/diagnostics/draw_disposition.hpp"  // why a draw did not reach the GPU
 #include "diagnostics/readback_reason_census.hpp"  // why a colour target is copied back
 #include "diagnostics/perf/perf_ledger.hpp"         // #3891: always-on alarm ledger
+#include "diagnostics/perf/wave64_refusal.hpp"
 #include "diagnostics/exit_census.hpp"       // one-line end-of-run reports
 #include "diagnostics/persistent_target_census.hpp"  // is the colour-target cache at its bound?
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
@@ -703,6 +704,7 @@ struct BackendDraw {
     std::array<uint32_t, 3> mesh_groups{1, 1, 1};
     prosper::gpu::SharedShaderWords vs_shared, fs_shared;
     uint64_t vs_identity = 0, fs_identity = 0;
+    uint64_t fs_guest_addr = 0; // diagnostic provenance only; zero for direct/override callers
     // Whether the backend may run a WaveAny-only fragment program at the host's native wave width.
     //
     // Set by the live renderer from a TITLE allowlist (live_renderer.cpp). Tests and gpu_replay call
@@ -11025,6 +11027,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
         };
 
+        prosper::diagnostics::perf::observe_wave64_shader(required_fragment_subgroup_size, false);
         if (fragment_subgroup_skip &&
             (bd.allow_native_fragment_vote_width || bd.allow_partial_wave_fragment) &&
             (ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
@@ -11095,6 +11098,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
         }
         if (fragment_subgroup_skip) {
+            prosper::diagnostics::perf::note_unsupported_wave64(
+                prosper::diagnostics::perf::Wave64Refusal::FragmentSubgroup,
+                required_fragment_subgroup_size, bd.fs_guest_addr,
+                bd.fs_identity ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size()),
+                prosper::gpu::fragment_spirv_required_subgroup_reasons(bd_fs),
+                ctx.min_subgroup_size, ctx.max_subgroup_size);
             const uint64_t shader_key = bd.fs_identity
                 ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
             static std::mutex log_mutex;

@@ -21,6 +21,9 @@
 //     line's `reasons=` names the top sites, the JSONL alarm record has a `breakdown` object, every
 //     JSONL window has `drop_reasons` / `dispatch_skips` / `host_copy_mib_by_site`, and the exit
 //     summary adds the breakdown summed over every window the rule fired in.
+//   * unsupported-wave64-shaders reports known Wave64 fragment/compute translation and subgroup
+//     refusals on every platform. Default-on [wave64-unsupported] lines identify failed work;
+//     wave64_refusals in JSONL counts repeated uses, separately from bounded new refusal identities.
 //   * at exit, also one census line (not a rule): the first failing field of the exact
 //     full-overwrite shape test over every tested compute result, and the destination refusals of
 //     the results that passed it -- printed only when a compute result was ever tested.

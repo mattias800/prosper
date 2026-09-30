@@ -8,6 +8,7 @@
 // device (the app/HLE, or tests via render_runner.h). agc_driver_submit_dcb calls this with the live
 // renderer once the device is wired; tests call it with the offscreen renderer to verify the spine.
 #pragma once
+#include "diagnostics/perf/wave64_refusal.hpp"
 #include <map>
 #include <atomic>
 #include <string>
@@ -2416,6 +2417,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     const std::vector<uint32_t>& vs_words = vs_shared ? *vs_shared : vs;
     const std::vector<uint32_t>& fs_words = fs_shared ? *fs_shared : fs;
+    if (rs.ps_addr)
+        prosper::diagnostics::perf::observe_wave64_shader(rs.ps_wave32 ? 32u : 64u, false);
     std::vector<uint32_t> gs;
     if ((interpolation.requires_geometry || rect_list_synthesis) && interpolation.valid) {
         // Geometry `Triangles` accepts list, strip, and fan input assembly. Points/lines cannot
@@ -2479,6 +2482,12 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             vs_words.empty()   ? prosper::diagnostics::perf::DropReason::ShaderRecompileVertex
             : fs_words.empty() ? prosper::diagnostics::perf::DropReason::ShaderRecompileFragment
                                : prosper::diagnostics::perf::DropReason::ShaderRecompileGeometry);
+        // The guest PS launch carries its width. Vertex launch width is not independently
+        // plumbed yet: do not infer Wave64 from the vertex translator's default Builder width.
+        if (fs_words.empty() && rs.ps_addr)
+            prosper::diagnostics::perf::note_unsupported_wave64(
+                prosper::diagnostics::perf::Wave64Refusal::FragmentRecompile,
+                rs.ps_wave32 ? 32u : 64u, rs.ps_addr, fs_identity);
         if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
         // PROSPER_DYNTRACE_FAIL=1: replay the FAILED vertex stage's resource build with the
         // dynamic-fetch walk trace + user-data block dump forced on (once per distinct VS), so the
