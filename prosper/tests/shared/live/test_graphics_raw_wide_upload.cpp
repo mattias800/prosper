@@ -252,10 +252,26 @@ int main(int argc, char** argv) {
                     d.required_bytes >= raw->size; });
             check(report.ok() && reflected != report.descriptors.end(), arm,
                   "actual stage module reflects the real exact-PC numeric buffer binding");
+            std::array<uint8_t, 32> captured{};
+            std::memcpy(captured.data(), reinterpret_cast<const void*>(raw->gpu_addr), raw->size);
+            auto hosted_table = std::make_shared<ShaderResourceTable>(*table);
+            auto hosted_source = std::find_if(hosted_table->resources.begin(),
+                hosted_table->resources.end(), [&](const auto& r) {
+                    return r.fetch_pc == program.load_pc;
+                });
+            hosted_source->host_data = captured.data();
+            hosted_source->host_data_size = count * sizeof(uint32_t);
+            hosted_source->host_data_prefix_bytes = 48u;
+            DrawItem hosted = draw;
+            if (vertex) hosted.vrt = hosted_table;
+            else hosted.prt = hosted_table;
+            check(valid_raw_register_snapshot_resource(*hosted_source), arm,
+                  "a prefixed replay view keeps its exact rebased owned source valid");
             observe_pixels(draw, vertex, first, arm);
             data[8u + count - 1u] = std::bit_cast<uint32_t>(second);
             notify_guest_gpu_write(guest + 32u, count * sizeof(uint32_t));
             observe_pixels(draw, vertex, second, arm);
+            observe_pixels(hosted, vertex, first, arm);
             const uint32_t ud = vertex ? P::SPI_SHADER_USER_DATA_GS_0 : P::SPI_SHADER_USER_DATA_PS_0;
             state.sh[ud + 2u] = 3u;
             DrawItem shifted;
