@@ -577,11 +577,6 @@ extern "C" int prosper_thread_in_renderer_callback(unsigned long native_tid) {
     return prosper::frontend::tid_is_in_renderer_callback(native_tid) ? 1 : 0;
 }
 
-namespace submit_renderer {
-
-
-} // namespace submit_renderer
-
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested,
                             const std::string& title_id) {
     // Keep the legacy global disable authoritative for every frontend, including callers with their
