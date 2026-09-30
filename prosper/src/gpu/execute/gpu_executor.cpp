@@ -8987,7 +8987,11 @@ std::vector<ComputeItem> realize_compute_dispatches(
         item.dispatch_index = dispatch_index;
         item.submit_no = submit_no;
         item.command_order = dispatch.command_order;
+        prosper::diagnostics::perf::observe_wave64_shader(config.wave_size, true);
         if (item.spirv.empty()) {
+            prosper::diagnostics::perf::note_unsupported_wave64(
+                prosper::diagnostics::perf::Wave64Refusal::ComputeRecompile,
+                config.wave_size, code_addr);
             log_compute_dispatch(code_addr, submit_no, dispatch_index, dispatch.command_order,
                                  "recompile-empty");
             record_failure(RealizationFailureReason::ShaderRecompile, item.resources, item.spirv,

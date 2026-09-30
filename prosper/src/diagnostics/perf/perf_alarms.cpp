@@ -1,4 +1,5 @@
 #include "diagnostics/perf/perf_alarms.hpp"
+#include "diagnostics/perf/wave64_refusal.hpp"
 
 #include "diagnostics/env_numeric.hpp"
 #include "diagnostics/exit_reports.hpp"
@@ -308,6 +309,19 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
         json_counts(jsonl_, ranked(w.drop_reasons, kDropReasonNames, kDropReasonCount));
         std::fputs(",\"dispatch_skips\":", jsonl_);
         json_counts(jsonl_, ranked(w.dispatch_skips, kDispatchSkipNames, kDispatchSkipCount));
+        {
+            uint64_t counts[kWave64RefusalCount];
+            for (size_t i = 0; i < kWave64RefusalCount; ++i)
+                counts[i] = w.count(kWave64RefusalCounters[i]);
+            std::fputs(",\"wave64_refusals\":", jsonl_);
+            json_counts(jsonl_, ranked(counts, kWave64RefusalNames, kWave64RefusalCount));
+            std::fprintf(jsonl_, ",\"wave64_new_refusal_identities\":%llu,"
+                         "\"wave64_unidentified_uses\":%llu,\"wave64_inventory_overflow_uses\":%llu,"
+                         "\"wave64_shader_checks\":%llu",
+                         n(Counter::Wave64NewRefusalIdentities),
+                         n(Counter::Wave64UnidentifiedRefusals), n(Counter::Wave64InventoryOverflow),
+                         n(Counter::Wave64ShaderChecks));
+        }
         {
             const char* names[kGpuMemoryClassSlots];
             for (size_t i = 0; i < kGpuMemoryClassSlots; ++i)

@@ -209,6 +209,7 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
         }
         bd.vs_identity = refvs ? 0 : it.vs_identity;
         bd.fs_identity = fs_ov ? 0 : it.fs_identity;
+        bd.fs_guest_addr = fs_ov ? 0 : it.fs_guest_addr;
         bd.allow_native_fragment_vote_width =
             !fs_ov && native_fragment_vote_width;
         bd.allow_partial_wave_fragment = !fs_ov && partial_wave_fragment;

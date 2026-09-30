@@ -14,6 +14,7 @@
 #include "diagnostics/perf/perf_alarm_rules.hpp"
 #include "diagnostics/perf/perf_alarms.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"
+#include "diagnostics/perf/wave64_refusal.hpp"
 #include "diagnostics/transfer_pressure.hpp"
 #include "gpu/diagnostics/draw_disposition.hpp"
 #include "hle/dispatch/dispatch.hpp"
@@ -1152,11 +1153,12 @@ void test_engine() {
     const std::string quiet = slurp(logp);
     check("...saying no rule fired", quiet.find("no rule fired in 1 windows") != std::string::npos);
     check("...and listing the rules that had no data as NOT quiet",
-          quiet.find("15 of 24 rules had data") != std::string::npos &&
+          quiet.find("15 of 25 rules had data") != std::string::npos &&
               quiet.find("NO DATA (not measured in any window, so not quiet): "
                          "texture-reference-cost,present-cpu-overhead,present-path-fallback,"
                          "present-slot-trouble,color-target-count-ceiling,gpu-sync-wait,"
-                         "gpu-present-stalled,gpu-device-time-coverage,rtt-colorless-publication") != std::string::npos);
+                         "gpu-present-stalled,gpu-device-time-coverage,rtt-colorless-publication,"
+                         "unsupported-wave64-shaders") != std::string::npos);
     std::fclose(s);
     std::remove(jsonl.c_str());
     std::remove(logp.c_str());
@@ -1793,9 +1795,123 @@ void test_rtt_colorless_publication() {
               fired(evaluate_rules(w, RuleThresholds{}), "rtt-colorless-publication"));
 }
 
+void test_unsupported_wave64() {
+    std::puts("unsupported Wave64 shaders (all platforms)");
+    check("supported native/lowered work is quiet",
+          !fired(evaluate_rules(healthy(), kDefault), "unsupported-wave64-shaders"));
+    check("absence of a known Wave64 observation is NO DATA, not a healthy shader claim",
+          !rule_has_data("unsupported-wave64-shaders", healthy()));
+    auto observed = healthy();
+    set_count(observed, Counter::Wave64ShaderChecks, 1);
+    check("known supported Wave64 work is observed and quiet",
+          rule_has_data("unsupported-wave64-shaders", observed) &&
+              !fired(evaluate_rules(observed, kDefault), "unsupported-wave64-shaders"));
+    for (Counter counter : kWave64RefusalCounters) {
+        auto w = healthy();
+        set_count(w, counter, 1);
+        const auto alarms = evaluate_rules(w, RuleThresholds::scaled(1000));
+        check("every translation/capability site fires at one use, without a host-width gate",
+              only(alarms, "unsupported-wave64-shaders") &&
+                  alarms[0].value == 1 && alarms[0].unit == std::string("refused-shader-uses"));
+        EngineConfig config;
+        config.log = nullptr;
+        AlarmEngine engine(std::move(config));
+        check("the correctness rule reports in its first window",
+              only(engine.close_window(w, 5), "unsupported-wave64-shaders"));
+        check("a healthy following window clears the active alarm",
+              engine.close_window(healthy(), 10).empty());
+    }
+    Wave64RefusalInventory<2> inventory;
+    using Observation = Wave64RefusalInventory<2>::Observation;
+    check("inventory retains identity domains and repeats without counting another shader",
+          inventory.observe(Wave64Refusal::FragmentRecompile, 10, 20) == Observation::New &&
+              inventory.observe(Wave64Refusal::FragmentRecompile, 11, 20) == Observation::Known &&
+              inventory.observe(Wave64Refusal::FragmentRecompile, 20, 0) == Observation::New);
+    check("unknown identities and a full inventory are explicit, existing identities survive",
+          inventory.observe(Wave64Refusal::ComputeRecompile, 0, 0) == Observation::Unidentified &&
+              inventory.observe(Wave64Refusal::ComputeRecompile, 30, 0) == Observation::Full &&
+              inventory.observe(Wave64Refusal::FragmentRecompile, 10, 20) == Observation::Known);
+    auto& l = ledger();
+    const auto count = [&](Counter counter) { return l.counters[static_cast<size_t>(counter)].load(); };
+    const uint64_t checks = count(Counter::Wave64ShaderChecks);
+    observe_wave64_shader(32, false);
+    observe_wave64_shader(0, true);
+    {
+        const SuppressDrawDropCounting capture;
+        observe_wave64_shader(64, false);
+    }
+    {
+        const SuppressDispatchSkipCounting capture;
+        observe_wave64_shader(64, true);
+    }
+    check("observation hooks exclude unknown widths, Wave32 and capture re-analysis",
+          count(Counter::Wave64ShaderChecks) == checks);
+    observe_wave64_shader(64, false);
+    observe_wave64_shader(64, true);
+    check("known Wave64 observation hooks provide data without a refusal",
+          count(Counter::Wave64ShaderChecks) == checks + 2);
+    const uint64_t before = count(Counter::Wave64FragmentRecompile);
+    const uint64_t identities = count(Counter::Wave64NewRefusalIdentities);
+    note_unsupported_wave64(Wave64Refusal::FragmentRecompile, 32, 0x39920001);
+    note_unsupported_wave64(Wave64Refusal::FragmentRecompile, 0, 0x39920001);
+    {
+        const SuppressDrawDropCounting capture;
+        note_unsupported_wave64(Wave64Refusal::FragmentRecompile, 64, 0x39920001);
+    }
+    check("Wave32, unknown width and draw re-realization do not create Wave64 refusals",
+          count(Counter::Wave64FragmentRecompile) == before &&
+              count(Counter::Wave64NewRefusalIdentities) == identities);
+    note_unsupported_wave64(Wave64Refusal::FragmentRecompile, 64, 0x39920001);
+    note_unsupported_wave64(Wave64Refusal::FragmentRecompile, 64, 0x39920001);
+    check("refused uses stay complete while identity announcements deduplicate",
+          count(Counter::Wave64FragmentRecompile) == before + 2 &&
+              count(Counter::Wave64NewRefusalIdentities) == identities + 1);
+    const uint64_t compute_before = count(Counter::Wave64ComputeRecompile);
+    {
+        const SuppressDispatchSkipCounting capture;
+        note_unsupported_wave64(Wave64Refusal::ComputeRecompile, 64, 0x39920002);
+    }
+    check("compute re-realization does not create a refusal",
+          count(Counter::Wave64ComputeRecompile) == compute_before);
+    note_unsupported_wave64(Wave64Refusal::ComputeRecompile, 64, 0);
+    check("unidentified Wave64 uses are counted rather than silently lost",
+          count(Counter::Wave64ComputeRecompile) == compute_before + 1 &&
+              count(Counter::Wave64UnidentifiedRefusals) != 0);
+}
+
+void test_wave64_engine_json() {
+    const std::string path = "test_wave64_" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()) + ".jsonl";
+    {
+        EngineConfig config;
+        config.jsonl_path = path;
+        config.log = nullptr;
+        config.window_ns = 1'000'000'000ull;
+        AlarmEngine engine(std::move(config));
+        Ledger l;
+        engine.on_flip(1'000'000'000ull, l, 60);
+        l.counters[static_cast<size_t>(Counter::Wave64FragmentSubgroup)] += 3;
+        l.counters[static_cast<size_t>(Counter::Wave64NewRefusalIdentities)] += 1;
+        const auto alarms = engine.on_flip(2'000'000'001ull, l, 60);
+        check("real ledger deltas reach the dedicated engine rule",
+              only(alarms, "unsupported-wave64-shaders") && alarms[0].value == 3);
+        check("the next window does not reuse lifetime refusal totals",
+              engine.on_flip(3'000'000'002ull, l, 60).empty());
+    }
+    const std::string json = slurp(path);
+    check("JSONL includes the site breakdown and identity counters, including quiet zeros",
+          json.find("\"wave64_refusals\":{\"fragment/subgroup-contract\":3}") != std::string::npos &&
+              json.find("\"wave64_new_refusal_identities\":1") != std::string::npos &&
+              json.find("\"wave64_refusals\":{}") != std::string::npos &&
+              json.find("\"wave64_inventory_overflow_uses\":0") != std::string::npos);
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
+    test_unsupported_wave64();
+    test_wave64_engine_json();
     test_quiet_baseline();
     test_texture_cache_thrash();
     test_surface_readback();
@@ -1837,8 +1953,9 @@ int main() {
           "gpu-memory-off-device (#3897), the six 2026-09-28 queue rules and the two "
           "2026-09-29 ones (host-copy-per-flip, present-slot-trouble, rtt-destination-refused, "
           "color-target-count-ceiling), gpu-sync-wait (#3948), gpu-present-stalled (#3951) "
-          "gpu-device-time-coverage and rtt-colorless-publication (#3891)",
-          rule_names().size() == 24);
+          "gpu-device-time-coverage and rtt-colorless-publication (#3891), "
+          "and unsupported-wave64-shaders (#3992)",
+          rule_names().size() == 25);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ok", g_failures);
     return g_failures ? 1 : 0;
 }

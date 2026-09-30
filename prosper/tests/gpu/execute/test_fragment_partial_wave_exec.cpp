@@ -132,14 +132,23 @@ int main() {
                 ctx.max_subgroup_size, native64 ? 1 : 0);
 
     constexpr uint32_t W = 64, H = 64;
+    using namespace prosper::diagnostics::perf;
+    const auto refused = [] {
+        return ledger().counters[static_cast<size_t>(Counter::Wave64FragmentSubgroup)].load();
+    };
+    const uint64_t before_strict = refused();
     // Fail-visible without the tier: a host that cannot supply 64 lanes must still refuse the draw.
     const std::vector<uint8_t> strict = render(vs, fs, false, W, H);
+    check(refused() == before_strict + (native64 ? 0u : 1u),
+          "only an actually refused Wave64 draw feeds the default alarm");
     check(strict.size() == W * H * 4, "strict arm rendered a target");
     if (!native64 && strict.size() == W * H * 4)
         check(is_blue_clear(&strict[(H / 2 * W + W / 2) * 4]),
               "without the tier a narrow host still skips the Wave64 draw fail-visible");
 
     const std::vector<uint8_t> px = render(vs, fs, true, W, H);
+    check(refused() == before_strict + (native64 ? 0u : 1u),
+          "faithful partial-wave admission does not feed the unsupported alarm");
     check(px.size() == W * H * 4, "partial-wave arm rendered a target");
     if (px.size() != W * H * 4) return 1;
 

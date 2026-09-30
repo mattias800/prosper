@@ -127,6 +127,15 @@ enum class Counter : uint8_t {
     GpuGraphicsDeferredBlocked,
     CpuRttPublicationChecks,     // evaluated slot-0 CPU pass-readback publication candidates
     CpuRttColorlessPublications, // actual publications with no slot-0 colour writer (#3907)
+    // Proven guest Wave64 refusals, counted per shader USE, not per distinct shader (#3992).
+    Wave64FragmentRecompile,
+    Wave64ComputeRecompile,
+    Wave64FragmentSubgroup,
+    Wave64ComputeSubgroup,
+    Wave64NewRefusalIdentities, // newly observed (site, compile identity), bounded inventory
+    Wave64UnidentifiedRefusals, // uses with neither a compile identity nor a program address
+    Wave64InventoryOverflow,   // uses whose identity could not enter the full inventory
+    Wave64ShaderChecks,        // known-Wave64 observations at realization/backend boundaries
     Count
 };
 
