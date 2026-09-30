@@ -2204,6 +2204,35 @@ int main(int argc, char** argv) {
                       control_second[0] > 0xC0 && control_second[1] < 0x40,
                   "both spans sample the unchanged red guest texture");
 
+            // #3892: re-register between spans on the calling thread. Use a cold guest address so
+            // the process decoded cache cannot supply the first decode. The second span must still
+            // observe the retained TLS identity; stable pixels alone would hide a cleared TLS map.
+            const uint64_t registration_texture = guest_base + 0xa000;
+            std::memcpy(guest + 0xa000, red_2x2.data(), red_2x2.size());
+            LiveComputeFn register_between_spans = [&](const std::vector<ComputeItem>&) {
+                prosper::frontend::register_live_renderer(".", false);
+                return true;
+            };
+            rendered_spans = 0;
+            reset_texture_decode_scope_stats();
+            execute_ordered_items(
+                two_spans,
+                {texture_draw(registration_texture, 2, 2, 8, 0, 100),
+                 texture_draw(registration_texture, 2, 2, 8, 1, 200)},
+                dispatches, counting_render, register_between_spans, W, H);
+            const auto registration_reuse = texture_decode_scope_stats();
+            CHECK(rendered_spans == 2 && registration_reuse.decodes == 1 &&
+                      registration_reuse.cross_span_reuses == 1 &&
+                      registration_reuse.invalidations == 0,
+                  "re-registration on the calling thread retains the cross-span decoded identity");
+            std::vector<uint8_t> registration_a, registration_b;
+            const uint8_t* registration_first = target_center(span_targets[0], registration_a);
+            const uint8_t* registration_second = target_center(span_targets[1], registration_b);
+            CHECK(registration_first && registration_second &&
+                      registration_first[0] > 0xC0 && registration_first[1] < 0x40 &&
+                      registration_second[0] > 0xC0 && registration_second[1] < 0x40,
+                  "re-registration preserves both spans' red guest-texture pixels");
+
             // (2) INVALIDATION — the same shape, except the dispatch rewrites the sampled backing
             // and reports it. Serving the retained entry here would publish pixels the guest has
             // already replaced; the second span must observe the new bytes. This assertion fails if
