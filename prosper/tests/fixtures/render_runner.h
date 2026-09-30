@@ -4633,8 +4633,9 @@ inline bool compute_overwrite_destination_eviction_enabled() {
     static const bool enabled = std::getenv("PROSPER_NO_COMPUTE_RTT_DEST_EVICT") == nullptr;
     return enabled;
 }
-// `allocation_failed` (optional) is set when the refusal was Vulkan's, not the cache bound's, so the
-// caller can report the two differently (destination-allocation-failed vs -creation-refused).
+// `allocation_failed` (optional) is set on a Vulkan image/allocation/binding failure. Other
+// refusals include admission checks and cache bounds, so destination-creation-refused alone
+// does not prove no room. The caller distinguishes it from destination-allocation-failed.
 inline PersistentColorTargetImage* ensure_persistent_color_target_for_compute_overwrite(
         uint64_t id, uint32_t width, uint32_t height, VkFormat format,
         bool* allocation_failed = nullptr) {

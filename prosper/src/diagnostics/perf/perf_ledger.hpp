@@ -101,10 +101,11 @@ enum class Counter : uint8_t {
     PipelineEvictions,         // graphics pipelines evicted from the full pipeline cache
     PipelineLayoutEvictions,   // pipeline layouts evicted from their full cache
     DescriptorSetLayoutEvictions,  // descriptor-set layouts evicted from their full cache
-    TextureValidationFailures,     // persistent decode-cache entries whose exact compare failed
-    TextureValidationFailedBytes,  // guest bytes those failed validations actually read (the
-                                   // compare stops at the first differing chunk, so this is the
-                                   // compare's cost, not the texture's size)
+    TextureValidationFailures,     // persistent decode-cache entries whose exact validation failed
+    TextureValidationFailedBytes,  // failed validations' route-specific prefix count: direct/depth
+                                   // comparisons count matching chunks, excluding the differing
+                                   // chunk; scratch validation counts copied readable bytes.
+                                   // Neither total compare traffic nor source mutation is proved.
     // #3891 queue (2026-09-29), all on event paths:
     RttDestinationRefusals,        // compute results whose renderer-image destination borrow was
                                    // refused, so the result went back through a CPU snapshot
@@ -290,8 +291,9 @@ constexpr size_t kPresentDeclineSlots = 24;
 // include). The recorder passes the reason's name as a string literal, stored by pointer, and
 // static_asserts that the enum fits.
 constexpr size_t kRttDestinationRefusalSlots = 24;
-// The refusal name (prosper::gpu::live_target_import_refusal_name) that means "the persistent
-// colour-target cache had no room". live_compute.cpp static_asserts the two spellings agree, so a
+// The non-Vulkan creation refusal name (prosper::gpu::live_target_import_refusal_name), covering
+// admission checks as well as cache bounds. It does not by itself prove no room.
+// live_compute.cpp static_asserts the two spellings agree, so a
 // rename on either side fails to compile instead of silently muting color-target-count-ceiling.
 constexpr const char* kDestinationCreationRefused = "destination-creation-refused";
 

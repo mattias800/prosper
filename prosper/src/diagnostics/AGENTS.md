@@ -201,11 +201,15 @@ gauge the live renderer sets once, naming the switch that turned GPU-resident co
 `present-cpu-overhead` already counts, and its `declines=` names WHY the renderer did not publish
 the front buffer (counted per final render span, so not a count of presents) (`no-render-target`, `not-gpu-resident`, `compute-scanout-stale`, ... -- the
 `GpuPresentOutcome` names in `frontends/shared/present/present_blit_policy.hpp`, #3915); `pipeline-cache-thrash` counts evictions from the pipeline,
-pipeline-layout and descriptor-set-layout caches; `texture-validation-churn` counts the guest bytes
-exact decode-cache validations that FAILED actually read (the compare stops at the first differing
-chunk, so a texture rewritten every frame is cheap and quiet; a source changing only near its end is
-what it names). Proposals needing a new expensive signal were
-declined on the issue with a reason rather than approximated.
+pipeline-layout and descriptor-set-layout caches; `texture-validation-churn` counts route-specific
+prefix bytes charged to failed exact decode-cache validations. Direct comparisons count fully
+matching chunks and omit the first differing chunk (at most 64 KiB); a first-chunk mismatch can
+therefore report zero. Depth comparisons accumulate matching guest-face prefixes, while the
+scratch-copy route counts copied readable bytes. An incomplete prefix can also fail validation,
+so the counter proves neither source mutation nor total comparison traffic. Late differences can
+still charge most of the source before a re-decode. The #3891 missing-chunk observer proposal is
+separate from this existing counter; no new observer is implied here. Proposals needing a new
+expensive signal were declined on the issue with a reason rather than approximated.
 
 **Surface readback separates attempt volume from duration** (#3891, #3948). Its detail appends
 `attempts/flip` beside the existing mean time per attempt. The outermost readback scope includes
@@ -244,6 +248,11 @@ reset at every window close) against its two bounds: at the entry-count bound, u
 budget, and either evicting or refusing a compute creation. The refusal arm is not optional: GTA V's
 pre-fix costly state sat at exactly 256 of 256 entries with zero evictions. Compute creation now
 evicts eligible idle targets (#3949), and a count-bound cache can churn without refusing it.
+`destination-creation-refused` also covers admission checks such as an unproven submission or
+partial/pinned target state. That reason alone does not prove the cache had no room; the combined
+count/byte/churn-or-refusal observation suggests count pressure without attributing every refusal
+to that bound. Eviction counts do not prove a physical readback either: valid targets need a sink
+and successful readback to publish CPU pixels; invalid targets or targets without a sink also count.
 When the rule fires on the refusal arm it
 reports `creation-refusals`, not a 0.00 evictions/s. The refusal it counts is matched by name
 (`kDestinationCreationRefused`, which `live_compute.cpp` static_asserts against
