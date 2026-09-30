@@ -2402,8 +2402,8 @@ inline bool flush_graphics_pipeline_cache(
 // entering the driver. That refusal is what lets prosper-app's drain reach zero before it _Exit()s
 // a process whose guest thread it cannot join — a thread caught inside an amdgpu submission at
 // exit_group() parks in __drm_exec_lock_obj and takes the host compositor down with it.
-// VK_ERROR_DEVICE_LOST is the honest result: the device really is going away, and every caller
-// here already treats a failed submit as "not submitted" and cleans up accordingly.
+// The gate returns the existing VK_ERROR_DEVICE_LOST failure sentinel without a driver call.
+// It does not report a Vulkan result; callers retain their existing failure/lifetime policies.
 enum class BackendQueueCallOrigin : uint8_t {
     NotAttempted,
     ShutdownGateRefused,
