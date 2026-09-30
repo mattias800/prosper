@@ -89,6 +89,12 @@ silently stops describing the tree, which is the same failure class this tool ex
     shadow and retires the name: unsure means declared. Any other forwarding (`.x = y`) retires
     the name too. A member initialised positionally, or from a non-alias
     value, is invisible.
+  - The member-name join uses a declared shared fact domain, with the original all-file table
+    retained for admitted TEST_LOCAL translation units. Every header and unannotated/refused
+    source remains shared and every file remains locally scanned and inventoried. The explicit
+    source-role contract has bounded literal safeguards, not complete build reachability
+    inference; see tools/env/MEMBER_FACT_DOMAINS.md. The reference-only/known-initializer limits
+    above apply within the selected table.
   - `#if`-gated code is scanned as if it were live.
   - A diagnostic gated by something other than an environment variable (a build flag, a member
     field, a runtime setting) is out of scope by construction.
@@ -111,6 +117,8 @@ import argparse
 import re
 import sys
 from pathlib import Path
+
+from member_fact_domains import Role, discover as discover_member_domains
 
 SCAN_DIRS = ("src", "frontends", "tools", "tests")
 SCAN_EXT = (".c", ".cc", ".cpp", ".h", ".hpp")
@@ -1703,8 +1711,14 @@ def resolve_members(member_writes: dict[str, list[frozenset]],
     return out
 
 
-def scan_tree(root: Path, follow_members: bool = True, follow_getters: bool = True):
+def scan_tree(root: Path, follow_members: bool = True, follow_getters: bool = True,
+              follow_test_domains: bool = True, domain_roles: list[Role] | None = None):
     files = collect_files(root)
+    test_local, roles = discover_member_domains(root, files, is_excluded_dir)
+    if domain_roles is not None:
+        domain_roles.extend(roles)
+    if not follow_test_domains:
+        test_local = set()  # calibrated control: original all-file member join
     preds = collect_predicates(files)
     printing = collect_printing(files)
     defined = collect_definitions(files)
@@ -1714,17 +1728,27 @@ def scan_tree(root: Path, follow_members: bool = True, follow_getters: bool = Tr
     # they are computed without those flags and would understate.
     flag_writes: dict[str, list[frozenset]] = {}
     member_writes: dict[str, list[frozenset]] = {}
+    shared_writes: dict[str, list[frozenset]] = {}
     for path, lines in files.items():
+        file_writes: dict[str, list[frozenset]] = {}
         FileScanner(str(path.relative_to(root)), lines, preds, {}, printing,
-                    None, flag_writes, None, member_writes, getters).run()
+                    None, flag_writes, None, file_writes, getters).run()
+        for name, writes in file_writes.items():
+            member_writes.setdefault(name, []).extend(writes)
+            if path not in test_local:
+                shared_writes.setdefault(name, []).extend(writes)
     flags = resolve_flags(flag_writes)
-    members = (resolve_members(member_writes, collect_member_kinds(files))
-               if follow_members else {})
+    all_members = (resolve_members(member_writes, collect_member_kinds(files))
+                   if follow_members else {})
+    shared_files = {path: lines for path, lines in files.items() if path not in test_local}
+    shared_members = (resolve_members(shared_writes, collect_member_kinds(shared_files))
+                      if follow_members and test_local else all_members)
 
     call_sites: dict[str, list[tuple[str, frozenset]]] = {}
     findings: list[Finding] = []
     for path, lines in files.items():
         rel = str(path.relative_to(root))
+        members = all_members if path in test_local else shared_members
         findings += FileScanner(rel, lines, preds, call_sites, printing, flags, None,
                                 members, None, getters).run()
     findings += split_call_findings(call_sites, defined)
@@ -2379,7 +2403,9 @@ def run_key_stability_test(verbose: bool = False) -> int:
     # cannot fix.
     import os
     import subprocess
-    probe = ("import importlib.util, sys; spec = importlib.util.spec_from_file_location('g', sys.argv[1]); "
+    probe = ("import importlib.util, sys; from pathlib import Path; "
+             "sys.path.insert(0, str(Path(sys.argv[1]).resolve().parent)); "
+             "spec = importlib.util.spec_from_file_location('g', sys.argv[1]); "
              "g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g); F = frozenset; "
              "sites = {'probe': [('src/b.cpp:1', F({F({'PROSPER_ZZ_B'})})), "
              "('src/a.cpp:1', F({F({'PROSPER_ZZ_A'})})), "
@@ -2934,13 +2960,21 @@ def main() -> int:
             or run_key_stability_test(args.verbose)
             or run_baseline_integrity_test(args.verbose)):
         return 1
+    # Import here to keep the controls' scanner dependency out of module initialization.
+    from test_member_fact_domains import run_tests as run_member_domain_tests
+    if run_member_domain_tests(args.verbose):
+        return 1
     if args.selftest:
         print("== all checks passed ==")
         return 0
 
     here = Path(__file__).resolve()
     root = Path(args.root).resolve() if args.root else here.parents[2]
-    files, preds, findings = scan_tree(root)
+    roles: list[Role] = []
+    files, preds, findings = scan_tree(root, domain_roles=roles)
+    for role in roles:
+        print(f"  [{'ok' if role.accepted else 'FAIL'}]   {role.report()}")
+    refused_roles = sum(not role.accepted for role in roles)
     if not files:
         print(f"  [FAIL] no sources found under {root} -- the scan is not seeing the tree")
         return 1
@@ -2962,7 +2996,7 @@ def main() -> int:
     if args.emit_baseline:
         for key in sorted({f.key() for f in findings}):
             print(f"{key}  # unreviewed")
-        return 0
+        return int(bool(refused_roles))
 
     baseline_path = here.parent / "diag_gate_baseline.txt"
     baseline = load_baseline(baseline_path)
@@ -2988,7 +3022,7 @@ def main() -> int:
         print(f"  [ok]   baseline notes: {len(baseline)} row(s) classified, header counts agree, "
               f"{UNREVIEWED_BUDGET} unreviewed as budgeted")
 
-    if not new and not stale and not integrity:
+    if not new and not stale and not integrity and not refused_roles:
         print("== all checks passed ==")
         return 0
 
@@ -3007,7 +3041,7 @@ def main() -> int:
         print(f"  [FAIL] {len(stale)} baseline entry(ies) no longer reproduce -- delete the row:")
         for k in stale:
             print(f"    {k}")
-    print(f"== {len(new) + len(stale) + len(integrity)} failure(s) ==")
+    print(f"== {len(new) + len(stale) + len(integrity) + refused_roles} failure(s) ==")
     return 1
 
 

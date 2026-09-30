@@ -24,6 +24,12 @@ are actually hot. This folder is about the switch surface itself.
   list: a row has to carry a mechanism at a `file:line` the next reader can open. Its narrow cached
   reference-getter bridge preserves config provenance through an identified singleton receiver;
   cross-file positive, bridge-off and adversarial controls run with `--selftest`.
+- **`member_fact_domains.py`** + `MEMBER_FACT_DOMAINS.md` — explicit TEST_LOCAL source-role
+  declarations partition both member declaration and initializer facts without excluding files.
+  Every header and uncertain/refused source remains shared; test TUs retain the original all-file
+  member table. Literal CMake/include safeguards do not infer complete build reachability.
+  `test_member_fact_domains.py` runs its admission, refusal and visibility controls inside the
+  existing diagnostic gate selftests and full scans.
 - **`check_env_numeric_arms.py`** — every knob parsed through `diagnostics/env_numeric.hpp` has a
   matching arm in `tests/diagnostics/test_env_numeric_sites.cpp`, and vice versa. Run it from
   `prosper/`, not the checkout root.
