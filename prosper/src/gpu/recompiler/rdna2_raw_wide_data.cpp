@@ -465,6 +465,93 @@ std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
     return proven;
 }
 
+std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
+        const std::vector<Rdna2Inst>& ins) {
+    // Reuse the entry-pointer, forward-CFG, bypass-reader and guest-write proofs. Only the
+    // candidate's addressing mode changes here; its loaded-word lifetime is unchanged.
+    auto immediate = ins;
+    for (auto& load : immediate)
+        if (load.fmt == Rdna2Format::SMEM &&
+            (load.opcode == 0x2u || load.opcode == 0x3u))
+            load.src[1] = {OperandKind::Special, 125};
+    const auto entry_proven = rdna2_proven_raw_immediate_wide_data_loads(immediate);
+    std::vector<uint32_t> proven;
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const auto& load = ins[i];
+        const auto& offset = load.src[1];
+        const bool ordinary = offset.kind == OperandKind::SGPR &&
+                              offset.value >= 0 && offset.value <= 105;
+        const bool vcc = offset.kind == OperandKind::Special &&
+                         (offset.value == 106 || offset.value == 107);
+        if ((!ordinary && !vcc) ||
+            !std::binary_search(entry_proven.begin(), entry_proven.end(), load.pc))
+            continue;
+        // The compact fold can omit implicit VALU mask writes. Authenticate the entire reaching
+        // scalar-definition chain against the FULL stream before trusting a concrete fold value.
+        std::bitset<128> needed;
+        needed.set(static_cast<size_t>(offset.value));
+        bool scalar_prefix = true;
+        for (size_t j = i; j-- > 0;) {
+            const auto& writer = ins[j];
+            // This first subset does not select between incoming scalar definitions. A later
+            // branch remains allowed by the shared lifetime proof, including a bypass overwrite.
+            if (writer.fmt == Rdna2Format::SOPP &&
+                sopp_opcode_is_direct_branch(writer.opcode)) {
+                scalar_prefix = false;
+                break;
+            }
+            const bool valu = writer.fmt == Rdna2Format::VOP1 ||
+                              writer.fmt == Rdna2Format::VOP2 ||
+                              writer.fmt == Rdna2Format::VOP3 ||
+                              writer.fmt == Rdna2Format::VOPC;
+            // Conservative for implicit writers too: no VALU may intervene in a live VCC
+            // dependency. An earlier VALU before its scalar replacement has no such dependency.
+            if (valu && (needed.test(106) || needed.test(107))) {
+                scalar_prefix = false;
+                break;
+            }
+            std::bitset<128> writes;
+            for_each_scalar_write(writer, [&](int base, uint32_t width) {
+                for (uint32_t k = 0; k < width; ++k)
+                    if (base + static_cast<int>(k) >= 0 &&
+                        base + static_cast<int>(k) < 128)
+                        writes.set(static_cast<size_t>(base + static_cast<int>(k)));
+            });
+            if ((writes & needed).none()) continue;
+            // Scalar moves and B32 arithmetic are per-draw data, rather than masks or conditional
+            // definitions. Concrete operands/opcode support are checked again by the live fold.
+            const bool scalar_writer =
+                (writer.fmt == Rdna2Format::SOP1 && writer.opcode == 0x03u) ||
+                (writer.fmt == Rdna2Format::SOP2 && scalar_write_width(writer) == 1u &&
+                 writer.opcode != 0x0au && writer.opcode != 0x04u && writer.opcode != 0x05u) ||
+                (writer.fmt == Rdna2Format::SOPK && writer.opcode == 0x00u);
+            if (!scalar_writer) {
+                scalar_prefix = false;
+                break;
+            }
+            needed &= ~writes;
+            for (uint32_t k = 0; k < writer.n_src; ++k) {
+                const auto& source = writer.src[k];
+                if (source.kind == OperandKind::SGPR ||
+                    (source.kind == OperandKind::Special &&
+                     (source.value == 106 || source.value == 107))) {
+                    if (source.value < 0 || source.value > 107) scalar_prefix = false;
+                    else needed.set(static_cast<size_t>(source.value));
+                } else if (source.kind == OperandKind::VGPR ||
+                           (source.kind == OperandKind::Special && source.value != 125)) {
+                    scalar_prefix = false;
+                }
+            }
+            if (!scalar_prefix) break;
+        }
+        // Ordinary entry SGPRs are resolved from this draw. VCC cannot be an uninitialized entry
+        // value: its complete scalar definition must have been found above.
+        if (scalar_prefix && !needed.test(106) && !needed.test(107))
+            proven.push_back(load.pc);
+    }
+    return proven;
+}
+
 std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(
         const std::vector<Rdna2Inst>& ins) {
     std::vector<uint32_t> proven;

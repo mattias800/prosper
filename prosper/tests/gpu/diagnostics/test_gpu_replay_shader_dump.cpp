@@ -471,10 +471,12 @@ int main(int argc, char** argv) {
               "CLI fixture writes the exact captured failed-fragment ABI");
         std::vector<uint8_t> legacy_fragment_bytes;
         CHECK(gpu::serialize_gpu_capture(fragment_fixture, legacy_fragment_bytes, error) &&
-              legacy_fragment_bytes.size() > 22u,
-              "CLI fixture serializes a v61 fragment retry for a legacy downgrade");
-        if (legacy_fragment_bytes.size() > 22u) {
-            legacy_fragment_bytes.resize(legacy_fragment_bytes.size() - 10u);
+              legacy_fragment_bytes.size() > 26u,
+              "CLI fixture serializes a current fragment retry for a legacy downgrade");
+        if (legacy_fragment_bytes.size() > 26u) {
+            // This fixture has no resources: remove the v62 zero-resource count and the
+            // v61 availability/flags/system-input tail to recover an exact v60 prefix.
+            legacy_fragment_bytes.resize(legacy_fragment_bytes.size() - 4u - 10u);
             legacy_fragment_bytes[8] = 60u;
             FILE* legacy_fragment = std::fopen(
                 (directory / "fragment-v60.prgcap").string().c_str(), "wb");
