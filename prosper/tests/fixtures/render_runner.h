@@ -2402,9 +2402,28 @@ inline bool flush_graphics_pipeline_cache(
 // entering the driver. That refusal is what lets prosper-app's drain reach zero before it _Exit()s
 // a process whose guest thread it cannot join — a thread caught inside an amdgpu submission at
 // exit_group() parks in __drm_exec_lock_obj and takes the host compositor down with it.
-// VK_ERROR_DEVICE_LOST is the honest result: the device really is going away, and every caller
-// here already treats a failed submit as "not submitted" and cleans up accordingly.
-inline VkResult render_locked_queue_submit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
+// The gate returns the existing VK_ERROR_DEVICE_LOST failure sentinel without a driver call.
+// It does not report a Vulkan result; callers retain their existing failure/lifetime policies.
+enum class BackendQueueCallOrigin : uint8_t {
+    NotAttempted,
+    ShutdownGateRefused,
+    DriverCalled,
+};
+
+inline const char* backend_queue_call_origin_name(BackendQueueCallOrigin origin) {
+    switch (origin) {
+    case BackendQueueCallOrigin::NotAttempted: return "not-attempted";
+    case BackendQueueCallOrigin::ShutdownGateRefused: return "shutdown-gate-refused";
+    case BackendQueueCallOrigin::DriverCalled: return "driver-called";
+    }
+    return "unknown";
+}
+
+// Origin describes this call, not the gate's later state or the cause of a driver failure.
+// Existing callers may omit it; admission, returned VkResult and locking remain identical.
+inline VkResult render_locked_queue_submit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f,
+                                          BackendQueueCallOrigin* origin = nullptr) {
+    if (origin) *origin = BackendQueueCallOrigin::NotAttempted;
     // #3533: the memory standing, on a cadence, from the path where the failure actually happens --
     // "Not enough memory for command submission" is a SUBMIT-time validation over the resident BO
     // set, which a process holding a steady footprint can hit having allocated nothing.
@@ -2416,26 +2435,41 @@ inline VkResult render_locked_queue_submit(VkQueue q, uint32_t n, const VkSubmit
     // also keeps the cadence reporting during shutdown, where the gate below returns early.
     prosper::gpu::report_device_memory_periodically();
     prosper::GpuSubmitRegion gate;
-    if (!gate.admitted()) return VK_ERROR_DEVICE_LOST;
+    if (!gate.admitted()) {
+        if (origin) *origin = BackendQueueCallOrigin::ShutdownGateRefused;
+        return VK_ERROR_DEVICE_LOST;
+    }
     if (prosper::gpu::shared_present_active()) {
         std::lock_guard<std::mutex> lk(prosper::gpu::shared_present_submit_mutex());
+        if (origin) *origin = BackendQueueCallOrigin::DriverCalled;
         return vkQueueSubmit(q, n, s, f);
     }
+    if (origin) *origin = BackendQueueCallOrigin::DriverCalled;
     return vkQueueSubmit(q, n, s, f);
 }
-inline VkResult render_locked_queue_wait_idle(VkQueue q) {
+inline VkResult render_locked_queue_wait_idle(VkQueue q, BackendQueueCallOrigin* origin = nullptr) {
+    if (origin) *origin = BackendQueueCallOrigin::NotAttempted;
     prosper::GpuSubmitRegion gate;
-    if (!gate.admitted()) return VK_ERROR_DEVICE_LOST;
+    if (!gate.admitted()) {
+        if (origin) *origin = BackendQueueCallOrigin::ShutdownGateRefused;
+        return VK_ERROR_DEVICE_LOST;
+    }
     if (prosper::gpu::shared_present_active()) {
         std::lock_guard<std::mutex> lk(prosper::gpu::shared_present_submit_mutex());
+        if (origin) *origin = BackendQueueCallOrigin::DriverCalled;
         return vkQueueWaitIdle(q);
     }
+    if (origin) *origin = BackendQueueCallOrigin::DriverCalled;
     return vkQueueWaitIdle(q);
 }
 
 struct BackendSubmissionBatchResult {
     VkResult submit_result = VK_SUCCESS;
     VkResult wait_result = VK_SUCCESS;
+    BackendQueueCallOrigin submit_origin = BackendQueueCallOrigin::NotAttempted;
+    BackendQueueCallOrigin idle_origin = BackendQueueCallOrigin::NotAttempted;
+    // Meaningful only when fence_waits != 0. wait_result keeps the effective fallback result.
+    VkResult fence_wait_result = VK_SUCCESS;
     uint64_t command_buffers = 0;
     uint64_t queue_submits = 0;
     uint64_t fence_waits = 0;
@@ -2894,7 +2928,8 @@ private:
                          commands_.size());
             std::fflush(stderr);
         }
-        result.submit_result = render_locked_queue_submit(queue, 1, &submit, fence);
+        result.submit_result = render_locked_queue_submit(queue, 1, &submit, fence,
+                                                         &result.submit_origin);
         result.queue_submits = 1;
         if (backend_trace) {
             std::fprintf(stderr,
@@ -2912,6 +2947,7 @@ private:
                 ? prosper::diagnostics::perf::now_ns() : 0;
             result.wait_result = vkWaitForFences(
                 dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+            result.fence_wait_result = result.wait_result;
             result.fence_waits = 1;
             if (wait_start_ns)   // #3948 stage 0
                 prosper::diagnostics::perf::add_cost(
@@ -2919,7 +2955,7 @@ private:
                     prosper::diagnostics::perf::now_ns() - wait_start_ns);
             // Preserve lifetime safety even if the bounded diagnostic wait expires.
             if (result.wait_result != VK_SUCCESS)
-                result.wait_result = render_locked_queue_wait_idle(queue);
+                result.wait_result = render_locked_queue_wait_idle(queue, &result.idle_origin);
         }
         if (backend_trace) {
             std::fprintf(stderr, "[backend-trace] fence-wait end result=%d\n",
@@ -2948,10 +2984,15 @@ private:
             if (n < 16 || (n & 255) == 0)
                 std::fprintf(stderr,
                              "[backend] GRAPHICS submission failed: submit=%d wait=%d "
-                             "command-buffers=%zu occurrence=%d\n",
+                             "command-buffers=%zu occurrence=%d submit-origin=%s "
+                             "fence-wait=%d fence-waits=%llu idle-origin=%s\n",
                              static_cast<int>(result.submit_result),
                              static_cast<int>(result.wait_result),
-                             result.command_buffers, n + 1);
+                             result.command_buffers, n + 1,
+                             backend_queue_call_origin_name(result.submit_origin),
+                             static_cast<int>(result.fence_wait_result),
+                             static_cast<unsigned long long>(result.fence_waits),
+                             backend_queue_call_origin_name(result.idle_origin));
         }
         const BackendSubmissionState state = backend_submission_state(
             result.submit_result == VK_SUCCESS,
