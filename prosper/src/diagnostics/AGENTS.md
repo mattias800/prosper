@@ -207,6 +207,14 @@ chunk, so a texture rewritten every frame is cheap and quiet; a source changing 
 what it names). Proposals needing a new expensive signal were
 declined on the issue with a reason rather than approximated.
 
+**Surface readback separates attempt volume from duration** (#3891, #3948). Its detail appends
+`attempts/flip` beside the existing mean time per attempt. The outermost readback scope includes
+early returns, so these are attempts rather than completed physical copies. Compare both fields
+across matching routes: a higher mean with unchanged attempt volume also warrants checking host
+CPU/memory contention. The measured GTA V host-load control reproduced the low-frame-rate state
+with deferred waits off. The hint suggests an investigation; it does not attribute a window's
+cost to host contention. The rule reuses existing quantities and keeps its thresholds.
+
 **Host copy has two denominators** (#3891, 2026-09-29). `host-copy-per-flip` divides the
 `transfer_pressure` bytes by guest flips and leads; `host-copy-pressure` (per second) reports only
 what the per-flip form cannot see -- a window with fewer flips than the per-flip floor (a stall, a
