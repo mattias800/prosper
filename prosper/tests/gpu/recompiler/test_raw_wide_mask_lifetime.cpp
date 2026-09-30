@@ -122,6 +122,53 @@ int main() {
         auto cmpx = tail;
         cmpx[0] = compare(24, 128u, 0x12u)[0];
         numeric(shader(export_word, cmpx), "CMPX cannot publish the decoded SDST mask lifetime");
+
+        auto cmpx_then_mask = cmpx;
+        cmpx_then_mask.erase(cmpx_then_mask.begin() + 2, cmpx_then_mask.end());
+        cmpx_then_mask.insert(cmpx_then_mask.end(), tail.begin(), tail.end());
+        cmpx_then_mask.push_back(0xbefe04c1u); // full EXEC before VS position export
+        const auto cmpx_fresh = shader(export_word, cmpx_then_mask);
+        const auto cmpx_decoded = decode(cmpx_fresh);
+        check(cmpx_decoded.at(5).fmt == Rdna2Format::VOPC &&
+              cmpx_decoded.at(5).opcode == 0x12u &&
+              vopc_is_cmpx(cmpx_decoded.at(5).opcode) &&
+              cmpx_decoded.at(5).dst.kind == OperandKind::SGPR &&
+              cmpx_decoded.at(5).dst.value == 24 &&
+              cmpx_decoded.at(5).src[0].kind == OperandKind::InlineInt &&
+              cmpx_decoded.at(5).src[1].kind == OperandKind::VGPR,
+              name, "CMPX decodes explicit independent inputs and an unwritten SDST field");
+        check(rdna2_raw_wide_data_loads(cmpx_decoded).empty() &&
+              !compile(cmpx_fresh, table_for(cmpx_fresh)).empty(), name,
+              "independent CMPX retains EXEC independence for a later fresh Bool mask");
+        auto cmpx_raw = cmpx_then_mask;
+        cmpx_raw[1] = compare(24, 24u, 0x12u)[1];
+        numeric(shader(export_word, cmpx_raw),
+                "CMPX explicit raw input cannot publish independent EXEC");
+        auto cmpx_uncertain_exec = cmpx_then_mask;
+        cmpx_uncertain_exec.insert(cmpx_uncertain_exec.begin(), 0xbefe0481u);
+        // The narrow proof admits only inline zero/all-ones mask sources. A non-certified
+        // incoming EXEC cannot acquire MUST authority merely through an independent CMPX.
+        numeric(shader(export_word, cmpx_uncertain_exec),
+                "CMPX cannot restore an uncertified incoming EXEC lifetime");
+        auto cmpx_high = cmpx_then_mask;
+        cmpx_high.insert(cmpx_high.begin() + 4, 0x7e000219u);
+        numeric(shader(export_word, cmpx_high),
+                "independent CMPX preserves a possible old numeric high-word reader");
+        auto cmpx_unknown = cmpx_then_mask;
+        cmpx_unknown[0] = compare(24, 128u, 0x97u)[0];
+        numeric(shader(export_word, cmpx_unknown),
+                "unknown effective CMPX compare cannot grant EXEC independence");
+        auto cmpx_join = cmpx_then_mask;
+        // One branch bypasses the independent compare replacing the old raw mask. CMPX
+        // does not turn its SDST field into that missing definition at the join.
+        cmpx_join.insert(cmpx_join.begin() + 2, {0xbf068014u, 0xbf840002u});
+        numeric(shader(export_word, cmpx_join),
+                "CMPX independence cannot manufacture a joined saved-mask definition");
+        auto cmpx_exec_join = cmpx_then_mask;
+        cmpx_exec_join.insert(cmpx_exec_join.begin(),
+            {0xbf068014u, 0xbf840001u, 0xbefe0481u});
+        numeric(shader(export_word, cmpx_exec_join),
+                "CMPX retains the MUST meet of unequal incoming EXEC authority");
         for (uint32_t overwrite : {0xbe98031au, 0xbe99031au}) {
             auto expired = tail;
             expired.insert(expired.begin() + 2, overwrite); // root/sibling = old raw s26

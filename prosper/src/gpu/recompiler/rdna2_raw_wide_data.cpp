@@ -96,10 +96,10 @@ public:
                 ? operand.value : -1;
         };
         const auto supported_compare = [](const Rdna2Inst& in) {
-            // Exact non-CMPX compare families lowered by emit_alu. Unknown encodings cannot
-            // manufacture a mask lifetime, even if the decoder supplies an SDST-shaped field.
-            const uint32_t op = in.opcode;
-            return in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(op) &&
+            // Match emit_alu's exact effective compare families. CMPX publishes EXEC only;
+            // its SDST-shaped decoder field cannot manufacture a saved-mask lifetime.
+            const uint32_t op = vopc_is_cmpx(in.opcode) ? in.opcode - 0x10u : in.opcode;
+            return in.fmt == Rdna2Format::VOPC &&
                 (op <= 0x0fu || (op >= 0x81u && op <= 0x86u) || op == 0x88u ||
                  (op >= 0x89u && op <= 0x8eu) || (op >= 0xa1u && op <= 0xa6u) ||
                  (op >= 0xa9u && op <= 0xaeu) || (op >= 0xc1u && op <= 0xc6u) ||
@@ -230,10 +230,16 @@ public:
             // Evaluate inputs before expiring overlapping roots. Both siblings are invalidated
             // conservatively: a saved Bool must never authorize a later physical data lifetime.
             const int compare_root = in.dst.value == 126 ? -1 : mask_register(in.dst);
-            const bool fresh_compare = supported_compare(in) && compare_root >= 0 &&
+            const bool fresh_compare = supported_compare(in) &&
+                !vopc_is_cmpx(in.opcode) && compare_root >= 0 &&
                 !derived_read && state.masks.test(126);
-            const bool fresh_exec = independent_transfer &&
-                (mask_saveexec || mask_register(in.dst) == 126);
+            // The emitter narrows EXEC with CMPX's explicit comparison. Independent inputs
+            // preserve an already independent EXEC, without overwriting SDST/VCC or proving
+            // anything about their numeric high words.
+            const bool independent_cmpx = supported_compare(in) &&
+                vopc_is_cmpx(in.opcode) && !derived_read && state.masks.test(126);
+            const bool fresh_exec = independent_cmpx || (independent_transfer &&
+                (mask_saveexec || mask_register(in.dst) == 126));
             for_each_scalar_write(in, [&](int base, uint32_t width) {
                 for (uint32_t k = 0; k < width; ++k) {
                     const int reg = base + static_cast<int>(k);
