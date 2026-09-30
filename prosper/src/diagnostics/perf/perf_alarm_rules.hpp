@@ -155,16 +155,16 @@ constexpr double kPresentFallbackMinPerSecond = 5.0;
 // 5/s is 25 per window, well above a scene change's one-off churn.
 constexpr double kPipelineCacheEvictionsPerSecond = 5.0;
 
-// texture-validation-churn: RATE. Guest bytes actually read by persistent decode-cache validations
-// that FAILED (the source had changed). The compare reads 64 KiB chunks and stops at the first
-// difference, so a texture rewritten wholesale every frame costs ~64 KiB per failure and stays far
-// below this; what the rule catches is a source that changes only NEAR ITS END (a partially
-// streamed atlas, a plane whose tail is rewritten), where each failure reads most of the texture
-// before finding the change and the re-decode follows anyway. 128 MiB/s is ~1% of one core at
-// memcpy-class compare rates -- a cost worth naming, not noise. Measured 2026-09-28 with the true
-// byte count on GTA V's intro movie: ~340 failed validations per 5 s window reading at most 10.2 MiB
-// in a window (~2 MiB/s), so the rule is quiet there; the earlier source-size count read 283 MiB/s
-// for the same windows and was ~140x too high. (Sonic Frontiers not re-measured.)
+// texture-validation-churn: RATE. Route-specific validation-prefix bytes charged to persistent
+// decode-cache validations that FAILED. Direct comparisons count only fully matching chunks;
+// the first differing chunk (at most 64 KiB) is omitted, so a first-chunk mismatch can report zero.
+// Depth comparisons accumulate matching guest-face prefixes; scratch validation counts copied
+// readable bytes. Failure can also mean an incomplete prefix, rather than changed source bytes.
+// This is not total comparison traffic. Late differences can still report most of the source
+// before a re-decode, which is the cost this rule names. The threshold remains 128 MiB/s.
+// The 2026-09-28 GTA V intro calibration reported ~340 failures per 5 s window with at most
+// 10.2 MiB charged (~2 MiB/s), not a complete guest-read measurement. The earlier source-size
+// estimate was 283 MiB/s for the same windows. See #3891 for the missing-chunk observer proposal.
 constexpr double kTextureValidationFailedMiBPerSecond = 128.0;
 
 // present-slot-trouble: SHARE of guest flips. The renderer's GPU-present declines that mean the
@@ -188,7 +188,7 @@ constexpr uint64_t kPresentSlotTroubleMinFlips = 20;
 // rtt-destination-refused: RATE per guest flip. Staging bytes of compute results whose renderer
 // image destination borrow was refused (live_compute's destination_refusal_census() note site), so
 // the result went back to the renderer through a CPU snapshot and its consumers re-materialized it
-// from guest bytes. GTA V's heavy host-copy regime (#3873) is exactly this: one 2560x1440 RGBA8
+// from guest bytes. GTA V's pre-#3949 heavy host-copy regime (#3873) was this: one 2560x1440 RGBA8
 // result refused with destination-creation-refused on every other flip (12.4 GiB / 869 calls in
 // one run, ~7 MiB/flip), while the light regime refuses nothing; the reason was printed only at
 // exit. The threshold sits under half the heavy regime and far above the light regime's zero.
@@ -197,22 +197,26 @@ constexpr double kRttDestinationRefusedMiBPerFlip = 4.0;
 constexpr uint64_t kRttDestinationRefusedMinFlips = 10;
 
 // color-target-count-ceiling: STATE. The persistent colour-target cache peaked at its ENTRY-count
-// bound in the window while its BYTE budget stayed under half used, AND the bound cost something:
-// it kept evicting (each eviction a readback through the CPU sink, then a re-creation), or a
-// compute destination creation was refused (compute creation never evicts, so a full cache latches
-// that result onto the CPU path). The count, not memory, is what binds. GTA V (#3873): `PEAK
-// residency 320 of 256 entries` at 27-29% of the 4 GiB budget in every run. Measured 2026-09-29 with
-// this rule's JSONL: through gameplay the cache sits at EXACTLY 256 entries with ZERO evictions
-// in every window -- the graphics working set is steady -- while every flip refuses one 14 MiB
+// bound in the window while its BYTE budget stayed under half used, with observed churn or refusal:
+// it kept evicting (valid targets may be read back through a CPU sink and later re-created on
+// use), or a compute destination creation was refused after applicable admission/eviction checks.
+// Compute creation now tries eligible idle-target eviction (#3949). Creation refusal also covers
+// unproven submissions and partial/pinned target state, so this combined alarm suggests count
+// pressure without proving that the bound caused the refusal.
+// The pre-#3949 GTA V runs (#3873) peaked at 320 of 256 entries at 27-29% of the 4 GiB budget.
+// In that historical 2026-09-29 JSONL calibration, gameplay sits at EXACTLY 256 entries with ZERO
+// evictions in every window while every flip refuses one 14 MiB
 // compute result (destination-creation-refused). So eviction churn alone, as first proposed, would
 // have missed the costly state; evictions are the load-time form (up to 392 per window).
 constexpr double kColorTargetCeilingByteShare = 0.5;
 constexpr double kColorTargetCeilingEvictionsPerSecond = 2.0;   // > 10 per 5 s window
-// kDestinationCreationRefused (perf_ledger.hpp) is the refusal name that means "no room".
+// kDestinationCreationRefused (perf_ledger.hpp) names non-Vulkan creation/admission refusals.
 
 // gpu-present-stalled: a GPU-present frontend presented NOTHING -- neither a GPU scanout nor a CPU
-// fallback -- for a whole window while the guest kept flipping. The window on screen is frozen or
-// was never shown. #3951 is the case that needed it: a recompiler refusal dropped ~99.7% of GTA V's
+// fallback -- for a whole window while the guest kept flipping, with no recorded unavailable-window
+// attempt (minimized, occluded or swapchain recreation). The hint names the last presented frame,
+// or black if none was presented; this counter is not a pixel observation. #3951 needed it when a
+// recompiler refusal dropped ~99.7% of GTA V's
 // draws, the guest flipped at ~30/s, prosper-app printed no `[app] fps` line in 60+ s, and the
 // only alarm that fired was a downstream host-copy-per-flip. The flip floor keeps a boot or a
 // loading pause (the guest is not flipping) out of it; sustain 2 keeps one long hitch out.

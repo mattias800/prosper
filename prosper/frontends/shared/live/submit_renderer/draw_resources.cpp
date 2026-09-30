@@ -2834,9 +2834,11 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                           resource_persistent_invalidation = true;
                           if (timing_enabled)
                               pending_timing.persistent_invalidations++;
-                          // #3891 texture-validation-churn: an exact validation that
-                          // found the source changed, charged the bytes it really read
-                          // (the compare stops at the first differing 64 KiB chunk).
+                          // #3891 texture-validation-churn: charge the failed validation's
+                          // route-specific prefix count. Direct/depth comparisons exclude
+                          // the first differing chunk; scratch validation counts copied bytes.
+                          // A failed validation can also mean an incomplete readable prefix,
+                          // so neither source mutation nor total comparison traffic is proved.
                           if (resource_texture_exact_validation) {
                               prosper::diagnostics::perf::add(
                                   prosper::diagnostics::perf::Counter::TextureValidationFailures);

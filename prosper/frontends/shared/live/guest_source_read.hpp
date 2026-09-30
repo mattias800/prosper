@@ -49,8 +49,10 @@ size_t copy_guest_source(uint8_t* destination, uint64_t address, size_t bytes,
     return readable;
 }
 
-// Return the number of whole chunks that matched, as the renderer's validation counters do.
-// A short readable prefix is reported to the caller; cache admission checks that count.
+// `compared` counts bytes in fully matching chunks, excluding the first differing chunk
+// (at most 64 KiB) and any chunk rejected for a null expected pointer. It is not a count
+// of all comparison reads. A short readable prefix may return true; cache admission must
+// also check `compared` against its required prefix length.
 template <typename HostReadable>
 bool equal_guest_source_prefix(const uint8_t* expected, uint64_t address, size_t bytes,
                                size_t& compared, HostReadable&& host_readable) {

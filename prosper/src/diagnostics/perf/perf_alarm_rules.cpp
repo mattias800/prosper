@@ -762,8 +762,9 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
             a.hint = "compute results that should have gone straight into the renderer's device "
                      "image were refused a destination, so each is snapshotted to the CPU and its "
                      "consumers re-materialize it from guest bytes (host-copy-per-flip usually "
-                     "fires beside this). destination-creation-refused = the persistent "
-                     "colour-target cache had no room (see color-target-count-ceiling); "
+                     "fires beside this). destination-creation-refused = renderer admission or "
+                     "creation declined after applicable eviction checks; it is not specific proof "
+                     "of no room (see color-target-count-ceiling and submission/target state); "
                      "destination-allocation-failed = Vulkan could not create/allocate/bind the "
                      "image (device memory, not the cache bound); extent/format/device-mismatch = "
                      "the renderer image has another shape. next: the [rtt-destination-refused] exit line, "
@@ -810,11 +811,12 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                               w.count(Counter::PersistentTargetEvictedBytes) / kMiB,
                               (unsigned long long)creation_refusals, creation_refused / kMiB,
                               (unsigned long long)w.flips);
-            a.hint = "the persistent colour-target cache is bound by its ENTRY COUNT while most of "
+            a.hint = "the persistent colour-target cache reached its ENTRY COUNT while most of "
                      "its byte budget is free: valid evicted targets may be read back through the "
                      "CPU eviction sink and later re-created. Compute destination creation also "
-                     "tries eligible idle-target eviction (#3949); if it still cannot make room, "
-                     "inspect rtt-destination-refused. next: the [persistent-targets] PEAK residency exit "
+                     "tries eligible idle-target eviction (#3949); creation refusals can include "
+                     "submission/target admission state, so inspect rtt-destination-refused "
+                     "before attributing them to capacity. next: the [persistent-targets] PEAK residency exit "
                      "line; A/B PROSPER_BACKEND_TARGET_CACHE_COUNT (its `of N entries` proves the "
                      "lever moved); cf. #3873, #1177";
             out.push_back(std::move(a));
