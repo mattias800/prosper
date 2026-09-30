@@ -854,6 +854,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.vcc = b.ucmp(Op_INotEqual, bit, b.uconst(0));
                     rs.sreg_bool_narrowed[106] = true;
                 }
+                rs.scc = b.ucmp(Op_INotEqual, result, b.uconst(0));
                 return true;
             }
             // 64-bit per-lane MASK ops (EXEC / VCC / saved masks). In our per-invocation model a wave
