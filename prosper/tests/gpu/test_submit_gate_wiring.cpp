@@ -81,8 +81,7 @@ public:
     }
     bool valid() const { return valid_; }
     std::string finish() {
-        std::fflush(stderr);
-        if (saved_ >= 0) { dup2(saved_, fileno(stderr)); close(saved_); saved_ = -1; }
+        restore_stderr();
         std::string text;
         if (file_) {
             std::rewind(file_);
@@ -93,8 +92,16 @@ public:
         std::fputs(text.c_str(), stderr);
         return text;
     }
-    ~StderrCapture() { if (file_ || saved_ >= 0) finish(); }
+    ~StderrCapture() {
+        // Exceptional/unfinished capture cleanup must not allocate or throw.
+        restore_stderr();
+        if (file_) std::fclose(file_);
+    }
 private:
+    void restore_stderr() noexcept {
+        std::fflush(stderr);
+        if (saved_ >= 0) { dup2(saved_, fileno(stderr)); close(saved_); saved_ = -1; }
+    }
     FILE* file_ = nullptr;
     int saved_ = -1;
     bool valid_ = false;
