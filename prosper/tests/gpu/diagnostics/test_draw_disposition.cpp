@@ -14,11 +14,15 @@
 //     path and the report would keep printing plausible numbers.
 
 #include "gpu/diagnostics/draw_disposition.hpp"
+#include "diagnostics/exit_reports.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"
 
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unistd.h>
 
 using namespace prosper::gpu;
@@ -29,14 +33,15 @@ static void check(bool ok, const char* name) {
     if (!ok) failures++;
 }
 
-// Capture what report_pass() writes to stderr for one pass.
-static std::string capture_pass() {
+// Capture actual report output, including the registered exit flush below.
+template<typename Report>
+static std::string capture_report(Report report) {
     fflush(stderr);
     const int saved = dup(STDERR_FILENO);
     FILE* tmp = tmpfile();
     if (!tmp) { printf("FAIL: tmpfile()\n"); failures++; return {}; }
     dup2(fileno(tmp), STDERR_FILENO);
-    draw_disposition_census().report_pass();
+    report();
     fflush(stderr);
     dup2(saved, STDERR_FILENO);
     close(saved);
@@ -49,8 +54,15 @@ static std::string capture_pass() {
     return out;
 }
 
+static std::string capture_pass() {
+    return capture_report([] { draw_disposition_census().report_pass(); });
+}
+
 int main() {
     auto& c = draw_disposition_census();
+    bool empty_reported = true;
+    const std::string empty = capture_report([&] { empty_reported = c.report_totals(); });
+    check(!empty_reported && empty.empty(), "an unused exit snapshot remains silent");
 
     // --- names -------------------------------------------------------------------------------
     bool names_ok = true;
@@ -147,6 +159,56 @@ int main() {
           c.dropped(DrawDrop::BufferResources) == 1,
           "drops are attributed to the reason that was named, not pooled");
     check(c.dropped_total() == 11, "aggregate drop total is the sum of the per-reason totals");
+
+    // Balance is not proof of quiescence, even before a worker starts preparing the next pass.
+    const std::string balanced = capture_report([&] { c.report_totals(); });
+    check(balanced.find("RUN SNAPSHOT quiescence=unverified") != std::string::npos,
+          "a balanced aggregate does not claim a quiescent final total");
+    check(balanced.find("snapshot-delta=") == std::string::npos,
+          "balanced independent loads do not invent a snapshot delta");
+
+    // A real counter producer reaches a pass, then waits unjoined across the registered flush.
+    // The rendezvous establishes this state without hoping to catch a timing-dependent race.
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool ready = false, release = false, worker_finished = false;
+    std::thread worker([&] {
+        c.note_seen();
+        std::unique_lock lock(mutex);
+        ready = true;
+        changed.notify_one();
+        changed.wait(lock, [&] { return release; });
+        lock.unlock();
+        c.note_recorded();
+        lock.lock();
+        worker_finished = true;
+    });
+    {
+        std::unique_lock lock(mutex);
+        changed.wait(lock, [&] { return ready; });
+        check(!worker_finished && c.pass_seen_for_scope() == 1,
+              "counter-producing worker remains live with an in-flight pass before flush");
+    }
+    const uint64_t exit_before = unaccounted();
+    const std::string live = capture_report([] { prosper::diagnostics::flush_exit_reports(); });
+    check(live.find("RUN SNAPSHOT quiescence=unverified") != std::string::npos &&
+          live.find("snapshot-delta=1") != std::string::npos,
+          "registered flush labels the live exit difference as an unverified snapshot");
+    check(live.find("UNACCOUNTED") == std::string::npos && unaccounted() == exit_before,
+          "an in-flight exit difference is not a completed-pass error or alarm");
+    {
+        std::scoped_lock lock(mutex);
+        check(!worker_finished, "worker has not finished at the registered flush boundary");
+        release = true;
+    }
+    changed.notify_one();
+    worker.join();
+    check(capture_pass().empty() && unaccounted() == exit_before,
+          "joined healthy pass retains quiet completed-pass accounting");
+    const std::string joined = capture_report([&] { c.report_totals(); });
+    check(joined.find("snapshot-delta=") == std::string::npos &&
+          joined.find("quiescence=unverified") != std::string::npos,
+          "balanced post-join loads still require an explicit quiescence proof");
 
     printf("%s\n", failures ? "FAILURES" : "ALL PASS");
     return failures ? 1 : 0;

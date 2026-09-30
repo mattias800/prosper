@@ -245,7 +245,10 @@ bool DrawDispositionCensus::report_totals() {
     uint64_t total_dropped = 0;
     for (size_t i = 0; i < kReasonCount; i++)
         total_dropped += s.dropped[i].load(std::memory_order_relaxed);
-    std::fprintf(stderr, "[draw-disposition] RUN TOTAL seen=%llu recorded=%llu dropped=%llu",
+    // No caller proves that CPU pass preparation has stopped. Even balanced independent loads
+    // are not a final total; draining the GPU submit gate does not join the guest (#3973).
+    std::fprintf(stderr, "[draw-disposition] RUN SNAPSHOT quiescence=unverified "
+                         "seen=%llu recorded=%llu dropped=%llu",
                  static_cast<unsigned long long>(total_seen),
                  static_cast<unsigned long long>(total_recorded),
                  static_cast<unsigned long long>(total_dropped));
@@ -254,7 +257,7 @@ bool DrawDispositionCensus::report_totals() {
         if (n) std::fprintf(stderr, " %s=%llu", kNames[i], static_cast<unsigned long long>(n));
     }
     if (total_recorded + total_dropped != total_seen)
-        std::fprintf(stderr, "  UNACCOUNTED=%lld",
+        std::fprintf(stderr, "  snapshot-delta=%lld",
                      static_cast<long long>(static_cast<int64_t>(total_seen) -
                                             static_cast<int64_t>(total_recorded) -
                                             static_cast<int64_t>(total_dropped)));

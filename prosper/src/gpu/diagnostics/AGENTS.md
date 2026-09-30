@@ -88,6 +88,13 @@ Two standing cautions, both learned expensively:
   per program, or only on some sub-population — several published figures were off by two orders of
   magnitude because the answer was assumed rather than read.
 
+`draw_disposition`'s exit aggregate is a `RUN SNAPSHOT` with `quiescence=unverified` (#3973).
+Its counters are loaded independently, and no reporting caller proves that CPU pass preparation
+has stopped. In particular, prosper-app drains queue calls but leaves its guest thread unjoined.
+A balanced snapshot does not prove completeness; `snapshot-delta` is an observed difference that
+may include an in-flight pass or interleaved loads. Completed-pass `UNACCOUNTED` reports and the
+`unaccounted-draws` performance alarm keep their existing accounting contract and are unchanged.
+
 `vk_object_names.hpp` is the odd one out here and worth a line: it is not a census or a trace but a
 naming shim, giving guest shader modules a `vkSetDebugUtilsObjectNameEXT` name so an external tool —
 RenderDoc, RGP, the validation layer — identifies them by something a reader recognises instead of a
