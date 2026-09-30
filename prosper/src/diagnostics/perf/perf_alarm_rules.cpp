@@ -269,13 +269,18 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
             a.unit = "%budget";
             a.threshold = t.readback_budget_share * 100.0;
             a.cost_ms = w.ms(Cost::SurfaceReadback);
-            a.detail = format("readbacks=%llu avg=%.2fms max=%.2fms flips=%llu budget=%.1fms(%uHz)",
+            a.detail = format("readbacks=%llu avg=%.2fms max=%.2fms flips=%llu budget=%.1fms(%uHz) "
+                              "attempts/flip=%.2f",
                               (unsigned long long)n, w.ms(Cost::SurfaceReadback) / n,
                               w.cost_max_ns[static_cast<size_t>(Cost::SurfaceReadback)] / 1e6,
-                              (unsigned long long)w.flips, budget, w.target_hz);
-            a.hint = "the CPU is waiting for GPU surfaces to be copied back (flush + fence wait + "
-                     "copy each time); next: F8 readback_ms, PROSPER_DEPTH_ARRAY_SNAPSHOT_CENSUS=1 "
-                     "for depth arrays, PROSPER_READBACK_WHY=1 for colour targets; cf. #3882";
+                              (unsigned long long)w.flips, budget, w.target_hz,
+                              w.flips ? static_cast<double>(n) / w.flips : 0.0);
+            a.hint = "surface readback attempts are consuming CPU time; compare attempts/flip and "
+                     "avg time per attempt across matching routes: higher avg "
+                     "with unchanged attempts/flip also warrants checking host CPU/memory "
+                     "contention; attempts include early returns, not only completed copies; "
+                     "next: F8 readback_ms, PROSPER_DEPTH_ARRAY_SNAPSHOT_CENSUS=1 for depth arrays, "
+                     "PROSPER_READBACK_WHY=1 for colour targets; cf. #3882";
             out.push_back(std::move(a));
         }
     }

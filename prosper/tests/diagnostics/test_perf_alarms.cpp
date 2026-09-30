@@ -167,6 +167,45 @@ void test_surface_readback() {
     WindowSample cheap = bad;
     set_cost(cheap, Cost::SurfaceReadback, 10.0, 100, 0.2);
     check("frequent cheap readbacks (<1% of budget) are quiet", evaluate_rules(cheap, kDefault).empty());
+
+    // Equal total cost can come from slower attempts or more attempts per flip. The line must
+    // let an operator distinguish those populations without implying completed physical copies.
+    auto metric = [](const std::vector<AlarmFiring>& alarms, const char* field) {
+        const auto alarm = std::find_if(alarms.begin(), alarms.end(), [](const AlarmFiring& a) {
+            return std::strcmp(a.rule, "surface-readback") == 0;
+        });
+        if (alarm == alarms.end()) return -1.0;
+        const auto at = alarm->detail.find(field);
+        if (at == std::string::npos) return -1.0;
+        return std::strtod(alarm->detail.c_str() + at + std::strlen(field), nullptr);
+    };
+    WindowSample steady = healthy();
+    set_cost(steady, Cost::SurfaceReadback, 1500.0, 300, 6.0);
+    const auto steady_alarms = evaluate_rules(steady, kDefault);
+    WindowSample slower = steady;
+    set_cost(slower, Cost::SurfaceReadback, 3000.0, 300, 12.0);
+    const auto slower_alarms = evaluate_rules(slower, kDefault);
+    WindowSample busier = steady;
+    set_cost(busier, Cost::SurfaceReadback, 3000.0, 600, 6.0);
+    const auto busier_alarms = evaluate_rules(busier, kDefault);
+    check("equal-cost slow and busy populations both report the readback alarm",
+          only(steady_alarms, "surface-readback") && only(slower_alarms, "surface-readback") &&
+          only(busier_alarms, "surface-readback"));
+    check("slower attempts retain the observed two attempts per flip",
+          metric(steady_alarms, "attempts/flip=") == 2.0 &&
+          metric(slower_alarms, "attempts/flip=") == 2.0);
+    check("slower attempts report a doubled mean duration",
+          metric(steady_alarms, "avg=") == 5.0 && metric(slower_alarms, "avg=") == 10.0);
+    check("more attempts report four per flip with the same mean duration",
+          metric(busier_alarms, "attempts/flip=") == 4.0 && metric(busier_alarms, "avg=") == 5.0);
+    check("the readback hint suggests host contention and qualifies attempt semantics",
+          !slower_alarms.empty() &&
+          slower_alarms[0].hint &&
+          std::strstr(slower_alarms[0].hint, "host CPU/memory contention") &&
+          std::strstr(slower_alarms[0].hint, "not only completed copies"));
+    steady.flips = 0;
+    check("no flips cannot produce a readback ratio alarm",
+          !fired(evaluate_rules(steady, kDefault), "surface-readback"));
 }
 
 // Texture references: `refs` in the window, one in kTextureRefSamplePeriod timed at `mean_us`.
