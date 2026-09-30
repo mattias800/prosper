@@ -92,6 +92,13 @@ silently stops describing the tree, which is the same failure class this tool ex
   - `#if`-gated code is scanned as if it were live.
   - A diagnostic gated by something other than an environment variable (a build flag, a member
     field, a runtime setting) is out of scope by construction.
+  - Cached reference getters are followed only for a unique class with a native `instance()`
+    singleton, a const pointer receiver, and a complete const-reference getter consisting of one
+    cached declaration and return of the same local. An optional slot's emplacement is read as
+    its value initializer only for an immobile owner and a slot mentioned solely in its declaration
+    and initializer. Only a declaration initialized by that receiver's zero-argument getter
+    is bridged; arbitrary member calls, mutable returns, unknown types and receiver shadows are
+    invisible. Plain by-value lambda captures preserve the receiver; uncertain mentions retire it.
 
 So a clean run means "no NEW instance of three specific lexical shapes", never "no diagnostic in
 this tree can print an unmeasured field".
@@ -716,6 +723,8 @@ def collect_predicates(files: dict[Path, list[str]]) -> dict[str, frozenset]:
       - a name defined more than once must AGREE everywhere, or it is dropped. Two files with
         different `avp_log()` bodies do not share a meaning, and guessing one is how an alias
         table starts inventing gates.
+    Pointer/reference returns are not scalar predicates. #3892's getter controls caught `int&`
+    entering this global-name table; cached references instead need the receiver-aware bridge.
     """
     seen: dict[str, list[frozenset]] = {}
     for _path, lines in files.items():
@@ -723,7 +732,11 @@ def collect_predicates(files: dict[Path, list[str]]) -> dict[str, frozenset]:
             m = is_func_def(line.strip())
             if not m:
                 continue
-            if not re.match(r"^\s*(?:static\s+|inline\s+|constexpr\s+)*(?:bool|int)\b", line):
+            # Match the COMPLETE plain scalar return/name prefix. Looking only immediately
+            # after `int` missed the legal `int const&` / `bool const*` spellings and exported
+            # their config through a global method-name alias (#3892 independent review).
+            if not re.match(r"^\s*(?:static\s+|inline\s+|constexpr\s+)*(?:bool|int)\s+"
+                            r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*\s*\(", line):
                 continue
             body, depth, closed = [], 0, False
             for probe in lines[idx:idx + PRED_MAX_LINES]:
@@ -742,6 +755,132 @@ def collect_predicates(files: dict[Path, list[str]]) -> dict[str, frozenset]:
             if variants[0] and all(v == variants[0] for v in variants)}
 
 
+CLASS_DEF_RE = re.compile(r"\b(?:class|struct)\s+([A-Za-z_]\w*)\s*(?:final\s*)?\{")
+CACHED_GETTER_RE = re.compile(
+    r"^\s*const\s+[\w:<>,\s]+&\s*([A-Za-z_]\w*)::([A-Za-z_]\w*)"
+    r"\s*\(\s*\)\s*(?:const\s*)?(?:noexcept\s*)?\{", re.M)
+CACHED_LOCAL_RE = re.compile(
+    r"\s*static\s+const\s+[\w:<>,\s*&]+?\b([A-Za-z_]\w*)\s*=\s*(.*?)"
+    r";\s*return\s+\1\s*;\s*", re.S)
+SINGLETON_RECEIVER_RE = re.compile(
+    r"^auto\s*\*\s*const\s+([A-Za-z_]\w*)\s*=\s*&"
+    r"([A-Za-z_]\w*)::instance\s*\(\s*\)\s*;\s*$")
+GETTER_CALL_RE = re.compile(r"\s*([A-Za-z_]\w*)\s*->\s*([A-Za-z_]\w*)"
+                            r"\s*\(\s*\)\s*;?\s*$")
+
+
+def brace_body(text: str, opening: int) -> str | None:
+    """Body after a known opening brace; strings/comments are already neutralised."""
+    depth = 0
+    for pos in range(opening, len(text)):
+        depth += {"{": 1, "}": -1}.get(text[pos], 0)
+        if depth == 0:
+            return text[opening + 1:pos]
+    return None
+
+
+def collect_cached_getters(files: dict[Path, list[str]]) -> dict[tuple[str, str], frozenset]:
+    """A narrow config return bridge, keyed by unique CLASS and accessor, never member name.
+
+    #3892 moves cached prelude configuration into reference getters. A global alias for `value`
+    (their local name), or for `limit()` alone, would invent gates on unrelated objects. Only an
+    unambiguous class with a native singleton and a complete, const-reference getter consisting
+    of ONE cached declaration and return of that same local is recognised. An optional slot's
+    emplace argument is its value initializer; apply the existing polarity/default/lambda rules
+    to that argument, exactly as before relocation. Optional owners must be immobile and the slot
+    may be mentioned only at declaration and emplacement. Mutable state and other method bodies remain
+    invisible. Duplicate classes or definitions retire the bridge rather than guessing a type.
+    """
+    texts = ["\n".join(lines) for lines in files.values()]
+    from collections import Counter
+    mentions = Counter(word for text in texts for word in IDENT_RE.findall(text))
+    classes: dict[str, list[str]] = {}
+    for text in texts:
+        for m in CLASS_DEF_RE.finditer(text):
+            body = brace_body(text, m.end() - 1)
+            if body is not None:
+                classes.setdefault(m.group(1), []).append(body)
+    seen: dict[tuple[str, str], list[frozenset]] = {}
+    for text in texts:
+        for m in CACHED_GETTER_RE.finditer(text):
+            owner, method = m.groups()
+            ctx = frozenset()
+            definitions = classes.get(owner, [])
+            body = brace_body(text, m.end() - 1)
+            local = CACHED_LOCAL_RE.fullmatch(body or "")
+            statements = [part for part in split_statements(body or "") if part.strip()]
+            if len(definitions) == 1 and local and len(statements) == 2:
+                rhs = local.group(2).strip()
+                emplace = re.match(r"([A-Za-z_]\w*)\.emplace\s*\(", rhs)
+                if emplace:
+                    close = _matching_close(rhs, emplace.end() - 1)
+                    slot = re.escape(emplace.group(1))
+                    optional = re.search(r"\bstd::optional\s*<[^;]+>\s+" + slot
+                                         + r"\s*;", definitions[0])
+                    # Whole-owner assignment can alter the slot without mentioning its name.
+                    # The process owner is immobile; require that contract for an optional bridge.
+                    owner_name = re.escape(owner)
+                    deleted_copy = re.search(owner_name + r"\s*\(\s*const\s+" + owner_name
+                                             + r"\s*&\s*\)\s*=\s*delete\s*;", definitions[0])
+                    deleted_assignment = re.search(
+                        r"\boperator\s*=\s*\(\s*const\s+" + owner_name
+                        + r"\s*&\s*\)\s*=\s*delete\s*;", definitions[0])
+                    immobile = deleted_copy and deleted_assignment \
+                        and len(re.findall(r"\boperator\s*=", definitions[0])) == 1
+                    # Besides the declaration and this emplacement, any mention might expose or
+                    # mutate the slot. Unsure means retire, including a same-named unrelated slot.
+                    if close != len(rhs) - 1 or not optional or not immobile \
+                            or mentions[emplace.group(1)] != 2:
+                        rhs = ""                  # unknown emplacement is not value provenance
+                    else:
+                        rhs = rhs[emplace.end():close]
+                if FileScanner.alias_is_a_gate(rhs):
+                    ctx = clauses_of(rhs)
+            seen.setdefault((owner, method), []).append(ctx)
+
+    # The only receiver construction recognised below must really return this owner's native
+    # singleton. A declaration or a same-name factory returning something else is insufficient.
+    owners = {owner for owner, _method in seen}
+    singleton_owners = set()
+    for owner in owners:
+        pattern = re.compile(r"^\s*" + re.escape(owner) + r"\s*&\s*"
+                             + re.escape(owner) + r"::instance\s*\(\s*\)\s*\{", re.M)
+        bodies = [brace_body(text, m.end() - 1) for text in texts
+                  for m in pattern.finditer(text)]
+        if len(bodies) == 1 and re.fullmatch(
+                r"\s*static\s+" + re.escape(owner)
+                + r"\s+([A-Za-z_]\w*)\s*;\s*return\s+\1\s*;\s*", bodies[0] or ""):
+            singleton_owners.add(owner)
+    definition_counts: dict[tuple[str, str], int] = {}
+    definition = re.compile(r"^\s*[\w:<>,*& \t]+\b([A-Za-z_]\w*)::([A-Za-z_]\w*)"
+                            r"\s*\(\s*\)\s*(?:const\s*)?(?:noexcept\s*)?\{", re.M)
+    for text in texts:
+        for m in definition.finditer(text):
+            key = m.groups()
+            definition_counts[key] = definition_counts.get(key, 0) + 1
+    return {key: variants[0] for key, variants in seen.items()
+            if key[0] in singleton_owners and definition_counts.get(key) == 1
+            and len(variants) == 1 and variants[0]}
+
+
+def receiver_read_mentions(name: str, text: str) -> bool:
+    """Reject shadow/reassignment/uncertainty between binding and call, except plain captures.
+
+    A named by-value lambda capture preserves the const pointer. Initializer captures and lambda
+    parameters may shadow it and are deliberately left for only_read_mentions() to reject.
+    A bracket after an object is an index rather than a lambda capture, and is not exempted.
+    """
+    capture = re.compile(r"\[([^\[\]]*)\]\s*\(")
+    def blank_capture(m):
+        before = text[:m.start()].rstrip()
+        if before and before[-1] not in "=(,{":
+            return m.group(0)
+        parts = m.group(1).split(",")
+        parts = [" " * len(part) if part.strip() == name else part for part in parts]
+        return "[" + ",".join(parts) + "]" + m.group(0)[len(m.group(1)) + 2:]
+    return only_read_mentions(name, capture.sub(blank_capture, text))
+
+
 class Scope:
     """One open brace: the gates it imposes, the aliases and the default-initialised locals in it.
 
@@ -757,6 +896,8 @@ class Scope:
         # `.x = x` is a pass-through of that member, not a new initialiser (#3892).
         # name -> index of the first line AFTER its rebind statement.
         self.member_rebinds: dict[str, int] = {}
+        # Const singleton pointer -> (unique class, first line after binding). None is a shadow.
+        self.receivers: dict[str, tuple[str, int] | None] = {}
         # var -> (decl line, [(line, gates)] writes, [(line, gates)] prints)
         self.decls: dict[str, tuple] = {}
 
@@ -836,7 +977,8 @@ class FileScanner:
                  flags: dict[str, frozenset] | None = None,
                  flag_writes: dict[str, list[frozenset]] | None = None,
                  members: dict[str, frozenset] | None = None,
-                 member_writes: dict[str, list[frozenset]] | None = None):
+                 member_writes: dict[str, list[frozenset]] | None = None,
+                 getters: dict[tuple[str, str], frozenset] | None = None):
         self.rel = rel
         self.lines = lines
         self.preds = preds
@@ -846,6 +988,7 @@ class FileScanner:
         self.flag_writes = flag_writes
         self.members = members or {}
         self.member_writes = member_writes
+        self.getters = getters or {}
         self.findings: list[Finding] = []
         self.stack: list[Scope] = [Scope(set())]
 
@@ -870,6 +1013,11 @@ class FileScanner:
             # A context member stands for what its designated initialisers held (#3919). Replace
             # the whole `.name` / `->name` so the object expression is left as an ordinary ident.
             def sub_member(m):
+                # A same-named METHOD is not this context's reference data member. Let only the
+                # receiver-aware getter bridge resolve calls, even after pass 1 found a real
+                # `.name = alias` context elsewhere (#3892).
+                if re.match(r"\s*\(", expr[m.end():]):
+                    return m.group(0)
                 ctx = self.members.get(m.group(1))
                 if not ctx:
                     return m.group(0)
@@ -911,6 +1059,25 @@ class FileScanner:
                 between = " ".join(self.lines[start:line_index]) if start < line_index else ""
                 return only_read_mentions(name, between + " " + prefix)
         return False
+
+    def getter_clauses(self, rhs: str, line_index: int, prefix: str) -> frozenset:
+        """Follow only a complete zero-argument call through an unshadowed known receiver."""
+        call = GETTER_CALL_RE.fullmatch(rhs)
+        if not call:
+            return frozenset()
+        receiver, method = call.groups()
+        for scope in reversed(self.stack):
+            if receiver not in scope.receivers:
+                continue
+            binding = scope.receivers[receiver]
+            if binding is None:
+                return frozenset()
+            owner, start = binding
+            between = " ".join(self.lines[start:line_index]) if start < line_index else ""
+            if not receiver_read_mentions(receiver, between + " " + prefix):
+                return frozenset()
+            return self.getters.get((owner, method), frozenset())
+        return frozenset()
 
     @staticmethod
     def alias_is_a_gate(rhs: str) -> bool:
@@ -1165,8 +1332,15 @@ class FileScanner:
                         self.stack[-1].member_rebinds[dm2.group(1)] = i + used
                     consumed = max(consumed, used)
                     ctx = clauses_of(self.expand(rhs))
+                    if not ctx:
+                        ctx = self.getter_clauses(rhs, i, raw[:eq + 1])
                     if ctx and self.alias_is_a_gate(rhs):
                         self.stack[-1].aliases[dm2.group(1)] = ctx
+                    receiver = SINGLETON_RECEIVER_RE.fullmatch(line)
+                    if receiver and any(owner == receiver.group(2) for owner, _ in self.getters):
+                        self.stack[-1].receivers[receiver.group(1)] = (receiver.group(2), i + used)
+                    elif any(dm2.group(1) in scope.receivers for scope in self.stack):
+                        self.stack[-1].receivers[dm2.group(1)] = None
 
             # ---- brace bookkeeping ---------------------------------------------------------
             text = " ".join(self.lines[i:i + consumed])
@@ -1412,6 +1586,16 @@ def member_declarations(text: str) -> list[tuple[str, str]]:
     first = text.split()[0]
     if first in ("using", "typedef", "friend", "template", "return", "static_assert"):
         return []
+    # A plain zero-argument const-reference getter is a METHOD, not a value member. Recording
+    # `const int& limit();` as data would retire the actual `const int& limit;` context member
+    # after #3892's config relocation. Parenthesized/function-typed data declarations do not
+    # match this narrow form and retain the conservative value classification below.
+    if re.fullmatch(r"const\s+[\w:<>,\s]+&\s*[A-Za-z_]\w*\s*\(\s*\)"
+                    r"\s*(?:const\s*)?(?:noexcept\s*)?", text):
+        return []
+    function_data = re.search(r"\(\s*[*&]+\s*([A-Za-z_]\w*)\s*\)\s*\(", text)
+    if function_data:
+        return [(function_data.group(1), "value")]
     # The initialiser is not part of the declarator: `x = compute()`, `x{}`, `x = {1, 2}`.
     pre = _top_level_split(text, "=")[0]
     pre = re.sub(r"\{\}\s*$", "", pre)
@@ -1519,11 +1703,12 @@ def resolve_members(member_writes: dict[str, list[frozenset]],
     return out
 
 
-def scan_tree(root: Path, follow_members: bool = True):
+def scan_tree(root: Path, follow_members: bool = True, follow_getters: bool = True):
     files = collect_files(root)
     preds = collect_predicates(files)
     printing = collect_printing(files)
     defined = collect_definitions(files)
+    getters = collect_cached_getters(files) if follow_getters else {}
 
     # Pass 1 discovers which `g_*` flags only an env gate can set. Its findings are discarded --
     # they are computed without those flags and would understate.
@@ -1531,7 +1716,7 @@ def scan_tree(root: Path, follow_members: bool = True):
     member_writes: dict[str, list[frozenset]] = {}
     for path, lines in files.items():
         FileScanner(str(path.relative_to(root)), lines, preds, {}, printing,
-                    None, flag_writes, None, member_writes).run()
+                    None, flag_writes, None, member_writes, getters).run()
     flags = resolve_flags(flag_writes)
     members = (resolve_members(member_writes, collect_member_kinds(files))
                if follow_members else {})
@@ -1541,7 +1726,7 @@ def scan_tree(root: Path, follow_members: bool = True):
     for path, lines in files.items():
         rel = str(path.relative_to(root))
         findings += FileScanner(rel, lines, preds, call_sites, printing, flags, None,
-                                members).run()
+                                members, None, getters).run()
     findings += split_call_findings(call_sites, defined)
     return files, preds, findings
 
@@ -2340,6 +2525,198 @@ def run_member_resolution_test(verbose: bool = False) -> int:
     return 0
 
 
+def run_cached_getter_test(verbose: bool = False) -> int:
+    """Cross-file relocation and adversarial receiver/return controls, unchanged baseline."""
+    import tempfile
+
+    header = """
+class GetterState {
+public:
+    static GetterState& instance();
+    const int& threshold();
+    GetterState(const GetterState&) = delete;
+    GetterState& operator=(const GetterState&) = delete;
+private:
+    GetterState() = default;
+    std::optional<int> threshold_;
+};
+struct GetterCtx { const int& threshold; };
+"""
+    definition = """
+GetterState& GetterState::instance() {
+    static GetterState state;
+    return state;
+}
+const int& GetterState::threshold() {
+    static const auto& value = threshold_.emplace(INITIALIZER);
+    return value;
+}
+"""
+    initializer = ('getenv("PROSPER_GETTER_THRESHOLD") '
+                   '? atoi(getenv("PROSPER_GETTER_THRESHOLD")) : 0')
+    caller = """
+void register_it() {
+    auto* const state = &GetterState::instance();
+    register_callback(
+        [state](const Items& items) {
+            static const auto& threshold = state->threshold();
+            consume(GetterCtx{ .threshold = threshold });
+        });
+}
+"""
+    consumer = """
+void consume(const GetterCtx& ctx) {
+    auto& threshold = ctx.threshold;
+    if (threshold) {
+        if (getenv("PROSPER_GETTER_PRINT")) fprintf(stderr, "x");
+    }
+}
+"""
+    # Each negative changes one property of the cross-file positive. A same-name local or method
+    # must not become a gate merely because another function's local `value` was env-derived.
+    cases = [
+        ("optional cached reference + plain lambda capture + context handoff", {}, True),
+        ("direct cached scalar reference", {"definition": definition.replace(
+            "const auto& value = threshold_.emplace(INITIALIZER)",
+            "const int value = INITIALIZER")}, True),
+        ("opt-out remains default-on", {"initializer":
+            'getenv("PROSPER_GETTER_THRESHOLD") == nullptr'}, False),
+        ("live ternary default remains ungated", {"initializer":
+            initializer[:-1] + "1"}, False),
+        ("immediately invoked lambda is a value", {"initializer":
+            '[] { return getenv("PROSPER_GETTER_THRESHOLD") != nullptr; }()'}, True),
+        ("stored lambda is not a value gate", {"initializer":
+            '[] { return getenv("PROSPER_GETTER_THRESHOLD") != nullptr; }'}, False),
+        ("changed return is not the cached value", {"definition": definition.replace(
+            "return value;", "return other;")}, False),
+        ("extra getter statement retires provenance", {"definition": definition.replace(
+            "return value;", "mutate(); return value;")}, False),
+        ("mutable reference is not cached configuration", {"definition": definition.replace(
+            "const int& GetterState::threshold()", "int& GetterState::threshold()")}, False),
+        ("alternate-CV reference is not a global scalar predicate", {"header": header.replace(
+            "const int& threshold();", "int const& threshold();"), "definition": definition.replace(
+            "const int& GetterState::threshold()", "int const& GetterState::threshold()")}, False),
+        ("alternate-CV pointer is not a global scalar predicate", {"header": header.replace(
+            "const int& threshold();", "bool const* threshold();"), "definition": """
+GetterState& GetterState::instance() {
+    static GetterState state;
+    return state;
+}
+bool const* GetterState::threshold() {
+    static const bool value = getenv("PROSPER_GETTER_THRESHOLD") != nullptr;
+    return &value;
+}
+""", "caller": caller.replace("consume(GetterCtx{ .threshold = threshold });", """
+if (threshold) {
+    if (getenv("PROSPER_GETTER_PRINT")) fprintf(stderr, "x");
+}
+""")}, False),
+        ("unknown emplacement is not optional value provenance", {"header": header.replace(
+            "std::optional<int> threshold_;", "CustomSlot threshold_;")}, False),
+        ("optional slot used outside its initializer", {"definition": definition + """
+void GetterState::reset() {
+    threshold_.reset();
+}
+"""}, False),
+        ("assignable optional owner is not immutable config", {"header": header.replace(
+            "GetterState& operator=(const GetterState&) = delete;", "")}, False),
+        ("additional assignment overload retires optional owner", {"header": header.replace(
+            "private:", "GetterState& operator=(GetterState&&);\nprivate:")}, False),
+        ("unknown receiver type", {"caller": caller.replace(
+            "auto* const state = &GetterState::instance();", "auto* const state = lookup();")}, False),
+        ("mutable pointer receiver", {"caller": caller.replace(
+            "auto* const state", "auto* state")}, False),
+        ("same-name unrelated owner", {"header": header + "class OtherState {};\n",
+            "caller": caller.replace("GetterState::instance()", "OtherState::instance()")}, False),
+        ("receiver local shadow", {"caller": caller.replace(
+            "static const auto& threshold", "auto* state = lookup();\n            static const auto& threshold")}, False),
+        ("receiver structured-binding shadow", {"caller": caller.replace(
+            "static const auto& threshold", "auto [state, other] = pair();\n            static const auto& threshold")}, False),
+        ("receiver parameter shadow", {"caller": caller.replace(
+            "const Items& items", "GetterState* state")}, False),
+        ("initializer capture changes receiver", {"caller": caller.replace(
+            "[state]", "[state = lookup()]")}, False),
+        ("duplicate class basename", {"header": header +
+            "namespace unrelated { class GetterState {}; }\n"}, False),
+        ("duplicate getter definition", {"definition": definition + """
+const int& GetterState::threshold() const {
+    static const int different = 1;
+    return different;
+}
+"""}, False),
+        ("non-native singleton factory", {"definition": definition.replace(
+            "static GetterState state;\n    return state;", "return lookup_state();")}, False),
+        ("same-named function-typed data remains unsafe", {"header": header +
+            "struct Other { const int (&threshold)(); };\n"}, False),
+    ]
+    bad = 0
+    key = "PROSPER_GETTER_PRINT+PROSPER_GETTER_THRESHOLD"
+    for label, changes, want in cases:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "src").mkdir()
+            source = {
+                "config.hpp": changes.get("header", header),
+                "config.cpp": changes.get("definition", definition).replace(
+                    "INITIALIZER", changes.get("initializer", initializer)),
+                "callback.cpp": changes.get("caller", caller),
+                "consumer.cpp": consumer,
+            }
+            for name, text in source.items():
+                (root / "src" / name).write_text(text, encoding="utf-8")
+            files, _preds, findings = scan_tree(root)
+            if len(files) != 4:
+                _apparatus_failure("the cached-getter cross-file arm")
+                return 1
+            got = any(f.kind == "TWO-GATE" and Finding.render(f.gates) == key for f in findings)
+            if got != want:
+                bad += 1
+                print(f"  [FAIL] cached getter: {label}: got={got}, want={want}")
+            elif verbose:
+                print(f"  [ok]   cached getter: {label}")
+            if not changes:
+                _files, _preds, disabled = scan_tree(root, follow_getters=False)
+                if any(f.kind == "TWO-GATE" and Finding.render(f.gates) == key for f in disabled):
+                    bad += 1
+                    print("  [FAIL] cached getter: positive must vanish with the bridge disabled")
+    # Seed the valid member join AND call a same-named getter through an unknown owner in the
+    # same tree. Without this arm the negative receiver cases are also satisfied by retiring
+    # `threshold` globally, and do not exercise pass 2's now-live member-data expansion.
+    for label, receiver in [("unknown", "lookup()"), ("other owner", "&OtherState::instance()")]:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "src").mkdir()
+            for name, text in {
+                    "config.hpp": header + "class OtherState {};\n",
+                    "config.cpp": definition.replace("INITIALIZER", initializer),
+                    "callback.cpp": caller,
+                    "consumer.cpp": consumer,
+                    "unrelated.cpp": """
+void unrelated() {
+    auto* const state = RECEIVER;
+    const auto& local = state->threshold();
+    if (local) {
+        if (getenv("PROSPER_GETTER_PRINT")) fprintf(stderr, "x");
+    }
+}
+""".replace("RECEIVER", receiver)}.items():
+                (root / "src" / name).write_text(text, encoding="utf-8")
+            files, _preds, findings = scan_tree(root)
+        positive = any(f.kind == "TWO-GATE" and f.where.startswith("src/consumer.cpp:")
+                       and Finding.render(f.gates) == key for f in findings)
+        leaked = any(f.kind == "TWO-GATE" and f.where.startswith("src/unrelated.cpp:")
+                     for f in findings)
+        if len(files) != 5 or not positive or leaked:
+            bad += 1
+            print(f"  [FAIL] cached getter: seeded-context {label} receiver: "
+                  f"positive={positive}, leaked={leaked}, files={len(files)}")
+        elif verbose:
+            print(f"  [ok]   cached getter: seeded-context {label} receiver stays unknown")
+    if not bad:
+        print(f"  [ok]   cached-getter resolution: {len(cases) + 2} cross-file arms, bridge-off control")
+    return bad
+
+
 def load_baseline(path: Path) -> dict[str, str]:
     entries = {}
     if not path.is_file():
@@ -2553,6 +2930,7 @@ def main() -> int:
         print(f"  [ok]   temp root {tmp} is a build-tree path -- the #2658 arm is live")
     if (run_exclusion_test(args.verbose) or run_self_test(args.verbose)
             or run_member_resolution_test(args.verbose)
+            or run_cached_getter_test(args.verbose)
             or run_key_stability_test(args.verbose)
             or run_baseline_integrity_test(args.verbose)):
         return 1
