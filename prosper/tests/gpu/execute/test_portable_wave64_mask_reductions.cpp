@@ -124,6 +124,24 @@ int main(int argc, char** argv) {
     CHECK(!prosper::gpu::recompile_compute(exec_count, std::size(exec_count), nullptr, config).empty());
     config.local_x = 16;
     CHECK(prosper::gpu::recompile_compute(exec_count, std::size(exec_count), nullptr, config).empty());
+    // A padded 64-invocation host workgroup is not a complete 64-lane guest wave. The
+    // complement contains bits belonging to absent guest lanes, not just the launched prefix.
+    const uint32_t partial_complement[] = {
+        0xbe86087eu, // s_not_b64 s[6:7],exec
+        0xbe841006u, // s_bcnt1_i32_b64 s4,s[6:7]
+        0xbf8a0000u, // s_barrier
+        0x7e020204u, // v_mov_b32 v1,s4
+        0xbf810000u,
+    };
+    config.local_x = 64;
+    config.exact_thread_extent = true;
+    config.threads_x = 16;
+    config.threads_y = config.threads_z = 1;
+    CHECK(prosper::gpu::recompile_compute(partial_complement,
+        std::size(partial_complement), nullptr, config).empty());
+    config.threads_x = 64;
+    CHECK(!prosper::gpu::recompile_compute(partial_complement,
+        std::size(partial_complement), nullptr, config).empty());
 
     auto overwritten = code;
     overwritten[8] = 0xbe87107eu; // count overwrites saved mask's HIGH word

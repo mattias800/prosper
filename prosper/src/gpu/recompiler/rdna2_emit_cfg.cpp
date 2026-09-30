@@ -2161,7 +2161,7 @@ bool emit_cfg_state_machine(
     };
     auto portable_mask_reduction_candidate = [&](const Rdna2Inst& in) {
         return b.is_compute && b.wave_size == 64 && !b.native_subgroup_size &&
-            b.local_count >= 64 && b.local_count % 64 == 0 &&
+            !initial_active && b.local_count >= 64 && b.local_count % 64 == 0 &&
             (in.src[0].kind == OperandKind::SGPR ||
              (in.src[0].kind == OperandKind::Special &&
               (in.src[0].value == 106 || in.src[0].value == 126))) &&
@@ -6462,6 +6462,7 @@ bool emit_cfg_state_machine(
         // Scalar mask operations ignore EXEC for their destination write. All launched guest
         // lanes publish the physical source bit, including EXEC-off lanes. The static event tag
         // and the guest-wave slice prevent unrelated sites/waves from supplying mask bits.
+        // A padded ACTIVE prefix was excluded at admission: it cannot supply absent mask bits.
         const uint32_t pending = b.load_function(b.t_bool, mask_reduction_pending_var);
         const uint32_t mask = b.load_function(b.t_bool, mask_reduction_mask_var);
         const uint32_t tag = b.load_function(b.t_u32, mask_reduction_event_var);
