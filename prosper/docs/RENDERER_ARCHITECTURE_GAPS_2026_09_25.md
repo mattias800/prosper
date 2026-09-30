@@ -310,6 +310,15 @@ Partial machinery already exists (`rtt_gpu_seed_import_extent_compatible`,
 
 ## Ruled out
 
+**RULED OUT (2026-09-30): a balanced draw census at app exit proves a final accounting total.**
+On a bounded GTA V route, one registered report saw balanced counters and a later report in the
+same flush saw an in-flight draw and a delta of one. The guest was not joined: the submit gate
+drains queue calls, not CPU pass preparation. Completed windows had zero unaccounted draws.
+The exit aggregate therefore names its unverified quiescence even when balanced, and reports a
+`snapshot-delta` separately from completed-pass `UNACCOUNTED` and its unchanged alarm counter.
+A counter-producing worker held live across the registered flush constrains that distinction;
+it does not certify a quiescent game exit. See [#3973](https://github.com/mattias800/prosper/issues/3973).
+
 **RULED OUT (2026-09-29): Stage 2 deferred graphics waits are necessary for GTA V's observed
 3.6 guest flips/s collapse.** On main `5680c4255ef1`, a sustained eight-compiler load reproduces
 3.43 guest flips/s with deferred wait OFF, against 9.38 before the load; the matched quiet ON

@@ -95,12 +95,16 @@ public:
     // always prints when the two independent routes disagree.
     void report_pass();
 
-    // One process-lifetime summary line, printed at end of run when any draw was seen, via
+    // One process-lifetime snapshot line, printed at end of run when any draw was seen, via
     // `register_exit_report` -- NOT std::atexit, which every frontend here skips (#3353). This is a
     // COMPLEMENT to report_pass(), never a replacement: a run that ends in a device loss may never
     // reach it, which is exactly why the per-pass report is the primary and this is the
     // convenience. It also separates the two states the per-pass report cannot distinguish by its
     // silence -- "every pass was healthy" and "no pass ever ran" both print nothing per-pass.
+    // Loads are independent and no caller proves CPU quiescence. RUN SNAPSHOT therefore always
+    // says quiescence=unverified, even when the numbers balance. A snapshot-delta may reflect an
+    // in-flight pass or interleaved loads, not a completed-pass accounting error (#3973).
+    // Completed-pass UNACCOUNTED reports and their performance-alarm counter remain authoritative.
     // Returns false when no draw was seen; see diagnostics/exit_census.hpp.
     bool report_totals();
 
