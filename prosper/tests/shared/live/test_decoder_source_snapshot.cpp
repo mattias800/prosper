@@ -176,6 +176,19 @@ int main(int argc, char** argv) {
                 check(hit.decodes == 0 && hit.late_snapshot_read_bytes == 0 &&
                       hit.decoder_snapshot_candidate_bytes == 0,
                       "unchanged source reuses its persistent decoded image");
+                if (format == DataFormat::Float32 && source_iteration == 0 && generation == 0) {
+                    // #3892: a registration references the same process cache. Pixels alone would
+                    // also pass after clearing it and decoding again, so inspect the decode work.
+                    prosper::frontend::register_live_renderer(".", false);
+                    reset_texture_decode_scope_stats();
+                    check(render(producer) == actual,
+                          "re-registration preserves the cached source's exact pixels");
+                    const auto registered_hit = texture_decode_scope_stats();
+                    check(registered_hit.decodes == 0 &&
+                          registered_hit.late_snapshot_read_bytes == 0 &&
+                          registered_hit.decoder_snapshot_candidate_bytes == 0,
+                          "re-registration reuses the process decoded cache without decoding again");
+                }
             }
             ++source_iteration;
         }

@@ -3,11 +3,18 @@
 `register_live_renderer` (in `../live_renderer.cpp`) installs one callback that turns each decoded
 guest submit into GPU work. It grew into a single 12,000-line lambda; #3892 carves it along the
 responsibilities it already had. This folder holds what has been carved out so far. The callback
-itself still lives in `live_renderer.cpp` and still owns all the state.
+itself still lives in `live_renderer.cpp`. Each registration references the same process-prelude
+owner; the callback keeps its thread-local state and the original lazy binding sites.
 
 - `callback_types.hpp` — the types, aliases and constants the callback used to declare locally
   (`RenderTiming`, `BuiltFrameResources`, the depth-snapshot records, `RC`, `RenderClock`, ...).
-  Types only: the callback's statics stay in the callback.
+  Types only: state ownership belongs to the process-prelude owner or the callback.
+- `callback_state.{hpp,cpp}` — the callback prelude's process-lifetime state, shared across
+  registrations. Registration constructs empty slots, and native function-static guards initialize
+  each value only when its original callback binding is first reached. Keep every binding in place
+  and in order across the render-last and warmup returns; the RTT-log bounds are reached between
+  those returns. Thread-local caches, pins, submit ordinals and timing populations stay in the
+  callback, with their existing per-thread lifetime across registrations.
 - `guest_reads.hpp` — `safe_span` / `safe_copy` / `safe_equal`, the bounds-checked guest reads.
 - `draw_resources.{hpp,cpp}` — `build_draw_frame_resources`: one draw's VS/PS resource tables to
   backend frame resources (the texture- and buffer-reference resolution chain; the hottest code in

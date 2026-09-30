@@ -3144,6 +3144,7 @@ endif()
       target_link_libraries(boot_trace PRIVATE Vulkan::Vulkan)
       target_compile_definitions(boot_trace PRIVATE PROSPER_HAVE_VULKAN=1)
       add_library(prosper_live_renderer STATIC frontends/shared/live/live_renderer.cpp
+                                               frontends/shared/live/submit_renderer/callback_state.cpp
                                                frontends/shared/live/submit_renderer/draw_resources.cpp
                                                frontends/shared/live/submit_renderer/timing_report.cpp
                                                frontends/shared/live/submit_renderer/backend_draws.cpp
@@ -3476,6 +3477,7 @@ endif()
       # boot_trace so BOTH boot_trace and prosper-app register the SAME renderer instead of
       # duplicating it. Needs render_runner.h (tests/) and refvs.inc (tools/boot_trace/).
       add_library(prosper_live_renderer STATIC frontends/shared/live/live_renderer.cpp
+                                               frontends/shared/live/submit_renderer/callback_state.cpp
                                                frontends/shared/live/submit_renderer/draw_resources.cpp
                                                frontends/shared/live/submit_renderer/timing_report.cpp
                                                frontends/shared/live/submit_renderer/backend_draws.cpp

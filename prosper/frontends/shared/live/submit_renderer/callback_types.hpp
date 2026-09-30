@@ -3,8 +3,8 @@
 // modules carved out of it (#3892). Each was a local type inside that callback; they moved here
 // verbatim, unchanged, so that a function outside the callback can name them.
 //
-// Nothing here owns state. The callback's statics stay where they were declared; only the TYPES
-// of that state live here.
+// Nothing here owns state. callback_state.hpp owns the process prelude; the callback keeps its
+// thread-local state and original lazy bindings. Only the TYPES of that state live here.
 
 #include "gpu/resources/shader_resources.hpp"      // ResourceClass, DescriptorValidationReport
 #include "shared/texture/validation_census.hpp"     // TextureValidationCensus

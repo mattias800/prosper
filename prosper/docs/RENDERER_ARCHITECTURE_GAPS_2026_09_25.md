@@ -331,6 +331,22 @@ it does not directly prove decoded-cache, texture-identity or thread-local-cache
 See [#3968](https://github.com/mattias800/prosper/pull/3968) and
 [#3892](https://github.com/mattias800/prosper/issues/3892).
 
+**RULED OUT (2026-09-30): unchanged pixels after renderer re-registration prove the decoded
+cache survived.** A private registration-clears-cache mutation preserves exact pixels but fails
+the new no-redecode assertion in all three decoder fixture modes (normal, eager snapshot control
+and write-watch). The restored renderer passes all four registration/decoder fixtures. Cache
+persistence requires observing decode work as well as pixels; this does not prove every cache or
+thread-local payload's lifetime. See [#3974](https://github.com/mattias800/prosper/pull/3974).
+
+**RULED OUT (2026-09-30): every prelude setting below the render-last return is first reached
+inside the warmup window.** The RTT-log submit bounds, validation-census setting and minimum RTT
+timing draw count are initialized after the render-last return but before the warmup return.
+The decode-budget initializer is reached after both returns. Moving these as one eagerly
+initialized block would change the contract even if the sampled budget harness passed. The
+process-prelude owner keeps each lazy binding at its original declaration site; its thread-local
+cache and timing state remain in the callback. See the source-derived reach-order audit and
+bounded state plan on [#3892](https://github.com/mattias800/prosper/issues/3892#issuecomment-5900509881).
+
 **RULED OUT as the first visibility boundary for Astro Bot's observed opening route (2026-09-29):
 the CPU read of the next indirect dispatch's argument triplet.** An exact argument-read observer
 and binding-60 output selector found the first read at `0x5074063e0+12`, disjoint from the pending
