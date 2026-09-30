@@ -336,24 +336,26 @@ int main(int argc, char** argv) {
               "next draw realizes the new memory selector instead of reusing the old range");
         if (next_made) observe_pixels(next, vertex, vertex ? 1.5f : 0.75f, arm, 0.375f);
 
-        auto& refused = register_program(vertex, Load::RuntimeSelector, false);
-        state = state_for(vertex ? refused : plain_vs, vertex ? plain_ps : refused,
-                          guest, reinterpret_cast<uint64_t>(selector), metadata);
-        const auto original_table = build_stage_table(state,
-            reinterpret_cast<uint64_t>(refused.code.data()), !vertex, 3u);
-        check(original_table && !original_table->resources.empty() &&
-              !original_table->by_fetch_pc(refused.load_pc), arm,
-              "runtime-selector negative has a legitimate nonempty stage table without raw backing");
-        const auto reason = vertex ? Perf::DropReason::ShaderRecompileVertex
-                                   : Perf::DropReason::ShaderRecompileFragment;
-        const uint64_t before = Perf::ledger().drop_reasons[static_cast<size_t>(reason)].load();
-        size_t backend_calls = 0;
-        const auto no_image = execute_gpustate(state, [&](const std::vector<DrawItem>&) {
-            ++backend_calls; return std::vector<uint8_t>{};
-        }, 64u);
-        check(backend_calls == 0u && no_image.empty() &&
-              Perf::ledger().drop_reasons[static_cast<size_t>(reason)].load() == before + 1u, arm,
-              "actual executor refuses unbacked numeric data with the exact stage drop before backend");
+        for (bool wide8 : {false, true}) {
+            auto& refused = register_program(vertex, Load::RuntimeSelector, wide8);
+            state = state_for(vertex ? refused : plain_vs, vertex ? plain_ps : refused,
+                              guest, reinterpret_cast<uint64_t>(selector), metadata);
+            const auto original_table = build_stage_table(state,
+                reinterpret_cast<uint64_t>(refused.code.data()), !vertex, 3u);
+            check(original_table && !original_table->resources.empty() &&
+                  !original_table->by_fetch_pc(refused.load_pc), arm,
+                  "runtime-selector negative has a legitimate nonempty stage table without raw backing");
+            const auto reason = vertex ? Perf::DropReason::ShaderRecompileVertex
+                                       : Perf::DropReason::ShaderRecompileFragment;
+            const uint64_t before = Perf::ledger().drop_reasons[static_cast<size_t>(reason)].load();
+            size_t backend_calls = 0;
+            const auto no_image = execute_gpustate(state, [&](const std::vector<DrawItem>&) {
+                ++backend_calls; return std::vector<uint8_t>{};
+            }, 64u);
+            check(backend_calls == 0u && no_image.empty() &&
+                  Perf::ledger().drop_reasons[static_cast<size_t>(reason)].load() == before + 1u, arm,
+                  "actual executor refuses unbacked numeric data with the exact stage drop before backend");
+        }
     }
     unmap(guest, Bytes, 0, 0, 0, 0);
     std::printf("graphics raw-wide upload: %d failures (%s)\n", failures,
