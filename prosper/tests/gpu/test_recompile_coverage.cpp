@@ -1403,12 +1403,9 @@ int main() {
     CHECK(raw_wide_data_pcs(raw_x8_no_effect_sopp).empty(),
           "no-effect SOPP instructions preserve descriptor-only raw wide admission");
 
-    // #3951: the register-offset refusal above belongs to the compute shell only. GTA V's vertex
-    // programs (0x2042f6b200 pc34, 0x2042f6ae00 pc37, ...) carry exactly this shape --
-    // `s_load_dwordx4 s[8:11], s[14:15], vcc_hi` (words f4080207 d6000000; wave32 uses VCC_HI
-    // as an ordinary SGPR) with a loaded word read as data -- and refusing them dropped ~99.7% of
-    // gameplay draws. Graphics stages keep the pre-#3944 placeholder lowering until these loads
-    // have real backing; the SAME body in the compute shell must still refuse.
+    // Numeric register-offset words cannot use descriptor placeholders in any stage. These
+    // synthetic observers intentionally differ from the captured GTA descriptor-only program;
+    // scalar-defined VCC_HI is valid at either wave size when the load has proven backing.
     const std::array<uint32_t, 7> raw_x4_vcc_hi_vertex = {
         0xbeeb0380u,                 // s_mov_b32 vcc_hi, 0 (register SOFFSET)
         0xf4080207u, 0xd6000000u,   // s_load_dwordx4 s[8:11], s[14:15], vcc_hi
@@ -1424,10 +1421,10 @@ int main() {
     };
     CHECK(raw_wide_data_pcs(raw_x4_vcc_hi_vertex) == std::vector<uint32_t>{1u} &&
               raw_wide_data_pcs(raw_x4_vcc_hi_compute) == std::vector<uint32_t>{1u},
-          "the GTA-shaped vcc_hi register-offset x4 load is classified as raw wide data");
-    CHECK(!recompile_vertex(raw_x4_vcc_hi_vertex.data(), std::size(raw_x4_vcc_hi_vertex),
-                            &raw_wide_table).empty(),
-          "vertex stage keeps the placeholder lowering for register-offset raw wide data (#3951)");
+          "the synthetic vcc_hi register-offset x4 observer is classified as raw wide data");
+    CHECK(recompile_vertex(raw_x4_vcc_hi_vertex.data(), std::size(raw_x4_vcc_hi_vertex),
+                           &raw_wide_table).empty(),
+          "vertex stage refuses unbacked numeric register-offset raw wide data (#3951)");
     CHECK(recompile_valu(raw_x4_vcc_hi_compute.data(), std::size(raw_x4_vcc_hi_compute), 1, 0,
                          &raw_wide_table).empty(),
           "compute stage still refuses the same register-offset raw wide data load (#3944)");
@@ -1439,9 +1436,9 @@ int main() {
         0xbf810000u,
     };
     CHECK(raw_wide_data_pcs(raw_x4_data_fragment) == std::vector<uint32_t>{1u} &&
-              !recompile_fragment(raw_x4_data_fragment.data(), std::size(raw_x4_data_fragment),
-                                  &raw_wide_table).empty(),
-          "pixel stage keeps the placeholder lowering for register-offset raw wide data (#3951)");
+              recompile_fragment(raw_x4_data_fragment.data(), std::size(raw_x4_data_fragment),
+                                 &raw_wide_table).empty(),
+          "pixel stage refuses unbacked numeric register-offset raw wide data (#3951)");
 
     ShaderResourceTable smem_x16_missing_rt;
     smem_x16_missing_rt.resources.push_back(x16_texture(4, 2));

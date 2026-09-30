@@ -544,7 +544,8 @@ inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource)
         resource.fetch_pc != UINT32_MAX && resource.srt_offset == UINT32_MAX &&
         resource.sgpr_base == UINT32_MAX && resource.table_index_count == 0u &&
         resource.scalar_buffer_dword_count == 0u && !resource.nested_raw_snapshot_admitted &&
-        (resource.gpu_addr & 3u) == 0u &&
+        resource.gpu_addr > 0x10000u && (resource.gpu_addr & 3u) == 0u &&
+        resource.gpu_addr <= UINT64_MAX - resource.size &&
         (resource.host_data ? resource.host_data_size >= resource.size :
                               resource.host_data_size == 0u);
 }

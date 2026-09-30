@@ -5653,13 +5653,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             //    (a runtime user-SGPR we have no value for) still rejects — never fold as 0.
             const bool soff_null = (in.src[1].kind == OperandKind::Special && in.src[1].value == 125);
             uint32_t soff_bits = 0; bool soff_dyn = false;
-            // #3951: the register-offset refusal is scoped to the COMPUTE shell, which is where it
-            // was established (#3944: Uncharted's full-resolution compute writer). Vertex and pixel
-            // stages keep their long-standing placeholder lowering for register-offset x4/x8 loads
-            // until those loads have real backing: refusing them dropped every draw that used them
-            // (GTA V gameplay 1.27M -> 4.3k draws per run; Blue Prince's title and Astro Bot went
-            // black). The placeholder is still WRONG for a word read as data -- it is the prior
-            // behaviour restored, not a proof -- so it stays visible under PROSPER_DBG below.
+            // Numeric register-offset x4/x8 words require real backing in every stage. Descriptor
+            // assembly alone is excluded by the full-stream derived-use classification; its exact
+            // consumer-PC route remains valid without treating descriptor placeholders as data.
             // The bounded immediate current-byte proof (#3956) is stage-independent and unchanged.
             const bool raw_wide_register_offset_data =
                 rt && (in.opcode == 0x2 || in.opcode == 0x3) && !soff_null &&
@@ -5686,13 +5682,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 valid_raw_register_snapshot_resource(*register_source) &&
                 register_source->fetch_pc == in.pc && register_source->size == n * 4u &&
                 shader_resource_buffer_binding_bytes(*register_source) >= n * 4u;
-            static std::atomic<uint32_t> raw_wide_placeholder_logs{0};
-            if (raw_wide_register_offset_data && !backed_register_wide && !b.is_compute && getenv("PROSPER_DBG") &&
-                raw_wide_placeholder_logs.fetch_add(1, std::memory_order_relaxed) < 64)
-                fprintf(stderr,
-                        "[smem-placeholder] pc=%u reason=raw-wide-data-graphics-placeholder "
-                        "op=0x%x (#3951: register-offset data words lowered as zero)\n",
-                        in.pc, in.opcode);
             // The bounded current-byte proof below covers an unchanged ENTRY pointer. A pointer
             // loaded into SGPRs by this shader can still name numeric x4/x8 data, but its load is
             // absent from that proof. In the compute shell, do not let the descriptor-only route
@@ -5701,15 +5690,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 sreg_range_written(rs, in.src[0].value, 2);
             if (rt && (in.opcode == 0x2 || in.opcode == 0x3) &&
                 rs.smem_raw_wide_data_loads.contains(in.pc) &&
-                ((!soff_null && (b.is_compute || backed_register_wide ||
-                               (register_source && register_source->raw_register_snapshot))) ||
+                (!soff_null ||
                  (soff_null && rs.smem_raw_immediate_wide_data_loads.contains(in.pc)) ||
                  nested_raw_wide_data)) {
                 // Keep the existing immediate descriptor route for loads outside the bounded
                 // current-byte proof. Some established routed tables carry only the resulting
                 // resource, without a source binding at this load PC. The may-use census still
                 // reports numeric/uncertain reads; it cannot turn that legacy route into a
-                // current-byte observation. Register-offset data retains its prior refusal.
+                // current-byte observation. Register-offset data requires backing in every stage.
                 const ShaderResource* exact = rt->by_fetch_pc(in.pc);
                 const bool backed_immediate_wide = soff_null && !nested_raw_wide_data &&
                     (n == 4u || n == 8u) &&
