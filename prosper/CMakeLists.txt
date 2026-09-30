@@ -1485,10 +1485,6 @@ if(TARGET prosper_core)
   target_include_directories(test_rtt_scale PRIVATE frontends)
   add_test(NAME rtt_scale COMMAND test_rtt_scale)
 
-  add_executable(test_seed_extent_history frontends/shared/tests/test_seed_extent_history.cpp)
-  target_include_directories(test_seed_extent_history PRIVATE frontends)
-  add_test(NAME seed_extent_history COMMAND test_seed_extent_history)
-
   # MRT-prefix truncation: which bound colour slot may join a pass, and which extent comparisons are
   # evidence of a real conflict rather than an unmeasured 0x0. Pure integer arithmetic, no deps.
   add_executable(test_mrt_extent frontends/shared/tests/test_mrt_extent.cpp)

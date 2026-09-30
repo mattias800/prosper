@@ -5323,13 +5323,15 @@ falsification.
   gameplay with HUD remain intact. This proves a compiler-contention mechanism, not the precise historical
   worker schedule. [#3948 causal controls](https://github.com/mattias800/prosper/issues/3948#issuecomment-5901138310).
 
-- **Any CPU attachment-seed extent mismatch identifies the depth-only readback clobber.**
-  False in the retained pre/post-#3907 readback traces: the fixed masked 3840x2160 pass still
-  requests a seed from the 2560x1440 HDR entry, but never publishes its colour and never produces
-  the opposite miss. The pre-fix trace misses in both directions at that same address. The
-  `rtt-seed-extent-churn` alarm therefore observes opposite extent misses; legitimate colour
-  writers can also alias an address at different extents, so the signature needs write-mask and
-  publication inspection rather than an automatic black-frame diagnosis. #3891.
+- **CPU attachment-seed extent mismatches, including opposite miss pairs, identify the
+  depth-only readback clobber.** False. The retained pre/post-#3907 traces showed a one-way
+  mismatch even after the fixed masked pass stopped publishing its clear. The later actual
+  300-second Performance-story CPU-readback controls also falsified opposite pairs as a
+  discriminant: restoring the old guard produced540 reversals over29,117 checks and fired in
+  32/55 windows, while the fixed guard still produced310 over28,445 checks and fired30/55.
+  Both arms exited0. The proposed generic extent alarm was withdrawn; legitimate colour aliases
+  require an observation of the actual publication/write-mask invariant. These diagnostic-path
+  arms are correctness calibration, not production throughput evidence. #3891, #3907.
 
 - **The 61-draw deferred capture at `PROSPER_GPU_CAPTURE_AT=286` can use its last colour target
   as a pixel oracle.** False on submit 4237 of the 2026-09-28 `reach-performance-story.pad` run:

@@ -268,15 +268,18 @@ windows cover about 89% of graphics waits; the broken deferred-envelope arms cov
 68-71%. This uses the existing counters at window close and adds no event hook. Check timestamp
 support, query results and envelope closure before drawing performance conclusions from it.
 
-**CPU attachment seed extent churn** (#3891, #3907). `rtt-seed-extent-churn` counts opposite
-extent misses at the same CPU RTT address: A-to-B followed by B-to-A. One observed pair is enough
-to report, independent of sensitivity, because it already contains two misses. The fixed
-depth-only pass still requests B from A but never publishes B, so a single mismatch or repeated
-one-way misses are quiet. The bounded history lives in each existing RTT entry and resets on a
-matching seed, format change or volume target; it rechecks the address after a resolve copies an
-entry. The observer changes no seed or publication policy and adds no guest reads or clocks.
-Legitimate colour writers can produce the same alias pattern, so inspect `PROSPER_RTTLOG` and
-write masks before diagnosing a clobber. No CPU seed decisions in a window means **NO DATA**.
+**Colourless CPU pass publication** (#3891, #3907). `rtt-colorless-publication` counts an
+actual slot-0 CPU pass-readback publication without any colour-write mask. A single violation
+reports immediately, independent of sensitivity. The candidate count covers guarded decisions,
+including depth-only candidates that correctly publish nothing; no candidates or violations is
+**NO DATA**, whereas observed candidates with zero violations are quiet. The predicate accepts
+both mask representations exactly as the existing guard does, and is evaluated only when that
+CPU fallback guard would inspect masks. The hook changes no publication policy and adds no guest
+reads, clocks or entry state. Compute snapshots, resolve copies and GPU materialization are
+outside this site's contract. Extent reversals alone were falsified by actual GTA controls:
+restoring the old guard produced540 reversals, but the fixed guard still produced310 in matching
+300-second CPU-readback routes, with32/55 versus30/55 windows firing. The generic alias signal
+was withdrawn rather than assigning a threshold that did not separate the two populations.
 
 **A window nobody saw** (#3891, #3951). `gpu-present-stalled` fires when a GPU-present frontend
 (`Gauge::GpuPresentActive`, set by `set_gpu_present_active`) presented nothing in a window, neither

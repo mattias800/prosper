@@ -107,7 +107,7 @@ const std::vector<const char*>& rule_names() {
         "rtt-destination-refused", "color-target-count-ceiling", "gpu-sync-wait",
         "gpu-present-stalled",
         "gpu-device-time-coverage",
-        "rtt-seed-extent-churn",
+        "rtt-colorless-publication",
     };
     return names;
 }
@@ -131,7 +131,9 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
     if (r == "gpu-device-time-coverage")
         return w.events(Cost::GpuWaitCompute) >= kGpuDeviceTimeCoverageMinWaits ||
                w.events(Cost::GpuWaitGraphics) >= kGpuDeviceTimeCoverageMinWaits;
-    if (r == "rtt-seed-extent-churn") return w.count(Counter::CpuRttSeedChecks) != 0;
+    if (r == "rtt-colorless-publication")
+        return w.count(Counter::CpuRttPublicationChecks) != 0 ||
+               w.count(Counter::CpuRttColorlessPublications) != 0;
     // Only a frontend with a GPU-present consumer is expected to present at all; a window without
     // enough guest flips cannot say whether presents SHOULD have happened.
     if (r == "gpu-present-stalled")
@@ -146,7 +148,7 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
 
 uint32_t sustain_windows(const char* rule) {
     const std::string r = rule ? rule : "";
-    if (r == "rtt-seed-extent-churn") return kRttSeedExtentSustainWindows;
+    if (r == "rtt-colorless-publication") return kRttColorlessPublicationSustainWindows;
     if (r == "dropped-draws" || r == "skipped-dispatches" || r == "gpu-memory-off-device" ||
         r == "unaccounted-draws" || r == "unimplemented-hle-calls" ||
         r == "diagnostic-path-active")
@@ -849,21 +851,19 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
         }
     }
 
-    // CPU RTT attachment seeds missed in both directions between two extents at one address.
-    // This identifies the #3907 publication signature without asserting a black-frame cause.
-    if (w.count(Counter::CpuRttSeedChecks) != 0 &&
-        w.count(Counter::CpuRttSeedExtentReversals) >= kRttSeedExtentReversalsPerWindow) {
+    // A pass with no slot-0 colour writer actually replaced the CPU colour cache (#3907).
+    // Ordinary depth-only candidates denied by the guard and intentional colour aliases are quiet.
+    if (w.count(Counter::CpuRttColorlessPublications) >= kRttColorlessPublicationsPerWindow) {
         AlarmFiring a;
-        a.rule = "rtt-seed-extent-churn";
-        a.value = static_cast<double>(w.count(Counter::CpuRttSeedExtentReversals));
-        a.unit = "extent reversals";
-        a.threshold = kRttSeedExtentReversalsPerWindow;
-        a.detail = format("cpu-seed-checks=%llu",
-                          (unsigned long long)w.count(Counter::CpuRttSeedChecks));
-        a.hint = "CPU RTT seeds missed in both directions between extents at the same address; "
-                 "inspect PROSPER_RTTLOG seed misses and colour-write masks for depth-only "
-                 "readbacks replacing colour (#3907). Intentional colour aliases can also "
-                 "produce this signature";
+        a.rule = "rtt-colorless-publication";
+        a.value = static_cast<double>(w.count(Counter::CpuRttColorlessPublications));
+        a.unit = "colourless publications";
+        a.threshold = kRttColorlessPublicationsPerWindow;
+        a.detail = format("cpu-publication-checks=%llu",
+                          (unsigned long long)w.count(Counter::CpuRttPublicationChecks));
+        a.hint = "slot-0 CPU pass readbacks replaced colour without any colour-write mask; "
+                 "inspect the per-target CPU publication guard and PROSPER_RTTLOG (#3907). "
+                 "This counter excludes compute snapshots, resolve copies and GPU materialization";
         out.push_back(std::move(a));
     }
 

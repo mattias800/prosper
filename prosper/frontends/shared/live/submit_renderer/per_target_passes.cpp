@@ -585,20 +585,6 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                 sit->second.format == pass_format &&
                 sit->second.has_uniform_color)
                 retained_uniform_clear = sit->second.uniform_color.data();
-            if (!live_gpu_targets && prosper::diagnostics::perf::enabled()) {
-                using prosper::diagnostics::perf::Counter;
-                if (!producer_volume_depth)
-                    prosper::diagnostics::perf::add(Counter::CpuRttSeedChecks);
-                if (sit != g_rtt.end()) {
-                    auto& history = sit->second.seed_extent_history;
-                    if (producer_volume_depth || sit->second.volume_depth)
-                        history.reset();
-                    else if (history.observe(base,
-                            {sit->second.w, sit->second.h, static_cast<uint32_t>(sit->second.format)},
-                            {gw, gh, static_cast<uint32_t>(pass_format)}))
-                        prosper::diagnostics::perf::add(Counter::CpuRttSeedExtentReversals);
-                }
-            }
             // Gated seed-decision diagnostic: a pass that should LOAD prior target
             // content but silently falls back to its clear color erases everything the
             // earlier pass produced (an opaque-black clear wipes a transparent UI RT —
@@ -1018,6 +1004,19 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             ? prosper::frontend::completed_source_submit(
                   prosper::test::persistent_color_producer_source(*completed_target))
             : 0;
+        // Preserve the existing fallback guard's short circuit: ordinary GPU publications do
+        // not scan draw masks. Count this site's evaluated candidates, including denied ones.
+        const bool cpu_publication_candidate =
+            base && !color_target_call.writes && !pass_pixels->empty();
+        const bool cpu_pass_writes_colour = cpu_publication_candidate &&
+            std::any_of(pass.begin(), pass.end(), [](const prosper::gpu::DrawItem* d) {
+                // Direct/replayed items may carry the named mask beside a stale array entry.
+                return prosper::frontend::mrt_write_mask(*d, 0) != 0 ||
+                       d->ps.color_write_mask != 0;
+            });
+        if (cpu_publication_candidate && prosper::diagnostics::perf::enabled())
+            prosper::diagnostics::perf::add(
+                prosper::diagnostics::perf::Counter::CpuRttPublicationChecks);
         if (base && color_target_call.writes) {
             RttSurf& surface = g_rtt[base];
             surface.w = gw;
@@ -1087,14 +1086,7 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                     }
                 }
             }
-        } else if (base && !pass_pixels->empty() &&
-                   std::any_of(pass.begin(), pass.end(), [](const prosper::gpu::DrawItem* d) {
-                       // Either representation of the slot-0 mask. Live decode keeps them equal;
-                       // direct/replayed items may carry only the named mask beside a stale array
-                       // entry, and those passes do write colour.
-                       return prosper::frontend::mrt_write_mask(*d, 0) != 0 ||
-                              d->ps.color_write_mask != 0;
-                   })) {
+        } else if (cpu_publication_candidate && cpu_pass_writes_colour) {
             // #3907: a pass none of whose draws writes colour slot 0 (CB target mask 0 --
             // GTA V's depth-only 3840x2160 pass whose colour register still names its
             // 2560x1440 HDR target) produced no colour. Publishing its readback -- the
@@ -1113,6 +1105,12 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             surface.gpu_valid = false;
             surface.has_uniform_color = false;
             surface.dcc_metadata_dirty = false;
+            // Observe the actual slot-0 CPU publication, not seed-size aliases or unrelated
+            // compute/resolve/materialization writers. The #3907 guard keeps this zero; its
+            // removal must expose a real colourless publication rather than a noisy signature.
+            if (!cpu_pass_writes_colour && prosper::diagnostics::perf::enabled())
+                prosper::diagnostics::perf::add(
+                    prosper::diagnostics::perf::Counter::CpuRttColorlessPublications);
         }
         const auto post_slot0_done = timing_enabled
             ? RenderClock::now() : RenderClock::time_point{};

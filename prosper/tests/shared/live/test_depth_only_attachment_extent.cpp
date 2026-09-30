@@ -58,8 +58,8 @@ static int readback_path_main(uint64_t guest, const std::vector<uint32_t>& vs,
         return prosper::diagnostics::perf::ledger()
             .counters[static_cast<size_t>(counter)].load(std::memory_order_relaxed);
     };
-    const auto checks_before = count(Counter::CpuRttSeedChecks);
-    const auto reversals_before = count(Counter::CpuRttSeedExtentReversals);
+    const auto checks_before = count(Counter::CpuRttPublicationChecks);
+    const auto violations_before = count(Counter::CpuRttColorlessPublications);
     constexpr uint32_t ColorW = 64, ColorH = 64, AliasW = 32, AliasH = 32;
     const uint64_t Color = guest + 0x100000;
     const uint64_t Depth = guest;
@@ -99,21 +99,21 @@ static int readback_path_main(uint64_t guest, const std::vector<uint32_t>& vs,
               (*snapshot.pixels)[2] == 0,
           "readback path: a depth-only pass keeps the colour target's 64x64 CPU copy");
     (void)render_submit_items({producer}, ColorW, ColorH);
-    check(count(Counter::CpuRttSeedChecks) - checks_before >= 3 &&
-              count(Counter::CpuRttSeedExtentReversals) == reversals_before,
-          "fixed depth-only alias and return to colour measure seed decisions without reversals");
+    check(count(Counter::CpuRttPublicationChecks) - checks_before >= 3 &&
+              count(Counter::CpuRttColorlessPublications) == violations_before,
+          "fixed depth-only alias and return to colour measure publication candidates without violations");
 
-    // Real colour writers can also change an address's extent. Exercise the production observer
-    // with that valid alias, so deleting the hook cannot leave all quiet controls green. The alarm
-    // names extent misses and leaves the cause to inspection; it must not call every alias a clobber.
+    // Real colour writers may legitimately alternate extents at one address. The actual
+    // publication invariant must remain quiet, unlike the falsified extent-reversal signature.
     DrawItem colour_alias = producer;
     colour_alias.color0_width = AliasW; colour_alias.color0_height = AliasH;
     colour_alias.ps.has_viewport = true;
     colour_alias.ps.viewport_w = float(AliasW); colour_alias.ps.viewport_h = float(AliasH);
     (void)render_submit_items({colour_alias}, ColorW, ColorH);
     (void)render_submit_items({producer}, ColorW, ColorH);
-    check(count(Counter::CpuRttSeedExtentReversals) == reversals_before + 1,
-          "real opposite-extent colour writers exercise the seed-reversal hook");
+    check(count(Counter::CpuRttPublicationChecks) - checks_before >= 5 &&
+              count(Counter::CpuRttColorlessPublications) == violations_before,
+          "real opposite-extent colour writers are measured without publication violations");
     std::printf("depth-only attachment extent (readback path): %d failures\n", failures);
     return failures ? 1 : 0;
 }

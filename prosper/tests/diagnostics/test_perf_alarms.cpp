@@ -1028,7 +1028,7 @@ void test_engine() {
         // Ten consecutive windows each dropping 3 draws: every one fires.
         for (int k = 0; k < 10; ++k) {
             l.counters[static_cast<size_t>(Counter::DroppedDrawsFrontend)] += 3;
-            l.counters[static_cast<size_t>(Counter::CpuRttSeedChecks)] += 17;
+            l.counters[static_cast<size_t>(Counter::CpuRttPublicationChecks)] += 17;
             t += 1'000'000'000ull;
             last = engine.on_flip(t, l, 60);
         }
@@ -1062,9 +1062,9 @@ void test_engine() {
     check("JSONL records every evaluated window (12), fired or not",
           count_of(j, "{\"type\":\"window\"") == 12 &&
               j.find("\"dropped_frontend\":3,") != std::string::npos);
-    check("JSONL distinguishes measured CPU seed decisions from absent reversals",
-          count_of(j, "\"cpu_rtt_seed_checks\":17,\"cpu_rtt_seed_extent_reversals\":0") == 10 &&
-              count_of(j, "\"cpu_rtt_seed_checks\":0,\"cpu_rtt_seed_extent_reversals\":0") == 2);
+    check("JSONL distinguishes measured CPU publication candidates from absent violations",
+          count_of(j, "\"cpu_rtt_publication_checks\":17,\"cpu_rtt_colorless_publications\":0") == 10 &&
+              count_of(j, "\"cpu_rtt_publication_checks\":0,\"cpu_rtt_colorless_publications\":0") == 2);
     check("JSONL records the ordinal and the target rate",
           j.find("\"ordinal\":10") != std::string::npos && j.find("\"target_hz\":60") != std::string::npos);
     const std::string summary = slurp(logp);
@@ -1117,7 +1117,7 @@ void test_engine() {
               quiet.find("NO DATA (not measured in any window, so not quiet): "
                          "texture-reference-cost,present-cpu-overhead,present-path-fallback,"
                          "present-slot-trouble,color-target-count-ceiling,gpu-sync-wait,"
-                         "gpu-present-stalled,gpu-device-time-coverage,rtt-seed-extent-churn") != std::string::npos);
+                         "gpu-present-stalled,gpu-device-time-coverage,rtt-colorless-publication") != std::string::npos);
     std::fclose(s);
     std::remove(jsonl.c_str());
     std::remove(logp.c_str());
@@ -1724,33 +1724,34 @@ void test_gpu_device_time_coverage() {
               engine.times_fired("gpu-device-time-coverage") == 1);
 }
 
-void test_rtt_seed_extent_churn() {
+void test_rtt_colorless_publication() {
     auto w = healthy();
-    check("no CPU seed decisions is no data for extent churn",
-          !rule_has_data("rtt-seed-extent-churn", w));
-    set_count(w, Counter::CpuRttSeedChecks, 100);
-    check("matching CPU seeds are measured quiet",
-          rule_has_data("rtt-seed-extent-churn", w) &&
-              !fired(evaluate_rules(w, RuleThresholds{}), "rtt-seed-extent-churn"));
-    set_count(w, Counter::CpuRttSeedExtentReversals, 1);
+    check("no CPU publication candidates is no data",
+          !rule_has_data("rtt-colorless-publication", w));
+    set_count(w, Counter::CpuRttPublicationChecks, 100);
+    check("guarded CPU publication candidates are measured quiet",
+          rule_has_data("rtt-colorless-publication", w) &&
+              !fired(evaluate_rules(w, RuleThresholds{}), "rtt-colorless-publication"));
+    set_count(w, Counter::CpuRttColorlessPublications, 1);
     const auto alarms = evaluate_rules(w, RuleThresholds{});
-    check("one opposite miss pair reports seed extent churn",
-          only(alarms, "rtt-seed-extent-churn") && alarms[0].value == 1 &&
+    check("one actual colourless publication reports the contract violation",
+          only(alarms, "rtt-colorless-publication") && alarms[0].value == 1 &&
               alarms[0].threshold == 1 && alarms[0].cost_ms < 0 &&
-              alarms[0].detail == "cpu-seed-checks=100");
-    check("observed opposite misses do not scale with sensitivity",
-          only(evaluate_rules(w, RuleThresholds::scaled(200)), "rtt-seed-extent-churn"));
+              alarms[0].detail == "cpu-publication-checks=100");
+    check("the correctness invariant does not scale with sensitivity",
+          only(evaluate_rules(w, RuleThresholds::scaled(200)), "rtt-colorless-publication"));
     EngineConfig config;
     config.log = nullptr;
     AlarmEngine engine(std::move(config));
-    check("the repeated-miss signature is reported in its first window",
-          only(engine.close_window(w, 5), "rtt-seed-extent-churn"));
-    set_count(w, Counter::CpuRttSeedExtentReversals, 0);
-    check("matching seeds end the alarm", engine.close_window(w, 10).empty());
-    set_count(w, Counter::CpuRttSeedChecks, 0);
-    set_count(w, Counter::CpuRttSeedExtentReversals, 1);
-    check("an orphan reversal count cannot invent measured seed decisions",
-          !fired(evaluate_rules(w, RuleThresholds{}), "rtt-seed-extent-churn"));
+    check("a publication violation reports in its first window",
+          only(engine.close_window(w, 5), "rtt-colorless-publication"));
+    set_count(w, Counter::CpuRttColorlessPublications, 0);
+    check("guarded publications end the alarm", engine.close_window(w, 10).empty());
+    set_count(w, Counter::CpuRttPublicationChecks, 0);
+    set_count(w, Counter::CpuRttColorlessPublications, 1);
+    check("an actual violation is data even if candidate sampling crosses the window boundary",
+          rule_has_data("rtt-colorless-publication", w) &&
+              fired(evaluate_rules(w, RuleThresholds{}), "rtt-colorless-publication"));
 }
 
 }  // namespace
@@ -1792,12 +1793,12 @@ int main() {
     test_engine_2026_09_29_censuses();
     test_gpu_sync_wait();
     test_gpu_device_time_coverage();
-    test_rtt_seed_extent_churn();
+    test_rtt_colorless_publication();
     check("rule_names lists the six phase-2 rules, the three added with phase 3, "
           "gpu-memory-off-device (#3897), the six 2026-09-28 queue rules and the two "
           "2026-09-29 ones (host-copy-per-flip, present-slot-trouble, rtt-destination-refused, "
           "color-target-count-ceiling), gpu-sync-wait (#3948), gpu-present-stalled (#3951) "
-          "gpu-device-time-coverage and rtt-seed-extent-churn (#3891)",
+          "gpu-device-time-coverage and rtt-colorless-publication (#3891)",
           rule_names().size() == 24);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ok", g_failures);
     return g_failures ? 1 : 0;
