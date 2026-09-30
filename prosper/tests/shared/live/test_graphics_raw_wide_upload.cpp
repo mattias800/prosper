@@ -62,6 +62,11 @@ static Program& register_program(bool vertex, Load load, bool wide8) {
             const uint32_t last = wide8 ? 31u : 27u;
             code.push_back((vertex ? 0x7e0e0200u : 0x7e000200u) | last);
         }
+        if (vertex && load == Load::MemorySelector) {
+            code.insert(code.end(), {0x7e100c16u, 0x101010f0u, 0x060e1107u});
+            // v7 += float(s22) * 0.5. Make the x1 upload itself observable beside the selected
+            // wide bytes: a guest selector reread after realization moves this triangle offscreen.
+        }
     }
     if (vertex) {
         code.insert(code.end(), std::begin(Fullscreen), std::end(Fullscreen));
@@ -71,8 +76,11 @@ static Program& register_program(bool vertex, Load load, bool wide8) {
         code.insert(code.end(), {0x7e000280u, 0x7e0202f2u, 0x7e040280u, 0x7e0602f2u,
                                 0xf800180fu, 0x03020100u, 0xbf810000u});
     } else {
-        code.insert(code.end(), {0x7e0202ffu, 0x3f000000u, 0x7e0402ffu, 0x3f400000u,
-                                0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u});
+        if (load == Load::MemorySelector)
+            code.insert(code.end(), {0x7e020c16u, 0x100202ffu, 0x3e000000u}); // green=selector/8
+        else code.insert(code.end(), {0x7e0202ffu, 0x3f000000u});
+        code.insert(code.end(), {0x7e0402ffu, 0x3f400000u, 0x7e0602f2u,
+                                0xf800180fu, 0x03020100u, 0xbf810000u});
     }
     std::copy(code.begin(), code.end(), p.code.begin());
     p.user.sharp_resource_offset[3] = &p.sharp;
@@ -146,22 +154,27 @@ static bool pixel(const std::vector<uint8_t>& image, uint32_t x, uint32_t y,
     }
     return true;
 }
-static void observe_pixels(const DrawItem& draw, bool vertex, float value, const char* arm) {
+static void observe_pixels(const DrawItem& draw, bool vertex, float value, const char* arm,
+                           float green = 0.5f) {
     if (cpu_only) return;
     const auto image = render(draw);
     if (vertex) {
-        const bool translated = value != 0.0f;
-        const uint8_t left_green = pixel_control ? (translated ? 255u : 0u) :
-                                                  (translated ? 0u : 255u);
-        const bool left = image.size() == W * H * 4u && image[(2u * W) * 4u + 1u] == left_green;
-        check(left && pixel(image, 6u, 2u, {0u, 255u, 0u, 255u}), arm,
+        bool correct = image.size() == W * H * 4u;
+        for (uint32_t x : {0u, 6u, 7u}) {
+            bool visible = static_cast<float>(2u * x + 1u) / W >= value;
+            if (pixel_control) visible = !visible;
+            correct &= image.size() == W * H * 4u &&
+                image[(2u * W + x) * 4u + 1u] == (visible ? 255u : 0u);
+        }
+        check(correct, arm,
               "actual VS last-word translation reaches the real upload and pixels");
     } else {
         const uint8_t red = static_cast<uint8_t>((pixel_control ? 1.0f - value : value) * 255.0f);
         bool correct = true;
         for (uint32_t y = 0; y < H; ++y)
             for (uint32_t x = 0; x < W; ++x)
-                correct &= pixel(image, x, y, {red, 128u, 191u, 255u});
+                correct &= pixel(image, x, y,
+                    {red, static_cast<uint8_t>(green * 255.0f), 191u, 255u});
         check(correct, arm, "actual PS last-word color reaches the real upload and pixels");
     }
 }
@@ -169,6 +182,10 @@ static void observe_pixels(const DrawItem& draw, bool vertex, float value, const
 int main(int argc, char** argv) {
     cpu_only = argc == 2 && std::strcmp(argv[1], "--cpu-only") == 0;
     pixel_control = argc == 2 && std::strcmp(argv[1], "--pixel-control") == 0;
+    if (argc > 2 || (argc == 2 && !cpu_only && !pixel_control)) {
+        std::printf("[FAIL] usage: test_graphics_raw_wide_upload [--cpu-only|--pixel-control]\n");
+        return 1;
+    }
     prosper::register_builtin_hle();
     const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
     const auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
@@ -228,6 +245,29 @@ int main(int argc, char** argv) {
                   "next real draw uses the changed per-draw selected address");
             if (shifted_made) observe_pixels(shifted, vertex, second, arm);
         }
+        for (bool wide8 : {false, true}) {
+            auto& descriptor = register_program(vertex, Load::Descriptor, wide8);
+            auto* descriptor_words_at_source = data + 8u;
+            descriptor_words(descriptor_words_at_source, guest + 0x3000u, 64u);
+            auto* buffer_value = reinterpret_cast<uint32_t*>(guest + 0x3000u);
+            *buffer_value = std::bit_cast<uint32_t>(vertex ? 0.5f : 0.25f);
+            notify_guest_gpu_write(guest, 0x3004u);
+            auto state = state_for(vertex ? descriptor : plain_vs, vertex ? plain_ps : descriptor,
+                guest, reinterpret_cast<uint64_t>(selector), metadata);
+            const auto inputs = build_stage_table(state,
+                reinterpret_cast<uint64_t>(descriptor.code.data()), !vertex, 3u);
+            const auto* consumer = inputs ? inputs->by_fetch_pc(descriptor.consumer_pc) : nullptr;
+            check(inputs && consumer && consumer->gpu_addr == guest + 0x3000u &&
+                  !inputs->by_fetch_pc(descriptor.load_pc), arm,
+                  "real descriptor-only fold resolves its exact consumer without numeric raw backing");
+            DrawItem draw;
+            const bool made = realize_draw_item(state, &state.draws[0], 3u, 64u, false, draw);
+            check(made, arm, "descriptor-only x4/x8 positive reaches real graphics realization");
+            if (made) observe_pixels(draw, vertex, vertex ? 0.5f : 0.25f, arm);
+            *buffer_value = std::bit_cast<uint32_t>(vertex ? 0.0f : 0.75f);
+            notify_guest_gpu_write(guest + 0x3000u, sizeof(*buffer_value));
+            if (made) observe_pixels(draw, vertex, vertex ? 0.0f : 0.75f, arm);
+        }
         auto& latched = register_program(vertex, Load::MemorySelector, false);
         data[11u] = std::bit_cast<uint32_t>(vertex ? 0.5f : 0.25f);
         data[15u] = std::bit_cast<uint32_t>(vertex ? 0.0f : 0.75f);
@@ -246,14 +286,18 @@ int main(int argc, char** argv) {
               table->by_fetch_pc(latched.load_pc) &&
               table->by_fetch_pc(latched.load_pc)->gpu_addr == guest + 32u, arm,
               "real draw owns the x1 selector paired with its selected wide range");
-        if (made) observe_pixels(draw, vertex, vertex ? 0.5f : 0.25f, arm);
+        if (made) observe_pixels(draw, vertex, vertex ? 1.5f : 0.25f, arm, 0.25f);
         DrawItem next;
         const bool next_made = realize_draw_item(state, &state.draws[0], 3u, 64u, false, next);
         const auto next_table = vertex ? next.vrt : next.prt;
-        check(next_made && next_table && next_table->by_fetch_pc(latched.load_pc) &&
+        uint32_t next_owned = UINT32_MAX;
+        const auto* next_scalar = next_table ? next_table->by_fetch_pc(latched.scalar_pc) : nullptr;
+        if (next_scalar && next_scalar->host_data && next_scalar->host_data_size >= sizeof(next_owned))
+            std::memcpy(&next_owned, next_scalar->host_data, sizeof(next_owned));
+        check(next_made && next_owned == 3u && next_table->by_fetch_pc(latched.load_pc) &&
               next_table->by_fetch_pc(latched.load_pc)->gpu_addr == guest + 48u, arm,
               "next draw realizes the new memory selector instead of reusing the old range");
-        if (next_made) observe_pixels(next, vertex, vertex ? 0.0f : 0.75f, arm);
+        if (next_made) observe_pixels(next, vertex, vertex ? 1.5f : 0.75f, arm, 0.375f);
 
         auto& refused = register_program(vertex, Load::RuntimeSelector, false);
         state = state_for(vertex ? refused : plain_vs, vertex ? plain_ps : refused,
