@@ -15,8 +15,9 @@ found Vulkan.
   keys, the guest-write drain). Include that header only from `live_renderer.cpp` and
   `submit_renderer/`; it is not an API.
   Registrations share the process prelude through `submit_renderer/callback_state.hpp`; its values
-  initialize at their original callback binding sites. Thread-local prelude state stays in the
-  callback and survives re-registration on the same thread.
+  initialize at their original callback binding sites. `submit_renderer/callback_thread_state.hpp`
+  owns the calling thread's prelude payloads across registrations. Resolve that owner inside the
+  callback; its native TLS reference bindings stay at their original lazy/conditional sites.
 - `live_compute.cpp` — the compute half, and a **separate Vulkan backend**, not a caller of the
   render one. It builds its own device (or adopts the renderer's when one is published), its own
   pipeline cache, descriptor pools, memory pool and command buffers, and does not include

@@ -4,17 +4,26 @@
 guest submit into GPU work. It grew into a single 12,000-line lambda; #3892 carves it along the
 responsibilities it already had. This folder holds what has been carved out so far. The callback
 itself still lives in `live_renderer.cpp`. Each registration references the same process-prelude
-owner; the callback keeps its thread-local state and the original lazy binding sites.
+owner; the callback resolves its calling-thread owner inside its body and keeps the original lazy
+reference binding sites.
 
 - `callback_types.hpp` — the types, aliases and constants the callback used to declare locally
   (`RenderTiming`, `BuiltFrameResources`, the depth-snapshot records, `RC`, `RenderClock`, ...).
-  Types only: state ownership belongs to the process-prelude owner or the callback.
+  Types only: state ownership belongs to the process-prelude or calling-thread owner.
 - `callback_state.{hpp,cpp}` — the callback prelude's process-lifetime state, shared across
   registrations. Registration constructs empty slots, and native function-static guards initialize
   each value only when its original callback binding is first reached. Keep every binding in place
   and in order across the render-last and warmup returns; the RTT-log bounds are reached between
-  those returns. Thread-local caches, pins, submit ordinals and timing populations stay in the
-  callback, with their existing per-thread lifetime across registrations.
+  those returns. The calling-thread owner separately keeps thread-local caches, pins, submit
+  ordinals and timing populations.
+- `callback_thread_state.{hpp,cpp}` — the 17 callback-prelude TLS payloads in one immobile native
+  per-thread owner. Resolve it inside the callback, never at registration or through a captured
+  registration-thread pointer. Empty optional slots preserve lazy construction; native TLS
+  reference guards stay at each original binding, including the conditional census site between
+  render-last and warmup returns. The immutable census-enable setting determines constructor
+  reach; F8 only changes active/data. Keep the original member sequence and separately audit
+  external destructor dependencies. GPU upload owners remain retained through completion;
+  storage-image writebacks run inline after the wait on the binding thread.
 - `guest_reads.hpp` — `safe_span` / `safe_copy` / `safe_equal`, the bounds-checked guest reads.
 - `draw_resources.{hpp,cpp}` — `build_draw_frame_resources`: one draw's VS/PS resource tables to
   backend frame resources (the texture- and buffer-reference resolution chain; the hottest code in

@@ -353,8 +353,27 @@ timing draw count are initialized after the render-last return but before the wa
 The decode-budget initializer is reached after both returns. Moving these as one eagerly
 initialized block would change the contract even if the sampled budget harness passed. The
 process-prelude owner keeps each lazy binding at its original declaration site; its thread-local
-cache and timing state remain in the callback. See the source-derived reach-order audit and
+cache and timing reference bindings remain in the callback. See the source-derived reach-order audit and
 bounded state plan on [#3892](https://github.com/mattias800/prosper/issues/3892#issuecomment-5900509881).
+
+**RULED OUT (2026-09-30): a rendered worker frame proves its callback state belongs to that
+worker.** Capturing the registration thread's prelude owner still renders the joined worker's
+frame, but fails the new census ownership assertion: no thread-exit census header arrives before
+the join finishes. The intended calling-thread owner reports exactly once inside that arm under
+actual F8 capture timing. The existing real-texture census integration separately reports two
+validation calls at thread exit. These tests sample census ownership and reporting; they do not
+prove every TLS payload's destructor, and `prosper-app`'s `_Exit` is not a TLS teardown test.
+See the calling-thread plan on
+[#3892](https://github.com/mattias800/prosper/issues/3892#issuecomment-5908243610).
+
+**RULED OUT (2026-09-30): unchanged pixels across renderer re-registration prove the submit's
+thread-local decoded identity survives.** Clearing the calling thread's decoded map at
+registration preserves both spans' red pixels, but fails exactly the new cross-span reuse
+assertion. The cold mapped guest texture requires one decode and one cross-span reuse without
+invalidation in the intended renderer, which passes alongside the joined-worker test. Observing
+pixels alone cannot distinguish a lost TLS identity from a process-cache fallback. This samples
+that map's re-registration lifetime, not every per-thread cache or a throughput improvement.
+See [#3892](https://github.com/mattias800/prosper/issues/3892#issuecomment-5908243610).
 
 **RULED OUT as the first visibility boundary for Astro Bot's observed opening route (2026-09-29):
 the CPU read of the next indirect dispatch's argument triplet.** An exact argument-read observer

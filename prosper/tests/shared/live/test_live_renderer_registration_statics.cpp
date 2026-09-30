@@ -15,14 +15,17 @@
 //      announcement prints again.
 //   4. A callback on a new thread (whose `static thread_local` prelude state is fresh) still shares
 //      the process-lifetime statics above: the gates are open and nothing initialises twice.
+//   5. With actual F8 timing active, that worker's validation census reports at thread exit before
+//      the join finishes. This observes calling-thread ownership, separately from process exit.
 // These arms constrain the sampled gates, budget and announcement. They do not directly observe
-// decoded-cache entries, texture identities or thread-local cache preservation. Needs its own
-// process: every arm depends on the sampled statics being untouched when it starts.
+// decoded-cache entries, texture identities or texture traffic in the zero-call census. Needs its
+// own process: every arm depends on the sampled statics being untouched when it starts.
 #include "fixtures/render_runner.h"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "shared/live/live_renderer.hpp"
+#include "shared/perf/performance_capture.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -104,6 +107,8 @@ int main() {
     if (!guest) return 1;
     check(!std::getenv("PROSPER_RENDER_DELAY_MS") && !std::getenv("PROSPER_TEXTURE_DECODE_CACHE_MB"),
           "fixture starts with neither variable set");
+    check(std::getenv("PROSPER_TEXTURE_VALIDATION_CENSUS") != nullptr,
+          "fixture enables the cached validation census before process startup");
 
     // A fullscreen red triangle into a 64x64 colour target: a real rendered submit whose result is
     // non-empty, so "rendered" and "skipped by the warmup gate" are distinguishable by the return.
@@ -182,8 +187,15 @@ int main() {
     }
 
     // ---- A callback on a new thread: its thread_local prelude state starts fresh, while the
-    // process-lifetime statics above must still apply.
+    // process-lifetime statics above must still apply. Earlier main-thread callbacks leave their
+    // census inactive. Actual capture timing makes only the worker's census active, so a log bound
+    // to the registration thread cannot produce the required report inside this joined arm.
     {
+        auto& timing_capture = prosper::perf::interactive_performance_capture();
+        const auto armed = timing_capture.arm(
+            log_dir, "fixture", "registration-statics", "test",
+            prosper::perf::monotonic_now_ns(), std::chrono::system_clock::now());
+        check(armed.ok, "5: actual F8 capture arms before the worker callback");
         StderrCapture capture(log_dir + "/registration_statics_thread.log");
         std::vector<uint8_t> threaded;
         std::thread worker([&] { threaded = render_submit_items({draw}, W, H); });
@@ -194,6 +206,10 @@ int main() {
         check(count(log, "decoded texture cache budget") == 0,
               "4: process-lifetime statics are shared across threads (no budget line on the new "
               "thread)");
+        check(count(log, "[texture-validation-census]") == 1 &&
+                  count(log, "reason=thread-exit calls=0") == 1,
+              "5: the calling worker owns its census and reports once before its join finishes");
+        timing_capture.cancel();
     }
 
     unmap(guest, GuestBytes, 0, 0, 0, 0);

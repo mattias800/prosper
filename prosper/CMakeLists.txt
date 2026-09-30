@@ -3148,6 +3148,7 @@ endif()
       target_compile_definitions(boot_trace PRIVATE PROSPER_HAVE_VULKAN=1)
       add_library(prosper_live_renderer STATIC frontends/shared/live/live_renderer.cpp
                                                frontends/shared/live/submit_renderer/callback_state.cpp
+                                               frontends/shared/live/submit_renderer/callback_thread_state.cpp
                                                frontends/shared/live/submit_renderer/draw_resources.cpp
                                                frontends/shared/live/submit_renderer/timing_report.cpp
                                                frontends/shared/live/submit_renderer/backend_draws.cpp
@@ -3481,6 +3482,7 @@ endif()
       # duplicating it. Needs render_runner.h (tests/) and refvs.inc (tools/boot_trace/).
       add_library(prosper_live_renderer STATIC frontends/shared/live/live_renderer.cpp
                                                frontends/shared/live/submit_renderer/callback_state.cpp
+                                               frontends/shared/live/submit_renderer/callback_thread_state.cpp
                                                frontends/shared/live/submit_renderer/draw_resources.cpp
                                                frontends/shared/live/submit_renderer/timing_report.cpp
                                                frontends/shared/live/submit_renderer/backend_draws.cpp
@@ -3655,7 +3657,7 @@ endif()
       target_link_libraries(test_live_renderer_registration_statics PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME live_renderer_registration_statics COMMAND test_live_renderer_registration_statics)
       set_tests_properties(live_renderer_registration_statics PROPERTIES ENVIRONMENT_MODIFICATION
-        "PROSPER_RENDER_DELAY_MS=unset:;PROSPER_TEXTURE_DECODE_CACHE_MB=unset:;PROSPER_RENDER_FIRST=unset:;PROSPER_RENDER_LAST=unset:")
+        "PROSPER_RENDER_DELAY_MS=unset:;PROSPER_TEXTURE_DECODE_CACHE_MB=unset:;PROSPER_RENDER_FIRST=unset:;PROSPER_RENDER_LAST=unset:;PROSPER_TEXTURE_VALIDATION_CENSUS=set:1")
       add_executable(test_float32_array_upload tests/shared/live/test_float32_array_upload.cpp)
       target_include_directories(test_float32_array_upload PRIVATE frontends src tests)
       target_link_libraries(test_float32_array_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
