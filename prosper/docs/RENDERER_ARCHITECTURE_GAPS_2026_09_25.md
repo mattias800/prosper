@@ -310,6 +310,16 @@ Partial machinery already exists (`rtt_gpu_seed_import_extent_compatible`,
 
 ## Ruled out
 
+**RULED OUT (2026-09-30): a graphics `submit=-4` or effective `wait=-4` proves Vulkan returned
+device lost.** The real queue-wrapper fixture closes the shutdown gate and passes null handles:
+the call returns `VK_ERROR_DEVICE_LOST` with zero driver entries. An admitted call still reaches
+Vulkan when shutdown starts at driver entry. A separate reporting control first completes a real
+fence, then substitutes `VK_TIMEOUT` and closes the gate; its queue-idle fallback reports `-4`
+without entering Vulkan. The retained fence result and per-call origins distinguish those cases
+without changing effective results or completion policy. The substituted timeout is not a real
+driver timeout/loss witness, and older uninstrumented failures remain unclassified. See
+[#3891](https://github.com/mattias800/prosper/issues/3891#issuecomment-5901248723).
+
 **RULED OUT (2026-09-30): a balanced draw census at app exit proves a final accounting total.**
 On a bounded GTA V route, one registered report saw balanced counters and a later report in the
 same flush saw an in-flight draw and a delta of one. The guest was not joined: the submit gate
