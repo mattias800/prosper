@@ -26,3 +26,14 @@ new direct observations. Its Linux `--direct-validation-watch` arm uses real map
 promotion, a CPU fault and dirty query: unchanged-watch reuse and watch-only refusal add no direct
 samples, while pre-promotion comparisons provide a positive population control. Environment modes
 are fixed before startup. These assertions do not imply physical comparison traffic or GPU timing.
+
+## Ruled out
+
+- A reused persistent output is not a fresh black background. The raw-wide upload fixture's
+  translated triangles leave old pixels untouched when the backend correctly loads that target.
+  Use distinct private output identities and observe every row pixel for each isolated draw.
+- A low-address static AGC program owner does not exercise absolute guest pointers: fields below
+  4 GiB are interpreted as relative offsets. Assert patched PGM/header metadata before using a
+  failed shader realization as a refusal control.
+- An EXEC-writing CMPX does not isolate a VS VCC lifetime refusal. Use the decoded non-EXEC
+  VCC compare with a known VGPR setup in the focused graphics backing test.

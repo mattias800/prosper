@@ -149,7 +149,11 @@ static GpuState state_for(const Program& vs, const Program& ps, uint64_t source,
 static std::vector<uint8_t> render(DrawItem draw) {
     // This synthetic offscreen output has no guest color allocation. Shader state, tables,
     // compilation and uploads remain production-realized; give its color output a private extent.
-    draw.color0_base = 0x7d000000u;
+    // Persistent targets preserve previously written pixels. Isolate each observation so
+    // translated triangles are compared against a fresh output, not earlier coverage.
+    static uint64_t output_identity = 0x7d000000u;
+    draw.color0_base = output_identity;
+    output_identity += 0x1000u;
     draw.color0_width = W; draw.color0_height = H;
     draw.color_targets[0].mirror_named_identity(draw.color0_base, W, H);
     return render_submit_items({draw}, W, H);
@@ -169,12 +173,19 @@ static void observe_pixels(const DrawItem& draw, bool vertex, float value, const
     const auto image = render(draw);
     if (vertex) {
         bool correct = image.size() == W * H * 4u;
-        for (uint32_t x : {0u, 6u, 7u}) {
+        uint32_t expected_mask = 0u, actual_mask = 0u;
+        for (uint32_t x = 0u; x < W; ++x) {
             bool visible = static_cast<float>(2u * x + 1u) / W >= value;
             if (pixel_control) visible = !visible;
-            correct &= image.size() == W * H * 4u &&
-                image[(2u * W + x) * 4u + 1u] == (visible ? 255u : 0u);
+            if (visible) expected_mask |= 1u << x;
+            const uint8_t actual = image.size() == W * H * 4u
+                ? image[(2u * W + x) * 4u + 1u] : 0u;
+            if (actual == 255u) actual_mask |= 1u << x;
+            correct &= image.size() == W * H * 4u && actual == (visible ? 255u : 0u);
         }
+        std::printf("[pixel-observation] VS selected=%g expected-mask=0x%02x "
+                    "actual-mask=0x%02x image-bytes=%zu\n", value,
+                    expected_mask, actual_mask, image.size());
         check(correct, arm,
               "actual VS last-word translation reaches the real upload and pixels");
     } else {
