@@ -12,6 +12,8 @@ tables, and checks numeric raw x4/x8 uploads and descriptor-only consumers in bo
 a device. Default execution observes pixels, including hosted bytes and the memory-fed selector's
 realization-owned word. The registry owners remain mapped for process lifetime: AGC interprets
 pointer fields below 4 GiB as relative offsets, so a low-address static fixture is not valid input.
+The descriptor-to-fresh-mask arms reuse the descriptor SGPR pair for an independent compare and
+exact Bool condition, retaining a real consumer table and both nonempty stages before pixel checks.
 
 `test_draw_resource_status` seeds explicit reflection-memo contracts and calls the real resource
 builder. It checks rejection reasons, both cache-cold MSAA skips, later bindings/stages, and

@@ -34,3 +34,19 @@ Register new cases in `prosper/CMakeLists.txt` under `if(TARGET prosper_core)`, 
 platform-independent — the file also has `if(WIN32)`/`if(UNIX)` branches, and a case registered in
 the wrong one silently never runs while ctest stays green. Verify by name with `ctest -N`, never by
 the total count.
+
+`test_raw_wide_mask_lifetime` separates a fresh emitted Bool mask from a possible surviving
+physical high-word dependency of an earlier raw x4 load. Numeric negatives assert the actual raw
+load's PC/op in addition to classification and an empty stage module; a later unrelated refusal
+does not prove the backing gate worked. Keep per-compile diagnostic addresses unique across stages.
+The no-descriptor-patch high-word arm also exercises the outer lifetime shortcut, while the patched
+arm reaches derived provenance. The one-arm compare targets the MUST mask meet at a forward join.
+
+## Ruled out
+
+- A non-CMPX compare's SGPR-pair-shaped destination does not prove both physical words were
+  overwritten in an unknown wave mode. A fresh Bool condition can be independent while an ordinary
+  numeric high-word read still requires backing.
+- A SAVEEXEC fixture that leaves EXEC narrowed cannot export a vertex position. Restore full EXEC
+  before that export when testing independent mask transfer; otherwise an unrelated export refusal
+  hides whether the mask proof worked.

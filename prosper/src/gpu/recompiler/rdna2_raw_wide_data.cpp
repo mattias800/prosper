@@ -69,21 +69,42 @@ public:
     }
 
     bool has_numeric_reader_or_uncertain_path() const {
-        // May-provenance, not a value proof: a read on ANY reachable path needs the actual
-        // bytes. Merge arriving register/SCC origins with OR and reprocess when they grow.
-        // Scalar descriptor assembly remains provenance-only until a non-descriptor consumer.
+        // Scalar data is MAY provenance (OR at joins). A separate MUST fact identifies exact
+        // fresh mask roots used by the emitter's Bool consumers (AND at joins). A compare can
+        // replace that Bool without proving that both physical scalar words were overwritten.
+        // Keep the possible high-word numeric dependency alive for every ordinary data reader.
         struct State {
             size_t index;
             std::bitset<128> regs;
             bool scc;
+            std::bitset<128> masks;
         };
         if (start + 1 >= ins.size()) return false;
-        State initial{start + 1, {}, false};
+        State initial{start + 1, {}, false, {}};
+        initial.masks.set(126); // entry EXEC cannot depend on this subsequent, unreplayed load
         for (uint32_t word = 0; word < words; ++word)
             initial.regs.set(static_cast<size_t>(first + static_cast<int>(word)));
         std::vector<State> pending{initial};
         std::vector<std::array<std::bitset<128>, 2>> seen(ins.size());
+        std::vector<std::array<std::bitset<128>, 2>> seen_masks(ins.size());
         std::vector<std::array<bool, 2>> seen_any(ins.size());
+        const auto mask_register = [](const Operand& operand) {
+            if (operand.kind != OperandKind::SGPR && operand.kind != OperandKind::Special)
+                return -1;
+            return operand.value >= 0 &&
+                (operand.value <= 105 || operand.value == 106 || operand.value == 126)
+                ? operand.value : -1;
+        };
+        const auto supported_compare = [](const Rdna2Inst& in) {
+            // Exact non-CMPX compare families lowered by emit_alu. Unknown encodings cannot
+            // manufacture a mask lifetime, even if the decoder supplies an SDST-shaped field.
+            const uint32_t op = in.opcode;
+            return in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(op) &&
+                (op <= 0x0fu || (op >= 0x81u && op <= 0x86u) || op == 0x88u ||
+                 (op >= 0x89u && op <= 0x8eu) || (op >= 0xa1u && op <= 0xa6u) ||
+                 (op >= 0xa9u && op <= 0xaeu) || (op >= 0xc1u && op <= 0xc6u) ||
+                 (op >= 0xc9u && op <= 0xceu) || (op >= 0xe1u && op <= 0xe6u));
+        };
         auto writes_scc = [](const Rdna2Inst& in) {
             if (in.fmt == Rdna2Format::SOPC) return true;
             if (in.fmt == Rdna2Format::SOP1)
@@ -109,10 +130,16 @@ public:
             if (state.index == start) return true; // a replayed load needs a new byte observation
             const size_t slot = state.scc ? 1u : 0u;
             if (seen_any[state.index][slot] &&
-                (state.regs & ~seen[state.index][slot]).none()) continue;
+                (state.regs & ~seen[state.index][slot]).none() &&
+                (seen_masks[state.index][slot] & ~state.masks).none()) continue;
+            if (seen_any[state.index][slot])
+                seen_masks[state.index][slot] &= state.masks;
+            else
+                seen_masks[state.index][slot] = state.masks;
             seen_any[state.index][slot] = true;
             seen[state.index][slot] |= state.regs;
             state.regs = seen[state.index][slot];
+            state.masks = seen_masks[state.index][slot];
             if (++processed > 32768) return true;
             const Rdna2Inst& in = ins[state.index];
             if (in.fmt == Rdna2Format::Unknown || !in.len_dwords) return true;
@@ -125,6 +152,29 @@ public:
 
             if (state.scc && in.fmt == Rdna2Format::SOPP &&
                 (in.opcode == 0x04u || in.opcode == 0x05u)) return true;
+            if (in.fmt == Rdna2Format::SOPP &&
+                (in.opcode == 0x08u || in.opcode == 0x09u) &&
+                !state.masks.test(126)) return true;
+            const auto independent_mask = [&](const Operand& operand) {
+                if (operand.kind == OperandKind::InlineInt)
+                    return operand.value == 0 || operand.value == -1;
+                const int root = mask_register(operand);
+                return root >= 0 && state.masks.test(static_cast<size_t>(root));
+            };
+            const bool mask_logical = in.fmt == Rdna2Format::SOP2 &&
+                (in.opcode == 0x0fu || in.opcode == 0x11u || in.opcode == 0x13u ||
+                 in.opcode == 0x15u || in.opcode == 0x17u || in.opcode == 0x19u ||
+                 in.opcode == 0x1bu || in.opcode == 0x1du);
+            const bool mask_move = in.fmt == Rdna2Format::SOP1 &&
+                in.opcode == kSop1OpcodeMovB64;
+            const bool mask_saveexec = in.fmt == Rdna2Format::SOP1 &&
+                in.opcode >= kSop1OpcodeAndSaveexecB64 &&
+                in.opcode <= kSop1OpcodeXnorSaveexecB64;
+            const bool independent_transfer = mask_register(in.dst) >= 0 &&
+                ((mask_logical && independent_mask(in.src[0]) &&
+                                  independent_mask(in.src[1])) ||
+                 (mask_move && independent_mask(in.src[0])) ||
+                 (mask_saveexec && independent_mask(in.src[0]) && state.masks.test(126)));
             const bool implicit_scc_read = state.scc &&
                 ((in.fmt == Rdna2Format::SOP2 &&
                   (in.opcode == 0x04u || in.opcode == 0x05u ||
@@ -150,13 +200,15 @@ public:
                         derived_read = true;
                 for (uint32_t source = 0; source < in.n_src; ++source) {
                     const Operand& operand = in.src[source];
+                    if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101u &&
+                        source == 2u && independent_mask(operand)) continue;
                     if (operand.kind == OperandKind::Special && operand.value == 253) {
                         derived_read |= state.scc;
                         continue;
                     }
                     if ((operand.kind != OperandKind::SGPR &&
                          !(operand.kind == OperandKind::Special &&
-                           operand.value >= 106 && operand.value <= 124)) ||
+                           operand.value >= 106 && operand.value <= 127)) ||
                         descriptor_source(in, source)) continue;
                     for (uint32_t k = 0; k < source_width(in, source); ++k)
                         if (operand.value >= 0 &&
@@ -172,7 +224,29 @@ public:
                 (in.dst.kind != OperandKind::SGPR ||
                  (in.fmt == Rdna2Format::SOPK &&
                   in.opcode == kSopkOpcodeSetregB32) ||
-                 rdna2_instruction_may_change_exec(in))) return true;
+                 rdna2_instruction_may_change_exec(in)) &&
+                !independent_transfer) return true;
+
+            // Evaluate inputs before expiring overlapping roots. Both siblings are invalidated
+            // conservatively: a saved Bool must never authorize a later physical data lifetime.
+            const int compare_root = in.dst.value == 126 ? -1 : mask_register(in.dst);
+            const bool fresh_compare = supported_compare(in) && compare_root >= 0 &&
+                !derived_read && state.masks.test(126);
+            const bool fresh_exec = independent_transfer &&
+                (mask_saveexec || mask_register(in.dst) == 126);
+            for_each_scalar_write(in, [&](int base, uint32_t width) {
+                for (uint32_t k = 0; k < width; ++k) {
+                    const int reg = base + static_cast<int>(k);
+                    if (reg >= 0 && reg < 128) state.masks.reset(static_cast<size_t>(reg));
+                    if (reg > 0 && reg <= 128) state.masks.reset(static_cast<size_t>(reg - 1));
+                }
+            });
+            if (in.fmt == Rdna2Format::VOPC && in.dst.value == 106 &&
+                !vopc_is_cmpx(in.opcode)) state.masks.reset(106);
+            if (rdna2_instruction_may_change_exec(in)) state.masks.reset(126);
+            if (fresh_compare) state.masks.set(static_cast<size_t>(compare_root));
+            if (independent_transfer) state.masks.set(static_cast<size_t>(mask_register(in.dst)));
+            if (fresh_exec) state.masks.set(126);
 
             std::array<bool, 2> copied{};
             if (plain_copy)
@@ -192,7 +266,9 @@ public:
                  in.opcode == kSopkOpcodeCmovkI32);
             const bool definite_scalar_write = !conditional_write &&
                 (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
-                 in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SMEM);
+                 in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SMEM ||
+                 (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) ||
+                 (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360u));
             for_each_scalar_write(in, [&](int base, uint32_t width) {
                 for (uint32_t k = 0; k < width; ++k) {
                     const int reg = base + static_cast<int>(k);
@@ -200,11 +276,14 @@ public:
                     if (definite_scalar_write)
                         state.regs.reset(static_cast<size_t>(reg));
                     if (derived_read && scalar_result &&
-                        in.dst.kind == OperandKind::SGPR &&
+                        (in.dst.kind == OperandKind::SGPR || independent_transfer) &&
                         base == in.dst.value)
                         produced.set(static_cast<size_t>(reg));
                 }
             }, /*wave32_one_word_masks*/true);
+            if (in.fmt == Rdna2Format::VOPC && in.dst.value == 106 &&
+                !vopc_is_cmpx(in.opcode))
+                state.regs.reset(106); // only the guaranteed VCC low word, no width assumption
             state.regs |= produced;
             if (plain_copy)
                 for (uint32_t k = 0; k < copy_words; ++k)
@@ -215,8 +294,10 @@ public:
             if (!state.regs.any() && !state.scc) continue;
 
             auto enqueue = [&](size_t next) {
-                if (next <= start) return false; // unsupported re-entry to producer or prefix
-                pending.push_back({next, state.regs, state.scc});
+                // A backwards edge may replay EXEC/mask definitions. This bounded proof does
+                // not establish their convergence or a fresh observation on every iteration.
+                if (next <= state.index) return false;
+                pending.push_back({next, state.regs, state.scc, state.masks});
                 return true;
             };
             if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
@@ -331,7 +412,7 @@ private:
                 if (base <= first + static_cast<int>(word) &&
                     first + static_cast<int>(word) < base + static_cast<int>(width))
                     live &= static_cast<uint16_t>(~(1u << word));
-        });
+        }, /*wave32_one_word_masks*/true);
         return live;
     }
 

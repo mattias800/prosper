@@ -2,6 +2,7 @@
 // bytes through the shipping resource builder/backend. Unsupported programs never execute on GPU.
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "shared/live/live_renderer.hpp"
 #include <algorithm>
@@ -26,7 +27,7 @@ constexpr uint32_t W = 8, H = 8;
 constexpr uint32_t Fullscreen[]{0x36020081u, 0x2c040081u, 0x7e020d01u,
     0x7e040d02u, 0x7e0a02f6u, 0x7e0c02f2u, 0x10020b01u, 0x08020d01u,
     0x10040b02u, 0x08040d02u, 0x7e060280u, 0x7e0802f2u};
-enum class Load { None, Numeric, MemorySelector, Descriptor, RuntimeSelector };
+enum class Load { None, Numeric, MemorySelector, Descriptor, DescriptorMask, RuntimeSelector };
 struct Program {
     alignas(256) std::array<uint32_t, 64> code{};
     AgcShaderSharp sharp{4u}; // independent metadata V# at user offset4, not a raw load source
@@ -37,7 +38,7 @@ struct Program {
 };
 // The process-lifetime registry retains header/code addresses. Give every variant a distinct,
 // immobile, aligned owner that remains alive until all fixture work and backend waits finish.
-using ProgramOwners = std::array<Program, 20>;
+using ProgramOwners = std::array<Program, 24>;
 static ProgramOwners* programs = nullptr;
 static size_t next_program = 0;
 static Program& register_program(bool vertex, Load load, bool wide8) {
@@ -56,10 +57,17 @@ static Program& register_program(bool vertex, Load load, bool wide8) {
         p.load_pc = static_cast<uint32_t>(code.size());
         code.insert(code.end(), {(wide8 ? 0xf40c0600u : 0xf4080600u) | (base / 2u),
                                  0x28000000u}); // s[24:27/31], entry pair, s20
-        if (load == Load::Descriptor) {
+        if (load == Load::Descriptor || load == Load::DescriptorMask) {
             code.push_back(0x8f1b801bu); // s27 = s27 << 0: descriptor-only assembly
             p.consumer_pc = static_cast<uint32_t>(code.size());
             code.insert(code.end(), {0xe0300000u, vertex ? 0x80060700u : 0x80060000u});
+            if (load == Load::DescriptorMask) {
+                // The former raw descriptor's SGPR pair is now an independent emitted Bool.
+                // Compare the separately resolved buffer value, then select a visible 0.5/0.
+                const uint32_t value = vertex ? 7u : 0u;
+                code.insert(code.end(), {0x7c0200f9u | (value << 9u), 0x06869880u,
+                    0xd5010000u | value, 128u | (240u << 9u) | (24u << 18u)});
+            }
         } else {
             const uint32_t last = wide8 ? 31u : 27u;
             code.push_back((vertex ? 0x7e0e0200u : 0x7e000200u) | last);
@@ -318,6 +326,31 @@ int main(int argc, char** argv) {
             notify_guest_gpu_write(guest + 0x3000u, sizeof(*buffer_value));
             if (made) observe_pixels(draw, vertex, vertex ? 0.0f : 0.75f, arm);
         }
+        auto& mask = register_program(vertex, Load::DescriptorMask, false);
+        descriptor_words(data + 8u, guest + 0x3000u, 64u);
+        auto* mask_value = reinterpret_cast<uint32_t*>(guest + 0x3000u);
+        *mask_value = std::bit_cast<uint32_t>(0.5f);
+        notify_guest_gpu_write(guest, 0x3004u);
+        auto mask_state = state_for(vertex ? mask : plain_vs, vertex ? plain_ps : mask,
+            guest, reinterpret_cast<uint64_t>(selector), metadata);
+        const auto mask_inputs = build_stage_table(mask_state,
+            reinterpret_cast<uint64_t>(mask.code.data()), !vertex, 3u);
+        std::vector<Rdna2Inst> mask_instructions;
+        rdna2_walk(mask.code.data(), mask.header.shader_size / sizeof(uint32_t), mask_instructions);
+        const auto* mask_consumer = mask_inputs ? mask_inputs->by_fetch_pc(mask.consumer_pc) : nullptr;
+        check(mask_inputs && !mask_inputs->resources.empty() && mask_consumer &&
+              mask_consumer->gpu_addr == guest + 0x3000u &&
+              !mask_inputs->by_fetch_pc(mask.load_pc) &&
+              rdna2_raw_wide_data_loads(mask_instructions).empty(), arm,
+              "real descriptor-to-fresh-mask program has exact consumer and no numeric raw source");
+        DrawItem mask_draw;
+        const bool mask_made = realize_draw_item(mask_state, &mask_state.draws[0], 3u, 64u, false, mask_draw);
+        check(mask_made && !mask_draw.vs_words().empty() && !mask_draw.fs_words().empty(), arm,
+              "real fresh mask lifetimes retain both nonempty graphics stages");
+        if (mask_made) observe_pixels(mask_draw, vertex, 0.5f, arm);
+        *mask_value = std::bit_cast<uint32_t>(0.0f);
+        notify_guest_gpu_write(guest + 0x3000u, sizeof(*mask_value));
+        if (mask_made) observe_pixels(mask_draw, vertex, 0.0f, arm);
         auto& latched = register_program(vertex, Load::MemorySelector, false);
         data[11u] = std::bit_cast<uint32_t>(vertex ? 0.5f : 0.25f);
         data[15u] = std::bit_cast<uint32_t>(vertex ? 0.0f : 0.75f);
