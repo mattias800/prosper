@@ -53,6 +53,7 @@
 #include "shared/live/texture_reference_census.hpp"  // PROSPER_TEXREF_CENSUS (#3873)
 #include "shared/live/submit_renderer/callback_types.hpp" // the callback's own types (#3892)
 #include "shared/live/submit_renderer/callback_state.hpp" // process prelude owner (#3892)
+#include "shared/live/submit_renderer/callback_thread_state.hpp" // calling-thread prelude owner (#3892)
 #include "shared/live/submit_renderer/guest_reads.hpp"    // safe_span / safe_copy / safe_equal
 #include "shared/live/submit_renderer/draw_resources.hpp" // build_draw_frame_resources (#3892)
 #include "shared/live/submit_renderer/timing_report.hpp"  // report_render_timing_aggregates (#3892)
@@ -575,6 +576,100 @@ ScopedRendererCallbackTid::~ScopedRendererCallbackTid() {
 extern "C" int prosper_thread_in_renderer_callback(unsigned long native_tid) {
     return prosper::frontend::tid_is_in_renderer_callback(native_tid) ? 1 : 0;
 }
+
+namespace submit_renderer {
+
+CallbackThreadState& CallbackThreadState::current() {
+    static thread_local CallbackThreadState state;
+    return state;
+}
+
+prosper::frontend::WriteWatchPromotionBudget& CallbackThreadState::write_watch_promotion_budget() {
+    static thread_local auto& value = write_watch_promotion_budget_.emplace();
+    return value;
+}
+
+std::vector<PinnedScanout>& CallbackThreadState::pinned_scanouts() {
+    static thread_local auto& value = pinned_scanouts_.emplace();
+    return value;
+}
+
+std::vector<PinnedRendererMipTarget>& CallbackThreadState::pinned_renderer_mip_targets() {
+    static thread_local auto& value = pinned_renderer_mip_targets_.emplace();
+    return value;
+}
+
+int& CallbackThreadState::g_this_submit() {
+    static thread_local auto& value = g_this_submit_.emplace(-1);
+    return value;
+}
+
+bool& CallbackThreadState::g_force_this_submit() {
+    static thread_local auto& value = g_force_this_submit_.emplace(false);
+    return value;
+}
+
+RenderTiming& CallbackThreadState::pending_timing() {
+    static thread_local auto& value = pending_timing_.emplace();
+    return value;
+}
+
+std::vector<RttTimingRecord>& CallbackThreadState::pending_rtt_timing() {
+    static thread_local auto& value = pending_rtt_timing_.emplace();
+    return value;
+}
+
+uint64_t& CallbackThreadState::pending_span_start_ns() {
+    static thread_local auto& value = pending_span_start_ns_.emplace(0);
+    return value;
+}
+
+uint64_t& CallbackThreadState::pending_capture_generation() {
+    static thread_local auto& value = pending_capture_generation_.emplace(0);
+    return value;
+}
+
+ValidationCensusLog& CallbackThreadState::validation_census_log() {
+    static thread_local auto& value = validation_census_log_.emplace();
+    return value;
+}
+
+std::vector<std::vector<uint8_t>>& CallbackThreadState::texstore() {
+    static thread_local auto& value = texstore_.emplace();
+    return value;
+}
+
+std::vector<bool>& CallbackThreadState::texstore_pinned() {
+    static thread_local auto& value = texstore_pinned_.emplace();
+    return value;
+}
+
+std::unordered_map<TextureDecodeKey, DecodedTexture, TextureDecodeKeyHash>& CallbackThreadState::decoded_textures() {
+    static thread_local auto& value = decoded_textures_.emplace();
+    return value;
+}
+
+uint64_t& CallbackThreadState::decode_span_ordinal() {
+    static thread_local auto& value = decode_span_ordinal_.emplace(0);
+    return value;
+}
+
+int& CallbackThreadState::decode_scope_submit() {
+    static thread_local auto& value = decode_scope_submit_.emplace(-1);
+    return value;
+}
+
+std::vector<std::shared_ptr<const std::vector<uint8_t>>>& CallbackThreadState::retired_submit_pixels() {
+    static thread_local auto& value = retired_submit_pixels_.emplace();
+    return value;
+}
+
+std::unordered_map<uint64_t, ReflectMemoEntry>& CallbackThreadState::reflect_memo() {
+    static thread_local auto& value = reflect_memo_.emplace();
+    return value;
+}
+
+} // namespace submit_renderer
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested,
                             const std::string& title_id) {
@@ -1504,13 +1599,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             drain_guest_gpu_writes(g_rtt, invalidate_ds);
             const prosper::gpu::LiveRenderPhase phase = prosper::gpu::live_render_phase();
             static const auto& write_watch_promotion_budget_bytes = callback_state->write_watch_promotion_budget_bytes();
-            static thread_local prosper::frontend::WriteWatchPromotionBudget
-                write_watch_promotion_budget;
+            auto& callback_thread_state = CallbackThreadState::current();
+            static thread_local auto& write_watch_promotion_budget = callback_thread_state.write_watch_promotion_budget();
             if (phase.first_span)
                 write_watch_promotion_budget.reset(write_watch_promotion_budget_bytes);
-            static thread_local std::vector<PinnedScanout> pinned_scanouts;
-            static thread_local std::vector<PinnedRendererMipTarget>
-                pinned_renderer_mip_targets;
+            static thread_local auto& pinned_scanouts = callback_thread_state.pinned_scanouts();
+            static thread_local auto& pinned_renderer_mip_targets = callback_thread_state.pinned_renderer_mip_targets();
             auto release_pinned_scanouts = [&] {
                 for (const PinnedScanout& target : pinned_scanouts)
                     prosper::test::unpin_persistent_color_target(
@@ -1551,8 +1645,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // window so a diagnostic slice at a late stall (RENDER_FIRST..RENDER_LAST) does not accumulate
             // unbounded RTT/GPU resources across tens of thousands of submits (which OOM-kills the process).
             static auto& g_render_last = callback_state->g_render_last();
-            static thread_local int g_this_submit = -1;
-            static thread_local bool g_force_this_submit = false;
+            static thread_local auto& g_this_submit = callback_thread_state.g_this_submit();
+            static thread_local auto& g_force_this_submit = callback_thread_state.g_force_this_submit();
             if (phase.first_span || g_this_submit < 0) {
                 g_this_submit = g_submit_idx++;
                 g_force_this_submit = false;
@@ -1564,17 +1658,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             const bool rtt_log_in_range =
                 g_this_submit >= g_rttlog_min_submit && g_this_submit <= g_rttlog_max_submit;
             const bool rtt_log = PROSPER_ENV_VALUE("PROSPER_RTTLOG") && rtt_log_in_range;
-            static thread_local RenderTiming pending_timing;
-            static thread_local std::vector<RttTimingRecord> pending_rtt_timing;
-            static thread_local uint64_t pending_span_start_ns = 0;
-            static thread_local uint64_t pending_capture_generation = 0;
+            static thread_local auto& pending_timing = callback_thread_state.pending_timing();
+            static thread_local auto& pending_rtt_timing = callback_thread_state.pending_rtt_timing();
+            static thread_local auto& pending_span_start_ns = callback_thread_state.pending_span_start_ns();
+            static thread_local auto& pending_capture_generation = callback_thread_state.pending_capture_generation();
             // The timing bool is sampled per callback, not a capture ID or completion proof.
             // Keep cumulative per-thread populations across captures; a falling edge is only
             // an observed inactive callback. This diagnostic does not change realization policy.
             static const auto& validation_census_requested = callback_state->validation_census_requested();
             ValidationCensusLog* validation_census = nullptr;
             if (validation_census_requested) {
-                static thread_local ValidationCensusLog log;
+                static thread_local auto& log = callback_thread_state.validation_census_log();
                 if (log.active && !perf_capture_timing)
                     log.data.report(stderr, log.thread, "timing-inactive");
                 log.active = perf_capture_timing;
@@ -1670,12 +1764,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // released and zero-filled tens of MiB every submit even though the decode paths overwrite
             // all pixels. Reusing same-sized slots avoids both costs; short guest reads explicitly clear
             // their uncovered tail below so stale scratch bytes can never become sampled pixels.
-            static thread_local std::vector<std::vector<uint8_t>> texstore;
+            static thread_local auto& texstore = callback_thread_state.texstore();
             // Parallel to `texstore`: a slot is pinned while a retained submit-scoped identity entry
             // still points into it. Handing a pinned slot to a later span's decode would overwrite the
             // very bytes that entry promises, so the allocator below skips them and the pins are
             // released together when the submit's identity map is rebuilt.
-            static thread_local std::vector<bool> texstore_pinned;
+            static thread_local auto& texstore_pinned = callback_thread_state.texstore_pinned();
             size_t texstore_used = 0;
             // PROSPER_NO_SUBMIT_TEXTURE_DECODE_SCOPE=1 restores the pre-#1691 span-scoped lifetime on
             // the same build, so a routed A/B measures the change and not two compilers' luck.
@@ -1687,9 +1781,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // with itself across builds while investigating exactly the kind of question it exists
             // for. Keep its output identical to pre-#1691 rather than make it cheaper.
             static const auto& submit_decode_scope_disabled = callback_state->submit_decode_scope_disabled();
-            static thread_local std::unordered_map<TextureDecodeKey, DecodedTexture,
-                                                   TextureDecodeKeyHash> decoded_textures;
-            static thread_local uint64_t decode_span_ordinal = 0;
+            static thread_local auto& decoded_textures = callback_thread_state.decoded_textures();
+            static thread_local auto& decode_span_ordinal = callback_thread_state.decode_span_ordinal();
             ++decode_span_ordinal;
             // `phase.first_span` is the normal submit boundary, but it is not the only one: the
             // warmup/window gates above (PROSPER_RENDER_FIRST, PROSPER_RENDER_DELAY_MS,
@@ -1699,7 +1792,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // warmup. Retained entries were never unsafe there (a foreign submit serial makes the
             // journal query Unknown, which refuses reuse before dereferencing anything), but stale
             // state that outlives its submit is not something to leave resting on that.
-            static thread_local int decode_scope_submit = -1;
+            static thread_local auto& decode_scope_submit = callback_thread_state.decode_scope_submit();
             const bool rebuild_decode_scope = phase.first_span || submit_decode_scope_disabled ||
                 g_this_submit != decode_scope_submit;
             decode_scope_submit = g_this_submit;
@@ -1721,8 +1814,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // retained pointer refers to cannot be freed under it later in the same submit.
             if (rebuild_decode_scope) ++persistent_decode_generation;
             const uint64_t decode_generation = persistent_decode_generation;
-            static thread_local std::vector<std::shared_ptr<const std::vector<uint8_t>>>
-                retired_submit_pixels;
+            static thread_local auto& retired_submit_pixels = callback_thread_state.retired_submit_pixels();
             static auto& retired_submit_bytes = callback_state->retired_submit_bytes();
             if (rebuild_decode_scope) {
                 decoded_textures.clear();
@@ -1781,7 +1873,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // used, but it would also make the entry a lie about what it holds the moment a caller
             // reads `issues`, and at 523 entries against a 4,096 cap the footprint is not the
             // constraint. If that ever inverts, narrow the entry rather than raising the cap.
-            static thread_local std::unordered_map<uint64_t, ReflectMemoEntry> reflect_memo;
+            static thread_local auto& reflect_memo = callback_thread_state.reflect_memo();
             // Read once per submit. Poison mode mutates the completed resource vector, so it keeps
             // the compatibility representation where every resource is a FrameResource. Ordinary
             // rendering stores buffers in the compact carrier and records their original order.
