@@ -145,12 +145,38 @@ int main() {
             auto vcc_table = table;
             check(!compile(stage, vcc, vcc_table).empty(), name,
                   "explicit scalar VCC address has backed graphics admission");
-            auto clobber = vcc;
-            clobber.insert(clobber.begin() + 1, 0x7da80484u); // implicit VCC writer
-            marked_unproven.resources.front().fetch_pc = 2u;
-            check(rdna2_proven_raw_register_wide_data_loads(decode(clobber)).empty() &&
-                  compile(stage, clobber, marked_unproven).empty(), name,
-                  "implicit VCC clobber cannot borrow a marked graphics range");
+            auto prepared_vcc = vcc;
+            prepared_vcc.insert(prepared_vcc.begin(), 0x7e000280u); // v0 = 0 before scalar VCC
+            auto prepared_vcc_table = vcc_table;
+            prepared_vcc_table.resources.front().fetch_pc = 2u;
+            const auto setup_decoded = decode(prepared_vcc);
+            const auto& setup = setup_decoded.front();
+            std::printf("[decode-control] %s x%u word=0x7e000280 pc=%u opcode=0x%x "
+                        "dst=v%d src0=%d\n", name, wide8 ? 8u : 4u,
+                        setup.pc, setup.opcode, setup.dst.value, setup.src[0].value);
+            check(setup.opcode == 1u && setup.dst.kind == OperandKind::VGPR &&
+                  setup.dst.value == 0 && setup.src[0].kind == OperandKind::InlineInt &&
+                  setup.src[0].value == 0 &&
+                  rdna2_proven_raw_register_wide_data_loads(setup_decoded) ==
+                      std::vector<uint32_t>{2u} &&
+                  !compile(stage, prepared_vcc, prepared_vcc_table).empty(), name,
+                  "known VGPR setup preserves backed scalar VCC graphics admission");
+            auto clobber = prepared_vcc;
+            clobber.insert(clobber.begin() + 2, 0x7d880084u); // v_cmp_gt_u32 vcc,4,v0
+            auto clobber_table = prepared_vcc_table;
+            clobber_table.resources.front().fetch_pc = 3u;
+            const auto clobber_decoded = decode(clobber);
+            const auto& compare = clobber_decoded.at(2u);
+            std::printf("[decode-control] %s x%u word=0x7d880084 pc=%u opcode=0x%x "
+                        "src0=%d src1=v%d cmpx=%d\n", name, wide8 ? 8u : 4u,
+                        compare.pc, compare.opcode, compare.src[0].value, compare.src[1].value,
+                        vopc_is_cmpx(compare.opcode));
+            check(compare.opcode == 0xc4u && compare.src[0].kind == OperandKind::InlineInt &&
+                  compare.src[0].value == 4 && compare.src[1].kind == OperandKind::VGPR &&
+                  compare.src[1].value == 0 && !vopc_is_cmpx(compare.opcode) &&
+                  rdna2_proven_raw_register_wide_data_loads(clobber_decoded).empty() &&
+                  compile(stage, clobber, clobber_table).empty(), name,
+                  "implicit non-EXEC VCC compare cannot borrow a marked graphics range");
         }
 
         // A raw descriptor bundle may be patched before its exact-PC consumer. Its words never
