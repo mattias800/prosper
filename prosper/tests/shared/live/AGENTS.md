@@ -6,6 +6,13 @@ GPU commands; distinguish those state assertions from rendered pixel or synchron
 Pure frontend policy tests belong in `frontends/shared/tests`. `tests/fixtures/render_runner.h`
 is also the shipping graphics backend, and its synchronization rules apply here.
 
+`test_graphics_raw_wide_upload` registers owned synthetic AGC programs, realizes their real graphics
+tables, and checks numeric raw x4/x8 uploads and descriptor-only consumers in both stages. Its
+`--cpu-only` arm checks registration, backing, reflection and pre-backend refusal without creating
+a device. Default execution observes pixels, including hosted bytes and the memory-fed selector's
+realization-owned word. The registry owners remain mapped for process lifetime: AGC interprets
+pointer fields below 4 GiB as relative offsets, so a low-address static fixture is not valid input.
+
 `test_draw_resource_status` seeds explicit reflection-memo contracts and calls the real resource
 builder. It checks rejection reasons, both cache-cold MSAA skips, later bindings/stages, and
 constructor-population versus successful census/timing deltas. Its hosted-byte checks are metadata
