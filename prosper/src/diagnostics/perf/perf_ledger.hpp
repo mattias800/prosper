@@ -124,6 +124,8 @@ enum class Counter : uint8_t {
     // (and so blocked, in Cost::GpuWaitGraphics).
     GpuGraphicsDeferred,
     GpuGraphicsDeferredBlocked,
+    CpuRttPublicationChecks,     // evaluated slot-0 CPU pass-readback publication candidates
+    CpuRttColorlessPublications, // actual publications with no slot-0 colour writer (#3907)
     Count
 };
 

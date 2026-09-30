@@ -3639,7 +3639,9 @@ endif()
       add_test(NAME depth_only_attachment_extent_readback
                COMMAND test_depth_only_attachment_extent --readback-path)
       set_tests_properties(depth_only_attachment_extent_readback PROPERTIES
-                           ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1")
+                           ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1"
+                           ENVIRONMENT_MODIFICATION
+                           "PROSPER_NO_PERF_ALARMS=unset:;PROSPER_RTT_NOSEED=unset:;PROSPER_RTT_NOSEED_TARGET=unset:")
       # #3892: when the live renderer callback's prelude statics initialise, across two
       # registrations in one process. Own process: every arm needs untouched statics.
       add_executable(test_live_renderer_registration_statics

@@ -251,6 +251,11 @@ constexpr double kGpuSyncWaitMinDeviceCoverage = 0.5;
 constexpr double kGpuDeviceTimeMinCoverage = 0.8;
 constexpr uint64_t kGpuDeviceTimeCoverageMinWaits = 100;
 
+// #3907: publishing a pass's CPU colour bytes without a slot-0 colour writer violates the
+// publication contract. One observed violation reports immediately, independent of sensitivity.
+constexpr uint64_t kRttColorlessPublicationsPerWindow = 1;
+constexpr uint32_t kRttColorlessPublicationSustainWindows = 1;
+
 // SUSTAIN: consecutive windows a rule's condition must hold before the engine reports it. A cost
 // that lasts one window is usually a load, and a steady-state alarm should not fire on it; a
 // correctness alarm fires on the first window.
