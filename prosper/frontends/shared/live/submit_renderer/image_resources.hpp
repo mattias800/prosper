@@ -60,6 +60,7 @@ const uint8_t* direct_shader_resource_source(const prosper::gpu::ShaderResource&
 const uint8_t* stage_tiled_shader_resource(const prosper::gpu::ShaderResource& r, const bool& no_direct_texture_source, prosper::frontend::DecodeScratchPool::Lease& lease, uint64_t addr, size_t n, size_t& got);
 size_t copy_shader_dcc_metadata(const prosper::gpu::ShaderResource& r, uint8_t* dst, size_t n);
 
+// PROSPER_DIAG_REF_OUTPUTS materialize_image_resource binding: resource_texture_validation_ms, resource_texture_validated_bytes, resource_texture_submit_query, resource_texture_watch_query, resource_texture_watch_active, resource_texture_watch_disabled, resource_texture_watch_only, resource_texture_watch_stability
 ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBindingContext& binding, const prosper::gpu::DrawItem& draw, prosper::test::BackendSubmissionBatch* producer_batch);
 
 } // namespace prosper::frontend::submit_renderer

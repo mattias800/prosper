@@ -26,11 +26,18 @@ reference binding sites.
   storage-image writebacks run inline after the wait on the binding thread.
 - `guest_reads.hpp` — `safe_span` / `safe_copy` / `safe_equal`, the bounds-checked guest reads.
 - `draw_resources.{hpp,cpp}` — `build_draw_frame_resources`: one draw's VS/PS resource tables to
-  backend frame resources (the texture- and buffer-reference resolution chain; the hottest code in
-  the renderer). Formerly the `build_R` lambda. The image branch currently returns plain
-  Keep/Skip/Reject(reason) in the same file; its caller preserves first-rejection accounting and
-  continues the original resource loop. Inner-loop control and the successful census/timing/emplace
-  tail stay in place until the separate pure extraction.
+  backend frame resources. Formerly the `build_R` lambda. It resolves buffer bindings and owns the
+  per-resource loop, successful census/timing/emplace tail and first-rejection accounting.
+- `image_resources.{hpp,cpp}` — `materialize_image_resource` resolves one image binding and returns
+  plain Keep/Skip/Reject(reason). Its borrowed `ImageBindingContext` owns no values and is consumed
+  synchronously. The original helper names remain local forwarders; their shared bodies are named
+  functions here. Retained writebacks keep their explicit captures and native TLS references;
+  neither context nor a local forwarder escapes. Inner-loop control stays verbatim inside the
+  image function, while its caller handles the original resource-loop continuation.
+  The private declaration's `PROSPER_DIAG_REF_OUTPUTS` contract preserves eight measured scalar
+  associations with the caller's timing report. Its exact reference aliases, local aggregate and
+  synchronous call must satisfy `tools/env/REFERENCE_OUTPUTS.md`; this does not infer general C++
+  effects. The four reports that physically moved retain their baseline classifications by re-key.
 - `timing_report.{hpp,cpp}` — `report_render_timing_aggregates`: the `PROSPER_RENDER_TIMING`
   lifetime/window summaries; and `publish_renderer_timing_record`, the F8 capture's per-submit
   `RendererTimingRecord`.
@@ -68,7 +75,8 @@ reference binding sites.
 **Diagnostics keep their gate beside their report.** When a diagnostic block moves out, a gate
 that is a `PROSPER_*` test moves with it, so `tools/env/check_diag_gates.py` still sees the gate
 next to the report it arms (the scanner is per-file and lexical, and does not follow a gate across
-a call). A gate that is a value of the calling code (`rtt_log`, a hash extent) stays at the call
+a call unless an explicit supported reference-output contract declares the association). A gate
+that is a value of the calling code (`rtt_log`, a hash extent) stays at the call
 site, so a false gate builds no context and makes no call. When such a gate sits inside the region
 being moved, end the region before it: the scanner does not follow `auto& x = ctx.x` (#3919), so
 moving a `rtt_log` report makes its row vanish. That is why the single-framebuffer RTT store and
