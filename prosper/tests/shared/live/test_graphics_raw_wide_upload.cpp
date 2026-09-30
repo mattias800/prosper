@@ -252,16 +252,18 @@ int main(int argc, char** argv) {
                     d.required_bytes >= raw->size; });
             check(report.ok() && reflected != report.descriptors.end(), arm,
                   "actual stage module reflects the real exact-PC numeric buffer binding");
-            std::array<uint8_t, 32> captured{};
-            std::memcpy(captured.data(), reinterpret_cast<const void*>(raw->gpu_addr), raw->size);
+            constexpr size_t Prefix = 48u;
+            alignas(uint32_t) std::array<uint8_t, Prefix + 32u> captured{};
+            std::memcpy(captured.data() + Prefix,
+                        reinterpret_cast<const void*>(raw->gpu_addr), raw->size);
             auto hosted_table = std::make_shared<ShaderResourceTable>(*table);
             auto hosted_source = std::find_if(hosted_table->resources.begin(),
                 hosted_table->resources.end(), [&](const auto& r) {
                     return r.fetch_pc == program.load_pc;
                 });
-            hosted_source->host_data = captured.data();
+            hosted_source->host_data = captured.data() + Prefix;
             hosted_source->host_data_size = count * sizeof(uint32_t);
-            hosted_source->host_data_prefix_bytes = 48u;
+            hosted_source->host_data_prefix_bytes = Prefix;
             DrawItem hosted = draw;
             if (vertex) hosted.vrt = hosted_table;
             else hosted.prt = hosted_table;
