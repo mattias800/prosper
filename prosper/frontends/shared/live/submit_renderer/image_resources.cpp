@@ -34,7 +34,9 @@ size_t acquire_image_texstore_slot(DrawResourceContext& ctx) {
             texstore.emplace_back();
             texstore_pinned.push_back(false);
         }
-        return texstore_used++;
+        const size_t slot = texstore_used;
+        ++texstore_used;
+        return slot;
 }
 
 void clear_image_depth_array_snapshots(DrawResourceContext& ctx) {
@@ -4800,7 +4802,7 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                                             prosper::gpu::f11_to_float((uint16_t)((v >> 11) & 0x7FFu)),
                                             prosper::gpu::f10_to_float((uint16_t)((v >> 22) & 0x3FFu)) };
                       for (int c = 0; c < 3; c++)
-                          tp[t * 4 + c] = (fc[c] != fc[c] || fc[c] <= 0.f) ? 0
+                          tp[t * 4 + c] = (std::isnan(fc[c]) || fc[c] <= 0.f) ? 0
                                         : (fc[c] >= 1.f ? 255 : (uint8_t)(fc[c] * 255.f + 0.5f));
                       tp[t * 4 + 3] = 255;
                   }

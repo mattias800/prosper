@@ -162,8 +162,8 @@ HOT_SITES = {
     "frontends/shared/live/submit_renderer/callback_prelude.cpp": [
         "PROSPER_DCCLOG",
     ],
-    # #3892 moved the per-resource path, and this read with it, out of live_renderer.cpp.
-    "frontends/shared/live/submit_renderer/draw_resources.cpp": [
+    # #3892 moved the image materialization path and its cached stride read to this source.
+    "frontends/shared/live/submit_renderer/image_resources.cpp": [
         "PROSPER_SLICESTRIDE",
     ],
 }
