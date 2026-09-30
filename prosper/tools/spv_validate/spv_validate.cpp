@@ -451,7 +451,13 @@ int main(int argc, char** argv) {
       source.format = DataFormat::Uint32;
       source.num_components = 1u;
       source.binding = 2u;
-      source.size = 16u;
+      // Complete owned bytes satisfy the raw snapshot's logical address/range contract.
+      // This sample validates emitted SPIR-V; it does not execute an upload or GPU read.
+      alignas(uint32_t) uint32_t bytes[4]{1u, 2u, 3u, 4u};
+      source.gpu_addr = reinterpret_cast<uint64_t>(bytes);
+      source.host_data = reinterpret_cast<uint8_t*>(bytes);
+      source.host_data_size = sizeof(bytes);
+      source.size = sizeof(bytes);
       source.fetch_pc = 1u;
       source.raw_register_snapshot = true;
       table.resources.push_back(source);
