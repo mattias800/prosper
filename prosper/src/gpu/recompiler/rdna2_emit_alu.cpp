@@ -5643,9 +5643,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // SOFFSET adds an SGPR-computed byte offset:
             //  * a descriptor-only s_load (x4/x8 = V#/T#) with a computed offset can be resolved
             //    by the front end at the exact fetch PC, leaving placeholder words here. Typeless
-            //    x4/x8 loads whose words also feed ordinary ALU require real backing and reject
-            //    below IN THE COMPUTE SHELL; Uncharted's full-resolution compute writer has several
-            //    such loads. Graphics stages keep the placeholder for now (#3951).
+            //    register-offset x4/x8 loads whose words also feed ordinary ALU require real
+            //    backing in every stage and reject below when that backing is not proven.
+            //    Uncharted's full-resolution compute writer has several such numeric loads.
             //  * an s_buffer_load (0x8..0xC) with a TRACKED scalar offset is a computed constant-
             //    buffer read (DOLL's bloom-combine PS: per-tap weights at `vcc_lo = 16*(tap/2)`
             //    inside its counted loop, #273) — model it as a DYNAMIC dword index into the
