@@ -9,6 +9,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -36,10 +37,11 @@ struct Program {
 };
 // The process-lifetime registry retains header/code addresses. Give every variant a distinct,
 // immobile, aligned owner that remains alive until all fixture work and backend waits finish.
-static std::array<Program, 20> programs;
+using ProgramOwners = std::array<Program, 20>;
+static ProgramOwners* programs = nullptr;
 static size_t next_program = 0;
 static Program& register_program(bool vertex, Load load, bool wide8) {
-    Program& p = programs.at(next_program++);
+    Program& p = programs->at(next_program++);
     std::vector<uint32_t> code;
     const uint32_t base = vertex ? 8u : 0u;
     if (load == Load::RuntimeSelector)
@@ -100,6 +102,13 @@ static Program& register_program(bool vertex, Load load, bool wide8) {
           reinterpret_cast<uint64_t>(&p.header), reinterpret_cast<uint64_t>(p.code.data()),
           0, 0, 0) == 0 && registered == &p.header, vertex ? "VS" : "PS",
           "register the owned AGC code/header through the real create-shader API");
+    const uint64_t address = reinterpret_cast<uint64_t>(p.code.data());
+    check(p.header.sh_registers == p.registers.data() &&
+          p.registers[0].value == static_cast<uint32_t>(address >> 8u) &&
+          p.registers[1].value == static_cast<uint32_t>((address >> 40u) & 0xffu) &&
+          p.header.user_data == &p.user && p.user.sharp_resource_offset[3] == &p.sharp &&
+          p.user.sharp_resource_count[3] == 1u, vertex ? "VS" : "PS",
+          "registration patches the exact PGM pair and preserves nonempty metadata ownership");
     return p;
 }
 
@@ -195,6 +204,18 @@ int main(int argc, char** argv) {
           reinterpret_cast<uint64_t>("graphics-raw-wide"), 0) == 0 && guest,
           "setup", "map real guest data and selector backing");
     if (!guest || !unmap) return 1;
+    // AGC treats pointer fields below 4 GiB as relative offsets. A non-PIE fixture's static
+    // addresses occupy that range, so own the registry inputs in actual mapped guest storage.
+    // Keep this bounded 64 KiB owner mapped for the registry's remaining process lifetime;
+    // only the separate, transient numeric-data allocation is unmapped below.
+    static_assert(sizeof(ProgramOwners) <= Bytes);
+    uint64_t program_guest = 0;
+    check(map(reinterpret_cast<uint64_t>(&program_guest), Bytes, 2u, 0,
+              reinterpret_cast<uint64_t>("graphics-raw-programs"), 0) == 0 &&
+          program_guest >= 0x100000000ull && program_guest % alignof(ProgramOwners) == 0,
+          "setup", "own immobile AGC pointers in the absolute guest-address range");
+    if (program_guest < 0x100000000ull || program_guest % alignof(ProgramOwners) != 0) return 1;
+    programs = std::construct_at(reinterpret_cast<ProgramOwners*>(program_guest));
     if (!cpu_only) prosper::frontend::register_live_renderer(".", false);
     auto& plain_vs = register_program(true, Load::None, false);
     auto& plain_ps = register_program(false, Load::None, false);
