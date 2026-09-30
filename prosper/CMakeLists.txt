@@ -3660,6 +3660,8 @@ endif()
         "PROSPER_RENDER_DELAY_MS=unset:;PROSPER_TEXTURE_DECODE_CACHE_MB=unset:;PROSPER_RENDER_FIRST=unset:;PROSPER_RENDER_LAST=unset:;PROSPER_TEXTURE_VALIDATION_CENSUS=set:1")
       # #3892: real builder rejection/skip/continuation and census tail, with seeded manifests.
       add_executable(test_draw_resource_status tests/shared/live/test_draw_resource_status.cpp)
+      # Maintained nonshipping TU role; all local diagnostic checks/inventory remain enabled.
+      set_property(TARGET test_draw_resource_status PROPERTY PROSPER_DIAG_MEMBER_FACT_DOMAIN TEST_LOCAL)
       target_include_directories(test_draw_resource_status PRIVATE frontends src tests)
       target_link_libraries(test_draw_resource_status PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME draw_resource_status COMMAND test_draw_resource_status)
