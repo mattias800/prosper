@@ -119,6 +119,7 @@ import sys
 from pathlib import Path
 
 from member_fact_domains import Role, discover as discover_member_domains
+from ref_output_associations import OutputAssociation, discover_output_associations
 
 SCAN_DIRS = ("src", "frontends", "tools", "tests")
 SCAN_EXT = (".c", ".cc", ".cpp", ".h", ".hpp")
@@ -986,7 +987,9 @@ class FileScanner:
                  flag_writes: dict[str, list[frozenset]] | None = None,
                  members: dict[str, frozenset] | None = None,
                  member_writes: dict[str, list[frozenset]] | None = None,
-                 getters: dict[tuple[str, str], frozenset] | None = None):
+                 getters: dict[tuple[str, str], frozenset] | None = None,
+                 output_associations: list[OutputAssociation] | None = None,
+                 collect_outputs: bool = False):
         self.rel = rel
         self.lines = lines
         self.preds = preds
@@ -997,6 +1000,8 @@ class FileScanner:
         self.members = members or {}
         self.member_writes = member_writes
         self.getters = getters or {}
+        self.output_associations = output_associations or []
+        self.collect_outputs = collect_outputs
         self.findings: list[Finding] = []
         self.stack: list[Scope] = [Scope(set())]
 
@@ -1259,7 +1264,21 @@ class FileScanner:
                 elif not line.startswith(("if", "for", "while", "return", "}", "else")):
                     am = ASSIGN_RE.match(line)
                     if am and not DEFAULT_RHS_RE.match(am.group(2).rstrip(";")):
-                        self.note_local(am.group(1), i + 1, here, True)
+                        # A designated reference binding initializes a context field,
+                        # not its caller local (which can have the same spelling).
+                        binding_initializer = any(
+                            association.admitted and (self.rel, i + 1, am.group(1))
+                            in association.binding_lines for association in self.output_associations)
+                        if not binding_initializer:
+                            self.note_local(am.group(1), i + 1, here, True)
+                        if self.collect_outputs:
+                            for association in self.output_associations:
+                                if (association.source_path == self.rel
+                                        and association.source_start <= i + 1 <= association.source_end
+                                        and i + 1 not in association.alias_lines
+                                        and am.group(1) in association.aliases):
+                                    field = association.aliases[am.group(1)]
+                                    association.writes.setdefault(field, []).append((i + 1, here))
                         if self.flag_writes is not None and GLOBAL_FLAG_RE.match(am.group(1)):
                             self.flag_writes.setdefault(am.group(1), []).append(
                                 frozenset(here) | frozenset(cond_gates))
@@ -1268,6 +1287,23 @@ class FileScanner:
                     consumed = max(consumed, used)
                     for ident in IDENT_RE.findall(args):
                         self.note_local(ident, i + 1, here, False)
+
+            # Import only the selected outputs of an explicitly admitted object/call
+            # association. CNF set union means conjunction of the caller and callee
+            # requirements; alternatives within each clause remain alternatives.
+            if not self.collect_outputs:
+                for association in self.output_associations:
+                    bindings = association.calls.get((self.rel, i + 1))
+                    if not bindings or not association.admitted:
+                        continue
+                    if any(not any(local in scope.decls for scope in self.stack)
+                           for local in bindings.values()):
+                        association.errors.append('caller output is not a defaulted local at call')
+                        continue
+                    for field, local in bindings.items():
+                        for _source_line, gates in association.writes.get(field, []):
+                            self.note_local(local, i + 1,
+                                            simplify(set(here) | set(cond_gates) | set(gates)), True)
 
             # ---- a DEFAULTED alias stops being (only) its own gate -------------------------
             # `const char* out = getenv("X"); if (!out || !*out) out = "shader0.bin";` leaves `out`
@@ -1712,7 +1748,9 @@ def resolve_members(member_writes: dict[str, list[frozenset]],
 
 
 def scan_tree(root: Path, follow_members: bool = True, follow_getters: bool = True,
-              follow_test_domains: bool = True, domain_roles: list[Role] | None = None):
+              follow_test_domains: bool = True, domain_roles: list[Role] | None = None,
+              follow_outputs: bool = True,
+              output_associations: list[OutputAssociation] | None = None):
     files = collect_files(root)
     test_local, roles = discover_member_domains(root, files, is_excluded_dir)
     if domain_roles is not None:
@@ -1744,14 +1782,36 @@ def scan_tree(root: Path, follow_members: bool = True, follow_getters: bool = Tr
     shared_members = (resolve_members(shared_writes, collect_member_kinds(shared_files))
                       if follow_members and test_local else all_members)
 
+    def defaulted_local(line, name):
+        declaration = DECL_RE.match(line)
+        return (declaration is not None and declaration.group(1) == name
+                and DEFAULT_RHS_RE.match(declaration.group(2).rstrip(';')) is not None)
+
+    associations = discover_output_associations(root, files, defaulted_local)
+    admitted = [record for record in associations if record.admitted] if follow_outputs else []
+    # Validate every caller against this scanner's actual declaration stack before
+    # suppressing reference initializers or importing any writes in the final pass.
+    # These discarded walks have no source writes yet, so refusal is all-or-nothing.
+    for path in {root / rel for record in admitted for rel, _line in record.calls}:
+        members = all_members if path in test_local else shared_members
+        FileScanner(str(path.relative_to(root)), files[path], preds, {}, printing,
+                    flags, None, members, None, getters, admitted).run()
+    admitted = [record for record in admitted if record.admitted]
+    for path in {root / record.source_path for record in admitted}:
+        members = all_members if path in test_local else shared_members
+        FileScanner(str(path.relative_to(root)), files[path], preds, {}, printing,
+                    flags, None, members, None, getters, admitted, True).run()
+
     call_sites: dict[str, list[tuple[str, frozenset]]] = {}
     findings: list[Finding] = []
     for path, lines in files.items():
         rel = str(path.relative_to(root))
         members = all_members if path in test_local else shared_members
         findings += FileScanner(rel, lines, preds, call_sites, printing, flags, None,
-                                members, None, getters).run()
+                                members, None, getters, admitted).run()
     findings += split_call_findings(call_sites, defined)
+    if output_associations is not None:
+        output_associations.extend(associations)
     return files, preds, findings
 
 
@@ -2964,6 +3024,9 @@ def main() -> int:
     from test_member_fact_domains import run_tests as run_member_domain_tests
     if run_member_domain_tests(args.verbose):
         return 1
+    from test_ref_output_associations import run_tests as run_output_tests
+    if run_output_tests(args.verbose):
+        return 1
     if args.selftest:
         print("== all checks passed ==")
         return 0
@@ -2971,10 +3034,16 @@ def main() -> int:
     here = Path(__file__).resolve()
     root = Path(args.root).resolve() if args.root else here.parents[2]
     roles: list[Role] = []
-    files, preds, findings = scan_tree(root, domain_roles=roles)
+    outputs: list[OutputAssociation] = []
+    files, preds, findings = scan_tree(root, domain_roles=roles, output_associations=outputs)
     for role in roles:
         print(f"  [{'ok' if role.accepted else 'FAIL'}]   {role.report()}")
     refused_roles = sum(not role.accepted for role in roles)
+    for association in outputs:
+        print(f"  [{'ok' if association.admitted else 'FAIL'}]   {association.report()}")
+    refused_outputs = sum(not association.admitted for association in outputs)
+    print(f"  [ok]   reference-output associations: {len(outputs) - refused_outputs} admitted, "
+          f"{refused_outputs} refused")
     if not files:
         print(f"  [FAIL] no sources found under {root} -- the scan is not seeing the tree")
         return 1
@@ -2996,7 +3065,7 @@ def main() -> int:
     if args.emit_baseline:
         for key in sorted({f.key() for f in findings}):
             print(f"{key}  # unreviewed")
-        return int(bool(refused_roles))
+        return int(bool(refused_roles or refused_outputs))
 
     baseline_path = here.parent / "diag_gate_baseline.txt"
     baseline = load_baseline(baseline_path)
@@ -3022,7 +3091,7 @@ def main() -> int:
         print(f"  [ok]   baseline notes: {len(baseline)} row(s) classified, header counts agree, "
               f"{UNREVIEWED_BUDGET} unreviewed as budgeted")
 
-    if not new and not stale and not integrity and not refused_roles:
+    if not new and not stale and not integrity and not refused_roles and not refused_outputs:
         print("== all checks passed ==")
         return 0
 
@@ -3041,7 +3110,7 @@ def main() -> int:
         print(f"  [FAIL] {len(stale)} baseline entry(ies) no longer reproduce -- delete the row:")
         for k in stale:
             print(f"    {k}")
-    print(f"== {len(new) + len(stale) + len(integrity) + refused_roles} failure(s) ==")
+    print(f"== {len(new) + len(stale) + len(integrity) + refused_roles + refused_outputs} failure(s) ==")
     return 1
 
 

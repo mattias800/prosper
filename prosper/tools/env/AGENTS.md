@@ -30,6 +30,12 @@ are actually hot. This folder is about the switch surface itself.
   member table. Literal CMake/include safeguards do not infer complete build reachability.
   `test_member_fact_domains.py` runs its admission, refusal and visibility controls inside the
   existing diagnostic gate selftests and full scans.
+- **`ref_output_associations.py`** + `REFERENCE_OUTPUTS.md` — explicit private-function/context
+  contracts retain selected lexical producer/report associations across reference outputs.
+  Exact callee aliases and caller object/local/call identities are required; admitted effects
+  conjoin caller and callee clauses, while unsupported or escaping contracts visibly refuse.
+  This does not infer general C++ effects. `test_ref_output_associations.py` calibrates bridge-off,
+  gate changes, no-write paths, unrelated fields and refusal/visibility inside the same gate.
 - **`check_env_numeric_arms.py`** — every knob parsed through `diagnostics/env_numeric.hpp` has a
   matching arm in `tests/diagnostics/test_env_numeric_sites.cpp`, and vice versa. Run it from
   `prosper/`, not the checkout root.
@@ -50,6 +56,14 @@ cached at all), conversion third. Picking sites by reading the source instead me
 has, historically, converted names no route ever reached.
 
 ## Ruled out
+
+- **A byte-preserving function split does not preserve a local producer/report association.**
+  The #3892 image extraction initially retained the complete source by reconstruction, but the
+  unmodified scanner fell from 122 findings/65 keys to 114 findings/57 keys. Eight defaulted
+  caller scalars still printed their original values; their guarded writes moved into context
+  reference aliases in the callee. Four other report keys changed only pathname. A declared,
+  per-object/per-call output association is needed before treating those eight classifications
+  as preserved; deleting their stale baseline rows would hide unchanged diagnostic gates.
 
 - **A source-preserving config relocation does not preserve a lexical scanner's visibility by
   itself.** On #3892's process-owner candidate `df8439ff5543`, the unmodified diagnostic scanner
