@@ -22,54 +22,60 @@ static void check(bool ok, const char* arm, const char* message) {
 // The builder's native TLS reference aliases bind once. Keep the same fixture-owned objects
 // alive for every call, and reset their contents rather than binding to successive stack owners.
 template <class T> using Owned = std::remove_cvref_t<T>;
+// One ordered field list keeps fixture ownership and its designated reference bindings aligned.
+#define IMAGE_STATUS_CONTEXT_FIELDS(FIELD) \
+    FIELD(g_rtt) \
+    FIELD(g_pass_log_submit) \
+    FIELD(invalidate_ds) \
+    FIELD(frame_no) \
+    FIELD(rtt_on) \
+    FIELD(live_gpu_targets) \
+    FIELD(write_watch_promotion_budget) \
+    FIELD(pinned_renderer_mip_targets) \
+    FIELD(g_this_submit) \
+    FIELD(rtt_log) \
+    FIELD(pending_timing) \
+    FIELD(validation_census) \
+    FIELD(timing_enabled) \
+    FIELD(render_timing_detail) \
+    FIELD(texstore) \
+    FIELD(texstore_pinned) \
+    FIELD(texstore_used) \
+    FIELD(decoded_textures) \
+    FIELD(decode_span_ordinal) \
+    FIELD(use_direct_buffer_views) \
+    FIELD(use_tracked_buffer_membership_cache) \
+    FIELD(persistent_decoded_textures) \
+    FIELD(persistent_decoded_texture_bytes) \
+    FIELD(decode_generation) \
+    FIELD(retired_submit_pixels) \
+    FIELD(retired_submit_bytes) \
+    FIELD(persistent_texture_id) \
+    FIELD(persistent_validation_scratch) \
+    FIELD(persistent_decode_limit) \
+    FIELD(resource_hash_w) \
+    FIELD(resource_hash_h) \
+    FIELD(rtt_injection_cache) \
+    FIELD(reflect_memo) \
+    FIELD(compact_buffer_resources) \
+    FIELD(reserve_frame_resources) \
+    FIELD(depth_array_census) \
+    FIELD(depth_array_snapshots) \
+    FIELD(depth_array_snapshot_bytes) \
+    FIELD(depth_array_snapshot_admitted) \
+    FIELD(reuse_depth_arrays_across_draws) \
+    FIELD(compact_depth_array_snapshots) \
+    FIELD(gpu_depth_array_snapshots) \
+    FIELD(disable_guest_depth_layers) \
+    FIELD(depth_array_guest_scans) \
+    FIELD(depth_array_guest_scan_epoch) \
+    FIELD(gpu_depth_cube_snapshots) \
+    FIELD(depth_cube_gpu_snapshots)
+
 struct FixtureState {
-    Owned<decltype(DrawResourceContext::g_rtt)> g_rtt{};
-    Owned<decltype(DrawResourceContext::g_pass_log_submit)> g_pass_log_submit{};
-    Owned<decltype(DrawResourceContext::invalidate_ds)> invalidate_ds{};
-    Owned<decltype(DrawResourceContext::frame_no)> frame_no{};
-    Owned<decltype(DrawResourceContext::rtt_on)> rtt_on{};
-    Owned<decltype(DrawResourceContext::live_gpu_targets)> live_gpu_targets{};
-    Owned<decltype(DrawResourceContext::write_watch_promotion_budget)> write_watch_promotion_budget{};
-    Owned<decltype(DrawResourceContext::pinned_renderer_mip_targets)> pinned_renderer_mip_targets{};
-    Owned<decltype(DrawResourceContext::g_this_submit)> g_this_submit{};
-    Owned<decltype(DrawResourceContext::rtt_log)> rtt_log{};
-    Owned<decltype(DrawResourceContext::pending_timing)> pending_timing{};
-    Owned<decltype(DrawResourceContext::validation_census)> validation_census{};
-    Owned<decltype(DrawResourceContext::timing_enabled)> timing_enabled{};
-    Owned<decltype(DrawResourceContext::render_timing_detail)> render_timing_detail{};
-    Owned<decltype(DrawResourceContext::texstore)> texstore{};
-    Owned<decltype(DrawResourceContext::texstore_pinned)> texstore_pinned{};
-    Owned<decltype(DrawResourceContext::texstore_used)> texstore_used{};
-    Owned<decltype(DrawResourceContext::decoded_textures)> decoded_textures{};
-    Owned<decltype(DrawResourceContext::decode_span_ordinal)> decode_span_ordinal{};
-    Owned<decltype(DrawResourceContext::use_direct_buffer_views)> use_direct_buffer_views{};
-    Owned<decltype(DrawResourceContext::use_tracked_buffer_membership_cache)> use_tracked_buffer_membership_cache{};
-    Owned<decltype(DrawResourceContext::persistent_decoded_textures)> persistent_decoded_textures{};
-    Owned<decltype(DrawResourceContext::persistent_decoded_texture_bytes)> persistent_decoded_texture_bytes{};
-    Owned<decltype(DrawResourceContext::decode_generation)> decode_generation{};
-    Owned<decltype(DrawResourceContext::retired_submit_pixels)> retired_submit_pixels{};
-    Owned<decltype(DrawResourceContext::retired_submit_bytes)> retired_submit_bytes{};
-    Owned<decltype(DrawResourceContext::persistent_texture_id)> persistent_texture_id{};
-    Owned<decltype(DrawResourceContext::persistent_validation_scratch)> persistent_validation_scratch{};
-    Owned<decltype(DrawResourceContext::persistent_decode_limit)> persistent_decode_limit{};
-    Owned<decltype(DrawResourceContext::resource_hash_w)> resource_hash_w{};
-    Owned<decltype(DrawResourceContext::resource_hash_h)> resource_hash_h{};
-    Owned<decltype(DrawResourceContext::rtt_injection_cache)> rtt_injection_cache{};
-    Owned<decltype(DrawResourceContext::reflect_memo)> reflect_memo{};
-    Owned<decltype(DrawResourceContext::compact_buffer_resources)> compact_buffer_resources{};
-    Owned<decltype(DrawResourceContext::reserve_frame_resources)> reserve_frame_resources{};
-    Owned<decltype(DrawResourceContext::depth_array_census)> depth_array_census{};
-    Owned<decltype(DrawResourceContext::depth_array_snapshots)> depth_array_snapshots{};
-    Owned<decltype(DrawResourceContext::depth_array_snapshot_bytes)> depth_array_snapshot_bytes{};
-    Owned<decltype(DrawResourceContext::depth_array_snapshot_admitted)> depth_array_snapshot_admitted{};
-    Owned<decltype(DrawResourceContext::reuse_depth_arrays_across_draws)> reuse_depth_arrays_across_draws{};
-    Owned<decltype(DrawResourceContext::compact_depth_array_snapshots)> compact_depth_array_snapshots{};
-    Owned<decltype(DrawResourceContext::gpu_depth_array_snapshots)> gpu_depth_array_snapshots{};
-    Owned<decltype(DrawResourceContext::disable_guest_depth_layers)> disable_guest_depth_layers{};
-    Owned<decltype(DrawResourceContext::depth_array_guest_scans)> depth_array_guest_scans{};
-    Owned<decltype(DrawResourceContext::depth_array_guest_scan_epoch)> depth_array_guest_scan_epoch{};
-    Owned<decltype(DrawResourceContext::gpu_depth_cube_snapshots)> gpu_depth_cube_snapshots{};
-    Owned<decltype(DrawResourceContext::depth_cube_gpu_snapshots)> depth_cube_gpu_snapshots{};
+#define IMAGE_STATUS_OWN_FIELD(name) Owned<decltype(DrawResourceContext::name)> name{};
+    IMAGE_STATUS_CONTEXT_FIELDS(IMAGE_STATUS_OWN_FIELD)
+#undef IMAGE_STATUS_OWN_FIELD
     RenderTiming previous_timing;
     uint64_t previous_census_refs = 0;
     uint64_t previous_texture_references = 0;
@@ -83,53 +89,9 @@ struct FixtureState {
 
     DrawResourceContext context() {
         return {
-            .g_rtt = g_rtt,
-            .g_pass_log_submit = g_pass_log_submit,
-            .invalidate_ds = invalidate_ds,
-            .frame_no = frame_no,
-            .rtt_on = rtt_on,
-            .live_gpu_targets = live_gpu_targets,
-            .write_watch_promotion_budget = write_watch_promotion_budget,
-            .pinned_renderer_mip_targets = pinned_renderer_mip_targets,
-            .g_this_submit = g_this_submit,
-            .rtt_log = rtt_log,
-            .pending_timing = pending_timing,
-            .validation_census = validation_census,
-            .timing_enabled = timing_enabled,
-            .render_timing_detail = render_timing_detail,
-            .texstore = texstore,
-            .texstore_pinned = texstore_pinned,
-            .texstore_used = texstore_used,
-            .decoded_textures = decoded_textures,
-            .decode_span_ordinal = decode_span_ordinal,
-            .use_direct_buffer_views = use_direct_buffer_views,
-            .use_tracked_buffer_membership_cache = use_tracked_buffer_membership_cache,
-            .persistent_decoded_textures = persistent_decoded_textures,
-            .persistent_decoded_texture_bytes = persistent_decoded_texture_bytes,
-            .decode_generation = decode_generation,
-            .retired_submit_pixels = retired_submit_pixels,
-            .retired_submit_bytes = retired_submit_bytes,
-            .persistent_texture_id = persistent_texture_id,
-            .persistent_validation_scratch = persistent_validation_scratch,
-            .persistent_decode_limit = persistent_decode_limit,
-            .resource_hash_w = resource_hash_w,
-            .resource_hash_h = resource_hash_h,
-            .rtt_injection_cache = rtt_injection_cache,
-            .reflect_memo = reflect_memo,
-            .compact_buffer_resources = compact_buffer_resources,
-            .reserve_frame_resources = reserve_frame_resources,
-            .depth_array_census = depth_array_census,
-            .depth_array_snapshots = depth_array_snapshots,
-            .depth_array_snapshot_bytes = depth_array_snapshot_bytes,
-            .depth_array_snapshot_admitted = depth_array_snapshot_admitted,
-            .reuse_depth_arrays_across_draws = reuse_depth_arrays_across_draws,
-            .compact_depth_array_snapshots = compact_depth_array_snapshots,
-            .gpu_depth_array_snapshots = gpu_depth_array_snapshots,
-            .disable_guest_depth_layers = disable_guest_depth_layers,
-            .depth_array_guest_scans = depth_array_guest_scans,
-            .depth_array_guest_scan_epoch = depth_array_guest_scan_epoch,
-            .gpu_depth_cube_snapshots = gpu_depth_cube_snapshots,
-            .depth_cube_gpu_snapshots = depth_cube_gpu_snapshots,
+#define IMAGE_STATUS_BIND_FIELD(name) .name = name,
+            IMAGE_STATUS_CONTEXT_FIELDS(IMAGE_STATUS_BIND_FIELD)
+#undef IMAGE_STATUS_BIND_FIELD
         };
     }
 
@@ -151,6 +113,7 @@ struct FixtureState {
         reflect_memo.clear();
     }
 };
+#undef IMAGE_STATUS_CONTEXT_FIELDS
 
 struct Input {
     ShaderResource resource;
