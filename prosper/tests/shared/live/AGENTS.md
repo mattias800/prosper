@@ -5,3 +5,9 @@ ownership and capture interfaces. Metadata-only arms may seed the real caches wi
 GPU commands; distinguish those state assertions from rendered pixel or synchronization evidence.
 Pure frontend policy tests belong in `frontends/shared/tests`. `tests/fixtures/render_runner.h`
 is also the shipping graphics backend, and its synchronization rules apply here.
+
+`test_draw_resource_status` seeds explicit reflection-memo contracts and calls the real resource
+builder. It checks rejection reasons, both cache-cold MSAA skips, later bindings/stages, and
+constructor-population versus successful census/timing deltas. Its hosted-byte checks are metadata
+materialization evidence, with no rendered-pixel, Vulkan-device, validation-layer or completion
+claim. Keep its same-thread context objects alive because two native TLS aliases bind once.

@@ -16,6 +16,14 @@ namespace {
 // timing, emplace) is skipped exactly as before.
 enum class ResourceOutcome { Keep, Skip };
 
+// One image binding may retain the resource, skip only that binding, or reject the draw.
+// The status owns no payload: the caller keeps first-rejection accounting and resource-loop control.
+enum class ImageDisposition { Keep, Skip, Reject };
+struct ImageResourceStatus {
+    ImageDisposition disposition;
+    DropReason reason = DropReason::Unattributed;
+};
+
 // The per-resource loop's state that materialize_buffer_resource reads and writes, one reference per object.
 struct BufferResourceContext {
     const prosper::gpu::DrawItem & draw;
@@ -628,6 +636,8 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
               return take;
           };
           if (image_resource) {
+          // Keep the body and all nested control targets in place until the separate pure move.
+          const auto image_status = [&]() -> ImageResourceStatus {
               auto& fr = *full_resource;
               fr.is_storage_image = r.cls == RC::StorageImage;
               fr.storage_image_numeric_class = reflected_binding->image_numeric_class;
@@ -651,8 +661,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                   std::fprintf(stderr,
                       "[render-array-reject] binding=%u unsupported Float32 reflected image shape\n",
                       r.binding);
-                  built.reject(DropReason::ArrayFloat32Shape);
-                  continue;
+                  return {ImageDisposition::Reject, DropReason::ArrayFloat32Shape};
               }
               const bool float32_array = float32_layered_texture &&
                   reflected_binding->image_arrayed;
@@ -907,7 +916,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                                   htile_metadata_got, htile_metadata.size(), htile_first,
                                   htile_first_different, htile_dwords_different);
                       }
-                      continue;
+                      return {ImageDisposition::Skip};
                   }
 
                   // Captured backing and DCC metadata cannot use the one-range journal
@@ -982,7 +991,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                                       "source=%zu/%zu bytes\n",
                                       set, r.binding, (unsigned long long)r.gpu_addr,
                                       copied, tiled.size());
-                          continue;
+                          return {ImageDisposition::Skip};
                       }
 
                       fr.tex_rgba_owner =
@@ -1055,8 +1064,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                       });
                   if (unpublished_interior_alias) {
                       report_volume_sample_drop("interior-alias", sampled_source_addr, sampled_bytes);
-                      built.reject(DropReason::VolumeInteriorAlias);
-                      continue;
+                      return {ImageDisposition::Reject, DropReason::VolumeInteriorAlias};
                   }
               }
               auto live_rtt = rtt_on ? g_rtt.find(sampled_source_addr) : g_rtt.end();
@@ -1079,8 +1087,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                   // this descriptor cannot consume its image.
                   report_volume_sample_drop("shape-mismatch", sampled_source_addr,
                                             0);
-                  built.reject(DropReason::VolumeShapeMismatch);
-                  continue;
+                  return {ImageDisposition::Reject, DropReason::VolumeShapeMismatch};
               }
               // A single retained color image proves only one layer. Never reinterpret its
               // CPU snapshot as the complete Float32 array or replace renderer authority
@@ -1091,8 +1098,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                       std::fprintf(stderr,
                           "[render-array-reject] binding=%u Float32 array aliases a single color RTT addr=0x%llx\n",
                           r.binding, (unsigned long long)r.gpu_addr);
-                  built.reject(DropReason::ArraySingleColorRtt);
-                  continue;
+                  return {ImageDisposition::Reject, DropReason::ArraySingleColorRtt};
               }
               // Deferred RTT readback (#1284): a GPU-resident target consumed in a way the
               // GPU bind below cannot serve (e.g. format mismatch or storage image) materializes
@@ -1235,8 +1241,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                       has_live_rtt)) {
                   report_volume_sample_drop("no-renderer-image", sampled_source_addr,
                                             live_rtt->second.volume_guest_bytes);
-                  built.reject(DropReason::VolumeNoRendererImage);
-                  continue;
+                  return {ImageDisposition::Reject, DropReason::VolumeNoRendererImage};
               }
               // A dim-5 base-slice view may need the CPU injection path rather than a direct
               // Vulkan bind, but the selected renderer target is still authoritative even if
@@ -1341,8 +1346,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                           unsigned(r.compression_enabled),
                           (unsigned long long)array_footprint,
                           (unsigned long long)array_budget_bytes, (unsigned long long)r.gpu_addr);
-                  built.reject(DropReason::ArrayShapeBudget);
-                  continue;
+                  return {ImageDisposition::Reject, DropReason::ArrayShapeBudget};
               }
               std::shared_ptr<const std::vector<uint8_t>> retained_depth_array;
               std::shared_ptr<prosper::test::PersistentDsDepthArrayGpuImage>
@@ -1364,8 +1368,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                           std::fprintf(stderr,
                               "[render-array-reject] binding=%u RGBA32F sampling unsupported addr=0x%llx\n",
                               r.binding, (unsigned long long)r.gpu_addr);
-                      built.reject(DropReason::ArrayFormatSupport);
-                      continue;
+                      return {ImageDisposition::Reject, DropReason::ArrayFormatSupport};
                   }
                   const bool depth_array_shape = r.num_components == 1u &&
                       !r.in_mip_tail && r.layer_mip_offset_bytes == 0u;
@@ -1445,8 +1448,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                           std::fprintf(stderr,
                               "[render-array-reject] binding=%u unproven retained depth write-base alias addr=0x%llx\n",
                               r.binding, (unsigned long long)r.gpu_addr);
-                      built.reject(DropReason::ArrayNoncanonicalDepth);
-                      continue;
+                      return {ImageDisposition::Reject, DropReason::ArrayNoncanonicalDepth};
                   }
                   if (retained_subview || (retained_exact && !depth_array_shape)) {
                       static thread_local uint32_t array_reject_logged = 0;
@@ -1454,8 +1456,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                           std::fprintf(stderr,
                               "[render-array-reject] binding=%u unsupported retained depth view addr=0x%llx\n",
                               r.binding, (unsigned long long)r.gpu_addr);
-                      built.reject(DropReason::ArrayDepthView);
-                      continue;
+                      return {ImageDisposition::Reject, DropReason::ArrayDepthView};
                   }
                   if (depth_array_shape) {
                       // The exact, non-rebased consumer proves the depth-plane stride.
@@ -1473,8 +1474,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                                   std::fprintf(stderr,
                                       "[render-array-reject] binding=%u unproven retained depth stride addr=0x%llx\n",
                                       r.binding, (unsigned long long)r.gpu_addr);
-                              built.reject(DropReason::ArrayDepthStride);
-                              continue;
+                              return {ImageDisposition::Reject, DropReason::ArrayDepthStride};
                           }
                           prosper::test::note_ds_layer_stride_locked(
                               r.gpu_addr, tw, th, r.layer_stride_bytes);
@@ -1510,8 +1510,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                                   std::fprintf(stderr,
                                       "[render-array-reject] binding=%u retained depth producer did not complete addr=0x%llx\n",
                                       r.binding, (unsigned long long)r.gpu_addr);
-                              built.reject(DropReason::ArrayProducerCompletion);
-                              continue;
+                              return {ImageDisposition::Reject, DropReason::ArrayProducerCompletion};
                           }
                           if (depth_array_census.enabled) ++depth_array_census.producer_flushes;
                       }
@@ -1659,8 +1658,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                                   unsigned(r.compression_enabled),
                                   (unsigned long long)r.layer_stride_bytes, layers.c_str());
                           }
-                          built.reject(DropReason::ArrayDepthUnavailable);
-                          continue;
+                          return {ImageDisposition::Reject, DropReason::ArrayDepthUnavailable};
                       }
                       if (status == prosper::test::PersistentDsDepthArrayStatus::Ready &&
                           retained_depth_array_gpu && !snapshot_reused) {
@@ -1740,8 +1738,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                           std::fprintf(stderr,
                               "[render-array-reject] binding=%u compressed Float32 array has no retained depth addr=0x%llx\n",
                               r.binding, (unsigned long long)r.gpu_addr);
-                      built.reject(DropReason::ArrayCompressedNoDepth);
-                      continue;
+                      return {ImageDisposition::Reject, DropReason::ArrayCompressedNoDepth};
                   }
               }
               // The SHAPE question -- is this a layered array? -- is what the
@@ -4366,8 +4363,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                           std::fprintf(stderr,
                               "[render-array-reject] binding=%u compressed Float32 guest backing addr=0x%llx\n",
                               r.binding, (unsigned long long)r.gpu_addr);
-                      built.reject(DropReason::ArrayCompressedGuest);
-                      continue;
+                      return {ImageDisposition::Reject, DropReason::ArrayCompressedGuest};
                   }
                   const uint32_t cb = prosper::gpu::bc_block_bytes(r.format);
                   const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
@@ -4582,8 +4578,7 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
                               "[render-array-reject] binding=%u Float32 short backing: "
                               "%u/%u slices, first=%u addr=0x%llx\n", r.binding, slice_short_count,
                               slice_count, slice_short[0], (unsigned long long)r.gpu_addr);
-                      built.reject(DropReason::ArrayShortBacking);
-                      continue;
+                      return {ImageDisposition::Reject, DropReason::ArrayShortBacking};
                   }
                   // The loop above filled `slice_count` slices. A cube publishes them through
                   // HEIGHT (fr.th = th*6) and an array through LAYERS (fr.sample_count), so the
@@ -5939,6 +5934,14 @@ BuiltFrameResources build_draw_frame_resources(DrawResourceContext& ctx,
               // level appears with this, the alpha channel (decode or DST_SEL swizzle) is the bug (#300).
               if (PROSPER_ENV_ON("PROSPER_ALPHA1")) fr.swizzle[3] = 1;
               }
+              return {ImageDisposition::Keep};
+          }();
+          // reject is a private result store. Image-local destruction now precedes this store;
+          // enclosing resource teardown and the next binding still follow it.
+          if (image_status.disposition == ImageDisposition::Reject)
+              built.reject(image_status.reason);
+          if (image_status.disposition != ImageDisposition::Keep)
+              continue;
           } else {
               BufferResourceContext materialize_buffer_resource_ctx{
                   .draw = draw,
