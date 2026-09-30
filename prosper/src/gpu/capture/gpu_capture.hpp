@@ -401,7 +401,8 @@ bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMeta
                         const CaptureMemoryReader& reader, GpuCaptureFile& out, std::string& error,
                         const CaptureRttSeedReader& rtt_reader = {});
 // Use the same interval planner as capture_submit_items, without reading guest bytes. The returned
-// amount is the merged resource allocation footprint, including mip-chain prefixes when admitted.
+// amount includes merged resource allocation ranges, admitted mip-chain prefixes, and each
+// independently owned scalar-word observation.
 // A positive preflight authorizes only this one draw's guest-resource copy; it does not establish
 // producer/dependency closure or bound RTT/DS seed snapshots.
 bool preflight_gpu_capture_draw_resources(const DrawItem& draw, uint64_t resource_limit_bytes,

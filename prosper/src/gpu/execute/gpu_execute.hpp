@@ -268,7 +268,8 @@ inline constexpr uint32_t kMaxSelectedTableRecords = 256u;
 struct SrtUse {
     bool operator==(const SrtUse&) const = default;
     int kind = 0;                    // 0 = texture, 1 = constant buffer, 2 = BVH buffer,
-                                     // 3 = proven guarded null BVH, 4 = raw register-offset snapshot
+                                     // 3 = proven guarded null BVH, 4 = raw register-offset snapshot,
+                                     // 5 = latched immediate-zero x1 offset source: v4={addr lo,hi,word,0}
     uint32_t key = 0;                // the s_load immediate byte offset (== emit_alu's sreg_srt tag);
                                      // 0xFFFFFFFF = key-less (direct entry V#, register-SOFFSET, or
                                      // negative-imm load; resolve by the exact instruction pc instead)
