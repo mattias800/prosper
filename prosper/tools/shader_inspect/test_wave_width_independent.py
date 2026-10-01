@@ -585,9 +585,9 @@ def main() -> int:
             dumped = subprocess.run([sys.argv[1], "--dump", tmp], capture_output=True, text=True)
             check("the #4007 fixture generator actually ran", dumped.returncode == 0, dumped.stdout)
             paths = sorted(Path(tmp).glob("*.spv"))
-            check("all 41 #4007 fixtures were emitted", len(paths) == 41, str(len(paths)))
+            check("all 44 #4007 fixtures were emitted", len(paths) == 44, str(len(paths)))
             for path in paths:
-                expected = not path.stem.endswith("_dependent")
+                expected = not path.stem.endswith(("_dependent", "_refused"))
                 done = subprocess.run([sys.executable, str(TOOL), str(path)],
                                       capture_output=True, text=True)
                 check("#4007 " + path.stem, done.returncode == (0 if expected else 1), done.stdout)

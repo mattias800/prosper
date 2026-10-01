@@ -36,7 +36,8 @@ int main(int argc, char** argv) {
     if (!dumping) {
         // Every ordinary pair changes just the observable index/branch operand, not the vote or
         // initialized data. The opaque-call control removes one instruction rather than one word.
-        for (size_t i = 0; i + 1 < corpus.size() - 3; i += 2) {
+        for (size_t i = 0; i + 1 < corpus.size(); i += 2) {
+            if (!corpus[i].name.ends_with("_dependent")) break;
             if (corpus[i].name.starts_with("opaque_call") ||
                 corpus[i].name.starts_with("callee_return")) continue;
             const auto& a = corpus[i].words;

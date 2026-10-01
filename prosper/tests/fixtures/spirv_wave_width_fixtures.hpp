@@ -6,6 +6,7 @@
 // initialized elements, stores, copies, image samples or an early return therefore is observable.
 // A fixed index/condition makes the SAME vote dead. spv_validate checks the baseline Vulkan1.1
 // corpus; Sized copies/flag atomics are separately marked parser-only (Addresses/Kernel).
+// The Gather component-ID pair is parser-only too: Vulkan requires a constant Component.
 // External non-atomic writers use distinct FragCoord-derived locations: the concrete witness is
 // a single primitive covering a single-sampled 64x1 framebuffer, with 64x1 storage images and a
 // 128-element output buffer. Real pixel x owns buffer slots 2*x/2*x+1 and image coordinate (x,0),
@@ -20,7 +21,8 @@ namespace prosper::test::wave_width {
 enum class Shape {
     BufferRead, ExternalStore, LocalRead, LocalStore, CopySourceExternal,
     CopyDestinationExternal, CopySourceLocal, CopyDestinationLocal, GuardedLocalCopy,
-    EarlyReturn, AtomicAddress, AtomicStoreAddress, ImageIdentity, ImageSample, DrefSample, OpaqueCall,
+    EarlyReturn, AtomicAddress, AtomicStoreAddress, ImageIdentity, ImageSample, DrefSample,
+    GatherComponent, OpaqueCall,
     CalleeReturn, CopySizeParserOnly, FlagClearParserOnly,
 };
 
@@ -46,14 +48,17 @@ inline void extension(std::vector<uint32_t>& words, const std::string& name) {
 }
 
 inline std::vector<uint32_t> module(Shape shape, bool dependent, bool uniform_vote = false,
-                                    bool mask_literal_matches_vote_id = false) {
+                                    bool mask_literal_matches_vote_id = false,
+                                    bool projected_dref_vote_source = false) {
     std::vector<uint32_t> w{0x07230203u, 0x00010300u, 0, 96, 0};
     const auto op = [&](uint32_t code, std::initializer_list<uint32_t> args) {
         instruction(w, code, args);
     };
     const bool image = shape == Shape::ImageIdentity || shape == Shape::ImageSample;
     const bool dref = shape == Shape::DrefSample;
-    const bool image_resource = image || dref;
+    const bool gather = shape == Shape::GatherComponent;
+    const bool sampled = dref || gather;
+    const bool image_resource = image || sampled;
     const bool external_writer = shape == Shape::ExternalStore ||
                                  shape == Shape::CopyDestinationExternal;
     const bool coordinates = image || external_writer;
@@ -79,7 +84,7 @@ inline std::vector<uint32_t> module(Shape shape, bool dependent, bool uniform_vo
     if (image_resource) {
         op(71, {33, 34, 0}); op(71, {33, 33, 1});
     }
-    if (dref) { op(71, {82, 34, 0}); op(71, {82, 33, 4}); }
+    if (sampled) { op(71, {82, 34, 0}); op(71, {82, 33, 4}); }
     if (shape == Shape::ImageIdentity) {
         op(71, {53, 5300}); op(71, {54, 5300}); op(71, {56, 5300}); // NonUniform
     }
@@ -102,7 +107,7 @@ inline std::vector<uint32_t> module(Shape shape, bool dependent, bool uniform_vo
     op(32, {19, 7, 15}); op(32, {20, 7, 4});
     op(44, {15, 21, 12, 13});            // local array is initialized {0,1}
     op(59, {6, 22, 1}); op(59, {7, 23, 3}); op(59, {17, 24, 12});
-    if (coordinates || dref) op(23, {25, 4, 4});
+    if (coordinates || sampled) op(23, {25, 4, 4});
     if (coordinates) {
         op(32, {71, 1, 25}); op(59, {71, 72, 1});
     }
@@ -114,14 +119,18 @@ inline std::vector<uint32_t> module(Shape shape, bool dependent, bool uniform_vo
         op(23, {26, 3, 2});
         op(44, {26, 27, 8, 8}); op(44, {25, 28, 13, 13, 13, 13});
         op(25, {29, 4, 1, dref ? 1u : 0u, 0, shape == Shape::ImageSample ? 1u : 0u,
-                dref ? 1u : 2u, dref ? 0u : 1u});
+                sampled ? 1u : 2u, sampled ? 0u : 1u});
         op(28, {30, 29, 10}); op(32, {31, 0, 30}); op(32, {32, 0, 29});
         op(59, {31, 33, 0});            // two rgba32f storage images
     }
-    if (dref) {
-        // A read-only depth image holding 0.5 and a comparison sampler distinguish refs 0/1.
+    if (sampled) {
+        // Read-only depth 0.5 distinguishes refs 0/1; read-only RGBA {0,1,0,1} distinguishes
+        // gathered components 0/1. Shared reads do not race. Sampler comparison is Dref-only.
         op(26, {79}); op(27, {80, 29}); op(32, {81, 0, 79}); op(59, {81, 82, 0});
         op(23, {86, 4, 2}); op(44, {86, 84, 12, 12});
+    }
+    if (projected_dref_vote_source) {
+        op(23, {90, 4, 3}); op(44, {90, 91, 12, 12, 13}); // (0,0,q=1)
     }
     if (atomic) {
         op(28, {34, 3, 10}); op(30, {35, 34});
@@ -199,7 +208,22 @@ inline std::vector<uint32_t> module(Shape shape, bool dependent, bool uniform_vo
         case Shape::DrefSample:
             op(65, {32, 54, 33, 8}); op(61, {29, 56, 54}); op(61, {79, 87, 82});
             op(86, {80, 88, 56, 87}); op(169, {4, 85, vote, 13, 12});
-            op(89, {4, 89, 88, 84, dependent ? 85u : 12u}); op(62, {23, 89});
+            if (projected_dref_vote_source) {
+                // Conservative proof-domain parity, NOT a demonstrated width-dependent witness:
+                // even uniform image operands do not prove a sampled predicate draw-uniform.
+                op(94, {4, 89, 88, 91, 12, 2, 12}); // Dref=0, Lod mask, Lod=0
+                op(186, {2, 92, 89, 12}); op(335, {2, 93, 11, 92});
+                op(169, {4, 94, 93, 13, 12}); op(62, {23, 94});
+            } else {
+                op(89, {4, 89, 88, 84, dependent ? 85u : 12u}); op(62, {23, 89});
+            }
+            break;
+        case Shape::GatherComponent:
+            // General SPIR-V permits the ID, but Vulkan requires a constant Component object.
+            // Both members of this operand-model pair stay outside the strict Vulkan corpus.
+            op(65, {32, 54, 33, 8}); op(61, {29, 56, 54}); op(61, {79, 87, 82});
+            op(86, {80, 88, 56, 87}); op(96, {25, 89, 88, 84, index});
+            op(81, {4, 85, 89, 0}); op(62, {23, 85});
             break;
         case Shape::CalleeReturn:
             if (dependent) {
@@ -240,6 +264,7 @@ inline std::vector<Fixture> fixtures() {
         {"atomic_store_address", Shape::AtomicStoreAddress},
         {"image_sample", Shape::ImageSample}, {"opaque_call", Shape::OpaqueCall},
         {"dref_sample", Shape::DrefSample},
+        {"gather_component", Shape::GatherComponent},
         {"callee_return", Shape::CalleeReturn},
         {"parser_copy_size", Shape::CopySizeParserOnly},
         {"parser_flag_clear", Shape::FlagClearParserOnly},
@@ -250,13 +275,16 @@ inline std::vector<Fixture> fixtures() {
             out.push_back({std::string(shape.name) + (dependent ? "_dependent" : "_dead"),
                            module(shape.shape, dependent), !dependent,
                            shape.shape != Shape::CopySizeParserOnly &&
-                           shape.shape != Shape::FlagClearParserOnly});
+                           shape.shape != Shape::FlagClearParserOnly &&
+                           shape.shape != Shape::GatherComponent});
         }
     }
     out.push_back({"uniform_vote_index", module(Shape::BufferRead, true, true), true, true});
     out.push_back({"uniform_vote_call", module(Shape::OpaqueCall, true, true), true, true});
     out.push_back({"image_literal_mask_is_not_id", module(Shape::ImageSample, false, false, true),
                    true, true});
+    out.push_back({"projected_dref_vote_source_refused",
+                   module(Shape::DrefSample, false, false, false, true), false, true});
     return out;
 }
 

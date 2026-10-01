@@ -194,12 +194,11 @@ bool spirv_is_id_operand(uint32_t op, uint32_t i) {
 // then has to earn uniformity through its operands instead of inheriting it, so an unknown case
 // fails towards "not proven" rather than towards "safe".
 bool spirv_op_is_divergent_source(uint32_t op) {
+    // The proof does not establish draw-uniform image contents or sampling/derivative state.
+    // Match the Python proof's complete image-source domain, including projected/depth forms.
+    // Uniform handles and coordinates alone are not a license to clear a later vote.
+    if (op >= 87 && op <= 106) return true;
     switch (op) {
-        case Op_ImageSampleImplicitLod: case Op_ImageSampleExplicitLod:
-        case Op_ImageSampleDrefImplicitLod: case Op_ImageSampleDrefExplicitLod:
-        case Op_ImageFetch: case Op_ImageGather: case Op_ImageRead:
-        case Op_ImageQuerySizeLod: case Op_ImageQuerySize: case Op_ImageQueryLod:
-        case Op_ImageQueryLevels:
         case Op_DPdx: case Op_DPdy:
         case 209 /*OpFwidth*/: case 210 /*OpDPdxFine*/: case 211 /*OpDPdyFine*/:
         case 212 /*OpFwidthFine*/: case 213 /*OpDPdxCoarse*/: case 214 /*OpDPdyCoarse*/:
