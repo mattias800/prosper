@@ -22,6 +22,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
+#include "../../tests/fixtures/spirv_wave_width_fixtures.hpp"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -481,6 +482,11 @@ int main(int argc, char** argv) {
     dump_numeric_wqm(dir);
     dump_numeric_wqm_sources(dir);
     dump_wqm_mask_compatibility(dir);
+    for (const auto& fixture : prosper::test::wave_width::fixtures()) {
+        if (!fixture.strict_vulkan) continue; // unsupported-environment parser controls, not modules
+        const std::string name = "wave_width_" + fixture.name;
+        dump(dir, name.c_str(), fixture.words);
+    }
     // GTA V's exact literal-bearing V_ALIGNBYTE_B32 packet.  Strict validation guards the
     // masked-shift lowering: SPIR-V shift operands must stay in the defined 0..31 range.
     { const uint32_t c[] = {0xd54f0006u,0x0415fe80u,0x3024240cu,0xbf810000u};

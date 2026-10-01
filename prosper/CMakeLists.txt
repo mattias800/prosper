@@ -2393,6 +2393,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_rdna2_spirv_struct PRIVATE prosper_core)
   add_test(NAME rdna2_spirv_struct COMMAND test_rdna2_spirv_struct)
 
+  # #4007: strict-valid, paired address/control counterexamples for the load-bearing width proof.
+  add_executable(test_wave_width_independent tests/gpu/recompiler/test_wave_width_independent.cpp)
+  target_link_libraries(test_wave_width_independent PRIVATE prosper_core)
+  add_test(NAME wave_width_independent COMMAND test_wave_width_independent)
+
   # #3203: the entry-M0 token containment's CFG-DISPATCHER re-arm. Its own binary rather than another
   # arm in test_rdna2_spirv_struct, because that one returns at its first failure and a mutation run
   # then cannot tell which arms moved. This reports every arm independently.
@@ -2770,7 +2775,8 @@ endif()
   if(Python3_Interpreter_FOUND)
     add_test(NAME wave_width_independence_refuses_the_class
              COMMAND "${Python3_EXECUTABLE}"
-                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_inspect/test_wave_width_independent.py")
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_inspect/test_wave_width_independent.py"
+                     "$<TARGET_FILE:test_wave_width_independent>")
   endif()
 
   # spv_validate: emit a module from EVERY SPIR-V-producing entry point and run spirv-val on each —

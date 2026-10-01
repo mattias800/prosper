@@ -18,6 +18,9 @@ answer admits a shader.
 RESULT_AT_1 = {19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,  # OpType*
                11, 14, 15, 315}                                             # ExtInstImport etc.
 NO_RESULT = {62, 71, 72, 249, 250, 246, 247, 248, 252, 253, 254, 5, 6, 7, 8, 10, 17}
+# Effects have no result. Inventing one aliases an operand with unrelated SSA data and can hide
+# an absent effect check (e.g. ImageWrite's Sample dependence appeared to taint its coordinate).
+NO_RESULT |= {56, 63, 64, 99, 224, 225, 228, 319, 4416, 5380}
 
 
 def id_operand_indices(op, n):

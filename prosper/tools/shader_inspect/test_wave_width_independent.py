@@ -572,6 +572,20 @@ def main() -> int:
         check("an unreadable module is NOT reported proven",
               done.returncode == 1 and "UNREADABLE" in done.stdout, done.stdout)
 
+    if len(sys.argv) > 1:
+        # Shared strict-valid #4007 fixtures guard parity with the shipped C++ proof. These are
+        # project-owned raw SPIR-V, independent of both analysers; spv_validate checks their types.
+        with tempfile.TemporaryDirectory() as tmp:
+            dumped = subprocess.run([sys.argv[1], "--dump", tmp], capture_output=True, text=True)
+            check("the #4007 fixture generator actually ran", dumped.returncode == 0, dumped.stdout)
+            paths = sorted(Path(tmp).glob("*.spv"))
+            check("all 35 #4007 fixtures were emitted", len(paths) == 35, str(len(paths)))
+            for path in paths:
+                expected = not path.stem.endswith("_dependent")
+                done = subprocess.run([sys.executable, str(TOOL), str(path)],
+                                      capture_output=True, text=True)
+                check("#4007 " + path.stem, done.returncode == (0 if expected else 1), done.stdout)
+
     print("\n%d checks failed" % len(failures) if failures else "\nall checks passed")
     return 1 if failures else 0
 
