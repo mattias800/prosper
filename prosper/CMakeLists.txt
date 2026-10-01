@@ -2449,6 +2449,10 @@ if(TARGET prosper_core)
   add_executable(test_normal_magnitude_predicate tests/gpu/recompiler/test_normal_magnitude_predicate.cpp)
   target_link_libraries(test_normal_magnitude_predicate PRIVATE prosper_core)
   add_test(NAME normal_magnitude_predicate COMMAND test_normal_magnitude_predicate)
+  add_executable(test_fragment_float_mode tests/gpu/recompiler/test_fragment_float_mode.cpp)
+  target_link_libraries(test_fragment_float_mode PRIVATE prosper_core)
+  target_include_directories(test_fragment_float_mode PRIVATE tests)
+  add_test(NAME fragment_float_mode COMMAND test_fragment_float_mode)
 
   # #3203: the entry-M0 token containment's CFG-DISPATCHER re-arm. Its own binary rather than another
   # arm in test_rdna2_spirv_struct, because that one returns at its first failure and a mutation run
@@ -2910,6 +2914,9 @@ endif()
   add_executable(test_realized_fragment_width tests/gpu/execute/test_realized_fragment_width.cpp)
   target_link_libraries(test_realized_fragment_width PRIVATE prosper_core)
   add_test(NAME realized_fragment_width_capture COMMAND test_realized_fragment_width)
+  add_executable(test_fragment_float_mode_capture tests/gpu/execute/test_fragment_float_mode_capture.cpp)
+  target_link_libraries(test_fragment_float_mode_capture PRIVATE prosper_core)
+  add_test(NAME fragment_float_mode_capture COMMAND test_fragment_float_mode_capture)
 
   add_executable(test_gpu_capture_bundle tests/gpu/capture/test_gpu_capture_bundle.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
@@ -5531,6 +5538,13 @@ endif()
 # has to fail when the legend is dropped; nothing else in the tree can. Behavioural rather than a
 # source grep: it runs the real binary and reads what an operator would actually see.
 if(TARGET gpu_replay AND Python3_Interpreter_FOUND)
+  add_test(NAME gpu_replay_fragment_float_mode_cli
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/gpu_replay/test_fragment_float_mode.py")
+  set_tests_properties(gpu_replay_fragment_float_mode_cli PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+  set_property(TEST gpu_replay_fragment_float_mode_cli APPEND PROPERTY ENVIRONMENT
+    "PROSPER_GPU_REPLAY_BIN=$<TARGET_FILE:gpu_replay>"
+    "PROSPER_FRAGMENT_FLOAT_MODE_FIXTURE_BIN=$<TARGET_FILE:test_fragment_float_mode_capture>")
   add_test(NAME gpu_replay_fragment_width_cli
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/gpu_replay/test_fragment_width.py")

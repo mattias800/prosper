@@ -396,6 +396,10 @@ struct SpirvCompute {
     // spirv-val with a LAYOUT complaint that says nothing about descriptors.
     std::vector<uint32_t> caps, exts, extimp, mem, entry, exec, debug, deco, types, code;
     RecompileDiagnosticContext diagnostic{};
+    FragmentFloatMode fragment_float_mode{};
+    uint64_t fragment_program_hash = 0;
+    bool fragment_float_mode_warning = false;
+    void warn_fragment_float_mode_unavailable(uint32_t pc);
     // Ordinal of the next CFG dispatcher emitted for THIS module. A barrier-phased compute program
     // emits one dispatcher per barrier-free phase, and they are not interchangeable — each covers a
     // different guest pc range. Numbering them lets a diagnostic name which one it means.
@@ -739,6 +743,7 @@ struct SpirvCompute {
     // Returns zero unless bound is an owned constant positive finite NORMAL binary32 encoding.
     // The comparison is invariant under either guest input-denorm mode and uses integer bits only.
     uint32_t f32_abs_normal_le_bits(uint32_t word, uint32_t bound);
+    uint32_t f32_nonzero_bits(uint32_t word);
     uint32_t bfalse() { if (!bconst_false) { bconst_false = id(); put(types, Op_ConstantFalse, {t_bool, bconst_false}); } return bconst_false; }
     uint32_t sel(uint32_t cond, uint32_t tval, uint32_t fval) { uint32_t r = id(); put(code, Op_Select, {t_u32, r, cond, tval, fval}); return r; }
     bool is_fragment_wave_vote_value(uint32_t value) const {

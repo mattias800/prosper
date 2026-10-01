@@ -3917,10 +3917,32 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             // Float source modifiers (abs then neg — hardware order), set only on FLOAT compares by the
             // assembler (VOP3-encoded e64 or SDWA forms; e.g. DOLL's `v_cmp_gt_f32_sdwa vcc, |v5|, s4`).
-            const bool guest_compare_fact = ok && !is_cmpx && !rs.exec_narrowed && !in.clamp &&
+            const bool guest_compare_fact = ok && !is_cmpx && !rs.exec_narrowed && !in.clamp && !in.omod &&
                 !in.has_dpp && (!in.has_sdwa ||
                     (in.sdwa_src0_sel == 6 && in.sdwa_src1_sel == 6 &&
                      !in.sdwa_src0_sext && !in.sdwa_src1_sext));
+            uint32_t zero_cmp = 0;
+            const bool zero_compare_eligible = ok && b.is_fragment &&
+                (eff == 0x02u || eff == 0x0du) && !in.clamp && !in.omod && !in.has_dpp &&
+                !in.src_abs[0] && !in.src_abs[1] &&
+                !in.src_neg[0] && !in.src_neg[1] &&
+                (!in.has_sdwa || (in.sdwa_src0_sel == 6 && in.sdwa_src1_sel == 6 &&
+                                 !in.sdwa_src0_sext && !in.sdwa_src1_sext));
+            if (zero_compare_eligible) {
+                uint32_t literal = 0, word = 0;
+                if (b.uconst_literal(ra, &literal) && (literal & 0x7fffffffu) == 0u)
+                    word = rc;
+                else if (b.uconst_literal(rc, &literal) && (literal & 0x7fffffffu) == 0u)
+                    word = ra;
+                if (word) {
+                    if (b.fragment_float_mode.available) {
+                        const uint32_t nonzero = b.f32_nonzero_bits(word);
+                        zero_cmp = eff == 0x02u ? b.logical_not(nonzero) : nonzero;
+                    } else {
+                        b.warn_fragment_float_mode_unavailable(in.pc);
+                    }
+                }
+            }
             uint32_t magnitude_cmp = 0, magnitude_word = 0;
             if (guest_compare_fact && !in.src_neg[0] && !in.src_neg[1]) {
                 if (eff == 0x03 && in.src_abs[0] && !in.src_abs[1]) {
@@ -3932,7 +3954,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     magnitude_word = rc;
                 }
             }
-            if (!magnitude_cmp) {
+            if (!magnitude_cmp && !zero_cmp) {
                 if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
                 if (in.src_neg[0]) a = b.fneg(a);
                 if (in.src_abs[1]) c = b.fext1(Glsl_FAbs, c);
@@ -3986,7 +4008,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             switch (eff) {
                 case 0x00: cmp = b.bfalse(); break;                              // v_cmp_f_f32
                 case 0x01: cmp = b.fcmp(Op_FOrdLessThan, a, c); break;         // v_cmp_lt_f32
-                case 0x02: cmp = b.fcmp(Op_FOrdEqual, a, c); break;            // v_cmp_eq_f32
+                case 0x02: cmp = zero_cmp ? zero_cmp :
+                    b.fcmp(Op_FOrdEqual, a, c); break;                      // v_cmp_eq_f32
                 case 0x03: cmp = magnitude_cmp ? magnitude_cmp :
                     b.fcmp(Op_FOrdLessThanEqual, a, c); break;               // v_cmp_le_f32
                 case 0x04: cmp = b.fcmp(Op_FOrdGreaterThan, a, c); break;      // v_cmp_gt_f32
@@ -4010,7 +4033,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x0A: cmp = b.fcmp(Op_FUnordEqual, a, c); break;          // v_cmp_nlg_f32 = !(a!=b)
                 case 0x0B: cmp = b.fcmp(Op_FUnordLessThanEqual, a, c); break;  // v_cmp_ngt_f32 = !(a>b)
                 case 0x0C: cmp = b.fcmp(Op_FUnordGreaterThan, a, c); break;    // v_cmp_nle_f32 = !(a<=b)
-                case 0x0D: cmp = b.fcmp(Op_FUnordNotEqual, a, c); break;       // v_cmp_neq_f32 = !(a==b)
+                case 0x0D: cmp = zero_cmp ? zero_cmp :
+                    b.fcmp(Op_FUnordNotEqual, a, c); break;                 // v_cmp_neq_f32 = !(a==b)
                 case 0x0E: cmp = b.fcmp(Op_FUnordGreaterThanEqual, a, c); break;// v_cmp_nlt_f32 = !(a<b)
                 case 0x0F: cmp = b.btrue(); break;                              // v_cmp_tru_f32
                 case 0x81: cmp = b.scmp(Op_SLessThan, a, c); break;            // v_cmp_lt_i32

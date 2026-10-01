@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
+#include "gpu/recompiler/fragment_float_mode.hpp"
 
 namespace prosper::gpu {
 
@@ -651,7 +652,8 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const FragmentInterpolationLayout* interpolation = nullptr,
                                          bool wave32 = false,
                                          RecompileDiagnosticContext diagnostic = {
-                                             RecompileDiagnosticStage::Fragment, 0});
+                                             RecompileDiagnosticStage::Fragment, 0},
+                                         FragmentFloatMode float_mode = {});
 
 // Test hook for the low-half EXEC/VCC mask path. Production fragment compilation supplies the same
 // mode from SPI_PS_IN_CONTROL.PS_W32_EN.

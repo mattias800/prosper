@@ -486,6 +486,30 @@ int main(int argc, char** argv) {
     dump_numeric_wqm(dir);
     dump_numeric_wqm_sources(dir);
     dump_wqm_mask_compatibility(dir);
+    // #4056: real mode-selected integer predicates feed both MRT0 and an Any-controlled live Phi.
+    // Validate SOURCE plus admitted EFFECTIVE, not only an isolated hand-written predicate.
+    for (uint32_t op : {2u,13u}) for (uint8_t mode : {uint8_t{0},uint8_t{16},uint8_t{32},uint8_t{48}})
+        for (bool wave32 : {false,true}) {
+            const uint32_t c[] = {
+                0xf4200500u,0xfa000000u,0x7e000214u,0x7e1202ffu,0x40000000u,
+                0xd400006au | (op<<16),128u | (256u<<9),
+                0xd5010008u,128u | (242u<<9) | (106u<<18),
+                0xbf870002u,0x7e1202ffu,0x40400000u,
+                0xf800180fu,0x09080908u,0xbf810000u,
+            };
+            ShaderResourceTable table;
+            ShaderResource buffer;
+            buffer.cls=ResourceClass::ConstantBuffer; buffer.format=DataFormat::Uint32;
+            buffer.sgpr_base=0; buffer.binding=32; buffer.size=4;
+            table.resources.push_back(buffer);
+            const auto source=recompile_fragment(c,std::size(c),&table,nullptr,UINT32_MAX,nullptr,
+                wave32,{RecompileDiagnosticStage::Fragment,0},{true,mode});
+            const auto name="fragment_float_mode_op"+std::to_string(op)+"_mode"+std::to_string(mode)+
+                (wave32?"_wave32":"_wave64");
+            dump(dir,name.c_str(),source,"recompile_fragment");
+            if (!wave32)
+                dump(dir,(name+"_effective").c_str(),lower_fragment_votes(source,true,true).words);
+        }
     for (const auto& fixture : prosper::test::wave_width::fixtures()) {
         if (!fixture.strict_vulkan) continue; // unsupported-environment parser controls, not modules
         const std::string name = "wave_width_" + fixture.name;

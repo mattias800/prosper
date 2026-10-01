@@ -316,15 +316,22 @@ with tempfile.TemporaryDirectory(prefix="prosper-fragment-width-", dir=scratch_r
     check(fixture.returncode == 0, "realized synthetic capture fixture builds without a GPU")
     if fixture.returncode:
         print(fixture.stdout + fixture.stderr)
-    states = [("unknown63", "fragment-width.prgcap", None),
+    states = [("unknown-current", "fragment-width.prgcap", None),
               ("captured32", "fragment-width-captured32.prgcap", 32),
               ("captured64", "fragment-width-captured64.prgcap", 64)]
     known32 = directory / "fragment-width-captured32.prgcap"
     if known32.is_file():
         original = known32.read_bytes()
+        genuine64 = (len(original) > 35 and struct.unpack_from("<I", original, 8)[0] == 64 and
+                     original[-10:] == struct.pack("<I", 1) + b"\x00\x00" + struct.pack("<I", 0))
+        check(genuine64, "current width fixture retains canonical unknown-mode v64 tail")
+        if genuine64:
+            original = bytearray(original[:-10])
+            struct.pack_into("<I", original, 8, 63)
+            original = bytes(original)
         genuine63 = (len(original) > 25 and struct.unpack_from("<I", original, 8)[0] == 63 and
                      original[-5:] == struct.pack("<I", 1) + b"\x02")
-        check(genuine63, "known32 fixture is genuine v63 with exact one-draw Wave32 tail")
+        check(genuine63, "known32 prefix is genuine v63 with exact one-draw Wave32 tail")
         if genuine63:
             # Relabeling alone leaves the new tail and is NOT a legacy-format fixture. Strip the
             # exact appended draw count/tag; the original known32 is now genuinely unavailable.

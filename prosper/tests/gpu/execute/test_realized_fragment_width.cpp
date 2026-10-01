@@ -131,8 +131,8 @@ int main() {
     std::vector<uint8_t> bytes;
     GpuCaptureFile loaded;
     CHECK(serialize_gpu_capture(capture, bytes, error) &&
-              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 63u,
-          "v63 realized-width tail round-trips through production codecs");
+              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 64u,
+          "current realized-width tail round-trips through production codecs");
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded, replay, error) && replay.items.size() == realized.size(),
           "production replay materializes captured launch ABI");
@@ -161,7 +161,8 @@ int main() {
         CHECK(false, "codec controls require the successful bounded realized fixture");
         return 1;
     }
-    const size_t tail = bytes.size() - 4u - realized.size();
+    const size_t mode_tail_size = 8u + 2u * realized.size();
+    const size_t tail = bytes.size() - mode_tail_size - 4u - realized.size();
 
     auto legacy_bytes = bytes;
     legacy_bytes.resize(tail);
