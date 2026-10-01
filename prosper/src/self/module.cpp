@@ -256,6 +256,11 @@ uint8_t* LoadedImage::at(uint64_t va) {
 const uint8_t* LoadedImage::at(uint64_t va) const { return const_cast<LoadedImage*>(this)->at(va); }
 
 bool build_image(const Module& m, uint64_t base, LoadedImage& out, std::string* err) {
+    if (std::none_of(m.segments.begin(), m.segments.end(),
+                     [](const Segment& s) { return s.type == PT_LOAD; })) {
+        if (err) *err = "module has no PT_LOAD segment, so nothing would be mapped";
+        return false;
+    }
     LoadedImage img; img.base = base;
     uint64_t lo = UINT64_MAX, hi = 0;
     for (auto& s : m.segments)
