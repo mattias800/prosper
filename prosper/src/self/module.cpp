@@ -1,6 +1,7 @@
 #include "module.hpp"
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <unordered_map>
 #include <algorithm>
@@ -73,11 +74,15 @@ std::optional<Module> Module::load(const std::string& path, std::string* err) {
     auto fail = [&](const char* m) -> std::optional<Module> { if (err) *err = m; return std::nullopt; };
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return fail("cannot open file");
+    std::unique_ptr<FILE, decltype(&fclose)> file(f, &fclose);
     Module m; m.path = path;
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (fseek(f, 0, SEEK_END) != 0) return fail("cannot seek to end of file");
+    const long n = ftell(f);
+    if (n < 0) return fail("cannot determine file size");
+    if (fseek(f, 0, SEEK_SET) != 0) return fail("cannot seek to start of file");
     m.file.resize(n);
-    if (fread(m.file.data(), 1, n, f) != (size_t)n) { fclose(f); return fail("short read"); }
-    fclose(f);
+    if (fread(m.file.data(), 1, n, f) != (size_t)n) return fail("short read");
+    file.reset();
 
     // SELF wrapper -> inner ELF, and SELF data segment map (flag 0x800 => real data).
     std::map<uint64_t, SelfSegment> data_seg; // phdr index -> data segment

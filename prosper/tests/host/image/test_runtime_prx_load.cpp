@@ -32,6 +32,11 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#ifdef __linux__
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 using namespace prosper;
 
@@ -286,6 +291,28 @@ int main(int argc, char** argv) {
     // (7) A genuinely absent path is still ENOENT — #146's contract is unchanged.
     CHECK(load(U("/app0/prx/no_such_module.prx"), 0, 0, 0, 0, 0) == 0x80020002ull,
           "a missing path still returns SCE_KERNEL_ERROR_ENOENT");
+
+#ifdef __linux__
+    // #2687: a keeper opened nonblocking makes both runtime preflight fopen and Module::load's
+    // fopen immediate. Put the same valid bytes in the pipe; only seekability differs from the
+    // successful regular-file control above. One PIPE_BUF-sized nonblocking write is bounded.
+    const std::string fifo_path = prx_dir + "/unseekable.prx";
+    CHECK(::mkfifo(fifo_path.c_str(), 0600) == 0, "create a disposable unseekable module FIFO");
+    const int keeper = ::open(fifo_path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    CHECK(keeper >= 0, "open the FIFO keeper without blocking");
+    if (keeper >= 0) {
+        const long pipe_buf = ::fpathconf(keeper, _PC_PIPE_BUF);
+        const bool fits = pipe_buf > 0 && image.size() <= (size_t)pipe_buf;
+        CHECK(fits && ::write(keeper, image.data(), image.size()) == (ssize_t)image.size(),
+              "the FIFO contains the successful control's complete valid module bytes");
+        res = 0x7fffffff;
+        CHECK(load(U("/app0/prx/unseekable.prx"), 0, 0, 0, 0, U(&res)) == 0x80020008ull,
+              "an unseekable module reaches the guest caller as SCE_KERNEL_ERROR_ENOEXEC");
+        CHECK(runtime_loaded_module_count() == 1 && res == 0x7fffffff,
+              "the rejected module publishes no handle and leaves the start result untouched");
+        ::close(keeper);
+    }
+#endif
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
