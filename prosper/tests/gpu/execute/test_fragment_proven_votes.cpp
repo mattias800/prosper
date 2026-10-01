@@ -3,6 +3,7 @@
 #include "fixtures/render_runner.h"
 #include "fixtures/spirv_fragment_vote_execution.hpp"
 #include "fixtures/spirv_fragment_vote_fixtures.hpp"
+#include "fixtures/spirv_fragment_neutral_fixtures.hpp"
 #include <cstdio>
 #include <string_view>
 
@@ -165,6 +166,93 @@ void verify_per_draw_loop_bounds(bool deterministic) {
         else verify_clear(frame, "ordinary robustness refuses both buffer-derived loop certificates");
     }
 }
+
+void verify_neutral_buffer_variants(bool deterministic) {
+    namespace neutral = prosper::test::fragment_neutral;
+    const auto source = std::make_shared<const std::vector<uint32_t>>(
+        neutral::make_module(neutral::Shape::BufferPredicate));
+    const auto captured = *source;
+    const auto make_draw = [&](uint64_t identity) {
+        prosper::test::BackendDraw draw;
+        draw.vs = f::edge_vertex(2, 2); draw.fs_shared = source; draw.fs_identity = identity;
+        draw.vcount = 3; draw.fragment_wave_policy = FragmentWavePolicy::ProvenVotes;
+        prosper::test::FrameResource predicate; predicate.binding = 5; predicate.dwords = {0};
+        draw.R.push_back(predicate);
+        return draw;
+    };
+    for (const bool readonly_first : {false, true}) {
+        const uint64_t identity = readonly_first ? 0xf4014501u : 0xf4014500u;
+        uint32_t visit = 0;
+        for (const bool readonly : {readonly_first, !readonly_first, readonly_first}) {
+            std::vector<prosper::test::BackendDraw> draws{make_draw(identity)};
+            if (!readonly) {
+                // Invalidate the whole-pass certificate without actually racing the predicate:
+                // this independent writer's Wave64 module refuses before command recording.
+                auto writer = make_draw(identity + 0x100);
+                writer.fs_shared = std::make_shared<const std::vector<uint32_t>>(
+                    prosper::test::fragment_votes::storage_predicate(false, false, true));
+                prosper::test::FrameResource values; values.binding = 0; values.dwords = {0, 0x3f800000u};
+                writer.R.push_back(values); draws.push_back(std::move(writer));
+            }
+            const auto pixels = prosper::test::render_draws_rgba(draws, f::width, f::height);
+            const Frame frame{pixels, prosper::test::backend_pipeline_cache_stats()};
+            verify_derivatives(frame, 2, 2);
+            // With robust2 these are distinct Copy(P)/Copy(TRUE) modules. Without it both passes
+            // select the identical neutral module and should share a warm pipeline.
+            const bool hit = visit >= (deterministic ? 2u : 1u);
+            check(frame.pipelines.hits == (hit ? 1u : 0u) &&
+                  frame.pipelines.misses == (hit ? 0u : 1u),
+                  "pipeline cache names each admitted buffer-certificate effective module");
+            ++visit;
+        }
+    }
+    check(*source == captured, "dual-admission cache variants preserve captured source words");
+}
+
+void verify_neutral_votes(uint32_t x, uint32_t y, bool poison) {
+    namespace neutral = prosper::test::fragment_neutral;
+    const auto vertex = f::edge_vertex(x, y);
+    for (const auto predicate : {neutral::Predicate::Helpers, neutral::Predicate::Visible,
+                                neutral::Predicate::AllFalse, neutral::Predicate::AllTrue}) {
+        const auto source = std::make_shared<const std::vector<uint32_t>>(
+            neutral::make_module(neutral::Shape::Masked, predicate, poison));
+        const auto captured = *source;
+        const auto lowered = prosper::gpu::lower_fragment_votes(*source);
+        check(lowered.neutral_votes == 1 && lowered.uniform_votes == 0,
+              "neutral certificate does not promote source predicate into uniform facts");
+        const bool visible = predicate == neutral::Predicate::Visible || predicate == neutral::Predicate::AllTrue;
+        const uint64_t identity = 0xf4013000u + y * 256 + x * 16 + static_cast<uint32_t>(predicate);
+        verify_clear(render(vertex, source, identity, FragmentWavePolicy::Strict));
+        for (const bool warm : {false, true}) {
+            const auto frame = render(vertex, source, identity, FragmentWavePolicy::ProvenVotes);
+            verify_derivatives(frame, x, y, visible ? 64 : 0);
+            check(frame.pipelines.hits == (warm ? 1u : 0u) && frame.pipelines.misses == (warm ? 0u : 1u),
+                  "neutral TRUE module has its own production cold/warm pipeline variant");
+        }
+        verify_clear(render(vertex, source, identity, FragmentWavePolicy::Strict));
+        check(*source == captured, "neutral pipeline/replay calls preserve immutable source words");
+    }
+    for (const auto shape : {neutral::Shape::Termination, neutral::Shape::UndefinedConjunction,
+                             neutral::Shape::MaskedFloat, neutral::Shape::MaskedBitcastPoison}) {
+        // All-false is the newly executed domain. No earlier Kill removes helpers before the
+        // analytic derivative, and unselected poison/undefined values must not affect state.
+        const auto source = std::make_shared<const std::vector<uint32_t>>(
+            neutral::make_module(shape, neutral::Predicate::AllFalse, poison));
+        verify_derivatives(render(vertex, source, 0, FragmentWavePolicy::ProvenVotes), x, y);
+    }
+    const auto terminated = std::make_shared<const std::vector<uint32_t>>(
+        neutral::make_module(neutral::Shape::Termination, neutral::Predicate::AllTrue));
+    verify_clear(render(vertex, terminated, 0, FragmentWavePolicy::ProvenVotes),
+                 "neutral control preserves actual live Kill decisions for true predicates");
+    for (const auto shape : {neutral::Shape::ScalarExport, neutral::Shape::TerminationExport,
+                             neutral::Shape::LiveUnequalPhi, neutral::Shape::SecondConsumer,
+                             neutral::Shape::PoisonConjunction, neutral::Shape::BitcastPoisonConjunction,
+                             neutral::Shape::SecondUnsafeVote}) {
+        const auto source = std::make_shared<const std::vector<uint32_t>>(neutral::make_module(shape));
+        verify_clear(render(vertex, source, 0, FragmentWavePolicy::ProvenVotes),
+                     "unsafe neutral export/controller refuses rather than executing a host-width approximation");
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -236,8 +324,10 @@ int main(int argc, char** argv) {
         verify_clear(render(vertex, fragment, 0, FragmentWavePolicy::Strict));
         check(*fragment == captured, "live/cache/replay calls leave shared captured source words byte-identical");
         verify_loop_votes(x, y, poison);
+        verify_neutral_votes(x, y, poison);
     }
     verify_buffer_authority(context.deterministic_storage_reads);
+    verify_neutral_buffer_variants(context.deterministic_storage_reads);
     verify_per_draw_loop_bounds(context.deterministic_storage_reads);
     std::printf("== %s: %d failures ==\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

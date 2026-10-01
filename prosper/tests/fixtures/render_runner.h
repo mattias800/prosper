@@ -11044,6 +11044,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         std::vector<uint32_t> effective_uncached_fs;
         const std::vector<uint32_t>* effective_fs = &bd_fs;
         bool fragment_votes_lowered = false;
+        bool fragment_vote_buffer_certificate = false;
         // Diagnostic: write the fragment module this gate just ruled on, so the ADMITTED and
         // SKIPPED populations can be compared offline. Off unless PROSPER_FRAGMENT_WAVE_DUMP names
         // a directory; one file per distinct shader key per verdict.
@@ -11090,6 +11091,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     effective_fs = &effective_uncached_fs;
                 } else effective_fs = &lowered->words;
                 fragment_votes_lowered = true;
+                fragment_vote_buffer_certificate = buffer_certificate;
                 required_fragment_subgroup_size = 0;
                 required_fragment_subgroup_features =
                     prosper::gpu::fragment_spirv_required_subgroup_features(*effective_fs);
@@ -11099,7 +11101,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 static std::unordered_set<uint64_t> proven_logged;
                 if (proven_logged.insert(shader_key).second) {
                     std::fprintf(stderr, "[render] proven fragment votes: subgroup 64 -> independent "
-                        "(uniform=%u dead=%u fs=%016llx)\n", lowered->uniform_votes, lowered->dead_votes,
+                        "(uniform=%u dead=%u neutral=%u fs=%016llx)\n", lowered->uniform_votes, lowered->dead_votes,
+                        lowered->neutral_votes,
                         (unsigned long long)shader_key);
                     dump_fragment_wave_module("lowered", shader_key, 0);
                 }
@@ -13320,6 +13323,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
             append(bd.fs_identity != 0);
             append(fragment_votes_lowered); // source identity alone does not name effective bytes
+            // Both input-certificate variants may admit the SAME source: uniform Copy(P) with
+            // immutable robust2 buffers, neutral Copy(TRUE) without them. Name the exact memo/
+            // lowering input variant, not merely successful lowering. Exact source/effective word
+            // identity remains authoritative on the zero-identity fallback below.
+            if (fragment_votes_lowered) append(fragment_vote_buffer_certificate);
             if (bd.fs_identity) {
                 append(static_cast<uint32_t>(bd.fs_identity));
                 append(static_cast<uint32_t>(bd.fs_identity >> 32));

@@ -20,16 +20,20 @@ struct FragmentVoteLowering {
     FragmentVoteRefusal refusal = FragmentVoteRefusal::MalformedModule;
     uint32_t uniform_votes = 0;
     uint32_t dead_votes = 0;
+    uint32_t neutral_votes = 0;
 };
 
 // Input must be a valid guest-generated SPIR-V module, not an unrestricted Vulkan peephole or
-// a replacement for spirv-val. Every Any must have a defined
-// predicate defined uniformly across the intended logical guest wave (including helpers), or a
-// finite known-pure SSA user graph with no control/effect consumer. This is NOT a claim that a
+// a replacement for spirv-val. Each Any needs an independent certificate: a predicate defined
+// uniformly across the intended logical guest wave (including helpers), a finite known-pure SSA
+// user graph with no control/effect consumer, or the neutral selection described below. This is
+// NOT a claim that a
 // per-draw value is uniform across an arbitrary host Vulkan subgroup: fragment subgroups may mix
 // commands. The guest's complete-wave scalar EXEC/VCC test is the semantic target; its Any emission
 // is an implementation of that target, not unrestricted source-SPIR-V optimization authority.
-// Output-dead branches/loops are deliberately not a rewrite certificate. Strict replay never calls
+// A common-entry one-arm selection additionally permits TRUE control only after proving every
+// extra operation UB-free and every live merge export stable and unchanged under P=false. P stays
+// varying; an output-dead branch/loop alone is NOT that certificate. Strict replay never calls
 // this transformation. A caller may certify buffer inputs immutable only after proving that all
 // shaders in the pass leave them read-only. Buffer-derived predicates additionally require an
 // enabled deterministic robust2 storage-read contract (32-bit aligned range, no rounded padding).
