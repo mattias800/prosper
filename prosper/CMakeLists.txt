@@ -3255,6 +3255,13 @@ endif()
       add_test(NAME portable_wave64_mask_reductions COMMAND test_portable_wave64_mask_reductions)
       set_tests_properties(portable_wave64_mask_reductions PROPERTIES TIMEOUT 60)
 
+      add_executable(test_portable_wave64_readfirstlane
+                     tests/gpu/execute/test_portable_wave64_readfirstlane.cpp)
+      target_include_directories(test_portable_wave64_readfirstlane PRIVATE tests)
+      target_link_libraries(test_portable_wave64_readfirstlane PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME portable_wave64_readfirstlane COMMAND test_portable_wave64_readfirstlane)
+      set_tests_properties(portable_wave64_readfirstlane PROPERTIES TIMEOUT 60)
+
       # #3425: registered on Windows as well as in the UNIX block below, deliberately. This
       # defect is about the WINDOWS/NVIDIA frontend's _Exit path and the cost it recovers was
       # measured there (#3450), so a Linux-only guard would test the fix everywhere except
@@ -3869,6 +3876,13 @@ endif()
       target_link_libraries(test_portable_wave64_mask_reductions PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME portable_wave64_mask_reductions COMMAND test_portable_wave64_mask_reductions)
       set_tests_properties(portable_wave64_mask_reductions PROPERTIES TIMEOUT 60)
+
+      add_executable(test_portable_wave64_readfirstlane
+                     tests/gpu/execute/test_portable_wave64_readfirstlane.cpp)
+      target_include_directories(test_portable_wave64_readfirstlane PRIVATE tests)
+      target_link_libraries(test_portable_wave64_readfirstlane PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME portable_wave64_readfirstlane COMMAND test_portable_wave64_readfirstlane)
+      set_tests_properties(portable_wave64_readfirstlane PROPERTIES TIMEOUT 60)
       add_executable(ngg_capture_probe tools/ngg_probe/ngg_capture_probe.cpp)
       target_include_directories(ngg_capture_probe PRIVATE tests)
       target_link_libraries(ngg_capture_probe PRIVATE prosper_core Vulkan::Vulkan)

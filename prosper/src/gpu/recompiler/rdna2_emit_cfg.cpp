@@ -2170,6 +2170,14 @@ bool emit_cfg_state_machine(
              in.opcode == kSop1OpcodeFf1I32B64) &&
             in.dst.value != 126 && in.dst.value != 127;
     };
+    auto portable_readfirstlane_candidate = [&](const Rdna2Inst& in) {
+        return b.portable_readfirstlane_shader && b.is_compute && b.wave_size == 64 &&
+            !b.native_subgroup_size && b.local_count > 0 &&
+            in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02 &&
+            in.src[0].kind == OperandKind::VGPR && in.dst.value >= 0 && in.dst.value <= 107 &&
+            !in.has_sdwa && !in.has_dpp && !in.src_abs[0] && !in.src_neg[0] &&
+            !in.clamp && !in.omod;
+    };
 
     // Split at every branch target/fallthrough and around every cross-lane operation. Case values are
     // dense block indices, not guest PCs. A cross-lane op must end its block so the common synchronized
@@ -2198,6 +2206,8 @@ bool emit_cfg_state_machine(
     std::set<int> portable_mask_reduction_dsts;
     std::unordered_map<uint32_t, uint32_t> portable_readlane_event_for_pc;
     std::set<int> portable_readlane_dsts;
+    std::unordered_map<uint32_t, uint32_t> portable_readfirstlane_event_for_pc;
+    std::set<int> portable_readfirstlane_dsts;
     // A VGPR written by V_WRITELANE is a scalar spill array. Its lane slots must remain in one
     // dispatcher case so the exact slot lowering can resolve them; only ordinary VGPR lifetimes
     // use the synchronized generic readlane phase.
@@ -2294,6 +2304,17 @@ bool emit_cfg_state_machine(
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
         }
+        if (b.portable_readfirstlane_shader && in.fmt == Rdna2Format::VOP1 &&
+            in.opcode == 0x02) {
+            if (!portable_readfirstlane_candidate(in))
+                return reject_cfg(in.pc, "portable-readfirstlane-form");
+            portable_readfirstlane_event_for_pc.emplace(
+                in.pc, static_cast<uint32_t>(portable_readfirstlane_event_for_pc.size() + 1));
+            portable_readfirstlane_dsts.insert(in.dst.value);
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
         if (b.is_compute && !b.native_subgroup_size &&
             in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
             !writelane_spill_arrays.contains(in.src[0].value)) {
@@ -2374,7 +2395,8 @@ bool emit_cfg_state_machine(
     const uint32_t dpp_value_base = 0;
     const uint32_t dpp_metadata_base = padded_lanes;
     const uint32_t wave_result_base = padded_lanes +
-        (has_portable_compute_dpp ? padded_lanes : 0u);
+        ((has_portable_compute_dpp || !portable_readfirstlane_event_for_pc.empty())
+             ? padded_lanes : 0u);
     const uint32_t group_active_slot = wave_result_base + wave_count;
     if (b.is_compute && !direct_dispatch &&
         !b.declare_cfg_scratch(group_active_slot + 1))
@@ -4276,6 +4298,17 @@ bool emit_cfg_state_machine(
         ? b.function_var(b.t_u32, ptr_u32) : 0;
     const uint32_t readlane_dst_var = has_portable_readlane
         ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const bool has_portable_readfirstlane = !portable_readfirstlane_event_for_pc.empty();
+    const uint32_t first_pending_var = has_portable_readfirstlane
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t first_exec_var = has_portable_readfirstlane
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t first_source_var = has_portable_readfirstlane
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t first_event_var = has_portable_readfirstlane
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t first_dst_var = has_portable_readfirstlane
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
 
     const uint32_t zero = b.uconst(0), no = b.bfalse(), yes = b.btrue();
     for (const auto& kv : vv) {
@@ -4408,6 +4441,10 @@ bool emit_cfg_state_machine(
         b.store_function(readlane_source_var, zero);
         b.store_function(readlane_selector_var, zero);
         b.store_function(readlane_dst_var, zero);
+    }
+    if (has_portable_readfirstlane) {
+        b.store_function(first_source_var, zero);
+        b.store_function(first_dst_var, zero);
     }
 
     auto load_state = [&](uint32_t dispatch = UINT32_MAX) {
@@ -4733,6 +4770,11 @@ bool emit_cfg_state_machine(
     }
     if (has_portable_readlane)
         b.store_function(readlane_pending_var, no);
+    if (has_portable_readfirstlane) {
+        b.store_function(first_pending_var, no);
+        b.store_function(first_exec_var, no);
+        b.store_function(first_event_var, zero);
+    }
     b.emit_loopmerge(loop_merge, loop_continue);
     b.emit_branch(switch_header);
     b.emit_label(switch_header);
@@ -4793,6 +4835,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* mask_ffbh = nullptr;
         const Rdna2Inst* mask_reduction = nullptr;
         const Rdna2Inst* readlane = nullptr;
+        const Rdna2Inst* readfirstlane = nullptr;
         const Rdna2Inst* mask_compare = nullptr;
         const Rdna2Inst* exec_saved_mask_compare = nullptr;
         const Rdna2Inst* saved_mask_pair_compare = nullptr;
@@ -4819,6 +4862,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_mask_ffbh = nullptr;
             const Rdna2Inst* block_mask_reduction = nullptr;
             const Rdna2Inst* block_readlane = nullptr;
+            const Rdna2Inst* block_readfirstlane = nullptr;
             const Rdna2Inst* block_mask_compare = nullptr;
             const Rdna2Inst* block_exec_saved_mask_compare = nullptr;
             const Rdna2Inst* block_saved_mask_pair_compare = nullptr;
@@ -4919,6 +4963,10 @@ bool emit_cfg_state_machine(
                         block_mask_ffbh = &in;
                         break;
                     }
+                }
+                if (portable_readfirstlane_event_for_pc.contains(in.pc)) {
+                    block_readfirstlane = &in;
+                    break;
                 }
                 if (portable_readlane_event_for_pc.contains(in.pc) &&
                     !spill_vgprs.contains(in.src[0].value) &&
@@ -5085,6 +5133,7 @@ bool emit_cfg_state_machine(
                     block_dpp_min_row_shr || block_dpp_add_row_shr ||
                     block_dpp_row_ror8 ||
                     block_dpp_add_row_mask || block_mask_ffbh || block_mask_reduction || block_readlane ||
+                    block_readfirstlane ||
                     block_mask_compare ||
                     block_exec_saved_mask_compare || block_saved_mask_pair_compare ||
                     block_vopc_mask_compare ||
@@ -5108,6 +5157,7 @@ bool emit_cfg_state_machine(
             mask_ffbh = block_mask_ffbh;
             mask_reduction = block_mask_reduction;
             readlane = block_readlane;
+            readfirstlane = block_readfirstlane;
             mask_compare = block_mask_compare;
             exec_saved_mask_compare = block_exec_saved_mask_compare;
             saved_mask_pair_compare = block_saved_mask_pair_compare;
@@ -5165,6 +5215,31 @@ bool emit_cfg_state_machine(
                 b.uconst(static_cast<uint32_t>(source - mask_base)));
             b.store_function(mask_ffbh_dst_var,
                 b.uconst(static_cast<uint32_t>(mask_ffbh->dst.value)));
+        }
+        if (readfirstlane) {
+            const auto source = state.vreg.find(readfirstlane->src[0].value);
+            if (source == state.vreg.end() ||
+                state.vgpr_lane_slots.contains(readfirstlane->src[0].value) ||
+                state.vgpr_lane_mask_slots.contains(readfirstlane->src[0].value))
+                return reject_cfg(readfirstlane->pc, "portable-readfirstlane-source");
+            b.store_function(first_pending_var, yes);
+            b.store_function(first_exec_var, state.exec);
+            b.store_function(first_source_var, source->second);
+            b.store_function(first_event_var,
+                b.uconst(portable_readfirstlane_event_for_pc.at(readfirstlane->pc)));
+            b.store_function(first_dst_var,
+                b.uconst(static_cast<uint32_t>(readfirstlane->dst.value)));
+            state.sreg.erase(readfirstlane->dst.value);
+            state.sreg_input.erase(readfirstlane->dst.value);
+            state.sreg_srt.erase(readfirstlane->dst.value);
+            for (int base : {readfirstlane->dst.value, readfirstlane->dst.value - 1}) {
+                state.sreg_bool.erase(base);
+                state.sreg_bool_narrowed.erase(base);
+                state.sreg_bool_b32.erase(base);
+                state.sreg_wave64_mask_half.erase(base);
+            }
+            if (readfirstlane->dst.value == 106 || readfirstlane->dst.value == 107)
+                state.vcc = 0;
         }
         if (readlane) {
             if (!portable_readlane_event_for_pc.contains(readlane->pc))
@@ -6458,6 +6533,33 @@ bool emit_cfg_state_machine(
     const uint32_t mbcnt_lane = b.ibin(
         Op_BitwiseAnd, b.linear_localid, b.uconst(b.wave_size - 1));
 
+    // Scalar wave services write every replica, independent of EXEC, and invalidate both
+    // physical halves of overlapping saved B64 masks. Keep the shared destination contract here.
+    const auto store_scalar_wave_result = [&](uint32_t pending, uint32_t dst, uint32_t result,
+                                             const std::set<int>& destinations,
+                                             const char* missing_destination) {
+        for (int reg : destinations) {
+            const auto destination = sv.find(reg);
+            if (destination == sv.end()) return reject_cfg(0, missing_destination);
+            const uint32_t selected = b.land(pending,
+                b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))));
+            b.store_function(destination->second, b.sel(selected, result,
+                b.load_function(b.t_u32, destination->second)));
+        }
+        const auto clear_overlapping_masks = [&](const auto& vars) {
+            for (const auto& [reg, var] : vars) {
+                const uint32_t overlaps = b.lor(
+                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))),
+                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg + 1))));
+                b.store_function(var, b.bsel(b.land(pending, overlaps), no,
+                    b.load_function(b.t_bool, var)));
+            }
+        };
+        clear_overlapping_masks(mv);
+        clear_overlapping_masks(mhv);
+        return true;
+    };
+
     if (has_portable_mask_reduction) {
         // Scalar mask operations ignore EXEC for their destination write. All launched guest
         // lanes publish the physical source bit, including EXEC-off lanes. The static event tag
@@ -6498,25 +6600,8 @@ bool emit_cfg_state_machine(
         const uint32_t result = b.cfg_scratch_load(
             b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index));
         const uint32_t dst = b.load_function(b.t_u32, mask_reduction_dst_var);
-        for (int reg : portable_mask_reduction_dsts) {
-            const auto destination = sv.find(reg);
-            if (destination == sv.end()) return reject_cfg(0, "missing-mask-reduction-dst");
-            const uint32_t selected = b.land(pending,
-                b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))));
-            b.store_function(destination->second, b.sel(selected, result,
-                b.load_function(b.t_u32, destination->second)));
-        }
-        const auto clear_overlapping_masks = [&](const auto& vars) {
-            for (const auto& [reg, var] : vars) {
-                const uint32_t overlaps = b.lor(
-                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))),
-                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg + 1))));
-                b.store_function(var, b.bsel(b.land(pending, overlaps), no,
-                    b.load_function(b.t_bool, var)));
-            }
-        };
-        clear_overlapping_masks(mv);
-        clear_overlapping_masks(mhv);
+        if (!store_scalar_wave_result(pending, dst, result, portable_mask_reduction_dsts,
+                                      "missing-mask-reduction-dst")) return false;
         // RDNA2 ISA 70648 section 12.3: BCNT sets SCC=(count != 0); FF1 preserves SCC.
         const uint32_t writes_scc = b.land(pending,
             b.load_function(b.t_bool, mask_reduction_count_var));
@@ -6613,6 +6698,74 @@ bool emit_cfg_state_machine(
         b.store_function(kv.second, b.bsel(selected, no, old));
     }
     b.barrier();
+    }
+
+    if (has_portable_readfirstlane) {
+        // AMD RDNA2 ISA 70648 section 12.8: select the lowest EXEC bit; EXEC=0 selects lane 0.
+        // Access and scalar destination writes ignore EXEC. Every invocation publishes its raw
+        // value and event/EXEC metadata, including inactive lanes and ended waves. All barriers
+        // are in this common dispatcher phase, never beneath guest-wave control flow.
+        const uint32_t pending = b.load_function(b.t_bool, first_pending_var);
+        const uint32_t tag = b.load_function(b.t_u32, first_event_var);
+        const uint32_t encoded = b.sel(pending,
+            b.ibin(Op_BitwiseOr, b.ibin(Op_ShiftLeftLogical, tag, b.uconst(1)),
+                   b.sel(b.load_function(b.t_bool, first_exec_var), b.uconst(1), zero)), zero);
+        b.cfg_scratch_store(b.linear_localid, b.load_function(b.t_u32, first_source_var));
+        b.cfg_scratch_store(b.ibin(Op_IAdd, b.uconst(padded_lanes), b.linear_localid), encoded);
+        b.barrier();
+        const bool partial_wave = initial_active || padded_lanes != b.local_count;
+        const uint32_t is_leader = partial_wave ? b.ucmp(Op_IEqual, mbcnt_lane, zero)
+            : b.land(pending, b.ucmp(Op_IEqual, mbcnt_lane, zero));
+        const uint32_t leader = b.id(), assembled = b.id();
+        b.emit_selmerge(assembled);
+        b.emit_condbranch(is_leader, leader, assembled);
+        b.emit_label(leader);
+        const uint32_t base = b.ibin(Op_ShiftLeftLogical, mbcnt_wave_index, b.uconst(6));
+        const auto lane_metadata = [&](uint32_t lane) {
+            const uint32_t index = b.ibin(Op_IAdd, base, b.uconst(lane));
+            if (padded_lanes == b.local_count)
+                return b.cfg_scratch_load(b.ibin(Op_IAdd, b.uconst(padded_lanes), index));
+            const uint32_t valid = b.ucmp(Op_ULessThan, index, b.uconst(b.local_count));
+            const uint32_t safe_index = b.sel(valid, index, zero);
+            const uint32_t metadata = b.cfg_scratch_load(b.ibin(Op_IAdd,
+                b.uconst(padded_lanes), safe_index));
+            return b.sel(valid, metadata, zero);
+        };
+        // ACTIVE excludes padded invocations from guest instructions, not from host barriers.
+        // The physical wave leader may therefore have no event: recover its wave's pending tag
+        // from actual participants. Nonexistent physical lanes never supply metadata.
+        uint32_t service_tag = tag;
+        if (partial_wave) {
+            service_tag = zero;
+            for (uint32_t lane = 0; lane < 64; ++lane) {
+                const uint32_t candidate = b.ibin(Op_ShiftRightLogical,
+                    lane_metadata(lane), b.uconst(1));
+                service_tag = b.sel(b.ucmp(Op_IEqual, service_tag, zero), candidate, service_tag);
+            }
+        }
+        uint32_t first = b.uconst(UINT32_MAX);
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            const uint32_t metadata = lane_metadata(lane);
+            const uint32_t include = b.land(
+                b.ucmp(Op_IEqual, b.ibin(Op_ShiftRightLogical, metadata, b.uconst(1)), service_tag),
+                b.ucmp(Op_INotEqual, b.ibin(Op_BitwiseAnd, metadata, b.uconst(1)), zero));
+            first = b.sel(b.land(include, b.ucmp(Op_IEqual, first, b.uconst(UINT32_MAX))),
+                          b.uconst(lane), first);
+        }
+        const uint32_t selected_lane = b.sel(b.ucmp(Op_IEqual, first, b.uconst(UINT32_MAX)),
+                                             zero, first);
+        b.cfg_scratch_store(b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index),
+                            b.cfg_scratch_load(b.ibin(Op_IAdd, base, selected_lane)));
+        b.emit_branch(assembled);
+        b.emit_label(assembled);
+        b.barrier();
+        const uint32_t result = b.cfg_scratch_load(
+            b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index));
+        const uint32_t dst = b.load_function(b.t_u32, first_dst_var);
+        if (!store_scalar_wave_result(pending, dst, result, portable_readfirstlane_dsts,
+                                      "missing-readfirstlane-dst")) return false;
+        // SCC is unchanged. The new scalar is wave-uniform, not workgroup-uniform.
+        b.barrier();
     }
 
     if (has_portable_readlane) {
@@ -7047,6 +7200,20 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                  (in.src[0].kind == OperandKind::Special &&
                   (in.src[0].value == 106 || in.src[0].value == 126)));
         });
+    const bool portable_compute_readfirstlane = b.portable_readfirstlane_shader &&
+        std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+            return in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02;
+        });
+    const auto append_emitter_only_end = [](std::vector<Rdna2Inst>& region, uint32_t pc) {
+        Rdna2Inst end;
+        end.pc = pc;
+        end.fmt = Rdna2Format::SOPP;
+        end.opcode = 0x01u;
+        end.len_dwords = 1;
+        end.is_end = true;
+        end.synthetic_terminator = true;
+        region.push_back(end);
+    };
 
     // A large generated compute kernel may put a workgroup-uniform scalar early-out around several
     // barrier-separated phases, then use arbitrary (but barrier-free) control flow in its final
@@ -7059,7 +7226,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         const BarrierPhasedCompute phased = analyze_barrier_phased_compute(ins);
         if (phased.found &&
             (phased.guarded || initial_dispatch_active || force_barrier_phases ||
-             portable_compute_mask_reduction)) {
+             portable_compute_mask_reduction || portable_compute_readfirstlane)) {
             // Every phase shares one immutable Workgroup OpTypeArray. Size it from the complete
             // phased stream before the first dispatcher: a later portable DPP operation needs a
             // second per-lane plane even when the earlier phase needed only votes/liveness.
@@ -7076,7 +7243,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             dpp_row_ror8_op(in) != DppRowRor8Op::None;
                     });
                 const uint32_t scratch_dwords = padded_lanes +
-                    (has_portable_dpp ? padded_lanes : 0u) + wave_count + 1;
+                    ((has_portable_dpp || portable_compute_readfirstlane) ? padded_lanes : 0u) +
+                    wave_count + 1;
                 if (!b.declare_cfg_scratch(scratch_dwords)) return false;
             }
             uint32_t merge_label = 0;
@@ -7085,11 +7253,19 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // Keep that uncommon combination on the existing fail-closed path; the unguarded
                 // phase form below is the one proved safe for partial workgroups.
                 if (initial_dispatch_active) return false;
-                const std::vector<Rdna2Inst> prefix(
+                std::vector<Rdna2Inst> prefix(
                     ins.begin(), ins.begin() + phased.guard_index);
+                const bool portable_service_prefix = !b.native_subgroup_size &&
+                    (portable_compute_mask_reduction || portable_compute_readfirstlane);
+                if (!prefix.empty() && portable_service_prefix) {
+                    // The uniform guard prefix is a complete region too. A common wave service
+                    // needs a dispatcher end block even though the real END follows the body.
+                    // No guest edge crosses this proven split; preserve SCC for the guard.
+                    append_emitter_only_end(prefix, ins[phased.guard_index].pc);
+                }
                 if (!prefix.empty() &&
                     !emit_body(b, rs, prefix, safe, rt, allow_exec_update, allow_smem,
-                               exp_fn, code, dwords, &dead_masks))
+                               exp_fn, code, dwords, &dead_masks, portable_service_prefix))
                     return false;
                 if (!rs.scc) return false;
                 const uint32_t execute_body = ins[phased.guard_index].opcode == 0x04
@@ -7127,14 +7303,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // barrier sequence. Give each proven split a synthetic, emitter-only terminator
                     // at the boundary; no branch crosses the boundary (proved above), and the raw
                     // barrier remains emitted exactly once by this outer shell.
-                    Rdna2Inst phase_end;
-                    phase_end.pc = ins[barrier_index].pc;
-                    phase_end.fmt = Rdna2Format::SOPP;
-                    phase_end.opcode = 0x01u;
-                    phase_end.len_dwords = 1;
-                    phase_end.is_end = true;
-                    phase_end.synthetic_terminator = true;
-                    phase.push_back(phase_end);
+                    append_emitter_only_end(phase, ins[barrier_index].pc);
                     if (getenv("PROSPER_DBG"))
                         std::fprintf(stderr, "[compute-phase] begin=%u end=%u barrier=%u\n",
                                      phase.front().pc, phase[phase.size() - 2].pc,
@@ -7181,7 +7350,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         return emit_cfg_state_machine(
             b, rs, ins, safe, rt, allow_exec_update, allow_smem,
             exp_fn, code, dwords, initial_dispatch_active, true);
-    if (allow_cfg_dispatcher && portable_compute_mask_reduction &&
+    if (allow_cfg_dispatcher &&
+        (portable_compute_mask_reduction || portable_compute_readfirstlane) &&
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) { return in.is_end; })) {
         // Do this before the counted-loop prefix can narrow EXEC: its scalar reductions need
         // a common host barrier site, not an invocation-local structured loop body.
@@ -7189,7 +7359,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 return in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a;
             })) {
             log_recompile_diagnostic(b.diagnostic, "compute-cfg-reject", "terminal",
-                "reason=portable-mask-reduction-dispatcher-unsafe guest-barrier=1");
+                "reason=portable-wave-service-dispatcher-unsafe guest-barrier=1");
             return false;
         }
         return emit_cfg_state_machine(b, rs, ins, safe, rt, allow_exec_update, allow_smem,

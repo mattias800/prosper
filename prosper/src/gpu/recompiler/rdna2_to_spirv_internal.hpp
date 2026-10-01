@@ -518,6 +518,10 @@ struct SpirvCompute {
     uint32_t ngg_vertex_index_value = 0;
     uint32_t ngg_instance_index_value = 0;
     bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
+    // Whole-original-shader authority, carried unchanged through recursive phases. A recognized
+    // waterfall anywhere keeps its existing per-invocation linearization; testing a phase alone
+    // would silently change the readfirstlane/removed-backedge contract in the other phase.
+    bool     portable_readfirstlane_shader=false;
     bool     uses_barrier=0;                          // guest or synthesized workgroup barrier emitted
     // Ordinary LDS writes that feed a synthesized float-atomic publication boundary are emitted as
     // atomic exchanges. RDNA serializes indexed same-bank conflicts, while Vulkan ordinary stores

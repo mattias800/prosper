@@ -409,6 +409,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      uint32_t threads_x_for_test) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
+    const bool original_has_waterfall = !waterfall_branches(ins).empty();
     const auto original_raw_x2_data = rdna2_proven_raw_x2_data_loads(ins);
     const auto original_raw_wide_data = rdna2_raw_wide_data_loads(ins);
     const auto original_raw_immediate_wide_data =
@@ -436,6 +437,10 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     }
     if (!local_x_for_test || local_x_for_test > 1024) return {};
     b.begin(num_inputs ? num_inputs : 1, rt, local_x_for_test, 1, 1, 64, 0);
+    // This legacy synthetic shell has no real guest extent unless the caller supplies one.
+    // Its old partial/per-lane test contracts are not evidence for a complete architectural wave.
+    b.portable_readfirstlane_shader = force_cfg_for_test && threads_x_for_test &&
+        !original_has_waterfall;
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     seed_smem_pointer_provenance(rs, ins);   // SRT pointer-load provenance (#3616)
@@ -494,7 +499,8 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
         return {}; // bindings 0/1 are this probe's input/export buffers
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
-    const bool has_barrier = native_wave64 && std::any_of(
+    const bool original_has_waterfall = !waterfall_branches(ins).empty();
+    const bool has_barrier = full_four_wave_launch_inputs && std::any_of(
         ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::SOPP && in.opcode == 0x0au;
         });
@@ -504,7 +510,7 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
             // The ordinary compute proof treats launch SGPRs as workgroup-uniform. This probe
             // supplies s3 separately to each guest wave, so a scalar terminal guard can let
             // only some of the four waves reach a Vulkan workgroup barrier.
-            log_recompile_diagnostic(diagnostic, "ngg-native-reject", "terminal",
+            log_recompile_diagnostic(diagnostic, "ngg-wave-reject", "terminal",
                                      phases.guarded ? "reason=per-wave-terminal-guard"
                                                     : "reason=barrier-phase-proof");
             return {};
@@ -524,6 +530,7 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
     b.native_subgroup_size = native_wave64 ? 64u : 0u;
     b.begin(num_inputs ? num_inputs : 1, resources,
             full_four_wave_launch_inputs ? 256u : 64u, 1, 1, 64, 0, true);
+    b.portable_readfirstlane_shader = !native_wave64 && !original_has_waterfall;
     if (native_wave64) {
         std::vector<uint32_t> marker;
         b.pstr(marker, "Prosper.NggProbeExactSubgroup=64");
@@ -588,7 +595,7 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
         }
         return true;
     };
-    const bool force_phases_for_dpp = has_barrier || std::any_of(
+    const bool force_phases_for_dpp = (native_wave64 && has_barrier) || std::any_of(
         ins.begin(), ins.end(), is_vadd_nc_u32_dpp_row_shr_bounded);
     if (!emit_body(b, rs, ins, safe_branches, resources, /*allow_exec_update*/true,
                    /*allow_smem*/resources != nullptr, export_word, code, dwords,
@@ -661,6 +668,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const uint64_t local_count = static_cast<uint64_t>(local_x) * local_y * local_z;
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
+    const bool original_has_waterfall = !waterfall_branches(ins).empty();
     const auto original_raw_x2_data = rdna2_proven_raw_x2_data_loads(ins);
     const auto original_raw_wide_data = rdna2_raw_wide_data_loads(ins);
     const auto original_raw_immediate_wide_data =
@@ -762,16 +770,23 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const BarrierPhasedCompute barrier_phases = analyze_barrier_phased_compute(ins);
     const bool partial_barrier_phases = config.exact_thread_extent && has_partial_workgroup &&
         barrier_phases.found && !barrier_phases.guarded;
+    b.native_subgroup_size = config.native_subgroup_size == wave_size &&
+        local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
+    const bool has_portable_readfirstlane = wave_size == 64 && !b.native_subgroup_size &&
+        !original_has_waterfall &&
+        std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+            return in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02;
+        });
     const bool exact_partial_dispatcher = config.exact_thread_extent &&
         has_partial_workgroup && (b.gta5_selected_sbuffer_dispatch_validated ||
                                   b.indirect_buffer_dispatch_validated ||
-                                  has_indirect_pointer_relocation);
-    b.native_subgroup_size = config.native_subgroup_size == wave_size &&
-        local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
+                                  has_indirect_pointer_relocation || has_portable_readfirstlane);
     // A partial guest wave needs the portable dispatcher's per-lane ACTIVE bit. Native subgroup
     // operations cannot be entered by only the real prefix of the final host subgroup.
     if (partial_barrier_phases || exact_partial_dispatcher)
         b.native_subgroup_size = 0;
+    b.portable_readfirstlane_shader = wave_size == 64 && !b.native_subgroup_size &&
+        !original_has_waterfall;
     // PROSPER_DBG: report the inputs to that decision, not just its outcome (#2429).
     //
     // Every wave-width-dependent lowering in this file gates on `b.native_subgroup_size` -- the
@@ -798,11 +813,12 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // gpu_executor.cpp instead.
     //
     // That inference is WRONG, and reporting only the effective value would preserve the error:
-    // the expression above is zero for THREE independent reasons -- the device width not matching
+    // the width expression above is zero for THREE independent reasons -- the device width not matching
     // `wave_size`, an implausible `local_count`, or a workgroup that is not a whole number of waves
     // (`local_count % wave_size`). A dispatch with a partial final wave disables the path on an
     // adapter whose width matches perfectly. #2429 attributes it entirely to the first cause, and
-    // that is checkable only if all three inputs are printed.
+    // that is checkable only if all three inputs are printed. An ACTIVE-dispatcher override can
+    // additionally disable an otherwise matching complete workgroup; report that separately.
     //
     // Deduplicated on the exact tuple rather than rate-limited, because the interesting event is a
     // DISTINCT combination appearing, not the hundredth repeat of one -- and a kernel that disables
@@ -817,10 +833,11 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
         // 256 and 256 while printing only 1024 -- and the 256-wide ones were the multi-wave
         // case that mattered. A diagnostic may aggregate, but it must not name one member of
         // a bucket as though it were the bucket.
-        static std::set<std::tuple<uint32_t, uint32_t, uint64_t, uint32_t>> seen;
+        static std::set<std::tuple<uint32_t, uint32_t, uint64_t, uint32_t, bool, bool>> seen;
         std::lock_guard<std::mutex> lk(mx);
         if (seen.insert(std::make_tuple(config.native_subgroup_size, wave_size,
-                                        local_count, b.native_subgroup_size)).second)
+                                        local_count, b.native_subgroup_size,
+                                        partial_barrier_phases, exact_partial_dispatcher)).second)
             std::fprintf(stderr,
                          "[subgroup-width] device=%u wave=%u local=%llu local%%wave=%llu -> "
                          "native_subgroup_size=%u (%s)\n",
@@ -833,6 +850,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                              : (partial_barrier_phases
                                     ? "DISABLED: partial barrier phases require the portable "
                                       "dispatcher"
+                                : (exact_partial_dispatcher
+                                    ? "DISABLED: exact partial dispatch requires the portable "
+                                      "ACTIVE dispatcher"
                                 : (config.native_subgroup_size == 0
                                     ? "DISABLED: no native width adopted -- "
                                       "select_native_compute_subgroup_size() declined"
@@ -842,7 +862,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                                   ? "DISABLED: local_count exceeds the plausibility "
                                                     "guard"
                                                   : "DISABLED: workgroup is not a whole number "
-                                                    "of waves")))));
+                                                    "of waves"))))));
     }
     b.native_storage_format_support = config.native_storage_format_support;
     b.storage_buffer_int64_atomics = config.storage_buffer_int64_atomics;
@@ -915,10 +935,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                    code, dwords, nullptr, true, initial_dispatch_active, false,
                    lds_fminmax_synchronization.needs_dispatcher))
         return {};
-    // Exact dispatch contracts execute their partial final wave through the CFG dispatcher's ACTIVE
-    // bit. Padded Vulkan lanes stay in the dispatcher and its synthesized workgroup barriers, but
-    // cannot execute guest memory effects. The full program, launch, and resource proof above is the
-    // authority boundary for extending the selected-SBUFFER path to the packed-pointer program.
+    // Exact resource contracts and portable RFL execute partial workgroups through ACTIVE. Padded
+    // Vulkan lanes stay in the dispatcher and synthesized barriers, but cannot execute guest effects.
+    // The resource contracts retain their own full program/launch proofs; RFL needs no title identity.
     if (exact_partial_dispatcher && b.uses_barrier)
         b.partial_barrier_phases_emitted = true;
     // The entry guard is intentionally divergent only in the final partial workgroup. Vulkan requires
