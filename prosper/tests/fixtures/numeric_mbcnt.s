@@ -31,5 +31,7 @@ s_mov_b32 s4, 0xaaaaaaaa
 v_cvt_u32_f32 v1, v0
 v_mbcnt_lo_u32_b32 v0, s4, 5
 v_mbcnt_hi_u32_b32 v0, v1, 5
+v_mbcnt_lo_u32_b32 v0, 1.0, 5
+v_mbcnt_hi_u32_b32 v0, 1.0, 5
 v_cvt_f32_u32 v0, v0
 s_endpgm

@@ -394,6 +394,12 @@ int main(int argc, char** argv) {
                 (hi ? "hi" : "lo") + (cfg ? "_cfg" : "_compact");
             dump(dir, name.c_str(), recompile_valu(compute, std::size(compute), 1, 0,
                  nullptr, 0, kDefaultComputePgmRsrc1, cfg));
+            const uint32_t float_bits[] = {
+                hi ? 0xd7660000u : 0xd7650000u, 0x00010af2u, 0xbf810000u};
+            const std::string float_name = std::string("compute_inline_float_mbcnt_") +
+                (hi ? "hi" : "lo") + (cfg ? "_cfg" : "_compact");
+            dump(dir, float_name.c_str(), recompile_valu(float_bits, std::size(float_bits),
+                 1, 0, nullptr, 0, kDefaultComputePgmRsrc1, cfg));
         }
         const uint32_t fragment[] = {
             hi ? 0xd7660000u : 0xd7650000u, 0x00010affu, 0x80000001u,

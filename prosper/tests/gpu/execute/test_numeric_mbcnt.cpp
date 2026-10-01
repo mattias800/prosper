@@ -62,11 +62,12 @@ int main() {
         std::printf("[%s] %s\n", ok ? "ok" : "FAIL", name);
         if (!ok) ++failures;
     };
-    enum class Source { Inline, Literal, Scalar, Vector };
+    enum class Source { Inline, InlineFloat, Literal, Scalar, Vector };
     struct Case { Source source; uint32_t mask; int inline_value; };
     const Case cases[] = {
         {Source::Inline, 0, 0}, {Source::Inline, 1, 1}, {Source::Inline, 3, 3},
         {Source::Inline, 15, 15}, {Source::Inline, 0xfffffffeu, -2},
+        {Source::InlineFloat, 0x3f800000u, 0}, // 1.0 operand contributes its raw bits
         {Source::Literal, 0x80000001u, 0}, {Source::Literal, 0x55555555u, 0},
         {Source::Scalar, 0xaaaaaaaau, 0}, {Source::Vector, 0, 0},
     };
@@ -85,6 +86,7 @@ int main() {
                 if (c.source == Source::Inline)
                     operand = c.inline_value >= 0 ? 128u + c.inline_value
                                                   : 192u - c.inline_value;
+                else if (c.source == Source::InlineFloat) operand = 242;
                 else if (c.source == Source::Literal) operand = 255;
                 else if (c.source == Source::Scalar) {
                     code.insert(code.end(), {0xbe8403ffu, c.mask}); // s_mov_b32 s4,literal
