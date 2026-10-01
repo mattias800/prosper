@@ -100,6 +100,51 @@ inline bool mbcnt_has_scalar_numeric_source(const RegState& rs, const Operand& s
     return rs.sreg.contains(source.value) || rs.sreg_input.contains(source.value);
 }
 
+inline bool wqm_has_scalar_numeric_source(const RegState& rs, const Rdna2Inst& in) {
+    // Dispatcher scalar variables and descriptor-only loads can contain synthetic placeholders.
+    // Neither their presence nor a missing Bool alias proves that these are guest DATA bits.
+    if (!rs.scalar_presence_has_no_placeholders ||
+        in.src[0].kind != OperandKind::SGPR || in.src[0].value < 0 ||
+        in.src[0].value > (in.opcode == 0x0a ? 104 : 105) ||
+        (in.opcode == 0x0a && (in.src[0].value & 1))) return false;
+    if (rs.sreg_srt.contains(in.src[0].value) ||
+        !mbcnt_has_scalar_numeric_source(rs, in.src[0])) return false;
+    if (in.opcode == 0x09) return true;
+    Operand high = in.src[0];
+    ++high.value;
+    return !rs.sreg_srt.contains(high.value) && mbcnt_has_scalar_numeric_source(rs, high);
+}
+
+// A numeric write replaces physical words, not just a saved predicate's root. End every
+// overlapping one-word or two-word mask lifetime, including an odd-rooted B64 high-half alias.
+inline void invalidate_wqm_numeric_mask_aliases(RegState& rs, int dst, int width) {
+    for (auto it = rs.sreg_bool.begin(); it != rs.sreg_bool.end();) {
+        const int root = it->first;
+        const int mask_width = rs.sreg_bool_b32.contains(root) ? 1 : 2;
+        if (root < dst + width && dst < root + mask_width) {
+            rs.sreg_bool_narrowed.erase(root);
+            rs.sreg_bool_b32.erase(root);
+            it = rs.sreg_bool.erase(it);
+        } else ++it;
+    }
+    for (int word = dst; word < dst + width; ++word) {
+        rs.sreg_bool_b32.erase(word);
+        rs.sreg_bool_narrowed.erase(word);
+        expire_wave64_mask_half(rs, word);
+        rs.sreg_srt.erase(word);
+    }
+}
+
+inline uint32_t numeric_wqm_word(SpirvCompute& b, uint32_t bits) {
+    // AMD RDNA2 ISA 70648 section 12.3, ops 9/10: any set bit widens its nibble to 0xf.
+    // Reduce each nibble into its low bit, then expand the eight independent bits in parallel.
+    uint32_t any = bits;
+    for (uint32_t shift = 1; shift < 4; ++shift)
+        any = b.ibin(Op_BitwiseOr, any,
+                     b.ibin(Op_ShiftRightLogical, bits, b.uconst(shift)));
+    return b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, any, b.uconst(0x11111111u)), b.uconst(15));
+}
+
 // Per-invocation bit of a 64-bit mask consumed by V_MBCNT. The HI instruction names the odd SGPR
 // of an aligned scalar pair (for example s7 for s[6:7]), while our bool-domain mask is keyed by the
 // pair's low register. The LOW instruction names that root directly; the HIGH instruction names the

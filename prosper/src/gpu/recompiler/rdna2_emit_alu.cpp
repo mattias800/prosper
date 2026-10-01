@@ -270,6 +270,51 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     if (in.has_modifier) { ok = false; return true; }
     switch (in.fmt) {
         case Rdna2Format::SOP1: {
+            if (in.opcode == 0x0a &&
+                ((in.dst.value & 1) ||
+                 ((in.src[0].kind == OperandKind::SGPR ||
+                   in.src[0].kind == OperandKind::Special) && (in.src[0].value & 1)))) {
+                log_recompile_diagnostic(b.diagnostic, "wqm-unaligned-pair", "sop1",
+                                         "pc=%u WQM_B64 requires aligned scalar pairs", in.pc);
+                ok = false;
+                return true;
+            }
+            if (wqm_has_intrinsic_numeric_source(in) && !wqm_has_numeric_destination(in) &&
+                !(in.src[0].kind == OperandKind::InlineInt &&
+                  (in.src[0].value == 0 || in.src[0].value == -1))) {
+                log_recompile_diagnostic(b.diagnostic, "wqm-numeric-special-destination", "sop1",
+                                         "pc=%u numeric WQM destination s%d is not supported",
+                                         in.pc, in.dst.value);
+                ok = false;
+                return true;
+            }
+            if (wqm_has_numeric_destination(in) &&
+                (wqm_has_intrinsic_numeric_source(in) ||
+                 wqm_has_scalar_numeric_source(rs, in))) {
+                // Capture the complete source before a self/overlapping write ends its aliases.
+                const uint32_t lo = val(in.src[0]);
+                uint32_t hi = 0;
+                if (in.opcode == 0x0a) {
+                    if (in.src[0].kind == OperandKind::SGPR) {
+                        Operand high = in.src[0];
+                        ++high.value;
+                        hi = val(high);
+                    } else {
+                        hi = b.uconst(in.src[0].kind == OperandKind::InlineInt &&
+                                      in.src[0].value < 0 ? UINT32_MAX : 0u);
+                    }
+                }
+                if (!ok) return true;
+                const uint32_t widened_lo = numeric_wqm_word(b, lo);
+                const uint32_t widened_hi = hi ? numeric_wqm_word(b, hi) : 0;
+                invalidate_wqm_numeric_mask_aliases(rs, in.dst.value, hi ? 2 : 1);
+                rs.sreg[in.dst.value] = widened_lo;
+                if (hi) rs.sreg[in.dst.value + 1] = widened_hi;
+                rs.scc = b.ucmp(Op_INotEqual,
+                    hi ? b.ibin(Op_BitwiseOr, widened_lo, widened_hi) : widened_lo,
+                    b.uconst(0));
+                return true;
+            }
             // s_quadmask_b64 D, S (#2412): D[i] = S[4i]|S[4i+1]|S[4i+2]|S[4i+3] for i in 0..15, upper
             // bits zero. Each output bit ORs a QUAD of lanes, so a per-invocation bool cannot form it.
             // `s_quadmask_b64 vcc, vcc` (0xbeea2d6a, confirmed with llvm-mc) is the first reject in 20

@@ -3057,6 +3057,33 @@ inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const R
     return snapshot;
 }
 
+inline bool wqm_has_numeric_destination(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x09 || in.opcode == 0x0a) &&
+        in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 &&
+        in.dst.value <= (in.opcode == 0x0a ? 104 : 105) &&
+        (in.opcode == 0x09 || (in.dst.value & 1) == 0);
+}
+
+inline bool wqm_has_exact_legacy_inline_mask_source(const Rdna2Inst& in) {
+    if (in.fmt != Rdna2Format::SOP1 || (in.opcode != 0x09 && in.opcode != 0x0a) ||
+        in.src[0].kind != OperandKind::InlineInt) return false;
+    if (in.opcode == 0x09) return in.src[0].value == 0 || in.src[0].value == -1;
+    // Preserve previously exact saved-mask consumers, not every old identity case. An inline
+    // B64 integer is sign-extended, so its high word is already quad-closed. Its low word must be
+    // invariant under nibble widening too (e.g. 0, 15, -1, -16). DATA/SCC support for these legacy
+    // mask spellings is separate work; do not silently drop the predicate that their users need.
+    const uint32_t bits = static_cast<uint32_t>(in.src[0].value);
+    const uint32_t any = bits | (bits >> 1) | (bits >> 2) | (bits >> 3);
+    return ((any & 0x11111111u) * 15u) == bits;
+}
+
+inline bool wqm_has_intrinsic_numeric_source(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x09 || in.opcode == 0x0a) &&
+        !wqm_has_exact_legacy_inline_mask_source(in) &&
+        (in.src[0].kind == OperandKind::InlineInt || in.src[0].kind == OperandKind::Literal ||
+         (in.opcode == 0x09 && in.src[0].kind == OperandKind::InlineFloat));
+}
+
 // True when this explicit scalar destination is written in the per-lane B64 mask domain.  Keep
 // this classification independent of the post-emission SSA maps: folded/data writers such as
 // s_getpc_b64 intentionally leave no scalar value behind, so absence from `sreg` cannot identify a
@@ -3064,7 +3091,10 @@ inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const R
 inline bool scalar_write_is_b64_mask(const Rdna2Inst& in, int base) {
     if (in.fmt == Rdna2Format::SOP1 && in.dst.value == base) {
         switch (in.opcode) {
-            case 0x04: case 0x08: case 0x0a:
+            case 0x0a:
+                return !(wqm_has_numeric_destination(in) &&
+                         wqm_has_intrinsic_numeric_source(in));
+            case 0x04: case 0x08:
             case 0x24: case 0x25: case 0x26: case 0x27:
             case 0x28: case 0x29: case 0x2a: case 0x2b:
             case 0x37: case 0x38:
@@ -3268,8 +3298,15 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
                 (in.opcode == 0x03 || in.opcode == 0x07 || in.opcode == 0x09 ||
                  sop1_opcode_is_emitted_saveexec_b32(in.opcode))) ||
                sop2_b32_mask_domain || vopc_b32_mask || vop3_b32_mask_write)));
+        // Raw-SGPR WQM is classified from the emitter's explicit numeric result, not the
+        // syntax-only mask inventory. The numeric lowering clears every overlapping Bool alias
+        // before publishing both new words; the Boolean WQM path erases both scalar words.
+        const bool numeric_wqm_write = wqm_has_numeric_destination(in) &&
+            rs.sreg.contains(base) &&
+            (in.opcode == 0x09 || rs.sreg.contains(base + 1)) &&
+            !rs.sreg_bool.contains(base);
         const bool writes_b64_mask = effective_width == 2 && !vopc_b32_mask &&
-            scalar_write_is_b64_mask(in, base);
+            !numeric_wqm_write && scalar_write_is_b64_mask(in, base);
         // The dedicated Wave64 half domain is a spelling of this physical SGPR's current bits,
         // not provenance attached to the register number forever.  V_READLANE clears the old
         // entry before emission and republishes it only for a MUST-proven mask-half reload; every

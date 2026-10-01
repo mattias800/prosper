@@ -3298,6 +3298,12 @@ endif()
       add_test(NAME numeric_mbcnt COMMAND test_numeric_mbcnt)
       set_tests_properties(numeric_mbcnt PROPERTIES TIMEOUT 60)
 
+      add_executable(test_numeric_wqm tests/gpu/execute/test_numeric_wqm.cpp)
+      target_include_directories(test_numeric_wqm PRIVATE tests)
+      target_link_libraries(test_numeric_wqm PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME numeric_wqm COMMAND test_numeric_wqm)
+      set_tests_properties(numeric_wqm PROPERTIES TIMEOUT 90)
+
       add_executable(test_portable_wave64_mask_reductions
                      tests/gpu/execute/test_portable_wave64_mask_reductions.cpp)
       target_include_directories(test_portable_wave64_mask_reductions PRIVATE tests)
@@ -4092,6 +4098,12 @@ endif()
       target_link_libraries(test_numeric_mbcnt PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME numeric_mbcnt COMMAND test_numeric_mbcnt)
       set_tests_properties(numeric_mbcnt PROPERTIES TIMEOUT 60)
+
+      add_executable(test_numeric_wqm tests/gpu/execute/test_numeric_wqm.cpp)
+      target_include_directories(test_numeric_wqm PRIVATE tests)
+      target_link_libraries(test_numeric_wqm PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME numeric_wqm COMMAND test_numeric_wqm)
+      set_tests_properties(numeric_wqm PROPERTIES TIMEOUT 90)
 
       # Render a frame where BOTH vertex + pixel shaders are recompiled from RDNA2.
       add_executable(test_recompiled_shaders tests/gpu/recompiler/test_recompiled_shaders.cpp)
