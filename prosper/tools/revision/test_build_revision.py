@@ -84,15 +84,15 @@ def configure(cmake: str, source: Path, build: Path, generator: str | None) -> N
     run(command, cwd=source)
 
 
-def build(cmake: str, build_dir: Path) -> None:
+def build(cmake: str, build_dir: Path, target: str = "revision_query") -> None:
     run(
-        [cmake, "--build", str(build_dir), "--config", "Release", "--target", "revision_query"],
+        [cmake, "--build", str(build_dir), "--config", "Release", "--target", target],
         cwd=build_dir,
     )
 
 
-def executable_path(build_dir: Path) -> Path:
-    return build_dir / "out" / ("revision_query.exe" if os.name == "nt" else "revision_query")
+def executable_path(build_dir: Path, target: str = "revision_query") -> Path:
+    return build_dir / "out" / (target + ".exe" if os.name == "nt" else target)
 
 
 def query(build_dir: Path, *, override: str | None = None) -> str:

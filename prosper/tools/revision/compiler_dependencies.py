@@ -1,0 +1,138 @@
+"""Bounded build-time dependency fingerprint for GCC/Clang prosper_core commands.
+
+This runs before compilation, using current resolved compile commands, not stale .d files or a
+configure-only source census. The output is ONLY a digest. Unsupported invocation/dependency
+syntax fails closed; CMake embeds unknown rather than claiming a complete compiler case.
+"""
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+
+MAX_UNITS, MAX_PATHS, MAX_BYTES = 1024, 16384, 256 * 1024 * 1024
+
+
+def argv(command):
+    if os.name != "nt":
+        return shlex.split(command)
+    import ctypes
+    from ctypes import wintypes
+    split = ctypes.windll.shell32.CommandLineToArgvW
+    split.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    split.restype = ctypes.POINTER(wintypes.LPWSTR)
+    count = ctypes.c_int()
+    result = split(command, ctypes.byref(count))
+    if not result:
+        raise ValueError("unsupported compiler command")
+    try:
+        return [result[k] for k in range(count.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(ctypes.cast(result, ctypes.c_void_p))
+
+
+def dependencies(command):
+    args = command.get("arguments") or argv(command["command"])
+    if not args or any(x.startswith("@") for x in args):
+        raise ValueError("response/wrapped compiler invocation unsupported")
+    compiler = Path(args[0]).resolve(strict=True)
+    if not re.fullmatch(r"(?:[\w.-]+-)?(?:g\+\+|gcc|c\+\+|clang\+\+|clang)(?:-\d+(?:\.\d+)*)?(?:\.exe)?", compiler.name):
+        raise ValueError("compiler driver unsupported")
+    filtered = [str(compiler)]
+    skip = False
+    for x in args[1:]:
+        if skip:
+            skip = False
+            continue
+        if x in ("-o", "-MF", "-MT", "-MQ"):
+            skip = True
+        elif x not in ("-c", "-MD", "-MMD", "-MP"):
+            filtered.append(x)
+    if skip or any(x.startswith("-fplugin") or x in ("-include-pch", "-fmodules") for x in filtered):
+        raise ValueError("compiler dependency extensions unsupported")
+    p = subprocess.run(filtered + ["-M", "-MT", "prosper"], cwd=command["directory"],
+                       capture_output=True, timeout=30)
+    if p.returncode or len(p.stdout) > 8 * 1024 * 1024:
+        raise ValueError("compiler dependency scan unavailable")
+    text = p.stdout.decode("utf-8", "strict").replace("\\\r\n", " ").replace("\\\n", " ")
+    if not text.startswith("prosper:") or "\n" in text.strip():
+        raise ValueError("compiler dependency layout unsupported")
+    # GCC Make-style escaping, not shell syntax. Preserve Windows separators; only escapes
+    # of whitespace/#/$/backslash are decoded. Literal dollar paths are unsupported rather than
+    # mistaken for Make expansion. Dependency existence is checked before any hashing.
+    text = text[len("prosper:"):].strip()
+    tokens, current = [], ""
+    k = 0
+    while k < len(text):
+        ch = text[k]
+        if ch == "\\" and k + 1 < len(text) and text[k + 1] in " \t#\\":
+            current += text[k + 1]
+            k += 2
+            continue
+        if ch.isspace():
+            if current:
+                tokens.append(current)
+                current = ""
+        else:
+            if ch == "$":
+                raise ValueError("Make expansion dependency unsupported")
+            current += ch
+        k += 1
+    if current:
+        tokens.append(current)
+    if not tokens or len(tokens) > MAX_PATHS:
+        raise ValueError("compiler dependency count")
+    paths = {compiler}
+    for token in tokens:
+        path = Path(token)
+        if not path.is_absolute():
+            path = Path(command["directory"]) / path
+        paths.add(path.resolve(strict=True))
+    # GCC's actual front-end is separate from its driver; clang normally uses its driver binary.
+    front = subprocess.run([str(compiler), "-print-prog-name=cc1plus"], capture_output=True,
+                           text=True, timeout=10)
+    if front.returncode == 0 and front.stdout.strip() != "cc1plus":
+        paths.add(Path(front.stdout.strip()).resolve(strict=True))
+    return paths
+
+
+def fingerprint(commands_file, root):
+    commands_path = Path(commands_file)
+    if commands_path.stat().st_size > 32 * 1024 * 1024:
+        raise ValueError("compile command budget")
+    commands = json.loads(commands_path.read_text(encoding="utf-8"))
+    selected = [c for c in commands if Path(c["file"]).resolve().is_relative_to(root / "prosper" / "src")]
+    if not selected or len(selected) > MAX_UNITS:
+        raise ValueError("core command count")
+    paths = set()
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for dependency_set in pool.map(dependencies, selected):
+            paths.update(dependency_set)
+            if len(paths) > MAX_PATHS:
+                raise ValueError("aggregate dependency count")
+    h = hashlib.sha256(commands_path.read_bytes())
+    size = 0
+    for path in sorted(paths, key=lambda p: p.as_posix()):
+        size += path.stat().st_size
+        if size > MAX_BYTES:
+            raise ValueError("aggregate dependency byte budget")
+        # Project paths are sorted/relative. External names remain local to this build-time digest;
+        # neither paths nor the manifest are embedded/exported into cases or public diagnostics.
+        name = path.relative_to(root).as_posix() if path.is_relative_to(root) else path.as_posix()
+        h.update(name.encode("utf-8") + b"\0" + hashlib.sha256(path.read_bytes()).digest())
+    return h.hexdigest()
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) != 3:
+            raise ValueError("arguments")
+        print(fingerprint(sys.argv[1], Path(sys.argv[2]).resolve(strict=True)))
+    except Exception:
+        # Do not print private compiler/header paths or subprocess stderr in a public build log.
+        print("compiler dependency identity unavailable", file=sys.stderr)
+        sys.exit(2)

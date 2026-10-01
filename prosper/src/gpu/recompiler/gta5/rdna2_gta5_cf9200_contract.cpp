@@ -1,4 +1,5 @@
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
+#include "gpu/recompiler/compiler_resource_access.hpp"
 
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -97,8 +98,8 @@ bool root_shape(const ShaderResource& root, uint64_t expected_address) {
 }
 
 const uint8_t* root_bytes(const ShaderResource& root) {
-    if (root.host_data)
-        return root.host_data_size >= kGtaCf9200RootBytes ? root.host_data : nullptr;
+    if (compiler_resource_has_host_data(root)) return compiler_resource_data(root, kGtaCf9200RootBytes);
+    compiler_resource_forbid_guest_read();
     if (!guest_readable(root.gpu_addr, kGtaCf9200RootBytes)) return nullptr;
     return reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(root.gpu_addr));
 }

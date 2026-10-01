@@ -1,4 +1,5 @@
 #include "gpu/recompiler/indirect/rdna2_indirect_buffer_shadow.hpp"
+#include "gpu/recompiler/compiler_resource_access.hpp"
 
 #include "gpu/resources/shader_resources.hpp"
 
@@ -286,6 +287,7 @@ bool current_indirect_buffer_shadow_matches(
         const ShaderResourceTable& table, const ShaderResource& source,
         const IndirectBufferShadowLayout& layout,
         std::span<const uint32_t> pointer_records) {
+    compiler_resource_forbid_guest_read();
     IndirectBufferShadowInfo info;
     if (!parse_indirect_buffer_shadow(
             source, source.host_data, source.host_data_size, layout, pointer_records, info))
@@ -651,6 +653,7 @@ bool current_indirect_buffer_relocation_matches(
         const ShaderResourceTable& table, const ShaderResource& source,
         const IndirectBufferRelocationLayout& layout,
         std::span<const IndirectBufferRelocationRecord> expected_records) {
+    compiler_resource_forbid_guest_read();
     IndirectBufferRelocationInfo info;
     if (!parse_indirect_buffer_relocation(
             source, source.host_data, source.host_data_size, layout, expected_records, info))
