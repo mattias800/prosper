@@ -35,12 +35,12 @@ Frame render(const std::vector<uint32_t>& vs, const prosper::gpu::SharedShaderWo
     return {std::move(pixels), prosper::test::backend_pipeline_cache_stats()};
 }
 bool blue(const uint8_t* p) { return p[0] == 0 && p[1] == 0 && p[2] == 255 && p[3] == 255; }
-void verify_clear(const Frame& frame) {
+void verify_clear(const Frame& frame, const char* name = "Strict refuses source Wave64 without inheriting a live pipeline") {
     bool clear = frame.pixels.size() == f::width * f::height * 4;
     if (clear) for (size_t i = 0; i < frame.pixels.size(); i += 4) clear &= blue(&frame.pixels[i]);
-    check(clear, "Strict refuses source Wave64 without inheriting a live pipeline");
+    check(clear, name);
 }
-void verify_derivatives(const Frame& frame, uint32_t x, uint32_t y) {
+void verify_derivatives(const Frame& frame, uint32_t x, uint32_t y, uint32_t expected_blue = 0) {
     check(frame.pixels.size() == f::width * f::height * 4, "proven module renders a target");
     if (frame.pixels.size() != f::width * f::height * 4) return;
     size_t covered = 0;
@@ -48,7 +48,8 @@ void verify_derivatives(const Frame& frame, uint32_t x, uint32_t y) {
     const auto* p = &frame.pixels[(y * f::width + x) * 4];
     std::printf("quad=(%u,%u) rgba=%u,%u,%u,%u covered=%zu\n", x & 1, y & 1,
                 p[0], p[1], p[2], p[3], covered);
-    check(covered == 1 && p[2] == 0 && p[3] == 255, "exactly the selected primitive-edge pixel renders");
+    check(covered == 1 && p[2] == expected_blue && p[3] == 255,
+          "exactly the selected primitive-edge pixel renders with the expected final induction state");
     check(p[0] >= 31 && p[0] <= 32 && p[1] >= 31 && p[1] <= 32,
           "analytic dFdx(x)=dFdy(y)=1 includes helper values through the uniform vote branch");
 }
@@ -94,6 +95,68 @@ void verify_buffer_authority(bool deterministic) {
         }
     }
     check(*source == captured, "buffer certificate/cache changes never alter shared captured shader bytes");
+}
+void verify_loop_votes(uint32_t x, uint32_t y, bool poison) {
+    namespace loops = prosper::test::fragment_loop_votes;
+    const auto vertex = f::edge_vertex(x, y);
+    for (uint32_t bound = 0; bound < 4; ++bound) {
+        const auto source = std::make_shared<const std::vector<uint32_t>>(
+            loops::make_module(loops::Shape::Counter, bound, poison));
+        const auto captured = *source;
+        const auto lowered = prosper::gpu::lower_fragment_votes(*source);
+        check(lowered.refusal == prosper::gpu::FragmentVoteRefusal::None && lowered.uniform_votes == 1,
+              "initialized finite induction supplies one independent guest-wave vote");
+        const uint64_t identity = 0xf4011000u + y * 256 + x * 16 + bound;
+        verify_clear(render(vertex, source, identity, FragmentWavePolicy::Strict));
+        for (const bool warm : {false, true}) {
+            const auto frame = render(vertex, source, identity, FragmentWavePolicy::ProvenVotes);
+            if (bound) verify_derivatives(frame, x, y, bound);
+            else verify_clear(frame, "zero-trip effective loop leaves its defined blue initial output");
+            check(frame.pipelines.hits == (warm ? 1u : 0u) && frame.pipelines.misses == (warm ? 0u : 1u),
+                  "loop module uses the production cold/warm effective pipeline variant");
+        }
+        verify_clear(render(vertex, source, identity, FragmentWavePolicy::Strict));
+        check(*source == captured, "loop lowering and pipeline reuse preserve shared captured bytes");
+    }
+    for (const auto shape : {loops::Shape::Nested, loops::Shape::CrossCarried, loops::Shape::BoolToggle,
+                             loops::Shape::CounterWithDeadVote}) {
+        const auto source = std::make_shared<const std::vector<uint32_t>>(loops::make_module(shape, 2, poison));
+        verify_derivatives(render(vertex, source, 0, FragmentWavePolicy::ProvenVotes), x, y,
+                           shape == loops::Shape::CrossCarried ? 10 : shape == loops::Shape::BoolToggle ? 9 : 2);
+    }
+    for (const auto shape : {loops::Shape::VaryingTrip, loops::Shape::VaryingInit, loops::Shape::VaryingBoolUpdate,
+                             loops::Shape::SecondUnsafeLoop}) {
+        const auto source = std::make_shared<const std::vector<uint32_t>>(loops::make_module(shape));
+        verify_clear(render(vertex, source, 0, FragmentWavePolicy::ProvenVotes),
+                     "helper-dependent recurrence refuses rather than executing a narrower vote");
+    }
+}
+
+void verify_per_draw_loop_bounds(bool deterministic) {
+    namespace loops = prosper::test::fragment_loop_votes;
+    const auto source = std::make_shared<const std::vector<uint32_t>>(loops::make_module(loops::Shape::BufferBound));
+    for (const bool reverse : {false, true}) {
+        std::vector<prosper::test::BackendDraw> draws;
+        for (uint32_t i = 0; i < 2; ++i) {
+            const uint32_t bound = reverse ? 1 - i : i;
+            prosper::test::BackendDraw draw;
+            draw.vs = f::edge_vertex(2 + bound, 2); draw.fs_shared = source;
+            draw.fs_identity = 0xf4011b00u; draw.vcount = 3;
+            draw.fragment_wave_policy = FragmentWavePolicy::ProvenVotes;
+            for (uint32_t set = 0; set < 2; ++set) {
+                prosper::test::FrameResource cb; cb.binding = 2; cb.set = set; draw.R.push_back(cb);
+                prosper::test::FrameResource vb; vb.binding = 3; vb.set = set; draw.R.push_back(vb);
+            }
+            prosper::test::FrameResource input; input.binding = 5; input.dwords = {bound}; draw.R.push_back(input);
+            draws.push_back(std::move(draw));
+        }
+        const auto pixels = prosper::test::render_draws_rgba(draws, f::width, f::height);
+        // Guest per-draw expectations, NOT an oracle for native Vulkan Any: the host may pack
+        // commands into one subgroup. Effective copies must keep the distinct descriptor values.
+        const Frame frame{pixels, {}};
+        if (deterministic) verify_derivatives(frame, 3, 2, 1);
+        else verify_clear(frame, "ordinary robustness refuses both buffer-derived loop certificates");
+    }
 }
 } // namespace
 
@@ -165,8 +228,10 @@ int main(int argc, char** argv) {
         verify_derivatives(render(vertex, fragment, 0, FragmentWavePolicy::ProvenVotes), x, y);
         verify_clear(render(vertex, fragment, 0, FragmentWavePolicy::Strict));
         check(*fragment == captured, "live/cache/replay calls leave shared captured source words byte-identical");
+        verify_loop_votes(x, y, poison);
     }
     verify_buffer_authority(context.deterministic_storage_reads);
+    verify_per_draw_loop_bounds(context.deterministic_storage_reads);
     std::printf("== %s: %d failures ==\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

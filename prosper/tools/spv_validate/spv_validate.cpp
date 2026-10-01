@@ -510,6 +510,19 @@ int main(int argc, char** argv) {
         dump(dir, name.c_str(), source);
         dump(dir, (name + "_effective").c_str(), lower_fragment_votes(source).words);
     }
+    namespace loop_votes = prosper::test::fragment_loop_votes;
+    for (const auto shape : {loop_votes::Shape::Counter, loop_votes::Shape::Nested,
+                             loop_votes::Shape::CrossCarried, loop_votes::Shape::BoolToggle,
+                             loop_votes::Shape::CounterWithDeadVote}) {
+        const bool counter = shape == loop_votes::Shape::Counter;
+        for (uint32_t bound = counter ? 0 : 2; bound < (counter ? 4u : 3u); ++bound) {
+            const std::string name = "fragment_vote_loop_poison_" +
+                std::to_string(static_cast<uint32_t>(shape)) + "_" + std::to_string(bound);
+            const auto source = loop_votes::make_module(shape, bound, true);
+            dump(dir, name.c_str(), source);
+            dump(dir, (name + "_effective").c_str(), lower_fragment_votes(source).words);
+        }
+    }
     // GTA V's exact literal-bearing V_ALIGNBYTE_B32 packet.  Strict validation guards the
     // masked-shift lowering: SPIR-V shift operands must stay in the defined 0..31 range.
     { const uint32_t c[] = {0xd54f0006u,0x0415fe80u,0x3024240cu,0xbf810000u};

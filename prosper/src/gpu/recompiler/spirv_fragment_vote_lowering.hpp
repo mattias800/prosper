@@ -24,7 +24,11 @@ struct FragmentVoteLowering {
 
 // Input must be a valid guest-generated SPIR-V module, not an unrestricted Vulkan peephole or
 // a replacement for spirv-val. Every Any must have a defined
-// draw-uniform predicate or a finite known-pure SSA user graph with no control/effect consumer.
+// predicate defined uniformly across the intended logical guest wave (including helpers), or a
+// finite known-pure SSA user graph with no control/effect consumer. This is NOT a claim that a
+// per-draw value is uniform across an arbitrary host Vulkan subgroup: fragment subgroups may mix
+// commands. The guest's complete-wave scalar EXEC/VCC test is the semantic target; its Any emission
+// is an implementation of that target, not unrestricted source-SPIR-V optimization authority.
 // Output-dead branches/loops are deliberately not a rewrite certificate. Strict replay never calls
 // this transformation. A caller may certify buffer inputs immutable only after proving that all
 // shaders in the pass leave them read-only. Buffer-derived predicates additionally require an
@@ -35,6 +39,9 @@ struct FragmentVoteLowering {
 // point's SignedZeroInfNanPreserve contract, and floating comparisons also require DenormPreserve.
 // Raw-bit predicates use integer loads; float-to-bits casts do not certify uniformity (sNaN
 // quieting is permitted). External writes/atomics/opaque calls retain their rendezvous obligation.
+// Initialized scalar Boolean/Int32 recurrences additionally require a closed, grounded proof of
+// EVERY entry-function branch/switch selector. Equal values at matching visits do not imply equal
+// values across iterations or bounded addresses; recurrence facts never expand load admission.
 FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
                                          bool immutable_storage_inputs = false,
                                          bool deterministic_storage_reads = false);

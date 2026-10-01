@@ -1,4 +1,5 @@
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
+#include "gpu/recompiler/spirv_fragment_uniform_trace.hpp"
 #include <algorithm>
 #include <charconv>
 #include <cstring>
@@ -410,11 +411,9 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
     for (size_t i = 0; i < instructions.size(); ++i)
         for (uint32_t value : value_uses(source, instructions[i], preserves_operands(instructions[i])))
             users[value].push_back(i);
+    std::unordered_set<uint32_t> dead_vote_ids;
     for (const auto& vote : votes) {
-        if (uniform.contains(source[vote.at + 4])) {
-            ++result.uniform_votes;
-            continue;
-        }
+        if (uniform.contains(source[vote.at + 4])) continue;
         std::vector<uint32_t> pending{source[vote.at + 2]};
         std::unordered_set<uint32_t> seen;
         bool dead = true;
@@ -428,7 +427,73 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
                 pending.push_back(source[in.at + 2]);
             }
         }
-        if (!dead) {
+        if (dead) dead_vote_ids.insert(source[vote.at + 2]);
+    }
+
+    // Recurrences require a separate simultaneous trace certificate. Never feed its provisional
+    // facts into pointer/load admission: uniform induction is NOT a non-wrapping address proof.
+    FragmentUniformTrace trace;
+    uint32_t function = 0, block = 0;
+    bool trace_supported = true;
+    for (const auto& in : instructions) {
+        const auto at = in.at;
+        if (in.op == 54) { function = source[at + 2]; block = 0; }
+        if (function != entry_id) continue;
+        if (in.op == 248) {
+            block = source[at + 1];
+            trace.successors.emplace(block, std::vector<uint32_t>{});
+            if (!trace.entry_block) trace.entry_block = block;
+        }
+        if (in.op == 56) { function = block = 0; continue; }
+        if (!block) continue;
+        auto& successors = trace.successors.at(block);
+        if (in.op == 249) successors.push_back(source[at + 1]);
+        if (in.op == 250) {
+            trace.selectors.push_back(source[at + 1]);
+            successors.insert(successors.end(), {source[at + 2], source[at + 3]});
+        }
+        if (in.op == 251) {
+            trace.selectors.push_back(source[at + 1]);
+            if (!value_types.contains(source[at + 1]) ||
+                !int32_types.contains(value_types.at(source[at + 1]))) { trace_supported = false; continue; }
+            successors.push_back(source[at + 2]);
+            for (uint32_t i = 4; i < in.count; i += 2) successors.push_back(source[at + i]);
+        }
+        if (in.count < 3 || no_result(in.op) || in.op == 248 ||
+            (!bool_types.contains(source[at + 1]) && !int32_types.contains(source[at + 1]))) continue;
+        FragmentTraceValue value;
+        value.block = block;
+        if (in.op == 245 && in.count >= 5 && (in.count % 2) == 1) {
+            for (uint32_t i = 3; i + 1 < in.count; i += 2) {
+                value.operands.push_back(source[at + i]);
+                value.phi_predecessors.push_back(source[at + i + 1]);
+            }
+        } else if (in.op == 335 && in.count == 5) value.operands = {source[at + 4]};
+        else value.operands = pure_operands(source, in, preserves_operands(in));
+        if (in.op == 124 && (in.count != 4 || !value_types.contains(source[at + 3]) ||
+                            !int32_types.contains(value_types.at(source[at + 3])) ||
+                            !int32_types.contains(source[at + 1]))) value.operands.clear();
+        if (!value.operands.empty()) trace.values.emplace(source[at + 2], std::move(value));
+    }
+    if (trace_supported) {
+        // A failed fallback must not revoke the older constant/dead-SSA certificates, even if
+        // unrelated control flow is varying. Only predicates missing those facts need this proof.
+        std::vector<uint32_t> predicates;
+        for (const auto& vote : votes)
+            if (!uniform.contains(source[vote.at + 4]) && !dead_vote_ids.contains(source[vote.at + 2]))
+                predicates.push_back(source[vote.at + 4]);
+        if (!predicates.empty()) {
+            const auto proved = prove_fragment_uniform_trace(trace, uniform, predicates);
+            uniform.insert(proved.begin(), proved.end());
+        }
+    }
+
+    for (const auto& vote : votes) {
+        if (uniform.contains(source[vote.at + 4])) {
+            ++result.uniform_votes;
+            continue;
+        }
+        if (!dead_vote_ids.contains(source[vote.at + 2])) {
             result.refusal = FragmentVoteRefusal::UnprovedVote;
             result.uniform_votes = result.dead_votes = 0;
             return result;

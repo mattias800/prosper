@@ -2410,6 +2410,9 @@ if(TARGET prosper_core)
   add_executable(test_fragment_vote_lowering tests/gpu/recompiler/test_fragment_vote_lowering.cpp)
   target_link_libraries(test_fragment_vote_lowering PRIVATE prosper_core)
   add_test(NAME fragment_vote_lowering COMMAND test_fragment_vote_lowering)
+  add_executable(test_fragment_loop_vote_lowering tests/gpu/recompiler/test_fragment_loop_vote_lowering.cpp)
+  target_link_libraries(test_fragment_loop_vote_lowering PRIVATE prosper_core)
+  add_test(NAME fragment_loop_vote_lowering COMMAND test_fragment_loop_vote_lowering)
 
   # #3203: the entry-M0 token containment's CFG-DISPATCHER re-arm. Its own binary rather than another
   # arm in test_rdna2_spirv_struct, because that one returns at its first failure and a mutation run
