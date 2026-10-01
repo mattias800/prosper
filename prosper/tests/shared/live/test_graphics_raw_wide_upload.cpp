@@ -208,12 +208,17 @@ static void observe_pixels(const DrawItem& draw, bool vertex, float value, const
         check(correct, arm,
               "actual VS last-word translation reaches the real upload and pixels");
     } else {
-        const uint8_t red = static_cast<uint8_t>((pixel_control ? 1.0f - value : value) * 255.0f);
+        const uint8_t expected_red = static_cast<uint8_t>(value * 255.0f);
+        // Flip a byte bit, so the negative oracle has no fixed point (including value=0.5).
+        const uint8_t red = pixel_control ? static_cast<uint8_t>(expected_red ^ 0x80u) : expected_red;
         bool correct = true;
         for (uint32_t y = 0; y < H; ++y)
             for (uint32_t x = 0; x < W; ++x)
                 correct &= pixel(image, x, y,
                     {red, static_cast<uint8_t>(green * 255.0f), 191u, 255u});
+        std::printf("[pixel-observation] PS selected=%g expected-red=%u "
+                    "actual-first-red=%u image-bytes=%zu\n", value, static_cast<unsigned>(red),
+                    image.size() >= 4u ? static_cast<unsigned>(image[0]) : 0u, image.size());
         check(correct, arm, "actual PS last-word color reaches the real upload and pixels");
     }
 }

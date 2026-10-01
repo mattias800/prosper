@@ -31,6 +31,11 @@ are fixed before startup. These assertions do not imply physical comparison traf
 
 ## Ruled out
 
+- Complementing the expected PS float with `1 - value` leaves `0.5` unchanged. The #3987
+  raw-wide negative observer produced 47 pixel failures and one passing fresh-mask arm, despite
+  all 48 production pixel checks passing. Flip expected red bit `0x80` instead: every byte changes
+  by 128, beyond the pixel observer's one-byte tolerance. Preserve the failed calibration.
+
 - A reused persistent output is not a fresh black background. The raw-wide upload fixture's
   translated triangles leave old pixels untouched when the backend correctly loads that target.
   Use distinct private output identities and observe every row pixel for each isolated draw.
