@@ -289,7 +289,8 @@ int main(int argc, char** argv) {
 #endif
 
         // Register the live renderer (same as screenshot tool / prosper-app)
-        prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false);
+        prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false,
+            prosper::gpu::FragmentWavePolicy::ProvenVotes);
         
         // Boot already completed above; run guest on separate thread
         std::thread guest_thread([&p]() {
@@ -347,7 +348,8 @@ int main(int argc, char** argv) {
         prosper::frontend::register_live_renderer_from_environment(
             [](const char* name) { return getenv(name); },
             [](const std::string& frame_dir, bool dump_bmps) {
-                prosper::frontend::register_live_renderer(frame_dir, dump_bmps);
+                prosper::frontend::register_live_renderer(frame_dir, dump_bmps,
+                    prosper::gpu::FragmentWavePolicy::ProvenVotes);
             });
     }
 #endif

@@ -129,37 +129,21 @@ def main() -> int:
     check("FPS extracts the frame count",
           skip_survey.FPS.findall("[app] 22.5 fps (480 frames, gpu-present)") == ["480"])
 
-    # ---- the allowlist must not drift from the renderer's -----------------------------------------
-    # It is a copy of a title id that lives in live_renderer.cpp; if that gains a title and this does
-    # not, the survey reports a structural zero as a real one.
+    # ---- live admission is explicit and title-independent ----------------------------------------
     live = source(REPO / "prosper" / "frontends" / "shared" / "live" / "live_renderer.cpp")
-    # W5 removed the per-title gate, so this now asserts its ABSENCE. Anchored on the assignment
-    # rather than on any `title_id ==` in the file: a bare match would redden on an unrelated
-    # per-title switch, and the natural repair -- adding that title to NATIVE_VOTE_ALLOWLIST --
-    # would make the survey claim wave-any is specially handled for a title where it is not.
-    #
-    # If a title gate is ever reintroduced, this reddens and the survey's universal caveat has to be
-    # narrowed again. That is the point: the tools describe the renderer, not the other way round.
-    # Collected from the whole gate REGION rather than from one syntactic form. This arm has been
-    # anchored on a single `title_id ==`, then on the assignment expression, and each time the thing
-    # moved: to an assignment, then to a `kNativeFragmentVoteTitles` array the assignment merely
-    # references. The array version passed an "is not title-scoped" assertion while the gate was
-    # fully title-scoped, because no PPSA literal appeared in the assignment any more.
-    #
-    # So: find the ids wherever they live between the allowlist declaration and the gate, and assert
-    # the tools EQUAL the renderer. That is the property that matters -- a survey claiming a title is
-    # allowlisted when it is not hides real refusals behind a reassuring note.
-    start = live.find("kNativeFragmentVoteTitles")
-    end = live.find("native_fragment_vote_width", start if start >= 0 else 0)
-    region = live[start:end + 400] if start >= 0 else live
-    ids = set(re.findall(r'"([A-Z]{4}\d{5})"', region))
-    check("skip_survey's allowlist matches the renderer's, exactly",
-          ids == set(skip_survey.NATIVE_VOTE_ALLOWLIST),
-          "-- renderer admits %s, survey has %s" % (sorted(ids) or "no title",
-                                                    sorted(skip_survey.NATIVE_VOTE_ALLOWLIST)))
-    check("the renderer's allowlist is non-empty and was actually found",
-          bool(ids),
-          "-- found no title ids near the gate; the pin may be looking at the wrong place again")
+    check("live wave admission has no legacy title list",
+          "kNativeFragmentVoteTitles" not in live and "native_fragment_vote_width" not in live)
+    check("proven admission is explicitly selected by the app",
+          "prosper::gpu::FragmentWavePolicy::ProvenVotes" in app)
+    check("proven emitter carries every parsed field",
+          '"[render] proven fragment votes: subgroup 64 -> independent "' in rr and
+          '"(uniform=%u dead=%u fs=%016llx)' in rr)
+    proven_line = "[render] proven fragment votes: subgroup 64 -> independent (uniform=2 dead=3 fs=00000000000000ab)"
+    check("ADMIT_PROVEN extracts proof counts and shader identity",
+          skip_survey.ADMIT_PROVEN.findall(proven_line) == [("2", "3", "00000000000000ab")])
+    check("proven admission does not match refusal or legacy patterns",
+          not skip_survey.SKIP.findall(proven_line) and not skip_survey.ADMIT.findall(proven_line) and
+          not skip_survey.ADMIT_PARTIAL.findall(proven_line) and not skip_survey.ADMIT_PROVEN.findall(skip_line))
 
     # N7: `admitted` is a shader count only because the emitter dedupes on shader identity
     # before printing. Nothing else pins that, so a refactor dropping the guard would turn
@@ -168,6 +152,9 @@ def main() -> int:
     check("the admit emitter still dedupes on shader identity",
           "native_width_logged.insert(shader_key).second" in rr,
           "-- admitted would become a DRAW count while still labelled shaders")
+    check("the proven admit emitter dedupes on source shader identity",
+          "proven_logged.insert(shader_key).second" in rr,
+          "-- proven admissions would become draw counts rather than shader counts")
 
     # --- the route actually reaches the title -------------------------------------------------
     # `snapshots.json` stores `pad_script` relative to `prosper/`, and the emulator resolves it

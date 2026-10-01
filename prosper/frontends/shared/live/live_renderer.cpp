@@ -578,82 +578,15 @@ extern "C" int prosper_thread_in_renderer_callback(unsigned long native_tid) {
 }
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested,
-                            const std::string& title_id) {
+                            prosper::gpu::FragmentWavePolicy requested_wave_policy) {
     // Keep the legacy global disable authoritative for every frontend, including callers with their
     // own explicit opt-in such as PROSPER_APP_DUMP_FRAMES.
     const bool dump_bmps = frame_dump_request_allowed(
         dump_bmps_requested, PROSPER_ENV_VALUE("PROSPER_NO_FRAME_DUMPS"));
-    // Titles whose WaveAny-only fragment programs may run at the host's native Wave32.
-    //
-    // The classifier (render_runner.h) admits a reason set of EXACTLY kFragmentWaveReasonWaveAny --
-    // no lane identity, no ballot, no shuffle, no scalar reduction. What this list controls is which
-    // titles that classifier is trusted on, and it is a list rather than a switch for a measured
-    // reason: every entry has a before/after survey on a reviewed route on this project's hardware,
-    // and joining it is one run (`tools/shader_inspect/skip_survey.py --from-snapshots`).
-    //
-    // Why not simply always-on, which is what #3464 W5 first proposed. The surveyed set is NOT a
-    // random sample of the corpus -- it is the titles that have snapshot routes, which biases toward
-    // simple, mature fragment work. That is exactly the population least likely to contain the
-    // shader this classifier still mis-admits, because the "control-flow only" property the safety
-    // argument rests on is NOT what the classifier tests (it tests the reason set, and the vote taint
-    // that would raise ScalarReduce has known escapes: `sel()` drops the taint `bsel()` propagates,
-    // and a vote routed into VCC is read per-lane by v_cndmask_b32 with no marker). Until the
-    // classifier tests the property its safety argument claims, each title is admitted on evidence.
-    //
-    // Keeping it title-keyed also preserves an invariant an always-on switch silently broke: tests
-    // and gpu_replay call register_live_renderer without a title_id (live_renderer.hpp:156 defaults
-    // it to {}), so they match nothing and keep the strict exact-width contract. gpu_replay gates on
-    // expected_output_hash, so admitting there would have moved the project's offline oracle.
-    //
-    // Measured on Windows/NVIDIA, reviewed routes (#3464, PR #3480). Modules reporting exactly
-    // WaveAny, and how many of them are PROVABLY width-independent:
-    //   PPSA01885 Evergate         11 of 11 (title + gameplay routes; the title screen's missing
-    //                                        3D content is restored, confirmed by eye)
-    //   PPSA02664 Alex Kidd DX       8 of 8  (title screen confirmed correct by eye; its WORLD has
-    //                                        a separate, unrelated defect -- #3479)
-    //   PPSA13579 Blasphemous 2      1 of 8
-    //   PPSA25009 Blue Prince       18 of 22
-    //   PPSA04263 Grand Theft Auto V         the original reviewed bank route
-    //
-    // Two of those titles are on the list although most or some of their modules do NOT clear. That
-    // is safe BECAUSE the decision is per module: under THIS tier the 11 that cannot be proved keep
-    // the exact-width contract and are refused individually. Admitting a title no longer means trusting
-    // all of its shaders, which is what made a title the wrong unit before. (The partial-wave tier
-    // below admits those 11 on its own, different argument; measured on all five titles, #3797.)
-    //
-    // NOT on this list: PPSA21564 (6 measured refusals, no dump and no after-arm yet). One survey
-    // run away, and with the per-module proof the run is confirmation rather than a gamble.
-    static const char* const kNativeFragmentVoteTitles[] = {
-        "PPSA01885", "PPSA02664", "PPSA04263", "PPSA13579", "PPSA25009",
-    };
-    // The opt-out exists so the A/B stays reproducible, following PROSPER_NO_GUEST_FS: a default-on
-    // behaviour whose disable switch is for bisection, not for routine use.
-    const bool native_fragment_vote_width =
-        !PROSPER_ENV_VALUE("PROSPER_STRICT_FRAGMENT_WAVE_WIDTH") &&
-        std::any_of(std::begin(kNativeFragmentVoteTitles), std::end(kNativeFragmentVoteTitles),
-                    [&](const char* id) { return title_id == id; });
-    // The partial-wave tier (#3464, rdna2_to_spirv.hpp kFragmentWavePartialWaveExactReasons) runs on
-    // every title above. Its argument does not depend on the title, but each title was still measured
-    // before joining, because on these titles it admits exactly the modules the vote tier's proof
-    // declined. Same binary, tier on vs PROSPER_NO_PARTIAL_WAVE_FRAGMENT=1, fresh saves, the reviewed
-    // snapshot routes on Windows/NVIDIA (32..32):
-    //   PPSA04263 GTA V          188 refused -> 0; the bank world renders instead of black (#3794)
-    //   PPSA25009 Blue Prince      4 refused -> 0 on the hall route; the bouquet and the edge lens
-    //                              fringe return and blue-prince-hall passes (it FAILS with the tier
-    //                              off: 13,609 colours against a 40,000 floor) (#3797)
-    //   PPSA01885 Evergate         4 refused -> 0 on the gameplay route; the save-slot portals show
-    //                              their world preview instead of being empty (#3797)
-    //   PPSA13579 Blasphemous 2    7 refused -> 0 (about 5% of gameplay draws, at a 640x360 target); the
-    //                              composite does not change beyond frame-to-frame noise (#3797)
-    //   PPSA02664 Alex Kidd DX     0 refused either way; the tier changes no admission (#3797)
-    // Every guard passes with the tier on. It stays a title list, not a rule: the other titles have
-    // no before/after, and a title joins with one survey run.
-    //
-    // Two switches turn it off: PROSPER_NO_PARTIAL_WAVE_FRAGMENT isolates THIS tier for an A/B on one
-    // binary (the renderer then behaves exactly as before the tier existed), and
-    // PROSPER_STRICT_FRAGMENT_WAVE_WIDTH, which disables both tiers through native_fragment_vote_width.
-    const bool partial_wave_fragment = native_fragment_vote_width &&
-        !PROSPER_ENV_VALUE("PROSPER_NO_PARTIAL_WAVE_FRAGMENT");
+    // Frontends select a guest-semantic contract explicitly. No game ID participates. Replay and
+    // direct callers remain Strict by default; a diagnostic opt-out cannot opt them into lowering.
+    const auto fragment_wave_policy = PROSPER_ENV_VALUE("PROSPER_STRICT_FRAGMENT_WAVE_WIDTH")
+        ? prosper::gpu::FragmentWavePolicy::Strict : requested_wave_policy;
     // Create (and thereby PUBLISH) the renderer's Vulkan device up front so the compute backend can
     // adopt it (#1091). Compute initializes lazily on its first dispatch, and titles routinely
     // dispatch before their first draw -- without this the compute device would be created first and
@@ -1472,8 +1405,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // Every registration shares process state; taking this reference initializes only empty slots.
     auto* const callback_state = &CallbackState::instance();
     prosper::gpu::set_submit_renderer(
-        [frame_dir, dump_bmps, invalidate_ds, native_fragment_vote_width,
-         partial_wave_fragment, callback_state](const std::vector<prosper::gpu::DrawItem>& items,
+        [frame_dir, dump_bmps, invalidate_ds, fragment_wave_policy,
+         callback_state](const std::vector<prosper::gpu::DrawItem>& items,
                                uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             const uint64_t callback_capture_generation =
                 prosper::perf::interactive_performance_capture().active_generation();
@@ -1875,8 +1808,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // load_shader_overrides. Computed once per callback, applied to every draw item.
             ShaderOverrides shader_overrides = load_shader_overrides();
             BackendDrawContext backend_draw_ctx{
-                .native_fragment_vote_width = native_fragment_vote_width,
-                .partial_wave_fragment = partial_wave_fragment,
+                .fragment_wave_policy = fragment_wave_policy,
                 .phase = phase,
                 .rtt_log = rtt_log,
                 .pending_timing = pending_timing,

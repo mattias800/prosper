@@ -2407,6 +2407,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_wave_width_independent PRIVATE prosper_core)
   add_test(NAME wave_width_independent COMMAND test_wave_width_independent)
 
+  add_executable(test_fragment_vote_lowering tests/gpu/recompiler/test_fragment_vote_lowering.cpp)
+  target_link_libraries(test_fragment_vote_lowering PRIVATE prosper_core)
+  add_test(NAME fragment_vote_lowering COMMAND test_fragment_vote_lowering)
+
   # #3203: the entry-M0 token containment's CFG-DISPATCHER re-arm. Its own binary rather than another
   # arm in test_rdna2_spirv_struct, because that one returns at its first failure and a mutation run
   # then cannot tell which arms moved. This reports every arm independently.
@@ -3307,6 +3311,15 @@ endif()
       add_test(NAME fragment_numeric_mbcnt COMMAND test_fragment_numeric_mbcnt)
       set_tests_properties(fragment_numeric_mbcnt PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 
+      add_executable(test_fragment_proven_votes tests/gpu/execute/test_fragment_proven_votes.cpp)
+      target_include_directories(test_fragment_proven_votes PRIVATE tests frontends)
+      target_link_libraries(test_fragment_proven_votes PRIVATE prosper_live_renderer)
+      add_test(NAME fragment_proven_votes COMMAND test_fragment_proven_votes)
+      set_tests_properties(fragment_proven_votes PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+      add_test(NAME fragment_proven_votes_no_robust2 COMMAND test_fragment_proven_votes --expect-no-robust2)
+      set_tests_properties(fragment_proven_votes_no_robust2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+        ENVIRONMENT "PROSPER_NO_ROBUST_BUFFER_ACCESS2=1")
+
       add_executable(test_numeric_mbcnt tests/gpu/execute/test_numeric_mbcnt.cpp)
       target_include_directories(test_numeric_mbcnt PRIVATE tests)
       target_link_libraries(test_numeric_mbcnt PRIVATE prosper_core Vulkan::Vulkan)
@@ -4107,6 +4120,15 @@ endif()
       target_link_libraries(test_fragment_numeric_mbcnt PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME fragment_numeric_mbcnt COMMAND test_fragment_numeric_mbcnt)
       set_tests_properties(fragment_numeric_mbcnt PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+      add_executable(test_fragment_proven_votes tests/gpu/execute/test_fragment_proven_votes.cpp)
+      target_include_directories(test_fragment_proven_votes PRIVATE tests frontends)
+      target_link_libraries(test_fragment_proven_votes PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME fragment_proven_votes COMMAND test_fragment_proven_votes)
+      set_tests_properties(fragment_proven_votes PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+      add_test(NAME fragment_proven_votes_no_robust2 COMMAND test_fragment_proven_votes --expect-no-robust2)
+      set_tests_properties(fragment_proven_votes_no_robust2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+        ENVIRONMENT "PROSPER_NO_ROBUST_BUFFER_ACCESS2=1")
 
       add_executable(test_numeric_mbcnt tests/gpu/execute/test_numeric_mbcnt.cpp)
       target_include_directories(test_numeric_mbcnt PRIVATE tests)

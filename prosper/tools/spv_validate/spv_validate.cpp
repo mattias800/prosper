@@ -23,6 +23,9 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "../../tests/fixtures/spirv_wave_width_fixtures.hpp"
+#include "../../tests/fixtures/spirv_fragment_vote_fixtures.hpp"
+#include "../../tests/fixtures/spirv_fragment_vote_execution.hpp"
+#include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -486,6 +489,26 @@ int main(int argc, char** argv) {
         if (!fixture.strict_vulkan) continue; // unsupported-environment parser controls, not modules
         const std::string name = "wave_width_" + fixture.name;
         dump(dir, name.c_str(), fixture.words);
+    }
+    for (const auto& fixture : prosper::test::fragment_votes::fixtures()) {
+        const std::string name = "fragment_vote_" + fixture.name;
+        dump(dir, name.c_str(), fixture.words);
+        if (fixture.admitted) {
+            const auto lowered = lower_fragment_votes(fixture.words, fixture.immutable_storage, true);
+            dump(dir, (name + "_effective").c_str(), lowered.words);
+        }
+    }
+    namespace vote_execution = prosper::test::fragment_vote_execution;
+    for (uint32_t y = 2; y < 4; ++y) for (uint32_t x = 2; x < 4; ++x) {
+        const auto name = "fragment_vote_edge_vertex_" + std::to_string(x) + "_" + std::to_string(y);
+        dump(dir, name.c_str(), vote_execution::edge_vertex(x, y));
+    }
+    dump(dir, "fragment_vote_helper_witness", vote_execution::helper_witness());
+    for (bool poison : {false, true}) {
+        const std::string name = poison ? "fragment_vote_edge_poison" : "fragment_vote_edge";
+        const auto source = vote_execution::derivative_fragment(poison);
+        dump(dir, name.c_str(), source);
+        dump(dir, (name + "_effective").c_str(), lower_fragment_votes(source).words);
     }
     // GTA V's exact literal-bearing V_ALIGNBYTE_B32 packet.  Strict validation guards the
     // masked-shift lowering: SPIR-V shift operands must stay in the defined 0..31 range.

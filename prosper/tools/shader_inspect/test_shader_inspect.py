@@ -216,18 +216,14 @@ def main() -> int:
 
     # ---- #3464 review: the census must not claim ADMISSION it cannot determine -------------
     #
-    # render_runner.h:7128-7133 is a five-conjunct condition and only the innermost equality
-    # (:7140) is a module property. `bd.allow_native_fragment_vote_width` defaults false
-    # (:565) and is set from `title_id == "PPSA04263"` alone (live_renderer.cpp:1216, :7591),
-    # and two more conjuncts depend on the HOST's subgroup limits. An offline tool knows none
-    # of those, so it must report the reason-set test under its own name and say plainly that
-    # admission needs more -- otherwise every non-GTA-V count reads as admitted when the
-    # renderer in fact drops the shader.
+    # A legacy source classification is not the live ProvenVotes transformation. Offline input
+    # has neither the enabled-device contract nor whole-pass authority used by the renderer.
     code, out = run(binary, spirv_module(64, 0x2), extra=["--wave-reasons"])
     check("the census states that admission is not decided by the module alone",
           "gate-undecided=" in out, "\n" + out)
-    check("the census names the title allowlist as an undecided conjunct",
-          "title-allowlist" in out, "\n" + out)
+    check("the census names the current rewrite/pass authority instead of a title gate",
+          "rewrite-certificate" in out and "pass-input-authority" in out and
+          "title-allowlist" not in out, "\n" + out)
     check("the census names the host subgroup limits as an undecided conjunct",
           "host-subgroup" in out, "\n" + out)
     # The two conjuncts a module CAN decide are reported rather than silently assumed to pass.

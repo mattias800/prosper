@@ -27,22 +27,13 @@ of health**, for TWO independent reasons, and an early version of this file publ
 a zero means only "none in the surveyed window". Measured on this tool's first run: GTA V rendered
 5160 frames and reported 0 refused, because 150 s reaches its menus and not its world.
 
-**(2) Admission.** On a title covered by the native-wave32 allowlist, a fragment shader whose reason
-set is exactly `wave-any` is ADMITTED rather than skipped -- `render_runner.h:7140-7155` sets
-`fragment_subgroup_skip = false` and logs `[render] native-width fragment vote:` INSTEAD of the
-skip line. So on `PPSA04263` that class never appears in the REFUSED column at any route or window,
-and wave-any is exactly the class every hit in the corpus belongs to. It is not invisible: it is
-counted separately, as `admitted`. An earlier version of this file said "invisible at any route",
-which was true before the admit line was counted and false afterwards -- printed, at that point,
-immediately beside the column counting it.
-
-(2) is the dangerous one, because (1) alone invites the obvious repair -- "run the Story/Performance
-route and look again" -- which cannot surface a single wave-any shader on that title. So this tool
-also counts the ADMIT line, reported as `admitted` beside `refused`. That number is what the
-allowlist is buying, i.e. what #3464's W5 would extend to other titles.
+**(2) Admission.** General per-vote certificates can lower a guest module to subgroup-independent
+effective bytes. Those modules produce `proven fragment votes` lines instead of refusal lines.
+Count them separately; a reason bit alone is not an admission certificate. Historical native-width
+and partial-wave diagnostic lines are also recognized when reading old logs.
 
 A zero is therefore printed as `none in window`, never `clean`; the window, frame count and admitted
-count print beside every row; and a title on the allowlist says so inline.
+count print beside every row. No title allowlist participates in live admission.
 
 Reason masks come from the emitter and are printed by the renderer, not decoded here: a second
 implementation of the bit names is exactly the drift this project has been bitten by.
@@ -63,17 +54,6 @@ ROUTE_GATED = {
     "PPSA04263": "world is behind the Story/Performance menu route; a default boot surveys menus",
 }
 
-# Titles the renderer admits the wave-any class on (live_renderer.cpp's kNativeFragmentVoteTitles).
-# On these, a fragment shader whose reason set is exactly wave-any is ADMITTED rather than skipped:
-# the renderer logs the admit line instead of the skip line, so that class never appears in the
-# REFUSED column for them -- not with a longer window, not with a route. It is counted, in the
-# ADMITTED column. On every OTHER title the same shader is still refused.
-#
-# Pinned by test_skip_survey.py against the renderer's own list, in whatever form it takes. It has
-# been a single id, then absent, then this array; a pin anchored to any one of those shapes missed
-# the change to the next.
-NATIVE_VOTE_ALLOWLIST = ("PPSA01885", "PPSA02664", "PPSA04263", "PPSA13579", "PPSA25009")
-
 # Both patterns are pinned to the emitter's format strings by test_skip_survey.py, which greps the
 # producing source. A regex that silently stops matching would make every title report zero -- the
 # worst failure this tool has, and one that looks exactly like good news (instrument trap 272).
@@ -82,7 +62,7 @@ NATIVE_VOTE_ALLOWLIST = ("PPSA01885", "PPSA02664", "PPSA04263", "PPSA13579", "PP
 SKIP = re.compile(r"\[render\] skip draw=\d+ fs=([0-9a-f]+): fragment shader requires subgroup "
                   r"size (\d+) .*?why=(\S+)([^)]*)\)")
 # "[render] native-width fragment vote: subgroup 64 -> 32 (why=0x2)" -- the ADMIT line. It is
-# emitted INSTEAD of a skip line, so without counting it an allowlisted title reports a zero that no
+# emitted INSTEAD of a skip line, so without counting it an admitted shader reports a zero that no
 # route or window can correct.
 # Trailing fields are tolerated deliberately. This regex broke once already: the emitter
 # gained an `fs=` field and a pattern anchored on `\(why=...\)` silently matched nothing,
@@ -95,6 +75,8 @@ ADMIT = re.compile(r"\[render\] native-width fragment vote: subgroup (\d+) -> (\
 # as the vote tier is, and reported separately so the two tiers can be told apart.
 ADMIT_PARTIAL = re.compile(r"\[render\] partial-wave fragment: subgroup (\d+) -> (\d+)\.\.(\d+) "
                            r"\(why=(\S+?)[ )]")
+ADMIT_PROVEN = re.compile(r"\[render\] proven fragment votes: subgroup 64 -> independent "
+                         r"\(uniform=(\d+) dead=(\d+) fs=([0-9a-f]+)\)")
 FPS = re.compile(r"\[app\] [\d.]+ fps \((\d+) frames")
 # Belt and braces against the failure that invalidated every routed run before it was noticed: the
 # path is checked before the corpus starts, and the log is checked after each boot, because a file
@@ -162,6 +144,7 @@ def survey(app, dump, seconds, out_dir, route=None):
         shaders[fs_hash] = (int(size), mask, names.strip())
     admitted = ADMIT.findall(text)
     admitted_partial = ADMIT_PARTIAL.findall(text)
+    admitted_proven = ADMIT_PROVEN.findall(text)
     # NOT a "did it draw" test. The fps line prints once per 60 presented frames (main.cpp), so this
     # is 0 for any run that presented fewer than 60 -- which is emphatically not the same as never
     # drawing, and skip lines are emitted from the submit path independently of presentation. It is
@@ -182,8 +165,9 @@ def survey(app, dump, seconds, out_dir, route=None):
         "exited_early": exited_early,
         "returncode": proc.returncode,
         "refused_shaders": len(shaders),
-        "admitted_shaders": len(admitted) + len(admitted_partial),
+        "admitted_shaders": len(admitted) + len(admitted_partial) + len(admitted_proven),
         "admitted_partial_wave_shaders": len(admitted_partial),
+        "admitted_proven_vote_shaders": len(admitted_proven),
         "reasons": collections.Counter("%s %s" % (m, n) for _, m, n in shaders.values()),
         "widths": sorted({s for s, _, _ in shaders.values()}),
         "log": str(log),
@@ -453,17 +437,11 @@ def main() -> int:
         if r["refused_shaders"]:
             notes.append(", ".join("%s x%d" % (k, v) for k, v in r["reasons"].most_common()))
         else:
-            # Never "clean". A zero is scoped to the window AND, on an allowlisted title, to a class
-            # this tool structurally cannot see.
+            # Never "clean". Admission and coverage are reported separately.
             notes.append("none in window")
-        # Per-title again since PR #3480, so the note must name WHICH titles rather than claim all
-        # of them. Saying "every title" while the renderer admits three would hide refusals on the
-        # rest behind a reassuring sentence.
         if r["admitted_shaders"]:
-            notes.append("ALLOWLISTED: wave-any is ADMITTED here (not skipped) -- those %d are in "
+            notes.append("wave modules are ADMITTED here (not skipped) -- those %d are in "
                          "the admitted column, never the refused one" % r["admitted_shaders"])
-        elif r["title"] in NATIVE_VOTE_ALLOWLIST:
-            notes.append("allowlisted for wave-any, but none was admitted in this window")
         if r["title"] in ROUTE_GATED:
             notes.append(ROUTE_GATED[r["title"]])
         if r["exited_early"]:

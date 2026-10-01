@@ -25,6 +25,7 @@
 #include "diagnostics/readback_reason_census.hpp"  // why a colour target is copied back
 #include "diagnostics/perf/perf_ledger.hpp"         // #3891: always-on alarm ledger
 #include "diagnostics/perf/wave64_refusal.hpp"
+#include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include "diagnostics/exit_census.hpp"       // one-line end-of-run reports
 #include "diagnostics/persistent_target_census.hpp"  // is the colour-target cache at its bound?
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
@@ -705,19 +706,12 @@ struct BackendDraw {
     prosper::gpu::SharedShaderWords vs_shared, fs_shared;
     uint64_t vs_identity = 0, fs_identity = 0;
     uint64_t fs_guest_addr = 0; // diagnostic provenance only; zero for direct/override callers
-    // Whether the backend may run a WaveAny-only fragment program at the host's native wave width.
-    //
-    // Set by the live renderer from a TITLE allowlist (live_renderer.cpp). Tests and gpu_replay call
-    // register_live_renderer without a title_id -- it defaults to {} at live_renderer.hpp:156 -- so
-    // they match no entry and keep the strict exact-width contract. That is load-bearing rather than
-    // incidental: gpu_replay gates on expected_output_hash, and an earlier draft of #3480 keyed this
-    // on an env var instead, which admitted in replay and moved its per-submit hash.
+    // Explicit guest-semantic lowering. Strict replay/direct callers never transform captured
+    // words. Live frontends opt into per-vote certificates, independent of the game being run.
+    prosper::gpu::FragmentWavePolicy fragment_wave_policy = prosper::gpu::FragmentWavePolicy::Strict;
+    // Legacy diagnostic/test-only contracts. The live renderer never sets either flag: a reason
+    // bit or an output-width proof alone is NOT authority for the new semantic transformation.
     bool allow_native_fragment_vote_width = false;
-    // Whether the backend may run a fragment program whose wave reasons are all exact on a partially
-    // populated guest wave (rdna2_to_spirv.hpp, kFragmentWavePartialWaveExactReasons) at the host's
-    // native width when the host cannot supply the guest wave. Same default and the same reason for
-    // it as the flag above: only the live renderer sets it, so tests opt in explicitly and gpu_replay
-    // keeps its strict per-submit hashes (#3464).
     bool allow_partial_wave_fragment = false;
     // Stable semantic draw ID from DrawItem::draw_index. Diagnostics must not use this backend
     // vector's pass-local offset: target/compute splitting can make that offset differ per pass.
@@ -1565,6 +1559,8 @@ struct RenderVkCtx {
     bool logic_op_enabled = false; bool ok = false;
     bool geometry_shader_enabled = false;
     bool fragment_stores_atomics = false;
+    // Enabled robust2 plus <=4-byte range rounding: word-buffer OOB reads deterministically zero.
+    bool deterministic_storage_reads = false;
     // Per-draw "fragment funnel" diagnostic (PROSPER_DRAW_STATS): pipeline-statistics + precise
     // occlusion queries. Enabled at device creation only when advertised; inert otherwise.
     bool pipeline_stats_enabled = false;
@@ -1924,6 +1920,8 @@ inline const RenderVkCtx& render_vk_ctx() {
         // Only features not promoted to core still require extension names below.
         std::vector<const char*> dev_exts;
         VkPhysicalDeviceImageRobustnessFeatures irf{};
+        VkPhysicalDeviceRobustness2FeaturesEXT robust2_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
         VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_properties{
@@ -2035,6 +2033,28 @@ inline const RenderVkCtx& render_vk_ctx() {
           std::vector<VkExtensionProperties> de(ne);
           vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, de.data());
           for (uint32_t i = 0; i < ne; i++) {
+              if (!strcmp(de[i].extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) &&
+                  !PROSPER_ENV_ON("PROSPER_NO_ROBUST_BUFFER_ACCESS2")) {
+                  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                  f2.pNext = &robust2_features;
+                  vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+                  if (robust2_features.robustBufferAccess2) {
+                      VkPhysicalDeviceRobustness2PropertiesEXT properties{
+                          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT};
+                      VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+                      p2.pNext = &properties;
+                      vkGetPhysicalDeviceProperties2(r.phys, &p2);
+                      robust2_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+                      robust2_features.robustBufferAccess2 = VK_TRUE;
+                      robust2_features.pNext = const_cast<void*>(dci.pNext);
+                      dci.pNext = &robust2_features;
+                      dev_exts.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+                      // All certified buffers use 4-byte words/ranges and storage-aligned offsets.
+                      // Larger rounding can read padding instead of zero and is not a certificate.
+                      r.deterministic_storage_reads = properties.robustStorageBufferAccessSizeAlignment != 0 &&
+                          properties.robustStorageBufferAccessSizeAlignment <= 4;
+                  }
+              }
               // Geometry-probe (PROSPER_GEOM_PROBE): capture the last pre-rasterization stage. Enable
               // only the base transformFeedback feature; separate geometry streams are not needed.
               if (!strcmp(de[i].extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME)) {
@@ -2115,6 +2135,9 @@ inline const RenderVkCtx& render_vk_ctx() {
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
+        std::fprintf(stderr, "[vk] deterministic storage word reads %s (robustBufferAccess2=%d)\n",
+            r.deterministic_storage_reads ? "ENABLED" : "unavailable",
+            static_cast<int>(robust2_features.robustBufferAccess2));
         if (mesh_features.meshShader) {
             r.cmd_draw_mesh_tasks = reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(
                 vkGetDeviceProcAddr(r.dev, "vkCmdDrawMeshTasksEXT"));
@@ -10572,6 +10595,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         !buffer_verify_enabled && getenv("PROSPER_NO_BACKEND_BUFFER_RESIDENCY") == nullptr &&
         resident_render_buffer_limit() != 0 &&
         resident_render_buffer_configured_owner_limit(ctx.detile_limits.maxMemoryAllocationCount) != 0;
+    // Content authority cannot depend on a residency/performance budget. Vote predicates read
+    // immutable snapshots only if EVERY final stage in this pass has complete negative write proof.
+    bool immutable_fragment_inputs = std::any_of(draws.begin(), draws.end(), [](const BackendDraw& draw) {
+        return draw.fragment_wave_policy == prosper::gpu::FragmentWavePolicy::ProvenVotes;
+    });
     {
         const ResourcePhaseTimer phase_plan(timing_enabled, &res_buffer_range_plan_ms);
         if (share_backend_resources && use_buffer_arena && !buffer_verify_enabled &&
@@ -10588,13 +10616,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
         // New overlap aliasing is safe only with complete whole-pass negative write proof.
         // Reflect only when a consumer needs it, and share the proof with optional residency.
-        if (readonly_buffer_pass || !buffer_range_groups.empty()) {
+        if (readonly_buffer_pass || !buffer_range_groups.empty() || immutable_fragment_inputs) {
             for (const auto& draw : draws) {
                 if (!backend_module_has_readonly_buffers(draw.vs_words(), draw.vs_shared) ||
                     !backend_module_has_readonly_buffers(draw.fs_words(), draw.fs_shared) ||
                     (!draw.gs_words().empty() &&
                      !backend_module_has_readonly_buffers(draw.gs_words()))) {
                     readonly_buffer_pass = false;
+                    immutable_fragment_inputs = false;
                     buffer_range_groups.clear();
                     break;
                 }
@@ -11012,6 +11041,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                  available_fragment_subgroup_features) ||
              (uses_internal_gds && !ctx.fragment_stores_atomics));
         uint32_t subgroup_reasons = UINT32_MAX;
+        std::vector<uint32_t> effective_uncached_fs;
+        const std::vector<uint32_t>* effective_fs = &bd_fs;
+        bool fragment_votes_lowered = false;
         // Diagnostic: write the fragment module this gate just ruled on, so the ADMITTED and
         // SKIPPED populations can be compared offline. Off unless PROSPER_FRAGMENT_WAVE_DUMP names
         // a directory; one file per distinct shader key per verdict.
@@ -11022,12 +11054,57 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             std::snprintf(path, sizeof path, "%s/fragwave_%s_%016llx_why%02x.spv",
                           dir, verdict, (unsigned long long)key, why);
             if (FILE* f = std::fopen(path, "wb")) {
-                std::fwrite(bd_fs.data(), sizeof(uint32_t), bd_fs.size(), f);
+                std::fwrite(effective_fs->data(), sizeof(uint32_t), effective_fs->size(), f);
                 std::fclose(f);
             }
         };
 
         prosper::diagnostics::perf::observe_wave64_shader(required_fragment_subgroup_size, false);
+        if (fragment_subgroup_skip && required_fragment_subgroup_size == 64 &&
+            bd.fragment_wave_policy == prosper::gpu::FragmentWavePolicy::ProvenVotes &&
+            !(uses_internal_gds && !ctx.fragment_stores_atomics)) {
+            // A source identity denotes immutable bytes, but the pass input certificate can change.
+            // Cache both verdicts separately; zero-identity replay/override words are never memoized.
+            static thread_local std::array<std::unordered_map<uint64_t, prosper::gpu::FragmentVoteLowering>, 2> vote_memos;
+            const bool buffer_certificate = immutable_fragment_inputs && ctx.deterministic_storage_reads;
+            auto& memo = vote_memos[buffer_certificate ? 1 : 0];
+            prosper::gpu::FragmentVoteLowering uncached;
+            const prosper::gpu::FragmentVoteLowering* lowered = nullptr;
+            if (bd.fs_identity && !no_subgroup_scan_memo) {
+                auto found = memo.find(bd.fs_identity);
+                if (found == memo.end()) {
+                    if (memo.size() >= kSubgroupScanMemoMaxEntries) memo.clear();
+                    found = memo.emplace(bd.fs_identity,
+                        prosper::gpu::lower_fragment_votes(bd_fs, buffer_certificate, ctx.deterministic_storage_reads)).first;
+                }
+                lowered = &found->second;
+            } else {
+                uncached = prosper::gpu::lower_fragment_votes(bd_fs, buffer_certificate, ctx.deterministic_storage_reads);
+                lowered = &uncached;
+            }
+            if (lowered->refusal == prosper::gpu::FragmentVoteRefusal::None) {
+                // Uncached words must survive until vkCreateShaderModule. Retain them per draw.
+                if (lowered == &uncached) {
+                    // The separate owner below is in the draw-loop scope, unlike this temporary.
+                    effective_uncached_fs = std::move(uncached.words);
+                    effective_fs = &effective_uncached_fs;
+                } else effective_fs = &lowered->words;
+                fragment_votes_lowered = true;
+                required_fragment_subgroup_size = 0;
+                required_fragment_subgroup_features =
+                    prosper::gpu::fragment_spirv_required_subgroup_features(*effective_fs);
+                fragment_subgroup_skip = !prosper::gpu::fragment_subgroup_features_supported(
+                    required_fragment_subgroup_features, available_fragment_subgroup_features);
+                const uint64_t shader_key = bd.fs_identity ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
+                static std::unordered_set<uint64_t> proven_logged;
+                if (proven_logged.insert(shader_key).second) {
+                    std::fprintf(stderr, "[render] proven fragment votes: subgroup 64 -> independent "
+                        "(uniform=%u dead=%u fs=%016llx)\n", lowered->uniform_votes, lowered->dead_votes,
+                        (unsigned long long)shader_key);
+                    dump_fragment_wave_module("lowered", shader_key, 0);
+                }
+            }
+        }
         if (fragment_subgroup_skip &&
             (bd.allow_native_fragment_vote_width || bd.allow_partial_wave_fragment) &&
             (ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
@@ -11048,8 +11125,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             // as over one 64-lane wave? See rdna2_to_spirv.hpp for the two grounds a vote clears on
             // and for why value reachability alone was not one of them.
             //
-            // Per MODULE, not per title -- the title allowlist in live_renderer.cpp only stages
-            // which titles are surveyed. Measured across four titles, 38 of 49 modules reporting
+            // Legacy diagnostic-only route; live frontends select ProvenVotes above, never these
+            // flags. The historical title staging list has been removed. Across four titles, 38 of 49 modules reporting
             // exactly WaveAny are provably width-independent and 11 are not, and the split runs
             // through titles rather than between them (Blue Prince 18 of 22, Blasphemous 2 1 of 8).
             // A title-wide answer would be wrong in both directions.
@@ -13242,12 +13319,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 for (uint32_t word : bd_vs) append(word);
             }
             append(bd.fs_identity != 0);
+            append(fragment_votes_lowered); // source identity alone does not name effective bytes
             if (bd.fs_identity) {
                 append(static_cast<uint32_t>(bd.fs_identity));
                 append(static_cast<uint32_t>(bd.fs_identity >> 32));
             } else {
-                append(static_cast<uint32_t>(bd_fs.size()));
-                for (uint32_t word : bd_fs) append(word);
+                append(static_cast<uint32_t>(effective_fs->size()));
+                for (uint32_t word : *effective_fs) append(word);
             }
             append(required_fragment_subgroup_size);
             append(static_cast<uint32_t>(bd_gs.size()));
@@ -13374,7 +13452,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
             v.vs = mkmod(bd_vs, bd.mesh_draw ? "ms" : "vs", bd.vs_identity);
             v.gs = bd_gs.empty() ? VK_NULL_HANDLE : mkmod(bd_gs, "gs", 0);
-            v.fs = mkmod(bd_fs, "fs", bd.fs_identity);
+            v.fs = mkmod(*effective_fs, fragment_votes_lowered ? "fs-proven" : "fs", bd.fs_identity);
             if (backend_trace) {
                 fprintf(stderr,
                         "[backend-trace] draw=%zu create-shaders end vs=%p gs=%p fs=%p\n",

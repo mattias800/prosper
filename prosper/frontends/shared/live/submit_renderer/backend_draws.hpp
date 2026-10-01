@@ -16,8 +16,7 @@ namespace prosper::frontend::submit_renderer {
 
 // The submit callback's state that build_backend_draws reads and writes, one reference per object.
 struct BackendDrawContext {
-    const bool& native_fragment_vote_width;
-    const bool& partial_wave_fragment;
+    const prosper::gpu::FragmentWavePolicy& fragment_wave_policy;
     const prosper::gpu::LiveRenderPhase& phase;
     const bool& rtt_log;
     RenderTiming& pending_timing;

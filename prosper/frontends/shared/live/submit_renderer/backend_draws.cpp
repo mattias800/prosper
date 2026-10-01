@@ -8,8 +8,7 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
                                                             const std::vector<const prosper::gpu::DrawItem*>& group,
                                                             prosper::test::BackendSubmissionBatch* producer_batch) {
     // Every name the moved body used from the callback, bound once to the same object.
-    auto& native_fragment_vote_width = ctx.native_fragment_vote_width;
-    auto& partial_wave_fragment = ctx.partial_wave_fragment;
+    auto& fragment_wave_policy = ctx.fragment_wave_policy;
     auto& phase = ctx.phase;
     auto& rtt_log = ctx.rtt_log;
     auto& pending_timing = ctx.pending_timing;
@@ -210,9 +209,7 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
         bd.vs_identity = refvs ? 0 : it.vs_identity;
         bd.fs_identity = fs_ov ? 0 : it.fs_identity;
         bd.fs_guest_addr = fs_ov ? 0 : it.fs_guest_addr;
-        bd.allow_native_fragment_vote_width =
-            !fs_ov && native_fragment_vote_width;
-        bd.allow_partial_wave_fragment = !fs_ov && partial_wave_fragment;
+        bd.fragment_wave_policy = fs_ov ? prosper::gpu::FragmentWavePolicy::Strict : fragment_wave_policy;
         bd.draw_index = it.draw_index;
         bd.command_order = it.command_order;
         bd.vcount = refvs ? 3u : it.vertex_count;

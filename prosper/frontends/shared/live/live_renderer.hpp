@@ -16,6 +16,7 @@
 #include "shared/texture/texture_decode_cache_policy.hpp"
 #include "shared/texture/texture_decode_diagnostic.hpp"
 #include "gpu/execute/gpu_execute.hpp"          // GuestGpuWriteQuery — the in-submit mutation proof
+#include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 
 namespace prosper::frontend {
 
@@ -195,7 +196,7 @@ bool texture_source_snapshot_can_follow_watch(bool source_matches_pixels,
 // caller explicitly requests dumps.
 void register_live_renderer(const std::string& frame_dir = ".",
                             bool dump_bmps = kFrameDumpsByDefault,
-                            const std::string& title_id = {});
+                            prosper::gpu::FragmentWavePolicy wave_policy = prosper::gpu::FragmentWavePolicy::Strict);
 
 // #2215: which OS thread is currently inside a live submit-render callback, or 0.
 //
