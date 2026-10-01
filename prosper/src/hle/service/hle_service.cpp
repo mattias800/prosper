@@ -35,6 +35,7 @@
 #include <thread>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <new>          // std::bad_alloc — the guest file-replacement buffer is guest-sized (#1955)
 #include <set>
@@ -753,10 +754,11 @@ static constexpr uint64_t PLAYGO_ERR_BAD_POINTER = 0x80B2000Aull;
 static constexpr uint64_t PLAYGO_ERR_BAD_SIZE    = 0x80B2000Bull;
 static constexpr uint64_t PLAYGO_ERR_BAD_CHUNK_ID = 0x80B2000Cull;
 
-// Most PS5 dumps do not include sce_sys/playgo-chunk.dat, but UE IoStore preserves the same chunk
-// ids in paired pakchunk<N>-*.utoc/.ucas files. Keep the PlayGo answers internally consistent with
-// the content that is actually present: GetChunkId enumerates these ids and GetLocus/GetProgress
-// reject everything else.
+// A local PS5 PlayGo manifest declares chunk ids by their record ordinals. If it is absent, UE
+// IoStore preserves chunk ids in paired pakchunk<N>-*.utoc/.ucas files. Keep GetChunkId and the
+// GetLocus/GetProgress validators on the same inventory; a malformed present manifest must not
+// widen that inventory through a filename fallback. The existing local-installation and progress
+// size policies below are unchanged: this declaration does not verify every payload byte.
 // Returning LOCAL_FAST for every possible u16 made DOLL probe through its 1000-id safety cap and left
 // its optional-content state unresolved even though pakchunk1 had mounted successfully (#1373).
 static std::vector<uint16_t> discover_playgo_chunks() {
@@ -766,6 +768,51 @@ static std::vector<uint16_t> discover_playgo_chunks() {
     bool saw_iostore_index = false;
     std::error_code ec;
     const fs::path app0(resolve_guest_path("/app0"));
+
+    // CONFIDENCE: HIGH — the fixed plgx header/table fields agree across nine local PS5
+    // declarations; 007 queries ordinal 1 from its two-record manifest (#4030). Read only the
+    // fixed header, validate the table against both the declared and actual extent, and bound
+    // the inventory by its u16 count. No package ranges or payload allocation are needed here.
+    const fs::path manifest_path = app0 / "sce_sys" / "playgo-chunk.dat";
+    const bool has_manifest = fs::exists(manifest_path, ec);
+    if (has_manifest || ec) {
+        auto reject = [&](const char* reason) {
+            std::fprintf(stderr, "[playgo] /app0/sce_sys/playgo-chunk.dat: %s; "
+                                 "no chunk identifiers accepted\n", reason);
+            return chunks;
+        };
+        if (ec) return reject("cannot inspect manifest");
+        if (!fs::is_regular_file(manifest_path, ec) || ec)
+            return reject("manifest is not a readable regular file");
+        std::ifstream manifest(manifest_path, std::ios::binary | std::ios::ate);
+        if (!manifest) return reject("cannot read manifest");
+        const std::streamoff actual_size = manifest.tellg();
+        uint8_t header[0x100]{};
+        if (actual_size < (std::streamoff)sizeof header) return reject("truncated header");
+        manifest.seekg(0);
+        if (!manifest.read((char*)header, sizeof header)) return reject("cannot read header");
+        auto u16 = [&](size_t at) -> uint16_t {
+            return (uint16_t)(header[at] | ((uint16_t)header[at + 1] << 8));
+        };
+        auto u32 = [&](size_t at) -> uint32_t {
+            return (uint32_t)header[at] | ((uint32_t)header[at + 1] << 8) |
+                   ((uint32_t)header[at + 2] << 16) | ((uint32_t)header[at + 3] << 24);
+        };
+        if (std::memcmp(header, "plgx", 4) != 0) return reject("unsupported magic");
+        if (u32(0x04) != 0x1000) return reject("unsupported version");
+        const uint32_t declared_size = u32(0x10);
+        const uint32_t count = u16(0x0a);
+        const uint32_t table_offset = u32(0xc0);
+        const uint32_t table_size = u32(0xc4);
+        if (declared_size < sizeof header || declared_size > (uint64_t)actual_size)
+            return reject("invalid declared file extent");
+        if (table_size != count * 0x20u || table_offset < sizeof header ||
+            table_offset > declared_size || table_size > declared_size - table_offset)
+            return reject("invalid chunk-table extent");
+        chunks.reserve(count);
+        for (uint32_t id = 0; id < count; ++id) chunks.push_back((uint16_t)id);
+        return chunks;
+    }
 
     auto lower = [](std::string value) {
         std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -854,7 +901,7 @@ static bool playgo_has_chunk(uint16_t id) {
 HLE(s_playgo_init)  { svc_log("scePlayGoInitialize", a0,a1,a2,a3,a4,a5);
                       g_playgo_chunks = discover_playgo_chunks();
                       if (svclog()) {
-                          std::fprintf(stderr, "[svc] PlayGo discovered %zu installed chunk(s):",
+                          std::fprintf(stderr, "[svc] PlayGo discovered %zu chunk identifier(s):",
                                        g_playgo_chunks.size());
                           for (uint16_t id : g_playgo_chunks) std::fprintf(stderr, " %u", id);
                           std::fputc('\n', stderr);
