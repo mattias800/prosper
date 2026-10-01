@@ -1078,6 +1078,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_sync_delete PRIVATE prosper_core)
   add_test(NAME sync_delete COMMAND test_sync_delete)
 
+  # Empty PollSema returns the encoded EBUSY value that guest drain loops require (#1640).
+  add_executable(test_kernel_sema_poll tests/hle/kernel/test_kernel_sema_poll.cpp)
+  target_link_libraries(test_kernel_sema_poll PRIVATE prosper_core)
+  add_test(NAME kernel_sema_poll COMMAND test_kernel_sema_poll)
+
   # Anchored wall-clock sources (#92): CLOCK_REALTIME ≈ host now, one shared epoch across
   # time()/gettimeofday/sceRtc*, FreeBSD clockid mapping, valid LocalTime calendar dates.
   add_executable(test_wall_clock tests/hle/test_wall_clock.cpp)
