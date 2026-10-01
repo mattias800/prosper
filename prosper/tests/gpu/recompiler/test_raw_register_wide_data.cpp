@@ -170,14 +170,16 @@ int main(int argc, char** argv) {
           "replay preserves the rebased range and its owned current bytes");
     if (!encoded.empty()) {
         auto legacy = encoded;
-        legacy.resize(legacy.size() - 5u); // count plus this resource's v62 marker
+        // No draws: remove the v63 zero-count suffix, then the v62 count/resource marker.
+        legacy.resize(legacy.size() - 4u - 5u);
         legacy[8] = 61u;
         CHECK(deserialize_gpu_capture(legacy, decoded, error) &&
               !decoded.computes[0].resources.resources[0].resource.raw_register_snapshot,
               "v61 capture leaves the new backing admission unavailable");
         auto malformed = encoded;
-        malformed.back() = 2u;
-        CHECK(!deserialize_gpu_capture(malformed, decoded, error),
+        malformed[malformed.size() - 5u] = 2u;
+        CHECK(!deserialize_gpu_capture(malformed, decoded, error) &&
+              error == "invalid raw register snapshot state",
               "codec refuses an invented marker encoding");
     }
     capture.computes[0].resources.resources[0].resource.size = 12u;

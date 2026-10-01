@@ -2886,6 +2886,11 @@ endif()
   target_link_libraries(test_gpu_capture PRIVATE prosper_core)
   add_test(NAME gpu_capture_roundtrip COMMAND test_gpu_capture)
 
+  # Actual CPU draw realization -> capture -> replay retains guest width independently of SPIR-V.
+  add_executable(test_realized_fragment_width tests/gpu/execute/test_realized_fragment_width.cpp)
+  target_link_libraries(test_realized_fragment_width PRIVATE prosper_core)
+  add_test(NAME realized_fragment_width_capture COMMAND test_realized_fragment_width)
+
   add_executable(test_gpu_capture_bundle tests/gpu/capture/test_gpu_capture_bundle.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_gpu_capture_bundle PRIVATE tests)

@@ -213,6 +213,11 @@ struct GpuCapturedDraw {
     PixelSystemInputMapping system_inputs{};
     bool has_pixel_inputs = false;
     bool has_system_inputs = false;
+    // v63: actual guest fragment launch width supplied at realization's compiler boundary.
+    // Distinct from stored/effective SPIR-V subgroup width and a replay diagnostic override.
+    // Pre-v63 and externally supplied draws remain explicitly unavailable.
+    bool fragment_wave_config_available = false;
+    bool ps_wave32 = false;
 };
 
 struct GpuCapturedCompute {

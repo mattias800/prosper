@@ -182,7 +182,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // existing v60 pixel-input mapping supplies the remaining interpolation dependency.
 // v62: exact-PC raw register-offset scalar snapshots. Older resources retain false and cannot
 // authorize the rebased numeric load path.
-constexpr uint32_t kVersion = 62;
+// v63 (#4041): realized draws retain the actual compile-time guest fragment wave width, with
+// explicit unavailable state. This does not describe the effective backend SPIR-V subgroup width.
+constexpr uint32_t kVersion = 63;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;

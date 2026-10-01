@@ -1158,6 +1158,16 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (const auto& diagnostic : c.failure_diagnostics)
         for (const auto& stage : diagnostic.stages)
             if (!write_raw_register_snapshots(stage.resource_table)) return false;
+    // v63: exactly one canonical width tag per bounded realized draw: 0 unavailable, 1 Wave64,
+    // 2 Wave32. Keep all previous record prefixes unchanged, including failed-stage retry state.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) {
+        if (!draw.fragment_wave_config_available && draw.ps_wave32) {
+            error = "invalid realized-draw fragment wave config";
+            return false;
+        }
+        w.u8(draw.fragment_wave_config_available ? (draw.ps_wave32 ? 2u : 1u) : 0u);
+    }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

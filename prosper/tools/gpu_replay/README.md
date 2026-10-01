@@ -646,14 +646,18 @@ A/B is partial, never silent. Composes with `PROSPER_FS_TAP` (masked during the 
 block keeps exclusive ownership of its semantic draw). Interface hints are re-derived from the raw streams,
 the same contract as the probes above.
 
-**Requested fragment width is not captured width.** Realized draws do not currently retain
-`SPI_PS_IN_CONTROL.PS_W32_EN`. Both `--recompile-raw` and `PROSPER_FS_TAP` therefore use the legacy
-requested Wave64 default, or the explicit diagnostic override
-`PROSPER_GPU_REPLAY_FRAGMENT_WAVE_SIZE=32|64`. The override uses strict base-0 unsigned syntax;
+**Guest compile width, requested override and effective subgroup width are distinct.** Capture v63+
+retains each realized draw's actual compile-time `SPI_PS_IN_CONTROL.PS_W32_EN` and explicit
+availability. Both `--recompile-raw` and `PROSPER_FS_TAP` choose the explicit diagnostic override
+`PROSPER_GPU_REPLAY_FRAGMENT_WAVE_SIZE=32|64` first, otherwise the captured width, otherwise the
+historical requested Wave64 default. Pre-v63 and externally supplied draws without provenance remain
+unavailable; a stored SPIR-V width marker is never used to invent a guest launch ABI.
+The override uses strict base-0 unsigned syntax;
 signs, whitespace, suffixes, overflow and other widths are rejected with exit status 2, not silently
-replaced. Each regeneration mode reports `fragment-wave=32|64`, `source=override|legacy-default`
-and `captured-width=unavailable`. These graphics experiments do not establish faithful per-draw
-width or complete compilation-input fidelity, even when every module is substituted. Failed-stage
+replaced. Each regeneration mode reports a per-draw `fragment-wave=32|64`,
+`source=override|captured|legacy-default` and `captured-width=32|64|unavailable`, including opposing
+overrides. This is the guest width requested of recompilation, not a guarantee of the resulting
+effective SPIR-V/backend subgroup width or complete compilation-input fidelity. Failed-stage
 fragment retries are separate: they use their captured v61+ PS width when available and ignore this
 realized-draw override. A plain stored-SPIR-V replay does not regenerate or change shader width.
 
