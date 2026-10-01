@@ -7,21 +7,36 @@
 #include <cerrno>
 #include <cstdio>
 #include <exception>
+#include <iostream>
 #include <string>
 
 using namespace prosper;
 namespace {
 enum class Failure { None, EndSeek, Tell, StartSeek };
-Failure failure = Failure::None;
-bool observing = false;
-FILE* observed_file = nullptr;
-int end_seeks = 0, tells = 0, start_seeks = 0, reads = 0, closes = 0;
-int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("[FAIL] %s\n", m); ++fails; } \
+struct IoState {
+    Failure failure = Failure::None;
+    bool observing = false;
+    FILE* observed_file = nullptr;
+    int end_seeks = 0;
+    int tells = 0;
+    int start_seeks = 0;
+    int reads = 0;
+    int closes = 0;
+    int fails = 0;
+};
+IoState& io() { static IoState state; return state; }
+#define CHECK(c, m) do { if (!(c)) { std::printf("[FAIL] %s\n", m); ++io().fails; } \
                         else std::printf("[ok] %s\n", m); } while (0)
 void begin(Failure value) {
-    failure = value; observing = true; observed_file = nullptr;
-    end_seeks = tells = start_seeks = reads = closes = 0;
+    auto& s = io();
+    s.failure = value;
+    s.observing = true;
+    s.observed_file = nullptr;
+    s.end_seeks = 0;
+    s.tells = 0;
+    s.start_seeks = 0;
+    s.reads = 0;
+    s.closes = 0;
 }
 } // namespace
 
@@ -31,48 +46,48 @@ long __real_ftell(FILE*);
 size_t __real_fread(void*, size_t, size_t, FILE*);
 int __real_fclose(FILE*);
 int __wrap_fseek(FILE* file, long offset, int whence) {
-    if (observing) {
-        observed_file = file;
+    if (io().observing) {
+        io().observed_file = file;
         if (whence == SEEK_END) {
-            ++end_seeks;
-            if (failure == Failure::EndSeek) { errno = ESPIPE; return -1; }
+            ++io().end_seeks;
+            if (io().failure == Failure::EndSeek) { errno = ESPIPE; return -1; }
         } else if (whence == SEEK_SET) {
-            ++start_seeks;
-            if (failure == Failure::StartSeek) { errno = EIO; return -1; }
+            ++io().start_seeks;
+            if (io().failure == Failure::StartSeek) { errno = EIO; return -1; }
         }
     }
     return __real_fseek(file, offset, whence);
 }
 long __wrap_ftell(FILE* file) {
-    if (observing && file == observed_file) {
-        ++tells;
-        if (failure == Failure::Tell) { errno = EIO; return -1; }
+    if (io().observing && file == io().observed_file) {
+        ++io().tells;
+        if (io().failure == Failure::Tell) { errno = EIO; return -1; }
     }
     return __real_ftell(file);
 }
 size_t __wrap_fread(void* data, size_t size, size_t count, FILE* file) {
-    if (observing && file == observed_file) ++reads;
+    if (io().observing && file == io().observed_file) ++io().reads;
     return __real_fread(data, size, count, file);
 }
 int __wrap_fclose(FILE* file) {
-    if (observing && file == observed_file) { ++closes; observed_file = nullptr; }
+    if (io().observing && file == io().observed_file) { ++io().closes; io().observed_file = nullptr; }
     return __real_fclose(file);
 }
 }
 
 namespace {
 void finish() {
-    observing = false;
+    io().observing = false;
     // The original negative-ftell implementation throws before closing. Clean up that red
     // control after recording the missing close, so even the failing test remains disposable.
-    if (observed_file) { __real_fclose(observed_file); observed_file = nullptr; }
+    if (io().observed_file) { __real_fclose(io().observed_file); io().observed_file = nullptr; }
 }
 void check_failure_operations(Failure value) {
-    CHECK(end_seeks == 1, "the end seek was exercised exactly once");
-    CHECK(tells == (value == Failure::EndSeek ? 0 : 1), "stop sizing after the first failed operation");
-    CHECK(start_seeks == (value == Failure::StartSeek ? 1 : 0), "do not seek again after sizing failure");
-    CHECK(reads == 0, "a failed sizing or seek operation never reaches fread");
-    CHECK(closes == 1, "close the module stream exactly once on failure");
+    CHECK(io().end_seeks == 1, "the end seek was exercised exactly once");
+    CHECK(io().tells == (value == Failure::EndSeek ? 0 : 1), "stop sizing after the first failed operation");
+    CHECK(io().start_seeks == (value == Failure::StartSeek ? 1 : 0), "do not seek again after sizing failure");
+    CHECK(io().reads == 0, "a failed sizing or seek operation never reaches fread");
+    CHECK(io().closes == 1, "close the module stream exactly once on failure");
 }
 } // namespace
 
@@ -82,44 +97,52 @@ int main() {
     spec.exports = { nid_hash("prosperIoControl") };
     std::string err;
     CHECK(prosper_test::write_synth_prx(path, spec, &err), "write a valid synthetic module");
-    if (fails) return 1;
+    if (io().fails) return 1;
 
     begin(Failure::None);
     const auto control = Module::load(path, &err);
     CHECK(control && control->file.size() == prosper_test::kSynthFileSize,
           "positive control: the same regular module parses with no injected failure");
-    CHECK(end_seeks == 1 && tells == 1 && start_seeks == 1 && reads == 1 && closes == 1,
+    CHECK(io().end_seeks == 1 && io().tells == 1 && io().start_seeks == 1 && io().reads == 1 && io().closes == 1,
           "positive control: all operation interceptors observe the real module load");
     finish();
     Program linked;
-    CHECK(link_program({{path, 0x400000000ull}}, 0x700000000ull, 0x7c0000000ull, linked, &err) &&
+    CHECK(link_program({{path, 0x400000000ULL}}, 0x700000000ULL, 0x7c0000000ULL, linked, &err) &&
           linked.mods.size() == 1 && !linked.imgs[0].mem.empty(),
           "positive control: the module links into a nonempty image");
 
-    for (const auto value : {Failure::EndSeek, Failure::Tell, Failure::StartSeek}) {
-        const char* expected = value == Failure::EndSeek ? "cannot seek to end of file" :
-                               value == Failure::Tell ? "cannot determine file size" :
-                                                        "cannot seek to start of file";
+    struct TestCase { Failure failure; const char* error; };
+    const TestCase cases[] = {
+        {Failure::EndSeek, "cannot seek to end of file"},
+        {Failure::Tell, "cannot determine file size"},
+        {Failure::StartSeek, "cannot seek to start of file"},
+    };
+    for (const auto& test : cases) {
         err.clear();
-        begin(value);
-        bool refused = false, threw = false;
-        try { refused = !Module::load(path, &err); }
-        catch (const std::exception&) { threw = true; }
-        CHECK(refused && !threw && err == expected, "the failed operation returns its loader error without throwing");
-        check_failure_operations(value);
+        begin(test.failure);
+        try {
+            CHECK(!Module::load(path, &err) && err == test.error,
+                  "the failed operation returns its loader error without throwing");
+        } catch (const std::exception&) {
+            CHECK(false, "Module::load threw instead of returning a loader error");
+        }
+        check_failure_operations(test.failure);
         finish();
 
-        begin(value);
-        err.clear(); Program out;
-        refused = false; threw = false;
-        try { refused = !link_program({{path, 0x400000000ull}}, 0x700000000ull, 0x7c0000000ull, out, &err); }
-        catch (const std::exception&) { threw = true; }
-        CHECK(refused && !threw && err == "load " + path + ": " + expected,
-              "link_program propagates the failed operation and module path to its caller");
+        begin(test.failure);
+        err.clear();
+        Program out;
+        try {
+            CHECK(!link_program({{path, 0x400000000ULL}}, 0x700000000ULL, 0x7c0000000ULL, out, &err) &&
+                  err == "load " + path + ": " + test.error,
+                  "link_program propagates the failed operation and module path to its caller");
+        } catch (const std::exception&) {
+            CHECK(false, "link_program threw instead of propagating a loader error");
+        }
         CHECK(out.mods.empty() && out.imgs.empty(), "a failed module load does not publish an image");
-        check_failure_operations(value);
+        check_failure_operations(test.failure);
         finish();
     }
-    std::printf("failures: %d\n", fails);
-    return fails ? 1 : 0;
+    std::cout << "failures: " << io().fails << '\n';
+    return io().fails ? 1 : 0;
 }
