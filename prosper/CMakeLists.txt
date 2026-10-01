@@ -3266,6 +3266,18 @@ endif()
       add_test(NAME fragment_partial_wave_exec COMMAND test_fragment_partial_wave_exec)
       set_tests_properties(fragment_partial_wave_exec PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 
+      add_executable(test_fragment_numeric_mbcnt tests/gpu/execute/test_fragment_numeric_mbcnt.cpp)
+      target_include_directories(test_fragment_numeric_mbcnt PRIVATE tests frontends)
+      target_link_libraries(test_fragment_numeric_mbcnt PRIVATE prosper_live_renderer)
+      add_test(NAME fragment_numeric_mbcnt COMMAND test_fragment_numeric_mbcnt)
+      set_tests_properties(fragment_numeric_mbcnt PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+      add_executable(test_numeric_mbcnt tests/gpu/execute/test_numeric_mbcnt.cpp)
+      target_include_directories(test_numeric_mbcnt PRIVATE tests)
+      target_link_libraries(test_numeric_mbcnt PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME numeric_mbcnt COMMAND test_numeric_mbcnt)
+      set_tests_properties(numeric_mbcnt PROPERTIES TIMEOUT 60)
+
       add_executable(test_portable_wave64_mask_reductions
                      tests/gpu/execute/test_portable_wave64_mask_reductions.cpp)
       target_include_directories(test_portable_wave64_mask_reductions PRIVATE tests)
@@ -4048,6 +4060,18 @@ endif()
       target_link_libraries(test_fragment_partial_wave_exec PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME fragment_partial_wave_exec COMMAND test_fragment_partial_wave_exec)
       set_tests_properties(fragment_partial_wave_exec PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+      add_executable(test_fragment_numeric_mbcnt tests/gpu/execute/test_fragment_numeric_mbcnt.cpp)
+      target_include_directories(test_fragment_numeric_mbcnt PRIVATE tests frontends)
+      target_link_libraries(test_fragment_numeric_mbcnt PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME fragment_numeric_mbcnt COMMAND test_fragment_numeric_mbcnt)
+      set_tests_properties(fragment_numeric_mbcnt PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+      add_executable(test_numeric_mbcnt tests/gpu/execute/test_numeric_mbcnt.cpp)
+      target_include_directories(test_numeric_mbcnt PRIVATE tests)
+      target_link_libraries(test_numeric_mbcnt PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME numeric_mbcnt COMMAND test_numeric_mbcnt)
+      set_tests_properties(numeric_mbcnt PROPERTIES TIMEOUT 60)
 
       # Render a frame where BOTH vertex + pixel shaders are recompiled from RDNA2.
       add_executable(test_recompiled_shaders tests/gpu/recompiler/test_recompiled_shaders.cpp)

@@ -5177,26 +5177,18 @@ int main() {
     printf("  [ok]   #1474: partially-overlapping fragment loops lower through the CFG dispatcher, "
            "exporting exactly once\n");
 
-    // The fail-visible backstop still has to work. A cross-lane MBCNT inside the same region
-    // disqualifies the per-invocation dispatcher — inside a dispatcher case the lanes of one subgroup
-    // sit at different guest blocks, so MBCNT's subgroup exclusive scan would be answering for a wave
-    // that is not there. See the `reason=mbcnt-cross-lane` reject in rdna2_to_spirv.cpp; if graphics
-    // ever gains a synchronized common phase that closes the gap, this assertion fails LOUDLY rather
-    // than silently losing the reject coverage. With the narrow structurizer already rejecting, a
-    // loud reject is the only remaining outcome. The compute-side #590 case keeps an s_barrier in its
-    // region for the same purpose (test_rdna2_to_spirv.cpp).
-    //
-    // Branch offsets are re-based for the MBCNT's two dwords, and the MBCNT sits on the REACHABLE
-    // path (pc5's fallthrough), not in the dead region above. Dropping it makes this stream lower,
-    // which is what makes the guard real rather than decorative.
-    const uint32_t overlapping_loops_cross_lane[] = {
+    // Numeric MBCNT is local source-word arithmetic, including inside crossing CFG regions. The
+    // same-site EXEC_LO mutation is still a peer-population scan and must reject: dispatcher lanes
+    // may sit at different guest blocks, so their dynamic subgroup scan is not the guest wave.
+    // Branch offsets account for MBCNT's two dwords; pc6 is on pc5's reachable fallthrough.
+    const uint32_t overlapping_loops_numeric[] = {
         0xbe800380u,               //  0: s_mov_b32 s0, 0
         0x7e020284u,               //  1: v_mov_b32 v1, 4
         0x7da20200u,               //  2: A_HDR: v_cmpx_lt_u32 s0, v1
         0xbf880008u,               //  3: s_cbranch_execz +8 -> 12 (export)
         0x7da20200u,               //  4: B_HDR: v_cmpx_lt_u32 s0, v1
         0xbf880008u,               //  5: s_cbranch_execz +8 -> 14 (endpgm)
-        0xd7650004u, 0x000100c1u,  //  6: v_mbcnt_lo_u32_b32 v4, -1, 0  (cross-lane)
+        0xd7650004u, 0x00010083u,  //  6: v_mbcnt_lo_u32_b32 v4, 3, 0  (local DATA)
         0x81008100u,               //  8: s0++
         0xbf82fff8u,               //  9: s_branch -8 -> 2  (A back-edge; A = [2,9])
         0x81008100u,               // 10: s0++
@@ -5204,13 +5196,27 @@ int main() {
         0xf800180fu, 0x05020302u,  // 12: exp mrt0
         0xbf810000u,               // 14: s_endpgm
     };
-    if (!recompile_fragment(overlapping_loops_cross_lane,
-                            std::size(overlapping_loops_cross_lane)).empty()) {
-        printf("  [FAIL] #1474: cross-lane MBCNT inside an unstructured fragment region must "
-               "REJECT, not lower through the per-invocation dispatcher\n");
+    const auto numeric_cfg = recompile_fragment(overlapping_loops_numeric,
+                                                std::size(overlapping_loops_numeric));
+    if (numeric_cfg.empty() || !has_opcode(numeric_cfg, 251) || !has_opcode(numeric_cfg, 205) ||
+        !type_result_ids_are_nonzero(numeric_cfg, nullptr) || !phi_ids_are_nonzero(numeric_cfg) ||
+        output_store_stats(numeric_cfg).stores != 1) {
+        printf("  [FAIL] numeric MBCNT in a crossing fragment CFG must lower locally and export once\n");
         return 1;
     }
-    printf("  [ok]   #1474: cross-lane op in an unstructured fragment region still rejects loudly\n");
+    std::vector<uint32_t> same_site(std::begin(overlapping_loops_numeric),
+                                    std::end(overlapping_loops_numeric));
+    same_site[7] = 0x000100c1u; // all-ones source: physical lane-ID fast path, no peer scan
+    if (recompile_fragment(same_site.data(), same_site.size()).empty()) {
+        printf("  [FAIL] all-ones MBCNT lane ID in a crossing fragment CFG must remain local\n");
+        return 1;
+    }
+    same_site[7] = 0x0001007eu; // EXEC_LO is a live Boolean-domain mask, not numeric DATA
+    if (!recompile_fragment(same_site.data(), same_site.size()).empty()) {
+        printf("  [FAIL] #1474: peer-mask MBCNT inside an unstructured fragment region must reject\n");
+        return 1;
+    }
+    printf("  [ok]   #1474: local numeric/lane-ID MBCNT compiles; same-site peer-mask scan rejects\n");
 
     // The graphics CFG dispatcher must retain the fragment shell's already-proven alpha-test
     // linearization.  This reduced Astro Bot shape prefixes the crossing-region CFG above with a

@@ -788,6 +788,9 @@ struct SpirvCompute {
     uint32_t fragment_wave_ballot_half(uint32_t mask_bit, uint32_t half);
     uint32_t subgroup_id();
     uint32_t fragment_mbcnt(uint32_t mask_bit, uint32_t acc_bits, bool lo);
+    // Numeric MBCNT counts physical source bits, not participating invocations. This lowering
+    // only needs the current invocation's architectural lane position and is valid in divergence.
+    uint32_t numeric_mbcnt(uint32_t source_bits, uint32_t acc_bits, bool lo);
     uint32_t native_wave_any(uint32_t value);
     // One 32-bit HALF of the guest wave mask, materialised from this lane's bool (#2420).
     // OpGroupNonUniformBallot returns a uvec4 whose .x/.y are lanes 0..31 / 32..63 OF THIS SUBGROUP,

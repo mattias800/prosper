@@ -125,6 +125,25 @@ uint32_t SpirvCompute::subgroup_id() {
         return subgroup;
     }
 
+uint32_t SpirvCompute::numeric_mbcnt(uint32_t source_bits, uint32_t acc_bits, bool lo) {
+        // AMD RDNA2 ISA 70648, 12.12, ops 869/870: ThreadMask is a physical bit-position
+        // prefix. Explicit source bits remain set even if their lanes are inactive or helpers.
+        const uint32_t lane = ibin(Op_BitwiseAnd, guest_lane_id(), uconst(wave_size - 1));
+        const uint32_t high = ucmp(Op_UGreaterThanEqual, lane, uconst(32));
+        const uint32_t width = lo
+            ? sel(high, uconst(32), lane)
+            : sel(high, ibin(Op_ISub, lane, uconst(32)), uconst(0));
+        // Both OpSelect operands are evaluated. Mask the shift itself, not just its result, so
+        // LO at lanes 32..63 never emits an undefined shift by 32.
+        const uint32_t partial = ibin(Op_ISub,
+            ibin(Op_ShiftLeftLogical, uconst(1),
+                 ibin(Op_BitwiseAnd, width, uconst(31))), uconst(1));
+        const uint32_t prefix = sel(ucmp(Op_IEqual, width, uconst(32)),
+                                    uconst(UINT32_MAX), partial);
+        const uint32_t count = iun(Op_BitCount, ibin(Op_BitwiseAnd, source_bits, prefix));
+        return ibin(Op_IAdd, acc_bits, count);
+    }
+
 uint32_t SpirvCompute::fragment_mbcnt(uint32_t mask_bit, uint32_t acc_bits, bool lo) {
         if (!is_fragment) return 0;
         const uint32_t lane = subgroup_local_id();

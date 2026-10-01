@@ -5133,6 +5133,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // its accumulator unchanged. This is the scalar counterpart of recompile_vertex's
                 // existing s3=1 (one ES vertex, no GS primitive) ABI model.
                 vreg[in.dst.value] = val(in.src[1]);
+            } else if ((in.opcode == 0x365 || in.opcode == 0x366) &&
+                       (b.is_compute || b.is_fragment) &&
+                       !(in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) &&
+                       (mbcnt_has_intrinsic_numeric_source(in) ||
+                        mbcnt_has_scalar_numeric_source(rs, in.src[0]))) {
+                // A numeric source word is local DATA. Scanning peer invocations would instead
+                // count their execution population (and could discard helper/inactive bits).
+                // Preserve the existing all-ones lane-ID fast path below; other numeric masks
+                // use the ISA's physical prefix directly, without `allow_wave` or barriers.
+                const uint32_t opsel = (in.words[0] >> 11) & 0xFu;
+                if (in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
+                    in.src_neg[0] || in.src_neg[1] || in.src_neg[2] ||
+                    in.clamp || in.omod || opsel || in.has_dpp || in.has_sdwa) {
+                    b.stage_reject_pc = in.pc;
+                    b.stage_reject_reason = "mbcnt-numeric-modifiers";
+                    ok = false;
+                } else {
+                    vreg[in.dst.value] = b.numeric_mbcnt(
+                        val(in.src[0]), val(in.src[1]), in.opcode == 0x365);
+                }
             } else if ((in.opcode == 0x365 || in.opcode == 0x366) && allow_wave &&
                        !(in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) &&
                        (b.is_compute || b.is_fragment)) {
