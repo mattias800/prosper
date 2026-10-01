@@ -21,8 +21,8 @@ uint32_t source(uint32_t wave, uint32_t lane, uint32_t vgpr) {
     return (vgpr == 2 ? 0xa5000000u : vgpr == 3 ? 0x5b000000u : 0x7d000000u) |
         (wave << 16) | lane;
 }
-std::vector<uint32_t> guest(bool scc) {
-    return {
+std::vector<uint32_t> guest(bool scc, bool refresh_source = false) {
+    std::vector<uint32_t> code = {
         0xbe800303u,              // s0=s3: each wave has 1..4 iterations
         0x7d8402f9u, 0x06068600u, // SDWA v_cmp_eq_u32 s[6:7],v0,v1
         0xbe882406u,              // s_and_saveexec_b64 s[8:9],s[6:7]
@@ -50,6 +50,12 @@ std::vector<uint32_t> guest(bool scc) {
         0xf8000201u, 0x00000008u,// EXP PARAM0.x
         0xbf810000u,
     };
+    if (refresh_source) {
+        // Change each source on every EXEC-active iteration. Empty EXEC changes nothing.
+        code.insert(code.begin() + 5, {0x4a040481u, 0x4a060681u, 0x4a080881u});
+        code[17] = 0xbf85fff2u; // backedge still targets the SCC compare at pc4
+    }
+    return code;
 }
 std::vector<uint32_t> compile(const std::vector<uint32_t>& code, bool native = false) {
     return prosper::gpu::recompile_ngg_exports_for_test(
@@ -89,7 +95,8 @@ std::vector<float> inputs(uint32_t mode) {
     }
     return input;
 }
-uint32_t mismatches(const std::vector<float>& output, uint32_t mode, bool scc) {
+uint32_t mismatches(const std::vector<float>& output, uint32_t mode, bool scc,
+                    bool refresh_source = false) {
     if (output.size() != kLanes * kStride) return kLanes;
     uint32_t bad = 0;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
@@ -98,9 +105,11 @@ uint32_t mismatches(const std::vector<float>& output, uint32_t mode, bool scc) {
         const auto word = [&](uint32_t slot) {
             return std::bit_cast<uint32_t>(output[lane * kStride + slot]);
         };
-        if (word(1) != source(wave, first, 2) ||
-            word(2) != source(wave, first, wave == 1 ? 3u : 4u) ||
-            word(3) != static_cast<uint32_t>(scc) || word(9) != ((first >> 5) & 1u)) {
+        const uint32_t delta = refresh_source && mode != 2 ? wave + 1u : 0u;
+        const uint32_t expected2 = source(wave, first, 2) + delta;
+        const uint32_t expected5 = source(wave, first, wave == 1 ? 3u : 4u) + delta;
+        if (word(1) != expected2 || word(2) != expected5 ||
+            word(3) != static_cast<uint32_t>(scc) || word(9) != ((expected2 >> 5) & 1u)) {
             if (bad < 3) std::fprintf(stderr,
                 "mode=%u scc=%u lane=%u got=%08x/%08x/%u/%u first=%u\n",
                 mode, scc, lane, word(1), word(2), word(3), word(9), first);
@@ -201,6 +210,49 @@ int main(int argc, char** argv) {
     one_wave_guard[4] = 0u; // EXP v0 exists in the smaller probe's input/vertex shell
     CHECK(!prosper::gpu::recompile_ngg_exports_for_test(one_wave_guard.data(),
         one_wave_guard.size(), 2, 0, nullptr, 4, 0, {}, true).empty());
+
+    // A workgroup-uniform terminal guard may have an RFL in its peeled prefix. Its scalar
+    // result must remain architectural when consumed after the guest barrier, not per lane.
+    for (bool mask_prefix : {false, true}) for (uint32_t skip_body : {0u, 1u}) {
+        std::vector<uint32_t> guarded_prefix = mask_prefix
+            ? std::vector<uint32_t>{0x7d8402f9u, 0x06068600u, 0xbe841006u}
+            : std::vector<uint32_t>{0x7e080500u};
+        // Also protect the same peeled-prefix route for the existing saved-mask count service.
+        guarded_prefix.insert(guarded_prefix.end(), {
+            0xbf068003u, 0xbf840004u, // independently uniform compare s3,0; skip to END
+            0xbf8a0000u, 0x7e040204u, // barrier; v2=s4
+            0xf80000c1u, 0x00000002u, 0xbf810000u,
+        });
+        const auto prefix_module = prosper::gpu::recompile_ngg_exports_for_test(
+            guarded_prefix.data(), guarded_prefix.size(), 2, 0, nullptr, 4, skip_body, {}, true);
+        CHECK(!prefix_module.empty());
+        if (prefix_module.empty()) continue;
+        std::vector<float> input(64u * 2u, 0);
+        for (uint32_t lane = 0; lane < 64u; ++lane) {
+            input[lane * 2u] = std::bit_cast<float>(mask_prefix ? lane : source(0, lane, 2));
+            input[lane * 2u + 1u] = std::bit_cast<float>(31u);
+        }
+        const auto output = prosper::test::run_compute(prefix_module, input,
+            64, 64u * kStride, {}, {}, nullptr, 64);
+        CHECK(output.size() == 64u * kStride);
+        uint32_t bad = 0;
+        for (uint32_t lane = 0; lane < 64u && output.size() == 64u * kStride; ++lane)
+            bad += std::bit_cast<uint32_t>(output[lane * kStride + 1u]) !=
+                (skip_body ? 0u : mask_prefix ? 1u : source(0, 0, 2));
+        if (bad) std::fprintf(stderr, "guarded prefix mask=%u skip=%u: %u bad lanes\n",
+                              mask_prefix, skip_body, bad);
+        CHECK(bad == 0);
+    }
+    for (uint32_t scc = 0; scc < 2; ++scc) {
+        const auto refreshed = compile(guest(scc != 0, true));
+        CHECK(!refreshed.empty());
+        if (refreshed.empty()) continue;
+        for (uint32_t mode = 0; mode < 4; ++mode) {
+            const auto output = prosper::test::run_compute(refreshed, inputs(mode),
+                kLanes, kLanes * kStride, {}, {}, nullptr, kLanes);
+            CHECK(mismatches(output, mode, scc != 0, true) == 0);
+        }
+    }
 
     // The second phase must use the already-sized two-plane array and carry exact scalar state.
     const std::vector<uint32_t> phased = {

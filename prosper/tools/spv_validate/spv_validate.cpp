@@ -949,6 +949,13 @@ int main(int argc, char** argv) {
                                            4, 0, {}, true, true),
            "recompile_ngg_exports_for_test"); }
     { const uint32_t c[] = {
+          0x7e080500u,0xbf068003u,0xbf840004u,0xbf8a0000u,
+          0x7e040204u,0xf80000c1u,0x00000002u,0xbf810000u};
+      dump(dir, "ngg_portable_readfirstlane_guard_prefix",
+           recompile_ngg_exports_for_test(c, std::size(c), 2, 0, nullptr,
+                                           4, 0, {}, true),
+           "recompile_ngg_exports_for_test"); }
+    { const uint32_t c[] = {
           0x7e000f00u,0x7e140300u,0xbf8a0000u,
           0x4a1614fau,0xff09110au,
           0xf8000941u,0x0000000bu,0xbf810000u};

@@ -7228,11 +7228,26 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 // Keep that uncommon combination on the existing fail-closed path; the unguarded
                 // phase form below is the one proved safe for partial workgroups.
                 if (initial_dispatch_active) return false;
-                const std::vector<Rdna2Inst> prefix(
+                std::vector<Rdna2Inst> prefix(
                     ins.begin(), ins.begin() + phased.guard_index);
+                const bool portable_service_prefix = !b.native_subgroup_size &&
+                    (portable_compute_mask_reduction || portable_compute_readfirstlane);
+                if (!prefix.empty() && portable_service_prefix) {
+                    // The uniform guard prefix is a complete region too. A common wave service
+                    // needs a dispatcher end block even though the real END follows the body.
+                    // No guest edge crosses this proven split; preserve SCC for the guard.
+                    Rdna2Inst prefix_end;
+                    prefix_end.pc = ins[phased.guard_index].pc;
+                    prefix_end.fmt = Rdna2Format::SOPP;
+                    prefix_end.opcode = 0x01u;
+                    prefix_end.len_dwords = 1;
+                    prefix_end.is_end = true;
+                    prefix_end.synthetic_terminator = true;
+                    prefix.push_back(prefix_end);
+                }
                 if (!prefix.empty() &&
                     !emit_body(b, rs, prefix, safe, rt, allow_exec_update, allow_smem,
-                               exp_fn, code, dwords, &dead_masks))
+                               exp_fn, code, dwords, &dead_masks, portable_service_prefix))
                     return false;
                 if (!rs.scc) return false;
                 const uint32_t execute_body = ins[phased.guard_index].opcode == 0x04
