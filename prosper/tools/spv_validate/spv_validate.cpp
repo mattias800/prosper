@@ -942,6 +942,13 @@ int main(int argc, char** argv) {
            recompile_ngg_exports_for_test(c, std::size(c), 1),
            "recompile_ngg_exports_for_test"); }
     { const uint32_t c[] = {
+          0xbf8a0000u,0x7e080502u,0xbf8a0000u,0x7e0a0204u,
+          0xf80000c1u,0x00000005u,0xbf810000u};
+      dump(dir, "ngg_portable_wave64_readfirstlane",
+           recompile_ngg_exports_for_test(c, std::size(c), 10, 0, nullptr,
+                                           4, 0, {}, true, true),
+           "recompile_ngg_exports_for_test"); }
+    { const uint32_t c[] = {
           0x7e000f00u,0x7e140300u,0xbf8a0000u,
           0x4a1614fau,0xff09110au,
           0xf8000941u,0x0000000bu,0xbf810000u};

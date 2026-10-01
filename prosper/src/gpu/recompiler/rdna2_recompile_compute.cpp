@@ -409,6 +409,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      uint32_t threads_x_for_test) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
+    const bool original_has_waterfall = !waterfall_branches(ins).empty();
     const auto original_raw_x2_data = rdna2_proven_raw_x2_data_loads(ins);
     const auto original_raw_wide_data = rdna2_raw_wide_data_loads(ins);
     const auto original_raw_immediate_wide_data =
@@ -436,6 +437,10 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     }
     if (!local_x_for_test || local_x_for_test > 1024) return {};
     b.begin(num_inputs ? num_inputs : 1, rt, local_x_for_test, 1, 1, 64, 0);
+    // This legacy synthetic shell has no real guest extent unless the caller supplies one.
+    // Its old partial/per-lane test contracts are not evidence for a complete architectural wave.
+    b.portable_readfirstlane_shader = force_cfg_for_test && threads_x_for_test &&
+        !original_has_waterfall;
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     seed_smem_pointer_provenance(rs, ins);   // SRT pointer-load provenance (#3616)
@@ -494,7 +499,8 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
         return {}; // bindings 0/1 are this probe's input/export buffers
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
-    const bool has_barrier = native_wave64 && std::any_of(
+    const bool original_has_waterfall = !waterfall_branches(ins).empty();
+    const bool has_barrier = full_four_wave_launch_inputs && std::any_of(
         ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::SOPP && in.opcode == 0x0au;
         });
@@ -504,7 +510,7 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
             // The ordinary compute proof treats launch SGPRs as workgroup-uniform. This probe
             // supplies s3 separately to each guest wave, so a scalar terminal guard can let
             // only some of the four waves reach a Vulkan workgroup barrier.
-            log_recompile_diagnostic(diagnostic, "ngg-native-reject", "terminal",
+            log_recompile_diagnostic(diagnostic, "ngg-wave-reject", "terminal",
                                      phases.guarded ? "reason=per-wave-terminal-guard"
                                                     : "reason=barrier-phase-proof");
             return {};
@@ -524,6 +530,7 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
     b.native_subgroup_size = native_wave64 ? 64u : 0u;
     b.begin(num_inputs ? num_inputs : 1, resources,
             full_four_wave_launch_inputs ? 256u : 64u, 1, 1, 64, 0, true);
+    b.portable_readfirstlane_shader = !native_wave64 && !original_has_waterfall;
     if (native_wave64) {
         std::vector<uint32_t> marker;
         b.pstr(marker, "Prosper.NggProbeExactSubgroup=64");
@@ -588,7 +595,7 @@ std::vector<uint32_t> recompile_ngg_exports_for_test(
         }
         return true;
     };
-    const bool force_phases_for_dpp = has_barrier || std::any_of(
+    const bool force_phases_for_dpp = (native_wave64 && has_barrier) || std::any_of(
         ins.begin(), ins.end(), is_vadd_nc_u32_dpp_row_shr_bounded);
     if (!emit_body(b, rs, ins, safe_branches, resources, /*allow_exec_update*/true,
                    /*allow_smem*/resources != nullptr, export_word, code, dwords,
@@ -661,6 +668,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const uint64_t local_count = static_cast<uint64_t>(local_x) * local_y * local_z;
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
+    const bool original_has_waterfall = !waterfall_branches(ins).empty();
     const auto original_raw_x2_data = rdna2_proven_raw_x2_data_loads(ins);
     const auto original_raw_wide_data = rdna2_raw_wide_data_loads(ins);
     const auto original_raw_immediate_wide_data =
@@ -772,6 +780,18 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // operations cannot be entered by only the real prefix of the final host subgroup.
     if (partial_barrier_phases || exact_partial_dispatcher)
         b.native_subgroup_size = 0;
+    b.portable_readfirstlane_shader = wave_size == 64 && !b.native_subgroup_size &&
+        !original_has_waterfall;
+    if (b.portable_readfirstlane_shader &&
+        (local_count < 64 || local_count % 64 != 0 ||
+         (config.exact_thread_extent && has_partial_workgroup)) &&
+        std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+            return in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02;
+        })) {
+        log_recompile_diagnostic(diagnostic, "compute-recompile-reject", "terminal",
+                                 "reason=readfirstlane-complete-wave-contract");
+        return {};
+    }
     // PROSPER_DBG: report the inputs to that decision, not just its outcome (#2429).
     //
     // Every wave-width-dependent lowering in this file gates on `b.native_subgroup_size` -- the
