@@ -91,7 +91,8 @@ std::optional<Module> Module::load(const std::string& path, std::string* err) {
     // (byte-compared across both dumps): 0x1D3D154F (The Messenger) and 0xEEF51454 (the UE4 title).
     // Missing this map is fatal-but-silent: the raw-ELF fallback below still finds the inner ELF, but
     // every segment file offset is then wrong, so the guest maps garbage bytes.
-    if (sh.magic == 0x1D3D154F || sh.magic == 0xEEF51454) {
+    const bool is_self = sh.magic == 0x1D3D154F || sh.magic == 0xEEF51454;
+    if (is_self) {
         for (int i = 0; i < sh.num_segments; i++) {
             auto s = rd<SelfSegment>(m.file, 0x20 + i * sizeof(SelfSegment));
             if (s.flags & 0x800) data_seg[self_segment_key(s.flags)] = s;
@@ -113,8 +114,26 @@ std::optional<Module> Module::load(const std::string& path, std::string* err) {
     for (int i = 0; i < eh.e_phnum; i++) {
         auto p = rd<Phdr>(m.file, m.elf_base + eh.e_phoff + i * sizeof(Phdr));
         Segment s{ p.p_type, p.p_flags, p.p_vaddr, p.p_memsz, p.p_filesz, 0 };
-        if (data_seg.count(i)) s.file_off = data_seg[i].file_offset;
-        else                   s.file_off = m.elf_base + p.p_offset;
+        const auto backing = data_seg.find(i);
+        if (is_self && p.p_type == PT_LOAD && p.p_filesz) {
+            // In a SELF, p_offset is logical: only the container's data segment
+            // identifies the bytes to map. An empty data map is still a SELF,
+            // while a BSS-only LOAD needs no file backing. Keep raw ELF and
+            // non-LOAD fallback resolution unchanged.
+            char msg[128];
+            if (backing == data_seg.end()) {
+                snprintf(msg, sizeof msg, "SELF PT_LOAD (program header %d) has no data segment", i);
+                return fail(msg);
+            }
+            if (backing->second.file_size < p.p_filesz ||
+                !self_read_ok(backing->second.file_offset, p.p_filesz, m.file.size())) {
+                snprintf(msg, sizeof msg,
+                         "SELF PT_LOAD (program header %d) data segment does not contain the declared file bytes", i);
+                return fail(msg);
+            }
+        }
+        if (backing != data_seg.end()) s.file_off = backing->second.file_offset;
+        else                          s.file_off = m.elf_base + p.p_offset;
         m.segments.push_back(s);
         if (p.p_filesz > 0 && (p.p_type == PT_LOAD || p.p_type == PT_DYNAMIC ||
                                p.p_type == PT_SCE_PROCPARAM || p.p_type == PT_TLS))

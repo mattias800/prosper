@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -53,6 +54,55 @@ static constexpr uint64_t kDataBase = 0x7c0000000ull;   // import-DATA aperture 
 
 static bool contains(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
+}
+
+// A hand-laid SELF wrapper around the synthetic PRX tables. Its second PT_LOAD has independent
+// logical and physical offsets: dropping its backing must not admit the in-file poison bytes.
+// This layout is local because only this test uses it; every byte is synthetic.
+static constexpr uint64_t kSelfElfBase = 0x60;
+static constexpr uint64_t kSelfMainPayload = 0x4000;
+static constexpr uint64_t kSelfTailPayload = 0x6000;
+static constexpr uint64_t kSelfTailVa = 0x4000;
+static constexpr uint64_t kSelfTailSize = 0x20;
+
+static std::vector<uint8_t> self_fixture_bytes(const SynthModuleSpec& spec, uint32_t magic,
+                                             bool tail_bss = false) {
+    using namespace prosper_test::detail;
+    auto elf = prosper_test::synth_prx_bytes(spec);
+    if (elf.empty()) return {};
+    // Move PT_DYNAMIC from index 1 to index 2, then hand-write the additional load header.
+    memmove(&elf[0xb0], &elf[0x78], 56);
+    sput16(elf, 0x38, 3);
+    sput32(elf, 0x78, PT_LOAD);
+    sput32(elf, 0x7c, 6);
+    sput64(elf, 0x80, prosper_test::kSynthFileSize);
+    sput64(elf, 0x88, kSelfTailVa);
+    sput64(elf, 0x90, kSelfTailVa);
+    sput64(elf, 0x98, tail_bss ? 0 : kSelfTailSize);
+    sput64(elf, 0xa0, 0x1000);
+    sput64(elf, 0xa8, 0x1000);
+
+    std::vector<uint8_t> bytes(kSelfTailPayload + kSelfTailSize, 0);
+    sput32(bytes, 0, magic);
+    bytes[4] = 1; bytes[6] = 1;
+    sput16(bytes, 0xc, 0x100);
+    sput64(bytes, 0x10, bytes.size());
+    sput16(bytes, 0x18, 2);
+    // Two SELF segment descriptors at 0x20 and 0x40; bit 0x800 identifies data backing.
+    sput64(bytes, 0x20, 0x800);
+    sput64(bytes, 0x28, kSelfMainPayload);
+    sput64(bytes, 0x30, elf.size());
+    sput64(bytes, 0x38, elf.size());
+    sput64(bytes, 0x40, (1ull << 20) | (tail_bss ? 0 : 0x800));
+    sput64(bytes, 0x48, kSelfTailPayload);
+    sput64(bytes, 0x50, kSelfTailSize);
+    sput64(bytes, 0x58, kSelfTailSize);
+    memcpy(&bytes[kSelfElfBase], elf.data(), elf.size());
+    memcpy(&bytes[kSelfMainPayload], elf.data(), elf.size());
+    std::fill_n(bytes.begin() + kSelfElfBase + prosper_test::kSynthFileSize,
+                kSelfTailSize, 0xdd);
+    std::fill_n(bytes.begin() + kSelfTailPayload, kSelfTailSize, 0xa5);
+    return bytes;
 }
 
 int main() {
@@ -88,6 +138,138 @@ int main() {
 
     // ---- module-level rejections. Each spec differs from `good_spec` in exactly one field. -------
     CHECK(link_error(good_path).empty(), "control: an unmodified fixture links");
+
+    // ---- SELF backing (#2686): recognized wrappers never borrow raw-ELF fallback bytes. --------
+    for (const uint32_t magic : { 0x1d3d154fu, 0xeef51454u }) {
+        const std::string prefix = magic == 0x1d3d154fu ? "self_a_" : "self_b_";
+        const auto control = self_fixture_bytes(good_spec, magic);
+        const std::string control_path = dir + "/" + prefix + "control.prx";
+        std::string err;
+        CHECK(prosper_test::write_module_bytes(control_path, control, &err),
+              "SELF control: the wrapper is written");
+        auto mod = Module::load(control_path, &err);
+        CHECK(mod.has_value(), "SELF control: the recognized wrapper parses");
+        if (mod) {
+            CHECK(mod->elf_base == kSelfElfBase && mod->segments.size() == 3 &&
+                      mod->segments[1].file_off == kSelfTailPayload,
+                  "SELF control: its second PT_LOAD uses the physical backing offset");
+            CHECK(mod->symbols.size() == 2 && mod->symbols[1].nid == kExport,
+                  "SELF control: dynamic tables resolve through the first physical payload");
+            LoadedImage img;
+            const bool built = build_image(*mod, kBase1, img, &err);
+            CHECK(built, "SELF control: the image builds");
+            const uint8_t* tail = built ? img.at(kBase1 + kSelfTailVa) : nullptr;
+            CHECK(tail && img.at(kBase1 + kSelfTailVa + kSelfTailSize - 1) &&
+                      std::all_of(tail, tail + kSelfTailSize, [](uint8_t v) { return v == 0xa5; }),
+                  "SELF control: physical payload bytes reach the image rather than logical poison");
+        }
+        CHECK(link_error(control_path).empty(), "SELF control: the wrapper links");
+        {
+            // PT_DYNAMIC needs no dedicated SELF entry when its VA resolves through a PT_LOAD;
+            // even an unusable standalone logical offset must preserve that existing resolution.
+            auto bytes = control;
+            prosper_test::detail::sput64(bytes, kSelfElfBase + 0xb8, bytes.size() + 0x100);
+            const std::string path = dir + "/" + prefix + "dynamic_offset_control.prx";
+            CHECK(prosper_test::write_module_bytes(path, bytes, &err),
+                  "SELF dynamic control: an out-of-file standalone logical offset is written");
+            auto dyn = Module::load(path, &err);
+            CHECK(dyn && dyn->segments.size() == 3 &&
+                      dyn->segments[2].file_off > dyn->file.size() &&
+                      dyn->symbols.size() == 2 && dyn->symbols[1].nid == kExport,
+                  "SELF dynamic control: the containing PT_LOAD supplies its dynamic tables");
+            CHECK(link_error(path).empty(),
+                  "SELF dynamic control: a non-LOAD without dedicated backing still links");
+        }
+
+        auto reject_self = [&](const char* name, const std::vector<uint8_t>& bytes,
+                               const std::string& reason) {
+            const std::string path = dir + "/" + prefix + name + ".prx";
+            CHECK(prosper_test::write_module_bytes(path, bytes, &err),
+                  "SELF rejection: the mutated wrapper is written");
+            CHECK(!Module::load(path, &err), "SELF rejection: Module::load refuses invalid backing");
+            CHECK(err == reason, "SELF rejection: the parser reports the specific backing error");
+            CHECK(!Module::load(path, nullptr), "SELF rejection: no error-text output is required");
+            Program later;
+            CHECK(!link_program({ { good_path, kBase0 }, { path, kBase1 } },
+                                kStubBase, kDataBase, later, &err) &&
+                      err == "load " + path + ": " + reason &&
+                      later.mods.size() == 1 && later.imgs.size() == 1 &&
+                      later.mods[0]->path == good_path,
+                  "SELF rejection: the caller propagates the error and publishes only its earlier module");
+            Program p;
+            CHECK(!link_program({ { path, kBase1 } }, kStubBase, kDataBase, p, &err) &&
+                      err == "load " + path + ": " + reason && p.mods.empty() && p.imgs.empty(),
+                  "SELF rejection: a failed first module publishes no module or image");
+            CHECK(link_program({ { control_path, kBase1 } }, kStubBase, kDataBase, p, &err) &&
+                      p.mods.size() == 1 && p.imgs.size() == 1 && p.mods[0]->path == control_path,
+                  "SELF recovery: valid backing retries successfully in the failed first module's Program");
+        };
+        const std::string missing_tail = "SELF PT_LOAD (program header 1) has no data segment";
+        const std::string short_tail =
+            "SELF PT_LOAD (program header 1) data segment does not contain the declared file bytes";
+        {
+            auto bytes = control;
+            prosper_test::detail::sput64(bytes, 0x40, 1ull << 20);
+            CHECK(kSelfElfBase + prosper_test::kSynthFileSize + kSelfTailSize <= bytes.size() &&
+                      bytes[kSelfElfBase + prosper_test::kSynthFileSize] == 0xdd,
+                  "SELF missing backing: the tempting logical fallback is in-file poison");
+            reject_self("missing_tail", bytes, missing_tail);
+        }
+        {
+            auto bytes = control;
+            prosper_test::detail::sput64(bytes, 0x20, 0);
+            prosper_test::detail::sput64(bytes, 0x40, 1ull << 20);
+            reject_self("empty_map", bytes, "SELF PT_LOAD (program header 0) has no data segment");
+        }
+        {
+            auto bytes = control;
+            prosper_test::detail::sput64(bytes, 0x50, kSelfTailSize - 1);
+            reject_self("short_descriptor", bytes, short_tail);
+        }
+        {
+            auto bytes = control;
+            prosper_test::detail::sput64(bytes, 0x48, bytes.size() - kSelfTailSize / 2);
+            reject_self("past_eof", bytes, short_tail);
+        }
+        {
+            auto bytes = control;
+            prosper_test::detail::sput64(bytes, 0x48, std::numeric_limits<uint64_t>::max() - 0xf);
+            reject_self("wrapping_offset", bytes, short_tail);
+        }
+        const std::string bss_path = dir + "/" + prefix + "bss.prx";
+        CHECK(prosper_test::write_module_bytes(bss_path, self_fixture_bytes(good_spec, magic, true),
+                                              &err),
+              "SELF BSS control: the wrapper with no second data backing is written");
+        auto bss = Module::load(bss_path, &err);
+        CHECK(bss.has_value(), "SELF BSS control: zero-file-size PT_LOAD needs no data backing");
+        if (bss) {
+            LoadedImage img;
+            const bool built = build_image(*bss, kBase1, img, &err);
+            CHECK(built, "SELF BSS control: its image builds");
+            const uint8_t* tail = built ? img.at(kBase1 + kSelfTailVa) : nullptr;
+            CHECK(tail && img.at(kBase1 + kSelfTailVa + 0xfff) &&
+                      std::all_of(tail, tail + 0x1000, [](uint8_t v) { return v == 0; }),
+                  "SELF BSS control: its memory is zero-filled despite unused physical payload bytes");
+        }
+        CHECK(link_error(bss_path).empty(), "SELF BSS control: the zero-file-size segment links");
+        CHECK(link_error(control_path).empty(), "SELF recovery control: valid backing links after rejections");
+        CHECK(link_error(good_path).empty(), "raw ELF recovery control: unwrapped input still links");
+    }
+    {
+        // The pre-existing unrecognized-header scan remains supported; only recognized SELF
+        // wrappers require a SELF map. This prefix is deliberately neither observed SELF magic.
+        std::vector<uint8_t> bytes(0x20, 0xcc);
+        const auto raw = prosper_test::synth_prx_bytes(good_spec);
+        bytes.insert(bytes.end(), raw.begin(), raw.end());
+        const std::string path = dir + "/raw_elf_scan_control.prx";
+        std::string err;
+        CHECK(prosper_test::write_module_bytes(path, bytes, &err),
+              "raw ELF scan control: the prefixed module is written");
+        auto mod = Module::load(path, &err);
+        CHECK(mod && mod->elf_base == 0x20,
+              "raw ELF scan control: an unrecognized prefix still resolves the inner ELF header");
+        CHECK(link_error(path).empty(), "raw ELF scan control: the discovered inner ELF still links");
+    }
 
     {
         SynthModuleSpec s = good_spec; s.omit_load_phdr = true;
