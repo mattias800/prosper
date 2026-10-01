@@ -549,6 +549,18 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         d.ps_wave32 = x.ps_wave32;
         d.ps_float_mode = x.ps_float_mode;
         if (!table(x.vrt, false, d.vrt) || !table(x.prt, false, d.prt)) return false;
+        if (x.vs_chain_raw_shader_index != UINT32_MAX) {
+            const auto* prolog = x.vs_raw_shader_index < c.raw_shader_versions.size()
+                ? &c.raw_shader_versions[x.vs_raw_shader_index].words : nullptr;
+            const auto* main = x.vs_chain_raw_shader_index < c.raw_shader_versions.size()
+                ? &c.raw_shader_versions[x.vs_chain_raw_shader_index].words : nullptr;
+            if (rdna2_vertex_chain_has_owned_raw_wide_inputs(
+                    prolog ? prolog->data() : nullptr, prolog ? prolog->size() : 0u,
+                    main ? main->data() : nullptr, main ? main->size() : 0u, d.vrt.get())) {
+                error = "owned raw wide replay inputs require a direct vertex stage";
+                return false;
+            }
+        }
         if (!restore_owned_raw_inputs(d.vrt, x.vrt, x.vs_raw_shader_index) ||
             !restore_owned_raw_inputs(d.prt, x.prt, x.fs_raw_shader_index)) return false;
         if (d.vrt) d.vrt->vertices_per_instance = d.vertex_count;

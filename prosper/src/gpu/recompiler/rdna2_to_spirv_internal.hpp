@@ -2871,6 +2871,17 @@ struct RegState {
     std::unordered_map<uint64_t, uint32_t> lds_addtid;
 };
 
+// Cache and live realization derive owned source authority from the original code. A selected
+// stream may drop requirements, but must not invent a new admitted read-point PC. Keep omitted
+// original PCs classified too, so their bindings cannot become another load's legacy fallback.
+inline bool retain_original_owned_raw_wide_proof(
+        RegState& rs, const std::vector<uint32_t>& original_pcs) {
+    for (uint32_t pc : rs.smem_raw_owned_wide_data_loads)
+        if (!std::binary_search(original_pcs.begin(), original_pcs.end(), pc)) return false;
+    rs.smem_raw_owned_wide_data_loads.insert(original_pcs.begin(), original_pcs.end());
+    return true;
+}
+
 inline bool scalar_is_lane_local(const RegState& rs, int sgpr) {
     if (rs.lane_local_scalars.empty()) return false;
     const auto it = rs.sreg.find(sgpr);

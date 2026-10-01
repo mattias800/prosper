@@ -2036,6 +2036,15 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
         uint64_t* cache_identity, uint32_t vertex_lds_dwords,
         bool capture_position) {
+    // This must precede lookup: the direct-stage key cannot authenticate rebased main PCs or
+    // recover owners discarded by the legacy chain table merge, including a warm entry.
+    if (rdna2_vertex_chain_has_owned_raw_wide_inputs(
+            prolog, prolog_dwords, main, main_dwords, resources)) {
+        if (cache_identity) *cache_identity = 0;
+        replay_terminal_reject_reasons(reinterpret_cast<uintptr_t>(prolog),
+            {{"recompile-reject", "owned raw wide inputs require a direct vertex stage"}});
+        return {};
+    }
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Vertex, prolog, prolog_dwords, resources, pixel_inputs, nullptr,
         main, main_dwords, vertex_lds_dwords, nullptr, false, capture_position);

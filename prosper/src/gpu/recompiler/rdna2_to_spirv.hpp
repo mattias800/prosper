@@ -306,6 +306,13 @@ struct VertexPrologInfo {
 
 VertexPrologInfo rdna2_vertex_prolog_info(const uint32_t* code, size_t dwords);
 
+// Owned read-point inputs currently have one direct-stage PC namespace. Detect requirements in
+// either original chain half or the linked stream, even without resource markers, so cache and
+// stored-module replay cannot bypass the direct compiler's explicit chain refusal.
+bool rdna2_vertex_chain_has_owned_raw_wide_inputs(
+    const uint32_t* prolog, size_t prolog_dwords, const uint32_t* main, size_t main_dwords,
+    const ShaderResourceTable* resources);
+
 PcrelDispatchInfo rdna2_pcrel_dispatch_info(const uint32_t* code, size_t dwords);
 
 // Retain only the selected arm of a proven compiler-generated PC-relative dispatch. The fragment

@@ -76,6 +76,99 @@ int main() {
                   recompile_valu(compute_unrelated.data(), compute_unrelated.size(), 2u, 0u,
                                  &owned_table).empty(), "compute",
                   "complete owned numeric source does not supply an unrelated binding2 fallback");
+            const std::vector<uint32_t> prolog{0xbfa00003u, 0xbe802006u};
+            const std::vector<uint32_t> legacy_main{
+                0x7e000280u, export_word, 0u, 0xbf810000u};
+            ShaderResourceTable legacy_table;
+            uint64_t legacy_identity = 0u;
+            const auto legacy_chain = recompile_vertex_chain_cached_shared(
+                prolog.data(), prolog.size(), legacy_main.data(), legacy_main.size(),
+                &legacy_table, nullptr, &legacy_identity);
+            check(!rdna2_vertex_chain_has_owned_raw_wide_inputs(
+                      prolog.data(), prolog.size(), legacy_main.data(), legacy_main.size(),
+                      &legacy_table) && legacy_chain && !legacy_chain->empty() &&
+                  !recompile_vertex_chain(prolog.data(), prolog.size(), legacy_main.data(),
+                                          legacy_main.size(), &legacy_table).empty(), name,
+                  "a real unowned non-passthrough vertex chain remains valid");
+            const auto chain_refuses = [&](const ShaderResourceTable& supplied, const char* label) {
+                uint64_t refused_identity = 77u, recovered_identity = 0u;
+                const bool cold = recompile_vertex_chain(prolog.data(), prolog.size(),
+                    owned_only.data(), owned_only.size(), &supplied).empty();
+                const bool warm = !recompile_vertex_chain_cached_shared(
+                    prolog.data(), prolog.size(), owned_only.data(), owned_only.size(),
+                    &supplied, nullptr, &refused_identity) && refused_identity == 0u;
+                const auto recovered = recompile_vertex_chain_cached_shared(
+                    prolog.data(), prolog.size(), legacy_main.data(), legacy_main.size(),
+                    &legacy_table, nullptr, &recovered_identity);
+                check(cold && warm && recovered == legacy_chain &&
+                      recovered_identity == legacy_identity, name, label);
+            };
+            chain_refuses(owned_table, "complete owned main refuses direct and warm chained admission");
+            auto marker_free = owned_table;
+            marker_free.resources.front().owned_raw_snapshot_bytes = 0u;
+            chain_refuses(marker_free, "marker-free owned main is still a code-derived chain refusal");
+            chain_refuses(legacy_table, "missing whole owned chain table cannot borrow warm legacy code");
+            auto short_chain = owned_table;
+            short_chain.resources.front().host_data_size = 15u;
+            chain_refuses(short_chain, "truncated owned main cannot borrow warm legacy chain code");
+            auto owned_prolog = owned_only;
+            owned_prolog.erase(owned_prolog.end() - 3, owned_prolog.end());
+            owned_prolog.push_back(0xbe802006u);
+            check(rdna2_vertex_chain_has_owned_raw_wide_inputs(
+                      owned_prolog.data(), owned_prolog.size(), legacy_main.data(), legacy_main.size(),
+                      &legacy_table) &&
+                  recompile_vertex_chain(owned_prolog.data(), owned_prolog.size(),
+                      legacy_main.data(), legacy_main.size(), &legacy_table).empty(), name,
+                  "linked prolog prefix requires owned authority even without any resource marker");
+        } else {
+            // The selector dispatch is the production-recognized bounded idiom. Selecting A
+            // exposes an owned read that original-stream proof cannot admit across s_setpc.
+            // Selecting B remains an ordinary legacy specialization with a real nonempty module.
+            std::vector<uint32_t> dispatch{
+                0xf4201a8cu, 0xfa000010u, 0x816ac16au, 0x83ea826au, 0x8f6a836au,
+                0xbea01f00u, 0x802020ffu, 80u, 0x82212180u, 0xf4040890u, 0xd4000000u,
+                0xbea81f00u, 0x80282228u, 0x82292329u, 0xbe802028u,
+                0xf4080600u, 0xfa000004u, 0xbe800380u, 0xbe810380u, 0x7e00021bu,
+                0xbf820001u, 0x7e000280u, export_word, 0u, 0xbf810000u, 0u,
+                12u, 0u, 36u, 0u, 40u, 0u};
+            const auto info = rdna2_pcrel_dispatch_info(dispatch.data(), dispatch.size());
+            auto selected = decode(dispatch);
+            const bool selected_ok = rdna2_specialize_pcrel_dispatch(selected, info, 15u);
+            auto dispatch_table = owned_table;
+            dispatch_table.resources.front().fetch_pc = 15u;
+            std::array<uint32_t, 5> selector{};
+            ShaderResource selector_resource;
+            selector_resource.cls = ResourceClass::ConstantBuffer;
+            selector_resource.binding = 0u;
+            selector_resource.sgpr_base = 24u;
+            selector_resource.size = sizeof(selector);
+            selector_resource.host_data = reinterpret_cast<uint8_t*>(selector.data());
+            selector_resource.host_data_size = sizeof(selector);
+            dispatch_table.resources.push_back(selector_resource);
+            check(info.valid && selected_ok && rdna2_owned_raw_wide_data_loads(decode(dispatch)).empty() &&
+                  rdna2_owned_raw_wide_data_loads(selected) == std::vector<uint32_t>{15u}, name,
+                  "selected body would introduce an owned PC absent from original code authority");
+            check(!recompile_fragment(dispatch.data(), dispatch.size(), &dispatch_table,
+                                      nullptr, 21u).empty(), name,
+                  "legacy dispatch specialization retains a nonempty fragment positive");
+            const auto selected_refuses = [&](ShaderResourceTable supplied, const char* label) {
+                const bool cold = recompile_fragment(dispatch.data(), dispatch.size(), &supplied,
+                                                      nullptr, 15u).empty();
+                selector[4] = 2u; // B / pc21: warm a valid legacy specialized module first.
+                const auto valid = recompile_graphics_shader_cached(
+                    stage, dispatch.data(), dispatch.size(), &supplied);
+                selector[4] = 1u; // A / pc15: absent original authority must remain refusal.
+                const auto refused = recompile_graphics_shader_cached(
+                    stage, dispatch.data(), dispatch.size(), &supplied);
+                selector[4] = 2u;
+                const auto recovered = recompile_graphics_shader_cached(
+                    stage, dispatch.data(), dispatch.size(), &supplied);
+                check(cold && !valid.empty() && refused.empty() && recovered == valid, name, label);
+            };
+            selected_refuses(dispatch_table, "specialized owned source cannot borrow valid legacy warm admission");
+            auto short_selected = dispatch_table;
+            short_selected.resources.front().host_data_size = 15u;
+            selected_refuses(short_selected, "truncated selected source cannot borrow valid legacy warm admission");
         }
         for (bool wide8 : {false, true}) {
             const std::vector<uint32_t> code{
