@@ -2632,6 +2632,13 @@ HLE(k_pthread_create_noname) { return k_pthread_create(a0, a1, a2, a3, 0, 0); }
 // successful join returning NULL, and the caller proceeded as if its worker had finished.
 // FreeBSD's pthread_join writes through `value_ptr` only when it really joined, and so does this now.
 HLE(k_pthread_join)   {
+    // #4033: FreeBSD libthr rejects NULL with EINVAL before looking up a thread:
+    // https://github.com/freebsd/freebsd-src/blob/releng/11.0/lib/libthr/thread/thr_join.c#L80-L87
+    // CONFIDENCE: HIGH on that FreeBSD rule and the observed host pthread_join(NULL) fault;
+    // MED that the guest inherits it. The Sony encoding remains the MED policy documented below.
+    // A finished joinable thread remains valid, so live-name/stack registry membership is not
+    // a validity check for non-null handles. Only the null case is handled here.
+    if (a0 == 0) return 22;   // bare FreeBSD EINVAL; the Sony alias encodes it, value_ptr untouched
     void* rv = nullptr;
     const int rc = pthread_join((pthread_t)a0, &rv);
     if (rc == 0 && a1) *(void**)(uintptr_t)a1 = rv;   // only a real join produces an exit value
