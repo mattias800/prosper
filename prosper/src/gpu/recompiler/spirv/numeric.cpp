@@ -5,6 +5,16 @@
 
 namespace prosper::gpu {
 
+uint32_t SpirvCompute::f32_abs_normal_le_bits(uint32_t word, uint32_t bound) {
+    uint32_t bits = 0;
+    if (!uconst_literal(bound, &bits) || bits < 0x00800000u || bits >= 0x7f800000u)
+        return 0;
+    // Positive binary32 magnitude order is unsigned bit order. Subnormals are below every
+    // NORMAL bound even if the guest flushes them; both infinities and all NaNs are above it.
+    const uint32_t magnitude = ibin(Op_BitwiseAnd, word, uconst(0x7fffffffu));
+    return ucmp(Op_ULessThanEqual, magnitude, bound);
+}
+
 uint32_t SpirvCompute::ffbh_u32(uint32_t a) {
         const uint32_t safe = ibin(Op_BitwiseOr, a, uconst(1));
         const uint32_t leading_zeroes = ibin(Op_ISub, uconst(31), find_umsb(safe));

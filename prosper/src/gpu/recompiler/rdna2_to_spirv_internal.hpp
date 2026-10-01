@@ -731,6 +731,14 @@ struct SpirvCompute {
     uint32_t cvt_f2u(uint32_t bits);
     // Float ordered compare on bit-operands -> bool (for VCC). select() picks bits by a bool condition.
     uint32_t fcmp(uint32_t cmpop, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, cmpop, {t_bool, r, bcf(a), bcf(b)}); return r; }
+    // Guest VOPC facts, not facts about arbitrary SPIR-V float comparisons. The emitter records
+    // only successful full-EXEC, nonexception-signaling DWORD F32 compares. Key and value are
+    // immutable result/raw-word SSA ids: register reuse, reloads and Phi never inherit them.
+    std::unordered_map<uint32_t, uint32_t> guest_f32_zero_equal_words;
+    std::unordered_map<uint32_t, uint32_t> guest_f32_abs_normal_le_words;
+    // Returns zero unless bound is an owned constant positive finite NORMAL binary32 encoding.
+    // The comparison is invariant under either guest input-denorm mode and uses integer bits only.
+    uint32_t f32_abs_normal_le_bits(uint32_t word, uint32_t bound);
     uint32_t bfalse() { if (!bconst_false) { bconst_false = id(); put(types, Op_ConstantFalse, {t_bool, bconst_false}); } return bconst_false; }
     uint32_t sel(uint32_t cond, uint32_t tval, uint32_t fval) { uint32_t r = id(); put(code, Op_Select, {t_u32, r, cond, tval, fval}); return r; }
     bool is_fragment_wave_vote_value(uint32_t value) const {

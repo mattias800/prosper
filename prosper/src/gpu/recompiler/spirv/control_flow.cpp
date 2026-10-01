@@ -70,6 +70,18 @@ uint32_t SpirvCompute::land(uint32_t a, uint32_t b_) {
     }
 
 uint32_t SpirvCompute::lor(uint32_t a, uint32_t b_) {
+        const auto absorbed = [&](uint32_t zero, uint32_t range) {
+            const auto equal = guest_f32_zero_equal_words.find(zero);
+            const auto magnitude = guest_f32_abs_normal_le_words.find(range);
+            return equal != guest_f32_zero_equal_words.end() &&
+                   magnitude != guest_f32_abs_normal_le_words.end() &&
+                   equal->second == magnitude->second;
+        };
+        // Ordered guest EQ(U,+/-0) implies ABS(U)<=K for every positive NORMAL K, including
+        // flushed subnormals. EQ alone is NOT an integer-zero test. Only explicit unmasked guest
+        // comparison facts permit this absorption; no arbitrary FP cone acquires uniformity.
+        if (absorbed(a, b_)) return b_;
+        if (absorbed(b_, a)) return a;
         uint32_t r = id();
         put(code, Op_LogicalOr, {t_bool, r, a, b_});
         propagate_fragment_wave_vote(r, a, b_);
