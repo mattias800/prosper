@@ -44,6 +44,12 @@ arm reaches derived provenance. The one-arm compare targets the MUST mask meet a
 
 ## Ruled out
 
+- Running the owned-input chain proof before every cache lookup is not a negligible warm-hit
+  cost. A balanced synthetic unowned 1,024-VMOV chain measured about 0.566 ms per current hit
+  versus 0.000817 ms with that private guard disabled. This is CPU cache-hit evidence, not title
+  FPS. Memoize the code-only proof by both immutable analysis versions; live resource obligations
+  and markers still require a check before every lookup. Preserve the uncached measurement.
+
 - Stripping only the v62 marker tail does not form a valid v61 capture after v63 appends its
   owned-wide count/width tail. The first current-base raw backing calibration failed this
   historical-layout control; remove both tails and separately pin the retained v62 marker.

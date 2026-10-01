@@ -100,6 +100,66 @@ int main() {
                   recompile_vertex_chain(prolog.data(), prolog.size(), legacy_main.data(),
                       legacy_main.size(), &requirement_only).empty(), name,
                   "same-code warm chain refuses a requirement omitted from its ordinary cache key");
+            auto ordinary_table = legacy_table;
+            auto ordinary_source = owned_source;
+            ordinary_source.fetch_pc = UINT32_MAX;
+            ordinary_source.owned_raw_snapshot_bytes = 0u;
+            ordinary_table.resources.push_back(ordinary_source);
+            uint64_t ordinary_identity = 0u, marked_identity = 99u;
+            const auto ordinary_chain = recompile_vertex_chain_cached_shared(
+                prolog.data(), prolog.size(), legacy_main.data(), legacy_main.size(),
+                &ordinary_table, nullptr, &ordinary_identity);
+            auto marker_only = ordinary_table;
+            marker_only.resources.front().owned_raw_snapshot_bytes = 16u;
+            check(ordinary_chain && !ordinary_chain->empty() && !recompile_vertex_chain_cached_shared(
+                    prolog.data(), prolog.size(), legacy_main.data(), legacy_main.size(),
+                    &marker_only, nullptr, &marked_identity) && marked_identity == 0u, name,
+                  "same-code warm chain refuses a marker omitted from its ordinary cache key");
+            // Both allocations stay fixed while their active bytes change. A proof cached by
+            // address instead of byte-validated analysis versions would borrow the legacy verdict.
+            std::array<uint32_t, 32> mutable_main{}, mutable_prolog{};
+            std::copy(legacy_main.begin(), legacy_main.end(), mutable_main.begin());
+            std::copy(prolog.begin(), prolog.end(), mutable_prolog.begin());
+            uint64_t version_identity = 0u;
+            const auto version_legacy = recompile_vertex_chain_cached_shared(
+                mutable_prolog.data(), prolog.size(), mutable_main.data(), legacy_main.size(),
+                &legacy_table, nullptr, &version_identity);
+            check(version_legacy && !version_legacy->empty(), name,
+                  "fixed-address chain establishes a valid unowned code version");
+            std::copy(owned_only.begin(), owned_only.end(), mutable_main.begin());
+            uint64_t changed_identity = 99u;
+            check(!recompile_vertex_chain_cached_shared(mutable_prolog.data(), prolog.size(),
+                      mutable_main.data(), owned_only.size(), &legacy_table, nullptr,
+                      &changed_identity) && changed_identity == 0u, name,
+                  "same-address changed main cannot borrow an unowned cached code proof");
+            std::copy(legacy_main.begin(), legacy_main.end(), mutable_main.begin());
+            uint64_t recovered_version = 0u;
+            check(recompile_vertex_chain_cached_shared(mutable_prolog.data(), prolog.size(),
+                      mutable_main.data(), legacy_main.size(), &legacy_table, nullptr,
+                      &recovered_version) == version_legacy && recovered_version == version_identity,
+                  name, "restored main code recovers the original shared chain module");
+            const std::array<uint32_t, 5> owned_prolog{
+                owned_only[0], owned_only[1], owned_only[2], owned_only[3], 0xbe802006u};
+            const std::vector<uint32_t> linked_observer_main{
+                owned_only[4], export_word, 0u, 0xbf810000u};
+            std::copy(linked_observer_main.begin(), linked_observer_main.end(), mutable_main.begin());
+            uint64_t linked_legacy_identity = 0u;
+            const auto linked_legacy = recompile_vertex_chain_cached_shared(mutable_prolog.data(),
+                prolog.size(), mutable_main.data(), linked_observer_main.size(),
+                &legacy_table, nullptr, &linked_legacy_identity);
+            std::copy(owned_prolog.begin(), owned_prolog.end(), mutable_prolog.begin());
+            const auto prolog_decode = decode(std::vector<uint32_t>(owned_prolog.begin(), owned_prolog.end()));
+            auto linked_code = std::vector<uint32_t>(owned_prolog.begin(), owned_prolog.end() - 1);
+            linked_code.insert(linked_code.end(), linked_observer_main.begin(), linked_observer_main.end());
+            const bool linked_only_owned = rdna2_owned_raw_wide_data_loads(prolog_decode).empty() &&
+                rdna2_owned_raw_wide_data_loads(decode(linked_observer_main)).empty() &&
+                rdna2_owned_raw_wide_data_loads(decode(linked_code)) == std::vector<uint32_t>{0u};
+            changed_identity = 99u;
+            check(linked_legacy && !linked_legacy->empty() && linked_only_owned &&
+                  !recompile_vertex_chain_cached_shared(mutable_prolog.data(), owned_prolog.size(),
+                      mutable_main.data(), linked_observer_main.size(), &legacy_table,
+                      nullptr, &changed_identity) && changed_identity == 0u, name,
+                  "same-address changed prolog checks ownership arising only in the linked stream");
             const auto chain_refuses = [&](const ShaderResourceTable& supplied, const char* label) {
                 uint64_t refused_identity = 77u, recovered_identity = 0u;
                 const bool cold = recompile_vertex_chain(prolog.data(), prolog.size(),

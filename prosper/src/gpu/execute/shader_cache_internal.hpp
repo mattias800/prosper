@@ -200,6 +200,10 @@ struct ShaderCompileKey {
     // transient concatenated buffer on every warm draw.
     std::shared_ptr<const std::vector<uint32_t>> chain_code;
     uint64_t chain_code_hash = 0;
+    // Non-semantic cache provenance: exact-byte analysis versions, never emitted module inputs.
+    // Module equality/hash intentionally exclude these IDs so code-identical versions still share.
+    uint64_t code_analysis_identity = 0;
+    uint64_t chain_analysis_identity = 0;
     std::vector<ShaderResourceCompileKey> resources;
     // Diagnostic identity. All-default in production (PROSPER_CFG_TRIP_BOUND unset), which leaves
     // every key byte-identical to what it was before this field existed -- so caching behaviour is

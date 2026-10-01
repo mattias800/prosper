@@ -597,6 +597,30 @@ struct ShaderAnalysisCache {
     uint64_t use_counter = 0;
 };
 
+// Only the code-derived owned-input verdict is memoized here. Entries retain weak analysis
+// owners, not shader bytes; resource requirements and markers stay outside this cache. Version IDs
+// are never reset by analysis clear/eviction, and both owner identities are checked on every hit,
+// so a theoretical ID wrap/reuse cannot authorize another byte version.
+struct ChainOwnedProofKey {
+    uint64_t prolog = 0, main = 0;
+    bool operator==(const ChainOwnedProofKey&) const = default;
+};
+struct ChainOwnedProofKeyHash {
+    size_t operator()(const ChainOwnedProofKey& key) const {
+        return static_cast<size_t>(hash_mix(key.prolog, key.main));
+    }
+};
+struct ChainOwnedProofEntry {
+    std::weak_ptr<const std::vector<uint32_t>> prolog, main;
+    bool requires_owned = false;
+    uint64_t last_use = 0;
+};
+struct ChainOwnedProofCache {
+    std::mutex mutex;
+    std::unordered_map<ChainOwnedProofKey, ChainOwnedProofEntry, ChainOwnedProofKeyHash> entries;
+    uint64_t use_counter = 0;
+};
+
 struct InterpolationCacheKey {
     uint64_t analysis_identity = 0;
     PixelSystemInputMapping system_inputs{};
@@ -839,6 +863,51 @@ ShaderDecodeCache& shader_decode_cache() {
 ShaderAnalysisCache& shader_analysis_cache() {
     static ShaderAnalysisCache cache;
     return cache;
+}
+
+ChainOwnedProofCache& chain_owned_proof_cache() {
+    static ChainOwnedProofCache cache;
+    return cache;
+}
+
+bool chain_code_requires_owned_cached(const ShaderCompileKey& key) {
+    const auto prove = [&] {
+        return rdna2_vertex_chain_has_owned_raw_wide_inputs(
+            key.code ? key.code->data() : nullptr, key.code ? key.code->size() : 0u,
+            key.chain_code ? key.chain_code->data() : nullptr,
+            key.chain_code ? key.chain_code->size() : 0u, nullptr);
+    };
+    // Zero denotes absent/uncacheable provenance. The underlying predicate still runs, including
+    // both standalone streams and the actual linked prolog prefix plus main code_span.
+    if (!key.code_analysis_identity || !key.chain_analysis_identity) return prove();
+    const ChainOwnedProofKey version{key.code_analysis_identity, key.chain_analysis_identity};
+    auto& cache = chain_owned_proof_cache();
+    {
+        std::lock_guard lock(cache.mutex);
+        auto found = cache.entries.find(version);
+        if (found != cache.entries.end()) {
+            const auto prolog = found->second.prolog.lock();
+            const auto main = found->second.main.lock();
+            if (prolog == key.code && main == key.chain_code) {
+                found->second.last_use = ++cache.use_counter;
+                return found->second.requires_owned;
+            }
+            cache.entries.erase(found);
+        }
+    }
+    // No cache mutex is held while decoding or acquiring any other shader cache. Concurrent cold
+    // workers may repeat a proof, but every published result names the same immutable owned bytes.
+    const bool requires_owned = prove();
+    std::lock_guard lock(cache.mutex);
+    constexpr size_t max_entries = 4096;
+    if (cache.entries.size() >= max_entries && !cache.entries.contains(version)) {
+        auto oldest = cache.entries.begin();
+        for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
+            if (it->second.last_use < oldest->second.last_use) oldest = it;
+        cache.entries.erase(oldest);
+    }
+    cache.entries[version] = {key.code, key.chain_code, requires_owned, ++cache.use_counter};
+    return requires_owned;
 }
 
 InterpolationCache& interpolation_cache() {
@@ -1337,6 +1406,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         // same blob as the direct path and table contents participate in the cache identity.
         key.code = std::shared_ptr<const std::vector<uint32_t>>(analysis, &analysis->code);
         key.code_hash = analysis->code_hash;
+        key.code_analysis_identity = analysis->identity;
     }
     if (stage == ShaderProgramStage::Vertex && chain_code && chain_dwords) {
         const std::shared_ptr<const ShaderCodeAnalysis> chain_analysis =
@@ -1345,6 +1415,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             key.chain_code = std::shared_ptr<const std::vector<uint32_t>>(
                 chain_analysis, &chain_analysis->code);
             key.chain_code_hash = chain_analysis->code_hash;
+            key.chain_analysis_identity = chain_analysis->identity;
         }
     }
     if (resources) {
@@ -1871,6 +1942,12 @@ void clear_shader_analysis_cache() {
         cache.use_counter = 0;
     }
     {
+        auto& cache = chain_owned_proof_cache();
+        std::lock_guard lock(cache.mutex);
+        cache.entries.clear();
+        cache.use_counter = 0;
+    }
+    {
         // #2945: the consumed-attribute memo is keyed on an analysis identity, so it must die with
         // the analysis cache. Leaving it would answer from an identity nothing can produce again.
         auto& cache = consumed_attribute_mask_cache();
@@ -2038,8 +2115,9 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
         bool capture_position) {
     // This must precede lookup: the direct-stage key cannot authenticate rebased main PCs or
     // recover owners discarded by the legacy chain table merge, including a warm entry.
-    if (rdna2_vertex_chain_has_owned_raw_wide_inputs(
-            prolog, prolog_dwords, main, main_dwords, resources)) {
+    if (resources && (!resources->owned_raw_snapshot_requirements.empty() || std::any_of(
+            resources->resources.begin(), resources->resources.end(),
+            [](const auto& resource) { return resource.owned_raw_snapshot_bytes != 0u; }))) {
         if (cache_identity) *cache_identity = 0;
         replay_terminal_reject_reasons(reinterpret_cast<uintptr_t>(prolog),
             {{"recompile-reject", "owned raw wide inputs require a direct vertex stage"}});
@@ -2050,6 +2128,12 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
         main, main_dwords, vertex_lds_dwords, nullptr, false, capture_position);
     if (!key.chain_code) {
         if (cache_identity) *cache_identity = 0;
+        return {};
+    }
+    if (chain_code_requires_owned_cached(key)) {
+        if (cache_identity) *cache_identity = 0;
+        replay_terminal_reject_reasons(reinterpret_cast<uintptr_t>(prolog),
+            {{"recompile-reject", "owned raw wide inputs require a direct vertex stage"}});
         return {};
     }
     // The prolog address is the program's identity everywhere else -- `DrawItem::vs_guest_addr` is
