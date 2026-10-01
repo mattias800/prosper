@@ -665,35 +665,41 @@ int main() {
             // POSIX specifies EDEADLK here ("a deadlock was detected, or the value of thread
             // specifies the calling thread"), so the host probe is a precondition rather than a
             // capability test — but it is still taken from the host, for the reason in the header.
-            char msg[224];
-            const int host_self_join = pthread_join(pthread_self(), nullptr);
-            if (host_self_join == 0) {
-                printf("  [SKIP] this host's own pthread_join permits a thread to join itself -- the "
-                       "#2575 EDEADLK arms cannot run here\n");
-            } else {
-                snprintf(msg, sizeof msg,
-                         "precondition: this HOST refuses a self-join with EDEADLK (host EDEADLK is "
-                         "%d here; got %d) -- established by a direct host call, so no handler can "
-                         "manufacture the skip", EDEADLK, host_self_join);
-                CHECK(host_self_join == EDEADLK, msg);
+            // Use a host-created worker: ASAN's thread-argument registry does not track the
+            // primordial main thread. All self-join checks finish before the parent continues.
+            std::thread self_join_probe([sce_join, posix_join] {
+                char msg[224];
+                const int host_self_join = pthread_join(pthread_self(), nullptr);
+                if (host_self_join == 0) {
+                    printf("  [SKIP] this host's own pthread_join permits a thread to join itself -- the "
+                           "#2575 EDEADLK arms cannot run here\n");
+                } else {
+                    snprintf(msg, sizeof msg,
+                             "precondition: this HOST refuses a self-join with EDEADLK (host EDEADLK is "
+                             "%d here; got %d) -- established by a direct host call, so no handler can "
+                             "manufacture the skip", EDEADLK, host_self_join);
+                    CHECK(host_self_join == EDEADLK, msg);
 
-                void* untouched = (void*)0xC0FFEE;
-                const uint64_t sony_rc =
-                    sce_join((uint64_t)pthread_self(), (uint64_t)(uintptr_t)&untouched, 0, 0, 0, 0);
-                const uint64_t posix_rc = posix_join((uint64_t)pthread_self(), 0, 0, 0, 0, 0);
-                snprintf(msg, sizeof msg,
-                         "pthread_join(self) reports bare FreeBSD EDEADLK (11), not this host's %d "
-                         "-- %d is FreeBSD's EAGAIN and would arrive as a retry hint (got %llu)",
-                         EDEADLK, EDEADLK, (unsigned long long)posix_rc);
-                CHECK(posix_rc == 11, msg);
-                snprintf(msg, sizeof msg,
-                         "scePthreadJoin(self) reports encoded FreeBSD EDEADLK 0x8002000b (got 0x%llx)",
-                         (unsigned long long)sony_rc);
-                CHECK(sony_rc == 0x8002000bull, msg);
-                CHECK(untouched == (void*)0xC0FFEE,
-                      "a REFUSED join leaves value_ptr untouched -- it used to be overwritten with "
-                      "NULL, which a guest reads as a legitimate NULL exit value");
-            }
+                    void* untouched = (void*)0xC0FFEE;
+                    const uint64_t sony_rc =
+                        sce_join((uint64_t)pthread_self(), (uint64_t)(uintptr_t)&untouched, 0, 0, 0, 0);
+                    const uint64_t posix_rc = posix_join((uint64_t)pthread_self(), 0, 0, 0, 0, 0);
+                    snprintf(msg, sizeof msg,
+                             "pthread_join(self) reports bare FreeBSD EDEADLK (11), not this host's %d "
+                             "-- %d is FreeBSD's EAGAIN and would arrive as a retry hint (got %llu)",
+                             EDEADLK, EDEADLK, (unsigned long long)posix_rc);
+                    CHECK(posix_rc == 11, msg);
+                    snprintf(msg, sizeof msg,
+                             "scePthreadJoin(self) reports encoded FreeBSD EDEADLK 0x8002000b (got 0x%llx)",
+                             (unsigned long long)sony_rc);
+                    CHECK(sony_rc == 0x8002000bull, msg);
+                    CHECK(untouched == (void*)0xC0FFEE,
+                          "a REFUSED join leaves value_ptr untouched -- it used to be overwritten with "
+                          "NULL, which a guest reads as a legitimate NULL exit value");
+                }
+            });
+            self_join_probe.join();
+            char msg[224];
 
             // --- detach. Its only reachable refusal is EINVAL, so it cannot carry the mapping half;
             // what it carries is the alias split, which is the defect it actually had.

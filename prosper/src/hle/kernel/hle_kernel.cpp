@@ -1033,13 +1033,14 @@ uint64_t guest_mutex_unlock_slot(uint64_t slot_addr) {
     return mtx_report("unlock", slot_addr, m, result);
 }
 HLE(k_mutex_lock)    { return guest_mutex_lock_slot(a0); }
-HLE(k_mutex_trylock) {
+uint64_t guest_mutex_trylock_slot(uint64_t slot_addr) {
     HostTcbScope host_tcb;                      // #3623
-    auto* m = ensure_mutex(a0); if (!m) return 0x16;
+    auto* m = ensure_mutex(slot_addr); if (!m) return 0x16;
     const int result = pthread_mutex_trylock(m);
     if (result == 0) { guest_mutex_acquired(m); mtx_waitlog_record(m); }
-    return mtx_report("trylock", a0, m, result);
+    return mtx_report("trylock", slot_addr, m, result);
 }
+HLE(k_mutex_trylock) { return guest_mutex_trylock_slot(a0); }
 HLE(k_mutex_unlock)  { return guest_mutex_unlock_slot(a0); }
 
 // --- Sony vs POSIX failure encoding for the shared pthread bodies (#1945, family of #1612) -------
@@ -1399,7 +1400,7 @@ HLE(k_cond_timedwait) {
     // to record. What holds instead, and can be checked mechanically: every indefinite park now goes
     // through `guest_cond_wait_slot`, which takes the scope itself, and the only bodies that call
     // `interruptible_cond_*wait` outside it are the two TIMED ones -- this function and
-    // `k_sce_cond_timedwait`. `grep -n 'interruptible_cond_\(clock_\)\?timed\?wait' hle_kernel.cpp`
+    // `guest_cond_timedwait_slot`. `grep -n 'interruptible_cond_\(clock_\)\?timed\?wait' hle_kernel.cpp`
     // is the check; anything it lists that is not scoped is a #2168 regression.
     GuestCondWaiterScope waiting(c);
     if (!a2) {
@@ -3106,25 +3107,27 @@ static timespec abs_deadline_us(uint64_t usec) {
 // scePthreadMutexTimedlock(mutex, SceKernelUseconds usec): acquire with a RELATIVE microsecond timeout,
 // returning 0 only when actually locked. Was MISSING -> the generic stub returned 0 (= "lock held")
 // without taking the lock, so the guest ran its critical section unguarded (the heap/GC-corruption class
-// root-caused for null static locks). ETIMEDOUT -> FreeBSD 60 (fbsd_errno doesn't remap it).
-// scePthreadMutexTimedlock has no POSIX spelling registered, so it encodes in place. The shipped
+// root-caused for null static locks). fbsd_errno maps host ETIMEDOUT to FreeBSD 60.
+// The Sony wrapper encodes the shared body's bare FreeBSD result. The shipped
 // guest libc.prx's `_Mtx_timedlock` compares this result against 0x8002003c (encoded ETIMEDOUT) and
 // maps anything else non-zero to Dinkumware `_Thrd_error`, which throws — so a plain 60 turned an
 // ordinary lock timeout into an uncaught std::system_error. Same contract as the mutex lock/trylock
 // aliases above (#1945).
-HLE(k_mutex_timedlock) {
+uint64_t guest_mutex_timedlock_slot(uint64_t slot_addr, uint64_t timeout_us) {
     HostTcbScope host_tcb;                      // #3623: ownership is resolved through %fs
-    auto* m = ensure_mutex(a0); if (!m) return prosper::hle::kSceKernelErrorEINVAL;
-    if (guest_mutex_self_deadlock(m)) return prosper::hle::kSceKernelErrorEDEADLK;
+    auto* m = ensure_mutex(slot_addr);
+    if (!m) return static_cast<uint32_t>(hle::FreeBsdErrno::EInval);
+    if (guest_mutex_self_deadlock(m)) return static_cast<uint32_t>(hle::FreeBsdErrno::EDeadlk);
     // Saturating for the same reason k_sem_timedwait's is (#3022's rule for the whole family):
-    // `a1 * 1000` wraps for a guest-supplied microsecond count above ~1.8e16.
+    // `timeout_us * 1000` wraps for a guest-supplied microsecond count above ~1.8e16.
     hle::WaitCensusScope census(hle::WaitKind::MutexTimedlock,
-                                prosper::host::timeout_ns_from_us(a1));
-    timespec dl = abs_deadline_us(a1);
+                                prosper::host::timeout_ns_from_us(timeout_us));
+    timespec dl = abs_deadline_us(timeout_us);
     int rc = pthread_mutex_timedlock(m, &dl);
     if (rc == 0) guest_mutex_acquired(m);
-    return sce_pthread_rc(fbsd_errno(rc));   // the table maps host ETIMEDOUT -> FreeBSD 60
+    return fbsd_errno(rc);   // the table maps host ETIMEDOUT -> FreeBSD 60
 }
+HLE(k_mutex_timedlock) { return sce_pthread_rc(guest_mutex_timedlock_slot(a0, a1)); }
 // scePthreadCondTimedwait(cond, mutex, SceKernelUseconds usec): the Sony 3rd arg is a RELATIVE µs scalar,
 // NOT an abstime pointer -> it must NOT be aliased to the POSIX k_cond_timedwait (which reads a2 as a
 // timespec*, so a small µs integer there derefs a bogus pointer). Unlike pthread_cond_timedwait, the
@@ -3133,18 +3136,18 @@ HLE(k_mutex_timedlock) {
 // wait; returning 60 makes it retry the timed wait forever instead of running its periodic work.
 // This one encoded only its TIMEOUT, and left EINVAL and every forwarded host failure bare — the
 // same question answered two ways inside a single function (#2178). It has no POSIX spelling
-// registered on its body (pthread_cond_timedwait takes the absolute form and has its own handler),
-// so it encodes in place, exactly as k_mutex_timedlock above does.
-HLE(k_cond_timedwait_sce) {
+// registered on its body (pthread_cond_timedwait takes the absolute form and has its own handler).
+// Its Sony wrapper encodes the shared body's bare result, like k_mutex_timedlock above.
+uint64_t guest_cond_timedwait_slot(uint64_t cond_slot, uint64_t mutex_slot, uint64_t timeout_us) {
     HostTcbScope host_tcb;                      // #3623
-    auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
-    if (!c || !m) return prosper::hle::kSceKernelErrorEINVAL;
+    auto* c = ensure_cond(cond_slot); auto* m = ensure_mutex(mutex_slot);
+    if (!c || !m) return static_cast<uint32_t>(hle::FreeBsdErrno::EInval);
     // FreeBSD refuses a wait on a mutex the caller does not own, with EPERM, BEFORE parking.
     // Answer that here rather than forwarding the host's: winpthreads reports EINVAL for this
     // case, so the guest got the right encoding carrying the wrong errno (#2327). Only fires
     // where prosper actually tracks ownership -- the registry is Windows-only, and on POSIX the
     // host already implements the FreeBSD contract itself.
-    if (guest_mutex_not_owned_by_self(m)) return prosper::hle::kSceKernelErrorEPERM;
+    if (guest_mutex_not_owned_by_self(m)) return static_cast<uint32_t>(hle::FreeBsdErrno::EPerm);
     GuestCondWaiterScope waiting(c);   // #2168: this body parks too, and was not counted either
     // #3056: the relative interval is measured on the CONDVAR'S OWN CLOCK, which is what its POSIX
     // sibling k_cond_timedwait already does (guest_cond_snapshot -> interruptible_cond_clock_timedwait).
@@ -3163,11 +3166,11 @@ HLE(k_cond_timedwait_sce) {
     const int32_t clock_id = guest_cond_snapshot(c).clock_id;
     timespec now{};
     if (const int clock_rc = guest_cond_clock_now(clock_id, now))
-        return sce_pthread_rc(fbsd_errno(clock_rc));
+        return fbsd_errno(clock_rc);
     const prosper::host::WaitDeadline abs = prosper::host::abs_deadline_from_rel_us(
-        prosper::host::WaitDeadline{(int64_t)now.tv_sec, (int64_t)now.tv_nsec}, a2);
+        prosper::host::WaitDeadline{(int64_t)now.tv_sec, (int64_t)now.tv_nsec}, timeout_us);
     const timespec dl{(time_t)abs.sec, (long)abs.nsec};
-    // Censused separately from k_cond_timedwait: this is the Sony spelling and its timeout is
+    // Censused separately from k_cond_timedwait: this is the Sony relative body and its timeout is
     // RELATIVE microseconds, so unlike the POSIX abstime form it yields an exact requested
     // interval. Leaving it out made the census report a clean zero for cond waits on titles
     // that only ever call this one, which is the shape CLAUDE.md warns about: the null was
@@ -3181,15 +3184,15 @@ HLE(k_cond_timedwait_sce) {
     // nanoseconds against a millisecond-scale request.
     //
     // The requested value is SATURATING, matching guest_ns_from in hle_kernel_time.cpp and
-    // k_sem_timedwait above: a2 is guest-controlled and `a2 * 1000` wraps above ~1.8e16 us, which
+    // k_sem_timedwait above: `timeout_us * 1000` wraps above ~1.8e16 guest-controlled us, which
     // would report a 5,800-year request as a short one.
     hle::WaitCensusScope census(hle::WaitKind::CondTimedwaitSce,
-                                prosper::host::timeout_ns_from_us(a2));
+                                prosper::host::timeout_ns_from_us(timeout_us));
     int rc = interruptible_cond_clock_timedwait(c, m, dl, clock_id, nullptr,
                                                 kGuestMutexCondWaitBookkeeping);
-    // sce_pthread_rc passes the already-encoded ETIMEDOUT through untouched, and encodes the rest.
-    return sce_pthread_rc(rc == ETIMEDOUT ? prosper::hle::kSceKernelErrorETIMEDOUT : fbsd_errno(rc));
+    return fbsd_errno(rc);
 }
+HLE(k_cond_timedwait_sce) { return sce_pthread_rc(guest_cond_timedwait_slot(a0, a1, a2)); }
 // scePthreadRwlockTimedrd/wrlock(rwlock, SceKernelUseconds usec): acquire with a RELATIVE µs timeout.
 // Were MISSING -> the generic stub returned 0 (= "lock held") without taking the lock, so the guest ran
 // its critical section unguarded (the same silent-unsync / heap-race class as k_mutex_timedlock above).
