@@ -170,8 +170,14 @@ int main() {
               kernel_stat_fn && fstat_fn && kernel_fstat_fn && lstat_fn && kernel_lstat_fn &&
               fcntl_fn && kernel_fcntl_fn,
           "file HLE functions registered");
+#ifdef _WIN32
     CHECK(kernel_sync_fn && kernel_sync_fn(0, 0, 0, 0, 0, 0) == 0,
-          "sceKernelSync performs the host-wide/process-file flush and returns success");
+          "sceKernelSync performs the process-file flush and returns success");
+#else
+    // file_sync_scope checks the result and scope with syscall interception. A real volume
+    // barrier here would make this byte-I/O test depend on unrelated host writeback (#2651).
+    CHECK(kernel_sync_fn != nullptr, "sceKernelSync is registered (barrier tested in file_sync_scope)");
+#endif
     std::array<uint8_t, 64> dir_buffer{};
 
     // Creating an existing directory is a failure, not an idempotent success. Linux previously

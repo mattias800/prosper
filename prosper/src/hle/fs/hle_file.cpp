@@ -7,6 +7,7 @@
 #include "hle/fs/save_capacity.hpp"   // allocation record + usage for GetMountInfo (#3654)
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/fs/save_paths.hpp"
+#include "hle/fs/guest_sync.hpp"
 #include "hle/service/hle_addcontent.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "host/memory/guest_write_watch.hpp"
@@ -544,6 +545,7 @@ namespace {
 #else
             ::mkdir(root.c_str(), 0777);
 #endif
+            guest_sync_note_root(root);
         }
         return root;
     }
@@ -572,6 +574,7 @@ namespace {
 #else
             ::mkdir(d.c_str(), 0777);
 #endif
+            guest_sync_note_root(d);
             return d;
         }();
         return root;
@@ -603,6 +606,7 @@ namespace {
             ::mkdir((d + "/savedata0").c_str(), 0777);
             ::mkdir((d + "/download0").c_str(), 0777);
 #endif
+            guest_sync_note_root(d);
             return d;
         }();
         return dir;
@@ -904,6 +908,7 @@ namespace {
 
 void set_app0_root(const std::string& root) {
     g_app0 = root;
+    guest_sync_note_root(root);
     addcontent_configure_for_app0(root);
 }
 std::string resolve_guest_path(const char* guest_path) {
@@ -995,6 +1000,7 @@ SaveDataMountOutcome savedata0_mount(const char* dirname, SaveDataMountPolicy po
     // mount -- the save itself is there -- it leaves the capacity reported as unknown, loudly.
     save_allocation_note_mount(save0_base(), dirname, created, requested_blocks);
     std::lock_guard<std::mutex> lk(g_save0_mx);
+    guest_sync_note_root(d);
     g_save0 = d;
     return created ? SaveDataMountOutcome::Created : SaveDataMountOutcome::Opened;
 }
@@ -1098,10 +1104,11 @@ void to_sce_stat64(const struct _stat64& s, uint8_t* out) {
 // --- stdio FILE* ---
 HLE(f_fopen)   { std::string h = translate(CS(a0)); const char* mode = CS(a1);
                   FILE* f = fopen(h.c_str(), mode);
+                  guest_sync_note_stream(f, mode && std::strpbrk(mode, "wa+"));
                   if (filelog()) fprintf(stderr, "[file] fopen host='%s' mode='%s' -> %p error=%d\n",
                                          h.c_str(), mode ? mode : "(null)", (void*)f, f ? 0 : errno);
                   return (uint64_t)(uintptr_t)f; }
-HLE(f_fclose)  { return a0 ? (uint64_t)(int64_t)fclose((FILE*)P(a0)) : 0; }
+HLE(f_fclose)  { return a0 ? (uint64_t)(int64_t)guest_sync_close_stream((FILE*)P(a0)) : 0; }
 HLE(f_fread)   { if (!a3) return 0;
                   FILE* f = (FILE*)P(a3); size_t n = fread(P(a0), a1, a2, f);
                   if (filelog()) fprintf(stderr,
@@ -1276,6 +1283,7 @@ HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_fla
                while (fd >= 0 && fd < 3) { int nfd = fcntl(fd, F_DUPFD, 3); ::close(fd); fd = nfd; }
 #endif
                int err = fd < 0 ? errno : 0;
+               guest_sync_note_fd(fd);
                filelog_remember_fd(fd, h);
                readbytes_note_open(h);
                readbytes_maybe_report();
@@ -1300,7 +1308,7 @@ HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
                int r = -1;
                if (!windows_close_directory(fd, &r)) r = ::close(fd);
 #else
-               int r = ::close(fd);
+               int r = guest_sync_close_fd(fd);
 #endif
                int err = r < 0 ? errno : 0;
                filelog_fd_io("close", fd, 0, 0, r, err);
@@ -1315,7 +1323,7 @@ HLE(k_close) { uint64_t result = f_close(a0, a1, a2, a3, a4, a5);
 // against elsewhere. Back with host dup/dup2; dup keeps the result above fd 2 (same as f_open).
 #ifndef _WIN32
 HLE(f_dup)  { int fd = ::dup((int)a0); while (fd >= 0 && fd < 3) { int n = fcntl(fd, F_DUPFD, 3); ::close(fd); fd = n; } return (uint64_t)(int64_t)fd; }
-HLE(f_dup2) { return (uint64_t)(int64_t)::dup2((int)a0, (int)a1); }
+HLE(f_dup2) { return (uint64_t)(int64_t)guest_sync_dup2((int)a0, (int)a1); }
 #else
 HLE(f_dup)  { return (uint64_t)(int64_t)windows_duplicate_above_stdio((int)a0); }
 HLE(f_dup2) {
@@ -1819,7 +1827,7 @@ HLE(k_pwritev){ uint64_t r = f_pwritev(a0, a1, a2, a3, a4, a5); int e = errno; r
 HLE(f_ftruncate) { return (uint64_t)(int64_t)::ftruncate((int)a0, (off_t)a1); }
 // sceKernelTruncate(path, length): the path-based sibling of ftruncate. Same fake-success -> stale-tail
 // corruption class (NID WlyEA-sLDf0, reached via libc.prx). Translate the path through the mount layer.
-HLE(f_truncate)  { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::truncate(h.c_str(), (off_t)a1); }
+HLE(f_truncate)  { std::string h = translate(CS(a0)); guest_sync_note_path(h); return (uint64_t)(int64_t)::truncate(h.c_str(), (off_t)a1); }
 #else
 HLE(f_ftruncate) { ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
                     int error = ::_chsize_s((int)a0, (__int64)a1);
@@ -1929,7 +1937,7 @@ HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); int err = r < 0 ? 
 // the key fix is WRITING the buffer. fsync: was fake-success; flush for real save durability.
 HLE(f_lstat) { std::string h = translate(CS(a0)); struct stat st; int r = ::lstat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_chmod) { if (!a0) { errno = EFAULT; return (uint64_t)(int64_t)-1; }
-               std::string h = translate(CS(a0));
+               std::string h = translate(CS(a0)); guest_sync_note_path(h);
                return (uint64_t)(int64_t)::chmod(h.c_str(), (mode_t)a1); }
 HLE(f_fchmod){ return (uint64_t)(int64_t)::fchmod((int)a0, (mode_t)a1); }
 HLE(f_fsync) { return (uint64_t)(int64_t)::fsync((int)a0); }
@@ -1943,9 +1951,9 @@ HLE(f_fdatasync) {
 #endif
 }
 HLE(k_sync) {
-    // sceKernelSync is the descriptor-free, whole-filesystem durability barrier. Unlike fsync it
-    // has no failure result to translate: the BSD/POSIX primitive returns void.
-    ::sync();
+    // CONFIDENCE: MED on PS5 scope (no hardware ordering evidence); preserve the existing
+    // void/success ABI and filesystem durability, bounded to guest storage filesystems.
+    guest_sync();
     return 0;
 }
 #else
@@ -2022,6 +2030,7 @@ HLE(k_utimes) {
             host_times[i].tv_usec = (suseconds_t)guest_times[i].usec;
         }
     }
+    guest_sync_note_path(host);
     const int result = ::utimes(host.c_str(), guest_times ? host_times : nullptr);
     return result == 0 ? 0 : file_sce_error(errno);
 #else
@@ -2066,14 +2075,14 @@ HLE(k_utimes) {
 #endif
 }
 HLE(f_access){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::access(h.c_str(), (int)a1); }
-HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode)
+HLE(f_mkdir) { std::string h = translate(CS(a0)); guest_sync_note_path(h);   // sceKernelMkdir(path, mode)
 #ifdef _WIN32
     return (uint64_t)(int64_t)::_mkdir(h.c_str());
 #else
     return (uint64_t)(int64_t)::mkdir(h.c_str(), (mode_t)(a1 ? a1 : 0777));
 #endif
 }
-HLE(f_rmdir) { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::rmdir(h.c_str()); }
+HLE(f_rmdir) { std::string h = translate(CS(a0)); guest_sync_note_path(h); return (uint64_t)(int64_t)::rmdir(h.c_str()); }
 HLE(k_mkdir) { uint64_t r = f_mkdir(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 HLE(k_rmdir) { uint64_t r = f_rmdir(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 
@@ -2126,7 +2135,7 @@ int getdents_close_fd(int fd) {
     if (it != g_getdents_dirs.end()) { if (it->second) closedir(it->second); g_getdents_dirs.erase(it); }
     // Keep the guest-fd close under the same guard. Otherwise getdents can repopulate this key
     // after erase but before close, leaving the replacement DIR* stale when the fd is reused.
-    return ::close(fd);
+    return guest_sync_close_fd(fd);
 }
 #endif
 HLE(k_getdents) {
@@ -2248,7 +2257,7 @@ HLE(f_getdents) {
 HLE(f_getdirentries) {
     return directory_result_to_posix(k_getdirentries(a0, a1, a2, a3, a4, a5));
 }
-HLE(f_unlink){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::
+HLE(f_unlink){ std::string h = translate(CS(a0)); guest_sync_note_path(h); return (uint64_t)(int64_t)::
 #ifdef _WIN32
     _unlink
 #else
@@ -2261,6 +2270,7 @@ HLE(f_unlink){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::
 // paths go through the mount-path translation (a rename inside /savedata0 must not hit raw guest paths).
 // NID 52NcYU9+lEo, reached via libc.prx. ::rename is standard C (Windows + Linux).
 HLE(f_rename){ std::string from = translate(CS(a0)), to = translate(CS(a1));
+               guest_sync_note_path(from); guest_sync_note_path(to);
                return (uint64_t)(int64_t)::rename(from.c_str(), to.c_str()); }
 HLE(k_unlink){ uint64_t r = f_unlink(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
 HLE(k_rename){ uint64_t r = f_rename(a0, a1, a2, a3, a4, a5); int e = errno; return kernel_file_result32(r, e); }
@@ -4524,7 +4534,7 @@ void register_file_hle() {
     R("lstat", f_lstat);   R("sceKernelLstat", k_lstat);     // was MISSING -> uninitialized stat buffer
     R("fsync", f_fsync);       R("sceKernelFsync", k_fsync);       // real descriptor durability
     R("fdatasync", f_fdatasync); R("sceKernelFdatasync", k_fdatasync); // data-only durability
-    R("sceKernelSync", k_sync); // whole-filesystem/process-file flush (was fake success)
+    R("sceKernelSync", k_sync); // guest-storage filesystem/process-stdio barrier
     R("sceKernelCheckReachability", k_check_reachability); // truthful file/directory existence
     R("sceKernelUtimes", k_utimes); // preserve guest access/modify timestamps (incl. touch-now)
     R("sceKernelChmod", k_chmod); R("sceKernelFchmod", k_fchmod); // real guest mode changes

@@ -1,5 +1,6 @@
 // save_paths.cpp — see save_paths.hpp for the contract and for why existing saves are not migrated.
 #include "hle/fs/save_paths.hpp"
+#include "hle/fs/guest_sync.hpp"
 
 #include "hle/service/hle_addcontent.hpp"
 
@@ -192,6 +193,7 @@ std::string ensure(const std::string& dir) {
                      dir.c_str());
         return {};
     }
+    guest_sync_note_root(dir);
     return dir;
 }
 }   // namespace

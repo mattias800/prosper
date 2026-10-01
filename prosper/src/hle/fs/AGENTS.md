@@ -5,6 +5,9 @@ save data the platform layers on top of it.
 
 - `hle_file` — the POSIX and `sceKernel*` file surface, with `/app0` path translation. The largest
   thing here and still per-platform in one file; see the note below.
+- `guest_sync` — the POSIX descriptor-free durability barrier, bounded to retained guest
+  storage filesystems. Private filesystem handles outlive guest closes and save unmounts;
+  writable guest stdio is flushed first.
 - `save_paths` — where a title's saves live on the host, per title id (#2734).
 - `save_param` — the save's parameter block, the metadata a title attaches to a slot (#2786).
 - `save_capacity` — a save's allocation (the blocks its creating mount asked for) and how much of it
