@@ -2234,6 +2234,20 @@ if(TARGET prosper_core)
     "${CMAKE_CURRENT_BINARY_DIR}/wait-regmem-observation-disabled.jsonl")
   set_tests_properties(wait_regmem_observation_disabled PROPERTIES
     ENVIRONMENT "PROSPER_NO_PERF_ALARMS=1")
+  add_executable(test_wait_regmem_packet_route tests/diagnostics/test_wait_regmem_packet_route.cpp)
+  set_property(TARGET test_wait_regmem_packet_route PROPERTY
+    PROSPER_DIAG_MEMBER_FACT_DOMAIN TEST_LOCAL)
+  target_link_libraries(test_wait_regmem_packet_route PRIVATE prosper_core)
+  add_test(NAME wait_regmem_packet_route COMMAND test_wait_regmem_packet_route
+    "${CMAKE_CURRENT_BINARY_DIR}/wait-regmem-packet-route.jsonl" proceed)
+  add_test(NAME wait_regmem_packet_route_defer COMMAND test_wait_regmem_packet_route
+    "${CMAKE_CURRENT_BINARY_DIR}/wait-regmem-packet-route-defer.jsonl" defer)
+  add_test(NAME wait_regmem_packet_route_disabled COMMAND test_wait_regmem_packet_route
+    "${CMAKE_CURRENT_BINARY_DIR}/wait-regmem-packet-route-disabled.jsonl" proceed)
+  set_tests_properties(wait_regmem_packet_route_disabled PROPERTIES
+    ENVIRONMENT "PROSPER_NO_PERF_ALARMS=1")
+  set_tests_properties(wait_regmem_packet_route wait_regmem_packet_route_defer
+    wait_regmem_packet_route_disabled PROPERTIES TIMEOUT 30)
 
   # Render-state extraction: fold a stream into a GpuState, then interpret RDNA2 registers.
   add_executable(test_render_state tests/gpu/state/test_render_state.cpp)
