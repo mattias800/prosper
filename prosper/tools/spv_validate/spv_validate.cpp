@@ -515,7 +515,9 @@ int main(int argc, char** argv) {
                              loop_votes::Shape::CrossCarried, loop_votes::Shape::BoolToggle,
                              loop_votes::Shape::CounterWithDeadVote}) {
         const bool counter = shape == loop_votes::Shape::Counter;
-        for (uint32_t bound = counter ? 0 : 2; bound < (counter ? 4u : 3u); ++bound) {
+        const bool changing_bool = shape == loop_votes::Shape::BoolToggle;
+        for (uint32_t bound = counter ? 0 : changing_bool ? 1 : 2;
+             bound < (counter || changing_bool ? 4u : 3u); ++bound) {
             const std::string name = "fragment_vote_loop_poison_" +
                 std::to_string(static_cast<uint32_t>(shape)) + "_" + std::to_string(bound);
             const auto source = loop_votes::make_module(shape, bound, true);

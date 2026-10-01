@@ -303,6 +303,9 @@ inline std::vector<Fixture> fixtures() {
     for (uint32_t bound = 0; bound < 4; ++bound)
         out.push_back({"initialized_loop_bound_" + std::to_string(bound),
                        loops::make_module(loops::Shape::Counter, bound), false, true, 1, 0});
+    for (const uint32_t bound : {1u, 3u})
+        out.push_back({"changing_boolean_odd_bound_" + std::to_string(bound),
+                       loops::make_module(loops::Shape::BoolToggle, bound), false, true, 1, 0});
     return out;
 }
 

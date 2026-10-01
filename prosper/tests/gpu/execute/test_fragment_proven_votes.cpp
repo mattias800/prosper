@@ -124,6 +124,13 @@ void verify_loop_votes(uint32_t x, uint32_t y, bool poison) {
         verify_derivatives(render(vertex, source, 0, FragmentWavePolicy::ProvenVotes), x, y,
                            shape == loops::Shape::CrossCarried ? 10 : shape == loops::Shape::BoolToggle ? 9 : 2);
     }
+    // An even number of toggles also ends true if the Boolean carry is accidentally frozen.
+    // Odd trips finish false, so blue = 4*count observes the changing Boolean independently.
+    for (const uint32_t bound : {1u, 3u}) {
+        const auto source = std::make_shared<const std::vector<uint32_t>>(
+            loops::make_module(loops::Shape::BoolToggle, bound, poison));
+        verify_derivatives(render(vertex, source, 0, FragmentWavePolicy::ProvenVotes), x, y, 4 * bound);
+    }
     for (const auto shape : {loops::Shape::VaryingTrip, loops::Shape::VaryingInit, loops::Shape::VaryingBoolUpdate,
                              loops::Shape::SecondUnsafeLoop}) {
         const auto source = std::make_shared<const std::vector<uint32_t>>(loops::make_module(shape));
