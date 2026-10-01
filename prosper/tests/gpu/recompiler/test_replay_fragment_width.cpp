@@ -13,6 +13,7 @@
 #include <map>
 #include <set>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace prosper;
@@ -44,6 +45,7 @@ constexpr uint32_t fragment_words[] = {
     0xbf810000u,
 };
 constexpr uint32_t stored_fragment_words[] = {
+    0xd7660004u, 0x00010081u, // dead v4 high-half MBCNT: stored width is not launch provenance
     0x7e000280u, 0x7e0202f2u, 0x7e040280u, 0x7e0602f2u,
     0xf800180fu, 0x03020100u, 0xbf810000u,
 };
@@ -219,6 +221,32 @@ int main(int argc, char** argv) {
         }
     }
 
+    for (const char* text : {static_cast<const char*>(nullptr), "32", "64"}) {
+        CHECK(tools::parse_replay_fragment_wave_size(text, selection), "resolver request parses");
+        const auto requested = selection;
+        for (const auto captured : {std::pair{false, false}, std::pair{false, true},
+                                    std::pair{true, false}, std::pair{true, true}}) {
+            const auto resolved = tools::resolve_replay_fragment_wave_size(
+                requested, captured.first, captured.second);
+            const bool expected32 = text ? std::strcmp(text, "32") == 0
+                                         : captured.first && captured.second;
+            CHECK(resolved.wave32() == expected32 && resolved.explicit_override == (text != nullptr),
+                  "override beats captured ABI; captured ABI beats unknown legacy Wave64 default");
+            CHECK(selection.size == requested.size &&
+                      selection.explicit_override == requested.explicit_override,
+                  "per-draw resolution does not mutate the process-wide request");
+        }
+    }
+
+    const tools::ReplayFragmentWaveSelection stale_non_override{
+        tools::ReplayFragmentWaveSize::Wave32, false};
+    for (bool unavailable_width : {false, true}) {
+        const auto resolved = tools::resolve_replay_fragment_wave_size(
+            stale_non_override, false, unavailable_width);
+        CHECK(!resolved.wave32() && !resolved.explicit_override,
+              "unavailable ABI resets stale non-override selection to canonical legacy Wave64");
+    }
+
     // This tiny stream cannot match the unchanged 3142-dword legacy capture exception.
     clear_tap();
     std::vector<gpu::Rdna2Inst> decoded;
@@ -231,14 +259,20 @@ int main(int argc, char** argv) {
           "fixture decodes real high-half numeric MBCNT followed by tapped u32-to-float conversion");
     for (const char* text : {static_cast<const char*>(nullptr), "32", "64"}) {
         CHECK(tools::parse_replay_fragment_wave_size(text, selection), "semantic control width parses");
-        const uint32_t width = selection.wave32() ? 32u : 64u;
-        const auto spirv = gpu::recompile_fragment(fragment_words, std::size(fragment_words),
-            nullptr, nullptr, UINT32_MAX, nullptr, selection.wave32());
-        CHECK(!spirv.empty() && gpu::fragment_spirv_required_subgroup_size(spirv) == width,
-              "real fragment recompiler emits the selected exact-width contract");
-        Module module;
-        CHECK(module.read(spirv) && module.live_high_half_mask(width),
-              "actual MRT0 red depends on typed live width mask, high-half compare and BitCount");
+        for (const auto captured : {std::pair{false, false}, std::pair{true, false},
+                                    std::pair{true, true}}) {
+            const uint32_t width = text ? (std::strcmp(text, "32") == 0 ? 32u : 64u)
+                                        : (captured.first && captured.second ? 32u : 64u);
+            const auto resolved = tools::resolve_replay_fragment_wave_size(
+                selection, captured.first, captured.second);
+            const auto spirv = gpu::recompile_fragment(fragment_words, std::size(fragment_words),
+                nullptr, nullptr, UINT32_MAX, nullptr, resolved.wave32());
+            CHECK(!spirv.empty() && gpu::fragment_spirv_required_subgroup_size(spirv) == width,
+                  "resolved captured/requested width reaches the real fragment compiler");
+            Module module;
+            CHECK(module.read(spirv) && module.live_high_half_mask(width),
+                  "actual MRT0 red depends on typed live width mask, high-half compare and BitCount");
+        }
     }
 
     if (argc == 3) {
@@ -249,9 +283,18 @@ int main(int argc, char** argv) {
         capture.raw_shader_versions.push_back(raw_shader(fragment_words, std::size(fragment_words)));
         gpu::GpuCapturedDraw draw;
         draw.vs = gpu::recompile_vertex(vertex_words, std::size(vertex_words));
-        // Distinct non-wave stored shader: a silent keep-stored fallback must fail the CLI oracle.
-        draw.fs = gpu::recompile_fragment(stored_fragment_words, std::size(stored_fragment_words));
-        CHECK(!draw.vs.empty() && !draw.fs.empty(), "synthetic stored graphics modules compile");
+        // Stored width deliberately opposes the captured/default choice while its MRT0 value
+        // remains distinct. Inferring launch width from a stored marker, or silently keeping the
+        // stored shader, must fail the CLI's live SSA/output oracle independently of notices.
+        const auto stored32 = gpu::recompile_fragment(stored_fragment_words,
+            std::size(stored_fragment_words), nullptr, nullptr, UINT32_MAX, nullptr, true);
+        const auto stored64 = gpu::recompile_fragment(stored_fragment_words,
+            std::size(stored_fragment_words), nullptr, nullptr, UINT32_MAX, nullptr, false);
+        CHECK(!draw.vs.empty() && !stored32.empty() && !stored64.empty() &&
+                  gpu::fragment_spirv_required_subgroup_size(stored32) == 32 &&
+                  gpu::fragment_spirv_required_subgroup_size(stored64) == 64,
+              "stored synthetic modules retain opposing width markers but a distinct MRT0 value");
+        draw.fs = stored32;
         draw.draw_index = 7; // not compact item 0: pin semantic draw selection as well
         draw.command_order = 1;
         draw.vertex_count = draw.raw_draw_count = 3;
@@ -263,10 +306,56 @@ int main(int argc, char** argv) {
         draw.fs_raw_shader_index = 1;
         capture.draws.push_back(draw);
         capture.operations.push_back({gpu::SubmitOperationKind::Draw, 7, 1, true});
-        std::string error;
-        CHECK(gpu::write_gpu_capture((directory / "fragment-width.prgcap").string(), capture, error),
-              "fixture mode writes a realized draw with production capture serialization");
-        if (!error.empty()) std::fprintf(stderr, "fixture: %s\n", error.c_str());
+        auto write = [&](const char* name, const gpu::GpuCaptureFile& fixture) {
+            std::string error;
+            CHECK(gpu::write_gpu_capture((directory / name).string(), fixture, error),
+                  "fixture mode writes width states with production capture serialization");
+            if (!error.empty()) std::fprintf(stderr, "fixture %s: %s\n", name, error.c_str());
+        };
+        write("fragment-width.prgcap", capture); // canonical unavailable v63
+        capture.draws[0].fragment_wave_config_available = true;
+        capture.draws[0].ps_wave32 = true;
+        capture.draws[0].fs = stored64;
+        write("fragment-width-captured32.prgcap", capture);
+        auto no_raw = capture;
+        no_raw.draws[0].vs_raw_shader_index = no_raw.draws[0].fs_raw_shader_index = UINT32_MAX;
+        no_raw.raw_shader_versions.clear();
+        write("fragment-width-no-raw.prgcap", no_raw);
+        capture.draws[0].ps_wave32 = false;
+        capture.draws[0].fs = stored32;
+        write("fragment-width-captured64.prgcap", capture);
+        auto second = capture.draws[0];
+        second.draw_index = 11;
+        second.command_order = 2;
+        capture.draws[0].ps_wave32 = true;
+        capture.draws[0].fs = stored64;
+        capture.draws.push_back(second);
+        capture.operations.push_back({gpu::SubmitOperationKind::Draw, 11, 2, true});
+        write("fragment-width-mixed.prgcap", capture);
+
+        // Realized-draw selection must not broaden the unrelated v61 failed-stage retry contract.
+        // The override is dormant there, even when it opposes the captured failure ABI or is bad.
+        gpu::GpuCaptureFile failed;
+        failed.metadata.width = failed.metadata.height = 1;
+        failed.failure_diagnostics_available = true;
+        failed.raw_shader_versions.push_back(raw_shader(fragment_words, std::size(fragment_words)));
+        failed.operations.push_back({gpu::SubmitOperationKind::Draw, 7, 1, false});
+        gpu::GpuCapturedOperationFailure failure;
+        failure.source_index = 7;
+        failure.command_order = 1;
+        failure.reason = gpu::RealizationFailureReason::ShaderRecompile;
+        failure.vertex_retry_config_available = true; // prerequisite for the v61 fragment tail
+        failure.fragment_retry_config_available = true;
+        gpu::GpuCapturedStageDiagnostic stage;
+        stage.stage = gpu::ShaderProgramStage::Fragment;
+        stage.program_addr = 0x7000u;
+        stage.raw_shader_index = 0;
+        failure.stages.push_back(stage);
+        failed.failure_diagnostics.push_back(failure);
+        failed.failure_diagnostics[0].ps_wave32 = true;
+        write("fragment-width-failed32.prgcap", failed);
+        failed.failure_diagnostics[0].ps_wave32 = false;
+        write("fragment-width-failed64.prgcap", failed);
     }
     std::printf("== %s (%d failures) ==\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

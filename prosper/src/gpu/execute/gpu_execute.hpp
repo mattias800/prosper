@@ -95,6 +95,12 @@ struct DrawItem {
     PixelSystemInputMapping system_inputs{};
     bool has_pixel_inputs = false;
     bool has_system_inputs = false;
+    // Guest launch ABI passed to the fragment compiler, not the selected SPIR-V's effective
+    // subgroup width (which may differ after a proved transformation or utility replacement).
+    // Synthetic/external modules and legacy captures leave availability false; never infer it
+    // from a module marker. An unavailable value has canonical ps_wave32=false.
+    bool fragment_wave_config_available = false;
+    bool ps_wave32 = false;
     // Process-unique identities supplied by the exact shader-recompile cache. Zero means the
     // shader came from an external/replay path, so persistent backend caches must compare words.
     uint64_t vs_identity = 0, fs_identity = 0;
@@ -2936,6 +2942,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     if (pixel_input_ptr) out.pixel_inputs = *pixel_input_ptr;
     out.has_system_inputs = system_input_ptr != nullptr;
     if (system_input_ptr) out.system_inputs = *system_input_ptr;
+    out.fragment_wave_config_available = rs.ps_addr != 0;
+    out.ps_wave32 = out.fragment_wave_config_available && rs.ps_wave32;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for

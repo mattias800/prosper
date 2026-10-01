@@ -474,9 +474,9 @@ int main(int argc, char** argv) {
               legacy_fragment_bytes.size() > 26u,
               "CLI fixture serializes a current fragment retry for a legacy downgrade");
         if (legacy_fragment_bytes.size() > 26u) {
-            // This fixture has no resources: remove the v62 zero-resource count and the
+            // This fixture has no realized draws/resources: remove the v63 and v62 zero counts and the
             // v61 availability/flags/system-input tail to recover an exact v60 prefix.
-            legacy_fragment_bytes.resize(legacy_fragment_bytes.size() - 4u - 10u);
+            legacy_fragment_bytes.resize(legacy_fragment_bytes.size() - 4u - 4u - 10u);
             legacy_fragment_bytes[8] = 60u;
             FILE* legacy_fragment = std::fopen(
                 (directory / "fragment-v60.prgcap").string().c_str(), "wb");

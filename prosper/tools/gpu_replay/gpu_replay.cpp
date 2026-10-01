@@ -63,12 +63,20 @@ bool select_fragment_wave_size(const char* mode,
                      "unsigned 32 or 64 (base-0); refusing fragment regeneration\n", mode);
         return false;
     }
-    std::fprintf(stderr,
-                 "[%s] fragment-wave=%u source=%s captured-width=unavailable; "
-                 "requested width is not a captured per-draw ABI\n",
-                 mode, static_cast<uint32_t>(selection.size),
-                 selection.explicit_override ? "override" : "legacy-default");
     return true;
+}
+
+void report_fragment_wave_size(const char* mode, const prosper::gpu::DrawItem& draw,
+                              const prosper::tools::ReplayFragmentWaveSelection& selection) {
+    const char* captured = draw.fragment_wave_config_available
+        ? (draw.ps_wave32 ? "32" : "64") : "unavailable";
+    const char* source = selection.explicit_override ? "override"
+        : (draw.fragment_wave_config_available ? "captured" : "legacy-default");
+    std::fprintf(stderr,
+                 "[%s] fragment-wave=%u source=%s captured-width=%s draw=%llu; "
+                 "guest compile request, not effective backend subgroup width\n",
+                 mode, static_cast<uint32_t>(selection.size), source, captured,
+                 static_cast<unsigned long long>(draw.draw_index));
 }
 
 void usage(const char* argv0) {
@@ -882,6 +890,8 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                         (d.ps.cb_target_mask & d.ps.cb_shader_mask) & 0xFFu);
         else
             std::printf("  color-state unavailable (capture v%u predates v43)\n", format_version);
+        std::printf("  ps-wave captured-width=%s (guest compile ABI, not SPIR-V subgroup width)\n",
+                    d.fragment_wave_config_available ? (d.ps_wave32 ? "32" : "64") : "unavailable");
         // Resolved SPI_PS_INPUT_CNTL linkage (see pixel_input_linkage.hpp): which producer PARAM
         // slot each pixel-shader input actually reads, or whether the interpolator synthesizes a
         // constant instead. Retained since capture v36; older captures print `none` rather than
@@ -3060,6 +3070,16 @@ int main(int argc, char** argv) {
     // Validate this diagnostic before Vulkan initialization can obscure a malformed request.
     if (recompile_raw && capture.format_version >= 36 &&
         !select_fragment_wave_size("recompile-raw", raw_fragment_wave)) return 2;
+    // Report the per-draw choice before Vulkan registration. Mixed-width submits must not use
+    // one process-wide request as though every realized draw had the same captured launch ABI.
+    if (recompile_raw && capture.format_version >= 36) {
+        for (const auto& item : replay.items) {
+            if (item.fs_raw_shader_index >= replay.raw_shader_versions.size()) continue;
+            const auto selection = prosper::tools::resolve_replay_fragment_wave_size(
+                raw_fragment_wave, item.fragment_wave_config_available, item.ps_wave32);
+            report_fragment_wave_size("recompile-raw", item, selection);
+        }
+    }
     if (recompile_raw && capture.format_version >= 39 &&
         prosper::tools::replay_will_render(render_intent)) {
         prosper::frontend::register_live_renderer(".", false);
@@ -3106,9 +3126,11 @@ int main(int argc, char** argv) {
                     raw.words.data(), raw.words.size(), system_inputs, pixel_inputs);
                 if (interpolation.valid) {
                     requires_geometry = interpolation.requires_geometry;
+                    const auto fragment_wave = prosper::tools::resolve_replay_fragment_wave_size(
+                        raw_fragment_wave, it.fragment_wave_config_available, it.ps_wave32);
                     fs = prosper::gpu::recompile_fragment(
                         raw.words.data(), raw.words.size(), it.prt.get(), system_inputs,
-                        UINT32_MAX, &interpolation, raw_fragment_wave.wave32());
+                        UINT32_MAX, &interpolation, fragment_wave.wave32());
                     if (interpolation.requires_geometry && it.ps.topology >= 3u &&
                         it.ps.topology <= 5u)
                         gs = prosper::gpu::recompile_interpolation_geometry(interpolation);
@@ -3288,6 +3310,9 @@ int main(int argc, char** argv) {
             prosper::tools::replay_item_index_for_draw(replay, prosper::tools::DrawIndex{n});
         if (item_index != prosper::tools::kNoItemIndex) {
             auto& it = replay.items[prosper::tools::raw(item_index)];
+            fragment_wave = prosper::tools::resolve_replay_fragment_wave_size(
+                fragment_wave, it.fragment_wave_config_available, it.ps_wave32);
+            report_fragment_wave_size("fs-tap", it, fragment_wave);
             const prosper::tools::OperationIndex operation_index =
                 prosper::tools::replay_operation_index_for_draw(
                     replay, prosper::tools::DrawIndex{n});

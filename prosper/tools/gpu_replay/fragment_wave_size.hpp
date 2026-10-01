@@ -4,8 +4,8 @@
 
 namespace prosper::tools {
 
-// Realized draws do not yet retain SPI_PS_IN_CONTROL.PS_W32_EN. Keep the historical
-// requested default distinct from an explicit diagnostic override, never a captured ABI claim.
+// Keep requested overrides, captured guest launch ABI and the historical unknown-width default
+// separate. Neither a request nor a stored SPIR-V subgroup marker supplies capture provenance.
 // A scoped enum cannot silently convert a numeric width to recompile_fragment's Boolean mode.
 enum class ReplayFragmentWaveSize : uint32_t { Wave32 = 32, Wave64 = 64 };
 
@@ -15,6 +15,14 @@ struct ReplayFragmentWaveSelection {
 
     bool wave32() const { return size == ReplayFragmentWaveSize::Wave32; }
 };
+
+inline ReplayFragmentWaveSelection resolve_replay_fragment_wave_size(
+    const ReplayFragmentWaveSelection& requested, bool captured_available, bool captured_wave32) {
+    if (requested.explicit_override) return requested;
+    if (!captured_available) return {};
+    return {captured_wave32 ? ReplayFragmentWaveSize::Wave32 : ReplayFragmentWaveSize::Wave64,
+            false};
+}
 
 inline bool parse_replay_fragment_wave_size(const char* text,
                                            ReplayFragmentWaveSelection& selection) {

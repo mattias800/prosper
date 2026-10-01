@@ -609,6 +609,10 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
     uint64_t raw_shader_words = 0;
     std::map<uint64_t, uint32_t> raw_shader_index_by_address;
     for (const auto& d : draws) {
+        if (!d.fragment_wave_config_available && d.ps_wave32) {
+            error = "invalid realized-draw fragment wave config";
+            return false;
+        }
         GpuCapturedDraw c; c.vs = d.vs_words(); c.gs = d.gs_words(); c.fs = d.fs_words();
         c.ps = d.ps; c.vertex_count = d.vertex_count;
         c.instance_count = d.instance_count;
@@ -639,6 +643,8 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.system_inputs = d.system_inputs;
         c.has_pixel_inputs = d.has_pixel_inputs;
         c.has_system_inputs = d.has_system_inputs;
+        c.fragment_wave_config_available = d.fragment_wave_config_available;
+        c.ps_wave32 = d.ps_wave32;
         if (!capture_table(d.vrt.get(), intervals, include_resource_data, false,
                            c.vrt, error, nullptr, &out) ||
             !capture_table(d.prt.get(), intervals, include_resource_data, false,
