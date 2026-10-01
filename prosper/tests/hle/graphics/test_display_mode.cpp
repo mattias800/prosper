@@ -131,6 +131,27 @@ int main() {
               "a host too small for 1080p drops to the 720p output mode, not to the host's own "
               "non-PS5 resolution");
 
+        // #4031: only evidenced geometry-to-enum mappings may reach OutputStatus's prefix.
+        CHECK(output_resolution_prefix(hd) == 1 && output_resolution_prefix(uhd) == 2,
+              "selected 1080p and 2160p modes have distinct HD1 and 4K2 prefixes");
+        CHECK(output_resolution_prefix(small) == 0,
+              "the unproven 720p enum stays UNKNOWN0 instead of claiming 1080p");
+        AdvertisedDisplayMode unmapped;
+        unmapped.width = 1920; unmapped.height = 720;
+        CHECK(output_resolution_prefix(unmapped) == 0,
+              "a width match alone cannot assign an enum to unmapped geometry");
+
+        const AdvertisedDisplayMode panel1440 = select_display_mode(
+            DisplayModePolicy::host, { 2560, 1440, 60.0 });
+        CHECK(panel1440.width == 1920 && panel1440.height == 1080 &&
+              output_resolution_prefix(panel1440) == 1,
+              "a 1440p desktop encodes the selected 1080p mode, not an unadvertised enum");
+        const AdvertisedDisplayMode panel8k = select_display_mode(
+            DisplayModePolicy::host, { 7680, 4320, 60.0 });
+        CHECK(panel8k.width == 3840 && panel8k.height == 2160 &&
+              output_resolution_prefix(panel8k) == 2,
+              "an 8K desktop encodes the selected 4K mode, not the host desktop");
+
         // A nominal "60.000" host maps onto the 59.94 enumerant -- the rate a PS5 calls 60 -- and
         // must NOT reach 119.88 even though the tolerance exists.
         CHECK(hd.refresh_enum == 3 && hd.vblank_period_ns == 16683350,
@@ -208,8 +229,9 @@ int main() {
         register_builtin_hle();
         auto open = Hle::lookup(nid_hash("sceVideoOutOpen"));
         auto res  = Hle::lookup(nid_hash("sceVideoOutGetResolutionStatus"));
-        CHECK(open && res, "the VideoOut entry points are registered");
-        if (open && res) {
+        auto outstat = Hle::lookup("utPrVdxio-8");  // actual GetOutputStatus import
+        CHECK(open && res && outstat, "the VideoOut entry points are registered");
+        if (open && res && outstat) {
             const uint64_t handle = open(0, 0, 0, 0, 0, 0);
             uint8_t rs[0x30];
             memset(rs, 0xEE, sizeof rs);
@@ -223,6 +245,13 @@ int main() {
                   "the pane resolution follows the same derived answer");
             CHECK(*(uint64_t*)(rs + 0x10) == 6,
                   "the advertised refresh enumerant is the host's 119.88, NOT the hardcoded 3");
+
+            uint32_t output_status[4] = {0xEEEEEEEEu, 0xEEEEEEEEu, 0xEEEEEEEEu, 0xEEEEEEEEu};
+            CHECK(outstat(handle, (uint64_t)(uintptr_t)output_status, 0, 0, 0, 0) == 0 &&
+                  output_status[0] == 2,
+                  "GetOutputStatus's actual NID reports 4K2 for the same derived 3840x2160 mode");
+            CHECK(output_status[2] == 0xEEEEEEEEu && output_status[3] == 0xEEEEEEEEu,
+                  "the derived mode query leaves the unknown status tail untouched");
 
             // (2) what actually PACES it -- the accessor hle_kernel_time.cpp's vblank pump reads.
             CHECK(prosper_vo_vblank_period_ns() == 8341675,

@@ -108,18 +108,26 @@ int main() {
 #endif
         };
         uint64_t capability = 0xEEEEEEEEEEEEEEEEull;
-        uint32_t status[2] = {0xEEEEEEEEu, 0xEEEEEEEEu};
+        // #4031: query the actual NID on a fresh handle, before any buffer is registered. The
+        // default advertised display has an HD resolution enum, independently of the HDR field.
+        uint32_t status[4] = {0xEEEEEEEEu, 0xEEEEEEEEu, 0xEEEEEEEEu, 0xEEEEEEEEu};
         set_hdr(nullptr);
         CHECK(cap(handle, (uint64_t)(uintptr_t)&capability, 0, 0, 0, 0) == 0 && capability == 0,
               "default device capability advertises SDR (0)");
         CHECK(outstat(handle, (uint64_t)(uintptr_t)status, 0, 0, 0, 0) == 0 && status[1] == 0,
               "default output status advertises dynamic-range mode 0 (SDR)");
+        CHECK(status[0] == 1,
+              "GetOutputStatus reports HD1 for the default 1080p display before buffer registration");
+        CHECK(status[2] == 0xEEEEEEEEu && status[3] == 0xEEEEEEEEu,
+              "GetOutputStatus writes only the known eight-byte prefix");
         set_hdr("1");
-        capability = 0xEEEEEEEEEEEEEEEEull; status[1] = 0xEEEEEEEEu;
+        capability = 0xEEEEEEEEEEEEEEEEull; status[0] = status[1] = 0xEEEEEEEEu;
         CHECK(cap(handle, (uint64_t)(uintptr_t)&capability, 0, 0, 0, 0) == 0 && capability == 0x2,
               "PROSPER_HDR advertises the BT2020/PQ capability bit");
         CHECK(outstat(handle, (uint64_t)(uintptr_t)status, 0, 0, 0, 0) == 0 && status[1] == 2,
               "PROSPER_HDR advertises dynamic-range mode 2 (HDR)");
+        CHECK(status[0] == 1 && status[2] == 0xEEEEEEEEu && status[3] == 0xEEEEEEEEu,
+              "HDR preserves the selected resolution and the untouched status tail");
         set_hdr(nullptr);
     }
 
@@ -879,6 +887,8 @@ int main() {
           "closed-handle flips cannot advance API or in-stream present state");
     uint8_t closed_status[0x40]; memset(closed_status, 0xEE, sizeof closed_status);
     CHECK((uint32_t)fstat(handle, (uint64_t)(uintptr_t)closed_status, 0, 0, 0, 0) ==
+              kInvalidHandle &&
+              (uint32_t)outstat(handle, (uint64_t)(uintptr_t)closed_status, 0, 0, 0, 0) ==
               kInvalidHandle,
           "status queries reject a closed handle");
     bool closed_status_untouched = true;
