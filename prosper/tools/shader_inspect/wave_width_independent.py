@@ -91,7 +91,7 @@ def instructions(words):
         n = words[off] >> 16
         op = words[off] & 0xffff
         if not n or off + n > len(words):
-            return
+            raise ValueError("zero-length or truncated SPIR-V instruction")
         yield op, words[off:off + n]
         off += n
 
@@ -205,7 +205,7 @@ class Module:
             # 11 provable modules, because any module containing one stopped being able to treat
             # a constant buffer as uniform. OpAtomicLoad stays OBSERVABLE, so a vote-guarded
             # region containing one is still refused; only arm (a) is loosened.
-            if op in (OP_KILL, 4416, 5380, 224, 225, OP_ATOMIC_LOAD):
+            if op in (OP_KILL, 253, 254, 4416, 5380, 224, 225, OP_ATOMIC_LOAD):
                 continue
             # A store to a colour output is observable but is not memory this shader reads back.
             if op in (OP_STORE, OP_COPY_MEMORY, OP_COPY_MEMORY_SIZED) and len(w) >= 2 \
@@ -287,42 +287,40 @@ class Module:
             stack.extend(self.succ.get(b, []))
         return seen, merge
 
+    def _reads_tainted_contents(self, raw, tainted_ptrs):
+        return (self.root_of(raw) in tainted_ptrs
+                if self.pointer_is_known(raw) else bool(tainted_ptrs))
+
+    def _taint_local_write(self, raw, tainted_ptrs):
+        before = len(tainted_ptrs)
+        if not self.pointer_is_known(raw):
+            tainted_ptrs |= self.locals
+        elif self.root_of(raw) in self.locals:
+            tainted_ptrs.add(self.root_of(raw))
+        return len(tainted_ptrs) != before
+
+    def _copy_is_tainted(self, op, w, tainted, tainted_ptrs):
+        return (w[1] in tainted or w[2] in tainted
+                or self._reads_tainted_contents(w[2], tainted_ptrs)
+                or (op == OP_COPY_MEMORY_SIZED and len(w) >= 4 and w[3] in tainted))
+
     def _dataflow(self, tainted, tainted_ptrs):
         changed = True
         while changed:
             changed = False
             for op, w in self.insts:
                 if op == OP_STORE and len(w) >= 3:
-                    if w[2] in tainted:
-                        if not self.pointer_is_known(w[1]):     # unknown: could be any of them
-                            if not self.locals <= tainted_ptrs:
-                                tainted_ptrs |= self.locals
-                                changed = True
-                        else:
-                            slot = self.root_of(w[1])
-                            if slot in self.locals and slot not in tainted_ptrs:
-                                tainted_ptrs.add(slot)
-                                changed = True
+                    if w[1] in tainted or w[2] in tainted:
+                        changed |= self._taint_local_write(w[1], tainted_ptrs)
                     continue
                 if op in (OP_COPY_MEMORY, OP_COPY_MEMORY_SIZED) and len(w) >= 3:
                     # Target <- Source, both pointers, with no OpLoad/OpStore pair for the closure
                     # to see. See the C++ twin.
-                    src_tainted = (self.root_of(w[2]) in tainted_ptrs
-                                   if self.pointer_is_known(w[2]) else bool(tainted_ptrs))
-                    if src_tainted:
-                        if not self.pointer_is_known(w[1]):
-                            if not self.locals <= tainted_ptrs:
-                                tainted_ptrs |= self.locals
-                                changed = True
-                        else:
-                            dst = self.root_of(w[1])
-                            if dst in self.locals and dst not in tainted_ptrs:
-                                tainted_ptrs.add(dst)
-                                changed = True
+                    if self._copy_is_tainted(op, w, tainted, tainted_ptrs):
+                        changed |= self._taint_local_write(w[1], tainted_ptrs)
                     continue
                 if op == OP_LOAD and len(w) >= 4:
-                    reads_tainted = (self.root_of(w[3]) in tainted_ptrs
-                                     if self.pointer_is_known(w[3]) else bool(tainted_ptrs))
+                    reads_tainted = w[3] in tainted or self._reads_tainted_contents(w[3], tainted_ptrs)
                     if reads_tainted and w[2] not in tainted:
                         tainted.add(w[2])
                         changed = True
@@ -351,7 +349,7 @@ class Module:
             return len(w) >= 3 and w[1] not in self.locals
         if op == 64:                                  # OpCopyMemorySized
             return len(w) >= 4 and w[1] not in self.locals
-        if op in (OP_IMAGE_WRITE, OP_KILL, 4416, 5380, 224, 225):
+        if op in (OP_IMAGE_WRITE, OP_KILL, OP_FUNCTION_CALL, 253, 254, 4416, 5380, 224, 225):
             return True                               # image write, kill, terminate, demote, barrier
         return op in ATOMIC_OPS
 
@@ -364,22 +362,24 @@ class Module:
         for _ in range(32):
             self._dataflow(tainted, tainted_ptrs)
             for op, w in self.insts:                 # a tainted value leaving the shader
-                if op == OP_STORE and len(w) >= 3 and w[1] not in self.locals and w[2] in tainted:
+                if op == OP_STORE and len(w) >= 3 and w[1] not in self.locals \
+                        and (w[1] in tainted or w[2] in tainted):
                     return True
-                if op == OP_IMAGE_WRITE and len(w) >= 4 and (w[2] in tainted or w[3] in tainted):
+                if op == OP_IMAGE_WRITE and len(w) >= 4 \
+                        and any(w[i] in tainted for i in range(1, len(w)) if i != 4):
                     return True
                 # EVERY id operand, not word 3 -- word 3 is an atomic's POINTER and the value it
                 # writes is further along, its index differing by opcode. See the C++ twin.
-                if op in ATOMIC_OPS and any(w[i] in tainted for i in range(3, len(w))):
-                    return True
+                if op in ATOMIC_OPS:
+                    first = 1 if result_index(op) is None else 3
+                    if any(w[i] in tainted for i in range(first, len(w))):
+                        return True
                 # The SOURCE is a pointer, so its taint lives in tainted_ptrs, not in tainted --
                 # a slot is tainted, not a value id. Testing the wrong set made this arm inert,
                 # which is what its own fixture caught.
                 if op in (OP_COPY_MEMORY, OP_COPY_MEMORY_SIZED) and len(w) >= 3 \
                         and w[1] not in self.locals:
-                    src_tainted = (self.root_of(w[2]) in tainted_ptrs
-                                   if self.pointer_is_known(w[2]) else bool(tainted_ptrs))
-                    if src_tainted:
+                    if self._copy_is_tainted(op, w, tainted, tainted_ptrs):
                         return True
             grew = False
             for head, cond in self.branch_cond.items():
@@ -392,18 +392,17 @@ class Module:
                     for op, w in self.blocks[b]:
                         if self._observable(op, w):
                             return True
+                        # Loop exit iteration changes even a header Phi exported directly after
+                        # the merge. Control-dependent definitions carry that count dependency;
+                        # region traversal reaches the header through its backedge.
+                        ri = result_index(op)
+                        if ri is not None and len(w) > ri and w[ri] not in tainted:
+                            tainted.add(w[ri])
+                            grew = True
                         # A store into a local inside the region is control-dependent too: whether
                         # it happened at all is the vote's answer.
-                        if op == OP_STORE and len(w) >= 3:
-                            if not self.pointer_is_known(w[1]):
-                                if not self.locals <= tainted_ptrs:
-                                    tainted_ptrs |= self.locals
-                                    grew = True
-                            else:
-                                slot = self.root_of(w[1])
-                                if slot in self.locals and slot not in tainted_ptrs:
-                                    tainted_ptrs.add(slot)
-                                    grew = True
+                        if op in (OP_STORE, OP_COPY_MEMORY, OP_COPY_MEMORY_SIZED) and len(w) >= 3:
+                            grew |= self._taint_local_write(w[1], tainted_ptrs)
                 for op, w in self.blocks.get(merge, []):
                     if op != OP_PHI or len(w) < 5 or w[2] in tainted:
                         continue
@@ -421,6 +420,8 @@ def analyse(path):
     m = Module(path)
     if not m.votes:
         return True, 0, 0
+    # No interprocedural graph: independently uniform votes can clear, but not presumed dead ones.
+    has_calls = any(op == OP_FUNCTION_CALL for op, _ in m.insts)
     uniform = m.uniform_values()
     unproved = 0
     for result, operand in m.votes:
@@ -429,7 +430,7 @@ def analyse(path):
         # uniform the value being balloted. Only deadness can clear one.
         if result not in m.ballots and operand in uniform:
             continue
-        if not m.influences_output(result):
+        if not has_calls and not m.influences_output(result):
             continue
         unproved += 1
     return unproved == 0, len(m.votes), unproved

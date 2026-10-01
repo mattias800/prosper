@@ -18,6 +18,9 @@ answer admits a shader.
 RESULT_AT_1 = {19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,  # OpType*
                11, 14, 15, 315}                                             # ExtInstImport etc.
 NO_RESULT = {62, 71, 72, 249, 250, 246, 247, 248, 252, 253, 254, 5, 6, 7, 8, 10, 17}
+# Effects have no result. Inventing one aliases an operand with unrelated SSA data and can hide
+# an absent effect check (e.g. ImageWrite's Sample dependence appeared to taint its coordinate).
+NO_RESULT |= {56, 63, 64, 99, 224, 225, 228, 317, 319, 4416, 5380}
 
 
 def id_operand_indices(op, n):
@@ -32,7 +35,10 @@ def id_operand_indices(op, n):
         return [i for i in (3, 4) if i < n]
     if op == 79:                       # OpVectorShuffle: v1(id), v2(id), literal components
         return [i for i in (3, 4) if i < n]
-    if op in (87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98):
+    if op in (89, 90, 93, 94, 96, 97):
+        # Dref or Gather Component is an ID at word 5; the optional literal mask is at word 6.
+        return [i for i in (3, 4, 5) if i < n] + list(range(7, n))
+    if op in (87, 88, 91, 92, 95, 98):
         # OpImageSample*: image(id), coord(id), LITERAL operands mask, then ids
         return [i for i in (3, 4) if i < n] + list(range(6, n))
     if op == 71:                       # OpDecorate: target(id), then literals

@@ -141,6 +141,11 @@ bool spirv_has_result(uint32_t op) {
         case Op_Store: case Op_Branch: case Op_BranchConditional:
         case Op_SelectionMerge: case Op_LoopMerge: case Op_Return: case Op_Kill:
         case Op_Decorate: case Op_MemberDecorate: case Op_Switch:
+        case 63 /*OpCopyMemory*/: case 64 /*OpCopyMemorySized*/: case Op_ImageWrite:
+        case Op_ControlBarrier: case Op_MemoryBarrier: case 228 /*OpAtomicStore*/:
+        case 319 /*OpAtomicFlagClear*/: case 254 /*OpReturnValue*/: case 255 /*OpUnreachable*/:
+        case 4416 /*OpTerminateInvocation*/: case 5380 /*OpDemoteToHelperInvocation*/:
+        case 56 /*OpFunctionEnd*/: case 8 /*OpLine*/: case 317 /*OpNoLine*/:
             return false;
         default: return true;
     }
@@ -170,7 +175,12 @@ bool spirv_is_id_operand(uint32_t op, uint32_t i) {
         case Op_ImageSampleImplicitLod:
         case Op_ImageSampleExplicitLod:
         case Op_ImageFetch: case Op_ImageGather:
+            if (op == Op_ImageGather) return i == 3 || i == 4 || i == 5 || i >= 7;
             return i == 3 || i == 4 || i >= 6;                    // word 5 is a LITERAL mask
+        case 89 /*OpImageSampleDrefImplicitLod*/: case 90 /*OpImageSampleDrefExplicitLod*/:
+        case 93 /*OpImageSampleProjDrefImplicitLod*/: case 94 /*OpImageSampleProjDrefExplicitLod*/:
+        case 97 /*OpImageDrefGather*/:
+            return i == 3 || i == 4 || i == 5 || i >= 7;           // Dref ID, then mask at 6
         case Op_TypeInt: case Op_TypeFloat: return false;
         case Op_TypeVector: case 24 /*OpTypeMatrix*/: case Op_TypeImage: return i == 2;
         case Op_TypePointer:    return i == 3;                    // word 2 is LITERAL storage
@@ -184,12 +194,11 @@ bool spirv_is_id_operand(uint32_t op, uint32_t i) {
 // then has to earn uniformity through its operands instead of inheriting it, so an unknown case
 // fails towards "not proven" rather than towards "safe".
 bool spirv_op_is_divergent_source(uint32_t op) {
+    // The proof does not establish draw-uniform image contents or sampling/derivative state.
+    // Match the Python proof's complete image-source domain, including projected/depth forms.
+    // Uniform handles and coordinates alone are not a license to clear a later vote.
+    if (op >= 87 && op <= 106) return true;
     switch (op) {
-        case Op_ImageSampleImplicitLod: case Op_ImageSampleExplicitLod:
-        case Op_ImageSampleDrefImplicitLod: case Op_ImageSampleDrefExplicitLod:
-        case Op_ImageFetch: case Op_ImageGather: case Op_ImageRead:
-        case Op_ImageQuerySizeLod: case Op_ImageQuerySize: case Op_ImageQueryLod:
-        case Op_ImageQueryLevels:
         case Op_DPdx: case Op_DPdy:
         case 209 /*OpFwidth*/: case 210 /*OpDPdxFine*/: case 211 /*OpDPdyFine*/:
         case 212 /*OpFwidthFine*/: case 213 /*OpDPdxCoarse*/: case 214 /*OpDPdyCoarse*/:
@@ -272,6 +281,12 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
     }
     if (votes.empty()) return true;                     // nothing width-dependent to prove
 
+    // There is no call/parameter/return or callee-effect graph here. Independently uniform votes
+    // can still clear arm (a), but a caller or callee vote cannot earn deadness through arm (b).
+    bool has_calls = false;
+    for (const SpirvInst& in : insts)
+        has_calls |= in.op == 57 /*OpFunctionCall*/;
+
     // --- storage classes ------------------------------------------------------------------------
     std::unordered_map<uint32_t, uint32_t> var_storage;
     std::unordered_set<uint32_t> outputs, locals;
@@ -336,7 +351,8 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                 return in.len >= 3 && !locals.count(spirv[in.at + 1]);
             case 64 /*OpCopyMemorySized*/:
                 return in.len >= 4 && !locals.count(spirv[in.at + 1]);
-            case Op_ImageWrite: case Op_Kill:
+            case Op_ImageWrite: case Op_Kill: case Op_Return: case 254 /*OpReturnValue*/:
+            case 57 /*OpFunctionCall*/:
             case 4416 /*OpTerminateInvocation*/: case 5380 /*OpDemoteToHelperInvocation*/:
             case Op_ControlBarrier: case Op_MemoryBarrier:
                 return true;
@@ -382,7 +398,8 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
         // 11 provable modules, because a module containing a barrier stopped being able to treat
         // any constant buffer as uniform.
         switch (in.op) {
-            case Op_Kill: case 4416 /*OpTerminateInvocation*/:
+            case Op_Kill: case Op_Return: case 254 /*OpReturnValue*/:
+            case 4416 /*OpTerminateInvocation*/:
             case 5380 /*OpDemoteToHelperInvocation*/:
             case Op_ControlBarrier: case Op_MemoryBarrier:
             // ...and an atomic LOAD, which reads. It is the one atomic with no Value operand at
@@ -534,6 +551,27 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
     // the whole population.
     const auto influences_output = [&](uint32_t seed) {
         std::unordered_set<uint32_t> tainted{seed}, tainted_ptrs;
+        const auto reads_tainted_contents = [&](uint32_t raw) {
+            return pointer_is_known(raw) ? tainted_ptrs.count(root_of(raw)) != 0
+                                         : !tainted_ptrs.empty();
+        };
+        const auto taint_local_write = [&](uint32_t raw) {
+            bool grew = false;
+            if (!pointer_is_known(raw)) {
+                for (uint32_t local : locals) grew |= tainted_ptrs.insert(local).second;
+            } else if (locals.count(root_of(raw))) {
+                grew = tainted_ptrs.insert(root_of(raw)).second;
+            }
+            return grew;
+        };
+        const auto copy_is_tainted = [&](const SpirvInst& in) {
+            // Root CONTENT and SSA ADDRESS are different dependencies. Which element is copied,
+            // where it is copied and whether a sized copy accesses anything can all carry a vote.
+            const uint32_t dst = spirv[in.at + 1], src = spirv[in.at + 2];
+            return tainted.count(dst) || tainted.count(src) || reads_tainted_contents(src) ||
+                   (in.op == 64 /*OpCopyMemorySized*/ && in.len >= 4 &&
+                    tainted.count(spirv[in.at + 3]));
+        };
         // A bounded fixed point, and the bound is conservative on purpose: falling out of the loop
         // still growing means the closure was NOT complete, so the honest answer is "it might" --
         // returning false there would admit a module on an unfinished analysis.
@@ -544,15 +582,8 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                 for (const SpirvInst& in : insts) {
                     if (in.op == Op_Store && in.len >= 3) {
                         const uint32_t raw = spirv[in.at + 1], val = spirv[in.at + 2];
-                        if (tainted.count(val)) {
-                            if (!pointer_is_known(raw)) {          // unknown: could be any of them
-                                for (uint32_t local : locals)
-                                    if (tainted_ptrs.insert(local).second) changed = true;
-                            } else if (locals.count(root_of(raw)) &&
-                                       tainted_ptrs.insert(root_of(raw)).second) {
-                                changed = true;
-                            }
-                        }
+                        if (tainted.count(val) || tainted.count(raw))
+                            changed |= taint_local_write(raw);
                         continue;
                     }
                     if ((in.op == 63 /*OpCopyMemory*/ || in.op == 64 /*OpCopyMemorySized*/) &&
@@ -560,26 +591,12 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                         // Target <- Source, both pointers. A tainted source slot makes the target
                         // slot tainted; no OpLoad/OpStore pair appears, which is why the closure
                         // could not see it.
-                        const uint32_t dst = spirv[in.at + 1], src = spirv[in.at + 2];
-                        const bool src_tainted = pointer_is_known(src)
-                            ? tainted_ptrs.count(root_of(src)) != 0
-                            : !tainted_ptrs.empty();
-                        if (src_tainted) {
-                            if (!pointer_is_known(dst)) {
-                                for (uint32_t local : locals)
-                                    if (tainted_ptrs.insert(local).second) changed = true;
-                            } else if (locals.count(root_of(dst)) &&
-                                       tainted_ptrs.insert(root_of(dst)).second) {
-                                changed = true;
-                            }
-                        }
+                        if (copy_is_tainted(in)) changed |= taint_local_write(spirv[in.at + 1]);
                         continue;
                     }
                     if (in.op == Op_Load && in.len >= 4) {
                         const uint32_t raw = spirv[in.at + 3];
-                        const bool reads_tainted = pointer_is_known(raw)
-                            ? tainted_ptrs.count(root_of(raw)) != 0
-                            : !tainted_ptrs.empty();               // unknown: could be any of them
+                        const bool reads_tainted = tainted.count(raw) || reads_tainted_contents(raw);
                         if (reads_tainted && tainted.insert(spirv[in.at + 2]).second)
                             changed = true;
                         continue;
@@ -600,18 +617,22 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
             }
             for (const SpirvInst& in : insts) {              // a tainted value leaving the shader
                 if (in.op == Op_Store && in.len >= 3 && !locals.count(spirv[in.at + 1]) &&
-                    tainted.count(spirv[in.at + 2]))
+                    (tainted.count(spirv[in.at + 1]) || tainted.count(spirv[in.at + 2])))
                     return true;
-                if (in.op == Op_ImageWrite && in.len >= 4 &&
-                    (tainted.count(spirv[in.at + 2]) || tainted.count(spirv[in.at + 3])))
-                    return true;
+                if (in.op == Op_ImageWrite && in.len >= 4) {
+                    // Image, coordinate, texel and optional ID operands (including Sample).
+                    // Word 4 is the literal image-operands mask, never an SSA value.
+                    for (uint32_t i = 1; i < in.len; ++i)
+                        if (i != 4 && tainted.count(spirv[in.at + i])) return true;
+                }
                 // EVERY id operand, not word 3. Word 3 is an atomic's POINTER; the value it
                 // writes is further along and its index differs by opcode, so checking one word
                 // let a vote-derived value be atomically written to a UAV in straight-line code --
                 // the scan fired and read the wrong word. Testing all of them needs no per-opcode
                 // value index and cannot drift as opcodes are added.
                 if (spirv_op_is_atomic(in.op)) {
-                    for (uint32_t i = 3; i < in.len; ++i)
+                    const uint32_t first = spirv_has_result(in.op) ? 3u : 1u;
+                    for (uint32_t i = first; i < in.len; ++i)
                         if (tainted.count(spirv[in.at + i])) return true;
                 }
                 // OpCopyMemory moves a value without an OpLoad/OpStore pair, so a tainted local
@@ -623,10 +644,7 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                     // The SOURCE is a POINTER, so its taint lives in tainted_ptrs -- a slot is
                     // tainted, not a value id. Testing `tainted` here made the arm inert, which is
                     // what its own fixture caught.
-                    const uint32_t src = spirv[in.at + 2];
-                    if (pointer_is_known(src) ? tainted_ptrs.count(root_of(src)) != 0
-                                              : !tainted_ptrs.empty())
-                        return true;
+                    if (copy_is_tainted(in)) return true;
                 }
             }
 
@@ -652,18 +670,22 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                 for (uint32_t b : inside) {
                     for (const SpirvInst& in : blocks[b]) {
                         if (is_observable_effect(in)) return true;
+                        // Execution count is a data dependency too. A bounded loop can export its
+                        // header Phi directly after the merge: no local store or merge-block Phi
+                        // carries the vote, but the final SSA counter depends on when it exits.
+                        // Taint definitions inside the controlled region, including the header
+                        // reached through a backedge; the ordinary closure follows their uses.
+                        if (spirv_has_result(in.op)) {
+                            const uint32_t rw = spirv_result_word(in.op);
+                            if (in.len > rw) grew |= tainted.insert(spirv[in.at + rw]).second;
+                        }
                         // A store into a local inside the region is control-dependent too: whether
                         // it happened at all is the vote's answer, so every later load of that
                         // local carries the vote.
-                        if (in.op == Op_Store && in.len >= 3) {
+                        if ((in.op == Op_Store || in.op == 63 /*OpCopyMemory*/ ||
+                             in.op == 64 /*OpCopyMemorySized*/) && in.len >= 3) {
                             const uint32_t raw = spirv[in.at + 1];
-                            if (!pointer_is_known(raw)) {
-                                for (uint32_t local : locals)
-                                    if (tainted_ptrs.insert(local).second) grew = true;
-                            } else if (locals.count(root_of(raw)) &&
-                                       tainted_ptrs.insert(root_of(raw)).second) {
-                                grew = true;
-                            }
+                            grew |= taint_local_write(raw);
                         }
                     }
                 }
@@ -689,6 +711,7 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
         // the subgroup's, so a 32-lane ballot reports half a mask as though it were whole however
         // uniform the value being balloted. Only deadness can clear one.
         if (!ballots.count(vote.first) && uniform.count(vote.second)) continue;
+        if (has_calls) return false;
         if (!influences_output(vote.first)) continue;
         return false;
     }
