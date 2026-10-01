@@ -23,6 +23,7 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <filesystem>
 #include <set>
@@ -291,6 +292,37 @@ static int check_emitter_coverage(const std::string& src_root) {
     return problems;
 }
 
+static void dump_numeric_mbcnt(const std::string& dir) {
+    // Numeric MBCNT is source-word DATA, not a peer population scan. Validate both half prefixes
+    // in the compact and CFG compute routes and in both guest fragment wave widths.
+    for (bool hi : {false, true}) {
+        const std::array compute = {
+            hi ? 0xd7660000u : 0xd7650000u, 0x00010affu, 0x80000001u, 0xbf810000u};
+        for (bool cfg : {false, true}) {
+            const std::string name = std::string("compute_numeric_mbcnt_") +
+                (hi ? "hi" : "lo") + (cfg ? "_cfg" : "_compact");
+            dump(dir, name.c_str(), recompile_valu(compute.data(), compute.size(), 1, 0,
+                 nullptr, 0, kDefaultComputePgmRsrc1, cfg));
+            const std::array float_bits = {
+                hi ? 0xd7660000u : 0xd7650000u, 0x00010af2u, 0xbf810000u};
+            const std::string float_name = std::string("compute_inline_float_mbcnt_") +
+                (hi ? "hi" : "lo") + (cfg ? "_cfg" : "_compact");
+            dump(dir, float_name.c_str(), recompile_valu(float_bits.data(), float_bits.size(),
+                 1, 0, nullptr, 0, kDefaultComputePgmRsrc1, cfg));
+        }
+        const std::array fragment = {
+            hi ? 0xd7660000u : 0xd7650000u, 0x00010affu, 0x80000001u,
+            0x7e000d00u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+            0xf800180fu, 0x03020100u, 0xbf810000u};
+        for (bool wave32 : {false, true}) {
+            const std::string name = std::string("fragment_numeric_mbcnt_") +
+                (hi ? "hi" : "lo") + (wave32 ? "_w32" : "_w64");
+            dump(dir, name.c_str(), recompile_fragment(fragment.data(), fragment.size(),
+                 nullptr, nullptr, UINT32_MAX, nullptr, wave32));
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : ".";
     // The source root is required, not optional: the coverage check is the half of this gate that
@@ -384,34 +416,7 @@ int main(int argc, char** argv) {
            "recompile_valu"); }
     { const uint32_t c[] = {0x06000300u, 0x10000500u, 0xBF810000u};
       dump(dir, "compute_alu", recompile_valu(c, 3, 3, 0), "recompile_valu"); }
-    // Numeric MBCNT is source-word DATA, not a peer population scan. Validate both half prefixes
-    // in the compact and CFG compute routes and in both guest fragment wave widths.
-    for (bool hi : {false, true}) {
-        const uint32_t compute[] = {
-            hi ? 0xd7660000u : 0xd7650000u, 0x00010affu, 0x80000001u, 0xbf810000u};
-        for (bool cfg : {false, true}) {
-            const std::string name = std::string("compute_numeric_mbcnt_") +
-                (hi ? "hi" : "lo") + (cfg ? "_cfg" : "_compact");
-            dump(dir, name.c_str(), recompile_valu(compute, std::size(compute), 1, 0,
-                 nullptr, 0, kDefaultComputePgmRsrc1, cfg));
-            const uint32_t float_bits[] = {
-                hi ? 0xd7660000u : 0xd7650000u, 0x00010af2u, 0xbf810000u};
-            const std::string float_name = std::string("compute_inline_float_mbcnt_") +
-                (hi ? "hi" : "lo") + (cfg ? "_cfg" : "_compact");
-            dump(dir, float_name.c_str(), recompile_valu(float_bits, std::size(float_bits),
-                 1, 0, nullptr, 0, kDefaultComputePgmRsrc1, cfg));
-        }
-        const uint32_t fragment[] = {
-            hi ? 0xd7660000u : 0xd7650000u, 0x00010affu, 0x80000001u,
-            0x7e000d00u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
-            0xf800180fu, 0x03020100u, 0xbf810000u};
-        for (bool wave32 : {false, true}) {
-            const std::string name = std::string("fragment_numeric_mbcnt_") +
-                (hi ? "hi" : "lo") + (wave32 ? "_w32" : "_w64");
-            dump(dir, name.c_str(), recompile_fragment(fragment, std::size(fragment),
-                 nullptr, nullptr, UINT32_MAX, nullptr, wave32));
-        }
-    }
+    dump_numeric_mbcnt(dir);
     // GTA V's exact literal-bearing V_ALIGNBYTE_B32 packet.  Strict validation guards the
     // masked-shift lowering: SPIR-V shift operands must stay in the defined 0..31 range.
     { const uint32_t c[] = {0xd54f0006u,0x0415fe80u,0x3024240cu,0xbf810000u};

@@ -4,19 +4,30 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "fixtures/render_runner.h"
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <stdexcept>
+#include <span>
 #include <string>
+#include <system_error>
 #include <vector>
 
 using namespace prosper::gpu;
 
 namespace {
-constexpr uint32_t W = 8, H = 8;
+constexpr uint32_t W = 8;
+constexpr uint32_t H = 8;
+struct Checks {
+    int failures = 0;
+    void check(bool ok, const char* name) {
+        std::printf("[%s] %s\n", ok ? "ok" : "FAIL", name);
+        if (!ok) ++failures;
+    }
+};
 
 std::vector<uint32_t> one_pixel_triangle() {
     SpirvCompute b;
@@ -38,14 +49,14 @@ std::vector<uint32_t> helper_witness() {
     SpirvCompute b;
     b.begin_fragment();
     const uint32_t lane = b.subgroup_local_id();
-    b.put(b.caps, Op_Capability, {Cap_GroupNonUniformQuad});
+    SpirvCompute::put(b.caps, Op_Capability, {Cap_GroupNonUniformQuad});
     const uint32_t helper = b.sel(b.helper_invocation(), b.uconst(1), b.uconst(0));
     uint32_t count = b.uconst(0);
     for (uint32_t i = 0; i < 4; ++i) {
         const uint32_t other = b.id();
         // OpGroupNonUniformQuadBroadcast = 365. This witness is test-only and its caller
         // explicitly checks QUAD support; it does not claim production QUAD feature admission.
-        b.put(b.code, 365, {b.t_u32, other, b.uconst(Scope_Subgroup), helper, b.uconst(i)});
+        SpirvCompute::put(b.code, 365, {b.t_u32, other, b.uconst(Scope_Subgroup), helper, b.uconst(i)});
         count = b.ibin(Op_IAdd, count, other);
     }
     const auto encode = [&](uint32_t value) {
@@ -72,12 +83,80 @@ std::vector<uint8_t> render(const std::vector<uint32_t>& vs,
 bool clear(const uint8_t* p) { return p[0] == 0 && p[1] == 0 && p[2] == 255; }
 
 void dump(const std::filesystem::path& directory, const std::string& name,
-          const std::vector<uint32_t>& module) {
+          const std::vector<uint32_t>& spirv) {
     if (directory.empty()) return;
-    std::ofstream file(directory / (name + ".spv"), std::ios::binary);
-    file.write(reinterpret_cast<const char*>(module.data()),
-               static_cast<std::streamsize>(module.size() * sizeof(uint32_t)));
-    if (!file) throw std::runtime_error("SPIR-V dump failed");
+    const auto path = directory / (name + ".spv");
+    std::ofstream file(path, std::ios::binary);
+    const auto bytes = std::as_bytes(std::span{spirv});
+    file.write(reinterpret_cast<const char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+    if (!file) throw std::filesystem::filesystem_error(
+        "SPIR-V dump failed", path, std::make_error_code(std::errc::io_error));
+}
+
+bool verify_helper_witness(Checks& checks, const std::vector<uint32_t>& vertex,
+                           const std::vector<uint32_t>& witness) {
+    const auto pixels = render(vertex, witness);
+    checks.check(pixels.size() == W * H * 4, "helper witness renders a target");
+    if (pixels.size() != W * H * 4) return false;
+    unsigned covered = 0;
+    for (unsigned i = 0; i < W * H; ++i) if (!clear(&pixels[i * 4])) ++covered;
+    const unsigned pixel = (W + 1) * 4;
+    checks.check(covered == 1 && !clear(&pixels[pixel]), "exactly pixel (1,1) is covered");
+    checks.check((pixels[pixel] & 3) == 3 && pixels[pixel + 1] == 3,
+                  "covered lane is quad position 3 and all three neighbors are helpers");
+    return covered == 1 && pixels[pixel + 1] == 3;
+}
+
+std::vector<uint32_t> numeric_fragment(bool wave32, bool hi, unsigned index, uint32_t mask) {
+    // The first five use inline integers; remaining words use literal numeric data.
+    uint32_t source = 255;
+    if (index < 4) source = 128u + mask;
+    else if (index == 4) source = 194;
+    std::vector code = {0xd7650007u, 0x000100c1u,
+                        0xd7660007u, 0x00020ec1u}; // physical lane v7
+    code.reserve(32);
+    code.insert(code.end(), {hi ? 0xd766000au : 0xd765000au,
+                             source | (133u << 9)}); // v10,source,5
+    if (source == 255) code.push_back(mask);
+    // The derivative forces helper execution in this independently recompiled shader too.
+    // Its source (physical lane id) is linear within each quad; blue is exported but not checked.
+    code.insert(code.end(), {
+        0x7e100d07u, // v_cvt_f32_u32 v8,v7
+        0x7e0402fau, 0xff000008u, // v_mov_b32_dpp v2,v8 quad_perm:[0,0,0,0]
+        0x7e000d07u, 0x100000ffu, 0x3b808081u, // red = lane / 255
+        0x7e020d0au, 0x100202ffu, 0x3b808081u, // green = count / 255
+        0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u,
+    });
+    return recompile_fragment(code.data(), code.size(), nullptr, nullptr, UINT32_MAX, nullptr,
+        wave32, {RecompileDiagnosticStage::Fragment, 0xa3996000u + index});
+}
+
+void run_fragment_case(Checks& checks, const std::vector<uint32_t>& vertex,
+                       const std::filesystem::path& directory, bool wave32, bool hi,
+                       unsigned index, uint32_t mask) {
+    const auto fragment = numeric_fragment(wave32, hi, index, mask);
+    checks.check(!fragment.empty(), "finite physical mask fragment compiles");
+    if (fragment.empty()) return;
+    dump(directory, "numeric_w" + std::to_string(wave32 ? 32 : 64) +
+        (hi ? "_hi_" : "_lo_") + std::to_string(index), fragment);
+    const auto pixels = render(vertex, fragment);
+    checks.check(pixels.size() == W * H * 4, "numeric mask shader renders a target");
+    if (pixels.size() != W * H * 4) return;
+    const unsigned pixel = (W + 1) * 4;
+    const unsigned lane = pixels[pixel];
+    // Fail visibly before forming a CPU prefix if the encoded lane itself is outside the guest wave.
+    const unsigned guest_width = wave32 ? 32 : 64;
+    checks.check(lane < guest_width, "reported physical lane is inside the guest wave");
+    if (lane >= guest_width) return;
+    unsigned width = std::min(lane, 32u);
+    if (hi) width = lane > 32 ? lane - 32 : 0;
+    const uint32_t prefix = width == 32 ? UINT32_MAX : (1u << width) - 1;
+    const unsigned expected = 5 + std::popcount(mask & prefix);
+    std::printf("wave=%u hi=%d mask=%08x lane=%u got=%u expected=%u\n",
+        guest_width, hi, mask, lane, pixels[pixel + 1], expected);
+    checks.check(!clear(&pixels[pixel]) && (lane & 3) == 3 && pixels[pixel + 1] == expected,
+                  "MBCNT counts explicit helper/inactive source bits at the primitive edge");
 }
 } // namespace
 
@@ -87,13 +166,9 @@ int main(int argc, char** argv) {
         dump_directory = argv[2];
         std::filesystem::create_directories(dump_directory);
     } else if (argc != 1) return 2;
-    int failures = 0;
-    const auto check = [&](bool ok, const char* name) {
-        std::printf("[%s] %s\n", ok ? "ok" : "FAIL", name);
-        if (!ok) ++failures;
-    };
-    const auto& context = prosper::test::render_vk_ctx();
-    if (!(context.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
+    Checks checks;
+    if (const auto& context = prosper::test::render_vk_ctx();
+        !(context.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
         !(context.subgroup_operations & VK_SUBGROUP_FEATURE_QUAD_BIT)) {
         std::puts("SKIP: fragment quad helper witness is unavailable");
         return 77;
@@ -102,61 +177,11 @@ int main(int argc, char** argv) {
     const auto witness = helper_witness();
     dump(dump_directory, "vertex", vertex);
     dump(dump_directory, "helper_witness", witness);
-    const auto witness_pixels = render(vertex, witness);
-    check(witness_pixels.size() == W * H * 4, "helper witness renders a target");
-    if (witness_pixels.size() != W * H * 4) return 1;
-    unsigned covered = 0;
-    for (unsigned i = 0; i < W * H; ++i) if (!clear(&witness_pixels[i * 4])) ++covered;
-    const unsigned pixel = (W + 1) * 4;
-    check(covered == 1 && !clear(&witness_pixels[pixel]), "exactly pixel (1,1) is covered");
-    check((witness_pixels[pixel] & 3) == 3 && witness_pixels[pixel + 1] == 3,
-          "covered lane is quad position 3 and all three neighbors are helpers");
-    if (covered != 1 || witness_pixels[pixel + 1] != 3) return 1;
-
-    const uint32_t masks[] = {0, 1, 3, 15, 0xfffffffeu, 0x80000001u, 0x55555555u};
-    for (bool wave32 : {false, true}) {
-        for (bool hi : {false, true}) {
-            for (unsigned index = 0; index < std::size(masks); ++index) {
-                // The first five use inline integers; remaining words use literal numeric data.
-                const uint32_t mask = masks[index];
-                const uint32_t source = index < 4 ? 128u + mask : index == 4 ? 194u : 255u;
-                std::vector<uint32_t> code = {0xd7650007u, 0x000100c1u,
-                                              0xd7660007u, 0x00020ec1u}; // physical lane v7
-                code.reserve(32);
-                code.insert(code.end(), {hi ? 0xd766000au : 0xd765000au,
-                                         source | (133u << 9)}); // v10,source,5
-                if (source == 255) code.push_back(mask);
-                // The derivative forces helper execution in this independently recompiled shader
-                // too. Its source (physical lane id) is linear within each quad; blue is unused.
-                code.insert(code.end(), {
-                    0x7e100d07u, // v_cvt_f32_u32 v8,v7
-                    0x7e0402fau, 0xff000008u, // v_mov_b32_dpp v2,v8 quad_perm:[0,0,0,0]
-                    0x7e000d07u, 0x100000ffu, 0x3b808081u, // red = lane / 255
-                    0x7e020d0au, 0x100202ffu, 0x3b808081u, // green = count / 255
-                    0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u,
-                });
-                const auto fragment = recompile_fragment(code.data(), code.size(), nullptr,
-                    nullptr, UINT32_MAX, nullptr, wave32,
-                    {RecompileDiagnosticStage::Fragment, 0xa3996000u + index});
-                check(!fragment.empty(), "finite physical mask fragment compiles");
-                if (fragment.empty()) continue;
-                dump(dump_directory, "numeric_w" + std::to_string(wave32 ? 32 : 64) +
-                    (hi ? "_hi_" : "_lo_") + std::to_string(index), fragment);
-                const auto pixels = render(vertex, fragment);
-                check(pixels.size() == W * H * 4, "numeric mask shader renders a target");
-                if (pixels.size() != W * H * 4) continue;
-                const unsigned lane = pixels[pixel];
-                const unsigned width = hi ? (lane > 32 ? lane - 32 : 0)
-                                          : (lane < 32 ? lane : 32);
-                const uint32_t prefix = width == 32 ? UINT32_MAX : (1u << width) - 1;
-                const unsigned expected = 5 + std::popcount(mask & prefix);
-                std::printf("wave=%u hi=%d mask=%08x lane=%u got=%u expected=%u\n",
-                    wave32 ? 32 : 64, hi, mask, lane, pixels[pixel + 1], expected);
-                check(!clear(&pixels[pixel]) && (lane & 3) == 3 &&
-                      pixels[pixel + 1] == expected,
-                      "MBCNT counts explicit helper/inactive source bits at the primitive edge");
-            }
-        }
-    }
-    return failures ? 1 : 0;
+    if (!verify_helper_witness(checks, vertex, witness)) return 1;
+    const std::array masks = {0u, 1u, 3u, 15u, 0xfffffffeu, 0x80000001u, 0x55555555u};
+    for (bool wave32 : {false, true})
+        for (bool hi : {false, true})
+            for (unsigned index = 0; index < masks.size(); ++index)
+                run_fragment_case(checks, vertex, dump_directory, wave32, hi, index, masks[index]);
+    return checks.failures ? 1 : 0;
 }
