@@ -101,6 +101,7 @@ struct SynthModuleSpec {
     // ---- same spec with only this field at its default, so the difference is exactly one field.
     uint16_t e_machine = 0x3e;                       // 0x3e = x86-64; anything else must be rejected
     bool     omit_dynamic_phdr = false;              // no PT_DYNAMIC -> the module must be rejected
+    bool     omit_load_phdr = false;                 // parses, but cannot build a mapped image
     bool     zero_value_exports = false;             // st_value == 0: defined, but NOT an export
     uint64_t relative_reloc_offset = kSynthInitArray;// where DT_INIT_ARRAY[0] is patched
     // 0 = whole file; else write only N bytes. Two different refusals, both pinned in
@@ -146,7 +147,9 @@ inline std::vector<uint8_t> synth_prx_bytes(const SynthModuleSpec& spec, std::st
     sput64(f, 0x20, 0x40);                            // e_phoff
     sput16(f, 0x34, 64);                              // e_ehsize
     sput16(f, 0x36, 56);                              // e_phentsize
-    sput16(f, 0x38, spec.omit_dynamic_phdr ? 1 : 2);  // e_phnum
+    const uint16_t phnum = static_cast<uint16_t>(!spec.omit_load_phdr) +
+                           static_cast<uint16_t>(!spec.omit_dynamic_phdr);
+    sput16(f, 0x38, phnum);                           // e_phnum
     // e_shentsize / e_shnum / e_shstrndx stay zero: a PRX has no section header table.
 
     auto phdr = [&](int i, uint32_t type, uint32_t flags, uint64_t off, uint64_t va,
@@ -156,9 +159,11 @@ inline std::vector<uint8_t> synth_prx_bytes(const SynthModuleSpec& spec, std::st
         sput64(f, p + 8, off);   sput64(f, p + 16, va); sput64(f, p + 24, va);
         sput64(f, p + 32, filesz); sput64(f, p + 40, memsz); sput64(f, p + 48, align);
     };
-    phdr(0, prosper::PT_LOAD, 7, 0, 0, kSynthFileSize, kSynthFileSize, 0x4000);
+    int phindex = 0;
+    if (!spec.omit_load_phdr)
+        phdr(phindex++, prosper::PT_LOAD, 7, 0, 0, kSynthFileSize, kSynthFileSize, 0x4000);
     if (!spec.omit_dynamic_phdr)
-        phdr(1, prosper::PT_DYNAMIC, 6, kSynthDynamic, kSynthDynamic, 0x100, 0x100, 8);
+        phdr(phindex, prosper::PT_DYNAMIC, 6, kSynthDynamic, kSynthDynamic, 0x100, 0x100, 8);
 
     // --- code: a bare `ret` in each body. Nothing here is executed (link_program does not run guest
     // --- code); the bytes exist so the fixture is an honest module rather than a hole.

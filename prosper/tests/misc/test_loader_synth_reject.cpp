@@ -29,6 +29,7 @@
 #include "fixtures/synth_prx.h"
 #include "fixtures/test_scratch.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -87,6 +88,62 @@ int main() {
 
     // ---- module-level rejections. Each spec differs from `good_spec` in exactly one field. -------
     CHECK(link_error(good_path).empty(), "control: an unmodified fixture links");
+
+    {
+        SynthModuleSpec s = good_spec; s.omit_load_phdr = true;
+        const std::string path = emit("reject_noload.prx", s);
+        const std::string reason = "module has no PT_LOAD segment, so nothing would be mapped";
+        std::string err;
+        auto mod = Module::load(path, &err);
+        CHECK(mod.has_value(), "no PT_LOAD: the module still parses");
+        if (mod) {
+            CHECK(mod->segments.size() == 1 && mod->segments[0].type == PT_DYNAMIC,
+                  "no PT_LOAD: the fixture retains only its dynamic program header");
+            CHECK(mod->symtabsz == 2 * 24 && mod->strtab_va == prosper_test::kSynthStrtab,
+                  "no PT_LOAD: dynamic tags survive, so rejection belongs to image building");
+            LoadedImage img;
+            img.base = kBase0;
+            img.entry = kBase0 + 8;
+            img.mem = { 0xa5 };
+            CHECK(!build_image(*mod, kBase1, img, &err),
+                  "no PT_LOAD: build_image refuses an unmapped module");
+            CHECK(err == reason, "no PT_LOAD: build_image reports the specific loader error");
+            CHECK(img.base == kBase0 && img.entry == kBase0 + 8 &&
+                      img.mem == std::vector<uint8_t>{ 0xa5 },
+                  "no PT_LOAD: failed image building preserves its output");
+            CHECK(!build_image(*mod, kBase1, img, nullptr),
+                  "no PT_LOAD: refusal does not require an error-text output");
+        }
+        CHECK(link_error(path) == "load " + path + ": " + reason,
+              "no PT_LOAD: link_program propagates the image error with the module path");
+        Program p;
+        CHECK(!link_program({ { path, kBase1 } }, kStubBase, kDataBase, p, &err),
+              "no PT_LOAD: the first module also fails through the caller");
+        CHECK(err == "load " + path + ": " + reason && p.mods.empty() && p.imgs.empty(),
+              "no PT_LOAD: the failed first module publishes no module or image");
+    }
+    {
+        // A load segment can occupy memory without file bytes. Build one independently of the
+        // PRX generator; m.loads is intentionally empty, because it is not the segment authority.
+        Module bss;
+        Segment segment;
+        segment.type = PT_LOAD;
+        segment.flags = 6;
+        segment.vaddr = 0x4000;
+        segment.memsz = 0x1000;
+        bss.segments.push_back(segment);
+        LoadedImage img;
+        std::string err;
+        const bool built = build_image(bss, kBase1, img, &err);
+        CHECK(built, "BSS-only control: a PT_LOAD without file bytes still builds");
+        if (built) {
+            CHECK(img.min_vaddr == 0x4000 && img.max_vaddr == 0x8000 &&
+                      img.mem.size() == 0x4000 && img.prot.size() == 1,
+                  "BSS-only control: the load segment defines memory and protection extents");
+            CHECK(std::all_of(img.mem.begin(), img.mem.end(), [](uint8_t v) { return v == 0; }),
+                  "BSS-only control: its memory is zero-filled");
+        }
+    }
 
     {
         const std::string missing = dir + "/reject_absent.prx";
