@@ -184,12 +184,9 @@ const Row kRows[] = {
     // --- barriers (no POSIX spelling registered on either body) ---
     {"scePthreadBarrierInit",        nullptr,                       "#2178, in place"},
     {"scePthreadBarrierWait",        nullptr,                       "#2178, in place"},
-    // scePthreadJoin / scePthreadDetach became fallible in #2575 and so now need the alias, but they
-    // deliberately have NO row here and that is not an oversight: kRows provokes its refusal with an
-    // all-zero call, and `pthread_join(0, …)` is not a defined refusal. A `pthread_t` is an opaque
-    // descriptor POINTER on both hosts prosper builds for, so a null one is dereferenced before any
-    // validity check — the sweep would segfault rather than report EINVAL. Their arms are §9, where
-    // the failure comes from a real thread.
+    // Join/Detach stay in §9 with real-worker controls for the host operation. Join's null-handle
+    // EINVAL refusal (#4033) is pinned there through literal guest NIDs and preserves output.
+    // Detach still needs a valid descriptor rather than the sweep's all-zero host call.
 };
 
 // --- §9 thread bodies. Plain HOST pthreads on purpose: these arms are about what k_pthread_join and
@@ -622,13 +619,32 @@ int main() {
     // whatever produced the null" rule applied literally.
     printf("-- join/detach report their result; only a real join writes value_ptr (#2575) --\n");
     {
-        HleFn sce_join     = Hle::lookup(nid_hash("scePthreadJoin"));     // onNY9Byn-W8
-        HleFn posix_join   = Hle::lookup(nid_hash("pthread_join"));
+        // Literal guest exports keep the registration check independent of the name-to-NID hash.
+        HleFn sce_join     = Hle::lookup("onNY9Byn-W8");    // scePthreadJoin
+        HleFn posix_join   = Hle::lookup("h9CcP3J0oVM");    // pthread_join
         HleFn sce_detach   = Hle::lookup(nid_hash("scePthreadDetach"));   // 4qGrR6eoP9Y
         HleFn posix_detach = Hle::lookup(nid_hash("pthread_detach"));
         CHECK(sce_join && posix_join && sce_detach && posix_detach,
               "scePthreadJoin/Detach and pthread_join/detach are registered under both spellings");
         if (sce_join && posix_join && sce_detach && posix_detach) {
+            // #4033: the guest null handle must be refused before host pthread_join dereferences
+            // it. Both output shapes are legal, and a failure must not manufacture an exit value.
+            // Removing the shared null guard restores the observed Linux host fault in this arm.
+            void* sony_null_out = (void*)0xC0FFEE;
+            void* posix_null_out = (void*)0x5EED;
+            CHECK(sce_join(0, (uint64_t)(uintptr_t)&sony_null_out, 0, 0, 0, 0) == kEncodedEINVAL,
+                  "#4033: onNY9Byn-W8 rejects a null thread with encoded EINVAL (0x80020016)");
+            CHECK(sony_null_out == (void*)0xC0FFEE,
+                  "#4033: refused Sony null join preserves the output sentinel");
+            CHECK(posix_join(0, (uint64_t)(uintptr_t)&posix_null_out, 0, 0, 0, 0) == kBareEINVAL,
+                  "#4033: h9CcP3J0oVM rejects a null thread with bare FreeBSD EINVAL (22)");
+            CHECK(posix_null_out == (void*)0x5EED,
+                  "#4033: refused POSIX null join preserves the output sentinel");
+            CHECK(sce_join(0, 0, 0, 0, 0, 0) == kEncodedEINVAL,
+                  "#4033: Sony null join with no output still reports encoded EINVAL");
+            CHECK(posix_join(0, 0, 0, 0, 0, 0) == kBareEINVAL,
+                  "#4033: POSIX null join with no output still reports bare EINVAL");
+
             // --- POSITIVE CONTROL. Without it, a body broken into "refuse everything" satisfies
             // every failure arm below, and a body that never joins at all satisfies the rc == 0 half.
             // The exit-value readback separates them: 0x5eed can only reach `out` through a join
