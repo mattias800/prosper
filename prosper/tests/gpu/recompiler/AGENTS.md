@@ -44,6 +44,12 @@ arm reaches derived provenance. The one-arm compare targets the MUST mask meet a
 
 ## Ruled out
 
+- A supported `image_sample_c_lz` is not a guest-memory write. An immutable failed compiler
+  input showed that unrelated comparison samples alone forced descriptor-only register-offset
+  raw loads into `rdna2_raw_wide_data_loads`. The paired classifier experiment preserved all
+  lifetime facts and real numeric/store/atomic/unknown-op refusals. This rules out that observed
+  site as evidence of a numeric or per-wave backing requirement; the broader raw plan stays open.
+
 - Running the owned-input chain proof before every cache lookup is not a negligible warm-hit
   cost. A balanced synthetic unowned 1,024-VMOV chain measured about 0.566 ms per current hit
   versus 0.000817 ms with that private guard disabled. This is CPU cache-hit evidence, not title

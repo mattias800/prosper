@@ -91,6 +91,81 @@ int main() {
             check(classified && refused && reason.find("pc=2 ") != std::string::npos &&
                   reason.find("op=0x2") != std::string::npos, name, label);
         };
+        // A read-only comparison sample elsewhere cannot turn descriptor assembly into a
+        // numeric read or aliasing guest write. The independent image uses an entry T#/S#;
+        // the raw quad is consumed only through its exact MUBUF resource below.
+        const auto image_packet = [](uint32_t opcode) {
+            return std::array<uint32_t, 2>{0xf0000108u | (opcode << 18u),
+                (16u << 16u) | (18u << 21u) | (4u << 8u)};
+        };
+        const auto sample_shader = [&](uint32_t opcode) {
+            std::vector<uint32_t> sample{0x7e020280u, 0x7e040280u}; // independent v1/v2 coords
+            append(sample, image_packet(opcode));
+            return shader(export_word, sample);
+        };
+        const auto sample_table_for = [&](const std::vector<uint32_t>& code) {
+            auto table = table_for(code);
+            ShaderResource image;
+            image.cls = ResourceClass::Texture;
+            image.format = DataFormat::Float32;
+            image.num_components = 1u;
+            image.binding = 6u;
+            image.sgpr_base = 64u;
+            image.sampler_sgpr_base = 72u;
+            image.width = 1u;
+            image.height = 1u;
+            image.depth = 1u;
+            image.depth_compare = true;
+            image.depth_compare_func = 3u;
+            image.gpu_addr = reinterpret_cast<uint64_t>(data.data());
+            image.size = sizeof(uint32_t);
+            for (const auto& instruction : decode(code))
+                if (instruction.fmt == Rdna2Format::MIMG) image.fetch_pc = instruction.pc;
+            table.resources.push_back(image);
+            return table;
+        };
+        const auto sample_code = sample_shader(0x2fu);
+        const auto sample_ins = decode(sample_code);
+        const auto sample_it = std::find_if(sample_ins.begin(), sample_ins.end(),
+            [](const auto& in) { return in.fmt == Rdna2Format::MIMG; });
+        check(sample_it != sample_ins.end() && sample_it->opcode == 0x2fu &&
+              sample_it->len_dwords == 2u && sample_it->mimg_dim == 1u &&
+              sample_it->mimg_dmask == 1u && sample_it->src[1].kind == OperandKind::SGPR &&
+              sample_it->src[1].value == 64 && sample_it->src[2].kind == OperandKind::SGPR &&
+              sample_it->src[2].value == 72,
+              name, "comparison sample decodes independent entry image and sampler descriptors");
+        check(rdna2_raw_wide_data_loads(sample_ins).empty() &&
+              !compile(sample_code, sample_table_for(sample_code)).empty(), name,
+              "descriptor assembly beside a read-only comparison sample remains a nonempty module");
+        const auto sample_refused = [&](const std::vector<uint32_t>& code,
+                                        const char* label, uint32_t raw_opcode = 2u) {
+            const auto classified = rdna2_raw_wide_data_loads(decode(code));
+            const bool refused = compile(code, sample_table_for(code)).empty();
+            const auto reason = last_terminal_reject_reason(last_program);
+            check(classified == std::vector<uint32_t>{2u} && refused &&
+                  reason.find("pc=2 ") != std::string::npos &&
+                  reason.find(raw_opcode == 2u ? "op=0x2" : "op=0x3") != std::string::npos,
+                  name, label);
+        };
+        auto sampled_numeric = sample_code;
+        sampled_numeric.insert(sampled_numeric.end() - 3, 0x7e00021bu); // v0 = physical s27
+        sample_refused(sampled_numeric,
+              "comparison sample preserves genuine x4 highest-word backing refusal");
+        for (uint32_t opcode : {0x08u, 0x0fu, 0x11u, 0x7fu}) {
+            sample_refused(sample_shader(opcode), opcode == 0x08u
+                ? "image store preserves descriptor alias backing refusal"
+                : opcode == 0x0fu
+                ? "image atomic opcode0f preserves descriptor alias backing refusal"
+                : opcode == 0x11u
+                ? "image atomic opcode11 preserves descriptor alias backing refusal"
+                : "unknown image opcode preserves conservative descriptor backing refusal");
+        }
+        auto sampled_x8_numeric = sample_code;
+        sampled_x8_numeric[2] = 0xf40c0600u; // same raw source/offset, x8 s24:31
+        sampled_x8_numeric.insert(sampled_x8_numeric.end() - 3, 0x7e00021fu); // v0 = physical s31
+        sample_refused(sampled_x8_numeric,
+              "comparison sample preserves genuine x8 highest-word backing refusal", 3u);
+
         std::vector<uint32_t> tail;
         append(tail, compare(24));
         append(tail, select());

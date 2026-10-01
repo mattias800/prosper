@@ -23,7 +23,7 @@ bool rdna2_may_write_guest_memory(const Rdna2Inst& in) {
         return !(in.opcode <= 0x03u ||
                  (in.opcode >= 0x08u && in.opcode <= 0x0fu));
     if (in.fmt == Rdna2Format::MIMG)
-        return in.opcode != 0x00u && in.opcode != 0x0eu && in.opcode != 0x27u;
+        return in.opcode != 0x00u && in.opcode != 0x0eu && in.opcode != 0x27u && in.opcode != 0x2fu;
     return false;
 }
 
