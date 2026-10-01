@@ -1,6 +1,7 @@
 // Real live renderer -> backend statistics -> ordered pending spans -> serialized F8 records.
 // The separator only creates an ordered graphics boundary; every pixel and upload is produced by
 // the registered Vulkan renderer. No BackendResourceReuseStats/RendererTimingRecord is fabricated.
+#include "diagnostics/perf/perf_ledger.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -32,6 +33,19 @@ int failures = 0;
 void check(bool ok, const char* message) {
     std::printf("[%s] %s\n", ok ? "ok" : "FAIL", message);
     failures += !ok;
+}
+using DirectValidationCounts = std::array<uint64_t,
+    prosper::diagnostics::perf::kTextureDirectValidationCounterCount>;
+DirectValidationCounts direct_validation_counts() {
+    namespace perf = prosper::diagnostics::perf;
+    DirectValidationCounts counts{};
+    for (size_t i = 0; i < counts.size(); ++i)
+        counts[i] = perf::ledger().counters[
+            static_cast<size_t>(perf::kTextureDirectValidationCounters[i])].load();
+    return counts;
+}
+uint64_t validation_count(prosper::diagnostics::perf::Counter counter) {
+    return prosper::diagnostics::perf::ledger().counters[static_cast<size_t>(counter)].load();
 }
 constexpr uint32_t Width = 32, Height = 32, PresentWidth = 64, PresentHeight = 64;
 constexpr size_t Words = 2048, Bytes = Words * sizeof(uint32_t);
@@ -225,7 +239,7 @@ int range_capture() {
 }
 
 #ifdef __linux__
-int small_texture_watch(bool unsupported, bool control) {
+int small_texture_watch(bool unsupported, bool control, bool observe_direct = false) {
     using prosper::host::guest_write_watch_stats;
     constexpr size_t SourceBytes = 64u << 10;
     // Install the actual fault handler before HLE mapping registers the source's physical identity.
@@ -248,8 +262,22 @@ int small_texture_watch(bool unsupported, bool control) {
     std::vector<uint8_t> target(Width * Height * 4u);
     auto draw = make_draw(positions_source, target);
     sample_packed_texture(draw, address, 128);
+    if (observe_direct) {
+        check(prosper::diagnostics::perf::enabled(),
+              "watch observer arm has active ledger counters");
+        check(!std::getenv("PROSPER_NO_SMALL_TEXTURE_WRITE_WATCH") &&
+              !std::getenv("PROSPER_TEXTURE_WRITE_WATCH_MIN_KB") &&
+              !std::getenv("PROSPER_TEXTURE_WRITE_WATCH_PROMOTE_HITS") &&
+              !std::getenv("PROSPER_AUDIT_CROSS_SUBMIT_TEXTURE_WRITE_WATCH") &&
+              !std::getenv("PROSPER_NO_CROSS_SUBMIT_TEXTURE_WRITE_WATCH") &&
+              !std::getenv("PROSPER_AUDIT_SUBMIT_TEXTURE_VALIDATION_REUSE") &&
+              !std::getenv("PROSPER_KEEP_TEXTURE_SOURCE_SNAPSHOTS") &&
+              !std::getenv("PROSPER_TEXTURE_VALIDATION_SCRATCH_COPY") &&
+              std::getenv("PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE"),
+              "watch observer arm uses default stable-small admission without audit or snapshot retention");
+    }
     const auto baseline = guest_write_watch_stats();
-    auto green = [&] {
+    auto green = [&draw] {
         check(solid(render_submit_items({draw}, Width, Height), true),
               "unchanged mapped texture renders green");
     };
@@ -275,10 +303,20 @@ int small_texture_watch(bool unsupported, bool control) {
         check(promoted.registrations == baseline.registrations + 1,
               "repeated exact matches promote precisely one source watch");
     }
+    const auto before_watch_reuse = direct_validation_counts();
     green();
     const auto reused = guest_write_watch_stats();
     check((reused.unchanged > promoted.unchanged) == (!unsupported && !control),
           "only a successfully registered watch supplies unchanged authority");
+    if (observe_direct) {
+        check(before_watch_reuse[0] > 0 && before_watch_reuse[3] > 0,
+              "watch promotion follows actual observed exact comparisons");
+        check(direct_validation_counts() == before_watch_reuse,
+              "observed unchanged-watch shortcut adds no direct comparison sample");
+    }
+    const auto before_dirty = direct_validation_counts();
+    const auto failures_before_dirty = validation_count(
+        prosper::diagnostics::perf::Counter::TextureValidationFailures);
     // No manual write notification: the actual CPU store must take the production watch fault.
     std::fill_n(words, SourceBytes / 4, 0xc00003ffu);
     if (!unsupported && !control)
@@ -286,6 +324,15 @@ int small_texture_watch(bool unsupported, bool control) {
               "raw CPU mutation reaches the production fault handler");
     check(solid_red(render_submit_items({draw}, Width, Height)),
           "mutation invalidates the promoted texture and renders new red pixels");
+    if (observe_direct) {
+        check(guest_write_watch_stats().dirty > reused.dirty,
+              "changed watch-only source reaches the actual dirty-query refusal");
+        check(direct_validation_counts() == before_dirty,
+              "observed dirty watch-only refusal adds no direct comparison sample");
+        check(validation_count(prosper::diagnostics::perf::Counter::TextureValidationFailures) ==
+                  failures_before_dirty,
+              "watch-only refusal preserves legacy exact-failure exclusion");
+    }
     check(solid_red(render_submit_items({draw}, Width, Height)),
           "refreshed texture remains red on subsequent reuse");
     if (!unsupported && !control)
@@ -303,7 +350,9 @@ int main(int argc, char** argv) {
     namespace fs = std::filesystem;
     const bool expect_snapshot_move = argc == 2 &&
         std::strcmp(argv[1], "--source-snapshot-expect-move") == 0;
-    const bool source_snapshot = expect_snapshot_move ||
+    const bool direct_validation = argc == 2 &&
+        std::strcmp(argv[1], "--direct-validation") == 0;
+    const bool source_snapshot = expect_snapshot_move || direct_validation ||
         (argc == 2 && std::strcmp(argv[1], "--source-snapshot") == 0);
     // This is the real live renderer with CPU color readback, as in draw_program_skip_render.
     // Only color-target retention is disabled; immutable buffer residency must remain enabled.
@@ -337,6 +386,8 @@ int main(int argc, char** argv) {
 
     prosper::frontend::register_live_renderer("", false);
 #ifdef __linux__
+    if (argc == 2 && std::strcmp(argv[1], "--direct-validation-watch") == 0)
+        return small_texture_watch(false, false, true);
     if (argc == 2 && std::strcmp(argv[1], "--small-watch") == 0)
         return small_texture_watch(false, false);
     if (argc == 2 && std::strcmp(argv[1], "--small-watch-unsupported") == 0)
@@ -366,7 +417,23 @@ int main(int argc, char** argv) {
     check(!draw.vs.empty() && !draw.fs.empty(), "real readonly vertex-fetch shaders compile");
     if (failures) return 1;
 
-    const fs::path directory = source_snapshot
+    const bool scratch_validation =
+        std::getenv("PROSPER_TEXTURE_VALIDATION_SCRATCH_COPY") != nullptr;
+    if (direct_validation) {
+        check(prosper::diagnostics::perf::enabled(),
+              "direct validation live arm has active ledger counters");
+        check(std::getenv("PROSPER_TEXTURE_WRITE_WATCH_MIN_KB") &&
+              std::strcmp(std::getenv("PROSPER_TEXTURE_WRITE_WATCH_MIN_KB"), "1024") == 0 &&
+              std::getenv("PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE"),
+              "direct validation live arm excludes watch and journal shortcuts explicitly");
+    }
+    const auto validation_failures_before = validation_count(
+        prosper::diagnostics::perf::Counter::TextureValidationFailures);
+    const auto validation_failed_bytes_before = validation_count(
+        prosper::diagnostics::perf::Counter::TextureValidationFailedBytes);
+    const fs::path directory = direct_validation
+        ? (scratch_validation ? "render_direct_validation_scratch_test" : "render_direct_validation_test")
+        : source_snapshot
         ? (std::getenv("PROSPER_NO_TEXTURE_SOURCE_SNAPSHOT_MOVE")
             ? "render_source_snapshot_copy_capture_test" : "render_source_snapshot_move_capture_test")
         : "render_buffer_capture_test";
@@ -386,12 +453,12 @@ int main(int argc, char** argv) {
     if (!armed.ok) return 1;
 
     std::vector<LiveRenderPhase> observed_phases;
-    LiveRenderFn live = [&](const std::vector<DrawItem>& items, uint32_t w, uint32_t h) {
+    LiveRenderFn live = [&observed_phases](const std::vector<DrawItem>& items, uint32_t w, uint32_t h) {
         observed_phases.push_back(live_render_phase());
         return RenderedFrame(render_submit_items(items, w, h));
     };
     unsigned separators = 0;
-    LiveComputeFn separator = [&](const std::vector<ComputeItem>&) {
+    LiveComputeFn separator = [&separators](const std::vector<ComputeItem>&) {
         ++separators;
         return true; // Only separates actual draw spans; no GPU/CPU statistics are fabricated.
     };
@@ -408,6 +475,13 @@ int main(int argc, char** argv) {
               !observed_phases[1].first_span && observed_phases[1].final_span,
           "actual ordered executor brackets two renderer calls into one semantic record");
     check(solid(split.frame.bytes(), true), "cold and unchanged spans actually draw the green quad");
+    if (direct_validation) {
+        check(direct_validation_counts() == DirectValidationCounts{},
+              "cold live decodes add no direct validation observations");
+        check(validation_count(prosper::diagnostics::perf::Counter::TextureValidationFailures) ==
+                  validation_failures_before,
+              "cold live decodes preserve legacy zero exact failures");
+    }
     if (source_snapshot)
         std::fill_n(reinterpret_cast<uint32_t*>(texture_address), 4, 0xc00003ffu);
     else
@@ -419,9 +493,27 @@ int main(int argc, char** argv) {
     const auto changed = render_submit_items({draw}, Width, Height);
     check(source_snapshot ? solid_red(changed) : solid(changed, false),
           "changed guest input actually changes the rendered pixels");
+    if (direct_validation) {
+        check(direct_validation_counts() == (scratch_validation
+                  ? DirectValidationCounts{} : DirectValidationCounts{1, 1, 16, 0, 1, 0, 0}),
+              "changed live source records one differing direct extent or excludes the scratch route");
+        check(validation_count(prosper::diagnostics::perf::Counter::TextureValidationFailures) ==
+                  validation_failures_before + 1 &&
+              validation_count(prosper::diagnostics::perf::Counter::TextureValidationFailedBytes) ==
+                  validation_failed_bytes_before + (scratch_validation ? 16u : 0u),
+              "changed live source preserves legacy route-specific failed-prefix charging");
+    }
     const auto unchanged = render_submit_items({draw}, Width, Height);
     check(source_snapshot ? solid_red(unchanged) : solid(unchanged, false),
           "unchanged refreshed input still draws the correct result");
+    if (direct_validation) {
+        check(direct_validation_counts() == (scratch_validation
+                  ? DirectValidationCounts{} : DirectValidationCounts{2, 2, 32, 1, 1, 0, 0}),
+              "warm live source records one accepted direct extent or excludes the scratch route");
+        check(validation_count(prosper::diagnostics::perf::Counter::TextureValidationFailures) ==
+                  validation_failures_before + 1,
+              "warm live source adds no legacy validation failure");
+    }
 
     // Drive only the process-sampler clock; never sleep or assert a speed threshold. Detailed
     // records came from actual renderer calls while the collector was armed.

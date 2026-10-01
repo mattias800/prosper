@@ -11,3 +11,11 @@ builder. It checks rejection reasons, both cache-cold MSAA skips, later bindings
 constructor-population versus successful census/timing deltas. Its hosted-byte checks are metadata
 materialization evidence, with no rendered-pixel, Vulkan-device, validation-layer or completion
 claim. Keep its same-thread context objects alive because two native TLS aliases bind once.
+
+`test_render_buffer_capture --direct-validation` keeps the actual cold/changed/warm packed-texture
+pixels and F8 records, then checks publication of direct comparison counts and the old failed-prefix
+charges. The scratch-copy CTest variant retains the same pixels/cache contract and requires no
+new direct observations. Its Linux `--direct-validation-watch` arm uses real mapping, watch
+promotion, a CPU fault and dirty query: unchanged-watch reuse and watch-only refusal add no direct
+samples, while pre-promotion comparisons provide a positive population control. Environment modes
+are fixed before startup. These assertions do not imply physical comparison traffic or GPU timing.

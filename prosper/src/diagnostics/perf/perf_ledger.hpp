@@ -144,6 +144,15 @@ enum class Counter : uint8_t {
     WaitRegMemDirectUnsupported,
     WaitRegMemDirectFalseProceed,
     WaitRegMemDirectFalseDefer,
+    // Two ordinary direct decode-cache validation routes only; not depth/scratch/watch proofs.
+    // Comparison extent includes the differing chunk, but does not measure physical read traffic.
+    TextureDirectValidationAttempts,
+    TextureDirectValidationMemcmpCalls,
+    TextureDirectValidationMemcmpExtentBytes,
+    TextureDirectValidationAcceptedPrefix,
+    TextureDirectValidationBytesDiffer,
+    TextureDirectValidationExpectedMissing,
+    TextureDirectValidationIncompletePrefix,
     Count
 };
 
@@ -445,6 +454,37 @@ inline constexpr size_t kWaitRegMemDirectCounterCount =
 inline const char* wait_regmem_direct_data_status(const uint64_t* counts) {
     if (counts[0]) return "OBSERVED";
     for (size_t i = 1; i < kWaitRegMemDirectCounterCount; ++i)
+        if (counts[i]) return "PARTIAL";
+    return "NO DATA";
+}
+
+// Caller passes the original final helper-result/required-prefix decision. The actual helper
+// refusal takes precedence over its caller's later prefix-length check. No sample is reread.
+inline void note_texture_direct_validation(bool accepted_prefix, bool bytes_differ,
+        bool expected_missing, uint64_t memcmp_calls, uint64_t memcmp_extent_bytes) {
+    if (!enabled()) return;
+    add(Counter::TextureDirectValidationAttempts);
+    add(Counter::TextureDirectValidationMemcmpCalls, memcmp_calls);
+    add(Counter::TextureDirectValidationMemcmpExtentBytes, memcmp_extent_bytes);
+    add(accepted_prefix ? Counter::TextureDirectValidationAcceptedPrefix :
+        expected_missing ? Counter::TextureDirectValidationExpectedMissing :
+        bytes_differ ? Counter::TextureDirectValidationBytesDiffer :
+        Counter::TextureDirectValidationIncompletePrefix);
+}
+
+inline constexpr Counter kTextureDirectValidationCounters[] = {
+    Counter::TextureDirectValidationAttempts, Counter::TextureDirectValidationMemcmpCalls,
+    Counter::TextureDirectValidationMemcmpExtentBytes, Counter::TextureDirectValidationAcceptedPrefix,
+    Counter::TextureDirectValidationBytesDiffer, Counter::TextureDirectValidationExpectedMissing,
+    Counter::TextureDirectValidationIncompletePrefix
+};
+inline constexpr size_t kTextureDirectValidationCounterCount =
+    sizeof(kTextureDirectValidationCounters) / sizeof(kTextureDirectValidationCounters[0]);
+
+// Snapshot inputs are independent relaxed loads, not a coherent outcome partition.
+inline const char* texture_direct_validation_data_status(const uint64_t* counts) {
+    if (counts[0]) return "OBSERVED";
+    for (size_t i = 1; i < kTextureDirectValidationCounterCount; ++i)
         if (counts[i]) return "PARTIAL";
     return "NO DATA";
 }

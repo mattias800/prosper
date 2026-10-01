@@ -20,3 +20,10 @@ them on the live-renderer target or Vulkan availability. The present-blit policy
 exception requiring Vulkan headers/types but no device; its CMake guard is not a template for
 ordinary policy tests. Environment-controlled variants need their own CTest environment when the
 implementation reads a setting once per process.
+
+`test_texture_direct_validation` maps real tracked guest memory through the HLE and calls the
+production readable-prefix comparison, ledger hook and window engine. Its enabled/disabled CTest
+variants retain equality/required-prefix assertions, including first/middle/final partial-chunk
+mismatches, unreadable/null/short cases and actual baseline/completed/trailing-partial windows.
+These CPU checks establish comparison argument extents and reporting, not live cache admission,
+rendered pixels, Vulkan completion or physical bandwidth. Each variant owns a distinct JSONL file.
