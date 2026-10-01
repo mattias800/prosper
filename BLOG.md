@@ -19,6 +19,21 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-01
+
+### Silent Hill 2 gets through its warning and menus
+
+The first Linux `prosper-app` run rendered the warning screen, and manual input reached New Game; the early black capture came before the warning, while slow rendering and a later GPU hang still block a gameplay claim ([tracker #4024](https://github.com/mattias800/prosper/issues/4024)).
+
+<p align="center"><img src="assets/screenshots/silent-hill-2-first-boot-black.webp" alt="Silent Hill 2 — the early, completely black frame-120 capture from prosper-app, before the warning appeared"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-warning.webp" alt="Silent Hill 2 — the expected content-warning screen in the Linux prosper-app window, with the frontend FPS and alarm overlay enabled"></p>
+
+### The Messenger confirms the control run
+
+The Messenger's control run worked well for the owner with the same Linux app binary; this unmodified `prosper-app` capture shows its opening artwork, before the manual play check ([tracker #1865](https://github.com/mattias800/prosper/issues/1865)).
+
+<p align="center"><img src="assets/screenshots/messenger-control-2026-10-01.webp" alt="The Messenger — the opening artwork captured by prosper-app during the October 1 control run"></p>
+
 ## 2026-09-27
 
 ### Outer Wilds runs twice as fast once its texture cache can let go
