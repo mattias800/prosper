@@ -1,5 +1,6 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "gpu/pm4/command_processor.hpp"
+#include "gpu/pm4/wait_regmem_sample.hpp"
 #include "gpu/pm4/pending_write_snapshot.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
@@ -7,6 +8,7 @@
 #include "gpu/execute/mb3_freelist.hpp"
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not switch a default-ON guard off
 #include "diagnostics/env_cache.hpp"   // cached PROSPER_* gates on per-draw/per-resource paths
+#include "diagnostics/perf/perf_ledger.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "hle/sync/sync_futex.hpp"   // wake_label_waiters (shared with sceKernelWaitOnAddress's futex)
@@ -3520,31 +3522,22 @@ bool pend_overlay_qword(uint64_t addr, uint64_t* value) {
 // never-gated flip/EOP-pulse liveness exceptions (hardware would order them too, but gating them
 // deadlocks our synchronous fold — the re-pulse keeps the guest-observable protocol sound).
 namespace {
-bool wait_regmem_value_satisfied(const Pm4Command& c, uint64_t memory_value) {
-    const uint64_t v = memory_value & c.wm_mask, r = c.wm_ref;
-    switch (c.wm_func) {           // PM4 WAIT_REG_MEM compare functions
-        case 0: return true;
-        case 1: return v <  r;
-        case 2: return v <= r;
-        case 3: return v == r;
-        case 4: return v != r;
-        case 5: return v >= r;
-        case 6: return v >  r;
-        default: return false;
-    }
-}
-
-bool wait_regmem_satisfied(const Pm4Command& c) {
+WaitRegMemPredicateSample evaluate_wait_regmem_predicate(const Pm4Command& c) {
     // The label page can be unmapped/freed — a recycled command buffer referencing a prior generation's
     // fence label, or a producer/consumer that freed the tracking block (the #312 freed-label class). A
     // raw 8-byte read of a stale guest address is a host SEGV, so probe first and treat an unmapped label
     // as NOT satisfied (the barrel-on default) — matching flush_deferred_streams(), which already guards
     // its WAIT_REG_MEM re-check this way. The wm_addr&3 alignment gate at the call site does not catch an
     // unmapped-but-aligned address. #380.
-    if (!guest_readable(c.wm_addr, sizeof(uint64_t))) return false;
-    uint64_t mem = 0; memcpy(&mem, (const void*)(uintptr_t)c.wm_addr, sizeof mem);
-    pend_overlay_qword(c.wm_addr, &mem);
-    return wait_regmem_value_satisfied(c, mem);
+    return sample_wait_regmem_predicate(c, [](uint64_t address, uint64_t* value) {
+        if (!guest_readable(address, sizeof(uint64_t))) return false;
+        memcpy(value, (const void*)(uintptr_t)address, sizeof(*value));
+        return true;
+    }, pend_overlay_qword);
+}
+
+bool wait_regmem_satisfied(const Pm4Command& c) {
+    return evaluate_wait_regmem_predicate(c).satisfied;
 }
 uint64_t defer_now_ms() {
     // The submit path executes shader translation, pipeline creation, dispatches, and rendering
@@ -4945,40 +4938,55 @@ void GpuState::apply(const Pm4Command& c) {
                 // Legacy callers consume the concrete value. Modern callers keep it private to the
                 // submit and let the evaluator overlay the queued scalar value.
                 if (!post_submit_visibility_enabled()) prosper_gpu_drain_completion_writes();
-                if (!ordered_wait_satisfied && !wait_regmem_satisfied(c)) {
-                    // Barrier model (#312), opt-in via PROSPER_WAIT_DEFER=1: pause the queue —
-                    // everything downstream defers until the condition holds (see the model
-                    // block above, including the measured verdict on why this is not default).
-                    // Default: the old barrel-on ("dependency violated") behavior.
-                    // Bounded diagnostic (an unsatisfied wait is now NORMAL, handled state — and
-                    // under the content-load burst it fires thousands of times a minute).
-                    static std::atomic<int> logged{0};
-                    int ln = logged.fetch_add(1);
-                    if (ln < 40 || (ln & 1023) == 0) {
-                        // wait_regmem_satisfied() returns false for an UNMAPPED label too (#380), so this
-                        // "not satisfied" diagnostic is reached with a stale/freed label whose page may be
-                        // gone — a raw 8-byte read then SEGVs, the exact crash #380 fixed but via the log
-                        // path #380 did not cover (#448). Read only when mapped; report UNMAPPED otherwise.
-                        bool label_readable = guest_readable(c.wm_addr, 8);
-                        uint64_t mem = 0; if (label_readable) memcpy(&mem, (const void*)(uintptr_t)c.wm_addr, sizeof mem);
-                        // #312 discriminator: build-journal age + freed-heap-shaped label content.
-                        uint64_t baddr = 0, bpre = 0, bt = 0;
-                        int have = prosper_fence_journal_lookup(pkt_addr(c), &baddr, &bpre, &bt, nullptr);
-                        char hist[512]; label_hist_report(c.wm_addr, hist, sizeof hist);
-                        static const char* qn2[] = {"?", "D", "A", "F"};
-                        fprintf(stderr, "[agc] WaitRegMem #%d q=%s NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s | built@%llums(age=%lldms)%s pre@build=0x%llx%s%s | %s\n",
-                                ln, c.queue_origin <= 3 ? qn2[c.queue_origin] : "?",
-                                (unsigned long long)c.wm_addr, (unsigned long long)c.wm_mask,
-                                (unsigned long long)(mem & c.wm_mask), c.wm_func, (unsigned long long)c.wm_ref,
-                                defer_enabled() ? "pausing queue (deferred effects)" : "dependency violated",
-                                (unsigned long long)bt, have ? (long long)(now_ms() - bt) : -1,
-                                (have && baddr != c.wm_addr) ? " TARGET-CHANGED" : "",
-                                (unsigned long long)bpre, ptr_like(mem) ? " CONTENT-PTR-LIKE(freed?)" : "",
-                                label_readable ? "" : " LABEL-UNMAPPED", hist);
-                    }
-                    if (defer_enabled()) {
-                        g_fold_deferring = true;
-                        defer_push(c);
+                if (!ordered_wait_satisfied) {
+                    const WaitRegMemPredicateSample decision = evaluate_wait_regmem_predicate(c);
+                    diagnostics::perf::note_wait_regmem_direct_evaluation(
+                        decision.readable, decision.comparison_supported, decision.satisfied);
+                    if (!decision.satisfied) {
+                        // Barrier model (#312), opt-in via PROSPER_WAIT_DEFER=1: pause the queue —
+                        // everything downstream defers until the condition holds (see the model
+                        // block above, including the measured verdict on why this is not default).
+                        // Default: the old barrel-on ("dependency violated") behavior.
+                        // Bounded diagnostic (an unsatisfied wait is now NORMAL, handled state — and
+                        // under the content-load burst it fires thousands of times a minute).
+                        static std::atomic<int> logged{0};
+                        int ln = logged.fetch_add(1);
+                        if (ln < 40 || (ln & 1023) == 0) {
+                            // wait_regmem_satisfied() returns false for an UNMAPPED label too (#380), so this
+                            // "not satisfied" diagnostic is reached with a stale/freed label whose page may be
+                            // gone — a raw 8-byte read then SEGVs, the exact crash #380 fixed but via the log
+                            // path #380 did not cover (#448). Read only when mapped; report UNMAPPED otherwise.
+                            bool label_readable = guest_readable(c.wm_addr, 8);
+                            uint64_t mem = 0; if (label_readable) memcpy(&mem, (const void*)(uintptr_t)c.wm_addr, sizeof mem);
+                            // #312 discriminator: build-journal age + freed-heap-shaped label content.
+                            uint64_t baddr = 0, bpre = 0, bt = 0;
+                            int have = prosper_fence_journal_lookup(pkt_addr(c), &baddr, &bpre, &bt, nullptr);
+                            char hist[512]; label_hist_report(c.wm_addr, hist, sizeof hist);
+                            static const char* qn2[] = {"?", "D", "A", "F"};
+                            fprintf(stderr, "[agc] WaitRegMem #%d q=%s NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s | built@%llums(age=%lldms)%s pre@build=0x%llx%s%s | %s | decision-value-valid=%u decision-raw=0x%llx decision-overlay=%u decision-effective=0x%llx decision-masked=0x%llx decision-supported=%u later-value-valid=%u build-journal-valid=%u\n",
+                                    ln, c.queue_origin <= 3 ? qn2[c.queue_origin] : "?",
+                                    (unsigned long long)c.wm_addr, (unsigned long long)c.wm_mask,
+                                    (unsigned long long)(mem & c.wm_mask), c.wm_func, (unsigned long long)c.wm_ref,
+                                    defer_enabled() ? "pausing queue (deferred effects)" : "dependency violated",
+                                    (unsigned long long)bt, have ? (long long)(now_ms() - bt) : -1,
+                                    (have && baddr != c.wm_addr) ? " TARGET-CHANGED" : "",
+                                    (unsigned long long)bpre, ptr_like(mem) ? " CONTENT-PTR-LIKE(freed?)" : "",
+                                    label_readable ? "" : " LABEL-UNMAPPED", hist,
+                                    decision.readable ? 1u : 0u,
+                                    (unsigned long long)decision.raw_value,
+                                    decision.overlay_touched ? 1u : 0u,
+                                    (unsigned long long)decision.effective_value,
+                                    (unsigned long long)decision.masked_value,
+                                    decision.comparison_supported ? 1u : 0u,
+                                    label_readable ? 1u : 0u, have ? 1u : 0u);
+                        }
+                        if (defer_enabled()) {
+                            g_fold_deferring = true;
+                            defer_push(c);
+                            diagnostics::perf::note_wait_regmem_direct_false_action(true);
+                        } else {
+                            diagnostics::perf::note_wait_regmem_direct_false_action(false);
+                        }
                     }
                 }
             }
