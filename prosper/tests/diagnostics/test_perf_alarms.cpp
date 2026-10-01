@@ -18,6 +18,7 @@
 #include "diagnostics/transfer_pressure.hpp"
 #include "gpu/diagnostics/draw_disposition.hpp"
 #include "hle/dispatch/dispatch.hpp"
+#include "../fixtures/test_scratch.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1153,12 +1154,12 @@ void test_engine() {
     const std::string quiet = slurp(logp);
     check("...saying no rule fired", quiet.find("no rule fired in 1 windows") != std::string::npos);
     check("...and listing the rules that had no data as NOT quiet",
-          quiet.find("15 of 25 rules had data") != std::string::npos &&
+          quiet.find("15 of 26 rules had data") != std::string::npos &&
               quiet.find("NO DATA (not measured in any window, so not quiet): "
                          "texture-reference-cost,present-cpu-overhead,present-path-fallback,"
                          "present-slot-trouble,color-target-count-ceiling,gpu-sync-wait,"
                          "gpu-present-stalled,gpu-device-time-coverage,rtt-colorless-publication,"
-                         "unsupported-wave64-shaders") != std::string::npos);
+                         "unsupported-wave64-shaders,unverified-fragment-f32-arithmetic") != std::string::npos);
     std::fclose(s);
     std::remove(jsonl.c_str());
     std::remove(logp.c_str());
@@ -1879,6 +1880,63 @@ void test_unsupported_wave64() {
               count(Counter::Wave64UnidentifiedRefusals) != 0);
 }
 
+void test_unverified_fragment_arithmetic() {
+    constexpr const char* rule = "unverified-fragment-f32-arithmetic";
+    const auto absent = healthy();
+    check("no compiler requests is NO DATA, not a healthy arithmetic claim", !rule_has_data(rule, absent));
+    check("absent arithmetic observations do not alarm", !fired(evaluate_rules(absent,kDefault),rule));
+    auto no_arithmetic = healthy();
+    set_count(no_arithmetic,Counter::FragmentArithmeticRequests,4);
+    check("requests without inventoried ADD/MUL are observed and quiet within the limited scope",
+          rule_has_data(rule,no_arithmetic) && !fired(evaluate_rules(no_arithmetic,kDefault),rule));
+    for (Counter mode : {Counter::FragmentArithmeticKnownMode,Counter::FragmentArithmeticUnknownMode}) {
+        auto w = no_arithmetic;
+        set_count(w,mode,1);
+        set_count(w,Counter::FragmentArithmeticAddRequests,1);
+        const auto alarms = evaluate_rules(w,kDefault);
+        check("a single known OR unavailable actual lowering request fires only the dedicated rule",
+              only(alarms,rule) && alarms[0].value==1 && alarms[0].threshold==1 &&
+              std::string(alarms[0].unit)=="unverified-compiler-requests" && alarms[0].breakdown.size()==1 &&
+              alarms[0].detail.find("inventory=ADD/MUL-only")!=std::string::npos &&
+              std::string(alarms[0].hint).find("not execution")!=std::string::npos);
+        EngineConfig config; config.log=nullptr;
+        AlarmEngine engine(std::move(config));
+        check("unverified semantic gap has first-window visibility", only(engine.close_window(w,5),rule));
+        check("next empty observation window does not reuse lifetime counts", engine.close_window(no_arithmetic,10).empty());
+    }
+    const auto path = prosper_test::test_scratch_file("fragment-arithmetic-window.jsonl");
+    {
+        EngineConfig config; config.log=nullptr; config.window_ns=1'000'000'000ull; config.jsonl_path=path;
+        AlarmEngine engine(std::move(config)); Ledger l;
+        engine.on_flip(1'000'000'000ull,l,60);
+        l.counters[size_t(Counter::FragmentArithmeticRequests)]+=4;
+        l.counters[size_t(Counter::FragmentArithmeticKnownMode)]+=2;
+        l.counters[size_t(Counter::FragmentArithmeticUnknownMode)]+=1;
+        l.counters[size_t(Counter::FragmentArithmeticAddRequests)]+=2;
+        l.counters[size_t(Counter::FragmentArithmeticMulRequests)]+=2;
+        l.counters[size_t(Counter::FragmentArithmeticRefusedRequests)]+=1;
+        l.counters[size_t(Counter::FragmentArithmeticTruncatedRequests)]+=1;
+        l.counters[size_t(Counter::FragmentArithmeticInventoryOverflowRequests)]+=1;
+        const auto alarms=engine.on_flip(2'000'000'001ull,l,60);
+        check("actual ledger window counts qualifying requests once rather than double-counting ADD+MUL",
+              only(alarms,rule) && alarms[0].value==3 &&
+              alarms[0].detail.find("refused-after-emission=1")!=std::string::npos &&
+              alarms[0].detail.find("sites-truncated-requests=1")!=std::string::npos);
+        check("actual engine clears arithmetic firing on zero deltas", engine.on_flip(3'000'000'002ull,l,60).empty());
+    }
+    const auto json=slurp(path);
+    check("JSONL exposes arithmetic request quantities and explicit quiet zeros",
+          json.find("\"fragment_arithmetic_requests\":4")!=std::string::npos &&
+          json.find("\"fragment_arithmetic_known_mode_requests\":2")!=std::string::npos &&
+          json.find("\"fragment_arithmetic_unknown_mode_requests\":1")!=std::string::npos &&
+          json.find("\"fragment_arithmetic_add_requests\":2")!=std::string::npos &&
+          json.find("\"fragment_arithmetic_mul_requests\":2")!=std::string::npos &&
+          json.find("\"fragment_arithmetic_refused_requests\":1")!=std::string::npos &&
+          json.find("\"fragment_arithmetic_truncated_requests\":1")!=std::string::npos &&
+          json.find("\"fragment_arithmetic_announcement_overflow_requests\":1")!=std::string::npos &&
+          json.find("\"fragment_arithmetic_requests\":0")!=std::string::npos);
+}
+
 void test_wave64_engine_json() {
     const std::string path = "test_wave64_" + std::to_string(
         std::chrono::steady_clock::now().time_since_epoch().count()) + ".jsonl";
@@ -1910,6 +1968,7 @@ void test_wave64_engine_json() {
 }  // namespace
 
 int main() {
+    test_unverified_fragment_arithmetic();
     test_unsupported_wave64();
     test_wave64_engine_json();
     test_quiet_baseline();
@@ -1954,8 +2013,8 @@ int main() {
           "2026-09-29 ones (host-copy-per-flip, present-slot-trouble, rtt-destination-refused, "
           "color-target-count-ceiling), gpu-sync-wait (#3948), gpu-present-stalled (#3951) "
           "gpu-device-time-coverage and rtt-colorless-publication (#3891), "
-          "and unsupported-wave64-shaders (#3992)",
-          rule_names().size() == 25);
+          "unsupported-wave64-shaders (#3992) and unverified-fragment-f32-arithmetic (#4062)",
+          rule_names().size() == 26);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ok", g_failures);
     return g_failures ? 1 : 0;
 }

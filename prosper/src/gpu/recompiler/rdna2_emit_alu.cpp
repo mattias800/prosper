@@ -3682,11 +3682,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), selected);
                     break;
                 }
-                case 0x03: d = b.fbin(Op_FAdd, a, c); break;          // v_add_f32
+                case 0x03:                                          // v_add_f32
+                    b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Add);
+                    d = b.fbin(Op_FAdd, a, c); break;
                 case 0x04: d = b.fbin(Op_FSub, a, c); break;          // v_sub_f32
                 case 0x05: d = b.fbin(Op_FSub, c, a); break;          // v_subrev_f32 (src1 - src0; e32 form of
                                                                       // VOP3 0x105 — round-trip llvm-mc gfx1010 0x0a020702)
-                case 0x08: d = b.fbin(Op_FMul, a, c); break;          // v_mul_f32
+                case 0x08:                                          // v_mul_f32
+                    b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Mul);
+                    d = b.fbin(Op_FMul, a, c); break;
                 case 0x0B: {                                        // v_mul_u32_u24
                     // Only the low 24 bits of each source participate; the result is the low
                     // 32 bits of the unsigned product (AMD RDNA2 ISA 11.6).
@@ -5353,12 +5357,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16_rtz(fv(0), fv(1)); // v_cvt_pkrtz VOP3: RTZ clamp (#452)
             } else if (in.opcode == 0x103) {                          // v_add_f32 (VOP3 form)
+                b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Add);
                 vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, fv(0), fv(1)));
             } else if (in.opcode == 0x104) {                          // v_sub_f32 (VOP3 form) = s0 - s1
                 vreg[in.dst.value] = fresult(b.fbin(Op_FSub, fv(0), fv(1)));
             } else if (in.opcode == 0x105) {                          // v_subrev_f32 (VOP3 form) = s1 - s0
                 vreg[in.dst.value] = fresult(b.fbin(Op_FSub, fv(1), fv(0)));
             } else if (in.opcode == 0x108) {                          // v_mul_f32 (VOP3 form)
+                b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Mul);
                 vreg[in.dst.value] = fresult(b.fbin(Op_FMul, fv(0), fv(1)));
             } else if (in.opcode == 0x10F) {                          // v_min_f32 (VOP3 form; NaN -> other operand)
                 vreg[in.dst.value] = fresult(b.fext2(Glsl_NMin, fv(0), fv(1)));

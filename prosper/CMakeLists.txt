@@ -2453,6 +2453,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_fragment_float_mode PRIVATE prosper_core)
   target_include_directories(test_fragment_float_mode PRIVATE tests)
   add_test(NAME fragment_float_mode COMMAND test_fragment_float_mode)
+  add_executable(test_fragment_arithmetic_diagnostics tests/gpu/recompiler/test_fragment_arithmetic_diagnostics.cpp)
+  target_link_libraries(test_fragment_arithmetic_diagnostics PRIVATE prosper_core)
+  target_include_directories(test_fragment_arithmetic_diagnostics PRIVATE tests)
+  add_test(NAME fragment_arithmetic_diagnostics COMMAND test_fragment_arithmetic_diagnostics)
 
   # #3203: the entry-M0 token containment's CFG-DISPATCHER re-arm. Its own binary rather than another
   # arm in test_rdna2_spirv_struct, because that one returns at its first failure and a mutation run

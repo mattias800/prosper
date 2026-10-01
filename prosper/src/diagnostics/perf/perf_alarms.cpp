@@ -326,6 +326,18 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
                          n(Counter::Wave64UnidentifiedRefusals), n(Counter::Wave64InventoryOverflow),
                          n(Counter::Wave64ShaderChecks));
         }
+        std::fprintf(jsonl_, ",\"fragment_arithmetic_requests\":%llu,"
+            "\"fragment_arithmetic_known_mode_requests\":%llu,"
+            "\"fragment_arithmetic_unknown_mode_requests\":%llu,"
+            "\"fragment_arithmetic_add_requests\":%llu,\"fragment_arithmetic_mul_requests\":%llu,"
+            "\"fragment_arithmetic_refused_requests\":%llu,"
+            "\"fragment_arithmetic_truncated_requests\":%llu,"
+            "\"fragment_arithmetic_announcement_overflow_requests\":%llu",
+            n(Counter::FragmentArithmeticRequests), n(Counter::FragmentArithmeticKnownMode),
+            n(Counter::FragmentArithmeticUnknownMode), n(Counter::FragmentArithmeticAddRequests),
+            n(Counter::FragmentArithmeticMulRequests), n(Counter::FragmentArithmeticRefusedRequests),
+            n(Counter::FragmentArithmeticTruncatedRequests),
+            n(Counter::FragmentArithmeticInventoryOverflowRequests));
         {
             const char* names[kGpuMemoryClassSlots];
             for (size_t i = 0; i < kGpuMemoryClassSlots; ++i)

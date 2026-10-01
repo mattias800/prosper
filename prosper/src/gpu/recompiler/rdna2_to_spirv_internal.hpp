@@ -397,6 +397,11 @@ struct SpirvCompute {
     std::vector<uint32_t> caps, exts, extimp, mem, entry, exec, debug, deco, types, code;
     RecompileDiagnosticContext diagnostic{};
     FragmentFloatMode fragment_float_mode{};
+    FragmentArithmeticObservation* fragment_arithmetic_observation = nullptr;
+    void observe_fragment_arithmetic_site(uint32_t pc, FragmentArithmeticFamily family) {
+        if (is_fragment && fragment_arithmetic_observation)
+            fragment_arithmetic_observation->record(pc, family);
+    }
     uint64_t fragment_program_hash = 0;
     bool fragment_float_mode_warning = false;
     void warn_fragment_float_mode_unavailable(uint32_t pc);

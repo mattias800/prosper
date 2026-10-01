@@ -110,12 +110,17 @@ const std::vector<const char*>& rule_names() {
         "gpu-device-time-coverage",
         "rtt-colorless-publication",
         "unsupported-wave64-shaders",
+        "unverified-fragment-f32-arithmetic",
     };
     return names;
 }
 
 bool rule_has_data(const char* rule, const WindowSample& w) {
     const std::string r = rule ? rule : "";
+    if (r == "unverified-fragment-f32-arithmetic")
+        return w.count(Counter::FragmentArithmeticRequests) != 0 ||
+               w.count(Counter::FragmentArithmeticKnownMode) != 0 ||
+               w.count(Counter::FragmentArithmeticUnknownMode) != 0;
     if (r == "unsupported-wave64-shaders") {
         if (w.count(Counter::Wave64ShaderChecks)) return true;
         for (Counter counter : kWave64RefusalCounters)
@@ -159,7 +164,8 @@ uint32_t sustain_windows(const char* rule) {
     if (r == "rtt-colorless-publication") return kRttColorlessPublicationSustainWindows;
     if (r == "dropped-draws" || r == "skipped-dispatches" || r == "gpu-memory-off-device" ||
         r == "unaccounted-draws" || r == "unimplemented-hle-calls" ||
-        r == "diagnostic-path-active" || r == "unsupported-wave64-shaders")
+        r == "diagnostic-path-active" || r == "unsupported-wave64-shaders" ||
+        r == "unverified-fragment-f32-arithmetic")
         return kCorrectnessSustainWindows;
     if (r == "shader-compile") return kShaderCompileSustainWindows;
     if (r == "texture-reference-cost") return kTextureReferenceSustainWindows;
@@ -427,6 +433,40 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                      "wave reason bits. Counts are repeated shader uses, not unique shaders. "
                      "Known guest widths only; unplumbed vertex wave width is not guessed. "
                      "Supported native or faithful lowered uses do not count; cf. #3992";
+            out.push_back(std::move(a));
+        }
+    }
+
+    // A known lowering gap is worth announcing even without a measured GPU numerical failure.
+    // Repeated cached requests replay actual producing facts; no runtime instruction frequency
+    // or draw execution is inferred from these counts. Refusals after emission remain included.
+    {
+        const uint64_t counts[] = {w.count(Counter::FragmentArithmeticKnownMode),
+                                   w.count(Counter::FragmentArithmeticUnknownMode)};
+        const char* names[] = {"known-launch-mode", "unavailable-launch-mode"};
+        const uint64_t total = counts[0] + counts[1];
+        if (total >= kUnverifiedFragmentArithmeticRequestsPerWindow) {
+            AlarmFiring a;
+            a.rule = "unverified-fragment-f32-arithmetic";
+            a.value = static_cast<double>(total);
+            a.unit = "unverified-compiler-requests";
+            a.threshold = kUnverifiedFragmentArithmeticRequestsPerWindow;
+            a.breakdown = ranked(counts, names, 2);
+            a.detail = format("requests=%llu ADD-requests=%llu MUL-requests=%llu "
+                "refused-after-emission=%llu sites-truncated-requests=%llu "
+                "announcement-overflow-requests=%llu inventory=ADD/MUL-only",
+                (unsigned long long)total,
+                (unsigned long long)w.count(Counter::FragmentArithmeticAddRequests),
+                (unsigned long long)w.count(Counter::FragmentArithmeticMulRequests),
+                (unsigned long long)w.count(Counter::FragmentArithmeticRefusedRequests),
+                (unsigned long long)w.count(Counter::FragmentArithmeticTruncatedRequests),
+                (unsigned long long)w.count(Counter::FragmentArithmeticInventoryOverflowRequests));
+            a.hint = "Default-on [fragment-arithmetic-unverified] lines name lookup/producing "
+                "program, guest PC/family and actual FLOAT_MODE availability. Retain raw program "
+                "and launch mode, then test input/output denorm and rounding requirements (#4059). "
+                "Known mode does not prove arithmetic support; unavailable is not mode0. "
+                "Counts are direct/cached compiler requests, including later refusal, not "
+                "execution, unique shaders, wrong pixels or complete float-op inventory";
             out.push_back(std::move(a));
         }
     }
