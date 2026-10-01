@@ -323,6 +323,41 @@ static void dump_numeric_mbcnt(const std::string& dir) {
     }
 }
 
+static void dump_numeric_wqm(const std::string& dir) {
+    for (bool wide : {false, true}) {
+        const std::array compute = {
+            wide ? 0xbe940affu : 0xbe9409ffu, 0x80000001u, 0x7e000214u, 0xbf810000u};
+        for (bool cfg : {false, true}) {
+            const std::string name = std::string("compute_numeric_wqm_") +
+                (wide ? "b64" : "b32") + (cfg ? "_cfg" : "_compact");
+            dump(dir, name.c_str(), recompile_valu(compute.data(), compute.size(), 1, 0,
+                 nullptr, 0, kDefaultComputePgmRsrc1, cfg));
+        }
+        const std::array fragment = {
+            wide ? 0xbe940affu : 0xbe9409ffu, 0x80000001u, 0x7e000214u, 0x7e000d00u,
+            0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u};
+        for (bool wave32 : {false, true}) {
+            const std::string name = std::string("fragment_numeric_wqm_") +
+                (wide ? "b64" : "b32") + (wave32 ? "_w32" : "_w64");
+            dump(dir, name.c_str(), recompile_fragment(fragment.data(), fragment.size(),
+                 nullptr, nullptr, UINT32_MAX, nullptr, wave32));
+        }
+    }
+}
+
+static void dump_numeric_wqm_sources(const std::string& dir) {
+    const std::array raw = {0xbe8403ffu, 0x80000000u, 0xbe8503ffu, 0x00000001u,
+                            0xbe940a04u, 0x7e000215u, 0xbf810000u};
+    dump(dir, "compute_numeric_wqm_raw_b64", recompile_valu(raw.data(), raw.size(), 1, 0));
+    const std::array float_bits = {0xbe9409f2u, 0x7e000214u, 0xbf810000u};
+    for (bool cfg : {false, true}) {
+        const std::string name = std::string("compute_numeric_wqm_float_b32") +
+            (cfg ? "_cfg" : "_compact");
+        dump(dir, name.c_str(), recompile_valu(float_bits.data(), float_bits.size(), 1, 0,
+             nullptr, 0, kDefaultComputePgmRsrc1, cfg));
+    }
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : ".";
     // The source root is required, not optional: the coverage check is the half of this gate that
@@ -417,6 +452,8 @@ int main(int argc, char** argv) {
     { const uint32_t c[] = {0x06000300u, 0x10000500u, 0xBF810000u};
       dump(dir, "compute_alu", recompile_valu(c, 3, 3, 0), "recompile_valu"); }
     dump_numeric_mbcnt(dir);
+    dump_numeric_wqm(dir);
+    dump_numeric_wqm_sources(dir);
     // GTA V's exact literal-bearing V_ALIGNBYTE_B32 packet.  Strict validation guards the
     // masked-shift lowering: SPIR-V shift operands must stay in the defined 0..31 range.
     { const uint32_t c[] = {0xd54f0006u,0x0415fe80u,0x3024240cu,0xbf810000u};

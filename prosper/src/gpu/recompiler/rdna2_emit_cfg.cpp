@@ -1411,7 +1411,9 @@ bool has_unpersisted_b32_mask_lifetime(const std::vector<Rdna2Inst>& ins,
     for (const auto& in : ins) {
         if (in.is_end || in.pc < lo || in.pc >= hi || in.fmt != Rdna2Format::SOP1)
             continue;
-        if (in.opcode == 0x09) return true; // s_wqm_b32 creates/consumes the same width state
+        if (in.opcode == 0x09 &&
+            !(wqm_has_numeric_destination(in) && wqm_has_intrinsic_numeric_source(in)))
+            return true; // only mask-domain s_wqm_b32 requires the unpersisted width state
         if (in.opcode != 0x03 && in.opcode != 0x07) continue;
         const bool register_source = in.src[0].kind == OperandKind::SGPR ||
                                      in.src[0].kind == OperandKind::Special;
@@ -3332,6 +3334,10 @@ bool emit_cfg_state_machine(
                         scalar_words.contains(in.dst.value + static_cast<int>(word));
             }
             const bool scalar_alu_result = scalar_sources && implicit_scalar_source;
+            // Only intrinsic DATA has a numeric proof at a dispatcher reload. SGPR variable
+            // presence can be a descriptor/scalar placeholder, so raw SGPR WQM stays compact-only.
+            const bool numeric_wqm = wqm_has_numeric_destination(in) &&
+                wqm_has_intrinsic_numeric_source(in);
             const bool vcc_pack_scalar_pair = b.is_compute && b.wave_size == 64 &&
                 in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x32 &&
                 in.opcode <= 0x34 && in.dst.value == 106 &&
@@ -3364,7 +3370,8 @@ bool emit_cfg_state_machine(
             } else if (in.fmt == Rdna2Format::SOP1 && in.dst.value <= 107) {
                 if (wave64_vcc_b32_mask_not)
                     mask_write = 106;
-                else if ((in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a) &&
+                else if (!numeric_wqm &&
+                    (in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a) &&
                     source_is_mask(in.src[0]))
                     mask_write = in.dst.value;
                 else if ((in.opcode >= kSop1OpcodeAndSaveexecB64 &&
@@ -3585,7 +3592,9 @@ bool emit_cfg_state_machine(
                      in.opcode <= kSop1OpcodeXnorSaveexecB64) ||
                     in.opcode == kSop1OpcodeAndn1SaveexecB64 ||
                     in.opcode == kSop1OpcodeOrn1SaveexecB64;
-                if (in.opcode == kSop1OpcodeNotB32 ||
+                if (numeric_wqm)
+                    scalar_scc = true;
+                else if (in.opcode == kSop1OpcodeNotB32 ||
                     in.opcode == kSop1OpcodeAbsI32)
                     scalar_scc = scalar_alu_result && !wave64_vcc_b32_mask_not;
                 else if (in.opcode == kSop1OpcodeBcnt1I32B64)
