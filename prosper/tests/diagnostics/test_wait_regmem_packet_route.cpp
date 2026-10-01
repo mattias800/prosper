@@ -2,6 +2,8 @@
 // is created: a validation-layer environment alone cannot turn these into rendering evidence.
 #include "diagnostics/perf/perf_alarms.hpp"
 #include "gpu/pm4/command_processor.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include "hle/memory/guest_memory_topology.hpp"
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -202,29 +204,87 @@ int main(int argc, char** argv) {
               "actual readable unsupported route has its own primary reason");
         if (deferred) {
             // These intentionally impossible barriers exercise the existing bounded liveness
-            // backstop; they are not a measured game timeout or a new timeout-policy claim.
-            std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+            // backstop; its age starts at the FIRST deferred recheck, not at direct folding.
+            // The unreadable barrier expires immediately; the readable unsupported barrier
+            // records its first blocked time and remains queued until a later timed recheck.
             const auto recheck_before = counts();
+            flush_deferred_streams();
+            check(deferred_pending(), "readable unsupported fixture barrier arms the existing watchdog");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100));
             flush_deferred_streams();
             delta(recheck_before, {}, disabled, "timeout rechecks remain outside direct incidence");
             check(!deferred_pending(), "impossible fixture barriers are reaped after the existing timeout");
         }
     }
 
-    // The real retained DMA/effect route must short-circuit both acceptance and refusal.
-    for (bool accepted : {false, true}) {
+    // Host-stack VA disjointness cannot prove physical topology. Preserve the existing fail-closed
+    // result explicitly rather than mistaking this arm for a satisfying retained-effect overlay.
+    {
         alignas(8) uint64_t source = 0x11223344u, destination = 0, label = 0;
         std::vector<uint32_t> stream;
         dma(stream, reinterpret_cast<uint64_t>(&destination), reinterpret_cast<uint64_t>(&source), 8u);
         dma(stream, reinterpret_cast<uint64_t>(&label), 1u, 8u, true);
-        wait(stream, reinterpret_cast<uint64_t>(&label), accepted ? 0x100000001ull : 2u);
+        wait(stream, reinterpret_cast<uint64_t>(&label), 0x100000001ull);
         GpuState state;
         const auto before = counts();
-        check(fold(stream, state) == 3u, "retained DMA/effect/wait decode through actual packets");
-        check(state.dma_execution_rejected == !accepted,
-              "retained-effect wait keeps its original acceptance/refusal result");
-        delta(before, {}, disabled, "ordered retained-effect acceptance/refusal is not direct incidence");
-        check(!deferred_pending(), "retained-effect arm leaves no deferred stream");
+        check(prosper::guest_memory_topology_relation(reinterpret_cast<uint64_t>(&destination), 8u,
+                  reinterpret_cast<uint64_t>(&label), 8u) ==
+                  prosper::GuestMemoryTopologyRelation::Unknown,
+              "unregistered retained DMA and label topology is explicitly unknown");
+        check(fold(stream, state) == 3u && state.dma_execution_rejected,
+              "unknown-topology retained-effect wait preserves the original rejection");
+        delta(before, {}, disabled, "unknown-topology retained rejection is not direct incidence");
+        check(!deferred_pending(), "unknown-topology arm leaves no deferred stream");
+    }
+
+    // Use real kernel direct-memory registration to prove the copy destination is physically
+    // disjoint from the waited label. This reaches the actual retained immediate-effect overlay.
+    {
+        prosper::register_builtin_hle();
+        const auto allocate = prosper::Hle::lookup(prosper::nid_hash("sceKernelAllocateDirectMemory"));
+        const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapDirectMemory"));
+        const auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
+        const auto release_mapping = prosper::Hle::lookup(prosper::nid_hash("sceKernelReleaseDirectMemory"));
+        constexpr uint64_t owned_length = 0x10000u;
+        constexpr uint64_t owned_budget_end = 16ull * 1024u * 1024u * 1024u;
+        uint64_t owned_physical = 0, owned_view = 0;
+        const bool routes = allocate && map && unmap && release_mapping;
+        check(routes, "retained-effect fixture resolves real memory HLE routes");
+        const bool allocated = routes && allocate(0, owned_budget_end, owned_length, owned_length,
+            0, reinterpret_cast<uint64_t>(&owned_physical)) == 0;
+        const bool mapped = allocated && map(reinterpret_cast<uint64_t>(&owned_view), owned_length,
+            0x2u, 0, owned_physical, owned_length) == 0 && owned_view;
+        check(mapped, "retained-effect fixture maps authoritative direct-memory topology");
+        if (mapped) for (bool accepted : {false, true}) {
+            auto* source = reinterpret_cast<uint64_t*>(owned_view);
+            auto* destination = reinterpret_cast<uint64_t*>(owned_view + 0x100u);
+            auto* label = reinterpret_cast<uint64_t*>(owned_view + 0x200u);
+            *source = 0x11223344u;
+            *destination = *label = 0;
+            check(prosper::guest_memory_topology_relation(reinterpret_cast<uint64_t>(destination),
+                      8u, reinterpret_cast<uint64_t>(label), 8u) ==
+                      prosper::GuestMemoryTopologyRelation::Disjoint,
+                  "registered retained copy and waited label are physically disjoint");
+            std::vector<uint32_t> stream;
+            dma(stream, reinterpret_cast<uint64_t>(destination), reinterpret_cast<uint64_t>(source), 8u);
+            dma(stream, reinterpret_cast<uint64_t>(label), 1u, 8u, true);
+            wait(stream, reinterpret_cast<uint64_t>(label), accepted ? 0x100000001ull : 2u);
+            GpuState state;
+            const auto before = counts();
+            check(fold(stream, state) == 3u, "retained DMA/effect/wait decode through actual packets");
+            check(state.dma_execution_rejected == !accepted,
+                  "retained-effect wait keeps its original acceptance/refusal result");
+            check(*destination == 0 && *label == 0 && state.ordered_memory_effects.size() == 1u,
+                  "retained route keeps its copy and immediate effect private during folding");
+            delta(before, {}, disabled, "ordered retained-effect acceptance/refusal is not direct incidence");
+            check(!deferred_pending(), "retained-effect arm leaves no deferred stream");
+        }
+        if (owned_view)
+            check(unmap(owned_view, owned_length, 0, 0, 0, 0) == 0,
+                  "retained-effect fixture unmaps its owned view after all folds");
+        if (allocated)
+            check(release_mapping(owned_physical, owned_length, 0, 0, 0, 0) == 0,
+                  "retained-effect fixture releases its owned direct memory");
     }
 
     perf::EngineConfig config;
