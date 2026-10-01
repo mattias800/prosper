@@ -1,6 +1,7 @@
 // Register actual synthetic AGC programs, realize real graphics tables, then consume their numeric
 // bytes through the shipping resource builder/backend. Unsupported programs never execute on GPU.
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/capture/gpu_capture.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "hle/dispatch/dispatch.hpp"
@@ -10,6 +11,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <vector>
 
@@ -223,12 +225,118 @@ static void observe_pixels(const DrawItem& draw, bool vertex, float value, const
     }
 }
 
+// Optional complete synthetic draws for stored/current-raw replay. Read only the two registered
+// code spans and the fixture's owned guest allocation; required parents come from the realized
+// table's old observation, after the guest's highest selector word has already changed.
+static void emit_owned_replay_fixture(const std::filesystem::path& directory, DrawItem draw,
+                                     const Program& vs, const Program& ps, bool vertex, bool wide8,
+                                     uint64_t guest, size_t guest_bytes, uint64_t parent_address,
+                                     uint32_t parent_pc, uint32_t child_pc, float child_value) {
+    if (directory.empty()) return;
+    const char* arm = vertex ? "VS" : "PS";
+    const uint32_t size = wide8 ? 32u : 16u, last = wide8 ? 7u : 3u;
+    draw.color0_base = 0x7e000000u + (vertex ? 0u : 0x2000u) + (wide8 ? 0x1000u : 0u);
+    draw.color0_width = W; draw.color0_height = H;
+    draw.color_targets[0].mirror_named_identity(draw.color0_base, W, H);
+    unsigned parent_reads = 0u;
+    const auto copy = [](uint64_t address, uint8_t* dst, size_t want,
+                         uint64_t base, const void* bytes, size_t length) {
+        if (address < base || address - base >= length) return size_t{0};
+        const auto offset = static_cast<size_t>(address - base);
+        const auto copied = std::min(want, length - offset);
+        std::memcpy(dst, static_cast<const uint8_t*>(bytes) + offset, copied);
+        return copied;
+    };
+    const CaptureMemoryReader reader = [&](uint64_t address, uint8_t* dst, size_t want) {
+        for (const Program* program : {&vs, &ps})
+            if (const auto n = copy(address, dst, want,
+                    reinterpret_cast<uint64_t>(program->code.data()), program->code.data(),
+                    program->header.shader_size)) return n;
+        const auto n = copy(address, dst, want, guest,
+                            reinterpret_cast<const void*>(guest), guest_bytes);
+        if (n && address < parent_address + size && parent_address < address + n)
+            ++parent_reads;
+        return n;
+    };
+    GpuCaptureMetadata metadata;
+    metadata.width = W; metadata.height = H;
+    metadata.input_route = "synthetic-owned-raw-wide";
+    GpuCaptureFile capture, decoded;
+    GpuReplayFrame replay;
+    std::string error;
+    const std::string filename = std::string(vertex ? "vs-" : "ps-") +
+        (wide8 ? "x8.prgcap" : "x4.prgcap");
+    const auto path = directory / filename;
+    const bool written = capture_draw_items({draw}, metadata, reader, capture, error) &&
+        write_gpu_capture(path.string(), capture, error) &&
+        read_gpu_capture(path.string(), decoded, error);
+    const auto matches_raw = [&](uint32_t index, const Program& program) {
+        if (index >= decoded.raw_shader_versions.size()) return false;
+        const auto& raw = decoded.raw_shader_versions[index];
+        return raw.has_endpgm && raw.words == std::vector<uint32_t>(program.code.begin(),
+            program.code.begin() + program.header.shader_size / sizeof(uint32_t));
+    };
+    const bool complete = written && decoded.draws.size() == 1u &&
+        decoded.metadata.width == W && decoded.metadata.height == H &&
+        !decoded.draws[0].vs.empty() && !decoded.draws[0].fs.empty() &&
+        decoded.draws[0].vertex_count == 3u && decoded.draws[0].instance_count == 1u &&
+        decoded.draws[0].raw_draw_count == 3u && !decoded.draws[0].raw_indexed &&
+        decoded.draws[0].color0_width == W && decoded.draws[0].color0_height == H &&
+        decoded.draws[0].vs_chain_raw_shader_index == UINT32_MAX &&
+        matches_raw(decoded.draws[0].vs_raw_shader_index, vs) &&
+        matches_raw(decoded.draws[0].fs_raw_shader_index, ps);
+    check(complete, arm, "optional owned replay writes both exact raw stages and complete draw state");
+    const bool materialized = complete && materialize_gpu_replay(decoded, replay, error);
+    const auto table = materialized && replay.items.size() == 1u
+        ? (vertex ? replay.items[0].vrt : replay.items[0].prt) : nullptr;
+    const auto* parent = table ? table->by_fetch_pc(parent_pc) : nullptr;
+    const auto* child = table ? table->by_fetch_pc(child_pc) : nullptr;
+    uint32_t parent_high = UINT32_MAX, child_high = UINT32_MAX;
+    if (parent && parent->host_data && parent->host_data_size == size)
+        std::memcpy(&parent_high, parent->host_data + last * 4u, 4u);
+    if (child && child->host_data && child->host_data_size >= size)
+        std::memcpy(&child_high, child->host_data + last * 4u, 4u);
+    check(materialized && parent_reads == 0u && parent &&
+          parent->owned_raw_snapshot_bytes == size && parent_high == 2u &&
+          child && child->size == size && child_high == std::bit_cast<uint32_t>(child_value) &&
+          replay.items[0].vs_words() == draw.vs_words() &&
+          replay.items[0].fs_words() == draw.fs_words(), arm,
+          "optional owned replay preserves old highest parent and separate highest child bytes");
+    if (vertex) {
+        const float translation = child_value + 1.0f; // retained parent selector 2 * 0.5
+        uint32_t expected_mask = 0u;
+        for (uint32_t x = 0u; x < W; ++x)
+            if (static_cast<float>(2u * x + 1u) / W >= translation) expected_mask |= 1u << x;
+        std::printf("[owned-replay-fixture] %s complete=%d materialized=%d parent-reads=%u "
+                    "expected-vs-translation=%g expected-row2-green-mask=0x%02x error=%s\n",
+                    path.string().c_str(), complete, materialized, parent_reads,
+                    translation, expected_mask, error.c_str());
+    } else {
+        std::printf("[owned-replay-fixture] %s complete=%d materialized=%d parent-reads=%u "
+                    "expected-ps-rgba=%u,%u,191,255 error=%s\n",
+                    path.string().c_str(), complete, materialized, parent_reads,
+                    static_cast<unsigned>(static_cast<uint8_t>(child_value * 255.0f)),
+                    static_cast<unsigned>(static_cast<uint8_t>(0.25f * 255.0f)), error.c_str());
+    }
+}
+
 int main(int argc, char** argv) {
-    cpu_only = argc == 2 && std::strcmp(argv[1], "--cpu-only") == 0;
+    std::filesystem::path replay_directory;
+    const bool emit_replay = argc == 3 && std::strcmp(argv[1], "--emit-owned-replay-fixtures") == 0;
+    cpu_only = emit_replay || (argc == 2 && std::strcmp(argv[1], "--cpu-only") == 0);
     pixel_control = argc == 2 && std::strcmp(argv[1], "--pixel-control") == 0;
-    if (argc > 2 || (argc == 2 && !cpu_only && !pixel_control)) {
-        std::printf("[FAIL] usage: test_graphics_raw_wide_upload [--cpu-only|--pixel-control]\n");
+    if ((!emit_replay && argc > 2) || (argc == 2 && !cpu_only && !pixel_control)) {
+        std::printf("[FAIL] usage: test_graphics_raw_wide_upload [--cpu-only|--pixel-control|"
+                    "--emit-owned-replay-fixtures NEW_DIRECTORY]\n");
         return 1;
+    }
+    if (emit_replay) {
+        replay_directory = argv[2];
+        std::error_code error;
+        if (!std::filesystem::create_directory(replay_directory, error)) {
+            std::fprintf(stderr, "owned replay requires a new directory: %s\n", error.message().c_str());
+            return 2;
+        }
     }
     prosper::register_builtin_hle();
     const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
@@ -371,7 +479,10 @@ int main(int argc, char** argv) {
             auto& owned_program = register_program(vertex, Load::OwnedSelector, wide8);
             const uint32_t count = wide8 ? 8u : 4u;
             const uint32_t last = count - 1u;
-            const float first = vertex ? 0.5f : 0.25f, second = vertex ? 0.0f : 0.75f;
+            // Export-only VS translation stays visible: child -0.5 plus saved selector 2/2.
+            // A parent reread (3/2) or wrong zero child changes the expected row coverage.
+            const float first = vertex ? (emit_replay ? -0.5f : 0.5f) : 0.25f;
+            const float second = vertex ? 0.0f : 0.75f;
             data[8u + last] = std::bit_cast<uint32_t>(first);
             data[12u + last] = std::bit_cast<uint32_t>(second);
             std::fill(selector, selector + 9u, 0u);
@@ -412,6 +523,10 @@ int main(int argc, char** argv) {
             observe_pixels(owned_draw, vertex, vertex ? first + 1.0f : first, arm, 0.25f);
             selector[1u + last] = 3u;
             notify_guest_gpu_write(reinterpret_cast<uint64_t>(selector + 1u), count * 4u);
+            emit_owned_replay_fixture(replay_directory, owned_draw,
+                vertex ? owned_program : plain_vs, vertex ? plain_ps : owned_program,
+                vertex, wide8, guest, Bytes, reinterpret_cast<uint64_t>(selector + 1u),
+                owned_program.scalar_pc, owned_program.load_pc, first);
             observe_pixels(owned_draw, vertex, vertex ? first + 1.0f : first, arm, 0.25f);
             data[8u + last] = std::bit_cast<uint32_t>(second);
             notify_guest_gpu_write(guest + 32u, count * 4u);

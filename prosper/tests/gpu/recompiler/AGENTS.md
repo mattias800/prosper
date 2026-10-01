@@ -50,11 +50,12 @@ arm reaches derived provenance. The one-arm compare targets the MUST mask meet a
   Choose nearest filtering explicitly for the explicit-LOD route assertion; preserve
   the failed calibration and independently validated linear vectors (#3987).
 
-- A supported `image_sample_c_lz` is not a guest-memory write. An immutable failed compiler
-  input showed that unrelated comparison samples alone forced descriptor-only register-offset
-  raw loads into `rdna2_raw_wide_data_loads`. The paired classifier experiment preserved all
-  lifetime facts and real numeric/store/atomic/unknown-op refusals. This rules out that observed
-  site as evidence of a numeric or per-wave backing requirement; the broader raw plan stays open.
+- A supported `image_sample_c_lz` is not a guest-memory write. The exact immutable GTA V
+  `0x205a95de00` compiler input's PC52 was forced into `rdna2_raw_wide_data_loads` by unrelated
+  comparison samples. The paired classifier experiment preserved all lifetime facts and real
+  numeric/store/atomic/unknown-op refusals; its residual PC30 still requires backing. This rules
+  out PC52 in that input as evidence of a numeric or per-wave backing requirement, not the broader
+  raw plan. See [PR #3987](https://github.com/mattias800/prosper/pull/3987) and the title's Ruled out row.
 
 - Running the owned-input chain proof before every cache lookup is not a negligible warm-hit
   cost. A balanced synthetic unowned 1,024-VMOV chain measured about 0.566 ms per current hit
