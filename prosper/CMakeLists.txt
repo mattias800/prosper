@@ -2968,6 +2968,10 @@ endif()
   target_link_libraries(test_gpu_replay_shader_dump PRIVATE prosper_core)
   add_test(NAME gpu_replay_shader_dump COMMAND test_gpu_replay_shader_dump)
 
+  add_executable(test_replay_fragment_width tests/gpu/recompiler/test_replay_fragment_width.cpp)
+  target_link_libraries(test_replay_fragment_width PRIVATE prosper_core)
+  add_test(NAME replay_fragment_width COMMAND test_replay_fragment_width)
+
   # Draw-scoped captured-resource replacement: strict semantic selector, exact span validation,
   # and copy-on-write isolation when draws share tables/backing. Pure/cross-platform; no Vulkan.
   add_executable(test_gpu_replay_resource_override
@@ -5494,6 +5498,14 @@ endif()
 # has to fail when the legend is dropped; nothing else in the tree can. Behavioural rather than a
 # source grep: it runs the real binary and reads what an operator would actually see.
 if(TARGET gpu_replay AND Python3_Interpreter_FOUND)
+  add_test(NAME gpu_replay_fragment_width_cli
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/gpu_replay/test_fragment_width.py")
+  set_tests_properties(gpu_replay_fragment_width_cli PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+  set_property(TEST gpu_replay_fragment_width_cli APPEND PROPERTY ENVIRONMENT
+    "PROSPER_GPU_REPLAY_BIN=$<TARGET_FILE:gpu_replay>"
+    "PROSPER_REPLAY_FRAGMENT_WIDTH_FIXTURE_BIN=$<TARGET_FILE:test_replay_fragment_width>")
+
   add_test(NAME gpu_replay_cli_contract
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/gpu_replay/test_cli_contract.py")
