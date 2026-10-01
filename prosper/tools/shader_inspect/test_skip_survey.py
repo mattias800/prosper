@@ -137,13 +137,25 @@ def main() -> int:
           "prosper::gpu::FragmentWavePolicy::ProvenVotes" in app)
     check("proven emitter carries every parsed field",
           '"[render] proven fragment votes: subgroup 64 -> independent "' in rr and
-          '"(uniform=%u dead=%u fs=%016llx)' in rr)
-    proven_line = "[render] proven fragment votes: subgroup 64 -> independent (uniform=2 dead=3 fs=00000000000000ab)"
+          '"(uniform=%u dead=%u neutral=%u fs=%016llx)' in rr)
+    proven_line = ("[render] proven fragment votes: subgroup 64 -> independent "
+                   "(uniform=2 dead=3 neutral=4 fs=00000000000000ab)")
     check("ADMIT_PROVEN extracts proof counts and shader identity",
-          skip_survey.ADMIT_PROVEN.findall(proven_line) == [("2", "3", "00000000000000ab")])
+          skip_survey.ADMIT_PROVEN.findall(proven_line) == [("2", "3", "4", "00000000000000ab")])
+    check("ADMIT_PROVEN still reads historical logs without a neutral count",
+          skip_survey.ADMIT_PROVEN.findall(proven_line.replace(" neutral=4", "")) ==
+          [("2", "3", "", "00000000000000ab")])
+    check("ADMIT_PROVEN refuses malformed neutral counts rather than guessing",
+          not skip_survey.ADMIT_PROVEN.findall(proven_line.replace("neutral=4", "neutral=unknown")))
+    check("ADMIT_PROVEN counts neutral-only admissions with zero legacy proof counts",
+          skip_survey.ADMIT_PROVEN.findall(proven_line.replace("uniform=2 dead=3", "uniform=0 dead=0")) ==
+          [("0", "0", "4", "00000000000000ab")])
     check("proven admission does not match refusal or legacy patterns",
           not skip_survey.SKIP.findall(proven_line) and not skip_survey.ADMIT.findall(proven_line) and
           not skip_survey.ADMIT_PARTIAL.findall(proven_line) and not skip_survey.ADMIT_PROVEN.findall(skip_line))
+    check("the survey explanation describes general admission, not the removed title list",
+          "ALLOWLISTED TITLES ONLY" not in source(HERE.parent / "skip_survey.py") and
+          "no title allowlist participates in live" in source(HERE.parent / "skip_survey.py"))
 
     # N7: `admitted` is a shader count only because the emitter dedupes on shader identity
     # before printing. Nothing else pins that, so a refactor dropping the guard would turn

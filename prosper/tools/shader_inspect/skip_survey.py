@@ -76,7 +76,7 @@ ADMIT = re.compile(r"\[render\] native-width fragment vote: subgroup (\d+) -> (\
 ADMIT_PARTIAL = re.compile(r"\[render\] partial-wave fragment: subgroup (\d+) -> (\d+)\.\.(\d+) "
                            r"\(why=(\S+?)[ )]")
 ADMIT_PROVEN = re.compile(r"\[render\] proven fragment votes: subgroup 64 -> independent "
-                         r"\(uniform=(\d+) dead=(\d+) fs=([0-9a-f]+)\)")
+                         r"\(uniform=(\d+) dead=(\d+)(?: neutral=(\d+))? fs=([0-9a-f]+)\)")
 FPS = re.compile(r"\[app\] [\d.]+ fps \((\d+) frames")
 # Belt and braces against the failure that invalidated every routed run before it was noticed: the
 # path is checked before the corpus starts, and the log is checked after each boot, because a file
@@ -461,11 +461,11 @@ def main() -> int:
     print("")
     print("A zero is NOT a clean bill of health, for two reasons. (1) A title refuses nothing until")
     print("it renders the thing that would have been refused -- GTA V reported 0 over 5160 frames")
-    print("while its world refuses 21 (#3464), because the window reached only its menus. (2) Since")
-    print("PR #3480 a wave-any shader is ADMITTED on ALLOWLISTED TITLES ONLY and logs the admit line")
-    print("instead of a skip line, so on those titles that class is counted in the ADMITTED column")
-    print("and never the refused one. On every other title it is still refused -- and wave-any was")
-    print("the class every hit in this corpus belonged to.")
+    print("while its world refuses 21 (#3464), because the window reached only its menus. (2) General")
+    print("per-vote certificates admit proved subgroup-independent modules and log an admit line")
+    print("instead of a skip line. Those modules are counted in the ADMITTED column, never the")
+    print("refused one. Unproved modules remain refused; no title allowlist participates in live")
+    print("admission. Historical native-width and partial-wave admit lines are also recognized.")
     print("Counts are SHADERS, never draws -- the renderer's message is inside a "
           "shader-identity")
     print("dedupe guard and the draw drop is outside it. They are UPPER BOUNDS on distinct "
