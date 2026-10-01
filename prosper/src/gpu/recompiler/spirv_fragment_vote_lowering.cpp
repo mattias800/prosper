@@ -1,5 +1,6 @@
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include "gpu/recompiler/spirv_fragment_uniform_trace.hpp"
+#include "gpu/recompiler/spirv_fragment_neutral_selection.hpp"
 #include <algorithm>
 #include <charconv>
 #include <cstring>
@@ -140,6 +141,136 @@ std::vector<uint32_t> value_uses(const std::vector<uint32_t>& words,
         values.push_back(words[in.at + i]);
     }
     return values;
+}
+
+std::unordered_set<uint32_t> neutral_selection_votes(
+    const std::vector<uint32_t>& words, const std::vector<Instruction>& instructions,
+    uint32_t entry_id, const std::unordered_set<uint32_t>& bool_types,
+    const std::unordered_set<uint32_t>& int_types, const std::unordered_set<uint32_t>& float_types,
+    const std::unordered_set<uint32_t>& glsl_sets, bool preserve_f32,
+    const std::unordered_set<uint32_t>& frozen_leaves,
+    const std::unordered_map<uint32_t, std::vector<size_t>>& users) {
+    FragmentNeutralSelection graph;
+    graph.preserve_f32 = preserve_f32;
+    std::unordered_map<uint32_t, std::vector<size_t>> blocks;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> predecessors;
+    std::unordered_map<size_t, uint32_t> instruction_blocks;
+    std::unordered_set<uint32_t> stable_builtin_pointers;
+    for (const auto& in : instructions)
+        if (in.op == 71 && in.count == 4 && words[in.at + 2] == 11 &&
+            (words[in.at + 3] == 15 || words[in.at + 3] == 23))
+            stable_builtin_pointers.insert(words[in.at + 1]); // FragCoord/HelperInvocation
+    uint32_t function = 0, block = 0, entry_block = 0;
+    for (size_t i = 0; i < instructions.size(); ++i) {
+        const auto& in = instructions[i];
+        const auto at = in.at;
+        if ((in.op == 16 || in.op == 331) && in.count >= 3 && words[at + 2] == 6028)
+            return {}; // FPFastMathDefault overrides the implicit finite-domain contract
+        if (in.op == 54) { function = words[at + 2]; block = 0; }
+        if (function == entry_id && in.op == 248) {
+            block = words[at + 1];
+            if (!entry_block) entry_block = block;
+        }
+        if (function == entry_id && block) {
+            blocks[block].push_back(i);
+            instruction_blocks.emplace(i, block);
+            if (in.op == 249) predecessors[words[at + 1]].push_back(block);
+            if (in.op == 250) {
+                predecessors[words[at + 2]].push_back(block);
+                predecessors[words[at + 3]].push_back(block);
+            }
+            if (in.op == 251) {
+                predecessors[words[at + 2]].push_back(block);
+                for (uint32_t n = 4; n < in.count; n += 2)
+                    predecessors[words[at + n]].push_back(block);
+            }
+        }
+        if (in.op == 56) { function = block = 0; }
+        // Ordinary definitions and constants only; type IDs, labels and metadata are not values.
+        if (in.count < 3 || no_result(in.op) || in.op == 248 ||
+            !(in.in_function || in.op == 1 || (in.op >= 41 && in.op <= 52))) continue;
+        FragmentNeutralValue value;
+        value.opcode = in.op;
+        const uint32_t type = words[at + 1];
+        value.type = bool_types.contains(type) ? FragmentNeutralType::Boolean :
+            int_types.contains(type) ? FragmentNeutralType::Int32 :
+            float_types.contains(type) ? FragmentNeutralType::Float32 : FragmentNeutralType::Other;
+        value.operands = pure_operands(words, in, true);
+        value.stable_input = in.op == 61 && in.count == 4 &&
+            stable_builtin_pointers.contains(words[at + 3]);
+        if ((in.op == 127 && in.count == 4) ||
+            ((in.op == 129 || in.op == 131 || in.op == 133) && in.count == 5))
+            value.operands.assign(words.begin() + at + 3, words.begin() + at + in.count);
+        if (in.op == 12 && in.count == 6 && glsl_sets.contains(words[at + 3])) {
+            value.extended_opcode = words[at + 4];
+            value.operands = {words[at + 5]};
+        }
+        if (((in.op == 41 || in.op == 42) && in.count == 3 && bool_types.contains(type)) ||
+            (in.op == 43 && in.count == 4 && (int_types.contains(type) || float_types.contains(type)))) {
+            value.constant = true;
+            value.literal = in.op == 41 ? 1 : in.op == 42 ? 0 : words[at + 3];
+        }
+        graph.values.emplace(words[at + 2], std::move(value));
+    }
+    std::unordered_set<uint32_t> proved;
+    if (!entry_block || !predecessors[entry_block].empty()) return proved;
+    const auto& header = blocks.at(entry_block);
+    if (header.size() < 3) return proved;
+    const auto& branch = instructions[header.back()];
+    const auto& selection = instructions[header[header.size() - 2]];
+    if (branch.op != 250 || branch.count != 4 || selection.op != 247 || selection.count != 3)
+        return proved;
+    const uint32_t controller = words[branch.at + 1], body = words[branch.at + 2],
+                   merge = words[branch.at + 3];
+    if (merge != words[selection.at + 1] || body == merge || !blocks.contains(body) ||
+        !blocks.contains(merge) || predecessors[body] != std::vector<uint32_t>{entry_block} ||
+        predecessors[merge].size() != 2) return proved;
+    const auto vote = std::find_if(header.begin(), header.end(), [&](size_t i) {
+        return instructions[i].op == 335 && words[instructions[i].at + 2] == controller;
+    });
+    if (vote == header.end() || !users.contains(controller) ||
+        users.at(controller) != std::vector<size_t>{header.back()}) return proved;
+    graph.predicate = words[instructions[*vote].at + 4];
+    if (frozen_leaves.contains(graph.predicate)) return proved; // retain the older Copy(P) certificate
+    const auto& body_instructions = blocks.at(body);
+    const auto& exit = instructions[body_instructions.back()];
+    if (exit.op != 249 || exit.count != 2 || words[exit.at + 1] != merge) return proved;
+    for (size_t i : body_instructions) {
+        const auto& in = instructions[i];
+        if (in.op == 248 || in.op == 249 || in.op == 8 || in.op == 317) continue;
+        if (in.count < 3 || no_result(in.op)) return proved;
+        graph.body.push_back(words[in.at + 2]);
+        // Every cross-region use must be a boundary Phi incoming from this body. Even an unused
+        // outside address/selector is not silently treated as a color-only export.
+        const auto found = users.find(words[in.at + 2]);
+        if (found == users.end()) continue;
+        for (size_t use : found->second) {
+            if (instruction_blocks.contains(use) && instruction_blocks.at(use) == body) continue;
+            const auto& consumer = instructions[use];
+            if (!instruction_blocks.contains(use) || instruction_blocks.at(use) != merge ||
+                consumer.op != 245) return proved;
+            for (uint32_t n = 3; n + 1 < consumer.count; n += 2)
+                if (words[consumer.at + n] == words[in.at + 2] && words[consumer.at + n + 1] != body)
+                    return proved;
+        }
+    }
+    for (size_t i : blocks.at(merge)) {
+        const auto& phi = instructions[i];
+        if (phi.op != 245) continue;
+        if (phi.count != 7) return proved;
+        const uint32_t id = words[phi.at + 2];
+        if (!users.contains(id) || users.at(id).empty()) continue;
+        FragmentNeutralExport output;
+        for (uint32_t n : {3u, 5u}) {
+            if (words[phi.at + n + 1] == entry_block) output.skipped = words[phi.at + n];
+            else if (words[phi.at + n + 1] == body) output.executed = words[phi.at + n];
+            else return proved;
+        }
+        if (!output.skipped || !output.executed) return proved;
+        graph.exports.push_back(output);
+    }
+    if (prove_fragment_neutral_selection(graph, frozen_leaves)) proved.insert(controller);
+    return proved;
 }
 
 } // namespace
@@ -430,6 +561,13 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
         if (dead) dead_vote_ids.insert(source[vote.at + 2]);
     }
 
+    const auto neutral_vote_ids = neutral_selection_votes(source, instructions, entry_id, bool_types,
+        int32_types, float32_types, glsl_sets, preserve_f32, uniform, users);
+    // These are facts about the transaction's EFFECTIVE controller, never about source P. The
+    // frozen source leaves above still own all load/address authority.
+    auto effective_leaves = uniform;
+    effective_leaves.insert(neutral_vote_ids.begin(), neutral_vote_ids.end());
+
     // Recurrences require a separate simultaneous trace certificate. Never feed its provisional
     // facts into pointer/load admission: uniform induction is NOT a non-wrapping address proof.
     FragmentUniformTrace trace;
@@ -480,32 +618,50 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
         // unrelated control flow is varying. Only predicates missing those facts need this proof.
         std::vector<uint32_t> predicates;
         for (const auto& vote : votes)
-            if (!uniform.contains(source[vote.at + 4]) && !dead_vote_ids.contains(source[vote.at + 2]))
+            if (!uniform.contains(source[vote.at + 4]) && !dead_vote_ids.contains(source[vote.at + 2]) &&
+                !neutral_vote_ids.contains(source[vote.at + 2]))
                 predicates.push_back(source[vote.at + 4]);
         if (!predicates.empty()) {
-            const auto proved = prove_fragment_uniform_trace(trace, uniform, predicates);
+            const auto proved = prove_fragment_uniform_trace(trace, effective_leaves, predicates);
             uniform.insert(proved.begin(), proved.end());
         }
     }
 
     for (const auto& vote : votes) {
+        if (neutral_vote_ids.contains(source[vote.at + 2])) {
+            ++result.neutral_votes;
+            continue;
+        }
         if (uniform.contains(source[vote.at + 4])) {
             ++result.uniform_votes;
             continue;
         }
         if (!dead_vote_ids.contains(source[vote.at + 2])) {
             result.refusal = FragmentVoteRefusal::UnprovedVote;
-            result.uniform_votes = result.dead_votes = 0;
+            result.uniform_votes = result.dead_votes = result.neutral_votes = 0;
             return result;
         }
         ++result.dead_votes;
     }
 
     result.words.assign(source.begin(), source.begin() + 5);
+    // Create one ordinary TRUE per Boolean type. ID bound belongs to the owned effective module;
+    // no source constant/result is mutated and no shader identity/title participates in admission.
+    std::unordered_map<uint32_t, uint32_t> true_ids;
+    for (const auto& vote : votes)
+        if (neutral_vote_ids.contains(source[vote.at + 2])) true_ids.emplace(source[vote.at + 1], 0);
+    for (auto& [type, id] : true_ids) id = result.words[3]++;
+    bool constants_inserted = false;
     for (const auto& in : instructions) {
+        if (in.op == 54 && !constants_inserted) {
+            for (const auto& [type, id] : true_ids)
+                result.words.insert(result.words.end(), {(3u << 16) | 41u, type, id});
+            constants_inserted = true;
+        }
         if (in.op == 335) {
             result.words.insert(result.words.end(), {(4u << 16) | 83u, source[in.at + 1],
-                                                     source[in.at + 2], source[in.at + 4]});
+                source[in.at + 2], neutral_vote_ids.contains(source[in.at + 2]) ?
+                    true_ids.at(source[in.at + 1]) : source[in.at + 4]});
         } else if (in.op == 17 && in.count == 2 && source[in.at + 1] >= 61 && source[in.at + 1] <= 68) {
             // Inventory above excludes all other subgroup instructions/builtins/imports.
             continue;

@@ -11099,7 +11099,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 static std::unordered_set<uint64_t> proven_logged;
                 if (proven_logged.insert(shader_key).second) {
                     std::fprintf(stderr, "[render] proven fragment votes: subgroup 64 -> independent "
-                        "(uniform=%u dead=%u fs=%016llx)\n", lowered->uniform_votes, lowered->dead_votes,
+                        "(uniform=%u dead=%u neutral=%u fs=%016llx)\n", lowered->uniform_votes, lowered->dead_votes,
+                        lowered->neutral_votes,
                         (unsigned long long)shader_key);
                     dump_fragment_wave_module("lowered", shader_key, 0);
                 }

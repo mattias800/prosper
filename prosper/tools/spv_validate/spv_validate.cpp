@@ -25,6 +25,7 @@
 #include "../../tests/fixtures/spirv_wave_width_fixtures.hpp"
 #include "../../tests/fixtures/spirv_fragment_vote_fixtures.hpp"
 #include "../../tests/fixtures/spirv_fragment_vote_execution.hpp"
+#include "../../tests/fixtures/spirv_fragment_neutral_fixtures.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <algorithm>
 #include <array>
@@ -525,6 +526,38 @@ int main(int argc, char** argv) {
             dump(dir, (name + "_effective").c_str(), lower_fragment_votes(source).words);
         }
     }
+    namespace neutral = prosper::test::fragment_neutral;
+    for (const auto& fixture : neutral::fixtures()) {
+        if (!fixture.strict) continue;
+        const std::string name = std::string("fragment_neutral_") + fixture.name;
+        const auto source = neutral::make_module(fixture.shape);
+        dump(dir, name.c_str(), source);
+        if (fixture.admitted) dump(dir, (name + "_effective").c_str(), lower_fragment_votes(source).words);
+    }
+    for (const auto predicate : {neutral::Predicate::Helpers, neutral::Predicate::Visible,
+                                neutral::Predicate::AllFalse, neutral::Predicate::AllTrue}) {
+        for (const bool poison : {false, true}) {
+            const auto name = "fragment_neutral_quad_" +
+                std::to_string(static_cast<uint32_t>(predicate)) + (poison ? "_poison" : "");
+            const auto source = neutral::make_module(neutral::Shape::Masked, predicate, poison);
+            dump(dir, name.c_str(), source);
+            dump(dir, (name + "_effective").c_str(), lower_fragment_votes(source).words);
+        }
+    }
+    // Validate the exact newly executed GPU arms, including the helper-poison fault variants.
+    for (const auto shape : {neutral::Shape::Termination, neutral::Shape::UndefinedConjunction,
+                             neutral::Shape::MaskedFloat, neutral::Shape::MaskedBitcastPoison}) {
+        for (const bool poison : {false, true}) {
+            const auto name = "fragment_neutral_extra_" +
+                std::to_string(static_cast<uint32_t>(shape)) + (poison ? "_poison" : "");
+            const auto source = neutral::make_module(shape, neutral::Predicate::AllFalse, poison);
+            dump(dir, name.c_str(), source);
+            dump(dir, (name + "_effective").c_str(), lower_fragment_votes(source).words);
+        }
+    }
+    const auto terminated = neutral::make_module(neutral::Shape::Termination, neutral::Predicate::AllTrue);
+    dump(dir, "fragment_neutral_termination_true", terminated);
+    dump(dir, "fragment_neutral_termination_true_effective", lower_fragment_votes(terminated).words);
     // GTA V's exact literal-bearing V_ALIGNBYTE_B32 packet.  Strict validation guards the
     // masked-shift lowering: SPIR-V shift operands must stay in the defined 0..31 range.
     { const uint32_t c[] = {0xd54f0006u,0x0415fe80u,0x3024240cu,0xbf810000u};

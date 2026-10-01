@@ -3,6 +3,7 @@
 #include "fixtures/render_runner.h"
 #include "fixtures/spirv_fragment_vote_execution.hpp"
 #include "fixtures/spirv_fragment_vote_fixtures.hpp"
+#include "fixtures/spirv_fragment_neutral_fixtures.hpp"
 #include <cstdio>
 #include <string_view>
 
@@ -165,6 +166,51 @@ void verify_per_draw_loop_bounds(bool deterministic) {
         else verify_clear(frame, "ordinary robustness refuses both buffer-derived loop certificates");
     }
 }
+
+void verify_neutral_votes(uint32_t x, uint32_t y, bool poison) {
+    namespace neutral = prosper::test::fragment_neutral;
+    const auto vertex = f::edge_vertex(x, y);
+    for (const auto predicate : {neutral::Predicate::Helpers, neutral::Predicate::Visible,
+                                neutral::Predicate::AllFalse, neutral::Predicate::AllTrue}) {
+        const auto source = std::make_shared<const std::vector<uint32_t>>(
+            neutral::make_module(neutral::Shape::Masked, predicate, poison));
+        const auto captured = *source;
+        const auto lowered = prosper::gpu::lower_fragment_votes(*source);
+        check(lowered.neutral_votes == 1 && lowered.uniform_votes == 0,
+              "neutral certificate leaves genuinely varying source predicate out of uniform facts");
+        const bool visible = predicate == neutral::Predicate::Visible || predicate == neutral::Predicate::AllTrue;
+        const uint64_t identity = 0xf4013000u + y * 256 + x * 16 + static_cast<uint32_t>(predicate);
+        verify_clear(render(vertex, source, identity, FragmentWavePolicy::Strict));
+        for (const bool warm : {false, true}) {
+            const auto frame = render(vertex, source, identity, FragmentWavePolicy::ProvenVotes);
+            verify_derivatives(frame, x, y, visible ? 64 : 0);
+            check(frame.pipelines.hits == (warm ? 1u : 0u) && frame.pipelines.misses == (warm ? 0u : 1u),
+                  "neutral TRUE module has its own production cold/warm pipeline variant");
+        }
+        verify_clear(render(vertex, source, identity, FragmentWavePolicy::Strict));
+        check(*source == captured, "neutral pipeline/replay calls preserve immutable source words");
+    }
+    for (const auto shape : {neutral::Shape::Termination, neutral::Shape::UndefinedConjunction,
+                             neutral::Shape::MaskedFloat, neutral::Shape::MaskedBitcastPoison}) {
+        // All-false is the newly executed domain. No earlier Kill removes helpers before the
+        // analytic derivative, and unselected poison/undefined values must not affect state.
+        const auto source = std::make_shared<const std::vector<uint32_t>>(
+            neutral::make_module(shape, neutral::Predicate::AllFalse, poison));
+        verify_derivatives(render(vertex, source, 0, FragmentWavePolicy::ProvenVotes), x, y);
+    }
+    const auto terminated = std::make_shared<const std::vector<uint32_t>>(
+        neutral::make_module(neutral::Shape::Termination, neutral::Predicate::AllTrue));
+    verify_clear(render(vertex, terminated, 0, FragmentWavePolicy::ProvenVotes),
+                 "neutral control preserves actual live Kill decisions for true predicates");
+    for (const auto shape : {neutral::Shape::ScalarExport, neutral::Shape::TerminationExport,
+                             neutral::Shape::LiveUnequalPhi, neutral::Shape::SecondConsumer,
+                             neutral::Shape::PoisonConjunction, neutral::Shape::BitcastPoisonConjunction,
+                             neutral::Shape::SecondUnsafeVote}) {
+        const auto source = std::make_shared<const std::vector<uint32_t>>(neutral::make_module(shape));
+        verify_clear(render(vertex, source, 0, FragmentWavePolicy::ProvenVotes),
+                     "unsafe neutral export/controller refuses rather than executing a host-width approximation");
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -236,6 +282,7 @@ int main(int argc, char** argv) {
         verify_clear(render(vertex, fragment, 0, FragmentWavePolicy::Strict));
         check(*fragment == captured, "live/cache/replay calls leave shared captured source words byte-identical");
         verify_loop_votes(x, y, poison);
+        verify_neutral_votes(x, y, poison);
     }
     verify_buffer_authority(context.deterministic_storage_reads);
     verify_per_draw_loop_bounds(context.deterministic_storage_reads);
