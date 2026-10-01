@@ -1957,6 +1957,17 @@ if(TARGET prosper_core)
   target_link_libraries(test_loader_synth_reject PRIVATE prosper_core)
   add_test(NAME loader_synth_reject COMMAND test_loader_synth_reject)
 
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Fail sizing/seek operations on a valid fixture without blocking I/O or huge allocations.
+    add_executable(test_module_file_io tests/misc/test_module_file_io.cpp)
+    target_include_directories(test_module_file_io PRIVATE tests)
+    target_link_libraries(test_module_file_io PRIVATE prosper_core)
+    target_link_options(test_module_file_io PRIVATE
+      "-Wl,--wrap=fseek" "-Wl,--wrap=ftell" "-Wl,--wrap=fread" "-Wl,--wrap=fclose")
+    add_test(NAME module_file_io COMMAND test_module_file_io)
+    set_tests_properties(module_file_io PROPERTIES TIMEOUT 20)
+  endif()
+
   # ATRAC9 decode (vendored LibAtrac9 + prosper glue): an embedded 16-superframe slice of a real PS5
   # snd0.at9 decodes bit-exact vs the LibAtrac9 reference (CRC32). Pure, no game dump; runs in CI.
   add_executable(test_atrac9 tests/hle/audio/test_atrac9.cpp)
