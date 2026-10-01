@@ -770,28 +770,23 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const BarrierPhasedCompute barrier_phases = analyze_barrier_phased_compute(ins);
     const bool partial_barrier_phases = config.exact_thread_extent && has_partial_workgroup &&
         barrier_phases.found && !barrier_phases.guarded;
+    b.native_subgroup_size = config.native_subgroup_size == wave_size &&
+        local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
+    const bool has_portable_readfirstlane = wave_size == 64 && !b.native_subgroup_size &&
+        !original_has_waterfall &&
+        std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+            return in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02;
+        });
     const bool exact_partial_dispatcher = config.exact_thread_extent &&
         has_partial_workgroup && (b.gta5_selected_sbuffer_dispatch_validated ||
                                   b.indirect_buffer_dispatch_validated ||
-                                  has_indirect_pointer_relocation);
-    b.native_subgroup_size = config.native_subgroup_size == wave_size &&
-        local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
+                                  has_indirect_pointer_relocation || has_portable_readfirstlane);
     // A partial guest wave needs the portable dispatcher's per-lane ACTIVE bit. Native subgroup
     // operations cannot be entered by only the real prefix of the final host subgroup.
     if (partial_barrier_phases || exact_partial_dispatcher)
         b.native_subgroup_size = 0;
     b.portable_readfirstlane_shader = wave_size == 64 && !b.native_subgroup_size &&
         !original_has_waterfall;
-    if (b.portable_readfirstlane_shader &&
-        (local_count < 64 || local_count % 64 != 0 ||
-         (config.exact_thread_extent && has_partial_workgroup)) &&
-        std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
-            return in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02;
-        })) {
-        log_recompile_diagnostic(diagnostic, "compute-recompile-reject", "terminal",
-                                 "reason=readfirstlane-complete-wave-contract");
-        return {};
-    }
     // PROSPER_DBG: report the inputs to that decision, not just its outcome (#2429).
     //
     // Every wave-width-dependent lowering in this file gates on `b.native_subgroup_size` -- the
@@ -818,11 +813,12 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // gpu_executor.cpp instead.
     //
     // That inference is WRONG, and reporting only the effective value would preserve the error:
-    // the expression above is zero for THREE independent reasons -- the device width not matching
+    // the width expression above is zero for THREE independent reasons -- the device width not matching
     // `wave_size`, an implausible `local_count`, or a workgroup that is not a whole number of waves
     // (`local_count % wave_size`). A dispatch with a partial final wave disables the path on an
     // adapter whose width matches perfectly. #2429 attributes it entirely to the first cause, and
-    // that is checkable only if all three inputs are printed.
+    // that is checkable only if all three inputs are printed. An ACTIVE-dispatcher override can
+    // additionally disable an otherwise matching complete workgroup; report that separately.
     //
     // Deduplicated on the exact tuple rather than rate-limited, because the interesting event is a
     // DISTINCT combination appearing, not the hundredth repeat of one -- and a kernel that disables
@@ -837,10 +833,11 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
         // 256 and 256 while printing only 1024 -- and the 256-wide ones were the multi-wave
         // case that mattered. A diagnostic may aggregate, but it must not name one member of
         // a bucket as though it were the bucket.
-        static std::set<std::tuple<uint32_t, uint32_t, uint64_t, uint32_t>> seen;
+        static std::set<std::tuple<uint32_t, uint32_t, uint64_t, uint32_t, bool, bool>> seen;
         std::lock_guard<std::mutex> lk(mx);
         if (seen.insert(std::make_tuple(config.native_subgroup_size, wave_size,
-                                        local_count, b.native_subgroup_size)).second)
+                                        local_count, b.native_subgroup_size,
+                                        partial_barrier_phases, exact_partial_dispatcher)).second)
             std::fprintf(stderr,
                          "[subgroup-width] device=%u wave=%u local=%llu local%%wave=%llu -> "
                          "native_subgroup_size=%u (%s)\n",
@@ -853,6 +850,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                              : (partial_barrier_phases
                                     ? "DISABLED: partial barrier phases require the portable "
                                       "dispatcher"
+                                : (exact_partial_dispatcher
+                                    ? "DISABLED: exact partial dispatch requires the portable "
+                                      "ACTIVE dispatcher"
                                 : (config.native_subgroup_size == 0
                                     ? "DISABLED: no native width adopted -- "
                                       "select_native_compute_subgroup_size() declined"
@@ -862,7 +862,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                                   ? "DISABLED: local_count exceeds the plausibility "
                                                     "guard"
                                                   : "DISABLED: workgroup is not a whole number "
-                                                    "of waves")))));
+                                                    "of waves"))))));
     }
     b.native_storage_format_support = config.native_storage_format_support;
     b.storage_buffer_int64_atomics = config.storage_buffer_int64_atomics;
@@ -935,10 +935,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                    code, dwords, nullptr, true, initial_dispatch_active, false,
                    lds_fminmax_synchronization.needs_dispatcher))
         return {};
-    // Exact dispatch contracts execute their partial final wave through the CFG dispatcher's ACTIVE
-    // bit. Padded Vulkan lanes stay in the dispatcher and its synthesized workgroup barriers, but
-    // cannot execute guest memory effects. The full program, launch, and resource proof above is the
-    // authority boundary for extending the selected-SBUFFER path to the packed-pointer program.
+    // Exact resource contracts and portable RFL execute partial workgroups through ACTIVE. Padded
+    // Vulkan lanes stay in the dispatcher and synthesized barriers, but cannot execute guest effects.
+    // The resource contracts retain their own full program/launch proofs; RFL needs no title identity.
     if (exact_partial_dispatcher && b.uses_barrier)
         b.partial_barrier_phases_emitted = true;
     // The entry guard is intentionally divergent only in the final partial workgroup. Vulkan requires

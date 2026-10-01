@@ -1,5 +1,6 @@
-// Architectural read-first-lane over complete Wave64s on narrower host subgroups.
+// Architectural read-first-lane over complete and partial Wave64s on narrower host subgroups.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "fixtures/compute_runner.h"
 #include <algorithm>
 #include <array>
@@ -157,7 +158,7 @@ int main(int argc, char** argv) {
     overlap[6] = 0x7e1c0502u; // s14: overlaps neither the BCNT source nor saved EXEC
     CHECK(!compile(overlap).empty());
 
-    // Production compute entry, plus paired complete/partial guest-wave boundaries.
+    // Production compute entry, including small waves and exact partial dispatches.
     const uint32_t rfl[] = {0x7e080500u, 0x7e020204u, 0xbf810000u};
     prosper::gpu::ComputeShaderConfig config;
     config.local_x = 64;
@@ -167,13 +168,114 @@ int main(int argc, char** argv) {
     CHECK(!prosper::gpu::recompile_compute(rfl, std::size(rfl), nullptr, config).empty());
     config.native_subgroup_size = 0;
     config.local_x = 16;
-    CHECK(prosper::gpu::recompile_compute(rfl, std::size(rfl), nullptr, config).empty());
+    CHECK(!prosper::gpu::recompile_compute(rfl, std::size(rfl), nullptr, config).empty());
     config.local_x = 64;
     config.exact_thread_extent = true;
     config.threads_x = 16; config.threads_y = config.threads_z = 1;
-    CHECK(prosper::gpu::recompile_compute(rfl, std::size(rfl), nullptr, config).empty());
+    CHECK(!prosper::gpu::recompile_compute(rfl, std::size(rfl), nullptr, config).empty());
+    auto native_partial = config;
+    native_partial.native_subgroup_size = 64;
+    const auto native_partial_module = prosper::gpu::recompile_compute(
+        rfl, std::size(rfl), nullptr, native_partial);
+    CHECK(!native_partial_module.empty() && opcode_count(native_partial_module, 224u) == 0);
     config.threads_x = 64;
     CHECK(!prosper::gpu::recompile_compute(rfl, std::size(rfl), nullptr, config).empty());
+    const uint32_t special_dst[] = {0x7ef80500u, 0xbf810000u}; // RFL m0,v0: not admitted
+    {
+        prosper::gpu::TerminalRejectCapture capture;
+        CHECK(prosper::gpu::recompile_compute(special_dst, std::size(special_dst), nullptr,
+            config, {prosper::gpu::RecompileDiagnosticStage::Compute, 0x3998u}).empty());
+        const auto records = capture.take();
+        CHECK(std::any_of(records.begin(), records.end(), [](const auto& record) {
+            return record.second.find("portable-readfirstlane-form") != std::string::npos;
+        }));
+    }
+
+    // Physical tails, dispatch-inactive tails, empty EXEC, and both numeric VCC destinations.
+    // Inputs outside the exact extent remain sentinels: they must arrive at host barriers but
+    // must not participate in guest events or execute the guest destination write.
+    for (const auto shape : {std::array<uint32_t, 2>{1, 1}, {16, 16}, {65, 65},
+                             {96, 96}, {64, 16}, {64, 65}, {96, 160}}) {
+        const uint32_t local = shape[0], threads = shape[1];
+        const uint32_t physical = ((threads + local - 1) / local) * local;
+        for (uint32_t dst : {4u, 106u, 107u}) for (bool empty_exec : {false, true}) {
+            const uint32_t partial_guest[] = {
+                0x7d8404f9u, 0x06068600u, // v_cmp_eq s[6:7],v0,v2 (SDWA)
+                0xbe882406u,             // s_and_saveexec s[8:9],s[6:7]
+                0x7e000501u | (dst << 17), // RFL sDST,v1
+                0xbefe0408u,             // restore EXEC
+                0x7e060200u | dst,       // v3=sDST
+                0xbf810000u,
+            };
+            const auto partial = prosper::gpu::recompile_valu(partial_guest,
+                std::size(partial_guest), 4, 3, nullptr, 0,
+                prosper::gpu::kDefaultComputePgmRsrc1, true, local, threads);
+            CHECK(!partial.empty());
+            if (partial.empty()) continue;
+            std::vector<float> input(physical * 4u);
+            for (uint32_t lane = 0; lane < physical; ++lane) {
+                const uint32_t group = lane / local * local, wave = lane % local / 64u * 64u;
+                const uint32_t base = group + wave;
+                const uint32_t population = std::min(64u, std::min(local - wave,
+                    threads > base ? threads - base : 0u));
+                input[lane * 4u] = std::bit_cast<float>(lane % local % 64u);
+                input[lane * 4u + 1u] = std::bit_cast<float>(0xa5000000u | lane);
+                input[lane * 4u + 2u] = std::bit_cast<float>(empty_exec ? 64u : population - 1u);
+                input[lane * 4u + 3u] = std::bit_cast<float>(0xbaad0000u | lane);
+            }
+            const auto output = prosper::test::run_compute(partial, input,
+                physical, physical, {}, {}, nullptr, local);
+            CHECK(output.size() == physical);
+            uint32_t bad = 0;
+            for (uint32_t lane = 0; lane < output.size(); ++lane) {
+                const uint32_t group = lane / local * local, wave = lane % local / 64u * 64u;
+                const uint32_t base = group + wave;
+                const uint32_t population = std::min(64u, std::min(local - wave,
+                    threads > base ? threads - base : 0u));
+                const uint32_t expected = lane >= threads ? 0xbaad0000u | lane
+                    : 0xa5000000u | (base + (empty_exec ? 0u : population - 1u));
+                bad += std::bit_cast<uint32_t>(output[lane]) != expected;
+            }
+            if (bad) std::fprintf(stderr, "partial local=%u threads=%u dst=%u empty=%u bad=%u\n",
+                                  local, threads, dst, empty_exec, bad);
+            CHECK(bad == 0);
+        }
+    }
+
+    // Production 2D extent: lane zero of wave 2 is dispatch-inactive, while lanes 16/17 are real.
+    // LLVM gfx1030 encodings: v_mad_u32_u24 v2,v1,48,v0; RFL; indexed buffer_store_dword.
+    const uint32_t sparse_guest[] = {
+        0xd5430002u, 0x04016101u, 0x7e080502u, 0x7e060204u,
+        0xe0702000u, 0x80000302u, 0xbf810000u,
+    };
+    prosper::gpu::ShaderResourceTable sparse_resources;
+    prosper::gpu::ShaderResource target;
+    target.cls = prosper::gpu::ResourceClass::ConstantBuffer;
+    target.binding = 2; target.sgpr_base = 0; target.stride = 4;
+    target.gpu_addr = 0x100000u;
+    target.size = 192u * 4u; target.num_components = 1;
+    target.format = prosper::gpu::DataFormat::Uint32;
+    sparse_resources.resources.push_back(target);
+    config.local_x = 48; config.local_y = 4; config.local_z = 1;
+    config.threads_x = 2; config.threads_y = 4; config.threads_z = 1;
+    config.tidig_comp_cnt = 1; config.native_subgroup_size = 0;
+    const auto sparse = prosper::gpu::recompile_compute(sparse_guest, std::size(sparse_guest),
+        &sparse_resources, config);
+    CHECK(!sparse.empty());
+    if (!sparse.empty()) {
+        std::vector<uint32_t> written;
+        const auto output = prosper::test::run_compute(sparse, {0.0f}, 192, 1,
+            std::vector<uint32_t>(192, 0xdeadbeefu), {}, nullptr, 192, &written);
+        CHECK(!output.empty() && written.size() == 192);
+        for (uint32_t lane = 0; lane < written.size(); ++lane) {
+            const uint32_t expected = lane % 48 >= 2 ? 0xdeadbeefu
+                : lane < 64 ? 0u : lane < 128 ? 96u : 144u;
+            if (written[lane] != expected)
+                std::fprintf(stderr, "sparse lane=%u got=%08x expected=%08x\n",
+                              lane, written[lane], expected);
+            CHECK(written[lane] == expected);
+        }
+    }
 
     // Architectural neighbour of the legacy T20 scalar-bit test: an explicit complete-wave
     // test-shell launch broadcasts lane zero's bit to every lane, not each lane's own bit.

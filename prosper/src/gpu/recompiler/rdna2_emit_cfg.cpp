@@ -2172,10 +2172,9 @@ bool emit_cfg_state_machine(
     };
     auto portable_readfirstlane_candidate = [&](const Rdna2Inst& in) {
         return b.portable_readfirstlane_shader && b.is_compute && b.wave_size == 64 &&
-            !b.native_subgroup_size && !initial_active &&
-            b.local_count >= 64 && b.local_count % 64 == 0 &&
+            !b.native_subgroup_size && b.local_count > 0 &&
             in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02 &&
-            in.src[0].kind == OperandKind::VGPR && in.dst.value >= 0 && in.dst.value <= 105 &&
+            in.src[0].kind == OperandKind::VGPR && in.dst.value >= 0 && in.dst.value <= 107 &&
             !in.has_sdwa && !in.has_dpp && !in.src_abs[0] && !in.src_neg[0] &&
             !in.clamp && !in.omod;
     };
@@ -2308,7 +2307,7 @@ bool emit_cfg_state_machine(
         if (b.portable_readfirstlane_shader && in.fmt == Rdna2Format::VOP1 &&
             in.opcode == 0x02) {
             if (!portable_readfirstlane_candidate(in))
-                return reject_cfg(in.pc, "readfirstlane-complete-wave-contract");
+                return reject_cfg(in.pc, "portable-readfirstlane-form");
             portable_readfirstlane_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_readfirstlane_event_for_pc.size() + 1));
             portable_readfirstlane_dsts.insert(in.dst.value);
@@ -5239,6 +5238,8 @@ bool emit_cfg_state_machine(
                 state.sreg_bool_b32.erase(base);
                 state.sreg_wave64_mask_half.erase(base);
             }
+            if (readfirstlane->dst.value == 106 || readfirstlane->dst.value == 107)
+                state.vcc = 0;
         }
         if (readlane) {
             if (!portable_readlane_event_for_pc.contains(readlane->pc))
@@ -6712,18 +6713,41 @@ bool emit_cfg_state_machine(
         b.cfg_scratch_store(b.linear_localid, b.load_function(b.t_u32, first_source_var));
         b.cfg_scratch_store(b.ibin(Op_IAdd, b.uconst(padded_lanes), b.linear_localid), encoded);
         b.barrier();
-        const uint32_t is_leader = b.land(pending, b.ucmp(Op_IEqual, mbcnt_lane, zero));
+        const bool partial_wave = initial_active || padded_lanes != b.local_count;
+        const uint32_t is_leader = partial_wave ? b.ucmp(Op_IEqual, mbcnt_lane, zero)
+            : b.land(pending, b.ucmp(Op_IEqual, mbcnt_lane, zero));
         const uint32_t leader = b.id(), assembled = b.id();
         b.emit_selmerge(assembled);
         b.emit_condbranch(is_leader, leader, assembled);
         b.emit_label(leader);
         const uint32_t base = b.ibin(Op_ShiftLeftLogical, mbcnt_wave_index, b.uconst(6));
+        const auto lane_metadata = [&](uint32_t lane) {
+            const uint32_t index = b.ibin(Op_IAdd, base, b.uconst(lane));
+            if (padded_lanes == b.local_count)
+                return b.cfg_scratch_load(b.ibin(Op_IAdd, b.uconst(padded_lanes), index));
+            const uint32_t valid = b.ucmp(Op_ULessThan, index, b.uconst(b.local_count));
+            const uint32_t safe_index = b.sel(valid, index, zero);
+            const uint32_t metadata = b.cfg_scratch_load(b.ibin(Op_IAdd,
+                b.uconst(padded_lanes), safe_index));
+            return b.sel(valid, metadata, zero);
+        };
+        // ACTIVE excludes padded invocations from guest instructions, not from host barriers.
+        // The physical wave leader may therefore have no event: recover its wave's pending tag
+        // from actual participants. Nonexistent physical lanes never supply metadata.
+        uint32_t service_tag = tag;
+        if (partial_wave) {
+            service_tag = zero;
+            for (uint32_t lane = 0; lane < 64; ++lane) {
+                const uint32_t candidate = b.ibin(Op_ShiftRightLogical,
+                    lane_metadata(lane), b.uconst(1));
+                service_tag = b.sel(b.ucmp(Op_IEqual, service_tag, zero), candidate, service_tag);
+            }
+        }
         uint32_t first = b.uconst(UINT32_MAX);
         for (uint32_t lane = 0; lane < 64; ++lane) {
-            const uint32_t metadata = b.cfg_scratch_load(b.ibin(Op_IAdd,
-                b.uconst(padded_lanes), b.ibin(Op_IAdd, base, b.uconst(lane))));
+            const uint32_t metadata = lane_metadata(lane);
             const uint32_t include = b.land(
-                b.ucmp(Op_IEqual, b.ibin(Op_ShiftRightLogical, metadata, b.uconst(1)), tag),
+                b.ucmp(Op_IEqual, b.ibin(Op_ShiftRightLogical, metadata, b.uconst(1)), service_tag),
                 b.ucmp(Op_INotEqual, b.ibin(Op_BitwiseAnd, metadata, b.uconst(1)), zero));
             first = b.sel(b.land(include, b.ucmp(Op_IEqual, first, b.uconst(UINT32_MAX))),
                           b.uconst(lane), first);

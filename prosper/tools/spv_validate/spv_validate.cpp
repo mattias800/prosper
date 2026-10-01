@@ -955,6 +955,13 @@ int main(int argc, char** argv) {
            recompile_ngg_exports_for_test(c, std::size(c), 2, 0, nullptr,
                                            4, 0, {}, true),
            "recompile_ngg_exports_for_test"); }
+    { const uint32_t c[] = {0x7ed40500u,0x7e02026au,0xbf810000u};
+      dump(dir, "compute_partial_wave64_readfirstlane_vcc",
+           recompile_valu(c, std::size(c), 2, 1, nullptr, 0,
+                          kDefaultComputePgmRsrc1, true, 96, 80));
+      dump(dir, "compute_single_lane_readfirstlane_vcc",
+           recompile_valu(c, std::size(c), 2, 1, nullptr, 0,
+                          kDefaultComputePgmRsrc1, true, 1, 1)); }
     { const uint32_t c[] = {
           0x7e000f00u,0x7e140300u,0xbf8a0000u,
           0x4a1614fau,0xff09110au,
