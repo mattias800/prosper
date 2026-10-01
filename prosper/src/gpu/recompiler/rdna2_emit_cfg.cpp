@@ -2223,7 +2223,8 @@ bool emit_cfg_state_machine(
         const auto& in = ins[i];
         if (in.is_end) break;
         if (in.fmt == Rdna2Format::VOP3 &&
-            (in.opcode == 0x365 || in.opcode == 0x366)) {
+            (in.opcode == 0x365 || in.opcode == 0x366) &&
+            !mbcnt_has_intrinsic_numeric_source(in)) {
             mbcnt_event_for_pc.emplace(in.pc,
                 static_cast<uint32_t>(mbcnt_event_for_pc.size()));
             start_set.insert(in.pc);
@@ -4875,7 +4876,8 @@ bool emit_cfg_state_machine(
                     break;
                 }
                 if (in.fmt == Rdna2Format::VOP3 &&
-                    (in.opcode == 0x365 || in.opcode == 0x366)) {
+                    (in.opcode == 0x365 || in.opcode == 0x366) &&
+                    !mbcnt_has_intrinsic_numeric_source(in)) {
                     block_mbcnt = &in;
                     break;
                 }

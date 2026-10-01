@@ -79,6 +79,27 @@ inline uint32_t inline_int_mask_bit_hi(SpirvCompute& b, int value) {
     return b.bsel(high, isset, b.bfalse());
 }
 
+// These operands are numeric dwords by construction. They never need a peer-lane rendezvous;
+// keep the CFG event inventory in agreement with the ALU lowering. SGPRs require a separate
+// live-state check because the same physical word may hold a Boolean-domain wave mask.
+inline bool mbcnt_has_intrinsic_numeric_source(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::VOP3 &&
+        (in.opcode == 0x365 || in.opcode == 0x366) &&
+        (in.src[0].kind == OperandKind::InlineInt ||
+         in.src[0].kind == OperandKind::InlineFloat ||
+         in.src[0].kind == OperandKind::Literal || in.src[0].kind == OperandKind::VGPR);
+}
+
+inline bool mbcnt_has_scalar_numeric_source(const RegState& rs, const Operand& source) {
+    if (source.kind != OperandKind::SGPR) return false;
+    // A scalar phi/placeholder coexisting with a saved mask is not proof of raw numeric bits.
+    // Conservatively retain the mask-domain route for either physical half of such a pair.
+    if (rs.sreg_bool.contains(source.value) ||
+        (source.value > 0 && rs.sreg_bool.contains(source.value - 1)) ||
+        rs.sreg_wave64_mask_half.contains(source.value)) return false;
+    return rs.sreg.contains(source.value) || rs.sreg_input.contains(source.value);
+}
+
 // Per-invocation bit of a 64-bit mask consumed by V_MBCNT. The HI instruction names the odd SGPR
 // of an aligned scalar pair (for example s7 for s[6:7]), while our bool-domain mask is keyed by the
 // pair's low register. The LOW instruction names that root directly; the HIGH instruction names the
