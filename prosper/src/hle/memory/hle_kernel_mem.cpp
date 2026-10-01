@@ -44,6 +44,17 @@ namespace prosper {
 // guest auto window. See k_reserve_vrange (POSIX) / win_reserve (Windows).
 inline constexpr uint64_t kHugeReserveLen = 0x2000000000ull;   // 128 GiB
 
+// #4032: ordinary implicit maps start above the fixed image apertures, rather than consuming
+// the beginning of a later fixed arena. Both hosts use the guest libc's accepted low aperture;
+// the end is exclusive. Fixed addresses and explicit search hints keep their existing semantics.
+// CONFIDENCE: HIGH on the aperture and observed startup collision; MED on the preferred base,
+// which is placement policy rather than a claimed console ABI minimum.
+inline constexpr uint64_t kGuestAutoMapBase = 0x1000000000ull;   // 64 GiB
+inline constexpr uint64_t kGuestAutoMapLimit = 0xfc00000000ull;
+// #312/#946's huge hinted reservations must vacate their low hint for a later metadata pool.
+// Retain their established placement floor independently of the ordinary-map preference.
+inline constexpr uint64_t kGuestHugeReserveBase = 0x2000000000ull;   // 128 GiB
+
 namespace {
 // This is separate from g_mx. A renderer may hold the shared side across a synchronous Vulkan
 // fence; it must still be able to make short mapping/topology and writeback queries under g_mx.
@@ -1480,8 +1491,6 @@ namespace {
     // address model, Sony libc explicitly rejects such an address as mspace backing.  Search a quiet
     // guest range atomically with MAP_FIXED_NOREPLACE; all HLE-created occupants are tracked, so a
     // collision can skip directly past them instead of probing every 64 KiB page.
-    constexpr uint64_t kGuestAutoMapBase  = 0x2000000000ull;
-    constexpr uint64_t kGuestAutoMapLimit = 0x40000000000ull;
     // Monotonic placement cursor for auto-mapped guest VA (#983). Restarting the linear probe in
     // map_guest_from() from kGuestAutoMapBase on EVERY auto-map is O(N) in the live-mapping count,
     // and on macOS each collided probe is a full mmap+munmap under Rosetta's VM tracking
@@ -1493,7 +1502,10 @@ namespace {
     // to the base to reclaim VA freed below the cursor. Atomic (lock-free) — concurrent mappers stay
     // correct via NOREPLACE; the cursor is a hint, not a lock.
     uint64_t g_auto_map_cursor = kGuestAutoMapBase;
-    void* map_guest_from(uint64_t start, uint64_t len, int prot, uint64_t align) {
+    // Explicit search hints (including AMM's window) retain their former 4 TiB ceiling.
+    // Ordinary automatic placement supplies the narrower guest-libc aperture below.
+    void* map_guest_from(uint64_t start, uint64_t len, int prot, uint64_t align,
+                         uint64_t limit = 0x40000000000ull) {
         const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
         if (align < page) align = page;
         if (!len || (align & (align - 1)) != 0 ||
@@ -1501,9 +1513,9 @@ namespace {
             return nullptr;
         const uint64_t step = align > 0x10000 ? align : 0x10000;
         uint64_t cand = align_up(start, align);
-        if (cand >= kGuestAutoMapLimit || len > kGuestAutoMapLimit - cand)
+        if (cand >= limit || len > limit - cand)
             return nullptr;
-        while (cand <= kGuestAutoMapLimit - len) {
+        while (cand <= limit - len) {
             void* p = prosper_mmap_noreplace((void*)cand, len, prot,
                                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (p != MAP_FAILED) return p;
@@ -1526,15 +1538,18 @@ namespace {
         return nullptr;
     }
 
-    void* map_guest_auto(uint64_t len, int prot, uint64_t align) {
+    void* map_guest_auto(uint64_t len, int prot, uint64_t align,
+                         uint64_t minimum = kGuestAutoMapBase) {
         // Start probing past the last successful placement (see g_auto_map_cursor, #983) instead of
         // rescanning from kGuestAutoMapBase every call. If the tail is exhausted, wrap once to the
-        // base to reclaim VA freed below the cursor.
+        // caller's floor to reclaim VA freed below the cursor. Huge hinted reservations retain
+        // their separate legacy floor; ordinary implicit mappings use the preferred base.
         uint64_t hint = __atomic_load_n(&g_auto_map_cursor, __ATOMIC_RELAXED);
-        if (hint < kGuestAutoMapBase) hint = kGuestAutoMapBase;
-        void* p = map_guest_from(hint, len, prot, align);
-        if (!p && hint > kGuestAutoMapBase)
-            p = map_guest_from(kGuestAutoMapBase, len, prot, align);
+        minimum = std::max(minimum, kGuestAutoMapBase);
+        if (hint < minimum) hint = minimum;
+        void* p = map_guest_from(hint, len, prot, align, kGuestAutoMapLimit);
+        if (!p && hint > minimum)
+            p = map_guest_from(minimum, len, prot, align, kGuestAutoMapLimit);
         if (p) {
             // Advance the cursor monotonically to the end of this placement (only forward; VA below
             // the cursor is reclaimed by the wrap above, never leaked).
@@ -1830,7 +1845,8 @@ HLE(k_reserve_vrange) {
     // corrupts MallocBinned3 metadata (#312). Only the flex arena is >= 128 GiB, so steer such
     // reservations into the guest auto-map region (map_guest_auto below, placement A/B-validated
     // in the #982 investigation), leaving the low hint free for the small metadata pool the
-    // guest reserves next with the same hint. The auto window bounds are untouched.
+    // guest reserves next with the same hint. Retain that floor even when ordinary automatic
+    // mappings prefer a lower base (#4032); all automatic placement stays in the low aperture.
     if (hint && a1 < kHugeReserveLen) {
         // Non-fixed hint: search for a free range starting at the hint. Probe candidates with
         // MAP_FIXED_NOREPLACE (also catches host mappings the tracker doesn't know); on a miss,
@@ -1860,7 +1876,9 @@ HLE(k_reserve_vrange) {
         MLOG("reserve search from 0x%llx FAILED (no free range)\n", (unsigned long long)hint);
         return 0x8002000cull;   // SCE_KERNEL_ERROR_ENOMEM
     }
-    void* raw = map_guest_auto(a1, PROT_NONE, align);
+    const uint64_t minimum = hint && a1 >= kHugeReserveLen
+        ? kGuestHugeReserveBase : kGuestAutoMapBase;
+    void* raw = map_guest_auto(a1, PROT_NONE, align, minimum);
     if (!raw) { MLOG("reserve len=0x%llx FAILED\n", (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
     uint64_t base = (uint64_t)raw;
     if (a0) *(uint64_t*)a0 = base;
@@ -3285,8 +3303,8 @@ namespace {
     // AMM (11.5 GiB) and stops growing, so a roomy window costs address space and nothing else.
     constexpr uint64_t kAmmWindowSize   = 0x1100000000ull;    // 68 GiB
     // Search from 1 TiB rather than from kGuestAutoMapBase: the window is a single 68 GiB span and
-    // placing it at the bottom of the auto-map region would push every ordinary guest mapping above
-    // it. It stays inside [kGuestAutoMapBase, kGuestAutoMapLimit) either way.
+    // placing it at the bottom would push every ordinary guest mapping above it. This dedicated
+    // reservation retains the explicit-search ceiling; ordinary auto maps use the low aperture.
     constexpr uint64_t kAmmWindowSearch = 0x10000000000ull;   // 1 TiB
     constexpr uint64_t kAmmWindowAlign  = 0x200000ull;        // the alignment the guest asks for
 
@@ -4898,12 +4916,12 @@ namespace {
     }
     constexpr uint64_t kWinAllocationGranularity = 0x10000;
     // PS5 libc accepts caller-supplied mspace storage in two virtual-address apertures. Keep
-    // automatically placed guest mappings in the low aperture and above the fixed module/direct
+    // automatically placed guest mappings in the low aperture and above the fixed module
     // ranges. Letting Windows choose from its full user VA space can land a valid mapping in the
     // rejected 1-8 TiB gap (Astro observed 0x2d980000000), after which sceLibcMspaceCreate returns
     // null even though the pages are accessible.
-    constexpr uint64_t kGuestAutoVaMin = 0x2000000000ull;   // 128 GiB
-    constexpr uint64_t kGuestAutoVaMax = 0xfbffffffffull;  // inclusive; one byte below a 64 KiB boundary
+    constexpr uint64_t kGuestAutoVaMin = kGuestAutoMapBase;
+    constexpr uint64_t kGuestAutoVaMax = kGuestAutoMapLimit - 1;  // inclusive
 
     // A paging-file SEC_RESERVE section avoids a 16 GiB commit charge, but every first guest touch
     // raises a Windows access violation. Windows builds its exception-dispatch frame below RSP
@@ -5075,12 +5093,14 @@ namespace {
     // Remove one exact page-aligned subrange from a free placeholder. VirtualFree with
     // MEM_PRESERVE_PLACEHOLDER splits the Windows placeholder without releasing either side.
     void* take_placeholder_locked(std::vector<PlaceholderSpan>& spans,
-                                  uint64_t hint, uint64_t len, uint64_t align) {
+                                  uint64_t hint, uint64_t len, uint64_t align,
+                                  uint64_t automatic_minimum = kGuestAutoVaMin) {
         if (!len) return nullptr;
         const uint64_t requested_align = align ? align : 0x1000;
         for (size_t i = 0; i < spans.size(); ++i) {
             const PlaceholderSpan span = spans[i];
-            uint64_t base = hint ? hint : align_up(span.base, requested_align);
+            uint64_t base = hint ? hint : align_up(
+                std::max(span.base, automatic_minimum), requested_align);
             if ((base & (requested_align - 1)) || base < span.base ||
                 base > UINT64_MAX - len ||
                 base + len > span.base + span.size) continue;
@@ -5116,8 +5136,9 @@ namespace {
         return nullptr;
     }
 
-    void* take_free_placeholder_locked(uint64_t hint, uint64_t len, uint64_t align) {
-        return take_placeholder_locked(g_free_placeholders, hint, len, align);
+    void* take_free_placeholder_locked(uint64_t hint, uint64_t len, uint64_t align,
+                                       uint64_t automatic_minimum = kGuestAutoVaMin) {
+        return take_placeholder_locked(g_free_placeholders, hint, len, align, automatic_minimum);
     }
 
     void* take_guest_placeholder_locked(uint64_t hint, uint64_t len, uint64_t align) {
@@ -6277,21 +6298,22 @@ namespace {
             std::lock_guard<std::mutex> lk(g_dview_mx);
             const uint64_t granule =
                 std::max<uint64_t>(align ? align : 0x4000, kWinAllocationGranularity);
+            if (len > UINT64_MAX - (kWinAllocationGranularity - 1)) return nullptr;
             const uint64_t span = align_up(len, kWinAllocationGranularity);
             // Recycle a freed placeholder first (window-bounded via the hint-less take path): an
             // unmapped huge arena's VA stays OS-reserved as a free placeholder, so without this a
             // reserve->unmap->re-reserve cycle exhausts the window and ENOMEMs (review finding on
             // #1084; Linux reuses freed VA naturally via the cursor wrap).
             AcquiredPlaceholder acquired{};
-            if (void* recycled = take_free_placeholder_locked(0, len, align))
+            if (void* recycled = take_free_placeholder_locked(0, len, align, kGuestHugeReserveBase))
                 acquired = {recycled, PlaceholderOwner::Free};
-            if (!acquired.address && span <= kGuestAutoVaMax + 1 - kGuestAutoVaMin) {
+            if (!acquired.address && span <= kGuestAutoVaMax + 1 - kGuestHugeReserveBase) {
                 const uint64_t band_low = (kGuestAutoVaMax + 1 - span) & ~(granule - 1);
-                if (band_low >= kGuestAutoVaMin)
+                if (band_low >= kGuestHugeReserveBase)
                     acquired = acquire_placeholder_window_locked(band_low, len, align);
             }
-            if (!acquired.address) {  // band contended/undersized: anywhere in-window
-                acquired = acquire_placeholder_window_locked(kGuestAutoVaMin, len, align);
+            if (!acquired.address) {  // band contended/undersized: anywhere in the legacy huge band
+                acquired = acquire_placeholder_window_locked(kGuestHugeReserveBase, len, align);
                 if (acquired.address)
                     MLOG("reserve(huge) top band unavailable -- whole-window fallback -> 0x%llx\n",
                          (unsigned long long)(uintptr_t)acquired.address);
@@ -6315,6 +6337,11 @@ namespace {
                 return acquired.address;
             }
         }
+        // #4032: an automatic reservation must stay in the guest aperture even when bounded
+        // placement fails. Modern placeholders supply that contract; without them (or without
+        // a suitable gap), return ENOMEM rather than leak an unconstrained host VA to the guest.
+        // Explicit hints retain the existing legacy fallback below.
+        if (!hint) return nullptr;
         if (hint) {
             if (void* p = VirtualAlloc((void*)hint, (SIZE_T)len, MEM_RESERVE, PAGE_NOACCESS)) return p;
             if (fixed) return nullptr;   // SCE_KERNEL_MAP_FIXED: must be exactly this address

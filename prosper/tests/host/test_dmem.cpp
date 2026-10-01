@@ -38,7 +38,7 @@ static constexpr uint64_t kEnd   = kBase + kTotal;
 using Hle7Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
                             uint64_t, uint64_t, uint64_t);
 #ifdef _WIN32
-static constexpr uint64_t kGuestAutoVaMin = 0x2000000000ull;
+static constexpr uint64_t kGuestAutoVaMin = 0x1000000000ull;
 static constexpr uint64_t kGuestAutoVaMax = 0xfbffffffffull;
 #elif defined(__linux__)
 namespace {
@@ -66,6 +66,99 @@ bool install_texture_watch_handler() {
     return true;
 }
 } // namespace
+#endif
+
+#if defined(_WIN32) || defined(__linux__)
+static void test_automatic_placement() {
+    const auto flexible = Hle::lookup(nid_hash("sceKernelMapFlexibleMemory"));
+    const auto alloc = Hle::lookup(nid_hash("sceKernelAllocateMainDirectMemory"));
+    const auto map = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
+    const auto batch = Hle::lookup(nid_hash("sceKernelBatchMap2"));
+    const auto reserve = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
+    const auto unmap = Hle::lookup(nid_hash("sceKernelMunmap"));
+    const auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
+    CHECK(flexible && alloc && map && batch && reserve && unmap && release,
+          "automatic-placement entry points registered");
+    if (!(flexible && alloc && map && batch && reserve && unmap && release)) return;
+
+    // #4032: an implicit C-runtime heap must not consume the beginning of a later fixed arena.
+    // Exercise both real mapping paths, preserving their bytes and the direct alias contract.
+    constexpr uint64_t heap_len = 0x100000, page_len = 0x10000, alignment = 0x200000;
+    constexpr uint64_t low_base = 0x1000000000ull;
+    constexpr uint64_t low_limit = 0xfc00000000ull;
+    uint64_t heap = 0, phys = 0, automatic = 0;
+    const bool have_heap = flexible((uint64_t)(uintptr_t)&heap, heap_len, 3, 0, 0, 0) == 0 && heap != 0;
+    CHECK(have_heap && heap >= low_base && heap <= low_limit - heap_len,
+          "automatic flexible heap stays inside the accepted low aperture");
+    if (have_heap) {
+        *(volatile uint32_t*)(uintptr_t)heap = 0xC041AB1Eu;
+        *(volatile uint32_t*)(uintptr_t)(heap + page_len) = 0xA110C471u;
+    }
+    const bool have_phys = alloc(page_len, alignment, 12, (uint64_t)(uintptr_t)&phys, 0, 0) == 0 && phys != 0;
+    CHECK(have_phys, "allocate physical pages for placement and alias checks");
+    const bool have_automatic = have_phys &&
+        map((uint64_t)(uintptr_t)&automatic, page_len, 3, 0, phys, alignment) == 0 && automatic != 0;
+    CHECK(have_automatic && automatic >= low_base && automatic <= low_limit - page_len &&
+              (automatic & (alignment - 1)) == 0,
+          "automatic direct view honors alignment and the accepted low aperture");
+    if (have_automatic) *(volatile uint32_t*)(uintptr_t)automatic = 0xD1AEC771u;
+
+    uint64_t fixed_base = 0x2000000000ull;
+#ifdef _WIN32
+    // ASLR may put host allocations anywhere in the low aperture. The Linux collision arm uses
+    // the exact arena base; Windows first proves a fixed probe free after the automatic maps.
+    bool fixed_free = false;
+    while (fixed_base <= low_limit - page_len) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((void*)(uintptr_t)fixed_base, &mbi, sizeof(mbi))) break;
+        const uint64_t end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (end <= fixed_base) break;
+        if (mbi.State == MEM_FREE && end - fixed_base >= page_len) {
+            fixed_free = true;
+            break;
+        }
+        if (end > UINT64_MAX - (page_len - 1)) break;
+        fixed_base = (end + page_len - 1) & ~(page_len - 1);
+    }
+    CHECK(fixed_free, "find a host-proven free fixed probe in the guest aperture");
+    if (!fixed_free) fixed_base = 0;
+#endif
+
+    struct Entry { uint64_t start, phys, len; uint8_t prot, type; uint16_t pad; int32_t op; };
+    static_assert(sizeof(Entry) == 0x20);
+    Entry entry{fixed_base, phys, page_len, 3, 0, 0, 0};
+    int done = -1;
+    const bool have_fixed = have_phys && fixed_base != 0 &&
+        batch((uint64_t)(uintptr_t)&entry, 1, (uint64_t)(uintptr_t)&done, 0x10, 0, 0) == 0;
+    CHECK(have_fixed && done == 1, "later fixed arena map succeeds after automatic startup maps");
+    if (have_fixed && have_automatic)
+        CHECK(*(volatile uint32_t*)(uintptr_t)fixed_base == 0xD1AEC771u,
+              "the fixed view aliases the earlier automatic direct view");
+    if (have_heap) {
+        CHECK(*(volatile uint32_t*)(uintptr_t)heap == 0xC041AB1Eu,
+              "the later fixed map preserves the automatic flexible heap");
+        if (have_phys) {
+            entry.start = heap + page_len;
+            done = -1;
+            CHECK(batch((uint64_t)(uintptr_t)&entry, 1, (uint64_t)(uintptr_t)&done, 0x10, 0, 0) != 0 &&
+                      done == 0,
+                  "fixed mapping still refuses a partial overlap of a live flexible heap");
+            CHECK(*(volatile uint32_t*)(uintptr_t)(heap + page_len) == 0xA110C471u,
+                  "refused fixed overlap leaves the existing bytes intact");
+        }
+    }
+    if (have_fixed) CHECK(unmap(fixed_base, page_len, 0, 0, 0, 0) == 0, "unmap the fixed alias");
+    if (have_automatic) CHECK(unmap(automatic, page_len, 0, 0, 0, 0) == 0, "unmap the automatic alias");
+    if (have_phys) CHECK(release(phys, page_len, 0, 0, 0, 0) == 0, "release placement-test physical pages");
+    if (have_heap) CHECK(unmap(heap, heap_len, 0, 0, 0, 0) == 0, "unmap the automatic flexible heap");
+
+    uint64_t oversized = 0;
+    constexpr uint64_t oversized_len = low_limit - low_base + page_len;
+    const uint64_t ret = reserve((uint64_t)(uintptr_t)&oversized, oversized_len, 0, page_len, 0, 0);
+    CHECK(ret != 0 && oversized == 0,
+          "an automatic reservation cannot escape the low aperture to satisfy an oversized request");
+    if (ret == 0) CHECK(unmap(oversized, oversized_len, 0, 0, 0, 0) == 0, "clean up a misplaced reservation");
+}
 #endif
 
 int main() {
@@ -96,6 +189,7 @@ int main() {
               mtypeprotect && release && query && get_type && batch,
           "memory HLE functions registered");
     if (fails) return 1;
+    test_automatic_placement();
 
     constexpr uint64_t len = 0x4000;
     CHECK((uint32_t)unmap(0, len, 0, 0, 0, 0) == 0x80020016u,
@@ -1166,6 +1260,7 @@ int main() {
           release && get_type)) {
         printf("== FAIL ==\n"); return 1;
     }
+    test_automatic_placement();
 
     // Persistent texture reuse must be able to trust unchanged flexible-memory assets too.  Linux
     // previously registered only direct-memory mappings with the page-fault write watcher, forcing
@@ -1557,7 +1652,7 @@ int main() {
                          p, len);
                 CHECK(rr == 0 && hinted && hinted != (uint64_t)(uintptr_t)live,
                       "non-fixed occupied direct-memory hint relocates");
-                CHECK(hinted >= 0x2000000000ull && hinted < 0x40000000000ull,
+                CHECK(hinted >= 0x1000000000ull && hinted < 0xfc00000000ull,
                       "relocated direct mapping stays in the guest user-VA range");
                 CHECK(*(volatile uint32_t*)live == 0xA57B0782u,
                       "relocated direct mapping does not clobber the live hint");

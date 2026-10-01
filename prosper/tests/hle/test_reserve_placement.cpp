@@ -33,13 +33,10 @@ static int fails = 0;
                                   (unsigned long long)(rc), (unsigned long long)(val))
 
 // Window bounds mirror hle_kernel_mem.cpp (kGuestAutoMapBase/Limit on Linux; kGuestAutoVaMin/Max
-// on Windows). The huge-reserve band must stay inside the platform's guest auto window.
-static constexpr uint64_t kAutoMin = 0x2000000000ull;      // 128 GiB
-#ifdef _WIN32
+// on Windows). Huge hinted reserves retain their existing 128 GiB floor even when ordinary
+// automatic maps prefer 64 GiB (#4032), so the low hint remains free for the metadata pool.
+static constexpr uint64_t kAutoMin = 0x2000000000ull;      // 128 GiB huge-reserve floor
 static constexpr uint64_t kAutoEndIncl = 0xfbffffffffull;  // inclusive (~1 TiB aperture ceiling)
-#else
-static constexpr uint64_t kAutoEndIncl = 0x40000000000ull - 1;   // limit exclusive -> inclusive
-#endif
 
 // The below-threshold probe asserts "a free hint is honored", which requires the hint span to
 // actually BE free in this host process — on Windows, high-entropy ASLR scatters small host
@@ -134,6 +131,20 @@ int main() {
         CHECK(rc == 0, "just-below-threshold reserve succeeds (hint occupancy: equality relaxed)");
         unmap(below, belowLen, 0, 0, 0, 0);
     }
+
+    // #4032: before ordinary automatic mappings, their new preferred base equals this low hint.
+    // The huge redirect retains its separate floor rather than becoming a literal-at-hint reserve.
+    // Windows case 1 below already covers that floor; an extra earlier giant reservation leaves
+    // a free placeholder that fragments its later 512 GiB allocation even after guest unmap.
+#ifndef _WIN32
+    uint64_t pristine = kArenaHint;
+    uint64_t pristine_rc = reserve((uint64_t)&pristine, kHugeMin, 0, kArenaAlign, 0, 0);
+    LOGV("pristine", pristine_rc, pristine);
+    CHECK(pristine_rc == 0 && pristine != kArenaHint && pristine >= kAutoMin &&
+              pristine <= kAutoEndIncl - kHugeMin + 1,
+          "a pristine huge hinted reserve keeps its legacy band above the ordinary preferred base");
+    if (pristine_rc == 0) unmap(pristine, kHugeMin, 0, 0, 0, 0);
+#endif
 
     // 1) The DQ7 arena reserve: huge + non-fixed must NOT land at its low hint, must land
     //    aligned inside the guest auto window.
