@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,10 +29,13 @@
 
 using namespace prosper::gpu;
 namespace perf = prosper::diagnostics::perf;
-static unsigned failures = 0;
+static unsigned& failure_count() {
+    static unsigned value = 0;
+    return value;
+}
 static void check(bool condition, const char* label) {
     std::printf("[%s] %s\n", condition ? "ok" : "FAIL", label);
-    failures += !condition;
+    if (!condition) ++failure_count();
 }
 static void environment(const char* name, const char* value) {
 #ifdef _WIN32
@@ -48,8 +52,7 @@ static Counts counts() {
         perf::Counter::WaitRegMemDirectFalseDefer};
     Counts result{};
     for (size_t i = 0; i < fields.size(); ++i)
-        result[i] = perf::ledger().counters[static_cast<size_t>(fields[i])].load(
-            std::memory_order_relaxed);
+        result[i] = perf::ledger().counters[static_cast<size_t>(fields[i])].load();
     return result;
 }
 static void delta(const Counts& before, Counts expected, bool disabled, const char* label) {
@@ -110,10 +113,14 @@ int main(int argc, char** argv) {
     const bool disabled = !perf::enabled();
     std::printf("Actual CPU packet route; mode=%s observers=%s; Vulkan UNRUN\n",
                 argv[2], disabled ? "disabled" : "enabled");
-    FILE* captured = std::tmpfile();
+    std::unique_ptr<FILE, decltype(&std::fclose)> captured(std::tmpfile(), &std::fclose);
+    if (!captured) return 2;
     const int saved = route_dup(route_fileno(stderr));
-    if (!captured || saved < 0 || route_dup2(route_fileno(captured), route_fileno(stderr)) < 0)
+    if (saved < 0) return 2;
+    if (route_dup2(route_fileno(captured.get()), route_fileno(stderr)) < 0) {
+        route_close(saved);
         return 2;
+    }
 
     // A real active submit holds the queued ReleaseMem private. Its overlay must satisfy the wait
     // without publishing the word. The false arm prints the retained raw/effective distinction.
@@ -332,10 +339,11 @@ int main(int argc, char** argv) {
               "actual route JSONL retains direct population");
     }
     std::fflush(stderr);
-    route_dup2(saved, route_fileno(stderr));
-    route_close(saved);
-    const auto diagnostics = read(captured);
-    std::fclose(captured);
+    const int restored = route_dup2(saved, route_fileno(stderr));
+    const int closed = route_close(saved);
+    if (restored < 0 || closed < 0) return 2;
+    const auto diagnostics = read(captured.get());
+    captured.reset();
     std::fwrite(diagnostics.data(), 1, diagnostics.size(), stderr);
     size_t warning_lines = 0;
     for (size_t cursor = 0; (cursor = diagnostics.find("NOT satisfied at fold time:", cursor)) !=
@@ -351,6 +359,6 @@ int main(int argc, char** argv) {
           "real unsupported warning retains comparison support");
     check(!deferred_pending() && !prosper_gpu_submit_scope_active(),
           "actual route fixture exits with no deferred streams or submit scope");
-    std::printf("== %s: %u failures ==\n", failures ? "FAIL" : "PASS", failures);
-    return failures ? 1 : 0;
+    std::printf("== %s: %u failures ==\n", failure_count() ? "FAIL" : "PASS", failure_count());
+    return failure_count() ? 1 : 0;
 }

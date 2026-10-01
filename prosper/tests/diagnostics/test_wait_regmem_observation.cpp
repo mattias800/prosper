@@ -12,14 +12,17 @@
 
 using namespace prosper::gpu;
 namespace perf = prosper::diagnostics::perf;
-static unsigned failures = 0;
+static unsigned& failure_count() {
+    static unsigned value = 0;
+    return value;
+}
 #define CHECK(condition, label) do { \
     if (condition) std::printf("[ok] %s\n", label); \
-    else { std::printf("[FAIL] %s\n", label); ++failures; } \
+    else { std::printf("[FAIL] %s\n", label); ++failure_count(); } \
 } while (false)
 
 static uint64_t count(perf::Counter counter) {
-    return perf::ledger().counters[static_cast<size_t>(counter)].load(std::memory_order_relaxed);
+    return perf::ledger().counters[static_cast<size_t>(counter)].load();
 }
 
 static std::string read_file(FILE* file) {
@@ -68,10 +71,10 @@ int main(int argc, char** argv) {
         command.wm_func = item.func;
         unsigned reads = 0, overlays = 0;
         const auto sample = sample_wait_regmem_predicate(command,
-            [&](uint64_t address, uint64_t* value) {
+            [&command, &reads, &item](uint64_t address, uint64_t* value) {
                 CHECK(address == command.wm_addr, "sampler uses selected address");
                 ++reads; *value = item.raw; return true;
-            }, [&](uint64_t, uint64_t*) { ++overlays; return false; });
+            }, [&overlays](uint64_t, uint64_t*) { ++overlays; return false; });
         CHECK(sample.satisfied == item.expected, "predicate comparison result");
         CHECK(reads == 1 && overlays == 1, "exactly one reader and overlay call");
         CHECK(sample.readable && sample.raw_value == item.raw &&
@@ -93,16 +96,16 @@ int main(int argc, char** argv) {
     uint64_t label = 0;
     unsigned overlay_calls = 0;
     const auto overlaid = sample_wait_regmem_predicate(command,
-        [&](uint64_t, uint64_t* value) { *value = label; return true; },
-        [&](uint64_t, uint64_t* value) { ++overlay_calls; *value = 1; return true; });
+        [&label](uint64_t, uint64_t* value) { *value = label; return true; },
+        [&overlay_calls](uint64_t, uint64_t* value) { ++overlay_calls; *value = 1; return true; });
     CHECK(overlaid.satisfied && overlaid.raw_value == 0 && overlaid.effective_value == 1,
           "predicate uses overlaid effective value");
     CHECK(overlaid.overlay_touched && overlaid.masked_value == 1 && label == 0 && overlay_calls == 1,
           "overlay callback retains raw label without publication");
 
     const auto retained = sample_wait_regmem_predicate(command,
-        [&](uint64_t, uint64_t* value) { *value = label; return true; },
-        [&](uint64_t, uint64_t*) { label = 1; return false; });
+        [&label](uint64_t, uint64_t* value) { *value = label; return true; },
+        [&label](uint64_t, uint64_t*) { label = 1; return false; });
     CHECK(!retained.satisfied && retained.raw_value == 0 && retained.effective_value == 0 &&
           retained.masked_value == 0 && label == 1,
           "later fixture change cannot replace retained decision sample");
@@ -111,7 +114,7 @@ int main(int argc, char** argv) {
     overlay_calls = 0;
     const auto unreadable = sample_wait_regmem_predicate(command,
         [](uint64_t, uint64_t*) { return false; },
-        [&](uint64_t, uint64_t*) { ++overlay_calls; return false; });
+        [&overlay_calls](uint64_t, uint64_t*) { ++overlay_calls; return false; });
     CHECK(!unreadable.readable && !unreadable.satisfied && unreadable.comparison_supported,
           "unreadable label fails before always comparison");
     CHECK(overlay_calls == 0, "unreadable sample invokes no overlay");
@@ -198,15 +201,15 @@ int main(int argc, char** argv) {
     std::mutex mutex;
     std::condition_variable cv;
     bool ready = false, release = false;
-    std::thread worker([&] {
+    std::thread worker([&overlaid, &mutex, &ready, &cv, &release] {
         observe(overlaid);
         std::unique_lock lock(mutex);
         ready = true; cv.notify_one();
-        cv.wait(lock, [&] { return release; });
+        cv.wait(lock, [&release] { return release; });
     });
     {
         std::unique_lock lock(mutex);
-        cv.wait(lock, [&] { return ready; });
+        cv.wait(lock, [&ready] { return ready; });
     }
     live.on_flip(2100, perf::ledger(), 60);
     const auto live_text = summary(live);
@@ -222,6 +225,6 @@ int main(int argc, char** argv) {
     cv.notify_one();
     worker.join();
 
-    std::printf("result: %u failure(s)\n", failures);
-    return failures ? 1 : 0;
+    std::printf("result: %u failure(s)\n", failure_count());
+    return failure_count() ? 1 : 0;
 }
