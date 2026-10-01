@@ -63,11 +63,12 @@ arm reaches derived provenance. The one-arm compare targets the MUST mask meet a
   FPS. Memoize the code-only proof by both immutable analysis versions; live resource obligations
   and markers still require a check before every lookup. Preserve the uncached measurement.
 
-- Stripping only the v62 marker tail does not form a valid v61 capture after v63 appends its
+- Stripping only the v62 marker tail did not form a valid v61 capture after the initial v63
   owned-wide count/width tail. The first current-base raw backing calibration failed this
-  historical-layout control; remove both tails and separately pin the retained v62 marker.
-  A future-version refusal fixture must also use a version above current v63 (#3987).
-- A successful current capture cannot still be asserted as v62 after the owned-wide v63
+  historical-layout control. The owned obligation is now v64 after the official v63 draw-width
+  tail; remove each newer tail and separately pin retained v62 markers and v63 width provenance.
+  A future-version refusal fixture must use a version above the current writer (#3987).
+- A successful current capture could not still be asserted as v62 after the initial owned-wide v63
   addition. The full Linux suite exposed this stale expectation in both existing indirect-pointer
   capture controls; keep their owned-byte, unused-candidate and round-trip assertions intact.
 - A non-CMPX compare's SGPR-pair-shaped destination does not prove both physical words were

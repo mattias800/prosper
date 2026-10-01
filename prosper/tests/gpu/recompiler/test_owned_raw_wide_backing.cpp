@@ -256,24 +256,38 @@ int main(int argc, char** argv) {
         }
         check(roundtrip && parent_reads == 0u && restored_high == 2u &&
               restored_child_high == child[8u + last],
-              "v63 capture owns highest selector and separate highest child word without guest reread");
+              "v64 capture owns highest selector and separate highest child word without guest reread");
         if (!roundtrip) continue;
-        auto v62_bytes = encoded;
-        const auto v63_tail_size = 4u + 4u * decoded.draws.front().vrt.resources.size();
+        const auto v64_tail_size = 4u + 4u * decoded.draws.front().vrt.resources.size();
+        auto v63_bytes = encoded;
+        v63_bytes.resize(v63_bytes.size() - v64_tail_size);
+        v63_bytes[8] = 63u;
+        v63_bytes[9] = v63_bytes[10] = v63_bytes[11] = 0u;
+        GpuCaptureFile official63;
+        check(deserialize_gpu_capture(v63_bytes, official63, error) &&
+              official63.format_version == 63u && official63.draws.size() == 1u &&
+              !official63.draws.front().fragment_wave_config_available &&
+              !official63.draws.front().ps_wave32 &&
+              std::all_of(official63.draws.front().vrt.resources.begin(),
+                          official63.draws.front().vrt.resources.end(), [](const auto& resource) {
+                  return resource.resource.owned_raw_snapshot_bytes == 0u;
+              }), "official v63 retains width availability without inventing an owned obligation");
+        auto v62_bytes = v63_bytes;
+        const auto v63_tail_size = 4u + decoded.draws.size();
         if (v62_bytes.size() >= v63_tail_size) {
             v62_bytes.resize(v62_bytes.size() - v63_tail_size);
             v62_bytes[8] = 62u;
             v62_bytes[9] = v62_bytes[10] = v62_bytes[11] = 0u;
         }
         auto bad_count = encoded;
-        if (bad_count.size() >= v63_tail_size) bad_count[bad_count.size() - v63_tail_size] ^= 1u;
+        if (bad_count.size() >= v64_tail_size) bad_count[bad_count.size() - v64_tail_size] ^= 1u;
         GpuCaptureFile invalid_format;
         check(!deserialize_gpu_capture(bad_count, invalid_format, error),
-              "v63 reader refuses mismatched owned-obligation resource count");
+              "v64 reader refuses mismatched owned-obligation resource count");
         auto cut_width = encoded;
         cut_width.pop_back();
         check(!deserialize_gpu_capture(cut_width, invalid_format, error),
-              "v63 reader refuses a truncated owned-obligation width field");
+              "v64 reader refuses a truncated owned-obligation width field");
         GpuCaptureFile v62;
         GpuReplayFrame legacy_replay;
         check(deserialize_gpu_capture(v62_bytes, v62, error) && v62.format_version == 62u &&

@@ -148,6 +148,7 @@ static GpuState state_for(const Program& vs, const Program& ps, uint64_t source,
     set_program(state, vs); set_program(state, ps);
     state.uc[P::VGT_PRIMITIVE_TYPE] = 4u;
     state.cx[P::CB_TARGET_MASK] = state.cx[P::CB_SHADER_MASK] = 15u;
+    state.cx[P::SPI_PS_IN_CONTROL] = 0u; // The real fragment compiler input is Wave64.
     state.sh[P::SPI_SHADER_PGM_RSRC2_GS] = 10u << P::SPI_SHADER_PGM_RSRC2_GS_USER_SGPR_SHIFT;
     state.sh[P::SPI_SHADER_PGM_RSRC2_PS] = 10u << P::SPI_SHADER_PGM_RSRC2_GS_USER_SGPR_SHIFT;
     // Make a runtime PS readfirstlane selector genuinely derive from FragCoord.x.
@@ -282,10 +283,13 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
         decoded.draws[0].vertex_count == 3u && decoded.draws[0].instance_count == 1u &&
         decoded.draws[0].raw_draw_count == 3u && !decoded.draws[0].raw_indexed &&
         decoded.draws[0].color0_width == W && decoded.draws[0].color0_height == H &&
+        draw.fragment_wave_config_available && !draw.ps_wave32 &&
+        decoded.draws[0].fragment_wave_config_available &&
+        decoded.draws[0].ps_wave32 == draw.ps_wave32 &&
         decoded.draws[0].vs_chain_raw_shader_index == UINT32_MAX &&
         matches_raw(decoded.draws[0].vs_raw_shader_index, vs) &&
         matches_raw(decoded.draws[0].fs_raw_shader_index, ps);
-    check(complete, arm, "optional owned replay writes both exact raw stages and complete draw state");
+    check(complete, arm, "optional owned replay writes both raw stages, complete draw state and guest fragment width");
     const bool materialized = complete && materialize_gpu_replay(decoded, replay, error);
     const auto table = materialized && replay.items.size() == 1u
         ? (vertex ? replay.items[0].vrt : replay.items[0].prt) : nullptr;
@@ -300,7 +304,9 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
           parent->owned_raw_snapshot_bytes == size && parent_high == 2u &&
           child && child->size == size && child_high == std::bit_cast<uint32_t>(child_value) &&
           replay.items[0].vs_words() == draw.vs_words() &&
-          replay.items[0].fs_words() == draw.fs_words(), arm,
+          replay.items[0].fs_words() == draw.fs_words() &&
+          replay.items[0].fragment_wave_config_available &&
+          replay.items[0].ps_wave32 == draw.ps_wave32, arm,
           "optional owned replay preserves old highest parent and separate highest child bytes");
     if (vertex) {
         const float translation = child_value + 1.0f; // retained parent selector 2 * 0.5
