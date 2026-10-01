@@ -3921,8 +3921,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (in.src_neg[0]) a = b.fneg(a);
             if (in.src_abs[1]) c = b.fext1(Glsl_FAbs, c);
             if (in.src_neg[1]) c = b.fneg(c);
-            // v_cmpx_* shares each type's compare set at base+0x10. It writes EXEC in addition to
-            // VCC. Map to the base compare, then narrow; vopc_is_cmpx covers the f32/f64,
+            // v_cmpx_* shares each type's compare set at base+0x10. On gfx10 it writes EXEC only,
+            // preserving VCC. Map to the base compare, then narrow; vopc_is_cmpx covers the f32/f64,
             // i32/i64, and u32/u64 windows.
             const bool integer_compare =
                 (eff >= 0x81u && eff <= 0x86u) ||
@@ -4151,13 +4151,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // The old shared handler fell into the `else` and set vcc = cmp for cmpx too,
                     // clobbering a VCC value kept live ACROSS the cmpx, so a later v_cndmask/s_cbranch_vccz/
                     // v_add_co_ci reading VCC got the compare mask instead of the real predicate (#464).
-                    rs.exec = b.land(rs.exec, cmp); rs.exec_narrowed = true;
+                    // EXEC suppresses inactive vector comparisons. Select masks an unselected
+                    // comparison's poison; strict OpLogicalAnd would propagate it into EXEC.
+                    rs.exec = b.bsel(rs.exec, cmp, b.bfalse()); rs.exec_narrowed = true;
                 } else {
                     // ISA 3.9: "VCC[n] = EXEC[n] & (test passed for thread n)" — a lane inactive in
                     // EXEC gets its mask bit forced to 0, never the raw test result. Masking at the
                     // write keeps wave reductions (vccz votes, mbcnt publications, v_writelane mask
                     // spills) from seeing phantom bits from inactive lanes. No-op when EXEC is full.
-                    const uint32_t masked = rs.exec_narrowed ? b.land(rs.exec, cmp) : cmp;
+                    // This is architectural predication, not scalar mask arithmetic: an inactive
+                    // lane writes defined zero even when its unevaluated comparison can be poison.
+                    const uint32_t masked = rs.exec_narrowed ? b.bsel(rs.exec, cmp, b.bfalse()) : cmp;
                     if (in.dst.kind == OperandKind::SGPR && in.dst.value <= 105) {
                         rs.sreg_bool[in.dst.value] = masked; rs.sreg_bool_narrowed[in.dst.value] = true;
                         if (b.allow_b32_masks &&

@@ -546,7 +546,8 @@ int main(int argc, char** argv) {
     }
     // Validate the exact newly executed GPU arms, including the helper-poison fault variants.
     for (const auto shape : {neutral::Shape::Termination, neutral::Shape::UndefinedConjunction,
-                             neutral::Shape::MaskedFloat, neutral::Shape::MaskedBitcastPoison}) {
+                             neutral::Shape::MaskedFloat, neutral::Shape::MaskedBitcastPoison,
+                             neutral::Shape::BitcastPoisonSelection, neutral::Shape::FloatPoisonSelection}) {
         for (const bool poison : {false, true}) {
             const auto name = "fragment_neutral_extra_" +
                 std::to_string(static_cast<uint32_t>(shape)) + (poison ? "_poison" : "");
