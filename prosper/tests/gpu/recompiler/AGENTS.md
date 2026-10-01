@@ -44,6 +44,10 @@ arm reaches derived provenance. The one-arm compare targets the MUST mask meet a
 
 ## Ruled out
 
+- Stripping only the v62 marker tail does not form a valid v61 capture after v63 appends its
+  owned-wide count/width tail. The first current-base raw backing calibration failed this
+  historical-layout control; remove both tails and separately pin the retained v62 marker.
+  A future-version refusal fixture must also use a version above current v63 (#3987).
 - A non-CMPX compare's SGPR-pair-shaped destination does not prove both physical words were
   overwritten in an unknown wave mode. A fresh Bool condition can be independent while an ordinary
   numeric high-word read still requires backing.
