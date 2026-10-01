@@ -44,6 +44,12 @@ arm reaches derived provenance. The one-arm compare targets the MUST mask meet a
 
 ## Ruled out
 
+- A nonempty comparison-sample module need not contain `OpImageSampleExplicitLod`:
+  `ShaderResource` defaults to linear filtering. Both new VS/PS positive checks failed
+  while their valid modules each contained four `OpImageFetch` instructions instead.
+  Choose nearest filtering explicitly for the explicit-LOD route assertion; preserve
+  the failed calibration and independently validated linear vectors (#3987).
+
 - A supported `image_sample_c_lz` is not a guest-memory write. An immutable failed compiler
   input showed that unrelated comparison samples alone forced descriptor-only register-offset
   raw loads into `rdna2_raw_wide_data_loads`. The paired classifier experiment preserved all

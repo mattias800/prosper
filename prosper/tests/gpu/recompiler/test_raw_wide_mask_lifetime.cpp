@@ -148,6 +148,8 @@ int main(int argc, char** argv) {
             image.depth = 1u;
             image.depth_compare = true;
             image.depth_compare_func = 3u;
+            image.mag_filter = 0u; // explicit nearest path emits OpImageSampleExplicitLod
+            image.min_filter = 0u;
             image.gpu_addr = reinterpret_cast<uint64_t>(data.data());
             image.size = sizeof(uint32_t);
             for (const auto& instruction : decode(code))
