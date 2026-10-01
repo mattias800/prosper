@@ -22,9 +22,10 @@ inline constexpr auto safe_copy = [](uint8_t* dst, uint64_t a, size_t n) -> size
     return copy_guest_source(dst, a, n, prosper::gpu::guest_readable);
 };
 inline constexpr auto safe_equal = [](const uint8_t* expected, uint64_t a, size_t n,
-                                                size_t& compared) -> bool {
+                                                size_t& compared,
+                                                GuestSourceComparisonObservation* observation = nullptr) -> bool {
     return equal_guest_source_prefix(
-        expected, a, n, compared, prosper::gpu::guest_readable);
+        expected, a, n, compared, prosper::gpu::guest_readable, observation);
 };
 
 } // namespace prosper::frontend::submit_renderer

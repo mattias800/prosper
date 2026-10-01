@@ -207,9 +207,25 @@ matching chunks and omit the first differing chunk (at most 64 KiB); a first-chu
 therefore report zero. Depth comparisons accumulate matching guest-face prefixes, while the
 scratch-copy route counts copied readable bytes. An incomplete prefix can also fail validation,
 so the counter proves neither source mutation nor total comparison traffic. Late differences can
-still charge most of the source before a re-decode. The #3891 missing-chunk observer proposal is
-separate from this existing counter; no new observer is implied here. Proposals needing a new
-expensive signal were declined on the issue with a reason rather than approximated.
+still charge most of the source before a re-decode. The separate direct-validation observer below
+keeps this counter's original meaning. Proposals needing a new expensive signal were declined on
+the issue with a reason rather than approximated.
+
+**Direct texture-validation observations** (#3891) cover only the retained-pixel and complete
+encoded-prefix branches of the live image cache's exact validation. Each actual helper invocation
+records an attempt, its number of `memcmp` calls, and the sum of their argument extents, including
+the first differing chunk. Extents do not measure physical reads or bandwidth. The original helper
+result and caller's required-prefix check classify accepted-prefix, bytes-differ, expected-missing
+or incomplete-prefix outcomes. A zero-readable prefix never claims the unreached null-expected
+refusal; short equal prefixes still obey the caller's original length requirement. Depth-source
+validation, scratch copying, watch-only refusal and watch/journal shortcuts are outside this scope.
+
+The seven `texture_direct_validation_*` JSONL quantities and the exit observer summary cover
+closed windows after the first-flip baseline, excluding boot and the trailing partial window.
+No attempts and no other quantities means NO DATA; positive work/outcomes without an attempt
+means PARTIAL; an observed attempt can have zero comparison work. Independent relaxed snapshots
+do not form a coherent outcome partition or certify guest quiescence. This adds no alarm threshold
+and leaves `texture-validation-churn`, F8 populations and all cache/watch admission policy intact.
 
 **Surface readback separates attempt volume from duration** (#3891, #3948). Its detail appends
 `attempts/flip` beside the existing mean time per attempt. The outermost readback scope includes

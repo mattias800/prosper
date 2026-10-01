@@ -25,6 +25,10 @@ reference binding sites.
   external destructor dependencies. GPU upload owners remain retained through completion;
   storage-image writebacks run inline after the wait on the binding thread.
 - `guest_reads.hpp` — `safe_span` / `safe_copy` / `safe_equal`, the bounds-checked guest reads.
+  `safe_equal` optionally returns observations of its existing comparison calls. Its legacy matched
+  prefix and equality result remain the cache authority; comparison argument extents include a
+  differing chunk and are not physical read counts. Only the two direct image-validation branches
+  publish this observation; depth/scratch validation and watch shortcuts keep their existing scope.
 - `draw_resources.{hpp,cpp}` — `build_draw_frame_resources`: one draw's VS/PS resource tables to
   backend frame resources. Formerly the `build_R` lambda. It resolves buffer bindings and owns the
   per-resource loop, successful census/timing/emplace tail and first-rejection accounting.

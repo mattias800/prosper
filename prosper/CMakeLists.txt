@@ -1425,6 +1425,15 @@ if(TARGET prosper_core)
   target_include_directories(test_texture_source_snapshot PRIVATE frontends)
   add_test(NAME texture_source_snapshot COMMAND test_texture_source_snapshot)
 
+  # Actual tracked mappings and direct comparison/window observations; no Vulkan device.
+  add_executable(test_texture_direct_validation frontends/shared/tests/test_texture_direct_validation.cpp)
+  target_include_directories(test_texture_direct_validation PRIVATE frontends)
+  target_link_libraries(test_texture_direct_validation PRIVATE prosper_core)
+  add_test(NAME texture_direct_validation COMMAND test_texture_direct_validation texture-direct-validation.jsonl)
+  add_test(NAME texture_direct_validation_disabled COMMAND test_texture_direct_validation texture-direct-validation-disabled.jsonl)
+  set_tests_properties(texture_direct_validation_disabled PROPERTIES
+    ENVIRONMENT "PROSPER_NO_PERF_ALARMS=1")
+
   add_executable(test_texture_validation_census frontends/shared/tests/test_texture_validation_census.cpp)
   target_include_directories(test_texture_validation_census PRIVATE frontends)
   add_test(NAME texture_validation_census COMMAND test_texture_validation_census)
@@ -4821,7 +4830,16 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
     ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0"
     TIMEOUT 120)
   add_test(NAME render_texture_snapshot_capture COMMAND test_render_buffer_capture --source-snapshot)
+  add_test(NAME render_texture_direct_validation COMMAND test_render_buffer_capture --direct-validation)
+  add_test(NAME render_texture_direct_validation_scratch COMMAND test_render_buffer_capture --direct-validation)
+  set_tests_properties(render_texture_direct_validation PROPERTIES
+    ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256;PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096;PROSPER_TEXTURE_WRITE_WATCH_MIN_KB=1024;PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE=1" TIMEOUT 120)
+  set_tests_properties(render_texture_direct_validation_scratch PROPERTIES
+    ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=256;PROSPER_BACKEND_BUFFER_RESIDENCY_OWNERS=4096;PROSPER_TEXTURE_WRITE_WATCH_MIN_KB=1024;PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE=1;PROSPER_TEXTURE_VALIDATION_SCRATCH_COPY=1" TIMEOUT 120)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME render_texture_direct_validation_watch COMMAND test_render_buffer_capture --direct-validation-watch)
+    set_tests_properties(render_texture_direct_validation_watch PROPERTIES
+      ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_BACKEND_BUFFER_RESIDENCY_MB=0;PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE=1" TIMEOUT 120)
     add_test(NAME render_small_texture_watch COMMAND test_render_buffer_capture --small-watch)
     add_test(NAME render_small_texture_watch_zero_hits COMMAND test_render_buffer_capture --small-watch)
     add_test(NAME render_small_texture_watch_unsupported COMMAND test_render_buffer_capture --small-watch-unsupported)

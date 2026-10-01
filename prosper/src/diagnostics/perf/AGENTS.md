@@ -27,3 +27,10 @@ Unplumbed vertex guest wave width is deliberately not inferred from the translat
 default; its failures remain covered by `dropped-draws`. The known-width scope does not mean all
 Wave64 gaps have been implemented or detected. Capture re-realization suppression applies to
 both observations and refusals; deliberate compute selectors decline before the backend hook.
+
+`texture-direct-validation` is an observer without a new alarm threshold. Its seven counters cover
+only actual retained-pixel/complete-encoded-prefix comparison invocations at the live image site;
+`memcmp` argument extents include the first differing chunk but do not measure physical traffic.
+Completed-window JSONL/exit reporting excludes boot and trailing partial data. Native mapped-source
+checks establish helper/ledger/window behavior; live cold/changed/warm, scratch and write-watch
+checks separately constrain the caller's publication scope and unchanged pixels/cache policy.

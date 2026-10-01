@@ -2176,15 +2176,18 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                               ? RenderClock::now() : RenderClock::time_point{};
                           bool matches = false;
                           size_t validated_bytes = 0;
+                          GuestSourceComparisonObservation direct_comparison;
+                          bool direct_validation = false;
                           if (cached->second.depth_cube_source.active) {
                               matches = equal_depth_cube_source(depth_cube_source_layout,
                                   cached->second.depth_cube_source, cached->second.source_prefix,
                                   safe_span, safe_equal, validated_bytes);
                           } else if (cached->second.source_matches_pixels) {
+                              direct_validation = true;
                               matches = safe_equal(
                                   cached->second.pixels ? cached->second.pixels->data() : nullptr,
                                   persistent_source_addr,
-                                  persistent_source_size, validated_bytes) &&
+                                  persistent_source_size, validated_bytes, &direct_comparison) &&
                                   validated_bytes == cached->second.source_prefix_size;
                           } else if (!PROSPER_ENV_VALUE("PROSPER_TEXTURE_VALIDATION_SCRATCH_COPY") &&
                                      cached->second.source_prefix.size() ==
@@ -2194,9 +2197,10 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                               // working set into a scratch buffer before memcmp doubled the
                               // validation traffic on every Evergate frame. safe_equal keeps
                               // the same sparse-page/readability guards and exact byte check.
+                              direct_validation = true;
                               matches = safe_equal(
                                   cached->second.source_prefix.data(), persistent_source_addr,
-                                  persistent_source_size, validated_bytes) &&
+                                  persistent_source_size, validated_bytes, &direct_comparison) &&
                                   validated_bytes == persistent_source_size;
                           } else {
                               persistent_validation_scratch.resize(persistent_source_size);
@@ -2209,6 +2213,12 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                                   (validated_bytes == 0 || !std::memcmp(
                                       persistent_validation_scratch.data(),
                                       cached->second.source_prefix.data(), validated_bytes));
+                          }
+                          if (direct_validation) {
+                              prosper::diagnostics::perf::note_texture_direct_validation(matches,
+                                  direct_comparison.outcome == GuestSourceComparisonOutcome::BytesDiffer,
+                                  direct_comparison.outcome == GuestSourceComparisonOutcome::ExpectedMissing,
+                                  direct_comparison.memcmp_calls, direct_comparison.memcmp_extent_bytes);
                           }
                           resource_texture_validated_bytes += validated_bytes;
                           if (timing_enabled) {

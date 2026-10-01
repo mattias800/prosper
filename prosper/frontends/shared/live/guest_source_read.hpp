@@ -49,22 +49,49 @@ size_t copy_guest_source(uint8_t* destination, uint64_t address, size_t bytes,
     return readable;
 }
 
+// Optional observations of the existing comparison, never an equality/admission authority.
+// Extent is the sum of memcmp argument lengths, not physical reads inside its implementation.
+enum class GuestSourceComparisonOutcome : uint8_t {
+    ReadablePrefixEqual, ExpectedMissing, BytesDiffer
+};
+struct GuestSourceComparisonObservation {
+    GuestSourceComparisonOutcome outcome = GuestSourceComparisonOutcome::ReadablePrefixEqual;
+    size_t readable_prefix = 0;
+    size_t memcmp_calls = 0;
+    size_t memcmp_extent_bytes = 0;
+};
+
 // `compared` counts bytes in fully matching chunks, excluding the first differing chunk
 // (at most 64 KiB) and any chunk rejected for a null expected pointer. It is not a count
 // of all comparison reads. A short readable prefix may return true; cache admission must
 // also check `compared` against its required prefix length.
 template <typename HostReadable>
 bool equal_guest_source_prefix(const uint8_t* expected, uint64_t address, size_t bytes,
-                               size_t& compared, HostReadable&& host_readable) {
+                               size_t& compared, HostReadable&& host_readable,
+                               GuestSourceComparisonObservation* observation = nullptr) {
     const size_t readable = guest_source_readable_prefix(
         address, bytes, std::forward<HostReadable>(host_readable));
     compared = 0;
+    if (observation) {
+        *observation = {};
+        observation->readable_prefix = readable;
+    }
     while (compared < readable) {
         const uint64_t current = address + compared;
         const size_t chunk = std::min(readable - compared,
                                       size_t{0x10000} - static_cast<size_t>(current & 0xffff));
-        if (!expected || std::memcmp(expected + compared,
-                                     reinterpret_cast<const void*>(current), chunk)) return false;
+        if (!expected) {
+            if (observation) observation->outcome = GuestSourceComparisonOutcome::ExpectedMissing;
+            return false;
+        }
+        if (observation) {
+            ++observation->memcmp_calls;
+            observation->memcmp_extent_bytes += chunk;
+        }
+        if (std::memcmp(expected + compared, reinterpret_cast<const void*>(current), chunk)) {
+            if (observation) observation->outcome = GuestSourceComparisonOutcome::BytesDiffer;
+            return false;
+        }
         compared += chunk;
     }
     return true;

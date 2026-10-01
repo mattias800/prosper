@@ -202,6 +202,8 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
     ++windows_;
     for (size_t i = 0; i < kWaitRegMemDirectCounterCount; ++i)
         wait_regmem_direct_totals_[i] += w.count(kWaitRegMemDirectCounters[i]);
+    for (size_t i = 0; i < kTextureDirectValidationCounterCount; ++i)
+        texture_direct_validation_totals_[i] += w.count(kTextureDirectValidationCounters[i]);
     std::vector<AlarmFiring> fired;
     for (auto& [name, state] : rules_) {
         if (rule_has_data(name, w)) ++state.windows_with_data;
@@ -413,6 +415,24 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
                          (unsigned long long)counts[4], (unsigned long long)counts[5]);
             json_string(jsonl_, wait_regmem_direct_data_status(counts));
         }
+        {
+            uint64_t counts[kTextureDirectValidationCounterCount];
+            for (size_t i = 0; i < kTextureDirectValidationCounterCount; ++i)
+                counts[i] = w.count(kTextureDirectValidationCounters[i]);
+            std::fprintf(jsonl_, ",\"texture_direct_validation_attempts\":%llu,"
+                         "\"texture_direct_validation_memcmp_calls\":%llu,"
+                         "\"texture_direct_validation_memcmp_extent_bytes\":%llu,"
+                         "\"texture_direct_validation_accepted_prefix\":%llu,"
+                         "\"texture_direct_validation_bytes_differ\":%llu,"
+                         "\"texture_direct_validation_expected_missing\":%llu,"
+                         "\"texture_direct_validation_incomplete_prefix\":%llu,"
+                         "\"texture_direct_validation_data\":",
+                         (unsigned long long)counts[0], (unsigned long long)counts[1],
+                         (unsigned long long)counts[2], (unsigned long long)counts[3],
+                         (unsigned long long)counts[4], (unsigned long long)counts[5],
+                         (unsigned long long)counts[6]);
+            json_string(jsonl_, texture_direct_validation_data_status(counts));
+        }
         // 2026-09-29 queue: compute destination refusals (MiB by reason), the colour-target
         // cache's bounds and window peaks, and the exact full-overwrite shape census.
         std::fprintf(jsonl_, ",\"rtt_destination_refusals\":%llu,"
@@ -486,6 +506,20 @@ bool AlarmEngine::write_summary(FILE* out) const {
                  (unsigned long long)wait_regmem_direct_totals_[3],
                  (unsigned long long)wait_regmem_direct_totals_[4],
                  (unsigned long long)wait_regmem_direct_totals_[5]);
+    // Direct comparison argument extents are observations, not physical bandwidth or an alarm.
+    std::fprintf(out, "[perf-alarm] summary observer=texture-direct-validation "
+                 "completed-windows=%llu snapshot=relaxed data=%s attempts=%llu "
+                 "memcmp-calls=%llu memcmp-extent-bytes=%llu accepted-prefix=%llu "
+                 "bytes-differ=%llu expected-missing=%llu incomplete-prefix=%llu\n",
+                 (unsigned long long)windows_,
+                 texture_direct_validation_data_status(texture_direct_validation_totals_),
+                 (unsigned long long)texture_direct_validation_totals_[0],
+                 (unsigned long long)texture_direct_validation_totals_[1],
+                 (unsigned long long)texture_direct_validation_totals_[2],
+                 (unsigned long long)texture_direct_validation_totals_[3],
+                 (unsigned long long)texture_direct_validation_totals_[4],
+                 (unsigned long long)texture_direct_validation_totals_[5],
+                 (unsigned long long)texture_direct_validation_totals_[6]);
     // Not a rule: the exact full-overwrite shape census over the run (to the last window close),
     // and the destination refusals behind it -- the funnel a compute result takes to reach the
     // renderer's device image, printed whether or not anything fired.

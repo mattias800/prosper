@@ -117,6 +117,7 @@ private:
     // Sum of closed-window deltas, excluding the boot baseline and trailing partial window.
     // Each input is an independent relaxed snapshot; these are not a coherent partition.
     uint64_t wait_regmem_direct_totals_[kWaitRegMemDirectCounterCount] = {};
+    uint64_t texture_direct_validation_totals_[kTextureDirectValidationCounterCount] = {};
     uint64_t prev_cost_ns_[kCostCount] = {};
     uint64_t prev_cost_events_[kCostCount] = {};
     uint64_t prev_counters_[kCounterCount] = {};
