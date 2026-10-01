@@ -3917,10 +3917,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             // Float source modifiers (abs then neg — hardware order), set only on FLOAT compares by the
             // assembler (VOP3-encoded e64 or SDWA forms; e.g. DOLL's `v_cmp_gt_f32_sdwa vcc, |v5|, s4`).
-            if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
-            if (in.src_neg[0]) a = b.fneg(a);
-            if (in.src_abs[1]) c = b.fext1(Glsl_FAbs, c);
-            if (in.src_neg[1]) c = b.fneg(c);
+            const bool guest_compare_fact = ok && !is_cmpx && !rs.exec_narrowed && !in.clamp &&
+                !in.has_dpp && (!in.has_sdwa ||
+                    (in.sdwa_src0_sel == 6 && in.sdwa_src1_sel == 6 &&
+                     !in.sdwa_src0_sext && !in.sdwa_src1_sext));
+            uint32_t magnitude_cmp = 0, magnitude_word = 0;
+            if (guest_compare_fact && !in.src_neg[0] && !in.src_neg[1]) {
+                if (eff == 0x03 && in.src_abs[0] && !in.src_abs[1]) {
+                    magnitude_cmp = b.f32_abs_normal_le_bits(ra, rc);
+                    magnitude_word = ra;
+                } else if (eff == 0x06 && !in.src_abs[0] && in.src_abs[1]) {
+                    // K >= ABS(U) is the same ordered relation with swapped operands.
+                    magnitude_cmp = b.f32_abs_normal_le_bits(rc, ra);
+                    magnitude_word = rc;
+                }
+            }
+            if (!magnitude_cmp) {
+                if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
+                if (in.src_neg[0]) a = b.fneg(a);
+                if (in.src_abs[1]) c = b.fext1(Glsl_FAbs, c);
+                if (in.src_neg[1]) c = b.fneg(c);
+            }
             // v_cmpx_* shares each type's compare set at base+0x10. On gfx10 it writes EXEC only,
             // preserving VCC. Map to the base compare, then narrow; vopc_is_cmpx covers the f32/f64,
             // i32/i64, and u32/u64 windows.
@@ -3970,10 +3987,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x00: cmp = b.bfalse(); break;                              // v_cmp_f_f32
                 case 0x01: cmp = b.fcmp(Op_FOrdLessThan, a, c); break;         // v_cmp_lt_f32
                 case 0x02: cmp = b.fcmp(Op_FOrdEqual, a, c); break;            // v_cmp_eq_f32
-                case 0x03: cmp = b.fcmp(Op_FOrdLessThanEqual, a, c); break;    // v_cmp_le_f32
+                case 0x03: cmp = magnitude_cmp ? magnitude_cmp :
+                    b.fcmp(Op_FOrdLessThanEqual, a, c); break;               // v_cmp_le_f32
                 case 0x04: cmp = b.fcmp(Op_FOrdGreaterThan, a, c); break;      // v_cmp_gt_f32
                 case 0x05: cmp = b.fcmp(Op_FOrdNotEqual, a, c); break;         // v_cmp_lg_f32
-                case 0x06: cmp = b.fcmp(Op_FOrdGreaterThanEqual, a, c); break; // v_cmp_ge_f32
+                case 0x06: cmp = magnitude_cmp ? magnitude_cmp :
+                    b.fcmp(Op_FOrdGreaterThanEqual, a, c); break;            // v_cmp_ge_f32
                 case 0x07: {                                                    // v_cmp_o_f32
                     const uint32_t a_ordered = b.fcmp(Op_FOrdEqual, a, a);
                     const uint32_t c_ordered = b.fcmp(Op_FOrdEqual, c, c);
@@ -4146,6 +4165,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // instead of VCC — track it in sreg_bool so a later v_cndmask_b32_e64 / s_cselect can read it.
             // Otherwise it writes VCC; keep VCC's narrowed-state in sync (106/107 = VCC_LO/HI).
             if (ok) {
+                if (magnitude_cmp && cmp == magnitude_cmp)
+                    b.guest_f32_abs_normal_le_words.emplace(cmp, magnitude_word);
+                if (guest_compare_fact && eff == 0x02 &&
+                    !in.src_abs[0] && !in.src_abs[1] && !in.src_neg[0] && !in.src_neg[1]) {
+                    uint32_t zero_bits = 0;
+                    if (b.uconst_literal(ra, &zero_bits) && (zero_bits & 0x7fffffffu) == 0)
+                        b.guest_f32_zero_equal_words.emplace(cmp, rc);
+                    else if (b.uconst_literal(rc, &zero_bits) && (zero_bits & 0x7fffffffu) == 0)
+                        b.guest_f32_zero_equal_words.emplace(cmp, ra);
+                }
                 if (is_cmpx) {
                     // v_cmpx writes EXEC ONLY on gfx10 (EXEC &= cmp) — it has NO VCC/SGPR destination.
                     // The old shared handler fell into the `else` and set vcc = cmp for cmpx too,
