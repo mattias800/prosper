@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <vector>
 #include "fixtures/test_scratch.h"
 
 using namespace prosper;
@@ -93,6 +94,127 @@ int main() {
             entries = 99;
             CHECK(get_ids(1, 0, 0, (uint64_t)(uintptr_t)&entries, 0, 0) == 0 && entries == 0,
                   "GetChunkId does not apply the non-IoStore fallback to a partial IoStore dump");
+        }
+        fs::remove_all(app0, ec);
+    }
+
+    // PS5's local PlayGo declaration is authoritative for chunk identifiers, including titles
+    // whose payload files do not use Unreal's pakchunk convention (#4030). These are synthetic
+    // metadata bytes, not a game manifest; only the fixed inventory header and table are needed.
+    {
+        namespace fs = std::filesystem;
+        const fs::path app0 = prosper_test::test_scratch_dir() /
+            ("prosper-playgo-manifest-" + std::to_string((uintptr_t)&fails));
+        std::error_code ec;
+        fs::remove_all(app0, ec);
+        fs::create_directories(app0 / "sce_sys", ec);
+        set_app0_root(app0.string());
+        const fs::path manifest_path = app0 / "sce_sys" / "playgo-chunk.dat";
+        HleFn init = Hle::lookup(nid_hash("scePlayGoInitialize"));
+        HleFn get_ids = Hle::lookup(nid_hash("scePlayGoGetChunkId"));
+        HleFn get_locus = Hle::lookup(nid_hash("scePlayGoGetLocus"));
+        HleFn get_progress = Hle::lookup(nid_hash("scePlayGoGetProgress"));
+        CHECK(init && get_ids && get_locus && get_progress, "PlayGo inventory queries registered");
+        if (init && get_ids && get_locus && get_progress) {
+            auto put16 = [](std::vector<uint8_t>& bytes, size_t at, uint16_t value) {
+                for (size_t i = 0; i < 2; ++i) bytes[at + i] = (uint8_t)(value >> (8 * i));
+            };
+            auto put32 = [](std::vector<uint8_t>& bytes, size_t at, uint32_t value) {
+                for (size_t i = 0; i < 4; ++i) bytes[at + i] = (uint8_t)(value >> (8 * i));
+            };
+            auto make_manifest = [&](uint16_t count) {
+                std::vector<uint8_t> bytes(0x100 + (size_t)count * 0x20, 0);
+                std::memcpy(bytes.data(), "plgx", 4);
+                put32(bytes, 0x04, 0x1000);
+                put16(bytes, 0x0a, count);
+                put32(bytes, 0x10, (uint32_t)bytes.size());
+                put32(bytes, 0xc0, 0x100);
+                put32(bytes, 0xc4, (uint32_t)count * 0x20);
+                return bytes;
+            };
+            auto write_manifest = [&](const std::vector<uint8_t>& bytes) {
+                std::ofstream out(manifest_path, std::ios::binary | std::ios::trunc);
+                out.write((const char*)bytes.data(), (std::streamsize)bytes.size());
+                CHECK(out.good(), "synthetic PlayGo metadata written");
+            };
+            auto count_chunks = [&]() {
+                init(0, 0, 0, 0, 0, 0);
+                uint32_t count = 99;
+                CHECK(get_ids(1, 0, 0, (uint64_t)(uintptr_t)&count, 0, 0) == 0,
+                      "PlayGo count query succeeds");
+                return count;
+            };
+
+            // An unrelated filename-derived chunk must not widen an explicit declaration.
+            fs::create_directories(app0 / "Content" / "Paks", ec);
+            std::ofstream(app0 / "Content" / "Paks" / "pakchunk7-ps5.utoc").put('\1');
+            std::ofstream(app0 / "Content" / "Paks" / "pakchunk7-ps5.ucas").put('\1');
+            write_manifest(make_manifest(3));
+            CHECK(count_chunks() == 3, "manifest supplies exactly its three chunk identifiers");
+            uint16_t ids[4] = {99, 99, 99, 99};
+            uint32_t entries = 99;
+            CHECK(get_ids(1, (uint64_t)(uintptr_t)ids, 4, (uint64_t)(uintptr_t)&entries, 0, 0) == 0 &&
+                      entries == 3 && ids[0] == 0 && ids[1] == 1 && ids[2] == 2 && ids[3] == 99,
+                  "manifest IDs are ordinals and enumeration stays within the declared set");
+            const uint16_t present = 2;
+            int8_t locus = -1;
+            CHECK(get_locus(1, (uint64_t)(uintptr_t)&present, 1, (uint64_t)(uintptr_t)&locus, 0, 0) == 0 &&
+                      locus == 3,
+                  "GetLocus accepts a declared nonzero chunk under existing local-installation policy");
+            uint64_t progress[2] = {};
+            CHECK(get_progress(1, (uint64_t)(uintptr_t)&present, 1,
+                               (uint64_t)(uintptr_t)progress, 0, 0) == 0 &&
+                      progress[0] != 0 && progress[0] == progress[1],
+                  "GetProgress uses the same declared inventory without changing its size policy");
+            const uint16_t absent = 3;
+            CHECK(get_locus(1, (uint64_t)(uintptr_t)&absent, 1, (uint64_t)(uintptr_t)&locus, 0, 0) ==
+                      0x80B2000Cull && locus == 0,
+                  "a manifest does not blanket-accept undeclared chunk IDs");
+
+            write_manifest(make_manifest(1));
+            CHECK(count_chunks() == 1, "changing the declared count changes the inventory");
+            write_manifest(make_manifest(0));
+            CHECK(count_chunks() == 0, "an empty declaration does not invent chunk zero");
+
+            auto invalid = make_manifest(3);
+            invalid[0] = 'x';
+            write_manifest(invalid);
+            CHECK(count_chunks() == 0, "bad magic cannot fall back to filename-derived IDs");
+            invalid = make_manifest(3);
+            put32(invalid, 4, 0x2000);
+            write_manifest(invalid);
+            CHECK(count_chunks() == 0, "an unsupported manifest version does not invent IDs");
+            invalid = make_manifest(3);
+            invalid.resize(0xff);
+            write_manifest(invalid);
+            CHECK(count_chunks() == 0, "a truncated fixed header is rejected");
+            invalid = make_manifest(3);
+            invalid.pop_back();
+            write_manifest(invalid);
+            CHECK(count_chunks() == 0, "a declared table beyond the actual file is rejected");
+            invalid = make_manifest(3);
+            put32(invalid, 0x10, 0x100);
+            write_manifest(invalid);
+            CHECK(count_chunks() == 0, "the table must fit the declared extent even if trailing bytes exist");
+            invalid = make_manifest(3);
+            put32(invalid, 0xc4, 0x5f);
+            write_manifest(invalid);
+            CHECK(count_chunks() == 0, "table length must contain every declared 32-byte record");
+            invalid = make_manifest(3);
+            put32(invalid, 0xc0, 0xfffffff0);
+            write_manifest(invalid);
+            CHECK(count_chunks() == 0, "large table offsets cannot wrap the bounds check");
+            invalid = make_manifest(3);
+            put32(invalid, 0xc0, 0xe0);
+            write_manifest(invalid);
+            CHECK(count_chunks() == 0, "the chunk table cannot overlap the header");
+            fs::remove(manifest_path, ec);
+            fs::create_directory(manifest_path, ec);
+            CHECK(count_chunks() == 0, "a non-file manifest cannot trigger a fallback inventory");
+            fs::remove(manifest_path, ec);
+            CHECK(count_chunks() == 1, "absent manifest retains paired-IoStore discovery");
+            fs::remove_all(app0 / "Content", ec);
+            CHECK(count_chunks() == 1, "absent non-IoStore manifest retains chunk-zero fallback");
         }
         fs::remove_all(app0, ec);
     }
