@@ -8,13 +8,104 @@ Read the repository-root `CLAUDE.md` before this document. `CLAUDE.md` remains a
 verification, evidence, review, privacy, and release policy. This document explains how to apply those rules when
 several game agents work at once.
 
-The checkpoint below was refreshed **2026-08-10**. The named Lane A–F allocation and Wave 1/2 sections remain
+The current title-wave checkpoint was refreshed **2026-10-01**. The named Lane A–F allocation and Wave 1/2 sections remain
 dated historical records; they retain valuable falsifications and apparatus lessons, but their ownership and
 "next assignment" text is not live. Update the checkpoint whenever an investigation materially moves, a PR merges,
 or ownership changes. Do not let this document replace issue comments: issues are the durable evidence log, while
 this document is the map that helps the next orchestrator find and interpret that evidence.
 
 ## Current checkpoint
+
+- Integration base: `361336513e6a6aaab68140c26aa6b14ac4b2e03e` on `main`.
+- Current wave: *Wolverine*, *007 First Light*, *Onimusha: Way of the Sword*, *Hades II*, and
+  *Silent Hill 2*. The user's acceptance target is: **"all games are at title screen with correct
+  visual rendering."** Each title retains a dedicated investigation owner; bounded work rotates
+  through the available worker slots. The orchestrator reviews and merges their PRs, coordinates
+  shared defects, and owns integration cleanup. The separate performance investigation continues
+  under its own acceptance criteria; the September speed target below is historical context for
+  that work, not an additional acceptance condition for this title wave.
+- First-launch records and direct frontend captures landed in [#4026](https://github.com/mattias800/prosper/pull/4026).
+  *The Messenger* worked as the interactive control. *Silent Hill 2* rendered its warning and
+  accepted the user's navigation to New Game, but title-background correctness was not captured.
+  Its later GPU timeout is [#4025](https://github.com/mattias800/prosper/issues/4025). The other four
+  titles have no verified visible frame. Do not promote a milestone from submitted draws, scanout
+  publication, or a diagnostic that changes guest state.
+- The capture-test header repair landed in [#4037](https://github.com/mattias800/prosper/pull/4037).
+  All app platform builds, Linux core tests and capture tests passed. The admin merge recorded
+  unrelated Windows scanner failures [#4040](https://github.com/mattias800/prosper/issues/4040)
+  and macOS scanner/timing failures [#4043](https://github.com/mattias800/prosper/issues/4043);
+  it was not a fully green matrix.
+
+| Title / owner | Tracker | Merged shared fix | Observed next frontier |
+| --- | --- | --- | --- |
+| Wolverine / Wolverine lane | [#4019](https://github.com/mattias800/prosper/issues/4019) | [#4047](https://github.com/mattias800/prosper/pull/4047): PollSema EBUSY, fixing #1640 | Guest leaves the empty-semaphore drain and publishes scanouts; frontend setup has no `window up` evidence. Obtain a deep host-main stack and a host window query while alive, then investigate shader refusals in #4036. |
+| 007 First Light / 007 lane | [#4021](https://github.com/mattias800/prosper/issues/4021) | [#4035](https://github.com/mattias800/prosper/pull/4035): local PlayGo manifest inventory, fixing #4030 | PlayGo assertion clears, then APR worker writes through a null sentinel. #4044 needs watchpoint attribution; #4042 separately records GetId's ignored u32 output. |
+| Onimusha: Way of the Sword / Onimusha lane | [#4022](https://github.com/mattias800/prosper/issues/4022) | [#4046](https://github.com/mattias800/prosper/pull/4046): bounded automatic-map placement, fixing #4032 | The normal preferred-base launch clears the fixed-arena collision and faults on a zero handle forwarded to host `pthread_join` (#4033). The exact app call site is verified; no visible frame or title was reached. |
+| Hades II / Hades lane | [#4023](https://github.com/mattias800/prosper/issues/4023) | [#4034](https://github.com/mattias800/prosper/pull/4034): available CPU mask, fixing #4027 | Worker allocation clears. A valid constructor probe finds a zero source descriptor from zero width/height, followed by a zero-sized allocation and null owner (#4031). Trace the upstream dimensions before choosing a fix. |
+| Silent Hill 2 / Silent Hill lane | [#4024](https://github.com/mattias800/prosper/issues/4024) | No game patch yet | The normal fresh-save rerun renders setup through settings-saved Continue, then retains that image while host presents advance. Title correctness remains unverified. Obtain a timer-triggered pass/resource capture before attributing a missing scene to one shader. |
+
+All four shared fixes are merged after exact-head author verification, independent registered
+review and green non-Windows/macOS CI. The maintainer explicitly excludes Windows and macOS
+from this wave's merge gate; their failures remain recorded rather than described as passing.
+Current-head focused checks passed: Hades four, PlayGo one, placement five and semaphore four.
+The placement runner's final summary parser failed after all five tests passed; its recovered
+evidence preserves the original command logs and does not repeat those tests. Runtime observations
+below belong to each recorded source-pinned binary, not a newly built combined-main app.
+None of these fixes establishes correct title rendering.
+
+The subsequent [Silent Hill rerun](https://github.com/mattias800/prosper/issues/4024#issuecomment-5939095958)
+used the retained `c8c24d44` app for 300.7 seconds, accepted seven ordinary Cross presses, and
+captured seven distinct setup screens. The last four client captures are pixel-identical at the
+settings-saved screen, including the overlay's 494-frame count, while the log reaches 971 host
+presents. This is an observation of retained output, not proof that guest progression stopped.
+No title was verified and no device loss appeared. The F9 attempt produced neither a grab log nor
+an artifact, so it is an invalid capture instrument. The retained 138 raw shader files map every
+logged refusal to bytes, but no pass/resource capture attributes one of them to the missing title.
+
+### Shared ownership and the next measurements
+
+The PlayGo inventory owner is the 007 lane; Wolverine should inherit that implementation rather
+than duplicate it. CPU-mask and semaphore changes touch separate contracts in the kernel file and
+are integrated sequentially. The Onimusha lane owns automatic placement; APR command-buffer
+bookkeeping is the 007 lane's separate memory/filesystem subject. Reconcile with the integrated
+placement patch before editing that shared file. Hades and Onimusha both import unresolved query
+`NH6xARDOVv8`, but a shared import alone does not establish one blocker. No fix is assigned without
+a runtime discriminator.
+
+Build/test sequences and live measurements share an exclusive scheduling wrapper with the
+performance lane. Wrap the **whole** configure/build/test sequence, or the whole bounded app run,
+in the agreed canonical lock; enqueue only after an explicit orchestrator grant. A waiting wrapper
+can acquire the lock immediately, and terminating it does not prove its distrobox children stopped.
+Release a slot only after checking and draining the exact owned app/compiler/launcher identities.
+Freeze shared-main merges for an agreed pinned measurement interval, with explicit launch and
+drain handoffs so preparation does not indefinitely starve another lane.
+
+The corrected Hades probe completed with nine constructor/allocation observations and eight
+layout returns. Earlier nonzero allocations succeeded; the failing path requests size and
+alignment zero after copying a zero descriptor. Its upstream dimension producer remains
+unproven. The first corrected hardware-probe setup supersedes the earlier unarmed GDB attempt,
+which remains invalid evidence.
+
+007's first sentinel-watch run stopped before a target hit with `SIGXFSZ`. Its process-wide
+32 MiB file limit also constrains emulator memory files; the log was only 3,702 bytes. The
+exact syscall was not captured. This is an invalid instrument, not a guest crash or evidence
+against the proposed writer. Prepare a bounded log sink without limiting guest memory backing
+before retrying. Onimusha's normal
+preferred-base run completed the fixed batch map and then confirmed the separate null-handle
+join fault. Both app identities were reaped; neither run produced a visual milestone.
+
+The next work is Hades' upstream dimension producer, 007's corrected sentinel-writer watch,
+Onimusha's generic null-join error contract, and Wolverine's frontend/shader capture, after the
+performance lane's agreed reservation. Silent Hill needs a working timer-triggered capture
+of the retained-output frontier on a fresh app carrying the realized-wave-width metadata. Runs
+use the normal app,
+full rendering cadence and native resolution, fresh save/config roots, audio and input. On this host
+X11 is the recorded window-visibility workaround (#4018). Run window tools on the host and apply
+instrument trap 37 before interpreting injected function keys; a timer capture avoids that path.
+Recheck The Messenger after shared kernel/memory fixes integrate. Correct title acceptance requires
+inspection of the direct frontend image and its actual background, not just a warning or menu text.
+
+## Historical August/September checkpoint
 
 - Repository: `mattias800/prosper` (renamed from `mattias800/ps5ys`).
 - Remote branch: `main`.
@@ -51,9 +142,9 @@ this document is the map that helps the next orchestrator find and interpret tha
   comparison evidence. The latter removes a cache-wide census identified in sampled user CPU;
   it does not change texture validation or establish an FPS gain.
 
-### The standing objective, in the user's words
+### The September objective, in the user's words
 
-**2026-09-05, most recent:** *"the goal here is to test games, and get them to title screen with
+**2026-09-05:** *"the goal here is to test games, and get them to title screen with
 correct visuals and at least 50% of full PS5 speed. prioritize mid tier games first, where progress is
 most likely."* — so **speed is now half the bar**, and it is the half that had no owner before that
 night: every title measured so far sits an order of magnitude below it (*Syberia* ~1.9 fps,

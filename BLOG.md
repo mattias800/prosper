@@ -21,6 +21,18 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-01
 
+### Silent Hill 2 renders its first-boot setup
+
+A fresh Linux `prosper-app` run renders the warnings and setup screens through “settings saved,” then keeps displaying that screen; correct title rendering remains unverified ([tracker update](https://github.com/mattias800/prosper/issues/4024#issuecomment-5939095958)). The gamma page shows the game's supplied preview images, not rendered gameplay; all captures include the frontend FPS and alarm overlay.
+
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-seizure-warning-2026-10-01.webp" alt="Silent Hill 2 — seizure warning on the fresh normal Linux prosper-app route"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-content-warning-2026-10-01.webp" alt="Silent Hill 2 — content warning and its ordinary continue prompt"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-language-2026-10-01.webp" alt="Silent Hill 2 — first-boot text and audio language settings"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-graphics-priority-2026-10-01.webp" alt="Silent Hill 2 — first-boot graphics priority at the unchanged Quality default"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-gamma-preview-2026-10-01.webp" alt="Silent Hill 2 — gamma setup with the game's supplied preview images, not a gameplay capture"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-settings-summary-2026-10-01.webp" alt="Silent Hill 2 — first-boot settings summary before continuing"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-settings-saved-2026-10-01.webp" alt="Silent Hill 2 — settings-saved Continue screen, retained in four later client-window captures"></p>
+
 ### Silent Hill 2 gets through its warning and menus
 
 The first Linux `prosper-app` run rendered the warning screen, and manual input reached New Game; the early black capture came before the warning, while slow rendering and a later GPU hang still block a gameplay claim ([tracker #4024](https://github.com/mattias800/prosper/issues/4024)).

@@ -85,7 +85,7 @@ Last updated: 2026-10-01
 | *007 First Light* | `PPSA11386` | — | 🔬 Rung 0 — main guest thread faults at a null address during startup, before the first frame | [#4021](https://github.com/mattias800/prosper/issues/4021) |
 | *Onimusha: Way of the Sword* | `PPSA27836` | — | 🔬 Rung 0 — direct-memory batch mapping fails, then the main guest thread faults at address `0x10`; no frame is presented | [#4022](https://github.com/mattias800/prosper/issues/4022) |
 | *Hades II* | `PPSA36082` | — | 🔬 Rung 0 — startup requests an approximately 32 GiB guest allocation, which is rejected; the main guest thread then faults at a null address, before any frame | [#4023](https://github.com/mattias800/prosper/issues/4023) |
-| *SILENT HILL 2* | `PPSA08709` | Unreal Engine | 🚧 Rung 2 — warning and menus render; the owner manually selected New Game. The next sequence is unclassified, recognizable gameplay is unverified, and a GPU timeout ends the run ([#4025](https://github.com/mattias800/prosper/issues/4025)) | [#4024](https://github.com/mattias800/prosper/issues/4024) |
+| *SILENT HILL 2* | `PPSA08709` | Unreal Engine | 🚧 Rung 2 — the owner previously selected New Game. A fresh normal rerun renders first-boot setup through settings-saved Continue, then retains that image while host presents advance; correct title-background rendering remains unverified. The earlier later-sequence GPU timeout is separate ([#4025](https://github.com/mattias800/prosper/issues/4025)) | [#4024](https://github.com/mattias800/prosper/issues/4024) |
 
 ## At a glance
 
@@ -824,6 +824,24 @@ Performance counters and the scope of the image-asset check are in the
 [tracker](https://github.com/mattias800/prosper/issues/4024); the hang is tracked separately in
 [#4025](https://github.com/mattias800/prosper/issues/4025). No deterministic input route, hardware
 oracle or snapshot guard is claimed.
+
+#### Fresh-save setup capture
+
+A subsequent normal Linux `prosper-app` run at `c8c24d44c54795b049bbcf07336a4a38c8ed1986`
+renders seven distinct warning/setup screens with unchanged defaults. These direct client-window
+captures retain the frontend FPS/alarm overlay; the gamma page's supplied preview images are not
+gameplay evidence. After settings-saved Continue, four client captures are pixel-identical while
+host presents continue. No correct title screen was verified, and this bounded run did not reproduce
+the earlier device loss. Input, binary identity, shader inventory and the failed F9 attempt are
+recorded in the [tracker update](https://github.com/mattias800/prosper/issues/4024#issuecomment-5939095958).
+
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-seizure-warning-2026-10-01.webp" alt="Silent Hill 2 — fresh-save seizure warning in Linux prosper-app"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-content-warning-2026-10-01.webp" alt="Silent Hill 2 — content warning and continue prompt"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-language-2026-10-01.webp" alt="Silent Hill 2 — text and audio language setup"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-graphics-priority-2026-10-01.webp" alt="Silent Hill 2 — unchanged Quality graphics priority"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-gamma-preview-2026-10-01.webp" alt="Silent Hill 2 — supplied gamma preview images, not gameplay"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-settings-summary-2026-10-01.webp" alt="Silent Hill 2 — first-boot settings summary"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-setup-settings-saved-2026-10-01.webp" alt="Silent Hill 2 — settings-saved Continue, the retained final image"></p>
 
 ## Reproducible routes
 
