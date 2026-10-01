@@ -12,6 +12,7 @@
 #include "shared/live/live_target_format.hpp"
 #include "replay_output_extent.hpp"
 #include "compute_recompile.hpp"
+#include "fragment_wave_size.hpp"
 #include "realized_shader_dump.hpp"
 #include "pixel_input_linkage.hpp"
 #include "post_compute_resource.hpp"
@@ -51,6 +52,23 @@ bool set_environment(const std::string& name, const std::string& value) {
 #else
     return setenv(name.c_str(), value.c_str(), 1) == 0;
 #endif
+}
+
+bool select_fragment_wave_size(const char* mode,
+                              prosper::tools::ReplayFragmentWaveSelection& selection) {
+    if (!prosper::tools::parse_replay_fragment_wave_size(
+            std::getenv("PROSPER_GPU_REPLAY_FRAGMENT_WAVE_SIZE"), selection)) {
+        std::fprintf(stderr,
+                     "[%s] invalid PROSPER_GPU_REPLAY_FRAGMENT_WAVE_SIZE: expected a complete "
+                     "unsigned 32 or 64 (base-0); refusing fragment regeneration\n", mode);
+        return false;
+    }
+    std::fprintf(stderr,
+                 "[%s] fragment-wave=%u source=%s captured-width=unavailable; "
+                 "requested width is not a captured per-draw ABI\n",
+                 mode, static_cast<uint32_t>(selection.size),
+                 selection.explicit_override ? "override" : "legacy-default");
+    return true;
 }
 
 void usage(const char* argv0) {
@@ -118,6 +136,11 @@ void usage(const char* argv0) {
                  "--recompile-raw and compute --retry-failed-stage. Graphics recompiles bypass\n"
                  "this hook; use --retry-failed-stage-spv for graphics retry output.\n"
                  "A plain replay runs stored SPIR-V and writes nothing for this variable.\n");
+    std::fprintf(stderr,
+                 "\nPROSPER_GPU_REPLAY_FRAGMENT_WAVE_SIZE=32|64 selects the requested fragment\n"
+                 "width for --recompile-raw and PROSPER_FS_TAP only (strict base-0 syntax).\n"
+                 "Unset means the legacy Wave64 default, not captured per-draw width.\n"
+                 "Failed-stage retries instead use their captured fragment ABI when available.\n");
 }
 
 // Targets at or below this many texels get a native-typed dump alongside any image conversion.
@@ -2920,9 +2943,9 @@ int main(int argc, char** argv) {
             return 2;
         }
         auto& draw = replay.items[prosper::tools::raw(index)];
-        const auto interface = prosper::gpu::validate_spirv_descriptor_interface(
+        const auto descriptor_interface = prosper::gpu::validate_spirv_descriptor_interface(
             words, draw.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment, true);
-        if (!interface.ok()) {
+        if (!descriptor_interface.ok()) {
             std::fprintf(stderr, "gpu_replay: fragment override descriptor interface rejected\n");
             return 2;
         }
@@ -3033,6 +3056,10 @@ int main(int argc, char** argv) {
     render_intent.failed_shader_dump = !failed_shader_spec.empty();
     render_intent.retry_failed_chain = !retry_failed_chain_spec.empty();
     render_intent.retry_failed_stage = !retry_failed_stage_spec.empty();
+    prosper::tools::ReplayFragmentWaveSelection raw_fragment_wave;
+    // Validate this diagnostic before Vulkan initialization can obscure a malformed request.
+    if (recompile_raw && capture.format_version >= 36 &&
+        !select_fragment_wave_size("recompile-raw", raw_fragment_wave)) return 2;
     if (recompile_raw && capture.format_version >= 39 &&
         prosper::tools::replay_will_render(render_intent)) {
         prosper::frontend::register_live_renderer(".", false);
@@ -3044,11 +3071,6 @@ int main(int argc, char** argv) {
                      "keeping all stored graphics modules\n",
                      capture.format_version);
     } else if (recompile_raw) {
-        uint32_t fragment_wave_size = 64;
-        if (const char* wave = std::getenv("PROSPER_GPU_REPLAY_FRAGMENT_WAVE_SIZE")) {
-            const unsigned long parsed = std::strtoul(wave, nullptr, 0);
-            if (parsed == 32 || parsed == 64) fragment_wave_size = static_cast<uint32_t>(parsed);
-        }
         const char* tap_env_raw = std::getenv("PROSPER_FS_TAP");
         const std::string tap_env = tap_env_raw ? tap_env_raw : "";
         if (tap_env_raw) clear_environment("PROSPER_FS_TAP");
@@ -3086,7 +3108,7 @@ int main(int argc, char** argv) {
                     requires_geometry = interpolation.requires_geometry;
                     fs = prosper::gpu::recompile_fragment(
                         raw.words.data(), raw.words.size(), it.prt.get(), system_inputs,
-                        UINT32_MAX, &interpolation, fragment_wave_size);
+                        UINT32_MAX, &interpolation, raw_fragment_wave.wave32());
                     if (interpolation.requires_geometry && it.ps.topology >= 3u &&
                         it.ps.topology <= 5u)
                         gs = prosper::gpu::recompile_interpolation_geometry(interpolation);
@@ -3253,11 +3275,8 @@ int main(int argc, char** argv) {
                          capture.format_version);
             return 2;
         }
-        uint32_t fragment_wave_size = 64;
-        if (const char* wave = std::getenv("PROSPER_GPU_REPLAY_FRAGMENT_WAVE_SIZE")) {
-            const unsigned long parsed = std::strtoul(wave, nullptr, 0);
-            if (parsed == 32 || parsed == 64) fragment_wave_size = static_cast<uint32_t>(parsed);
-        }
+        prosper::tools::ReplayFragmentWaveSelection fragment_wave;
+        if (!select_fragment_wave_size("fs-tap", fragment_wave)) return 2;
         uint64_t n = 0;
         uint32_t tap_pc = 0;
         if (!prosper::gpu::parse_fragment_tap_selector(f, n, tap_pc)) {
@@ -3285,7 +3304,7 @@ int main(int argc, char** argv) {
                                                            it.prt.get(),
                                                            it.has_system_inputs ? &it.system_inputs : nullptr,
                                                            UINT32_MAX, &interpolation,
-                                                           fragment_wave_size);
+                                                           fragment_wave.wave32());
                 if (!fs.empty()) {
                     it.set_fs(std::move(fs));
                     std::fprintf(stderr,

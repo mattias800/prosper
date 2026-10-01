@@ -616,16 +616,16 @@ fragment shader's intermediate at instruction `PC` (the same PC `shader_inspect`
 MRT0 colour export to it**, so semantic draw `DRAW`'s pixels in the rendered frame *are* the value visualised. Unlike the
 VS tap it needs no separate capture — the output BMP is the readout. Point `--dump-shader-raw DRAW:fs` +
 `shader_inspect` at the FS to find the PC (an `image_sample`/MIMG result, a UV, a pre-blend colour), then
-`PROSPER_FS_TAP=DRAW:PC`. gpu_replay re-recompiles only that draw's FS (needs a v19+ capsule with the raw FS
+`PROSPER_FS_TAP=DRAW:PC`. gpu_replay re-recompiles only that draw's FS (needs a v36+ capsule with the raw FS
 stream); the rest of the frame renders normally, so read the tapped draw's region.
 
 Precision: the value goes through the colour attachment, so it inherits that target's format — values in [0,1]
 (UVs, colours, factors, alpha) show directly; larger values clamp (8-bit targets) — read them as colour, not
 exact floats. It confirmed GTA V #1163 draw 6 samples the correct artwork texture (so the colour path is fine;
 the defect is the stencil masks). Fragment stage only; tap a straight-line PC (same loop/if caveat as the VS
-tap); inert and byte-identical when the env var is unset. The re-recompile drops system inputs, so a tapped
-value derived from `gl_FragCoord`/sample position reads 0 (visualise fetch/sample/colour intermediates, not
-FragCoord-dependent terms).
+tap); inert and byte-identical when the env var is unset. Regeneration requires v36+ pixel-stage ABI
+state and passes the retained system-input mapping and re-derived interpolation layout to the current
+fragment compiler. This does not recover other missing compilation inputs, including per-draw width.
 
 ## Offline recompiler A/B — `--recompile-raw` (does a recompiler change fix/regress this frame?)
 
@@ -638,13 +638,24 @@ FragCoord-dependent terms).
 
 A capsule stores already-recompiled SPIR-V, so recompiler changes are invisible to a default replay.
 `--recompile-raw` re-recompiles **every** retained raw VS/FS with the current recompiler and substitutes the
-results — any v19+ capsule becomes a deterministic ~seconds-per-iteration A/B vehicle for graphics work
+results — a v36+ capsule supplies raw graphics programs and the retained pixel-stage inputs for offline work
 (compare the replay hashes / BMPs), instead of a multi-minute live route per experiment. This was the
 iteration loop that localized #1394 for #1287. Items without a retained raw stream, or whose re-recompile
 fails, keep their stored SPIR-V — the `[recompile-raw]` line counts them; a nonzero `kept-stored` means the
 A/B is partial, never silent. Composes with `PROSPER_FS_TAP` (masked during the mass loop so the per-draw tap
 block keeps exclusive ownership of its semantic draw). Interface hints are re-derived from the raw streams,
 the same contract as the probes above.
+
+**Requested fragment width is not captured width.** Realized draws do not currently retain
+`SPI_PS_IN_CONTROL.PS_W32_EN`. Both `--recompile-raw` and `PROSPER_FS_TAP` therefore use the legacy
+requested Wave64 default, or the explicit diagnostic override
+`PROSPER_GPU_REPLAY_FRAGMENT_WAVE_SIZE=32|64`. The override uses strict base-0 unsigned syntax;
+signs, whitespace, suffixes, overflow and other widths are rejected with exit status 2, not silently
+replaced. Each regeneration mode reports `fragment-wave=32|64`, `source=override|legacy-default`
+and `captured-width=unavailable`. These graphics experiments do not establish faithful per-draw
+width or complete compilation-input fidelity, even when every module is substituted. Failed-stage
+fragment retries are separate: they use their captured v61+ PS width when available and ignore this
+realized-draw override. A plain stored-SPIR-V replay does not regenerate or change shader width.
 
 Capture v39 extends the same loop to realized compute dispatches. It retains the bounded raw RDNA2 stream,
 user SGPR push constants, launch/thread ABI, wave/TGID/LDS controls, and the capture host's optional typed-
