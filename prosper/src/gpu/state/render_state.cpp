@@ -313,6 +313,10 @@ RenderState extract_render_state(const GpuState& st) {
     rs.ps_input_addr = rd(st.cx, P::SPI_PS_INPUT_ADDR);
     rs.ps_wave32 = PM4_FIELD(rd(st.cx, P::SPI_PS_IN_CONTROL),
                              SPI_PS_IN_CONTROL, PS_W32_EN) != 0;
+    if (const auto rsrc1 = st.sh.find(P::SPI_SHADER_PGM_RSRC1_PS); rsrc1 != st.sh.end()) {
+        rs.ps_float_mode = {true, static_cast<uint8_t>(
+            PM4_FIELD(rsrc1->second, SPI_SHADER_PGM_RSRC1_PS, FLOAT_MODE))};
+    }
 
     // Color MRT 0 (context register file).
     rs.color0_base            = addr_of(rd(st.cx, P::CB_COLOR0_BASE), rd(st.cx, P::CB_COLOR0_BASE_EXT));

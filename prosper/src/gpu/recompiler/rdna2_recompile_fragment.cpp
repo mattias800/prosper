@@ -31,6 +31,33 @@
 
 namespace prosper::gpu {
 
+void SpirvCompute::warn_fragment_float_mode_unavailable(uint32_t pc) {
+    if (fragment_float_mode_warning) return;
+    fragment_float_mode_warning = true;
+    // Cold, bypass and direct compiles share the same bounded content/provenance warning.
+    // Do not record a terminal rejection: this explicitly retains the legacy FP fallback.
+    static std::mutex mutex;
+    static std::set<std::pair<uint64_t, uint64_t>> warned;
+    static bool overflow_reported = false;
+    std::lock_guard lock(mutex);
+    const auto identity = std::pair{diagnostic.program_address, fragment_program_hash};
+    if (warned.contains(identity)) return;
+    if (warned.size() >= 4096u) {
+        if (!overflow_reported) {
+            overflow_reported = true;
+            fprintf(stderr, "[fragment-float-mode] warning identity limit reached; further "
+                            "unavailable-mode comparison warnings suppressed\n");
+        }
+        return;
+    }
+    warned.insert(identity);
+    fprintf(stderr, "[fragment-float-mode] program=0x%llx source=%016llx pc=%u "
+                    "FLOAT_MODE=unavailable; eligible zero comparison retains host-dependent "
+                    "legacy FP path; exact guest semantics unverified\n",
+            static_cast<unsigned long long>(diagnostic.program_address),
+            static_cast<unsigned long long>(fragment_program_hash), pc);
+}
+
 
 
 FragmentInterpolationLayout::FragmentInterpolationLayout() {
@@ -366,10 +393,22 @@ static std::vector<uint32_t> recompile_fragment_impl(
         uint32_t pcrel_dispatch_target,
         const FragmentInterpolationLayout* interpolation,
         uint32_t wave_size,
-        RecompileDiagnosticContext diagnostic) {
-    if (wave_size != 32 && wave_size != 64) return {};
+        RecompileDiagnosticContext diagnostic,
+        FragmentFloatMode float_mode = {}) {
+    if ((wave_size != 32 && wave_size != 64) || !float_mode.canonical()) return {};
     std::vector<Rdna2Inst> ins;
     const size_t program_dwords = rdna2_walk(code, dwords, ins);
+    // Unsupported scalar writes can replace launch MODE authority. Inspect the original stream
+    // before specialization or dead EXEC can hide them. Future MODE support needs ordered state.
+    for (const auto& in : ins) {
+        if ((in.fmt == Rdna2Format::SOPK && (in.opcode == 0x13u || in.opcode == 0x15u)) ||
+            (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x24u || in.opcode == 0x25u))) {
+            log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",
+                                     "fragment mode write unsupported pc=%u op=0x%x",
+                                     in.pc, in.opcode);
+            return {};
+        }
+    }
     // The front half can publish an exact-PC raw x2 binding from the original code while
     // PC-relative specialization removes its direct uses. Keep that binding out of an
     // unrelated scalar load's fallback even when the selected stream omits the load.
@@ -440,6 +479,8 @@ static std::vector<uint32_t> recompile_fragment_impl(
         wave_size, program_dwords, shader_program_hash(code, program_dwords));
     SpirvCompute b;
     b.diagnostic = diagnostic;
+    b.fragment_float_mode = float_mode;
+    b.fragment_program_hash = shader_program_hash(code, program_dwords);
     b.wave_size = effective_wave_size;
     b.begin_fragment(rt, color_mask);
     // SPI_PS_IN_CONTROL.PS_W32_EN proves that EXEC_HI/VCC_HI are unused and the low-half mask
@@ -617,10 +658,11 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          uint32_t pcrel_dispatch_target,
                                          const FragmentInterpolationLayout* interpolation,
                                          bool wave32,
-                                         RecompileDiagnosticContext diagnostic) {
+                                         RecompileDiagnosticContext diagnostic,
+                                         FragmentFloatMode float_mode) {
     return recompile_fragment_impl(code, dwords, rt, system_inputs,
                                    pcrel_dispatch_target, interpolation,
-                                   wave32 ? 32u : 64u, diagnostic);
+                                   wave32 ? 32u : 64u, diagnostic, float_mode);
 }
 
 std::vector<uint32_t> recompile_fragment_wave32_for_test(

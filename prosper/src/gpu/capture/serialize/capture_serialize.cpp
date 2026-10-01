@@ -1168,6 +1168,22 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         }
         w.u8(draw.fragment_wave_config_available ? (draw.ps_wave32 ? 2u : 1u) : 0u);
     }
+    // v64: immutable producing mode, with canonical unknown encoded as (0,0). Full value bytes
+    // retain rounding/output-denorm settings too, even though this repair only consumes input mode.
+    const auto write_float_mode = [&](FragmentFloatMode mode, const char* message) {
+        if (!mode.canonical()) { error = message; return false; }
+        w.u8(mode.available ? 1u : 0u);
+        w.u8(mode.value);
+        return true;
+    };
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws)
+        if (!write_float_mode(draw.ps_float_mode,
+                              "invalid realized-draw fragment float mode")) return false;
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics)
+        if (!write_float_mode(diagnostic.ps_float_mode,
+                              "invalid failed-draw fragment float mode")) return false;
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

@@ -5,6 +5,17 @@
 
 namespace prosper::gpu {
 
+uint32_t SpirvCompute::f32_nonzero_bits(uint32_t word) {
+    if (!is_fragment || !fragment_float_mode.available) return 0;
+    const uint32_t magnitude = ibin(Op_BitwiseAnd, word, uconst(0x7fffffffu));
+    // AMD70648 section6.4: FP_DENORM[0] allows input denormals. EQ/NEQ have no
+    // floating result, so output-denorm and rounding bits cannot affect this relation.
+    // All NaNs and infinities have magnitudes above the normal threshold.
+    return fragment_float_mode.preserves_f32_inputs()
+        ? ucmp(Op_INotEqual, magnitude, uconst(0))
+        : ucmp(Op_UGreaterThanEqual, magnitude, uconst(0x00800000u));
+}
+
 uint32_t SpirvCompute::f32_abs_normal_le_bits(uint32_t word, uint32_t bound) {
     uint32_t bits = 0;
     if (!uconst_literal(bound, &bits) || bits < 0x00800000u || bits >= 0x7f800000u)

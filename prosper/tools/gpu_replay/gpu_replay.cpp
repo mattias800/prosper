@@ -77,6 +77,14 @@ void report_fragment_wave_size(const char* mode, const prosper::gpu::DrawItem& d
                  "guest compile request, not effective backend subgroup width\n",
                  mode, static_cast<uint32_t>(selection.size), source, captured,
                  static_cast<unsigned long long>(draw.draw_index));
+    if (draw.ps_float_mode.available)
+        std::fprintf(stderr, "[%s] fragment-float-mode=0x%02x source=captured draw=%llu; "
+                             "guest launch input, not host float controls\n", mode,
+                     static_cast<unsigned>(draw.ps_float_mode.value),
+                     static_cast<unsigned long long>(draw.draw_index));
+    else
+        std::fprintf(stderr, "[%s] fragment-float-mode=unavailable source=legacy-unknown draw=%llu\n",
+                     mode, static_cast<unsigned long long>(draw.draw_index));
 }
 
 void usage(const char* argv0) {
@@ -892,6 +900,11 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
             std::printf("  color-state unavailable (capture v%u predates v43)\n", format_version);
         std::printf("  ps-wave captured-width=%s (guest compile ABI, not SPIR-V subgroup width)\n",
                     d.fragment_wave_config_available ? (d.ps_wave32 ? "32" : "64") : "unavailable");
+        if (d.ps_float_mode.available)
+            std::printf("  ps-float-mode captured=0x%02x (guest launch MODE)\n",
+                        static_cast<unsigned>(d.ps_float_mode.value));
+        else
+            std::printf("  ps-float-mode captured=unavailable (guest semantics unverified)\n");
         // Resolved SPI_PS_INPUT_CNTL linkage (see pixel_input_linkage.hpp): which producer PARAM
         // slot each pixel-shader input actually reads, or whether the interpolator synthesizes a
         // constant instead. Retained since capture v36; older captures print `none` rather than
@@ -3130,7 +3143,9 @@ int main(int argc, char** argv) {
                         raw_fragment_wave, it.fragment_wave_config_available, it.ps_wave32);
                     fs = prosper::gpu::recompile_fragment(
                         raw.words.data(), raw.words.size(), it.prt.get(), system_inputs,
-                        UINT32_MAX, &interpolation, fragment_wave.wave32());
+                        UINT32_MAX, &interpolation, fragment_wave.wave32(),
+                        {prosper::gpu::RecompileDiagnosticStage::Fragment, 0},
+                        it.ps_float_mode);
                     if (interpolation.requires_geometry && it.ps.topology >= 3u &&
                         it.ps.topology <= 5u)
                         gs = prosper::gpu::recompile_interpolation_geometry(interpolation);
@@ -3329,7 +3344,9 @@ int main(int argc, char** argv) {
                                                            it.prt.get(),
                                                            it.has_system_inputs ? &it.system_inputs : nullptr,
                                                            UINT32_MAX, &interpolation,
-                                                           fragment_wave.wave32());
+                                                           fragment_wave.wave32(),
+                                                           {prosper::gpu::RecompileDiagnosticStage::Fragment,
+                                                            0}, it.ps_float_mode);
                 if (!fs.empty()) {
                     it.set_fs(std::move(fs));
                     std::fprintf(stderr,
@@ -3848,13 +3865,21 @@ int main(int argc, char** argv) {
                              pixel_inputs ? 1u : 0u, system_inputs ? 1u : 0u,
                              !failure.fragment_retry_config_available ? "unknown(default=64)" :
                                  (failure.ps_wave32 ? "32" : "64"));
+                if (failure.ps_float_mode.available)
+                    std::fprintf(stderr, "[retry-failed-stage] fragment-float-mode=0x%02x "
+                                         "source=captured\n",
+                                 static_cast<unsigned>(failure.ps_float_mode.value));
+                else
+                    std::fprintf(stderr, "[retry-failed-stage] fragment-float-mode=unavailable "
+                                         "source=legacy-unknown\n");
                 // Preserve the real program address in rejection diagnostics and deduplication.
                 spirv = prosper::gpu::recompile_fragment(
                     raw.words.data(), raw.words.size(), resources,
                     system_inputs, /*pcrel_dispatch_target=*/UINT32_MAX,
                     failure.fragment_retry_config_available ? &interpolation : nullptr,
                     failure.fragment_retry_config_available && failure.ps_wave32,
-                    {prosper::gpu::RecompileDiagnosticStage::Fragment, stage.program_addr});
+                    {prosper::gpu::RecompileDiagnosticStage::Fragment, stage.program_addr},
+                    failure.ps_float_mode);
                 break;
             }
             case prosper::gpu::ShaderProgramStage::Compute:

@@ -184,7 +184,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // authorize the rebased numeric load path.
 // v63 (#4041): realized draws retain the actual compile-time guest fragment wave width, with
 // explicit unavailable state. This does not describe the effective backend SPIR-V subgroup width.
-constexpr uint32_t kVersion = 63;
+// v64 (#4056): canonical availability plus all eight guest FLOAT_MODE bits for realized draws and
+// failed draws. Independent of the v63 width contract; legacy files retain explicit unknown mode.
+constexpr uint32_t kVersion = 64;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -1323,6 +1325,11 @@ inline bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::str
             raw_referenced[compute.raw_shader_index] = true;
     }
     for (const auto& diagnostic : capture.failure_diagnostics) {
+        if (!diagnostic.ps_float_mode.canonical() ||
+            (diagnostic.kind != SubmitOperationKind::Draw && diagnostic.ps_float_mode.available)) {
+            error = "invalid failed-draw fragment float mode";
+            return false;
+        }
         if (diagnostic.kind > SubmitOperationKind::Dispatch ||
             diagnostic.reason <= RealizationFailureReason::None ||
             diagnostic.reason > kMaxRealizationFailureReason ||

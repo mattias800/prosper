@@ -450,6 +450,10 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
     };
     out.items.reserve(c.draws.size());
     for (const auto& x : c.draws) {
+        if (!x.ps_float_mode.canonical()) {
+            error = "invalid realized-draw fragment float mode";
+            return false;
+        }
         if (!x.fragment_wave_config_available && x.ps_wave32) {
             error = "invalid realized-draw fragment wave config";
             return false;
@@ -480,6 +484,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         d.has_system_inputs = x.has_system_inputs;
         d.fragment_wave_config_available = x.fragment_wave_config_available;
         d.ps_wave32 = x.ps_wave32;
+        d.ps_float_mode = x.ps_float_mode;
         if (!table(x.vrt, false, d.vrt) || !table(x.prt, false, d.prt)) return false;
         if (d.vrt) d.vrt->vertices_per_instance = d.vertex_count;
         out.items.push_back(std::move(d));
