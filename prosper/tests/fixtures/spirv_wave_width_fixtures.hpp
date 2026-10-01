@@ -23,7 +23,8 @@ enum class Shape {
     CopyDestinationExternal, CopySourceLocal, CopyDestinationLocal, GuardedLocalCopy,
     EarlyReturn, AtomicAddress, AtomicStoreAddress, ImageIdentity, ImageSample, DrefSample,
     GatherComponent, OpaqueCall,
-    CalleeReturn, CopySizeParserOnly, FlagClearParserOnly,
+    CalleeReturn, LoopCounter, DeadLoopCounter, DebugDeadLoopCounter,
+    CopySizeParserOnly, FlagClearParserOnly,
 };
 
 struct Fixture {
@@ -47,7 +48,7 @@ inline void extension(std::vector<uint32_t>& words, const std::string& name) {
     words.insert(words.end(), literal.begin(), literal.end());
 }
 
-inline std::vector<uint32_t> module(Shape shape, bool dependent, bool uniform_vote = false,
+inline std::vector<uint32_t> make_module(Shape shape, bool dependent, bool uniform_vote = false,
                                     bool mask_literal_matches_vote_id = false,
                                     bool projected_dref_vote_source = false) {
     std::vector<uint32_t> w{0x07230203u, 0x00010300u, 0, 96, 0};
@@ -77,6 +78,7 @@ inline std::vector<uint32_t> module(Shape shape, bool dependent, bool uniform_vo
     if (coordinates) op(15, {4, 40, 0x6e69616du, 0, 22, 23, 72});
     else op(15, {4, 40, 0x6e69616du, 0, 22, 23}); // Fragment %40 "main"
     op(16, {40, 7});                     // OriginUpperLeft
+    if (shape == Shape::DebugDeadLoopCounter) op(7, {95, 0x74786966, 0x00657275}); // "fixture"
     op(71, {22, 30, 0}); op(71, {23, 30, 0}); // Location0
     op(71, {15, 6, 4});                  // ArrayStride4
     op(71, {16, 2}); op(72, {16, 0, 35, 0}); // Block, member Offset0
@@ -225,6 +227,29 @@ inline std::vector<uint32_t> module(Shape shape, bool dependent, bool uniform_vo
             op(86, {80, 88, 56, 87}); op(96, {25, 89, 88, 84, index});
             op(81, {4, 85, 89, 0}); op(62, {23, 85});
             break;
+        case Shape::LoopCounter:
+        case Shape::DeadLoopCounter:
+        case Shape::DebugDeadLoopCounter:
+            // Finite and race-free: Any(P) selects zero versus two iterations. The loop-header
+            // Phi dominates the merge and its final counter is exported directly, with no local
+            // store or merge-block Phi. The fixed-condition twin always performs two iterations.
+            op(249, {63}); op(248, {63});
+            op(245, {3, 57, 8, 45, 56, 61});
+            op(176, {2, 58, 57, 10}); // counter < 2
+            op(167, {2, 59, dependent ? vote : 14u, 58});
+            op(246, {62, 61, 0}); op(250, {59, 60, 62});
+            op(248, {60}); op(249, {61});
+            op(248, {61});
+            if (shape == Shape::DebugDeadLoopCounter) op(8, {95, 23, 1}); // line literal == Output ID
+            op(128, {3, 56, 57, 9}); op(249, {63}); op(248, {62});
+            if (shape == Shape::LoopCounter) {
+                op(112, {4, 90, 57}); op(62, {23, 90});
+            } else {
+                // Truly dead counter: control-dependent SSA may be tainted without refusing
+                // every loop. Debug lines are not definitions and cannot taint Output ID 23.
+                op(62, {23, 13});
+            }
+            break;
         case Shape::CalleeReturn:
             if (dependent) {
                 op(57, {2, 56, 80}); op(169, {4, 57, 56, 13, 12}); op(62, {23, 57});
@@ -266,6 +291,7 @@ inline std::vector<Fixture> fixtures() {
         {"dref_sample", Shape::DrefSample},
         {"gather_component", Shape::GatherComponent},
         {"callee_return", Shape::CalleeReturn},
+        {"loop_counter", Shape::LoopCounter},
         {"parser_copy_size", Shape::CopySizeParserOnly},
         {"parser_flag_clear", Shape::FlagClearParserOnly},
     };
@@ -273,18 +299,22 @@ inline std::vector<Fixture> fixtures() {
     for (const auto& shape : shapes) {
         for (bool dependent : {true, false}) {
             out.push_back({std::string(shape.name) + (dependent ? "_dependent" : "_dead"),
-                           module(shape.shape, dependent), !dependent,
+                           make_module(shape.shape, dependent), !dependent,
                            shape.shape != Shape::CopySizeParserOnly &&
                            shape.shape != Shape::FlagClearParserOnly &&
                            shape.shape != Shape::GatherComponent});
         }
     }
-    out.push_back({"uniform_vote_index", module(Shape::BufferRead, true, true), true, true});
-    out.push_back({"uniform_vote_call", module(Shape::OpaqueCall, true, true), true, true});
-    out.push_back({"image_literal_mask_is_not_id", module(Shape::ImageSample, false, false, true),
+    out.push_back({"uniform_vote_index", make_module(Shape::BufferRead, true, true), true, true});
+    out.push_back({"uniform_vote_call", make_module(Shape::OpaqueCall, true, true), true, true});
+    out.push_back({"image_literal_mask_is_not_id", make_module(Shape::ImageSample, false, false, true),
                    true, true});
     out.push_back({"projected_dref_vote_source_refused",
-                   module(Shape::DrefSample, false, false, false, true), false, true});
+                   make_module(Shape::DrefSample, false, false, false, true), false, true});
+    out.push_back({"uniform_vote_loop", make_module(Shape::LoopCounter, true, true), true, true});
+    out.push_back({"dead_counter_loop", make_module(Shape::DeadLoopCounter, true), true, true});
+    out.push_back({"debug_line_is_not_result", make_module(Shape::DebugDeadLoopCounter, true),
+                   true, true});
     return out;
 }
 

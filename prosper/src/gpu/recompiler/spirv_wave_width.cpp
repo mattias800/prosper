@@ -145,7 +145,7 @@ bool spirv_has_result(uint32_t op) {
         case Op_ControlBarrier: case Op_MemoryBarrier: case 228 /*OpAtomicStore*/:
         case 319 /*OpAtomicFlagClear*/: case 254 /*OpReturnValue*/: case 255 /*OpUnreachable*/:
         case 4416 /*OpTerminateInvocation*/: case 5380 /*OpDemoteToHelperInvocation*/:
-        case 56 /*OpFunctionEnd*/:
+        case 56 /*OpFunctionEnd*/: case 8 /*OpLine*/: case 317 /*OpNoLine*/:
             return false;
         default: return true;
     }
@@ -670,6 +670,15 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                 for (uint32_t b : inside) {
                     for (const SpirvInst& in : blocks[b]) {
                         if (is_observable_effect(in)) return true;
+                        // Execution count is a data dependency too. A bounded loop can export its
+                        // header Phi directly after the merge: no local store or merge-block Phi
+                        // carries the vote, but the final SSA counter depends on when it exits.
+                        // Taint definitions inside the controlled region, including the header
+                        // reached through a backedge; the ordinary closure follows their uses.
+                        if (spirv_has_result(in.op)) {
+                            const uint32_t rw = spirv_result_word(in.op);
+                            if (in.len > rw) grew |= tainted.insert(spirv[in.at + rw]).second;
+                        }
                         // A store into a local inside the region is control-dependent too: whether
                         // it happened at all is the vote's answer, so every later load of that
                         // local carries the vote.

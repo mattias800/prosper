@@ -392,6 +392,13 @@ class Module:
                     for op, w in self.blocks[b]:
                         if self._observable(op, w):
                             return True
+                        # Loop exit iteration changes even a header Phi exported directly after
+                        # the merge. Control-dependent definitions carry that count dependency;
+                        # region traversal reaches the header through its backedge.
+                        ri = result_index(op)
+                        if ri is not None and len(w) > ri and w[ri] not in tainted:
+                            tainted.add(w[ri])
+                            grew = True
                         # A store into a local inside the region is control-dependent too: whether
                         # it happened at all is the vote's answer.
                         if op in (OP_STORE, OP_COPY_MEMORY, OP_COPY_MEMORY_SIZED) and len(w) >= 3:
