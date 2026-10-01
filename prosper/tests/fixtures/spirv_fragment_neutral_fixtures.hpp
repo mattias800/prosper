@@ -8,7 +8,7 @@ enum class Shape {
     DeadLoad, DeadDivide, DeadDerivative, BodyStore, BodyEscape, SecondUnsafeVote,
     BitcastPoisonConjunction, MaskedBitcastPoison,
     UndefinedReconsume, NonEntry, Nested, Reentered, BuiltinReconsume, LocationReconsume,
-    BufferPredicate,
+    BufferPredicate, BitcastPoisonSelection, FloatPoisonConjunction, FloatPoisonSelection,
 };
 enum class Predicate { Helpers, Visible, AllFalse, AllTrue };
 
@@ -24,7 +24,9 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
         base::instruction(w, code, args);
     };
     const bool floating = shape == Shape::MaskedFloat || shape == Shape::UnmaskedFloat ||
-        shape == Shape::BitcastPoisonConjunction || shape == Shape::MaskedBitcastPoison ||
+        shape == Shape::BitcastPoisonConjunction || shape == Shape::BitcastPoisonSelection ||
+        shape == Shape::MaskedBitcastPoison || shape == Shape::FloatPoisonConjunction ||
+        shape == Shape::FloatPoisonSelection ||
         shape == Shape::UndefinedReconsume || shape == Shape::BuiltinReconsume ||
         shape == Shape::LocationReconsume;
     const bool reconsume = shape == Shape::UndefinedReconsume || shape == Shape::BuiltinReconsume ||
@@ -59,7 +61,9 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
     if (shape == Shape::BufferPredicate) {
         op(29, {126, 3}); op(30, {127, 126}); op(32, {128, 12, 127}); op(32, {129, 12, 3});
     }
-    if (shape == Shape::BitcastPoisonConjunction || shape == Shape::MaskedBitcastPoison)
+    if (shape == Shape::BitcastPoisonConjunction || shape == Shape::BitcastPoisonSelection ||
+        shape == Shape::MaskedBitcastPoison || shape == Shape::FloatPoisonConjunction ||
+        shape == Shape::FloatPoisonSelection)
         op(43, {4, 89, 0x7f800000u}); // +Inf, NOT finite bitcast authority
     op(59, {7, 22, 1}); op(59, {18, 23, 3}); op(59, {19, 24, 1});
     if (shape == Shape::LocationReconsume) op(59, {7, 123, 1});
@@ -109,10 +113,13 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
         op(129, {4, 77, 76, 13}); op(133, {4, 78, 77, 13});
         op(12, {4, 79, 90, 10, 78}); op(124, {3, 85, 79}); new_state = 85;
     }
-    if (shape == Shape::BitcastPoisonConjunction || shape == Shape::MaskedBitcastPoison) {
+    if (shape == Shape::BitcastPoisonConjunction || shape == Shape::BitcastPoisonSelection ||
+        shape == Shape::MaskedBitcastPoison) {
         op(124, {3, 85, 89});
         if (shape == Shape::MaskedBitcastPoison) new_state = 85;
     }
+    if (shape == Shape::FloatPoisonConjunction || shape == Shape::FloatPoisonSelection)
+        op(12, {4, 85, 90, 4, 89}); // FAbs(+Inf): implicit NotInf remains under SZI preserve
     if (reconsume) {
         op(124, {4, 120, 117}); op(180, {2, 121, 120, 12});
         op(167, {2, 81, p, 121});
@@ -125,8 +132,17 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
         op(167, {2, 81, p, 54}); op(168, {2, 82, 81});
     } else if (shape == Shape::UnmaskedFloat) {
         op(186, {2, 81, 79, 12}); op(167, {2, 84, p, 81}); op(168, {2, 82, 84});
-    } else if (shape == Shape::BitcastPoisonConjunction) {
-        op(171, {2, 81, 85, 8}); op(167, {2, 84, p, 81}); op(168, {2, 82, 84});
+    } else if (shape == Shape::BitcastPoisonConjunction || shape == Shape::BitcastPoisonSelection ||
+               shape == Shape::FloatPoisonConjunction || shape == Shape::FloatPoisonSelection) {
+        if (shape == Shape::FloatPoisonConjunction || shape == Shape::FloatPoisonSelection)
+            op(186, {2, 81, 85, 12});
+        else op(171, {2, 81, 85, 8});
+        // The paired modules differ only in this architectural mask instruction. Strict AND
+        // propagates comparison poison into live EXEC; Select suppresses it when EXEC is false.
+        if (shape == Shape::BitcastPoisonSelection || shape == Shape::FloatPoisonSelection)
+            op(169, {2, 84, p, 81, 15});
+        else op(167, {2, 84, p, 81});
+        op(168, {2, 82, 84});
     } else if (reconsume) op(168, {2, 82, 81});
     else op(83, {2, 82, 14});
     if (shape == Shape::DeadLoad) op(61, {2, 86, 25});
@@ -173,6 +189,9 @@ inline std::vector<Fixture> fixtures() {
         {"body_escape_parser_only", Shape::BodyEscape, false, false},
         {"second_unsafe_vote", Shape::SecondUnsafeVote, false},
         {"bitcast_poison_conjunction", Shape::BitcastPoisonConjunction, false},
+        {"bitcast_poison_selection", Shape::BitcastPoisonSelection, true},
+        {"float_poison_conjunction", Shape::FloatPoisonConjunction, false},
+        {"float_poison_selection", Shape::FloatPoisonSelection, true},
         {"masked_bitcast_poison", Shape::MaskedBitcastPoison, true},
         {"undefined_reconsume", Shape::UndefinedReconsume, false},
         {"non_entry_selection", Shape::NonEntry, false}, {"nested_selection", Shape::Nested, false},

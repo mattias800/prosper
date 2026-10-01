@@ -233,7 +233,8 @@ void verify_neutral_votes(uint32_t x, uint32_t y, bool poison) {
         check(*source == captured, "neutral pipeline/replay calls preserve immutable source words");
     }
     for (const auto shape : {neutral::Shape::Termination, neutral::Shape::UndefinedConjunction,
-                             neutral::Shape::MaskedFloat, neutral::Shape::MaskedBitcastPoison}) {
+                             neutral::Shape::MaskedFloat, neutral::Shape::MaskedBitcastPoison,
+                             neutral::Shape::BitcastPoisonSelection, neutral::Shape::FloatPoisonSelection}) {
         // All-false is the newly executed domain. No earlier Kill removes helpers before the
         // analytic derivative, and unselected poison/undefined values must not affect state.
         const auto source = std::make_shared<const std::vector<uint32_t>>(
@@ -247,7 +248,7 @@ void verify_neutral_votes(uint32_t x, uint32_t y, bool poison) {
     for (const auto shape : {neutral::Shape::ScalarExport, neutral::Shape::TerminationExport,
                              neutral::Shape::LiveUnequalPhi, neutral::Shape::SecondConsumer,
                              neutral::Shape::PoisonConjunction, neutral::Shape::BitcastPoisonConjunction,
-                             neutral::Shape::SecondUnsafeVote}) {
+                             neutral::Shape::FloatPoisonConjunction, neutral::Shape::SecondUnsafeVote}) {
         const auto source = std::make_shared<const std::vector<uint32_t>>(neutral::make_module(shape));
         verify_clear(render(vertex, source, 0, FragmentWavePolicy::ProvenVotes),
                      "unsafe neutral export/controller refuses rather than executing a host-width approximation");

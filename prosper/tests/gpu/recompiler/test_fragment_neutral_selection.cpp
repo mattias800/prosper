@@ -110,9 +110,42 @@ void proof_controls() {
     g.body = {31, 32, 33, 20, 21}; g.exports.push_back({2, 33});
     check(!prove_fragment_neutral_selection(g, frozen),
           "cross-float infinity bitcast may poison a live false conjunction even with preserve mode");
+    g.values[33] = {Type::Boolean, 169, 0, {10, 32, 2}};
+    g.values[34] = {Type::Boolean, 168, 0, {33}};
+    g.body.push_back(34); g.exports = {{1, 34}};
+    check(prove_fragment_neutral_selection(g, frozen),
+          "inactive compare Select preserves defined live EXEC without nonpoison authority for its comparison");
+    g.values[33].operands[0] = 1;
+    g.values[35] = {Type::Boolean, 167, 0, {2, 33}};
+    g.values[34].operands[0] = 35;
+    g.body.insert(g.body.end() - 1, 35);
+    check(!prove_fragment_neutral_selection(g, frozen),
+          "active compare poison survives Select and cannot be absorbed by scalar FALSE AND");
+    g.body.erase(g.body.end() - 2); g.values.erase(35); g.values[34].operands[0] = 33;
+    g.values[33] = {Type::Boolean, 167, 0, {10, 32}};
+    check(!prove_fragment_neutral_selection(g, frozen),
+          "restoring strict AND loses the inactive live EXEC certificate");
     g.values[30].literal = 0;
     check(prove_fragment_neutral_selection(g, frozen),
           "explicit finite bits authorize scalar cross-float nonpoison, not general float identities");
+    g = graph();
+    g.values[30] = {Type::Float32, 43, 0, {}, true, 0x7f800000u};
+    g.values[31] = {Type::Float32, 12, 4, {30}};
+    g.values[32] = {Type::Boolean, 186, 0, {31, 5}};
+    g.values[33] = {Type::Boolean, 167, 0, {10, 32}};
+    g.values[34] = {Type::Boolean, 168, 0, {33}};
+    g.body = {31, 32, 33, 34}; g.exports = {{1, 34}};
+    check(!prove_fragment_neutral_selection(g, frozen),
+          "floating compare propagates intrinsic poison through strict inactive AND");
+    g.values[33] = {Type::Boolean, 169, 0, {10, 32, 2}};
+    check(prove_fragment_neutral_selection(g, frozen),
+          "inactive floating compare Select keeps defined live EXEC");
+    g.values[33].operands[0] = 1;
+    g.values[35] = {Type::Boolean, 167, 0, {2, 33}};
+    g.values[34].operands[0] = 35;
+    g.body.insert(g.body.end() - 1, 35);
+    check(!prove_fragment_neutral_selection(g, frozen),
+          "active floating compare poison survives Select and cannot be absorbed by scalar FALSE AND");
     g = graph();
     g.values[30] = {Type::Int32, 1, 0, {}};
     g.values[31] = {Type::Float32, 124, 0, {30}};
@@ -136,6 +169,20 @@ void dump(const std::filesystem::path& directory, const std::string& name,
 
 void module_controls(const char* directory) {
     namespace f = prosper::test::fragment_neutral;
+    namespace base = prosper::test::fragment_votes;
+    for (const bool floating_compare : {false, true}) {
+        const auto strict_mask = f::make_module(floating_compare ? f::Shape::FloatPoisonConjunction :
+                                                                  f::Shape::BitcastPoisonConjunction);
+        auto selected_mask = strict_mask;
+        const auto mask_at = base::find(selected_mask, 167);
+        if (mask_at + 5 <= selected_mask.size()) {
+            selected_mask.erase(selected_mask.begin() + mask_at, selected_mask.begin() + mask_at + 5);
+            selected_mask.insert(selected_mask.begin() + mask_at, {(6u << 16) | 169u, 2, 84, 53, 81, 15});
+        }
+        check(selected_mask == f::make_module(floating_compare ? f::Shape::FloatPoisonSelection :
+                                                                f::Shape::BitcastPoisonSelection),
+              "poison AND/Select modules differ only in one mask instruction, with identical live EXEC Phi/Kill consumers");
+    }
     for (const auto& fixture : f::fixtures()) {
         const auto words = f::make_module(fixture.shape), unchanged = words;
         const auto lowered = lower_fragment_votes(words);

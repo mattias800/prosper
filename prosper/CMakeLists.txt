@@ -2417,6 +2417,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_fragment_neutral_selection PRIVATE prosper_core)
   add_test(NAME fragment_neutral_selection COMMAND test_fragment_neutral_selection)
 
+  # #4016: exact compare-mask SSA, CMPX VCC preservation, and strict scalar-AND controls.
+  add_executable(test_compare_exec_masking tests/gpu/recompiler/test_compare_exec_masking.cpp)
+  target_link_libraries(test_compare_exec_masking PRIVATE prosper_core)
+  add_test(NAME compare_exec_masking COMMAND test_compare_exec_masking)
+
   # #3203: the entry-M0 token containment's CFG-DISPATCHER re-arm. Its own binary rather than another
   # arm in test_rdna2_spirv_struct, because that one returns at its first failure and a mutation run
   # then cannot tell which arms moved. This reports every arm independently.
