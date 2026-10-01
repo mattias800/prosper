@@ -20,7 +20,7 @@ struct Checks {
 };
 struct Case { uint32_t operand, lo, hi; };
 constexpr std::array<Case, 16> Cases{{
-    {128, 0, 0}, {129, 1, 0}, {131, 3, 0}, {143, 15, 0},
+    {255, 0, 0}, {129, 1, 0}, {131, 3, 0}, {143, 15, 0},
     {194, 0xfffffffeu, UINT32_MAX}, {193, UINT32_MAX, UINT32_MAX},
     {255, 8, 0}, {255, 16, 0}, {255, 0x80000000u, 0},
     {255, 0x80000001u, 0}, {255, 0x01000010u, 0}, {242, 0x3f800000u, 0},
@@ -83,24 +83,31 @@ bool no_subgroup_capability(const std::vector<uint32_t>& spirv) {
     return true;
 }
 
-void execute(Checks& checks, const std::vector<uint32_t>& code, bool dispatcher,
-             uint32_t expected) {
+void execute_words(Checks& checks, const std::vector<uint32_t>& code, bool dispatcher,
+                   const std::vector<uint32_t>& expected) {
     const auto spirv = compile(code, dispatcher);
     checks.check(!spirv.empty(), "numeric WQM compiles in the claimed route");
     if (spirv.empty()) return;
     checks.check(no_subgroup_capability(spirv), "numeric WQM requires no subgroup capability");
     const auto actual = prosper::test::run_compute(spirv, std::vector<float>(N), N, N);
     unsigned bad = 0;
-    for (float value : actual) bad += std::bit_cast<uint32_t>(value) != expected;
+    for (size_t i = 0; i < actual.size(); ++i)
+        bad += i >= expected.size() || std::bit_cast<uint32_t>(actual[i]) != expected[i];
     std::printf("dispatcher=%d expected=%08x outputs=%zu bad=%u\n",
-                dispatcher, expected, actual.size(), bad);
-    checks.check(actual.size() == N && bad == 0, "all 128 output words match the exact nibble oracle");
+                dispatcher, expected.front(), actual.size(), bad);
+    checks.check(actual.size() == N && bad == 0, "all 128 output words match the exact scalar oracle");
+}
+
+void execute(Checks& checks, const std::vector<uint32_t>& code, bool dispatcher,
+             uint32_t expected) {
+    execute_words(checks, code, dispatcher, std::vector<uint32_t>(N, expected));
 }
 
 void matrix(Checks& checks) {
     for (const auto& c : Cases) {
         for (bool wide : {false, true}) {
             if (wide && c.operand == 242) continue; // distinct B64 inline-float contract is not admitted
+            if (c.operand == 193 || (wide && c.operand == 143)) continue; // exact legacy mask spellings
             for (bool dispatcher : {false, true}) {
                 if (dispatcher && c.operand == 4) continue; // scalar placeholders are not DATA proof
                 execute(checks, packet(c, wide, false), dispatcher, widened(c.lo));
@@ -114,6 +121,7 @@ std::vector<uint32_t> scc_packet(const Case& c, bool wide, bool edge, bool empty
     std::vector<uint32_t> code;
     code.reserve(16);
     const bool nonzero = c.lo || (wide && c.hi);
+    source(code, c);
     if (empty_exec) code.push_back(0xbefe0480u); // scalar WQM still executes under empty EXEC
     code.push_back(nonzero ? 0xbf068180u : 0xbf068080u); // deliberately opposite preceding SCC
     wqm(code, c, wide, 20);
@@ -131,6 +139,12 @@ void scalar_conditions(Checks& checks) {
                 for (bool empty_exec : {false, true})
                     execute(checks, scc_packet(c, wide, dispatcher, empty_exec), dispatcher,
                             (c.lo || (wide && c.hi)) ? 1u : 0u);
+    // A high-only B64 result must set SCC even though its low word remains zero.
+    // Raw register sources have no dispatcher provenance proof yet.
+    for (const auto& c : {Cases[12], Cases[13]})
+        for (bool wide : {false, true})
+            for (bool empty_exec : {false, true})
+                execute(checks, scc_packet(c, wide, false, empty_exec), false, wide ? 1u : 0u);
 }
 
 void lifetime_execution(Checks& checks) {
@@ -151,6 +165,98 @@ void lifetime_execution(Checks& checks) {
         0xbe9e1014u, 0x7e00021eu, 0xbf810000u,
     };
     execute(checks, fresh, false, 5); // popcount(2) + popcount(WQM(1))
+}
+
+void mask_consumers(Checks& checks) {
+    for (const auto& c : {Case{128, 0, 0}, Case{143, 15, 0},
+                          Case{193, UINT32_MAX, UINT32_MAX},
+                          Case{208, 0xfffffff0u, UINT32_MAX}})
+        for (bool dispatcher : {false, true}) {
+            for (bool copy : {false, true})
+                for (bool edge : {false, true})
+                    for (bool invert : {false, true}) {
+                        // The compact structurizer cannot persist this saved-mask lifetime over
+                        // the branch. Exercise that edge in the existing dispatcher route instead.
+                        if (edge && !dispatcher) continue;
+                        std::vector<uint32_t> code;
+                        source(code, c);
+                        code.push_back(0x7e000287u); // initialize v0=7 before changing EXEC
+                        wqm(code, c, true, 4);
+                        if (copy) code.push_back(0xbe880404u); // complete DATA copy s[8:9]<-s[4:5]
+                        if (edge) code.insert(code.end(), {0xbf820001u, 0xbf800000u});
+                        code.push_back((invert ? 0xbefe0800u : 0xbefe0400u) | (copy ? 8u : 4u));
+                        code.insert(code.end(), {0x7e000281u, 0xbefe04c1u, 0xbf810000u});
+                        std::vector<uint32_t> expected(N);
+                        for (uint32_t i = 0; i < N; ++i) {
+                            const uint32_t lane = i & 63u;
+                            const uint32_t word = widened(lane < 32 ? c.lo : c.hi);
+                            const bool active = ((word >> (lane & 31u)) & 1u) != 0;
+                            expected[i] = (active != invert) ? 1u : 7u;
+                        }
+                        execute_words(checks, code, dispatcher, expected);
+                    }
+            // Other former saved-mask consumers must retain their predicate view too. These are
+            // already quad-closed constants: this is compatibility, not dynamic Boolean WQM.
+            for (unsigned consumer = 0; consumer < 5; ++consumer) {
+                std::vector<uint32_t> code{0x7e000287u};
+                wqm(code, c, true, 4);
+                if (consumer == 0) code.insert(code.end(), {0xd5010000u, 0x00110287u}); // cndmask
+                else if (consumer == 1) code.insert(code.end(), {0xd5286a00u, 0x00110481u}); // carry-in
+                else {
+                    if (consumer == 2) code.insert(code.end(), {0xbf068080u, 0x85fe8004u}); // cselect EXEC
+                    else code.push_back(consumer == 3 ? 0x87fec104u : 0xbe942404u); // AND / SAVEEXEC
+                    code.insert(code.end(), {0x7e000281u, 0xbefe04c1u});
+                }
+                code.push_back(0xbf810000u);
+                std::vector<uint32_t> expected(N);
+                for (uint32_t i = 0; i < N; ++i) {
+                    const uint32_t lane = i & 63u;
+                    const uint32_t word = lane < 32 ? c.lo : c.hi;
+                    const bool active = ((word >> (lane & 31u)) & 1u) != 0;
+                    expected[i] = consumer == 1 ? (active ? 4u : 3u) : (active ? 1u : 7u);
+                }
+                execute_words(checks, code, dispatcher, expected);
+            }
+            const std::vector<uint32_t> direct{
+                0x7e000287u, 0xbefe0a00u | c.operand,
+                0x7e000281u, 0xbefe04c1u, 0xbf810000u,
+            };
+            std::vector<uint32_t> expected(N);
+            for (uint32_t i = 0; i < N; ++i) {
+                const uint32_t lane = i & 63u;
+                expected[i] = (((lane < 32 ? c.lo : c.hi) >> (lane & 31u)) & 1u) ? 1u : 7u;
+            }
+            execute_words(checks, direct, dispatcher, expected);
+        }
+}
+
+void mask_provenance_controls(Checks& checks) {
+    const std::vector<uint32_t> half_overwrite{
+        0xbe840ac1u, 0xbe850380u, // WQM pair then a fresh high-word scalar definition
+        0xbf820001u, 0xbf800000u, 0xbefe0404u, 0xbefe04c1u, 0xbf810000u,
+    };
+    checks.check(compile(half_overwrite, true).empty(),
+                 "an overlapping write kills the saved-mask dispatcher MUST fact");
+    const std::vector<uint32_t> missing_path{
+        0xbf068080u, 0xbf840001u, 0xbe840ac1u, // only one predecessor defines the pair
+        0xbefe0404u, 0xbefe04c1u, 0xbf810000u,
+    };
+    checks.check(compile(missing_path, true).empty(),
+                 "a saved-mask lifetime is a MUST fact at a dispatcher join");
+    for (uint32_t operand : {128u, 193u}) {
+        const std::vector<uint32_t> vertex{
+            0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+            0xbe840a00u | operand, 0xbefe0404u, 0x7e000281u, 0xbefe04c1u,
+            0xf80008cfu, 0x03020100u, 0xbf810000u,
+        };
+        checks.check(!recompile_vertex(vertex.data(), vertex.size()).empty(),
+                     "vertex saved empty/full WQM masks retain compatibility");
+        auto fragment = vertex;
+        fragment[8] = 0xf800000fu;
+        const auto spirv = recompile_fragment(fragment.data(), fragment.size());
+        checks.check(!spirv.empty() && no_subgroup_capability(spirv),
+                     "fragment saved empty/full WQM masks add no subgroup-width dependency");
+    }
 }
 
 void provenance_controls(Checks& checks) {
@@ -234,6 +340,8 @@ int main() {
     matrix(checks);
     scalar_conditions(checks);
     lifetime_execution(checks);
+    mask_consumers(checks);
+    mask_provenance_controls(checks);
     provenance_controls(checks);
     overlap_controls(checks);
     rejection_controls(checks);

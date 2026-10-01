@@ -3064,8 +3064,22 @@ inline bool wqm_has_numeric_destination(const Rdna2Inst& in) {
         (in.opcode == 0x09 || (in.dst.value & 1) == 0);
 }
 
+inline bool wqm_has_exact_legacy_inline_mask_source(const Rdna2Inst& in) {
+    if (in.fmt != Rdna2Format::SOP1 || (in.opcode != 0x09 && in.opcode != 0x0a) ||
+        in.src[0].kind != OperandKind::InlineInt) return false;
+    if (in.opcode == 0x09) return in.src[0].value == 0 || in.src[0].value == -1;
+    // Preserve previously exact saved-mask consumers, not every old identity case. An inline
+    // B64 integer is sign-extended, so its high word is already quad-closed. Its low word must be
+    // invariant under nibble widening too (e.g. 0, 15, -1, -16). DATA/SCC support for these legacy
+    // mask spellings is separate work; do not silently drop the predicate that their users need.
+    const uint32_t bits = static_cast<uint32_t>(in.src[0].value);
+    const uint32_t any = bits | (bits >> 1) | (bits >> 2) | (bits >> 3);
+    return ((any & 0x11111111u) * 15u) == bits;
+}
+
 inline bool wqm_has_intrinsic_numeric_source(const Rdna2Inst& in) {
     return in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x09 || in.opcode == 0x0a) &&
+        !wqm_has_exact_legacy_inline_mask_source(in) &&
         (in.src[0].kind == OperandKind::InlineInt || in.src[0].kind == OperandKind::Literal ||
          (in.opcode == 0x09 && in.src[0].kind == OperandKind::InlineFloat));
 }

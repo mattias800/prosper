@@ -358,6 +358,32 @@ static void dump_numeric_wqm_sources(const std::string& dir) {
     }
 }
 
+static void dump_wqm_mask_compatibility(const std::string& dir) {
+    for (uint32_t operand : {128u, 143u, 193u, 208u}) {
+        for (bool cfg : {false, true}) {
+            std::vector<uint32_t> code{0xbe840a00u | operand};
+            if (cfg) code.insert(code.end(), {0xbf820001u, 0xbf800000u});
+            code.insert(code.end(), {0xbefe0404u, 0x7e000281u, 0xbefe04c1u, 0xbf810000u});
+            const std::string name = "compute_wqm_exact_mask_" + std::to_string(operand) +
+                (cfg ? "_cfg" : "_compact");
+            dump(dir, name.c_str(), recompile_valu(code.data(), code.size(), 1, 0,
+                 nullptr, 0, kDefaultComputePgmRsrc1, cfg));
+        }
+        if (operand != 128 && operand != 193) continue;
+        std::vector<uint32_t> graphics{
+            0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
+            0xbe840a00u | operand, 0xbefe0404u, 0x7e000281u, 0xbefe04c1u,
+            0xf80008cfu, 0x03020100u, 0xbf810000u,
+        };
+        const std::string suffix = std::to_string(operand);
+        dump(dir, ("vertex_wqm_exact_mask_" + suffix).c_str(),
+             recompile_vertex(graphics.data(), graphics.size()));
+        graphics[8] = 0xf800000fu;
+        dump(dir, ("fragment_wqm_exact_mask_" + suffix).c_str(),
+             recompile_fragment(graphics.data(), graphics.size()));
+    }
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : ".";
     // The source root is required, not optional: the coverage check is the half of this gate that
@@ -454,6 +480,7 @@ int main(int argc, char** argv) {
     dump_numeric_mbcnt(dir);
     dump_numeric_wqm(dir);
     dump_numeric_wqm_sources(dir);
+    dump_wqm_mask_compatibility(dir);
     // GTA V's exact literal-bearing V_ALIGNBYTE_B32 packet.  Strict validation guards the
     // masked-shift lowering: SPIR-V shift operands must stay in the defined 0..31 range.
     { const uint32_t c[] = {0xd54f0006u,0x0415fe80u,0x3024240cu,0xbf810000u};
