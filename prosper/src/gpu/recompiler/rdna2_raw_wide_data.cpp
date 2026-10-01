@@ -82,6 +82,7 @@ public:
         };
         if (start + 1 >= ins.size()) return false;
         State initial{start + 1, {}, false, {}};
+        initial.masks = saved_exec_masks_at_load();
         initial.masks.set(126); // entry EXEC cannot depend on this subsequent, unreplayed load
         for (uint32_t word = 0; word < words; ++word)
             initial.regs.set(static_cast<size_t>(first + static_cast<int>(word)));
@@ -301,9 +302,10 @@ public:
             if (!state.regs.any() && !state.scc) continue;
 
             auto enqueue = [&](size_t next) {
-                // A backwards edge may replay EXEC/mask definitions. This bounded proof does
-                // not establish their convergence or a fresh observation on every iteration.
-                if (next <= state.index) return false;
+                // MAY words grow and MUST mask roots shrink at joins, including backedges.
+                // The finite worklist must converge within the cap above. Reexecuting this
+                // load still requires a fresh observation, not its earlier descriptor proof.
+                if (next == start) return false;
                 pending.push_back({next, state.regs, state.scc, state.masks});
                 return true;
             };
@@ -362,6 +364,66 @@ private:
     size_t start;
     int first;
     uint32_t words;
+
+    std::bitset<128> saved_exec_masks_at_load() const {
+        // Only actual mask saves, on every path reaching this load, may seed its Bool facts.
+        // Their value predates this load; no scalar bits, wave width or zero are inferred.
+        std::vector<std::bitset<128>> incoming(start + 1);
+        std::vector<bool> reached(start + 1);
+        reached[0] = true;
+        for (size_t index = 0; index < start; ++index) {
+            if (!reached[index]) continue;
+            const auto& in = ins[index];
+            if (in.fmt == Rdna2Format::Unknown || !in.len_dwords ||
+                (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u) ||
+                (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x28u && in.opcode <= 0x2au) ||
+                (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCallB64)) return {};
+            auto masks = incoming[index];
+            for_each_scalar_write(in, [&](int base, uint32_t width) {
+                for (uint32_t k = 0; k < width; ++k) {
+                    const int reg = base + static_cast<int>(k);
+                    if (reg >= 0 && reg < 128) masks.reset(static_cast<size_t>(reg));
+                    if (reg > 0 && reg <= 128) masks.reset(static_cast<size_t>(reg - 1));
+                }
+            });
+            if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
+                in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 && in.dst.value <= 104 &&
+                in.src[0].kind == OperandKind::Special && in.src[0].value == 126)
+                masks.set(static_cast<size_t>(in.dst.value));
+            const auto enter = [&](size_t next) {
+                if (next > start) return;
+                if (reached[next]) incoming[next] &= masks;
+                else incoming[next] = masks;
+                reached[next] = true;
+            };
+            if (in.is_end) continue;
+            if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
+                const int64_t target_pc = static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
+                if (target_pc <= in.pc || target_pc > UINT32_MAX) return {};
+                const auto target = by_pc.find(static_cast<uint32_t>(target_pc));
+                if (target == by_pc.end()) {
+                    if (target_pc <= ins.back().pc) return {};
+                } else {
+                    if (target->second <= index) return {};
+                    enter(target->second);
+                }
+                if (in.opcode == kSoppOpcodeBranch) continue;
+            } else if (in.fmt == Rdna2Format::SOPP && !sopp_is_noop(in) &&
+                       in.opcode != 0x0au && in.opcode != 0x10u &&
+                       in.opcode != 0x16u && in.opcode != 0x17u) return {};
+            enter(index + 1);
+        }
+        auto masks = reached[start] ? incoming[start] : std::bitset<128>{};
+        // The load itself overwrites data and invalidates an overlapping saved pair.
+        for_each_scalar_write(ins[start], [&](int base, uint32_t width) {
+            for (uint32_t k = 0; k < width; ++k) {
+                const int reg = base + static_cast<int>(k);
+                if (reg >= 0 && reg < 128) masks.reset(static_cast<size_t>(reg));
+                if (reg > 0 && reg <= 128) masks.reset(static_cast<size_t>(reg - 1));
+            }
+        });
+        return masks;
+    }
 
     bool overlaps(int base, uint32_t width, uint16_t live) const {
         if (base < 0) return false;
@@ -625,6 +687,10 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
             if (std::binary_search(owned_parents.begin(), owned_parents.end(), writer.pc)) {
                 needed &= ~writes;
                 sources.push_back(writer.pc);
+                // The exact parent already proves its entry pointer and reaching definition.
+                // Once every selector word resolves, unrelated earlier control is irrelevant.
+                // The child entry-pointer authority remains required by entry_proven above.
+                if (needed.none()) break;
                 continue;
             }
             // A bounded immediate raw x1 fetch is a latched scalar value. Its entry pointer

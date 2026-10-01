@@ -69,6 +69,51 @@ int main(int argc, char** argv) {
         check(parent_high == 2u && source->gpu_addr == parent_address + 4u &&
               selected->gpu_addr == child_address + 32u && selected->size == size,
               "highest parent word and child highest-data range derive from the same observed fold");
+        // Both paths join ON the authenticated parent. Control before that completed
+        // definition cannot invalidate an already resolved child selector dependency.
+        auto joined_parent = code;
+        joined_parent.insert(joined_parent.begin(),
+            {0xbf068080u, 0xbf840001u, 0xbe940380u});
+        std::vector<Rdna2Inst> joined_ins;
+        rdna2_walk(joined_parent.data(), joined_parent.size(), joined_ins);
+        std::vector<uint32_t> joined_sources;
+        const auto joined_children = rdna2_proven_raw_register_wide_data_loads(
+            joined_ins, &joined_sources);
+        ShaderResourceTable joined_table;
+        add_compute_buffer_resources(joined_table, joined_parent.data(), joined_parent.size(),
+                                     user.data(), user.size());
+        assign_convention_bindings(joined_table, 2u);
+        const auto* joined_source = joined_table.by_fetch_pc(3u);
+        const auto* joined_child = joined_table.by_fetch_pc(10u);
+        uint32_t joined_high = UINT32_MAX;
+        if (joined_source && joined_source->host_data && joined_source->host_data_size == size)
+            std::memcpy(&joined_high, joined_source->host_data + last * 4u, 4u);
+        check(joined_children == std::vector<uint32_t>{10u} &&
+              joined_sources == std::vector<uint32_t>{3u} && joined_high == 2u &&
+              joined_child && joined_child->gpu_addr == child_address + 32u &&
+              joined_table.owned_raw_snapshot_requirements ==
+                  std::vector<std::pair<uint32_t, uint32_t>>{{3u, size}} &&
+              !recompile_vertex(joined_parent.data(), joined_parent.size(), &joined_table).empty(),
+              "control joining on a complete owned parent preserves highest-word selector and actual child module");
+        auto bypass_parent = joined_parent;
+        bypass_parent[1] = 0xbf840003u; // target pc5, AFTER the parent at pc3
+        std::vector<Rdna2Inst> bypass_ins;
+        rdna2_walk(bypass_parent.data(), bypass_parent.size(), bypass_ins);
+        check(rdna2_proven_raw_register_wide_data_loads(bypass_ins).empty(),
+              "branch bypassing the owned parent cannot resolve a later selector");
+        auto changed_parent_pointer = joined_parent;
+        changed_parent_pointer.insert(changed_parent_pointer.begin() + 3, 0xbe800380u);
+        std::vector<Rdna2Inst> changed_parent_ins;
+        rdna2_walk(changed_parent_pointer.data(), changed_parent_pointer.size(), changed_parent_ins);
+        check(rdna2_proven_raw_register_wide_data_loads(changed_parent_ins).empty(),
+              "parent pointer overwrite before its read cannot resolve a later selector");
+        auto intervening_control = joined_parent;
+        intervening_control.insert(intervening_control.begin() + 7, 0xbf840000u);
+        std::vector<Rdna2Inst> intervening_ins;
+        rdna2_walk(intervening_control.data(), intervening_control.size(), intervening_ins);
+        check(rdna2_proven_raw_register_wide_data_loads(intervening_ins).empty(),
+              "intervening conditional control remains outside the owned selector slice");
+
         parent[1u + last] = 3u;
         uint32_t latched_high = UINT32_MAX;
         if (source->host_data && source->host_data_size == size)

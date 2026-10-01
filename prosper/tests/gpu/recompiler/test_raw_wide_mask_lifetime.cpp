@@ -3,6 +3,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <string>
@@ -186,8 +187,98 @@ int main() {
                                         0xbf840002u}); // s_cbranch_scc0 +2 dwords
         numeric(shader(export_word, one_arm), "one-arm fresh mask does not dominate the joined reader");
         auto loop = tail;
-        loop.insert(loop.begin() + 2, 0xbf82fffdu); // back to the compare
-        numeric(shader(export_word, loop), "backwards mask proof requires an unsupported convergence proof");
+        loop.insert(loop.begin() + 2, 0xbf82fffdu); // back to the independent compare
+        check(rdna2_raw_wide_data_loads(decode(shader(export_word, loop))).empty(), name,
+              "independent backward mask facts converge without inventing a numeric observer");
+        auto loop_reader = tail;
+        loop_reader.insert(loop_reader.begin() + 2,
+            {0x7e000219u, 0xbf82fffcu}); // real old-high-word reader, then back to compare
+        numeric(shader(export_word, loop_reader),
+                "converged loop retains a real numeric high-word reader");
+        auto descriptor_loop = shader(export_word,
+            {0xbea80382u,                  // s40 = two iterations
+             0x81a88128u,                  // s40 -= 1
+             0xbf068028u, 0xbf84fffdu,     // loop on independent counter SCC
+             0xbe980480u, 0xbe9a0480u,     // overwrite raw words after the loop
+             0xbefe04c1u});
+        check(rdna2_raw_wide_data_loads(decode(descriptor_loop)).empty() &&
+              !compile(descriptor_loop, table_for(descriptor_loop)).empty(), name,
+              "descriptor-only finite loop after a once-executed load remains a nonempty module");
+        auto loop_exit_reader = descriptor_loop;
+        loop_exit_reader.insert(loop_exit_reader.begin() + 11, 0x7e000219u);
+        numeric(loop_exit_reader, "loop-carried high-word data remains required at the exit reader");
+        std::vector<uint32_t> first_iteration_mask{0xbea80382u};
+        append(first_iteration_mask, compare(24));
+        append(first_iteration_mask, select());
+        first_iteration_mask.insert(first_iteration_mask.end(),
+            {0xbe99031au, 0x81a88128u, 0xbf068028u, 0xbf84fffau});
+        numeric(shader(export_word, first_iteration_mask),
+                "a mask valid on the first iteration expires before the next loop reader");
+        auto replayed_load = loop;
+        replayed_load[2] = 0xbf82fff8u; // branch pc9 back to the raw load pc2
+        numeric(shader(export_word, replayed_load),
+                "same raw load reexecution cannot reuse an earlier descriptor observation");
+
+        // Save a real Bool EXEC before the raw load; restoring it later must retain that
+        // independent lifetime. The conditional body overwrites all raw words before data use.
+        auto saved_exec = shader(export_word,
+            {0xbefe0420u,                  // EXEC = saved s32:33
+             compare(24, 128u, 0x12u)[0], compare(24, 128u, 0x12u)[1],
+             0xbf880002u,                 // EXECZ skips the two complete pair overwrites
+             0xbe980480u, 0xbe9a0480u,
+             0xbefe04c1u});               // full EXEC before VS position export
+        saved_exec.insert(saved_exec.begin() + 2, 0xbea0047eu); // s32:33 = EXEC
+        const auto saved_decoded = decode(saved_exec);
+        check(saved_decoded.at(2).fmt == Rdna2Format::SOP1 &&
+              saved_decoded.at(2).opcode == 4u && saved_decoded.at(2).dst.value == 32 &&
+              saved_decoded.at(2).src[0].kind == OperandKind::Special &&
+              saved_decoded.at(2).src[0].value == 126 &&
+              saved_decoded.at(3).fmt == Rdna2Format::SMEM && saved_decoded.at(3).pc == 3u,
+              name, "saved EXEC and later raw load decode as distinct exact definitions");
+        check(rdna2_raw_wide_data_loads(saved_decoded).empty() &&
+              !compile(saved_exec, table_for(saved_exec)).empty(), name,
+              "dominating unchanged pre-load saved EXEC remains a nonempty graphics module");
+        const auto saved_numeric = [&](const std::vector<uint32_t>& code, const char* label) {
+            const auto instructions = decode(code);
+            const auto load = std::find_if(instructions.begin(), instructions.end(),
+                [](const auto& in) { return in.fmt == Rdna2Format::SMEM && in.opcode == 2u; });
+            const auto classified = rdna2_raw_wide_data_loads(instructions);
+            const bool refused = compile(code, table_for(code)).empty();
+            const auto reason = last_terminal_reject_reason(last_program);
+            const auto pc = load == instructions.end() ? UINT32_MAX : load->pc;
+            check(classified == std::vector<uint32_t>{pc} && refused &&
+                  reason.find("pc=" + std::to_string(pc) + " ") != std::string::npos &&
+                  reason.find("op=0x2") != std::string::npos, name, label);
+        };
+        for (uint32_t overwrite : {0xbea00319u, 0xbea10319u}) {
+            auto expired_saved = saved_exec;
+            expired_saved.insert(expired_saved.begin() + 8, overwrite); // root/sibling = raw s25
+            saved_numeric(expired_saved, overwrite == 0xbea00319u
+                ? "post-load root overwrite expires a pre-load saved EXEC proof"
+                : "post-load sibling overwrite expires a pre-load saved EXEC proof");
+        }
+        auto conditional_save = saved_exec;
+        conditional_save.insert(conditional_save.begin() + 2,
+            {0xbf068080u, 0xbf840001u}); // one path bypasses the only saved definition
+        saved_numeric(conditional_save,
+                "pre-load saved EXEC must dominate every reaching path");
+        auto unknown_prefix = saved_exec;
+        unknown_prefix.insert(unknown_prefix.begin() + 3, 0xbea82828u); // relative SGPR write
+        check(rdna2_raw_wide_data_loads(decode(unknown_prefix)) == std::vector<uint32_t>{4u},
+              name, "unknown relative prefix write cannot seed a textual saved EXEC alias");
+        auto before_load_expired = saved_exec;
+        before_load_expired.insert(before_load_expired.begin() + 3, 0xbea10314u);
+        saved_numeric(before_load_expired,
+                "pre-load sibling overwrite invalidates the saved EXEC pair");
+        auto overlap_save = saved_exec;
+        overlap_save[2] = 0xbe98047eu; // save in s24:25, overwritten by the load itself
+        overlap_save[8] = 0xbefe0418u;
+        saved_numeric(overlap_save,
+                "raw load overlap cannot retain the old saved EXEC pair");
+        auto saved_high = saved_exec;
+        saved_high.insert(saved_high.begin() + 9, 0x7e000219u);
+        saved_numeric(saved_high,
+                "pre-load saved EXEC does not erase an ordinary loaded high-word reader");
 
         std::vector<uint32_t> combined;
         append(combined, compare(24));
