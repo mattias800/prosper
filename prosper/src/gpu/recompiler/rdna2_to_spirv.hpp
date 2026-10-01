@@ -209,6 +209,10 @@ std::vector<uint32_t> rdna2_proven_raw_x2_data_loads(const std::vector<Rdna2Inst
 std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& instructions);
 std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
     const std::vector<Rdna2Inst>& instructions);
+// Exact immediate x4/x8 read points requiring an owned same-fold observation: entry pointers
+// may change after the fetch, or the fetched words select a proven register-offset child.
+std::vector<uint32_t> rdna2_owned_raw_wide_data_loads(
+    const std::vector<Rdna2Inst>& instructions);
 // Register offsets with a straight-line scalar-data definition, followed by the same entry-pointer
 // and lifetime proof as immediate loads. Immediate-zero raw x1 dependencies authenticate their
 // source pointer only through that read; realization owns the observed scalar bytes. Explicit

@@ -5661,9 +5661,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rt && (in.opcode == 0x2 || in.opcode == 0x3) && !soff_null &&
                 rs.smem_raw_wide_data_loads.contains(in.pc);
             const ShaderResource* register_source = rt ? rt->by_fetch_pc(in.pc) : nullptr;
+            const bool owned_wide_source = rs.smem_raw_owned_wide_data_loads.contains(in.pc);
+            const ShaderResource* owned_wide_binding = owned_wide_source && rt
+                ? owned_raw_snapshot_at(*rt, in.pc, n * sizeof(uint32_t)) : nullptr;
+            if (owned_wide_source && !owned_wide_binding) {
+                if (getenv("PROSPER_DBG"))
+                    fprintf(stderr,
+                            "[smem-reject] pc=%u reason=raw-wide-read-requires-owned-backing\n",
+                            in.pc);
+                ok = false;
+                return true;
+            }
             // A source word admitted by the wide-offset proof belongs to this exact realization.
             // A malformed replay table must fail before ordinary scalar-load resource fallback.
-            if (rs.smem_raw_offset_scalar_source_pcs.contains(in.pc) &&
+            if (!owned_wide_source && rs.smem_raw_offset_scalar_source_pcs.contains(in.pc) &&
                 (!register_source || register_source->fetch_pc != in.pc ||
                  !valid_raw_offset_scalar_snapshot_resource(*register_source))) {
                 if (getenv("PROSPER_DBG"))
@@ -5699,12 +5710,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // reports numeric/uncertain reads; it cannot turn that legacy route into a
                 // current-byte observation. Register-offset data requires backing in every stage.
                 const ShaderResource* exact = rt->by_fetch_pc(in.pc);
-                const bool backed_immediate_wide = soff_null && !nested_raw_wide_data &&
+                const bool backed_immediate_wide = owned_wide_binding ||
+                    (soff_null && !nested_raw_wide_data &&
                     (n == 4u || n == 8u) &&
                     rs.smem_raw_immediate_wide_data_loads.contains(in.pc) && exact &&
                     exact->fetch_pc == in.pc && exact->cls == ResourceClass::ConstantBuffer &&
                     shader_resource_buffer_binding_bytes(*exact) >=
-                        static_cast<uint64_t>(in.literal) + n * sizeof(uint32_t);
+                        static_cast<uint64_t>(in.literal) + n * sizeof(uint32_t));
                 const bool backed_nested_wide = nested_raw_wide_data &&
                     rs.smem_raw_nested_wide_data_loads.contains(in.pc) && exact &&
                     exact->fetch_pc == in.pc && exact->cls == ResourceClass::ConstantBuffer &&
@@ -5802,7 +5814,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 soff_dyn = true;
             } else if ((int32_t)in.literal < 0) { ok = false; return true; }   // negative imm-only would wrap
-            uint32_t base_idx = (soff_dyn || backed_register_wide) ? 0 : in.literal >> 2;
+            uint32_t base_idx = (soff_dyn || backed_register_wide || owned_wide_source)
+                ? 0 : in.literal >> 2;
             // Descriptor provenance: pick which bound constant buffer via the resource table, routing this
             // load to that buffer's OWN binding (N-buffer model) — so Unity's several constant buffers
             // (per-draw transform, per-frame, …) don't collapse onto one. For s_buffer_load, SBASE
@@ -5879,6 +5892,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                (resource.fetch_pc == in.pc ||
                                !rs.smem_raw_x2_data_loads.contains(resource.fetch_pc) &&
                                !rs.smem_raw_offset_scalar_source_pcs.contains(resource.fetch_pc) &&
+                               !rs.smem_raw_owned_wide_data_loads.contains(resource.fetch_pc) &&
                                !rs.smem_raw_register_wide_data_loads.contains(resource.fetch_pc) &&
                                !rs.smem_raw_immediate_wide_data_loads.contains(resource.fetch_pc)) &&
                                (resource.cls == ResourceClass::ConstantBuffer ||

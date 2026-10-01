@@ -6,6 +6,7 @@
 #include <array>
 #include <bitset>
 #include <cstdint>
+#include <iterator>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -487,8 +488,8 @@ std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& in
 // buffer. The predicate above reports uncertainty as "needs backing"; it must never itself grant
 // admission. Here the entire decoded program has only valid forward edges, and the raw pointer is
 // an unchanged entry pair. A load then observes one dispatch-local upload on every visit.
-std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
-        const std::vector<Rdna2Inst>& ins) {
+static std::vector<uint32_t> proven_immediate_wide_data_loads(
+        const std::vector<Rdna2Inst>& ins, bool owned_read_point) {
     std::vector<uint32_t> proven;
     if (ins.empty()) return proven;
     std::unordered_map<uint32_t, size_t> by_pc;
@@ -529,7 +530,7 @@ std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
         for (const Rdna2Inst& in : ins) {
             // Forward-only control permits a textual prefix scan: any earlier global/image
             // store might alias the raw source after the CPU upload was captured.
-            if (in.pc < load.pc && rdna2_may_write_guest_memory(in))
+            if ((owned_read_point || in.pc < load.pc) && rdna2_may_write_guest_memory(in))
                 stable_entry_pointer = false;
             // A predecessor may bypass the load only if every bypass path overwrites all
             // would-be loaded words before reading them. This admits branch-to-after-region
@@ -543,17 +544,23 @@ std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
                         by_pc.at(static_cast<uint32_t>(target))))
                     stable_entry_pointer = false;
             }
-            for_each_scalar_write(in, [&](int base, uint32_t width) {
-                if (base >= 0 && base <= load.src[0].value + 1 &&
-                    base + static_cast<int>(width) > load.src[0].value)
-                    stable_entry_pointer = false;
-            });
+            if (!owned_read_point || in.pc < load.pc)
+                for_each_scalar_write(in, [&](int base, uint32_t width) {
+                    if (base >= 0 && base <= load.src[0].value + 1 &&
+                        base + static_cast<int>(width) > load.src[0].value)
+                        stable_entry_pointer = false;
+                });
             if (!stable_entry_pointer) break;
         }
         if (stable_entry_pointer && lifetime.has_numeric_reader_or_uncertain_path())
             proven.push_back(load.pc);
     }
     return proven;
+}
+
+std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
+        const std::vector<Rdna2Inst>& ins) {
+    return proven_immediate_wide_data_loads(ins, false);
 }
 
 std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
@@ -567,6 +574,7 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
             (load.opcode == 0x2u || load.opcode == 0x3u))
             load.src[1] = {OperandKind::Special, 125};
     const auto entry_proven = rdna2_proven_raw_immediate_wide_data_loads(immediate);
+    const auto owned_parents = proven_immediate_wide_data_loads(ins, true);
     std::vector<uint32_t> proven;
     for (size_t i = 0; i < ins.size(); ++i) {
         const auto& load = ins[i];
@@ -611,6 +619,14 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                         writes.set(static_cast<size_t>(base + static_cast<int>(k)));
             });
             if ((writes & needed).none()) continue;
+            // A complete immediate parent supplies the SAME observed words to the fold and
+            // emitted stage. Later writes to its entry pointer cannot retarget this earlier read.
+            // The parent proof still rejects every potentially aliasing guest write in the shader.
+            if (std::binary_search(owned_parents.begin(), owned_parents.end(), writer.pc)) {
+                needed &= ~writes;
+                sources.push_back(writer.pc);
+                continue;
+            }
             // A bounded immediate raw x1 fetch is a latched scalar value. Its entry pointer
             // needs to survive only UNTIL this read, unlike the wide source pointer, whose
             // full-program lifetime is authenticated above. GTA overwrites this source pair
@@ -689,6 +705,22 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                                 scalar_source_pcs->end());
     }
     return proven;
+}
+
+std::vector<uint32_t> rdna2_owned_raw_wide_data_loads(const std::vector<Rdna2Inst>& ins) {
+    const auto strict = rdna2_proven_raw_immediate_wide_data_loads(ins);
+    const auto read_points = proven_immediate_wide_data_loads(ins, true);
+    std::vector<uint32_t> owned;
+    std::set_difference(read_points.begin(), read_points.end(), strict.begin(), strict.end(),
+                        std::back_inserter(owned));
+    std::vector<uint32_t> scalar_sources;
+    rdna2_proven_raw_register_wide_data_loads(ins, &scalar_sources);
+    for (uint32_t pc : scalar_sources)
+        if (std::binary_search(read_points.begin(), read_points.end(), pc))
+            owned.push_back(pc);
+    std::sort(owned.begin(), owned.end());
+    owned.erase(std::unique(owned.begin(), owned.end()), owned.end());
+    return owned;
 }
 
 std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(

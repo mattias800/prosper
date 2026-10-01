@@ -1184,6 +1184,29 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (const auto& diagnostic : c.failure_diagnostics)
         if (!write_float_mode(diagnostic.ps_float_mode,
                               "invalid failed-draw fragment float mode")) return false;
+    // v65: a refusal obligation only; materialization independently derives required PC/width.
+    w.u32(static_cast<uint32_t>(sample_resource_count));
+    auto write_owned_raw_snapshots = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources) {
+            const auto& resource = captured.resource;
+            const uint32_t bytes = resource.owned_raw_snapshot_bytes;
+            if (bytes && ((bytes != 16u && bytes != 32u) ||
+                          !valid_owned_raw_snapshot_shape(resource, bytes) ||
+                          captured.captured_size < bytes)) {
+                error = "invalid owned wide snapshot obligation";
+                return false;
+            }
+            w.u32(bytes);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_owned_raw_snapshots(draw.vrt) || !write_owned_raw_snapshots(draw.prt)) return false;
+    for (const auto& compute : c.computes)
+        if (!write_owned_raw_snapshots(compute.resources)) return false;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (!write_owned_raw_snapshots(stage.resource_table)) return false;
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace prosper::gpu {
@@ -535,6 +536,9 @@ struct ShaderResource {
     // A fold-proven raw register-offset x4/x8 load bound to exactly the effective source bytes.
     // The recompiler reads at index zero, after independently proving this load and wave contract.
     bool raw_register_snapshot = false;
+    // Capture obligation, never admission authority: exact raw code must independently prove
+    // this PC/width. Missing raw provenance cannot silently replay this resource as guest memory.
+    uint32_t owned_raw_snapshot_bytes = 0;
 };
 
 inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource) {
@@ -553,17 +557,28 @@ inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource)
 // The immediate x1 source of a fold-proven wide offset owns the four bytes observed during
 // realization. Code-side provenance identifies its PC; replay must supply a complete hosted word
 // at that PC instead of borrowing current guest memory or a legacy binding-2 buffer.
-inline bool valid_raw_offset_scalar_snapshot_resource(const ShaderResource& resource) {
+inline bool valid_owned_raw_snapshot_shape(const ShaderResource& resource, uint32_t bytes) {
     return resource.cls == ResourceClass::ConstantBuffer &&
         resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
-        resource.size == sizeof(uint32_t) && resource.stride == 0u &&
+        (bytes == 4u || bytes == 16u || bytes == 32u) &&
+        resource.size == bytes && resource.stride == 0u &&
         resource.fetch_pc != UINT32_MAX && resource.srt_offset == UINT32_MAX &&
         resource.sgpr_base == UINT32_MAX && resource.table_index_count == 0u &&
         resource.scalar_buffer_dword_count == 0u && !resource.nested_raw_snapshot_admitted &&
         !resource.raw_register_snapshot && resource.gpu_addr > 0x10000u &&
         (resource.gpu_addr & 3u) == 0u &&
-        resource.gpu_addr <= UINT64_MAX - sizeof(uint32_t) && resource.host_data &&
-        resource.host_data_size >= sizeof(uint32_t) && resource.host_data_prefix_bytes == 0u;
+        resource.gpu_addr <= UINT64_MAX - bytes && resource.host_data_prefix_bytes == 0u &&
+        (bytes == 4u ? resource.owned_raw_snapshot_bytes == 0u :
+                      (!resource.owned_raw_snapshot_bytes || resource.owned_raw_snapshot_bytes == bytes));
+}
+
+inline bool valid_owned_raw_snapshot_resource(const ShaderResource& resource, uint32_t bytes) {
+    return valid_owned_raw_snapshot_shape(resource, bytes) && resource.host_data &&
+        (bytes == 4u ? resource.host_data_size >= bytes : resource.host_data_size == bytes);
+}
+
+inline bool valid_raw_offset_scalar_snapshot_resource(const ShaderResource& resource) {
+    return valid_owned_raw_snapshot_resource(resource, sizeof(uint32_t));
 }
 
 // Decode the exact SQ_IMG_SAMP state consumed by one MIMG instruction. Metadata describes a
@@ -876,6 +891,9 @@ struct ShaderResourceTable {
     // vertex/instance invocations into guest waves; flattening InstanceIndex therefore needs the
     // submitted number of vertices per instance. Zero keeps standalone shader fixtures compatible.
     uint32_t vertices_per_instance = 0;
+    // Live code-derived capture obligations. Never serialized or trusted by replay: replay's
+    // emitter derives the required PC/width independently from the restored exact shader bytes.
+    std::vector<std::pair<uint32_t, uint32_t>> owned_raw_snapshot_requirements;
 
     // Resolve the resource whose descriptor originates at `srt_offset` (indirect/`s_load` provenance);
     // nullptr if none. Deterministic; first match wins.
@@ -911,6 +929,19 @@ struct ShaderResourceTable {
     // Resolve by assigned Vulkan binding (the pipeline's lookup); nullptr if none.
     const ShaderResource* by_binding(uint32_t binding) const;
 };
+
+// A proof-owned source cannot borrow a later valid duplicate after an earlier poisoned match.
+// Use this same unique exact-PC selection in emission and compile-key admission.
+inline const ShaderResource* owned_raw_snapshot_at(const ShaderResourceTable& table,
+                                                   uint32_t pc, uint32_t bytes) {
+    const ShaderResource* selected = nullptr;
+    for (const auto& resource : table.resources) {
+        if (resource.fetch_pc != pc) continue;
+        if (selected) return nullptr;
+        selected = &resource;
+    }
+    return selected && valid_owned_raw_snapshot_resource(*selected, bytes) ? selected : nullptr;
+}
 
 // Validate the generic runtime-selected buffer-array representation. Scalar resources are valid
 // only with an inert table payload; array resources require a coherent selector and one raw,

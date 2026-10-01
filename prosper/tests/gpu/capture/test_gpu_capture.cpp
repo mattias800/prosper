@@ -499,7 +499,7 @@ int main(int argc, char** argv) {
         for (const auto& failure : f.failure_diagnostics)
             for (const auto& stage : failure.stages)
                 resources += stage.resource_table.resources.size();
-        size_t bytes = 4u + resources; // v62 count plus one raw-register snapshot byte per resource
+        size_t bytes = 8u + 5u * resources; // v62 count/markers plus v64 count/owned obligations
         bytes += 4u + f.draws.size(); // v63 count plus one realized guest-width tag per draw
         bytes += 8u + 2u * (f.draws.size() + f.failure_diagnostics.size()); // v64 modes
         for (const auto& failure : f.failure_diagnostics) {

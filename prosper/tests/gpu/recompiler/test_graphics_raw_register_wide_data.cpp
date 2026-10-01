@@ -40,6 +40,43 @@ int main() {
         const char* name = stage == ShaderProgramStage::Vertex ? "VS" : "PS";
         const uint32_t export_word = stage == ShaderProgramStage::Vertex
             ? 0xf80008cfu : 0xf800180fu;
+        // A standalone relaxed read point has no Route A dependency or old strict-PC tag.
+        // Its exact owned binding cannot become the conventional fallback for another load.
+        const std::vector<uint32_t> owned_only{
+            0xf4080600u, 0xfa000004u, 0xbe800380u, 0xbe810380u,
+            0x7e00021bu, export_word, 0u, 0xbf810000u};
+        ShaderResourceTable owned_table;
+        ShaderResource owned_source;
+        owned_source.cls = ResourceClass::ConstantBuffer;
+        owned_source.format = DataFormat::Uint32;
+        owned_source.num_components = 1u;
+        owned_source.binding = 2u;
+        owned_source.fetch_pc = 0u;
+        owned_source.gpu_addr = address + 4u;
+        owned_source.size = 16u;
+        owned_source.host_data = reinterpret_cast<uint8_t*>(words.data() + 1u);
+        owned_source.host_data_size = 16u;
+        owned_source.owned_raw_snapshot_bytes = 16u;
+        owned_table.resources.push_back(owned_source);
+        check(rdna2_owned_raw_wide_data_loads(decode(owned_only)) ==
+                  std::vector<uint32_t>{0u} && !compile(stage, owned_only, owned_table).empty(),
+              name, "standalone nonzero-immediate read executes from its complete owned binding");
+        auto unrelated_owned = owned_only;
+        unrelated_owned.insert(unrelated_owned.begin() + 5,
+            {0xf4000a01u, 0xfa000000u, 0x7e020228u}); // unrelated x1 s40,entry2:3; v1=s40
+        check(compile(stage, unrelated_owned, owned_table).empty(), name,
+              "owned-only binding2 cannot authorize an unrelated unresolved raw scalar load");
+        if (stage == ShaderProgramStage::Vertex) {
+            auto compute_owned = owned_only;
+            compute_owned.erase(compute_owned.end() - 3, compute_owned.end() - 1);
+            auto compute_unrelated = unrelated_owned;
+            compute_unrelated.erase(compute_unrelated.end() - 3, compute_unrelated.end() - 1);
+            check(!recompile_valu(compute_owned.data(), compute_owned.size(), 1u, 0u,
+                                  &owned_table).empty() &&
+                  recompile_valu(compute_unrelated.data(), compute_unrelated.size(), 2u, 0u,
+                                 &owned_table).empty(), "compute",
+                  "complete owned numeric source does not supply an unrelated binding2 fallback");
+        }
         for (bool wide8 : {false, true}) {
             const std::vector<uint32_t> code{
                 0x8f148402u, // s_lshl_b32 s20,entry s2,4

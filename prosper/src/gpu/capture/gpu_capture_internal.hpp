@@ -186,7 +186,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // explicit unavailable state. This does not describe the effective backend SPIR-V subgroup width.
 // v64 (#4056): canonical availability plus all eight guest FLOAT_MODE bits for realized draws and
 // failed draws. Independent of the v63 width contract; legacy files retain explicit unknown mode.
-constexpr uint32_t kVersion = 64;
+// v65: owned immediate-wide capture obligations. Raw code and exact hosted bytes remain
+// independent admission requirements; older unmarked captures retain their historical shape.
+constexpr uint32_t kVersion = 65;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -1470,6 +1472,10 @@ inline bool capture_authority_requires_backing(const ShaderResourceTable* table,
                                         const ShaderResource& resource) {
     if (is_capture_authority_resource(resource)) return true;
     if (!table || !resource.gpu_addr) return false;
+    if (std::any_of(table->owned_raw_snapshot_requirements.begin(),
+                    table->owned_raw_snapshot_requirements.end(), [&](const auto& requirement) {
+            return requirement.first == resource.fetch_pc;
+        })) return true;
     const uint64_t footprint = resource_footprint(resource);
     return footprint && std::any_of(
         table->resources.begin(), table->resources.end(),
