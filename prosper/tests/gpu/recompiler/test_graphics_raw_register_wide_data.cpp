@@ -138,7 +138,7 @@ int main() {
                       mutable_main.data(), legacy_main.size(), &legacy_table, nullptr,
                       &recovered_version) == version_legacy && recovered_version == version_identity,
                   name, "restored main code recovers the original shared chain module");
-            const std::array<uint32_t, 5> owned_prolog{
+            const std::array<uint32_t, 5> linked_owned_prolog{
                 owned_only[0], owned_only[1], owned_only[2], owned_only[3], 0xbe802006u};
             const std::vector<uint32_t> linked_observer_main{
                 owned_only[4], export_word, 0u, 0xbf810000u};
@@ -147,16 +147,16 @@ int main() {
             const auto linked_legacy = recompile_vertex_chain_cached_shared(mutable_prolog.data(),
                 prolog.size(), mutable_main.data(), linked_observer_main.size(),
                 &legacy_table, nullptr, &linked_legacy_identity);
-            std::copy(owned_prolog.begin(), owned_prolog.end(), mutable_prolog.begin());
-            const auto prolog_decode = decode(std::vector<uint32_t>(owned_prolog.begin(), owned_prolog.end()));
-            auto linked_code = std::vector<uint32_t>(owned_prolog.begin(), owned_prolog.end() - 1);
+            std::copy(linked_owned_prolog.begin(), linked_owned_prolog.end(), mutable_prolog.begin());
+            const auto prolog_decode = decode(std::vector<uint32_t>(linked_owned_prolog.begin(), linked_owned_prolog.end()));
+            auto linked_code = std::vector<uint32_t>(linked_owned_prolog.begin(), linked_owned_prolog.end() - 1);
             linked_code.insert(linked_code.end(), linked_observer_main.begin(), linked_observer_main.end());
             const bool linked_only_owned = rdna2_owned_raw_wide_data_loads(prolog_decode).empty() &&
                 rdna2_owned_raw_wide_data_loads(decode(linked_observer_main)).empty() &&
                 rdna2_owned_raw_wide_data_loads(decode(linked_code)) == std::vector<uint32_t>{0u};
             changed_identity = 99u;
             check(linked_legacy && !linked_legacy->empty() && linked_only_owned &&
-                  !recompile_vertex_chain_cached_shared(mutable_prolog.data(), owned_prolog.size(),
+                  !recompile_vertex_chain_cached_shared(mutable_prolog.data(), linked_owned_prolog.size(),
                       mutable_main.data(), linked_observer_main.size(), &legacy_table,
                       nullptr, &changed_identity) && changed_identity == 0u, name,
                   "same-address changed prolog checks ownership arising only in the linked stream");
