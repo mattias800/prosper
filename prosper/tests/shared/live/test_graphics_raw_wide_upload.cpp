@@ -27,7 +27,7 @@ constexpr uint32_t W = 8, H = 8;
 constexpr uint32_t Fullscreen[]{0x36020081u, 0x2c040081u, 0x7e020d01u,
     0x7e040d02u, 0x7e0a02f6u, 0x7e0c02f2u, 0x10020b01u, 0x08020d01u,
     0x10040b02u, 0x08040d02u, 0x7e060280u, 0x7e0802f2u};
-enum class Load { None, Numeric, MemorySelector, Descriptor, DescriptorMask, RuntimeSelector };
+enum class Load { None, Numeric, MemorySelector, OwnedSelector, Descriptor, DescriptorMask, RuntimeSelector };
 struct Program {
     alignas(256) std::array<uint32_t, 64> code{};
     AgcShaderSharp sharp{4u}; // independent metadata V# at user offset4, not a raw load source
@@ -51,8 +51,16 @@ static Program& register_program(bool vertex, Load load, bool wide8) {
         p.scalar_pc = static_cast<uint32_t>(code.size());
         code.insert(code.end(), {0xf4000580u | ((base + 8u) / 2u), 0xfa000000u});
     }
+    if (load == Load::OwnedSelector) {
+        p.scalar_pc = static_cast<uint32_t>(code.size());
+        code.insert(code.end(), {(wide8 ? 0xf40c0a00u : 0xf4080a00u) | ((base + 8u) / 2u),
+                                 0xfa000004u}); // parent s[40:43/47], entry pair, +4
+        code.push_back(0xbe800380u | ((base + 8u) << 16u));
+        code.push_back(0xbe800380u | ((base + 9u) << 16u)); // pointer overwritten AFTER read
+    }
     if (load != Load::None) {
-        const uint32_t selector = load == Load::MemorySelector ? 22u : base + 2u;
+        const uint32_t selector = load == Load::MemorySelector ? 22u :
+            load == Load::OwnedSelector ? (wide8 ? 47u : 43u) : base + 2u;
         code.push_back(0x8f148400u | selector); // s20 = selector << 4
         p.load_pc = static_cast<uint32_t>(code.size());
         code.insert(code.end(), {(wide8 ? 0xf40c0600u : 0xf4080600u) | (base / 2u),
@@ -72,9 +80,10 @@ static Program& register_program(bool vertex, Load load, bool wide8) {
             const uint32_t last = wide8 ? 31u : 27u;
             code.push_back((vertex ? 0x7e0e0200u : 0x7e000200u) | last);
         }
-        if (vertex && load == Load::MemorySelector) {
-            code.insert(code.end(), {0x7e100c16u, 0x101010f0u, 0x060e1107u});
-            // v7 += float(s22) * 0.5. Make the x1 upload itself observable beside the selected
+        if (vertex && (load == Load::MemorySelector || load == Load::OwnedSelector)) {
+            const uint32_t source = load == Load::MemorySelector ? 22u : (wide8 ? 47u : 43u);
+            code.insert(code.end(), {0x7e100c00u | source, 0x101010f0u, 0x060e1107u});
+            // v7 += float(s22) * 0.5. Make the selector upload itself observable beside the selected
             // wide bytes: a guest selector reread after realization moves this triangle offscreen.
         }
     }
@@ -86,8 +95,10 @@ static Program& register_program(bool vertex, Load load, bool wide8) {
         code.insert(code.end(), {0x7e000280u, 0x7e0202f2u, 0x7e040280u, 0x7e0602f2u,
                                 0xf800180fu, 0x03020100u, 0xbf810000u});
     } else {
-        if (load == Load::MemorySelector)
-            code.insert(code.end(), {0x7e020c16u, 0x100202ffu, 0x3e000000u}); // green=selector/8
+        if (load == Load::MemorySelector || load == Load::OwnedSelector) {
+            const uint32_t source = load == Load::MemorySelector ? 22u : (wide8 ? 47u : 43u);
+            code.insert(code.end(), {0x7e020c00u | source, 0x100202ffu, 0x3e000000u}); // green=selector/8
+        }
         else code.insert(code.end(), {0x7e0202ffu, 0x3f000000u});
         code.insert(code.end(), {0x7e0402ffu, 0x3f400000u, 0x7e0602f2u,
                                 0xf800180fu, 0x03020100u, 0xbf810000u});
@@ -351,6 +362,65 @@ int main(int argc, char** argv) {
         *mask_value = std::bit_cast<uint32_t>(0.0f);
         notify_guest_gpu_write(guest + 0x3000u, sizeof(*mask_value));
         if (mask_made) observe_pixels(mask_draw, vertex, 0.0f, arm);
+        for (bool wide8 : {false, true}) {
+            auto& owned_program = register_program(vertex, Load::OwnedSelector, wide8);
+            const uint32_t count = wide8 ? 8u : 4u;
+            const uint32_t last = count - 1u;
+            const float first = vertex ? 0.5f : 0.25f, second = vertex ? 0.0f : 0.75f;
+            data[8u + last] = std::bit_cast<uint32_t>(first);
+            data[12u + last] = std::bit_cast<uint32_t>(second);
+            std::fill(selector, selector + 9u, 0u);
+            selector[1u + last] = 2u;
+            notify_guest_gpu_write(guest, 0x2024u);
+            auto owned_state = state_for(vertex ? owned_program : plain_vs,
+                vertex ? plain_ps : owned_program, guest,
+                reinterpret_cast<uint64_t>(selector), metadata);
+            DrawItem owned_draw;
+            const bool owned_made = realize_draw_item(owned_state, &owned_state.draws[0],
+                3u, 64u, false, owned_draw);
+            const auto owned_table = vertex ? owned_draw.vrt : owned_draw.prt;
+            const auto* parent = owned_table ? owned_table->by_fetch_pc(owned_program.scalar_pc) : nullptr;
+            const auto* child = owned_table ? owned_table->by_fetch_pc(owned_program.load_pc) : nullptr;
+            uint32_t observed = UINT32_MAX;
+            if (parent && parent->host_data && parent->host_data_size == count * 4u)
+                std::memcpy(&observed, parent->host_data + last * 4u, 4u);
+            check(owned_made && parent && child && observed == 2u &&
+                  parent->owned_raw_snapshot_bytes == count * 4u &&
+                  parent->gpu_addr == reinterpret_cast<uint64_t>(selector + 1u) &&
+                  owned_table->owned_host_data.size() == 1u &&
+                  std::count_if(owned_table->resources.begin(), owned_table->resources.end(),
+                      [&](const auto& r) { return r.fetch_pc == owned_program.scalar_pc; }) == 1 &&
+                  child->gpu_addr == guest + 32u && child->size == count * 4u, arm,
+                  "real stage owns complete x4/x8 parent highest word with exactly one authoritative binding");
+            if (!owned_made || !parent || !child) continue;
+            const auto interface = validate_spirv_descriptor_interface(
+                vertex ? owned_draw.vs_words() : owned_draw.fs_words(), owned_table.get(),
+                vertex ? 0u : 1u, vertex ? SpirvShaderStage::Vertex : SpirvShaderStage::Fragment);
+            const auto reflected = [&](const ShaderResource* source) {
+                return std::any_of(interface.descriptors.begin(), interface.descriptors.end(),
+                    [&](const auto& d) { return d.binding == source->binding &&
+                        d.kind == SpirvDescriptorKind::StorageBuffer && d.readable &&
+                        d.required_bytes >= source->size; });
+            };
+            check(interface.ok() && reflected(parent) && reflected(child), arm,
+                  "both real graphics bindings reflect complete highest parent and child words");
+            observe_pixels(owned_draw, vertex, vertex ? first + 1.0f : first, arm, 0.25f);
+            selector[1u + last] = 3u;
+            notify_guest_gpu_write(reinterpret_cast<uint64_t>(selector + 1u), count * 4u);
+            observe_pixels(owned_draw, vertex, vertex ? first + 1.0f : first, arm, 0.25f);
+            data[8u + last] = std::bit_cast<uint32_t>(second);
+            notify_guest_gpu_write(guest + 32u, count * 4u);
+            observe_pixels(owned_draw, vertex, vertex ? second + 1.0f : second, arm, 0.25f);
+            DrawItem next_owned;
+            const bool next_made = realize_draw_item(owned_state, &owned_state.draws[0],
+                3u, 64u, false, next_owned);
+            const auto next_table = vertex ? next_owned.vrt : next_owned.prt;
+            check(next_made && next_table && next_table->by_fetch_pc(owned_program.load_pc) &&
+                  next_table->by_fetch_pc(owned_program.load_pc)->gpu_addr == guest + 48u, arm,
+                  "next real draw uses changed highest parent word to select the new child bytes");
+            if (next_made) observe_pixels(next_owned, vertex,
+                vertex ? second + 1.5f : second, arm, 0.375f);
+        }
         auto& latched = register_program(vertex, Load::MemorySelector, false);
         data[11u] = std::bit_cast<uint32_t>(vertex ? 0.5f : 0.25f);
         data[15u] = std::bit_cast<uint32_t>(vertex ? 0.0f : 0.75f);

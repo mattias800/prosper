@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -16,7 +17,21 @@ static void check(bool ok, const char* label) {
     failures += !ok;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    std::filesystem::path replay_fixture_directory;
+    if (argc == 3 && std::string(argv[1]) == "--emit-replay-fixtures") {
+        replay_fixture_directory = argv[2];
+        std::error_code directory_error;
+        std::filesystem::create_directories(replay_fixture_directory, directory_error);
+        if (directory_error) {
+            std::fprintf(stderr, "cannot create replay fixture directory: %s\n",
+                         directory_error.message().c_str());
+            return 2;
+        }
+    } else if (argc != 1) {
+        std::fprintf(stderr, "usage: %s [--emit-replay-fixtures DIRECTORY]\n", argv[0]);
+        return 2;
+    }
     for (bool wide8 : {false, true}) {
         const uint32_t size = wide8 ? 32u : 16u;
         const uint32_t last = wide8 ? 7u : 3u;
@@ -109,6 +124,70 @@ int main() {
             std::memcpy(dst, static_cast<const uint8_t*>(data) + offset, copied);
             return copied;
         };
+        // Both inputs deliberately name the same guest interval. Planning owns the old parent
+        // separately, while the child interval can supply newer guest bytes. Removing the owner
+        // after planning must fail at table copying rather than choose that unrelated observation.
+        alignas(16) std::array<uint32_t, 128> overlap{};
+        overlap[8u + last] = 2u;
+        const auto overlap_address = reinterpret_cast<uint64_t>(overlap.data());
+        const auto overlap_parent_address = overlap_address + 28u;
+        const std::array<uint32_t, 4> overlap_user{
+            static_cast<uint32_t>(overlap_parent_address),
+            static_cast<uint32_t>(overlap_parent_address >> 32u),
+            static_cast<uint32_t>(overlap_address),
+            static_cast<uint32_t>(overlap_address >> 32u)};
+        ShaderResourceTable overlap_table;
+        add_compute_buffer_resources(overlap_table, code.data(), code.size(),
+                                     overlap_user.data(), overlap_user.size());
+        assign_convention_bindings(overlap_table, 2u);
+        DrawItem overlap_draw = draw;
+        overlap_draw.vrt = std::make_shared<ShaderResourceTable>(overlap_table);
+        overlap_draw.vs = recompile_vertex(code.data(), code.size(), overlap_draw.vrt.get());
+        const auto* overlap_source = overlap_table.by_fetch_pc(0u);
+        const auto* overlap_child = overlap_table.by_fetch_pc(7u);
+        check(!overlap_draw.vs.empty() && overlap_source && overlap_child &&
+              overlap_source->gpu_addr == overlap_address + 32u &&
+              overlap_child->gpu_addr == overlap_source->gpu_addr &&
+              overlap_source->size == overlap_child->size &&
+              preflight_gpu_capture_draw_resources(overlap_draw, 1u << 20u, planned, error),
+              "overlapping owned parent and guest child are valid before capture planning");
+        overlap[8u + last] = 3u;
+        bool lose_owner = false;
+        unsigned owner_losses = 0u;
+        const CaptureMemoryReader overlap_reader = [&](uint64_t address, uint8_t* dst, size_t want) {
+            if (address >= overlap_draw.vs_guest_addr &&
+                address < overlap_draw.vs_guest_addr + code.size() * 4u) {
+                if (lose_owner && !overlap_draw.vrt->owned_host_data.empty()) {
+                    overlap_draw.vrt->owned_host_data.clear();
+                    ++owner_losses;
+                }
+                return copy_range(address, dst, want, overlap_draw.vs_guest_addr,
+                                  code.data(), code.size() * 4u);
+            }
+            return copy_range(address, dst, want, overlap_address, overlap.data(), sizeof(overlap));
+        };
+        GpuCaptureFile overlap_capture;
+        GpuReplayFrame overlap_replay;
+        const bool overlap_captured = capture_draw_items({overlap_draw}, {}, overlap_reader,
+                                                         overlap_capture, error);
+        const bool overlap_materialized = overlap_captured &&
+            materialize_gpu_replay(overlap_capture, overlap_replay, error);
+        uint32_t overlap_parent_high = UINT32_MAX, overlap_child_high = UINT32_MAX;
+        if (overlap_materialized && overlap_replay.items.size() == 1u && overlap_replay.items[0].vrt) {
+            if (const auto* r = overlap_replay.items[0].vrt->by_fetch_pc(0u); r && r->host_data)
+                std::memcpy(&overlap_parent_high, r->host_data + last * 4u, 4u);
+            if (const auto* r = overlap_replay.items[0].vrt->by_fetch_pc(7u); r && r->host_data)
+                std::memcpy(&overlap_child_high, r->host_data + last * 4u, 4u);
+        }
+        check(overlap_materialized && overlap_parent_high == 2u && overlap_child_high == 3u,
+              "capture keeps distinct observed parent and current child bytes at the same guest address");
+        lose_owner = true;
+        GpuCaptureFile refused_owner_capture;
+        const bool late_owner_capture = capture_draw_items({overlap_draw}, {}, overlap_reader,
+                                                           refused_owner_capture, error);
+        check(owner_losses == 1u && !late_owner_capture &&
+              error == "code-required wide scalar source has no complete owned capture backing",
+              "table copying refuses owner loss after successful planning instead of rereading overlapping guest bytes");
         unsigned parent_reads = 0u;
         const CaptureMemoryReader reader = [&](uint64_t address, uint8_t* dst, size_t want) {
             if (address >= parent_address && address < parent_address + sizeof(parent)) ++parent_reads;
@@ -141,6 +220,15 @@ int main() {
             v62_bytes[8] = 62u;
             v62_bytes[9] = v62_bytes[10] = v62_bytes[11] = 0u;
         }
+        auto bad_count = encoded;
+        if (bad_count.size() >= v63_tail_size) bad_count[bad_count.size() - v63_tail_size] ^= 1u;
+        GpuCaptureFile invalid_format;
+        check(!deserialize_gpu_capture(bad_count, invalid_format, error),
+              "v63 reader refuses mismatched owned-obligation resource count");
+        auto cut_width = encoded;
+        cut_width.pop_back();
+        check(!deserialize_gpu_capture(cut_width, invalid_format, error),
+              "v63 reader refuses a truncated owned-obligation width field");
         GpuCaptureFile v62;
         GpuReplayFrame legacy_replay;
         check(deserialize_gpu_capture(v62_bytes, v62, error) && v62.format_version == 62u &&
@@ -148,33 +236,116 @@ int main() {
                   [](const auto& r) { return r.resource.owned_raw_snapshot_bytes == 0u; }) &&
               materialize_gpu_replay(v62, legacy_replay, error),
               "v62 parsing preserves complete payloads and derives new source authority from code");
+        auto tail_code = code;
+        tail_code.insert(tail_code.end() - 3, {
+            0xbeb21f00u, 0x803232ffu, 52u, 0x82333380u,
+            0xbeb40394u, 0xbeb503ffu, 0x10005004u, 0xbeea0384u,
+            0xf4280e19u, 0xd4000000u, 0x7e020238u});
+        tail_code.insert(tail_code.end(), {7u, 11u, 13u, 17u, 19u});
+        DrawItem tail_draw = draw;
+        tail_draw.vs_guest_addr = reinterpret_cast<uint64_t>(tail_code.data());
+        tail_draw.vs = recompile_vertex(tail_code.data(), tail_code.size(), &table);
+        GpuCaptureFile tail_capture, tail_decoded;
+        GpuReplayFrame tail_replay;
+        std::vector<uint8_t> tail_encoded;
+        const CaptureMemoryReader tail_reader = [&](uint64_t requested, uint8_t* dst, size_t want) {
+            if (const auto n = copy_range(requested, dst, want, tail_draw.vs_guest_addr,
+                                         tail_code.data(), tail_code.size() * 4u)) return n;
+            return reader(requested, dst, want);
+        };
+        const bool tail_ok = !tail_draw.vs.empty() &&
+            rdna2_recompile_code_span(tail_code.data(), tail_code.size()) == tail_code.size() &&
+            capture_draw_items({tail_draw}, {}, tail_reader, tail_capture, error) &&
+            serialize_gpu_capture(tail_capture, tail_encoded, error) &&
+            deserialize_gpu_capture(tail_encoded, tail_decoded, error) &&
+            materialize_gpu_replay(tail_decoded, tail_replay, error);
+        if (!tail_ok) std::printf("owned inline-tail capture error: %s\n", error.c_str());
+        check(tail_ok && tail_decoded.raw_shader_versions.size() == 1u &&
+              tail_decoded.raw_shader_versions.front().words == tail_code,
+              "owned source replay admits its proven post-END inline-data tail without decoding data as ISA");
+
         const auto source_index = static_cast<size_t>(source - table.resources.data());
-        const auto rejects_stored = [&](GpuCaptureFile malformed, const char* label) {
+        const auto emit_replay_fixture = [&](const GpuCaptureFile& fixture, const char* name) {
+            if (replay_fixture_directory.empty()) return;
+            const auto path = replay_fixture_directory /
+                (std::string(wide8 ? "x8-" : "x4-") + name + ".prgcap");
+            GpuCaptureFile parsed;
+            const bool written = write_gpu_capture(path.string(), fixture, error);
+            const bool read = written && read_gpu_capture(path.string(), parsed, error);
+            check(read, "replay CLI input writes and parses before materializer refusal");
+            std::printf("[replay-fixture] %s: parsed=%d error=%s\n",
+                        path.string().c_str(), read, error.c_str());
+        };
+        emit_replay_fixture(decoded, "valid");
+        const auto rejects_stored = [&](GpuCaptureFile malformed, const char* expected, const char* label) {
             GpuReplayFrame refused;
-            check(!materialize_gpu_replay(malformed, refused, error), label);
+            const bool rejected = !materialize_gpu_replay(malformed, refused, error);
+            std::printf("[replay-refusal] %s: rejected=%d reason=%s\n", label, rejected, error.c_str());
+            check(rejected && error == expected, label);
         };
         auto missing_payload = decoded;
         missing_payload.draws.front().vrt.resources[source_index].blob_index = UINT32_MAX;
-        rejects_stored(missing_payload, "stored-module replay refuses absent parent payload before execution");
+        emit_replay_fixture(missing_payload, "absent-parent");
+        rejects_stored(missing_payload, "owned wide replay has missing, malformed or incomplete exact-PC backing", "stored-module replay refuses absent parent payload before execution");
         auto unmarked_missing = missing_payload;
         unmarked_missing.draws.front().vrt.resources[source_index].resource.owned_raw_snapshot_bytes = 0u;
-        rejects_stored(unmarked_missing, "removing obligation cannot hide raw-code-required absent backing");
+        emit_replay_fixture(unmarked_missing, "unmarked-absent-parent");
+        rejects_stored(unmarked_missing, "owned wide replay has missing, malformed or incomplete exact-PC backing", "removing obligation cannot hide raw-code-required absent backing");
+        auto noncanonical = unmarked_missing;
+        auto& raw = noncanonical.raw_shader_versions.front();
+        raw.words.push_back(0xdeadbeefu); // unrelated post-END data outside the owning compile span
+        raw.content_hash = gpu_capture_hash(reinterpret_cast<const uint8_t*>(raw.words.data()),
+                                            raw.words.size() * 4u);
+        emit_replay_fixture(noncanonical, "unmarked-noncanonical");
+        rejects_stored(noncanonical, "owned wide replay lacks complete raw shader or resource table",
+            "marker-free noncanonical raw span cannot erase its executable-prefix backing requirement");
         auto short_read = decoded;
         const auto blob = short_read.draws.front().vrt.resources[source_index].blob_index;
         short_read.blobs[blob].bytes_read = size - 4u;
-        rejects_stored(short_read, "padded blob extent cannot conceal an actually short captured parent read");
+        emit_replay_fixture(short_read, "short-read-parent");
+        rejects_stored(short_read, "owned wide replay source exceeds the actually observed capture bytes", "padded blob extent cannot conceal an actually short captured parent read");
+        auto replay_wrong_width = decoded;
+        auto& wrong_source = replay_wrong_width.draws.front().vrt.resources[source_index];
+        const uint32_t opposite_width = wide8 ? 16u : 32u;
+        wrong_source.resource.size = opposite_width;
+        wrong_source.resource.owned_raw_snapshot_bytes = opposite_width;
+        wrong_source.captured_size = opposite_width;
+        auto& wrong_blob = replay_wrong_width.blobs[wrong_source.blob_index];
+        wrong_blob.bytes.resize(std::max<size_t>(wrong_blob.bytes.size(), opposite_width));
+        wrong_blob.bytes_read = wrong_blob.bytes.size();
+        wrong_blob.content_hash = gpu_capture_hash(wrong_blob.bytes.data(), wrong_blob.bytes.size());
+        emit_replay_fixture(replay_wrong_width, "opposite-width-parent");
+        rejects_stored(replay_wrong_width,
+            "owned wide replay has missing, malformed or incomplete exact-PC backing",
+            "stored replay refuses a complete opposite width at the decoded parent PC");
+        auto replay_poisoned = decoded;
+        auto duplicate_source = replay_poisoned.draws.front().vrt.resources[source_index];
+        duplicate_source.resource.binding = 127u; // keep bindings distinct; collide only in fetch PC
+        replay_poisoned.draws.front().vrt.resources[source_index].resource.format = DataFormat::Float32;
+        replay_poisoned.draws.front().vrt.resources[source_index].resource.owned_raw_snapshot_bytes = 0u;
+        replay_poisoned.draws.front().vrt.resources.push_back(duplicate_source);
+        emit_replay_fixture(replay_poisoned, "poisoned-first-duplicate-parent");
+        rejects_stored(replay_poisoned,
+            "owned wide replay has missing, malformed or incomplete exact-PC backing",
+            "stored replay refuses an ordinary poisoned first source followed by a valid same-PC source");
         auto no_table = decoded;
         no_table.draws.front().vrt = {};
-        rejects_stored(no_table, "raw-code requirement survives omission of the whole stored replay table");
+        emit_replay_fixture(no_table, "absent-table");
+        rejects_stored(no_table, "owned wide replay lacks complete raw shader or resource table", "raw-code requirement survives omission of the whole stored replay table");
         auto no_code = decoded;
         no_code.draws.front().vs_raw_shader_index = UINT32_MAX;
-        rejects_stored(no_code, "marked stored replay refuses missing raw shader provenance");
+        no_code.raw_shader_versions.clear(); // retain structural validity; no unreferenced program
+        emit_replay_fixture(no_code, "absent-code");
+        rejects_stored(no_code, "owned wide replay lacks exact raw shader provenance", "marked stored replay refuses missing raw shader provenance");
         auto chain = decoded;
-        chain.raw_shader_versions.push_back({0u, false, {0xbfa00003u, 0xbe802006u}});
+        const std::vector<uint32_t> prolog{0xbfa00003u, 0xbe802006u};
+        chain.raw_shader_versions.push_back({gpu_capture_hash(
+            reinterpret_cast<const uint8_t*>(prolog.data()), prolog.size() * 4u), false, prolog});
         chain.draws.front().vs_chain_raw_shader_index = chain.draws.front().vs_raw_shader_index;
         chain.draws.front().vs_raw_shader_index = static_cast<uint32_t>(chain.raw_shader_versions.size() - 1u);
         for (auto& r : chain.draws.front().vrt.resources) r.resource.owned_raw_snapshot_bytes = 0u;
-        rejects_stored(chain, "marker-free stored chain derives refusal from the linked main raw code");
+        emit_replay_fixture(chain, "unmarked-chain");
+        rejects_stored(chain, "owned raw wide replay inputs require a direct vertex stage", "marker-free stored chain derives refusal from the linked main raw code");
     }
     return failures ? 1 : 0;
 }

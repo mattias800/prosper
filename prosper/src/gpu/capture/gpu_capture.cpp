@@ -470,9 +470,10 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         // bounded span instead of treating data words as instructions or bypassing their proof.
         const bool complete = consumed &&
             rdna2_recompile_code_span(raw.data(), raw.size()) == raw.size();
-        const auto required = complete
-            ? rdna2_owned_raw_wide_data_loads(decoded) : std::vector<uint32_t>{};
-        if ((marked && !complete) || (!required.empty() && !resources)) {
+        const auto required = rdna2_owned_raw_wide_data_loads(decoded);
+        // Noncanonical trailing bytes cannot erase executable-prefix obligations merely by
+        // removing the serialized marker. They invalidate provenance for those required PCs.
+        if (((marked || !required.empty()) && !complete) || (!required.empty() && !resources)) {
             error = "owned wide replay lacks complete raw shader or resource table";
             return false;
         }

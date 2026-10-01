@@ -90,6 +90,16 @@ int main() {
                   !recompile_vertex_chain(prolog.data(), prolog.size(), legacy_main.data(),
                                           legacy_main.size(), &legacy_table).empty(), name,
                   "a real unowned non-passthrough vertex chain remains valid");
+            auto requirement_only = legacy_table;
+            requirement_only.owned_raw_snapshot_requirements.emplace_back(0u, 16u);
+            uint64_t requirement_identity = 99u;
+            const auto requirement_warm = recompile_vertex_chain_cached_shared(
+                prolog.data(), prolog.size(), legacy_main.data(), legacy_main.size(),
+                &requirement_only, nullptr, &requirement_identity);
+            check(!requirement_warm && requirement_identity == 0u &&
+                  recompile_vertex_chain(prolog.data(), prolog.size(), legacy_main.data(),
+                      legacy_main.size(), &requirement_only).empty(), name,
+                  "same-code warm chain refuses a requirement omitted from its ordinary cache key");
             const auto chain_refuses = [&](const ShaderResourceTable& supplied, const char* label) {
                 uint64_t refused_identity = 77u, recovered_identity = 0u;
                 const bool cold = recompile_vertex_chain(prolog.data(), prolog.size(),
