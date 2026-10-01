@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -20,6 +22,21 @@ static std::vector<Rdna2Inst> decode(const std::vector<uint32_t>& code) {
     std::vector<Rdna2Inst> result;
     rdna2_walk(code.data(), code.size(), result);
     return result;
+}
+
+// Match the existing image_sample_dref_manual_2d nearest path, which emits
+// OpImageSampleExplicitLod (88) followed by its manual depth comparison.
+static bool has_explicit_sample(const std::vector<uint32_t>& module) {
+    constexpr uint32_t OpImageSampleExplicitLod = 88u;
+    if (module.size() < 5 || module[0] != 0x07230203u) return false;
+    bool sampled = false;
+    for (size_t at = 5; at < module.size();) {
+        const uint32_t words = module[at] >> 16u;
+        if (!words || words > module.size() - at) return false;
+        sampled |= (module[at] & 0xffffu) == OpImageSampleExplicitLod && words >= 7u;
+        at += words;
+    }
+    return sampled;
 }
 
 static std::array<uint32_t, 2> compare(uint32_t root, uint32_t source = 128u,
@@ -50,7 +67,21 @@ static std::array<uint32_t, 2> select(uint32_t root = 24u) {
     return {0xd5010000u, 128u | (242u << 9u) | (root << 18u)};
 }
 
-int main() {
+int main(int argc, char** argv) {
+    std::filesystem::path module_dir;
+    if (argc != 1) {
+        if (argc != 3 || std::string(argv[1]) != "--dump-mimg-readonly-modules") {
+            std::fprintf(stderr, "usage: %s [--dump-mimg-readonly-modules NEW_DIR]\n", argv[0]);
+            return 2;
+        }
+        module_dir = argv[2];
+        std::error_code error;
+        if (!std::filesystem::create_directory(module_dir, error)) {
+            std::fprintf(stderr, "module output directory must be new: %s (%s)\n",
+                argv[2], error.message().c_str());
+            return 2;
+        }
+    }
     alignas(16) std::array<uint32_t, 128> data{};
     uint64_t last_program = 0x1ee0000000ull;
     for (auto stage : {RecompileDiagnosticStage::Vertex, RecompileDiagnosticStage::Fragment}) {
@@ -134,9 +165,23 @@ int main() {
               sample_it->src[1].value == 64 && sample_it->src[2].kind == OperandKind::SGPR &&
               sample_it->src[2].value == 72,
               name, "comparison sample decodes independent entry image and sampler descriptors");
+        const auto sample_module = compile(sample_code, sample_table_for(sample_code));
         check(rdna2_raw_wide_data_loads(sample_ins).empty() &&
-              !compile(sample_code, sample_table_for(sample_code)).empty(), name,
+              has_explicit_sample(sample_module), name,
               "descriptor assembly beside a read-only comparison sample remains a nonempty module");
+        if (!module_dir.empty()) {
+            const auto path = module_dir / (std::string(name) + "_image_sample_c_lz.spv");
+            std::ofstream output(path, std::ios::binary);
+            output.write(reinterpret_cast<const char*>(sample_module.data()),
+                static_cast<std::streamsize>(sample_module.size() * sizeof(uint32_t)));
+            output.close();
+            if (sample_module.empty() || !output) {
+                std::fprintf(stderr, "failed to write nonempty module: %s\n", path.string().c_str());
+                return 2;
+            }
+            std::printf("[module] %s words=%zu path=%s\n", name,
+                sample_module.size(), path.string().c_str());
+        }
         const auto sample_refused = [&](const std::vector<uint32_t>& code,
                                         const char* label, uint32_t raw_opcode = 2u) {
             const auto classified = rdna2_raw_wide_data_loads(decode(code));
