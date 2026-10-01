@@ -3,6 +3,7 @@
 // Project-owned rewrite certificates and counterexamples. Reuse the independent address/effect
 // corpus, not the recompiler: the previous output-width proof is deliberately NOT the oracle.
 #include "spirv_wave_width_fixtures.hpp"
+#include "spirv_fragment_loop_vote_fixtures.hpp"
 #include <algorithm>
 
 namespace prosper::test::fragment_votes {
@@ -265,6 +266,46 @@ inline std::vector<Fixture> fixtures() {
             fixture.inventory_refusal = true;
         }
     }
+    namespace loops = fragment_loop_votes;
+    const struct { const char* name; loops::Shape shape; bool admitted; } loop_cases[] = {
+        {"initialized_counter_self_bool", loops::Shape::Counter, true},
+        {"coupled_nested_counter_reset", loops::Shape::Nested, true},
+        {"cross_carried_initialized_phis", loops::Shape::CrossCarried, true},
+        {"one_undef_seed_in_cross_carried_component", loops::Shape::CrossUndefined, false},
+        {"initialized_changing_boolean_recurrence", loops::Shape::BoolToggle, true},
+        {"helper_dependent_boolean_carry_update", loops::Shape::VaryingBoolUpdate, false},
+        {"immutable_constant_index_loop_bound", loops::Shape::BufferBound, true},
+        {"helper_varying_trip_direct_header_export", loops::Shape::VaryingTrip, false},
+        {"undef_counter_initializer", loops::Shape::UndefinedInit, false},
+        {"helper_varying_counter_initializer", loops::Shape::VaryingInit, false},
+        {"vote_is_not_an_initializer_root", loops::Shape::VoteInit, false},
+        {"unsupported_counter_update", loops::Shape::UnsupportedUpdate, false},
+        {"uniform_diamond_different_phi_values", loops::Shape::UniformDiamond, true},
+        {"varying_diamond_different_phi_values", loops::Shape::VaryingDiamond, false},
+        {"uniform_switch_different_phi_values", loops::Shape::UniformSwitch, true},
+        {"varying_switch_different_phi_values", loops::Shape::VaryingSwitch, false},
+        {"uniform_induction_is_not_address_authority", loops::Shape::InductionAddress, false},
+        {"bounded_masked_induction_does_not_expand_load_authority", loops::Shape::MaskedInductionAddress, false},
+        {"safe_counter_then_unsafe_vote_rollback", loops::Shape::SecondUnsafeVote, false},
+        {"safe_loop_then_varying_loop_rollback", loops::Shape::SecondUnsafeLoop, false},
+        {"uniform_loop_combines_with_genuinely_dead_vote", loops::Shape::CounterWithDeadVote, true},
+        {"committed_trace_facts_do_not_recertify_dead_masked_load", loops::Shape::CounterWithDeadMaskedLoad, true},
+        {"old_constant_vote_with_varying_control", loops::Shape::ConstantWithVaryingControl, true},
+        {"old_dead_vote_with_varying_control", loops::Shape::DeadWithVaryingControl, true},
+    };
+    for (const auto& item : loop_cases) {
+        const bool dead = item.shape == loops::Shape::DeadWithVaryingControl;
+        out.push_back({item.name, loops::make_module(item.shape), true, item.admitted,
+                       item.admitted && !dead ? 1u : 0u,
+                       dead || item.shape == loops::Shape::CounterWithDeadVote ||
+                           item.shape == loops::Shape::CounterWithDeadMaskedLoad ? 1u : 0u});
+    }
+    for (uint32_t bound = 0; bound < 4; ++bound)
+        out.push_back({"initialized_loop_bound_" + std::to_string(bound),
+                       loops::make_module(loops::Shape::Counter, bound), false, true, 1, 0});
+    for (const uint32_t bound : {1u, 3u})
+        out.push_back({"changing_boolean_odd_bound_" + std::to_string(bound),
+                       loops::make_module(loops::Shape::BoolToggle, bound), false, true, 1, 0});
     return out;
 }
 
