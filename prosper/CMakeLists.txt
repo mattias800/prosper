@@ -2225,8 +2225,6 @@ if(TARGET prosper_core)
   target_link_libraries(test_wait_barrier PRIVATE prosper_core)
   add_test(NAME wait_barrier COMMAND test_wait_barrier)
   add_executable(test_wait_regmem_observation tests/diagnostics/test_wait_regmem_observation.cpp)
-  set_property(TARGET test_wait_regmem_observation PROPERTY
-    PROSPER_DIAG_MEMBER_FACT_DOMAIN TEST_LOCAL)
   target_link_libraries(test_wait_regmem_observation PRIVATE prosper_core)
   add_test(NAME wait_regmem_observation COMMAND test_wait_regmem_observation
     "${CMAKE_CURRENT_BINARY_DIR}/wait-regmem-observation.jsonl")
@@ -2235,8 +2233,6 @@ if(TARGET prosper_core)
   set_tests_properties(wait_regmem_observation_disabled PROPERTIES
     ENVIRONMENT "PROSPER_NO_PERF_ALARMS=1")
   add_executable(test_wait_regmem_packet_route tests/diagnostics/test_wait_regmem_packet_route.cpp)
-  set_property(TARGET test_wait_regmem_packet_route PROPERTY
-    PROSPER_DIAG_MEMBER_FACT_DOMAIN TEST_LOCAL)
   target_link_libraries(test_wait_regmem_packet_route PRIVATE prosper_core)
   add_test(NAME wait_regmem_packet_route COMMAND test_wait_regmem_packet_route
     "${CMAKE_CURRENT_BINARY_DIR}/wait-regmem-packet-route.jsonl" proceed)

@@ -15,3 +15,7 @@ actual report path in controls, with discriminating mutations for missing or sub
   packet-route calibration's retained-effect positive instead took the existing fail-closed
   unknown-topology rejection. Use real kernel direct-memory registration and assert the production
   topology result before claiming that a retained-effect overlay acceptance was reached.
+- These multi-mode fixtures do not satisfy the diagnostic member-domain contract's single
+  registered-test form. Their invalid TEST_LOCAL annotations were refused and retained shared
+  member facts. Keep them unannotated in the shared domain, with every ordinary and disabled mode
+  intact, rather than weakening that contract or claiming test isolation that was never admitted.
