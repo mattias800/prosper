@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -124,12 +125,12 @@ int main(int argc, char** argv) {
     const auto module = compile(guest(false));
     CHECK(!module.empty());
     if (argc == 3 && std::strcmp(argv[1], "--dump-spv") == 0) {
-        auto* file = std::fopen(argv[2], "wb");
-        CHECK(file != nullptr);
-        if (file) {
-            CHECK(std::fwrite(module.data(), sizeof(uint32_t), module.size(), file) == module.size());
-            CHECK(std::fclose(file) == 0);
-        }
+        std::ofstream output(argv[2], std::ios::binary);
+        output.write(reinterpret_cast<const char*>(module.data()),
+                     static_cast<std::streamsize>(module.size() * sizeof(uint32_t)));
+        CHECK(output.good());
+        output.close();
+        CHECK(output.good());
         return failures ? 1 : 0;
     }
     CHECK(opcode_count(module, 251u) > 0 && opcode_count(module, 224u) > 0);

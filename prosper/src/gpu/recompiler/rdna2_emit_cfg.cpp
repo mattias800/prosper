@@ -6532,6 +6532,33 @@ bool emit_cfg_state_machine(
     const uint32_t mbcnt_lane = b.ibin(
         Op_BitwiseAnd, b.linear_localid, b.uconst(b.wave_size - 1));
 
+    // Scalar wave services write every replica, independent of EXEC, and invalidate both
+    // physical halves of overlapping saved B64 masks. Keep the shared destination contract here.
+    const auto store_scalar_wave_result = [&](uint32_t pending, uint32_t dst, uint32_t result,
+                                             const std::set<int>& destinations,
+                                             const char* missing_destination) {
+        for (int reg : destinations) {
+            const auto destination = sv.find(reg);
+            if (destination == sv.end()) return reject_cfg(0, missing_destination);
+            const uint32_t selected = b.land(pending,
+                b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))));
+            b.store_function(destination->second, b.sel(selected, result,
+                b.load_function(b.t_u32, destination->second)));
+        }
+        const auto clear_overlapping_masks = [&](const auto& vars) {
+            for (const auto& [reg, var] : vars) {
+                const uint32_t overlaps = b.lor(
+                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))),
+                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg + 1))));
+                b.store_function(var, b.bsel(b.land(pending, overlaps), no,
+                    b.load_function(b.t_bool, var)));
+            }
+        };
+        clear_overlapping_masks(mv);
+        clear_overlapping_masks(mhv);
+        return true;
+    };
+
     if (has_portable_mask_reduction) {
         // Scalar mask operations ignore EXEC for their destination write. All launched guest
         // lanes publish the physical source bit, including EXEC-off lanes. The static event tag
@@ -6572,25 +6599,8 @@ bool emit_cfg_state_machine(
         const uint32_t result = b.cfg_scratch_load(
             b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index));
         const uint32_t dst = b.load_function(b.t_u32, mask_reduction_dst_var);
-        for (int reg : portable_mask_reduction_dsts) {
-            const auto destination = sv.find(reg);
-            if (destination == sv.end()) return reject_cfg(0, "missing-mask-reduction-dst");
-            const uint32_t selected = b.land(pending,
-                b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))));
-            b.store_function(destination->second, b.sel(selected, result,
-                b.load_function(b.t_u32, destination->second)));
-        }
-        const auto clear_overlapping_masks = [&](const auto& vars) {
-            for (const auto& [reg, var] : vars) {
-                const uint32_t overlaps = b.lor(
-                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))),
-                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg + 1))));
-                b.store_function(var, b.bsel(b.land(pending, overlaps), no,
-                    b.load_function(b.t_bool, var)));
-            }
-        };
-        clear_overlapping_masks(mv);
-        clear_overlapping_masks(mhv);
+        if (!store_scalar_wave_result(pending, dst, result, portable_mask_reduction_dsts,
+                                      "missing-mask-reduction-dst")) return false;
         // RDNA2 ISA 70648 section 12.3: BCNT sets SCC=(count != 0); FF1 preserves SCC.
         const uint32_t writes_scc = b.land(pending,
             b.load_function(b.t_bool, mask_reduction_count_var));
@@ -6728,27 +6738,8 @@ bool emit_cfg_state_machine(
         const uint32_t result = b.cfg_scratch_load(
             b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index));
         const uint32_t dst = b.load_function(b.t_u32, first_dst_var);
-        for (int reg : portable_readfirstlane_dsts) {
-            const auto destination = sv.find(reg);
-            if (destination == sv.end()) return reject_cfg(0, "missing-readfirstlane-dst");
-            const uint32_t selected = b.land(pending,
-                b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))));
-            b.store_function(destination->second, b.sel(selected, result,
-                b.load_function(b.t_u32, destination->second)));
-        }
-        // A B32 write ends every saved B64 lifetime overlapping either physical word.
-        // Do not copy the older readlane root-only invalidation for a high-word destination.
-        const auto clear_overlapping_masks = [&](const auto& vars) {
-            for (const auto& [reg, var] : vars) {
-                const uint32_t overlaps = b.lor(
-                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))),
-                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg + 1))));
-                b.store_function(var, b.bsel(b.land(pending, overlaps), no,
-                    b.load_function(b.t_bool, var)));
-            }
-        };
-        clear_overlapping_masks(mv);
-        clear_overlapping_masks(mhv);
+        if (!store_scalar_wave_result(pending, dst, result, portable_readfirstlane_dsts,
+                                      "missing-readfirstlane-dst")) return false;
         // SCC is unchanged. The new scalar is wave-uniform, not workgroup-uniform.
         b.barrier();
     }
@@ -7189,6 +7180,16 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02;
         });
+    const auto append_emitter_only_end = [](std::vector<Rdna2Inst>& region, uint32_t pc) {
+        Rdna2Inst end;
+        end.pc = pc;
+        end.fmt = Rdna2Format::SOPP;
+        end.opcode = 0x01u;
+        end.len_dwords = 1;
+        end.is_end = true;
+        end.synthetic_terminator = true;
+        region.push_back(end);
+    };
 
     // A large generated compute kernel may put a workgroup-uniform scalar early-out around several
     // barrier-separated phases, then use arbitrary (but barrier-free) control flow in its final
@@ -7236,14 +7237,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // The uniform guard prefix is a complete region too. A common wave service
                     // needs a dispatcher end block even though the real END follows the body.
                     // No guest edge crosses this proven split; preserve SCC for the guard.
-                    Rdna2Inst prefix_end;
-                    prefix_end.pc = ins[phased.guard_index].pc;
-                    prefix_end.fmt = Rdna2Format::SOPP;
-                    prefix_end.opcode = 0x01u;
-                    prefix_end.len_dwords = 1;
-                    prefix_end.is_end = true;
-                    prefix_end.synthetic_terminator = true;
-                    prefix.push_back(prefix_end);
+                    append_emitter_only_end(prefix, ins[phased.guard_index].pc);
                 }
                 if (!prefix.empty() &&
                     !emit_body(b, rs, prefix, safe, rt, allow_exec_update, allow_smem,
@@ -7285,14 +7279,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // barrier sequence. Give each proven split a synthetic, emitter-only terminator
                     // at the boundary; no branch crosses the boundary (proved above), and the raw
                     // barrier remains emitted exactly once by this outer shell.
-                    Rdna2Inst phase_end;
-                    phase_end.pc = ins[barrier_index].pc;
-                    phase_end.fmt = Rdna2Format::SOPP;
-                    phase_end.opcode = 0x01u;
-                    phase_end.len_dwords = 1;
-                    phase_end.is_end = true;
-                    phase_end.synthetic_terminator = true;
-                    phase.push_back(phase_end);
+                    append_emitter_only_end(phase, ins[barrier_index].pc);
                     if (getenv("PROSPER_DBG"))
                         std::fprintf(stderr, "[compute-phase] begin=%u end=%u barrier=%u\n",
                                      phase.front().pc, phase[phase.size() - 2].pc,
