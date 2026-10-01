@@ -1265,7 +1265,7 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
     prosper::frontend::register_live_renderer(
         getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".",
         getenv("PROSPER_APP_DUMP_FRAMES") != nullptr,
-        prosper::frontend::title_id_from_app0_path(app0_root));
+        prosper::gpu::FragmentWavePolicy::ProvenVotes);
 #else
     fprintf(stderr, "[app] built without the live renderer; the window will stay blank.\n");
 #endif

@@ -1,0 +1,460 @@
+#include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
+#include <algorithm>
+#include <charconv>
+#include <cstring>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace prosper::gpu {
+namespace {
+
+struct Instruction {
+    size_t at;
+    uint32_t op;
+    uint32_t count;
+    bool in_function;
+};
+
+// Explicit, total core operations only. In particular, integer divide/variable shifts,
+// float-to-integer conversion, arbitrary GLSL operations, derivatives and collectives do not
+// inherit a proof from uniform inputs. The same domain bounds the dead-SSA graph.
+std::vector<uint32_t> pure_operands(const std::vector<uint32_t>& words,
+                                  const Instruction& in, bool preserve_f32) {
+    const auto at = in.at;
+    switch (in.op) {
+        case 83: case 124: case 126: case 168: case 200: // copy, bitcast, integer/Boolean NOT
+        case 204: case 205: // bit reverse/count
+            if (in.count == 4) return {words[at + 3]};
+            break;
+        case 128: case 130: case 132: // wrapping integer arithmetic
+        case 164: case 165: case 166: case 167: // Boolean comparisons/combinations
+        case 170: case 171: case 172: case 173: case 174: case 175:
+        case 176: case 177: case 178: case 179: // integer comparisons
+        case 197: case 198: case 199: // integer bitwise operations
+            if (in.count == 5) return {words[at + 3], words[at + 4]};
+            break;
+        case 180: case 181: case 182: case 183: case 184: case 185:
+        case 186: case 187: case 188: case 189: case 190: case 191:
+            // Preserve is required for arbitrary buffer NaNs, not inferred from finite fixtures.
+            if (preserve_f32 && in.count == 5)
+                return {words[at + 3], words[at + 4]};
+            break;
+        case 169: // select: condition AND both alternatives must be uniform
+            if (in.count == 6)
+                return {words[at + 3], words[at + 4], words[at + 5]};
+            break;
+        case 80: // composite construction
+            if (in.count >= 4)
+                return {words.begin() + at + 3, words.begin() + at + in.count};
+            break;
+        case 81: // literal composite indexes are not SSA uses
+            if (in.count >= 5) return {words[at + 3]};
+            break;
+        default: break;
+    }
+    return {};
+}
+
+bool no_result(uint32_t op) {
+    switch (op) {
+        case 0: case 8: case 56: case 62: case 63: case 64: case 71: case 72:
+        case 99: case 224: case 225: case 228: case 246: case 247: case 249:
+        case 250: case 251: case 252: case 253: case 254: case 255: case 317:
+        case 319: case 4416: case 5380:
+            return true;
+        default: return false;
+    }
+}
+
+std::string_view instruction_string(const std::vector<uint32_t>& words,
+                                    const Instruction& in, uint32_t start) {
+    if (start >= in.count) return {};
+    const char* data = reinterpret_cast<const char*>(words.data() + in.at + start);
+    const size_t bytes = (in.count - start) * sizeof(uint32_t);
+    const char* end = static_cast<const char*>(std::memchr(data, 0, bytes));
+    if (!end) return {};
+    // Reject hidden trailing data in a load-bearing marker/import.
+    for (const char* p = end; p != data + bytes; ++p)
+        if (*p != 0) return {};
+    return {data, static_cast<size_t>(end - data)};
+}
+
+bool read_marker(std::string_view text, std::string_view prefix,
+                 uint32_t expected, bool& seen) {
+    if (!text.starts_with(prefix)) return true;
+    uint32_t value = 0;
+    const auto number = text.substr(prefix.size());
+    const auto parsed = std::from_chars(number.data(), number.data() + number.size(), value);
+    if (number.empty() || parsed.ec != std::errc{} ||
+        parsed.ptr != number.data() + number.size() || value != expected || seen)
+        return false;
+    seen = true;
+    return true;
+}
+
+bool is_fragment_builtin(uint32_t builtin) {
+    switch (builtin) {
+        case 7: case 9: case 10: case 15: case 16: case 17:
+        case 18: case 19: case 20: case 22: case 23:
+            return true;
+        default: return false; // subgroup IDs/masks and unclassified extension builtins fail closed
+    }
+}
+
+void append_marker(std::vector<uint32_t>& words, std::string_view marker) {
+    const size_t count = 1 + (marker.size() + 1 + 3) / 4;
+    const size_t at = words.size();
+    words.resize(at + count, 0);
+    words[at] = (static_cast<uint32_t>(count) << 16) | 330;
+    std::memcpy(words.data() + at + 1, marker.data(), marker.size());
+}
+
+// Actual function value uses only. Unknown instructions scan conservatively; a literal collision
+// can cost admission but cannot grant it. Known image literals/debug metadata are excluded.
+std::vector<uint32_t> value_uses(const std::vector<uint32_t>& words,
+                               const Instruction& in, bool preserve_f32) {
+    if (!in.in_function || in.op == 8 || in.op == 317 || in.op == 248 ||
+        in.op == 249 || in.op == 246 || in.op == 247 || in.op == 253 || in.op == 56)
+        return {};
+    auto pure = pure_operands(words, in, preserve_f32);
+    if (!pure.empty()) return pure;
+    if (in.op == 335 && in.count == 5) return {words[in.at + 4]};
+    if (in.op == 250 && in.count >= 4) return {words[in.at + 1]};
+    if (in.op == 245 && in.count >= 5) {
+        std::vector<uint32_t> values;
+        for (uint32_t i = 3; i + 1 < in.count; i += 2) values.push_back(words[in.at + i]);
+        return values;
+    }
+    const uint32_t start = no_result(in.op) ? 1 : 3;
+    std::vector<uint32_t> values;
+    for (uint32_t i = start; i < in.count; ++i) {
+        if ((in.op == 12 && i == 4) ||
+            (in.op == 99 && i == 4) ||
+            ((in.op == 87 || in.op == 88 || in.op == 91 || in.op == 92 ||
+              in.op == 95 || in.op == 98) && i == 5) ||
+            ((in.op == 89 || in.op == 90 || in.op == 93 || in.op == 94 ||
+              in.op == 96 || in.op == 97) && i == 6))
+            continue;
+        values.push_back(words[in.at + i]);
+    }
+    return values;
+}
+
+} // namespace
+
+FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
+                                         bool immutable_storage_inputs,
+                                         bool deterministic_storage_reads) {
+    FragmentVoteLowering result;
+    if (source.size() < 5 || source[0] != 0x07230203u || !source[3] || source[4] ||
+        source[1] < 0x00010300u || source[1] > 0x00010600u || (source[1] & 0xffu))
+        return result;
+    std::vector<Instruction> instructions;
+    bool in_function = false;
+    for (size_t at = 5; at < source.size();) {
+        const uint32_t count = source[at] >> 16, op = source[at] & 0xffffu;
+        if (!count || count > source.size() - at) return result;
+        if (op == 54) in_function = true;
+        instructions.push_back({at, op, count, in_function});
+        if (op == 56) in_function = false;
+        at += count;
+    }
+    if (in_function) return result;
+
+    bool size_seen = false, why_seen = false, entry_seen = false, preserve_f32 = false;
+    uint32_t entry_id = 0, preserve_entry = 0;
+    uint32_t denorm_entry = 0;
+    bool denorm_defined = false;
+    bool writes_memory = false;
+    std::unordered_set<uint32_t> bool_types, int32_types, float32_types, glsl_sets;
+    std::unordered_map<uint32_t, uint32_t> value_types, pointer_classes;
+    std::unordered_map<uint32_t, uint32_t> pointer_elements, runtime_elements, struct_members, strides, constants;
+    std::unordered_set<uint32_t> offset_zero_structs;
+    std::vector<Instruction> votes;
+    for (const auto& in : instructions) {
+        const auto at = in.at;
+        if (in.op == 15) {
+            if (in.count < 4 || source[at + 1] != 4 || entry_seen) return result;
+            entry_seen = true;
+            entry_id = source[at + 2];
+        }
+        if (in.op == 20 && in.count == 2) bool_types.insert(source[at + 1]);
+        if (in.op == 21 && in.count == 4 && source[at + 2] == 32)
+            int32_types.insert(source[at + 1]);
+        if (in.op == 22 && in.count == 3 && source[at + 2] == 32)
+            float32_types.insert(source[at + 1]);
+        if ((in.in_function && !no_result(in.op) && in.op != 248 && in.count >= 3) ||
+            ((in.op >= 41 && in.op <= 52) && in.count >= 3))
+            value_types.emplace(source[at + 2], source[at + 1]);
+        if (in.op == 59 && in.count >= 4) pointer_classes.emplace(source[at + 2], source[at + 3]);
+        if (in.op == 32 && in.count == 4 && source[at + 2] == 12)
+            pointer_elements.emplace(source[at + 1], source[at + 3]);
+        if (in.op == 29 && in.count == 3) runtime_elements.emplace(source[at + 1], source[at + 2]);
+        if (in.op == 30 && in.count == 3) struct_members.emplace(source[at + 1], source[at + 2]);
+        if (in.op == 71 && in.count == 4 && source[at + 2] == 6)
+            strides.emplace(source[at + 1], source[at + 3]);
+        if (in.op == 72 && in.count == 5 && source[at + 2] == 0 &&
+            source[at + 3] == 35 && source[at + 4] == 0)
+            offset_zero_structs.insert(source[at + 1]);
+        if (in.op == 43 && in.count == 4 && int32_types.contains(source[at + 1]))
+            constants.emplace(source[at + 2], source[at + 3]);
+        if (in.op == 16 && in.count == 4 && source[at + 2] == 4461 && source[at + 3] == 32) {
+            if (preserve_f32) return result;
+            preserve_f32 = true;
+            preserve_entry = source[at + 1];
+        }
+        if (in.op == 16 && in.count == 4 && source[at + 2] == 4459 &&
+            source[at + 3] == 32) {
+            if (denorm_defined) return result;
+            denorm_defined = true;
+            denorm_entry = source[at + 1];
+        }
+        if (in.op == 330) {
+            const auto text = instruction_string(source, in, 1);
+            if (text.empty() || !read_marker(text, "Prosper.FragmentSubgroupSize=", 64, size_seen) ||
+                !read_marker(text, "Prosper.FragmentSubgroupWhy=", 2, why_seen)) {
+                result.refusal = FragmentVoteRefusal::InconsistentContract;
+                return result;
+            }
+        }
+        if (in.op == 11 && instruction_string(source, in, 2) != "GLSL.std.450") {
+            result.refusal = FragmentVoteRefusal::UnsupportedWaveOperation;
+            return result;
+        }
+        if (in.op == 11 && in.count >= 3) glsl_sets.insert(source[at + 1]);
+        if ((in.op >= 333 && in.op <= 366 && in.op != 335) ||
+            (in.op >= 259 && in.op <= 271) || in.op == 73 || in.op == 74 || in.op == 75 ||
+            (in.op > 400 && in.op != 4416 && in.op != 5380)) {
+            result.refusal = FragmentVoteRefusal::UnsupportedWaveOperation;
+            return result;
+        }
+        if ((in.op == 71 && in.count >= 4 && source[at + 2] == 11 &&
+             !is_fragment_builtin(source[at + 3])) ||
+            (in.op == 72 && in.count >= 5 && source[at + 3] == 11 &&
+             !is_fragment_builtin(source[at + 4])) ||
+            (in.op == 71 && in.count >= 3 && (source[at + 2] == 0 || source[at + 2] == 40 ||
+             source[at + 2] == 4469 || source[at + 2] == 4470)) ||
+            (in.op == 72 && in.count >= 4 && (source[at + 3] == 0 || source[at + 3] == 40 ||
+             source[at + 3] == 4469 || source[at + 3] == 4470))) {
+            result.refusal = FragmentVoteRefusal::UnsupportedWaveOperation;
+            return result;
+        }
+        if (in.op == 335) votes.push_back(in);
+    }
+    if (!entry_seen || !size_seen || !why_seen || votes.empty()) {
+        result.refusal = FragmentVoteRefusal::InconsistentContract;
+        return result;
+    }
+    if (preserve_f32 && preserve_entry != entry_id) return result;
+    if (denorm_defined && denorm_entry != entry_id) return result;
+    for (const auto& vote : votes) {
+        if (vote.count != 5 || !bool_types.contains(source[vote.at + 1]) ||
+            !value_types.contains(source[vote.at + 4]) ||
+            value_types.at(source[vote.at + 4]) != source[vote.at + 1])
+            return result;
+        bool subgroup_scope = false;
+        for (const auto& in : instructions)
+            if (in.op == 43 && in.count == 4 && int32_types.contains(source[in.at + 1]) &&
+                source[in.at + 2] == source[vote.at + 3] &&
+                source[in.at + 3] == 3)
+                subgroup_scope = true;
+        if (!subgroup_scope) return result;
+    }
+
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const auto& in : instructions) {
+            if ((in.op != 65 && in.op != 66 && in.op != 67 && in.op != 70 && in.op != 83) ||
+                in.count < 4 || !pointer_classes.contains(source[in.at + 3]))
+                continue;
+            if (pointer_classes.emplace(source[in.at + 2],
+                                        pointer_classes.at(source[in.at + 3])).second)
+                changed = true;
+        }
+    }
+    for (const auto& in : instructions) {
+        // No residual subgroup-scoped synchronization may survive erasing the width contract.
+        // Device/workgroup/invocation memory scopes do not acquire subgroup semantics from Any.
+        uint32_t scope_id = 0;
+        if (in.op == 224) {
+            result.refusal = FragmentVoteRefusal::UnsupportedWaveOperation;
+            return result;
+        }
+        if (in.op == 225 && in.count >= 3) scope_id = source[in.at + 1];
+        if (((in.op >= 227 && in.op <= 242) || in.op == 318) && in.count >= 6)
+            scope_id = source[in.at + 4];
+        if ((in.op == 228 || in.op == 319) && in.count >= 4) scope_id = source[in.at + 2];
+        if (scope_id && (!constants.contains(scope_id) || constants.at(scope_id) == 3)) {
+            result.refusal = FragmentVoteRefusal::UnsupportedWaveOperation;
+            return result;
+        }
+        if (in.op == 12 && (in.count < 5 || !glsl_sets.contains(source[in.at + 3]))) {
+            result.refusal = FragmentVoteRefusal::UnsupportedWaveOperation;
+            return result;
+        }
+        if ((in.op == 62 || in.op == 63 || in.op == 64) && in.count >= 2) {
+            const auto storage = pointer_classes.find(source[in.at + 1]);
+            // Function/Output writes cannot change immutable input-buffer contents.
+            writes_memory |= storage == pointer_classes.end() ||
+                (storage->second != 7 && storage->second != 3);
+        } else if (in.op == 12 && in.count >= 7 &&
+                   (source[in.at + 4] == 35 || source[in.at + 4] == 51)) {
+            // GLSL Modf/Frexp have an output pointer as well as their returned value.
+            const auto storage = pointer_classes.find(source[in.at + 6]);
+            writes_memory |= storage == pointer_classes.end() ||
+                (storage->second != 7 && storage->second != 3);
+        } else if (in.op == 57 || in.op == 99 || (in.op >= 227 && in.op <= 242) ||
+                   in.op == 318 || in.op == 319) {
+            writes_memory = true;
+        }
+    }
+    // Any is also an execution rendezvous. A dead result does not prove it may be erased around
+    // externally observable memory effects, atomics or an opaque callee. Do not confuse the
+    // absence of subgroup-scoped barriers with the absence of that ordering obligation.
+    if (writes_memory) {
+        result.refusal = FragmentVoteRefusal::UnsupportedWaveOperation;
+        return result;
+    }
+    const auto preserves_operands = [&](const Instruction& in) {
+        if (in.op < 180 || in.op > 191) return false;
+        return preserve_f32 && denorm_defined && in.count == 5 &&
+            value_types.contains(source[in.at + 3]) && value_types.contains(source[in.at + 4]) &&
+            float32_types.contains(value_types.at(source[in.at + 3])) &&
+            float32_types.contains(value_types.at(source[in.at + 4]));
+    };
+
+    std::unordered_set<uint32_t> uniform, uniform_pointers, bounded_word_indexes;
+    std::unordered_map<uint32_t, uint32_t> word_buffer_roots;
+    for (const auto& in : instructions) {
+        if (((in.op == 41 || in.op == 42 || in.op == 46) && in.count == 3) ||
+            (in.op == 43 && in.count >= 4))
+            uniform.insert(source[in.at + 2]);
+        if (in.op == 43 && in.count == 4 && int32_types.contains(source[in.at + 1]) &&
+            source[in.at + 3] <= 0x3fffffffu)
+            bounded_word_indexes.insert(source[in.at + 2]);
+        if (in.op == 59 && in.count == 4 && source[in.at + 3] == 12 &&
+            immutable_storage_inputs && deterministic_storage_reads && !writes_memory) {
+            const auto pointer = pointer_elements.find(source[in.at + 1]);
+            if (pointer == pointer_elements.end() || !offset_zero_structs.contains(pointer->second)) continue;
+            const auto member = struct_members.find(pointer->second);
+            if (member == struct_members.end() || !strides.contains(member->second) ||
+                strides.at(member->second) != 4 || !runtime_elements.contains(member->second)) continue;
+            const auto element = runtime_elements.at(member->second);
+            if (int32_types.contains(element) || (float32_types.contains(element) && preserve_f32))
+                word_buffer_roots.emplace(source[in.at + 2], element);
+        }
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const auto& in : instructions) {
+            const auto at = in.at;
+            if (in.count < 3 || no_result(in.op)) continue;
+            const uint32_t id = source[at + 2];
+            // Robust2 defines descriptor bounds, not wrapping address calculations. The guest
+            // word layout has zero member offset and stride4: prove 0 <= index <= 2^30-1.
+            // Masks admit dynamic uniform indexes too, without treating arbitrary SGPRs as bounds.
+            if (value_types.contains(id) && int32_types.contains(value_types.at(id))) {
+                bool bounded = false;
+                if ((in.op == 83 || in.op == 124) && in.count == 4)
+                    bounded = bounded_word_indexes.contains(source[at + 3]);
+                if (in.op == 199 && in.count == 5)
+                    bounded = bounded_word_indexes.contains(source[at + 3]) ||
+                              bounded_word_indexes.contains(source[at + 4]);
+                if (in.op == 169 && in.count == 6)
+                    bounded = bounded_word_indexes.contains(source[at + 4]) &&
+                              bounded_word_indexes.contains(source[at + 5]);
+                if (bounded && bounded_word_indexes.insert(id).second) changed = true;
+            }
+            if (uniform.contains(id)) continue;
+            std::vector<uint32_t> operands;
+            if (in.op == 65 && in.count == 6) {
+                if (!word_buffer_roots.contains(source[at + 3]) ||
+                    !pointer_elements.contains(source[at + 1]) ||
+                    pointer_elements.at(source[at + 1]) != word_buffer_roots.at(source[at + 3]) ||
+                    !constants.contains(source[at + 4]) || constants.at(source[at + 4]) != 0 ||
+                    !uniform.contains(source[at + 5]) || !value_types.contains(source[at + 5]) ||
+                    !int32_types.contains(value_types.at(source[at + 5])) ||
+                    !bounded_word_indexes.contains(source[at + 5])) continue;
+                if (uniform_pointers.insert(id).second) changed = true;
+                continue;
+            }
+            if (in.op == 61 && in.count == 4 && uniform_pointers.contains(source[at + 3])) {
+                if (uniform.insert(id).second) changed = true;
+                continue;
+            }
+            if (in.op == 44 && in.count >= 4)
+                operands.assign(source.begin() + at + 3, source.begin() + at + in.count);
+            else if (in.op == 335 && in.count == 5) operands = {source[at + 4]};
+            else if (in.op == 245 && in.count >= 5 && (in.count % 2) == 1) {
+                bool identical = true;
+                for (uint32_t i = 5; i + 1 < in.count; i += 2)
+                    identical &= source[at + i] == source[at + 3];
+                if (identical) operands = {source[at + 3]};
+            } else operands = pure_operands(source, in, preserves_operands(in));
+            // Even preserved float operations may quiet a signaling NaN. Float value equality
+            // is sufficient for ordered/unordered comparisons, not for a raw-bit predicate.
+            // Only scalar integer-to-integer bitcasts carry the uniform certificate. Arbitrary
+            // integer bits reinterpreted as floats do not supply a finite-value domain proof.
+            if (in.op == 124 && (in.count != 4 || !value_types.contains(source[at + 3]) ||
+                                !int32_types.contains(value_types.at(source[at + 3])) ||
+                                !int32_types.contains(source[at + 1])))
+                operands.clear();
+            if (!operands.empty() && std::all_of(operands.begin(), operands.end(),
+                                               [&](uint32_t op) { return uniform.contains(op); }))
+                if (uniform.insert(id).second) changed = true;
+        }
+    }
+
+    std::unordered_map<uint32_t, std::vector<size_t>> users;
+    for (size_t i = 0; i < instructions.size(); ++i)
+        for (uint32_t value : value_uses(source, instructions[i], preserves_operands(instructions[i])))
+            users[value].push_back(i);
+    for (const auto& vote : votes) {
+        if (uniform.contains(source[vote.at + 4])) {
+            ++result.uniform_votes;
+            continue;
+        }
+        std::vector<uint32_t> pending{source[vote.at + 2]};
+        std::unordered_set<uint32_t> seen;
+        bool dead = true;
+        while (!pending.empty() && dead) {
+            const uint32_t value = pending.back();
+            pending.pop_back();
+            if (!seen.insert(value).second) continue;
+            for (size_t user : users[value]) {
+                const auto& in = instructions[user];
+                if (pure_operands(source, in, preserves_operands(in)).empty()) { dead = false; break; }
+                pending.push_back(source[in.at + 2]);
+            }
+        }
+        if (!dead) {
+            result.refusal = FragmentVoteRefusal::UnprovedVote;
+            result.uniform_votes = result.dead_votes = 0;
+            return result;
+        }
+        ++result.dead_votes;
+    }
+
+    result.words.assign(source.begin(), source.begin() + 5);
+    for (const auto& in : instructions) {
+        if (in.op == 335) {
+            result.words.insert(result.words.end(), {(4u << 16) | 83u, source[in.at + 1],
+                                                     source[in.at + 2], source[in.at + 4]});
+        } else if (in.op == 17 && in.count == 2 && source[in.at + 1] >= 61 && source[in.at + 1] <= 68) {
+            // Inventory above excludes all other subgroup instructions/builtins/imports.
+            continue;
+        } else if (in.op == 330 && instruction_string(source, in, 1).starts_with("Prosper.FragmentSubgroupSize=")) {
+            append_marker(result.words, "Prosper.FragmentSubgroupSize=0");
+        } else if (in.op == 330 && instruction_string(source, in, 1).starts_with("Prosper.FragmentSubgroupWhy=")) {
+            append_marker(result.words, "Prosper.FragmentSubgroupWhy=0");
+        } else {
+            result.words.insert(result.words.end(), source.begin() + in.at,
+                                source.begin() + in.at + in.count);
+        }
+    }
+    result.refusal = FragmentVoteRefusal::None;
+    return result;
+}
+
+} // namespace prosper::gpu

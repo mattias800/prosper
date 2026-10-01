@@ -18,14 +18,10 @@ nothing is reimplemented: this script only sequences those tools and tallies the
     python capture_wave_census.py --gpu-replay G --shader-inspect S --capture cap.prgcap
     python capture_wave_census.py --gpu-replay G --shader-inspect S --bundle f.prgbundle
 
-WHAT "DROPPED" MEANS, spelled out because getting it wrong made the first version of this script
-report the opposite of the truth. The renderer's gate is FIVE conjuncts
-(`render_runner.h:7128-7133`); the reason-set equality at `:7140` is only the innermost. The
-decisive one is `bd.allow_native_fragment_vote_width`, which defaults false (`:565`) and is set from
-`title_id == "PPSA04263"` alone (`live_renderer.cpp:1216`, `:7591`) -- so **outside GTA V every
-shader requiring more than 32 lanes is dropped, whatever its reason set**. Pass `--title` to say
-which title the capture came from; without it this assumes NOT on the allowlist, which is true for
-every title but one.
+This reports captured SOURCE requirements, not actual admission. Live rendering uses general
+per-vote certificates and immutable/deterministic-input authority that this offline census does
+not evaluate. Strict replay retains its source contract regardless of title. Reason-set candidate
+counts are not votes proved safe, draws executed, or a prediction of a live rendering result.
 
 SCOPE: a capture is ONE FRAME (and, with --bundle, one SUBMIT of it). This answers "of the fragment
 shaders this frame ran, how many need a wide wave and what for" -- not "how many does the title
@@ -39,11 +35,6 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-
-# The titles the renderer admits the narrow WaveAny class on, mirroring live_renderer.cpp's
-# kNativeFragmentVoteTitles (PR #3480). Every entry has a before/after survey on a reviewed route;
-# joining the list is one run, so this is a queue rather than a wall.
-NATIVE_VOTE_ALLOWLIST = ("PPSA01885", "PPSA02664", "PPSA04263", "PPSA13579", "PPSA25009")
 
 DRAW = re.compile(r"^draw\[(\d+)\].*?\bfs=(\d+)/([0-9a-f]+)/", re.M)
 DS_SUBMIT = re.compile(r"\bfirst=(\d+) last=(\d+)")
@@ -127,9 +118,7 @@ def main() -> int:
     ap.add_argument("--ds-submits", action="store_true",
                     help="census the submits --bundle-ds-summary names: the FIRST and LAST\n                         submit of each depth-stencil identity. Not every DS submit -- see\n                         ds_submit_ordinals().")
     ap.add_argument("--title", default="",
-                    help="title id the capture came from, e.g. PPSA04263. Decides whether the "
-                         "native-wave32 allowlist applies; without it, assumed NOT on the "
-                         "allowlist, which is true for every title but one.")
+                    help="title id the capture came from (provenance only; never an admission rule)")
     ap.add_argument("--work", help="directory for intermediates (default: a temporary one)")
     args = ap.parse_args()
     # Resolved to absolute up front. A relative tool path that a shell finds is not necessarily one
@@ -143,11 +132,6 @@ def main() -> int:
     if bool(args.capture) == bool(args.bundle):
         print("give exactly one of --capture or --bundle", file=sys.stderr)
         return 2
-
-    # W5 retired the per-title scope, so the WaveAny class is admissible everywhere. The
-    # variable stays because the OTHER conjuncts are still undecidable offline -- admission
-    # is an upper bound, not a certainty, whatever the title.
-    allowlisted = not NATIVE_VOTE_ALLOWLIST or args.title in NATIVE_VOTE_ALLOWLIST
 
     tmp = None
     if args.work:
@@ -249,18 +233,14 @@ def main() -> int:
     ok = {h: r for h, r in results.items() if r[0] == "ok"}
     bad = {h: r for h, r in results.items() if r[0] != "ok"}
     needs = {h: r for h, r in ok.items() if r[1] > 32}
-    # Admitted only if the title is on the allowlist AND the reason set passes. Two more conjuncts
-    # (host subgroup-size control, host subgroup features) are properties of the RUN and cannot be
-    # decided here, so even a 1 is an upper bound on admission, never a guarantee.
-    admitted = {h: r for h, r in needs.items() if allowlisted and r[4]}
+    # Source classifier candidates only. Neither the live rewrite nor its input authority runs here.
+    admitted = {h: r for h, r in needs.items() if r[4]}
     dropped = {h: r for h, r in needs.items() if h not in admitted}
 
     print("draws=%d  distinct fragment shaders=%d  analysed=%d  unreadable=%d"
           % (len(draws), len(first_draw), len(ok), len(bad)))
-    print("title=%s  native-wave32 allowlist: %s"
-          % (args.title or "(unspecified)",
-             "YES" if allowlisted else "no -- every wide-wave shader below is dropped"))
-    print("require>32=%d  possibly admitted=%d  DROPPED=%d"
+    print("title=%s  admission NOT EVALUATED (source census)" % (args.title or "(unspecified)"))
+    print("require>32=%d  source-classifier candidates=%d  other wide-wave modules=%d"
           % (len(needs), len(admitted), len(dropped)))
     if needs:
         hist = collections.Counter((r[2], r[3]) for r in needs.values())
@@ -268,7 +248,7 @@ def main() -> int:
         for (mask, names), n in hist.most_common():
             print("  %-8s %-42s %3d shaders" % (mask, names, n))
     if dropped:
-        print("\ndropped shaders (hash, reasons, draws using it):")
+        print("\nother wide-wave source shaders (hash, reasons, captured draws using it):")
         for h, r in sorted(dropped.items(), key=lambda kv: -draw_count[kv[0]]):
             print("  %s  %-8s %-40s %3d draws" % (h[:16], r[2], r[3], draw_count[h]))
     if bad:
@@ -277,8 +257,8 @@ def main() -> int:
         for h, r in sorted(bad.items()):
             print("  %s  %s" % (h[:16], r[0]))
     if admitted:
-        print("\nNOTE: 'possibly admitted' is an UPPER bound. Admission also needs the host to "
-              "support\nthe width and the module's subgroup features, which this tool cannot see.")
+        print("\nNOTE: source-classifier candidates do NOT establish live per-vote rewrite safety "
+              "or input authority. This census does not evaluate admission.")
     if args.bundle:
         print("\nSCOPE: %d of the bundle's %d submits. Submits not censused may run shaders not"
               % (len(captures), bundle_submits))

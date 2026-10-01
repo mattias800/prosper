@@ -113,38 +113,31 @@ census of what could be decoded.
 
 ## `--wave-reasons`: which shaders need the guest Wave64, and why
 
-On any NVIDIA host the entire supported subgroup range is `32..32` -- no extension, driver or
-device yields a 64-wide subgroup -- so a fragment module that requires the guest's Wave64 is
-dropped. On *Grand Theft Auto V* that removes most of the world's lighting (#3464).
+On the measured Windows/RTX4090 host, fragment subgroups are `32..32`. A source requiring Wave64
+needs a correct lowering or is refused with a diagnostics alarm; host limits must be measured.
 
 ```sh
 shader_inspect <raw-rdna2.bin> --wave-reasons
 wave-reasons required-subgroup-size=64 reasons=0x2 names=wave-any reason-set-admissible=1 \
     internal-gds=0 subgroup-features=0x1 wave-width-independent=1
-wave-reasons gate-undecided=title-allowlist,host-subgroup-size-control,host-subgroup-features ...
+wave-reasons gate-undecided=fragment-policy,rewrite-certificate,pass-input-authority,host-subgroup-size-control,host-subgroup-features ...
 wave-reasons-end file=... input=rdna2 dwords=12 recompiled=1 table_dependent=0 endpgm=1
 ```
 
 ### `reason-set-admissible` is NOT `admitted`, and the difference is most of the answer
 
-The renderer's gate is **five conjuncts** (`tests/fixtures/render_runner.h`). The reason-set
-equality -- the one this field mirrors -- is only one of them, and it is not the one that decides
-correctness. `bd.allow_native_fragment_vote_width` defaults false and stages which titles are
-surveyed at all; `wave-width-independent` is the per-module proof that the draw may run at the
-host's narrower subgroup.
+This is a legacy source-classifier field, not the current renderer's rewrite certificate.
+Live frontends explicitly request title-independent `ProvenVotes`; replay defaults to `Strict`.
+The transformation must prove every vote safe, including helper values and execution/effect
+obligations. Buffer predicates additionally need immutable pass inputs and an enabled deterministic
+read contract. This tool evaluates none of those run-time authority conditions.
 
-**So a title not on that list drops every shader requiring more than 32 lanes regardless of its
-reason set.** An earlier version of this tool called the reason-set test `native-wave32-admitted`
-and was therefore wrong in the one direction that mattered: it under-reported the loss #3464
-exists to size. Its *Blasphemous 2* validation run reported `0 dropped` where the true answer
-was `2` -- and it went unquestioned because it agreed with the expectation.
-
-### `wave-width-independent` is the property the allowance actually needs
+### `wave-width-independent` is a source property, not permission to rewrite
 
 Whether the module answers the same over two 32-lane groups as over one 64-lane wave, decided per
-module by `fragment_spirv_wave_width_independent` (`src/gpu/recompiler/rdna2_to_spirv.hpp`, which
-carries the argument). A vote clears when its operand is provably wave-uniform, or when its result
-cannot influence a colour output through data flow **or** control dependence.
+module by `fragment_spirv_wave_width_independent` (`src/gpu/recompiler/rdna2_to_spirv.hpp`).
+It is retained for source investigation and explicit diagnostic paths. Output independence alone
+does not prove a collective can be deleted: derivatives, termination and memory ordering matter.
 
 The reason set alone cannot answer this and neither can value reachability, which is the mistake
 this field replaced: a vote used only as a branch condition never flows into a store, yet it
@@ -155,10 +148,9 @@ falsifications are in `RECOMPILER_REMAINING.md`'s *Ruled out* table.
 `wave_width_independent.py` answers the same question over a directory of `.spv` dumps, and the
 two implementations are cross-checked against each other on that corpus.
 
-The two conjuncts a module CAN decide are reported beside it (`internal-gds`,
-`subgroup-features`); the three it cannot are named on their own `gate-undecided=` line, every
-time, so no consumer can read admission into the row by omission. For a per-title verdict use
-`capture_wave_census.py --title`.
+Module properties (`internal-gds`, `subgroup-features`) are reported separately from the
+undecided run-time contracts. `capture_wave_census.py --title` attaches provenance only, not
+admission authority. Actual admitted/refused counts come from live logs (`skip_survey.py`).
 
 A module that needs no particular width reports `size=0 reasons=absent reason-set-admissible=0`.
 `reasons=0x0` is never printed: a module either carries the marker or does not, and `absent` is

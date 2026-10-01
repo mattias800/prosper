@@ -605,7 +605,8 @@ int main(int argc, char** argv) {
 
     // Register the shared live renderer (feeds the present layer; no BMP spam), then boot + run the
     // guest on its own thread while this thread samples the present layer.
-    prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false, code);
+    prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false,
+        prosper::gpu::FragmentWavePolicy::ProvenVotes);
     Program prog; std::string err;
     if (!boot_program(dump, prog, &err, [&]{
 #ifdef PROSPER_AUDIO_FFMPEG

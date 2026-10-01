@@ -96,13 +96,8 @@ def main() -> int:
     unrecompiled = [r for r in results if not r.error and not r.recompiled]
     ok = [r for r in results if not r.error and r.recompiled]
     needs = [r for r in ok if r.size > 32]
-    # The reason-set test is only the INNERMOST of the renderer's five conjuncts
-    # (render_runner.h:7128-7133). The decisive one, `allow_native_fragment_vote_width`,
-    # defaults false (:565) and comes from `title_id == "PPSA04263"` alone
-    # (live_renderer.cpp:1216), and two more are properties of the HOST. A raw-dump sweep has
-    # neither a title nor a host, so it reports the module property under its own name and
-    # never calls anything admitted -- an earlier version did, and undercounted the loss
-    # #3464 is about for every title but one.
+    # This legacy source classifier does not evaluate the title-independent ProvenVotes
+    # transformation, enabled device contracts or immutable pass inputs. Never call it admission.
     admissible = [r for r in needs if r.admissible]
 
     print("files=%d  errors=%d  unrecompiled(no resource table)=%d  analysed=%d"
@@ -113,9 +108,9 @@ def main() -> int:
     else:
         print("of the analysed: require>32=%d  of those reason-set admissible=%d"
               % (len(needs), len(admissible)))
-        print("NOTE: admissible is NOT admitted. The renderer also requires the title to be on")
-        print("the native-wave32 allowlist (currently PPSA04263 only) and the host to support")
-        print("the width and features. For a per-title verdict use capture_wave_census.py.")
+        print("NOTE: admissible is NOT admitted. Live admission is title-independent and requires")
+        print("an explicit fragment policy, a rewrite certificate and measured device/pass contracts.")
+        print("Those are NOT evaluated by this source census. Use live logs for admission counts.")
         by_reason = collections.Counter((r.reasons, r.names) for r in needs)
         if by_reason:
             print("\nreason sets among the %d that require a wide wave:" % len(needs))

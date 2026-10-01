@@ -1,0 +1,172 @@
+// Execute the production ProvenVotes path at all four quad positions, with three measured
+// helper invocations. Strict replay/source bytes and effective pipeline variants stay separate.
+#include "fixtures/render_runner.h"
+#include "fixtures/spirv_fragment_vote_execution.hpp"
+#include "fixtures/spirv_fragment_vote_fixtures.hpp"
+#include <cstdio>
+#include <string_view>
+
+namespace {
+using prosper::gpu::FragmentWavePolicy;
+namespace f = prosper::test::fragment_vote_execution;
+int failures = 0;
+void check(bool ok, const char* name) {
+    std::printf("[%s] %s\n", ok ? "ok" : "FAIL", name);
+    failures += !ok;
+}
+struct Frame {
+    std::vector<uint8_t> pixels;
+    prosper::test::BackendPipelineCacheStats pipelines;
+};
+Frame render(const std::vector<uint32_t>& vs, const prosper::gpu::SharedShaderWords& fs,
+             uint64_t identity, FragmentWavePolicy policy, bool legacy_native = false) {
+    prosper::test::BackendDraw draw;
+    draw.vs = vs;
+    draw.fs_shared = fs;
+    draw.fs_identity = identity;
+    draw.vcount = 3;
+    draw.fragment_wave_policy = policy;
+    draw.allow_partial_wave_fragment = legacy_native; // explicit diagnostic control, never live policy
+    for (uint32_t set = 0; set < 2; ++set) {
+        prosper::test::FrameResource cb; cb.binding = 2; cb.set = set; draw.R.push_back(cb);
+        prosper::test::FrameResource vb; vb.binding = 3; vb.set = set; draw.R.push_back(vb);
+    }
+    auto pixels = prosper::test::render_draws_rgba({draw}, f::width, f::height);
+    return {std::move(pixels), prosper::test::backend_pipeline_cache_stats()};
+}
+bool blue(const uint8_t* p) { return p[0] == 0 && p[1] == 0 && p[2] == 255 && p[3] == 255; }
+void verify_clear(const Frame& frame) {
+    bool clear = frame.pixels.size() == f::width * f::height * 4;
+    if (clear) for (size_t i = 0; i < frame.pixels.size(); i += 4) clear &= blue(&frame.pixels[i]);
+    check(clear, "Strict refuses source Wave64 without inheriting a live pipeline");
+}
+void verify_derivatives(const Frame& frame, uint32_t x, uint32_t y) {
+    check(frame.pixels.size() == f::width * f::height * 4, "proven module renders a target");
+    if (frame.pixels.size() != f::width * f::height * 4) return;
+    size_t covered = 0;
+    for (size_t i = 0; i < frame.pixels.size(); i += 4) covered += !blue(&frame.pixels[i]);
+    const auto* p = &frame.pixels[(y * f::width + x) * 4];
+    std::printf("quad=(%u,%u) rgba=%u,%u,%u,%u covered=%zu\n", x & 1, y & 1,
+                p[0], p[1], p[2], p[3], covered);
+    check(covered == 1 && p[2] == 0 && p[3] == 255, "exactly the selected primitive-edge pixel renders");
+    check(p[0] >= 31 && p[0] <= 32 && p[1] >= 31 && p[1] <= 32,
+          "analytic dFdx(x)=dFdy(y)=1 includes helper values through the uniform vote branch");
+}
+void verify_buffer_authority(bool deterministic) {
+    namespace inputs = prosper::test::fragment_votes;
+    const auto source = std::make_shared<const std::vector<uint32_t>>(inputs::storage_predicate());
+    const auto captured = *source;
+    const auto vertex = f::edge_vertex(2, 2);
+    const auto draw = [&](uint64_t identity) {
+        prosper::test::BackendDraw d;
+        d.vs = vertex; d.fs_shared = source; d.fs_identity = identity; d.vcount = 3;
+        d.fragment_wave_policy = FragmentWavePolicy::ProvenVotes;
+        for (uint32_t set = 0; set < 2; ++set) {
+            prosper::test::FrameResource cb; cb.binding = 2; cb.set = set; d.R.push_back(cb);
+            prosper::test::FrameResource vb; vb.binding = 3; vb.set = set; d.R.push_back(vb);
+        }
+        prosper::test::FrameResource values; values.binding = 0; values.dwords = {0, 0x3f800000u};
+        d.R.push_back(values);
+        prosper::test::FrameResource predicate; predicate.binding = 5; predicate.dwords = {1};
+        d.R.push_back(predicate);
+        return d;
+    };
+    const auto verify = [&](const std::vector<uint8_t>& pixels, bool admitted) {
+        check(pixels.size() == f::width * f::height * 4, "buffer predicate renders a target");
+        if (pixels.size() != f::width * f::height * 4) return;
+        // Scalar Location0 defines red only. Do not assert unspecified G/B/A output components.
+        const auto red = pixels[(2 * f::width + 2) * 4];
+        check(red == (admitted ? 255 : 0), "buffer-vote admission follows actual device and whole-pass authority");
+    };
+    for (const bool readonly_first : {false, true}) {
+        const uint64_t id = readonly_first ? 0xf3995001u : 0xf3995000u;
+        for (const bool readonly : {readonly_first, !readonly_first, readonly_first}) {
+            std::vector<prosper::test::BackendDraw> draws{draw(id)};
+            if (!readonly) {
+                // A later writer invalidates the WHOLE pass certificate. Its own Wave64 shader
+                // refuses before recording; this is an authority control, not a raced GPU write.
+                auto writer = draw(id + 0x100);
+                writer.fs_shared = std::make_shared<const std::vector<uint32_t>>(
+                    inputs::storage_predicate(false, false, true));
+                draws.push_back(std::move(writer));
+            }
+            verify(prosper::test::render_draws_rgba(draws, f::width, f::height), readonly && deterministic);
+        }
+    }
+    check(*source == captured, "buffer certificate/cache changes never alter shared captured shader bytes");
+}
+} // namespace
+
+int main(int argc, char** argv) {
+    const bool poison = argc == 2 && std::string_view(argv[1]) == "--poison-helpers";
+    const bool expect_no_robust2 = argc == 2 && std::string_view(argv[1]) == "--expect-no-robust2";
+    if (argc != 1 && !poison && !expect_no_robust2) return 2;
+    const auto& context = prosper::test::render_vk_ctx();
+    if (!context.ok || !(context.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
+        !(context.subgroup_operations & VK_SUBGROUP_FEATURE_QUAD_BIT) ||
+        !(context.subgroup_operations & VK_SUBGROUP_FEATURE_VOTE_BIT)) {
+        std::puts("SKIP: fragment subgroup helper witness is unavailable");
+        return 77;
+    }
+    if (context.subgroup_size_control && context.min_subgroup_size <= 64 &&
+        context.max_subgroup_size >= 64 &&
+        (context.required_subgroup_size_stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
+        std::puts("SKIP: this device supplies native Wave64; the unsupported-width lowering would not run");
+        return 77;
+    }
+    if (expect_no_robust2)
+        check(!context.deterministic_storage_reads,
+              "requested robust2 opt-out actually removes deterministic storage-read authority");
+    const auto fragment = std::make_shared<const std::vector<uint32_t>>(f::derivative_fragment(poison));
+    const auto captured = *fragment;
+    const auto witness = std::make_shared<const std::vector<uint32_t>>(f::helper_witness());
+    const auto effective = prosper::gpu::lower_fragment_votes(*fragment);
+    check(effective.refusal == prosper::gpu::FragmentVoteRefusal::None && effective.uniform_votes == 1,
+          "source has one independently lowerable uniform vote");
+    check(prosper::gpu::fragment_spirv_required_subgroup_size(*fragment) == 64 &&
+          prosper::gpu::fragment_spirv_required_subgroup_size(effective.words) == 0,
+          "source and effective modules have distinct width contracts");
+    for (uint32_t y = 2; y < 4; ++y) for (uint32_t x = 2; x < 4; ++x) {
+        const auto vertex = f::edge_vertex(x, y);
+        const auto edge = render(vertex, witness, 0, FragmentWavePolicy::Strict, true);
+        check(edge.pixels.size() == f::width * f::height * 4, "quad witness renders");
+        if (edge.pixels.size() != f::width * f::height * 4) continue;
+        size_t covered = 0;
+        for (size_t i = 0; i < edge.pixels.size(); i += 4) covered += !blue(&edge.pixels[i]);
+        const auto* p = &edge.pixels[(y * f::width + x) * 4];
+        check(covered == 1 && p[0] == ((y & 1) * 2 + (x & 1)) && p[1] == 3,
+              "the chosen quad position has three actual helper neighbors");
+        const uint64_t id = 0xf3990000u + y * 16 + x;
+        verify_clear(render(vertex, fragment, id, FragmentWavePolicy::Strict));
+        const auto live = render(vertex, fragment, id, FragmentWavePolicy::ProvenVotes);
+        verify_derivatives(live, x, y);
+        check(live.pipelines.misses == 1 && live.pipelines.hits == 0, "first effective variant creates its pipeline");
+        const auto warm = render(vertex, fragment, id, FragmentWavePolicy::ProvenVotes);
+        verify_derivatives(warm, x, y);
+        check(warm.pipelines.hits == 1 && warm.pipelines.misses == 0, "unchanged effective variant reuses its pipeline");
+        verify_clear(render(vertex, fragment, id, FragmentWavePolicy::Strict));
+
+        // Both routes omit required-size pNext but create DIFFERENT module bytes for one source
+        // identity. Exercise both cache orders; the variant bit must prevent either false hit.
+        for (const bool live_first : {false, true}) {
+            const uint64_t alternate = id + (live_first ? 0x200u : 0x100u);
+            const auto first = render(vertex, fragment, alternate,
+                live_first ? FragmentWavePolicy::ProvenVotes : FragmentWavePolicy::Strict, !live_first);
+            check(first.pipelines.misses == 1, "first width-independent cache variant is cold");
+            const auto second = render(vertex, fragment, alternate,
+                live_first ? FragmentWavePolicy::Strict : FragmentWavePolicy::ProvenVotes, live_first);
+            check(second.pipelines.misses == 1 && second.pipelines.hits == 0,
+                  "effective bytes and native diagnostic bytes do not collide at required width zero");
+            if (live_first) verify_derivatives(first, x, y);
+            else verify_derivatives(second, x, y);
+            verify_clear(render(vertex, fragment, alternate, FragmentWavePolicy::Strict));
+        }
+        // No source identity bypasses both transform memos and pipeline cache ownership.
+        verify_derivatives(render(vertex, fragment, 0, FragmentWavePolicy::ProvenVotes), x, y);
+        verify_clear(render(vertex, fragment, 0, FragmentWavePolicy::Strict));
+        check(*fragment == captured, "live/cache/replay calls leave shared captured source words byte-identical");
+    }
+    verify_buffer_authority(context.deterministic_storage_reads);
+    std::printf("== %s: %d failures ==\n", failures ? "FAIL" : "PASS", failures);
+    return failures ? 1 : 0;
+}

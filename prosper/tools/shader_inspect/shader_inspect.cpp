@@ -184,10 +184,10 @@ int main(int argc, char** argv) {
             "rdna2_walk, terminated by a `mimg-sites-end` line so a consumer can tell a real empty\n"
             "census from a run that died before printing one.\n"
             "--wave-reasons prints ONLY a machine-readable fragment wave-width census: the guest\n"
-            "wave width the recompiled module requires, why, and whether render_runner.h would\n"
-            "would ADMIT at a host native wave32. `reason-set-admissible` is the module half of\n"
-            "that gate only -- admission also needs a title allowlist and host support, which an\n"
-            "offline tool cannot see, and every line says so. Same sentinel discipline as\n"
+            "wave width the source module requires, why, and its legacy reason-set classification.\n"
+            "This is NOT the live ProvenVotes rewrite certificate: policy, enabled device contracts\n"
+            "and pass input authority are not evaluated here. No title allowlist controls admission.\n"
+            "Every row states these limits. Same sentinel discipline as\n"
             "--mimg-sites.\n"
             "It accepts EITHER a raw RDNA2 stream or a SPIR-V module (detected by the magic). A\n"
             "raw dump has no descriptors, so a texture-sampling shader cannot be lowered here and\n"
@@ -352,10 +352,9 @@ int main(int argc, char** argv) {
             // Named explicitly, every time, so no consumer can read the line above as an
             // admission verdict by omission. These are the conjuncts an OFFLINE tool cannot
             // evaluate at all -- they are properties of the run, not of the module.
-            std::printf("wave-reasons gate-undecided=title-allowlist,host-subgroup-size-control,"
-                        "host-subgroup-features NOTE: admission additionally requires the title to be"
-                        " on the allowlist (currently PPSA04263 only) and the host to support the"
-                        " width and features; this tool knows none of those.\n");
+            std::printf("wave-reasons gate-undecided=fragment-policy,rewrite-certificate,pass-input-authority,"
+                        "host-subgroup-size-control,host-subgroup-features NOTE: source classification"
+                        " is NOT live admission; title-independent ProvenVotes is not evaluated here.\n");
         }
         // `recompiled` is honest only for a raw stream -- a SPIR-V input is READ, not
         // recompiled -- so it is reported as n/a there rather than as a 1 that would inflate
