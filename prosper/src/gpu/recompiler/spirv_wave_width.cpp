@@ -175,7 +175,12 @@ bool spirv_is_id_operand(uint32_t op, uint32_t i) {
         case Op_ImageSampleImplicitLod:
         case Op_ImageSampleExplicitLod:
         case Op_ImageFetch: case Op_ImageGather:
+            if (op == Op_ImageGather) return i == 3 || i == 4 || i == 5 || i >= 7;
             return i == 3 || i == 4 || i >= 6;                    // word 5 is a LITERAL mask
+        case 89 /*OpImageSampleDrefImplicitLod*/: case 90 /*OpImageSampleDrefExplicitLod*/:
+        case 93 /*OpImageSampleProjDrefImplicitLod*/: case 94 /*OpImageSampleProjDrefExplicitLod*/:
+        case 97 /*OpImageDrefGather*/:
+            return i == 3 || i == 4 || i == 5 || i >= 7;           // Dref ID, then mask at 6
         case Op_TypeInt: case Op_TypeFloat: return false;
         case Op_TypeVector: case 24 /*OpTypeMatrix*/: case Op_TypeImage: return i == 2;
         case Op_TypePointer:    return i == 3;                    // word 2 is LITERAL storage
@@ -627,7 +632,8 @@ bool fragment_spirv_wave_width_independent(const std::vector<uint32_t>& spirv) {
                 // the scan fired and read the wrong word. Testing all of them needs no per-opcode
                 // value index and cannot drift as opcodes are added.
                 if (spirv_op_is_atomic(in.op)) {
-                    for (uint32_t i = 3; i < in.len; ++i)
+                    const uint32_t first = spirv_has_result(in.op) ? 3u : 1u;
+                    for (uint32_t i = first; i < in.len; ++i)
                         if (tainted.count(spirv[in.at + i])) return true;
                 }
                 // OpCopyMemory moves a value without an OpLoad/OpStore pair, so a tainted local

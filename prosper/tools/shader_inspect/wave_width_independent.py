@@ -91,7 +91,7 @@ def instructions(words):
         n = words[off] >> 16
         op = words[off] & 0xffff
         if not n or off + n > len(words):
-            return
+            raise ValueError("zero-length or truncated SPIR-V instruction")
         yield op, words[off:off + n]
         off += n
 
@@ -370,8 +370,10 @@ class Module:
                     return True
                 # EVERY id operand, not word 3 -- word 3 is an atomic's POINTER and the value it
                 # writes is further along, its index differing by opcode. See the C++ twin.
-                if op in ATOMIC_OPS and any(w[i] in tainted for i in range(3, len(w))):
-                    return True
+                if op in ATOMIC_OPS:
+                    first = 1 if result_index(op) is None else 3
+                    if any(w[i] in tainted for i in range(first, len(w))):
+                        return True
                 # The SOURCE is a pointer, so its taint lives in tainted_ptrs, not in tainted --
                 # a slot is tainted, not a value id. Testing the wrong set made this arm inert,
                 # which is what its own fixture caught.

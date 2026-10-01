@@ -571,6 +571,12 @@ def main() -> int:
         done = subprocess.run([sys.executable, str(TOOL), str(p)], capture_output=True, text=True)
         check("an unreadable module is NOT reported proven",
               done.returncode == 1 and "UNREADABLE" in done.stdout, done.stdout)
+        for name, words in (
+                ("zero instruction length", [MAGIC, VERSION, 0, 96, 0, 0]),
+                ("truncated vote", [MAGIC, VERSION, 0, 96, 0, (5 << 16) | 335, 2, 52, 11])):
+            write(words, p)
+            done = subprocess.run([sys.executable, str(TOOL), str(p)], capture_output=True, text=True)
+            check("REFUSES " + name, done.returncode == 1 and "UNREADABLE" in done.stdout, done.stdout)
 
     if len(sys.argv) > 1:
         # Shared strict-valid #4007 fixtures guard parity with the shipped C++ proof. These are
@@ -579,7 +585,7 @@ def main() -> int:
             dumped = subprocess.run([sys.argv[1], "--dump", tmp], capture_output=True, text=True)
             check("the #4007 fixture generator actually ran", dumped.returncode == 0, dumped.stdout)
             paths = sorted(Path(tmp).glob("*.spv"))
-            check("all 35 #4007 fixtures were emitted", len(paths) == 35, str(len(paths)))
+            check("all 41 #4007 fixtures were emitted", len(paths) == 41, str(len(paths)))
             for path in paths:
                 expected = not path.stem.endswith("_dependent")
                 done = subprocess.run([sys.executable, str(TOOL), str(path)],

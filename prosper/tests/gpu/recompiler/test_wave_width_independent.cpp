@@ -50,6 +50,14 @@ int main(int argc, char** argv) {
                 ++failures;
             }
         }
+        for (const auto& words : {
+                 std::vector<uint32_t>{0x07230203u, 0x00010300u, 0, 96, 0, 0},
+                 std::vector<uint32_t>{0x07230203u, 0x00010300u, 0, 96, 0,
+                                       (5u << 16) | 335u, 2, 52, 11}}) {
+            const bool ok = !prosper::gpu::fragment_spirv_wave_width_independent(words);
+            std::printf("  [%s] malformed instruction stream is NOT PROVEN\n", ok ? "ok" : "FAIL");
+            failures += !ok;
+        }
     }
     std::printf("== %s: %zu fixtures, %d failures ==\n", failures ? "FAIL" : "PASS",
                 corpus.size(), failures);

@@ -35,7 +35,10 @@ def id_operand_indices(op, n):
         return [i for i in (3, 4) if i < n]
     if op == 79:                       # OpVectorShuffle: v1(id), v2(id), literal components
         return [i for i in (3, 4) if i < n]
-    if op in (87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98):
+    if op in (89, 90, 93, 94, 96, 97):
+        # Dref or Gather Component is an ID at word 5; the optional literal mask is at word 6.
+        return [i for i in (3, 4, 5) if i < n] + list(range(7, n))
+    if op in (87, 88, 91, 92, 95, 98):
         # OpImageSample*: image(id), coord(id), LITERAL operands mask, then ids
         return [i for i in (3, 4) if i < n] + list(range(6, n))
     if op == 71:                       # OpDecorate: target(id), then literals
