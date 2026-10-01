@@ -470,22 +470,27 @@ int main(int argc, char** argv) {
                                      fragment_fixture, error),
               "CLI fixture writes the exact captured failed-fragment ABI");
         std::vector<uint8_t> legacy_fragment_bytes;
-        constexpr size_t legacy_fragment_tail_bytes = 10u + 4u + 4u + 10u;
+        constexpr size_t legacy_fragment_tail_bytes = 4u + 10u + 4u + 4u + 10u;
         CHECK(gpu::serialize_gpu_capture(fragment_fixture, legacy_fragment_bytes, error) &&
               legacy_fragment_bytes.size() > 12u + legacy_fragment_tail_bytes &&
-              legacy_fragment_bytes[8] == 64u,
+              legacy_fragment_bytes[8] == 65u,
               "CLI fixture serializes a current fragment retry for a legacy downgrade");
         if (legacy_fragment_bytes.size() > 12u + legacy_fragment_tail_bytes &&
-            legacy_fragment_bytes[8] == 64u) {
-            // No realized draws/resources and one failure: remove the v64 mode counts/unknown
-            // pair, v63/v62 zero counts, and v61 retry-config tail to recover an exact v60 prefix.
+            legacy_fragment_bytes[8] == 65u) {
+            // No realized draws/resources and one failure: remove v65 owned count, v64 mode
+            // counts/unknown pair, v63/v62 zero counts and v61 retry tail for a v60 prefix.
             legacy_fragment_bytes.resize(legacy_fragment_bytes.size() - legacy_fragment_tail_bytes);
             legacy_fragment_bytes[8] = 60u;
             gpu::GpuCaptureFile legacy_fragment_capture;
             CHECK(gpu::deserialize_gpu_capture(legacy_fragment_bytes, legacy_fragment_capture, error) &&
                   legacy_fragment_capture.format_version == 60u &&
                   legacy_fragment_capture.failure_diagnostics.size() == 1u &&
+                  legacy_fragment_capture.failure_diagnostics[0].vertex_retry_config_available &&
                   !legacy_fragment_capture.failure_diagnostics[0].fragment_retry_config_available &&
+                  !legacy_fragment_capture.failure_diagnostics[0].has_system_inputs &&
+                  !legacy_fragment_capture.failure_diagnostics[0].ps_wave32 &&
+                  legacy_fragment_capture.raw_shader_versions.size() == 1u &&
+                  legacy_fragment_capture.raw_shader_versions[0].words == fragment_raw.words &&
                   !legacy_fragment_capture.failure_diagnostics[0].ps_float_mode.available &&
                   legacy_fragment_capture.failure_diagnostics[0].ps_float_mode.value == 0u,
                   "CLI fixture proves genuine v60 decode with unknown fragment ABI and FLOAT_MODE");

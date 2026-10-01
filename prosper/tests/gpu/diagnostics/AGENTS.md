@@ -25,3 +25,10 @@ different bar from "it compiles and counts":
 Each of those has cost this project real time when it was missing, which is why they are asserted
 rather than assumed. See `src/gpu/diagnostics/AGENTS.md` for the instruments themselves and
 `diag_ratelimit.hpp` for the rate-limiting contract every capped diagnostic here must follow.
+
+## Ruled out
+
+- Removing only the v62 resource count and v61 fragment ABI tail no longer creates a v60
+  fixture after v63 appends its own resource count. The Linux replay CLI contract rejected that
+  malformed payload before reaching the unknown-ABI report. Remove all three tails and validate
+  the exact v60 parse, preserved raw words and unavailable fragment ABI before writing it (#3987).
