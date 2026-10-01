@@ -37,6 +37,14 @@ namespace prosper { void prosper_eq_trigger_eop(); }
 #include <condition_variable>
 #include <thread>
 
+// The dedicated pending-drain fixture compiles this same translation unit with rendezvous
+// checkpoints. Shipping prosper_core has neither these declarations nor the calls below.
+#ifdef PROSPER_PENDING_DRAIN_TEST_CHECKPOINTS
+extern "C" void prosper_pending_drain_inflight_wait_for_test();
+extern "C" void prosper_pending_drain_resume_for_test();
+extern "C" void prosper_pending_drain_active_wait_for_test();
+#endif
+
 namespace prosper::gpu {
 
 // High 32 bits of the guest GPU VA aperture, learned from any full indirect-args base. One address
@@ -3034,6 +3042,7 @@ PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
 thread_local uint32_t t_submit_scope_depth = 0;
 void apply_effect(const Pm4Command& c);   // fwd (defined with the WAIT_DEFER machinery below)
 void apply_deferred_effect(const Pm4Command& c);   // fwd: guarded apply (#449)
+void pend_wait_post_submit(PendQueue& p, std::unique_lock<std::mutex>& lk);
 // Drain returns only when every pending write has LANDED, and writes land STRICTLY IN QUEUE ORDER.
 //
 // #312 ROOT CAUSE (2026-07-10, label-event-ring attribution): the previous loop popped the NEXT
@@ -3053,8 +3062,22 @@ void apply_deferred_effect(const Pm4Command& c);   // fwd: guarded apply (#449)
 // the suspect class vanishes with this fix).
 void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
     for (;;) {
+        // A CV wait or apply/relock can outlive the caller's zero-active observation. A new
+        // submit may have admitted meanwhile, so qualify every pop under the same queue lock.
+        // Older SDK callers retain their existing worker delay and eager compatibility policy.
+        if (post_submit_visibility_enabled()) pend_wait_post_submit(p, lk);
         if (p.inflight > 0) {            // another drainer is mid-apply: WAIT — never overtake it
+#ifdef PROSPER_PENDING_DRAIN_TEST_CHECKPOINTS
+            prosper_pending_drain_inflight_wait_for_test();
+#endif
             p.cv.wait(lk);
+#ifdef PROSPER_PENDING_DRAIN_TEST_CHECKPOINTS
+            // Force the valid scheduler handoff while the waiter is outside mx, just as can
+            // happen before CV lock reacquisition. Do not inspect or refresh queue state here.
+            lk.unlock();
+            prosper_pending_drain_resume_for_test();
+            lk.lock();
+#endif
             continue;
         }
         if (p.q.empty()) break;
@@ -3082,6 +3105,9 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
 // Keep the real active-scope boundary and in-flight/FIFO guards, without inventing a GPU delay.
 void pend_wait_post_submit(PendQueue& p, std::unique_lock<std::mutex>& lk) {
     for (;;) {
+#ifdef PROSPER_PENDING_DRAIN_TEST_CHECKPOINTS
+        if (p.active_submits != 0) prosper_pending_drain_active_wait_for_test();
+#endif
         p.cv.wait(lk, [&] { return p.active_submits == 0; });
         const auto deadline = p.release_after;
         if (std::chrono::steady_clock::now() >= deadline) return;

@@ -2181,6 +2181,24 @@ if(TARGET prosper_core)
   target_link_libraries(test_eop_write PRIVATE prosper_core)
   add_test(NAME eop_write COMMAND test_eop_write)
 
+  # #4003: force the stale-drainer handoff in the actual completion-queue implementation.
+  # This executable supplies its own CP object; the ordinary archive CP object stays unselected.
+  # Rendezvous calls are compiled out of prosper_core and every shipping frontend.
+  add_executable(test_pending_drain_gate tests/gpu/pm4/test_pending_drain_gate.cpp
+    src/gpu/pm4/command_processor.cpp)
+  target_link_libraries(test_pending_drain_gate PRIVATE prosper_core)
+  target_compile_definitions(test_pending_drain_gate PRIVATE PROSPER_PENDING_DRAIN_TEST_CHECKPOINTS)
+  if(PROSPER_DIAGNOSTICS)
+    target_compile_definitions(test_pending_drain_gate PRIVATE PROSPER_DIAGNOSTICS)
+  endif()
+  if(UNIX AND NOT APPLE)
+    target_link_options(test_pending_drain_gate PRIVATE
+      "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/test_pending_drain_gate.map")
+  endif()
+  add_test(NAME pending_drain_gate COMMAND test_pending_drain_gate)
+  add_test(NAME pending_drain_legacy COMMAND test_pending_drain_gate --legacy)
+  set_tests_properties(pending_drain_gate pending_drain_legacy PROPERTIES TIMEOUT 15)
+
   # #1945: the interior free-chain poison scan — its structural predicate, and the census that keeps
   # a zero from reading as "the chains are clean" when the walk reached nothing. POSIX only: the test
   # needs a MAP_FIXED anonymous mapping inside the guest VA window to build a pool array with real
