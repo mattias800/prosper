@@ -44,12 +44,15 @@ namespace prosper {
 // guest auto window. See k_reserve_vrange (POSIX) / win_reserve (Windows).
 inline constexpr uint64_t kHugeReserveLen = 0x2000000000ull;   // 128 GiB
 
-// #4032: ordinary implicit maps start above the fixed image apertures, rather than consuming
-// the beginning of a later fixed arena. Both hosts use the guest libc's accepted low aperture;
-// the end is exclusive. Fixed addresses and explicit search hints keep their existing semantics.
-// CONFIDENCE: HIGH on the aperture and observed startup collision; MED on the preferred base,
-// which is placement policy rather than a claimed console ABI minimum.
-inline constexpr uint64_t kGuestAutoMapBase = 0x1000000000ull;   // 64 GiB
+// #4032/#4064: keep bounded automatic maps below the guest libc's accepted upper ceiling. Ordinary
+// implicit maps prefer 256 GiB, above observed fixed startup arenas in the 64/128 GiB bands.
+// This leaves 752 GiB before the exclusive ceiling; it does not guarantee room for an arbitrary
+// future fixed request. Fixed addresses and explicit search hints keep their existing semantics.
+// CONFIDENCE: HIGH on the accepted upper ceiling; MED on the preferred ordinary placement. The
+// preserved automatic-window lower bound is project policy, not a derived console ABI minimum.
+// Huge hinted reserves retain their separate floor below.
+inline constexpr uint64_t kGuestAutoMapMin = 0x1000000000ull;    // 64 GiB automatic-window lower bound
+inline constexpr uint64_t kGuestAutoMapBase = 0x4000000000ull;   // 256 GiB ordinary preference
 inline constexpr uint64_t kGuestAutoMapLimit = 0xfc00000000ull;
 // #312/#946's huge hinted reservations must vacate their low hint for a later metadata pool.
 // Retain their established placement floor independently of the ordinary-map preference.
@@ -1421,6 +1424,26 @@ namespace {
         out = *best;
         return true;
     }
+    // A failure-time ledger snapshot, not a host-VMA census or proof of whole-span coverage.
+    // Share the small cap across direct calls and BatchMap; diagnostics never change refusal.
+    void log_fixed_refusal(uint64_t addr, int saved_errno) {
+        if (memlog()) {
+            static std::atomic<unsigned> logged{0};
+            const unsigned seen = logged.fetch_add(1, std::memory_order_relaxed);
+            if (seen < 8) {
+                Mapping cover{};
+                const bool tracked = snapshot_mapping(addr, cover);
+                MLOG("fixed-refusal va=0x%llx errno=%d cover-at-start=%s committed=%d "
+                     "base=0x%llx size=0x%llx physical-offset=0x%llx\n",
+                     (unsigned long long)addr, saved_errno, tracked ? "tracked" : "none",
+                     tracked && cover.committed, (unsigned long long)cover.base,
+                     (unsigned long long)cover.size, (unsigned long long)cover.offset);
+            } else if (seen == 8) {
+                MLOG("further fixed-refusal snapshots suppressed after 8\n");
+            }
+        }
+        if (memlog()) errno = saved_errno;
+    }
     // Is [base, base+len) entirely covered by our OWN UNCOMMITTED (PROT_NONE reservation) mappings?
     // Only then is a MAP_FIXED replace safe: the guest is committing a range it reserved (#137). A
     // committed span (live guest memory) or a gap (an untracked host mapping / loaded image) means a
@@ -1545,7 +1568,7 @@ namespace {
         // caller's floor to reclaim VA freed below the cursor. Huge hinted reservations retain
         // their separate legacy floor; ordinary implicit mappings use the preferred base.
         uint64_t hint = __atomic_load_n(&g_auto_map_cursor, __ATOMIC_RELAXED);
-        minimum = std::max(minimum, kGuestAutoMapBase);
+        minimum = std::max(minimum, kGuestAutoMapMin);
         if (hint < minimum) hint = minimum;
         void* p = map_guest_from(hint, len, prot, align, kGuestAutoMapLimit);
         if (!p && hint > minimum)
@@ -1846,7 +1869,7 @@ HLE(k_reserve_vrange) {
     // reservations into the guest auto-map region (map_guest_auto below, placement A/B-validated
     // in the #982 investigation), leaving the low hint free for the small metadata pool the
     // guest reserves next with the same hint. Retain that floor even when ordinary automatic
-    // mappings prefer a lower base (#4032); all automatic placement stays in the low aperture.
+    // mappings prefer a higher base (#4064); all automatic placement stays in the low aperture.
     if (hint && a1 < kHugeReserveLen) {
         // Non-fixed hint: search for a free range starting at the hint. Probe candidates with
         // MAP_FIXED_NOREPLACE (also catches host mappings the tracker doesn't know); on a miss,
@@ -2275,6 +2298,7 @@ static uint64_t map_dmem_impl(uint64_t addr_in_out, uint64_t len, uint64_t prot,
     uint64_t hint = addr_in_out ? *(uint64_t*)addr_in_out : 0;
     const bool fixed = (flags & 0x10) != 0;
     void* p = map_phys_at(hint, len, host_prot(prot), phys, align, fixed);
+    const int map_errno = p ? 0 : errno;
     // PROSPER_MAPWATCH=0xADDR[:SIZE] (#2998): report every direct-memory map whose RESULT overlaps
     // one guest range, with the physical offset and whether the placement was fixed. The question it
     // answers is "does the title map physical memory INTO this allocation later?" -- the shape a
@@ -2301,16 +2325,19 @@ static uint64_t map_dmem_impl(uint64_t addr_in_out, uint64_t len, uint64_t prot,
     if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx flags=0x%llx phys=0x%llx align=0x%llx FAILED\n",
                    (unsigned long long)hint, (unsigned long long)len,
                    (unsigned long long)flags, (unsigned long long)phys,
-                   (unsigned long long)align); return 0x8002000cull; } // ENOMEM
+                   (unsigned long long)align);
+        if (fixed && hint) log_fixed_refusal(hint, map_errno);
+        return 0x8002000cull; } // ENOMEM
     if (set_memory_type) dmem_retype(phys, len, memory_type);
     if (addr_in_out) *(uint64_t*)addr_in_out = (uint64_t)p;
     track((uint64_t)p, len, host_prot(prot), static_cast<uint32_t>(prot), true,
           "direct", kVirtualQueryDirect, phys, memory_type);
     // (The texture write-watch alias for this mapping is registered at the map_phys_at chokepoint above,
     // which also covers BatchMap MAP_DIRECT and Ampr — see #1144 B3.)
-    MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx\n",
+    MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx hint=0x%llx\n",
          (unsigned long long)p, (unsigned long long)len, (unsigned long long)phys,
-         (unsigned long long)prot, (unsigned long long)flags, (unsigned long long)align);
+         (unsigned long long)prot, (unsigned long long)flags, (unsigned long long)align,
+         (unsigned long long)hint);
     return 0;
 }
 
@@ -3757,10 +3784,12 @@ HLE(k_batch_map) {
             break;
         }
         bool ok = true;
+        int map_errno = 0;
         switch (op) {
             case 0: {                               // MAP_DIRECT: phys-backed (aliasing preserved)
                 void* p = map_phys_at(start, len, host_prot(prot), phys);
                 ok = (p != nullptr);
+                if (!ok) map_errno = errno;
                 int32_t memory_type = 0;
                 dmem_type_at(phys, memory_type);
                 if (ok) track((uint64_t)p, len, host_prot(prot), prot, true,
@@ -3776,7 +3805,12 @@ HLE(k_batch_map) {
             }
             case 1: if (start) {                                                             // UNMAP
                         host::guest_write_watch_notify_direct_mapping_removed(start, len);    // #1144 B3/B4
-                        munmap((void*)(uintptr_t)start, len); untrack(start, len);
+                        const int unmap_ret = munmap((void*)(uintptr_t)start, len);
+                        const int unmap_errno = unmap_ret ? errno : 0;
+                        MLOG("bm UNMAP va=0x%llx len=0x%llx host-ret=%d errno=%d\n",
+                             (unsigned long long)start, (unsigned long long)len,
+                             unmap_ret, unmap_errno);
+                        untrack(start, len);
                     } break;
             case 2: case 4: {                                                            // PROTECT / TYPE_PROTECT
                 if (start) {
@@ -3803,6 +3837,7 @@ HLE(k_batch_map) {
             default: ok = false; ret = 0x80020016ull; break;
         }
         if (!ok) {
+            if (op == 0 && start) log_fixed_refusal(start, map_errno);
             // A failed entry is FATAL to the caller -- UE4 titles turn the resulting ENOMEM into
             // `LowLevelFatalError ... sceKernelBatchMap failed with error code: 0x8002000c` and kill
             // the process (#2450, Dragon Quest VII PPSA17942). Report it unconditionally: this fires
@@ -4876,6 +4911,27 @@ namespace {
         out = *best;
         return true;
     }
+    // A failure-time ledger snapshot, not a host-VMA census or proof of whole-span coverage.
+    // Share the small cap across direct calls and BatchMap; diagnostics never change refusal.
+    void log_fixed_refusal(uint64_t addr, DWORD saved_error) {
+        if (memlog()) {
+            static std::atomic<unsigned> logged{0};
+            const unsigned seen = logged.fetch_add(1, std::memory_order_relaxed);
+            if (seen < 8) {
+                Mapping cover{};
+                const bool tracked = snapshot_mapping(addr, cover);
+                MLOG("fixed-refusal va=0x%llx error=%lu cover-at-start=%s committed=%d "
+                     "base=0x%llx size=0x%llx physical-offset=0x%llx\n",
+                     (unsigned long long)addr, (unsigned long)saved_error,
+                     tracked ? "tracked" : "none", tracked && cover.committed,
+                     (unsigned long long)cover.base, (unsigned long long)cover.size,
+                     (unsigned long long)cover.offset);
+            } else if (seen == 8) {
+                MLOG("further fixed-refusal snapshots suppressed after 8\n");
+            }
+        }
+        if (memlog()) SetLastError(saved_error);
+    }
     uint64_t next_base(uint64_t addr) {
         std::lock_guard<std::mutex> lk(g_mx);
         uint64_t n = 0;
@@ -4920,7 +4976,7 @@ namespace {
     // ranges. Letting Windows choose from its full user VA space can land a valid mapping in the
     // rejected 1-8 TiB gap (Astro observed 0x2d980000000), after which sceLibcMspaceCreate returns
     // null even though the pages are accessible.
-    constexpr uint64_t kGuestAutoVaMin = kGuestAutoMapBase;
+    constexpr uint64_t kGuestAutoVaMin = kGuestAutoMapMin;
     constexpr uint64_t kGuestAutoVaMax = kGuestAutoMapLimit - 1;  // inclusive
 
     // A paging-file SEC_RESERVE section avoids a 16 GiB commit charge, but every first guest touch
@@ -5094,7 +5150,7 @@ namespace {
     // MEM_PRESERVE_PLACEHOLDER splits the Windows placeholder without releasing either side.
     void* take_placeholder_locked(std::vector<PlaceholderSpan>& spans,
                                   uint64_t hint, uint64_t len, uint64_t align,
-                                  uint64_t automatic_minimum = kGuestAutoVaMin) {
+                                  uint64_t automatic_minimum = kGuestAutoMapBase) {
         if (!len) return nullptr;
         const uint64_t requested_align = align ? align : 0x1000;
         for (size_t i = 0; i < spans.size(); ++i) {
@@ -5137,7 +5193,7 @@ namespace {
     }
 
     void* take_free_placeholder_locked(uint64_t hint, uint64_t len, uint64_t align,
-                                       uint64_t automatic_minimum = kGuestAutoVaMin) {
+                                       uint64_t automatic_minimum = kGuestAutoMapBase) {
         return take_placeholder_locked(g_free_placeholders, hint, len, align, automatic_minimum);
     }
 
@@ -5214,7 +5270,7 @@ namespace {
             return {take_free_placeholder_locked(hint, len, align), PlaceholderOwner::Free};
         }
 
-        return acquire_placeholder_window_locked(kGuestAutoVaMin, len, align);
+        return acquire_placeholder_window_locked(kGuestAutoMapBase, len, align);
     }
 
     bool protect_committed_regions(uint64_t base, uint64_t len, int hp) {
@@ -7146,7 +7202,7 @@ HLE(k_map_flexible) {
     if (fixed && !hint) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
     void* p = hint ? win_commit_flexible_exact(hint, a1, host_prot(a2)) : nullptr;
     if (!p && !fixed)
-        p = win_commit_from(hint ? hint : kGuestAutoVaMin, a1, host_prot(a2));
+        p = win_commit_from(hint ? hint : kGuestAutoMapBase, a1, host_prot(a2));
     if (!p) { MLOG("mapflexible hint=0x%llx len=0x%llx FAILED\n",
                    (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; }
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
@@ -7503,16 +7559,20 @@ static uint64_t map_dmem_impl(uint64_t addr_in_out, uint64_t len, uint64_t prot,
     uint64_t hint = addr_in_out ? *(uint64_t*)addr_in_out : 0;
     const bool fixed = (flags & 0x10) != 0;
     void* p = win_map_phys(hint, len, host_prot(prot), phys, align, fixed);
+    const DWORD map_error = p ? ERROR_SUCCESS : GetLastError();
     if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx FAILED\n",
-                   (unsigned long long)hint, (unsigned long long)len); return 0x8002000cull; }
+                   (unsigned long long)hint, (unsigned long long)len);
+        if (fixed && hint) log_fixed_refusal(hint, map_error);
+        return 0x8002000cull; }
     if (set_memory_type) dmem_retype(phys, len, memory_type);
     if (addr_in_out) *(uint64_t*)addr_in_out = (uint64_t)p;
     const bool sparse = sparse_dmem_view_contains((uint64_t)p, (uint64_t)p + len);
     track((uint64_t)p, len, host_prot(prot), static_cast<uint32_t>(prot), true,
           "direct", kVirtualQueryDirect, phys, memory_type, !sparse);
-    MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx\n",
+    MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx hint=0x%llx\n",
          (unsigned long long)p, (unsigned long long)len, (unsigned long long)phys,
-         (unsigned long long)prot, (unsigned long long)flags, (unsigned long long)align);
+         (unsigned long long)prot, (unsigned long long)flags, (unsigned long long)align,
+         (unsigned long long)hint);
     return 0;
 }
 
@@ -7706,6 +7766,9 @@ HLE(k_batch_map) {
                     ok = win_unmap(start, len);
                 if (!ok) { win_err = GetLastError(); win_err_valid = true; }
                 if (ok && start) untrack(start, len);
+                if (start) MLOG("bm UNMAP va=0x%llx len=0x%llx win-unmap-ret=%d error=%lu\n",
+                               (unsigned long long)start, (unsigned long long)len,
+                               ok ? 1 : 0, (unsigned long)(win_err_valid ? win_err : ERROR_SUCCESS));
                 break;
             }
             case 2: case 4: {                                                            // PROTECT / TYPE_PROTECT
@@ -7734,6 +7797,7 @@ HLE(k_batch_map) {
             default: ok = false; ret = 0x80020016ull; break;
         }
         if (!ok) {
+            if (op == 0 && start) log_fixed_refusal(start, win_err);
             // Name the failing entry (#2450). A failed entry is fatal to the caller: UE4 titles
             // turn the resulting ENOMEM into `LowLevelFatalError ... sceKernelBatchMap failed with
             // error code: 0x8002000c` and kill the process (Dragon Quest VII, PPSA17942). Fires
