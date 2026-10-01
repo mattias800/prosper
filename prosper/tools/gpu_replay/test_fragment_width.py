@@ -201,7 +201,10 @@ def run(args, width=None, tap=False):
 print("== test_gpu_replay_fragment_width_cli ==")
 VAL = validator()
 check(VAL is not None, "strict spirv-val is available (absence is a failure, not a validation claim)")
-with tempfile.TemporaryDirectory(prefix="prosper-fragment-width-") as temp:
+scratch_root = Path(os.environ.get("PROSPER_TEST_SCRATCH_DIR") or
+                    (Path.cwd() / "prosper-test-scratch"))
+scratch_root.mkdir(parents=True, exist_ok=True)
+with tempfile.TemporaryDirectory(prefix="prosper-fragment-width-", dir=scratch_root) as temp:
     directory = Path(temp)
     fixture_env = dict(os.environ)
     fixture_env.pop("PROSPER_FS_TAP", None)
