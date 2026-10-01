@@ -774,13 +774,13 @@ int main() {
     // GTA V's Wave64 traversal kernels count complete EXEC, VCC, and VOPC-saved masks.  A native
     // subgroup reduction is exact only under the required 64-lane contract.  The asymmetric VCC
     // predicate contains 33 lanes, including lane 32, while the second wave is empty; doubling the
-    // result also keeps the immediately-preceding SCC=false observable after S_BCNT.
+    // result also makes S_BCNT's architectural SCC=(count!=0) observable.
     const uint32_t code9_bcnt_vcc[] = {
         0x7d8800a1u,              // v_cmp_gt_u32 vcc, 33, v0 -> wave0 lanes 0..32
         0xbe810381u,              // s_mov_b32 s1, 1
         0xbf068001u,              // s_cmp_eq_u32 s1, 0 -> SCC=false
         0xbe84106au,              // s_bcnt1_i32_b64 s4, vcc
-        0x85058081u,              // s_cselect_b32 s5, 1, 0 -> 0 only if SCC is preserved
+        0x85058081u,              // s_cselect_b32 s5, 1, 0 -> 1 for a nonempty mask
         0x8f048104u,              // s_lshl_b32 s4, s4, 1
         0x80040504u,              // s_add_u32 s4, s4, s5
         0x7e020204u,              // v_mov_b32 v1, s4
@@ -847,13 +847,13 @@ int main() {
         uint32_t bad_bcnt = 0;
         for (uint32_t lane = 0; lane < 128 && got_bcnt_vcc.size() == 128 &&
              got_bcnt_exec.size() == 128 && got_bcnt_saved.size() == 128; ++lane) {
-            bad_bcnt += got_bcnt_vcc[lane] != (lane < 64 ? 66u : 0u);
+            bad_bcnt += got_bcnt_vcc[lane] != (lane < 64 ? 67u : 0u);
             bad_bcnt += got_bcnt_exec[lane] != (lane < 64 ? 33u : 0u);
             bad_bcnt += got_bcnt_saved[lane] != (lane < 64 ? 1u : 0u);
         }
         CHECK(got_bcnt_vcc.size() == 128 && got_bcnt_exec.size() == 128 &&
                   got_bcnt_saved.size() == 128 && bad_bcnt == 0,
-              "Wave64 s_bcnt counts high-half/empty masks and preserves SCC=false");
+              "Wave64 s_bcnt counts high-half/empty masks and sets SCC from the count");
     } else {
         std::printf("  [skip] Wave64 s_bcnt execution: host subgroup is %u or lacks arithmetic\n",
                     exec_ballot_subgroup.size);
@@ -874,13 +874,13 @@ int main() {
         0x7e020204u,
         0xbf810000u,
     };
-    CHECK(recompile_compute(code9_bcnt_exec_scalar, std::size(code9_bcnt_exec_scalar), nullptr,
-                            bcnt_native32_config).empty() &&
-              recompile_compute(code9_bcnt_exec_scalar, std::size(code9_bcnt_exec_scalar), nullptr,
-                                bcnt_unknown_config).empty() &&
+    CHECK(!recompile_compute(code9_bcnt_exec_scalar, std::size(code9_bcnt_exec_scalar), nullptr,
+                             bcnt_native32_config).empty() &&
+              !recompile_compute(code9_bcnt_exec_scalar, std::size(code9_bcnt_exec_scalar), nullptr,
+                                 bcnt_unknown_config).empty() &&
               recompile_compute(code9_bcnt_exec_scalar, std::size(code9_bcnt_exec_scalar), nullptr,
                                 bcnt_wave32_config).empty(),
-          "S_BCNT1_I32_B64 rejects native32, unknown-width, and Wave32 mask execution");
+          "S_BCNT1_I32_B64 admits portable complete waves on narrow/unknown hosts, rejects Wave32 masks");
     const uint32_t code9_bcnt_unknown_pair[] = {0xbe841006u, 0xbf810000u};
     const uint32_t code9_bcnt_ambiguous[] = {
         0xbe8604c1u,              // s_mov_b64 s[6:7], -1 (mask and scalar-data views)
@@ -3414,9 +3414,9 @@ int main() {
                              native_cfg17d1b).empty(),
           "exact Wave64 s_ff1 resolves a complete VCC source to scalar data");
 
-    // Fail-visible domain/width arms.  They mutate the same op0x14 production gate and mask
-    // resolver as the positive packets: mismatched/unknown subgroups, plain scalar B64 data,
-    // mask+data ambiguity, an absent saved pair, and either EXEC-half destination must all reject.
+    // Complete Wave64 launches now have a portable reduction service when the native host
+    // contract is missing or narrower. Wave32 and unproven source/destination domains below
+    // retain their existing fail-visible boundaries.
     ComputeShaderConfig native32_cfg17d1b = native_cfg17d1b;
     native32_cfg17d1b.native_subgroup_size = 32;
     ComputeShaderConfig unknown_cfg17d1b = native_cfg17d1b;
@@ -3429,13 +3429,17 @@ int main() {
         0x7e040204u,              // v_mov_b32 v2, s4
         0xbf810000u,
     };
+    const auto narrow_spv17d1b_ff1 = recompile_compute(
+        code17d1b_exec_scalar, std::size(code17d1b_exec_scalar), nullptr, native32_cfg17d1b);
+    const auto portable_spv17d1b_ff1 = recompile_compute(
+        code17d1b_exec_scalar, std::size(code17d1b_exec_scalar), nullptr, unknown_cfg17d1b);
+    CHECK(!narrow_spv17d1b_ff1.empty() && !portable_spv17d1b_ff1.empty() &&
+              count_spirv_opcode(narrow_spv17d1b_ff1, 224) > 0 &&
+              count_spirv_opcode(portable_spv17d1b_ff1, 224) > 0,
+          "S_FF1_I32_B64 uses common barriers for narrow/unknown native Wave64 contracts");
     CHECK(recompile_compute(code17d1b_exec_scalar, std::size(code17d1b_exec_scalar), nullptr,
-                            native32_cfg17d1b).empty() &&
-              recompile_compute(code17d1b_exec_scalar, std::size(code17d1b_exec_scalar), nullptr,
-                                unknown_cfg17d1b).empty() &&
-              recompile_compute(code17d1b_exec_scalar, std::size(code17d1b_exec_scalar), nullptr,
-                                wave32_cfg17d1b).empty(),
-          "S_FF1_I32_B64 rejects native32, unknown-width, and Wave32 execution");
+                            wave32_cfg17d1b).empty(),
+          "S_FF1_I32_B64 retains the Wave32 rejection");
     const uint32_t code17d1b_unknown_pair[] = {
         0xbe841410u,              // s_ff1_i32_b64 s4, untracked s[16:17]
         0xbf810000u,

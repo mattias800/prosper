@@ -2159,6 +2159,17 @@ bool emit_cfg_state_machine(
             in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeFfbhU32 &&
             in.src[0].kind == OperandKind::SGPR && !in.has_sdwa && !in.has_dpp;
     };
+    auto portable_mask_reduction_candidate = [&](const Rdna2Inst& in) {
+        return b.is_compute && b.wave_size == 64 && !b.native_subgroup_size &&
+            !initial_active && b.local_count >= 64 && b.local_count % 64 == 0 &&
+            (in.src[0].kind == OperandKind::SGPR ||
+             (in.src[0].kind == OperandKind::Special &&
+              (in.src[0].value == 106 || in.src[0].value == 126))) &&
+            in.fmt == Rdna2Format::SOP1 &&
+            (in.opcode == kSop1OpcodeBcnt1I32B64 ||
+             in.opcode == kSop1OpcodeFf1I32B64) &&
+            in.dst.value != 126 && in.dst.value != 127;
+    };
 
     // Split at every branch target/fallthrough and around every cross-lane operation. Case values are
     // dense block indices, not guest PCs. A cross-lane op must end its block so the common synchronized
@@ -2183,6 +2194,8 @@ bool emit_cfg_state_machine(
     std::unordered_set<uint32_t> compute_dpp_add_row_mask_pcs;
     std::unordered_map<uint32_t, uint32_t> portable_mask_ffbh_event_for_pc;
     std::set<int> portable_mask_ffbh_dsts;
+    std::unordered_map<uint32_t, uint32_t> portable_mask_reduction_event_for_pc;
+    std::set<int> portable_mask_reduction_dsts;
     std::unordered_map<uint32_t, uint32_t> portable_readlane_event_for_pc;
     std::set<int> portable_readlane_dsts;
     // A VGPR written by V_WRITELANE is a scalar spill array. Its lane slots must remain in one
@@ -2269,6 +2282,14 @@ bool emit_cfg_state_machine(
             portable_mask_ffbh_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_mask_ffbh_event_for_pc.size() + 1));
             portable_mask_ffbh_dsts.insert(in.dst.value);
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (portable_mask_reduction_candidate(in)) {
+            portable_mask_reduction_event_for_pc.emplace(
+                in.pc, static_cast<uint32_t>(portable_mask_reduction_event_for_pc.size() + 1));
+            portable_mask_reduction_dsts.insert(in.dst.value);
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -3012,8 +3033,8 @@ bool emit_cfg_state_machine(
         // Architectural EXEC is a complete B64 mask source. emit_alu already materializes this
         // reduction from EXEC directly, but the MUST dataflow below has to agree, or the result is
         // a scalar the dispatcher erases at the next block entry -- see the note at the
-        // exact_mask_reduction use. The exactness precondition is emit_alu's own: the ballot equals
-        // the guest wave mask only when the native subgroup IS the guest wave.
+        // exact_mask_reduction use. A native ballot or the common portable event reconstructs
+        // every bit of the complete guest wave; a partial launched wave is not admitted here.
         //
         // This covers BOTH opcodes admitted above, not only the population count: 0x10 is
         // s_bcnt1_i32_b64 and 0x14 is s_ff1_i32_b64, and `s_ff1_i32_b64 <- exec` (find-first-set over
@@ -3023,11 +3044,11 @@ bool emit_cfg_state_machine(
         // CONFIDENCE: HIGH — EXEC as a B64 mask source for these two reductions is architectural
         // (RDNA2 ISA 70648 §5.3/§12.2: both take a 64-bit scalar source, and EXEC is a legal SSRC),
         // and the wave-size guard is the same precondition emit_alu already relies on rather than a
-        // new assumption. What is NOT covered is a 32-wide native subgroup, where the ballot is not
-        // the guest wave: that returns -1 and the dispatcher declines, loudly, via
-        // [subgroup-width] ... DISABLED. See #2429.
+        // new assumption. A narrower native subgroup does not cover the guest wave: only the
+        // portable common-phase service below may use LDS to cross that host subgroup boundary.
         if (in.src[0].kind == OperandKind::Special && in.src[0].value == 126 &&
-            b.native_subgroup_size == b.wave_size)
+            (b.native_subgroup_size == b.wave_size ||
+             portable_mask_reduction_candidate(in)))
             return 126;
         return -1;
     };
@@ -3530,7 +3551,6 @@ bool emit_cfg_state_machine(
                     in.opcode == kSop1OpcodeCmovB32 ||
                     in.opcode == kSop1OpcodeCmovB64 ||
                     in.opcode == kSop1OpcodeBrevB32 ||
-                    in.opcode == kSop1OpcodeBcnt1I32B64 ||
                     in.opcode == kSop1OpcodeFf1I32B64 ||
                     in.opcode == kSop1OpcodeFlbitI32B32 ||
                     in.opcode == kSop1OpcodeFlbitI32B64 ||
@@ -3545,6 +3565,8 @@ bool emit_cfg_state_machine(
                 if (in.opcode == kSop1OpcodeNotB32 ||
                     in.opcode == kSop1OpcodeAbsI32)
                     scalar_scc = scalar_alu_result && !wave64_vcc_b32_mask_not;
+                else if (in.opcode == kSop1OpcodeBcnt1I32B64)
+                    scalar_scc = scalar_sources || exact_mask_reduction;
                 else if (saveexec)
                     scalar_scc = b.is_fragment && initial.reads_scc &&
                         source_is_mask(in.src[0]);
@@ -4234,6 +4256,17 @@ bool emit_cfg_state_machine(
         ? b.function_var(b.t_u32, ptr_u32) : 0;
     const uint32_t mask_ffbh_dst_var = has_portable_mask_ffbh
         ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const bool has_portable_mask_reduction = !portable_mask_reduction_event_for_pc.empty();
+    const uint32_t mask_reduction_pending_var = has_portable_mask_reduction
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t mask_reduction_mask_var = has_portable_mask_reduction
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t mask_reduction_event_var = has_portable_mask_reduction
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t mask_reduction_count_var = has_portable_mask_reduction
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t mask_reduction_dst_var = has_portable_mask_reduction
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
     const bool has_portable_readlane = !portable_readlane_event_for_pc.empty();
     const uint32_t readlane_pending_var = has_portable_readlane
         ? b.function_var(b.t_bool, ptr_bool) : 0;
@@ -4366,6 +4399,10 @@ bool emit_cfg_state_machine(
         b.store_function(mask_ffbh_event_var, zero);
         b.store_function(mask_ffbh_half_var, zero);
         b.store_function(mask_ffbh_dst_var, zero);
+    }
+    if (has_portable_mask_reduction) {
+        b.store_function(mask_reduction_count_var, no);
+        b.store_function(mask_reduction_dst_var, zero);
     }
     if (has_portable_readlane) {
         b.store_function(readlane_source_var, zero);
@@ -4689,6 +4726,11 @@ bool emit_cfg_state_machine(
         b.store_function(mask_ffbh_write_var, no);
         b.store_function(mask_ffbh_event_var, zero);
     }
+    if (has_portable_mask_reduction) {
+        b.store_function(mask_reduction_pending_var, no);
+        b.store_function(mask_reduction_mask_var, no);
+        b.store_function(mask_reduction_event_var, zero);
+    }
     if (has_portable_readlane)
         b.store_function(readlane_pending_var, no);
     b.emit_loopmerge(loop_merge, loop_continue);
@@ -4749,6 +4791,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* dpp_row_ror8 = nullptr;
         const Rdna2Inst* dpp_add_row_mask = nullptr;
         const Rdna2Inst* mask_ffbh = nullptr;
+        const Rdna2Inst* mask_reduction = nullptr;
         const Rdna2Inst* readlane = nullptr;
         const Rdna2Inst* mask_compare = nullptr;
         const Rdna2Inst* exec_saved_mask_compare = nullptr;
@@ -4774,6 +4817,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_dpp_row_ror8 = nullptr;
             const Rdna2Inst* block_dpp_add_row_mask = nullptr;
             const Rdna2Inst* block_mask_ffbh = nullptr;
+            const Rdna2Inst* block_mask_reduction = nullptr;
             const Rdna2Inst* block_readlane = nullptr;
             const Rdna2Inst* block_mask_compare = nullptr;
             const Rdna2Inst* block_exec_saved_mask_compare = nullptr;
@@ -4850,6 +4894,11 @@ bool emit_cfg_state_machine(
                                      in.pc, in.dst.value, in.src[1].value,
                                      in.dpp_row_mask);
                     block_dpp_add_row_mask = &in;
+                    break;
+                }
+                if (portable_mask_reduction_candidate(in) &&
+                    proven_wave64_mask_reduction_pcs.contains(in.pc)) {
+                    block_mask_reduction = &in;
                     break;
                 }
                 if (portable_mask_ffbh_candidate(in) &&
@@ -5035,7 +5084,7 @@ bool emit_cfg_state_machine(
                     block_swizzle || block_bpermute ||
                     block_dpp_min_row_shr || block_dpp_add_row_shr ||
                     block_dpp_row_ror8 ||
-                    block_dpp_add_row_mask || block_mask_ffbh || block_readlane ||
+                    block_dpp_add_row_mask || block_mask_ffbh || block_mask_reduction || block_readlane ||
                     block_mask_compare ||
                     block_exec_saved_mask_compare || block_saved_mask_pair_compare ||
                     block_vopc_mask_compare ||
@@ -5057,12 +5106,42 @@ bool emit_cfg_state_machine(
             dpp_row_ror8 = block_dpp_row_ror8;
             dpp_add_row_mask = block_dpp_add_row_mask;
             mask_ffbh = block_mask_ffbh;
+            mask_reduction = block_mask_reduction;
             readlane = block_readlane;
             mask_compare = block_mask_compare;
             exec_saved_mask_compare = block_exec_saved_mask_compare;
             saved_mask_pair_compare = block_saved_mask_pair_compare;
             vopc_mask_compare = block_vopc_mask_compare;
             b64_mask_scc_vote = block_b64_mask_scc_vote;
+        }
+        if (mask_reduction) {
+            const int source = wave64_mask_reduction_source(*mask_reduction);
+            const auto saved = state.sreg_bool.find(source);
+            const uint32_t mask = source == 126 ? state.exec :
+                source == 106 ? state.vcc :
+                saved != state.sreg_bool.end() ? saved->second : 0;
+            if (!mask) return reject_cfg(mask_reduction->pc, "mask-reduction-source");
+            b.store_function(mask_reduction_pending_var, yes);
+            b.store_function(mask_reduction_mask_var, mask);
+            b.store_function(mask_reduction_event_var,
+                b.uconst(portable_mask_reduction_event_for_pc.at(mask_reduction->pc)));
+            b.store_function(mask_reduction_count_var,
+                mask_reduction->opcode == kSop1OpcodeBcnt1I32B64 ? yes : no);
+            b.store_function(mask_reduction_dst_var,
+                b.uconst(static_cast<uint32_t>(mask_reduction->dst.value)));
+            // The common phase supplies scalar DATA after save_state. End every overlapping
+            // mask lifetime now, just as the ordinary scalar lowering does.
+            const int dst = mask_reduction->dst.value;
+            state.sreg.erase(dst);
+            state.sreg_input.erase(dst);
+            state.sreg_srt.erase(dst);
+            for (int base : {dst, dst - 1}) {
+                state.sreg_bool.erase(base);
+                state.sreg_bool_narrowed.erase(base);
+                state.sreg_bool_b32.erase(base);
+                state.sreg_wave64_mask_half.erase(base);
+            }
+            if (dst == 106 || dst == 107) state.vcc = 0;
         }
         if (mask_ffbh) {
             const int source = mask_ffbh->src[0].value;
@@ -5618,7 +5697,10 @@ bool emit_cfg_state_machine(
             }
         }
         save_state(state, dispatch);
-        if (mask_ffbh) {
+        if (mask_reduction) {
+            if (!set_next(mask_reduction->pc + mask_reduction->len_dwords))
+                return reject_cfg(mask_reduction->pc, "mask-reduction-successor");
+        } else if (mask_ffbh) {
             if (!set_next(mask_ffbh->pc + mask_ffbh->len_dwords))
                 return reject_cfg(mask_ffbh->pc, "mask-ffbh-successor");
         } else if (readlane) {
@@ -6376,6 +6458,73 @@ bool emit_cfg_state_machine(
     const uint32_t mbcnt_lane = b.ibin(
         Op_BitwiseAnd, b.linear_localid, b.uconst(b.wave_size - 1));
 
+    if (has_portable_mask_reduction) {
+        // Scalar mask operations ignore EXEC for their destination write. All launched guest
+        // lanes publish the physical source bit, including EXEC-off lanes. The static event tag
+        // and the guest-wave slice prevent unrelated sites/waves from supplying mask bits.
+        // A padded ACTIVE prefix was excluded at admission: it cannot supply absent mask bits.
+        const uint32_t pending = b.load_function(b.t_bool, mask_reduction_pending_var);
+        const uint32_t mask = b.load_function(b.t_bool, mask_reduction_mask_var);
+        const uint32_t tag = b.load_function(b.t_u32, mask_reduction_event_var);
+        const uint32_t encoded = b.sel(pending,
+            b.ibin(Op_BitwiseOr, b.ibin(Op_ShiftLeftLogical, tag, b.uconst(1)),
+                   b.sel(mask, b.uconst(1), zero)), zero);
+        b.cfg_scratch_store(b.linear_localid, encoded);
+        b.barrier();
+        const uint32_t leader = b.id(), assembled = b.id();
+        const uint32_t is_leader = b.land(pending, b.ucmp(Op_IEqual, mbcnt_lane, zero));
+        b.emit_selmerge(assembled);
+        b.emit_condbranch(is_leader, leader, assembled);
+        b.emit_label(leader);
+        const uint32_t base = b.ibin(Op_ShiftLeftLogical, mbcnt_wave_index, b.uconst(6));
+        uint32_t count = zero, first = b.uconst(UINT32_MAX);
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            const uint32_t index = b.ibin(Op_IAdd, base, b.uconst(lane));
+            const uint32_t valid = b.ucmp(Op_ULessThan, index, b.uconst(b.local_count));
+            const uint32_t value = b.cfg_scratch_load(b.sel(valid, index, zero));
+            const uint32_t include = b.land(valid, b.land(
+                b.ucmp(Op_IEqual, b.ibin(Op_ShiftRightLogical, value, b.uconst(1)), tag),
+                b.ucmp(Op_INotEqual, b.ibin(Op_BitwiseAnd, value, b.uconst(1)), zero)));
+            count = b.ibin(Op_IAdd, count, b.sel(include, b.uconst(1), zero));
+            first = b.sel(b.land(include, b.ucmp(Op_IEqual, first, b.uconst(UINT32_MAX))),
+                          b.uconst(lane), first);
+        }
+        const uint32_t is_count = b.load_function(b.t_bool, mask_reduction_count_var);
+        b.cfg_scratch_store(b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index),
+                            b.sel(is_count, count, first));
+        b.emit_branch(assembled);
+        b.emit_label(assembled);
+        b.barrier();
+        const uint32_t result = b.cfg_scratch_load(
+            b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index));
+        const uint32_t dst = b.load_function(b.t_u32, mask_reduction_dst_var);
+        for (int reg : portable_mask_reduction_dsts) {
+            const auto destination = sv.find(reg);
+            if (destination == sv.end()) return reject_cfg(0, "missing-mask-reduction-dst");
+            const uint32_t selected = b.land(pending,
+                b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))));
+            b.store_function(destination->second, b.sel(selected, result,
+                b.load_function(b.t_u32, destination->second)));
+        }
+        const auto clear_overlapping_masks = [&](const auto& vars) {
+            for (const auto& [reg, var] : vars) {
+                const uint32_t overlaps = b.lor(
+                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))),
+                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg + 1))));
+                b.store_function(var, b.bsel(b.land(pending, overlaps), no,
+                    b.load_function(b.t_bool, var)));
+            }
+        };
+        clear_overlapping_masks(mv);
+        clear_overlapping_masks(mhv);
+        // RDNA2 ISA 70648 section 12.3: BCNT sets SCC=(count != 0); FF1 preserves SCC.
+        const uint32_t writes_scc = b.land(pending,
+            b.load_function(b.t_bool, mask_reduction_count_var));
+        b.store_function(scc_var, b.bsel(writes_scc,
+            b.ucmp(Op_INotEqual, result, zero), b.load_function(b.t_bool, scc_var)));
+        b.barrier();
+    }
+
     if (has_portable_mask_ffbh) {
     // Portable Wave64 saved-mask FFBH phase. Each publishing lane contributes its one predicate bit
     // with a static-event tag. Lane zero assembles the selected architectural 32-bit half in LDS,
@@ -6887,6 +7036,17 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     if (!inherited_dead_masks) local_dead_masks = dead_wave_mask_writes(ins);
     const std::unordered_set<uint32_t>& dead_masks = inherited_dead_masks
         ? *inherited_dead_masks : local_dead_masks;
+    const bool portable_compute_mask_reduction = b.is_compute &&
+        b.wave_size == 64 && !b.native_subgroup_size &&
+        b.local_count >= 64 && b.local_count % 64 == 0 &&
+        std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+            return in.fmt == Rdna2Format::SOP1 &&
+                (in.opcode == kSop1OpcodeBcnt1I32B64 ||
+                 in.opcode == kSop1OpcodeFf1I32B64) &&
+                (in.src[0].kind == OperandKind::SGPR ||
+                 (in.src[0].kind == OperandKind::Special &&
+                  (in.src[0].value == 106 || in.src[0].value == 126)));
+        });
 
     // A large generated compute kernel may put a workgroup-uniform scalar early-out around several
     // barrier-separated phases, then use arbitrary (but barrier-free) control flow in its final
@@ -6898,7 +7058,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     if (b.is_compute) {
         const BarrierPhasedCompute phased = analyze_barrier_phased_compute(ins);
         if (phased.found &&
-            (phased.guarded || initial_dispatch_active || force_barrier_phases)) {
+            (phased.guarded || initial_dispatch_active || force_barrier_phases ||
+             portable_compute_mask_reduction)) {
             // Every phase shares one immutable Workgroup OpTypeArray. Size it from the complete
             // phased stream before the first dispatcher: a later portable DPP operation needs a
             // second per-lane plane even when the earlier phase needed only votes/liveness.
@@ -7020,6 +7181,20 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         return emit_cfg_state_machine(
             b, rs, ins, safe, rt, allow_exec_update, allow_smem,
             exp_fn, code, dwords, initial_dispatch_active, true);
+    if (allow_cfg_dispatcher && portable_compute_mask_reduction &&
+        std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) { return in.is_end; })) {
+        // Do this before the counted-loop prefix can narrow EXEC: its scalar reductions need
+        // a common host barrier site, not an invocation-local structured loop body.
+        if (std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+                return in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a;
+            })) {
+            log_recompile_diagnostic(b.diagnostic, "compute-cfg-reject", "terminal",
+                "reason=portable-mask-reduction-dispatcher-unsafe guest-barrier=1");
+            return false;
+        }
+        return emit_cfg_state_machine(b, rs, ins, safe, rt, allow_exec_update, allow_smem,
+                                      exp_fn, code, dwords, initial_dispatch_active);
+    }
     std::unordered_set<uint32_t> effective_safe = safe;
     const CountedLoop L = detect_counted_loop(ins);
     size_t idx = 0;
