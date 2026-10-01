@@ -558,6 +558,9 @@ int main(int argc, char** argv) {
     const auto terminated = neutral::make_module(neutral::Shape::Termination, neutral::Predicate::AllTrue);
     dump(dir, "fragment_neutral_termination_true", terminated);
     dump(dir, "fragment_neutral_termination_true_effective", lower_fragment_votes(terminated).words);
+    const auto buffered_neutral = neutral::make_module(neutral::Shape::BufferPredicate);
+    dump(dir, "fragment_neutral_buffer_certified_effective",
+         lower_fragment_votes(buffered_neutral, true, true).words);
     // GTA V's exact literal-bearing V_ALIGNBYTE_B32 packet.  Strict validation guards the
     // masked-shift lowering: SPIR-V shift operands must stay in the defined 0..31 range.
     { const uint32_t c[] = {0xd54f0006u,0x0415fe80u,0x3024240cu,0xbf810000u};

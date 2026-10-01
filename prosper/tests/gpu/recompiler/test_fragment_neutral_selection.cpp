@@ -169,8 +169,16 @@ void module_controls(const char* directory) {
                                 f::Predicate::AllFalse, f::Predicate::AllTrue}) {
         const auto words = f::make_module(f::Shape::Masked, predicate);
         check(lower_fragment_votes(words).neutral_votes == 1,
-              "all-false/all-true/visible/helper predicate roles remain varying source facts");
+              "all-false/all-true/visible/helper predicates gain no source uniformity fact");
     }
+    const auto buffered = f::make_module(f::Shape::BufferPredicate), captured = buffered;
+    const auto certified = lower_fragment_votes(buffered, true, true);
+    const auto uncertified = lower_fragment_votes(buffered, false, true);
+    check(certified.uniform_votes == 1 && certified.neutral_votes == 0 &&
+          uncertified.uniform_votes == 0 && uncertified.neutral_votes == 1 &&
+          !certified.words.empty() && !uncertified.words.empty() &&
+          certified.words != uncertified.words && buffered == captured,
+          "one source admits distinct owned Copy(P)/Copy(TRUE) buffer-certificate variants");
 }
 } // namespace
 

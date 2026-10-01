@@ -8,6 +8,7 @@ enum class Shape {
     DeadLoad, DeadDivide, DeadDerivative, BodyStore, BodyEscape, SecondUnsafeVote,
     BitcastPoisonConjunction, MaskedBitcastPoison,
     UndefinedReconsume, NonEntry, Nested, Reentered, BuiltinReconsume, LocationReconsume,
+    BufferPredicate,
 };
 enum class Predicate { Helpers, Visible, AllFalse, AllTrue };
 
@@ -44,6 +45,10 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
     w.insert(w.end(), metadata.begin(), metadata.end());
     op(71, {22, 11, 15}); op(71, {23, 30, 0}); op(71, {24, 11, 23});
     if (shape == Shape::LocationReconsume) op(71, {123, 30, 1});
+    if (shape == Shape::BufferPredicate) {
+        op(71, {126, 6, 4}); op(71, {127, 2}); op(72, {127, 0, 35, 0});
+        op(71, {131, 34, 0}); op(71, {131, 33, 5});
+    }
     op(19, {1}); op(20, {2}); op(21, {3, 32, 0}); op(22, {4, 32});
     op(33, {5, 1}); op(23, {6, 4, 4}); op(32, {7, 1, 6}); op(32, {18, 3, 6});
     op(32, {19, 1, 2}); op(32, {26, 7, 2});
@@ -51,10 +56,14 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
     op(43, {4, 12, 0}); op(43, {4, 13, 0x3f800000u});
     op(41, {2, 14}); op(42, {2, 15}); op(43, {4, 16, 0x3e000000u});
     op(43, {4, 17, 0x3b808081u}); // 1/255, exact integer-state observation
+    if (shape == Shape::BufferPredicate) {
+        op(29, {126, 3}); op(30, {127, 126}); op(32, {128, 12, 127}); op(32, {129, 12, 3});
+    }
     if (shape == Shape::BitcastPoisonConjunction || shape == Shape::MaskedBitcastPoison)
         op(43, {4, 89, 0x7f800000u}); // +Inf, NOT finite bitcast authority
     op(59, {7, 22, 1}); op(59, {18, 23, 3}); op(59, {19, 24, 1});
     if (shape == Shape::LocationReconsume) op(59, {7, 123, 1});
+    if (shape == Shape::BufferPredicate) op(59, {128, 131, 12});
     if (shape == Shape::UndefinedConjunction) op(1, {2, 54});
     if (shape == Shape::UndefinedReconsume) op(1, {3, 117});
     op(54, {1, 40, 0, 5});
@@ -74,6 +83,9 @@ inline std::vector<uint32_t> make_module(Shape shape = Shape::Masked,
     op(61, {2, 53, 24});
     if (shape == Shape::PoisonConjunction) op(61, {2, 54, 25});
     uint32_t p = 53;
+    if (shape == Shape::BufferPredicate) {
+        op(65, {129, 132, 131, 8, 8}); op(61, {3, 133, 132}); op(171, {2, 55, 133, 8}); p = 55;
+    }
     if (shape == Shape::BuiltinReconsume) op(124, {3, 117, 51});
     if (shape == Shape::LocationReconsume) {
         op(61, {6, 124, 123}); op(81, {4, 125, 124, 0}); op(124, {3, 117, 125});
@@ -166,6 +178,7 @@ inline std::vector<Fixture> fixtures() {
         {"non_entry_selection", Shape::NonEntry, false}, {"nested_selection", Shape::Nested, false},
         {"reentered_selection", Shape::Reentered, false},
         {"builtin_reconsume", Shape::BuiltinReconsume, true},
-        {"location_reconsume", Shape::LocationReconsume, false}};
+        {"location_reconsume", Shape::LocationReconsume, false},
+        {"buffer_predicate_uncertified", Shape::BufferPredicate, true}};
 }
 } // namespace prosper::test::fragment_neutral
