@@ -5,6 +5,8 @@
 
 #include <vulkan/vulkan_core.h>
 
+#include "present_attempt.hpp"
+
 // Present policy for prosper-app (#1182). Real game boots normally share the renderer's Vulkan device;
 // the private-device fallback hands frames across as a lock-free CPU shared_ptr copy. Neither path
 // should let a BLOCKING swapchain acquire (`vkAcquireNextImageKHR(..., UINT64_MAX, ...)`) freeze event
@@ -30,25 +32,6 @@ constexpr bool request_gpu_present(const char* setting, bool test_pattern, bool 
 constexpr std::optional<uint64_t> rendered_frame_counter(bool gpu_present,
                                                          uint64_t cpu_frame_seq) {
     return gpu_present ? std::nullopt : std::optional<uint64_t>{cpu_frame_seq};
-}
-
-// Outcome of one present_frame attempt.
-enum class PresentAttempt {
-    presented,    // the rendered frame reached the swapchain
-    skipped,      // no swapchain image available within the bounded acquire (occluded/minimized) — retry
-    out_of_date,  // swapchain is stale/lost/unusable — recreate it before the next present
-    failed,       // device/synchronization recovery failed — stop instead of waiting forever
-};
-
-// A staged GPU readback is only a snapshot of a proposed frame until the swapchain accepts it.
-// Keep pending screenshots and authored/automatic snaps for a later attempt on every other result.
-// Own the callback invocation here so a test can prove a rejected attempt never consumes one.
-template <typename Capture>
-constexpr bool dispatch_presented_capture(PresentAttempt attempt, bool staged_pixels_ready,
-                                          Capture&& capture) {
-    if (attempt != PresentAttempt::presented || !staged_pixels_ready) return false;
-    capture();
-    return true;
 }
 
 // Every successful presentation path contributes to the same --frames budget.  Keep the count and
