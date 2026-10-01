@@ -19,7 +19,7 @@ see [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md), which is **generated from the 
 and kept in step with them by CI. Neither file is authoritative over a tracker; when this page and
 a tracker disagree, the tracker wins.
 
-Last updated: 2026-09-23
+Last updated: 2026-10-01
 
 ## Summary
 
@@ -81,14 +81,17 @@ Last updated: 2026-09-23
 | *Tomb Raider I-III Remastered* | `PPSA16901` | Custom (Saber) | 🚧 Rung 3 — a pad route clears the title's own 40-page EULA gate (Cross is inert until page 40), reaches the rendered title screen, and enters **Croft Manor**, which now renders with correct geometry — steps, walls, hedges, trees, Lara and Winston all correctly shaped and animating. **The world now renders correctly textured** — Croft Manor's assault course draws its brickwork, sandstone, mossy platforms, gravel and foliage, with Lara and Winston (screenshot: `assets/screenshots/tomb-raider-croft-manor-assault-course.webp`, a genuine render confirmed against the dump's own picture assets). The wrong-texture defect is fixed ([#2998](https://github.com/mattias800/prosper/issues/2998)): the decode cache validated one surface of a 256-layer array — 0.29% of the atlas — so a decode taken while it was nearly empty was reused all run; some text draws the wrong glyphs ([#2999](https://github.com/mattias800/prosper/issues/2999)). The shattered world was one defect: the title's 32-bit index buffers are never announced and were read as 16-bit. Route: `prosper/scripts/tomb-raider-PPSA16901/` | [#2990](https://github.com/mattias800/prosper/issues/2990) |
 | *Outer Wilds* | `PPSA08102` | Unity 2019.4 / IL2CPP | 🚧 Rung 3 — a fresh-save route accepts NEW EXPEDITION, clears the Wake Up prompt and reaches a recognizable wooded first-person scene with Look Around / Move prompts. The owner saw the in-game world and reported largely correct rendering, but an F9 frame has a large white blob. The title wordmark is absent against the supplied PS5 title oracle; gameplay has no matching PS5 oracle, and speed remains unverified against hardware. Route: `prosper/scripts/outer-wilds-PPSA08102/`. [Evidence and limits](prosper/docs/OUTER_WILDS_STATUS.md) | [#3804](https://github.com/mattias800/prosper/issues/3804) |
 | *Kena: Bridge of Spirits* | `PPSA01802` | Unreal Engine 4 | 🔬 Rung 2 — on Windows/NVIDIA a pad route reaches the main menu, the difficulty picker, the brightness calibration screen, the first level load, the full intro narration and the first gameplay prompt (*"Press … to Pulse"*, the button drawn as a pad glyph) — but **the world behind the prompt does not draw**: every sampled gameplay frame is black apart from the prompt. The leading suspect is the title's wave64 fragment shaders, which a 32-wide NVIDIA device skips ([#2147](https://github.com/mattias800/prosper/issues/2147)), but that is not established per draw, and a Linux trace of the menu scene ([#3813](https://github.com/mattias800/prosper/pull/3813)) is a reason to check composition first. The two crashes before this point are fixed on `main` ([#3814](https://github.com/mattias800/prosper/pull/3814), [#3817](https://github.com/mattias800/prosper/pull/3817)). Route: `prosper/scripts/kena/` | [#3787](https://github.com/mattias800/prosper/issues/3787) |
+| *Marvel's Wolverine* | `PPSA03671` | — | 🔬 Rung 0 — guest boots and submits compute work, but presents no frame; main and render threads remain in startup polling/wait loops | [#4019](https://github.com/mattias800/prosper/issues/4019) |
+| *007 First Light* | `PPSA11386` | — | 🔬 Rung 0 — main guest thread faults at a null address during startup, before the first frame | [#4021](https://github.com/mattias800/prosper/issues/4021) |
+| *Onimusha: Way of the Sword* | `PPSA27836` | — | 🔬 Rung 0 — direct-memory batch mapping fails, then the main guest thread faults at address `0x10`; no frame is presented | [#4022](https://github.com/mattias800/prosper/issues/4022) |
+| *Hades II* | `PPSA36082` | — | 🔬 Rung 0 — startup requests an approximately 32 GiB guest allocation, which is rejected; the main guest thread then faults at a null address, before any frame | [#4023](https://github.com/mattias800/prosper/issues/4023) |
+| *SILENT HILL 2* | `PPSA08709` | Unreal Engine | 🚧 Rung 2 — warning and menus render; the owner manually selected New Game. The next sequence is unclassified, recognizable gameplay is unverified, and a GPU timeout ends the run ([#4025](https://github.com/mattias800/prosper/issues/4025)) | [#4024](https://github.com/mattias800/prosper/issues/4024) |
 
 ## At a glance
 
 Derived from the table above by reading each row's **milestone text** against the six-rung bring-up
-ladder in `CLAUDE.md`. It is *not* derived from the ✅/🚧/🔬 markers, which are not a rung scale:
-fifteen of the twenty-eight titles that reach gameplay are marked 🚧 rather than ✅, and the fifteen 🔬
-rows sit at three different rungs — four at rung 2, three at rung 1 and eight at rung 0 — with none
-unrun. Counting markers gives a different — and wrong — answer.
+ladder in `CLAUDE.md`. The ✅/🚧/🔬 markers are not a rung scale: each marker can cover different
+milestones, so counting markers cannot determine how many titles reach gameplay.
 
 **"Not yet booted" is a real category, not a rung.** A title can be tracked and never measured, and
 that is different from having been measured and found wanting. It is counted separately so an
@@ -97,11 +100,11 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | Where the title stops | Titles |
 | --- | --- |
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 28 |
-| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 18 |
+| **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 19 |
 | **Below a title screen** — logo or splash only (rung 1) | 2 |
-| **Boots, but no frame with content** (rung 0) | 8 |
+| **Boots, but no frame with content** (rung 0) | 12 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
-| Total tracked | 56 |
+| Total tracked | 61 |
 
 Every figure above is re-derived from the rows each time this table is touched, and the buckets now
 sum to the total. They did not before: **rung 0 had no row at all**, so the titles that boot and
@@ -795,6 +798,32 @@ and every menu after it render over black — the animated background never draw
 first gameplay prompt appears over an **absent world**, so this is rung 2. See
 [`prosper/docs/KENA_STATUS.md`](prosper/docs/KENA_STATUS.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/3787).
+
+## October 1 first-launch checks
+
+Linux windowed `prosper-app` at `df5d07a417a2`, with SDL3 audio/input enabled, fresh per-title
+save/config roots, default rendering, and `SDL_VIDEODRIVER=x11` for the waiting-window workaround
+([#4018](https://github.com/mattias800/prosper/issues/4018)). Titles ran one at a time. Wolverine,
+007 First Light, Onimusha and Hades II all stopped before presenting a game frame; their trackers
+retain the distinct startup failures and reproduction commands. The owner confirmed that a
+control run of The Messenger worked well with the same binary and its documented
+`-force-gfx-direct` guest argument.
+
+### SILENT HILL 2 — `PPSA08709`
+
+<p align="center"><img src="assets/screenshots/silent-hill-2-first-boot-black.webp" alt="Silent Hill 2 — the early black frame-120 capture, before the warning appeared"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-warning.webp" alt="Silent Hill 2 — the content-warning screen in the Linux prosper-app window with its own FPS/alarm overlay"></p>
+
+Direct, unmodified captures from the live `prosper-app` frontend: the early native frame was black,
+but a later 1280×720 client-window capture shows the expected warning UI, from a 3840×2160 scanout.
+The owner then manually navigated to **New Game**. That later menu milestone is a human observation;
+the screenshot shows the warning rather than the title menu. The next sequence could not be
+classified as an intro movie or loading screen, and no recognizable gameplay is established.
+Rendering was visibly slow, and the run ended with a kernel GPU timeout and device loss.
+Performance counters and the scope of the image-asset check are in the
+[tracker](https://github.com/mattias800/prosper/issues/4024); the hang is tracked separately in
+[#4025](https://github.com/mattias800/prosper/issues/4025). No deterministic input route, hardware
+oracle or snapshot guard is claimed.
 
 ## Reproducible routes
 
