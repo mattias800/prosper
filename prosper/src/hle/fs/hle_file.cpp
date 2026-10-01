@@ -1308,7 +1308,7 @@ HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
                int r = -1;
                if (!windows_close_directory(fd, &r)) r = ::close(fd);
 #else
-               int r = ::close(fd);
+               int r = guest_sync_close_fd(fd);
 #endif
                int err = r < 0 ? errno : 0;
                filelog_fd_io("close", fd, 0, 0, r, err);
@@ -1323,7 +1323,7 @@ HLE(k_close) { uint64_t result = f_close(a0, a1, a2, a3, a4, a5);
 // against elsewhere. Back with host dup/dup2; dup keeps the result above fd 2 (same as f_open).
 #ifndef _WIN32
 HLE(f_dup)  { int fd = ::dup((int)a0); while (fd >= 0 && fd < 3) { int n = fcntl(fd, F_DUPFD, 3); ::close(fd); fd = n; } return (uint64_t)(int64_t)fd; }
-HLE(f_dup2) { return (uint64_t)(int64_t)::dup2((int)a0, (int)a1); }
+HLE(f_dup2) { return (uint64_t)(int64_t)guest_sync_dup2((int)a0, (int)a1); }
 #else
 HLE(f_dup)  { return (uint64_t)(int64_t)windows_duplicate_above_stdio((int)a0); }
 HLE(f_dup2) {
@@ -2135,7 +2135,7 @@ int getdents_close_fd(int fd) {
     if (it != g_getdents_dirs.end()) { if (it->second) closedir(it->second); g_getdents_dirs.erase(it); }
     // Keep the guest-fd close under the same guard. Otherwise getdents can repopulate this key
     // after erase but before close, leaving the replacement DIR* stale when the fd is reused.
-    return ::close(fd);
+    return guest_sync_close_fd(fd);
 }
 #endif
 HLE(k_getdents) {

@@ -18,6 +18,7 @@
 namespace prosper {
 namespace {
 struct Anchor {
+    std::mutex mutex; // Pins the kernel descriptor identity across writeback and relocation.
     int fd;
     explicit Anchor(int value) : fd(value) {}
     ~Anchor() { ::close(fd); }
@@ -33,30 +34,39 @@ void report(const char* operation, int error) {
     // without inventing an SCE error or escalating to whole-host sync.
     std::fprintf(stderr, "[file-sync] %s failed (host error %d)\n", operation, error);
 }
+// Caller holds the registry mutex. Anchor fd changes also require this mutex.
+std::shared_ptr<Anchor> private_anchor(SyncState& s, int fd) {
+    for (const auto& [device, anchor] : s.filesystems)
+        if (anchor->fd == fd) return anchor;
+    return {};
+}
+void note_fd_locked(SyncState& s, int fd) {
+    struct stat st{};
+    if (::fstat(fd, &st) != 0) report("filesystem identification", errno);
+    else if ((S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)) && !s.filesystems.count(st.st_dev)) {
+        const int retained = ::fcntl(fd, F_DUPFD_CLOEXEC, 3);
+        if (retained < 0) report("filesystem retention", errno);
+        else s.filesystems.emplace(st.st_dev, std::make_shared<Anchor>(retained));
+    }
+}
 } // namespace
 
 void guest_sync_note_fd(int fd) {
     if (fd < 0) return;
     const int saved_errno = errno;
-    struct stat st{};
-    if (::fstat(fd, &st) != 0) report("filesystem identification", errno);
-    else if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)) {
-        auto& s = state();
-        std::lock_guard lock(s.mutex);
-        if (!s.filesystems.count(st.st_dev)) {
-            const int retained = ::fcntl(fd, F_DUPFD_CLOEXEC, 3);
-            if (retained < 0) report("filesystem retention", errno);
-            else s.filesystems.emplace(st.st_dev, std::make_shared<Anchor>(retained));
-        }
-    }
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
+    note_fd_locked(s, fd);
     errno = saved_errno;
 }
 
 void guest_sync_note_root(const std::string& root) {
     if (root.empty()) return;
     const int saved_errno = errno;
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
     const int fd = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK);
-    if (fd >= 0) { guest_sync_note_fd(fd); ::close(fd); }
+    if (fd >= 0) { note_fd_locked(s, fd); ::close(fd); }
     else report("root retention", errno);
     errno = saved_errno;
 }
@@ -69,10 +79,12 @@ void guest_sync_note_path(const std::string& path) {
     const int saved_errno = errno;
     auto parent = std::filesystem::path(path).parent_path();
     guest_sync_note_root(parent.empty() ? "." : parent.string());
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
     struct stat st{};
     if (::stat(path.c_str(), &st) == 0 && (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-        if (fd >= 0) { guest_sync_note_fd(fd); ::close(fd); }
+        if (fd >= 0) { note_fd_locked(s, fd); ::close(fd); }
         else report("path retention", errno);
     }
     errno = saved_errno;
@@ -96,6 +108,42 @@ int guest_sync_close_stream(FILE* stream) {
     return ::fclose(stream);
 }
 
+int guest_sync_close_fd(int fd) {
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
+    if (private_anchor(s, fd)) { errno = EBADF; return -1; }
+    return ::close(fd);
+}
+
+int guest_sync_dup2(int source, int destination) {
+    auto& s = state();
+    for (;;) {
+        std::shared_ptr<Anchor> collision;
+        {
+            std::lock_guard lock(s.mutex);
+            if (private_anchor(s, source)) { errno = EBADF; return -1; }
+            collision = private_anchor(s, destination);
+            if (!collision) return ::dup2(source, destination);
+        }
+        // Wait outside the stream registry mutex: fclose must still complete during syncfs.
+        // All operations needing both locks acquire the anchor lock first.
+        std::lock_guard anchor_lock(collision->mutex);
+        std::lock_guard registry_lock(s.mutex);
+        if (collision->fd != destination) continue;
+        if (private_anchor(s, source)) { errno = EBADF; return -1; }
+        const int retained = ::fcntl(destination, F_DUPFD_CLOEXEC, 3);
+        if (retained < 0) return -1; // Preserve the original anchor if relocation cannot succeed.
+        const int result = ::dup2(source, destination);
+        if (result >= 0) collision->fd = retained;
+        else {
+            const int error = errno;
+            ::close(retained); // A failed dup2 leaves the original destination open.
+            errno = error;
+        }
+        return result;
+    }
+}
+
 void guest_sync() {
     const int saved_errno = errno;
     std::vector<std::shared_ptr<Anchor>> anchors;
@@ -109,6 +157,7 @@ void guest_sync() {
     // Private anchors stay live across concurrent guest close/dup2, mount changes and other
     // barriers. Do not hold the stream registry lock during filesystem writeback.
     for (const auto& anchor : anchors) {
+        std::lock_guard lock(anchor->mutex);
         int error;
         do {
 #ifdef __APPLE__

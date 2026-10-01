@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <fcntl.h>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <set>
 #include <sys/stat.h>
@@ -23,7 +24,9 @@ std::atomic<int> host_sync_calls{0};
 std::mutex observer_mutex;
 std::condition_variable observer_cv;
 std::set<dev_t> observed_devices;
+std::map<dev_t, int> observed_fds;
 bool block_barrier = false, entered_barrier = false, release_barrier = false;
+int held_fd = -1;
 bool invalid_anchor = false;
 int barrier_calls = 0;
 int injected_error = 0, interrupted_calls = 0;
@@ -33,14 +36,17 @@ int observe_barrier(int fd) {
     ++barrier_calls;
     struct stat st{};
     if (::fstat(fd, &st) != 0) invalid_anchor = true;
-    else observed_devices.insert(st.st_dev);
+    else { observed_devices.insert(st.st_dev); observed_fds[st.st_dev] = fd; }
+    const auto original = st;
     if (block_barrier) {
+        held_fd = fd;
         entered_barrier = true;
         observer_cv.notify_all();
         // A failed implementation must fail a bounded test, never strand the laptop.
         if (!observer_cv.wait_for(lock, std::chrono::seconds(5), [] { return release_barrier; }))
             invalid_anchor = true;
-        if (::fstat(fd, &st) != 0) invalid_anchor = true;
+        if (::fstat(fd, &st) != 0 || st.st_dev != original.st_dev || st.st_ino != original.st_ino)
+            invalid_anchor = true;
     }
     if (interrupted_calls > 0) { --interrupted_calls; errno = EINTR; return -1; }
     if (injected_error) { errno = injected_error; return -1; }
@@ -154,6 +160,36 @@ int main() {
     barrier_calls = 0;
     CHECK(call("sceKernelSync") == 0 && barrier_calls == 2 && observed_devices == std::set<dev_t>({device(app), other_device}),
           "closed files and retired mounts on both filesystems remain covered");
+
+    const dev_t app_device = device(app);
+    const int replacement = (int)call("sceKernelOpen", ptr("/app0/replacement"), 0x601, 0600);
+    CHECK(replacement >= 3, "open a real guest dup2 source on the second filesystem");
+    if (replacement < 3) return 1;
+    if (observed_fds.count(app_device)) {
+        const int anchor_fd = observed_fds.at(app_device);
+        CHECK(call("sceKernelClose", anchor_fd) == 0x80020009ull,
+              "a private anchor slot is not a closeable guest descriptor");
+        CHECK(call("sceKernelDup2", replacement, anchor_fd) == (uint64_t)anchor_fd,
+              "guest dup2 may select an actual anchor slot as its destination");
+        struct stat replaced{};
+        CHECK(::fstat(anchor_fd, &replaced) == 0 && replaced.st_dev == other_device,
+              "dup2 returns the requested guest descriptor on the source filesystem");
+        observed_devices.clear(); observed_fds.clear(); barrier_calls = 0;
+        call("sceKernelSync");
+        CHECK(barrier_calls == 2 && observed_devices == std::set<dev_t>({app_device, other_device}) &&
+              observed_fds.count(app_device) && observed_fds.at(app_device) != anchor_fd,
+              "relocating the real anchor retains both filesystem durability obligations");
+        CHECK(call("sceKernelClose", anchor_fd) == 0, "close the guest replacement in the former anchor slot");
+        const int reused_anchor = ::open((root / "anchor-reused").c_str(), O_CREAT | O_RDWR, 0600);
+        CHECK(reused_anchor >= 0 && ::dup2(reused_anchor, anchor_fd) == anchor_fd,
+              "reuse the closed former anchor slot with a host file");
+        if (reused_anchor >= 0 && reused_anchor != anchor_fd) ::close(reused_anchor);
+        if (reused_anchor >= 0) ::close(anchor_fd);
+        observed_devices.clear();
+        call("sceKernelSync");
+        CHECK(observed_devices == std::set<dev_t>({app_device, other_device}),
+              "closing and reusing the former anchor slot does not lose either filesystem");
+    } else CHECK(false, "the syscall observer captured the first filesystem's actual anchor");
 #endif
 
     // Hold the intercepted barrier after its anchor snapshot, and close/reuse guest resources.
@@ -168,6 +204,25 @@ int main() {
         entered = observer_cv.wait_for(lock, std::chrono::seconds(2), [] { return entered_barrier; });
     }
     CHECK(entered, "barrier reached the controlled syscall interception point");
+#ifdef __linux__
+    std::atomic<bool> replacing_started{false}, replacing_finished{false};
+    uint64_t replacing_result = (uint64_t)-1;
+    const int collision_fd = held_fd;
+    std::thread replacing([&] {
+        replacing_started = true;
+        observer_cv.notify_all();
+        replacing_result = call("sceKernelDup2", replacement, collision_fd);
+        replacing_finished = true;
+        observer_cv.notify_all();
+    });
+    {
+        std::unique_lock lock(observer_mutex);
+        CHECK(observer_cv.wait_for(lock, std::chrono::seconds(2), [&] { return replacing_started.load(); }),
+              "start guest dup2 against the anchor held inside the intercepted syscall");
+        CHECK(!observer_cv.wait_for(lock, std::chrono::milliseconds(100), [&] { return replacing_finished.load(); }),
+              "dup2 waits for the active barrier before replacing its descriptor identity");
+    }
+#endif
     CHECK(call("fclose", ptr(stream)) == 0, "concurrent fclose completes while filesystem sync is held");
     const int reused = ::open((root / "reused").c_str(), O_CREAT | O_RDWR, 0600);
     CHECK(reused >= 0 && ::dup2(reused, fd) == fd, "reuse the old guest descriptor number");
@@ -179,8 +234,20 @@ int main() {
         observer_cv.notify_all();
     }
     syncing.join();
+#ifdef __linux__
+    replacing.join();
+    CHECK(replacing_result == (uint64_t)collision_fd, "in-flight anchor relocation preserves the guest dup2 result");
+    if ((int64_t)replacing_result >= 0) call("sceKernelClose", collision_fd);
+    call("sceKernelClose", replacement);
+#endif
     block_barrier = false;
     CHECK(!invalid_anchor, "retained barrier descriptors survive concurrent close and descriptor reuse");
+#ifdef __linux__
+    observed_devices.clear();
+    call("sceKernelSync");
+    CHECK(observed_devices == std::set<dev_t>({device(app), other_device}),
+          "both filesystem obligations survive replacement during an in-flight barrier");
+#endif
     interrupted_calls = 1;
     const int before_interrupt = barrier_calls;
     CHECK(call("sceKernelSync") == 0 && interrupted_calls == 0 &&

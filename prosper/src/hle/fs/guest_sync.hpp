@@ -14,6 +14,10 @@ void guest_sync_note_root(const std::string& root);
 void guest_sync_note_path(const std::string& path);
 void guest_sync_note_stream(FILE* stream, bool writable);
 int guest_sync_close_stream(FILE* stream);
+// Private retention descriptors are not guest handles. Reject closes of those slots and
+// relocate an anchor before dup2 replaces its slot, preserving the guest's requested number.
+int guest_sync_close_fd(int fd);
+int guest_sync_dup2(int source, int destination);
 void guest_sync();
 
 } // namespace prosper
