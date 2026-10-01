@@ -16,7 +16,7 @@ this document is the map that helps the next orchestrator find and interpret tha
 
 ## Current checkpoint
 
-- Integration base: `0cef9e45d94bfc803625e9154534cc8e74e6b7c7` on `main`.
+- Integration base: `361336513e6a6aaab68140c26aa6b14ac4b2e03e` on `main`.
 - Current wave: *Wolverine*, *007 First Light*, *Onimusha: Way of the Sword*, *Hades II*, and
   *Silent Hill 2*. The user's acceptance target is: **"all games are at title screen with correct
   visual rendering."** Each title retains a dedicated investigation owner; bounded work rotates
@@ -36,18 +36,22 @@ this document is the map that helps the next orchestrator find and interpret tha
   and macOS scanner/timing failures [#4043](https://github.com/mattias800/prosper/issues/4043);
   it was not a fully green matrix.
 
-| Title / owner | Tracker | Prepared shared fix | Observed next frontier |
+| Title / owner | Tracker | Merged shared fix | Observed next frontier |
 | --- | --- | --- | --- |
 | Wolverine / Wolverine lane | [#4019](https://github.com/mattias800/prosper/issues/4019) | [#4047](https://github.com/mattias800/prosper/pull/4047): PollSema EBUSY, fixing #1640 | Guest leaves the empty-semaphore drain and publishes scanouts; frontend setup has no `window up` evidence. Obtain a deep host-main stack and a host window query while alive, then investigate shader refusals in #4036. |
 | 007 First Light / 007 lane | [#4021](https://github.com/mattias800/prosper/issues/4021) | [#4035](https://github.com/mattias800/prosper/pull/4035): local PlayGo manifest inventory, fixing #4030 | PlayGo assertion clears, then APR worker writes through a null sentinel. #4044 needs watchpoint attribution; #4042 separately records GetId's ignored u32 output. |
-| Onimusha: Way of the Sword / Onimusha lane | [#4022](https://github.com/mattias800/prosper/issues/4022) | [#4046](https://github.com/mattias800/prosper/pull/4046): bounded automatic-map placement, fixing #4032 | Normal preferred-base launch still pending. A host-cursor diagnostic clears the fixed-arena collision and reaches the separate zero-handle join fault #4033; that diagnostic is not default-route acceptance. |
-| Hades II / Hades lane | [#4023](https://github.com/mattias800/prosper/issues/4023) | [#4034](https://github.com/mattias800/prosper/pull/4034): available CPU mask, fixing #4027 | Worker allocation clears, then descriptor owner remains null (#4031). Probe both constructor paths and allocator return before choosing a fix. |
+| Onimusha: Way of the Sword / Onimusha lane | [#4022](https://github.com/mattias800/prosper/issues/4022) | [#4046](https://github.com/mattias800/prosper/pull/4046): bounded automatic-map placement, fixing #4032 | The normal preferred-base launch clears the fixed-arena collision and faults on a zero handle forwarded to host `pthread_join` (#4033). The exact app call site is verified; no visible frame or title was reached. |
+| Hades II / Hades lane | [#4023](https://github.com/mattias800/prosper/issues/4023) | [#4034](https://github.com/mattias800/prosper/pull/4034): available CPU mask, fixing #4027 | Worker allocation clears. A valid constructor probe finds a zero source descriptor from zero width/height, followed by a zero-sized allocation and null owner (#4031). Trace the upstream dimensions before choosing a fix. |
 | Silent Hill 2 / Silent Hill lane | [#4024](https://github.com/mattias800/prosper/issues/4024) | No game patch yet | The normal fresh-save rerun renders setup through settings-saved Continue, then retains that image while host presents advance. Title correctness remains unverified. Obtain a timer-triggered pass/resource capture before attributing a missing scene to one shader. |
 
-All four prepared game patches were rebased without changing their hunks onto the integration base.
-Their previous author checks and live observations belong to the recorded pre-rebase binaries;
-current-head author verification and CI remain required before integration. The orchestrator's
-registered reviews name the rebased heads. No prepared patch establishes correct title rendering.
+All four shared fixes are merged after exact-head author verification, independent registered
+review and green non-Windows/macOS CI. The maintainer explicitly excludes Windows and macOS
+from this wave's merge gate; their failures remain recorded rather than described as passing.
+Current-head focused checks passed: Hades four, PlayGo one, placement five and semaphore four.
+The placement runner's final summary parser failed after all five tests passed; its recovered
+evidence preserves the original command logs and does not repeat those tests. Runtime observations
+below belong to each recorded source-pinned binary, not a newly built combined-main app.
+None of these fixes establishes correct title rendering.
 
 The subsequent [Silent Hill rerun](https://github.com/mattias800/prosper/issues/4024#issuecomment-5939095958)
 used the retained `c8c24d44` app for 300.7 seconds, accepted seven ordinary Cross presses, and
@@ -76,10 +80,25 @@ Release a slot only after checking and draining the exact owned app/compiler/lau
 Freeze shared-main merges for an agreed pinned measurement interval, with explicit launch and
 drain handoffs so preparation does not indefinitely starve another lane.
 
-The next live order is Hades' descriptor/allocator observation, 007's sentinel-writer watch,
-Onimusha's normal placement validation, and Wolverine's frontend/shader capture, after the
-performance lane's agreed reservation. Silent Hill then needs a working timer-triggered capture
-of the retained-output frontier. Runs use the normal app,
+The corrected Hades probe completed with nine constructor/allocation observations and eight
+layout returns. Earlier nonzero allocations succeeded; the failing path requests size and
+alignment zero after copying a zero descriptor. Its upstream dimension producer remains
+unproven. The first corrected hardware-probe setup supersedes the earlier unarmed GDB attempt,
+which remains invalid evidence.
+
+007's first sentinel-watch run stopped before a target hit with `SIGXFSZ`. Its process-wide
+32 MiB file limit also constrains emulator memory files; the log was only 3,702 bytes. The
+exact syscall was not captured. This is an invalid instrument, not a guest crash or evidence
+against the proposed writer. Prepare a bounded log sink without limiting guest memory backing
+before retrying. Onimusha's normal
+preferred-base run completed the fixed batch map and then confirmed the separate null-handle
+join fault. Both app identities were reaped; neither run produced a visual milestone.
+
+The next work is Hades' upstream dimension producer, 007's corrected sentinel-writer watch,
+Onimusha's generic null-join error contract, and Wolverine's frontend/shader capture, after the
+performance lane's agreed reservation. Silent Hill needs a working timer-triggered capture
+of the retained-output frontier on a fresh app carrying the realized-wave-width metadata. Runs
+use the normal app,
 full rendering cadence and native resolution, fresh save/config roots, audio and input. On this host
 X11 is the recorded window-visibility workaround (#4018). Run window tools on the host and apply
 instrument trap 37 before interpreting injected function keys; a timer capture avoids that path.
