@@ -1963,9 +1963,17 @@ HLE(k_attr_getstacksize) {
 // Stopwatch/+0x40 isn't created yet when the main thread times it — see docs/CUTSCENE_PROGRESSION.md).
 // CONFIDENCE: MED — the mask→worker-count coupling is the standard Unity behavior; gated so default
 // boot (0xff) is unchanged.
-HLE(k_attr_getaffinity) {
+static uint64_t available_guest_cpumask() {
     static const bool one = getenv("PROSPER_ONE_CPU") != nullptr;
-    if (a1) *(uint64_t*)(uintptr_t)a1 = one ? 0x01 : 0xff;
+    return one ? 0x01 : 0xff;
+}
+// sceKernelGetAvailableCpumask returns the mask itself, not an error code. Hades II consumes
+// La9uyZv4Kvw with popcnt to size its worker pool and also passes it to AttrSetaffinity (#4027).
+// A zero-return stub underflows its worker count and requests two approximately 32 GiB arrays.
+// CONFIDENCE: HIGH for the return ABI; the available cores follow the existing guest CPU policy.
+HLE(k_get_available_cpumask) { return available_guest_cpumask(); }
+HLE(k_attr_getaffinity) {
+    if (a1) *(uint64_t*)(uintptr_t)a1 = available_guest_cpumask();
     return 0;
 }
 // Scheduling Get* handlers. The Set* side is a legitimate no-op (we don't re-prioritize host
@@ -5369,6 +5377,7 @@ void register_kernel_hle() {
     R("scePthreadAttrGetstackaddr", k_attr_getstackaddr);
     R("scePthreadAttrGetstacksize", k_attr_getstacksize);
     R("scePthreadAttrGetaffinity", k_attr_getaffinity);  // report 8 cores (not an empty mask)
+    R("sceKernelGetAvailableCpumask", k_get_available_cpumask);
     R("scePthreadAttrSetaffinity", k_attr_noop);         // accept affinity requests (we don't pin)
     R("scePthreadGetaffinity", k_attr_getaffinity);      R("scePthreadSetaffinity", k_attr_noop);
     R("scePthreadGetschedparam", k_getschedparam);  R("pthread_getschedparam", k_getschedparam);

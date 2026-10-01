@@ -156,6 +156,7 @@ const std::vector<std::string>& builtin_symbol_names() {
         // libkernel process / module / misc
         "sceKernelGetProcParam","sceKernelLoadStartModule","sceKernelDlsym","sceKernelGetModuleInfo",
         "sceKernelError","sceKernelGetCpumode","sceKernelIsNeoMode","sceKernelUsleep","sceKernelSleep",
+        "sceKernelGetAvailableCpumask",
         "sceKernelNanosleep","sceKernelGettimeofday","sceKernelClockGettime","sceKernelGetProcessTime",
         "sceKernelGetTscFrequency","sceKernelReadTsc","sceKernelGetSystemSwVersion",
         // libkernel threads / sync primitives
