@@ -159,6 +159,7 @@ endif()
 
 # --- tests (agentic-first: self-checking, exit-code = truth) -------------
 enable_testing()
+include(cmake/ProsperGTest.cmake)
 
 # Pure selection/accounting policy behind the stable compute-timing hash filter. This must remain
 # runnable without prosper_core, a game dump, or Vulkan so a broken diagnostic cannot hide behind a
@@ -173,9 +174,9 @@ add_test(NAME compute_timing_selector_policy COMMAND test_compute_timing_selecto
 
 # execute_item()'s five CPU phases on a dispatch that breaks early (#3461): no negative interval,
 # no whole-item cleanup, and the parts still sum to the item.
-add_executable(test_compute_phase_attribution tests/shared/compute/test_compute_phase_attribution.cpp)
-target_include_directories(test_compute_phase_attribution PRIVATE frontends)
-add_test(NAME compute_phase_attribution COMMAND test_compute_phase_attribution)
+prosper_add_gtest(test_compute_phase_attribution
+  SOURCES tests/shared/compute/test_compute_phase_attribution.cpp
+  INCLUDES frontends)
 
 # Pure fail-closed policy for a behavior-neutral census of hypothetical deferred compute results.
 # It has no Vulkan dependency and does not change the live backend's synchronous writeback.
@@ -193,21 +194,21 @@ add_test(NAME compute_authority_census_policy COMMAND test_compute_authority_cen
 # project that does not build prosper, so this code is not under TSan.
 # compute_buffer_bytes.hpp counts parallel-worker spawn volume, so it reaches into
 # src/diagnostics; any target including it needs `src` and that translation unit.
-add_executable(test_compute_buffer_diff_span tests/shared/compute/test_compute_buffer_diff_span.cpp
-               src/diagnostics/worker_spawn_census.cpp
-               src/diagnostics/exit_census.cpp
-               src/diagnostics/transfer_pressure.cpp
-               src/diagnostics/exit_reports.cpp)
-target_include_directories(test_compute_buffer_diff_span PRIVATE frontends src)
 find_package(Threads REQUIRED)
-target_link_libraries(test_compute_buffer_diff_span PRIVATE Threads::Threads)
+prosper_add_gtest(test_compute_buffer_diff_span
+  SOURCES tests/shared/compute/test_compute_buffer_diff_span.cpp
+          src/diagnostics/worker_spawn_census.cpp
+          src/diagnostics/exit_census.cpp
+          src/diagnostics/transfer_pressure.cpp
+          src/diagnostics/exit_reports.cpp
+  INCLUDES frontends src
+  LIBRARIES Threads::Threads)
 
 # Standard-library-only host lifetime guard: no core/GPU/game and no scratch/export opt-out.
 add_executable(test_native_tls_lifetime tests/host/platform/test_native_tls_lifetime.cpp)
 target_link_libraries(test_native_tls_lifetime PRIVATE Threads::Threads)
 add_test(NAME native_tls_lifetime COMMAND test_native_tls_lifetime)
 set_tests_properties(native_tls_lifetime PROPERTIES TIMEOUT 30)
-add_test(NAME compute_buffer_diff_span COMMAND test_compute_buffer_diff_span)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
@@ -482,6 +483,10 @@ if(Python3_Interpreter_FOUND)
   # checkout root and this test must run from any build directory -- CI runs the scan itself, in
   # the Docs job. Its own failure mode is silence: a matcher that stops matching reports a clean
   # tree forever, which is why the selftest carries the prose lines an earlier revision got wrong.
+  # New tests must use GoogleTest (prosper_add_gtest); hand-rolled main() files are allowlisted legacy.
+  add_test(NAME gtest_policy
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_gtest_policy.py"
+                   --selftest --root "${CMAKE_SOURCE_DIR}")
   add_test(NAME ctest_gate_checker
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_ctest_gate.py"
                    --selftest)
@@ -1005,10 +1010,8 @@ if(TARGET prosper_core)
 
   # AMD SSE4a INSERTQ/EXTRQ emulation (the SIGILL handler emulates these Zen2-only ops on Intel
   # hosts). Golden bit-math vectors — header-only, no game dump required.
-  add_executable(test_sse4a tests/host/x86/test_sse4a.cpp)
   # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
-  target_include_directories(test_sse4a PRIVATE src)
-  add_test(NAME sse4a_insertq_extrq COMMAND test_sse4a)
+  prosper_add_gtest(test_sse4a SOURCES tests/host/x86/test_sse4a.cpp INCLUDES src)
 
   # macOS/Rosetta %fs trap-emulation decode core (guest-TLS access redirection). Golden
   # instruction vectors incl. the #727 no-REX AH/CH/DH/BH byte-register rules — header-only,
@@ -1532,10 +1535,9 @@ if(TARGET prosper_core)
   # > 0xffff pointer (GTA V's 0x302200) must report unreadable, not SIGSEGV. POSIX-only
   # (process_vm_readv / mmap); ampr_arglog lives in the __linux__||__APPLE__ half of hle_kernel_mem.
   if(NOT WIN32)
-    add_executable(test_amprlog_safe_read tests/host/platform/test_amprlog_safe_read.cpp)
     # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
-    target_include_directories(test_amprlog_safe_read PRIVATE src)
-    add_test(NAME amprlog_safe_read COMMAND test_amprlog_safe_read)
+    prosper_add_gtest(test_amprlog_safe_read
+      SOURCES tests/host/platform/test_amprlog_safe_read.cpp INCLUDES src)
   endif()
 
   # Compute-side renderer-owned-RTT scale detection (PROSPER_RENDER_SCALE>1 downscale vs a view alias).
@@ -1915,10 +1917,9 @@ if(TARGET prosper_core)
   # Which preloaded modules are started with a real SCE module-param descriptor. Pure policy over
   # the fixed guest base map: no dump, no SELF parser, no filesystem — so both the inclusion and the
   # exclusion direction are checkable in ordinary CI.
-  add_executable(test_module_start_params tests/host/image/test_module_start_params.cpp
-                                          src/host/image/module_start_params.cpp)
-  target_include_directories(test_module_start_params PRIVATE src)
-  add_test(NAME module_start_params COMMAND test_module_start_params)
+  prosper_add_gtest(test_module_start_params
+    SOURCES tests/host/image/test_module_start_params.cpp src/host/image/module_start_params.cpp
+    INCLUDES src)
 
   add_executable(test_boot_phase_log tests/diagnostics/test_boot_phase_log.cpp)
   target_link_libraries(test_boot_phase_log PRIVATE prosper_core)
@@ -2157,9 +2158,9 @@ if(TARGET prosper_core)
 
   # Capped-diagnostic rate limit (issue #1761): a print budget must never be readable as a
   # population. Pins the sparse tail and the per-key budget; header-only, no GPU state.
-  add_executable(test_diag_ratelimit tests/gpu/diagnostics/test_diag_ratelimit.cpp)
-  target_include_directories(test_diag_ratelimit PRIVATE src)
-  add_test(NAME diag_ratelimit COMMAND test_diag_ratelimit)
+  prosper_add_gtest(test_diag_ratelimit
+    SOURCES tests/gpu/diagnostics/test_diag_ratelimit.cpp
+    INCLUDES src)
 
   # Readback-reason policy: the verdict is expressed in terms of the reason, so a future edit
   # cannot change what is counted without changing what is decided.
@@ -2167,12 +2168,10 @@ if(TARGET prosper_core)
 
   # Transfer pressure: host bytes/second, default-on. Pins that categories stay separable, that a
   # zero-byte call is not an event, and that an out-of-range category cannot corrupt a neighbour.
-  add_executable(test_transfer_pressure tests/gpu/diagnostics/test_transfer_pressure.cpp
-                 src/diagnostics/transfer_pressure.cpp
-                 src/diagnostics/exit_census.cpp
-                 src/diagnostics/exit_reports.cpp)
-  target_include_directories(test_transfer_pressure PRIVATE src)
-  add_test(NAME transfer_pressure COMMAND test_transfer_pressure)
+  prosper_add_gtest(test_transfer_pressure
+    SOURCES tests/gpu/diagnostics/test_transfer_pressure.cpp src/diagnostics/transfer_pressure.cpp
+    src/diagnostics/exit_census.cpp src/diagnostics/exit_reports.cpp
+    INCLUDES src)
 
   # Classified draw disposition: six involuntary drop paths folded into one counter, two of them
   # silent. Pins that a healthy pass stays quiet, that a drop names its mechanism, and that the
@@ -2186,12 +2185,10 @@ if(TARGET prosper_core)
 
   # Pass-break classification: keeps the per-reason distribution separable, because the reason
   # that ends the most passes is not the reason holding the mean down.
-  add_executable(test_pass_break_census tests/gpu/diagnostics/test_pass_break_census.cpp
-                 src/gpu/diagnostics/pass_break_census.cpp
-                 src/diagnostics/exit_census.cpp
-                 src/diagnostics/exit_reports.cpp)
-  target_include_directories(test_pass_break_census PRIVATE src)
-  add_test(NAME pass_break_census COMMAND test_pass_break_census)
+  prosper_add_gtest(test_pass_break_census
+    SOURCES tests/gpu/diagnostics/test_pass_break_census.cpp src/gpu/diagnostics/pass_break_census.cpp
+    src/diagnostics/exit_census.cpp src/diagnostics/exit_reports.cpp
+    INCLUDES src)
 
   # IME keyboard event delivery (issue #1093): sceImeUpdate must invoke the guest handler
   # per queued key event; the old stub delivered none.

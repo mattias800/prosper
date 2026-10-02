@@ -10,16 +10,13 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <gtest/gtest.h>
 
 using namespace prosper;
 
-static int failures = 0;
-static void check(bool ok, const char* name) {
-    printf("%s: %s\n", ok ? "PASS" : "FAIL", name);
-    if (!ok) failures++;
-}
+static void check(bool ok, const char* name) { EXPECT_TRUE(ok) << name; }
 
-int main() {
+TEST(DiagRateLimit, PrintWindowAndPerKeyBudgets) {
     // --- the print window ------------------------------------------------------------------
     bool all_first = true;
     for (uint64_t o = 1; o <= 64; o++) if (!diag_should_print(o)) all_first = false;
@@ -90,6 +87,4 @@ int main() {
 
     // Trailing summary, present iff the run completed — an abort partway through must not read as
     // a pass.
-    printf("%s (%d failed)\n", failures ? "FAILED" : "OK", failures);
-    return failures ? 1 : 0;
 }

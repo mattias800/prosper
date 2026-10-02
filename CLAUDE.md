@@ -1141,3 +1141,9 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     touches; they do **not** fence off who may work where. Any file or issue is fair game — when
     several agents run concurrently, coordinate through the claim lock and worktrees above rather than
     by carving up the codebase.
+
+## Tests use GoogleTest
+
+New C++ tests are written with GoogleTest and registered via `prosper_add_gtest` (`prosper/cmake/ProsperGTest.cmake`).
+Do not add files with a hand-rolled `main()`/`CHECK`; ctest `gtest_policy` rejects them. Migrating a legacy test means
+deleting its line from `prosper/tools/ci/gtest_legacy_allowlist.txt`. Details: `prosper/tests/AGENTS.md`.

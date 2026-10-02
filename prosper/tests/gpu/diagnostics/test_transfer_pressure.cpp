@@ -9,17 +9,14 @@
 #include "diagnostics/transfer_pressure.hpp"
 
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <cstring>
 
 using namespace prosper::diagnostics;
 
-static int failures = 0;
-static void check(bool ok, const char* name) {
-    std::printf("%s: %s\n", ok ? "PASS" : "FAIL", name);
-    if (!ok) failures++;
-}
+static void check(bool ok, const char* name) { EXPECT_TRUE(ok) << name; }
 
-int main() {
+TEST(TransferPressure, CategoriesStaySeparable) {
     bool names_ok = true;
     for (int i = 0; i < static_cast<int>(Transfer::Count); i++) {
         const char* n = transfer_name(static_cast<Transfer>(i));
@@ -84,6 +81,4 @@ int main() {
     check(transfer_bytes(Transfer::Detile) == detile0 + 5,
           "...and the helper's own category sees only what ran outside every scope");
 
-    std::printf("%s\n", failures ? "FAILURES" : "ALL PASS");
-    return failures ? 1 : 0;
 }

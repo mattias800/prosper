@@ -16,8 +16,8 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
+#include <gtest/gtest.h>
 
 // Mirrors the exact read the fix performs: 16 bytes (two qwords) at `p`, fault-safe. Returns true iff
 // the whole pair was readable.
@@ -26,11 +26,9 @@ static bool try_read_pair(uint64_t p, uint64_t out[2]) {
     return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)(sizeof(uint64_t) * 2);
 }
 
-static int failures = 0;
-#define CHECK(cond) do { if (!(cond)) { \
-    std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
+#define CHECK(cond) EXPECT_TRUE(cond)
 
-int main() {
+TEST(AmprlogSafeRead, UnmappedAddressIsReportedNotFaulted) {
     // 1) A genuinely mapped, aligned pair reads back its bytes (proves the read path still works).
     long pagesz = sysconf(_SC_PAGESIZE);
     void* page = mmap(nullptr, (size_t)pagesz, PROT_READ | PROT_WRITE,
@@ -58,6 +56,4 @@ int main() {
     uint64_t out[2] = {1, 2};
     CHECK(!try_read_pair(kGtaUnmapped, out));
 
-    if (failures == 0) std::printf("amprlog_safe_read: OK\n");
-    return failures == 0 ? 0 : 1;
 }

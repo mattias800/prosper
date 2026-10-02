@@ -2,17 +2,13 @@
 // in exec_image_linux.cpp (PS5 Zen2 guest code #UDs these on Intel hosts). Values are derived from
 // AMD64 Architecture Programmer's Manual Volume 4 (publication 26568), independent of the signal path.
 #include "host/x86/sse4a.hpp"
-#include <cstdio>
 #include <cstdint>
+#include <gtest/gtest.h>
 
 using namespace prosper;
-static int g_fail = 0, g_pass = 0;
-#define CHECK(expr, expect) do { uint64_t _v = (expr); if (_v == (uint64_t)(expect)) g_pass++; else { \
-    g_fail++; printf("  [FAIL] %s:%d  %s = 0x%llx, expected 0x%llx\n", __FILE__, __LINE__, #expr, \
-    (unsigned long long)_v, (unsigned long long)(uint64_t)(expect)); } } while (0)
+#define CHECK(expr, expect) EXPECT_EQ(static_cast<uint64_t>(expr), static_cast<uint64_t>(expect))
 
-int main() {
-    printf("== test_sse4a ==\n");
+TEST(Sse4a, InsertqExtrqGoldenVectors) {
 
     // --- INSERTQ: replace `len` bits of dst at bit `idx` with low `len` bits of src ---
     CHECK(sse4a_insertq(0x0, 0xAB, 8, 8), 0xAB00);                    // insert byte at bit 8
@@ -34,6 +30,4 @@ int main() {
     // Round-trip: insert then extract the same field recovers it.
     CHECK(sse4a_extrq(sse4a_insertq(0x0, 0x3C, 8, 24), 8, 24), 0x3C);
 
-    printf("== test_sse4a: %d passed, %d failed ==\n", g_pass, g_fail);
-    return g_fail ? 1 : 0;
 }
