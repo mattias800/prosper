@@ -2520,6 +2520,11 @@ if(TARGET prosper_core)
   target_include_directories(test_fragment_float_mode PRIVATE tests)
   add_test(NAME fragment_float_mode COMMAND test_fragment_float_mode)
 
+  # #4086: known IEEE/DX10 flags and result-width OMOD/CLAMP, actual SOURCE MRT0 CPU oracle.
+  add_executable(test_fragment_float_modifiers tests/gpu/recompiler/test_fragment_float_modifiers.cpp)
+  target_link_libraries(test_fragment_float_modifiers PRIVATE prosper_core)
+  add_test(NAME fragment_float_modifiers COMMAND test_fragment_float_modifiers)
+
   add_executable(test_fragment_float_transport tests/gpu/recompiler/test_fragment_float_transport.cpp)
   target_link_libraries(test_fragment_float_transport PRIVATE prosper_core)
   add_test(NAME fragment_float_transport COMMAND test_fragment_float_transport)
