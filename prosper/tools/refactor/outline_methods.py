@@ -534,7 +534,7 @@ def main() -> int:
             if text[r["b0"]:r["b1"]] not in back:
                 print(f"  [FAIL] {r['name']}: body missing from {path} after write-back")
                 return 1
-    print(f"  [ok]   read back from disk: every body still verbatim")
+    print("  [ok]   read back from disk: every body still verbatim")
     for path, items in sorted(routed.items(), key=lambda kv: -len(kv[1])):
         print(f"  wrote {path} -- {len(items)} method(s), "
               f"{sum(r['lines'] for r, _ in items)} line(s)")

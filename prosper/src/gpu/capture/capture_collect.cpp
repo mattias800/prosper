@@ -62,6 +62,9 @@ bool owns_scalar_word(const ShaderResourceTable& table, const ShaderResource& re
         table.owned_raw_snapshot_requirements.begin(), table.owned_raw_snapshot_requirements.end(),
         [&](const auto& requirement) {
             return requirement.first == resource.fetch_pc && requirement.second == resource.size;
+        }) || std::any_of(table.owned_nested_snapshot_requirements.begin(),
+                         table.owned_nested_snapshot_requirements.end(), [&](const auto& requirement) {
+            return requirement.first == resource.fetch_pc && requirement.second == resource.size;
         });
     return resource.cls == ResourceClass::ConstantBuffer &&
         resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
@@ -94,6 +97,22 @@ bool validate_owned_raw_capture_inputs(const ShaderResourceTable& table, std::st
             return false;
         }
     }
+    for (const auto& resource : table.resources)
+        if (resource.owned_nested_snapshot_bytes && std::none_of(
+                table.owned_nested_snapshot_requirements.begin(),
+                table.owned_nested_snapshot_requirements.end(), [&](const auto& requirement) {
+                    return requirement.first == resource.fetch_pc &&
+                        requirement.second == resource.owned_nested_snapshot_bytes;
+                })) {
+            error = "owned nested capture lacks its code-derived source obligation";
+            return false;
+        }
+    for (const auto& [pc, bytes] : table.owned_nested_snapshot_requirements)
+        if (const auto* resource = owned_nested_snapshot_at(table, pc, bytes);
+            !resource || !owns_scalar_word(table, *resource)) {
+            error = "code-required nested source has no complete owned capture backing";
+            return false;
+        }
     return true;
 }
 
@@ -477,6 +496,8 @@ bool capture_failure_diagnostics(
         diagnostic.has_system_inputs = failure.has_system_inputs;
         diagnostic.ps_wave32 = failure.ps_wave32;
         diagnostic.ps_float_mode = failure.ps_float_mode;
+        diagnostic.ps_float_flags = failure.ps_float_flags;
+        diagnostic.ps_launch_rsrc1 = failure.ps_launch_rsrc1;
         diagnostic.float_transport = failure.float_transport;
         diagnostic.compute_launch = failure.compute_launch;
         for (const auto& runtime_stage : failure.stages) {
@@ -640,6 +661,14 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
     uint64_t raw_shader_words = 0;
     std::map<uint64_t, uint32_t> raw_shader_index_by_address;
     for (const auto& d : draws) {
+        if (!d.ps_launch_rsrc1.canonical()) {
+            error = "invalid realized-draw RSRC1_PS evidence";
+            return false;
+        }
+        if (!d.ps_float_flags.canonical()) {
+            error = "invalid realized-draw fragment float flags";
+            return false;
+        }
         if (!d.ps_float_mode.canonical() || !d.float_transport.canonical()) {
             error = "invalid realized-draw fragment float mode";
             return false;
@@ -681,6 +710,8 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.fragment_wave_config_available = d.fragment_wave_config_available;
         c.ps_wave32 = d.ps_wave32;
         c.ps_float_mode = d.ps_float_mode;
+        c.ps_float_flags = d.ps_float_flags;
+        c.ps_launch_rsrc1 = d.ps_launch_rsrc1;
         c.float_transport = d.float_transport;
         if (!capture_table(d.vrt.get(), intervals, include_resource_data, false,
                            c.vrt, error, nullptr, &out) ||

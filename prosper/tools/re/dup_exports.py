@@ -23,7 +23,10 @@ Result at the time of writing: 30 dumps scanned, 7 with duplicates, 41 aliased N
 modules linked BY NAME (PSNCommon+PSNCore on six titles, libfmod+libfmodstudio 16 NIDs on one,
 AkMotion/AkSoundEngine/AkVorbisHwAccelerator one NID three ways).
 """
-import subprocess, pathlib, collections, sys
+import subprocess
+import pathlib
+import collections
+import sys
 
 SELF_DUMP = str(pathlib.Path(__file__).resolve().parents[2] / "build-linux" / "self_dump")
 def _default_root():

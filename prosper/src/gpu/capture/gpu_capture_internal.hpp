@@ -189,7 +189,11 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v65: owned immediate-wide capture obligations. Raw code and exact hosted bytes remain
 // independent admission requirements; older unmarked captures retain their historical shape.
 // v66: actual producing float transport profile, independently retained from guest MODE.
-constexpr uint32_t kVersion = 66;
+// v67: independent observed IEEE_MODE/DX10_CLAMP and full RSRC1_PS evidence for realized/failed draws.
+// Older captures retain Unknown, never infer flags from known FLOAT_MODE or a host profile.
+// v68: effective owned parent/child widths for direct graphics one-hop numeric loads. Code and
+// actually observed byte owners independently authenticate the chain; no live proof is serialized.
+constexpr uint32_t kVersion = 68;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -1336,6 +1340,16 @@ inline bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::str
             raw_referenced[compute.raw_shader_index] = true;
     }
     for (const auto& diagnostic : capture.failure_diagnostics) {
+        if (!diagnostic.ps_launch_rsrc1.canonical() ||
+            (diagnostic.kind != SubmitOperationKind::Draw && diagnostic.ps_launch_rsrc1.available)) {
+            error = "invalid failed-draw RSRC1_PS evidence";
+            return false;
+        }
+        if (!diagnostic.ps_float_flags.canonical() ||
+            (diagnostic.kind != SubmitOperationKind::Draw && diagnostic.ps_float_flags.available)) {
+            error = "invalid failed-draw fragment float flags";
+            return false;
+        }
         if (!diagnostic.ps_float_mode.canonical() ||
             (diagnostic.kind != SubmitOperationKind::Draw && diagnostic.ps_float_mode.available)) {
             error = "invalid failed-draw fragment float mode";
@@ -1491,6 +1505,10 @@ inline bool capture_authority_requires_backing(const ShaderResourceTable* table,
     if (!table || !resource.gpu_addr) return false;
     if (std::any_of(table->owned_raw_snapshot_requirements.begin(),
                     table->owned_raw_snapshot_requirements.end(), [&](const auto& requirement) {
+            return requirement.first == resource.fetch_pc;
+        })) return true;
+    if (std::any_of(table->owned_nested_snapshot_requirements.begin(),
+                    table->owned_nested_snapshot_requirements.end(), [&](const auto& requirement) {
             return requirement.first == resource.fetch_pc;
         })) return true;
     const uint64_t footprint = resource_footprint(resource);

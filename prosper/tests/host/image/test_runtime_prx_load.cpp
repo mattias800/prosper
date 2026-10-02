@@ -18,6 +18,8 @@
 // The module is a synthetic ET_SCE_DYNAMIC ELF written by this test, so the check is hermetic:
 // no game dump, no network, and the "guest" code is bytes this file emits and can therefore
 // assert on exactly.
+// The Linux missing-data-base mode also pins unresolved OBJECT refusal and recovery against a
+// real installed DATA backend, without following the wrong low GOT produced by the old loader.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "host/image/boot_program.hpp"
@@ -41,6 +43,7 @@
 #include <array>
 #include <cerrno>
 #include <filesystem>
+#include <fstream>
 #include <system_error>
 #include <sys/mman.h>
 #endif
@@ -85,7 +88,8 @@ static uint64_t emit_riprel(std::vector<uint8_t>& f, uint64_t at, const uint8_t 
 }
 
 static std::vector<uint8_t> build_module(const std::string& export_nid,
-                                         const std::string& import_nid) {
+                                         const std::string& import_nid,
+                                         uint8_t import_type = STT_FUNC) {
     std::vector<uint8_t> f(kFileSize, 0);
 
     // --- ELF header (ET_SCE_DYNAMIC PRX, x86-64, FreeBSD ABI, program headers only) ---
@@ -146,7 +150,7 @@ static std::vector<uint8_t> build_module(const std::string& export_nid,
     auto sym = [&](int i, uint64_t name_off, uint16_t shndx, uint64_t value) {
         const uint64_t p = kSymtab + (uint64_t)i * 24;
         put32(f, p + 0, (uint32_t)name_off);
-        f[p + 4] = 0x12;                       // STB_GLOBAL | STT_FUNC
+        f[p + 4] = 0x10 | (i == 2 ? import_type : STT_FUNC);
         put16(f, p + 6, shndx);
         put64(f, p + 8, value);
         put64(f, p + 16, 8);
@@ -164,7 +168,8 @@ static std::vector<uint8_t> build_module(const std::string& export_nid,
         put64(f, at + 16, (uint64_t)addend);
     };
     rela(kRela,   kInitArray, R_X86_64_RELATIVE,  0, (int64_t)kCtor);   // init_array[0] = &ctor
-    rela(kJmprel, kGot,       R_X86_64_JUMP_SLOT, 2, 0);                // GOT slot = the import
+    rela(kJmprel, kGot, import_type == STT_OBJECT ? R_X86_64_GLOB_DAT : R_X86_64_JUMP_SLOT,
+         2, 0);                                                      // GOT slot = the import
 
     // --- dynamic tags. DT_SCE_SYMTABSZ first so the parser's "this is a PS5 .dynamic" run check
     // sees an SCE tag within its 8-entry window. ---
@@ -489,6 +494,216 @@ int run_append_fixture(AppendFailure failure) {
     printf("== PASS ==\n");
     return 0;
 }
+
+// #3554: backend installation does not make Program.data_base valid. Keep the backend live so
+// missing Program state cannot accidentally be rejected later by append_import_data instead.
+constexpr uint64_t kDataPrefixMarker = 0x13572468ULL;
+constexpr uint64_t kDataWriteMarker = 0x24681357ULL;
+constexpr uint64_t kProviderObject = 0x850;
+
+void add_fixture_object(std::vector<uint8_t>& bytes, const std::string& nid, bool provider) {
+    uint64_t strsz = 0;
+    memcpy(&strsz, bytes.data() + kDynamic + 4 * 16 + 8, sizeof strsz);
+    const std::string raw = nid + (provider ? "" : "#A#A");
+    memcpy(bytes.data() + kStrtab + strsz, raw.c_str(), raw.size() + 1);
+    const uint64_t symbol = kSymtab + 3 * 24;
+    put32(bytes, symbol, static_cast<uint32_t>(strsz));
+    bytes[symbol + 4] = 0x11; // GLOBAL OBJECT, following the original FUNC import
+    put16(bytes, symbol + 6, provider ? 1 : 0);
+    put64(bytes, symbol + 8, provider ? kProviderObject : 0);
+    put64(bytes, symbol + 16, 8);
+    put64(bytes, kDynamic + 8, 4 * 24); // DT_SCE_SYMTABSZ
+    put64(bytes, kDynamic + 4 * 16 + 8, strsz + raw.size() + 1); // DT_STRSZ
+    if (provider) {
+        put64(bytes, kProviderObject, kDataPrefixMarker);
+    } else {
+        put64(bytes, kJmprel + 24, kGot + 8);
+        put32(bytes, kJmprel + 32, R_X86_64_GLOB_DAT);
+        put32(bytes, kJmprel + 36, 3);
+        put64(bytes, kDynamic + 8 * 16 + 8, 48); // DT_PLTRELSZ
+    }
+}
+
+bool write_data_fixture(const AppendFixture& fixture, const char* basename,
+                        const std::string& function, const std::string& object,
+                        bool provider = false) {
+    auto bytes = build_module(nid_hash("prosperRecoveryExport"),
+                              function.empty() ? object : function,
+                              function.empty() ? STT_OBJECT : STT_FUNC);
+    if (!function.empty()) add_fixture_object(bytes, object, provider);
+    const std::string path = fixture.root + "/prx/" + basename;
+    std::ofstream stream(path, std::ios::binary);
+    stream.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    stream.close();
+    if (!append_check(!stream.fail(), "data fixture", "write the complete synthetic DATA module"))
+        return false;
+    std::string err;
+    const auto module = Module::load(path, &err);
+    const bool mixed = !function.empty() && !provider;
+    if (!append_check(module && module->imports.size() == (mixed ? 2 : 1) &&
+                      module->imports[0].nid == (function.empty() ? object : function) &&
+                      module->imports[0].elf_type == (function.empty() ? STT_OBJECT : STT_FUNC) &&
+                      (!mixed || (module->imports[1].nid == object &&
+                                  module->imports[1].elf_type == STT_OBJECT)),
+                      "data fixture", "parse the intended import order and ELF types")) return false;
+    LoadedImage image;
+    return append_check(build_image(*module, BOOT_RUNTIME_MODULE_BASE, image, &err) &&
+                        image.min_vaddr == 0 && image.max_vaddr == kMappedImageBytes &&
+                        image.mem.size() == kMappedImageBytes, "data fixture",
+                        "the DATA fixture independently builds a valid bounded image");
+}
+
+struct DataModuleView { uint64_t handle = 0, base = 0; bool mapped = false; };
+
+DataModuleView load_data_fixture(const AppendFixture& fixture, const char* basename,
+                                uint64_t expected_base, size_t expected_count, const char* scope) {
+    int32_t result = kResultSentinel;
+    DataModuleView view;
+    view.handle = call_append_load(fixture, basename, result);
+    if (!append_check(view.handle >= kSceModuleHandleBase && view.handle < 0x80000000ULL,
+                      scope, "the registered caller returns a real handle")) return view;
+    append_check(result == 0 && runtime_loaded_module_count() == expected_count, scope,
+                 "successful pRes and exact module count reach the caller");
+    uint64_t address = 0;
+    if (!append_check(fixture.dlsym(view.handle, append_pointer("prosperRecoveryExport"),
+                                   append_pointer(&address), 0, 0, 0) == 0 && address != 0,
+                      scope, "Dlsym resolves this module's real export")) return view;
+    view.base = address - kExportFn;
+    view.mapped = view.base >= BOOT_RUNTIME_MODULE_BASE && view.base < BOOT_RUNTIME_MODULE_END &&
+        (view.base - BOOT_RUNTIME_MODULE_BASE) % BOOT_RUNTIME_MODULE_STRIDE == 0 &&
+        guest_va_in_module_code(address) && guest_va_in_module(view.base + kMappedImageBytes - 1);
+    if (!append_check(view.mapped, scope, "the export belongs to an observed bounded runtime image"))
+        return view;
+    // A guard-disabled source may already have cached this path at the first base. Still inspect
+    // its actual mapped image, report the wrong base/GOT normally, and never follow its low GOT.
+    append_check(view.base == expected_base, scope, "the load preserves the failed-base-slot burn policy");
+    append_check(reinterpret_cast<uint32_t (*)()>(address)() == 0x5eed, scope,
+                 "the mapped export executes the independent positive control");
+    append_check(append_peek(view.base, kStartCount) == 1 && append_peek(view.base, kCtorCount) == 1 &&
+                 append_peek(view.base, kSavedArgs) == kAppendArgs &&
+                 append_peek(view.base, kSavedArgp) == kAppendArgp, scope,
+                 "initializers run once with the original guest arguments");
+    check_append_repeat(fixture, basename, view.handle, view.base, expected_count, scope);
+    check_append_prefix(fixture, scope);
+    return view;
+}
+
+bool check_data_target(const DataModuleView& view, uint64_t offset, uint64_t expected,
+                       const char* scope) {
+    return append_check(view.mapped && append_peek(view.base, offset) == expected,
+                        scope, "the OBJECT GOT addresses the exact owned writable storage");
+}
+
+int run_missing_data_base_fixture() {
+    AppendFixture fixture;
+    if (!prepare_append_fixture(fixture, 2, 96)) return 1;
+    Program& program = *fixture.program;
+    const std::string function = nid_hash("prosperDataRecoveryFunction");
+    const std::string object = nid_hash("prosperDataRecoveryObject");
+    const std::string prefix_nid = nid_hash("prosperDataPrefix");
+    Hle::register_fn(function, append_import_handler, "fixture data-recovery function");
+    program.data_slots.push_back({"fixture", prefix_nid});
+    program.data_stride = kStubPageBytes;
+    std::string err;
+    if (!append_check(install_import_data(program.data_slots, BOOT_IMPORT_DATA,
+                                          program.data_stride, &err), "data setup",
+                      "install a real writable DATA prefix with nonzero stride")) return 1;
+    memcpy(reinterpret_cast<void*>(BOOT_IMPORT_DATA), &kDataPrefixMarker, sizeof kDataPrefixMarker);
+    std::array<uint8_t, kStubPageBytes> data_prefix{};
+    memcpy(data_prefix.data(), reinterpret_cast<const void*>(BOOT_IMPORT_DATA), data_prefix.size());
+    program.data_base = 0;
+    runtime_module_loader_init(&program);
+    append_check(import_data_addr(0) == BOOT_IMPORT_DATA && program.data_base == 0 &&
+                 program.data_stride == kStubPageBytes, "data setup",
+                 "only Program base is missing while the real backend remains installed");
+    if (!write_data_fixture(fixture, "missing-data.prx", function, object)) return 1;
+
+    observe_append();
+    int32_t result = kResultSentinel;
+    append_check(call_append_load(fixture, "missing-data.prx", result) == 0x8002000cULL,
+                 "data refusal", "ENOMEM reaches the registered guest caller");
+    append_check(result == kResultSentinel, "data refusal", "pRes is untouched on refusal");
+    append_check(runtime_loaded_module_count() == 0 &&
+                 module_handle_for_path("/app0/prx/missing-data.prx") == 0,
+                 "data refusal", "no module or cached path handle is published");
+    append_check(program.slots.size() == fixture.prefix_slots && program.data_slots.size() == 1 &&
+                 program.data_slots[0].nid == prefix_nid, "data refusal",
+                 "mixed import refusal preserves both slot prefixes");
+    append_check(mmap_probe.image_requests == 0 && mmap_probe.tail_requests == 0 &&
+                 mmap_probe.injected == 0, "data refusal", "binding refuses before image or stub-tail mapping");
+    append_check(memcmp(fixture.first_page.data(), reinterpret_cast<const void*>(BOOT_STUB),
+                        fixture.first_page.size()) == 0, "data refusal",
+                 "the staged FUNC import leaves the entire code page unchanged");
+    check_append_prefix(fixture, "data refusal");
+    append_check(memcmp(data_prefix.data(), reinterpret_cast<const void*>(BOOT_IMPORT_DATA),
+                        data_prefix.size()) == 0, "data refusal", "actual DATA prefix bytes survive refusal");
+
+    program.data_base = BOOT_IMPORT_DATA; // The same backend is not reinstalled or remapped.
+    const uint64_t slot = BOOT_IMPORT_DATA + kStubPageBytes;
+    const auto retry = load_data_fixture(fixture, "missing-data.prx",
+        BOOT_RUNTIME_MODULE_BASE + BOOT_RUNTIME_MODULE_STRIDE, 1, "data recovery");
+    append_check(program.slots.size() == 3 && program.data_slots.size() == 2 &&
+                 program.data_slots[1].nid == object, "data recovery",
+                 "base-only retry claims exactly one FUNC and one DATA slot");
+    const bool installed_function = retry.mapped && program.slots.size() == 3 &&
+        program.slots[2].nid == function && append_peek(retry.base, kGot) == BOOT_STUB + 2 * 96;
+    append_check(installed_function && reinterpret_cast<HleFn>(BOOT_STUB + 2 * 96)(0, 0, 0, 0, 0, 0) ==
+                 kImportMarker, "data recovery", "the staged FUNC NID recovers a real installed handler");
+    append_check(call_order() == fixture.prefix_order, "data recovery",
+                 "a registered FUNC call preserves the unresolved prefix census");
+    const bool writable = check_data_target(retry, kGot + 8, slot, "data recovery");
+    const uint64_t variable = retry.mapped ? append_peek(retry.base, kGot + 8) : 0;
+    append_check(writable && append_peek(variable, 0) == 0, "data recovery", "new DATA storage is really zero-filled");
+    if (writable) memcpy(reinterpret_cast<void*>(variable), &kDataWriteMarker, sizeof kDataWriteMarker);
+    append_check(writable && append_peek(variable, 0) == kDataWriteMarker, "data recovery",
+                 "a write through the resolved variable is retained");
+
+    if (!write_data_fixture(fixture, "data-followup.prx", function, object)) return 1;
+    const auto followup = load_data_fixture(fixture, "data-followup.prx",
+        BOOT_RUNTIME_MODULE_BASE + 2 * BOOT_RUNTIME_MODULE_STRIDE, 2, "data followup");
+    const bool shared = check_data_target(followup, kGot + 8, slot, "data followup");
+    append_check(shared && append_peek(slot, 0) == kDataWriteMarker && program.data_slots.size() == 2 &&
+                 program.slots.size() == 3, "data followup", "another module shares the retained DATA slot and bytes");
+
+    program.data_base = 0;
+    if (!write_append_module(fixture, "data-function-only.prx", function)) return 1;
+    const auto plain = load_data_fixture(fixture, "data-function-only.prx",
+        BOOT_RUNTIME_MODULE_BASE + 3 * BOOT_RUNTIME_MODULE_STRIDE, 3, "data FUNC control");
+    append_check(plain.mapped && append_peek(plain.base, kGot) == BOOT_STUB + 2 * 96 &&
+                 program.slots.size() == 3 && program.data_slots.size() == 2,
+                 "data FUNC control", "function-only loading needs no Program DATA base");
+
+    const std::string global_object = nid_hash("prosperDataGlobalObject");
+    program.exports[global_object] = BOOT_IMPORT_DATA;
+    if (!write_data_fixture(fixture, "data-global-object.prx", "", global_object)) return 1;
+    const auto global = load_data_fixture(fixture, "data-global-object.prx",
+        BOOT_RUNTIME_MODULE_BASE + 4 * BOOT_RUNTIME_MODULE_STRIDE, 4, "data global control");
+    append_check(check_data_target(global, kGot, BOOT_IMPORT_DATA, "data global control") &&
+                 append_peek(BOOT_IMPORT_DATA, 0) == kDataPrefixMarker && program.data_slots.size() == 2,
+                 "data global control", "a real global OBJECT export wins over the missing DATA base");
+
+    const std::string runtime_object = nid_hash("prosperDataRuntimeObject");
+    if (!write_data_fixture(fixture, "data-provider.prx", function, runtime_object, true)) return 1;
+    const auto provider = load_data_fixture(fixture, "data-provider.prx",
+        BOOT_RUNTIME_MODULE_BASE + 5 * BOOT_RUNTIME_MODULE_STRIDE, 5, "data provider control");
+    uint64_t provider_address = 0;
+    const bool provider_export = provider.mapped && fixture.dlsym(provider.handle,
+        append_pointer("prosperDataRuntimeObject"), append_pointer(&provider_address), 0, 0, 0) == 0 &&
+        provider_address == provider.base + kProviderObject;
+    append_check(provider_export && append_peek(provider_address, 0) == kDataPrefixMarker,
+                 "data provider control", "Dlsym exposes the provider's real writable OBJECT bytes");
+    if (!write_data_fixture(fixture, "data-runtime-object.prx", "", runtime_object)) return 1;
+    const auto runtime = load_data_fixture(fixture, "data-runtime-object.prx",
+        BOOT_RUNTIME_MODULE_BASE + 6 * BOOT_RUNTIME_MODULE_STRIDE, 6, "data runtime control");
+    append_check(provider_export && check_data_target(runtime, kGot, provider_address, "data runtime control") &&
+                 program.data_slots.size() == 2, "data runtime control",
+                 "a real runtime OBJECT export wins over the missing DATA base");
+    append_check(memcmp(data_prefix.data(), reinterpret_cast<const void*>(BOOT_IMPORT_DATA),
+                        data_prefix.size()) == 0, "data final", "every valid load preserves actual DATA prefix bytes");
+    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
+    printf("== PASS ==\n");
+    return 0;
+}
 } // namespace
 #endif
 
@@ -500,6 +715,8 @@ int main(int argc, char** argv) {
         return run_append_fixture(AppendFailure::Image);
     if (argc == 2 && strcmp(argv[1], "--append-emission-failure") == 0)
         return run_append_fixture(AppendFailure::Emission);
+    if (argc == 2 && strcmp(argv[1], "--missing-data-base") == 0)
+        return run_missing_data_base_fixture();
 #endif
     printf("== test_runtime_prx_load ==\n");
     // A scratch "dump root", on real disk and never /tmp: tests/fixtures/test_scratch.h roots it at

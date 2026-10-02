@@ -421,7 +421,8 @@ def self_test() -> int:
         if got != want:
             print(f"  [FAIL] stale-pin self-test: want={want} got={got}")
             bad += 1
-    import io, contextlib
+    import io
+    import contextlib
     for cached, per_submit, want in PER_SUBMIT_SELF_TESTS:
         with contextlib.redirect_stdout(io.StringIO()):
             got = check_per_submit(cached, per_submit)
@@ -443,7 +444,7 @@ def self_test() -> int:
             print(f"         per-submit want={want_submit} got={got_submit}")
             bad += 1
     if bad:
-        print(f"  the scanner's own patterns are broken -- a tree scan would report a false CLEAN")
+        print("  the scanner's own patterns are broken -- a tree scan would report a false CLEAN")
     else:
         print(f"  [ok]   scanner self-test: "
               f"{len(SELF_TESTS) + len(HOT_SELF_TESTS) + len(PER_SUBMIT_SELF_TESTS) + len(PIN_SELF_TESTS) + len(STALE_PIN_SELF_TESTS)} cases")

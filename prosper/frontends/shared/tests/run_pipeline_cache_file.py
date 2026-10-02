@@ -1,3 +1,5 @@
+"""Run a pipeline-cache test binary against a fresh temporary directory (argv[1] is the binary)."""
+
 import subprocess
 import sys
 import tempfile

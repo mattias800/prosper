@@ -220,6 +220,12 @@ public:
     // Seconds spent in intervals no longer than kActiveIntervalMultiple x the typical interval.
     double active_seconds() const;
     uint64_t interval_samples() const { return interval_samples_; }
+    // Interval at quantile q in (0,1) between consecutive distinct frames, by NEAREST RANK over the
+    // same histogram (and the same bucket-midpoint estimator, so the same +/-5%) as the median.
+    // Zero means "not measured": no intervals, or fewer than 1/(1-q) of them, in which case the
+    // requested tail holds no sample beyond the rank and the answer would just be the maximum
+    // wearing a percentile's name. Zero is NOT a fast frame time.
+    double interval_quantile_seconds(double q) const;
 
 private:
     void record_interval(double seconds);
@@ -256,6 +262,11 @@ struct PresentRateSnapshot {
     double typical_interval_seconds = 0;     // 0 => fewer than two distinct frames
     double active_seconds = 0;
     uint64_t interval_samples = 0;
+    // Tail intervals from the same cumulative histogram; 0 => not resolvable at this sample count
+    // (see FrameRateCounter::interval_quantile_seconds). Same differencing caveat as the median.
+    double interval_p90_seconds = 0;
+    double interval_p95_seconds = 0;
+    double interval_p99_seconds = 0;
 };
 
 // Both rates over one window, plus the raw counts they were derived from. The counts travel with
@@ -289,6 +300,22 @@ struct FrameRate {
     // to print it -- has to test this first. #3027.
     bool active_fraction_measured = false;
     double active_fraction = 0;
+
+    // FRAME-TIME TAIL, over DISTINCT frames (a re-served retained frame is not a frame time). Each
+    // `*_measured` is false when the interval population is too small to resolve that tail -- p90
+    // needs 10 intervals, p95 needs 20, p99 needs 100 -- and the seconds are then 0, to be rendered
+    // as "--". Never filled by frame_rate_between, for the same cumulative-histogram reason as
+    // `typical_fps`.
+    bool p90_measured = false;
+    bool p95_measured = false;
+    bool p99_measured = false;
+    double interval_p90_seconds = 0;
+    double interval_p95_seconds = 0;
+    double interval_p99_seconds = 0;
+    // "1% low" = the frame rate at the 99th-percentile interval, 1 / p99. That is one of two
+    // conventions in circulation; the other (mean fps of the slowest 1% of frames) is NOT what this
+    // is, and the two differ whenever the tail is skewed. It tracks `p99_measured`.
+    double low_1pct_fps = 0;
 };
 
 // Window = [first publication, the moment the snapshot was taken]. Wall clock, not "time between
@@ -333,6 +360,12 @@ FrameRate frame_rate_between(const PresentRateSnapshot& earlier, const PresentRa
 // A run that produced fewer than two distinct frames gets "-- fps ... 0% active" and a sentence
 // naming the count, because that is the case a number of any kind would misrepresent.
 std::string format_frame_rate(const FrameRate& rate);
+
+// One line: "frame time p90 18.2 ms  p95 21.0 ms  p99 33.4 ms  1% low 29.9 fps  (2431 intervals)".
+// A tail that the interval population cannot resolve prints "--" and the line says how many
+// intervals it had, so a short run reads as short rather than as a clean tail. Empty when the
+// rate came from frame_rate_between, which carries no interval histogram at all.
+std::string format_frame_percentiles(const FrameRate& rate);
 
 // A compact form for burning into an image or drawing in a HUD:
 // "18.5 fps  62% active  3840x2160". Falls back to the run average when the typical rate is not

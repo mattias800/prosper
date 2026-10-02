@@ -31,6 +31,9 @@ int main(int argc, char** argv) {
                   << " source_words=" << c.source.size() << " semantic_reads=" << c.choices.reads.size()
                   << " wave_width=" << (c.wave32 ? 32 : 64) << " guest_float_mode="
                   << (c.float_mode.available ? std::to_string(c.float_mode.value) : "unknown")
+                  << " guest_ieee_mode=" << (c.float_flags.available ? (c.float_flags.ieee_mode ? "1" : "0") : "unknown")
+                  << " guest_dx10_clamp=" << (c.float_flags.available ? (c.float_flags.dx10_clamp ? "1" : "0") : "unknown")
+                  << " rsrc1_ps_evidence=" << (c.launch_rsrc1.available ? std::to_string(c.launch_rsrc1.value) : "unknown")
                   << " host_float_transport=" << float_transport_profile_name(c.float_transport) << '\n'
                   << "producing_compiler=" << c.compiler << " replay_compiler="
                   << prosper::embedded_build_revision() << ':' << prosper::embedded_build_source_identity() << '\n';

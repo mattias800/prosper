@@ -28,7 +28,15 @@ disassembler or decoder is missing, exits 2 and says so rather than printing zer
 silent scanner is indistinguishable from a clean codebase, and that failure has cost this project
 real time.
 """
-import argparse, json, os, re, shutil, struct, subprocess, sys, tempfile
+import argparse
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
 
 # MIMG DIM values (SQ_RSRC), as reported by prosper's decoder in `Rdna2Inst::mimg_dim`. This is a
 # naming and classification table, not a decode: nothing here reads an instruction word. Which bits

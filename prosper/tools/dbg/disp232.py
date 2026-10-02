@@ -1,7 +1,9 @@
-# gdb -p PID -batch -x disp232.py
-# Issue #232: capture the IoDispatcher object from a pool-pop hit (0x23d5a20, rdi=disp+0x8),
-# run to the stall, then dump the dispatcher/batch/pool state that gates the final flush.
-import gdb, struct, time
+"""gdb -p PID -batch -x disp232.py
+Issue #232: capture the IoDispatcher object from a pool-pop hit (0x23d5a20, rdi=disp+0x8),
+run to the stall, then dump the dispatcher/batch/pool state that gates the final flush.
+"""
+import gdb
+import time
 
 gdb.execute("set pagination off")
 gdb.execute("handle SIGSEGV SIGBUS SIGILL nostop pass noprint")

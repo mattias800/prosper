@@ -474,7 +474,14 @@ namespace prosper {
 
 // Both touch guest memory, so each half defines them with its own fault-safety rules: a fault in
 // host HLE code kills the emulator, not just the guest.
-static void apr_write_result_slot(uint64_t addr, uint64_t value);
+//
+// The result slots are 32-bit: sceKernelAprSubmitCommandBufferAndGetResult takes
+// (cb, ring, uint32_t* out1, uint32_t* out2). The evidence is the guest's own code: a caller lays
+// the two slots out as adjacent 4-byte stack locals ([rbp-0x3c] and [rbp-0x34], the second sitting
+// directly below its stack canary), initialises one with a 32-bit store and reads it back with a
+// 32-bit load. An 8-byte store here overwrote the four bytes after the slot, which on that stack was
+// the low half of the canary (#4138).
+static void apr_write_result_slot(uint64_t addr, uint32_t value);
 // Diagnostic-only (PROSPER_AMPRLOG): read two guest qwords, false if not safely readable.
 static bool apr_probe_guest_pair(uint64_t addr, uint64_t out[2]);
 
@@ -763,8 +770,10 @@ static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
     const bool tag_echo = bound && bc.eq;
     uint64_t token = tag_echo ? bc.tag : prosper_apr_next_token(ring);
     if (!bound && write_result_outputs) {
-        if (a2 > 0xffff) apr_write_result_slot(a2, token);
-        if (a3 > 0xffff) apr_write_result_slot(a3, token);
+        // The slots are 32 bits wide, so the guest only ever observed the low half of a 64-bit
+        // token through them; storing exactly that keeps what it saw and stops the overrun.
+        if (a2 > 0xffff) apr_write_result_slot(a2, (uint32_t)token);
+        if (a3 > 0xffff) apr_write_result_slot(a3, (uint32_t)token);
     }
     if (amprlog()) fprintf(stderr, "[amprlog] AprSubmit%s cb=0x%llx ring1b=%llu out1=0x%llx out2=0x%llx -> token=0x%llx%s%s\n",
                            write_result_outputs ? "AndGetResult" : "",
@@ -814,8 +823,8 @@ namespace prosper {
 
 // #2139: unchanged from the pre-hoist code -- a plain store, exactly as the POSIX submit path has
 // always written its result slots. The caller already rejected obviously bogus addresses (<=0xffff).
-static void apr_write_result_slot(uint64_t addr, uint64_t value) {
-    *(uint64_t*)(uintptr_t)addr = value;
+static void apr_write_result_slot(uint64_t addr, uint32_t value) {
+    *(uint32_t*)(uintptr_t)addr = value;
 }
 
 // #2139 POSIX sibling: process_vm_readv reports EFAULT instead of faulting (all-or-nothing per
@@ -1118,7 +1127,11 @@ namespace {
     }();
     // Direct ("physical") memory allocations, kept SORTED by start (first-fit allocation walks the
     // gaps). Also serves sceKernelDirectMemoryQuery.
-    struct DMem { uint64_t start, end; int type; };
+    struct DMem {
+        uint64_t start, end; int type;
+        uint64_t origin_start, origin_end, origin_id;
+    };
+    uint64_t g_next_dmem_origin = 1;
     std::mutex g_dmx;
     std::vector<DMem> g_dmem;
 
@@ -1159,7 +1172,8 @@ namespace {
         }
         return false;
     found:
-        g_dmem.insert(g_dmem.begin() + insert_at, { off_out, off_out + sz, type });
+        g_dmem.insert(g_dmem.begin() + insert_at,
+                      {off_out, off_out + sz, type, off_out, off_out + sz, g_next_dmem_origin++});
         return true;
     }
 
@@ -1198,8 +1212,8 @@ namespace {
         out.reserve(g_dmem.size());
         for (auto& d : g_dmem) {
             if (d.end <= start || d.start >= end) { out.push_back(d); continue; }
-            if (d.start < start) out.push_back({ d.start, start, d.type });
-            if (d.end > end)     out.push_back({ end, d.end, d.type });
+            if (d.start < start) out.push_back({d.start, start, d.type, d.origin_start, d.origin_end, d.origin_id});
+            if (d.end > end) out.push_back({end, d.end, d.type, d.origin_start, d.origin_end, d.origin_id});
         }
         g_dmem.swap(out);
     }
@@ -1228,11 +1242,11 @@ namespace {
                 out.push_back(d);
                 continue;
             }
-            if (d.start < start) out.push_back({d.start, start, d.type});
+            if (d.start < start) out.push_back({d.start, start, d.type, d.origin_start, d.origin_end, d.origin_id});
             const uint64_t changed_start = d.start < start ? start : d.start;
             const uint64_t changed_end = d.end > end ? end : d.end;
-            out.push_back({changed_start, changed_end, type});
-            if (d.end > end) out.push_back({end, d.end, d.type});
+            out.push_back({changed_start, changed_end, type, d.origin_start, d.origin_end, d.origin_id});
+            if (d.end > end) out.push_back({end, d.end, d.type, d.origin_start, d.origin_end, d.origin_id});
         }
         g_dmem.swap(out);
     }
@@ -1554,6 +1568,23 @@ namespace {
                         if (past > next) next = past;
                     }
                 }
+            }
+            // An occupant the tracker does not know -- a host mapping -- is skipped the same way,
+            // when the host can say where it ends (Darwin; see prosper_host_occupant_end, #4043).
+            // Still only a starting hint: the next iteration claims with NOREPLACE semantics again.
+            if (const uint64_t host_end = prosper_host_occupant_end(cand, cand + len);
+                host_end > next && host_end <= UINT64_MAX - (align - 1)) {
+                const uint64_t past = align_up(host_end, align);
+                static std::atomic<bool> reported{false};
+                if (past - cand >= (1ull << 30) && !reported.exchange(true))
+                    fprintf(stderr, "[mem] auto-map: skipped an untracked host mapping ending at "
+                                    "0x%llx (%llu MiB past the probe at 0x%llx) in one step "
+                                    "instead of %llu 64 KiB probes (#4043; reported once)\n",
+                            (unsigned long long)host_end,
+                            (unsigned long long)((past - cand) >> 20),
+                            (unsigned long long)cand,
+                            (unsigned long long)((past - cand) / step));
+                next = past;
             }
             if (next <= cand) return nullptr;
             cand = next;
@@ -4294,14 +4325,14 @@ namespace prosper {
 // one, so if a title ever stalls waiting on that value the log is what points at this line; a
 // silent skip would leave it looking like the write happened. Bounded so a pathological caller
 // cannot flood the log. POSIX cannot reach this state: its store faults instead of skipping.
-static void apr_write_result_slot(uint64_t addr, uint64_t value) {
+static void apr_write_result_slot(uint64_t addr, uint32_t value) {
     MEMORY_BASIC_INFORMATION mbi{};
     constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY |
                                 PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
     const bool writable =
         VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)), &mbi, sizeof(mbi)) &&
         mbi.State == MEM_COMMIT && (mbi.Protect & kWritable) &&
-        static_cast<uintptr_t>(addr) + sizeof(uint64_t) <=
+        static_cast<uintptr_t>(addr) + sizeof(uint32_t) <=
             reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
     if (!writable) {
         static std::atomic<int> skipped{0};
@@ -4316,7 +4347,7 @@ static void apr_write_result_slot(uint64_t addr, uint64_t value) {
             fprintf(stderr, "[ampr] further APR result-slot drops suppressed\n");
         return;
     }
-    *reinterpret_cast<uint64_t*>(static_cast<uintptr_t>(addr)) = value;
+    *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(addr)) = value;
 }
 
 // #2139 Windows sibling: prove the whole pair is committed and readable before touching it.
@@ -4645,7 +4676,11 @@ namespace {
         }
         return 16ull * 1024 * 1024 * 1024;
     }();
-    struct DMem { uint64_t start, end; int type; };
+    struct DMem {
+        uint64_t start, end; int type;
+        uint64_t origin_start, origin_end, origin_id;
+    };
+    uint64_t g_next_dmem_origin = 1;
     std::mutex g_dmx;
     std::vector<DMem> g_dmem;
 
@@ -4678,7 +4713,8 @@ namespace {
         }
         return false;
     found:
-        g_dmem.insert(g_dmem.begin() + insert_at, { off_out, off_out + sz, type });
+        g_dmem.insert(g_dmem.begin() + insert_at,
+                      {off_out, off_out + sz, type, off_out, off_out + sz, g_next_dmem_origin++});
         return true;
     }
     void dmem_largest_free(uint64_t lo, uint64_t hi, uint64_t align, uint64_t& off_out, uint64_t& size_out) {
@@ -4708,8 +4744,8 @@ namespace {
         out.reserve(g_dmem.size());
         for (auto& d : g_dmem) {
             if (d.end <= start || d.start >= end) { out.push_back(d); continue; }
-            if (d.start < start) out.push_back({ d.start, start, d.type });
-            if (d.end > end)     out.push_back({ end, d.end, d.type });
+            if (d.start < start) out.push_back({d.start, start, d.type, d.origin_start, d.origin_end, d.origin_id});
+            if (d.end > end) out.push_back({end, d.end, d.type, d.origin_start, d.origin_end, d.origin_id});
         }
         g_dmem.swap(out);
     }
@@ -4736,11 +4772,11 @@ namespace {
                 out.push_back(d);
                 continue;
             }
-            if (d.start < start) out.push_back({d.start, start, d.type});
+            if (d.start < start) out.push_back({d.start, start, d.type, d.origin_start, d.origin_end, d.origin_id});
             const uint64_t changed_start = d.start < start ? start : d.start;
             const uint64_t changed_end = d.end > end ? end : d.end;
-            out.push_back({changed_start, changed_end, type});
-            if (d.end > end) out.push_back({end, d.end, d.type});
+            out.push_back({changed_start, changed_end, type, d.origin_start, d.origin_end, d.origin_id});
+            if (d.end > end) out.push_back({end, d.end, d.type, d.origin_start, d.origin_end, d.origin_id});
         }
         g_dmem.swap(out);
     }
@@ -8473,6 +8509,83 @@ int dmem_caller_scan_slots_for_test(const volatile uint64_t* frame, int want) {
 // Both platform implementations keep their mapping table and lock under these same names.
 // Resolve the public topology query here so one contract serves either platform.
 namespace prosper {
+namespace {
+GuestDirectAllocation direct_allocation_locked(uint64_t address, uint64_t bytes) {
+    if (!bytes || address > UINT64_MAX - bytes) return {};
+    const auto mapping = std::find_if(g_maps.begin(), g_maps.end(), [&](const auto& mapping) {
+        return mapping.committed && (mapping.query_flags & kVirtualQueryDirect) &&
+            mapping.base <= address && address - mapping.base < mapping.size &&
+            bytes <= mapping.size - (address - mapping.base);
+    });
+    if (mapping == g_maps.end() || mapping->offset > UINT64_MAX - (address - mapping->base))
+        return {};
+    const uint64_t physical = mapping->offset + address - mapping->base;
+    const auto allocation = std::find_if(g_dmem.begin(), g_dmem.end(), [&](const auto& range) {
+        return range.start <= physical && physical < range.end &&
+            range.origin_start <= physical && physical < range.origin_end &&
+            bytes <= range.origin_end - physical;
+    });
+    if (allocation == g_dmem.end() || !allocation->origin_id) return {};
+    // Type changes split the public query ledger; they do not split allocation ownership.
+    // A partially released/reused origin is not a new producer's authenticated whole backing.
+    uint64_t cursor = allocation->origin_start;
+    for (const auto& range : g_dmem) {
+        if (range.end <= cursor) continue;
+        if (range.start != cursor || range.origin_id != allocation->origin_id ||
+            range.origin_start != allocation->origin_start || range.origin_end != allocation->origin_end)
+            return {};
+        cursor = range.end;
+        if (cursor == allocation->origin_end)
+            return {address, bytes, allocation->origin_start, allocation->origin_end,
+                    allocation->origin_id};
+    }
+    return {};
+}
+} // namespace
+
+GuestDirectAllocation guest_memory_direct_allocation(const GuestMappingLease&,
+                                                     uint64_t address, uint64_t bytes) {
+    std::scoped_lock lock(g_mx, g_dmx);
+    return direct_allocation_locked(address, bytes);
+}
+
+GuestMemoryTopologyRelation guest_memory_retained_allocation_relation(
+        const GuestMappingLease&, uint64_t source_address, uint64_t source_bytes,
+        const GuestDirectAllocation& producer) {
+    if (!source_bytes || source_address > UINT64_MAX - source_bytes ||
+        !producer.identity || producer.physical_begin >= producer.physical_end)
+        return GuestMemoryTopologyRelation::Unknown;
+    // The retained owner authenticates producer birth/bounds. It may outlive its guest VA and
+    // physical release. Physical reuse still overlaps: a different allocation ID is not isolation.
+    // Only source bindings are resolved from CURRENT maps/allocations under both HLE locks.
+    std::scoped_lock lock(g_mx, g_dmx);
+    uint64_t cursor = source_address;
+    const uint64_t end = source_address + source_bytes;
+    bool overlap = false;
+    while (cursor < end) {
+        const auto source = std::find_if(g_maps.begin(), g_maps.end(), [&](const auto& mapping) {
+            return mapping.committed && (mapping.query_flags & kVirtualQueryDirect) &&
+                mapping.base <= cursor && cursor - mapping.base < mapping.size;
+        });
+        if (source == g_maps.end() || source->offset > UINT64_MAX - (cursor - source->base))
+            return GuestMemoryTopologyRelation::Unknown;
+        const uint64_t first = source->offset + cursor - source->base;
+        const uint64_t bytes = std::min(end - cursor, source->size - (cursor - source->base));
+        if (first > UINT64_MAX - bytes || !direct_allocation_locked(cursor, bytes).identity)
+            return GuestMemoryTopologyRelation::Unknown;
+        overlap |= first < producer.physical_end && producer.physical_begin < first + bytes;
+        cursor += bytes;
+    }
+    return overlap ? GuestMemoryTopologyRelation::Overlap : GuestMemoryTopologyRelation::Disjoint;
+}
+
+GuestMemoryTopologyRelation guest_memory_direct_allocation_relation(
+        const GuestMappingLease& lease, uint64_t source_address, uint64_t source_bytes,
+        uint64_t producer_address, uint64_t minimum_producer_bytes) {
+    return guest_memory_retained_allocation_relation(lease, source_address, source_bytes,
+        guest_memory_direct_allocation(lease, producer_address, minimum_producer_bytes));
+}
+
 GuestMemoryTopologyRelation guest_memory_topology_relation(
         uint64_t first_address, uint64_t first_size,
         uint64_t second_address, uint64_t second_size) {

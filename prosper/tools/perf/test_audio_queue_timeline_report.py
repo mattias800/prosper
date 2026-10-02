@@ -6,8 +6,6 @@ by inspection. The properties that matter are the ones a mean cannot see, becaus
 reason this tool exists is that the one-second delivery average stayed at 100% of real time while
 the queue emptied in every gap (#3016).
 """
-import io
-import re
 import subprocess
 import sys
 import tempfile

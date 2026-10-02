@@ -64,6 +64,6 @@ if __name__ == "__main__":
             raise ValueError("reader policy arguments")
         verify(Path(sys.argv[1]).resolve(strict=True))
         print("fragment compiler reader policy: verified")
-    except Exception as error:
+    except Exception:
         print("fragment compiler reader policy: UNVERIFIED (re-audit changed read seams)", file=sys.stderr)
         sys.exit(2)

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Unit tests for hang_probe.py (subprocess calls are mocked)."""
 import importlib.util
 import os
 import subprocess

@@ -162,6 +162,7 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
     // PROSPER_GFXLOG at runtime, and a cached read would make its arms vacuous).
     const bool gfxlog = getenv("PROSPER_GFXLOG") != nullptr;
     for (const auto* itp : group) {
+        prosper::test::BackendProducerAttempt producer_attempt;
         const auto& it = *itp;
         if (draw_is_skipped(it.draw_index)) continue;
         prosper::test::BackendDraw bd;
@@ -216,6 +217,9 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
         bd.instance_count = it.instance_count;
         bd.vertex_offset = refvs ? 0 : it.vertex_offset;
         bd.ps     = nops ? nullptr : &it.ps;
+        bd.raster_quads = it.raster_quads;
+        bd.raster_quad_contract_modified = refvs || fs_ov || nops ||
+            (descriptor_validate_mode && !strcmp(descriptor_validate_mode, "poison"));
         // Five clock reads bounding four spans, only when timing is armed -- ~0.9% of
         // this bucket at 2,100 draws a submit. It inflates what it measures while
         // armed, as every timer here does; read the shares, not the totals.
@@ -528,6 +532,7 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
             }
         }
         bds.push_back(std::move(bd));
+        producer_attempt.accepted = true;
     }
     return bds;
 }

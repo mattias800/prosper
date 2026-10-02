@@ -10,7 +10,7 @@ import re
 import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from collections.abc import Callable
 
 PROPERTY = "PROSPER_DIAG_MEMBER_FACT_DOMAIN"
 IDENT = re.compile(r"[A-Za-z_][A-Za-z_0-9.-]*\Z")
@@ -133,9 +133,15 @@ def discover(root: Path, files: dict[Path, list[str]], excluded: Callable[[str],
     source. Unrelated opaque CMake/macro generation is not interpreted: the assertion must still
     be true under build review. All unannotated files and all headers remain shared.
     """
-    root = root.resolve()
+    # Every path below is compared in CANONICAL form (`_identity` resolves), but callers key
+    # `files` under their own spelling of the root. Those differ whenever the root sits under a
+    # symlink -- on macOS every temporary directory does (/var -> /private/var) -- and then no
+    # resolved source is ever "in files" and `relative_to(root)` raises (#4043). So translate the
+    # keys once on the way in and translate the admitted set back on the way out.
+    caller_root, root = root, root.resolve()
+    canonical = {root / path.relative_to(caller_root): path for path in files}
     cmake = []
-    include_files = set(files)
+    include_files = set(canonical)
     for directory, dirs, names in os.walk(root):
         dirs[:] = sorted(d for d in dirs if not excluded(d) and d != ".git")
         for name in sorted(names):
@@ -175,7 +181,7 @@ def discover(root: Path, files: dict[Path, list[str]], excluded: Callable[[str],
                 lexical = Path(os.path.abspath(declaration.path.parent / spelling))
                 if (source is None or source != lexical or not source.is_file()
                         or not rel.startswith("tests/") or source.suffix != ".cpp"
-                        or source not in files):
+                        or source not in canonical):
                     failures.append("source must be an existing collected tests/*.cpp without symlinks")
         registered = [c for c in cmake if c.name == "add_test" and not c.definition
                       and c.complete
@@ -248,5 +254,5 @@ def discover(root: Path, files: dict[Path, list[str]], excluded: Callable[[str],
                           accepted, "; ".join(sorted(set(failures))) if failures
                           else "declared nonshipping TU; literal guards passed"))
         if accepted:
-            local.add(source)
+            local.add(canonical[source])
     return local, roles

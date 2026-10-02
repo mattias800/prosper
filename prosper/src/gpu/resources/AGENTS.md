@@ -54,6 +54,9 @@ exclusive-predecessor snapshot slots, EXEC-write classification and mip-operand 
 shader cache. Register values, descriptors, guest reads and snapshot values remain invocation-local;
 a plan must never become proof that resource contents are unchanged.
 
-`fold_reader` is the resource-fold workbench seam. Live reads preserve repeated consumption;
-only the existing partially OOB scalar-buffer load snapshots an in-range prefix. Offline readers
+`fold_reader` is the resource-fold workbench seam. Ordinary live reads preserve repeated consumption;
+partially OOB scalar-buffer loads snapshot an in-range prefix. The ordered direct-graphics nested
+wide reader retains one exact-PC parent/child observation shared by folding and emitted resources.
+Its mapping lease protects topology, while producer completion and retained physical-allocation
+origin checks separately establish visibility and isolation. Offline readers
 match ordered logical requests and must never dereference captured guest addresses.

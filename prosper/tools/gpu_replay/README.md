@@ -33,6 +33,18 @@ Capsules contain title-derived shaders, resource bytes, addresses, ordered DMA e
 pixels, and optional exact persistent Vulkan depth/stencil checkpoint planes.
 They are gitignored local artifacts and must never be committed or shared as project fixtures.
 
+Capture v68 appends exact-PC nested parent/child byte obligations after the unchanged official
+v67 launch flags/raw RSRC1 evidence and v66 producing float-transport profile tails.
+Producing launch context, profile and ownership remain separate inputs.
+Materialization re-derives the complete original one-hop, width and no-writer proof, requires both
+actually observed owned spans, and checks the saved parent pointer selects the saved child.
+Stored modules pass the same check as raw recompilation. Older unmarked numeric nested captures
+remain readable but cannot supply new runtime ownership. Live producer status, physical allocation
+origins and native footprint certificates are not serialized or accepted from capture metadata.
+Project-owned fixtures can be exported with
+`test_graphics_raw_wide_upload --emit-nested-replay-fixtures <NEW_DIRECTORY>`; both raw stage substitutions must be checked together,
+followed by ordinary strict SPIR-V validation and the same numeric pixel oracle as stored replay.
+
 For a long scripted route, first set `PROSPER_CAPTURE_SCREENSHOT_AT_FRAME=N` to read back the Nth
 successfully presented host frame without paying the cost of a command capture. The one-shot writes
 `scheduled_frame_N.bmp` under `PROSPER_CAPTURE_DIR`; set `PROSPER_CAPTURE_SCREENSHOT=/path/out.bmp`

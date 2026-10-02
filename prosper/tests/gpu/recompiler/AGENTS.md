@@ -44,6 +44,14 @@ arm reaches derived provenance. The one-arm compare targets the MUST mask meet a
 
 ## Ruled out
 
+- Complete owned packet inputs do not supply live mask facts to unreachable dispatcher blocks.
+  [PR #4114's d317 Linux CI](https://github.com/mattias800/prosper/actions/runs/37032364442/job/110922088436)
+  rejected the unchanged all-ended `mbcnt_98` at dead PC9 BCNT (`be8c106a`) despite its entry
+  S_BRANCH targeting S_ENDPGM. Omit only structurally entry-unreachable owned packet cases;
+  conditional branches retain both arms and the caller still inventories every instruction/slot.
+  The corrected source requires fresh exact-head execution; this is the observed failure, not a
+  passing result for the correction.
+
 - A nonempty comparison-sample module need not contain `OpImageSampleExplicitLod`:
   `ShaderResource` defaults to linear filtering. Both new VS/PS positive checks failed
   while their valid modules each contained four `OpImageFetch` instructions instead.

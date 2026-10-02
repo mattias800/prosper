@@ -1719,6 +1719,72 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 }
         }
     }
+    if (version >= 67u) {
+        const auto read_float_flags = [&](FragmentFloatFlags& flags, FragmentLaunchRsrc1& raw) {
+            uint8_t available = 0, ieee = 0, dx10 = 0, raw_available = 0;
+            uint32_t raw_word = 0;
+            if (!r.u8(available) || !r.u8(ieee) || !r.u8(dx10) ||
+                !r.u8(raw_available) || !r.u32(raw_word) ||
+                available > 1u || ieee > 1u || dx10 > 1u ||
+                raw_available > 1u || (!raw_available && raw_word) ||
+                (!available && (ieee || dx10))) return false;
+            flags = {available != 0u, ieee != 0u, dx10 != 0u};
+            raw = {raw_available != 0u, raw_word};
+            return true;
+        };
+        uint32_t count = 0;
+        if (!r.u32(count) || count != c.draws.size()) {
+            error = "invalid realized-draw fragment float flags count";
+            return false;
+        }
+        for (auto& draw : c.draws)
+            if (!read_float_flags(draw.ps_float_flags, draw.ps_launch_rsrc1)) {
+                error = "invalid realized-draw fragment float flags";
+                return false;
+            }
+        if (!r.u32(count) || count != c.failure_diagnostics.size()) {
+            error = "invalid failed-draw fragment float flags count";
+            return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics)
+            if (!read_float_flags(diagnostic.ps_float_flags, diagnostic.ps_launch_rsrc1)) {
+                error = "invalid failed-draw fragment float flags";
+                return false;
+            }
+    }
+    if (version >= 68u) {
+        size_t expected = 0;
+        for (const auto& draw : c.draws) expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes) expected += compute.resources.resources.size();
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages) expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) { error = "invalid nested snapshot count"; return false; }
+        auto read_nested_snapshots = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                uint32_t width = 0;
+                if (!r.u32(width)) return false;
+                captured.resource.owned_nested_snapshot_bytes = width;
+                if (width && ((width != 16u && width != 32u) ||
+                              !valid_owned_raw_snapshot_shape(captured.resource, width) ||
+                              captured.captured_size < width)) return false;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_nested_snapshots(draw.vrt) || !read_nested_snapshots(draw.prt)) {
+                error = "invalid owned nested snapshot state"; return false;
+            }
+        for (auto& compute : c.computes)
+            if (!read_nested_snapshots(compute.resources)) {
+                error = "invalid owned nested snapshot state"; return false;
+            }
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_nested_snapshots(stage.resource_table)) {
+                    error = "invalid owned nested snapshot state"; return false;
+                }
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.

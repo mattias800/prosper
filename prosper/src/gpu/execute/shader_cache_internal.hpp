@@ -18,6 +18,7 @@
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // first-N-then-powers-of-two report throttling
@@ -113,6 +114,7 @@ struct ShaderResourceCompileKey {
     uint32_t sgpr_base = 0;
     uint32_t fetch_pc = 0;
     uint32_t nested_raw_snapshot_bytes = 0;
+    uint32_t owned_nested_snapshot_bytes = 0;
     uint32_t raw_register_snapshot_bytes = 0;
     uint32_t raw_offset_scalar_snapshot_bytes = 0;
     uint32_t raw_owned_wide_snapshot_bytes = 0;
@@ -170,6 +172,8 @@ struct ShaderCompileKey {
     bool fragment_wave32 = false;
     FragmentFloatMode fragment_float_mode{};
     FloatTransportConfig float_transport{};
+    FragmentFloatFlags fragment_float_flags{};
+    FragmentLaunchRsrc1 fragment_launch_rsrc1{};
     bool has_pcrel_dispatch = false;
     uint32_t pcrel_dispatch_target = UINT32_MAX;
     // Compute modules also depend on launch ABI shape. User SGPR VALUES are push constants and stay
@@ -237,6 +241,8 @@ struct ShaderCompileKey {
                fragment_wave32 == other.fragment_wave32 &&
                fragment_float_mode == other.fragment_float_mode &&
                float_transport == other.float_transport &&
+               fragment_float_flags == other.fragment_float_flags &&
+               fragment_launch_rsrc1 == other.fragment_launch_rsrc1 &&
                has_pcrel_dispatch == other.has_pcrel_dispatch &&
                pcrel_dispatch_target == other.pcrel_dispatch_target &&
                has_compute_config == other.has_compute_config &&
@@ -325,6 +331,11 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, key.fragment_float_mode.available);
         hash = hash_mix(hash, key.fragment_float_mode.value);
         hash = hash_mix(hash, static_cast<uint8_t>(key.float_transport.profile));
+        hash = hash_mix(hash, key.fragment_float_flags.available);
+        hash = hash_mix(hash, key.fragment_float_flags.ieee_mode);
+        hash = hash_mix(hash, key.fragment_float_flags.dx10_clamp);
+        hash = hash_mix(hash, key.fragment_launch_rsrc1.available);
+        hash = hash_mix(hash, key.fragment_launch_rsrc1.value);
         hash = hash_mix(hash, key.has_pcrel_dispatch);
         if (key.has_pcrel_dispatch) hash = hash_mix(hash, key.pcrel_dispatch_target);
         hash = hash_mix(hash, key.has_compute_config);
@@ -381,6 +392,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.sgpr_base);
             hash = hash_mix(hash, resource.fetch_pc);
             hash = hash_mix(hash, resource.nested_raw_snapshot_bytes);
+            hash = hash_mix(hash, resource.owned_nested_snapshot_bytes);
             hash = hash_mix(hash, resource.raw_register_snapshot_bytes);
             hash = hash_mix(hash, resource.raw_offset_scalar_snapshot_bytes);
             hash = hash_mix(hash, resource.raw_owned_wide_snapshot_bytes);
@@ -527,6 +539,8 @@ struct DecodedShader {
     std::vector<uint32_t> raw_offset_scalar_source_pcs;
     std::vector<uint32_t> raw_owned_wide_data_load_pcs;
     std::vector<uint32_t> raw_nested_wide_data_load_pcs;
+    std::vector<RawNestedWideChain> owned_nested_wide_chains;
+    std::vector<uint32_t> raw_nested_numeric_load_pcs;
     // Full-stream inventory: specialization may remove a spill but cannot introduce one.
     std::bitset<256> scalar_spill_written_vgprs;
     size_t source_dwords = 0;

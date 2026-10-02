@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# Guess NID names: sha1(name + Sony salt), first 8 bytes reversed, Sony b64, 11 chars.
-import hashlib, sys
+"""Guess NID names: sha1(name + Sony salt), first 8 bytes reversed, Sony b64, 11 chars.
+"""
+import hashlib
 
 SALT = bytes([0x51,0x8D,0x64,0xA6,0x35,0xDE,0xD8,0xC1,0xE6,0xB0,0x39,0xB1,0xC3,0xE5,0x52,0x30])
 A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-"

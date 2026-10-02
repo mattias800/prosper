@@ -1227,6 +1227,48 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         for (const auto& stage : diagnostic.stages)
             if (!write_transport(stage.recompile_config.float_transport)) return false;
     }
+    // v67: independently observed launch flags follow the complete v66 transport profile tail.
+    const auto write_float_flags = [&](FragmentFloatFlags flags, FragmentLaunchRsrc1 raw,
+                                       const char* message) {
+        if (!flags.canonical() || !raw.canonical()) { error = message; return false; }
+        w.u8(flags.available ? 1u : 0u);
+        w.u8(flags.ieee_mode ? 1u : 0u);
+        w.u8(flags.dx10_clamp ? 1u : 0u);
+        w.u8(raw.available ? 1u : 0u);
+        w.u32(raw.value);
+        return true;
+    };
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws)
+        if (!write_float_flags(draw.ps_float_flags, draw.ps_launch_rsrc1,
+                               "invalid realized-draw fragment float flags")) return false;
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics)
+        if (!write_float_flags(diagnostic.ps_float_flags, diagnostic.ps_launch_rsrc1,
+                               "invalid failed-draw fragment float flags")) return false;
+    // v68: per-resource nested obligation; the official v1..v67 prefix is unchanged.
+    w.u32(static_cast<uint32_t>(sample_resource_count));
+    auto write_nested_snapshots = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources) {
+            const auto& resource = captured.resource;
+            const uint32_t width = resource.owned_nested_snapshot_bytes;
+            if (width && ((width != 16u && width != 32u) ||
+                          !valid_owned_raw_snapshot_shape(resource, width) ||
+                          captured.captured_size < width)) {
+                error = "invalid owned nested snapshot obligation";
+                return false;
+            }
+            w.u32(width);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_nested_snapshots(draw.vrt) || !write_nested_snapshots(draw.prt)) return false;
+    for (const auto& compute : c.computes)
+        if (!write_nested_snapshots(compute.resources)) return false;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (!write_nested_snapshots(stage.resource_table)) return false;
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

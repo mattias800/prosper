@@ -1,8 +1,12 @@
-# gdb -p PID -batch -x probe232z.py — issue #232:
-# 1) read the parked FAsyncLoadingThread2 (ALT) thread's regs/stack to recover `this`,
-#    then dump async-loading counters + package-state histogram.
-# 2) sample the GameThread (thread 1) 40x for a guest-RA histogram of its tick phase.
-import gdb, struct, time, threading
+"""gdb -p PID -batch -x probe232z.py — issue #232:
+1) read the parked FAsyncLoadingThread2 (ALT) thread's regs/stack to recover `this`,
+   then dump async-loading counters + package-state histogram.
+2) sample the GameThread (thread 1) 40x for a guest-RA histogram of its tick phase.
+"""
+import gdb
+import struct
+import time
+import threading
 from collections import Counter
 
 gdb.execute("set pagination off")
@@ -118,7 +122,7 @@ else:
 
 # --- part 2: GameThread RA histogram ---
 hist = Counter()
-for i in range(40):
+for _i in range(40):
     for t in inf.threads():
         if t.num == 1:
             t.switch()

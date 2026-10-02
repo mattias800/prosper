@@ -52,8 +52,8 @@ REF_PREFIX = 'refs/worktree/prosper-stash'
 MSG_TAG = 'wt_stash'
 HOOK_MARKER = '# prosper wt_stash refs/stash guard (tools/wt_stash.py install-hook)'
 
-HOOK_BODY = '''#!/bin/sh
-{marker}
+HOOK_BODY = f'''#!/bin/sh
+{HOOK_MARKER}
 #
 # Refuses any update to refs/stash. refs/stash is shared by every worktree in this repository, so
 # two concurrent agents stashing in their own worktrees collide on one LIFO stack and pop each
@@ -84,7 +84,7 @@ echo "    python3 prosper/tools/wt_stash.py push -m 'why' [PATH ...]" >&2
 echo "    python3 prosper/tools/wt_stash.py pop" >&2
 echo "  One-off bypass: git -c core.hooksPath=/dev/null stash ..." >&2
 exit 1
-'''.format(marker=HOOK_MARKER)
+'''
 
 
 class Fail(Exception):
@@ -106,11 +106,11 @@ def git_rc(*args, cwd=None):
 
 def slot_ref(slot):
     if not slot or slot.startswith('-') or '..' in slot or slot.endswith('/'):
-        raise Fail('bad slot name: {!r}'.format(slot))
-    ref = '{}/{}'.format(REF_PREFIX, slot)
+        raise Fail(f'bad slot name: {slot!r}')
+    ref = f'{REF_PREFIX}/{slot}'
     rc, _, err = git_rc('check-ref-format', ref)
     if rc != 0:
-        raise Fail('bad slot name: {!r} ({})'.format(slot, err.strip()))
+        raise Fail(f'bad slot name: {slot!r} ({err.strip()})')
     return ref
 
 
@@ -138,7 +138,7 @@ def encode_message(slot, note, paths):
     Stored in the commit rather than beside the ref because a ref carries no metadata, and a
     sidecar file would be one more thing that can go missing between push and pop.
     """
-    lines = ['{} slot={}'.format(MSG_TAG, slot)]
+    lines = [f'{MSG_TAG} slot={slot}']
     if note:
         lines.append('note: ' + note.replace('\n', ' '))
     lines.append('')
@@ -161,7 +161,7 @@ def decode_paths(sha):
 def describe(sha):
     subject = git('log', '-1', '--format=%s', sha).strip()
     when = git('log', '-1', '--format=%ci', sha).strip()
-    return '{}  {}  {}'.format(sha[:12], when, subject)
+    return f'{sha[:12]}  {when}  {subject}'
 
 
 # --- subcommands ---------------------------------------------------------------------------
@@ -173,9 +173,9 @@ def cmd_push(args):
     if existing:
         # Refusing beats stacking. A stack is what makes refs/stash losable, and an overwrite here
         # would reproduce the very failure this tool exists to remove.
-        raise Fail('slot {!r} is already occupied by {}\n'
+        raise Fail(f'slot {args.slot!r} is already occupied by {describe(existing)}\n'
                    '  pop or drop it first, or use --slot with another name'
-                   .format(args.slot, describe(existing)))
+                   )
 
     untracked = [ln for ln in git('ls-files', '--others', '--exclude-standard').splitlines() if ln]
     if untracked and not args.allow_untracked:
@@ -217,8 +217,8 @@ def cmd_push(args):
             except OSError:
                 pass
 
-    print('parked {} at {}'.format(sha[:12], ref))
-    print('  restore with: python3 prosper/tools/wt_stash.py pop --slot {}'.format(args.slot))
+    print(f'parked {sha[:12]} at {ref}')
+    print(f'  restore with: python3 prosper/tools/wt_stash.py pop --slot {args.slot}')
     return 0
 
 
@@ -229,9 +229,9 @@ def _restore(sha):
         return paths
     rc, out, err = git_rc('stash', 'apply', sha)
     if rc != 0:
-        raise Fail('could not apply {}: {}\n'
+        raise Fail(f'could not apply {sha[:12]}: {(err or out).strip()}\n'
                    '  the slot is intact -- resolve the conflict and retry'
-                   .format(sha[:12], (err or out).strip()))
+                   )
     return []
 
 
@@ -239,10 +239,10 @@ def cmd_apply(args):
     ref = slot_ref(args.slot)
     sha = resolve(ref)
     if not sha:
-        raise Fail('no such slot: {!r}'.format(args.slot))
+        raise Fail(f'no such slot: {args.slot!r}')
     paths = _restore(sha)
     print('restored {} from {}{}'.format(sha[:12], ref,
-                                         ' ({} path(s))'.format(len(paths)) if paths else ''))
+                                         f' ({len(paths)} path(s))' if paths else ''))
     return 0
 
 
@@ -250,12 +250,12 @@ def cmd_pop(args):
     ref = slot_ref(args.slot)
     sha = resolve(ref)
     if not sha:
-        raise Fail('no such slot: {!r}'.format(args.slot))
+        raise Fail(f'no such slot: {args.slot!r}')
     paths = _restore(sha)
     git('update-ref', '-d', ref, sha)
     print('restored {} from {}{} and dropped the slot'
-          .format(sha[:12], ref, ' ({} path(s))'.format(len(paths)) if paths else ''))
-    print('  the snapshot commit {} stays reachable until git gc'.format(sha))
+          .format(sha[:12], ref, f' ({len(paths)} path(s))' if paths else ''))
+    print(f'  the snapshot commit {sha} stays reachable until git gc')
     return 0
 
 
@@ -263,10 +263,10 @@ def cmd_drop(args):
     ref = slot_ref(args.slot)
     sha = resolve(ref)
     if not sha:
-        raise Fail('no such slot: {!r}'.format(args.slot))
+        raise Fail(f'no such slot: {args.slot!r}')
     git('update-ref', '-d', ref, sha)
-    print('dropped {} -> {}'.format(ref, sha))
-    print('  recover with: git update-ref {} {}'.format(ref, sha))
+    print(f'dropped {ref} -> {sha}')
+    print(f'  recover with: git update-ref {ref} {sha}')
     return 0
 
 
@@ -279,7 +279,7 @@ def cmd_list(args):
     here = _slots_in(None)
     if here:
         for ref, sha in here:
-            print('{}  {}'.format(ref, describe(sha)))
+            print(f'{ref}  {describe(sha)}')
     else:
         print('(no slots in this worktree)')
     if not args.all:
@@ -301,7 +301,7 @@ def cmd_list(args):
             continue
         for ref, sha in slots:
             found = True
-            print('  {}  {}  {}'.format(path, ref, describe(sha)))
+            print(f'  {path}  {ref}  {describe(sha)}')
     if not found:
         print('  (none)')
     return 0
@@ -333,8 +333,8 @@ def cmd_check(args):
         print('shared refs/stash is empty -- nothing to collide with')
         return 0
     branch = current_branch()
-    print('shared refs/stash holds {} entry/entries (visible from EVERY worktree):'
-          .format(len(entries)))
+    print(f'shared refs/stash holds {len(entries)} entry/entries (visible from EVERY worktree):'
+          )
     foreign = []
     for line in entries:
         sel, _, subject = line.partition('|')
@@ -350,10 +350,10 @@ def cmd_check(args):
         print('  {:<12} {:<15} on {:<28} {}'
               .format(sel, verdict, owner or '(unknown)', subject))
     if not foreign:
-        print('every entry was created on this worktree\'s branch ({})'.format(branch))
+        print(f'every entry was created on this worktree\'s branch ({branch})')
         return 0
     print('')
-    print('{} entry/entries on the shared stack were not created here.'.format(len(foreign)))
+    print(f'{len(foreign)} entry/entries on the shared stack were not created here.')
     print('Do NOT `git stash pop`: it takes the TOP of the stack, which may be another lane\'s')
     print('work, and drops their entry in the process (#3174).')
     print('Park your own changes with: python3 prosper/tools/wt_stash.py push')
@@ -374,9 +374,9 @@ def _hook_path():
     """
     configured = git('config', '--default', '', '--get', 'core.hooksPath').strip()
     if configured:
-        raise Fail('core.hooksPath is set to {!r}; this installer only manages the default '
+        raise Fail(f'core.hooksPath is set to {configured!r}; this installer only manages the default '
                    'hooks directory. Install the hook there by hand, or unset the config.'
-                   .format(configured))
+                   )
     tried = []
     for fmt in ('relative', 'absolute'):
         rc, out, _ = git_rc('rev-parse', '--path-format=' + fmt, '--git-common-dir')
@@ -419,14 +419,14 @@ def _hook_is_live():
 def cmd_install_hook(args):
     path = _hook_path()
     if os.path.exists(path):
-        with open(path, 'r', encoding='utf-8', errors='replace', newline='') as fh:
+        with open(path, encoding='utf-8', errors='replace', newline='') as fh:
             existing = fh.read()
         if HOOK_MARKER in existing:
-            print('already installed: {}'.format(path))
+            print(f'already installed: {path}')
             return 0
         if not args.force:
-            raise Fail('a different reference-transaction hook already exists at {}\n'
-                       '  refusing to overwrite it; merge by hand or pass --force'.format(path))
+            raise Fail(f'a different reference-transaction hook already exists at {path}\n'
+                       '  refusing to overwrite it; merge by hand or pass --force')
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # newline='' -- text mode otherwise translates every '\n' to os.linesep, so on Windows the
     # hook lands with CRLF endings and the shell running it sees a stray CR inside every token
@@ -438,11 +438,11 @@ def cmd_install_hook(args):
     live = _hook_is_live()
     if live is False:
         os.remove(path)
-        raise Fail('wrote {} but git did not honour it -- a sentinel refs/stash write went '
+        raise Fail(f'wrote {path} but git did not honour it -- a sentinel refs/stash write went '
                    'through anyway. The hook has been removed again rather than left there '
                    'reading as protection. Park changes with `wt_stash.py push` instead.'
-                   .format(path))
-    print('installed {}'.format(path))
+                   )
+    print(f'installed {path}')
     if live is None:
         print('  NOT verified: refs/stash is already occupied (or HEAD is unborn), so the')
         print('  sentinel check was skipped rather than raced against somebody else\'s entry.')
@@ -456,14 +456,14 @@ def cmd_install_hook(args):
 def cmd_uninstall_hook(args):
     path = _hook_path()
     if not os.path.exists(path):
-        print('not installed: {}'.format(path))
+        print(f'not installed: {path}')
         return 0
-    with open(path, 'r', encoding='utf-8', errors='replace', newline='') as fh:
+    with open(path, encoding='utf-8', errors='replace', newline='') as fh:
         existing = fh.read()
     if HOOK_MARKER not in existing:
-        raise Fail('{} was not written by wt_stash; refusing to remove it'.format(path))
+        raise Fail(f'{path} was not written by wt_stash; refusing to remove it')
     os.remove(path)
-    print('removed {}'.format(path))
+    print(f'removed {path}')
     return 0
 
 
@@ -519,7 +519,7 @@ def main(argv):
     try:
         return args.func(args)
     except Fail as e:
-        print('wt_stash: {}'.format(e), file=sys.stderr)
+        print(f'wt_stash: {e}', file=sys.stderr)
         return 2
 
 

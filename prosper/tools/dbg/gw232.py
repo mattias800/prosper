@@ -1,5 +1,7 @@
-# gdb -p PID -batch -x gw232.py — dump per-thread host frame + guest return addresses (safe reads).
-import gdb, struct
+"""gdb -p PID -batch -x gw232.py — dump per-thread host frame + guest return addresses (safe reads).
+"""
+import gdb
+import struct
 
 inf = gdb.selected_inferior()
 

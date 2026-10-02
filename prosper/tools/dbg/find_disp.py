@@ -1,4 +1,5 @@
-# gdb -p PID -batch -x find_disp.py — break on the pool pop once, record disp to /root/disp.txt
+"""gdb -p PID -batch -x find_disp.py — break on the pool pop once, record disp to /root/disp.txt
+"""
 import gdb
 gdb.execute("set pagination off")
 gdb.execute("handle SIGSEGV SIGBUS SIGILL nostop pass noprint")

@@ -320,7 +320,7 @@ class InstallerTests(unittest.TestCase):
             def validation(*args, **kwargs):
                 nonlocal count
                 count += 1
-                if count == failing_call:
+                if count == failing_call:  # noqa: B023 -- called within this iteration
                     raise subprocess.CalledProcessError(1, args[0])
             with self.subTest(failing_call=failing_call), self.assertRaises(subprocess.CalledProcessError):
                 self.invoke(validation)

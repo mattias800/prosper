@@ -396,9 +396,10 @@ static std::vector<uint32_t> recompile_fragment_impl(
         uint32_t wave_size,
         RecompileDiagnosticContext diagnostic,
         FragmentFloatMode float_mode,
-        FragmentArithmeticObservation* arithmetic_observation, FloatTransportConfig float_transport) {
+        FragmentArithmeticObservation* arithmetic_observation, FloatTransportConfig float_transport,
+        FragmentFloatFlags float_flags) {
     if ((wave_size != 32 && wave_size != 64) || !float_mode.canonical() ||
-        !float_transport.canonical()) return {};
+        !float_transport.canonical() || !float_flags.canonical()) return {};
     std::vector<Rdna2Inst> ins;
     const size_t program_dwords = rdna2_walk(code, dwords, ins);
     // Unsupported scalar writes can replace launch MODE authority. Inspect the original stream
@@ -420,6 +421,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
     const auto original_raw_immediate_wide_data =
         rdna2_proven_raw_immediate_wide_data_loads(ins);
     const auto original_owned_raw_wide_data = rdna2_owned_raw_wide_data_loads(ins);
+    const auto original_owned_nested_wide = rdna2_owned_nested_wide_chains(ins);
     if (pcrel_dispatch_target != UINT32_MAX) {
         const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(code, dwords);
         if (!specialize_pcrel_dispatch(ins, dispatch, pcrel_dispatch_target)) {
@@ -484,6 +486,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
     SpirvCompute b;
     b.diagnostic = diagnostic;
     b.fragment_float_mode = float_mode;
+    b.fragment_float_flags = float_flags;
     b.float_transport = float_transport;
     b.fragment_program_hash = shader_program_hash(code, program_dwords);
     b.fragment_arithmetic_observation = arithmetic_observation;
@@ -524,6 +527,11 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // only in the CFG dispatcher: a shader emitted straight-line otherwise carries an empty set and
     // its SRT pointer load reaches the constant-buffer path and rejects the whole shader (#3616).
     seed_smem_pointer_provenance(rs, ins);
+    if (!retain_original_owned_nested_wide_proof(rs, original_owned_nested_wide)) {
+        log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",
+                                 "specialization lacks original nested wide source authority");
+        return {};
+    }
     if (!retain_original_owned_raw_wide_proof(rs, original_owned_raw_wide_data)) {
         log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",
                                  "specialization lacks original owned raw wide source authority");
@@ -678,11 +686,13 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          RecompileDiagnosticContext diagnostic,
                                          FragmentFloatMode float_mode,
                                          FragmentArithmeticObservation* arithmetic_observation,
-                                         FloatTransportConfig float_transport) {
+                                         FloatTransportConfig float_transport,
+                                         FragmentFloatFlags float_flags) {
     FragmentArithmeticObservation observation;
     auto result = recompile_fragment_impl(code, dwords, rt, system_inputs,
                                          pcrel_dispatch_target, interpolation,
-                                         wave32 ? 32u : 64u, diagnostic, float_mode, &observation, float_transport);
+                                         wave32 ? 32u : 64u, diagnostic, float_mode, &observation,
+                                         float_transport, float_flags);
     if (arithmetic_observation) *arithmetic_observation = observation;
     else observe_fragment_arithmetic(observation, diagnostic.program_address, !result.empty());
     return result;

@@ -10,6 +10,8 @@
 #pragma once
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/recompiler/fragment_float_mode.hpp"
+#include "gpu/recompiler/fragment_float_flags.hpp"
+#include "gpu/state/raster_launch_facts.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -52,6 +54,10 @@ struct ColorTargetState {
     bool in_mip_tail = false;
     uint32_t mip_tail_offset = 0, mip_tail_x = 0, mip_tail_y = 0;
 };
+
+// Complete physical extent of one supported native color view; zero means unproved. This
+// certificate is used before raw input snapshots, not a guess from a host image's linear size.
+uint64_t color_target_physical_bytes(const ColorTargetState& target);
 
 struct ColorTargetVolumeView {
     uint32_t selected_mip_depth = 0; // physical depth after selecting CB_COLORn_VIEW.MIP_LEVEL
@@ -109,6 +115,7 @@ struct PositionOutputState {
 };
 
 struct RenderState {
+    RasterLaunchFacts ps_raster_launch{};
     std::array<ColorTargetState, kColorTargetCount> color_targets{};
     PositionOutputState position_output{};
     // Shader program GPU addresses per stage (byte address; 0 if that stage's PGM regs were unset).
@@ -131,6 +138,8 @@ struct RenderState {
     uint32_t ps_input_addr = 0;
     bool ps_wave32 = false; // SPI_PS_IN_CONTROL.PS_W32_EN
     FragmentFloatMode ps_float_mode{};
+    FragmentFloatFlags ps_float_flags{};
+    FragmentLaunchRsrc1 ps_launch_rsrc1{};
 
     // Color MRT 0. format/number_type/comp_swap together select the VkFormat (see vk_translate).
     uint64_t color0_base        = 0;   // byte address (CB_COLOR0_BASE + BASE_EXT)

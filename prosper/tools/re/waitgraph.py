@@ -113,7 +113,7 @@ def main(paths):
 
     if unrecorded:
         print("\n=== not evidence: raw `address` waits, whose wakes this ring does not record ===")
-        for pthread, kind, obj, source in unrecorded:
+        for pthread, kind, obj, _source in unrecorded:
             print("  pthread=%-6s %-10s object=%s" % (pthread, kind, obj))
 
     # A condition slot is a recycled entry in a fixed 4096-slot array (sync_futex.cpp: a retired

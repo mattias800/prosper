@@ -14,7 +14,11 @@ Usage:
 Exit code: 0 = no repetition signature, 1 = repetition detected, 2 = not enough signal.
 Verdict thresholds are conservative; see REPEAT_SPIKE below.
 """
-import argparse, json, math, struct, sys
+import argparse
+import json
+import math
+import struct
+import sys
 
 # Spike = corr(block lag) - max(corr(neighbor lags)). Broken Messenger measures ~0.7 spike;
 # clean content measures near 0 (music self-similarity shows up at MUSICAL periods, which are

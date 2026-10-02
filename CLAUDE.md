@@ -494,6 +494,20 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   output capture fails, so redirect stdout **and** stderr to a file on the real disk, end with `exit 0`,
   read that file, and `rm -rf` scratch that is a day or more old. Leave `/tmp/claude-*` and anything
   touched in the last few hours alone — other agents are live.
+- **Behavior changes need meaningful regression coverage.** Add or extend a test that fails without
+  a behavioral bug fix, including verified review findings. New or changed HLE behavior needs
+  coverage for its established return codes and edge cases. Pure documentation and mechanical
+  changes use relevant checks when there is no behavior to assert; state the scope and any
+  verification limits in the PR. Never weaken an assertion to get green without explaining why.
+  Full rules: `prosper/tests/AGENTS.md`. PR descriptions may use
+  `.github/pull_request_template.md` (Context, Higher Goal, Acceptance Criteria, Out of Scope,
+  Summary of Changes, Verification), scaled to the change.
+  Optional project skills in `.claude/skills/`: `start-task` and `implement-hle-function`.
+  They preserve the task's existing authorization, resource coordination and machine-local rules.
+- **Python:** behavior changes need meaningful regression coverage, reusing applicable tests;
+  document mechanical scope and execution limits. New `.py` files need a purpose docstring;
+  ruff is gated on changed files only (`pyproject.toml`, uv).
+  `prosper/tools/ci/AGENTS.md` § Python rule.
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth
   **only with `--no-tests=error`** — plain `ctest` on a build directory with nothing registered prints
   `No tests were found!!!` and **exits 0**, so "no tests ran" and "everything passed" are the same
@@ -799,9 +813,12 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     happened to contain no image. Keep those short, and skip them when there is genuinely nothing a
     reader would enjoy; a blog nobody wants to read is worse than a thin one.
   - **Batch related work into one PR. A PR per commit is a real, measured cost to everyone.**
-    Every PR runs the **entire** CI matrix — `.github/workflows/ci.yml` carries **no `paths` or
-    `paths-ignore` filter**, so a one-line documentation change costs the same runner time as a
-    recompiler change, and the queue it sits in is shared with every other lane. Measured over the
+    Every PR that touches anything besides `*.md` or `assets/` runs the **entire** CI matrix —
+    `.github/workflows/ci.yml` carries **no `paths` or `paths-ignore` filter**, so a one-line code
+    or script change costs the same runner time as a recompiler change, and the queue it sits in is
+    shared with every other lane. Since #4116 its `changes` job skips only the four Windows/macOS
+    jobs on a PR whose diff is *purely* `*.md`/`assets/` — the Linux, sanitizer and Docs jobs
+    still run, and so does everything on `main` pushes and tags. Measured over the
     30 most recently merged PRs (2026-09-15): median **5** files, but **17% touched exactly one
     file** and **33% touched two or fewer**. Four of those five single-file PRs came from one
     session, and **three of them edited the same file within about an hour** — three full matrix

@@ -4,7 +4,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from member_fact_domains import PROPERTY, discover
+from member_fact_domains import PROPERTY
 
 DECLARATION = "add_executable(test_member_domain tests/local.cpp)\n"
 TEST = "add_test(NAME member_domain COMMAND test_member_domain)\n"
@@ -204,6 +204,30 @@ def run_tests(verbose: bool = False) -> int:
         files, _keys, roles = scan(root)
         check("symlink source refuses isolation while both file identities are collected",
               len(files) == 3 and roles and not roles[0].accepted and "without symlinks" in roles[0].reason)
+
+    # A root reached through a symlink must behave exactly like its canonical spelling (#4043).
+    # macOS gets this for free -- every temporary directory is /var -> /private/var -- but the arm
+    # builds the symlink BY HAND so it fails on any host, not only on the one that exposed it.
+    with tempfile.TemporaryDirectory() as td:
+        real, link = Path(td) / "real", Path(td) / "link"
+        real.mkdir()
+        link.symlink_to(real, target_is_directory=True)
+        tree(real, local=LOCAL + VALUE)
+        _f, canonical_keys, _r = scan(real.resolve())
+        files, keys, roles = scan(link)
+        check("symlinked root: role accepted and production report identical to canonical root",
+              len(roles) == 1 and roles[0].accepted and roles[0].source == "tests/local.cpp"
+              and PRODUCTION_KEY in keys and keys == canonical_keys
+              and link / "tests/local.cpp" in files, sorted(keys))
+        (real / "src/include.cpp").write_text('#include "../tests/local.cpp"\n', encoding="utf-8")
+        try:
+            _f, _k, roles = scan(link)
+            refused = (bool(roles) and not roles[0].accepted
+                       and "literal CPP inclusion: src/include.cpp" in roles[0].reason)
+        except ValueError as exc:  # the pre-fix shape: relative_to across the two spellings
+            refused, roles = False, [exc]
+        check("symlinked root: CPP-inclusion refusal names the file instead of raising", refused,
+              roles)
 
     if not bad:
         print(f"  [ok]   member-fact domains: {count} controls; declarations/writes, "

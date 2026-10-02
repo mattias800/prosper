@@ -698,7 +698,7 @@ def selftest() -> int:
     # every anonymous cursor shares. Keyed on the exact value libclang produces, because the failure
     # is a confident wrong edge rather than a crash: it made split_file.py refuse a correct plan.
     check("c:" in UNREFERENCEABLE_USRS, "the shared anonymous USR is excluded from the graph")
-    check(not ("c:@F@real_function" in UNREFERENCEABLE_USRS),
+    check("c:@F@real_function" not in UNREFERENCEABLE_USRS,
           "a real USR is not excluded by a prefix match")
 
     print("== PASS ==" if not bad else f"== FAIL: {bad} ==")

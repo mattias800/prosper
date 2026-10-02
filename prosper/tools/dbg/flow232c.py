@@ -1,6 +1,7 @@
-# gdb -p PID -batch -x flow232c.py — issue #232 session 6:
-# 1) at eboot+0x5044740 entry: rbp-chain backtrace (guest frames) + raw stack RA scan
-# 2) RTTI typeinfo names for this (vtable 0x408a46708) and media obj (vtable 0x4090757c0)
+"""gdb -p PID -batch -x flow232c.py — issue #232 session 6:
+1) at eboot+0x5044740 entry: rbp-chain backtrace (guest frames) + raw stack RA scan
+2) RTTI typeinfo names for this (vtable 0x408a46708) and media obj (vtable 0x4090757c0)
+"""
 import gdb
 
 EBOOT = 0x400000000
