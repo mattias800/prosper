@@ -4137,10 +4137,11 @@ endif()
       # First real rendered output: a VkPipeline whose topology/format come from a RenderState via
       # vk_translate, drawing a triangle (embedded placeholder SPIR-V), verified by pixel readback.
       # Includes a shared fixture, which resolves from the `tests` root.
-      prosper_add_gtest(test_vulkan_triangle
-        SOURCES tests/gpu/state/test_vulkan_triangle.cpp
-        INCLUDES tests
-        LIBRARIES prosper_core Vulkan::Vulkan)
+      add_executable(test_vulkan_triangle tests/gpu/state/test_vulkan_triangle.cpp)
+      # Includes a shared fixture, which resolves from the `tests` root.
+      target_include_directories(test_vulkan_triangle PRIVATE tests)
+      target_link_libraries(test_vulkan_triangle PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME vulkan_triangle_render COMMAND test_vulkan_triangle)
 
       # Execution-differential harness (verification layer 4): run a compute shader with known
       # inputs, assert numeric outputs. The RDNA2->SPIR-V recompiler's output will plug in here.

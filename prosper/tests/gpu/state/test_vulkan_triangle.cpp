@@ -6,7 +6,6 @@
 // window, pixels checked programmatically. The RDNA2->SPIR-V recompiler will later replace the
 // placeholder shaders; the fixed-function state already comes from the real register translation.
 #include <vulkan/vulkan.h>
-#include <gtest/gtest.h>
 #include "gpu/state/render_state.hpp"
 #include "gpu/state/vk_translate.hpp"
 #include "fixtures/spirv_triangle.h"
@@ -30,10 +29,11 @@ static uint32_t crc32(const uint8_t* p, size_t n) {
 static void maybe_dump_ppm(const uint8_t* px, uint32_t W, uint32_t H);
 
 static int fails = 0;
-#define CHECK(c, m) EXPECT_TRUE(c) << (m)
+#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
+                         else       { printf("  [ok]   %s\n", m); } } while (0)
 #define VKCHECK(e, m) CHECK((e) == VK_SUCCESS, m)
 
-TEST(VulkanTriangle, Contract) {
+int main() {
     printf("== test_vulkan_triangle ==\n");
     const uint32_t W = 64, H = 64;
 
@@ -54,10 +54,10 @@ TEST(VulkanTriangle, Contract) {
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
     VkInstance inst = VK_NULL_HANDLE;
     VKCHECK(vkCreateInstance(&ici, nullptr, &inst), "vkCreateInstance");
-    if (!inst) { printf("== FAIL: no instance ==\n"); FAIL() << "legacy early exit"; }
+    if (!inst) { printf("== FAIL: no instance ==\n"); return 1; }
 
     uint32_t ndev = 0; vkEnumeratePhysicalDevices(inst, &ndev, nullptr);
-    if (!ndev) { printf("== FAIL: no device ==\n"); FAIL() << "legacy early exit"; }
+    if (!ndev) { printf("== FAIL: no device ==\n"); return 1; }
     std::vector<VkPhysicalDevice> devs(ndev);
     vkEnumeratePhysicalDevices(inst, &ndev, devs.data());
     VkPhysicalDevice phys = devs[0];
@@ -69,7 +69,7 @@ TEST(VulkanTriangle, Contract) {
     vkGetPhysicalDeviceQueueFamilyProperties(phys, &nqf, qf.data());
     uint32_t qfi = UINT32_MAX;
     for (uint32_t i = 0; i < nqf; i++) if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { qfi = i; break; }
-    if (qfi == UINT32_MAX) { printf("== FAIL: no graphics queue ==\n"); FAIL() << "legacy early exit"; }
+    if (qfi == UINT32_MAX) { printf("== FAIL: no graphics queue ==\n"); return 1; }
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = qfi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
@@ -77,7 +77,7 @@ TEST(VulkanTriangle, Contract) {
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
     VkDevice dev = VK_NULL_HANDLE;
     VKCHECK(vkCreateDevice(phys, &dci, nullptr, &dev), "vkCreateDevice");
-    if (!dev) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
+    if (!dev) { printf("== FAIL ==\n"); return 1; }
     VkQueue queue; vkGetDeviceQueue(dev, qfi, 0, &queue);
 
     VkPhysicalDeviceMemoryProperties memp; vkGetPhysicalDeviceMemoryProperties(phys, &memp);
@@ -258,10 +258,9 @@ TEST(VulkanTriangle, Contract) {
     vkDestroyImage(dev, img, nullptr); vkFreeMemory(dev, imem, nullptr);
     vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr);
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
+    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
-    return;
-    EXPECT_EQ(fails, 0);
+    return 0;
 }
 
 static void maybe_dump_ppm(const uint8_t* px, uint32_t W, uint32_t H) {

@@ -135,6 +135,7 @@ tests/gpu/state/test_compute_overwrite_eviction.cpp
 tests/gpu/state/test_descriptor_array_render.cpp
 tests/gpu/state/test_fragment_float_flags.cpp
 tests/gpu/state/test_render_buffer_residency.cpp
+tests/gpu/state/test_vulkan_triangle.cpp
 tests/gpu/test_capture_trigger_file.cpp
 tests/gpu/test_descriptor_array_emit.cpp
 tests/gpu/test_gpu_timeline_capture_exit.cpp
