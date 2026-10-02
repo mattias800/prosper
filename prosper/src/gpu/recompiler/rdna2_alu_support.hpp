@@ -246,7 +246,9 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
             if (rs.vgpr_lane_slots.count(o.value) || rs.vgpr_lane_mask_slots.count(o.value)) {
                 if (ok) *ok = false; return b.uconst(0);
             }
-            auto it = rs.vreg.find(o.value); return it == rs.vreg.end() ? b.uconst(0) : it->second; }
+            auto it = rs.vreg.find(o.value);
+            if (it == rs.vreg.end() && b.is_fragment_packet() && ok) *ok = false;
+            return it == rs.vreg.end() ? b.uconst(0) : it->second; }
         case OperandKind::SGPR: {
             // Holding the ENTRY value of M0 as an opaque token (#3133). It is not data, and the
             // register's stale `sreg_input` word is not it either -- reading either here would be
@@ -321,6 +323,7 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
                 }
                 if (ok) *ok = false;
             }
+            if (b.is_fragment_packet() && ok) *ok = false;
             return b.uconst(0);
         }
         case OperandKind::InlineInt:   return b.uconst((uint32_t)o.value);

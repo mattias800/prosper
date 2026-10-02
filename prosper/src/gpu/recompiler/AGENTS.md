@@ -6,6 +6,16 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   makes it the cheapest thing in the stack to unit-test.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the
   translator: register state, control-flow structurization, and per-instruction lowering.
+- `rdna2_recompile_fragment_packet` — an owned 64-slot guest-fragment executor in a physical
+  64-worker compute workgroup. It directly uses the synchronized CFG services for whole-wave
+  votes, saved-mask reductions, READLANE and explicit logical-quad B64 WQM, then records raw EXP
+  metadata/payload instead of killing physical workers or writing a framebuffer. It is NOT a
+  raster fallback: missing
+  register/slot state, interpolation, FP arithmetic, image/memory effects and repeated exports
+  refuse transactionally. `fragment_packet_contract` evaluates actual emitted uint sinks from
+  project-owned packets; `spv_validate` emits this entry separately. No live DrawItem enters it.
+  Quad consumers additionally require the supplied consecutive-logical-quad topology tag; it grants
+  no raster packing/helper authority. B32 WQM and unsupported constant/forms remain named gaps.
 - `spirv_builder` — small hand-built SPIR-V modules. **These include shipped shaders**:
   `frontends/shared/live/live_compute.cpp`'s `prepare_compare_pipeline()` feeds
   `build_compute_compare_uvec4()` straight to `vkCreateShaderModule` on the live path. The GPU
