@@ -1123,6 +1123,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_sync_delete PRIVATE prosper_core)
   add_test(NAME sync_delete COMMAND test_sync_delete)
 
+  # lseek/fseek/ftell must address offsets >= 2 GiB. MinGW's long/off_t are 32 bits, so Black Flag's
+  # 30 GiB DataPS5_boot.forge allocation-table seek failed and the title aborted itself.
+  add_executable(test_large_offset_seek tests/hle/kernel/test_large_offset_seek.cpp)
+  target_link_libraries(test_large_offset_seek PRIVATE prosper_core)
+  target_include_directories(test_large_offset_seek PRIVATE src)
+  add_test(NAME large_offset_seek COMMAND test_large_offset_seek)
+
   # Empty PollSema returns the encoded EBUSY value that guest drain loops require (#1640).
   add_executable(test_kernel_sema_poll tests/hle/kernel/test_kernel_sema_poll.cpp)
   target_link_libraries(test_kernel_sema_poll PRIVATE prosper_core)

@@ -1124,8 +1124,29 @@ HLE(f_fwrite)  { if (!a3) return 0;
                           (const char*)P(a0), items * (size_t)a1,
                           gpu::GuestLogCaptureSource::Fwrite);
                   return (uint64_t)items; }
-HLE(f_fseek)   { return a0 ? (uint64_t)(int64_t)fseek((FILE*)P(a0), (long)a1, (int)a2) : -1; }
-HLE(f_ftell)   { return a0 ? (uint64_t)(int64_t)ftell((FILE*)P(a0)) : -1; }
+// MinGW's `long` and `off_t` are 32 bits, so fseek/ftell/lseek truncate or reject every offset at
+// or above 2 GiB. Titles that stream multi-gigabyte archives (Assassin's Creed Black Flag
+// Resynced's 30 GiB DataPS5_boot.forge) seek past that, so Windows uses the 64-bit CRT entry points.
+HLE(f_fseek) {
+    if (!a0) return (uint64_t)-1;
+#ifdef _WIN32
+    const int rc = _fseeki64((FILE*)P(a0), (__int64)a1, (int)a2);
+#else
+    const int rc = fseek((FILE*)P(a0), (long)a1, (int)a2);
+#endif
+    if (rc != 0 && filelog())
+        fprintf(stderr, "[file] fseek FAILED file=%p offset=0x%llx whence=%d errno=%d\n",
+                P(a0), (unsigned long long)a1, (int)a2, errno);
+    return (uint64_t)(int64_t)rc;
+}
+HLE(f_ftell) {
+    if (!a0) return (uint64_t)-1;
+#ifdef _WIN32
+    return (uint64_t)(int64_t)_ftelli64((FILE*)P(a0));
+#else
+    return (uint64_t)(int64_t)ftell((FILE*)P(a0));
+#endif
+}
 HLE(f_fgets)   { return (uint64_t)(uintptr_t)(a2 ? fgets((char*)P(a0), (int)a1, (FILE*)P(a2)) : nullptr); }
 HLE(f_fflush)  { return (uint64_t)(int64_t)fflush(a0 ? (FILE*)P(a0) : nullptr); }
 HLE(f_feof)    { return a0 ? (uint64_t)feof((FILE*)P(a0)) : 1; }
@@ -1600,7 +1621,13 @@ HLE(f_read)  { int fd = (int)a0; int64_t off = -1;
 #ifdef _WIN32
                ScopedCrtInvalidParameterHandler suppress_invalid_parameter;
 #endif
+#ifdef _WIN32
+               // Log-only, but a 32-bit lseek reports -1 for every position at or above 2 GiB, which
+               // made the Black Flag boot.forge reads look like they started at offset -1.
+               if (filelog() || fdlog_on()) off = (int64_t)::_lseeki64(fd, 0, SEEK_CUR);
+#else
                if (filelog() || fdlog_on()) off = (int64_t)::lseek(fd, 0, SEEK_CUR);
+#endif
                if (fdlog_on()) preadlog("read", a0, (uint64_t)off, a2);
                auto logged_return = [&](int64_t r) -> uint64_t {
                    readbytes_note_read(fd, r);
@@ -1671,7 +1698,12 @@ HLE(f_lseek) { if (fdlog_on() && ((int)a2 != SEEK_CUR || a1 != 0)) preadlog("lse
                if (windows_seek_directory((int)a0, (int64_t)a1, (int)a2, &directory_result))
                    return (uint64_t)directory_result;
 #endif
+#ifdef _WIN32
+               // 64-bit offset: MinGW's lseek takes a 32-bit off_t and cannot address a 30 GiB archive.
+               return (uint64_t)(int64_t)::_lseeki64((int)a0, (__int64)a1, (int)a2); }
+#else
                return (uint64_t)(int64_t)::lseek((int)a0, (off_t)a1, (int)a2); }
+#endif
 #ifndef _WIN32
 HLE(f_pread)  { preadlog("pread", a0, a3, a2); int64_t r = read_full((int)a0, P(a1), (size_t)a2, true, (off_t)a3);
                 readbytes_note_read((int)a0, r);
