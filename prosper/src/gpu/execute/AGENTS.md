@@ -52,8 +52,9 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   submit. `indirect_dispatch_stats()` counts the two routes without a log.
 - `gpu_dependency_graph` — ordering and dependencies between submitted work.
 - `fragment_packet_preparation` — consumed producing-draw entry and bounded resource identity for
-  the refused-draw raster collector. Physical USER_DATA presence and raw RSRC2 are observations,
-  not a launched SGPR count/mapping or system-parameter seed. Owned buffer bytes do not prove a
+  the refused-draw raster collector. A canonical source-associated RSRC2 count proves only the
+  consecutive PS user-SGPR prefix; missing physical words remain absent. The following system
+  SGPRs and M0/parameter state are not seeded from physical USER_DATA. Owned buffer bytes do not prove a
   guest fetch/read-point, producer epoch or image/sampler capability. Preparation retains named
   unmet obligations and never grants kernel, guest-wave, helper or output-commit admission.
 - `graphics_nested_wide_reader` — one-hop direct VS/PS numeric x4/x8 parent/child ownership.

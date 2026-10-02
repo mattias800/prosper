@@ -173,11 +173,27 @@ static void entry_preparation_controls(const DrawItem& draw, GpuState state, Own
         prepared->inputs->entry.rsrc2_available && prepared->inputs->entry.rsrc2 == 0,
         "real shipping preparation distinguishes present-zero USER_DATA/RSRC2 from absent word1");
     check(prepared && !prepared->ready &&
-        has_gap(*prepared,"packet-entry-userdata-required-set-and-mapping-unproved") &&
+        prepared->user_sgpr_count_available && prepared->user_sgpr_count == 0 &&
+        prepared->initial_user_sgprs.empty() &&
+        has_gap(*prepared,"packet-entry-system-sgprs-and-m0-unproved") &&
         has_gap(*prepared,"packet-logical64-composition-unproved") &&
         has_gap(*prepared,"packet-ordered-export-commit-unimplemented") &&
         !has_gap(*prepared,"packet-entry-ps-rsrc2-unavailable"),
-        "fully observed raw facts grant neither a launch ABI, logical wave nor commit");
+        "known count0 grants an empty user prefix, not system inputs, logical wave or commit");
+    auto prefix_state = state;
+    prefix_state.sh[P::SPI_SHADER_PGM_RSRC2_PS] = 17u << 1;
+    prefix_state.sh[P::SPI_SHADER_USER_DATA_PS_0 + 16] = 0x76543210u;
+    prefix_state.sh[P::SPI_SHADER_USER_DATA_PS_0 + 17] = 0xaaaaaaaa;
+    DrawItem prefix_draw;
+    const bool prefix_realized = realize_draw_item(prefix_state,&prefix_state.draws[0],6,64,false,
+                                                  prefix_draw,nullptr,true);
+    const auto prefix = prefix_realized ? prepare(prefix_draw) : nullptr;
+    check(prefix && prefix->user_sgpr_count_available && prefix->user_sgpr_count == 17 &&
+        prefix->initial_user_sgprs == std::vector<std::pair<uint32_t,uint32_t>>{{0,0},{16,0x76543210u}} &&
+        prefix->missing_user_sgprs == 0xfffeu && !prefix->ready &&
+        has_gap(*prefix,"packet-entry-user-sgpr-words-unavailable") &&
+        has_gap(*prefix,"packet-entry-system-sgprs-and-m0-unproved"),
+        "real producing join grants present s0/s16 only, never physical UD17 as system s17");
     state.sh.erase(P::SPI_SHADER_PGM_RSRC2_PS);
     state.sh.erase(P::SPI_SHADER_USER_DATA_PS_0);
     DrawItem absent;
@@ -191,7 +207,8 @@ static void entry_preparation_controls(const DrawItem& draw, GpuState state, Own
         "same cached shader gets fresh per-draw missing inputs without changing older observation");
     auto substituted = backend_contract(draw); substituted.set_fs({0xdeadbeefu});
     const auto bad_source = prosper::test::prepare_backend_fragment_packet_inputs(substituted);
-    check(bad_source && has_gap(*bad_source,"packet-producing-source-unavailable") && !bad_source->ready,
+    check(bad_source && has_gap(*bad_source,"packet-producing-source-unavailable") &&
+        !bad_source->user_sgpr_count_available && bad_source->initial_user_sgprs.empty() && !bad_source->ready,
         "actual backend shader replacement cannot borrow producing input authority");
 
     // Real registered metadata creates a PS resource table; no guest bytes are granted authority.
@@ -315,10 +332,12 @@ static void capture_entry_controls(const DrawItem& draw, Owners& owner) {
     }
     auto restored_backend = captured_backend_contract(replay.items[0],decoded.draws[0],decoded);
     const auto prepared = prosper::test::prepare_backend_fragment_packet_inputs(restored_backend);
-    check(prepared && prepared->inputs->entry.rsrc2_available &&
-        prepared->inputs->entry.user_data_available == 0x80000001u && !prepared->ready &&
-        !has_gap(*prepared,"packet-entry-ps-rsrc2-unavailable"),
-        "round-tripped present-zero state reaches actual shipping preparation without granting ABI");
+      check(prepared && prepared->inputs->entry.rsrc2_available &&
+          prepared->inputs->entry.user_data_available == 0x80000001u && !prepared->ready &&
+          prepared->user_sgpr_count_available && prepared->user_sgpr_count == 0 &&
+          prepared->initial_user_sgprs.empty() &&
+          !has_gap(*prepared,"packet-entry-ps-rsrc2-unavailable"),
+          "test-reconstructed v69 facts reach preparation with known empty prefix, not system ABI");
     // v69 is an append-only 4-byte count plus 159 bytes per draw; remove exactly that suffix.
     auto legacy = bytes; legacy.resize(legacy.size() - (4u + kGpuCaptureFragmentEntryRecordBytes));
     legacy[8] = 68; legacy[9] = legacy[10] = legacy[11] = 0;
