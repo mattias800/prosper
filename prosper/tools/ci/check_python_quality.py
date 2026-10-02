@@ -58,14 +58,25 @@ def ratchet_violations(path, base_count, head_count):
     return []
 
 
+def toplevel():
+    """The checkout root. Paths from `git diff` are relative to it, and ruff resolves a relative
+    `--stdin-filename` against its cwd only, so both ruff and file reads run from here: from a
+    subdirectory (ctest runs in the build tree) ruff would silently fall back to its defaults."""
+    out = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True
+    )
+    return Path(out.stdout.strip())
+
+
 def ruff(args, stdin=None):
-    """Run ruff from the dev environment; return the completed process."""
+    """Run ruff from the dev environment at the checkout root; return the completed process."""
     return subprocess.run(
         [sys.executable, "-m", "ruff", *args],
         input=stdin,
         capture_output=True,
         text=True,
         check=False,
+        cwd=toplevel(),
     )
 
 
@@ -99,8 +110,10 @@ def validate_ref(ref):
 
 
 def git(*args):
-    """Run git and return stdout, raising on failure."""
-    return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
+    """Run git at the checkout root and return stdout, raising on failure."""
+    return subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=True, cwd=toplevel()
+    ).stdout
 
 
 def parse_changes(out):
@@ -151,7 +164,7 @@ def check_added(path):
 def check_modified(path, base, base_path):
     """Ratchet for an existing file against its base version."""
     base_src = git("show", f"{base}:{base_path}")
-    head_src = Path(path).read_text(encoding="utf-8")
+    head_src = (toplevel() / path).read_text(encoding="utf-8")
     return ratchet_violations(path, count_findings(base_src, path), count_findings(head_src, path))
 
 
