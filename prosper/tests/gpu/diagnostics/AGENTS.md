@@ -31,5 +31,8 @@ rather than assumed. See `src/gpu/diagnostics/AGENTS.md` for the instruments the
 - Removing only the v62 resource count and v61 fragment ABI tail did not create a v60
   fixture after the initial v63 owned resource count. The Linux replay CLI contract rejected that
   malformed payload before reaching the unknown-ABI report. The current owned count is v65 after
-  official v64 FLOAT_MODE and v63 draw-width records; remove all five appended tails and validate
-  the exact v60 parse, preserved raw words and unavailable fragment ABI before writing it (#3987).
+  official v64 FLOAT_MODE and v63 draw-width records. Current v67 additionally appends v66 transport
+  and v67 launch flags/full RSRC1 evidence: pin the exact seven-tail suffix before removing it, then
+  validate the v60 parse, preserved raw words and unavailable ABI/MODE/flags/raw register before
+  writing it. A stale v66 assertion in the fixture generator failed the full Linux CLI contract
+  before any fixture-backed tool controls ran (#3987, #4113).
