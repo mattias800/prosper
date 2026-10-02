@@ -5,7 +5,9 @@ Scans tests/ and frontends/**/tests/ for .cpp files defining `int main(`. Files 
 tools/ci/gtest_legacy_allowlist.txt predate the policy and are tolerated until migrated.
 A listed file that no longer has main() must be removed from the list (the list only shrinks).
 
-Usage: check_gtest_policy.py [--root DIR] [--selftest]
+Usage: check_gtest_policy.py [--selftest]
+
+The scanned root is always the checkout this script lives in; it takes no path argument.
 """
 import re
 import sys
@@ -44,7 +46,7 @@ def selftest():
 def main():
     if "--selftest" in sys.argv:
         selftest()
-    root = Path(sys.argv[sys.argv.index("--root") + 1]) if "--root" in sys.argv else Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[2]
     lst = root / "tools/ci/gtest_legacy_allowlist.txt"
     allow = {l.strip() for l in lst.read_text().splitlines() if l.strip() and not l.startswith("#")}
     errs = check(scan(root), allow)

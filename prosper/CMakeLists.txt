@@ -486,7 +486,7 @@ if(Python3_Interpreter_FOUND)
   # New tests must use GoogleTest (prosper_add_gtest); hand-rolled main() files are allowlisted legacy.
   add_test(NAME gtest_policy
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_gtest_policy.py"
-                   --selftest --root "${CMAKE_SOURCE_DIR}")
+                   --selftest)
   add_test(NAME ctest_gate_checker
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_ctest_gate.py"
                    --selftest)
