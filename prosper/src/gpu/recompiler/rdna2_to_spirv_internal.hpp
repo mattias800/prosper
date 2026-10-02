@@ -926,7 +926,7 @@ struct SpirvCompute {
     uint32_t ds_bpermute_b32(uint32_t address, uint32_t value,
                              uint32_t active, uint32_t offset,
                              uint32_t event = 0) {
-        // RDNA2 ISA 12.13.3: ADDR is a byte address and BPERMUTE gathers DATA0 backward from
+        // RDNA2 ISA 10.4.4: ADDR is a byte address and BPERMUTE gathers DATA0 backward from
         // ((ADDR + OFFSET) >> 2) & 31 within each independent 32-lane half. Addition is deliberately
         // performed before the shift so uint32 overflow and unaligned byte addresses match hardware.
         mark_subgroup_min32();
@@ -948,6 +948,10 @@ struct SpirvCompute {
         }
         return sel(valid, shuffled, uconst(0));
     }
+    // Called only at the portable compute dispatcher's common Workgroup rendezvous.
+    uint32_t portable_ds_bpermute_b32(uint32_t address, uint32_t value,
+                                      uint32_t active, uint32_t offset,
+                                      uint32_t event, uint32_t metadata_base);
     uint32_t subgroup_permlane16(uint32_t value, uint32_t selectors_lo,
                                 uint32_t selectors_hi, bool across_rows,
                                 uint32_t* source_lane_out = nullptr) {

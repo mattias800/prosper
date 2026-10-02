@@ -2249,8 +2249,8 @@ bool emit_cfg_state_machine(
                 start_set.insert(ins[i + 1].pc);
         }
         if (in.fmt == Rdna2Format::DS && in.opcode == kDsOpcodeBpermuteB32) {
-            if (!b.is_compute || in.ds_gds || !b.native_subgroup_size ||
-                b.native_subgroup_size != b.wave_size)
+            if (!b.is_compute || in.ds_gds ||
+                (b.native_subgroup_size && b.native_subgroup_size != b.wave_size))
                 return reject_cfg(in.pc, "ds-bpermute-native-wave-contract");
             bpermute_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(bpermute_event_for_pc.size() + 1));
@@ -2392,13 +2392,15 @@ bool emit_cfg_state_machine(
         !b.native_subgroup_size && !compute_dpp_row_ror8_pcs.empty();
     const bool has_portable_compute_dpp =
         has_portable_compute_dpp_add || has_portable_compute_dpp_ror8;
-    // Portable DPP needs a full-width value beside an event/EXEC word for every invocation. The
-    // first plane remains reusable by MBCNT/votes after DPP's trailing barrier; only shaders that
-    // actually contain this event pay for the second plane.
+    const bool has_portable_compute_bpermute =
+        !b.native_subgroup_size && !bpermute_event_for_pc.empty();
+    // Portable gathers need a full-width value beside an event/EXEC word for every invocation.
+    // The first plane remains reusable by MBCNT/votes after each service's trailing barrier.
     const uint32_t dpp_value_base = 0;
     const uint32_t dpp_metadata_base = padded_lanes;
     const uint32_t wave_result_base = padded_lanes +
-        ((has_portable_compute_dpp || !portable_readfirstlane_event_for_pc.empty())
+        ((has_portable_compute_dpp || has_portable_compute_bpermute ||
+          !portable_readfirstlane_event_for_pc.empty())
              ? padded_lanes : 0u);
     const uint32_t group_active_slot = wave_result_base + wave_count;
     if (b.is_compute && !direct_dispatch &&
@@ -5471,11 +5473,11 @@ bool emit_cfg_state_machine(
         if (bpermute) {
             const auto event = bpermute_event_for_pc.find(bpermute->pc);
             if (event == bpermute_event_for_pc.end() || !b.is_compute ||
-                bpermute->ds_gds || !b.native_subgroup_size ||
-                b.native_subgroup_size != b.wave_size)
+                bpermute->ds_gds ||
+                (b.native_subgroup_size && b.native_subgroup_size != b.wave_size))
                 return reject_cfg(bpermute->pc, "ds-bpermute-native-wave-contract");
             // Publish lane-local operands in the selected case. The actual gathers run after the
-            // switch merge, where every subgroup invocation participates in uniform control flow.
+            // switch merge, where every physical invocation participates in uniform control flow.
             const auto address = state.vreg.find(bpermute->src[0].value);
             const auto source = state.vreg.find(bpermute->src[1].value);
             b.store_function(bpermute_pending_var, yes);
@@ -6071,11 +6073,17 @@ bool emit_cfg_state_machine(
         const uint32_t pending = b.load_function(b.t_bool, bpermute_pending_var);
         const uint32_t active = b.load_function(b.t_bool, bpermute_active_var);
         const uint32_t event = b.load_function(b.t_u32, bpermute_event_var);
-        const uint32_t result = b.ds_bpermute_b32(
-            b.load_function(b.t_u32, bpermute_address_var),
-            b.load_function(b.t_u32, bpermute_source_var),
-            b.land(pending, active),
-            b.load_function(b.t_u32, bpermute_offset_var), event);
+        const uint32_t result = has_portable_compute_bpermute
+            ? b.portable_ds_bpermute_b32(
+                b.load_function(b.t_u32, bpermute_address_var),
+                b.load_function(b.t_u32, bpermute_source_var),
+                b.land(pending, active),
+                b.load_function(b.t_u32, bpermute_offset_var), event, dpp_metadata_base)
+            : b.ds_bpermute_b32(
+                b.load_function(b.t_u32, bpermute_address_var),
+                b.load_function(b.t_u32, bpermute_source_var),
+                b.land(pending, active),
+                b.load_function(b.t_u32, bpermute_offset_var), event);
         const uint32_t dst = b.load_function(b.t_u32, bpermute_dst_var);
         const uint32_t write = b.land(pending, active);
         for (const auto& kv : vv) {
@@ -7215,6 +7223,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02;
         });
+    const bool portable_compute_bpermute = b.is_compute && !b.native_subgroup_size &&
+        std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+            return in.fmt == Rdna2Format::DS && in.opcode == kDsOpcodeBpermuteB32;
+        });
     const auto append_emitter_only_end = [](std::vector<Rdna2Inst>& region, uint32_t pc) {
         Rdna2Inst end;
         end.pc = pc;
@@ -7237,7 +7249,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         const BarrierPhasedCompute phased = analyze_barrier_phased_compute(ins);
         if (phased.found &&
             (phased.guarded || initial_dispatch_active || force_barrier_phases ||
-             portable_compute_mask_reduction || portable_compute_readfirstlane)) {
+             portable_compute_mask_reduction || portable_compute_readfirstlane ||
+             portable_compute_bpermute)) {
             // Every phase shares one immutable Workgroup OpTypeArray. Size it from the complete
             // phased stream before the first dispatcher: a later portable DPP operation needs a
             // second per-lane plane even when the earlier phase needed only votes/liveness.
@@ -7254,7 +7267,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             dpp_row_ror8_op(in) != DppRowRor8Op::None;
                     });
                 const uint32_t scratch_dwords = padded_lanes +
-                    ((has_portable_dpp || portable_compute_readfirstlane) ? padded_lanes : 0u) +
+                    ((has_portable_dpp || portable_compute_readfirstlane ||
+                      portable_compute_bpermute) ? padded_lanes : 0u) +
                     wave_count + 1;
                 if (!b.declare_cfg_scratch(scratch_dwords)) return false;
             }
@@ -7267,7 +7281,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 std::vector<Rdna2Inst> prefix(
                     ins.begin(), ins.begin() + phased.guard_index);
                 const bool portable_service_prefix = !b.native_subgroup_size &&
-                    (portable_compute_mask_reduction || portable_compute_readfirstlane);
+                    (portable_compute_mask_reduction || portable_compute_readfirstlane ||
+                     portable_compute_bpermute);
                 if (!prefix.empty() && portable_service_prefix) {
                     // The uniform guard prefix is a complete region too. A common wave service
                     // needs a dispatcher end block even though the real END follows the body.
@@ -7362,9 +7377,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             b, rs, ins, safe, rt, allow_exec_update, allow_smem,
             exp_fn, code, dwords, initial_dispatch_active, true);
     if (allow_cfg_dispatcher &&
-        (portable_compute_mask_reduction || portable_compute_readfirstlane) &&
+        (portable_compute_mask_reduction || portable_compute_readfirstlane ||
+         portable_compute_bpermute) &&
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) { return in.is_end; })) {
-        // Do this before the counted-loop prefix can narrow EXEC: its scalar reductions need
+        // Do this before the counted-loop prefix can narrow EXEC: portable wave services need
         // a common host barrier site, not an invocation-local structured loop body.
         if (std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
                 return in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a;
