@@ -3830,15 +3830,6 @@ endif()
       add_executable(vkprobe tools/vkprobe/vkprobe.cpp)
       target_link_libraries(vkprobe PRIVATE Vulkan::Vulkan)
 
-      # vkval_sync_probe (#3248): the positive control for `vk_validation_scan.py --sync`. It
-      # commits one deliberate write-after-write so the scanner can prove SYNCHRONIZATION validation
-      # is armed before reporting a sync verdict -- loading the layer proves only that CORE checks
-      # run, and a sync setting the layer version does not recognise produces exactly the output of
-      # a clean sync run. Deliberately NOT registered as a ctest: it exists to be invalid, and the
-      # gate it feeds fails on any hazard the ledger does not carry.
-      add_executable(vkval_sync_probe tools/vkval/sync_probe.cpp)
-      target_link_libraries(vkval_sync_probe PRIVATE Vulkan::Vulkan)
-
       # Local-only realized-submit replayer (#514): no guest boot, reads a versioned capture whose game
       # data remains gitignored, renders it through the same live backend, and checks the captured hash.
       add_executable(gpu_replay tools/gpu_replay/gpu_replay.cpp)
@@ -4872,6 +4863,15 @@ endif()
 endif()
 
 if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
+  # vkval_sync_probe (#3248): the positive control for `vk_validation_scan.py --sync`. It
+  # commits one deliberate write-after-write so the scanner can prove SYNCHRONIZATION validation
+  # is armed before reporting a sync verdict -- loading the layer proves only that CORE checks
+  # run, and a sync setting the layer version does not recognise produces exactly the output of
+  # a clean sync run. Deliberately NOT registered as a ctest: it exists to be invalid, and the
+  # gate it feeds fails on any hazard the ledger does not carry.
+  add_executable(vkval_sync_probe tools/vkval/sync_probe.cpp)
+  target_link_libraries(vkval_sync_probe PRIVATE Vulkan::Vulkan)
+
   # Interpolation: a recompiled VS exports EXP PARAM0, a recompiled PS reads it via v_interp.
   add_executable(test_interp_render tests/gpu/recompiler/test_interp_render.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
