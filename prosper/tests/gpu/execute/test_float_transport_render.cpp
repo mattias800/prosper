@@ -172,7 +172,25 @@ int main(int argc,char** argv) {
                 uint8_t(exponent==255?255:0),uint8_t(fraction?255:0),uint8_t(bits>>31?255:0)};
             const bool nan=exponent==255 && fraction;
             bool correct=true;
-            for(size_t i=0;i<pixels.size();i+=4) for(unsigned c=0;c<(nan?3u:4u);++c) correct &= pixels[i+c]==expected[c];
+            size_t first_bad=SIZE_MAX;
+            unsigned first_channel=0,bad_pixels=0;
+            for(size_t i=0;i<pixels.size();i+=4) {
+                bool pixel_correct=true;
+                for(unsigned c=0;c<(nan?3u:4u);++c) if(pixels[i+c]!=expected[c]) {
+                    if(first_bad==SIZE_MAX) {first_bad=i;first_channel=c;}
+                    pixel_correct=false;
+                }
+                if(!pixel_correct) {correct=false;++bad_pixels;}
+            }
+            if(!correct) {
+                std::printf("  transport mismatch: route=%s bits=0x%08x pixel=%zu,%zu channel=%u "
+                            "actual=%u,%u,%u,%u expected=%u,%u,%u,%u bad-pixels=%u/256\n",
+                    use_input?"flat-input":"raw-u32",bits,(first_bad/4)%16,(first_bad/4)/16,
+                    first_channel,unsigned(pixels[first_bad]),unsigned(pixels[first_bad+1]),
+                    unsigned(pixels[first_bad+2]),unsigned(pixels[first_bad+3]),
+                    unsigned(expected[0]),unsigned(expected[1]),unsigned(expected[2]),
+                    unsigned(expected[3]),bad_pixels);
+            }
             check(correct,"actual raw/Input class and signed-zero colors match independent integer oracle");++draws;
         }
     }

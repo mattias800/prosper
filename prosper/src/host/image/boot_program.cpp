@@ -4,10 +4,12 @@
 #include "host/image/boot_program.hpp"
 #include "host/image/module_path_policy.hpp"
 #include "host/image/module_start_params.hpp"
+#include "host/symbols/il2cpp_symbols.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <optional>
 #include <set>
 #include <system_error>
 #include <vector>
@@ -314,7 +316,12 @@ std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
 
 bool boot_program(const std::string& d, Program& p, std::string* err,
                   const std::function<void()>& after_hle_registered) {
-    auto fail = [&](const std::string& m) { if (err) *err = m; return false; };
+    il2cpp::clear_symbol_table();
+    auto fail = [&](const std::string& m) {
+        il2cpp::publish_loaded_module_bounds(std::nullopt);
+        if (err) *err = m;
+        return false;
+    };
 
     // Diagnostics: record boot start.
     diagnostics::record_boot_phase(diagnostics::BootPhase::PROCESS_START);
@@ -369,6 +376,14 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
 
     set_app0_root(d);
     for (auto& img : p.imgs) if (!map_image(img, &e)) return fail("map failed: " + e);
+    std::optional<il2cpp::LoadedModuleBounds> il2cpp_bounds;
+    for (const auto& img : p.imgs) {
+        if (img.base == BOOT_IL2CPP) {
+            il2cpp_bounds = il2cpp::LoadedModuleBounds{img.min_vaddr, img.max_vaddr};
+            break;
+        }
+    }
+    il2cpp::publish_loaded_module_bounds(il2cpp_bounds);
 
     // Diagnostics: all modules mapped.
     diagnostics::record_boot_phase(diagnostics::BootPhase::MODULES_MAPPED);
@@ -439,6 +454,8 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
 #else  // no guest-execution substrate for this platform.
 namespace prosper {
 bool boot_program(const std::string&, Program&, std::string* err, const std::function<void()>&) {
+    il2cpp::clear_symbol_table();
+    il2cpp::publish_loaded_module_bounds(std::nullopt);
     if (err) *err = "boot_program: no guest-execution substrate for this platform"; return false;
 }
 } // namespace prosper

@@ -1640,6 +1640,48 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             }
     }
     if (version >= 65u) {
+        size_t expected = 0;
+        for (const auto& draw : c.draws)
+            expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected += compute.resources.resources.size();
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages)
+                expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) {
+            error = "invalid owned wide snapshot count";
+            return false;
+        }
+        auto read_owned_raw_snapshots = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                uint32_t bytes = 0;
+                if (!r.u32(bytes)) return false;
+                captured.resource.owned_raw_snapshot_bytes = bytes;
+                if (bytes && ((bytes != 16u && bytes != 32u) ||
+                              !valid_owned_raw_snapshot_shape(captured.resource, bytes) ||
+                              captured.captured_size < bytes)) return false;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_owned_raw_snapshots(draw.vrt) || !read_owned_raw_snapshots(draw.prt)) {
+                error = "invalid owned wide snapshot state";
+                return false;
+            }
+        for (auto& compute : c.computes)
+            if (!read_owned_raw_snapshots(compute.resources)) {
+                error = "invalid owned wide snapshot state";
+                return false;
+            }
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_owned_raw_snapshots(stage.resource_table)) {
+                    error = "invalid owned wide snapshot state";
+                    return false;
+                }
+    }
+    if (version >= 66u) {
         const auto read_transport = [&](FloatTransportConfig& config) {
             uint8_t tag = 0;
             if (!r.u8(tag) || tag > 2u) return false;
@@ -1677,7 +1719,7 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 }
         }
     }
-    if (version >= 66u) {
+    if (version >= 67u) {
         const auto read_float_flags = [&](FragmentFloatFlags& flags) {
             uint8_t available = 0, ieee = 0, dx10 = 0;
             if (!r.u8(available) || !r.u8(ieee) || !r.u8(dx10) ||

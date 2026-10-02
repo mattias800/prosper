@@ -1420,6 +1420,10 @@ Both fail closed where `/proc` is unreadable: without it, ownership cannot be es
 
 ## Ruled out
 
+- A `std::vector<uint32_t>` return type alone does not identify a SPIR-V emitter. The owned-wide
+  proof returns decoded PCs and the strict gate initially misclassified it (#3987). Classify that
+  analysis function explicitly and validate real x4/x8 consuming modules with complete backing;
+  do not satisfy coverage by labelling an unrelated module as the proof function's output.
 - **A `git` alias cannot guard `git stash`.** `git config alias.stash '!<guard>'` is silently
   ignored — git does not let an alias shadow a builtin — so the guard never runs and the stash
   lands as usual. Measured 2026-09-02 on git 2.55.0: with the alias configured, `git stash push`

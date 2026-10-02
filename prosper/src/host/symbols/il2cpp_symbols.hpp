@@ -39,6 +39,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace prosper {
@@ -50,7 +51,7 @@ namespace il2cpp {
 enum class ResolveState {
     NotConfigured,   // no symbol table was ever requested (PROSPER_IL2CPP_SYMBOLS unset)
     Unavailable,     // one WAS requested and could not be loaded -- see symbol_table_status().error
-    OutsideModule,   // the address is not in the IL2CPP module's guest aperture at all
+    OutsideModule,   // the address is outside the loaded IL2CPP range (or offline guest aperture)
     NoMatch,         // a table is loaded and no method covers this offset
     Resolved,        // `name` + `offset` are meaningful
 };
@@ -90,18 +91,30 @@ bool load_symbol_table_from_env();
 // the environment probe costs one getenv for the whole process rather than one per printed frame.
 void ensure_symbol_table_loaded();
 
-// Drop the table and re-arm the once-only probe. For tests.
+// Start a new symbol session: drop the table and loaded bounds, re-arm the environment probe, and
+// prevent an earlier session's in-flight load from publishing. Before mapping, bounds are unknown
+// so offline tools can still resolve RVAs without a loaded guest module.
 void clear_symbol_table();
+
+struct LoadedModuleBounds {
+    uint64_t min_rva;
+    uint64_t max_rva;   // exclusive, relative to BOOT_IL2CPP rather than min_rva
+};
+
+// Publish the actually mapped IL2CPP image's bounds after boot mapping. nullopt (or an empty range)
+// means no module was loaded. Revalidates an early table; the highest RVA must be below max_rva.
+// This catches some mismatched tables, without establishing module identity or method coverage.
+void publish_loaded_module_bounds(std::optional<LoadedModuleBounds> bounds);
 
 SymbolTableStatus symbol_table_status();
 
 // Resolve a module-relative RVA (what script.json's `Address` field holds, and what a prosper
-// `Il2cpp+0x<offset>` label prints).
+// `Il2cpp+0x<offset>` label prints). When bounds are known, queries must be within the loaded range.
 Resolution resolve_rva(uint64_t rva);
 
-// Resolve an absolute guest virtual address. Addresses outside the IL2CPP module's aperture return
-// OutsideModule rather than being folded into some other module's offset space (#1659's lesson: a
-// single wide range labelled every module in it "eboot+", i.e. wrong binary, not just wrong offset).
+// Resolve an absolute guest virtual address. Addresses outside the loaded range (offline: aperture)
+// return OutsideModule rather than being folded into some other module's offset space (#1659's
+// lesson: a single wide range labelled every module in it "eboot+", i.e. wrong binary, wrong offset).
 Resolution resolve_guest_va(uint64_t va);
 
 // " Name+0x<offset>" / " <no-managed-method>" / " <il2cpp-symbols-unavailable>" / "" -- the suffix

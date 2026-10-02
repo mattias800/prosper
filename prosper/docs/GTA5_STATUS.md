@@ -5324,6 +5324,8 @@ falsification.
   This boot does not exonerate other shader behavior or isolate #4046 as the historical cause;
   the original log lacked a failure-time mapping snapshot and host errno.
 
+- **The retained GTA V vertex input `0x205a95de00`'s PC52 raw x4 refusal establishes a numeric or per-wave backing requirement** — falsified for the exact compiler-owned 2,667-word input (SHA-256 `3e3663c9017532b2826d9696f222cd289afa4f4874e9bc31ff371f702486ebbc`). Exempting only the 72 supported `image_sample_c_lz` operations from the guest-write census reduced the needs-backing set from 16 sites to PC30 alone; all 32 lifetime facts and the other three proof sets stayed unchanged. PC52 was forced by the false write flag, while PC30's genuine numeric/uncertain backing requirement remains. This classifier witness does not establish that the shader compiles, that all dropped draws recover, or that gameplay renders. Evidence: [PR #3987](https://github.com/mattias800/prosper/pull/3987), [#3951](https://github.com/mattias800/prosper/issues/3951).
+
 - **An increased SurfaceReadback count caused the 3.67 guest flips/s deferred-wait outlier** — falsified
   for the retained late gameplay windows of #3948 (2026-09-29): normal OFF/ON arms and the
   collapsed ON arm all performed **11.028–11.032 readbacks per flip**. Frontend groups, texture

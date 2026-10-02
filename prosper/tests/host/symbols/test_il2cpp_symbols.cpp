@@ -1,6 +1,6 @@
 // test_il2cpp_symbols.cpp — the runtime IL2CPP symbol resolver (#2551).
 //
-// Two modes:
+// Modes:
 //   (no args)                       self-checking unit test; exit code is truth
 //   --probe <symtab> <rva> [...]    print one machine-readable line per rva, for the cross-
 //                                   implementation agreement test (tools/il2cpp/test_symtab_agreement.py)
@@ -8,6 +8,8 @@
 //                                   production label a fault backtrace prints. Honors
 //                                   PROSPER_IL2CPP_SYMBOLS, so this is how a live capture is checked
 //                                   against a real title's symbol table by hand.
+//   --boot-bounds <valid|oversized|absent>  one synthetic real boot per fresh process, without
+//                                         imports, initializers, or executing the guest entry.
 //
 // Every assertion below is paired with a MUTATION ARM — an input differing in exactly the property
 // under test, whose expected answer differs. An arm is only worth having if no other branch of the
@@ -15,14 +17,31 @@
 #include "host/symbols/il2cpp_symbols.hpp"
 #include "host/image/boot_program.hpp"
 #include "host/image/exec_image.hpp"   // describe_code_address: the production label being symbolicated
+#include "fixtures/synth_prx.h"
+#include "fixtures/test_scratch.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 using namespace prosper::il2cpp;
 
@@ -418,6 +437,375 @@ void test_describe_code_address_wiring(const std::string& fixture) {
              "an IL2CPP address with no method says so in the label");
 }
 
+// #2650: the first entry is shared between valid and oversized tables. A lookup inside the
+// actual image must lose that plausible name when the LAST entry proves the table mismatched.
+const char* const kBoundsInside = "Prosper.Bounds.Shared$$Inside";
+
+std::string bounds_table(uint64_t first, uint64_t last, const char* edge) {
+    std::ostringstream body;
+    body << "prosper-il2cpp-symtab v1 window=0x8000 count=2\n" << std::hex
+         << first << ' ' << kBoundsInside << '\n' << last << ' ' << edge << '\n';
+    return body.str();
+}
+
+std::string write_bounds_table(const char* name, uint64_t first, uint64_t last,
+                               const char* edge = "Prosper.Bounds.Edge$$Valid") {
+    const std::string path = prosper_test::test_scratch_file(name);
+    std::ofstream out(path, std::ios::binary);
+    out << bounds_table(first, last, edge);
+    out.close();
+    check(!out.fail(), std::string("bounds fixture writes: ") + name);
+    return path;
+}
+
+void check_bounds_refusal(const std::string& source, const std::string* caller_error,
+                          const char* token, const std::string& arm) {
+    const SymbolTableStatus status = symbol_table_status();
+    check(status.attempted && !status.loaded && status.count == 0 && status.window == 0,
+          arm + ": rejected status has no retained symbols");
+    check_eq(status.source, source, arm + ": rejected status retains its source");
+    check(status.error.find(token) != std::string::npos,
+          arm + ": status names the loaded-module refusal");
+    if (caller_error)
+        check_eq(*caller_error, status.error, arm + ": caller receives the status error");
+}
+
+void test_loaded_bounds_reload() {
+    clear_test_env("PROSPER_IL2CPP_SYMBOLS");
+    clear_symbol_table();
+    publish_loaded_module_bounds(LoadedModuleBounds{0, 0x4000});
+    const std::string valid = write_bounds_table("bounds-valid.symtab", 0x100, 0x3fff);
+    const std::string oversized = write_bounds_table("bounds-oversized.symtab", 0x100, 0x4000);
+    check(load_symbol_table(valid, nullptr), "loaded bounds: last byte is accepted");
+    check_eq(resolved_name(0x108), kBoundsInside, "loaded bounds: shared low entry resolves");
+    check(resolved_offset(0x108) == 8, "loaded bounds: shared low entry keeps its offset");
+    check_eq(resolved_name(0x3fff), "Prosper.Bounds.Edge$$Valid",
+             "loaded bounds: final admitted RVA resolves");
+
+    std::string error;
+    check(!load_symbol_table(oversized, &error), "loaded bounds: exclusive end is refused");
+    check_bounds_refusal(oversized, &error, "loaded IL2CPP RVA range", "exclusive end");
+    check(error.find("0x4000") != std::string::npos,
+          "exclusive end: caller error includes the offending RVA");
+    check_eq(state_of(0x108), "unavailable", "exclusive end: plausible low entry is unavailable");
+    check_eq(prosper::describe_code_address(prosper::BOOT_IL2CPP + 0x108),
+             "Il2cpp+0x108 <il2cpp-symbols-unavailable>",
+             "exclusive end: refusal reaches the production annotation");
+    check_eq(state_of(0x4000), "outside-module", "loaded bounds: raw query at end is outside");
+    check_eq(annotation_for_guest_va(prosper::BOOT_IL2CPP + 0x4000), "",
+             "loaded bounds: absolute query at end claims no name");
+    check(load_symbol_table(valid, nullptr), "loaded bounds: valid reload recovers");
+    check(symbol_table_status().count == 2 && symbol_table_status().error.empty(),
+          "loaded bounds: recovery restores exactly the valid table");
+    check_eq(resolved_name(0x108), kBoundsInside, "loaded bounds: recovery resolves the shared entry");
+}
+
+void test_bounds_publication_and_env() {
+    const std::string valid = write_bounds_table("bounds-env-valid.symtab", 0x100, 0x3fff);
+    const std::string oversized = write_bounds_table("bounds-env-oversized.symtab", 0x100, 0x4000);
+    clear_symbol_table();
+    set_test_env("PROSPER_IL2CPP_SYMBOLS", oversized);
+    check_eq(prosper::describe_code_address(prosper::BOOT_IL2CPP + 0x108),
+             "Il2cpp+0x108 Prosper.Bounds.Shared$$Inside+0x8",
+             "early env: Unknown session accepts an offline table");
+    publish_loaded_module_bounds(LoadedModuleBounds{0, 0x4000});
+    check_bounds_refusal(oversized, nullptr, "loaded IL2CPP RVA range", "early env publication");
+    check_eq(prosper::describe_code_address(prosper::BOOT_IL2CPP + 0x108),
+             "Il2cpp+0x108 <il2cpp-symbols-unavailable>",
+             "early env: publication invalidates a table after the once-only probe");
+
+    clear_symbol_table();
+    set_test_env("PROSPER_IL2CPP_SYMBOLS", valid);
+    ensure_symbol_table_loaded();
+    publish_loaded_module_bounds(LoadedModuleBounds{0, 0x4000});
+    check(symbol_table_status().loaded && symbol_table_status().count == 2,
+          "early env: publication keeps an in-bounds table");
+    check_eq(resolved_name(0x3fff), "Prosper.Bounds.Edge$$Valid",
+             "early env: retained table resolves at the last mapped byte");
+    clear_test_env("PROSPER_IL2CPP_SYMBOLS");
+    clear_symbol_table();
+    publish_loaded_module_bounds(LoadedModuleBounds{0, 0x4000});
+    check_eq(prosper::describe_code_address(prosper::BOOT_IL2CPP + 0x108), "Il2cpp+0x108",
+             "loaded bounds: unset environment keeps the production label bare");
+    check(!symbol_table_status().attempted, "loaded bounds: unset environment attempts no load");
+}
+
+void test_nonzero_bss_bounds() {
+    // Independently constructed pure BSS, without the synthetic PRX generator. Its end is an
+    // ELF RVA (0xc000), not the span (0x4000), and the file contains no backing bytes at all.
+    prosper::Module module;
+    prosper::Segment bss;
+    bss.type = prosper::PT_LOAD;
+    bss.flags = 6;
+    bss.vaddr = 0x8000;
+    bss.memsz = 0x4000;
+    module.segments.push_back(bss);
+    prosper::LoadedImage image;
+    std::string error;
+    const bool built = prosper::build_image(module, prosper::BOOT_IL2CPP, image, &error);
+    check(built, "nonzero BSS: independent image builds");
+    if (!built) return;
+    check(image.min_vaddr == 0x8000 && image.max_vaddr == 0xc000 && image.mem.size() == 0x4000,
+          "nonzero BSS: actual extent differs from both the span and file size");
+    clear_symbol_table();
+    publish_loaded_module_bounds(LoadedModuleBounds{image.min_vaddr, image.max_vaddr});
+    const std::string valid = write_bounds_table("bounds-bss-valid.symtab", 0x8100, 0xbfff);
+    const std::string oversized = write_bounds_table("bounds-bss-oversized.symtab", 0x8100, 0xc000);
+    check(load_symbol_table(valid, nullptr), "nonzero BSS: highest RVA below actual end loads");
+    check_eq(resolved_name(0x8108), kBoundsInside, "nonzero BSS: raw RVAs are relative to image base");
+    check(resolve_guest_va(image.base + 0x8108).state == ResolveState::Resolved,
+          "nonzero BSS: guest VA uses image base without subtracting the nonzero minimum");
+    check_eq(state_of(0x7fff), "outside-module", "nonzero BSS: query below actual minimum is outside");
+    check_eq(state_of(0xc000), "outside-module", "nonzero BSS: query at actual end is outside");
+    const std::string low_record = write_bounds_table("bounds-bss-low-record.symtab", 0x100, 0x8100);
+    check(load_symbol_table(low_record, nullptr),
+          "nonzero BSS: a low record alone does not turn the partial mismatch check into identity validation");
+    check_eq(state_of(0x100), "outside-module", "nonzero BSS: accepted low record cannot name an outside query");
+    check_eq(resolved_name(0x8108), "Prosper.Bounds.Edge$$Valid",
+             "nonzero BSS: accepted sibling record still resolves inside the loaded extent");
+    check(!load_symbol_table(oversized, &error), "nonzero BSS: exclusive RVA end is refused");
+    check_bounds_refusal(oversized, &error, "loaded IL2CPP RVA range", "nonzero BSS end");
+    check(load_symbol_table(valid, nullptr), "nonzero BSS: valid reload recovers");
+}
+
+void test_absent_bounds_and_reset(const std::string& fixture) {
+    clear_symbol_table();
+    publish_loaded_module_bounds(LoadedModuleBounds{0, 0x4000});
+    const std::string valid = write_bounds_table("bounds-absent-valid.symtab", 0x100, 0x3fff);
+    check(load_symbol_table(valid, nullptr), "absent publication: valid sibling first loads");
+    publish_loaded_module_bounds(std::nullopt);
+    check_bounds_refusal(valid, nullptr, "no IL2CPP module is loaded", "absent publication");
+    check_eq(state_of(0x108), "outside-module", "absent module: formerly inside raw query is outside");
+    check_eq(prosper::describe_code_address(prosper::BOOT_IL2CPP + 0x108), "Il2cpp+0x108",
+             "absent module: production labels make no symbol claim");
+    std::string error;
+    check(!load_symbol_table(fixture, &error), "absent module: even a valid offline table is refused");
+    check_bounds_refusal(fixture, &error, "no IL2CPP module is loaded", "absent direct load");
+    clear_symbol_table();
+    check(load_symbol_table(fixture, nullptr), "reset: Unknown session restores offline fixture loading");
+    check_eq(resolved_name(0xa00000), "Prosper.Fixture.Tied$$MethodZzz",
+             "reset: offline query beyond the old loaded extent resolves again");
+    clear_symbol_table();
+}
+
+#ifndef _WIN32
+struct PendingSymbolLoad {
+    std::atomic<bool> done{false};
+    bool loaded = false;
+    std::string error;
+};
+
+void require_worker_drain(std::thread& worker, const std::shared_ptr<PendingSymbolLoad>& state) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!state->done.load() && std::chrono::steady_clock::now() < end)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    check(state->done.load(), "POSIX stale parse: worker drains within the bounded deadline");
+    if (!state->done.load()) {
+        // The worker retains its state. Avoid joining a blocked reader or tearing down globals
+        // underneath it; a fixture failure must remain bounded even when the loader is broken.
+        std::fflush(nullptr);
+        std::_Exit(1);
+    }
+    worker.join();
+}
+
+std::shared_ptr<PendingSymbolLoad> complete_stale_parse(
+    const std::string& old_payload, const std::function<void()>& reset_while_blocked) {
+    const std::string fifo = prosper_test::test_scratch_file("bounds-pending.fifo");
+    const bool created = ::mkfifo(fifo.c_str(), 0600) == 0;
+    check(created, "POSIX stale parse: disposable FIFO is created");
+    if (!created) return nullptr;
+    clear_symbol_table();
+    auto state = std::make_shared<PendingSymbolLoad>();
+    std::thread worker([state, fifo] {
+        state->loaded = load_symbol_table(fifo, &state->error);
+        state->done.store(true);
+    });
+    int writer = -1;
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (writer < 0 && std::chrono::steady_clock::now() < end) {
+        writer = ::open(fifo.c_str(), O_WRONLY | O_NONBLOCK);
+        if (writer >= 0 || (errno != ENXIO && errno != EINTR)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    check(writer >= 0, "POSIX stale parse: nonblocking writer observes the old reader");
+    if (writer < 0) {
+        std::fflush(nullptr);
+        std::_Exit(1);
+    }
+    // load_symbol_table captures its session before opening the FIFO. A writer can open only
+    // once that old reader exists, and no payload is supplied until the new session is installed.
+    reset_while_blocked();
+    const long atomic_limit = ::fpathconf(writer, _PC_PIPE_BUF);
+    check(atomic_limit > 0 && old_payload.size() <= static_cast<size_t>(atomic_limit),
+          "POSIX stale parse: synthetic payload fits one atomic pipe write");
+    ssize_t written;
+    do { written = ::write(writer, old_payload.data(), old_payload.size()); }
+    while (written < 0 && errno == EINTR && std::chrono::steady_clock::now() < end);
+    check(written == static_cast<ssize_t>(old_payload.size()), "POSIX stale parse: old payload is delivered");
+    ::close(writer);
+    require_worker_drain(worker, state);
+    check(!state->loaded, "POSIX stale parse: superseded parse reports refusal to its caller");
+    check(state->error.find("symbol load superseded by session reset") != std::string::npos,
+          "POSIX stale parse: caller receives the session-reset reason");
+    ::unlink(fifo.c_str());
+    return state;
+}
+
+void test_reset_fences_pending_parse() {
+    const std::string current = write_bounds_table("bounds-current.symtab", 0x100, 0x3fff);
+    const auto state = complete_stale_parse(
+        bounds_table(0x100, 0x3ffe, "Prosper.Bounds.Old$$Stale"), [&] {
+            clear_symbol_table();
+            publish_loaded_module_bounds(LoadedModuleBounds{0, 0x4000});
+            check(load_symbol_table(current, nullptr), "POSIX stale parse: new-session valid table loads");
+        });
+    if (!state) return;
+    const SymbolTableStatus status = symbol_table_status();
+    check(status.loaded && status.count == 2 && status.error.empty() && status.source == current,
+          "POSIX stale parse: old completion preserves the current status and source");
+    check_eq(resolved_name(0x3fff), "Prosper.Bounds.Edge$$Valid",
+             "POSIX stale parse: old completion cannot replace the current final method");
+    // Shrinking the extent invalidates the current table without resetting its completed probe.
+    // An in-bounds replacement in the environment must wait for an explicit load or session reset.
+    publish_loaded_module_bounds(LoadedModuleBounds{0, 0x3fff});
+    const std::string recovery = write_bounds_table("bounds-probe-recovery.symtab", 0x100, 0x3ffe);
+    set_test_env("PROSPER_IL2CPP_SYMBOLS", recovery);
+    check_eq(prosper::describe_code_address(prosper::BOOT_IL2CPP + 0x108),
+             "Il2cpp+0x108 <il2cpp-symbols-unavailable>",
+             "POSIX stale parse: subsequent annotation retains the completed env probe");
+    check(load_symbol_table(recovery, nullptr), "POSIX stale parse: explicit valid reload recovers");
+    check_eq(resolved_name(0x3ffe), "Prosper.Bounds.Edge$$Valid",
+             "POSIX stale parse: recovery resolves the new final method");
+    clear_test_env("PROSPER_IL2CPP_SYMBOLS");
+    clear_symbol_table();
+}
+
+void test_reset_fences_failed_env_probe() {
+    const auto state = complete_stale_parse("not a prosper symbol table\n", [] {
+        clear_symbol_table();
+        publish_loaded_module_bounds(LoadedModuleBounds{0, 0x4000});
+    });
+    if (!state) return;
+    const SymbolTableStatus status = symbol_table_status();
+    check(!status.attempted && !status.loaded && status.count == 0 && status.source.empty() &&
+              status.error.empty(), "POSIX stale failure: old parse leaves new session unattempted");
+    check_eq(state_of(0x108), "not-configured", "POSIX stale failure: old error cannot become new status");
+    const std::string current = write_bounds_table("bounds-new-env.symtab", 0x100, 0x3fff);
+    set_test_env("PROSPER_IL2CPP_SYMBOLS", current);
+    ensure_symbol_table_loaded();
+    check(symbol_table_status().loaded && symbol_table_status().source == current,
+          "POSIX stale failure: old completion cannot consume the new session's env probe");
+    check_eq(prosper::describe_code_address(prosper::BOOT_IL2CPP + 0x108),
+             "Il2cpp+0x108 Prosper.Bounds.Shared$$Inside+0x8",
+             "POSIX stale failure: new env-backed label resolves after the old failure");
+    clear_test_env("PROSPER_IL2CPP_SYMBOLS");
+    clear_symbol_table();
+}
+#else
+void test_reset_fences_pending_parse() {
+    std::printf("[skip] POSIX FIFO stale-parse handshake is unavailable on Windows\n");
+}
+void test_reset_fences_failed_env_probe() {
+    std::printf("[skip] POSIX FIFO stale-failure env-probe control is unavailable on Windows\n");
+}
+#endif
+
+void record_guest_entry(bool, void* opaque) { ++*static_cast<int*>(opaque); }
+
+bool write_boot_modules(const std::filesystem::path& root, bool include_il2cpp) {
+    std::error_code error;
+    std::filesystem::create_directories(root / "Media/Modules", error);
+    check(!error, "boot fixture: module directories created");
+    if (error) return false;
+    prosper_test::SynthModuleSpec spec;
+    spec.init = false;
+    std::string reason;
+    const bool eboot = prosper_test::write_synth_prx((root / "eboot.bin").string(), spec, &reason);
+    check(eboot, "boot fixture: synthetic eboot writes");
+    if (!eboot) return false;
+    const bool il2cpp = !include_il2cpp || prosper_test::write_synth_prx(
+        (root / "Media/Modules/Il2cppUserAssemblies.prx").string(), spec, &reason);
+    check(il2cpp, "boot fixture: synthetic IL2CPP presence matches the requested arm");
+    return il2cpp;
+}
+
+void check_boot_image(const prosper::Program& program, bool present) {
+    const prosper::LoadedImage* image = nullptr;
+    for (const auto& candidate : program.imgs)
+        if (candidate.base == prosper::BOOT_IL2CPP) image = &candidate;
+    check((image != nullptr) == present, "real boot: IL2CPP image presence matches the fixture");
+    if (!image) return;
+    check(image->min_vaddr == 0 && image->max_vaddr == 0x4000 && image->mem.size() == 0x4000,
+          "real boot: loaded image end includes the materialized BSS/alignment extent");
+    if (image->mem.size() >= 4) {
+        const auto* mapped = reinterpret_cast<const uint8_t*>(image->base + image->min_vaddr);
+        check(std::memcmp(mapped, image->mem.data(), 4) == 0 && mapped[0] == 0x7f,
+              "real boot: image bytes are actually mapped at the guest address");
+    }
+}
+
+int boot_bounds_mode(const std::string& mode) {
+    const bool absent = mode == "absent";
+    const bool oversized = mode == "oversized";
+    if (!absent && !oversized && mode != "valid") return 2;
+    const auto root = prosper_test::test_scratch_path("symbol-boot");
+    if (!write_boot_modules(root, !absent)) return 1;
+    const std::string table = write_bounds_table("bounds-boot.symtab", 0x100,
+                                                 oversized ? 0x4000 : 0x3fff);
+    set_test_env("PROSPER_IL2CPP_SYMBOLS", table);
+    prosper::Program program;
+    std::string error;
+    int guest_entries = 0;
+    bool callback_ran = false;
+    prosper::set_guest_execution_thread_enter_test_hook(record_guest_entry, &guest_entries);
+    const bool booted = prosper::boot_program(root.string(), program, &error, [&] {
+        callback_ran = true;
+        check_eq(prosper::describe_code_address(prosper::BOOT_IL2CPP + 0x108),
+                 "Il2cpp+0x108 Prosper.Bounds.Shared$$Inside+0x8",
+                 "real boot: pre-map environment lookup accepts the Unknown-session table");
+        check(symbol_table_status().loaded && symbol_table_status().count == 2,
+              "real boot: early table is loaded before actual image publication");
+    });
+    prosper::set_guest_execution_thread_enter_test_hook(nullptr);
+    check(booted, "real boot: synthetic modules boot successfully");
+    if (!booted) {
+        std::fprintf(stderr, "synthetic boot failed: %s\n", error.c_str());
+        clear_test_env("PROSPER_IL2CPP_SYMBOLS");
+        return 1;
+    }
+    check(callback_ran, "real boot: production pre-map callback runs");
+    check(guest_entries == 0 && program.init_fns.empty() && program.slots.empty() &&
+              program.data_slots.empty(), "real boot: fixture executes no guest entry or initializer");
+    check(program.mods.size() == (absent ? 1U : 2U) && program.imgs.size() == program.mods.size(),
+          "real boot: only the requested synthetic modules are linked");
+    check_boot_image(program, !absent);
+    if (absent) {
+        check_bounds_refusal(table, nullptr, "no IL2CPP module is loaded", "real boot absent");
+        check_eq(state_of(0x108), "outside-module", "real boot absent: raw query is outside");
+        check_eq(prosper::describe_code_address(prosper::BOOT_IL2CPP + 0x108), "Il2cpp+0x108",
+                 "real boot absent: publication removes the early plausible method name");
+    } else if (oversized) {
+        check_bounds_refusal(table, nullptr, "loaded IL2CPP RVA range", "real boot oversized");
+        check_eq(state_of(0x108), "unavailable", "real boot oversized: low query is unavailable");
+        check_eq(prosper::describe_code_address(prosper::BOOT_IL2CPP + 0x108),
+                 "Il2cpp+0x108 <il2cpp-symbols-unavailable>",
+                 "real boot oversized: publication removes the early plausible method name");
+        check_eq(state_of(0x4000), "outside-module", "real boot oversized: exclusive end is outside");
+    } else {
+        check(symbol_table_status().loaded && symbol_table_status().count == 2,
+              "real boot valid: publication retains the accepted early table");
+        check_eq(resolved_name(0x3fff), "Prosper.Bounds.Edge$$Valid",
+                 "real boot valid: symbol beyond physical EOF resolves inside the mapped image");
+        check_eq(prosper::describe_code_address(prosper::BOOT_IL2CPP + 0x108),
+                 "Il2cpp+0x108 Prosper.Bounds.Shared$$Inside+0x8",
+                 "real boot valid: production label keeps the accepted method name");
+    }
+    clear_test_env("PROSPER_IL2CPP_SYMBOLS");
+    std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "PASSED", g_failures);
+    return g_failures ? 1 : 0;
+}
+
 int describe_mode(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) {
         const uint64_t va = std::strtoull(argv[i], nullptr, 0);
@@ -448,6 +836,7 @@ int probe_mode(int argc, char** argv) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--boot-bounds") == 0) return boot_bounds_mode(argv[2]);
     if (argc >= 4 && std::strcmp(argv[1], "--probe") == 0) return probe_mode(argc, argv);
     if (argc >= 3 && std::strcmp(argv[1], "--describe") == 0) return describe_mode(argc, argv);
 
@@ -470,6 +859,12 @@ int main(int argc, char** argv) {
     test_utf8_name_roundtrip();
     test_env_path(fixture);
     test_describe_code_address_wiring(fixture);
+    test_loaded_bounds_reload();
+    test_bounds_publication_and_env();
+    test_nonzero_bss_bounds();
+    test_absent_bounds_and_reset(fixture);
+    test_reset_fences_pending_parse();
+    test_reset_fences_failed_env_probe();
 
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "PASSED", g_failures);
     return g_failures ? 1 : 0;

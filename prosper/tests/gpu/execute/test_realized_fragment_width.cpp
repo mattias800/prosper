@@ -131,7 +131,7 @@ int main() {
     std::vector<uint8_t> bytes;
     GpuCaptureFile loaded;
     CHECK(serialize_gpu_capture(capture, bytes, error) &&
-              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 66u,
+              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 67u,
           "current realized-width tail round-trips through production codecs");
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded, replay, error) && replay.items.size() == realized.size(),
@@ -157,16 +157,44 @@ int main() {
                       result->draws[i].ps_wave32 == realized[i].ps_wave32,
                   "full and metadata-only bundle paths preserve each captured guest width");
     }
-    if (bytes.size() < 4u + realized.size() || loaded.draws.size() != realized.size()) {
+    const bool no_resources = capture.computes.empty() && capture.failure_diagnostics.empty() &&
+        std::all_of(capture.draws.begin(), capture.draws.end(), [](const auto& draw) {
+            return draw.vrt.resources.empty() && draw.prt.resources.empty();
+        });
+    if (bytes.size() < 28u + 4u * realized.size() || loaded.draws.size() != realized.size() || !no_resources) {
         CHECK(false, "codec controls require the successful bounded realized fixture");
         return 1;
     }
+    // No resources: remove transport T, owned U4, then M for genuine v63.
     const size_t mode_tail_size = 8u + 2u * realized.size();
     const size_t transport_tail_size = 12u + realized.size();
     const size_t flags_tail_size = 8u + 3u * realized.size();
-    const size_t tail = bytes.size() - flags_tail_size - transport_tail_size - mode_tail_size - 4u - realized.size();
+    auto mode_bytes = bytes;
+    mode_bytes.resize(mode_bytes.size() - flags_tail_size - transport_tail_size - 4u);
+    set_u32(mode_bytes, 8u, 64u);
+    GpuCaptureFile official64;
+    CHECK(deserialize_gpu_capture(mode_bytes, official64, error) &&
+              official64.format_version == 64u && official64.draws.size() == realized.size(),
+          "official v64 prefix retains producing mode independently of the owned tail");
+    for (size_t i = 0; i < realized.size(); ++i)
+        CHECK(i < official64.draws.size() &&
+                  official64.draws[i].ps_float_mode == realized[i].ps_float_mode,
+              "official v64 retains the complete known or unknown producing mode");
+    auto width_bytes = mode_bytes;
+    width_bytes.resize(width_bytes.size() - mode_tail_size);
+    set_u32(width_bytes, 8u, 63u);
+    GpuCaptureFile official63;
+    CHECK(deserialize_gpu_capture(width_bytes, official63, error) &&
+              official63.format_version == 63u && official63.draws.size() == realized.size(),
+          "official v63 prefix retains the captured per-draw guest width");
+    for (size_t i = 0; i < realized.size(); ++i)
+        CHECK(i < official63.draws.size() && official63.draws[i].fragment_wave_config_available &&
+                  official63.draws[i].ps_wave32 == realized[i].ps_wave32 &&
+                  !official63.draws[i].ps_float_mode.available && official63.draws[i].ps_float_mode.value == 0u,
+              "official v63 retains width and explicitly unknown mode");
+    const size_t tail = width_bytes.size() - 4u - realized.size();
 
-    auto legacy_bytes = bytes;
+    auto legacy_bytes = width_bytes;
     legacy_bytes.resize(tail);
     set_u32(legacy_bytes, 8u, 62u);
     GpuCaptureFile legacy;
@@ -208,26 +236,26 @@ int main() {
           "collector rejects noncanonical external draw state");
 
     for (uint32_t count : {0u, 1u, static_cast<uint32_t>(realized.size() + 1u), UINT32_MAX}) {
-        auto malformed = bytes;
+        auto malformed = width_bytes;
         set_u32(malformed, tail, count);
         CHECK(!deserialize_gpu_capture(malformed, upgraded, error) &&
                   error == "invalid realized-draw fragment wave count",
               "reader rejects mismatched/hostile width counts without allocating a second draw list");
     }
     for (uint8_t tag : {uint8_t{3}, uint8_t{128}, uint8_t{255}}) {
-        auto malformed = bytes;
+        auto malformed = width_bytes;
         malformed[tail + 4u] = tag;
         CHECK(!deserialize_gpu_capture(malformed, upgraded, error) &&
                   error == "invalid realized-draw fragment wave config",
               "reader rejects reserved width tags rather than treating them as a Boolean");
     }
-    for (size_t end : {tail, tail + 1u, tail + 3u, tail + 4u, bytes.size() - 1u}) {
-        auto malformed = bytes;
+    for (size_t end : {tail, tail + 1u, tail + 3u, tail + 4u, width_bytes.size() - 1u}) {
+        auto malformed = width_bytes;
         malformed.resize(end);
         CHECK(!deserialize_gpu_capture(malformed, upgraded, error),
               "reader refuses truncated count or per-draw width tags");
     }
-    auto trailing = bytes;
+    auto trailing = width_bytes;
     trailing.push_back(0u);
     CHECK(!deserialize_gpu_capture(trailing, upgraded, error) && error == "capture has trailing data",
           "reader refuses data after the complete v63 tail");

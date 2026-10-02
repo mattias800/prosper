@@ -78,13 +78,13 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
         data=path.read_bytes()
         flags_tail=(struct.pack("<II",0,1)+b"\x01\x00\x00" if failed else
                     struct.pack("<I",1)+b"\x01\x00\x00"+struct.pack("<I",0))
-        check(struct.unpack_from("<I",data,8)[0]==66 and data.endswith(flags_tail),"genuine independent v66 flags tail")
+        check(struct.unpack_from("<I",data,8)[0]==67 and data.endswith(flags_tail),"genuine independent v67 flags tail")
         data=bytearray(data[:-len(flags_tail)])
-        struct.pack_into("<I",data,8,65)
+        struct.pack_into("<I",data,8,66)
         tail=(struct.pack("<III",0,0,1)+b"\x02"+struct.pack("<I",1)+b"\x00" if failed else
               struct.pack("<I",1)+b"\x02"+struct.pack("<II",0,0))
-        check(struct.unpack_from("<I",data,8)[0]==65 and data.endswith(tail),"genuine v65 exact profile tail")
-        legacy=bytearray(data[:-len(tail)]); struct.pack_into("<I",legacy,8,64)
+        check(struct.unpack_from("<I",data,8)[0]==66 and data.endswith(tail),"genuine v66 exact profile tail")
+        legacy=bytearray(data[:-len(tail)]); struct.pack_into("<I",legacy,8,65)
         (directory/("legacy"+("-failed" if failed else "")+".prgcap")).write_bytes(legacy)
     states=("unknown","implicit","explicit-nonfinite32","legacy")
     modules=0
@@ -150,7 +150,7 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
              "compute-count":original[:start+5]+struct.pack("<I",1)+original[start+9:],
              "failure-count":original[:start+9]+struct.pack("<I",1)+original[start+13:],
              "truncated":original[:-1],"trailing":original+b"\x00",
-             "version-only64":original[:8]+struct.pack("<I",64)+original[12:]}
+             "version-only65":original[:8]+struct.pack("<I",65)+original[12:]}
     for name,data in corrupt.items():
         capture=directory/(name+".prgcap"); capture.write_bytes(data)
         output=directory/"sentinel.spv"; output.write_bytes(b"unchanged")

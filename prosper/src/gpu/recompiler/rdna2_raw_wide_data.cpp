@@ -6,6 +6,7 @@
 #include <array>
 #include <bitset>
 #include <cstdint>
+#include <iterator>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -22,7 +23,7 @@ bool rdna2_may_write_guest_memory(const Rdna2Inst& in) {
         return !(in.opcode <= 0x03u ||
                  (in.opcode >= 0x08u && in.opcode <= 0x0fu));
     if (in.fmt == Rdna2Format::MIMG)
-        return in.opcode != 0x00u && in.opcode != 0x0eu && in.opcode != 0x27u;
+        return in.opcode != 0x00u && in.opcode != 0x0eu && in.opcode != 0x27u && in.opcode != 0x2fu;
     return false;
 }
 
@@ -69,21 +70,43 @@ public:
     }
 
     bool has_numeric_reader_or_uncertain_path() const {
-        // May-provenance, not a value proof: a read on ANY reachable path needs the actual
-        // bytes. Merge arriving register/SCC origins with OR and reprocess when they grow.
-        // Scalar descriptor assembly remains provenance-only until a non-descriptor consumer.
+        // Scalar data is MAY provenance (OR at joins). A separate MUST fact identifies exact
+        // fresh mask roots used by the emitter's Bool consumers (AND at joins). A compare can
+        // replace that Bool without proving that both physical scalar words were overwritten.
+        // Keep the possible high-word numeric dependency alive for every ordinary data reader.
         struct State {
             size_t index;
             std::bitset<128> regs;
             bool scc;
+            std::bitset<128> masks;
         };
         if (start + 1 >= ins.size()) return false;
-        State initial{start + 1, {}, false};
+        State initial{start + 1, {}, false, {}};
+        initial.masks = saved_exec_masks_at_load();
+        initial.masks.set(126); // entry EXEC cannot depend on this subsequent, unreplayed load
         for (uint32_t word = 0; word < words; ++word)
             initial.regs.set(static_cast<size_t>(first + static_cast<int>(word)));
         std::vector<State> pending{initial};
         std::vector<std::array<std::bitset<128>, 2>> seen(ins.size());
+        std::vector<std::array<std::bitset<128>, 2>> seen_masks(ins.size());
         std::vector<std::array<bool, 2>> seen_any(ins.size());
+        const auto mask_register = [](const Operand& operand) {
+            if (operand.kind != OperandKind::SGPR && operand.kind != OperandKind::Special)
+                return -1;
+            return operand.value >= 0 &&
+                (operand.value <= 105 || operand.value == 106 || operand.value == 126)
+                ? operand.value : -1;
+        };
+        const auto supported_compare = [](const Rdna2Inst& in) {
+            // Match emit_alu's exact effective compare families. CMPX publishes EXEC only;
+            // its SDST-shaped decoder field cannot manufacture a saved-mask lifetime.
+            const uint32_t op = vopc_is_cmpx(in.opcode) ? in.opcode - 0x10u : in.opcode;
+            return in.fmt == Rdna2Format::VOPC &&
+                (op <= 0x0fu || (op >= 0x81u && op <= 0x86u) || op == 0x88u ||
+                 (op >= 0x89u && op <= 0x8eu) || (op >= 0xa1u && op <= 0xa6u) ||
+                 (op >= 0xa9u && op <= 0xaeu) || (op >= 0xc1u && op <= 0xc6u) ||
+                 (op >= 0xc9u && op <= 0xceu) || (op >= 0xe1u && op <= 0xe6u));
+        };
         auto writes_scc = [](const Rdna2Inst& in) {
             if (in.fmt == Rdna2Format::SOPC) return true;
             if (in.fmt == Rdna2Format::SOP1)
@@ -109,10 +132,16 @@ public:
             if (state.index == start) return true; // a replayed load needs a new byte observation
             const size_t slot = state.scc ? 1u : 0u;
             if (seen_any[state.index][slot] &&
-                (state.regs & ~seen[state.index][slot]).none()) continue;
+                (state.regs & ~seen[state.index][slot]).none() &&
+                (seen_masks[state.index][slot] & ~state.masks).none()) continue;
+            if (seen_any[state.index][slot])
+                seen_masks[state.index][slot] &= state.masks;
+            else
+                seen_masks[state.index][slot] = state.masks;
             seen_any[state.index][slot] = true;
             seen[state.index][slot] |= state.regs;
             state.regs = seen[state.index][slot];
+            state.masks = seen_masks[state.index][slot];
             if (++processed > 32768) return true;
             const Rdna2Inst& in = ins[state.index];
             if (in.fmt == Rdna2Format::Unknown || !in.len_dwords) return true;
@@ -125,6 +154,29 @@ public:
 
             if (state.scc && in.fmt == Rdna2Format::SOPP &&
                 (in.opcode == 0x04u || in.opcode == 0x05u)) return true;
+            if (in.fmt == Rdna2Format::SOPP &&
+                (in.opcode == 0x08u || in.opcode == 0x09u) &&
+                !state.masks.test(126)) return true;
+            const auto independent_mask = [&](const Operand& operand) {
+                if (operand.kind == OperandKind::InlineInt)
+                    return operand.value == 0 || operand.value == -1;
+                const int root = mask_register(operand);
+                return root >= 0 && state.masks.test(static_cast<size_t>(root));
+            };
+            const bool mask_logical = in.fmt == Rdna2Format::SOP2 &&
+                (in.opcode == 0x0fu || in.opcode == 0x11u || in.opcode == 0x13u ||
+                 in.opcode == 0x15u || in.opcode == 0x17u || in.opcode == 0x19u ||
+                 in.opcode == 0x1bu || in.opcode == 0x1du);
+            const bool mask_move = in.fmt == Rdna2Format::SOP1 &&
+                in.opcode == kSop1OpcodeMovB64;
+            const bool mask_saveexec = in.fmt == Rdna2Format::SOP1 &&
+                in.opcode >= kSop1OpcodeAndSaveexecB64 &&
+                in.opcode <= kSop1OpcodeXnorSaveexecB64;
+            const bool independent_transfer = mask_register(in.dst) >= 0 &&
+                ((mask_logical && independent_mask(in.src[0]) &&
+                                  independent_mask(in.src[1])) ||
+                 (mask_move && independent_mask(in.src[0])) ||
+                 (mask_saveexec && independent_mask(in.src[0]) && state.masks.test(126)));
             const bool implicit_scc_read = state.scc &&
                 ((in.fmt == Rdna2Format::SOP2 &&
                   (in.opcode == 0x04u || in.opcode == 0x05u ||
@@ -150,13 +202,15 @@ public:
                         derived_read = true;
                 for (uint32_t source = 0; source < in.n_src; ++source) {
                     const Operand& operand = in.src[source];
+                    if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101u &&
+                        source == 2u && independent_mask(operand)) continue;
                     if (operand.kind == OperandKind::Special && operand.value == 253) {
                         derived_read |= state.scc;
                         continue;
                     }
                     if ((operand.kind != OperandKind::SGPR &&
                          !(operand.kind == OperandKind::Special &&
-                           operand.value >= 106 && operand.value <= 124)) ||
+                           operand.value >= 106 && operand.value <= 127)) ||
                         descriptor_source(in, source)) continue;
                     for (uint32_t k = 0; k < source_width(in, source); ++k)
                         if (operand.value >= 0 &&
@@ -172,7 +226,35 @@ public:
                 (in.dst.kind != OperandKind::SGPR ||
                  (in.fmt == Rdna2Format::SOPK &&
                   in.opcode == kSopkOpcodeSetregB32) ||
-                 rdna2_instruction_may_change_exec(in))) return true;
+                 rdna2_instruction_may_change_exec(in)) &&
+                !independent_transfer) return true;
+
+            // Evaluate inputs before expiring overlapping roots. Both siblings are invalidated
+            // conservatively: a saved Bool must never authorize a later physical data lifetime.
+            const int compare_root = in.dst.value == 126 ? -1 : mask_register(in.dst);
+            const bool fresh_compare = supported_compare(in) &&
+                !vopc_is_cmpx(in.opcode) && compare_root >= 0 &&
+                !derived_read && state.masks.test(126);
+            // The emitter narrows EXEC with CMPX's explicit comparison. Independent inputs
+            // preserve an already independent EXEC, without overwriting SDST/VCC or proving
+            // anything about their numeric high words.
+            const bool independent_cmpx = supported_compare(in) &&
+                vopc_is_cmpx(in.opcode) && !derived_read && state.masks.test(126);
+            const bool fresh_exec = independent_cmpx || (independent_transfer &&
+                (mask_saveexec || mask_register(in.dst) == 126));
+            for_each_scalar_write(in, [&](int base, uint32_t width) {
+                for (uint32_t k = 0; k < width; ++k) {
+                    const int reg = base + static_cast<int>(k);
+                    if (reg >= 0 && reg < 128) state.masks.reset(static_cast<size_t>(reg));
+                    if (reg > 0 && reg <= 128) state.masks.reset(static_cast<size_t>(reg - 1));
+                }
+            });
+            if (in.fmt == Rdna2Format::VOPC && in.dst.value == 106 &&
+                !vopc_is_cmpx(in.opcode)) state.masks.reset(106);
+            if (rdna2_instruction_may_change_exec(in)) state.masks.reset(126);
+            if (fresh_compare) state.masks.set(static_cast<size_t>(compare_root));
+            if (independent_transfer) state.masks.set(static_cast<size_t>(mask_register(in.dst)));
+            if (fresh_exec) state.masks.set(126);
 
             std::array<bool, 2> copied{};
             if (plain_copy)
@@ -192,7 +274,9 @@ public:
                  in.opcode == kSopkOpcodeCmovkI32);
             const bool definite_scalar_write = !conditional_write &&
                 (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
-                 in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SMEM);
+                 in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SMEM ||
+                 (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) ||
+                 (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360u));
             for_each_scalar_write(in, [&](int base, uint32_t width) {
                 for (uint32_t k = 0; k < width; ++k) {
                     const int reg = base + static_cast<int>(k);
@@ -200,11 +284,14 @@ public:
                     if (definite_scalar_write)
                         state.regs.reset(static_cast<size_t>(reg));
                     if (derived_read && scalar_result &&
-                        in.dst.kind == OperandKind::SGPR &&
+                        (in.dst.kind == OperandKind::SGPR || independent_transfer) &&
                         base == in.dst.value)
                         produced.set(static_cast<size_t>(reg));
                 }
             }, /*wave32_one_word_masks*/true);
+            if (in.fmt == Rdna2Format::VOPC && in.dst.value == 106 &&
+                !vopc_is_cmpx(in.opcode))
+                state.regs.reset(106); // only the guaranteed VCC low word, no width assumption
             state.regs |= produced;
             if (plain_copy)
                 for (uint32_t k = 0; k < copy_words; ++k)
@@ -215,8 +302,11 @@ public:
             if (!state.regs.any() && !state.scc) continue;
 
             auto enqueue = [&](size_t next) {
-                if (next <= start) return false; // unsupported re-entry to producer or prefix
-                pending.push_back({next, state.regs, state.scc});
+                // MAY words grow and MUST mask roots shrink at joins, including backedges.
+                // The finite worklist must converge within the cap above. Reexecuting this
+                // load still requires a fresh observation, not its earlier descriptor proof.
+                if (next == start) return false;
+                pending.push_back({next, state.regs, state.scc, state.masks});
                 return true;
             };
             if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
@@ -275,6 +365,66 @@ private:
     int first;
     uint32_t words;
 
+    std::bitset<128> saved_exec_masks_at_load() const {
+        // Only actual mask saves, on every path reaching this load, may seed its Bool facts.
+        // Their value predates this load; no scalar bits, wave width or zero are inferred.
+        std::vector<std::bitset<128>> incoming(start + 1);
+        std::vector<bool> reached(start + 1);
+        reached[0] = true;
+        for (size_t index = 0; index < start; ++index) {
+            if (!reached[index]) continue;
+            const auto& in = ins[index];
+            if (in.fmt == Rdna2Format::Unknown || !in.len_dwords ||
+                (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u) ||
+                (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x28u && in.opcode <= 0x2au) ||
+                (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCallB64)) return {};
+            auto masks = incoming[index];
+            for_each_scalar_write(in, [&](int base, uint32_t width) {
+                for (uint32_t k = 0; k < width; ++k) {
+                    const int reg = base + static_cast<int>(k);
+                    if (reg >= 0 && reg < 128) masks.reset(static_cast<size_t>(reg));
+                    if (reg > 0 && reg <= 128) masks.reset(static_cast<size_t>(reg - 1));
+                }
+            });
+            if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
+                in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 && in.dst.value <= 104 &&
+                in.src[0].kind == OperandKind::Special && in.src[0].value == 126)
+                masks.set(static_cast<size_t>(in.dst.value));
+            const auto enter = [&](size_t next) {
+                if (next > start) return;
+                if (reached[next]) incoming[next] &= masks;
+                else incoming[next] = masks;
+                reached[next] = true;
+            };
+            if (in.is_end) continue;
+            if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
+                const int64_t target_pc = static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
+                if (target_pc <= in.pc || target_pc > UINT32_MAX) return {};
+                const auto target = by_pc.find(static_cast<uint32_t>(target_pc));
+                if (target == by_pc.end()) {
+                    if (target_pc <= ins.back().pc) return {};
+                } else {
+                    if (target->second <= index) return {};
+                    enter(target->second);
+                }
+                if (in.opcode == kSoppOpcodeBranch) continue;
+            } else if (in.fmt == Rdna2Format::SOPP && !sopp_is_noop(in) &&
+                       in.opcode != 0x0au && in.opcode != 0x10u &&
+                       in.opcode != 0x16u && in.opcode != 0x17u) return {};
+            enter(index + 1);
+        }
+        auto masks = reached[start] ? incoming[start] : std::bitset<128>{};
+        // The load itself overwrites data and invalidates an overlapping saved pair.
+        for_each_scalar_write(ins[start], [&](int base, uint32_t width) {
+            for (uint32_t k = 0; k < width; ++k) {
+                const int reg = base + static_cast<int>(k);
+                if (reg >= 0 && reg < 128) masks.reset(static_cast<size_t>(reg));
+                if (reg > 0 && reg <= 128) masks.reset(static_cast<size_t>(reg - 1));
+            }
+        });
+        return masks;
+    }
+
     bool overlaps(int base, uint32_t width, uint16_t live) const {
         if (base < 0) return false;
         for (uint32_t word = 0; word < words; ++word) {
@@ -331,7 +481,7 @@ private:
                 if (base <= first + static_cast<int>(word) &&
                     first + static_cast<int>(word) < base + static_cast<int>(width))
                     live &= static_cast<uint16_t>(~(1u << word));
-        });
+        }, /*wave32_one_word_masks*/true);
         return live;
     }
 
@@ -400,8 +550,8 @@ std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& in
 // buffer. The predicate above reports uncertainty as "needs backing"; it must never itself grant
 // admission. Here the entire decoded program has only valid forward edges, and the raw pointer is
 // an unchanged entry pair. A load then observes one dispatch-local upload on every visit.
-std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
-        const std::vector<Rdna2Inst>& ins) {
+static std::vector<uint32_t> proven_immediate_wide_data_loads(
+        const std::vector<Rdna2Inst>& ins, bool owned_read_point) {
     std::vector<uint32_t> proven;
     if (ins.empty()) return proven;
     std::unordered_map<uint32_t, size_t> by_pc;
@@ -442,7 +592,7 @@ std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
         for (const Rdna2Inst& in : ins) {
             // Forward-only control permits a textual prefix scan: any earlier global/image
             // store might alias the raw source after the CPU upload was captured.
-            if (in.pc < load.pc && rdna2_may_write_guest_memory(in))
+            if ((owned_read_point || in.pc < load.pc) && rdna2_may_write_guest_memory(in))
                 stable_entry_pointer = false;
             // A predecessor may bypass the load only if every bypass path overwrites all
             // would-be loaded words before reading them. This admits branch-to-after-region
@@ -456,17 +606,23 @@ std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
                         by_pc.at(static_cast<uint32_t>(target))))
                     stable_entry_pointer = false;
             }
-            for_each_scalar_write(in, [&](int base, uint32_t width) {
-                if (base >= 0 && base <= load.src[0].value + 1 &&
-                    base + static_cast<int>(width) > load.src[0].value)
-                    stable_entry_pointer = false;
-            });
+            if (!owned_read_point || in.pc < load.pc)
+                for_each_scalar_write(in, [&](int base, uint32_t width) {
+                    if (base >= 0 && base <= load.src[0].value + 1 &&
+                        base + static_cast<int>(width) > load.src[0].value)
+                        stable_entry_pointer = false;
+                });
             if (!stable_entry_pointer) break;
         }
         if (stable_entry_pointer && lifetime.has_numeric_reader_or_uncertain_path())
             proven.push_back(load.pc);
     }
     return proven;
+}
+
+std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
+        const std::vector<Rdna2Inst>& ins) {
+    return proven_immediate_wide_data_loads(ins, false);
 }
 
 std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
@@ -480,6 +636,7 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
             (load.opcode == 0x2u || load.opcode == 0x3u))
             load.src[1] = {OperandKind::Special, 125};
     const auto entry_proven = rdna2_proven_raw_immediate_wide_data_loads(immediate);
+    const auto owned_parents = proven_immediate_wide_data_loads(ins, true);
     std::vector<uint32_t> proven;
     for (size_t i = 0; i < ins.size(); ++i) {
         const auto& load = ins[i];
@@ -524,6 +681,18 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                         writes.set(static_cast<size_t>(base + static_cast<int>(k)));
             });
             if ((writes & needed).none()) continue;
+            // A complete immediate parent supplies the SAME observed words to the fold and
+            // emitted stage. Later writes to its entry pointer cannot retarget this earlier read.
+            // The parent proof still rejects every potentially aliasing guest write in the shader.
+            if (std::binary_search(owned_parents.begin(), owned_parents.end(), writer.pc)) {
+                needed &= ~writes;
+                sources.push_back(writer.pc);
+                // The exact parent already proves its entry pointer and reaching definition.
+                // Once every selector word resolves, unrelated earlier control is irrelevant.
+                // The child entry-pointer authority remains required by entry_proven above.
+                if (needed.none()) break;
+                continue;
+            }
             // A bounded immediate raw x1 fetch is a latched scalar value. Its entry pointer
             // needs to survive only UNTIL this read, unlike the wide source pointer, whose
             // full-program lifetime is authenticated above. GTA overwrites this source pair
@@ -602,6 +771,22 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                                 scalar_source_pcs->end());
     }
     return proven;
+}
+
+std::vector<uint32_t> rdna2_owned_raw_wide_data_loads(const std::vector<Rdna2Inst>& ins) {
+    const auto strict = rdna2_proven_raw_immediate_wide_data_loads(ins);
+    const auto read_points = proven_immediate_wide_data_loads(ins, true);
+    std::vector<uint32_t> owned;
+    std::set_difference(read_points.begin(), read_points.end(), strict.begin(), strict.end(),
+                        std::back_inserter(owned));
+    std::vector<uint32_t> scalar_sources;
+    rdna2_proven_raw_register_wide_data_loads(ins, &scalar_sources);
+    for (uint32_t pc : scalar_sources)
+        if (std::binary_search(read_points.begin(), read_points.end(), pc))
+            owned.push_back(pc);
+    std::sort(owned.begin(), owned.end());
+    owned.erase(std::unique(owned.begin(), owned.end()), owned.end());
+    return owned;
 }
 
 std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(

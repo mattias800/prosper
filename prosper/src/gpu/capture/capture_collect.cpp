@@ -53,21 +53,48 @@
 namespace prosper::gpu {
 namespace {
 
-// Resource folding owns a four-byte scalar when that exact observation selected a later
+// Resource folding owns a scalar observation when that exact value selected a later
 // register-offset load. Preserve each draw's observation independently, including when another
 // draw uses the same guest address after it changes. Ordinary guest-backed buffers keep their
 // shared allocation intervals.
 bool owns_scalar_word(const ShaderResourceTable& table, const ShaderResource& resource) {
+    const bool owned_wide = std::any_of(
+        table.owned_raw_snapshot_requirements.begin(), table.owned_raw_snapshot_requirements.end(),
+        [&](const auto& requirement) {
+            return requirement.first == resource.fetch_pc && requirement.second == resource.size;
+        });
     return resource.cls == ResourceClass::ConstantBuffer &&
         resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
-        resource.size == sizeof(uint32_t) && resource.host_data_size == sizeof(uint32_t) &&
+        (resource.size == sizeof(uint32_t) || owned_wide) &&
+        resource.host_data_size == resource.size &&
         resource.host_data && !resource.host_data_prefix_bytes && !resource.table_index_count &&
         !resource.metadata_addr && resource.fetch_pc != UINT32_MAX &&
         std::any_of(table.owned_host_data.begin(), table.owned_host_data.end(),
             [&](const auto& owner) {
-                return owner && owner->size() == sizeof(uint32_t) &&
+                return owner && owner->size() == resource.size &&
                     owner->data() == resource.host_data;
             });
+}
+
+bool validate_owned_raw_capture_inputs(const ShaderResourceTable& table, std::string& error) {
+    for (const auto& resource : table.resources)
+        if (resource.owned_raw_snapshot_bytes &&
+            std::none_of(table.owned_raw_snapshot_requirements.begin(),
+                         table.owned_raw_snapshot_requirements.end(), [&](const auto& requirement) {
+                return requirement.first == resource.fetch_pc &&
+                       requirement.second == resource.owned_raw_snapshot_bytes;
+            })) {
+            error = "owned wide capture lacks its code-derived source obligation";
+            return false;
+        }
+    for (const auto& [pc, bytes] : table.owned_raw_snapshot_requirements) {
+        const auto* resource = owned_raw_snapshot_at(table, pc, bytes);
+        if (!resource || !owns_scalar_word(table, *resource)) {
+            error = "code-required wide scalar source has no complete owned capture backing";
+            return false;
+        }
+    }
+    return true;
 }
 
 // `own_mip_chain_allocations` extends a materializable mip chain's range to the WHOLE guest
@@ -86,6 +113,7 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
     auto add_table = [&](const ShaderResourceTable* t,
                          const std::set<uint32_t>* used_bindings) -> bool {
         if (!t) return true;
+        if (!validate_owned_raw_capture_inputs(*t, error)) return false;
         for (const auto& r : t->resources) {
             if (!valid_shader_buffer_table_contract(r)) {
                 error = "resource has an invalid buffer descriptor-table contract";
@@ -103,11 +131,11 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
                 !capture_authority_requires_backing(t, r))
                 continue;
             if (owns_scalar_word(*t, r)) {
-                if (total > kMaxTotalBlobBytes - sizeof(uint32_t)) {
+                if (total > kMaxTotalBlobBytes - r.size) {
                     error = "capture resource data exceeds 3 GiB";
                     return false;
                 }
-                total += sizeof(uint32_t);
+                total += r.size;
                 continue;
             }
             if (r.table_index_count) {
@@ -253,6 +281,7 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
                    GpuCaptureFile* capture = nullptr) {
     dst.present = src != nullptr;
     if (!src) return true;
+    if (include_resource_data && !validate_owned_raw_capture_inputs(*src, error)) return false;
     for (const auto& r : src->resources) {
         if (!valid_shader_buffer_table_contract(r)) {
             error = "resource has an invalid buffer descriptor-table contract";
@@ -323,8 +352,8 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
             }
             GpuCaptureBlob blob;
             blob.guest_addr = r.gpu_addr;
-            blob.bytes_read = sizeof(uint32_t);
-            blob.bytes.assign(r.host_data, r.host_data + sizeof(uint32_t));
+            blob.bytes_read = r.size;
+            blob.bytes.assign(r.host_data, r.host_data + r.size);
             blob.content_hash = gpu_capture_hash(blob.bytes);
             c.blob_index = static_cast<uint32_t>(capture->blobs.size());
             capture->blobs.push_back(std::move(blob));

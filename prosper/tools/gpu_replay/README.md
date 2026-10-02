@@ -661,7 +661,7 @@ effective SPIR-V/backend subgroup width or complete compilation-input fidelity. 
 fragment retries are separate: they use their captured v61+ PS width when available and ignore this
 realized-draw override. A plain stored-SPIR-V replay does not regenerate or change shader width.
 
-Capture v65 independently retains the producing host float-transport profile for realized draws,
+Capture v66 independently retains the producing host float-transport profile for realized draws,
 compute configurations and failed compiler requests: `unknown`, `implicit`, or
 `explicit-nonfinite32`. Raw, pixel-tap and failed-stage regeneration pass that retained choice and
 report it; legacy captures remain unknown, never inferred from a stored SPIR-V capability or the

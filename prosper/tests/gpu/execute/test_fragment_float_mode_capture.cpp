@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> bytes;
     CHECK(capture_draw_items(realized,metadata,reader,capture,error) &&
               serialize_gpu_capture(capture,bytes,error) && deserialize_gpu_capture(bytes,loaded,error) &&
-              loaded.format_version==66 && loaded.draws.size()==realized.size(),
+              loaded.format_version==67 && loaded.draws.size()==realized.size(),
           "actual collector and current production codecs round trip realized mode");
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded,replay,error) && replay.items.size()==realized.size(),
@@ -170,9 +170,9 @@ int main(int argc, char** argv) {
                   result->draws[i].ps_float_flags==realized[i].ps_float_flags,
               "bundle paths preserve unknown, explicitly programmed zero and full-byte values");
     const size_t flags_tail=bytes.size()-8u-3u*capture.draws.size();
-    auto v65_bytes=bytes; v65_bytes.resize(flags_tail); set32(v65_bytes,8,65);
-    CHECK(deserialize_gpu_capture(v65_bytes,loaded,error) && loaded.format_version==65,
-          "genuine v65 prefix retains MODE/profile without inventing independent flags");
+    auto v66_bytes=bytes; v66_bytes.resize(flags_tail); set32(v66_bytes,8,66);
+    CHECK(deserialize_gpu_capture(v66_bytes,loaded,error) && loaded.format_version==66,
+          "genuine v66 prefix retains MODE/profile without inventing independent flags");
     for (const auto& draw : loaded.draws) CHECK(draw.ps_float_flags==FragmentFloatFlags{},
           "known old MODE and source markers do not create known IEEE/DX10 flags");
     CHECK(serialize_gpu_capture(loaded,bytes,error) && deserialize_gpu_capture(bytes,loaded,error),
@@ -181,27 +181,38 @@ int main(int argc, char** argv) {
     CHECK(serialize_gpu_capture(capture,bytes,error),"restore exact producing flag bytes for hostile controls");
     for (size_t field : {flags_tail,bytes.size()-4}) {
         auto corrupt=bytes; set32(corrupt,field,UINT32_MAX);
-        CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"hostile v66 counts refuse before second allocations");
+        CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"hostile v67 counts refuse before second allocations");
     }
     for (size_t field : {flags_tail+4,flags_tail+5,flags_tail+6}) {
         auto corrupt=bytes; corrupt[field]=2;
         CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="invalid realized-draw fragment float flags",
-              "every v66 flag byte rejects nonboolean tags");
+              "every v67 flag byte rejects nonboolean tags");
     }
     auto bad_flags=bytes; bad_flags[flags_tail+4]=0; bad_flags[flags_tail+5]=1;
     CHECK(!deserialize_gpu_capture(bad_flags,loaded,error),"unavailable nonzero flag payload refuses");
     for (size_t end=flags_tail;end<bytes.size();++end) {
         auto corrupt=bytes; corrupt.resize(end);
-        CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"every truncated v66 suffix refuses");
+        CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"every truncated v67 suffix refuses");
     }
-    auto v64_bytes = bytes;
-    v64_bytes.resize(v64_bytes.size() - 8u - 3u*capture.draws.size()); // v66 flags
-    v64_bytes.resize(v64_bytes.size() - 12u - capture.draws.size());
-    set32(v64_bytes,8,64);
-    CHECK(deserialize_gpu_capture(v64_bytes,loaded,error) && loaded.format_version==64,
-          "genuine v64 prefix removes only the complete transport tail");
-    const size_t tail = v64_bytes.size() - 8u - 2u*capture.draws.size();
-    auto legacy_bytes = v64_bytes; legacy_bytes.resize(tail); set32(legacy_bytes,8,63);
+    const bool no_resources = capture.computes.empty() && capture.failure_diagnostics.empty() &&
+        std::all_of(capture.draws.begin(),capture.draws.end(),[](const auto& draw) {
+            return draw.vrt.resources.empty() && draw.prt.resources.empty();
+        });
+    CHECK(no_resources && bytes.size() >= 32u+6u*capture.draws.size(),
+          "mode controls require the resource-free combined fixture");
+    if (!no_resources || bytes.size() < 32u+6u*capture.draws.size()) return 1;
+    auto mode_bytes = bytes;
+    mode_bytes.resize(mode_bytes.size()-8u-3u*capture.draws.size()-12u-capture.draws.size()-4u);
+    set32(mode_bytes,8,64);
+    GpuCaptureFile official64;
+    CHECK(deserialize_gpu_capture(mode_bytes,official64,error) && official64.format_version==64 &&
+              official64.draws.size()==capture.draws.size(),
+          "genuine official v64 prefix retains complete producing-mode records");
+    for (size_t i=0;i<capture.draws.size() && i<official64.draws.size();++i)
+        CHECK(official64.draws[i].ps_float_mode==capture.draws[i].ps_float_mode,
+              "official v64 preserves known zero, all mode bits and unknown availability");
+    const size_t tail = mode_bytes.size() - 8u - 2u*capture.draws.size();
+    auto legacy_bytes = mode_bytes; legacy_bytes.resize(tail); set32(legacy_bytes,8,63);
     GpuCaptureFile legacy;
     CHECK(deserialize_gpu_capture(legacy_bytes,legacy,error) && legacy.format_version==63,
           "genuine append-only v63 prefix loads without FLOAT_MODE");
@@ -213,22 +224,22 @@ int main(int argc, char** argv) {
           "legacy rewrite succeeds without inventing mode authority");
     for (const auto& draw : legacy.draws) CHECK(!draw.ps_float_mode.available,"rewrite preserves unknown mode");
     for (uint32_t count : {0u,1u,UINT32_MAX}) {
-        auto corrupt=v64_bytes; set32(corrupt,tail,count);
+        auto corrupt=mode_bytes; set32(corrupt,tail,count);
         CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="invalid realized-draw fragment float mode count",
               "hostile mode count rejected before allocating additional records");
     }
     for (uint8_t tag : {uint8_t{2},uint8_t{255}}) {
-        auto corrupt=v64_bytes; corrupt[tail+4]=tag;
+        auto corrupt=mode_bytes; corrupt[tail+4]=tag;
         CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="invalid realized-draw fragment float mode",
               "reserved mode availability tags reject");
     }
-    auto corrupt=v64_bytes; corrupt[tail+4]=0; corrupt[tail+5]=1;
+    auto corrupt=mode_bytes; corrupt[tail+4]=0; corrupt[tail+5]=1;
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error), "unknown nonzero mode fails closed");
-    corrupt=v64_bytes; set32(corrupt,v64_bytes.size()-4,UINT32_MAX);
+    corrupt=bytes; set32(corrupt,mode_bytes.size()-4,UINT32_MAX);
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="invalid failed-draw fragment float mode count",
           "failure mode count must match already bounded diagnostics");
-    for (size_t end : {tail,tail+3,tail+4,tail+5,v64_bytes.size()-1}) {
-        corrupt=v64_bytes; corrupt.resize(end);
+    for (size_t end : {tail,tail+3,tail+4,tail+5,mode_bytes.size()-1}) {
+        corrupt=bytes; corrupt.resize(end);
         CHECK(!deserialize_gpu_capture(corrupt,loaded,error), "truncated v64 tail rejects");
     }
     corrupt=bytes; corrupt.push_back(0);

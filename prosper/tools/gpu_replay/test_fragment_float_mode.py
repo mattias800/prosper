@@ -37,7 +37,7 @@ class Module:
             self.ops.append(op)
             if op in (20,21,22,23,32):
                 self.types[a[0]] = (op,a)
-            elif op in (41,42,43,59,80,83,124,168,169,170,171,174,199):
+            elif op in (41,42,43,59,80,83,124,128,132,168,169,170,171,174,199):
                 self.defs[a[1]] = (op,a)
             elif op == 71 and len(a)==3 and a[1]==30:
                 self.locations[a[0]]=a[2]
@@ -77,8 +77,9 @@ class Module:
                 result=evaluate(a[3] if evaluate(a[2]) else a[4])
             elif op==168 and t==20:
                 result=int(not evaluate(a[2]))
-            elif op==199 and t==21 and ta[1:]==(32,0):
-                result=evaluate(a[2]) & evaluate(a[3])
+            elif op in (128,132,199) and t==21 and ta[1:]==(32,0):
+                lhs,rhs=evaluate(a[2]),evaluate(a[3])
+                result=((lhs+rhs) if op==128 else (lhs*rhs) if op==132 else (lhs&rhs)) & 0xffffffff
             elif op in (170,171,174) and t==20:
                 lhs,rhs=evaluate(a[2]),evaluate(a[3])
                 result=int(lhs==rhs if op==170 else lhs!=rhs if op==171 else lhs>=rhs)
@@ -123,24 +124,31 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
         data=(directory/(name+".prgcap")).read_bytes()
         flags_tail=(struct.pack("<I",1)+b"\x01\x00\x00"+struct.pack("<I",0) if name=="mode16" else
                     struct.pack("<II",0,1)+b"\x01\x00\x00")
-        check(struct.unpack_from("<I",data,8)[0]==66 and data.endswith(flags_tail),
-              name+" genuine independent known-clear-flags v66 tail")
+        check(struct.unpack_from("<I",data,8)[0]==67 and data.endswith(flags_tail),
+              name+" genuine independent known-clear-flags v67 tail")
         data=bytearray(data[:-len(flags_tail)])
-        struct.pack_into("<I",data,8,65)
+        struct.pack_into("<I",data,8,66)
         transport_tail=(struct.pack("<I",1)+b"\x00"+struct.pack("<II",0,0) if name=="mode16" else
                         struct.pack("<III",0,0,1)+b"\x00"+struct.pack("<I",1)+b"\x00")
-        check(struct.unpack_from("<I",data,8)[0]==65 and data.endswith(transport_tail),
-              name+" genuine canonical unknown-transport v65 tail")
+        check(struct.unpack_from("<I",data,8)[0]==66 and data.endswith(transport_tail),
+              name+" genuine canonical unknown-transport v66 tail")
         data=bytearray(data[:-len(transport_tail)])
-        struct.pack_into("<I",data,8,64)
+        struct.pack_into("<I",data,8,65)
         expected_tail=(struct.pack("<I",1)+b"\x01\x10"+struct.pack("<I",0) if name=="mode16" else
                        struct.pack("<I",0)+struct.pack("<I",1)+b"\x01\x10")
-        check(struct.unpack_from("<I",data,8)[0]==64 and data.endswith(expected_tail),
-              name+" genuine canonical v64 producing mode tail")
-        legacy=bytearray(data[:-len(expected_tail)])
+        combined=(struct.unpack_from("<I",data,8)[0]==65 and
+                  data.endswith(expected_tail+struct.pack("<I",0)))
+        check(combined,name+" combined v65 retains canonical mode before zero owned obligations")
+        if not combined:
+            continue
+        official=bytearray(data[:-4])
+        struct.pack_into("<I",official,8,64)
+        check(official.endswith(expected_tail),name+" genuine official v64 producing mode tail")
+        (directory/("official64"+("-failed" if name.endswith("failed") else "")+".prgcap")).write_bytes(official)
+        legacy=bytearray(official[:-len(expected_tail)])
         struct.pack_into("<I",legacy,8,63)
         (directory/("legacy"+("-failed" if name.endswith("failed") else "")+".prgcap")).write_bytes(legacy)
-    states.append(("legacy",None))
+    states.extend([("official64",16),("legacy",None)])
     for state,mode in states:
         for route in ("recompile-raw","fs-tap","retry-failed-stage"):
             capture=directory/(state+("-failed" if route=="retry-failed-stage" else "")+".prgcap")
@@ -178,16 +186,19 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
                     except ValueError as error:
                         check(False,label+" fail-closed output oracle: "+str(error))
     original=(directory/"mode16.prgcap").read_bytes()
-    # MODE offsets precede the exact one-draw, no-compute, no-failure v65 transport tail.
+    # MODE precedes one zero-owned-count v65 tail and one-draw/no-compute/no-failure v66 transport.
     transport_tail_size=13
     flags_tail_size=11
-    start=len(original)-flags_tail_size-transport_tail_size-10
+    start=len(original)-flags_tail_size-transport_tail_size-4-10
     malformed={
         "count":original[:start]+struct.pack("<I",0)+original[start+4:],
         "tag":original[:start+4]+b"\x02"+original[start+5:],
         "unknown-value":original[:start+4]+b"\x00\x10"+original[start+6:],
         "failure-count":original[:start+6]+struct.pack("<I",1)+original[start+10:],
-        "truncated":original[:-1],
+        "truncated-mode":original[:start+9],
+        "truncated-owned":original[:-flags_tail_size-transport_tail_size-1],
+        "truncated-transport":original[:-flags_tail_size-1],
+        "truncated-flags":original[:-1],
         "trailing":original+b"\x00",
         "relabel-only63":original[:8]+struct.pack("<I",63)+original[12:],
     }

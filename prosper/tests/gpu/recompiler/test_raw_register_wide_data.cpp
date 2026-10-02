@@ -168,26 +168,39 @@ int main(int argc, char** argv) {
           std::memcmp(replay.computes[0].resources->resources[0].host_data,
                       blob.bytes.data(), blob.bytes.size()) == 0,
           "replay preserves the rebased range and its owned current bytes");
-    // This compute-only fixture has no draw/failure records and one unknown transport profile.
+    // One compute resource, no draw/failure records: flags F8, transport T13, owned U8, mode M8, width W4.
     constexpr size_t flags_tail_bytes = 8u;
     constexpr size_t transport_tail_bytes = 13u;
+    constexpr size_t owned_tail_bytes = 8u;
     constexpr size_t mode_tail_bytes = 8u;
     constexpr size_t width_tail_bytes = 4u;
     constexpr size_t backing_tail_bytes = 5u;
-    CHECK(encoded.size() >= flags_tail_bytes + transport_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes &&
-          encoded[8] == 66u,
+    CHECK(encoded.size() >= flags_tail_bytes + transport_tail_bytes + owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes &&
+          encoded[8] == 67u,
           "legacy controls require the current versioned capture tail");
-    if (encoded.size() >= flags_tail_bytes + transport_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes) {
-        auto legacy = encoded;
-        // Remove v66 flag counts, v65 transport, v64 mode counts, v63 draw-width count,
-        // then the v62 backing marker to recover the genuine v61 prefix.
-        legacy.resize(legacy.size() - flags_tail_bytes - transport_tail_bytes - mode_tail_bytes - width_tail_bytes - backing_tail_bytes);
+    if (encoded.size() >= flags_tail_bytes + transport_tail_bytes + owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes) {
+        auto v64 = encoded;
+        v64.resize(v64.size() - flags_tail_bytes - transport_tail_bytes - owned_tail_bytes);
+        v64[8] = 64u;
+        CHECK(deserialize_gpu_capture(v64, decoded, error) &&
+              decoded.computes[0].resources.resources[0].resource.raw_register_snapshot &&
+              decoded.computes[0].resources.resources[0].resource.owned_raw_snapshot_bytes == 0u,
+              "official v64 retains the old marker without inventing an owned-wide obligation");
+        auto v62 = v64;
+        v62.resize(v62.size() - mode_tail_bytes - width_tail_bytes);
+        v62[8] = 62u;
+        CHECK(deserialize_gpu_capture(v62, decoded, error) &&
+              decoded.computes[0].resources.resources[0].resource.raw_register_snapshot &&
+              decoded.computes[0].resources.resources[0].resource.owned_raw_snapshot_bytes == 0u,
+              "v62 capture preserves the old marker without inventing an owned-wide obligation");
+        auto legacy = v62;
+        legacy.resize(legacy.size() - backing_tail_bytes);
         legacy[8] = 61u;
         CHECK(deserialize_gpu_capture(legacy, decoded, error) &&
               !decoded.computes[0].resources.resources[0].resource.raw_register_snapshot,
               "v61 capture leaves the new backing admission unavailable");
-        auto malformed = encoded;
-        malformed[malformed.size() - flags_tail_bytes - transport_tail_bytes - mode_tail_bytes - width_tail_bytes - 1u] = 2u;
+        auto malformed = v62;
+        malformed.back() = 2u;
         CHECK(!deserialize_gpu_capture(malformed, decoded, error) &&
               error == "invalid raw register snapshot state",
               "codec refuses an invented marker encoding");
