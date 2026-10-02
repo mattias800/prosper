@@ -366,6 +366,8 @@ jobs:
     name: Python quality
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       # Its own job for the reason contribution-shape is: it builds nothing, and a finding here must
       # not cost the build-and-test signal. Ruff is a RATCHET on changed files (the tree has ~1,500
