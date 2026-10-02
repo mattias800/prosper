@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -37,6 +38,12 @@ class PureRules(unittest.TestCase):
         )
         self.assertEqual([], cpq.missing_test_violations([tool], [tool, "prosper/tests/host/t.py"]))
 
+    def test_only_python_test_names_or_test_tree_changes_satisfy_presence(self):
+        tool = "prosper/tools/x/a.py"
+        self.assertTrue(cpq.missing_test_violations([tool], [tool, "prosper/tools/test_bypass.md"]))
+        self.assertTrue(cpq.is_test_file("prosper/tools/test_a.py"))
+        self.assertTrue(cpq.is_test_file("prosper/tests/host/test_tool.cpp"))
+
     def test_validate_ref_rejects_option_like_input(self):
         for bad in ("--output=x", "-x", "", "a b", "a;b"):
             with self.assertRaises(ValueError, msg=bad):
@@ -48,6 +55,39 @@ class PureRules(unittest.TestCase):
         (msg,) = cpq.ratchet_violations("a.py", 2, 5)
         self.assertIn("2 -> 5", msg)
         self.assertEqual([], cpq.ratchet_violations("a.py", 5, 5))
+
+    def test_ruff_errors_and_invalid_reports_are_not_zero_findings(self):
+        for code, stdout in ((2, "[]"), (0, ""), (1, "not JSON"), (0, "{}"), (0, '["x"]')):
+            with self.subTest(code=code, stdout=stdout):
+                result = subprocess.CompletedProcess([], code, stdout, "tool error")
+                with mock.patch.object(cpq, "ruff", return_value=result):
+                    with self.assertRaisesRegex(RuntimeError, "could not evaluate"):
+                        cpq.count_findings("x = 1\n", "a.py")
+
+    def test_valid_ruff_reports_are_counted(self):
+        for code, stdout, count in ((0, "[]", 0), (1, "[{}, {}]", 2)):
+            result = subprocess.CompletedProcess([], code, stdout, "")
+            with mock.patch.object(cpq, "ruff", return_value=result):
+                self.assertEqual(count, cpq.count_findings("x = 1\n", "a.py"))
+
+    def test_nul_records_preserve_paths_rename_origins_and_non_python_tests(self):
+        quoted = "prosper/tools/test_caf\u00e9\t.py"
+        records = f"A\0{quoted}\0R090\0old.py\0new.py\0M\0prosper/tests/test.cpp\0"
+        added, modified, touched = cpq.parse_changes(records)
+        self.assertEqual([quoted], added)
+        self.assertEqual({"new.py": "old.py"}, modified)
+        self.assertEqual([quoted, "new.py", "prosper/tests/test.cpp"], touched)
+
+    def test_incomplete_or_unknown_git_records_are_refused(self):
+        for records in ("A\0", "R100\0old.py\0", "A\0a.py", "X\0a.py\0"):
+            with self.subTest(records=records):
+                with self.assertRaises(ValueError):
+                    cpq.parse_changes(records)
+
+    def test_cli_reports_unevaluated_tool_failure(self):
+        with mock.patch.object(sys, "argv", ["quality", "--base", "main"]):
+            with mock.patch.object(cpq, "run", side_effect=RuntimeError("tool failed")):
+                self.assertEqual(2, cpq.main())
 
     @NEEDS_RUFF
     def test_selftest_passes(self):
@@ -118,6 +158,32 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual([], self.verdict())
         self.write("prosper/tools/x/old.py", "import importlib.util\nimport sys\nx = 2\n")
         self.commit("worse")
+        self.assertTrue(any("findings rose" in p for p in self.verdict()))
+
+    def test_non_python_test_tree_file_satisfies_the_presence_rule(self):
+        self.write("prosper/tools/x/new.py", CLEAN)
+        (self.repo / "prosper/tests/host").mkdir(parents=True)
+        self.write("prosper/tests/host/test_tool.cpp", "// Presence fixture; no execution.\n")
+        self.commit("tool with a test-tree change")
+        self.assertEqual([], self.verdict())
+
+    def test_non_python_test_basename_outside_test_tree_does_not_bypass_presence(self):
+        self.write("prosper/tools/x/new.py", CLEAN)
+        self.write("prosper/tools/x/test_bypass.md", "# Metadata is not a Python test.\n")
+        self.commit("tool with misleading metadata name")
+        self.assertTrue(any("no test_*.py" in p for p in self.verdict()))
+
+    def test_git_quoted_python_filename_is_checked(self):
+        self.write("prosper/tools/x/test_caf\u00e9.py", "x = 1\n")
+        self.commit("quoted path")
+        self.assertTrue(any("D100" in p for p in self.verdict()))
+
+    def test_renamed_python_retains_baseline_and_rejects_new_findings(self):
+        self.git("mv", "prosper/tools/x/old.py", "prosper/tools/x/moved.py")
+        self.commit("rename")
+        self.assertEqual([], self.verdict())
+        self.write("prosper/tools/x/moved.py", "import importlib.util\nimport sys\nx = 1\n")
+        self.commit("renamed file gets worse")
         self.assertTrue(any("findings rose" in p for p in self.verdict()))
 
 

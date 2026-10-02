@@ -69,7 +69,7 @@ ALLOWED_TOP_LEVEL = {
 
 # Root-level files that are fine regardless of the set above (documentation and licensing).
 ALLOWED_ROOT_SUFFIXES = (".md",)
-ALLOWED_ROOT_NAMES = {"LICENSE", "LICENSE.txt", "LICENSE.md", "NOTICE"}
+ALLOWED_ROOT_NAMES = {"LICENSE", "LICENSE.txt", "LICENSE.md", "NOTICE", "pyproject.toml", "uv.lock"}
 
 
 def top_level(path):
@@ -155,6 +155,8 @@ def selftest():
         ("rule 1: a new top-level directory", [("A", "framework/thing.hpp")]),
         ("rule 2: new source, no test touched", [("A", "prosper/src/diagnostics/foo.cpp")]),
         ("both rules at once", [("A", "core/x.hpp"), ("A", "prosper/src/y.cpp")]),
+        ("unreviewed root config", [("A", "private.toml")]),
+        ("unreviewed root lockfile", [("A", "other.lock")]),
     ]
     must_pass = [
         ("project startup hook", [("A", ".claude/settings.json")]),
@@ -169,6 +171,8 @@ def selftest():
         ("a new header under prosper/src (no .cpp)", [("A", "prosper/src/diagnostics/x.hpp")]),
         ("scripts and assets", [("A", "scripts/x.sh"), ("A", "assets/x.png")]),
         ("a deleted root file", [("D", "core/old.hpp")]),
+        ("project Python config", [("A", "pyproject.toml")]),
+        ("project Python lockfile", [("A", "uv.lock")]),
     ]
 
     failures = 0
