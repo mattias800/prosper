@@ -9,10 +9,6 @@ Companion docs: `GPU_PROFILING_EXTERNAL.md` (vendor tools that need no prosper c
 `DIAGNOSTIC_GATE_AUDIT.md` (existing switches), `src/diagnostics/AGENTS.md` and
 `src/diagnostics/perf/AGENTS.md` (the always-on `[perf-alarm]` layer), `tools/AGENTS.md` (tool index).
 
-The gap list was seeded by comparing against the planning beans of the sibling PortPS5 project
-(diagnostics epic and performance track). Those are **ideas to re-derive**, not code to port; see the
-evidence hierarchy in the charter.
-
 ## Principles
 
 - **Reach for free vendor tooling first** (RGP, RenderDoc, `radeontop`, the validation layer). Build a
