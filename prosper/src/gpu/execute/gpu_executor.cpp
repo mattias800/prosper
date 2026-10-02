@@ -3086,15 +3086,6 @@ bool straight_line_null_chain_dominates(const std::vector<Rdna2Inst>& instructio
     return found_definition && found_use;
 }
 
-// MIMG opcodes that WRITE memory: image_store, image_store_pck and every integer image atomic. This
-// is the set the consumer classifier treats as storage-only (`is_storage_image` in the fold below,
-// opcodes verified with llvm-mc in #2275). Every other MIMG opcode -- loads, samples of every flavour,
-// gathers, size and LOD queries -- only reads, and cannot rewrite descriptor backing.
-static bool mimg_opcode_writes_memory(uint32_t opcode) {
-    return opcode == 0x08 || opcode == 0x09 || opcode == 0x0f ||
-           (opcode >= 0x11 && opcode <= 0x1a && opcode != 0x13);
-}
-
 // A split image descriptor needs a stronger proof than the scalar fold's linear walk. In
 // particular, a conditional branch can skip one of two adjacent loads while the walk still sees
 // both. This deliberately admits only direct, entry-rooted scalar loads; computed pointers and
@@ -3199,12 +3190,9 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
     // are left unresolved because proving non-aliasing would need resource ownership analysis.
     for (size_t i = 0; i < use; ++i) {
         const auto& in = full[i];
-        if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF ||
-            in.fmt == Rdna2Format::FLAT ||
-            // Image loads, samples and gathers only read their source image. A prior store or
-            // atomic could rewrite these descriptor bytes through an alias.
-            (in.fmt == Rdna2Format::MIMG && mimg_opcode_writes_memory(in.opcode)) ||
-            (in.fmt == Rdna2Format::SMEM && in.opcode >= 0x10u)) return false;
+        // A prior store or atomic could rewrite these descriptor bytes through an alias. Plain
+        // loads, samples and gathers only read, so they do not revoke the proof.
+        if (rdna2_instruction_may_write_memory(in)) return false;
     }
     // Registers whose value the consumer's descriptor depends on: the T# words themselves, and (per
     // lane, below) the registers it was copied from and the pointer it was loaded through.
@@ -3274,10 +3262,7 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
     for (const auto& loop : backedges) {
         for (size_t i = loop[0]; i <= loop[1]; ++i) {
             const auto& in = full[i];
-            if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF ||
-                in.fmt == Rdna2Format::FLAT ||
-                (in.fmt == Rdna2Format::MIMG && mimg_opcode_writes_memory(in.opcode)) ||
-                (in.fmt == Rdna2Format::SMEM && in.opcode >= 0x10u)) return false;
+            if (rdna2_instruction_may_write_memory(in)) return false;
             for (const int reg : preserved)
                 if (may_write(in, reg)) return false;
         }

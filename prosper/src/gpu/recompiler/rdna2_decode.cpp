@@ -97,6 +97,26 @@ bool rdna2_instruction_may_change_exec(const Rdna2Inst& in) {
     return is_exec(in.dst) || is_exec(in.sdst);
 }
 
+bool rdna2_instruction_may_write_memory(const Rdna2Inst& in) {
+    switch (in.fmt) {
+        case Rdna2Format::MIMG:
+            // image_store, image_store_pck and the integer image atomics; samples, gathers, loads
+            // and queries only read. The same set the consumer classifier treats as storage-only.
+            return in.opcode == 0x08u || in.opcode == 0x09u || in.opcode == 0x0fu ||
+                   (in.opcode >= 0x11u && in.opcode <= 0x1au && in.opcode != 0x13u);
+        case Rdna2Format::MUBUF:
+            return !((in.opcode <= 0x03u) || (in.opcode >= 0x08u && in.opcode <= 0x0fu));
+        case Rdna2Format::MTBUF:
+            return in.opcode > 0x03u;
+        case Rdna2Format::FLAT:
+            return !(in.opcode >= 0x08u && in.opcode <= 0x0fu);
+        case Rdna2Format::SMEM:
+            return in.opcode >= 0x10u;
+        default:
+            return false;
+    }
+}
+
 static uint32_t mtbuf_vdata_dwords(const Rdna2Inst& in) {
     if (in.opcode > 15u) return 0;
     const uint32_t components = (in.opcode & 3u) + 1u;
