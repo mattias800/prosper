@@ -1718,9 +1718,9 @@ if(TARGET prosper_core)
   target_include_directories(test_frame_dump_policy PRIVATE frontends)
   add_test(NAME frame_dump_policy COMMAND test_frame_dump_policy)
 
-  add_executable(test_capture_compute_policy tests/gpu/capture/test_capture_compute_policy.cpp)
-  target_include_directories(test_capture_compute_policy PRIVATE src)
-  add_test(NAME capture_compute_policy COMMAND test_capture_compute_policy)
+  prosper_add_gtest(test_capture_compute_policy
+    SOURCES tests/gpu/capture/test_capture_compute_policy.cpp
+    INCLUDES src)
 
   add_executable(test_write_watch_policy frontends/shared/tests/test_write_watch_policy.cpp)
   # `src` as well as `frontends`: the knobs' strict parsing lives in diagnostics/env_numeric.hpp,
@@ -2834,11 +2834,10 @@ endif()
     SOURCES tests/host/memory/test_guest_memory_map.cpp
     LIBRARIES prosper_core)
 
-  add_executable(test_renderer_tracked_mapping_cache
-                 tests/hle/memory/test_renderer_tracked_mapping_cache.cpp)
-  target_include_directories(test_renderer_tracked_mapping_cache PRIVATE frontends)
-  target_link_libraries(test_renderer_tracked_mapping_cache PRIVATE prosper_core)
-  add_test(NAME renderer_tracked_mapping_cache COMMAND test_renderer_tracked_mapping_cache)
+  prosper_add_gtest(test_renderer_tracked_mapping_cache
+    SOURCES tests/hle/memory/test_renderer_tracked_mapping_cache.cpp
+    INCLUDES frontends
+    LIBRARIES prosper_core)
 
   add_executable(test_guest_memory_query tests/host/memory/test_guest_memory_query.cpp)
   target_link_libraries(test_guest_memory_query PRIVATE prosper_core)
