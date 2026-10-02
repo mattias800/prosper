@@ -18,6 +18,7 @@
 #endif
 
 #include "host/image/exec_image.hpp"
+#include "host/image/stub_append_batch.hpp"
 #include "host/fault/rbp_chain.hpp"   // guest_frames_from_rbp: the shared frame-pointer walk
 #include "host/fault/guest_stack_scan.hpp"   // the scan-based sibling, shared by both platforms
 #include "host/platform/immortal.hpp"   // #2613: registries a guest thread can reach after exit()
@@ -43,7 +44,6 @@
 #include <iterator>
 #include <map>
 #include <mutex>
-#include <new>
 #include <atomic>
 #include <limits>
 #include <string>
@@ -1277,26 +1277,12 @@ bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::s
 
     // Refuse the whole suffix before committing pages or touching the old table's padding.
     // Pass the scratch capacity, not the destination stride: invalid bridges report 257 bytes.
-    struct StagedStub {
-        uint8_t bytes[abi::kMaxBridgeBytes];
-        size_t length = 0;
-    };
-    std::vector<StagedStub> staged;
-    const size_t added = slots.size() - first_new;
-    if (added > staged.max_size()) return fail("import stub staging allocation failed");
-    try {
-        staged.resize(added);
-    } catch (const std::bad_alloc&) {
-        return fail("import stub staging allocation failed");
-    }
-    for (size_t j = 0; j < added; j++) {
-        const size_t i = first_new + j;
-        auto& stub = staged[j];
-        stub.length = emit_one_stub(stub.bytes, slots[i], (uint32_t)i, sizeof(stub.bytes));
-        if (stub.length > sizeof(stub.bytes))
-            return fail("generated Windows ABI bridge exceeds staging capacity");
-        if (stub.length > g_stub_size) return fail("generated Windows ABI bridge exceeds stub_size");
-    }
+    std::vector<detail::StagedStub<abi::kMaxBridgeBytes>> staged;
+    if (!detail::stage_stub_suffix(staged, first_new, slots.size(), g_stub_size,
+            [&slots](auto& bytes, size_t i) {
+                return emit_one_stub(bytes.data(), slots[i], (uint32_t)i, bytes.size());
+            }, "generated Windows ABI bridge exceeds staging capacity",
+            "generated Windows ABI bridge exceeds stub_size", err)) return false;
     // Commit only the pages the new slots need, inside the aperture install_stubs reserved. The
     // already-committed pages are never re-committed with different protection: relocated guest
     // code holds addresses inside them.
@@ -1305,11 +1291,7 @@ bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::s
         void* got = VirtualAlloc(want, need_end - mapped_end, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (!got || got != want) return fail("VirtualAlloc stub region extension failed");
     }
-    for (size_t j = 0; j < added; j++) {
-        const uint64_t i = first_new + j;
-        memcpy((uint8_t*)(uintptr_t)(g_stub_base + i * g_stub_size),
-               staged[j].bytes, staged[j].length);
-    }
+    detail::publish_stub_suffix(staged, g_stub_base, g_stub_size, first_new);
     g_nstubs = n;
     dispatch_grow_slots(&slots);   // publish only after every new stub is written
     if (getenv("PROSPER_STUBDUMP"))

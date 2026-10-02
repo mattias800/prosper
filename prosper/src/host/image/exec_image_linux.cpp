@@ -1,6 +1,7 @@
 // exec_image_linux.cpp — Linux host backing + HLE stubs (M2/M3). Compiles to nothing
 // on non-Linux so the shared (mingw) build is unaffected.
 #include "host/image/exec_image.hpp"
+#include "host/image/stub_append_batch.hpp"
 #include "host/abi/sysv_ms_bridge.hpp"
 #include "host/platform/immortal.hpp"   // #2613: registries a guest thread can reach after exit()
 #include "host/x86/sse4a.hpp"
@@ -43,7 +44,6 @@
 #include <limits>
 #include <map>
 #include <mutex>
-#include <new>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -3234,25 +3234,12 @@ bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::s
 
     // Current POSIX emitters need at most 82 bytes. Validate the whole suffix before mapping or
     // writing live pages, including the padding in the last page of the old table.
-    struct StagedStub {
-        uint8_t bytes[96];
-        size_t length = 0;
-    };
-    std::vector<StagedStub> staged;
-    const size_t added = slots.size() - first_new;
-    if (added > staged.max_size()) return fail("import stub staging allocation failed");
-    try {
-        staged.resize(added);
-    } catch (const std::bad_alloc&) {
-        return fail("import stub staging allocation failed");
-    }
-    for (size_t j = 0; j < added; j++) {
-        const size_t i = first_new + j;
-        auto& stub = staged[j];
-        stub.length = emit_one_stub(stub.bytes, slots[i], (uint32_t)i, swap);
-        if (stub.length > sizeof(stub.bytes)) return fail("generated import stub exceeds staging capacity");
-        if (stub.length > g_stub_size) return fail("generated import stub exceeds stub_size");
-    }
+    std::vector<detail::StagedStub<96>> staged;
+    if (!detail::stage_stub_suffix(staged, first_new, slots.size(), g_stub_size,
+            [&slots, swap](auto& bytes, size_t i) {
+                return emit_one_stub(bytes.data(), slots[i], (uint32_t)i, swap);
+            }, "generated import stub exceeds staging capacity",
+            "generated import stub exceeds stub_size", err)) return false;
     // Grow the region only by the pages the new slots need. The already-mapped pages are NEVER
     // remapped: relocated guest code already holds addresses inside them, and a fresh MAP_FIXED
     // would tear a stub out from under a thread executing it.
@@ -3263,11 +3250,7 @@ bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::s
                                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (got == MAP_FAILED || got != want) return fail("mmap stub region extension failed");
     }
-    for (size_t j = 0; j < added; j++) {
-        const uint64_t i = first_new + j;
-        memcpy((uint8_t*)(uintptr_t)(g_stub_base + i * g_stub_size),
-               staged[j].bytes, staged[j].length);
-    }
+    detail::publish_stub_suffix(staged, g_stub_base, g_stub_size, first_new);
     g_nstubs = n;
     // Publish the grown table only after every new stub is written: prosper_on_unimpl indexes it.
     dispatch_grow_slots(&slots);
