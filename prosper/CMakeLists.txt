@@ -5619,6 +5619,12 @@ endif()
 # physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
 # silent pass) where one does not.
 if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  add_executable(test_fragment_packet_exec tests/gpu/execute/test_fragment_packet_exec.cpp)
+  target_include_directories(test_fragment_packet_exec PRIVATE tests)
+  target_link_libraries(test_fragment_packet_exec PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME fragment_packet_exec COMMAND test_fragment_packet_exec)
+  set_tests_properties(fragment_packet_exec PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
   add_executable(test_float_transport_render tests/gpu/execute/test_float_transport_render.cpp)
   target_include_directories(test_float_transport_render PRIVATE tests frontends)
   target_link_libraries(test_float_transport_render PRIVATE prosper_core Vulkan::Vulkan)
