@@ -32,6 +32,7 @@
 
 using namespace prosper::gpu;
 
+static int fails = 0;
 #define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
@@ -564,5 +565,16 @@ void the_unchanged_picture_verdict_separates_static_from_dead() {
 } // namespace
 
 TEST(PresentFrameRate, Contract) {
-
+    std::printf("== content signature ==\n");            signature_discriminates();
+    std::printf("== live title ==\n");                   live_title_reports_its_real_rate();
+    std::printf("== FROZEN title (the arm) ==\n");       frozen_title_does_not_report_full_speed();
+    std::printf("== frozen, distinct buffers ==\n");     frozen_title_with_distinct_buffers_is_still_frozen();
+    std::printf("== a title that pauses (the arm) ==\n"); a_title_that_pauses_reports_its_producing_rate();
+    std::printf("== estimator accuracy ==\n");           interval_estimator_is_accurate();
+    std::printf("== window arithmetic ==\n");            window_math();
+    std::printf("== windowed active share (#3027) ==\n"); a_windowed_active_share_cannot_be_differenced();
+    std::printf("== static vs dead (the arm, #3027) ==\n"); the_unchanged_picture_verdict_separates_static_from_dead();
+    std::printf("== present-layer wiring ==\n");         present_layer_wiring();
+    dense_signature_pins_the_gpu_path();
+    EXPECT_EQ(fails, 0);
 }
