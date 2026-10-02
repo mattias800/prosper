@@ -244,6 +244,32 @@ private:
 std::string json_escape(const std::string& value);
 const char* capture_source_name(CaptureSource source);
 std::string manifest_run_json(const CaptureRunConfig& config);
+
+// The conditions a framerate depends on that the `run` line cannot know: it is written before the
+// guest boots and before the renderer has chosen a GPU. Written as its own `conditions` record just
+// before the summary, so a consumer (tools/perf/compare_runs.py) can refuse to compare two runs whose
+// conditions differ. Every field here decides whether two rates may be compared at all.
+struct CaptureConditions {
+    // Which harness produced the numbers. tools/screenshot never calls set_gpu_present_active, so its
+    // renderer copies every scanout frame back to the CPU: its rate describes the forced-readback
+    // path, not the shipped present path, and must never be compared against a prosper-app rate.
+    std::string harness = "tools/screenshot";
+    std::string present_path = "forced_readback";
+    std::string os;                // "windows", "linux", "macos"
+    // The guest flip pacing in force for the run (PROSPER_FLIP_PACE_FPS as seen by the process, after
+    // the tool's own opt-out). Two runs at different pacing are measuring different things.
+    std::string flip_pace_fps;
+    bool gpu_known = false;        // false when the renderer never selected a device
+    uint32_t gpu_vendor_id = 0;
+    uint32_t gpu_device_id = 0;
+    uint32_t gpu_driver_version = 0;
+    uint32_t gpu_api_version = 0;
+    uint32_t gpu_device_type = 0;
+};
+
+// `{"type":"conditions","schema":1,...}`. GPU fields are `null` when `gpu_known` is false, never 0:
+// a zero vendor id would read as a device and let two unknown-device runs compare as equal.
+std::string manifest_conditions_json(const CaptureConditions& conditions);
 std::string manifest_sample_json(int index, const std::string& png_path,
                                  const CaptureObservation& observation,
                                  const CaptureClassification& classification,

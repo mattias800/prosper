@@ -44,3 +44,11 @@ is a candidate for investigation, not proof that evicting it is profitable.
 `compare_capture_pair.py` checks routed F8 A/B run identities and balanced environment keys before
 computing the mean of recurring-shape renderer medians. Its weights and matching coverage stay visible; they are
 local recorded work, not equal-input proof or newly rendered FPS. See `COMPARE_CAPTURE_PAIR.md`.
+
+`compare_runs.py` compares two `tools/screenshot` manifests, and **refuses** (exit 2) rather than
+reporting a delta when the runs are not comparable: different title, route, scale, harness, present
+path, flip pacing, GPU or driver; an unknown GPU; a window that mixed regimes (active fraction below
+0.90); or a run that failed. Only the build revision and the measured fields may differ. Exit 1 means
+comparable and a threshold was crossed. The 3% typical-rate and 5% 1%-low thresholds are proposals,
+not noise-calibrated: repeat a baseline against itself to learn a title's noise first. It reads the
+two manifests and nothing else, and says nothing about image content.
