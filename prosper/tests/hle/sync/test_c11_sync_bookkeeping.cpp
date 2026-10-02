@@ -714,17 +714,17 @@ int main() {
             // that just renamed EDEADLK to ETIMEDOUT passes the first arm and fails this one).
             for (const int deadline_ms : { -1000, 60 }) {
                 auto arm = make_arm();
-                if (!c11_deadline(get_time, arm->deadline, deadline_ms)) {
-                    CHECK(false, "C11 control: the timed self-relock deadline is constructed");
-                    cleanup(arm);
-                    continue;
-                }
-                start_c11_worker(arm, [timed_lock, sce_try, sce_unlock](C11TimedArm& state) {
+                // The deadline is built INSIDE the worker, after `begin` is read. Built on the
+                // controller before the thread starts, every millisecond of thread start-up would
+                // come off the measured wait, and load would make a correct body fail the bound.
+                start_c11_worker(arm, [timed_lock, sce_try, sce_unlock, get_time,
+                                       deadline_ms](C11TimedArm& state) {
                     state.lock_result = call1(sce_try, &state.mutex);
                     if (state.lock_result == 0) {
                         const auto begin = std::chrono::steady_clock::now();
-                        state.result = timed_lock((uint64_t)(uintptr_t)&state.mutex,
-                                                   (uint64_t)(uintptr_t)state.deadline, 0, 0, 0, 0);
+                        if (c11_deadline(get_time, state.deadline, deadline_ms))
+                            state.result = timed_lock((uint64_t)(uintptr_t)&state.mutex,
+                                                       (uint64_t)(uintptr_t)state.deadline, 0, 0, 0, 0);
                         state.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - begin).count();
                     }
@@ -737,8 +737,9 @@ int main() {
                           "_Mtx_timedlock maps an expired ERRORCHECK self-relock to _Thrd_timedout(2), "
                           "as libthr does -- not glibc's immediate EDEADLK -> _Thrd_error(4)");
                 } else {
-                    // Lower bound only, with slack for wall-clock vs steady-clock granularity: load
-                    // can only make the call take LONGER, so this arm cannot flake under ctest -j.
+                    // Lower bound only, with slack for the guest clock's microsecond rounding. The
+                    // wait starts after `begin`, so load can only make it LONGER -- this arm cannot
+                    // flake under ctest -j.
                     CHECK(arm->lock_result == 0 && arm->result == 2 && arm->elapsed_ms >= 50,
                           "_Mtx_timedlock waits out a future deadline on an ERRORCHECK self-relock "
                           "before reporting _Thrd_timedout(2)");
@@ -747,6 +748,28 @@ int main() {
                       "C11 timed self-relock: the timeout preserves the original acquisition and permits cleanup");
                 cleanup(arm);
             }
+        }
+        // The same shared body through the Sony spelling, which takes a RELATIVE microsecond
+        // timeout and encodes its result: a self-relock is the encoded ETIMEDOUT, not the
+        // encoded EDEADLK this path used to report (#4133).
+        if (const HleFn sce_timed = by_name("scePthreadMutexTimedlock")) {
+            auto arm = make_arm();
+            start_c11_worker(arm, [sce_timed, sce_try, sce_unlock](C11TimedArm& state) {
+                state.lock_result = call1(sce_try, &state.mutex);
+                if (state.lock_result == 0)
+                    state.result = sce_timed((uint64_t)(uintptr_t)&state.mutex, 0, 0, 0, 0, 0);
+                state.probe = pthread_mutex_trylock((pthread_mutex_t*)state.mutex);
+                state.unlock_result = call1(sce_unlock, &state.mutex);
+            });
+            finish_c11_worker(arm, sce_broadcast);
+            CHECK(arm->lock_result == 0 && arm->result == prosper::hle::kSceKernelErrorETIMEDOUT,
+                  "scePthreadMutexTimedlock reports an ERRORCHECK self-relock as encoded ETIMEDOUT "
+                  "(0x8002003c), not encoded EDEADLK");
+            CHECK(arm->probe == EBUSY && arm->unlock_result == 0,
+                  "Sony timed self-relock: the timeout preserves the original acquisition and permits cleanup");
+            cleanup(arm);
+        } else {
+            CHECK(false, "scePthreadMutexTimedlock is registered");
         }
 
         // Deadline conversion failures must reach both callers without acquiring anything. Each

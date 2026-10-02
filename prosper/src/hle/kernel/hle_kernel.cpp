@@ -3138,8 +3138,7 @@ uint64_t guest_mutex_timedlock_slot(uint64_t slot_addr, uint64_t timeout_us) {
     hle::WaitCensusScope census(hle::WaitKind::MutexTimedlock, timeout_ns);
     const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    const uint64_t steady_deadline_ns = timeout_ns > UINT64_MAX - now_ns ? UINT64_MAX
-                                                                         : now_ns + timeout_ns;
+    const uint64_t steady_deadline_ns = prosper::host::deadline_ns_from(now_ns, timeout_ns);
     // Windows: winpthreads cannot report the relock itself, so the registry answers first.
     if (guest_mutex_self_deadlock(m)) return timed_self_relock(steady_deadline_ns);
     timespec dl = abs_deadline_us(timeout_us);
