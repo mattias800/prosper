@@ -127,8 +127,8 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> bytes;
     CHECK(capture_draw_items(realized,metadata,reader,capture,error) &&
               serialize_gpu_capture(capture,bytes,error) && deserialize_gpu_capture(bytes,loaded,error) &&
-              loaded.format_version==64 && loaded.draws.size()==realized.size(),
-          "actual collector and v64 production codecs round trip realized mode");
+              loaded.format_version==65 && loaded.draws.size()==realized.size(),
+          "actual collector and combined v65 production codecs round trip realized mode");
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded,replay,error) && replay.items.size()==realized.size(),
           "production replay materializes each immutable mode");
@@ -146,8 +146,23 @@ int main(int argc, char** argv) {
     for (const auto* result : {&full,&manifest}) for (size_t i=0;i<realized.size();++i)
         CHECK(i<result->draws.size() && result->draws[i].ps_float_mode==realized[i].ps_float_mode,
               "bundle paths preserve unknown, explicitly programmed zero and full-byte values");
-    const size_t tail = bytes.size() - 8u - 2u*capture.draws.size();
-    auto legacy_bytes = bytes; legacy_bytes.resize(tail); set32(legacy_bytes,8,63);
+    const bool no_resources = capture.computes.empty() && capture.failure_diagnostics.empty() &&
+        std::all_of(capture.draws.begin(),capture.draws.end(),[](const auto& draw) {
+            return draw.vrt.resources.empty() && draw.prt.resources.empty();
+        });
+    CHECK(no_resources && bytes.size() >= 4u+8u+2u*capture.draws.size(),
+          "mode controls require the resource-free combined fixture");
+    if (!no_resources || bytes.size() < 4u+8u+2u*capture.draws.size()) return 1;
+    auto mode_bytes = bytes; mode_bytes.resize(mode_bytes.size()-4u); set32(mode_bytes,8,64);
+    GpuCaptureFile official64;
+    CHECK(deserialize_gpu_capture(mode_bytes,official64,error) && official64.format_version==64 &&
+              official64.draws.size()==capture.draws.size(),
+          "genuine official v64 prefix retains complete producing-mode records");
+    for (size_t i=0;i<capture.draws.size() && i<official64.draws.size();++i)
+        CHECK(official64.draws[i].ps_float_mode==capture.draws[i].ps_float_mode,
+              "official v64 preserves known zero, all mode bits and unknown availability");
+    const size_t tail = mode_bytes.size() - 8u - 2u*capture.draws.size();
+    auto legacy_bytes = mode_bytes; legacy_bytes.resize(tail); set32(legacy_bytes,8,63);
     GpuCaptureFile legacy;
     CHECK(deserialize_gpu_capture(legacy_bytes,legacy,error) && legacy.format_version==63,
           "genuine append-only v63 prefix loads without FLOAT_MODE");
@@ -170,10 +185,10 @@ int main(int argc, char** argv) {
     }
     auto corrupt=bytes; corrupt[tail+4]=0; corrupt[tail+5]=1;
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error), "unknown nonzero mode fails closed");
-    corrupt=bytes; set32(corrupt,bytes.size()-4,UINT32_MAX);
+    corrupt=bytes; set32(corrupt,mode_bytes.size()-4,UINT32_MAX);
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="invalid failed-draw fragment float mode count",
           "failure mode count must match already bounded diagnostics");
-    for (size_t end : {tail,tail+3,tail+4,tail+5,bytes.size()-1}) {
+    for (size_t end : {tail,tail+3,tail+4,tail+5,mode_bytes.size()-1}) {
         corrupt=bytes; corrupt.resize(end);
         CHECK(!deserialize_gpu_capture(corrupt,loaded,error), "truncated v64 tail rejects");
     }

@@ -16,6 +16,7 @@
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
 #include "gpu/resources/fold_control_plan.hpp"
 #include "gpu/capture/fold_capture.hpp"
+#include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
@@ -114,6 +115,7 @@ struct ShaderResourceCompileKey {
     uint32_t nested_raw_snapshot_bytes = 0;
     uint32_t raw_register_snapshot_bytes = 0;
     uint32_t raw_offset_scalar_snapshot_bytes = 0;
+    uint32_t raw_owned_wide_snapshot_bytes = 0;
     uint32_t fetch_index_mode = 0;
     uint32_t table_index_count = 0;
     uint32_t table_entry_stride = 0;
@@ -198,6 +200,10 @@ struct ShaderCompileKey {
     // transient concatenated buffer on every warm draw.
     std::shared_ptr<const std::vector<uint32_t>> chain_code;
     uint64_t chain_code_hash = 0;
+    // Non-semantic cache provenance: exact-byte analysis versions, never emitted module inputs.
+    // Module equality/hash intentionally exclude these IDs so code-identical versions still share.
+    uint64_t code_analysis_identity = 0;
+    uint64_t chain_analysis_identity = 0;
     std::vector<ShaderResourceCompileKey> resources;
     // Diagnostic identity. All-default in production (PROSPER_CFG_TRIP_BOUND unset), which leaves
     // every key byte-identical to what it was before this field existed -- so caching behaviour is
@@ -374,6 +380,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.nested_raw_snapshot_bytes);
             hash = hash_mix(hash, resource.raw_register_snapshot_bytes);
             hash = hash_mix(hash, resource.raw_offset_scalar_snapshot_bytes);
+            hash = hash_mix(hash, resource.raw_owned_wide_snapshot_bytes);
             hash = hash_mix(hash, resource.fetch_index_mode);
             hash = hash_mix(hash, resource.table_index_count);
             hash = hash_mix(hash, resource.table_entry_stride);
@@ -437,6 +444,8 @@ struct ShaderCompileKeyHash {
 
 struct CachedShader {
     SharedShaderWords spirv;
+    FragmentArithmeticObservation fragment_arithmetic;
+    std::shared_ptr<const FragmentCompileCase> fragment_case;
     uint64_t identity = 0;
     mutable std::atomic<uint64_t> last_use{0};
     uint64_t bytes = 0;
@@ -451,12 +460,15 @@ struct CachedShader {
     // ordering is irrelevant to correctness and the stronger one costs nothing measurable here.
     CachedShader() = default;
     CachedShader(CachedShader&& other) noexcept
-        : spirv(std::move(other.spirv)), identity(other.identity),
+        : spirv(std::move(other.spirv)), fragment_arithmetic(other.fragment_arithmetic),
+          fragment_case(std::move(other.fragment_case)), identity(other.identity),
           last_use(other.last_use.load()),
           bytes(other.bytes), writes_trip_witness(other.writes_trip_witness) {}
     CachedShader& operator=(CachedShader&& other) noexcept {
         if (this != &other) {
             spirv = std::move(other.spirv);
+            fragment_arithmetic = other.fragment_arithmetic;
+            fragment_case = std::move(other.fragment_case);
             identity = other.identity;
             last_use.store(other.last_use.load());
             bytes = other.bytes;
@@ -465,12 +477,15 @@ struct CachedShader {
         return *this;
     }
     CachedShader(const CachedShader& other)
-        : spirv(other.spirv), identity(other.identity),
+        : spirv(other.spirv), fragment_arithmetic(other.fragment_arithmetic),
+          fragment_case(other.fragment_case), identity(other.identity),
           last_use(other.last_use.load(std::memory_order_relaxed)),
           bytes(other.bytes), writes_trip_witness(other.writes_trip_witness) {}
     CachedShader& operator=(const CachedShader& other) {
         if (this != &other) {
             spirv = other.spirv;
+            fragment_arithmetic = other.fragment_arithmetic;
+            fragment_case = other.fragment_case;
             identity = other.identity;
             last_use.store(other.last_use.load(std::memory_order_relaxed), std::memory_order_relaxed);
             bytes = other.bytes;
@@ -507,6 +522,7 @@ struct DecodedShader {
     std::vector<uint32_t> raw_immediate_wide_data_load_pcs;
     std::vector<uint32_t> raw_register_wide_data_load_pcs;
     std::vector<uint32_t> raw_offset_scalar_source_pcs;
+    std::vector<uint32_t> raw_owned_wide_data_load_pcs;
     std::vector<uint32_t> raw_nested_wide_data_load_pcs;
     // Full-stream inventory: specialization may remove a spill but cannot introduce one.
     std::bitset<256> scalar_spill_written_vgprs;

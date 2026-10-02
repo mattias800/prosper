@@ -4,6 +4,7 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "host/abi/guest_varargs.hpp"   // #3246: the guest's variadic list, re-expressed for the host
+#include "hle/libc/libc_variadic_capture.hpp"
 #include "gpu/timeline/gpu_timeline.hpp"
 #include <cstring>
 #include <cstdlib>
@@ -477,7 +478,9 @@ HLE(h_wcslen)   { return (uint64_t)wcslen((const wchar_t*)P(a0)); }   // host wc
 // argument's class from the format string, and write the flat slot array that IS a Microsoft
 // `va_list`. host/abi/guest_varargs.cpp owns that; this is the wiring.
 namespace {
+#if defined(_WIN32)
 int capture_aware_vprintf(const char* format, va_list args);   // defined below, with the log capture
+#endif
 
 #if defined(_WIN32)
 using prosper::abi::FormatGrammar;
@@ -493,13 +496,12 @@ void warn_unmodelled_format(const char* fmt, const char* why) {
                     "only: \"%s\"\n", why ? why : "?", fmt ? fmt : "(null)");
 }
 
-enum class WinVariadicSink { Printf, Sprintf, Snprintf, Sscanf };
-
 // Everything the PROSPER_GUEST_ABI shims must not do in their own frames. `noinline` and `noexcept`
 // are load-bearing rather than decorative: a guest-ABI frame cannot carry SEH unwind data, so an
 // inlined callee owning a destructor — or a call that may throw — makes the function fail to
 // assemble (`.seh_handlerdata used outside of .seh_proc block`). See PROSPER_GUEST_ABI in
 // dispatch.hpp. Keeping every C++ object on this side of the call is the whole discipline.
+} // namespace
 __attribute__((noinline))
 uint64_t win_variadic_call(WinVariadicSink sink, void* buf, size_t n, const char* src,
                            const char* fmt, const SysvVaList& ap, bool run_checkpoint) noexcept {
@@ -520,6 +522,7 @@ uint64_t win_variadic_call(WinVariadicSink sink, void* buf, size_t n, const char
     if (run_checkpoint) dispatch_pending_guest_exception();
     return (uint64_t)(int64_t)r;
 }
+namespace {
 
 // A guest `va_list*`, read as the System V structure it actually is.
 SysvVaList guest_va_list_at(uint64_t guest_ptr) {
@@ -633,6 +636,9 @@ bool format_may_write_n(const char* format) {
     return false;
 }
 
+#if !defined(_WIN32)
+} // namespace
+#endif
 int capture_aware_vprintf(const char* format, va_list args) {
     if (!prosper::gpu::guest_log_capture_bundle_enabled() || format_may_write_n(format))
         return vprintf(format, args);
@@ -665,6 +671,9 @@ int capture_aware_vprintf(const char* format, va_list args) {
     }
     return result;
 }
+#if !defined(_WIN32)
+namespace {
+#endif
 
 void observe_guest_c_string(const char* text, bool known_newline,
                             prosper::gpu::GuestLogCaptureSource source) {
@@ -677,81 +686,6 @@ void observe_guest_c_string(const char* text, bool known_newline,
 }
 } // namespace
 
-// The printf family: REAL C variadic functions, and PROSPER_GUEST_ABI so the import stub is the same
-// bare tail-jump on EVERY platform. That is what puts the guest's own System V frame — integer
-// registers, xmm registers, AL and the overflow area alike — in front of the compiler's variadic
-// prologue, which is the only thing that can capture an argument list the format string decides at
-// run time. On Linux and macOS this is exactly what already happened and the tag expands to nothing;
-// on Windows it replaces a fixed integer shuffle that could not deliver a floating-point argument at
-// all and displaced every argument behind one (#3246).
-//
-// Guest pointers are identity-mapped (guest VA == host VA), so the buffer, the format string and any
-// %s argument are usable host pointers directly — no P() translation, because nothing re-places the
-// guest's values on the way in.
-//
-// Each body is deliberately trivial, and that is a REQUIREMENT rather than a style: a guest-ABI frame
-// cannot carry SEH unwind data on Windows, so it may own no object with a destructor and must call
-// nothing that could be inlined into it carrying one (PROSPER_GUEST_ABI in dispatch.hpp). Capture,
-// delegate, return.
-//
-// THE ONE CAVEAT, and it is on LINUX rather than on the new path. When guest %fs TLS is on — which is
-// the DEFAULT (`guest_tls.cpp` opts out only through PROSPER_NO_GUEST_FS) — the import stub is not a
-// tail-jump at all but the swap stub, which interposes a CALL so it can restore the guest's %fs
-// afterwards. To keep the callee's stack arguments where SysV puts them it re-pushes the guest's
-// spilled words... and it re-pushes exactly FOUR of them (`emit_swap_stub`, exec_image_linux.cpp:
-// "push original arg10/9/8/7"). Immediately behind those sits the stub's saved r11, then the guest's
-// return address, then a shifted duplicate of the same four words.
-//
-// So a variadic call whose overflow area holds a FIFTH word reads the stub's saved r11 as that
-// argument, and everything after it is wrong too. Reaching it needs more than six integer-class or
-// more than eight floating-point variadic arguments — rare for a format call, and unchanged by this
-// commit, which is why it is recorded rather than fixed here (#3271). It is NOT a Windows problem: there the
-// guest-ABI stub really is a bare tail-jump with no interposed frame, so the overflow area arrives
-// whole. macOS never emits the swap stub either (`stub_swap_mode()` returns false there).
-//
-// CONFIDENCE: HIGH on Linux/macOS for register and xmm arguments, which is the overwhelmingly common
-// case and the long-standing behaviour with the tag empty; MED for Linux stack-spilled arguments past
-// the fourth, per the paragraph above. HIGH on the Windows mechanism — the shape below was assembled
-// by MinGW GCC 16.1.1 at every optimization level and executed under wine, delivering a
-// twelve-argument mixed call including System V overflow-area integers and five xmm doubles, and the
-// whole suite runs on the Windows MinGW CI host (#3246). What is NOT verified is a live guest calling
-// it on a Windows host; nobody here has one.
-static PROSPER_GUEST_ABI uint64_t h_snprintf(void* buf, size_t n, const char* fmt, ...) {
-#if defined(_WIN32)
-    __builtin_sysv_va_list ap; __builtin_sysv_va_start(ap, fmt);
-    prosper::abi::SysvVaList captured; memcpy(&captured, &ap, sizeof captured);
-    __builtin_sysv_va_end(ap);
-    return win_variadic_call(WinVariadicSink::Snprintf, buf, n, nullptr, fmt, captured,
-                             /*run_checkpoint=*/true);
-#else
-    va_list ap; va_start(ap, fmt); int r = vsnprintf((char*)buf, n, fmt, ap); va_end(ap);
-    return (uint64_t)(int64_t)r;
-#endif
-}
-static PROSPER_GUEST_ABI uint64_t h_sprintf(void* buf, const char* fmt, ...) {
-#if defined(_WIN32)
-    __builtin_sysv_va_list ap; __builtin_sysv_va_start(ap, fmt);
-    prosper::abi::SysvVaList captured; memcpy(&captured, &ap, sizeof captured);
-    __builtin_sysv_va_end(ap);
-    return win_variadic_call(WinVariadicSink::Sprintf, buf, 0, nullptr, fmt, captured,
-                             /*run_checkpoint=*/true);
-#else
-    va_list ap; va_start(ap, fmt); int r = vsprintf((char*)buf, fmt, ap); va_end(ap);
-    return (uint64_t)(int64_t)r;
-#endif
-}
-static PROSPER_GUEST_ABI uint64_t h_printf(const char* fmt, ...) {
-#if defined(_WIN32)
-    __builtin_sysv_va_list ap; __builtin_sysv_va_start(ap, fmt);
-    prosper::abi::SysvVaList captured; memcpy(&captured, &ap, sizeof captured);
-    __builtin_sysv_va_end(ap);
-    return win_variadic_call(WinVariadicSink::Printf, nullptr, 0, nullptr, fmt, captured,
-                             /*run_checkpoint=*/true);
-#else
-    va_list ap; va_start(ap, fmt); int r = capture_aware_vprintf(fmt, ap); va_end(ap);
-    return (uint64_t)(int64_t)r;
-#endif
-}
 // sscanf: a REAL variadic host thunk, and deliberately NOT guest-ABI — the one member of the family
 // #3246's affected table lists that turns out not to be affected. Every variadic argument a
 // scanf-family call passes is a POINTER, so the list is all-integer, no floating-point duplication is

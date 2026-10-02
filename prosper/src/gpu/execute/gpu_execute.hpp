@@ -279,10 +279,11 @@ struct SrtUse {
     int kind = 0;                    // 0 = texture, 1 = constant buffer, 2 = BVH buffer,
                                      // 3 = proven guarded null BVH, 4 = raw register-offset snapshot,
                                      // 5 = latched immediate-zero x1 offset source: v4={addr lo,hi,word,0}
+                                     // 6 = owned immediate-wide read: v4={effective addr lo,hi,0,0}
     uint32_t key = 0;                // the s_load immediate byte offset (== emit_alu's sreg_srt tag);
                                      // 0xFFFFFFFF = key-less (direct entry V#, register-SOFFSET, or
                                      // negative-imm load; resolve by the exact instruction pc instead)
-    std::array<uint32_t, 8> t8{};    // T# dwords as loaded (kind 0)
+    std::array<uint32_t, 8> t8{};    // T# words (kind 0), owned observed x4/x8 words (kind 6)
     // Exact mapped source of the eight live T# dwords, when every word still descends from the
     // same contiguous mapped range, possibly via adjacent scalar loads. Zero means the live
     // descriptor was seeded directly, assembled from unrelated loads, or modified by scalar ALU.

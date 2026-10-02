@@ -1,4 +1,6 @@
 #pragma once
+#include "gpu/recompiler/compiler_choices.hpp"
+#include "gpu/recompiler/compiler_resource_access.hpp"
 
 // Lifted out of rdna2_to_spirv.cpp's anonymous namespaces so the emit functions that
 // operate on them can live in their own translation units. These are INTERNAL to the
@@ -397,6 +399,11 @@ struct SpirvCompute {
     std::vector<uint32_t> caps, exts, extimp, mem, entry, exec, debug, deco, types, code;
     RecompileDiagnosticContext diagnostic{};
     FragmentFloatMode fragment_float_mode{};
+    FragmentArithmeticObservation* fragment_arithmetic_observation = nullptr;
+    void observe_fragment_arithmetic_site(uint32_t pc, FragmentArithmeticFamily family) {
+        if (is_fragment && fragment_arithmetic_observation)
+            fragment_arithmetic_observation->record(pc, family);
+    }
     uint64_t fragment_program_hash = 0;
     bool fragment_float_mode_warning = false;
     void warn_fragment_float_mode_unavailable(uint32_t pc);
@@ -919,7 +926,7 @@ struct SpirvCompute {
     uint32_t ds_bpermute_b32(uint32_t address, uint32_t value,
                              uint32_t active, uint32_t offset,
                              uint32_t event = 0) {
-        // RDNA2 ISA 12.13.3: ADDR is a byte address and BPERMUTE gathers DATA0 backward from
+        // RDNA2 ISA 10.4.4: ADDR is a byte address and BPERMUTE gathers DATA0 backward from
         // ((ADDR + OFFSET) >> 2) & 31 within each independent 32-lane half. Addition is deliberately
         // performed before the shift so uint32 overflow and unaligned byte addresses match hardware.
         mark_subgroup_min32();
@@ -941,6 +948,10 @@ struct SpirvCompute {
         }
         return sel(valid, shuffled, uconst(0));
     }
+    // Called only at the portable compute dispatcher's common Workgroup rendezvous.
+    uint32_t portable_ds_bpermute_b32(uint32_t address, uint32_t value,
+                                      uint32_t active, uint32_t offset,
+                                      uint32_t event, uint32_t metadata_base);
     uint32_t subgroup_permlane16(uint32_t value, uint32_t selectors_lo,
                                 uint32_t selectors_hi, bool across_rows,
                                 uint32_t* source_lane_out = nullptr) {
@@ -1161,6 +1172,7 @@ struct SpirvCompute {
         }
     }
     static int forced_array_layer() {
+        return static_cast<int>(compiler_choice(CompilerChoice::ForcedArrayLayer, [] {
         static const int v = [] {
             const char* e = getenv("PROSPER_FORCE_LAYER");
             if (!e || !*e) return -1;
@@ -1170,6 +1182,7 @@ struct SpirvCompute {
             return (int)n;
         }();
         return v;
+        }));
     }
     void image_sample_2d_array(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
                                uint32_t layer_bits, uint32_t out[4]);
@@ -2811,6 +2824,7 @@ struct RegState {
     std::unordered_set<uint32_t> smem_raw_immediate_wide_data_loads;
     std::unordered_set<uint32_t> smem_raw_register_wide_data_loads;
     std::unordered_set<uint32_t> smem_raw_offset_scalar_source_pcs;
+    std::unordered_set<uint32_t> smem_raw_owned_wide_data_loads;
     std::unordered_set<uint32_t> smem_raw_nested_wide_data_loads;
     std::unordered_set<uint32_t> smem_raw_wide_data_loads;
     bool smem_pointer_analysis_done = false;
@@ -2856,6 +2870,17 @@ struct RegState {
     // never-written slot rejects (fail-visible).
     std::unordered_map<uint64_t, uint32_t> lds_addtid;
 };
+
+// Cache and live realization derive owned source authority from the original code. A selected
+// stream may drop requirements, but must not invent a new admitted read-point PC. Keep omitted
+// original PCs classified too, so their bindings cannot become another load's legacy fallback.
+inline bool retain_original_owned_raw_wide_proof(
+        RegState& rs, const std::vector<uint32_t>& original_pcs) {
+    for (uint32_t pc : rs.smem_raw_owned_wide_data_loads)
+        if (!std::binary_search(original_pcs.begin(), original_pcs.end(), pc)) return false;
+    rs.smem_raw_owned_wide_data_loads.insert(original_pcs.begin(), original_pcs.end());
+    return true;
+}
 
 inline bool scalar_is_lane_local(const RegState& rs, int sgpr) {
     if (rs.lane_local_scalars.empty()) return false;

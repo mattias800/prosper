@@ -73,6 +73,9 @@ constexpr uint64_t kSkippedDispatchesPerWindow = 1;
 // unsupported-wave64-shaders: correctness, any known Wave64 shader use refused by translation
 // or subgroup admission, regardless of whether the host supplies native Wave64 (#3992).
 constexpr uint64_t kUnsupportedWave64UsesPerWindow = 1;
+// Source-confirmed unverified lowering (#4059/#4062), not measured wrong pixels. Any compiler
+// request that reached ordinary guest F32 ADD/MUL deserves a semantics/provenance warning.
+constexpr uint64_t kUnverifiedFragmentArithmeticRequestsPerWindow = 1;
 
 // gpu-memory-off-device: CORRECTNESS class (the frame is right, but on a discrete GPU every access
 // to the resource crosses the bus, and no pixel test can see it). Any GPU-only renderer allocation

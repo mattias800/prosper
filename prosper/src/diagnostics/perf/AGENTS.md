@@ -23,10 +23,27 @@ counter. Inventory saturation and unidentified uses remain explicit. No known-Wa
 is NO DATA, not evidence that every shader is supported. Observation counts cover realization and
 backend boundaries and must not be called distinct shader counts.
 
+Fragment subgroup refusals additionally retain the actual lowering verdict and, for an unproved
+vote, the first failed vote's SOURCE SPIR-V dword offset/result/predicate IDs and defining opcode.
+This is not a guest instruction PC or proof of a varying/undefined predicate. Not-attempted and
+unavailable vote metadata remain explicit; the existing bounded announcement inventory is reused.
+
 Unplumbed vertex guest wave width is deliberately not inferred from the translator's Wave64
 default; its failures remain covered by `dropped-draws`. The known-width scope does not mean all
 Wave64 gaps have been implemented or detected. Capture re-realization suppression applies to
 both observations and refusals; deliberate compute selectors decline before the backend hook.
+
+`unverified-fragment-f32-arithmetic` (#4062) announces the source-confirmed remaining #4059
+lowering gap, not a measured GPU failure. It counts direct/cached fragment compiler requests
+that actually reached ordinary guest F32 ADD/MUL emission, including a later refusal. Cold
+requests transfer immutable bounded site/mode provenance to the cache; warm requests replay it
+with their current lookup address. It is not a draw or execution counter, complete arithmetic
+inventory, unique-shader census or permission to infer unknown launch mode as mode0. Fixed site
+prefix truncation and announcement-inventory saturation are explicit; repeated request accounting
+continues. No observed requests means NO DATA; requests without emitted ADD/MUL are quiet within
+this limited inventory. F9 re-realization suppression applies; ordinary offline direct compiles
+still announce before flip windows. Shader words, compile keys and numeric/admission policy do not
+depend on these observations. Completing #4059 is separate from announcing it.
 
 `texture-direct-validation` is an observer without a new alarm threshold. Its seven counters cover
 only actual retained-pixel/complete-encoded-prefix comparison invocations at the live image site;

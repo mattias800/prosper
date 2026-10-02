@@ -145,8 +145,8 @@ one.
 
 ### Limits
 
-- **One module.** Only the IL2CPP aperture is symbolicated; the Unity player eboot and the system
-  PRXs are stripped C++ and stay bare offsets. Use `tools/guest_bt/` when you want a whole *stack*
+- **One module.** Only the loaded IL2CPP image range is symbolicated; the Unity player eboot and the
+  system PRXs are stripped C++ and stay bare offsets. Use `tools/guest_bt/` when you want a whole *stack*
   rather than a single address — it unwinds guest threads through the HLE stub boundary and already
   consumes a `script.json` for managed names.
 - **Nearest-preceding, windowed at `0x8000`.** script.json gives method starts, never lengths, so an
@@ -157,7 +157,12 @@ one.
   `script.json`). `tests/data/il2cpp_symtab_fixture.symtab` is hand-written and contains no dumper
   output.
 - IL2CPP layout is version-dependent; a symtab is only valid for the exact module it was dumped
-  from. Nothing detects a mismatched pair, so a stale symtab yields confident wrong names.
+  from. During boot, the highest symbol RVA must be below the loaded image's exclusive end RVA;
+  an early-loaded table is rechecked after mapping. RVAs remain relative to the IL2CPP module base,
+  even when its mapped range starts above zero. This is a partial mismatch check: a stale table
+  whose highest RVA fits can still give wrong names, and matching bounds do not prove module
+  identity or method coverage. Offline probes have no loaded image and keep their existing lookup
+  behavior; guest-address lookup uses the fixed IL2CPP aperture until loaded bounds are published.
 
 ## Tool reference
 

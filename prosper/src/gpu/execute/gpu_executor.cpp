@@ -5,6 +5,7 @@
 // pure. No Vulkan here — the backend is a std::function injected by whoever owns a device (the runtime
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
 #include "gpu/resources/fold_control_plan.hpp"
+#include "build_revision.hpp"
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/compute_program_facts.hpp"
@@ -19,6 +20,7 @@
 #include "gpu/capture/capture_compute_policy.hpp"
 #include "gpu/diagnostics/compute_parent_walk.hpp"
 #include "gpu/diagnostics/shader_dump_filter.hpp"  // PROSPER_SHADER_DUMP_PROGRAM address filter
+#include "gpu/diagnostics/fragment_arithmetic.hpp"
 #include "gpu/diagnostics/compute_tree_watch.hpp"
 #include "gpu/present/videoout_present.hpp"   // present_write_frame
 #include "gpu/timeline/menu_capture_runtime.hpp"
@@ -596,6 +598,30 @@ struct ShaderAnalysisCache {
     uint64_t use_counter = 0;
 };
 
+// Only the code-derived owned-input verdict is memoized here. Entries retain weak analysis
+// owners, not shader bytes; resource requirements and markers stay outside this cache. Version IDs
+// are never reset by analysis clear/eviction, and both owner identities are checked on every hit,
+// so a theoretical ID wrap/reuse cannot authorize another byte version.
+struct ChainOwnedProofKey {
+    uint64_t prolog = 0, main = 0;
+    bool operator==(const ChainOwnedProofKey&) const = default;
+};
+struct ChainOwnedProofKeyHash {
+    size_t operator()(const ChainOwnedProofKey& key) const {
+        return static_cast<size_t>(hash_mix(key.prolog, key.main));
+    }
+};
+struct ChainOwnedProofEntry {
+    std::weak_ptr<const std::vector<uint32_t>> prolog, main;
+    bool requires_owned = false;
+    uint64_t last_use = 0;
+};
+struct ChainOwnedProofCache {
+    std::mutex mutex;
+    std::unordered_map<ChainOwnedProofKey, ChainOwnedProofEntry, ChainOwnedProofKeyHash> entries;
+    uint64_t use_counter = 0;
+};
+
 struct InterpolationCacheKey {
     uint64_t analysis_identity = 0;
     PixelSystemInputMapping system_inputs{};
@@ -840,6 +866,51 @@ ShaderAnalysisCache& shader_analysis_cache() {
     return cache;
 }
 
+ChainOwnedProofCache& chain_owned_proof_cache() {
+    static ChainOwnedProofCache cache;
+    return cache;
+}
+
+bool chain_code_requires_owned_cached(const ShaderCompileKey& key) {
+    const auto prove = [&] {
+        return rdna2_vertex_chain_has_owned_raw_wide_inputs(
+            key.code ? key.code->data() : nullptr, key.code ? key.code->size() : 0u,
+            key.chain_code ? key.chain_code->data() : nullptr,
+            key.chain_code ? key.chain_code->size() : 0u, nullptr);
+    };
+    // Zero denotes absent/uncacheable provenance. The underlying predicate still runs, including
+    // both standalone streams and the actual linked prolog prefix plus main code_span.
+    if (!key.code_analysis_identity || !key.chain_analysis_identity) return prove();
+    const ChainOwnedProofKey version{key.code_analysis_identity, key.chain_analysis_identity};
+    auto& cache = chain_owned_proof_cache();
+    {
+        std::lock_guard lock(cache.mutex);
+        auto found = cache.entries.find(version);
+        if (found != cache.entries.end()) {
+            const auto prolog = found->second.prolog.lock();
+            const auto main = found->second.main.lock();
+            if (prolog == key.code && main == key.chain_code) {
+                found->second.last_use = ++cache.use_counter;
+                return found->second.requires_owned;
+            }
+            cache.entries.erase(found);
+        }
+    }
+    // No cache mutex is held while decoding or acquiring any other shader cache. Concurrent cold
+    // workers may repeat a proof, but every published result names the same immutable owned bytes.
+    const bool requires_owned = prove();
+    std::lock_guard lock(cache.mutex);
+    constexpr size_t max_entries = 4096;
+    if (cache.entries.size() >= max_entries && !cache.entries.contains(version)) {
+        auto oldest = cache.entries.begin();
+        for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
+            if (it->second.last_use < oldest->second.last_use) oldest = it;
+        cache.entries.erase(oldest);
+    }
+    cache.entries[version] = {key.code, key.chain_code, requires_owned, ++cache.use_counter};
+    return requires_owned;
+}
+
 InterpolationCache& interpolation_cache() {
     static InterpolationCache cache;
     return cache;
@@ -961,6 +1032,7 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
             rdna2_proven_raw_immediate_wide_data_loads(decoded);
         result->raw_register_wide_data_load_pcs =
             rdna2_proven_raw_register_wide_data_loads(decoded, &result->raw_offset_scalar_source_pcs);
+        result->raw_owned_wide_data_load_pcs = rdna2_owned_raw_wide_data_loads(decoded);
         result->raw_nested_wide_data_load_pcs =
             rdna2_proven_raw_nested_wide_data_loads(decoded);
         retain_fold_instructions(decoded, result->instructions);
@@ -986,6 +1058,7 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                          result->raw_immediate_wide_data_load_pcs.capacity() +
                          result->raw_register_wide_data_load_pcs.capacity() +
                          result->raw_offset_scalar_source_pcs.capacity() +
+                         result->raw_owned_wide_data_load_pcs.capacity() +
                          result->raw_nested_wide_data_load_pcs.capacity()) * sizeof(uint32_t);
         return result;
     };
@@ -1334,6 +1407,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         // same blob as the direct path and table contents participate in the cache identity.
         key.code = std::shared_ptr<const std::vector<uint32_t>>(analysis, &analysis->code);
         key.code_hash = analysis->code_hash;
+        key.code_analysis_identity = analysis->identity;
     }
     if (stage == ShaderProgramStage::Vertex && chain_code && chain_dwords) {
         const std::shared_ptr<const ShaderCodeAnalysis> chain_analysis =
@@ -1342,12 +1416,13 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             key.chain_code = std::shared_ptr<const std::vector<uint32_t>>(
                 chain_analysis, &chain_analysis->code);
             key.chain_code_hash = chain_analysis->code_hash;
+            key.chain_analysis_identity = chain_analysis->identity;
         }
     }
     if (resources) {
-        // Resolve the source-PC proof lazily: ordinary resources do not need another cached
-        // decode lookup. Only a complete hosted x1 candidate can be admitted; every malformed
-        // form stays in the rejected partition, distinct from a previously admitted module.
+        // Reuse cached exact-byte analysis for instruction-scoped resources. Owned sources use
+        // the same exact-PC selection and width as emission, including duplicate/poisoned entries.
+        // Guest addresses/content do not change module identity; admission state does.
         std::shared_ptr<const DecodedShader> scalar_source_proof;
         key.resources.reserve(resources->resources.size());
         for (const auto& resource : resources->resources) {
@@ -1410,14 +1485,24 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                 resource.host_data_size >= resource.size ? resource.size : 0u;
             compiled.raw_register_snapshot_bytes = !resource.raw_register_snapshot ? 0u :
                 valid_raw_register_snapshot_resource(resource) ? resource.size : UINT32_MAX;
-            if (valid_raw_offset_scalar_snapshot_resource(resource)) {
+            if (resource.fetch_pc != UINT32_MAX) {
                 if (!scalar_source_proof && key.code && !key.code->empty())
                     scalar_source_proof = decode_shader_cached(key.code->data(), key.code->size());
                 if (scalar_source_proof &&
                     std::binary_search(scalar_source_proof->raw_offset_scalar_source_pcs.begin(),
                                        scalar_source_proof->raw_offset_scalar_source_pcs.end(),
-                                       resource.fetch_pc))
+                                       resource.fetch_pc) &&
+                    valid_raw_offset_scalar_snapshot_resource(resource))
                     compiled.raw_offset_scalar_snapshot_bytes = sizeof(uint32_t);
+                if (scalar_source_proof && std::binary_search(
+                        scalar_source_proof->raw_owned_wide_data_load_pcs.begin(),
+                        scalar_source_proof->raw_owned_wide_data_load_pcs.end(), resource.fetch_pc)) {
+                    const auto load = rdna2_decode_one(key.code->data() + resource.fetch_pc,
+                                                      key.code->size() - resource.fetch_pc);
+                    const uint32_t bytes = load.opcode == 0x2u ? 16u : 32u;
+                    compiled.raw_owned_wide_snapshot_bytes =
+                        owned_raw_snapshot_at(*resources, resource.fetch_pc, bytes) ? bytes : UINT32_MAX;
+                }
             }
             compiled.fetch_index_mode = static_cast<uint32_t>(resource.fetch_index_mode);
             compiled.table_index_count = resource.table_index_count;
@@ -1494,7 +1579,9 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
 // not at guest memory (#3130).
 std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const ShaderCompileKey& key,
                                               const ShaderResourceTable* resources,
-                                              uint64_t program_address) {
+                                              uint64_t program_address,
+                                              FragmentArithmeticObservation* arithmetic_observation,
+                                              std::shared_ptr<const FragmentCompileCase>* producer = nullptr) {
     const uint32_t* code = !key.code || key.code->empty() ? nullptr : key.code->data();
     const size_t code_size = key.code ? key.code->size() : 0u;
     if (stage == ShaderProgramStage::Vertex)
@@ -1520,12 +1607,52 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
             code, code_size,
             key.has_system_inputs ? &key.system_inputs : nullptr,
             key.has_pixel_inputs ? &key.pixel_inputs : nullptr);
-        return recompile_fragment(code, code_size, resources,
+        std::shared_ptr<FragmentCompileCase> record;
+        if (producer && fragment_compile_case_recording_enabled()) {
+            record = std::make_shared<FragmentCompileCase>();
+            record->compiler = std::string(prosper::embedded_build_revision()) + ":" +
+                               prosper::embedded_build_source_identity();
+            record->program_address = program_address;
+            record->has_pixel_inputs = key.has_pixel_inputs; record->pixel_inputs = key.pixel_inputs;
+            record->has_system_inputs = key.has_system_inputs; record->system_inputs = key.system_inputs;
+            record->interpolation = interpolation; record->wave32 = key.fragment_wave32;
+            record->float_mode = key.fragment_float_mode;
+            record->pcrel_target = key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX;
+            record->trip = key.trip_bound;
+            try {
+                if (!key.code || key.code->empty() || key.code->size() > kCompileCaseMaxWords)
+                    throw std::runtime_error("raw-code-unavailable-or-budget");
+                record->code = *key.code;
+                own_fragment_compile_case_resources(*record, resources);
+            } catch (const std::exception& e) {
+                record->complete = false; record->reason = e.what();
+                record->resources = {}; record->backing.clear(); record->blobs.clear();
+            }
+        }
+        // The normal compiler still consumes its existing inputs. The case's independent owned
+        // replay must reproduce the whole resulting SOURCE (or refusal) before it is COMPLETE.
+        CompilerChoiceTrace trace;
+        auto compile = [&] { return recompile_fragment(code, code_size, resources,
                                   key.has_system_inputs ? &key.system_inputs : nullptr,
                                   key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX,
                                   &interpolation, key.fragment_wave32,
                                   {RecompileDiagnosticStage::Fragment, program_address},
-                                  key.fragment_float_mode);
+                                  key.fragment_float_mode, arithmetic_observation); };
+        std::vector<uint32_t> result;
+        if (record) {
+            std::vector<std::pair<std::string, std::string>> rejects;
+            { CompilerChoiceScope reads(trace); TerminalRejectCapture rejection;
+              result = compile(); rejects = rejection.take(); }
+            record->expected_reject = rejects.empty() ? std::string{} :
+                rejects.back().first + " " + rejects.back().second;
+            record->choices = std::move(trace);
+            finish_fragment_compile_case(*record, result);
+            // Nested capture keeps the independent baseline out of the cache's producer reasons.
+            // Forward only the records from the ACTUAL producing attempt to the outer cache scope.
+            replay_terminal_reject_reasons(program_address, rejects);
+            *producer = std::move(record);
+        } else result = compile();
+        return result;
     }
     return {};
 }
@@ -1672,8 +1799,13 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
     if (PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
         cache.bypasses.fetch_add(1, std::memory_order_relaxed);
+        FragmentArithmeticObservation arithmetic_observation;
+        std::shared_ptr<const FragmentCompileCase> producer;
         auto spirv = std::make_shared<const std::vector<uint32_t>>(
-            compile_graphics_shader(stage, key, resources, program_address));
+            compile_graphics_shader(stage, key, resources, program_address, &arithmetic_observation, &producer));
+        if (stage == ShaderProgramStage::Fragment)
+            observe_fragment_arithmetic(arithmetic_observation, program_address, !spirv->empty());
+        if (stage == ShaderProgramStage::Fragment) maybe_dump_fragment_compile_case(producer, program_address, *spirv);
         maybe_dump_successful_shader(stage, key, *spirv, program_address, chain_address);
         return spirv;
     }
@@ -1687,6 +1819,11 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
             found->second.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
                                          std::memory_order_relaxed);
             if (cache_identity) *cache_identity = found->second.identity;
+            if (stage == ShaderProgramStage::Fragment)
+                observe_fragment_arithmetic(found->second.fragment_arithmetic,
+                                            program_address, !found->second.spirv->empty());
+            if (stage == ShaderProgramStage::Fragment)
+                maybe_dump_fragment_compile_case(found->second.fragment_case, program_address, *found->second.spirv);
             maybe_dump_successful_shader(stage, key, *found->second.spirv, program_address,
                                         chain_address);
             return found->second.spirv;
@@ -1700,14 +1837,24 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
         double_check->second.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
                                             std::memory_order_relaxed);
         if (cache_identity) *cache_identity = double_check->second.identity;
+        if (stage == ShaderProgramStage::Fragment)
+            observe_fragment_arithmetic(double_check->second.fragment_arithmetic,
+                                        program_address, !double_check->second.spirv->empty());
+        if (stage == ShaderProgramStage::Fragment)
+            maybe_dump_fragment_compile_case(double_check->second.fragment_case, program_address, *double_check->second.spirv);
         maybe_dump_successful_shader(stage, key, *double_check->second.spirv, program_address,
                                     chain_address);
         return double_check->second.spirv;
     }
 
     const auto start = std::chrono::steady_clock::now();
+    FragmentArithmeticObservation arithmetic_observation;
+    std::shared_ptr<const FragmentCompileCase> producer;
     auto spirv = std::make_shared<const std::vector<uint32_t>>(
-        compile_graphics_shader(stage, key, resources, program_address));
+        compile_graphics_shader(stage, key, resources, program_address, &arithmetic_observation, &producer));
+    if (stage == ShaderProgramStage::Fragment)
+        observe_fragment_arithmetic(arithmetic_observation, program_address, !spirv->empty());
+    if (stage == ShaderProgramStage::Fragment) maybe_dump_fragment_compile_case(producer, program_address, *spirv);
     maybe_dump_successful_shader(stage, key, *spirv, program_address, chain_address);
     const auto end = std::chrono::steady_clock::now();
     ++cache.stats.misses;
@@ -1721,7 +1868,8 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
 
     scratch.prepare_for_cache();
     constexpr size_t max_entries = 4096;
-    const uint64_t bytes = shader_cache_entry_bytes(key, *spirv);
+    const uint64_t bytes = shader_cache_entry_bytes(key, *spirv) +
+        (producer ? fragment_compile_case_retained_bytes(*producer) : 0u);
     const uint64_t limit = shader_cache_limit_bytes();
     while (!cache.entries.empty() &&
            (cache.entries.size() >= max_entries || cache.stats.bytes + bytes > limit)) {
@@ -1737,6 +1885,8 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
     if (bytes <= limit && max_entries != 0) {
         CachedShader value;
         value.spirv = spirv;
+        value.fragment_arithmetic = arithmetic_observation;
+        value.fragment_case = std::move(producer);
         value.identity = cache.next_identity++;
         value.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
                              std::memory_order_relaxed);
@@ -1790,6 +1940,12 @@ void clear_shader_analysis_cache() {
         std::lock_guard lock(cache.mutex);
         cache.entries.clear();
         cache.stats = {};
+        cache.use_counter = 0;
+    }
+    {
+        auto& cache = chain_owned_proof_cache();
+        std::lock_guard lock(cache.mutex);
+        cache.entries.clear();
         cache.use_counter = 0;
     }
     {
@@ -1921,7 +2077,11 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
         const SharedShaderAnalysis& captured_analysis,
         FragmentFloatMode fragment_float_mode) {
     if (cache_identity) *cache_identity = 0;
-    if (!fragment_float_mode.canonical()) return {};
+    if (!fragment_float_mode.canonical()) {
+        if (stage == ShaderProgramStage::Fragment)
+            observe_fragment_arithmetic({}, reinterpret_cast<uintptr_t>(code), false);
+        return {};
+    }
     ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
                                                    system_inputs, nullptr, 0,
                                                    vertex_lds_dwords, nullptr,
@@ -1954,11 +2114,27 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
         uint64_t* cache_identity, uint32_t vertex_lds_dwords,
         bool capture_position) {
+    // This must precede lookup: the direct-stage key cannot authenticate rebased main PCs or
+    // recover owners discarded by the legacy chain table merge, including a warm entry.
+    if (resources && (!resources->owned_raw_snapshot_requirements.empty() || std::any_of(
+            resources->resources.begin(), resources->resources.end(),
+            [](const auto& resource) { return resource.owned_raw_snapshot_bytes != 0u; }))) {
+        if (cache_identity) *cache_identity = 0;
+        replay_terminal_reject_reasons(reinterpret_cast<uintptr_t>(prolog),
+            {{"recompile-reject", "owned raw wide inputs require a direct vertex stage"}});
+        return {};
+    }
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Vertex, prolog, prolog_dwords, resources, pixel_inputs, nullptr,
         main, main_dwords, vertex_lds_dwords, nullptr, false, capture_position);
     if (!key.chain_code) {
         if (cache_identity) *cache_identity = 0;
+        return {};
+    }
+    if (chain_code_requires_owned_cached(key)) {
+        if (cache_identity) *cache_identity = 0;
+        replay_terminal_reject_reasons(reinterpret_cast<uintptr_t>(prolog),
+            {{"recompile-reject", "owned raw wide inputs require a direct vertex stage"}});
         return {};
     }
     // The prolog address is the program's identity everywhere else -- `DrawItem::vs_guest_addr` is
@@ -4648,7 +4824,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     soff_field == 125u && in.literal == 0u &&
                     std::binary_search(decoded->raw_offset_scalar_source_pcs.begin(),
                                        decoded->raw_offset_scalar_source_pcs.end(), in.pc);
+                const bool owned_wide_source = !is_buffer && (n == 4u || n == 8u) &&
+                    soff_field == 125u && std::binary_search(
+                        decoded->raw_owned_wide_data_load_pcs.begin(),
+                        decoded->raw_owned_wide_data_load_pcs.end(), in.pc);
                 if (srt_uses && !is_buffer && raw_scalar_data && !latched_offset_source &&
+                    !owned_wide_source &&
                     valid_reg(sbase) && valid_reg(sbase + 1) &&
                     val_known.test((size_t)sbase) && val_known.test((size_t)(sbase + 1))) {
                     const uint64_t ptr = (uint64_t)val[(size_t)sbase] |
@@ -4982,7 +5163,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 std::array<uint32_t, 16> bounded_scalar_words{};
                 FoldWords mem(reader, in.pc, addr);
-                if (latched_offset_source || (is_buffer && scalar_in_range_dwords < n))
+                const bool owned_wide_address_valid = owned_wide_source &&
+                    (base & 3u) == 0u && (in.literal & 3u) == 0u &&
+                    static_cast<int32_t>(in.literal) >= 0 &&
+                    base <= UINT64_MAX - static_cast<uint64_t>(in.literal) &&
+                    addr <= UINT64_MAX - n * sizeof(uint32_t);
+                if (latched_offset_source || owned_wide_address_valid ||
+                    (is_buffer && scalar_in_range_dwords < n))
                     mem.snapshot_prefix(bounded_scalar_words.data(),
                                         scalar_in_range_dwords * sizeof(uint32_t));
                 const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
@@ -5015,6 +5202,17 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     source.v4 = {static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u),
                                  bounded_scalar_words[0], 0u};
                     source.required_size = sizeof(uint32_t);
+                    source.use_pc = in.pc;
+                    srt_uses->push_back(source);
+                }
+                if (srt_uses && owned_wide_address_valid) {
+                    SrtUse source;
+                    source.kind = 6;
+                    source.key = UINT32_MAX;
+                    source.v4 = {static_cast<uint32_t>(addr),
+                                 static_cast<uint32_t>(addr >> 32u), 0u, 0u};
+                    std::copy_n(bounded_scalar_words.begin(), n, source.t8.begin());
+                    source.required_size = n * sizeof(uint32_t);
                     source.use_pc = in.pc;
                     srt_uses->push_back(source);
                 }
@@ -6203,6 +6401,53 @@ static void add_raw_offset_scalar_snapshot(ShaderResourceTable& table, const Srt
     table.resources.push_back(resource);
 }
 
+// Both scalar folding and the emitted immediate load consume this one complete observation.
+// Effective-address backing starts at index zero, even when the source instruction had +4/+20.
+static void add_owned_raw_wide_snapshot(ShaderResourceTable& table, const SrtUse& use,
+                                        const uint32_t* code, size_t dwords) {
+    if (use.kind != 6 || use.key != UINT32_MAX || use.use_pc >= dwords ||
+        use.v4[2] || use.v4[3] || use.scalar_buffer_dword_count || use.zero_record_raw ||
+        use.table_record_count || use.instruction_format != UINT32_MAX)
+        return;
+    const auto decoded = decode_shader_cached(code, dwords);
+    if (!std::binary_search(decoded->raw_owned_wide_data_load_pcs.begin(),
+                           decoded->raw_owned_wide_data_load_pcs.end(), use.use_pc))
+        return;
+    const auto load = rdna2_decode_one(code + use.use_pc, dwords - use.use_pc);
+    const uint32_t size = load.opcode == 0x2u ? 16u : 32u;
+    const uint64_t address = static_cast<uint64_t>(use.v4[0]) |
+                             (static_cast<uint64_t>(use.v4[1]) << 32u);
+    if (use.required_size != size || address <= 0x10000u || (address & 3u) ||
+        address > UINT64_MAX - size ||
+        (size == 16u && std::any_of(use.t8.begin() + 4, use.t8.end(),
+                                  [](uint32_t word) { return word != 0u; })))
+        return;
+    auto bytes = std::make_shared<std::vector<uint8_t>>(size);
+    std::memcpy(bytes->data(), use.t8.data(), size);
+    ShaderResource resource;
+    resource.cls = ResourceClass::ConstantBuffer;
+    resource.format = DataFormat::Uint32;
+    resource.num_components = 1;
+    resource.gpu_addr = address;
+    resource.size = size;
+    resource.fetch_pc = use.use_pc;
+    resource.owned_raw_snapshot_bytes = size;
+    resource.host_data = bytes->data();
+    resource.host_data_size = bytes->size();
+    table.owned_host_data.push_back(std::move(bytes));
+    table.resources.push_back(resource);
+}
+
+static void set_owned_raw_snapshot_requirements(ShaderResourceTable& table,
+                                                const uint32_t* code, size_t dwords) {
+    table.owned_raw_snapshot_requirements.clear();
+    const auto decoded = decode_shader_cached(code, dwords);
+    for (uint32_t pc : decoded->raw_owned_wide_data_load_pcs) {
+        const auto load = rdna2_decode_one(code + pc, dwords - pc);
+        table.owned_raw_snapshot_requirements.emplace_back(pc, load.opcode == 0x2u ? 16u : 32u);
+    }
+}
+
 bool shader_resource_allows_zero_mip_specialization(
     const SrtUse& use, const DecodedImageDescriptor& descriptor,
     const DecodedImageView& view) {
@@ -6239,6 +6484,7 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
                                                  uint32_t tgid_x_sgpr,
                                                  const ComputeResourceDispatchContext*
                                                      dispatch_context) {
+    set_owned_raw_snapshot_requirements(table, code, dwords);
     std::vector<SrtUse> srt_uses;
     const std::vector<DynFetch> direct_fetches = resolve_dynamic_fetch(
         code, dwords, user_sgprs, nsgpr, /*user_sgpr_base*/0, &srt_uses);
@@ -6366,6 +6612,10 @@ std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
 
     std::set<uint64_t> seen;
     for (const auto& u : srt_uses) {
+        if (u.kind == 6) {
+            add_owned_raw_wide_snapshot(table, u, code, dwords);
+            continue;
+        }
         if (u.kind == 5) {
             add_raw_offset_scalar_snapshot(table, u, code, dwords);
             continue;
@@ -7530,6 +7780,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             read_user_sgprs(st.sh, base + range_start, sgprs);
             t = build_shader_resources(*hdr, sgprs, kUserSgprs, user_sgpr_base);
         }
+        set_owned_raw_snapshot_requirements(t,
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
         // Add the const-fold-resolved dynamic buffers, keyed by their SRSRC SGPR so the
         // recompiler's by_sgpr_base() resolves each buffer_load_format. The V#'s data format is patched
         // at runtime by the fetch shader (so the load-time snapshot reads Unknown) — default to Float32
@@ -7656,6 +7908,12 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                 bool clash = exact_mtbuf || u.key == 0xFFFFFFFFu;
                 if (!clash)
                     for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
+                if (u.kind == 6) {
+                    add_owned_raw_wide_snapshot(t, u,
+                        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                        shader_dwords);
+                    continue;
+                }
                 if (u.kind == 5) {
                     add_raw_offset_scalar_snapshot(t, u,
                         reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),

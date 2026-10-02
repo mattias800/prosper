@@ -4,6 +4,23 @@ project(prosper LANGUAGES C CXX)   # C for the vendored LibAtrac9 decoder (third
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+include(cmake/WindowsGnuVariadicProducer.cmake)
+
+# #4078: the native WinLibs POSIX emutls runtime can free C++ TLS storage before its
+# destructor. This explicitly selected profile uses Clang's native Windows TLS instead.
+# Keep ordinary builds unchanged; the lifetime regression remains visible on broken runtimes.
+if(PROSPER_NATIVE_CLANG_TLS)
+  if(NOT WIN32 OR NOT MINGW OR NOT CMAKE_C_COMPILER_ID STREQUAL "Clang" OR
+     NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+     NOT CMAKE_CXX_COMPILER_TARGET STREQUAL "x86_64-w64-windows-gnu")
+    message(FATAL_ERROR "native-Clang TLS profile requires actual Windows GNU-ABI Clang compilers")
+  endif()
+  add_compile_options(-fno-emulated-tls)
+  # libstdc++/libgcc from the GNU sysroot use winpthreads. Append after the compiler's
+  # default runtime archives, rather than relying on archive order in Threads::Threads.
+  set(CMAKE_CXX_STANDARD_LIBRARIES "${CMAKE_CXX_STANDARD_LIBRARIES} -lwinpthread")
+  message(STATUS "prosper native-Clang profile: Windows GNU ABI, native TLS (not emutls)")
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
@@ -86,6 +103,9 @@ include(cmake/ProsperBuildRevision.cmake)
 prosper_add_build_revision_library(prosper_build_revision WORK_TREE "${CMAKE_SOURCE_DIR}/..")
 
 file(GLOB_RECURSE PROSPER_SRC CONFIGURE_DEPENDS src/*.cpp)
+if(PROSPER_NATIVE_CLANG_TLS)
+  list(FILTER PROSPER_SRC EXCLUDE REGEX "src/hle/libc/libc_variadic_capture\\.cpp$")
+endif()
 # Exclude the diagnostics HISTORY/REPORT layer when the feature is disabled (default). When enabled,
 # the PROSPER_DIAGNOSTICS define activates the real implementation; the headers always compile
 # (stubs when disabled).
@@ -109,6 +129,10 @@ if(PROSPER_SRC)
   target_include_directories(prosper_core PRIVATE third_party/stb)
   target_link_libraries(prosper_core PUBLIC libatrac9 PRIVATE prosper_build_revision)
   target_compile_definitions(prosper_core PRIVATE PROSPER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  if(PROSPER_NATIVE_CLANG_TLS)
+    prosper_add_gnu_variadic_producer(prosper_core
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/hle/libc/libc_variadic_capture.cpp" libc_capture)
+  endif()
   if(PROSPER_DIAGNOSTICS)
     target_compile_definitions(prosper_core PRIVATE PROSPER_DIAGNOSTICS)
   endif()
@@ -177,6 +201,12 @@ add_executable(test_compute_buffer_diff_span tests/shared/compute/test_compute_b
 target_include_directories(test_compute_buffer_diff_span PRIVATE frontends src)
 find_package(Threads REQUIRED)
 target_link_libraries(test_compute_buffer_diff_span PRIVATE Threads::Threads)
+
+# Standard-library-only host lifetime guard: no core/GPU/game and no scratch/export opt-out.
+add_executable(test_native_tls_lifetime tests/host/platform/test_native_tls_lifetime.cpp)
+target_link_libraries(test_native_tls_lifetime PRIVATE Threads::Threads)
+add_test(NAME native_tls_lifetime COMMAND test_native_tls_lifetime)
+set_tests_properties(native_tls_lifetime PROPERTIES TIMEOUT 30)
 add_test(NAME compute_buffer_diff_span COMMAND test_compute_buffer_diff_span)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -636,6 +666,12 @@ if(Python3_Interpreter_FOUND)
                --module "${CMAKE_SOURCE_DIR}/cmake/ProsperBuildRevision.cmake"
                --scratch-root "${CMAKE_CURRENT_BINARY_DIR}/build-revision-regression"
                --generator "${CMAKE_GENERATOR}")
+    add_test(NAME compiler_source_identity
+             COMMAND "${Python3_EXECUTABLE}"
+               "${CMAKE_SOURCE_DIR}/tools/revision/test_source_identity.py"
+               --cmake "${CMAKE_COMMAND}"
+               --module "${CMAKE_SOURCE_DIR}/cmake/ProsperBuildRevision.cmake"
+               --generator "${CMAKE_GENERATOR}")
   endif()
 endif()
 # Path to the (gitignored) local game dump; override with -DGAME_DUMP=...
@@ -771,10 +807,17 @@ if(TARGET prosper_core)
   # fixture is committed and synthetic — no game dump, no Il2CppDumper — so this never degrades
   # into a silent skip. The binary doubles as the probe the agreement test drives.
   add_executable(test_il2cpp_symbols tests/host/symbols/test_il2cpp_symbols.cpp)
+  target_include_directories(test_il2cpp_symbols PRIVATE tests)
   target_link_libraries(test_il2cpp_symbols PRIVATE prosper_core)
   add_test(NAME il2cpp_symbol_resolution
            COMMAND test_il2cpp_symbols
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/il2cpp_symtab_fixture.symtab")
+  # Each synthetic boot owns fixed guest mappings, so run the wiring controls in fresh processes.
+  foreach(mode valid oversized absent)
+    add_test(NAME il2cpp_symbol_boot_${mode}
+             COMMAND test_il2cpp_symbols --boot-bounds ${mode})
+    set_tests_properties(il2cpp_symbol_boot_${mode} PROPERTIES TIMEOUT 20)
+  endforeach()
   if(Python3_Interpreter_FOUND)
     # ...and the runtime resolver must answer exactly what tools/il2cpp/resolve.py answers. They
     # share the record set by construction (resolve.py emits the table the runtime reads), but the
@@ -2350,6 +2393,19 @@ if(TARGET prosper_core)
   add_test(NAME cached_shader_moves COMMAND test_cached_shader_moves)
 
   add_executable(test_shader_recompile_cache tests/gpu/execute/test_shader_recompile_cache.cpp)
+  add_executable(fragment_compile_replay tools/fragment_compile_replay/main.cpp)
+  target_link_libraries(fragment_compile_replay PRIVATE prosper_core)
+  add_executable(test_fragment_compile_case tests/gpu/execute/test_fragment_compile_case.cpp)
+  target_include_directories(test_fragment_compile_case PRIVATE tests)
+  target_link_libraries(test_fragment_compile_case PRIVATE prosper_core)
+  add_test(NAME fragment_compile_case COMMAND test_fragment_compile_case)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME fragment_compile_read_policy COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_SOURCE_DIR}/tools/fragment_compile_replay/reader_policy.py" "${CMAKE_SOURCE_DIR}/..")
+    add_test(NAME fragment_compile_case_cli COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_SOURCE_DIR}/tools/fragment_compile_replay/test_cli.py"
+      "$<TARGET_FILE:test_fragment_compile_case>" "$<TARGET_FILE:fragment_compile_replay>")
+  endif()
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_shader_recompile_cache PRIVATE tests)
   target_link_libraries(test_shader_recompile_cache PRIVATE prosper_core)
@@ -2434,6 +2490,11 @@ if(TARGET prosper_core)
   add_executable(test_fragment_vote_lowering tests/gpu/recompiler/test_fragment_vote_lowering.cpp)
   target_link_libraries(test_fragment_vote_lowering PRIVATE prosper_core)
   add_test(NAME fragment_vote_lowering COMMAND test_fragment_vote_lowering)
+  add_executable(test_fragment_vote_refusal_details tests/gpu/recompiler/test_fragment_vote_refusal_details.cpp)
+  target_link_libraries(test_fragment_vote_refusal_details PRIVATE prosper_core)
+  add_test(NAME fragment_vote_refusal_details COMMAND test_fragment_vote_refusal_details)
+  add_test(NAME fragment_vote_refusal_details_disabled COMMAND test_fragment_vote_refusal_details --disabled)
+  set_tests_properties(fragment_vote_refusal_details_disabled PROPERTIES ENVIRONMENT "PROSPER_NO_PERF_ALARMS=1")
   add_executable(test_fragment_loop_vote_lowering tests/gpu/recompiler/test_fragment_loop_vote_lowering.cpp)
   target_link_libraries(test_fragment_loop_vote_lowering PRIVATE prosper_core)
   add_test(NAME fragment_loop_vote_lowering COMMAND test_fragment_loop_vote_lowering)
@@ -2453,6 +2514,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_fragment_float_mode PRIVATE prosper_core)
   target_include_directories(test_fragment_float_mode PRIVATE tests)
   add_test(NAME fragment_float_mode COMMAND test_fragment_float_mode)
+  add_executable(test_fragment_arithmetic_diagnostics tests/gpu/recompiler/test_fragment_arithmetic_diagnostics.cpp)
+  target_link_libraries(test_fragment_arithmetic_diagnostics PRIVATE prosper_core)
+  target_include_directories(test_fragment_arithmetic_diagnostics PRIVATE tests)
+  add_test(NAME fragment_arithmetic_diagnostics COMMAND test_fragment_arithmetic_diagnostics)
 
   # #3203: the entry-M0 token containment's CFG-DISPATCHER re-arm. Its own binary rather than another
   # arm in test_rdna2_spirv_struct, because that one returns at its first failure and a mutation run
@@ -2476,6 +2541,20 @@ if(TARGET prosper_core)
   add_executable(test_raw_register_wide_data tests/gpu/recompiler/test_raw_register_wide_data.cpp)
   target_link_libraries(test_raw_register_wide_data PRIVATE prosper_core)
   add_test(NAME raw_register_wide_data COMMAND test_raw_register_wide_data)
+  add_executable(test_graphics_raw_register_wide_data
+    tests/gpu/recompiler/test_graphics_raw_register_wide_data.cpp)
+  target_link_libraries(test_graphics_raw_register_wide_data PRIVATE prosper_core)
+  add_test(NAME graphics_raw_register_wide_data COMMAND test_graphics_raw_register_wide_data)
+  add_executable(test_raw_wide_mask_lifetime
+    tests/gpu/recompiler/test_raw_wide_mask_lifetime.cpp)
+  target_link_libraries(test_raw_wide_mask_lifetime PRIVATE prosper_core)
+  add_test(NAME raw_wide_mask_lifetime COMMAND test_raw_wide_mask_lifetime)
+  add_executable(test_raw_wide_read_point tests/gpu/recompiler/test_raw_wide_read_point.cpp)
+  target_link_libraries(test_raw_wide_read_point PRIVATE prosper_core)
+  add_test(NAME raw_wide_read_point COMMAND test_raw_wide_read_point)
+  add_executable(test_owned_raw_wide_backing tests/gpu/recompiler/test_owned_raw_wide_backing.cpp)
+  target_link_libraries(test_owned_raw_wide_backing PRIVATE prosper_core)
+  add_test(NAME owned_raw_wide_backing COMMAND test_owned_raw_wide_backing)
   add_executable(test_memory_fed_raw_wide tests/gpu/recompiler/test_memory_fed_raw_wide.cpp)
   target_link_libraries(test_memory_fed_raw_wide PRIVATE prosper_core)
   add_test(NAME memory_fed_raw_wide COMMAND test_memory_fed_raw_wide)
@@ -2519,6 +2598,12 @@ endif()
                  tests/gpu/recompiler/test_readfirstlane_uniformity.cpp)
   target_link_libraries(test_readfirstlane_uniformity PRIVATE prosper_core)
   add_test(NAME readfirstlane_uniformity COMMAND test_readfirstlane_uniformity)
+
+  add_executable(test_portable_bpermute tests/gpu/recompiler/test_portable_bpermute.cpp)
+  target_include_directories(test_portable_bpermute PRIVATE tests)
+  target_link_libraries(test_portable_bpermute PRIVATE prosper_core)
+  add_test(NAME portable_bpermute_contract COMMAND test_portable_bpermute)
+  set_tests_properties(portable_bpermute_contract PROPERTIES TIMEOUT 90)
 
   # #3713: a scalar branch may only be called workgroup-uniform when the value it compares is the
   # same for every wave along every path. Built as positive/negative pairs -- a proof that never
@@ -3145,6 +3230,10 @@ endif()
   add_executable(test_sysv_ms_bridge tests/host/abi/test_sysv_ms_bridge.cpp)
   target_link_libraries(test_sysv_ms_bridge PRIVATE prosper_core)
   add_test(NAME sysv_ms_bridge COMMAND test_sysv_ms_bridge)
+  add_executable(test_guest_tailjump tests/host/abi/test_guest_tailjump.cpp)
+  target_link_libraries(test_guest_tailjump PRIVATE prosper_core)
+  add_test(NAME guest_tailjump COMMAND test_guest_tailjump)
+  set_tests_properties(guest_tailjump PROPERTIES SKIP_RETURN_CODE 77)
 
   # #3246: the one argument list #2955's CallSignature cannot describe — a real C variadic, whose
   # shape the format string decides at run time. CROSS-PLATFORM for the same reason as the bridge
@@ -3154,6 +3243,8 @@ endif()
   # compiler's own readers here, and against the real CRT on Windows.
   add_executable(test_guest_varargs tests/host/abi/test_guest_varargs.cpp)
   target_link_libraries(test_guest_varargs PRIVATE prosper_core)
+  prosper_add_gnu_variadic_producer(test_guest_varargs
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/host/abi/guest_varargs_fixture.cpp" test_capture)
   add_test(NAME guest_varargs COMMAND test_guest_varargs)
 
   # sceImeUpdate must invoke the guest key handler on the CALLER's guest %fs, not the host %fs the
@@ -3384,6 +3475,11 @@ endif()
       add_executable(test_fragment_proven_votes tests/gpu/execute/test_fragment_proven_votes.cpp)
       target_include_directories(test_fragment_proven_votes PRIVATE tests frontends)
       target_link_libraries(test_fragment_proven_votes PRIVATE prosper_live_renderer)
+      add_executable(test_fragment_vote_refusal_reporting tests/gpu/execute/test_fragment_vote_refusal_reporting.cpp)
+      target_include_directories(test_fragment_vote_refusal_reporting PRIVATE tests frontends)
+      target_link_libraries(test_fragment_vote_refusal_reporting PRIVATE prosper_live_renderer)
+      add_test(NAME fragment_vote_refusal_reporting COMMAND test_fragment_vote_refusal_reporting)
+      set_tests_properties(fragment_vote_refusal_reporting PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
       add_test(NAME fragment_proven_votes COMMAND test_fragment_proven_votes)
       set_tests_properties(fragment_proven_votes PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
       add_test(NAME fragment_proven_votes_no_robust2 COMMAND test_fragment_proven_votes --expect-no-robust2)
@@ -3415,6 +3511,12 @@ endif()
       target_link_libraries(test_portable_wave64_readfirstlane PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME portable_wave64_readfirstlane COMMAND test_portable_wave64_readfirstlane)
       set_tests_properties(portable_wave64_readfirstlane PROPERTIES TIMEOUT 60)
+
+      add_executable(test_portable_bpermute_execution tests/gpu/execute/test_portable_bpermute.cpp)
+      target_include_directories(test_portable_bpermute_execution PRIVATE tests)
+      target_link_libraries(test_portable_bpermute_execution PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME portable_bpermute_execution COMMAND test_portable_bpermute_execution)
+      set_tests_properties(portable_bpermute_execution PROPERTIES TIMEOUT 90)
 
       # #3425: registered on Windows as well as in the UNIX block below, deliberately. This
       # defect is about the WINDOWS/NVIDIA frontend's _Exit path and the cost it recovers was
@@ -3841,6 +3943,10 @@ endif()
       target_include_directories(test_float32_array_upload PRIVATE frontends src tests)
       target_link_libraries(test_float32_array_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME float32_array_upload COMMAND test_float32_array_upload)
+      add_executable(test_graphics_raw_wide_upload tests/shared/live/test_graphics_raw_wide_upload.cpp)
+      target_include_directories(test_graphics_raw_wide_upload PRIVATE frontends src tests)
+      target_link_libraries(test_graphics_raw_wide_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME graphics_raw_wide_upload COMMAND test_graphics_raw_wide_upload)
       add_executable(test_decoder_source_snapshot tests/shared/live/test_decoder_source_snapshot.cpp)
       target_include_directories(test_decoder_source_snapshot PRIVATE frontends src tests)
       target_link_libraries(test_decoder_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
@@ -4051,6 +4157,12 @@ endif()
       target_link_libraries(test_portable_wave64_readfirstlane PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME portable_wave64_readfirstlane COMMAND test_portable_wave64_readfirstlane)
       set_tests_properties(portable_wave64_readfirstlane PROPERTIES TIMEOUT 60)
+
+      add_executable(test_portable_bpermute_execution tests/gpu/execute/test_portable_bpermute.cpp)
+      target_include_directories(test_portable_bpermute_execution PRIVATE tests)
+      target_link_libraries(test_portable_bpermute_execution PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME portable_bpermute_execution COMMAND test_portable_bpermute_execution)
+      set_tests_properties(portable_bpermute_execution PROPERTIES TIMEOUT 90)
       add_executable(ngg_capture_probe tools/ngg_probe/ngg_capture_probe.cpp)
       target_include_directories(ngg_capture_probe PRIVATE tests)
       target_link_libraries(ngg_capture_probe PRIVATE prosper_core Vulkan::Vulkan)
@@ -4208,6 +4320,11 @@ endif()
       add_executable(test_fragment_proven_votes tests/gpu/execute/test_fragment_proven_votes.cpp)
       target_include_directories(test_fragment_proven_votes PRIVATE tests frontends)
       target_link_libraries(test_fragment_proven_votes PRIVATE prosper_core Vulkan::Vulkan)
+      add_executable(test_fragment_vote_refusal_reporting tests/gpu/execute/test_fragment_vote_refusal_reporting.cpp)
+      target_include_directories(test_fragment_vote_refusal_reporting PRIVATE tests frontends)
+      target_link_libraries(test_fragment_vote_refusal_reporting PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME fragment_vote_refusal_reporting COMMAND test_fragment_vote_refusal_reporting)
+      set_tests_properties(fragment_vote_refusal_reporting PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
       add_test(NAME fragment_proven_votes COMMAND test_fragment_proven_votes)
       set_tests_properties(fragment_proven_votes PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
       add_test(NAME fragment_proven_votes_no_robust2 COMMAND test_fragment_proven_votes --expect-no-robust2)

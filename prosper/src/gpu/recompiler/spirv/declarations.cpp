@@ -16,7 +16,9 @@ void SpirvCompute::declare_descriptor_indexing() {
 
 void SpirvCompute::declare_float_controls(uint32_t entry) {
         if (float_controls_declared) return;
-        if (!signed_zero_inf_nan_preserve_declared()) return;
+        if (!compiler_choice(CompilerChoice::FloatControls, [] {
+                return signed_zero_inf_nan_preserve_declared();
+            })) return;
         float_controls_declared = true;
         put(caps, Op_Capability, {Cap_SignedZeroInfNanPreserve});
         std::vector<uint32_t> o; pstr(o, "SPV_KHR_float_controls");

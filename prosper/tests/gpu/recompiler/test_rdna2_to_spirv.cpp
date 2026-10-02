@@ -3066,9 +3066,11 @@ int main() {
         code17d1i.data(), code17d1i.size(), &rt17d1, native_cfg17d1);
     CHECK(!native_spv17d1i.empty() && count_spirv_opcode(native_spv17d1i, 345) == 3,
           "exact Wave32 DS_BPERMUTE shuffles DATA0, EXEC, and its static event tag");
-    CHECK(recompile_compute(code17d1i.data(), code17d1i.size(), &rt17d1,
-                            portable_cfg17d1).empty(),
-          "DS_BPERMUTE stays fail-visible without an exact native wave contract");
+    const auto portable_spv17d1i = recompile_compute(
+        code17d1i.data(), code17d1i.size(), &rt17d1, portable_cfg17d1);
+    CHECK(!portable_spv17d1i.empty() && count_spirv_opcode(portable_spv17d1i, 345) == 0 &&
+              count_spirv_opcode(portable_spv17d1i, 224) > 0,
+          "DS_BPERMUTE uses the common portable gather without a native wave contract");
     std::vector<uint32_t> code17d1i_offset4 = code17d1i;
     code17d1i_offset4[3] = 0xdacc0004u; // same packet, OFFSET changes from 0 to 4 bytes
     const auto native_spv17d1i_offset4 = recompile_compute(

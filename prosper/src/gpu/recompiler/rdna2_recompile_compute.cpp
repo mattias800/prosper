@@ -416,6 +416,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
         rdna2_proven_raw_immediate_wide_data_loads(ins);
     const auto original_raw_nested_wide_data =
         rdna2_proven_raw_nested_wide_data_loads(ins);
+    const auto original_owned_raw_wide_data = rdna2_owned_raw_wide_data_loads(ins);
     // This shell publishes register state after the structured region, so both terminal arms can
     // converge in the host SPIR-V without inventing further guest execution. Graphics exports keep
     // separate side-effect bookkeeping and remain on the conservative reject path for this shape.
@@ -444,6 +445,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     seed_smem_pointer_provenance(rs, ins);   // SRT pointer-load provenance (#3616)
+    if (!retain_original_owned_raw_wide_proof(rs, original_owned_raw_wide_data)) return {};
     rs.smem_raw_x2_data_loads.insert(original_raw_x2_data.begin(),
                                      original_raw_x2_data.end());
     rs.smem_raw_wide_data_loads.insert(original_raw_wide_data.begin(),
@@ -675,6 +677,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
         rdna2_proven_raw_immediate_wide_data_loads(ins);
     const auto original_raw_nested_wide_data =
         rdna2_proven_raw_nested_wide_data_loads(ins);
+    const auto original_owned_raw_wide_data = rdna2_owned_raw_wide_data_loads(ins);
     // A dispatch-scoped proven-null BVH can collapse an exact no-hit exit and fully matched empty-stack
     // traversal cycle before generic shader-byte constant folding. Resource identity (including null
     // marker + fetch PC) is already part of the compute module cache key, so a later non-null dispatch
@@ -777,10 +780,14 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02;
         });
+    const bool has_bpermute = std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+        return in.fmt == Rdna2Format::DS && in.opcode == kDsOpcodeBpermuteB32;
+    });
     const bool exact_partial_dispatcher = config.exact_thread_extent &&
         has_partial_workgroup && (b.gta5_selected_sbuffer_dispatch_validated ||
                                   b.indirect_buffer_dispatch_validated ||
-                                  has_indirect_pointer_relocation || has_portable_readfirstlane);
+                                  has_indirect_pointer_relocation || has_portable_readfirstlane ||
+                                  has_bpermute);
     // A partial guest wave needs the portable dispatcher's per-lane ACTIVE bit. Native subgroup
     // operations cannot be entered by only the real prefix of the final host subgroup.
     if (partial_barrier_phases || exact_partial_dispatcher)
@@ -888,6 +895,11 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     rs.scc = b.bfalse();
     rs.exec = b.btrue();
     seed_smem_pointer_provenance(rs, ins);   // SRT pointer-load provenance (#3616)
+    if (!retain_original_owned_raw_wide_proof(rs, original_owned_raw_wide_data)) {
+        log_recompile_diagnostic(diagnostic, "compute-recompile-reject", "terminal",
+                                 "specialization lacks original owned raw wide source authority");
+        return {};
+    }
     rs.smem_raw_x2_data_loads.insert(original_raw_x2_data.begin(),
                                      original_raw_x2_data.end());
     rs.smem_raw_wide_data_loads.insert(original_raw_wide_data.begin(),
@@ -935,9 +947,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                    code, dwords, nullptr, true, initial_dispatch_active, false,
                    lds_fminmax_synchronization.needs_dispatcher))
         return {};
-    // Exact resource contracts and portable RFL execute partial workgroups through ACTIVE. Padded
+    // Exact resource contracts and portable wave gathers execute partial workgroups through ACTIVE. Padded
     // Vulkan lanes stay in the dispatcher and synthesized barriers, but cannot execute guest effects.
-    // The resource contracts retain their own full program/launch proofs; RFL needs no title identity.
+    // The resource contracts retain their own full program/launch proofs; gathers need no title identity.
     if (exact_partial_dispatcher && b.uses_barrier)
         b.partial_barrier_phases_emitted = true;
     // The entry guard is intentionally divergent only in the final partial workgroup. Vulkan requires

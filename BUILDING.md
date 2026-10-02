@@ -72,6 +72,29 @@ against WinLibs or MSYS2 MinGW plus an installed Vulkan SDK:
 .\prosper\scripts\run-windows.ps1 .\PPSA24651-app0
 ```
 
+The launcher needs the **LunarG Vulkan SDK** for the app target. Without it, configure only logs
+`Vulkan not found` and the launcher stops right after configure with a pointer back here. Install it,
+then open a new shell so `VULKAN_SDK` is set:
+
+```powershell
+winget install KhronosGroup.VulkanSDK
+```
+
+If `ccache` (or `sccache`) is on `PATH`, the launcher passes it to CMake as the C and C++ compiler
+launcher when it first configures a build directory, so a second build in a fresh directory is
+mostly cache hits (check with `ccache -s`). Without one, nothing changes. For `ccache` it also sets
+`CCACHE_SLOPPINESS=pch_defines,time_macros` for that run (unless you already set one): the fetched
+SDL3 builds with a precompiled header, and without this ccache misses it on every rebuild. Set the
+same variable yourself when building outside the launcher.
+
+```powershell
+winget install Ccache.Ccache     # or: scoop install ccache / choco install ccache
+```
+
+The same cache works on Linux and macOS: CMake reads `CMAKE_C_COMPILER_LAUNCHER` and
+`CMAKE_CXX_COMPILER_LAUNCHER` from the environment (or pass them as `-D` options) when it first
+configures a build directory.
+
 The full native build, screenshot and diagnostic recipe is in
 [`WINDOWS_PORT_HANDOFF.md`](prosper/docs/WINDOWS_PORT_HANDOFF.md).
 

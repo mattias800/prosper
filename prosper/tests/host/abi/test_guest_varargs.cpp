@@ -20,6 +20,7 @@
 // What NONE of this checks is a live guest calling printf on a Windows host. Nothing here pretends to.
 #include "host/abi/guest_varargs.hpp"
 #include "host/abi/sysv_ms_bridge.hpp"
+#include "guest_varargs_fixture.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 
@@ -57,7 +58,7 @@ using namespace prosper::abi;
 #endif
 #endif
 
-namespace {
+namespace prosper_varargs_fixture {
 // PROSPER_GUEST_ABI's whole value is that it is part of the FUNCTION TYPE: that is what makes
 // `Hle::register_guest_abi` reject an untagged handler at compile time on Windows, and what makes
 // the tag a no-op everywhere else. Both halves are checked by the compiler, here, rather than
@@ -169,12 +170,12 @@ void check_stub_and_registry() {
     params.checkpoint = 0x99aabbccddeeff00ull;
     params.guest_abi = true;
     const size_t n = emit_sysv_to_ms_bridge(bytes, params);
-    static const uint8_t kTailJump[] = { 0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
-                                         0xFF, 0xE0 };
+    static const uint8_t kTailJump[] = { 0x49, 0xBB, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+                                         0x41, 0xFF, 0xE3 };
     expect("guest-abi stub length", n == sizeof kTailJump,
-           "emitted " + std::to_string(n) + " bytes, expected 12");
+           "emitted " + std::to_string(n) + " bytes, expected 13");
     expect("guest-abi stub bytes", n == sizeof kTailJump && memcmp(bytes, kTailJump, n) == 0,
-           "the tail-jump is not `movabs rax, handler ; jmp rax`");
+           "the tail-jump is not `movabs r11, handler ; jmp r11`");
 
     // DISCRIMINATOR. Without the flag the same params emit the converting bridge, which is many times
     // longer. If they agreed, the arm above would be asserting nothing about the flag.
@@ -374,29 +375,6 @@ void capture_and_pack(const char* fmt, const SysvVaList& ap) {
     g_fallback_complete = call.complete();
     g_fallback_reject = call.reject();
     snprintf(g_fallback_format, sizeof g_fallback_format, "%s", call.format());
-}
-
-// The guest side: an ordinary C variadic call, placed by System V. What it captures is exactly what
-// h_printf captures.
-TEST_GUEST_ABI void guest_call(const char* fmt, ...) {
-    TEST_GUEST_VA_LIST ap;
-    TEST_GUEST_VA_START(ap, fmt);
-    SysvVaList captured;
-    memcpy(&captured, &ap, sizeof captured);
-    TEST_GUEST_VA_END(ap);
-    capture_and_pack(fmt, captured);
-}
-
-// The same frame, read by the COMPILER's own System V va_arg instead of by sysv_va_arg — the
-// independently produced positive instance that stops arm (1) being checked against itself.
-TEST_GUEST_ABI void guest_call_reference(const char* fmt, ...) {
-    TEST_GUEST_VA_LIST ap;
-    TEST_GUEST_VA_START(ap, fmt);
-    for (unsigned i = 0; i < g_ref_n; ++i) {
-        if (g_cls[i] == VarargClass::Sse) g_ref_d[i] = __builtin_va_arg(ap, double);
-        else                              g_ref_u[i] = __builtin_va_arg(ap, uint64_t);
-    }
-    TEST_GUEST_VA_END(ap);
 }
 
 // Consume a packed Microsoft va_list image with the COMPILER's own Microsoft va_arg. This is what
@@ -666,9 +644,10 @@ void check_executed() {
 }
 #endif  // PROSPER_TEST_X86_64
 
-} // namespace
+} // namespace prosper_varargs_fixture
 
 int main() {
+    using namespace prosper_varargs_fixture;
     check_plans();
     check_stub_and_registry();
     check_lookup_accessors();

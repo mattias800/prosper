@@ -111,6 +111,19 @@ struct AdvertisedDisplayMode {
     bool derived = false;
 };
 
+// GetOutputStatus's first u32 is a resolution enum (#4031). Messenger logs names for UNKNOWN=0,
+// HD=1, 4K=2, 8K=3; Hades and Onimusha use 1 for 1920x1080, and Hades uses 2 for 3840x2160.
+// An independent homebrew API consumer also uses 2 for 3840x2160. CONFIDENCE: MED on these
+// enum-to-geometry mappings: actual consumer code, not an authoritative SDK or hardware capture.
+// Encode the SELECTED advertised mode, never the host desktop or a registered render surface.
+// No numeric mapping is established for our opt-in 720p mode; retain UNKNOWN for it and any future
+// unmapped geometry. Hades's allocation choices for 3/4 do not establish a complete enum.
+constexpr uint32_t output_resolution_prefix(const AdvertisedDisplayMode& mode) {
+    if (mode.width == 1920 && mode.height == 1080) return 1;  // HD
+    if (mode.width == 3840 && mode.height == 2160) return 2;  // 4K
+    return 0;  // UNKNOWN: do not guess another geometry's enum
+}
+
 // PROSPER_DISPLAY_MODE. Default is `legacy`: byte-identical to prosper's pre-#3017 behaviour, so a
 // title that works today cannot be changed by this code existing. Deriving is opt-in because the
 // advertised mode is something titles ACT on -- resolution selection and frame pacing both hang

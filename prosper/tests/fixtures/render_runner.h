@@ -11045,6 +11045,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         const std::vector<uint32_t>* effective_fs = &bd_fs;
         bool fragment_votes_lowered = false;
         bool fragment_vote_buffer_certificate = false;
+        prosper::gpu::FragmentVoteLoweringDiagnostic fragment_vote_diagnostic;
         // Diagnostic: write the fragment module this gate just ruled on, so the ADMITTED and
         // SKIPPED populations can be compared offline. Off unless PROSPER_FRAGMENT_WAVE_DUMP names
         // a directory; one file per distinct shader key per verdict.
@@ -11083,6 +11084,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 uncached = prosper::gpu::lower_fragment_votes(bd_fs, buffer_certificate, ctx.deterministic_storage_reads);
                 lowered = &uncached;
             }
+            fragment_vote_diagnostic = lowered->diagnostic();
             if (lowered->refusal == prosper::gpu::FragmentVoteRefusal::None) {
                 // Uncached words must survive until vkCreateShaderModule. Retain them per draw.
                 if (lowered == &uncached) {
@@ -11183,7 +11185,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 required_fragment_subgroup_size, bd.fs_guest_addr,
                 bd.fs_identity ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size()),
                 prosper::gpu::fragment_spirv_required_subgroup_reasons(bd_fs),
-                ctx.min_subgroup_size, ctx.max_subgroup_size);
+                ctx.min_subgroup_size, ctx.max_subgroup_size, fragment_vote_diagnostic);
             const uint64_t shader_key = bd.fs_identity
                 ? bd.fs_identity : hash_buffer_words(bd_fs.data(), bd_fs.size());
             static std::mutex log_mutex;

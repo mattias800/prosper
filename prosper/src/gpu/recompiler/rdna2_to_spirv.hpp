@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <vector>
 #include "gpu/recompiler/fragment_float_mode.hpp"
+#include "gpu/recompiler/fragment_arithmetic_observation.hpp"
 
 namespace prosper::gpu {
 
@@ -177,6 +178,8 @@ uint64_t trip_bound_parses();
 class TripBoundOperation {
 public:
     TripBoundOperation();
+    // Offline compilation restores the producing pin without parsing or inheriting host settings.
+    explicit TripBoundOperation(const ComputeTripBoundSettings& retained);
     ~TripBoundOperation();
     TripBoundOperation(const TripBoundOperation&) = delete;
     TripBoundOperation& operator=(const TripBoundOperation&) = delete;
@@ -205,6 +208,10 @@ std::vector<uint32_t> rdna2_proven_raw_x2_data_loads(const std::vector<Rdna2Inst
 // replacement. Such loads cannot use the descriptor-only zero-placeholder lowering.
 std::vector<uint32_t> rdna2_raw_wide_data_loads(const std::vector<Rdna2Inst>& instructions);
 std::vector<uint32_t> rdna2_proven_raw_immediate_wide_data_loads(
+    const std::vector<Rdna2Inst>& instructions);
+// Exact immediate x4/x8 read points requiring an owned same-fold observation: entry pointers
+// may change after the fetch, or the fetched words select a proven register-offset child.
+std::vector<uint32_t> rdna2_owned_raw_wide_data_loads(
     const std::vector<Rdna2Inst>& instructions);
 // Register offsets with a straight-line scalar-data definition, followed by the same entry-pointer
 // and lifetime proof as immediate loads. Immediate-zero raw x1 dependencies authenticate their
@@ -298,6 +305,13 @@ struct VertexPrologInfo {
 };
 
 VertexPrologInfo rdna2_vertex_prolog_info(const uint32_t* code, size_t dwords);
+
+// Owned read-point inputs currently have one direct-stage PC namespace. Detect requirements in
+// either original chain half or the linked stream, even without resource markers, so cache and
+// stored-module replay cannot bypass the direct compiler's explicit chain refusal.
+bool rdna2_vertex_chain_has_owned_raw_wide_inputs(
+    const uint32_t* prolog, size_t prolog_dwords, const uint32_t* main, size_t main_dwords,
+    const ShaderResourceTable* resources);
 
 PcrelDispatchInfo rdna2_pcrel_dispatch_info(const uint32_t* code, size_t dwords);
 
@@ -645,6 +659,8 @@ uint32_t compute_spirv_min_subgroup_size(const std::vector<uint32_t>& spirv);
 // write vec4(src0..3) to the matching color output. NULL-only shaders retain discard/EXEC effects and
 // intentionally expose no color output. Returns {} if unsupported / no implemented export.
 // An optional ShaderResourceTable enables memory ops (SMEM/MUBUF/MTBUF) with resolved bindings.
+// A nonnull arithmetic_observation transfers reporting to the owning cache request; it must replay
+// the retained observation on every return. Default direct callers announce once per request.
 std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt = nullptr,
                                          const PixelSystemInputMapping* system_inputs = nullptr,
@@ -653,7 +669,8 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          bool wave32 = false,
                                          RecompileDiagnosticContext diagnostic = {
                                              RecompileDiagnosticStage::Fragment, 0},
-                                         FragmentFloatMode float_mode = {});
+                                         FragmentFloatMode float_mode = {},
+                                         FragmentArithmeticObservation* arithmetic_observation = nullptr);
 
 // Test hook for the low-half EXEC/VCC mask path. Production fragment compilation supplies the same
 // mode from SPI_PS_IN_CONTROL.PS_W32_EN.

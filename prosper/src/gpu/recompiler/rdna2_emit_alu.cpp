@@ -3682,11 +3682,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), selected);
                     break;
                 }
-                case 0x03: d = b.fbin(Op_FAdd, a, c); break;          // v_add_f32
+                case 0x03:                                          // v_add_f32
+                    b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Add);
+                    d = b.fbin(Op_FAdd, a, c); break;
                 case 0x04: d = b.fbin(Op_FSub, a, c); break;          // v_sub_f32
                 case 0x05: d = b.fbin(Op_FSub, c, a); break;          // v_subrev_f32 (src1 - src0; e32 form of
                                                                       // VOP3 0x105 — round-trip llvm-mc gfx1010 0x0a020702)
-                case 0x08: d = b.fbin(Op_FMul, a, c); break;          // v_mul_f32
+                case 0x08:                                          // v_mul_f32
+                    b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Mul);
+                    d = b.fbin(Op_FMul, a, c); break;
                 case 0x0B: {                                        // v_mul_u32_u24
                     // Only the low 24 bits of each source participate; the result is the low
                     // 32 bits of the unsigned product (AMD RDNA2 ISA 11.6).
@@ -5353,12 +5357,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16_rtz(fv(0), fv(1)); // v_cvt_pkrtz VOP3: RTZ clamp (#452)
             } else if (in.opcode == 0x103) {                          // v_add_f32 (VOP3 form)
+                b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Add);
                 vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, fv(0), fv(1)));
             } else if (in.opcode == 0x104) {                          // v_sub_f32 (VOP3 form) = s0 - s1
                 vreg[in.dst.value] = fresult(b.fbin(Op_FSub, fv(0), fv(1)));
             } else if (in.opcode == 0x105) {                          // v_subrev_f32 (VOP3 form) = s1 - s0
                 vreg[in.dst.value] = fresult(b.fbin(Op_FSub, fv(1), fv(0)));
             } else if (in.opcode == 0x108) {                          // v_mul_f32 (VOP3 form)
+                b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Mul);
                 vreg[in.dst.value] = fresult(b.fbin(Op_FMul, fv(0), fv(1)));
             } else if (in.opcode == 0x10F) {                          // v_min_f32 (VOP3 form; NaN -> other operand)
                 vreg[in.dst.value] = fresult(b.fext2(Glsl_NMin, fv(0), fv(1)));
@@ -5637,9 +5643,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // SOFFSET adds an SGPR-computed byte offset:
             //  * a descriptor-only s_load (x4/x8 = V#/T#) with a computed offset can be resolved
             //    by the front end at the exact fetch PC, leaving placeholder words here. Typeless
-            //    x4/x8 loads whose words also feed ordinary ALU require real backing and reject
-            //    below IN THE COMPUTE SHELL; Uncharted's full-resolution compute writer has several
-            //    such loads. Graphics stages keep the placeholder for now (#3951).
+            //    register-offset x4/x8 loads whose words also feed ordinary ALU require real
+            //    backing in every stage and reject below when that backing is not proven.
+            //    Uncharted's full-resolution compute writer has several such numeric loads.
             //  * an s_buffer_load (0x8..0xC) with a TRACKED scalar offset is a computed constant-
             //    buffer read (DOLL's bloom-combine PS: per-tap weights at `vcc_lo = 16*(tap/2)`
             //    inside its counted loop, #273) — model it as a DYNAMIC dword index into the
@@ -5647,23 +5653,35 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             //    (a runtime user-SGPR we have no value for) still rejects — never fold as 0.
             const bool soff_null = (in.src[1].kind == OperandKind::Special && in.src[1].value == 125);
             uint32_t soff_bits = 0; bool soff_dyn = false;
-            // #3951: the register-offset refusal is scoped to the COMPUTE shell, which is where it
-            // was established (#3944: Uncharted's full-resolution compute writer). Vertex and pixel
-            // stages keep their long-standing placeholder lowering for register-offset x4/x8 loads
-            // until those loads have real backing: refusing them dropped every draw that used them
-            // (GTA V gameplay 1.27M -> 4.3k draws per run; Blue Prince's title and Astro Bot went
-            // black). The placeholder is still WRONG for a word read as data -- it is the prior
-            // behaviour restored, not a proof -- so it stays visible under PROSPER_DBG below.
+            // Numeric register-offset x4/x8 words require real backing in every stage. Descriptor
+            // assembly alone is excluded by the full-stream derived-use classification; its exact
+            // consumer-PC route remains valid without treating descriptor placeholders as data.
             // The bounded immediate current-byte proof (#3956) is stage-independent and unchanged.
             const bool raw_wide_register_offset_data =
                 rt && (in.opcode == 0x2 || in.opcode == 0x3) && !soff_null &&
                 rs.smem_raw_wide_data_loads.contains(in.pc);
             const ShaderResource* register_source = rt ? rt->by_fetch_pc(in.pc) : nullptr;
+            const bool owned_wide_source = rs.smem_raw_owned_wide_data_loads.contains(in.pc);
+            // SOURCE replay retains opaque backing presence separately from readable bytes.
+            // These admission checks consume only shape/presence; actual byte readers use the
+            // checked resource gateway, and draw execution retains its real ownership checks.
+            const ShaderResource* owned_wide_binding = owned_wide_source && rt
+                ? owned_raw_snapshot_at(*rt, in.pc, n * sizeof(uint32_t),
+                                        compiler_resource_has_host_data) : nullptr;
+            if (owned_wide_source && !owned_wide_binding) {
+                if (getenv("PROSPER_DBG"))
+                    fprintf(stderr,
+                            "[smem-reject] pc=%u reason=raw-wide-read-requires-owned-backing\n",
+                            in.pc);
+                ok = false;
+                return true;
+            }
             // A source word admitted by the wide-offset proof belongs to this exact realization.
             // A malformed replay table must fail before ordinary scalar-load resource fallback.
-            if (rs.smem_raw_offset_scalar_source_pcs.contains(in.pc) &&
+            if (!owned_wide_source && rs.smem_raw_offset_scalar_source_pcs.contains(in.pc) &&
                 (!register_source || register_source->fetch_pc != in.pc ||
-                 !valid_raw_offset_scalar_snapshot_resource(*register_source))) {
+                 !valid_owned_raw_snapshot_resource(*register_source, sizeof(uint32_t),
+                     compiler_resource_has_host_data(*register_source)))) {
                 if (getenv("PROSPER_DBG"))
                     fprintf(stderr,
                             "[smem-reject] pc=%u reason=raw-offset-scalar-requires-owned-backing\n",
@@ -5677,16 +5695,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool backed_register_wide = raw_wide_register_offset_data &&
                 rs.smem_raw_register_wide_data_loads.contains(in.pc) &&
                 register_source &&
-                valid_raw_register_snapshot_resource(*register_source) &&
+                valid_raw_register_snapshot_resource(*register_source,
+                    compiler_resource_has_host_data(*register_source)) &&
                 register_source->fetch_pc == in.pc && register_source->size == n * 4u &&
                 shader_resource_buffer_binding_bytes(*register_source) >= n * 4u;
-            static std::atomic<uint32_t> raw_wide_placeholder_logs{0};
-            if (raw_wide_register_offset_data && !backed_register_wide && !b.is_compute && getenv("PROSPER_DBG") &&
-                raw_wide_placeholder_logs.fetch_add(1, std::memory_order_relaxed) < 64)
-                fprintf(stderr,
-                        "[smem-placeholder] pc=%u reason=raw-wide-data-graphics-placeholder "
-                        "op=0x%x (#3951: register-offset data words lowered as zero)\n",
-                        in.pc, in.opcode);
             // The bounded current-byte proof below covers an unchanged ENTRY pointer. A pointer
             // loaded into SGPRs by this shader can still name numeric x4/x8 data, but its load is
             // absent from that proof. In the compute shell, do not let the descriptor-only route
@@ -5695,27 +5707,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 sreg_range_written(rs, in.src[0].value, 2);
             if (rt && (in.opcode == 0x2 || in.opcode == 0x3) &&
                 rs.smem_raw_wide_data_loads.contains(in.pc) &&
-                ((!soff_null && (b.is_compute || backed_register_wide ||
-                               (register_source && register_source->raw_register_snapshot))) ||
+                (!soff_null ||
                  (soff_null && rs.smem_raw_immediate_wide_data_loads.contains(in.pc)) ||
                  nested_raw_wide_data)) {
                 // Keep the existing immediate descriptor route for loads outside the bounded
                 // current-byte proof. Some established routed tables carry only the resulting
                 // resource, without a source binding at this load PC. The may-use census still
                 // reports numeric/uncertain reads; it cannot turn that legacy route into a
-                // current-byte observation. Register-offset data retains its prior refusal.
+                // current-byte observation. Register-offset data requires backing in every stage.
                 const ShaderResource* exact = rt->by_fetch_pc(in.pc);
-                const bool backed_immediate_wide = soff_null && !nested_raw_wide_data &&
+                const bool backed_immediate_wide = owned_wide_binding ||
+                    (soff_null && !nested_raw_wide_data &&
                     (n == 4u || n == 8u) &&
                     rs.smem_raw_immediate_wide_data_loads.contains(in.pc) && exact &&
                     exact->fetch_pc == in.pc && exact->cls == ResourceClass::ConstantBuffer &&
                     shader_resource_buffer_binding_bytes(*exact) >=
-                        static_cast<uint64_t>(in.literal) + n * sizeof(uint32_t);
+                        static_cast<uint64_t>(in.literal) + n * sizeof(uint32_t));
                 const bool backed_nested_wide = nested_raw_wide_data &&
                     rs.smem_raw_nested_wide_data_loads.contains(in.pc) && exact &&
                     exact->fetch_pc == in.pc && exact->cls == ResourceClass::ConstantBuffer &&
                     exact->nested_raw_snapshot_admitted &&
-                    exact->host_data && exact->host_data_size >= exact->size &&
+                    compiler_resource_has_host_data(*exact) && exact->host_data_size >= exact->size &&
                     shader_resource_buffer_binding_bytes(*exact) >=
                         static_cast<uint64_t>(in.literal) + n * sizeof(uint32_t);
                 if (!backed_immediate_wide && !backed_nested_wide && !backed_register_wide) {
@@ -5808,7 +5820,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 soff_dyn = true;
             } else if ((int32_t)in.literal < 0) { ok = false; return true; }   // negative imm-only would wrap
-            uint32_t base_idx = (soff_dyn || backed_register_wide) ? 0 : in.literal >> 2;
+            uint32_t base_idx = (soff_dyn || backed_register_wide || owned_wide_source)
+                ? 0 : in.literal >> 2;
             // Descriptor provenance: pick which bound constant buffer via the resource table, routing this
             // load to that buffer's OWN binding (N-buffer model) — so Unity's several constant buffers
             // (per-draw transform, per-frame, …) don't collapse onto one. For s_buffer_load, SBASE
@@ -5885,6 +5898,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                (resource.fetch_pc == in.pc ||
                                !rs.smem_raw_x2_data_loads.contains(resource.fetch_pc) &&
                                !rs.smem_raw_offset_scalar_source_pcs.contains(resource.fetch_pc) &&
+                               !rs.smem_raw_owned_wide_data_loads.contains(resource.fetch_pc) &&
                                !rs.smem_raw_register_wide_data_loads.contains(resource.fetch_pc) &&
                                !rs.smem_raw_immediate_wide_data_loads.contains(resource.fetch_pc)) &&
                                (resource.cls == ResourceClass::ConstantBuffer ||
@@ -7943,7 +7957,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 //
                 // Never acceptable in a run that produces progression evidence: every unresolved sample
                 // reads a flat value.
-                if (!res && getenv("PROSPER_MIMG_SOFT")) {
+                if (!res && compiler_choice(CompilerChoice::MimgSoft, [] {
+                        return getenv("PROSPER_MIMG_SOFT") != nullptr;
+                    })) {
                     const uint32_t soft = b.uconst(fbits(0.5f));
                     uint32_t comps = 0;
                     for (uint32_t m = 0; m < 4; ++m) if (in.mimg_dmask & (1u << m)) ++comps;
@@ -8562,7 +8578,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // faces, explicit LOD/bias, DREF and packed offsets are not spatial coordinates. Explicit
             // gradients receive the same per-axis scale so mip selection remains identical.
             const bool normalize_sampler_coordinates = res->unnormalized &&
-                !getenv("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE");
+                compiler_choice(CompilerChoice::NormalizeSamplerCoordinates, [] {
+                    return getenv("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE") == nullptr;
+                });
             auto normalized_spatial = [&](uint32_t coordinate, uint32_t extent) {
                 if (!normalize_sampler_coordinates) return coordinate;
                 if (!extent) { ok = false; return b.uconst(0); }
@@ -8894,8 +8912,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         case Rdna2Format::DS: {
             if (in.opcode == kDsOpcodeBpermuteB32) {
                 // A native subgroup exactly matching the guest wave gives each architectural
-                // 32-lane half a valid shuffle domain. Portable compute needs a workgroup-scratch
-                // gather and remains fail-visible until that separate synchronized route exists.
+                // 32-lane half a valid shuffle domain. Portable compute is routed through the
+                // CFG common event; never put its workgroup rendezvous in this arbitrary ALU arm.
                 if (!b.is_compute || in.ds_gds || !b.native_subgroup_size ||
                     b.native_subgroup_size != b.wave_size) {
                     ok = false;

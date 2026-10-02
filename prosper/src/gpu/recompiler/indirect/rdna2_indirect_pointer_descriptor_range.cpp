@@ -1,4 +1,5 @@
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
+#include "gpu/recompiler/compiler_resource_access.hpp"
 
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -490,8 +491,9 @@ const ShaderResource* unique_resource_at(const ShaderResourceTable& resources,
 }
 
 const uint8_t* complete_bytes(const ShaderResource& resource) {
-    if (resource.host_data && resource.host_data_size >= resource.size)
-        return resource.host_data;
+    if (compiler_resource_has_host_data(resource) && resource.host_data_size >= resource.size)
+        return compiler_resource_data(resource, resource.size);
+    compiler_resource_forbid_guest_read();
     return resource.size <= UINT32_MAX && guest_readable(resource.gpu_addr, resource.size)
         ? reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(resource.gpu_addr))
         : nullptr;

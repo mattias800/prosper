@@ -247,6 +247,37 @@ constexpr WaitDeadline normalize_wait_deadline(WaitDeadline t) {
     return WaitDeadline{t.sec + carry, nsec};
 }
 
+struct C11Timeout32 {
+    bool valid;
+    uint32_t usec;
+};
+
+// The C11 wrappers convert an absolute UTC deadline to relative microseconds, round up, then
+// pass only the low 32 bits to scePthread*. Normalization overflow is rejected rather than
+// manufacturing a deadline; it is outside the valid C11 timespec range.
+constexpr C11Timeout32 c11_timeout_from_deadline(WaitDeadline now, WaitDeadline deadline) {
+    constexpr int64_t kNsPerSec = 1000000000LL;
+    const auto normalize_checked = [](WaitDeadline& t) constexpr {
+        int64_t carry = t.nsec / kNsPerSec;
+        int64_t nsec = t.nsec % kNsPerSec;
+        if (nsec < 0) { nsec += kNsPerSec; --carry; }
+        if ((carry > 0 && t.sec > INT64_MAX - carry) ||
+            (carry < 0 && t.sec < INT64_MIN - carry)) return false;
+        t = {t.sec + carry, nsec};
+        return true;
+    };
+    if (!normalize_checked(now) || !normalize_checked(deadline)) return {false, 0};
+    if (deadline.sec < now.sec ||
+        (deadline.sec == now.sec && deadline.nsec <= now.nsec)) return {true, 0};
+
+    // Unsigned subtraction also covers intervals spanning the full signed-seconds range.
+    uint64_t seconds = (uint64_t)deadline.sec - (uint64_t)now.sec;
+    int64_t nsec = deadline.nsec - now.nsec;
+    if (nsec < 0) { nsec += kNsPerSec; --seconds; }
+    // Unsigned wrap preserves the required low 32 bits even for enormous intervals.
+    return {true, (uint32_t)(seconds * 1000000ULL + ((uint64_t)nsec + 999ULL) / 1000ULL)};
+}
+
 // `now` + `usec`, saturating at INT64_MAX seconds.
 //
 // The saturation is the rule guest_ns_from() (#3022) and timeout_ns_from_us() (#3069) already state

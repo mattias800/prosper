@@ -2,6 +2,7 @@
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
+#include "gpu/diagnostics/fragment_arithmetic.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -394,7 +395,8 @@ static std::vector<uint32_t> recompile_fragment_impl(
         const FragmentInterpolationLayout* interpolation,
         uint32_t wave_size,
         RecompileDiagnosticContext diagnostic,
-        FragmentFloatMode float_mode = {}) {
+        FragmentFloatMode float_mode,
+        FragmentArithmeticObservation* arithmetic_observation) {
     if ((wave_size != 32 && wave_size != 64) || !float_mode.canonical()) return {};
     std::vector<Rdna2Inst> ins;
     const size_t program_dwords = rdna2_walk(code, dwords, ins);
@@ -416,6 +418,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
     const auto original_raw_wide_data = rdna2_raw_wide_data_loads(ins);
     const auto original_raw_immediate_wide_data =
         rdna2_proven_raw_immediate_wide_data_loads(ins);
+    const auto original_owned_raw_wide_data = rdna2_owned_raw_wide_data_loads(ins);
     if (pcrel_dispatch_target != UINT32_MAX) {
         const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(code, dwords);
         if (!specialize_pcrel_dispatch(ins, dispatch, pcrel_dispatch_target)) {
@@ -481,6 +484,10 @@ static std::vector<uint32_t> recompile_fragment_impl(
     b.diagnostic = diagnostic;
     b.fragment_float_mode = float_mode;
     b.fragment_program_hash = shader_program_hash(code, program_dwords);
+    b.fragment_arithmetic_observation = arithmetic_observation;
+    arithmetic_observation->producing_program = diagnostic.program_address;
+    arithmetic_observation->source_fingerprint = b.fragment_program_hash;
+    arithmetic_observation->float_mode = float_mode;
     b.wave_size = effective_wave_size;
     b.begin_fragment(rt, color_mask);
     // SPI_PS_IN_CONTROL.PS_W32_EN proves that EXEC_HI/VCC_HI are unused and the low-half mask
@@ -491,11 +498,14 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // VGPR produced at that PC so the rendered frame visualises the value. The `draw:` prefix is consumed by
     // gpu_replay (which re-recompiles only that draw's FS). Parse the same complete selector here so an
     // invalid or overflowing PC cannot silently become PC zero or truncate to 32 bits.
-    if (const char* tap = getenv("PROSPER_FS_TAP")) {
+    b.tap_pc = static_cast<uint32_t>(compiler_choice(CompilerChoice::FragmentTapPc, [] {
+      if (const char* tap = getenv("PROSPER_FS_TAP")) {
         uint64_t draw = 0;
         uint32_t pc = 0;
-        if (parse_fragment_tap_selector(tap, draw, pc)) b.tap_pc = pc;
-    }
+        if (parse_fragment_tap_selector(tap, draw, pc)) return pc;
+      }
+      return UINT32_MAX;
+    }));
     b.declare_guest_scratch(scratch);
     b.fragment_interpolation = &derived_interpolation;
     // P0-only attributes retain the cheap Flat varying path. Mixed smooth/explicit-parameter reads
@@ -512,6 +522,11 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // only in the CFG dispatcher: a shader emitted straight-line otherwise carries an empty set and
     // its SRT pointer load reaches the constant-buffer path and rejects the whole shader (#3616).
     seed_smem_pointer_provenance(rs, ins);
+    if (!retain_original_owned_raw_wide_proof(rs, original_owned_raw_wide_data)) {
+        log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",
+                                 "specialization lacks original owned raw wide source authority");
+        return {};
+    }
     rs.smem_raw_x2_data_loads.insert(original_raw_x2_data.begin(),
                                      original_raw_x2_data.end());
     rs.smem_raw_wide_data_loads.insert(original_raw_wide_data.begin(),
@@ -659,17 +674,22 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const FragmentInterpolationLayout* interpolation,
                                          bool wave32,
                                          RecompileDiagnosticContext diagnostic,
-                                         FragmentFloatMode float_mode) {
-    return recompile_fragment_impl(code, dwords, rt, system_inputs,
-                                   pcrel_dispatch_target, interpolation,
-                                   wave32 ? 32u : 64u, diagnostic, float_mode);
+                                         FragmentFloatMode float_mode,
+                                         FragmentArithmeticObservation* arithmetic_observation) {
+    FragmentArithmeticObservation observation;
+    auto result = recompile_fragment_impl(code, dwords, rt, system_inputs,
+                                         pcrel_dispatch_target, interpolation,
+                                         wave32 ? 32u : 64u, diagnostic, float_mode, &observation);
+    if (arithmetic_observation) *arithmetic_observation = observation;
+    else observe_fragment_arithmetic(observation, diagnostic.program_address, !result.empty());
+    return result;
 }
 
 std::vector<uint32_t> recompile_fragment_wave32_for_test(
         const uint32_t* code, size_t dwords) {
-    return recompile_fragment_impl(code, dwords, nullptr, nullptr,
-                                   UINT32_MAX, nullptr, 32,
-                                   {RecompileDiagnosticStage::Fragment, 0});
+    return recompile_fragment(code, dwords, nullptr, nullptr,
+                              UINT32_MAX, nullptr, true,
+                              {RecompileDiagnosticStage::Fragment, 0});
 }
 
 namespace {

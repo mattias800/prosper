@@ -34,7 +34,7 @@ static int fails = 0;
 
 // Window bounds mirror hle_kernel_mem.cpp (kGuestAutoMapBase/Limit on Linux; kGuestAutoVaMin/Max
 // on Windows). Huge hinted reserves retain their existing 128 GiB floor even when ordinary
-// automatic maps prefer 64 GiB (#4032), so the low hint remains free for the metadata pool.
+// automatic maps prefer 256 GiB (#4064), so the low hint remains free for the metadata pool.
 static constexpr uint64_t kAutoMin = 0x2000000000ull;      // 128 GiB huge-reserve floor
 static constexpr uint64_t kAutoEndIncl = 0xfbffffffffull;  // inclusive (~1 TiB aperture ceiling)
 
@@ -60,6 +60,24 @@ static bool span_is_free(uint64_t base, uint64_t len) {
         }
         cur = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
     }
+#elif defined(__linux__)
+    FILE* maps = std::fopen("/proc/self/maps", "r");
+    if (!maps) return false;
+    char line[512];
+    bool free = true;
+    while (std::fgets(line, sizeof(line), maps)) {
+        unsigned long long lo = 0, hi = 0;
+        if (std::sscanf(line, "%llx-%llx", &lo, &hi) != 2) { free = false; break; }
+        if (lo < base + len && hi > base) {
+            printf("  [occupant] base=0x%llx end=0x%llx (probe span 0x%llx)\n", lo, hi,
+                   (unsigned long long)base);
+            free = false;
+            break;
+        }
+    }
+    if (std::ferror(maps)) free = false;
+    std::fclose(maps);
+    return free;
 #else
     (void)base; (void)len;
 #endif
@@ -132,7 +150,7 @@ int main() {
         unmap(below, belowLen, 0, 0, 0, 0);
     }
 
-    // #4032: before ordinary automatic mappings, their new preferred base equals this low hint.
+    // #4032/#4064: before ordinary automatic mappings, keep huge's floor distinct from their base.
     // The huge redirect retains its separate floor rather than becoming a literal-at-hint reserve.
     // Windows case 1 below already covers that floor; an extra earlier giant reservation leaves
     // a free placeholder that fragments its later 512 GiB allocation even after guest unmap.
@@ -142,7 +160,7 @@ int main() {
     LOGV("pristine", pristine_rc, pristine);
     CHECK(pristine_rc == 0 && pristine != kArenaHint && pristine >= kAutoMin &&
               pristine <= kAutoEndIncl - kHugeMin + 1,
-          "a pristine huge hinted reserve keeps its legacy band above the ordinary preferred base");
+          "a pristine huge hinted reserve keeps its legacy band above the low hint");
     if (pristine_rc == 0) unmap(pristine, kHugeMin, 0, 0, 0, 0);
 #endif
 
@@ -211,6 +229,50 @@ int main() {
     CHECK(rc == 0 && atThr != 0x1200000000ull && atThr >= kAutoMin,
           "exactly-128GiB non-fixed reserve is redirected into the window");
     unmap(atThr, kHugeMin, 0, 0, 0, 0);
+
+#ifdef __linux__
+    // Force the shared cursor to wrap BELOW the ordinary floor. The entire ordinary tail is a
+    // sparse PROT_NONE reservation; only [128,256) can fit the next huge hinted 128 GiB request.
+    // Checking the host-free precondition first makes a blocked fixture an explicit failure.
+    constexpr uint64_t ordinaryFloor = 0x4000000000ull;
+    constexpr uint64_t apertureEnd = kAutoEndIncl + 1;
+    constexpr uint64_t tailLen = apertureEnd - ordinaryFloor;  // 752 GiB, no physical writes
+    const bool tailFree = span_is_free(ordinaryFloor, tailLen);
+    const bool hugeBandFree = span_is_free(kAutoMin, ordinaryFloor - kAutoMin);
+    CHECK(tailFree && hugeBandFree, "host-free precondition for the ordinary-tail/huge-wrap discriminator");
+    if (tailFree && hugeBandFree) {
+        uint64_t tail = 0;
+        const uint64_t tailRc = reserve((uint64_t)&tail, tailLen, 0, kArenaAlign, 0, 0);
+        LOGV("tail", tailRc, tail);
+        CHECK(tailRc == 0 && tail == ordinaryFloor && tail + tailLen == apertureEnd,
+              "ordinary null-hint reservation wraps to its floor and fills only the bounded tail");
+        if (tailRc == 0) {
+            uint64_t lowerHuge = kArenaHint;
+            const uint64_t lowerRc = reserve((uint64_t)&lowerHuge, kHugeMin, 0, kArenaAlign, 0, 0);
+            LOGV("huge-wrap", lowerRc, lowerHuge);
+            CHECK(lowerRc == 0 && lowerHuge == kAutoMin && lowerHuge + kHugeMin == ordinaryFloor,
+                  "huge hinted reservation wraps to 128 GiB independently of the ordinary 256 GiB floor");
+            if (lowerRc == 0)
+                CHECK(unmap(lowerHuge, kHugeMin, 0, 0, 0, 0) == 0, "release the lower huge-wrap reservation");
+            CHECK(unmap(tail, tailLen, 0, 0, 0, 0) == 0, "release the whole ordinary-tail reservation");
+        }
+
+        // The higher ordinary floor must still leave a real 512 GiB huge fit after ordinary use.
+        constexpr uint64_t huge512Len = 0x8000000000ull;
+        uint64_t huge512 = kArenaHint;
+        const uint64_t huge512Rc = reserve((uint64_t)&huge512, huge512Len, 0, kArenaAlign, 0, 0);
+        LOGV("huge512", huge512Rc, huge512);
+        CHECK(huge512Rc == 0 && huge512 >= kAutoMin && huge512 <= apertureEnd - huge512Len,
+              "a 512 GiB huge hinted reservation still fits after ordinary-tail use and release");
+        uint64_t metadata = kArenaHint;
+        const uint64_t metadataRc = reserve((uint64_t)&metadata, 0x4000000, 0, 0x4000, 0, 0);
+        LOGV("metadata", metadataRc, metadata);
+        CHECK(metadataRc == 0 && metadata == kArenaHint,
+              "small hinted metadata retains its 64 GiB address beside the 512 GiB arena");
+        if (metadataRc == 0) CHECK(unmap(metadata, 0x4000000, 0, 0, 0, 0) == 0, "release the metadata pool");
+        if (huge512Rc == 0) CHECK(unmap(huge512, huge512Len, 0, 0, 0, 0) == 0, "release the 512 GiB reservation");
+    }
+#endif
 
     printf("fails=%d\n", fails);
     return fails ? 1 : 0;

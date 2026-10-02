@@ -6,6 +6,8 @@ contract: a change here is a change to a format that already-written captures ar
 
 - `fold_capture_codec` — independent versioned `.prfold` format with bounded field-wise encoding
   and code/file integrity checks. Its schema is separate from frame and bundle versions.
+- `fragment_compile_case_codec` — the independent bounded `.prfc` compiler-input format,
+  validating owned backing references and atomic publication without serializing host pointers.
 - `capture_codecs` — the `Writer`/`Reader` byte cursors, and one `write_*`/`read_*` pair per field
   group (pipeline, colour target, scissor, logic op, resource, table). A header because both entry
   points use them, and the only place a field's on-disk shape is spelled.
