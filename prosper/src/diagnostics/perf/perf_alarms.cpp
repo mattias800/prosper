@@ -200,6 +200,17 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
     std::vector<AlarmFiring> candidates = evaluate_rules(w, config_.thresholds);
     std::lock_guard<std::mutex> lock(mutex_);
     ++windows_;
+    frame_breakdown_.seconds += w.seconds;
+    frame_breakdown_.flips += w.flips;
+    frame_breakdown_.target_hz = w.target_hz;
+    for (size_t i = 0; i < kCostCount; ++i) {
+        frame_breakdown_.cost_ns[i] += w.cost_ns[i];
+        frame_breakdown_.cost_events[i] += w.cost_events[i];
+    }
+    frame_breakdown_.device_ns_graphics += w.count(Counter::GpuDeviceNsGraphics);
+    frame_breakdown_.device_samples_graphics += w.count(Counter::GpuDeviceSamplesGraphics);
+    frame_breakdown_.device_ns_compute += w.count(Counter::GpuDeviceNsCompute);
+    frame_breakdown_.device_samples_compute += w.count(Counter::GpuDeviceSamplesCompute);
     for (size_t i = 0; i < kWaitRegMemDirectCounterCount; ++i)
         wait_regmem_direct_totals_[i] += w.count(kWaitRegMemDirectCounters[i]);
     for (size_t i = 0; i < kTextureDirectValidationCounterCount; ++i)
@@ -473,6 +484,68 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
     return fired;
 }
 
+std::string format_frame_breakdown(const FrameBreakdownTotals& t) {
+    // Per-flip means over zero flips are undefined, not zero: print nothing rather than a table of 0s.
+    if (t.flips == 0 || !(t.seconds > 0)) return {};
+    const double flips = static_cast<double>(t.flips);
+    const double interval_ms = t.seconds * 1000.0 / flips;
+    const double budget_ms = t.target_hz ? 1000.0 / t.target_hz : 1000.0 / 60.0;
+    char head[256];
+    std::snprintf(head, sizeof head,
+                  "[perf-alarm] summary observer=frame-breakdown flips=%llu span=%.1fs "
+                  "interval=%.2fms (%.1f fps) budget=%.2fms; per flip, summed THREAD time, NOT a "
+                  "partition of the frame (stages overlap across threads): ",
+                  static_cast<unsigned long long>(t.flips), t.seconds, interval_ms,
+                  flips / t.seconds, budget_ms);
+    std::string out = head;
+
+    // texture-ref-sample records 1 reference in kTextureRefSamplePeriod, so a per-flip mean of it would
+    // understate the real cost by that factor; it belongs to its own rule, not to this table.
+    constexpr size_t kSampled = static_cast<size_t>(Cost::TextureRefSample);
+    struct Row { size_t cost; double ms_per_flip; double events_per_flip; };
+    std::vector<Row> rows;
+    std::string idle;
+    for (size_t i = 0; i < kCostCount; ++i) {
+        if (i == kSampled) continue;
+        if (t.cost_events[i] == 0) {
+            if (!idle.empty()) idle += ",";
+            idle += kCostNames[i];
+            continue;
+        }
+        rows.push_back({i, static_cast<double>(t.cost_ns[i]) / 1e6 / flips,
+                        static_cast<double>(t.cost_events[i]) / flips});
+    }
+    std::stable_sort(rows.begin(), rows.end(),
+                     [](const Row& a, const Row& b) { return a.ms_per_flip > b.ms_per_flip; });
+    char item[128];
+    bool first = true;
+    for (const Row& r : rows) {
+        std::snprintf(item, sizeof item, "%s%s %.2fms (%.2f events)", first ? "" : ", ",
+                      kCostNames[r.cost], r.ms_per_flip, r.events_per_flip);
+        out += item;
+        first = false;
+    }
+    if (rows.empty()) out += "no cost recorded any event";
+    // GPU device time (a timestamp pair inside the wait) is reported against how many waits carried
+    // one: a wait without a readable pair counts in the wait cost only, so a low coverage understates it.
+    auto device = [&](const char* name, uint64_t ns, uint64_t samples, Cost wait) {
+        if (samples == 0) return;
+        std::snprintf(item, sizeof item, "; %s %.2fms (timestamp pair on %llu of %llu waits)", name,
+                      static_cast<double>(ns) / 1e6 / flips,
+                      static_cast<unsigned long long>(samples),
+                      static_cast<unsigned long long>(t.cost_events[static_cast<size_t>(wait)]));
+        out += item;
+    };
+    device("gpu-device-graphics", t.device_ns_graphics, t.device_samples_graphics, Cost::GpuWaitGraphics);
+    device("gpu-device-compute", t.device_ns_compute, t.device_samples_compute, Cost::GpuWaitCompute);
+    if (!idle.empty()) out += "; no events: " + idle;
+    std::snprintf(item, sizeof item,
+                  "; texture-ref-sample is sampled 1-in-%llu and is reported by its own rule",
+                  static_cast<unsigned long long>(kTextureRefSamplePeriod));
+    out += item;
+    return out;
+}
+
 bool AlarmEngine::write_summary(FILE* out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!windows_ || !out) return false;
@@ -504,6 +577,11 @@ bool AlarmEngine::write_summary(FILE* out) const {
         std::fprintf(out, "[perf-alarm] summary: no rule fired in %llu windows of %.1fs "
                           "(%zu of %zu rules had data)\n",
                      (unsigned long long)windows_, config_.window_ns / 1e9, with_data, rules_.size());
+    // Not a rule: where the frame budget goes over the whole run, printed whether or not anything fired.
+    {
+        const std::string breakdown = format_frame_breakdown(frame_breakdown_);
+        if (!breakdown.empty()) std::fprintf(out, "%s\n", breakdown.c_str());
+    }
     // Observation, not an alarm. This narrow scope neither detects hardware timeouts nor proves
     // completion order; independent relaxed inputs do not certify counter balance/quiescence.
     std::fprintf(out, "[perf-alarm] summary observer=wait-regmem-direct-fold "

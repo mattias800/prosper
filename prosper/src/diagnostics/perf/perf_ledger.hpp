@@ -378,6 +378,12 @@ constexpr const char* kExactResultDeclineNames[kExactResultDeclineCount] = {
 };
 
 constexpr size_t kCostCount = static_cast<size_t>(Cost::Count);
+// Stable, grepped names for the time costs, in Cost order. The frame-breakdown summary prints them;
+// never reword casually.
+constexpr const char* kCostNames[kCostCount] = {
+    "surface-readback", "hle-blocking-wait", "present-cpu", "frontend-build", "texture-ref-sample",
+    "shader-compile", "pipeline-create", "gpu-wait-compute", "gpu-wait-graphics",
+};
 constexpr size_t kCounterCount = static_cast<size_t>(Counter::Count);
 constexpr size_t kGaugeCount = static_cast<size_t>(Gauge::Count);
 constexpr size_t kPeakCount = static_cast<size_t>(Peak::Count);

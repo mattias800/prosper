@@ -56,7 +56,7 @@ These are the contract. An item that cannot meet them is redesigned, not waived.
 | Frame grab + offline replay | F9 `.prgbundle`, `tools/gpu_replay` (schedulable headless via `PROSPER_GRAB_BUNDLE_*`) | Captures rendered-frame bugs only; not CPU, logic or audio. |
 | RenderDoc in-app capture | `frontends/shared/diagnostics/renderdoc_capture.hpp`, `PROSPER_RENDERDOC_AFTER_MS` / `_AT_FRAME` / `_AT_PAD_FLIP` (#3321) | Needs RenderDoc already injected; nothing bundled. |
 | Bounded perf capture | F8 `.prperf`, `tools/perf/performance_capture_report.py` | Reports by time; six timestamp brackets per **compute** dispatch. |
-| Always-on alarms | `[perf-alarm]`, `src/diagnostics/perf/` | Names a cost per window; no per-frame cause code. |
+| Always-on alarms | `[perf-alarm]`, `src/diagnostics/perf/` | Names a cost per window; no per-frame cause code. Its exit summary also prints a run-level `observer=frame-breakdown` line (per-flip summed thread time by stage; not a partition). |
 | Stage buckets | `PROSPER_RENDER_TIMING` | Setup/resource breakdown; not a per-frame guest/driver/GPU/wait/present split. |
 | GPU submit index | `PROSPER_GPU_TIMELINE`, `tools/gpu_timeline` | Guest-submit index, **not** GPU pass timing. |
 | Guest frame pacing | `tools/perf/flip_pacing_report.py` | Interval distribution of guest flips from `PROSPER_EVLOG`; names the limiter class. |
@@ -196,7 +196,12 @@ charter: addresses and operation ordinals are run-local).
 
 ### M2. Per-frame breakdown: guest CPU, driver, GPU, wait, present
 
-- **Evidence:** `PROSPER_RENDER_TIMING` and the F8 buckets give stage costs, not a per-frame series.
+- **Evidence (corrected 2026-10-02):** the always-on `[perf-alarm]` ledger already measures most of
+  these stages as per-window totals (`GpuWaitGraphics`/`GpuWaitCompute` fence waits, GPU device time
+  from a timestamp pair inside them, `PresentCpu`, `FrontendBuild`, `ShaderCompile`, `PipelineCreate`,
+  `SurfaceReadback`, `HleBlockingWait`), and `PROSPER_PERF_ALARM_LOG` writes them per window. What was
+  missing was one run-level answer to "where does the frame budget go". An earlier version of this
+  item said the stages were not measured; that was wrong.
 - **Design:** per frame, numeric `cpu_ms` (guest until submit), `rec_ms` (driver record/submit),
   `gpu_ms` (timestamp queries around the frame's submits, converted with `timestampPeriod`; omitted when
   the queue lacks timestamp support), `wait_ms` (blocked on a fence), `present_ms`; plus per-frame
@@ -205,6 +210,15 @@ charter: addresses and operation ordinals are run-local).
 - **Acceptance:** conversion and schema unit-tested with a synthetic clock; a software-device test that
   a submit yields a `gpu_ms`; harness-forced readback is flagged in the record (rule 7).
 - **Out of scope here:** per-pass timelines (M4).
+- **Status (run-level slice landed):** the exit summary now prints an `observer=frame-breakdown` line:
+  achieved flip interval against the budget, then per flip the summed thread time of each cost with
+  events, largest first, GPU device time against how many waits carried a timestamp pair, and the costs
+  that recorded nothing. **It is not the per-frame partition the design above asks for, and cannot be
+  built from the ledger:** the render, executor and present threads run concurrently and each cost is
+  summed thread time, so the figures can exceed the frame together. A true per-frame record
+  (`cpu_ms`/`rec_ms`/`gpu_ms`/`wait_ms`/`present_ms` that add up) needs per-frame timestamps taken on
+  one timeline, which does not exist yet. `VK_EXT_calibrated_timestamps` correlation and the per-frame
+  series are **not done**.
 
 ### M3. Run metadata and baseline compare with refusal
 
@@ -321,5 +335,9 @@ hypothesis the work falsified is recorded under `## Ruled out` below.
   reference `VK_AMD_buffer_marker` or `vkCmdWriteBufferMarkerAMD`.
 - **"There are no GPU timestamp queries."** Falsified 2026-10-02: `live_compute.cpp` writes timestamps
   around compute dispatches. The gap is graphics passes, not timestamps in general.
+- **"The ledger's stage costs can be added up into a per-frame partition of the frame budget."**
+  Falsified 2026-10-02 (M2): they are summed THREAD time across concurrent render, executor and present
+  threads, so the per-flip figures overlap and may exceed the frame together. The run-level
+  `frame-breakdown` line says so in its own text; a partition needs one timeline per frame.
 - **"A third-party logging library is the fix for diagnosability."** Not adopted: the cost is the
   output contract (grepped `[tag]` lines) and async-signal-safety, not the formatting API (see M8).
