@@ -470,14 +470,15 @@ int main(int argc, char** argv) {
                                      fragment_fixture, error),
               "CLI fixture writes the exact captured failed-fragment ABI");
         std::vector<uint8_t> legacy_fragment_bytes;
-        constexpr size_t legacy_fragment_tail_bytes = 18u + 10u + 4u + 4u + 10u;
+        constexpr size_t legacy_fragment_tail_bytes = 11u + 18u + 10u + 4u + 4u + 10u;
         CHECK(gpu::serialize_gpu_capture(fragment_fixture, legacy_fragment_bytes, error) &&
               legacy_fragment_bytes.size() > 12u + legacy_fragment_tail_bytes &&
-              legacy_fragment_bytes[8] == 65u,
+              legacy_fragment_bytes[8] == 66u,
               "CLI fixture serializes a current fragment retry for a legacy downgrade");
         if (legacy_fragment_bytes.size() > 12u + legacy_fragment_tail_bytes &&
-            legacy_fragment_bytes[8] == 65u) {
-            // No realized draws/resources and one failure/stage: remove the v65 transport tail,
+            legacy_fragment_bytes[8] == 66u) {
+            // No realized draws/resources and one failure/stage: remove v66 flag counts/state,
+            // then the v65 transport tail,
             // then the v64 mode counts/unknown
             // pair, v63/v62 zero counts, and v61 retry-config tail to recover an exact v60 prefix.
             legacy_fragment_bytes.resize(legacy_fragment_bytes.size() - legacy_fragment_tail_bytes);
