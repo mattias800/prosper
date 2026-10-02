@@ -1790,8 +1790,9 @@ bool emit_cfg_state_machine(
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
     bool allow_exec_update, bool allow_smem,
     const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
-    const uint32_t* code, size_t dwords, uint32_t initial_active = 0,
-    bool synchronize_lds_fminmax = false) {
+    const uint32_t* code, size_t dwords, uint32_t initial_active,
+    bool synchronize_lds_fminmax,
+    const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction) {
     const bool graphics = !b.has_workgroup_execution() && (b.is_fragment || b.is_vertex);
     auto reject_cfg = [&](uint32_t pc, const char* reason) {
         log_recompile_diagnostic(b.diagnostic,
@@ -5159,8 +5160,14 @@ bool emit_cfg_state_machine(
                 // records the post-instruction VGPR under the entry EXEC, not the new mask.
                 const uint32_t trace_entry_exec = state.exec_narrowed ? state.exec : 0;
                 const SavedB64MaskSnapshot saved_masks = snapshot_saved_b64_masks(state, in);
-                const bool handled = emit_alu(b, state, in, ok, allow_exec_update, &safe,
-                                              allow_smem, rt, /*allow_wave*/false);
+                // Owned packet services handle original guest resource/numeric instructions at
+                // this exact dispatcher boundary. Native paths have no callback and keep their
+                // old lowering. Services do not bypass scalar lifetime invalidation below.
+                const int packet_handled = packet_instruction ? packet_instruction(state, in) : 0;
+                if (packet_handled < 0) return reject_cfg(in.pc, "packet-owned-service-emission");
+                const bool handled = packet_handled > 0 ||
+                    emit_alu(b, state, in, ok, allow_exec_update, &safe,
+                             allow_smem, rt, /*allow_wave*/false);
                 if (handled && ok)
                     record_scalar_write(
                         state, in,

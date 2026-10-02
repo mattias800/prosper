@@ -31,6 +31,12 @@
 //   * at exit, also one census line (not a rule): the first failing field of the exact
 //     full-overwrite shape test over every tested compute result, and the destination refusals of
 //     the results that passed it -- printed only when a compute result was ever tested.
+//   * at exit, one `observer=frame-breakdown` line (not a rule), printed whether or not anything fired:
+//     the achieved flip interval against the budget, and per flip the SUMMED THREAD time of each cost
+//     with events, largest first. The threads overlap, so it is NOT a partition of the frame: it says
+//     which stage is big, never how 16.7 ms adds up. The sampled texture-ref cost is excluded (it is
+//     timed 1 in kTextureRefSamplePeriod), and costs that never recorded an event are listed as such
+//     rather than as zeros.
 //   * at exit (register_exit_report): one summary line per rule that fired (windows fired, worst
 //     value, when), or a line saying no rule fired in N evaluated windows. The second form exists so
 //     "nothing fired" cannot be confused with "the engine never ran": the latter prints nothing.
@@ -51,6 +57,24 @@
 #include <vector>
 
 namespace prosper::diagnostics::perf {
+
+// Run totals of the window deltas, from which the exit summary prints WHERE THE FRAME BUDGET GOES.
+// Every cost here is summed THREAD time: the render, executor and present threads run concurrently,
+// so the per-flip figures are NOT a partition of the frame and may exceed the budget together. They
+// say which stage is big, never how the 16.7 ms adds up.
+struct FrameBreakdownTotals {
+    double seconds = 0;
+    uint64_t flips = 0;
+    uint32_t target_hz = 60;   // the guest's last SetFlipRate
+    uint64_t cost_ns[kCostCount] = {};
+    uint64_t cost_events[kCostCount] = {};
+    uint64_t device_ns_graphics = 0, device_samples_graphics = 0;
+    uint64_t device_ns_compute = 0, device_samples_compute = 0;
+};
+
+// The `[perf-alarm] summary observer=frame-breakdown ...` line. Empty when no flip was ever counted:
+// per-flip means over zero flips are not zero, they are undefined. Pure, so it is unit-tested.
+std::string format_frame_breakdown(const FrameBreakdownTotals& totals);
 
 struct EngineConfig {
     uint64_t window_ns = 5'000'000'000ull;
@@ -118,6 +142,7 @@ private:
     uint64_t window_start_ns_ = 0;
     uint64_t flips_in_window_ = 0;
     uint64_t windows_ = 0;
+    FrameBreakdownTotals frame_breakdown_;   // summed closed-window deltas, like the totals below
     // Sum of closed-window deltas, excluding the boot baseline and trailing partial window.
     // Each input is an independent relaxed snapshot; these are not a coherent partition.
     uint64_t wait_regmem_direct_totals_[kWaitRegMemDirectCounterCount] = {};

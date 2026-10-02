@@ -106,6 +106,18 @@ the arena never enters submission cleanup callbacks. `PROSPER_NO_BUFFER_LOOKUP_A
 direct PMR heap allocation; unsupported PMR deployment targets retain ordinary standard maps.
 Allocation observations count upstream heap requests/bytes, not nodes or GPU buffer traffic.
 
+## Steady-state performance rules here
+
+Both backends run once per guest submit, so the invariants in `CLAUDE.md` § *Architecture and
+performance ratchets* bind here more than anywhere. The compute half already waits on
+`dispatch_fence` for every dispatch before writing back into guest memory
+(`live_compute.cpp`, the `vkWaitForFences` after `queue-submit`); P1 allows a wait only where the
+guest reads the result, so do not add another, and name the guest reader if you keep one. Create
+Vulkan objects at setup or behind a cache, never per dispatch or draw (P2), and do not take a
+process-global lock in the submit path (P4). `live_compute.cpp` is past the ratchet's 5,000-line
+cap: put new code in a new file beside it (`submit_renderer/` shows the pattern for the renderer)
+rather than growing it.
+
 ## Device-resolved indirect dispatch (#3656)
 
 `indirect_dispatch.hpp` is the backend half of `ComputeItem::indirect_args_addr` (the executor half is

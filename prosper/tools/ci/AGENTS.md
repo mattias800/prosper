@@ -16,6 +16,25 @@ usage, whether a PR is safe to merge.
   *changes*. Added files must be ruff-clean, ruff-format-clean and carry a module docstring; modified
   files may not gain ruff findings; an added tool under `prosper/tools/` needs a test in the same PR.
   Config lives in the root `pyproject.toml` (uv, `uv.lock`); see the Python rule below.
+- **`check_arch_ratchet.py`** + `arch_ratchet_baseline.txt` — a ratchet over costs every title
+  pays: title ids and title-named directories in shared code, raw `getenv` reads, blocking GPU syncs
+  (`vkWaitForFences`, `*WaitIdle`, `ALL_COMMANDS` barriers), files over 5,000 lines, and
+  `prosper::test::` in the shipping frontend; and four structural ones: host-platform `#if`s
+  outside `src/host` (`platform-ifdef`, seam: `docs/HOST_PLATFORM_SEAM.md`), includes against the
+  layer order (`layer-include`, `LAYER_ORDER` in the checker; `docs/ARCHITECTURE_TARGET_TREE.md`),
+  frontends including `tests/fixtures/` (`fixture-include`), and Vulkan object-creation call sites
+  (`vk-object`). The practice -> rule table, including what is not mechanically checkable yet
+  (giant functions: owned by the clang-tidy PR's `readability-function-size`), is in
+  `docs/ARCHITECTURE_TARGET_TREE.md` § Bad practices. Path arguments are resolved and must stay
+  inside `--root`, and `--update` writes only `prosper/tools/ci/arch_ratchet_baseline.txt`. Per-file counts may go down, never up; a count that
+  fell must have its row lowered (`--update` lowers and deletes, never raises). Raising a row is a
+  reviewed baseline edit with a `# note` — for a new sync, naming the guest-visible result it
+  delivers. **Two modes:** `--base REF` (delta — what CI gates on) looks only at files changed
+  since the merge base of HEAD and REF, working tree included, and fails only when *this* change
+  raised a count past its row; the plain full-tree run is the baseline-maintenance report and is
+  informational in CI, because main's baseline goes stale whenever a PR grows a capped file and
+  that must not redden every unrelated PR. It is not a refactoring plan; it only stops the numbers
+  getting worse while one happens.
 - **`check_ctest_gate.py`** — finds callers that run `ctest` without `--no-tests=error`. Plain
   `ctest` exits 0 when it finds no tests, so "nothing ran" and "everything passed" share a status.
 - **`check_usage_text.py`** — finds tools whose usage block stopped being a docstring, so
@@ -26,6 +45,13 @@ usage, whether a PR is safe to merge.
   `gh pr edit --body-file` has been seen returning rc=1 on a GraphQL projects-deprecation error
   *without applying the edit* (#2918), so `set` writes over REST and then re-reads the live body;
   the verdict is always the read-back, never the write's exit code.
+- **`ratchet_hook.py`** — the Claude Code PreToolUse hook (`.claude/settings.json`, Bash and
+  PowerShell) that runs `check_arch_ratchet.py --base origin/main` (delta mode: only what this
+  checkout changed since its merge base) before `git commit` / `git push`. The rollout is
+  **warn-only**: a violation is shown as a `systemMessage` and the command proceeds;
+  `BLOCK_ON_VIOLATION` is the single switch that makes it block. A missing checker, a missing
+  `origin/main`, an exit 2 or a missing interpreter fails open with a visible `ratchet UNVERIFIED`
+  message. CI remains the gate.
 
 ## Secret scan (`.github/workflows/gitleaks.yml`, `.github/gitleaks.toml`)
 
