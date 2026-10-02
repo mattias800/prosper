@@ -799,9 +799,12 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     happened to contain no image. Keep those short, and skip them when there is genuinely nothing a
     reader would enjoy; a blog nobody wants to read is worse than a thin one.
   - **Batch related work into one PR. A PR per commit is a real, measured cost to everyone.**
-    Every PR runs the **entire** CI matrix — `.github/workflows/ci.yml` carries **no `paths` or
-    `paths-ignore` filter**, so a one-line documentation change costs the same runner time as a
-    recompiler change, and the queue it sits in is shared with every other lane. Measured over the
+    Every PR that touches anything besides `*.md` or `assets/` runs the **entire** CI matrix —
+    `.github/workflows/ci.yml` carries **no `paths` or `paths-ignore` filter**, so a one-line code
+    or script change costs the same runner time as a recompiler change, and the queue it sits in is
+    shared with every other lane. Since #4116 its `changes` job skips only the four Windows/macOS
+    jobs on a PR whose diff is *purely* `*.md`/`assets/` — the Linux, sanitizer and Docs jobs
+    still run, and so does everything on `main` pushes and tags. Measured over the
     30 most recently merged PRs (2026-09-15): median **5** files, but **17% touched exactly one
     file** and **33% touched two or fewer**. Four of those five single-file PRs came from one
     session, and **three of them edited the same file within about an hour** — three full matrix

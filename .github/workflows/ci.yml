@@ -9,10 +9,60 @@ on:
     tags: ['v*']
   pull_request:
 
+# A new push to a PR supersedes its in-flight run. main pushes and v* tags are never cancelled:
+# every main commit keeps its own result and the release job must not be interrupted. Non-PR runs
+# therefore get a group of their own (the run id). `cancel-in-progress: false` alone is NOT enough
+# for that: it protects only the RUNNING member of a group, and GitHub keeps at most one PENDING
+# member, so on a shared `refs/heads/main` group a third push silently cancels the second while
+# the first is still running -- and that commit never gets a result at all.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # Cheap gate: a PR whose diff is only markdown / committed screenshots cannot change any build or
+  # test result, so the four native build+test jobs below skip. Skipped jobs report as passing to
+  # branch protection. pushes and tags always run everything (code_changed=true), so main and
+  # releases are never gated. Docs, contribution-shape, sanitizers and the Linux jobs still run.
+  #
+  # FAIL-CLOSED: the gated jobs test `code_changed != 'false'` under `!cancelled()`, so if this job
+  # errors (empty output) they RUN. Testing `== 'true'` would skip them on an error, and a skipped
+  # job reads as a pass -- a broken gate would then look exactly like a docs-only PR.
+  changes:
+    name: Detect code changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      code_changed: ${{ steps.filter.outputs.code_changed }}
+    steps:
+      # fetch-depth: 2 for the same reason as the Docs job: on a `pull_request` merge ref HEAD^1 is
+      # the base commit, so `HEAD^1 HEAD` is exactly the PR's change against its base without
+      # cloning the whole history.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          CHANGED=$(git diff --name-only HEAD^1 HEAD)
+          echo "$CHANGED"
+          if [ -z "$CHANGED" ] || echo "$CHANGED" | grep -qvE '\.md$|^assets/'; then
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code_changed=false" >> "$GITHUB_OUTPUT"
+            echo "Docs/assets-only change: native build jobs skipped."
+          fi
+
   host-sanitizers:
     name: Host ASan + UBSan
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,6 +86,7 @@ jobs:
     # optimization once -- so the claim is pinned here rather than left to local runs.
     name: Host TSan
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,6 +107,7 @@ jobs:
   linux:
     name: Linux
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -98,7 +150,7 @@ jobs:
         uses: ./.github/actions/setup-vulkan
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-linux-${{ runner.os }}-${{ github.sha }}
@@ -154,6 +206,7 @@ jobs:
           fi
 
       - name: Build
+        id: build
         run: cmake --build prosper/build-ci
 
       # The runner has no GPU, so this is Mesa's lavapipe software rasteriser. Four tests were once
@@ -200,7 +253,7 @@ jobs:
           # gating on it reports a confident green having verified nothing (#2187). This job also
           # has the by-name registration guard above, which is the stronger check; the flag is
           # here so the protection does not depend on remembering which job carries which guard.
-          ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 --no-tests=error
+          ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 --no-tests=error -LE timing-margin -j4
 
       # A green run has to carry the NUMBERS, not just the verdict (#3067). The `timing-margin`
       # ctest label marks the tests whose pass rests on a MEASURED wall-clock margin and which print
@@ -212,14 +265,18 @@ jobs:
       # (`(timeout took 13.58 ms via none)` against a 12 ms ceiling) was filed as "unresolved, two
       # candidates" and stayed open for six days.
       #
-      # Re-running the label is a few seconds -- the labelled tests are ~1.5 s each even under
-      # Rosetta 2. It is a SECOND sample of an assertion the step above already gated on, so it is
-      # left blocking on purpose: if a timing arm fails only on the re-run, that is a real second
-      # observation and worth a red job, and `-V` says which arm and at what measured value.
+      # Running the label is a few seconds -- the labelled tests are ~1.5 s each even under
+      # Rosetta 2. The step above runs the rest of the suite in parallel (`-j4`) and EXCLUDES this
+      # label (`-LE timing-margin`), because a wall-clock margin measured beside three other tests
+      # measures the neighbours. So this serial step is now the ONLY gate on these assertions, and
+      # it is blocking on purpose: `-V` says which arm failed and at what measured value.
       #
       # `-L` together with `--no-tests=error` is the self-checking half: if the label is renamed or
       # dropped, this step fails loudly instead of silently reporting nothing for ever after.
       - name: Report the measured wait margins
+        # Runs even when the parallel suite failed, so a timing regression is not hidden behind
+        # an unrelated red test -- but only on a binary that actually built.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: ctest --test-dir prosper/build-ci -L timing-margin -V --no-tests=error
 
       # #1704: until this step existed, no Vulkan validation layer ran anywhere in the project.
@@ -250,9 +307,19 @@ jobs:
         if: always()
         run: ccache -s
 
+      # Written only from main: per-PR writes evicted the shared 10 GB repository cache and
+      # PRs restore main's warm objects through restore-keys anyway.
+      - name: Save ccache
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-linux-${{ runner.os }}-${{ github.sha }}
+
   contribution-shape:
     name: Contribution shape
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       # Its own job, like Docs and for the same reason: it needs nothing built, finishes in seconds,
       # and a false positive here must not cost the build-and-test signal from an unrelated job.
@@ -298,6 +365,7 @@ jobs:
   docs:
     name: Docs
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # No `issues: read` here any more, and that is deliberate rather than an oversight: it existed
     # solely for the PROGRESS_TRACKER.md staleness check, which now lives in `progress-tracker`.
     # Every remaining step in this job is local and offline, so the grant would be dead -- and a
@@ -503,6 +571,7 @@ jobs:
   progress-tracker:
     name: Progress tracker
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Master only. PROGRESS_TRACKER.md is generated from the tracker ISSUES, which live outside this
     # repository, so it can go stale with no commit at all -- and a merge that closes a cited issue
     # makes it stale at the moment of merging, which no pre-merge check can repair. Master therefore
@@ -586,6 +655,7 @@ jobs:
   linux-app:
     name: Linux App
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -618,7 +688,7 @@ jobs:
         uses: ./.github/actions/setup-vulkan
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-linux-app-${{ runner.os }}-${{ github.sha }}
@@ -636,6 +706,15 @@ jobs:
         if: always()
         run: ccache -s
 
+      # Written only from main: per-PR writes evicted the shared 10 GB repository cache and
+      # PRs restore main's warm objects through restore-keys anyway.
+      - name: Save ccache
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-linux-app-${{ runner.os }}-${{ github.sha }}
+
   linux-app-package:
     name: Linux App Package
     # PINNED, deliberately not ubuntu-latest. No AppImage bundles libc, so this runner's glibc is
@@ -646,6 +725,7 @@ jobs:
     # buys six weeks and then starts failing builds. 24.04 is the oldest runner that is not about to
     # break; verify-linux-app.sh asserts the resulting floor (2.39) so it cannot drift silently.
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
 
     # Separate from `Linux App` on purpose. That job stays Debug and build-only, which is the cheap
     # compile signal for the frontends; this one is the release path -- Release build, real
@@ -724,7 +804,10 @@ jobs:
 
   windows-mingw:
     name: Windows MinGW
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code_changed != 'false' }}
     runs-on: windows-latest
+    timeout-minutes: 90
     env:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -751,7 +834,7 @@ jobs:
             mingw-w64-ucrt-x86_64-spirv-tools
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-windows-mingw-${{ runner.os }}-${{ github.sha }}
@@ -762,16 +845,20 @@ jobs:
         run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON
 
       - name: Build
+        id: build
         shell: msys2 {0}
         run: cmake --build prosper/build-ci
 
       - name: Test
         shell: msys2 {0}
         # See the linux job: plain ctest exits 0 on an empty suite (#2187).
-        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 --no-tests=error
+        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 --no-tests=error -LE timing-margin -j4
 
       # Same measured-margin report as the Linux job -- see the long note there (#3067/#3208).
       - name: Report the measured wait margins
+        # Runs even when the parallel suite failed, so a timing regression is not hidden behind
+        # an unrelated red test -- but only on a binary that actually built.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: msys2 {0}
         run: ctest --test-dir prosper/build-ci -L timing-margin -V --no-tests=error
 
@@ -780,9 +867,21 @@ jobs:
         shell: msys2 {0}
         run: ccache -s
 
+      # Written only from main: per-PR writes evicted the shared 10 GB repository cache and
+      # PRs restore main's warm objects through restore-keys anyway.
+      - name: Save ccache
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-windows-mingw-${{ runner.os }}-${{ github.sha }}
+
   windows-app:
     name: Windows App
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code_changed != 'false' }}
     runs-on: windows-latest
+    timeout-minutes: 90
     env:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -811,7 +910,7 @@ jobs:
             mingw-w64-ucrt-x86_64-vulkan-loader
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-windows-app-${{ runner.os }}-${{ github.sha }}
@@ -917,9 +1016,21 @@ jobs:
         shell: msys2 {0}
         run: ccache -s
 
+      # Written only from main: per-PR writes evicted the shared 10 GB repository cache and
+      # PRs restore main's warm objects through restore-keys anyway.
+      - name: Save ccache
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-windows-app-${{ runner.os }}-${{ github.sha }}
+
   macos:
     name: macOS (x86_64 / Rosetta 2)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code_changed != 'false' }}
     runs-on: macos-latest
+    timeout-minutes: 90
     env:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -945,7 +1056,7 @@ jobs:
           softwareupdate --install-rosetta --agree-to-license
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-macos-${{ runner.os }}-${{ github.sha }}
@@ -957,6 +1068,7 @@ jobs:
         run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON
 
       - name: Build
+        id: build
         run: cmake --build prosper/build-ci
 
       - name: Test
@@ -964,19 +1076,34 @@ jobs:
         # with -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE, so its suite is DELIBERATELY the smaller
         # non-GPU one -- which is exactly why a by-name Vulkan guard cannot be copied here and
         # why the empty case has to be caught by the flag instead.
-        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 --no-tests=error
+        run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 --no-tests=error -LE timing-margin -j4
 
       # Same measured-margin report as the Linux job -- see the long note there (#3067/#3208).
       - name: Report the measured wait margins
+        # Runs even when the parallel suite failed, so a timing regression is not hidden behind
+        # an unrelated red test -- but only on a binary that actually built.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: ctest --test-dir prosper/build-ci -L timing-margin -V --no-tests=error
 
       - name: ccache statistics
         if: always()
         run: ccache -s
 
+      # Written only from main: per-PR writes evicted the shared 10 GB repository cache and
+      # PRs restore main's warm objects through restore-keys anyway.
+      - name: Save ccache
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-macos-${{ runner.os }}-${{ github.sha }}
+
   macos-app:
     name: macOS App (SDL3 + MoltenVK)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code_changed != 'false' }}
     runs-on: macos-latest
+    timeout-minutes: 90
     env:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -1003,7 +1130,7 @@ jobs:
         run: bash prosper/scripts/fetch-macos-vulkan.sh
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-macos-app-${{ runner.os }}-${{ github.sha }}
@@ -1019,11 +1146,21 @@ jobs:
         if: always()
         run: ccache -s
 
+      # Written only from main: per-PR writes evicted the shared 10 GB repository cache and
+      # PRs restore main's warm objects through restore-keys anyway.
+      - name: Save ccache
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-macos-app-${{ runner.os }}-${{ github.sha }}
+
   release:
     name: Publish Release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [linux, linux-app, linux-app-package, windows-mingw, windows-app, macos, macos-app]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
 
