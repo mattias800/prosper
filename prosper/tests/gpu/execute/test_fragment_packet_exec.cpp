@@ -1,5 +1,6 @@
 #include "fixtures/compute_runner.h"
 #include "fixtures/fragment_packet_fixture.hpp"
+#include "fixtures/fragment_packet_wqm_fixture.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -89,7 +90,46 @@ int main() {
             compare(actual, lane8, "actual READLANE8 control");
         }
     }
-    check(dispatches == 25, "all24 good packets and live mutation actually dispatched");
+    // These are supplied logical quads, not inferred raster ownership. Execute the actual WQM
+    // lowering on hardware as well as in the CPU SOURCE interpreter. Every source bit must widen
+    // its three initially EXEC-off neighbors, including quads crossing the native wave32 halves.
+    namespace w = prosper::test::fragment_packet::wqm;
+    uint32_t wqm_ordinal = 0;
+    const auto run_wqm = [&](const w::Case& c, const std::string& name) {
+        const auto program = prosper::gpu::recompile_fragment_packet(w::packet(c),
+            {prosper::gpu::RecompileDiagnosticStage::Fragment, 0x40990000u + wqm_ordinal++});
+        check(!program.spirv.empty() && program.rejection.empty(), name + " actual WQM guest emits");
+        if (!program.spirv.empty()) compare(execute(program), w::expected(c), name);
+    };
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        w::Case c; c.exec = uint64_t(1) << lane; c.initial_scc = lane & 1u;
+        run_wqm(c, "wqm_exec_bit_" + std::to_string(lane));
+    }
+    for (const auto source : {w::Source::Exec, w::Source::Vcc, w::Source::SavedVcc,
+                              w::Source::ScalarPair, w::Source::Empty, w::Source::Full})
+        for (uint32_t destination : {126u, 106u, 16u, 30u}) {
+            w::Case c; c.source = source; c.destination = destination;
+            c.scalar = (uint64_t(1) << 63) | (uint64_t(1) << 35) | 2;
+            c.vcc = (uint64_t(1) << 40) | 8;
+            c.initial_scc = source == w::Source::Empty;
+            run_wqm(c, "wqm_source_destination_" + std::to_string(wqm_ordinal));
+        }
+    for (uint64_t mask : {uint64_t(0), UINT64_MAX, uint64_t(0x8000000100000001ull),
+                          uint64_t(0xaaaaaaaa55555555ull)}) {
+        w::Case c; c.exec = mask; c.source = w::Source::Vcc;
+        c.vcc = ~mask; c.second = mask; c.initial_scc = true;
+        run_wqm(c, "wqm_independent_masks_" + std::to_string(wqm_ordinal));
+    }
+    // Restored active pixels in the opposite half consume the scalar SCC: a native32 or per-quad
+    // vote can otherwise appear correct at the widened pixels. Repeated WQM sites also change the
+    // source to lane40, so an old event/result cannot silently satisfy the last EXP record.
+    for (uint32_t source_lane : {0u, 40u, 63u}) {
+        w::Case c; c.source = w::Source::Vcc; c.vcc = uint64_t(1) << source_lane;
+        c.exec = uint64_t(1) << (source_lane < 32 ? 63u : 0u);
+        run_wqm(c, "wqm_opposite_half_scc_" + std::to_string(source_lane));
+    }
+    check(wqm_ordinal == 95, "all64 WQM bits,24 source/destination,4 mask and3 SCC cases compiled");
+    check(dispatches == 120, "all24 good packets, live mutation and95 WQM packets dispatched");
     std::printf("fragment_packet_exec: dispatches=%d checks=%d failures=%d "
                 "(owned packets only; no raster/game claim)\n", dispatches, checks, failures);
     return failures ? 1 : 0;
