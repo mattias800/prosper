@@ -11,6 +11,8 @@ struct FragmentFloatMode {
 
     constexpr bool canonical() const { return available || value == 0; }
     constexpr bool preserves_f32_inputs() const { return (value & 0x10u) != 0; }
+    constexpr bool preserves_f32_outputs() const { return (value & 0x20u) != 0; }
+    constexpr bool preserves_f16_outputs() const { return (value & 0x80u) != 0; }
     bool operator==(const FragmentFloatMode&) const = default;
 };
 

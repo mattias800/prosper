@@ -734,12 +734,18 @@ struct SpirvCompute {
     // (+-0, NaN, denormals) on every driver, unlike OpFNegate which lacks that guarantee without
     // SignedZeroInfNanPreserve. The unpacked-f16 paths run in the f32 domain, so this applies there too.
     uint32_t fneg(uint32_t a) { return ibin(Op_BitwiseXor, a, uconst(0x80000000u)); }
-    // CLAMP-modifier saturate to [0,1] with the hardware's DX10_CLAMP NaN rule: a NaN result clamps
-    // to 0 (graphics shaders run with MODE.DX10_CLAMP set). NMax(NaN, 0) = 0 then NMin(0, 1) = 0
-    // gives that for free; the previous FMin/FMax chain left a NaN result driver-defined.
-    uint32_t clamp01(uint32_t x) {
-        return fext2(Glsl_NMin, fext2(Glsl_NMax, x, bcu(fconstf(0.0f))), bcu(fconstf(1.0f)));
-    }
+    // Fragment launch flags are producing inputs, never inferred from graphics stage or host.
+    // result_width names the guest result, including unpacked F16 represented here as F32.
+    // Unavailable inputs needed by a modifier fail visibly rather than guessing a launch mode.
+    uint32_t float_output_modifiers(uint32_t bits, uint8_t omod, bool clamp,
+                                    unsigned result_width, uint32_t pc, bool& ok);
+    // The documented active-OMOD output flush, after the existing scale operation.
+    // Active arithmetic remains announced as unverified: launch flags do not prove
+    // guest ALU/OMOD rounding, input-flush order, or overflow behavior (#4059).
+    uint32_t flush_omod_f32_output(uint32_t bits);
+    // The scalar-F16 result is rounded by its existing packer before the output-denorm test.
+    // Keep that test in the RESULT domain rather than accidentally testing F32 exponents.
+    uint32_t finish_omod_f16(uint32_t half_word, uint8_t omod);
     uint32_t cvt_u2f(uint32_t u) { uint32_t rf = id(); put(code, Op_ConvertUToF, {t_f32, rf, u}); return bcu(rf); }   // uint -> float bits
     // v_cvt_u32_f32 SATURATES: NaN -> 0, negative -> 0, >= 2^32 -> 0xFFFFFFFF. A bare OpConvertFToU
     // has an undefined result out of range (#135), so clamp first. FMin/FMax are themselves

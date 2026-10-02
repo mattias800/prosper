@@ -51,7 +51,7 @@ void observe_fragment_arithmetic(const FragmentArithmeticObservation& observatio
             state->full_announced = true;
             std::fprintf(stderr, "[fragment-arithmetic-unverified] announcement inventory full "
                 "(1024); further provenance/site lines suppressed; request counters continue; "
-                "see unverified-fragment-f32-arithmetic alarm; inventory=ADD/MUL-only\n");
+                "see unverified-fragment-f32-arithmetic alarm; inventory=F32-ADD/MUL+F32/F16-OMOD\n");
         }
         return;
     }
@@ -61,17 +61,25 @@ void observe_fragment_arithmetic(const FragmentArithmeticObservation& observatio
         std::snprintf(mode, sizeof mode, "0x%02x", observation.float_mode.value);
     for (size_t i = 0; i < observation.site_count; ++i) {
         const auto& site = observation.sites[i];
+        const bool modifier = site.family == FragmentArithmeticFamily::OutputModifierF32 ||
+                              site.family == FragmentArithmeticFamily::OutputModifierF16;
+        const char* family = site.family == FragmentArithmeticFamily::Add ? "F32-ADD" :
+                             site.family == FragmentArithmeticFamily::Mul ? "F32-MUL" :
+                             site.family == FragmentArithmeticFamily::OutputModifierF32
+                                 ? "F32-OMOD" : "F16-OMOD";
         std::fprintf(stderr, "[fragment-arithmetic-unverified] stage=fragment program=0x%llx "
-            "producing-program=0x%llx source-fingerprint=%016llx pc=%u pc-unit=dwords family=F32-%s "
+            "producing-program=0x%llx source-fingerprint=%016llx pc=%u pc-unit=dwords family=%s "
             "FLOAT_MODE=%s module-produced=%s observation=compiler-request "
-            "semantics=host-dependent-unverified(input/output-denorm,rounding) "
-            "inventory=ADD/MUL-only sites-truncated=%s next=retain-guest-mode-and-raw-program; "
+            "semantics=host-dependent-unverified(%s) "
+            "inventory=%s sites-truncated=%s next=retain-guest-mode-and-raw-program; "
             "compare-denorm/rounding-oracle; cf.#4059 (not-a-measured-GPU-failure)\n",
             static_cast<unsigned long long>(lookup_program),
             static_cast<unsigned long long>(observation.producing_program),
             static_cast<unsigned long long>(observation.source_fingerprint), site.pc,
-            site.family == FragmentArithmeticFamily::Add ? "ADD" : "MUL", mode,
-            module_produced ? "yes" : "no", observation.truncated_emissions ? "yes" : "no");
+            family, mode, module_produced ? "yes" : "no",
+            modifier ? "ALU/OMOD-rounding,flush-order,overflow" : "input/output-denorm,rounding",
+            observation.families & 12u ? "F32-ADD/MUL+F32/F16-OMOD" : "ADD/MUL-only",
+            observation.truncated_emissions ? "yes" : "no");
     }
 }
 

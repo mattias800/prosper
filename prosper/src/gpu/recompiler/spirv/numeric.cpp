@@ -5,6 +5,70 @@
 
 namespace prosper::gpu {
 
+uint32_t SpirvCompute::flush_omod_f32_output(uint32_t bits) {
+    // AMD RDNA2 ISA70648 sec6.2.2 specifies output-denorm flushing and -0 -> +0
+    // for active OMOD. This post-result operation does not settle whether an ALU
+    // result was flushed/rounded before OMOD or how a scale overflow is handled.
+    const uint32_t magnitude = ibin(Op_BitwiseAnd, bits, uconst(0x7fffffffu));
+    return sel(ucmp(Op_UGreaterThanEqual, magnitude, uconst(0x00800000u)), bits, uconst(0));
+}
+
+uint32_t SpirvCompute::float_output_modifiers(uint32_t bits, uint8_t omod, bool clamp,
+                                             unsigned result_width, uint32_t pc, bool& ok) {
+    if (!omod && !clamp) return bits;
+    const bool output_preserved = fragment_float_mode.available &&
+        (result_width == 16 ? fragment_float_mode.preserves_f16_outputs()
+                            : fragment_float_mode.preserves_f32_outputs());
+    const bool ieee = fragment_float_flags.available && fragment_float_flags.ieee_mode;
+    if (is_fragment) {
+        // Either observed disabling input proves OMOD is a no-op on its own.
+        // CLAMP still needs its independent DX10 flag even when IEEE disables OMOD.
+        if (!fragment_float_flags.available && (clamp || (omod && !output_preserved))) {
+            log_recompile_diagnostic(diagnostic, "fragment-float-flags-unavailable", "float-modifier",
+                                     "pc=%u result_width=%u OMOD=%u CLAMP=%u requires observed IEEE_MODE/DX10_CLAMP; launch flags unavailable",
+                                     pc, result_width, unsigned(omod), unsigned(clamp));
+            ok = false;
+            return bits;
+        }
+        if (omod && !ieee && !output_preserved && !fragment_float_mode.available) {
+            log_recompile_diagnostic(diagnostic, "fragment-float-output-mode-unavailable", "float-modifier",
+                                     "pc=%u result_width=%u OMOD=%u requires observed output-denorm mode; FLOAT_MODE unavailable",
+                                     pc, result_width, unsigned(omod));
+            ok = false;
+            return bits;
+        }
+    }
+    if (omod && (!is_fragment || (!ieee && !output_preserved))) {
+        // Retain the existing scale operation. Launch flags now select WHETHER
+        // to scale, but cannot prove all guest arithmetic boundaries. Announce
+        // every active modifier, including conversion/min/max and F16 paths
+        // missing from the historical F32 ADD/MUL observation population.
+        observe_fragment_arithmetic_site(pc, result_width == 16
+            ? FragmentArithmeticFamily::OutputModifierF16 : FragmentArithmeticFamily::OutputModifierF32);
+        bits = fbin(Op_FMul, bits, uconst(omod == 1 ? 0x40000000u :
+                                       omod == 2 ? 0x40800000u : 0x3f000000u));
+        if (is_fragment) bits = flush_omod_f32_output(bits);
+    }
+    if (clamp) {
+        const uint32_t original = bits;
+        bits = fext2(Glsl_NMin, fext2(Glsl_NMax, bits, uconst(0)), uconst(0x3f800000u));
+        if (is_fragment && !fragment_float_flags.dx10_clamp) {
+            const uint32_t magnitude = ibin(Op_BitwiseAnd, original, uconst(0x7fffffffu));
+            const uint32_t nan = ucmp(Op_UGreaterThanEqual, magnitude, uconst(0x7f800001u));
+            bits = sel(nan, original, bits);
+        }
+    }
+    return bits;
+}
+
+uint32_t SpirvCompute::finish_omod_f16(uint32_t half_word, uint8_t omod) {
+    if (!is_fragment || !omod || !fragment_float_flags.available ||
+        fragment_float_flags.ieee_mode || !fragment_float_mode.available ||
+        fragment_float_mode.preserves_f16_outputs()) return half_word;
+    const uint32_t magnitude = ibin(Op_BitwiseAnd, half_word, uconst(0x7fffu));
+    return sel(ucmp(Op_UGreaterThanEqual, magnitude, uconst(0x0400u)), half_word, uconst(0));
+}
+
 uint32_t SpirvCompute::f32_nonzero_bits(uint32_t word) {
     if (!is_fragment || !fragment_float_mode.available) return 0;
     const uint32_t magnitude = ibin(Op_BitwiseAnd, word, uconst(0x7fffffffu));

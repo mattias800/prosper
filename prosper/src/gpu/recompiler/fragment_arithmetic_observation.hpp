@@ -1,5 +1,6 @@
 #pragma once
-// Observation of actual guest F32 ADD/MUL lowering, not an instruction inventory or permission.
+// Observation of actual guest F32 ADD/MUL and active F32/F16 OMOD lowering,
+// not an instruction inventory, complete arithmetic census, or permission.
 #include "gpu/recompiler/fragment_float_mode.hpp"
 #include <array>
 #include <cstddef>
@@ -7,7 +8,7 @@
 
 namespace prosper::gpu {
 
-enum class FragmentArithmeticFamily : uint8_t { Add, Mul };
+enum class FragmentArithmeticFamily : uint8_t { Add, Mul, OutputModifierF32, OutputModifierF16 };
 struct FragmentArithmeticSite {
     uint32_t pc = 0;
     FragmentArithmeticFamily family = FragmentArithmeticFamily::Add;

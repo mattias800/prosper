@@ -2525,6 +2525,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_fragment_float_modifiers PRIVATE prosper_core)
   add_test(NAME fragment_float_modifiers COMMAND test_fragment_float_modifiers)
 
+  add_executable(test_fragment_float_modifier_inputs tests/gpu/recompiler/test_fragment_float_modifier_inputs.cpp)
+  target_link_libraries(test_fragment_float_modifier_inputs PRIVATE prosper_core)
+  add_test(NAME fragment_float_modifier_inputs COMMAND test_fragment_float_modifier_inputs)
+
   add_executable(test_fragment_float_transport tests/gpu/recompiler/test_fragment_float_transport.cpp)
   target_link_libraries(test_fragment_float_transport PRIVATE prosper_core)
   add_test(NAME fragment_float_transport COMMAND test_fragment_float_transport)

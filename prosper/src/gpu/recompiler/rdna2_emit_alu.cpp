@@ -2759,7 +2759,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         case 0x11: r = b.fext2(Glsl_NMin, half(0, high), half(1, high)); break;
                         default:   r = b.fext2(Glsl_NMax, half(0, high), half(1, high)); break;
                     }
-                    if (in.clamp) r = b.clamp01(r);
+                    if (in.clamp) r = b.float_output_modifiers(r, 0, true, 16, in.pc, ok);
                     return r;
                 };
                 const uint32_t lo = b.pack_half_lo(operation(false));
@@ -2798,7 +2798,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return v;
             };
             uint32_t r = b.fbin(Op_FAdd, b.fbin(Op_FMul, mixv(0), mixv(1)), mixv(2));
-            if (in.clamp) r = b.clamp01(r);
+            if (in.clamp) r = b.float_output_modifiers(r, 0, true,
+                                                     in.opcode == 0x20 ? 32 : 16, in.pc, ok);
             uint32_t& d = rs.vreg[in.dst.value];
             if (in.opcode == 0x20) d = r;
             else if (in.opcode == 0x21)
@@ -3498,10 +3499,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x05: case 0x06: case 0x0B: case 0x0E: case 0x11: case 0x12: case 0x13: case 0x14:
                 case 0x20: case 0x21: case 0x22: case 0x23: case 0x24:
                 case 0x25: case 0x27: case 0x2A: case 0x2B: case 0x2E: case 0x33: case 0x35: case 0x36:
-                    if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
-                    else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));
-                    else if (in.omod == 3) d = b.fbin(Op_FMul, d, b.uconst(fbits(0.5f)));
-                    if (in.clamp) d = b.clamp01(d);
+                    d = b.float_output_modifiers(d, in.omod, in.clamp, 32, in.pc, ok);
                     break;
                 default: ok = false; break;
             }
@@ -3796,7 +3794,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                : in.opcode == 0x35 ? b.fbin(Op_FMul, x, y)
                                : in.opcode == 0x39 ? b.fext2(Glsl_NMax, x, y)   // NaN -> other operand
                                                    : b.fext2(Glsl_NMin, x, y);
-                    if (in.clamp) p = b.clamp01(p);
+                    if (in.clamp) p = b.float_output_modifiers(p, 0, true, 16, in.pc, ok);
                     uint32_t r16 = b.pack_half_lo(p);
                     // dst_sel==6 covers TWO encodings the decoder now distinguishes: the SDWA
                     // DWORD+UNUSED_PAD form (zero-fill, has_sdwa) and the plain e32 form, whose
@@ -3841,10 +3839,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (ok && (in.omod || in.clamp) && !packed_f16) switch (in.opcode) {
                 case 0x03: case 0x04: case 0x05: case 0x08: case 0x0F: case 0x10:
                 case 0x1F: case 0x2B: case 0x20: case 0x2C: case 0x21: case 0x2D:
-                    if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
-                    else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));
-                    else if (in.omod == 3) d = b.fbin(Op_FMul, d, b.uconst(fbits(0.5f)));
-                    if (in.clamp) d = b.clamp01(d);
+                    d = b.float_output_modifiers(d, in.omod, in.clamp, 32, in.pc, ok);
                     break;
                 // A non-float-result opcode carrying a modifier (e.g. an INTEGER SDWA op with CLAMP =
                 // integer saturation) is not modeled by the float-domain omod/clamp above, so applying
@@ -4586,13 +4581,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // (ISA 6.5) or an unhandled combination — the dispatch tail rejects it fail-visibly
             // instead of silently dropping the saturation.
             bool clamp_routed = false;
-            auto fresult = [&](uint32_t bits) -> uint32_t {
+            auto fresult = [&](uint32_t bits, unsigned result_width = 32) -> uint32_t {
                 clamp_routed = true;
-                if (in.omod == 1)      bits = b.fbin(Op_FMul, bits, b.uconst(fbits(2.0f)));
-                else if (in.omod == 2) bits = b.fbin(Op_FMul, bits, b.uconst(fbits(4.0f)));
-                else if (in.omod == 3) bits = b.fbin(Op_FMul, bits, b.uconst(fbits(0.5f)));
-                if (in.clamp) bits = b.clamp01(bits);
-                return bits;
+                return b.float_output_modifiers(bits, in.omod, in.clamp, result_width, in.pc, ok);
             };
             if (in.opcode == 0x311) {
                 // v_pack_b32_f16: D.u32 = {S1.f16, S0.f16} — S0's selected half becomes bits
@@ -4683,8 +4674,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                                          b.fcmp(Op_FUnordNotEqual, z, z)));
                     result = b.sel(nan_any, min3, med);
                 }
-                result = fresult(result);
-                uint32_t r16 = b.pack_half_lo(result);
+                result = fresult(result, 16);
+                uint32_t r16 = b.finish_omod_f16(b.pack_half_lo(result), in.omod);
                 vreg[in.dst.value] = (in.vop3p_opsel & 8u)
                     ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
                              b.ibin(Op_ShiftLeftLogical, r16, b.uconst(16)))
