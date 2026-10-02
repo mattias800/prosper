@@ -307,14 +307,20 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   says everything, does not need one. If you cannot write a sentence the reader would not have
   guessed, skip it.
 
-- **Architecture and performance ratchets.** `python3 prosper/tools/ci/check_arch_ratchet.py --root .`
-  holds six per-file counts to "down, never up": title ids and title-named directories in shared
-  code, raw `getenv` reads, blocking GPU syncs, files over 5,000 lines, and `prosper::test::` in the
-  frontends. CI runs it, and `prosper/tools/ci/ratchet_hook.py` runs it before an agent's
-  `git commit` / `git push`. On a failure, fix the code; if the new count is genuinely right, raise
-  its row in `prosper/tools/ci/arch_ratchet_baseline.txt` **in the same PR** with a `# note` a
-  reviewer reads (a new sync names the guest-visible result it delivers). Record a drop with
-  `--update`, which only lowers. Exit 2 means "could not evaluate", never clean.
+- **Architecture and performance ratchets.** `prosper/tools/ci/check_arch_ratchet.py` holds six
+  per-file counts to "down, never up": title ids and title-named directories in shared code, raw
+  `getenv` reads, blocking GPU syncs, files over 5,000 lines, and `prosper::test::` in the
+  frontends. **Check your change with delta mode:**
+  `python3 prosper/tools/ci/check_arch_ratchet.py --root . --base origin/main`. It judges only the
+  files changed since your merge base with `origin/main` (working tree included) and fails only on
+  a count *your change* raised past its row, so a stale row elsewhere on `main` is not your
+  failure. CI gates on delta mode against the PR's base; the full-tree run (no `--base`) is the
+  baseline-maintenance report and is informational in CI. `prosper/tools/ci/ratchet_hook.py` runs
+  delta mode before an agent's `git commit` / `git push` and, for now, **only warns** (a
+  `systemMessage`; the command proceeds). On a failure, fix the code; if the new count is genuinely
+  right, raise its row in `prosper/tools/ci/arch_ratchet_baseline.txt` **in the same PR** with a
+  `# note` a reviewer reads (a new sync names the guest-visible result it delivers). Record a drop
+  with `--update`, which only lowers. Exit 2 means "could not evaluate", never clean.
   - **Steady-state invariants** — a direction and a review rule, not a description of today. After
     warm-up: **P1** no CPU wait on, or readback from, the GPU inside a frame unless the guest
     observes that result; **P2** no Vulkan object creation per draw or dispatch; **P3** no shader or

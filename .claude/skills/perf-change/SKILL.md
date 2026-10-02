@@ -42,5 +42,7 @@ task and `prosper/docs/GAME_COMPAT_ORCHESTRATION.md` for those.
 7. **Record the verdict either way.** A win lands with its A/B in the PR. A loss or a null is a
    result: add a line to the relevant `## Ruled out` (the title's status doc, or the area doc for a
    cross-title one) with the evidence and the PR or issue link, and delete the switch if the change is abandoned.
-8. **Run the ratchet** — `python3 prosper/tools/ci/check_arch_ratchet.py --root .` — and fix any
-   new count, or justify a raised baseline row in the same PR.
+8. **Run the ratchet in delta mode** —
+   `python3 prosper/tools/ci/check_arch_ratchet.py --root . --base origin/main` — and fix any count
+   your change raised, or justify a raised baseline row in the same PR. The commit hook runs the
+   same check but only warns, so do not read a commit that went through as a pass.
