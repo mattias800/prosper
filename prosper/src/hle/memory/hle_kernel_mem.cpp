@@ -13,6 +13,7 @@
 #endif
 #endif
 #include "hle/dispatch/dispatch.hpp"
+#include "hle/kernel/apr_event_dialect.hpp"   // AprDialect, stored on each binding
 #include "diagnostics/diag_clock.hpp"
 #include "diagnostics/env_numeric.hpp"   // #3267: -1 here overflowed the MiB multiply
 #include "hle/memory/dmem_caller_chain.hpp"
@@ -513,8 +514,8 @@ static uint64_t ampr_arglog(const char* tag, uint64_t a0, uint64_t a1, uint64_t 
 uint64_t prosper_apr_next_token(unsigned ring);                          // hle_kernel_time.cpp
 void prosper_eq_add_apr(uint64_t eq, int64_t id, uint64_t udata);        // "
 uint64_t prosper_eq_identity(uint64_t eq);                               // " (lifetime guard)
-void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
-                               int64_t id, uint64_t token);              // " (tag echo, #208)
+void prosper_eq_post_apr_event(uint64_t eq, uint64_t eq_identity, int64_t id,
+                               uint64_t token, AprDialect dialect);      // " (tag echo, #208)
 namespace {
     // Command-buffer ctxs bound to the APR event queue via H896Pt-yB4I, with the binding's a3 TAG
     // and target equeue. The tag IS the guest-chosen completion token for that cb ((ring<<58)|n,
@@ -533,6 +534,9 @@ namespace {
         bool completion_posted;
         bool fallback_pending;
         std::chrono::steady_clock::time_point fallback_due;
+        // How this binding's completion is delivered. Classified ONCE, from the bind arguments, so
+        // delivery switches on a recorded fact rather than re-deriving it from the tag each time.
+        AprDialect dialect = AprDialect::Counter;
     };
     struct AprBoundState {
         std::mutex mx;
@@ -570,7 +574,7 @@ namespace {
             }
             lk.unlock();
             for (const auto& b : ready)
-                prosper_eq_post_apr_token(b.eq, b.eq_identity, b.id, b.tag);
+                prosper_eq_post_apr_event(b.eq, b.eq_identity, b.id, b.tag, b.dialect);
             lk.lock();
         }
     }
@@ -647,6 +651,13 @@ size_t prosper_apr_binding_count_for_test(uint64_t cb) {
     for (const auto& b : state.cbs) if (b.cb == cb) ++n;
     return n;
 }
+// Test seam: the dialect recorded at bind time for `cb`; false when `cb` is not bound.
+bool prosper_apr_binding_dialect_for_test(uint64_t cb, AprDialect* out) {
+    AprBoundState& state = apr_bound_state();
+    std::lock_guard<std::mutex> lk(state.mx);
+    for (const auto& b : state.cbs) if (b.cb == cb) { *out = b.dialect; return true; }
+    return false;
+}
 void prosper_apr_mark_eventful(uint64_t req, bool eventful) {
     std::lock_guard<std::mutex> lk(g_apr_eventful_mx);
     g_apr_eventful[req] = eventful;   // stack frames are reused: update, don't accumulate stale marks
@@ -673,6 +684,7 @@ static uint64_t apr_cb_set_equeue(uint64_t command_size, bool eager_completion,
         for (auto& b : state.cbs)
             if (b.cb == a0) {
                 b.tag = a3; b.eq = a1; b.id = (int64_t)a2;
+                b.dialect = classify_apr_dialect((int64_t)a2, a3);
                 b.eq_identity = prosper_eq_identity(a1);
                 b.deduplicate_completion = eager_completion;
                 b.completion_posted = false;
@@ -687,7 +699,8 @@ static uint64_t apr_cb_set_equeue(uint64_t command_size, bool eager_completion,
                                   eager_completion, false,
                                   eager_completion && a1 && a3,
                                   std::chrono::steady_clock::now() +
-                                      std::chrono::milliseconds(10) });
+                                      std::chrono::milliseconds(10),
+                                  classify_apr_dialect((int64_t)a2, a3) });
         if (eager_completion && !state.worker_started) {
             state.worker_started = true;
             start_worker = true;
@@ -748,11 +761,10 @@ static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
     // statement of intent — do not add a mutation to "prove" it, since no such mutation is
     // observable.
     //
-    // "Echoed verbatim" is true only in the id==0 pointer dialect. prosper_eq_post_apr_token
-    // branches on the binding's id: id==0 delivers this exact token, while id!=0 delivers
-    // (ring<<58) | per-(eq,ring) high-water mark, so a zero tag there arrives as a counter value
-    // that merely happens to be 0 on a fresh queue. Harmless for CRI, whose waiter tests only the
-    // ident, but do not read this call as a guarantee that the tag reaches the guest unmodified.
+    // "Echoed verbatim" holds for the RequestPointer and ConstantZero dialects. The binding's
+    // dialect (apr_event_dialect.hpp, classified at bind) decides delivery: a Counter binding
+    // delivers (ring<<58) | per-(eq,ring) high-water mark, not this exact tag. Do not read this
+    // call as a guarantee that the tag reaches the guest unmodified.
     //
     // The 3.20 sibling names the semantics: o67gODLFpls is
     // sceAmprCommandBufferWriteKernelEventQueueOnCompletion — the tag is the VALUE WRITTEN on
@@ -782,7 +794,7 @@ static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
                            bound ? " (bound)" : "", apr_req_eventful(a0) ? " (arg8-async)" : "");
     if (token_out) *token_out = token;
     if (tag_echo && should_post)
-        prosper_eq_post_apr_token(bc.eq, bc.eq_identity, bc.id, bc.tag);
+        prosper_eq_post_apr_event(bc.eq, bc.eq_identity, bc.id, bc.tag, bc.dialect);
     // Submit consumes the encoded commands. Pathless reuses completed pool buffers without calling
     // the public Reset/ClearBuffer NIDs between batches, so the next append must observe a fresh
     // cursor even though the fixed capacity remains attached to the command-buffer object.
