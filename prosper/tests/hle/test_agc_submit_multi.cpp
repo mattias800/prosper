@@ -130,10 +130,10 @@ int main(int argc, char** argv) {
     if (argc == 2) return child(argv[1], submit);
     CHECK(submit != nullptr, "MultiDcbs import registered");
     auto hook = Hle::return_hook_of("6UzEidRZwkg");
-    CHECK(hook == &gpu::prosper_gpu_submit_scope_end, "MultiDcbs owns the established return hook");
+    CHECK(hook == &::prosper_gpu_submit_scope_end, "MultiDcbs owns the established return hook");
     if (!submit || !hook) return 1;
 
-    gpu::prosper_gpu_enable_post_submit_visibility();
+    ::prosper_gpu_enable_post_submit_visibility();
     uint32_t first[] = {header(3, gpu::IT_SET_SH_REG), 0x123, 0x11223344,
                        header(3, gpu::IT_NOP, gpu::R_DRAW_INDEX_AUTO), 3, 0};
     uint32_t second[] = {0x80000000u, header(2, gpu::IT_NOP), 0xa5a5a5a5,
@@ -148,9 +148,9 @@ int main(int argc, char** argv) {
     CHECK(after == before + 1 && draws == 1, "one-entry array executes its draw as one submission");
     CHECK(prosper_agc_submit_sh_reg(0, 0x123, &value) && value == 0x11223344,
           "one-entry array applies the pointed-to stream");
-    CHECK(gpu::prosper_gpu_submit_scope_active(), "import scope remains active before return hook");
+    CHECK(::prosper_gpu_submit_scope_active(), "import scope remains active before return hook");
     hook();
-    CHECK(!gpu::prosper_gpu_submit_scope_active(), "one return hook retires one import scope");
+    CHECK(!::prosper_gpu_submit_scope_active(), "one return hook retires one import scope");
 
     before = after;
     submit(U(pointers), U(lengths), 2, 0, 0, 0);
@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
     CHECK(prosper_agc_submit_sh_reg(0, 0x123, &value) && value == 0x55667788,
           "later array entry overwrites the earlier register in order");
     hook();
-    CHECK(!gpu::prosper_gpu_submit_scope_active(), "multi-buffer submission opens only one scope");
+    CHECK(!::prosper_gpu_submit_scope_active(), "multi-buffer submission opens only one scope");
 
     // Distinct target addresses matter: per-address gating would conceal a fold reset if both
     // buffers wrote the same label. A blocked WAIT must gate even the fresh second-buffer address.
@@ -174,13 +174,13 @@ int main(int argc, char** argv) {
           consumed[0] == 15 && consumed[1] == 7, "batch processor consumes both complete streams");
     CHECK(gpu::last_fold_deferred() && gpu::deferred_pending(),
           "batch still reports a first-buffer wait after folding the second buffer");
-    gpu::prosper_gpu_drain_completion_writes();
+    ::prosper_gpu_drain_completion_writes();
     CHECK(upstream == 1 && downstream == 0,
           "upstream write drains while distinct second-buffer effect remains gated");
     condition = 1;
     // This processor-only case starts no HLE watchdog, so release and inspection stay on one thread.
     gpu::flush_deferred_streams();
-    gpu::prosper_gpu_drain_completion_writes();
+    ::prosper_gpu_drain_completion_writes();
     CHECK(downstream == 9 && !gpu::deferred_pending(), "satisfied barrier releases the batch tail");
 
     CHECK(run_child(argv[0], "probe") == 0, "death-test child launches successfully");
