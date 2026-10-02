@@ -44,6 +44,50 @@ uint32_t SpirvCompute::portable_ds_bpermute_b32(
     return result;
 }
 
+std::pair<uint32_t, uint32_t> SpirvCompute::packet_wqm_b64(
+    uint32_t source, uint32_t pending, uint32_t event, uint32_t result_slot) {
+    if (!is_fragment_packet() ||
+        packet_quad_topology != FragmentPacketQuadTopology::ConsecutiveLogicalQuads ||
+        wave_size != 64 || local_count != 64 || native_subgroup_size ||
+        !cfg_scratch || result_slot < local_count || result_slot >= cfg_scratch_dwords)
+        return {0, 0};
+    // CONFIDENCE: HIGH for the published mask operation, not for raster packet construction.
+    // AMD RDNA2 70648 section 12.3: each result nibble is all ones iff any source bit in
+    // that nibble is set; SCC=(complete result != 0). Scalar WQM is not EXEC-predicated.
+    // Every physical worker publishes and rendezvouses, even when guest EXEC is disabled.
+    const uint32_t zero = uconst(0), no = bfalse();
+    const uint32_t encoded = sel(pending,
+        ibin(Op_BitwiseOr, ibin(Op_ShiftLeftLogical, event, uconst(1)),
+             sel(source, uconst(1), zero)), zero);
+    cfg_scratch_store(linear_localid, encoded);
+    barrier();
+    const auto source_bit = [&](uint32_t index) {
+        const uint32_t value = cfg_scratch_load(index);
+        return land(ucmp(Op_IEqual, ibin(Op_ShiftRightLogical, value, uconst(1)), event),
+                    ucmp(Op_INotEqual, ibin(Op_BitwiseAnd, value, uconst(1)), zero));
+    };
+    const uint32_t quad_base = ibin(Op_BitwiseAnd, linear_localid, uconst(~3u));
+    uint32_t widened = no;
+    for (uint32_t neighbor = 0; neighbor < 4; ++neighbor)
+        widened = lor(widened, source_bit(ibin(Op_IAdd, quad_base, uconst(neighbor))));
+    // SCC must be whole64, not this invocation's nibble or a native32 subgroup reduction.
+    const uint32_t leader = id(), assembled = id();
+    const uint32_t is_leader = land(pending, ucmp(Op_IEqual, linear_localid, zero));
+    emit_selmerge(assembled);
+    emit_condbranch(is_leader, leader, assembled);
+    emit_label(leader);
+    uint32_t any = no;
+    for (uint32_t lane = 0; lane < 64; ++lane) any = lor(any, source_bit(uconst(lane)));
+    cfg_scratch_store(uconst(result_slot), sel(any, uconst(1), zero));
+    emit_branch(assembled);
+    emit_label(assembled);
+    barrier();
+    const uint32_t scc = ucmp(Op_INotEqual, cfg_scratch_load(uconst(result_slot)), zero);
+    // Complete every shared source/result read before another service reuses either plane.
+    barrier();
+    return {widened, scc};
+}
+
 void SpirvCompute::mark_fragment_wave_vote_value(uint32_t value) {
         std::vector<uint32_t> pending{value};
         while (!pending.empty()) {
@@ -614,6 +658,7 @@ uint32_t SpirvCompute::vertex_invocation_id() {
     }
 
 uint32_t SpirvCompute::guest_lane_id() {
+        if (has_workgroup_execution()) return linear_localid;
         if (is_fragment) return subgroup_local_id();
         if (is_compute) return linear_localid;
         return ibin(Op_BitwiseAnd, vertex_invocation_id(), uconst(wave_size - 1));

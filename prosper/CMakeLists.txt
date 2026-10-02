@@ -2607,6 +2607,16 @@ endif()
   target_include_directories(test_portable_bpermute PRIVATE tests)
   target_link_libraries(test_portable_bpermute PRIVATE prosper_core)
   add_test(NAME portable_bpermute_contract COMMAND test_portable_bpermute)
+
+  add_executable(test_fragment_packet tests/gpu/recompiler/test_fragment_packet.cpp)
+  target_include_directories(test_fragment_packet PRIVATE tests)
+  target_link_libraries(test_fragment_packet PRIVATE prosper_core)
+  add_test(NAME fragment_packet_contract COMMAND test_fragment_packet)
+  add_executable(test_fragment_packet_wqm tests/gpu/recompiler/test_fragment_packet_wqm.cpp)
+  target_include_directories(test_fragment_packet_wqm PRIVATE tests)
+  target_link_libraries(test_fragment_packet_wqm PRIVATE prosper_core)
+  add_test(NAME fragment_packet_wqm_contract COMMAND test_fragment_packet_wqm)
+  set_tests_properties(fragment_packet_wqm_contract PROPERTIES TIMEOUT 90)
   set_tests_properties(portable_bpermute_contract PROPERTIES TIMEOUT 90)
 
   # #3713: a scalar branch may only be called workgroup-uniform when the value it compares is the
@@ -5630,6 +5640,12 @@ endif()
 # physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
 # silent pass) where one does not.
 if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  add_executable(test_fragment_packet_exec tests/gpu/execute/test_fragment_packet_exec.cpp)
+  target_include_directories(test_fragment_packet_exec PRIVATE tests)
+  target_link_libraries(test_fragment_packet_exec PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME fragment_packet_exec COMMAND test_fragment_packet_exec)
+  set_tests_properties(fragment_packet_exec PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
   add_executable(test_float_transport_render tests/gpu/execute/test_float_transport_render.cpp)
   target_include_directories(test_float_transport_render PRIVATE tests frontends)
   target_link_libraries(test_float_transport_render PRIVATE prosper_core Vulkan::Vulkan)
