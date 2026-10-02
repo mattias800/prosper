@@ -3,7 +3,8 @@
 # loading screen. Identify the ticked object (RTTI typename), the *0x288 target, diff the object's
 # fields across ~300 frames (what changes vs what is parked), and histogram the GameThread's RIP/RA
 # between frames to find the poll site.
-import gdb, time
+import gdb
+import time
 from collections import Counter
 
 EBOOT = 0x400000000
