@@ -41,9 +41,9 @@
 //   nid_census <app0-dir|module> [more...] [--names <PS5-3.20_Libs-dir>]
 //              [--registered] [--tsv] [--lib <substr>] [--self-check] [--data-only]
 //
-// `<app0-dir>` is scanned recursively for eboot.bin and *.prx/*.sprx. Passing several titles ranks
-// each NID by how many of them import it, which is the reachability signal #2081 asks for: a NID
-// one title imports is a different priority from one that twelve do.
+// `<app0-dir>` selects the loader's link set; an explicit module path selects that module alone.
+// Each input's selection and parse counts are reported beside the aggregate census. Passing several
+// dump roots ranks each NID by how many of them import it, which is the signal #2081 asks for.
 //
 // `--names` points at the PS5 3.20 stub dump, whose loader lines carry `<NID> <-> <funcName>`
 // pairs directly. `--self-check` re-derives each pair with prosper's own `nid_hash` and reports
@@ -75,7 +75,7 @@ struct Row {
     std::string nid;
     std::string name;                 // "" when the stub dump does not name it
     std::set<std::string> libs;       // import library names as the module declares them
-    std::set<std::string> titles;     // which inputs import it
+    std::set<std::string> titles;     // legacy aggregate labels: distinct input basenames
     size_t modules = 0;               // how many modules import it
     // ELF64_ST_TYPE values this NID was imported with. A set, not a scalar: nothing stops two
     // modules from declaring the same NID with different types, and collapsing that to one value
@@ -83,6 +83,34 @@ struct Row {
     std::set<unsigned> elf_types;
     bool object() const { return elf_types.count(STT_OBJECT) != 0; }
 };
+
+struct ModuleSelection {
+    std::vector<fs::path> paths;
+    bool single_module = false;
+};
+
+struct InputScope {
+    std::string input;
+    bool single_module = false;
+    size_t selected = 0, read = 0, failed = 0, data_bindings = 0;
+};
+
+// Metadata stays on one LF-delimited record even when a POSIX path contains control bytes.
+// Backslashes are escaped too, so literal escape-looking text remains distinguishable. Preserve
+// ordinary UTF-8 bytes and the existing aggregate TSV fields.
+std::string input_label(const std::string& input) {
+    constexpr char hex[] = "0123456789abcdef";
+    std::string label;
+    for (unsigned char c : input) {
+        if (c == '\\') label += "\\\\";
+        else if (c < 0x20 || c == 0x7f) {
+            label += "\\x";
+            label += hex[c >> 4];
+            label += hex[c & 0xf];
+        } else label += static_cast<char>(c);
+    }
+    return label;
+}
 
 // The ELF symbol types this corpus actually carries, spelled for a report.
 const char* sym_type_name(unsigned t) {
@@ -152,7 +180,7 @@ bool is_module_file(const fs::path& p) {
 // reaches the dispatcher, so it is excluded from the census. That is sound only if the sibling set
 // matches what the loader actually links. A tree scan is strictly larger -- it picks up .sprx (never
 // auto-linked), everything under sce_module/ (the loader takes exactly two named files), plugin
-// directories other than Media/Plugins/ (the only one auto-discovered), and modules whose file the
+// directories outside Media/Plugins/ and the dump root, and modules whose file the
 // loader would drop or refuse. Every one of those made the tool exclude a binding that DOES fall to
 // the dispatcher's `return 0` at runtime.
 //
@@ -162,16 +190,20 @@ bool is_module_file(const fs::path& p) {
 //
 // A single regular file still means "just this module", which is how --lib and single-module runs
 // work; only a dump ROOT goes through the loader's set.
-std::vector<fs::path> collect_modules(const std::string& input) {
-    std::vector<fs::path> out;
+ModuleSelection collect_modules(const std::string& input) {
+    ModuleSelection out;
     std::error_code ec;
     const fs::path root(input);
-    if (fs::is_regular_file(root, ec)) { out.push_back(root); return out; }
+    if (fs::is_regular_file(root, ec)) {
+        out.single_module = true;
+        out.paths.push_back(root);
+        return out;
+    }
     // verbose=false: boot_link_inputs prints the loader's auto-link and case-correction lines, and
     // --tsv writes machine-readable rows to the same stdout.
     for (const auto& li : prosper::boot_link_inputs(input, /*verbose=*/false))
-        out.push_back(fs::path(li.path));
-    std::sort(out.begin(), out.end());
+        out.paths.push_back(fs::path(li.path));
+    std::sort(out.paths.begin(), out.paths.end());
     return out;
 }
 
@@ -181,10 +213,16 @@ std::vector<fs::path> collect_modules(const std::string& input) {
 void print_scope(const char* prefix, size_t total, size_t modules_read, size_t modules_failed,
                  size_t unregistered, size_t shown, size_t shown_unregistered,
                  size_t satisfied_cross_module,
-                 const std::map<std::string, size_t>& data_bindings_by_title,
+                 const std::vector<InputScope>& input_scopes,
                  size_t data_satisfied_cross_module,
                  size_t mismatches, const std::string& lib_filter, bool self_check,
                  bool data_only) {
+    for (const auto& input : input_scopes) {
+        printf("%sinput: %s -> ", prefix, input_label(input.input).c_str());
+        if (input.single_module) printf("single module");
+        else printf("link set, %zu module%s", input.selected, input.selected == 1 ? "" : "s");
+        printf(" (%zu read, %zu unreadable)\n", input.read, input.failed);
+    }
     printf("%sscope: %zu distinct imported NIDs over %zu module(s) read, %zu unreadable\n",
            prefix, total, modules_read, modules_failed);
     printf("%sscope: %zu unregistered before filtering, %zu shown (%zu unregistered)%s%s\n",
@@ -196,17 +234,21 @@ void print_scope(const char* prefix, size_t total, size_t modules_read, size_t m
         // #3529: what reaches the writable import-data aperture. A data import a sibling module
         // DEFINES is bound to that definition and never comes here, which is why the exclusion
         // count is reported beside it rather than left implicit.
-        size_t data_total = 0, titles_with_data = 0;
-        for (const auto& [t, n] : data_bindings_by_title) { data_total += n; if (n) titles_with_data++; }
+        size_t data_total = 0, inputs_with_data = 0;
+        for (const auto& input : input_scopes) {
+            data_total += input.data_bindings;
+            if (input.data_bindings) inputs_with_data++;
+        }
         printf("%sscope: %zu DATA binding(s) (ELF STT_OBJECT) unresolved by any sibling module, "
                "over %zu of %zu input(s); a further %zu were satisfied cross-module\n",
-               prefix, data_total, titles_with_data, data_bindings_by_title.size(),
+               prefix, data_total, inputs_with_data, input_scopes.size(),
                data_satisfied_cross_module);
-        // The per-title breakdown only in --data-only: over a whole-corpus run it is one line per
-        // dump, which would bury the default report's own scope block.
+        // Keep each argument, including zero-count and same-basename inputs. An explicit module
+        // is not a title, and its imports are classified without any sibling from another input.
         if (data_only)
-            for (const auto& [t, n] : data_bindings_by_title)
-                printf("%sdata: %-20s %zu\n", prefix, t.c_str(), n);
+            for (const auto& input : input_scopes)
+                printf("%sdata input: %s -> %zu unresolved DATA binding(s)\n",
+                       prefix, input_label(input.input).c_str(), input.data_bindings);
     }
     if (self_check)
         printf("%sscope: name-table self-check %zu mismatch(es)\n", prefix, mismatches);
@@ -219,7 +261,7 @@ void print_scope(const char* prefix, size_t total, size_t modules_read, size_t m
     // #1756 plus sceKernelWaitCommandBufferCompletion — a ready-made explanation for its fault — and
     // calls NONE of them. The runtime unimplemented-call census over a full faulting run was 12 NIDs,
     // none in libSceAgc/libSceAgcDriver/libkernel (#1226).
-    printf("%sNOTE: this is a STATIC import census -- what a title MAY call, not what it did. A NID "
+    printf("%sNOTE: this is a STATIC import census -- what the selected modules MAY call, not what they did. A NID "
            "listed here may never execute, and a fault is not explained by its presence. For what a "
            "run actually called, use prosper_on_unimpl's first-seen census from a live boot, or "
            "hle_calls (#1980), and bound it to the window the behaviour occurs in.\n", prefix);
@@ -227,6 +269,8 @@ void print_scope(const char* prefix, size_t total, size_t modules_read, size_t m
            "inputs inspect that module alone. Cross-module exclusions use the modules "
            "selected for each input.\n",
            prefix);
+    printf("%sNOTE: aggregate #lbl (TSV titles/title_list) groups inputs by basename; "
+           "the per-input lines identify each argument.\n", prefix);
 }
 
 void usage(const char* argv0) {
@@ -280,15 +324,16 @@ int main(int argc, char** argv) {
 
     std::map<std::string, Row> rows;
     size_t modules_read = 0, modules_failed = 0, satisfied_cross_module = 0;
-    // Per-title DATA accounting (#3529), kept even when --data-only is off so the scope block can
-    // report it unconditionally: it costs two counters and it is the number the issue asked for.
-    std::map<std::string, size_t> data_bindings_by_title;   // unresolved STT_OBJECT bindings
+    // Per-input DATA accounting (#3529), even outside --data-only. Selection context is kept in
+    // argument order rather than keyed by a basename that may identify several different inputs.
+    std::vector<InputScope> input_scopes;
     size_t data_satisfied_cross_module = 0;
 
     for (const auto& input : inputs) {
         const std::string title = fs::path(input).filename().string();
         const auto mods = collect_modules(input);
-        if (mods.empty()) fprintf(stderr, "[warn] no modules under %s\n", input.c_str());
+        InputScope scope{input, mods.single_module, mods.paths.size()};
+        if (mods.paths.empty()) fprintf(stderr, "[warn] no modules under %s\n", input.c_str());
 
         // A title's modules are linked together, so its own exports are the first resolver. Parse
         // every module once, keep them, and take the union of their exports before classifying any
@@ -296,15 +341,17 @@ int main(int argc, char** argv) {
         // reaches the dispatcher, so it is not a candidate here at all.
         std::vector<Module> loaded;
         std::set<std::string> title_exports;
-        for (const auto& mp : mods) {
+        for (const auto& mp : mods.paths) {
             std::string err;
             auto m = Module::load(mp.string(), &err);
             if (!m) {
                 modules_failed++;
+                scope.failed++;
                 fprintf(stderr, "[warn] %s: %s\n", mp.string().c_str(), err.c_str());
                 continue;
             }
             modules_read++;
+            scope.read++;
             for (const auto& nid : module_export_nids(*m)) title_exports.insert(nid);
             loaded.push_back(std::move(*m));
         }
@@ -324,12 +371,10 @@ int main(int argc, char** argv) {
                 r.elf_types.insert(im.elf_type);
                 // One binding per IMPORT, not per NID: two modules importing the same variable are
                 // two bindings that both land on the (one, deduped) data slot.
-                if (im.elf_type == STT_OBJECT) data_bindings_by_title[title]++;
+                if (im.elf_type == STT_OBJECT) scope.data_bindings++;
             }
         }
-        // A title with zero unresolved data imports must still appear, or "how many titles are
-        // affected" would be read off a map that silently omits the answer "none".
-        data_bindings_by_title.emplace(title, 0);
+        input_scopes.push_back(std::move(scope));
     }
 
     // Classify against the live registry.
@@ -355,7 +400,7 @@ int main(int argc, char** argv) {
         if (!registered) shown_unregistered++;
     }
 
-    // Most-imported first: the count of distinct titles is the reachability rank.
+    // Preserve the aggregate's existing rank by distinct input basenames.
     std::sort(selected.begin(), selected.end(), [](const Row* a, const Row* b) {
         if (a->titles.size() != b->titles.size()) return a->titles.size() > b->titles.size();
         if (a->name != b->name) return a->name < b->name;
@@ -374,7 +419,7 @@ int main(int argc, char** argv) {
                    r->titles.size(), r->modules, libs.c_str(), tl.c_str());
         }
         print_scope("# ", total, modules_read, modules_failed, unregistered, selected.size(),
-                    shown_unregistered, satisfied_cross_module, data_bindings_by_title,
+                    shown_unregistered, satisfied_cross_module, input_scopes,
                     data_satisfied_cross_module, names.mismatches, lib_filter, self_check,
                     data_only);
         return 0;
@@ -386,7 +431,7 @@ int main(int argc, char** argv) {
         ? "\n== imports (registered and unregistered) ==\n"
         : "\n== imports with NO registered handler -> dispatcher returns 0 ==\n");
     printf("%-13s %-52s %-8s %10s %5s  %s\n",
-           "NID", "name", "sym type", "registered", "#ttl", "import library");
+           "NID", "name", "sym type", "registered", "#lbl", "import library");
     for (const Row* r : selected) {
         std::string libs;
         for (const auto& l : r->libs) { if (!libs.empty()) libs += ","; libs += l; }
@@ -396,7 +441,7 @@ int main(int argc, char** argv) {
     }
     printf("\n");
     print_scope("", total, modules_read, modules_failed, unregistered, selected.size(),
-                shown_unregistered, satisfied_cross_module, data_bindings_by_title,
+                shown_unregistered, satisfied_cross_module, input_scopes,
                 data_satisfied_cross_module, names.mismatches, lib_filter, self_check,
                 data_only);
     return 0;
