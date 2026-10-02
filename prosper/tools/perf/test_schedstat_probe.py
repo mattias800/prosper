@@ -15,13 +15,29 @@ from pathlib import Path
 from schedstat_probe import collect, read_thread, select_threads, stat_fields
 
 
+def through_sharing_violations(operation):
+    # Windows refuses to rename over, or delete, a file another handle has open (WinError 32),
+    # and the probe under test opens these files at 200 Hz. The probe holds each one only for a
+    # read, so a short bounded retry always gets in; without it the fixture thread died on the
+    # exception, the change it stood for never happened, and the arm failed with a misleading
+    # assertion (#4142). Any other error -- or one that persists for 2 s -- still raises.
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            return operation()
+        except PermissionError as error:
+            if getattr(error, 'winerror', None) != 32 or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.001)
+
+
 def replace_atomically(path, text):
     # A plain write_text truncates first, so a concurrent reader can observe an empty file and
     # the probe would report "unreadable" where the test means "identity changed". Real /proc
     # reads never see a torn file; rename gives the synthetic tree the same property.
     temporary = path.with_name(path.name + '.new')
     temporary.write_text(text)
-    temporary.replace(path)
+    through_sharing_violations(lambda: temporary.replace(path))
 
 
 def stat_text(pid, comm, state, starttime):
@@ -124,7 +140,7 @@ class CollectLoopTests(unittest.TestCase):
         self.assertEqual(report['terminal'], 'process identity changed')
 
     def test_unreadable_process_stops_the_run(self):
-        self.after(0.05, lambda: self.root.joinpath('stat').unlink())
+        self.after(0.05, lambda: through_sharing_violations(self.root.joinpath('stat').unlink))
         report = collect(1234, 'prosper-app', 5.0, 200.0, proc_root=self.proc)
         self.assertEqual(report['terminal'], 'process exited or became unreadable')
 

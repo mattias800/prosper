@@ -366,6 +366,8 @@ jobs:
     name: Python quality
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       # Its own job for the reason contribution-shape is: it builds nothing, and a finding here must
       # not cost the build-and-test signal. Ruff is a RATCHET on changed files (the tree has ~1,500
@@ -388,17 +390,19 @@ jobs:
       # The selftest and pytest run first: they hold hand-built violating inputs, so a gate that
       # stopped discriminating fails here instead of passing every PR.
       - name: Verify the checker still discriminates
-        run: uv run --no-sync --group dev python prosper/tools/ci/check_python_quality.py --selftest
+        run: uv run --no-sync --no-build --group dev python prosper/tools/ci/check_python_quality.py --selftest
 
       - name: Test the checker (pytest)
-        run: uv run --no-sync --group dev pytest
+        run: uv run --no-sync --no-build --group dev pytest
 
       - name: Ruff on changed Python files
         if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          git fetch --no-tags origin "${{ github.base_ref }}"
-          uv run --no-sync --group dev python prosper/tools/ci/check_python_quality.py \
-            --base "origin/${{ github.base_ref }}"
+          git fetch --no-tags origin "$BASE_REF"
+          uv run --no-sync --no-build --group dev python prosper/tools/ci/check_python_quality.py \
+            --base "origin/$BASE_REF"
 
   docs:
     name: Docs

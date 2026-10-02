@@ -11,6 +11,7 @@
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/recompiler/fragment_float_mode.hpp"
 #include "gpu/recompiler/fragment_float_flags.hpp"
+#include "gpu/state/raster_launch_facts.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -110,6 +111,7 @@ struct PositionOutputState {
 };
 
 struct RenderState {
+    RasterLaunchFacts ps_raster_launch{};
     std::array<ColorTargetState, kColorTargetCount> color_targets{};
     PositionOutputState position_output{};
     // Shader program GPU addresses per stage (byte address; 0 if that stage's PGM regs were unset).

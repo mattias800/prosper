@@ -23,9 +23,11 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/diagnostics/draw_disposition.hpp"  // why a draw did not reach the GPU
 #include "diagnostics/readback_reason_census.hpp"  // why a colour target is copied back
+#include "diagnostics/readback_refusal.hpp"        // selected early refusals, without changing authority
 #include "diagnostics/perf/perf_ledger.hpp"         // #3891: always-on alarm ledger
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
+#include "gpu/recompiler/raster_quad_collector.hpp"
 #include "diagnostics/exit_census.hpp"       // one-line end-of-run reports
 #include "diagnostics/persistent_target_census.hpp"  // is the colour-target cache at its bound?
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
@@ -698,6 +700,8 @@ inline BackendColorTargetStats backend_color_target_stats() {
 // order, normally in one render pass; an attached-depth write/sample transition is the narrow case
 // that requires an ordered pass boundary. render_triangle_rgba is a thin single-draw wrapper (below).
 struct BackendDraw {
+    std::shared_ptr<prosper::gpu::RasterQuadCollection> raster_quads;
+    bool raster_quad_contract_modified = false;
     std::vector<uint32_t> vs, gs, fs;
     // For a mesh draw, `vs` carries a MeshEXT module instead of a vertex module. The group counts
     // are draw-time state, not pipeline identity. The backend refuses this path unless the optional
@@ -2006,14 +2010,20 @@ inline const RenderVkCtx& render_vk_ctx() {
         }
 
         {
+            // Core quad/subgroup support is independent of optional exact-size control. The real
+            // quad collector needs QuadBroadcast, not a request for subgroupSize=64.
+            VkPhysicalDeviceProperties2 core{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            core.pNext = &subgroup_core_properties;
+            vkGetPhysicalDeviceProperties2(r.phys, &core);
+            r.subgroup_stages = subgroup_core_properties.supportedStages;
+            r.subgroup_operations = subgroup_core_properties.supportedOperations;
             VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
             f2.pNext = &subgroup_features;
             vkGetPhysicalDeviceFeatures2(r.phys, &f2);
             if (subgroup_features.subgroupSizeControl) {
                 VkPhysicalDeviceProperties2 p2{
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-                p2.pNext = &subgroup_core_properties;
-                subgroup_core_properties.pNext = &subgroup_properties;
+                p2.pNext = &subgroup_properties;
                 vkGetPhysicalDeviceProperties2(r.phys, &p2);
                 subgroup_features.pNext = const_cast<void*>(dci.pNext);
                 dci.pNext = &subgroup_features;
@@ -2025,8 +2035,6 @@ inline const RenderVkCtx& render_vk_ctx() {
                     subgroup_properties.maxComputeWorkgroupSubgroups;
                 r.required_subgroup_size_stages =
                     subgroup_properties.requiredSubgroupSizeStages;
-                r.subgroup_stages = subgroup_core_properties.supportedStages;
-                r.subgroup_operations = subgroup_core_properties.supportedOperations;
             }
         }
 
@@ -3615,7 +3623,11 @@ inline size_t persistent_color_target_count_ceiling(bool eviction_deferred) {
 
 inline PersistentColorTargetImage* find_persistent_color_target(
     uint64_t id, uint32_t width, uint32_t height, VkFormat format, bool require_valid = true,
-    uint32_t volume_depth = 0) {
+    uint32_t volume_depth = 0,
+    prosper::diagnostics::readback_refusal::LookupObservation* observation = nullptr) {
+    using prosper::diagnostics::readback_refusal::ObservedBool;
+    if (observation)
+        *observation = {ObservedBool::NotObserved, ObservedBool::NotObserved};
     if (!id) return nullptr;
     format = backend_color_format(format);
     auto& cache = persistent_color_target_cache();
@@ -3626,7 +3638,17 @@ inline PersistentColorTargetImage* find_persistent_color_target(
         cache.size(), persistent_color_target_count_limit(),
         persistent_color_target_bytes(), persistent_color_target_limit());
     auto found = cache.find({id, width, height, format, volume_depth});
-    if (found == cache.end() || (require_valid && !found->second.valid)) return nullptr;
+    if (found == cache.end()) {
+        if (observation) observation->key_present = ObservedBool::No;
+        return nullptr;
+    }
+    if (observation) observation->key_present = ObservedBool::Yes;
+    if (require_valid) {
+        const bool valid = found->second.valid;
+        if (observation)
+            observation->valid = valid ? ObservedBool::Yes : ObservedBool::No;
+        if (!valid) return nullptr;
+    }
     return &found->second;
 }
 
@@ -3765,7 +3787,8 @@ inline void destroy_persistent_color_target(const RenderVkCtx& ctx,
 
 inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32_t height,
                                              VkFormat format, std::vector<uint8_t>& output,
-                                             std::string& error, uint32_t volume_depth = 0);
+                                             std::string& error, uint32_t volume_depth = 0,
+                                             prosper::diagnostics::readback_refusal::Record* record = nullptr);
 
 // With deferred RTT readback (#1284) a valid persistent target can hold the ONLY copy of its
 // rendered pixels. Eviction must hand those pixels back to the frontend's CPU cache before the
@@ -7197,20 +7220,67 @@ inline BackendSubmissionState submit_persistent_ds_transfer(
 // synchronizing only at that consumer preserves both the persistent-target contract and DMA versioning.
 inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32_t height,
                                              VkFormat format, std::vector<uint8_t>& output,
-                                             std::string& error, uint32_t volume_depth) {
+                                             std::string& error, uint32_t volume_depth,
+                                             prosper::diagnostics::readback_refusal::Record* record) {
+    namespace refusal = prosper::diagnostics::readback_refusal;
     output.clear(); error.clear();
     // #3891: a CPU readback of a GPU surface (outermost scope only; nested helpers are one event).
     const prosper::diagnostics::perf::CostScope perf_readback(
         prosper::diagnostics::perf::Cost::SurfaceReadback);
+    if (record) {
+        // Context belongs to the synchronous caller. These helpers have no current-thread
+        // resource-guard witness, so observe only the operands the original branches read.
+        record->reason = refusal::Reason::NotRefused;
+        record->source_us = 0;
+        record->address = id;
+        record->width = width;
+        record->height = height;
+        record->volume_depth = volume_depth;
+        record->requested_format = static_cast<uint32_t>(format);
+        record->canonical_format = 0;
+        record->canonical_known = false;
+        record->lookup = {refusal::ObservedBool::NotObserved, refusal::ObservedBool::NotObserved};
+        record->image_present = refusal::ObservedBool::NotObserved;
+        record->layout = 0;
+        record->layout_known = false;
+    }
     if (backend_has_unproven_submission()) {
         error = "Vulkan submission completion is unproven";
+        refusal::stamp_refusal(record, refusal::Reason::GlobalUnproven);
         return false;
     }
     format = backend_color_format(format);
+    if (record) {
+        record->canonical_format = static_cast<uint32_t>(format);
+        record->canonical_known = true;
+    }
     PersistentColorTargetImage* target = find_persistent_color_target(
-        id, width, height, format, true, volume_depth);
-    if (!target || !target->image || target->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        id, width, height, format, true, volume_depth, record ? &record->lookup : nullptr);
+    if (!target) {
         error = "persistent color target is unavailable";
+        if (record)
+            refusal::stamp_refusal(record,
+                record->lookup.key_present == refusal::ObservedBool::Yes
+                    ? refusal::Reason::PresentInvalid
+                    : record->lookup.key_present == refusal::ObservedBool::No
+                        ? refusal::Reason::ExactKeyAbsent : refusal::Reason::LookupNotPerformed);
+        return false;
+    }
+    if (!target->image) {
+        error = "persistent color target is unavailable";
+        if (record) record->image_present = refusal::ObservedBool::No;
+        refusal::stamp_refusal(record, refusal::Reason::NoImage);
+        return false;
+    }
+    if (record) record->image_present = refusal::ObservedBool::Yes;
+    const VkImageLayout observed_layout = target->layout;
+    if (record) {
+        record->layout = static_cast<uint32_t>(observed_layout);
+        record->layout_known = true;
+    }
+    if (observed_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        error = "persistent color target is unavailable";
+        refusal::stamp_refusal(record, refusal::Reason::UndefinedLayout);
         return false;
     }
     target->last_use = ++persistent_color_target_generation();
@@ -8606,6 +8676,10 @@ inline uint64_t backend_pass_source_submit(std::span<const BackendDraw> draws) {
         if (draw.source_submit != source) return 0;
     return source;
 }
+
+// Shared live/test renderer owner; it deliberately uses the same device, buffer pool and ordered
+// completion machinery, not a second standalone Vulkan harness.
+#include "fixtures/raster_quad_collection_gpu.h"
 
 inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> draws,
                                                   uint32_t W, uint32_t H,
@@ -11124,6 +11198,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 }
             }
         }
+        if (fragment_subgroup_skip && required_fragment_subgroup_size == 64 && bd.raster_quads)
+            collect_backend_raster_quads(ctx, bd, W, H, active_submission);
         if (fragment_subgroup_skip &&
             (bd.allow_native_fragment_vote_width || bd.allow_partial_wave_fragment) &&
             (ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&

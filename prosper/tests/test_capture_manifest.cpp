@@ -396,6 +396,9 @@ int main() {
         live.typical_interval_seconds = 1.0 / 60.0;
         live.active_seconds = 9.8;
         live.interval_samples = 599;
+        // p99 resolved (599 >= 100 intervals), p90/p95 left unset so the same fixture covers both
+        // the measured and the null spelling of the tail fields.
+        live.interval_p99_seconds = 0.040;
         const prosper::gpu::FrameRate live_rate =
             prosper::gpu::frame_rate_since_first_publication(live);
 
@@ -422,6 +425,13 @@ int main() {
               live_summary.find("\"interval_samples\":599") != std::string::npos &&
               live_summary.find("\"active_fraction\":0.9800") != std::string::npos,
               "the measured branch of the emitter writes the typical rate and its active share");
+        // The frame-time tail: a resolved p99 is a number (and 1/p99 = 25 fps), an unresolved tail
+        // is `null`, never 0 -- the same spelling rule as the typical rate above.
+        CHECK(live_summary.find("\"interval_p99_ms\":40.000") != std::string::npos &&
+              live_summary.find("\"low_1pct_fps\":25.000") != std::string::npos &&
+              live_summary.find("\"interval_p90_ms\":null") != std::string::npos &&
+              live_summary.find("\"interval_p95_ms\":null") != std::string::npos,
+              "a resolved tail is a number and an unresolved one is null in the manifest");
 
         const std::string frozen_summary = manifest_summary_json(
             5, 5, SamplingStop::RequestSatisfied, tracker, ok_verdict, running, false, frozen_rate);
@@ -446,6 +456,9 @@ int main() {
         // ...and the stream state must not leak out of that branch onto the next field.
         CHECK(unmeasured.find("\"typical_interval_seconds\":0.000000") != std::string::npos,
               "the field after the null is still formatted with its own precision");
+        CHECK(unmeasured.find("\"interval_p99_ms\":null") != std::string::npos &&
+              unmeasured.find("\"low_1pct_fps\":null") != std::string::npos,
+              "an unmeasured run has no tail, spelled null");
 
         // A frozen title reaches the manifest through the same branch, which is the case the whole
         // `--` contract exists for.

@@ -8,13 +8,61 @@ Read the repository-root `CLAUDE.md` before this document. `CLAUDE.md` remains a
 verification, evidence, review, privacy, and release policy. This document explains how to apply those rules when
 several game agents work at once.
 
-The current title-wave checkpoint was refreshed **2026-10-01**. The named Lane A–F allocation and Wave 1/2 sections remain
+The current title-wave checkpoint was refreshed **2026-10-02**. The earlier title-wave checkpoint, named Lane A–F allocation and Wave 1/2 sections remain
 dated historical records; they retain valuable falsifications and apparatus lessons, but their ownership and
 "next assignment" text is not live. Update the checkpoint whenever an investigation materially moves, a PR merges,
 or ownership changes. Do not let this document replace issue comments: issues are the durable evidence log, while
 this document is the map that helps the next orchestrator find and interpret that evidence.
 
 ## Current checkpoint
+
+- Integration base: `d6b6bb2da4606008b2c1e52225606b07ae5b6e44` on `main`.
+- Acceptance still covers *Wolverine*, *007 First Light*, *Onimusha: Way of the Sword*,
+  *Hades II*, and *Silent Hill 2*: all five must reach a title screen with correct visual rendering.
+  **None has met that acceptance target.** *The Messenger* remains the user-confirmed interactive
+  control. Warnings, setup menus, host presentation counts and successful cleanup do not establish
+  a correctly rendered title screen.
+- The orchestrator retains merge ownership and rotates bounded investigations through the worker
+  slots. Authors keep their worktrees and artifacts isolated. Shared-machine configure/build/test
+  sequences and app/device runs require the canonical scheduling wrapper and an explicit named
+  resource grant; source preparation can continue while another lane holds the slot.
+
+| Title / owner | Tracker | Current evidence and next frontier |
+| --- | --- | --- |
+| Wolverine / Wolverine lane | [#4019](https://github.com/mattias800/prosper/issues/4019) | Semaphore fix [#4047](https://github.com/mattias800/prosper/pull/4047) is merged. Generic numeric FF1 support [#4063](https://github.com/mattias800/prosper/pull/4063), for [#4060](https://github.com/mattias800/prosper/issues/4060), remains unmerged. Historical source `17706dd0` passed 12 focused CPU checks and 62 Vulkan fixture checks; current `e585f068` author validation and mutation controls remain pending. The live source-register producer and the effect on Wolverine's shader refusal [#4036](https://github.com/mattias800/prosper/issues/4036) are unproved. No new game picture was captured. |
+| 007 First Light / 007 lane | [#4021](https://github.com/mattias800/prosper/issues/4021) | PlayGo [#4035](https://github.com/mattias800/prosper/pull/4035) and APR SDK inline-status layout [#4102](https://github.com/mattias800/prosper/pull/4102) are merged. A normal frozen `e46523a8` app ran for 30.36 seconds and reported 240 host presentations, but its native frame-120 capture was entirely black and failed `prerender_check` as FEATURELESS. No guest fault was retained; that does not identify or isolate the earlier writer. Capture the rejected vertex program and terminal PC before assigning a compiler fix. |
+| Onimusha: Way of the Sword / Onimusha lane | [#4022](https://github.com/mattias800/prosper/issues/4022) | Placement [#4046](https://github.com/mattias800/prosper/pull/4046) and null-thread join [#4057](https://github.com/mattias800/prosper/pull/4057) are merged. The last accepted frozen `a6d5e0fe` run opened its window, cleared the observed map/join faults, and presented zero frames. A bounded MultiDcbs submission ABI observation is prepared but has not run; live array/count/stream evidence is required before implementing that contract. |
+| Hades II / Hades lane | [#4023](https://github.com/mattias800/prosper/issues/4023) | CPU-mask [#4034](https://github.com/mattias800/prosper/pull/4034) and VideoOut resolution-prefix [#4058](https://github.com/mattias800/prosper/pull/4058) fixes are merged. The accepted frozen `366f0854` baseline opened a viewable black window, presented zero frames, and recorded 6,126 vertex-recompilation drops across the fired alarm windows. The window-before-guest candidate [#4098](https://github.com/mattias800/prosper/pull/4098) failed acceptance and was rejected and closed. Its cause remains unproved; [#4079](https://github.com/mattias800/prosper/issues/4079) stays open. |
+| Silent Hill 2 / Silent Hill lane | [#4024](https://github.com/mattias800/prosper/issues/4024) | Warning/setup screens and manual menu navigation remain the furthest visible evidence. Correct title/background rendering is unverified; the later GPU timeout is [#4025](https://github.com/mattias800/prosper/issues/4025). Targeted consumed-SMEM-word logging [#4118](https://github.com/mattias800/prosper/pull/4118), for [#4117](https://github.com/mattias800/prosper/issues/4117), is source-reviewed but unbuilt/unrun. It is an observation aid, not a dynamic-mip fix or evidence that LOD is zero. |
+
+The normal 007 observation used native SDL/X11 rendering, default FIFO and production memory
+settings, with fresh saves/config and no injected input. Audio/input backends were enabled, but
+audible game audio and responsive guest input were not verified. Its owned app exited after the
+deliberate budget stop and was reaped. [The tracker records the actual run and frame
+verdict](https://github.com/mattias800/prosper/issues/4021#issuecomment-5957102835). This was the
+frozen APR author app, not a runtime qualification of combined current main.
+
+The latest accepted Hades and Onimusha observations explicitly used a 1 GiB texture-cache cap and
+the test-only 8 GiB heap budget. Preserve that qualification: they are startup observations, not
+production-default memory or performance evidence. [The Hades baseline/candidate
+comparison](https://github.com/mattias800/prosper/issues/4023#issuecomment-5953176581) retains both
+outcomes; the failed ordering proposal must not be revived as an established cure.
+
+Hades and 007 both drop vertex draws at the recompiler refusal boundary. **One shared causal
+shader bug has not been demonstrated.** Historical Hades diagnostic PCs do not identify the
+current normal 007 failure. Join stage, program, terminal PC and complete code evidence before
+assigning a shared fix, and state any missing launch-mode/resource provenance.
+
+Windows and macOS remain excluded from this wave's merge gate by the maintainer's instruction;
+all other applicable checks still count. The original reviewer carries unchanged approval
+forward privately through corrections and main movement, reviews actual deltas, and registers
+one final exact-head verdict when author evidence and CI make the PR merge-ready. Avoid repeated
+intermediate public approvals and duplicate author test runs.
+
+## Earlier title-wave checkpoint (2026-10-01)
+
+The following records the earlier integration state and measurements. Its next assignments and
+frontier descriptions are historical; use the current checkpoint and the linked trackers above.
 
 - Integration base: `361336513e6a6aaab68140c26aa6b14ac4b2e03e` on `main`.
 - Current wave: *Wolverine*, *007 First Light*, *Onimusha: Way of the Sword*, *Hades II*, and

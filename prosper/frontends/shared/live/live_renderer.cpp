@@ -1,6 +1,7 @@
 // live_renderer.cpp — see live_renderer.hpp. Extracted from boot_trace's PROSPER_RENDER lambda
 // (behavior-preserving); Vulkan-backed, so this unit links Vulkan::Vulkan.
 #include "shared/live/live_renderer.hpp"
+#include "diagnostics/readback_refusal.hpp"
 #include "diagnostics/env_cache.hpp"   // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "diagnostics/env_numeric.hpp" // #3253: a typo must not select a different setting
 #include "gpu/resources/metadata_kind_correlation.hpp"  // positive metadata-kind correlation (pure, tested)
@@ -579,6 +580,7 @@ extern "C" int prosper_thread_in_renderer_callback(unsigned long native_tid) {
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested,
                             prosper::gpu::FragmentWavePolicy requested_wave_policy) {
+    prosper::diagnostics::readback_refusal::initialize();
     // Keep the legacy global disable authoritative for every frontend, including callers with their
     // own explicit opt-in such as PROSPER_APP_DUMP_FRAMES.
     const bool dump_bmps = frame_dump_request_allowed(
@@ -882,8 +884,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             if ((!surface.rgba || surface.rgba->size() != expected) && surface.gpu_valid) {
                 std::vector<uint8_t> materialized;
                 std::string error;
-                if (prosper::test::readback_persistent_color_target(
-                        addr, surface.w, surface.h, format, materialized, error) &&
+                const bool readback_ok = [&] {
+                    namespace refusal = prosper::diagnostics::readback_refusal;
+                    if (!refusal::selected(addr))
+                        return prosper::test::readback_persistent_color_target(
+                            addr, surface.w, surface.h, format, materialized, error);
+                    refusal::Record record{};
+                    record.context.caller = refusal::Caller::ComputeSnapshot;
+                    record.context.frontend_gpu_valid = surface.gpu_valid
+                        ? refusal::ObservedBool::Yes : refusal::ObservedBool::No;
+                    record.context.frontend_cpu_pixels = surface.rgba
+                        ? refusal::ObservedBool::Yes : refusal::ObservedBool::No;
+                    const bool result = prosper::test::readback_persistent_color_target(
+                        addr, surface.w, surface.h, format, materialized, error, 0, &record);
+                    refusal::emit(record);
+                    return result;
+                }();
+                if (readback_ok &&
                     materialized.size() == expected) {
                     surface.rgba = std::make_shared<const std::vector<uint8_t>>(
                         std::move(materialized));

@@ -1352,7 +1352,6 @@ bool append_import_data(const std::vector<ImportSlot>& slots, size_t first_new, 
     if (!g_data_stride) return fail("append_import_data before install_import_data");
     if (first_new > n || first_new != g_ndata)
         return fail("append_import_data: slot table is not an extension");
-    if (first_new == n) return true;
     const uint64_t mapped_end = page_up(g_ndata * g_data_stride);
     const uint64_t need_end   = page_up(n * g_data_stride);
     if (need_end > kImportDataApertureBytes) return fail("import data table exceeds its aperture");

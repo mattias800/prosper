@@ -494,8 +494,19 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   output capture fails, so redirect stdout **and** stderr to a file on the real disk, end with `exit 0`,
   read that file, and `rm -rf` scratch that is a day or more old. Leave `/tmp/claude-*` and anything
   touched in the last few hours alone — other agents are live.
-- **Python:** every new or changed Python tool needs a test that fails without the change, and a new
-  `.py` file needs a purpose docstring; ruff is gated on changed files only (`pyproject.toml`, uv).
+- **Behavior changes need meaningful regression coverage.** Add or extend a test that fails without
+  a behavioral bug fix, including verified review findings. New or changed HLE behavior needs
+  coverage for its established return codes and edge cases. Pure documentation and mechanical
+  changes use relevant checks when there is no behavior to assert; state the scope and any
+  verification limits in the PR. Never weaken an assertion to get green without explaining why.
+  Full rules: `prosper/tests/AGENTS.md`. PR descriptions may use
+  `.github/pull_request_template.md` (Context, Higher Goal, Acceptance Criteria, Out of Scope,
+  Summary of Changes, Verification), scaled to the change.
+  Optional project skills in `.claude/skills/`: `start-task` and `implement-hle-function`.
+  They preserve the task's existing authorization, resource coordination and machine-local rules.
+- **Python:** behavior changes need meaningful regression coverage, reusing applicable tests;
+  document mechanical scope and execution limits. New `.py` files need a purpose docstring;
+  ruff is gated on changed files only (`pyproject.toml`, uv).
   `prosper/tools/ci/AGENTS.md` § Python rule.
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth
   **only with `--no-tests=error`** — plain `ctest` on a build directory with nothing registered prints
