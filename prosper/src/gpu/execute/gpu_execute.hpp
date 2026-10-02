@@ -21,6 +21,7 @@
 #include <cstring>                 // memcpy: aliasing-safe index-buffer fingerprint loads
 #include "diagnostics/perf/perf_ledger.hpp"   // #3951: shader-recompile draw drops
 #include "gpu/recompiler/rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
+#include "gpu/recompiler/raster_quad_collector.hpp"
 #include "gpu/resources/shader_resources.hpp"    // ShaderResourceTable
 #include "gpu/resources/compressed_source_authority.hpp"  // CompressionMetadataKind
 #include "gpu/agc/agc_shader_layout.hpp"   // DecodedBufferDescriptor (DynFetch)
@@ -71,6 +72,8 @@ SharedShaderAnalysis acquire_shader_analysis(const uint32_t* code, size_t dwords
 // — e.g. Unity's background + composite, whose per-draw masks/blends/shaders differ — composites
 // correctly instead of collapsing onto a single draw. The tables may be null (color-only shaders).
 struct DrawItem {
+    // Development-activated real raster producer. No automatic fragment admission authority.
+    std::shared_ptr<RasterQuadCollection> raster_quads;
     std::vector<uint32_t> vs, gs, fs;                 // recompiled/generated SPIR-V
     // The live path can retain warm-cache shader modules by shared ownership instead of copying the
     // same SPIR-V words twice per draw (cache -> DrawItem -> BackendDraw). Capture/replay and direct
@@ -789,6 +792,7 @@ uint32_t fragment_consumed_attribute_mask_cached(const SharedShaderAnalysis& ana
 uint32_t fragment_color_export_mask_cached(const SharedShaderAnalysis& analysis);
 bool shader_analysis_has_prefix(const SharedShaderAnalysis& analysis,
                                 const uint32_t* words, size_t dwords);
+SharedShaderWords shader_analysis_owned_words(const SharedShaderAnalysis& analysis);
 
 // apply_fragment_consumption over the memoized mask. Honours PROSPER_NO_DEAD_VARYING_ELIM through
 // dead_varying_elimination_enabled(), so the live path and the uncached form cannot drift on the
@@ -3013,6 +3017,27 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.ps_float_flags = rs.ps_addr ? rs.ps_float_flags : FragmentFloatFlags{};
     out.ps_launch_rsrc1 = rs.ps_addr ? rs.ps_launch_rsrc1 : FragmentLaunchRsrc1{};
     out.float_transport = float_transport;
+    out.raster_quads.reset();
+    // Pin activation and producing inputs here, before the renderer can select a different phase.
+    // Analysis reuse off deliberately supplies no raw-version authority instead of rereading VA.
+    if (PROSPER_ENV_ON("PROSPER_FRAGMENT_QUAD_COLLECT")) {
+        auto inputs = std::make_shared<RasterQuadInputs>();
+        inputs->source_vs = out.vs_shared ? out.vs_shared :
+            std::make_shared<const std::vector<uint32_t>>(out.vs);
+        inputs->source_gs = std::make_shared<const std::vector<uint32_t>>(out.gs);
+        inputs->source_fs = out.fs_shared ? out.fs_shared :
+            std::make_shared<const std::vector<uint32_t>>(out.fs);
+        inputs->raw_code = shader_analysis_owned_words(fragment_analysis);
+        inputs->raw_matches_producing_source = bool(fragment_analysis) && !dcc_decompress;
+        inputs->has_pixel_inputs = out.has_pixel_inputs; inputs->pixel_inputs = out.pixel_inputs;
+        inputs->has_system_inputs = out.has_system_inputs; inputs->system_inputs = out.system_inputs;
+        inputs->interpolation = interpolation; inputs->launch = rs.ps_raster_launch;
+        inputs->generated_interpolation_geometry = !out.gs.empty() &&
+            interpolation.requires_geometry && !rect_list_synthesis;
+        inputs->float_transport = float_transport;
+        out.raster_quads = std::make_shared<RasterQuadCollection>();
+        out.raster_quads->inputs = std::move(inputs);
+    }
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for

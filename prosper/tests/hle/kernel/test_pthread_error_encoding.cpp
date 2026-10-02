@@ -667,7 +667,14 @@ int main() {
             // capability test — but it is still taken from the host, for the reason in the header.
             // Use a host-created worker: ASAN's thread-argument registry does not track the
             // primordial main thread. All self-join checks finish before the parent continues.
-            std::thread self_join_probe([sce_join, posix_join] {
+            //
+            // The parent must not START joining until the probe is done (#4043). Darwin's
+            // pthread_join answers EINVAL, not EDEADLK, for a thread that already has a joiner
+            // waiting on it -- it tests "joinable and unjoined" before "is the caller" -- so an
+            // immediate parent join() turned the host precondition into EINVAL on macOS. glibc
+            // tests self first, which is why the race was invisible on Linux.
+            std::atomic<bool> probe_done{false};
+            std::thread self_join_probe([sce_join, posix_join, &probe_done] {
                 char msg[224];
                 const int host_self_join = pthread_join(pthread_self(), nullptr);
                 if (host_self_join == 0) {
@@ -697,7 +704,9 @@ int main() {
                           "a REFUSED join leaves value_ptr untouched -- it used to be overwritten with "
                           "NULL, which a guest reads as a legitimate NULL exit value");
                 }
+                probe_done.store(true, std::memory_order_release);
             });
+            while (!probe_done.load(std::memory_order_acquire)) std::this_thread::yield();
             self_join_probe.join();
             char msg[224];
 
