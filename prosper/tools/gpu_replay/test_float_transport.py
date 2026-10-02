@@ -86,6 +86,12 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
     for failed in (False,True):
         path=directory/("explicit-nonfinite32"+("-failed" if failed else "")+".prgcap")
         data=path.read_bytes()
+        launch=b"\x01\x00\x00\x01"+struct.pack("<I",16<<12)
+        flags_tail=(struct.pack("<II",0,1)+launch if failed else
+                    struct.pack("<I",1)+launch+struct.pack("<I",0))
+        check(struct.unpack_from("<I",data,8)[0]==67 and data.endswith(flags_tail),"genuine independent v67 flags tail")
+        data=bytearray(data[:-len(flags_tail)])
+        struct.pack_into("<I",data,8,66)
         tail=(struct.pack("<III",0,0,1)+b"\x02"+struct.pack("<I",1)+b"\x00" if failed else
               struct.pack("<I",1)+b"\x02"+struct.pack("<II",0,0))
         check(struct.unpack_from("<I",data,8)[0]==66 and data.endswith(tail),"genuine v66 exact profile tail")
@@ -149,11 +155,11 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
             check(done.returncode==0 and stored.is_file(),state+" stored module remains usable offline")
             if stored.is_file(): check(facts(stored.read_bytes())[0] == (state!="explicit-nonfinite32"),
                                       state+" opposing stored capability is dormant producer authority")
-    original=(directory/"explicit-nonfinite32.prgcap").read_bytes(); start=len(original)-13
+    original=(directory/"explicit-nonfinite32.prgcap").read_bytes(); start=len(original)-16-13
     corrupt={"draw-count":original[:start]+struct.pack("<I",2)+original[start+4:],
              "draw-tag":original[:start+4]+b"\x03"+original[start+5:],
              "compute-count":original[:start+5]+struct.pack("<I",1)+original[start+9:],
-             "failure-count":original[:-4]+struct.pack("<I",1),
+             "failure-count":original[:start+9]+struct.pack("<I",1)+original[start+13:],
              "truncated":original[:-1],"trailing":original+b"\x00",
              "version-only65":original[:8]+struct.pack("<I",65)+original[12:]}
     for name,data in corrupt.items():

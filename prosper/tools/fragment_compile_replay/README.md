@@ -13,6 +13,20 @@ replayable; schema-1/2 absence is instead inspectable
 `INCOMPLETE fragment-transport-config-unavailable` and cannot enter the compiler. Neither profile
 nor SOURCE grants feature permission to a different executing Vulkan device.
 
+Schema 4 appends independently observed guest IEEE_MODE/DX10_CLAMP availability and values after
+the schema-3 host profile. An explicitly producing Unknown flag state is retained, not inferred
+from FLOAT_MODE or transport. Genuine schema-1/2/3 files remain inspectable; absent launch flags
+make replay INCOMPLETE (`fragment-float-flags-unavailable`, unless an earlier reason is retained).
+Frame capture v67 carries the same independent flag state for realized and failed draws.
+Both schema4 and v67 also retain the exact observed RSRC1_PS word with separate availability.
+It is producing evidence only, never a fallback for missing MODE/IEEE/DX10 or implicit FP16_OVFL
+authority, and is not passed as an unused numerical compiler argument. The actual key includes
+the word so a warm case cannot report another launch's otherwise unconsumed register bits.
+These flags do not describe FP16_OVFL, do not authorize host float features, and do not establish
+general guest arithmetic, half packing, or NaN-payload fidelity.
+This retention groundwork does not change emitted arithmetic. The numerical obligations in
+#4086/#4101/#4059/#4096 remain open; legacy operations are not renamed as semantic support.
+
 ```text
 fragment_compile_replay --inspect-only <CASE.prfc>
 fragment_compile_replay --baseline <CASE.prfc> --output <BASELINE.spv>

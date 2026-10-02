@@ -3,6 +3,7 @@
 // fallback for an unresolved id. This locks in stable ids, path dedup, valid colliding-id reads,
 // unique-size fallback, ambiguous fallback refusal, and truthful resolution-method diagnostics.
 #include <cstdio>
+#include <cstddef>
 #include <cstdint>
 #include <array>
 #include <cstdlib>
@@ -190,11 +191,13 @@ int main() {
     uint32_t fixture_id = prosper_apr_register(fixture_path, expected.size());
     std::array<uint8_t, 0x48> request{};
     std::array<uint64_t, 3> completion{};
+    completion.fill(~uint64_t{0});
     constexpr size_t read_offset = 41;
     constexpr size_t read_size = 73;
     std::array<uint8_t, 0x90> destination{};
     uint64_t result = read_file && stub_error.empty()
-        ? read_file_guest((uint64_t)(uintptr_t)request.data(), 0,
+        ? read_file_guest((uint64_t)(uintptr_t)request.data(),
+                          (uint64_t)(uintptr_t)(request.data() + 0x18),
                           (uint64_t)(uintptr_t)completion.data(), fixture_id,
                           (uint64_t)(uintptr_t)destination.data(), read_size,
                           read_offset, 0, 0)
@@ -366,16 +369,63 @@ int main() {
     }
 #endif
 
-    // Regression (Terminator 2D: NO FATE, PPSA25872, Unity IL2CPP): some titles pass the completion
-    // record INSIDE the request object — a2 = req+0x20, so the bytes-transferred slot a2+0x10 aliases
-    // req+0x30, a LIVE guest pointer the engine still uses. A live capture proved the bytes-
-    // transferred write clobbered it with the file size (9612 = 0x258c); the guest later freed
-    // 0x258c, and the next pop of that lock-free allocator freelist dereferenced 0x258c and SIGSEGV'd.
-    // The handler must NOT publish the byte count for this exact alternate record shape.
+    // #4044: SDK constructor/read wrappers forward two persistent qword slots at cb+0x18/+0x20
+    // in an independently allocated 0x28-byte object. The following qwords belong to its caller,
+    // not to a completion record. Diagnostic padding backs the existing 0x48-byte request log;
+    // it does not enlarge the SDK object. Both builders must deliver bytes without changing either
+    // adjacent canary. Before the fix, the shared helper zeros the first canary at out2+8.
+    struct SdkReadFixture {
+        std::array<uint64_t, 5> cb{};
+        std::array<uint64_t, 2> canaries{};
+        std::array<uint64_t, 2> diagnostic_padding{};
+    } sdk;
+    static_assert(offsetof(SdkReadFixture, canaries) == 0x28);
+    constexpr std::array<uint64_t, 2> sdk_canaries = {
+        0x123456789abcdef0ull, 0x0fedcba987654321ull
+    };
+    sdk.canaries = sdk_canaries;
+    sdk.cb[4] = ~uint64_t{0};
+    const uint64_t sdk_cb = (uint64_t)(uintptr_t)sdk.cb.data();
+    const uint64_t sdk_out1 = sdk_cb + 0x18, sdk_out2 = sdk_cb + 0x20;
+    std::array<uint8_t, 0x90> sdk_dst{};
+    uint64_t sdk_result = read_file && stub_error.empty()
+        ? read_file_guest(sdk_cb, sdk_out1, sdk_out2, fixture_id,
+                          (uint64_t)(uintptr_t)sdk_dst.data(), read_size, read_offset, 0, 0)
+        : ~uint64_t{0};
+    CHECK(sdk_result == 0 &&
+              std::memcmp(sdk_dst.data(), expected.data() + read_offset, read_size) == 0,
+          "SDK inline ReadFile delivers the requested destination bytes");
+    CHECK(sdk.cb[4] == (uint64_t)(uintptr_t)sdk_dst.data(),
+          "SDK inline ReadFile publishes its in-bounds data pointer");
+    CHECK(sdk.canaries == sdk_canaries,
+          "SDK inline ReadFile preserves both qwords after the 40-byte object");
+
+    HleFn gather_scatter = Hle::lookup("BVmR1H8l+XI");
+    CHECK(gather_scatter != nullptr, "AMPR gather-scatter HLE registered");
+    sdk.canaries = sdk_canaries;
+    sdk.cb[4] = ~uint64_t{0};
+    std::array<uint8_t, 0x90> sdk_segment_dst{};
+    sdk_segment_dst.fill(0xEE);
+    constexpr size_t segment_offset = read_offset + read_size;
+    uint64_t sdk_segment_result = gather_scatter
+        ? gather_scatter(sdk_cb, sdk_out1, sdk_out2,
+                         (uint64_t)(uintptr_t)sdk_segment_dst.data(), read_size, segment_offset)
+        : ~uint64_t{0};
+    CHECK(sdk_segment_result == 0 &&
+              std::memcmp(sdk_segment_dst.data(), expected.data() + segment_offset, read_size) == 0,
+          "SDK inline gather-scatter delivers the requested destination bytes");
+    CHECK(sdk.cb[4] == (uint64_t)(uintptr_t)sdk_segment_dst.data(),
+          "SDK inline gather-scatter publishes its in-bounds data pointer");
+    CHECK(sdk.canaries == sdk_canaries,
+          "SDK inline gather-scatter preserves both qwords after the 40-byte object");
+
+    // Preserve the existing #1107 count safeguard when only out2 is cb+0x20. Without the paired
+    // out1 this fixture remains an independent compatibility record, not the SDK object above.
     alignas(uint64_t) std::array<uint8_t, 0x48> req_overlap{};
     const uint64_t live_ptr = 0x2010216e00ull;                 // the guest's live req+0x30 pointer
     std::memcpy(req_overlap.data() + 0x30, &live_ptr, 8);
     uint64_t* record = reinterpret_cast<uint64_t*>(req_overlap.data() + 0x20);  // a2 == req+0x20
+    record[1] = ~uint64_t{0};
     uint32_t overlap_id = prosper_apr_register(fixture_path, expected.size());
     std::array<uint8_t, 0x90> overlap_dst{};
     uint64_t overlap_result = read_file && stub_error.empty()
@@ -389,22 +439,27 @@ int main() {
     CHECK(survived == live_ptr,
           "bytes-transferred write does not clobber the live req+0x30 pointer (Terminator 2D)");
     CHECK(record[0] == (uint64_t)(uintptr_t)overlap_dst.data() && record[1] == 0,
-          "overlapping record still publishes destination + success");
+          "unpaired cb+0x20 record retains destination + success publication");
 
     // Do not generalize the live observation into a guessed request-object extent. A caller may
     // place an ordinary three-qword completion record at another address within the storage it
     // passes as a0; a2 remains the authority for that output record.
     std::array<uint64_t, 9> embedded_request{};
+    embedded_request.fill(~uint64_t{0});
     uint64_t* embedded_record = embedded_request.data();
     std::array<uint8_t, 0x90> embedded_dst{};
     uint64_t embedded_result = read_file && stub_error.empty()
-        ? read_file_guest((uint64_t)(uintptr_t)embedded_request.data(), 0,
+        ? read_file_guest((uint64_t)(uintptr_t)embedded_request.data(),
+                          (uint64_t)(uintptr_t)embedded_request.data() + 0x18,
                           (uint64_t)(uintptr_t)embedded_record, overlap_id,
                           (uint64_t)(uintptr_t)embedded_dst.data(), read_size,
                           read_offset, 0, 0)
         : ~uint64_t{0};
-    CHECK(embedded_result == 0 && embedded_record[2] == read_size,
-          "ordinary embedded completion record still publishes byte count");
+    CHECK(embedded_result == 0 &&
+              std::memcmp(embedded_dst.data(), expected.data() + read_offset, read_size) == 0 &&
+              embedded_record[0] == (uint64_t)(uintptr_t)embedded_dst.data() &&
+              embedded_record[1] == 0 && embedded_record[2] == read_size,
+          "independent embedded completion retains destination, success, and byte count");
 
     std::remove(fixture_path);
     std::remove(collision_path);

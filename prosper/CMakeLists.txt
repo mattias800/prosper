@@ -772,6 +772,12 @@ if(TARGET prosper_core)
   # register_fn() call sites cannot see any of the three.
   add_executable(nid_census tools/nid_census/nid_census.cpp)
   target_link_libraries(nid_census PRIVATE prosper_core)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME nid_census_context COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_nid_census_context.py"
+      $<TARGET_FILE:nid_census>)
+    set_tests_properties(nid_census_context PROPERTIES TIMEOUT 60)
+  endif()
 
   add_executable(test_module tests/test_module.cpp)
   target_link_libraries(test_module PRIVATE prosper_core)
@@ -975,7 +981,9 @@ if(TARGET prosper_core)
   # the headroom cannot be checked without reddening the job first -- the #3208 defect (a threshold
   # whose margin nobody has measured recently) with the measurement one flag away.
   #
-  # The CI jobs re-run this label with `-V` after the suite, so every green log carries the figures.
+  # The CI jobs exclude this label from the parallel suite (`-LE timing-margin -j4`, so a margin is
+  # not measured beside other load) and run it serially with `-V` instead, so every log carries the
+  # figures.
   # `kernel_nanosleep` is deliberately NOT labelled: its wall-clock bounds are 500 ms order-of-
   # magnitude guards against a ~292-year sleep and it prints no measured value, so a verbose re-run
   # would report nothing. Add the label when a test both DEPENDS ON and PRINTS a margin.
@@ -1507,6 +1515,10 @@ if(TARGET prosper_core)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_schedstat_f8.py")
     add_test(NAME schedstat_probe_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_schedstat_probe.py")
+    # RUN_SERIAL: its fixture changes are wall-clock timers that must land inside a fixed sampling
+    # window, and under the CI's `ctest -j4` (#4116) they missed it on macOS and Windows in two
+    # different subtests while passing every serial run. A stopgap, NOT a fix -- #4142.
+    set_tests_properties(schedstat_probe_logic PROPERTIES RUN_SERIAL TRUE)
     add_test(NAME compare_capture_pair_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_capture_pair.py")
   endif()
@@ -2625,6 +2637,11 @@ endif()
   target_link_libraries(test_fragment_packet_wqm PRIVATE prosper_core)
   add_test(NAME fragment_packet_wqm_contract COMMAND test_fragment_packet_wqm)
   set_tests_properties(fragment_packet_wqm_contract PROPERTIES TIMEOUT 90)
+  add_executable(test_fragment_packet_mbcnt tests/gpu/recompiler/test_fragment_packet_mbcnt.cpp)
+  target_include_directories(test_fragment_packet_mbcnt PRIVATE tests)
+  target_link_libraries(test_fragment_packet_mbcnt PRIVATE prosper_core)
+  add_test(NAME fragment_packet_mbcnt_contract COMMAND test_fragment_packet_mbcnt)
+  set_tests_properties(fragment_packet_mbcnt_contract PROPERTIES TIMEOUT 90)
   set_tests_properties(portable_bpermute_contract PROPERTIES TIMEOUT 90)
 
   # #3713: a scalar branch may only be called workgroup-uniform when the value it compares is the
@@ -3024,6 +3041,12 @@ endif()
   add_executable(test_fragment_float_mode_capture tests/gpu/execute/test_fragment_float_mode_capture.cpp)
   target_link_libraries(test_fragment_float_mode_capture PRIVATE prosper_core)
   add_test(NAME fragment_float_mode_capture COMMAND test_fragment_float_mode_capture)
+  add_executable(test_fragment_float_flags tests/gpu/state/test_fragment_float_flags.cpp)
+  target_link_libraries(test_fragment_float_flags PRIVATE prosper_core)
+  add_test(NAME fragment_float_flags COMMAND test_fragment_float_flags)
+  add_executable(test_fragment_float_flags_key tests/gpu/execute/test_fragment_float_flags_key.cpp)
+  target_link_libraries(test_fragment_float_flags_key PRIVATE prosper_core)
+  add_test(NAME fragment_float_flags_key COMMAND test_fragment_float_flags_key)
   add_executable(test_float_transport_capture tests/gpu/execute/test_float_transport_capture.cpp)
   target_link_libraries(test_float_transport_capture PRIVATE prosper_core)
   add_test(NAME float_transport_capture COMMAND test_float_transport_capture)
@@ -4244,6 +4267,11 @@ endif()
                             PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME backend_persistent_resource_lock
                COMMAND test_backend_persistent_resource_lock)
+      # RUN_SERIAL: its non-vacuity arms REQUIRE the guarded threads to overlap, and under a
+      # parallel ctest (CI runs `-j4`) three neighbouring tests can starve them into running one
+      # after another -- "guarded threads really contended" then fails with no defect present
+      # (first `-j4` CI run, #4116). Alone, the contention it measures is its own.
+      set_tests_properties(backend_persistent_resource_lock PROPERTIES RUN_SERIAL TRUE)
 
       # #2944: every GPU readback in the render backend is host-read after a fence wait, and a fence
       # orders execution rather than performing the availability operation into the host domain.
@@ -5325,6 +5353,11 @@ if(WIN32 AND TARGET prosper_core)
     PROSPER_TEST_VP9_AU_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/vp9_testpattern.ivf"
     PROSPER_TEST_H264_BFRAMES_AU_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/h264_annexb_bframes.264")
   add_test(NAME video_media_foundation COMMAND test_video_mf)
+  # RUN_SERIAL: under the first parallel (`-j4`) CI run its forced-software H.264 pass produced 11
+  # pictures from 12 access units, after passing on every serial run. That looks like a real
+  # scheduling dependence in the Media Foundation drain (#4122), not a test artefact -- serial keeps
+  # CI from reddening every lane while it is diagnosed, and is NOT a fix for it.
+  set_tests_properties(video_media_foundation PROPERTIES RUN_SERIAL TRUE)
 
   # The join test_video_mf and test_videodec2_decode each stop short of: the guest's own Videodec2
   # lifecycle (CreateDecoder with codec 2382845, Decode, DeleteDecoder) on the real Media Foundation

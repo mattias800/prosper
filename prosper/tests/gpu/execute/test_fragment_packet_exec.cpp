@@ -1,6 +1,7 @@
 #include "fixtures/compute_runner.h"
 #include "fixtures/fragment_packet_fixture.hpp"
 #include "fixtures/fragment_packet_wqm_fixture.hpp"
+#include "fixtures/fragment_packet_mbcnt_fixture.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -135,7 +136,26 @@ int main() {
             scc ? "skipped_prior_scc_true" : "skipped_prior_scc_false");
     }
     check(wqm_ordinal == 95, "all64 WQM bits,24 source/destination,4 mask and3 SCC cases compiled");
-    check(dispatches == 122, "all24 good packets, live mutation,95 WQM and2 skipped WQM dispatched");
+    namespace m = prosper::test::fragment_packet::mbcnt;
+    uint32_t mbcnt_ordinal = 0;
+    for (const auto& c : m::cases()) {
+        const auto program = prosper::gpu::recompile_fragment_packet(m::packet(c),
+            {prosper::gpu::RecompileDiagnosticStage::Fragment, 0x41100000u + mbcnt_ordinal});
+        const std::string name = "mbcnt_" + std::to_string(mbcnt_ordinal++);
+        check(!program.spirv.empty() && program.rejection.empty(), name + " actual MBCNT guest emits");
+        if (!program.spirv.empty()) compare(execute(program), m::expected(c), name);
+    }
+    m::Case lo; lo.source = m::Source::Literal; lo.mask = UINT64_MAX;
+    auto hi = lo; hi.first_is_high = true;
+    const auto hi_program = prosper::gpu::recompile_fragment_packet(m::packet(hi));
+    check(!hi_program.spirv.empty() && hi_program.rejection.empty(), "legal original HI control emits");
+    if (!hi_program.spirv.empty()) {
+        const auto actual = execute(hi_program);
+        check(!actual.empty() && actual != m::expected(lo), "live guest LO-to-HI mutation rejects LO oracle");
+        compare(actual, m::expected(hi), "actual original HI control");
+    }
+    check(mbcnt_ordinal == 100, "all100 original owned MBCNT packets compiled");
+    check(dispatches == 223, "122 prior packet/WQM and101 actual MBCNT/control dispatches");
     std::printf("fragment_packet_exec: dispatches=%d checks=%d failures=%d "
                 "(owned packets only; no raster/game claim)\n", dispatches, checks, failures);
     return failures ? 1 : 0;
