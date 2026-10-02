@@ -250,7 +250,7 @@ def main() -> int:
             continue
         text = read_exact(new_path)
 
-        def fix(m: re.Match) -> str:
+        def fix(m: re.Match, old=old, new_path=new_path) -> str:
             nonlocal fixed_rel
             spelling = m.group(1)
             if not spelling.startswith((".", "/")) and "/" in spelling:

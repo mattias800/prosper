@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# findrefs.py <va_hex> — find e9 jumps, e8 calls, lea-rip refs and 8-byte pointer literals to a VA
-# anywhere in the DOLL eboot file (text VA0 @0x34050; rodata VA 0x669c000 @0x66e04d0; data VA
-# 0x8828000 @0x8871930 per the self_dump segment/phdr tables).
+"""findrefs.py <va_hex> — find e9 jumps, e8 calls, lea-rip refs and 8-byte pointer literals to a VA
+anywhere in the DOLL eboot file (text VA0 @0x34050; rodata VA 0x669c000 @0x66e04d0; data VA
+0x8828000 @0x8871930 per the self_dump segment/phdr tables).
+"""
 import sys
 import struct
 

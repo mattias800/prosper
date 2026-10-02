@@ -1,5 +1,6 @@
-# gdb -p PID -batch -x probe232x.py — issue #232: catch ProcessLoadedPackages (0x259f440)
-# on the flushing GameThread, capture this, dump loader state + all async packages.
+"""gdb -p PID -batch -x probe232x.py — issue #232: catch ProcessLoadedPackages (0x259f440)
+on the flushing GameThread, capture this, dump loader state + all async packages.
+"""
 import gdb
 import time
 

@@ -1,8 +1,9 @@
-# gdb -p PID -batch -x flow5.py — DOLL loading-progression diagnosis (diag/doll-loading-progression):
-# the game ticks its per-frame state fn eboot+0x5044740 (`this` + vtable call *0x288) forever on the
-# loading screen. Identify the ticked object (RTTI typename), the *0x288 target, diff the object's
-# fields across ~300 frames (what changes vs what is parked), and histogram the GameThread's RIP/RA
-# between frames to find the poll site.
+"""gdb -p PID -batch -x flow5.py — DOLL loading-progression diagnosis (diag/doll-loading-progression):
+the game ticks its per-frame state fn eboot+0x5044740 (`this` + vtable call *0x288) forever on the
+loading screen. Identify the ticked object (RTTI typename), the *0x288 target, diff the object's
+fields across ~300 frames (what changes vs what is parked), and histogram the GameThread's RIP/RA
+between frames to find the poll site.
+"""
 import gdb
 import time
 from collections import Counter
@@ -83,7 +84,7 @@ for t in inf.threads():
         break
 if t1 is None:
     t1 = inf.threads()[-1]
-for i in range(80):
+for _i in range(80):
     gdb.execute("continue &")
     time.sleep(0.04)
     gdb.execute("interrupt")

@@ -1113,6 +1113,15 @@ if(TARGET prosper_core)
   target_link_libraries(test_apr_equeue_completion PRIVATE prosper_core)
   add_test(NAME apr_equeue_completion COMMAND test_apr_equeue_completion)
 
+  # #3554: all three AMPR userdata registration routes and actual completion/accessor delivery.
+  # The legacy sizing route registers only on POSIX; Windows' size query is intentionally pure.
+  if(NOT WIN32)
+    add_executable(test_ampr_udata tests/hle/kernel/test_ampr_udata.cpp)
+    target_link_libraries(test_ampr_udata PRIVATE prosper_core)
+    add_test(NAME ampr_udata COMMAND test_ampr_udata)
+    set_tests_properties(ampr_udata PROPERTIES TIMEOUT 20)
+  endif()
+
   # Variadic libc formatters (issue #122): real va_list capture so %f/XMM + stack + %s-past-4th
   # args format correctly (was a 3-integer-register forward). Cross-platform (host libc printf).
   add_executable(test_printf tests/hle/test_printf.cpp)
@@ -1421,6 +1430,15 @@ if(TARGET prosper_core)
   add_executable(test_pthread_names tests/hle/test_pthread_names.cpp)
   target_link_libraries(test_pthread_names PRIVATE prosper_core)
   add_test(NAME pthread_names COMMAND test_pthread_names)
+
+  # The ScePthread handle a guest receives must be a readable object, identical across Create/Self,
+  # and validated on the way back in. A raw winpthreads index sent AC Black Flag Resynced's main
+  # thread into address 3 at eboot+0x161ed91.
+  add_executable(test_guest_thread_handle tests/hle/kernel/test_guest_thread_handle.cpp)
+  target_link_libraries(test_guest_thread_handle PRIVATE prosper_core)
+  target_include_directories(test_guest_thread_handle PRIVATE src)
+  add_test(NAME guest_thread_handle COMMAND test_guest_thread_handle)
+  set_tests_properties(guest_thread_handle PROPERTIES TIMEOUT 60)
 
   add_executable(test_cond_clock tests/hle/test_cond_clock.cpp)
   target_link_libraries(test_cond_clock PRIVATE prosper_core)

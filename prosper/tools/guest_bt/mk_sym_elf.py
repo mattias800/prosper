@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-# mk_sym_elf.py — turn a prosper-flattened guest module ELF (from tools/il2cpp/prx_to_elf.py,
-# which drops the section-header table so p_offset==p_vaddr) into one gdb can actually UNWIND and
-# SYMBOLICATE:
-#
-#   * a `.eh_frame` section header pointing at the module's real DWARF CFI (located through the
-#     PT_GNU_EH_FRAME / .eh_frame_hdr segment) — without a section named ".eh_frame" gdb never
-#     engages its DWARF unwinder, so `bt` stalls the moment frame pointers are absent (all of
-#     Unity/IL2CPP), and
-#   * an optional `.symtab` synthesised from an Il2CppDumper `script.json`, so every managed method
-#     shows up by name in `bt` for free (no post-processing).
-#
-# The input must already be flattened (prx_to_elf.py output): p_offset==p_vaddr, e_shoff==0.
-# Usage:
-#   python3 mk_sym_elf.py <flattened.elf> <out.elf> [--symbols script.json]
-#
-# Adding sections is append-only (segments/LOAD data are untouched), so the result still loads at
-# the same guest base via `add-symbol-file <out.elf> <base>`.
+"""mk_sym_elf.py — turn a prosper-flattened guest module ELF (from tools/il2cpp/prx_to_elf.py,
+which drops the section-header table so p_offset==p_vaddr) into one gdb can actually UNWIND and
+SYMBOLICATE:
+
+  * a `.eh_frame` section header pointing at the module's real DWARF CFI (located through the
+    PT_GNU_EH_FRAME / .eh_frame_hdr segment) — without a section named ".eh_frame" gdb never
+    engages its DWARF unwinder, so `bt` stalls the moment frame pointers are absent (all of
+    Unity/IL2CPP), and
+  * an optional `.symtab` synthesised from an Il2CppDumper `script.json`, so every managed method
+    shows up by name in `bt` for free (no post-processing).
+
+The input must already be flattened (prx_to_elf.py output): p_offset==p_vaddr, e_shoff==0.
+Usage:
+  python3 mk_sym_elf.py <flattened.elf> <out.elf> [--symbols script.json]
+
+Adding sections is append-only (segments/LOAD data are untouched), so the result still loads at
+the same guest base via `add-symbol-file <out.elf> <base>`.
+"""
 import struct
 import sys
 import json

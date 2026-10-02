@@ -1,4 +1,5 @@
-# gdb -p PID -batch -x dump_disp.py — dump the IoDispatcher state recorded in /root/disp.txt
+"""gdb -p PID -batch -x dump_disp.py — dump the IoDispatcher state recorded in /root/disp.txt
+"""
 import gdb
 gdb.execute("set pagination off")
 d = int(open("/root/disp.txt").read().strip(), 16)

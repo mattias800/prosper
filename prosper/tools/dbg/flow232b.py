@@ -1,5 +1,6 @@
-# gdb -p PID -batch -x flow232b.py — issue #232 session 6: probe fn eboot+0x5044740 entry.
-# Reads this (rdi), this+0x7c0 (movie obj), this+0x800 (media obj), then dumps this.
+"""gdb -p PID -batch -x flow232b.py — issue #232 session 6: probe fn eboot+0x5044740 entry.
+Reads this (rdi), this+0x7c0 (movie obj), this+0x800 (media obj), then dumps this.
+"""
 import gdb
 
 EBOOT = 0x400000000

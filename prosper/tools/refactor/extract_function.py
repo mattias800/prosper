@@ -376,7 +376,7 @@ def main() -> int:
     changes = applied["params"]["edit"].get("changes") or {}
     total = sum(len(v) for v in changes.values())
     print(f"  clangd produced {total} edit(s):")
-    for uri, edits in changes.items():
+    for _uri, edits in changes.items():
         for e in edits:
             txt = e["newText"]
             if txt.strip():
