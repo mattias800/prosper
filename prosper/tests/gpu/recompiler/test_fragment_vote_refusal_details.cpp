@@ -1,6 +1,7 @@
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include "../../fixtures/spirv_fragment_vote_fixtures.hpp"
+#include "../../fixtures/test_scratch.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -115,7 +116,8 @@ int main(int argc, char** argv) {
           "missing contract does not fabricate vote details");
 
     check(enabled() == !disabled, "ordinary and explicitly disabled observer modes are distinct");
-    FILE* captured = std::tmpfile();
+    FILE* captured = std::fopen(
+        prosper_test::test_scratch_file("fragment-vote-refusal-stderr.log").c_str(), "w+b");
     std::fflush(stderr);
     const int saved = detail_dup(detail_fileno(stderr));
     if (!captured || saved < 0 || detail_dup2(detail_fileno(captured), detail_fileno(stderr)) < 0) {

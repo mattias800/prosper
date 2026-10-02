@@ -3,6 +3,7 @@
 #include "fixtures/render_runner.h"
 #include "fixtures/spirv_fragment_vote_execution.hpp"
 #include "fixtures/spirv_fragment_vote_fixtures.hpp"
+#include "fixtures/test_scratch.h"
 #include <cstdio>
 #include <string>
 #ifdef _WIN32
@@ -74,7 +75,8 @@ int main() {
             clear &= pixels[i] == 0 && pixels[i + 1] == 0 && pixels[i + 2] == 255 && pixels[i + 3] == 255;
         check(clear, "actual refused draw preserves the backend clear rather than executing a narrow vote");
     };
-    FILE* captured = std::tmpfile();
+    FILE* captured = std::fopen(
+        prosper_test::test_scratch_file("fragment-vote-reporting-stderr.log").c_str(), "w+b");
     std::fflush(stderr);
     const int saved = reporting_dup(reporting_fileno(stderr));
     if (!captured || saved < 0 || reporting_dup2(reporting_fileno(captured), reporting_fileno(stderr)) < 0) {
