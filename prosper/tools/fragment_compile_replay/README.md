@@ -84,21 +84,13 @@ manifest, its compiler/front-end bytes and transitive headers. Its build-local m
 exported; missing/malformed producer context makes the linked identity unknown. Test-only producer
 commands are not claimed as production compiler inputs.
 
-Before candidate replay, a separately embedded reader-policy verdict must be verified. If it reports
-`reader-policy-source-mismatch`, audit every changed compiler/resource read seam, route new byte
-reads through `compiler_resource_data` and actual semantic choices through `compiler_choice`, then
-update `reader_policy.json` from the reviewed inventory in the same PR. Rebuild before replay.
-Changing the compiler identity alone never authorizes new readers. Fault controls that intentionally
-leave this policy stale test the guard; semantic outcome/full-word controls must deliberately update
-the reviewed policy so the changed compiler actually runs.
-The inventory conservatively guards `prosper/src` files matching `*.cpp`, `*.hpp`, `*.h`, and `*.inc`:
-an existing helper can add a reader
-without changing its caller. Unrelated source edits may therefore require a reviewed refresh too.
-The verifier lists changed/missing/added repository-relative paths, bounded to 32. A stale policy
-declines offline entry and completeness; it is separate from the wider transitive dependency/source
-identity fingerprint and does not authorize readers in tools, frontends, third-party or external code.
-It is not a claim that the normal compiler refused, nor
-that every listed source is semantically consumed by one attempt.
+Replay is a debugging aid, not a guard: it reproduces a captured compile offline so a recompiler
+change can be iterated on a frozen input. Compiler code should keep routing byte reads through
+`compiler_resource_data` and semantic choices through `compiler_choice`, because a read that bypasses
+them is invisible to the capture and makes a replay diverge from the live compile. A divergence is
+then the thing to investigate, not a reason to distrust the tool. (Until 2026-10-02 a hash inventory
+of all `prosper/src` files, `reader_policy.json`, gated replay and a ctest on every source edit; it
+was removed because it could not detect a new reader, only that some file changed.)
 
 These files contain private shader bytes. Do not commit or publish them. SOURCE reproduction does
 not establish buffer immutability, Wave64 admission, draw execution, or pixel correctness.

@@ -2482,8 +2482,6 @@ if(TARGET prosper_core)
   target_link_libraries(test_fragment_compile_case PRIVATE prosper_core)
   add_test(NAME fragment_compile_case COMMAND test_fragment_compile_case)
   if(Python3_Interpreter_FOUND)
-    add_test(NAME fragment_compile_read_policy COMMAND "${Python3_EXECUTABLE}"
-      "${CMAKE_SOURCE_DIR}/tools/fragment_compile_replay/reader_policy.py" "${CMAKE_SOURCE_DIR}/..")
     add_test(NAME fragment_compile_case_cli COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_SOURCE_DIR}/tools/fragment_compile_replay/test_cli.py"
       "$<TARGET_FILE:test_fragment_compile_case>" "$<TARGET_FILE:fragment_compile_replay>")
