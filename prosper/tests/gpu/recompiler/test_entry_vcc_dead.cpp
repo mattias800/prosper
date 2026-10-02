@@ -280,4 +280,15 @@ TEST(EntryVccDead, Contract) {
     CHECK(!dominated.empty() && has_opcode(dominated, kOpSwitch),
           "#2952: a successor-block define that DOMINATES every VCC read compiles, via the dispatcher");
 
+    if (::testing::Test::HasFailure()) {
+        printf("  [info] arm reject reason:           '%s'\n",
+               last_terminal_reject_reason(0x32310001ull).c_str());
+        printf("  [info] control A reject reason:     '%s'\n",
+               last_terminal_reject_reason(0x32310002ull).c_str());
+        printf("  [info] negative reject reason:      '%s'\n", negative_reason.c_str());
+        printf("  [info] half-pair reject reason:     '%s'\n",
+               last_terminal_reject_reason(0x32310004ull).c_str());
+        printf("  [info] late-define reject reason:   '%s'\n",
+               last_terminal_reject_reason(0x32310005ull).c_str());
+    }
 }
