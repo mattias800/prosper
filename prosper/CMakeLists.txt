@@ -772,6 +772,12 @@ if(TARGET prosper_core)
   # register_fn() call sites cannot see any of the three.
   add_executable(nid_census tools/nid_census/nid_census.cpp)
   target_link_libraries(nid_census PRIVATE prosper_core)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME nid_census_context COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_nid_census_context.py"
+      $<TARGET_FILE:nid_census>)
+    set_tests_properties(nid_census_context PROPERTIES TIMEOUT 60)
+  endif()
 
   add_executable(test_module tests/test_module.cpp)
   target_link_libraries(test_module PRIVATE prosper_core)
