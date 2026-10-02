@@ -12,6 +12,10 @@ GPU arm observes only private pre-depth/pre-guest-PS raster-input records, inclu
 covered status and per-primitive overlap. The CAS budget controls discard whole incomplete batches.
 No observed varying is labeled MUST-defined guest state, and neither append order nor the supplied
 fullscreen fixture demonstrates PS5 Wave64 raster packing or ordered attachment commit.
+The realized smooth and explicit-parameter programs export an owned per-vertex varying; all covered
+Interpolant/Parameter/SystemInterpolation record words have an independent clip-vertex/barycentric
+oracle. Helper values remain raw observations without numeric guest authority. The separate
+presence-zero empty-scissor case must refuse rather than collect different effective raster state.
 
 `test_graphics_raw_wide_upload` registers owned synthetic AGC programs, realizes their real graphics
 tables, and checks numeric raw x4/x8 uploads and descriptor-only consumers in both stages. Its

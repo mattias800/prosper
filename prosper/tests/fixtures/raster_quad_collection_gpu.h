@@ -2,6 +2,29 @@
 // This input-only pass does not bind a guest color/depth image, clear an attachment, or execute PS.
 #pragma once
 
+inline bool raster_quad_raster_state_overridden() {
+    // These are presence switches in the selected normal renderer, including the value "0".
+    // Refuse rather than collect raw guest state while the normal path executes a different state.
+    return PROSPER_ENV_ON("PROSPER_NO_CULL") || PROSPER_ENV_ON("PROSPER_FLIP_FRONT_FACE") ||
+           PROSPER_ENV_ON("PROSPER_NO_DEPTH_BIAS") || PROSPER_ENV_ON("PROSPER_IGNORE_EMPTY_SCISSOR");
+}
+
+inline const char* raster_quad_descriptor_limits(const VkPhysicalDeviceLimits& limits,
+                                                uint64_t vertex_storage_buffers) {
+    // Set0 is the exact read-only VS buffer inventory; Set1 has one fragment-only collector SSBO.
+    // Geometry is descriptor-free. Validate API limits BEFORE creating either layout or pipeline.
+    if (limits.maxBoundDescriptorSets < 2) return "quad-collector-descriptor-set-limit";
+    if (limits.maxPerStageDescriptorStorageBuffers < 1 ||
+        vertex_storage_buffers > limits.maxPerStageDescriptorStorageBuffers)
+        return "quad-collector-per-stage-storage-limit";
+    if (limits.maxPerStageResources < 1 || vertex_storage_buffers > limits.maxPerStageResources)
+        return "quad-collector-per-stage-resource-limit";
+    if (limits.maxDescriptorSetStorageBuffers < 1 ||
+        vertex_storage_buffers > uint64_t(limits.maxDescriptorSetStorageBuffers) - 1)
+        return "quad-collector-aggregate-storage-limit";
+    return nullptr;
+}
+
 inline bool raster_quad_pre_raster_readonly(const std::vector<uint32_t>& words) {
     using namespace prosper::gpu;
     const auto report = validate_spirv_descriptor_interface(words, nullptr, 0, SpirvShaderStage::Unknown, false);
@@ -151,8 +174,7 @@ inline void collect_backend_raster_quads(const RenderVkCtx& ctx, const BackendDr
         return refuse("quad-collector-enabled-device-features-unavailable");
     if (!ctx.float_transport.explicit_nonfinite32())
         return refuse("quad-collector-enabled-transport-unavailable");
-    if (PROSPER_ENV_ON("PROSPER_NO_CULL") || PROSPER_ENV_ON("PROSPER_FLIP_FRONT_FACE") ||
-        PROSPER_ENV_ON("PROSPER_NO_DEPTH_BIAS"))
+    if (raster_quad_raster_state_overridden())
         return refuse("quad-collector-raster-state-override");
     if (!draw.ps || draw.mesh_draw || draw.instance_count != 1 ||
         draw.ps->topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || draw.ps->polygon_mode != VK_POLYGON_MODE_FILL)
@@ -206,6 +228,8 @@ inline void collect_backend_raster_quads(const RenderVkCtx& ctx, const BackendDr
     uint64_t vertex_bytes = 0;
     if (reflected.descriptors.size() > 32)
         return refuse("quad-collector-vertex-buffer-budget");
+    if (const char* limit = raster_quad_descriptor_limits(ctx.detile_limits, reflected.descriptors.size()))
+        return refuse(limit);
     for (const auto& binding : reflected.descriptors) {
         if (binding.set != 0 || binding.descriptor_count != 1)
             return refuse("quad-collector-vertex-descriptor-layout-unimplemented");
