@@ -107,6 +107,45 @@ void verdict_arithmetic() {
           "...and the report says so");
 }
 
+// The id counter wraps from kBreadcrumbMaxId back to 1, after which the NEWEST id is numerically the
+// SMALLEST. Comparing ids with `>` or std::max then reads a healthy run as corrupt and picks the OLD
+// checkpoint as the latest. Started three below the maximum, so the sequence crosses the wrap:
+// ids M-2, M-1, M, 1, 2 for draw indexes 0..4.
+void wraparound() {
+    constexpr uint32_t M = kBreadcrumbMaxId;
+    BreadcrumbTable table(M - 2);
+    std::vector<uint32_t> ids;
+    for (uint32_t i = 0; i < 5; ++i) ids.push_back(table.begin_site(site(3, 0, i)));
+    CHECK(ids[0] == M - 2 && ids[2] == M && ids[3] == 1 && ids[4] == 2,
+          "the counter wraps from the maximum id to 1, never issuing 0");
+    using State = BreadcrumbVerdict::State;
+
+    // Started id 2 (draw 4), finished id M-1 (draw 1): sites M, 1, 2 are in flight, a window of THREE
+    // even though 2 < M-1 numerically.
+    BreadcrumbVerdict v = resolve_breadcrumbs(table, 2, breadcrumb_after_value(M - 1));
+    CHECK(v.state == State::in_flight && v.window_sites == 3,
+          "across the wrap, started 2 / finished M-1 is a window of THREE, not corruption");
+    CHECK(v.first_unfinished_known && v.first_unfinished.draw_index == 2 &&
+              v.last_started.draw_index == 4,
+          "...from the site with id M (draw 2) through id 2 (draw 4)");
+
+    v = resolve_breadcrumbs(table, 1, breadcrumb_after_value(M));
+    CHECK(v.state == State::in_flight && v.window_sites == 1 && v.first_unfinished.draw_index == 3,
+          "started 1 / finished M: exactly one site in flight, the first after the wrap");
+
+    v = resolve_breadcrumbs(table, M - 1, breadcrumb_after_value(2));
+    CHECK(v.state == State::inconsistent,
+          "a finished marker far AHEAD of the started one is still inconsistent across the wrap");
+
+    // A checkpoint SET spanning the wrap: the latest before is id 1 (after M), not M.
+    const uint32_t values[] = {breadcrumb_before_value(M), breadcrumb_before_value(1),
+                               breadcrumb_after_value(M - 1), breadcrumb_after_value(M)};
+    uint32_t started = 0, finished = 0;
+    reduce_checkpoint_values(values, 4, started, finished);
+    CHECK(started == 1 && finished == breadcrumb_after_value(M),
+          "checkpoint reduction picks the latest id around the ring, not the numerically greatest");
+}
+
 void checkpoint_reduction() {
     const uint32_t values[] = {breadcrumb_before_value(7), breadcrumb_after_value(5),
                                breadcrumb_before_value(6), breadcrumb_after_value(4), 0};
@@ -287,6 +326,7 @@ void support_selection() {
 int main() {
     std::printf("== ids and ring ==\n");               ids_and_ring();
     std::printf("== verdict arithmetic ==\n");         verdict_arithmetic();
+    std::printf("== id wraparound ==\n");              wraparound();
     std::printf("== checkpoint reduction ==\n");       checkpoint_reduction();
     std::printf("== report text ==\n");                report_text();
     std::printf("== inactive emitter ==\n");           inactive_emitter_does_nothing();
