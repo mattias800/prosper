@@ -44,10 +44,12 @@ static int fails = 0;
 struct KEvent { int64_t ident; int16_t filter; uint16_t flags; uint32_t fflags; int64_t data; uint64_t udata; };
 static_assert(sizeof(KEvent) == 0x20, "SceKernelEvent must be 0x20 bytes");
 
-// The APR completion filter the backend posts (EVFILT_AMPR_MODELED). The guest never reads it;
-// asserting it here is what proves the counted entries are APR completions and not some other
-// source that merely happened to raise the queue depth.
-static constexpr int16_t kAprFilter = -24;
+// The APR completion filter the backend posts (SCE_KERNEL_EVFILT_AMPR, -25). Some guests read it:
+// Black Flag Resynced's completion consumer dispatches on filter == 0xffe7 and ignores every other
+// event, so the exact value is part of the contract (#4139). Asserting it here is also what proves
+// the counted entries are APR completions and not some other source that merely happened to raise
+// the queue depth.
+static constexpr int16_t kAprFilter = -25;
 
 // Drain whatever is queued so each scenario starts from an empty queue.
 static void drain(HleFn wait, uint64_t eq) {
@@ -167,6 +169,36 @@ int main() {
         settle();
         const uint64_t n = getcount(eq, 0, 0, 0, 0, 0);
         CHECK(n == 2, "pointer-dialect (id==0) completions remain individually delivered");
+        drain(wait, eq);
+    }
+
+    // --- Black Flag Resynced's shape: id != 0 with a HEAP-POINTER tag. ----------------------------
+    // Its IOComplete consumer reads event.data as the request pointer and filter as 0xffe7. Two
+    // outstanding requests must arrive as two events, each carrying ITS OWN pointer: treating the
+    // pointer as a counter would coalesce them and deliver the high-water mark (the other request).
+    {
+        const uint64_t cb7 = 0x205df97000ull, cb8 = 0x205df97028ull;
+        constexpr uint64_t kPtrA = 0x4080041240ull, kPtrB = 0x4080052380ull;
+        addampr(eq, 1, 0, 0, 0, 0);
+        bind(cb7, eq, /*id=*/1, /*tag=*/kPtrA, 0, 0);
+        bind(cb8, eq, /*id=*/1, /*tag=*/kPtrB, 0, 0);
+        submit(cb7, 1, 0, 0, 0, 0);
+        submit(cb8, 1, 0, 0, 0, 0);
+        settle();
+        const uint64_t n = getcount(eq, 0, 0, 0, 0, 0);
+        CHECK(n == 2, "id != 0 pointer-tag completions are individually delivered, not coalesced");
+        std::vector<KEvent> ev(128);
+        int32_t out = -1; uint32_t cap = 1000;
+        wait(eq, (uint64_t)(uintptr_t)ev.data(), ev.size(), (uint64_t)(uintptr_t)&out,
+             (uint64_t)(uintptr_t)&cap, 0);
+        bool a = false, b = false, filt = out == 2;
+        for (int i = 0; i < out && i < 2; i++) {
+            a |= (uint64_t)ev[i].data == kPtrA;
+            b |= (uint64_t)ev[i].data == kPtrB;
+            filt &= (uint16_t)ev[i].filter == 0xffe7;
+        }
+        CHECK(a && b, "each pointer-tag event carries its own request pointer in data");
+        CHECK(filt, "the posted filter is 0xffe7 (-25), the value the guest dispatches on");
         drain(wait, eq);
     }
 

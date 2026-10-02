@@ -1208,7 +1208,7 @@ namespace {
                     // noise; for a COUNTED completion source it is a lost wakeup, and this is the only
                     // place that can see it — by the time a consumer notices, the evidence is a thread
                     // blocked in WaitEqueue with nothing to say why. Printed with ident/filter so the
-                    // APR completion filter (-24) is separable from the 60 Hz pump. Same gate as every
+                    // APR completion filter (-25) is separable from the 60 Hz pump. Same gate as every
                     // other producer here, so the count can never be an unarmed zero.
                     if (evlog() && e.filter != -7 && e.filter != -15)
                         fprintf(stderr, "[ev] coalesce-replace eq=0x%llx ident=%lld filter=%d "
@@ -1779,7 +1779,12 @@ HLE(k_eq_getcount){
 uint64_t prosper_eq_apr_udata(uint64_t eq, int64_t id);   // defined below, with the registry
 
 namespace {
-    constexpr int16_t EVFILT_AMPR_MODELED = -24;   // guest never reads filter; distinct on purpose
+    // SCE_KERNEL_EVFILT_AMPR. The guest DOES read it on some titles: Assassin's Creed Black Flag
+    // Resynced's IOCompleteEventQueue consumer (eboot+0xacb370) dispatches on `filter == 0xffe7`
+    // (-25) and treats every other APR event as not its own, so a completion posted with any other
+    // filter was dropped and the title's boot stalled with every thread idle. The value was -24
+    // while the guest was assumed never to read it; -25 also matches a secondary implementation.
+    constexpr int16_t EVFILT_AMPR = -25;
     // udata is the guest's own pointer, handed to sceKernelAddAmprEvent and handed BACK on every
     // completion event through sceKernelGetEventUserData. It is not decoration: NINJA GAIDEN 4's
     // Wwise I/O hook dereferences it directly (`call sceKernelGetEventUserData; mov edi,[rax]` at
@@ -1804,7 +1809,7 @@ namespace {
     }
     void apr_post(uint64_t eq, uint64_t eq_identity, int64_t id,
                   unsigned ring, uint64_t token, bool coalesce, uint64_t udata) {   // no APR lock held
-        SceKEvent e{}; e.ident = id + (int64_t)ring; e.filter = EVFILT_AMPR_MODELED;
+        SceKEvent e{}; e.ident = id + (int64_t)ring; e.filter = EVFILT_AMPR;
         e.data = (int64_t)token; e.udata = udata;
         eq_post(eq, e, coalesce, eq_identity);
     }
@@ -1866,7 +1871,7 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
                 struct timespec ts{ 0, 2000000 };   // 2 ms modeled DMA latency (as the #208 path)
                 nanosleep(&ts, nullptr);
                 for (auto& p : batch) {
-                    SceKEvent e{}; e.ident = 0; e.filter = EVFILT_AMPR_MODELED; e.data = (int64_t)p.token;
+                    SceKEvent e{}; e.ident = 0; e.filter = EVFILT_AMPR; e.data = (int64_t)p.token;
                     // Both dialects hand the udata back; the guest reads it through the same
                     // accessor regardless of which one delivered the event.
                     e.udata = prosper_eq_apr_udata(p.eq, 0);
@@ -1916,7 +1921,12 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
     // CONFIDENCE: HIGH on the CRI half (guest disassembly for the zero tag and the ident-only
     // waiter, plus the live token census above); HIGH that the counter dialect is untouched (the
     // predicate is false for every token it can produce).
-    const bool counter_dialect = cnt != 0;
+    // A pointer-sized tag is a REQUEST POINTER, not a counter, whatever the id (Black Flag Resynced
+    // binds with id=1 and a heap pointer tag; its consumer dereferences event.data as the request,
+    // eboot+0xacb3da). Counters are dense from 1000 upward, so anything >= 2^32 is a pointer. Such a
+    // tag must be delivered exactly and individually: coalescing it, or replacing it with the ring's
+    // high-water mark, hands the guest some OTHER request's pointer.
+    const bool counter_dialect = cnt != 0 && cnt < (1ull << 32);
     const uint64_t hwm_key = apr_hwm_key(eq_identity, ring);
     {
         AprTokenState& state = apr_token_state();
@@ -1928,7 +1938,7 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
     // interleaving of a multi-threaded log, which silently mis-attributes every post.
     if (evlog()) fprintf(stderr, "[ev] AprTagComplete token=0x%llx (ring=%u id=%lld) -> eq=0x%llx scheduled\n",
                          (unsigned long long)token, ring, (long long)id, (unsigned long long)eq);
-    std::thread([eq, eq_identity, id, ring, hwm_key, counter_dialect] {
+    std::thread([eq, eq_identity, id, ring, hwm_key, counter_dialect, token] {
         struct timespec ts{ 0, 2000000 };   // 2 ms
         nanosleep(&ts, nullptr);
         uint64_t hwm;
@@ -1938,7 +1948,7 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
             hwm = state.tag_hwm[hwm_key];
         }
         // Resolved BEFORE the post, not inside it: apr_post runs with no APR lock held on purpose.
-        apr_post(eq, eq_identity, id, ring, ((uint64_t)ring << 58) | hwm, counter_dialect,
+        apr_post(eq, eq_identity, id, ring, counter_dialect ? (((uint64_t)ring << 58) | hwm) : token, counter_dialect,
                  prosper_eq_apr_udata(eq, id));
     }).detach();
 }
