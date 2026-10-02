@@ -26,6 +26,10 @@ usage, whether a PR is safe to merge.
   `gh pr edit --body-file` has been seen returning rc=1 on a GraphQL projects-deprecation error
   *without applying the edit* (#2918), so `set` writes over REST and then re-reads the live body;
   the verdict is always the read-back, never the write's exit code.
+- **`ratchet_hook.py`** — the Claude Code PreToolUse hook (`.claude/settings.json`, Bash and
+  PowerShell) that runs `check_arch_ratchet.py` before `git commit` / `git push`. It blocks only on
+  a reported violation; a missing checker, an exit 2 or a missing interpreter fails open with a
+  visible `ratchet UNVERIFIED` message. CI remains the gate.
 
 ## Secret scan (`.github/workflows/gitleaks.yml`, `.github/gitleaks.toml`)
 

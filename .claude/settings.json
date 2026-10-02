@@ -10,6 +10,18 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "h=\"${CLAUDE_PROJECT_DIR}/prosper/tools/ci/ratchet_hook.py\"; [ -f \"$h\" ] || exit 0; in=$(cat); case \"$in\" in *git*) ;; *) exit 0 ;; esac; for p in python3 python py; do if command -v \"$p\" >/dev/null 2>&1; then printf '%s' \"$in\" | \"$p\" \"$h\"; r=$?; [ \"$r\" -eq 0 ] && exit 0; [ \"$r\" -eq 2 ] && exit 2; fi; done; echo '{\"systemMessage\":\"ratchet UNVERIFIED: could not start python3, python or py; the architecture ratchet did not run\"}'; exit 0",
+            "timeout": 60
+          }
+        ]
+      }
     ]
   }
 }
