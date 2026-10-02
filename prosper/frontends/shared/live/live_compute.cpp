@@ -482,6 +482,7 @@ std::atomic<bool> g_fail_next_storage_readback_for_test{false};
 std::function<void(uint32_t, const uint8_t*, size_t)> g_image_readback_observer_for_test;
 std::function<void()> g_before_image_publish_observer_for_test;
 std::atomic<bool> g_fail_next_buffer_readback_for_test{false};
+std::atomic<bool> g_fail_next_indirect_readback_for_test{false};
 std::atomic<bool> g_leave_next_dcc_metadata_compressed_for_test{false};
 std::atomic<bool> g_disable_next_dcc_allocation_reuse_for_test{false};
 std::atomic<bool> g_limit_next_image_replacement_for_test{false};
@@ -12781,13 +12782,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             break;
         }
         completion_proven = true;
-        // #3656: report a launch the validation pass refused. This runs after the fence the
-        // dispatch already waits on and reads four host-coherent words; it informs the log and the
-        // counter and is never an input to what was dispatched.
+        // #3656: the completed scratch result decides refusal/no-op/writeback, not just diagnostics.
+        // Failure to read it cannot authorize publication or reconstruct an already-issued launch
+        // from mutable guest arguments. Completion stays proven, but failure cleanup must invalidate
+        // retained output authority and the caller must poison the producer epoch.
         if (device_indirect) {
             void* mapped = nullptr;
-            if (ctx.map_memory(ctx.indirect_scratch_memory, 0,
-                               IndirectDispatchValidator::kRecordBytes, &mapped) == VK_SUCCESS) {
+            const VkResult readback_result =
+                g_fail_next_indirect_readback_for_test.exchange(false, std::memory_order_acq_rel)
+                    ? VK_ERROR_MEMORY_MAP_FAILED
+                    : ctx.map_memory(ctx.indirect_scratch_memory, 0,
+                                     IndirectDispatchValidator::kRecordBytes, &mapped);
+            if (vk_ok(readback_result, "indirect-argument-readback")) {
                 uint32_t record[8] = {};
                 std::memcpy(record, mapped, sizeof(record));
                 ctx.unmap_memory(ctx.indirect_scratch_memory);
@@ -12823,6 +12829,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     std::fprintf(stderr, "[compute]   indirect groups=%ux%ux%u (device-resolved)\n",
                                  record[0], record[1], record[2]);
                 }
+            } else {
+                break;
             }
         }
         if (ledger_gpu_timing) {
@@ -14757,6 +14765,11 @@ LiveComputeStorageImageDevice live_compute_storage_image_device() {
     return mutable_storage_image_device();
 }
 
+std::array<uint32_t, 3> live_compute_workgroup_count_limits_for_test() {
+    const auto* context = g_live_compute_context.load(std::memory_order_acquire);
+    return context ? context->max_compute_workgroup_count : std::array<uint32_t, 3>{};
+}
+
 uint64_t live_compute_sampled_image_upload_skips() {
     return g_sampled_image_upload_skips.load(std::memory_order_relaxed);
 }
@@ -14818,6 +14831,14 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 
 void live_compute_fail_next_buffer_readback_for_test() {
     g_fail_next_buffer_readback_for_test.store(true, std::memory_order_release);
+}
+
+void live_compute_fail_next_indirect_readback_for_test() {
+    g_fail_next_indirect_readback_for_test.store(true, std::memory_order_release);
+}
+
+bool live_compute_indirect_readback_fault_pending_for_test() {
+    return g_fail_next_indirect_readback_for_test.load(std::memory_order_acquire);
 }
 
 void live_compute_set_image_readback_observer_for_test(

@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -216,6 +217,20 @@ int main() {
               "the consumer launched the GPU's x=2 (128 records), not the guest's wrong x=7");
     }
 
+    const auto device_limits = prosper::frontend::live_compute_workgroup_count_limits_for_test();
+    const bool limits_observed = std::all_of(device_limits.begin(), device_limits.end(),
+                                           [](uint32_t limit) { return limit != 0; });
+    CHECK(limits_observed, "observe the selected device's limits before deciding expected launches");
+    if (!limits_observed) return 1;
+    std::printf("  device workgroup-count limits: %u x %u x %u\n",
+                device_limits[0], device_limits[1], device_limits[2]);
+    std::array<uint32_t, 4> excessive_counts{1, 1, 1, 0};
+    const auto excessive_axis = std::find_if(device_limits.begin(), device_limits.end(),
+        [](uint32_t limit) { return limit != std::numeric_limits<uint32_t>::max(); });
+    const bool excessive_representable = excessive_axis != device_limits.end();
+    if (excessive_representable)
+        excessive_counts[excessive_axis - device_limits.begin()] = *excessive_axis + 1u;
+
     // ---- Arm 2: nonzero buffer offsets -------------------------------------------------------------
     {
         const Counters before = counters();
@@ -286,9 +301,9 @@ int main() {
     }
 
     // ---- Arm 6: a device-produced count above the device limit is refused, not launched -----------
-    {
+    if (excessive_representable) {
         const Counters before = counters();
-        std::vector<ComputeItem> items = {producer({0xFFFFFFFFu, 1, 1, 0}, 0x36560070u),
+        std::vector<ComputeItem> items = {producer(excessive_counts, 0x36560070u),
                                           consumer(args_base, 0x36560071u)};
         reset_output(out);
         const std::vector<bool> ran = run_submit(items);
@@ -303,10 +318,9 @@ int main() {
     }
 
     // ---- Arm 6b: the limit is per AXIS ------------------------------------------------------------
-    {
-        // y = 65536 is above the 65535 that devices advertise for y, so it is refused even though
-        // x = 1 is in range.
-        std::vector<ComputeItem> items = {producer({1, 65536, 1, 0}, 0x36560072u),
+    if (device_limits[1] != std::numeric_limits<uint32_t>::max()) {
+        // Derive an actually illegal Y count from this device, not the portable minimum.
+        std::vector<ComputeItem> items = {producer({1, device_limits[1] + 1u, 1, 0}, 0x36560072u),
                                           consumer(args_base, 0x36560073u)};
         reset_output(out);
         const Counters before = counters();
@@ -316,25 +330,23 @@ int main() {
               "y above its own axis limit is refused even though x=1 is within range");
     }
     {
-        // x = 70000 is above the portable 65535 but legal on a device whose X limit is larger
-        // (NVIDIA, RADV advertise far more). One shared min-of-axes limit would refuse it. The
-        // property holds on every device: either the launch is refused and NOTHING is written, or
-        // it runs and writes the whole output -- never a partial or silently zeroed success.
+        // The expected outcome comes from the property query, never the backend's rejection counter.
+        // A shared min-of-axes limit must fail this arm when the actual X limit admits 70000.
+        const bool expected_refusal = 70000u > device_limits[0];
         std::vector<ComputeItem> items = {producer({70000, 1, 1, 0}, 0x36560074u),
                                           consumer(args_base, 0x36560075u)};
         reset_output(out);
         const Counters before = counters();
         const std::vector<bool> ran = run_submit(items);
         const Counters after = counters();
-        const bool refused = after.rejected == before.rejected + 1;
-        CHECK(ran.size() == 2 && ran[0] && ran[1] != refused,
-              "an x count between 65535 and the device's x limit is either refused or run, "
-              "and the result says which");
-        CHECK(refused ? output_matches(out, 0, kConsumerPattern)
-                      : output_matches(out, kOutputBytes / 16, kConsumerPattern),
-              refused ? "refused on this device: nothing was written"
-                      : "legal on this device (x limit above 65535): the whole output was written");
-        std::printf("  note: x=70000 was %s on this device\n", refused ? "refused" : "run");
+        CHECK(ran.size() == 2 && ran[0] && ran[1] == !expected_refusal &&
+                  after.device == before.device + 1 &&
+                  after.rejected == before.rejected + (expected_refusal ? 1u : 0u),
+              "x=70000 matches the independently observed X limit");
+        CHECK(output_matches(out, expected_refusal ? 0 : kOutputBytes / 16, kConsumerPattern),
+              "the independent limit expectation determines all output words and canaries");
+        std::printf("  note: x=70000 must be %s on this device\n",
+                    expected_refusal ? "refused" : "run");
     }
 
     // ---- Arm 7: a range that is not wholly inside a retained buffer is resolved on the host --------
@@ -415,6 +427,94 @@ int main() {
         CHECK(output_matches(out, 2 * 64, kConsumerPattern),
               "the host fallback launched the guest's current triplet {2,1,3}");
     }
+
+    // ---- Arm 12: actual validator with synthetic unequal limits ---------------------------------
+    // Only one 128-worker group runs the validation shader. The large values are DATA, not launch
+    // dimensions, so this safely distinguishes the shared-minimum bug on equal-limit CI devices too.
+    struct ValidatorCase {
+        std::array<uint32_t, 8> input, expected;
+        const char* name;
+    };
+    const ValidatorCase validator_cases[] = {
+        {{70000, 4, 5, 9, 100000, 8, 16, 0xABCD},
+         {70000, 4, 5, 0, 100000, 8, 16, 0xABCD}, "unequal limits admit a legal large X count"},
+        {{100000, 8, 16, 9, 100000, 8, 16, 0xABCD},
+         {100000, 8, 16, 0, 100000, 8, 16, 0xABCD}, "each axis admits its exact boundary"},
+        {{1, 9, 1, 0, 100000, 8, 16, 0xABCD},
+         {0, 0, 0, 1, 100000, 8, 16, 0xABCD}, "Y above its independent limit refuses the whole launch"},
+        {{1, 1, 17, 0, 100000, 8, 16, 0xABCD},
+         {0, 0, 0, 1, 100000, 8, 16, 0xABCD}, "Z above its independent limit refuses the whole launch"},
+    };
+    uint64_t validator_code = 0x365600D0u;
+    for (const auto& test : validator_cases) {
+        Storage record_storage(4096);
+        std::memcpy(record_storage.base, test.input.data(), sizeof(test.input));
+        ShaderResource record{};
+        record.cls = ResourceClass::ConstantBuffer;
+        record.binding = 0;
+        record.format = DataFormat::Uint32;
+        record.num_components = 1;
+        record.stride = 4;
+        record.gpu_addr = reinterpret_cast<uint64_t>(record_storage.base);
+        record.size = sizeof(test.input);
+        ComputeItem item;
+        item.resources = std::make_shared<ShaderResourceTable>();
+        item.resources->resources = {record};
+        item.spirv = build_compute_indirect_dispatch_validate();
+        item.code_addr = validator_code++;
+        item.user_sgprs = {0};
+        item.launch.groups_x = item.launch.groups_y = item.launch.groups_z = 1;
+        item.launch.local_x = item.launch.threads_x = 128;
+        item.launch.local_y = item.launch.local_z = item.launch.threads_y = item.launch.threads_z = 1;
+        const bool ran = prosper::frontend::execute_live_compute_items({item});
+        CHECK(ran && std::memcmp(record_storage.base, test.expected.data(), sizeof(test.expected)) == 0,
+              test.name);
+    }
+
+    // ---- Arm 13: post-fence map failure declines without publishing, then recovery ----------------
+    // Seed a retained output too. After the failed consumer, a deliberately unjournaled CPU store
+    // changes that output's next argument triplet. Failure authority must prevent a stale device pin.
+    Storage fault_output(kArgumentBufferBytes);
+    const uint64_t fault_base = reinterpret_cast<uint64_t>(fault_output.base);
+    std::vector<std::array<uint32_t, 4>> fault_counts{{0, 1, 1, 0}};
+    if (excessive_representable) fault_counts.push_back(excessive_counts);
+    uint64_t fault_code = 0x365600E0u;
+    for (const auto counts : fault_counts) {
+        const Counters before = counters();
+        reset_output(out);
+        std::vector<ComputeItem> items = {
+            producer(counts, fault_code++),
+            fill_item(fault_output.base, kArgumentBufferBytes, {1, 1, 1, 0}, kRecords, 0, fault_code++),
+            fill_item(fault_output.base, kArgumentBufferBytes, kConsumerPattern, 0, args_base, fault_code++),
+            consumer(fault_base, fault_code++),
+        };
+        uint32_t output_writes = 0;
+        const auto ran = run_submit(items, [&](size_t index) {
+            if (index == 1) {
+                set_guest_gpu_write_observer([&](uint64_t address, uint64_t size, const char*) {
+                    if (address < fault_base + kArgumentBufferBytes && fault_base < address + size)
+                        ++output_writes;
+                });
+                prosper::frontend::live_compute_fail_next_indirect_readback_for_test();
+            } else if (index == 2) {
+                auto* words = fault_output.words();
+                words[0] = 2; words[1] = words[2] = 1;
+            }
+        });
+        set_guest_gpu_write_observer({});
+        const Counters after = counters();
+        CHECK(ran.size() == 4 && ran[0] && ran[1] && !ran[2] && ran[3],
+              "post-fence indirect result-map failure declines; the following dispatch recovers");
+        CHECK(!prosper::frontend::live_compute_indirect_readback_fault_pending_for_test(),
+              "the post-fence fault was consumed, not missed or consumed during setup");
+        CHECK(output_writes == 0, "an unreadable launch result publishes no output write");
+        CHECK(after.device == before.device + 1 && after.fallback == before.fallback + 1,
+              "failure authority prevents the following consumer from pinning a stale retained result");
+        CHECK(output_matches(out, 2 * 64, kConsumerPattern),
+              "recovery consumes the new guest triplet, not the retained GPU's stale x=1");
+    }
+    if (!excessive_representable)
+        std::printf("  note: no representable count exceeds this device; synthetic refusal cases ran\n");
 
     std::printf(failures ? "== FAIL ==\n" : "== PASS ==\n");
     return failures ? 1 : 0;

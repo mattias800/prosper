@@ -113,17 +113,21 @@ in `src/gpu/execute/AGENTS.md`). `execute_item` pins a retained persistent buffe
 **authoritative** for the 12-byte range — identity materialization of guest memory, valid, containing
 the range at a 4-byte offset, and unchanged since it was last made equal to guest memory according to
 the in-submit write journal (the same proof that lets the cache skip an upload; it answers Unknown, so
-refuses, outside `execute_ordered_items`). It then copies the triplet to a 16-byte device scratch
+refuses, outside `execute_ordered_items`). It then copies the triplet to a 32-byte device scratch
 record, runs a one-invocation validation pass that zeroes the launch when any count exceeds
-`min(maxComputeWorkGroupCount)` (a clamp would silently compute part of the domain; word 3 records
+its own axis's `maxComputeWorkGroupCount` (a clamp would silently compute part of the domain; word 3 records
 the refusal), and records `vkCmdDispatchIndirect` from that scratch record. Any other case — no
 authoritative buffer, a straddling or unaligned range, an aliasing resource, no validation pass on
 this device — resolves the triplet on the host and dispatches directly, as the executor used to.
 
 Two limits to keep in mind. Persistent buffers exist only from 1 MiB up, so a small producer buffer
 always takes the host route. And the pin scans `buffer_cache` linearly per indirect dispatch; fine at
-the cache's size, not something to call per draw. The post-fence read of the scratch record's flag
-feeds the log and `indirect_dispatch_backend_stats()` only — it is never an input to the dispatch.
+the cache's size, not something to call per draw. The post-fence scratch read decides whether the
+completed dispatch was refused, was a zero-group no-op, or may publish results. A failed read declines
+before publication and invalidates retained output authority; it never guesses from guest arguments.
+The regression fixture injects failure at that post-fence map boundary and observes the selected
+device's actual axis limits independently of launch results. Synthetic records exercise the actual
+validation shader with deliberately unequal limits even on devices whose real limits are equal.
 `PROSPER_NO_GPU_INDIRECT_DISPATCH=1` (executor) keeps every dispatch on the host route.
 
 ## Native BCn textures

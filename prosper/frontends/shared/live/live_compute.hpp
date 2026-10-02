@@ -4,6 +4,7 @@
 #include "shared/device/storage_image_contract.hpp"  // #3531: the OOB image-read contract
 #include "shared/texture/write_watch_census.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -251,6 +252,10 @@ LiveComputeBufferDescriptorPlan plan_live_compute_buffer_descriptors(
 // Execute already-realized compute items synchronously. Exposed for the production-backend test.
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items);
 
+// Quiescent test observation of the selected device's actual property-query results. Does not
+// initialize the backend; returns zeros before initialization. Never derived from dispatch outcomes.
+std::array<uint32_t, 3> live_compute_workgroup_count_limits_for_test();
+
 // Borrow an exact native storage result for a later sampled graphics binding. The import is
 // deliberately narrower than the compute image cache: only a successful typed-storage dispatch can
 // publish one, the complete descriptor identity must match, and either the current submit journal or
@@ -409,6 +414,10 @@ void live_compute_set_image_readback_observer_for_test(
 void live_compute_set_before_image_publish_observer_for_test(std::function<void()> observer);
 // Consume only after a writable-buffer GPU dispatch completes, before guest publication.
 void live_compute_fail_next_buffer_readback_for_test();
+// One-shot failure at the completed indirect dispatch's scratch-result map boundary, not setup.
+// Consumed only by a device-resolved indirect dispatch after its fence proves completion.
+void live_compute_fail_next_indirect_readback_for_test();
+bool live_compute_indirect_readback_fault_pending_for_test();
 // Inject an optional conversion-admission result; does not fail an actual driver call.
 void live_compute_fail_next_packed_rtt_setup_for_test(bool device_lost);
 // One-shot failure at retile's actual allocation/eager-map driver boundary.
