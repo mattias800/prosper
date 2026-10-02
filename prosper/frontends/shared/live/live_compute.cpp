@@ -22,6 +22,7 @@
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
 #include "shared/device/pipeline_cache_file.hpp"  // #3425: one checked envelope for both stages
+#include "shared/device/device_identity.hpp"
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/device/float_transport.hpp"
 #include "shared/device/image_robustness.hpp"  // #3531: the recompiler's OOB image-read contract
@@ -3831,6 +3832,11 @@ struct VulkanComputeContext {
                      selection.properties.deviceName,
                      vulkan_device_type_name(selection.properties.deviceType));
         log_vulkan_runtime_device("compute", physical, selection.properties);
+        // Say which device this process rendered on, so a manifest can record the comparison
+        // conditions a framerate depends on (device_identity.hpp).
+        record_device_identity(selection.properties.vendorID, selection.properties.deviceID,
+                               selection.properties.driverVersion, selection.properties.apiVersion,
+                               static_cast<uint32_t>(selection.properties.deviceType));
 
         float priority = 1.0f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};

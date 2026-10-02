@@ -774,6 +774,14 @@ int main(int argc, char** argv) {
     // recompile_valu entry point above.
     { const uint32_t c[] = {0xd7620000u, 0x0002030du, 0xbf810000u};
       dump(dir, "compute_ldexp", recompile_valu(c, sizeof(c) / sizeof(c[0]), 14, 0)); }
+    // #4060: one ordinary numeric scalar word; FindILsb preserves the zero sentinel and
+    // produces scalar data without a guest-wave reduction or a native-subgroup requirement.
+    { const uint32_t c[] = {
+          0xbea403ffu, 0x00010000u, // s_mov_b32 s36,0x10000
+          0xbea51324u,             // s_ff1_i32_b32 s37,s36
+          0x7e000225u,             // v_mov_b32 v0,s37
+          0xbf810000u};
+      dump(dir, "compute_scalar_ff1_b32", recompile_valu(c, std::size(c), 0, 0)); }
     // Compute + SMEM constant-buffer load (s_buffer_load_dword; routes to binding 2).
     { const uint32_t c[] = {0xf4000000u, 0xfa000004u, 0x7e000200u, 0xbf810000u};
       dump(dir, "compute_smem", recompile_valu(c, sizeof(c)/4, 1, 0)); }

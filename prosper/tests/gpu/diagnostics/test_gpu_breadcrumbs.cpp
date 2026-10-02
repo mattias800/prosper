@@ -143,6 +143,7 @@ struct Recorded {
     std::vector<VkPipelineStageFlagBits> amd_stages;
     std::vector<uint32_t> checkpoints;
     std::vector<uint32_t> nv_reported;   // what the mock queue "returns" after a loss
+    std::vector<VkPipelineStageFlagBits> nv_stages;   // stage per entry; BOTTOM_OF_PIPE when absent
 };
 Recorded rec;
 
@@ -158,8 +159,12 @@ VKAPI_ATTR void VKAPI_CALL mock_set_checkpoint(VkCommandBuffer, const void* mark
 VKAPI_ATTR void VKAPI_CALL mock_get_checkpoint_data(VkQueue, uint32_t* count, VkCheckpointDataNV* data) {
     if (!data) { *count = static_cast<uint32_t>(rec.nv_reported.size()); return; }
     for (uint32_t i = 0; i < *count && i < rec.nv_reported.size(); ++i)
+    {
         data[i].pCheckpointMarker =
             reinterpret_cast<void*>(static_cast<uintptr_t>(rec.nv_reported[i]));
+        data[i].stage = i < rec.nv_stages.size() ? rec.nv_stages[i]
+                                                  : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    }
 }
 VKAPI_ATTR VkResult VKAPI_CALL mock_fault_info(VkDevice, VkDeviceFaultCountsEXT* counts,
                                                VkDeviceFaultInfoEXT* info) {
@@ -263,6 +268,14 @@ void nv_path() {
               report.find("program=0x600") != std::string::npos,
           "the reached checkpoints resolve to the second draw as the one in flight");
     CHECK(report.find("[gpu-fault]") == std::string::npos, "no fault section when VK_EXT_device_fault is off");
+
+    // An "after" checkpoint seen only at TOP_OF_PIPE means the command processor got past the draw,
+    // not that it finished, so the first site is still open: two sites are in flight, not one.
+    rec.nv_reported = {breadcrumb_before_value(b), breadcrumb_after_value(a)};
+    rec.nv_stages = {VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT};
+    CHECK(emitter.report_device_loss(kQueue).find("ONE site") == std::string::npos,
+          "an after checkpoint short of BOTTOM_OF_PIPE does not close its site");
+    rec.nv_stages.clear();
 
     rec.nv_reported.clear();
     CHECK(emitter.report_device_loss(kQueue).find("NO marker reached memory") != std::string::npos,

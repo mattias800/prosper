@@ -14,6 +14,7 @@
 // Real game boots normally adopt the renderer's Vulkan device and pass its front image directly to
 // the swapchain. Test-pattern boots, an explicit override, or failed adoption retain the original
 // two-device path, where frames cross as shared immutable CPU pixels.
+#include "guest_end_status.hpp"         // exit status + fault banner for a dead guest (#4140)
 #include "diagnostics/exit_reports.hpp"         // flush_exit_reports before std::_Exit (#3353)
 #include "gpu/present/videoout_present.hpp"   // present_acquire_rendered_frame / present_write_frame
 #include "gpu/execute/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
@@ -1196,6 +1197,49 @@ bool g_guest_started = false;
 // state for 72 minutes). The detail string is written before the kind is released.
 std::atomic<int> g_guest_end_kind{-1};
 std::string g_guest_end_detail;
+#ifdef _WIN32
+// Last-chance handler for a fault no one owns: a guest WORKER thread (the VEH only recovers armed
+// threads and declines the rest) or a host exception. Without it the process dies with Windows' own
+// status and no module+offset, no backtrace -- only the entry thread had a report (#4140). Exits with
+// kExitGuestFault so a script sees a crash, same as an entry-thread fault.
+LPTOP_LEVEL_EXCEPTION_FILTER g_previous_unhandled_filter = nullptr;
+
+LONG WINAPI report_unhandled_fault(EXCEPTION_POINTERS* ep) {
+    // Not a fault: MinGW's own filter (installed by crt startup, chained below) turns an uncaught
+    // C++ throw (GCC's 0x2?474343 codes) into "terminate called..." with the exception's type and
+    // message. Reporting it here as a crash would lose both, so hand those on unchanged.
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if ((code & 0xF0FFFFFFu) == 0x20474343u)
+        return g_previous_unhandled_filter ? g_previous_unhandled_filter(ep)
+                                           : EXCEPTION_CONTINUE_SEARCH;
+    // One reporter. A second thread faulting meanwhile parks, so the OS cannot end the process with
+    // that thread's status before the first report and _Exit(3); a fault inside the reporter itself
+    // falls through to the default handling. The park is BOUNDED: the parked thread may hold the
+    // stdio or heap lock the reporter needs, and an unbounded wait would hang the process forever.
+    static std::atomic<DWORD> reporter{0};
+    DWORD expected = 0;
+    const DWORD self = GetCurrentThreadId();
+    if (!reporter.compare_exchange_strong(expected, self)) {
+        if (expected == self) return EXCEPTION_CONTINUE_SEARCH;
+        Sleep(10000);
+        std::_Exit(prosper::app::kExitGuestFault);
+    }
+    const CONTEXT* c = ep->ContextRecord;
+    const uint64_t rip = c->Rip;
+    fprintf(stderr, "%s\n",
+            prosper::app::format_fault_banner(
+                g_guest_started ? "guest/host" : "host", self, code, rip,
+                describe_code_address(rip)).c_str());
+    uint64_t frames[32];
+    const int n = guest_frames_from_rbp(c->Rbp, frames, 32);
+    for (int i = 0; i < n; i++)
+        fprintf(stderr, "[app] fault backtrace: 0x%llx (%s)\n", (unsigned long long)frames[i],
+                describe_code_address(frames[i]).c_str());
+    dump_guest_exception_trace();
+    fflush(nullptr);
+    std::_Exit(prosper::app::kExitGuestFault);
+}
+#endif
 // True when THIS process authored PROSPER_GUEST_ARGS from the settings file (start_guest). A
 // relaunch must strip an app-authored value so the next title re-resolves its own (#2973 review).
 bool g_guest_args_app_set = false;
@@ -1352,7 +1396,8 @@ int exit_startup_failure() {
     prosper::host::guest_dmem_write_trace_report();
     prosper::diagnostics::flush_exit_reports();
     fflush(nullptr);
-    std::_Exit(1);
+    // A guest that already faulted still reports 3: the fault is the more specific fact.
+    std::_Exit(prosper::app::exit_status(g_guest_end_kind.load(std::memory_order_acquire), true));
 }
 
 // The host folder picker. SDL may deliver the result on another thread, so the callback only parks
@@ -1462,6 +1507,9 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    g_previous_unhandled_filter = SetUnhandledExceptionFilter(report_unhandled_fault);
+#endif
     // Line-buffer stdout: the boot/loader diagnostics go through printf (stdout), and under a
     // file redirect stdout block-buffers — every boot-time line then flushes at exit and lands
     // AFTER hours' worth of unbuffered stderr in a merged `> log 2>&1`, making the log read as
@@ -3714,7 +3762,9 @@ int main(int argc, char** argv) {
     perfCapture.cancel();     // never publish a short/incomplete .prperf on a graceful early exit
     prosper_request_stop();   // signal the guest run-loop to wind down at its next boundary
     fprintf(stderr, "[app] shutting down after %llu presented frame(s)\n", (unsigned long long)shown);
-    const int exitCode = (exitAfter && (int)shown < exitAfter) ? 1 : 0;
+    const int exitCode = prosper::app::exit_status(
+        g_guest_end_kind.load(std::memory_order_acquire),
+        exitAfter && (int)shown < exitAfter);
 
     // run_entry does not yet observe the frontend stop flag, so a booted guest cannot be joined.
     // Returning from main after detaching it is unsafe: C++ static teardown destroys HLE/renderer

@@ -428,6 +428,50 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // S_FF1 does not modify SCC.
                 return true;
             }
+            if (in.opcode == 0x13 && in.dst.value >= 0 && in.dst.value <= 105) {
+                // AMD RDNA2 70648, 12.3 p113: FF1_B32 scans one scalar word from the LSB,
+                // returns all ones for zero, and leaves SCC alone. Numeric data needs no vote.
+                // Keep the existing mask path below: a Bool or a CFG placeholder is not a word.
+                const Operand& source = in.src[0];
+                uint32_t word = 0;
+                if (source.kind == OperandKind::InlineInt ||
+                    source.kind == OperandKind::InlineFloat || source.kind == OperandKind::Literal) {
+                    word = val(source);
+                } else if (source.kind == OperandKind::SGPR && source.value >= 0 &&
+                           source.value <= 105 && !rs.sreg_bool.contains(source.value) &&
+                           !(source.value > 0 && rs.sreg_bool.contains(source.value - 1) &&
+                             !rs.sreg_bool_b32.contains(source.value - 1)) &&
+                           !rs.sreg_wave64_mask_half.contains(source.value) &&
+                           !rs.sreg_srt.contains(source.value) && !entry_m0_live(rs, source.value)) {
+                    if (rs.scalar_presence_has_no_placeholders) {
+                        const auto current = rs.sreg.find(source.value);
+                        if (current != rs.sreg.end()) word = current->second;
+                    }
+                    if (!word) {
+                        const auto input = rs.sreg_input.find(source.value);
+                        if (input != rs.sreg_input.end()) word = input->second;
+                    }
+                }
+                if (word) {
+                    // Capture first, including a self-source, then end every overlapping complete
+                    // mask lifetime. A B32 mask in the preceding register is an independent word.
+                    const uint32_t result = b.find_ilsb(word);
+                    // #3606: scanning a lane-local scalar cannot make it wave-uniform. Keep the
+                    // known source provenance when FindILsb and its bitcast create a fresh id.
+                    if (rs.lane_local_scalars.contains(word)) rs.lane_local_scalars.insert(result);
+                    const int dst = in.dst.value;
+                    const auto erase_mask = [&](int base) {
+                        rs.sreg_bool.erase(base);
+                        rs.sreg_bool_narrowed.erase(base);
+                        rs.sreg_bool_b32.erase(base);
+                    };
+                    erase_mask(dst);
+                    if (dst > 0 && !rs.sreg_bool_b32.contains(dst - 1)) erase_mask(dst - 1);
+                    rs.sreg[dst] = result;
+                    rs.sreg_srt.erase(dst);
+                    return true;
+                }
+            }
             if (b.is_compute && b.wave_size == 32 && b.native_subgroup_size == 32 &&
                 in.opcode == 0x13) { // s_ff1_i32_b32
                 // RDNA2 returns the first set bit from the low end, or 0xffffffff for an empty

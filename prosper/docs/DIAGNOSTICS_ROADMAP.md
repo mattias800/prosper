@@ -234,6 +234,16 @@ pass-local offset (graphics), the guest program address and a pipeline hash. D5 
   58 fps" impossible to quote across a `fifo`/`immediate` or readback/GPU-present boundary.
 - **Out of scope:** CI-side perf gating (no GPU in hosted CI); machine model strings (personal
   hardware detail).
+- **Status (first slice landed for `tools/screenshot`):** the manifest gained a `conditions` record
+  (harness, present path, OS, flip pacing, and numeric GPU vendor/device/driver/API/type, `null` when
+  no device was selected), and `tools/perf/compare_runs.py` refuses a pair whose route, scale, harness,
+  present path, pacing, GPU or driver differ, whose window mixed regimes (active fraction below 0.90),
+  or whose run failed. It exits 0 / 1 (regression) / 2 (refused). `build_revision` was already
+  recorded and is the one thing allowed to differ.
+  **Not done:** the `prosper-app` interactive path writes no manifest, so nothing yet compares its
+  rates; no config hash or build-flags hash is recorded (a `PROSPER_*` environment hash would cover
+  the former); the 3% / 5% thresholds are proposals, not calibrated against measured run-to-run
+  noise, which needs repeat runs per title on a real GPU.
 
 ### M4. Per-graphics-pass GPU timeline
 
