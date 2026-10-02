@@ -10,9 +10,13 @@ on:
   pull_request:
 
 # A new push to a PR supersedes its in-flight run. main pushes and v* tags are never cancelled:
-# every main commit keeps its own result and the release job must not be interrupted.
+# every main commit keeps its own result and the release job must not be interrupted. Non-PR runs
+# therefore get a group of their own (the run id). `cancel-in-progress: false` alone is NOT enough
+# for that: it protects only the RUNNING member of a group, and GitHub keeps at most one PENDING
+# member, so on a shared `refs/heads/main` group a third push silently cancels the second while
+# the first is still running -- and that commit never gets a result at all.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -20,25 +24,33 @@ jobs:
   # test result, so the four native build+test jobs below skip. Skipped jobs report as passing to
   # branch protection. pushes and tags always run everything (code_changed=true), so main and
   # releases are never gated. Docs, contribution-shape, sanitizers and the Linux jobs still run.
+  #
+  # FAIL-CLOSED: the gated jobs test `code_changed != 'false'` under `!cancelled()`, so if this job
+  # errors (empty output) they RUN. Testing `== 'true'` would skip them on an error, and a skipped
+  # job reads as a pass -- a broken gate would then look exactly like a docs-only PR.
   changes:
     name: Detect code changes
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
     outputs:
       code_changed: ${{ steps.filter.outputs.code_changed }}
     steps:
-      - uses: actions/checkout@v6
+      # fetch-depth: 2 for the same reason as the Docs job: on a `pull_request` merge ref HEAD^1 is
+      # the base commit, so `HEAD^1 HEAD` is exactly the PR's change against its base without
+      # cloning the whole history.
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 2
       - id: filter
         env:
           EVENT: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
         run: |
           if [ "$EVENT" != "pull_request" ]; then
             echo "code_changed=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          CHANGED=$(git diff --name-only "origin/$BASE_REF...HEAD")
+          CHANGED=$(git diff --name-only HEAD^1 HEAD)
           echo "$CHANGED"
           if [ -z "$CHANGED" ] || echo "$CHANGED" | grep -qvE '\.md$|^assets/'; then
             echo "code_changed=true" >> "$GITHUB_OUTPUT"
@@ -252,10 +264,11 @@ jobs:
       # (`(timeout took 13.58 ms via none)` against a 12 ms ceiling) was filed as "unresolved, two
       # candidates" and stayed open for six days.
       #
-      # Re-running the label is a few seconds -- the labelled tests are ~1.5 s each even under
-      # Rosetta 2. It is a SECOND sample of an assertion the step above already gated on, so it is
-      # left blocking on purpose: if a timing arm fails only on the re-run, that is a real second
-      # observation and worth a red job, and `-V` says which arm and at what measured value.
+      # Running the label is a few seconds -- the labelled tests are ~1.5 s each even under
+      # Rosetta 2. The step above runs the rest of the suite in parallel (`-j4`) and EXCLUDES this
+      # label (`-LE timing-margin`), because a wall-clock margin measured beside three other tests
+      # measures the neighbours. So this serial step is now the ONLY gate on these assertions, and
+      # it is blocking on purpose: `-V` says which arm failed and at what measured value.
       #
       # `-L` together with `--no-tests=error` is the self-checking half: if the label is renamed or
       # dropped, this step fails loudly instead of silently reporting nothing for ever after.
@@ -788,7 +801,7 @@ jobs:
   windows-mingw:
     name: Windows MinGW
     needs: changes
-    if: needs.changes.outputs.code_changed == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code_changed != 'false' }}
     runs-on: windows-latest
     timeout-minutes: 90
     env:
@@ -858,7 +871,7 @@ jobs:
   windows-app:
     name: Windows App
     needs: changes
-    if: needs.changes.outputs.code_changed == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code_changed != 'false' }}
     runs-on: windows-latest
     timeout-minutes: 90
     env:
@@ -1007,7 +1020,7 @@ jobs:
   macos:
     name: macOS (x86_64 / Rosetta 2)
     needs: changes
-    if: needs.changes.outputs.code_changed == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code_changed != 'false' }}
     runs-on: macos-latest
     timeout-minutes: 90
     env:
@@ -1076,7 +1089,7 @@ jobs:
   macos-app:
     name: macOS App (SDL3 + MoltenVK)
     needs: changes
-    if: needs.changes.outputs.code_changed == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code_changed != 'false' }}
     runs-on: macos-latest
     timeout-minutes: 90
     env:
