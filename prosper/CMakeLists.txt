@@ -1133,6 +1133,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_sync_delete PRIVATE prosper_core)
   add_test(NAME sync_delete COMMAND test_sync_delete)
 
+  # sceKernelGetOperationMode, the coredump-handler pair and the PRT aperture pair are registered and
+  # honour their contracts (out-parameters written, slot range checked) rather than being logged-0
+  # stubs.
+  add_executable(test_kernel_system_stubs tests/hle/kernel/test_kernel_system_stubs.cpp)
+  target_link_libraries(test_kernel_system_stubs PRIVATE prosper_core)
+  target_include_directories(test_kernel_system_stubs PRIVATE src)
+  add_test(NAME kernel_system_stubs COMMAND test_kernel_system_stubs)
+
   # The APR submit's result out-parameters are uint32_t*; an 8-byte store overran into the guest's
   # stack canary and killed the title with __stack_chk_fail (#4138).
   add_executable(test_apr_result_slot_width tests/hle/kernel/test_apr_result_slot_width.cpp)
