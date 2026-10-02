@@ -2,6 +2,7 @@
 #include "shared/live/submit_renderer/draw_resources.hpp"
 #include "shared/live/submit_renderer/image_resources.hpp"
 #include "shared/live/submit_renderer/guest_reads.hpp"
+#include "diagnostics/readback_refusal.hpp"
 
 namespace prosper::frontend::submit_renderer {
 
@@ -695,9 +696,25 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                        surface.rgba->size() != surface_texels * surface_bpp)) {
                       std::vector<uint8_t> materialized;
                       std::string error;
-                      if (prosper::test::readback_persistent_color_target(
+                      const bool readback_ok = [&] {
+                          namespace refusal = prosper::diagnostics::readback_refusal;
+                          if (!refusal::selected(sampled_source_addr))
+                              return prosper::test::readback_persistent_color_target(
+                                  sampled_source_addr, surface.w, surface.h, surface_format,
+                                  materialized, error);
+                          refusal::Record record{};
+                          record.context.caller = refusal::Caller::LazySampled;
+                          record.context.frontend_gpu_valid = surface.gpu_valid
+                              ? refusal::ObservedBool::Yes : refusal::ObservedBool::No;
+                          record.context.frontend_cpu_pixels = surface.rgba
+                              ? refusal::ObservedBool::Yes : refusal::ObservedBool::No;
+                          const bool result = prosper::test::readback_persistent_color_target(
                               sampled_source_addr, surface.w, surface.h, surface_format,
-                              materialized, error) &&
+                              materialized, error, 0, &record);
+                          refusal::emit(record);
+                          return result;
+                      }();
+                      if (readback_ok &&
                           materialized.size() == surface_texels * surface_bpp) {
                           surface.rgba = std::make_shared<const std::vector<uint8_t>>(
                               std::move(materialized));

@@ -45,6 +45,31 @@ is process-wide, so independently taken values in unrelated translation units co
 no anchor or registry. Anything that needs to be time-ordered against a diagnostic in another
 subsystem should stamp it rather than grow a private clock.
 
+`readback_refusal.{hpp,cpp}` observes selected early persistent-color readback refusals (#3891,
+#3948). `PROSPER_RTT_READBACK_TRACE_TARGETS=0xaddr[,0xaddr...]` uses the shared strict address
+parser and accepts at most eight unique nonzero addresses. Selection initializes at live-renderer
+registration before guest work; unset, malformed or excessive selection arms nothing. Backend
+lookup/readback receive optional plain-value observation outputs, never a frontend dependency or
+a second lookup. Unselected calls perform no record initialization or diagnostic clock read.
+
+The two frontend callers are compute snapshot and lazy sampled materialization. A selected early
+refusal reports source `diag_now_us()`, requested and actually canonicalized key, typed reason,
+and the existing short-circuit operands. An earlier unproven-submission refusal has no canonical
+lookup observation; zero-ID lookup rejection is separately `lookup-not-performed`. Fields skipped
+by the original branch remain NOT_OBSERVED. Frontend GPU validity is speculative; CPU vector
+presence proves neither exact size nor current bytes. These helpers lack a current-thread resource
+guard witness, so producer tokens and pins remain NOT_OBSERVED. History, gate linkage and final
+consumer disposition remain UNKNOWN. Successful lookup metadata is not successful GPU readback.
+
+Only the first 64 selected early-refusal records are output, after the backend helper returns and
+outside counted submission/queue-lock regions. A cap notice states subsequent suppression. The
+exit report is an unverified RUN SNAPSHOT: independent relaxed counts report seen reservations,
+accepted/failed `fputs` calls and suppression decisions, not a coherent partition, durable output
+or guest-worker quiescence. No new alarm rule, lifecycle journal, wait, pin or publication policy
+is introduced. Total selected requests are not observed; a zero refusal count is not a qualified
+healthy population. Absence of these records cannot clear other callers, later transfer failures
+or final rendering obligations.
+
 `env_cache.hpp`, `env_numeric.hpp` and `env_submit.hpp` are the remaining always-reachable files, and they are here for
 the same reason as `diag_clock.hpp`: it is shared, and it belongs to no one subsystem. It holds `PROSPER_ENV_ON` /
 `PROSPER_ENV_VALUE`, the one-shot reads of a `PROSPER_*` switch. They lived in
