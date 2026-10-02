@@ -161,7 +161,7 @@ int main() {
         std::all_of(capture.draws.begin(), capture.draws.end(), [](const auto& draw) {
             return draw.vrt.resources.empty() && draw.prt.resources.empty();
         });
-    if (bytes.size() < 8u + realized.size() || loaded.draws.size() != realized.size() || !no_resources) {
+    if (bytes.size() < 16u + 3u * realized.size() || loaded.draws.size() != realized.size() || !no_resources) {
         CHECK(false, "codec controls require the successful bounded realized fixture");
         return 1;
     }

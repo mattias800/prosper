@@ -375,7 +375,7 @@ with tempfile.TemporaryDirectory(prefix="prosper-fragment-width-", dir=scratch_r
                           "gpu_replay: %s: %s" % (malformed_capture, error) in done.stderr and
                           "fragment-wave=" not in done.stderr and path.read_bytes() == sentinel,
                           "%s %s malformed capture rejects before regeneration/dump" % (route, name))
-    check(len(states) == 5, "official v63 captured width and legacy v62 remain explicit matrix arms")
+    check(len(states) == 6, "official v64/v63 captured width and legacy v62 remain explicit matrix arms")
 
     for state, filename, captured_width in states:
         capture = directory / filename

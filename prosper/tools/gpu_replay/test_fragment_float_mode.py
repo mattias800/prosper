@@ -123,12 +123,19 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
         data=(directory/(name+".prgcap")).read_bytes()
         expected_tail=(struct.pack("<I",1)+b"\x01\x10"+struct.pack("<I",0) if name=="mode16" else
                        struct.pack("<I",0)+struct.pack("<I",1)+b"\x01\x10")
-        check(struct.unpack_from("<I",data,8)[0]==64 and data.endswith(expected_tail),
-              name+" genuine canonical v64 producing mode tail")
-        legacy=bytearray(data[:-len(expected_tail)])
+        combined=(struct.unpack_from("<I",data,8)[0]==65 and
+                  data.endswith(expected_tail+struct.pack("<I",0)))
+        check(combined,name+" combined v65 retains canonical mode before zero owned obligations")
+        if not combined:
+            continue
+        official=bytearray(data[:-4])
+        struct.pack_into("<I",official,8,64)
+        check(official.endswith(expected_tail),name+" genuine official v64 producing mode tail")
+        (directory/("official64"+("-failed" if name.endswith("failed") else "")+".prgcap")).write_bytes(official)
+        legacy=bytearray(official[:-len(expected_tail)])
         struct.pack_into("<I",legacy,8,63)
         (directory/("legacy"+("-failed" if name.endswith("failed") else "")+".prgcap")).write_bytes(legacy)
-    states.append(("legacy",None))
+    states.extend([("official64",16),("legacy",None)])
     for state,mode in states:
         for route in ("recompile-raw","fs-tap","retry-failed-stage"):
             capture=directory/(state+("-failed" if route=="retry-failed-stage" else "")+".prgcap")
@@ -166,13 +173,14 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
                     except ValueError as error:
                         check(False,label+" fail-closed output oracle: "+str(error))
     original=(directory/"mode16.prgcap").read_bytes()
-    start=len(original)-10
+    start=len(original)-4-10
     malformed={
         "count":original[:start]+struct.pack("<I",0)+original[start+4:],
         "tag":original[:start+4]+b"\x02"+original[start+5:],
         "unknown-value":original[:start+4]+b"\x00\x10"+original[start+6:],
-        "failure-count":original[:-4]+struct.pack("<I",1),
-        "truncated":original[:-1],
+        "failure-count":original[:start+6]+struct.pack("<I",1)+original[start+10:],
+        "truncated-mode":original[:start+9],
+        "truncated-owned":original[:-1],
         "trailing":original+b"\x00",
         "relabel-only63":original[:8]+struct.pack("<I",63)+original[12:],
     }

@@ -3,6 +3,8 @@
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/state/render_state.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -256,11 +258,102 @@ int main(int argc, char** argv) {
         }
         check(roundtrip && parent_reads == 0u && restored_high == 2u &&
               restored_child_high == child[8u + last],
-              "v64 capture owns highest selector and separate highest child word without guest reread");
+              "v65 capture owns highest selector and separate highest child word without guest reread");
         if (!roundtrip) continue;
-        const auto v64_tail_size = 4u + 4u * decoded.draws.front().vrt.resources.size();
-        auto v63_bytes = encoded;
-        v63_bytes.resize(v63_bytes.size() - v64_tail_size);
+        // The same owned parent/selected child feeds a real PS zero relation. Child words are
+        // nonzero subnormal bit patterns; the incoming mode fixtures own its category oracle.
+        auto fragment_code = code;
+        fragment_code.resize(fragment_code.size() - 3u);
+        fragment_code.insert(fragment_code.end(), {
+            0x7c040080u, 0xd5010001u, 128u | (242u << 9u) | (106u << 18u),
+            0xf800180fu, 0x01010101u, 0xbf810000u});
+        std::vector<uint64_t> mode_identities;
+        std::vector<std::vector<uint32_t>> mode_modules;
+        for (const auto requested : {FragmentFloatMode{true, 0u}, FragmentFloatMode{true, 16u},
+                                     FragmentFloatMode{true, 0xabu}, FragmentFloatMode{}}) {
+            GpuState launch;
+            if (requested.available)
+                launch.sh[prosper::agc::Pm4::SPI_SHADER_PGM_RSRC1_PS] =
+                    uint32_t(requested.value) << prosper::agc::Pm4::SPI_SHADER_PGM_RSRC1_PS_FLOAT_MODE_SHIFT;
+            const auto mode = extract_render_state(launch).ps_float_mode;
+            uint64_t identity = 0u, warm_identity = 0u, refused_identity = 99u, recovered_identity = 0u;
+            const auto direct = recompile_fragment(fragment_code.data(), fragment_code.size(), &table,
+                nullptr, UINT32_MAX, nullptr, false, {RecompileDiagnosticStage::Fragment, 0u}, mode);
+            const auto module = recompile_graphics_shader_cached_shared(ShaderProgramStage::Fragment,
+                fragment_code.data(), fragment_code.size(), &table, nullptr, nullptr, &identity,
+                false, 0u, false, {}, mode);
+            const auto warm = recompile_graphics_shader_cached_shared(ShaderProgramStage::Fragment,
+                fragment_code.data(), fragment_code.size(), &table, nullptr, nullptr, &warm_identity,
+                false, 0u, false, {}, mode);
+            check(mode == requested && !direct.empty() && module && module == warm &&
+                  identity && identity == warm_identity && *module == direct,
+                  "producing register mode and owned PS input share exact cold/warm compiler authority");
+            const auto refused = recompile_graphics_shader_cached_shared(ShaderProgramStage::Fragment,
+                fragment_code.data(), fragment_code.size(), &short_parent, nullptr, nullptr, &refused_identity,
+                false, 0u, false, {}, mode);
+            const auto recovered = recompile_graphics_shader_cached_shared(ShaderProgramStage::Fragment,
+                fragment_code.data(), fragment_code.size(), &table, nullptr, nullptr, &recovered_identity,
+                false, 0u, false, {}, mode);
+            check(!refused && refused_identity == 0u && recovered == module && recovered_identity == identity &&
+                  recompile_fragment(fragment_code.data(), fragment_code.size(), &short_parent,
+                      nullptr, UINT32_MAX, nullptr, false, {RecompileDiagnosticStage::Fragment, 0u}, mode).empty(),
+                  "known or unknown mode cannot admit short owned PS backing after a warm valid entry");
+            mode_identities.push_back(identity);
+            mode_modules.push_back(direct);
+            DrawItem combined_draw = draw;
+            combined_draw.fs = direct;
+            combined_draw.fs_guest_addr = reinterpret_cast<uint64_t>(fragment_code.data());
+            combined_draw.prt = std::make_shared<ShaderResourceTable>(table);
+            combined_draw.ps_float_mode = mode;
+            combined_draw.fragment_wave_config_available = true;
+            combined_draw.ps_wave32 = false;
+            const CaptureMemoryReader combined_reader = [&](uint64_t address, uint8_t* dst, size_t want) {
+                if (const auto n = copy_range(address, dst, want, combined_draw.fs_guest_addr,
+                                              fragment_code.data(), fragment_code.size() * 4u)) return n;
+                return reader(address, dst, want);
+            };
+            GpuCaptureFile combined_capture, combined_decoded;
+            GpuReplayFrame combined_replay;
+            std::vector<uint8_t> combined_bytes;
+            const bool combined_ok = capture_draw_items({combined_draw}, {}, combined_reader, combined_capture, error) &&
+                serialize_gpu_capture(combined_capture, combined_bytes, error) &&
+                deserialize_gpu_capture(combined_bytes, combined_decoded, error) &&
+                materialize_gpu_replay(combined_decoded, combined_replay, error);
+            const auto* restored_parent = combined_ok && combined_replay.items.size() == 1u && combined_replay.items[0].prt
+                ? combined_replay.items[0].prt->by_fetch_pc(0u) : nullptr;
+            const auto* restored_child = combined_ok && combined_replay.items.size() == 1u && combined_replay.items[0].prt
+                ? combined_replay.items[0].prt->by_fetch_pc(7u) : nullptr;
+            check(combined_ok && combined_decoded.format_version == 65u &&
+                  combined_decoded.draws.front().ps_float_mode == mode && combined_replay.items[0].ps_float_mode == mode &&
+                  combined_replay.items[0].fragment_wave_config_available && !combined_replay.items[0].ps_wave32 &&
+                  restored_parent && restored_parent->host_data && restored_parent->owned_raw_snapshot_bytes == size &&
+                  restored_parent->host_data_size == size && std::memcmp(restored_parent->host_data, source->host_data, size) == 0 &&
+                  restored_child && restored_child->host_data && restored_child->host_data_size >= size &&
+                  std::memcmp(restored_child->host_data, child.data() + 8u, size) == 0,
+                  "combined v65 retains every owned parent/child byte, exact width and full producing mode");
+            auto combined_ownerless = combined_draw;
+            combined_ownerless.prt = std::make_shared<ShaderResourceTable>(table);
+            combined_ownerless.prt->owned_host_data.clear();
+            check(!preflight_gpu_capture_draw_resources(combined_ownerless, 1u << 20u, planned, error),
+                  "producing mode never replaces the missing owned PS capture owner");
+        }
+        std::sort(mode_identities.begin(), mode_identities.end());
+        check(mode_identities.size() == 4u && std::adjacent_find(mode_identities.begin(), mode_identities.end()) == mode_identities.end() &&
+              mode_modules[0] != mode_modules[1] && mode_modules[3] != mode_modules[0],
+              "full mode availability/bits partition owned PS cache and preserve flush/preserve/unknown relation paths");
+        const auto owned_tail_size = 4u + 4u * decoded.draws.front().vrt.resources.size();
+        auto v64_bytes = encoded;
+        v64_bytes.resize(v64_bytes.size() - owned_tail_size);
+        v64_bytes[8] = 64u;
+        GpuCaptureFile official64;
+        check(deserialize_gpu_capture(v64_bytes, official64, error) &&
+              official64.format_version == 64u && official64.draws.size() == 1u &&
+              !official64.draws.front().ps_float_mode.available &&
+              official64.draws.front().ps_float_mode.value == 0u &&
+              materialize_gpu_replay(official64, replay, error),
+              "genuine official v64 retains unknown mode and derives owned source authority from raw code");
+        auto v63_bytes = v64_bytes;
+        v63_bytes.resize(v63_bytes.size() - 8u - 2u * decoded.draws.size());
         v63_bytes[8] = 63u;
         v63_bytes[9] = v63_bytes[10] = v63_bytes[11] = 0u;
         GpuCaptureFile official63;
@@ -280,14 +373,14 @@ int main(int argc, char** argv) {
             v62_bytes[9] = v62_bytes[10] = v62_bytes[11] = 0u;
         }
         auto bad_count = encoded;
-        if (bad_count.size() >= v64_tail_size) bad_count[bad_count.size() - v64_tail_size] ^= 1u;
+        if (bad_count.size() >= owned_tail_size) bad_count[bad_count.size() - owned_tail_size] ^= 1u;
         GpuCaptureFile invalid_format;
         check(!deserialize_gpu_capture(bad_count, invalid_format, error),
-              "v64 reader refuses mismatched owned-obligation resource count");
+              "v65 reader refuses mismatched owned-obligation resource count");
         auto cut_width = encoded;
         cut_width.pop_back();
         check(!deserialize_gpu_capture(cut_width, invalid_format, error),
-              "v64 reader refuses a truncated owned-obligation width field");
+              "v65 reader refuses a truncated owned-obligation width field");
         GpuCaptureFile v62;
         GpuReplayFrame legacy_replay;
         check(deserialize_gpu_capture(v62_bytes, v62, error) && v62.format_version == 62u &&
