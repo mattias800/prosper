@@ -72,11 +72,71 @@ int main(int argc, char** argv) {
     check(ordinal == 100, "nine source kinds, all64 bits, six addend kinds, skipped/ended and replacement");
 
     // A legal original-instruction mutation changes the first numeric MBCNT from LO to HI.
-    // Its differently derived expected output must pass, and the good LO output must reject it.
+    // Walk both actual instruction streams; changing the oracle's first_is_high flag alone is
+    // not evidence that a legal guest opcode changed. All other guest words remain identical.
     m::Case good; good.source = m::Source::Literal; good.mask = UINT64_MAX;
     m::Case changed = good; changed.first_is_high = true;
-    const auto actual = run(m::packet(changed), m::expected(changed), "original_hi_control", directory);
+    const auto original = m::packet(good);
+    auto mutated = original;
+    constexpr uint32_t first_mbcnt_pc = 2; // two one-dword S_MOV_B64 saves precede it
+    mutated.guest_code[first_mbcnt_pc] ^= (0x365u ^ 0x366u) << 16;
+    check(m::packet(changed).guest_code == mutated.guest_code,
+          "shared native HI fixture is this exact original opcode mutation");
+    uint32_t changed_words = 0;
+    for (size_t word = 0; word < original.guest_code.size(); ++word)
+        if (original.guest_code[word] != mutated.guest_code[word]) {
+            ++changed_words;
+            check(word == first_mbcnt_pc, "only the first original MBCNT opcode word changes");
+        }
+    check(changed_words == 1, "one original guest instruction mutation");
+    const auto decoded_witness = [&](const auto& p, uint32_t opcode) {
+        std::vector<prosper::gpu::Rdna2Inst> decoded;
+        prosper::gpu::rdna2_walk(p.guest_code.data(), p.guest_code.size(), decoded);
+        const auto first = std::find_if(decoded.begin(), decoded.end(), [](const auto& in) {
+            return in.fmt == prosper::gpu::Rdna2Format::VOP3 &&
+                   (in.opcode == 0x365 || in.opcode == 0x366);
+        });
+        check(first != decoded.end(), "actual original/mutated MBCNT decodes");
+        if (first == decoded.end()) return;
+        check(first->pc == first_mbcnt_pc && first->opcode == opcode && first->len_dwords == 3 &&
+              first->n_src == 2 && first->dst.kind == prosper::gpu::OperandKind::VGPR &&
+              first->dst.value == 1 && first->src[0].kind == prosper::gpu::OperandKind::Literal &&
+              first->literal == UINT32_MAX && first->src[1].kind == prosper::gpu::OperandKind::VGPR &&
+              first->src[1].value == 7, "exact decoded first site retains its literal and v7 addend");
+    };
+    decoded_witness(original, 0x365);
+    decoded_witness(mutated, 0x366);
+    const auto baseline = run(original, m::expected(good), "original_lo_control", directory);
+    const auto actual = run(mutated, m::expected(changed), "original_hi_control", directory);
     check(!actual.empty() && actual != m::expected(good), "legal guest LO-to-HI mutation reddens LO oracle");
+    // Independently of expected(first_is_high): with all source bits set, first LO/HI counts
+    // are min(N,32)/max(N-32,0). Their modular difference is -N below32, N-64 above32.
+    // The second MBCNT carries that change into v2; the later pair resets both destinations.
+    if (baseline.size() == 64 * 36 && actual.size() == baseline.size()) {
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            const uint32_t delta = lane < 32 ? 0u - lane : lane - 64u;
+            for (uint32_t word = 0; word < 36; ++word) {
+                const bool carries = word == 8 || word == 9 || word == 20 || word == 21;
+                check(actual[lane * 36 + word] - baseline[lane * 36 + word] == (carries ? delta : 0u),
+                      "analytic mutation delta lane=" + std::to_string(lane) + " word=" + std::to_string(word));
+            }
+        }
+        for (uint32_t lane : {0u, 1u, 4u, 5u, 31u, 32u, 33u, 63u}) {
+            const uint32_t addend = uint32_t(0xfffffff0ull + 3ull * lane);
+            const uint32_t lo = lane < 32 ? lane : 32u, hi = lane < 32 ? 0u : lane - 32u;
+            for (uint32_t export_word : {0u, 12u}) for (uint32_t channel = 0; channel < 2; ++channel) {
+                const uint32_t word = lane * 36 + export_word + 8 + channel;
+                check(baseline[word] == addend + lo + channel * hi &&
+                      actual[word] == addend + hi + channel * hi,
+                      "independent LO/HI boundary raw values lane=" + std::to_string(lane));
+            }
+            check(actual[lane * 36 + 32] == addend + lo &&
+                  actual[lane * 36 + 33] == addend + lo + hi,
+                  "later EXP boundary values are reset lane=" + std::to_string(lane));
+        }
+        check(baseline[4 * 36 + 8] == 0u && actual[4 * 36 + 8] == 0xfffffffcu,
+              "original LO count wraps while mutated first HI adds zero");
+    }
 
     // Operand KINDS must survive decoding: v106/v126 are numeric columns, not architectural
     // VCC/EXEC merely because their decoded register numbers overlap those scalar encodings.
@@ -99,7 +159,13 @@ int main(int argc, char** argv) {
     missing = m::packet(varying);
     std::erase_if(missing.vgprs, [](const auto& value) { return value.reg == 5; });
     refuse(missing, "packet-vgpr-input-unavailable", "missing supplied vector source");
-    missing = m::packet(varying); missing.slots_available[31] = false;
+    m::Case only63 = varying; only63.exec = uint64_t(1) << 63;
+    const auto owned_inactive = m::packet(only63);
+    check(!(owned_inactive.exec_mask & (uint64_t(1) << 31)) &&
+          !owned_inactive.export_enabled[31] && owned_inactive.slots_available[31],
+          "paired slot31 is supplied, genuinely EXEC-off and export-ineligible");
+    run(owned_inactive, m::expected(only63), "owned_inactive_slot31", directory);
+    missing = owned_inactive; missing.slots_available[31] = false;
     refuse(missing, "packet-invocation-state-unavailable", "missing EXEC-off/export-ineligible slot");
     missing = m::packet(varying);
     std::erase_if(missing.vgprs, [](const auto& value) { return value.reg == 1; });

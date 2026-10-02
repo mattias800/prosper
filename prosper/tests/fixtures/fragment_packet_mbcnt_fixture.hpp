@@ -4,6 +4,9 @@
 namespace prosper::test::fragment_packet::mbcnt {
 // These original guest programs consume owned register packets, not inferred raster waves.
 // The oracle enumerates source-word bit positions independently of emitted event/scratch state.
+// AMD RDNA2 XML pins U32 operands and encodings 869/870. The position-prefix contract is at
+// https://gpuopen.com/learn/fast-compaction-with-mbcnt/ : count source bits strictly below lane N.
+// Splitting those 64 positions gives LO min(N,32) and HI max(N-32,0), not N bits of a HI dword.
 enum class Source { Exec, Vcc, SavedVcc, Scalar, Vgpr, Inline, InlineFloat, Literal, Full };
 enum class Accumulator { Vgpr, Scc, Scalar, Inline, InlineFloat, Literal };
 struct Case {
