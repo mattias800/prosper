@@ -1,10 +1,12 @@
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/compiler_resource_access.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/indirect/rdna2_indirect_buffer_shadow.hpp"
 #include "build_revision.hpp"
 #include "fixtures/test_scratch.h"
 #include <bit>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <fstream>
@@ -28,31 +30,43 @@ static const std::vector<uint32_t> green = {
     0x7e000280, 0x7e0202f2, 0x7e040280, 0x7e0602f2,
     0xf800180f, 0x03020100, 0xbf810000,
 };
+// Defined raw integer literal -> ordered F32 zero compare -> live MRT0.r. No float Input,
+// runtime memory or host FP is involved: guest preserve compares subnormal != zero; flush equals.
+static const std::vector<uint32_t> mode_probe = {
+    0x7e0002ffu, 1u,                    // v0 raw bits = smallest positive subnormal
+    0xd402006au, 128u | (256u << 9),   // v_cmp_eq_f32_e64 VCC, 0, v0
+    0xd5010000u, 128u | (242u << 9) | (106u << 18), // v0 = VCC ? 1.0 : 0.0
+    0x7e0202f2u, 0x7e040280u, 0x7e0602f2u,
+    0xf800180fu, 0x03020100u, 0xbf810000u,
+};
 static std::string identity() {
     return std::string(prosper::embedded_build_revision()) + ':' + prosper::embedded_build_source_identity();
 }
 static FragmentCompileCase produce(std::vector<uint32_t> code, bool wave32 = false,
-                                   const ShaderResourceTable* table = nullptr) {
+                                   const ShaderResourceTable* table = nullptr,
+                                   FragmentFloatMode mode = {}) {
     FragmentCompileCase c;
     c.compiler = identity(); c.program_address = 0x123400;
-    c.code = std::move(code); c.wave32 = wave32;
+    c.code = std::move(code); c.wave32 = wave32; c.float_mode = mode;
     own_fragment_compile_case_resources(c, table);
     c.interpolation = fragment_interpolation_layout(c.code.data(), c.code.size());
     std::vector<uint32_t> source;
     { CompilerChoiceScope choices(c.choices); TerminalRejectCapture rejection;
       source = recompile_fragment(c.code.data(), c.code.size(), table, nullptr, UINT32_MAX,
-          &c.interpolation, wave32, {RecompileDiagnosticStage::Fragment, c.program_address});
+          &c.interpolation, wave32, {RecompileDiagnosticStage::Fragment, c.program_address}, mode);
       const auto rejects = rejection.take();
       c.expected_reject = rejects.empty() ? std::string{} :
           rejects.back().first + " " + rejects.back().second; }
     finish_fragment_compile_case(c, std::move(source)); return c;
 }
 // Fail-closed typed oracle for this project's constant MRT fixture, independent of round-trip
-// equality. Only constant/composite/copy values feeding the live location-0 Output store qualify.
-static bool solid_green(const std::vector<uint32_t>& w) {
+// equality. Only defined constants, a bounded typed UInt32/Boolean relation, selects and
+// composites feeding the live location-0 Output qualify. Unknown/FP/Input/Undef dependencies fail.
+static bool constant_color(const std::vector<uint32_t>& w, const std::vector<uint32_t>& expected) {
     if (w.size() < 5 || w[0] != 0x07230203) return false;
     std::map<uint32_t, std::vector<uint32_t>> value;
     std::map<uint32_t, uint32_t> storage, location, types;
+    std::map<uint32_t, uint32_t> kind, operation;
     std::map<uint32_t, std::vector<uint32_t>> operands;
     uint32_t output = 0, stored = 0;
     for (size_t k = 5; k < w.size();) {
@@ -60,11 +74,20 @@ static bool solid_green(const std::vector<uint32_t>& w) {
         if (!n || n > w.size() - k) return false;
         if (op == 22 && n == 3 && w[k + 2] == 32) types[w[k + 1]] = 1; // float32
         if (op == 21 && n == 4 && w[k + 2] == 32 && w[k + 3] == 0) types[w[k + 1]] = 2; // uint32
+        if (op == 20 && n == 2) types[w[k + 1]] = 3; // Boolean
         if (op == 23 && n == 4 && w[k + 3] == 4 && types[w[k + 2]] == 1) types[w[k + 1]] = 4;
-        if (op == 43 && n == 4 && (types[w[k + 1]] == 1 || types[w[k + 1]] == 2)) value[w[k + 2]] = {w[k + 3]};
-        if ((op == 80 || op == 83 || op == 124) && n >= 4) {
-            if (types[w[k + 1]] == 4 || types[w[k + 1]] == 1)
+        if (op == 43 && n == 4 && (types[w[k + 1]] == 1 || types[w[k + 1]] == 2)) {
+            value[w[k + 2]] = {w[k + 3]}; kind[w[k + 2]] = types[w[k + 1]];
+        }
+        if ((op == 41 || op == 42) && n == 3 && types[w[k + 1]] == 3) {
+            value[w[k + 2]] = {op == 41 ? 1u : 0u}; kind[w[k + 2]] = 3;
+        }
+        if ((op == 80 || op == 83 || op == 124 || op == 168 || op == 169 ||
+             op == 170 || op == 171 || op == 174 || op == 199) && n >= 4) {
+            if (types[w[k + 1]] >= 1 && types[w[k + 1]] <= 4) {
                 operands[w[k + 2]] = std::vector<uint32_t>(w.begin() + k + 3, w.begin() + k + n);
+                kind[w[k + 2]] = types[w[k + 1]]; operation[w[k + 2]] = op;
+            }
         }
         if (op == 59 && n >= 4) storage[w[k + 2]] = w[k + 3];
         if (op == 71 && n == 4 && w[k + 2] == 30) location[w[k + 1]] = w[k + 3];
@@ -82,12 +105,33 @@ static bool solid_green(const std::vector<uint32_t>& w) {
             std::vector<uint32_t> v; bool known = true;
             for (auto x : inputs) { if (!value.contains(x)) { known = false; break; }
                 v.insert(v.end(), value[x].begin(), value[x].end()); }
-            if (known) { value[id] = std::move(v); progress = true; }
+            if (!known) continue;
+            const auto op = operation[id], result_kind = kind[id];
+            bool typed = false;
+            if (op == 80) typed = result_kind == 4 && inputs.size() == 4 && v.size() == 4 &&
+                std::all_of(inputs.begin(), inputs.end(), [&](auto x) { return kind[x] == 1 && value[x].size() == 1; });
+            else if (op == 83 || op == 124) typed = inputs.size() == 1 &&
+                (op == 83 ? kind[inputs[0]] == result_kind : result_kind == 1 && kind[inputs[0]] == 2);
+            else if (op == 168 && result_kind == 3 && inputs.size() == 1 && v.size() == 1 && kind[inputs[0]] == 3) {
+                typed = true; v[0] = !v[0];
+            } else if (op == 169 && inputs.size() == 3 && kind[inputs[0]] == 3 && value[inputs[0]].size() == 1 &&
+                       kind[inputs[1]] == result_kind && kind[inputs[2]] == result_kind) {
+                typed = true; v = value[inputs[value[inputs[0]][0] ? 1 : 2]];
+            } else if (inputs.size() == 2 && v.size() == 2 && kind[inputs[0]] == 2 && kind[inputs[1]] == 2) {
+                if (op == 199 && result_kind == 2) { typed = true; v = {v[0] & v[1]}; }
+                if (result_kind == 3 && (op == 170 || op == 171 || op == 174)) {
+                    typed = true; v = {uint32_t(op == 170 ? v[0] == v[1] : op == 171 ? v[0] != v[1] : v[0] >= v[1])};
+                }
+            }
+            if (typed) { value[id] = std::move(v); progress = true; }
         }
         if (!progress) break;
     }
     return output && stored && value.contains(stored) &&
-        value[stored] == std::vector<uint32_t>({0, 0x3f800000, 0, 0x3f800000});
+        value[stored] == expected;
+}
+static bool solid_green(const std::vector<uint32_t>& w) {
+    return constant_color(w, {0, 0x3f800000, 0, 0x3f800000});
 }
 static std::vector<std::filesystem::path> files(const std::filesystem::path& dir) {
     std::vector<std::filesystem::path> result;
@@ -145,6 +189,9 @@ static void codec_tests(const FragmentCompileCase& produced) {
     CHECK(refused.expected_reject.find("no supported export") != std::string::npos);
     CHECK(replay_fragment_compile_case(decode_fragment_compile_case(encode_fragment_compile_case(refused)), true).empty());
     CHECK(replay_fragment_compile_case(refused, false).empty());
+    std::string actual_refusal;
+    CHECK(replay_fragment_compile_case(refused, false, &actual_refusal).empty() && actual_refusal == refused.expected_reject);
+    CHECK(replay_fragment_compile_case(produced, false, &actual_refusal) == produced.source && actual_refusal.empty());
     auto unrecorded = refused; unrecorded.expected_reject.clear();
     finish_fragment_compile_case(unrecorded, {});
     CHECK(!unrecorded.complete && unrecorded.reason == "compiler-refusal-diagnostic-unavailable");
@@ -352,6 +399,46 @@ static void atomic_tests(const FragmentCompileCase& c) {
     for (const auto& item : std::filesystem::directory_iterator(path.parent_path()))
         CHECK(item.path().filename().string().find("atomic.prfc.tmp-") == std::string::npos);
 }
+static void mode_tests() {
+    const auto compare = rdna2_decode_one(mode_probe.data() + 2, 2);
+    CHECK(compare.fmt == Rdna2Format::VOPC && compare.opcode == 2 && compare.dst.value == 106 &&
+          compare.src[0].kind == OperandKind::InlineInt && compare.src[0].value == 0 &&
+          compare.src[1].kind == OperandKind::VGPR && compare.src[1].value == 0);
+    for (const bool wave32 : {false, true}) {
+        const auto flush = produce(mode_probe, wave32, nullptr, {true, 0});
+        const auto preserve = produce(mode_probe, wave32, nullptr, {true, 16});
+        CHECK(flush.complete && preserve.complete && flush.source != preserve.source);
+        CHECK(constant_color(flush.source, {0x3f800000, 0x3f800000, 0, 0x3f800000}));
+        CHECK(solid_green(preserve.source));
+        CHECK(replay_fragment_compile_case(decode_fragment_compile_case(encode_fragment_compile_case(flush)), true) == flush.source);
+        CHECK(replay_fragment_compile_case(decode_fragment_compile_case(encode_fragment_compile_case(preserve)), true) == preserve.source);
+        auto lost_mode = flush; lost_mode.float_mode = preserve.float_mode;
+        CHECK(error([&] { replay_fragment_compile_case(lost_mode, true); }).find("SOURCE differs") != std::string::npos);
+    }
+    for (unsigned byte = 0; byte < 256; ++byte) {
+        const FragmentFloatMode mode{true, uint8_t(byte)};
+        const auto c = produce(green, false, nullptr, mode);
+        const auto decoded = decode_fragment_compile_case(encode_fragment_compile_case(c));
+        CHECK(c.complete && decoded.float_mode == mode && replay_fragment_compile_case(decoded, true) == c.source);
+    }
+    const auto directory = prosper_test::test_scratch_dir() / "mode";
+    clear_shader_recompile_cache(); env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", directory.string().c_str());
+    const auto compile = [&](FragmentFloatMode mode) {
+        return recompile_graphics_shader_cached(ShaderProgramStage::Fragment, mode_probe.data(), mode_probe.size(),
+            nullptr, nullptr, nullptr, nullptr, false, 0, false, {}, mode);
+    };
+    const auto flush = compile({true, 0}), preserve = compile({true, 16});
+    const auto before = shader_recompile_cache_stats();
+    CHECK(flush != preserve && solid_green(preserve));
+    CHECK(compile({true, 0}) == flush && shader_recompile_cache_stats().hits == before.hits + 1);
+    CHECK(files(directory).size() == 2);
+    for (const auto& path : files(directory)) {
+        const auto c = read_fragment_compile_case(path);
+        CHECK(c.complete && c.float_mode.available && (c.float_mode.value == 0 || c.float_mode.value == 16));
+        CHECK(c.source == (c.float_mode.value == 0 ? flush : preserve) && replay_fragment_compile_case(c, true) == c.source);
+    }
+    env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", nullptr);
+}
 int main(int argc, char** argv) {
     try {
         env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", nullptr); env("PROSPER_FS_TAP", nullptr);
@@ -374,17 +461,27 @@ int main(int argc, char** argv) {
             write_fragment_compile_case(dir / "different.prfc", mismatch);
             auto broken_source = produce(green); broken_source.source.back() ^= 1;
             write_fragment_compile_case(dir / "wrong-source.prfc", broken_source);
+            for (uint8_t mode : {uint8_t(0), uint8_t(16)}) {
+                auto c = produce(mode_probe, false, nullptr, {true, mode}); CHECK(c.complete);
+                CHECK(constant_color(c.source, {mode ? 0u : 0x3f800000u, 0x3f800000u, 0, 0x3f800000u}));
+                write_fragment_compile_case(dir / (mode ? "preserve.prfc" : "flush.prfc"), c);
+            }
         } else {
             CHECK(argc == 1 || (argc == 3 && std::string_view(argv[1]) == "--dump"));
             auto c = produce(green); CHECK(c.complete);
-            codec_tests(c); resource_tests(c); cache_tests(); atomic_tests(c);
+            codec_tests(c); resource_tests(c); cache_tests(); atomic_tests(c); mode_tests();
             auto wave32 = produce(green, true); CHECK(wave32.complete && solid_green(wave32.source));
             CHECK(wave32.wave32 && !c.wave32); // width need not alter a wave-insensitive program
-            auto unknown = c; unknown.float_mode_available = false; unknown.float_mode = 1;
+            auto unknown = c; unknown.float_mode = {false, 1};
             CHECK(!error([&] { encode_fragment_compile_case(unknown); }).empty());
             if (argc == 3) { const std::filesystem::path dir = argv[2]; std::filesystem::create_directories(dir);
                 write_fragment_compile_source(dir / "wave64.spv", c.source);
-                write_fragment_compile_source(dir / "wave32.spv", wave32.source); }
+                write_fragment_compile_source(dir / "wave32.spv", wave32.source);
+                for (bool narrow : {false, true}) for (uint8_t mode : {uint8_t(0), uint8_t(16)}) {
+                    auto known = produce(mode_probe, narrow, nullptr, {true, mode}); CHECK(known.complete);
+                    write_fragment_compile_source(dir / (std::string("mode") + std::to_string(mode) +
+                        "-wave" + (narrow ? "32" : "64") + ".spv"), known.source);
+                } }
         }
     } catch (const std::exception& e) { ++failures; std::printf("[FAIL] unexpected: %s\n", e.what()); }
     std::printf("fragment compile case: %u checks, %u independent resource fields, %u failures\n", checks, field_checks, failures);

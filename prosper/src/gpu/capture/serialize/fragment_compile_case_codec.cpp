@@ -60,7 +60,7 @@ template<class A, class C> void capsule(A& a, C& c) {
       c.interpolation.attribute_mask, c.interpolation.smooth_mask,
       c.interpolation.passthrough_mask, c.interpolation.flat_mask,
       c.interpolation.requires_geometry, c.interpolation.valid,
-      c.wave32, c.float_mode_available, c.float_mode, c.pcrel_target,
+      c.wave32, c.float_mode.available, c.float_mode.value, c.pcrel_target,
       c.trip.bound, c.trip.only_program, c.trip.only_phase, c.trip.only_ordinal,
       c.resources.vertices_per_instance);
     a.sequence(c.resources.resources, kCompileCaseMaxResources);

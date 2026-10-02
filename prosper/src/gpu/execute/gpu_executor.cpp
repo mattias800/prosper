@@ -1532,8 +1532,7 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
             record->has_pixel_inputs = key.has_pixel_inputs; record->pixel_inputs = key.pixel_inputs;
             record->has_system_inputs = key.has_system_inputs; record->system_inputs = key.system_inputs;
             record->interpolation = interpolation; record->wave32 = key.fragment_wave32;
-            record->float_mode_available = key.fragment_float_mode.available;
-            record->float_mode = key.fragment_float_mode.value;
+            record->float_mode = key.fragment_float_mode;
             record->pcrel_target = key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX;
             record->trip = key.trip_bound;
             try {

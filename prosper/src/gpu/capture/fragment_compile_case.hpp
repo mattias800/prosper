@@ -48,9 +48,7 @@ struct FragmentCompileCase {
     PixelSystemInputMapping system_inputs{};
     FragmentInterpolationLayout interpolation{};
     bool wave32 = false;
-    // Reserved invocation authority for #4056; unavailable is canonical and never inferred.
-    bool float_mode_available = false;
-    uint8_t float_mode = 0;
+    FragmentFloatMode float_mode{}; // actual producing key authority; unavailable is never inferred
     uint32_t pcrel_target = UINT32_MAX;
     ComputeTripBoundSettings trip{};
     ShaderResourceTable resources;
@@ -64,7 +62,8 @@ struct FragmentCompileCase {
 void own_fragment_compile_case_resources(FragmentCompileCase&, const ShaderResourceTable*);
 void restore_fragment_compile_case_backing(FragmentCompileCase&);
 void validate_fragment_compile_case(const FragmentCompileCase&);
-std::vector<uint32_t> replay_fragment_compile_case(const FragmentCompileCase&, bool baseline);
+std::vector<uint32_t> replay_fragment_compile_case(const FragmentCompileCase&, bool baseline,
+                                                 std::string* actual_refusal = nullptr);
 void finish_fragment_compile_case(FragmentCompileCase&, std::vector<uint32_t> source);
 std::vector<uint8_t> encode_fragment_compile_case(const FragmentCompileCase&);
 FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t>);

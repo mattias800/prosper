@@ -199,10 +199,7 @@ void validate_fragment_compile_case(const FragmentCompileCase& c) {
         require(c.compiler.find("unknown") == std::string::npos && !c.compiler.empty(), "compile-case compiler identity unknown");
         require(c.choices.error.empty(), "compile-case choices unavailable");
     }
-    require(c.float_mode_available || c.float_mode == 0, "compile-case noncanonical float mode");
-    // The merged #4056 API will replace this reservation before schema 1 is released. Until then
-    // a known byte must never be silently ignored by an older compiler invocation.
-    require(!c.float_mode_available, "compile-case known float mode API not integrated");
+    require(c.float_mode.canonical(), "compile-case noncanonical float mode");
     require(c.resources.resources.size() <= kCompileCaseMaxResources &&
             c.blobs.size() <= kCompileCaseMaxBlobs && c.choices.reads.size() <= 65536,
             "compile-case collection budget");
@@ -253,7 +250,9 @@ void validate_fragment_compile_case(const FragmentCompileCase& c) {
     }
 }
 
-std::vector<uint32_t> replay_fragment_compile_case(const FragmentCompileCase& c, bool baseline) {
+std::vector<uint32_t> replay_fragment_compile_case(const FragmentCompileCase& c, bool baseline,
+                                                 std::string* actual_refusal) {
+    if (actual_refusal) actual_refusal->clear();
     validate_fragment_compile_case(c);
     require(c.complete, "INCOMPLETE fragment compile case cannot replay");
     require(prosper::embedded_fragment_compile_read_policy_verified(),
@@ -276,14 +275,16 @@ std::vector<uint32_t> replay_fragment_compile_case(const FragmentCompileCase& c,
     TerminalRejectCapture rejection;
     auto result = recompile_fragment(c.code.data(), c.code.size(), c.has_resources ? &owned.resources : nullptr,
         c.has_system_inputs ? &c.system_inputs : nullptr, c.pcrel_target,
-        &c.interpolation, c.wave32, {RecompileDiagnosticStage::Fragment, c.program_address});
+        &c.interpolation, c.wave32, {RecompileDiagnosticStage::Fragment, c.program_address}, c.float_mode);
     choices.finish_replay();
     if (baseline) require(result == c.source, "baseline SOURCE differs (full word comparison)");
     const auto reject_records = rejection.take();
-    if (baseline && result.empty()) {
-        require(!reject_records.empty(), "baseline actual refusal diagnostic absent");
+    if (result.empty()) {
+        require(!reject_records.empty(), "INCOMPLETE: actual compiler refusal diagnostic absent");
         const std::string reject = reject_records.back().first + " " + reject_records.back().second;
-        require(reject == c.expected_reject, "baseline refusal diagnostic differs");
+        require(reject.size() <= 256, "INCOMPLETE: actual compiler refusal diagnostic budget");
+        if (baseline) require(reject == c.expected_reject, "baseline refusal diagnostic differs");
+        if (actual_refusal) *actual_refusal = reject;
     }
     return result;
 }

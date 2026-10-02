@@ -5,6 +5,8 @@ compile. Each `.prfc` is one bounded, versioned compiler attempt, including full
 (also trailing retained data), full resource/interface metadata, selected width/PC-relative target,
 pinned trip settings, actual consumed semantic choices, immutable linked compiler identity, and
 expected complete SOURCE or refusal. It is not a frame capture.
+The actual producing key's complete guest FLOAT_MODE byte and availability are retained separately
+from wave width and host float-control publication. Unknown stays unknown; replay never infers it.
 
 ```text
 fragment_compile_replay --inspect-only <CASE.prfc>

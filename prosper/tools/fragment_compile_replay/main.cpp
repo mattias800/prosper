@@ -28,14 +28,19 @@ int main(int argc, char** argv) {
         std::cout << "input=" << (c.complete ? "COMPLETE" : "INCOMPLETE") << " reason="
                   << (c.reason.empty() ? "none" : c.reason) << " expected="
                   << (c.expected_produced ? "PRODUCED" : "REFUSED") << " raw_words=" << c.code.size()
-                  << " source_words=" << c.source.size() << " semantic_reads=" << c.choices.reads.size() << '\n'
+                  << " source_words=" << c.source.size() << " semantic_reads=" << c.choices.reads.size()
+                  << " wave_width=" << (c.wave32 ? 32 : 64) << " guest_float_mode="
+                  << (c.float_mode.available ? std::to_string(c.float_mode.value) : "unknown") << '\n'
                   << "producing_compiler=" << c.compiler << " replay_compiler="
                   << prosper::embedded_build_revision() << ':' << prosper::embedded_build_source_identity() << '\n';
+        if (!c.expected_reject.empty()) std::cout << "producer_refusal=" << c.expected_reject << '\n';
         if (mode == "--inspect-only") return 0;
         const bool baseline = mode == "--baseline";
-        const auto result = replay_fragment_compile_case(c, baseline);
+        std::string actual_refusal;
+        const auto result = replay_fragment_compile_case(c, baseline, &actual_refusal);
         std::cout << (baseline ? "BASELINE MATCH " : "CANDIDATE ")
                   << (result.empty() ? "REFUSED" : "PRODUCED") << " source_words=" << result.size() << '\n';
+        if (!actual_refusal.empty()) std::cout << "actual_refusal=" << actual_refusal << '\n';
         if (!result.empty() && argc == 5) write_fragment_compile_source(argv[4], result);
         return !baseline && result.empty() ? 3 : 0;
     } catch (const std::exception& e) {

@@ -41,11 +41,20 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
         assert baseline.read_bytes()[:4] == b"\x03\x02\x23\x07"
         run(validator, "--target-env", "vulkan1.1", str(baseline))
         run(validator, "--target-env", "vulkan1.1", str(candidate))
-    assert "BASELINE MATCH REFUSED" in run(replay, "--baseline", str(root / "refused.prfc"))
+    mode_outputs = []
+    for name, mode in (("flush", 0), ("preserve", 16)):
+        output = root / f"{name}.spv"
+        report = run(replay, "--baseline", str(root / f"{name}.prfc"), "--output", str(output))
+        assert f"guest_float_mode={mode}" in report and "BASELINE MATCH PRODUCED" in report
+        run(validator, "--target-env", "vulkan1.1", str(output))
+        mode_outputs.append(output.read_bytes())
+    assert mode_outputs[0] != mode_outputs[1], "captured guest mode must reach live compiler relation"
+    refusal = run(replay, "--baseline", str(root / "refused.prfc"))
+    assert "BASELINE MATCH REFUSED" in refusal and "actual_refusal=" in refusal and "no supported export" in refusal
     saved = root / "preserved.spv"
     saved.write_bytes(b"previous-output")
-    assert "CANDIDATE REFUSED" in run(replay, "--candidate", str(root / "refused.prfc"),
-                                     "--output", str(saved), code=3)
+    refusal = run(replay, "--candidate", str(root / "refused.prfc"), "--output", str(saved), code=3)
+    assert "CANDIDATE REFUSED" in refusal and "actual_refusal=" in refusal and "no supported export" in refusal
     assert saved.read_bytes() == b"previous-output"
     assert "INCOMPLETE" in run(replay, "--inspect-only", str(root / "incomplete.prfc"))
     assert "INCOMPLETE" in run(replay, "--candidate", str(root / "incomplete.prfc"), code=2)
@@ -68,4 +77,4 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
     invalid_spv.write_bytes(b"not-a-SPIR-V-module")
     run(validator, "--target-env", "vulkan1.1", str(invalid_spv), code=1)
 
-print(f"fragment compile replay CLI: {checks} real invocations passed, four strict modules and validator rejection; no GPU/game")
+print(f"fragment compile replay CLI: {checks} real invocations passed, six strict modules and validator rejection; no GPU/game")
