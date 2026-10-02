@@ -1564,6 +1564,23 @@ namespace {
                     }
                 }
             }
+            // An occupant the tracker does not know -- a host mapping -- is skipped the same way,
+            // when the host can say where it ends (Darwin; see prosper_host_occupant_end, #4043).
+            // Still only a starting hint: the next iteration claims with NOREPLACE semantics again.
+            if (const uint64_t host_end = prosper_host_occupant_end(cand, cand + len);
+                host_end > next && host_end <= UINT64_MAX - (align - 1)) {
+                const uint64_t past = align_up(host_end, align);
+                static std::atomic<bool> reported{false};
+                if (past - cand >= (1ull << 30) && !reported.exchange(true))
+                    fprintf(stderr, "[mem] auto-map: skipped an untracked host mapping ending at "
+                                    "0x%llx (%llu MiB past the probe at 0x%llx) in one step "
+                                    "instead of %llu 64 KiB probes (#4043; reported once)\n",
+                            (unsigned long long)host_end,
+                            (unsigned long long)((past - cand) >> 20),
+                            (unsigned long long)cand,
+                            (unsigned long long)((past - cand) / step));
+                next = past;
+            }
             if (next <= cand) return nullptr;
             cand = next;
         }
