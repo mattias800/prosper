@@ -11,4 +11,5 @@ Do not switch or reset someone else's worktree to silence a warning.
 Follow the applicable nested `AGENTS.md` files for the area being changed. The startup check is
 automatic in Claude Code through `.claude/settings.json`; other agents run the command above.
 
-Skills live in `.claude/skills/`: `start-task`, `build-and-test` and `implement-hle-function`. Test rules: `prosper/tests/AGENTS.md`.
+Optional project skills live in `.claude/skills/`: `start-task` and `implement-hle-function`.
+They do not expand task authorization. Test rules: `prosper/tests/AGENTS.md`.

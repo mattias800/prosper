@@ -494,14 +494,16 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   output capture fails, so redirect stdout **and** stderr to a file on the real disk, end with `exit 0`,
   read that file, and `rm -rf` scratch that is a day or more old. Leave `/tmp/claude-*` and anything
   touched in the last few hours alone — other agents are live.
-- **Always create tests.** Every bug fix, issue or review finding adds a test that fails without
-  the fix, and every new or changed HLE function gets a test for its return codes and edge cases.
-  Verify a finding against the code before writing its test. Never weaken an assertion to get green
-  without saying why in the PR. Full rules: `prosper/tests/AGENTS.md`. PR descriptions follow
+- **Behavior changes need meaningful regression coverage.** Add or extend a test that fails without
+  a behavioral bug fix, including verified review findings. New or changed HLE behavior needs
+  coverage for its established return codes and edge cases. Pure documentation and mechanical
+  changes use relevant checks when there is no behavior to assert; state the scope and any
+  verification limits in the PR. Never weaken an assertion to get green without explaining why.
+  Full rules: `prosper/tests/AGENTS.md`. PR descriptions may use
   `.github/pull_request_template.md` (Context, Higher Goal, Acceptance Criteria, Out of Scope,
-  Summary of Changes, Verification).
-  Skills in `.claude/skills/`: `start-task` (begin any task), `build-and-test`, and `implement-hle-function` (fix or add a
-  reimplemented Sony function, test-first).
+  Summary of Changes, Verification), scaled to the change.
+  Optional project skills in `.claude/skills/`: `start-task` and `implement-hle-function`.
+  They preserve the task's existing authorization, resource coordination and machine-local rules.
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth
   **only with `--no-tests=error`** — plain `ctest` on a build directory with nothing registered prints
   `No tests were found!!!` and **exits 0**, so "no tests ran" and "everything passed" are the same

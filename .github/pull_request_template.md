@@ -12,7 +12,7 @@
 
 ## Out of Scope
 
-<!-- Boundaries and deferred work (file an issue for each deferred item). -->
+<!-- Boundaries and deferred work; link existing issues or use the authorized issue workflow. -->
 
 ## Summary of Changes
 
@@ -28,8 +28,8 @@
 
 ## Checklist
 
-- [ ] A test that fails without the change is included, or the PR says why none can run ([prosper/tests/AGENTS.md](../prosper/tests/AGENTS.md))
-- [ ] Every new file lives under `prosper/`; a new `prosper/src/**/*.cpp` touches `prosper/tests/`
+- [ ] Behavior changes have a meaningful regression; nonbehavioral scope and execution limits are stated ([test rules](https://github.com/mattias800/prosper/blob/main/prosper/tests/AGENTS.md))
+- [ ] New source/test files live under `prosper/`; repository metadata uses the contribution-shape allowlist; a new `prosper/src/**/*.cpp` touches `prosper/tests/`
 - [ ] No Sony code/keys/firmware, no game data, no `*-app0` content, no absolute host paths
 - [ ] No unconditional "owned" answers to entitlement/add-content queries
 - [ ] Any falsified hypothesis recorded in the relevant `## Ruled out` section
