@@ -138,6 +138,34 @@ solved fence investigation when diagnosing a later Windows failure.
 
 ## Full frontend build and validation (native Windows, MinGW)
 
+### Native Clang TLS profile (#4078)
+
+WinLibs GCC16.1 POSIX UCRT has a reproduced C++ TLS lifetime defect: its emulated TLS allocation
+is freed from winpthreads cleanup before the C++ destructor runs. This can crash concurrent warm
+shader-key lookups with diagnostic exports armed. Shared linkage does not correct the measured
+failure. Do not disable scratch/export to claim correctness.
+
+The opt-in native Windows GNU-ABI Clang profile uses existing LLVM and MinGW installations and
+selects native TLS explicitly. It installs nothing and requires a **new owned build directory**:
+
+```powershell
+cmake -S prosper -B prosper/build-native-clang -G Ninja `
+  -DCMAKE_TOOLCHAIN_FILE=cmake/windows-native-clang.cmake `
+  -DPROSPER_NATIVE_CLANG_ROOT=<EXISTING_LLVM_ROOT> `
+  -DPROSPER_NATIVE_MINGW_ROOT=<EXISTING_MINGW_ROOT> `
+  -DCMAKE_BUILD_TYPE=Release -DPROSPER_APP=OFF `
+  -DGAME_DUMP=<DUMP_ROOT>/PPSA24651-app0
+cmake --build prosper/build-native-clang -j6 --target test_native_tls_lifetime
+ctest --test-dir prosper/build-native-clang --no-tests=error -R '^native_tls_lifetime$' --output-on-failure
+```
+
+`native_tls_lifetime` asserts 800 constructor/destructor pairs plus bounded payload ownership under
+allocation pressure. It runs without prosper_core, GPU or game execution and does not waive the
+ordinary shader-cache/export regressions. Inspect actual compile/link commands and TLS lowering,
+not only the requested profile name. An otherwise identical Clang `-femulated-tls` control reproduces
+the failure; native TLS passes the standalone reproduction. The legacy GCC recipes below remain
+historical/diagnostic on the affected runtime, not a claim that GCC16.1 is lifetime-safe.
+
 The normal interactive path is now one command from the repository root. It configures the full
 SDL3 video/audio/controller build when needed and then launches the title in the native window:
 
