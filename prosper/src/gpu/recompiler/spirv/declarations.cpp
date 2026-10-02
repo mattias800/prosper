@@ -23,6 +23,15 @@ void SpirvCompute::declare_float_controls(uint32_t entry) {
         // ambient publisher change this module's producing profile or its bit-preserving ops.
         if (!float_transport.explicit_nonfinite32() && !signed_zero_inf_nan_preserve_declared()) return;
         float_controls_declared = true;
+        if (float_transport.explicit_nonfinite32() && !float_transport_declared) {
+            // Even a generated stage with no eligible transport forces SZI32 from this profile.
+            // Retain its full feature envelope in the WORDS so a different executing device
+            // cannot miss the SZI prerequisite merely because there are no None decorations.
+            float_transport_declared = true;
+            put(caps, Op_Capability, {Cap_FloatControls2});
+            std::vector<uint32_t> extension; pstr(extension, "SPV_KHR_float_controls2");
+            putv(exts, Op_Extension, extension);
+        }
         put(caps, Op_Capability, {Cap_SignedZeroInfNanPreserve});
         std::vector<uint32_t> o; pstr(o, "SPV_KHR_float_controls");
         putv(exts, Op_Extension, o);
@@ -63,12 +72,6 @@ void SpirvCompute::decorate_float_transport(uint32_t result) {
                 static_cast<unsigned long long>(diagnostic.program_address),
                 static_cast<unsigned>(diagnostic.stage));
             return;
-        }
-        if (!float_transport_declared) {
-            float_transport_declared = true;
-            put(caps, Op_Capability, {Cap_FloatControls2});
-            std::vector<uint32_t> extension; pstr(extension, "SPV_KHR_float_controls2");
-            putv(exts, Op_Extension, extension);
         }
         // Per-instruction None overrides implicit NSZ/NotInf/NotNaN. Never decorate arithmetic
         // or publish FPFastMathDefault (which cannot coexist with SZI/NoContraction).

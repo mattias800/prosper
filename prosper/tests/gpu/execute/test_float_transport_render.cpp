@@ -108,8 +108,9 @@ void dump(const char* directory,const std::string& name,const std::vector<uint32
 }
 int main(int argc,char** argv) {
     const char* directory=nullptr;
+    const bool query_only=argc==2 && std::string_view(argv[1])=="--device-query-only";
     if(argc==3 && std::string_view(argv[1])=="--dump-directory") {directory=argv[2];std::filesystem::create_directories(directory);}
-    else if(argc!=1) return 2;
+    else if(argc!=1 && !query_only) return 2;
     const auto& device=prosper::test::render_vk_ctx(); // query AND request AND successful creation first
     if(!device.ok) {std::fprintf(stderr,"float transport render: Vulkan device unavailable\n");return 1;}
     if(!device.float_transport.explicit_nonfinite32()) {
@@ -117,6 +118,25 @@ int main(int argc,char** argv) {
     }
     const auto shared=shared_vulkan_context();
     check(shared.valid() && shared.float_transport==device.float_transport,"shared/adopted device retains actual enabled profile");
+    // These independent real physical-device queries inspect REQUEST bytes only. They do not
+    // publish a witness, create a second device, or submit an invalid-feature shader.
+    for(bool request:{false,true}) {
+        VkPhysicalDeviceFeatures2 prior{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        VkDeviceCreateInfo create{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};create.pNext=&prior;
+        VkPhysicalDeviceShaderFloatControls2Features requested{};
+        const auto choice=prosper::frontend::acquire_float_transport_device_features(
+            "transport-request-control",device.phys,prosper::frontend::kVulkanRuntimeVersion,
+            requested,create,request);
+        check(request?(choice.explicit_nonfinite32() && requested.shaderFloatControls2==VK_TRUE &&
+                      create.pNext==&requested && requested.pNext==&prior):
+                     (choice.profile==FloatTransportProfile::Implicit && requested.shaderFloatControls2==VK_FALSE &&
+                      create.pNext==&prior),"actual query/request control retains prior pNext and distinguishes supported from enabled request");
+    }
+    if(query_only) {
+        std::printf("float transport device-query: %u checks, %u failures; no shader/pipeline/submission\n",checks,failures);
+        return failures?1:0;
+    }
+    if(failures) return 1; // never submit a shader if the enabled-request contract already failed
     constexpr std::array<uint32_t,11> samples{0,0x80000000u,1,0x80000001u,0x007fffffu,
         0x00800000u,0x3f800000u,0x7f800000u,0xff800000u,0x7fc01234u,0xffc01234u};
     PixelInputMapping flat;flat.valid_mask=1;flat.controls[0]=0x400; // actual Flat Location0, no custom GS

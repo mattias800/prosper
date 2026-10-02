@@ -89,6 +89,16 @@ int main(int argc, char** argv) {
     std::vector<OperationRealizationFailure> failures_to_capture;
     std::vector<SubmitOperation> operations;
     clear_shader_recompile_cache();
+    uint64_t rejected_identity=0x4066;
+    const FloatTransportConfig invalid{static_cast<FloatTransportProfile>(3)};
+    CHECK(!recompile_vertex_chain_cached_shared(nullptr,0,nullptr,0,nullptr,nullptr,
+              &rejected_identity,0,false,invalid) && rejected_identity==0,
+          "invalid chain profile clears stale caller identity before rejecting");
+    rejected_identity=0x4066;
+    CHECK(!recompile_graphics_shader_cached_shared(ShaderProgramStage::Fragment,
+              fragment,std::size(fragment),nullptr,nullptr,nullptr,&rejected_identity,
+              false,0,false,{}, {true,16},invalid) && rejected_identity==0,
+          "invalid ordinary profile clears stale caller identity before rejecting");
     std::set<uint64_t> identities;
     std::vector<std::shared_ptr<const std::vector<uint32_t>>> modules;
     for (const auto config : {unknown,implicit,explicit32}) {

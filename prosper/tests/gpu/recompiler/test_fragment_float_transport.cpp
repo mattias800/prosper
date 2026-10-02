@@ -342,6 +342,40 @@ void emitter_tests(const char* dir) {
         inventory(m,true,false,name); check(m.count(opcode==3?129:133)==1,name+" genuine FP instruction is present and undecorated");
         dump(dir,name+"_source",source);
     }
+    // Generated geometry can force SZI32 without emitting any eligible cross-float transport.
+    // Its declaration words must still name the executing Explicit device prerequisite.
+    const uint32_t mixed_ps[]{0xc80e0002u,0xc8110002u,0xf800000fu,0x03030303u,0xbf810000u};
+    const auto layout=fragment_interpolation_layout(mixed_ps,std::size(mixed_ps));
+    check(layout.valid && layout.requires_geometry,"actual mixed parameter/smooth layout needs geometry");
+    const uint32_t vertex_code[]{0x7e000280u,0x7e020281u,0xf80008cfu,0x01010000u,0xbf810000u};
+    std::array<std::vector<uint32_t>,3> geometry,vertex;
+    for(unsigned p=0;p<3;++p) {
+        const FloatTransportConfig config{static_cast<FloatTransportProfile>(p)};
+        geometry[p]=recompile_interpolation_geometry(layout,false,false,config); ++modules;
+        vertex[p]=recompile_vertex(vertex_code,std::size(vertex_code),nullptr,nullptr,false,0,
+            {RecompileDiagnosticStage::Vertex,0x40660000u+modules},config); ++modules;
+        for(bool generated:{true,false}) {
+            const auto& words=generated?geometry[p]:vertex[p]; const Module m(words);
+            const std::string name=std::string(generated?"geometry":"vertex")+"_profile"+std::to_string(p);
+            check(m.valid && !words.empty(),name+" actual stage emitted");
+            check(m.capability(6029)==config.explicit_nonfinite32() &&
+                  m.extension("SPV_KHR_float_controls2")==config.explicit_nonfinite32(),
+                  name+" actual WORDS name the complete Explicit prerequisite");
+            check(m.capability(4466)==config.explicit_nonfinite32() && m.szi_entry()==config.explicit_nonfinite32(),
+                  name+" SZI32 declaration follows pinned profile with ambient publisher absent");
+            check(float_transport_module_supported(words.data(),words.size(),{FloatTransportProfile::ExplicitNonFinite32}),
+                  name+" actual enabled executing profile accepts module");
+            for(auto executing:{FloatTransportProfile::Unknown,FloatTransportProfile::Implicit})
+                check(float_transport_module_supported(words.data(),words.size(),{executing})==!config.explicit_nonfinite32(),
+                      name+" executing profile cannot acquire permission from producing metadata");
+            if(generated) {
+                size_t none=0; for(const auto& i:m.ins) none+=i.op==71 && i.a.size()>=2 && i.a[1]==40;
+                check(m.count(124)==0 && none==0,name+" genuinely has no Bitcast or None decoration");
+            }
+            dump(dir,name+"_source",words);
+        }
+    }
+    check(geometry[0]==geometry[1] && vertex[0]==vertex[1],"all legacy stage WORDS remain byte-identical Unknown/Implicit");
 }
 
 namespace fixture=prosper::test::fragment_neutral;
@@ -367,6 +401,7 @@ void parser_refusal(const std::vector<uint32_t>& words,const std::string& name) 
 void proof_tests(const char* dir) {
     const auto baseline=fixture::make_module(fixture::Shape::BuiltinReconsume);
     expect_lower(baseline,true,"implicit_finite_back",dir);
+    expect_lower(explicit_module(baseline,{}),true,"envelope_only_does_not_invent_None_facts",dir);
     // Same stable scalar, SAME SSA, SAME live strict conjunction; only consuming environment
     // differs. Implicit cross-cast of the raw carrier in the newly executed body needs finite bits.
     const auto mixed=explicit_module(baseline,{117,118});
@@ -431,6 +466,6 @@ int main(int argc,char** argv) {
     if(argc==3 && std::string_view(argv[1])=="--dump-directory") {dir=argv[2];std::filesystem::create_directories(dir);}
     else if(argc!=1) {std::fprintf(stderr,"usage: test_fragment_float_transport [--dump-directory DIR]\n");return 2;}
     emitter_tests(dir); proof_tests(dir);
-    std::printf("fragment float transport: %u checks, %u actual guest modules, %u failures\n",checks,modules,failures);
+    std::printf("fragment float transport: %u checks, %u translator invocations, %u failures\n",checks,modules,failures);
     return failures?1:0;
 }
