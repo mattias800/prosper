@@ -399,6 +399,11 @@ int main(int argc, char** argv) {
                 (!varying_draw.gs.empty()) == parameter && fragment_spirv_required_subgroup_size(varying_draw.fs_words()) == 64,
                 "real AGC varying realization supplies actual routing and Wave64 SOURCE");
             if (!realized || !varying_draw.raster_quads) continue;
+            RasterQuadCollector varying_output;
+            varying_output.fields.push_back({RasterQuadFieldKind::Interpolant,0,0,4});
+            check(prosper::test::raster_quad_varying_interface(varying_draw.vs_words(),
+                *varying_draw.raster_quads->inputs,varying_output),
+                "actual owned varying VS has the required declaration AND whole-vector writer");
             dump_sources(dump_directory,parameter ? "parameter" : "smooth",varying_draw);
             if (!cpu) {
                 const auto observed = observe(varying_draw,256);
@@ -418,11 +423,11 @@ int main(int argc, char** argv) {
         DrawItem missing;
         const bool realized = realize_draw_item(missing_state,&missing_state.draws[0],6,64,false,missing,nullptr,true);
         check(realized && missing.raster_quads && !missing.gs.empty(),
-            "actual explicit PS can retain a generated GS while its selected VS lacks the required varying");
+            "actual explicit PS realization retains its generated GS with a declaration-only VS varying");
         if (realized && missing.raster_quads) {
             RasterQuadCollector needed; needed.fields.push_back({RasterQuadFieldKind::Interpolant,0,0,4});
             check(!prosper::test::raster_quad_varying_interface(missing.vs_words(),*missing.raster_quads->inputs,needed),
-                "actual realized missing producer interface fails before GPU creation");
+                "actual declared-but-unwritten producer varying fails before GPU creation");
             if (!cpu) {
                 const auto refused = observe(missing,256);
                 check(refused.attempted && !refused.complete && refused.quads.empty() &&

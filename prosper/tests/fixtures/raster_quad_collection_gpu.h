@@ -68,11 +68,13 @@ inline bool raster_quad_pre_raster_readonly(const std::vector<uint32_t>& words) 
 
 inline bool raster_quad_varying_interface(const std::vector<uint32_t>& producer,
         const prosper::gpu::RasterQuadInputs& inputs, const prosper::gpu::RasterQuadCollector& contract) {
-    // This checks the Vulkan interface ABI only. It intentionally DOES NOT prove a store executes
-    // on every path or label observed varying words as initialized guest registers.
+    // Check the Vulkan interface ABI plus NECESSARY whole-vector writer evidence. The native
+    // compiler intentionally declares consumed-but-unwritten outputs (#3416), so a declaration
+    // alone must not authorize collecting a definitely unwritten value. A direct OpStore somewhere
+    // still DOES NOT prove it executes on every path or establish initialized guest registers.
     std::set<uint32_t> f32, v4f;
     std::map<uint32_t, uint32_t> pointers, variables, locations;
-    std::set<uint32_t> nondefault_components;
+    std::set<uint32_t> nondefault_components, whole_vector_writers;
     for (size_t p = 5; p < producer.size();) {
         const uint32_t n = producer[p] >> 16, op = producer[p] & 0xffff;
         if (!n || p + n > producer.size()) return false;
@@ -86,6 +88,9 @@ inline bool raster_quad_varying_interface(const std::vector<uint32_t>& producer,
         }
         if (op == 71 && n >= 3 && (producer[p + 2] == 31 || producer[p + 2] == 32))
             nondefault_components.insert(producer[p + 1]);
+        // This first producer supports the existing emitted whole-vec4 stores. Partial stores,
+        // access-chain/copy writers and unknown output provenance conservatively decline.
+        if (op == 62 && n == 3) whole_vector_writers.insert(producer[p + 1]);
         p += n;
     }
     for (const auto& field : contract.fields) {
@@ -97,7 +102,8 @@ inline bool raster_quad_varying_interface(const std::vector<uint32_t>& producer,
         for (const auto& [variable, location] : locations) {
             if (location != required || !variables.count(variable)) continue;
             const auto pointer = pointers.find(variables.at(variable));
-            if (pointer == pointers.end() || !v4f.count(pointer->second) || nondefault_components.count(variable))
+            if (pointer == pointers.end() || !v4f.count(pointer->second) || nondefault_components.count(variable) ||
+                !whole_vector_writers.count(variable))
                 return false;
             ++matches;
         }

@@ -90,6 +90,9 @@ owners and publishes no records. Complete records still have no guest input-init
 post-depth export-eligibility, append-order or guest Wave64 packing authority. The registered
 `raster_quad_collection` case arms the actual shipping caller; `raster_quad_realization` is
 device-free producing-ownership evidence only.
+Required varying outputs need a matching interface and a direct whole-vector writer; the native
+compiler may declare an unwritten consumed output. This necessary evidence is NOT an all-path
+definition proof: branch-only stores never grant MUST-defined or guest-initialization authority.
 
 Prefer extending an existing harness over a second one that does nearly the same thing; the tests
 that share `render_runner.h` share its device, caches and statistics, and a parallel copy would
