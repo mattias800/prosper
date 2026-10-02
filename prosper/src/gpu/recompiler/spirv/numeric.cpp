@@ -54,10 +54,14 @@ uint32_t SpirvCompute::float_output_modifiers(uint32_t bits, uint8_t omod, bool 
     if (clamp) {
         const uint32_t original = bits;
         bits = fext2(Glsl_NMin, fext2(Glsl_NMax, bits, uconst(0)), uconst(0x3f800000u));
-        if (is_fragment && !fragment_float_flags.dx10_clamp) {
+        if (is_fragment) {
             const uint32_t magnitude = ibin(Op_BitwiseAnd, original, uconst(0x7fffffffu));
             const uint32_t nan = ucmp(Op_UGreaterThanEqual, magnitude, uconst(0x7f800001u));
-            bits = sel(nan, original, bits);
+            // GLSL NMin/NMax permit default NotNaN even under the entry-point
+            // SZI mode. Select the defined NaN arm using integer bits for BOTH
+            // DX10 values; an unselected FP result cannot supply this contract.
+            // This does not settle earlier ALU behavior or equal-zero signs.
+            bits = sel(nan, fragment_float_flags.dx10_clamp ? uconst(0) : original, bits);
         }
     }
     return bits;

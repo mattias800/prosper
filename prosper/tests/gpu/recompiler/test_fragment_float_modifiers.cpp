@@ -211,9 +211,12 @@ struct Oracle {
             }
             if ((a[3]==79 || a[3]==80) && a.size()==6 && m.f32(r.type) && x.type==r.type) {
                 const Value y=arg(5);same(y);
-                if(nan_bits(x.bits[0])) r.bits[0]=y.bits[0];
-                else if(nan_bits(y.bits[0])) r.bits[0]=x.bits[0];
-                else {
+                // Vulkan's default FP environment permits NotNaN for GLSL NMin/NMax
+                // even under SignedZeroInfNanPreserve. A live NaN cannot acquire the
+                // host library's preferred value here; the actual integer Select
+                // must keep this operation out of the chosen MRT0 dependency.
+                if(nan_bits(x.bits[0]) || nan_bits(y.bits[0])) {good=false;return {};}
+                {
                     const float xf=std::bit_cast<float>(x.bits[0]),yf=std::bit_cast<float>(y.bits[0]);
                     // We do NOT choose the unspecified equal-zero sign of GLSL min/max.
                     if(xf==0 && yf==0 && x.bits[0]!=y.bits[0]) {good=false;return {};}
@@ -409,6 +412,33 @@ void oracle_controls(const std::vector<uint32_t>& source,const std::filesystem::
             "oracle live-value sensitivity/refusal control "+std::to_string(variant));
         // Only valid typed mutations are submitted to strict validation, never the malformed type arm.
         if(variant<3) dump(dir,"oracle_control_"+std::to_string(variant),words);
+    }
+    // Hand-construct live NaN NMin/NMax outside the guest fixture generator.
+    // These valid typed modules must be unresolved under their default NotNaN
+    // environment, not assigned the host library's preferred finite answer.
+    uint32_t glsl_import=0;
+    for(const auto& i:original.ins) if(i.op==11 && !i.a.empty() && original.glsl(i.a[0]))
+        glsl_import=i.a[0];
+    check(glsl_import!=0,"NaN live-operation controls use the actual GLSL import");
+    for(uint32_t opcode:{79u,80u}) {
+        Module changed(source);
+        const uint32_t constant_id=source[3];
+        uint32_t float_type=0, result_id=0;
+        for(auto& i:changed.ins) if(i.op==133 && i.a.size()==4) {
+            float_type=i.a[0];result_id=i.a[1];const uint32_t rhs=i.a[3];
+            i.op=12;i.a={float_type,result_id,glsl_import,opcode,constant_id,rhs};break;
+        }
+        check(float_type!=0 && !original.decorated(result_id,40,0),
+            "hand NaN control has no per-operation FPFastMathMode None");
+        for(auto i=changed.ins.begin();i!=changed.ins.end();++i) if(i->op==54) {
+            changed.ins.insert(i,Inst{43,{float_type,constant_id,qnan}});break;
+        }
+        auto header=source;header[3]=constant_id+1;
+        const auto words=changed.words(header);Module reparsed(words);Oracle oracle{reparsed};
+        (void)oracle.value(reparsed.output());
+        check(reparsed.valid && reparsed.output()!=0 && !oracle.good,
+            "oracle refuses a genuine live NaN NMin/NMax dependency "+std::to_string(opcode));
+        dump(dir,"oracle_nan_control_"+std::to_string(opcode),words);
     }
     Module killed(source);
     for(auto& i:killed.ins) if(i.op==253) {i.op=252;break;}
