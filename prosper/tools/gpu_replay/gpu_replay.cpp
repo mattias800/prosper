@@ -1032,10 +1032,11 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                     static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
                         reinterpret_cast<const uint8_t*>(c.spirv.data()), c.spirv.size() * 4)),
                     raw_available ? "yes" : "no");
+        // The v66 profile tail is independent of the older compute-config availability bit.
+        std::printf("    float-transport=%s source=%s (producing host profile)\n",
+                    prosper::gpu::float_transport_profile_name(c.recompile_config.float_transport),
+                    capture_retains_float_transport(format_version) ? "captured" : "legacy-unknown");
         if (c.recompile_config_available) {
-            std::printf("    float-transport=%s source=%s (producing host profile)\n",
-                        prosper::gpu::float_transport_profile_name(c.recompile_config.float_transport),
-                        capture_retains_float_transport(format_version) ? "captured" : "legacy-unknown");
             std::printf("    compute-contract program=%016llx native-storage-formats=%08x\n",
                         static_cast<unsigned long long>(c.code_addr),
                         c.recompile_config.native_storage_format_support);
