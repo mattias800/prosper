@@ -84,7 +84,8 @@ exit status is a contract, because the failure this tool must never have is a ze
 #
 # `from` scans a ~2KB window forward from the given address.
 
-import struct, sys
+import struct
+import sys
 from collections import defaultdict
 
 MODRM_RIP = {0x05, 0x0d, 0x15, 0x1d, 0x25, 0x2d, 0x35, 0x3d}   # mod=00, rm=101 (rip-rel), reg=any

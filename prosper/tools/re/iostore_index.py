@@ -367,7 +367,7 @@ def parse_read_log(path: str, container_stem: str = None):
     `container_stem` filters by host path, so a title that streams from several `.ucas` files does
     not attribute one container's offsets to another's index.
     """
-    with open(path, 'r', errors='replace') as f:
+    with open(path, errors='replace') as f:
         for line in f:
             m = _READ_RE.search(line)
             if m:
