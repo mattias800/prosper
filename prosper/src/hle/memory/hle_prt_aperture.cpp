@@ -8,11 +8,11 @@
 // a valid call right and gets two things wrong: an out-of-range slot index is accepted, and a
 // GetPrtAperture reads back nothing.
 //
-// Slots: three. Two independently written implementations (AnyPS5 and shadPS4) agree on a count of 3
-// and on EINVAL for an index outside [0, 3). CONFIDENCE: MED on the count (secondary agreement, no
-// title or firmware evidence yet), HIGH that an out-of-range index fails with EINVAL. shadPS4
-// additionally rejects an unaligned address or one outside a fixed PRT area, but that area is a PS4
-// constant and nothing here shows the PS5 value, so no address validation is added.
+// Slots: three. Two independently written secondary implementations agree on a count of 3 and on
+// EINVAL for an index outside [0, 3). CONFIDENCE: MED on both (secondary agreement only; no title or
+// firmware evidence yet). One of them additionally rejects an unaligned address or one outside a
+// fixed PRT area, but that area is a PS4 constant and nothing here shows the PS5 value, so no
+// address validation is added.
 //
 // Nothing here is title-specific.
 #include "hle/dispatch/dispatch.hpp"

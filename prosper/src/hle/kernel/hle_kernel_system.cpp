@@ -44,7 +44,7 @@ HLE(k_get_operation_mode) {
 //
 // The handler is RECORDED and never invoked: prosper does not turn host crashes into guest core
 // dumps, and a guest that registers one only needs the call to succeed so its crash reporting
-// initialises. Two independently written implementations (AnyPS5, shadPS4) both accept a valid
+// initialises. Two independently written secondary implementations both accept a valid
 // registration and return 0; they differ on validation (one rejects a null handler or a duplicate
 // with libSceCoredump-specific error codes, the other accepts everything), and one source for those
 // error values is not enough to adopt them, so every call succeeds. CONFIDENCE: HIGH on success for
