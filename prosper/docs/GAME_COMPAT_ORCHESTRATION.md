@@ -17,7 +17,8 @@ this document is the map that helps the next orchestrator find and interpret tha
 ## Current checkpoint
 
 - Latest title-wave integration: `e41de9f6fa5ca80ef78b88c846a7a62a7852ebed` on `main`.
-  This is source integration; a combined normal-app build and fresh game validation remain pending.
+  The combined normal-app build succeeded; focused tests passed seven of eight cases. Fresh game
+  validation remains pending while the failing shader fixture is corrected and rechecked.
 - Acceptance still covers *Wolverine*, *007 First Light*, *Onimusha: Way of the Sword*,
   *Hades II*, and *Silent Hill 2*: all five must reach a title screen with correct visual rendering.
   **None has met that acceptance target.** *The Messenger* remains the user-confirmed interactive
@@ -30,9 +31,9 @@ this document is the map that helps the next orchestrator find and interpret tha
 
 | Title / owner | Tracker | Current evidence and next frontier |
 | --- | --- | --- |
-| Wolverine / Wolverine lane | [#4019](https://github.com/mattias800/prosper/issues/4019) | Semaphore fix [#4047](https://github.com/mattias800/prosper/pull/4047) and numeric FF1 support [#4063](https://github.com/mattias800/prosper/pull/4063) are merged. Frozen `e585f068` built 13 targets and passed 12 CPU checks; the 62-check Vulkan result belongs to historical `17706dd0`. The current-main source transfer preserves the reviewed FF1 changes. Five mutation controls and current Vulkan checks remain unrun. The live source-register producer and normal-game effect on [#4036](https://github.com/mattias800/prosper/issues/4036) remain unproved. |
-| 007 First Light / 007 lane | [#4021](https://github.com/mattias800/prosper/issues/4021) | PlayGo [#4035](https://github.com/mattias800/prosper/pull/4035) and APR SDK layout [#4102](https://github.com/mattias800/prosper/pull/4102) are merged. The follow-up frozen `e46523a8` diagnostic retained black output. Eleven VS terminal records match retained words across eight programs; the strongest chain is scalar-buffer descriptor load PC31 followed by unresolved MUBUF PC40. Generic consumer-PC publication correction [#4169](https://github.com/mattias800/prosper/pull/4169) is merged, but its tests and actual title causality remain unverified. |
-| Onimusha: Way of the Sword / Onimusha lane | [#4022](https://github.com/mattias800/prosper/issues/4022) | Placement [#4046](https://github.com/mattias800/prosper/pull/4046), null-thread join [#4057](https://github.com/mattias800/prosper/pull/4057) and MultiDcbs submission [#4158](https://github.com/mattias800/prosper/pull/4158) are merged. The bounded import witness established count 1, a 1484-DWORD stream and eight sampled headers; full payload, extra arguments, error and hardware completion contracts remain unproved. Six focused CPU cases and the normal game retest are pending. No title screen is verified. |
+| Wolverine / Wolverine lane | [#4019](https://github.com/mattias800/prosper/issues/4019) | Semaphore fix [#4047](https://github.com/mattias800/prosper/pull/4047) and numeric FF1 support [#4063](https://github.com/mattias800/prosper/pull/4063) are merged. Frozen `e585f068` built 13 targets and passed 12 CPU checks; the 62-check Vulkan result belongs to historical `17706dd0`. Shared `e41de9f6` passed `scalar_ff1_b32` with 68 checks and zero failures. Five mutation controls and current Vulkan checks remain unrun. The live source-register producer and normal-game effect on [#4036](https://github.com/mattias800/prosper/issues/4036) remain unproved. |
+| 007 First Light / 007 lane | [#4021](https://github.com/mattias800/prosper/issues/4021) | PlayGo [#4035](https://github.com/mattias800/prosper/pull/4035) and APR SDK layout [#4102](https://github.com/mattias800/prosper/pull/4102) are merged. The follow-up frozen `e46523a8` diagnostic retained black output. Eleven VS terminal records match retained words across eight programs; the strongest chain is scalar-buffer descriptor load PC31 followed by unresolved MUBUF PC40. Generic consumer-PC publication correction [#4169](https://github.com/mattias800/prosper/pull/4169) is merged. Its CPU test failed three assertions; source inspection found malformed fixture pointer encoding, so the intended metadata regression is not yet verified. Actual title causality remains unproved. |
+| Onimusha: Way of the Sword / Onimusha lane | [#4022](https://github.com/mattias800/prosper/issues/4022) | Placement [#4046](https://github.com/mattias800/prosper/pull/4046), null-thread join [#4057](https://github.com/mattias800/prosper/pull/4057) and MultiDcbs submission [#4158](https://github.com/mattias800/prosper/pull/4158) are merged. The bounded import witness established count 1, a 1484-DWORD stream and eight sampled headers; full payload, extra arguments, error and hardware completion contracts remain unproved. Shared `e41de9f6` passed all six focused CPU cases. The normal game retest remains pending; no title screen is verified. |
 | Hades II / Hades lane | [#4023](https://github.com/mattias800/prosper/issues/4023) | CPU-mask [#4034](https://github.com/mattias800/prosper/pull/4034) and VideoOut prefix [#4058](https://github.com/mattias800/prosper/pull/4058) are merged. Frozen `366f0854` opened a black window, presented zero frames and recorded 6,126 vertex-recompilation drops across alarm windows. Candidate [#4098](https://github.com/mattias800/prosper/pull/4098) was rejected and closed. The historical GLOBAL PC167 failure differs from 007's observed MUBUF PC40; current-main program, launch route and backing remain unproved. Normal production-memory retest is next. |
 | Silent Hill 2 / Silent Hill lane | [#4024](https://github.com/mattias800/prosper/issues/4024) | Warning/setup screens and manual navigation remain the furthest visible evidence. Correct title/background rendering is unverified; the later GPU timeout is [#4025](https://github.com/mattias800/prosper/issues/4025). Consumed-SMEM-word logging [#4118](https://github.com/mattias800/prosper/pull/4118) is merged. It remains an unrun CPU observation aid, not a dynamic-mip correction or proof of matching GPU backing. |
 
@@ -69,11 +70,16 @@ restores normal checks and the unmodified gate for future merges, retaining the 
 and macOS exceptions. Independent exact-head code approval remains required. External contributor
 drafts must be published by their authors before merge; agents must not promote them.
 
-One shared normal audio/input app build is running on frozen `e41de9f6` with six Onimusha CPU
-cases, `scalar_ff1_b32` and `agc_shader_create`. No accepted app artifact or completed test result
-is available yet. Game runs remain separate named resource intervals. Preserve the accepted
-frozen cohorts, attribute results to their actual revisions, and carry review forward only
-through inspected source deltas.
+The shared normal audio/input app built on frozen `e41de9f6`. Its eight-case CPU run ended with
+seven passes and one failure: three assertions in `agc_shader_create`. The passed
+`agc_dcb_callback_abi` entry explicitly skips its Windows-only ABI checks on this Linux host.
+Source inspection identified
+absolute low-address fixture pointers that `CreateShader` treats as self-relative offsets, so
+registration success did not establish the metadata required by those assertions. A test-only
+correction must preserve the assertions, prove pointer relocation, and recheck the intended
+consumer-PC regression. No corrected test result or fresh game validation is accepted yet. Game
+runs remain separate named resource intervals. Preserve the failed cohort, attribute results to
+their actual revisions, and carry review forward only through inspected source deltas.
 
 ## Earlier title-wave checkpoint (2026-10-01)
 
