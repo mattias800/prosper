@@ -34,6 +34,7 @@
 #include "../../tests/fixtures/fragment_packet_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_wqm_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_mbcnt_fixture.hpp"
+#include "../../tests/fixtures/fragment_resource_packet_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <algorithm>
 #include <array>
@@ -132,6 +133,9 @@ static const std::vector<KnownGap> kKnownGaps = {};
 // deliberate entry here can exempt one, and it has to say why.
 struct NotAnEmitter { const char* name; const char* why; };
 static const NotAnEmitter kNotEmitters[] = {
+    {"recompile_fragment_packet_impl",
+     "shared body of the public integer and resource packet entries, BOTH validated here with "
+     "actual original instruction inputs; it has no independent caller/configuration route"},
     {"shader_analysis_owned_words",
      "aliases the immutable owned RAW RDNA2 analysis bytes; it neither translates instructions "
      "nor assembles a SPIR-V module"},
@@ -210,7 +214,7 @@ static std::vector<std::string> declared_emitters(const std::string& header_text
     // FragmentPacketProgram owns the module plus its exact raw input/output buffers. Its different
     // return shape must not remove the genuine packet compiler entry from strict emitter coverage.
     static const char* const kReturnTypes[] = {
-        "std::vector<uint32_t>", "SharedShaderWords", "FragmentPacketProgram"};
+        "std::vector<uint32_t>", "SharedShaderWords", "FragmentPacketProgram", "FragmentResourcePacketProgram"};
     std::vector<std::string> names;
     for (const char* ret_type : kReturnTypes) {
         const std::string kRet = ret_type;
@@ -691,6 +695,14 @@ int main(int argc, char** argv) {
         }
     }
     namespace neutral = prosper::test::fragment_neutral;
+    {
+        namespace resources = prosper::test::fragment_resource_packet;
+        for (bool lod : {false, true}) {
+            const auto packet = recompile_fragment_resource_packet(resources::chain(lod, true));
+            dump(dir, lod ? "fragment_resource_packet_l" : "fragment_resource_packet_lz",
+                 packet.packet.spirv, "recompile_fragment_resource_packet");
+        }
+    }
     {
         namespace fp = prosper::test::fragment_packet;
         uint32_t ordinal = 0;
