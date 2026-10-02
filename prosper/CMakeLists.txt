@@ -5,6 +5,22 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# #4078: the native WinLibs POSIX emutls runtime can free C++ TLS storage before its
+# destructor. This explicitly selected profile uses Clang's native Windows TLS instead.
+# Keep ordinary builds unchanged; the lifetime regression remains visible on broken runtimes.
+if(PROSPER_NATIVE_CLANG_TLS)
+  if(NOT WIN32 OR NOT MINGW OR NOT CMAKE_C_COMPILER_ID STREQUAL "Clang" OR
+     NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+     NOT CMAKE_CXX_COMPILER_TARGET STREQUAL "x86_64-w64-windows-gnu")
+    message(FATAL_ERROR "native-Clang TLS profile requires actual Windows GNU-ABI Clang compilers")
+  endif()
+  add_compile_options(-fno-emulated-tls)
+  # libstdc++/libgcc from the GNU sysroot use winpthreads. Append after the compiler's
+  # default runtime archives, rather than relying on archive order in Threads::Threads.
+  set(CMAKE_CXX_STANDARD_LIBRARIES "${CMAKE_CXX_STANDARD_LIBRARIES} -lwinpthread")
+  message(STATUS "prosper native-Clang profile: Windows GNU ABI, native TLS (not emutls)")
+endif()
+
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -177,6 +193,12 @@ add_executable(test_compute_buffer_diff_span tests/shared/compute/test_compute_b
 target_include_directories(test_compute_buffer_diff_span PRIVATE frontends src)
 find_package(Threads REQUIRED)
 target_link_libraries(test_compute_buffer_diff_span PRIVATE Threads::Threads)
+
+# Standard-library-only host lifetime guard: no core/GPU/game and no scratch/export opt-out.
+add_executable(test_native_tls_lifetime tests/host/platform/test_native_tls_lifetime.cpp)
+target_link_libraries(test_native_tls_lifetime PRIVATE Threads::Threads)
+add_test(NAME native_tls_lifetime COMMAND test_native_tls_lifetime)
+set_tests_properties(native_tls_lifetime PROPERTIES TIMEOUT 30)
 add_test(NAME compute_buffer_diff_span COMMAND test_compute_buffer_diff_span)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
