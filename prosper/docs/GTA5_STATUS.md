@@ -5316,6 +5316,14 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **The startup guest-store fault requires #3987's shader changes** — falsified by a native
+  MEMLOG boot on main `4e86ed4d4` without those changes (2026-10-01): the app exited 90 before
+  a frame, after fixed BatchMap refusals, with the same HDD-streaming store fault at
+  `0x1545000000`. The successful direct-map span and failed fixed targets support the automatic
+  placement mechanism tracked in [#4064](https://github.com/mattias800/prosper/issues/4064).
+  This boot does not exonerate other shader behavior or isolate #4046 as the historical cause;
+  the original log lacked a failure-time mapping snapshot and host errno.
+
 - **An increased SurfaceReadback count caused the 3.67 guest flips/s deferred-wait outlier** — falsified
   for the retained late gameplay windows of #3948 (2026-09-29): normal OFF/ON arms and the
   collapsed ON arm all performed **11.028–11.032 readbacks per flip**. Frontend groups, texture

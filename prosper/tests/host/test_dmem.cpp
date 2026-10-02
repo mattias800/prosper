@@ -19,6 +19,7 @@ extern "C" int prosper_try_commit_reserved_placeholder(uint64_t addr, uint64_t l
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cerrno>
 #ifdef __linux__
 #include <csignal>
 #include <sys/mman.h>
@@ -69,6 +70,30 @@ bool install_texture_watch_handler() {
 #endif
 
 #if defined(_WIN32) || defined(__linux__)
+// Prove the exact later fixed spans free BEFORE automatic placement, without reserving them
+// first or replacing a collided target with a different address. Either would hide the regression.
+static bool placement_span_is_free(uint64_t base, uint64_t len) {
+#ifdef _WIN32
+    for (uint64_t cur = base; cur < base + len;) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((void*)(uintptr_t)cur, &mbi, sizeof(mbi)) || mbi.State != MEM_FREE)
+            return false;
+        const uint64_t end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (end <= cur) return false;
+        cur = end;
+    }
+#else
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    if (!page) return false;
+    for (uint64_t cur = base; cur < base + len; cur += page) {
+        unsigned char resident = 0;
+        if (mincore((void*)(uintptr_t)cur, page, &resident) == 0 || errno != ENOMEM)
+            return false;
+    }
+#endif
+    return true;
+}
+
 static void test_automatic_placement() {
     const auto flexible = Hle::lookup(nid_hash("sceKernelMapFlexibleMemory"));
     const auto alloc = Hle::lookup(nid_hash("sceKernelAllocateMainDirectMemory"));
@@ -81,15 +106,27 @@ static void test_automatic_placement() {
           "automatic-placement entry points registered");
     if (!(flexible && alloc && map && batch && reserve && unmap && release)) return;
 
-    // #4032: an implicit C-runtime heap must not consume the beginning of a later fixed arena.
-    // Exercise both real mapping paths, preserving their bytes and the direct alias contract.
+    // #4064: sparse startup backing must not consume later fixed arenas in either observed band.
+    // The GTA-size automatic direct view catches the 64 GiB policy at high offsets; the flexible
+    // heap catches the previous 128 GiB policy. Only a few pages are written, not the whole bulk.
     constexpr uint64_t heap_len = 0x100000, page_len = 0x10000, alignment = 0x200000;
-    constexpr uint64_t low_base = 0x1000000000ull;
+    constexpr uint64_t ordinary_base = 0x4000000000ull;
     constexpr uint64_t low_limit = 0xfc00000000ull;
+    constexpr uint64_t bulk_len = 0x120f00000ull;
+    constexpr uint64_t fixed_bases[] = {0x10c38c0000ull, 0x1084290000ull, 0x2000000000ull};
+    bool fixed_free = true;
+    for (uint64_t base : fixed_bases) {
+        const bool free = placement_span_is_free(base, page_len);
+        printf("  fixed precondition base=0x%llx free=%d\n", (unsigned long long)base, free);
+        CHECK(free, "exact later fixed span is host-free before automatic startup maps");
+        fixed_free = fixed_free && free;
+    }
+    if (!fixed_free) return;
+
     uint64_t heap = 0, phys = 0, automatic = 0;
     const bool have_heap = flexible((uint64_t)(uintptr_t)&heap, heap_len, 3, 0, 0, 0) == 0 && heap != 0;
-    CHECK(have_heap && heap >= low_base && heap <= low_limit - heap_len,
-          "automatic flexible heap stays inside the accepted low aperture");
+    CHECK(have_heap && heap >= ordinary_base && heap <= low_limit - heap_len,
+          "automatic flexible heap starts above the observed fixed startup bands");
     if (have_heap) {
         *(volatile uint32_t*)(uintptr_t)heap = 0xC041AB1Eu;
         *(volatile uint32_t*)(uintptr_t)(heap + page_len) = 0xA110C471u;
@@ -98,42 +135,59 @@ static void test_automatic_placement() {
     CHECK(have_phys, "allocate physical pages for placement and alias checks");
     const bool have_automatic = have_phys &&
         map((uint64_t)(uintptr_t)&automatic, page_len, 3, 0, phys, alignment) == 0 && automatic != 0;
-    CHECK(have_automatic && automatic >= low_base && automatic <= low_limit - page_len &&
+    CHECK(have_automatic && automatic >= ordinary_base && automatic <= low_limit - page_len &&
               (automatic & (alignment - 1)) == 0,
           "automatic direct view honors alignment and the accepted low aperture");
     if (have_automatic) *(volatile uint32_t*)(uintptr_t)automatic = 0xD1AEC771u;
 
-    uint64_t fixed_base = 0x2000000000ull;
-#ifdef _WIN32
-    // ASLR may put host allocations anywhere in the low aperture. The Linux collision arm uses
-    // the exact arena base; Windows first proves a fixed probe free after the automatic maps.
-    bool fixed_free = false;
-    while (fixed_base <= low_limit - page_len) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (!VirtualQuery((void*)(uintptr_t)fixed_base, &mbi, sizeof(mbi))) break;
-        const uint64_t end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-        if (end <= fixed_base) break;
-        if (mbi.State == MEM_FREE && end - fixed_base >= page_len) {
-            fixed_free = true;
-            break;
-        }
-        if (end > UINT64_MAX - (page_len - 1)) break;
-        fixed_base = (end + page_len - 1) & ~(page_len - 1);
+    uint64_t bulk_phys = 0, bulk = 0;
+    const bool have_bulk_phys = alloc(bulk_len, alignment, 12,
+        (uint64_t)(uintptr_t)&bulk_phys, 0, 0) == 0 && bulk_phys != 0;
+    CHECK(have_bulk_phys && bulk_phys != phys, "allocate distinct sparse physical backing for the bulk view");
+    const bool have_bulk = have_bulk_phys &&
+        map((uint64_t)(uintptr_t)&bulk, bulk_len, 3, 0, bulk_phys, alignment) == 0 && bulk != 0;
+    CHECK(have_bulk && bulk >= ordinary_base && bulk <= low_limit - bulk_len,
+          "GTA-size automatic direct backing stays above both later fixed bands");
+    if (have_bulk) {
+        *(volatile uint32_t*)(uintptr_t)bulk = 0xB017C041u;
+        *(volatile uint32_t*)(uintptr_t)(bulk + page_len) = 0xB017D1A0u;
+        *(volatile uint32_t*)(uintptr_t)(bulk + bulk_len - page_len) = 0xB0177A11u;
     }
-    CHECK(fixed_free, "find a host-proven free fixed probe in the guest aperture");
-    if (!fixed_free) fixed_base = 0;
-#endif
 
     struct Entry { uint64_t start, phys, len; uint8_t prot, type; uint16_t pad; int32_t op; };
     static_assert(sizeof(Entry) == 0x20);
-    Entry entry{fixed_base, phys, page_len, 3, 0, 0, 0};
+    Entry entry{0, phys, page_len, 3, 0, 0, 0};
     int done = -1;
-    const bool have_fixed = have_phys && fixed_base != 0 &&
-        batch((uint64_t)(uintptr_t)&entry, 1, (uint64_t)(uintptr_t)&done, 0x10, 0, 0) == 0;
-    CHECK(have_fixed && done == 1, "later fixed arena map succeeds after automatic startup maps");
-    if (have_fixed && have_automatic)
-        CHECK(*(volatile uint32_t*)(uintptr_t)fixed_base == 0xD1AEC771u,
-              "the fixed view aliases the earlier automatic direct view");
+    for (uint64_t fixed_base : fixed_bases) {
+        const bool bulk_occupant = have_bulk && fixed_base >= bulk &&
+            fixed_base - bulk <= bulk_len - page_len;
+        if (bulk_occupant) *(volatile uint32_t*)(uintptr_t)fixed_base = 0xC0111DE5u;
+        entry.start = fixed_base;
+        done = -1;
+        const bool have_fixed = have_phys &&
+            batch((uint64_t)(uintptr_t)&entry, 1, (uint64_t)(uintptr_t)&done, 0x10, 0, 0) == 0;
+        printf("  fixed result base=0x%llx mapped=%d done=%d\n",
+               (unsigned long long)fixed_base, have_fixed, done);
+        CHECK(have_fixed && done == 1, "exact later fixed arena map succeeds after automatic startup maps");
+        if (bulk_occupant)
+            CHECK(*(volatile uint32_t*)(uintptr_t)fixed_base == 0xC0111DE5u,
+                  "refused fixed map preserves the bulk occupant at the exact fixed target");
+        if (have_fixed && have_automatic)
+            CHECK(*(volatile uint32_t*)(uintptr_t)fixed_base == 0xD1AEC771u,
+                  "the fixed view aliases the earlier automatic direct view");
+        if (have_fixed) CHECK(unmap(fixed_base, page_len, 0, 0, 0, 0) == 0, "unmap the fixed alias");
+    }
+    if (have_bulk) {
+        entry.start = bulk + page_len;
+        done = -1;
+        CHECK(batch((uint64_t)(uintptr_t)&entry, 1, (uint64_t)(uintptr_t)&done, 0x10, 0, 0) != 0 &&
+                  done == 0,
+              "fixed different-physical backing still refuses a live bulk overlap");
+        CHECK(*(volatile uint32_t*)(uintptr_t)bulk == 0xB017C041u &&
+              *(volatile uint32_t*)(uintptr_t)(bulk + page_len) == 0xB017D1A0u &&
+              *(volatile uint32_t*)(uintptr_t)(bulk + bulk_len - page_len) == 0xB0177A11u,
+              "the later fixed views preserve the distinct automatic bulk backing");
+    }
     if (have_heap) {
         CHECK(*(volatile uint32_t*)(uintptr_t)heap == 0xC041AB1Eu,
               "the later fixed map preserves the automatic flexible heap");
@@ -147,16 +201,25 @@ static void test_automatic_placement() {
                   "refused fixed overlap leaves the existing bytes intact");
         }
     }
-    if (have_fixed) CHECK(unmap(fixed_base, page_len, 0, 0, 0, 0) == 0, "unmap the fixed alias");
+    if (have_bulk) CHECK(unmap(bulk, bulk_len, 0, 0, 0, 0) == 0, "unmap the sparse bulk view");
+    if (have_bulk_phys) CHECK(release(bulk_phys, bulk_len, 0, 0, 0, 0) == 0, "release sparse bulk physical backing");
     if (have_automatic) CHECK(unmap(automatic, page_len, 0, 0, 0, 0) == 0, "unmap the automatic alias");
     if (have_phys) CHECK(release(phys, page_len, 0, 0, 0, 0) == 0, "release placement-test physical pages");
     if (have_heap) CHECK(unmap(heap, heap_len, 0, 0, 0, 0) == 0, "unmap the automatic flexible heap");
 
+    // On Windows the released fixed views leave lower-band free placeholders. Ordinary null-hint
+    // reservations must not recycle those addresses; POSIX exercises the same ordinary floor.
+    uint64_t recycled = 0;
+    const uint64_t recycled_rc = reserve((uint64_t)(uintptr_t)&recycled, page_len, 0, page_len, 0, 0);
+    CHECK(recycled_rc == 0 && recycled >= ordinary_base && recycled <= low_limit - page_len,
+          "ordinary automatic reservation keeps its floor after lower fixed views are released");
+    if (recycled_rc == 0) CHECK(unmap(recycled, page_len, 0, 0, 0, 0) == 0, "unmap the ordinary reservation");
+
     uint64_t oversized = 0;
-    constexpr uint64_t oversized_len = low_limit - low_base + page_len;
+    constexpr uint64_t oversized_len = low_limit - ordinary_base + page_len;
     const uint64_t ret = reserve((uint64_t)(uintptr_t)&oversized, oversized_len, 0, page_len, 0, 0);
     CHECK(ret != 0 && oversized == 0,
-          "an automatic reservation cannot escape the low aperture to satisfy an oversized request");
+          "an ordinary automatic reservation cannot search below its floor for an oversized request");
     if (ret == 0) CHECK(unmap(oversized, oversized_len, 0, 0, 0, 0) == 0, "clean up a misplaced reservation");
 }
 #endif
@@ -562,8 +625,11 @@ int main() {
     // long. `kBase + 0x10000000` happened to be 2 MiB aligned at kBase = 0x10000000 and silently
     // stopped being so when the base moved (#2954) -- a Windows-only failure that no Linux ctest
     // run can see. Aligning here states the property the window actually needs.
+    // Keep this virgin range above the earlier bulk-placement allocation: released physical
+    // offsets remain in the Windows ever-allocated ledger and would trigger eager zeroing on reuse.
     constexpr uint64_t sparse_window =
-        (kBase + 0x10000000 + sparse_align - 1) & ~(sparse_align - 1);
+        (kBase + 0x200000000ull + sparse_align - 1) & ~(sparse_align - 1);
+    static_assert(sparse_window >= kBase && sparse_window + sparse_len <= kEnd);
     uint64_t sparse_phys = 0, sparse_va1 = 0, sparse_va2 = 0;
     CHECK(alloc(sparse_window, sparse_window + sparse_len, sparse_len, sparse_align, 0,
                 (uint64_t)(uintptr_t)&sparse_phys) == 0 && sparse_phys == sparse_window,
