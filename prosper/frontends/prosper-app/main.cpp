@@ -242,13 +242,16 @@ struct Vk {
 
 // The Vulkan loader finds drivers through ICD manifests (JSON files). If the GPU driver files are
 // installed but its manifest is not registered, the loader sees zero drivers and SDL reports a
-// missing instance extension instead of the real cause.
+// missing instance extension instead of the real cause. Only the core surface extensions count:
+// SDL words a missing VK_EXT_headless_surface (SDL_VIDEODRIVER=offscreen on a driver without it)
+// the same way, and that is a video-driver choice, not an unregistered ICD. macOS loads MoltenVK
+// directly (no ICD manifests), so the report below says nothing there.
 bool vulkan_error_means_no_driver(const char* err) {
-    return err && (std::strstr(err, "VK_KHR_surface") || std::strstr(err, "VK_KHR_win32_surface") ||
-                   std::strstr(err, "doesn't implement"));
+    return err && (std::strstr(err, "VK_KHR_surface") || std::strstr(err, "VK_KHR_win32_surface"));
 }
 
 void report_no_vulkan_driver() {
+#ifndef __APPLE__
     fprintf(stderr,
         "[app] error: no usable Vulkan driver was found.\n"
         "[app] Likely cause: the GPU driver is installed but its Vulkan ICD manifest (a JSON file) is\n"
@@ -260,6 +263,7 @@ void report_no_vulkan_driver() {
         "[app]   sh:         export VK_DRIVER_FILES=<path to the driver's Vulkan .json manifest>\n"
         "[app] The manifest name and location vary by vendor (on Windows, usually under\n"
         "[app] C:\\Windows\\System32\\DriverStore\\FileRepository\\<driver package>\\). See BUILDING.md.\n");
+#endif
 }
 
 uint32_t find_mem(VkPhysicalDevice p, uint32_t typeBits, VkMemoryPropertyFlags props) {
@@ -1331,6 +1335,7 @@ int exit_startup_failure() {
     g_guest_thread.detach();
     prosper::gpu_submit_gate_begin_shutdown();
     (void)prosper::gpu_submit_gate_drain(2000);
+    prosper::host::guest_dmem_write_trace_report();
     prosper::diagnostics::flush_exit_reports();
     fflush(nullptr);
     std::_Exit(1);
