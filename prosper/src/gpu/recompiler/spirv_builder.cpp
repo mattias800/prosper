@@ -993,4 +993,79 @@ std::vector<uint32_t> build_compute_rgba8_to_packed10() {
     return e.assemble();
 }
 
+std::vector<uint32_t> build_compute_indirect_dispatch_validate() {
+    Emitter e;
+    const InPlaceWordComputeIds ids = make_in_place_word_compute_ids(e);
+    const auto& [void_t, fn_t, uint_t, bool_t, vec_t, input_ptr, gid,
+                 array_t, block_t, block_ptr, word_ptr, words, push_t, push_ptr,
+                 push_word, push, main, entry, body, done] = ids;
+    emit_in_place_word_compute_header(e, ids);
+    // Constants must be unique per value and type.
+    std::vector<std::pair<uint32_t, uint32_t>> uints;
+    auto constant = [&](uint32_t value) {
+        for (auto [v, id] : uints) if (v == value) return id;
+        const auto id = e.id();
+        uints.emplace_back(value, id);
+        Emitter::put(e.types, Op_Constant, {uint_t, id, value});
+        return id;
+    };
+    auto predicate = [&](uint32_t op, uint32_t a, uint32_t b) {
+        const auto id = e.id();
+        Emitter::put(e.code, op, {bool_t, id, a, b});
+        return id;
+    };
+    auto select = [&](uint32_t condition, uint32_t yes, uint32_t no) {
+        const auto id = e.id();
+        Emitter::put(e.code, Op_Select, {uint_t, id, condition, yes, no});
+        return id;
+    };
+    // Make the constants exist before the function body opens: OpConstant lives in the types
+    // section, so creating one mid-function is fine, but the ids must not interleave with a block.
+    const uint32_t zero = constant(0), one = constant(1), two = constant(2), three = constant(3),
+                   four = constant(4), five = constant(5), six = constant(6);
+    Emitter::put(e.code, Op_Function, {void_t, main, FC_None, fn_t});
+    Emitter::put(e.code, Op_Label, {entry});
+    const auto xyz = e.id(), index = e.id(), first = e.id();
+    Emitter::put(e.code, Op_Load, {vec_t, xyz, gid});
+    Emitter::put(e.code, Op_CompositeExtract, {uint_t, index, xyz, 0});
+    Emitter::put(e.code, Op_IEqual, {bool_t, first, index, zero});
+    // One invocation owns the whole four-word record, so no other lane can race its stores.
+    Emitter::put(e.code, Op_SelectionMerge, {done, 0});
+    Emitter::put(e.code, Op_BranchConditional, {first, body, done});
+    Emitter::put(e.code, Op_Label, {body});
+    uint32_t pointer[4], value[3], limit_pointer[3], limit[3];
+    const uint32_t slots[4] = {zero, one, two, three};
+    const uint32_t limit_slots[3] = {four, five, six};
+    for (uint32_t i = 0; i < 4; ++i) {
+        pointer[i] = e.id();
+        Emitter::put(e.code, Op_AccessChain, {word_ptr, pointer[i], words, zero, slots[i]});
+    }
+    for (uint32_t i = 0; i < 3; ++i) {
+        value[i] = e.id();
+        Emitter::put(e.code, Op_Load, {uint_t, value[i], pointer[i]});
+        limit_pointer[i] = e.id();
+        Emitter::put(e.code, Op_AccessChain, {word_ptr, limit_pointer[i], words, zero,
+                                              limit_slots[i]});
+        limit[i] = e.id();
+        Emitter::put(e.code, Op_Load, {uint_t, limit[i], limit_pointer[i]});
+    }
+    // vkCmdDispatchIndirect requires every count to be within ITS AXIS's maxComputeWorkGroupCount
+    // (NVIDIA advertises 2^31-1 on x and 65535 on y/z, so one shared limit would refuse legal x
+    // counts). A count that is not cannot be clamped (a clamped kernel would silently compute part
+    // of its domain), so the whole launch becomes the hardware no-op of zero groups and word 3
+    // records why. The per-axis limits are host-written once into words 4..6 of the record.
+    const auto bad = predicate(Op_LogicalOr,
+        predicate(Op_LogicalOr, predicate(Op_UGreaterThan, value[0], limit[0]),
+                  predicate(Op_UGreaterThan, value[1], limit[1])),
+        predicate(Op_UGreaterThan, value[2], limit[2]));
+    for (uint32_t i = 0; i < 3; ++i)
+        Emitter::put(e.code, Op_Store, {pointer[i], select(bad, zero, value[i])});
+    Emitter::put(e.code, Op_Store, {pointer[3], select(bad, one, zero)});
+    Emitter::put(e.code, Op_Branch, {done});
+    Emitter::put(e.code, Op_Label, {done});
+    Emitter::put(e.code, Op_Return, {});
+    Emitter::put(e.code, Op_FunctionEnd, {});
+    return e.assemble();
+}
+
 } // namespace prosper::gpu

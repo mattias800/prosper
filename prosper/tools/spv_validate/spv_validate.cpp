@@ -1161,6 +1161,8 @@ int main(int argc, char** argv) {
          "build_compute_rgba8_to_packed10");
     dump(dir, "builder_depth_to_rgba8", build_compute_depth_to_rgba8(),
          "build_compute_depth_to_rgba8");
+    dump(dir, "builder_indirect_dispatch_validate", build_compute_indirect_dispatch_validate(),
+         "build_compute_indirect_dispatch_validate");   // #3656
 
     // --- Recompiler entry points beyond the four main stage functions ---
     // Wave32 fragment lowering (s_wqm_b32 through the low-half EXEC/VCC mask path).
