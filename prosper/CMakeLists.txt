@@ -772,6 +772,12 @@ if(TARGET prosper_core)
   # register_fn() call sites cannot see any of the three.
   add_executable(nid_census tools/nid_census/nid_census.cpp)
   target_link_libraries(nid_census PRIVATE prosper_core)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME nid_census_context COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_nid_census_context.py"
+      $<TARGET_FILE:nid_census>)
+    set_tests_properties(nid_census_context PROPERTIES TIMEOUT 60)
+  endif()
 
   add_executable(test_module tests/test_module.cpp)
   target_link_libraries(test_module PRIVATE prosper_core)
@@ -1508,6 +1514,10 @@ if(TARGET prosper_core)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_schedstat_f8.py")
     add_test(NAME schedstat_probe_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_schedstat_probe.py")
+    # RUN_SERIAL: its fixture changes are wall-clock timers that must land inside a fixed sampling
+    # window, and under the CI's `ctest -j4` (#4116) they missed it on macOS and Windows in two
+    # different subtests while passing every serial run. A stopgap, NOT a fix -- #4142.
+    set_tests_properties(schedstat_probe_logic PROPERTIES RUN_SERIAL TRUE)
     add_test(NAME compare_capture_pair_logic
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_capture_pair.py")
   endif()
@@ -2626,6 +2636,11 @@ endif()
   target_link_libraries(test_fragment_packet_wqm PRIVATE prosper_core)
   add_test(NAME fragment_packet_wqm_contract COMMAND test_fragment_packet_wqm)
   set_tests_properties(fragment_packet_wqm_contract PROPERTIES TIMEOUT 90)
+  add_executable(test_fragment_packet_mbcnt tests/gpu/recompiler/test_fragment_packet_mbcnt.cpp)
+  target_include_directories(test_fragment_packet_mbcnt PRIVATE tests)
+  target_link_libraries(test_fragment_packet_mbcnt PRIVATE prosper_core)
+  add_test(NAME fragment_packet_mbcnt_contract COMMAND test_fragment_packet_mbcnt)
+  set_tests_properties(fragment_packet_mbcnt_contract PROPERTIES TIMEOUT 90)
   set_tests_properties(portable_bpermute_contract PROPERTIES TIMEOUT 90)
 
   # #3713: a scalar branch may only be called workgroup-uniform when the value it compares is the

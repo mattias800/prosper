@@ -58,6 +58,33 @@ const char* packet_instruction_gap(const Rdna2Inst& in) {
                    (in.opcode >= 0xd0 && in.opcode <= 0xd7)
                 ? nullptr : "packet-fp-or-compare-unimplemented";
         case Rdna2Format::VOP3:
+            if (in.opcode == 0x365 || in.opcode == 0x366) {
+                // AMD's RDNA2 machine-readable opcodes 869/870: MBCNT
+                // consumes one raw dword, or one canonical half of a live wave mask.
+                // Numeric operands use guest logical lane positions, not active population.
+                // Bool-domain words require the synchronized, MUST-filtered CFG service.
+                if ((in.words[0] >> 11) & 0xfu)
+                    return "packet-mbcnt-modifier-unimplemented";
+                const auto numeric = [](const Operand& op) {
+                    return op.kind == OperandKind::VGPR || op.kind == OperandKind::SGPR ||
+                           op.kind == OperandKind::InlineInt ||
+                           op.kind == OperandKind::InlineFloat || op.kind == OperandKind::Literal;
+                };
+                const auto& mask = in.src[0];
+                if (mask.kind == OperandKind::Special) {
+                    const bool high = in.opcode == 0x366;
+                    if (mask.value == 106 || mask.value == 107 ||
+                        mask.value == 126 || mask.value == 127) {
+                        if (mask.value != (high ? 107 : 106) &&
+                            mask.value != (high ? 127 : 126))
+                            return "packet-mbcnt-mask-half-unimplemented";
+                    } else return "packet-mbcnt-source-kind-unimplemented";
+                } else if (!numeric(mask)) return "packet-mbcnt-source-kind-unimplemented";
+                if (!numeric(in.src[1]) &&
+                    !(in.src[1].kind == OperandKind::Special && in.src[1].value == 253))
+                    return "packet-mbcnt-accumulator-kind-unimplemented";
+                return nullptr;
+            }
             if (in.opcode != 0x360) return "packet-valu-op-unimplemented";
             // RDNA2's READLANE source is VGPR-or-LDS, not generic VOP3 SSRC. The
             // synchronized service reads the VGPR bank; never alias a decoded SGPR
