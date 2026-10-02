@@ -494,6 +494,12 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   output capture fails, so redirect stdout **and** stderr to a file on the real disk, end with `exit 0`,
   read that file, and `rm -rf` scratch that is a day or more old. Leave `/tmp/claude-*` and anything
   touched in the last few hours alone — other agents are live.
+- **Always create tests.** Every bug fix, issue or review finding adds a test that fails without
+  the fix, and every new or changed HLE function gets a test for its return codes and edge cases.
+  Verify a finding against the code before writing its test. Never weaken an assertion to get green
+  without saying why in the PR. Full rules: `prosper/tests/AGENTS.md`. PR descriptions follow
+  `.github/pull_request_template.md` (Context, Higher Goal, Acceptance Criteria, Out of Scope,
+  Summary of Changes, Verification).
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth
   **only with `--no-tests=error`** — plain `ctest` on a build directory with nothing registered prints
   `No tests were found!!!` and **exits 0**, so "no tests ran" and "everything passed" are the same
