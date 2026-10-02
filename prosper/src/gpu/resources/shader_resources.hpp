@@ -541,7 +541,8 @@ struct ShaderResource {
     uint32_t owned_raw_snapshot_bytes = 0;
 };
 
-inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource) {
+inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource,
+                                                 bool host_data_present) {
     return resource.raw_register_snapshot && resource.cls == ResourceClass::ConstantBuffer &&
         resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
         (resource.size == 16u || resource.size == 32u) && resource.stride == 0u &&
@@ -550,8 +551,12 @@ inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource)
         resource.scalar_buffer_dword_count == 0u && !resource.nested_raw_snapshot_admitted &&
         resource.gpu_addr > 0x10000u && (resource.gpu_addr & 3u) == 0u &&
         resource.gpu_addr <= UINT64_MAX - resource.size &&
-        (resource.host_data ? resource.host_data_size >= resource.size :
-                              resource.host_data_size == 0u);
+        (host_data_present ? resource.host_data_size >= resource.size :
+                             resource.host_data_size == 0u);
+}
+
+inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource) {
+    return valid_raw_register_snapshot_resource(resource, resource.host_data != nullptr);
 }
 
 // The immediate x1 source of a fold-proven wide offset owns the four bytes observed during
@@ -572,9 +577,14 @@ inline bool valid_owned_raw_snapshot_shape(const ShaderResource& resource, uint3
                       (!resource.owned_raw_snapshot_bytes || resource.owned_raw_snapshot_bytes == bytes));
 }
 
-inline bool valid_owned_raw_snapshot_resource(const ShaderResource& resource, uint32_t bytes) {
-    return valid_owned_raw_snapshot_shape(resource, bytes) && resource.host_data &&
+inline bool valid_owned_raw_snapshot_resource(const ShaderResource& resource, uint32_t bytes,
+                                              bool host_data_present) {
+    return valid_owned_raw_snapshot_shape(resource, bytes) && host_data_present &&
         (bytes == 4u ? resource.host_data_size >= bytes : resource.host_data_size == bytes);
+}
+
+inline bool valid_owned_raw_snapshot_resource(const ShaderResource& resource, uint32_t bytes) {
+    return valid_owned_raw_snapshot_resource(resource, bytes, resource.host_data != nullptr);
 }
 
 inline bool valid_raw_offset_scalar_snapshot_resource(const ShaderResource& resource) {
@@ -932,15 +942,25 @@ struct ShaderResourceTable {
 
 // A proof-owned source cannot borrow a later valid duplicate after an earlier poisoned match.
 // Use this same unique exact-PC selection in emission and compile-key admission.
+template<class HasHostData>
 inline const ShaderResource* owned_raw_snapshot_at(const ShaderResourceTable& table,
-                                                   uint32_t pc, uint32_t bytes) {
+                                                   uint32_t pc, uint32_t bytes,
+                                                   HasHostData has_host_data) {
     const ShaderResource* selected = nullptr;
     for (const auto& resource : table.resources) {
         if (resource.fetch_pc != pc) continue;
         if (selected) return nullptr;
         selected = &resource;
     }
-    return selected && valid_owned_raw_snapshot_resource(*selected, bytes) ? selected : nullptr;
+    return selected && valid_owned_raw_snapshot_resource(*selected, bytes,
+                                                         has_host_data(*selected))
+        ? selected : nullptr;
+}
+
+inline const ShaderResource* owned_raw_snapshot_at(const ShaderResourceTable& table,
+                                                   uint32_t pc, uint32_t bytes) {
+    return owned_raw_snapshot_at(table, pc, bytes,
+        [](const ShaderResource& resource) { return resource.host_data != nullptr; });
 }
 
 // Validate the generic runtime-selected buffer-array representation. Scalar resources are valid

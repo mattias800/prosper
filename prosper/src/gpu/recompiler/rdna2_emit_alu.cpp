@@ -5662,8 +5662,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.smem_raw_wide_data_loads.contains(in.pc);
             const ShaderResource* register_source = rt ? rt->by_fetch_pc(in.pc) : nullptr;
             const bool owned_wide_source = rs.smem_raw_owned_wide_data_loads.contains(in.pc);
+            // SOURCE replay retains opaque backing presence separately from readable bytes.
+            // These admission checks consume only shape/presence; actual byte readers use the
+            // checked resource gateway, and draw execution retains its real ownership checks.
             const ShaderResource* owned_wide_binding = owned_wide_source && rt
-                ? owned_raw_snapshot_at(*rt, in.pc, n * sizeof(uint32_t)) : nullptr;
+                ? owned_raw_snapshot_at(*rt, in.pc, n * sizeof(uint32_t),
+                                        compiler_resource_has_host_data) : nullptr;
             if (owned_wide_source && !owned_wide_binding) {
                 if (getenv("PROSPER_DBG"))
                     fprintf(stderr,
@@ -5676,7 +5680,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // A malformed replay table must fail before ordinary scalar-load resource fallback.
             if (!owned_wide_source && rs.smem_raw_offset_scalar_source_pcs.contains(in.pc) &&
                 (!register_source || register_source->fetch_pc != in.pc ||
-                 !valid_raw_offset_scalar_snapshot_resource(*register_source))) {
+                 !valid_owned_raw_snapshot_resource(*register_source, sizeof(uint32_t),
+                     compiler_resource_has_host_data(*register_source)))) {
                 if (getenv("PROSPER_DBG"))
                     fprintf(stderr,
                             "[smem-reject] pc=%u reason=raw-offset-scalar-requires-owned-backing\n",
@@ -5690,7 +5695,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool backed_register_wide = raw_wide_register_offset_data &&
                 rs.smem_raw_register_wide_data_loads.contains(in.pc) &&
                 register_source &&
-                valid_raw_register_snapshot_resource(*register_source) &&
+                valid_raw_register_snapshot_resource(*register_source,
+                    compiler_resource_has_host_data(*register_source)) &&
                 register_source->fetch_pc == in.pc && register_source->size == n * 4u &&
                 shader_resource_buffer_binding_bytes(*register_source) >= n * 4u;
             // The bounded current-byte proof below covers an unchanged ENTRY pointer. A pointer

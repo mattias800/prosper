@@ -152,7 +152,12 @@ struct Reader {
 std::vector<uint8_t> encode_fragment_compile_case(const FragmentCompileCase& c) {
     validate_fragment_compile_case(c);
     Writer w; const uint8_t magic[8] = {'P','R','F','C','A','S','E',0};
-    w(magic, uint32_t(1)); capsule(w, c); w.value(checksum(w.bytes)); return std::move(w.bytes);
+    w(magic, uint32_t(2)); capsule(w, c);
+    // Schema 1's field walk remains an unchanged prefix. Retain each marker verbatim: it is a
+    // compiler input whose malformed value can cause a refusal, never replay admission authority.
+    w.count(c.resources.resources.size(), kCompileCaseMaxResources);
+    for (const auto& resource : c.resources.resources) w.value(resource.owned_raw_snapshot_bytes);
+    w.value(checksum(w.bytes)); return std::move(w.bytes);
 }
 FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes) {
     check(bytes.size() >= 20 && bytes.size() <= kCompileCaseMaxFileBytes, "compile-case file size");
@@ -160,9 +165,15 @@ FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes)
     check(checksum(bytes.first(bytes.size() - 8)) == hash, "compile-case checksum");
     Reader r{bytes.first(bytes.size() - 8)}; uint8_t magic[8]{}; uint32_t schema{}; r(magic, schema);
     const uint8_t wanted[8] = {'P','R','F','C','A','S','E',0};
-    check(std::equal(std::begin(magic), std::end(magic), std::begin(wanted)) && schema == 1,
+    check(std::equal(std::begin(magic), std::end(magic), std::begin(wanted)) &&
+          (schema == 1 || schema == 2),
           "compile-case schema");
     FragmentCompileCase c; capsule(r, c);
+    if (schema >= 2) {
+        const size_t count = r.count(kCompileCaseMaxResources);
+        check(count == c.resources.resources.size(), "compile-case marker/resource count");
+        for (auto& resource : c.resources.resources) r.value(resource.owned_raw_snapshot_bytes);
+    }
     check(r.position == r.bytes.size(), "compile-case trailing data");
     for (size_t k = 0; k < c.blobs.size(); ++k) if (c.blobs[k].alias_of != UINT32_MAX) {
         check(c.blobs[k].alias_of < k, "compile-case alias index");
