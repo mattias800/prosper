@@ -2725,6 +2725,9 @@ endif()
   target_include_directories(test_fragment_packet PRIVATE tests)
   target_link_libraries(test_fragment_packet PRIVATE prosper_core)
   add_test(NAME fragment_packet_contract COMMAND test_fragment_packet)
+  prosper_add_gtest(test_fragment_resource_packet
+    SOURCES tests/gpu/recompiler/test_fragment_resource_packet.cpp
+    INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
   add_executable(test_fragment_packet_wqm tests/gpu/recompiler/test_fragment_packet_wqm.cpp)
   target_include_directories(test_fragment_packet_wqm PRIVATE tests)
   target_link_libraries(test_fragment_packet_wqm PRIVATE prosper_core)
@@ -5828,6 +5831,11 @@ if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
   target_link_libraries(test_fragment_packet_exec PRIVATE prosper_core Vulkan::Vulkan)
   add_test(NAME fragment_packet_exec COMMAND test_fragment_packet_exec)
   set_tests_properties(fragment_packet_exec PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+  prosper_add_gtest(test_fragment_resource_packet_exec
+    SOURCES tests/gpu/execute/test_fragment_resource_packet_exec.cpp
+    INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
+    PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION "[[]  SKIPPED []]")
 
   add_executable(test_float_transport_render tests/gpu/execute/test_float_transport_render.cpp)
   target_include_directories(test_float_transport_render PRIVATE tests frontends)
