@@ -173,8 +173,10 @@ int PacketResourceServices::emit(SpirvCompute& b, RegState& state, const Rdna2In
         // ALL export publication and inactive destinations retain their supplied old words.
         const auto sampler = b.id(), coordinate = b.id(), sampled = b.id();
         b.put(b.code, Op_Load, {b.tex_binding_simg.at(binding), sampler, b.tex_var.at(binding)});
+        const auto safe_u = b.uconst(fbits(0.5f / static_cast<float>(found->mips.front().width)));
+        const auto safe_v = b.uconst(fbits(0.5f / static_cast<float>(found->mips.front().height)));
         b.put(b.code, Op_CompositeConstruct, {b.t_v2f(), coordinate,
-            b.bcf(b.sel(safe, u, b.uconst(fbits(0.5f)))), b.bcf(b.sel(safe, v, b.uconst(fbits(0.5f))))});
+            b.bcf(b.sel(safe, u, safe_u)), b.bcf(b.sel(safe, v, safe_v))});
         b.put(b.code, Op_ImageSampleExplicitLod, {b.t_v4f, sampled, sampler, coordinate,
             ImgOp_Lod, b.bcf(b.sel(safe, lod, b.uconst(0)))});
         for (uint32_t c = 0; c < 4; ++c) {
