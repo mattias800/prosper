@@ -112,6 +112,23 @@ class EndToEnd(unittest.TestCase):
         self.commit("pr")
         self.assertTrue(any("format --check" in p for p in self.verdict()))
 
+    def test_renamed_file_is_ratcheted_against_its_old_path(self):
+        self.git("mv", "prosper/tools/x/old.py", "prosper/tools/x/moved.py")
+        self.commit("pure move")
+        self.assertEqual([], self.verdict())
+        self.write("prosper/tools/x/moved.py", "import importlib.util\nimport sys\nx = 1\n")
+        self.commit("move gains a finding")
+        self.assertTrue(any("moved.py: ruff findings rose" in p for p in self.verdict()))
+
+    def test_gate_and_selftest_give_the_same_answer_from_a_subdirectory(self):
+        # ctest runs from the build tree; ruff must still find the root config (D100 included).
+        self.write("prosper/tools/x/new.py", "x = 1\n")
+        self.write("prosper/tools/x/test_new.py", CLEAN)
+        self.commit("pr")
+        os.chdir(self.repo / "prosper/tools/x")
+        self.assertTrue(any("D100" in p for p in self.verdict()))
+        self.assertEqual(0, cpq.selftest())
+
     def test_modified_file_may_keep_findings_but_not_add_them(self):
         self.write("prosper/tools/x/old.py", "import importlib.util\nx = 2\n")
         self.commit("keep")

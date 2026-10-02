@@ -58,14 +58,25 @@ def ratchet_violations(path, base_count, head_count):
     return []
 
 
+def toplevel():
+    """The checkout root. Paths from `git diff` are relative to it, and ruff resolves a relative
+    `--stdin-filename` against its cwd only, so both ruff and file reads run from here: from a
+    subdirectory (ctest runs in the build tree) ruff would silently fall back to its defaults."""
+    out = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True
+    )
+    return Path(out.stdout.strip())
+
+
 def ruff(args, stdin=None):
-    """Run ruff from the dev environment; return the completed process."""
+    """Run ruff from the dev environment at the checkout root; return the completed process."""
     return subprocess.run(
         [sys.executable, "-m", "ruff", *args],
         input=stdin,
         capture_output=True,
         text=True,
         check=False,
+        cwd=toplevel(),
     )
 
 
@@ -75,6 +86,9 @@ def count_findings(source, filename):
         ["check", "--output-format", "json", "--stdin-filename", filename, "-"],
         stdin=source,
     )
+    # 0 = clean, 1 = findings; anything else is ruff failing, which must not read as "0 findings".
+    if proc.returncode not in (0, 1):
+        raise RuntimeError(f"ruff check failed on {filename}: {proc.stderr.strip()}")
     return len(json.loads(proc.stdout or "[]"))
 
 
@@ -89,18 +103,36 @@ def validate_ref(ref):
 
 
 def git(*args):
-    """Run git and return stdout, raising on failure."""
-    return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
+    """Run git at the checkout root and return stdout, raising on failure."""
+    return subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=True, cwd=toplevel()
+    ).stdout
 
 
 def changed(base):
-    """Return (added, modified) .py paths of HEAD against the merge base with `base`."""
-    out = git("diff", "--name-status", "--diff-filter=AM", f"{base}...HEAD")
+    """Return (added, modified) .py paths of HEAD against the merge base with `base`.
+
+    `modified` holds (head_path, base_path) pairs. A rename (R) is a modification of its old path,
+    so moving a tool cannot carry new findings past the ratchet; `-z` keeps unusual names intact.
+    """
+    out = git("diff", "--name-status", "-z", "--diff-filter=AMR", f"{base}...HEAD")
+    fields = out.split("\0")
     added, modified = [], []
-    for line in out.splitlines():
-        status, _, path = line.partition("\t")
-        if is_python(path):
-            (added if status == "A" else modified).append(path)
+    i = 0
+    while i < len(fields) and fields[i]:
+        status = fields[i]
+        if status.startswith("R"):
+            old, path = fields[i + 1], fields[i + 2]
+            i += 3
+        else:
+            old = path = fields[i + 1]
+            i += 2
+        if not is_python(path):
+            continue
+        if status == "A":
+            added.append(path)
+        else:
+            modified.append((path, old))
     return added, modified
 
 
@@ -116,10 +148,10 @@ def check_added(path):
     return problems
 
 
-def check_modified(path, base):
-    """Ratchet for an existing file against its base version."""
-    base_src = git("show", f"{base}:{path}")
-    head_src = Path(path).read_text(encoding="utf-8")
+def check_modified(path, base, base_path=None):
+    """Ratchet for an existing file against its base version (at `base_path` if it was renamed)."""
+    base_src = git("show", f"{base}:{base_path or path}")
+    head_src = (toplevel() / path).read_text(encoding="utf-8")
     return ratchet_violations(path, count_findings(base_src, path), count_findings(head_src, path))
 
 
@@ -127,11 +159,11 @@ def run(base):
     """Evaluate the whole PR; return the list of violation strings."""
     merge_base = git("merge-base", validate_ref(base), "HEAD").strip()
     added, modified = changed(merge_base)
-    problems = missing_test_violations(added, added + modified)
+    problems = missing_test_violations(added, added + [path for path, _ in modified])
     for path in added:
         problems += check_added(path)
-    for path in modified:
-        problems += check_modified(path, merge_base)
+    for path, base_path in modified:
+        problems += check_modified(path, merge_base, base_path)
     print(f"checked {len(added)} added, {len(modified)} modified Python file(s)")
     return problems
 
