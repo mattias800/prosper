@@ -5267,11 +5267,11 @@ bool emit_cfg_state_machine(
                     const auto high = state.sreg.find(source.value + 1);
                     if (low != state.sreg.end() && high != state.sreg.end()) {
                         const uint32_t word = b.sel(
-                            b.ucmp(Op_ULessThan, mbcnt_lane, b.uconst(32)),
+                            b.ucmp(Op_ULessThan, b.linear_localid, b.uconst(32)),
                             low->second, high->second);
                         bit = b.ucmp(Op_INotEqual,
                             b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, word,
-                                b.ibin(Op_BitwiseAnd, mbcnt_lane, b.uconst(31))), b.uconst(1)),
+                                b.ibin(Op_BitwiseAnd, b.linear_localid, b.uconst(31))), b.uconst(1)),
                             zero);
                     }
                 }
