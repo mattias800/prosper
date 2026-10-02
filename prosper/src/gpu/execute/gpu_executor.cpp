@@ -8097,7 +8097,10 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                                 r0.scalar_buffer_dword_count == scalar_buffer_dwords) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu && r0.cls == ResourceClass::ConstantBuffer)
                                     r0.fetch_pc = u.use_pc;
-                                piggybacked = r0.fetch_pc == u.use_pc || r0.cls == ResourceClass::VertexBuffer;
+                                // Matching bytes do not supply another instruction's provenance.
+                                // Preserve a VertexBuffer's existing fetch PC and publish this use
+                                // separately when its shader-loaded descriptor has no other key.
+                                piggybacked = r0.fetch_pc == u.use_pc;
                                 if (piggybacked) break;
                             }
                         if (piggybacked) continue;
