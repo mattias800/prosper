@@ -1170,11 +1170,12 @@ if(TARGET prosper_core)
 
   # lseek/fseek/ftell must address offsets >= 2 GiB. MinGW's long/off_t are 32 bits, so Black Flag's
   # 30 GiB DataPS5_boot.forge allocation-table seek failed and the title aborted itself.
-  add_executable(test_large_offset_seek tests/hle/kernel/test_large_offset_seek.cpp)
-  target_link_libraries(test_large_offset_seek PRIVATE prosper_core)
-  target_include_directories(test_large_offset_seek PRIVATE src)
-  add_test(NAME large_offset_seek COMMAND test_large_offset_seek)
-  set_tests_properties(large_offset_seek PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+  # An unsupported sparse/sizing filesystem is reported with GTEST_SKIP (ctest "Skipped"), not success.
+  prosper_add_gtest(test_large_offset_seek
+    SOURCES tests/hle/kernel/test_large_offset_seek.cpp
+    INCLUDES src
+    LIBRARIES prosper_core
+    PROPERTIES TIMEOUT 30)
 
   # Empty PollSema returns the encoded EBUSY value that guest drain loops require (#1640).
   prosper_add_gtest(test_kernel_sema_poll
@@ -1439,11 +1440,11 @@ if(TARGET prosper_core)
   # The ScePthread handle a guest receives must be a readable object, identical across Create/Self,
   # and validated on the way back in. A raw winpthreads index sent AC Black Flag Resynced's main
   # thread into address 3 at eboot+0x161ed91.
-  add_executable(test_guest_thread_handle tests/hle/kernel/test_guest_thread_handle.cpp)
-  target_link_libraries(test_guest_thread_handle PRIVATE prosper_core)
-  target_include_directories(test_guest_thread_handle PRIVATE src)
-  add_test(NAME guest_thread_handle COMMAND test_guest_thread_handle)
-  set_tests_properties(guest_thread_handle PROPERTIES TIMEOUT 60)
+  prosper_add_gtest(test_guest_thread_handle
+    SOURCES tests/hle/kernel/test_guest_thread_handle.cpp
+    INCLUDES src
+    LIBRARIES prosper_core
+    PROPERTIES TIMEOUT 60)
 
   add_executable(test_cond_clock tests/hle/test_cond_clock.cpp)
   target_link_libraries(test_cond_clock PRIVATE prosper_core)
@@ -1784,12 +1785,11 @@ if(TARGET prosper_core)
 
   # PROSPER_SYNC_RING_CALLERS: ring events carry the guest call site that reached them, so a total
   # deadlock can be traced back to the guest function that was supposed to signal.
-  add_executable(test_sync_ring_callers tests/hle/sync/test_sync_ring_callers.cpp)
-  target_link_libraries(test_sync_ring_callers PRIVATE prosper_core)
-  target_include_directories(test_sync_ring_callers PRIVATE src)
-  add_test(NAME sync_ring_callers COMMAND test_sync_ring_callers)
-  set_tests_properties(sync_ring_callers PROPERTIES
-                       ENVIRONMENT "PROSPER_SYNC_RING=256;PROSPER_SYNC_RING_CALLERS=1")
+  prosper_add_gtest(test_sync_ring_callers
+    SOURCES tests/hle/sync/test_sync_ring_callers.cpp
+    INCLUDES src
+    LIBRARIES prosper_core
+    ENVIRONMENT PROSPER_SYNC_RING=256 PROSPER_SYNC_RING_CALLERS=1)
 
   prosper_add_gtest(test_mutex_host_tcb_identity
     SOURCES tests/hle/sync/test_mutex_host_tcb_identity.cpp
@@ -2598,9 +2598,9 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_entry_m0_dispatcher.cpp
     LIBRARIES prosper_core)
 
-  add_executable(test_scalar_ff1_b32 tests/gpu/recompiler/test_scalar_ff1_b32.cpp)
-  target_link_libraries(test_scalar_ff1_b32 PRIVATE prosper_core)
-  add_test(NAME scalar_ff1_b32 COMMAND test_scalar_ff1_b32)
+  prosper_add_gtest(test_scalar_ff1_b32
+    SOURCES tests/gpu/recompiler/test_scalar_ff1_b32.cpp
+    LIBRARIES prosper_core)
 
   # #3231: the CFG dispatcher's `missing-entry-vcc` gate and the entry-block-dominance case it may
   # now admit. Both directions, in its own binary for the same reason as the file above.

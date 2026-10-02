@@ -3,11 +3,11 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <vector>
 
 using namespace prosper::gpu;
-static int failures = 0, checks = 0;
-#define CHECK(c, m) do { ++checks; if (!(c)) { std::printf("FAIL: %s\n", m); ++failures; } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static size_t instructions(const std::vector<uint32_t>& words, uint32_t opcode,
                            uint32_t extended = UINT32_MAX) {
@@ -154,14 +154,14 @@ static void state_contracts(const Rdna2Inst& ff1) {
     }
 }
 
-int main() {
+TEST(ScalarFf1B32, Contract) {
     constexpr uint32_t captured = 0xbea51324u;
     const auto decoded = rdna2_decode_one(&captured, 1);
     CHECK(decoded.fmt == Rdna2Format::SOP1 && decoded.len_dwords == 1 &&
               decoded.opcode == 0x13 && decoded.dst.value == 37 &&
               decoded.src[0].kind == OperandKind::SGPR && decoded.src[0].value == 36,
           "independent guest word decodes as FF1_B32 s37,s36");
-    if (failures) return 1;
+    if (::testing::Test::HasFailure()) return;
     state_contracts(decoded);
 
     const std::vector<uint32_t> numeric{0xbea403ffu, 0x10000u, captured, 0xbf810000u};
@@ -191,6 +191,4 @@ int main() {
     CHECK(compile({0xbea5137eu, 0xbf810000u}).empty(), "EXEC scalar placeholders remain unavailable");
     CHECK(compile({0xbefe1381u, 0xbf810000u}).empty(), "FF1 numeric writes to EXEC remain refused");
     CHECK(compile({0xbeea1381u, 0xbf810000u}).empty(), "new numeric path does not invent VCC mask bits");
-    std::printf("scalar_ff1_b32: %d checks, %d failures\n", checks, failures);
-    return failures ? 1 : 0;
 }
