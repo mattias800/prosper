@@ -552,13 +552,16 @@ static void nested_marker_tests() {
             table.resources.push_back(r); table.owned_host_data.push_back(std::move(owner));
         }
         constexpr FloatTransportConfig explicit_transport{FloatTransportProfile::ExplicitNonFinite32};
+        constexpr FragmentFloatFlags launch_flags{true, true, false};
+        constexpr FragmentLaunchRsrc1 launch_word{true, 0x20810000u};
         const auto roundtrip = [&](const ShaderResourceTable& input, bool produced,
                                    FloatTransportConfig transport = {FloatTransportProfile::ExplicitNonFinite32}) {
-            const auto c = produce(code, false, &input, {}, transport);
+            const auto c = produce(code, false, &input, {}, transport, launch_flags, launch_word);
             CHECK(c.complete && c.expected_produced == produced && c.source.empty() == !produced);
             const auto wire = encode_fragment_compile_case(c);
             const auto decoded = decode_fragment_compile_case(wire);
-            CHECK(wire[8] == 5u && decoded.float_transport == transport);
+            CHECK(wire[8] == 5u && decoded.float_transport == transport &&
+                  decoded.float_flags == launch_flags && decoded.launch_rsrc1 == launch_word);
             CHECK(decoded.resources.owned_nested_snapshot_requirements.empty());
             for (size_t k = 0; k < input.resources.size(); ++k)
                 CHECK(decoded.resources.resources[k].owned_nested_snapshot_bytes ==
@@ -586,16 +589,16 @@ static void nested_marker_tests() {
         uint64_t identity = 0;
         const auto warm_source = recompile_graphics_shader_cached(ShaderProgramStage::Fragment,
             code.data(), code.size(), &table, nullptr, nullptr, &identity,
-            false, 0u, false, {}, {}, explicit_transport);
+            false, 0u, false, {}, {}, explicit_transport, launch_flags, launch_word);
         CHECK(warm_source == positive.source && identity != 0u);
         const uint64_t valid_identity = identity;
         ShaderResourceTable empty;
         CHECK(recompile_graphics_shader_cached(ShaderProgramStage::Fragment,
             code.data(), code.size(), &empty, nullptr, nullptr, &identity,
-            false, 0u, false, {}, {}, explicit_transport).empty() && identity != 0u && identity != valid_identity);
+            false, 0u, false, {}, {}, explicit_transport, launch_flags, launch_word).empty() && identity != 0u && identity != valid_identity);
         CHECK(recompile_graphics_shader_cached(ShaderProgramStage::Fragment,
             code.data(), code.size(), &table, nullptr, nullptr, &identity,
-            false, 0u, false, {}, {}, explicit_transport) == warm_source && identity == valid_identity);
+            false, 0u, false, {}, {}, explicit_transport, launch_flags, launch_word) == warm_source && identity == valid_identity);
         auto opaque = table; opaque.owned_host_data.clear();
         const auto opaque_positive = roundtrip(opaque, true);
         CHECK(opaque_positive.source == positive.source && opaque_positive.blobs.size() == 2u);
@@ -624,7 +627,8 @@ static void nested_marker_tests() {
         const size_t tail = legacy.size() - 8u - 4u * (1u + table.resources.size());
         legacy.erase(legacy.begin() + tail, legacy.end() - 8); legacy[8] = 4; rechecksum(legacy);
         const auto old = decode_fragment_compile_case(legacy);
-        CHECK(old.complete && old.float_transport == explicit_transport && old.source == positive.source &&
+        CHECK(old.complete && old.float_transport == explicit_transport &&
+              old.float_flags == launch_flags && old.launch_rsrc1 == launch_word && old.source == positive.source &&
               old.resources.resources[0].owned_nested_snapshot_bytes == 0u);
         CHECK(!error([&] { replay_fragment_compile_case(old, true); }).empty());
         std::string legacy_refusal;

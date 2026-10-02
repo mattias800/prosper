@@ -129,17 +129,17 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
         launch=b"\x01\x00\x00\x01"+struct.pack("<I",16<<12)
         flags_tail=(struct.pack("<I",1)+launch+struct.pack("<I",0) if name=="mode16" else
                     struct.pack("<II",0,1)+launch)
-        check(struct.unpack_from("<I",data,8)[0]==67 and data.endswith(flags_tail),
-              name+" genuine independent known-clear-flags v67 tail")
+        check(struct.unpack_from("<I",data,8)[0]==68 and data.endswith(flags_tail+bytes(4)),
+              name+" exact official67 flags followed by resource-free nested68 count")
+        data=bytearray(data[:-4]); struct.pack_into("<I",data,8,67)
+        check(data.endswith(flags_tail),name+" genuine independent known-clear-flags v67 tail")
         data=bytearray(data[:-len(flags_tail)])
         struct.pack_into("<I",data,8,66)
         (directory/("official66"+("-failed" if name.endswith("failed") else "")+".prgcap")).write_bytes(data)
         transport_tail=(struct.pack("<I",1)+b"\x00"+struct.pack("<II",0,0) if name=="mode16" else
                         struct.pack("<III",0,0,1)+b"\x00"+struct.pack("<I",1)+b"\x00")
-        check(struct.unpack_from("<I",data,8)[0]==67 and data.endswith(transport_tail+bytes(4)),
-              name+" canonical unknown transport precedes zero nested67 count")
-        data=bytearray(data[:-4]); struct.pack_into("<I",data,8,66)
-        check(data.endswith(transport_tail),name+" genuine official unknown-transport v66 tail")
+        check(struct.unpack_from("<I",data,8)[0]==66 and data.endswith(transport_tail),
+              name+" genuine official unknown-transport v66 tail")
         data=bytearray(data[:-len(transport_tail)])
         struct.pack_into("<I",data,8,65)
         expected_tail=(struct.pack("<I",1)+b"\x01\x10"+struct.pack("<I",0) if name=="mode16" else

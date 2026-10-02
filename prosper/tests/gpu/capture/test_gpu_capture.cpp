@@ -499,7 +499,7 @@ int main(int argc, char** argv) {
         for (const auto& failure : f.failure_diagnostics)
             for (const auto& stage : failure.stages)
                 resources += stage.resource_table.resources.size();
-        size_t bytes = 12u + 9u * resources; // v62 markers plus v65/v67 owned obligations
+        size_t bytes = 12u + 9u * resources; // v62 markers plus v65/v68 owned obligations
         bytes += 4u + f.draws.size(); // v63 count plus one realized guest-width tag per draw
         bytes += 8u + 2u * (f.draws.size() + f.failure_diagnostics.size()); // v64 modes
         bytes += 12u + f.draws.size() + f.computes.size(); // v66 transport counts/profiles
@@ -4150,6 +4150,10 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> legacy_bytes;
     CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 32,
           "created a diagnostic-free v22 payload for legacy-reader fixtures");
+    uint32_t future_version = 0;
+    if (legacy_bytes.size() >= 12)
+        for (unsigned i = 0; i < 4; ++i) future_version |= uint32_t(legacy_bytes[8 + i]) << (8u * i);
+    ++future_version; // derive the unknown version from this actual writer's header
     std::vector<uint8_t> v13_bytes = legacy_bytes;
     if (v13_bytes.size() >= 32) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
@@ -4277,9 +4281,10 @@ int main(int argc, char** argv) {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 68;   // kVersion + 1: a future version
+    if (legacy_bytes.size() >= 12)
+        for (unsigned i = 0; i < 4; ++i) legacy_bytes[8 + i] = uint8_t(future_version >> (8u * i));
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 68",
+          error == "unsupported capture version " + std::to_string(future_version),
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

@@ -33,8 +33,9 @@ Capsules contain title-derived shaders, resource bytes, addresses, ordered DMA e
 pixels, and optional exact persistent Vulkan depth/stencil checkpoint planes.
 They are gitignored local artifacts and must never be committed or shared as project fixtures.
 
-Capture v67 appends exact-PC nested parent/child byte obligations after the unchanged official
-v66 producing float-transport profile tail. Profile and ownership remain separate inputs.
+Capture v68 appends exact-PC nested parent/child byte obligations after the unchanged official
+v67 launch flags/raw RSRC1 evidence and v66 producing float-transport profile tails.
+Producing launch context, profile and ownership remain separate inputs.
 Materialization re-derives the complete original one-hop, width and no-writer proof, requires both
 actually observed owned spans, and checks the saved parent pointer selects the saved child.
 Stored modules pass the same check as raw recompilation. Older unmarked numeric nested captures

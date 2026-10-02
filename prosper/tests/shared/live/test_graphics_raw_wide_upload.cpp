@@ -371,11 +371,12 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
                 ps.code.data(), ps.header.shader_size / 4u, producing.prt.get(),
                 producing.has_pixel_inputs ? &producing.pixel_inputs : nullptr,
                 producing.has_system_inputs ? &producing.system_inputs : nullptr, nullptr,
-                producing.ps_wave32, 0u, false, {}, producing.ps_float_mode, producing.float_transport);
+                producing.ps_wave32, 0u, false, {}, producing.ps_float_mode, producing.float_transport,
+                producing.ps_float_flags, producing.ps_launch_rsrc1);
             return std::pair{std::move(raw_vs), std::move(raw_fs)};
         };
         const auto [raw_vs, raw_fs] = recompile_pair(item);
-        check(decoded.format_version == 67u && !raw_vs.empty() && !raw_fs.empty() &&
+        check(decoded.format_version == 68u && !raw_vs.empty() && !raw_fs.empty() &&
               raw_vs == item.vs_words() && raw_fs == item.fs_words() &&
               owned_nested_snapshot_at(*table, parent_pc, size) &&
               owned_nested_snapshot_at(*table, child_pc, size), arm,
@@ -384,6 +385,8 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
         // executing backend must still gate the resulting words against its enabled features.
         auto explicit_item = item;
         explicit_item.float_transport = {FloatTransportProfile::ExplicitNonFinite32};
+        explicit_item.ps_float_flags = {true, true, false};
+        explicit_item.ps_launch_rsrc1 = {true, 0x20810000u};
         auto explicit_words = recompile_pair(explicit_item);
         explicit_item.set_vs(std::move(explicit_words.first));
         explicit_item.set_fs(std::move(explicit_words.second));
@@ -400,15 +403,19 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
             ? (vertex ? combined_replay.items[0].vrt : combined_replay.items[0].prt) : nullptr;
         const auto* combined_parent = combined_table ? owned_nested_snapshot_at(*combined_table, parent_pc, size) : nullptr;
         const auto* combined_child = combined_table ? owned_nested_snapshot_at(*combined_table, child_pc, size) : nullptr;
-        check(combined_ok && combined_loaded.format_version == 67u && combined_parent && combined_child &&
+        check(combined_ok && combined_loaded.format_version == 68u && combined_parent && combined_child &&
               combined_loaded.draws[0].float_transport == explicit_item.float_transport &&
               combined_replay.items[0].float_transport == explicit_item.float_transport &&
+              combined_loaded.draws[0].ps_float_flags == explicit_item.ps_float_flags &&
+              combined_loaded.draws[0].ps_launch_rsrc1 == explicit_item.ps_launch_rsrc1 &&
+              combined_replay.items[0].ps_float_flags == explicit_item.ps_float_flags &&
+              combined_replay.items[0].ps_launch_rsrc1 == explicit_item.ps_launch_rsrc1 &&
               std::memcmp(combined_parent->host_data, parent->host_data, size) == 0 &&
               std::memcmp(combined_child->host_data, child->host_data, size) == 0 &&
               combined_replay.items[0].vs_words() == explicit_item.vs_words() &&
               combined_replay.items[0].fs_words() == explicit_item.fs_words() &&
               parent_reads == 0u && child_reads == 0u, arm,
-              "same roundtrip retains explicit producing profile and immutable owned parent/child SOURCE");
+              "same roundtrip retains producing profile, launch context and immutable owned parent/child SOURCE");
         if (combined_ok) {
             const auto paired = recompile_pair(combined_replay.items[0]);
             check(paired.first == explicit_item.vs_words() && paired.second == explicit_item.fs_words(), arm,
@@ -429,14 +436,22 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
         const size_t tail_bytes = 4u * (1u + resource_count);
         if (serialize_gpu_capture(decoded, wire, error) && wire.size() > tail_bytes) {
             auto legacy = wire;
-            legacy.resize(legacy.size() - tail_bytes); legacy[8] = 66u;
+            legacy.resize(legacy.size() - tail_bytes); legacy[8] = 67u;
             GpuCaptureFile previous;
             GpuReplayFrame refused;
-            check(deserialize_gpu_capture(legacy, previous, error) && previous.format_version == 66u &&
+            check(deserialize_gpu_capture(legacy, previous, error) && previous.format_version == 67u &&
                   previous.draws[0].float_transport == item.float_transport &&
                   !materialize_gpu_replay(previous, refused, error), arm,
-                  "genuine official v66 preserves producing profile but lacks nested runtime ownership");
-            auto legacy65 = legacy;
+                  "genuine official v67 preserves producing profile and launch evidence but lacks nested runtime ownership");
+            auto legacy66 = legacy;
+            legacy66.resize(legacy66.size() - 16u); legacy66[8] = 66u;
+            check(deserialize_gpu_capture(legacy66, previous, error) && previous.format_version == 66u &&
+                  previous.draws[0].float_transport == item.float_transport &&
+                  previous.draws[0].ps_float_flags == FragmentFloatFlags{} &&
+                  previous.draws[0].ps_launch_rsrc1 == FragmentLaunchRsrc1{} &&
+                  !materialize_gpu_replay(previous, refused, error), arm,
+                  "genuine official v66 retains profile but invents no launch evidence or nested ownership");
+            auto legacy65 = legacy66;
             legacy65.resize(legacy65.size() - 13u); legacy65[8] = 65u;
             check(deserialize_gpu_capture(legacy65, previous, error) && previous.format_version == 65u &&
                   previous.draws[0].float_transport == FloatTransportConfig{} &&
@@ -447,10 +462,10 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
             wrong_count[tail] = 0u; wrong_count[tail + 1u] = 0u;
             wrong_count[tail + 2u] = 0u; wrong_count[tail + 3u] = 0u;
             check(!deserialize_gpu_capture(wrong_count, previous, error), arm,
-                  "v67 nested count must match every already bounded resource");
+                  "v68 nested count must match every already bounded resource");
             auto truncated = wire; truncated.pop_back();
             check(!deserialize_gpu_capture(truncated, previous, error), arm,
-                  "truncated v67 nested tail refuses before replay");
+                  "truncated v68 nested tail refuses before replay");
         } else check(false, arm, "serialize complete nested capture for independent prefix controls");
         const auto rejects = [&](const GpuCaptureFile& bad, const char* reason) {
             GpuReplayFrame refused;

@@ -67,8 +67,8 @@ Raw-load SOURCE admission uses the recorded backing-presence fact and exact reso
 readable bytes still require the checked resource gateway. Frame replay and draw uploads retain
 their separate backing-ownership checks.
 
-Schema 4 appends a separate exact-PC parent/child snapshot marker tail after the unchanged
-schema-3 producing profile. Schemas 1 through 3 remain readable with zero nested markers; they cannot supply new
+Schema 5 appends a separate exact-PC parent/child snapshot marker tail after the unchanged
+schema-4 launch context and schema-3 producing profile. Schemas 1 through 4 remain readable with zero nested markers; they cannot supply new
 nested admission. Valid and malformed markers are retained exactly so baseline/candidate replay
 preserves SOURCE or refusal. The complete original shader independently supplies the one-hop,
 width, pointer-selection and no-writer proof. Recorded presence supports SOURCE metadata checks;
