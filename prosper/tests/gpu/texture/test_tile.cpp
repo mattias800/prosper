@@ -2,6 +2,7 @@
 // inverses of tiling (round-trip identity for arbitrary sizes), that linear mode is a passthrough, and
 // that tiled layouts are genuine permutations (no texel dropped/duplicated).
 #include "gpu/texture/tile.hpp"
+#include <gtest/gtest.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
@@ -12,8 +13,7 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 
 // A linear image where each texel encodes its (x,y) so any misplacement is detectable.
@@ -95,7 +95,7 @@ static void reference_sw4kb_copy(uint8_t* dst, const uint8_t* src, uint32_t w, u
     }
 }
 
-int main() {
+TEST(Tile, Contract) {
     printf("== test_tile ==\n");
 
     CHECK(tile_mode_is_tiled((uint32_t)TileMode::Sw256BS), "tile_mode 1 (SW_256B_S) is tiled");
@@ -1344,7 +1344,5 @@ int main() {
         (void)any_false;
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

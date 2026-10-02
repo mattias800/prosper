@@ -1,4 +1,5 @@
 #include "shared/diagnostics/capture_renderer_policy.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 
@@ -8,14 +9,8 @@ using prosper::frontend::LiveColorTargetResidencyInputs;
 using prosper::frontend::pass_readback_deferral_allowed_during_capture;
 using prosper::frontend::timeline_capture_allows_persistent_targets;
 
-int main() {
-    int failures = 0;
-    auto check = [&](bool ok, const char* what) {
-        if (!ok) {
-            std::fprintf(stderr, "FAIL: %s\n", what);
-            ++failures;
-        }
-    };
+TEST(CaptureRendererPolicy, Contract) {
+    auto check = [&](bool ok, const char* what) { EXPECT_TRUE(ok) << what; };
 
     check(timeline_capture_allows_persistent_targets(false, false),
           "normal rendering retains persistent targets");
@@ -60,5 +55,4 @@ int main() {
           "outside a capture submit colour0 readback may be deferred");
     check(!pass_readback_deferral_allowed_during_capture(true),
           "a capture submit reads back colour0 so its output oracle is the readback path's");
-    return failures ? 1 : 0;
 }

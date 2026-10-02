@@ -3,15 +3,14 @@
 // a crafted/garbled name (empty, "." / "..", or one with an embedded separator) can never traverse
 // out of the sandbox to stat/create a directory elsewhere. Pure predicate — no filesystem.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(SavedataDirname, Contract) {
     std::printf("== test_savedata_dirname ==\n");
 
     // Accepted: a normal single-component save directory name.
@@ -37,6 +36,4 @@ int main() {
     CHECK(savedata0_mount("a/b", SaveDataMountPolicy::OpenOrCreate) == SaveDataMountOutcome::NotFound,
           "savedata0_mount('a/b', OpenOrCreate) -> NotFound (embedded separator rejected)");
 
-    std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

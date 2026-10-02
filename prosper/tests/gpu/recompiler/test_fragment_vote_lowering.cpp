@@ -1,9 +1,10 @@
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "../../fixtures/spirv_fragment_vote_fixtures.hpp"
 #include <cstdio>
 
-int main() {
+TEST(FragmentVoteLowering, Contract) {
     using namespace prosper::gpu;
     namespace f = prosper::test::fragment_votes;
     int failures = 0;
@@ -74,6 +75,5 @@ int main() {
     words = baseline;
     words.pop_back();
     refusal(words, FragmentVoteRefusal::MalformedModule, "unclosed function refused");
-    std::printf("== %s: %d failures ==\n", failures ? "FAIL" : "PASS", failures);
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }

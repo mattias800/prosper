@@ -5,6 +5,7 @@
 // wrote into every slot would satisfy the first assertion and destroy the honest zero every other
 // unresolved variable depends on.
 #include "hle/dispatch/import_data_seed.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 
 #include <cstdint>
@@ -14,11 +15,9 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
-int main() {
+TEST(ImportDataSeed, Contract) {
     printf("== test_import_data_seed ==\n");
 
     // The two documented properties of the canary, checked on the constant itself so a future edit
@@ -62,6 +61,4 @@ int main() {
 
     CHECK(!seed_import_data(guard, nullptr, 8), "a null slot is refused rather than dereferenced");
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

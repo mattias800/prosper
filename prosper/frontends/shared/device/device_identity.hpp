@@ -41,8 +41,8 @@ inline DeviceIdentity& device_identity_slot() {
 }
 } // namespace detail
 
-// Called once per process by the code that selects the Vulkan device. A later call replaces the
-// earlier one, so the last device selected is the one reported.
+// Called by the graphics renderer's device selection. A private compute device must not replace
+// this identity: capture rates describe the renderer's published frames.
 inline void record_device_identity(uint32_t vendor_id, uint32_t device_id, uint32_t driver_version,
                                    uint32_t api_version, uint32_t device_type) {
     std::lock_guard<std::mutex> lock(detail::device_identity_mutex());

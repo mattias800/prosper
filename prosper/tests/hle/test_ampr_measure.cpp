@@ -3,6 +3,7 @@
 // while DOLL's older SDK wrapper passes a registered APR id and relies on its legacy entry point to
 // fill the destination.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "fixtures/test_scratch.h"
 #include <array>
@@ -22,9 +23,7 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
                                int64_t id, uint64_t token);
 }
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 struct KEvent {
     int64_t ident;
@@ -81,7 +80,7 @@ static bool is_exact_fence(const EventSequence& sequence, uint64_t fence_tag) {
            (uint64_t)sequence.events[0].data == fence_tag;
 }
 
-int main() {
+TEST(AmprMeasure, Contract) {
     std::printf("== test_ampr_measure ==\n");
     register_builtin_hle();
 
@@ -420,6 +419,4 @@ int main() {
         std::remove(fixture_path);
     }
 
-    std::printf("== %s ==\n", fails ? "FAIL" : "PASS");
-    return fails ? 1 : 0;
 }

@@ -5,6 +5,7 @@
 // scales a stale, wrong-view snapshot, so the boundary is pinned here.
 
 #include "shared/rtt/rtt_scale.hpp"
+#include <gtest/gtest.h>
 #include "shared/rtt/rtt_authority.hpp"
 
 #include <cstdio>
@@ -31,11 +32,9 @@ using prosper::frontend::live_rtt_unpublished_volume_blocks_sample;
 using prosper::frontend::live_rtt_compute_mirror_eligible;
 using prosper::frontend::live_rtt_mirror_identity_matches;
 
-static int failures = 0;
-#define CHECK(cond) do { if (!(cond)) { \
-    std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
+#define CHECK(cond) EXPECT_TRUE(cond)
 
-int main() {
+TEST(RttScale, Contract) {
     // PROSPER_RENDER_SCALE downscales: exact, equal on both axes -> the scale factor.
     CHECK(rtt_integer_upscale_factor(1920, 1080, 480, 270) == 4);   // scale=4 (Blue Prince)
     CHECK(rtt_integer_upscale_factor(1920, 1080, 960, 540) == 2);   // scale=2
@@ -223,6 +222,4 @@ int main() {
     CHECK(live_rtt_color_footprint_bytes(UINT32_MAX, UINT32_MAX, UINT32_MAX, 16) ==
           UINT64_MAX);
 
-    if (failures == 0) std::printf("rtt_scale: OK\n");
-    return failures == 0 ? 0 : 1;
 }

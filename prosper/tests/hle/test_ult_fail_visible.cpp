@@ -9,6 +9,7 @@
 // This file owns the REGISTRATION and RETURN-POLICY contract. The implemented semantics (mutual
 // exclusion, work areas, object identity) are tested in test_ult_semantics.cpp.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -17,8 +18,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // SCE_KERNEL_ERROR_ENOSYS — 0x80020000 | FreeBSD errno 78. See hle_ult.cpp for why this specific
 // value is a derived convention rather than an invented libSceUlt constant.
@@ -56,7 +56,7 @@ static const char* const kSizeNids[] = {
 // far below the 2.0 GiB that SCE_KERNEL_ERROR_ENOSYS produced.
 static constexpr uint64_t kSaneWorkAreaLimit = 16ull * 1024 * 1024;
 
-int main() {
+TEST(UltFailVisible, Contract) {
     register_builtin_hle();
     ult_reset_counts_for_test();
     // The environment must not decide whether this test passes: pin both policies explicitly.
@@ -72,7 +72,7 @@ int main() {
     auto lock = Hle::lookup("8hEGkR1pfr8");     // sceUltMutexLock
     auto unlock = Hle::lookup("h0XebKiMBtk");   // sceUltMutexUnlock
     CHECK(lock && unlock, "sceUltMutexLock / sceUltMutexUnlock resolve to prosper handlers");
-    if (!lock || !unlock) { std::printf("== FAIL: %d ==\n", ++fails); return 1; }
+    if (!lock || !unlock) { std::printf("== FAIL: %d ==\n", ++fails); FAIL() << "legacy early exit"; }
 
     // A lock on an object that was never created must not claim to have been taken. 0x1234 is not a
     // usable guest pointer, so this also proves the pointer is validated rather than dereferenced.
@@ -137,6 +137,5 @@ int main() {
               "even under PROSPER_ULT_LEGACY_ENOSYS a size query returns 0, not a sentinel (#1618)");
     }
 
-    std::printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

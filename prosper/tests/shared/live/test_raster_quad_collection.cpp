@@ -2,6 +2,8 @@
 // --cpu-only verifies producing ownership without creating Vulkan. GPU records are host raster
 // observations, NOT initialized guest registers, PS5 Wave64 packing or post-depth visibility.
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/capture/gpu_capture.hpp"
+#include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "shared/live/live_renderer.hpp"
@@ -47,12 +49,14 @@ static constexpr uint32_t PARAMETER_PS[]{0xc80e0000u,0xc8120001u,0xc8160002u,
 struct Program {
     alignas(256) std::array<uint32_t, 64> code{};
     AgcShaderUserData user{};
+    AgcShaderSharp sharp{4u};
     std::array<ShaderReg, 2> registers{};
     AgcShaderHeader header{};
 };
 struct Owners {
-    Program vs, ps, varying_vs, smooth_ps, parameter_ps;
+    Program vs, ps, varying_vs, smooth_ps, parameter_ps, resource_ps;
     std::array<uint32_t, 6> indices{0,1,2,0,1,2};
+    std::array<uint8_t, 64> resource_bytes{};
 };
 static bool register_program(Program& p, bool vertex, const uint32_t* raw, size_t count) {
     std::copy(raw, raw + count, p.code.begin());
@@ -83,6 +87,9 @@ static GpuState state_for(const Owners& o, const Program* vertex = nullptr,
     state.cx[P::SPI_PS_IN_CONTROL] = 0; // known Wave64, not inferred from effective SPIR-V
     state.cx[P::SPI_BARYC_CNTL] = 0xa5000000u; // full unused bits must not disappear
     state.cx[P::SPI_PS_INPUT_ENA] = state.cx[P::SPI_PS_INPUT_ADDR] = varying ? 2u : 0x300u;
+    state.sh[P::SPI_SHADER_PGM_RSRC2_PS] = 0; // observed zero, not an assumed USER_SGPR count
+    state.sh[P::SPI_SHADER_USER_DATA_PS_0] = 0;
+    state.sh[P::SPI_SHADER_USER_DATA_PS_0 + 31] = 0x7f123456u;
     if (varying) state.cx[P::SPI_PS_INPUT_CNTL_0] = 0; // actual attr0 -> producer PARAM0, not metadata guess
     state.index_type = 1; state.index_type_announced = true;
     GpuState::Draw draw;
@@ -129,6 +136,203 @@ static prosper::test::BackendDraw backend_contract(const DrawItem& draw) {
     b.vs = draw.vs; b.gs = draw.gs; b.fs = draw.fs;
     b.vs_shared = draw.vs_shared; b.fs_shared = draw.fs_shared;
     b.raster_quads = draw.raster_quads; return b;
+}
+static bool has_gap(const FragmentPacketPreparation& preparation, const char* reason) {
+    return std::find(preparation.unmet.begin(),preparation.unmet.end(),reason) != preparation.unmet.end();
+}
+static std::shared_ptr<const FragmentPacketPreparation> prepare(const DrawItem& draw) {
+    return prosper::test::prepare_backend_fragment_packet_inputs(backend_contract(draw));
+}
+static prosper::test::BackendDraw captured_backend_contract(const DrawItem& draw,
+        const GpuCapturedDraw& captured, const GpuCaptureFile& file) {
+    // Only decoded/materialized capture facts enter this consumer; no live producer capsule is
+    // borrowed. Interpolation/guest ABI stays unknown and this cannot run a packet kernel.
+    auto inputs = std::make_shared<RasterQuadInputs>();
+    inputs->source_vs = std::make_shared<const std::vector<uint32_t>>(draw.vs_words());
+    inputs->source_gs = std::make_shared<const std::vector<uint32_t>>(draw.gs_words());
+    inputs->source_fs = std::make_shared<const std::vector<uint32_t>>(draw.fs_words());
+    if (captured.fs_raw_shader_index < file.raw_shader_versions.size())
+        inputs->raw_code = std::make_shared<const std::vector<uint32_t>>(
+            file.raw_shader_versions[captured.fs_raw_shader_index].words);
+    inputs->raw_matches_producing_source = captured.ps_entry_source_available;
+    inputs->entry = draw.ps_entry; inputs->launch = draw.ps_raster_launch;
+    inputs->float_mode = draw.ps_float_mode; inputs->float_flags = draw.ps_float_flags;
+    inputs->launch_rsrc1 = draw.ps_launch_rsrc1; inputs->float_transport = draw.float_transport;
+    inputs->ps_resources = own_fragment_packet_resources(draw.prt.get());
+    auto backend = backend_contract(draw);
+    backend.raster_quads = std::make_shared<RasterQuadCollection>();
+    backend.raster_quads->inputs = std::move(inputs);
+    return backend;
+}
+static void entry_preparation_controls(const DrawItem& draw, GpuState state, Owners& owner) {
+    const auto prepared = prepare(draw);
+    check(prepared && prepared->inputs && prepared->inputs->entry.observed &&
+        prepared->inputs->entry.user_data_available == 0x80000001u &&
+        prepared->inputs->entry.user_data[0] == 0 && prepared->inputs->entry.user_data[1] == 0 &&
+        prepared->inputs->entry.user_data[31] == 0x7f123456u &&
+        prepared->inputs->entry.rsrc2_available && prepared->inputs->entry.rsrc2 == 0,
+        "real shipping preparation distinguishes present-zero USER_DATA/RSRC2 from absent word1");
+    check(prepared && !prepared->ready &&
+        has_gap(*prepared,"packet-entry-userdata-required-set-and-mapping-unproved") &&
+        has_gap(*prepared,"packet-logical64-composition-unproved") &&
+        has_gap(*prepared,"packet-ordered-export-commit-unimplemented") &&
+        !has_gap(*prepared,"packet-entry-ps-rsrc2-unavailable"),
+        "fully observed raw facts grant neither a launch ABI, logical wave nor commit");
+    state.sh.erase(P::SPI_SHADER_PGM_RSRC2_PS);
+    state.sh.erase(P::SPI_SHADER_USER_DATA_PS_0);
+    DrawItem absent;
+    const bool realized = realize_draw_item(state,&state.draws[0],6,64,false,absent,nullptr,true);
+    const auto absent_prepared = realized ? prepare(absent) : nullptr;
+    check(absent_prepared && absent_prepared->inputs &&
+        absent_prepared->inputs->entry.user_data_available == 0x80000000u &&
+        !absent_prepared->inputs->entry.rsrc2_available &&
+        has_gap(*absent_prepared,"packet-entry-ps-rsrc2-unavailable") &&
+        prepared && prepared->inputs && prepared->inputs->entry.user_data_available == 0x80000001u,
+        "same cached shader gets fresh per-draw missing inputs without changing older observation");
+    auto substituted = backend_contract(draw); substituted.set_fs({0xdeadbeefu});
+    const auto bad_source = prosper::test::prepare_backend_fragment_packet_inputs(substituted);
+    check(bad_source && has_gap(*bad_source,"packet-producing-source-unavailable") && !bad_source->ready,
+        "actual backend shader replacement cannot borrow producing input authority");
+
+    // Real registered metadata creates a PS resource table; no guest bytes are granted authority.
+    owner.resource_ps.user.sharp_resource_offset[3] = &owner.resource_ps.sharp;
+    owner.resource_ps.user.sharp_resource_count[3] = 1;
+    if (!register_program(owner.resource_ps,false,PS,std::size(PS))) return;
+    auto resource_state = state_for(owner,nullptr,&owner.resource_ps);
+    const uint64_t first_address = reinterpret_cast<uint64_t>(owner.resource_bytes.data());
+    const auto set_resource = [&](uint64_t address) {
+        resource_state.sh[P::SPI_SHADER_USER_DATA_PS_0 + 4] = uint32_t(address);
+        resource_state.sh[P::SPI_SHADER_USER_DATA_PS_0 + 5] = uint32_t(address >> 32) & 0xffffu;
+        resource_state.sh[P::SPI_SHADER_USER_DATA_PS_0 + 6] = 16;
+        resource_state.sh[P::SPI_SHADER_USER_DATA_PS_0 + 7] = (22u << 12) | 0xfacu;
+    };
+    set_resource(first_address);
+    DrawItem first_resource;
+    const bool first_ok = realize_draw_item(resource_state,&resource_state.draws[0],6,64,false,
+                                            first_resource,nullptr,true);
+    const auto first = first_ok ? prepare(first_resource) : nullptr;
+    const auto table = first && first->inputs ? first->inputs->ps_resources.table : nullptr;
+    check(table && table->resources.size() == 1 && table->resources[0].gpu_addr == first_address &&
+        !table->resources[0].host_data && first->inputs->ps_resources.host_backing_owned.size() == 1 &&
+        !first->inputs->ps_resources.host_backing_owned[0] &&
+        has_gap(*first,"packet-resource-content-authority-unproved") &&
+        has_gap(*first,"packet-resource-guest-fetch-and-read-point-unproved"),
+        "real producing normalized identity is retained while live guest content remains unproved");
+    if (!table || table->resources.size() != 1 || !first_resource.prt) return;
+    first_resource.prt->resources[0].gpu_addr = 0xdeadbeefu;
+    set_resource(first_address + 16);
+    DrawItem next_resource;
+    const bool next_ok = realize_draw_item(resource_state,&resource_state.draws[0],6,64,false,
+                                           next_resource,nullptr,true);
+    const auto next = next_ok ? prepare(next_resource) : nullptr;
+    check(next && next->inputs && next->inputs->ps_resources.table &&
+        next->inputs->ps_resources.table->resources.size() == 1 &&
+        next->inputs->ps_resources.table->resources[0].gpu_addr == first_address + 16 &&
+        table->resources[0].gpu_addr == first_address,
+        "changed real resource and later mutable table cannot alter older preparation identity");
+
+    // Independently supplied owned-byte arm drives the same shipping consumer. It is not evidence
+    // of a new resource-lowering or guest-memory admission route.
+    ShaderResourceTable owned_table;
+    auto bytes = std::make_shared<std::vector<uint8_t>>(std::initializer_list<uint8_t>{1,2,3,4});
+    ShaderResource resource;
+    resource.size = 4; resource.host_data = bytes->data(); resource.host_data_size = 4;
+    owned_table.resources.push_back(resource); owned_table.owned_host_data.push_back(bytes);
+    auto input = std::make_shared<RasterQuadInputs>(*draw.raster_quads->inputs);
+    input->ps_resources = own_fragment_packet_resources(&owned_table);
+    auto owned_draw = backend_contract(draw);
+    owned_draw.raster_quads = std::make_shared<RasterQuadCollection>();
+    owned_draw.raster_quads->inputs = input;
+    const auto owned = prosper::test::prepare_backend_fragment_packet_inputs(owned_draw);
+    (*bytes)[0] = 9; owned_table.resources[0].size = 99;
+    owned_table.owned_host_data.clear(); bytes.reset();
+    check(owned && owned->inputs && owned->inputs->ps_resources.table &&
+        owned->inputs->ps_resources.table->resources[0].size == 4 &&
+        owned->inputs->ps_resources.table->resources[0].host_data &&
+        owned->inputs->ps_resources.table->resources[0].host_data[0] == 1 &&
+        !has_gap(*owned,"packet-resource-content-authority-unproved") &&
+        has_gap(*owned,"packet-resource-guest-fetch-and-read-point-unproved") && !owned->ready,
+        "shipping consumer retains bounded bytes after caller mutation/release, not fetch authority");
+    owned_table.resources.resize(kCompileCaseMaxResources + 1u);
+    input = std::make_shared<RasterQuadInputs>(*draw.raster_quads->inputs);
+    input->ps_resources = own_fragment_packet_resources(&owned_table);
+    owned_draw.raster_quads->inputs = input;
+    const auto oversized = prosper::test::prepare_backend_fragment_packet_inputs(owned_draw);
+    check(oversized && !oversized->inputs->ps_resources.table &&
+        has_gap(*oversized,"packet-resource-ownership-transaction-failed") && !oversized->ready,
+        "failed ownership budget publishes no partial resource identity or packet admission");
+}
+
+static void capture_entry_controls(const DrawItem& draw, Owners& owner) {
+    if (!draw.raster_quads || !draw.raster_quads->inputs || !draw.raster_quads->inputs->raw_code) {
+        check(false,"capture requires the actual producing raw owner"); return;
+    }
+    const auto original = *draw.raster_quads->inputs->raw_code;
+    owner.ps.code[2] ^= 1;
+    GpuCaptureMetadata metadata; metadata.width = W; metadata.height = H;
+    GpuCaptureFile captured, decoded;
+    std::string error; std::vector<uint8_t> bytes;
+    // A failing VA reader cannot supply old raw words. Only the real producing owner can.
+    const bool captured_ok = capture_draw_items({draw},metadata,
+        [](uint64_t,uint8_t*,size_t) -> size_t { return 0; },captured,error);
+    owner.ps.code[2] ^= 1;
+    check(captured_ok && captured.draws.size() == 1 && captured.draws[0].ps_entry_source_available &&
+        captured.draws[0].fs_raw_shader_index < captured.raw_shader_versions.size() &&
+        captured.raw_shader_versions[captured.draws[0].fs_raw_shader_index].words == original,
+        "actual capture retains producing raw/SOURCE despite changed guest VA and failed reread");
+    const bool roundtrip = captured_ok && serialize_gpu_capture(captured,bytes,error) &&
+        deserialize_gpu_capture(bytes,decoded,error);
+    GpuReplayFrame replay;
+    const bool restored = roundtrip && materialize_gpu_replay(decoded,replay,error) && replay.items.size() == 1;
+    check(restored && replay.items[0].ps_entry == draw.ps_entry &&
+        replay.items[0].ps_raster_launch == draw.ps_raster_launch,
+        "actual capture codec and materializer retain observed raw entry/launch facts");
+    if (!restored) return;
+    auto invalid = captured;
+    invalid.draws[0].ps_entry.user_data[1] = 42;
+    std::vector<uint8_t> refused_bytes;
+    check(!serialize_gpu_capture(invalid,refused_bytes,error),
+        "absent USER_DATA word cannot carry a nonzero serialized payload");
+    invalid = captured;
+    invalid.draws[0].ps_entry.rsrc2_available = false; invalid.draws[0].ps_entry.rsrc2 = 1;
+    check(!serialize_gpu_capture(invalid,refused_bytes,error),
+        "unknown raw RSRC2 cannot carry guessed launch bits");
+    invalid = captured; invalid.draws[0].fs_raw_shader_index = UINT32_MAX;
+    check(!serialize_gpu_capture(invalid,refused_bytes,error),
+        "producing association requires retained raw words, not merely SOURCE or an entry marker");
+    const size_t entry_start = bytes.size() - (4u + kGpuCaptureFragmentEntryRecordBytes);
+    auto corrupt = bytes; corrupt[entry_start] ^= 1u;
+    GpuCaptureFile refused;
+    check(!deserialize_gpu_capture(corrupt,refused,error),
+        "entry count is checked against the already bounded actual draw inventory");
+    corrupt = bytes; corrupt[entry_start + 4u] = 2u;
+    check(!deserialize_gpu_capture(corrupt,refused,error),
+        "nonboolean observed-entry tag refuses before materialization");
+    for (size_t end = entry_start; end < bytes.size(); ++end) {
+        corrupt = bytes; corrupt.resize(end);
+        check(!deserialize_gpu_capture(corrupt,refused,error),
+            "every truncated v69 entry byte refuses without guessed defaults");
+    }
+    auto restored_backend = captured_backend_contract(replay.items[0],decoded.draws[0],decoded);
+    const auto prepared = prosper::test::prepare_backend_fragment_packet_inputs(restored_backend);
+    check(prepared && prepared->inputs->entry.rsrc2_available &&
+        prepared->inputs->entry.user_data_available == 0x80000001u && !prepared->ready &&
+        !has_gap(*prepared,"packet-entry-ps-rsrc2-unavailable"),
+        "round-tripped present-zero state reaches actual shipping preparation without granting ABI");
+    // v69 is an append-only 4-byte count plus 159 bytes per draw; remove exactly that suffix.
+    auto legacy = bytes; legacy.resize(legacy.size() - (4u + kGpuCaptureFragmentEntryRecordBytes));
+    legacy[8] = 68; legacy[9] = legacy[10] = legacy[11] = 0;
+    const bool old_ok = deserialize_gpu_capture(legacy,decoded,error) &&
+        materialize_gpu_replay(decoded,replay,error) && replay.items.size() == 1;
+    check(old_ok && !decoded.draws[0].ps_entry_source_available && !replay.items[0].ps_entry.observed,
+        "actual pre-v69 capture remains readable with explicit unavailable entry/source facts");
+    if (!old_ok) return;
+    restored_backend = captured_backend_contract(replay.items[0],decoded.draws[0],decoded);
+    const auto old = prosper::test::prepare_backend_fragment_packet_inputs(restored_backend);
+    check(old && has_gap(*old,"packet-entry-register-observation-unavailable") &&
+        has_gap(*old,"packet-entry-ps-rsrc2-unavailable") &&
+        has_gap(*old,"packet-producing-source-unavailable") && !old->ready,
+        "legacy absence stays a named shipping preparation refusal, never an inferred zero seed");
 }
 static void ownership_controls(DrawItem& draw, Owners& owner) {
     const auto sink = draw.raster_quads;
@@ -199,6 +403,11 @@ static RasterQuadResult observe(DrawItem draw, uint32_t budget) {
 static void observe_complete(const RasterQuadResult& result) {
     check(result.attempted && result.complete && result.rejection.empty() && !result.quads.empty(),
         "registered DrawItem refusal route completed real scratch collection");
+    check(result.packet_preparation && result.packet_preparation->inputs &&
+        result.packet_preparation->inputs->entry.rsrc2_available &&
+        !result.packet_preparation->ready &&
+        has_gap(*result.packet_preparation,"packet-logical64-composition-unproved"),
+        "actual registered refused-draw collector consumes the producing entry capsule");
     check(result.host_raster_domain_available && result.host_sample_count == 1 && result.host_sample_index == 0 &&
         result.host_layer == 0 && result.host_view_index == 0 && result.host_instance_count == 1 &&
         result.host_first_instance == 0 && !result.guest_export_eligibility_available,
@@ -391,7 +600,11 @@ int main(int argc, char** argv) {
         check(build_raster_quad_collector(inputs,2,contract).empty() &&
             contract.rejection == "quad-collector-producing-source-unavailable",
             "actual DrawItem without owned producing analysis loudly declines");
-    } else ownership_controls(draw,owner);
+    } else {
+        ownership_controls(draw,owner);
+        entry_preparation_controls(draw,state,owner);
+        capture_entry_controls(draw,owner);
+    }
     if (!cpu && scissor_override) {
         // The normal backend would replace this empty scissor despite the string value "0".
         draw.ps.has_scissor = true;

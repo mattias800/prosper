@@ -11,15 +11,14 @@
 // check kills a constant, and the destroy-twice check proves the registry actually records ids
 // rather than answering true unconditionally.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(SavedataTxres, Contract) {
     std::printf("== test_savedata_txres ==\n");
 
     const size_t live0 = savedata_tx_resource_live_count();
@@ -46,6 +45,4 @@ int main() {
     CHECK(!savedata_tx_resource_destroy(-1), "a negative id is rejected");
     CHECK(!savedata_tx_resource_destroy(0x7fffffff), "an unallocated id is rejected");
 
-    std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

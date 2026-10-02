@@ -15,6 +15,7 @@
 //   M4  GetPrtAperture does not read back what was set         -> the round-trip arm
 //   M5  the coredump pair is unregistered again                -> the registered arms
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 
 #include <cstdint>
@@ -23,16 +24,14 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Written as a literal so a mutated sce_errno.hpp cannot make the arms agree with itself.
 static constexpr uint64_t kEncodedEINVAL = 0x80020016ull;
 
 static uint64_t call3(HleFn f, uint64_t a, uint64_t b, uint64_t c) { return f(a, b, c, 0, 0, 0); }
 
-int main() {
+TEST(KernelSystemStubs, Contract) {
     printf("== test_kernel_system_stubs ==\n");
     register_builtin_hle();
 
@@ -44,7 +43,7 @@ int main() {
     CHECK(get_mode != nullptr, "sceKernelGetOperationMode is registered (M1)");
     CHECK(co_reg && co_unreg, "the coredump handler pair is registered (M5)");
     CHECK(prt_set && prt_get, "the PRT aperture pair is registered");
-    if (!get_mode || !co_reg || !co_unreg || !prt_set || !prt_get) return 1;
+    if (!get_mode || !co_reg || !co_unreg || !prt_set || !prt_get) FAIL() << "legacy early exit";
 
     // --- GetOperationMode: two 32-bit out-parameters, both written, nothing else touched ----------
     {
@@ -104,6 +103,4 @@ int main() {
     CHECK(call3(prt_get, 0, 0, (uint64_t)(uintptr_t)&l) == kEncodedEINVAL,
           "GetPrtAperture with a null out-pointer: EINVAL, no host fault");
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

@@ -5,6 +5,7 @@
 // builders themselves read SysV stack args via __builtin_frame_address, only valid under the loaded
 // game) and asserts run_command_buffer writes the right bytes to the target address.
 #include "gpu/pm4/command_processor.hpp"
+#include <gtest/gtest.h>
 #include "gpu/pm4/pending_write_snapshot.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/mb3_freelist.hpp"
@@ -58,9 +59,7 @@ extern "C" int prosper_forge_predicate_for_test(uint64_t pre, uint64_t width, ui
 extern "C" int prosper_liveptr_shape_for_test(uint64_t pre, uint64_t width, uint64_t value);
 extern "C" int prosper_nonheap_guard_content_for_test(uint64_t pre, uint64_t width, uint64_t value);
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 #ifdef _WIN32
 static int test_fileno(FILE* stream) { return _fileno(stream); }
@@ -113,7 +112,7 @@ static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
     return n;
 }
 
-int main() {
+TEST(EopWrite, Contract) {
     // Exercise the SDK-13 post-submit queue policy; older callers use the eager compatibility path.
     prosper_gpu_enable_post_submit_visibility();
     // Keep an inherited developer environment from turning this unit test into the destructive
@@ -2623,7 +2622,4 @@ int main() {
               "the preserving notification keeps its exact range");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

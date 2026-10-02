@@ -1,4 +1,5 @@
 #include "shared/texture/texture_decode_diagnostic.hpp"
+#include <gtest/gtest.h>
 #include "shared/texture/texture_decode_cache_policy.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 
@@ -14,13 +15,10 @@ using prosper::frontend::texture_decode_miss_reason;
 using prosper::frontend::texture_decode_miss_is_expensive_block;
 using prosper::frontend::TextureDecodeMissReason;
 
-static int failures = 0;
-#define CHECK(cond) do { if (!(cond)) { \
-    std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
-#define CHECK_NAMED(name, cond) do { if (!(cond)) { \
-    std::fprintf(stderr, "FAIL %s: %s\n", name, #cond); ++failures; } } while (0)
+#define CHECK(cond) EXPECT_TRUE(cond)
+#define CHECK_NAMED(name, cond) EXPECT_TRUE(name) << (cond)
 
-int main() {
+TEST(TextureDecodeDiagnostic, Contract) {
     CHECK(texture_decode_cache_candidate(false, false, false, 1u, true, true, false));
     CHECK(texture_decode_cache_candidate(false, false, false, 2u, true, true, false));
     CHECK(texture_decode_cache_candidate(false, false, false, 5u, true, true, false));
@@ -167,6 +165,4 @@ int main() {
     // A non-array, non-BC texture's declared size is unaffected: nothing to overshoot.
     CHECK(texcommit_scan_extent(65536u) == 65536u);
 
-    if (!failures) std::printf("texture_decode_diagnostic: OK\n");
-    return failures ? 1 : 0;
 }

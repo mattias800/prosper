@@ -1,5 +1,6 @@
 // Guest clocks advance in real time; only the internal GPU dependency watchdog discounts stalls.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/kernel/hle_kernel_time.hpp"
 #include "hle/dispatch/nid.hpp"
 #include <algorithm>
@@ -12,17 +13,16 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(GpuTimeCompensation, Contract) {
     std::printf("== test_gpu_time_compensation ==\n");
     register_builtin_hle();
     auto ptc = Hle::lookup(nid_hash("sceKernelGetProcessTimeCounter"));
     auto clock_gettime_fn = Hle::lookup(nid_hash("sceKernelClockGettime"));
     auto tsc = Hle::lookup(nid_hash("sceKernelReadTsc"));
     CHECK(ptc && tsc && clock_gettime_fn, "monotonic, TSC and realtime entry points registered");
-    if (fails) return 1;
+    if (fails || ::testing::Test::HasFailure()) FAIL() << "legacy early exit";
 
     constexpr uint64_t kBudgetNs = 8'000'000;
     const uint64_t guest_before = ptc(0, 0, 0, 0, 0, 0);
@@ -131,5 +131,5 @@ int main() {
 
     if (fails) std::printf("== FAIL (%d) ==\n", fails);
     else       std::printf("== PASS ==\n");
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

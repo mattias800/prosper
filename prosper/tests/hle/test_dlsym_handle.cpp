@@ -4,6 +4,7 @@
 // LoadStartModule resolves a linked-module path (basename match) to a real handle; an unknown path
 // returns ENOENT (#146) — dlsym against a non-module handle still falls back to the global table.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -13,16 +14,15 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(DlsymHandle, Contract) {
     printf("== test_dlsym_handle ==\n");
     register_builtin_hle();
     auto load  = Hle::lookup(nid_hash("sceKernelLoadStartModule"));
     auto dlsym = Hle::lookup(nid_hash("sceKernelDlsym"));
     CHECK(load && dlsym, "LoadStartModule + Dlsym registered");
-    if (fails) { printf("== FAIL ==\n"); return 1; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // Two synthetic modules that BOTH export PSN_PrxInitialize, at different addresses; the
     // global table holds the first definition (what the linker's first-wins pass produces).
@@ -73,7 +73,5 @@ int main() {
     CHECK(dlsym(hA, U("NoSuchExport"), U(&addr), 0, 0, 0) == 0x80020003 && addr == 0xFEED,
           "unknown symbol -> ESRCH, *funcAddr untouched");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

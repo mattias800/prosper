@@ -17,6 +17,7 @@
 // them apart from a genuine absence has no result at all.
 
 #include "../../../src/host/memory/guest_memory_search.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 #include <cstring>
@@ -27,14 +28,8 @@ using namespace prosper::host;
 
 namespace {
 
-int g_failures = 0;
 
-void check(bool ok, const std::string& what) {
-    if (!ok) {
-        fprintf(stderr, "FAIL: %s\n", what.c_str());
-        ++g_failures;
-    }
-}
+void check(bool ok, const std::string& what) { EXPECT_TRUE(ok) << what; }
 
 // A synthetic address space: one contiguous blob mapped at `base`.
 struct FakeSpace {
@@ -77,7 +72,7 @@ std::vector<uint8_t> needle_bytes(size_t n) {
 
 }  // namespace
 
-int main() {
+TEST(GuestMemorySearch, Contract) {
     // NOT a copied constant: see the header note. A straddle case that stops straddling still
     // passes, and then nothing tests the overlap at all.
     const size_t kChunk = memory_search_chunk_bytes();
@@ -329,10 +324,4 @@ int main() {
         check(s.fetches == 0, "short range: never fetched");
     }
 
-    if (g_failures) {
-        fprintf(stderr, "guest_memory_search: %d failure(s)\n", g_failures);
-        return 1;
-    }
-    printf("guest_memory_search: all cases passed\n");
-    return 0;
 }

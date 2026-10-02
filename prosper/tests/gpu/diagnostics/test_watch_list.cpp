@@ -6,15 +6,14 @@
 // an instrument trap for PROSPER_TARGET_WATCH, then reproduced by a diagnostic whose own comment claimed
 // `0x` was required. Nothing checked the prefix. So the rule is tested, not restated.
 #include "gpu/diagnostics/watch_list.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 #include <vector>
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 bool rejects(const char* spec) {
@@ -24,7 +23,7 @@ bool rejects(const char* spec) {
 }
 }  // namespace
 
-int main() {
+TEST(WatchList, Contract) {
     printf("== test_watch_list ==\n");
 
     // Accepted: 0x-prefixed, single and comma-separated, either case, with tolerated spaces.
@@ -83,7 +82,4 @@ int main() {
         CHECK(!parse_hex_watch_list("", out) && out.empty(), "an empty spec is rejected");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

@@ -18,7 +18,7 @@
 #include "shared/compute/compute_buffer_bytes.hpp"
 
 #include <cstdint>
-#include <cstdio>
+#include <gtest/gtest.h>
 #include <cstring>
 #include <random>
 #include <string>
@@ -26,11 +26,7 @@
 
 namespace {
 
-int failures = 0;
-void check(bool ok, const std::string& message) {
-    std::printf("[%s] %s\n", ok ? "ok" : "FAIL", message.c_str());
-    failures += !ok;
-}
+void check(bool ok, const std::string& message) { EXPECT_TRUE(ok) << message; }
 
 // The whole contract in one place: compare, copy only what it reported, and require the result to
 // equal a full copy. `expect_first`/`expect_last` pin the extent itself where the case knows it.
@@ -74,7 +70,7 @@ std::vector<uint8_t> pattern(size_t bytes, uint32_t seed) {
 
 }  // namespace
 
-int main() {
+TEST(ComputeBufferDiffSpan, SpanCopyReproducesFullCopy) {
     // Small buffers take the single-threaded path; anything at or above 8 MiB takes the eight-worker
     // parallel path, where the per-worker first/last must combine correctly across slice boundaries.
     // Both are exercised, because a combine bug is invisible below the threshold.
@@ -145,11 +141,4 @@ int main() {
                                                                   &first, &last),
               "zero bytes compares equal");
     }
-
-    if (failures) {
-        std::printf("compute_buffer_diff_span: %d FAILED\n", failures);
-        return 1;
-    }
-    std::printf("compute_buffer_diff_span: OK\n");
-    return 0;
 }

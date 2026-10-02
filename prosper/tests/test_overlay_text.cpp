@@ -10,15 +10,14 @@
 #include "overlay_text.hpp"
 
 #include <cstdint>
+#include <gtest/gtest.h>
 #include <cstdio>
 #include <string>
 #include <vector>
 
 using namespace prosper::screenshot;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -43,12 +42,8 @@ void font_table_is_well_formed() {
     // this is asserted rather than assumed -- a typo'd row is invisible on inspection and out of
     // bounds at runtime, and no pixel arm below would necessarily catch it.
     char bad = 0;
-    if (!overlay_font_rows_are_well_formed(&bad)) {
-        std::printf("  [FAIL] glyph '%c' has a row that is not %d characters\n", bad, kGlyphWidth);
-        fails++;
-    } else {
-        std::printf("  [ok]   every glyph row is exactly %d characters\n", kGlyphWidth);
-    }
+    EXPECT_TRUE(overlay_font_rows_are_well_formed(&bad))
+        << "glyph '" << bad << "' has a row that is not " << kGlyphWidth << " characters";
 
     // Checked through the public surface: every character the overlay can be asked to draw must
     // resolve to a glyph or to the deliberate fallback, and neither may crash or draw nothing.
@@ -160,12 +155,8 @@ void scale_tracks_resolution() {
 
 } // namespace
 
-int main() {
-    std::printf("== font table ==\n");        font_table_is_well_formed();
-    std::printf("== it draws ==\n");          the_overlay_is_actually_drawn();
-    std::printf("== it discriminates ==\n");  different_text_draws_differently();
-    std::printf("== it refuses ==\n");        it_refuses_rather_than_corrupts();
-    std::printf("== scale ==\n");             scale_tracks_resolution();
-    std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
-}
+TEST(OverlayText, FontTableIsWellFormed) { font_table_is_well_formed(); }
+TEST(OverlayText, OverlayIsActuallyDrawn) { the_overlay_is_actually_drawn(); }
+TEST(OverlayText, DifferentTextDrawsDifferently) { different_text_draws_differently(); }
+TEST(OverlayText, RefusesRatherThanCorrupts) { it_refuses_rather_than_corrupts(); }
+TEST(OverlayText, ScaleTracksResolution) { scale_tracks_resolution(); }

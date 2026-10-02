@@ -1,4 +1,5 @@
 #include "gpu/timeline/menu_capture_policy.hpp"
+#include <gtest/gtest.h>
 
 #include <array>
 #include <cstdio>
@@ -8,12 +9,9 @@
 
 using namespace prosper::gpu;
 
-static int failures = 0;
-#define CHECK(condition, message) do { \
-    if (!(condition)) { std::printf("FAIL: %s\n", message); ++failures; } \
-} while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
-int main() {
+TEST(MenuFrameGate, Contract) {
     constexpr uint32_t width = 100, height = 100;
     const MenuFrameGateSpec gate{
         .width = width, .height = height,
@@ -273,6 +271,4 @@ int main() {
                   std::numeric_limits<size_t>::max(),
           "a prior effect is temporal evidence only when the exact selected draw exists later");
 
-    std::printf("menu_frame_gate: %s\n", failures ? "FAIL" : "PASS");
-    return failures ? 1 : 0;
 }

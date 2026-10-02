@@ -13,6 +13,7 @@
 //     header scanner. Every such arm pre-fills the out-parameters with a sentinel and requires
 //     the sentinel to SURVIVE alongside a non-zero return.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/net/hle_http2.hpp"
 
 #include <cstdint>
@@ -22,8 +23,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -103,7 +103,7 @@ bool is_positive_id(uint64_t ret) {
 
 } // namespace
 
-int main() {
+TEST(Http2, Contract) {
     std::printf("== test_http2 ==\n");
     register_builtin_hle();
 
@@ -121,7 +121,7 @@ int main() {
     }
     CHECK(missing == 0, "every libSceHttp2 export this file implements is registered");
     CHECK(misnamed == 0, "every registration carries its PS5 3.20 name");
-    if (missing) { std::printf("== FAIL: %d ==\n", fails); return 1; }
+    if (missing) { std::printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
 
     HleFn init = fn("3JCe3lCbQ8A"), term = fn("YiBUtz-pGkc");
     HleFn create_tmpl = fn("+wCt7fCijgk"), del_tmpl = fn("pDom5-078DA");
@@ -292,5 +292,5 @@ int main() {
 
     if (fails) std::printf("== FAIL: %d ==\n", fails);
     else std::printf("== PASS ==\n");
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

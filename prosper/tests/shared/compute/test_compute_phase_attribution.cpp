@@ -9,7 +9,7 @@
 
 #include <chrono>
 #include <cmath>
-#include <cstdio>
+#include <gtest/gtest.h>
 #include <optional>
 
 using namespace prosper::frontend;
@@ -28,11 +28,7 @@ using Opt = std::optional<TP>;
 
 TP at(long ms) { return TP(std::chrono::milliseconds(ms)); }
 
-int failures = 0;
-void check(const char* what, bool ok) {
-    std::printf("  %s  %s\n", ok ? "PASS" : "FAIL", what);
-    if (!ok) ++failures;
-}
+void check(const char* what, bool ok) { EXPECT_TRUE(ok) << what; }
 bool near(double a, double b) { return std::fabs(a - b) < 1e-9; }
 double sum(const ComputePhaseMilliseconds& p) {
     return p.setup + p.pipeline + p.dispatch + p.writeback + p.cleanup;
@@ -43,8 +39,7 @@ bool nonnegative(const ComputePhaseMilliseconds& p) {
 
 }  // namespace
 
-int main() {
-    std::printf("compute phase attribution\n");
+TEST(ComputePhaseAttribution, AllShapes) {
 
     // 1. A complete dispatch: every interval is its marker difference, cleanup from writeback.
     {
@@ -91,6 +86,4 @@ int main() {
               near(p.cleanup, 1) && near(sum(p), 7));
     }
 
-    std::printf("%s\n", failures ? "FAILURES PRESENT" : "all passed");
-    return failures ? 1 : 0;
 }

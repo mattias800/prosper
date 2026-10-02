@@ -191,8 +191,8 @@ The standing warnings that are **not** title-specific:
   `! alarm: <rule>` while one is active. How to read them: `src/diagnostics/AGENTS.md`.
 - **Before quoting an FPS number from this project, check which harness produced it — and when.**
   Three ways to get a wrong one, and a single run can hit all three:
-  - **`tools/screenshot` never calls `set_gpu_present_active`** (the sole call site is
-    `frontends/prosper-app/main.cpp:694`), so in that harness the renderer copies every scanout frame
+  - **`tools/screenshot` never calls `set_gpu_present_active`** (the sole frontend call site is
+    `frontends/prosper-app/main.cpp:748`), so in that harness the renderer copies every scanout frame
     back to the CPU. Its rate describes the forced-readback path, not the shipped one. **This applies
     only to figures measured after 2026-07-24** — before #1270 there was no GPU-present path, so
     every harness took the readback and the old figures are honest measurements of what then shipped.
@@ -306,6 +306,45 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   *"Within reason"* is part of the rule: a folder holding a single file, or a leaf whose name already
   says everything, does not need one. If you cannot write a sentence the reader would not have
   guessed, skip it.
+
+- **Architecture and performance ratchets.** `prosper/tools/ci/check_arch_ratchet.py` holds six
+  per-file counts to "down, never up": title ids and title-named directories in shared code, raw
+  `getenv` reads, blocking GPU syncs, files over 5,000 lines, and `prosper::test::` in the
+  frontends. **Check your change with delta mode:**
+  `python3 prosper/tools/ci/check_arch_ratchet.py --root . --base origin/main`. It judges only the
+  files changed since your merge base with `origin/main` (working tree included) and fails only on
+  a count *your change* raised past its row, so a stale row elsewhere on `main` is not your
+  failure. CI gates on delta mode against the PR's base; the full-tree run (no `--base`) is the
+  baseline-maintenance report and is informational in CI. `prosper/tools/ci/ratchet_hook.py` runs
+  delta mode before an agent's `git commit` / `git push` and, for now, **only warns** (a
+  `systemMessage`; the command proceeds). On a failure, fix the code; if the new count is genuinely
+  right, raise its row in `prosper/tools/ci/arch_ratchet_baseline.txt` **in the same PR** with a
+  `# note` a reviewer reads (a new sync names the guest-visible result it delivers). Record a drop
+  with `--update`, which only lowers. Exit 2 means "could not evaluate", never clean.
+  - **Steady-state invariants** — a direction and a review rule, not a description of today. After
+    warm-up: **P1** no CPU wait on, or readback from, the GPU inside a frame unless the guest
+    observes that result; **P2** no Vulkan object creation per draw or dispatch; **P3** no shader or
+    pipeline compile on the submit thread; **P4** no process-global lock on a hot path; **P5**
+    per-draw cost does not grow with guest resource size — memory that tracking can prove unchanged
+    is not compared or copied in full; **P6** bounded frames in flight, frame N+1 recording while
+    frame N executes on the GPU. A PR that moves away from one says so. **prosper violates P1 and
+    P5 today:** the main render submit waits on its fence (`submit_and_wait()`,
+    `tests/fixtures/render_runner.h:2986` → `vkWaitForFences` in `wait_and_finish()`, `:3076`;
+    staged fix #3948), and a resident-buffer hit is re-validated by a full `memcmp` (`:5462`) once
+    write-watch disables itself after two dirty queries (`:5407`, #3155).
+  - **Title ids** never appear in a condition in shared code; naming the evidence in a comment is fine,
+    and tests may use them as fixture data.
+    Behaviour one title needs is a general rule the evidence supports, or isolated code with its
+    measurement (`src/gpu/recompiler/gta5/`).
+  - **Switches:** classify every new `PROSPER_*` in its PR as a *host-capability* switch (what this
+    machine can do), a *diagnostic* (observes; changes nothing the guest sees, e.g. `PROSPER_GFXLOG`)
+    or a *guest-behaviour selector* (changes what the guest sees, e.g.
+    `PROSPER_POST_SUBMIT_VISIBILITY`). A selector needs an issue whose resolution settles the
+    default and deletes the switch.
+  - **Performance claims** are a same-binary A/B whose control arm is the change switched off.
+    `tools/perf/compare_runs.py` refuses mismatched runs but reads only `tools/screenshot`
+    manifests, and `prosper-app` writes none — so a `prosper-app` claim states frontend, present
+    mode, route and both arms by hand until it does. Procedure: `.claude/skills/perf-change/`.
 
 - **The branch is `main`. There is no `master`, and older text that names one is historical.**
   The repository's history was rewritten around 2026-07-04; `main` carries the rewritten line and is
@@ -502,7 +541,8 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   Full rules: `prosper/tests/AGENTS.md`. PR descriptions may use
   `.github/pull_request_template.md` (Context, Higher Goal, Acceptance Criteria, Out of Scope,
   Summary of Changes, Verification), scaled to the change.
-  Optional project skills in `.claude/skills/`: `start-task` and `implement-hle-function`.
+  Optional project skills in `.claude/skills/`: `start-task`, `implement-hle-function` and
+  `perf-change`.
   They preserve the task's existing authorization, resource coordination and machine-local rules.
 - **Python:** behavior changes need meaningful regression coverage, reusing applicable tests;
   document mechanical scope and execution limits. New `.py` files need a purpose docstring;
@@ -1155,3 +1195,9 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     touches; they do **not** fence off who may work where. Any file or issue is fair game — when
     several agents run concurrently, coordinate through the claim lock and worktrees above rather than
     by carving up the codebase.
+
+## Tests use GoogleTest
+
+New C++ tests are written with GoogleTest and registered via `prosper_add_gtest` (`prosper/cmake/ProsperGTest.cmake`).
+Do not add files with a hand-rolled `main()`/`CHECK`; ctest `gtest_policy` rejects them. Migrating a legacy test means
+deleting its line from `prosper/tools/ci/gtest_legacy_allowlist.txt`. Details: `prosper/tests/AGENTS.md`.

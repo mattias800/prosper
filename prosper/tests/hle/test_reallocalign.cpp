@@ -26,6 +26,7 @@
 // relocated to 16- but not 256-aligned. Sony ships `reallocalign` beside `realloc` for this
 // reason, and pairs sceLibcMspaceRealloc with sceLibcMspaceReallocalign.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstddef>
 #include <cstdint>
@@ -44,12 +45,11 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static uint64_t U(const void* p) { return (uint64_t)(uintptr_t)p; }
 
-int main() {
+TEST(Reallocalign, Contract) {
     printf("== test_reallocalign ==\n");
     register_builtin_hle();
 
@@ -64,7 +64,7 @@ int main() {
     CHECK(memalign_fn != nullptr && free_fn != nullptr, "memalign/free are registered");
     if (!reallocalign_fn || !memalign_fn || !free_fn) {
         printf("== %d failure(s) ==\n", fails);
-        return 1;
+        FAIL() << "legacy early exit";
     }
 
     // --- grow, preserving BOTH contents and the extended alignment ------------------------------
@@ -72,7 +72,7 @@ int main() {
         const size_t kAlign = 256, kOld = 513, kNew = 4099;
         auto* p = (uint8_t*)(uintptr_t)memalign_fn(kAlign, kOld, 0, 0, 0, 0);
         CHECK(p != nullptr && ((uintptr_t)p % kAlign) == 0, "memalign returns a 256-aligned block");
-        if (!p) { printf("== %d failure(s) ==\n", fails); return 1; }
+        if (!p) { printf("== %d failure(s) ==\n", fails); FAIL() << "legacy early exit"; }
         for (size_t i = 0; i < kOld; ++i) p[i] = (uint8_t)(i * 31u + 7u);
 
         auto* grown = (uint8_t*)(uintptr_t)reallocalign_fn(U(p), kNew, kAlign, 0, 0, 0);
@@ -266,6 +266,5 @@ int main() {
         }
     }
 
-    printf(fails ? "== %d failure(s) ==\n" : "== all checks passed ==\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

@@ -2,6 +2,7 @@
 // volume candidates (#3873 plan item 2). The cache here is a stand-in with the one field the index
 // reads, so the test needs no device and no renderer.
 #include "shared/rtt/volume_target_index.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -15,17 +16,13 @@ struct Surf {
 };
 using Cache = std::unordered_map<uint64_t, Surf>;
 
-int failures = 0;
-void check(bool ok, const char* what) {
-    std::printf("[%s] %s\n", ok ? "ok" : "FAIL", what);
-    failures += !ok;
-}
+void check(bool ok, const char* what) { EXPECT_TRUE(ok) << what; }
 
 bool overlaps(uint64_t a, uint64_t an, uint64_t b, uint64_t bn) { return a < b + bn && b < a + an; }
 
 }  // namespace
 
-int main() {
+TEST(VolumeTargetIndex, Contract) {
     using prosper::frontend::VolumeTargetIndex;
     using prosper::frontend::any_volume_target_full_scan;
 
@@ -97,5 +94,4 @@ int main() {
     index.note(0);
     check(!index.contains(0), "address zero is never indexed");
 
-    return failures ? 1 : 0;
 }

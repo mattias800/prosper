@@ -1,4 +1,5 @@
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/gpu_dependency_graph.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -21,10 +22,7 @@ using namespace prosper::gpu;
 
 namespace {
 
-int failures = 0;
-#define CHECK(condition, message) do { \
-    if (!(condition)) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; } \
-} while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
 uint8_t nibble(char value) {
     return value >= '0' && value <= '9' ? static_cast<uint8_t>(value - '0')
@@ -132,7 +130,7 @@ struct Fixture {
 
 } // namespace
 
-int main() {
+TEST(Gta5PackedPointer, Contract) {
     const std::vector<uint32_t> exact = program();
     Fixture valid;
     const std::vector<uint8_t> original_source = valid.source;
@@ -610,10 +608,4 @@ int main() {
               materialize_gpu_replay(reserialized_capture, replay, capture_error),
           "zero-marker loaded capture reserializes and remints packed authority");
 
-    if (failures) {
-        std::fprintf(stderr, "%d GTA packed-pointer assertion(s) failed\n", failures);
-        return 1;
-    }
-    std::puts("GTA V packed-pointer contract tests passed");
-    return 0;
 }

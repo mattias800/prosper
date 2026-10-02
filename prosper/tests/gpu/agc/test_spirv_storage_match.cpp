@@ -4,6 +4,7 @@
 // The permissive direction is the dangerous one: a false "native" binds the guest image directly and
 // the shader reads it with the wrong element type. Every arm below therefore has a rejection partner.
 #include "gpu/resources/spirv_storage_match.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 
 using prosper::gpu::DataFormat;
@@ -15,16 +16,14 @@ using prosper::gpu::spirv_native_uint_storage;
 // passed in; this test only needs them to be DISTINCT, which is the property the predicate relies on.
 static constexpr uint32_t R32UI = 101, R16UI = 102, R8UI = 103, RGBA8UI = 104;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); ++fails; } \
-                         else printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static SpirvStorageDeclaration uint_decl(uint32_t fmt, bool atomic = false) {
     SpirvStorageDeclaration d{}; d.numeric_class_is_uint = true; d.atomic_access = atomic;
     d.storage_image_format = fmt; return d;
 }
 
-int main() {
+TEST(SpirvStorageMatch, Contract) {
     printf("== spirv storage match (#3204) ==\n");
 
     // Float: the module's word is sufficient, no format pair to check.
@@ -63,6 +62,4 @@ int main() {
     CHECK(!spirv_native_uint_storage(neither, DataFormat::Uint32, 1, R32UI, R16UI, R8UI, RGBA8UI),
           "a module declaring neither class is not a native uint storage image");
 
-    printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
 }

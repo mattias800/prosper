@@ -5,6 +5,7 @@
 // defers the free to the last waiter leaving. This drives it through the NID registry: park a
 // waiter, delete from the main thread, and assert the waiter wakes with EACCES and nothing crashes.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"   // kSceKernelErrorEINVAL (#1963)
 #include <cstdio>
@@ -27,8 +28,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static constexpr uint32_t kEACCES = 0x8002000Du;
 static constexpr uint32_t kEBUSY = 0x80020010u;
@@ -75,7 +75,7 @@ static void close_descriptor(int fd) {
 #endif
 }
 
-int main() {
+TEST(SyncDelete, Contract) {
     printf("== test_sync_delete ==\n");
     char formatted_tid[32]{};
     snprintf(formatted_tid, sizeof(formatted_tid), "%" PRIu64,
@@ -117,7 +117,7 @@ int main() {
     CHECK(ef_create && ef_poll && ef_wait && ef_delete && se_create && se_wait && se_delete && se_signal,
           "ef/sema fns registered");
     if (!(ef_create && ef_poll && ef_wait && ef_delete && se_create && se_wait && se_delete && se_signal)) {
-        printf("== FAIL ==\n"); return 1;
+        printf("== FAIL ==\n"); FAIL() << "legacy early exit";
     }
 
     // --- #1963: sceKernelCreateEventFlag must VALIDATE its out-pointer, not merely test it
@@ -343,7 +343,6 @@ int main() {
     CHECK(trace.find("SEMA.signal") == std::string::npos,
           "deleted semaphore focus does not retain a reused object's signal");
 
-    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
+    EXPECT_EQ(fails, 0);
 }

@@ -9,17 +9,14 @@
 #include "gpu/diagnostics/pass_break_census.hpp"
 
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <cstring>
 
 using namespace prosper::gpu;
 
-static int failures = 0;
-static void check(bool ok, const char* name) {
-    printf("%s: %s\n", ok ? "PASS" : "FAIL", name);
-    if (!ok) failures++;
-}
+static void check(bool ok, const char* name) { EXPECT_TRUE(ok) << name; }
 
-int main() {
+TEST(PassBreakCensus, DistributionStaysSeparable) {
     bool names_ok = true;
     for (int i = 0; i < static_cast<int>(PassBreak::Count); i++) {
         const char* n = pass_break_name(static_cast<PassBreak>(i));
@@ -48,6 +45,4 @@ int main() {
     check(pooled > 30.0 && targets_mean == 1.0,
           "per-reason means separate a fragmenting reason that the pooled mean would hide");
 
-    printf("%s\n", failures ? "FAILURES" : "ALL PASS");
-    return failures ? 1 : 0;
 }

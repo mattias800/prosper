@@ -22,6 +22,7 @@
 // Both arms below must still REJECT: an unresolvable V# is fail-visible by design and this test does
 // not change that. What it pins is that the reject explains itself.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -32,8 +33,7 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static void set_test_env(const char* name, const char* value) {
 #ifdef _WIN32
@@ -69,7 +69,7 @@ static bool has(const std::string& haystack, const char* needle) {
     return haystack.find(needle) != std::string::npos;
 }
 
-int main() {
+TEST(VertexFetchRejectDiagnostic, Contract) {
     printf("== test_vertex_fetch_reject_diagnostic ==\n");
     set_test_env("PROSPER_DBG", "1");
 
@@ -147,7 +147,5 @@ int main() {
           "the two arms report OPPOSITE rewritten= verdicts (the field is derived, not constant)");
 
     set_test_env("PROSPER_DBG", nullptr);
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

@@ -16,6 +16,7 @@
 // is equally explained by a fixture that never opened a chain at all, and every arm passes for the
 // wrong reason. The GetSize arm is the other half — a non-closer must leave the chain open.
 #include <array>
+#include <gtest/gtest.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -36,9 +37,7 @@ void prosper_apr_reset_for_test();
 }
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { std::printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 // The error every APR read builder returns for a file it cannot name or serve.
 constexpr uint64_t kAprRefused = 0x80020016ull;
@@ -50,7 +49,7 @@ using GuestReadFile = uint64_t(__attribute__((sysv_abi)) *)(uint64_t, uint64_t, 
                                                             uint64_t, uint64_t, uint64_t, uint64_t,
                                                             uint64_t);
 
-int main() {
+TEST(AprGatherScatter, Contract) {
     std::printf("== test_apr_gather_scatter ==\n");
     register_builtin_hle();
 
@@ -75,7 +74,7 @@ int main() {
     CHECK(gather_scatter != nullptr, "...ReadFileGatherScatter is registered");
     if (!gather_scatter) {
         std::printf("== FAIL ==\n");
-        return 1;
+        FAIL() << "legacy early exit";
     }
 
     // ---- Fixture: a real file, a real APR id, and a real chain-opening ReadFile ----------------
@@ -243,6 +242,4 @@ int main() {
 
     prosper_apr_reset_for_test();
     std::remove(fixture_path);
-    std::printf("== %s ==\n", fails ? "FAIL" : "PASS");
-    return fails ? 1 : 0;
 }

@@ -1,13 +1,13 @@
 #include "shared/texture/validation_census.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 #include <cstring>
 
 using namespace prosper::frontend;
-static int failures = 0;
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); ++failures; } } while (0)
+#define CHECK(x) EXPECT_TRUE(x)
 
-int main() {
+TEST(TextureValidationCensus, Contract) {
     using Outcome = TextureValidationOutcome;
     using Watch = TextureValidationWatch;
     TextureValidationCensus c;
@@ -52,5 +52,4 @@ int main() {
     c.reset();
     CHECK(c.calls() == 0);
     CHECK(c.bucket(Outcome::Match, Watch::DisabledAfterDirty, 2).calls == 0);
-    return failures ? 1 : 0;
 }

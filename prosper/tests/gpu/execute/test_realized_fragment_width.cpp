@@ -1,6 +1,7 @@
 // #4041: retain the actual guest compiler input, never reconstruct it from emitted SPIR-V.
 // All inputs are project-owned synthetic ISA; realization/collection/codec/replay are CPU-only.
 #include "gpu/capture/gpu_capture.hpp"
+#include <gtest/gtest.h>
 #include "gpu/capture/gpu_capture_bundle.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -15,9 +16,7 @@
 
 using namespace prosper::gpu;
 namespace P = prosper::agc::Pm4;
-static int failures = 0;
-#define CHECK(c, m) do { if (c) std::printf("  [ok]   %s\n", m); \
-    else { std::printf("  [FAIL] %s\n", m); ++failures; } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 alignas(256) constexpr uint32_t vertex_words[] = {
@@ -71,7 +70,7 @@ void set_u32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
 }
 } // namespace
 
-int main() {
+TEST(RealizedFragmentWidth, Contract) {
     std::printf("== test_realized_fragment_width ==\n");
     clear_shader_recompile_cache();
     std::vector<DrawItem> realized;
@@ -131,7 +130,7 @@ int main() {
     std::vector<uint8_t> bytes;
     GpuCaptureFile loaded;
     CHECK(serialize_gpu_capture(capture, bytes, error) &&
-              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 68u,
+              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 69u,
           "current realized-width tail round-trips through production codecs");
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded, replay, error) && replay.items.size() == realized.size(),
@@ -163,14 +162,15 @@ int main() {
         });
     if (bytes.size() < 28u + 4u * realized.size() || loaded.draws.size() != realized.size() || !no_resources) {
         CHECK(false, "codec controls require the successful bounded realized fixture");
-        return 1;
+        FAIL() << "legacy early exit";
     }
-    // No resources: remove nested N4, transport T, owned U4, then M for genuine v63.
+    // No resources: remove entry E, nested N4, transport T, owned U4, then M for genuine v63.
     const size_t mode_tail_size = 8u + 2u * realized.size();
     const size_t transport_tail_size = 12u + realized.size();
     const size_t flags_tail_size = 8u + 8u * realized.size();
     auto mode_bytes = bytes;
-    mode_bytes.resize(mode_bytes.size() - 4u - flags_tail_size - transport_tail_size - 4u);
+    mode_bytes.resize(mode_bytes.size() - 4u - kGpuCaptureFragmentEntryRecordBytes*realized.size() -
+        4u - flags_tail_size - transport_tail_size - 4u);
     set_u32(mode_bytes, 8u, 64u);
     GpuCaptureFile official64;
     CHECK(deserialize_gpu_capture(mode_bytes, official64, error) &&
@@ -263,6 +263,4 @@ int main() {
     CHECK(serialize_gpu_capture(empty, rewritten, error) &&
               deserialize_gpu_capture(rewritten, upgraded, error) && upgraded.draws.empty(),
           "empty capture has a canonical zero-count width tail");
-    std::printf("== %s (%d failures) ==\n", failures ? "FAIL" : "PASS", failures);
-    return failures ? 1 : 0;
 }

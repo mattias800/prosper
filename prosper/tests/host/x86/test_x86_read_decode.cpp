@@ -7,33 +7,28 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <vector>
 
 using namespace prosper;
 
 namespace {
-int g_fail = 0;
-
 void expect_ok(const char* name, std::vector<uint8_t> bytes, int want_reg, int want_len) {
     int reg = -1, len = -1;
-    bool ok = decode_low_read_dest(bytes.data(), bytes.size(), &reg, &len);
-    if (!ok || reg != want_reg || len != want_len) {
-        fprintf(stderr, "FAIL %-28s: ok=%d reg=%d(want %d) len=%d(want %d)\n",
-                name, (int)ok, reg, want_reg, len, want_len);
-        g_fail++;
-    }
+    const bool ok = decode_low_read_dest(bytes.data(), bytes.size(), &reg, &len);
+    EXPECT_TRUE(ok && reg == want_reg && len == want_len)
+        << name << ": ok=" << ok << " reg=" << reg << "(want " << want_reg << ") len=" << len
+        << "(want " << want_len << ")";
 }
 
 void expect_reject(const char* name, std::vector<uint8_t> bytes) {
     int reg = -1, len = -1;
-    if (decode_low_read_dest(bytes.data(), bytes.size(), &reg, &len)) {
-        fprintf(stderr, "FAIL %-28s: expected reject but decoded reg=%d len=%d\n", name, reg, len);
-        g_fail++;
-    }
+    EXPECT_FALSE(decode_low_read_dest(bytes.data(), bytes.size(), &reg, &len))
+        << name << ": expected reject but decoded reg=" << reg << " len=" << len;
 }
 } // namespace
 
-int main() {
+TEST(X86ReadDecode, LowAddressReadDestination) {
     // --- Accepted: the exact instructions observed faulting in DOLL's init walk. ---
     expect_ok("mov (%rdx),%rdx",        {0x48,0x8b,0x12},              2, 3);  // reg=rdx
     expect_ok("mov 0x8(%rdx),%rax",     {0x48,0x8b,0x42,0x08},         0, 4);  // reg=rax, disp8
@@ -103,7 +98,4 @@ int main() {
     expect_ok("mov rax,ss:(%rdx) [0x36]",   {0x36,0x48,0x8b,0x02},                        0, 4);
     expect_ok("mov rax,es:(%rdx) [0x26]",   {0x26,0x48,0x8b,0x02},                        0, 4);
 
-    if (g_fail) { fprintf(stderr, "test_x86_read_decode: %d failure(s)\n", g_fail); return 1; }
-    printf("test_x86_read_decode: all cases passed\n");
-    return 0;
 }

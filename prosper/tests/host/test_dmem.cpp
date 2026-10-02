@@ -5,6 +5,7 @@
 // Drives the handlers through the NID registry exactly as the guest does. Each ctest binary is its
 // own process, so the process-global direct-memory pool starts empty here.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "host/memory/guest_write_watch.hpp"
 #ifdef _WIN32
@@ -29,8 +30,7 @@ extern "C" int prosper_try_commit_reserved_placeholder(uint64_t addr, uint64_t l
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Pool bounds mirror hle_kernel_mem.cpp (kDmemBase / kDmemTotal).
 static constexpr uint64_t kBase  = 0x10000ull;
@@ -224,7 +224,7 @@ static void test_automatic_placement() {
 }
 #endif
 
-int main() {
+TEST(Dmem, Contract) {
     printf("== test_dmem ==\n");
 #ifdef _WIN32
     // Windows first-touch handling must commit one 16 KiB guest page, not a 64 KiB allocation-
@@ -251,7 +251,7 @@ int main() {
     CHECK(reserve && flexible && unmap && alloc && alloc_main && map && map2 && protect &&
               mtypeprotect && release && query && get_type && batch,
           "memory HLE functions registered");
-    if (fails) return 1;
+    if (fails || ::testing::Test::HasFailure()) FAIL() << "legacy early exit";
     test_automatic_placement();
 
     constexpr uint64_t len = 0x4000;
@@ -265,7 +265,7 @@ int main() {
     uint64_t va = 0x30000000000ull;  // Fixed, 64 KiB-aligned, and above the VEH's heap threshold.
     CHECK(reserve((uint64_t)(uintptr_t)&va, len, 0x10 /* MAP_FIXED */, len, 0, 0) == 0,
           "ReserveVirtualRange creates an exact 16 KiB reservation");
-    if (fails) return 1;
+    if (fails || ::testing::Test::HasFailure()) FAIL() << "legacy early exit";
 
     install_trap_handler();
     volatile uint32_t* cell = (volatile uint32_t*)(uintptr_t)va;
@@ -1291,14 +1291,14 @@ int main() {
               "clean up fragmented UNMAP retained suffix");
     }
 
-    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
     printf("== PASS ==\n");
-    return 0;
+    return;
 #elif !defined(__linux__)
     // The direct-memory HLE (hle_kernel_mem.cpp) is #ifdef __linux__ — its functions aren't
     // registered on this platform, so there is nothing to exercise here. Skip cleanly.
     printf("  [skip] direct-memory HLE is Linux-only on this build\n== PASS ==\n");
-    return 0;
+    return;
 #else
     register_builtin_hle();
 
@@ -1324,7 +1324,7 @@ int main() {
           "dmem fns registered");
     if (!(avail && flexible && alloc && alloc_main && map && map2 && query && unmap && mtypeprotect && batch &&
           release && get_type)) {
-        printf("== FAIL ==\n"); return 1;
+        printf("== FAIL ==\n"); FAIL() << "legacy early exit";
     }
     test_automatic_placement();
 
@@ -1737,8 +1737,9 @@ int main() {
         }
     }
 
-    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
     printf("== PASS ==\n");
-    return 0;
+    return;
 #endif
+    EXPECT_EQ(fails, 0);
 }

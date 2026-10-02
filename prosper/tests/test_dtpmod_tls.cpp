@@ -2,6 +2,7 @@
 // through the DEFINING module's id, in-block symbol offset, and shared static layout (#136/#338).
 // Builds a synthetic Module + LoadedImage and drives apply_relocations directly.
 #include "../src/self/module.hpp"
+#include <gtest/gtest.h>
 #include "../src/loader/tls_layout.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -11,15 +12,13 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static uint64_t rd64(const LoadedImage& img, uint64_t off) {
     uint64_t v = 0; std::memcpy(&v, img.mem.data() + off, 8); return v;
 }
 
-int main() {
+TEST(DtpmodTls, Contract) {
     printf("== test_dtpmod_tls ==\n");
 
     // Module with TLS assigned id 5; symbol[1] is a cross-module TLS IMPORT (nid "TLSX"),
@@ -104,7 +103,4 @@ int main() {
               "an unknown import does not prevent local TPOFF64 resolution");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

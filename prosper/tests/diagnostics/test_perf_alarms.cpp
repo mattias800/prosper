@@ -12,6 +12,7 @@
 // contract while the JSONL keeps every window, that the exit summary distinguishes "nothing fired"
 // from "never evaluated", and that the frame budget follows the guest's SetFlipRate.
 #include "diagnostics/perf/perf_alarm_rules.hpp"
+#include <gtest/gtest.h>
 #include "diagnostics/perf/perf_alarms.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"
 #include "diagnostics/perf/wave64_refusal.hpp"
@@ -1967,7 +1968,7 @@ void test_wave64_engine_json() {
 
 }  // namespace
 
-int main() {
+TEST(PerfAlarms, Contract) {
     test_unverified_fragment_arithmetic();
     test_unsupported_wave64();
     test_wave64_engine_json();
@@ -2015,6 +2016,5 @@ int main() {
           "gpu-device-time-coverage and rtt-colorless-publication (#3891), "
           "unsupported-wave64-shaders (#3992) and unverified-fragment-f32-arithmetic (#4062)",
           rule_names().size() == 26);
-    std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "ok", g_failures);
-    return g_failures ? 1 : 0;
+    EXPECT_EQ(g_failures, 0);
 }

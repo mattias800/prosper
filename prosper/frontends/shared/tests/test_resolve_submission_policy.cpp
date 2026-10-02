@@ -1,15 +1,14 @@
 #include "shared/live/resolve_submission_policy.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 
 using prosper::frontend::resolve_copy_may_batch;
 using prosper::frontend::terminal_resolve_must_flush;
 
-static int failures = 0;
-#define CHECK(cond) do { if (!(cond)) { \
-    std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
+#define CHECK(cond) EXPECT_TRUE(cond)
 
-int main() {
+TEST(ResolveSubmissionPolicy, Contract) {
     CHECK(resolve_copy_may_batch(true, false));
 
     // PROSPER_NO_BACKEND_BATCH_SUBMITS and PROSPER_NO_BATCHED_RESOLVE_COPY independently preserve
@@ -26,6 +25,4 @@ int main() {
     CHECK(!terminal_resolve_must_flush(true, true, false));
     CHECK(!terminal_resolve_must_flush(false, true, true));
 
-    if (!failures) std::printf("resolve_submission_policy: OK\n");
-    return failures ? 1 : 0;
 }

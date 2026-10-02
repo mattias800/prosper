@@ -12,6 +12,7 @@
 // still live, and correct output on the fallback cannot prove anything was cached, so each is
 // asserted with the property the other one does not have.
 #include "diagnostics/env_submit.hpp"
+#include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -21,9 +22,7 @@
 #include <stdlib.h>
 #endif
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Bounded: an unbounded `while (x != want)` in a test never dies when the handshake breaks, it
 // just hangs ctest. Returns false so the caller can mark the arm void rather than pass it.
@@ -49,7 +48,7 @@ static void set_test_env(const char* name, const char* value) {
 static bool probe_a() { return PROSPER_ENV_ON_PER_SUBMIT("PROSPER_TEST_ENV_SUBMIT"); }
 static bool probe_b() { return PROSPER_ENV_ON_PER_SUBMIT("PROSPER_TEST_ENV_SUBMIT"); }
 
-int main() {
+TEST(EnvSubmit, Contract) {
     printf("== test_env_submit ==\n");
     set_test_env("PROSPER_TEST_ENV_SUBMIT", nullptr);
 
@@ -177,7 +176,4 @@ int main() {
     CHECK(probe_a(), "closing the outermost scope restores the live read");
 
     set_test_env("PROSPER_TEST_ENV_SUBMIT", nullptr);
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

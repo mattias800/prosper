@@ -7,6 +7,7 @@
 // there are none left. If an intentional override is ever added, list its NID in kAllowed with a
 // justification — silence here is the healthy state.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <string>
@@ -17,7 +18,7 @@ using namespace prosper;
 static uint64_t dummy_a(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) { return 1; }
 static uint64_t dummy_b(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) { return 2; }
 
-int main() {
+TEST(HleNoShadow, Contract) {
     printf("== test_hle_no_shadow ==\n");
     // Reverse map: NID -> readable name, from the built-in symbol list (for diagnostics only).
     std::unordered_map<std::string, std::string> nid2name;
@@ -49,7 +50,7 @@ int main() {
                "   the #330 bug (getter returns OK without writing its out-param). Remove the duplicate\n"
                "   (leave the function in one file), or allowlist it in kAllowed with a reason. ==\n",
                unexpected);
-        return 1;
+        FAIL() << "legacy early exit";
     }
 
     // Self-validation: prove the detector actually fires, so a clean list above means "no shadow",
@@ -64,8 +65,6 @@ int main() {
     Hle::register_fn("test.dummy.ph", (HleFn)dummy_b, "real");          // placeholder->real override
     bool ignored = Hle::shadowed_registrations().size() == mid;
     printf("  [%s] mechanism: overriding a placeholder is NOT recorded\n", ignored ? "ok" : "FAIL");
-    if (!caught || !ignored) { printf("== FAIL: shadow detector is not working ==\n"); return 1; }
+    if (!caught || !ignored) { printf("== FAIL: shadow detector is not working ==\n"); FAIL() << "legacy early exit"; }
 
-    printf("== PASS ==\n");
-    return 0;
 }

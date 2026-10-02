@@ -2,6 +2,15 @@
 
 Where a decoded draw or dispatch becomes real GPU work.
 
+Everything here runs per guest draw or dispatch, so `CLAUDE.md`'s steady-state invariants are
+per-call budgets in this folder: no Vulkan object creation (P2), no shader compile after warm-up
+(P3), no process-global lock (P4), and no work proportional to a guest resource's size when a
+memo can prove it unchanged (P5) — `compute_program_facts` is the shape to copy. Classify a new
+`PROSPER_*` lever as that section says: a cache-off control such as
+`PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE` must leave every result identical, and one that changes
+what the guest sees is a *guest-behaviour selector* that needs an issue which will delete it.
+`gpu_executor.cpp` is past the ratchet's 5,000-line cap; add a file beside it instead.
+
 The existing immutable compiled-shader entry also owns its compute trip-witness analysis result.
 Return that fact only with the exact selected module; replacement or transformation needs fresh
 analysis. Dispatch-specific guest-GDS exclusion remains outside the cache. Cold compilation,
@@ -51,6 +60,11 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   Unknown outside `execute_ordered_items`, so a test must run producer and consumer in one ordered
   submit. `indirect_dispatch_stats()` counts the two routes without a log.
 - `gpu_dependency_graph` — ordering and dependencies between submitted work.
+- `fragment_packet_preparation` — consumed producing-draw entry and bounded resource identity for
+  the refused-draw raster collector. Physical USER_DATA presence and raw RSRC2 are observations,
+  not a launched SGPR count/mapping or system-parameter seed. Owned buffer bytes do not prove a
+  guest fetch/read-point, producer epoch or image/sampler capability. Preparation retains named
+  unmet obligations and never grants kernel, guest-wave, helper or output-commit admission.
 - `graphics_nested_wide_reader` — one-hop direct VS/PS numeric x4/x8 parent/child ownership.
   The ordered executor retires earlier producer work before constructing its context. Exact
   original code supplies the no-writer/PC/width proof; the first checked read supplies both the

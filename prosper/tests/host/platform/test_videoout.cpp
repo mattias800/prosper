@@ -3,6 +3,7 @@
 // (swapchain scaffolding) must record the surface the game set up. Drives the functions through the
 // NID registry exactly as the guest does, then asserts the reported display + recorded buffers.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "diagnostics/transfer_pressure.hpp"  // #3891: the guest-scanout host-copy site
 #include "gpu/present/videoout_present.hpp"
 #include "gpu/texture/tile.hpp"              // tile/detile round trip for the flipped-buffer image
@@ -33,15 +34,14 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx,
                                            uint32_t flip_mode, int64_t flip_arg);
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 using Hle7Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
                             uint64_t, uint64_t, uint64_t);
 using Hle8Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
                             uint64_t, uint64_t, uint64_t, uint64_t);
 
-int main() {
+TEST(Videoout, Contract) {
     printf("== test_videoout ==\n");
     register_builtin_hle();
 
@@ -75,7 +75,7 @@ int main() {
     if (!(open && close && res && vbl && cap && issup && setba && regb && setba2 && regb2 &&
           unreg && labels && setrate && cfg && outstat && flip && pending && addflip &&
           addvblank && fstat && margins)) {
-        printf("== FAIL ==\n"); return 1;
+        printf("== FAIL ==\n"); FAIL() << "legacy early exit";
     }
 
     const uint64_t handle = open(0, 0, 0, 0, 0, 0);
@@ -1089,7 +1089,5 @@ int main() {
               "a zero period reports zero rather than dividing by zero");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

@@ -1,4 +1,5 @@
 #include "../tools/gpu_replay/resource_override.hpp"
+#include <gtest/gtest.h>
 #include "fixtures/test_scratch.h"
 
 #include <cstdio>
@@ -7,11 +8,9 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(GpuReplayResourceOverride, Contract) {
     std::printf("== test_gpu_replay_resource_override ==\n");
 
     tools::ResourceOverrideSelector selector;
@@ -352,6 +351,4 @@ int main() {
               "the exact retained image seed, rather than unused host bytes, changes in replay");
     }
 
-    std::printf("%s\n", fails ? "FAILED" : "ALL TESTS PASSED");
-    return fails ? 1 : 0;
 }

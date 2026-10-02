@@ -155,6 +155,30 @@ class Refusals(unittest.TestCase):
     def test_active_fraction_at_the_floor_is_accepted(self):
         self.assertEqual(cr.refusals(manifest(), manifest(summary={"active_fraction": 0.90})), [])
 
+    def test_measured_rates_require_finite_positive_numbers(self):
+        for key in ("typical_fps", "distinct_fps"):
+            for value in (None, True, "60", 0, -1, float("nan"), float("inf"), 10**1000):
+                with self.subTest(key=key, value=value):
+                    for a, b in (
+                        (manifest(), manifest(summary={key: value})),
+                        (manifest(summary={key: value}), manifest()),
+                    ):
+                        self.assertTrue(any(key in reason for reason in cr.refusals(a, b)))
+
+    def test_active_fraction_requires_a_finite_fraction(self):
+        for value in (None, True, "0.98", float("nan"), float("inf"), -0.1, 1.1):
+            with self.subTest(value=value):
+                reasons = cr.refusals(manifest(), manifest(summary={"active_fraction": value}))
+                self.assertTrue(any("active fraction" in reason for reason in reasons), reasons)
+
+    def test_reported_tails_are_numeric_but_unmeasured_tails_remain_valid(self):
+        for key in ("low_1pct_fps", "interval_p99_ms", "interval_p95_ms"):
+            for value in (True, "20", -1, float("nan"), float("inf")):
+                with self.subTest(key=key, value=value):
+                    reasons = cr.refusals(manifest(), manifest(summary={key: value}))
+                    self.assertTrue(any(key in reason for reason in reasons), reasons)
+            self.assertEqual(cr.refusals(manifest(), manifest(summary={key: None})), [])
+
 
 class Comparison(unittest.TestCase):
     def crossed(self, **summary):
@@ -237,6 +261,53 @@ class Cli(unittest.TestCase):
                 handle.write(json.dumps(summary_record(typical_fps=10.0)) + "\n")
                 handle.write(json.dumps(summary_record(typical_fps=60.0)) + "\n")
             self.assertEqual(cr.load_manifest(path)["summary"]["typical_fps"], 60.0)
+
+    def test_invalid_measurements_refuse_instead_of_success_or_deltas(self):
+        cases = [
+            {"typical_fps": None},
+            {"distinct_fps": None},
+            {"typical_fps": True},
+            {"typical_fps": float("nan"), "active_fraction": float("nan")},
+            {"low_1pct_fps": float("inf")},
+            {"active_fraction": 1.1},
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            base = self.write(d, "base.jsonl", manifest())
+            for change in cases:
+                bad = self.write(d, "bad.jsonl", manifest(summary=change))
+                for flags in ((), ("--json",)):
+                    with self.subTest(change=change, flags=flags):
+                        code, out, err = self.run_main(base, bad, *flags)
+                        self.assertEqual(code, 2, out + err)
+                        self.assertNotIn('"delta"', out)
+                        self.assertNotIn("typical fps", out)
+                        self.assertNotIn("REGRESSION", out)
+
+    def test_thresholds_cannot_disable_detection_with_nonfinite_numbers(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = self.write(d, "base.jsonl", manifest())
+            slow = self.write(d, "slow.jsonl", manifest(summary={"typical_fps": 30.0}))
+            for flag in ("--max-typical-drop-pct", "--max-low-drop-pct"):
+                for value in ("nan", "inf", "-inf", "-1", "invalid"):
+                    with (
+                        self.subTest(flag=flag, value=value),
+                        self.assertRaises(SystemExit) as exit_,
+                    ):
+                        self.run_main(base, slow, f"{flag}={value}")
+                    self.assertEqual(exit_.exception.code, 2)
+            self.assertEqual(self.run_main(base, slow, "--max-typical-drop-pct=0")[0], 1)
+
+    def test_malformed_record_fields_are_refused_without_crashing(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = self.write(d, "base.jsonl", manifest())
+            for change in ({"build_revision": None}, {"build_revision": 5}, {"assertions": []}):
+                with self.subTest(change=change):
+                    bad = self.write(d, "bad.jsonl", manifest(run=change))
+                    self.assertEqual(self.run_main(base, bad)[0], 2)
+            invalid_utf8 = os.path.join(d, "invalid-utf8.jsonl")
+            with open(invalid_utf8, "wb") as handle:
+                handle.write(b"\xff\n")
+            self.assertEqual(self.run_main(base, invalid_utf8)[0], 2)
 
 
 if __name__ == "__main__":

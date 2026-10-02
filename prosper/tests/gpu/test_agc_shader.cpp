@@ -1,6 +1,7 @@
 // test_agc_shader -- shader registration and real stage-table provenance guards. A loaded buffer
 // descriptor must retain its consumer PC even when metadata already describes the same memory.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
@@ -77,8 +78,7 @@ static void make_test_tsharp(uint32_t t[8], uint64_t base, uint32_t width,
 }
 
 int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 } // namespace
 
@@ -93,7 +93,7 @@ extern "C" size_t prosper_agc_shader_headers_for_code(uint64_t code_addr, const 
 extern "C" const void* prosper_agc_fused_back_header_for_front(uint64_t front_code_addr);
 extern "C" uint64_t prosper_agc_shader_continuation_for_code(uint64_t code_addr);
 
-int main() {
+TEST(AgcShader, Contract) {
     printf("== test_agc_shader ==\n");
     register_builtin_hle();
 
@@ -111,7 +111,7 @@ int main() {
           "fused-shader size query and SDK aliases registered");
     CHECK(create_interp != nullptr && create_interp_320 != nullptr && create_interp_old != nullptr,
           "CreateInterpolantMapping SDK aliases registered");
-    if (!create_shader) return 1;
+    if (!create_shader) FAIL() << "legacy early exit";
 
     // Pathless builds GS/HS shaders from separately compiled front/back binaries. A success-only
     // stub left its stack-local fused Shader untouched, and the later register copier interpreted
@@ -623,11 +623,23 @@ int main() {
         0x40a00000u, 0x40c00000u, 0x40e00000u, 0x41000000u,
     };
     alignas(16) static uint32_t publication_descriptor[4];
-    static uint16_t publication_offsets[16];
+    // #4179: CreateShader relocates small pointer fields as SDK self-relative offsets. Static
+    // objects can also have absolute addresses below 4 GiB in a non-PIE executable, so provide a
+    // real contiguous blob instead of relying on the host's placement of separate objects.
+    struct PublicationShaderBlob {
+        Shader shader;
+        ShaderUserData user;
+        uint16_t offsets[16];
+    };
+    static PublicationShaderBlob publication_blob{};
+    auto& publication_shader = publication_blob.shader;
+    auto& publication_user = publication_blob.user;
+    auto& publication_offsets = publication_blob.offsets;
     for (auto& offset : publication_offsets) offset = 0xffffu;
     publication_offsets[8] = 4u; // metadata V# at user dword4 -> shader s[12:15]
-    static ShaderUserData publication_user{};
-    publication_user.direct_resource_offset = publication_offsets;
+    publication_user.direct_resource_offset = reinterpret_cast<uint16_t*>(
+        reinterpret_cast<uintptr_t>(publication_offsets) -
+        reinterpret_cast<uintptr_t>(&publication_user.direct_resource_offset));
     publication_user.direct_resource_count = 16u;
     static const uint32_t publication_code[] = {
         0xf4280604u, 0xfa000000u, // pc0: s_buffer_load_dwordx4 s[24:27],s[8:11],0
@@ -642,11 +654,13 @@ int main() {
         0xf80008cfu, 0x00000000u,
         0xbf810000u,
     };
-    static Shader publication_shader{}, publication_format_shader{};
+    static Shader publication_format_shader{};
     publication_shader.file_header = publication_format_shader.file_header = 0x34333231u;
     publication_shader.version = publication_format_shader.version = 0x18u;
     publication_shader.type = publication_format_shader.type = 2u;
-    publication_shader.user_data = &publication_user;
+    publication_shader.user_data = reinterpret_cast<ShaderUserData*>(
+        reinterpret_cast<uintptr_t>(&publication_user) -
+        reinterpret_cast<uintptr_t>(&publication_shader.user_data));
     publication_shader.shader_size = sizeof(publication_code);
     publication_format_shader.shader_size = sizeof(publication_format_code);
     dst = nullptr;
@@ -655,6 +669,10 @@ int main() {
                        reinterpret_cast<uint64_t>(publication_code), 0, 0, 0);
     CHECK(rc == 0 && dst == &publication_shader,
           "keyless buffer-publication shader enters the real AGC registry");
+    CHECK(publication_shader.user_data == &publication_user,
+          "publication shader relocates the exact fixture user-data pointer");
+    CHECK(publication_user.direct_resource_offset == publication_offsets,
+          "publication user data relocates the exact fixture offset-array pointer");
     dst = nullptr;
     rc = create_shader(reinterpret_cast<uint64_t>(&dst),
                        reinterpret_cast<uint64_t>(&publication_format_shader),
@@ -1346,7 +1364,5 @@ int main() {
               filtered_shader_after.hits == filtered_shader_before.hits,
           "all-filtered parallel batch rejects no-effect draws before shader realization");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

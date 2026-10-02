@@ -1,6 +1,7 @@
 // #1640: a guest drains a semaphore until PollSema reports the encoded EBUSY value.
 // Exercise the registered import, including partial acquisitions and count preservation.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"
 
@@ -9,10 +10,9 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("[FAIL] %s\n", m); ++fails; } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(KernelSemaPoll, Contract) {
     register_builtin_hle();
     const HleFn create = Hle::lookup(nid_hash("sceKernelCreateSema").c_str());
     const HleFn poll = Hle::lookup("12wOHk8ywb0");
@@ -21,12 +21,12 @@ int main() {
     CHECK(create && poll && signal && destroy, "semaphore imports are registered");
     CHECK(poll == Hle::lookup(nid_hash("sceKernelPollSema").c_str()),
           "actual guest PollSema NID resolves to the named entry point");
-    if (!create || !poll || !signal || !destroy) return 1;
+    if (!create || !poll || !signal || !destroy) FAIL() << "legacy early exit";
 
     void* sema = nullptr;
     CHECK(create(reinterpret_cast<uintptr_t>(&sema), 0, 0, 0, 8, 0) == 0 && sema,
           "empty semaphore is created");
-    if (!sema) return 1;
+    if (!sema) FAIL() << "legacy early exit";
     const uint64_t handle = reinterpret_cast<uintptr_t>(sema);
     constexpr uint64_t busy = 0x80020010ull; // The guest drain loop compares this literal.
     static_assert(hle::kSceKernelErrorEBUSY == busy);
@@ -53,6 +53,4 @@ int main() {
           "drain acquires every unit then terminates on the first empty poll");
     CHECK(poll(handle, 1, 0, 0, 0, 0) == busy, "drain leaves no phantom units");
     CHECK(destroy(handle, 0, 0, 0, 0, 0) == 0, "semaphore is deleted");
-    std::printf("kernel_sema_poll: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
-    return fails ? 1 : 0;
 }

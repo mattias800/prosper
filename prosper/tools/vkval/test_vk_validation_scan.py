@@ -159,7 +159,9 @@ def probe_controls():
     hazard_line = "Validation Error: [ SYNC-HAZARD-WRITE-AFTER-WRITE ] control"
     for suffix in ("", ".exe"):
         with tempfile.TemporaryDirectory() as td:
-            build = Path(td)
+            # Resolved: the scanner resolves --build-dir, and every macOS temp dir is a symlink
+            # (/var -> /private/var), so expectations built from the raw spelling never match.
+            build = Path(td).resolve()
             layer = build / f"layer_control{suffix}"
             sync = build / f"{scan.SYNC_PROBE}{suffix}"
             layer.touch()
@@ -195,7 +197,7 @@ def probe_controls():
 
             with patch.object(scan.subprocess, "run", side_effect=cli_completed) as run:
                 try:
-                    rc = run_main(["--build-dir", td, "--probe", "layer_control", "--sync",
+                    rc = run_main(["--build-dir", str(build), "--probe", "layer_control", "--sync",
                                    "--allowlist", str(ledger), "--ctest-arg=-R",
                                    "--ctest-arg=^unit_control$"])
                 except SystemExit:

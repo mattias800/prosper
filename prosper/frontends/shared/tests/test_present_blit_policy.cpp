@@ -1,4 +1,5 @@
 #include "shared/present/present_blit_policy.hpp"
+#include <gtest/gtest.h>
 #include "shared/present/compute_scanout.hpp"
 #include "diagnostics/perf/perf_alarm_rules.hpp"   // kPresentSlotTroubleReasons (header-only use)
 
@@ -9,11 +10,9 @@ using prosper::frontend::present_blit_wait_completed;
 using prosper::frontend::present_blit_has_new_flip;
 using prosper::frontend::present_source_is_newer;
 
-static int failures = 0;
-#define CHECK(cond) do { if (!(cond)) { \
-    std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
+#define CHECK(cond) EXPECT_TRUE(cond)
 
-int main() {
+TEST(PresentBlitPolicy, Contract) {
     CHECK(present_blit_wait_completed(VK_SUCCESS));
 
     // #1303: a timeout or device error must not publish a slot whose blit may still be in flight.
@@ -106,6 +105,4 @@ int main() {
     { auto d = in; d.watch_state = 2;
       CHECK(compute_scanout_present_decision(d) == ComputeScanoutPresent::Unwatched); }
 
-    if (!failures) std::printf("present_blit_policy: OK\n");
-    return failures ? 1 : 0;
 }
