@@ -515,6 +515,10 @@ if(Python3_Interpreter_FOUND)
   # loudly, when ruff is absent; the python-quality CI job installs it, so there they always run.
   add_test(NAME python_quality_gate
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_check_python_quality.py")
+  # check_cpp_lint.py gates clang-format/clang-tidy on CHANGED lines only (#4210). The end-to-end
+  # arm skips, loudly, without the clang tools; the Linux CI job runs its --selftest directly.
+  add_test(NAME cpp_lint_gate
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_check_cpp_lint.py")
   # pr_body.py answers "is the PR body actually what I published?" (#2918). `gh pr edit --body-file`
   # was observed returning rc=1 on a GraphQL projects-deprecation error WITHOUT applying the edit,
   # leaving a stale body the author believed was corrected -- and a PR body is where reviewers and

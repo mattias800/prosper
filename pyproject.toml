@@ -18,6 +18,13 @@ dev = [
     "pytest-cov>=6.0",
     "ruff>=0.14",
 ]
+# C++ lint, gated on CHANGED LINES only (prosper/tools/ci/check_cpp_lint.py). Exact pins: a new
+# clang-tidy release adds checks and changes findings, so an unpinned version would move the gate
+# under every PR at once. Bump deliberately, in its own PR. `uv sync --group cpp-lint`.
+cpp-lint = [
+    "clang-format==22.1.8",
+    "clang-tidy==22.1.8",
+]
 
 [tool.ruff]
 target-version = "py311"

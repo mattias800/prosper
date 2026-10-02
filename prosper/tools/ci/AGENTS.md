@@ -16,6 +16,9 @@ usage, whether a PR is safe to merge.
   *changes*. Added files must be ruff-clean, ruff-format-clean and carry a module docstring; modified
   files may not gain ruff findings; an added tool under `prosper/tools/` needs a test in the same PR.
   Config lives in the root `pyproject.toml` (uv, `uv.lock`); see the Python rule below.
+- **`check_cpp_lint.py`** — the C++ half of the same idea: root `.clang-format` and `.clang-tidy`,
+  enforced on the lines a change **adds or modifies**, against the merge base. It runs last in the
+  Linux CI job because clang-tidy needs that job's `compile_commands.json`. See *C++ lint* below.
 - **`check_ctest_gate.py`** — finds callers that run `ctest` without `--no-tests=error`. Plain
   `ctest` exits 0 when it finds no tests, so "nothing ran" and "everything passed" share a status.
 - **`check_usage_text.py`** — finds tools whose usage block stopped being a docstring, so
@@ -56,6 +59,27 @@ tests, 40 are script-style (ctest runs them as programs; pytest collects nothing
 so ctest stays the source of truth. When you convert a test to unittest/pytest style, add it to
 `testpaths`. Set up with `uv sync --group dev`, run with
 `uv run --group dev pytest` and `uv run --group dev ruff check <file>`.
+
+## C++ lint (`check_cpp_lint.py`, `.clang-format`, `.clang-tidy`)
+
+The tree predates both configs: at the 2026-10-02 census `.clang-format` would rewrite ~30% of the
+lines under `prosper/src` and `prosper/frontends`, and the candidate tidy set found 7,196 issues.
+So both are judged on changed lines only. **Never run clang-format over a whole file**, and never
+mass-fix tidy findings in a PR about something else. Each config file records its census counts
+and the reason for every disabled check. Re-run the census (clang-tidy over the whole compile
+database, counting unique file:line:check) before you turn a check on. Tool versions are
+exact-pinned in the `cpp-lint` uv group, so bumping them is its own PR. `misc-include-cleaner`
+only warns until the header-cost work settles umbrella headers. Suppress a finding with
+`// NOLINT(check-name): reason`: no bare `NOLINT`, and the total count should go down over time.
+
+    uv sync --group cpp-lint
+    uv run --no-sync python prosper/tools/ci/check_cpp_lint.py --build prosper/build-linux
+    uv run --no-sync git-clang-format "$(git merge-base origin/main HEAD)"   # apply format fixes
+
+On a MinGW build, add `--extra-arg=--target=x86_64-w64-mingw32`, because clang otherwise assumes
+MSVC and cannot compile the TU. `--no-tidy` checks formatting with no build at all.
+`--check-db` is the positive control. The gate skips any file clang cannot compile, so it proves
+that a real TU from the database does compile.
 
 ## The property they share, and why it dictates how they are tested
 
