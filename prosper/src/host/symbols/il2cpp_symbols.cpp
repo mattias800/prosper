@@ -32,10 +32,39 @@ struct Table {
     uint64_t window = 0;
 };
 
+enum class BoundsState { Unknown, Absent, Present };
+
 std::mutex g_mutex;
 std::shared_ptr<const Table> g_table;      // guarded by g_mutex
 SymbolTableStatus g_status;                // guarded by g_mutex
 bool g_env_probe_done = false;             // guarded by g_mutex
+BoundsState g_bounds_state = BoundsState::Unknown;   // guarded by g_mutex
+LoadedModuleBounds g_bounds{};                     // guarded by g_mutex
+uint64_t g_generation = 0;                          // guarded by g_mutex
+
+// Called under g_mutex. Sorted entries make the last RVA the only upper-bound check needed.
+std::string bounds_error(const Table& table) {
+    if (g_bounds_state == BoundsState::Absent) return "no IL2CPP module is loaded";
+    if (g_bounds_state != BoundsState::Present || table.entries.back().rva < g_bounds.max_rva)
+        return {};
+    std::ostringstream why;
+    why << "highest symbol RVA 0x" << std::hex << table.entries.back().rva
+        << " is outside loaded IL2CPP RVA range [0x" << g_bounds.min_rva
+        << ", 0x" << g_bounds.max_rva << ")";
+    return why.str();
+}
+
+struct Snapshot {
+    std::shared_ptr<const Table> table;
+    bool attempted;
+    BoundsState bounds_state;
+    LoadedModuleBounds bounds;
+};
+
+Snapshot symbol_snapshot() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return {g_table, g_status.attempted, g_bounds_state, g_bounds};
+}
 
 // Read the required `key=0x…` / `key=…` field out of the magic line. Returns false when the key is
 // absent or unparseable, so a header that does not state its own semantics is a load failure rather
@@ -95,7 +124,10 @@ const char* resolve_state_token(ResolveState state) {
     return "unknown";
 }
 
-bool load_symbol_table(const std::string& path, std::string* err) {
+namespace {
+
+bool load_symbol_table_for_generation(const std::string& path, std::string* err,
+                                      uint64_t generation) {
     SymbolTableStatus status;
     status.attempted = true;
     status.source = path;
@@ -181,69 +213,55 @@ bool load_symbol_table(const std::string& path, std::string* err) {
             status.error = "header is valid but the table has no entries";
     }
 
-    if (status.error.empty()) {
-        status.loaded = true;
-        status.count = table->entries.size();
-        status.window = table->window;
-    } else {
-        table.reset();
-    }
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_table = table;
-        g_status = status;
-        g_env_probe_done = true;   // an explicit load supersedes the environment probe
+        if (generation != g_generation) {
+            status.error = "symbol load superseded by session reset";
+        } else {
+            if (status.error.empty()) status.error = bounds_error(*table);
+            if (status.error.empty()) {
+                status.loaded = true;
+                status.count = table->entries.size();
+                status.window = table->window;
+            } else {
+                table.reset();
+            }
+            g_table = table;
+            g_status = status;
+            g_env_probe_done = true;   // an explicit load supersedes the environment probe
+        }
     }
     announce(status);
     if (err) *err = status.error;
     return status.loaded;
 }
 
-bool load_symbol_table_from_env() {
+bool load_from_env(bool once_only) {
+    uint64_t generation;
+    std::string path;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_table) return true;
-    }
-    const char* path = std::getenv(kEnvVar);
-    if (!path || !*path) {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        if (once_only && g_env_probe_done) return false;
+        generation = g_generation;
+        const char* env_path = std::getenv(kEnvVar);
+        if (env_path) path = env_path;   // copy the live value before releasing the session lock
         g_env_probe_done = true;
-        return false;
     }
-    return load_symbol_table(path, nullptr);
+    return !path.empty() && load_symbol_table_for_generation(path, nullptr, generation);
 }
 
-void ensure_symbol_table_loaded() {
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_env_probe_done) return;
-    }
-    load_symbol_table_from_env();
-}
-
-void clear_symbol_table() {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_table.reset();
-    g_status = SymbolTableStatus{};
-    g_env_probe_done = false;
-}
-
-SymbolTableStatus symbol_table_status() {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    return g_status;
-}
-
-Resolution resolve_rva(uint64_t rva) {
-    std::shared_ptr<const Table> table;
-    bool attempted = false;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        table = g_table;
-        attempted = g_status.attempted;
-    }
+Resolution resolve_snapshot_rva(const Snapshot& snapshot, uint64_t rva) {
     Resolution out;
+    if (snapshot.bounds_state == BoundsState::Absent ||
+        (snapshot.bounds_state == BoundsState::Present &&
+         (rva < snapshot.bounds.min_rva || rva >= snapshot.bounds.max_rva))) {
+        out.state = ResolveState::OutsideModule;
+        return out;
+    }
+    const auto& table = snapshot.table;
     if (!table) {
-        out.state = attempted ? ResolveState::Unavailable : ResolveState::NotConfigured;
+        out.state = snapshot.attempted ? ResolveState::Unavailable : ResolveState::NotConfigured;
         return out;
     }
     // Last entry with entry.rva <= rva — the same record Python's `bisect_right(keys, off) - 1`
@@ -259,13 +277,81 @@ Resolution resolve_rva(uint64_t rva) {
     return out;
 }
 
+}  // namespace
+
+bool load_symbol_table(const std::string& path, std::string* err) {
+    uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        generation = g_generation;
+    }
+    return load_symbol_table_for_generation(path, err, generation);
+}
+
+bool load_symbol_table_from_env() {
+    return load_from_env(false);
+}
+
+void ensure_symbol_table_loaded() {
+    load_from_env(true);
+}
+
+void clear_symbol_table() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ++g_generation;
+    g_table.reset();
+    g_status = SymbolTableStatus{};
+    g_env_probe_done = false;
+    g_bounds_state = BoundsState::Unknown;
+    g_bounds = {};
+}
+
+void publish_loaded_module_bounds(std::optional<LoadedModuleBounds> bounds) {
+    SymbolTableStatus rejected;
+    bool invalidated = false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (bounds && bounds->min_rva < bounds->max_rva) {
+            g_bounds_state = BoundsState::Present;
+            g_bounds = *bounds;
+        } else {
+            g_bounds_state = BoundsState::Absent;
+            g_bounds = {};
+        }
+        if (g_table) {
+            const std::string error = bounds_error(*g_table);
+            if (!error.empty()) {
+                g_table.reset();
+                g_status.loaded = false;
+                g_status.count = 0;
+                g_status.window = 0;
+                g_status.error = error;
+                rejected = g_status;
+                invalidated = true;
+            }
+        }
+    }
+    if (invalidated) announce(rejected);
+}
+
+SymbolTableStatus symbol_table_status() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_status;
+}
+
+Resolution resolve_rva(uint64_t rva) {
+    return resolve_snapshot_rva(symbol_snapshot(), rva);
+}
+
 Resolution resolve_guest_va(uint64_t va) {
-    if (va < BOOT_IL2CPP || va >= BOOT_PSNCORE) {
+    const Snapshot snapshot = symbol_snapshot();
+    if (va < BOOT_IL2CPP ||
+        (snapshot.bounds_state == BoundsState::Unknown && va >= BOOT_PSNCORE)) {
         Resolution out;
         out.state = ResolveState::OutsideModule;
         return out;
     }
-    return resolve_rva(va - BOOT_IL2CPP);
+    return resolve_snapshot_rva(snapshot, va - BOOT_IL2CPP);
 }
 
 std::string annotation_for_guest_va(uint64_t va) {
