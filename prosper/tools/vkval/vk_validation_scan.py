@@ -201,12 +201,13 @@ def layer_env(base: dict[str, str] | None = None, sync_setting: str | None = Non
 def probe_executable(build_dir: Path, probe: str) -> Path:
     """Resolve only the requested build artifact, with the native Windows suffix as fallback.
 
-    Prefer the exact name on all hosts. An explicit .exe name is already complete; never search
-    PATH or another build configuration, since that could prove an unrelated binary instead.
+    Prefer an existing exact artifact on all hosts (the caller rejects non-files). In particular,
+    an empty/dot name denotes the build directory, not its sibling .exe. An explicit .exe name is
+    already complete; never search PATH or another build configuration for an unrelated binary.
     Return the requested name when missing so each control retains its specific refusal message.
     """
     exact = build_dir / probe
-    if exact.is_file() or exact.name.lower().endswith(".exe"):
+    if exact.exists() or exact.name.lower().endswith(".exe"):
         return exact
     windows = exact.with_name(exact.name + ".exe")
     return windows if windows.is_file() else exact

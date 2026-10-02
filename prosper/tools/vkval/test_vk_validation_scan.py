@@ -231,6 +231,19 @@ def probe_controls():
             check(refused and run.call_count == 0,
                   "a missing explicit exe refuses rather than launching a doubled suffix")
 
+        selected = build / "selected-build"
+        selected.mkdir()
+        selected.with_name(selected.name + ".exe").touch()
+        for probe in ("", "."):
+            with patch.object(scan.subprocess, "run") as run:
+                try:
+                    run_main(["--build-dir", str(selected), "--probe", probe, "--sync"])
+                    refused = False
+                except SystemExit as error:
+                    refused = "probe binary" in str(error)
+                check(refused and run.call_count == 0,
+                      f"public probe {probe!r} refuses the build directory despite a sibling exe")
+
         # Filesystem presence alone must never stand in for either positive control.
         with patch.object(scan.subprocess, "run", return_value=
                           subprocess.CompletedProcess([], 0, "no layer or hazard\n")) as run:
