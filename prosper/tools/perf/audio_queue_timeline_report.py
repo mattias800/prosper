@@ -250,7 +250,7 @@ def main(argv):
     if not paths:
         print(__doc__)
         return 2
-    with open(paths[0], "r", encoding="utf-8", errors="replace") as fh:
+    with open(paths[0], encoding="utf-8", errors="replace") as fh:
         ports, gaps = parse(fh.read())
     return report(ports, gaps, min_ep, window_us)
 

@@ -334,8 +334,8 @@ def main() -> int:
             label = f"{key:<28} {seen[key]:>5}" if first else f"{'':<28} {'':>5}"
             print(f"  {label}  {pct:5.1f}%  {site}")
             first = False
-    print(f"\n  Shares are per thread: n/(samples in which THAT thread was seen), so a "
-          f"thread\n  that started late is not diluted by samples it could not appear in.\n")
+    print("\n  Shares are per thread: n/(samples in which THAT thread was seen), so a "
+          "thread\n  that started late is not diluted by samples it could not appear in.\n")
     return 0
 
 
