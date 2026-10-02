@@ -3400,6 +3400,11 @@ endif()
     SOURCES tests/gpu/pm4/test_agc_submit.cpp
     LIBRARIES prosper_core)
 
+  # sceAgcDriverSubmitMultiDcbs: zero-length segments are skipped, not fatal.
+  prosper_add_gtest(test_agc_multi_dcb_empty_segment
+    SOURCES tests/gpu/pm4/test_agc_multi_dcb_empty_segment.cpp
+    LIBRARIES prosper_core)
+
   add_executable(test_agc_submit_multi tests/hle/test_agc_submit_multi.cpp)
   target_include_directories(test_agc_submit_multi PRIVATE tests)
   target_link_libraries(test_agc_submit_multi PRIVATE prosper_core)
