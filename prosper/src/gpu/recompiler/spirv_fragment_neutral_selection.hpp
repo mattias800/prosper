@@ -18,6 +18,7 @@ struct FragmentNeutralValue {
     bool constant = false;
     uint32_t literal = 0;
     bool stable_input = false; // caller-certified builtins, not arbitrary Location inputs
+    bool explicit_transport = false; // exact caller-validated per-op FPFastMathMode None
 };
 
 struct FragmentNeutralExport {
@@ -29,7 +30,8 @@ struct FragmentNeutralExport {
 // contract, not an arbitrary host subgroup Any. The caller proves a single common-entry, one-arm,
 // straight-line selection, sole Any controller use, no escaping SSA/CFG and no module-wide
 // rendezvous effects. Body IDs are in execution order; exports include EVERY live merge Phi.
-// The caller excludes explicit FPFastMathDefault/FPFastMathMode environments. No arbitrary Input
+// The caller excludes FPFastMathDefault and all per-op environments except exact transport None.
+// Transport None supplies no stable/uniform/address authority. No arbitrary Input
 // load is a definedness seed. Frozen leaves are independently defined values;
 // this certificate must never be fed back into address/load admission.
 struct FragmentNeutralSelection {

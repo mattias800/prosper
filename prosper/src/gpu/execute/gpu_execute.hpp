@@ -103,6 +103,7 @@ struct DrawItem {
     bool ps_wave32 = false;
     // Actual producing launch MODE, independent of requested/effective replay wave width.
     FragmentFloatMode ps_float_mode{};
+    FloatTransportConfig float_transport{}; // actual producing host profile, not guest MODE
     // Process-unique identities supplied by the exact shader-recompile cache. Zero means the
     // shader came from an external/replay path, so persistent backend caches must compare words.
     uint64_t vs_identity = 0, fs_identity = 0;
@@ -623,7 +624,8 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        uint32_t vertex_lds_dwords = 0,
                                                        bool vertex_capture_position = false,
                                                        const SharedShaderAnalysis& captured_analysis = {},
-                                                       FragmentFloatMode fragment_float_mode = {});
+                                                       FragmentFloatMode fragment_float_mode = {},
+                                                       FloatTransportConfig float_transport = {});
 SharedShaderWords recompile_graphics_shader_cached_shared(
     ShaderProgramStage stage, const uint32_t* code, size_t dwords,
     const ShaderResourceTable* resources = nullptr,
@@ -634,7 +636,8 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     uint32_t vertex_lds_dwords = 0,
     bool vertex_capture_position = false,
     const SharedShaderAnalysis& captured_analysis = {},
-    FragmentFloatMode fragment_float_mode = {});
+    FragmentFloatMode fragment_float_mode = {},
+    FloatTransportConfig float_transport = {});
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; ordinary per-dispatch push-constant values do not.
 // Conditional marker lowerings validate their value-dependent dispatch proof before cache lookup.
@@ -745,7 +748,8 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
     const PixelInputMapping* pixel_inputs = nullptr,
     uint64_t* cache_identity = nullptr,
     uint32_t vertex_lds_dwords = 0,
-    bool capture_position = false);
+    bool capture_position = false,
+    FloatTransportConfig float_transport = {});
 ShaderRecompileCacheStats shader_recompile_cache_stats();
 void clear_shader_recompile_cache();
 
@@ -1044,6 +1048,7 @@ struct OperationRealizationFailure {
     bool has_system_inputs = false;
     bool ps_wave32 = false;
     FragmentFloatMode ps_float_mode{};
+    FloatTransportConfig float_transport{};
     ComputeLaunchDimensions compute_launch;
     std::vector<ShaderRealizationDiagnostic> stages;
 };
@@ -1484,6 +1489,7 @@ struct SharedVulkanContext {
     // VK_KHR_shader_atomic_int64's storage-buffer feature, ENABLED on the borrowed device together
     // with core shaderInt64. Physical support alone is insufficient for module admission.
     bool storage_buffer_int64_atomics = false;
+    FloatTransportConfig float_transport{}; // requested AND enabled on this exact device
     uint32_t max_compute_workgroup_subgroups = 0;
     uint32_t max_compute_workgroup_size_x = 0;
     uint32_t max_compute_workgroup_invocations = 0;
@@ -1953,10 +1959,12 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             }
         }
     }
+    const FloatTransportConfig float_transport = published_float_transport_config();
     if (failure) {
         *failure = {};
         failure->kind = SubmitOperationKind::Draw;
         failure->ps_float_mode = rs.ps_addr ? rs.ps_float_mode : FragmentFloatMode{};
+        failure->float_transport = float_transport;
         failure->pipeline_present = true;
         failure->pipeline = resolve_pipeline_state(rs);
         failure->color0_base = rs.color0_base;
@@ -2369,34 +2377,34 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)), vertex_dwords,
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)), chain_dwords,
                 vrt.get(), pixel_input_ptr, &vs_identity, vertex_lds_dwords,
-                capture_vertex_position);
+                capture_vertex_position, float_transport);
         else
             vs_shared = recompile_graphics_shader_cached_shared(
                 ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
                 max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity,
-                false, vertex_lds_dwords, capture_vertex_position);
+                false, vertex_lds_dwords, capture_vertex_position, {}, {}, float_transport);
         fs_shared = recompile_graphics_shader_cached_shared(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
             max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
-            rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode);
+            rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode, float_transport);
     } else {
         if (vertex_chain) {
             const SharedShaderWords linked = recompile_vertex_chain_cached_shared(
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)), vertex_dwords,
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)), chain_dwords,
                 vrt.get(), pixel_input_ptr, &vs_identity, vertex_lds_dwords,
-                capture_vertex_position);
+                capture_vertex_position, float_transport);
             if (linked) vs = *linked;
         } else {
             vs = recompile_graphics_shader_cached(
                 ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
                 max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity,
-                false, vertex_lds_dwords, capture_vertex_position);
+                false, vertex_lds_dwords, capture_vertex_position, {}, {}, float_transport);
         }
         fs = recompile_graphics_shader_cached(
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
             max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
-            rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode);
+            rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode, float_transport);
     }
     // CB_COLOR_CONTROL.DCC_DECOMPRESS interprets the bound AGC metadata helper, rather than its
     // ordinary fragment-color export. The operation bits can remain folded into a later graphics
@@ -2421,10 +2429,19 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         static constexpr uint32_t kNullExportProgram[] = {
             0xf8001890u, 0x00000000u, 0xbf810000u,
         };
-        static const std::vector<uint32_t> kNullExportFragment =
-            recompile_fragment(kNullExportProgram, std::size(kNullExportProgram));
+        // Unlike the ordinary cached fragment above, this synthesized program has no guest
+        // cache key. Retain one lazily initialized immutable source per canonical producing
+        // profile: the first decompression draw must not select every later draw's envelope.
+        static std::array<std::once_flag, 3> null_export_initialized;
+        static std::array<std::vector<uint32_t>, 3> null_export_fragments;
+        const size_t profile_index = static_cast<size_t>(float_transport.profile);
+        std::call_once(null_export_initialized.at(profile_index), [float_transport, profile_index] {
+            null_export_fragments.at(profile_index) =
+                recompile_fragment(kNullExportProgram, std::size(kNullExportProgram), nullptr,
+                                   nullptr, UINT32_MAX, nullptr, false, {}, {}, nullptr, float_transport);
+        });
         fs_shared.reset();
-        fs = kNullExportFragment;
+        fs = null_export_fragments.at(profile_index);
         fs_identity = 0;
     }
     const std::vector<uint32_t>& vs_words = vs_shared ? *vs_shared : vs;
@@ -2440,7 +2457,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         if (triangle_topology)
             gs = recompile_interpolation_geometry(
                 interpolation, PROSPER_ENV_ON("PROSPER_GEOM_PROBE"),
-                rect_list_synthesis);
+                rect_list_synthesis, float_transport);
     }
     if (phase_timing) {
         const auto shader_done = std::chrono::steady_clock::now();
@@ -2951,6 +2968,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.fragment_wave_config_available = rs.ps_addr != 0;
     out.ps_wave32 = out.fragment_wave_config_available && rs.ps_wave32;
     out.ps_float_mode = rs.ps_addr ? rs.ps_float_mode : FragmentFloatMode{};
+    out.float_transport = float_transport;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for

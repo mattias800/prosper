@@ -22,6 +22,7 @@
 #include "shared/rtt/rtt_authority.hpp"
 #include "shared/device/pipeline_cache_file.hpp"  // #3425: one checked envelope for both stages
 #include "shared/device/vulkan_device_select.hpp"
+#include "shared/device/float_transport.hpp"
 #include "shared/device/image_robustness.hpp"  // #3531: the recompiler's OOB image-read contract
 #include "shared/texture/write_watch_census.hpp"
 #include "shared/texture/write_watch_policy.hpp"
@@ -1705,6 +1706,7 @@ LiveComputeStorageImageDevice& mutable_storage_image_device() {
 }
 
 struct VulkanComputeContext {
+    prosper::gpu::FloatTransportConfig float_transport{};
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
@@ -3669,6 +3671,11 @@ struct VulkanComputeContext {
             instance = static_cast<VkInstance>(shared.instance);
             physical = static_cast<VkPhysicalDevice>(shared.physical);
             device = static_cast<VkDevice>(shared.device);
+            float_transport = shared.float_transport;
+            std::fprintf(stderr, "[compute] float transport profile=%s ENABLED witness "
+                                 "inherited from the adopted device\n",
+                         float_transport.explicit_nonfinite32() ? "explicit-nonfinite32" :
+                             (float_transport.available() ? "implicit" : "unknown"));
             queue = static_cast<VkQueue>(shared.queue);
             queue_family = shared.queue_family;
             borrowed = true;
@@ -3762,6 +3769,7 @@ struct VulkanComputeContext {
             device = VK_NULL_HANDLE; queue = VK_NULL_HANDLE;
             queue_family = UINT32_MAX; borrowed = false; image_support = false;
             storage_image_features = {}; storage_image_device_adopted = false;
+            float_transport = {};
             native_subgroup_contract = false;
             min_native_subgroup_size = max_native_subgroup_size = 0;
             pipeline_cache = VK_NULL_HANDLE;
@@ -3890,6 +3898,9 @@ struct VulkanComputeContext {
         storage_image_device_adopted = false;
         image_support = storage_image_features.storage_image_capable();
         mutable_storage_image_device() = {storage_image_features, false, true};
+        VkPhysicalDeviceShaderFloatControls2Features transport_features{};
+        float_transport = acquire_float_transport_device_features(
+            "compute", physical, kVulkanRuntimeVersion, transport_features, dci);
         record_compare_memory_topology(physical);
 #ifdef __APPLE__
         // Spec-mandated on MoltenVK: enable VK_KHR_portability_subset when advertised (always is).
@@ -3909,6 +3920,7 @@ struct VulkanComputeContext {
         prosper::gpu::publish_device_float_controls(
             "compute", physical, kVulkanRuntimeVersion,
             /*float_controls_extension_enabled=*/false);
+        prosper::gpu::publish_float_transport_config(float_transport);
         vkGetDeviceQueue(device, queue_family, 0, &queue);
         if (!create_pipeline_cache())
             return false;
@@ -11019,6 +11031,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     std::fprintf(stderr, "[compute] dumped SPIR-V %016llx (%zu words) -> %s\n",
                                  (unsigned long long)dump_hash, spirv.size(), path);
                 }
+            }
+            if (!float_transport_module_supported(spirv.data(), spirv.size(), ctx.float_transport)) {
+                std::fprintf(stderr, "[float-transport] compute REFUSED module: executing device "
+                                     "lacks enabled explicit-nonfinite32 witness (#4066)\n");
+                break;
             }
             if (!vk_ok(vkCreateShaderModule(ctx.device, &smci, nullptr, &shader), "shader-module"))
                 break;

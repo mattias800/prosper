@@ -30,7 +30,8 @@ int main(int argc, char** argv) {
                   << (c.expected_produced ? "PRODUCED" : "REFUSED") << " raw_words=" << c.code.size()
                   << " source_words=" << c.source.size() << " semantic_reads=" << c.choices.reads.size()
                   << " wave_width=" << (c.wave32 ? 32 : 64) << " guest_float_mode="
-                  << (c.float_mode.available ? std::to_string(c.float_mode.value) : "unknown") << '\n'
+                  << (c.float_mode.available ? std::to_string(c.float_mode.value) : "unknown")
+                  << " host_float_transport=" << float_transport_profile_name(c.float_transport) << '\n'
                   << "producing_compiler=" << c.compiler << " replay_compiler="
                   << prosper::embedded_build_revision() << ':' << prosper::embedded_build_source_identity() << '\n';
         if (!c.expected_reject.empty()) std::cout << "producer_refusal=" << c.expected_reject << '\n';

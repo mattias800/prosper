@@ -66,8 +66,18 @@ bool select_fragment_wave_size(const char* mode,
     return true;
 }
 
+void report_float_transport(const char* mode, prosper::gpu::FloatTransportConfig config,
+                            const char* record, uint64_t index, bool retained) {
+    std::fprintf(stderr, "[%s] float-transport=%s source=%s %s=%llu; producing host profile, "
+                         "not guest FLOAT_MODE or replay device support\n", mode,
+                 prosper::gpu::float_transport_profile_name(config),
+                 retained ? "captured" : "legacy-unknown", record,
+                 static_cast<unsigned long long>(index));
+}
+
 void report_fragment_wave_size(const char* mode, const prosper::gpu::DrawItem& draw,
-                              const prosper::tools::ReplayFragmentWaveSelection& selection) {
+                              const prosper::tools::ReplayFragmentWaveSelection& selection,
+                              bool transport_retained) {
     const char* captured = draw.fragment_wave_config_available
         ? (draw.ps_wave32 ? "32" : "64") : "unavailable";
     const char* source = selection.explicit_override ? "override"
@@ -85,6 +95,7 @@ void report_fragment_wave_size(const char* mode, const prosper::gpu::DrawItem& d
     else
         std::fprintf(stderr, "[%s] fragment-float-mode=unavailable source=legacy-unknown draw=%llu\n",
                      mode, static_cast<unsigned long long>(draw.draw_index));
+    report_float_transport(mode, draw.float_transport, "draw", draw.draw_index, transport_retained);
 }
 
 void usage(const char* argv0) {
@@ -905,6 +916,9 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                         static_cast<unsigned>(d.ps_float_mode.value));
         else
             std::printf("  ps-float-mode captured=unavailable (guest semantics unverified)\n");
+        std::printf("  float-transport=%s source=%s (producing host profile, not replay device support)\n",
+                    prosper::gpu::float_transport_profile_name(d.float_transport),
+                    format_version >= 65 ? "captured" : "legacy-unknown");
         // Resolved SPI_PS_INPUT_CNTL linkage (see pixel_input_linkage.hpp): which producer PARAM
         // slot each pixel-shader input actually reads, or whether the interpolator synthesizes a
         // constant instead. Retained since capture v36; older captures print `none` rather than
@@ -1014,6 +1028,9 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                         reinterpret_cast<const uint8_t*>(c.spirv.data()), c.spirv.size() * 4)),
                     raw_available ? "yes" : "no");
         if (c.recompile_config_available) {
+            std::printf("    float-transport=%s source=%s (producing host profile)\n",
+                        prosper::gpu::float_transport_profile_name(c.recompile_config.float_transport),
+                        format_version >= 65 ? "captured" : "legacy-unknown");
             std::printf("    compute-contract program=%016llx native-storage-formats=%08x\n",
                         static_cast<unsigned long long>(c.code_addr),
                         c.recompile_config.native_storage_format_support);
@@ -1046,12 +1063,15 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
     }
     for (size_t i = 0; i < replay.failure_diagnostics.size(); ++i) {
         const auto& failure = replay.failure_diagnostics[i];
-        std::printf("failure[%zu] %s source=%llu order=%llu reason=%s stages=%zu\n", i,
+        std::printf("failure[%zu] %s source=%llu order=%llu reason=%s stages=%zu "
+                    "float-transport=%s source=%s\n", i,
                     operation_kind_name(failure.kind),
                     static_cast<unsigned long long>(failure.source_index),
                     static_cast<unsigned long long>(failure.command_order),
                     prosper::gpu::realization_failure_reason_name(failure.reason),
-                    failure.stages.size());
+                    failure.stages.size(),
+                    prosper::gpu::float_transport_profile_name(failure.float_transport),
+                    format_version >= 65 ? "captured" : "legacy-unknown");
         if (failure.kind == prosper::gpu::SubmitOperationKind::Draw) {
             std::printf("  target=%016llx extent=%ux%u vertices=%u instances=",
                         static_cast<unsigned long long>(failure.color0_base),
@@ -1143,8 +1163,10 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                         stage.resource_table_present ? "present" : "absent",
                         stage.resource_count, stage.descriptor_issue_count);
             if (stage.stage == prosper::gpu::ShaderProgramStage::Compute)
-                std::printf(" config=%s",
-                            stage.recompile_config_available ? "present" : "absent");
+                std::printf(" config=%s float-transport=%s source=%s",
+                            stage.recompile_config_available ? "present" : "absent",
+                            prosper::gpu::float_transport_profile_name(stage.recompile_config.float_transport),
+                            format_version >= 65 ? "captured" : "legacy-unknown");
             if (stage.first_descriptor_issue != 0xFFFFFFFFu)
                 std::printf(" first-descriptor=%s", prosper::gpu::descriptor_issue_name(
                     static_cast<prosper::gpu::DescriptorIssueCode>(stage.first_descriptor_issue)));
@@ -3090,7 +3112,7 @@ int main(int argc, char** argv) {
             if (item.fs_raw_shader_index >= replay.raw_shader_versions.size()) continue;
             const auto selection = prosper::tools::resolve_replay_fragment_wave_size(
                 raw_fragment_wave, item.fragment_wave_config_available, item.ps_wave32);
-            report_fragment_wave_size("recompile-raw", item, selection);
+            report_fragment_wave_size("recompile-raw", item, selection, capture.format_version >= 65);
         }
     }
     if (recompile_raw && capture.format_version >= 39 &&
@@ -3126,11 +3148,14 @@ int main(int argc, char** argv) {
                     const auto& main = replay.raw_shader_versions[it.vs_chain_raw_shader_index];
                     vs = prosper::gpu::recompile_vertex_chain(
                         raw.words.data(), raw.words.size(), main.words.data(), main.words.size(),
-                        it.vrt.get(), pixel_inputs, false, it.vertex_lds_dwords);
+                        it.vrt.get(), pixel_inputs, false, it.vertex_lds_dwords,
+                        {prosper::gpu::RecompileDiagnosticStage::Vertex, 0}, it.float_transport);
                 } else {
                     vs = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
                                                         it.vrt.get(), pixel_inputs, false,
-                                                        it.vertex_lds_dwords);
+                                                        it.vertex_lds_dwords,
+                                                        {prosper::gpu::RecompileDiagnosticStage::Vertex, 0},
+                                                        it.float_transport);
                 }
             } else ++vs_kept;
             if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
@@ -3145,10 +3170,11 @@ int main(int argc, char** argv) {
                         raw.words.data(), raw.words.size(), it.prt.get(), system_inputs,
                         UINT32_MAX, &interpolation, fragment_wave.wave32(),
                         {prosper::gpu::RecompileDiagnosticStage::Fragment, 0},
-                        it.ps_float_mode);
+                        it.ps_float_mode, nullptr, it.float_transport);
                     if (interpolation.requires_geometry && it.ps.topology >= 3u &&
                         it.ps.topology <= 5u)
-                        gs = prosper::gpu::recompile_interpolation_geometry(interpolation);
+                        gs = prosper::gpu::recompile_interpolation_geometry(
+                            interpolation, false, false, it.float_transport);
                 }
             } else ++fs_kept;
             if (!vs.empty() && !fs.empty() && (!requires_geometry || !gs.empty())) {
@@ -3176,6 +3202,8 @@ int main(int argc, char** argv) {
         const prosper::gpu::SharedVulkanContext replay_device =
             prosper::gpu::shared_vulkan_context();
         for (auto& compute : replay.computes) {
+            report_float_transport("recompile-raw", compute.recompile_config.float_transport,
+                                   "dispatch", compute.dispatch_index, capture.format_version >= 65);
             if (!prosper::tools::recompile_captured_compute(
                     compute, replay.raw_shader_versions,
                     replay_device.valid() ? &replay_device : nullptr,
@@ -3242,7 +3270,7 @@ int main(int argc, char** argv) {
                 if (interpolation.valid && interpolation.requires_geometry &&
                     it.ps.topology >= 3u && it.ps.topology <= 5u) {
                     rebuilt_geometry = prosper::gpu::recompile_interpolation_geometry(
-                        interpolation, true);
+                        interpolation, true, false, it.float_transport);
                 }
             }
             const bool has_raw_vertex =
@@ -3278,11 +3306,14 @@ int main(int argc, char** argv) {
                         replay.raw_shader_versions[it.vs_chain_raw_shader_index];
                     xfb = prosper::gpu::recompile_vertex_chain(
                         raw.words.data(), raw.words.size(), main.words.data(), main.words.size(),
-                        it.vrt.get(), pixel_inputs, true, it.vertex_lds_dwords);
+                        it.vrt.get(), pixel_inputs, true, it.vertex_lds_dwords,
+                        {prosper::gpu::RecompileDiagnosticStage::Vertex, 0}, it.float_transport);
                 } else {
                     xfb = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
                                                          it.vrt.get(), pixel_inputs, true,
-                                                         it.vertex_lds_dwords);
+                                                         it.vertex_lds_dwords,
+                                                         {prosper::gpu::RecompileDiagnosticStage::Vertex, 0},
+                                                         it.float_transport);
                 }
                 if (xfb.empty()) {
                     std::fprintf(stderr, "[geom-probe] draw %llu: xfb re-recompile produced no VS "
@@ -3327,7 +3358,7 @@ int main(int argc, char** argv) {
             auto& it = replay.items[prosper::tools::raw(item_index)];
             fragment_wave = prosper::tools::resolve_replay_fragment_wave_size(
                 fragment_wave, it.fragment_wave_config_available, it.ps_wave32);
-            report_fragment_wave_size("fs-tap", it, fragment_wave);
+            report_fragment_wave_size("fs-tap", it, fragment_wave, capture.format_version >= 65);
             const prosper::tools::OperationIndex operation_index =
                 prosper::tools::replay_operation_index_for_draw(
                     replay, prosper::tools::DrawIndex{n});
@@ -3346,7 +3377,7 @@ int main(int argc, char** argv) {
                                                            UINT32_MAX, &interpolation,
                                                            fragment_wave.wave32(),
                                                            {prosper::gpu::RecompileDiagnosticStage::Fragment,
-                                                            0}, it.ps_float_mode);
+                                                            0}, it.ps_float_mode, nullptr, it.float_transport);
                 if (!fs.empty()) {
                     it.set_fs(std::move(fs));
                     std::fprintf(stderr,
@@ -3651,6 +3682,8 @@ int main(int argc, char** argv) {
             return 2;
         }
         const auto& failure = replay.failure_diagnostics[static_cast<size_t>(failure_index)];
+        report_float_transport("retry-failed-chain", failure.float_transport,
+                               "failure", static_cast<uint64_t>(failure_index), capture.format_version >= 65);
         if (failure.stages.size() < 2 ||
             failure.stages[0].stage != prosper::gpu::ShaderProgramStage::Vertex ||
             failure.stages[1].stage != prosper::gpu::ShaderProgramStage::Vertex) {
@@ -3743,7 +3776,8 @@ int main(int argc, char** argv) {
                 prolog.words.data(), prolog.words.size(), main.words.data(), main.words.size(),
                 resources, pixel_inputs, exact && failure.capture_vertex_position,
                 exact ? failure.vertex_lds_dwords : 0u,
-                {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr});
+                {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr},
+                failure.float_transport);
         }
         const std::string reason = spirv.empty()
             ? prosper::gpu::last_terminal_reject_reason(main_stage.program_addr) : "";
@@ -3817,6 +3851,10 @@ int main(int argc, char** argv) {
         }
         const auto& failure = replay.failure_diagnostics[static_cast<size_t>(failure_index)];
         const auto& stage = failure.stages[static_cast<size_t>(stage_index)];
+        report_float_transport("retry-failed-stage",
+            stage.stage == prosper::gpu::ShaderProgramStage::Compute
+                ? stage.recompile_config.float_transport : failure.float_transport,
+            "failure", static_cast<uint64_t>(failure_index), capture.format_version >= 65);
         if (std::getenv("PROSPER_SHADER_DUMP_SUCCESS") &&
             stage.stage != prosper::gpu::ShaderProgramStage::Compute)
             std::fprintf(stderr,
@@ -3845,7 +3883,9 @@ int main(int argc, char** argv) {
         switch (stage.stage) {
             case prosper::gpu::ShaderProgramStage::Vertex:
                 spirv = prosper::gpu::recompile_vertex(
-                    raw.words.data(), raw.words.size(), resources);
+                    raw.words.data(), raw.words.size(), resources, nullptr, false, 0,
+                    {prosper::gpu::RecompileDiagnosticStage::Vertex, stage.program_addr},
+                    failure.float_transport);
                 break;
             case prosper::gpu::ShaderProgramStage::Fragment: {
                 // v61 carries the same pixel/system-input and wave ABI used by live compilation.
@@ -3879,7 +3919,7 @@ int main(int argc, char** argv) {
                     failure.fragment_retry_config_available ? &interpolation : nullptr,
                     failure.fragment_retry_config_available && failure.ps_wave32,
                     {prosper::gpu::RecompileDiagnosticStage::Fragment, stage.program_addr},
-                    failure.ps_float_mode);
+                    failure.ps_float_mode, nullptr, failure.float_transport);
                 break;
             }
             case prosper::gpu::ShaderProgramStage::Compute:

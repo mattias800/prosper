@@ -148,6 +148,7 @@ std::unordered_set<uint32_t> neutral_selection_votes(
     uint32_t entry_id, const std::unordered_set<uint32_t>& bool_types,
     const std::unordered_set<uint32_t>& int_types, const std::unordered_set<uint32_t>& float_types,
     const std::unordered_set<uint32_t>& glsl_sets, bool preserve_f32,
+    const std::unordered_set<uint32_t>& explicit_transport,
     const std::unordered_set<uint32_t>& frozen_leaves,
     const std::unordered_map<uint32_t, std::vector<size_t>>& users) {
     FragmentNeutralSelection graph;
@@ -191,6 +192,7 @@ std::unordered_set<uint32_t> neutral_selection_votes(
             !(in.in_function || in.op == 1 || (in.op >= 41 && in.op <= 52))) continue;
         FragmentNeutralValue value;
         value.opcode = in.op;
+        value.explicit_transport = explicit_transport.contains(words[at + 2]);
         const uint32_t type = words[at + 1];
         value.type = bool_types.contains(type) ? FragmentNeutralType::Boolean :
             int_types.contains(type) ? FragmentNeutralType::Int32 :
@@ -300,6 +302,8 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
     bool denorm_defined = false;
     bool writes_memory = false;
     std::unordered_set<uint32_t> bool_types, int32_types, float32_types, glsl_sets;
+    std::unordered_set<uint32_t> float32_vectors, explicit_transport, no_contraction;
+    bool transport_capability = false, transport_extension = false;
     std::unordered_map<uint32_t, uint32_t> value_types, pointer_classes;
     std::unordered_map<uint32_t, uint32_t> pointer_elements, runtime_elements, struct_members, strides, constants;
     std::unordered_set<uint32_t> offset_zero_structs;
@@ -316,8 +320,28 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
             int32_types.insert(source[at + 1]);
         if (in.op == 22 && in.count == 3 && source[at + 2] == 32)
             float32_types.insert(source[at + 1]);
+        if (in.op == 23 && in.count == 4 && float32_types.contains(source[at + 2]) &&
+            source[at + 3] >= 2 && source[at + 3] <= 4)
+            float32_vectors.insert(source[at + 1]);
+        if (in.op == 17 && in.count == 2 && source[at + 1] == 6029)
+            transport_capability = true;
+        if (in.op == 10 && instruction_string(source, in, 1) == "SPV_KHR_float_controls2")
+            transport_extension = true;
+        if ((in.op == 16 || in.op == 331) && in.count >= 3 && source[at + 2] == 6028) {
+            result.refusal = FragmentVoteRefusal::UnsupportedWaveOperation;
+            return result; // this contract supports only exact per-instruction transport None
+        }
+        if (in.op == 71 && in.count >= 3 && source[at + 2] == 40) {
+            if (in.count != 4 || source[at + 3] != 0 ||
+                !explicit_transport.insert(source[at + 1]).second) {
+                result.refusal = FragmentVoteRefusal::UnsupportedWaveOperation;
+                return result;
+            }
+        }
+        if (in.op == 71 && in.count == 3 && source[at + 2] == 42)
+            no_contraction.insert(source[at + 1]);
         if ((in.in_function && !no_result(in.op) && in.op != 248 && in.count >= 3) ||
-            ((in.op >= 41 && in.op <= 52) && in.count >= 3))
+            ((in.op == 1 || (in.op >= 41 && in.op <= 52)) && in.count >= 3))
             value_types.emplace(source[at + 2], source[at + 1]);
         if (in.op == 59 && in.count >= 4) pointer_classes.emplace(source[at + 2], source[at + 3]);
         if (in.op == 32 && in.count == 4 && source[at + 2] == 12)
@@ -365,7 +389,7 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
              !is_fragment_builtin(source[at + 3])) ||
             (in.op == 72 && in.count >= 5 && source[at + 3] == 11 &&
              !is_fragment_builtin(source[at + 4])) ||
-            (in.op == 71 && in.count >= 3 && (source[at + 2] == 0 || source[at + 2] == 40 ||
+            (in.op == 71 && in.count >= 3 && (source[at + 2] == 0 ||
              source[at + 2] == 4469 || source[at + 2] == 4470)) ||
             (in.op == 72 && in.count >= 4 && (source[at + 3] == 0 || source[at + 3] == 40 ||
              source[at + 3] == 4469 || source[at + 3] == 4470))) {
@@ -440,6 +464,36 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
                    in.op == 318 || in.op == 319) {
             writes_memory = true;
         }
+    }
+    // Allow only the producing transport slice, not general explicit FP environments.
+    // Strict module validity alone does not prove the stronger neutral theorem's premises.
+    if (!explicit_transport.empty() &&
+        (!transport_capability || !transport_extension || !preserve_f32)) {
+        result.refusal = FragmentVoteRefusal::UnsupportedWaveOperation;
+        return result;
+    }
+    std::unordered_set<uint32_t> validated_transport;
+    for (const auto& in : instructions) {
+        if (!in.in_function || in.count < 3 || !explicit_transport.contains(source[in.at + 2]))
+            continue;
+        const size_t at = in.at;
+        const uint32_t id = source[at + 2], type = source[at + 1];
+        const bool cross_float_bitcast = in.op == 124 && in.count == 4 &&
+            value_types.contains(source[at + 3]) &&
+            ((float32_types.contains(type) && int32_types.contains(value_types.at(source[at + 3]))) ||
+             (int32_types.contains(type) && float32_types.contains(value_types.at(source[at + 3]))));
+        const bool fragment_input_load = in.op == 61 && in.count == 4 &&
+            (float32_types.contains(type) || float32_vectors.contains(type)) &&
+            pointer_classes.contains(source[at + 3]) && pointer_classes.at(source[at + 3]) == 1;
+        if ((!cross_float_bitcast && !fragment_input_load) || no_contraction.contains(id)) {
+            result.refusal = FragmentVoteRefusal::UnsupportedWaveOperation;
+            return result;
+        }
+        validated_transport.insert(id);
+    }
+    if (validated_transport != explicit_transport) {
+        result.refusal = FragmentVoteRefusal::UnsupportedWaveOperation;
+        return result;
     }
     // Any is also an execution rendezvous. A dead result does not prove it may be erased around
     // externally observable memory effects, atomics or an opaque callee. Do not confuse the
@@ -562,7 +616,7 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
     }
 
     const auto neutral_vote_ids = neutral_selection_votes(source, instructions, entry_id, bool_types,
-        int32_types, float32_types, glsl_sets, preserve_f32, uniform, users);
+        int32_types, float32_types, glsl_sets, preserve_f32, explicit_transport, uniform, users);
     // These are facts about the transaction's EFFECTIVE controller, never about source P. The
     // frozen source leaves above still own all load/address authority.
     auto effective_leaves = uniform;
@@ -644,7 +698,7 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
             // collision. This adds no facts to the proof and never rewrites SOURCE or EFFECTIVE.
             for (const auto& in : instructions) {
                 if (((in.in_function && !no_result(in.op) && in.op != 248 && in.count >= 3) ||
-                     ((in.op >= 41 && in.op <= 52) && in.count >= 3)) &&
+                     ((in.op == 1 || (in.op >= 41 && in.op <= 52)) && in.count >= 3)) &&
                     source[in.at + 2] == result.failed_vote.predicate_id) {
                     result.failed_vote.predicate_opcode = in.op;
                     break;

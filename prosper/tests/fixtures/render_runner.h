@@ -37,6 +37,7 @@
 #include "host/platform/gpu_submit_gate.hpp"   // refuse submits once the frontend shuts down (#3225)
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/device/vulkan_device_select.hpp"
+#include "shared/device/float_transport.hpp"
 #include "shared/device/pipeline_cache_file.hpp"
 #include "shared/device/image_robustness.hpp"  // #3531: the recompiler's OOB image-read contract
 #include "shared/perf/performance_timing_gate.hpp"
@@ -1561,6 +1562,7 @@ struct RenderVkCtx {
     bool fragment_stores_atomics = false;
     // Enabled robust2 plus <=4-byte range rounding: word-buffer OOB reads deterministically zero.
     bool deterministic_storage_reads = false;
+    prosper::gpu::FloatTransportConfig float_transport{};
     // Per-draw "fragment funnel" diagnostic (PROSPER_DRAW_STATS): pipeline-statistics + precise
     // occlusion queries. Enabled at device creation only when advertised; inert otherwise.
     bool pipeline_stats_enabled = false;
@@ -1946,6 +1948,9 @@ inline const RenderVkCtx& render_vk_ctx() {
         r.storage_image_features = prosper::frontend::acquire_storage_image_device_features(
             "vk", r.phys, feats.shaderStorageImageReadWithoutFormat == VK_TRUE,
             feats.shaderStorageImageWriteWithoutFormat == VK_TRUE, irf, dci);
+        VkPhysicalDeviceShaderFloatControls2Features transport_features{};
+        r.float_transport = prosper::frontend::acquire_float_transport_device_features(
+            "render", r.phys, prosper::frontend::kVulkanRuntimeVersion, transport_features, dci);
 
         // Runtime-selected storage buffers use bounded fixed arrays. Request only the one
         // descriptor-indexing feature their non-uniform access chains require.
@@ -2175,6 +2180,7 @@ inline const RenderVkCtx& render_vk_ctx() {
         prosper::gpu::publish_device_float_controls(
             "render", r.phys, prosper::frontend::kVulkanRuntimeVersion,
             /*float_controls_extension_enabled=*/false);
+        prosper::gpu::publish_float_transport_config(r.float_transport);
         VkPipelineCacheCreateInfo cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         std::vector<uint8_t> initial_cache;
         try {
@@ -2235,6 +2241,7 @@ inline const RenderVkCtx& render_vk_ctx() {
             shared.instance = r.inst;
             shared.physical = r.phys;
             shared.device = r.dev;
+            shared.float_transport = r.float_transport;
             shared.queue = r.queue;
             shared.queue_family = r.qfi;
             // Publish what the device was actually CREATED with (feats), not what the physical
@@ -5887,6 +5894,13 @@ inline VkResult create_render_shader_module_checked(VkDevice dev,
                                                     const VkShaderModuleCreateInfo& ci,
                                                     VkShaderModule* out_module) {
     *out_module = VK_NULL_HANDLE;
+    const auto& owner = render_vk_ctx();
+    if (owner.dev != dev || !prosper::frontend::float_transport_module_supported(
+            ci.pCode, ci.codeSize / sizeof(uint32_t), owner.float_transport)) {
+        std::fprintf(stderr, "[float-transport] render REFUSED module: executing device lacks "
+                             "enabled explicit-nonfinite32 transport witness (#4066)\n");
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
     const VkResult result = consume_render_vk_object_create_failure(
                                 RenderVkObjectCreateSite::ShaderModule)
         ? VK_ERROR_OUT_OF_DEVICE_MEMORY

@@ -24,6 +24,14 @@ def run(*args, code=0, extra=None):
     return p.stdout + p.stderr
 
 
+def rechecksum(blob):
+    value = 14695981039346656037
+    for byte in blob[:-8]:
+        value = ((value ^ byte) * 1099511628211) & ((1 << 64) - 1)
+    blob[-8:] = value.to_bytes(8, "little")
+    return blob
+
+
 with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as temp:
     root = Path(temp)
     run(fixture, "--emit", str(root))
@@ -49,10 +57,49 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
         run(validator, "--target-env", "vulkan1.1", str(output))
         mode_outputs.append(output.read_bytes())
     assert mode_outputs[0] != mode_outputs[1], "captured guest mode must reach live compiler relation"
+    for profile, value in (("unknown", 0), ("implicit", 1), ("explicit-nonfinite32", 2)):
+        case = root / f"transport-{profile}.prfc"
+        wire = case.read_bytes()
+        assert wire[8:12] == (2).to_bytes(4, "little") and wire[-9] == value, "exact schema2 profile tail"
+        source = root / f"transport-{profile}.spv"
+        candidate = root / f"transport-{profile}-candidate.spv"
+        report = run(replay, "--baseline", str(case), "--output", str(source))
+        assert "input=COMPLETE" in report and f"host_float_transport={profile}" in report and "BASELINE MATCH PRODUCED" in report
+        report = run(replay, "--candidate", str(case), "--output", str(candidate))
+        assert f"host_float_transport={profile}" in report and "CANDIDATE PRODUCED" in report
+        assert source.read_bytes() == candidate.read_bytes()
+        run(validator, "--target-env", "vulkan1.1", str(source))
+        run(validator, "--target-env", "vulkan1.1", str(candidate))
     refusal = run(replay, "--baseline", str(root / "refused.prfc"))
     assert "BASELINE MATCH REFUSED" in refusal and "actual_refusal=" in refusal and "no supported export" in refusal
     saved = root / "preserved.spv"
     saved.write_bytes(b"previous-output")
+    current = bytearray((root / "transport-unknown.prfc").read_bytes())
+    legacy = bytearray(current)
+    del legacy[-9]  # remove the actual append-only tail, not merely relabel the current version
+    legacy[8:12] = (1).to_bytes(4, "little")
+    legacy_case = root / "legacy-schema1.prfc"
+    legacy_case.write_bytes(rechecksum(legacy))
+    report = run(replay, "--inspect-only", str(legacy_case))
+    assert "input=INCOMPLETE" in report and "fragment-transport-config-unavailable" in report and "host_float_transport=unknown" in report
+    for mode in ("--baseline", "--candidate"):
+        assert "INCOMPLETE" in run(replay, mode, str(legacy_case), "--output", str(saved), code=2)
+        assert saved.read_bytes() == b"previous-output"
+    malformed_profiles = []
+    relabeled = bytearray(current)
+    relabeled[8:12] = (1).to_bytes(4, "little")
+    malformed_profiles.append((relabeled, "trailing data"))
+    invalid_profile = bytearray(current)
+    invalid_profile[-9] = 255
+    malformed_profiles.append((invalid_profile, "noncanonical float transport"))
+    truncated_profile = bytearray(current)
+    del truncated_profile[-9]
+    malformed_profiles.append((truncated_profile, "truncated"))
+    for index, (wire, reason) in enumerate(malformed_profiles):
+        path = root / f"malformed-profile-{index}.prfc"
+        path.write_bytes(rechecksum(wire))
+        assert reason in run(replay, "--candidate", str(path), "--output", str(saved), code=2)
+        assert saved.read_bytes() == b"previous-output"
     refusal = run(replay, "--candidate", str(root / "refused.prfc"), "--output", str(saved), code=3)
     assert "CANDIDATE REFUSED" in refusal and "actual_refusal=" in refusal and "no supported export" in refusal
     assert saved.read_bytes() == b"previous-output"
@@ -77,4 +124,4 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
     invalid_spv.write_bytes(b"not-a-SPIR-V-module")
     run(validator, "--target-env", "vulkan1.1", str(invalid_spv), code=1)
 
-print(f"fragment compile replay CLI: {checks} real invocations passed, six strict modules and validator rejection; no GPU/game")
+print(f"fragment compile replay CLI: {checks} real invocations passed, twelve strict modules and validator rejection; no GPU/game")

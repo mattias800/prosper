@@ -186,7 +186,8 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // explicit unavailable state. This does not describe the effective backend SPIR-V subgroup width.
 // v64 (#4056): canonical availability plus all eight guest FLOAT_MODE bits for realized draws and
 // failed draws. Independent of the v63 width contract; legacy files retain explicit unknown mode.
-constexpr uint32_t kVersion = 64;
+// v65: actual producing float transport profile, independently retained from guest MODE.
+constexpr uint32_t kVersion = 65;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -825,6 +826,10 @@ inline bool validate_compute_config(const ComputeShaderConfig& config,
                              uint32_t required_subgroup_size,
                              const char* state_error,
                              std::string& error) {
+    if (!config.float_transport.canonical()) {
+        error = "invalid compute float transport config";
+        return false;
+    }
     const bool subgroup_valid = config.native_subgroup_size == 0 ||
         config.native_subgroup_size == 32 || config.native_subgroup_size == 64;
     if ((required_subgroup_size != 0 && required_subgroup_size != 32 &&
@@ -851,6 +856,10 @@ inline bool validate_compute_config(const ComputeShaderConfig& config,
 
 inline bool validate_compute_recompile_state(const GpuCapturedCompute& compute,
                                       std::string& error) {
+    if (!compute.recompile_config.float_transport.canonical()) {
+        error = "invalid compute float transport config";
+        return false;
+    }
     if (!compute.recompile_config_available) {
         if (compute.raw_shader_index != 0xFFFFFFFFu) {
             error = "compute raw shader has no recompile state";
@@ -1330,6 +1339,10 @@ inline bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::str
             error = "invalid failed-draw fragment float mode";
             return false;
         }
+        if (!diagnostic.float_transport.canonical()) {
+            error = "invalid failed-operation float transport config";
+            return false;
+        }
         if (diagnostic.kind > SubmitOperationKind::Dispatch ||
             diagnostic.reason <= RealizationFailureReason::None ||
             diagnostic.reason > kMaxRealizationFailureReason ||
@@ -1360,6 +1373,10 @@ inline bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::str
         // unique so an accidentally duplicated record remains fail-visible.
         std::set<std::pair<uint8_t, uint64_t>> stage_programs;
         for (const auto& stage : diagnostic.stages) {
+            if (!stage.recompile_config.float_transport.canonical()) {
+                error = "invalid failed-stage float transport config";
+                return false;
+            }
             if (stage.stage > ShaderProgramStage::Compute ||
                 (stage.raw_shader_index != 0xFFFFFFFFu &&
                  stage.raw_shader_index >= capture.raw_shader_versions.size()) ||

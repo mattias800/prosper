@@ -1639,6 +1639,44 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 return false;
             }
     }
+    if (version >= 65u) {
+        const auto read_transport = [&](FloatTransportConfig& config) {
+            uint8_t tag = 0;
+            if (!r.u8(tag) || tag > 2u) return false;
+            config = {static_cast<FloatTransportProfile>(tag)};
+            return true;
+        };
+        uint32_t count = 0;
+        if (!r.u32(count) || count != c.draws.size()) {
+            error = "invalid draw float transport count"; return false;
+        }
+        for (auto& draw : c.draws)
+            if (!read_transport(draw.float_transport)) {
+                error = "invalid draw float transport config"; return false;
+            }
+        if (!r.u32(count) || count != c.computes.size()) {
+            error = "invalid compute float transport count"; return false;
+        }
+        for (auto& compute : c.computes)
+            if (!read_transport(compute.recompile_config.float_transport)) {
+                error = "invalid compute float transport config"; return false;
+            }
+        if (!r.u32(count) || count != c.failure_diagnostics.size()) {
+            error = "invalid failed-operation float transport count"; return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics) {
+            if (!read_transport(diagnostic.float_transport)) {
+                error = "invalid failed-operation float transport config"; return false;
+            }
+            if (!r.u32(count) || count != diagnostic.stages.size()) {
+                error = "invalid failed-stage float transport count"; return false;
+            }
+            for (auto& stage : diagnostic.stages)
+                if (!read_transport(stage.recompile_config.float_transport)) {
+                    error = "invalid failed-stage float transport config"; return false;
+                }
+        }
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.

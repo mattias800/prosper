@@ -49,6 +49,15 @@ preserve Inf anyway, so the guard is structural on purpose. The hand-built modul
 `spirv_builder` are prosper's own code rather than translated guest code and are deliberately outside
 this contract.
 
+`FloatTransportConfig` is a separate, immutable producing profile. Explicit nonfinite F32 transport
+requires both enabled `shaderFloatControls2` and the SZI32 property; device owners publish only after
+successful device creation. Cache keys, retained draws/failures and replay pass the actual profile,
+never an ambient capability guess. Its per-instruction `FPFastMathMode None` covers only scalar
+cross-float Bitcasts and floating fragment Input loads. It does not promise signaling-NaN payload
+identity, arithmetic denorm/rounding behavior, or any uniform/frozen/address authority. The vote
+parser accepts only this exact typed envelope and removes its old implicit finite-back premise for
+decorated transport; `FPFastMathDefault`, other flags and unrelated decorated operations refuse.
+
 ## `PROSPER_CFG_TRIP_BOUND` — is this a non-terminating loop?
 
 A guest program whose control flow neither structured emitter accepts is lowered by

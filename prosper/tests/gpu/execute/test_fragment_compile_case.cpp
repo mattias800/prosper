@@ -83,16 +83,18 @@ static std::string identity() {
 }
 static FragmentCompileCase produce(std::vector<uint32_t> code, bool wave32 = false,
                                    const ShaderResourceTable* table = nullptr,
-                                   FragmentFloatMode mode = {}) {
+                                   FragmentFloatMode mode = {}, FloatTransportConfig transport = {}) {
     FragmentCompileCase c;
     c.compiler = identity(); c.program_address = 0x123400;
     c.code = std::move(code); c.wave32 = wave32; c.float_mode = mode;
+    c.float_transport = transport;
     own_fragment_compile_case_resources(c, table);
     c.interpolation = fragment_interpolation_layout(c.code.data(), c.code.size());
     std::vector<uint32_t> source;
     { CompilerChoiceScope choices(c.choices); TerminalRejectCapture rejection;
       source = recompile_fragment(c.code.data(), c.code.size(), table, nullptr, UINT32_MAX,
-          &c.interpolation, wave32, {RecompileDiagnosticStage::Fragment, c.program_address}, mode);
+          &c.interpolation, wave32, {RecompileDiagnosticStage::Fragment, c.program_address},
+          mode, nullptr, transport);
       const auto rejects = rejection.take();
       c.expected_reject = rejects.empty() ? std::string{} :
           rejects.back().first + " " + rejects.back().second; }
@@ -221,7 +223,7 @@ static void codec_tests(const FragmentCompileCase& produced) {
         auto bad = wire; bad[offset] ^= 0x80;
         CHECK(error([&] { decode_fragment_compile_case(bad); }).find("checksum") != std::string::npos);
     }
-    auto schema = wire; schema[8] = 2; rechecksum(schema);
+    auto schema = wire; schema[8] = 3; rechecksum(schema);
     CHECK(error([&] { decode_fragment_compile_case(schema); }).find("schema") != std::string::npos);
     auto boolean = wire; boolean[12] = 2; rechecksum(boolean);
     CHECK(error([&] { decode_fragment_compile_case(boolean); }).find("boolean") != std::string::npos);
@@ -484,6 +486,79 @@ static void mode_tests() {
     }
     env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", nullptr);
 }
+static void transport_tests() {
+    reset_float_controls_support_for_test();
+    constexpr FloatTransportConfig profiles[] = {{FloatTransportProfile::Unknown},
+        {FloatTransportProfile::Implicit}, {FloatTransportProfile::ExplicitNonFinite32}};
+    const std::vector<uint32_t> color = {0x40400000u, 0, 0, 0x3f800000u};
+    for (bool wave32 : {false, true}) for (const auto profile : profiles) {
+        const auto c = produce(add_probe, wave32, nullptr, {true, 0x31}, profile);
+        CHECK(c.complete && constant_color(c.source, color));
+        const auto wire = encode_fragment_compile_case(c);
+        CHECK(wire.size() > 21 && wire[8] == 2 && wire[wire.size() - 9] == uint8_t(profile.profile));
+        const auto decoded = decode_fragment_compile_case(wire);
+        CHECK(decoded.complete && decoded.float_transport == profile && decoded.code == c.code);
+        CHECK(replay_fragment_compile_case(decoded, true) == c.source);
+        unsigned legacy_reads = 0;
+        for (const auto& read : c.choices.reads) if (read.choice == CompilerChoice::FloatControls) ++legacy_reads;
+        CHECK(legacy_reads == (profile.explicit_nonfinite32() ? 0u : 1u));
+        CHECK(float_transport_module_supported(c.source.data(), c.source.size(),
+            {FloatTransportProfile::Implicit}) == !profile.explicit_nonfinite32());
+
+        auto legacy = wire;
+        legacy.erase(legacy.end() - 9); // genuine schema-1 payload, NOT a version-only relabel
+        legacy[8] = 1; rechecksum(legacy);
+        const auto old = decode_fragment_compile_case(legacy);
+        CHECK(!old.complete && old.reason == "fragment-transport-config-unavailable" &&
+            old.float_transport == FloatTransportConfig{} && old.source == c.source && old.code == c.code);
+        CHECK(error([&] { replay_fragment_compile_case(old, false); }).find("INCOMPLETE") != std::string::npos);
+        auto relabel = wire; relabel[8] = 1; rechecksum(relabel);
+        CHECK(error([&] { decode_fragment_compile_case(relabel); }).find("trailing data") != std::string::npos);
+        auto missing = wire; missing.erase(missing.end() - 9); rechecksum(missing);
+        CHECK(error([&] { decode_fragment_compile_case(missing); }).find("truncated") != std::string::npos);
+        auto invalid = wire; invalid[invalid.size() - 9] = 3; rechecksum(invalid);
+        CHECK(error([&] { decode_fragment_compile_case(invalid); }).find("noncanonical float transport") != std::string::npos);
+        auto invalid_input = c; invalid_input.float_transport.profile = static_cast<FloatTransportProfile>(3);
+        CHECK(error([&] { encode_fragment_compile_case(invalid_input); }).find("noncanonical float transport") != std::string::npos);
+        if (profile.explicit_nonfinite32()) {
+            auto loss = c; loss.float_transport = {};
+            CHECK(!error([&] { replay_fragment_compile_case(loss, false); }).empty());
+        }
+    }
+    // The legacy ambient read remains captured only when consumed, and replay does not replace
+    // that producing choice with a later publication. Explicit attempts are independent of it.
+    const auto implicit = produce(add_probe, false, nullptr, {true, 0x31}, profiles[1]);
+    const auto explicit_case = produce(add_probe, false, nullptr, {true, 0x31}, profiles[2]);
+    publish_float_controls_support(true, true);
+    CHECK(replay_fragment_compile_case(implicit, true) == implicit.source);
+    CHECK(replay_fragment_compile_case(explicit_case, true) == explicit_case.source);
+    reset_float_controls_support_for_test();
+
+    const auto directory = prosper_test::test_scratch_dir() / "transport";
+    clear_shader_recompile_cache(); env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", directory.string().c_str());
+    const auto compile = [&](FloatTransportConfig profile) {
+        return recompile_graphics_shader_cached_shared(ShaderProgramStage::Fragment,
+            add_probe.data(), add_probe.size(), nullptr, nullptr, nullptr, nullptr,
+            false, 0, false, {}, {true, 0x31}, profile);
+    };
+    std::array<SharedShaderWords, 3> outputs;
+    for (size_t k = 0; k < 3; ++k) { outputs[k] = compile(profiles[k]); CHECK(outputs[k] && constant_color(*outputs[k], color)); }
+    CHECK(outputs[0] != outputs[1] && outputs[1] != outputs[2] && outputs[0] != outputs[2]);
+    const auto before = shader_recompile_cache_stats();
+    for (size_t k = 0; k < 3; ++k) CHECK(compile(profiles[k]) == outputs[k]);
+    const auto after = shader_recompile_cache_stats();
+    CHECK(after.hits == before.hits + 3 && after.misses == before.misses);
+    const auto captured = files(directory); CHECK(captured.size() == 3);
+    unsigned seen = 0;
+    for (const auto& path : captured) {
+        const auto c = read_fragment_compile_case(path);
+        const auto k = size_t(c.float_transport.profile);
+        CHECK(c.complete && k < 3);
+        if (k < 3) { seen |= 1u << k; CHECK(c.source == *outputs[k] && replay_fragment_compile_case(c, true) == c.source); }
+    }
+    CHECK(seen == 7);
+    env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", nullptr); clear_shader_recompile_cache();
+}
 static std::vector<uint32_t> arithmetic_accounting_tests() {
     namespace perf = prosper::diagnostics::perf;
     const auto count = [](perf::Counter counter) { return perf::ledger().counters[size_t(counter)].load(); };
@@ -588,10 +663,16 @@ int main(int argc, char** argv) {
                 CHECK(constant_color(c.source, {mode ? 0u : 0x3f800000u, 0x3f800000u, 0, 0x3f800000u}));
                 write_fragment_compile_case(dir / (mode ? "preserve.prfc" : "flush.prfc"), c);
             }
+            for (const auto profile : {FloatTransportProfile::Unknown, FloatTransportProfile::Implicit,
+                                      FloatTransportProfile::ExplicitNonFinite32}) {
+                auto c = produce(add_probe, false, nullptr, {true, 0x31}, {profile}); CHECK(c.complete);
+                write_fragment_compile_case(dir / (std::string("transport-") +
+                    float_transport_profile_name({profile}) + ".prfc"), c);
+            }
         } else {
             CHECK(argc == 1 || (argc == 3 && std::string_view(argv[1]) == "--dump"));
             auto c = produce(green); CHECK(c.complete);
-            codec_tests(c); resource_tests(c); cache_tests(); atomic_tests(c); mode_tests();
+            codec_tests(c); resource_tests(c); cache_tests(); atomic_tests(c); mode_tests(); transport_tests();
             const auto add = arithmetic_accounting_tests();
             auto wave32 = produce(green, true); CHECK(wave32.complete && solid_green(wave32.source));
             CHECK(wave32.wave32 && !c.wave32); // width need not alter a wave-insensitive program
@@ -605,7 +686,15 @@ int main(int argc, char** argv) {
                     auto known = produce(mode_probe, narrow, nullptr, {true, mode}); CHECK(known.complete);
                     write_fragment_compile_source(dir / (std::string("mode") + std::to_string(mode) +
                         "-wave" + (narrow ? "32" : "64") + ".spv"), known.source);
-                } }
+                }
+                for (bool narrow : {false, true}) for (const auto profile : {
+                    FloatTransportProfile::Unknown, FloatTransportProfile::Implicit,
+                    FloatTransportProfile::ExplicitNonFinite32}) {
+                    auto known = produce(add_probe, narrow, nullptr, {true, 0x31}, {profile}); CHECK(known.complete);
+                    write_fragment_compile_source(dir / (std::string("transport-") +
+                        float_transport_profile_name({profile}) + "-wave" + (narrow ? "32" : "64") + ".spv"), known.source);
+                }
+            }
         }
     } catch (const std::exception& e) { ++failures; std::printf("[FAIL] unexpected: %s\n", e.what()); }
     std::printf("fragment compile case: %u checks, %u independent resource fields, %u failures\n", checks, field_checks, failures);

@@ -2,6 +2,9 @@
 // gpu/recompiler/rdna2_to_spirv_internal.hpp. outline_methods.py checked each body byte for byte.
 
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/diagnostics/diag_ratelimit.hpp"
+#include <set>
+#include <tuple>
 
 namespace prosper::gpu {
 
@@ -16,14 +19,69 @@ void SpirvCompute::declare_descriptor_indexing() {
 
 void SpirvCompute::declare_float_controls(uint32_t entry) {
         if (float_controls_declared) return;
-        if (!compiler_choice(CompilerChoice::FloatControls, [] {
+        // The explicit profile is an independently retained device witness. Do not let a later
+        // ambient publisher change this module's producing profile or its bit-preserving ops.
+        // Only a nonexplicit attempt consumes the legacy semantic read. Explicit attempts must
+        // not fabricate a transcript event for an ambient value they never used.
+        if (!float_transport.explicit_nonfinite32() &&
+            !compiler_choice(CompilerChoice::FloatControls, [] {
                 return signed_zero_inf_nan_preserve_declared();
             })) return;
         float_controls_declared = true;
+        if (float_transport.explicit_nonfinite32() && !float_transport_declared) {
+            // Even a generated stage with no eligible transport forces SZI32 from this profile.
+            // Retain its full feature envelope in the WORDS so a different executing device
+            // cannot miss the SZI prerequisite merely because there are no None decorations.
+            float_transport_declared = true;
+            put(caps, Op_Capability, {Cap_FloatControls2});
+            std::vector<uint32_t> extension; pstr(extension, "SPV_KHR_float_controls2");
+            putv(exts, Op_Extension, extension);
+        }
         put(caps, Op_Capability, {Cap_SignedZeroInfNanPreserve});
         std::vector<uint32_t> o; pstr(o, "SPV_KHR_float_controls");
         putv(exts, Op_Extension, o);
         put(exec, Op_ExecutionMode, {entry, EM_SignedZeroInfNanPreserve, 32});
+    }
+
+void SpirvCompute::decorate_float_transport(uint32_t result) {
+        if (!float_transport.explicit_nonfinite32()) {
+            if (float_transport_warning) return;
+            float_transport_warning = true;
+            // Modules can compile before lazy device initialization, and old captures lack the
+            // witness entirely. Both retain compatibility, but neither certifies nonfinite data.
+            using WarningKey = std::tuple<uint64_t, RecompileDiagnosticStage,
+                                          FloatTransportProfile, bool, uint8_t>;
+            static std::mutex mutex;
+            static std::set<WarningKey> reported;
+            static uint64_t overflow[2]{};
+            std::lock_guard lock(mutex);
+            const WarningKey key{diagnostic.program_address, diagnostic.stage,
+                float_transport.profile, fragment_float_mode.available, fragment_float_mode.value};
+            if (reported.contains(key)) return;
+            constexpr size_t maximum_reports = 256;
+            if (reported.size() >= maximum_reports) {
+                const uint64_t ordinal = ++overflow[float_transport.available() ? 1 : 0];
+                if (prosper::diag_should_print(ordinal, 1)) std::fprintf(stderr,
+                    "[float-transport] profile=%s key=overflow ordinal=%llu; warning identity "
+                    "set saturated at 256; additional compile occurrences have unverified "
+                    "nonfinite transport (#4066)\n",
+                    float_transport.available() ? "implicit" : "unknown",
+                    static_cast<unsigned long long>(ordinal));
+                return;
+            }
+            reported.insert(key);
+            std::fprintf(stderr,
+                "[float-transport] profile=%s program=%llx stage=%u key=program-profile ordinal=1: retaining implicit "
+                "FP environment; nonfinite raw/Input transport semantics UNVERIFIED (#4066)\n",
+                float_transport.available() ? "implicit" : "unknown",
+                static_cast<unsigned long long>(diagnostic.program_address),
+                static_cast<unsigned>(diagnostic.stage));
+            return;
+        }
+        // Per-instruction None overrides implicit NSZ/NotInf/NotNaN. Never decorate arithmetic
+        // or publish FPFastMathDefault (which cannot coexist with SZI/NoContraction).
+        // Signaling NaN may still quiet; this is not exact arbitrary NaN payload authority.
+        put(deco, Op_Decorate, {result, Dec_FPFastMathMode, 0});
     }
 
 void SpirvCompute::pstr(std::vector<uint32_t>& v, const char* s) {

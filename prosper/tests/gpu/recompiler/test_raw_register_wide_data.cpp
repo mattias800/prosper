@@ -168,23 +168,24 @@ int main(int argc, char** argv) {
           std::memcmp(replay.computes[0].resources->resources[0].host_data,
                       blob.bytes.data(), blob.bytes.size()) == 0,
           "replay preserves the rebased range and its owned current bytes");
-    // This compute-only fixture has no draw or failure records: v64 appends two zero counts.
+    // This compute-only fixture has no draw/failure records and one unknown transport profile.
+    constexpr size_t transport_tail_bytes = 13u;
     constexpr size_t mode_tail_bytes = 8u;
     constexpr size_t width_tail_bytes = 4u;
     constexpr size_t backing_tail_bytes = 5u;
-    CHECK(encoded.size() >= mode_tail_bytes + width_tail_bytes + backing_tail_bytes &&
-          encoded[8] == 64u,
+    CHECK(encoded.size() >= transport_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes &&
+          encoded[8] == 65u,
           "legacy controls require the current versioned capture tail");
-    if (encoded.size() >= mode_tail_bytes + width_tail_bytes + backing_tail_bytes) {
+    if (encoded.size() >= transport_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes) {
         auto legacy = encoded;
-        // Remove v64 mode counts, v63 draw-width count, then v62 count/resource marker.
-        legacy.resize(legacy.size() - mode_tail_bytes - width_tail_bytes - backing_tail_bytes);
+        // Remove v65 transport, v64 mode counts, v63 draw-width count, then v62 backing marker.
+        legacy.resize(legacy.size() - transport_tail_bytes - mode_tail_bytes - width_tail_bytes - backing_tail_bytes);
         legacy[8] = 61u;
         CHECK(deserialize_gpu_capture(legacy, decoded, error) &&
               !decoded.computes[0].resources.resources[0].resource.raw_register_snapshot,
               "v61 capture leaves the new backing admission unavailable");
         auto malformed = encoded;
-        malformed[malformed.size() - mode_tail_bytes - width_tail_bytes - 1u] = 2u;
+        malformed[malformed.size() - transport_tail_bytes - mode_tail_bytes - width_tail_bytes - 1u] = 2u;
         CHECK(!deserialize_gpu_capture(malformed, decoded, error) &&
               error == "invalid raw register snapshot state",
               "codec refuses an invented marker encoding");

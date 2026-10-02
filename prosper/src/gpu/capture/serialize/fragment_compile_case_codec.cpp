@@ -152,7 +152,10 @@ struct Reader {
 std::vector<uint8_t> encode_fragment_compile_case(const FragmentCompileCase& c) {
     validate_fragment_compile_case(c);
     Writer w; const uint8_t magic[8] = {'P','R','F','C','A','S','E',0};
-    w(magic, uint32_t(1)); capsule(w, c); w.value(checksum(w.bytes)); return std::move(w.bytes);
+    // The schema-1 payload is unchanged. Profile is an append-only schema-2 tail, independent
+    // of guest FLOAT_MODE and the ordered legacy FloatControls semantic read.
+    w(magic, uint32_t(2)); capsule(w, c); w(c.float_transport.profile);
+    w.value(checksum(w.bytes)); return std::move(w.bytes);
 }
 FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes) {
     check(bytes.size() >= 20 && bytes.size() <= kCompileCaseMaxFileBytes, "compile-case file size");
@@ -160,15 +163,25 @@ FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes)
     check(checksum(bytes.first(bytes.size() - 8)) == hash, "compile-case checksum");
     Reader r{bytes.first(bytes.size() - 8)}; uint8_t magic[8]{}; uint32_t schema{}; r(magic, schema);
     const uint8_t wanted[8] = {'P','R','F','C','A','S','E',0};
-    check(std::equal(std::begin(magic), std::end(magic), std::begin(wanted)) && schema == 1,
+    check(std::equal(std::begin(magic), std::end(magic), std::begin(wanted)) &&
+          (schema == 1 || schema == 2),
           "compile-case schema");
     FragmentCompileCase c; capsule(r, c);
+    if (schema >= 2) r(c.float_transport.profile);
     check(r.position == r.bytes.size(), "compile-case trailing data");
     for (size_t k = 0; k < c.blobs.size(); ++k) if (c.blobs[k].alias_of != UINT32_MAX) {
         check(c.blobs[k].alias_of < k, "compile-case alias index");
         c.blobs[k].bytes = c.blobs[c.blobs[k].alias_of].bytes;
     }
-    validate_fragment_compile_case(c); restore_fragment_compile_case_backing(c); return c;
+    validate_fragment_compile_case(c); restore_fragment_compile_case_backing(c);
+    if (schema == 1) {
+        // Validate the genuine old schema before losing completeness. In particular, merely
+        // relabeling a schema-2 file as schema 1 is trailing data, not a legacy compatibility arm.
+        c.float_transport = {};
+        c.complete = false;
+        if (c.reason.empty()) c.reason = "fragment-transport-config-unavailable";
+    }
+    return c;
 }
 FragmentCompileCase read_fragment_compile_case(const std::filesystem::path& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate); check(bool(f), "cannot open compile case");
