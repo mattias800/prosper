@@ -1434,6 +1434,11 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_snap_author PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_snap_author COMMAND test_prosper_app_snap_author)
 
+  # Exit status + fault wording for a dead guest (#4140); no SDL/Vulkan.
+  add_executable(test_prosper_app_guest_end_status frontends/prosper-app/test_guest_end_status.cpp)
+  target_include_directories(test_prosper_app_guest_end_status PRIVATE frontends/prosper-app)
+  add_test(NAME prosper_app_guest_end_status COMMAND test_prosper_app_guest_end_status)
+
   add_executable(test_prosper_app_capture_schedule frontends/prosper-app/test_capture_schedule.cpp)
   target_include_directories(test_prosper_app_capture_schedule PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_capture_schedule COMMAND test_prosper_app_capture_schedule)

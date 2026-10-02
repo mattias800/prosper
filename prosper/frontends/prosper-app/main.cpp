@@ -14,6 +14,7 @@
 // Real game boots normally adopt the renderer's Vulkan device and pass its front image directly to
 // the swapchain. Test-pattern boots, an explicit override, or failed adoption retain the original
 // two-device path, where frames cross as shared immutable CPU pixels.
+#include "guest_end_status.hpp"         // exit status + fault banner for a dead guest (#4140)
 #include "diagnostics/exit_reports.hpp"         // flush_exit_reports before std::_Exit (#3353)
 #include "gpu/present/videoout_present.hpp"   // present_acquire_rendered_frame / present_write_frame
 #include "gpu/execute/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
@@ -1170,6 +1171,32 @@ bool g_guest_started = false;
 // state for 72 minutes). The detail string is written before the kind is released.
 std::atomic<int> g_guest_end_kind{-1};
 std::string g_guest_end_detail;
+#ifdef _WIN32
+// Last-chance handler for a fault no one owns: a guest WORKER thread (the VEH only recovers armed
+// threads and declines the rest) or a host exception. Without it the process dies with Windows' own
+// status and no module+offset, no backtrace -- only the entry thread had a report (#4140). Exits with
+// kExitGuestFault so a script sees a crash, same as an entry-thread fault.
+LONG WINAPI report_unhandled_fault(EXCEPTION_POINTERS* ep) {
+    static std::atomic<bool> reporting{false};
+    if (reporting.exchange(true)) return EXCEPTION_CONTINUE_SEARCH;   // fault inside the reporter
+    const CONTEXT* c = ep->ContextRecord;
+    const uint64_t rip = c->Rip;
+    fprintf(stderr, "%s
+",
+            prosper::app::format_fault_banner(
+                g_guest_started ? "guest/host" : "host", GetCurrentThreadId(),
+                ep->ExceptionRecord->ExceptionCode, rip, describe_code_address(rip)).c_str());
+    uint64_t frames[32];
+    const int n = guest_frames_from_rbp(c->Rbp, frames, 32);
+    for (int i = 0; i < n; i++)
+        fprintf(stderr, "[app] fault backtrace: 0x%llx (%s)
+", (unsigned long long)frames[i],
+                describe_code_address(frames[i]).c_str());
+    dump_guest_exception_trace();
+    fflush(nullptr);
+    std::_Exit(prosper::app::kExitGuestFault);
+}
+#endif
 // True when THIS process authored PROSPER_GUEST_ARGS from the settings file (start_guest). A
 // relaunch must strip an app-authored value so the next title re-resolves its own (#2973 review).
 bool g_guest_args_app_set = false;
@@ -1419,6 +1446,9 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(report_unhandled_fault);
+#endif
     // Line-buffer stdout: the boot/loader diagnostics go through printf (stdout), and under a
     // file redirect stdout block-buffers — every boot-time line then flushes at exit and lands
     // AFTER hours' worth of unbuffered stderr in a merged `> log 2>&1`, making the log read as
@@ -3666,7 +3696,9 @@ int main(int argc, char** argv) {
     perfCapture.cancel();     // never publish a short/incomplete .prperf on a graceful early exit
     prosper_request_stop();   // signal the guest run-loop to wind down at its next boundary
     fprintf(stderr, "[app] shutting down after %llu presented frame(s)\n", (unsigned long long)shown);
-    const int exitCode = (exitAfter && (int)shown < exitAfter) ? 1 : 0;
+    const int exitCode = prosper::app::exit_status(
+        g_guest_end_kind.load(std::memory_order_acquire),
+        exitAfter && (int)shown < exitAfter);
 
     // run_entry does not yet observe the frontend stop flag, so a booted guest cannot be joined.
     // Returning from main after detaching it is unsafe: C++ static teardown destroys HLE/renderer

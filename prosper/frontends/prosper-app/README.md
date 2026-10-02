@@ -206,6 +206,9 @@ tuning one; leave it unset for normal use.
 - `--set-games-dir <path>` — record that directory for future launches, then exit. An empty path
   (`--set-games-dir ""`) clears the stored setting; a missing one is an error (exit 2).
 - `--list-games` — print the library as plain text and exit, with no window, no Vulkan and no guest.
+- **Exit status.** 0 clean; 1 `--frames N` not reached; 3 the guest faulted (entry thread ended with a
+  fault, or on Windows a guest worker thread / host exception went unhandled and was reported with
+  module+offset and a backtrace). 3 outranks 1. See `guest_end_status.hpp`.
 - `--frames N` — present N frames then exit 0 (non-interactive smoke; exit 1 if it couldn't).
 - `--fps` — draw the framerate over the running title. **Off by default.** See below.
 - `--present-mode fifo|mailbox|immediate` — choose swapchain latency behavior. FIFO is the default;
