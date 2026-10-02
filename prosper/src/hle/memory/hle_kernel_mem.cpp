@@ -474,7 +474,7 @@ namespace prosper {
 
 // Both touch guest memory, so each half defines them with its own fault-safety rules: a fault in
 // host HLE code kills the emulator, not just the guest.
-static void apr_write_result_slot(uint64_t addr, uint64_t value);
+static void apr_write_result_slot(uint64_t addr, uint64_t value, unsigned width = 8);
 // Diagnostic-only (PROSPER_AMPRLOG): read two guest qwords, false if not safely readable.
 static bool apr_probe_guest_pair(uint64_t addr, uint64_t out[2]);
 
@@ -764,7 +764,13 @@ static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
     uint64_t token = tag_echo ? bc.tag : prosper_apr_next_token(ring);
     if (!bound && write_result_outputs) {
         if (a2 > 0xffff) apr_write_result_slot(a2, token);
-        if (a3 > 0xffff) apr_write_result_slot(a3, token);
+        // out2 is a 32-bit submission id: sceKernelAprSubmitCommandBufferAndGetResult(cb, ring,
+        // result*, uint32_t* id). Black Flag Resynced (PPSA28183) keeps it in a 4-byte stack int
+        // (eboot+0x24511b0 zero-initialises it with a movl, reads it back with a 32-bit load and
+        // hands it to sceKernelAprWaitCommandBuffer) directly below its stack canary, so the
+        // former 8-byte store zeroed the canary's low dword and the epilogue called
+        // __stack_chk_fail (#4139 follow-up). Only the low 32 bits are the id.
+        if (a3 > 0xffff) apr_write_result_slot(a3, token, 4);
     }
     if (amprlog()) fprintf(stderr, "[amprlog] AprSubmit%s cb=0x%llx ring1b=%llu out1=0x%llx out2=0x%llx -> token=0x%llx%s%s\n",
                            write_result_outputs ? "AndGetResult" : "",
@@ -814,8 +820,9 @@ namespace prosper {
 
 // #2139: unchanged from the pre-hoist code -- a plain store, exactly as the POSIX submit path has
 // always written its result slots. The caller already rejected obviously bogus addresses (<=0xffff).
-static void apr_write_result_slot(uint64_t addr, uint64_t value) {
-    *(uint64_t*)(uintptr_t)addr = value;
+static void apr_write_result_slot(uint64_t addr, uint64_t value, unsigned width) {
+    if (width == 4) *(uint32_t*)(uintptr_t)addr = (uint32_t)value;
+    else *(uint64_t*)(uintptr_t)addr = value;
 }
 
 // #2139 POSIX sibling: process_vm_readv reports EFAULT instead of faulting (all-or-nothing per
@@ -4311,7 +4318,7 @@ namespace prosper {
 // one, so if a title ever stalls waiting on that value the log is what points at this line; a
 // silent skip would leave it looking like the write happened. Bounded so a pathological caller
 // cannot flood the log. POSIX cannot reach this state: its store faults instead of skipping.
-static void apr_write_result_slot(uint64_t addr, uint64_t value) {
+static void apr_write_result_slot(uint64_t addr, uint64_t value, unsigned width) {
     MEMORY_BASIC_INFORMATION mbi{};
     constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY |
                                 PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
@@ -4333,7 +4340,8 @@ static void apr_write_result_slot(uint64_t addr, uint64_t value) {
             fprintf(stderr, "[ampr] further APR result-slot drops suppressed\n");
         return;
     }
-    *reinterpret_cast<uint64_t*>(static_cast<uintptr_t>(addr)) = value;
+    if (width == 4) *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(addr)) = (uint32_t)value;
+    else *reinterpret_cast<uint64_t*>(static_cast<uintptr_t>(addr)) = value;
 }
 
 // #2139 Windows sibling: prove the whole pair is committed and readable before touching it.
