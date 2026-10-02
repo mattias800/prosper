@@ -6,7 +6,11 @@ full image), so a directory of 4K frame dumps montages quickly. Useful for
 scanning a gameplay capture for a specific visual artifact.
 Usage: bmp_montage.py <dir-or-glob> <out.png> [thumb=160] [cols=8]
 """
-import struct, zlib, glob, os, sys
+import struct
+import zlib
+import glob
+import os
+import sys
 
 
 def bmp_thumb(path, tw, th):

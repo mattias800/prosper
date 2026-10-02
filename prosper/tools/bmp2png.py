@@ -5,7 +5,11 @@ Handles the uncompressed 24/32-bit BGR(A) bottom-up BMPs that prosper's frame /
 texture dumps produce, so captured frames and PROSPER_DUMP_TEX outputs can be
 viewed without Pillow. Usage: bmp2png.py in.bmp [out.png]  (or a dir of *.bmp).
 """
-import struct, zlib, sys, os, glob
+import struct
+import zlib
+import sys
+import os
+import glob
 
 
 def bmp_to_png(bmp_path, png_path):
