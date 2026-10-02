@@ -448,6 +448,70 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         }
         return true;
     };
+    // Stored SPIR-V replay bypasses raw recompilation. Authenticate required read-point inputs
+    // here as well, before either replay route can consume the module. The serialized obligation
+    // can require refusal without raw provenance, but cannot grant admission or hide a code PC.
+    auto restore_owned_raw_inputs = [&](const std::shared_ptr<ShaderResourceTable>& resources,
+                                        const GpuCapturedTable& captured_table, uint32_t raw_index) {
+        const bool marked = resources && std::any_of(
+            resources->resources.begin(), resources->resources.end(),
+            [](const auto& resource) { return resource.owned_raw_snapshot_bytes != 0u; });
+        if (raw_index >= c.raw_shader_versions.size()) {
+            if (marked) {
+                error = "owned wide replay lacks exact raw shader provenance";
+                return false;
+            }
+            return true; // Older unmarked captures retain their historical stored-module route.
+        }
+        const auto& raw = c.raw_shader_versions[raw_index].words;
+        std::vector<Rdna2Inst> decoded;
+        const size_t consumed = rdna2_walk(raw.data(), raw.size(), decoded);
+        // The normal compile span can include a proven constant table after END. Match that same
+        // bounded span instead of treating data words as instructions or bypassing their proof.
+        const bool complete = consumed &&
+            rdna2_recompile_code_span(raw.data(), raw.size()) == raw.size();
+        const auto required = rdna2_owned_raw_wide_data_loads(decoded);
+        // Noncanonical trailing bytes cannot erase executable-prefix obligations merely by
+        // removing the serialized marker. They invalidate provenance for those required PCs.
+        if (((marked || !required.empty()) && !complete) || (!required.empty() && !resources)) {
+            error = "owned wide replay lacks complete raw shader or resource table";
+            return false;
+        }
+        if (!resources) return true;
+        for (const auto& resource : resources->resources)
+            if (resource.owned_raw_snapshot_bytes &&
+                !std::binary_search(required.begin(), required.end(), resource.fetch_pc)) {
+                error = "owned wide replay obligation is not proven by its raw shader";
+                return false;
+            }
+        for (uint32_t pc : required) {
+            const auto load = rdna2_decode_one(raw.data() + pc, raw.size() - pc);
+            const uint32_t bytes = load.opcode == 0x2u ? 16u : 32u;
+            const auto* source = owned_raw_snapshot_at(*resources, pc, bytes);
+            if (!source) {
+                error = "owned wide replay has missing, malformed or incomplete exact-PC backing";
+                return false;
+            }
+            const auto index = static_cast<size_t>(source - resources->resources.data());
+            const auto& captured = captured_table.resources[index];
+            if (captured.blob_index >= c.blobs.size() || captured.blob_offset != 0u ||
+                c.blobs[captured.blob_index].bytes_read < bytes) {
+                error = "owned wide replay source exceeds the actually observed capture bytes";
+                return false;
+            }
+            // Replay's blob owner lives outside the table. Restore a per-draw table owner too,
+            // so a later capture cannot fall back to guest bytes or merge distinct observations.
+            auto owner = std::make_shared<std::vector<uint8_t>>(source->host_data,
+                                                               source->host_data + bytes);
+            auto& resource = resources->resources[index];
+            resource.host_data = owner->data();
+            resource.host_data_size = owner->size();
+            resource.owned_raw_snapshot_bytes = bytes;
+            resources->owned_host_data.push_back(std::move(owner));
+            resources->owned_raw_snapshot_requirements.emplace_back(pc, bytes);
+        }
+        return true;
+    };
     out.items.reserve(c.draws.size());
     for (const auto& x : c.draws) {
         if (!x.ps_float_mode.canonical()) {
@@ -486,6 +550,20 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         d.ps_wave32 = x.ps_wave32;
         d.ps_float_mode = x.ps_float_mode;
         if (!table(x.vrt, false, d.vrt) || !table(x.prt, false, d.prt)) return false;
+        if (x.vs_chain_raw_shader_index != UINT32_MAX) {
+            const auto* prolog = x.vs_raw_shader_index < c.raw_shader_versions.size()
+                ? &c.raw_shader_versions[x.vs_raw_shader_index].words : nullptr;
+            const auto* main = x.vs_chain_raw_shader_index < c.raw_shader_versions.size()
+                ? &c.raw_shader_versions[x.vs_chain_raw_shader_index].words : nullptr;
+            if (rdna2_vertex_chain_has_owned_raw_wide_inputs(
+                    prolog ? prolog->data() : nullptr, prolog ? prolog->size() : 0u,
+                    main ? main->data() : nullptr, main ? main->size() : 0u, d.vrt.get())) {
+                error = "owned raw wide replay inputs require a direct vertex stage";
+                return false;
+            }
+        }
+        if (!restore_owned_raw_inputs(d.vrt, x.vrt, x.vs_raw_shader_index) ||
+            !restore_owned_raw_inputs(d.prt, x.prt, x.fs_raw_shader_index)) return false;
         if (d.vrt) d.vrt->vertices_per_instance = d.vertex_count;
         out.items.push_back(std::move(d));
     }
@@ -532,6 +610,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             std::any_of(x.resources.resources.begin(), x.resources.resources.end(),
                         captured_resource_has_indirect_pointer_state);
         if (!table(x.resources, true, compute.resources)) return false;
+        if (!restore_owned_raw_inputs(compute.resources, x.resources, x.raw_shader_index)) return false;
         const bool has_cf9200_no_backing =
             captured_compute_has_gta5_cf9200_no_backing(x);
         if (has_cf9200_no_backing &&

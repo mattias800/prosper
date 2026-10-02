@@ -221,7 +221,7 @@ static void codec_tests(const FragmentCompileCase& produced) {
         auto bad = wire; bad[offset] ^= 0x80;
         CHECK(error([&] { decode_fragment_compile_case(bad); }).find("checksum") != std::string::npos);
     }
-    auto schema = wire; schema[8] = 2; rechecksum(schema);
+    auto schema = wire; schema[8] = 3; rechecksum(schema);
     CHECK(error([&] { decode_fragment_compile_case(schema); }).find("schema") != std::string::npos);
     auto boolean = wire; boolean[12] = 2; rechecksum(boolean);
     CHECK(error([&] { decode_fragment_compile_case(boolean); }).find("boolean") != std::string::npos);
@@ -363,11 +363,134 @@ static void resource_tests(const FragmentCompileCase& produced) {
     FIELD(indirect_pointer_relocation.binding_bytes, 64u); FIELD(indirect_pointer_relocation.record_count, 2u);
     FIELD(indirect_pointer_relocation.segment_count, 3u); FIELD(indirect_pointer_relocation.segment_directory_byte_offset, 16u);
     FIELD(indirect_pointer_relocation.proof_fingerprint, UINT64_C(0x12345)); FIELD(scalar_buffer_dword_count, 16u);
-    FIELD(raw_register_snapshot, true);
+    FIELD(raw_register_snapshot, true); FIELD(owned_raw_snapshot_bytes, 16u);
 #undef FIELD
     auto invalid_enum = specimen; invalid_enum.resources.resources[0].cls = static_cast<ResourceClass>(999);
     CHECK(!error([&] { encode_fragment_compile_case(invalid_enum); }).empty());
     (void)produced;
+}
+static void owned_marker_tests() {
+    // Independent schema-1 wire fixture, without the current encoder or shared field walk.
+    // It is an inspectable incomplete case: no code, resource payload or semantic choices.
+    std::vector<uint8_t> legacy{'P','R','F','C','A','S','E',0};
+    const auto put = [&](uint64_t value, unsigned bytes) {
+        for (unsigned k = 0; k < bytes; ++k) legacy.push_back(uint8_t(value >> (8u * k)));
+    };
+    const auto text = [&](std::string_view value) {
+        put(value.size(), 4); legacy.insert(legacy.end(), value.begin(), value.end());
+    };
+    put(1, 4); put(0, 1); text("hand-built-v1"); text(""); text("");
+    put(0, 1); put(0x123400, 8); put(0, 4); put(0, 4); // outcome, address, code, SOURCE
+    for (unsigned k = 0; k < 3; ++k) put(0, 1); // optional input tables
+    for (unsigned k = 0; k < 35; ++k) put(0, 4); // 32 controls and three masks
+    put(0, 1); put(0, 4); put(0, 4); // consumption known, system input ena/addr
+    for (unsigned k = 0; k < 103; ++k) put(UINT32_MAX, 4); // interpolation locations
+    for (unsigned k = 0; k < 4; ++k) put(0, 4); // interpolation masks
+    put(0, 1); put(1, 1); put(0, 1); put(0, 1); put(0, 1); // geometry, valid, wave, MODE
+    put(UINT32_MAX, 4); put(0, 4); put(0, 8); put(UINT32_MAX, 4); put(UINT32_MAX, 4);
+    for (unsigned k = 0; k < 5; ++k) put(0, 4); // vertices, resources, blobs, backing, choice error
+    put(0, 4); put(0, 8); rechecksum(legacy); // choice count and checksum
+    const auto old = decode_fragment_compile_case(legacy);
+    CHECK(!old.complete && old.reason == "hand-built-v1" && old.program_address == 0x123400);
+    CHECK(old.resources.resources.empty() && old.resources.owned_raw_snapshot_requirements.empty());
+
+    for (bool wide8 : {false, true}) {
+        const uint32_t size = wide8 ? 32u : 16u, last = wide8 ? 7u : 3u;
+        // Highest parent word determines the register-offset child read. Both are ordinary
+        // scalar-address data; SOURCE consumes metadata, not the backing bytes themselves.
+        const std::vector<uint32_t> code{
+            wide8 ? 0xf40c0600u : 0xf4080600u, 0xfa000004u,
+            0xbe800380u, 0xbe810380u,
+            0x8f6b8400u | (24u + last), 0x876bff6bu, 0x1f0u,
+            wide8 ? 0xf40c0201u : 0xf4080201u, 0xd6000000u,
+            wide8 ? 0x7e00020fu : 0x7e00020bu,
+            0x7c040080u, 0xd5010001u, 128u | (242u << 9u) | (106u << 18u),
+            0xf800180fu, 0x01010101u, 0xbf810000u};
+        ShaderResourceTable table;
+        for (uint32_t k = 0; k < 2; ++k) {
+            auto allocation = std::make_shared<std::vector<uint8_t>>(size, 0x5a);
+            ShaderResource resource;
+            resource.cls = ResourceClass::ConstantBuffer; resource.format = DataFormat::Uint32;
+            resource.binding = 2u + k; resource.gpu_addr = k ? 0x300020 : 0x200004;
+            resource.size = size; resource.fetch_pc = k ? 7u : 0u;
+            resource.host_data = allocation->data(); resource.host_data_size = size;
+            resource.owned_raw_snapshot_bytes = k ? 0u : size;
+            resource.raw_register_snapshot = k != 0;
+            table.owned_host_data.push_back(std::move(allocation));
+            table.resources.push_back(resource);
+        }
+        table.owned_raw_snapshot_requirements.emplace_back(0u, size);
+        std::vector<Rdna2Inst> ins; rdna2_walk(code.data(), code.size(), ins);
+        CHECK(rdna2_owned_raw_wide_data_loads(ins) == std::vector<uint32_t>{0u});
+        const auto check_roundtrip = [&](const ShaderResourceTable& input, bool produced) {
+            const auto c = produce(code, false, &input);
+            CHECK(c.complete && c.expected_produced == produced && c.source.empty() == !produced);
+            const auto wire = encode_fragment_compile_case(c);
+            CHECK(wire[8] == 2 && wire[9] == 0 && wire[10] == 0 && wire[11] == 0);
+            const auto decoded = decode_fragment_compile_case(wire);
+            CHECK(decoded.resources.resources[0].owned_raw_snapshot_bytes ==
+                  input.resources[0].owned_raw_snapshot_bytes);
+            CHECK(decoded.resources.owned_raw_snapshot_requirements.empty());
+            CHECK(decoded.blobs[0].opaque == c.blobs[0].opaque &&
+                  (c.blobs[0].opaque ? !decoded.blobs[0].bytes :
+                      decoded.blobs[0].bytes && *decoded.blobs[0].bytes == *c.blobs[0].bytes));
+            CHECK(replay_fragment_compile_case(decoded, true) == c.source);
+            std::string refusal;
+            CHECK(replay_fragment_compile_case(decoded, false, &refusal) == c.source);
+            CHECK(produced ? refusal.empty() : !refusal.empty() && refusal == c.expected_reject);
+            return wire;
+        };
+        const auto wire = check_roundtrip(table, true);
+        auto malformed = table; malformed.resources[0].owned_raw_snapshot_bytes = wide8 ? 16u : 32u;
+        check_roundtrip(malformed, false);
+        malformed.resources[0].owned_raw_snapshot_bytes = UINT32_MAX;
+        check_roundtrip(malformed, false);
+        auto short_parent = table; short_parent.resources[0].host_data_size = size - 4u;
+        check_roundtrip(short_parent, false);
+        auto missing_parent = table; missing_parent.resources[0].host_data = nullptr;
+        missing_parent.resources[0].host_data_size = 0;
+        check_roundtrip(missing_parent, false);
+
+        // Opaque original presence is metadata, not a dummy pointer or an owned byte span.
+        auto opaque = table; opaque.owned_host_data.clear();
+        for (auto& r : opaque.resources) r.host_data = reinterpret_cast<uint8_t*>(uintptr_t(r.gpu_addr));
+        check_roundtrip(opaque, true);
+        auto opaque_bad = opaque; opaque_bad.resources[0].owned_raw_snapshot_bytes = wide8 ? 16u : 32u;
+        check_roundtrip(opaque_bad, false);
+        auto opaque_short = opaque; opaque_short.resources[0].host_data_size = size - 4u;
+        check_roundtrip(opaque_short, false);
+        auto opaque_missing = opaque; opaque_missing.resources[0].host_data = nullptr;
+        opaque_missing.resources[0].host_data_size = 0;
+        check_roundtrip(opaque_missing, false);
+        const auto opaque_case = produce(code, false, &opaque);
+        CHECK(opaque_case.complete && opaque_case.blobs.size() == 2);
+        CHECK(opaque_case.source == produce(code, false, &table).source);
+        const auto& input = opaque_case.resources.resources[0];
+        CHECK(!input.host_data && opaque_case.blobs[0].opaque && !opaque_case.blobs[0].bytes);
+        { CompilerResourceScope scope({{&input, true, false, {}}});
+          CHECK(compiler_resource_has_host_data(input));
+          CHECK(error([&] { compiler_resource_data(input, size); }).find("opaque") != std::string::npos); }
+
+        // The append-only tail's count must match the prefix's exact resource count.
+        const size_t tail = wire.size() - 8u - 4u * (1u + table.resources.size());
+        auto wrong_count = wire; wrong_count[tail] = 1; rechecksum(wrong_count);
+        CHECK(error([&] { decode_fragment_compile_case(wrong_count); }).find("marker/resource count") != std::string::npos);
+        auto huge_count = wire; huge_count[tail] = 1; huge_count[tail + 1] = 2; rechecksum(huge_count);
+        CHECK(error([&] { decode_fragment_compile_case(huge_count); }).find("count bound") != std::string::npos);
+        auto short_tail = wire; short_tail.erase(short_tail.end() - 9); rechecksum(short_tail);
+        CHECK(error([&] { decode_fragment_compile_case(short_tail); }).find("truncated") != std::string::npos);
+        auto extra_tail = wire; extra_tail.insert(extra_tail.end() - 8, 0); rechecksum(extra_tail);
+        CHECK(error([&] { decode_fragment_compile_case(extra_tail); }).find("trailing") != std::string::npos);
+
+        // A historical v1 resource has no marker. Exact code still derives its required width.
+        auto markerless = table; markerless.resources[0].owned_raw_snapshot_bytes = 0;
+        auto v1 = check_roundtrip(markerless, true);
+        const size_t v1_tail = v1.size() - 8u - 4u * (1u + markerless.resources.size());
+        v1.erase(v1.begin() + v1_tail, v1.end() - 8); v1[8] = 1; rechecksum(v1);
+        const auto decoded_v1 = decode_fragment_compile_case(v1);
+        CHECK(decoded_v1.resources.resources[0].owned_raw_snapshot_bytes == 0);
+        CHECK(replay_fragment_compile_case(decoded_v1, true) == produce(code, false, &markerless).source);
+    }
 }
 static void cache_tests() {
     const auto root = prosper_test::test_scratch_dir();
@@ -591,7 +714,7 @@ int main(int argc, char** argv) {
         } else {
             CHECK(argc == 1 || (argc == 3 && std::string_view(argv[1]) == "--dump"));
             auto c = produce(green); CHECK(c.complete);
-            codec_tests(c); resource_tests(c); cache_tests(); atomic_tests(c); mode_tests();
+            codec_tests(c); resource_tests(c); owned_marker_tests(); cache_tests(); atomic_tests(c); mode_tests();
             const auto add = arithmetic_accounting_tests();
             auto wave32 = produce(green, true); CHECK(wave32.complete && solid_green(wave32.source));
             CHECK(wave32.wave32 && !c.wave32); // width need not alter a wave-insensitive program

@@ -40,6 +40,14 @@ Unowned ordinary buffer backing is also opaque when the invocation needs metadat
 buffer allocations are retained within the aggregate budget; any actual byte consumer of opaque
 backing refuses. This is not permission to reinterpret a guest address or invent readable storage.
 
+Schema 2 appends each resource's owned raw-snapshot byte marker after the schema-1 payload. Both
+valid and malformed markers survive the codec so candidate replay retains the producing compiler's
+admission or refusal inputs. Schema-1 files remain readable with the historical zero marker.
+Code-derived draw capture requirements remain independently derived from the restored shader.
+Raw-load SOURCE admission uses the recorded backing-presence fact and exact resource shape;
+readable bytes still require the checked resource gateway. Frame replay and draw uploads retain
+their separate backing-ownership checks.
+
 The linked identity covers dirty/untracked project sources, actual GCC/Clang dependency headers,
 compiler/front-end bytes and resolved compile commands/configuration. Unsupported dependency
 syntax or unavailable compile commands produce an unknown identity, not a complete case. This is

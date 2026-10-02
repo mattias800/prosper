@@ -322,10 +322,20 @@ with tempfile.TemporaryDirectory(prefix="prosper-fragment-width-", dir=scratch_r
     known32 = directory / "fragment-width-captured32.prgcap"
     if known32.is_file():
         original = known32.read_bytes()
+        genuine65 = (len(original) > 39 and struct.unpack_from("<I", original, 8)[0] == 65 and
+                     original[-4:] == struct.pack("<I", 0))
+        check(genuine65, "current resource-free width fixture retains v65 zero owned obligations")
+        if genuine65:
+            original = bytearray(original[:-4])
+            struct.pack_into("<I", original, 8, 64)
+            original = bytes(original)
         genuine64 = (len(original) > 35 and struct.unpack_from("<I", original, 8)[0] == 64 and
                      original[-10:] == struct.pack("<I", 1) + b"\x00\x00" + struct.pack("<I", 0))
-        check(genuine64, "current width fixture retains canonical unknown-mode v64 tail")
+        check(genuine64, "official v64 prefix retains canonical unknown producing mode")
         if genuine64:
+            official64_path = directory / "fragment-width-v64.prgcap"
+            official64_path.write_bytes(original)
+            states.append(("captured32-v64", official64_path.name, 32))
             original = bytearray(original[:-10])
             struct.pack_into("<I", original, 8, 63)
             original = bytes(original)
@@ -333,20 +343,24 @@ with tempfile.TemporaryDirectory(prefix="prosper-fragment-width-", dir=scratch_r
                      original[-5:] == struct.pack("<I", 1) + b"\x02")
         check(genuine63, "known32 prefix is genuine v63 with exact one-draw Wave32 tail")
         if genuine63:
+            width63 = original
+            official63_path = directory / "fragment-width-v63.prgcap"
+            official63_path.write_bytes(width63)
+            states.append(("captured32-v63", official63_path.name, 32))
             # Relabeling alone leaves the new tail and is NOT a legacy-format fixture. Strip the
             # exact appended draw count/tag; the original known32 is now genuinely unavailable.
-            legacy = bytearray(original[:-5])
+            legacy = bytearray(width63[:-5])
             struct.pack_into("<I", legacy, 8, 62)
             legacy_path = directory / "fragment-width-v62.prgcap"
             legacy_path.write_bytes(legacy)
             states.append(("legacy62-from32", legacy_path.name, None))
             bad_captures = {
-                "count": (original[:-5] + struct.pack("<I", 2) + b"\x02",
+                "count": (width63[:-5] + struct.pack("<I", 2) + b"\x02",
                           "invalid realized-draw fragment wave count"),
-                "tag": (original[:-1] + b"\x03", "invalid realized-draw fragment wave config"),
-                "truncated": (original[:-1], "invalid realized-draw fragment wave config"),
-                "trailing": (original + b"\x00", "capture has trailing data"),
-                "relabel-only62": (original[:8] + struct.pack("<I", 62) + original[12:],
+                "tag": (width63[:-1] + b"\x03", "invalid realized-draw fragment wave config"),
+                "truncated": (width63[:-1], "invalid realized-draw fragment wave config"),
+                "trailing": (width63 + b"\x00", "capture has trailing data"),
+                "relabel-only62": (width63[:8] + struct.pack("<I", 62) + width63[12:],
                                    "capture has trailing data"),
             }
             for name, (data, error) in bad_captures.items():
@@ -361,7 +375,7 @@ with tempfile.TemporaryDirectory(prefix="prosper-fragment-width-", dir=scratch_r
                           "gpu_replay: %s: %s" % (malformed_capture, error) in done.stderr and
                           "fragment-wave=" not in done.stderr and path.read_bytes() == sentinel,
                           "%s %s malformed capture rejects before regeneration/dump" % (route, name))
-    check(len(states) == 4, "genuine legacy v62 remains an explicit matrix arm")
+    check(len(states) == 6, "official v64/v63 captured width and legacy v62 remain explicit matrix arms")
 
     for state, filename, captured_width in states:
         capture = directory / filename

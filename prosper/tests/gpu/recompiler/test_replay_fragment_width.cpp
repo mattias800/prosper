@@ -312,7 +312,7 @@ int main(int argc, char** argv) {
                   "fixture mode writes width states with production capture serialization");
             if (!error.empty()) std::fprintf(stderr, "fixture %s: %s\n", name, error.c_str());
         };
-        write("fragment-width.prgcap", capture); // canonical unavailable v63
+        write("fragment-width.prgcap", capture); // canonical unavailable current format
         capture.draws[0].fragment_wave_config_available = true;
         capture.draws[0].ps_wave32 = true;
         capture.draws[0].fs = stored64;
