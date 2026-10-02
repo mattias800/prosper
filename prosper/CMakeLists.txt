@@ -1989,6 +1989,12 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_perf_alarms
     SOURCES tests/diagnostics/test_perf_alarms.cpp
     LIBRARIES prosper_core)
+  # The run-level frame-breakdown line of the exit summary: per-flip means, the sampled cost it must
+  # exclude, the "not a partition" wording, and accumulation through the engine. Its own executable so
+  # it needs none of test_perf_alarms' HLE-dispatcher fixtures.
+  prosper_add_gtest(test_frame_breakdown
+    SOURCES tests/diagnostics/test_frame_breakdown.cpp
+    LIBRARIES prosper_core)
   # The rules' detail strings go through a printf-attributed format() helper; the attribute only
   # checks anything under -Wformat, which prosper_core does not enable, so make a mismatch an ERROR
   # for this one translation unit (the gpu_replay precedent below: GCC diagnoses this at plain
