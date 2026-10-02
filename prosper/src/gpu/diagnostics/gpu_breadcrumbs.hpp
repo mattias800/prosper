@@ -133,6 +133,11 @@ BreadcrumbVerdict resolve_breadcrumbs(const BreadcrumbTable& table, uint32_t las
 void reduce_checkpoint_values(const uint32_t* values, size_t count, uint32_t& last_started_value,
                               uint32_t& last_finished_value);
 
+// One site as text: `draw submit=42 local=4 index=17 program=0x... pipeline=0x...`. The ONE spelling of a
+// site's identity: breadcrumb verdicts and GPU debug labels both use it, so a RenderDoc or RGP marker
+// can be matched to a verdict line by eye. Numbers and hashes only.
+std::string format_breadcrumb_site(const BreadcrumbSite& site);
+
 // One report, `[gpu-breadcrumb] ...`, naming the window, its sites and the markers read. Numbers only.
 std::string format_breadcrumb_verdict(const BreadcrumbVerdict& verdict, uint32_t raw_started_value,
                                       uint32_t raw_finished_value);

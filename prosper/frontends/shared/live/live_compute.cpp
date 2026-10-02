@@ -39,6 +39,7 @@
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: how much of the heap does prosper hold?
 #include "gpu/diagnostics/gpu_breadcrumbs_vk.hpp"    // PROSPER_GPU_BREADCRUMBS: where did the GPU stop?
+#include "gpu/diagnostics/gpu_labels_vk.hpp"         // PROSPER_GPU_LABELS: guest-meaningful command labels
 #include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only images prefer VRAM
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
@@ -12329,13 +12330,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // site is built only when armed.
         auto& breadcrumbs = prosper::gpu::breadcrumb_emitter();
         uint32_t breadcrumb = 0;
-        if (breadcrumbs.active()) {
+        bool labelled = false;
+        if (breadcrumbs.active() || prosper::gpu::gpu_labels_requested()) {
             prosper::gpu::BreadcrumbSite site;
             site.kind = prosper::gpu::BreadcrumbKind::dispatch;
             site.submit_no = item.submit_no;
             site.draw_index = static_cast<uint32_t>(item.dispatch_index);
             site.program_addr = item.code_addr;
             site.pipeline_hash = std::hash<std::string>{}(pipeline_key);
+            if (prosper::gpu::gpu_labels_requested())
+                labelled = prosper::gpu::gpu_label_begin(ctx.device, command, site);
             breadcrumb = breadcrumbs.begin(command, site);
         }
         if (device_indirect) {
@@ -12347,6 +12351,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                           item.launch.groups_z);
         }
         breadcrumbs.end(command, breadcrumb);
+        if (labelled) prosper::gpu::gpu_label_end(ctx.device, command);
         if (perf_gpu_timing)
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                 ctx.dispatch_timestamp_pool, 2);

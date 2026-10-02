@@ -76,6 +76,13 @@ switched on for the run that mattered (#3533). `PROSPER_GPU_MEM_LOG=0` silences 
   assigned in recording order (not submit order), and unmarked work (transfers, barriers, presents) is
   invisible. Read the header before quoting one. It exists because a loss names the submission that
   OBSERVES it, not the one that caused it (instrument trap 170).
+- `gpu_labels_vk` — `PROSPER_GPU_LABELS`: a `VK_EXT_debug_utils` label around every draw and dispatch
+  whose text is `format_breadcrumb_site`, **the same spelling a breadcrumb verdict uses**, so a
+  RenderDoc/RGP marker can be matched to a `[gpu-breadcrumb]` line by eye. It is the command-label
+  half of naming; `vk_object_names.hpp` is the object half and still names shader modules only. Off
+  by default and free when off; an absent extension makes every call a no-op. Numbers and hashes only.
+  Tested against recording entry points, so what is proved is what is recorded, not how a capture
+  tool displays it.
 - `watch_list`, `compute_tree_watch`, `compute_parent_walk` — watching addresses and walking compute
   parentage.
 - `draw_program_skip` — naming a graphics shader program, to census it or to decline every draw

@@ -156,6 +156,10 @@ strategy, dependencies and what it deliberately does not do.
   and hashes only, never guest strings.** Zero cost off: the function pointers are not loaded.
 - **Acceptance:** a debug-messenger test checks the labels on a real (software) device; a default run
   shows no loaded debug-utils pointers.
+- **Status (command labels landed with D1):** `PROSPER_GPU_LABELS` brackets every draw and dispatch with
+  a `VK_EXT_debug_utils` label whose text is the breadcrumb site spelling. **Not done:** object names
+  beyond shader modules (buffers, images, pipelines, render targets), and no real RenderDoc or RGP
+  capture has been opened to confirm how the labels display.
 - **Enables:** D1 (shared identity), and readable captures from the existing RenderDoc in-app trigger
   (`renderdoc_capture.hpp`, #3321).
 

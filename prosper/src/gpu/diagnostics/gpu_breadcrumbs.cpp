@@ -109,15 +109,19 @@ const char* kind_name(BreadcrumbKind kind) {
     return kind == BreadcrumbKind::dispatch ? "dispatch" : "draw";
 }
 
-void append_site(std::string& out, const BreadcrumbSite& s) {
+} // namespace
+
+std::string format_breadcrumb_site(const BreadcrumbSite& s) {
     char text[160];
     std::snprintf(text, sizeof text, "%s submit=%llu local=%u index=%u program=0x%llx pipeline=0x%llx",
                   kind_name(s.kind), static_cast<unsigned long long>(s.submit_no), s.pass_local_index,
                   s.draw_index, static_cast<unsigned long long>(s.program_addr),
                   static_cast<unsigned long long>(s.pipeline_hash));
-    out += text;
+    return text;
 }
 
+namespace {
+void append_site(std::string& out, const BreadcrumbSite& s) { out += format_breadcrumb_site(s); }
 } // namespace
 
 std::string format_breadcrumb_verdict(const BreadcrumbVerdict& v, uint32_t raw_started_value,

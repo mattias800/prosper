@@ -16,6 +16,7 @@
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 #include "gpu/diagnostics/gpu_breadcrumbs_vk.hpp"    // PROSPER_GPU_BREADCRUMBS: where did the GPU stop?
+#include "gpu/diagnostics/gpu_labels_vk.hpp"         // PROSPER_GPU_LABELS: guest-meaningful command labels
 #include "gpu/memory/texture_cache_budget.hpp"  // #3873: texture budget from live headroom
 #include "gpu/memory/spill_recovery.hpp"        // #3905: rebuild spilled retained resources in VRAM
 #include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only memory prefers VRAM
@@ -14788,7 +14789,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // (instrument trap 170). The site is built only when armed: this loop is the hot path.
         auto& breadcrumbs = prosper::gpu::breadcrumb_emitter();
         uint32_t breadcrumb = 0;
-        if (breadcrumbs.active()) {
+        bool labelled = false;
+        // PROSPER_GPU_LABELS shares the site (and its text) with the breadcrumb, built once for either.
+        if (breadcrumbs.active() || prosper::gpu::gpu_labels_requested()) {
             prosper::gpu::BreadcrumbSite site;
             site.kind = prosper::gpu::BreadcrumbKind::draw;
             site.submit_no = draws[di].source_submit;
@@ -14796,6 +14799,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             site.draw_index = static_cast<uint32_t>(draws[di].draw_index);
             site.program_addr = draws[di].fs_guest_addr;
             site.pipeline_hash = draws[di].vs_identity ^ (draws[di].fs_identity * 1099511628211ull);
+            if (prosper::gpu::gpu_labels_requested())
+                labelled = prosper::gpu::gpu_label_begin(dev, cmd, site);
             breadcrumb = breadcrumbs.begin(cmd, site);
         }
         if (v.mesh_draw) {
@@ -14808,6 +14813,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                       static_cast<uint32_t>(v.vertex_offset), 0);
         }
         breadcrumbs.end(cmd, breadcrumb);
+        if (labelled) prosper::gpu::gpu_label_end(dev, cmd);
         if (geom_here) { VkDeviceSize coff = 0; p_endxfb(cmd, 0, 1, &geom_counter, &coff); }
         if (ds_active) {
             vkCmdEndQuery(cmd, ds_occ_pool, static_cast<uint32_t>(di));
