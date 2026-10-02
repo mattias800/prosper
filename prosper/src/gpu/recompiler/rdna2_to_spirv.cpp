@@ -113,6 +113,7 @@ namespace {
 // is a diagnosis worth printing. See rdna2_to_spirv.hpp for the whole contract.
 std::atomic<bool> g_float_controls_published{false};
 std::atomic<bool> g_float_controls_supported{true};
+std::atomic<uint8_t> g_float_transport_profile{0};
 
 // Each half of the gate says its own sentence once. A shared counter would let whichever device
 // published first silence the other's reason, and WHICH half failed is the actionable part: one is
@@ -160,6 +161,26 @@ void reset_float_controls_support_for_test() {
     g_float_controls_published.store(false, std::memory_order_release);
 }
 
+void publish_float_transport_config(FloatTransportConfig config) {
+    if (!config.canonical() || !config.available()) return;
+    const uint8_t offered = static_cast<uint8_t>(config.profile);
+    uint8_t previous = g_float_transport_profile.load(std::memory_order_relaxed);
+    while (true) {
+        const uint8_t next = previous == 0 ? offered : std::min(previous, offered);
+        if (g_float_transport_profile.compare_exchange_weak(
+                previous, next, std::memory_order_release, std::memory_order_relaxed)) return;
+    }
+}
+
+FloatTransportConfig published_float_transport_config() {
+    return {static_cast<FloatTransportProfile>(
+        g_float_transport_profile.load(std::memory_order_acquire))};
+}
+
+void reset_float_transport_config_for_test() {
+    g_float_transport_profile.store(0, std::memory_order_release);
+}
+
 void apply_fragment_consumption(PixelInputMapping& mapping,
                                 const uint32_t* fragment_code, size_t dwords) {
     if (!dead_varying_elimination_enabled() || !mapping.valid_mask || !fragment_code || !dwords)
@@ -170,8 +191,10 @@ void apply_fragment_consumption(PixelInputMapping& mapping,
 
 std::vector<uint32_t> recompile_interpolation_geometry(
         const FragmentInterpolationLayout& layout, bool capture_position,
-        bool synthesize_rect) {
+        bool synthesize_rect, FloatTransportConfig float_transport) {
+    if (!float_transport.canonical()) return {};
     SpirvCompute builder;
+    builder.float_transport = float_transport;
     return builder.build_interpolation_geometry(layout, capture_position, synthesize_rect);
 }
 

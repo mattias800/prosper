@@ -131,7 +131,7 @@ int main() {
     std::vector<uint8_t> bytes;
     GpuCaptureFile loaded;
     CHECK(serialize_gpu_capture(capture, bytes, error) &&
-              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 64u,
+              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 65u,
           "current realized-width tail round-trips through production codecs");
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded, replay, error) && replay.items.size() == realized.size(),
@@ -162,7 +162,8 @@ int main() {
         return 1;
     }
     const size_t mode_tail_size = 8u + 2u * realized.size();
-    const size_t tail = bytes.size() - mode_tail_size - 4u - realized.size();
+    const size_t transport_tail_size = 12u + realized.size();
+    const size_t tail = bytes.size() - transport_tail_size - mode_tail_size - 4u - realized.size();
 
     auto legacy_bytes = bytes;
     legacy_bytes.resize(tail);

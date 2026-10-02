@@ -1184,6 +1184,26 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (const auto& diagnostic : c.failure_diagnostics)
         if (!write_float_mode(diagnostic.ps_float_mode,
                               "invalid failed-draw fragment float mode")) return false;
+    // v65: append only. Unknown is tag0, not an inferred capability-off decision. Counts
+    // must match existing bounded records; every preceding capture prefix stays byte-identical.
+    const auto write_transport = [&](FloatTransportConfig config) {
+        if (!config.canonical()) { error = "invalid float transport config"; return false; }
+        w.u8(static_cast<uint8_t>(config.profile));
+        return true;
+    };
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws)
+        if (!write_transport(draw.float_transport)) return false;
+    w.u32(static_cast<uint32_t>(c.computes.size()));
+    for (const auto& compute : c.computes)
+        if (!write_transport(compute.recompile_config.float_transport)) return false;
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics) {
+        if (!write_transport(diagnostic.float_transport)) return false;
+        w.u32(static_cast<uint32_t>(diagnostic.stages.size()));
+        for (const auto& stage : diagnostic.stages)
+            if (!write_transport(stage.recompile_config.float_transport)) return false;
+    }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

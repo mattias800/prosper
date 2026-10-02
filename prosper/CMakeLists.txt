@@ -2926,6 +2926,9 @@ endif()
   add_executable(test_fragment_float_mode_capture tests/gpu/execute/test_fragment_float_mode_capture.cpp)
   target_link_libraries(test_fragment_float_mode_capture PRIVATE prosper_core)
   add_test(NAME fragment_float_mode_capture COMMAND test_fragment_float_mode_capture)
+  add_executable(test_float_transport_capture tests/gpu/execute/test_float_transport_capture.cpp)
+  target_link_libraries(test_float_transport_capture PRIVATE prosper_core)
+  add_test(NAME float_transport_capture COMMAND test_float_transport_capture)
 
   add_executable(test_gpu_capture_bundle tests/gpu/capture/test_gpu_capture_bundle.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
@@ -5561,6 +5564,12 @@ endif()
 # has to fail when the legend is dropped; nothing else in the tree can. Behavioural rather than a
 # source grep: it runs the real binary and reads what an operator would actually see.
 if(TARGET gpu_replay AND Python3_Interpreter_FOUND)
+  add_test(NAME gpu_replay_float_transport_cli
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gpu_replay/test_float_transport.py")
+  set_tests_properties(gpu_replay_float_transport_cli PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+  set_property(TEST gpu_replay_float_transport_cli APPEND PROPERTY ENVIRONMENT
+    "PROSPER_GPU_REPLAY_BIN=$<TARGET_FILE:gpu_replay>"
+    "PROSPER_FLOAT_TRANSPORT_FIXTURE_BIN=$<TARGET_FILE:test_float_transport_capture>")
   add_test(NAME gpu_replay_fragment_float_mode_cli
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/gpu_replay/test_fragment_float_mode.py")

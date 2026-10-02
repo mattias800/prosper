@@ -399,7 +399,9 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
                                                    const NggPassthroughLayout* passthrough,
                                                    bool allow_test_ngg_output_gate,
                                                    bool allow_test_ngg_one_lane,
-                                                   RecompileDiagnosticContext diagnostic) {
+                                                   RecompileDiagnosticContext diagnostic,
+                                                   FloatTransportConfig float_transport = {}) {
+    if (!float_transport.canonical()) return {};
     const uint32_t passthrough_mask =
         pixel_inputs ? pixel_inputs->effective_passthrough_mask() : 0u;
     std::vector<Rdna2Inst> ins;
@@ -412,6 +414,7 @@ static std::vector<uint32_t> recompile_vertex_impl(const uint32_t* code, size_t 
     // EVERY vertex program and the unconditional skip line could only print `reason=unrecorded`.
     // #3130 fixed exactly this for the fragment stage; the vertex half was left behind.
     b.diagnostic = diagnostic;
+    b.float_transport = float_transport;
     b.capture_position = capture_position;   // geometry-probe: mark gl_Position for xfb capture (gated)
     b.vertex_lds_dwords = std::min(virtual_lds_dwords, 16384u);
     b.vertices_per_instance = rt ? rt->vertices_per_instance : 0u;
@@ -901,9 +904,10 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
                                        const PixelInputMapping* pixel_inputs,
                                        bool capture_position,
                                        uint32_t virtual_lds_dwords,
-                                       RecompileDiagnosticContext diagnostic) {
+                                       RecompileDiagnosticContext diagnostic,
+                                       FloatTransportConfig float_transport) {
     return recompile_vertex_impl(code, dwords, rt, pixel_inputs, capture_position,
-                                 virtual_lds_dwords, nullptr, false, false, diagnostic);
+                                 virtual_lds_dwords, nullptr, false, false, diagnostic, float_transport);
 }
 
 std::vector<uint32_t> recompile_vertex_terminal_ngg_gate_for_test(
@@ -924,7 +928,8 @@ std::vector<uint32_t> recompile_vertex_chain(const uint32_t* prolog, size_t prol
                                              const PixelInputMapping* pixel_inputs,
                                              bool capture_position,
                                              uint32_t virtual_lds_dwords,
-                                             RecompileDiagnosticContext diagnostic) {
+                                             RecompileDiagnosticContext diagnostic,
+                                             FloatTransportConfig float_transport) {
     const VertexPrologInfo info = rdna2_vertex_prolog_info(prolog, prolog_dwords);
     if (!info.valid || !main || !main_dwords) return {};
 
@@ -935,14 +940,14 @@ std::vector<uint32_t> recompile_vertex_chain(const uint32_t* prolog, size_t prol
     if (passthrough.valid) {
         return recompile_vertex_impl(prolog, info.prefix_dwords, rt, pixel_inputs,
                                      capture_position, virtual_lds_dwords, &passthrough, false,
-                                     false, diagnostic);
+                                     false, diagnostic, float_transport);
     }
     std::vector<uint32_t> linked;
     linked.reserve(info.prefix_dwords + main_span);
     linked.insert(linked.end(), prolog, prolog + info.prefix_dwords);
     linked.insert(linked.end(), main, main + main_span);
     return recompile_vertex_impl(linked.data(), linked.size(), rt, pixel_inputs, capture_position,
-                                 virtual_lds_dwords, nullptr, false, false, diagnostic);
+                                 virtual_lds_dwords, nullptr, false, false, diagnostic, float_transport);
 }
 
 } // namespace prosper::gpu

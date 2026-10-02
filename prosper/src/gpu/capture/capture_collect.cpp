@@ -448,6 +448,7 @@ bool capture_failure_diagnostics(
         diagnostic.has_system_inputs = failure.has_system_inputs;
         diagnostic.ps_wave32 = failure.ps_wave32;
         diagnostic.ps_float_mode = failure.ps_float_mode;
+        diagnostic.float_transport = failure.float_transport;
         diagnostic.compute_launch = failure.compute_launch;
         for (const auto& runtime_stage : failure.stages) {
             GpuCapturedStageDiagnostic stage;
@@ -610,7 +611,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
     uint64_t raw_shader_words = 0;
     std::map<uint64_t, uint32_t> raw_shader_index_by_address;
     for (const auto& d : draws) {
-        if (!d.ps_float_mode.canonical()) {
+        if (!d.ps_float_mode.canonical() || !d.float_transport.canonical()) {
             error = "invalid realized-draw fragment float mode";
             return false;
         }
@@ -651,6 +652,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.fragment_wave_config_available = d.fragment_wave_config_available;
         c.ps_wave32 = d.ps_wave32;
         c.ps_float_mode = d.ps_float_mode;
+        c.float_transport = d.float_transport;
         if (!capture_table(d.vrt.get(), intervals, include_resource_data, false,
                            c.vrt, error, nullptr, &out) ||
             !capture_table(d.prt.get(), intervals, include_resource_data, false,

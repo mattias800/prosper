@@ -259,6 +259,7 @@ enum : uint32_t {
     // NVIDIA honoured the execution mode anyway while emitting an invalid module -- only
     // `spv_validate` (spirv-val, an instrument that does not share this header) reported it.
     Cap_SignedZeroInfNanPreserve=4466,
+    Cap_FloatControls2=6029,
     Cap_StorageBufferArrayNonUniformIndexing=5308,
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
@@ -292,6 +293,7 @@ enum : uint32_t {
     Dec_Centroid=16, Dec_Sample=17, Dec_Aliased=20, Dec_Coherent=23,
     Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35, Dec_XfbBuffer=36, Dec_XfbStride=37,
+    Dec_FPFastMathMode=40,
     // Decoration 5300 -- descriptor indexing's NonUniform, unrelated to the GroupNonUniform ops.
     Dec_NonUniform=5300,
     BI_Position=0, BI_Layer=9, BI_FragCoord=15, BI_SampleMask=20, BI_FragDepth=22, BI_HelperInvocation=23,
@@ -402,6 +404,10 @@ struct SpirvCompute {
         if (is_fragment && fragment_arithmetic_observation)
             fragment_arithmetic_observation->record(pc, family);
     }
+    FloatTransportConfig float_transport{};
+    bool float_transport_declared = false;
+    bool float_transport_warning = false;
+    void decorate_float_transport(uint32_t result);
     uint64_t fragment_program_hash = 0;
     bool fragment_float_mode_warning = false;
     void warn_fragment_float_mode_unavailable(uint32_t pc);
@@ -681,8 +687,8 @@ struct SpirvCompute {
     // VGPRs are modeled as raw 32-bit VALUES (uint). Float ops bitcast their operands uint->float and
     // bitcast the result back to uint; integer ops operate on the bits directly. This matches the
     // hardware's untyped VGPRs and lets float and integer instructions share the same register file.
-    uint32_t bcf(uint32_t u) { uint32_t r = id(); put(code, Op_Bitcast, {t_f32, r, u}); return r; }   // bits -> float
-    uint32_t bcu(uint32_t f) { uint32_t r = id(); put(code, Op_Bitcast, {t_u32, r, f}); return r; }   // float -> bits
+    uint32_t bcf(uint32_t u) { uint32_t r = id(); put(code, Op_Bitcast, {t_f32, r, u}); decorate_float_transport(r); return r; }
+    uint32_t bcu(uint32_t f) { uint32_t r = id(); put(code, Op_Bitcast, {t_u32, r, f}); decorate_float_transport(r); return r; }
     uint32_t fconstf(float f) { uint32_t b = fbits(f); auto it = fconst_cache.find(b); if (it != fconst_cache.end()) return it->second;
         uint32_t c = id(); put(types, Op_Constant, {t_f32, c, b}); fconst_cache[b] = c; return c; }
     // Float binary op on bit-operands -> bit-result.

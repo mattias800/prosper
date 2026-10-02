@@ -108,8 +108,8 @@ bool prove_fragment_neutral_selection(const FragmentNeutralSelection& graph,
         // Vulkan's default environment assumes NotInf/NotNaN for cross-float Bitcast and GLSL
         // math even under SignedZeroInfNanPreserve. A nonpoison strict predicate dependency on
         // one therefore proves its scalar operand/result finite; a random nonpoison float does
-        // NOT. Explicit overrides were excluded by the caller, not guessed from captures.
-        if (value.opcode == 12 || (value.opcode == 124 &&
+        // NOT. An explicit transport environment removes that implicit finite-domain premise.
+        if (value.opcode == 12 || (value.opcode == 124 && !value.explicit_transport &&
             (value.type == Type::Float32 || graph.values.at(value.operands[0]).type == Type::Float32))) {
             if (stable.contains(id)) finite_bits.insert(id);
             for (uint32_t operand : value.operands)
@@ -149,7 +149,7 @@ bool prove_fragment_neutral_selection(const FragmentNeutralSelection& graph,
             else result.nonpoison = all_nonpoison;
         } else if (value.opcode == 83 && exact_type) result = arg(0);
         else if (value.opcode == 124) {
-            result.nonpoison = all_nonpoison && (arg(0).finite_bits ||
+            result.nonpoison = all_nonpoison && (value.explicit_transport || arg(0).finite_bits ||
                 (value.type == Type::Int32 && graph.values.at(value.operands[0]).type == Type::Int32));
             result.finite_bits = arg(0).finite_bits && result.nonpoison;
         }

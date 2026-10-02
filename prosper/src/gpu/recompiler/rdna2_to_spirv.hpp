@@ -19,6 +19,7 @@
 #include <vector>
 #include "gpu/recompiler/fragment_float_mode.hpp"
 #include "gpu/recompiler/fragment_arithmetic_observation.hpp"
+#include "gpu/recompiler/float_transport_config.hpp"
 
 namespace prosper::gpu {
 
@@ -542,7 +543,7 @@ bool dead_varying_elimination_enabled();
 // capture flag decorates this final pre-rasterization stage for the geometry diagnostic only.
 std::vector<uint32_t> recompile_interpolation_geometry(
     const FragmentInterpolationLayout& layout, bool capture_position = false,
-    bool synthesize_rect = false);
+    bool synthesize_rect = false, FloatTransportConfig float_transport = {});
 
 // Translate a straight-line float-VALU RDNA2 stream to a compute-shader SPIR-V module.
 // Returns {} if the stream contains an opcode/format this stage does not yet handle. An optional
@@ -613,6 +614,7 @@ struct ComputeShaderConfig {
     // packed float format natively. The generated shader packs/unpacks the guest word in SPIR-V,
     // avoiding the portable but much wider RGBA32_UINT CPU-conversion interchange format.
     bool packed_r11_storage = true;
+    FloatTransportConfig float_transport{};
 };
 
 // Translate a game compute program without the synthetic binding-0 input / binding-1 output used by
@@ -657,7 +659,8 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          RecompileDiagnosticContext diagnostic = {
                                              RecompileDiagnosticStage::Fragment, 0},
                                          FragmentFloatMode float_mode = {},
-                                         FragmentArithmeticObservation* arithmetic_observation = nullptr);
+                                         FragmentArithmeticObservation* arithmetic_observation = nullptr,
+                                         FloatTransportConfig float_transport = {});
 
 // Test hook for the low-half EXEC/VCC mask path. Production fragment compilation supplies the same
 // mode from SPI_PS_IN_CONTROL.PS_W32_EN.
@@ -851,7 +854,8 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
                                        bool capture_position = false,
                                        uint32_t virtual_lds_dwords = 0,
                                        RecompileDiagnosticContext diagnostic = {
-                                           RecompileDiagnosticStage::Vertex, 0});
+                                           RecompileDiagnosticStage::Vertex, 0},
+                                       FloatTransportConfig float_transport = {});
 
 // Recompile a separately-installed vertex-fetch prolog and its main shader as one architectural
 // program. The validated tail transfer is replaced by fallthrough, preserving every SGPR/VGPR value
@@ -864,7 +868,8 @@ std::vector<uint32_t> recompile_vertex_chain(const uint32_t* prolog, size_t prol
                                              bool capture_position = false,
                                              uint32_t virtual_lds_dwords = 0,
                                              RecompileDiagnosticContext diagnostic = {
-                                                 RecompileDiagnosticStage::Vertex, 0});
+                                                 RecompileDiagnosticStage::Vertex, 0},
+                                             FloatTransportConfig float_transport = {});
 
 // Test hook: allow a tiny synthetic NGG shader to reach the terminal EXEC-gated export lowering so
 // Vulkan tests can execute both active and inactive outcomes. Production recompile_vertex keeps that

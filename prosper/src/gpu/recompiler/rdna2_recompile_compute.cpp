@@ -615,6 +615,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
                                         const ComputeShaderConfig& config,
                                         RecompileDiagnosticContext diagnostic) {
+    if (!config.float_transport.canonical()) return {};
     const bool has_null_guarded_raw_store = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
                     is_proven_null_guarded_raw_store);
@@ -693,6 +694,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     SpirvCompute b;
     b.atomicized_lds_store_pcs = lds_fminmax_synchronization.atomicized_store_pcs;
     b.diagnostic = diagnostic;
+    b.float_transport = config.float_transport;
     b.gta5_selected_sbuffer_dispatch_validated = has_selected_sbuffer_descriptor;
     if (selected_sbuffer_descriptor && has_selected_sbuffer_descriptor)
         b.gta5_selected_sbuffer_soffset = selected_sbuffer_descriptor->selected_sbuffer_soffset;

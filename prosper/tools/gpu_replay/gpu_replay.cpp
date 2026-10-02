@@ -66,6 +66,15 @@ bool select_fragment_wave_size(const char* mode,
     return true;
 }
 
+void report_float_transport(const char* mode, prosper::gpu::FloatTransportConfig config,
+                            const char* record, uint64_t index) {
+    std::fprintf(stderr, "[%s] float-transport=%s source=%s %s=%llu; producing host profile, "
+                         "not guest FLOAT_MODE or replay device support\n", mode,
+                 prosper::gpu::float_transport_profile_name(config),
+                 config.available() ? "captured" : "legacy-unknown", record,
+                 static_cast<unsigned long long>(index));
+}
+
 void report_fragment_wave_size(const char* mode, const prosper::gpu::DrawItem& draw,
                               const prosper::tools::ReplayFragmentWaveSelection& selection) {
     const char* captured = draw.fragment_wave_config_available
@@ -85,6 +94,7 @@ void report_fragment_wave_size(const char* mode, const prosper::gpu::DrawItem& d
     else
         std::fprintf(stderr, "[%s] fragment-float-mode=unavailable source=legacy-unknown draw=%llu\n",
                      mode, static_cast<unsigned long long>(draw.draw_index));
+    report_float_transport(mode, draw.float_transport, "draw", draw.draw_index);
 }
 
 void usage(const char* argv0) {
@@ -905,6 +915,9 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                         static_cast<unsigned>(d.ps_float_mode.value));
         else
             std::printf("  ps-float-mode captured=unavailable (guest semantics unverified)\n");
+        std::printf("  float-transport=%s source=%s (producing host profile, not replay device support)\n",
+                    prosper::gpu::float_transport_profile_name(d.float_transport),
+                    d.float_transport.available() ? "captured" : "legacy-unknown");
         // Resolved SPI_PS_INPUT_CNTL linkage (see pixel_input_linkage.hpp): which producer PARAM
         // slot each pixel-shader input actually reads, or whether the interpolator synthesizes a
         // constant instead. Retained since capture v36; older captures print `none` rather than
@@ -1014,6 +1027,9 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                         reinterpret_cast<const uint8_t*>(c.spirv.data()), c.spirv.size() * 4)),
                     raw_available ? "yes" : "no");
         if (c.recompile_config_available) {
+            std::printf("    float-transport=%s source=%s (producing host profile)\n",
+                        prosper::gpu::float_transport_profile_name(c.recompile_config.float_transport),
+                        c.recompile_config.float_transport.available() ? "captured" : "legacy-unknown");
             std::printf("    compute-contract program=%016llx native-storage-formats=%08x\n",
                         static_cast<unsigned long long>(c.code_addr),
                         c.recompile_config.native_storage_format_support);
@@ -3126,11 +3142,14 @@ int main(int argc, char** argv) {
                     const auto& main = replay.raw_shader_versions[it.vs_chain_raw_shader_index];
                     vs = prosper::gpu::recompile_vertex_chain(
                         raw.words.data(), raw.words.size(), main.words.data(), main.words.size(),
-                        it.vrt.get(), pixel_inputs, false, it.vertex_lds_dwords);
+                        it.vrt.get(), pixel_inputs, false, it.vertex_lds_dwords,
+                        {prosper::gpu::RecompileDiagnosticStage::Vertex, 0}, it.float_transport);
                 } else {
                     vs = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
                                                         it.vrt.get(), pixel_inputs, false,
-                                                        it.vertex_lds_dwords);
+                                                        it.vertex_lds_dwords,
+                                                        {prosper::gpu::RecompileDiagnosticStage::Vertex, 0},
+                                                        it.float_transport);
                 }
             } else ++vs_kept;
             if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
@@ -3145,10 +3164,11 @@ int main(int argc, char** argv) {
                         raw.words.data(), raw.words.size(), it.prt.get(), system_inputs,
                         UINT32_MAX, &interpolation, fragment_wave.wave32(),
                         {prosper::gpu::RecompileDiagnosticStage::Fragment, 0},
-                        it.ps_float_mode);
+                        it.ps_float_mode, nullptr, it.float_transport);
                     if (interpolation.requires_geometry && it.ps.topology >= 3u &&
                         it.ps.topology <= 5u)
-                        gs = prosper::gpu::recompile_interpolation_geometry(interpolation);
+                        gs = prosper::gpu::recompile_interpolation_geometry(
+                            interpolation, false, false, it.float_transport);
                 }
             } else ++fs_kept;
             if (!vs.empty() && !fs.empty() && (!requires_geometry || !gs.empty())) {
@@ -3278,11 +3298,14 @@ int main(int argc, char** argv) {
                         replay.raw_shader_versions[it.vs_chain_raw_shader_index];
                     xfb = prosper::gpu::recompile_vertex_chain(
                         raw.words.data(), raw.words.size(), main.words.data(), main.words.size(),
-                        it.vrt.get(), pixel_inputs, true, it.vertex_lds_dwords);
+                        it.vrt.get(), pixel_inputs, true, it.vertex_lds_dwords,
+                        {prosper::gpu::RecompileDiagnosticStage::Vertex, 0}, it.float_transport);
                 } else {
                     xfb = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
                                                          it.vrt.get(), pixel_inputs, true,
-                                                         it.vertex_lds_dwords);
+                                                         it.vertex_lds_dwords,
+                                                         {prosper::gpu::RecompileDiagnosticStage::Vertex, 0},
+                                                         it.float_transport);
                 }
                 if (xfb.empty()) {
                     std::fprintf(stderr, "[geom-probe] draw %llu: xfb re-recompile produced no VS "
@@ -3346,7 +3369,7 @@ int main(int argc, char** argv) {
                                                            UINT32_MAX, &interpolation,
                                                            fragment_wave.wave32(),
                                                            {prosper::gpu::RecompileDiagnosticStage::Fragment,
-                                                            0}, it.ps_float_mode);
+                                                            0}, it.ps_float_mode, nullptr, it.float_transport);
                 if (!fs.empty()) {
                     it.set_fs(std::move(fs));
                     std::fprintf(stderr,
@@ -3743,7 +3766,8 @@ int main(int argc, char** argv) {
                 prolog.words.data(), prolog.words.size(), main.words.data(), main.words.size(),
                 resources, pixel_inputs, exact && failure.capture_vertex_position,
                 exact ? failure.vertex_lds_dwords : 0u,
-                {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr});
+                {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr},
+                failure.float_transport);
         }
         const std::string reason = spirv.empty()
             ? prosper::gpu::last_terminal_reject_reason(main_stage.program_addr) : "";
@@ -3817,6 +3841,10 @@ int main(int argc, char** argv) {
         }
         const auto& failure = replay.failure_diagnostics[static_cast<size_t>(failure_index)];
         const auto& stage = failure.stages[static_cast<size_t>(stage_index)];
+        report_float_transport("retry-failed-stage",
+            stage.stage == prosper::gpu::ShaderProgramStage::Compute
+                ? stage.recompile_config.float_transport : failure.float_transport,
+            "failure", static_cast<uint64_t>(failure_index));
         if (std::getenv("PROSPER_SHADER_DUMP_SUCCESS") &&
             stage.stage != prosper::gpu::ShaderProgramStage::Compute)
             std::fprintf(stderr,
@@ -3845,7 +3873,9 @@ int main(int argc, char** argv) {
         switch (stage.stage) {
             case prosper::gpu::ShaderProgramStage::Vertex:
                 spirv = prosper::gpu::recompile_vertex(
-                    raw.words.data(), raw.words.size(), resources);
+                    raw.words.data(), raw.words.size(), resources, nullptr, false, 0,
+                    {prosper::gpu::RecompileDiagnosticStage::Vertex, stage.program_addr},
+                    failure.float_transport);
                 break;
             case prosper::gpu::ShaderProgramStage::Fragment: {
                 // v61 carries the same pixel/system-input and wave ABI used by live compilation.
@@ -3879,7 +3909,7 @@ int main(int argc, char** argv) {
                     failure.fragment_retry_config_available ? &interpolation : nullptr,
                     failure.fragment_retry_config_available && failure.ps_wave32,
                     {prosper::gpu::RecompileDiagnosticStage::Fragment, stage.program_addr},
-                    failure.ps_float_mode);
+                    failure.ps_float_mode, nullptr, failure.float_transport);
                 break;
             }
             case prosper::gpu::ShaderProgramStage::Compute:

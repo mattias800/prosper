@@ -1242,7 +1242,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                                          bool fragment_wave32 = false,
                                          bool capture_position = false,
                                          const SharedShaderAnalysis& captured_analysis = {},
-                                         FragmentFloatMode fragment_float_mode = {}) {
+                                         FragmentFloatMode fragment_float_mode = {},
+                                         FloatTransportConfig float_transport = {}) {
     ShaderCompileKey key;
     key.resources = ShaderKeyResourceScratch::acquire();
     key.stage = stage;
@@ -1263,6 +1264,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     key.fragment_wave32 = stage == ShaderProgramStage::Fragment && fragment_wave32;
     key.fragment_float_mode = stage == ShaderProgramStage::Fragment
         ? fragment_float_mode : FragmentFloatMode{};
+    key.float_transport = compute_config ? compute_config->float_transport : float_transport;
     key.has_compute_config = stage == ShaderProgramStage::Compute && compute_config;
     if (key.has_compute_config) {
         key.compute_user_sgpr_count = static_cast<uint32_t>(compute_config->user_sgprs.size());
@@ -1510,12 +1512,12 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
                                      key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
                                      key.capture_position,
                                      key.vertex_lds_dwords,
-                                     {RecompileDiagnosticStage::Vertex, program_address})
+                                     {RecompileDiagnosticStage::Vertex, program_address}, key.float_transport)
             : recompile_vertex(code, code_size, resources,
                                key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
                                key.capture_position,
                                key.vertex_lds_dwords,
-                               {RecompileDiagnosticStage::Vertex, program_address});
+                               {RecompileDiagnosticStage::Vertex, program_address}, key.float_transport);
     if (stage == ShaderProgramStage::Fragment) {
         const FragmentInterpolationLayout interpolation = fragment_interpolation_layout(
             code, code_size,
@@ -1526,7 +1528,7 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
                                   key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX,
                                   &interpolation, key.fragment_wave32,
                                   {RecompileDiagnosticStage::Fragment, program_address},
-                                  key.fragment_float_mode, arithmetic_observation);
+                                  key.fragment_float_mode, arithmetic_observation, key.float_transport);
     }
     return {};
 }
@@ -1933,9 +1935,9 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
         bool fragment_wave32, uint32_t vertex_lds_dwords,
         bool vertex_capture_position,
         const SharedShaderAnalysis& captured_analysis,
-        FragmentFloatMode fragment_float_mode) {
+        FragmentFloatMode fragment_float_mode, FloatTransportConfig float_transport) {
     if (cache_identity) *cache_identity = 0;
-    if (!fragment_float_mode.canonical()) {
+    if (!fragment_float_mode.canonical() || !float_transport.canonical()) {
         if (stage == ShaderProgramStage::Fragment)
             observe_fragment_arithmetic({}, reinterpret_cast<uintptr_t>(code), false);
         return {};
@@ -1944,7 +1946,7 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
                                                    system_inputs, nullptr, 0,
                                                    vertex_lds_dwords, nullptr,
                                                    fragment_wave32, vertex_capture_position,
-                                                   captured_analysis, fragment_float_mode);
+                                                   captured_analysis, fragment_float_mode, float_transport);
     // Guest memory is 1:1-mapped, so the caller's code pointer IS the guest program address; it must
     // be captured here because the key owns a copy of the words rather than pointing at them.
     const uint64_t program_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(code));
@@ -1971,10 +1973,11 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
         const uint32_t* main, size_t main_dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
         uint64_t* cache_identity, uint32_t vertex_lds_dwords,
-        bool capture_position) {
+        bool capture_position, FloatTransportConfig float_transport) {
+    if (!float_transport.canonical()) return {};
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Vertex, prolog, prolog_dwords, resources, pixel_inputs, nullptr,
-        main, main_dwords, vertex_lds_dwords, nullptr, false, capture_position);
+        main, main_dwords, vertex_lds_dwords, nullptr, false, capture_position, {}, {}, float_transport);
     if (!key.chain_code) {
         if (cache_identity) *cache_identity = 0;
         return {};
@@ -2001,11 +2004,11 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
         bool fragment_wave32, uint32_t vertex_lds_dwords,
         bool vertex_capture_position,
         const SharedShaderAnalysis& captured_analysis,
-        FragmentFloatMode fragment_float_mode) {
+        FragmentFloatMode fragment_float_mode, FloatTransportConfig float_transport) {
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
         stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity,
         fragment_wave32, vertex_lds_dwords, vertex_capture_position, captured_analysis,
-        fragment_float_mode);
+        fragment_float_mode, float_transport);
     return words ? *words : std::vector<uint32_t>{};
 }
 
@@ -8701,6 +8704,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
         }
 
         ComputeShaderConfig config;
+        config.float_transport = published_float_transport_config();
         config.compute_pgm_rsrc1 = rd(ds.sh, P::COMPUTE_PGM_RSRC1);
         config.user_sgprs.assign(sgprs, sgprs + std::min(user_count, kUserSgprs));
         config.local_x = launch.local_x;

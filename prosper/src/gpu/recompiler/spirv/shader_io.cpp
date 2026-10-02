@@ -130,6 +130,7 @@ uint32_t SpirvCompute::frag_input(uint32_t attr) {
 uint32_t SpirvCompute::interp_read(uint32_t attr, uint32_t chan) {
         uint32_t v = frag_input(attr);
         uint32_t vec = id(); put(code, Op_Load, {t_v4f, vec, v});
+        decorate_float_transport(vec);
         uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, vec, chan}); return bcu(e);
     }
 
@@ -153,6 +154,7 @@ uint32_t SpirvCompute::interp_parameter(uint32_t attr, uint32_t chan, uint32_t s
             in_varying[0x10000u | location] = variable; iface.push_back(variable);
         }
         uint32_t vec = id(); put(code, Op_Load, {t_v4f, vec, variable});
+        decorate_float_transport(vec);
         uint32_t element = id(); put(code, Op_CompositeExtract, {t_f32, element, vec, chan});
         return bcu(element);
     }
@@ -178,6 +180,7 @@ uint32_t SpirvCompute::system_interpolation_component(uint32_t field, uint32_t c
             in_varying[0x20000u | location] = variable; iface.push_back(variable);
         }
         uint32_t vec = id(); put(code, Op_Load, {t_v4f, vec, variable});
+        decorate_float_transport(vec);
         uint32_t element = id(); put(code, Op_CompositeExtract, {t_f32, element, vec, component});
         return bcu(element);
     }
@@ -192,6 +195,7 @@ uint32_t SpirvCompute::fragcoord_var() {
 
 uint32_t SpirvCompute::fragcoord_component(uint32_t component) {
         uint32_t value = id(); put(code, Op_Load, {t_v4f, value, fragcoord_var()});
+        decorate_float_transport(value);
         uint32_t scalar = id(); put(code, Op_CompositeExtract, {t_f32, scalar, value, component});
         return bcu(scalar);
     }
