@@ -75,8 +75,26 @@ $env:PROSPER_BOOTPHASE='1'; $env:PROSPER_EXIT_ON_GUEST_END='1'
 
 Unexplained and not yet shown to matter:
 
-- An init function (`0x5d4000020`, fault `rip=0x5d4234ab0`, host code) takes an access violation at
-  address 0 and boot continues (`continuing`).
+- The init-function fault (`init fn 0x5d4000020 faulted ... addr=0x0 rip=0x5d4234ab0`, #4139) is
+  **not benign and is now explained, but not fixed**. `0x5d4000000` is `libaegir_f.prx`; `0x5d4000020`
+  is its module entry (a crt start that walks `DT_INIT_ARRAY`, so the rest of that array is skipped
+  after the fault). The faulting code is a static constructor at image `+0x234a70` that calls the
+  title's pooled allocator (`+0xb6f70`, which falls to `+0x1e90`). On a first allocation that
+  allocator reserves a 1 GiB arena through the import `WLABcNu8BnU`, which resolves to
+  `libmemorywrapper_f.prx` (`0x5d0000000`). That export is a thin dispatcher: when the module's callback
+  table (`+0xc018`) is zero it returns 0, the allocator returns NULL, and the constructor stores through
+  it (`mov %rax,(%rax)` with `rax = 0`). The table is only filled by `libmemorywrapper_f`'s own init
+  export (`d1C59AHrOPI`, `+0xd0`), which no linked module imports, so the title has to call it itself.
+  prosper links both root-level PRXs as boot-time dependencies and runs every init before the eboot
+  starts, in ascending name order (`libaegir_f` before `libmemorywrapper_f`), so the guest has not yet
+  had a chance. The eboot carries the strings `/app0/libmemorywrapper_f.prx` and `libaegir_f.prx`,
+  which suggests the title loads both itself with `sceKernelLoadStartModule` (initialising the wrapper
+  first) and that deferring auto-linked modules' init until that call would be the faithful fix. Not
+  verified: no run got far enough to observe a `sceKernelLoadStartModule` call, because both an
+  unmodified and an aegir-init-skipped run die later at `__stack_chk_fail` during `sceUltInitialize`.
+  That change would alter init timing for every title that auto-links a module, so it needs a
+  cross-title census before landing. Evidence: gdb and disassembly of the SELF modules flattened with
+  `tools/il2cpp/prx_to_elf.py`, 2026-10-02, main `4a2ea88d` plus #4129 and #4137.
 - `scePthreadAttrGetstack` is unimplemented and returns 0 without filling its outputs. The
   `SystemLogger` thread called it right before the crash; that is a suspicion, not a result.
 - Unimplemented calls returning 0, names from `ps5rs/data/nids.csv`: `kqueue`, `kevent`
