@@ -5,7 +5,6 @@ frontends/dialog_sdl3/test_dialog_helpers.cpp
 frontends/pad_sdl3/test_pad_sdl3.cpp
 frontends/prosper-app/test_capture_schedule.cpp
 frontends/prosper-app/test_fps_hud.cpp
-frontends/prosper-app/test_frame_grab_match.cpp
 frontends/prosper-app/test_frame_grab_naming.cpp
 frontends/prosper-app/test_game_library.cpp
 frontends/prosper-app/test_game_path.cpp
