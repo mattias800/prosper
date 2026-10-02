@@ -18,9 +18,11 @@
 //     thread, and the handle every other call accepts are the SAME value. Windows guest entry stays
 //     behind the native start gate until registration and the output-handle write are complete.
 //   * Readable: the object is ordinary host memory and its first dword is the thread id. Objects
-//     are pooled and never returned to the OS, so a stale handle reads zeros, never unmapped memory.
-//   * Validated: a value that is not a live handle resolves to nothing (the caller returns ESRCH)
-//     instead of being cast to a `pthread_t` and handed to winpthreads.
+//     are pooled and never returned to the OS. Free slots read zero; a slot may later be reused for
+//     another thread, so a spent handle must not be used after join/detached exit.
+//   * Validated: a value absent from the live table resolves to nothing (the caller returns ESRCH)
+//     instead of being cast to a `pthread_t` and handed to winpthreads. Like native pthread handles,
+//     a stale address reused by a new owner is not distinguishable from that new owner's handle.
 //   * Adopted: scePthreadSelf on a thread scePthreadCreate never made (the guest main thread, a
 //     driver worker) yields a stable handle flagged `adopted`; joining it from another thread or
 //     detaching it is EINVAL. Self-join retains EDEADLK. Native key cleanup retires adopted workers.

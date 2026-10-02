@@ -57,6 +57,7 @@ constexpr uint64_t kBareEINVAL    = 22;
 std::atomic<uint64_t> g_child_self{0};
 std::atomic<bool> g_child_started{false};
 std::atomic<bool> g_child_release{false};
+std::atomic<uintptr_t> g_child_stack_marker{0};
 #ifdef _WIN32
 bool g_entry_before_publication = false;
 void hold_creation_before_registration() {
@@ -70,6 +71,8 @@ void hold_creation_before_registration() {
 // Body outside the ABI shim and noinline: see test_pthread_names.cpp for the WinLibs assembler bug
 // this works around (#2142).
 __attribute__((noinline)) void* child_body(bool wait_for_release) {
+    volatile uint64_t stack_marker = 0;
+    g_child_stack_marker.store((uintptr_t)&stack_marker, std::memory_order_release);
     HleFn self = Hle::lookup(nid_hash("scePthreadSelf"));
     g_child_self.store(self(0, 0, 0, 0, 0, 0), std::memory_order_release);
     g_child_started.store(true, std::memory_order_release);
@@ -89,6 +92,7 @@ void reset_child() {
     g_child_self.store(0);
     g_child_started.store(false);
     g_child_release.store(false);
+    g_child_stack_marker.store(0);
 }
 
 void wait_started() {
@@ -199,6 +203,10 @@ int main() {
     attr_base((uint64_t)(uintptr_t)&attr, (uint64_t)(uintptr_t)&stack_base, 0, 0, 0, 0);
     attr_size((uint64_t)(uintptr_t)&attr, (uint64_t)(uintptr_t)&stack_size, 0, 0, 0, 0);
     CHECK(stack_base && stack_size, "created worker query reports real nonempty stack bounds");
+    const uintptr_t marker = g_child_stack_marker.load(std::memory_order_acquire);
+    const uintptr_t low = (uintptr_t)stack_base;
+    CHECK(marker >= low && marker - low < stack_size && marker != 0,
+          "queried worker bounds contain its independently observed stack-local address");
     CHECK(attr_get(3, (uint64_t)(uintptr_t)&attr, 0, 0, 0, 0) == kBareESRCH,
           "AttrGet refuses an invalid guest handle with bare ESRCH");
     void* preserved_base = nullptr;
