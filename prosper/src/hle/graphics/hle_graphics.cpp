@@ -1450,19 +1450,13 @@ HLE(g_vo_configure_output) {
     return 0;
 }
 
-// sceVideoOutGetOutputStatus (utPrVdxio-8): (handle, status*). The full out-struct layout has NO
-// reference (Kyty predates it, shadPS4 only stubs the name), but the ONE consumer in the wild is
-// now RE'd (issue #82; DOLL/PPSA17942 swapchain-init, eboot+0x2226fea..0x2227042, gdb-captured):
-// it reads a single u32 at status+0x04 and compares it to 2 — the ==2 branch (together with two
-// runtime capability checks) switches the display pipe to an HDR pixel format
-// (0x8100070400000000) — i.e. status+0x04 is the output's dynamic-range/colorimetry mode with
-// 2 = HDR. Previously we returned success with the struct UNWRITTEN, so the caller consumed
-// uninitialized stack (usually != 2 -> SDR by luck — the classic success+garbage-out hazard).
-// Write a defined 8-byte {u32 state=0, u32 mode} prefix: mode 0 by default (the SDR path,
-// matching prosper's default SDR-only display) and mode 2 under PROSPER_HDR (the --hdr opt-in).
-// 8 bytes cannot overrun any plausible real struct (the DOLL caller reserves 0x50 stack bytes
-// for it). CONFIDENCE: MED on field semantics (single consumer, unambiguous read), HIGH that a
-// defined write beats garbage.
+// sceVideoOutGetOutputStatus (utPrVdxio-8): (handle, status*). The first u32 describes resolution
+// (#4031); derive it from the same selected mode as GetResolutionStatus and the vblank grid.
+// display_mode.hpp records the known enum mappings and the UNKNOWN policy for unproven modes.
+// +4 is the dynamic-range mode: DOLL/PPSA17942's measured swapchain-init consumer compares it
+// to 2 before selecting an HDR format (issue #82). Preserve SDR0 / PROSPER_HDR2 independently
+// of resolution. The complete struct layout remains unverified: write only the known 8-byte
+// prefix and leave the tail untouched.
 HLE(g_vo_get_output_status) {
     vo_argtrace("GetOutputStatus", a0,a1,a2,a3,a4,a5);
     if (!a1)
@@ -1470,7 +1464,8 @@ HLE(g_vo_get_output_status) {
     VideoOutHandleGuard handle(a0);
     if (!handle.valid()) return kVoErrorInvalidHandle;
     if (a1 > 0xffffull) {
-        *(uint32_t*)(uintptr_t)a1       = 0;   // +0x00: output state (0 = the boring/default state)
+        *(uint32_t*)(uintptr_t)a1 = prosper::hle::graphics::output_resolution_prefix(
+            advertised_display_mode());
         // +0x04: dynamic-range mode (2 = HDR; 0 = SDR — the DOLL-RE'd field, issue #82).
         *(uint32_t*)(uintptr_t)(a1 + 4) = prosper_hdr_output() ? 2u : 0u;
     }
