@@ -14,6 +14,7 @@
 #endif
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "hle/kernel/guest_thread_handle.hpp"   // Windows: guest-readable ScePthread objects
 #include "hle/kernel/sce_errno.hpp"
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not remove the fairness yield
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
@@ -243,6 +244,14 @@ namespace {
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+
+// Guest-visible thread handles (see guest_thread_handle.hpp).
+using prosper::hle::guest_thread_handle_create;
+using prosper::hle::guest_thread_handle_detached;
+using prosper::hle::guest_thread_handle_exited;
+using prosper::hle::guest_thread_handle_joined;
+using prosper::hle::guest_thread_handle_resolve;
+using prosper::hle::guest_thread_handle_self;
 
 namespace prosper {
 
@@ -1771,7 +1780,7 @@ HLE(k_pthread_once) {
 // Return the real host thread handle as the Sony ScePthread — unique and stable per
 // thread, used as an opaque id (stored/compared, not dereferenced). A constant here
 // collides across threads and breaks per-thread lookups (GC, TLS).
-HLE(k_pthread_self) { return (uint64_t)pthread_self(); }
+HLE(k_pthread_self) { return guest_thread_handle_self(); }
 HLE(k_pthread_equal){ return (uint64_t)(a0 == a1); }
 HLE(k_pthread_yield){ sched_yield(); return 0; }
 
@@ -2195,8 +2204,10 @@ HLE(k_log_attr_setschedparam) { // scePthreadAttrSetschedparam(attr, SchedParam*
 HLE(k_pthread_getname) {
     if (!a0) return 3;    // ESRCH
     if (!a1) return 14;   // EFAULT
+    pthread_t host_thread{};
+    if (!guest_thread_handle_resolve(a0, &host_thread)) return 3;
     std::array<char, kGuestThreadNameSize> name{};
-    if (!get_guest_thread_name(a0, name)) return 3;
+    if (!get_guest_thread_name((uint64_t)(uintptr_t)host_thread, name)) return 3;
     memcpy((void*)(uintptr_t)a1, name.data(), name.size());
     return 0;
 }
@@ -2205,7 +2216,9 @@ HLE(k_pthread_rename) {
     if (!a0) return 22;  // EINVAL
     if (!a1) return 0;   // Sony accepts a null name as a no-op
     const char* name = (const char*)(uintptr_t)a1;
-    if (!set_guest_thread_name(a0, name)) return 3;
+    pthread_t host_thread{};
+    if (!guest_thread_handle_resolve(a0, &host_thread)) return 3;
+    if (!set_guest_thread_name((uint64_t)(uintptr_t)host_thread, name)) return 3;
     return 0;
 }
 
@@ -2479,6 +2492,7 @@ void* win_thread_trampoline(void* p) {
     unregister_thread_stack((uint64_t)GetCurrentThreadId());   // ids recycle; stale bounds = wrong bounds
     unregister_thread_stack(guest_thread);
     unregister_current_thread_handle(guest_thread);
+    guest_thread_handle_exited(pthread_self());
     retire_guest_thread_name(guest_thread, name_generation);
     return rv;
 }
@@ -2580,7 +2594,9 @@ HLE(k_pthread_create) {
     (void)publish_guest_thread_name((uint64_t)(uintptr_t)tid, ts->name_generation, ts->name);
     ts->name_published.store(true, std::memory_order_release);
 #endif
-    if (a0) *(uint64_t*)a0 = (uint64_t)tid;
+    // The guest dereferences this value (see guest_thread_handle.hpp), so it is not the host id on
+    // Windows. Linux/macOS keep the raw pthread_t, which is already a readable pointer there.
+    if (a0) *(uint64_t*)a0 = guest_thread_handle_create(tid);
     return 0;
 }
 // Spawn a guest-code thread through the EXACT path scePthreadCreate uses, with an explicit
@@ -2603,13 +2619,21 @@ int guest_thread_spawn(uint64_t entry, uint64_t arg, const char* name,
     attr.supplied_stack = guest_stack;
     attr.supplied_stack_size = guest_stack_size;
     void* attr_ptr = &attr;
-    uint64_t tid = 0;
+    uint64_t guest_handle = 0;
     t_pending_guest_thread_hooks = hooks;
-    const uint64_t rc = k_pthread_create((uint64_t)(uintptr_t)&tid, (uint64_t)(uintptr_t)&attr_ptr,
+    const uint64_t rc = k_pthread_create((uint64_t)(uintptr_t)&guest_handle, (uint64_t)(uintptr_t)&attr_ptr,
                                          entry, arg, (uint64_t)(uintptr_t)name, 0);
     t_pending_guest_thread_hooks = nullptr;
     pthread_attr_destroy(&attr.host);
-    if (rc == 0 && out_thread) *out_thread = tid;
+    if (rc == 0) {
+        // Callers (libSceUlt) join by HOST id and never show this thread to guest code, so convert
+        // the guest handle back and retire it; otherwise its object would live until process exit.
+        pthread_t host{};
+        if (guest_thread_handle_resolve(guest_handle, &host)) {
+            if (out_thread) *out_thread = (uint64_t)(uintptr_t)host;
+            guest_thread_handle_detached(guest_handle);
+        }
+    }
     return (int)rc;
 }
 
@@ -2640,12 +2664,27 @@ HLE(k_pthread_join)   {
     // A finished joinable thread remains valid, so live-name/stack registry membership is not
     // a validity check for non-null handles. Only the null case is handled here.
     if (a0 == 0) return 22;   // bare FreeBSD EINVAL; the Sony alias encodes it, value_ptr untouched
+    pthread_t host_thread{};
+    bool adopted = false;
+    if (!guest_thread_handle_resolve(a0, &host_thread, &adopted)) return 3;   // ESRCH: not a live handle
+    // Joining yourself stays the host's EDEADLK; any OTHER thread the guest did not create (the main
+    // thread, a driver worker) is not joinable, which FreeBSD reports as EINVAL.
+    if (adopted && !pthread_equal(host_thread, pthread_self())) return 22;
     void* rv = nullptr;
-    const int rc = pthread_join((pthread_t)a0, &rv);
+    const int rc = pthread_join(host_thread, &rv);
+    if (rc == 0) guest_thread_handle_joined(a0);
     if (rc == 0 && a1) *(void**)(uintptr_t)a1 = rv;   // only a real join produces an exit value
     return fbsd_errno(rc);   // bare here (#1612); scePthreadJoin encodes through the alias below
 }
-HLE(k_pthread_detach) { return fbsd_errno(pthread_detach((pthread_t)a0)); }
+HLE(k_pthread_detach) {
+    pthread_t host_thread{};
+    bool adopted = false;
+    if (!guest_thread_handle_resolve(a0, &host_thread, &adopted)) return 3;   // ESRCH
+    if (adopted) return 22;   // EINVAL: the guest never created this thread
+    const int rc = pthread_detach(host_thread);
+    if (rc == 0) guest_thread_handle_detached(a0);
+    return fbsd_errno(rc);
+}
 // Both bodies are registered under BOTH spellings, which is why the fix cannot live in the body
 // alone: `pthread_join` / `pthread_detach` must report the bare FreeBSD errno and `scePthreadJoin`
 // (onNY9Byn-W8) / `scePthreadDetach` (4qGrR6eoP9Y) the libkernel-encoded `0x8002_0000 | errno`, so
@@ -2732,6 +2771,7 @@ HLE(k_pthread_exit)   {
     unregister_thread_stack((uint64_t)GetCurrentThreadId());
     unregister_thread_stack((uint64_t)pthread_self());
     unregister_current_thread_handle((uint64_t)pthread_self());
+    guest_thread_handle_exited(pthread_self());
 #endif
     pthread_exit((void*)(uintptr_t)a0);
     return 0;
@@ -5018,7 +5058,11 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
     }
 #elif defined(_WIN32)
     {
-        uint64_t ret = win_raise_exception(a0, a1);
+        pthread_t target_thread{};
+        // A value that is not a live handle cannot name a thread; ESRCH, not a cast to pthread_t.
+        const uint64_t ret = guest_thread_handle_resolve(a0, &target_thread)
+                                 ? win_raise_exception((uint64_t)(uintptr_t)target_thread, a1)
+                                 : (uint64_t)prosper::hle::kSceKernelErrorESRCH;
         if (g_exc_log2) {
             char msg[192];
             snprintf(msg, sizeof msg,
