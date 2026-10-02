@@ -38,7 +38,6 @@ tests/diagnostics/test_env_numeric_sites.cpp
 tests/diagnostics/test_exit_reports.cpp
 tests/diagnostics/test_wait_regmem_observation.cpp
 tests/diagnostics/test_wait_regmem_packet_route.cpp
-tests/gpu/capture/test_capture_compute_policy.cpp
 tests/gpu/capture/test_gpu_capture.cpp
 tests/gpu/capture/test_gpu_capture_bundle_streaming.cpp
 tests/gpu/capture/test_gpu_replay_seed_order.cpp
@@ -66,7 +65,6 @@ tests/gpu/execute/test_fragment_packet_exec.cpp
 tests/gpu/execute/test_fragment_partial_wave_exec.cpp
 tests/gpu/execute/test_fragment_proven_votes.cpp
 tests/gpu/execute/test_fragment_vote_refusal_reporting.cpp
-tests/gpu/execute/test_gpu_detile.cpp
 tests/gpu/execute/test_gpu_detile_render.cpp
 tests/gpu/execute/test_gpu_execute.cpp
 tests/gpu/execute/test_gpu_retile.cpp
@@ -154,7 +152,6 @@ tests/hle/kernel/test_select_sleep.cpp
 tests/hle/memory/test_dmem_caller_attribution_alloc_dmem.cpp
 tests/hle/memory/test_dmem_caller_attribution_alloc_main_dmem.cpp
 tests/hle/memory/test_guest_mapping_lease.cpp
-tests/hle/memory/test_renderer_tracked_mapping_cache.cpp
 tests/hle/sync/test_c11_sync_bookkeeping.cpp
 tests/hle/sync/test_sync_destroy_lifetime.cpp
 tests/hle/sync/test_sync_ring.cpp
@@ -170,7 +167,6 @@ tests/hle/test_hle_registered.cpp
 tests/hle/test_json2.cpp
 tests/hle/test_libc_alloc.cpp
 tests/hle/test_posix_sem.cpp
-tests/hle/test_printf.cpp
 tests/hle/test_pthread_sched_getters.cpp
 tests/hle/test_savedata_capacity.cpp
 tests/hle/test_service_logging.cpp
@@ -178,7 +174,6 @@ tests/hle/test_win_pthread_key_destructor.cpp
 tests/hle/video/test_videodec2_decode.cpp
 tests/host/abi/test_guest_tailjump.cpp
 tests/host/abi/test_guest_varargs.cpp
-tests/host/fault/test_fault_context.cpp
 tests/host/fault/test_trap_arbitration.cpp
 tests/host/image/test_exit_registry_lifetime.cpp
 tests/host/image/test_hle_stack_args.cpp
@@ -226,7 +221,6 @@ tests/shared/live/test_storage_float_roundtrip.cpp
 tests/shared/live/test_texture_preparation.cpp
 tests/shared/present/test_compute_scanout.cpp
 tests/test_capture_manifest.cpp
-tests/test_dmem_caller_walk.cpp
 tests/test_gpu_replay_rtt_seed_rgba8.cpp
 tests/test_module.cpp
 tests/test_self_bounds.cpp

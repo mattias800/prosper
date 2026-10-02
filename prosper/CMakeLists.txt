@@ -1145,9 +1145,9 @@ if(TARGET prosper_core)
 
   # Variadic libc formatters (issue #122): real va_list capture so %f/XMM + stack + %s-past-4th
   # args format correctly (was a 3-integer-register forward). Cross-platform (host libc printf).
-  add_executable(test_printf tests/hle/test_printf.cpp)
-  target_link_libraries(test_printf PRIVATE prosper_core)
-  add_test(NAME printf_varargs COMMAND test_printf)
+  prosper_add_gtest(test_printf
+    SOURCES tests/hle/test_printf.cpp
+    LIBRARIES prosper_core)
 
   # Windows' aligned allocator family must remain paired end-to-end. Mixing _aligned_malloc with
   # plain free corrupts the heap under aligned game-buffer churn; ordinary and aligned guest
@@ -2231,9 +2231,9 @@ if(TARGET prosper_core)
   # PROSPER_DMEM_CALLER stack walk (issue #1755): the diagnostic scans up to 160 slots above its
   # frame and used to read straight off the top of a thread stack, dying with a SIGSEGV that reads
   # as a guest fault.
-  add_executable(test_dmem_caller_walk tests/test_dmem_caller_walk.cpp)
-  target_link_libraries(test_dmem_caller_walk PRIVATE prosper_core)
-  add_test(NAME dmem_caller_walk COMMAND test_dmem_caller_walk)
+  prosper_add_gtest(test_dmem_caller_walk
+    SOURCES tests/test_dmem_caller_walk.cpp
+    LIBRARIES prosper_core)
 
   # PROSPER_DMEM_CALLER correlation (issue #1859): the full stack remains one bounded line per
   # caller identity while every MEMLOG allocation can carry the same stable run-local ID. Pure,
@@ -3404,14 +3404,14 @@ endif()
 
   # #2018: a fatal worker-thread fault report must describe one fault. Header-only snapshot of the
   # handler's own siginfo/ucontext; POSIX signal contexts only (the test self-skips elsewhere).
-  add_executable(test_fault_context tests/host/fault/test_fault_context.cpp)
   # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
-  target_include_directories(test_fault_context PRIVATE src)
   # The contention arm spawns real threads. This target links no library, so unlike every other
   # thread-using test here it inherits -pthread from nothing; name Threads::Threads explicitly
   # (found above with prosper_core, whose existence gates this block).
-  target_link_libraries(test_fault_context PRIVATE Threads::Threads)
-  add_test(NAME fault_context COMMAND test_fault_context)
+  prosper_add_gtest(test_fault_context
+    SOURCES tests/host/fault/test_fault_context.cpp
+    INCLUDES src
+    LIBRARIES Threads::Threads)
 
   # End-to-end AGC submit plus fixed args 7-9 in ReleaseMem/WaitRegMem. This is cross-platform so
   # Windows validates the real fence builders behind the generated import-ABI conformance test.
@@ -5190,10 +5190,10 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
     --unset=PROSPER_NO_BACKEND_RESOURCE_SHARE
     --unset=PROSPER_NO_BACKEND_BUFFER_POOL --unset=PROSPER_BUFVERIFY
     $<TARGET_FILE:test_render_buffer_residency> --default-disabled)
-  add_executable(test_gpu_detile tests/gpu/execute/test_gpu_detile.cpp)
-  target_include_directories(test_gpu_detile PRIVATE tests)
-  target_link_libraries(test_gpu_detile PRIVATE prosper_core Vulkan::Vulkan)
-  add_test(NAME gpu_detile COMMAND test_gpu_detile)
+  prosper_add_gtest(test_gpu_detile
+    SOURCES tests/gpu/execute/test_gpu_detile.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core Vulkan::Vulkan)
   # The bounded VkCommandPool free list (#3407). Registered TWICE: the second run sets
   # PROSPER_NO_COMMAND_POOL_REUSE, which is the negative control and has to be a separate process
   # because the switch is read once into a function-local static.
