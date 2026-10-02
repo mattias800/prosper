@@ -56,6 +56,11 @@ jobs:
   linux:
     name: Linux
     runs-on: ubuntu-latest
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
 
     steps:
       - name: Checkout
@@ -78,7 +83,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config libavformat-dev libavcodec-dev \
+          sudo apt-get install -y ccache ninja-build pkg-config libavformat-dev libavcodec-dev \
             libavutil-dev libswresample-dev libswscale-dev libva-dev \
             libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers spirv-tools gdb
 
@@ -90,6 +95,13 @@ jobs:
       # Keep the distribution's Mesa ICD and validation layer for the existing test baseline.
       - name: Set up Vulkan 1.4
         uses: ./.github/actions/setup-vulkan
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-linux-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-linux-${{ runner.os }}-
 
       - name: Configure
         run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPROSPER_DIAGNOSTICS=ON
@@ -232,6 +244,10 @@ jobs:
       - name: Vulkan validation scan
         run: |
           python3 prosper/tools/vkval/vk_validation_scan.py --build-dir prosper/build-ci
+
+      - name: ccache statistics
+        if: always()
+        run: ccache -s
 
   contribution-shape:
     name: Contribution shape
@@ -569,6 +585,12 @@ jobs:
   linux-app:
     name: Linux App
     runs-on: ubuntu-latest
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      CCACHE_SLOPPINESS: pch_defines,time_macros
 
     # Builds the desktop frontend (prosper-app) with the SDL3 audio + gamepad frontends and Vulkan,
     # so the windowing/present/boot glue and the frontends stay compiling. Build-only: the app opens a
@@ -583,7 +605,7 @@ jobs:
         # fetched + built by CMake (FetchContent), so no libsdl package is needed.
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config libvulkan-dev \
+          sudo apt-get install -y ccache ninja-build pkg-config libvulkan-dev \
             libwayland-dev wayland-protocols libxkbcommon-dev libx11-dev \
             libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxfixes-dev \
             libpulse-dev libasound2-dev libavformat-dev libavcodec-dev libavutil-dev \
@@ -594,6 +616,13 @@ jobs:
       - name: Set up Vulkan 1.4
         uses: ./.github/actions/setup-vulkan
 
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-linux-app-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-linux-app-${{ runner.os }}-
+
       - name: Configure
         run: cmake -S prosper -B prosper/build-app -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON
 
@@ -601,6 +630,10 @@ jobs:
         # Building this target also builds its deps: prosper_core, prosper_live_renderer, SDL3, and
         # the prosper_audio_sdl3 / prosper_pad_sdl3 frontends.
         run: cmake --build prosper/build-app --target prosper-app
+
+      - name: ccache statistics
+        if: always()
+        run: ccache -s
 
   linux-app-package:
     name: Linux App Package
@@ -691,6 +724,11 @@ jobs:
   windows-mingw:
     name: Windows MinGW
     runs-on: windows-latest
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
 
     steps:
       - name: Checkout
@@ -707,8 +745,16 @@ jobs:
             git
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-ccache
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-spirv-tools
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-windows-mingw-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-windows-mingw-${{ runner.os }}-
 
       - name: Configure
         shell: msys2 {0}
@@ -728,9 +774,20 @@ jobs:
         shell: msys2 {0}
         run: ctest --test-dir prosper/build-ci -L timing-margin -V --no-tests=error
 
+      - name: ccache statistics
+        if: always()
+        shell: msys2 {0}
+        run: ccache -s
+
   windows-app:
     name: Windows App
     runs-on: windows-latest
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      CCACHE_SLOPPINESS: pch_defines,time_macros
 
     # Build-only for the Vulkan window itself: hosted Windows runners do not expose a reliable GPU
     # or interactive desktop. The SDL audio/pad seams still run through their dummy-driver tests.
@@ -747,9 +804,17 @@ jobs:
             git
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-ccache
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-vulkan-headers
             mingw-w64-ucrt-x86_64-vulkan-loader
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-windows-app-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-windows-app-${{ runner.os }}-
 
       - name: Configure frontend
         shell: msys2 {0}
@@ -846,9 +911,19 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: ccache statistics
+        if: always()
+        shell: msys2 {0}
+        run: ccache -s
+
   macos:
     name: macOS (x86_64 / Rosetta 2)
     runs-on: macos-latest
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
 
     # GitHub's macos-latest runners are Apple Silicon (arm64). prosper has no ARM CPU backend — it
     # runs the guest's x86-64 code natively — so the whole app is built x86_64 (CMAKE_OSX_ARCHITECTURES)
@@ -865,8 +940,15 @@ jobs:
         # the Linux job's dependency note). The validator is invoked as a subprocess, so the
         # native arm64 build serves the x86_64 test binaries fine.
         run: |
-          brew install ninja spirv-tools
+          brew install ccache ninja spirv-tools
           softwareupdate --install-rosetta --agree-to-license
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-macos-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-macos-${{ runner.os }}-
 
       - name: Configure
         # Vulkan is disabled (Homebrew's loader is arm64-only; the headless core + substrate tests
@@ -887,9 +969,19 @@ jobs:
       - name: Report the measured wait margins
         run: ctest --test-dir prosper/build-ci -L timing-margin -V --no-tests=error
 
+      - name: ccache statistics
+        if: always()
+        run: ccache -s
+
   macos-app:
     name: macOS App (SDL3 + MoltenVK)
     runs-on: macos-latest
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      CCACHE_SLOPPINESS: pch_defines,time_macros
 
     # Builds the realtime window frontend (prosper-app) x86_64 against a UNIVERSAL MoltenVK, so the
     # SDL3-window/MoltenVK-present glue and the frontends stay compiling on a real macOS toolchain.
@@ -902,18 +994,29 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install ninja vulkan-headers
+          brew install ccache ninja vulkan-headers
           softwareupdate --install-rosetta --agree-to-license
 
       - name: Fetch universal MoltenVK
         # Homebrew's MoltenVK is arm64-only; the x86_64 app needs a universal driver.
         run: bash prosper/scripts/fetch-macos-vulkan.sh
 
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-macos-app-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-macos-app-${{ runner.os }}-
+
       - name: Configure
         run: cmake -S prosper -B prosper/build-app -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 -DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON -DPROSPER_MACOS_MOLTENVK=${{ github.workspace }}/.macos-vulkan/lib/libMoltenVK.dylib
 
       - name: Build prosper-app
         run: cmake --build prosper/build-app --target prosper-app
+
+      - name: ccache statistics
+        if: always()
+        run: ccache -s
 
   release:
     name: Publish Release
