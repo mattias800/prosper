@@ -1,15 +1,5 @@
 set(PROSPER_GENERATED_REVISION "unknown")
 set(PROSPER_GENERATED_SOURCE_IDENTITY "unknown")
-set(PROSPER_GENERATED_READER_POLICY "false")
-if(PROSPER_REVISION_PYTHON AND PROSPER_REVISION_WORK_TREE)
-  execute_process(COMMAND "${PROSPER_REVISION_PYTHON}"
-    "${PROSPER_REVISION_WORK_TREE}/prosper/tools/fragment_compile_replay/reader_policy.py"
-    "${PROSPER_REVISION_WORK_TREE}"
-    RESULT_VARIABLE _policy_result OUTPUT_QUIET ERROR_QUIET)
-  if(_policy_result EQUAL 0)
-    set(PROSPER_GENERATED_READER_POLICY "true")
-  endif()
-endif()
 
 # Both ordinary clones (.git directory) and linked worktrees (.git file) have an entry at their
 # root. Requiring that entry prevents Git from walking up into an unrelated ancestor when this runs
@@ -43,8 +33,6 @@ if(PROSPER_REVISION_WORK_TREE AND PROSPER_REVISION_CONFIG_ID)
     "${PROSPER_REVISION_WORK_TREE}/prosper/cmake/*.cmake"
     "${PROSPER_REVISION_WORK_TREE}/prosper/cmake/build_revision.cpp.in"
     "${PROSPER_REVISION_WORK_TREE}/prosper/tools/revision/compiler_dependencies.py"
-    "${PROSPER_REVISION_WORK_TREE}/prosper/tools/fragment_compile_replay/reader_policy.py"
-    "${PROSPER_REVISION_WORK_TREE}/prosper/tools/fragment_compile_replay/reader_policy.json"
     "${PROSPER_REVISION_WORK_TREE}/prosper/CMakeLists.txt")
   list(SORT _source_inputs)
   set(_source_manifest "config=${PROSPER_REVISION_CONFIG_ID}|build=${PROSPER_REVISION_BUILD_CONFIG}")

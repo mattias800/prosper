@@ -15,6 +15,8 @@
 #include "buffer_range_plan.h"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
+#include "gpu/diagnostics/gpu_breadcrumbs_vk.hpp"    // PROSPER_GPU_BREADCRUMBS: where did the GPU stop?
+#include "gpu/diagnostics/gpu_labels_vk.hpp"         // PROSPER_GPU_LABELS: guest-meaningful command labels
 #include "gpu/memory/texture_cache_budget.hpp"  // #3873: texture budget from live headroom
 #include "gpu/memory/spill_recovery.hpp"        // #3905: rebuild spilled retained resources in VRAM
 #include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only memory prefers VRAM
@@ -2051,10 +2053,32 @@ inline const RenderVkCtx& render_vk_ctx() {
         VkPhysicalDevicePortabilitySubsetFeaturesKHR portability_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
 #endif
+        // PROSPER_GPU_BREADCRUMBS: the marker extensions, add-if-advertised and only when asked for, so a
+        // default run requests nothing new. VK_EXT_device_fault also needs its feature bit.
+        prosper::gpu::BreadcrumbDeviceSupport breadcrumb_support;
+        VkPhysicalDeviceFaultFeaturesEXT fault_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+        bool breadcrumb_fault_enabled = false;
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, nullptr);
           std::vector<VkExtensionProperties> de(ne);
           vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, de.data());
           for (uint32_t i = 0; i < ne; i++) {
+              if (prosper::gpu::breadcrumbs_requested()) {
+                  if (const char* name = breadcrumb_support.note_extension(de[i].extensionName))
+                      dev_exts.push_back(name);
+                  if (!strcmp(de[i].extensionName, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+                      VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                      f2.pNext = &fault_features;
+                      vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+                      if (fault_features.deviceFault) {
+                          fault_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+                          fault_features.deviceFault = VK_TRUE;
+                          fault_features.pNext = const_cast<void*>(dci.pNext);
+                          dci.pNext = &fault_features;
+                          dev_exts.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+                          breadcrumb_fault_enabled = true;
+                      }
+                  }
+              }
               if (!strcmp(de[i].extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) &&
                   !PROSPER_ENV_ON("PROSPER_NO_ROBUST_BUFFER_ACCESS2")) {
                   VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -2157,6 +2181,9 @@ inline const RenderVkCtx& render_vk_ctx() {
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
+        if (prosper::gpu::breadcrumbs_requested())
+            prosper::gpu::breadcrumb_arm_device(r.dev, r.phys, breadcrumb_support,
+                                                breadcrumb_fault_enabled, "render");
         std::fprintf(stderr, "[vk] deterministic storage word reads %s (robustBufferAccess2=%d)\n",
             r.deterministic_storage_reads ? "ENABLED" : "unavailable",
             static_cast<int>(robust2_features.robustBufferAccess2));
@@ -3079,6 +3106,16 @@ private:
         // single 2,045 ms compute dispatch in a whole route, immediately before the loss. A zero
         // timeout count never meant a zero latency count. This reporting stands on its own merits:
         // a graphics submission that fails or hangs must not be silent either.
+        // PROSPER_GPU_BREADCRUMBS: on a device loss, say where the GPU stopped. Once per process: the
+        // device is permanently lost, so every later submission would print the same markers.
+        if (result.submit_result == VK_ERROR_DEVICE_LOST || result.wait_result == VK_ERROR_DEVICE_LOST) {
+            static std::atomic<bool> breadcrumb_reported{false};
+            if (!breadcrumb_reported.exchange(true)) {
+                const std::string report = prosper::gpu::breadcrumb_emitter().report_device_loss(dev, queue);
+                std::fputs(report.c_str(), stderr);
+                std::fflush(stderr);
+            }
+        }
         if (result.submit_result != VK_SUCCESS || result.wait_result != VK_SUCCESS) {
             static std::atomic<int> reported{0};
             const int n = reported.fetch_add(1);
@@ -14754,6 +14791,25 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             std::fflush(stderr);
         }
         prosper::gpu::draw_disposition_census().note_recorded();
+        // PROSPER_GPU_BREADCRUMBS: a marker before and after the draw, so a device loss can name the
+        // window the GPU stopped inside instead of the submission that happened to observe it
+        // (instrument trap 170). The site is built only when armed: this loop is the hot path.
+        auto& breadcrumbs = prosper::gpu::breadcrumb_emitter();
+        uint32_t breadcrumb = 0;
+        bool labelled = false;
+        // PROSPER_GPU_LABELS shares the site (and its text) with the breadcrumb, built once for either.
+        if (breadcrumbs.armed_for(dev) || prosper::gpu::gpu_labels_requested()) {
+            prosper::gpu::BreadcrumbSite site;
+            site.kind = prosper::gpu::BreadcrumbKind::draw;
+            site.submit_no = draws[di].source_submit;
+            site.pass_local_index = static_cast<uint32_t>(di);
+            site.draw_index = static_cast<uint32_t>(draws[di].draw_index);
+            site.program_addr = draws[di].fs_guest_addr;
+            site.pipeline_hash = draws[di].vs_identity ^ (draws[di].fs_identity * 1099511628211ull);
+            if (prosper::gpu::gpu_labels_requested())
+                labelled = prosper::gpu::gpu_label_begin(dev, cmd, site);
+            breadcrumb = breadcrumbs.begin(dev, cmd, site);
+        }
         if (v.mesh_draw) {
             ctx.cmd_draw_mesh_tasks(cmd, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);
         } else if (v.icount) {
@@ -14763,6 +14819,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             vkCmdDraw(cmd, v.vcount, v.instance_count,
                       static_cast<uint32_t>(v.vertex_offset), 0);
         }
+        breadcrumbs.end(cmd, breadcrumb);
+        if (labelled) prosper::gpu::gpu_label_end(dev, cmd);
         if (geom_here) { VkDeviceSize coff = 0; p_endxfb(cmd, 0, 1, &geom_counter, &coff); }
         if (ds_active) {
             vkCmdEndQuery(cmd, ds_occ_pool, static_cast<uint32_t>(di));

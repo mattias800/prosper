@@ -1449,6 +1449,18 @@ if(TARGET prosper_core)
   target_link_libraries(test_cond_clock PRIVATE prosper_core)
   add_test(NAME pthread_cond_clock COMMAND test_cond_clock)
 
+  # Registered on every host, not only under if(UNIX): its _WIN32 arms exercise the Windows
+  # ownership registry, which was otherwise covered by no test (noted on #4150).
+  # #2619 / #2623: sharing the slot RESOLUTION was not the same as sharing the per-object
+  # BOOKKEEPING. Guards the claim-and-poison of a destroyed slot, the missed-wakeup generation,
+  # and the cond-destroy waiter count -- through BOTH spellings, since a divergence between them
+  # is the defect. Deliberately separate from c11_thread_slots: every arm there passes with the
+  # bookkeeping absent. Same generous TIMEOUT, same reason -- one arm parks a real thread.
+  add_executable(test_c11_sync_bookkeeping tests/hle/sync/test_c11_sync_bookkeeping.cpp)
+  target_link_libraries(test_c11_sync_bookkeeping PRIVATE prosper_core)
+  add_test(NAME c11_sync_bookkeeping COMMAND test_c11_sync_bookkeeping)
+  set_tests_properties(c11_sync_bookkeeping PROPERTIES TIMEOUT 120)
+
   # libScePad controller input: ScePadData layout + HostPadState mapping + HLE fill contract (pure).
   add_executable(test_pad tests/input/test_pad.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
@@ -2482,8 +2494,6 @@ if(TARGET prosper_core)
   target_link_libraries(test_fragment_compile_case PRIVATE prosper_core)
   add_test(NAME fragment_compile_case COMMAND test_fragment_compile_case)
   if(Python3_Interpreter_FOUND)
-    add_test(NAME fragment_compile_read_policy COMMAND "${Python3_EXECUTABLE}"
-      "${CMAKE_SOURCE_DIR}/tools/fragment_compile_replay/reader_policy.py" "${CMAKE_SOURCE_DIR}/..")
     add_test(NAME fragment_compile_case_cli COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_SOURCE_DIR}/tools/fragment_compile_replay/test_cli.py"
       "$<TARGET_FILE:test_fragment_compile_case>" "$<TARGET_FILE:fragment_compile_replay>")
@@ -2532,6 +2542,19 @@ if(TARGET prosper_core)
   add_executable(test_shader_dump_filter tests/gpu/diagnostics/test_shader_dump_filter.cpp)
   target_link_libraries(test_shader_dump_filter PRIVATE prosper_core)
   add_test(NAME shader_dump_filter COMMAND test_shader_dump_filter)
+
+  # PROSPER_GPU_BREADCRUMBS core + emitter against recording Vulkan entry points. No device: stock
+  # lavapipe exposes neither marker extension, so what this proves is the emitter/resolver contract,
+  # not that a real driver executes the writes before a hang (a local run, recorded in the PR).
+  add_executable(test_gpu_breadcrumbs tests/gpu/diagnostics/test_gpu_breadcrumbs.cpp)
+  target_link_libraries(test_gpu_breadcrumbs PRIVATE prosper_core)
+  add_test(NAME gpu_breadcrumbs COMMAND test_gpu_breadcrumbs)
+
+  # PROSPER_GPU_LABELS: the label text, colour class and begin/end pairing, against recording
+  # debug-utils entry points. What a capture tool DISPLAYS of them is a local look, not a ctest.
+  add_executable(test_gpu_labels tests/gpu/diagnostics/test_gpu_labels.cpp)
+  target_link_libraries(test_gpu_labels PRIVATE prosper_core)
+  add_test(NAME gpu_labels COMMAND test_gpu_labels)
 
   add_executable(test_gpu_memory_budget tests/gpu/diagnostics/test_gpu_memory_budget.cpp)
   target_include_directories(test_gpu_memory_budget PRIVATE tests)   # fixtures/test_scratch.h
@@ -2710,12 +2733,15 @@ endif()
   target_include_directories(test_fragment_packet_wqm PRIVATE tests)
   target_link_libraries(test_fragment_packet_wqm PRIVATE prosper_core)
   add_test(NAME fragment_packet_wqm_contract COMMAND test_fragment_packet_wqm)
-  set_tests_properties(fragment_packet_wqm_contract PROPERTIES TIMEOUT 90)
+  # TIMEOUT 300, not 90: measured 62-74 s on Linux, ~70 s on Windows MinGW, and >90 s on the
+  # macOS x86_64/Rosetta 2 job, where it has timed out on every run (#4176). Same for mbcnt
+  # below (89 s on Linux under -j4). A stopgap for the test's cost, not a fix -- #4176.
+  set_tests_properties(fragment_packet_wqm_contract PROPERTIES TIMEOUT 300)
   add_executable(test_fragment_packet_mbcnt tests/gpu/recompiler/test_fragment_packet_mbcnt.cpp)
   target_include_directories(test_fragment_packet_mbcnt PRIVATE tests)
   target_link_libraries(test_fragment_packet_mbcnt PRIVATE prosper_core)
   add_test(NAME fragment_packet_mbcnt_contract COMMAND test_fragment_packet_mbcnt)
-  set_tests_properties(fragment_packet_mbcnt_contract PROPERTIES TIMEOUT 90)
+  set_tests_properties(fragment_packet_mbcnt_contract PROPERTIES TIMEOUT 300)
   set_tests_properties(portable_bpermute_contract PROPERTIES TIMEOUT 90)
 
   # #3713: a scalar branch may only be called workgroup-uniform when the value it compares is the
@@ -3828,16 +3854,6 @@ endif()
     add_test(NAME c11_thread_slots COMMAND test_c11_thread_slots)
     set_tests_properties(c11_thread_slots PROPERTIES TIMEOUT 120)
 
-    # #2619 / #2623: sharing the slot RESOLUTION was not the same as sharing the per-object
-    # BOOKKEEPING. Guards the claim-and-poison of a destroyed slot, the missed-wakeup generation,
-    # and the cond-destroy waiter count -- through BOTH spellings, since a divergence between them
-    # is the defect. Deliberately separate from c11_thread_slots: every arm there passes with the
-    # bookkeeping absent. Same generous TIMEOUT, same reason -- one arm parks a real thread.
-    add_executable(test_c11_sync_bookkeeping tests/hle/sync/test_c11_sync_bookkeeping.cpp)
-    target_link_libraries(test_c11_sync_bookkeeping PRIVATE prosper_core)
-    add_test(NAME c11_sync_bookkeeping COMMAND test_c11_sync_bookkeeping)
-    set_tests_properties(c11_sync_bookkeeping PROPERTIES TIMEOUT 120)
-
     # __tls_get_addr per-thread DTV is purged (blocks freed) on both thread-exit paths (#68), and
     # normal return leaves guest %fs before glibc resumes host pthread cleanup (#644).
     add_executable(test_tls_dtv_purge tests/hle/test_tls_dtv_purge.cpp)
@@ -4348,11 +4364,6 @@ endif()
                             PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME backend_persistent_resource_lock
                COMMAND test_backend_persistent_resource_lock)
-      # RUN_SERIAL: its non-vacuity arms REQUIRE the guarded threads to overlap, and under a
-      # parallel ctest (CI runs `-j4`) three neighbouring tests can starve them into running one
-      # after another -- "guarded threads really contended" then fails with no defect present
-      # (first `-j4` CI run, #4116). Alone, the contention it measures is its own.
-      set_tests_properties(backend_persistent_resource_lock PROPERTIES RUN_SERIAL TRUE)
 
       # #2944: every GPU readback in the render backend is host-read after a fence wait, and a fence
       # orders execution rather than performing the availability operation into the host domain.

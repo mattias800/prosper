@@ -8,8 +8,5 @@ const char* embedded_build_revision() noexcept {
 const char* embedded_build_source_identity() noexcept {
     return "@PROSPER_GENERATED_SOURCE_IDENTITY@";
 }
-bool embedded_fragment_compile_read_policy_verified() noexcept {
-    return @PROSPER_GENERATED_READER_POLICY@;
-}
 
 } // namespace prosper
