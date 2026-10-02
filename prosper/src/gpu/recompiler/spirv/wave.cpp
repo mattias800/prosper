@@ -72,8 +72,9 @@ std::pair<uint32_t, uint32_t> SpirvCompute::packet_wqm_b64(
         widened = lor(widened, source_bit(ibin(Op_IAdd, quad_base, uconst(neighbor))));
     // SCC must be whole64, not this invocation's nibble or a native32 subgroup reduction.
     const uint32_t leader = id(), assembled = id();
+    const uint32_t is_leader = land(pending, ucmp(Op_IEqual, linear_localid, zero));
     emit_selmerge(assembled);
-    emit_condbranch(land(pending, ucmp(Op_IEqual, linear_localid, zero)), leader, assembled);
+    emit_condbranch(is_leader, leader, assembled);
     emit_label(leader);
     uint32_t any = no;
     for (uint32_t lane = 0; lane < 64; ++lane) any = lor(any, source_bit(uconst(lane)));
