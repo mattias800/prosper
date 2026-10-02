@@ -108,6 +108,18 @@ Unexplained and not yet shown to matter:
   worker had already broadcast before it began waiting. `kqueue` and `kevent` (`libScePosix`)
   still return 0 through the unimplemented stub, so a descriptor of 0 comes back from `kqueue`;
   whether the stall is an engine file-completion path waiting on them is a hypothesis, not a result.
+- Where the stall sits, from guest disassembly (eboot offsets): the title does load the memory
+  wrapper itself. `eboot+0x3d136b0` calls `sceKernelLoadStartModule("/app0/libmemorywrapper_f.prx")`
+  and then `sceKernelDlsym(..., "AE_MemoryWrapper_Init")`, which is the wrapper's init export
+  (`d1C59AHrOPI`) that fills the dispatch table the aegir constructor needs. That function has no
+  direct callers (only reachable through an indirect call) and is never reached in a run: no
+  `sceKernelLoadStartModule` call is seen in 80 s. The guest main thread is parked in a scheduler
+  loop (`eboot+0x21adff0`, called from `+0x21adf60`) waiting for a flag that a worker sets after
+  starting (`+0x5deaa34`), and the twelve `TaskThread`s and three `IdleThread`s are idle. So the
+  open question is what the engine's startup waits on before it reaches the wrapper load, not the
+  wrapper itself. `kqueue`/`kevent` are called once each by the eboot (`+0x334ebba`, `+0x334ebd1`)
+  to register one read filter on ident 0 and nothing waits on them, so they are unlikely to be
+  the blocker; no implementation is in flight elsewhere (#4153 lists them out of scope).
 - `scePthreadAttrGetstack` is unimplemented and returns 0 without filling its outputs. The
   `SystemLogger` thread called it right before the crash; that is a suspicion, not a result.
 - Unimplemented calls returning 0, names from `ps5rs/data/nids.csv`: `kqueue`, `kevent`
