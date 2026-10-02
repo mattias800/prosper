@@ -38,6 +38,7 @@
 #include "gpu/diagnostics/diag_ratelimit.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: how much of the heap does prosper hold?
+#include "gpu/diagnostics/gpu_breadcrumbs_vk.hpp"    // PROSPER_GPU_BREADCRUMBS: where did the GPU stop?
 #include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only images prefer VRAM
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
@@ -3920,9 +3921,42 @@ struct VulkanComputeContext {
           for (auto& e : de) if (!std::strcmp(e.extensionName, "VK_KHR_portability_subset")) {
               dev_exts.push_back("VK_KHR_portability_subset"); break; } }
 #endif
+        // PROSPER_GPU_BREADCRUMBS on the standalone device, so a compute-only run (boot_trace registers
+        // compute unconditionally) can say where the GPU stopped too. Add-if-advertised and only when
+        // asked for; a default run requests nothing new. With a live renderer this path does not run
+        // and the renderer's device arms the process-wide emitter instead.
+        prosper::gpu::BreadcrumbDeviceSupport breadcrumb_support;
+        VkPhysicalDeviceFaultFeaturesEXT fault_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+        bool breadcrumb_fault_enabled = false;
+        if (prosper::gpu::breadcrumbs_requested()) {
+            uint32_t ne = 0;
+            vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
+            std::vector<VkExtensionProperties> de(ne);
+            vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, de.data());
+            for (const VkExtensionProperties& e : de) {
+                if (const char* name = breadcrumb_support.note_extension(e.extensionName))
+                    dev_exts.push_back(name);
+                if (!std::strcmp(e.extensionName, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+                    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                    f2.pNext = &fault_features;
+                    vkGetPhysicalDeviceFeatures2(physical, &f2);
+                    if (fault_features.deviceFault) {
+                        fault_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+                        fault_features.deviceFault = VK_TRUE;
+                        fault_features.pNext = const_cast<void*>(dci.pNext);
+                        dci.pNext = &fault_features;
+                        dev_exts.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+                        breadcrumb_fault_enabled = true;
+                    }
+                }
+            }
+        }
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(physical, &dci, nullptr, &device) != VK_SUCCESS) return false;
+        if (prosper::gpu::breadcrumbs_requested())
+            prosper::gpu::breadcrumb_arm_device(device, physical, breadcrumb_support,
+                                                breadcrumb_fault_enabled, "compute");
         // Same measurement the renderer makes, for the same reason image robustness is acquired
         // here through a shared helper (#3531): this device executes the SAME recompiled modules,
         // and a module declaring a capability only one of the two devices can take is invalid on
@@ -7311,6 +7345,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                          static_cast<unsigned long long>(item.submit_no),
                          static_cast<unsigned long long>(item.dispatch_index),
                          static_cast<unsigned long long>(item.command_order));
+            // PROSPER_GPU_BREADCRUMBS: where the GPU actually stopped. The line above names the call
+            // that OBSERVED the loss, which is not necessarily the one that caused it (trap 170).
+            const std::string report =
+                prosper::gpu::breadcrumb_emitter().report_device_loss(ctx.queue);
+            std::fputs(report.c_str(), stderr);
         }
         if (trace) std::fprintf(stderr, "[compute]   Vulkan failure stage=%s result=%d\n",
                                 stage, static_cast<int>(result));
@@ -12285,6 +12324,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (const auto& buffer : buffers)
             if (buffer.alias_of == SIZE_MAX && buffer.persistent && buffer.writable)
                 ctx.forget_cached_buffer_fill(buffer.cache_key);
+        // PROSPER_GPU_BREADCRUMBS: a marker before and after the dispatch, so a device loss names the
+        // window the GPU stopped inside rather than the submission that observed it (trap 170). The
+        // site is built only when armed.
+        auto& breadcrumbs = prosper::gpu::breadcrumb_emitter();
+        uint32_t breadcrumb = 0;
+        if (breadcrumbs.active()) {
+            prosper::gpu::BreadcrumbSite site;
+            site.kind = prosper::gpu::BreadcrumbKind::dispatch;
+            site.submit_no = item.submit_no;
+            site.draw_index = static_cast<uint32_t>(item.dispatch_index);
+            site.program_addr = item.code_addr;
+            site.pipeline_hash = std::hash<std::string>{}(pipeline_key);
+            breadcrumb = breadcrumbs.begin(command, site);
+        }
         if (device_indirect) {
             vkCmdDispatchIndirect(command, ctx.indirect_scratch, 0);
             prosper::frontend::indirect_dispatch_backend_stats().device_dispatches.fetch_add(
@@ -12293,6 +12346,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             vkCmdDispatch(command, item.launch.groups_x, item.launch.groups_y,
                           item.launch.groups_z);
         }
+        breadcrumbs.end(command, breadcrumb);
         if (perf_gpu_timing)
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                 ctx.dispatch_timestamp_pool, 2);
