@@ -171,7 +171,7 @@ def discover(root: Path, files: dict[Path, list[str]], excluded: Callable[[str],
             else:
                 spelling = declaration.args[1]
                 source = _identity(root, declaration.path.parent, spelling)
-                rel = str(source.relative_to(root)) if source else ""
+                rel = source.relative_to(root).as_posix() if source else ""
                 lexical = Path(os.path.abspath(declaration.path.parent / spelling))
                 if (source is None or source != lexical or not source.is_file()
                         or not rel.startswith("tests/") or source.suffix != ".cpp"
@@ -241,10 +241,10 @@ def discover(root: Path, files: dict[Path, list[str]], excluded: Callable[[str],
                 for include in include_re.finditer(text):
                     value = include.group(1)
                     if source in (_identity(root, path.parent, value), _identity(root, root, value)):
-                        failures.append(f"literal CPP inclusion: {path.relative_to(root)}")
-        location = f"{marker.path.relative_to(root)}:{marker.line}"
+                        failures.append(f"literal CPP inclusion: {path.relative_to(root).as_posix()}")
+        location = f"{marker.path.relative_to(root).as_posix()}:{marker.line}"
         accepted = not failures
-        roles.append(Role(target, str(source.relative_to(root)) if source else "", location,
+        roles.append(Role(target, source.relative_to(root).as_posix() if source else "", location,
                           accepted, "; ".join(sorted(set(failures))) if failures
                           else "declared nonshipping TU; literal guards passed"))
         if accepted:
