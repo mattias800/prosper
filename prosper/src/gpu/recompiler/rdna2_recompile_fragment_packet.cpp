@@ -44,7 +44,20 @@ const char* packet_instruction_gap(const Rdna2Inst& in) {
                    (in.opcode >= 0xd0 && in.opcode <= 0xd7)
                 ? nullptr : "packet-fp-or-compare-unimplemented";
         case Rdna2Format::VOP3:
-            return in.opcode == 0x360 ? nullptr : "packet-valu-op-unimplemented";
+            if (in.opcode != 0x360) return "packet-valu-op-unimplemented";
+            // RDNA2's READLANE source is VGPR-or-LDS, not generic VOP3 SSRC. The
+            // synchronized service reads the VGPR bank; never alias a decoded SGPR
+            // number into that bank. LDS-direct is outside this owned-register slice.
+            if (in.src[0].kind != OperandKind::VGPR)
+                return "packet-readlane-source-kind-unimplemented";
+            // OPR_SSRC_LANESEL supplies an ordinary scalar register or inline integer
+            // 0..63 in this slice. A varying VGPR selector cannot become scalar state;
+            // literal, float and special selector encodings are not admitted here.
+            if (in.src[1].kind != OperandKind::SGPR &&
+                !(in.src[1].kind == OperandKind::InlineInt &&
+                  in.src[1].value >= 0 && in.src[1].value <= 63))
+                return "packet-readlane-selector-kind-unimplemented";
+            return nullptr;
         case Rdna2Format::EXP:
             if (in.exp_compr) return "packet-compressed-export-unimplemented";
             if (in.exp_target < kFragmentColorOutputs) return nullptr;

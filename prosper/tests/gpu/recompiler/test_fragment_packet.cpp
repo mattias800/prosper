@@ -56,6 +56,86 @@ void reject(prosper::gpu::FragmentInvocationPacket p, const std::string& reason,
           name + " transactional refusal");
     check(result.rejection == reason, name + " precise reason: " + result.rejection);
 }
+void sink_case(const prosper::gpu::FragmentInvocationPacket& input,
+               const std::vector<uint32_t>& want, const std::string& name,
+               const std::filesystem::path& directory, bool bitcount_controls = false) {
+    const auto result = prosper::gpu::recompile_fragment_packet(
+        input, {prosper::gpu::RecompileDiagnosticStage::Fragment, 0x4093});
+    check(!result.spirv.empty() && result.rejection.empty(), name + " emits actual guest");
+    if (result.spirv.empty()) return;
+    bpermute_oracle::Interpreter vm(result.spirv);
+    const auto actual = vm.run_packet(result.input_words, result.output_words);
+    check(vm.error.empty(), name + " typed actual SOURCE: " + vm.error);
+    check(actual == want, name + " all logical64 raw sinks");
+    if (actual.size() == want.size())
+        for (size_t word = 0; word < want.size(); ++word)
+            check(actual[word] == want[word], name + " word=" + std::to_string(word));
+    if (bitcount_controls) {
+        size_t bitcount = 0;
+        uint32_t boolean_type = 0, zero = 0;
+        for (size_t pc = 5; pc < result.spirv.size();) {
+            const uint32_t n = result.spirv[pc] >> 16, op = result.spirv[pc] & 0xffffu;
+            if (!n || n > result.spirv.size() - pc) break;
+            if (op == 205 && n == 4 && !bitcount) bitcount = pc;
+            if (op == 20 && n == 2) boolean_type = result.spirv[pc + 1];
+            pc += n;
+        }
+        if (bitcount) for (size_t pc = 5; pc < result.spirv.size();) {
+            const uint32_t n = result.spirv[pc] >> 16, op = result.spirv[pc] & 0xffffu;
+            if (!n || n > result.spirv.size() - pc) break;
+            if (op == 43 && n == 4 && result.spirv[pc + 1] == result.spirv[bitcount + 1] &&
+                result.spirv[pc + 3] == 0) zero = result.spirv[pc + 2];
+            pc += n;
+        }
+        check(bitcount && boolean_type && zero, name + " actual typed BitCount control operands");
+        if (bitcount && boolean_type && zero) {
+            auto wrong_type = result.spirv;
+            wrong_type[bitcount + 1] = boolean_type;
+            bpermute_oracle::Interpreter typed(wrong_type);
+            (void)typed.run_packet(result.input_words, result.output_words);
+            check(typed.error == "unsupported BitCount result", name + " BitCount type fails closed");
+            // Valid typed IAdd(source,0) does not count bits. This is a live numeric
+            // mutation of the emitted module, not a precomputed expected-data flip.
+            auto no_count = result.spirv;
+            no_count[bitcount] = (5u << 16) | 128u;
+            no_count.insert(no_count.begin() + bitcount + 4, zero);
+            bpermute_oracle::Interpreter changed(no_count);
+            const auto changed_words = changed.run_packet(result.input_words, result.output_words);
+            check(changed.error.empty() && changed_words != want,
+                  name + " actual live scalar popcount omission changes raw sink");
+            if (!directory.empty()) {
+                std::ofstream control(directory / (name + "_oracle_nopopcount.spv"), std::ios::binary);
+                control.write(reinterpret_cast<const char*>(no_count.data()),
+                              static_cast<std::streamsize>(no_count.size() * 4));
+                control.close();
+                check(bool(control), name + " valid typed numeric mutation dump");
+            }
+        }
+    }
+    if (!directory.empty()) {
+        std::ofstream file(directory / (name + ".spv"), std::ios::binary);
+        file.write(reinterpret_cast<const char*>(result.spirv.data()),
+                   static_cast<std::streamsize>(result.spirv.size() * 4));
+        file.close();
+        check(bool(file), name + " strict-validation dump");
+    }
+}
+// Append an independently specified one-channel EXP to the existing one-record
+// fixture. The scalar input is uniform; only the guest VGPR destination write is
+// EXEC-predicated. Export eligibility is retained separately in the raw record.
+std::vector<uint32_t> extra_scalar_record(const std::vector<uint32_t>& first,
+                                        const prosper::gpu::FragmentInvocationPacket& input,
+                                        uint32_t scalar) {
+    std::vector<uint32_t> want(24 * 64, 0);
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        std::copy_n(first.begin() + lane * 12, 12, want.begin() + lane * 24);
+        const bool exec = (input.exec_mask >> lane) & 1u;
+        const uint32_t header[] = {1, uint32_t(exec), input.export_enabled[lane], 0, 1, 0, 1, 1};
+        std::copy(std::begin(header), std::end(header), want.begin() + lane * 24 + 12);
+        want[lane * 24 + 20] = exec ? scalar : prosper::test::fragment_packet::poison_sentinel;
+    }
+    return want;
+}
 } // namespace
 int main(int argc, char** argv) {
     using namespace prosper::test::fragment_packet;
@@ -64,12 +144,13 @@ int main(int argc, char** argv) {
     else if (argc != 1) return 2;
     uint32_t ordinal = 0;
     for (uint32_t selected : {63u, 31u, 64u})
-        for (uint32_t variant = 0; variant < 6; ++variant) {
+        for (uint32_t variant = 0; variant < 8; ++variant) {
             Case c;
             c.selected_lane = selected;
             c.inactive_source = variant >= 1 && variant <= 3;
             c.leave_source_inactive = variant == 2 || variant == 3;
-            c.second_export = variant == 3;
+            c.second_export = variant == 3 || variant == 7;
+            c.scalar_selector = variant == 6;
             c.data_base = variant == 1 ? 0x7f800001u : 0x51000000u + ordinal * 0x1000;
             auto input = packet(c);
             if (variant == 4) input.exec_mask = uint64_t(1) << 63;
@@ -87,8 +168,11 @@ int main(int argc, char** argv) {
                 }
                 if (i.fmt == prosper::gpu::Rdna2Format::VOP3) {
                     ++reads;
-                    check(i.opcode == 0x360 && i.src[0].value == 8 &&
-                          i.src[1].kind == prosper::gpu::OperandKind::InlineInt && i.src[1].value == 40,
+                    check(i.opcode == 0x360 &&
+                          i.src[0].kind == prosper::gpu::OperandKind::VGPR && i.src[0].value == 8 &&
+                          i.src[1].kind == (c.scalar_selector ? prosper::gpu::OperandKind::SGPR
+                                                             : prosper::gpu::OperandKind::InlineInt) &&
+                          i.src[1].value == (c.scalar_selector ? 22 : 40),
                           "actual READLANE40 decode");
                 }
                 exports += i.fmt == prosper::gpu::Rdna2Format::EXP;
@@ -133,6 +217,106 @@ int main(int argc, char** argv) {
             }
         }
     auto clean = packet({});
+    // FF1 scans the full saved logical mask and preserves SCC established by
+    // BCNT. In particular, an empty mask returns -1 but must NOT set SCC true.
+    // Both a real SCC branch and an independent CSELECT make that preservation
+    // observable, rather than checking only the FF1 marker/instruction count.
+    for (uint32_t selected : {63u, 31u, 64u}) {
+        Case c; c.selected_lane = selected;
+        auto p = packet(c);
+        p.scc = selected == 64; // deliberately opposite to BCNT's new SCC
+        p.sgprs.emplace_back(13, poison_sentinel);
+        p.sgprs.emplace_back(24, branch_true); p.sgprs.emplace_back(25, branch_false);
+        const auto count_at = std::find(p.guest_code.begin(), p.guest_code.end(), 0xbe8c1014u);
+        check(count_at != p.guest_code.end(), "FF1 fixture retains saved-mask BCNT");
+        if (count_at == p.guest_code.end()) continue;
+        p.guest_code.insert(count_at + 1, {0xbe8c1414u, 0x850d1918u}); // FF1 s12,s20; CSELECT s13,s24,s25
+        const auto branch_at = std::find(p.guest_code.begin(), p.guest_code.end(), 0xbf860002u);
+        check(branch_at != p.guest_code.end(), "FF1 fixture retains real conditional branch");
+        if (branch_at == p.guest_code.end()) continue;
+        *branch_at = 0xbf840002u; // SCCZ instead of VCCZ, same paired forward destination
+        p.guest_code.insert(p.guest_code.end() - 1, {0x7e0a020du, 0xf8001801u, 5u});
+        auto first = expected(c, p);
+        for (uint32_t lane = 0; lane < 64; ++lane)
+            first[lane * 12 + 8] = selected < 64 ? selected : UINT32_MAX;
+        sink_case(p, extra_scalar_record(first, p, selected < 64 ? branch_true : branch_false),
+                  "ff1_scc_" + std::to_string(selected), directory);
+    }
+    // Read the supplied initial VCC before the compare replaces it, including
+    // a high-half bit belonging to an EXEC-off lane. Scalar mask reduction reads
+    // the full VCC data, not the current EXEC or the later compare result.
+    for (uint64_t initial : {uint64_t(0), uint64_t(1), uint64_t(1) << 40,
+                             uint64_t(1) << 63, (uint64_t(1) << 63) | 1}) {
+        auto p = clean; p.vcc_mask = initial;
+        if (initial == (uint64_t(1) << 40)) p.exec_mask &= ~(uint64_t(1) << 40);
+        for (uint32_t reg : {26u, 27u, 28u}) p.sgprs.emplace_back(reg, poison_sentinel);
+        p.guest_code.insert(p.guest_code.begin(), {0xbe9a046au, 0xbe9c101au});
+        p.guest_code.insert(p.guest_code.end() - 1, {0x7e0a021cu, 0xf8001801u, 5u});
+        uint32_t count = 0;
+        for (uint32_t lane = 0; lane < 64; ++lane) count += (initial >> lane) & 1u;
+        sink_case(p, extra_scalar_record(expected({}, p), p, count),
+                  "initial_vcc_" + std::to_string(initial), directory);
+    }
+    // Ordinary supplied scalar-pair BCNT takes a different emitted numeric
+    // route from a saved Boolean wave mask. Test its raw result, SCC-dependent
+    // select/branch, then an independent ADD carry and select through live EXPs.
+    for (uint64_t raw : {uint64_t(0), uint64_t(1) << 63, uint64_t(0x8000000180000001ull)})
+        for (bool carry : {false, true}) {
+            auto p = clean;
+            p.sgprs = {{12, poison_sentinel}, {14, poison_sentinel}, {15, branch_false},
+                {16, poison_sentinel}, {19, poison_sentinel}, {20, uint32_t(raw)},
+                {21, uint32_t(raw >> 32)}, {24, branch_true}, {25, branch_false},
+                {26, carry ? UINT32_MAX : 3u}, {27, carry ? 2u : 4u}};
+            p.guest_code = {0xbe8c1014u, 0x850e1918u, 0xbf840002u};
+            smov(p.guest_code, 15, branch_true);
+            p.guest_code.insert(p.guest_code.end(), {0x80131b1au, 0x85101918u});
+            vmov(p.guest_code, 1, 12); vmov(p.guest_code, 2, 14);
+            vmov(p.guest_code, 3, 15); vmov(p.guest_code, 8, 19);
+            exp(p.guest_code, 15, 0x08030201u);
+            vmov(p.guest_code, 5, 16); exp(p.guest_code, 1, 5);
+            p.guest_code.push_back(0xbf810000u);
+            uint32_t bits = 0;
+            for (uint32_t position = 0; position < 64; ++position) bits += (raw >> position) & 1u;
+            std::vector<uint32_t> first(12 * 64);
+            for (uint32_t lane = 0; lane < 64; ++lane) {
+                const uint32_t record[] = {1, 1, 1, 0, 15, 0, 1, 1,
+                    bits, raw ? branch_true : branch_false, raw ? branch_true : branch_false,
+                    carry ? 1u : 7u};
+                std::copy(std::begin(record), std::end(record), first.begin() + lane * 12);
+            }
+            sink_case(p, extra_scalar_record(first, p, carry ? branch_true : branch_false),
+                "scalar_bcnt_add_" + std::to_string(raw) + "_" + std::to_string(carry), directory,
+                raw == 0x8000000180000001ull && !carry);
+        }
+    // Change the ACTUAL decoded operand fields while keeping both register banks
+    // supplied. A missing-register refusal must not conceal bank aliasing or an
+    // inadmissible varying selector flowing into the scalar/PC state.
+    for (uint32_t arm = 0; arm < 7; ++arm) {
+        auto p = clean;
+        p.sgprs.emplace_back(8, 0x87654321u); // not the supplied VGPR8 values
+        const auto read = std::find(p.guest_code.begin(), p.guest_code.end(), 0xd760000fu);
+        check(read != p.guest_code.end(), "operand-kind control targets actual READLANE");
+        if (read == p.guest_code.end()) continue;
+        const size_t pc = static_cast<size_t>(read - p.guest_code.begin());
+        const uint32_t source = arm == 0 ? 8u : arm == 6 ? 254u : 264u;
+        const uint32_t selector = arm == 1 ? 256u : arm == 2 ? 192u :
+                                  arm == 3 ? 193u : arm == 4 ? 240u : arm == 5 ? 255u : 168u;
+        p.guest_code[pc + 1] = source | (selector << 9);
+        if (arm == 5) p.guest_code.insert(p.guest_code.begin() + pc + 2, 40u);
+        const auto decoded = prosper::gpu::rdna2_decode_one(p.guest_code.data() + pc,
+                                                           p.guest_code.size() - pc);
+        check(decoded.fmt == prosper::gpu::Rdna2Format::VOP3 && decoded.opcode == 0x360 &&
+              decoded.src[0].kind == (arm == 0 ? prosper::gpu::OperandKind::SGPR
+                  : arm == 6 ? prosper::gpu::OperandKind::Special : prosper::gpu::OperandKind::VGPR) &&
+              decoded.src[1].kind == (arm == 1 ? prosper::gpu::OperandKind::VGPR
+                  : arm == 4 ? prosper::gpu::OperandKind::InlineFloat
+                  : arm == 5 ? prosper::gpu::OperandKind::Literal
+                             : prosper::gpu::OperandKind::InlineInt),
+              "actual unsupported READLANE operand kinds retained by decoder");
+        reject(p, arm == 0 || arm == 6 ? "packet-readlane-source-kind-unimplemented"
+                          : "packet-readlane-selector-kind-unimplemented",
+               "READLANE bank/domain control " + std::to_string(arm));
+    }
     // A supplied initial scalar word is NOT authority for stale data after a saved-mask write.
     // Keep the extra read live in EXP. The count destination is a real data word (positive);
     // the saved mask's unmaterialized low word must refuse, never use the CFG placeholder zero.

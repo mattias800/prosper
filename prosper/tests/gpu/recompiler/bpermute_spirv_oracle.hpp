@@ -399,6 +399,16 @@ struct Interpreter {
         if (a.size() != 3 || ty(a[0]).op != 20)
           fail("LogicalNot type mismatch");
         set(l, a[1], a[0], {uint32_t(!boolean(l, a[2]))});
+      } else if (op == 205) {
+        if (a.size() != 3 || !uint_type(a[0]))
+          fail("unsupported BitCount result");
+        const auto x = value(l, a[2]);
+        if (x.type != a[0] || x.words.size() != 1)
+          fail("BitCount operand type mismatch");
+        uint32_t bits = 0;
+        for (uint32_t position = 0; position < 32; ++position)
+          bits += (x.words[0] >> position) & 1u;
+        set(l, a[1], a[0], {bits}, x.defined);
       } else if (op == 170 || op == 171 || op == 172 || op == 174 ||
                  op == 176 || op == 178 || op == 128 || op == 130 ||
                  op == 132 || op == 134 || op == 137 || op == 194 ||

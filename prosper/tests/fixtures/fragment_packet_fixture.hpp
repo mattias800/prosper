@@ -12,6 +12,7 @@ inline constexpr uint32_t branch_false = 0x130bad01u, branch_true = 0x63060001u;
 struct Case {
     uint32_t selected_lane = 63, data_base = 0x51000000u;
     bool inactive_source = false, leave_source_inactive = false, second_export = false;
+    bool scalar_selector = false;
 };
 inline void smov(std::vector<uint32_t>& p, uint32_t reg, uint32_t value) {
     p.insert(p.end(), {0xbe8003ffu | (reg << 16), value});
@@ -36,7 +37,8 @@ inline std::vector<uint32_t> guest(const Case& c) {
         p.push_back(0xbe90047eu); // S_MOV_B64 s[16:17],EXEC
         p.insert(p.end(), {0x7daa00ffu, 40}); // V_CMPX_NE_U32 EXEC,literal40,v0
     }
-    p.insert(p.end(), {0xd760000fu, 264u | (168u << 9)}); // READLANE s15,v8,40
+    const uint32_t selector = c.scalar_selector ? 22u : 168u;
+    p.insert(p.end(), {0xd760000fu, 264u | (selector << 9)}); // READLANE s15,v8,40 or s22
     if (c.inactive_source && !c.leave_source_inactive)
         p.push_back(0xbefe0410u); // restore EXEC from supplied/saved full mask
     vmov(p, 1, 12);
@@ -45,7 +47,10 @@ inline std::vector<uint32_t> guest(const Case& c) {
     exp(p, 15, 0x08030201u); // count, branch, readlane40, own raw v8
     if (c.second_export) {
         // A real common event AFTER the first EXP catches OpKill/Return of EXEC-off workers.
-        p.insert(p.end(), {0xd7600013u, 264u | (168u << 9)}); // READLANE s19,v8,40
+        // Publish genuinely changed VGPR data at the next rendezvous. EXEC-off lanes
+        // retain their old word, so the second READLANE must still ignore source EXEC.
+        vmov(p, 8, 256u); // v8 = v0 for active lanes only
+        p.insert(p.end(), {0xd7600013u, 264u | (selector << 9)}); // READLANE s19,v8,40 or s22
         vmov(p, 5, 19);
         exp(p, 1, 5);
     }
@@ -70,6 +75,7 @@ inline prosper::gpu::FragmentInvocationPacket packet(const Case& c) {
     }
     for (uint32_t reg : {12u, 14u, 15u, 16u, 17u, 19u, 20u, 21u})
         p.sgprs.emplace_back(reg, poison_sentinel);
+    p.sgprs.emplace_back(22, 40);
     return p;
 }
 inline std::vector<uint32_t> expected(const Case& c,
@@ -97,7 +103,10 @@ inline std::vector<uint32_t> expected(const Case& c,
         if (c.second_export) {
             const uint32_t second[] = {1, uint32_t(exec), p.export_enabled[lane], 0, 1, 0, 1, 1};
             std::copy(std::begin(second), std::end(second), out.begin() + base + 12);
-            out[base + 20] = exec ? c.data_base + 40 * 17 : poison_sentinel;
+            const bool source_exec = ((p.exec_mask >> 40) & 1u) &&
+                !(c.inactive_source && c.leave_source_inactive);
+            out[base + 20] = exec ? (source_exec ? 40u : c.data_base + 40 * 17)
+                                   : poison_sentinel;
         }
     }
     return out;
