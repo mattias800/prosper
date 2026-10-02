@@ -23,6 +23,16 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   packets. The shipping renderer companion in `tests/fixtures/raster_quad_collection_gpu.h` owns
   the actual scratch pass; it declines unproved pre-raster effects, missing producing modules and
   unsupported domains. No framebuffer export, depth/blend commit or guest-wave packing is added.
+- `fragment_resource_packet` — a separate owned-input packet compiler/transactional EXP consumer.
+  `fragment_packet_resource_preflight` checks original read-PC/descriptor/parameter/M0 ownership
+  and all-path full WAIT completion; `fragment_packet_resource_services` emits actual SMEM,
+  P1/P2, explicit-LZ/L nearest sampling and integer finite F32 operations from those inputs.
+  `fragment_packet_f32` preserves explicit input/output denorm and rounding modes in integer
+  arithmetic; nonfinite/overflow and non-exact interpolation remain named runtime failures.
+  All64 workers rendezvous and append sticky statuses; ANY failure prevents the consumer from
+  publishing ANY raw EXP record. Integer packet ABI/native paths remain separate. Complete supplied
+  VGPR backing is mandatory, and this does not initialize guest inputs from host raster records,
+  enable implicit/bias sampling, establish live resource epochs, or admit any real DrawItem.
 - `spirv_builder` — small hand-built SPIR-V modules. **These include shipped shaders**:
   `frontends/shared/live/live_compute.cpp`'s `prepare_compare_pipeline()` feeds
   `build_compute_compare_uvec4()` straight to `vkCreateShaderModule` on the live path. The GPU
@@ -36,6 +46,14 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 backstop for genuinely unknown encodings — mark `CONFIDENCE: LOW`, log loudly, file an issue with the
 exact opcode — but every one hit on a live boot is the next thing to implement. A silently skipped
 instruction drops real rendered content and reads as "handled".
+
+**No title id in a condition, and no title-named module outside `gta5/`.** The architecture
+ratchet (`CLAUDE.md` § *Architecture and performance ratchets*) counts `PPSA#####` outside comments
+and caps `gta5/`'s size, so a lowering one title needs either generalises into the translator or
+lands in `gta5/` with its measurement — and shrinking `gta5/` by generalising is the direction.
+Compile cost is a frame-time cost: the recompiler's output must be cacheable by program bytes so
+that, after warm-up, nothing here runs on the submit thread (P3). `rdna2_emit_alu.cpp` and
+`rdna2_emit_cfg.cpp` are past the 5,000-line cap; grow a new file, not them.
 
 ## `SignedZeroInfNanPreserve`: a correctness contract, and a device gate
 
