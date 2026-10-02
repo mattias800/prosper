@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
     w::Case scalar; scalar.source = w::Source::ScalarPair;
     p = w::packet(scalar);
     std::erase_if(p.sgprs, [](const auto& value) { return value.first == 31; });
-    refuse(p, "packet-sgpr-input-unavailable", "no invented numeric high word");
+    refuse(p, "packet-sgpr-read-before-definition", "no invented numeric high word");
     // Initial scalar words must not reappear after the pair becomes a saved mask. A one-word
     // overwrite destroys that complete mask without defining its untouched low data word.
     // The matching NOP twin retains the saved VCC mask and must reach the same live raw sinks.

@@ -1,5 +1,6 @@
 #include "fixtures/compute_runner.h"
 #include "fixtures/fragment_packet_fixture.hpp"
+#include "fixtures/fragment_packet_scalar_fixture.hpp"
 #include "fixtures/fragment_packet_wqm_fixture.hpp"
 #include "fixtures/fragment_packet_mbcnt_fixture.hpp"
 #include <algorithm>
@@ -155,7 +156,17 @@ int main() {
         compare(actual, m::expected(hi), "actual original HI control");
     }
     check(mbcnt_ordinal == 100, "all100 original owned MBCNT packets compiled");
-    check(dispatches == 223, "122 prior packet/WQM and101 actual MBCNT/control dispatches");
+    namespace s = prosper::test::fragment_packet::scalar;
+    uint32_t scalar_ordinal = 0;
+    for (const auto& c : s::cases()) {
+        const auto program = prosper::gpu::recompile_fragment_packet(s::packet(c),
+            {prosper::gpu::RecompileDiagnosticStage::Fragment,0x41570000u + scalar_ordinal});
+        const std::string name = "scalar_initialization_" + std::to_string(scalar_ordinal++);
+        check(!program.spirv.empty() && program.rejection.empty(),name + " actual guest emits");
+        if (!program.spirv.empty()) compare(execute(program),s::expected(c),name);
+    }
+    check(scalar_ordinal == 13,"all13 scalar supplied-entry/scratch packets compiled");
+    check(dispatches == 236, "223 prior packet/WQM/MBCNT and13 scalar-initialization dispatches");
     std::printf("fragment_packet_exec: dispatches=%d checks=%d failures=%d "
                 "(owned packets only; no raster/game claim)\n", dispatches, checks, failures);
     return failures ? 1 : 0;

@@ -143,6 +143,12 @@ int main() {
                         const auto entry = shared.find(static_cast<uint64_t>(probe) * kIterations + i);
                         if (entry != shared.end() && entry->second == entry->first * 3 + 1) ++found;
                     }
+                    // Hold the guard across a sleep, as the control arm does (#4123). The map work
+                    // alone is so short that on a loaded host the threads ran one after another and
+                    // the non-vacuity check below failed with no defect present. A sleep yields the
+                    // CPU WHILE the guard is held, so every released thread that runs meanwhile
+                    // queues on it: the contention is constructed, not left to the scheduler.
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
                 }
             });
         for (auto& thread : threads) thread.join();
