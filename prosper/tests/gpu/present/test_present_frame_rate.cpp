@@ -50,6 +50,9 @@ PresentRateSnapshot snapshot_of(const FrameRateCounter& counter, double now_seco
     s.typical_interval_seconds = counter.typical_interval_seconds();
     s.active_seconds = counter.active_seconds();
     s.interval_samples = counter.interval_samples();
+    s.interval_p90_seconds = counter.interval_quantile_seconds(0.90);
+    s.interval_p95_seconds = counter.interval_quantile_seconds(0.95);
+    s.interval_p99_seconds = counter.interval_quantile_seconds(0.99);
     s.now_seconds = now_seconds;
     return s;
 }
@@ -562,6 +565,129 @@ void the_unchanged_picture_verdict_separates_static_from_dead() {
     CHECK(format_unchanged_picture(live_verdict).empty(), "...and prints nothing");
 }
 
+// The tail is the point of a percentile: the median of a run with 2% hitches still reads as a clean
+// 60 fps, and only p99 / "1% low" sees them. Known mixture, so the expected answers are derived from
+// the construction rather than from the implementation under test.
+void percentiles_see_the_tail_the_median_hides() {
+    FrameRateCounter counter;
+    double t = 0;
+    uint8_t v = 0;
+    counter.observe(signature_of(frame(v++)), t);   // the first frame has no interval before it
+    // 1000 intervals: 980 at 1/60 s and 20 at 1/20 s (2%), interleaved so ordering cannot matter.
+    for (int i = 0; i < 1000; i++) {
+        t += (i % 50 == 49) ? 1.0 / 20.0 : 1.0 / 60.0;
+        counter.observe(signature_of(frame(v++)), t);
+    }
+    CHECK(counter.interval_samples() == 1000, "1000 intervals were recorded");
+    const FrameRate rate = frame_rate_since_first_publication(snapshot_of(counter, t));
+    const double tol = kIntervalRelativeError;
+    CHECK(rate.typical_measured && std::fabs(rate.typical_fps - 60.0) <= tol * 60.0 + 1e-9,
+          "the median still reads 60 fps: it cannot see a 2% tail");
+    CHECK(rate.p90_measured && rate.p95_measured && rate.p99_measured,
+          "all three tails resolve at n=1000");
+    CHECK(std::fabs(rate.interval_p90_seconds - 1.0 / 60.0) <= tol / 60.0 + 1e-9,
+          "p90 is still the 60 fps interval (98% of frames are on it)");
+    CHECK(std::fabs(rate.interval_p95_seconds - 1.0 / 60.0) <= tol / 60.0 + 1e-9, "p95 likewise");
+    CHECK(std::fabs(rate.interval_p99_seconds - 1.0 / 20.0) <= tol / 20.0 + 1e-9,
+          "p99 lands on the 50 ms hitch the median hid");
+    CHECK(std::fabs(rate.low_1pct_fps - 20.0) <= tol * 20.0 + 1e-9,
+          "1% low is 1 / p99, about 20 fps, against a 60 fps typical rate");
+    const std::string line = format_frame_percentiles(rate);
+    // The values are pinned numerically above; this pins that the line prints the p99 (about 50 ms,
+    // so it starts with 5) and labels the 1% low, without freezing a bucket-midpoint digit.
+    CHECK(line.find("p99 5") != std::string::npos && line.find("1% low ") != std::string::npos &&
+              line.find(" fps") != std::string::npos,
+          "the formatted line carries the p99 and the 1% low");
+    CHECK(line.find("--") == std::string::npos, "nothing is dashed when every tail resolved");
+}
+
+// The rank boundary, which the 2% mixture above cannot see: with EXACTLY 1% hitches (990 fast, 10 at
+// 50 ms) nearest rank puts the 990th of 1000 sorted intervals -- the last fast one -- at p99. A
+// definition that takes the next sample instead (seen > rank) would report the hitch, so this arm is
+// what pins "nearest rank" as documented rather than as an accident of the test data.
+void p99_at_exactly_one_percent_is_nearest_rank() {
+    FrameRateCounter counter;
+    double t = 0;
+    uint8_t v = 0;
+    counter.observe(signature_of(frame(v++)), t);
+    for (int i = 0; i < 1000; i++) {
+        t += (i % 100 == 99) ? 1.0 / 20.0 : 1.0 / 60.0;
+        counter.observe(signature_of(frame(v++)), t);
+    }
+    const FrameRate rate = frame_rate_since_first_publication(snapshot_of(counter, t));
+    const double tol = kIntervalRelativeError;
+    CHECK(rate.p99_measured &&
+              std::fabs(rate.interval_p99_seconds - 1.0 / 60.0) <= tol / 60.0 + 1e-9,
+          "exactly 1% hitches: nearest-rank p99 is still the fast interval");
+    CHECK(std::fabs(rate.low_1pct_fps - 60.0) <= tol * 60.0 + 1e-9,
+          "...so the 1% low reads the fast rate; a slowest-1% mean would read 20 fps");
+}
+
+// A tail with no sample beyond its rank is just the maximum under a percentile's name. The
+// threshold is n * (1 - q) >= 1, so p90 needs 10 intervals, p95 needs 20 and p99 needs 100.
+void a_short_run_does_not_invent_a_tail() {
+    struct Case { int intervals; bool p90, p95, p99; };
+    const Case cases[] = {{9, false, false, false}, {10, true, false, false},
+                          {20, true, true, false},  {99, true, true, false},
+                          {100, true, true, true}};
+    for (const Case& c : cases) {
+        FrameRateCounter counter;
+        double t = 0;
+        uint8_t v = 0;
+        counter.observe(signature_of(frame(v++)), t);
+        for (int i = 0; i < c.intervals; i++) {
+            t += 1.0 / 60.0;
+            counter.observe(signature_of(frame(v++)), t);
+        }
+        const FrameRate rate = frame_rate_since_first_publication(snapshot_of(counter, t));
+        char message[128];
+        std::snprintf(message, sizeof message, "n=%d resolves p90=%d p95=%d p99=%d",
+                      c.intervals, c.p90, c.p95, c.p99);
+        CHECK(rate.p90_measured == c.p90 && rate.p95_measured == c.p95 &&
+                  rate.p99_measured == c.p99,
+              message);
+        CHECK(rate.p99_measured || rate.low_1pct_fps == 0,
+              "an unresolved 1% low is absent, not zero");
+    }
+    FrameRateCounter few;
+    double t = 0;
+    uint8_t v = 0;
+    few.observe(signature_of(frame(v++)), t);
+    for (int i = 0; i < 12; i++) {
+        t += 1.0 / 60.0;
+        few.observe(signature_of(frame(v++)), t);
+    }
+    const std::string line =
+        format_frame_percentiles(frame_rate_since_first_publication(snapshot_of(few, t)));
+    CHECK(line.find("p90 1") != std::string::npos && line.find("p99 --") != std::string::npos &&
+              line.find("1% low --") != std::string::npos &&
+              line.find("12 distinct-frame") != std::string::npos,
+          "a 12-interval run prints p90, dashes the unresolved tails, and states its sample count");
+}
+
+// A frozen title and a differenced window both have no interval histogram to take a tail from. Both
+// must read as absent, never as a clean tail, and the line must stay empty rather than print dashes
+// that look like a measurement of nothing.
+void unmeasured_populations_report_no_percentiles() {
+    FrameRateCounter frozen;
+    for (int i = 0; i < 300; i++) frozen.observe(signature_of(frame(7)), i / 60.0);
+    const FrameRate dead = frame_rate_since_first_publication(snapshot_of(frozen, 5.0));
+    CHECK(!dead.p90_measured && !dead.p95_measured && !dead.p99_measured && dead.low_1pct_fps == 0,
+          "a frozen title has no tail");
+    CHECK(format_frame_percentiles(dead).empty(), "...and prints no percentile line");
+
+    FrameRateCounter live;
+    double t = 0;
+    uint8_t v = 0;
+    for (int i = 0; i < 500; i++) { live.observe(signature_of(frame(v++)), t); t += 1.0 / 60.0; }
+    const PresentRateSnapshot a = snapshot_of(live, t);
+    for (int i = 0; i < 500; i++) { live.observe(signature_of(frame(v++)), t); t += 1.0 / 60.0; }
+    const FrameRate window = frame_rate_between(a, snapshot_of(live, t));
+    CHECK(!window.p99_measured && window.low_1pct_fps == 0,
+          "a differenced window claims no tail: the histogram is cumulative");
+    CHECK(format_frame_percentiles(window).empty(), "...and prints no percentile line");
+}
+
 } // namespace
 
 int main() {
@@ -571,6 +697,10 @@ int main() {
     std::printf("== frozen, distinct buffers ==\n");     frozen_title_with_distinct_buffers_is_still_frozen();
     std::printf("== a title that pauses (the arm) ==\n"); a_title_that_pauses_reports_its_producing_rate();
     std::printf("== estimator accuracy ==\n");           interval_estimator_is_accurate();
+    std::printf("== percentiles: the hidden tail ==\n"); percentiles_see_the_tail_the_median_hides();
+    std::printf("== percentiles: exact 1%% boundary ==\n"); p99_at_exactly_one_percent_is_nearest_rank();
+    std::printf("== percentiles: short runs ==\n");     a_short_run_does_not_invent_a_tail();
+    std::printf("== percentiles: unmeasured ==\n");     unmeasured_populations_report_no_percentiles();
     std::printf("== window arithmetic ==\n");            window_math();
     std::printf("== windowed active share (#3027) ==\n"); a_windowed_active_share_cannot_be_differenced();
     std::printf("== static vs dead (the arm, #3027) ==\n"); the_unchanged_picture_verdict_separates_static_from_dead();

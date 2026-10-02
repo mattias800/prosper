@@ -958,6 +958,10 @@ int main(int argc, char** argv) {
     // skimming takes the first number, so the first number has to be the one that cannot lie about
     // a frozen title.
     fprintf(stderr, "[shot] fps: %s\n", gpu::format_frame_rate(run_rate).c_str());
+    // A separate line so the fps record's grammar (gen_progress_tracker.py) is untouched. Empty when
+    // the run produced no intervals, in which case nothing is printed rather than dashes.
+    const std::string frame_time = gpu::format_frame_percentiles(run_rate);
+    if (!frame_time.empty()) fprintf(stderr, "[shot] %s\n", frame_time.c_str());
     if (gpu::frame_rate_is_mostly_unchanged(run_rate))
         fprintf(stderr,
                 "[shot] NOTE: only %.1f%% of the %llu published frames carried new content, so the "
