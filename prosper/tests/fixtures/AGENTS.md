@@ -80,6 +80,17 @@ Consequences for anything you change in it:
 
 ## Adding to it
 
+`raster_quad_collection_gpu.h` is a SHIPPING companion of `render_runner.h`, not a second device or
+test-only renderer. Development activation `PROSPER_FRAGMENT_QUAD_COLLECT=1` is pinned at real
+DrawItem realization. Only a refused exact-Wave64 draw can enter its scratch-only input pass;
+native shader admission remains unchanged. It retains exact selected producers and raw PS analysis,
+checks conservative VS/GS effect and interface contracts, and uses the normal submission completion
+owner plus explicit fragment-write-to-host-read availability. Indeterminate completion retains GPU
+owners and publishes no records. Complete records still have no guest input-initialization,
+post-depth export-eligibility, append-order or guest Wave64 packing authority. The registered
+`raster_quad_collection` case arms the actual shipping caller; `raster_quad_realization` is
+device-free producing-ownership evidence only.
+
 Prefer extending an existing harness over a second one that does nearly the same thing; the tests
 that share `render_runner.h` share its device, caches and statistics, and a parallel copy would
 diverge. Fixtures that only one test uses belong beside that test, not here.

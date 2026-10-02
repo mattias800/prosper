@@ -2512,6 +2512,9 @@ if(TARGET prosper_core)
   add_executable(test_normal_magnitude_predicate tests/gpu/recompiler/test_normal_magnitude_predicate.cpp)
   target_link_libraries(test_normal_magnitude_predicate PRIVATE prosper_core)
   add_test(NAME normal_magnitude_predicate COMMAND test_normal_magnitude_predicate)
+  add_executable(test_raster_quad_collector tests/gpu/recompiler/test_raster_quad_collector.cpp)
+  target_link_libraries(test_raster_quad_collector PRIVATE prosper_core)
+  add_test(NAME raster_quad_collector_contract COMMAND test_raster_quad_collector)
   add_executable(test_fragment_float_mode tests/gpu/recompiler/test_fragment_float_mode.cpp)
   target_link_libraries(test_fragment_float_mode PRIVATE prosper_core)
   target_include_directories(test_fragment_float_mode PRIVATE tests)
@@ -5090,6 +5093,21 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
 endif()
 
 if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
+  # #4106: same shipping DrawItem caller, with an explicit device-free ownership arm.
+  add_executable(test_raster_quad_collection tests/shared/live/test_raster_quad_collection.cpp)
+  target_include_directories(test_raster_quad_collection PRIVATE src tests frontends)
+  target_link_libraries(test_raster_quad_collection PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+  add_test(NAME raster_quad_realization COMMAND test_raster_quad_collection --cpu-only)
+  add_test(NAME raster_quad_realization_analysis_unavailable
+    COMMAND test_raster_quad_collection --cpu-only --analysis-unavailable)
+  add_test(NAME raster_quad_collection COMMAND test_raster_quad_collection)
+  set_tests_properties(raster_quad_realization raster_quad_collection PROPERTIES
+    ENVIRONMENT "PROSPER_FRAGMENT_QUAD_COLLECT=1"
+    ENVIRONMENT_MODIFICATION "PROSPER_NO_FRAGMENT_ANALYSIS_REUSE=unset:;PROSPER_NO_SHADER_DECODE_REUSE=unset:;PROSPER_RENDER_REFVS=unset:;PROSPER_FS_SPV=unset:;PROSPER_RENDER_TESTPS=unset:;PROSPER_RENDER_NOPS=unset:;PROSPER_DESCRIPTOR_VALIDATE=unset:;PROSPER_NO_CULL=unset:;PROSPER_FLIP_FRONT_FACE=unset:;PROSPER_NO_DEPTH_BIAS=unset:;PROSPER_SKIP_DRAW=unset:;PROSPER_RENDER_FIRST=unset:;PROSPER_RENDER_LAST=unset:"
+    TIMEOUT 90)
+  set_tests_properties(raster_quad_collection PROPERTIES SKIP_RETURN_CODE 77)
+  set_tests_properties(raster_quad_realization_analysis_unavailable PROPERTIES
+    ENVIRONMENT "PROSPER_FRAGMENT_QUAD_COLLECT=1;PROSPER_NO_FRAGMENT_ANALYSIS_REUSE=1" TIMEOUT 90)
   add_executable(test_render_buffer_capture tests/shared/live/test_render_buffer_capture.cpp)
   target_include_directories(test_render_buffer_capture PRIVATE frontends)
   target_link_libraries(test_render_buffer_capture PRIVATE prosper_live_renderer

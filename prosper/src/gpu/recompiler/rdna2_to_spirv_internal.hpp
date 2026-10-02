@@ -2444,8 +2444,11 @@ struct SpirvCompute {
     // changes. Vulkan flips the winding test on a strip's odd triangle, so both halves agree.
     std::vector<uint32_t> build_interpolation_geometry(
             const FragmentInterpolationLayout& layout, bool capture_geometry_position,
-            bool synthesize_rect = false) {
+            bool synthesize_rect = false, bool publish_primitive_id = false) {
         if ((!layout.requires_geometry && !synthesize_rect) || !layout.valid) return {};
+        // The collector's primitive key covers a one-input/one-output triangle, not RectList's
+        // two generated children. Native geometry emission is unchanged when this is false.
+        if (publish_primitive_id && synthesize_rect) return {};
 
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
@@ -2464,6 +2467,10 @@ struct SpirvCompute {
         const uint32_t ptr_in_v4f = id(), ptr_out_position = id(), ptr_out_v4f = id();
         const uint32_t input_position = id(), output_position = id();
         f_main = id(); const uint32_t label = id(); glsl = id();
+        const uint32_t primitive_in = publish_primitive_id ? id() : 0;
+        const uint32_t primitive_out = publish_primitive_id ? id() : 0;
+        const uint32_t primitive_in_ptr = publish_primitive_id ? id() : 0;
+        const uint32_t primitive_out_ptr = publish_primitive_id ? id() : 0;
 
         std::array<uint32_t, 32> attribute_inputs{}, attribute_outputs{};
         std::array<std::array<uint32_t, 3>, 32> parameter_outputs{};
@@ -2532,6 +2539,11 @@ struct SpirvCompute {
             iface.push_back(variable);
         }
         iface.push_back(input_position); iface.push_back(output_position);
+        if (publish_primitive_id) {
+            put(deco, Op_Decorate, {primitive_in, Dec_BuiltIn, 7});
+            put(deco, Op_Decorate, {primitive_out, Dec_BuiltIn, 7});
+            iface.push_back(primitive_in); iface.push_back(primitive_out);
+        }
 
         put(types, Op_TypeVoid, {t_void});
         put(types, Op_TypeFunction, {t_fn, t_void});
@@ -2539,6 +2551,12 @@ struct SpirvCompute {
         put(types, Op_TypeInt, {t_u32, 32, 0});
         put(types, Op_TypeInt, {t_i32, 32, 1});
         put(types, Op_TypeBool, {t_bool});
+        if (publish_primitive_id) {
+            put(types, Op_TypePointer, {primitive_in_ptr, SC_Input, t_i32});
+            put(types, Op_TypePointer, {primitive_out_ptr, SC_Output, t_i32});
+            put(types, Op_Variable, {primitive_in_ptr, primitive_in, SC_Input});
+            put(types, Op_Variable, {primitive_out_ptr, primitive_out, SC_Output});
+        }
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
         if (synthesize_rect) put(types, Op_TypeVector, {t_v4bool, t_bool, 4});
         put(types, Op_TypeStruct, {t_input_per_vertex, t_v4f});
@@ -2565,6 +2583,8 @@ struct SpirvCompute {
 
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {label}); cur_block = label;
+        const uint32_t primitive_value = publish_primitive_id ? id() : 0;
+        if (publish_primitive_id) put(code, Op_Load, {t_i32, primitive_value, primitive_in});
 
         std::array<std::array<uint32_t, 3>, 32> attribute_values{};
         for (uint32_t attr = 0; attr < 32; ++attr) {
@@ -2693,6 +2713,7 @@ struct SpirvCompute {
 
         const uint32_t output_vertices = synthesize_rect ? 4u : 3u;
         for (uint32_t vertex = 0; vertex < output_vertices; ++vertex) {
+            if (publish_primitive_id) put(code, Op_Store, {primitive_out, primitive_value});
             const uint32_t position = slot_of(vertex, positions, rect_position);
             uint32_t output_pointer = id();
             put(code, Op_AccessChain,
