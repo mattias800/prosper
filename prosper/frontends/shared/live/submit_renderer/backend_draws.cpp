@@ -162,6 +162,7 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
     // PROSPER_GFXLOG at runtime, and a cached read would make its arms vacuous).
     const bool gfxlog = getenv("PROSPER_GFXLOG") != nullptr;
     for (const auto* itp : group) {
+        prosper::test::BackendProducerAttempt producer_attempt;
         const auto& it = *itp;
         if (draw_is_skipped(it.draw_index)) continue;
         prosper::test::BackendDraw bd;
@@ -531,6 +532,7 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
             }
         }
         bds.push_back(std::move(bd));
+        producer_attempt.accepted = true;
     }
     return bds;
 }

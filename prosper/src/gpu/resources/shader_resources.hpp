@@ -539,6 +539,9 @@ struct ShaderResource {
     // Capture obligation, never admission authority: exact raw code must independently prove
     // this PC/width. Missing raw provenance cannot silently replay this resource as guest memory.
     uint32_t owned_raw_snapshot_bytes = 0;
+    // Effective parent/child x4/x8 observation. This is a replay obligation, not a code proof
+    // or a live mapping/producer certificate. Graphics re-derives the complete original chain.
+    uint32_t owned_nested_snapshot_bytes = 0;
 };
 
 inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource,
@@ -904,6 +907,7 @@ struct ShaderResourceTable {
     // Live code-derived capture obligations. Never serialized or trusted by replay: replay's
     // emitter derives the required PC/width independently from the restored exact shader bytes.
     std::vector<std::pair<uint32_t, uint32_t>> owned_raw_snapshot_requirements;
+    std::vector<std::pair<uint32_t, uint32_t>> owned_nested_snapshot_requirements;
 
     // Resolve the resource whose descriptor originates at `srt_offset` (indirect/`s_load` provenance);
     // nullptr if none. Deterministic; first match wins.
@@ -955,6 +959,27 @@ inline const ShaderResource* owned_raw_snapshot_at(const ShaderResourceTable& ta
     return selected && valid_owned_raw_snapshot_resource(*selected, bytes,
                                                          has_host_data(*selected))
         ? selected : nullptr;
+}
+
+template<class HasHostData>
+inline const ShaderResource* owned_nested_snapshot_at(const ShaderResourceTable& table,
+        uint32_t pc, uint32_t bytes, HasHostData has_host_data) {
+    const ShaderResource* selected = nullptr;
+    for (const auto& resource : table.resources) {
+        if (resource.fetch_pc != pc) continue;
+        if (selected) return nullptr;
+        selected = &resource;
+    }
+    return selected && (bytes == 16u || bytes == 32u) &&
+        selected->owned_nested_snapshot_bytes == bytes &&
+        valid_owned_raw_snapshot_resource(*selected, bytes, has_host_data(*selected))
+        ? selected : nullptr;
+}
+
+inline const ShaderResource* owned_nested_snapshot_at(const ShaderResourceTable& table,
+        uint32_t pc, uint32_t bytes) {
+    return owned_nested_snapshot_at(table, pc, bytes,
+        [](const ShaderResource& resource) { return resource.host_data != nullptr; });
 }
 
 inline const ShaderResource* owned_raw_snapshot_at(const ShaderResourceTable& table,

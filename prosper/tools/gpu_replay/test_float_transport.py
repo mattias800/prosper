@@ -89,13 +89,21 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
         launch=b"\x01\x00\x00\x01"+struct.pack("<I",16<<12)
         flags_tail=(struct.pack("<II",0,1)+launch if failed else
                     struct.pack("<I",1)+launch+struct.pack("<I",0))
-        check(struct.unpack_from("<I",data,8)[0]==67 and data.endswith(flags_tail),"genuine independent v67 flags tail")
-        data=bytearray(data[:-len(flags_tail)])
-        struct.pack_into("<I",data,8,66)
+        check(struct.unpack_from("<I",data,8)[0]==68 and data.endswith(flags_tail+bytes(4)),
+              "exact official67 launch flags followed by resource-free nested68 count")
+        official67=bytearray(data[:-4]); struct.pack_into("<I",official67,8,67)
+        check(official67.endswith(flags_tail), "genuine independent official67 flags tail")
+        official66=bytearray(official67[:-len(flags_tail)]); struct.pack_into("<I",official66,8,66)
         tail=(struct.pack("<III",0,0,1)+b"\x02"+struct.pack("<I",1)+b"\x00" if failed else
               struct.pack("<I",1)+b"\x02"+struct.pack("<II",0,0))
-        check(struct.unpack_from("<I",data,8)[0]==66 and data.endswith(tail),"genuine v66 exact profile tail")
-        legacy=bytearray(data[:-len(tail)]); struct.pack_into("<I",legacy,8,65)
+        check(official66.endswith(tail), "genuine official66 profile tail")
+        official_path=directory/("official66"+("-failed" if failed else "")+".prgcap")
+        official_path.write_bytes(official66)
+        inspect=subprocess.run([REPLAY,"--inspect-only",str(official_path)],env=env,
+                               capture_output=True,text=True,timeout=120)
+        check(inspect.returncode==0 and "float-transport=explicit-nonfinite32 source=captured" in inspect.stdout,
+              "genuine official66 retains exact explicit producing profile")
+        legacy=bytearray(official66[:-len(tail)]); struct.pack_into("<I",legacy,8,65)
         (directory/("legacy"+("-failed" if failed else "")+".prgcap")).write_bytes(legacy)
     states=("unknown","implicit","explicit-nonfinite32","legacy")
     modules=0
@@ -155,14 +163,15 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
             check(done.returncode==0 and stored.is_file(),state+" stored module remains usable offline")
             if stored.is_file(): check(facts(stored.read_bytes())[0] == (state!="explicit-nonfinite32"),
                                       state+" opposing stored capability is dormant producer authority")
-    original=(directory/"explicit-nonfinite32.prgcap").read_bytes(); start=len(original)-16-13
+    original=(directory/"explicit-nonfinite32.prgcap").read_bytes(); start=len(original)-4-16-13
     corrupt={"draw-count":original[:start]+struct.pack("<I",2)+original[start+4:],
              "draw-tag":original[:start+4]+b"\x03"+original[start+5:],
              "compute-count":original[:start+5]+struct.pack("<I",1)+original[start+9:],
              "failure-count":original[:start+9]+struct.pack("<I",1)+original[start+13:],
-             "truncated":original[:-1],"trailing":original+b"\x00",
+             "truncated":original[:start+12],"trailing":original+b"\x00",
              "version-only65":original[:8]+struct.pack("<I",65)+original[12:]}
     for name,data in corrupt.items():
+        check(data != original,name+" corruption changes the actual capture")
         capture=directory/(name+".prgcap"); capture.write_bytes(data)
         output=directory/"sentinel.spv"; output.write_bytes(b"unchanged")
         done=subprocess.run([REPLAY,"--inspect-only","--recompile-raw","--dump-shader","7:fs",

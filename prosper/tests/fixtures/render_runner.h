@@ -417,6 +417,8 @@ struct BackendColorTarget {
     uint32_t volume_first_slice = 0;
     uint32_t volume_slice_count = 0;
     uint64_t volume_guest_bytes = 0; // native tiled footprint, supplied by the live producer
+    // Zero means no complete guest layout bound, independently of native image validity.
+    std::array<uint64_t, prosper::gpu::kColorTargetCount> guest_footprint_bytes{};
 };
 
 inline bool backend_color_volume_view_valid(const BackendColorTarget& target) {
@@ -2691,6 +2693,56 @@ inline std::atomic<int>& backend_pending_submission_batches() {
     return pending;
 }
 
+// Consumers compare this generation across THEIR ordered producer epoch. A historical failure
+// alone is not a ban on a disjoint later raw input; pending/unproven work remains independent.
+inline std::atomic<uint64_t>& backend_failed_publication_generation() {
+    static std::atomic<uint64_t> failures{0};
+    return failures;
+}
+
+// A nonempty producer attempt must explicitly reach an accepted boundary. Empty pixel output
+// cannot express this: successful nonfinal and depth-only passes intentionally return no pixels.
+// Enqueued commands are subsequently covered by the batch's fence/discard publication status.
+struct BackendProducerAttempt {
+    bool accepted = false;
+    ~BackendProducerAttempt() {
+        if (!accepted)
+            backend_failed_publication_generation().fetch_add(1, std::memory_order_release);
+    }
+};
+
+inline prosper::GuestDirectAllocation retain_guest_allocation(uint64_t address,
+                                                              uint64_t minimum_bytes = 1u) {
+    prosper::GuestMappingLease lease;
+    return prosper::guest_memory_direct_allocation(lease, address, minimum_bytes);
+}
+
+// An image can receive another producer after its guest VA is rebound. Keep every authenticated
+// original physical interval for this owner's lifetime; neither re-resolving today's VA nor a
+// new allocation birth erases old unpublished bytes. Bound history per owner, failing explicitly
+// when its complete layout or retained origin history is unavailable.
+struct BackendGuestProducerOrigins {
+    std::vector<prosper::GuestDirectAllocation> allocations;
+    bool unknown = false;
+    void retain(const prosper::GuestDirectAllocation& allocation) {
+        if (!allocation.identity) { unknown = true; return; }
+        if (std::any_of(allocations.begin(), allocations.end(), [&](const auto& prior) {
+                return prior.identity == allocation.identity &&
+                    prior.physical_begin == allocation.physical_begin &&
+                    prior.physical_end == allocation.physical_end;
+            })) return;
+        if (allocations.size() >= 64u) { unknown = true; return; }
+        allocations.push_back(allocation);
+    }
+    void observe(uint64_t address, uint64_t physical_bytes) {
+        retain(retain_guest_allocation(address, physical_bytes));
+    }
+    void merge(const BackendGuestProducerOrigins& other) {
+        unknown |= other.unknown;
+        for (const auto& allocation : other.allocations) retain(allocation);
+    }
+};
+
 inline bool backend_has_unproven_submission() {
     return backend_unproven_submission_storage().load(std::memory_order_acquire);
 }
@@ -2867,6 +2919,8 @@ public:
     }
 
     void discard() {
+        if (!commands_.empty())
+            backend_failed_publication_generation().fetch_add(1, std::memory_order_release);
         clear_commands();
         release_gpu_timestamp();
         finish_persistent_state(false);
@@ -3036,6 +3090,8 @@ private:
         const BackendSubmissionState state = backend_submission_state(
             result.submit_result == VK_SUCCESS,
             result.submit_result == VK_SUCCESS && result.wait_result == VK_SUCCESS);
+        if (state != BackendSubmissionState::Complete)
+            backend_failed_publication_generation().fetch_add(1, std::memory_order_release);
         if (state != BackendSubmissionState::Pending) {
             if (state == BackendSubmissionState::Complete && gpu_timestamp_.ended) {
                 uint64_t values[2]{};
@@ -3197,6 +3253,8 @@ struct PersistentColorTargetImage {
     const BackendSubmissionBatch* planned_batch = nullptr;
     ColorProducerTicket planned_ticket;
     prosper::frontend::CompletedProducer planned_producer;
+    BackendGuestProducerOrigins guest_origins;
+    bool guest_producer_seen = false;
 };
 
 inline void invalidate_color_producer(PersistentColorTargetImage& image) {
@@ -3755,6 +3813,8 @@ inline bool restore_persistent_color_target_after_mirrored_write(
     }
     target->compute_overwrite_uninitialized = false;
     target->valid = true;
+    target->guest_producer_seen = true;
+    target->guest_origins.observe(id, 0u); // mirrored compute notification lacks guest layout proof
     // A mirrored compute write has completed, but this path does not yet carry its own producer
     // identity. It must not inherit a renderer version from the overwritten allocation.
     invalidate_color_producer(*target);
@@ -6195,6 +6255,8 @@ struct PersistentDsImage {
     // guest view with SLICE_MAX > SLICE_START (a whole-array clear, layered rendering) writes
     // layers no key names; this records that they were written (#3893 review).
     uint32_t programmed_slice_max = 0;
+    std::array<prosper::GuestDirectAllocation, 5> guest_allocations{};
+    bool guest_producer_seen = false;
 };
 
 inline uint64_t& persistent_ds_write_generation() {
@@ -7340,7 +7402,8 @@ inline bool readback_persistent_color_target(uint64_t id, uint32_t width, uint32
 // truth, fail-visibly).
 inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint32_t width,
                                          uint32_t height, VkFormat format, std::string& error,
-                                         BackendSubmissionBatch* submission_batch = nullptr) {
+                                         BackendSubmissionBatch* submission_batch = nullptr,
+                                         uint64_t guest_footprint_bytes = 0u) {
     error.clear();
     if (backend_has_unproven_submission() ||
         (submission_batch && submission_batch->retains_pending_resources())) {
@@ -7535,6 +7598,8 @@ inline bool copy_persistent_color_target(uint64_t src_id, uint64_t dst_id, uint3
     region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.extent = {width, height, 1};
+    dst->guest_origins.observe(dst_id, guest_footprint_bytes);
+    dst->guest_producer_seen = true;
     vkCmdCopyImage(command, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    dst->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -8436,6 +8501,11 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
                         static_cast<uint32_t>(format), seed.slice};
     PersistentDsImage& image = persistent_ds_cache()[key];
     if (!image.image) {
+        size_t index = 0;
+        for (uint64_t base : {key.dr, key.dw, key.sr, key.sw, key.htile}) {
+            (void)base;
+            image.guest_allocations[index++] = {}; // captures do not certify live native DS allocation bounds
+        }
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         info.imageType = VK_IMAGE_TYPE_2D; info.format = format;
         info.extent = {seed.width, seed.height, 1};
@@ -8491,6 +8561,7 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
         prosper::gpu::free_device_memory(ctx.dev, memory);
     }
     if (transfer != BackendSubmissionState::Complete) return false;
+    image.guest_producer_seen = true;
     image.layout_initialized = true;
     image.depth_valid = seed.depth_valid; image.stencil_valid = seed.stencil_valid;
     return true;
@@ -8664,6 +8735,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (mrt_outputs)
         for (auto& color : mrt_outputs->colors) color.clear();
     if (draws.empty()) return out;
+    BackendProducerAttempt producer_attempt;
+    const size_t requested_draws = draws.size();
     // PROSPER_RENDER_DROP_UNPROVEN_DRAW=1 — DIAGNOSTIC. Discard only the draw carrying an
     // unproven resource instead of the whole batch.
     //
@@ -9134,6 +9207,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             htile_identity = identity->stencil_read_base - 0x10000;
         ds_key = persistent_ds_key_for(*identity, htile_identity, W, H, (uint32_t)DFMT);
         cached_ds = &persistent_ds_cache()[ds_key];
+        if (!cached_ds->image) {
+            size_t index = 0;
+            for (uint64_t base : {ds_key.dr, ds_key.dw, ds_key.sr, ds_key.sw, ds_key.htile}) {
+                (void)base;
+                // Raw DB programming does not yet prove a complete tiled/layered guest plane.
+                // Refuse a later raw snapshot rather than make a linear-size allocation claim.
+                cached_ds->guest_allocations[index++] = {};
+            }
+        }
         cached_ds->programmed_slice_max = std::max({cached_ds->programmed_slice_max, ds_key.slice,
             pass_depth_slice_max});
         // The key carries the PASS extent, so one guest depth surface reached through two passes of
@@ -10315,6 +10397,13 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             return d.ps->color_targets[slot].write_mask != 0;
         });
         if (!cleared && !draw_writes) continue;
+        // Track attempted producers even when optional value/lineage instrumentation is off.
+        // Never-produced empty entries do not impose a raw-source authority obligation.
+        retained->guest_producer_seen = true;
+        const uint64_t guest_address = slot == 0 ? color_key.id :
+            slot == 1 ? color_key1.id : extra_keys[slot].id;
+        retained->guest_origins.observe(guest_address,
+            color_target ? color_target->guest_footprint_bytes[slot] : 0u);
         // A CPU seed replaces the old image contents before the pass. Its provenance is unknown
         // even when the same allocation previously held a completed renderer version.
         const bool loaded_known_image =
@@ -15211,7 +15300,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
 
     const auto timing_recorded = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     active_submission.enqueue(cmd);
+    producer_attempt.accepted = draws.size() == requested_draws &&
+        std::all_of(dv.begin(), dv.end(), [](const auto& draw) { return draw.ok; });
     if (cached_ds) {
+        cached_ds->guest_producer_seen |= (use_depth && depth_used_meaningfully) || use_stencil;
         active_submission.add_failure_cleanup([cached_ds]() {
             cached_ds->layout_initialized = false;
             cached_ds->depth_valid = false;
@@ -16286,6 +16378,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         backend_texture_upload_stats_storage() = {};
         backend_resource_reuse_stats_storage() = {};
         backend_render_timing_stats_storage() = {};
+        if (!all.empty())
+            backend_failed_publication_generation().fetch_add(1, std::memory_order_release);
         return {};
     }
     if (!persist_depth_stencil ||

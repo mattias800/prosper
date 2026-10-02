@@ -55,6 +55,10 @@ struct ColorTargetState {
     uint32_t mip_tail_offset = 0, mip_tail_x = 0, mip_tail_y = 0;
 };
 
+// Complete physical extent of one supported native color view; zero means unproved. This
+// certificate is used before raw input snapshots, not a guess from a host image's linear size.
+uint64_t color_target_physical_bytes(const ColorTargetState& target);
+
 struct ColorTargetVolumeView {
     uint32_t selected_mip_depth = 0; // physical depth after selecting CB_COLORn_VIEW.MIP_LEVEL
     uint32_t first_slice = 0;

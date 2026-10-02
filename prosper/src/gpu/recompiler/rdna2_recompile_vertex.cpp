@@ -925,15 +925,18 @@ std::vector<uint32_t> recompile_vertex_ngg_one_lane_for_test(
 bool rdna2_vertex_chain_has_owned_raw_wide_inputs(
         const uint32_t* prolog, size_t prolog_dwords,
         const uint32_t* main, size_t main_dwords, const ShaderResourceTable* resources) {
-    if (resources && (!resources->owned_raw_snapshot_requirements.empty() || std::any_of(
+    if (resources && (!resources->owned_raw_snapshot_requirements.empty() ||
+            !resources->owned_nested_snapshot_requirements.empty() || std::any_of(
             resources->resources.begin(), resources->resources.end(),
-            [](const auto& resource) { return resource.owned_raw_snapshot_bytes != 0u; })))
+            [](const auto& resource) { return resource.owned_raw_snapshot_bytes != 0u ||
+                                            resource.owned_nested_snapshot_bytes != 0u; })))
         return true;
     const auto requires_owned = [](const uint32_t* code, size_t dwords) {
         if (!code || !dwords) return false;
         std::vector<Rdna2Inst> decoded;
         rdna2_walk(code, dwords, decoded);
-        return !rdna2_owned_raw_wide_data_loads(decoded).empty();
+        return !rdna2_owned_raw_wide_data_loads(decoded).empty() ||
+            !rdna2_owned_nested_wide_chains(decoded).empty();
     };
     if (requires_owned(prolog, prolog_dwords) || requires_owned(main, main_dwords)) return true;
     if (!prolog || !main) return false;

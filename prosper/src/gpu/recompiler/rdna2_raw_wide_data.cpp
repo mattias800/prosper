@@ -868,4 +868,53 @@ std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(
     return proven;
 }
 
+std::vector<uint32_t> rdna2_raw_nested_numeric_loads(const std::vector<Rdna2Inst>& ins) {
+    const auto numeric = rdna2_raw_wide_data_loads(ins);
+    std::vector<uint32_t> result;
+    for (size_t index = 0; index < ins.size(); ++index) {
+        const auto& load = ins[index];
+        if (load.fmt != Rdna2Format::SMEM || load.src[0].kind != OperandKind::SGPR ||
+            load.src[1].kind != OperandKind::Special || load.src[1].value != 125 ||
+            !std::binary_search(numeric.begin(), numeric.end(), load.pc)) continue;
+        bool written = false;
+        for (size_t before = 0; before < index; ++before)
+            for_each_scalar_write(ins[before], [&](int base, uint32_t width) {
+                written |= base < load.src[0].value + 2 &&
+                           load.src[0].value < base + static_cast<int>(width);
+            });
+        if (written) result.push_back(load.pc);
+    }
+    return result;
+}
+
+std::vector<RawNestedWideChain> rdna2_owned_nested_wide_chains(
+        const std::vector<Rdna2Inst>& ins) {
+    if (std::any_of(ins.begin(), ins.end(), rdna2_may_write_guest_memory)) return {};
+    const auto children = rdna2_proven_raw_nested_wide_data_loads(ins);
+    const auto parents = rdna2_proven_raw_immediate_wide_data_loads(ins);
+    std::vector<RawNestedWideChain> chains;
+    for (uint32_t pc : children) {
+        const auto child = std::find_if(ins.begin(), ins.end(),
+            [pc](const Rdna2Inst& in) { return in.pc == pc; });
+        if (child == ins.end()) return {};
+        const Rdna2Inst* parent = nullptr;
+        for (auto it = ins.begin(); it != child; ++it)
+            if (it->fmt == Rdna2Format::SMEM &&
+                (it->opcode == 0x2u || it->opcode == 0x3u) &&
+                it->dst.kind == OperandKind::SGPR &&
+                it->dst.value == child->src[0].value &&
+                std::binary_search(parents.begin(), parents.end(), it->pc)) parent = &*it;
+        if (!parent) return {};
+        // One bounded hop only. The effective snapshots are short; offsets cannot authenticate
+        // a giant allocation, negative addressing, or a later pointer chain.
+        const uint32_t parent_bytes = parent->opcode == 0x2u ? 16u : 32u;
+        const uint32_t child_bytes = child->opcode == 0x2u ? 16u : 32u;
+        if (uint64_t(parent->literal) + parent_bytes > 0x100000u ||
+            uint64_t(child->literal) + child_bytes > 0x100000u) continue;
+        chains.push_back({parent->pc, child->pc, parent_bytes, child_bytes,
+                          parent->literal, child->literal});
+    }
+    return chains;
+}
+
 } // namespace prosper::gpu

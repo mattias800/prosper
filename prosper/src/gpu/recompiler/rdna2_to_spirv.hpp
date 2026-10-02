@@ -226,6 +226,19 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
 // A dispatch must additionally own the parent/child bytes and exclude writable aliases.
 std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(
     const std::vector<Rdna2Inst>& instructions);
+// Graphics owns both effective observations. The full original program must exclude every
+// possible guest writer; a selected/sliced body cannot supply this authority.
+struct RawNestedWideChain {
+    uint32_t parent_pc = 0, child_pc = 0;
+    uint32_t parent_bytes = 0, child_bytes = 0;
+    uint32_t parent_offset = 0, child_offset = 0;
+    bool operator==(const RawNestedWideChain&) const = default;
+};
+std::vector<RawNestedWideChain> rdna2_owned_nested_wide_chains(
+    const std::vector<Rdna2Inst>& instructions);
+// Refusal census only: numeric immediate x4/x8 loads whose pointer words may be written by
+// earlier code. This conservative set confers no reaching-definition or ownership authority.
+std::vector<uint32_t> rdna2_raw_nested_numeric_loads(const std::vector<Rdna2Inst>& ins);
 bool rdna2_may_write_guest_memory(const Rdna2Inst& instruction);
 
 // Per-invocation provenance for fail-visible shader diagnostics. This is observation-only metadata:

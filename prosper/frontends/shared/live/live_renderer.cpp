@@ -35,6 +35,7 @@
 
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/execute/gpu_execute.hpp"          // DrawItem, set_submit_renderer
+#include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/timeline/gpu_timeline.hpp"         // phase-gated detailed-capture policy
 #include "gpu/capture/writer_provenance.hpp"
 #include "gpu/capture/gpu_capture.hpp"          // temporal RTT capture/replay seeds
@@ -169,6 +170,7 @@ void register_cpu_rtt_dcc_metadata(
                 if (!metadata_bytes) continue;
                 surface->second.dcc_metadata_addr = resource.metadata_addr;
                 surface->second.dcc_metadata_bytes = metadata_bytes;
+                surface->second.dcc_guest_origins.observe(resource.metadata_addr, metadata_bytes);
             }
         }
     }
@@ -594,6 +596,54 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // compute-only use (tests/gpu/recompiler/test_game_compute.cpp) still creates its own device.
     (void)prosper::test::render_vk_ctx();
     static RttCache g_rtt;   // render-to-texture cache (#167)
+    prosper::gpu::set_graphics_producer_status_query([] {
+        return prosper::gpu::GraphicsProducerStatus{
+            true, prosper::test::backend_has_unproven_submission() ||
+                prosper::test::backend_pending_submission_batches().load(std::memory_order_acquire) != 0,
+            prosper::test::backend_failed_publication_generation().load(std::memory_order_acquire)};
+    });
+    prosper::gpu::set_graphics_raw_source_authority(
+        [](const prosper::GuestMappingLease& lease, uint64_t address, uint32_t bytes) {
+            prosper::test::BackendPersistentResourceGuard guard;
+            if (prosper::test::backend_has_unproven_submission() ||
+                prosper::test::backend_pending_submission_batches().load(std::memory_order_acquire))
+                return false;
+            const auto disjoint = [&](const prosper::test::BackendGuestProducerOrigins& origins) {
+                return !origins.unknown && !origins.allocations.empty() &&
+                    std::all_of(origins.allocations.begin(), origins.allocations.end(),
+                        [&](const auto& producer) {
+                            return prosper::guest_memory_retained_allocation_relation(lease, address,
+                                bytes, producer) == prosper::GuestMemoryTopologyRelation::Disjoint;
+                        });
+            };
+            // A recorded, complete producer layout must fit inside its original physical
+            // allocation. Exclude that whole allocation, including padding and unselected bytes;
+            // same-allocation inputs refuse even when their VAs are disjoint. Missing layout or
+            // origin proof is Unknown, including unsupported DS/array/tail shapes. The allocator,
+            // never a readable VMA or today's resolution of an old target VA, supplies the bounds.
+            for (const auto& [base, surface] : g_rtt) {
+                (void)base;
+                if (!surface.rgba && !surface.has_uniform_color && !surface.gpu_valid &&
+                    !surface.volume_guest_bytes) continue; // never-produced empty entry
+                if (!disjoint(surface.guest_origins)) return false;
+                if (surface.dcc_metadata_addr && !disjoint(surface.dcc_guest_origins)) return false;
+            }
+            for (const auto& [key, image] : prosper::test::persistent_color_target_cache()) {
+                (void)key;
+                if (image.guest_producer_seen && !disjoint(image.guest_origins)) return false;
+            }
+            for (const auto& [key, image] : prosper::test::persistent_ds_cache()) {
+                if (!image.guest_producer_seen) continue;
+                size_t index = 0;
+                for (uint64_t base : {key.dr, key.dw, key.sr, key.sw, key.htile}) {
+                    if (base && prosper::guest_memory_retained_allocation_relation(lease, address,
+                            bytes, image.guest_allocations[index]) !=
+                            prosper::GuestMemoryTopologyRelation::Disjoint) return false;
+                    ++index;
+                }
+            }
+            return true;
+        });
     // PROSPER_FLIP_GUEST_SCANOUT=1 (default OFF): let a guest FLIP publish the guest's own scanout
     // buffer when the renderer has produced nothing at all.
     //
@@ -1182,6 +1232,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 prosper::test::invalidate_persistent_color_target_dimension_aliases(
                     write.gpu_addr, write.width, write.height, format, 0u);
                 RttSurf& published = g_rtt[write.gpu_addr];
+                // Linear CPU pixels do not name the compute program's tiled guest write extent.
+                published.guest_origins.observe(write.gpu_addr, 0u);
                 published.rgba = write.linear_pixels;
                 published.has_uniform_color = false;
                 published.w = write.width;
@@ -1207,6 +1259,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 return;
             }
             RttSurf& published = g_rtt[write.gpu_addr];
+            // This notification names the exact image, but has no complete guest-layout bound.
+            // Preserve its old authenticated allocation if one exists; do not re-resolve its VA.
+            const auto* retained = prosper::test::find_persistent_color_target(
+                write.gpu_addr, write.width, write.height, format, false);
+            if (retained) published.guest_origins.merge(retained->guest_origins);
+            else published.guest_origins.observe(write.gpu_addr, 0u);
             published.rgba.reset();
             published.has_uniform_color = false;
             published.w = write.width;
@@ -1293,6 +1351,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 error = "invalid temporal RTT seed"; return false;
             }
             RttSurf& surface = g_rtt[seed.guest_addr];
+            surface.guest_origins.observe(seed.guest_addr, 0u); // capture pixels do not certify a live guest layout
             surface.w = seed.width; surface.h = seed.height;
             surface.volume_depth = 0;
             surface.format = format;
@@ -1490,7 +1549,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 g_this_submit = g_submit_idx++;
                 g_force_this_submit = false;
             }
-            if (g_this_submit > g_render_last) return {};
+            if (g_this_submit > g_render_last) {
+                if (!items.empty())
+                    prosper::test::backend_failed_publication_generation().fetch_add(
+                        1, std::memory_order_release);
+                return {};
+            }
             static const auto& g_rttlog_min_submit = callback_state->g_rttlog_min_submit();
             static const auto& g_rttlog_max_submit = callback_state->g_rttlog_max_submit();
             scan_for_descriptors_once(static_cast<uint64_t>(g_this_submit < 0 ? 0 : g_this_submit));
@@ -1588,7 +1652,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 fprintf(stderr, "[render] wall-clock warmup complete after %lld ms at submit %d\n",
                         (long long)elapsed_ms, g_this_submit);
             }
-            if ((g_this_submit < g_render_first || before_delay) && !g_force_this_submit) return {};
+            if ((g_this_submit < g_render_first || before_delay) && !g_force_this_submit) {
+                // The renderer deliberately omitted this producer. A later forced/delayed span
+                // must not consume its guest backing as a successfully published current epoch.
+                // Successful nonfinal callbacks may also return no pixels; only this explicit
+                // nonempty omission advances the failure generation.
+                if (!items.empty())
+                    prosper::test::backend_failed_publication_generation().fetch_add(
+                        1, std::memory_order_release);
+                return {};
+            }
             // Dump the FIRST item's recompiled SPIR-V (diagnostic; survives a mid-render crash).
             ShaderDumpContext dump_first_item_spirv_ctx{
                 .items = items};
@@ -1941,6 +2014,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     for (const auto& it : items) if (it.color0_base) { tgt = it.color0_base; break; }
                     if (tgt) {
                         RttSurf& s = g_rtt[tgt];
+                        uint64_t physical_bytes = 0;
+                        for (const auto& item : items) {
+                            if (item.color0_base != tgt) continue;
+                            const uint64_t bytes = raw_snapshot_color_footprint(item, 0);
+                            if (!bytes) { physical_bytes = 0; break; }
+                            physical_bytes = std::max(physical_bytes, bytes);
+                        }
+                        s.guest_origins.observe(tgt, physical_bytes);
                         s.rgba = selected_pixels; s.w = w; s.h = h;
                         s.volume_depth = 0;
                         s.format = VK_FORMAT_R8G8B8A8_UNORM; s.gpu_valid = false;
