@@ -262,7 +262,7 @@ void report_no_vulkan_driver() {
         "[app] C:\\Windows\\System32\\DriverStore\\FileRepository\\<driver package>\\). See BUILDING.md.\n");
 }
 
-uint32_t find_mem(VkPhysicalDevice p,uint32_t typeBits, VkMemoryPropertyFlags props) {
+uint32_t find_mem(VkPhysicalDevice p, uint32_t typeBits, VkMemoryPropertyFlags props) {
     VkPhysicalDeviceMemoryProperties m; vkGetPhysicalDeviceMemoryProperties(p, &m);
     for (uint32_t i = 0; i < m.memoryTypeCount; i++)
         if ((typeBits & (1u << i)) && (m.memoryTypes[i].propertyFlags & props) == props) return i;
@@ -1320,6 +1320,22 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
     return true;
 }
 
+// A startup failure after start_guest() has launched g_guest_thread (#4141). Returning from main
+// would destroy that still-joinable std::thread, which is std::terminate ("terminate called without
+// an active exception"); detaching and returning would run static teardown under a live guest, the
+// hazard the normal shutdown path documents. So exit the way that path does, without its Vulkan wait:
+// close the submit gate, bound the drain, flush the exit reports, _Exit. Before a guest exists this
+// is a plain `return 1`.
+int exit_startup_failure() {
+    if (!g_guest_thread.joinable()) return 1;
+    g_guest_thread.detach();
+    prosper::gpu_submit_gate_begin_shutdown();
+    (void)prosper::gpu_submit_gate_drain(2000);
+    prosper::diagnostics::flush_exit_reports();
+    fflush(nullptr);
+    std::_Exit(1);
+}
+
 // The host folder picker. SDL may deliver the result on another thread, so the callback only parks
 // the chosen path; the event loop consumes it between frames, where booting is safe.
 std::mutex g_picked_mutex;
@@ -1660,7 +1676,7 @@ int main(int argc, char** argv) {
                         "(drop a game folder on it, or press Ctrl+O).\n");
     }
 
-    if (!SDL_Init(SDL_INIT_VIDEO)) { fprintf(stderr, "[app] SDL_Init: %s\n", SDL_GetError()); return 1; }
+    if (!SDL_Init(SDL_INIT_VIDEO)) { fprintf(stderr, "[app] SDL_Init: %s\n", SDL_GetError()); return exit_startup_failure(); }
 #ifdef __APPLE__
     // There is no system Vulkan loader on macOS; point SDL at MoltenVK so SDL_Vulkan_* uses the same
     // driver this binary links. PROSPER_VULKAN_LIB overrides the path; default resolves via the
@@ -1668,7 +1684,7 @@ int main(int argc, char** argv) {
     if (!SDL_Vulkan_LoadLibrary(getenv("PROSPER_VULKAN_LIB") ? getenv("PROSPER_VULKAN_LIB") : "libMoltenVK.dylib")) {
         fprintf(stderr, "[app] SDL_Vulkan_LoadLibrary(MoltenVK): %s\n", SDL_GetError());
         fprintf(stderr, "[app] set PROSPER_VULKAN_LIB=/path/to/libMoltenVK.dylib\n");
-        return 1;
+        return exit_startup_failure();
     }
 #endif
     // Title: "prosper - <game name>" for a booted game, else a label saying what the empty window
@@ -1680,10 +1696,7 @@ int main(int argc, char** argv) {
         const char* err = SDL_GetError();
         fprintf(stderr, "[app] SDL_CreateWindow: %s\n", err);
         if (vulkan_error_means_no_driver(err)) report_no_vulkan_driver();
-        // _Exit: threads started earlier may still be joinable, and unwinding main would
-        // reach std::terminate ("terminate called without an active exception").
-        fflush(stderr);
-        std::_Exit(1);
+        return exit_startup_failure();
     }
 
     Vk vk;
@@ -1693,11 +1706,11 @@ int main(int argc, char** argv) {
     const bool wantGpuPresent = prosper::frontend::request_gpu_present(
         getenv("PROSPER_APP_GPU_PRESENT"), testPattern, !dump.empty());
     if (!wantGpuPresent || !try_adopt_shared_present(vk, win)) {
-        if (!create_instance(vk, win) || !pick_device(vk)) return 1;
+        if (!create_instance(vk, win) || !pick_device(vk)) return exit_startup_failure();
     }
     // Initial swapchain sized to the window; recreated on resize / out-of-date.
     { int dw = 0, dh = 0; SDL_GetWindowSizeInPixels(win, &dw, &dh);
-      if (!create_swapchain(vk, (uint32_t)dw, (uint32_t)dh, requestedPresentMode)) return 1; }
+      if (!create_swapchain(vk, (uint32_t)dw, (uint32_t)dh, requestedPresentMode)) return exit_startup_failure(); }
 
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; cpi.queueFamilyIndex = vk.qfamily;
@@ -1707,7 +1720,7 @@ int main(int argc, char** argv) {
     vkAllocateCommandBuffers(vk.device, &cai, &vk.cmd);
     if (!replace_present_sync(vk)) {
         fprintf(stderr, "[app] could not create present synchronization\n");
-        return 1;
+        return exit_startup_failure();
     }
 
     fprintf(stderr, "[app] window up (%s). Close the window or press Esc to quit.\n",
