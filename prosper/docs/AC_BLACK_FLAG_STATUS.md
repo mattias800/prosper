@@ -27,6 +27,9 @@ hour (see § Ruled out).
 
 ## Reproduction route
 
+The diagnostic route below uses a build with open PR #4129 applied;
+`PROSPER_EXIT_ON_GUEST_END` is not available on unmodified main.
+
 ```powershell
 $env:PROSPER_RENDER='1'; $env:PROSPER_GUEST_ARGS='-force-gfx-direct'
 $env:PROSPER_BOOTPHASE='1'; $env:PROSPER_EXIT_ON_GUEST_END='1'
@@ -52,8 +55,9 @@ $env:PROSPER_BOOTPHASE='1'; $env:PROSPER_EXIT_ON_GUEST_END='1'
    and the primary thread died (`ACCESS-VIOLATION addr=0x3 rax=0x3`). With the fix the guest passes
    that instruction and the `SystemLogger` thread runs. `CONFIDENCE: MED` on the handle layout (first
    dword is the thread id): inferred from this one disassembly, not checked against a PS5.
-2. **Next, and now explained: the title aborts itself on a failed archive read.** The process exit
-   code `0xC0000005` is the title's own deliberate crash, not a prosper host fault. Under gdb (Python
+2. **Next: the observed fault is the title's abort path after a failed archive read.** The process
+   exit code `0xC0000005` comes from a deliberate guest write to address 2. The cause of the failed
+   archive read remains unresolved. Under gdb (Python
    script that lets prosper's expected `%fs:0` TLS-emulation faults and the init-function fault pass),
    the first other fault is at `eboot+0x5bcf9e4`, `mov DWORD PTR ds:0x2,0x0` (a write to address 2),
    reached straight after `call eboot+0x80` with `esi=0x100`. That is a `snprintf`-style call into a
@@ -65,8 +69,9 @@ $env:PROSPER_BOOTPHASE='1'; $env:PROSPER_EXIT_ON_GUEST_END='1'
    whether that is prosper leaving an output uninitialised (for example an unimplemented `ftell` or
    `fgetpos`) is **not** established. Evidence: `gdb` run 2026-10-02 at main `deff140b8d4a` plus
    #4129; disassembly of the SELF `eboot.bin` flattened with `tools/il2cpp/prx_to_elf.py`. Still
-   open: which libc or kernel call failed, with what offset and whence, and on which archive. The
-   stubs listed below were **not** the cause of this abort.
+   open: which libc or kernel call failed, with what offset and whence, and on which archive.
+   Locating the final fault in guest code does not rule out an earlier HLE error or unfilled output
+   as the cause of the failed seek; the stubs listed below remain untested.
 
 Unexplained and not yet shown to matter:
 
@@ -92,7 +97,7 @@ Unexplained and not yet shown to matter:
   from prosper.
 - **"The host crashes in an HLE stub after `sceKeyboardInit`."** Falsified for the first host-visible
   death: the exit code `0xC0000005` is the title's own abort path (write to address 2 after formatting
-  `fseek error while reading the fat ...`), reached from `eboot+0x5bcf9e4`. The unimplemented stubs
-  seen before it did not cause it. They may still matter later.
+  `fseek error while reading the fat ...`), reached from `eboot+0x5bcf9e4`. This identifies the final
+  faulting instruction; it does not rule out an earlier HLE error as the cause of the failed seek.
 - **"The boot or link phase is what stalls."** Falsified by the phase log: all seven phases complete
   (`PROCESS_START` through `BOOT_COMPLETE`) in under 2.1 s.
