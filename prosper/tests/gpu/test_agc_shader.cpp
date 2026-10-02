@@ -1,4 +1,5 @@
-// test_agc_shader -- focused guards for sceAgcCreateShader's guest-visible side effects.
+// test_agc_shader -- shader registration and real stage-table provenance guards. A loaded buffer
+// descriptor must retain its consumer PC even when metadata already describes the same memory.
 #include "hle/dispatch/dispatch.hpp"
 #include <gtest/gtest.h>
 #include "gpu/capture/gpu_capture.hpp"
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <iterator>
 #include <thread>
 #include <vector>
 
@@ -610,6 +612,126 @@ TEST(AgcShader, Contract) {
               prosper::gpu::shader_resource_buffer_binding_bytes(
                   *narrow_scalar_resource) == 4u,
           "graphics stage table bounds scalar dwords by the V# byte footprint");
+
+    // #4167: a descriptor loaded through a scalar buffer has no SRT key. The RAW consumer must
+    // resolve by its own PC after the load rewrites SRSRC. A matching metadata VertexBuffer with
+    // no PC, or a dynamic format fetch with another PC, cannot replace that provenance.
+    alignas(16) static uint32_t publication_payload[4] = {
+        0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u,
+    };
+    alignas(16) static uint32_t distinct_publication_payload[4] = {
+        0x40a00000u, 0x40c00000u, 0x40e00000u, 0x41000000u,
+    };
+    alignas(16) static uint32_t publication_descriptor[4];
+    static uint16_t publication_offsets[16];
+    for (auto& offset : publication_offsets) offset = 0xffffu;
+    publication_offsets[8] = 4u; // metadata V# at user dword4 -> shader s[12:15]
+    static ShaderUserData publication_user{};
+    publication_user.direct_resource_offset = publication_offsets;
+    publication_user.direct_resource_count = 16u;
+    static const uint32_t publication_code[] = {
+        0xf4280604u, 0xfa000000u, // pc0: s_buffer_load_dwordx4 s[24:27],s[8:11],0
+        0xe0300000u, 0x80060000u, // pc2: buffer_load_dword v0,off,s[24:27],0
+        0xf80008cfu, 0x00000000u, // export the loaded word in the position components
+        0xbf810000u,
+    };
+    static const uint32_t publication_format_code[] = {
+        0xf4280604u, 0xfa000000u,
+        0xe0000000u, 0x80060200u, // pc2: format fetch through the same loaded s[24:27]
+        0xe0300000u, 0x80060000u, // pc4: independent raw consumer of that descriptor
+        0xf80008cfu, 0x00000000u,
+        0xbf810000u,
+    };
+    static Shader publication_shader{}, publication_format_shader{};
+    publication_shader.file_header = publication_format_shader.file_header = 0x34333231u;
+    publication_shader.version = publication_format_shader.version = 0x18u;
+    publication_shader.type = publication_format_shader.type = 2u;
+    publication_shader.user_data = &publication_user;
+    publication_shader.shader_size = sizeof(publication_code);
+    publication_format_shader.shader_size = sizeof(publication_format_code);
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                       reinterpret_cast<uint64_t>(&publication_shader),
+                       reinterpret_cast<uint64_t>(publication_code), 0, 0, 0);
+    CHECK(rc == 0 && dst == &publication_shader,
+          "keyless buffer-publication shader enters the real AGC registry");
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst),
+                       reinterpret_cast<uint64_t>(&publication_format_shader),
+                       reinterpret_cast<uint64_t>(publication_format_code), 0, 0, 0);
+    CHECK(rc == 0 && dst == &publication_format_shader,
+          "two-consumer buffer-publication shader enters the real AGC registry");
+    auto publication_vsharp = [](uint32_t* words, uint64_t base) {
+        words[0] = static_cast<uint32_t>(base);
+        words[1] = (static_cast<uint32_t>(base >> 32u) & 0xffffu) | (4u << 16u);
+        words[2] = 4u;
+        words[3] = (22u << 12u) | 0xfacu;
+    };
+    publication_vsharp(publication_descriptor, reinterpret_cast<uint64_t>(publication_payload));
+    uint32_t metadata_descriptor[4];
+    publication_vsharp(metadata_descriptor, reinterpret_cast<uint64_t>(publication_payload));
+    prosper::gpu::GpuState publication_state;
+    constexpr uint32_t kGsUser = prosper::agc::Pm4::SPI_SHADER_USER_DATA_GS_0;
+    const uint64_t publication_table_addr = reinterpret_cast<uint64_t>(publication_descriptor);
+    publication_state.sh[kGsUser] = static_cast<uint32_t>(publication_table_addr);
+    publication_state.sh[kGsUser + 1u] = static_cast<uint32_t>(publication_table_addr >> 32u) & 0xffffu;
+    publication_state.sh[kGsUser + 2u] = sizeof(publication_descriptor); // unstrided byte bound
+    publication_state.sh[kGsUser + 3u] = (22u << 12u) | 0xfacu;
+    for (uint32_t i = 0; i < 4u; ++i)
+        publication_state.sh[kGsUser + 4u + i] = metadata_descriptor[i];
+    auto publication_table = prosper::gpu::build_stage_table(
+        publication_state, reinterpret_cast<uint64_t>(publication_code), false, 1);
+    const auto* metadata_buffer = publication_table ? publication_table->by_sgpr_base(12u) : nullptr;
+    const auto* published_buffer = publication_table ? publication_table->by_fetch_pc(2u) : nullptr;
+    CHECK(metadata_buffer && metadata_buffer->cls == prosper::gpu::ResourceClass::VertexBuffer &&
+              metadata_buffer->fetch_pc == UINT32_MAX &&
+              metadata_buffer->gpu_addr == reinterpret_cast<uint64_t>(publication_payload),
+          "metadata VertexBuffer keeps its original direct-SGPR provenance");
+    CHECK(published_buffer && published_buffer != metadata_buffer &&
+              published_buffer->gpu_addr == reinterpret_cast<uint64_t>(publication_payload) &&
+              published_buffer->size == sizeof(publication_payload) && published_buffer->stride == 4u &&
+              !prosper::gpu::recompile_vertex(publication_code, std::size(publication_code),
+                                             publication_table.get()).empty(),
+          "matching metadata VertexBuffer preserves the loaded raw consumer PC and compilation");
+    publication_user.direct_resource_count = 0u;
+    auto no_metadata_table = prosper::gpu::build_stage_table(
+        publication_state, reinterpret_cast<uint64_t>(publication_code), false, 1);
+    CHECK(no_metadata_table && no_metadata_table->by_fetch_pc(2u) &&
+              !prosper::gpu::recompile_vertex(publication_code, std::size(publication_code),
+                                             no_metadata_table.get()).empty(),
+          "loaded raw consumer also compiles without an existing metadata buffer");
+    publication_user.direct_resource_count = 16u;
+    publication_vsharp(publication_descriptor,
+                       reinterpret_cast<uint64_t>(distinct_publication_payload));
+    auto distinct_table = prosper::gpu::build_stage_table(
+        publication_state, reinterpret_cast<uint64_t>(publication_code), false, 1);
+    CHECK(distinct_table && distinct_table->by_fetch_pc(2u) &&
+              distinct_table->by_fetch_pc(2u)->gpu_addr ==
+                  reinterpret_cast<uint64_t>(distinct_publication_payload) &&
+              distinct_table->by_sgpr_base(12u) &&
+              distinct_table->by_sgpr_base(12u)->gpu_addr ==
+                  reinterpret_cast<uint64_t>(publication_payload) &&
+              !prosper::gpu::recompile_vertex(publication_code, std::size(publication_code),
+                                             distinct_table.get()).empty(),
+          "different loaded memory never borrows the metadata buffer");
+    publication_vsharp(publication_descriptor, reinterpret_cast<uint64_t>(publication_payload));
+    auto two_consumer_table = prosper::gpu::build_stage_table(
+        publication_state, reinterpret_cast<uint64_t>(publication_format_code), false, 1);
+    CHECK(two_consumer_table && two_consumer_table->by_fetch_pc(2u) &&
+              two_consumer_table->by_fetch_pc(2u)->cls == prosper::gpu::ResourceClass::VertexBuffer &&
+              two_consumer_table->by_fetch_pc(4u) &&
+              two_consumer_table->by_fetch_pc(4u)->gpu_addr ==
+                  reinterpret_cast<uint64_t>(publication_payload) &&
+              !prosper::gpu::recompile_vertex(publication_format_code,
+                      std::size(publication_format_code), two_consumer_table.get()).empty(),
+          "dynamic format fetch keeps its PC without discarding a second raw consumer");
+    publication_state.sh[kGsUser] = publication_state.sh[kGsUser + 1u] = 0u;
+    auto invalid_source_table = prosper::gpu::build_stage_table(
+        publication_state, reinterpret_cast<uint64_t>(publication_code), false, 1);
+    CHECK(invalid_source_table && !invalid_source_table->by_fetch_pc(2u) &&
+              prosper::gpu::recompile_vertex(publication_code, std::size(publication_code),
+                                             invalid_source_table.get()).empty(),
+          "invalid scalar-buffer source refuses instead of substituting a metadata VertexBuffer");
 
     // An exactly-zero T# recovered from a descriptor table is an explicit null sampled image, not
     // a missing resource. Exercise build_stage_table itself: the production fix lives in its dynamic

@@ -191,7 +191,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v66: actual producing float transport profile, independently retained from guest MODE.
 // v67: independent observed IEEE_MODE/DX10_CLAMP and full RSRC1_PS evidence for realized/failed draws.
 // Older captures retain Unknown, never infer flags from known FLOAT_MODE or a host profile.
-constexpr uint32_t kVersion = 67;
+// v68: effective owned parent/child widths for direct graphics one-hop numeric loads. Code and
+// actually observed byte owners independently authenticate the chain; no live proof is serialized.
+constexpr uint32_t kVersion = 68;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -1503,6 +1505,10 @@ inline bool capture_authority_requires_backing(const ShaderResourceTable* table,
     if (!table || !resource.gpu_addr) return false;
     if (std::any_of(table->owned_raw_snapshot_requirements.begin(),
                     table->owned_raw_snapshot_requirements.end(), [&](const auto& requirement) {
+            return requirement.first == resource.fetch_pc;
+        })) return true;
+    if (std::any_of(table->owned_nested_snapshot_requirements.begin(),
+                    table->owned_nested_snapshot_requirements.end(), [&](const auto& requirement) {
             return requirement.first == resource.fetch_pc;
         })) return true;
     const uint64_t footprint = resource_footprint(resource);

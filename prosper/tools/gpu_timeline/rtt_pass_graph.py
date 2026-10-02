@@ -46,7 +46,7 @@ def fmt_name(n):
 def parse(path):
     """Yield frames, each a list of passes; a pass is (target, w, h, draws, nz, rgb, inputs, scanout)."""
     frames, passes, pending = [], [], []
-    with open(path, 'r', errors='replace') as handle:
+    with open(path, errors='replace') as handle:
         for line in handle:
             if '[rtt] ' not in line:
                 continue

@@ -82,7 +82,9 @@ untouched, and no sample of it has been checked.
 Always exits 0 on classification -- this reports, it does not gate. An unreadable file is reported on
 its own line and does not abort the run or lose the tally.
 """
-import sys, os, glob
+import sys
+import os
+import glob
 try:
     from PIL import Image
 except ImportError:

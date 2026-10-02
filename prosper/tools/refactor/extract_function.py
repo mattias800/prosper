@@ -367,7 +367,7 @@ def main() -> int:
 
     c = cands[args.apply]
     print(f"\n  extracting candidate {args.apply}: lines {c['start_line']}-{c['end_line']}")
-    cd = Clangd(str((root / args.build)))
+    cd = Clangd(str(root / args.build))
     cd.open(path)
     applied, offered = cd.extract(c, args.name)
     if not applied:
@@ -376,7 +376,7 @@ def main() -> int:
     changes = applied["params"]["edit"].get("changes") or {}
     total = sum(len(v) for v in changes.values())
     print(f"  clangd produced {total} edit(s):")
-    for uri, edits in changes.items():
+    for _uri, edits in changes.items():
         for e in edits:
             txt = e["newText"]
             if txt.strip():

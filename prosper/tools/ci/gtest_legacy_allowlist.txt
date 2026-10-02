@@ -62,6 +62,7 @@ tests/gpu/execute/test_portable_wave64_mask_reductions.cpp
 tests/gpu/execute/test_portable_wave64_readfirstlane.cpp
 tests/gpu/execute/test_raw_register_wide_exec.cpp
 tests/gpu/execute/test_renderer_uint_copy.cpp
+tests/gpu/execute/test_scalar_ff1_b32_exec.cpp
 tests/gpu/execute/test_seed_coverage_dynamic.cpp
 tests/gpu/execute/test_shader_recompile_cache.cpp
 tests/gpu/execute/test_storage_metadata_borrow.cpp
@@ -108,6 +109,7 @@ tests/gpu/recompiler/test_recompiled_fragment.cpp
 tests/gpu/recompiler/test_recompiled_shaders.cpp
 tests/gpu/recompiler/test_rect_synthesis_render.cpp
 tests/gpu/recompiler/test_replay_fragment_width.cpp
+tests/gpu/recompiler/test_scalar_ff1_b32.cpp
 tests/gpu/recompiler/test_shader_property_scans.cpp
 tests/gpu/recompiler/test_spirv_builder.cpp
 tests/gpu/recompiler/test_traversal_chase.cpp
@@ -149,9 +151,15 @@ tests/hle/audio/test_ajm_opus.cpp
 tests/hle/audio/test_audio.cpp
 tests/hle/audio/test_audiodec.cpp
 tests/hle/dispatch/test_nid.cpp
+tests/hle/kernel/test_ampr_udata.cpp
+tests/hle/kernel/test_apr_result_slot_width.cpp
+tests/hle/kernel/test_attr_getstack.cpp
+tests/hle/kernel/test_guest_thread_handle.cpp
 tests/hle/kernel/test_kernel_cond_timedwait_clock.cpp
 tests/hle/kernel/test_kernel_nanosleep.cpp
 tests/hle/kernel/test_kernel_sem_timedwait.cpp
+tests/hle/kernel/test_kernel_system_stubs.cpp
+tests/hle/kernel/test_large_offset_seek.cpp
 tests/hle/kernel/test_pthread_error_encoding.cpp
 tests/hle/kernel/test_sce_errno.cpp
 tests/hle/kernel/test_select_sleep.cpp
@@ -163,7 +171,9 @@ tests/hle/memory/test_renderer_tracked_mapping_cache.cpp
 tests/hle/sync/test_c11_sync_bookkeeping.cpp
 tests/hle/sync/test_sync_destroy_lifetime.cpp
 tests/hle/sync/test_sync_ring.cpp
+tests/hle/sync/test_sync_ring_callers.cpp
 tests/hle/test_agc_getsize.cpp
+tests/hle/test_agc_submit_multi.cpp
 tests/hle/test_apr_measure_duplicate.cpp
 tests/hle/test_c11_thread_slots.cpp
 tests/hle/test_cond_clock.cpp
@@ -224,6 +234,7 @@ tests/render/test_dsbridge_miss_classifier.cpp
 tests/render/test_gds_scan_memo.cpp
 tests/render/test_host_read_barrier.cpp
 tests/render/test_mip_assembly_barrier.cpp
+tests/render/test_persistent_readback_refusal.cpp
 tests/render/test_render_diagnostic_paths.cpp
 tests/self/test_real_shader_render.cpp
 tests/shared/compute/test_compute_authority_census.cpp

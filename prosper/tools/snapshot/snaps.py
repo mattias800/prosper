@@ -229,7 +229,7 @@ def load_entry(name):
     path = store_path(name)
     if not os.path.exists(path):
         raise SystemExit(f"snaps: no snap set named '{name}' ({path} does not exist)")
-    with open(path, "r", encoding="utf-8") as handle:
+    with open(path, encoding="utf-8") as handle:
         return json.load(handle)
 
 
@@ -522,7 +522,7 @@ def cmd_author(args):
     existing = {}
     if os.path.exists(session_path):
         try:
-            with open(session_path, "r", encoding="utf-8") as handle:
+            with open(session_path, encoding="utf-8") as handle:
                 existing = json.load(handle)
         except (OSError, ValueError) as exc:
             print(f"  note: {session_path} is unreadable ({exc}); this run's own settings will be "
@@ -579,7 +579,7 @@ def cmd_author(args):
     manifest = os.path.join(out_dir, "snaps.jsonl")
     taken = 0
     if os.path.exists(manifest):
-        with open(manifest, "r", encoding="utf-8") as handle:
+        with open(manifest, encoding="utf-8") as handle:
             taken = sum(1 for line in handle if line.strip())
     print(f"\nsession ended: {taken} snap(s) in {out_dir}")
     if not taken:
@@ -619,7 +619,7 @@ def cmd_import(args):
         raise SystemExit(f"snaps: {manifest} does not exist -- was PROSPER_SNAP_DIR pointed here, "
                          f"and were any snaps taken with F6/F7?")
     records = []
-    with open(manifest, "r", encoding="utf-8") as handle:
+    with open(manifest, encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if line:
@@ -644,7 +644,7 @@ def cmd_import(args):
     session_path = os.path.join(args.capture_dir, "session.json")
     if os.path.exists(session_path):
         try:
-            with open(session_path, "r", encoding="utf-8") as handle:
+            with open(session_path, encoding="utf-8") as handle:
                 session = json.load(handle)
         except (OSError, ValueError) as exc:
             print(f"  note: {session_path} unreadable ({exc}); falling back to the command line")
@@ -830,7 +830,7 @@ def run_replay(entry, out_dir):
     def read_actuals():
         found = {}
         if os.path.exists(manifest):
-            with open(manifest, "r", encoding="utf-8") as handle:
+            with open(manifest, encoding="utf-8") as handle:
                 for line in handle:
                     line = line.strip()
                     if line:

@@ -1,7 +1,10 @@
-# gdb -p PID -batch -x waketrace232.py — at the DOLL plateau, trace the wake chain:
-# every k_cond_timedwait entry (thread, cond slot, timeout-from-now), every cond signal/broadcast,
-# and every AGC submit. Non-stop logging; detaches after DURATION seconds.
-import gdb, time, struct
+"""gdb -p PID -batch -x waketrace232.py — at the DOLL plateau, trace the wake chain:
+every k_cond_timedwait entry (thread, cond slot, timeout-from-now), every cond signal/broadcast,
+and every AGC submit. Non-stop logging; detaches after DURATION seconds.
+"""
+import gdb
+import time
+import struct
 
 DURATION = 150
 

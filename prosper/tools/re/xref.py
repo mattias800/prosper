@@ -84,7 +84,8 @@ exit status is a contract, because the failure this tool must never have is a ze
 #
 # `from` scans a ~2KB window forward from the given address.
 
-import struct, sys
+import struct
+import sys
 from collections import defaultdict
 
 MODRM_RIP = {0x05, 0x0d, 0x15, 0x1d, 0x25, 0x2d, 0x35, 0x3d}   # mod=00, rm=101 (rip-rel), reg=any
@@ -194,13 +195,13 @@ class Module:
                 f"refusing rather than answering 0 for every address (#2346).")
 
     def foff(self, va):
-        for v, o, fs, fl in self.segs:
+        for v, o, fs, _fl in self.segs:
             if v <= va < v + fs:
                 return o + (va - v)
         return None
 
     def va_at(self, fo):
-        for v, o, fs, fl in self.segs:
+        for v, o, fs, _fl in self.segs:
             if o <= fo < o + fs:
                 return v + (fo - o)
         return None

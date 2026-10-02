@@ -28,6 +28,15 @@ double now_seconds() {
     return std::chrono::duration<double>(RateClock::now() - epoch).count();
 }
 
+// Geometric midpoint of bucket i: the right centre for log-spaced edges. Bucket 0 has no lower
+// edge, so it reports its upper one.
+double bucket_midpoint_seconds(size_t i) {
+    const double high = kIntervalMinSeconds * std::pow(kIntervalGrowth, static_cast<double>(i));
+    if (i == 0) return high;
+    const double low = kIntervalMinSeconds * std::pow(kIntervalGrowth, static_cast<double>(i - 1));
+    return std::sqrt(low * high);
+}
+
 std::mutex g_rate_mx;
 FrameRateCounter g_rate;   // guarded by g_rate_mx
 
@@ -103,15 +112,22 @@ double FrameRateCounter::typical_interval_seconds() const {
     uint64_t seen = 0;
     for (size_t i = 0; i < kIntervalBuckets; i++) {
         seen += interval_counts_[i];
-        if (seen > half) {
-            const double high =
-                kIntervalMinSeconds * std::pow(kIntervalGrowth, static_cast<double>(i));
-            if (i == 0) return high;
-            const double low =
-                kIntervalMinSeconds * std::pow(kIntervalGrowth, static_cast<double>(i - 1));
-            // Geometric midpoint: the right centre for log-spaced edges.
-            return std::sqrt(low * high);
-        }
+        if (seen > half) return bucket_midpoint_seconds(i);
+    }
+    return 0;
+}
+
+double FrameRateCounter::interval_quantile_seconds(double q) const {
+    if (!(q > 0.0 && q < 1.0) || interval_samples_ == 0) return 0;
+    // The tail beyond rank must hold at least one interval, i.e. n * (1 - q) >= 1.
+    // The epsilon is load-bearing: 10 * (1 - 0.90) is 0.9999999999999998 in doubles.
+    if (static_cast<double>(interval_samples_) * (1.0 - q) < 1.0 - 1e-9) return 0;
+    // Nearest rank: the smallest bucket whose cumulative count reaches ceil(q * n).
+    const uint64_t rank = static_cast<uint64_t>(std::ceil(q * static_cast<double>(interval_samples_)));
+    uint64_t seen = 0;
+    for (size_t i = 0; i < kIntervalBuckets; i++) {
+        seen += interval_counts_[i];
+        if (seen >= rank) return bucket_midpoint_seconds(i);
     }
     return 0;
 }
@@ -162,6 +178,13 @@ FrameRate frame_rate_since_first_publication(const PresentRateSnapshot& s) {
         r.typical_measured = true;
         r.typical_fps = 1.0 / s.typical_interval_seconds;
     }
+    r.p90_measured = s.interval_p90_seconds > 0;
+    r.p95_measured = s.interval_p95_seconds > 0;
+    r.p99_measured = s.interval_p99_seconds > 0;
+    r.interval_p90_seconds = s.interval_p90_seconds;
+    r.interval_p95_seconds = s.interval_p95_seconds;
+    r.interval_p99_seconds = s.interval_p99_seconds;
+    if (r.p99_measured) r.low_1pct_fps = 1.0 / s.interval_p99_seconds;
     if (r.window_seconds > 0) {
         r.active_fraction = std::min(1.0, s.active_seconds / r.window_seconds);
         // Measured, not defaulted -- this is the one constructor that can say so. A 0 here is the
@@ -209,6 +232,29 @@ std::string format_frame_rate(const FrameRate& rate) {
                   static_cast<unsigned long long>(rate.distinct),
                   static_cast<unsigned long long>(rate.published),
                   rate.distinct_fps, rate.presented_fps);
+    return text;
+}
+
+std::string format_frame_percentiles(const FrameRate& rate) {
+    // frame_rate_between never fills the histogram-derived fields and says so with
+    // typical_measured; there is nothing honest to print for such a window.
+    if (!rate.measured || rate.interval_samples == 0) return {};
+    char tail[3][24];
+    const bool measured[3] = {rate.p90_measured, rate.p95_measured, rate.p99_measured};
+    const double seconds[3] = {rate.interval_p90_seconds, rate.interval_p95_seconds,
+                               rate.interval_p99_seconds};
+    for (int i = 0; i < 3; i++) {
+        if (measured[i]) std::snprintf(tail[i], sizeof tail[i], "%.1f ms", seconds[i] * 1000.0);
+        else             std::snprintf(tail[i], sizeof tail[i], "--");
+    }
+    char low[24];
+    if (rate.p99_measured) std::snprintf(low, sizeof low, "%.1f fps", rate.low_1pct_fps);
+    else                   std::snprintf(low, sizeof low, "--");
+    char text[256];
+    std::snprintf(text, sizeof text,
+                  "frame time p90 %s  p95 %s  p99 %s  1%% low %s  (%llu distinct-frame intervals)",
+                  tail[0], tail[1], tail[2], low,
+                  static_cast<unsigned long long>(rate.interval_samples));
     return text;
 }
 
@@ -328,6 +374,9 @@ PresentRateSnapshot present_rate_snapshot() {
     out.typical_interval_seconds = g_rate.typical_interval_seconds();
     out.active_seconds = g_rate.active_seconds();
     out.interval_samples = g_rate.interval_samples();
+    out.interval_p90_seconds = g_rate.interval_quantile_seconds(0.90);
+    out.interval_p95_seconds = g_rate.interval_quantile_seconds(0.95);
+    out.interval_p99_seconds = g_rate.interval_quantile_seconds(0.99);
     return out;
 }
 

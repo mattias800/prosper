@@ -367,7 +367,7 @@ def parse_read_log(path: str, container_stem: str = None):
     `container_stem` filters by host path, so a title that streams from several `.ucas` files does
     not attribute one container's offsets to another's index.
     """
-    with open(path, 'r', errors='replace') as f:
+    with open(path, errors='replace') as f:
         for line in f:
             m = _READ_RE.search(line)
             if m:
@@ -608,7 +608,7 @@ def main(argv=None):
 
         if args.maps or args.distinct:
             seen = set()
-            for name, offset, size, got, status, exact in names:
+            for name, offset, _size, _got, _status, _exact in names:
                 if args.maps and not name.lower().endswith('.umap'):
                     continue
                 if name in seen:
@@ -617,7 +617,7 @@ def main(argv=None):
                 print(f'0x{offset:012x}  {name}')
             return 0
 
-        for name, offset, size, got, status, exact in names:
+        for name, offset, size, _got, status, exact in names:
             mark = '' if exact else ' (past payload)'
             print(f'0x{offset:012x} size={size:<9d} {status:<5s} {name}{mark}')
         return 0

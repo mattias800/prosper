@@ -23,6 +23,9 @@ struct FoldReader {
     uint32_t decoded_dwords = 0;
     bool shader_constant_specialized = false;
     virtual ~FoldReader() = default;
+    // Only a live proof-owned reader requests a short effective snapshot for this exact PC.
+    // Capture/replay readers retain the ordinary request stream unless explicitly overridden.
+    virtual bool owns_raw_wide(uint32_t) const { return false; }
     virtual bool probe(FoldProbe kind, uint32_t pc, uint64_t address, uint32_t bytes) = 0;
     virtual uint32_t word(uint32_t pc, uint64_t address) = 0;
     virtual void prefix(uint32_t pc, uint64_t address, void* destination, uint32_t bytes) = 0;

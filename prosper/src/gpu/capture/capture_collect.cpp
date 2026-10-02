@@ -62,6 +62,9 @@ bool owns_scalar_word(const ShaderResourceTable& table, const ShaderResource& re
         table.owned_raw_snapshot_requirements.begin(), table.owned_raw_snapshot_requirements.end(),
         [&](const auto& requirement) {
             return requirement.first == resource.fetch_pc && requirement.second == resource.size;
+        }) || std::any_of(table.owned_nested_snapshot_requirements.begin(),
+                         table.owned_nested_snapshot_requirements.end(), [&](const auto& requirement) {
+            return requirement.first == resource.fetch_pc && requirement.second == resource.size;
         });
     return resource.cls == ResourceClass::ConstantBuffer &&
         resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
@@ -94,6 +97,22 @@ bool validate_owned_raw_capture_inputs(const ShaderResourceTable& table, std::st
             return false;
         }
     }
+    for (const auto& resource : table.resources)
+        if (resource.owned_nested_snapshot_bytes && std::none_of(
+                table.owned_nested_snapshot_requirements.begin(),
+                table.owned_nested_snapshot_requirements.end(), [&](const auto& requirement) {
+                    return requirement.first == resource.fetch_pc &&
+                        requirement.second == resource.owned_nested_snapshot_bytes;
+                })) {
+            error = "owned nested capture lacks its code-derived source obligation";
+            return false;
+        }
+    for (const auto& [pc, bytes] : table.owned_nested_snapshot_requirements)
+        if (const auto* resource = owned_nested_snapshot_at(table, pc, bytes);
+            !resource || !owns_scalar_word(table, *resource)) {
+            error = "code-required nested source has no complete owned capture backing";
+            return false;
+        }
     return true;
 }
 

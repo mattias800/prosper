@@ -203,7 +203,7 @@ int main(int argc, char** argv) {
     }
     std::vector<uint8_t> bytes;
     const bool roundtrip=serialize_gpu_capture(capture,bytes,error) && deserialize_gpu_capture(bytes,loaded,error);
-    CHECK(roundtrip && loaded.format_version==67,"current codec accepts exact bounded producing profile tails");
+    CHECK(roundtrip && loaded.format_version==68,"current codec accepts exact bounded producing profile tails");
     if (!roundtrip) { std::printf("codec error: %s\n",error.c_str()); return 1; }
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded,replay,error) && replay.items.size()==draws.size(),
@@ -233,7 +233,12 @@ int main(int argc, char** argv) {
         append32(tail,static_cast<uint32_t>(item.stages.size()));
         for (const auto& stage:item.stages) tail.push_back(static_cast<uint8_t>(stage.recompile_config.float_transport.profile));
     }
-    auto v66_bytes = bytes;
+    CHECK(bytes.size() > 4u && std::all_of(bytes.end()-4, bytes.end(), [](uint8_t b) { return b == 0; }),
+          "resource-free v68 fixture has an exact zero nested count");
+    auto official67 = bytes; official67.resize(official67.size()-4u); set32(official67,8,67);
+    CHECK(deserialize_gpu_capture(official67,loaded,error) && loaded.format_version==67,
+          "genuine official v67 retains producing launch evidence without nested ownership");
+    auto v66_bytes = official67;
     v66_bytes.resize(v66_bytes.size() - 8u - 8u*(capture.draws.size()+capture.failure_diagnostics.size()));
     set32(v66_bytes,8,66);
     CHECK(deserialize_gpu_capture(v66_bytes,loaded,error) && loaded.format_version==66,
@@ -263,9 +268,13 @@ int main(int argc, char** argv) {
     }
     auto corrupt=bytes; set32(corrupt,failure_count+5,UINT32_MAX);
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"failed-stage count must match previously bounded inventory");
-    for (size_t end=start;end<bytes.size();++end) {
-        corrupt=bytes; corrupt.resize(end);
+    for (size_t end=start;end<v66_bytes.size();++end) {
+        corrupt=v66_bytes; corrupt.resize(end);
         CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"every truncated v66 suffix refuses");
+    }
+    for (size_t end=v66_bytes.size();end<bytes.size();++end) {
+        corrupt=bytes; corrupt.resize(end);
+        CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"every truncated v67 launch/v68 nested suffix refuses");
     }
     corrupt=bytes; corrupt.push_back(0);
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="capture has trailing data","strict EOF after new tail");

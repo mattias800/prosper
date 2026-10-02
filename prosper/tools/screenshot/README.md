@@ -127,6 +127,20 @@ question a stored manifest usually has to answer.
 The window for the summary rate is *first publication → end of sampling*, wall clock. A title that
 stops publishing therefore decays toward zero rather than freezing at whatever it last managed.
 
+#### Comparing two runs
+
+Just before the summary the manifest carries a `conditions` record: `harness`, `present_path`
+(`forced_readback` for this tool, because it never calls `set_gpu_present_active`, so its rate must
+never be compared with `prosper-app`'s), `os`, `flip_pace_fps`, and the numeric
+`gpu_vendor_id` / `gpu_device_id` / `gpu_driver_version` / `gpu_api_version` / `gpu_device_type`
+(`null`, never 0, when the renderer selected no device; the device name string is deliberately not
+recorded). Together with the `run` record these are what decides whether two rates may be compared.
+`tools/perf/compare_runs.py BASELINE.jsonl CANDIDATE.jsonl` refuses a pair whose conditions differ
+and exits 2 without printing a delta; see `tools/perf/AGENTS.md`.
+
+The summary also carries the frame-time tail: `interval_p90_ms`, `interval_p95_ms`, `interval_p99_ms`
+and `low_1pct_fps` (`1 / p99`), each `null` when the run had too few intervals to resolve it.
+
 #### Choose the window before you quote anything
 
 **A route that spends most of its time on menus, loading screens and waits will report a low distinct

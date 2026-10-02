@@ -255,12 +255,12 @@ def _read_intended(args) -> str:
     if args.body is not None:
         return args.body
     try:
-        with open(args.body_file, "r", encoding="utf-8") as fh:
+        with open(args.body_file, encoding="utf-8") as fh:
             return fh.read()
     except OSError as exc:
-        raise BodyError("could not read --body-file %s: %s" % (args.body_file, exc))
+        raise BodyError("could not read --body-file %s: %s" % (args.body_file, exc)) from exc
     except UnicodeDecodeError as exc:
-        raise BodyError("--body-file %s is not UTF-8: %s" % (args.body_file, exc))
+        raise BodyError("--body-file %s is not UTF-8: %s" % (args.body_file, exc)) from exc
 
 
 def main(argv=None) -> int:

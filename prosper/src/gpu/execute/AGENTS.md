@@ -51,6 +51,19 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   Unknown outside `execute_ordered_items`, so a test must run producer and consumer in one ordered
   submit. `indirect_dispatch_stats()` counts the two routes without a log.
 - `gpu_dependency_graph` — ordering and dependencies between submitted work.
+- `graphics_nested_wide_reader` — one-hop direct VS/PS numeric x4/x8 parent/child ownership.
+  The ordered executor retires earlier producer work before constructing its context. Exact
+  original code supplies the no-writer/PC/width proof; the first checked read supplies both the
+  fold and emitted binding. HLE origin observations retain original physical allocation bounds
+  through retype, unmapping and reuse. An owner retains at most 64 original intervals, captured
+  before each actual producer write; further history is explicitly unknown for that owner. A
+  different allocation birth does not imply disjointness.
+  The live renderer excludes genuinely produced retained targets; never-produced empty cache
+  entries impose no obligation. Missing layout/origin proof, pending work and failed current
+  producer epochs refuse before named byte reads. Mapping leases protect topology, not guest CPU
+  byte writes: submitted inputs must remain live and stable as with other draw inputs.
+  Chained vertex stages, deeper chains, per-wave windows, unproved native DS/metadata/array/tail
+  layouts and hosts without the direct lazy-fault proof remain outside this admission.
 - `host_read_barrier` — the availability half of a GPU→CPU readback: the `HOST_READ`/`HOST_BIT`
   dependency that a fence wait does **not** perform (#2944/#3249). Header-only and deliberately
   backend-agnostic, because both Vulkan backends need it and they live in different trees — the

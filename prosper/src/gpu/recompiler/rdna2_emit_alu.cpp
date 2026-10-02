@@ -428,6 +428,50 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // S_FF1 does not modify SCC.
                 return true;
             }
+            if (in.opcode == 0x13 && in.dst.value >= 0 && in.dst.value <= 105) {
+                // AMD RDNA2 70648, 12.3 p113: FF1_B32 scans one scalar word from the LSB,
+                // returns all ones for zero, and leaves SCC alone. Numeric data needs no vote.
+                // Keep the existing mask path below: a Bool or a CFG placeholder is not a word.
+                const Operand& source = in.src[0];
+                uint32_t word = 0;
+                if (source.kind == OperandKind::InlineInt ||
+                    source.kind == OperandKind::InlineFloat || source.kind == OperandKind::Literal) {
+                    word = val(source);
+                } else if (source.kind == OperandKind::SGPR && source.value >= 0 &&
+                           source.value <= 105 && !rs.sreg_bool.contains(source.value) &&
+                           !(source.value > 0 && rs.sreg_bool.contains(source.value - 1) &&
+                             !rs.sreg_bool_b32.contains(source.value - 1)) &&
+                           !rs.sreg_wave64_mask_half.contains(source.value) &&
+                           !rs.sreg_srt.contains(source.value) && !entry_m0_live(rs, source.value)) {
+                    if (rs.scalar_presence_has_no_placeholders) {
+                        const auto current = rs.sreg.find(source.value);
+                        if (current != rs.sreg.end()) word = current->second;
+                    }
+                    if (!word) {
+                        const auto input = rs.sreg_input.find(source.value);
+                        if (input != rs.sreg_input.end()) word = input->second;
+                    }
+                }
+                if (word) {
+                    // Capture first, including a self-source, then end every overlapping complete
+                    // mask lifetime. A B32 mask in the preceding register is an independent word.
+                    const uint32_t result = b.find_ilsb(word);
+                    // #3606: scanning a lane-local scalar cannot make it wave-uniform. Keep the
+                    // known source provenance when FindILsb and its bitcast create a fresh id.
+                    if (rs.lane_local_scalars.contains(word)) rs.lane_local_scalars.insert(result);
+                    const int dst = in.dst.value;
+                    const auto erase_mask = [&](int base) {
+                        rs.sreg_bool.erase(base);
+                        rs.sreg_bool_narrowed.erase(base);
+                        rs.sreg_bool_b32.erase(base);
+                    };
+                    erase_mask(dst);
+                    if (dst > 0 && !rs.sreg_bool_b32.contains(dst - 1)) erase_mask(dst - 1);
+                    rs.sreg[dst] = result;
+                    rs.sreg_srt.erase(dst);
+                    return true;
+                }
+            }
             if (b.is_compute && b.wave_size == 32 && b.native_subgroup_size == 32 &&
                 in.opcode == 0x13) { // s_ff1_i32_b32
                 // RDNA2 returns the first set bit from the low end, or 0xffffffff for an empty
@@ -5661,6 +5705,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rt && (in.opcode == 0x2 || in.opcode == 0x3) && !soff_null &&
                 rs.smem_raw_wide_data_loads.contains(in.pc);
             const ShaderResource* register_source = rt ? rt->by_fetch_pc(in.pc) : nullptr;
+            bool owned_nested_source = false;
+            if (!b.is_compute) {
+                for (const auto& chain : rs.smem_owned_nested_wide_chains) {
+                    if (chain.parent_pc != in.pc && chain.child_pc != in.pc) continue;
+                    owned_nested_source = true;
+                    if (!rt || !owned_nested_snapshot_at(*rt, chain.parent_pc,
+                            chain.parent_bytes, compiler_resource_has_host_data) ||
+                        !owned_nested_snapshot_at(*rt, chain.child_pc,
+                            chain.child_bytes, compiler_resource_has_host_data)) {
+                        if (getenv("PROSPER_DBG"))
+                            fprintf(stderr, "[smem-reject] pc=%u reason=nested-wide-requires-owned-chain\n",
+                                    in.pc);
+                        ok = false;
+                        return true;
+                    }
+                }
+            }
             const bool owned_wide_source = rs.smem_raw_owned_wide_data_loads.contains(in.pc);
             // SOURCE replay retains opaque backing presence separately from readable bytes.
             // These admission checks consume only shape/presence; actual byte readers use the
@@ -5701,10 +5762,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 shader_resource_buffer_binding_bytes(*register_source) >= n * 4u;
             // The bounded current-byte proof below covers an unchanged ENTRY pointer. A pointer
             // loaded into SGPRs by this shader can still name numeric x4/x8 data, but its load is
-            // absent from that proof. In the compute shell, do not let the descriptor-only route
-            // turn those bytes into zero. Graphics retains #3951's compatibility placeholder.
-            const bool nested_raw_wide_data = b.is_compute && soff_null &&
+            // absent from that proof. No stage may turn numeric child bytes into descriptor zeros.
+            const bool nested_raw_wide_data = soff_null &&
                 sreg_range_written(rs, in.src[0].value, 2);
+            if (!b.is_compute && !rt && nested_raw_wide_data &&
+                (in.opcode == 0x2 || in.opcode == 0x3) &&
+                rs.smem_raw_wide_data_loads.contains(in.pc)) {
+                // A missing table is absence of ownership, including chains excluded by the
+                // full-program proof. It must not select the legacy descriptor-zero route.
+                ok = false;
+                return true;
+            }
             if (rt && (in.opcode == 0x2 || in.opcode == 0x3) &&
                 rs.smem_raw_wide_data_loads.contains(in.pc) &&
                 (!soff_null ||
@@ -5716,20 +5784,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // reports numeric/uncertain reads; it cannot turn that legacy route into a
                 // current-byte observation. Register-offset data requires backing in every stage.
                 const ShaderResource* exact = rt->by_fetch_pc(in.pc);
-                const bool backed_immediate_wide = owned_wide_binding ||
+                const bool backed_immediate_wide = owned_nested_source || owned_wide_binding ||
                     (soff_null && !nested_raw_wide_data &&
                     (n == 4u || n == 8u) &&
                     rs.smem_raw_immediate_wide_data_loads.contains(in.pc) && exact &&
                     exact->fetch_pc == in.pc && exact->cls == ResourceClass::ConstantBuffer &&
                     shader_resource_buffer_binding_bytes(*exact) >=
                         static_cast<uint64_t>(in.literal) + n * sizeof(uint32_t));
-                const bool backed_nested_wide = nested_raw_wide_data &&
+                const bool backed_nested_wide = owned_nested_source || (b.is_compute && nested_raw_wide_data &&
                     rs.smem_raw_nested_wide_data_loads.contains(in.pc) && exact &&
                     exact->fetch_pc == in.pc && exact->cls == ResourceClass::ConstantBuffer &&
                     exact->nested_raw_snapshot_admitted &&
                     compiler_resource_has_host_data(*exact) && exact->host_data_size >= exact->size &&
                     shader_resource_buffer_binding_bytes(*exact) >=
-                        static_cast<uint64_t>(in.literal) + n * sizeof(uint32_t);
+                        static_cast<uint64_t>(in.literal) + n * sizeof(uint32_t));
                 if (!backed_immediate_wide && !backed_nested_wide && !backed_register_wide) {
                     if (getenv("PROSPER_DBG"))
                         fprintf(stderr,
@@ -5820,7 +5888,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 soff_dyn = true;
             } else if ((int32_t)in.literal < 0) { ok = false; return true; }   // negative imm-only would wrap
-            uint32_t base_idx = (soff_dyn || backed_register_wide || owned_wide_source)
+            uint32_t base_idx = (soff_dyn || backed_register_wide || owned_wide_source || owned_nested_source)
                 ? 0 : in.literal >> 2;
             // Descriptor provenance: pick which bound constant buffer via the resource table, routing this
             // load to that buffer's OWN binding (N-buffer model) — so Unity's several constant buffers
@@ -5899,6 +5967,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                !rs.smem_raw_x2_data_loads.contains(resource.fetch_pc) &&
                                !rs.smem_raw_offset_scalar_source_pcs.contains(resource.fetch_pc) &&
                                !rs.smem_raw_owned_wide_data_loads.contains(resource.fetch_pc) &&
+                               !resource.owned_nested_snapshot_bytes &&
                                !rs.smem_raw_register_wide_data_loads.contains(resource.fetch_pc) &&
                                !rs.smem_raw_immediate_wide_data_loads.contains(resource.fetch_pc)) &&
                                (resource.cls == ResourceClass::ConstantBuffer ||

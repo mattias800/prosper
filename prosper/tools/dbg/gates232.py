@@ -1,7 +1,9 @@
-# gdb -p PID -batch -x gates232.py — issue #232: the eboot+0x5044740 state machine's .data gates.
-# 1) read the gate bytes (eboot+0x9803460 / +0x9803470) and the doubles at +0x9603030..48
-# 2) arm hardware WRITE watchpoints on both gates for 60 s; report every writer (RIP + thread)
-import gdb, time
+"""gdb -p PID -batch -x gates232.py — issue #232: the eboot+0x5044740 state machine's .data gates.
+1) read the gate bytes (eboot+0x9803460 / +0x9803470) and the doubles at +0x9603030..48
+2) arm hardware WRITE watchpoints on both gates for 60 s; report every writer (RIP + thread)
+"""
+import gdb
+import time
 
 EBOOT = 0x400000000
 G0 = EBOOT + 0x9803460

@@ -75,8 +75,50 @@ $env:PROSPER_BOOTPHASE='1'; $env:PROSPER_EXIT_ON_GUEST_END='1'
 
 Unexplained and not yet shown to matter:
 
-- An init function (`0x5d4000020`, fault `rip=0x5d4234ab0`, host code) takes an access violation at
-  address 0 and boot continues (`continuing`).
+- The init-function fault (`init fn 0x5d4000020 faulted ... addr=0x0 rip=0x5d4234ab0`, #4139) is
+  **not benign and is now explained, but not fixed**. `0x5d4000000` is `libaegir_f.prx`; `0x5d4000020`
+  is its module entry (a crt start that walks `DT_INIT_ARRAY`, so the rest of that array is skipped
+  after the fault). The faulting code is a static constructor at image `+0x234a70` that calls the
+  title's pooled allocator (`+0xb6f70`, which falls to `+0x1e90`). On a first allocation that
+  allocator reserves a 1 GiB arena through the import `WLABcNu8BnU`, which resolves to
+  `libmemorywrapper_f.prx` (`0x5d0000000`). That export is a thin dispatcher: when the module's callback
+  table (`+0xc018`) is zero it returns 0, the allocator returns NULL, and the constructor stores through
+  it (`mov %rax,(%rax)` with `rax = 0`). The table is only filled by `libmemorywrapper_f`'s own init
+  export (`d1C59AHrOPI`, `+0xd0`), which no linked module imports, so the title has to call it itself.
+  prosper links both root-level PRXs as boot-time dependencies and runs every init before the eboot
+  starts, in ascending name order (`libaegir_f` before `libmemorywrapper_f`), so the guest has not yet
+  had a chance. The eboot carries the strings `/app0/libmemorywrapper_f.prx` and `libaegir_f.prx`,
+  which suggests the title loads both itself with `sceKernelLoadStartModule` (initialising the wrapper
+  first) and that deferring auto-linked modules' init until that call would be the faithful fix. Not
+  verified: no run got far enough to observe a `sceKernelLoadStartModule` call, because both an
+  unmodified and an aegir-init-skipped run die later at `__stack_chk_fail` during `sceUltInitialize`.
+  That change would alter init timing for every title that auto-links a module, so it needs a
+  cross-title census before landing. Evidence: gdb and disassembly of the SELF modules flattened with
+  `tools/il2cpp/prx_to_elf.py`, 2026-10-02, main `4a2ea88d` plus #4129 and #4137.
+- The `__stack_chk_fail` that ended the "Loading Thread" right after `sceUltInitialize` is explained
+  and fixed on main by #4146 (filed as #4138): `sceKernelAprSubmitCommandBufferAndGetResult`
+  (`ASoW5WE-UPo`) takes `(cb, ring, result*, uint32_t* id)`, the title passes a 4-byte stack int
+  for the id (`eboot+0x24511b0`) directly under its canary, and prosper stored an 8-byte token
+  there, zeroing the canary's low dword. Evidence: the stack copy of the canary read
+  `0x5245505300000000` against the expected `0x524550534F525000`.
+- With that fix and the deferral prototype applied the process no longer dies: about 25 guest threads
+  (`TaskThread00..11`, `IdleThread00..02`, `Loading Thread`, `SaveGameThread`) all sit in
+  `sceKernelWaitCond`/timed waits and the guest main thread waits on a condition variable that a
+  worker had already broadcast before it began waiting. `kqueue` and `kevent` (`libScePosix`)
+  still return 0 through the unimplemented stub, so a descriptor of 0 comes back from `kqueue`;
+  whether the stall is an engine file-completion path waiting on them is a hypothesis, not a result.
+- Where the stall sits, from guest disassembly (eboot offsets): the title does load the memory
+  wrapper itself. `eboot+0x3d136b0` calls `sceKernelLoadStartModule("/app0/libmemorywrapper_f.prx")`
+  and then `sceKernelDlsym(..., "AE_MemoryWrapper_Init")`, which is the wrapper's init export
+  (`d1C59AHrOPI`) that fills the dispatch table the aegir constructor needs. That function has no
+  direct callers (only reachable through an indirect call) and is never reached in a run: no
+  `sceKernelLoadStartModule` call is seen in 80 s. The guest main thread is parked in a scheduler
+  loop (`eboot+0x21adff0`, called from `+0x21adf60`) waiting for a flag that a worker sets after
+  starting (`+0x5deaa34`), and the twelve `TaskThread`s and three `IdleThread`s are idle. So the
+  open question is what the engine's startup waits on before it reaches the wrapper load, not the
+  wrapper itself. `kqueue`/`kevent` are called once each by the eboot (`+0x334ebba`, `+0x334ebd1`)
+  to register one read filter on ident 0 and nothing waits on them, so they are unlikely to be
+  the blocker; no implementation is in flight elsewhere (#4153 lists them out of scope).
 - `scePthreadAttrGetstack` is unimplemented and returns 0 without filling its outputs. The
   `SystemLogger` thread called it right before the crash; that is a suspicion, not a result.
 - Unimplemented calls returning 0, names from `ps5rs/data/nids.csv`: `kqueue`, `kevent`

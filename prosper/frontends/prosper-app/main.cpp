@@ -14,6 +14,7 @@
 // Real game boots normally adopt the renderer's Vulkan device and pass its front image directly to
 // the swapchain. Test-pattern boots, an explicit override, or failed adoption retain the original
 // two-device path, where frames cross as shared immutable CPU pixels.
+#include "guest_end_status.hpp"         // exit status + fault banner for a dead guest (#4140)
 #include "diagnostics/exit_reports.hpp"         // flush_exit_reports before std::_Exit (#3353)
 #include "gpu/present/videoout_present.hpp"   // present_acquire_rendered_frame / present_write_frame
 #include "gpu/execute/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
@@ -116,6 +117,7 @@ static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before
 #include <cmath>
 #include <chrono>
 #include <thread>
+#include <atomic>
 #include <mutex>
 #include <sys/stat.h>                  // the host filesystem probe behind resolve_app0_root()
 #include <filesystem>                  // directory listing behind the library scan
@@ -240,6 +242,32 @@ struct Vk {
     prosper::frontend::FpsOverlay* overlay = nullptr;
 };
 
+// The Vulkan loader finds drivers through ICD manifests (JSON files). If the GPU driver files are
+// installed but its manifest is not registered, the loader sees zero drivers and SDL reports a
+// missing instance extension instead of the real cause. Only the core surface extensions count:
+// SDL words a missing VK_EXT_headless_surface (SDL_VIDEODRIVER=offscreen on a driver without it)
+// the same way, and that is a video-driver choice, not an unregistered ICD. macOS loads MoltenVK
+// directly (no ICD manifests), so the report below says nothing there.
+bool vulkan_error_means_no_driver(const char* err) {
+    return err && (std::strstr(err, "VK_KHR_surface") || std::strstr(err, "VK_KHR_win32_surface"));
+}
+
+void report_no_vulkan_driver() {
+#ifndef __APPLE__
+    fprintf(stderr,
+        "[app] error: no usable Vulkan driver was found.\n"
+        "[app] Likely cause: the GPU driver is installed but its Vulkan ICD manifest (a JSON file) is\n"
+        "[app]   not registered, so the Vulkan loader sees zero drivers (`vulkaninfo` prints\n"
+        "[app]   \"Found no drivers!\"). On Windows the registration lives in the registry; a driver\n"
+        "[app]   update or clean install can leave it empty.\n"
+        "[app] Workaround: point the loader at the manifest directly, then relaunch:\n"
+        "[app]   PowerShell: $env:VK_DRIVER_FILES = \"<path to the driver's Vulkan .json manifest>\"\n"
+        "[app]   sh:         export VK_DRIVER_FILES=<path to the driver's Vulkan .json manifest>\n"
+        "[app] The manifest name and location vary by vendor (on Windows, usually under\n"
+        "[app] C:\\Windows\\System32\\DriverStore\\FileRepository\\<driver package>\\). See BUILDING.md.\n");
+#endif
+}
+
 uint32_t find_mem(VkPhysicalDevice p, uint32_t typeBits, VkMemoryPropertyFlags props) {
     VkPhysicalDeviceMemoryProperties m; vkGetPhysicalDeviceMemoryProperties(p, &m);
     for (uint32_t i = 0; i < m.memoryTypeCount; i++)
@@ -282,7 +310,7 @@ bool create_instance(Vk& vk, SDL_Window* win) {
 
 bool pick_device(Vk& vk) {
     uint32_t n = 0; vkEnumeratePhysicalDevices(vk.instance, &n, nullptr);
-    if (!n) { fprintf(stderr, "[app] no Vulkan device\n"); return false; }
+    if (!n) { fprintf(stderr, "[app] no Vulkan device\n"); report_no_vulkan_driver(); return false; }
     std::vector<VkPhysicalDevice> devs(n); vkEnumeratePhysicalDevices(vk.instance, &n, devs.data());
     for (auto d : devs) {
         VkPhysicalDeviceProperties properties{};
@@ -1162,6 +1190,56 @@ static std::string window_title_for(const std::string& dump, bool test_pattern) 
 Program g_prog;
 std::thread g_guest_thread;
 bool g_guest_started = false;
+// How the guest's entry thread ended, published for the event loop. -1 = still running; otherwise
+// BootResult::kind (0 = returned, non-zero = fault/abort). Without it a guest whose main thread
+// dies in the first seconds leaves a live window painting nothing and no message saying so: the
+// "black screen" is indistinguishable from a slow load (an AC Black Flag Resynced run sat in that
+// state for 72 minutes). The detail string is written before the kind is released.
+std::atomic<int> g_guest_end_kind{-1};
+std::string g_guest_end_detail;
+#ifdef _WIN32
+// Last-chance handler for a fault no one owns: a guest WORKER thread (the VEH only recovers armed
+// threads and declines the rest) or a host exception. Without it the process dies with Windows' own
+// status and no module+offset, no backtrace -- only the entry thread had a report (#4140). Exits with
+// kExitGuestFault so a script sees a crash, same as an entry-thread fault.
+LPTOP_LEVEL_EXCEPTION_FILTER g_previous_unhandled_filter = nullptr;
+
+LONG WINAPI report_unhandled_fault(EXCEPTION_POINTERS* ep) {
+    // Not a fault: MinGW's own filter (installed by crt startup, chained below) turns an uncaught
+    // C++ throw (GCC's 0x2?474343 codes) into "terminate called..." with the exception's type and
+    // message. Reporting it here as a crash would lose both, so hand those on unchanged.
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if ((code & 0xF0FFFFFFu) == 0x20474343u)
+        return g_previous_unhandled_filter ? g_previous_unhandled_filter(ep)
+                                           : EXCEPTION_CONTINUE_SEARCH;
+    // One reporter. A second thread faulting meanwhile parks, so the OS cannot end the process with
+    // that thread's status before the first report and _Exit(3); a fault inside the reporter itself
+    // falls through to the default handling. The park is BOUNDED: the parked thread may hold the
+    // stdio or heap lock the reporter needs, and an unbounded wait would hang the process forever.
+    static std::atomic<DWORD> reporter{0};
+    DWORD expected = 0;
+    const DWORD self = GetCurrentThreadId();
+    if (!reporter.compare_exchange_strong(expected, self)) {
+        if (expected == self) return EXCEPTION_CONTINUE_SEARCH;
+        Sleep(10000);
+        std::_Exit(prosper::app::kExitGuestFault);
+    }
+    const CONTEXT* c = ep->ContextRecord;
+    const uint64_t rip = c->Rip;
+    fprintf(stderr, "%s\n",
+            prosper::app::format_fault_banner(
+                g_guest_started ? "guest/host" : "host", self, code, rip,
+                describe_code_address(rip)).c_str());
+    uint64_t frames[32];
+    const int n = guest_frames_from_rbp(c->Rbp, frames, 32);
+    for (int i = 0; i < n; i++)
+        fprintf(stderr, "[app] fault backtrace: 0x%llx (%s)\n", (unsigned long long)frames[i],
+                describe_code_address(frames[i]).c_str());
+    dump_guest_exception_trace();
+    fflush(nullptr);
+    std::_Exit(prosper::app::kExitGuestFault);
+}
+#endif
 // True when THIS process authored PROSPER_GUEST_ARGS from the settings file (start_guest). A
 // relaunch must strip an app-authored value so the next title re-resolves its own (#2973 review).
 bool g_guest_args_app_set = false;
@@ -1293,9 +1371,33 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
             fprintf(stderr, "[app] guest backtrace: 0x%llx (%s)\n",
                     static_cast<unsigned long long>(address),
                     describe_code_address(address).c_str());
+        g_guest_end_detail = result.detail;
+        g_guest_end_kind.store(result.kind, std::memory_order_release);
+        fprintf(stderr,
+                "[app] GUEST ENTRY THREAD ENDED (kind=%d): guest workers may still be running. "
+                "Set PROSPER_EXIT_ON_GUEST_END=1 to quit instead.\n",
+                result.kind);
     });   // runs the guest frame loop
     fprintf(stderr, "[app] guest booted; presenting its frames.\n");
     return true;
+}
+
+// A startup failure after start_guest() has launched g_guest_thread (#4141). Returning from main
+// would destroy that still-joinable std::thread, which is std::terminate ("terminate called without
+// an active exception"); detaching and returning would run static teardown under a live guest, the
+// hazard the normal shutdown path documents. So exit the way that path does, without its Vulkan wait:
+// close the submit gate, bound the drain, flush the exit reports, _Exit. Before a guest exists this
+// is a plain `return 1`.
+int exit_startup_failure() {
+    if (!g_guest_thread.joinable()) return 1;
+    g_guest_thread.detach();
+    prosper::gpu_submit_gate_begin_shutdown();
+    (void)prosper::gpu_submit_gate_drain(2000);
+    prosper::host::guest_dmem_write_trace_report();
+    prosper::diagnostics::flush_exit_reports();
+    fflush(nullptr);
+    // A guest that already faulted still reports 3: the fault is the more specific fact.
+    std::_Exit(prosper::app::exit_status(g_guest_end_kind.load(std::memory_order_acquire), true));
 }
 
 // The host folder picker. SDL may deliver the result on another thread, so the callback only parks
@@ -1405,6 +1507,9 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    g_previous_unhandled_filter = SetUnhandledExceptionFilter(report_unhandled_fault);
+#endif
     // Line-buffer stdout: the boot/loader diagnostics go through printf (stdout), and under a
     // file redirect stdout block-buffers — every boot-time line then flushes at exit and lands
     // AFTER hours' worth of unbuffered stderr in a merged `> log 2>&1`, making the log read as
@@ -1638,7 +1743,7 @@ int main(int argc, char** argv) {
                         "(drop a game folder on it, or press Ctrl+O).\n");
     }
 
-    if (!SDL_Init(SDL_INIT_VIDEO)) { fprintf(stderr, "[app] SDL_Init: %s\n", SDL_GetError()); return 1; }
+    if (!SDL_Init(SDL_INIT_VIDEO)) { fprintf(stderr, "[app] SDL_Init: %s\n", SDL_GetError()); return exit_startup_failure(); }
 #ifdef __APPLE__
     // There is no system Vulkan loader on macOS; point SDL at MoltenVK so SDL_Vulkan_* uses the same
     // driver this binary links. PROSPER_VULKAN_LIB overrides the path; default resolves via the
@@ -1646,7 +1751,7 @@ int main(int argc, char** argv) {
     if (!SDL_Vulkan_LoadLibrary(getenv("PROSPER_VULKAN_LIB") ? getenv("PROSPER_VULKAN_LIB") : "libMoltenVK.dylib")) {
         fprintf(stderr, "[app] SDL_Vulkan_LoadLibrary(MoltenVK): %s\n", SDL_GetError());
         fprintf(stderr, "[app] set PROSPER_VULKAN_LIB=/path/to/libMoltenVK.dylib\n");
-        return 1;
+        return exit_startup_failure();
     }
 #endif
     // Title: "prosper - <game name>" for a booted game, else a label saying what the empty window
@@ -1654,7 +1759,12 @@ int main(int argc, char** argv) {
     std::string title = window_title_for(dump, testPattern);
     fprintf(stderr, "[app] window title: \"%s\"\n", title.c_str());
     SDL_Window* win = SDL_CreateWindow(title.c_str(), (int)winW, (int)winH, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
-    if (!win) { fprintf(stderr, "[app] SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
+    if (!win) {
+        const char* err = SDL_GetError();
+        fprintf(stderr, "[app] SDL_CreateWindow: %s\n", err);
+        if (vulkan_error_means_no_driver(err)) report_no_vulkan_driver();
+        return exit_startup_failure();
+    }
 
     Vk vk;
     // Present unification (#1270): prefer the renderer's shared device for real game boots so we can
@@ -1663,11 +1773,11 @@ int main(int argc, char** argv) {
     const bool wantGpuPresent = prosper::frontend::request_gpu_present(
         getenv("PROSPER_APP_GPU_PRESENT"), testPattern, !dump.empty());
     if (!wantGpuPresent || !try_adopt_shared_present(vk, win)) {
-        if (!create_instance(vk, win) || !pick_device(vk)) return 1;
+        if (!create_instance(vk, win) || !pick_device(vk)) return exit_startup_failure();
     }
     // Initial swapchain sized to the window; recreated on resize / out-of-date.
     { int dw = 0, dh = 0; SDL_GetWindowSizeInPixels(win, &dw, &dh);
-      if (!create_swapchain(vk, (uint32_t)dw, (uint32_t)dh, requestedPresentMode)) return 1; }
+      if (!create_swapchain(vk, (uint32_t)dw, (uint32_t)dh, requestedPresentMode)) return exit_startup_failure(); }
 
     VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; cpi.queueFamilyIndex = vk.qfamily;
@@ -1677,7 +1787,7 @@ int main(int argc, char** argv) {
     vkAllocateCommandBuffers(vk.device, &cai, &vk.cmd);
     if (!replace_present_sync(vk)) {
         fprintf(stderr, "[app] could not create present synchronization\n");
-        return 1;
+        return exit_startup_failure();
     }
 
     fprintf(stderr, "[app] window up (%s). Close the window or press Esc to quit.\n",
@@ -2667,7 +2777,22 @@ int main(int argc, char** argv) {
     // The automatic capture delay starts at app-loop entry, not process start or guest boot. This
     // gives unattended routes one explicit, repeatable host-time origin without desktop input.
     const uint64_t perfLoopStartNs = prosper::perf::monotonic_now_ns();
+    bool guestEndReported = false;
     while (running && !prosper_stop_requested()) {
+        // Surface a dead guest in the title bar (and optionally quit) so a black window is never
+        // mistaken for a slow load. Reported once; later title updates may overwrite it.
+        if (!guestEndReported) {
+            const int endKind = g_guest_end_kind.load(std::memory_order_acquire);
+            if (endKind >= 0) {
+                guestEndReported = true;
+                if (win)
+                    SDL_SetWindowTitle(win, (title + (endKind != 0 ? " - GUEST CRASHED: "
+                                                                   : " - guest exited: ") +
+                                             g_guest_end_detail).c_str());
+                const char* quit = getenv("PROSPER_EXIT_ON_GUEST_END");
+                if (quit && quit[0] != '\0' && quit[0] != '0') running = false;
+            }
+        }
         drainStagedGrabCandidate();
         expirePendingGrabProducer();
         // Close a RenderDoc capture opened on the previous pass. Reporting the path is the whole
@@ -3637,7 +3762,9 @@ int main(int argc, char** argv) {
     perfCapture.cancel();     // never publish a short/incomplete .prperf on a graceful early exit
     prosper_request_stop();   // signal the guest run-loop to wind down at its next boundary
     fprintf(stderr, "[app] shutting down after %llu presented frame(s)\n", (unsigned long long)shown);
-    const int exitCode = (exitAfter && (int)shown < exitAfter) ? 1 : 0;
+    const int exitCode = prosper::app::exit_status(
+        g_guest_end_kind.load(std::memory_order_acquire),
+        exitAfter && (int)shown < exitAfter);
 
     // run_entry does not yet observe the frontend stop flag, so a booted guest cannot be joined.
     // Returning from main after detaching it is unsafe: C++ static teardown destroys HLE/renderer

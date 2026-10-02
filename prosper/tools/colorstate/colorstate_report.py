@@ -393,7 +393,7 @@ def main():
     if not args.log or not args.scanout_prefix:
         ap.error("LOG and --scanout-prefix are required "
                  "(the scanout VA is title-specific; the tool will not guess)")
-    with open(args.log, "r", errors="replace") as fh:
+    with open(args.log, errors="replace") as fh:
         report(parse(fh), args.scanout_prefix.lower(), args.top,
                by_program=args.by_program, by_pipeline=args.by_pipeline)
     return 0

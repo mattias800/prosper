@@ -1,47 +1,48 @@
 #!/usr/bin/env python3
-# hostprof — a poor-man's SAMPLING PROFILER for a running prosper process (or any native process),
-# built on repeated gdb backtraces. It answers "where is the HOST (C++) side spending CPU?" — the
-# render/submit thread, a compute worker, the readback copy — by sampling the live process N times and
-# aggregating the innermost (leaf) function across samples into a ranked histogram.
-#
-# Why this exists (and why not perf):
-#   * On locked-down / immutable hosts `perf` is unusable: `kernel.perf_event_paranoid>=2` denies the
-#     perf_event syscalls without root (the exact situation on the Bazzite dev box). gdb ptrace-attach,
-#     by contrast, works whenever `kernel.yama.ptrace_scope=0` (or from a parent/root), so this keeps
-#     working where perf does not.
-#   * The existing tools/dbg/*.sh sampling scripts dump RAW all-thread backtraces to a fixed path for a
-#     specific title and leave the aggregation to hand-written awk. This generalizes that: any pid/name,
-#     leaf/folded/thread aggregation, template+argument-stripped symbol names, and idle-frame filtering.
-#   * tools/guest_bt answers the complementary question for GUEST threads (managed C# unwinding through
-#     the HLE stub boundary). hostprof is purely the NATIVE (prosper C++ / libc) side.
-#
-# It is a *statistical* profiler: each sample is one stack per thread, so the histogram approximates the
-# fraction of wall-time each leaf sits on top of the stack. More samples -> tighter estimate. It is not
-# a substitute for instrumented timing (e.g. PROSPER_RENDER_TIMING) when exact per-phase ms are needed;
-# it is the fast "which function is hot right now" first look.
-#
-# Usage:
-#   hostprof.py <pid|process-name> [-n SAMPLES] [-i INTERVAL] [-d DEPTH]
-#               [--thread REGEX] [--mode leaf|folded|thread] [--keep-idle] [--raw-names]
-#
-# Examples:
-#   # 30 leaf samples of the busiest thread of a running boot_trace, ranked:
-#   hostprof.py boot_trace -n 30 --mode thread
-#   # Focus the render/submit thread (matched anywhere in its stack) and rank its leaves:
-#   hostprof.py boot_trace -n 40 --thread 'execute_ordered|agc_driver_submit'
-#   # Collapsed stacks for a flamegraph (pipe to flamegraph.pl):
-#   hostprof.py 12345 -n 200 --thread 'execute_ordered' --mode folded > out.folded
-#
-# Requires: gdb on PATH. Read-only: it only attaches, samples, and detaches; it never writes to or
-# resumes-with-changes the target (each `gdb -batch` attaches, prints, and detaches, leaving the process
-# running). Sampling briefly stops the process (a few ms per sample) — do not use on latency-critical runs.
+"""hostprof — a poor-man's SAMPLING PROFILER for a running prosper process (or any native process),
+built on repeated gdb backtraces. It answers "where is the HOST (C++) side spending CPU?" — the
+render/submit thread, a compute worker, the readback copy — by sampling the live process N times and
+aggregating the innermost (leaf) function across samples into a ranked histogram.
+
+Why this exists (and why not perf):
+  * On locked-down / immutable hosts `perf` is unusable: `kernel.perf_event_paranoid>=2` denies the
+    perf_event syscalls without root (the exact situation on the Bazzite dev box). gdb ptrace-attach,
+    by contrast, works whenever `kernel.yama.ptrace_scope=0` (or from a parent/root), so this keeps
+    working where perf does not.
+  * The existing tools/dbg/*.sh sampling scripts dump RAW all-thread backtraces to a fixed path for a
+    specific title and leave the aggregation to hand-written awk. This generalizes that: any pid/name,
+    leaf/folded/thread aggregation, template+argument-stripped symbol names, and idle-frame filtering.
+  * tools/guest_bt answers the complementary question for GUEST threads (managed C# unwinding through
+    the HLE stub boundary). hostprof is purely the NATIVE (prosper C++ / libc) side.
+
+It is a *statistical* profiler: each sample is one stack per thread, so the histogram approximates the
+fraction of wall-time each leaf sits on top of the stack. More samples -> tighter estimate. It is not
+a substitute for instrumented timing (e.g. PROSPER_RENDER_TIMING) when exact per-phase ms are needed;
+it is the fast "which function is hot right now" first look.
+
+Usage:
+  hostprof.py <pid|process-name> [-n SAMPLES] [-i INTERVAL] [-d DEPTH]
+              [--thread REGEX] [--mode leaf|folded|thread] [--keep-idle] [--raw-names]
+
+Examples:
+  # 30 leaf samples of the busiest thread of a running boot_trace, ranked:
+  hostprof.py boot_trace -n 30 --mode thread
+  # Focus the render/submit thread (matched anywhere in its stack) and rank its leaves:
+  hostprof.py boot_trace -n 40 --thread 'execute_ordered|agc_driver_submit'
+  # Collapsed stacks for a flamegraph (pipe to flamegraph.pl):
+  hostprof.py 12345 -n 200 --thread 'execute_ordered' --mode folded > out.folded
+
+Requires: gdb on PATH. Read-only: it only attaches, samples, and detaches; it never writes to or
+resumes-with-changes the target (each `gdb -batch` attaches, prints, and detaches, leaving the process
+running). Sampling briefly stops the process (a few ms per sample) — do not use on latency-critical runs.
+"""
 
 import argparse
 import re
 import subprocess
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 
 # Leaf functions that mean "this thread is parked/idle, not burning CPU". Filtered by default so the
 # histogram reflects real work; pass --keep-idle to see the wait breakdown instead. Matched against the
@@ -82,7 +83,8 @@ def resolve_pid(spec):
 
 def busiest_tid(pid):
     """Return the tid of the thread with the most CPU time (utime+stime), or None."""
-    import glob, os
+    import glob
+    import os
     best, best_ticks = None, -1
     for stat in glob.glob(f"/proc/{pid}/task/*/stat"):
         try:

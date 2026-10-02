@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Unit tests for guest_bt.py, the guest-stack unwinder driver (subprocess calls are mocked)."""
 import importlib.util
 import os
 import subprocess

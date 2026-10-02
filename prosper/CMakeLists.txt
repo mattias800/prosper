@@ -511,6 +511,10 @@ if(Python3_Interpreter_FOUND)
   # guards a state this repository produces routinely, since every lane pushes after CI starts.
   add_test(NAME pr_merge_gate
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_merge_gate.py")
+  # check_python_quality.py ratchets ruff on CHANGED Python files only (#4126). Its tests skip,
+  # loudly, when ruff is absent; the python-quality CI job installs it, so there they always run.
+  add_test(NAME python_quality_gate
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_check_python_quality.py")
   # pr_body.py answers "is the PR body actually what I published?" (#2918). `gh pr edit --body-file`
   # was observed returning rc=1 on a GraphQL projects-deprecation error WITHOUT applying the edit,
   # leaving a stale body the author believed was corrected -- and a PR body is where reviewers and
@@ -605,6 +609,11 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME flip_pacing_report_logic
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_flip_pacing_report.py")
+  # compare_runs.py: refuses two screenshot manifests whose run conditions differ. Synthetic
+  # manifests; every refusal arm differs from the matching pair in exactly one condition.
+  add_test(NAME compare_runs_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_runs.py")
   # The two /proc samplers (#3400 / #3401). Both run against a /proc tree the test BUILDS, so they
   # need no target process, no privileges and no sleeping: wait_profile's arms pin per-thread
   # identity (same-name threads, TID reuse, renames, PID reuse), and lock_holder's pin that a run
@@ -1109,6 +1118,15 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_apr_equeue_completion.cpp
     LIBRARIES prosper_core)
 
+  # #3554: all three AMPR userdata registration routes and actual completion/accessor delivery.
+  # The legacy sizing route registers only on POSIX; Windows' size query is intentionally pure.
+  if(NOT WIN32)
+    add_executable(test_ampr_udata tests/hle/kernel/test_ampr_udata.cpp)
+    target_link_libraries(test_ampr_udata PRIVATE prosper_core)
+    add_test(NAME ampr_udata COMMAND test_ampr_udata)
+    set_tests_properties(ampr_udata PROPERTIES TIMEOUT 20)
+  endif()
+
   # Variadic libc formatters (issue #122): real va_list capture so %f/XMM + stack + %s-past-4th
   # args format correctly (was a 3-integer-register forward). Cross-platform (host libc printf).
   add_executable(test_printf tests/hle/test_printf.cpp)
@@ -1128,6 +1146,35 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_sync_delete
     SOURCES tests/hle/kernel/test_sync_delete.cpp
     LIBRARIES prosper_core)
+
+  # sceKernelGetOperationMode, the coredump-handler pair and the PRT aperture pair are registered and
+  # honour their contracts (out-parameters written, slot range checked) rather than being logged-0
+  # stubs.
+  add_executable(test_kernel_system_stubs tests/hle/kernel/test_kernel_system_stubs.cpp)
+  target_link_libraries(test_kernel_system_stubs PRIVATE prosper_core)
+  target_include_directories(test_kernel_system_stubs PRIVATE src)
+  add_test(NAME kernel_system_stubs COMMAND test_kernel_system_stubs)
+
+  # scePthreadAttrGetstack was unregistered: both outputs were left untouched.
+  add_executable(test_attr_getstack tests/hle/kernel/test_attr_getstack.cpp)
+  target_link_libraries(test_attr_getstack PRIVATE prosper_core)
+  target_include_directories(test_attr_getstack PRIVATE src)
+  add_test(NAME attr_getstack COMMAND test_attr_getstack)
+
+  # The APR submit's result out-parameters are uint32_t*; an 8-byte store overran into the guest's
+  # stack canary and killed the title with __stack_chk_fail (#4138).
+  add_executable(test_apr_result_slot_width tests/hle/kernel/test_apr_result_slot_width.cpp)
+  target_link_libraries(test_apr_result_slot_width PRIVATE prosper_core)
+  target_include_directories(test_apr_result_slot_width PRIVATE src)
+  add_test(NAME apr_result_slot_width COMMAND test_apr_result_slot_width)
+
+  # lseek/fseek/ftell must address offsets >= 2 GiB. MinGW's long/off_t are 32 bits, so Black Flag's
+  # 30 GiB DataPS5_boot.forge allocation-table seek failed and the title aborted itself.
+  add_executable(test_large_offset_seek tests/hle/kernel/test_large_offset_seek.cpp)
+  target_link_libraries(test_large_offset_seek PRIVATE prosper_core)
+  target_include_directories(test_large_offset_seek PRIVATE src)
+  add_test(NAME large_offset_seek COMMAND test_large_offset_seek)
+  set_tests_properties(large_offset_seek PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 
   # Empty PollSema returns the encoded EBUSY value that guest drain loops require (#1640).
   prosper_add_gtest(test_kernel_sema_poll
@@ -1389,6 +1436,15 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_pthread_names.cpp
     LIBRARIES prosper_core)
 
+  # The ScePthread handle a guest receives must be a readable object, identical across Create/Self,
+  # and validated on the way back in. A raw winpthreads index sent AC Black Flag Resynced's main
+  # thread into address 3 at eboot+0x161ed91.
+  add_executable(test_guest_thread_handle tests/hle/kernel/test_guest_thread_handle.cpp)
+  target_link_libraries(test_guest_thread_handle PRIVATE prosper_core)
+  target_include_directories(test_guest_thread_handle PRIVATE src)
+  add_test(NAME guest_thread_handle COMMAND test_guest_thread_handle)
+  set_tests_properties(guest_thread_handle PROPERTIES TIMEOUT 60)
+
   add_executable(test_cond_clock tests/hle/test_cond_clock.cpp)
   target_link_libraries(test_cond_clock PRIVATE prosper_core)
   add_test(NAME pthread_cond_clock COMMAND test_cond_clock)
@@ -1433,6 +1489,11 @@ if(TARGET prosper_core)
   add_executable(test_prosper_app_snap_author frontends/prosper-app/test_snap_author.cpp)
   target_include_directories(test_prosper_app_snap_author PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_snap_author COMMAND test_prosper_app_snap_author)
+
+  # Exit status + fault wording for a dead guest (#4140); no SDL/Vulkan.
+  add_executable(test_prosper_app_guest_end_status frontends/prosper-app/test_guest_end_status.cpp)
+  target_include_directories(test_prosper_app_guest_end_status PRIVATE frontends/prosper-app)
+  add_test(NAME prosper_app_guest_end_status COMMAND test_prosper_app_guest_end_status)
 
   add_executable(test_prosper_app_capture_schedule frontends/prosper-app/test_capture_schedule.cpp)
   target_include_directories(test_prosper_app_capture_schedule PRIVATE frontends/prosper-app)
@@ -1720,6 +1781,15 @@ if(TARGET prosper_core)
   target_link_libraries(test_sync_ring PRIVATE prosper_core)
   add_test(NAME sync_ring COMMAND test_sync_ring)
   set_tests_properties(sync_ring PROPERTIES ENVIRONMENT "PROSPER_SYNC_RING=64")
+
+  # PROSPER_SYNC_RING_CALLERS: ring events carry the guest call site that reached them, so a total
+  # deadlock can be traced back to the guest function that was supposed to signal.
+  add_executable(test_sync_ring_callers tests/hle/sync/test_sync_ring_callers.cpp)
+  target_link_libraries(test_sync_ring_callers PRIVATE prosper_core)
+  target_include_directories(test_sync_ring_callers PRIVATE src)
+  add_test(NAME sync_ring_callers COMMAND test_sync_ring_callers)
+  set_tests_properties(sync_ring_callers PROPERTIES
+                       ENVIRONMENT "PROSPER_SYNC_RING=256;PROSPER_SYNC_RING_CALLERS=1")
 
   prosper_add_gtest(test_mutex_host_tcb_identity
     SOURCES tests/hle/sync/test_mutex_host_tcb_identity.cpp
@@ -2528,6 +2598,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_entry_m0_dispatcher.cpp
     LIBRARIES prosper_core)
 
+  add_executable(test_scalar_ff1_b32 tests/gpu/recompiler/test_scalar_ff1_b32.cpp)
+  target_link_libraries(test_scalar_ff1_b32 PRIVATE prosper_core)
+  add_test(NAME scalar_ff1_b32 COMMAND test_scalar_ff1_b32)
+
   # #3231: the CFG dispatcher's `missing-entry-vcc` gate and the entry-block-dominance case it may
   # now admit. Both directions, in its own binary for the same reason as the file above.
   prosper_add_gtest(test_entry_vcc_dead
@@ -3301,6 +3375,11 @@ endif()
     SOURCES tests/gpu/pm4/test_agc_submit.cpp
     LIBRARIES prosper_core)
 
+  add_executable(test_agc_submit_multi tests/hle/test_agc_submit_multi.cpp)
+  target_include_directories(test_agc_submit_multi PRIVATE tests)
+  target_link_libraries(test_agc_submit_multi PRIVATE prosper_core)
+  add_test(NAME agc_submit_multi COMMAND test_agc_submit_multi)
+
   # libSceVideoOut: query/config functions return real 1080p60 values + swapchain-scaffolding
   # display-buffer registry records the game's registered framebuffers.
   #
@@ -3649,6 +3728,8 @@ endif()
                    COMMAND test_runtime_prx_load --append-${failure}-failure)
           set_tests_properties(runtime_prx_append_${failure}_failure PROPERTIES TIMEOUT 20)
         endforeach()
+        add_test(NAME runtime_prx_missing_data_base COMMAND test_runtime_prx_load --missing-data-base)
+        set_tests_properties(runtime_prx_missing_data_base PROPERTIES TIMEOUT 20)
       endif()
     endif()
 
@@ -3964,6 +4045,10 @@ endif()
       target_include_directories(test_graphics_raw_wide_upload PRIVATE frontends src tests)
       target_link_libraries(test_graphics_raw_wide_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME graphics_raw_wide_upload COMMAND test_graphics_raw_wide_upload)
+      add_test(NAME graphics_nested_wide_cpu COMMAND test_graphics_raw_wide_upload --nested-cpu-only)
+      add_test(NAME graphics_nested_wide_upload COMMAND test_graphics_raw_wide_upload --nested-only)
+      set_tests_properties(graphics_nested_wide_cpu graphics_nested_wide_upload PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 60)
       add_executable(test_decoder_source_snapshot tests/shared/live/test_decoder_source_snapshot.cpp)
       target_include_directories(test_decoder_source_snapshot PRIVATE frontends src tests)
       target_link_libraries(test_decoder_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
@@ -4148,6 +4233,11 @@ endif()
       target_include_directories(test_rdna2_to_spirv PRIVATE tests)
       target_link_libraries(test_rdna2_to_spirv PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME rdna2_to_spirv_exec COMMAND test_rdna2_to_spirv)
+      add_executable(test_scalar_ff1_b32_exec tests/gpu/execute/test_scalar_ff1_b32_exec.cpp)
+      target_include_directories(test_scalar_ff1_b32_exec PRIVATE tests)
+      target_link_libraries(test_scalar_ff1_b32_exec PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME scalar_ff1_b32_exec COMMAND test_scalar_ff1_b32_exec)
+      set_tests_properties(scalar_ff1_b32_exec PROPERTIES TIMEOUT 120)
       add_executable(test_raw_register_wide_exec tests/gpu/execute/test_raw_register_wide_exec.cpp)
       target_include_directories(test_raw_register_wide_exec PRIVATE tests)
       target_link_libraries(test_raw_register_wide_exec PRIVATE prosper_core Vulkan::Vulkan)
@@ -4879,6 +4969,29 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
   target_include_directories(test_rect_synthesis_render PRIVATE frontends)
   target_link_libraries(test_rect_synthesis_render PRIVATE prosper_core Vulkan::Vulkan)
   add_test(NAME rect_synthesis_render COMMAND test_rect_synthesis_render)
+
+  # CPU-only controls drive the shipping persistent-color lookup/readback refusal branches.
+  # Vulkan dev files satisfy the backend header; no usable device or GPU execution is required.
+  add_executable(test_persistent_readback_refusal tests/render/test_persistent_readback_refusal.cpp)
+  target_include_directories(test_persistent_readback_refusal PRIVATE tests frontends)
+  target_link_libraries(test_persistent_readback_refusal PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME persistent_readback_refusal COMMAND test_persistent_readback_refusal --armed)
+  add_test(NAME persistent_readback_refusal_disabled COMMAND ${CMAKE_COMMAND} -E env
+    --unset=PROSPER_RTT_READBACK_TRACE_TARGETS $<TARGET_FILE:test_persistent_readback_refusal> --unarmed)
+  set_tests_properties(persistent_readback_refusal PROPERTIES TIMEOUT 15
+    ENVIRONMENT "PROSPER_RTT_READBACK_TRACE_TARGETS=0x38910000")
+  set_tests_properties(persistent_readback_refusal_disabled PROPERTIES TIMEOUT 15)
+  set(readback_refusal_selector_malformed "0x38910000,bad")
+  set(readback_refusal_selector_empty "")
+  set(readback_refusal_selector_zero "0x38910000,0x0")
+  set(readback_refusal_selector_excess "0x38910000,0x1,0x2,0x3,0x4,0x5,0x6,0x7,0x8")
+  foreach(readback_refusal_selector_mode IN ITEMS empty malformed zero excess)
+    add_test(NAME persistent_readback_refusal_${readback_refusal_selector_mode}
+      COMMAND test_persistent_readback_refusal --unarmed)
+    set_tests_properties(persistent_readback_refusal_${readback_refusal_selector_mode}
+      PROPERTIES TIMEOUT 15
+      ENVIRONMENT "PROSPER_RTT_READBACK_TRACE_TARGETS=${readback_refusal_selector_${readback_refusal_selector_mode}}")
+  endforeach()
 
   # A compute full-overwrite destination at the colour-target COUNT bound evicts under the graphics
   # admission predicate instead of refusing (#3873).

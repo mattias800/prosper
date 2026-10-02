@@ -166,6 +166,10 @@ static const NotAnEmitter kNotEmitters[] = {
     {"rdna2_proven_raw_nested_wide_data_loads",
      "returns decoded instruction PCs, not SPIR-V; recompile_coverage covers admitted numeric "
      "children and bypass refusals, and rdna2_to_spirv_exec validates consuming modules"},
+    {"rdna2_raw_nested_numeric_loads",
+     "returns decoded numeric-child PCs, not SPIR-V; owned_nested_vertex_x4/x8 and "
+     "owned_nested_fragment_x4/x8 below assert the census and exact owned chains, then "
+     "strictly validate the consuming direct-stage modules"},
     {"rdna2_raw_wide_data_loads",
      "returns decoded instruction PCs, not SPIR-V; recompile_coverage covers numeric reads, "
      "overwrites, branches and no-effect instructions, and validates consuming modules"},
@@ -564,6 +568,58 @@ int main(int argc, char** argv) {
       dump(dir, wide8 ? "owned_raw_wide_x8" : "owned_raw_wide_x4",
            recompile_valu(c, std::size(c), 1u, 0u, &table), "recompile_valu");
     }
+    // One-hop direct graphics consumes two complete owners, not a descriptor placeholder.
+    // Independently pin the numeric-child census and the parent/child proof before validating
+    // both widths in both actual stage emitters. This proves module legality, not guest-byte
+    // visibility, renderer upload, executing-device features or numeric execution.
+    for (bool wide8 : {false, true}) for (bool fragment : {false, true}) {
+      const uint32_t width = wide8 ? 32u : 16u;
+      const uint32_t code[] = {
+          wide8 ? 0xf40c0a00u : 0xf4080a00u, 0xfa000004u,
+          wide8 ? 0xf40c0b14u : 0xf4080b14u, 0xfa000010u,
+          0x7e000200u | (wide8 ? 51u : 47u),
+          0x7e020280u, 0x7e0402f2u, 0x7e0602f2u,
+          fragment ? 0xf800180fu : 0xf80008cfu, 0x03020100u, 0xbf810000u};
+      const std::string name = std::string("owned_nested_") +
+          (fragment ? "fragment_" : "vertex_") + (wide8 ? "x8" : "x4");
+      std::vector<Rdna2Inst> decoded;
+      if (rdna2_walk(code, std::size(code), decoded) != std::size(code) ||
+          rdna2_raw_nested_numeric_loads(decoded) != std::vector<uint32_t>{2u} ||
+          rdna2_owned_nested_wide_chains(decoded) !=
+              std::vector<RawNestedWideChain>{{0u, 2u, width, width, 4u, 16u}}) {
+          printf("  [FAIL] %s exact numeric census and parent/child chain\n", name.c_str());
+          ++fails;
+      }
+      ShaderResourceTable table;
+      for (uint32_t pc : {0u, 2u}) {
+          auto owner = std::make_shared<std::vector<uint8_t>>(width, 0u);
+          if (pc == 0u) {
+              const uint64_t child_pointer = 0x300000u;
+              std::memcpy(owner->data(), &child_pointer, sizeof(child_pointer));
+          } else {
+              const uint32_t numeric_bits = 0x3f000000u;
+              std::memcpy(owner->data() + width - sizeof(numeric_bits),
+                          &numeric_bits, sizeof(numeric_bits));
+          }
+          ShaderResource resource;
+          resource.cls = ResourceClass::ConstantBuffer;
+          resource.format = DataFormat::Uint32;
+          resource.num_components = 1u;
+          resource.binding = pc ? 3u : 2u;
+          resource.fetch_pc = pc;
+          resource.gpu_addr = pc ? 0x300010u : 0x200004u;
+          resource.size = resource.host_data_size = width;
+          resource.host_data = owner->data();
+          resource.owned_nested_snapshot_bytes = width;
+          table.resources.push_back(resource);
+          table.owned_host_data.push_back(std::move(owner));
+          table.owned_nested_snapshot_requirements.emplace_back(pc, width);
+      }
+      dump(dir, name.c_str(), fragment
+          ? recompile_fragment(code, std::size(code), &table)
+          : recompile_vertex(code, std::size(code), &table),
+          fragment ? "recompile_fragment" : "recompile_vertex");
+    }
     { const uint32_t c[] = {0x06000300u, 0x10000500u, 0xBF810000u};
       dump(dir, "compute_alu", recompile_valu(c, 3, 3, 0), "recompile_valu"); }
     dump_numeric_mbcnt(dir);
@@ -718,6 +774,14 @@ int main(int argc, char** argv) {
     // recompile_valu entry point above.
     { const uint32_t c[] = {0xd7620000u, 0x0002030du, 0xbf810000u};
       dump(dir, "compute_ldexp", recompile_valu(c, sizeof(c) / sizeof(c[0]), 14, 0)); }
+    // #4060: one ordinary numeric scalar word; FindILsb preserves the zero sentinel and
+    // produces scalar data without a guest-wave reduction or a native-subgroup requirement.
+    { const uint32_t c[] = {
+          0xbea403ffu, 0x00010000u, // s_mov_b32 s36,0x10000
+          0xbea51324u,             // s_ff1_i32_b32 s37,s36
+          0x7e000225u,             // v_mov_b32 v0,s37
+          0xbf810000u};
+      dump(dir, "compute_scalar_ff1_b32", recompile_valu(c, std::size(c), 0, 0)); }
     // Compute + SMEM constant-buffer load (s_buffer_load_dword; routes to binding 2).
     { const uint32_t c[] = {0xf4000000u, 0xfa000004u, 0x7e000200u, 0xbf810000u};
       dump(dir, "compute_smem", recompile_valu(c, sizeof(c)/4, 1, 0)); }

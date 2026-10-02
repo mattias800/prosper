@@ -1,5 +1,8 @@
-# gdb -p PID -batch -x unimpl232.py — count prosper_on_unimpl hits (import index) per thread for 60 s.
-import gdb, time, struct, collections
+"""gdb -p PID -batch -x unimpl232.py — count prosper_on_unimpl hits (import index) per thread for 60 s.
+"""
+import gdb
+import time
+import collections
 
 DURATION = 60
 hits = collections.Counter()

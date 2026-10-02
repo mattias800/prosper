@@ -18,6 +18,7 @@
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // first-N-then-powers-of-two report throttling
@@ -113,6 +114,7 @@ struct ShaderResourceCompileKey {
     uint32_t sgpr_base = 0;
     uint32_t fetch_pc = 0;
     uint32_t nested_raw_snapshot_bytes = 0;
+    uint32_t owned_nested_snapshot_bytes = 0;
     uint32_t raw_register_snapshot_bytes = 0;
     uint32_t raw_offset_scalar_snapshot_bytes = 0;
     uint32_t raw_owned_wide_snapshot_bytes = 0;
@@ -390,6 +392,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.sgpr_base);
             hash = hash_mix(hash, resource.fetch_pc);
             hash = hash_mix(hash, resource.nested_raw_snapshot_bytes);
+            hash = hash_mix(hash, resource.owned_nested_snapshot_bytes);
             hash = hash_mix(hash, resource.raw_register_snapshot_bytes);
             hash = hash_mix(hash, resource.raw_offset_scalar_snapshot_bytes);
             hash = hash_mix(hash, resource.raw_owned_wide_snapshot_bytes);
@@ -536,6 +539,8 @@ struct DecodedShader {
     std::vector<uint32_t> raw_offset_scalar_source_pcs;
     std::vector<uint32_t> raw_owned_wide_data_load_pcs;
     std::vector<uint32_t> raw_nested_wide_data_load_pcs;
+    std::vector<RawNestedWideChain> owned_nested_wide_chains;
+    std::vector<uint32_t> raw_nested_numeric_load_pcs;
     // Full-stream inventory: specialization may remove a spill but cannot introduce one.
     std::bitset<256> scalar_spill_written_vgprs;
     size_t source_dwords = 0;

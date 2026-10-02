@@ -737,7 +737,7 @@ def load_nid_names(libs_dir):
     try:
         entries = sorted(os.listdir(libs_dir))
     except OSError as e:
-        raise SystemExit("--names %s: %s" % (libs_dir, e))
+        raise SystemExit("--names %s: %s" % (libs_dir, e)) from e
     for fn in entries:
         if not fn.endswith(".c"):
             continue

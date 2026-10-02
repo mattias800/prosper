@@ -1,4 +1,5 @@
-# gdb boot_trace core -batch -x corescan.py — scan guest .bss/data for the UE4 fatal message
+"""gdb boot_trace core -batch -x corescan.py — scan guest .bss/data for the UE4 fatal message
+"""
 import gdb
 gdb.execute("set pagination off")
 inf = gdb.selected_inferior()

@@ -256,7 +256,7 @@ import errno
 import os
 import re
 import sys
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 FENCE = re.compile(r"^\s*(```|~~~)")
@@ -558,7 +558,7 @@ def select_numbered_table(
     return candidates[0], []
 
 
-@lru_cache(maxsize=None)
+@cache
 def load_baseline(baseline_path: str, table_header: str | None) -> tuple[tuple[int, ...] | None, str]:
     """The baseline table's row numbers, parsed ONCE. Returns (numbers, error-or-empty).
 

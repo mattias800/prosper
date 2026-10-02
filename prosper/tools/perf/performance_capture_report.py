@@ -60,7 +60,7 @@ class CaptureError(ValueError):
 def load_capture(path):
     records = []
     try:
-        with open(path, "r", encoding="utf-8") as stream:
+        with open(path, encoding="utf-8") as stream:
             for line_number, line in enumerate(stream, 1):
                 if not line.strip():
                     continue
