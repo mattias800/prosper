@@ -197,14 +197,29 @@ def layer_env(base: dict[str, str] | None = None, sync_setting: str | None = Non
     return env
 
 
+def probe_executable(build_dir: Path, probe: str) -> Path:
+    """Resolve only the requested build artifact, with the native Windows suffix as fallback.
+
+    Prefer an existing exact artifact on all hosts (the caller rejects non-files). In particular,
+    an empty/dot name denotes the build directory, not its sibling .exe. An explicit .exe name is
+    already complete; never search PATH or another build configuration for an unrelated binary.
+    Return the requested name when missing so each control retains its specific refusal message.
+    """
+    exact = build_dir / probe
+    if exact.exists() or exact.name.lower().endswith(".exe"):
+        return exact
+    windows = exact.with_name(exact.name + ".exe")
+    return windows if windows.is_file() else exact
+
+
 def prove_layer_loads(build_dir: Path, probe: str, sync_setting: str | None = None) -> str:
     """Fail loudly unless the loader reports inserting the validation layer.
 
     Without this, "no findings" is ambiguous between a clean suite and a layer that never loaded,
     and the second reading is the one that quietly retires the guard.
     """
-    exe = build_dir / probe
-    if not exe.exists():
+    exe = probe_executable(build_dir, probe)
+    if not exe.is_file():
         raise SystemExit(
             f"[vkval] probe binary {exe} is missing — the Vulkan-gated tests were not built, so "
             f"there is nothing for the validation layer to observe (see #1675)"
@@ -242,8 +257,8 @@ def prove_sync_validation_arms(build_dir: Path) -> str:
     `vkval_sync_probe` commits one write-after-write on purpose. Each spelling is tried ALONE (see
     SYNC_SETTINGS) and the first one that reports the hazard back is the one the scan then runs with.
     """
-    exe = build_dir / SYNC_PROBE
-    if not exe.exists():
+    exe = probe_executable(build_dir, SYNC_PROBE)
+    if not exe.is_file():
         raise SystemExit(
             f"[vkval] --sync needs the positive control {exe}, which is not built. It is gated on "
             f"Vulkan being found, exactly like the tests this scan observes (see #1675) - without "

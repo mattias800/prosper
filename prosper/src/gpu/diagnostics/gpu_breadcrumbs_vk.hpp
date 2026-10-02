@@ -68,12 +68,16 @@ public:
 
     BreadcrumbMode mode() const { return mode_.load(std::memory_order_acquire); }
     bool active() const { return mode() != BreadcrumbMode::off; }
+    // Armed AND for this device. The emitter's buffer and entry points belong to the device that armed
+    // it, so a second device (a private compute device) must neither record through them nor read a
+    // checkpoint list with them.
+    bool armed_for(VkDevice device) const { return active() && device != VK_NULL_HANDLE && device_ == device; }
 
     // Records the BEFORE marker for `site` into `command` and returns its id; 0 when inactive, so a
     // caller can pass the result straight to end() without testing it.
-    uint32_t begin(VkCommandBuffer command, const BreadcrumbSite& site) {
+    uint32_t begin(VkDevice device, VkCommandBuffer command, const BreadcrumbSite& site) {
         const BreadcrumbMode current = mode();
-        if (current == BreadcrumbMode::off) return 0;
+        if (current == BreadcrumbMode::off || device_ != device) return 0;
         const uint32_t id = breadcrumb_table().begin_site(site);
         write(command, current, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, /*slot=*/0,
               breadcrumb_before_value(id));
@@ -113,9 +117,18 @@ public:
             dispatch_.get_queue_checkpoint_data(queue, &count, nullptr);
             std::vector<VkCheckpointDataNV> data(count, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
             if (count) dispatch_.get_queue_checkpoint_data(queue, &count, data.data());
+            // Each entry is the last checkpoint a given pipeline STAGE reached. A "before" marker seen
+            // at any stage means the command processor got to that site; an "after" marker only means
+            // the draw finished once it has passed BOTTOM_OF_PIPE -- seen at an earlier stage it says
+            // nothing about completion, and counting it would report a window that never closed.
             std::vector<uint32_t> values;
-            for (uint32_t i = 0; i < count && i < data.size(); ++i)
-                values.push_back(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker)));
+            for (uint32_t i = 0; i < count && i < data.size(); ++i) {
+                const uint32_t value =
+                    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker));
+                const bool after = (value & kBreadcrumbAfterBit) != 0;
+                if (after && !(data[i].stage & VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT)) continue;
+                values.push_back(value);
+            }
             reduce_checkpoint_values(values.data(), values.size(), out.started, out.finished);
             out.ok = true;
             return out;
@@ -128,10 +141,13 @@ public:
     // VK_EXT_device_fault is enabled. When the emitter is inactive it says so and how to arm it, rather
     // than staying silent: an absent line reads as "nothing to report", which is the wrong conclusion
     // about a run that simply was not instrumented (docs/DIAGNOSTIC_GATE_AUDIT.md, rule 1).
-    std::string report_device_loss(VkQueue queue) const {
+    std::string report_device_loss(VkDevice device, VkQueue queue) const {
         if (!active())
             return "[gpu-breadcrumb] not armed: re-run with PROSPER_GPU_BREADCRUMBS=1 to learn where "
                    "the GPU stopped (needs VK_AMD_buffer_marker or VK_NV_device_diagnostic_checkpoints)\n";
+        if (!armed_for(device))
+            return "[gpu-breadcrumb] the lost device is not the armed one; its work carried no markers "
+                   "(the other device in this process holds them)\n";
         std::string out;
         const Readback read = read_back(queue);
         if (!read.ok) {
@@ -248,10 +264,26 @@ struct BreadcrumbDeviceSupport {
 //
 // The marker buffer and its memory live for the process: a handful of bytes, and freeing them would
 // race the very device loss they exist to survive.
+// The process has ONE emitter, so the first device to arm keeps it. A second device (the compute
+// context falls back to a private device whenever it declines to adopt the renderer's) must not
+// re-point the emitter: the renderer would go on recording markers with the other device's buffer and
+// entry points, which is cross-device handle use from a different thread.
+inline std::atomic<bool>& breadcrumb_arm_claim() {
+    static std::atomic<bool> claimed{false};
+    return claimed;
+}
+
 inline BreadcrumbMode breadcrumb_arm_device(VkDevice device, VkPhysicalDevice physical,
                                             const BreadcrumbDeviceSupport& support,
                                             bool fault_enabled, const char* who) {
     const BreadcrumbMode mode = support.chosen();
+    if (mode != BreadcrumbMode::off && breadcrumb_arm_claim().exchange(true)) {
+        std::fprintf(stderr, "[gpu-breadcrumb] %s: another device is already armed; not armed "
+                             "(markers stay on the first device)\n", who);
+        return BreadcrumbMode::off;
+    }
+    // Any failure below gives the claim back, so a device that could not arm does not block one that can.
+    auto unarmed = [] { breadcrumb_arm_claim().store(false); return BreadcrumbMode::off; };
     if (mode == BreadcrumbMode::off) {
         std::fprintf(stderr,
                      "[gpu-breadcrumb] %s: requested, but the device advertises neither "
@@ -274,19 +306,19 @@ inline BreadcrumbMode breadcrumb_arm_device(VkDevice device, VkPhysicalDevice ph
     if (mode == BreadcrumbMode::nv_checkpoint) {
         if (!dispatch.cmd_set_checkpoint || !dispatch.get_queue_checkpoint_data) {
             std::fprintf(stderr, "[gpu-breadcrumb] %s: NV checkpoint entry points missing; not armed\n", who);
-            return BreadcrumbMode::off;
+            return unarmed();
         }
     } else {
         if (!dispatch.cmd_write_buffer_marker) {
             std::fprintf(stderr, "[gpu-breadcrumb] %s: vkCmdWriteBufferMarkerAMD missing; not armed\n", who);
-            return BreadcrumbMode::off;
+            return unarmed();
         }
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bci.size = 2 * sizeof(uint32_t);
         bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;   // required of a vkCmdWriteBufferMarkerAMD target
         if (vkCreateBuffer(device, &bci, nullptr, &buffer) != VK_SUCCESS) {
             std::fprintf(stderr, "[gpu-breadcrumb] %s: marker buffer creation failed; not armed\n", who);
-            return BreadcrumbMode::off;
+            return unarmed();
         }
         VkMemoryRequirements req{};
         vkGetBufferMemoryRequirements(device, buffer, &req);
@@ -304,7 +336,7 @@ inline BreadcrumbMode breadcrumb_arm_device(VkDevice device, VkPhysicalDevice ph
             vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS ||
             vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS || !mapped) {
             std::fprintf(stderr, "[gpu-breadcrumb] %s: marker memory setup failed; not armed\n", who);
-            return BreadcrumbMode::off;
+            return unarmed();
         }
         slots = static_cast<volatile uint32_t*>(mapped);
         slots[0] = 0;

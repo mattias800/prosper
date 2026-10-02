@@ -40,6 +40,7 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "host/platform/gpu_submit_gate.hpp"   // refuse submits once the frontend shuts down (#3225)
 #include "shared/rtt/rtt_scale.hpp"
+#include "shared/device/device_identity.hpp"     // which device a capture manifest reports
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/device/float_transport.hpp"
 #include "shared/device/pipeline_cache_file.hpp"
@@ -1849,6 +1850,12 @@ inline const RenderVkCtx& render_vk_ctx() {
                      selection.properties.deviceName,
                      prosper::frontend::vulkan_device_type_name(selection.properties.deviceType));
         prosper::frontend::log_vulkan_runtime_device("render", r.phys, selection.properties);
+        // The graphics device IS the run's device: the compute context normally adopts it and then
+        // never reaches its own record call, so recording only there left a renderer run unknown.
+        prosper::frontend::record_device_identity(
+            selection.properties.vendorID, selection.properties.deviceID,
+            selection.properties.driverVersion, selection.properties.apiVersion,
+            static_cast<uint32_t>(selection.properties.deviceType));
         // #3873: the texture-cache budget treats every non-discrete device's device-local heap as
         // system RAM. See texture_cache_budget.hpp for why this is not read off the memory types.
         r.unified_memory =
@@ -3104,7 +3111,7 @@ private:
         if (result.submit_result == VK_ERROR_DEVICE_LOST || result.wait_result == VK_ERROR_DEVICE_LOST) {
             static std::atomic<bool> breadcrumb_reported{false};
             if (!breadcrumb_reported.exchange(true)) {
-                const std::string report = prosper::gpu::breadcrumb_emitter().report_device_loss(queue);
+                const std::string report = prosper::gpu::breadcrumb_emitter().report_device_loss(dev, queue);
                 std::fputs(report.c_str(), stderr);
                 std::fflush(stderr);
             }
@@ -14791,7 +14798,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         uint32_t breadcrumb = 0;
         bool labelled = false;
         // PROSPER_GPU_LABELS shares the site (and its text) with the breadcrumb, built once for either.
-        if (breadcrumbs.active() || prosper::gpu::gpu_labels_requested()) {
+        if (breadcrumbs.armed_for(dev) || prosper::gpu::gpu_labels_requested()) {
             prosper::gpu::BreadcrumbSite site;
             site.kind = prosper::gpu::BreadcrumbKind::draw;
             site.submit_no = draws[di].source_submit;
@@ -14801,7 +14808,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             site.pipeline_hash = draws[di].vs_identity ^ (draws[di].fs_identity * 1099511628211ull);
             if (prosper::gpu::gpu_labels_requested())
                 labelled = prosper::gpu::gpu_label_begin(dev, cmd, site);
-            breadcrumb = breadcrumbs.begin(cmd, site);
+            breadcrumb = breadcrumbs.begin(dev, cmd, site);
         }
         if (v.mesh_draw) {
             ctx.cmd_draw_mesh_tasks(cmd, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);

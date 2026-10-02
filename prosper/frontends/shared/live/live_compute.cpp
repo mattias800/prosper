@@ -22,6 +22,7 @@
 #include "shared/rtt/rtt_scale.hpp"
 #include "shared/rtt/rtt_authority.hpp"
 #include "shared/device/pipeline_cache_file.hpp"  // #3425: one checked envelope for both stages
+#include "shared/device/device_identity.hpp"
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/device/float_transport.hpp"
 #include "shared/device/image_robustness.hpp"  // #3531: the recompiler's OOB image-read contract
@@ -3832,6 +3833,11 @@ struct VulkanComputeContext {
                      selection.properties.deviceName,
                      vulkan_device_type_name(selection.properties.deviceType));
         log_vulkan_runtime_device("compute", physical, selection.properties);
+        // Say which device this process rendered on, so a manifest can record the comparison
+        // conditions a framerate depends on (device_identity.hpp).
+        record_device_identity(selection.properties.vendorID, selection.properties.deviceID,
+                               selection.properties.driverVersion, selection.properties.apiVersion,
+                               static_cast<uint32_t>(selection.properties.deviceType));
 
         float priority = 1.0f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -7349,7 +7355,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // PROSPER_GPU_BREADCRUMBS: where the GPU actually stopped. The line above names the call
             // that OBSERVED the loss, which is not necessarily the one that caused it (trap 170).
             const std::string report =
-                prosper::gpu::breadcrumb_emitter().report_device_loss(ctx.queue);
+                prosper::gpu::breadcrumb_emitter().report_device_loss(ctx.device, ctx.queue);
             std::fputs(report.c_str(), stderr);
         }
         if (trace) std::fprintf(stderr, "[compute]   Vulkan failure stage=%s result=%d\n",
@@ -12331,7 +12337,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         auto& breadcrumbs = prosper::gpu::breadcrumb_emitter();
         uint32_t breadcrumb = 0;
         bool labelled = false;
-        if (breadcrumbs.active() || prosper::gpu::gpu_labels_requested()) {
+        if (breadcrumbs.armed_for(ctx.device) || prosper::gpu::gpu_labels_requested()) {
             prosper::gpu::BreadcrumbSite site;
             site.kind = prosper::gpu::BreadcrumbKind::dispatch;
             site.submit_no = item.submit_no;
@@ -12340,7 +12346,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             site.pipeline_hash = std::hash<std::string>{}(pipeline_key);
             if (prosper::gpu::gpu_labels_requested())
                 labelled = prosper::gpu::gpu_label_begin(ctx.device, command, site);
-            breadcrumb = breadcrumbs.begin(command, site);
+            breadcrumb = breadcrumbs.begin(ctx.device, command, site);
         }
         if (device_indirect) {
             vkCmdDispatchIndirect(command, ctx.indirect_scratch, 0);

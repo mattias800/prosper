@@ -604,6 +604,11 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME flip_pacing_report_logic
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_flip_pacing_report.py")
+  # compare_runs.py: refuses two screenshot manifests whose run conditions differ. Synthetic
+  # manifests; every refusal arm differs from the matching pair in exactly one condition.
+  add_test(NAME compare_runs_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_runs.py")
   # The two /proc samplers (#3400 / #3401). Both run against a /proc tree the test BUILDS, so they
   # need no target process, no privileges and no sleeping: wait_profile's arms pin per-thread
   # identity (same-name threads, TID reuse, renames, PID reuse), and lock_holder's pin that a run
@@ -1484,6 +1489,11 @@ if(TARGET prosper_core)
   add_executable(test_prosper_app_snap_author frontends/prosper-app/test_snap_author.cpp)
   target_include_directories(test_prosper_app_snap_author PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_snap_author COMMAND test_prosper_app_snap_author)
+
+  # Exit status + fault wording for a dead guest (#4140); no SDL/Vulkan.
+  add_executable(test_prosper_app_guest_end_status frontends/prosper-app/test_guest_end_status.cpp)
+  target_include_directories(test_prosper_app_guest_end_status PRIVATE frontends/prosper-app)
+  add_test(NAME prosper_app_guest_end_status COMMAND test_prosper_app_guest_end_status)
 
   add_executable(test_prosper_app_capture_schedule frontends/prosper-app/test_capture_schedule.cpp)
   target_include_directories(test_prosper_app_capture_schedule PRIVATE frontends/prosper-app)
@@ -2617,6 +2627,10 @@ if(TARGET prosper_core)
   add_executable(test_entry_m0_dispatcher tests/gpu/recompiler/test_entry_m0_dispatcher.cpp)
   target_link_libraries(test_entry_m0_dispatcher PRIVATE prosper_core)
   add_test(NAME entry_m0_dispatcher COMMAND test_entry_m0_dispatcher)
+
+  add_executable(test_scalar_ff1_b32 tests/gpu/recompiler/test_scalar_ff1_b32.cpp)
+  target_link_libraries(test_scalar_ff1_b32 PRIVATE prosper_core)
+  add_test(NAME scalar_ff1_b32 COMMAND test_scalar_ff1_b32)
 
   # #3231: the CFG dispatcher's `missing-entry-vcc` gate and the entry-block-dominance case it may
   # now admit. Both directions, in its own binary for the same reason as the file above.
@@ -4259,6 +4273,11 @@ endif()
       target_include_directories(test_rdna2_to_spirv PRIVATE tests)
       target_link_libraries(test_rdna2_to_spirv PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME rdna2_to_spirv_exec COMMAND test_rdna2_to_spirv)
+      add_executable(test_scalar_ff1_b32_exec tests/gpu/execute/test_scalar_ff1_b32_exec.cpp)
+      target_include_directories(test_scalar_ff1_b32_exec PRIVATE tests)
+      target_link_libraries(test_scalar_ff1_b32_exec PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME scalar_ff1_b32_exec COMMAND test_scalar_ff1_b32_exec)
+      set_tests_properties(scalar_ff1_b32_exec PROPERTIES TIMEOUT 120)
       add_executable(test_raw_register_wide_exec tests/gpu/execute/test_raw_register_wide_exec.cpp)
       target_include_directories(test_raw_register_wide_exec PRIVATE tests)
       target_link_libraries(test_raw_register_wide_exec PRIVATE prosper_core Vulkan::Vulkan)
