@@ -93,6 +93,6 @@ TEST(AbnormalTerminationStops, Contract) {
           "a signal that had latched permanently");
 
     prosper_reset_stop();
-    if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) failed ==\n", fails); FAIL() << "legacy early exit"; }
     EXPECT_EQ(fails, 0);
 }

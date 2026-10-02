@@ -106,7 +106,7 @@ TEST(AgcDcbCallbackAbi, Contract) {
     CHECK(g_seen_user == 0xD00DFEEDCAFEB00Dull,
           "argument 3 is user_data, delivered whole and in the guest's THIRD register");
 
-    if (fails) { std::printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { std::printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
     std::printf("== PASS ==\n");
     return;
 #endif

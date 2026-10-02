@@ -38,7 +38,7 @@ TEST(BarrierDestroyBusy, Contract) {
     HleFn wait    = by_name("scePthreadBarrierWait");
     HleFn destroy = by_name("scePthreadBarrierDestroy");
     check(init && wait && destroy, "the barrier entry points are registered");
-    if (failures) { std::fprintf(stderr, "== FAIL ==\n"); FAIL() << "legacy early exit"; }
+    if (failures || ::testing::Test::HasFailure()) { std::fprintf(stderr, "== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // --- the control FIRST: a barrier with no waiters must still destroy cleanly ----------------
     // Asserted before the busy case so a change returning EBUSY unconditionally cannot pass this

@@ -82,7 +82,7 @@ static void migration_arms() {
     auto run  = Hle::lookup("a0LLrZWac0M");
     alignas(16) static uint8_t fiber[256]{};
     alignas(16) static uint8_t stack[64 * 1024]{};
-    if (!init || !run) { std::printf("  [FAIL] fiber NIDs not registered\n"); ++fails; return; }
+    if (!init || !run) { ADD_FAILURE() << "fiber NIDs not registered"; return; }
 
     uint64_t returned = 0;
     CHECK(init(fiber, "migrate", (void*)fiber_body_migrate, 0xabc, stack, sizeof stack,

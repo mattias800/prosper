@@ -440,7 +440,7 @@ TEST(H264Sps, Contract) {
     test_fill_rejects_undersized_block();
     test_fill_tiers_for_the_0x58_variant();
 
-    if (fails) {
+    if (fails || ::testing::Test::HasFailure()) {
         printf("%d check(s) FAILED\n", fails);
         FAIL() << "legacy early exit";
     }

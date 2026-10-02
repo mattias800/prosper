@@ -33,10 +33,10 @@ TEST(DetClock, Contract) {
     auto clock_gettime_fn = Hle::lookup(nid_hash("sceKernelClockGettime"));
     CHECK(videoout_open && ptc && clock_gettime_fn,
           "VideoOut and monotonic/realtime entry points registered");
-    if (fails) FAIL() << "legacy early exit";
+    if (fails || ::testing::Test::HasFailure()) FAIL() << "legacy early exit";
     const uint64_t handle = videoout_open(0, 0, 0, 0, 0, 0);
     CHECK((int64_t)handle > 0, "opened a live VideoOut handle for flip pacing");
-    if (fails) FAIL() << "legacy early exit";
+    if (fails || ::testing::Test::HasFailure()) FAIL() << "legacy early exit";
 
     uint64_t pre0 = ptc(0, 0, 0, 0, 0, 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(10));

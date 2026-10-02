@@ -22,7 +22,7 @@ TEST(GpuTimeCompensation, Contract) {
     auto clock_gettime_fn = Hle::lookup(nid_hash("sceKernelClockGettime"));
     auto tsc = Hle::lookup(nid_hash("sceKernelReadTsc"));
     CHECK(ptc && tsc && clock_gettime_fn, "monotonic, TSC and realtime entry points registered");
-    if (fails) FAIL() << "legacy early exit";
+    if (fails || ::testing::Test::HasFailure()) FAIL() << "legacy early exit";
 
     constexpr uint64_t kBudgetNs = 8'000'000;
     const uint64_t guest_before = ptc(0, 0, 0, 0, 0, 0);
