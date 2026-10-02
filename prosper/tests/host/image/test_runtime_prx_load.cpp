@@ -37,6 +37,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+#if defined(__linux__) && defined(__x86_64__)
+#include <array>
+#include <cerrno>
+#include <filesystem>
+#include <system_error>
+#include <sys/mman.h>
+#endif
 
 using namespace prosper;
 
@@ -179,7 +186,321 @@ static std::vector<uint8_t> build_module(const std::string& export_nid,
     return f;
 }
 
+#if defined(__linux__) && defined(__x86_64__)
+namespace {
+constexpr size_t kStubPageBytes = 0x1000;
+constexpr size_t kMappedImageBytes = 0x4000;
+constexpr uint64_t kAppendArgs = 0x10, kAppendArgp = 0xdeadbeef;
+constexpr int32_t kResultSentinel = 0x7fffffff;
+constexpr uint64_t kImportMarker = 0xa550;
+
+enum class AppendFailure { Map, Image, Emission };
+enum class MmapFailure { None, Tail, Image };
+struct MmapProbe {
+    MmapFailure failure = MmapFailure::None;
+    uint64_t image_address = 0;
+    unsigned tail_requests = 0, tail_successes = 0, image_requests = 0, injected = 0;
+    bool tail_is_mapped = false;
+};
+MmapProbe mmap_probe;
+
+bool fixture_mapping(void* address, size_t length, int prot, int flags, int fd, off_t offset,
+                     uint64_t expected_address, size_t expected_length) {
+    return reinterpret_cast<uintptr_t>(address) == expected_address && length == expected_length &&
+        prot == (PROT_READ | PROT_WRITE | PROT_EXEC) &&
+        flags == (MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE) && fd == -1 && offset == 0;
+}
+
+void observe_append(MmapFailure failure = MmapFailure::None) {
+    // Keep the mapping-ownership observation across phases; only counters/injection are reset.
+    const bool mapped = mmap_probe.tail_is_mapped;
+    mmap_probe = {};
+    mmap_probe.tail_is_mapped = mapped;
+    mmap_probe.failure = failure;
+    mmap_probe.image_address = BOOT_RUNTIME_MODULE_BASE;
+}
+
+bool append_check(bool condition, const char* scope, const char* label) {
+    printf("  [%s] %s: %s\n", condition ? "ok" : "FAIL", scope, label);
+    if (!condition) ++fails;
+    return condition;
+}
+
+PROSPER_SYSV_ABI uint64_t append_import_handler(uint64_t, uint64_t, uint64_t,
+                                                uint64_t, uint64_t, uint64_t) {
+    return kImportMarker;
+}
+void append_return_hook() {}
+} // namespace
+
+// Target-only --wrap=mmap observes the six-argument fixture tuple. All other host requests pass
+// through, and a selected failure consumes exactly one request without creating a mapping.
+extern "C" void* __real_mmap(void*, size_t, int, int, int, off_t);
+extern "C" void* __wrap_mmap(void* address, size_t length, int prot, int flags, int fd, off_t offset) {
+    const bool tail = fixture_mapping(address, length, prot, flags, fd, offset,
+                                     BOOT_STUB + kStubPageBytes, kStubPageBytes);
+    const bool image = fixture_mapping(address, length, prot, flags, fd, offset,
+                                      mmap_probe.image_address, kMappedImageBytes);
+    if (tail) ++mmap_probe.tail_requests;
+    if (image) ++mmap_probe.image_requests;
+    if ((tail && mmap_probe.failure == MmapFailure::Tail) ||
+        (image && mmap_probe.failure == MmapFailure::Image)) {
+        mmap_probe.failure = MmapFailure::None;
+        ++mmap_probe.injected;
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+    void* result = __real_mmap(address, length, prot, flags, fd, offset);
+    if (tail && result == address) {
+        ++mmap_probe.tail_successes;
+        mmap_probe.tail_is_mapped = true;
+    }
+    return result;
+}
+
+namespace {
+struct AppendFixture {
+    Program* program = nullptr;
+    std::string root;
+    HleFn load = nullptr, dlsym = nullptr;
+    size_t prefix_slots = 0;
+    std::vector<uint8_t> prefix_bytes;
+    std::array<uint8_t, kStubPageBytes> first_page{};
+    std::vector<uint32_t> prefix_order;
+};
+
+uint64_t append_pointer(const void* p) { return reinterpret_cast<uintptr_t>(p); }
+
+bool prepare_append_fixture(AppendFixture& fixture, size_t prefix_slots, uint64_t stride) {
+    register_builtin_hle();
+    const TlsModuleDesc empty_tls{};
+    if (!append_check(setenv("PROSPER_NO_GUEST_FS", "1", 1) == 0, "append setup",
+                      "select host TLS before configuring templates")) return false;
+    guest_tls_set_templates(&empty_tls, 1);
+    if (!append_check(!guest_tls_enabled(), "append setup", "host-mode stubs are selected"))
+        return false;
+    fixture.root = prosper_test::test_scratch_file("stub-recovery-root");
+    std::error_code error;
+    std::filesystem::create_directories(fixture.root + "/prx", error);
+    if (!append_check(!error, "append setup", "create the owned synthetic module directory"))
+        return false;
+    set_app0_root(fixture.root);
+    static Program program; // dispatcher/runtime registries retain this pointer until process exit
+    fixture.program = &program;
+    fixture.prefix_slots = prefix_slots;
+    program.stub_base = BOOT_STUB;
+    program.stub_size = stride;
+    for (size_t i = 0; i < prefix_slots; ++i)
+        program.slots.push_back({ "fixture", nid_hash("prosperAppendPrefix" + std::to_string(i)) });
+    std::string err;
+    if (!append_check(install_stubs(program.slots, program.stub_base, stride, &err),
+                      "append setup", "install a real one-page prefix")) return false;
+    runtime_module_loader_init(&program);
+    fixture.load = Hle::lookup(nid_hash("sceKernelLoadStartModule"));
+    fixture.dlsym = Hle::lookup(nid_hash("sceKernelDlsym"));
+    if (!append_check(fixture.load && fixture.dlsym, "append setup",
+                      "resolve the final registered LoadStartModule and Dlsym callers")) return false;
+    // Index1 leaves sanitizer indirect-call metadata reads inside our owned mapped prefix page.
+    const auto prefix = reinterpret_cast<HleFn>(BOOT_STUB + stride);
+    append_check(prefix(0, 0, 0, 0, 0, 0) == 0 && prefix(0, 0, 0, 0, 0, 0) == 0,
+                 "append setup", "the existing unresolved stub executes twice");
+    fixture.prefix_order = call_order();
+    append_check(fixture.prefix_order == std::vector<uint32_t>{1}, "append setup",
+                 "two prefix calls produce one first-seen census entry");
+    fixture.prefix_bytes.resize(prefix_slots * stride);
+    memcpy(fixture.prefix_bytes.data(), reinterpret_cast<const void*>(BOOT_STUB),
+           fixture.prefix_bytes.size());
+    memcpy(fixture.first_page.data(), reinterpret_cast<const void*>(BOOT_STUB), kStubPageBytes);
+    return fails == 0;
+}
+
+bool write_append_module(const AppendFixture& fixture, const char* basename,
+                         const std::string& import_nid) {
+    const std::vector<uint8_t> bytes = build_module(nid_hash("prosperRecoveryExport"), import_nid);
+    const std::string path = fixture.root + "/prx/" + basename;
+    FILE* file = fopen(path.c_str(), "wb");
+    bool written = false;
+    if (file) {
+        const bool complete = fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
+        written = fclose(file) == 0 && complete;
+    }
+    if (!append_check(written, "append fixture", "write the complete synthetic module")) return false;
+    std::string err;
+    const auto module = Module::load(path, &err);
+    if (!append_check(module && module->imports.size() == 1 && module->imports[0].nid == import_nid,
+                      "append fixture", "parse a valid module with exactly the selected import"))
+        return false;
+    LoadedImage image;
+    return append_check(build_image(*module, BOOT_RUNTIME_MODULE_BASE, image, &err) &&
+                        image.min_vaddr == 0 && image.max_vaddr == kMappedImageBytes &&
+                        image.mem.size() == kMappedImageBytes && bytes.size() == kFileSize,
+                        "append fixture", "the valid 4 KiB file builds a 16 KiB image");
+}
+
+uint64_t call_append_load(const AppendFixture& fixture, const char* basename, int32_t& result) {
+    const std::string path = "/app0/prx/" + std::string(basename);
+    return fixture.load(append_pointer(path.c_str()), kAppendArgs, kAppendArgp, 0, 0,
+                        append_pointer(&result));
+}
+
+void check_append_prefix(const AppendFixture& fixture, const char* scope) {
+    append_check(memcmp(fixture.prefix_bytes.data(), reinterpret_cast<const void*>(BOOT_STUB),
+                        fixture.prefix_bytes.size()) == 0, scope, "live prefix bytes remain unchanged");
+    append_check(call_order() == fixture.prefix_order, scope, "the prefix census survives before another call");
+    const auto prefix = reinterpret_cast<HleFn>(BOOT_STUB + fixture.program->stub_size);
+    append_check(prefix(0, 0, 0, 0, 0, 0) == 0 && call_order() == fixture.prefix_order,
+                 scope, "another prefix call preserves its first-seen count");
+}
+
+void check_append_refusal(const AppendFixture& fixture, const char* scope, bool committed) {
+    int32_t result = kResultSentinel;
+    append_check(call_append_load(fixture, "failure.prx", result) == 0x8002000cULL, scope,
+                 "ENOMEM reaches the registered guest caller");
+    append_check(result == kResultSentinel && runtime_loaded_module_count() == 0, scope,
+                 "refusal leaves pRes untouched and publishes no module");
+    append_check(fixture.program->slots.size() == fixture.prefix_slots + (committed ? 1 : 0), scope,
+                 committed ? "the committed code slot is retained" : "uncommitted code slots are rolled back");
+    check_append_prefix(fixture, scope);
+    if (!committed)
+        append_check(memcmp(fixture.first_page.data(), reinterpret_cast<const void*>(BOOT_STUB),
+                            kStubPageBytes) == 0, scope, "refusal preserves the entire original page");
+}
+
+uint64_t append_peek(uint64_t base, uint64_t offset) {
+    uint64_t value;
+    memcpy(&value, reinterpret_cast<const void*>(base + offset), sizeof value);
+    return value;
+}
+
+void check_append_repeat(const AppendFixture& fixture, const char* basename, uint64_t handle,
+                         uint64_t base, size_t expected_count, const char* scope) {
+    int32_t result = kResultSentinel;
+    append_check(call_append_load(fixture, basename, result) == handle && result == 0 &&
+                 runtime_loaded_module_count() == expected_count, scope,
+                 "repeat load returns the same handle and successful pRes");
+    append_check(append_peek(base, kStartCount) == 1 && append_peek(base, kCtorCount) == 1,
+                 scope, "repeat load does not rerun either initializer");
+}
+
+bool check_append_loaded(const AppendFixture& fixture, const char* basename, uint64_t expected_base,
+                         size_t expected_count, size_t expected_slots, size_t import_slot,
+                         const char* scope) {
+    int32_t result = kResultSentinel;
+    const uint64_t handle = call_append_load(fixture, basename, result);
+    if (!append_check(handle >= kSceModuleHandleBase && handle < 0x80000000ULL, scope,
+                      "the registered caller returns a real handle")) return false;
+    append_check(runtime_loaded_module_count() == expected_count, scope, "one new module is published");
+    append_check(fixture.program->slots.size() == expected_slots, scope, "the exact slot count is preserved");
+    uint64_t address = 0;
+    if (!append_check(fixture.dlsym(handle, append_pointer("prosperRecoveryExport"),
+                                   append_pointer(&address), 0, 0, 0) == 0 && address != 0,
+                      scope, "Dlsym resolves this handle's real export")) return false;
+    const uint64_t base = address - kExportFn;
+    if (!append_check(base == expected_base, scope, "the successful load uses the next burned image base"))
+        return false;
+    append_check(reinterpret_cast<uint32_t (*)()>(address)() == 0x5eed, scope,
+                 "the mapped export executes the synthetic positive control");
+    append_check(result == 0 && append_peek(base, kStartCount) == 1 && append_peek(base, kCtorCount) == 1,
+                 scope, "both initializers run once and pRes receives success");
+    append_check(append_peek(base, kSavedArgs) == kAppendArgs && append_peek(base, kSavedArgp) == kAppendArgp,
+                 scope, "module_start receives the original guest arguments");
+    const uint64_t got = append_peek(base, kGot);
+    append_check(got == BOOT_STUB + import_slot * fixture.program->stub_size, scope,
+                 "the relocated GOT retains the exact import slot address");
+    const bool mapped = got >= BOOT_STUB && got < BOOT_STUB + 2 * kStubPageBytes &&
+        (got < BOOT_STUB + kStubPageBytes || mmap_probe.tail_is_mapped);
+    if (append_check(mapped, scope, "the resolved import points into observed owned stub pages"))
+        append_check(reinterpret_cast<HleFn>(got)(0, 0, 0, 0, 0, 0) == kImportMarker, scope,
+                     "the resolved import stub executes its real handler");
+    check_append_repeat(fixture, basename, handle, base, expected_count, scope);
+    check_append_prefix(fixture, scope);
+    return true;
+}
+
+void check_append_tail_recovery(const char* scope) {
+    append_check(mmap_probe.tail_requests == 1 && mmap_probe.tail_successes == 1 &&
+                 mmap_probe.injected == 0, scope, "one tail mapping succeeds without injection");
+}
+
+void exercise_append_map_failure(AppendFixture& fixture, const std::string& import_nid) {
+    observe_append(MmapFailure::Tail);
+    check_append_refusal(fixture, "map refusal", false);
+    append_check(mmap_probe.injected == 1 && mmap_probe.tail_requests == 1 &&
+                 mmap_probe.tail_successes == 0 && mmap_probe.image_requests == 0,
+                 "map refusal", "one exact tail request is refused before image mapping");
+    observe_append();
+    const bool loaded = check_append_loaded(fixture, "failure.prx",
+        BOOT_RUNTIME_MODULE_BASE + BOOT_RUNTIME_MODULE_STRIDE, 1, 43, 42, "map recovery");
+    check_append_tail_recovery("map recovery");
+    const std::string next_nid = nid_hash(import_nid + "Next");
+    if (!loaded || !write_append_module(fixture, "followup.prx", next_nid)) return;
+    Hle::register_fn(next_nid, append_import_handler, "fixture next import");
+    observe_append();
+    check_append_loaded(fixture, "followup.prx", BOOT_RUNTIME_MODULE_BASE + 2 * BOOT_RUNTIME_MODULE_STRIDE,
+                        2, 44, 43, "map followup");
+    append_check(mmap_probe.tail_requests == 0, "map followup", "the next slot reuses the mapped tail page");
+}
+
+void exercise_append_image_failure(AppendFixture& fixture, const std::string& import_nid) {
+    observe_append(MmapFailure::Image);
+    check_append_refusal(fixture, "image refusal", true);
+    append_check(mmap_probe.injected == 1 && mmap_probe.image_requests == 1 &&
+                 mmap_probe.tail_requests == 1 && mmap_probe.tail_successes == 1,
+                 "image refusal", "the tail commits before one exact 16 KiB image refusal");
+    observe_append();
+    const bool loaded = check_append_loaded(fixture, "failure.prx",
+        BOOT_RUNTIME_MODULE_BASE + BOOT_RUNTIME_MODULE_STRIDE, 1, 43, 42, "image recovery");
+    append_check(mmap_probe.tail_requests == 0, "image recovery", "retry retains the already mapped tail page");
+    if (!loaded || !write_append_module(fixture, "followup.prx", import_nid)) return;
+    observe_append();
+    check_append_loaded(fixture, "followup.prx", BOOT_RUNTIME_MODULE_BASE + 2 * BOOT_RUNTIME_MODULE_STRIDE,
+                        2, 43, 42, "image followup");
+    append_check(mmap_probe.tail_requests == 0, "image followup", "another module reuses the committed import");
+}
+
+void exercise_append_emission_failure(AppendFixture& fixture, const std::string& fitting_nid) {
+    observe_append();
+    check_append_refusal(fixture, "emission refusal", false);
+    append_check(mmap_probe.tail_requests == 0 && mmap_probe.image_requests == 0 && mmap_probe.injected == 0,
+                 "emission refusal", "oversized emission is refused before any tail or image mapping");
+    if (!write_append_module(fixture, "recovery.prx", fitting_nid)) return;
+    observe_append();
+    check_append_loaded(fixture, "recovery.prx",
+        BOOT_RUNTIME_MODULE_BASE + BOOT_RUNTIME_MODULE_STRIDE, 1, 171, 170, "emission recovery");
+    check_append_tail_recovery("emission recovery");
+}
+
+int run_append_fixture(AppendFailure failure) {
+    AppendFixture fixture;
+    const bool emission = failure == AppendFailure::Emission;
+    if (!prepare_append_fixture(fixture, emission ? 170 : 42, emission ? 24 : 96)) return 1;
+    const std::string fitting_nid = nid_hash("prosperAppendFittingImport");
+    const std::string hooked_nid = nid_hash("prosperAppendHookedImport");
+    Hle::register_fn(fitting_nid, append_import_handler, "fixture fitting import");
+    Hle::register_fn(hooked_nid, append_import_handler, "fixture hooked import", append_return_hook);
+    append_check(Hle::return_hook_of(hooked_nid) == append_return_hook &&
+                 !Hle::return_hook_of(fitting_nid), "append setup",
+                 "the oversized hook and fitting plain handler have distinct emitter metadata");
+    if (!write_append_module(fixture, "failure.prx", emission ? hooked_nid : fitting_nid)) return 1;
+    if (failure == AppendFailure::Map) exercise_append_map_failure(fixture, fitting_nid);
+    else if (failure == AppendFailure::Image) exercise_append_image_failure(fixture, fitting_nid);
+    else exercise_append_emission_failure(fixture, fitting_nid);
+    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
+    printf("== PASS ==\n");
+    return 0;
+}
+} // namespace
+#endif
+
 int main(int argc, char** argv) {
+#if defined(__linux__) && defined(__x86_64__)
+    if (argc == 2 && strcmp(argv[1], "--append-map-failure") == 0)
+        return run_append_fixture(AppendFailure::Map);
+    if (argc == 2 && strcmp(argv[1], "--append-image-failure") == 0)
+        return run_append_fixture(AppendFailure::Image);
+    if (argc == 2 && strcmp(argv[1], "--append-emission-failure") == 0)
+        return run_append_fixture(AppendFailure::Emission);
+#endif
     printf("== test_runtime_prx_load ==\n");
     // A scratch "dump root", on real disk and never /tmp: tests/fixtures/test_scratch.h roots it at
     // PROSPER_TEST_SCRATCH_DIR (which prosper/CMakeLists.txt points into the build tree, per ctest

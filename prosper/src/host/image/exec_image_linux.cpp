@@ -40,8 +40,10 @@
 #include <cstdint>
 #include <cerrno>
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <mutex>
+#include <new>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -3222,12 +3224,38 @@ bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::s
     if (first_new == n) return true;                    // nothing new to emit
     const bool swap = stub_swap_mode();
     if (swap && g_stub_size < 96) return fail("stub_size too small for guest-%fs swap stub (need >= 96)");
+    if (n > kStubApertureBytes / g_stub_size)
+        return fail("import stub table exceeds the stub aperture");
+    // The division bound keeps both products and page rounding within the page-aligned aperture.
+    const uint64_t mapped_end = page_up(g_nstubs * g_stub_size);
+    const uint64_t need_end   = page_up(n * g_stub_size);
+    if (g_stub_base > std::numeric_limits<uint64_t>::max() - need_end)
+        return fail("import stub table address overflows");
+
+    // Current POSIX emitters need at most 82 bytes. Validate the whole suffix before mapping or
+    // writing live pages, including the padding in the last page of the old table.
+    struct StagedStub {
+        uint8_t bytes[96];
+        size_t length = 0;
+    };
+    std::vector<StagedStub> staged;
+    const size_t added = slots.size() - first_new;
+    if (added > staged.max_size()) return fail("import stub staging allocation failed");
+    try {
+        staged.resize(added);
+    } catch (const std::bad_alloc&) {
+        return fail("import stub staging allocation failed");
+    }
+    for (size_t j = 0; j < added; j++) {
+        const size_t i = first_new + j;
+        auto& stub = staged[j];
+        stub.length = emit_one_stub(stub.bytes, slots[i], (uint32_t)i, swap);
+        if (stub.length > sizeof(stub.bytes)) return fail("generated import stub exceeds staging capacity");
+        if (stub.length > g_stub_size) return fail("generated import stub exceeds stub_size");
+    }
     // Grow the region only by the pages the new slots need. The already-mapped pages are NEVER
     // remapped: relocated guest code already holds addresses inside them, and a fresh MAP_FIXED
     // would tear a stub out from under a thread executing it.
-    const uint64_t mapped_end = page_up(g_nstubs * g_stub_size);
-    const uint64_t need_end   = page_up(n * g_stub_size);
-    if (need_end > kStubApertureBytes) return fail("import stub table exceeds the stub aperture");
     if (need_end > mapped_end) {
         void* want = (void*)(g_stub_base + mapped_end);
         void* got = prosper_mmap_noreplace(want, need_end - mapped_end,
@@ -3235,11 +3263,10 @@ bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::s
                                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (got == MAP_FAILED || got != want) return fail("mmap stub region extension failed");
     }
-    for (uint64_t i = first_new; i < n; i++) {
-        const size_t emitted =
-            emit_one_stub((uint8_t*)(uintptr_t)(g_stub_base + i * g_stub_size), slots[i],
-                          (uint32_t)i, swap);
-        if (emitted > g_stub_size) return fail("generated import stub exceeds stub_size");
+    for (size_t j = 0; j < added; j++) {
+        const uint64_t i = first_new + j;
+        memcpy((uint8_t*)(uintptr_t)(g_stub_base + i * g_stub_size),
+               staged[j].bytes, staged[j].length);
     }
     g_nstubs = n;
     // Publish the grown table only after every new stub is written: prosper_on_unimpl indexes it.
