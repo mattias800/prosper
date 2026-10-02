@@ -38,7 +38,7 @@ constexpr uint32_t tb=20, ti=21, tf=22, tv=23, ta=29, ts=30, tp=32;
 constexpr uint32_t ct=41, cf=42, con=43, var=59, load=61, store=62, chain=65;
 constexpr uint32_t deco=71, member=72, construct=80, extract=81, copy=83, cast=124;
 constexpr uint32_t lor=166, land=167, lnot=168, select=169, ieq=170, ine=171;
-constexpr uint32_t uge=174, ule=178, band=199, phi=245, branch=250, any=335;
+constexpr uint32_t add=128, mul=132, uge=174, ule=178, band=199, phi=245, branch=250, any=335;
 struct Instruction { uint32_t op; std::vector<uint32_t> a; };
 // Adapted from prosper's normal_magnitude_predicate typed sink oracle. Unknown definitions,
 // arbitrary Inputs, Undef and unsupported FP dependencies never acquire a default value.
@@ -62,7 +62,7 @@ struct Module {
         for (const auto& i:ins) switch(i.op) {
             case ct: case cf: case con: case var: case load: case chain: case construct:
             case extract: case copy: case cast: case lor: case land: case lnot: case select:
-            case ieq: case ine: case uge: case ule: case band: case phi: case any:
+            case ieq: case ine: case uge: case ule: case band: case add: case mul: case phi: case any:
             case 12: case 127: case 180: case 182: case 183: case 188: case 190:
                 if (i.a.size()>=2 && i.a[1]==id) return &i; break;
             default: break;
@@ -176,8 +176,11 @@ struct Oracle {
         if (d->op==load) { uint32_t ix=0; if(m.word_load(*d,ix)) { ++leaves; return words[ix]; } }
         if (m.varying_bits(*d)) { ++leaves; return input_word; }
         if (d->op==copy && a.size()==3) return uint_value(a[2],depth+1);
-        if (d->op==band && a.size()==4) {
-            const uint32_t l=uint_value(a[2],depth+1),r=uint_value(a[3],depth+1); return l&r;
+        if ((d->op==band || d->op==add || d->op==mul) && a.size()==4) {
+            const uint32_t l=uint_value(a[2],depth+1),r=uint_value(a[3],depth+1);
+            if(d->op==band) return l&r;
+            if(d->op==add) return l+r;
+            if(d->op==mul) return l*r;
         }
         good=false; return 0;
     }
@@ -213,10 +216,11 @@ bool guest_compare(uint32_t word,uint8_t mode,bool neq) {
     // NaNs, including signalling NaNs, are NOT EQ-zero and ARE unordered NEQ-zero.
     return neq?!guest_zero(word,mode):guest_zero(word,mode);
 }
-const std::array<uint32_t,22> samples{0,0x80000000u,1,0x80000001u,0x003fffffu,0x803fffffu,
+const std::array<uint32_t,29> samples{0,0x80000000u,1,0x80000001u,0x003fffffu,0x803fffffu,
     0x007fffffu,0x807fffffu,0x00800000u,0x80800000u,0x00800001u,0x80800001u,
     0x3f800000u,0xbf800000u,0x7f7fffffu,0xff7fffffu,0x7f800000u,0xff800000u,
-    0x7f800001u,0xffbfffffu,0x7fc00000u,0xffffffffu};
+    0x7f800001u,0xffbfffffu,0x7fc00000u,0xffffffffu,
+    0x3fffffffu,0xbfffffffu,0x40000000u,0xc0000000u,0x7ffffffeu,0xfffffffeu,0x7fffffffu};
 enum class Encoding { E32,Sdwa,E64 };
 struct Options {
     Encoding encoding=Encoding::E64;

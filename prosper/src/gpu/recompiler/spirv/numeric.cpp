@@ -11,9 +11,16 @@ uint32_t SpirvCompute::f32_nonzero_bits(uint32_t word) {
     // AMD70648 section6.4: FP_DENORM[0] allows input denormals. EQ/NEQ have no
     // floating result, so output-denorm and rounding bits cannot affect this relation.
     // All NaNs and infinities have magnitudes above the normal threshold.
-    return fragment_float_mode.preserves_f32_inputs()
-        ? ucmp(Op_INotEqual, magnitude, uconst(0))
-        : ucmp(Op_UGreaterThanEqual, magnitude, uconst(0x00800000u));
+    if (!fragment_float_mode.preserves_f32_inputs())
+        return ucmp(Op_UGreaterThanEqual, magnitude, uconst(0x00800000u));
+    // Keep this relation in integer arithmetic rather than a direct sign-mask/equality
+    // pattern that host backends can turn into an FP zero classification. For 31-bit M,
+    // M*(M+1) is zero modulo 2^32 iff M is zero: one adjacent factor is odd and the other
+    // has at most 31 trailing zero bits. The wrapped product introduces no FP operation,
+    // undefined execution or new proof fact. The extra integer shape is intentional.
+    const uint32_t next = ibin(Op_IAdd, magnitude, uconst(1));
+    const uint32_t product = ibin(Op_IMul, magnitude, next);
+    return ucmp(Op_INotEqual, product, uconst(0));
 }
 
 uint32_t SpirvCompute::f32_abs_normal_le_bits(uint32_t word, uint32_t bound) {

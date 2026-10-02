@@ -39,7 +39,7 @@ struct Module {
             // Never guess that metadata/type/label IDs have values.
             switch (i.op) {
                 case 1: case 41: case 42: case 43: case 59: case 61: case 65:
-                case 80: case 81: case 83: case 124: case 128: case 129: case 133:
+                case 80: case 81: case 83: case 124: case 128: case 129: case 132: case 133:
                 case 166: case 167: case 168: case 169: case 170: case 171:
                 case 172: case 174: case 176: case 178: case 197: case 198:
                 case 199: case 245: case 335:
@@ -115,6 +115,16 @@ struct Module {
         }
         return 0;
     }
+    bool integer_nonzero_product(uint32_t predicate) const {
+        const auto* cmp=def(predicate);
+        if(!cmp || cmp->op!=171 || cmp->a.size()!=4 || !boolean(cmp->a[0]) || !literal(cmp->a[3],0)) return false;
+        const auto* product=def(cmp->a[2]);
+        if(!product || product->op!=132 || product->a.size()!=4 || !u32(product->a[0])) return false;
+        const auto* magnitude=def(product->a[2]); const auto* next=def(product->a[3]);
+        return magnitude && magnitude->op==199 && magnitude->a.size()==4 && u32(magnitude->a[0]) &&
+            literal(magnitude->a[3],0x7fffffffu) && next && next->op==128 && next->a.size()==4 &&
+            next->a[0]==magnitude->a[0] && next->a[2]==magnitude->a[1] && literal(next->a[3],1);
+    }
     bool live_branch(uint32_t predicate) const {
         uint32_t vote=0;
         for(const auto& i:ins) if(i.op==335 && i.a.size()==4 && i.a[3]==predicate && literal(i.a[2],3)) vote=i.a[1];
@@ -137,7 +147,7 @@ struct Module {
         size_t end=d->a.size();
         switch(d->op) {
             case 81: end=3; break; // component selector is a literal, not an SSA value
-            case 83: case 124: case 166: case 167: case 168: case 169:
+            case 83: case 124: case 128: case 132: case 166: case 167: case 168: case 169:
             case 170: case 171: case 174: case 178: case 197: case 198: case 199: break;
             default: return false;
         }
@@ -191,6 +201,8 @@ struct Oracle {
             const auto* x=m.def(a[2]); const auto* y=m.def(a[3]);
             if(!x || !y || !m.u32(x->a[0]) || !m.u32(y->a[0])) {good=false;return 0;}
             const uint32_t xvalue=arg(2),yvalue=arg(3);
+            if(d->op==128) return xvalue+yvalue;
+            if(d->op==132) return xvalue*yvalue;
             if(d->op==199) return xvalue&yvalue;
             if(d->op==197) return xvalue|yvalue;
             if(d->op==198) return xvalue^yvalue;
@@ -216,9 +228,10 @@ struct Oracle {
         good=false; return 0; // includes Undef, FP, unknown load, Phi and Any
     }
 };
-constexpr std::array<uint32_t,20> samples{0,0x80000000u,1,0x80000001u,0x007fffffu,0x807fffffu,
+constexpr std::array<uint32_t,27> samples{0,0x80000000u,1,0x80000001u,0x007fffffu,0x807fffffu,
     0x00800000u,0x80800000u,0x00800001u,0x3f800000u,0xbf800000u,0x7f7fffffu,0xff7fffffu,
-    0x7f800000u,0xff800000u,0x7f800001u,0xff800001u,0x7fc00000u,0xffc00000u,0xffffffffu};
+    0x7f800000u,0xff800000u,0x7f800001u,0xff800001u,0x7fc00000u,0xffc00000u,0xffffffffu,
+    0x3fffffffu,0xbfffffffu,0x40000000u,0xc0000000u,0x7ffffffeu,0xfffffffeu,0x7fffffffu};
 bool expected_nonzero(uint32_t bits, uint8_t mode) {
     const bool zero=(bits&0x7fffffffu)==0;
     const bool subnormal=(bits&0x7f800000u)==0 && (bits&0x007fffffu)!=0;
@@ -281,6 +294,8 @@ void emitter_tests(const char* dir) {
         const Module m(source); inventory(m,true,input,stem+"_explicit"); if(!m.valid) continue;
         dump(dir,stem+"_source",source);
         const uint32_t p=m.exported_predicate(); check(p!=0,stem+" predicate reaches actual typed MRT0.r tag");
+        check((mode&16u)==0 || m.integer_nonzero_product(p),
+            stem+" preserve-mode live zero relation uses bounded adjacent integer factors");
         for(uint32_t bits:samples) {
             Oracle o{m,bits,input}; const bool actual=o.value(p)!=0;
             check(o.good && o.leaves>0 && actual==expected_nonzero(bits,mode),stem+" actual integer predicate matches independent class oracle");
