@@ -630,13 +630,13 @@ def scan_tree(src_hle, platform):
         for w in wrappers:
             by_name.setdefault(w.name, []).append(w)
 
-        def in_definition(idx):
+        def in_definition(idx, def_spans=def_spans):
             return any(a <= idx < b for a, b in def_spans)
 
-        def is_wrapper_template(idx):
+        def is_wrapper_template(idx, fwd_spans=fwd_spans):
             return any(a <= idx < b for a, b in fwd_spans)
 
-        def wrapper_named(name, at):
+        def wrapper_named(name, at, by_name=by_name):
             """The wrapper `name` that is in scope AT a call site — one file may define the same
             macro twice with disjoint `#define`..`#undef` spans, and picking the wrong one would
             expand a call through the wrong body."""
@@ -974,7 +974,7 @@ def print_cross(sc, idx, names, gated, gated_path, min_names):
     # Per-library, never a rolled-up "libc"/"non-libc" subtotal: the one place this measurement has
     # been misread is exactly there, and the disagreement was a definition rather than a result.
     bylib = {}
-    for nid, r in shared:
+    for nid, _r in shared:
         _, lib = names.get(nid, ("", ""))
         bylib.setdefault(lib or "(not in --names)", []).append(nid)
     print("   by library (PS5 3.20 firmware file names, verbatim — `libkernel` is its OWN library")

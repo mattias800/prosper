@@ -122,7 +122,7 @@ else:
 
 # --- part 2: GameThread RA histogram ---
 hist = Counter()
-for i in range(40):
+for _i in range(40):
     for t in inf.threads():
         if t.num == 1:
             t.switch()

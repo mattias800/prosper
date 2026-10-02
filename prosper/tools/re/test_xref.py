@@ -283,7 +283,7 @@ def refusal():
             XREF.Module(path)
         except XREF.BadModule as exc:
             if must_mention and must_mention not in str(exc):
-                raise AssertionError("%s: message must mention %r, got: %s" % (why, must_mention, exc))
+                raise AssertionError("%s: message must mention %r, got: %s" % (why, must_mention, exc)) from exc
         else:
             raise AssertionError("%s: constructed a Module instead of refusing" % why)
 
