@@ -5,6 +5,45 @@
 
 namespace prosper::gpu {
 
+uint32_t SpirvCompute::portable_ds_bpermute_b32(
+    uint32_t address, uint32_t value, uint32_t active, uint32_t offset,
+    uint32_t event, uint32_t metadata_base) {
+    // AMD RDNA2 70648, section 10.4.4: BPERMUTE gathers within each independent
+    // 32-lane half, and an EXEC-disabled source supplies zero. All physical
+    // invocations publish, including ended waves and EXEC-disabled destinations.
+    // No guest LDS allocation or host subgroup layout participates in this service.
+    const uint32_t zero = uconst(0);
+    cfg_scratch_store(linear_localid, value);
+    const uint32_t metadata = sel(active,
+        ibin(Op_BitwiseOr,
+             ibin(Op_ShiftLeftLogical, event, uconst(1)), uconst(1)), zero);
+    cfg_scratch_store(ibin(Op_IAdd, uconst(metadata_base), linear_localid), metadata);
+    barrier();
+
+    const uint32_t selected = ibin(Op_BitwiseAnd,
+        ibin(Op_ShiftRightLogical, ibin(Op_IAdd, address, offset), uconst(2)),
+        uconst(31));
+    const uint32_t peer = ibin(Op_BitwiseOr,
+        ibin(Op_BitwiseAnd, linear_localid, uconst(~31u)), selected);
+    const uint32_t present = ucmp(Op_ULessThan, peer, uconst(local_count));
+    // OpSelect does not suppress evaluation of a load. Address an initialized
+    // physical slot for an absent peer, then invalidate its value explicitly.
+    const uint32_t safe_peer = sel(present, peer, linear_localid);
+    const uint32_t source = cfg_scratch_load(safe_peer);
+    const uint32_t source_metadata = cfg_scratch_load(
+        ibin(Op_IAdd, uconst(metadata_base), safe_peer));
+    const uint32_t source_active = ucmp(Op_INotEqual,
+        ibin(Op_BitwiseAnd, source_metadata, uconst(1)), zero);
+    const uint32_t same_event = ucmp(Op_IEqual,
+        ibin(Op_ShiftRightLogical, source_metadata, uconst(1)), event);
+    const uint32_t result = sel(land(present, land(source_active, same_event)),
+                                source, zero);
+    // Peers must finish consuming both planes before another service or the next
+    // dispatcher iteration overwrites them. The caller separately predicates VDST.
+    barrier();
+    return result;
+}
+
 void SpirvCompute::mark_fragment_wave_vote_value(uint32_t value) {
         std::vector<uint32_t> pending{value};
         while (!pending.empty()) {

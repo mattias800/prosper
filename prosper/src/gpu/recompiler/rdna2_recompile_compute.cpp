@@ -779,10 +779,14 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02;
         });
+    const bool has_bpermute = std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+        return in.fmt == Rdna2Format::DS && in.opcode == kDsOpcodeBpermuteB32;
+    });
     const bool exact_partial_dispatcher = config.exact_thread_extent &&
         has_partial_workgroup && (b.gta5_selected_sbuffer_dispatch_validated ||
                                   b.indirect_buffer_dispatch_validated ||
-                                  has_indirect_pointer_relocation || has_portable_readfirstlane);
+                                  has_indirect_pointer_relocation || has_portable_readfirstlane ||
+                                  has_bpermute);
     // A partial guest wave needs the portable dispatcher's per-lane ACTIVE bit. Native subgroup
     // operations cannot be entered by only the real prefix of the final host subgroup.
     if (partial_barrier_phases || exact_partial_dispatcher)
@@ -937,9 +941,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                    code, dwords, nullptr, true, initial_dispatch_active, false,
                    lds_fminmax_synchronization.needs_dispatcher))
         return {};
-    // Exact resource contracts and portable RFL execute partial workgroups through ACTIVE. Padded
+    // Exact resource contracts and portable wave gathers execute partial workgroups through ACTIVE. Padded
     // Vulkan lanes stay in the dispatcher and synthesized barriers, but cannot execute guest effects.
-    // The resource contracts retain their own full program/launch proofs; RFL needs no title identity.
+    // The resource contracts retain their own full program/launch proofs; gathers need no title identity.
     if (exact_partial_dispatcher && b.uses_barrier)
         b.partial_barrier_phases_emitted = true;
     // The entry guard is intentionally divergent only in the final partial workgroup. Vulkan requires
