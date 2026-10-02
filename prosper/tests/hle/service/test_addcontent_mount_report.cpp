@@ -256,6 +256,6 @@ TEST(AddcontentMountReport, Contract) {
 
     set_app0_root(".");
     fs::remove_all(scratch, ec);
-    if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) failed ==\n", fails); FAIL() << "legacy early exit"; }
     EXPECT_EQ(fails, 0);
 }

@@ -43,7 +43,11 @@ int checks = 0;
 
 // Counts assertions ACTUALLY EXECUTED. A deleted block leaves `failures` at zero, which is
 // indistinguishable from a passing run; the count is the falsifiable half.
-void check(bool ok, const std::string& label) { EXPECT_TRUE(ok) << label; }
+void check(bool ok, const std::string& label) {
+    ++checks;
+    if (!ok) ++failures;
+    EXPECT_TRUE(ok) << label;
+}
 
 constexpr uint32_t kOpExtension = 10;
 constexpr uint32_t kOpEntryPoint = 15;
@@ -237,5 +241,6 @@ TEST(FloatControls, Contract) {
                 failures ? "FAIL" : "PASS", checks, failures);
     // A run that executed nothing is a failure, not a pass: see the comment on `checks`.
     constexpr int kExpectedChecks = 74;
+    EXPECT_GE(checks, kExpectedChecks) << "a run that executed fewer checks than expected is a failure";
     EXPECT_EQ(failures, 0);
 }

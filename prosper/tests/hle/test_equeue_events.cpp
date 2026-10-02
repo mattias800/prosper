@@ -316,6 +316,6 @@ TEST(EqueueEvents, Contract) {
         CHECK((uint32_t)wret == 0x80020009u && wout == 0, "DeleteEqueue wakes an infinite waiter with EBADF");
     }
 
-    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
     EXPECT_EQ(fails, 0);
 }

@@ -1,4 +1,25 @@
 # Legacy hand-rolled main() tests. New tests MUST use GoogleTest. List only shrinks.
+frontends/audio_sdl3/test_audio_demand.cpp
+frontends/audio_sdl3/test_audio_sdl3.cpp
+frontends/dialog_sdl3/test_dialog_helpers.cpp
+frontends/pad_sdl3/test_pad_sdl3.cpp
+frontends/prosper-app/test_capture_schedule.cpp
+frontends/prosper-app/test_fps_hud.cpp
+frontends/prosper-app/test_frame_grab_match.cpp
+frontends/prosper-app/test_frame_grab_naming.cpp
+frontends/prosper-app/test_game_library.cpp
+frontends/prosper-app/test_game_path.cpp
+frontends/prosper-app/test_guest_end_status.cpp
+frontends/prosper-app/test_keyboard_pad_map.cpp
+frontends/prosper-app/test_launcher_media.cpp
+frontends/prosper-app/test_library_descriptor_budget.cpp
+frontends/prosper-app/test_library_nav.cpp
+frontends/prosper-app/test_pad_overlay.cpp
+frontends/prosper-app/test_performance_capture_schedule.cpp
+frontends/prosper-app/test_present_mode.cpp
+frontends/prosper-app/test_present_policy.cpp
+frontends/prosper-app/test_snap_author.cpp
+frontends/prosper-app/test_window_controls.cpp
 frontends/shared/tests/test_cpu_rtt_snapshot_pool.cpp
 frontends/shared/tests/test_depth_cube_quantize.cpp
 frontends/shared/tests/test_frame_dump_policy.cpp
@@ -7,6 +28,9 @@ frontends/shared/tests/test_pipeline_cache_file.cpp
 frontends/shared/tests/test_storage_write_mask_spirv.cpp
 frontends/shared/tests/test_texture_direct_validation.cpp
 frontends/shared/tests/test_write_watch_policy.cpp
+frontends/video_mf/test_video_mf.cpp
+frontends/video_mf/test_videodec2_mf.cpp
+frontends/video_vaapi/test_video_vaapi.cpp
 tests/diagnostics/test_boot_phase_log.cpp
 tests/diagnostics/test_diagnostics_enabled.cpp
 tests/diagnostics/test_diagnostics_json.cpp
@@ -184,7 +208,6 @@ tests/hle/test_posix_sem.cpp
 tests/hle/test_printf.cpp
 tests/hle/test_prot_none.cpp
 tests/hle/test_pthread_sched_getters.cpp
-tests/hle/test_reserve_placement.cpp
 tests/hle/test_rwlock_once.cpp
 tests/hle/test_savedata_capacity.cpp
 tests/hle/test_service_logging.cpp

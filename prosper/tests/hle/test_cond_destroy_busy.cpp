@@ -53,7 +53,7 @@ TEST(CondDestroyBusy, Contract) {
     check(cond_init && cond_wait && cond_broadcast && cond_destroy &&
           mutex_init && mutex_lock && mutex_unlock,
           "every pthread entry point this test needs is registered");
-    if (failures) { std::fprintf(stderr, "== FAIL ==\n"); FAIL() << "legacy early exit"; }
+    if (failures || ::testing::Test::HasFailure()) { std::fprintf(stderr, "== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // Guest-visible slots: the HLE takes the ADDRESS of a pointer-sized slot, not the object.
     uint64_t cond_slot = 0, mutex_slot = 0;

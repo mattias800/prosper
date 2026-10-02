@@ -469,7 +469,7 @@ TEST(ComputeImageBorrowCensus, Contract) {
         CHECK(format_compute_image_borrow_census(census.snapshot(), one, 0) == 0);
     }
 
-    if (failures) {
+    if (failures || ::testing::Test::HasFailure()) {
         std::fprintf(stderr, "compute_image_borrow_census: %d check(s) failed\n", failures);
         FAIL() << "legacy early exit";
     }

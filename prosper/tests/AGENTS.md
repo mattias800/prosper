@@ -12,7 +12,8 @@ Older tests are standalone executables registered with `add_test` and a local `C
 - Legacy hand-rolled tests are listed in `tools/ci/gtest_legacy_allowlist.txt`. When you migrate one,
   delete its line (the check fails if a listed file no longer has `main()`).
 - Prefer one `TEST` per behaviour, with a message on `EXPECT_*` (`<< "why"`), not one giant test.
-- A test that must compile standalone (e.g. `tools/perf/mutate_*.sh` use plain g++) may stay legacy.
+- The few tests that must compile standalone (e.g. `tools/perf/mutate_*.sh` build them with plain g++)
+  stay on the allowlist. Since the list only shrinks, a new standalone test needs the owner's say-so.
 - Dump- or Vulkan-gated tests keep their gating in CMake, not inside gtest.
 
 ## Rules
@@ -48,7 +49,7 @@ Older tests are standalone executables registered with `add_test` and a local `C
 ## Where things go
 
 A new test file goes in the subfolder matching the subsystem it exercises (`hle/`, `gpu/`,
-`loader/`, `self/`, …), registered by `add_test` in `prosper/CMakeLists.txt`. `fixtures/` holds
+`loader/`, `self/`, …), registered in `prosper/CMakeLists.txt` (`prosper_add_gtest`, or `add_test` for legacy tests). `fixtures/` holds
 inputs and machinery under test; `support/` holds helpers that can never change an assertion's
 outcome (see its own `AGENTS.md`).
 

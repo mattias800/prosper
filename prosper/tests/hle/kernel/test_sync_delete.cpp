@@ -343,6 +343,6 @@ TEST(SyncDelete, Contract) {
     CHECK(trace.find("SEMA.signal") == std::string::npos,
           "deleted semaphore focus does not retain a reused object's signal");
 
-    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
     EXPECT_EQ(fails, 0);
 }

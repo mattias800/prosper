@@ -81,8 +81,7 @@ TEST(AmprAmm, Contract) {
     CHECK(get_ranges && give_dmem && amm_ctor && amm_map && amm_submit && amm_wait,
           "all six libSceAmpr AMM NIDs are registered");
     if (!(get_ranges && give_dmem && amm_ctor && amm_map && amm_submit && amm_wait)) {
-        std::printf("%s\n", fails ? "FAILED" : "PASSED");
-        return fails ? 1 : 0;
+        FAIL() << "the libSceAmpr AMM NIDs are not all registered";
     }
 
     // ---- the window ------------------------------------------------------------------------

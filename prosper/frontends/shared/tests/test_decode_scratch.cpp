@@ -274,6 +274,6 @@ TEST(DecodeScratch, Contract) {
         CHECK(decode_scratch_pool().retained_buffers() == retained_before);
     }
 
-    if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); FAIL() << "legacy early exit"; }
+    if (failures || ::testing::Test::HasFailure()) { std::fprintf(stderr, "%d check(s) failed\n", failures); FAIL() << "legacy early exit"; }
     EXPECT_EQ(failures, 0);
 }
