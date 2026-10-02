@@ -1,5 +1,5 @@
 name: Vulkan 1.4 toolchain
-description: Build pinned Khronos headers and loader while retaining the runner's Mesa driver and validation layer.
+description: Build matching pinned Khronos headers, loader and validation layer while retaining the runner's Mesa driver.
 runs:
   using: composite
   steps:
@@ -10,14 +10,14 @@ runs:
         . /etc/os-release
         printf 'distribution=%s-%s\n' "$ID" "$VERSION_ID" >> "$GITHUB_OUTPUT"
 
-    - name: Cache headers and loader
+    - name: Cache the matching Vulkan toolchain
       id: cache
       uses: actions/cache@v4
       with:
         path: ${{ runner.temp }}/prosper-vulkan
-        key: vulkan-1.4.341-${{ runner.os }}-${{ runner.arch }}-${{ steps.host.outputs.distribution }}-1
+        key: vulkan-1.4.341-vvl-${{ runner.os }}-${{ runner.arch }}-${{ steps.host.outputs.distribution }}-2
 
-    - name: Build headers and loader
+    - name: Build headers, loader and validation layer
       if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
@@ -33,12 +33,34 @@ runs:
         curl --fail --location --retry 3 \
           https://codeload.github.com/KhronosGroup/Vulkan-Loader/tar.gz/refs/tags/v1.4.341 \
           --output loader.tar.gz
+        curl --fail --location --retry 3 \
+          https://codeload.github.com/KhronosGroup/Vulkan-ValidationLayers/tar.gz/refs/tags/v1.4.341 \
+          --output validation.tar.gz
+        # The embedded SPIR-V parser must match VVL, not the distro's older library.
+        # These are VVL v1.4.341's scripts/known_good.json production dependencies.
+        curl --fail --location --retry 3 \
+          https://codeload.github.com/KhronosGroup/Vulkan-Utility-Libraries/tar.gz/refs/tags/v1.4.341 \
+          --output utility.tar.gz
+        curl --fail --location --retry 3 \
+          https://codeload.github.com/KhronosGroup/SPIRV-Headers/tar.gz/04f10f650d514df88b76d25e83db360142c7b174 \
+          --output spirv-headers.tar.gz
+        curl --fail --location --retry 3 \
+          https://codeload.github.com/KhronosGroup/SPIRV-Tools/tar.gz/fbe4f3ad913c44fe8700545f8ffe35d1382b7093 \
+          --output spirv-tools.tar.gz
         printf '%s\n' \
           '8876aad926b2e72bdefddc34885472d5332e2d20aa3ed57313466f0bc982cf3f  headers.tar.gz' \
           '9a8c6f1aace4a03641429a09bc823073f2375abf2d62ac5a4d38c46e732b2d85  loader.tar.gz' \
+          'cbedb6fbd5194474d02e7a9d85f7092e54fa39989acc5ca8512447b97520ded1  validation.tar.gz' \
+          '066e9d0eb098f6cb3aa80585ae57757ae2c56bc6dbdd5990f6b3bc1c778b9a42  utility.tar.gz' \
+          '1b220e3eec1714f0451b0e3652979bd280edf10893f617837b88e6359a804ded  spirv-headers.tar.gz' \
+          'cabb35f4eef0da3ef72ad9edd596af4191d7507a8f35c05df526d2d5ff889f59  spirv-tools.tar.gz' \
           | sha256sum --check
         tar -xzf headers.tar.gz
         tar -xzf loader.tar.gz
+        tar -xzf validation.tar.gz
+        tar -xzf utility.tar.gz
+        tar -xzf spirv-headers.tar.gz
+        tar -xzf spirv-tools.tar.gz
         cmake -S Vulkan-Headers-1.4.341 -B headers-build -G Ninja \
           -DCMAKE_INSTALL_PREFIX="$vulkan_prefix"
         cmake --install headers-build
@@ -48,11 +70,51 @@ runs:
           -DBUILD_TESTS=OFF -DUPDATE_DEPS=OFF
         cmake --build loader-build --parallel 2
         cmake --install loader-build
+        cmake -S SPIRV-Headers-04f10f650d514df88b76d25e83db360142c7b174 -B spirv-headers-build -G Ninja \
+          -DCMAKE_INSTALL_PREFIX="$vulkan_prefix"
+        cmake --install spirv-headers-build
+        cmake -S SPIRV-Tools-fbe4f3ad913c44fe8700545f8ffe35d1382b7093 -B spirv-tools-build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$vulkan_prefix" \
+          -DCMAKE_INSTALL_LIBDIR=lib \
+          -DSPIRV-Headers_SOURCE_DIR="$vulkan_root/SPIRV-Headers-04f10f650d514df88b76d25e83db360142c7b174" \
+          -DSPIRV_WERROR=OFF -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=OFF
+        cmake --build spirv-tools-build --parallel 2
+        cmake --install spirv-tools-build
+        cmake -S Vulkan-Utility-Libraries-1.4.341 -B utility-build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$vulkan_prefix" \
+          -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_PREFIX_PATH="$vulkan_prefix" \
+          -DBUILD_TESTS=OFF -DUPDATE_DEPS=OFF
+        cmake --build utility-build --parallel 2
+        cmake --install utility-build
+        cmake -S Vulkan-ValidationLayers-1.4.341 -B validation-build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$vulkan_prefix" \
+          -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_PREFIX_PATH="$vulkan_prefix" \
+          -DBUILD_TESTS=OFF -DUPDATE_DEPS=OFF
+        cmake --build validation-build --parallel 2
+        cmake --install validation-build
 
     - name: Select the Vulkan toolchain
       shell: bash
       run: |
         vulkan_prefix="$RUNNER_TEMP/prosper-vulkan"
+        # Refuse a partial or old cache instead of silently discovering the system layer.
+        python3 - "$vulkan_prefix" <<'PY'
+        import json
+        import pathlib
+        import sys
+        prefix = pathlib.Path(sys.argv[1])
+        manifest = prefix / "share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json"
+        layer = json.loads(manifest.read_text())["layer"]
+        if (layer["name"] != "VK_LAYER_KHRONOS_validation" or
+            layer["api_version"] != "1.4.341" or
+            layer["library_path"] != "libVkLayer_khronos_validation.so" or
+            not (prefix / "lib" / layer["library_path"]).is_file()):
+            raise SystemExit("Pinned Vulkan validation layer is missing or mismatched")
+        print(f"Selected validation manifest: {manifest}; API {layer['api_version']}")
+        PY
+        sha256sum "$vulkan_prefix/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json" \
+          "$vulkan_prefix/lib/libVkLayer_khronos_validation.so"
         printf 'VULKAN_SDK=%s\n' "$vulkan_prefix" >> "$GITHUB_ENV"
         printf 'LD_LIBRARY_PATH=%s/lib%s\n' "$vulkan_prefix" \
           "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+        printf 'VK_LAYER_PATH=%s/share/vulkan/explicit_layer.d\n' "$vulkan_prefix" >> "$GITHUB_ENV"

@@ -87,7 +87,8 @@ jobs:
       # shader-recompiler and GPU-execution differential. They are designed for a software device
       # (llvmpipe/lavapipe) and run in seconds locally, so CI can run them too.
       # The live runtime requires Vulkan 1.4; Ubuntu 24.04's headers/loader are 1.3.
-      # Keep the distribution's Mesa ICD and validation layer for the existing test baseline.
+      # Keep the distribution's Mesa ICD, but match the validator to the 1.4 toolchain:
+      # the old 1.3.275 layer cannot recognize enabled FloatControls2 (#4100).
       - name: Set up Vulkan 1.4
         uses: ./.github/actions/setup-vulkan
 
