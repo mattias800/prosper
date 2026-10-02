@@ -280,6 +280,12 @@ int main(int argc, char** argv) {
           "failed stage profile rejects independently of older compute-config availability");
     if (argc==3 && std::strcmp(argv[1],"--write-fixture")==0 && modules.size()==3) {
         const std::filesystem::path directory(argv[2]);
+        CHECK(write_gpu_capture((directory/"inventory.prgcap").string(),capture,error),
+              "inspect fixture retains draw, compute, failed parent and failed-compute profiles");
+        // Already independently stripped and decoded above: keep the genuine owned v65 prefix.
+        { std::ofstream output(directory/"legacy-inventory.prgcap",std::ios::binary);
+          output.write(reinterpret_cast<const char*>(legacy.data()),legacy.size());
+          CHECK(output.good(),"legacy inspect fixture has no producing transport tail"); }
         for (size_t i=0;i<3;++i) {
             auto item=draws[i*2]; item.draw_index=7; item.command_order=1;
             GpuCaptureFile single;

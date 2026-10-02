@@ -430,7 +430,7 @@ static void owned_marker_tests() {
             const auto c = produce(code, false, &input);
             CHECK(c.complete && c.expected_produced == produced && c.source.empty() == !produced);
             const auto wire = encode_fragment_compile_case(c);
-            CHECK(wire[8] == 2 && wire[9] == 0 && wire[10] == 0 && wire[11] == 0);
+            CHECK(wire[8] == 3 && wire[9] == 0 && wire[10] == 0 && wire[11] == 0);
             const auto decoded = decode_fragment_compile_case(wire);
             CHECK(decoded.resources.resources[0].owned_raw_snapshot_bytes ==
                   input.resources[0].owned_raw_snapshot_bytes);

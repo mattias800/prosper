@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -167,14 +168,14 @@ struct Module {
 };
 struct Oracle {
     const Module& m; std::array<uint32_t,2> words; uint32_t input_word=0;
-    bool good=true; size_t leaves=0;
+    bool good=true; std::set<uint32_t> leaves;
     uint32_t uint_value(uint32_t id,unsigned depth=0) {
         const auto* d=m.def(id);
         if (depth>64 || !d || !m.u32(d->a[0])) { good=false; return 0; }
         const auto& a=d->a;
         if (d->op==con && a.size()==3) return a[2];
-        if (d->op==load) { uint32_t ix=0; if(m.word_load(*d,ix)) { ++leaves; return words[ix]; } }
-        if (m.varying_bits(*d)) { ++leaves; return input_word; }
+        if (d->op==load) { uint32_t ix=0; if(m.word_load(*d,ix)) { leaves.insert(id); return words[ix]; } }
+        if (m.varying_bits(*d)) { leaves.insert(id); return input_word; }
         if (d->op==copy && a.size()==3) return uint_value(a[2],depth+1);
         if ((d->op==band || d->op==add || d->op==mul) && a.size()==4) {
             const uint32_t l=uint_value(a[2],depth+1),r=uint_value(a[3],depth+1);
@@ -335,7 +336,7 @@ void positive(const Options& o,uint8_t mode,uint32_t wave,const std::string& nam
     for(const uint32_t word:samples) for(const uint32_t gate:{0u,1u}) {
         Oracle oracle{m,{word,gate},word}; const bool actual=oracle.bool_value(predicate);
         const bool expected=o.cmpx?gate==0:guest_compare(word,mode,o.neq)&&(!o.narrow || gate!=0);
-        check(oracle.good && oracle.leaves>=1 && actual==expected,name+" defined live result matches independent guest relation");
+        check(oracle.good && !oracle.leaves.empty() && actual==expected,name+" defined live result matches independent guest relation");
         ++values;
         if(o.cmpx) {
             Oracle exec{m,{word,gate},word}; const uint32_t mask=m.exported_predicate(2);
@@ -549,6 +550,8 @@ void absorption_controls(const char* dir) {
             const bool in_range=exp<1 || (exp==1 && frac==0);
             Oracle oracle{m,{first,second}}; const bool actual=oracle.bool_value(sink);
             check(oracle.good && actual==(guest_zero(first,mode)||in_range),"actual absorbed/retained OR respects mode and raw SSA provenance");
+            check(oracle.leaves.size()==(changed?2u:1u),
+                  "leaf identity counts distinct loads, not repeated use of one SSA word");
         }
         dump(dir,"absorption_mode"+std::to_string(mode)+"_ssa"+std::to_string(changed),source);
     }
@@ -568,7 +571,8 @@ int main(int argc,char** argv) {
         if(canonical.empty()) canonical=source;
         check(!source.empty() && source==canonical,"all256 mode bytes: only actual F32 input-denorm bit changes zero module");
         for(const uint32_t word:samples) { Oracle oracle{m,{word,1}}; const bool result=oracle.bool_value(p);
-            check(p && oracle.good && oracle.leaves==1 && result==guest_compare(word,static_cast<uint8_t>(mode),neq),
+            // Reusing one SSA word is not a second load; a distinct load still adds a leaf.
+            check(p && oracle.good && oracle.leaves.size()==1 && result==guest_compare(word,static_cast<uint8_t>(mode),neq),
                   "all256 mode bytes: actual typed exported value matches independent guest categories"); ++values; }
         if(mode==0 || mode==16 || mode==32 || mode==48) dump(dir,"modebyte"+std::to_string(mode)+(neq?"_neq":"_eq"),source);
     }

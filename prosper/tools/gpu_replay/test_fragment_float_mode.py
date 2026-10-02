@@ -124,10 +124,10 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
         data=(directory/(name+".prgcap")).read_bytes()
         transport_tail=(struct.pack("<I",1)+b"\x00"+struct.pack("<II",0,0) if name=="mode16" else
                         struct.pack("<III",0,0,1)+b"\x00"+struct.pack("<I",1)+b"\x00")
-        check(struct.unpack_from("<I",data,8)[0]==65 and data.endswith(transport_tail),
-              name+" genuine canonical unknown-transport v65 tail")
+        check(struct.unpack_from("<I",data,8)[0]==66 and data.endswith(transport_tail),
+              name+" genuine canonical unknown-transport v66 tail")
         data=bytearray(data[:-len(transport_tail)])
-        struct.pack_into("<I",data,8,64)
+        struct.pack_into("<I",data,8,65)
         expected_tail=(struct.pack("<I",1)+b"\x01\x10"+struct.pack("<I",0) if name=="mode16" else
                        struct.pack("<I",0)+struct.pack("<I",1)+b"\x01\x10")
         combined=(struct.unpack_from("<I",data,8)[0]==65 and
