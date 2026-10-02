@@ -20,6 +20,75 @@ using namespace prosper::gpu;
 namespace {
 unsigned checks=0,failures=0,draws=0;
 void check(bool ok,const char* message) { ++checks; if(!ok) {++failures;std::printf("[FAIL] %s\n",message);} }
+constexpr std::array<uint32_t,11> samples{0,0x80000000u,1,0x80000001u,0x007fffffu,
+    0x00800000u,0x3f800000u,0x7f800000u,0xff800000u,0x7fc01234u,0xffc01234u};
+using Color=std::array<uint8_t,4>;
+Color preserved_colors(uint32_t bits) {
+    return {uint8_t((bits&0x7fffffffu)?255:0),uint8_t((bits&0x7f800000u)==0x7f800000u?255:0),
+            uint8_t((bits&0x007fffffu)?255:0),uint8_t(bits>>31?255:0)};
+}
+enum class PixelMatch { Mismatch,Preserved,EntryFlushed };
+PixelMatch match_pixel(bool input,uint32_t bits,const uint8_t* actual) {
+    const auto expected=preserved_colors(bits);
+    const bool nan=(bits&0x7f800000u)==0x7f800000u && (bits&0x007fffffu);
+    bool preserved=true;
+    for(unsigned c=0;c<(nan?3u:4u);++c) preserved &= actual[c]==expected[c];
+    if(preserved) return PixelMatch::Preserved;
+    // Shader-entry denorm flushing is separate from the instruction-local None/bit-preserving
+    // rules; this profile has no DenormPreserve mode. Only an Input subnormal may therefore
+    // arrive as zero. All colors must describe that SAME zero, never independent R/B choices.
+    // The entry-flush permission does not specify a zero sign: accept either Boolean A here,
+    // but retain exact original sign for preserved values and the actual +/-0 input controls.
+    // https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#_precision_and_operation_of_spir_v_instructions
+    const bool subnormal=(bits&0x7f800000u)==0 && (bits&0x007fffffu);
+    if(input && subnormal && actual[0]==0 && actual[1]==0 && actual[2]==0 &&
+       (actual[3]==0 || actual[3]==255)) return PixelMatch::EntryFlushed;
+    return PixelMatch::Mismatch;
+}
+void pixel_oracle_controls() {
+    for(bool input:{false,true}) for(uint32_t bits:samples) {
+        const auto preserved=preserved_colors(bits);
+        check(match_pixel(input,bits,preserved.data())==PixelMatch::Preserved,
+              "exact raw/Input class tuple is accepted");
+        const bool nan=(bits&0x7f800000u)==0x7f800000u && (bits&0x007fffffu);
+        for(unsigned c=0;c<(nan?3u:4u);++c) {
+            auto wrong=preserved;wrong[c]^=255;
+            check(match_pixel(input,bits,wrong.data())==PixelMatch::Mismatch,
+                  "wrong strict category or preserved sign is rejected");
+        }
+        if(nan) {
+            auto arbitrary_nan_sign=preserved;arbitrary_nan_sign[3]=127;
+            check(match_pixel(input,bits,arbitrary_nan_sign.data())==PixelMatch::Preserved,
+                  "NaN sign remains deliberately outside the oracle");
+        }
+    }
+    for(uint32_t bits:{1u,0x007fffffu,0x80000001u,0x807fffffu}) {
+        const auto preserved=preserved_colors(bits);
+        for(uint8_t sign:{uint8_t(0),uint8_t(255)}) {
+            const Color flushed{0,0,0,sign};
+            check(match_pixel(true,bits,flushed.data())==PixelMatch::EntryFlushed,
+                  "Input subnormal accepts coupled entry-zero with either Boolean sign");
+            check(match_pixel(false,bits,flushed.data())==PixelMatch::Mismatch,
+                  "raw-U32 subnormal never accepts entry-zero alternative");
+            const Color old_failure{0,0,255,sign},converse{255,0,0,sign},wrong_exponent{0,255,0,sign};
+            for(const auto& mixed:{old_failure,converse,wrong_exponent})
+                check(match_pixel(true,bits,mixed.data())==PixelMatch::Mismatch,
+                      "mixed red/blue or nonzero exponent cannot masquerade as entry flushing");
+        }
+        const Color nonbinary_sign{0,0,0,128};
+        check(match_pixel(true,bits,nonbinary_sign.data())==PixelMatch::Mismatch,
+              "entry-zero requires a Boolean sign color");
+        auto wrong_preserved_sign=preserved;wrong_preserved_sign[3]^=255;
+        check(match_pixel(true,bits,wrong_preserved_sign.data())==PixelMatch::Mismatch,
+              "preserved subnormal still requires original sign");
+    }
+    for(uint32_t bits:{0x00800000u,0x80800000u,0x3f800000u,0x7f800000u,0xff800000u,
+                       0x7fc01234u,0xffc01234u}) {
+        const Color zero{0,0,0,uint8_t(bits>>31?255:0)};
+        check(match_pixel(true,bits,zero.data())==PixelMatch::Mismatch,
+              "non-subnormal Input cannot use entry-zero alternative");
+    }
+}
 void move(std::vector<uint32_t>& words,uint32_t reg,uint32_t bits) {
     words.insert(words.end(),{0x7e0002ffu|(reg<<17),bits});
 }
@@ -109,8 +178,14 @@ void dump(const char* directory,const std::string& name,const std::vector<uint32
 int main(int argc,char** argv) {
     const char* directory=nullptr;
     const bool query_only=argc==2 && std::string_view(argv[1])=="--device-query-only";
+    const bool oracle_only=argc==2 && std::string_view(argv[1])=="--oracle-only";
     if(argc==3 && std::string_view(argv[1])=="--dump-directory") {directory=argv[2];std::filesystem::create_directories(directory);}
-    else if(argc!=1 && !query_only) return 2;
+    else if(argc!=1 && !query_only && !oracle_only) return 2;
+    if(oracle_only) {
+        pixel_oracle_controls();
+        std::printf("float transport pixel oracle: %u checks, %u failures; no Vulkan initialization\n",checks,failures);
+        return failures?1:0;
+    }
     const auto& device=prosper::test::render_vk_ctx(); // query AND request AND successful creation first
     if(!device.ok) {std::fprintf(stderr,"float transport render: Vulkan device unavailable\n");return 1;}
     if(!device.float_transport.explicit_nonfinite32()) {
@@ -137,8 +212,7 @@ int main(int argc,char** argv) {
         return failures?1:0;
     }
     if(failures) return 1; // never submit a shader if the enabled-request contract already failed
-    constexpr std::array<uint32_t,11> samples{0,0x80000000u,1,0x80000001u,0x007fffffu,
-        0x00800000u,0x3f800000u,0x7f800000u,0xff800000u,0x7fc01234u,0xffc01234u};
+    unsigned entry_flushed_pixels=0;
     PixelInputMapping flat;flat.valid_mask=1;flat.controls[0]=0x400; // actual Flat Location0, no custom GS
     const auto raw=fragment(false),input=fragment(true);
     ShaderResourceTable table;ShaderResource resource;
@@ -167,20 +241,21 @@ int main(int argc,char** argv) {
             const auto pixels=prosper::test::render_triangle_rgba(vs,fs,16,16,nullptr,nullptr,nullptr,nullptr,&resources);
             check(pixels.size()==16u*16u*4u,"live finite color readback exists");
             if(pixels.size()!=16u*16u*4u) continue;
-            const uint32_t exponent=(bits>>23)&255u,fraction=bits&0x007fffffu;
-            const std::array<uint8_t,4> expected{uint8_t((bits&0x7fffffffu)?255:0),
-                uint8_t(exponent==255?255:0),uint8_t(fraction?255:0),uint8_t(bits>>31?255:0)};
-            const bool nan=exponent==255 && fraction;
+            const auto expected=preserved_colors(bits);
+            const bool nan=(bits&0x7f800000u)==0x7f800000u && (bits&0x007fffffu);
             bool correct=true;
             size_t first_bad=SIZE_MAX;
             unsigned first_channel=0,bad_pixels=0;
             for(size_t i=0;i<pixels.size();i+=4) {
-                bool pixel_correct=true;
-                for(unsigned c=0;c<(nan?3u:4u);++c) if(pixels[i+c]!=expected[c]) {
-                    if(first_bad==SIZE_MAX) {first_bad=i;first_channel=c;}
-                    pixel_correct=false;
+                const auto match=match_pixel(use_input,bits,pixels.data()+i);
+                if(match==PixelMatch::EntryFlushed) ++entry_flushed_pixels;
+                if(match==PixelMatch::Mismatch) {
+                    if(first_bad==SIZE_MAX) {
+                        first_bad=i;
+                        for(unsigned c=0;c<(nan?3u:4u);++c) if(pixels[i+c]!=expected[c]) {first_channel=c;break;}
+                    }
+                    correct=false;++bad_pixels;
                 }
-                if(!pixel_correct) {correct=false;++bad_pixels;}
             }
             if(!correct) {
                 std::printf("  transport mismatch: route=%s bits=0x%08x pixel=%zu,%zu channel=%u "
@@ -191,9 +266,11 @@ int main(int argc,char** argv) {
                     unsigned(expected[0]),unsigned(expected[1]),unsigned(expected[2]),
                     unsigned(expected[3]),bad_pixels);
             }
-            check(correct,"actual raw/Input class and signed-zero colors match independent integer oracle");++draws;
+            check(correct,"actual raw/Input colors match coupled portable class and signed-zero oracle");++draws;
         }
     }
-    std::printf("float transport render: %u checks, %u actual draws, %u failures (categories only; no NaN payload identity)\n",checks,draws,failures);
+    std::printf("float transport render: %u checks, %u actual draws, %u failures; %u entry-flushed Input pixels "
+                "(categories only; no NaN payload identity or entry-denorm-preservation claim)\n",
+                checks,draws,failures,entry_flushed_pixels);
     return failures?1:0;
 }
