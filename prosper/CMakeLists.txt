@@ -533,6 +533,15 @@ if(Python3_Interpreter_FOUND)
   # every other arm in the file. Platform-independent: nothing here reads /proc or shells out.
   add_test(NAME pr_body_readback
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_body.py")
+  # ratchet_hook.py is the PreToolUse hook that runs check_arch_ratchet.py before an agent's
+  # `git commit` / `git push` (#4193), in delta mode against origin/main. The rollout is warn-only
+  # (BLOCK_ON_VIOLATION): a violation exits 0 with a systemMessage, and everything that is not a
+  # verdict fails open. Each case -- clean, violation (warned, and blocked with the switch on),
+  # could-not-evaluate, missing checker, no origin/main, not a checkout -- has an arm against a
+  # throwaway git repo and a stand-in checker. The last arm reads .claude/settings.json: an
+  # interpreter `||` chain there would swallow exit 2 once the switch is flipped.
+  add_test(NAME ratchet_hook
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_ratchet_hook.py")
   add_test(NAME session_start
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/test_session_start.py")
   # PROSPER_ENV_ON/_VALUE sample getenv once and return it forever. Applied to a name a TEST arms at
@@ -1980,6 +1989,12 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_perf_alarms
     SOURCES tests/diagnostics/test_perf_alarms.cpp
     LIBRARIES prosper_core)
+  # The run-level frame-breakdown line of the exit summary: per-flip means, the sampled cost it must
+  # exclude, the "not a partition" wording, and accumulation through the engine. Its own executable so
+  # it needs none of test_perf_alarms' HLE-dispatcher fixtures.
+  prosper_add_gtest(test_frame_breakdown
+    SOURCES tests/diagnostics/test_frame_breakdown.cpp
+    LIBRARIES prosper_core)
   # The rules' detail strings go through a printf-attributed format() helper; the attribute only
   # checks anything under -Wformat, which prosper_core does not enable, so make a mismatch an ERROR
   # for this one translation unit (the gpu_replay precedent below: GCC diagnoses this at plain
@@ -3405,6 +3420,11 @@ endif()
 
   prosper_add_gtest(test_agc_submit
     SOURCES tests/gpu/pm4/test_agc_submit.cpp
+    LIBRARIES prosper_core)
+
+  # sceAgcDriverSubmitMultiDcbs: zero-length segments are skipped, not fatal.
+  prosper_add_gtest(test_agc_multi_dcb_empty_segment
+    SOURCES tests/gpu/pm4/test_agc_multi_dcb_empty_segment.cpp
     LIBRARIES prosper_core)
 
   add_executable(test_agc_submit_multi tests/hle/test_agc_submit_multi.cpp)

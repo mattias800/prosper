@@ -3194,13 +3194,23 @@ HLE(agc_driver_submit_multi_dcbs) {
         // Snapshot both arrays before executing any work; memcpy also accepts unaligned arrays.
         memcpy(&stream, (const void*)(uintptr_t)(a0 + uint64_t(i) * sizeof(stream)), sizeof(stream));
         memcpy(&words, (const void*)(uintptr_t)(a1 + uint64_t(i) * sizeof(words)), sizeof(words));
-        if (!words || words > UINT32_MAX / sizeof(uint32_t))
+        // A zero-length segment carries no packets, so there is nothing to execute: skip it. Black
+        // Flag Resynced submits 27 segments in one call and leaves some of them empty (segment 14,
+        // stream 0x407ff6c000, zero dwords); treating that as fatal ended the title right after its
+        // first real frame setup. Only an unrepresentable length remains unsupported.
+        if (!words) continue;
+        if (words > UINT32_MAX / sizeof(uint32_t))
             unsupported_multi_dcb("stream extent", count, i);
         if (stream % alignof(uint32_t)) unsupported_multi_dcb("unaligned command stream", count, i);
         if (!gpu::guest_readable(stream, words * static_cast<uint32_t>(sizeof(uint32_t))))
             unsupported_multi_dcb("unreadable command stream", count, i);
         buffers.push_back({(const uint32_t*)(uintptr_t)stream, words});
     }
+    // Only the MIXED case is evidenced (an empty segment beside real ones). A batch with no
+    // non-empty segment at all has never been observed, and returning 0 would also skip the submit
+    // count and completion pulse a guest may wait on, so it stays unsupported until a title shows
+    // it. CONFIDENCE: MED.
+    if (buffers.empty()) unsupported_multi_dcb("every segment is empty", count, 0);
     return submit_dcb_buffers(buffers.data(), buffers.size(), "SubmitMultiDcbs", 0, true,
                               /* require_complete_pm4 */ true);
 }
