@@ -3,7 +3,8 @@
 Tracker: [#4131](https://github.com/mattias800/prosper/issues/4131). This document is the technical
 record the tracker points at; the tracker holds the rung.
 
-**Rung 0 — nothing renders.** First measured 2026-10-02 on Windows 11 (MinGW build, NVIDIA RTX 4070
+**Rung 0 — nothing renders** (the guest now runs and flips, with every draw dropped; see
+§ Progress 2026-10-02 (later); the paragraphs below describe the original stall). First measured 2026-10-02 on Windows 11 (MinGW build, NVIDIA RTX 4070
 SUPER) at main `deff140b8d4a`, then again with the thread-handle fix of #4129 applied.
 
 The guest boots in about 1.6 to 2.0 s and `prosper-app` opens its window, but no guest frame is
@@ -46,6 +47,28 @@ $env:PROSPER_BOOTPHASE='1'; $env:PROSPER_EXIT_ON_GUEST_END='1'
 - There is no input route yet: nothing renders, so there is nothing to navigate.
 
 **Best checked-in screenshot: none.**
+
+## Progress 2026-10-02 (later): the guest now runs; every draw is dropped
+
+With #4129, #4146 and #4166 on main plus the open PRs #4174 (APR completion filter -25), #4189
+(fixed direct-memory remap on Windows) and #4194 (empty MultiDcb segments), and the opt-in init
+deferral prototype (not for merge; branch `proto/defer-autolink-init` on the contributor fork), the
+title no longer stalls or aborts. A 60 s run loads `libmemorywrapper_f.prx` and `libaegir_f.prx` from the
+eboot, creates the engine threads, reaches AGC initialisation, registers three 1080p scanout
+buffers and flips about 40 to 50 times with audio playing. The window is still black.
+
+Why it is black (`PROSPER_DBG=1`, one 40 s run, NVIDIA host, 32-lane subgroups): only 15 draws are seen
+and none is issued. Thirteen fragment programs are refused by the recompiler and two by the backend
+(`subgroup-contract`, `unproved-vote`). Eighteen compute programs are refused too, so their outputs
+are never written. Of those, eleven stop at an image instruction (`MIMG`) with
+`mode=unresolved-operand`; one example reads `[mimg-unresolved] pc=38 op=0x00 srsrc=s20 srt_tag=NONE
+key_res=null ud_alias=NONE written=1`, i.e. the T# in `s20..s27` was written by the shader itself and
+no SRT-tag, fetch-pc or user-data-alias route resolves it. Others stop at `s_cselect_b64` with `vcc`
+as destination (`pc=20`), an `SMEM` load, and one `s_branch` the structured emitter cannot place.
+This is the same recompiler/resource-binding frontier recorded for other titles (`docs/RECOMPILER_REMAINING.md`,
+`docs/RESOURCE_BINDING.md`); it is not specific to this title. Not yet established: whether the host's
+32-lane subgroups (against the guest's wave64) are what blocks the two `subgroup-contract` fragment
+draws, since the compute refusals print `host-subgroups=unavailable`.
 
 ## Current frontier
 

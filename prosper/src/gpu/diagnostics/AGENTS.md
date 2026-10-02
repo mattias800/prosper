@@ -64,6 +64,25 @@ switched on for the run that mattered (#3533). `PROSPER_GPU_MEM_LOG=0` silences 
   var says what was asked for; the two diverged.
 - `diag_ratelimit` — rate limiting. **Check a diagnostic's rate limit before quoting its volume as a
   frequency**; several phantom findings came from reading a capped count as a real one.
+- `gpu_breadcrumbs` / `gpu_breadcrumbs_vk` — `PROSPER_GPU_BREADCRUMBS`: where did the GPU STOP? A
+  marker is written before and after every draw and dispatch (`VK_AMD_buffer_marker`, or
+  `VK_NV_device_diagnostic_checkpoints`), and after a device loss the last markers that reached
+  memory name the window of sites the GPU stopped inside, beside `VK_EXT_device_fault`'s own account.
+  Off by default and free when off; **an unarmed run prints a one-line "not armed" hint on a loss**,
+  not silence. The core is Vulkan-free and tested on synthetic streams; the emitter takes an
+  injectable dispatch table because stock lavapipe exposes neither extension, so CI proves the
+  emitter/resolver contract and **cannot** prove a real driver executes the writes before a hang.
+  **A verdict is a WINDOW, not a culprit**: "started" and "finished" are different moments, ids are
+  assigned in recording order (not submit order), and unmarked work (transfers, barriers, presents) is
+  invisible. Read the header before quoting one. It exists because a loss names the submission that
+  OBSERVES it, not the one that caused it (instrument trap 170).
+- `gpu_labels_vk` — `PROSPER_GPU_LABELS`: a `VK_EXT_debug_utils` label around every draw and dispatch
+  whose text is `format_breadcrumb_site`, **the same spelling a breadcrumb verdict uses**, so a
+  RenderDoc/RGP marker can be matched to a `[gpu-breadcrumb]` line by eye. It is the command-label
+  half of naming; `vk_object_names.hpp` is the object half and still names shader modules only. Off
+  by default and free when off; an absent extension makes every call a no-op. Numbers and hashes only.
+  Tested against recording entry points, so what is proved is what is recorded, not how a capture
+  tool displays it.
 - `watch_list`, `compute_tree_watch`, `compute_parent_walk` — watching addresses and walking compute
   parentage.
 - `draw_program_skip` — naming a graphics shader program, to census it or to decline every draw
