@@ -168,18 +168,19 @@ int main(int argc, char** argv) {
           std::memcmp(replay.computes[0].resources->resources[0].host_data,
                       blob.bytes.data(), blob.bytes.size()) == 0,
           "replay preserves the rebased range and its owned current bytes");
-    // One compute resource and no draw/failure records: transport T13, owned U8, mode M8, width W4.
+    // One compute resource, no draw/failure records: flags F8, transport T13, owned U8, mode M8, width W4.
+    constexpr size_t flags_tail_bytes = 8u;
     constexpr size_t transport_tail_bytes = 13u;
     constexpr size_t owned_tail_bytes = 8u;
     constexpr size_t mode_tail_bytes = 8u;
     constexpr size_t width_tail_bytes = 4u;
     constexpr size_t backing_tail_bytes = 5u;
-    CHECK(encoded.size() >= transport_tail_bytes + owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes &&
-          encoded[8] == 66u,
+    CHECK(encoded.size() >= flags_tail_bytes + transport_tail_bytes + owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes &&
+          encoded[8] == 67u,
           "legacy controls require the current versioned capture tail");
-    if (encoded.size() >= transport_tail_bytes + owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes) {
+    if (encoded.size() >= flags_tail_bytes + transport_tail_bytes + owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes) {
         auto v64 = encoded;
-        v64.resize(v64.size() - transport_tail_bytes - owned_tail_bytes);
+        v64.resize(v64.size() - flags_tail_bytes - transport_tail_bytes - owned_tail_bytes);
         v64[8] = 64u;
         CHECK(deserialize_gpu_capture(v64, decoded, error) &&
               decoded.computes[0].resources.resources[0].resource.raw_register_snapshot &&

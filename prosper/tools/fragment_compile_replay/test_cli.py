@@ -60,7 +60,7 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
     for profile, value in (("unknown", 0), ("implicit", 1), ("explicit-nonfinite32", 2)):
         case = root / f"transport-{profile}.prfc"
         wire = case.read_bytes()
-        assert wire[8:12] == (3).to_bytes(4, "little") and wire[-9] == value, "exact schema3 profile tail"
+        assert wire[8:12] == (4).to_bytes(4, "little") and wire[-12] == value and wire[-11:-8] == b"\x00\x00\x00", "exact schema4 independent profile/flags tails"
         source = root / f"transport-{profile}.spv"
         candidate = root / f"transport-{profile}-candidate.spv"
         report = run(replay, "--baseline", str(case), "--output", str(source))
@@ -70,12 +70,33 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
         assert source.read_bytes() == candidate.read_bytes()
         run(validator, "--target-env", "vulkan1.1", str(source))
         run(validator, "--target-env", "vulkan1.1", str(candidate))
+    for ieee in (0, 1):
+        for dx10 in (0, 1):
+            case = root / f"flags-i{ieee}-d{dx10}.prfc"
+            wire = case.read_bytes()
+            assert wire[-11:-8] == bytes((1, ieee, dx10))
+            for mode in ("--baseline", "--candidate"):
+                report = run(replay, mode, str(case))
+                assert "input=COMPLETE" in report and "guest_float_mode=unknown" in report
+                assert f"guest_ieee_mode={ieee}" in report and f"guest_dx10_clamp={dx10}" in report
+                assert "PRODUCED" in report
     refusal = run(replay, "--baseline", str(root / "refused.prfc"))
     assert "BASELINE MATCH REFUSED" in refusal and "actual_refusal=" in refusal and "no supported export" in refusal
     saved = root / "preserved.spv"
     saved.write_bytes(b"previous-output")
     current = bytearray((root / "transport-unknown.prfc").read_bytes())
-    legacy = bytearray(current)
+    legacy3 = bytearray(current)
+    del legacy3[-11:-8]  # remove all three actual flags bytes to recover the schema-3 prefix
+    legacy3[8:12] = (3).to_bytes(4, "little")
+    legacy3_case = root / "legacy-schema3.prfc"
+    legacy3_case.write_bytes(rechecksum(legacy3))
+    report = run(replay, "--inspect-only", str(legacy3_case))
+    assert "input=INCOMPLETE" in report and "fragment-float-flags-unavailable" in report
+    assert "guest_ieee_mode=unknown" in report and "guest_dx10_clamp=unknown" in report
+    for mode in ("--baseline", "--candidate"):
+        assert "INCOMPLETE" in run(replay, mode, str(legacy3_case), "--output", str(saved), code=2)
+        assert saved.read_bytes() == b"previous-output"
+    legacy = bytearray(legacy3)
     del legacy[-9]  # remove transport only, retaining the actual schema2 marker tail
     legacy[8:12] = (2).to_bytes(4, "little")
     legacy_case = root / "legacy-schema2.prfc"
@@ -100,11 +121,18 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
     relabeled[8:12] = (2).to_bytes(4, "little")
     malformed_profiles.append((relabeled, "trailing data"))
     invalid_profile = bytearray(current)
-    invalid_profile[-9] = 255
+    invalid_profile[-12] = 255
     malformed_profiles.append((invalid_profile, "noncanonical float transport"))
     truncated_profile = bytearray(current)
     del truncated_profile[-9]
     malformed_profiles.append((truncated_profile, "truncated"))
+    for offset in (-11, -10, -9):
+        invalid_flag = bytearray(current)
+        invalid_flag[offset] = 2
+        malformed_profiles.append((invalid_flag, "boolean"))
+    invalid_flag = bytearray(current)
+    invalid_flag[-10] = 1  # unavailable payload must be all clear, not fabricated known IEEE
+    malformed_profiles.append((invalid_flag, "noncanonical float flags"))
     for index, (wire, reason) in enumerate(malformed_profiles):
         path = root / f"malformed-profile-{index}.prfc"
         path.write_bytes(rechecksum(wire))

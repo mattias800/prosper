@@ -152,7 +152,7 @@ struct Reader {
 std::vector<uint8_t> encode_fragment_compile_case(const FragmentCompileCase& c) {
     validate_fragment_compile_case(c);
     Writer w; const uint8_t magic[8] = {'P','R','F','C','A','S','E',0};
-    w(magic, uint32_t(3)); capsule(w, c);
+    w(magic, uint32_t(4)); capsule(w, c);
     // Schema 1's field walk remains an unchanged prefix. Retain each marker verbatim: it is a
     // compiler input whose malformed value can cause a refusal, never replay admission authority.
     w.count(c.resources.resources.size(), kCompileCaseMaxResources);
@@ -160,6 +160,8 @@ std::vector<uint8_t> encode_fragment_compile_case(const FragmentCompileCase& c) 
     // Profile follows the unchanged schema-2 marker tail, independently of guest MODE and
     // the ordered legacy FloatControls semantic read.
     w(c.float_transport.profile);
+    // Independent launch flags follow the unchanged schema-3 transport tail.
+    w(c.float_flags.available, c.float_flags.ieee_mode, c.float_flags.dx10_clamp);
     w.value(checksum(w.bytes)); return std::move(w.bytes);
 }
 FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes) {
@@ -169,7 +171,7 @@ FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes)
     Reader r{bytes.first(bytes.size() - 8)}; uint8_t magic[8]{}; uint32_t schema{}; r(magic, schema);
     const uint8_t wanted[8] = {'P','R','F','C','A','S','E',0};
     check(std::equal(std::begin(magic), std::end(magic), std::begin(wanted)) &&
-          (schema == 1 || schema == 2 || schema == 3),
+          (schema >= 1 && schema <= 4),
           "compile-case schema");
     FragmentCompileCase c; capsule(r, c);
     if (schema >= 2) {
@@ -178,6 +180,8 @@ FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes)
         for (auto& resource : c.resources.resources) r.value(resource.owned_raw_snapshot_bytes);
     }
     if (schema >= 3) r(c.float_transport.profile);
+    if (schema >= 4)
+        r(c.float_flags.available, c.float_flags.ieee_mode, c.float_flags.dx10_clamp);
     check(r.position == r.bytes.size(), "compile-case trailing data");
     for (size_t k = 0; k < c.blobs.size(); ++k) if (c.blobs[k].alias_of != UINT32_MAX) {
         check(c.blobs[k].alias_of < k, "compile-case alias index");
@@ -190,6 +194,13 @@ FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes)
         c.float_transport = {};
         c.complete = false;
         if (c.reason.empty()) c.reason = "fragment-transport-config-unavailable";
+    }
+    if (schema < 4) {
+        // The checksum and exact legacy EOF are checked before downgrading. Relabeling a newer
+        // file cannot hide its tail or convert absent flags into an explicitly recorded Unknown.
+        c.float_flags = {};
+        c.complete = false;
+        if (c.reason.empty()) c.reason = "fragment-float-flags-unavailable";
     }
     return c;
 }

@@ -80,9 +80,26 @@ bool capture_retains_float_transport(uint32_t format_version) {
     return format_version >= 66;
 }
 
+bool capture_retains_fragment_float_flags(uint32_t format_version) {
+    return format_version >= 67;
+}
+
+void report_fragment_float_flags(const char* mode, prosper::gpu::FragmentFloatFlags flags,
+                                 const char* record, uint64_t index, uint32_t format_version) {
+    if (flags.available)
+        std::fprintf(stderr, "[%s] fragment-float-flags ieee-mode=%u dx10-clamp=%u "
+                             "source=captured %s=%llu; guest launch inputs, not host controls\n",
+                     mode, flags.ieee_mode ? 1u : 0u, flags.dx10_clamp ? 1u : 0u,
+                     record, static_cast<unsigned long long>(index));
+    else
+        std::fprintf(stderr, "[%s] fragment-float-flags=unavailable source=%s %s=%llu\n",
+                     mode, capture_retains_fragment_float_flags(format_version) ? "captured" : "legacy-unknown",
+                     record, static_cast<unsigned long long>(index));
+}
+
 void report_fragment_wave_size(const char* mode, const prosper::gpu::DrawItem& draw,
                               const prosper::tools::ReplayFragmentWaveSelection& selection,
-                              bool transport_retained) {
+                              uint32_t format_version) {
     const char* captured = draw.fragment_wave_config_available
         ? (draw.ps_wave32 ? "32" : "64") : "unavailable";
     const char* source = selection.explicit_override ? "override"
@@ -100,7 +117,9 @@ void report_fragment_wave_size(const char* mode, const prosper::gpu::DrawItem& d
     else
         std::fprintf(stderr, "[%s] fragment-float-mode=unavailable source=legacy-unknown draw=%llu\n",
                      mode, static_cast<unsigned long long>(draw.draw_index));
-    report_float_transport(mode, draw.float_transport, "draw", draw.draw_index, transport_retained);
+    report_float_transport(mode, draw.float_transport, "draw", draw.draw_index,
+                           capture_retains_float_transport(format_version));
+    report_fragment_float_flags(mode, draw.ps_float_flags, "draw", draw.draw_index, format_version);
 }
 
 void usage(const char* argv0) {
@@ -921,6 +940,12 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                         static_cast<unsigned>(d.ps_float_mode.value));
         else
             std::printf("  ps-float-mode captured=unavailable (guest semantics unverified)\n");
+        if (d.ps_float_flags.available)
+            std::printf("  ps-float-flags ieee-mode=%u dx10-clamp=%u source=captured (guest launch inputs)\n",
+                        d.ps_float_flags.ieee_mode ? 1u : 0u, d.ps_float_flags.dx10_clamp ? 1u : 0u);
+        else
+            std::printf("  ps-float-flags unavailable source=%s (guest semantics unverified)\n",
+                        capture_retains_fragment_float_flags(format_version) ? "captured" : "legacy-unknown");
         std::printf("  float-transport=%s source=%s (producing host profile, not replay device support)\n",
                     prosper::gpu::float_transport_profile_name(d.float_transport),
                     capture_retains_float_transport(format_version) ? "captured" : "legacy-unknown");
@@ -1079,6 +1104,12 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                     prosper::gpu::float_transport_profile_name(failure.float_transport),
                     capture_retains_float_transport(format_version) ? "captured" : "legacy-unknown");
         if (failure.kind == prosper::gpu::SubmitOperationKind::Draw) {
+            if (failure.ps_float_flags.available)
+                std::printf("  ps-float-flags ieee-mode=%u dx10-clamp=%u source=captured (guest launch inputs)\n",
+                            failure.ps_float_flags.ieee_mode ? 1u : 0u, failure.ps_float_flags.dx10_clamp ? 1u : 0u);
+            else
+                std::printf("  ps-float-flags unavailable source=%s (guest semantics unverified)\n",
+                            capture_retains_fragment_float_flags(format_version) ? "captured" : "legacy-unknown");
             std::printf("  target=%016llx extent=%ux%u vertices=%u instances=",
                         static_cast<unsigned long long>(failure.color0_base),
                         failure.color0_width, failure.color0_height, failure.vertex_count);
@@ -3118,7 +3149,7 @@ int main(int argc, char** argv) {
             if (item.fs_raw_shader_index >= replay.raw_shader_versions.size()) continue;
             const auto selection = prosper::tools::resolve_replay_fragment_wave_size(
                 raw_fragment_wave, item.fragment_wave_config_available, item.ps_wave32);
-            report_fragment_wave_size("recompile-raw", item, selection, capture_retains_float_transport(capture.format_version));
+            report_fragment_wave_size("recompile-raw", item, selection, capture.format_version);
         }
     }
     if (recompile_raw && capture.format_version >= 39 &&
@@ -3176,7 +3207,7 @@ int main(int argc, char** argv) {
                         raw.words.data(), raw.words.size(), it.prt.get(), system_inputs,
                         UINT32_MAX, &interpolation, fragment_wave.wave32(),
                         {prosper::gpu::RecompileDiagnosticStage::Fragment, 0},
-                        it.ps_float_mode, nullptr, it.float_transport);
+                        it.ps_float_mode, nullptr, it.float_transport, it.ps_float_flags);
                     if (interpolation.requires_geometry && it.ps.topology >= 3u &&
                         it.ps.topology <= 5u)
                         gs = prosper::gpu::recompile_interpolation_geometry(
@@ -3364,7 +3395,7 @@ int main(int argc, char** argv) {
             auto& it = replay.items[prosper::tools::raw(item_index)];
             fragment_wave = prosper::tools::resolve_replay_fragment_wave_size(
                 fragment_wave, it.fragment_wave_config_available, it.ps_wave32);
-            report_fragment_wave_size("fs-tap", it, fragment_wave, capture_retains_float_transport(capture.format_version));
+            report_fragment_wave_size("fs-tap", it, fragment_wave, capture.format_version);
             const prosper::tools::OperationIndex operation_index =
                 prosper::tools::replay_operation_index_for_draw(
                     replay, prosper::tools::DrawIndex{n});
@@ -3383,7 +3414,7 @@ int main(int argc, char** argv) {
                                                            UINT32_MAX, &interpolation,
                                                            fragment_wave.wave32(),
                                                            {prosper::gpu::RecompileDiagnosticStage::Fragment,
-                                                            0}, it.ps_float_mode, nullptr, it.float_transport);
+                                                            0}, it.ps_float_mode, nullptr, it.float_transport, it.ps_float_flags);
                 if (!fs.empty()) {
                     it.set_fs(std::move(fs));
                     std::fprintf(stderr,
@@ -3918,6 +3949,8 @@ int main(int argc, char** argv) {
                 else
                     std::fprintf(stderr, "[retry-failed-stage] fragment-float-mode=unavailable "
                                          "source=legacy-unknown\n");
+                report_fragment_float_flags("retry-failed-stage", failure.ps_float_flags,
+                    "failure", static_cast<uint64_t>(failure_index), capture.format_version);
                 // Preserve the real program address in rejection diagnostics and deduplication.
                 spirv = prosper::gpu::recompile_fragment(
                     raw.words.data(), raw.words.size(), resources,
@@ -3925,7 +3958,7 @@ int main(int argc, char** argv) {
                     failure.fragment_retry_config_available ? &interpolation : nullptr,
                     failure.fragment_retry_config_available && failure.ps_wave32,
                     {prosper::gpu::RecompileDiagnosticStage::Fragment, stage.program_addr},
-                    failure.ps_float_mode, nullptr, failure.float_transport);
+                    failure.ps_float_mode, nullptr, failure.float_transport, failure.ps_float_flags);
                 break;
             }
             case prosper::gpu::ShaderProgramStage::Compute:

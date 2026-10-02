@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <fstream>
 #include <map>
+#include <set>
 #include <thread>
 #ifdef _WIN32
 #include <io.h>
@@ -83,18 +84,20 @@ static std::string identity() {
 }
 static FragmentCompileCase produce(std::vector<uint32_t> code, bool wave32 = false,
                                    const ShaderResourceTable* table = nullptr,
-                                   FragmentFloatMode mode = {}, FloatTransportConfig transport = {}) {
+                                   FragmentFloatMode mode = {}, FloatTransportConfig transport = {},
+                                   FragmentFloatFlags flags = {}) {
     FragmentCompileCase c;
     c.compiler = identity(); c.program_address = 0x123400;
     c.code = std::move(code); c.wave32 = wave32; c.float_mode = mode;
     c.float_transport = transport;
+    c.float_flags = flags;
     own_fragment_compile_case_resources(c, table);
     c.interpolation = fragment_interpolation_layout(c.code.data(), c.code.size());
     std::vector<uint32_t> source;
     { CompilerChoiceScope choices(c.choices); TerminalRejectCapture rejection;
       source = recompile_fragment(c.code.data(), c.code.size(), table, nullptr, UINT32_MAX,
           &c.interpolation, wave32, {RecompileDiagnosticStage::Fragment, c.program_address},
-          mode, nullptr, transport);
+          mode, nullptr, transport, flags);
       const auto rejects = rejection.take();
       c.expected_reject = rejects.empty() ? std::string{} :
           rejects.back().first + " " + rejects.back().second; }
@@ -225,7 +228,7 @@ static void codec_tests(const FragmentCompileCase& produced) {
         auto bad = wire; bad[offset] ^= 0x80;
         CHECK(error([&] { decode_fragment_compile_case(bad); }).find("checksum") != std::string::npos);
     }
-    auto schema = wire; schema[8] = 4; rechecksum(schema);
+    auto schema = wire; schema[8] = 5; rechecksum(schema);
     CHECK(error([&] { decode_fragment_compile_case(schema); }).find("schema") != std::string::npos);
     auto boolean = wire; boolean[12] = 2; rechecksum(boolean);
     CHECK(error([&] { decode_fragment_compile_case(boolean); }).find("boolean") != std::string::npos);
@@ -430,7 +433,7 @@ static void owned_marker_tests() {
             const auto c = produce(code, false, &input);
             CHECK(c.complete && c.expected_produced == produced && c.source.empty() == !produced);
             const auto wire = encode_fragment_compile_case(c);
-            CHECK(wire[8] == 3 && wire[9] == 0 && wire[10] == 0 && wire[11] == 0);
+            CHECK(wire[8] == 4 && wire[9] == 0 && wire[10] == 0 && wire[11] == 0);
             const auto decoded = decode_fragment_compile_case(wire);
             CHECK(decoded.resources.resources[0].owned_raw_snapshot_bytes ==
                   input.resources[0].owned_raw_snapshot_bytes);
@@ -476,7 +479,7 @@ static void owned_marker_tests() {
           CHECK(error([&] { compiler_resource_data(input, size); }).find("opaque") != std::string::npos); }
 
         // The append-only tail's count must match the prefix's exact resource count.
-        const size_t tail = wire.size() - 8u - 1u - 4u * (1u + table.resources.size());
+        const size_t tail = wire.size() - 8u - 3u - 1u - 4u * (1u + table.resources.size());
         auto wrong_count = wire; wrong_count[tail] = 1; rechecksum(wrong_count);
         CHECK(error([&] { decode_fragment_compile_case(wrong_count); }).find("marker/resource count") != std::string::npos);
         auto huge_count = wire; huge_count[tail] = 1; huge_count[tail + 1] = 2; rechecksum(huge_count);
@@ -486,8 +489,16 @@ static void owned_marker_tests() {
         auto extra_tail = wire; extra_tail.insert(extra_tail.end() - 8, 0); rechecksum(extra_tail);
         CHECK(error([&] { decode_fragment_compile_case(extra_tail); }).find("trailing") != std::string::npos);
 
+        // A historical v3 retains its exact markers/profile but lacks launch flags.
+        auto v3 = wire; v3.erase(v3.end() - 11, v3.end() - 8); v3[8] = 3; rechecksum(v3);
+        const auto decoded_v3 = decode_fragment_compile_case(v3);
+        CHECK(!decoded_v3.complete && decoded_v3.reason == "fragment-float-flags-unavailable" &&
+              decoded_v3.float_transport == FloatTransportConfig{} &&
+              decoded_v3.float_flags == FragmentFloatFlags{} &&
+              decoded_v3.resources.resources[0].owned_raw_snapshot_bytes == size);
+        CHECK(error([&] { replay_fragment_compile_case(decoded_v3, true); }).find("INCOMPLETE") != std::string::npos);
         // A historical v2 retains its exact markers but lacks transport, so cannot replay.
-        auto v2 = wire; v2.erase(v2.end() - 9); v2[8] = 2; rechecksum(v2);
+        auto v2 = v3; v2.erase(v2.end() - 9); v2[8] = 2; rechecksum(v2);
         const auto decoded_v2 = decode_fragment_compile_case(v2);
         CHECK(!decoded_v2.complete && decoded_v2.reason == "fragment-transport-config-unavailable" &&
               decoded_v2.float_transport == FloatTransportConfig{} &&
@@ -497,7 +508,7 @@ static void owned_marker_tests() {
         // remain inspectable, but neither absent input is invented for replay.
         auto markerless = table; markerless.resources[0].owned_raw_snapshot_bytes = 0;
         auto v1 = check_roundtrip(markerless, true);
-        const size_t v1_tail = v1.size() - 8u - 1u - 4u * (1u + markerless.resources.size());
+        const size_t v1_tail = v1.size() - 8u - 3u - 1u - 4u * (1u + markerless.resources.size());
         v1.erase(v1.begin() + v1_tail, v1.end() - 8); v1[8] = 1; rechecksum(v1);
         const auto decoded_v1 = decode_fragment_compile_case(v1);
         CHECK(decoded_v1.resources.resources[0].owned_raw_snapshot_bytes == 0 && !decoded_v1.complete &&
@@ -630,7 +641,7 @@ static void transport_tests() {
         const auto c = produce(add_probe, wave32, nullptr, {true, 0x31}, profile);
         CHECK(c.complete && constant_color(c.source, color));
         const auto wire = encode_fragment_compile_case(c);
-        CHECK(wire.size() > 25 && wire[8] == 3 && wire[wire.size() - 9] == uint8_t(profile.profile));
+        CHECK(wire.size() > 28 && wire[8] == 4 && wire[wire.size() - 12] == uint8_t(profile.profile));
         const auto decoded = decode_fragment_compile_case(wire);
         CHECK(decoded.complete && decoded.float_transport == profile && decoded.code == c.code);
         CHECK(replay_fragment_compile_case(decoded, true) == c.source);
@@ -640,7 +651,15 @@ static void transport_tests() {
         CHECK(float_transport_module_supported(c.source.data(), c.source.size(),
             {FloatTransportProfile::Implicit}) == !profile.explicit_nonfinite32());
 
-        auto legacy = wire;
+        auto legacy3 = wire;
+        legacy3.erase(legacy3.end() - 11, legacy3.end() - 8); // genuine schema-3 prefix
+        legacy3[8] = 3; rechecksum(legacy3);
+        const auto old3 = decode_fragment_compile_case(legacy3);
+        CHECK(!old3.complete && old3.reason == "fragment-float-flags-unavailable" &&
+            old3.float_transport == profile && old3.float_flags == FragmentFloatFlags{} &&
+            old3.source == c.source && old3.code == c.code);
+        CHECK(error([&] { replay_fragment_compile_case(old3, false); }).find("INCOMPLETE") != std::string::npos);
+        auto legacy = legacy3;
         legacy.erase(legacy.end() - 9); // genuine schema-2 payload, NOT a version-only relabel
         legacy[8] = 2; rechecksum(legacy);
         const auto old = decode_fragment_compile_case(legacy);
@@ -658,7 +677,7 @@ static void transport_tests() {
         CHECK(error([&] { decode_fragment_compile_case(relabel); }).find("trailing data") != std::string::npos);
         auto missing = wire; missing.erase(missing.end() - 9); rechecksum(missing);
         CHECK(error([&] { decode_fragment_compile_case(missing); }).find("truncated") != std::string::npos);
-        auto invalid = wire; invalid[invalid.size() - 9] = 3; rechecksum(invalid);
+        auto invalid = wire; invalid[invalid.size() - 12] = 3; rechecksum(invalid);
         CHECK(error([&] { decode_fragment_compile_case(invalid); }).find("noncanonical float transport") != std::string::npos);
         auto invalid_input = c; invalid_input.float_transport.profile = static_cast<FloatTransportProfile>(3);
         CHECK(error([&] { encode_fragment_compile_case(invalid_input); }).find("noncanonical float transport") != std::string::npos);
@@ -699,6 +718,86 @@ static void transport_tests() {
         if (k < 3) { seen |= 1u << k; CHECK(c.source == *outputs[k] && replay_fragment_compile_case(c, true) == c.source); }
     }
     CHECK(seen == 7);
+    env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", nullptr); clear_shader_recompile_cache();
+}
+static void float_flags_tests() {
+    constexpr FragmentFloatFlags flags[] = {{}, {true,false,false}, {true,true,false},
+        {true,false,true}, {true,true,true}};
+    constexpr FloatTransportConfig profiles[] = {{FloatTransportProfile::Unknown},
+        {FloatTransportProfile::Implicit}, {FloatTransportProfile::ExplicitNonFinite32}};
+    // Flags, MODE and the host profile are independent retained inputs. This fixture has no
+    // OMOD/CLAMP, so its green sink is intentionally invariant, not a modifier-semantics oracle.
+    for (bool wave32 : {false,true}) for (auto mode : {FragmentFloatMode{}, FragmentFloatMode{true,0xab}})
+        for (auto profile : profiles) for (auto flag : flags) {
+            const auto c = produce(green, wave32, nullptr, mode, profile, flag);
+            const auto unchanged = produce(green, wave32, nullptr, mode, profile);
+            CHECK(c.complete && solid_green(c.source));
+            CHECK(c.source == unchanged.source); // retention alone grants no numerical behavior
+            const auto wire = encode_fragment_compile_case(c);
+            CHECK(wire[8] == 4 && wire[wire.size()-12] == uint8_t(profile.profile) &&
+                wire[wire.size()-11] == uint8_t(flag.available) &&
+                wire[wire.size()-10] == uint8_t(flag.ieee_mode) &&
+                wire[wire.size()-9] == uint8_t(flag.dx10_clamp));
+            const auto decoded = decode_fragment_compile_case(wire);
+            CHECK(decoded.complete && decoded.float_flags == flag && decoded.float_mode == mode &&
+                decoded.float_transport == profile && decoded.wave32 == wave32);
+            CHECK(replay_fragment_compile_case(decoded, true) == c.source);
+        }
+    const auto c = produce(green, false, nullptr, {}, profiles[2], flags[4]);
+    const auto wire = encode_fragment_compile_case(c);
+    for (size_t offset : {wire.size()-11, wire.size()-10, wire.size()-9}) {
+        auto bad = wire; bad[offset] = 2; rechecksum(bad);
+        CHECK(error([&] { decode_fragment_compile_case(bad); }).find("boolean") != std::string::npos);
+    }
+    auto bad = wire; bad[bad.size()-11] = 0; rechecksum(bad);
+    CHECK(error([&] { decode_fragment_compile_case(bad); }).find("noncanonical float flags") != std::string::npos);
+    auto bad_input = c; bad_input.float_flags = {false,true,false};
+    CHECK(error([&] { encode_fragment_compile_case(bad_input); }).find("noncanonical float flags") != std::string::npos);
+    auto relabel = wire; relabel[8] = 2; rechecksum(relabel);
+    CHECK(error([&] { decode_fragment_compile_case(relabel); }).find("trailing data") != std::string::npos);
+    auto prior = c; prior.complete = false; prior.reason = "prior-input-loss";
+    auto old_wire = encode_fragment_compile_case(prior);
+    old_wire.erase(old_wire.end()-11, old_wire.end()-8); old_wire[8] = 3; rechecksum(old_wire);
+    const auto old = decode_fragment_compile_case(old_wire);
+    CHECK(!old.complete && old.reason == "prior-input-loss" && old.float_flags == FragmentFloatFlags{} &&
+        old.float_transport == profiles[2]);
+    CHECK(error([&] { replay_fragment_compile_case(old, false); }).find("INCOMPLETE") != std::string::npos);
+
+    clear_shader_recompile_cache();
+    const auto directory = prosper_test::test_scratch_dir() / "float-flags";
+    env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", directory.string().c_str());
+    std::array<std::array<SharedShaderWords,5>,3> outputs;
+    std::set<const void*> ownership;
+    const auto compile = [&](FloatTransportConfig profile, FragmentFloatFlags flag) {
+        return recompile_graphics_shader_cached_shared(ShaderProgramStage::Fragment,
+            green.data(), green.size(), nullptr, nullptr, nullptr, nullptr, false, 0, false,
+            {}, {}, profile, flag);
+    };
+    for (size_t p=0; p<3; ++p) for (size_t f=0; f<5; ++f) {
+        outputs[p][f] = compile(profiles[p],flags[f]);
+        CHECK(outputs[p][f] && solid_green(*outputs[p][f]));
+        ownership.insert(outputs[p][f].get());
+    }
+    CHECK(ownership.size() == 15); // actual compiled cache entries, not just a key-container test
+    const auto before = shader_recompile_cache_stats();
+    for (size_t p=0; p<3; ++p) for (size_t f=0; f<5; ++f)
+        CHECK(compile(profiles[p],flags[f]) == outputs[p][f]);
+    const auto after = shader_recompile_cache_stats();
+    CHECK(after.hits == before.hits+15 && after.misses == before.misses);
+    const auto captured = files(directory); CHECK(captured.size() == 15);
+    unsigned seen = 0;
+    for (const auto& path : captured) {
+        const auto saved = read_fragment_compile_case(path);
+        const size_t p = size_t(saved.float_transport.profile);
+        const size_t f = saved.float_flags.available ? 1u+unsigned(saved.float_flags.ieee_mode)+2u*unsigned(saved.float_flags.dx10_clamp) : 0u;
+        CHECK(saved.complete && p<3 && f<5 && !saved.float_mode.available);
+        if (p<3 && f<5) {
+            seen |= 1u << (p*5+f);
+            CHECK(saved.float_flags == flags[f] && saved.source == *outputs[p][f] &&
+                replay_fragment_compile_case(saved, true) == saved.source);
+        }
+    }
+    CHECK(seen == 0x7fffu);
     env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", nullptr); clear_shader_recompile_cache();
 }
 static std::vector<uint32_t> arithmetic_accounting_tests() {
@@ -811,10 +910,16 @@ int main(int argc, char** argv) {
                 write_fragment_compile_case(dir / (std::string("transport-") +
                     float_transport_profile_name({profile}) + ".prfc"), c);
             }
+            for (bool ieee : {false,true}) for (bool dx10 : {false,true}) {
+                auto c = produce(green, false, nullptr, {}, {}, {true,ieee,dx10});
+                CHECK(c.complete && solid_green(c.source));
+                write_fragment_compile_case(dir / (std::string("flags-i") + (ieee ? "1" : "0") +
+                    "-d" + (dx10 ? "1" : "0") + ".prfc"), c);
+            }
         } else {
             CHECK(argc == 1 || (argc == 3 && std::string_view(argv[1]) == "--dump"));
             auto c = produce(green); CHECK(c.complete);
-            codec_tests(c); resource_tests(c); owned_marker_tests(); cache_tests(); atomic_tests(c); mode_tests(); transport_tests();
+            codec_tests(c); resource_tests(c); owned_marker_tests(); cache_tests(); atomic_tests(c); mode_tests(); transport_tests(); float_flags_tests();
             const auto add = arithmetic_accounting_tests();
             auto wave32 = produce(green, true); CHECK(wave32.complete && solid_green(wave32.source));
             CHECK(wave32.wave32 && !c.wave32); // width need not alter a wave-insensitive program

@@ -36,7 +36,8 @@ void program(GpuState& state, uint32_t lo, uint32_t hi, const uint32_t* words) {
     state.sh[lo] = static_cast<uint32_t>(address >> 8);
     state.sh[hi] = static_cast<uint32_t>((address >> 40) & 255u);
 }
-GpuState state_for(FragmentFloatMode mode, const uint32_t* fs = fragment, bool wave32 = false) {
+GpuState state_for(FragmentFloatMode mode, const uint32_t* fs = fragment, bool wave32 = false,
+                   uint32_t modifier_flags = 0) {
     GpuState state;
     program(state,P::SPI_SHADER_PGM_LO_ES,P::SPI_SHADER_PGM_HI_ES,vertex);
     program(state,P::SPI_SHADER_PGM_LO_PS,P::SPI_SHADER_PGM_HI_PS,fs);
@@ -45,7 +46,8 @@ GpuState state_for(FragmentFloatMode mode, const uint32_t* fs = fragment, bool w
     state.cx[P::CB_COLOR_CONTROL] = P::CB_COLOR_CONTROL_MODE_NORMAL << P::CB_COLOR_CONTROL_MODE_SHIFT;
     state.cx[P::SPI_PS_IN_CONTROL] = wave32 ? 1u << P::SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT : 0u;
     if (mode.available)
-        state.sh[P::SPI_SHADER_PGM_RSRC1_PS] = uint32_t(mode.value) << P::SPI_SHADER_PGM_RSRC1_PS_FLOAT_MODE_SHIFT;
+        state.sh[P::SPI_SHADER_PGM_RSRC1_PS] =
+            (uint32_t(mode.value) << P::SPI_SHADER_PGM_RSRC1_PS_FLOAT_MODE_SHIFT) | modifier_flags;
     return state;
 }
 size_t reader(uint64_t address, uint8_t* destination, size_t count) {
@@ -86,6 +88,24 @@ int main(int argc, char** argv) {
             realized.push_back(std::move(draw));
         }
     }
+    for (bool shared : {false,true}) for (bool wave32 : {false,true})
+        for (bool ieee : {false,true}) for (bool dx10 : {false,true}) {
+            const FragmentFloatFlags expected{true,ieee,dx10};
+            const uint32_t bits = (ieee ? 1u << P::SPI_SHADER_PGM_RSRC1_PS_IEEE_MODE_SHIFT : 0u) |
+                                  (dx10 ? 1u << P::SPI_SHADER_PGM_RSRC1_PS_DX10_CLAMP_SHIFT : 0u);
+            DrawItem cold,warm;
+            const auto state = state_for({true,0xab},fragment,wave32,bits);
+            CHECK(realize_draw_item(state,nullptr,3,std::size(vertex),false,cold,nullptr,shared) &&
+                      realize_draw_item(state,nullptr,3,std::size(vertex),false,warm,nullptr,shared) &&
+                      cold.ps_float_flags==expected && warm.ps_float_flags==expected &&
+                      cold.ps_float_mode==FragmentFloatMode({true,0xab}) &&
+                      warm.fs_words()==cold.fs_words() && cold.fs_words()==direct({true,0xab},wave32),
+                  "actual copied/shared cold/warm producer retains all four known flag states");
+            for (auto* item : {&cold,&warm}) {
+                item->draw_index=realized.size(); item->command_order=realized.size()+1;
+                realized.push_back(std::move(*item));
+            }
+        }
     std::set<uint64_t> identities;
     for (unsigned value=0; value<256; ++value) {
         uint64_t id = 0, warm_id = 0;
@@ -103,22 +123,38 @@ int main(int argc, char** argv) {
     CHECK(!recompile_graphics_shader_cached_shared(ShaderProgramStage::Fragment,fragment,std::size(fragment),
             nullptr,nullptr,nullptr,&invalid_id,false,0,false,{}, {false,16}) && invalid_id==0,
           "noncanonical unavailable mode refuses before cache identity publication");
-    GpuState mixed = state_for({true,255});
+    for (const FragmentFloatFlags flags : {FragmentFloatFlags{false,true,false},
+                                          FragmentFloatFlags{false,false,true},
+                                          FragmentFloatFlags{false,true,true}}) {
+        invalid_id=99;
+        CHECK(!recompile_graphics_shader_cached_shared(ShaderProgramStage::Fragment,fragment,std::size(fragment),
+                nullptr,nullptr,nullptr,&invalid_id,false,0,false,{}, {}, {}, flags) && invalid_id==0,
+              "noncanonical independent flags refuse before shared cache identity publication");
+        invalid_id=99;
+        CHECK(recompile_graphics_shader_cached(ShaderProgramStage::Fragment,fragment,std::size(fragment),
+                nullptr,nullptr,nullptr,&invalid_id,false,0,false,{}, {}, {}, flags).empty() && invalid_id==0,
+              "noncanonical independent flags refuse before copied cache identity publication");
+    }
+    GpuState mixed = state_for({true,255},fragment,false,(1u<<23)|(1u<<21));
     for (uint8_t mode : {uint8_t{0},uint8_t{16}}) {
         GpuState::Draw draw; draw.index_count=3; draw.command_order=mixed.draws.size()+1;
-        draw.state=std::make_shared<const GpuState>(state_for({true,mode}));
+        draw.state=std::make_shared<const GpuState>(state_for({true,mode},fragment,false,
+            mode ? (1u<<23)|(1u<<21) : 0u));
         mixed.draws.push_back(std::move(draw));
     }
     const auto per_draw = realize_gpustate_draws(mixed,std::size(vertex),1,1,nullptr,true,false);
     CHECK(per_draw.size()==2 && per_draw[0].ps_float_mode==FragmentFloatMode({true,0}) &&
               per_draw[1].ps_float_mode==FragmentFloatMode({true,16}) &&
+              per_draw[0].ps_float_flags==FragmentFloatFlags({true,false,false}) &&
+              per_draw[1].ps_float_flags==FragmentFloatFlags({true,true,true}) &&
               per_draw[0].fs_words()==flush && per_draw[1].fs_words()==preserve,
-          "per-draw snapshots beat conflicting submit-end mode and warm cache");
-    auto util = state_for({true,0xab},utility,true);
+          "per-draw snapshots beat conflicting submit-end mode/flags and warm cache");
+    auto util = state_for({true,0xab},utility,true,1u<<23);
     util.cx[P::CB_COLOR_CONTROL]=P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS << P::CB_COLOR_CONTROL_MODE_SHIFT;
     DrawItem replaced;
     CHECK(realize_draw_item(util,nullptr,3,std::size(vertex),false,replaced) &&
               replaced.ps_float_mode==FragmentFloatMode({true,0xab}) &&
+              replaced.ps_float_flags==FragmentFloatFlags({true,true,false}) &&
               fragment_spirv_required_subgroup_size(replaced.fs_words())==0,
           "utility replacement retains launch mode rather than inferring authority from effective SPIR-V");
     GpuCaptureMetadata metadata; metadata.width=metadata.height=1;
@@ -127,7 +163,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> bytes;
     CHECK(capture_draw_items(realized,metadata,reader,capture,error) &&
               serialize_gpu_capture(capture,bytes,error) && deserialize_gpu_capture(bytes,loaded,error) &&
-              loaded.format_version==66 && loaded.draws.size()==realized.size(),
+              loaded.format_version==67 && loaded.draws.size()==realized.size(),
           "actual collector and current production codecs round trip realized mode");
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded,replay,error) && replay.items.size()==realized.size(),
@@ -135,6 +171,8 @@ int main(int argc, char** argv) {
     for (size_t i=0; i<realized.size() && i<replay.items.size(); ++i)
         CHECK(loaded.draws[i].ps_float_mode==realized[i].ps_float_mode &&
                   replay.items[i].ps_float_mode==realized[i].ps_float_mode &&
+                  loaded.draws[i].ps_float_flags==realized[i].ps_float_flags &&
+                  replay.items[i].ps_float_flags==realized[i].ps_float_flags &&
                   replay.items[i].fs_words()==realized[i].fs_words(),
               "mode availability/value and stored source bytes survive collector/codec/replay");
     GpuCaptureBundle bundle;
@@ -144,17 +182,44 @@ int main(int argc, char** argv) {
               materialize_gpu_capture_bundle_manifest(bundle,0,manifest,error),
           "bundle payload and metadata-only manifest materialize mode tail");
     for (const auto* result : {&full,&manifest}) for (size_t i=0;i<realized.size();++i)
-        CHECK(i<result->draws.size() && result->draws[i].ps_float_mode==realized[i].ps_float_mode,
+        CHECK(i<result->draws.size() && result->draws[i].ps_float_mode==realized[i].ps_float_mode &&
+                  result->draws[i].ps_float_flags==realized[i].ps_float_flags,
               "bundle paths preserve unknown, explicitly programmed zero and full-byte values");
+    const size_t flags_tail=bytes.size()-8u-3u*capture.draws.size();
+    auto v66_bytes=bytes; v66_bytes.resize(flags_tail); set32(v66_bytes,8,66);
+    CHECK(deserialize_gpu_capture(v66_bytes,loaded,error) && loaded.format_version==66,
+          "genuine v66 prefix retains MODE/profile without inventing independent flags");
+    for (const auto& draw : loaded.draws) CHECK(draw.ps_float_flags==FragmentFloatFlags{},
+          "known old MODE and source markers do not create known IEEE/DX10 flags");
+    CHECK(serialize_gpu_capture(loaded,bytes,error) && deserialize_gpu_capture(bytes,loaded,error),
+          "legacy rewrite preserves unknown flags");
+    for (const auto& draw : loaded.draws) CHECK(draw.ps_float_flags==FragmentFloatFlags{},"rewritten flags stay unknown");
+    CHECK(serialize_gpu_capture(capture,bytes,error),"restore exact producing flag bytes for hostile controls");
+    for (size_t field : {flags_tail,bytes.size()-4}) {
+        auto corrupt=bytes; set32(corrupt,field,UINT32_MAX);
+        CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"hostile v67 counts refuse before second allocations");
+    }
+    for (size_t field : {flags_tail+4,flags_tail+5,flags_tail+6}) {
+        auto corrupt=bytes; corrupt[field]=2;
+        CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="invalid realized-draw fragment float flags",
+              "every v67 flag byte rejects nonboolean tags");
+    }
+    auto bad_flags=bytes; bad_flags[flags_tail+4]=0; bad_flags[flags_tail+5]=1;
+    CHECK(!deserialize_gpu_capture(bad_flags,loaded,error),"unavailable nonzero flag payload refuses");
+    for (size_t end=flags_tail;end<bytes.size();++end) {
+        auto corrupt=bytes; corrupt.resize(end);
+        CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"every truncated v67 suffix refuses");
+    }
     const bool no_resources = capture.computes.empty() && capture.failure_diagnostics.empty() &&
         std::all_of(capture.draws.begin(),capture.draws.end(),[](const auto& draw) {
             return draw.vrt.resources.empty() && draw.prt.resources.empty();
         });
-    CHECK(no_resources && bytes.size() >= 12u+capture.draws.size()+4u+8u+2u*capture.draws.size(),
+    CHECK(no_resources && bytes.size() >= 32u+6u*capture.draws.size(),
           "mode controls require the resource-free combined fixture");
-    if (!no_resources || bytes.size() < 12u+capture.draws.size()+4u+8u+2u*capture.draws.size()) return 1;
+    if (!no_resources || bytes.size() < 32u+6u*capture.draws.size()) return 1;
     auto mode_bytes = bytes;
-    mode_bytes.resize(mode_bytes.size()-12u-capture.draws.size()-4u); set32(mode_bytes,8,64);
+    mode_bytes.resize(mode_bytes.size()-8u-3u*capture.draws.size()-12u-capture.draws.size()-4u);
+    set32(mode_bytes,8,64);
     GpuCaptureFile official64;
     CHECK(deserialize_gpu_capture(mode_bytes,official64,error) && official64.format_version==64 &&
               official64.draws.size()==capture.draws.size(),
@@ -199,45 +264,66 @@ int main(int argc, char** argv) {
     auto bad=capture; bad.draws[0].ps_float_mode={false,16};
     CHECK(!serialize_gpu_capture(bad,upgraded_bytes,error) && !materialize_gpu_replay(bad,replay,error),
           "writer/direct materializer reject noncanonical untrusted mode");
+    bad=capture; bad.draws[0].ps_float_flags={false,true,false};
+    CHECK(!serialize_gpu_capture(bad,upgraded_bytes,error) && !materialize_gpu_replay(bad,replay,error),
+          "writer/direct materializer reject noncanonical untrusted independent flags");
     auto bad_draws=realized; bad_draws[0].ps_float_mode={false,16};
     CHECK(!capture_draw_items(bad_draws,metadata,reader,bad,error),"collector rejects noncanonical mode");
     OperationRealizationFailure failure;
     DrawItem rejected;
-    CHECK(!realize_draw_item(state_for({true,0x9b},failed_fragment),nullptr,3,std::size(vertex),false,
+    CHECK(!realize_draw_item(state_for({true,0x9b},failed_fragment,false,
+                             1u<<P::SPI_SHADER_PGM_RSRC1_PS_IEEE_MODE_SHIFT),nullptr,3,std::size(vertex),false,
                              rejected,&failure) && failure.reason==RealizationFailureReason::ShaderRecompile &&
-              failure.ps_float_mode==FragmentFloatMode({true,0x9b}),
+              failure.ps_float_mode==FragmentFloatMode({true,0x9b}) &&
+              failure.ps_float_flags==FragmentFloatFlags({true,true,false}),
           "actual failed-stage compiler retains known launch mode");
     failure.index=7; failure.command_order=1;
     GpuCaptureFile failed;
     CHECK(capture_submit_items({}, {},{{SubmitOperationKind::Draw,7,1}},metadata,reader,failed,error,{}, {failure}) &&
               serialize_gpu_capture(failed,upgraded_bytes,error) && deserialize_gpu_capture(upgraded_bytes,loaded,error) &&
-              loaded.failure_diagnostics.size()==1 && loaded.failure_diagnostics[0].ps_float_mode==failure.ps_float_mode,
+              loaded.failure_diagnostics.size()==1 && loaded.failure_diagnostics[0].ps_float_mode==failure.ps_float_mode &&
+              loaded.failure_diagnostics[0].ps_float_flags==failure.ps_float_flags,
           "actual failure collector/codec retain mode independently of successful draws");
+    auto invalid_failure=failed;
+    invalid_failure.failure_diagnostics[0].ps_float_flags={false,true,false};
+    CHECK(!serialize_gpu_capture(invalid_failure,upgraded_bytes,error),
+          "writer rejects noncanonical failed-draw flags");
+    invalid_failure=failed;
+    invalid_failure.failure_diagnostics[0].kind=SubmitOperationKind::Compute;
+    CHECK(!serialize_gpu_capture(invalid_failure,upgraded_bytes,error) &&
+              error=="invalid failed-draw fragment float flags",
+          "draw flag authority cannot be relabeled as compute failure authority");
     if (argc==3 && std::string(argv[1])=="--write-fixture") {
         const std::filesystem::path directory(argv[2]);
-        for (const auto entry : {std::pair{"mode0",FragmentFloatMode{true,0}},
-                                 std::pair{"mode16",FragmentFloatMode{true,16}},
-                                 std::pair{"unknown",FragmentFloatMode{}}}) {
+        struct Fixture { const char* name; FragmentFloatMode mode; uint32_t flag_bits; };
+        for (const auto entry : {Fixture{"mode0",{true,0},0},
+                                 Fixture{"mode16",{true,16},0},
+                                 Fixture{"unknown",{},0},
+                                 Fixture{"mode16-i0-d0",{true,16},0},
+                                 Fixture{"mode16-i1-d0",{true,16},1u<<23},
+                                 Fixture{"mode16-i0-d1",{true,16},1u<<21},
+                                 Fixture{"mode16-i1-d1",{true,16},(1u<<23)|(1u<<21)}}) {
             DrawItem draw;
-            CHECK(realize_draw_item(state_for(entry.second),nullptr,3,std::size(vertex),false,draw),"CLI fixture realizes");
+            CHECK(realize_draw_item(state_for(entry.mode,fragment,false,entry.flag_bits),
+                                   nullptr,3,std::size(vertex),false,draw),"CLI fixture realizes");
             draw.draw_index=7; draw.command_order=1;
             GpuCaptureFile single;
             CHECK(capture_draw_items({draw},metadata,reader,single,error),"CLI fixture captures exact producing input");
             // Wrong stored pixels must not pass for regenerated source. Oppose the known mode.
-            single.draws[0].fs=entry.second.available && entry.second.value==0 ? preserve : flush;
-            CHECK(write_gpu_capture((directory/(std::string(entry.first)+".prgcap")).string(),single,error),"CLI fixture writes");
+            single.draws[0].fs=entry.mode.available && entry.mode.value==0 ? preserve : flush;
+            CHECK(write_gpu_capture((directory/(std::string(entry.name)+".prgcap")).string(),single,error),"CLI fixture writes");
             auto retry=single; retry.draws.clear(); retry.operations={{SubmitOperationKind::Draw,7,1,false}};
             retry.failure_diagnostics_available=true;
             GpuCapturedOperationFailure f; f.source_index=7; f.command_order=1;
             f.reason=RealizationFailureReason::ShaderRecompile; f.vertex_retry_config_available=true;
-            f.fragment_retry_config_available=true; f.ps_float_mode=entry.second;
+            f.fragment_retry_config_available=true; f.ps_float_mode=entry.mode; f.ps_float_flags=draw.ps_float_flags;
             GpuCapturedStageDiagnostic stage; stage.stage=ShaderProgramStage::Fragment;
             stage.program_addr=reinterpret_cast<uint64_t>(fragment); stage.raw_shader_index=single.draws[0].fs_raw_shader_index;
             f.stages.push_back(stage); retry.failure_diagnostics.push_back(f);
             // Remove the otherwise unreferenced vertex raw version and remap fragment index.
             const auto raw=retry.raw_shader_versions[stage.raw_shader_index]; retry.raw_shader_versions={raw};
             retry.failure_diagnostics[0].stages[0].raw_shader_index=0;
-            CHECK(write_gpu_capture((directory/(std::string(entry.first)+"-failed.prgcap")).string(),retry,error),"retry CLI fixture writes");
+            CHECK(write_gpu_capture((directory/(std::string(entry.name)+"-failed.prgcap")).string(),retry,error),"retry CLI fixture writes");
         }
     }
     std::printf("== %s (%d failures) ==\n",failures?"FAIL":"PASS",failures);

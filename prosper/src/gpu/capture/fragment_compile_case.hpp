@@ -52,6 +52,9 @@ struct FragmentCompileCase {
     // Schema 3 retains even an explicitly producing Unknown profile. A schema-1/2 file has no
     // such input and is downgraded to INCOMPLETE, never inferred from SOURCE or today's device.
     FloatTransportConfig float_transport{};
+    // Schema 4 retains independent observed launch flags. A legacy schema cannot derive these
+    // inputs from FLOAT_MODE, SOURCE, width or a host device and stays inspectable INCOMPLETE.
+    FragmentFloatFlags float_flags{};
     uint32_t pcrel_target = UINT32_MAX;
     ComputeTripBoundSettings trip{};
     ShaderResourceTable resources;
