@@ -152,6 +152,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <memory>
 #include <pthread.h>
 #include <thread>
 
@@ -205,6 +208,68 @@ bool broadcast_until_awake(void* cnd_slot, void* mtx_slot, const std::atomic<int
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return flag.load(std::memory_order_acquire) != 0;
+}
+
+// #2635 workers own their slots and deadline storage. Even an expired timed call can block if
+// its absolute-deadline pointer is mistakenly interpreted as a relative interval. Main never
+// joins or takes a blocking handshake lock; a failed rescue exits before static HLE teardown.
+struct C11TimedArm {
+    void* mutex = nullptr;
+    void* cond = nullptr;
+    int64_t deadline[2]{};
+    std::atomic<int> entered{0}, done{0}, stop{0};
+    uint64_t result = ~0ULL, lock_result = ~0ULL, unlock_result = ~0ULL;
+    int probe = -1;
+#ifdef _WIN32
+    bool recorded_owner = false;
+#endif
+    // Normal access follows the mutex discipline; atomic storage also keeps a broken wait that
+    // returns without reacquiring from introducing a data race in the failure path of this test.
+    std::atomic<int> predicate{0};
+    bool saw_predicate = false;  // read only after done's release/acquire
+};
+
+bool c11_deadline(HleFn get_time, int64_t (&deadline)[2], int milliseconds) {
+    int64_t tv[2]{};
+    if (get_time((uint64_t)(uintptr_t)tv, 0, 0, 0, 0, 0) != 0 ||
+        tv[1] < 0 || tv[1] >= 1'000'000) return false;
+    deadline[0] = tv[0] + milliseconds / 1000;
+    deadline[1] = tv[1] * 1000 + (milliseconds % 1000) * 1'000'000LL;
+    deadline[0] += deadline[1] / 1'000'000'000LL;
+    deadline[1] %= 1'000'000'000LL;
+    return true;
+}
+
+template<class Work>
+void start_c11_worker(const std::shared_ptr<C11TimedArm>& arm, Work work) {
+    try {
+        std::thread([arm, work] {
+            work(*arm);
+            // No slot, HLE object, or result access follows this store.
+            arm->done.store(1);
+        }).detach();
+    } catch (...) {
+        CHECK(false, "C11 control: the detached worker starts");
+        fflush(stdout);
+        std::_Exit(1);
+    }
+}
+
+void finish_c11_worker(const std::shared_ptr<C11TimedArm>& arm, HleFn broadcast) {
+    if (spin_until(arm->done, 3)) return;
+    CHECK(false, "C11 control: the timed worker completes within its safety bound");
+    arm->stop.store(1);
+    const auto rescue_end = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!arm->done.load() &&
+           std::chrono::steady_clock::now() < rescue_end) {
+        if (arm->cond) call1(broadcast, &arm->cond);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!arm->done.load()) {
+        CHECK(false, "C11 control: rescue drains the worker before any object or static teardown");
+        fflush(stdout);
+        std::_Exit(1);
+    }
 }
 
 }  // namespace
@@ -528,6 +593,274 @@ int main() {
         pthread_mutex_destroy(&errorcheck);
     }
 #endif
+
+    // ===== 7–9. The remaining C11 acquisition/wait spellings perform real operations (#2635) ===
+    // Three independent registry assertions discriminate the original missing handlers. Keeping
+    // the existing sections above running also retains their valid-input controls on that source.
+    const HleFn try_lock = by_name("_Mtx_trylock");
+    const HleFn timed_lock = by_name("_Mtx_timedlock");
+    const HleFn timed_wait = by_name("_Cnd_timedwait");
+    CHECK(try_lock, "_Mtx_trylock is registered");
+    CHECK(timed_lock, "_Mtx_timedlock is registered");
+    CHECK(timed_wait, "_Cnd_timedwait is registered");
+    const HleFn sce_init = by_name("scePthreadMutexInit");
+    const HleFn sce_try = by_name("scePthreadMutexTrylock");
+    const HleFn sce_unlock = by_name("scePthreadMutexUnlock");
+    const HleFn sce_cond_init = by_name("scePthreadCondInit");
+    const HleFn sce_broadcast = by_name("scePthreadCondBroadcast");
+    const HleFn get_time = by_name("gettimeofday");
+    const bool controls = sce_init && sce_try && sce_unlock && sce_cond_init && sce_broadcast && get_time;
+    CHECK(controls, "C11 control: Sony synchronization and guest wall-clock entry points are registered");
+    if (controls) {
+        const auto make_arm = [&] {
+            auto arm = std::make_shared<C11TimedArm>();
+            // Sony's default is ERRORCHECK. _Mtx_init is recursive, and Linux static slots are
+            // NORMAL: either would conceal the ownership refusals and native acquisition probe.
+            if (call1(sce_init, &arm->mutex) != 0 || !arm->mutex ||
+                sce_cond_init((uint64_t)(uintptr_t)&arm->cond, 0, 0, 0, 0, 0) != 0 || !arm->cond ||
+                !c11_deadline(get_time, arm->deadline, -1000)) {
+                CHECK(false, "C11 control: ERRORCHECK objects and an expired guest deadline are constructed");
+                fflush(stdout);
+                std::_Exit(1);
+            }
+            return arm;
+        };
+        const auto cleanup = [&](const std::shared_ptr<C11TimedArm>& arm) {
+            CHECK(call1(sce_cnd_destroy, &arm->cond) == 0,
+                  "C11 cleanup: completed waits leave no live waiter count");
+            CHECK(call1(sce_mtx_destroy, &arm->mutex) == 0,
+                  "C11 cleanup: the drained mutex can be retired");
+        };
+
+        // Any possibly blocking acquisition goes on a worker, including trylock's contention arm:
+        // aliasing it to an ordinary lock must produce a bounded failure, not hang this controller.
+        const auto lock_arm = [&](HleFn fn, bool timed, bool held, bool destroyed,
+                                  uint64_t expected, const char* label) {
+            auto arm = make_arm();
+            if (destroyed) call1(sce_mtx_destroy, &arm->mutex);
+            if (held && call1(sce_try, &arm->mutex) != 0) {
+                CHECK(false, "C11 control: the controller really holds the contended mutex");
+                cleanup(arm);
+                return;
+            }
+            const auto invoke = [fn, timed, destroyed, sce_unlock](C11TimedArm& state) {
+                state.entered.store(1);
+                state.result = fn((uint64_t)(uintptr_t)&state.mutex,
+                                  timed ? (uint64_t)(uintptr_t)state.deadline : 0, 0, 0, 0, 0);
+                if (!destroyed) {
+#ifdef _WIN32
+                    state.recorded_owner = win_guest_mutex_owned_by_current_thread_for_test(state.mutex);
+#endif
+                    state.probe = pthread_mutex_trylock((pthread_mutex_t*)state.mutex);
+                    // If a false-success handler took nothing, this probe acquired it. Always
+                    // unlock: ERRORCHECK refuses another thread's ownership without changing it.
+                    state.unlock_result = call1(sce_unlock, &state.mutex);
+                }
+            };
+            start_c11_worker(arm, invoke);
+            if (held) {
+                CHECK(spin_until(arm->done, 3), "C11 contention: refusal returns while the other owner holds the mutex");
+                CHECK(call1(sce_unlock, &arm->mutex) == 0, "C11 control: the controller releases its held mutex");
+            }
+            finish_c11_worker(arm, sce_broadcast);
+            CHECK(arm->result == expected, label);
+            if (expected == 0) {
+                CHECK(arm->probe == EBUSY && arm->unlock_result == 0,
+                      "C11 acquisition: success actually owns the mutex and can release it");
+#ifdef _WIN32
+                CHECK(arm->recorded_owner, "C11 acquisition: the shared Windows ownership map records the new spelling");
+#endif
+            } else if (held) {
+                CHECK(arm->probe == EBUSY && arm->unlock_result == prosper::hle::kSceKernelErrorEPERM,
+                      "C11 contention: refusal leaves ownership with the original holder");
+            }
+            if (held) {
+                arm->done.store(0);
+                arm->result = ~0ULL;
+                arm->probe = -1;
+                arm->unlock_result = ~0ULL;
+                start_c11_worker(arm, invoke);
+                finish_c11_worker(arm, sce_broadcast);
+                CHECK(arm->result == 0 && arm->probe == EBUSY && arm->unlock_result == 0,
+                      "C11 recovery: the same handler really acquires the same mutex after contention ends");
+#ifdef _WIN32
+                CHECK(arm->recorded_owner, "C11 recovery: the Windows ownership map also records the retry");
+#endif
+            }
+            if (!destroyed) {
+                CHECK(call1(sce_try, &arm->mutex) == 0,
+                      "C11 recovery: the mutex remains acquirable after success or refusal");
+                call1(sce_unlock, &arm->mutex);
+            }
+            cleanup(arm);
+        };
+        if (try_lock) {
+            lock_arm(try_lock, false, false, false, 0, "_Mtx_trylock acquires a free mutex");
+            lock_arm(try_lock, false, true, false, 3, "_Mtx_trylock maps real contention to _Thrd_busy(3)");
+            lock_arm(try_lock, false, false, true, 4, "_Mtx_trylock maps a destroyed slot to _Thrd_error(4)");
+        }
+        if (timed_lock) {
+            lock_arm(timed_lock, true, false, false, 0,
+                     "_Mtx_timedlock still acquires a free mutex with an expired absolute deadline");
+            lock_arm(timed_lock, true, true, false, 2, "_Mtx_timedlock maps expiration under contention to _Thrd_timedout(2)");
+            lock_arm(timed_lock, true, false, true, 4, "_Mtx_timedlock maps a destroyed slot to _Thrd_error(4)");
+            auto arm = make_arm();
+            start_c11_worker(arm, [timed_lock, sce_try, sce_unlock](C11TimedArm& state) {
+                state.lock_result = call1(sce_try, &state.mutex);
+                if (state.lock_result == 0)
+                    state.result = timed_lock((uint64_t)(uintptr_t)&state.mutex,
+                                               (uint64_t)(uintptr_t)state.deadline, 0, 0, 0, 0);
+                state.probe = pthread_mutex_trylock((pthread_mutex_t*)state.mutex);
+                state.unlock_result = call1(sce_unlock, &state.mutex);
+            });
+            finish_c11_worker(arm, sce_broadcast);
+            CHECK(arm->lock_result == 0 && arm->result == 4,
+                  "_Mtx_timedlock maps an ERRORCHECK self-deadlock to error(4), unlike _Mtx_lock's busy(3)");
+            CHECK(arm->probe == EBUSY && arm->unlock_result == 0,
+                  "C11 timed self-deadlock: refusal preserves the original acquisition and permits cleanup");
+            cleanup(arm);
+        }
+
+        // Deadline conversion failures must reach both callers without acquiring anything. Each
+        // malformed arm is followed by a valid operation on the very same slot and worker storage.
+        for (const bool condition : { false, true }) {
+            const HleFn fn = condition ? timed_wait : timed_lock;
+            if (!fn) continue;
+            for (const bool null_deadline : { true, false }) {
+                auto arm = make_arm();
+                arm->deadline[0] = std::numeric_limits<int64_t>::max();
+                arm->deadline[1] = 1'000'000'000LL;  // normalization would overflow signed seconds
+                start_c11_worker(arm, [fn, condition, null_deadline, sce_unlock](C11TimedArm& state) {
+                    const uint64_t deadline = null_deadline ? 0 : (uint64_t)(uintptr_t)state.deadline;
+                    state.result = condition
+                        ? fn((uint64_t)(uintptr_t)&state.cond, (uint64_t)(uintptr_t)&state.mutex,
+                             deadline, 0, 0, 0)
+                        : fn((uint64_t)(uintptr_t)&state.mutex, deadline, 0, 0, 0, 0);
+                    state.probe = pthread_mutex_trylock((pthread_mutex_t*)state.mutex);
+                    state.unlock_result = call1(sce_unlock, &state.mutex);
+                });
+                finish_c11_worker(arm, sce_broadcast);
+                CHECK(arm->result == 4, null_deadline
+                      ? "C11 timed caller: a null absolute-deadline pointer reports error(4)"
+                      : "C11 timed caller: signed deadline normalization overflow reports error(4)");
+                CHECK(arm->probe == 0 && arm->unlock_result == 0,
+                      "C11 invalid deadline: refusal leaves the mutex unacquired and the native probe is cleaned");
+
+                CHECK(c11_deadline(get_time, arm->deadline, -1000),
+                      "C11 deadline recovery: a valid expired guest deadline is restored");
+                arm->done.store(0);
+                arm->result = ~0ULL;
+                arm->probe = -1;
+                arm->unlock_result = ~0ULL;
+                start_c11_worker(arm, [fn, condition, sce_try, sce_unlock](C11TimedArm& state) {
+                    if (condition) state.lock_result = call1(sce_try, &state.mutex);
+                    if (!condition || state.lock_result == 0)
+                        state.result = condition
+                            ? fn((uint64_t)(uintptr_t)&state.cond, (uint64_t)(uintptr_t)&state.mutex,
+                                 (uint64_t)(uintptr_t)state.deadline, 0, 0, 0)
+                            : fn((uint64_t)(uintptr_t)&state.mutex, (uint64_t)(uintptr_t)state.deadline,
+                                 0, 0, 0, 0);
+                    state.probe = pthread_mutex_trylock((pthread_mutex_t*)state.mutex);
+                    state.unlock_result = call1(sce_unlock, &state.mutex);
+                });
+                finish_c11_worker(arm, sce_broadcast);
+                CHECK(arm->result == (condition ? 2U : 0U) && arm->probe == EBUSY && arm->unlock_result == 0,
+                      "C11 deadline recovery: the same slot accepts a valid operation and retains real ownership");
+                cleanup(arm);
+            }
+        }
+
+        if (timed_wait) {
+            const auto cond_arm = [&](bool owned, bool destroyed_cond, bool destroyed_mutex,
+                                      uint64_t expected, const char* label) {
+                auto arm = make_arm();
+                if (destroyed_cond) call1(sce_cnd_destroy, &arm->cond);
+                if (destroyed_mutex) call1(sce_mtx_destroy, &arm->mutex);
+                start_c11_worker(arm, [owned, destroyed_mutex, timed_wait, sce_try, sce_unlock](C11TimedArm& state) {
+                    if (owned) state.lock_result = call1(sce_try, &state.mutex);
+                    state.entered.store(1);
+                    if (!owned || state.lock_result == 0)
+                        state.result = timed_wait((uint64_t)(uintptr_t)&state.cond,
+                                                  (uint64_t)(uintptr_t)&state.mutex,
+                                                  (uint64_t)(uintptr_t)state.deadline, 0, 0, 0);
+                    if (!destroyed_mutex) {
+#ifdef _WIN32
+                        state.recorded_owner = win_guest_mutex_owned_by_current_thread_for_test(state.mutex);
+#endif
+                        state.probe = pthread_mutex_trylock((pthread_mutex_t*)state.mutex);
+                        state.unlock_result = call1(sce_unlock, &state.mutex);
+                    }
+                });
+                finish_c11_worker(arm, sce_broadcast);
+                if (owned) CHECK(arm->lock_result == 0, "C11 wait control: the worker owns its ERRORCHECK mutex");
+                CHECK(arm->result == expected, label);
+                if (!destroyed_mutex) {
+                    CHECK(arm->probe == (owned ? EBUSY : 0) && arm->unlock_result == 0,
+                          "C11 wait: ownership is preserved or reacquired, and an unexpected probe acquisition is cleaned");
+#ifdef _WIN32
+                    CHECK(arm->recorded_owner == owned, "C11 wait: the Windows map preserves or reacquires the correct ownership");
+#endif
+                    CHECK(call1(sce_try, &arm->mutex) == 0, "C11 wait recovery: the mutex is usable after the refusal");
+                    call1(sce_unlock, &arm->mutex);
+                }
+                cleanup(arm);
+            };
+            cond_arm(true, false, false, 2, "_Cnd_timedwait maps an owned expired wait to _Thrd_timedout(2)");
+            cond_arm(false, false, false, 5, "_Cnd_timedwait maps an unowned ERRORCHECK mutex to the guest's EPERM result(5)");
+            cond_arm(true, true, false, 4, "_Cnd_timedwait maps a destroyed condition slot to _Thrd_error(4)");
+            cond_arm(false, false, true, 4, "_Cnd_timedwait maps a destroyed mutex slot to _Thrd_error(4)");
+
+            auto arm = make_arm();
+            start_c11_worker(arm, [timed_wait, sce_try, sce_unlock, get_time](C11TimedArm& state) {
+                state.lock_result = call1(sce_try, &state.mutex);
+                const bool deadline_ok = c11_deadline(get_time, state.deadline, 10000);
+                state.entered.store(1);
+                const auto safety_end = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+                if (state.lock_result == 0 && deadline_ok) {
+                    while (!state.predicate.load() &&
+                           !state.stop.load() &&
+                           std::chrono::steady_clock::now() < safety_end) {
+                        state.result = timed_wait((uint64_t)(uintptr_t)&state.cond,
+                                                  (uint64_t)(uintptr_t)&state.mutex,
+                                                  (uint64_t)(uintptr_t)state.deadline, 0, 0, 0);
+                        if (state.result != 0) break;
+                    }
+                    state.saw_predicate = state.predicate.load() != 0;
+                }
+#ifdef _WIN32
+                state.recorded_owner = win_guest_mutex_owned_by_current_thread_for_test(state.mutex);
+#endif
+                state.unlock_result = call1(sce_unlock, &state.mutex);
+            });
+            CHECK(spin_until(arm->entered, 3), "C11 signal control: the worker enters with a guest-wall-clock deadline");
+            bool acquired = false;
+            const auto handshake_end = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (!arm->done.load() &&
+                   std::chrono::steady_clock::now() < handshake_end) {
+                if (call1(sce_try, &arm->mutex) == 0) { acquired = true; break; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            CHECK(acquired, "_Cnd_timedwait really releases its owned mutex so a signaller can acquire it");
+            if (acquired) {
+                CHECK(call1(sce_cnd_destroy, &arm->cond) == prosper::hle::kSceKernelErrorEBUSY,
+                      "C11 wait bookkeeping: the timed waiter remains visible to the destroy-busy check");
+                arm->predicate.store(1);
+                call1(sce_cnd_signal, &arm->cond);
+                CHECK(call1(sce_unlock, &arm->mutex) == 0, "C11 signal control: the signaller releases before waiting for completion");
+            } else {
+                arm->stop.store(1);
+            }
+            finish_c11_worker(arm, sce_broadcast);
+            CHECK(arm->lock_result == 0 && arm->result == 0 && arm->saw_predicate && arm->unlock_result == 0,
+                  "_Cnd_timedwait observes a protected predicate after signal and reacquires its mutex");
+#ifdef _WIN32
+            CHECK(arm->recorded_owner, "C11 signalled wait: the Windows ownership map records reacquisition");
+#endif
+            CHECK(call1(sce_try, &arm->mutex) == 0, "C11 signalled-wait recovery: its mutex remains usable");
+            call1(sce_unlock, &arm->mutex);
+            cleanup(arm);
+        }
+    }
 
     if (fails) printf("== FAIL (%d) ==\n", fails);
     else       printf("== PASS ==\n");

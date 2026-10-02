@@ -816,6 +816,50 @@ int main() {
         CHECK(monotone, "clamping never reorders two deadlines");
     }
 
+    // #2635: C11 absolute deadlines become the guest wrapper's relative microseconds.
+    // Expected literals use whole timestamp differences, independently of the helper's
+    // seconds/nanoseconds decomposition. No real clock or sleep participates.
+    {
+        struct Case {
+            host::WaitDeadline now, deadline;
+            bool valid;
+            uint32_t usec;
+            const char* name;
+        };
+        constexpr Case cases[] = {
+            {{100LL, 234567000LL}, {100LL, 234567000LL}, true, 0U, "equal deadline"},
+            {{100LL, 234567001LL}, {100LL, 234567000LL}, true, 0U, "one nanosecond in the past"},
+            {{100LL, 0LL}, {99LL, 999999999LL}, true, 0U, "earlier second"},
+            {{100LL, 0LL}, {100LL, 1LL}, true, 1U, "one nanosecond rounds up"},
+            {{100LL, 0LL}, {100LL, 999LL}, true, 1U, "999 nanoseconds round up"},
+            {{100LL, 0LL}, {100LL, 1000LL}, true, 1U, "exact microsecond"},
+            {{100LL, 0LL}, {100LL, 1001LL}, true, 2U, "1001 nanoseconds round up"},
+            {{100LL, 999999999LL}, {101LL, 0LL}, true, 1U, "nanosecond borrow"},
+            {{100LL, 999999000LL}, {101LL, 0LL}, true, 1U, "microsecond borrow"},
+            {{100LL, 1LL}, {101LL, 0LL}, true, 1000000U, "ceiling carries a second"},
+            {{100LL, 0LL}, {100LL, 2500000000LL}, true, 2500000U, "positive nanosecond normalization"},
+            {{100LL, 0LL}, {103LL, -2500000000LL}, true, 500000U, "negative nanosecond normalization"},
+            {{4LL, 0LL}, {5LL, -1LL}, true, 1000000U, "negative normalization rounds up"},
+            {{0LL, 0LL}, {0LL, 4294967796LL}, true, 4294968U, "64-bit nanosecond field"},
+            {{0LL, 0LL}, {4294LL, 967295000LL}, true, 4294967295U, "last microsecond before low-32 wrap"},
+            {{0LL, 0LL}, {4294LL, 967296000LL}, true, 0U, "exact low-32 wrap"},
+            {{0LL, 0LL}, {4294LL, 967296001LL}, true, 1U, "one nanosecond above low-32 wrap"},
+            {{0LL, 0LL}, {10000LL, 0LL}, true, 1410065408U, "long future interval uses low 32 bits"},
+            {{-1LL, 999999999LL}, {0LL, 0LL}, true, 1U, "signed seconds cross zero"},
+            {{0LL, 0LL}, {INT64_MAX, 0LL}, true, 4293967296U, "maximum signed seconds"},
+            {{INT64_MIN, 0LL}, {INT64_MAX, 0LL}, true, 4293967296U, "full signed seconds span"},
+            {{INT64_MIN, 999999999LL}, {INT64_MAX, 0LL}, true, 4292967297U, "full span with nanosecond borrow"},
+            {{0LL, 0LL}, {0LL, INT64_MAX}, true, 2783138808U, "largest signed nanosecond normalization"},
+            {{0LL, 0LL}, {10000000000LL, INT64_MIN}, true, 3386747913U, "smallest signed nanosecond normalization"},
+            {{0LL, 0LL}, {INT64_MAX, 1000000000LL}, false, 0U, "upper normalization overflow"},
+            {{0LL, 0LL}, {INT64_MIN, -1LL}, false, 0U, "lower normalization overflow"},
+        };
+        for (const Case& c : cases) {
+            const auto actual = host::c11_timeout_from_deadline(c.now, c.deadline);
+            CHECK(actual.valid == c.valid && actual.usec == c.usec, c.name);
+        }
+    }
+
     printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
     return fails ? 1 : 0;
 }

@@ -131,8 +131,10 @@ size_t emit_legacy_integer_prologue(uint8_t* out) {
 
 size_t emit_guest_abi_tailjump(uint8_t* out, uint64_t handler) {
     Buf b{ out };
-    movabs_rax(b, handler);
-    b.b(0xFF); b.b(0xE0);          // jmp rax
+    // SysV variadics carry the vector-register count in AL. R11 is neither an
+    // argument register nor callee-preserved; R10 can carry a static chain.
+    movabs_r11(b, handler);
+    b.b(0x41); b.b(0xFF); b.b(0xE3); // jmp r11; the complete caller frame stays intact
     return b.n;
 }
 

@@ -3184,6 +3184,10 @@ endif()
   add_executable(test_sysv_ms_bridge tests/host/abi/test_sysv_ms_bridge.cpp)
   target_link_libraries(test_sysv_ms_bridge PRIVATE prosper_core)
   add_test(NAME sysv_ms_bridge COMMAND test_sysv_ms_bridge)
+  add_executable(test_guest_tailjump tests/host/abi/test_guest_tailjump.cpp)
+  target_link_libraries(test_guest_tailjump PRIVATE prosper_core)
+  add_test(NAME guest_tailjump COMMAND test_guest_tailjump)
+  set_tests_properties(guest_tailjump PROPERTIES SKIP_RETURN_CODE 77)
 
   # #3246: the one argument list #2955's CallSignature cannot describe — a real C variadic, whose
   # shape the format string decides at run time. CROSS-PLATFORM for the same reason as the bridge

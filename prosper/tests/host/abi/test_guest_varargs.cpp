@@ -170,12 +170,12 @@ void check_stub_and_registry() {
     params.checkpoint = 0x99aabbccddeeff00ull;
     params.guest_abi = true;
     const size_t n = emit_sysv_to_ms_bridge(bytes, params);
-    static const uint8_t kTailJump[] = { 0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
-                                         0xFF, 0xE0 };
+    static const uint8_t kTailJump[] = { 0x49, 0xBB, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+                                         0x41, 0xFF, 0xE3 };
     expect("guest-abi stub length", n == sizeof kTailJump,
-           "emitted " + std::to_string(n) + " bytes, expected 12");
+           "emitted " + std::to_string(n) + " bytes, expected 13");
     expect("guest-abi stub bytes", n == sizeof kTailJump && memcmp(bytes, kTailJump, n) == 0,
-           "the tail-jump is not `movabs rax, handler ; jmp rax`");
+           "the tail-jump is not `movabs r11, handler ; jmp r11`");
 
     // DISCRIMINATOR. Without the flag the same params emit the converting bridge, which is many times
     // longer. If they agreed, the arm above would be asserting nothing about the flag.
