@@ -180,7 +180,7 @@ uint64_t guest_thread_handle_self() {
     return o ? (uint64_t)(uintptr_t)o : 0;
 }
 
-bool guest_thread_handle_resolve(uint64_t handle, pthread_t* host, bool* adopted) {
+bool guest_thread_handle_resolve(uint64_t handle, pthread_t* host, bool* adopted, bool* detached) {
     if (!handle || !host) return false;
     State& s = *g_state;
     std::lock_guard<std::mutex> lock(s.mutex);
@@ -188,6 +188,7 @@ bool guest_thread_handle_resolve(uint64_t handle, pthread_t* host, bool* adopted
     if (it == s.by_handle.end()) return false;
     *host = it->second->host;
     if (adopted) *adopted = it->second->adopted;
+    if (detached) *detached = it->second->released;
     return true;
 }
 

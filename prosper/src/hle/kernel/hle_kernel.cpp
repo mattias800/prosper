@@ -2697,7 +2697,11 @@ HLE(k_pthread_join)   {
     if (a0 == 0) return 22;   // bare FreeBSD EINVAL; the Sony alias encodes it, value_ptr untouched
     pthread_t host_thread{};
     bool adopted = false;
-    if (!guest_thread_handle_resolve(a0, &host_thread, &adopted)) return 3;   // ESRCH: not a live handle
+    bool detached = false;
+    if (!guest_thread_handle_resolve(a0, &host_thread, &adopted, &detached)) return 3; // ESRCH
+    // Winpthreads has discarded the native HANDLE after detach; its ESRCH is not the guest's
+    // EINVAL for a still-running detached thread. Preserve our known ownership state explicitly.
+    if (detached) return 22;
     // Joining yourself stays the host's EDEADLK; any OTHER thread the guest did not create (the main
     // thread, a driver worker) is not joinable, which FreeBSD reports as EINVAL.
     if (adopted && !pthread_equal(host_thread, pthread_self())) return 22;
@@ -2710,8 +2714,9 @@ HLE(k_pthread_join)   {
 HLE(k_pthread_detach) {
     pthread_t host_thread{};
     bool adopted = false;
-    if (!guest_thread_handle_resolve(a0, &host_thread, &adopted)) return 3;   // ESRCH
-    if (adopted) return 22;   // EINVAL: the guest never created this thread
+    bool detached = false;
+    if (!guest_thread_handle_resolve(a0, &host_thread, &adopted, &detached)) return 3; // ESRCH
+    if (adopted || detached) return 22; // EINVAL: not owned as a joinable guest thread
     const int rc = pthread_detach(host_thread);
     if (rc == 0) guest_thread_handle_detached(a0);
     return fbsd_errno(rc);

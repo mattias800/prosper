@@ -48,8 +48,9 @@ uint64_t guest_thread_handle_create(pthread_t host);
 uint64_t guest_thread_handle_self();
 
 // Resolve a guest-supplied handle. False for null, garbage, and handles already joined/retired.
-// `*adopted` (optional) reports whether join/detach must refuse it.
-bool guest_thread_handle_resolve(uint64_t handle, pthread_t* host, bool* adopted = nullptr);
+// Optional ownership flags let guest join/detach refuse before a detached native HANDLE is gone.
+bool guest_thread_handle_resolve(uint64_t handle, pthread_t* host, bool* adopted = nullptr,
+                                 bool* detached = nullptr);
 
 // Lifecycle notifications. `exited` runs on the thread itself as the last guest-visible step;
 // `joined` after a successful pthread_join; `detached` after a successful pthread_detach. An object
@@ -70,8 +71,10 @@ void guest_thread_handle_before_create_for_test(void (*probe)());
 
 inline uint64_t guest_thread_handle_create(pthread_t host) { return (uint64_t)(uintptr_t)host; }
 inline uint64_t guest_thread_handle_self() { return (uint64_t)(uintptr_t)pthread_self(); }
-inline bool guest_thread_handle_resolve(uint64_t handle, pthread_t* host, bool* adopted = nullptr) {
+inline bool guest_thread_handle_resolve(uint64_t handle, pthread_t* host, bool* adopted = nullptr,
+                                      bool* detached = nullptr) {
     if (adopted) *adopted = false;
+    if (detached) *detached = false;
     *host = (pthread_t)(uintptr_t)handle;
     return true;   // unchanged behaviour: the raw value is the host id on these platforms
 }
