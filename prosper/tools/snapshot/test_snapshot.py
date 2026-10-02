@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -794,7 +794,7 @@ class BaselineVerificationMetadataTests(unittest.TestCase):
     # --- visibility ---------------------------------------------------------------------------------
 
     def test_list_distinguishes_never_verified_from_a_recent_human_verification(self):
-        now = datetime(2026, 9, 2, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 9, 2, 12, 0, 0, tzinfo=UTC)
         never = {"name": "never-verified", "dump": "PPSA00001-app0", "min_colors": 10}
         fresh = SNAPSHOT.stamp_verification(
             {"name": "fresh-human", "dump": "PPSA00002-app0", "min_colors": 10},
@@ -832,7 +832,7 @@ class BaselineVerificationMetadataTests(unittest.TestCase):
         self.assertIn("UNPARSEABLE", rendered)
 
     def test_verification_age_is_measured_in_whole_days_from_the_stamp(self):
-        now = datetime(2026, 9, 2, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 9, 2, 12, 0, 0, tzinfo=UTC)
         self.assertEqual(0, SNAPSHOT.verification_age_days("2026-09-02T00:00:00Z", now))
         self.assertEqual(32, SNAPSHOT.verification_age_days("2026-08-01T00:00:00Z", now))
         # A non-UTC offset must be normalised, not compared as wall-clock text.

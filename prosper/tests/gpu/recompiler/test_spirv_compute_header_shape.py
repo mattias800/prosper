@@ -112,9 +112,9 @@ def main() -> int:
     if len(over) > MAX_LARGE_BODIES:
         print("         New large inline bodies: "
               + ", ".join(f"line {ln} ({n}L)" for ln, n in over[MAX_LARGE_BODIES:][:5]))
-        print(f"         Move it to src/gpu/recompiler/spirv/:")
-        print(f"           python3 prosper/tools/refactor/outline_methods.py \\")
-        print(f"             --header src/gpu/recompiler/rdna2_to_spirv_internal.hpp \\")
+        print("         Move it to src/gpu/recompiler/spirv/:")
+        print("           python3 prosper/tools/refactor/outline_methods.py \\")
+        print("             --header src/gpu/recompiler/rdna2_to_spirv_internal.hpp \\")
         print(f"             --class {CLASS} --group src/gpu/recompiler/spirv/<facility>.cpp=<pattern> --apply")
 
     # Ratchet: if the count has DROPPED, the bound is stale and should be lowered with the change

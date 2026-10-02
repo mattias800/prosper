@@ -4,7 +4,6 @@
 # gpu_replay itself is not invoked here (that path is exercised manually against a local corpus).
 import importlib.util
 import os
-import sys
 import unittest
 from pathlib import Path
 from subprocess import CompletedProcess

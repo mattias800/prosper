@@ -202,7 +202,7 @@ def main():
     streams = []
     if args.logs:
         try:
-            streams = [open(p, "r", errors="replace") for p in args.logs]
+            streams = [open(p, errors="replace") for p in args.logs]
         except OSError as error:
             print(f"cannot read log: {error}", file=sys.stderr)
             return 2

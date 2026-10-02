@@ -18,7 +18,13 @@
 # live GPU residency; a change to live_gpu_targets/residency can be hash-identical yet wrong (see
 # docs blind-spot note / issue #1103). Use this to catch translation regressions fast, not as full coverage.
 
-import argparse, json, os, re, shutil, subprocess, sys
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 HASH_RE = re.compile(r"\bhash=([0-9a-fA-F]{1,16})\b")

@@ -33,7 +33,6 @@ these that a person can make it.
 import pathlib
 import re
 import subprocess
-import sys
 
 # Which include ROOT makes each canonical prefix resolve. DERIVED from the tree, not listed: a
 # hand-written list silently omitted `src/diagnostics` and `src/input`, so every include of those

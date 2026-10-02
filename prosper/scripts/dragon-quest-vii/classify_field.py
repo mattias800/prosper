@@ -34,7 +34,12 @@ brightness floor it replaced, where 73 of 144 field frames sat within 1.0 of the
 faintest of them was only 0.26 above it -- the frames are DARK precisely because they are HUD over an
 unrendered world, so brightness was measuring the defect rather than the state.
 """
-import argparse, glob, json, os, statistics, sys
+import argparse
+import glob
+import json
+import os
+import statistics
+import sys
 
 import numpy as np
 from PIL import Image
@@ -467,7 +472,8 @@ def run_mutants():
     control: if it reddens too, the harness is failing for some unrelated reason and the whole run
     is void, not passing.
     """
-    import subprocess, tempfile, shutil
+    import subprocess
+    import tempfile
     here = os.path.dirname(os.path.abspath(__file__))
     listing = os.path.join(here, "mutants.txt")
     src = open(os.path.join(here, "classify_field.py"), encoding="utf-8").read()

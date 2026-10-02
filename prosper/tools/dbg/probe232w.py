@@ -1,6 +1,9 @@
 # gdb -p PID -batch -x probe232w.py — issue #232: sample ALL threads' RIPs at the stall;
 # print guest pc / guest return addresses to pin the busy-spin loop.
-import gdb, struct, time, threading
+import gdb
+import struct
+import time
+import threading
 
 gdb.execute("set pagination off")
 gdb.execute("set confirm off")

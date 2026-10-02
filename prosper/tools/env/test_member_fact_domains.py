@@ -4,7 +4,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from member_fact_domains import PROPERTY, discover
+from member_fact_domains import PROPERTY
 
 DECLARATION = "add_executable(test_member_domain tests/local.cpp)\n"
 TEST = "add_test(NAME member_domain COMMAND test_member_domain)\n"

@@ -16,7 +16,9 @@
 #
 # Adding sections is append-only (segments/LOAD data are untouched), so the result still loads at
 # the same guest base via `add-symbol-file <out.elf> <base>`.
-import struct, sys, json
+import struct
+import sys
+import json
 
 def u16(b, o): return struct.unpack_from('<H', b, o)[0]
 def u32(b, o): return struct.unpack_from('<I', b, o)[0]

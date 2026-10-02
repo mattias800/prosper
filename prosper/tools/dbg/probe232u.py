@@ -9,7 +9,8 @@
 # (24-byte {u64 PackageId, FAsyncPackage2*, i32 hashnext}), slots num=+0xe0, free=+0x10c,
 # ExternalReadQueue head=+0x138, DeferredDeleteQueue=+0xa8, pkg state byte=pkg+0xe0,
 # pkg ExternalReadDependencies={data pkg+0x110, num pkg+0x118}.
-import gdb, struct, time
+import gdb
+import time
 
 gdb.execute("set pagination off")
 gdb.execute("set confirm off")

@@ -43,7 +43,6 @@ import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 
 DEFAULT_FILE = "prosper/docs/GAME_COMPAT_ORCHESTRATION.md"
 DEFAULT_HEADER = "Instrument"

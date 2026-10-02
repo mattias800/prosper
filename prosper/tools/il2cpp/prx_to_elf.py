@@ -13,7 +13,8 @@
 # need them, but its ELF reader does consult sections on some paths and I could not run it here, so
 # the default output is byte-for-byte what it was. Turn it on for disassembly, leave it off for a
 # dump.
-import struct, sys
+import struct
+import sys
 
 def main(src, dst, want_sections=False):
     f = open(src, "rb").read()

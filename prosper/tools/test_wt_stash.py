@@ -43,12 +43,12 @@ for stale in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'):
 
 def check(name, got, want, extra=''):
     if got == want:
-        print('  ok   {}'.format(name))
+        print(f'  ok   {name}')
     else:
-        msg = '{}: got {!r}, want {!r}'.format(name, got, want)
+        msg = f'{name}: got {got!r}, want {want!r}'
         if extra:
-            msg += ' ({})'.format(extra)
-        print('  FAIL {}'.format(msg))
+            msg += f' ({extra})'
+        print(f'  FAIL {msg}')
         FAILURES.append(msg)
 
 
@@ -159,7 +159,7 @@ def arm_wt_stash_isolates():
         check('lane A parked into the per-worktree namespace', sha_a is not None, True)
         check('lane B parked into the per-worktree namespace', sha_b is not None, True)
         check('one ref NAME, two different values', sha_a != sha_b, True,
-              '{} vs {}'.format(sha_a, sha_b))
+              f'{sha_a} vs {sha_b}')
 
         check('the shared refs/stash was never written', rev(main, 'refs/stash'), None)
 
@@ -458,7 +458,7 @@ def main():
     arm_hook()
     print('')
     if FAILURES:
-        print('{} failure(s):'.format(len(FAILURES)))
+        print(f'{len(FAILURES)} failure(s):')
         for f in FAILURES:
             print('  - ' + f)
         return 1
