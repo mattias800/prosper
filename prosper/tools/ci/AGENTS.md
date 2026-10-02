@@ -16,6 +16,13 @@ usage, whether a PR is safe to merge.
   *changes*. Added files must be ruff-clean, ruff-format-clean and carry a module docstring; modified
   files may not gain ruff findings; an added tool under `prosper/tools/` needs a test in the same PR.
   Config lives in the root `pyproject.toml` (uv, `uv.lock`); see the Python rule below.
+- **`check_arch_ratchet.py`** + `arch_ratchet_baseline.txt` — a ratchet over costs every title
+  pays: title ids and title-named directories in shared code, raw `getenv` reads, blocking GPU syncs
+  (`vkWaitForFences`, `*WaitIdle`, `ALL_COMMANDS` barriers), files over 5,000 lines, and
+  `prosper::test::` in the shipping frontend. Per-file counts may go down, never up; a count that
+  fell must have its row lowered (`--update` lowers and deletes, never raises). Raising a row is a
+  reviewed baseline edit with a `# note` — for a new sync, naming the guest-visible result it
+  delivers. It is not a refactoring plan; it only stops the numbers getting worse while one happens.
 - **`check_ctest_gate.py`** — finds callers that run `ctest` without `--no-tests=error`. Plain
   `ctest` exits 0 when it finds no tests, so "nothing ran" and "everything passed" share a status.
 - **`check_usage_text.py`** — finds tools whose usage block stopped being a docstring, so

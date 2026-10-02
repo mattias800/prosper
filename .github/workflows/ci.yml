@@ -556,6 +556,18 @@ jobs:
           python3 prosper/tools/env/check_diag_gates.py --selftest
           python3 prosper/tools/env/check_diag_gates.py prosper
 
+      # Same job, same reason: a text scan over tracked files that needs nothing built. Six costs
+      # every title pays -- title ids and title-named modules in shared code, raw getenv reads,
+      # blocking GPU syncs, ever-growing files, and the shipping frontend reaching into
+      # prosper::test:: -- each as a per-file count that may go DOWN, never UP. It fails on a new or
+      # risen count AND on a count that fell without its row being lowered, so the baseline cannot
+      # drift into headroom. Exit 2 means it could not evaluate, never "clean". --selftest first
+      # and separately, for the reason the steps above give.
+      - name: Verify no architecture-ratchet count rose
+        run: |
+          python3 prosper/tools/ci/check_arch_ratchet.py --selftest
+          python3 prosper/tools/ci/check_arch_ratchet.py --root .
+
       # Same job, same reason again: a repository-wide text scan needing nothing built -- and here
       # the "needing nothing built" part is the point, because the defect this catches is visible
       # ONLY on Windows and would otherwise wait for the MinGW job. stdout carries bytes, and the
