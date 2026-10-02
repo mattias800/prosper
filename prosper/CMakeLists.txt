@@ -2522,6 +2522,9 @@ if(TARGET prosper_core)
   add_executable(test_normal_magnitude_predicate tests/gpu/recompiler/test_normal_magnitude_predicate.cpp)
   target_link_libraries(test_normal_magnitude_predicate PRIVATE prosper_core)
   add_test(NAME normal_magnitude_predicate COMMAND test_normal_magnitude_predicate)
+  add_executable(test_raster_quad_collector tests/gpu/recompiler/test_raster_quad_collector.cpp)
+  target_link_libraries(test_raster_quad_collector PRIVATE prosper_core)
+  add_test(NAME raster_quad_collector_contract COMMAND test_raster_quad_collector)
   add_executable(test_fragment_float_mode tests/gpu/recompiler/test_fragment_float_mode.cpp)
   target_link_libraries(test_fragment_float_mode PRIVATE prosper_core)
   target_include_directories(test_fragment_float_mode PRIVATE tests)
@@ -3842,15 +3845,6 @@ endif()
       add_executable(vkprobe tools/vkprobe/vkprobe.cpp)
       target_link_libraries(vkprobe PRIVATE Vulkan::Vulkan)
 
-      # vkval_sync_probe (#3248): the positive control for `vk_validation_scan.py --sync`. It
-      # commits one deliberate write-after-write so the scanner can prove SYNCHRONIZATION validation
-      # is armed before reporting a sync verdict -- loading the layer proves only that CORE checks
-      # run, and a sync setting the layer version does not recognise produces exactly the output of
-      # a clean sync run. Deliberately NOT registered as a ctest: it exists to be invalid, and the
-      # gate it feeds fails on any hazard the ledger does not carry.
-      add_executable(vkval_sync_probe tools/vkval/sync_probe.cpp)
-      target_link_libraries(vkval_sync_probe PRIVATE Vulkan::Vulkan)
-
       # Local-only realized-submit replayer (#514): no guest boot, reads a versioned capture whose game
       # data remains gitignored, renders it through the same live backend, and checks the captured hash.
       add_executable(gpu_replay tools/gpu_replay/gpu_replay.cpp)
@@ -4766,26 +4760,6 @@ endif()
       target_link_libraries(test_storage_image_copy PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME storage_image_copy COMMAND test_storage_image_copy)
 
-      # Interpolation: a recompiled VS exports EXP PARAM0, a recompiled PS reads it via v_interp.
-      add_executable(test_interp_render tests/gpu/recompiler/test_interp_render.cpp)
-      # Includes a shared fixture, which resolves from the `tests` root.
-      target_include_directories(test_interp_render PRIVATE tests)
-      # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
-      target_include_directories(test_interp_render PRIVATE frontends)
-      target_link_libraries(test_interp_render PRIVATE prosper_core Vulkan::Vulkan)
-      add_test(NAME interp_render COMMAND test_interp_render)
-
-
-      # RectList fourth-corner synthesis: the geometry stage must complete the rectangle whichever of
-      # the three supplied vertices is the shared corner (#3507).
-      add_executable(test_rect_synthesis_render tests/gpu/recompiler/test_rect_synthesis_render.cpp)
-      # Includes a shared fixture, which resolves from the `tests` root.
-      target_include_directories(test_rect_synthesis_render PRIVATE tests)
-      # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
-      target_include_directories(test_rect_synthesis_render PRIVATE frontends)
-      target_link_libraries(test_rect_synthesis_render PRIVATE prosper_core Vulkan::Vulkan)
-      add_test(NAME rect_synthesis_render COMMAND test_rect_synthesis_render)
-
       # Full textured-draw path: VS exports interpolated UVs, PS samples a texture at them (+screenshot).
       add_executable(test_textured_interp_render tests/gpu/test_textured_interp_render.cpp)
       # Includes a shared fixture, which resolves from the `tests` root.
@@ -4904,6 +4878,35 @@ endif()
 endif()
 
 if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
+  # vkval_sync_probe (#3248): the positive control for `vk_validation_scan.py --sync`. It
+  # commits one deliberate write-after-write so the scanner can prove SYNCHRONIZATION validation
+  # is armed before reporting a sync verdict -- loading the layer proves only that CORE checks
+  # run, and a sync setting the layer version does not recognise produces exactly the output of
+  # a clean sync run. Deliberately NOT registered as a ctest: it exists to be invalid, and the
+  # gate it feeds fails on any hazard the ledger does not carry.
+  add_executable(vkval_sync_probe tools/vkval/sync_probe.cpp)
+  target_link_libraries(vkval_sync_probe PRIVATE Vulkan::Vulkan)
+
+  # Interpolation: a recompiled VS exports EXP PARAM0, a recompiled PS reads it via v_interp.
+  add_executable(test_interp_render tests/gpu/recompiler/test_interp_render.cpp)
+  # Includes a shared fixture, which resolves from the `tests` root.
+  target_include_directories(test_interp_render PRIVATE tests)
+  # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
+  target_include_directories(test_interp_render PRIVATE frontends)
+  target_link_libraries(test_interp_render PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME interp_render COMMAND test_interp_render)
+
+
+  # RectList fourth-corner synthesis: the geometry stage must complete the rectangle whichever of
+  # the three supplied vertices is the shared corner (#3507).
+  add_executable(test_rect_synthesis_render tests/gpu/recompiler/test_rect_synthesis_render.cpp)
+  # Includes a shared fixture, which resolves from the `tests` root.
+  target_include_directories(test_rect_synthesis_render PRIVATE tests)
+  # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
+  target_include_directories(test_rect_synthesis_render PRIVATE frontends)
+  target_link_libraries(test_rect_synthesis_render PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME rect_synthesis_render COMMAND test_rect_synthesis_render)
+
   # A compute full-overwrite destination at the colour-target COUNT bound evicts under the graphics
   # admission predicate instead of refusing (#3873).
   # BackendSubmissionBatch's timestamp envelope reuses one query pool across batches (#3948).
@@ -5105,6 +5108,30 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
 endif()
 
 if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
+  # #4106: same shipping DrawItem caller, with an explicit device-free ownership arm.
+  add_executable(test_raster_quad_collection tests/shared/live/test_raster_quad_collection.cpp)
+  target_include_directories(test_raster_quad_collection PRIVATE src tests frontends)
+  target_link_libraries(test_raster_quad_collection PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+  add_test(NAME raster_quad_realization COMMAND test_raster_quad_collection --cpu-only)
+  add_test(NAME raster_quad_realization_analysis_unavailable
+    COMMAND test_raster_quad_collection --cpu-only --analysis-unavailable)
+  add_test(NAME raster_quad_realization_scissor_override
+    COMMAND test_raster_quad_collection --cpu-only --scissor-override)
+  add_test(NAME raster_quad_collection COMMAND test_raster_quad_collection)
+  add_test(NAME raster_quad_collection_scissor_override COMMAND test_raster_quad_collection --scissor-override)
+  set(_raster_quad_clean_env "PROSPER_NO_SHADER_DECODE_REUSE=unset:;PROSPER_RENDER_REFVS=unset:;PROSPER_FS_SPV=unset:;PROSPER_RENDER_TESTPS=unset:;PROSPER_RENDER_NOPS=unset:;PROSPER_DESCRIPTOR_VALIDATE=unset:;PROSPER_NO_CULL=unset:;PROSPER_FLIP_FRONT_FACE=unset:;PROSPER_NO_DEPTH_BIAS=unset:;PROSPER_SKIP_DRAW=unset:;PROSPER_RENDER_FIRST=unset:;PROSPER_RENDER_LAST=unset:")
+  set_tests_properties(raster_quad_realization raster_quad_collection PROPERTIES
+    ENVIRONMENT "PROSPER_FRAGMENT_QUAD_COLLECT=1"
+    ENVIRONMENT_MODIFICATION "${_raster_quad_clean_env};PROSPER_NO_FRAGMENT_ANALYSIS_REUSE=unset:;PROSPER_IGNORE_EMPTY_SCISSOR=unset:"
+    TIMEOUT 90)
+  set_tests_properties(raster_quad_collection raster_quad_collection_scissor_override PROPERTIES SKIP_RETURN_CODE 77)
+  set_tests_properties(raster_quad_realization_analysis_unavailable PROPERTIES
+    ENVIRONMENT "PROSPER_FRAGMENT_QUAD_COLLECT=1;PROSPER_NO_FRAGMENT_ANALYSIS_REUSE=1"
+    ENVIRONMENT_MODIFICATION "${_raster_quad_clean_env};PROSPER_IGNORE_EMPTY_SCISSOR=unset:" TIMEOUT 90)
+  set_tests_properties(raster_quad_realization_scissor_override raster_quad_collection_scissor_override PROPERTIES
+    ENVIRONMENT "PROSPER_FRAGMENT_QUAD_COLLECT=1;PROSPER_IGNORE_EMPTY_SCISSOR=0"
+    ENVIRONMENT_MODIFICATION "${_raster_quad_clean_env};PROSPER_NO_FRAGMENT_ANALYSIS_REUSE=unset:" TIMEOUT 90)
+  unset(_raster_quad_clean_env)
   add_executable(test_render_buffer_capture tests/shared/live/test_render_buffer_capture.cpp)
   target_include_directories(test_render_buffer_capture PRIVATE frontends)
   target_link_libraries(test_render_buffer_capture PRIVATE prosper_live_renderer
