@@ -203,7 +203,7 @@ int main(int argc, char** argv) {
     }
     std::vector<uint8_t> bytes;
     const bool roundtrip=serialize_gpu_capture(capture,bytes,error) && deserialize_gpu_capture(bytes,loaded,error);
-    CHECK(roundtrip && loaded.format_version==65,"current codec accepts exact bounded producing profile tails");
+    CHECK(roundtrip && loaded.format_version==66,"current codec accepts exact bounded producing profile tails");
     if (!roundtrip) { std::printf("codec error: %s\n",error.c_str()); return 1; }
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded,replay,error) && replay.items.size()==draws.size(),
@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
     GpuCaptureBundle bundle; GpuCaptureFile full,manifest;
     CHECK(append_gpu_capture_bundle(bundle,capture,error) &&
               materialize_gpu_capture_bundle_submit(bundle,0,full,error) &&
-              materialize_gpu_capture_bundle_manifest(bundle,0,manifest,error),"both bundle routes retain v65 profile tail");
+              materialize_gpu_capture_bundle_manifest(bundle,0,manifest,error),"both bundle routes retain v66 profile tail");
     for (const auto* result : {&full,&manifest}) for (size_t i=0;i<draws.size();++i)
         CHECK(result->draws[i].float_transport==draws[i].float_transport,"full/manifest do not replace producer with current profile");
     std::vector<uint8_t> tail;
@@ -237,9 +237,9 @@ int main(int argc, char** argv) {
           "canonical tail is exact, not a version-only relabel");
     if (bytes.size()<=tail.size()) return 1;
     const size_t start=bytes.size()-tail.size();
-    auto legacy=bytes; legacy.resize(start); set32(legacy,8,64);
-    CHECK(deserialize_gpu_capture(legacy,loaded,error) && loaded.format_version==64,
-          "genuine v64 prefix remains readable without fabricated profile authority");
+    auto legacy=bytes; legacy.resize(start); set32(legacy,8,65);
+    CHECK(deserialize_gpu_capture(legacy,loaded,error) && loaded.format_version==65,
+          "genuine v65 prefix retains owned markers without fabricated profile authority");
     for (const auto& item:loaded.draws) CHECK(item.float_transport==unknown,"old explicit source markers do not infer producing profile");
     for (const auto& item:loaded.computes) CHECK(item.recompile_config.float_transport==unknown,"old compute config remains unknown");
     for (const auto& item:loaded.failure_diagnostics) {
@@ -260,11 +260,11 @@ int main(int argc, char** argv) {
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"failed-stage count must match previously bounded inventory");
     for (size_t end=start;end<bytes.size();++end) {
         corrupt=bytes; corrupt.resize(end);
-        CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"every truncated v65 suffix refuses");
+        CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"every truncated v66 suffix refuses");
     }
     corrupt=bytes; corrupt.push_back(0);
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="capture has trailing data","strict EOF after new tail");
-    corrupt=bytes; set32(corrupt,8,64);
+    corrupt=bytes; set32(corrupt,8,65);
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="capture has trailing data","version-only downgrade is not legacy");
     auto bad=capture; bad.draws[0].float_transport.profile=static_cast<FloatTransportProfile>(3);
     CHECK(!serialize_gpu_capture(bad,bytes,error) && !materialize_gpu_replay(bad,replay,error),

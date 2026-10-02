@@ -22,6 +22,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "build_revision.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "../../tests/fixtures/spirv_wave_width_fixtures.hpp"
@@ -34,6 +35,7 @@
 #include <array>
 #include <cctype>
 #include <filesystem>
+#include <memory>
 #include <set>
 #include <system_error>
 #include <cstdio>
@@ -151,6 +153,9 @@ static const NotAnEmitter kNotEmitters[] = {
     {"rdna2_proven_raw_register_wide_data_loads",
      "returns decoded instruction PCs, not SPIR-V; raw_register_wide_data covers complete "
      "scalar-offset provenance and raw_register_wide_exec executes changed source bytes"},
+    {"rdna2_owned_raw_wide_data_loads",
+     "returns decoded instruction PCs, not SPIR-V; owned_raw_wide_x4 and owned_raw_wide_x8 "
+     "below assert those PCs and strictly validate consuming recompile_valu modules"},
     {"rdna2_proven_raw_nested_wide_data_loads",
      "returns decoded instruction PCs, not SPIR-V; recompile_coverage covers admitted numeric "
      "children and bypass refusals, and rdna2_to_spirv_exec validates consuming modules"},
@@ -451,7 +456,13 @@ int main(int argc, char** argv) {
       source.format = DataFormat::Uint32;
       source.num_components = 1u;
       source.binding = 2u;
-      source.size = 16u;
+      // Complete owned bytes satisfy the raw snapshot's logical address/range contract.
+      // This sample validates emitted SPIR-V; it does not execute an upload or GPU read.
+      alignas(uint32_t) uint32_t bytes[4]{1u, 2u, 3u, 4u};
+      source.gpu_addr = reinterpret_cast<uint64_t>(bytes);
+      source.host_data = reinterpret_cast<uint8_t*>(bytes);
+      source.host_data_size = sizeof(bytes);
+      source.size = sizeof(bytes);
       source.fetch_pc = 1u;
       source.raw_register_snapshot = true;
       table.resources.push_back(source);
@@ -483,6 +494,66 @@ int main(int argc, char** argv) {
       table.resources.push_back(wide);
       dump(dir, "memory_fed_raw_wide", recompile_valu(c, std::size(c), 1u, 0u, &table),
            "recompile_valu"); }
+    // The parent and child both consume real complete hosted bytes. The parent pointer is
+    // overwritten only after its read, and its highest word selects the register-offset child.
+    // Strict validation here proves module legality, not renderer upload or GPU execution.
+    for (bool wide8 : {false, true}) {
+      const uint32_t size = wide8 ? 32u : 16u;
+      const uint32_t last = wide8 ? 7u : 3u;
+      const uint32_t c[] = {
+          wide8 ? 0xf40c0600u : 0xf4080600u, 0xfa000004u,
+          0xbe800380u, 0xbe810380u,
+          0x8f6b8400u | (24u + last), 0x876bff6bu, 0x1f0u,
+          wide8 ? 0xf40c0201u : 0xf4080201u, 0xd6000000u,
+          wide8 ? 0x7e00020fu : 0x7e00020bu, 0xbf810000u};
+      std::vector<Rdna2Inst> decoded;
+      std::vector<uint32_t> sources;
+      if (rdna2_walk(c, std::size(c), decoded) != std::size(c) ||
+          rdna2_owned_raw_wide_data_loads(decoded) != std::vector<uint32_t>{0u} ||
+          rdna2_proven_raw_register_wide_data_loads(decoded, &sources) !=
+              std::vector<uint32_t>{7u} || sources != std::vector<uint32_t>{0u}) {
+          printf("  [FAIL] owned_raw_wide_%s exact parent/child proof PCs\n", wide8 ? "x8" : "x4");
+          ++fails;
+      }
+      alignas(16) std::array<uint32_t, 9> parent{};
+      alignas(16) std::array<uint32_t, 8> child{};
+      parent[1u + last] = 2u;
+      child[last] = 42u;
+      auto owner = std::make_shared<std::vector<uint8_t>>(size);
+      std::memcpy(owner->data(), parent.data() + 1u, size);
+      ShaderResourceTable table;
+      ShaderResource source;
+      source.cls = ResourceClass::ConstantBuffer;
+      source.format = DataFormat::Uint32;
+      source.num_components = 1u;
+      source.binding = 2u;
+      source.gpu_addr = reinterpret_cast<uint64_t>(parent.data() + 1u);
+      source.host_data = owner->data();
+      source.host_data_size = size;
+      source.size = size;
+      source.fetch_pc = 0u;
+      source.owned_raw_snapshot_bytes = size;
+      table.resources.push_back(source);
+      table.owned_host_data.push_back(owner);
+      table.owned_raw_snapshot_requirements.emplace_back(0u, size);
+      ShaderResource selected = source;
+      selected.binding = 3u;
+      selected.fetch_pc = 7u;
+      selected.gpu_addr = reinterpret_cast<uint64_t>(child.data());
+      selected.host_data = reinterpret_cast<uint8_t*>(child.data());
+      selected.raw_register_snapshot = true;
+      selected.owned_raw_snapshot_bytes = 0u;
+      table.resources.push_back(selected);
+      auto short_parent = table;
+      short_parent.resources.front().host_data_size = size - 4u;
+      if (!recompile_valu(c, std::size(c), 1u, 0u, &short_parent).empty()) {
+          printf("  [FAIL] owned_raw_wide_%s missing highest parent word was admitted\n",
+                 wide8 ? "x8" : "x4");
+          ++fails;
+      }
+      dump(dir, wide8 ? "owned_raw_wide_x8" : "owned_raw_wide_x4",
+           recompile_valu(c, std::size(c), 1u, 0u, &table), "recompile_valu");
+    }
     { const uint32_t c[] = {0x06000300u, 0x10000500u, 0xBF810000u};
       dump(dir, "compute_alu", recompile_valu(c, 3, 3, 0), "recompile_valu"); }
     dump_numeric_mbcnt(dir);

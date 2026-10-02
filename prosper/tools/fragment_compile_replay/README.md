@@ -7,8 +7,9 @@ pinned trip settings, actual consumed semantic choices, immutable linked compile
 expected complete SOURCE or refusal. It is not a frame capture.
 The actual producing key's complete guest FLOAT_MODE byte and availability are retained separately
 from wave width and host float-control publication. Unknown stays unknown; replay never infers it.
-Schema 2 appends the actual pinned host float-transport profile. An explicitly producing `unknown`
-profile is a retained input and remains replayable; schema-1 absence is instead inspectable
+Schema 3 appends the actual pinned host float-transport profile after the unchanged schema-2
+owned-marker tail. An explicitly producing `unknown` profile is a retained input and remains
+replayable; schema-1/2 absence is instead inspectable
 `INCOMPLETE fragment-transport-config-unavailable` and cannot enter the compiler. Neither profile
 nor SOURCE grants feature permission to a different executing Vulkan device.
 
@@ -43,6 +44,14 @@ actually refused compiler attempt can have complete inputs, even with no semanti
 Unowned ordinary buffer backing is also opaque when the invocation needs metadata only. Owned
 buffer allocations are retained within the aggregate budget; any actual byte consumer of opaque
 backing refuses. This is not permission to reinterpret a guest address or invent readable storage.
+
+Schema 2 appends each resource's owned raw-snapshot byte marker after the schema-1 payload. Both
+valid and malformed markers survive the codec so candidate replay retains the producing compiler's
+admission or refusal inputs. Schema-1 files remain readable with the historical zero marker.
+Code-derived draw capture requirements remain independently derived from the restored shader.
+Raw-load SOURCE admission uses the recorded backing-presence fact and exact resource shape;
+readable bytes still require the checked resource gateway. Frame replay and draw uploads retain
+their separate backing-ownership checks.
 
 The linked identity covers dirty/untracked project sources, actual GCC/Clang dependency headers,
 compiler/front-end bytes and resolved compile commands/configuration. Unsupported dependency

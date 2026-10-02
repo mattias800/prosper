@@ -922,6 +922,29 @@ std::vector<uint32_t> recompile_vertex_ngg_one_lane_for_test(
                                  {RecompileDiagnosticStage::Vertex, 0});
 }
 
+bool rdna2_vertex_chain_has_owned_raw_wide_inputs(
+        const uint32_t* prolog, size_t prolog_dwords,
+        const uint32_t* main, size_t main_dwords, const ShaderResourceTable* resources) {
+    if (resources && (!resources->owned_raw_snapshot_requirements.empty() || std::any_of(
+            resources->resources.begin(), resources->resources.end(),
+            [](const auto& resource) { return resource.owned_raw_snapshot_bytes != 0u; })))
+        return true;
+    const auto requires_owned = [](const uint32_t* code, size_t dwords) {
+        if (!code || !dwords) return false;
+        std::vector<Rdna2Inst> decoded;
+        rdna2_walk(code, dwords, decoded);
+        return !rdna2_owned_raw_wide_data_loads(decoded).empty();
+    };
+    if (requires_owned(prolog, prolog_dwords) || requires_owned(main, main_dwords)) return true;
+    if (!prolog || !main) return false;
+    const auto info = rdna2_vertex_prolog_info(prolog, prolog_dwords);
+    const auto main_span = rdna2_recompile_code_span(main, main_dwords);
+    if (!info.valid || !main_span || info.prefix_dwords > SIZE_MAX - main_span) return false;
+    std::vector<uint32_t> linked(prolog, prolog + info.prefix_dwords);
+    linked.insert(linked.end(), main, main + main_span);
+    return requires_owned(linked.data(), linked.size());
+}
+
 std::vector<uint32_t> recompile_vertex_chain(const uint32_t* prolog, size_t prolog_dwords,
                                              const uint32_t* main, size_t main_dwords,
                                              const ShaderResourceTable* rt,
@@ -930,6 +953,12 @@ std::vector<uint32_t> recompile_vertex_chain(const uint32_t* prolog, size_t prol
                                              uint32_t virtual_lds_dwords,
                                              RecompileDiagnosticContext diagnostic,
                                              FloatTransportConfig float_transport) {
+    if (rdna2_vertex_chain_has_owned_raw_wide_inputs(
+            prolog, prolog_dwords, main, main_dwords, rt)) {
+        log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",
+                                 "owned raw wide inputs require a direct vertex stage");
+        return {};
+    }
     const VertexPrologInfo info = rdna2_vertex_prolog_info(prolog, prolog_dwords);
     if (!info.valid || !main || !main_dwords) return {};
 

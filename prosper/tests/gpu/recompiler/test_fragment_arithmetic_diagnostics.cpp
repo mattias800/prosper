@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -154,6 +155,88 @@ void dump(const std::filesystem::path& directory, const char* name, const std::v
     std::ofstream stream(directory / name, std::ios::binary);
     stream.write(reinterpret_cast<const char*>(words.data()), std::streamsize(words.size()*4));
     check(bool(stream), "SOURCE dump writes");
+}
+void owned_requests() {
+    // The owned read precedes the ADD, so a short owner must refuse before arithmetic emission.
+    // Existing owned replay fixtures constrain the loaded data; this fixture constrains request
+    // accounting at that same admission boundary, without claiming a GPU arithmetic oracle.
+    for (bool wide8 : {false,true}) {
+        const uint32_t width = wide8 ? 32u : 16u;
+        alignas(16) std::array<uint32_t,9> parent{};
+        for (size_t n=0;n<parent.size();++n) parent[n]=0x3f800000u+uint32_t(n);
+        const auto parent_address=reinterpret_cast<uintptr_t>(parent.data());
+        const std::array<uint32_t,2> user{uint32_t(parent_address),uint32_t(parent_address>>32)};
+        auto code=program(3,false);
+        code.insert(code.begin(),{wide8?0xf40c0600u:0xf4080600u,0xfa000004u,
+            0xbe800380u,0xbe810380u,wide8?0x7e04021fu:0x7e04021bu});
+        auto alias=code;
+        ShaderResourceTable table;
+        add_compute_buffer_resources(table,code.data(),code.size(),user.data(),user.size());
+        assign_convention_bindings(table,2u);
+        const auto* source=table.by_fetch_pc(0u);
+        check(table.owned_raw_snapshot_requirements==std::vector<std::pair<uint32_t,uint32_t>>{{0u,width}} &&
+            table.owned_host_data.size()==1 && source && source->host_data &&
+            source->owned_raw_snapshot_bytes==width && source->host_data_size==width &&
+            std::memcmp(source->host_data,parent.data()+1,width)==0,
+            "actual owned x4/x8 fold supplies a complete read-point before arithmetic");
+        if (!source) continue;
+        auto short_owner=table;
+        short_owner.resources[size_t(source-table.resources.data())].host_data_size=width-4u;
+        for (const auto mode : {FragmentFloatMode{true,0xab},FragmentFloatMode{}}) {
+            FragmentArithmeticObservation observation;
+            const auto baseline=recompile_fragment(code.data(),code.size(),&table,nullptr,UINT32_MAX,
+                nullptr,false,{RecompileDiagnosticStage::Fragment,addr(code)},mode,&observation);
+            check(!baseline.empty() && Module(baseline).live_binary(129) &&
+                observation.float_mode==mode && observation.producing_program==addr(code) &&
+                observation.source_fingerprint!=0 && observation.site_count==1 &&
+                observation.sites[0]==FragmentArithmeticSite{9u,FragmentArithmeticFamily::Add},
+                "owned request retains actual ADD boundary and full known/unknown producing mode");
+            const auto compile=[&](const std::vector<uint32_t>& words,const ShaderResourceTable& resources,
+                                   uint64_t* id=nullptr) {
+                return recompile_graphics_shader_cached_shared(ShaderProgramStage::Fragment,
+                    words.data(),words.size(),&resources,nullptr,nullptr,id,false,0,false,{},mode);
+            };
+            const auto requests=count(perf::Counter::FragmentArithmeticRequests);
+            const auto modes=count(mode.available?perf::Counter::FragmentArithmeticKnownMode:
+                                                   perf::Counter::FragmentArithmeticUnknownMode);
+            const auto refused_requests=count(perf::Counter::FragmentArithmeticRefusedRequests);
+            uint64_t cold_id=0,warm_id=0,rejected_id=0,recovered_id=0;
+            SharedShaderWords cold,warm,bypass,rejected,rejected_warm,recovered;
+            capture([&] { cold=compile(code,table,&cold_id); });
+            const auto warm_log=capture([&] { warm=compile(alias,table,&warm_id); });
+            check(cold && warm && !cold->empty() && cold==warm && *cold==baseline && cold_id && cold_id==warm_id &&
+                warm_log.find("program="+address(addr(alias))+" ")!=std::string::npos &&
+                warm_log.find("producing-program="+address(addr(code))+" ")!=std::string::npos &&
+                warm_log.find(mode.available?"FLOAT_MODE=0xab":"FLOAT_MODE=unavailable")!=std::string::npos,
+                "owned warm alias preserves immutable producer facts and current lookup address");
+            env("PROSPER_NO_SHADER_CACHE","1");
+            capture([&] { bypass=compile(alias,table); });
+            env("PROSPER_NO_SHADER_CACHE",nullptr);
+            check(bypass && *bypass==baseline,"owned bypass preserves SOURCE and producing mode");
+            const auto suppressed=capture([&] {
+                perf::SuppressDrawDropCounting suppress;
+                compile(alias,table);
+            });
+            check(suppressed.empty() && count(perf::Counter::FragmentArithmeticRequests)==requests+3,
+                "owned F9 re-realization suppresses observation and request accounting");
+            std::vector<uint32_t> rejected_direct;
+            const auto short_log=capture([&] {
+                rejected_direct=recompile_fragment(code.data(),code.size(),&short_owner,nullptr,UINT32_MAX,
+                    nullptr,false,{RecompileDiagnosticStage::Fragment,addr(code)},mode);
+                rejected=compile(code,short_owner,&rejected_id);
+                rejected_warm=compile(alias,short_owner);
+            });
+            capture([&] { recovered=compile(alias,table,&recovered_id); });
+            check(rejected_direct.empty() && rejected && rejected->empty() && rejected==rejected_warm &&
+                rejected_id!=cold_id && recovered==cold && recovered_id==cold_id &&
+                short_log.find("[fragment-arithmetic-unverified]")==std::string::npos &&
+                count(perf::Counter::FragmentArithmeticRequests)==requests+7 &&
+                count(mode.available?perf::Counter::FragmentArithmeticKnownMode:
+                                     perf::Counter::FragmentArithmeticUnknownMode)==modes+4 &&
+                count(perf::Counter::FragmentArithmeticRefusedRequests)==refused_requests,
+                "short owned input counts direct/cold/warm requests once but invents no unreached ADD or mode; recovery uses valid module");
+        }
+    }
 }
 }
 int main(int argc, char** argv) {
@@ -334,6 +417,7 @@ int main(int argc, char** argv) {
     check(invalid_direct.empty() && !invalid_cached && invalid_log.empty() &&
         count(perf::Counter::FragmentArithmeticRequests)==invalid_before+2,
         "both public noncanonical-mode refusals count requests once without inventing arithmetic sites");
+    owned_requests();
     // Exercise the real observer's bounded installed inventory, then an already-known key. Counts
     // remain request counts at saturation; this is not a claim of 1024 distinct shader contents.
     const auto overflow_before=count(perf::Counter::FragmentArithmeticInventoryOverflowRequests);

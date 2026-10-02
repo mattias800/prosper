@@ -1184,7 +1184,30 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (const auto& diagnostic : c.failure_diagnostics)
         if (!write_float_mode(diagnostic.ps_float_mode,
                               "invalid failed-draw fragment float mode")) return false;
-    // v65: append only. Unknown is tag0, not an inferred capability-off decision. Counts
+    // v65: a refusal obligation only; materialization independently derives required PC/width.
+    w.u32(static_cast<uint32_t>(sample_resource_count));
+    auto write_owned_raw_snapshots = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources) {
+            const auto& resource = captured.resource;
+            const uint32_t bytes = resource.owned_raw_snapshot_bytes;
+            if (bytes && ((bytes != 16u && bytes != 32u) ||
+                          !valid_owned_raw_snapshot_shape(resource, bytes) ||
+                          captured.captured_size < bytes)) {
+                error = "invalid owned wide snapshot obligation";
+                return false;
+            }
+            w.u32(bytes);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_owned_raw_snapshots(draw.vrt) || !write_owned_raw_snapshots(draw.prt)) return false;
+    for (const auto& compute : c.computes)
+        if (!write_owned_raw_snapshots(compute.resources)) return false;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (!write_owned_raw_snapshots(stage.resource_table)) return false;
+    // v66: append only. Unknown is tag0, not an inferred capability-off decision. Counts
     // must match existing bounded records; every preceding capture prefix stays byte-identical.
     const auto write_transport = [&](FloatTransportConfig config) {
         if (!config.canonical()) { error = "invalid float transport config"; return false; }

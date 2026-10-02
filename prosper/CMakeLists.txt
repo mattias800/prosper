@@ -807,10 +807,17 @@ if(TARGET prosper_core)
   # fixture is committed and synthetic — no game dump, no Il2CppDumper — so this never degrades
   # into a silent skip. The binary doubles as the probe the agreement test drives.
   add_executable(test_il2cpp_symbols tests/host/symbols/test_il2cpp_symbols.cpp)
+  target_include_directories(test_il2cpp_symbols PRIVATE tests)
   target_link_libraries(test_il2cpp_symbols PRIVATE prosper_core)
   add_test(NAME il2cpp_symbol_resolution
            COMMAND test_il2cpp_symbols
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/il2cpp_symtab_fixture.symtab")
+  # Each synthetic boot owns fixed guest mappings, so run the wiring controls in fresh processes.
+  foreach(mode valid oversized absent)
+    add_test(NAME il2cpp_symbol_boot_${mode}
+             COMMAND test_il2cpp_symbols --boot-bounds ${mode})
+    set_tests_properties(il2cpp_symbol_boot_${mode} PROPERTIES TIMEOUT 20)
+  endforeach()
   if(Python3_Interpreter_FOUND)
     # ...and the runtime resolver must answer exactly what tools/il2cpp/resolve.py answers. They
     # share the record set by construction (resolve.py emits the table the runtime reads), but the
@@ -2538,6 +2545,20 @@ if(TARGET prosper_core)
   add_executable(test_raw_register_wide_data tests/gpu/recompiler/test_raw_register_wide_data.cpp)
   target_link_libraries(test_raw_register_wide_data PRIVATE prosper_core)
   add_test(NAME raw_register_wide_data COMMAND test_raw_register_wide_data)
+  add_executable(test_graphics_raw_register_wide_data
+    tests/gpu/recompiler/test_graphics_raw_register_wide_data.cpp)
+  target_link_libraries(test_graphics_raw_register_wide_data PRIVATE prosper_core)
+  add_test(NAME graphics_raw_register_wide_data COMMAND test_graphics_raw_register_wide_data)
+  add_executable(test_raw_wide_mask_lifetime
+    tests/gpu/recompiler/test_raw_wide_mask_lifetime.cpp)
+  target_link_libraries(test_raw_wide_mask_lifetime PRIVATE prosper_core)
+  add_test(NAME raw_wide_mask_lifetime COMMAND test_raw_wide_mask_lifetime)
+  add_executable(test_raw_wide_read_point tests/gpu/recompiler/test_raw_wide_read_point.cpp)
+  target_link_libraries(test_raw_wide_read_point PRIVATE prosper_core)
+  add_test(NAME raw_wide_read_point COMMAND test_raw_wide_read_point)
+  add_executable(test_owned_raw_wide_backing tests/gpu/recompiler/test_owned_raw_wide_backing.cpp)
+  target_link_libraries(test_owned_raw_wide_backing PRIVATE prosper_core)
+  add_test(NAME owned_raw_wide_backing COMMAND test_owned_raw_wide_backing)
   add_executable(test_memory_fed_raw_wide tests/gpu/recompiler/test_memory_fed_raw_wide.cpp)
   target_link_libraries(test_memory_fed_raw_wide PRIVATE prosper_core)
   add_test(NAME memory_fed_raw_wide COMMAND test_memory_fed_raw_wide)
@@ -3916,6 +3937,10 @@ endif()
       target_include_directories(test_float32_array_upload PRIVATE frontends src tests)
       target_link_libraries(test_float32_array_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME float32_array_upload COMMAND test_float32_array_upload)
+      add_executable(test_graphics_raw_wide_upload tests/shared/live/test_graphics_raw_wide_upload.cpp)
+      target_include_directories(test_graphics_raw_wide_upload PRIVATE frontends src tests)
+      target_link_libraries(test_graphics_raw_wide_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME graphics_raw_wide_upload COMMAND test_graphics_raw_wide_upload)
       add_executable(test_decoder_source_snapshot tests/shared/live/test_decoder_source_snapshot.cpp)
       target_include_directories(test_decoder_source_snapshot PRIVATE frontends src tests)
       target_link_libraries(test_decoder_source_snapshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)

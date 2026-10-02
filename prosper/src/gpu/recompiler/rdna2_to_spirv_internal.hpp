@@ -2830,6 +2830,7 @@ struct RegState {
     std::unordered_set<uint32_t> smem_raw_immediate_wide_data_loads;
     std::unordered_set<uint32_t> smem_raw_register_wide_data_loads;
     std::unordered_set<uint32_t> smem_raw_offset_scalar_source_pcs;
+    std::unordered_set<uint32_t> smem_raw_owned_wide_data_loads;
     std::unordered_set<uint32_t> smem_raw_nested_wide_data_loads;
     std::unordered_set<uint32_t> smem_raw_wide_data_loads;
     bool smem_pointer_analysis_done = false;
@@ -2875,6 +2876,17 @@ struct RegState {
     // never-written slot rejects (fail-visible).
     std::unordered_map<uint64_t, uint32_t> lds_addtid;
 };
+
+// Cache and live realization derive owned source authority from the original code. A selected
+// stream may drop requirements, but must not invent a new admitted read-point PC. Keep omitted
+// original PCs classified too, so their bindings cannot become another load's legacy fallback.
+inline bool retain_original_owned_raw_wide_proof(
+        RegState& rs, const std::vector<uint32_t>& original_pcs) {
+    for (uint32_t pc : rs.smem_raw_owned_wide_data_loads)
+        if (!std::binary_search(original_pcs.begin(), original_pcs.end(), pc)) return false;
+    rs.smem_raw_owned_wide_data_loads.insert(original_pcs.begin(), original_pcs.end());
+    return true;
+}
 
 inline bool scalar_is_lane_local(const RegState& rs, int sgpr) {
     if (rs.lane_local_scalars.empty()) return false;

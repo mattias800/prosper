@@ -419,6 +419,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
     const auto original_raw_wide_data = rdna2_raw_wide_data_loads(ins);
     const auto original_raw_immediate_wide_data =
         rdna2_proven_raw_immediate_wide_data_loads(ins);
+    const auto original_owned_raw_wide_data = rdna2_owned_raw_wide_data_loads(ins);
     if (pcrel_dispatch_target != UINT32_MAX) {
         const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(code, dwords);
         if (!specialize_pcrel_dispatch(ins, dispatch, pcrel_dispatch_target)) {
@@ -523,6 +524,11 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // only in the CFG dispatcher: a shader emitted straight-line otherwise carries an empty set and
     // its SRT pointer load reaches the constant-buffer path and rejects the whole shader (#3616).
     seed_smem_pointer_provenance(rs, ins);
+    if (!retain_original_owned_raw_wide_proof(rs, original_owned_raw_wide_data)) {
+        log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",
+                                 "specialization lacks original owned raw wide source authority");
+        return {};
+    }
     rs.smem_raw_x2_data_loads.insert(original_raw_x2_data.begin(),
                                      original_raw_x2_data.end());
     rs.smem_raw_wide_data_loads.insert(original_raw_wide_data.begin(),

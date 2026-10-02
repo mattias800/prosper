@@ -60,7 +60,7 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
     for profile, value in (("unknown", 0), ("implicit", 1), ("explicit-nonfinite32", 2)):
         case = root / f"transport-{profile}.prfc"
         wire = case.read_bytes()
-        assert wire[8:12] == (2).to_bytes(4, "little") and wire[-9] == value, "exact schema2 profile tail"
+        assert wire[8:12] == (3).to_bytes(4, "little") and wire[-9] == value, "exact schema3 profile tail"
         source = root / f"transport-{profile}.spv"
         candidate = root / f"transport-{profile}-candidate.spv"
         report = run(replay, "--baseline", str(case), "--output", str(source))
@@ -76,7 +76,17 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
     saved.write_bytes(b"previous-output")
     current = bytearray((root / "transport-unknown.prfc").read_bytes())
     legacy = bytearray(current)
-    del legacy[-9]  # remove the actual append-only tail, not merely relabel the current version
+    del legacy[-9]  # remove transport only, retaining the actual schema2 marker tail
+    legacy[8:12] = (2).to_bytes(4, "little")
+    legacy_case = root / "legacy-schema2.prfc"
+    legacy_case.write_bytes(rechecksum(legacy))
+    report = run(replay, "--inspect-only", str(legacy_case))
+    assert "input=INCOMPLETE" in report and "fragment-transport-config-unavailable" in report and "host_float_transport=unknown" in report
+    for mode in ("--baseline", "--candidate"):
+        assert "INCOMPLETE" in run(replay, mode, str(legacy_case), "--output", str(saved), code=2)
+        assert saved.read_bytes() == b"previous-output"
+    assert legacy[-12:-8] == bytes(4), "resource-free schema2 has exact zero marker count"
+    del legacy[-12:-8]
     legacy[8:12] = (1).to_bytes(4, "little")
     legacy_case = root / "legacy-schema1.prfc"
     legacy_case.write_bytes(rechecksum(legacy))
@@ -87,7 +97,7 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
         assert saved.read_bytes() == b"previous-output"
     malformed_profiles = []
     relabeled = bytearray(current)
-    relabeled[8:12] = (1).to_bytes(4, "little")
+    relabeled[8:12] = (2).to_bytes(4, "little")
     malformed_profiles.append((relabeled, "trailing data"))
     invalid_profile = bytearray(current)
     invalid_profile[-9] = 255

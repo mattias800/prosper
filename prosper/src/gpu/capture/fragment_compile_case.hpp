@@ -49,7 +49,7 @@ struct FragmentCompileCase {
     FragmentInterpolationLayout interpolation{};
     bool wave32 = false;
     FragmentFloatMode float_mode{}; // actual producing key authority; unavailable is never inferred
-    // Schema 2 retains even an explicitly producing Unknown profile. A schema-1 file has no
+    // Schema 3 retains even an explicitly producing Unknown profile. A schema-1/2 file has no
     // such input and is downgraded to INCOMPLETE, never inferred from SOURCE or today's device.
     FloatTransportConfig float_transport{};
     uint32_t pcrel_target = UINT32_MAX;
