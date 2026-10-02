@@ -494,6 +494,9 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   output capture fails, so redirect stdout **and** stderr to a file on the real disk, end with `exit 0`,
   read that file, and `rm -rf` scratch that is a day or more old. Leave `/tmp/claude-*` and anything
   touched in the last few hours alone — other agents are live.
+- **Python:** every new or changed Python tool needs a test that fails without the change, and a new
+  `.py` file needs a purpose docstring; ruff is gated on changed files only (`pyproject.toml`, uv).
+  `prosper/tools/ci/AGENTS.md` § Python rule.
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth
   **only with `--no-tests=error`** — plain `ctest` on a build directory with nothing registered prints
   `No tests were found!!!` and **exits 0**, so "no tests ran" and "everything passed" are the same

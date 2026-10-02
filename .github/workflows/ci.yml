@@ -362,6 +362,44 @@ jobs:
           python3 prosper/tools/ci/check_contribution_shape.py --github \
             --base "origin/${{ github.base_ref }}"
 
+  python-quality:
+    name: Python quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Its own job for the reason contribution-shape is: it builds nothing, and a finding here must
+      # not cost the build-and-test signal. Ruff is a RATCHET on changed files (the tree has ~1,500
+      # pre-existing findings and 209 unformatted files), so nothing is mass-reformatted; see
+      # prosper/tools/ci/check_python_quality.py. fetch-depth: 0 for the merge-base diff.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.12"
+          python-version: "3.13"
+
+      - name: Install the locked dev group
+        run: uv sync --locked --group dev
+
+      # The selftest and pytest run first: they hold hand-built violating inputs, so a gate that
+      # stopped discriminating fails here instead of passing every PR.
+      - name: Verify the checker still discriminates
+        run: uv run --locked --group dev python prosper/tools/ci/check_python_quality.py --selftest
+
+      - name: Test the checker (pytest)
+        run: uv run --locked --group dev pytest
+
+      - name: Ruff on changed Python files
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          uv run --locked --group dev python prosper/tools/ci/check_python_quality.py \
+            --base "origin/${{ github.base_ref }}"
+
   docs:
     name: Docs
     runs-on: ubuntu-latest

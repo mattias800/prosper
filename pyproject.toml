@@ -1,0 +1,37 @@
+# prosper Python tooling (prosper/tools, prosper/tests, prosper/scripts).
+#
+# Managed with uv: `uv sync --group dev` installs pytest, pytest-cov and ruff pinned by uv.lock.
+# ctest still drives the stdlib-unittest/selftest cases through add_test; this file adds nothing
+# those need. Ruff is gated on CHANGED files only (prosper/tools/ci/check_python_quality.py), so the
+# existing tree is not reformatted wholesale.
+
+[project]
+name = "prosper-tools"
+version = "0.1.0"
+description = "Python tooling and self-tests for prosper"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.14",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["third_party"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "D100"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["prosper/tools/ci"]
+addopts = ["-p", "no:cacheprovider"]

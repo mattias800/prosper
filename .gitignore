@@ -66,3 +66,6 @@ prosper/scripts/play/
 
 # Machine-local agent instructions (pointed at by CLAUDE.md) — per-computer, never committed.
 /LOCAL.md
+
+# uv virtualenv
+.venv/

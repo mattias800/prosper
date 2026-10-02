@@ -12,6 +12,10 @@ usage, whether a PR is safe to merge.
 ## What lives here
 
 - **`check_contribution_shape.py`** — the contribution-shape CI job.
+- **`check_python_quality.py`** — the `python-quality` CI job: a ratchet over the Python a PR
+  *changes*. Added files must be ruff-clean, ruff-format-clean and carry a module docstring; modified
+  files may not gain ruff findings; an added tool under `prosper/tools/` needs a test in the same PR.
+  Config lives in the root `pyproject.toml` (uv, `uv.lock`); see the Python rule below.
 - **`check_ctest_gate.py`** — finds callers that run `ctest` without `--no-tests=error`. Plain
   `ctest` exits 0 when it finds no tests, so "nothing ran" and "everything passed" share a status.
 - **`check_usage_text.py`** — finds tools whose usage block stopped being a docstring, so
@@ -22,6 +26,18 @@ usage, whether a PR is safe to merge.
   `gh pr edit --body-file` has been seen returning rc=1 on a GraphQL projects-deprecation error
   *without applying the edit* (#2918), so `set` writes over REST and then re-reads the live body;
   the verdict is always the read-back, never the write's exit code.
+
+## Python rule (applies to every Python file in the repository)
+
+Every new or changed Python tool gets a test that **fails without the change** — a pytest function or
+a stdlib `unittest`/`--selftest` case, registered in ctest when it is a host-side tool — and every new
+`.py` file opens with a docstring stating its purpose (ruff `D100`, enforced on added files).
+
+Measured baseline, 2026-10-02: 211 tracked `.py` files, 1,520 ruff findings under the config in
+`pyproject.toml`, 209 files that `ruff format` would rewrite. That is why the gate is a ratchet and
+not a sweep: **do not mass-reformat**, and do not reformat a file you only touch for a fix. Lowering
+a file's findings is welcome; raising them fails CI. Set up with `uv sync --group dev`, run with
+`uv run --group dev pytest` and `uv run --group dev ruff check <file>`.
 
 ## The property they share, and why it dictates how they are tested
 
