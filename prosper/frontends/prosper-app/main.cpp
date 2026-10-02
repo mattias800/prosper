@@ -1304,8 +1304,8 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
         g_guest_end_detail = result.detail;
         g_guest_end_kind.store(result.kind, std::memory_order_release);
         fprintf(stderr,
-                "[app] GUEST ENTRY THREAD ENDED (kind=%d): no further guest frames will be "
-                "produced; the window stays idle. Set PROSPER_EXIT_ON_GUEST_END=1 to quit instead.\n",
+                "[app] GUEST ENTRY THREAD ENDED (kind=%d): guest workers may still be running. "
+                "Set PROSPER_EXIT_ON_GUEST_END=1 to quit instead.\n",
                 result.kind);
     });   // runs the guest frame loop
     fprintf(stderr, "[app] guest booted; presenting its frames.\n");

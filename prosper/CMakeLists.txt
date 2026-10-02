@@ -1396,6 +1396,7 @@ if(TARGET prosper_core)
   target_link_libraries(test_guest_thread_handle PRIVATE prosper_core)
   target_include_directories(test_guest_thread_handle PRIVATE src)
   add_test(NAME guest_thread_handle COMMAND test_guest_thread_handle)
+  set_tests_properties(guest_thread_handle PROPERTIES TIMEOUT 60)
 
   add_executable(test_cond_clock tests/hle/test_cond_clock.cpp)
   target_link_libraries(test_cond_clock PRIVATE prosper_core)
