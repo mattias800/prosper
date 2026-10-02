@@ -601,6 +601,28 @@ void percentiles_see_the_tail_the_median_hides() {
     CHECK(line.find("--") == std::string::npos, "nothing is dashed when every tail resolved");
 }
 
+// The rank boundary, which the 2% mixture above cannot see: with EXACTLY 1% hitches (990 fast, 10 at
+// 50 ms) nearest rank puts the 990th of 1000 sorted intervals -- the last fast one -- at p99. A
+// definition that takes the next sample instead (seen > rank) would report the hitch, so this arm is
+// what pins "nearest rank" as documented rather than as an accident of the test data.
+void p99_at_exactly_one_percent_is_nearest_rank() {
+    FrameRateCounter counter;
+    double t = 0;
+    uint8_t v = 0;
+    counter.observe(signature_of(frame(v++)), t);
+    for (int i = 0; i < 1000; i++) {
+        t += (i % 100 == 99) ? 1.0 / 20.0 : 1.0 / 60.0;
+        counter.observe(signature_of(frame(v++)), t);
+    }
+    const FrameRate rate = frame_rate_since_first_publication(snapshot_of(counter, t));
+    const double tol = kIntervalRelativeError;
+    CHECK(rate.p99_measured &&
+              std::fabs(rate.interval_p99_seconds - 1.0 / 60.0) <= tol / 60.0 + 1e-9,
+          "exactly 1% hitches: nearest-rank p99 is still the fast interval");
+    CHECK(std::fabs(rate.low_1pct_fps - 60.0) <= tol * 60.0 + 1e-9,
+          "...so the 1% low reads the fast rate; a slowest-1% mean would read 20 fps");
+}
+
 // A tail with no sample beyond its rank is just the maximum under a percentile's name. The
 // threshold is n * (1 - q) >= 1, so p90 needs 10 intervals, p95 needs 20 and p99 needs 100.
 void a_short_run_does_not_invent_a_tail() {
@@ -676,6 +698,7 @@ int main() {
     std::printf("== a title that pauses (the arm) ==\n"); a_title_that_pauses_reports_its_producing_rate();
     std::printf("== estimator accuracy ==\n");           interval_estimator_is_accurate();
     std::printf("== percentiles: the hidden tail ==\n"); percentiles_see_the_tail_the_median_hides();
+    std::printf("== percentiles: exact 1%% boundary ==\n"); p99_at_exactly_one_percent_is_nearest_rank();
     std::printf("== percentiles: short runs ==\n");     a_short_run_does_not_invent_a_tail();
     std::printf("== percentiles: unmeasured ==\n");     unmeasured_populations_report_no_percentiles();
     std::printf("== window arithmetic ==\n");            window_math();
