@@ -1062,12 +1062,15 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
     }
     for (size_t i = 0; i < replay.failure_diagnostics.size(); ++i) {
         const auto& failure = replay.failure_diagnostics[i];
-        std::printf("failure[%zu] %s source=%llu order=%llu reason=%s stages=%zu\n", i,
+        std::printf("failure[%zu] %s source=%llu order=%llu reason=%s stages=%zu "
+                    "float-transport=%s source=%s\n", i,
                     operation_kind_name(failure.kind),
                     static_cast<unsigned long long>(failure.source_index),
                     static_cast<unsigned long long>(failure.command_order),
                     prosper::gpu::realization_failure_reason_name(failure.reason),
-                    failure.stages.size());
+                    failure.stages.size(),
+                    prosper::gpu::float_transport_profile_name(failure.float_transport),
+                    failure.float_transport.available() ? "captured" : "legacy-unknown");
         if (failure.kind == prosper::gpu::SubmitOperationKind::Draw) {
             std::printf("  target=%016llx extent=%ux%u vertices=%u instances=",
                         static_cast<unsigned long long>(failure.color0_base),
@@ -1159,8 +1162,10 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                         stage.resource_table_present ? "present" : "absent",
                         stage.resource_count, stage.descriptor_issue_count);
             if (stage.stage == prosper::gpu::ShaderProgramStage::Compute)
-                std::printf(" config=%s",
-                            stage.recompile_config_available ? "present" : "absent");
+                std::printf(" config=%s float-transport=%s source=%s",
+                            stage.recompile_config_available ? "present" : "absent",
+                            prosper::gpu::float_transport_profile_name(stage.recompile_config.float_transport),
+                            stage.recompile_config.float_transport.available() ? "captured" : "legacy-unknown");
             if (stage.first_descriptor_issue != 0xFFFFFFFFu)
                 std::printf(" first-descriptor=%s", prosper::gpu::descriptor_issue_name(
                     static_cast<prosper::gpu::DescriptorIssueCode>(stage.first_descriptor_issue)));
@@ -3196,6 +3201,8 @@ int main(int argc, char** argv) {
         const prosper::gpu::SharedVulkanContext replay_device =
             prosper::gpu::shared_vulkan_context();
         for (auto& compute : replay.computes) {
+            report_float_transport("recompile-raw", compute.recompile_config.float_transport,
+                                   "dispatch", compute.dispatch_index);
             if (!prosper::tools::recompile_captured_compute(
                     compute, replay.raw_shader_versions,
                     replay_device.valid() ? &replay_device : nullptr,
@@ -3262,7 +3269,7 @@ int main(int argc, char** argv) {
                 if (interpolation.valid && interpolation.requires_geometry &&
                     it.ps.topology >= 3u && it.ps.topology <= 5u) {
                     rebuilt_geometry = prosper::gpu::recompile_interpolation_geometry(
-                        interpolation, true);
+                        interpolation, true, false, it.float_transport);
                 }
             }
             const bool has_raw_vertex =
@@ -3674,6 +3681,8 @@ int main(int argc, char** argv) {
             return 2;
         }
         const auto& failure = replay.failure_diagnostics[static_cast<size_t>(failure_index)];
+        report_float_transport("retry-failed-chain", failure.float_transport,
+                               "failure", static_cast<uint64_t>(failure_index));
         if (failure.stages.size() < 2 ||
             failure.stages[0].stage != prosper::gpu::ShaderProgramStage::Vertex ||
             failure.stages[1].stage != prosper::gpu::ShaderProgramStage::Vertex) {

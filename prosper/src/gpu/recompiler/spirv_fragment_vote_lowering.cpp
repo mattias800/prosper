@@ -327,6 +327,10 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
             transport_capability = true;
         if (in.op == 10 && instruction_string(source, in, 1) == "SPV_KHR_float_controls2")
             transport_extension = true;
+        if ((in.op == 16 || in.op == 331) && in.count >= 3 && source[at + 2] == 6028) {
+            result.refusal = FragmentVoteRefusal::UnsupportedWaveOperation;
+            return result; // this contract supports only exact per-instruction transport None
+        }
         if (in.op == 71 && in.count >= 3 && source[at + 2] == 40) {
             if (in.count != 4 || source[at + 3] != 0 ||
                 !explicit_transport.insert(source[at + 1]).second) {
@@ -337,7 +341,7 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
         if (in.op == 71 && in.count == 3 && source[at + 2] == 42)
             no_contraction.insert(source[at + 1]);
         if ((in.in_function && !no_result(in.op) && in.op != 248 && in.count >= 3) ||
-            ((in.op >= 41 && in.op <= 52) && in.count >= 3))
+            ((in.op == 1 || (in.op >= 41 && in.op <= 52)) && in.count >= 3))
             value_types.emplace(source[at + 2], source[at + 1]);
         if (in.op == 59 && in.count >= 4) pointer_classes.emplace(source[at + 2], source[at + 3]);
         if (in.op == 32 && in.count == 4 && source[at + 2] == 12)

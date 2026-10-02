@@ -2458,6 +2458,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_fragment_float_mode PRIVATE prosper_core)
   target_include_directories(test_fragment_float_mode PRIVATE tests)
   add_test(NAME fragment_float_mode COMMAND test_fragment_float_mode)
+
+  add_executable(test_fragment_float_transport tests/gpu/recompiler/test_fragment_float_transport.cpp)
+  target_link_libraries(test_fragment_float_transport PRIVATE prosper_core)
+  add_test(NAME fragment_float_transport COMMAND test_fragment_float_transport)
   add_executable(test_fragment_arithmetic_diagnostics tests/gpu/recompiler/test_fragment_arithmetic_diagnostics.cpp)
   target_link_libraries(test_fragment_arithmetic_diagnostics PRIVATE prosper_core)
   target_include_directories(test_fragment_arithmetic_diagnostics PRIVATE tests)
@@ -4600,6 +4604,7 @@ endif()
       target_link_libraries(test_interp_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME interp_render COMMAND test_interp_render)
 
+
       # RectList fourth-corner synthesis: the geometry stage must complete the rectangle whichever of
       # the three supplied vertices is the shared corner (#3507).
       add_executable(test_rect_synthesis_render tests/gpu/recompiler/test_rect_synthesis_render.cpp)
@@ -5492,6 +5497,12 @@ endif()
 # physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
 # silent pass) where one does not.
 if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  add_executable(test_float_transport_render tests/gpu/execute/test_float_transport_render.cpp)
+  target_include_directories(test_float_transport_render PRIVATE tests frontends)
+  target_link_libraries(test_float_transport_render PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME float_transport_render COMMAND test_float_transport_render)
+  set_tests_properties(float_transport_render PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
   add_executable(test_image_robustness tests/shared/device/test_image_robustness.cpp)
   # Spells `shared/...` and `gpu/...` includes, which resolve from `frontends` and `src`.
   target_include_directories(test_image_robustness PRIVATE frontends src)

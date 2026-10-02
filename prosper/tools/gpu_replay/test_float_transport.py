@@ -114,6 +114,21 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
                 valid=subprocess.run([VAL,"--target-env","vulkan1.3",str(output)],capture_output=True,text=True,timeout=30)
                 check(valid.returncode==0,label+" strict source valid")
                 if valid.returncode: print(valid.stdout+valid.stderr)
+                if state=="explicit-nonfinite32" and route=="recompile-raw":
+                    # Actual None instructions without their capability are illegal even when
+                    # a driver happens to honor them. Pixels cannot prove device enablement.
+                    words=list(struct.unpack("<%dI" % (output.stat().st_size//4),output.read_bytes()))
+                    at=5; removed=False
+                    while at<len(words):
+                        count,op=words[at]>>16,words[at]&65535
+                        if op==17 and count==2 and words[at+1]==6029:
+                            del words[at:at+count];removed=True;break
+                        at+=count
+                    negative=directory/"none-without-capability.spv"
+                    negative.write_bytes(struct.pack("<%dI" % len(words),*words))
+                    invalid=subprocess.run([VAL,"--target-env","vulkan1.3",str(negative)],capture_output=True,text=True,timeout=30)
+                    check(removed and invalid.returncode!=0 and "FloatControls2" in invalid.stdout+invalid.stderr,
+                          "hand-constructed missing-capability control is rejected by actual strict validator")
             modules+=1
         if state!="legacy":
             stored=directory/(state+"-stored.spv")
