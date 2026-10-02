@@ -1613,19 +1613,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Boot the game (unless test-pattern): the shared start_guest() path registers the live renderer
-    // so the guest's GPU submits composite to frames on the present layer, boots through
-    // boot_program, and runs the guest on its own thread while this thread owns the window +
-    // present. Reaching the frame loop needs PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct
-    // in the environment (same as boot_trace).
-    //
-    // This is the argv path and it keeps its original position: the guest is up before the window
-    // exists. A title opened later (drop / picker, #1469) boots from inside the event loop instead,
-    // through this same start_guest().
-    if (!testPattern && !dump.empty()) {
-        std::string err;
-        if (!start_guest(dump, &err)) { fprintf(stderr, "[app] boot failed: %s\n", err.c_str()); return 1; }
-    } else if (!testPattern) {
+    if (!testPattern && dump.empty()) {
         // The library view that will draw these is #1471 stage 2; for now report what was found so a
         // misconfigured games_dir is visible without waiting for the UI.
         if (!gamesDir.empty()) {
@@ -1649,12 +1637,36 @@ int main(int argc, char** argv) {
         return 1;
     }
 #endif
-    // Title: "prosper - <game name>" for a booted game, else a label saying what the empty window
+    // Title: "prosper - <game name>" for a selected game, else a label saying what the empty window
     // is waiting for. A title opened later replaces this (#1469).
     std::string title = window_title_for(dump, testPattern);
     fprintf(stderr, "[app] window title: \"%s\"\n", title.c_str());
     SDL_Window* win = SDL_CreateWindow(title.c_str(), (int)winW, (int)winH, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!win) { fprintf(stderr, "[app] SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
+
+    // Finish native window creation before registering the renderer, running guest module
+    // initializers or starting guest threads. Drop/picker boots already have an app window.
+    // Keep argv boot before device adoption so presentation reuses the renderer's device.
+    if (!testPattern && !dump.empty()) {
+        std::string err;
+        if (!start_guest(dump, &err)) {
+            fprintf(stderr, "[app] boot failed: %s\n", err.c_str());
+            // A failed boot may already have installed SDL-dependent host backends.
+            // Release them before SDL_Quit; no guest thread has been started on this path.
+#ifdef PROSPER_AUDIO_SDL3
+            shutdown_sdl3_audio_sink();
+#endif
+#ifdef PROSPER_PAD_SDL3
+            shutdown_sdl3_pad_backend();
+#endif
+#ifdef PROSPER_HAVE_DIALOG_SDL3
+            shutdown_sdl3_platform_ui();
+#endif
+            SDL_DestroyWindow(win);
+            SDL_Quit();
+            return 1;
+        }
+    }
 
     Vk vk;
     // Present unification (#1270): prefer the renderer's shared device for real game boots so we can
