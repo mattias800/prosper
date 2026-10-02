@@ -99,7 +99,9 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
             if done.returncode or not output.is_file():
                 print(done.stdout+done.stderr); continue
             expected="unknown" if state=="legacy" else state
-            check("float-transport="+expected+" source=" in done.stderr,label+" exact producing profile visible")
+            provenance="legacy-unknown" if state=="legacy" else "captured"
+            check("float-transport="+expected+" source="+provenance in done.stderr,
+                  label+" exact producing profile/provenance visible; retained Unknown is not absent legacy")
             try:
                 cap,szi,extension,decorations,eligible,default=facts(output.read_bytes())
                 check(bool(eligible) and not default,label+" live transport slice exists without FPDefault")

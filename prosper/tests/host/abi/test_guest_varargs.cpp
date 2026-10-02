@@ -20,6 +20,7 @@
 // What NONE of this checks is a live guest calling printf on a Windows host. Nothing here pretends to.
 #include "host/abi/guest_varargs.hpp"
 #include "host/abi/sysv_ms_bridge.hpp"
+#include "guest_varargs_fixture.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 
@@ -57,7 +58,7 @@ using namespace prosper::abi;
 #endif
 #endif
 
-namespace {
+namespace prosper_varargs_fixture {
 // PROSPER_GUEST_ABI's whole value is that it is part of the FUNCTION TYPE: that is what makes
 // `Hle::register_guest_abi` reject an untagged handler at compile time on Windows, and what makes
 // the tag a no-op everywhere else. Both halves are checked by the compiler, here, rather than
@@ -376,29 +377,6 @@ void capture_and_pack(const char* fmt, const SysvVaList& ap) {
     snprintf(g_fallback_format, sizeof g_fallback_format, "%s", call.format());
 }
 
-// The guest side: an ordinary C variadic call, placed by System V. What it captures is exactly what
-// h_printf captures.
-TEST_GUEST_ABI void guest_call(const char* fmt, ...) {
-    TEST_GUEST_VA_LIST ap;
-    TEST_GUEST_VA_START(ap, fmt);
-    SysvVaList captured;
-    memcpy(&captured, &ap, sizeof captured);
-    TEST_GUEST_VA_END(ap);
-    capture_and_pack(fmt, captured);
-}
-
-// The same frame, read by the COMPILER's own System V va_arg instead of by sysv_va_arg — the
-// independently produced positive instance that stops arm (1) being checked against itself.
-TEST_GUEST_ABI void guest_call_reference(const char* fmt, ...) {
-    TEST_GUEST_VA_LIST ap;
-    TEST_GUEST_VA_START(ap, fmt);
-    for (unsigned i = 0; i < g_ref_n; ++i) {
-        if (g_cls[i] == VarargClass::Sse) g_ref_d[i] = __builtin_va_arg(ap, double);
-        else                              g_ref_u[i] = __builtin_va_arg(ap, uint64_t);
-    }
-    TEST_GUEST_VA_END(ap);
-}
-
 // Consume a packed Microsoft va_list image with the COMPILER's own Microsoft va_arg. This is what
 // makes the layout claim — "a Microsoft va_list is a flat array of 8-byte slots" — checkable without
 // a Windows host: were it wrong, GCC's own reader would disagree with this file's writer.
@@ -666,9 +644,10 @@ void check_executed() {
 }
 #endif  // PROSPER_TEST_X86_64
 
-} // namespace
+} // namespace prosper_varargs_fixture
 
 int main() {
+    using namespace prosper_varargs_fixture;
     check_plans();
     check_stub_and_registry();
     check_lookup_accessors();

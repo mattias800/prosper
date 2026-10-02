@@ -334,6 +334,11 @@ TripBoundOperation::TripBoundOperation() {
     owns_ = true;
 }
 
+TripBoundOperation::TripBoundOperation(const ComputeTripBoundSettings& retained)
+    : settings_(retained), previous_(trip_bound_pin()), owns_(true) {
+    trip_bound_pin() = &settings_;
+}
+
 TripBoundOperation::~TripBoundOperation() {
     if (owns_) trip_bound_pin() = previous_;
 }

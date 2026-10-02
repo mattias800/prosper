@@ -21,7 +21,12 @@ void SpirvCompute::declare_float_controls(uint32_t entry) {
         if (float_controls_declared) return;
         // The explicit profile is an independently retained device witness. Do not let a later
         // ambient publisher change this module's producing profile or its bit-preserving ops.
-        if (!float_transport.explicit_nonfinite32() && !signed_zero_inf_nan_preserve_declared()) return;
+        // Only a nonexplicit attempt consumes the legacy semantic read. Explicit attempts must
+        // not fabricate a transcript event for an ambient value they never used.
+        if (!float_transport.explicit_nonfinite32() &&
+            !compiler_choice(CompilerChoice::FloatControls, [] {
+                return signed_zero_inf_nan_preserve_declared();
+            })) return;
         float_controls_declared = true;
         if (float_transport.explicit_nonfinite32() && !float_transport_declared) {
             // Even a generated stage with no eligible transport forces SZI32 from this profile.

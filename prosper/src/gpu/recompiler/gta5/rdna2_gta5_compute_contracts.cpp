@@ -1,4 +1,5 @@
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
+#include "gpu/recompiler/compiler_resource_access.hpp"
 #include <mutex>
 #include <tuple>
 #include <map>
@@ -271,10 +272,12 @@ bool raw_dword_packet(const Rdna2Inst& in, uint32_t opcode, uint32_t vdata,
 }
 
 bool witness_is_zero(const ShaderResource& marker) {
-    const uint8_t* bytes = marker.host_data;
-    if (bytes) {
+    const uint8_t* bytes = nullptr;
+    if (compiler_resource_has_host_data(marker)) {
         if (marker.host_data_size < kGtaNullableOutputWitnessBytes) return false;
+        bytes = compiler_resource_data(marker, kGtaNullableOutputWitnessBytes);
     } else {
+        compiler_resource_forbid_guest_read();
         if (!guest_readable(marker.gpu_addr, kGtaNullableOutputWitnessBytes)) return false;
         bytes = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(marker.gpu_addr));
     }
@@ -284,8 +287,8 @@ bool witness_is_zero(const ShaderResource& marker) {
 }
 
 const uint8_t* complete_resource_bytes(const ShaderResource& resource, uint32_t bytes) {
-    if (resource.host_data)
-        return resource.host_data_size >= bytes ? resource.host_data : nullptr;
+    if (compiler_resource_has_host_data(resource)) return compiler_resource_data(resource, bytes);
+    compiler_resource_forbid_guest_read();
     if (!resource.gpu_addr || !guest_readable(resource.gpu_addr, bytes)) return nullptr;
     return reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(resource.gpu_addr));
 }

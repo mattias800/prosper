@@ -179,6 +179,8 @@ uint64_t trip_bound_parses();
 class TripBoundOperation {
 public:
     TripBoundOperation();
+    // Offline compilation restores the producing pin without parsing or inheriting host settings.
+    explicit TripBoundOperation(const ComputeTripBoundSettings& retained);
     ~TripBoundOperation();
     TripBoundOperation(const TripBoundOperation&) = delete;
     TripBoundOperation& operator=(const TripBoundOperation&) = delete;
