@@ -66,13 +66,26 @@ constexpr uint32_t kBreadcrumbRingSites = 4096;
 constexpr uint32_t breadcrumb_before_value(uint32_t id) { return id; }
 constexpr uint32_t breadcrumb_after_value(uint32_t id) { return id | kBreadcrumbAfterBit; }
 
+// Ids are 1..kBreadcrumbMaxId and wrap from the maximum back to 1, so they form a RING of
+// kBreadcrumbMaxId values and ORDER is meaningful only modulo that ring. Comparing two ids with `>` is
+// wrong the moment the counter has wrapped: the newest id is then the SMALLEST. The in-flight window is
+// always far smaller than half the ring, so "b is at or after a" means distance(a, b) <= half.
+constexpr uint32_t kBreadcrumbIdHalfRing = kBreadcrumbMaxId / 2;
+constexpr uint32_t breadcrumb_id_next(uint32_t id) { return id >= kBreadcrumbMaxId ? 1u : id + 1u; }
+// Steps forward from `from` to `to` around the ring, in [0, kBreadcrumbMaxId).
+constexpr uint32_t breadcrumb_id_distance(uint32_t from, uint32_t to) {
+    return to >= from ? to - from : to + kBreadcrumbMaxId - from;
+}
+
 // Thread-safe, bounded, and cheap enough to sit on the draw-recording path when ARMED. Not armed by
 // default: nothing calls begin_site unless the switch is on.
 class BreadcrumbTable {
 public:
+    // `first_id` exists so a test can start the counter near the wrap; production uses the default.
+    explicit BreadcrumbTable(uint32_t first_id = 1) : next_id_(first_id), first_id_(first_id) {}
     // Assigns the next id to `site` (its `id` field is ignored), stores it, and returns the id. Ids
-    // start at 1 and never carry the after bit; after 2^31 - 1 sites the counter wraps to 1, which a
-    // lookup tells apart from the older site only by the ring still holding the right one.
+    // start at 1 and never carry the after bit; after 2^31 - 1 sites the counter wraps to 1. Compare
+    // ids only with breadcrumb_id_distance, never with `<` or `>`.
     uint32_t begin_site(BreadcrumbSite site);
     // True and fills `out` when the ring still holds the site with this exact id.
     bool lookup(uint32_t id, BreadcrumbSite& out) const;
@@ -83,6 +96,7 @@ private:
     mutable std::mutex mutex_;
     std::array<BreadcrumbSite, kBreadcrumbRingSites> ring_{};
     uint32_t next_id_ = 1;
+    uint32_t first_id_ = 1;
     uint64_t recorded_ = 0;
 };
 
@@ -96,7 +110,8 @@ struct BreadcrumbVerdict {
     State state = State::nothing_recorded;
     uint32_t last_started_id = 0;    // 0 = none
     uint32_t last_finished_id = 0;   // 0 = none
-    // Number of sites in the in-flight window, last_started - last_finished. 1 means one suspect.
+    // Number of sites in the in-flight window: the ring distance from last_finished to last_started.
+    // 1 means one suspect.
     uint32_t window_sites = 0;
     bool first_unfinished_known = false;   // the table still holds the window's first site
     bool last_started_known = false;       // ... and its last
