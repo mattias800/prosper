@@ -26,6 +26,8 @@
   "prosper/src/diagnostics/persistent_target_census.hpp": "20726897c62170218ed5bd5a41bdb06a23e922ef2a5f970be0b8ccd70e9c14b7",
   "prosper/src/diagnostics/readback_reason_census.cpp": "28525952358ef34896088eb6f15971f2f38d3bafac54e1e3d5427182ba5f7f27",
   "prosper/src/diagnostics/readback_reason_census.hpp": "16b89cf59502b11de51c3ad0e578a56bd7ca244ced3654d68032dcbe7de15d61",
+  "prosper/src/diagnostics/readback_refusal.cpp": "338521e65bf9267031747e522907ae67afb337ae1aca60c1d9a6aa8e7eddfd37",
+  "prosper/src/diagnostics/readback_refusal.hpp": "9fc8f09abc940b92ce388e0eef5e09df9afe0ebe31552cfa095c2608dcc3629a",
   "prosper/src/diagnostics/storage/json_writer.cpp": "096feaf6e7d34500dfdf3a648f5afc47ace0274f3cf377ff1128f5a10c2250ff",
   "prosper/src/diagnostics/storage/json_writer.hpp": "522db069497dd2fab3aa3860df13b66dacc0cf733e6ee78e834b72afce68e02d",
   "prosper/src/diagnostics/transfer_pressure.cpp": "29b09ae282b77dd44886933cc7b673b3c6dede5f7b01b41aa128327f1de846ae",
