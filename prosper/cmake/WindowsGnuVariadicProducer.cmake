@@ -23,7 +23,7 @@ function(prosper_add_gnu_variadic_producer target source name)
   # Build-local argv, not a shell command: each nonempty line is one actual argument.
   # The compile-case identity scanner can audit the secondary compiler and its headers.
   # This manifest is never exported. Newline-bearing flag/path syntax is unsupported.
-  foreach(_argument IN ITEMS "${_gcc}" "${source}" "${PROSPER_NATIVE_MINGW_ROOT}" IN LISTS _flags)
+  foreach(_argument IN ITEMS "${_gcc}" "${source}" "${PROSPER_NATIVE_MINGW_ROOT}" ${_flags})
     if(_argument MATCHES "[\r\n]")
       message(FATAL_ERROR "SysV variadic producer arguments cannot contain newlines")
     endif()

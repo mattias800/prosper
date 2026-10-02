@@ -140,6 +140,14 @@ solved fence investigation when diagnosing a later Windows failure.
 
 ### Native Clang TLS profile (#4078)
 
+Clang cannot capture SysV variadics on a Windows target. This profile therefore uses the existing
+same-sysroot GCC **only** for the three trivial guest capture frames and the two independent test
+compiler readers. Formatting, capture/checkpoints, assertions and nontrivial TLS remain on Clang.
+The producers have no TLS, global initialization, destructor ownership or SEH cleanup. Their actual
+arguments/header dependencies are retained locally for build-identity auditing; they are not exported
+into diagnostic cases. The registered ABI tests execute all three real printf-family stubs with both
+integer and floating-point stack overflow. This is not a new assembly/va_list implementation.
+
 WinLibs GCC16.1 POSIX UCRT has a reproduced C++ TLS lifetime defect: its emulated TLS allocation
 is freed from winpthreads cleanup before the C++ destructor runs. This can crash concurrent warm
 shader-key lookups with diagnostic exports armed. Shared linkage does not correct the measured
