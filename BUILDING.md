@@ -95,6 +95,19 @@ The same cache works on Linux and macOS: CMake reads `CMAKE_C_COMPILER_LAUNCHER`
 `CMAKE_CXX_COMPILER_LAUNCHER` from the environment (or pass them as `-D` options) when it first
 configures a build directory.
 
+**`SDL_CreateWindow: Installed Vulkan doesn't implement the VK_KHR_surface extension`** (or
+`no Vulkan device`) usually means the GPU driver files are installed but its Vulkan ICD is not
+registered in the registry, so the loader sees zero drivers; `vulkaninfo` prints `Found no drivers!`.
+`prosper-app` now prints this diagnosis and exits non-zero. Workaround: point the loader at the
+driver's JSON manifest. The file name and location vary by vendor; look under
+`C:\Windows\System32\DriverStore\FileRepository\` for the driver package's Vulkan `.json`:
+
+```powershell
+$env:VK_DRIVER_FILES = "C:\Windows\System32\DriverStore\FileRepository\<driver package>\<manifest>.json"
+```
+
+The durable fix is reinstalling the GPU driver (clean install) so it re-registers.
+
 The full native build, screenshot and diagnostic recipe is in
 [`WINDOWS_PORT_HANDOFF.md`](prosper/docs/WINDOWS_PORT_HANDOFF.md).
 
