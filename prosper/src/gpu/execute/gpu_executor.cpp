@@ -3111,6 +3111,8 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
     if (use_it == by_pc.end()) return false;
     const size_t use = use_it->second;
     std::vector<std::array<size_t, 2>> edges(full.size());
+    // Loops that re-enter the consumer: {first instruction index, branch instruction index}.
+    std::vector<std::array<size_t, 2>> backedges;
     constexpr size_t no_edge = SIZE_MAX;
     for (size_t i = 0; i < full.size(); ++i) {
         edges[i] = {no_edge, no_edge};
@@ -3126,8 +3128,10 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
             const auto branch = by_pc.find(static_cast<uint32_t>(target));
             if (branch == by_pc.end()) return false;
             // A later iteration may reach this same image instruction with different scalar
-            // values or descriptor backing. The linear fold publishes one binding per use PC.
-            if (i > use && branch->second <= use) return false;
+            // values or descriptor backing. The linear fold publishes one binding per use PC, so
+            // such a loop is admitted only if its whole body provably preserves the descriptor
+            // (checked below once the descriptor's registers are known).
+            if (i > use && branch->second <= use) backedges.push_back({branch->second, i});
             edges[i][0] = branch->second;
             if (sopp_is_unconditional_branch(in)) continue;
             if (i + 1 >= full.size()) return false;
@@ -3194,6 +3198,10 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
              in.opcode != 0x27u) ||
             (in.fmt == Rdna2Format::SMEM && in.opcode >= 0x10u)) return false;
     }
+    // Registers whose value the consumer's descriptor depends on: the T# words themselves, and (per
+    // lane, below) the registers it was copied from and the pointer it was loaded through.
+    std::vector<int> preserved;
+    for (int lane = 0; lane < 8; ++lane) preserved.push_back(tbase + lane);
     for (int lane = 0; lane < 8; ++lane) {
         const auto found = by_pc.find(source_pc[static_cast<size_t>(lane)]);
         if (found == by_pc.end() || found->second >= use) return false;
@@ -3224,13 +3232,19 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
             static_cast<int>((addr - first_addr) / sizeof(uint32_t));
         if (original_reg < 0 || original_reg >= 106)
             return false;
+        preserved.push_back(original_reg);
+        preserved.push_back(base_reg);
+        preserved.push_back(base_reg + 1);
         if (reaches_use(producer)) return false; // a path bypasses this load
         bool copied = original_reg == reg;
         for (size_t i = producer + 1; i < use; ++i) {
             const Rdna2Inst& step = full[i];
-            // A copied lane needs one unconditional scalar move. No branch in this local span
-            // may skip or replay it; the earlier producer-dominance check handles entry edges.
-            if (original_reg != reg && sopp_is_branch(step)) return false;
+            // A copied lane needs one unconditional scalar move. No branch between its load and
+            // that move may skip it; once the move has executed, a later branch cannot undo it (a
+            // branch back to before the load is still refused just below, and a write to either
+            // register is still refused by the overwrite checks). The producer-dominance check
+            // above handles entry edges.
+            if (!copied && original_reg != reg && sopp_is_branch(step)) return false;
             if (sopp_is_branch(step) && sopp_branch_target(step) <=
                                             static_cast<int64_t>(load.pc)) return false;
             const bool exact_copy = original_reg != reg && !copied &&
@@ -3243,6 +3257,22 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
             if (exact_copy) copied = true;
         }
         if (!copied) return false;
+    }
+    // A loop that re-enters the consumer runs the same image instruction again, and the linear
+    // fold published one binding for it. That binding stays valid only if nothing in the loop can
+    // change what the consumer reads: no write to a descriptor word, to a register one was copied
+    // from, or to the pointer it was loaded through, and no memory write that could alias the
+    // descriptor's backing (the same set the straight-line prefix is held to).
+    for (const auto& loop : backedges) {
+        for (size_t i = loop[0]; i <= loop[1]; ++i) {
+            const auto& in = full[i];
+            if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF ||
+                in.fmt == Rdna2Format::FLAT ||
+                (in.fmt == Rdna2Format::MIMG && in.opcode != 0x00u && in.opcode != 0x27u) ||
+                (in.fmt == Rdna2Format::SMEM && in.opcode >= 0x10u)) return false;
+            for (const int reg : preserved)
+                if (may_write(in, reg)) return false;
+        }
     }
     return true;
 }
