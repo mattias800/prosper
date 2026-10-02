@@ -3206,7 +3206,11 @@ HLE(agc_driver_submit_multi_dcbs) {
             unsupported_multi_dcb("unreadable command stream", count, i);
         buffers.push_back({(const uint32_t*)(uintptr_t)stream, words});
     }
-    if (buffers.empty()) return 0;   // every segment was empty: nothing to execute
+    // Only the MIXED case is evidenced (an empty segment beside real ones). A batch with no
+    // non-empty segment at all has never been observed, and returning 0 would also skip the submit
+    // count and completion pulse a guest may wait on, so it stays unsupported until a title shows
+    // it. CONFIDENCE: MED.
+    if (buffers.empty()) unsupported_multi_dcb("every segment is empty", count, 0);
     return submit_dcb_buffers(buffers.data(), buffers.size(), "SubmitMultiDcbs", 0, true,
                               /* require_complete_pm4 */ true);
 }
