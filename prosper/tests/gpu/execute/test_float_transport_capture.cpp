@@ -234,7 +234,7 @@ int main(int argc, char** argv) {
         for (const auto& stage:item.stages) tail.push_back(static_cast<uint8_t>(stage.recompile_config.float_transport.profile));
     }
     auto v66_bytes = bytes;
-    v66_bytes.resize(v66_bytes.size() - 8u - 3u*(capture.draws.size()+capture.failure_diagnostics.size()));
+    v66_bytes.resize(v66_bytes.size() - 8u - 8u*(capture.draws.size()+capture.failure_diagnostics.size()));
     set32(v66_bytes,8,66);
     CHECK(deserialize_gpu_capture(v66_bytes,loaded,error) && loaded.format_version==66,
           "genuine v66 profile prefix survives without fabricated launch flags");
@@ -307,6 +307,7 @@ int main(int argc, char** argv) {
             failed.fragment_retry_config_available=true; failed.ps_float_mode=item.ps_float_mode;
             failed.float_transport=item.float_transport;
             failed.ps_float_flags=item.ps_float_flags;
+            failed.ps_launch_rsrc1=item.ps_launch_rsrc1;
             GpuCapturedStageDiagnostic stage; stage.stage=ShaderProgramStage::Fragment;
             stage.program_addr=reinterpret_cast<uint64_t>(fragment);
             stage.raw_shader_index=single.draws[0].fs_raw_shader_index;

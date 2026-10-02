@@ -99,6 +99,8 @@ int main(int argc, char** argv) {
                       realize_draw_item(state,nullptr,3,std::size(vertex),false,warm,nullptr,shared) &&
                       cold.ps_float_flags==expected && warm.ps_float_flags==expected &&
                       cold.ps_float_mode==FragmentFloatMode({true,0xab}) &&
+                      cold.ps_launch_rsrc1==FragmentLaunchRsrc1({true,(0xabu<<12)|bits}) &&
+                      warm.ps_launch_rsrc1==cold.ps_launch_rsrc1 &&
                       warm.fs_words()==cold.fs_words() && cold.fs_words()==direct({true,0xab},wave32),
                   "actual copied/shared cold/warm producer retains all four known flag states");
             for (auto* item : {&cold,&warm}) {
@@ -106,6 +108,32 @@ int main(int argc, char** argv) {
                 realized.push_back(std::move(*item));
             }
         }
+    for (bool shared : {false,true}) {
+        uint64_t identities[2]{};
+        std::vector<uint32_t> unchanged;
+        for (unsigned i=0;i<2;++i) {
+            const uint32_t word=(0xabu<<12)|(1u<<29)|(i ? 1u<<22 : 0u);
+            DrawItem cold,warm;
+            const auto launch=state_for({true,0xab},fragment,false,(1u<<29)|(i ? 1u<<22 : 0u));
+            CHECK(realize_draw_item(launch,nullptr,3,std::size(vertex),false,cold,nullptr,shared) &&
+                  realize_draw_item(launch,nullptr,3,std::size(vertex),false,warm,nullptr,shared) &&
+                  cold.ps_launch_rsrc1==FragmentLaunchRsrc1({true,word}) &&
+                  warm.ps_launch_rsrc1==cold.ps_launch_rsrc1 &&
+                  cold.ps_float_flags==FragmentFloatFlags({true,false,false}) &&
+                  cold.ps_float_mode==FragmentFloatMode({true,0xab}) &&
+                  cold.fs_identity && warm.fs_identity==cold.fs_identity,
+                  "non-IEEE/DX10 raw bits partition copied/shared producing context without policy inference");
+            identities[i]=cold.fs_identity;
+            if (i==0) unchanged=cold.fs_words();
+            CHECK(cold.fs_words()==unchanged && warm.fs_words()==unchanged,
+                  "raw evidence alone changes no live integer-comparison SOURCE words");
+            for (auto* item : {&cold,&warm}) {
+                item->draw_index=realized.size(); item->command_order=realized.size()+1;
+                realized.push_back(std::move(*item));
+            }
+        }
+        CHECK(identities[0]!=identities[1],"unconsumed raw bits cannot borrow a prior producing cache identity");
+    }
     std::set<uint64_t> identities;
     for (unsigned value=0; value<256; ++value) {
         uint64_t id = 0, warm_id = 0;
@@ -147,6 +175,8 @@ int main(int argc, char** argv) {
               per_draw[1].ps_float_mode==FragmentFloatMode({true,16}) &&
               per_draw[0].ps_float_flags==FragmentFloatFlags({true,false,false}) &&
               per_draw[1].ps_float_flags==FragmentFloatFlags({true,true,true}) &&
+              per_draw[0].ps_launch_rsrc1==FragmentLaunchRsrc1({true,0}) &&
+              per_draw[1].ps_launch_rsrc1==FragmentLaunchRsrc1({true,(16u<<12)|(1u<<23)|(1u<<21)}) &&
               per_draw[0].fs_words()==flush && per_draw[1].fs_words()==preserve,
           "per-draw snapshots beat conflicting submit-end mode/flags and warm cache");
     auto util = state_for({true,0xab},utility,true,1u<<23);
@@ -173,6 +203,8 @@ int main(int argc, char** argv) {
                   replay.items[i].ps_float_mode==realized[i].ps_float_mode &&
                   loaded.draws[i].ps_float_flags==realized[i].ps_float_flags &&
                   replay.items[i].ps_float_flags==realized[i].ps_float_flags &&
+                  loaded.draws[i].ps_launch_rsrc1==realized[i].ps_launch_rsrc1 &&
+                  replay.items[i].ps_launch_rsrc1==realized[i].ps_launch_rsrc1 &&
                   replay.items[i].fs_words()==realized[i].fs_words(),
               "mode availability/value and stored source bytes survive collector/codec/replay");
     GpuCaptureBundle bundle;
@@ -185,27 +217,34 @@ int main(int argc, char** argv) {
         CHECK(i<result->draws.size() && result->draws[i].ps_float_mode==realized[i].ps_float_mode &&
                   result->draws[i].ps_float_flags==realized[i].ps_float_flags,
               "bundle paths preserve unknown, explicitly programmed zero and full-byte values");
-    const size_t flags_tail=bytes.size()-8u-3u*capture.draws.size();
+    for (const auto* result : {&full,&manifest}) for (size_t i=0;i<realized.size();++i)
+        CHECK(i<result->draws.size() && result->draws[i].ps_launch_rsrc1==realized[i].ps_launch_rsrc1,
+              "bundle paths preserve unknown, explicitly programmed zero and full-byte values");
+    const size_t flags_tail=bytes.size()-8u-8u*capture.draws.size();
     auto v66_bytes=bytes; v66_bytes.resize(flags_tail); set32(v66_bytes,8,66);
     CHECK(deserialize_gpu_capture(v66_bytes,loaded,error) && loaded.format_version==66,
           "genuine v66 prefix retains MODE/profile without inventing independent flags");
-    for (const auto& draw : loaded.draws) CHECK(draw.ps_float_flags==FragmentFloatFlags{},
+    for (const auto& draw : loaded.draws) CHECK(draw.ps_float_flags==FragmentFloatFlags{} &&
+          draw.ps_launch_rsrc1==FragmentLaunchRsrc1{},
           "known old MODE and source markers do not create known IEEE/DX10 flags");
     CHECK(serialize_gpu_capture(loaded,bytes,error) && deserialize_gpu_capture(bytes,loaded,error),
           "legacy rewrite preserves unknown flags");
-    for (const auto& draw : loaded.draws) CHECK(draw.ps_float_flags==FragmentFloatFlags{},"rewritten flags stay unknown");
+    for (const auto& draw : loaded.draws) CHECK(draw.ps_float_flags==FragmentFloatFlags{} &&
+          draw.ps_launch_rsrc1==FragmentLaunchRsrc1{},"rewritten flags/raw evidence stay unknown");
     CHECK(serialize_gpu_capture(capture,bytes,error),"restore exact producing flag bytes for hostile controls");
     for (size_t field : {flags_tail,bytes.size()-4}) {
         auto corrupt=bytes; set32(corrupt,field,UINT32_MAX);
         CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"hostile v67 counts refuse before second allocations");
     }
-    for (size_t field : {flags_tail+4,flags_tail+5,flags_tail+6}) {
+    for (size_t field : {flags_tail+4,flags_tail+5,flags_tail+6,flags_tail+7}) {
         auto corrupt=bytes; corrupt[field]=2;
         CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="invalid realized-draw fragment float flags",
               "every v67 flag byte rejects nonboolean tags");
     }
     auto bad_flags=bytes; bad_flags[flags_tail+4]=0; bad_flags[flags_tail+5]=1;
     CHECK(!deserialize_gpu_capture(bad_flags,loaded,error),"unavailable nonzero flag payload refuses");
+    bad_flags=bytes; bad_flags[flags_tail+7]=0; set32(bad_flags,flags_tail+8,1);
+    CHECK(!deserialize_gpu_capture(bad_flags,loaded,error),"unavailable nonzero raw word refuses");
     for (size_t end=flags_tail;end<bytes.size();++end) {
         auto corrupt=bytes; corrupt.resize(end);
         CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"every truncated v67 suffix refuses");
@@ -218,7 +257,7 @@ int main(int argc, char** argv) {
           "mode controls require the resource-free combined fixture");
     if (!no_resources || bytes.size() < 32u+6u*capture.draws.size()) return 1;
     auto mode_bytes = bytes;
-    mode_bytes.resize(mode_bytes.size()-8u-3u*capture.draws.size()-12u-capture.draws.size()-4u);
+    mode_bytes.resize(mode_bytes.size()-8u-8u*capture.draws.size()-12u-capture.draws.size()-4u);
     set32(mode_bytes,8,64);
     GpuCaptureFile official64;
     CHECK(deserialize_gpu_capture(mode_bytes,official64,error) && official64.format_version==64 &&
@@ -267,6 +306,9 @@ int main(int argc, char** argv) {
     bad=capture; bad.draws[0].ps_float_flags={false,true,false};
     CHECK(!serialize_gpu_capture(bad,upgraded_bytes,error) && !materialize_gpu_replay(bad,replay,error),
           "writer/direct materializer reject noncanonical untrusted independent flags");
+    bad=capture; bad.draws[0].ps_launch_rsrc1={false,1};
+    CHECK(!serialize_gpu_capture(bad,upgraded_bytes,error) && !materialize_gpu_replay(bad,replay,error),
+          "writer/direct materializer reject unavailable nonzero raw evidence");
     auto bad_draws=realized; bad_draws[0].ps_float_mode={false,16};
     CHECK(!capture_draw_items(bad_draws,metadata,reader,bad,error),"collector rejects noncanonical mode");
     OperationRealizationFailure failure;
@@ -277,22 +319,32 @@ int main(int argc, char** argv) {
               failure.ps_float_mode==FragmentFloatMode({true,0x9b}) &&
               failure.ps_float_flags==FragmentFloatFlags({true,true,false}),
           "actual failed-stage compiler retains known launch mode");
+    CHECK(failure.ps_launch_rsrc1==FragmentLaunchRsrc1({true,(0x9bu<<12)|(1u<<23)}),
+          "actual failed-stage compiler retains known launch mode");
     failure.index=7; failure.command_order=1;
     GpuCaptureFile failed;
     CHECK(capture_submit_items({}, {},{{SubmitOperationKind::Draw,7,1}},metadata,reader,failed,error,{}, {failure}) &&
               serialize_gpu_capture(failed,upgraded_bytes,error) && deserialize_gpu_capture(upgraded_bytes,loaded,error) &&
               loaded.failure_diagnostics.size()==1 && loaded.failure_diagnostics[0].ps_float_mode==failure.ps_float_mode &&
-              loaded.failure_diagnostics[0].ps_float_flags==failure.ps_float_flags,
+              loaded.failure_diagnostics[0].ps_float_flags==failure.ps_float_flags &&
+              loaded.failure_diagnostics[0].ps_launch_rsrc1==failure.ps_launch_rsrc1,
           "actual failure collector/codec retain mode independently of successful draws");
     auto invalid_failure=failed;
     invalid_failure.failure_diagnostics[0].ps_float_flags={false,true,false};
     CHECK(!serialize_gpu_capture(invalid_failure,upgraded_bytes,error),
           "writer rejects noncanonical failed-draw flags");
     invalid_failure=failed;
-    invalid_failure.failure_diagnostics[0].kind=SubmitOperationKind::Compute;
+    invalid_failure.failure_diagnostics[0].ps_launch_rsrc1={};
+    invalid_failure.failure_diagnostics[0].kind=SubmitOperationKind::Dispatch;
     CHECK(!serialize_gpu_capture(invalid_failure,upgraded_bytes,error) &&
               error=="invalid failed-draw fragment float flags",
           "draw flag authority cannot be relabeled as compute failure authority");
+    invalid_failure=failed;
+    invalid_failure.failure_diagnostics[0].ps_float_flags={};
+    invalid_failure.failure_diagnostics[0].kind=SubmitOperationKind::Dispatch;
+    CHECK(!serialize_gpu_capture(invalid_failure,upgraded_bytes,error) &&
+              error=="invalid failed-draw RSRC1_PS evidence",
+          "draw raw evidence cannot be relabeled as compute failure authority");
     if (argc==3 && std::string(argv[1])=="--write-fixture") {
         const std::filesystem::path directory(argv[2]);
         struct Fixture { const char* name; FragmentFloatMode mode; uint32_t flag_bits; };
@@ -302,7 +354,9 @@ int main(int argc, char** argv) {
                                  Fixture{"mode16-i0-d0",{true,16},0},
                                  Fixture{"mode16-i1-d0",{true,16},1u<<23},
                                  Fixture{"mode16-i0-d1",{true,16},1u<<21},
-                                 Fixture{"mode16-i1-d1",{true,16},(1u<<23)|(1u<<21)}}) {
+                                 Fixture{"mode16-i1-d1",{true,16},(1u<<23)|(1u<<21)},
+                                 Fixture{"mode16-raw-a",{true,16},1u<<29},
+                                 Fixture{"mode16-raw-b",{true,16},(1u<<29)|(1u<<22)}}) {
             DrawItem draw;
             CHECK(realize_draw_item(state_for(entry.mode,fragment,false,entry.flag_bits),
                                    nullptr,3,std::size(vertex),false,draw),"CLI fixture realizes");
@@ -317,6 +371,7 @@ int main(int argc, char** argv) {
             GpuCapturedOperationFailure f; f.source_index=7; f.command_order=1;
             f.reason=RealizationFailureReason::ShaderRecompile; f.vertex_retry_config_available=true;
             f.fragment_retry_config_available=true; f.ps_float_mode=entry.mode; f.ps_float_flags=draw.ps_float_flags;
+            f.ps_launch_rsrc1=draw.ps_launch_rsrc1;
             GpuCapturedStageDiagnostic stage; stage.stage=ShaderProgramStage::Fragment;
             stage.program_addr=reinterpret_cast<uint64_t>(fragment); stage.raw_shader_index=single.draws[0].fs_raw_shader_index;
             f.stages.push_back(stage); retry.failure_diagnostics.push_back(f);

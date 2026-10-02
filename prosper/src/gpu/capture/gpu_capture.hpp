@@ -222,6 +222,7 @@ struct GpuCapturedDraw {
     FragmentFloatMode ps_float_mode{};
     FloatTransportConfig float_transport{};
     FragmentFloatFlags ps_float_flags{}; // v67: independent producing launch flags
+    FragmentLaunchRsrc1 ps_launch_rsrc1{}; // v67: exact observed word, not inferred policy
 };
 
 struct GpuCapturedCompute {
@@ -321,6 +322,7 @@ struct GpuCapturedOperationFailure {
     FragmentFloatMode ps_float_mode{};
     FloatTransportConfig float_transport{};
     FragmentFloatFlags ps_float_flags{};
+    FragmentLaunchRsrc1 ps_launch_rsrc1{};
     ComputeLaunchDimensions compute_launch;
     std::vector<GpuCapturedStageDiagnostic> stages;
 };

@@ -505,7 +505,7 @@ int main(int argc, char** argv) {
         bytes += 12u + f.draws.size() + f.computes.size(); // v66 transport counts/profiles
         for (const auto& failure : f.failure_diagnostics)
             bytes += 5u + failure.stages.size(); // parent profile, stage count/profiles
-        bytes += 8u + 3u * (f.draws.size() + f.failure_diagnostics.size()); // v67 flags
+        bytes += 8u + 8u * (f.draws.size() + f.failure_diagnostics.size()); // v67 flags/full word
         for (const auto& failure : f.failure_diagnostics) {
             ++bytes; // availability, including early failures
             if (!failure.fragment_retry_config_available) continue;

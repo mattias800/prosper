@@ -1317,7 +1317,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                                          const SharedShaderAnalysis& captured_analysis = {},
                                          FragmentFloatMode fragment_float_mode = {},
                                          FloatTransportConfig float_transport = {},
-                                         FragmentFloatFlags fragment_float_flags = {}) {
+                                         FragmentFloatFlags fragment_float_flags = {},
+                                         FragmentLaunchRsrc1 fragment_launch_rsrc1 = {}) {
     ShaderCompileKey key;
     key.resources = ShaderKeyResourceScratch::acquire();
     key.stage = stage;
@@ -1340,6 +1341,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         ? fragment_float_mode : FragmentFloatMode{};
     key.fragment_float_flags = stage == ShaderProgramStage::Fragment
         ? fragment_float_flags : FragmentFloatFlags{};
+    key.fragment_launch_rsrc1 = stage == ShaderProgramStage::Fragment
+        ? fragment_launch_rsrc1 : FragmentLaunchRsrc1{};
     key.float_transport = compute_config ? compute_config->float_transport : float_transport;
     key.has_compute_config = stage == ShaderProgramStage::Compute && compute_config;
     if (key.has_compute_config) {
@@ -1624,6 +1627,7 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
             record->float_mode = key.fragment_float_mode;
             record->float_transport = key.float_transport;
             record->float_flags = key.fragment_float_flags;
+            record->launch_rsrc1 = key.fragment_launch_rsrc1;
             record->pcrel_target = key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX;
             record->trip = key.trip_bound;
             try {
@@ -2084,10 +2088,10 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
         bool vertex_capture_position,
         const SharedShaderAnalysis& captured_analysis,
         FragmentFloatMode fragment_float_mode, FloatTransportConfig float_transport,
-        FragmentFloatFlags fragment_float_flags) {
+        FragmentFloatFlags fragment_float_flags, FragmentLaunchRsrc1 fragment_launch_rsrc1) {
     if (cache_identity) *cache_identity = 0;
     if (!fragment_float_mode.canonical() || !float_transport.canonical() ||
-        !fragment_float_flags.canonical()) {
+        !fragment_float_flags.canonical() || !fragment_launch_rsrc1.canonical()) {
         if (stage == ShaderProgramStage::Fragment)
             observe_fragment_arithmetic({}, reinterpret_cast<uintptr_t>(code), false);
         return {};
@@ -2097,7 +2101,7 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
                                                    vertex_lds_dwords, nullptr,
                                                    fragment_wave32, vertex_capture_position,
                                                    captured_analysis, fragment_float_mode, float_transport,
-                                                   fragment_float_flags);
+                                                   fragment_float_flags, fragment_launch_rsrc1);
     // Guest memory is 1:1-mapped, so the caller's code pointer IS the guest program address; it must
     // be captured here because the key owns a copy of the words rather than pointing at them.
     const uint64_t program_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(code));
@@ -2172,11 +2176,11 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
         bool vertex_capture_position,
         const SharedShaderAnalysis& captured_analysis,
         FragmentFloatMode fragment_float_mode, FloatTransportConfig float_transport,
-        FragmentFloatFlags fragment_float_flags) {
+        FragmentFloatFlags fragment_float_flags, FragmentLaunchRsrc1 fragment_launch_rsrc1) {
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
         stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity,
         fragment_wave32, vertex_lds_dwords, vertex_capture_position, captured_analysis,
-        fragment_float_mode, float_transport, fragment_float_flags);
+        fragment_float_mode, float_transport, fragment_float_flags, fragment_launch_rsrc1);
     return words ? *words : std::vector<uint32_t>{};
 }
 

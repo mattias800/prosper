@@ -133,6 +133,7 @@ struct RenderState {
     bool ps_wave32 = false; // SPI_PS_IN_CONTROL.PS_W32_EN
     FragmentFloatMode ps_float_mode{};
     FragmentFloatFlags ps_float_flags{};
+    FragmentLaunchRsrc1 ps_launch_rsrc1{};
 
     // Color MRT 0. format/number_type/comp_swap together select the VkFormat (see vk_translate).
     uint64_t color0_base        = 0;   // byte address (CB_COLOR0_BASE + BASE_EXT)

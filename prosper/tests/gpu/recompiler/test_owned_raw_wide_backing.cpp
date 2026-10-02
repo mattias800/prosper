@@ -344,7 +344,7 @@ int main(int argc, char** argv) {
               "full mode availability/bits partition owned PS cache and preserve flush/preserve/unknown relation paths");
         const auto owned_tail_size = 4u + 4u * decoded.draws.front().vrt.resources.size();
         const auto transport_tail_size = 12u + decoded.draws.size();
-        const auto flags_tail_size = 8u + 3u * decoded.draws.size();
+        const auto flags_tail_size = 8u + 8u * decoded.draws.size();
         auto v65_bytes = encoded;
         v65_bytes.resize(v65_bytes.size() - flags_tail_size - transport_tail_size); v65_bytes[8] = 65u;
         GpuCaptureFile official65;

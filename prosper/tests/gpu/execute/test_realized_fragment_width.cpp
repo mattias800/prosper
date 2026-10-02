@@ -168,7 +168,7 @@ int main() {
     // No resources: remove transport T, owned U4, then M for genuine v63.
     const size_t mode_tail_size = 8u + 2u * realized.size();
     const size_t transport_tail_size = 12u + realized.size();
-    const size_t flags_tail_size = 8u + 3u * realized.size();
+    const size_t flags_tail_size = 8u + 8u * realized.size();
     auto mode_bytes = bytes;
     mode_bytes.resize(mode_bytes.size() - flags_tail_size - transport_tail_size - 4u);
     set_u32(mode_bytes, 8u, 64u);

@@ -119,13 +119,16 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
     check(fixture.returncode==0,"actual realization/collector fixture succeeds without GPU")
     if fixture.returncode:
         print(fixture.stdout+fixture.stderr)
-    states=[("mode0",0,(0,0)),("mode16",16,(0,0)),("unknown",None,None)]
-    states.extend(("mode16-i%d-d%d" % (ieee,dx10),16,(ieee,dx10))
+    states=[("mode0",0,(0,0),0),("mode16",16,(0,0),16<<12),("unknown",None,None,None)]
+    states.extend(("mode16-i%d-d%d" % (ieee,dx10),16,(ieee,dx10),(16<<12)|(ieee<<23)|(dx10<<21))
                   for ieee in (0,1) for dx10 in (0,1))
+    states.extend([("mode16-raw-a",16,(0,0),(16<<12)|(1<<29)),
+                   ("mode16-raw-b",16,(0,0),(16<<12)|(1<<29)|(1<<22))])
     for name in ("mode16","mode16-failed"):
         data=(directory/(name+".prgcap")).read_bytes()
-        flags_tail=(struct.pack("<I",1)+b"\x01\x00\x00"+struct.pack("<I",0) if name=="mode16" else
-                    struct.pack("<II",0,1)+b"\x01\x00\x00")
+        launch=b"\x01\x00\x00\x01"+struct.pack("<I",16<<12)
+        flags_tail=(struct.pack("<I",1)+launch+struct.pack("<I",0) if name=="mode16" else
+                    struct.pack("<II",0,1)+launch)
         check(struct.unpack_from("<I",data,8)[0]==67 and data.endswith(flags_tail),
               name+" genuine independent known-clear-flags v67 tail")
         data=bytearray(data[:-len(flags_tail)])
@@ -151,8 +154,8 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
         legacy=bytearray(official[:-len(expected_tail)])
         struct.pack_into("<I",legacy,8,63)
         (directory/("legacy"+("-failed" if name.endswith("failed") else "")+".prgcap")).write_bytes(legacy)
-    states.extend([("official66",16,None),("official64",16,None),("legacy",None,None)])
-    for state,mode,flags in states:
+    states.extend([("official66",16,None,None),("official64",16,None,None),("legacy",None,None,None)])
+    for state,mode,flags,raw_word in states:
         for route in ("recompile-raw","fs-tap","retry-failed-stage"):
             capture=directory/(state+("-failed" if route=="retry-failed-stage" else "")+".prgcap")
             for width in (None,"32","64"):
@@ -176,6 +179,13 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
                     provenance="captured" if state=="unknown" else "legacy-unknown"
                     check("fragment-float-flags=unavailable source="+provenance in done.stderr,
                           label+" missing flags remain visibly unknown, never known-clear")
+                if raw_word is not None:
+                    check("fragment-rsrc1-ps=0x%08x source=captured" % raw_word in done.stderr,
+                          label+" exact observed full word remains visible evidence, not inferred policy")
+                else:
+                    provenance="captured" if state=="unknown" else "legacy-unknown"
+                    check("fragment-rsrc1-ps=unavailable source="+provenance in done.stderr,
+                          label+" missing raw word stays unavailable independently of known MODE")
                 if mode is None:
                     check("fragment-float-mode=unavailable" in done.stderr and
                           "FLOAT_MODE=unavailable" in done.stderr and
@@ -198,7 +208,7 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
     original=(directory/"mode16.prgcap").read_bytes()
     # MODE precedes one zero-owned-count v65 tail and one-draw/no-compute/no-failure v66 transport.
     transport_tail_size=13
-    flags_tail_size=11
+    flags_tail_size=16
     start=len(original)-flags_tail_size-transport_tail_size-4-10
     malformed={
         "count":original[:start]+struct.pack("<I",0)+original[start+4:],
@@ -210,8 +220,10 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
         "truncated-transport":original[:-flags_tail_size-1],
         "truncated-flags":original[:-1],
         "flags-count":original[:-flags_tail_size]+struct.pack("<I",0)+original[-flags_tail_size+4:],
-        "flags-tag":original[:-7]+b"\x02"+original[-6:],
-        "flags-unknown-value":original[:-7]+b"\x00\x01\x00"+original[-4:],
+        "flags-tag":original[:-12]+b"\x02"+original[-11:],
+        "flags-unknown-value":original[:-12]+b"\x00\x01\x00"+original[-9:],
+        "raw-tag":original[:-9]+b"\x02"+original[-8:],
+        "raw-unknown-value":original[:-9]+b"\x00"+struct.pack("<I",1)+original[-4:],
         "trailing":original+b"\x00",
         "relabel-only63":original[:8]+struct.pack("<I",63)+original[12:],
     }
@@ -222,6 +234,7 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
             done=run(args(capture,path,route),route=="fs-tap")
             check(done.returncode==2 and "fragment-float-mode=" not in done.stderr and
                   "fragment-float-flags" not in done.stderr and
+                  "fragment-rsrc1-ps" not in done.stderr and
                   path.read_bytes()==b"unchanged",name+" "+route+" rejects before regeneration/dump")
 print("== %s (%d failures) ==" % ("FAIL" if failures else "PASS",len(failures)))
 sys.exit(1 if failures else 0)

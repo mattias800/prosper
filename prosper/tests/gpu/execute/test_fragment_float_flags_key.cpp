@@ -20,14 +20,17 @@ void check(bool condition, const char* message, unsigned first = 0, unsigned sec
 }
 
 int main() {
-    constexpr std::array<FragmentFloatFlags, 5> states{{
-        {}, {true, false, false}, {true, true, false},
-        {true, false, true}, {true, true, true}}};
+    struct State { FragmentFloatFlags flags; FragmentLaunchRsrc1 raw; };
+    constexpr std::array<State,8> states{{
+        {{},{}}, {{true,false,false},{}}, {{true,true,false},{}},
+        {{true,false,true},{}}, {{true,true,true},{}},
+        {{},{true,0}}, {{},{true,1u<<29}}, {{},{true,(1u<<29)|(1u<<22)}}}};
     std::array<ShaderCompileKey, states.size()> keys;
     for (unsigned i = 0; i < states.size(); ++i) {
         auto& key = keys[i];
         key.stage = ShaderProgramStage::Fragment;
-        key.fragment_float_flags = states[i];
+        key.fragment_float_flags = states[i].flags;
+        key.fragment_launch_rsrc1 = states[i].raw;
         // Unknown FLOAT_MODE remains independent of known flag authority. Every key
         // uses equal code bytes, deliberately held in different immutable allocations.
         key.code = std::make_shared<const std::vector<uint32_t>>(
@@ -35,6 +38,7 @@ int main() {
         key.code_hash = hash_shader_code(*key.code);
         key.cached_hash = ShaderCompileKeyHash::compute(key);
         check(key.fragment_float_flags.canonical(), "canonical independent flag state", i);
+        check(key.fragment_launch_rsrc1.canonical(), "canonical independent raw evidence state",i);
     }
     for (unsigned i = 0; i < states.size(); ++i) {
         for (unsigned j = 0; j < states.size(); ++j) {
@@ -50,7 +54,7 @@ int main() {
     }
     std::unordered_map<ShaderCompileKey, unsigned, ShaderCompileKeyHash> entries;
     for (unsigned i = 0; i < states.size(); ++i) entries.emplace(keys[i], i);
-    check(entries.size() == states.size(), "five producing flag identities coexist");
+    check(entries.size() == states.size(), "eight flag/raw producing identities coexist");
     for (unsigned i = 0; i < states.size(); ++i) {
         auto repeated = keys[i];
         repeated.code = std::make_shared<const std::vector<uint32_t>>(*keys[i].code);
@@ -58,7 +62,7 @@ int main() {
         const auto hit = entries.find(repeated);
         check(hit != entries.end() && hit->second == i, "equal byte identity reuses its own key", i);
     }
-    std::printf("fragment_float_flags_key: %u checks, %u failures; five authority states\n",
+    std::printf("fragment_float_flags_key: %u checks, %u failures; eight flag/evidence states\n",
                 checks, failures);
     return failures ? 1 : 0;
 }

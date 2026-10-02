@@ -18,6 +18,10 @@ the schema-3 host profile. An explicitly producing Unknown flag state is retaine
 from FLOAT_MODE or transport. Genuine schema-1/2/3 files remain inspectable; absent launch flags
 make replay INCOMPLETE (`fragment-float-flags-unavailable`, unless an earlier reason is retained).
 Frame capture v67 carries the same independent flag state for realized and failed draws.
+Both schema4 and v67 also retain the exact observed RSRC1_PS word with separate availability.
+It is producing evidence only, never a fallback for missing MODE/IEEE/DX10 or implicit FP16_OVFL
+authority, and is not passed as an unused numerical compiler argument. The actual key includes
+the word so a warm case cannot report another launch's otherwise unconsumed register bits.
 These flags do not describe FP16_OVFL, do not authorize host float features, and do not establish
 general guest arithmetic, half packing, or NaN-payload fidelity.
 This retention groundwork does not change emitted arithmetic. The numerical obligations in

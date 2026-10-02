@@ -105,6 +105,7 @@ struct DrawItem {
     FragmentFloatMode ps_float_mode{};
     FloatTransportConfig float_transport{}; // actual producing host profile, not guest MODE
     FragmentFloatFlags ps_float_flags{};
+    FragmentLaunchRsrc1 ps_launch_rsrc1{};
     // Process-unique identities supplied by the exact shader-recompile cache. Zero means the
     // shader came from an external/replay path, so persistent backend caches must compare words.
     uint64_t vs_identity = 0, fs_identity = 0;
@@ -634,7 +635,8 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const SharedShaderAnalysis& captured_analysis = {},
                                                        FragmentFloatMode fragment_float_mode = {},
                                                        FloatTransportConfig float_transport = {},
-                                                       FragmentFloatFlags fragment_float_flags = {});
+                                                       FragmentFloatFlags fragment_float_flags = {},
+                                                       FragmentLaunchRsrc1 fragment_launch_rsrc1 = {});
 SharedShaderWords recompile_graphics_shader_cached_shared(
     ShaderProgramStage stage, const uint32_t* code, size_t dwords,
     const ShaderResourceTable* resources = nullptr,
@@ -647,7 +649,8 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     const SharedShaderAnalysis& captured_analysis = {},
     FragmentFloatMode fragment_float_mode = {},
     FloatTransportConfig float_transport = {},
-    FragmentFloatFlags fragment_float_flags = {});
+    FragmentFloatFlags fragment_float_flags = {},
+    FragmentLaunchRsrc1 fragment_launch_rsrc1 = {});
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; ordinary per-dispatch push-constant values do not.
 // Conditional marker lowerings validate their value-dependent dispatch proof before cache lookup.
@@ -1060,6 +1063,7 @@ struct OperationRealizationFailure {
     FragmentFloatMode ps_float_mode{};
     FloatTransportConfig float_transport{};
     FragmentFloatFlags ps_float_flags{};
+    FragmentLaunchRsrc1 ps_launch_rsrc1{};
     ComputeLaunchDimensions compute_launch;
     std::vector<ShaderRealizationDiagnostic> stages;
 };
@@ -1999,6 +2003,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         failure->kind = SubmitOperationKind::Draw;
         failure->ps_float_mode = rs.ps_addr ? rs.ps_float_mode : FragmentFloatMode{};
         failure->ps_float_flags = rs.ps_addr ? rs.ps_float_flags : FragmentFloatFlags{};
+        failure->ps_launch_rsrc1 = rs.ps_addr ? rs.ps_launch_rsrc1 : FragmentLaunchRsrc1{};
         failure->float_transport = float_transport;
         failure->pipeline_present = true;
         failure->pipeline = resolve_pipeline_state(rs);
@@ -2422,7 +2427,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
             max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
             rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode, float_transport,
-            rs.ps_float_flags);
+            rs.ps_float_flags, rs.ps_launch_rsrc1);
     } else {
         if (vertex_chain) {
             const SharedShaderWords linked = recompile_vertex_chain_cached_shared(
@@ -2441,7 +2446,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
             max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
             rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode, float_transport,
-            rs.ps_float_flags);
+            rs.ps_float_flags, rs.ps_launch_rsrc1);
     }
     // CB_COLOR_CONTROL.DCC_DECOMPRESS interprets the bound AGC metadata helper, rather than its
     // ordinary fragment-color export. The operation bits can remain folded into a later graphics
@@ -3006,6 +3011,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.ps_wave32 = out.fragment_wave_config_available && rs.ps_wave32;
     out.ps_float_mode = rs.ps_addr ? rs.ps_float_mode : FragmentFloatMode{};
     out.ps_float_flags = rs.ps_addr ? rs.ps_float_flags : FragmentFloatFlags{};
+    out.ps_launch_rsrc1 = rs.ps_addr ? rs.ps_launch_rsrc1 : FragmentLaunchRsrc1{};
     out.float_transport = float_transport;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;

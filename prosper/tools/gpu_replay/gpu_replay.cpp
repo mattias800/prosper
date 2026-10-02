@@ -85,7 +85,8 @@ bool capture_retains_fragment_float_flags(uint32_t format_version) {
 }
 
 void report_fragment_float_flags(const char* mode, prosper::gpu::FragmentFloatFlags flags,
-                                 const char* record, uint64_t index, uint32_t format_version) {
+                                 prosper::gpu::FragmentLaunchRsrc1 raw, const char* record,
+                                 uint64_t index, uint32_t format_version) {
     if (flags.available)
         std::fprintf(stderr, "[%s] fragment-float-flags ieee-mode=%u dx10-clamp=%u "
                              "source=captured %s=%llu; guest launch inputs, not host controls\n",
@@ -93,6 +94,13 @@ void report_fragment_float_flags(const char* mode, prosper::gpu::FragmentFloatFl
                      record, static_cast<unsigned long long>(index));
     else
         std::fprintf(stderr, "[%s] fragment-float-flags=unavailable source=%s %s=%llu\n",
+                     mode, capture_retains_fragment_float_flags(format_version) ? "captured" : "legacy-unknown",
+                     record, static_cast<unsigned long long>(index));
+    if (raw.available)
+        std::fprintf(stderr, "[%s] fragment-rsrc1-ps=0x%08x source=captured %s=%llu evidence-only\n",
+                     mode, raw.value, record, static_cast<unsigned long long>(index));
+    else
+        std::fprintf(stderr, "[%s] fragment-rsrc1-ps=unavailable source=%s %s=%llu\n",
                      mode, capture_retains_fragment_float_flags(format_version) ? "captured" : "legacy-unknown",
                      record, static_cast<unsigned long long>(index));
 }
@@ -119,7 +127,8 @@ void report_fragment_wave_size(const char* mode, const prosper::gpu::DrawItem& d
                      mode, static_cast<unsigned long long>(draw.draw_index));
     report_float_transport(mode, draw.float_transport, "draw", draw.draw_index,
                            capture_retains_float_transport(format_version));
-    report_fragment_float_flags(mode, draw.ps_float_flags, "draw", draw.draw_index, format_version);
+    report_fragment_float_flags(mode, draw.ps_float_flags, draw.ps_launch_rsrc1,
+                               "draw", draw.draw_index, format_version);
 }
 
 void usage(const char* argv0) {
@@ -949,6 +958,11 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
         std::printf("  float-transport=%s source=%s (producing host profile, not replay device support)\n",
                     prosper::gpu::float_transport_profile_name(d.float_transport),
                     capture_retains_float_transport(format_version) ? "captured" : "legacy-unknown");
+        if (d.ps_launch_rsrc1.available)
+            std::printf("  ps-rsrc1=0x%08x source=captured evidence-only\n",d.ps_launch_rsrc1.value);
+        else
+            std::printf("  ps-rsrc1 unavailable source=%s\n",
+                        capture_retains_fragment_float_flags(format_version) ? "captured" : "legacy-unknown");
         // Resolved SPI_PS_INPUT_CNTL linkage (see pixel_input_linkage.hpp): which producer PARAM
         // slot each pixel-shader input actually reads, or whether the interpolator synthesizes a
         // constant instead. Retained since capture v36; older captures print `none` rather than
@@ -1104,6 +1118,11 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
                     prosper::gpu::float_transport_profile_name(failure.float_transport),
                     capture_retains_float_transport(format_version) ? "captured" : "legacy-unknown");
         if (failure.kind == prosper::gpu::SubmitOperationKind::Draw) {
+            if (failure.ps_launch_rsrc1.available)
+                std::printf("  ps-rsrc1=0x%08x source=captured evidence-only\n",failure.ps_launch_rsrc1.value);
+            else
+                std::printf("  ps-rsrc1 unavailable source=%s\n",
+                            capture_retains_fragment_float_flags(format_version) ? "captured" : "legacy-unknown");
             if (failure.ps_float_flags.available)
                 std::printf("  ps-float-flags ieee-mode=%u dx10-clamp=%u source=captured (guest launch inputs)\n",
                             failure.ps_float_flags.ieee_mode ? 1u : 0u, failure.ps_float_flags.dx10_clamp ? 1u : 0u);
@@ -3950,7 +3969,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "[retry-failed-stage] fragment-float-mode=unavailable "
                                          "source=legacy-unknown\n");
                 report_fragment_float_flags("retry-failed-stage", failure.ps_float_flags,
-                    "failure", static_cast<uint64_t>(failure_index), capture.format_version);
+                    failure.ps_launch_rsrc1, "failure", static_cast<uint64_t>(failure_index), capture.format_version);
                 // Preserve the real program address in rejection diagnostics and deduplication.
                 spirv = prosper::gpu::recompile_fragment(
                     raw.words.data(), raw.words.size(), resources,

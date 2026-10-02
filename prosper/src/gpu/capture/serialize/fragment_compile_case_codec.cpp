@@ -162,6 +162,7 @@ std::vector<uint8_t> encode_fragment_compile_case(const FragmentCompileCase& c) 
     w(c.float_transport.profile);
     // Independent launch flags follow the unchanged schema-3 transport tail.
     w(c.float_flags.available, c.float_flags.ieee_mode, c.float_flags.dx10_clamp);
+    w(c.launch_rsrc1.available, c.launch_rsrc1.value);
     w.value(checksum(w.bytes)); return std::move(w.bytes);
 }
 FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes) {
@@ -180,8 +181,10 @@ FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes)
         for (auto& resource : c.resources.resources) r.value(resource.owned_raw_snapshot_bytes);
     }
     if (schema >= 3) r(c.float_transport.profile);
-    if (schema >= 4)
+    if (schema >= 4) {
         r(c.float_flags.available, c.float_flags.ieee_mode, c.float_flags.dx10_clamp);
+        r(c.launch_rsrc1.available, c.launch_rsrc1.value);
+    }
     check(r.position == r.bytes.size(), "compile-case trailing data");
     for (size_t k = 0; k < c.blobs.size(); ++k) if (c.blobs[k].alias_of != UINT32_MAX) {
         check(c.blobs[k].alias_of < k, "compile-case alias index");
@@ -199,6 +202,7 @@ FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes)
         // The checksum and exact legacy EOF are checked before downgrading. Relabeling a newer
         // file cannot hide its tail or convert absent flags into an explicitly recorded Unknown.
         c.float_flags = {};
+        c.launch_rsrc1 = {};
         c.complete = false;
         if (c.reason.empty()) c.reason = "fragment-float-flags-unavailable";
     }

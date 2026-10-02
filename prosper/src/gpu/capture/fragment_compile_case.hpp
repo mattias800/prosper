@@ -55,6 +55,7 @@ struct FragmentCompileCase {
     // Schema 4 retains independent observed launch flags. A legacy schema cannot derive these
     // inputs from FLOAT_MODE, SOURCE, width or a host device and stays inspectable INCOMPLETE.
     FragmentFloatFlags float_flags{};
+    FragmentLaunchRsrc1 launch_rsrc1{}; // schema 4 evidence; not an unused compiler argument
     uint32_t pcrel_target = UINT32_MAX;
     ComputeTripBoundSettings trip{};
     ShaderResourceTable resources;
