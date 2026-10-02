@@ -96,13 +96,12 @@ Unexplained and not yet shown to matter:
   cross-title census before landing. Evidence: gdb and disassembly of the SELF modules flattened with
   `tools/il2cpp/prx_to_elf.py`, 2026-10-02, main `4a2ea88d` plus #4129 and #4137.
 - The `__stack_chk_fail` that ended the "Loading Thread" right after `sceUltInitialize` is explained
-  and fixed on the fork (`fix/apr-submit-id-width`): `sceKernelAprSubmitCommandBufferAndGetResult`
+  and fixed on main by #4146 (filed as #4138): `sceKernelAprSubmitCommandBufferAndGetResult`
   (`ASoW5WE-UPo`) takes `(cb, ring, result*, uint32_t* id)`, the title passes a 4-byte stack int
   for the id (`eboot+0x24511b0`) directly under its canary, and prosper stored an 8-byte token
   there, zeroing the canary's low dword. Evidence: the stack copy of the canary read
-  `0x5245505300000000` against the expected `0x524550534F525000`. Not yet checked against the UE4
-  titles that treat both slots as 8-byte records.
-- With that and the deferral prototype applied the process no longer dies: about 25 guest threads
+  `0x5245505300000000` against the expected `0x524550534F525000`.
+- With that fix and the deferral prototype applied the process no longer dies: about 25 guest threads
   (`TaskThread00..11`, `IdleThread00..02`, `Loading Thread`, `SaveGameThread`) all sit in
   `sceKernelWaitCond`/timed waits and the guest main thread waits on a condition variable that a
   worker had already broadcast before it began waiting. `kqueue` and `kevent` (`libScePosix`)
