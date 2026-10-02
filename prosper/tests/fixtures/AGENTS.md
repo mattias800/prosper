@@ -94,6 +94,15 @@ Required varying outputs need a matching interface and a direct whole-vector wri
 compiler may declare an unwritten consumed output. This necessary evidence is NOT an all-path
 definition proof: branch-only stores never grant MUST-defined or guest-initialization authority.
 
+Because the live renderer runs it, `render_runner.h` is where two of the known violations of
+`CLAUDE.md`'s steady-state invariants live: the main render submit waits on its own fence
+(`submit_and_wait()` → `wait_and_finish()`, P1; the staged replacement is #3948's
+`submit_deferred()`), and a resident-buffer cache hit falls back to a full `memcmp` once its
+write-watch disables itself (P5, #3155). Do not add a new caller of `submit_and_wait()` on a
+per-frame path, and do not add full-buffer compares where a watch or generation can prove the
+bytes unchanged. The file is far past the ratchet's 5,000-line cap — new code goes in a companion
+header (as `retained_depth_array_gpu.h` does), not into it.
+
 Prefer extending an existing harness over a second one that does nearly the same thing; the tests
 that share `render_runner.h` share its device, caches and statistics, and a parallel copy would
 diverge. Fixtures that only one test uses belong beside that test, not here.

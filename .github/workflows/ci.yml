@@ -590,6 +590,45 @@ jobs:
           python3 prosper/tools/env/check_diag_gates.py --selftest
           python3 prosper/tools/env/check_diag_gates.py prosper
 
+      # Same job, same reason: a text scan over tracked files that needs nothing built. Six costs
+      # every title pays -- title ids and title-named modules in shared code, raw getenv reads,
+      # blocking GPU syncs, ever-growing files, and the shipping frontend reaching into
+      # prosper::test:: -- each as a per-file count that may go DOWN, never UP. It fails on a new or
+      # risen count AND on a count that fell without its row being lowered, so the baseline cannot
+      # drift into headroom. Exit 2 means it could not evaluate, never "clean". --selftest first
+      # and separately, for the reason the steps above give.
+      #
+      # The GATE is delta mode: it fails only when THIS change raised a count past its row. Full
+      # mode is printed for information and never fails the job, because main's baseline goes
+      # stale every time a PR grows a capped file, and a stale row on main must not redden every
+      # unrelated PR until somebody repairs it (#4173 did exactly that while this gate was in
+      # review). Base: the PR's base SHA when this shallow clone has it, else HEAD~1 -- on the
+      # pull_request merge ref that IS the base branch GitHub merged against (see fetch-depth: 2
+      # above). On a push, the pre-push tip when present; a push with no usable base skips the
+      # delta check with a notice rather than inventing one.
+      - name: Verify no architecture-ratchet count rose
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          python3 prosper/tools/ci/check_arch_ratchet.py --selftest
+          has() { [ -n "$1" ] && git cat-file -e "$1^{commit}" 2>/dev/null; }
+          BASE=""
+          if [ "$EVENT" = "pull_request" ]; then
+            if has "$PR_BASE"; then BASE="$PR_BASE"; else BASE="HEAD~1"; fi
+          elif has "$PUSH_BEFORE"; then
+            BASE="$PUSH_BEFORE"
+          fi
+          if [ -n "$BASE" ]; then
+            python3 prosper/tools/ci/check_arch_ratchet.py --root . --base "$BASE"
+          else
+            echo "::notice::architecture ratchet: no base commit for this $EVENT event; delta check skipped"
+          fi
+          if ! python3 prosper/tools/ci/check_arch_ratchet.py --root .; then
+            echo "::warning::architecture ratchet: the full-tree report is not clean (informational only; see the log above). Repair rows with --update, or raise them with a note naming the PR that grew them."
+          fi
+
       # Same job, same reason again: a repository-wide text scan needing nothing built -- and here
       # the "needing nothing built" part is the point, because the defect this catches is visible
       # ONLY on Windows and would otherwise wait for the MinGW job. stdout carries bytes, and the

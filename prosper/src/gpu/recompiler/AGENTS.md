@@ -37,6 +37,14 @@ backstop for genuinely unknown encodings — mark `CONFIDENCE: LOW`, log loudly,
 exact opcode — but every one hit on a live boot is the next thing to implement. A silently skipped
 instruction drops real rendered content and reads as "handled".
 
+**No title id in a condition, and no title-named module outside `gta5/`.** The architecture
+ratchet (`CLAUDE.md` § *Architecture and performance ratchets*) counts `PPSA#####` outside comments
+and caps `gta5/`'s size, so a lowering one title needs either generalises into the translator or
+lands in `gta5/` with its measurement — and shrinking `gta5/` by generalising is the direction.
+Compile cost is a frame-time cost: the recompiler's output must be cacheable by program bytes so
+that, after warm-up, nothing here runs on the submit thread (P3). `rdna2_emit_alu.cpp` and
+`rdna2_emit_cfg.cpp` are past the 5,000-line cap; grow a new file, not them.
+
 ## `SignedZeroInfNanPreserve`: a correctness contract, and a device gate
 
 RDNA2 float arithmetic defines Inf, NaN and signed zero exactly. Vulkan does **not** promise that by
