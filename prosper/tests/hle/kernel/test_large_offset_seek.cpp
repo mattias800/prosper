@@ -44,9 +44,9 @@ static int fails = 0;
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
 struct TempStream {
+    const std::string path = prosper_test::test_scratch_file("large-offset.bin");
     FILE* file = nullptr;
     TempStream() {
-        const std::string path = prosper_test::test_scratch_file("large-offset.bin");
 #ifdef _WIN32
         const int fd = _open(path.c_str(), _O_RDWR | _O_CREAT | _O_EXCL | _O_BINARY,
                              _S_IREAD | _S_IWRITE);
@@ -137,12 +137,12 @@ int main() {
     // A failing diagnostic sink must not replace the guest's seek EINVAL with the sink's errno.
 #ifdef _WIN32
     const int saved_stderr = _dup(_fileno(stderr));
-    const int readonly_sink = _open("NUL", _O_RDONLY | _O_BINARY);
+    const int readonly_sink = _open(owned.path.c_str(), _O_RDONLY | _O_BINARY);
     const bool redirected = saved_stderr >= 0 && readonly_sink >= 0 &&
                             _dup2(readonly_sink, _fileno(stderr)) == 0;
 #else
     const int saved_stderr = dup(fileno(stderr));
-    const int readonly_sink = open("/dev/null", O_RDONLY);
+    const int readonly_sink = open(owned.path.c_str(), O_RDONLY);
     const bool redirected = saved_stderr >= 0 && readonly_sink >= 0 &&
                             dup2(readonly_sink, fileno(stderr)) >= 0;
 #endif
@@ -156,6 +156,8 @@ int main() {
         const int64_t rc = (int64_t)fseek_fn((uint64_t)(uintptr_t)file, (uint64_t)(int64_t)-1,
                                             SEEK_SET, 0, 0, 0);
         const int seek_error = errno;
+        printf("  sink probe: rc=%d errno=%d; guest seek: rc=%lld errno=%d\n",
+               probe, sink_error, (long long)rc, seek_error);
         CHECK(probe < 0 && sink_error != 0 && sink_error != EINVAL,
               "diagnostic sink independently refuses with a different errno");
         CHECK(rc != 0 && seek_error == EINVAL, "failed seek preserves EINVAL despite logging (M4)");
