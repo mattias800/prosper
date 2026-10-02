@@ -1113,6 +1113,15 @@ if(TARGET prosper_core)
   target_link_libraries(test_apr_equeue_completion PRIVATE prosper_core)
   add_test(NAME apr_equeue_completion COMMAND test_apr_equeue_completion)
 
+  # #3554: all three AMPR userdata registration routes and actual completion/accessor delivery.
+  # The legacy sizing route registers only on POSIX; Windows' size query is intentionally pure.
+  if(NOT WIN32)
+    add_executable(test_ampr_udata tests/hle/kernel/test_ampr_udata.cpp)
+    target_link_libraries(test_ampr_udata PRIVATE prosper_core)
+    add_test(NAME ampr_udata COMMAND test_ampr_udata)
+    set_tests_properties(ampr_udata PROPERTIES TIMEOUT 20)
+  endif()
+
   # Variadic libc formatters (issue #122): real va_list capture so %f/XMM + stack + %s-past-4th
   # args format correctly (was a 3-integer-register forward). Cross-platform (host libc printf).
   add_executable(test_printf tests/hle/test_printf.cpp)
