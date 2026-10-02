@@ -367,7 +367,7 @@ def main() -> int:
 
     c = cands[args.apply]
     print(f"\n  extracting candidate {args.apply}: lines {c['start_line']}-{c['end_line']}")
-    cd = Clangd(str((root / args.build)))
+    cd = Clangd(str(root / args.build))
     cd.open(path)
     applied, offered = cd.extract(c, args.name)
     if not applied:

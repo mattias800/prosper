@@ -55,7 +55,7 @@ def read_exact(path: pathlib.Path) -> str:
     deletions for a one-line path citation, and the resulting diff is unreviewable -- which is
     exactly when a real change hides.
     """
-    with open(path, "r", encoding="utf-8", newline="") as fh:
+    with open(path, encoding="utf-8", newline="") as fh:
         return fh.read()
 
 
