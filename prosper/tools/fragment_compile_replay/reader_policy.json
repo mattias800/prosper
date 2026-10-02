@@ -313,6 +313,6 @@
   "prosper/src/loader/support_modules.cpp": "6a19bf9feee2f74794a75ffddd48d5c712eedb58fbb40abb8c226134c748b745",
   "prosper/src/loader/support_modules.hpp": "9f552b094d35335943cfac75b7d8940e5f9f8e5065ff46506d04b3daf46e08e4",
   "prosper/src/loader/tls_layout.hpp": "a3a362d0d486c921853a2fba7376218dcd17fe27bbc26ee9963778ed4a93301d",
-  "prosper/src/self/module.cpp": "c162a592981f119be0e8238fec671a6b66e2f9f44ac012c5e43d184a42db2810",
+  "prosper/src/self/module.cpp": "acf522496aa0a911b2558304e13e22e8eb278fb95189cffc91ee5a23bb4eb6f2",
   "prosper/src/self/module.hpp": "f77ca1108dc7a9de52b7a93946ef1cfd6356e226865a0acf936b146c60b562e2"
 }
