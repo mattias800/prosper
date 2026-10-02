@@ -3,6 +3,7 @@
 // fallback for an unresolved id. This locks in stable ids, path dedup, valid colliding-id reads,
 // unique-size fallback, ambiguous fallback refusal, and truthful resolution-method diagnostics.
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -36,9 +37,7 @@ namespace prosper {
 }
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 static bool set_test_env(const char* name, const char* value) {
 #ifdef _WIN32
@@ -104,7 +103,7 @@ static std::string capture_stderr(Fn&& fn) {
     return output;
 }
 
-int main() {
+TEST(AprRegistry, Contract) {
     // Unbuffered stdout, so a crash cannot erase the evidence of where it happened.
     // ctest captures a test's stdout through a pipe, which makes libc fully buffer it (4 KiB
     // typically) rather than line-buffer it as it would to a terminal. This whole file's output
@@ -926,7 +925,4 @@ int main() {
         }
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

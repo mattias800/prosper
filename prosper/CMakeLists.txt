@@ -800,9 +800,9 @@ if(TARGET prosper_core)
   endif()
 
   # #3529: the initial value of an unresolved DATA import. Pure -- no dump, no mapping.
-  add_executable(test_import_data_seed tests/hle/dispatch/test_import_data_seed.cpp)
-  target_link_libraries(test_import_data_seed PRIVATE prosper_core)
-  add_test(NAME import_data_seed COMMAND test_import_data_seed)
+  prosper_add_gtest(test_import_data_seed
+    SOURCES tests/hle/dispatch/test_import_data_seed.cpp
+    LIBRARIES prosper_core)
 
   add_executable(test_hle_registered tests/hle/test_hle_registered.cpp)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
@@ -851,9 +851,9 @@ if(TARGET prosper_core)
 
   # Cooperative stop signal (issue #164 P0): request_stop/stop_requested the frontend uses to wind
   # the guest run-loop down on window-close. Pure, no deps.
-  add_executable(test_lifecycle tests/host/platform/test_lifecycle.cpp)
-  target_link_libraries(test_lifecycle PRIVATE prosper_core)
-  add_test(NAME lifecycle_stop_signal COMMAND test_lifecycle)
+  prosper_add_gtest(test_lifecycle
+    SOURCES tests/host/platform/test_lifecycle.cpp
+    LIBRARIES prosper_core)
 
   # GPU submit gate (#3225): the counted region + bounded drain prosper-app runs before std::_Exit,
   # so a detached guest thread cannot be killed inside an amdgpu submission (which parks the task in
@@ -1009,9 +1009,9 @@ if(TARGET prosper_core)
 
   # Cross-module TLS resolution (#136/#338): dynamic and initial-exec relocations resolve through
   # the DEFINING module's id, symbol offset, and shared static layout. Pure synthetic unit test.
-  add_executable(test_dtpmod_tls tests/test_dtpmod_tls.cpp)
-  target_link_libraries(test_dtpmod_tls PRIVATE prosper_core)
-  add_test(NAME dtpmod_tls_cross_module COMMAND test_dtpmod_tls)
+  prosper_add_gtest(test_dtpmod_tls
+    SOURCES tests/test_dtpmod_tls.cpp
+    LIBRARIES prosper_core)
 
   # AMD SSE4a INSERTQ/EXTRQ emulation (the SIGILL handler emulates these Zen2-only ops on Intel
   # hosts). Golden bit-math vectors — header-only, no game dump required.
@@ -1091,9 +1091,9 @@ if(TARGET prosper_core)
   # The fill layout asserts every offset the guest has been observed reading, and carries
   # a mutation arm (absent-meta fill over a poisoned buffer) so removing the fill cannot
   # pass vacuously.
-  add_executable(test_h264_sps tests/hle/video/test_h264_sps.cpp)
-  target_link_libraries(test_h264_sps PRIVATE prosper_core)
-  add_test(NAME h264_sps COMMAND test_h264_sps)
+  prosper_add_gtest(test_h264_sps
+    SOURCES tests/hle/video/test_h264_sps.cpp
+    LIBRARIES prosper_core)
 
   add_executable(test_json2 tests/hle/test_json2.cpp)
   target_link_libraries(test_json2 PRIVATE prosper_core)
@@ -1186,9 +1186,9 @@ if(TARGET prosper_core)
   add_test(NAME cond_destroy_busy COMMAND test_cond_destroy_busy)
 
   # #2178: no Sony pthread spelling may return a bare FreeBSD errno.
-  add_executable(test_sce_pthread_encoding tests/hle/test_sce_pthread_encoding.cpp)
-  target_link_libraries(test_sce_pthread_encoding PRIVATE prosper_core)
-  add_test(NAME sce_pthread_encoding COMMAND test_sce_pthread_encoding)
+  prosper_add_gtest(test_sce_pthread_encoding
+    SOURCES tests/hle/test_sce_pthread_encoding.cpp
+    LIBRARIES prosper_core)
 
   # #2168 (barrier half): a barrier destroy must refuse while threads are parked.
   add_executable(test_barrier_destroy_busy tests/hle/test_barrier_destroy_busy.cpp)
@@ -1201,9 +1201,9 @@ if(TARGET prosper_core)
 
   # #2081 FALSE SUCCESS: an unregistered NID answers the dispatcher's 0, which for an SCE_OK
   # contract is a success report over an out-parameter nothing wrote. Pure, no game dump.
-  add_executable(test_false_success_nids tests/hle/test_false_success_nids.cpp)
-  target_link_libraries(test_false_success_nids PRIVATE prosper_core)
-  add_test(NAME false_success_nids COMMAND test_false_success_nids)
+  prosper_add_gtest(test_false_success_nids
+    SOURCES tests/hle/test_false_success_nids.cpp
+    LIBRARIES prosper_core)
 
   # #2004: sceAppContentAddcontUnmount releases the claim the mount takes, so a mount/unmount/
   # re-mount cycle works instead of being permanently BUSY. Pure, no game dump.
@@ -1286,16 +1286,16 @@ if(TARGET prosper_core)
 
   # #1659: every diagnostic that prints "<module>+0x<rva>" agrees with the loader's mapped base, and a
   # printed offset round-trips back through PROSPER_BP. Header-only; no dump, no device.
-  add_executable(test_guest_module_label tests/host/image/test_guest_module_label.cpp)
-  target_link_libraries(test_guest_module_label PRIVATE prosper_core)
-  add_test(NAME guest_module_label COMMAND test_guest_module_label)
+  prosper_add_gtest(test_guest_module_label
+    SOURCES tests/host/image/test_guest_module_label.cpp
+    LIBRARIES prosper_core)
 
   # The frame-pointer walk shared by the fault reporter and PROSPER_HWBP_STACK. It dereferences
   # guest-controlled pointers inside a signal handler, so every stop condition (cycle, unreadable
   # frame, depth cap) is a safety property. Header-only; no dump, no device.
-  add_executable(test_rbp_chain tests/host/fault/test_rbp_chain.cpp)
-  target_link_libraries(test_rbp_chain PRIVATE prosper_core)
-  add_test(NAME rbp_chain COMMAND test_rbp_chain)
+  prosper_add_gtest(test_rbp_chain
+    SOURCES tests/host/fault/test_rbp_chain.cpp
+    LIBRARIES prosper_core)
 
   # PlatformUi hook (#347): the app frontend can service the guest's ImeDialog with real UI; with no
   # backend registered the headless auto-complete default is unchanged. Pure, no game dump.
@@ -1313,11 +1313,11 @@ if(TARGET prosper_core)
 
   # libSceImeDialog lifecycle + libSceSaveData memory API round-trip (#191): auto-completing dialog
   # (no hang) + a real per-(user,slot) Set->Get memory block with verified shadPS4 struct layouts.
-  add_executable(test_savedata_ime tests/hle/test_savedata_ime.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_savedata_ime PRIVATE tests)
-  target_link_libraries(test_savedata_ime PRIVATE prosper_core)
-  add_test(NAME savedata_ime COMMAND test_savedata_ime)
+  prosper_add_gtest(test_savedata_ime
+    SOURCES tests/hle/test_savedata_ime.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   # The save's parameter block (#2786): sceSaveDataSetParam/GetParam were unregistered, so both
   # answered SCE_OK while storing and reading nothing. Drives the real NIDs, including a mutation arm
@@ -1359,10 +1359,10 @@ if(TARGET prosper_core)
   # Save data is namespaced by title id (#2734): two titles that pick the same guest save name --
   # `OptionSettings`, or SaveDataMemory's (user 1, slot 0) -- must not share one host save. Runs two
   # application roots over one guest name, because a single-title round trip passes on the broken code.
-  add_executable(test_savedata_title_namespace tests/hle/test_savedata_title_namespace.cpp)
-  target_include_directories(test_savedata_title_namespace PRIVATE tests)
-  target_link_libraries(test_savedata_title_namespace PRIVATE prosper_core)
-  add_test(NAME savedata_title_namespace COMMAND test_savedata_title_namespace)
+  prosper_add_gtest(test_savedata_title_namespace
+    SOURCES tests/hle/test_savedata_title_namespace.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   # sceSaveDataDirNameSearch reported NO saves on Windows (#2760): savedata0_list_dirs() was
   # `#ifndef _WIN32`-ed out, so every title's load/continue list was empty there. Drives the real NID
@@ -1394,17 +1394,17 @@ if(TARGET prosper_core)
   add_test(NAME pthread_cond_clock COMMAND test_cond_clock)
 
   # libScePad controller input: ScePadData layout + HostPadState mapping + HLE fill contract (pure).
-  add_executable(test_pad tests/input/test_pad.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_pad PRIVATE tests)
-  target_link_libraries(test_pad PRIVATE prosper_core)
-  add_test(NAME pad_input COMMAND test_pad)
+  prosper_add_gtest(test_pad
+    SOURCES tests/input/test_pad.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   # Render-cadence inertness: when a retained DMA copy overrides EVERY skip PROSPER_RENDER_EVERY
   # asked for, the run is a cadence-1 run wearing an `every=N` label and must say so (#2837).
-  add_executable(test_render_cadence tests/hle/test_render_cadence.cpp)
-  target_link_libraries(test_render_cadence PRIVATE prosper_core)
-  add_test(NAME render_cadence COMMAND test_render_cadence)
+  prosper_add_gtest(test_render_cadence
+    SOURCES tests/hle/test_render_cadence.cpp
+    LIBRARIES prosper_core)
 
   add_executable(test_prosper_app_pad_overlay frontends/prosper-app/test_pad_overlay.cpp)
   target_include_directories(test_prosper_app_pad_overlay PRIVATE src frontends/prosper-app)
@@ -1730,9 +1730,9 @@ if(TARGET prosper_core)
   target_link_libraries(test_mutex_host_tcb_identity PRIVATE prosper_core)
   add_test(NAME mutex_host_tcb_identity COMMAND test_mutex_host_tcb_identity)
 
-  add_executable(test_fiber_guest_tp_stash tests/hle/sync/test_fiber_guest_tp_stash.cpp)
-  target_link_libraries(test_fiber_guest_tp_stash PRIVATE prosper_core)
-  add_test(NAME fiber_guest_tp_stash COMMAND test_fiber_guest_tp_stash)
+  prosper_add_gtest(test_fiber_guest_tp_stash
+    SOURCES tests/hle/sync/test_fiber_guest_tp_stash.cpp
+    LIBRARIES prosper_core)
 
   add_executable(test_cond_slot_identity tests/hle/sync/test_cond_slot_identity.cpp)
   target_link_libraries(test_cond_slot_identity PRIVATE prosper_core)
@@ -1754,9 +1754,9 @@ if(TARGET prosper_core)
   target_link_libraries(test_agc_shader PRIVATE prosper_core)
   add_test(NAME agc_shader_create COMMAND test_agc_shader)
 
-  add_executable(test_tile tests/gpu/texture/test_tile.cpp)
-  target_link_libraries(test_tile PRIVATE prosper_core)
-  add_test(NAME gpu_surface_detile COMMAND test_tile)
+  prosper_add_gtest(test_tile
+    SOURCES tests/gpu/texture/test_tile.cpp
+    LIBRARIES prosper_core)
   add_test(NAME gpu_surface_detile_gather COMMAND test_tile)
   set_tests_properties(gpu_surface_detile_gather PROPERTIES
                        ENVIRONMENT "PROSPER_NO_PAIRED_AVX2_DETILE=1")
@@ -1787,15 +1787,15 @@ if(TARGET prosper_core)
   target_link_libraries(test_bc_decode PRIVATE prosper_core)
   add_test(NAME bc_decode COMMAND test_bc_decode)
 
-  add_executable(test_stat tests/test_stat.cpp)
-  target_link_libraries(test_stat PRIVATE prosper_core)
-  add_test(NAME sce_stat_layout COMMAND test_stat)
+  prosper_add_gtest(test_stat
+    SOURCES tests/test_stat.cpp
+    LIBRARIES prosper_core)
 
-  add_executable(test_file_binary tests/hle/test_file_binary.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_file_binary PRIVATE tests)
-  target_link_libraries(test_file_binary PRIVATE prosper_core)
-  add_test(NAME file_binary_roundtrip COMMAND test_file_binary)
+  prosper_add_gtest(test_file_binary
+    SOURCES tests/hle/test_file_binary.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   if(UNIX)
     # Intercepts both the old host-wide and new filesystem-wide barrier; no real writeback.
     add_executable(test_file_sync tests/hle/test_file_sync.cpp)
@@ -1805,13 +1805,13 @@ if(TARGET prosper_core)
     set_tests_properties(file_sync_scope PROPERTIES TIMEOUT 20)
   endif()
 
-  add_executable(test_savedata_dirname tests/hle/test_savedata_dirname.cpp)
-  target_link_libraries(test_savedata_dirname PRIVATE prosper_core)
-  add_test(NAME savedata_dirname_guard COMMAND test_savedata_dirname)
+  prosper_add_gtest(test_savedata_dirname
+    SOURCES tests/hle/test_savedata_dirname.cpp
+    LIBRARIES prosper_core)
 
-  add_executable(test_savedata_txres tests/hle/test_savedata_txres.cpp)
-  target_link_libraries(test_savedata_txres PRIVATE prosper_core)
-  add_test(NAME savedata_tx_resource_ids COMMAND test_savedata_txres)
+  prosper_add_gtest(test_savedata_txres
+    SOURCES tests/hle/test_savedata_txres.cpp
+    LIBRARIES prosper_core)
 
   add_executable(test_savedata_event_drain tests/hle/service/test_savedata_event_drain.cpp)
   target_include_directories(test_savedata_event_drain PRIVATE tests)
@@ -1829,11 +1829,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_signin_dialog PRIVATE prosper_core)
   add_test(NAME signin_dialog COMMAND test_signin_dialog)
 
-  add_executable(test_translate_sandbox tests/hle/test_translate_sandbox.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_translate_sandbox PRIVATE tests)
-  target_link_libraries(test_translate_sandbox PRIVATE prosper_core)
-  add_test(NAME translate_sandbox_guard COMMAND test_translate_sandbox)
+  prosper_add_gtest(test_translate_sandbox
+    SOURCES tests/hle/test_translate_sandbox.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   add_executable(test_service_logging tests/hle/test_service_logging.cpp)
   target_link_libraries(test_service_logging PRIVATE prosper_core)
@@ -1859,11 +1859,11 @@ if(TARGET prosper_core)
   # hard-coded preload path (Blasphemous 2 / Evergate's Il2CppUserAssemblies.prx on a case-sensitive
   # host filesystem) must resolve to the real on-disk entry instead of being dropped as absent.
   # Pure std::filesystem against a temp tree; no game dump needed.
-  add_executable(test_module_path_case tests/host/image/test_module_path_case.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_module_path_case PRIVATE tests)
-  target_link_libraries(test_module_path_case PRIVATE prosper_core)
-  add_test(NAME module_path_case COMMAND test_module_path_case)
+  prosper_add_gtest(test_module_path_case
+    SOURCES tests/host/image/test_module_path_case.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   # Module path policy: prosper links guest modules only from the dump locations it names
   # (eboot.bin, sce_module/, Media/Modules/, Media/Plugins/), rejects everything else by default,
@@ -1871,10 +1871,10 @@ if(TARGET prosper_core)
   # dumps ship third-party replacements of libSceAppContent / libSceNpEntitlementAccess /
   # libSceAmpr; loading one would shadow prosper's own implementation and answer the guest with
   # somebody else's stub. Pure string policy plus one end-to-end arm against a temp tree.
-  add_executable(test_module_path_policy tests/host/image/test_module_path_policy.cpp)
-  target_include_directories(test_module_path_policy PRIVATE tests)
-  target_link_libraries(test_module_path_policy PRIVATE prosper_core)
-  add_test(NAME module_path_policy COMMAND test_module_path_policy)
+  prosper_add_gtest(test_module_path_policy
+    SOURCES tests/host/image/test_module_path_policy.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   # dump_hygiene classifies files in a game dump that prosper must never load, and can delete them.
   # Its control arms matter more than its positive ones: during development it twice classified
@@ -1906,9 +1906,9 @@ if(TARGET prosper_core)
   endif()
 
   # Diagnostics: disabled-path test — verifies stubs are zero-cost (always runs).
-  add_executable(test_diagnostics_disabled tests/diagnostics/test_diagnostics_disabled.cpp)
-  target_link_libraries(test_diagnostics_disabled PRIVATE prosper_core)
-  add_test(NAME diagnostics_disabled_stubs COMMAND test_diagnostics_disabled)
+  prosper_add_gtest(test_diagnostics_disabled
+    SOURCES tests/diagnostics/test_diagnostics_disabled.cpp
+    LIBRARIES prosper_core)
 
   # The boot-phase LINE is reachable in a default build (no PROSPER_DIAGNOSTICS), driven only by
   # PROSPER_BOOTPHASE. Deliberately registered outside the PROSPER_DIAGNOSTICS block: the property
@@ -1916,10 +1916,9 @@ if(TARGET prosper_core)
   # where boot_program() stopped.
   # Which bundled support PRXs are preloaded at all. Pure policy: no dump, no SELF parser, no
   # filesystem — so both the DROP and the KEEP direction are checkable in ordinary CI.
-  add_executable(test_support_modules tests/loader/test_support_modules.cpp
-                                      src/loader/support_modules.cpp)
-  target_include_directories(test_support_modules PRIVATE src)
-  add_test(NAME loader_support_modules COMMAND test_support_modules)
+  prosper_add_gtest(test_support_modules
+    SOURCES tests/loader/test_support_modules.cpp src/loader/support_modules.cpp
+    INCLUDES src)
 
   # Which preloaded modules are started with a real SCE module-param descriptor. Pure policy over
   # the fixed guest base map: no dump, no SELF parser, no filesystem — so both the inclusion and the
@@ -1936,18 +1935,18 @@ if(TARGET prosper_core)
   # needs no library: it mutates the environment between two evaluations of the same macro and
   # asserts the second still reports the first value -- the one behaviour a live getenv cannot
   # produce, so the arms go red if the caching is ever removed.
-  add_executable(test_env_cache tests/diagnostics/test_env_cache.cpp)
-  target_include_directories(test_env_cache PRIVATE src)
-  add_test(NAME diagnostics_env_cache COMMAND test_env_cache)
+  prosper_add_gtest(test_env_cache
+    SOURCES tests/diagnostics/test_env_cache.cpp
+    INCLUDES src)
 
   # The per-submit sampling contract (diagnostics/env_submit.hpp). Two-sided by construction: it
   # asserts a value is frozen INSIDE one SubmitEnvScope -- which a live getenv cannot do -- and that
   # the next scope observes an arm made since -- which PROSPER_ENV_ON cannot do. Either half alone
   # would pass against the wrong mechanism. Threads, so link the thread library.
-  add_executable(test_env_submit tests/diagnostics/test_env_submit.cpp)
-  target_include_directories(test_env_submit PRIVATE src)
-  target_link_libraries(test_env_submit PRIVATE Threads::Threads)
-  add_test(NAME diagnostics_env_submit COMMAND test_env_submit)
+  prosper_add_gtest(test_env_submit
+    SOURCES tests/diagnostics/test_env_submit.cpp
+    INCLUDES src
+    LIBRARIES Threads::Threads)
 
   # One arm per PROSPER_* knob #3267 converted to diagnostics/env_numeric.hpp. Header-only and
   # environment-free by construction: nearly every converted site caches its read in a
@@ -2045,19 +2044,19 @@ if(TARGET prosper_core)
 
   # APR container registry + read-source resolution (#62/#1901): stable ids, path dedup, ID-first
   # reads, unique-size fallback, ambiguous fallback refusal, and method diagnostics. Pure; no dump.
-  add_executable(test_apr_registry tests/host/memory/test_apr_registry.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_apr_registry PRIVATE tests)
-  target_link_libraries(test_apr_registry PRIVATE prosper_core)
-  add_test(NAME apr_registry_resolution COMMAND test_apr_registry)
+  prosper_add_gtest(test_apr_registry
+    SOURCES tests/host/memory/test_apr_registry.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   # #2384: the AMPR tracks-offset predicate. Its NEW case is provable by a boot; what needs a unit
   # test is that the widening is strictly ADDITIVE, because the predicate is shared by every title
   # that constructs a command buffer and none of their dumps are available to CI. Pure function of a
   # 64-bit argument, so it needs no dump and cannot skip silently.
-  add_executable(test_ampr_tracks_offset tests/hle/memory/test_ampr_tracks_offset.cpp)
-  target_link_libraries(test_ampr_tracks_offset PRIVATE prosper_core)
-  add_test(NAME ampr_tracks_offset COMMAND test_ampr_tracks_offset)
+  prosper_add_gtest(test_ampr_tracks_offset
+    SOURCES tests/hle/memory/test_ampr_tracks_offset.cpp
+    LIBRARIES prosper_core)
   add_executable(test_ampr_amm tests/hle/memory/test_ampr_amm.cpp)
   target_link_libraries(test_ampr_amm PRIVATE prosper_core)
   add_test(NAME ampr_amm COMMAND test_ampr_amm)
@@ -2079,11 +2078,11 @@ if(TARGET prosper_core)
   # GTA V (#1139/#1142) net-new HLE regression guards: sceKernelAprGetFileStat fills the real stat
   # (#1133) and sceAudioOut2GetSpeakerArrayMemorySize returns a non-zero allocation size (#1134). The
   # AGC GetSize third piece is covered separately by test_agc_getsize (#1208).
-  add_executable(test_apr_stat_audio tests/hle/test_apr_stat_audio.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_apr_stat_audio PRIVATE tests)
-  target_link_libraries(test_apr_stat_audio PRIVATE prosper_core)
-  add_test(NAME apr_stat_audio_gtav COMMAND test_apr_stat_audio)
+  prosper_add_gtest(test_apr_stat_audio
+    SOURCES tests/hle/test_apr_stat_audio.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   # #2926/#2928: the APR read builders' two silent-success shapes -- an unregistered NID answering
   # SCE_OK from the dispatcher's return-0 default, and a gather/scatter segment reporting success
@@ -2112,11 +2111,11 @@ if(TARGET prosper_core)
   set_tests_properties(apr_measure_duplicate_never PROPERTIES
                        ENVIRONMENT "PROSPER_APR_MEASURE_READ=never")
 
-  add_executable(test_ampr_measure tests/hle/test_ampr_measure.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_ampr_measure PRIVATE tests)
-  target_link_libraries(test_ampr_measure PRIVATE prosper_core)
-  add_test(NAME ampr_measure COMMAND test_ampr_measure)
+  prosper_add_gtest(test_ampr_measure
+    SOURCES tests/hle/test_ampr_measure.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   # sceAmprCommandBufferGetSize must not answer for one command buffer with another's recorded
   # capacity: a too-small answer permanently hangs the guest's IoStore append loop, which polls
@@ -2141,10 +2140,10 @@ if(TARGET prosper_core)
   # PROSPER_DMEM_CALLER correlation (issue #1859): the full stack remains one bounded line per
   # caller identity while every MEMLOG allocation can carry the same stable run-local ID. Pure,
   # including explicit unknown/overflow states and concurrent interning.
-  add_executable(test_dmem_caller_chain tests/hle/memory/test_dmem_caller_chain.cpp)
   # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
-  target_include_directories(test_dmem_caller_chain PRIVATE src)
-  add_test(NAME dmem_caller_chain COMMAND test_dmem_caller_chain)
+  prosper_add_gtest(test_dmem_caller_chain
+    SOURCES tests/hle/memory/test_dmem_caller_chain.cpp
+    INCLUDES src)
 
   # #3057: test_dmem_caller_chain above covers format_dmem_caller_chain_definition (the formatter)
   # only -- it never calls k_alloc_dmem/k_alloc_main_dmem, so deleting the actual
@@ -2259,9 +2258,9 @@ if(TARGET prosper_core)
   add_test(NAME command_provenance COMMAND test_command_provenance)
 
   # Stage B: CommandProcessor honors RELEASE_MEM/WRITE_DATA memory writes (synchronous end-of-pipe).
-  add_executable(test_eop_write tests/gpu/test_eop_write.cpp)
-  target_link_libraries(test_eop_write PRIVATE prosper_core)
-  add_test(NAME eop_write COMMAND test_eop_write)
+  prosper_add_gtest(test_eop_write
+    SOURCES tests/gpu/test_eop_write.cpp
+    LIBRARIES prosper_core)
 
   # #4003: force the stale-drainer handoff in the actual completion-queue implementation.
   # This executable supplies its own CP object; the ordinary archive CP object stays unselected.
@@ -2297,15 +2296,15 @@ if(TARGET prosper_core)
   # #729: the synchronous (PROSPER_EOP_WRITE_SYNC=1) honor_* label writes must probe
   # guest_readable before dereferencing a guest-PM4-supplied address (own executable: the
   # env var latches process-wide on first use).
-  add_executable(test_eop_write_sync_guard tests/gpu/pm4/test_eop_write_sync_guard.cpp)
-  target_link_libraries(test_eop_write_sync_guard PRIVATE prosper_core)
-  add_test(NAME eop_write_sync_guard COMMAND test_eop_write_sync_guard)
+  prosper_add_gtest(test_eop_write_sync_guard
+    SOURCES tests/gpu/pm4/test_eop_write_sync_guard.cpp
+    LIBRARIES prosper_core)
 
   # #312 per-queue WAIT_REG_MEM barrier model: unsatisfied waits gate downstream memory effects,
   # streams release independently, jumps don't un-gate, timeout backstop preserves liveness.
-  add_executable(test_wait_barrier tests/gpu/pm4/test_wait_barrier.cpp)
-  target_link_libraries(test_wait_barrier PRIVATE prosper_core)
-  add_test(NAME wait_barrier COMMAND test_wait_barrier)
+  prosper_add_gtest(test_wait_barrier
+    SOURCES tests/gpu/pm4/test_wait_barrier.cpp
+    LIBRARIES prosper_core)
   add_executable(test_wait_regmem_observation tests/diagnostics/test_wait_regmem_observation.cpp)
   target_link_libraries(test_wait_regmem_observation PRIVATE prosper_core)
   add_test(NAME wait_regmem_observation COMMAND test_wait_regmem_observation
@@ -2348,9 +2347,9 @@ if(TARGET prosper_core)
   add_test(NAME kernel_signal_time COMMAND test_kernel_signal_time)
 
   # Pipeline-state resolution: RenderState (RDNA2 enums) -> Vulkan-ready pipeline state (pure, no Vulkan).
-  add_executable(test_pipeline_state tests/gpu/state/test_pipeline_state.cpp)
-  target_link_libraries(test_pipeline_state PRIVATE prosper_core)
-  add_test(NAME pipeline_state_resolve COMMAND test_pipeline_state)
+  prosper_add_gtest(test_pipeline_state
+    SOURCES tests/gpu/state/test_pipeline_state.cpp
+    LIBRARIES prosper_core)
 
   # Recompiler coverage metric (pure): per-instruction support report used by shader_histo.
   add_executable(test_recompile_coverage tests/gpu/test_recompile_coverage.cpp)
@@ -2363,18 +2362,17 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/test_workgroup_uniformity.cpp src/gpu/recompiler/rdna2_decode.cpp
     INCLUDES src)
 
-  add_executable(test_direct_descriptor_copy tests/gpu/recompiler/test_direct_descriptor_copy.cpp)
-  target_link_libraries(test_direct_descriptor_copy PRIVATE prosper_core)
-  add_test(NAME direct_descriptor_copy COMMAND test_direct_descriptor_copy)
+  prosper_add_gtest(test_direct_descriptor_copy
+    SOURCES tests/gpu/recompiler/test_direct_descriptor_copy.cpp
+    LIBRARIES prosper_core)
 
-  add_executable(test_smem_pointer_provenance tests/gpu/recompiler/test_smem_pointer_provenance.cpp)
-  target_link_libraries(test_smem_pointer_provenance PRIVATE prosper_core)
-  add_test(NAME smem_pointer_provenance COMMAND test_smem_pointer_provenance)
+  prosper_add_gtest(test_smem_pointer_provenance
+    SOURCES tests/gpu/recompiler/test_smem_pointer_provenance.cpp
+    LIBRARIES prosper_core)
 
-  add_executable(test_image_descriptor_class_lookup
-                 tests/gpu/recompiler/test_image_descriptor_class_lookup.cpp)
-  target_link_libraries(test_image_descriptor_class_lookup PRIVATE prosper_core)
-  add_test(NAME image_descriptor_class_lookup COMMAND test_image_descriptor_class_lookup)
+  prosper_add_gtest(test_image_descriptor_class_lookup
+    SOURCES tests/gpu/recompiler/test_image_descriptor_class_lookup.cpp
+    LIBRARIES prosper_core)
 
   # #657: query-only descriptors. The negative control (one added sample instruction) is what makes
   # the positive arm mean anything, so both live in one binary.
@@ -2387,9 +2385,9 @@ if(TARGET prosper_core)
   # key and the compilation it names. Needs no GPU and no fixture -- it asserts agreement between
   # two reads, plus a work counter, because correct settings cannot show that the sampling happened
   # once rather than four times.
-  add_executable(test_trip_bound_operation tests/gpu/execute/test_trip_bound_operation.cpp)
-  target_link_libraries(test_trip_bound_operation PRIVATE prosper_core)
-  add_test(NAME trip_bound_operation COMMAND test_trip_bound_operation)
+  prosper_add_gtest(test_trip_bound_operation
+    SOURCES tests/gpu/execute/test_trip_bound_operation.cpp
+    LIBRARIES prosper_core)
 
   # #3745: CachedShader's hand-written copy pair suppressed its implicit moves, so every cache
   # insertion copied. Asserts the move pair exists and transfers the SPIR-V shared_ptr.
@@ -2427,55 +2425,56 @@ if(TARGET prosper_core)
     ENVIRONMENT "PROSPER_NO_SHADER_KEY_WORD_HASH=1;PROSPER_NO_SHADER_KEY_SCRATCH=1")
 
   # RDNA2 shader instruction-stream walker (first stage of the RDNA2->SPIR-V recompiler).
-  add_executable(test_compressed_source_authority tests/gpu/resources/test_compressed_source_authority.cpp)
-  target_link_libraries(test_compressed_source_authority PRIVATE prosper_core)
-  add_test(NAME compressed_source_authority COMMAND test_compressed_source_authority)
+  prosper_add_gtest(test_compressed_source_authority
+    SOURCES tests/gpu/resources/test_compressed_source_authority.cpp
+    LIBRARIES prosper_core)
 
-  add_executable(test_metadata_kind_correlation tests/gpu/resources/test_metadata_kind_correlation.cpp)
-  target_link_libraries(test_metadata_kind_correlation PRIVATE prosper_core)
-  add_test(NAME metadata_kind_correlation COMMAND test_metadata_kind_correlation)
+  prosper_add_gtest(test_metadata_kind_correlation
+    SOURCES tests/gpu/resources/test_metadata_kind_correlation.cpp
+    LIBRARIES prosper_core)
 
-  add_executable(test_watch_list tests/gpu/diagnostics/test_watch_list.cpp)
-  target_link_libraries(test_watch_list PRIVATE prosper_core)
-  add_test(NAME watch_list COMMAND test_watch_list)
+  prosper_add_gtest(test_watch_list
+    SOURCES tests/gpu/diagnostics/test_watch_list.cpp
+    LIBRARIES prosper_core)
 
   # PROSPER_SKIP_DRAW_PROGRAM: decline graphics draws by shader PROGRAM identity (the graphics
   # counterpart of PROSPER_COMPUTE_SKIP_PROGRAM). Pure selector logic -- no Vulkan; the wiring into
   # the live renderer is pinned separately by draw_program_skip_render below.
-  add_executable(test_draw_program_skip tests/gpu/diagnostics/test_draw_program_skip.cpp)
-  target_link_libraries(test_draw_program_skip PRIVATE prosper_core)
-  add_test(NAME draw_program_skip COMMAND test_draw_program_skip)
+  prosper_add_gtest(test_draw_program_skip
+    SOURCES tests/gpu/diagnostics/test_draw_program_skip.cpp
+    LIBRARIES prosper_core)
 
   # PROSPER_DRAW_LINKSCAN: the CPU-side census of the linked lists a draw's scalar buffers contain
   # (the graphics counterpart of PROSPER_COMPUTE_PARENTSCAN). Pure analysis + selector -- no Vulkan.
-  add_executable(test_link_list_census tests/gpu/diagnostics/test_link_list_census.cpp)
-  target_link_libraries(test_link_list_census PRIVATE prosper_core)
-  add_test(NAME link_list_census COMMAND test_link_list_census)
+  prosper_add_gtest(test_link_list_census
+    SOURCES tests/gpu/diagnostics/test_link_list_census.cpp
+    LIBRARIES prosper_core)
 
-  add_executable(test_shader_dump_filter tests/gpu/diagnostics/test_shader_dump_filter.cpp)
-  target_link_libraries(test_shader_dump_filter PRIVATE prosper_core)
-  add_test(NAME shader_dump_filter COMMAND test_shader_dump_filter)
+  prosper_add_gtest(test_shader_dump_filter
+    SOURCES tests/gpu/diagnostics/test_shader_dump_filter.cpp
+    LIBRARIES prosper_core)
 
-  add_executable(test_gpu_memory_budget tests/gpu/diagnostics/test_gpu_memory_budget.cpp)
-  target_include_directories(test_gpu_memory_budget PRIVATE tests)   # fixtures/test_scratch.h
-  target_link_libraries(test_gpu_memory_budget PRIVATE prosper_core)
-  add_test(NAME gpu_memory_budget COMMAND test_gpu_memory_budget)
+     # fixtures/test_scratch.h
+  prosper_add_gtest(test_gpu_memory_budget
+    SOURCES tests/gpu/diagnostics/test_gpu_memory_budget.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   # #3873: the persistent texture cache's budget from VK_EXT_memory_budget headroom (pure policy).
-  add_executable(test_texture_cache_budget tests/gpu/memory/test_texture_cache_budget.cpp)
-  target_link_libraries(test_texture_cache_budget PRIVATE prosper_core)
-  add_test(NAME texture_cache_budget COMMAND test_texture_cache_budget)
+  prosper_add_gtest(test_texture_cache_budget
+    SOURCES tests/gpu/memory/test_texture_cache_budget.cpp
+    LIBRARIES prosper_core)
 
   # #3905: when spilled retained resources may be evicted to be re-created device-local (pure).
-  add_executable(test_spill_recovery tests/gpu/memory/test_spill_recovery.cpp)
-  target_link_libraries(test_spill_recovery PRIVATE prosper_core)
-  add_test(NAME spill_recovery COMMAND test_spill_recovery)
+  prosper_add_gtest(test_spill_recovery
+    SOURCES tests/gpu/memory/test_spill_recovery.cpp
+    LIBRARIES prosper_core)
 
   # #3888: GPU-only images/buffers prefer a DEVICE_LOCAL memory type (pure; Vulkan headers only).
   if(TARGET Vulkan::Vulkan)
-    add_executable(test_memory_type_select tests/gpu/memory/test_memory_type_select.cpp)
-    target_link_libraries(test_memory_type_select PRIVATE prosper_core Vulkan::Vulkan)
-    add_test(NAME memory_type_select COMMAND test_memory_type_select)
+    prosper_add_gtest(test_memory_type_select
+      SOURCES tests/gpu/memory/test_memory_type_select.cpp
+      LIBRARIES prosper_core Vulkan::Vulkan)
   endif()
 
   add_executable(test_rdna2_decode tests/gpu/recompiler/test_rdna2_decode.cpp)
@@ -2540,9 +2539,9 @@ if(TARGET prosper_core)
 
   # #3231: the CFG dispatcher's `missing-entry-vcc` gate and the entry-block-dominance case it may
   # now admit. Both directions, in its own binary for the same reason as the file above.
-  add_executable(test_entry_vcc_dead tests/gpu/recompiler/test_entry_vcc_dead.cpp)
-  target_link_libraries(test_entry_vcc_dead PRIVATE prosper_core)
-  add_test(NAME entry_vcc_dead COMMAND test_entry_vcc_dead)
+  prosper_add_gtest(test_entry_vcc_dead
+    SOURCES tests/gpu/recompiler/test_entry_vcc_dead.cpp
+    LIBRARIES prosper_core)
 
   # Scalar const-fold interpreter behind bindless-dynamic vertex-fetch resolution (no Vulkan needed).
   add_executable(test_dynfetch_fold tests/gpu/recompiler/test_dynfetch_fold.cpp)
@@ -2567,9 +2566,9 @@ if(TARGET prosper_core)
   add_executable(test_owned_raw_wide_backing tests/gpu/recompiler/test_owned_raw_wide_backing.cpp)
   target_link_libraries(test_owned_raw_wide_backing PRIVATE prosper_core)
   add_test(NAME owned_raw_wide_backing COMMAND test_owned_raw_wide_backing)
-  add_executable(test_memory_fed_raw_wide tests/gpu/recompiler/test_memory_fed_raw_wide.cpp)
-  target_link_libraries(test_memory_fed_raw_wide PRIVATE prosper_core)
-  add_test(NAME memory_fed_raw_wide COMMAND test_memory_fed_raw_wide)
+  prosper_add_gtest(test_memory_fed_raw_wide
+    SOURCES tests/gpu/recompiler/test_memory_fed_raw_wide.cpp
+    LIBRARIES prosper_core)
   add_executable(test_folded_stride_zero tests/gpu/recompiler/test_folded_stride_zero.cpp)
   target_link_libraries(test_folded_stride_zero PRIVATE prosper_core)
   add_test(NAME folded_stride_zero COMMAND test_folded_stride_zero)
@@ -2635,10 +2634,9 @@ endif()
   # #3713: a scalar branch may only be called workgroup-uniform when the value it compares is the
   # same for every wave along every path. Built as positive/negative pairs -- a proof that never
   # fires would otherwise pass the suite.
-  add_executable(test_scc_branch_uniformity
-                 tests/gpu/recompiler/test_scc_branch_uniformity.cpp)
-  target_link_libraries(test_scc_branch_uniformity PRIVATE prosper_core)
-  add_test(NAME scc_branch_uniformity COMMAND test_scc_branch_uniformity)
+  prosper_add_gtest(test_scc_branch_uniformity
+    SOURCES tests/gpu/recompiler/test_scc_branch_uniformity.cpp
+    LIBRARIES prosper_core)
 
   # #3573: the CFG dispatcher must lower a fragment exec/vcc branch as a wave vote.
   add_executable(test_dispatcher_wave_vote tests/gpu/recompiler/test_dispatcher_wave_vote.cpp)
@@ -2873,9 +2871,9 @@ endif()
   endif()
 
   # Unannounced-32-bit index-buffer fingerprint (#304 — DOLL's Slate/UMG quads). No Vulkan needed.
-  add_executable(test_index_size_detect tests/gpu/execute/test_index_size_detect.cpp)
-  target_link_libraries(test_index_size_detect PRIVATE prosper_core)
-  add_test(NAME index_size_detect COMMAND test_index_size_detect)
+  prosper_add_gtest(test_index_size_detect
+    SOURCES tests/gpu/execute/test_index_size_detect.cpp
+    LIBRARIES prosper_core)
 
   # 16-bit index expansion: equivalence against the retained (uncalled) AVX2 kernel and the
   # PROT_NONE mapping edge. Header-only, links nothing, and needs no Vulkan — registered here
@@ -3002,17 +3000,17 @@ endif()
 
   # AGC→Vulkan resource layer: the front-half↔back-half contract (gpu_resources.hpp). Registry
   # behavior is fixed here so both halves integrate against a stable API. Pure/cross-platform.
-  add_executable(test_gpu_resources tests/gpu/resources/test_gpu_resources.cpp)
-  target_link_libraries(test_gpu_resources PRIVATE prosper_core)
-  add_test(NAME gpu_resource_registry COMMAND test_gpu_resources)
+  prosper_add_gtest(test_gpu_resources
+    SOURCES tests/gpu/resources/test_gpu_resources.cpp
+    LIBRARIES prosper_core)
 
   # Resource-binding contract (shader_resources.hpp): format sizing + the provenance/binding lookups
   # the recompiler and pipeline share. Pure/cross-platform. See docs/RESOURCE_BINDING.md.
-  add_executable(test_shader_resources tests/gpu/resources/test_shader_resources.cpp)
   # Spells a `shared/...` include, which resolves from `frontends`.
-  target_include_directories(test_shader_resources PRIVATE frontends)
-  target_link_libraries(test_shader_resources PRIVATE prosper_core)
-  add_test(NAME shader_resource_contract COMMAND test_shader_resources)
+  prosper_add_gtest(test_shader_resources
+    SOURCES tests/gpu/resources/test_shader_resources.cpp
+    INCLUDES frontends
+    LIBRARIES prosper_core)
 
   # Versioned realized-draw capture: explicit round-trip, overlapping-resource alias preservation,
   # owned replay backing, and corrupt/truncated input rejection. Pure; no Vulkan or game dump.
@@ -3041,11 +3039,11 @@ endif()
   add_test(NAME float_transport_null_export_explicit_first
     COMMAND test_float_transport_capture --dcc-explicit-first)
 
-  add_executable(test_gpu_capture_bundle tests/gpu/capture/test_gpu_capture_bundle.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_gpu_capture_bundle PRIVATE tests)
-  target_link_libraries(test_gpu_capture_bundle PRIVATE prosper_core)
-  add_test(NAME gpu_capture_bundle_roundtrip COMMAND test_gpu_capture_bundle)
+  prosper_add_gtest(test_gpu_capture_bundle
+    SOURCES tests/gpu/capture/test_gpu_capture_bundle.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   add_executable(test_gpu_capture_bundle_streaming tests/gpu/capture/test_gpu_capture_bundle_streaming.cpp)
   target_include_directories(test_gpu_capture_bundle_streaming PRIVATE tests)
@@ -3064,9 +3062,9 @@ endif()
   # Framerate must count DISTINCT guest frames, not publications: the renderer re-serves its retained
   # frame through the ordinary publish path, so a present-counting fps reads full speed for a frozen
   # title (#2783 / instrument trap 90). Pure -- no Vulkan, no dump.
-  add_executable(test_present_frame_rate tests/gpu/present/test_present_frame_rate.cpp)
-  target_link_libraries(test_present_frame_rate PRIVATE prosper_core)
-  add_test(NAME present_frame_rate COMMAND test_present_frame_rate)
+  prosper_add_gtest(test_present_frame_rate
+    SOURCES tests/gpu/present/test_present_frame_rate.cpp
+    LIBRARIES prosper_core)
 
   # Native-speed append-only submit/present timeline: portable framing, checksums, and truncated-tail
   # recovery are pure and must not depend on Vulkan or a game dump.
@@ -3076,9 +3074,9 @@ endif()
   target_link_libraries(test_gpu_timeline PRIVATE prosper_core)
   add_test(NAME gpu_timeline_roundtrip COMMAND test_gpu_timeline)
 
-  add_executable(test_menu_frame_gate tests/gpu/timeline/test_menu_frame_gate.cpp)
-  target_link_libraries(test_menu_frame_gate PRIVATE prosper_core)
-  add_test(NAME menu_frame_gate COMMAND test_menu_frame_gate)
+  prosper_add_gtest(test_menu_frame_gate
+    SOURCES tests/gpu/timeline/test_menu_frame_gate.cpp
+    LIBRARIES prosper_core)
 
   add_executable(test_gpu_timeline_capture_exit tests/gpu/test_gpu_timeline_capture_exit.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
@@ -3088,11 +3086,11 @@ endif()
 
   # Generic guest-log phase gate: exact bounded lines arm the existing seeded whole-frame capture
   # after one completed present. Pure/cross-platform; no game dump or Vulkan device.
-  add_executable(test_guest_log_capture tests/gpu/test_guest_log_capture.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_guest_log_capture PRIVATE tests)
-  target_link_libraries(test_guest_log_capture PRIVATE prosper_core)
-  add_test(NAME guest_log_capture COMMAND test_guest_log_capture)
+  prosper_add_gtest(test_guest_log_capture
+    SOURCES tests/gpu/test_guest_log_capture.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   # The same gate's SILENT failure: an armed marker that never matches must diagnose itself instead
   # of leaving a missing file as the only evidence (#1684). Separate binary because the gate is a
@@ -3123,9 +3121,9 @@ endif()
 
   # gpu_replay output dimensions follow the selected draw/prefix target when its byte count agrees.
   # Pure/cross-platform so focused replay tooling remains available in CI.
-  add_executable(test_gpu_replay_extent tests/test_gpu_replay_extent.cpp)
-  target_link_libraries(test_gpu_replay_extent PRIVATE prosper_core)
-  add_test(NAME gpu_replay_output_extent COMMAND test_gpu_replay_extent)
+  prosper_add_gtest(test_gpu_replay_extent
+    SOURCES tests/test_gpu_replay_extent.cpp
+    LIBRARIES prosper_core)
 
   add_executable(test_gpu_replay_shader_dump tests/gpu/diagnostics/test_gpu_replay_shader_dump.cpp)
   target_link_libraries(test_gpu_replay_shader_dump PRIVATE prosper_core)
@@ -3137,25 +3135,23 @@ endif()
 
   # Draw-scoped captured-resource replacement: strict semantic selector, exact span validation,
   # and copy-on-write isolation when draws share tables/backing. Pure/cross-platform; no Vulkan.
-  add_executable(test_gpu_replay_resource_override
-                 tests/test_gpu_replay_resource_override.cpp)
                  # Includes a shared fixture, which resolves from the `tests` root.
-                 target_include_directories(test_gpu_replay_resource_override PRIVATE tests)
-  target_link_libraries(test_gpu_replay_resource_override PRIVATE prosper_core)
-  add_test(NAME gpu_replay_resource_override COMMAND test_gpu_replay_resource_override)
+  prosper_add_gtest(test_gpu_replay_resource_override
+    SOURCES tests/test_gpu_replay_resource_override.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   # Selected-prefix compute output inspection must distinguish captured seed bytes from the
   # descriptor-visible post-dispatch image, including tiled 2D and true 3D storage layouts.
-  add_executable(test_gpu_replay_post_compute_resource
-                 tests/test_gpu_replay_post_compute_resource.cpp)
-  target_link_libraries(test_gpu_replay_post_compute_resource PRIVATE prosper_core)
-  add_test(NAME gpu_replay_post_compute_resource COMMAND test_gpu_replay_post_compute_resource)
+  prosper_add_gtest(test_gpu_replay_post_compute_resource
+    SOURCES tests/test_gpu_replay_post_compute_resource.cpp
+    LIBRARIES prosper_core)
 
   # Offline SPI_PS_INPUT_CNTL linkage classification: a pixel-shader input wired to the constant
   # form consumes no producer export, and must never be reported as a PARAM consumer.
-  add_executable(test_gpu_replay_pixel_inputs tests/test_gpu_replay_pixel_inputs.cpp)
-  target_link_libraries(test_gpu_replay_pixel_inputs PRIVATE prosper_core)
-  add_test(NAME gpu_replay_pixel_inputs COMMAND test_gpu_replay_pixel_inputs)
+  prosper_add_gtest(test_gpu_replay_pixel_inputs
+    SOURCES tests/test_gpu_replay_pixel_inputs.cpp
+    LIBRARIES prosper_core)
 
   # Compile-only synthetic reject-route guard for #2790; not an executable real-shader reproducer.
   add_executable(test_undef_loop_accumulator tests/gpu/recompiler/test_undef_loop_accumulator.cpp)
@@ -3182,18 +3178,18 @@ endif()
   endif()
   add_test(NAME gpu_replay_rtt_seed_rgba8 COMMAND test_gpu_replay_rtt_seed_rgba8)
 
-  add_executable(test_gpu_dependency_graph tests/gpu/execute/test_gpu_dependency_graph.cpp)
-  target_link_libraries(test_gpu_dependency_graph PRIVATE prosper_core)
-  add_test(NAME gpu_dependency_graph COMMAND test_gpu_dependency_graph)
+  prosper_add_gtest(test_gpu_dependency_graph
+    SOURCES tests/gpu/execute/test_gpu_dependency_graph.cpp
+    LIBRARIES prosper_core)
 
   add_executable(gpu_timeline tools/gpu_timeline/gpu_timeline.cpp)
   target_link_libraries(gpu_timeline PRIVATE prosper_core)
 
   # Front-half resource-table builder + V# descriptor decode (agc_shader_layout.cpp): shader user_data
   # + user-data SGPRs -> ShaderResourceTable (constant buffers, stage 1). Pure/cross-platform.
-  add_executable(test_build_shader_resources tests/gpu/agc/test_build_shader_resources.cpp)
-  target_link_libraries(test_build_shader_resources PRIVATE prosper_core)
-  add_test(NAME build_shader_resources COMMAND test_build_shader_resources)
+  prosper_add_gtest(test_build_shader_resources
+    SOURCES tests/gpu/agc/test_build_shader_resources.cpp
+    LIBRARIES prosper_core)
 
   # GPU descriptor-bound INVARIANT guard (agc_shader_layout.cpp decode_image/buffer_descriptor): the
   # entire guest-input memory-safety argument relies on width/height <= 16384, depth <= 8192, and V#
@@ -3207,34 +3203,34 @@ endif()
   # are populated on one construction path and left unset on another, so comparing them
   # unconditionally split identical single-level descriptors into separate Vulkan images -- which
   # dropped three of four quadrant stores in GTA V and rendered a checkerboard. Pure predicate.
-  add_executable(test_mip_provenance_identity tests/gpu/agc/test_mip_provenance_identity.cpp)
-  target_link_libraries(test_mip_provenance_identity PRIVATE prosper_core)
-  add_test(NAME mip_provenance_identity COMMAND test_mip_provenance_identity)
+  prosper_add_gtest(test_mip_provenance_identity
+    SOURCES tests/gpu/agc/test_mip_provenance_identity.cpp
+    LIBRARIES prosper_core)
 
   # #3204: the image-identity predicates extracted from execute_item. They decide whether two
   # bindings alias ONE Vulkan image -- the aliasing GTA V's four quadrant writes depend on, and
   # the thing #3205 broke while it was an unnamed local expression. Pure comparisons.
-  add_executable(test_image_identity tests/gpu/agc/test_image_identity.cpp)
-  target_link_libraries(test_image_identity PRIVATE prosper_core)
-  add_test(NAME image_identity COMMAND test_image_identity)
+  prosper_add_gtest(test_image_identity
+    SOURCES tests/gpu/agc/test_image_identity.cpp
+    LIBRARIES prosper_core)
 
   # #3195: the atomic-image LOGICAL/PHYSICAL staging extents, extracted from execute_item.
-  add_executable(test_atomic_image_staging tests/gpu/agc/test_atomic_image_staging.cpp)
-  target_link_libraries(test_atomic_image_staging PRIVATE prosper_core)
-  add_test(NAME atomic_image_staging COMMAND test_atomic_image_staging)
+  prosper_add_gtest(test_atomic_image_staging
+    SOURCES tests/gpu/agc/test_atomic_image_staging.cpp
+    LIBRARIES prosper_core)
 
   # #3204: SPIR-V/guest storage-format agreement, extracted from execute_item. The permissive
   # direction binds the guest image with the wrong element type, so every arm has a rejection
   # partner -- including atomics, which are never a native storage image however well formats match.
-  add_executable(test_spirv_storage_match tests/gpu/agc/test_spirv_storage_match.cpp)
-  target_link_libraries(test_spirv_storage_match PRIVATE prosper_core)
-  add_test(NAME spirv_storage_match COMMAND test_spirv_storage_match)
+  prosper_add_gtest(test_spirv_storage_match
+    SOURCES tests/gpu/agc/test_spirv_storage_match.cpp
+    LIBRARIES prosper_core)
 
   # Descriptor-binding policy (#157): textures/storage images never land on the recompiler's hardwired
   # cbuf bindings 2/3; constant/vertex buffers assigned first. Pure, no game dump / Vulkan needed.
-  add_executable(test_convention_bindings tests/gpu/test_convention_bindings.cpp)
-  target_link_libraries(test_convention_bindings PRIVATE prosper_core)
-  add_test(NAME convention_bindings COMMAND test_convention_bindings)
+  prosper_add_gtest(test_convention_bindings
+    SOURCES tests/gpu/test_convention_bindings.cpp
+    LIBRARIES prosper_core)
 
   add_executable(test_writer_provenance tests/gpu/capture/test_writer_provenance.cpp)
   target_link_libraries(test_writer_provenance PRIVATE prosper_core)
@@ -3338,9 +3334,9 @@ endif()
   # complementary process where those variables are unset and the untouched `legacy` default is
   # asserted. CROSS-PLATFORM for the same reason test_videoout is: it drives the HLE registry and
   # a pure header, with no OS display access.
-  add_executable(test_display_mode tests/hle/graphics/test_display_mode.cpp)
-  target_link_libraries(test_display_mode PRIVATE prosper_core)
-  add_test(NAME display_mode_derivation COMMAND test_display_mode)
+  prosper_add_gtest(test_display_mode
+    SOURCES tests/hle/graphics/test_display_mode.cpp
+    LIBRARIES prosper_core)
 
   # #3379: guest flips are paced at the cadence the TITLE asked for by default. Its own executable
   # rather than an arm of test_videoout, for the same reason test_display_mode above is: the
@@ -3421,10 +3417,10 @@ endif()
       # menu. Now an exhaustive switch: the compiler pins exhaustiveness, this test pins the
       # table. Registered HERE, inside if(Vulkan_FOUND), because live_target_format.hpp includes
       # <vulkan/vulkan.h> -- registering it outside built on Linux and broke MinGW and macOS.
-      add_executable(test_live_target_format_match tests/gpu/test_live_target_format_match.cpp)
-      target_link_libraries(test_live_target_format_match PRIVATE prosper_core Vulkan::Vulkan)
-      target_include_directories(test_live_target_format_match PRIVATE frontends src)
-      add_test(NAME live_target_format_match COMMAND test_live_target_format_match)
+      prosper_add_gtest(test_live_target_format_match
+        SOURCES tests/gpu/test_live_target_format_match.cpp
+        INCLUDES frontends src
+        LIBRARIES prosper_core Vulkan::Vulkan)
       target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
 
       # Keep the production compute backend covered on native Windows too. This catches host- and
@@ -5706,11 +5702,11 @@ if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
   add_test(NAME float_transport_render COMMAND test_float_transport_render)
   set_tests_properties(float_transport_render PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 
-  add_executable(test_image_robustness tests/shared/device/test_image_robustness.cpp)
   # Spells `shared/...` and `gpu/...` includes, which resolve from `frontends` and `src`.
-  target_include_directories(test_image_robustness PRIVATE frontends src)
-  target_link_libraries(test_image_robustness PRIVATE prosper_core Vulkan::Vulkan)
-  add_test(NAME image_robustness COMMAND test_image_robustness)
+  prosper_add_gtest(test_image_robustness
+    SOURCES tests/shared/device/test_image_robustness.cpp
+    INCLUDES frontends src
+    LIBRARIES prosper_core Vulkan::Vulkan)
 endif()
 
 # Shared-device adoption guard (#1091). prosper_live_renderer only exists in frontend-enabled

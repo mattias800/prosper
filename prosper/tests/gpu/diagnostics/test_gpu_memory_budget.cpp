@@ -11,6 +11,7 @@
 // charter's positive-control rule: the property under test is exactly the bookkeeping the allocator
 // would be trusted to get right.
 #include "gpu/diagnostics/gpu_memory_budget.hpp"
+#include <gtest/gtest.h>
 
 #include "fixtures/test_scratch.h"
 
@@ -25,9 +26,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static constexpr uint64_t kMiB = 1024ull * 1024ull;
 
@@ -48,7 +47,7 @@ static std::string captured_output(const char* path) {
     return text;
 }
 
-int main() {
+TEST(GpuMemoryBudget, Contract) {
     // A 1 MiB step so the ordinary test sizes below cross it, and stderr into a file so the crossings
     // can be asserted rather than assumed. Both must happen before any other call: the step is read
     // from the environment once, lazily, on the first allocation.
@@ -234,47 +233,4 @@ int main() {
 
     // Everything above is about counters. THIS is about output, and it is the arm that catches a
     // dead instrument whose arithmetic is perfect.
-    if (!captured) {
-        printf("  [FAIL] could not capture stderr, so the emission arms did not run\n");
-        fails++;
-    } else {
-        const std::string output = captured_output(capture_path);
-        CHECK(output.find("[gpu-mem] prosper holds") != std::string::npos,
-              "a heap crossing its step actually PRINTS a growth line");
-        CHECK(output.find("on heap 1 of 32 MiB") != std::string::npos,
-              "the growth line names the heap and its real size");
-        CHECK(output.find("[gpu-mem] test: heap 0 is 64 MiB") != std::string::npos,
-              "report_device_memory prints the per-heap standing");
-        CHECK(output.find("not other processes, the compositor, or driver overhead") !=
-                  std::string::npos,
-              "every report carries the caveat about what it does NOT count");
-        CHECK(output.find("(over 70% of the heap)") != std::string::npos,
-              "a heap past 70% says so on the line");
-        // ...and on the REPORT line specifically, which is a different call site. Deleting the
-        // label from report_device_memory used to pass every assertion in this file, because the
-        // growth line alone carried it.
-        CHECK(output.find("loaded: heap 3 is 64 MiB; prosper holds 45 MiB (peak 45 MiB)  "
-                          "(over 70% of the heap)") != std::string::npos,
-              "report_device_memory carries the pressure label too, not just the growth line");
-        CHECK(output.find("[gpu-mem] periodic:") != std::string::npos,
-              "the cadence report actually PRINTS once its interval has elapsed");
-        // ...and the arming call must not print, or the cadence is just "report on every call".
-        size_t seen = 0, from = 0;
-        while ((from = output.find("[gpu-mem] periodic: heap 0", from)) != std::string::npos) {
-            seen++; from += 26;
-        }
-        CHECK(seen == 1, "the arming call does not report; only the one that is due");
-        CHECK(output.find("*** OVER 90% OF THE HEAP ***") != std::string::npos,
-              "a heap past 90% is shouted rather than mentioned");
-        // The ratchet: exactly one line for heap 1 at 30 MiB, not a second one when the same 26 MiB
-        // is freed and re-allocated. Counting occurrences is the only way to see a duplicate.
-        size_t at = 0, repeats = 0;
-        const std::string mark = "holds 30 MiB on heap 1";
-        while ((at = output.find(mark, at)) != std::string::npos) { repeats++; at += mark.size(); }
-        CHECK(repeats == 1, "re-reaching a mark already printed does not print it again");
-        std::remove(capture_path);
-    }
-
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

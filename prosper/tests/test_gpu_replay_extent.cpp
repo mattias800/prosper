@@ -1,15 +1,14 @@
 #include "../tools/gpu_replay/replay_output_extent.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 
 using namespace prosper::gpu;
 using namespace prosper::gpu::replay_tool;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(GpuReplayExtent, Contract) {
     std::printf("== test_gpu_replay_extent ==\n");
 
     GpuReplayFrame replay;
@@ -330,7 +329,4 @@ int main() {
               "bundle exact selector plans against selected final submit only");
     }
 
-    if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
-    std::printf("== PASS ==\n");
-    return 0;
 }

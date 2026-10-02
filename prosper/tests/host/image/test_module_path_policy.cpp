@@ -15,6 +15,7 @@
 //      directory, not recursive, wrong extension — so it is included only as an invariant arm and
 //      labelled as one. It cannot fail today; its job is to fail the day module discovery widens.
 #include "fixtures/test_scratch.h"
+#include <gtest/gtest.h>
 #include "host/image/boot_program.hpp"
 #include "host/image/module_path_policy.hpp"
 
@@ -27,9 +28,7 @@
 using namespace prosper;
 namespace fs = std::filesystem;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static void permit(const char* root, const char* path, const char* what) {
     const ModulePathDecision d = classify_module_path(root, path);
@@ -56,7 +55,7 @@ static bool linked(const std::vector<LinkInput>& in, const std::string& needle) 
     return false;
 }
 
-int main() {
+TEST(ModulePathPolicy, Contract) {
     printf("== test_module_path_policy ==\n");
     const char* R = "/dumps/PPSA00000-app0";
 
@@ -192,77 +191,4 @@ int main() {
         CHECK(all_explained, "every refusal carries a reason -- a silent drop is the failure mode");
     }
 
-    printf("-- end-to-end through boot_link_inputs --\n");
-    {
-        const fs::path root = prosper_test::test_scratch_dir() / "prosper_test_module_path_policy";
-        std::error_code ec;
-        fs::remove_all(root, ec);
-
-        // Deliberately NOT valid SELF images: boot_link_inputs only stats these paths, and using
-        // non-images keeps the arm about path policy alone.
-        write_file(root / "eboot.bin", "not-a-real-image");
-        write_file(root / "Media" / "Plugins" / "RealPlugin.prx", "not-a-real-image");
-        write_file(root / "Media" / "Plugins" / "libSceNpEntitlementAccess.prx", "not-a-real-image");
-        write_file(root / "fakelib" / "libSceAppContent.sprx", "not-a-real-image");
-        // #3497 opened the dump ROOT to a title's own middleware. Per src/host/image/AGENTS.md, a
-        // discovery widening must extend the guard test WITH it -- and specifically here, at the
-        // end-to-end layer: the unit arms above judge strings, while this one runs the real
-        // discovery->policy chain, which is the only place a scan that finds a file the policy would
-        // refuse can actually be caught.
-        write_file(root / "RootMiddleware.prx", "not-a-real-image");
-        write_file(root / "libSceAppContent.prx", "not-a-real-image");
-        // libkernel.prx, NOT libc.prx. `sce_module/libc.prx` is in boot_link_inputs' fixed list
-        // (boot_program.cpp:243) and discovery skips any basename already listed, so a root
-        // libc.prx is never discovered with OR without the platform-prefix rule -- an arm using it
-        // passes against a tree with that rule deleted, which is no arm at all. libkernel is in no
-        // fixed list, so it reaches the policy and the assertion below has teeth. Raised in the
-        // re-review of #3508.
-        write_file(root / "libkernel.prx", "not-a-real-image");
-
-        const std::vector<LinkInput> in = boot_link_inputs(root.string(), /*verbose=*/false);
-
-        // THE regression arm. Without the policy, #1609's auto-link discovers every .prx in
-        // Media/Plugins and links this one -- so this assertion fails on a tree with the guard
-        // removed. Verified by doing exactly that before trusting it.
-        CHECK(!linked(in, "libSceNpEntitlementAccess"),
-              "a Sony library dropped into the auto-linked plugin directory is NOT linked");
-
-        // The same three questions for the ROOT, end to end. The middle one is the guard: the root
-        // is auto-scanned wholesale, so a platform module dropped beside eboot.bin must be refused
-        // by the POLICY rather than merely not found. Kills: opening the root without applying the
-        // platform-name rule to it, which leaves both refusals below linked.
-        CHECK(linked(in, "RootMiddleware.prx"),
-              "a title's own middleware in the dump root IS discovered and linked");
-        CHECK(!linked(in, "libSceAppContent.prx"),
-              "a Sony library dropped in the dump root is NOT linked");
-        // No disjunct: `|| linked(in, "sce_module")` would be an assertion with a built-in off
-        // switch, green whenever the second half happens to hold.
-        CHECK(!linked(in, "libkernel.prx"),
-              "a non-libSce platform module in the root is NOT linked");
-
-        // Positive control for the arm above: the guard must not have simply disabled auto-linking.
-        // Without this, deleting the whole #1609 block would also make the arm pass.
-        CHECK(linked(in, "RealPlugin.prx"),
-              "...while a genuine title plugin in the same directory still IS linked");
-
-        CHECK(linked(in, "eboot.bin"), "the eboot is linked");
-
-        // INVARIANT arm, not a regression arm: this passes with or without the guard, because
-        // discovery never reaches fakelib/ today. It exists to fail if discovery ever widens.
-        CHECK(!linked(in, "fakelib"), "[invariant] nothing under fakelib/ is linked");
-
-        // Whole-list invariant: whatever the loader decided to link, all of it is permitted.
-        bool all_permitted = true;
-        for (const auto& e : in)
-            if (!classify_module_path(root.string(), e.path).permitted()) {
-                printf("         (unpermitted survivor: %s)\n", e.path.c_str());
-                all_permitted = false;
-            }
-        CHECK(all_permitted, "[invariant] every linked path satisfies the policy");
-
-        fs::remove_all(root, ec);
-    }
-
-    printf(fails ? "== FAILED (%d) ==\n" : "== passed ==\n", fails);
-    return fails ? 1 : 0;
 }

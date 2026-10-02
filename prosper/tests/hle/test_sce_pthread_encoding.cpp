@@ -12,6 +12,7 @@
 // tested elsewhere.
 
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 
 #include <cstdint>
@@ -20,16 +21,12 @@
 #include <string>
 #include <vector>
 
-static int failures = 0;
-static void check(bool ok, const std::string& what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what.c_str()); ++failures; }
-    else std::fprintf(stderr, "ok: %s\n", what.c_str());
-}
+static void check(bool ok, const std::string& what) { EXPECT_TRUE(ok) << what; }
 
 using prosper::Hle;
 using prosper::HleFn;
 
-int main() {
+TEST(ScePthreadEncoding, Contract) {
     std::fprintf(stderr, "== test_sce_pthread_encoding ==\n");
     prosper::register_kernel_hle();
 
@@ -137,6 +134,4 @@ int main() {
               "Sony wrapper rather than to the shared body");
     }
 
-    std::fprintf(stderr, failures ? "== FAIL ==\n" : "== PASS ==\n");
-    return failures ? 1 : 0;
 }

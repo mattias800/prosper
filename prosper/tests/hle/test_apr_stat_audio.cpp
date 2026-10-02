@@ -17,6 +17,7 @@
 // guest stat buffer resolves to itself.
 
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -32,11 +33,9 @@ namespace prosper {
 }
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); fails++; } \
-                              else          { std::printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
-int main() {
+TEST(AprStatAudio, Contract) {
     std::printf("== test_apr_stat_audio (#1142: AprGetFileStat + AudioOut2 speaker-array) ==\n");
     register_file_hle();
     register_audio_hle();
@@ -101,6 +100,4 @@ int main() {
         CHECK(sz == 0x600ull, "speaker-array size follows the 0x400 + speakers*0x40 VBAP contract");
     }
 
-    std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

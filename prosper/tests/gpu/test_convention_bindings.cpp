@@ -4,6 +4,7 @@
 // descriptor types at one binding -> layout-creation failure, the draw disappears (#157). Constant/
 // vertex buffers are assigned first (2/3+), matching the common cbufs-first shaders byte-for-byte.
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"   // kComputeInternalGdsBinding
 #include "gpu/resources/shader_resources.hpp"
 #include <cstdio>
@@ -13,13 +14,11 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static ShaderResource res(ResourceClass cls) { ShaderResource r{}; r.cls = cls; return r; }
 
-int main() {
+TEST(ConventionBindings, Contract) {
     printf("== test_convention_bindings ==\n");
     using RC = ResourceClass;
 
@@ -275,7 +274,4 @@ int main() {
         CHECK(seen.size() == count, "every resource still receives its own binding");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

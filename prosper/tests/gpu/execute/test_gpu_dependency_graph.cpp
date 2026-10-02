@@ -1,4 +1,5 @@
 #include "gpu/agc/agc_shader_layout.hpp"
+#include <gtest/gtest.h>
 #include "gpu/execute/gpu_dependency_graph.hpp"
 #include "gpu/state/vk_translate.hpp"
 
@@ -10,9 +11,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static ShaderResource resource(uint64_t addr, uint64_t bytes, uint32_t binding,
                                ResourceClass cls = ResourceClass::Texture) {
@@ -47,7 +46,7 @@ static std::vector<uint32_t> storage_image_copy_spirv() {
     return spv;
 }
 
-int main() {
+TEST(GpuDependencyGraph, Contract) {
     std::printf("== test_gpu_dependency_graph ==\n");
     GpuReplayFrame replay;
 
@@ -451,7 +450,4 @@ int main() {
           error.find("no materialized item") != std::string::npos,
           "graph rejects a falsely realized operation");
 
-    if (fails) return 1;
-    std::printf("== PASS ==\n");
-    return 0;
 }

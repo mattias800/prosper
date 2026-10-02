@@ -3,6 +3,7 @@
 // RDNA2->Vulkan mappings are NON-identity (e.g. RDNA2 triangle-strip=6 -> VK topology 4; DstColor
 // blend=8 -> VK DST_COLOR=4; Min comb=2 -> VK MIN=3) — proving translation, not passthrough.
 #include "gpu/state/render_state.hpp"
+#include <gtest/gtest.h>
 #include "gpu/state/vk_translate.hpp"
 #include <array>
 #include <cstdio>
@@ -10,11 +11,9 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(PipelineState, Contract) {
     printf("== test_pipeline_state ==\n");
 
     RenderState rs;
@@ -107,7 +106,4 @@ int main() {
           "negative yscale (-540, +Y-up NDC) -> flipped Vulkan viewport y=1080 h=-1080");
     CHECK(vp.min_depth == 0.0f && vp.max_depth == 1.0f, "zscale/zoffset 1/0 -> depth range 0..1");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

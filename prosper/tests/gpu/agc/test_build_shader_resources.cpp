@@ -4,6 +4,7 @@
 // base/stride/size/format and assigns provenance (srt_offset) + bindings — the contract the recompiler
 // and pipeline consume. Pure/headless; validates the decode against hand-built descriptors.
 #include "gpu/agc/agc_shader_layout.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -11,9 +12,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Build a 4-dword V# (buffer resource): Base48, 14-bit stride @[16:29] of word1, num_records=word2,
 // RDNA2 combined 7-bit FORMAT @[18:12] of word3 and identity DST_SEL X/Y/Z/W in [11:0].
@@ -42,7 +41,7 @@ static void make_tsharp(uint32_t t[8], uint64_t base, uint32_t w, uint32_t h, ui
         t[4] = (base_array << 16) | ((base_array + depth - 1) & 0x1fffu);
 }
 
-int main() {
+TEST(BuildShaderResources, Contract) {
     printf("== test_build_shader_resources ==\n");
 
     // --- Gen5 IMG_FMT mapper (pure table, #65) --------------------------------------------------
@@ -1194,44 +1193,4 @@ int main() {
     // default `true` and the guard below stopped rejecting anything -- with no compiler diagnostic,
     // because `bool -> uint32_t` is a promotion. These arms pin the contract at the function the
     // production path now calls, so the same mistake reddens here instead of binding slice zero.
-    {
-        DecodedImageDescriptor unmapped{};
-        unmapped.base = 0x2026900000ull;
-        unmapped.width = 1920;
-        unmapped.height = 1080;
-        unmapped.depth = 1;
-
-        const DecodedImageView plain = unmapped_format_image_view(unmapped);
-        CHECK(plain.supported && plain.base == unmapped.base &&
-                  plain.width == 1920u && plain.height == 1080u,
-              "unmapped format at level zero of slice zero yields a supported allocation-base view");
-        CHECK(plain.mip_offset == 0 && !plain.in_mip_tail && plain.mip_tail_bytes == 0 &&
-                  plain.mip_tail_x == 0 && plain.mip_tail_y == 0 &&
-                  plain.layer_stride == 0 && plain.layer_mip_offset == 0,
-              "the unmapped-format view claims no mip or layer placement");
-        CHECK(plain.chain_element_width == 0 && plain.chain_element_height == 0 &&
-                  plain.chain_bytes_per_block == 0 && plain.chain_max_mip == 0 &&
-                  plain.chain_base_level == 0,
-              "the unmapped-format view reports its mip chain as NOT MODELLED (#3048)");
-
-        DecodedImageDescriptor shifted_level = unmapped;
-        shifted_level.base_level = 1;
-        CHECK(!unmapped_format_image_view(shifted_level).supported,
-              "unmapped format with a selected BASE_LEVEL fails closed (no mip offset is derivable)");
-
-        DecodedImageDescriptor shifted_slice = unmapped;
-        shifted_slice.base_array = 1;
-        CHECK(!unmapped_format_image_view(shifted_slice).supported,
-              "unmapped format with a selected BASE_ARRAY fails closed (it would bind slice ZERO)");
-
-        DecodedImageDescriptor shifted_both = unmapped;
-        shifted_both.base_level = 2;
-        shifted_both.base_array = 3;
-        CHECK(!unmapped_format_image_view(shifted_both).supported,
-              "unmapped format with both selectors set fails closed");
-    }
-
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

@@ -9,15 +9,14 @@
 // and an honest caller frame sits at a HIGHER address than its callee's.
 
 #include "host/fault/rbp_chain.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
 
 using namespace prosper::host;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // A readable window the predicate below reports on. Everything outside it is "unmapped", so a walk
 // that stepped past the end of the stack would be caught here instead of segfaulting the test.
@@ -29,7 +28,7 @@ static bool in_window(uint64_t a) {
 }
 static bool never_readable(uint64_t) { return false; }
 
-int main() {
+TEST(RbpChain, Contract) {
     std::printf("== test_rbp_chain ==\n");
 
     // frame[i] = { saved_rbp -> frame[i+1], return address }
@@ -109,6 +108,4 @@ int main() {
         g_lo = &st[0]; g_hi = &st[8];
     }
 
-    std::printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
 }

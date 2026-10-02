@@ -3,6 +3,7 @@
 // a real per-(user,slot) block: Setup allocates, Set writes guest->block, Get reads block->guest,
 // Sync commits. Struct layouts mirror shadPS4 save_data/savedata.cpp (offsets asserted below).
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/fs/save_paths.hpp"
 #include <cstdio>
 #include <cstdlib>   // setenv (test-private save dir)
@@ -20,9 +21,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Guest struct mirrors (natural x86-64 alignment == the guest's LP64 layout).
 struct MemData    { void* buf; uint64_t bufSize; int64_t offset; uint8_t rsv[40]; };
@@ -63,7 +62,7 @@ static bool all_bytes_are(const void* data, size_t size, uint8_t value) {
     return true;
 }
 
-int main() {
+TEST(SavedataIme, Contract) {
     printf("== test_savedata_ime ==\n");
     const int process_id =
 #ifdef _WIN32
@@ -291,7 +290,4 @@ int main() {
 
     std::filesystem::remove_all(test_root, mount_ec);
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

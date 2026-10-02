@@ -14,6 +14,7 @@
 // fallback. It returns composed paths unchanged whenever the exact-case entry exists (or nothing
 // matches), which keeps the byte-exact checks below valid on case-insensitive filesystems too.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -24,13 +25,11 @@
 namespace fs = std::filesystem;
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static bool denied(const std::string& r) { return r.rfind("/prosper-denied", 0) == 0; }
 
-int main() {
+TEST(TranslateSandbox, Contract) {
     std::printf("== test_translate_sandbox ==\n");
     std::error_code ec;
     const fs::path root = prosper_test::test_scratch_dir() / "prosper_test_translate_sandbox";
@@ -184,6 +183,4 @@ int main() {
     }
 
     fs::remove_all(root, ec);
-    std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

@@ -41,6 +41,7 @@
 // Every arm reports independently instead of returning at the first failure, so a mutation run can
 // see which arms moved.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -50,9 +51,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     if (spv.size() < 5) return false;
@@ -96,7 +95,7 @@ static std::vector<uint32_t> compile(const uint32_t* code, size_t dwords, uint64
 //   0x4A020000  v_add_nc_u32 v1, s0, v0
 // ---------------------------------------------------------------------------------------------
 
-int main() {
+TEST(EntryVccDead, Contract) {
     printf("== test_entry_vcc_dead ==\n");
 
     // ---------------------------------------------------------------------------------------------
@@ -281,19 +280,4 @@ int main() {
     CHECK(!dominated.empty() && has_opcode(dominated, kOpSwitch),
           "#2952: a successor-block define that DOMINATES every VCC read compiles, via the dispatcher");
 
-    if (fails) {
-        printf("  [info] arm reject reason:           '%s'\n",
-               last_terminal_reject_reason(0x32310001ull).c_str());
-        printf("  [info] control A reject reason:     '%s'\n",
-               last_terminal_reject_reason(0x32310002ull).c_str());
-        printf("  [info] negative reject reason:      '%s'\n", negative_reason.c_str());
-        printf("  [info] half-pair reject reason:     '%s'\n",
-               last_terminal_reject_reason(0x32310004ull).c_str());
-        printf("  [info] late-define reject reason:   '%s'\n",
-               last_terminal_reject_reason(0x32310005ull).c_str());
-        printf("== FAIL: %d ==\n", fails);
-        return 1;
-    }
-    printf("== PASS ==\n");
-    return 0;
 }

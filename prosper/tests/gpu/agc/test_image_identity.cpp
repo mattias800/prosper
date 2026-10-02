@@ -9,13 +9,12 @@
 // Each arm below states a rule the aliasing depends on, and each has a counter-arm: a predicate that
 // returned a constant would fail the pair.
 #include "gpu/resources/image_identity.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); ++fails; } \
-                         else printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static ShaderResource base_descriptor() {
     ShaderResource r{};
@@ -28,7 +27,7 @@ static ShaderResource base_descriptor() {
     return r;
 }
 
-int main() {
+TEST(ImageIdentity, Contract) {
     printf("== image identity (#3204) ==\n");
     const ComputeImageViewShape shape{false, 1, 1};
 
@@ -139,6 +138,4 @@ int main() {
         CHECK(!shader_resource_same_sampler(c, d), "a different swizzle is a different sampler");
     }
 
-    printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
 }

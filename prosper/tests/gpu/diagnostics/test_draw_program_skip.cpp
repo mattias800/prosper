@@ -11,6 +11,7 @@
 // about a program nobody selected), it must report which stage matched, and its rate limit must
 // carry the ordinal so the cap can never be read as the rate.
 #include "gpu/diagnostics/draw_program_skip.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 #include <cstring>
@@ -18,9 +19,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -33,7 +32,7 @@ constexpr uint64_t kPs    = 0x5002af200ull;
 
 }  // namespace
 
-int main() {
+TEST(DrawProgramSkip, Contract) {
     printf("== test_draw_program_skip ==\n");
 
     // ---- default OFF -------------------------------------------------------------------------
@@ -176,7 +175,4 @@ int main() {
               "the census reports how many distinct program triples it has seen");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }
