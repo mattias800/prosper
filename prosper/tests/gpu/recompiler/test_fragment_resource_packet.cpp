@@ -8,6 +8,7 @@
 #include <fstream>
 #include <cstdio>
 #include <cstdlib>
+#include <unordered_map>
 #include <gtest/gtest.h>
 
 namespace {
@@ -65,7 +66,8 @@ void reject(const FragmentResourcePacket& p, const std::string& reason, const st
     check(r.packet.rejection == reason, name + " exact reason=" + r.packet.rejection);
 }
 void runtime_reject(const FragmentResourcePacket& p, FragmentPacketRuntimeFailure reason,
-                    const std::string& name, const std::filesystem::path& directory, uint32_t lane = 0) {
+                    const std::string& name, const std::filesystem::path& directory,
+                    uint32_t first_pc, uint32_t lane = 0) {
     const auto program = compile(p);
     check(!program.packet.spirv.empty(), name + " runtime obligation emitted: " + program.packet.rejection);
     if (program.packet.spirv.empty()) return;
@@ -74,6 +76,8 @@ void runtime_reject(const FragmentResourcePacket& p, FragmentPacketRuntimeFailur
     const auto r = decode_fragment_resource_packet(program, words, true, p.device.device_identity);
     check(r.exports.empty() && !r.rejection.empty() && r.failure == reason && r.lane == lane,
           name + " whole packet refused with deterministic lane/first reason");
+    check(r.pc == first_pc, name + " original first failing guest PC=" + std::to_string(first_pc) +
+          " actual=" + std::to_string(r.pc));
     dump(program, name, directory);
 }
 std::vector<uint32_t> arithmetic_expected(uint32_t raw) {
@@ -114,12 +118,20 @@ TEST(FragmentResourcePacket, OriginalOwnedChainsAndTransactionalConsumer) {
         // A valid typed arithmetic omission must alter the executed SOURCE, not just the oracle's
         // expected array. The first live uint64 multiply carries real nonzero P10 or numeric data.
         auto mutant = program.packet.spirv;
-        uint32_t wide = 0, boolean = 0; size_t site = 0;
+        uint32_t wide = 0, boolean = 0, narrow = 0; size_t site = 0, direction_select = 0;
+        std::unordered_map<uint32_t, uint32_t> comparisons;
         for (size_t pc = 5; pc < mutant.size();) {
             const auto n = mutant[pc] >> 16, op = mutant[pc] & 0xffff;
             if (!n || n > mutant.size() - pc) break;
             if (op == 21 && n == 4 && mutant[pc + 2] == 64) wide = mutant[pc + 1];
+            if (op == 21 && n == 4 && mutant[pc + 2] == 32 && mutant[pc + 3] == 0) narrow = mutant[pc + 1];
             if (op == 20 && n == 2) boolean = mutant[pc + 1];
+            if ((op == 174 || op == 176) && n == 5) comparisons[mutant[pc + 2]] = op;
+            // The packer's normal/subnormal shift direction selects BOOL comparisons, not
+            // uint bits. This is the actual invalid OpSelect caught by the first native run.
+            if (op == 169 && n == 6 && mutant[pc + 1] == boolean &&
+                comparisons[mutant[pc + 3]] == 174 && comparisons[mutant[pc + 4]] == 174 &&
+                comparisons[mutant[pc + 5]] == 176 && !direction_select) direction_select = pc;
             if (op == 132 && n == 5 && mutant[pc + 1] == wide && !site) site = pc;
             pc += n;
         }
@@ -131,6 +143,12 @@ TEST(FragmentResourcePacket, OriginalOwnedChainsAndTransactionalConsumer) {
             mutant = program.packet.spirv; mutant[site + 1] = boolean;
             (void)evaluate(program, error, &mutant);
             check(!error.empty(), name + " wrong uint64 result type fails closed");
+        }
+        check(direction_select && narrow, name + " actual Boolean rounding-direction Select found");
+        if (direction_select) {
+            mutant = program.packet.spirv; mutant[direction_select + 1] = narrow;
+            std::string error; (void)evaluate(program, error, &mutant);
+            check(error == "Select type mismatch", name + " Boolean arms with uint result fail closed");
         }
     }
 }
@@ -193,36 +211,43 @@ TEST(FragmentResourcePacket, FiniteArithmeticAllRoundingAndDenormalModes) {
 }
 TEST(FragmentResourcePacket, RuntimeFailureIsStickyAndSuppressesWholePacket) {
     const auto directory = dump_directory();
-    runtime_reject(fixture::arithmetic(8, 0x7f7fffff, 0x40000000, 0x30), FragmentPacketRuntimeFailure::FiniteOverflow, "finite_overflow", directory);
-    runtime_reject(fixture::arithmetic(3, 0x7fc00001, 0x3f800000, 0x30), FragmentPacketRuntimeFailure::NonFinite, "nonfinite_no_fake_canonical_nan", directory);
+    runtime_reject(fixture::arithmetic(8, 0x7f7fffff, 0x40000000, 0x30), FragmentPacketRuntimeFailure::FiniteOverflow, "finite_overflow", directory, 0);
+    runtime_reject(fixture::arithmetic(3, 0x7fc00001, 0x3f800000, 0x30), FragmentPacketRuntimeFailure::NonFinite, "nonfinite_no_fake_canonical_nan", directory, 0);
     auto p = fixture::chain();
     p.invocation.vgprs[0].words[63] = 0x7fc00001;
-    runtime_reject(p, FragmentPacketRuntimeFailure::InterpolationNotExact, "lane63_whole_packet_rejection", directory, 63);
+    std::vector<Rdna2Inst> decoded;
+    rdna2_walk(p.invocation.guest_code.data(), p.invocation.guest_code.size(), decoded);
+    const auto first_p1 = std::find_if(decoded.begin(), decoded.end(),
+        [](const auto& in) { return in.fmt == Rdna2Format::VINTRP; });
+    ASSERT_NE(first_p1, decoded.end());
+    ASSERT_EQ(first_p1->pc, 4u); ASSERT_EQ(first_p1->opcode, 0u);
+    // This same lane subsequently fails P2 and sampling. Neither may overwrite first PC4.
+    runtime_reject(p, FragmentPacketRuntimeFailure::InterpolationNotExact, "lane63_whole_packet_rejection", directory, 4, 63);
     p = fixture::chain(); p.invocation.sgprs.back().second = 0; // actual S# high word mismatch
     // sampler word3 is already zero; mutate the actual first S# word instead.
     for (auto& [reg, value] : p.invocation.sgprs) if (reg == 12) value ^= 1;
-    runtime_reject(p, FragmentPacketRuntimeFailure::DescriptorMismatch, "actual_sampler_identity", directory);
+    runtime_reject(p, FragmentPacketRuntimeFailure::DescriptorMismatch, "actual_sampler_identity", directory, p.images[0].pc);
     p = fixture::chain(); for (auto& [reg, value] : p.invocation.sgprs) if (reg == 16) value ^= 1;
-    runtime_reject(p, FragmentPacketRuntimeFailure::M0Mismatch, "actual_original_m0_writer", directory);
+    runtime_reject(p, FragmentPacketRuntimeFailure::M0Mismatch, "actual_original_m0_writer", directory, 4);
     p = fixture::chain(); for (auto& t : p.parameter_cache.parameters) { t.p0 = 0x3f800000; t.p10 = 0x33800000; }
     p.invocation.vgprs[0].words.fill(0x3f800000);
-    runtime_reject(p, FragmentPacketRuntimeFailure::InterpolationNotExact, "interpolation_halfway_not_exact", directory);
+    runtime_reject(p, FragmentPacketRuntimeFailure::InterpolationNotExact, "interpolation_halfway_not_exact", directory, 4);
     p = fixture::chain(); for (auto& t : p.parameter_cache.parameters) t.p10 = 0x00800000;
     p.invocation.vgprs[0].words.fill(0x3f000000);
-    runtime_reject(p, FragmentPacketRuntimeFailure::InterpolationNotExact, "interpolation_underflow_not_normal", directory);
+    runtime_reject(p, FragmentPacketRuntimeFailure::InterpolationNotExact, "interpolation_underflow_not_normal", directory, 4);
     p = fixture::chain(true); p.buffers[0].words[2] = fixture::bits(0.0f);
-    runtime_reject(p, FragmentPacketRuntimeFailure::SampleCoordinateDomain, "original_explicit_lod_changes_coordinate_obligation", directory);
+    runtime_reject(p, FragmentPacketRuntimeFailure::SampleCoordinateDomain, "original_explicit_lod_changes_coordinate_obligation", directory, p.images[0].pc);
     p = fixture::chain(true); p.buffers[0].words[2] = fixture::bits(0.5f);
-    runtime_reject(p, FragmentPacketRuntimeFailure::SampleLodDomain, "fractional_lod_named_not_rounded", directory);
+    runtime_reject(p, FragmentPacketRuntimeFailure::SampleLodDomain, "fractional_lod_named_not_rounded", directory, p.images[0].pc);
     p = fixture::chain();
     const auto sample_pc = p.images[0].pc;
     p.invocation.guest_code.insert(p.invocation.guest_code.begin() + sample_pc,
         {0x7e1402ffu, fixture::bits(0.125f) + 1}); // original v10 <- literal adjacent ULP
     update_image_pc(p);
-    runtime_reject(p, FragmentPacketRuntimeFailure::SampleCoordinateDomain, "adjacent_ulp_not_exact_texel_center", directory);
+    runtime_reject(p, FragmentPacketRuntimeFailure::SampleCoordinateDomain, "adjacent_ulp_not_exact_texel_center", directory, p.images[0].pc);
     p = fixture::chain();
     for (auto& parameter : p.parameter_cache.parameters) parameter.p0 = parameter.p10 = parameter.p20 = 0;
-    runtime_reject(p, FragmentPacketRuntimeFailure::InterpolationNotExact, "interpolation_zero_sign_authority_unavailable", directory);
+    runtime_reject(p, FragmentPacketRuntimeFailure::InterpolationNotExact, "interpolation_zero_sign_authority_unavailable", directory, 4);
 }
 TEST(FragmentResourcePacket, CompletionAndOwnershipAreCompileTimeObligations) {
     auto p = fixture::chain();

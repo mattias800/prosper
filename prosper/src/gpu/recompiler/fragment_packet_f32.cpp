@@ -47,7 +47,7 @@ struct IntegerF32 {
         const auto normal = b.ucmp(Op_UGreaterThanEqual, scale, b.uconst(386));
         const auto normal_right = b.ucmp(Op_UGreaterThanEqual, msb, b.uconst(23));
         const auto sub_right = b.ucmp(Op_ULessThan, exponent, b.uconst(363));
-        const auto right = b.sel(normal, normal_right, sub_right);
+        const auto right = b.bsel(normal, normal_right, sub_right);
         const auto shift = b.sel(normal,
             b.sel(normal_right, b.ibin(Op_ISub, msb, b.uconst(23)), b.ibin(Op_ISub, b.uconst(23), msb)),
             b.sel(sub_right, b.ibin(Op_ISub, b.uconst(363), exponent), b.ibin(Op_ISub, exponent, b.uconst(363))));

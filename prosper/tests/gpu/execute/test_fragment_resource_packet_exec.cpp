@@ -21,7 +21,12 @@ class FragmentResourcePacketExecution : public testing::Test {
         if (!prosper::test::default_compute_subgroup_properties().size)
             GTEST_SKIP() << "No Vulkan compute device; no execution credited";
     }
-    void TearDown() override { RecordProperty("owned_dispatch_attempts", dispatches); }
+    void TearDown() override {
+        RecordProperty("owned_dispatch_attempts", dispatches);
+        const auto* info = testing::UnitTest::GetInstance()->current_test_info();
+        std::printf("[fragment-resource-packet-execution] case=%s.%s owned_dispatch_attempts=%d\n",
+                    info->test_suite_name(), info->name(), dispatches);
+    }
 };
 struct Execution {
     FragmentResourcePacketProgram program;
@@ -131,8 +136,10 @@ TEST_F(FragmentResourcePacketExecution, FailedHighLaneSuppressesEveryExport) {
     if (unsupported_owner) GTEST_SKIP() << "Queried+enabled Int64/RGBA32F owner unavailable";
     check(result.result.exports.empty() && result.result.failure == FragmentPacketRuntimeFailure::InterpolationNotExact && result.result.lane == 63,
           "one high-half failure suppresses ALL exports after all workers complete");
+    EXPECT_EQ(result.result.pc, 4u) << "later P2/image failures must preserve original first P1 PC4";
     bad = fixture::chain(); for (auto& [reg, value] : bad.invocation.sgprs) if (reg == 16) value ^= 1;
     result = execute(bad, "failure_original_m0");
     check(result.result.exports.empty() && result.result.failure == FragmentPacketRuntimeFailure::M0Mismatch,
           "actual reaching original M0 identity required");
+    EXPECT_EQ(result.result.pc, 4u) << "original first parameter consumer detects M0 identity";
 }
