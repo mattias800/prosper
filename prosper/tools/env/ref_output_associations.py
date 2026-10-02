@@ -167,12 +167,12 @@ def discover_output_associations(root: Path, files: dict[Path, list[str]], defau
             match = MARKER.match(line)
             if not match:
                 if re.match(r'^\s*//\s*PROSPER_DIAG_REF_OUTPUTS\b', line):
-                    record = OutputAssociation(str(path.relative_to(root)), index+1, '', '', ())
+                    record = OutputAssociation(path.relative_to(root).as_posix(), index+1, '', '', ())
                     record.errors.append('malformed reference-output marker')
                     records.append(record)
                 continue
             fields = tuple(part.strip() for part in match[3].split(','))
-            record = OutputAssociation(str(path.relative_to(root)), index+1,
+            record = OutputAssociation(path.relative_to(root).as_posix(), index+1,
                                        match[1], match[2], fields)
             records.append(record)
             try:
@@ -228,7 +228,7 @@ def _validate(record, root, files, defaulted_local, declared_params):
     path, first, last, body, defined_params = definitions[0]
     if defined_params != declared_params:
         raise ValueError('declaration/definition parameter mismatch')
-    record.source_path, record.source_start, record.source_end = str(path.relative_to(root)),first,last
+    record.source_path, record.source_start, record.source_end = path.relative_to(root).as_posix(),first,last
     aliases = [m for line in body.splitlines() if (m := ALIAS.match(line)) and m[2] == record.parameter]
     for name in record.fields:
         matches = [m[1] for m in aliases if m[3] == name]
@@ -417,7 +417,7 @@ def _header_value_consumer(structural, qualified: str, root: Path):
         for declaration in declaration_re.finditer(text):
             if opening < declaration.start() < end and brace_ancestors(text,declaration.start()) == (opening,):
                 accounted.add(declaration.start('name'))
-                candidates.append({'kind': 'qualified-header', 'path': str(path.relative_to(root)),
+                candidates.append({'kind': 'qualified-header', 'path': path.relative_to(root).as_posix(),
                                    'line': text.count('\n',0,declaration.start())+1,
                                    'positions': sorted(_primitive_value_positions(declaration['params']))})
         # Unsupported/multiline overloads must not vanish from uniqueness. Every
@@ -541,7 +541,7 @@ def _validate_calls(record, root, files, structural, signatures, defaulted_local
                 calling_closures = _validate_closure_uses(text, set(), (match.start(),))
             except ValueError as error:
                 raise ValueError('associated call is inside a closure without verified local uses: ' + str(error))
-            record.calling_closures.extend(dict(closure, path=str(path.relative_to(root)),
+            record.calling_closures.extend(dict(closure, path=path.relative_to(root).as_posix(),
                                                associated_line=line) for closure in calling_closures)
             end = matching(text,opening,'(',')')
             arguments = [value.strip() for value in text[opening+1:end].split(',')]
@@ -566,7 +566,7 @@ def _validate_calls(record, root, files, structural, signatures, defaulted_local
             for field_match in re.finditer(r'\.(\w+)\s*=\s*(\w+)', text[start+1:finish]):
                 if field_match[1] in record.fields:
                     binding_line = text.count('\n', 0, start+1+field_match.start())+1
-                    record.binding_lines.add((str(path.relative_to(root)), binding_line, field_match[1]))
+                    record.binding_lines.add((path.relative_to(root).as_posix(), binding_line, field_match[1]))
             object_id = (str(path),aggregate[0].start())
             if object_id in admitted_objects:
                 raise ValueError('context object used by multiple calls')
@@ -600,8 +600,8 @@ def _validate_calls(record, root, files, structural, signatures, defaulted_local
             caller_names = {bindings[field] for field in record.fields}
             _validate_closure_uses(text, caller_names)
             _refuse_unknown_calls(text, caller_names, record, structural, root,
-                                  str(path.relative_to(root)), allowed_initializers=((start,finish),))
-            call_key = (str(path.relative_to(root)),line)
+                                  path.relative_to(root).as_posix(), allowed_initializers=((start,finish),))
+            call_key = (path.relative_to(root).as_posix(),line)
             if call_key in record.calls:
                 raise ValueError('multiple associated calls on one line')
             record.calls[call_key] = {field:bindings[field] for field in record.fields}
