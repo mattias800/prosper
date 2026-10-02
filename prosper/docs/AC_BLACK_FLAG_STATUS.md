@@ -52,8 +52,21 @@ $env:PROSPER_BOOTPHASE='1'; $env:PROSPER_EXIT_ON_GUEST_END='1'
    and the primary thread died (`ACCESS-VIOLATION addr=0x3 rax=0x3`). With the fix the guest passes
    that instruction and the `SystemLogger` thread runs. `CONFIDENCE: MED` on the handle layout (first
    dword is the thread id): inferred from this one disassembly, not checked against a PS5.
-2. **Next: the host process dies with exit code `0xC0000005`** shortly after `sceKeyboardInit`. The
-   faulting address and the guest context have not been captured yet.
+2. **Next, and now explained: the title aborts itself on a failed archive read.** The process exit
+   code `0xC0000005` is the title's own deliberate crash, not a prosper host fault. Under gdb (Python
+   script that lets prosper's expected `%fs:0` TLS-emulation faults and the init-function fault pass),
+   the first other fault is at `eboot+0x5bcf9e4`, `mov DWORD PTR ds:0x2,0x0` (a write to address 2),
+   reached straight after `call eboot+0x80` with `esi=0x100`. That is a `snprintf`-style call into a
+   256-byte buffer, and the format string at `eboot+0xab1bd80` is
+   `fseek error while reading the fat. Seek pos: %llu bigfile: %s`. So the title is reporting that an
+   `fseek` on one of its `DataPS5_*.forge` "bigfile" archives failed while reading the archive's file
+   allocation table, then crashes on purpose. The `%llu` argument was `0x524550534f525000`, which is
+   not a plausible file offset and reads as the ASCII bytes of the string "PROSPER" shifted by one;
+   whether that is prosper leaving an output uninitialised (for example an unimplemented `ftell` or
+   `fgetpos`) is **not** established. Evidence: `gdb` run 2026-10-02 at main `deff140b8d4a` plus
+   #4129; disassembly of the SELF `eboot.bin` flattened with `tools/il2cpp/prx_to_elf.py`. Still
+   open: which libc or kernel call failed, with what offset and whence, and on which archive. The
+   stubs listed below were **not** the cause of this abort.
 
 Unexplained and not yet shown to matter:
 
@@ -77,5 +90,9 @@ Unexplained and not yet shown to matter:
   and the renderer registered; no guest flip was ever issued because the guest was dead. The one
   `VK_KHR_surface` failure seen came from the host Vulkan ICD not being registered (§ Reproduction), not
   from prosper.
+- **"The host crashes in an HLE stub after `sceKeyboardInit`."** Falsified for the first host-visible
+  death: the exit code `0xC0000005` is the title's own abort path (write to address 2 after formatting
+  `fseek error while reading the fat ...`), reached from `eboot+0x5bcf9e4`. The unimplemented stubs
+  seen before it did not cause it. They may still matter later.
 - **"The boot or link phase is what stalls."** Falsified by the phase log: all seven phases complete
   (`PROCESS_START` through `BOOT_COMPLETE`) in under 2.1 s.
