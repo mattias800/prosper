@@ -3,6 +3,7 @@
 // This is separate from the lock-free ledger: only a REFUSAL pays the bounded identity lookup
 // and first-observation log. Accepted uses add only a coarse counter; no guest reads or clocks.
 #include "diagnostics/perf/perf_ledger.hpp"
+#include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <array>
 #include <cstdio>
 #include <mutex>
@@ -51,7 +52,8 @@ inline void observe_wave64_shader(uint32_t guest_wave, bool compute) {
 inline void note_unsupported_wave64(Wave64Refusal site, uint32_t guest_wave,
                                     uint64_t program, uint64_t identity = 0,
                                     uint32_t wave_reasons = UINT32_MAX,
-                                    uint32_t host_min = 0, uint32_t host_max = 0) {
+                                    uint32_t host_min = 0, uint32_t host_max = 0,
+                                    const gpu::FragmentVoteLoweringDiagnostic& lowering = {}) {
     const size_t i = static_cast<size_t>(site);
     if (!enabled() || guest_wave != 64 || i >= kWave64RefusalCount) return;
     const bool compute = site == Wave64Refusal::ComputeRecompile ||
@@ -91,16 +93,36 @@ inline void note_unsupported_wave64(Wave64Refusal site, uint32_t guest_wave,
         std::snprintf(host, sizeof host, "%u..%u", host_min, host_max);
     if (wave_reasons != UINT32_MAX)
         std::snprintf(reasons, sizeof reasons, "0x%x", wave_reasons);
+    char detail[256] = "";
+    if (site == Wave64Refusal::FragmentSubgroup) {
+        if (!lowering.attempted) {
+            std::snprintf(detail, sizeof detail, " lowering=not-attempted");
+        } else if (lowering.refusal == gpu::FragmentVoteRefusal::UnprovedVote &&
+                   lowering.failed_vote.available) {
+            const auto& vote = lowering.failed_vote;
+            char opcode[32] = "unavailable";
+            if (vote.predicate_opcode != UINT32_MAX)
+                std::snprintf(opcode, sizeof opcode, "%u", vote.predicate_opcode);
+            std::snprintf(detail, sizeof detail,
+                " lowering=unproved-vote vote-source-word=%zu vote-result-id=%u "
+                "vote-predicate-id=%u predicate-def-op=%s",
+                vote.source_word, vote.vote_result_id, vote.predicate_id, opcode);
+        } else {
+            std::snprintf(detail, sizeof detail, " lowering=%s failed-vote=unavailable",
+                          gpu::fragment_vote_refusal_name(lowering.refusal));
+        }
+    }
     std::fprintf(stderr,
         "[wave64-unsupported] stage=%s program=0x%llx identity=0x%llx "
         "refusal=%s guest-wave=64 host-subgroups=%s wave-reasons=%s consequence=%s "
-        "next=%s\n",
+        "next=%s%s\n",
         compute ? "compute" : "fragment", (unsigned long long)program,
         (unsigned long long)identity, kWave64RefusalNames[i], host, reasons,
         compute ? "dispatch-skipped/output-unwritten" : "draw-dropped/content-missing",
         site == Wave64Refusal::FragmentRecompile || site == Wave64Refusal::ComputeRecompile
             ? "recompiler/resource-binding; PROSPER_DBG_PROGRAM=<program> for rejection pc"
-            : "subgroup-contract/lowering; see the adjacent backend skip and wave reason bits");
+            : "subgroup-contract/lowering; see the adjacent backend skip and wave reason bits",
+        detail);
 }
 
 } // namespace prosper::diagnostics::perf
