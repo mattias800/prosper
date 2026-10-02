@@ -2777,11 +2777,14 @@ static bool split_final_state() {
 // Distinct from the Acb per-queue map: keyed by nothing, because there is exactly one Dcb-final
 // stream. Retained process-lifetime like the graphics state it shadows.
 static gpu::GpuState& agc_final_state() { static gpu::GpuState st; return st; }
-static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const char* who,
-                                  uint64_t queue_id = 0) {
-    if (!addr) return 0;
-    constexpr uint32_t kUnknownCap = 0x80000;   // 512 KiB of dwords — well past any real Dcb
-    uint32_t walk = dw_num ? dw_num : kUnknownCap;
+[[noreturn]] static void unsupported_multi_dcb(const char* reason, size_t count, size_t index = 0) {
+    fprintf(stderr, "[agc] sceAgcDriverSubmitMultiDcbs unsupported: %s (count=%zu index=%zu)\n",
+            reason, count, index);
+    std::abort();
+}
+static uint64_t submit_dcb_buffers(const gpu::CommandBuffer* buffers, size_t buffer_count,
+                                   const char* who, uint64_t queue_id = 0,
+                                   bool explicit_lengths = true, bool require_complete_pm4 = false) {
     FoldLedgerScope ledger(who);   // #1226 (arc7): entry stamp BEFORE the lock, like call_stamp
     const SubmitCallStamp call_stamp = stamp_submit_call();   // BEFORE the lock: see the note above
     // unique_lock rather than lock_guard only so the SUBMIT_STALL_OUTSIDE discriminator can release
@@ -2789,6 +2792,21 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     // lock_guard's (acquired here, released at return).
     std::unique_lock<std::mutex> lk(g_agc_state_mu);   // serialize with the other submit entry (#278)
     ledger.locked();
+    if (require_complete_pm4) {
+        // Validate every segment before shared state changes, under the same lock as folding (the
+        // decoder also owns diagnostic counters). This does not establish partial acceptance.
+        for (size_t i = 0; i < buffer_count; ++i) {
+            std::vector<gpu::Pm4Command> commands;
+            if (gpu::decode_pm4(buffers[i].data, buffers[i].dwords, commands) != buffers[i].dwords)
+                unsupported_multi_dcb("incomplete PM4 decode", buffer_count, i);
+            for (const auto& command : commands)
+                // CbNop emits IT_NOP/r=0 data padding. The legacy decoder labels it Unknown,
+                // but skipping its payload is the builder's established no-op behavior.
+                if (command.kind == gpu::Pm4Command::Kind::Unknown &&
+                    !(command.op == gpu::IT_NOP && command.r == 0))
+                    unsupported_multi_dcb("unknown PM4 packet", buffer_count, i);
+        }
+    }
     const bool async_compute = strcmp(who, "SubmitAcb") == 0;
     const bool dcb_final = strcmp(who, "SubmitDcbFinal") == 0;
     gpu::GpuState& state = async_compute            ? agc_compute_state(queue_id)
@@ -2818,11 +2836,22 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     state.dma_execution_rejected = false;
     state.ordered_memory_effects.clear();
     state.capture_dma_data_records = gpu::begin_gpu_timeline_submit(g_submit_count + 1);
-    size_t consumed = 0;
-    size_t applied = gpu::run_command_buffer(addr, walk, state, &consumed);
+    std::vector<size_t> consumed(buffer_count);
+    size_t applied = gpu::run_command_buffers(buffers, buffer_count, state, consumed.data());
     g_submit_count++;
-    report_short_fold(who, g_submit_count, addr, dw_num, consumed);
-    report_submit_order(who, call_stamp, g_submit_count, addr, dw_num, state.draws.size());
+    size_t total_dwords = 0;
+    for (size_t i = 0; i < buffer_count; ++i) {
+        total_dwords += buffers[i].dwords;
+        report_short_fold(who, g_submit_count, buffers[i].data,
+                          explicit_lengths ? static_cast<uint32_t>(buffers[i].dwords) : 0,
+                          consumed[i]);
+    }
+    // The existing order diagnostic records an entry pointer/length. For a batch that is its
+    // first segment; the batch log below reports the complete count, without truncating a sum.
+    const auto& first = buffers[0];
+    report_submit_order(who, call_stamp, g_submit_count, first.data,
+                        explicit_lengths ? static_cast<uint32_t>(first.dwords) : 0,
+                        state.draws.size());
     gpu::diagnose_compute_dispatches(state, g_submit_count);
     static unsigned draw_submits2 = 0;
     execute_submit_work(state, g_submit_count, draw_submits2);
@@ -2842,15 +2871,31 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     mb3_poison_probe(g_submit_count);
     ledger.work_done();   // #1226 (arc7): everything after this is the diagnostic stall
     submit_stall();
-    if (getenv("PROSPER_GFXLOG"))
-        fprintf(stderr, "[agc] %s #%llu: %u dwords (walk=%u) -> %zu packets applied (draws: %zu, dispatches: %llu)\n",
-                who, (unsigned long long)g_submit_count, dw_num, walk, applied,
-                state.draws.size(), (unsigned long long)state.dispatch_count);
+    if (getenv("PROSPER_GFXLOG")) {
+        if (buffer_count == 1)
+            fprintf(stderr, "[agc] %s #%llu: %u dwords (walk=%u) -> %zu packets applied (draws: %zu, dispatches: %llu)\n",
+                    who, (unsigned long long)g_submit_count,
+                    explicit_lengths ? static_cast<uint32_t>(first.dwords) : 0,
+                    static_cast<uint32_t>(first.dwords), applied,
+                    state.draws.size(), (unsigned long long)state.dispatch_count);
+        else
+            fprintf(stderr, "[agc] %s #%llu: %zu buffers, %zu dwords -> %zu packets applied (draws: %zu, dispatches: %llu)\n",
+                    who, (unsigned long long)g_submit_count, buffer_count, total_dwords, applied,
+                    state.draws.size(), (unsigned long long)state.dispatch_count);
+    }
     progress_heartbeat(state.draws.size(), g_submit_count,
                        (uint64_t)state.dispatch_count);
     // #1226 discriminator: same sleep, same thread, mutex released first. Inert unless armed.
     if (submit_stall_outside()) { lk.unlock(); submit_stall_sleep(); }
     return 0;
+}
+
+static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const char* who,
+                                  uint64_t queue_id = 0) {
+    if (!addr) return 0;
+    constexpr uint32_t kUnknownCap = 0x80000; // Preserve the existing unknown-length single-stream walk.
+    const gpu::CommandBuffer buffer{addr, dw_num ? dw_num : kUnknownCap};
+    return submit_dcb_buffers(&buffer, 1, who, queue_id, dw_num != 0);
 }
 
 // sceAgcCbBranch (NID w1KFAHVqpaU). The identity is a determination, not a guess:
@@ -3122,6 +3167,42 @@ HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, 
     if ((header & 0xc0000000u) != 0xc0000000u && header != 0x80000000u)
         return reject("stream-header", stream, count64, header);
     return submit_dcb_stream((const uint32_t*)(uintptr_t)stream, count32, "SubmitAcb", a0);
+}
+
+// sceAgcDriverSubmitMultiDcbs, libSceAgcDriver (primary firmware name/NID metadata).
+// CONFIDENCE: HIGH for pointer-array/u32 DWORD-length-array/u32 count: caller construction plus an
+// actual import witness (count 1, 1484 DWORDs). Full arity/additional argument semantics are unproved.
+// CONFIDENCE: MED for a generic ordered batch on the existing graphics queue. We retain prosper's
+// established execute/visibility/completion policy once for the batch; this is not evidence of a
+// Sony completion or return-code contract. Empty/invalid/partial acceptance semantics are unproved,
+// so unsupported input is fatal and explicit rather than a guessed SCE error or fake success.
+HLE(agc_driver_submit_multi_dcbs) {
+    prosper_gpu_submit_scope_begin();
+    const uint32_t count = static_cast<uint32_t>(a2);
+    // guest_readable has a uint32 byte extent. Refuse unrepresentable ranges before narrowing;
+    // these are host implementation bounds, not asserted Sony array/stream limits.
+    if (!count || count > UINT32_MAX / sizeof(uint64_t))
+        unsupported_multi_dcb("array extent", count);
+    if (!gpu::guest_readable(a0, count * static_cast<uint32_t>(sizeof(uint64_t))) ||
+        !gpu::guest_readable(a1, count * static_cast<uint32_t>(sizeof(uint32_t))))
+        unsupported_multi_dcb("unreadable descriptor arrays", count);
+    std::vector<gpu::CommandBuffer> buffers;
+    buffers.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint64_t stream = 0;
+        uint32_t words = 0;
+        // Snapshot both arrays before executing any work; memcpy also accepts unaligned arrays.
+        memcpy(&stream, (const void*)(uintptr_t)(a0 + uint64_t(i) * sizeof(stream)), sizeof(stream));
+        memcpy(&words, (const void*)(uintptr_t)(a1 + uint64_t(i) * sizeof(words)), sizeof(words));
+        if (!words || words > UINT32_MAX / sizeof(uint32_t))
+            unsupported_multi_dcb("stream extent", count, i);
+        if (stream % alignof(uint32_t)) unsupported_multi_dcb("unaligned command stream", count, i);
+        if (!gpu::guest_readable(stream, words * static_cast<uint32_t>(sizeof(uint32_t))))
+            unsupported_multi_dcb("unreadable command stream", count, i);
+        buffers.push_back({(const uint32_t*)(uintptr_t)stream, words});
+    }
+    return submit_dcb_buffers(buffers.data(), buffers.size(), "SubmitMultiDcbs", 0, true,
+                              /* require_complete_pm4 */ true);
 }
 
 // --- Indirect-register patch helpers: modify a packet returned by a Set*RegsIndirect call.
@@ -3929,6 +4010,7 @@ void register_agc_hle() {
     // trampoline. This per-NID checkpoint ends the submit scope immediately before guest return.
     RN_SUBMIT("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
     RN_SUBMIT("gSRnr79F8tQ", agc_driver_submit_acb);   // sceAgcDriverSubmitAcb -> ordered compute replay
+    RN_SUBMIT_NAMED("6UzEidRZwkg", agc_driver_submit_multi_dcbs, "sceAgcDriverSubmitMultiDcbs");
     // sceAgcCbBranch (#2173) — named, so logs and hle_calls do not report a bare NID for the one
     // entry here whose published name is established. See the block above agc_cb_branch.
     RN_SUBMIT_NAMED("w1KFAHVqpaU", agc_cb_branch, "sceAgcCbBranch");

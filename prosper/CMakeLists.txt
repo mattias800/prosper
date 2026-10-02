@@ -3363,6 +3363,11 @@ endif()
   target_link_libraries(test_agc_submit PRIVATE prosper_core)
   add_test(NAME agc_submit_to_gpustate COMMAND test_agc_submit)
 
+  add_executable(test_agc_submit_multi tests/hle/test_agc_submit_multi.cpp)
+  target_include_directories(test_agc_submit_multi PRIVATE tests)
+  target_link_libraries(test_agc_submit_multi PRIVATE prosper_core)
+  add_test(NAME agc_submit_multi COMMAND test_agc_submit_multi)
+
   # libSceVideoOut: query/config functions return real 1080p60 values + swapchain-scaffolding
   # display-buffer registry records the game's registered framebuffers.
   #
