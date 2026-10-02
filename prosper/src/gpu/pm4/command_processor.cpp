@@ -5411,8 +5411,8 @@ void GpuState::apply(const Pm4Command& c) {
 // Dcb/DcbFinal ordered independently from Acb.
 extern "C" void prosper_gpu_set_fold_origin(uint8_t origin) { g_fold_origin = origin; }
 
-size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st,
-                          size_t* consumed_dwords) {
+static size_t run_command_buffer_segment(const uint32_t* buf, size_t dwords, GpuState& st,
+                                         size_t* consumed_dwords, bool begin_fold) {
     // Each TOP-LEVEL stream starts a fresh fold state (#312: the pause flag and the lazily-opened
     // deferred stream are per-fold). A Jump recursion must NOT reset them: the jump target
     // executes INSIDE the paused stream, and resetting mid-stream both un-gated the parent's
@@ -5420,7 +5420,9 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st,
     // so hle_agc never started the release watchdog — the observed WAIT_DEFER wedge with zero
     // DEFER-TIMEOUT logs (a deferred stream nobody ever re-checked while the guest CPU-polled one
     // of its labels).
-    if (st.jump_depth == 0) {
+    // Multi-buffer submissions begin once; subsequent segments belong to that same fold just as
+    // Jump targets do. Resetting here for every array entry would release its predecessor's wait.
+    if (begin_fold && st.jump_depth == 0) {
         g_fold_deferring = false; g_fold_stream_open = false;
         g_fold_discard_deferred_suffix = false;
         g_fold_seq.fetch_add(1, std::memory_order_relaxed);   // #312 label-history fold id
@@ -5517,6 +5519,21 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st,
         }
     }
     return ops.size();
+}
+
+size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st,
+                          size_t* consumed_dwords) {
+    return run_command_buffer_segment(buf, dwords, st, consumed_dwords, true);
+}
+
+size_t run_command_buffers(const CommandBuffer* buffers, size_t buffer_count, GpuState& st,
+                           size_t* consumed_dwords) {
+    size_t packets = 0;
+    for (size_t i = 0; i < buffer_count; ++i)
+        packets += run_command_buffer_segment(buffers[i].data, buffers[i].dwords, st,
+                                               consumed_dwords ? &consumed_dwords[i] : nullptr,
+                                               i == 0);
+    return packets;
 }
 
 } // namespace prosper::gpu
