@@ -5245,6 +5245,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         bvh_build_origin[(size_t)(sbase + 1)])
                     bvh_count_origin = bvh_build_origin[(size_t)sbase];
                 for (uint32_t k = 0; k < n; k++) set_value(sdst + (int)k, mem[k]);
+                if (trc) {
+                    // Report the consumed fold value; reading mem[k] again would reread the guest.
+                    for (uint32_t k = 0; k < n; ++k) {
+                        const int reg = sdst + static_cast<int>(k);
+                        if (!valid_reg(reg)) continue;
+                        fprintf(stderr, "[dyntrace] consumed program=0x%llx pc=%u s%d=0x%08x\n",
+                                (unsigned long long)(uintptr_t)code, in.pc, reg,
+                                val[static_cast<size_t>(reg)]);
+                    }
+                }
                 if (srt_uses && latched_offset_source) {
                     SrtUse source;
                     source.kind = 5;
