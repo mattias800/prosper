@@ -51,7 +51,8 @@ struct Program {
 using ProgramOwners = std::array<Program, 32>;
 static ProgramOwners* programs = nullptr;
 static size_t next_program = 0;
-static Program& register_program(bool vertex, Load load, bool wide8, uint32_t writer_position = 0) {
+static Program& register_program(bool vertex, Load load, bool wide8, uint32_t writer_position = 0,
+                                  uint32_t nested_destination = 44u) {
     Program& p = programs->at(next_program++);
     std::vector<uint32_t> code;
     const uint32_t base = vertex ? 8u : 0u;
@@ -61,8 +62,11 @@ static Program& register_program(bool vertex, Load load, bool wide8, uint32_t wr
         code.insert(code.end(), {(wide8 ? 0xf40c0a00u : 0xf4080a00u) | (base / 2u),
                                  0xfa000004u});
         p.load_pc = static_cast<uint32_t>(code.size());
-        code.insert(code.end(), {wide8 ? 0xf40c0b14u : 0xf4080b14u, 0xfa000010u});
-        code.push_back((vertex ? 0x7e0e0200u : 0x7e000200u) | (wide8 ? 51u : 47u));
+        code.insert(code.end(), {(wide8 ? 0xf40c0014u : 0xf4080014u) |
+                                 (nested_destination << 6u), 0xfa000010u});
+        // Keep a real ordinary numeric observer even when the negative destination spans VCC.
+        const uint32_t observed = std::min(nested_destination + (wide8 ? 7u : 3u), 105u);
+        code.push_back((vertex ? 0x7e0e0200u : 0x7e000200u) | observed);
     }
     if (load == Load::RuntimeSelector)
         code.push_back(0x7e000500u | ((base + 2u) << 17u)); // s offset <- real lane's v0
@@ -615,6 +619,42 @@ static void run_nested_cases(const Program& plain_vs, const Program& plain_ps,
         const GraphicsRawSnapshotContext complete{publication.known && !publication.pending};
         check(complete.producers_complete, arm,
               "real backend (or CPU production fixture) reports completed producer publication");
+        for (bool straddles_vcc : {false, true}) {
+            const uint32_t destination = (wide8 ? 98u : 102u) + (straddles_vcc ? 2u : 0u);
+            const auto& boundary = register_program(vertex, Load::Nested, wide8, 0u, destination);
+            auto bounded_state = state_for(vertex ? boundary : plain_vs,
+                vertex ? plain_ps : boundary, guest + 0x1000u, 0u, guest + 0x4000u);
+            std::vector<Rdna2Inst> bounded_instructions;
+            rdna2_walk(boundary.code.data(), boundary.header.shader_size / 4u, bounded_instructions);
+            check(rdna2_raw_wide_data_loads(bounded_instructions) ==
+                      std::vector<uint32_t>({0u, 2u}), arm,
+                  "destination boundary control still requires the original numeric child bytes");
+            authority_calls = 0u;
+            DrawItem bounded_draw;
+            const bool bounded_made = realize_draw_item(bounded_state, &bounded_state.draws[0],
+                3u, 64u, false, bounded_draw, nullptr, true, nullptr, &complete);
+            if (straddles_vcc) {
+                const auto blocked = build_stage_table(bounded_state,
+                    reinterpret_cast<uint64_t>(boundary.code.data()), !vertex, 3u, 0u, &complete);
+                check(rdna2_owned_nested_wide_chains(bounded_instructions).empty() &&
+                      !bounded_made && blocked && blocked->resources.empty() &&
+                      blocked->owned_host_data.empty() && (!cpu_only || authority_calls == 0u), arm,
+                      "x4/x8 straddling VCC refuses production realization before observing guest bytes");
+            } else {
+                const auto bounded_table = vertex ? bounded_draw.vrt : bounded_draw.prt;
+                const auto* bounded_parent = bounded_table ?
+                    owned_nested_snapshot_at(*bounded_table, 0u, width) : nullptr;
+                const auto* bounded_child = bounded_table ?
+                    owned_nested_snapshot_at(*bounded_table, 2u, width) : nullptr;
+                uint32_t highest = 0u;
+                if (bounded_child) std::memcpy(&highest, bounded_child->host_data + last * 4u, 4u);
+                check(bounded_made && bounded_parent && bounded_child &&
+                      bounded_parent->gpu_addr == guest + 0x1004u &&
+                      bounded_child->gpu_addr == a + 16u &&
+                      highest == std::bit_cast<uint32_t>(0.25f), arm,
+                      "x4/x8 ending at s105 owns the highest ordinary numeric word through realization");
+            }
+        }
         DrawItem old;
         const bool made = realize_draw_item(state, &state.draws[0], 3u, 64u, false, old,
                                             nullptr, true, nullptr, &complete);

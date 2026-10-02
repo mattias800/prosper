@@ -55,6 +55,39 @@ int main() {
     expect(decoded.size() == 5 && decoded[3].fmt == Rdna2Format::MIMG &&
                decoded[3].opcode == 0x08u && decoded[3].pc == 5u,
            "the positive fixture contains the intended image store");
+    for (bool wide8 : {false, true}) {
+        const uint32_t width = wide8 ? 8u : 4u;
+        for (bool straddles_vcc : {false, true}) {
+            const uint32_t destination = 106u - width + (straddles_vcc ? 2u : 0u);
+            const uint32_t boundary_shader[] = {
+                wide8 ? 0xf40c0a00u : 0xf4080a00u, 0xfa000000u,
+                (wide8 ? 0xf40c0014u : 0xf4080014u) | (destination << 6u),
+                0xfa000010u,
+                0x7e000269u, // numeric s105 observer: last ordinary SGPR, never a Bool mask
+                0xbf810000u,
+            };
+            std::vector<Rdna2Inst> boundary;
+            rdna2_walk(boundary_shader, std::size(boundary_shader), boundary);
+            expect(boundary.size() == 4u && boundary[1].dst.value == destination &&
+                       boundary[2].src[0].kind == OperandKind::SGPR &&
+                       boundary[2].src[0].value == 105 &&
+                       rdna2_raw_wide_data_loads(boundary) ==
+                           std::vector<uint32_t>({0u, 2u}),
+                   "x4/x8 boundary fixture keeps the child numeric backing obligation");
+            if (straddles_vcc) {
+                expect(rdna2_proven_raw_nested_wide_data_loads(boundary).empty() &&
+                           rdna2_owned_nested_wide_chains(boundary).empty(),
+                       "x4/x8 writes through s106/s107 refuse nested owned admission");
+            } else {
+                expect(rdna2_proven_raw_nested_wide_data_loads(boundary) ==
+                           std::vector<uint32_t>{2u} &&
+                           rdna2_owned_nested_wide_chains(boundary) ==
+                               std::vector<RawNestedWideChain>({{0u, 2u, width * 4u,
+                                   width * 4u, 0u, 16u}}),
+                       "x4/x8 ending at s105 retain the exact-PC parent/child proof");
+            }
+        }
+    }
     expect(tiled_surface_bytes(64, 64, 27, 0, 1) > 64 * 64,
            "write footprint includes tile padding beyond the declared size");
 

@@ -814,9 +814,12 @@ std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(
     }
     for (size_t child_index = 0; child_index < ins.size(); ++child_index) {
         const Rdna2Inst& child = ins[child_index];
+        const int child_width = child.opcode == 0x2u ? 4 : 8;
         if (child.fmt != Rdna2Format::SMEM ||
             (child.opcode != 0x2u && child.opcode != 0x3u) ||
             child.dst.kind != OperandKind::SGPR ||
+            // Numeric snapshots write ordinary SGPRs, not the emitter's typed VCC mask.
+            child.dst.value < 0 || child.dst.value > 106 - child_width ||
             child.src[0].kind != OperandKind::SGPR ||
             child.src[0].value < 0 || child.src[0].value + 1 >= 106 ||
             child.src[1].kind != OperandKind::Special || child.src[1].value != 125 ||
