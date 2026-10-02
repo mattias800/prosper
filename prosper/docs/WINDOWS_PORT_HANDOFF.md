@@ -150,7 +150,7 @@ selects native TLS explicitly. It installs nothing and requires a **new owned bu
 
 ```powershell
 cmake -S prosper -B prosper/build-native-clang -G Ninja `
-  -DCMAKE_TOOLCHAIN_FILE=cmake/windows-native-clang.cmake `
+  '-DCMAKE_TOOLCHAIN_FILE=cmake/windows-native-clang.cmake' `
   -DPROSPER_NATIVE_CLANG_ROOT=<EXISTING_LLVM_ROOT> `
   -DPROSPER_NATIVE_MINGW_ROOT=<EXISTING_MINGW_ROOT> `
   -DCMAKE_BUILD_TYPE=Release -DPROSPER_APP=OFF `
