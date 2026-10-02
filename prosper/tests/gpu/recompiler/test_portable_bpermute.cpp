@@ -125,18 +125,25 @@ int main(int argc, char **argv) {
         "exact native straight-line path still shuffles value/EXEC");
   dump(root, "bpermute_native32", native);
   for (uint32_t wave : {32u, 64u}) {
-    Case partial{64, wave, 16, 4, 1};
-    const auto m = compile(partial, wave);
-    check(!m.empty() && count(m, 345) == 0,
-          "adopted native width switches to ACTIVE for an exact tail");
-    if (m.empty())
-      continue;
-    dump(root, "bpermute_native_requested_tail" + std::to_string(wave), m);
-    bpermute_oracle::Interpreter vm(m);
-    check(vm.run(partial.local, input(partial)) == expected(partial) &&
-              vm.error.empty(),
-          "adopted native tail actually executes portable source-off zero and "
-          "keeps padded sinks");
+    for (uint32_t offset : {0u, 4u}) {
+      Case partial{64, wave, 16, offset, 1};
+      const auto m = compile(partial, wave);
+      check(!m.empty() && count(m, 345) == 0,
+            "adopted native width switches to ACTIVE for an exact tail");
+      if (m.empty())
+        continue;
+      dump(root,
+           "bpermute_native_requested_tail" + std::to_string(wave) + "_offset" +
+               std::to_string(offset),
+           m);
+      bpermute_oracle::Interpreter vm(m);
+      check(vm.run(partial.local, input(partial)) == expected(partial) &&
+                vm.error.empty(),
+            offset == 0 ? "adopted native tail actually supplies source-off "
+                          "zero and keeps padded sinks"
+                        : "adopted native tail actually gathers active source "
+                          "after OFFSET wrap and keeps padded sinks");
+    }
   }
 
   // The interpreter itself must fail closed: remove all actual Workgroup
