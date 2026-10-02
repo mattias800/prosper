@@ -1,6 +1,7 @@
 // test_lifecycle — the cooperative stop signal (src/host/platform/lifecycle.hpp) a long-running frontend
 // uses to wind the guest run-loop down on window-close. Pure, no deps.
 #include "host/platform/lifecycle.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 #include <thread>
 #include <atomic>
@@ -9,11 +10,9 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(Lifecycle, Contract) {
     printf("== test_lifecycle ==\n");
     prosper_reset_stop();
     CHECK(!prosper_stop_requested(), "not stopped after reset");
@@ -59,7 +58,4 @@ int main() {
     prosper_reset_stop();
     CHECK(!prosper_stop_requested() && !prosper_paused(),
           "reset clears stop and pause together");
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

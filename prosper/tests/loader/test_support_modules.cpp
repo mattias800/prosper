@@ -12,6 +12,7 @@
 // would satisfy the drop arm perfectly and silently break Sonic Origins.
 
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <string>
 #include <vector>
 
@@ -21,9 +22,7 @@ using prosper::LinkInput;
 using prosper::support_module_lib_name;
 using prosper::unimported_support_module_indices;
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 static LinkInput candidate(const char* path) {
     LinkInput e; e.path = path; e.base = 0; e.only_if_imported = true; return e;
@@ -36,7 +35,7 @@ static bool dropped(const std::vector<size_t>& d, size_t i) {
     return false;
 }
 
-int main() {
+TEST(SupportModules, Contract) {
     printf("== test_support_modules ==\n");
 
     // --- library name derivation -------------------------------------------------------------
@@ -129,6 +128,4 @@ int main() {
         CHECK(d.size() == 2 && desc, "ORDER: dropped indices are descending (erase-safe)");
     }
 
-    printf(fails ? "\ntest_support_modules: %d FAILURE(S)\n" : "\ntest_support_modules: all ok\n", fails);
-    return fails ? 1 : 0;
 }

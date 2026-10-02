@@ -20,6 +20,7 @@
 //      guest polling a gated label can wait at most one timeout.
 //   6. A SATISFIED wait is a pass-through no-op (the fast path every healthy frame takes).
 #include "gpu/pm4/command_processor.hpp"
+#include <gtest/gtest.h>
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/pm4/pm4_decode.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
@@ -33,9 +34,7 @@
 using namespace prosper::gpu;
 extern "C" uint64_t prosper_guest_tsc_ns();
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // PM4 type-3 NOP-wrapped header, identical to hle_agc.cpp PM4(): len = total dwords incl. header.
 static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
@@ -86,7 +85,7 @@ static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
     return n;
 }
 
-int main() {
+TEST(WaitBarrier, Contract) {
     // Enable the opt-in model. The default one-second release timeout is generous enough that the
     // ordering assertions below do not race it; the two liveness tests deliberately sleep past it.
     // The model gate must be set before the first fold caches it.
@@ -431,7 +430,4 @@ int main() {
         flush_deferred_streams();
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

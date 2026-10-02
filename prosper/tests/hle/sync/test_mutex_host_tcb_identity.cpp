@@ -25,6 +25,7 @@
 //  * Nothing between the `%fs` swap and the call may touch TLS: with a foreign TCB installed, errno,
 //    thread_local and the stack canary all belong to the other thread. The window is exactly one call.
 #include "hle/sync/pthread_slot.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/dispatch.hpp"
 
 #include <atomic>
@@ -35,19 +36,18 @@
 #include <thread>
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 #if defined(__linux__) && defined(__x86_64__)
 static inline uint64_t rd_fs() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
 static inline void     wr_fs(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
 #endif
 
-int main() {
+TEST(MutexHostTcbIdentity, Contract) {
     printf("== test_mutex_host_tcb_identity ==\n");
 #if !defined(__linux__) || !defined(__x86_64__)
     printf("  [skip] guest-%%fs swapping is x86-64 Linux only\n== PASS ==\n");
-    return 0;
+    return;
 #else
     // A second REAL host thread, parked, lending us its TCB address — the value a stale stash holds.
     std::atomic<uint64_t> other_tcb{0};
@@ -148,8 +148,9 @@ int main() {
     done.store(true, std::memory_order_release);
     helper.join();
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
     printf("== PASS ==\n");
-    return 0;
+    return;
 #endif
+    EXPECT_EQ(fails, 0);
 }

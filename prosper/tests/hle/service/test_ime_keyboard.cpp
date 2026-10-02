@@ -3,6 +3,7 @@
 // info) rather than leaving the caller's structs uninitialized. Struct layouts mirror shadPS4
 // src/core/libraries/ime/ime_common.h (offsets asserted below).
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/service/platform_ui.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -19,9 +20,7 @@ struct KbdUi : PlatformUi {
     }
 };
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 struct KbdResIds { int32_t user_id; uint32_t resource_id[5]; };
 struct KbdInfo   { int32_t user_id; uint32_t device; uint32_t type; uint32_t repeat_delay;
@@ -29,14 +28,14 @@ struct KbdInfo   { int32_t user_id; uint32_t device; uint32_t type; uint32_t rep
 static_assert(sizeof(KbdResIds) == 24, "ResourceIdArray size");
 static_assert(sizeof(KbdInfo) == 36 && offsetof(KbdInfo, status) == 20, "KeyboardInfo layout");
 
-int main() {
+TEST(ImeKeyboard, Contract) {
     printf("== test_ime_keyboard ==\n");
     register_builtin_hle();
 
     HleFn open  = Hle::lookup("eaFXjfJv3xs"), update = Hle::lookup("-4GCfYdNF1s"),
           info  = Hle::lookup("VkqLPArfFdc"), resid  = Hle::lookup("dKadqZFgKKQ");
     CHECK(open && update && info && resid, "Ime keyboard functions registered");
-    if (!(open && update && info && resid)) { printf("== FAIL ==\n"); return 1; }
+    if (!(open && update && info && resid)) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     CHECK(open(1, 0, 0, 0, 0, 0) == 0, "sceImeKeyboardOpen -> OK (Error, not a handle)");
     CHECK(update(0, 0, 0, 0, 0, 0) == 0, "sceImeUpdate -> OK (no events to pump)");
@@ -78,7 +77,4 @@ int main() {
     resid(1, (uint64_t)(uintptr_t)&ids3, 0, 0, 0, 0);
     CHECK(ids3.resource_id[0] == 0, "after unregister: GetResourceId reports no keyboards again");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

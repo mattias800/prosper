@@ -15,6 +15,7 @@
 //      directory, not recursive, wrong extension — so it is included only as an invariant arm and
 //      labelled as one. It cannot fail today; its job is to fail the day module discovery widens.
 #include "fixtures/test_scratch.h"
+#include <gtest/gtest.h>
 #include "host/image/boot_program.hpp"
 #include "host/image/module_path_policy.hpp"
 
@@ -28,8 +29,7 @@ using namespace prosper;
 namespace fs = std::filesystem;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static void permit(const char* root, const char* path, const char* what) {
     const ModulePathDecision d = classify_module_path(root, path);
@@ -56,7 +56,7 @@ static bool linked(const std::vector<LinkInput>& in, const std::string& needle) 
     return false;
 }
 
-int main() {
+TEST(ModulePathPolicy, Contract) {
     printf("== test_module_path_policy ==\n");
     const char* R = "/dumps/PPSA00000-app0";
 
@@ -263,6 +263,5 @@ int main() {
         fs::remove_all(root, ec);
     }
 
-    printf(fails ? "== FAILED (%d) ==\n" : "== passed ==\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

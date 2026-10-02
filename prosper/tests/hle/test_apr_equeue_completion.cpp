@@ -26,6 +26,7 @@
 // id=0 (pointer dialect) and 34 bind a nonzero id — 22 of those on id=1 alone — every one of the
 // 34 posting `AprTagComplete token=0x0 (ring=0)`. Same equeue, same ident, constant zero tag.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -36,9 +37,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // SceKernelEvent (FreeBSD kevent layout, 0x20 bytes) — must match the backend's struct exactly.
 struct KEvent { int64_t ident; int16_t filter; uint16_t flags; uint32_t fflags; int64_t data; uint64_t udata; };
@@ -57,7 +56,7 @@ static void drain(HleFn wait, uint64_t eq) {
          (uint64_t)(uintptr_t)&cap, 0);
 }
 
-int main() {
+TEST(AprEqueueCompletion, Contract) {
     printf("== test_apr_equeue_completion ==\n");
     register_builtin_hle();
 
@@ -72,7 +71,7 @@ int main() {
     CHECK(create && addampr && adduser && trigger && wait && getcount && bind && submit,
           "all APR + equeue entry points registered");
     if (!(create && addampr && adduser && trigger && wait && getcount && bind && submit)) {
-        printf("== FAIL ==\n"); return 1;
+        printf("== FAIL ==\n"); FAIL() << "legacy early exit";
     }
 
     uint64_t eq = 0;
@@ -170,6 +169,4 @@ int main() {
         drain(wait, eq);
     }
 
-    printf(fails ? "== FAIL ==\n" : "== PASS ==\n");
-    return fails ? 1 : 0;
 }

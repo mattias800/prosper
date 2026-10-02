@@ -27,6 +27,7 @@
 // On Linux/macOS the handle is the raw pthread_t by design (identity helpers), so only the platform-
 // neutral arms (§2 identity, §3 equality, §5 join) assert there; the readability, validation and
 // leak arms are Windows-only because that is the only platform where the translation exists.
+#include <gtest/gtest.h>
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/guest_thread_handle.hpp"
@@ -41,9 +42,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -102,7 +101,7 @@ void wait_started() {
 
 }   // namespace
 
-int main() {
+TEST(GuestThreadHandle, Contract) {
     printf("== test_guest_thread_handle ==\n");
     register_builtin_hle();
 
@@ -117,7 +116,7 @@ int main() {
     CHECK(create && self && equal && join && detach && rename && getname && posix_join,
           "thread entry points are registered");
     if (!create || !self || !equal || !join || !detach || !rename || !getname || !posix_join)
-        return 1;
+        return;
 
     const uint64_t baseline = hle::guest_thread_handle_live_count();
 
@@ -191,7 +190,7 @@ int main() {
     if (!attr_init || !attr_get || !attr_base || !attr_size || !attr_destroy || !attr_detach) {
         g_child_release.store(true);
         join(handle, 0, 0, 0, 0, 0);
-        return 1;
+        return;
     }
     void* attr = nullptr;
     CHECK(attr_init((uint64_t)(uintptr_t)&attr, 0, 0, 0, 0, 0) == 0 && attr,
@@ -351,6 +350,4 @@ int main() {
     CHECK(live == baseline + 1, "joined and detached threads release their handle objects (M5, M6)");
 #endif
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

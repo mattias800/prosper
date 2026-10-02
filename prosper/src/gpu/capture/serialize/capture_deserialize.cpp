@@ -1785,6 +1785,37 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                     error = "invalid owned nested snapshot state"; return false;
                 }
     }
+    if (version >= 69u) {
+        uint32_t count = 0;
+        if (!r.u32(count) || count != c.draws.size()) {
+            error = "invalid realized-draw fragment entry count";
+            return false;
+        }
+        const auto flag = [&](bool& value) {
+            uint8_t byte = 0;
+            if (!r.u8(byte) || byte > 1u) return false;
+            value = byte != 0u;
+            return true;
+        };
+        for (auto& draw : c.draws) {
+            auto& entry = draw.ps_entry;
+            auto& launch = draw.ps_raster_launch;
+            bool ok = flag(entry.observed) && r.u32(entry.user_data_available);
+            for (auto& word : entry.user_data) ok = ok && r.u32(word);
+            ok = ok && flag(entry.rsrc2_available) && r.u32(entry.rsrc2) &&
+                flag(draw.ps_entry_source_available) &&
+                flag(launch.ps_in_control_available) && r.u32(launch.ps_in_control) &&
+                flag(launch.baryc_cntl_available) && r.u32(launch.baryc_cntl) &&
+                flag(launch.input_ena_available) && r.u32(launch.input_ena) &&
+                flag(launch.input_addr_available) && r.u32(launch.input_addr);
+            if (!ok || !entry.canonical() || !launch.canonical() ||
+                (draw.ps_entry_source_available && (!entry.observed || draw.fs.empty() ||
+                 draw.fs_raw_shader_index >= c.raw_shader_versions.size()))) {
+                error = "invalid realized-draw fragment entry evidence";
+                return false;
+            }
+        }
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.

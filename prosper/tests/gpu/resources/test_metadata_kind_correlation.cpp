@@ -11,15 +11,14 @@
 // The rule is tested here rather than through the renderer's registration, because mutating that lambda
 // to answer DCC unconditionally left the forwarding test green — plumbing coverage, not rule coverage.
 #include "gpu/resources/metadata_kind_correlation.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 #include <vector>
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -56,7 +55,7 @@ CompressionMetadataKind kind(const MetadataKindRequest& r) {
 
 }  // namespace
 
-int main() {
+TEST(MetadataKindCorrelation, Contract) {
     printf("== test_metadata_kind_correlation ==\n");
 
     // POSITIVE HTILE: the retained surface names this plane AND this resource is one of its aspects.
@@ -123,7 +122,4 @@ int main() {
               "a retained surface with no HTILE plane correlates nothing");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

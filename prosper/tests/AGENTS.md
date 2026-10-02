@@ -1,8 +1,20 @@
 # tests — what a test here must do
 
-Rules for tests under `prosper/tests/`. Tests are standalone executables registered with `add_test` in
-`prosper/CMakeLists.txt` (there is no GoogleTest dependency), reporting through a local `CHECK`
-macro or `tests/support/`.
+Rules for tests under `prosper/tests/`. **New tests use GoogleTest** (`TEST`/`TEST_F`,
+`EXPECT_*`/`ASSERT_*`), registered with `prosper_add_gtest(<target> SOURCES ... INCLUDES ... LIBRARIES ...)`
+from `prosper/cmake/ProsperGTest.cmake`; each `TEST` is its own ctest case (`Suite.Name`).
+Older tests are standalone executables registered with `add_test` and a local `CHECK` macro.
+
+## GoogleTest policy
+
+- Do not add a file with its own `int main()` and a home-made `CHECK`. The ctest `gtest_policy`
+  (`tools/ci/check_gtest_policy.py`) fails on it.
+- Legacy hand-rolled tests are listed in `tools/ci/gtest_legacy_allowlist.txt`. When you migrate one,
+  delete its line (the check fails if a listed file no longer has `main()`).
+- Prefer one `TEST` per behaviour, with a message on `EXPECT_*` (`<< "why"`), not one giant test.
+- The few tests that must compile standalone (e.g. `tools/perf/mutate_*.sh` build them with plain g++)
+  stay on the allowlist. Since the list only shrinks, a new standalone test needs the owner's say-so.
+- Dump- or Vulkan-gated tests keep their gating in CMake, not inside gtest.
 
 ## Rules
 
@@ -37,7 +49,7 @@ macro or `tests/support/`.
 ## Where things go
 
 A new test file goes in the subfolder matching the subsystem it exercises (`hle/`, `gpu/`,
-`loader/`, `self/`, …), registered by `add_test` in `prosper/CMakeLists.txt`. `fixtures/` holds
+`loader/`, `self/`, …), registered in `prosper/CMakeLists.txt` (`prosper_add_gtest`, or `add_test` for legacy tests). `fixtures/` holds
 inputs and machinery under test; `support/` holds helpers that can never change an assertion's
 outcome (see its own `AGENTS.md`).
 

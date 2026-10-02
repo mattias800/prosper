@@ -1,15 +1,12 @@
 #include "host/memory/guest_memory_map.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 
 using prosper::host::GuestReadableRangeCache;
 
-int main() {
-    int failures = 0;
-    auto check = [&](bool condition, const char* name) {
-        std::printf("  [%s] %s\n", condition ? "ok" : "FAIL", name);
-        if (!condition) ++failures;
-    };
+TEST(GuestMemoryMap, Contract) {
+    auto check = [&](bool condition, const char* name) { EXPECT_TRUE(condition) << name; };
 
     std::puts("== test_guest_memory_map ==");
     GuestReadableRangeCache cache;
@@ -55,6 +52,4 @@ int main() {
     check(!prosper::host::guest_readable_mapping_containing(0x20000, 0x21000, mapping),
           "malformed mapping change conservatively clears readable extents");
 
-    std::puts(failures ? "== FAIL ==" : "== PASS ==");
-    return failures ? 1 : 0;
 }

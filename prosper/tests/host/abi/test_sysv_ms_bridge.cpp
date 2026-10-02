@@ -17,6 +17,7 @@
 // What NEITHER can check is a live guest calling a real Sony import on Windows. Nothing here claims
 // to; the bridge is verified, the Windows boot is not.
 #include "host/abi/sysv_ms_bridge.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/dispatch.hpp"
 
 #include <cstdint>
@@ -642,7 +643,7 @@ void check_sizes_and_no_op() {
 
 } // namespace
 
-int main() {
+TEST(SysvMsBridge, Contract) {
     check_tables();
     check_sizes_and_no_op();
 #if PROSPER_TEST_CAN_EXECUTE
@@ -650,7 +651,5 @@ int main() {
 #else
     printf("test_sysv_ms_bridge: not x86-64; the emitted bytes were checked but not executed\n");
 #endif
-    if (g_fail) { fprintf(stderr, "test_sysv_ms_bridge: %d failure(s)\n", g_fail); return 1; }
-    printf("test_sysv_ms_bridge: all cases passed\n");
-    return 0;
+    EXPECT_EQ(g_fail, 0);
 }

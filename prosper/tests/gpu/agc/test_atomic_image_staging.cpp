@@ -13,13 +13,12 @@
 // count, fails at least one of them rather than silently under-bounding the readability probe by
 // exactly the tile padding.
 #include "gpu/resources/atomic_image_staging.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); ++fails; } \
-                         else printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Sonic Racing: CrossWorlds' full-screen atomic dispatch (#2265), the surface the padding was
 // measured on.
@@ -37,7 +36,7 @@ static ShaderResource crossworlds_surface() {
     return r;
 }
 
-int main() {
+TEST(AtomicImageStaging, Contract) {
     printf("== atomic-image staging extents (#3195 / #2265) ==\n");
 
     // --- the discriminator: physical is NOT logical for a tiled surface -----------------------
@@ -129,6 +128,4 @@ int main() {
         CHECK(!atomic_image_staging_extents(r).valid, "an empty footprint is rejected");
     }
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

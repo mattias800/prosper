@@ -1,4 +1,5 @@
 #include "fixtures/interactive_capture_wait.h"
+#include <gtest/gtest.h>
 // Exact guest-log phase gate for whole-frame captures. Pure/offline: no guest or Vulkan device.
 #include "gpu/capture/gpu_capture_bundle.hpp"
 #include "gpu/timeline/gpu_timeline.hpp"
@@ -21,9 +22,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static void set_test_env(const char* name, const std::string& value) {
 #ifdef _WIN32
@@ -49,7 +48,7 @@ static int stream_fd(FILE* stream) {
 #endif
 }
 
-int main() {
+TEST(GuestLogCapture, Contract) {
     std::printf("== test_guest_log_capture ==\n");
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto bundle_path = prosper_test::test_scratch_dir() /
@@ -160,7 +159,4 @@ int main() {
 
     std::error_code ec;
     std::filesystem::remove(bundle_path, ec);
-    if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
-    std::printf("== PASS ==\n");
-    return 0;
 }

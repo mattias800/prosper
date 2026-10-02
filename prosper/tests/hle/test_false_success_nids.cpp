@@ -10,6 +10,7 @@
 // passes for the wrong reason is the recurring failure in this project: a `CHECK(ret == 0)` on a
 // fill contract passes against the very stub the change exists to remove.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #if !defined(_WIN32)
 #include <sys/mman.h>   // the untracked host mapping test_pool_decommit must be left alone
 #endif
@@ -25,8 +26,7 @@ static constexpr uint64_t kEinvalPool = 0x80020016ull;   // SCE_KERNEL_ERROR_EIN
 extern "C" int prosper_reserved_range_state(uint64_t addr);
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -626,7 +626,7 @@ void test_pool_decommit() {
           "an overflowing decommit released NOTHING (mutation: drop a guard -> this reads 1)");
 }
 
-int main() {
+TEST(FalseSuccessNids, Contract) {
     printf("== test_false_success_nids ==\n");
     register_builtin_hle();
     test_random();
@@ -636,7 +636,6 @@ int main() {
     test_apr_submit_and_get_id();
     test_pool_decommit();
     test_kernel_memory_pool();
-    if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) failed ==\n", fails); FAIL() << "legacy early exit"; }
+    EXPECT_EQ(fails, 0);
 }

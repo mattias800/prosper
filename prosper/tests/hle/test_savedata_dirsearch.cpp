@@ -29,6 +29,7 @@
 //  arm 6  isolation      [D]  another title does not see these saves (#2734) — gated on arm 3's
 //                             positive control so it cannot pass vacuously on an empty listing.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/fs/save_paths.hpp"
 #include "fixtures/savedata_test_env.h"
 #include "fixtures/test_scratch.h"
@@ -50,8 +51,7 @@ using prosper_test::set_env;
 
 static int fails = 0;
 static int checks = 0;
-#define CHECK(c, m) do { ++checks; if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -119,7 +119,7 @@ bool contains(const std::vector<std::string>& v, const std::string& s) {
 
 }   // namespace
 
-int main() {
+TEST(SavedataDirsearch, Contract) {
     printf("== test_savedata_dirsearch ==\n");
     register_builtin_hle();
 
@@ -128,7 +128,7 @@ int main() {
     CHECK(g_search != nullptr, "[G] sceSaveDataDirNameSearch is registered");
     if (!g_search) {
         printf("== FAIL: %d == (%d assertions executed)\n", fails, checks);
-        return 1;
+        FAIL() << "legacy early exit";
     }
 
     const fs::path scratch = prosper_test::test_scratch_dir() / "savedata-dirsearch";
@@ -211,6 +211,5 @@ int main() {
               "[D] another title is offered none of these saves (positive control: title A sees 3)");
     }
 
-    printf("== %s: %d == (%d assertions executed)\n", fails ? "FAIL" : "PASS", fails, checks);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

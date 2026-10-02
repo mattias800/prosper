@@ -23,6 +23,7 @@
 // subject — so the log line is asserted against the bytes the guest actually received, not merely
 // asserted to exist.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/service/hle_addcontent.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "fixtures/test_scratch.h"
@@ -43,8 +44,7 @@ using namespace prosper;
 namespace fs = std::filesystem;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 constexpr const char* kAddcontMount   = "VANhIWcqYak";  // sceAppContentAddcontMount
@@ -116,7 +116,7 @@ struct Label {
 };
 } // namespace
 
-int main() {
+TEST(AddcontentMountReport, Contract) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     printf("== test_addcontent_mount_report ==\n");
     register_builtin_hle();
@@ -142,7 +142,7 @@ int main() {
     HleFn mount = Hle::lookup(kAddcontMount);
     HleFn unmount = Hle::lookup(kAddcontUnmount);
     CHECK(mount != nullptr && unmount != nullptr, "AddcontMount/AddcontUnmount are registered");
-    if (!mount || !unmount) { printf("== FAIL: %d ==\n", fails); return 1; }
+    if (!mount || !unmount) { printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
 
     // ---------------------------------------------------------------------------------------
     // 1. Each label gets ITS OWN declared mount point, mounted in the scrambled order the live
@@ -256,7 +256,6 @@ int main() {
 
     set_app0_root(".");
     fs::remove_all(scratch, ec);
-    if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) failed ==\n", fails); FAIL() << "legacy early exit"; }
+    EXPECT_EQ(fails, 0);
 }

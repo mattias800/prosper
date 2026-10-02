@@ -13,6 +13,7 @@
 //  5. may_specialize: the scratch-copy gate is true exactly for the resource shapes the two
 //     specializers act on.
 #include "gpu/execute/compute_program_facts.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <cstdio>
@@ -25,10 +26,7 @@ using namespace prosper::gpu;
 
 namespace {
 int failures = 0;
-void check(bool ok, const char* message) {
-    std::fprintf(stderr, "%s: %s\n", ok ? "PASS" : "FAIL", message);
-    if (!ok) ++failures;
-}
+void check(bool ok, const char* message) { EXPECT_TRUE(ok) << message; }
 
 bool same_stream(const std::vector<Rdna2Inst>& a, const std::vector<Rdna2Inst>& b) {
     if (a.size() != b.size()) return false;
@@ -66,7 +64,7 @@ RecompileDiagnosticContext at(uint64_t address) {
 }
 } // namespace
 
-int main() {
+TEST(ComputeProgramFacts, Contract) {
     // 1 + 2: hit counting and equality with a direct evaluation.
     reset_compute_program_facts_for_test();
     std::vector<uint32_t> vote(std::begin(kVoteHeavy), std::end(kVoteHeavy));
@@ -172,5 +170,5 @@ int main() {
 
     if (failures) std::fprintf(stderr, "%d FAILED\n", failures);
     else std::fprintf(stderr, "all compute_program_facts checks passed\n");
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }

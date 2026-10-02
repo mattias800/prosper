@@ -14,6 +14,7 @@
 // The %fs swap is Linux-only (Windows/macOS never swap hardware %fs at the import boundary), so the
 // test is a no-op pass elsewhere.
 #include "host/image/exec_image.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/input/ime_input.hpp"
 
@@ -26,8 +27,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 #if defined(__linux__) && !defined(__APPLE__)
 // The "guest" IME event handler: record the %fs base it is invoked on and the decoded event. Runs on
@@ -52,13 +52,11 @@ static void test_ime_handler(uint64_t /*arg0*/, void* ev) {
 using GuestIme = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 #endif
 
-int main() {
+TEST(ImeFs, Contract) {
     std::printf("== test_ime_fs ==\n");
 
 #if !defined(__linux__) || defined(__APPLE__)
-    std::printf("  [skip] guest-%%fs swap at the import boundary is Linux-only; nothing to guard here\n");
-    std::printf("== PASS ==\n");
-    return 0;
+    GTEST_SKIP() << "guest-%fs swap at the import boundary is Linux-only; nothing to guard here";
 #else
     // Enable the Linux guest initial-exec %fs path with a single empty TLS module (as the guest-fs
     // stub-args test does), then confirm it is active. The Linux suite already runs a guest-fs test,
@@ -79,10 +77,10 @@ int main() {
     // where the real loader places import stubs. A base outside it makes recovery fail closed (return 0).
     CHECK(install_stubs(slots, 0x680000000ull, 96, &err),
           "generated the sceImeUpdate import stub");
-    if (fails) {
+    if (fails || ::testing::Test::HasFailure()) {
         if (!err.empty()) std::printf("  install error: %s\n", err.c_str());
         std::printf("== FAIL: %d ==\n", fails);
-        return 1;
+        FAIL() << "legacy early exit";
     }
     auto ime_update = reinterpret_cast<GuestIme>(static_cast<uintptr_t>(stub_addr(0)));
 
@@ -122,8 +120,9 @@ int main() {
     CHECK(fs_at_return == guest_fs,
           "import boundary left %fs on the caller's guest TCB after sceImeUpdate returned (swap balanced)");
 
-    if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
+    if (fails || ::testing::Test::HasFailure()) { std::printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
     std::printf("== PASS ==\n");
-    return 0;
+    return;
 #endif
+    EXPECT_EQ(fails, 0);
 }

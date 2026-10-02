@@ -4,19 +4,16 @@
 // regression in the SELECTOR is not diagnosed as a regression in the dump.
 
 #include "gpu/diagnostics/shader_dump_filter.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 
 using prosper::gpu::ShaderDumpProgramFilter;
 using Result = prosper::gpu::ShaderDumpProgramFilter::ConfigureResult;
 
-static int failures = 0;
-#define CHECK(condition, message) do { \
-    if (condition) std::printf("  [ok]   %s\n", message); \
-    else { std::printf("  [FAIL] %s\n", message); ++failures; } \
-} while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
-int main() {
+TEST(ShaderDumpFilter, Contract) {
     std::printf("== test_shader_dump_filter ==\n");
 
     ShaderDumpProgramFilter filter;
@@ -81,10 +78,4 @@ int main() {
     filter.configure("0x1234");
     CHECK(filter.withheld_total() == 0, "re-arming resets the withheld count");
 
-    if (failures) {
-        std::printf("== FAIL: %d ==\n", failures);
-        return 1;
-    }
-    std::printf("== PASS ==\n");
-    return 0;
 }

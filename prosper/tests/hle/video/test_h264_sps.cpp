@@ -13,6 +13,7 @@
 // VALUES chosen, so a reader that mis-skips desyncs every later field and fails loudly.
 
 #include "hle/video/h264_sps.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -20,8 +21,7 @@
 #include <vector>
 
 static int fails = 0;
-#define CHECK(c, m) \
-    do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 using prosper::h264::SpsPictureMeta;
 
@@ -428,7 +428,7 @@ static void test_fill_tiers_for_the_0x58_variant() {
     CHECK(buf[0x55] == 0, "timing does not fit in 0x58; its in-bounds flag stays zero");
 }
 
-int main() {
+TEST(H264Sps, Contract) {
     printf("test_h264_sps (#2898)\n");
     test_baseline_parses_with_all_flags_absent();
     test_high_profile_scaling_skip_and_vui();
@@ -440,10 +440,9 @@ int main() {
     test_fill_rejects_undersized_block();
     test_fill_tiers_for_the_0x58_variant();
 
-    if (fails) {
+    if (fails || ::testing::Test::HasFailure()) {
         printf("%d check(s) FAILED\n", fails);
-        return 1;
+        FAIL() << "legacy early exit";
     }
-    printf("all checks passed\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

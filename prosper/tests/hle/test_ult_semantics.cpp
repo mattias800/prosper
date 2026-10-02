@@ -17,6 +17,7 @@
 // The Ult object the guest owns is a 256-byte caller-allocated blob; these tests allocate the same
 // shape so prosper's 16-byte header lands where it does in the guest.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
@@ -29,8 +30,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Sony's Ult objects are 256-byte opaque blobs (proven for Earthion: a mutex at eboot+0x241730 is
 // followed by unrelated data at 0x241830, and the class at eboot+0xd8a0 spaces its mutex/condvar/
@@ -140,7 +140,7 @@ static constexpr uint32_t kNumMaxUlthread = 16, kNumWorkerThread = 3;
 static constexpr uint32_t kNumThreads = 16, kNumSyncObjects = 16;
 static constexpr uint64_t kApiVersion = 0x12000000ull;   // literal at every guest create site
 
-int main() {
+TEST(UltSemantics, Contract) {
     register_builtin_hle();
     ult_reset_counts_for_test();
     ult_set_return_success_for_test(false);
@@ -501,6 +501,5 @@ int main() {
     CHECK(faked_size == 0,
           "under the legacy policy a size query returns 0, never an error sentinel (#1618)");
 
-    std::printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

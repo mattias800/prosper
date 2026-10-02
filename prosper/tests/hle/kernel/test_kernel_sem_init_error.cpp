@@ -24,6 +24,7 @@
 // confirmed; Darwin: ENOSYS on any value, per Apple's documented sem_init) the probe fails and the
 // regression arms below run for real.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"
 
@@ -36,16 +37,15 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(KernelSemInitError, Contract) {
     printf("== test_kernel_sem_init_error ==\n");
     register_builtin_hle();
 
     HleFn sem_init_fn = Hle::lookup(nid_hash("scePthreadSemInit").c_str());
     CHECK(sem_init_fn != nullptr, "scePthreadSemInit is registered");
-    if (!sem_init_fn) { printf("== FAIL (unresolved) ==\n"); return 1; }
+    if (!sem_init_fn) { printf("== FAIL (unresolved) ==\n"); FAIL() << "legacy early exit"; }
 
     // UINT32_MAX: exceeds SEM_VALUE_MAX (INT_MAX on glibc, and Darwin rejects everything anyway)
     // on every platform this project targets.
@@ -63,7 +63,7 @@ int main() {
         // the probe value, so this run cannot exercise the failure path at all.
         printf("== SKIP (this platform's sem_init() accepted an out-of-range value; the failure "
                "path cannot be exercised here) ==\n");
-        return 0;
+        return;
     }
 
     // GUEST SIDE: same value, through the HLE entry point. The handle is a POINTER CELL (see the
@@ -95,6 +95,5 @@ int main() {
           "the guest slot is left untouched, not published with a pointer to storage that was "
           "never initialised");
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

@@ -11,22 +11,20 @@
 // is the negative control, and it is a separate PROCESS because the switch is read once into a
 // function-local static — arming it mid-run would be read by nothing.
 #include "fixtures/render_runner.h"
+#include <gtest/gtest.h>
 #include <cstdlib>
 #include <set>
 
 using namespace prosper::test;
 
 static int failures = 0;
-static void check(bool ok, const char* message) {
-    std::printf("[%s] %s\n", ok ? "ok" : "FAIL", message);
-    failures += !ok;
-}
+static void check(bool ok, const char* message) { EXPECT_TRUE(ok) << message; }
 
-int main() {
+TEST(CommandPoolReuse, Contract) {
     const auto& ctx = render_vk_ctx();
     if (!ctx.ok) {
         std::printf("[skip] no Vulkan device\n");
-        return 0;
+        return;
     }
     const bool reuse = std::getenv("PROSPER_NO_COMMAND_POOL_REUSE") == nullptr;
     std::printf("== test_command_pool_reuse (reuse %s) ==\n", reuse ? "ENABLED" : "DISABLED");
@@ -206,7 +204,5 @@ int main() {
     //  * GENUINELY NOT CAUGHT: ignoring `queue_family` when matching a cached pool. This device
     //    exposes one usable family, so no arm here can distinguish a correct match from a
     //    device-only one.
-    if (failures) { std::printf("== FAIL: %d ==\n", failures); return 1; }
-    std::printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(failures, 0);
 }

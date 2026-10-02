@@ -2,17 +2,14 @@
 // re-created device-local (#3905). Pure arithmetic over hand-chosen figures; every expected value is
 // worked out by hand from the header's rules, not computed by the function under test.
 #include "gpu/memory/spill_recovery.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-static void check(bool ok, const char* what) {
-    std::printf("%s %s\n", ok ? "[ok]  " : "[FAIL]", what);
-    if (!ok) ++fails;
-}
+static void check(bool ok, const char* what) { EXPECT_TRUE(ok) << what; }
 
 static constexpr uint64_t MiB = 1024ull * 1024ull;
 static constexpr uint64_t GiB = 1024ull * MiB;
@@ -25,7 +22,7 @@ static SpillRecoveryInputs budget(uint64_t now, uint64_t spilled, uint64_t heap_
     return in;
 }
 
-int main() {
+TEST(SpillRecovery, Contract) {
     // 1. Nothing spilled: never due, never granted, state untouched (the healthy-run cost).
     {
         SpillRecoveryState s;
@@ -103,6 +100,4 @@ int main() {
         spill_recovery_allowance(in, s);
         check(s.interval_ms == kSpillRecoveryMaxBackoffMs, "backoff caps at 60 s");
     }
-    std::printf("%s (%d failure%s)\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
-    return fails ? 1 : 0;
 }

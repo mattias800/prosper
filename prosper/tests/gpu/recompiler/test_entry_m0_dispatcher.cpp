@@ -58,6 +58,7 @@
 // arms moved; #3136's author had to build a throwaway probe harness for exactly that. This one is
 // the harness, kept in the tree.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -68,8 +69,7 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Whether the module contains an instruction with the given opcode.
 static bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
@@ -98,7 +98,7 @@ static std::vector<uint32_t> compile(const uint32_t* code, size_t dwords, uint64
                              {RecompileDiagnosticStage::Compute, program});
 }
 
-int main() {
+TEST(EntryM0Dispatcher, Contract) {
     printf("== test_entry_m0_dispatcher ==\n");
 
     // ---------------------------------------------------------------------------------------------
@@ -381,7 +381,5 @@ int main() {
     //                                          why the reject reason's `pc=` is asserted and not
     //                                          just the emptiness: without it this mutation passes
     //                                          the arm while refusing the wrong instruction.
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

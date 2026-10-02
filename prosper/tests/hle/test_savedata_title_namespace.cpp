@@ -33,6 +33,7 @@
 //   6. default   — with no PROSPER_SAVE0 the root follows the per-user data location rather than the
 //                  RAM-backed tmpfs the old default used.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/fs/save_paths.hpp"
 #include "hle/service/hle_addcontent.hpp"
 #include "fixtures/test_scratch.h"
@@ -49,9 +50,7 @@
 using namespace prosper;
 namespace fs = std::filesystem;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -115,7 +114,7 @@ constexpr const char* kTitleAOnlySlot = "TitleAPrivateSave";
 
 }   // namespace
 
-int main() {
+TEST(SavedataTitleNamespace, Contract) {
     printf("== test_savedata_title_namespace ==\n");
     register_builtin_hle();
 
@@ -300,6 +299,4 @@ int main() {
     CHECK(default_root != default_mem_root,
           "the /savedata0 mount and SaveDataMemory keep separate roots");
 
-    printf("== %s: %d ==\n", fails ? "FAIL" : "PASS", fails);
-    return fails ? 1 : 0;
 }

@@ -4,6 +4,7 @@
 // base/stride/size/format and assigns provenance (srt_offset) + bindings — the contract the recompiler
 // and pipeline consume. Pure/headless; validates the decode against hand-built descriptors.
 #include "gpu/agc/agc_shader_layout.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -12,8 +13,7 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Build a 4-dword V# (buffer resource): Base48, 14-bit stride @[16:29] of word1, num_records=word2,
 // RDNA2 combined 7-bit FORMAT @[18:12] of word3 and identity DST_SEL X/Y/Z/W in [11:0].
@@ -42,7 +42,7 @@ static void make_tsharp(uint32_t t[8], uint64_t base, uint32_t w, uint32_t h, ui
         t[4] = (base_array << 16) | ((base_array + depth - 1) & 0x1fffu);
 }
 
-int main() {
+TEST(BuildShaderResources, Contract) {
     printf("== test_build_shader_resources ==\n");
 
     // --- Gen5 IMG_FMT mapper (pure table, #65) --------------------------------------------------
@@ -1231,7 +1231,5 @@ int main() {
               "unmapped format with both selectors set fails closed");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

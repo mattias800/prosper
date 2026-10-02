@@ -16,6 +16,7 @@
 // `descriptor-resolved` and prints no `reject-` string at all, every assertion here would also pass
 // against an emitter that refused everything.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -37,8 +38,7 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static void set_test_env(const char* name, const char* value) {
 #ifdef _WIN32
@@ -98,7 +98,7 @@ static ShaderResourceTable table_with_format(DataFormat fmt, uint32_t ncomp) {
     return rt;
 }
 
-int main() {
+TEST(BufOpCensusDisposition, Contract) {
     printf("== test_buf_op_census_disposition ==\n");
     set_test_env("PROSPER_DBG", "1");
 
@@ -215,7 +215,5 @@ int main() {
     }
 
     set_test_env("PROSPER_DBG", nullptr);
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

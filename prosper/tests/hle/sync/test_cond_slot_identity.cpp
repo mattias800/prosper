@@ -21,6 +21,7 @@
 //    unrecoverable from inside the test -- a rescue broadcast resolves to the same wrong slot -- so
 //    joining would hang the suite instead of reporting a failure.
 #include "hle/sync/sync_futex.hpp"
+#include <gtest/gtest.h>
 
 #include <pthread.h>
 #include <cstdio>
@@ -34,8 +35,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); fails++; } \
-                              else std::printf("  [ok]   %s\n", msg); } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 namespace {
 
@@ -112,11 +112,11 @@ bool signal_survives_slot_reuse(pthread_cond_t* earlier, pthread_cond_t* target,
 
 }  // namespace
 
-int main() {
+TEST(CondSlotIdentity, Contract) {
 #ifndef _WIN32
     std::printf("  [skip] the condition-slot table is Windows-only\n");
     std::printf("== PASS ==\n");
-    return 0;
+    return;
 #else
     // `early` claims a slot before `target`, so it sits earlier in the table. Signalling with nobody
     // waiting is the cheapest way to force the claim and is otherwise a no-op.
@@ -145,7 +145,7 @@ int main() {
         std::printf("  [skip] recycled-slot case: a thread is stuck on the wrong slot\n");
     }
 
-    if (fails) {
+    if (fails || ::testing::Test::HasFailure()) {
         std::printf("== FAIL: %d ==\n", fails);
         std::fflush(stdout);
         // A waiter may still be parked on a slot nothing will ever signal, so a normal return would
@@ -153,6 +153,7 @@ int main() {
         std::_Exit(1);
     }
     std::printf("== PASS ==\n");
-    return 0;
+    return;
 #endif
+    EXPECT_EQ(fails, 0);
 }

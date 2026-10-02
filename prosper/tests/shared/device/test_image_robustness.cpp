@@ -29,6 +29,7 @@
 // construction, since `image_support` is assigned from the helper's verdict and from nowhere else.
 
 #include "shared/device/image_robustness.hpp"
+#include <gtest/gtest.h>
 #include "shared/device/vulkan_runtime.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 
@@ -36,14 +37,11 @@
 #include <cstring>
 #include <vector>
 
-static int fails = 0;
-static int checks = 0;
-#define CHECK(c, m) do { ++checks; if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 using prosper::frontend::storage_image_device_features;
 
-int main() {
+TEST(ImageRobustness, Contract) {
     // Unbuffered: a crash must not swallow the arms that already reported. Without this a fault
     // anywhere below turns a run that had printed twelve [ok] lines into a run that printed none,
     // which reads as "the test never started".
@@ -184,7 +182,4 @@ int main() {
         }
     }
 
-    if (fails) { std::printf("== FAIL: %d == (%d assertions executed)\n", fails, checks); return 1; }
-    std::printf("== PASS == (%d assertions executed)\n", checks);
-    return 0;
 }

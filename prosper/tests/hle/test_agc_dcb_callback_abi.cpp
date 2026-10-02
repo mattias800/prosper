@@ -12,6 +12,7 @@
 // and would pass whether or not the trampoline is used -- i.e. it could not fail, which is the trap
 // this test exists to avoid.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -27,8 +28,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 #ifdef _WIN32
 
@@ -65,16 +65,16 @@ extern "C" __attribute__((sysv_abi)) bool test_dcb_full(void* dcb, uint32_t need
 
 #endif  // _WIN32
 
-int main() {
+TEST(AgcDcbCallbackAbi, Contract) {
 #ifndef _WIN32
     std::printf("  [skip] host->guest ABI conversion is a Windows-only concern\n");
     std::printf("== PASS ==\n");
-    return 0;
+    return;
 #else
     register_builtin_hle();   // populates the NID table, as every other AGC test does
     HleFn set_sh_range = Hle::lookup("n2fD4A+pb+g");   // sceAgcCbSetShRegisterRangeDirect
     CHECK(set_sh_range != nullptr, "sceAgcCbSetShRegisterRangeDirect is registered");
-    if (!set_sh_range) { std::printf("== FAIL: %d ==\n", fails); return 1; }
+    if (!set_sh_range) { std::printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
 
     static uint32_t ring[64];
     TestDcb dcb{};
@@ -106,8 +106,9 @@ int main() {
     CHECK(g_seen_user == 0xD00DFEEDCAFEB00Dull,
           "argument 3 is user_data, delivered whole and in the guest's THIRD register");
 
-    if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
+    if (fails || ::testing::Test::HasFailure()) { std::printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
     std::printf("== PASS ==\n");
-    return 0;
+    return;
 #endif
+    EXPECT_EQ(fails, 0);
 }

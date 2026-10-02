@@ -2,15 +2,14 @@
 // enforce handle validity. This is the front-half↔back-half integration point (gpu_resources.hpp);
 // the test fixes its behavior so both halves can rely on it as we build the Vulkan backing.
 #include "gpu/resources/gpu_resources.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(GpuResources, Contract) {
     printf("== test_gpu_resources ==\n");
     resource_reset();
     CHECK(resource_count() == 0, "registry starts empty");
@@ -69,7 +68,4 @@ int main() {
     resource_reset();
     CHECK(resource_count() == 0 && !resource_valid(h_rt), "reset clears the registry");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

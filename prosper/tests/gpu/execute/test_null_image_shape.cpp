@@ -20,6 +20,7 @@
 // with it. That is also the fix: the null synthesis now carries `SrtUse::mimg_dim` into `img_dim`,
 // which uses the same SQ_RSRC encoding.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -28,10 +29,9 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(NullImageShape, Contract) {
     printf("== test_null_image_shape ==\n");
 
     // image_load v[0:3], v0, s[8:15] dim:3D dmask:0xf   (gfx1030; dim field = bits 5:3 = 2)
@@ -62,7 +62,7 @@ int main() {
     std::vector<uint32_t> spirv = recompile_compute(code_3d, std::size(code_3d), &rt_correct,
                                                     ComputeShaderConfig{});
     CHECK(!spirv.empty(), "a 3D image_load through an all-zero T# recompiles");
-    if (spirv.empty()) { printf("== FAIL: %d ==\n", fails + 1); return 1; }
+    if (spirv.empty()) { printf("== FAIL: %d ==\n", fails + 1); FAIL() << "legacy early exit"; }
 
     // Establish the premise before asserting anything about it: the module really does declare Dim=3D.
     // Without this the two arms below could both pass against a module that declared 2D, which is
@@ -116,7 +116,5 @@ int main() {
           "#3577: a 3D descriptor with ZERO depth is reported -- the backend would build a "
           "VK_IMAGE_TYPE_3D with extent.depth = 0 and lose the draw to a create failure");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

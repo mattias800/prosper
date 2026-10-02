@@ -14,7 +14,8 @@
 // The configured per-process scratch fixture is exclusively created and automatically cleaned.
 // On Windows explicitly mark it sparse before
 // SetEndOfFile; extending an ordinary NTFS file is not a sparse-allocation guarantee.
-// Unsupported sparse/sizing operations return CTest's explicit skip code, not success.
+// Unsupported sparse/sizing operations are reported with GTEST_SKIP, not success.
+#include <gtest/gtest.h>
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "../../fixtures/test_scratch.h"
@@ -39,9 +40,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 struct TempStream {
     const std::string path = prosper_test::test_scratch_file("large-offset.bin");
@@ -65,7 +64,7 @@ struct TempStream {
     ~TempStream() { if (file) std::fclose(file); }
 };
 
-int main() {
+TEST(LargeOffsetSeek, Contract) {
     printf("== test_large_offset_seek ==\n");
 #ifdef _WIN32
     _putenv_s("PROSPER_FILELOG", "1");
@@ -79,7 +78,7 @@ int main() {
     HleFn fseek_fn = Hle::lookup(nid_hash("fseek"));
     HleFn ftell_fn = Hle::lookup(nid_hash("ftell"));
     CHECK(lseek_fn && fseek_fn && ftell_fn, "lseek, fseek and ftell are registered");
-    if (!lseek_fn || !fseek_fn || !ftell_fn) return 1;
+    if (!lseek_fn || !fseek_fn || !ftell_fn) return;
 
     constexpr int64_t kSize = (int64_t)6 * 1024 * 1024 * 1024;            // logical 6 GiB
     constexpr int64_t kPast2GiB = (int64_t)0x80000000LL + 0x1234;         // first bytes past 2 GiB
@@ -88,15 +87,14 @@ int main() {
     TempStream owned;
     FILE* file = owned.file;
     CHECK(file != nullptr, "exclusive auto-cleaned temporary stream opens");
-    if (!file) return 1;
+    if (!file) return;
 #ifdef _WIN32
     const int fd = _fileno(file);
     const HANDLE handle = (HANDLE)_get_osfhandle(fd);
     DWORD returned = 0;
     if (!DeviceIoControl(handle, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr)) {
-        printf("  [skip] temporary filesystem cannot mark sparse storage (Windows error %lu)\n",
-               (unsigned long)GetLastError());
-        return 77;
+        GTEST_SKIP() << "temporary filesystem cannot mark sparse storage (Windows error "
+                     << (unsigned long)GetLastError() << ")";
     }
     LARGE_INTEGER size;
     size.QuadPart = kSize;
@@ -106,8 +104,7 @@ int main() {
     const bool sized = ftruncate(fd, (off_t)kSize) == 0;
 #endif
     if (!sized) {
-        printf("  [skip] temporary filesystem cannot size a logical 6 GiB extent\n");
-        return 77;
+        GTEST_SKIP() << "temporary filesystem cannot size a logical 6 GiB extent";
     }
 
     // --- §1 lseek through the registered handler -------------------------------------------------
@@ -177,6 +174,4 @@ int main() {
 #endif
     std::clearerr(stderr);
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

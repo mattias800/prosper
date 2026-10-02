@@ -23,6 +23,7 @@
 // corrupted variant produced by the same generator as the control inherits that generator's geometry,
 // so a malformation it cannot express would read as a clean pass.
 #include "hle/dispatch/nid.hpp"
+#include <gtest/gtest.h>
 #include "loader/linker.hpp"
 #include "self/module.hpp"
 #include "fixtures/handmade_prx.h"
@@ -42,8 +43,7 @@ using namespace prosper;
 using prosper_test::SynthModuleSpec;
 
 static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 // Typed constants rather than an enum: these are added to the fixtures' own layout enums, and
 // enum + enum arithmetic is deprecated in C++20.
@@ -105,7 +105,7 @@ static std::vector<uint8_t> self_fixture_bytes(const SynthModuleSpec& spec, uint
     return bytes;
 }
 
-int main() {
+TEST(LoaderSynthReject, Contract) {
     printf("== test_loader_synth_reject ==\n");
 
     const std::string dir = prosper_test::test_scratch_dir().string();
@@ -581,6 +581,5 @@ int main() {
         }
     }
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

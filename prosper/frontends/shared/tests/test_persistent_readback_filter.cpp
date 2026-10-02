@@ -1,14 +1,14 @@
 #include "shared/diagnostics/persistent_readback_filter.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 #include <initializer_list>
 
 using namespace prosper::frontend;
 
-static int failures = 0;
-#define CHECK(condition, message) do { if (!(condition)) { std::printf("FAIL: %s\n", message); ++failures; } } while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
-int main() {
+TEST(PersistentReadbackFilter, Contract) {
     const auto broad = parse_persistent_readback_filter(nullptr);
     CHECK(broad.state == PersistentReadbackFilterState::All &&
           broad.allows(0x3080030000ull) && broad.allows(0x9fc2000000ull),
@@ -66,7 +66,4 @@ int main() {
           bytes == 0 && overflow_budget.charged_bytes == 0,
           "unknown zero-stride format refuses without charging");
 
-    if (failures) return 1;
-    std::printf("== PASS ==\n");
-    return 0;
 }

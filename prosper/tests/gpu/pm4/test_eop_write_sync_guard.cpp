@@ -4,6 +4,7 @@
 // apply) must be skipped, not dereferenced: before the fix each case below SIGSEGVs.
 // The mapped-target cases assert the guard introduces no false skips (liveness).
 #include "gpu/pm4/command_processor.hpp"
+#include <gtest/gtest.h>
 #include "gpu/pm4/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -11,9 +12,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & (R_NUM - 1u)) << 2u);
@@ -22,7 +21,7 @@ static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
 // A canonical guest-space address that is certainly unmapped in this test process.
 static constexpr uint64_t kUnmapped = 0x5F0000010000ull;
 
-int main() {
+TEST(EopWriteSyncGuard, Contract) {
     // Must be set before the first honor_* call: eop_write_sync() latches on first use.
     // (MinGW has no setenv; _putenv is the Windows equivalent.)
 #ifdef _WIN32
@@ -88,7 +87,4 @@ int main() {
               "sync WRITE_DATA to a mapped target still writes all dwords");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

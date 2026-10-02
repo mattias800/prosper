@@ -13,14 +13,13 @@
 // covered the frame. Measured on PPSA04263 before the guard: 33,615 aliasing rejections across 46
 // distinct addresses in under a minute, every one with `declared_mip_levels == 1` on both sides.
 #include "gpu/agc/agc_shader_layout.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 
 using prosper::gpu::ShaderResource;
 using prosper::gpu::shader_resource_mip_chain_provenance_matches;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); ++fails; } \
-                         else printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // A descriptor as `image_base_level_view` leaves it: provenance filled in.
 static ShaderResource with_provenance(uint32_t declared_levels) {
@@ -41,7 +40,7 @@ static ShaderResource without_provenance(uint32_t declared_levels) {
     return r;
 }
 
-int main() {
+TEST(MipProvenanceIdentity, Contract) {
     printf("== mip provenance identity (#3205) ==\n");
 
     // THE REGRESSION. Both single-level, provenance set on one side only. These describe the same
@@ -83,6 +82,4 @@ int main() {
         CHECK(!shader_resource_mip_chain_provenance_matches(a, b), msg);
     }
 
-    printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
 }

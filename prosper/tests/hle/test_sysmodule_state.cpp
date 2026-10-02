@@ -27,6 +27,7 @@
 // at the same time and so did not test what its name claims. Holding two simultaneously is the only
 // arrangement that separates a per-id map from a single slot.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -34,12 +35,11 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static const uint64_t kUnloaded = 0x805A1001;   // SCE_SYSMODULE_ERROR_UNLOADED (GTA V's own compare)
 
-int main() {
+TEST(SysmoduleState, Contract) {
     printf("== test_sysmodule_state ==\n");
     register_builtin_hle();
 
@@ -47,7 +47,7 @@ int main() {
     HleFn load      = Hle::lookup(nid_hash("sceSysmoduleLoadModule"));
     HleFn unload    = Hle::lookup(nid_hash("sceSysmoduleUnloadModule"));
     CHECK(is_loaded && load && unload, "sysmodule-handlers-registered");
-    if (!is_loaded || !load || !unload) return 1;
+    if (!is_loaded || !load || !unload) FAIL() << "legacy early exit";
 
     // 0xB4 is the id GTA V asks about before sceAppContentInitialize; 0x19 is another id it queries.
     const uint64_t kAppContent = 0xB4, kOther = 0x19;
@@ -130,6 +130,5 @@ int main() {
         }
     }
 
-    printf(fails ? "== FAILURES: %d ==\n" : "== all checks passed ==\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

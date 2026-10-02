@@ -21,6 +21,7 @@
 // than kAmmWindowSize means resizing the window stays legal and shrinking it below what the guest
 // can use does not.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -33,8 +34,7 @@ using namespace prosper;
 extern "C" int prosper_reserved_range_state(uint64_t addr);
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 constexpr uint64_t kPoison  = 0xdeadbeefdeadbeefull;   // what "wrote nothing" looks like
@@ -44,7 +44,7 @@ constexpr uint64_t kEagain  = 0x80020010ull;           // the guest's retry sent
 constexpr uint64_t kFourGiB = 0x100000000ull;
 }
 
-int main() {
+TEST(AmprAmm, Contract) {
     std::printf("== test_ampr_amm ==\n");
     register_builtin_hle();
 
@@ -81,8 +81,7 @@ int main() {
     CHECK(get_ranges && give_dmem && amm_ctor && amm_map && amm_submit && amm_wait,
           "all six libSceAmpr AMM NIDs are registered");
     if (!(get_ranges && give_dmem && amm_ctor && amm_map && amm_submit && amm_wait)) {
-        std::printf("%s\n", fails ? "FAILED" : "PASSED");
-        return fails ? 1 : 0;
+        FAIL() << "the libSceAmpr AMM NIDs are not all registered";
     }
 
     // ---- the window ------------------------------------------------------------------------
@@ -103,7 +102,7 @@ int main() {
         std::printf("  [stop]  the window out-parameters were not written; the arms below would "
                     "dereference residue\n");
         std::printf("FAILED\n");
-        return 1;
+        FAIL() << "legacy early exit";
     }
     const uint64_t window_base = ranges[0], window_end = ranges[1];
     CHECK(window_base != 0 && window_end > window_base, "the window is a real, non-empty range");
@@ -144,7 +143,7 @@ int main() {
           "the direct-memory NIDs this test builds its preconditions from are registered");
     if (!(alloc_dmem && map_dmem && munmap_fn && release_dmem)) {
         std::printf("FAILED\n");
-        return 1;
+        FAIL() << "legacy early exit";
     }
 
     // (1) Hold a 16 KiB block forever, so the pool's first free gap is no longer 2 MiB aligned.
@@ -298,6 +297,5 @@ int main() {
                 "site in hle_kernel_mem.cpp)\n");
 #endif
 
-    std::printf("%s\n", fails ? "FAILED" : "PASSED");
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

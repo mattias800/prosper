@@ -13,6 +13,10 @@ into a `.prgbundle` / `.prgcap` that `tools/gpu_replay` can reproduce offline an
   plumbing behind the F9 grab and the scheduled triggers.
 - `capture_collect` — gathering a frame's contents: intervals, tables, submit items, raw shader
   versions, failure diagnostics.
+  Capture v69 appends physical fragment entry/launch knownness per draw. Exact-source-associated
+  collector draws retain producing owned raw words and normalized PS resource identity rather
+  than a later VA/table observation. Older captures keep entry/source association unavailable;
+  materialization does not manufacture a guest ABI, packet kernel or render admission.
 - `serialize/` — the file format, in its own folder: byte cursors, per-field codecs, and the two
   entry points. See its `AGENTS.md`; the boundary against this folder is the version contract.
 - `gpu_capture_internal` — the vocabulary those two share: magic/version/limits, footprint

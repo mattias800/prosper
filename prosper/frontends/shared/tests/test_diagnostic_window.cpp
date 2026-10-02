@@ -10,14 +10,13 @@
 // Pure predicate, so no renderer, no device and no clock: `contains()` takes the elapsed time as an
 // argument precisely so the latch can be driven backwards, forwards and out of order under test.
 #include "shared/diagnostics/diagnostic_window.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); ++fails; } \
-                              else         { std::printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
-int main() {
+TEST(DiagnosticWindow, Contract) {
     using prosper::frontend::DiagnosticWindow;
     using prosper::frontend::parse_diagnostic_window;
 
@@ -92,7 +91,4 @@ int main() {
               "an ordinal at the top of the range does not wrap the window open");
     }
 
-    std::printf(fails ? "test_diagnostic_window: %d FAILURE(S)\n" : "test_diagnostic_window: all ok\n",
-                fails);
-    return fails ? 1 : 0;
 }

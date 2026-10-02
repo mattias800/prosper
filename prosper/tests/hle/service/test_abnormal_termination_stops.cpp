@@ -18,6 +18,7 @@
 // The suppression arm is a discriminator, not a courtesy. Without it, a stop signal latched by
 // unrelated code anywhere in the process would make the first arm pass forever.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "host/platform/lifecycle.hpp"
 
@@ -28,8 +29,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", (msg)); ++fails; } \
-                              else printf("ok: %s\n", (msg)); } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 static void set_continue(bool on) {
 #ifdef _WIN32
@@ -44,14 +44,14 @@ static void set_continue(bool on) {
 // than silently unhooking the handler. Verified against the PS5 3.20 libSceSystemService stub table.
 static const char* kNid = "3s8cHiCBKBE";
 
-int main() {
+TEST(AbnormalTerminationStops, Contract) {
     register_builtin_hle();
 
     HleFn fn = Hle::lookup(kNid);
     CHECK(fn != nullptr,
           "sceSystemServiceReportAbnormalTermination is registered (unregistered, it falls to the "
           "dispatcher default and can never stop the run)");
-    if (!fn) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
+    if (!fn) { printf("== FAIL: %d check(s) failed ==\n", fails); FAIL() << "legacy early exit"; }
 
     // ---- arm 1: the DEFAULT path does NOT stop ----------------------------------------------
     set_continue(false);
@@ -93,7 +93,6 @@ int main() {
           "a signal that had latched permanently");
 
     prosper_reset_stop();
-    if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) failed ==\n", fails); FAIL() << "legacy early exit"; }
+    EXPECT_EQ(fails, 0);
 }

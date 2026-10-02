@@ -3,6 +3,7 @@
 // primitive type, depth/blend state) via the AGC Dcb builders, replay it into a GpuState, then
 // extract the semantic RenderState and assert every field (addresses use the RDNA2 <<8|<<40 rule).
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/state/render_state.hpp"
 #include "gpu/state/vk_translate.hpp"
@@ -24,8 +25,7 @@ using namespace prosper::gpu;
 namespace P = prosper::agc::Pm4;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 #ifdef _WIN32
 static int test_fileno(FILE* stream) { return _fileno(stream); }
@@ -86,14 +86,14 @@ static uint64_t rdna2_addr(uint32_t lo, uint32_t hi) {
     return ((uint64_t)lo << 8) | (((uint64_t)hi & 0xff) << 40);
 }
 
-int main() {
+TEST(RenderState, Contract) {
     printf("== test_render_state ==\n");
     register_builtin_hle();
     auto setcx = Hle::lookup("ZvwO9euwYzc");   // SetCxRegistersIndirect
     auto setsh = Hle::lookup("-HOOCn0JY48");   // SetShRegistersIndirect
     auto setuc = Hle::lookup("hvUfkUIQcOE");   // SetUcRegistersIndirect (VGT_PRIMITIVE_TYPE is uconfig)
     CHECK(setcx && setsh && setuc, "AGC Dcb builders registered");
-    if (!(setcx && setsh && setuc)) { printf("== FAIL ==\n"); return 1; }
+    if (!(setcx && setsh && setuc)) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // Context registers: color target base(+ext), color info(format), prim type, depth/blend/mask.
     ShaderReg cx_regs[] = {
@@ -1251,7 +1251,5 @@ int main() {
         }
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

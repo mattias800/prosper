@@ -26,6 +26,7 @@
 // gate scans for PROSPER_* names only, so an unprefixed name keeps this test outside its scope
 // without adding an exception to it. (The macros are name-agnostic, so nothing is lost.)
 #include "diagnostics/env_cache.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -49,13 +50,9 @@ static ENVCACHE_NOINLINE bool site_on()       { return PROSPER_ENV_ON("ENVCACHE_
 static ENVCACHE_NOINLINE bool site_off()      { return PROSPER_ENV_ON("ENVCACHE_TEST_OFF"); }
 static ENVCACHE_NOINLINE const char* site_v() { return PROSPER_ENV_VALUE("ENVCACHE_TEST_VAL"); }
 
-static int fails = 0;
-static void check(bool ok, const char* what) {
-    printf("%s %s\n", ok ? "[ok]  " : "[FAIL]", what);
-    if (!ok) ++fails;
-}
+static void check(bool ok, const char* what) { EXPECT_TRUE(ok) << what; }
 
-int main() {
+TEST(EnvCache, Contract) {
     // --- armed BEFORE first use, then disarmed --------------------------------------------------
     put_env("ENVCACHE_TEST_ON", "1");
     check(site_on(), "PROSPER_ENV_ON reports a variable set before the site's first evaluation");
@@ -96,6 +93,4 @@ int main() {
     check(site_on() && !site_off(),
           "two different sites keep independent cached storage (true and false coexist)");
 
-    printf(fails ? "== FAILURES: %d ==\n" : "== all passed (%d failures) ==\n", fails);
-    return fails ? 1 : 0;
 }

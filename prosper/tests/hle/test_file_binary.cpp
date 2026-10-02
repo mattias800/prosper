@@ -1,6 +1,7 @@
 // Guest fd I/O must preserve every byte of binary game content on every host.
 // In particular, Windows CRT text mode treats 0x1a as EOF and translates CRLF.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "fixtures/test_scratch.h"
 #include <array>
@@ -26,9 +27,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { std::printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 // FreeBSD/Orbis fcntl ABI values. Host constants are deliberately not used here: Linux and
 // Windows assign different bits to several status flags even when command numbers coincide.
@@ -54,7 +53,7 @@ struct GuestTimeval {
 };
 static_assert(sizeof(GuestTimeval) == 0x10, "SceKernelTimeval ABI");
 
-int main() {
+TEST(FileBinary, Contract) {
     std::printf("== test_file_binary ==\n");
     // Say up front whether the ENOTSUP arms below can distinguish a FreeBSD publish from a host
     // one. They cannot on a host whose ENOTSUP is already 45 (Darwin) -- a green run there is
@@ -1338,7 +1337,4 @@ int main() {
 #endif
     std::remove(path);
 
-    if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
-    std::printf("== PASS ==\n");
-    return 0;
 }

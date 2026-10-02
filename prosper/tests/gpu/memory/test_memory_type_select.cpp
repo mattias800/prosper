@@ -11,6 +11,7 @@
 // gpu-memory-off-device ledger counters, and AMD device-coherent exclusion. The mutation arms this
 // file was checked against are listed in the PRs.
 #include "diagnostics/perf/perf_ledger.hpp"
+#include <gtest/gtest.h>
 #include "gpu/diagnostics/memory_placement_log.hpp"
 #include "gpu/memory/memory_type_select.hpp"
 
@@ -23,11 +24,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-static void check(bool ok, const char* what) {
-    std::printf("%s %s\n", ok ? "[ok]  " : "[FAIL]", what);
-    if (!ok) ++fails;
-}
+static void check(bool ok, const char* what) { EXPECT_TRUE(ok) << what; }
 
 static constexpr VkMemoryPropertyFlags DL = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 static constexpr VkMemoryPropertyFlags HV = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
@@ -63,7 +60,7 @@ static uint32_t bits(std::initializer_list<uint32_t> types) {
     return b;
 }
 
-int main() {
+TEST(MemoryTypeSelect, Contract) {
     // ---- 1. The #3888 failure: a flag-less host type listed first ---------------------------------
     {
         const auto p = layout({{8 * GiB, true}, {32 * GiB, false}},
@@ -451,6 +448,4 @@ int main() {
               "pool-oom: released VRAM is used before the fallback reaches system memory");
     }
 
-    std::printf("%s (%d failure%s)\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
-    return fails ? 1 : 0;
 }
