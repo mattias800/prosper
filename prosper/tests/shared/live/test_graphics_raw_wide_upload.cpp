@@ -381,9 +381,28 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
               owned_nested_snapshot_at(*table, parent_pc, size) &&
               owned_nested_snapshot_at(*table, child_pc, size), arm,
               "fresh owned nested capture raw/stored paired SOURCE is exact after guest A changed to B");
+        // Replay owns its raw versions by index, but never publishes their old guest addresses
+        // as live capture origins. Retained modules/owners cannot replace that missing provenance.
+        GpuCaptureFile absent_origin, absent_origin_loaded;
+        GpuReplayFrame refused_origin;
+        std::vector<uint8_t> absent_origin_wire;
+        const bool recaptured_without_origin = !item.vs_guest_addr && !item.fs_guest_addr &&
+            capture_draw_items({item}, metadata, reader, absent_origin, error) &&
+            serialize_gpu_capture(absent_origin, absent_origin_wire, error) &&
+            deserialize_gpu_capture(absent_origin_wire, absent_origin_loaded, error) &&
+            absent_origin_loaded.draws.size() == 1u;
+        check(recaptured_without_origin &&
+              absent_origin_loaded.draws[0].vs_raw_shader_index == UINT32_MAX &&
+              absent_origin_loaded.draws[0].fs_raw_shader_index == UINT32_MAX &&
+              !materialize_gpu_replay(absent_origin_loaded, refused_origin, error) &&
+              error == "owned nested replay lacks exact raw shader provenance" &&
+              refused_origin.items.empty(), arm,
+              "recaptured replay modules and owners cannot replace absent producing raw-code origins");
         // This is a CPU producing-profile control, not a device-enablement witness. The
         // executing backend must still gate the resulting words against its enabled features.
-        auto explicit_item = item;
+        // Use the original retained draw: its registered code origins and immutable observation
+        // still belong to producer A even after the guest has changed the parent to B.
+        auto explicit_item = draw;
         explicit_item.float_transport = {FloatTransportProfile::ExplicitNonFinite32};
         explicit_item.ps_float_flags = {true, true, false};
         explicit_item.ps_launch_rsrc1 = {true, 0x20810000u};
