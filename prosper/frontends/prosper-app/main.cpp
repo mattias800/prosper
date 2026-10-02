@@ -240,7 +240,29 @@ struct Vk {
     prosper::frontend::FpsOverlay* overlay = nullptr;
 };
 
-uint32_t find_mem(VkPhysicalDevice p, uint32_t typeBits, VkMemoryPropertyFlags props) {
+// The Vulkan loader finds drivers through ICD manifests (JSON files). If the GPU driver files are
+// installed but its manifest is not registered, the loader sees zero drivers and SDL reports a
+// missing instance extension instead of the real cause.
+bool vulkan_error_means_no_driver(const char* err) {
+    return err && (std::strstr(err, "VK_KHR_surface") || std::strstr(err, "VK_KHR_win32_surface") ||
+                   std::strstr(err, "doesn't implement"));
+}
+
+void report_no_vulkan_driver() {
+    fprintf(stderr,
+        "[app] error: no usable Vulkan driver was found.\n"
+        "[app] Likely cause: the GPU driver is installed but its Vulkan ICD manifest (a JSON file) is\n"
+        "[app]   not registered, so the Vulkan loader sees zero drivers (`vulkaninfo` prints\n"
+        "[app]   \"Found no drivers!\"). On Windows the registration lives in the registry; a driver\n"
+        "[app]   update or clean install can leave it empty.\n"
+        "[app] Workaround: point the loader at the manifest directly, then relaunch:\n"
+        "[app]   PowerShell: $env:VK_DRIVER_FILES = \"<path to the driver's Vulkan .json manifest>\"\n"
+        "[app]   sh:         export VK_DRIVER_FILES=<path to the driver's Vulkan .json manifest>\n"
+        "[app] The manifest name and location vary by vendor (on Windows, usually under\n"
+        "[app] C:\\Windows\\System32\\DriverStore\\FileRepository\\<driver package>\\). See BUILDING.md.\n");
+}
+
+uint32_t find_mem(VkPhysicalDevice p,uint32_t typeBits, VkMemoryPropertyFlags props) {
     VkPhysicalDeviceMemoryProperties m; vkGetPhysicalDeviceMemoryProperties(p, &m);
     for (uint32_t i = 0; i < m.memoryTypeCount; i++)
         if ((typeBits & (1u << i)) && (m.memoryTypes[i].propertyFlags & props) == props) return i;
@@ -282,7 +304,7 @@ bool create_instance(Vk& vk, SDL_Window* win) {
 
 bool pick_device(Vk& vk) {
     uint32_t n = 0; vkEnumeratePhysicalDevices(vk.instance, &n, nullptr);
-    if (!n) { fprintf(stderr, "[app] no Vulkan device\n"); return false; }
+    if (!n) { fprintf(stderr, "[app] no Vulkan device\n"); report_no_vulkan_driver(); return false; }
     std::vector<VkPhysicalDevice> devs(n); vkEnumeratePhysicalDevices(vk.instance, &n, devs.data());
     for (auto d : devs) {
         VkPhysicalDeviceProperties properties{};
@@ -1654,7 +1676,15 @@ int main(int argc, char** argv) {
     std::string title = window_title_for(dump, testPattern);
     fprintf(stderr, "[app] window title: \"%s\"\n", title.c_str());
     SDL_Window* win = SDL_CreateWindow(title.c_str(), (int)winW, (int)winH, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
-    if (!win) { fprintf(stderr, "[app] SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
+    if (!win) {
+        const char* err = SDL_GetError();
+        fprintf(stderr, "[app] SDL_CreateWindow: %s\n", err);
+        if (vulkan_error_means_no_driver(err)) report_no_vulkan_driver();
+        // _Exit: threads started earlier may still be joinable, and unwinding main would
+        // reach std::terminate ("terminate called without an active exception").
+        fflush(stderr);
+        std::_Exit(1);
+    }
 
     Vk vk;
     // Present unification (#1270): prefer the renderer's shared device for real game boots so we can
