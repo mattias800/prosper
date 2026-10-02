@@ -1,5 +1,11 @@
 # Target source tree and layer order
 
+> **Status: proposal.** The current-tree measurements and the layer order, which the ratchet
+> enforces, are descriptive. The *target* tree is a direction the project owner has not yet approved:
+> the new `src/guest/` layer, the move of the shipping Vulkan backend to `frontends/shared/backend/`,
+> and the "Planned moves" table. Read them as a plan to discuss, and don't start a move from this
+> document alone.
+
 What the source tree looks like now, what it should look like, which way dependencies may point,
 and the planned moves that get from one to the other. Every move is a move-only PR made with the
 refactor tools; every structural cost this document names is frozen by a ratchet rule so it cannot
