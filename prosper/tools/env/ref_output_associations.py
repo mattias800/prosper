@@ -486,7 +486,7 @@ def _refuse_unknown_calls(text: str, names: set[str], record, structural, root, 
     for match in re.finditer(r'\b([\w:]+)(?:\s*<[^{};()]*>)?\s*\(', text):
         end = matching(text,match.end()-1,'(',')')
         calls.append((match[1],match.start(),end,text[match.end():end]))
-    for name,start,end,args in calls:
+    for name,start,_end,args in calls:
         if not (bare_identifiers(args) & names):
             continue
         before = start
@@ -540,7 +540,7 @@ def _validate_calls(record, root, files, structural, signatures, defaulted_local
             try:
                 calling_closures = _validate_closure_uses(text, set(), (match.start(),))
             except ValueError as error:
-                raise ValueError('associated call is inside a closure without verified local uses: ' + str(error))
+                raise ValueError('associated call is inside a closure without verified local uses: ' + str(error)) from error
             record.calling_closures.extend(dict(closure, path=path.relative_to(root).as_posix(),
                                                associated_line=line) for closure in calling_closures)
             end = matching(text,opening,'(',')')

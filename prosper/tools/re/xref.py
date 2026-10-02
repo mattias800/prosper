@@ -195,13 +195,13 @@ class Module:
                 f"refusing rather than answering 0 for every address (#2346).")
 
     def foff(self, va):
-        for v, o, fs, fl in self.segs:
+        for v, o, fs, _fl in self.segs:
             if v <= va < v + fs:
                 return o + (va - v)
         return None
 
     def va_at(self, fo):
-        for v, o, fs, fl in self.segs:
+        for v, o, fs, _fl in self.segs:
             if o <= fo < o + fs:
                 return v + (fo - o)
         return None

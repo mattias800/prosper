@@ -84,7 +84,7 @@ for t in inf.threads():
         break
 if t1 is None:
     t1 = inf.threads()[-1]
-for i in range(80):
+for _i in range(80):
     gdb.execute("continue &")
     time.sleep(0.04)
     gdb.execute("interrupt")

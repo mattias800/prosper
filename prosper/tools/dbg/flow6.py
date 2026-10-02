@@ -25,7 +25,7 @@ def sym(v):
 
 bp = gdb.Breakpoint("prosper_on_unimpl")
 chains = Counter()
-for i in range(40):
+for _i in range(40):
     gdb.execute("continue")
     try:
         idx = int(gdb.parse_and_eval("$rdi")) & 0xffffffff

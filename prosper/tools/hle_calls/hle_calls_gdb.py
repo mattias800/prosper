@@ -663,7 +663,7 @@ for addr, name in SYMS:
 try:
     _Clock(CLOCK)
 except gdb.error as exc:
-    raise SystemExit("hle_calls: cannot set the clock breakpoint on %s: %s" % (CLOCK, exc))
+    raise SystemExit("hle_calls: cannot set the clock breakpoint on %s: %s" % (CLOCK, exc)) from exc
 
 print("hle_calls: armed %d handler breakpoints at load bias %#x; window = %d entries of %s "
       "(mode=%s values=%s)" % (armed, LOAD_BIAS, TICKS, CLOCK, MODE, "on" if VALUES else "off"))

@@ -59,7 +59,7 @@ for t in inf.threads():
         break
 hist = Counter()
 if main:
-    for i in range(20):
+    for _i in range(20):
         gdb.execute("continue &", to_string=True)
         time.sleep(0.15)
         gdb.execute("interrupt", to_string=True)

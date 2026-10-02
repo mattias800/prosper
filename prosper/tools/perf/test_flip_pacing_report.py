@@ -59,10 +59,10 @@ def main():
     #    both rates rather than one smeared average.
     stamps = []
     t = 1.0
-    for i in range(300):
+    for _i in range(300):
         t += 1 / 60.0
         stamps.append(t)
-    for i in range(300):
+    for _i in range(300):
         t += 1 / 30.0
         stamps.append(t)
     log = "".join(f"[ev] GpuFlip t={t:.3f}\n" for t in stamps)
@@ -227,7 +227,7 @@ def main():
 
     stamps = []
     t = 1.0
-    for i in range(600):
+    for _i in range(600):
         t += 0.015625
         stamps.append(t)
     log = "".join(f"[ev] GpuFlip t={t:.6f}\n" for t in stamps)

@@ -136,7 +136,7 @@ def main(argv=None):
     try:
         addrs = [int(w, 0) for w in words]
     except ValueError as exc:
-        raise SystemExit("bad address: %s" % exc)
+        raise SystemExit("bad address: %s" % exc) from exc
 
     segs, data = load_segments(args.image)
     for va in addrs:

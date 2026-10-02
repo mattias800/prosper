@@ -381,16 +381,16 @@ def _take_opts(rest, known, cols_default=16, rows_default=9):
             try:
                 c, r = spec.lower().split("x")
                 cols, rows = int(c), int(r)
-            except Exception:
-                raise SystemExit(f"--cells wants COLSxROWS, got {spec!r}")
+            except Exception as exc:
+                raise SystemExit(f"--cells wants COLSxROWS, got {spec!r}") from exc
             if cols < 1 or rows < 1:
                 raise SystemExit(f"--cells must be positive, got {spec!r}")
             del rest[i:i + 2]
         elif rest[i] == "--threshold" and i + 1 < len(rest):
             try:
                 thr = int(rest[i + 1])
-            except Exception:
-                raise SystemExit(f"--threshold wants an integer, got {rest[i + 1]!r}")
+            except Exception as exc:
+                raise SystemExit(f"--threshold wants an integer, got {rest[i + 1]!r}") from exc
             if not 0 <= thr <= 255:
                 raise SystemExit(f"--threshold must be 0..255, got {thr}")
             del rest[i:i + 2]
