@@ -49,7 +49,8 @@ Usage:
   image_likeness.py --locate REFERENCE DIR          # rank surfaces by best region
   image_likeness.py --selftest                      # verify the measure's own claims
 """
-import sys, os
+import sys
+import os
 import numpy as np
 from PIL import Image
 
@@ -455,7 +456,9 @@ def selftest():
     algorithm reinstated, bottom-half locates as "top-right q", left-half as
     "bottom-left q" and centre as "top-left q". Do not simplify this fixture.
     """
-    import io, contextlib, tempfile
+    import io
+    import contextlib
+    import tempfile
     ok = True
 
     def check(name, cond):
