@@ -1011,9 +1011,9 @@ if(TARGET prosper_core)
       LIBRARIES prosper_core)
     # #3635: a second guest_tls_activate_thread() on one thread keeps its guest TCB instead of
     # installing a fresh zeroed block. The wrfsbase path is x86-64 Linux only; the test skips elsewhere.
-    prosper_add_gtest(test_guest_tls_reactivate
-      SOURCES tests/host/tls/test_guest_tls_reactivate.cpp
-      LIBRARIES prosper_core)
+    add_executable(test_guest_tls_reactivate tests/host/tls/test_guest_tls_reactivate.cpp)
+    target_link_libraries(test_guest_tls_reactivate PRIVATE prosper_core)
+    add_test(NAME guest_tls_reactivate COMMAND test_guest_tls_reactivate)
   endif()
 
   # Cross-module TLS resolution (#136/#338): dynamic and initial-exec relocations resolve through
@@ -1037,9 +1037,10 @@ if(TARGET prosper_core)
   # PROSPER_NULL_PAGE backing must not touch errno/TLS on guest-%fs threads (issue #1071).
   if(UNIX AND NOT APPLE)
     # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
-    prosper_add_gtest(test_raw_syscall
-      SOURCES tests/host/platform/test_raw_syscall.cpp
-      INCLUDES src tests)
+    add_executable(test_raw_syscall tests/host/platform/test_raw_syscall.cpp)
+    target_include_directories(test_raw_syscall PRIVATE src)
+    target_include_directories(test_raw_syscall PRIVATE tests)
+    add_test(NAME raw_syscall COMMAND test_raw_syscall)
   endif()
 
   # sceAudioOut HLE: format decode, port lifecycle, PCM forwarding, volume, batch, error paths
@@ -4901,10 +4902,13 @@ endif()
       # GPU-executor core (Stage A): GpuState -> execute_gpustate() -> render -> present round-trip.
       # Includes a shared fixture, which resolves from the `tests` root.
       # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
-      prosper_add_gtest(test_gpu_execute
-        SOURCES tests/gpu/execute/test_gpu_execute.cpp
-        INCLUDES tests frontends
-        LIBRARIES prosper_core Vulkan::Vulkan)
+      add_executable(test_gpu_execute tests/gpu/execute/test_gpu_execute.cpp)
+      # Includes a shared fixture, which resolves from the `tests` root.
+      target_include_directories(test_gpu_execute PRIVATE tests)
+      # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
+      target_include_directories(test_gpu_execute PRIVATE frontends)
+      target_link_libraries(test_gpu_execute PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME gpu_execute COMMAND test_gpu_execute)
 
       # Payoff demo: recompile the GAME'S OWN embedded shaders and render them on real Vulkan.
       # Needs both Vulkan and the (gitignored) game dump, so it's gated on HAVE_GAME_DUMP.

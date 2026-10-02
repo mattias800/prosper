@@ -72,6 +72,7 @@ tests/gpu/execute/test_fragment_vote_refusal_reporting.cpp
 tests/gpu/execute/test_gpu_detile.cpp
 tests/gpu/execute/test_gpu_detile_render.cpp
 tests/gpu/execute/test_gpu_detile_storage.cpp
+tests/gpu/execute/test_gpu_execute.cpp
 tests/gpu/execute/test_gpu_retile.cpp
 tests/gpu/execute/test_index_expand.cpp
 tests/gpu/execute/test_live_compute_indirect_dispatch.cpp
@@ -197,7 +198,9 @@ tests/host/memory/test_guest_write_watch_index.cpp
 tests/host/memory/test_watch_mapping_generation.cpp
 tests/host/platform/test_gpu_submit_gate.cpp
 tests/host/platform/test_native_tls_lifetime.cpp
+tests/host/platform/test_raw_syscall.cpp
 tests/host/symbols/test_il2cpp_symbols.cpp
+tests/host/tls/test_guest_tls_reactivate.cpp
 tests/misc/test_boot_linux.cpp
 tests/misc/test_gpu_capture_render.cpp
 tests/misc/test_module_file_io.cpp
