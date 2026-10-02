@@ -87,10 +87,10 @@ commands are not claimed as production compiler inputs.
 Replay is a debugging aid, not a guard: it reproduces a captured compile offline so a recompiler
 change can be iterated on a frozen input. Compiler code should keep routing byte reads through
 `compiler_resource_data` and semantic choices through `compiler_choice`, because a read that bypasses
-them is invisible to the capture and makes a replay diverge from the live compile. A divergence is
+them is invisible to the capture and can make a replay diverge from the live compile. A divergence is
 then the thing to investigate, not a reason to distrust the tool. (Until 2026-10-02 a hash inventory
-of all `prosper/src` files, `reader_policy.json`, gated replay and a ctest on every source edit; it
-was removed because it could not detect a new reader, only that some file changed.)
+of all `prosper/src` files, `reader_policy.json`, gated replay and ran a ctest on every source edit;
+it was removed because it could not detect a new reader, only that some file changed.)
 
 These files contain private shader bytes. Do not commit or publish them. SOURCE reproduction does
 not establish buffer immutability, Wave64 admission, draw execution, or pixel correctness.
