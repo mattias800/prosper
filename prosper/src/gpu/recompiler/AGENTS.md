@@ -8,7 +8,8 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   translator: register state, control-flow structurization, and per-instruction lowering.
 - `rdna2_recompile_fragment_packet` — an owned 64-slot guest-fragment executor in a physical
   64-worker compute workgroup. It directly uses the synchronized CFG services for whole-wave
-  votes, saved-mask reductions, READLANE and explicit logical-quad B64 WQM, then records raw EXP
+  votes, saved-mask reductions, canonical-half mask MBCNT, READLANE and explicit logical-quad B64 WQM,
+  alongside numeric source-word MBCNT at owned logical lane positions, then records raw EXP
   metadata/payload instead of killing physical workers or writing a framebuffer. It is NOT a
   raster fallback: missing
   register/slot state, interpolation, FP arithmetic, image/memory effects and repeated exports
@@ -16,6 +17,12 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   project-owned packets; `spv_validate` emits this entry separately. No live DrawItem enters it.
   Quad consumers additionally require the supplied consecutive-logical-quad topology tag; it grants
   no raster packing/helper authority. B32 WQM and unsupported constant/forms remain named gaps.
+- `raster_quad_collector` — an input-only fragment emitter and transactional raw-record decoder.
+  Four unconditional QuadBroadcasts retain helpers before a nonhelper reserves a bounded scratch
+  slot. These are host raster observations, not initialized guest registers or logical Wave64
+  packets. The shipping renderer companion in `tests/fixtures/raster_quad_collection_gpu.h` owns
+  the actual scratch pass; it declines unproved pre-raster effects, missing producing modules and
+  unsupported domains. No framebuffer export, depth/blend commit or guest-wave packing is added.
 - `spirv_builder` — small hand-built SPIR-V modules. **These include shipped shaders**:
   `frontends/shared/live/live_compute.cpp`'s `prepare_compare_pipeline()` feeds
   `build_compute_compare_uvec4()` straight to `vkCreateShaderModule` on the live path. The GPU

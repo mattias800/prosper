@@ -336,6 +336,31 @@ static inline void* prosper_mmap_noreplace(void* addr, size_t len, int prot, int
 #endif
 }
 
+// End of the first HOST mapping that overlaps [lo, hi), or 0 when none does / the host cannot say.
+// For a probe that has just failed to claim [lo, hi): it lets the caller step past an occupant it
+// does not track in one move. Darwin has to: every failed prosper_mmap_noreplace above is a whole
+// mmap + munmap, and crawling a multi-GiB host occupant 64 KiB at a time under Rosetta 2 took tens of
+// seconds per placement (#4043). mach_vm_region reports the region containing `lo`, or the first one
+// above it. Linux returns 0 and keeps stepping: its MAP_FIXED_NOREPLACE probe fails in the kernel
+// without creating anything, so the crawl that motivated this never cost it measurable time.
+static inline uint64_t prosper_host_occupant_end(uint64_t lo, uint64_t hi) {
+#ifdef __APPLE__
+    mach_vm_address_t region = (mach_vm_address_t)lo;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info{};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
+                       (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
+        return 0;
+    if ((uint64_t)region >= hi || size == 0) return 0;   // nothing overlaps: a race, not an occupant
+    return (uint64_t)region + (uint64_t)size;
+#else
+    (void)lo; (void)hi;
+    return 0;
+#endif
+}
+
 // Anonymous shared-memory fd usable for multi-mapping one physical range (Linux memfd_create).
 // Darwin: a POSIX shm object, unlinked immediately so the fd is the only reference.
 static inline int prosper_memfd_create(const char* name) {

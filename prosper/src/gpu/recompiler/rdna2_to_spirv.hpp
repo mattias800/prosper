@@ -607,7 +607,8 @@ bool dead_varying_elimination_enabled();
 // capture flag decorates this final pre-rasterization stage for the geometry diagnostic only.
 std::vector<uint32_t> recompile_interpolation_geometry(
     const FragmentInterpolationLayout& layout, bool capture_position = false,
-    bool synthesize_rect = false, FloatTransportConfig float_transport = {});
+    bool synthesize_rect = false, FloatTransportConfig float_transport = {},
+    bool publish_primitive_id = false);
 
 // Translate a straight-line float-VALU RDNA2 stream to a compute-shader SPIR-V module.
 // Returns {} if the stream contains an opcode/format this stage does not yet handle. An optional
