@@ -11,5 +11,11 @@ Do not switch or reset someone else's worktree to silence a warning.
 Follow the applicable nested `AGENTS.md` files for the area being changed. The startup check is
 automatic in Claude Code through `.claude/settings.json`; other agents run the command above.
 
-Optional project skills live in `.claude/skills/`: `start-task` and `implement-hle-function`.
+Before committing, run `python3 prosper/tools/ci/check_arch_ratchet.py --root . --base origin/main`
+(delta mode: it judges only what your change raised since its merge base). How to handle a
+failure, and the steady-state performance invariants, are in `CLAUDE.md` § *Architecture and
+performance ratchets*.
+
+Optional project skills live in `.claude/skills/`: `start-task`, `implement-hle-function` and
+`perf-change`.
 They do not expand task authorization. Test rules: `prosper/tests/AGENTS.md`.

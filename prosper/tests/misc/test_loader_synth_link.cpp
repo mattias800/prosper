@@ -125,7 +125,7 @@ TEST(LoaderSynthLink, Contract) {
     const std::string alt_path       = emit("synth_alt.prx",       alt_spec);
     const std::string subsumed_path  = emit("synth_subsumed.prx",  subsumed_spec);
     const std::string valueless_path = emit("synth_valueless.prx", valueless_spec);
-    if (fails) { printf("FAILED (%d) -- fixtures were not written\n", fails); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { printf("FAILED (%d) -- fixtures were not written\n", fails); FAIL() << "legacy early exit"; }
 
     const uint64_t kExp0 = prosper_test::synth_export_va(0);
     const uint64_t kExp1 = prosper_test::synth_export_va(1);

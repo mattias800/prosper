@@ -22,7 +22,7 @@ TEST(DlsymHandle, Contract) {
     auto load  = Hle::lookup(nid_hash("sceKernelLoadStartModule"));
     auto dlsym = Hle::lookup(nid_hash("sceKernelDlsym"));
     CHECK(load && dlsym, "LoadStartModule + Dlsym registered");
-    if (fails) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // Two synthetic modules that BOTH export PSN_PrxInitialize, at different addresses; the
     // global table holds the first definition (what the linker's first-wins pass produces).

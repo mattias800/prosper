@@ -62,7 +62,7 @@ TEST(RetrackReservation, Contract) {
     CHECK(reserve && protect && mtypeprotect && batch && query && query_protection && flexible &&
               flexible_noname && unmap,
           "memory HLE functions registered");
-    if (fails) FAIL() << "legacy early exit";
+    if (fails || ::testing::Test::HasFailure()) FAIL() << "legacy early exit";
 
     constexpr uint64_t page = 0x10000;
 
@@ -394,6 +394,6 @@ TEST(RetrackReservation, Contract) {
               protection_start == UINT64_MAX && protection_end == UINT64_MAX &&
               protection_value == UINT32_MAX,
           "QueryMemoryProtection rejects an untracked address without writing outputs");
-    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
     EXPECT_EQ(fails, 0);
 }

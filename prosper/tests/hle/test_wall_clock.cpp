@@ -43,7 +43,7 @@ TEST(WallClock, Contract) {
     auto tsc_fn           = Hle::lookup(nid_hash("sceKernelReadTsc"));
     CHECK(clock_gettime_fn && gettimeofday_fn && time_fn && rtc_tick_fn && rtc_local_fn &&
           rtc_clock_fn && rtc_utc_fn && ptc_fn && tsc_fn, "all time fns registered");
-    if (fails) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // --- CLOCK_REALTIME (FreeBSD id 0) tracks the HOST's real now (± seconds, not ± decades). ---
     int64_t ts[2] = { 0, 0 };

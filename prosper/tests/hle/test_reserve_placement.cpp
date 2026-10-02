@@ -104,8 +104,10 @@ static constexpr uint64_t kArenaLen   = 0x2800000000ull;   // 160 GiB (>= 128 Gi
 // hours across host-occupied spans (observed: the CI Test step hung >30 min vs a ~5 min norm).
 // The reserve-placement contract is platform-shared and fully exercised by the Linux and
 // Windows jobs; skip here like test_raw_syscall does off-Linux.
-int main() { printf("reserve_placement: skipped under Rosetta (giant-reservation VM-tracking "
-                    "pathology); contract covered by the Linux and Windows jobs\n"); return 0; }
+TEST(ReservePlacement, Contract) {
+    GTEST_SKIP() << "skipped under Rosetta (giant-reservation VM-tracking pathology); contract "
+                    "covered by the Linux and Windows jobs";
+}
 #else
 TEST(ReservePlacement, Contract) {
     printf("== test_reserve_placement ==\n");

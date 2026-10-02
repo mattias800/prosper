@@ -145,7 +145,7 @@ TEST(CondSlotIdentity, Contract) {
         std::printf("  [skip] recycled-slot case: a thread is stuck on the wrong slot\n");
     }
 
-    if (fails) {
+    if (fails || ::testing::Test::HasFailure()) {
         std::printf("== FAIL: %d ==\n", fails);
         std::fflush(stdout);
         // A waiter may still be parked on a slot nothing will ever signal, so a normal return would

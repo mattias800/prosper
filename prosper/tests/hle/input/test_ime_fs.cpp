@@ -56,9 +56,7 @@ TEST(ImeFs, Contract) {
     std::printf("== test_ime_fs ==\n");
 
 #if !defined(__linux__) || defined(__APPLE__)
-    std::printf("  [skip] guest-%%fs swap at the import boundary is Linux-only; nothing to guard here\n");
-    std::printf("== PASS ==\n");
-    return;
+    GTEST_SKIP() << "guest-%fs swap at the import boundary is Linux-only; nothing to guard here";
 #else
     // Enable the Linux guest initial-exec %fs path with a single empty TLS module (as the guest-fs
     // stub-args test does), then confirm it is active. The Linux suite already runs a guest-fs test,
@@ -79,7 +77,7 @@ TEST(ImeFs, Contract) {
     // where the real loader places import stubs. A base outside it makes recovery fail closed (return 0).
     CHECK(install_stubs(slots, 0x680000000ull, 96, &err),
           "generated the sceImeUpdate import stub");
-    if (fails) {
+    if (fails || ::testing::Test::HasFailure()) {
         if (!err.empty()) std::printf("  install error: %s\n", err.c_str());
         std::printf("== FAIL: %d ==\n", fails);
         FAIL() << "legacy early exit";
@@ -122,7 +120,7 @@ TEST(ImeFs, Contract) {
     CHECK(fs_at_return == guest_fs,
           "import boundary left %fs on the caller's guest TCB after sceImeUpdate returned (swap balanced)");
 
-    if (fails) { std::printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { std::printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
     std::printf("== PASS ==\n");
     return;
 #endif

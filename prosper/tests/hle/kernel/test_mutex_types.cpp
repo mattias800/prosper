@@ -41,7 +41,7 @@ TEST(MutexTypes, Contract) {
     CHECK(attr_init && attr_settype && attr_gettype && attr_destroy &&
               m_init && m_lock && m_trylock && m_unlock && m_destroy,
           "mutex HLE functions registered");
-    if (fails) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     auto U = [](void* p) { return (uint64_t)(uintptr_t)p; };
 

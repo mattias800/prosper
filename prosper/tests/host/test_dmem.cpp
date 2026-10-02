@@ -251,7 +251,7 @@ TEST(Dmem, Contract) {
     CHECK(reserve && flexible && unmap && alloc && alloc_main && map && map2 && protect &&
               mtypeprotect && release && query && get_type && batch,
           "memory HLE functions registered");
-    if (fails) FAIL() << "legacy early exit";
+    if (fails || ::testing::Test::HasFailure()) FAIL() << "legacy early exit";
     test_automatic_placement();
 
     constexpr uint64_t len = 0x4000;
@@ -265,7 +265,7 @@ TEST(Dmem, Contract) {
     uint64_t va = 0x30000000000ull;  // Fixed, 64 KiB-aligned, and above the VEH's heap threshold.
     CHECK(reserve((uint64_t)(uintptr_t)&va, len, 0x10 /* MAP_FIXED */, len, 0, 0) == 0,
           "ReserveVirtualRange creates an exact 16 KiB reservation");
-    if (fails) FAIL() << "legacy early exit";
+    if (fails || ::testing::Test::HasFailure()) FAIL() << "legacy early exit";
 
     install_trap_handler();
     volatile uint32_t* cell = (volatile uint32_t*)(uintptr_t)va;
@@ -1291,7 +1291,7 @@ TEST(Dmem, Contract) {
               "clean up fragmented UNMAP retained suffix");
     }
 
-    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
     printf("== PASS ==\n");
     return;
 #elif !defined(__linux__)
@@ -1737,7 +1737,7 @@ TEST(Dmem, Contract) {
         }
     }
 
-    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
     printf("== PASS ==\n");
     return;
 #endif

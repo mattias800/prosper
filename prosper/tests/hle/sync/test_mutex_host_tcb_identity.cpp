@@ -148,7 +148,7 @@ TEST(MutexHostTcbIdentity, Contract) {
     done.store(true, std::memory_order_release);
     helper.join();
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
     printf("== PASS ==\n");
     return;
 #endif

@@ -636,6 +636,6 @@ TEST(FalseSuccessNids, Contract) {
     test_apr_submit_and_get_id();
     test_pool_decommit();
     test_kernel_memory_pool();
-    if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); FAIL() << "legacy early exit"; }
+    if (fails || ::testing::Test::HasFailure()) { printf("== FAIL: %d check(s) failed ==\n", fails); FAIL() << "legacy early exit"; }
     EXPECT_EQ(fails, 0);
 }
