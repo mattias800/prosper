@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-# guest_bt.py — driver for the prosper guest-stack unwinder.
-#
-# One command turns a live/frozen prosper process into symbolicated GUEST backtraces (managed IL2CPP
-# method names included), stepping through prosper's synthesized HLE import stubs that defeat gdb's
-# native unwinder. See tools/guest_bt/README.md for the how/why.
-#
-# Typical use (attach to a running title and dump every guest thread):
-#   python3 tools/guest_bt/guest_bt.py --pid $(pgrep -f PPSA25872 | head -1) \
-#       --initlog run.log --dump /path/PPSA25872-app0 --all
-#
-# --initlog is any file containing prosper's `[initlog] module N base=0x.. path=..` lines (run the
-# title once with PROSPER_INITLOG=1). The driver flattens+sections each module (cached under --cache)
-# and, for the IL2CPP module, reuses an Il2CppDumper script.json for managed symbol names if one is
-# found next to the dump or passed via --il2cpp-script.
+r"""guest_bt.py — driver for the prosper guest-stack unwinder.
+
+One command turns a live/frozen prosper process into symbolicated GUEST backtraces (managed IL2CPP
+method names included), stepping through prosper's synthesized HLE import stubs that defeat gdb's
+native unwinder. See tools/guest_bt/README.md for the how/why.
+
+Typical use (attach to a running title and dump every guest thread):
+  python3 tools/guest_bt/guest_bt.py --pid $(pgrep -f PPSA25872 | head -1) \
+      --initlog run.log --dump /path/PPSA25872-app0 --all
+
+--initlog is any file containing prosper's `[initlog] module N base=0x.. path=..` lines (run the
+title once with PROSPER_INITLOG=1). The driver flattens+sections each module (cached under --cache)
+and, for the IL2CPP module, reuses an Il2CppDumper script.json for managed symbol names if one is
+found next to the dump or passed via --il2cpp-script.
+"""
 import argparse
 import json
 import os

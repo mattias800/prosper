@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# findcalls.py <target_va_hex> [...] — scan DOLL eboot text for e8-rel32 calls to the target VA(s).
-# Text LOAD: VA 0 at file offset 0x34050, size 0x669b81c.
+"""findcalls.py <target_va_hex> [...] — scan DOLL eboot text for e8-rel32 calls to the target VA(s).
+Text LOAD: VA 0 at file offset 0x34050, size 0x669b81c.
+"""
 import sys
 import struct
 

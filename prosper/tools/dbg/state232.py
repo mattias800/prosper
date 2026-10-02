@@ -1,7 +1,8 @@
-# gdb -p PID -batch -x state232.py — issue #232 session 5: post-savedata steady-state survey.
-# 1) gate bytes (eboot+0x9803460/+0x9803470) + doubles at +0x9603030..48
-# 2) per-named-worker RIP + a short guest-RA stack classification
-# 3) GameThread (thread 1) RIP samples x20
+"""gdb -p PID -batch -x state232.py — issue #232 session 5: post-savedata steady-state survey.
+1) gate bytes (eboot+0x9803460/+0x9803470) + doubles at +0x9603030..48
+2) per-named-worker RIP + a short guest-RA stack classification
+3) GameThread (thread 1) RIP samples x20
+"""
 import gdb
 import time
 from collections import Counter

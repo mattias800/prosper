@@ -1,25 +1,26 @@
-# guest_bt_gdb.py — gdb plugin: symbolicated backtraces of prosper GUEST threads.
-#
-# The problem it solves: a guest thread blocked in an HLE (e.g. sceKernelWaitOnAddress) has, on its
-# stack, guest frames that gdb refuses to unwind — Unity/IL2CPP is built without frame pointers, and
-# prosper's synthesized import STUB (BOOT_STUB=0x600000000, no `.eh_frame`) sits between the C++ HLE
-# and the guest caller, so gdb's unwind dies at the stub with a bogus saved-rip=0.
-#
-# This plugin fixes both halves:
-#   * loads each guest module's flattened+sectioned ELF (see mk_sym_elf.py) at its runtime base, so
-#     gdb's DWARF unwinder has the modules' real CFI + a `.symtab` (managed method names for free), and
-#   * registers a custom Unwinder for the stub region that steps THROUGH a stub frame to the guest
-#     caller using the fixed swap-stub layout (5 pushes of 0x28 + the `call r10`):
-#         caller_sp  = stub_frame_sp + 0x30
-#         caller_pc  = *(stub_frame_sp + 0x28)          # the guest return address
-#     with all callee-saved registers passed through unchanged (the stub clobbers only rax/r10/r11).
-#
-# Config comes from the JSON file named by env PROSPER_GBT_CONFIG:
-#   { "modules": [ {"elf": "...", "base": "0x410000000"}, ... ],
-#     "stub_base": "0x600000000", "stub_size": 96, "stub_ret_off": 61 }
-# stub_ret_off is informational; the unwind rule keys only on PC being inside the stub region.
-#
-# Command:  guest-bt <thread-id-or-name>     e.g.  guest-bt GameUpdate
+"""guest_bt_gdb.py — gdb plugin: symbolicated backtraces of prosper GUEST threads.
+
+The problem it solves: a guest thread blocked in an HLE (e.g. sceKernelWaitOnAddress) has, on its
+stack, guest frames that gdb refuses to unwind — Unity/IL2CPP is built without frame pointers, and
+prosper's synthesized import STUB (BOOT_STUB=0x600000000, no `.eh_frame`) sits between the C++ HLE
+and the guest caller, so gdb's unwind dies at the stub with a bogus saved-rip=0.
+
+This plugin fixes both halves:
+  * loads each guest module's flattened+sectioned ELF (see mk_sym_elf.py) at its runtime base, so
+    gdb's DWARF unwinder has the modules' real CFI + a `.symtab` (managed method names for free), and
+  * registers a custom Unwinder for the stub region that steps THROUGH a stub frame to the guest
+    caller using the fixed swap-stub layout (5 pushes of 0x28 + the `call r10`):
+        caller_sp  = stub_frame_sp + 0x30
+        caller_pc  = *(stub_frame_sp + 0x28)          # the guest return address
+    with all callee-saved registers passed through unchanged (the stub clobbers only rax/r10/r11).
+
+Config comes from the JSON file named by env PROSPER_GBT_CONFIG:
+  { "modules": [ {"elf": "...", "base": "0x410000000"}, ... ],
+    "stub_base": "0x600000000", "stub_size": 96, "stub_ret_off": 61 }
+stub_ret_off is informational; the unwind rule keys only on PC being inside the stub region.
+
+Command:  guest-bt <thread-id-or-name>     e.g.  guest-bt GameUpdate
+"""
 import gdb
 import json
 import os

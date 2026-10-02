@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Unit tests for snapshot.py, the golden-image regression guard driver."""
 import contextlib
 import difflib
 import importlib.util

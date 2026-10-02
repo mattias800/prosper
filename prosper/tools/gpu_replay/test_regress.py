@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# test_regress.py (#1258) — unit tests for the pure logic of the capsule-hash regression gate
-# (regress.py): output-hash extraction from gpu_replay's log and the baseline-vs-current classifier.
-# gpu_replay itself is not invoked here (that path is exercised manually against a local corpus).
+"""test_regress.py (#1258) — unit tests for the pure logic of the capsule-hash regression gate
+(regress.py): output-hash extraction from gpu_replay's log and the baseline-vs-current classifier.
+gpu_replay itself is not invoked here (that path is exercised manually against a local corpus).
+"""
 import importlib.util
 import os
 import unittest

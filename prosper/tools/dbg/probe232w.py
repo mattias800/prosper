@@ -1,5 +1,6 @@
-# gdb -p PID -batch -x probe232w.py — issue #232: sample ALL threads' RIPs at the stall;
-# print guest pc / guest return addresses to pin the busy-spin loop.
+"""gdb -p PID -batch -x probe232w.py — issue #232: sample ALL threads' RIPs at the stall;
+print guest pc / guest return addresses to pin the busy-spin loop.
+"""
 import gdb
 import struct
 import time
