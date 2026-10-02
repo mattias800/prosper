@@ -1129,6 +1129,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_sync_delete PRIVATE prosper_core)
   add_test(NAME sync_delete COMMAND test_sync_delete)
 
+  # The APR submit's result out-parameters are uint32_t*; an 8-byte store overran into the guest's
+  # stack canary and killed the title with __stack_chk_fail (#4138).
+  add_executable(test_apr_result_slot_width tests/hle/kernel/test_apr_result_slot_width.cpp)
+  target_link_libraries(test_apr_result_slot_width PRIVATE prosper_core)
+  target_include_directories(test_apr_result_slot_width PRIVATE src)
+  add_test(NAME apr_result_slot_width COMMAND test_apr_result_slot_width)
+
   # lseek/fseek/ftell must address offsets >= 2 GiB. MinGW's long/off_t are 32 bits, so Black Flag's
   # 30 GiB DataPS5_boot.forge allocation-table seek failed and the title aborted itself.
   add_executable(test_large_offset_seek tests/hle/kernel/test_large_offset_seek.cpp)
