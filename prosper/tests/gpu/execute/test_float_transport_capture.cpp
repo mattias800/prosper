@@ -203,7 +203,7 @@ int main(int argc, char** argv) {
     }
     std::vector<uint8_t> bytes;
     const bool roundtrip=serialize_gpu_capture(capture,bytes,error) && deserialize_gpu_capture(bytes,loaded,error);
-    CHECK(roundtrip && loaded.format_version==65,"current codec accepts exact bounded producing profile tails");
+    CHECK(roundtrip && loaded.format_version==66,"current codec accepts exact bounded producing profile tails");
     if (!roundtrip) { std::printf("codec error: %s\n",error.c_str()); return 1; }
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded,replay,error) && replay.items.size()==draws.size(),
@@ -233,11 +233,16 @@ int main(int argc, char** argv) {
         append32(tail,static_cast<uint32_t>(item.stages.size()));
         for (const auto& stage:item.stages) tail.push_back(static_cast<uint8_t>(stage.recompile_config.float_transport.profile));
     }
-    CHECK(bytes.size()>tail.size() && std::equal(tail.rbegin(),tail.rend(),bytes.rbegin()),
+    auto v65_bytes = bytes;
+    v65_bytes.resize(v65_bytes.size() - 8u - 3u*(capture.draws.size()+capture.failure_diagnostics.size()));
+    set32(v65_bytes,8,65);
+    CHECK(deserialize_gpu_capture(v65_bytes,loaded,error) && loaded.format_version==65,
+          "genuine v65 profile prefix survives without fabricated launch flags");
+    CHECK(v65_bytes.size()>tail.size() && std::equal(tail.rbegin(),tail.rend(),v65_bytes.rbegin()),
           "canonical tail is exact, not a version-only relabel");
     if (bytes.size()<=tail.size()) return 1;
-    const size_t start=bytes.size()-tail.size();
-    auto legacy=bytes; legacy.resize(start); set32(legacy,8,64);
+    const size_t start=v65_bytes.size()-tail.size();
+    auto legacy=v65_bytes; legacy.resize(start); set32(legacy,8,64);
     CHECK(deserialize_gpu_capture(legacy,loaded,error) && loaded.format_version==64,
           "genuine v64 prefix remains readable without fabricated profile authority");
     for (const auto& item:loaded.draws) CHECK(item.float_transport==unknown,"old explicit source markers do not infer producing profile");
@@ -295,6 +300,7 @@ int main(int argc, char** argv) {
             failed.reason=RealizationFailureReason::ShaderRecompile; failed.vertex_retry_config_available=true;
             failed.fragment_retry_config_available=true; failed.ps_float_mode=item.ps_float_mode;
             failed.float_transport=item.float_transport;
+            failed.ps_float_flags=item.ps_float_flags;
             GpuCapturedStageDiagnostic stage; stage.stage=ShaderProgramStage::Fragment;
             stage.program_addr=reinterpret_cast<uint64_t>(fragment);
             stage.raw_shader_index=single.draws[0].fs_raw_shader_index;

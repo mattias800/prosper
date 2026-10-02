@@ -36,7 +36,8 @@ void program(GpuState& state, uint32_t lo, uint32_t hi, const uint32_t* words) {
     state.sh[lo] = static_cast<uint32_t>(address >> 8);
     state.sh[hi] = static_cast<uint32_t>((address >> 40) & 255u);
 }
-GpuState state_for(FragmentFloatMode mode, const uint32_t* fs = fragment, bool wave32 = false) {
+GpuState state_for(FragmentFloatMode mode, const uint32_t* fs = fragment, bool wave32 = false,
+                   uint32_t modifier_flags = 0) {
     GpuState state;
     program(state,P::SPI_SHADER_PGM_LO_ES,P::SPI_SHADER_PGM_HI_ES,vertex);
     program(state,P::SPI_SHADER_PGM_LO_PS,P::SPI_SHADER_PGM_HI_PS,fs);
@@ -45,7 +46,8 @@ GpuState state_for(FragmentFloatMode mode, const uint32_t* fs = fragment, bool w
     state.cx[P::CB_COLOR_CONTROL] = P::CB_COLOR_CONTROL_MODE_NORMAL << P::CB_COLOR_CONTROL_MODE_SHIFT;
     state.cx[P::SPI_PS_IN_CONTROL] = wave32 ? 1u << P::SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT : 0u;
     if (mode.available)
-        state.sh[P::SPI_SHADER_PGM_RSRC1_PS] = uint32_t(mode.value) << P::SPI_SHADER_PGM_RSRC1_PS_FLOAT_MODE_SHIFT;
+        state.sh[P::SPI_SHADER_PGM_RSRC1_PS] =
+            (uint32_t(mode.value) << P::SPI_SHADER_PGM_RSRC1_PS_FLOAT_MODE_SHIFT) | modifier_flags;
     return state;
 }
 size_t reader(uint64_t address, uint8_t* destination, size_t count) {
@@ -86,6 +88,24 @@ int main(int argc, char** argv) {
             realized.push_back(std::move(draw));
         }
     }
+    for (bool shared : {false,true}) for (bool wave32 : {false,true})
+        for (bool ieee : {false,true}) for (bool dx10 : {false,true}) {
+            const FragmentFloatFlags expected{true,ieee,dx10};
+            const uint32_t bits = (ieee ? 1u << P::SPI_SHADER_PGM_RSRC1_PS_IEEE_MODE_SHIFT : 0u) |
+                                  (dx10 ? 1u << P::SPI_SHADER_PGM_RSRC1_PS_DX10_CLAMP_SHIFT : 0u);
+            DrawItem cold,warm;
+            const auto state = state_for({true,0xab},fragment,wave32,bits);
+            CHECK(realize_draw_item(state,nullptr,3,std::size(vertex),false,cold,nullptr,shared) &&
+                      realize_draw_item(state,nullptr,3,std::size(vertex),false,warm,nullptr,shared) &&
+                      cold.ps_float_flags==expected && warm.ps_float_flags==expected &&
+                      cold.ps_float_mode==FragmentFloatMode({true,0xab}) &&
+                      warm.fs_words()==cold.fs_words(),
+                  "actual copied/shared cold/warm producer retains all four known flag states");
+            for (auto* item : {&cold,&warm}) {
+                item->draw_index=realized.size(); item->command_order=realized.size()+1;
+                realized.push_back(std::move(*item));
+            }
+        }
     std::set<uint64_t> identities;
     for (unsigned value=0; value<256; ++value) {
         uint64_t id = 0, warm_id = 0;
@@ -127,7 +147,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> bytes;
     CHECK(capture_draw_items(realized,metadata,reader,capture,error) &&
               serialize_gpu_capture(capture,bytes,error) && deserialize_gpu_capture(bytes,loaded,error) &&
-              loaded.format_version==65 && loaded.draws.size()==realized.size(),
+              loaded.format_version==66 && loaded.draws.size()==realized.size(),
           "actual collector and current production codecs round trip realized mode");
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded,replay,error) && replay.items.size()==realized.size(),
@@ -135,6 +155,8 @@ int main(int argc, char** argv) {
     for (size_t i=0; i<realized.size() && i<replay.items.size(); ++i)
         CHECK(loaded.draws[i].ps_float_mode==realized[i].ps_float_mode &&
                   replay.items[i].ps_float_mode==realized[i].ps_float_mode &&
+                  loaded.draws[i].ps_float_flags==realized[i].ps_float_flags &&
+                  replay.items[i].ps_float_flags==realized[i].ps_float_flags &&
                   replay.items[i].fs_words()==realized[i].fs_words(),
               "mode availability/value and stored source bytes survive collector/codec/replay");
     GpuCaptureBundle bundle;
@@ -144,9 +166,36 @@ int main(int argc, char** argv) {
               materialize_gpu_capture_bundle_manifest(bundle,0,manifest,error),
           "bundle payload and metadata-only manifest materialize mode tail");
     for (const auto* result : {&full,&manifest}) for (size_t i=0;i<realized.size();++i)
-        CHECK(i<result->draws.size() && result->draws[i].ps_float_mode==realized[i].ps_float_mode,
+        CHECK(i<result->draws.size() && result->draws[i].ps_float_mode==realized[i].ps_float_mode &&
+                  result->draws[i].ps_float_flags==realized[i].ps_float_flags,
               "bundle paths preserve unknown, explicitly programmed zero and full-byte values");
+    const size_t flags_tail=bytes.size()-8u-3u*capture.draws.size();
+    auto v65_bytes=bytes; v65_bytes.resize(flags_tail); set32(v65_bytes,8,65);
+    CHECK(deserialize_gpu_capture(v65_bytes,loaded,error) && loaded.format_version==65,
+          "genuine v65 prefix retains MODE/profile without inventing independent flags");
+    for (const auto& draw : loaded.draws) CHECK(draw.ps_float_flags==FragmentFloatFlags{},
+          "known old MODE and source markers do not create known IEEE/DX10 flags");
+    CHECK(serialize_gpu_capture(loaded,bytes,error) && deserialize_gpu_capture(bytes,loaded,error),
+          "legacy rewrite preserves unknown flags");
+    for (const auto& draw : loaded.draws) CHECK(draw.ps_float_flags==FragmentFloatFlags{},"rewritten flags stay unknown");
+    CHECK(serialize_gpu_capture(capture,bytes,error),"restore exact producing flag bytes for hostile controls");
+    for (size_t field : {flags_tail,bytes.size()-4}) {
+        auto corrupt=bytes; set32(corrupt,field,UINT32_MAX);
+        CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"hostile v66 counts refuse before second allocations");
+    }
+    for (size_t field : {flags_tail+4,flags_tail+5,flags_tail+6}) {
+        auto corrupt=bytes; corrupt[field]=2;
+        CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="invalid realized-draw fragment float flags",
+              "every v66 flag byte rejects nonboolean tags");
+    }
+    auto bad_flags=bytes; bad_flags[flags_tail+4]=0; bad_flags[flags_tail+5]=1;
+    CHECK(!deserialize_gpu_capture(bad_flags,loaded,error),"unavailable nonzero flag payload refuses");
+    for (size_t end=flags_tail;end<bytes.size();++end) {
+        auto corrupt=bytes; corrupt.resize(end);
+        CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"every truncated v66 suffix refuses");
+    }
     auto v64_bytes = bytes;
+    v64_bytes.resize(v64_bytes.size() - 8u - 3u*capture.draws.size()); // v66 flags
     v64_bytes.resize(v64_bytes.size() - 12u - capture.draws.size());
     set32(v64_bytes,8,64);
     CHECK(deserialize_gpu_capture(v64_bytes,loaded,error) && loaded.format_version==64,
@@ -192,15 +241,18 @@ int main(int argc, char** argv) {
     CHECK(!capture_draw_items(bad_draws,metadata,reader,bad,error),"collector rejects noncanonical mode");
     OperationRealizationFailure failure;
     DrawItem rejected;
-    CHECK(!realize_draw_item(state_for({true,0x9b},failed_fragment),nullptr,3,std::size(vertex),false,
+    CHECK(!realize_draw_item(state_for({true,0x9b},failed_fragment,false,
+                             1u<<P::SPI_SHADER_PGM_RSRC1_PS_IEEE_MODE_SHIFT),nullptr,3,std::size(vertex),false,
                              rejected,&failure) && failure.reason==RealizationFailureReason::ShaderRecompile &&
-              failure.ps_float_mode==FragmentFloatMode({true,0x9b}),
+              failure.ps_float_mode==FragmentFloatMode({true,0x9b}) &&
+              failure.ps_float_flags==FragmentFloatFlags({true,true,false}),
           "actual failed-stage compiler retains known launch mode");
     failure.index=7; failure.command_order=1;
     GpuCaptureFile failed;
     CHECK(capture_submit_items({}, {},{{SubmitOperationKind::Draw,7,1}},metadata,reader,failed,error,{}, {failure}) &&
               serialize_gpu_capture(failed,upgraded_bytes,error) && deserialize_gpu_capture(upgraded_bytes,loaded,error) &&
-              loaded.failure_diagnostics.size()==1 && loaded.failure_diagnostics[0].ps_float_mode==failure.ps_float_mode,
+              loaded.failure_diagnostics.size()==1 && loaded.failure_diagnostics[0].ps_float_mode==failure.ps_float_mode &&
+              loaded.failure_diagnostics[0].ps_float_flags==failure.ps_float_flags,
           "actual failure collector/codec retain mode independently of successful draws");
     if (argc==3 && std::string(argv[1])=="--write-fixture") {
         const std::filesystem::path directory(argv[2]);
@@ -219,7 +271,7 @@ int main(int argc, char** argv) {
             retry.failure_diagnostics_available=true;
             GpuCapturedOperationFailure f; f.source_index=7; f.command_order=1;
             f.reason=RealizationFailureReason::ShaderRecompile; f.vertex_retry_config_available=true;
-            f.fragment_retry_config_available=true; f.ps_float_mode=entry.second;
+            f.fragment_retry_config_available=true; f.ps_float_mode=entry.second; f.ps_float_flags=draw.ps_float_flags;
             GpuCapturedStageDiagnostic stage; stage.stage=ShaderProgramStage::Fragment;
             stage.program_addr=reinterpret_cast<uint64_t>(fragment); stage.raw_shader_index=single.draws[0].fs_raw_shader_index;
             f.stages.push_back(stage); retry.failure_diagnostics.push_back(f);

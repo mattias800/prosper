@@ -187,7 +187,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v64 (#4056): canonical availability plus all eight guest FLOAT_MODE bits for realized draws and
 // failed draws. Independent of the v63 width contract; legacy files retain explicit unknown mode.
 // v65: actual producing float transport profile, independently retained from guest MODE.
-constexpr uint32_t kVersion = 65;
+// v66 (#4086): independent IEEE_MODE/DX10_CLAMP launch flags for realized and failed draws.
+// Older files keep canonical unknown; known flags do not imply known FLOAT_MODE or wave width.
+constexpr uint32_t kVersion = 66;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
@@ -1334,6 +1336,11 @@ inline bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::str
             raw_referenced[compute.raw_shader_index] = true;
     }
     for (const auto& diagnostic : capture.failure_diagnostics) {
+        if (!diagnostic.ps_float_flags.canonical() ||
+            (diagnostic.kind != SubmitOperationKind::Draw && diagnostic.ps_float_flags.available)) {
+            error = "invalid failed-draw fragment float flags";
+            return false;
+        }
         if (!diagnostic.ps_float_mode.canonical() ||
             (diagnostic.kind != SubmitOperationKind::Draw && diagnostic.ps_float_mode.available)) {
             error = "invalid failed-draw fragment float mode";

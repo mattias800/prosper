@@ -11,6 +11,10 @@ Schema 2 appends the actual pinned host float-transport profile. An explicitly p
 profile is a retained input and remains replayable; schema-1 absence is instead inspectable
 `INCOMPLETE fragment-transport-config-unavailable` and cannot enter the compiler. Neither profile
 nor SOURCE grants feature permission to a different executing Vulkan device.
+Schema 3 additionally retains the independent IEEE_MODE and DX10_CLAMP availability/values.
+An explicitly producing unknown flag input remains replayable; schema-1/2 absence is inspectable
+but incomplete, rather than inferring these flags from MODE, SOURCE or wave width. This retention
+does not establish correct modifier or general floating-point arithmetic semantics.
 
 ```text
 fragment_compile_replay --inspect-only <CASE.prfc>

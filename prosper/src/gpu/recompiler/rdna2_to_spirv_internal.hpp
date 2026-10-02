@@ -401,6 +401,7 @@ struct SpirvCompute {
     std::vector<uint32_t> caps, exts, extimp, mem, entry, exec, debug, deco, types, code;
     RecompileDiagnosticContext diagnostic{};
     FragmentFloatMode fragment_float_mode{};
+    FragmentFloatFlags fragment_float_flags{};
     FragmentArithmeticObservation* fragment_arithmetic_observation = nullptr;
     void observe_fragment_arithmetic_site(uint32_t pc, FragmentArithmeticFamily family) {
         if (is_fragment && fragment_arithmetic_observation)

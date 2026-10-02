@@ -221,6 +221,7 @@ struct GpuCapturedDraw {
     // v64: actual producing RSRC1_PS.FLOAT_MODE; missing legacy metadata is unknown, not mode0.
     FragmentFloatMode ps_float_mode{};
     FloatTransportConfig float_transport{};
+    FragmentFloatFlags ps_float_flags{};
 };
 
 struct GpuCapturedCompute {
@@ -319,6 +320,7 @@ struct GpuCapturedOperationFailure {
     bool ps_wave32 = false;
     FragmentFloatMode ps_float_mode{};
     FloatTransportConfig float_transport{};
+    FragmentFloatFlags ps_float_flags{};
     ComputeLaunchDimensions compute_launch;
     std::vector<GpuCapturedStageDiagnostic> stages;
 };

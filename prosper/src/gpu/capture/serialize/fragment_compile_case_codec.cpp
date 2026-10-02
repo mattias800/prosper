@@ -152,9 +152,10 @@ struct Reader {
 std::vector<uint8_t> encode_fragment_compile_case(const FragmentCompileCase& c) {
     validate_fragment_compile_case(c);
     Writer w; const uint8_t magic[8] = {'P','R','F','C','A','S','E',0};
-    // The schema-1 payload is unchanged. Profile is an append-only schema-2 tail, independent
-    // of guest FLOAT_MODE and the ordered legacy FloatControls semantic read.
-    w(magic, uint32_t(2)); capsule(w, c); w(c.float_transport.profile);
+    // Preserve both historical payloads. Schema 3 appends independent canonical booleans
+    // after the schema-2 profile, before the existing checksum.
+    w(magic, uint32_t(3)); capsule(w, c); w(c.float_transport.profile);
+    w(c.float_flags.available, c.float_flags.ieee_mode, c.float_flags.dx10_clamp);
     w.value(checksum(w.bytes)); return std::move(w.bytes);
 }
 FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes) {
@@ -164,10 +165,12 @@ FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes)
     Reader r{bytes.first(bytes.size() - 8)}; uint8_t magic[8]{}; uint32_t schema{}; r(magic, schema);
     const uint8_t wanted[8] = {'P','R','F','C','A','S','E',0};
     check(std::equal(std::begin(magic), std::end(magic), std::begin(wanted)) &&
-          (schema == 1 || schema == 2),
+          (schema >= 1 && schema <= 3),
           "compile-case schema");
     FragmentCompileCase c; capsule(r, c);
     if (schema >= 2) r(c.float_transport.profile);
+    if (schema >= 3)
+        r(c.float_flags.available, c.float_flags.ieee_mode, c.float_flags.dx10_clamp);
     check(r.position == r.bytes.size(), "compile-case trailing data");
     for (size_t k = 0; k < c.blobs.size(); ++k) if (c.blobs[k].alias_of != UINT32_MAX) {
         check(c.blobs[k].alias_of < k, "compile-case alias index");
@@ -180,6 +183,13 @@ FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes)
         c.float_transport = {};
         c.complete = false;
         if (c.reason.empty()) c.reason = "fragment-transport-config-unavailable";
+    }
+    if (schema < 3) {
+        // EOF/checksum and old metadata validation happen before this downgrade. A version
+        // relabel cannot launder a newer tail into an older schema.
+        c.float_flags = {};
+        c.complete = false;
+        if (c.reason.empty()) c.reason = "fragment-float-flags-unavailable";
     }
     return c;
 }

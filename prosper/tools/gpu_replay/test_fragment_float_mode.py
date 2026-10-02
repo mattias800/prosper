@@ -121,6 +121,12 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
     states=[("mode0",0),("mode16",16),("unknown",None)]
     for name in ("mode16","mode16-failed"):
         data=(directory/(name+".prgcap")).read_bytes()
+        flags_tail=(struct.pack("<I",1)+b"\x01\x00\x00"+struct.pack("<I",0) if name=="mode16" else
+                    struct.pack("<II",0,1)+b"\x01\x00\x00")
+        check(struct.unpack_from("<I",data,8)[0]==66 and data.endswith(flags_tail),
+              name+" genuine independent known-clear-flags v66 tail")
+        data=bytearray(data[:-len(flags_tail)])
+        struct.pack_into("<I",data,8,65)
         transport_tail=(struct.pack("<I",1)+b"\x00"+struct.pack("<II",0,0) if name=="mode16" else
                         struct.pack("<III",0,0,1)+b"\x00"+struct.pack("<I",1)+b"\x00")
         check(struct.unpack_from("<I",data,8)[0]==65 and data.endswith(transport_tail),
@@ -174,7 +180,8 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
     original=(directory/"mode16.prgcap").read_bytes()
     # MODE offsets precede the exact one-draw, no-compute, no-failure v65 transport tail.
     transport_tail_size=13
-    start=len(original)-transport_tail_size-10
+    flags_tail_size=11
+    start=len(original)-flags_tail_size-transport_tail_size-10
     malformed={
         "count":original[:start]+struct.pack("<I",0)+original[start+4:],
         "tag":original[:start+4]+b"\x02"+original[start+5:],

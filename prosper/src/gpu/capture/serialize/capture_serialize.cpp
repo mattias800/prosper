@@ -1204,6 +1204,23 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         for (const auto& stage : diagnostic.stages)
             if (!write_transport(stage.recompile_config.float_transport)) return false;
     }
+    // v66: independently observed launch flags, after the complete v65 profile tail. Missing
+    // legacy flags stay unknown; neither a known MODE nor a retained width can stand in for them.
+    const auto write_float_flags = [&](FragmentFloatFlags flags, const char* message) {
+        if (!flags.canonical()) { error = message; return false; }
+        w.u8(flags.available ? 1u : 0u);
+        w.u8(flags.ieee_mode ? 1u : 0u);
+        w.u8(flags.dx10_clamp ? 1u : 0u);
+        return true;
+    };
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws)
+        if (!write_float_flags(draw.ps_float_flags,
+                               "invalid realized-draw fragment float flags")) return false;
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics)
+        if (!write_float_flags(diagnostic.ps_float_flags,
+                               "invalid failed-draw fragment float flags")) return false;
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

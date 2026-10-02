@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <vector>
 #include "gpu/recompiler/fragment_float_mode.hpp"
+#include "gpu/recompiler/fragment_float_flags.hpp"
 #include "gpu/recompiler/fragment_arithmetic_observation.hpp"
 #include "gpu/recompiler/float_transport_config.hpp"
 
@@ -662,7 +663,8 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                              RecompileDiagnosticStage::Fragment, 0},
                                          FragmentFloatMode float_mode = {},
                                          FragmentArithmeticObservation* arithmetic_observation = nullptr,
-                                         FloatTransportConfig float_transport = {});
+                                         FloatTransportConfig float_transport = {},
+                                         FragmentFloatFlags float_flags = {});
 
 // Test hook for the low-half EXEC/VCC mask path. Production fragment compilation supplies the same
 // mode from SPI_PS_IN_CONTROL.PS_W32_EN.

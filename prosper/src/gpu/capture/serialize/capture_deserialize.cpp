@@ -1677,6 +1677,35 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 }
         }
     }
+    if (version >= 66u) {
+        const auto read_float_flags = [&](FragmentFloatFlags& flags) {
+            uint8_t available = 0, ieee = 0, dx10 = 0;
+            if (!r.u8(available) || !r.u8(ieee) || !r.u8(dx10) ||
+                available > 1u || ieee > 1u || dx10 > 1u ||
+                (!available && (ieee || dx10))) return false;
+            flags = {available != 0u, ieee != 0u, dx10 != 0u};
+            return true;
+        };
+        uint32_t count = 0;
+        if (!r.u32(count) || count != c.draws.size()) {
+            error = "invalid realized-draw fragment float flags count";
+            return false;
+        }
+        for (auto& draw : c.draws)
+            if (!read_float_flags(draw.ps_float_flags)) {
+                error = "invalid realized-draw fragment float flags";
+                return false;
+            }
+        if (!r.u32(count) || count != c.failure_diagnostics.size()) {
+            error = "invalid failed-draw fragment float flags count";
+            return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics)
+            if (!read_float_flags(diagnostic.ps_float_flags)) {
+                error = "invalid failed-draw fragment float flags";
+                return false;
+            }
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.
