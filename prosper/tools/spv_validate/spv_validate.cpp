@@ -119,10 +119,10 @@ static void dump(const std::string& dir, const char* name, const std::vector<uin
 //
 // The list of gaps is EMPTY, and that is the intended state. A gap belongs here only with the issue
 // that tracks it, never as a silent omission.
-// (#1715 — the generated geometry stage's missing OpExecutionMode Invocations — is deliberately NOT
-// a gap: measured, that module passes spirv-val under both the universal and the vulkan1.1
-// environments. 00715 is a Vulkan pipeline-creation rule that spirv-val does not check, so it is the
-// validation layer's to catch, and the emitter is covered here regardless.)
+// (#1715's former missing geometry Invocations passed spirv-val under both universal and vulkan1.1.
+// The shared emitter now declares Invocations 1 explicitly; raster_quad_collector_contract pins
+// the actual Geometry entry's count on every generated form. Pipeline rule stage-00715 still
+// needs the Vulkan validation layer: strict module legality alone cannot prove its absence.)
 struct KnownGap { const char* emitter; const char* reason; };
 static const std::vector<KnownGap> kKnownGaps = {};
 

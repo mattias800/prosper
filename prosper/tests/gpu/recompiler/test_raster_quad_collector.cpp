@@ -67,6 +67,62 @@ static bool quad_operand_types_ok(const std::vector<uint32_t>& words) {
     }
     return count != 0;
 }
+static bool geometry_invocations_one(const std::vector<uint32_t>& words) {
+    // Independent SPIR-V fields: Geometry=3, OpEntryPoint=15, OpExecutionMode=16,
+    // Invocations=0 (one literal U32 operand), OpFunction=54. This checks the identified entry,
+    // not an opcode anywhere in the module; strict spirv-val does not enforce Vulkan stage-00715.
+    if (words.size() < 5 || words[0] != 0x07230203u) return false;
+    uint32_t entry = 0, invocation_owner = 0, invocation_count = 0;
+    unsigned entries = 0, modes = 0;
+    std::set<uint32_t> functions;
+    for (size_t p = 5; p < words.size();) {
+        const uint32_t n = words[p] >> 16, op = words[p] & 65535;
+        if (!n || n > words.size() - p) return false;
+        if (op == 15) {
+            if (n < 5 || words[p + 1] != 3) return false;
+            entry = words[p + 2]; ++entries;
+        }
+        if (op == 16) {
+            if (n < 3) return false;
+            if (words[p + 2] == 0) {
+                if (n != 4) return false;
+                invocation_owner = words[p + 1]; invocation_count = words[p + 3]; ++modes;
+            }
+        }
+        if (op == 54) {
+            if (n != 5 || !functions.insert(words[p + 2]).second) return false;
+        }
+        p += n;
+    }
+    return entries == 1 && entry && functions.count(entry) && modes == 1 &&
+        invocation_owner == entry && invocation_count == 1;
+}
+static void geometry_invocation_controls(const std::vector<uint32_t>& words) {
+    size_t mode = words.size();
+    for (size_t p = 5; p < words.size();) {
+        const uint32_t n = words[p] >> 16, op = words[p] & 65535;
+        if (!n || n > words.size() - p) break;
+        if (op == 16 && n == 4 && words[p + 2] == 0) { mode = p; break; }
+        p += n;
+    }
+    check(mode < words.size(), "actual generated GS supplies load-bearing Invocations instruction");
+    if (mode == words.size()) return;
+    auto changed = words;
+    changed.erase(changed.begin() + mode, changed.begin() + mode + 4);
+    check(!geometry_invocations_one(changed), "actual former GS omission fails invocation observer");
+    for (uint32_t count : {0u,2u}) {
+        changed = words; changed[mode + 3] = count;
+        check(!geometry_invocations_one(changed), "zero or duplicated-per-primitive count fails invocation observer");
+    }
+    changed = words; changed[mode + 1] = words[3];
+    check(!geometry_invocations_one(changed), "a count not owned by the actual GS entry fails invocation observer");
+    changed = words;
+    changed.insert(changed.begin() + mode, words.begin() + mode, words.begin() + mode + 4);
+    check(!geometry_invocations_one(changed), "duplicate Invocations cannot satisfy the actual GS contract");
+    changed = words;
+    changed[mode] = (3u << 16) | 16u; changed.erase(changed.begin() + mode + 3);
+    check(!geometry_invocations_one(changed), "Invocations without its literal count fails invocation observer");
+}
 static bool retry_loop_scopes_ok(const std::vector<uint32_t>& words) {
     std::set<uint32_t> continues, selections;
     for (size_t p = 5; p < words.size();) {
@@ -201,6 +257,21 @@ int main(int argc, char** argv) {
         recompile_interpolation_geometry(layout,false,false,in.float_transport,false),
         "default GS API selects unchanged no-PrimitiveId-publisher form");
     const auto id_geometry = recompile_interpolation_geometry(layout,false,false,in.float_transport,true);
+    check(geometry_invocations_one(native_geometry), "actual native interpolation GS declares exactly one invocation on its entry");
+    check(geometry_invocations_one(id_geometry), "actual PrimitiveId publisher GS declares exactly one invocation on its entry");
+    geometry_invocation_controls(native_geometry);
+    struct GeometryForm { bool capture, rect, publisher; const char* dump_name; };
+    const GeometryForm geometry_forms[]{
+        {false,true,false,"raster_quad_geometry_rect.spv"},
+        {true,false,false,"raster_quad_geometry_capture.spv"},
+        {true,true,false,"raster_quad_geometry_capture_rect.spv"},
+        {true,false,true,"raster_quad_geometry_capture_ids.spv"}};
+    for (const auto& form : geometry_forms) {
+        const auto geometry = recompile_interpolation_geometry(
+            layout,form.capture,form.rect,in.float_transport,form.publisher);
+        check(geometry_invocations_one(geometry), "actual RectList/XFB/publisher form declares exactly one invocation on its entry");
+        dump(directory,form.dump_name,geometry);
+    }
     std::map<uint32_t,uint32_t> builtin, storage;
     uint32_t id_input = 0, id_output = 0, id_value = 0, stores = 0, emits = 0;
     bool id_ready = false, all_emits_owned = true;

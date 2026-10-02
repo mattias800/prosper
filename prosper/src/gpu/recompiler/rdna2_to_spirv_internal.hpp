@@ -264,7 +264,7 @@ enum : uint32_t {
     Cap_FloatControls2=6029,
     Cap_StorageBufferArrayNonUniformIndexing=5308,
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
-    EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
+    EM_Invocations=0, EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
     EM_OutputVertices=26, EM_OutputTriangleStrip=29, EM_Xfb=11,   // transform-feedback execution mode
     EM_SignedZeroInfNanPreserve=4461,
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_PushConstant=9,
@@ -2497,6 +2497,9 @@ struct SpirvCompute {
           putv(extimp, Op_ExtInstImport, operands); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         exec_model = Exec_Geometry;
+        // Vulkan pipeline rule stage-00715 requires an explicit positive invocation count.
+        // One preserves SPIR-V's default: run once per input triangle, for every generated form.
+        put(exec, Op_ExecutionMode, {f_main, EM_Invocations, 1});
         put(exec, Op_ExecutionMode, {f_main, EM_Triangles});
         put(exec, Op_ExecutionMode, {f_main, EM_OutputTriangleStrip});
         put(exec, Op_ExecutionMode, {f_main, EM_OutputVertices, synthesize_rect ? 4u : 3u});
