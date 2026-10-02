@@ -3991,6 +3991,13 @@ bool emit_cfg_state_machine(
         }
     }
     for (uint32_t first = 0; first < starts.size(); ++first) {
+        // Packet MUST facts describe only entry-reachable blocks. A forward S_BRANCH can
+        // bypass the entire body, whose saved-mask/reduction operands then have no live
+        // lifetime to load or emit. Keep those blocks out of this owned packet's dispatcher
+        // rather than fabricating state for them. scalar_reachable follows both successors
+        // of every conditional branch: supplied SCC/EXEC values never prune a possible arm.
+        // The packet caller still inventories every original instruction and supplied slot.
+        if (b.is_fragment_packet() && !scalar_reachable[first]) continue;
         if (dispatch_for_block[first] != UINT32_MAX) continue;
         const uint32_t dispatch = static_cast<uint32_t>(dispatch_blocks.size());
         dispatch_blocks.push_back({});

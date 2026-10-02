@@ -67,9 +67,73 @@ int main(int argc, char** argv) {
                       "actual MBCNT has two raw sources and vector destination");
             }
         check(mbcnts == 4, "four original guest MBCNT sites decoded");
+        if (c.skip_all && !decoded.empty()) {
+            const auto& branch = decoded.front();
+            check(branch.pc == 0 && branch.fmt == prosper::gpu::Rdna2Format::SOPP &&
+                  branch.opcode == 0x02 && branch.len_dwords == 1 && decoded.back().is_end &&
+                  branch.pc + branch.len_dwords + branch.simm16 == decoded.back().pc,
+                  "all-ended original guest branches directly to S_ENDPGM");
+            check(std::any_of(decoded.begin(), decoded.end(), [](const auto& in) {
+                      return in.pc == 9 && in.fmt == prosper::gpu::Rdna2Format::SOP1 &&
+                             in.opcode == prosper::gpu::kSop1OpcodeBcnt1I32B64 &&
+                             in.words[0] == 0xbe8c106au;
+                  }), "all-ended original guest retains the unreachable BCNT at pc9");
+            auto unowned = p; unowned.slots_available[31] = false;
+            refuse(unowned, "packet-invocation-state-unavailable",
+                   "all-ended guest still requires complete owned slots");
+            auto unsupported = p; unsupported.guest_code[3] |= 1u << 8;
+            refuse(unsupported, "packet-modifier-unimplemented",
+                   "all-ended guest still inventories unsupported original modifiers");
+        }
         run(p, m::expected(c), "mbcnt_" + std::to_string(ordinal++), directory);
     }
     check(ordinal == 100, "nine source kinds, all64 bits, six addend kinds, skipped/ended and replacement");
+
+    // A supplied true SCC takes this conditional edge to S_ENDPGM at execution time, but
+    // the CFG must still retain its fallthrough arm. Replace exactly one original S_MOV:
+    // a complete saved VCC definition is legal; a B32 DATA write expires the high mask half.
+    auto conditional = m::packet({});
+    conditional.guest_code.insert(conditional.guest_code.begin() + 2, 0xbe94046au);
+    conditional.guest_code.insert(conditional.guest_code.begin(),
+                                  0xbf850000u | uint32_t(conditional.guest_code.size() - 1));
+    check(conditional.scc, "conditional ended control really supplies true SCC");
+    auto conditional_expired = conditional;
+    conditional_expired.guest_code[3] = 0xbe940318u; // S_MOV_B32 s20,s24, not a saved mask pair
+    for (const auto* p : {&conditional, &conditional_expired}) {
+        std::vector<prosper::gpu::Rdna2Inst> decoded;
+        prosper::gpu::rdna2_walk(p->guest_code.data(), p->guest_code.size(), decoded);
+        check(!decoded.empty(), "conditional reachability original instructions decode");
+        if (decoded.empty()) continue;
+        const auto& branch = decoded.front();
+        check(branch.pc == 0 && branch.fmt == prosper::gpu::Rdna2Format::SOPP &&
+              branch.opcode == 0x05 && branch.len_dwords == 1 && decoded.back().is_end &&
+              branch.pc + branch.len_dwords + branch.simm16 == decoded.back().pc,
+              "actual S_CBRANCH_SCC1 has both end and fallthrough CFG successors");
+        const auto save = std::find_if(decoded.begin(), decoded.end(), [](const auto& in) {
+            return in.pc == 3;
+        });
+        const bool expired = p == &conditional_expired;
+        check(save != decoded.end() && save->fmt == prosper::gpu::Rdna2Format::SOP1 &&
+              save->len_dwords == 1 && save->dst.kind == prosper::gpu::OperandKind::SGPR &&
+              save->dst.value == 20 && save->n_src == 1 &&
+              save->opcode == (expired ? prosper::gpu::kSop1OpcodeMovB32 :
+                                        prosper::gpu::kSop1OpcodeMovB64) &&
+              save->src[0].value == (expired ? 24 : 106) &&
+              save->src[0].kind == (expired ? prosper::gpu::OperandKind::SGPR :
+                                            prosper::gpu::OperandKind::Special),
+              "one decoded conditional-arm instruction distinguishes DATA from live saved mask");
+    }
+    uint32_t conditional_changes = 0;
+    for (size_t word = 0; word < conditional.guest_code.size(); ++word)
+        if (conditional.guest_code[word] != conditional_expired.guest_code[word]) {
+            ++conditional_changes;
+            check(word == 3, "conditional lifetime control changes only the saved-mask definition");
+        }
+    check(conditional_changes == 1, "conditional reachability pair changes one guest instruction word");
+    m::Case ended; ended.skip_all = true;
+    run(conditional, m::expected(ended), "conditional_reachable_saved_mask", directory);
+    refuse(conditional_expired, "mbcnt-unproven-saved-mask",
+           "runtime-taken SCC1 cannot hide its reachable expired-mask arm", false);
 
     // A legal original-instruction mutation changes the first numeric MBCNT from LO to HI.
     // Walk both actual instruction streams; changing the oracle's first_is_high flag alone is
