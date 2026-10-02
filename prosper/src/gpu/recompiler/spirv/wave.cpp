@@ -614,6 +614,7 @@ uint32_t SpirvCompute::vertex_invocation_id() {
     }
 
 uint32_t SpirvCompute::guest_lane_id() {
+        if (has_workgroup_execution()) return linear_localid;
         if (is_fragment) return subgroup_local_id();
         if (is_compute) return linear_localid;
         return ibin(Op_BitwiseAnd, vertex_invocation_id(), uconst(wave_size - 1));

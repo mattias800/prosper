@@ -30,6 +30,7 @@
 #include "../../tests/fixtures/spirv_fragment_vote_execution.hpp"
 #include "../../tests/fixtures/spirv_fragment_neutral_fixtures.hpp"
 #include "../../tests/fixtures/portable_bpermute_fixture.hpp"
+#include "../../tests/fixtures/fragment_packet_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <algorithm>
 #include <array>
@@ -196,7 +197,10 @@ static const NotAnEmitter kNotEmitters[] = {
 // (`std::vector<uint32_t> words(n);` reads as a declaration of an emitter named `words`). None
 // exists today; if you write one and this gate goes red, that is why — use `=` or brace init.
 static std::vector<std::string> declared_emitters(const std::string& header_text) {
-    static const char* const kReturnTypes[] = {"std::vector<uint32_t>", "SharedShaderWords"};
+    // FragmentPacketProgram owns the module plus its exact raw input/output buffers. Its different
+    // return shape must not remove the genuine packet compiler entry from strict emitter coverage.
+    static const char* const kReturnTypes[] = {
+        "std::vector<uint32_t>", "SharedShaderWords", "FragmentPacketProgram"};
     std::vector<std::string> names;
     for (const char* ret_type : kReturnTypes) {
         const std::string kRet = ret_type;
@@ -625,6 +629,20 @@ int main(int argc, char** argv) {
         }
     }
     namespace neutral = prosper::test::fragment_neutral;
+    {
+        namespace fp = prosper::test::fragment_packet;
+        uint32_t ordinal = 0;
+        for (uint32_t selected : {63u, 64u}) for (bool inactive : {false, true}) {
+            fp::Case c;
+            c.selected_lane = selected;
+            c.inactive_source = inactive;
+            c.leave_source_inactive = inactive;
+            c.second_export = true;
+            const auto compiled = recompile_fragment_packet(fp::packet(c));
+            const auto name = "fragment_packet_" + std::to_string(ordinal++);
+            dump(dir, name.c_str(), compiled.spirv, "recompile_fragment_packet");
+        }
+    }
     {
         namespace bp = prosper::test::bpermute;
         uint32_t ordinal = 0;

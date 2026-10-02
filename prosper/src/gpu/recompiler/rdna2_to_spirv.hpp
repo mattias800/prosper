@@ -480,6 +480,51 @@ struct PixelSystemInputMapping {
     bool operator==(const PixelSystemInputMapping&) const = default;
 };
 
+// Explicitly supplied guest invocation state, not a raster-packing reconstruction. Each column
+// owns all 64 raw VGPR words; every slot must be available. The initial implementation consumes
+// these VGPRs directly and rejects VINTRP/implicit derivatives/WQM and external memory effects.
+// A caller must not fill missing guest values with zero or infer a packet by pairing host subgroups.
+inline constexpr uint32_t kFragmentPacketLanes = 64;
+struct FragmentPacketVgpr {
+    uint32_t reg = 0;
+    std::array<uint32_t, kFragmentPacketLanes> words{};
+};
+struct FragmentInvocationPacket {
+    std::vector<uint32_t> guest_code;
+    std::vector<FragmentPacketVgpr> vgprs;
+    std::vector<std::pair<uint32_t, uint32_t>> sgprs; // explicit wave-uniform scalar words
+    std::array<bool, kFragmentPacketLanes> slots_available{};
+    std::array<uint8_t, kFragmentPacketLanes> export_enabled{}; // 0/1, separate from EXEC
+    bool mask_state_available = false;
+    uint64_t exec_mask = 0, vcc_mask = 0;
+    bool scc = false;
+    FragmentFloatMode float_mode{};
+    FragmentFloatFlags float_flags{};
+    FloatTransportConfig float_transport{};
+};
+
+// One record per static EXP, in guest-PC order, per lane. Forward-only control flow makes this
+// order unambiguous; looped/repeated exports currently refuse. Records are NOT framebuffer writes.
+// [reached, EXEC, export_enabled, target, EN, COMPR, DONE, VM, raw VSRC0..3]. A reached record
+// with EXEC=0 retains a discard/export-mask observation without terminating its physical worker.
+inline constexpr uint32_t kFragmentPacketExportWords = 12;
+struct FragmentPacketProgram {
+    std::vector<uint32_t> spirv;
+    // Execute exactly ONE workgroup (LocalSize 64x1x1), with these complete Set0 binding0/1
+    // owned buffers. They describe one logical packet, not an arbitrary guest dispatch grid.
+    std::vector<uint32_t> input_words;  // owned raw-u32 set0/binding0, lane-major
+    std::vector<uint32_t> output_words; // owned initialized records, set0/binding1
+    uint32_t input_stride = 0, exports_per_lane = 0;
+    std::string rejection;
+};
+
+// Actual guest instruction emission into a 64-worker logical-wave executor. No native subgroup64
+// requirement and no native fragment invocation pairing. This entry does not rasterize, interpolate,
+// assemble helper packets, apply depth/stencil/blend, or admit a live DrawItem.
+FragmentPacketProgram recompile_fragment_packet(
+    const FragmentInvocationPacket& packet,
+    RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Fragment, 0});
+
 // Portable lowering contract for GFX10's explicit pixel-interpolation parameters. AMD hardware can
 // expose P0/P10/P20 directly to v_interp_mov; Vulkan only has an equivalent fragment extension on a
 // subset of devices. When `requires_geometry` is true, the renderer inserts the generated geometry
