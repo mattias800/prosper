@@ -2362,10 +2362,9 @@ if(TARGET prosper_core)
 
   # Pure CFG proof regression: compile only the decoder, so adversarial barrier-uniformity
   # cases can be checked without a renderer/core build or a potentially unsafe GPU dispatch.
-  add_executable(test_workgroup_uniformity tests/gpu/test_workgroup_uniformity.cpp
-      src/gpu/recompiler/rdna2_decode.cpp)
-  target_include_directories(test_workgroup_uniformity PRIVATE src)
-  add_test(NAME workgroup_uniformity COMMAND test_workgroup_uniformity)
+  prosper_add_gtest(test_workgroup_uniformity
+    SOURCES tests/gpu/test_workgroup_uniformity.cpp src/gpu/recompiler/rdna2_decode.cpp
+    INCLUDES src)
 
   add_executable(test_direct_descriptor_copy tests/gpu/recompiler/test_direct_descriptor_copy.cpp)
   target_link_libraries(test_direct_descriptor_copy PRIVATE prosper_core)
@@ -3298,10 +3297,9 @@ endif()
 
   # x86-64 low-address READ decoder used by the Windows PROSPER_NULL_PAGE emulation. Header-only, so the
   # decode logic is verified on every platform even though the VEH caller is Windows-only.
-  add_executable(test_x86_read_decode tests/host/x86/test_x86_read_decode.cpp)
-  # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
-  target_include_directories(test_x86_read_decode PRIVATE src)
-  add_test(NAME x86_read_decode COMMAND test_x86_read_decode)
+  prosper_add_gtest(test_x86_read_decode
+    SOURCES tests/host/x86/test_x86_read_decode.cpp
+    INCLUDES src)
 
   # #2018: a fatal worker-thread fault report must describe one fault. Header-only snapshot of the
   # handler's own siginfo/ucontext; POSIX signal contexts only (the test self-skips elsewhere).

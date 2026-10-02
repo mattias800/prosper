@@ -1,20 +1,12 @@
 // Workgroup barrier admission must prove every wave takes the same branch. These are CPU-only
 // counterexamples: dispatching a shader whose waves disagree around a barrier is not a safe test.
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
-#include <cstdio>
+#include <gtest/gtest.h>
 #include <vector>
 
 using namespace prosper::gpu;
 
-static int failures = 0;
-static int checks = 0;
-static void check(bool condition, const char* message) {
-    ++checks;
-    if (!condition) {
-        ++failures;
-        std::printf("FAIL: %s\n", message);
-    }
-}
+static void check(bool condition, const char* message) { EXPECT_TRUE(condition) << message; }
 
 static bool uniform(const std::vector<uint32_t>& code) {
     std::vector<Rdna2Inst> ins;
@@ -23,7 +15,7 @@ static bool uniform(const std::vector<uint32_t>& code) {
     return scc_branch_is_workgroup_uniform(ins, static_cast<uint32_t>(code.size() - 3));
 }
 
-int main() {
+TEST(WorkgroupUniformity, BarrierAdmissionCounterexamples) {
     // Exercise both the new entry-prefix walk (a block boundary before the compare) and the
     // local-block walk. They must agree about implicit operands and source widths.
     for (bool separate_block : {false, true}) {
@@ -141,6 +133,4 @@ int main() {
     check(!vcc_branch_is_workgroup_uniform(narrowed_ins, 6),
           "VCC still requires full EXEC at the same site");
 
-    std::printf("%d checks, %d failures\n", checks, failures);
-    return failures ? 1 : 0;
 }

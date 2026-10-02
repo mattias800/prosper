@@ -150,6 +150,7 @@ tests/gpu/recompiler/test_fragment_loop_mask.cpp
 tests/gpu/recompiler/test_fragment_loop_vote_lowering.cpp
 tests/gpu/recompiler/test_fragment_neutral_selection.cpp
 tests/gpu/recompiler/test_fragment_packet.cpp
+tests/gpu/recompiler/test_fragment_packet_mbcnt.cpp
 tests/gpu/recompiler/test_fragment_packet_wqm.cpp
 tests/gpu/recompiler/test_fragment_vote_lowering.cpp
 tests/gpu/recompiler/test_fragment_vote_refusal_details.cpp
@@ -169,6 +170,7 @@ tests/gpu/recompiler/test_messenger_recompile_guard.cpp
 tests/gpu/recompiler/test_normal_magnitude_predicate.cpp
 tests/gpu/recompiler/test_owned_raw_wide_backing.cpp
 tests/gpu/recompiler/test_portable_bpermute.cpp
+tests/gpu/recompiler/test_raster_quad_collector.cpp
 tests/gpu/recompiler/test_raw_register_wide_data.cpp
 tests/gpu/recompiler/test_raw_wide_mask_lifetime.cpp
 tests/gpu/recompiler/test_raw_wide_read_point.cpp
@@ -228,7 +230,6 @@ tests/gpu/test_texture_mip_render.cpp
 tests/gpu/test_texture_sample_render.cpp
 tests/gpu/test_textured_interp_render.cpp
 tests/gpu/test_vertex_fetch_render.cpp
-tests/gpu/test_workgroup_uniformity.cpp
 tests/gpu/texture/bench_detile.cpp
 tests/gpu/texture/test_avplayer.cpp
 tests/gpu/texture/test_bc_decode.cpp
@@ -388,7 +389,6 @@ tests/host/symbols/test_il2cpp_symbols.cpp
 tests/host/test_dmem.cpp
 tests/host/tls/test_fs_emu.cpp
 tests/host/tls/test_guest_tls_reactivate.cpp
-tests/host/x86/test_x86_read_decode.cpp
 tests/input/test_pad.cpp
 tests/loader/test_guest_tls_align.cpp
 tests/loader/test_support_modules.cpp
@@ -427,6 +427,7 @@ tests/shared/live/test_live_compute_host_read_barrier.cpp
 tests/shared/live/test_live_renderer_registration_statics.cpp
 tests/shared/live/test_live_target_format.cpp
 tests/shared/live/test_native_bc_upload.cpp
+tests/shared/live/test_raster_quad_collection.cpp
 tests/shared/live/test_render_buffer_capture.cpp
 tests/shared/live/test_shared_vulkan_device.cpp
 tests/shared/live/test_storage_float_roundtrip.cpp
