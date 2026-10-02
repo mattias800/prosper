@@ -402,6 +402,22 @@ struct SpirvCompute {
     RecompileDiagnosticContext diagnostic{};
     FragmentFloatMode fragment_float_mode{};
     FragmentFloatFlags fragment_float_flags{};
+    struct FloatModifierReject {
+        const char* tag = nullptr;
+        uint32_t pc = 0;
+        unsigned result_width = 0;
+        uint8_t omod = 0;
+        bool clamp = false;
+    } float_modifier_reject;
+    // Generic emit_body failures can overwrite the specific modifier cause.
+    // Restore it only when this fragment request actually returns no module.
+    void restore_float_modifier_reject() {
+        if (!float_modifier_reject.tag) return;
+        log_recompile_diagnostic(diagnostic, float_modifier_reject.tag, "terminal",
+            "pc=%u result_width=%u OMOD=%u CLAMP=%u required observed launch state unavailable; no modifier semantics guessed",
+            float_modifier_reject.pc, float_modifier_reject.result_width,
+            unsigned(float_modifier_reject.omod), unsigned(float_modifier_reject.clamp));
+    }
     FragmentArithmeticObservation* fragment_arithmetic_observation = nullptr;
     void observe_fragment_arithmetic_site(uint32_t pc, FragmentArithmeticFamily family) {
         if (is_fragment && fragment_arithmetic_observation)

@@ -24,6 +24,7 @@ uint32_t SpirvCompute::float_output_modifiers(uint32_t bits, uint8_t omod, bool 
         // Either observed disabling input proves OMOD is a no-op on its own.
         // CLAMP still needs its independent DX10 flag even when IEEE disables OMOD.
         if (!fragment_float_flags.available && (clamp || (omod && !output_preserved))) {
+            float_modifier_reject = {"fragment-float-flags-unavailable", pc, result_width, omod, clamp};
             log_recompile_diagnostic(diagnostic, "fragment-float-flags-unavailable", "float-modifier",
                                      "pc=%u result_width=%u OMOD=%u CLAMP=%u requires observed IEEE_MODE/DX10_CLAMP; launch flags unavailable",
                                      pc, result_width, unsigned(omod), unsigned(clamp));
@@ -31,6 +32,7 @@ uint32_t SpirvCompute::float_output_modifiers(uint32_t bits, uint8_t omod, bool 
             return bits;
         }
         if (omod && !ieee && !output_preserved && !fragment_float_mode.available) {
+            float_modifier_reject = {"fragment-float-output-mode-unavailable", pc, result_width, omod, clamp};
             log_recompile_diagnostic(diagnostic, "fragment-float-output-mode-unavailable", "float-modifier",
                                      "pc=%u result_width=%u OMOD=%u requires observed output-denorm mode; FLOAT_MODE unavailable",
                                      pc, result_width, unsigned(omod));

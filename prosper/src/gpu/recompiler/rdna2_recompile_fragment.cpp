@@ -638,6 +638,7 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // is handled by EXEC predication like compute, and the export is guarded above. Memory ops need a
     // resource table. Loops (if any) are reconstructed by emit_body.
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) {
+        b.restore_float_modifier_reject();
         if (getenv("PROSPER_DBG") && pcrel_dispatch_target != UINT32_MAX)
             log_recompile_diagnostic(diagnostic, "recompile-reject", "consequent",
                                      "pcrel target=%u body failed", pcrel_dispatch_target);
