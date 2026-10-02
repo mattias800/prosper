@@ -41,7 +41,7 @@ import re
 import subprocess
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 
 # Leaf functions that mean "this thread is parked/idle, not burning CPU". Filtered by default so the
 # histogram reflects real work; pass --keep-idle to see the wait breakdown instead. Matched against the
@@ -82,7 +82,8 @@ def resolve_pid(spec):
 
 def busiest_tid(pid):
     """Return the tid of the thread with the most CPU time (utime+stime), or None."""
-    import glob, os
+    import glob
+    import os
     best, best_ticks = None, -1
     for stat in glob.glob(f"/proc/{pid}/task/*/stat"):
         try:
