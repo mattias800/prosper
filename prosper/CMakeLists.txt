@@ -4949,6 +4949,29 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
   target_link_libraries(test_rect_synthesis_render PRIVATE prosper_core Vulkan::Vulkan)
   add_test(NAME rect_synthesis_render COMMAND test_rect_synthesis_render)
 
+  # CPU-only controls drive the shipping persistent-color lookup/readback refusal branches.
+  # Vulkan dev files satisfy the backend header; no usable device or GPU execution is required.
+  add_executable(test_persistent_readback_refusal tests/render/test_persistent_readback_refusal.cpp)
+  target_include_directories(test_persistent_readback_refusal PRIVATE tests frontends)
+  target_link_libraries(test_persistent_readback_refusal PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME persistent_readback_refusal COMMAND test_persistent_readback_refusal --armed)
+  add_test(NAME persistent_readback_refusal_disabled COMMAND ${CMAKE_COMMAND} -E env
+    --unset=PROSPER_RTT_READBACK_TRACE_TARGETS $<TARGET_FILE:test_persistent_readback_refusal> --unarmed)
+  set_tests_properties(persistent_readback_refusal PROPERTIES TIMEOUT 15
+    ENVIRONMENT "PROSPER_RTT_READBACK_TRACE_TARGETS=0x38910000")
+  set_tests_properties(persistent_readback_refusal_disabled PROPERTIES TIMEOUT 15)
+  set(readback_refusal_selector_malformed "0x38910000,bad")
+  set(readback_refusal_selector_empty "")
+  set(readback_refusal_selector_zero "0x38910000,0x0")
+  set(readback_refusal_selector_excess "0x38910000,0x1,0x2,0x3,0x4,0x5,0x6,0x7,0x8")
+  foreach(readback_refusal_selector_mode IN ITEMS empty malformed zero excess)
+    add_test(NAME persistent_readback_refusal_${readback_refusal_selector_mode}
+      COMMAND test_persistent_readback_refusal --unarmed)
+    set_tests_properties(persistent_readback_refusal_${readback_refusal_selector_mode}
+      PROPERTIES TIMEOUT 15
+      ENVIRONMENT "PROSPER_RTT_READBACK_TRACE_TARGETS=${readback_refusal_selector_${readback_refusal_selector_mode}}")
+  endforeach()
+
   # A compute full-overwrite destination at the colour-target COUNT bound evicts under the graphics
   # admission predicate instead of refusing (#3873).
   # BackendSubmissionBatch's timestamp envelope reuses one query pool across batches (#3948).

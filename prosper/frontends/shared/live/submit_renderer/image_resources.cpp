@@ -2,8 +2,42 @@
 #include "shared/live/submit_renderer/draw_resources.hpp"
 #include "shared/live/submit_renderer/image_resources.hpp"
 #include "shared/live/submit_renderer/guest_reads.hpp"
+#include "diagnostics/readback_refusal.hpp"
 
 namespace prosper::frontend::submit_renderer {
+namespace {
+void materialize_lazy_sampled_color_target(RttSurf& surface, uint64_t address,
+                                         VkFormat format, uint64_t expected_bytes) {
+    std::vector<uint8_t> materialized;
+    std::string error;
+    const bool readback_ok = [&] {
+        namespace refusal = prosper::diagnostics::readback_refusal;
+        if (!refusal::selected(address))
+            return prosper::test::readback_persistent_color_target(
+                address, surface.w, surface.h, format, materialized, error);
+        refusal::Record record{};
+        record.context.caller = refusal::Caller::LazySampled;
+        record.context.frontend_gpu_valid = surface.gpu_valid
+            ? refusal::ObservedBool::Yes : refusal::ObservedBool::No;
+        record.context.frontend_cpu_pixels = surface.rgba
+            ? refusal::ObservedBool::Yes : refusal::ObservedBool::No;
+        const bool result = prosper::test::readback_persistent_color_target(
+            address, surface.w, surface.h, format, materialized, error, 0, &record);
+        refusal::emit(record);
+        return result;
+    }();
+    if (readback_ok && materialized.size() == expected_bytes) {
+        surface.rgba = std::make_shared<const std::vector<uint8_t>>(std::move(materialized));
+    } else {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 24)
+            fprintf(stderr,
+                    "[rtt] lazy sampled target readback failed: "
+                    "base=0x%llx extent=%ux%u error=%s\n",
+                    (unsigned long long)address, surface.w, surface.h, error.c_str());
+    }
+}
+} // namespace
 
 size_t consume_image_renderer_mip_chain(DrawResourceContext& ctx, const RendererMipChainLayout& chain, uint32_t width, uint32_t height, VkFormat format) {
     auto& pinned_renderer_mip_targets = ctx.pinned_renderer_mip_targets;
@@ -693,23 +727,8 @@ ImageResourceStatus materialize_image_resource(DrawResourceContext& ctx, ImageBi
                       surface_texels <= UINT64_MAX / surface_bpp &&
                       (!surface.rgba ||
                        surface.rgba->size() != surface_texels * surface_bpp)) {
-                      std::vector<uint8_t> materialized;
-                      std::string error;
-                      if (prosper::test::readback_persistent_color_target(
-                              sampled_source_addr, surface.w, surface.h, surface_format,
-                              materialized, error) &&
-                          materialized.size() == surface_texels * surface_bpp) {
-                          surface.rgba = std::make_shared<const std::vector<uint8_t>>(
-                              std::move(materialized));
-                      } else {
-                          static std::atomic<int> warned{0};
-                          if (warned.fetch_add(1) < 24)
-                              fprintf(stderr,
-                                      "[rtt] lazy sampled target readback failed: "
-                                      "base=0x%llx extent=%ux%u error=%s\n",
-                                      (unsigned long long)sampled_source_addr, surface.w,
-                                      surface.h, error.c_str());
-                      }
+                      materialize_lazy_sampled_color_target(
+                          surface, sampled_source_addr, surface_format, surface_texels * surface_bpp);
                   }
               }
               static const bool retain_cpu_rtt_snapshots =
