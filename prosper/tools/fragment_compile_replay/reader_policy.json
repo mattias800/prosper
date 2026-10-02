@@ -201,7 +201,7 @@
   "prosper/src/hle/audio/hle_audiodec.cpp": "42fd01b7bb6d22381537def99dffad93a4b6578dc96e7a3f6af5ac113b81ba5d",
   "prosper/src/hle/dispatch/callback_fs.hpp": "0daa5cec1e0eaa3e20b29246ff63a8040760563a372d44230d32f24ad4c9cd16",
   "prosper/src/hle/dispatch/dispatch.cpp": "c1e8a5006ece559c1bc23aad2f26a396ed813449b0ba3f59c9148434af968319",
-  "prosper/src/hle/dispatch/dispatch.hpp": "4cd1823ccf4a4ed4d353ee037010277fefaa9c172063b3f577969d3d2df558a7",
+  "prosper/src/hle/dispatch/dispatch.hpp": "3614c1b4f622615726bea6ef901b86f4f6137f9c9756056581e522e8ad89a18f",
   "prosper/src/hle/dispatch/import_data_seed.cpp": "807ca7bdec1133975f064bbb49c7539cc9449d77780b4ab5bedf60eb5eb5fc9f",
   "prosper/src/hle/dispatch/import_data_seed.hpp": "8259e519dd1a1324bebab40ec937da09e48ea3525a7c2238308ee70293aed2d1",
   "prosper/src/hle/dispatch/nid.cpp": "706b9505602d92a2c3a9f6dee0810f00f2e08c209dcb09046ae9f668539fcc20",
@@ -225,7 +225,7 @@
   "prosper/src/hle/input/hle_pad.cpp": "324d127996cc0ab79cb770217eb16572cecdc2005387ed6213ea5c768adf2fd6",
   "prosper/src/hle/input/ime.cpp": "514f89c5ce03ca778840ce7686d81096aaf6bbe65d227460d7aa1b59d898f5e2",
   "prosper/src/hle/input/ime_input.hpp": "75c3ecc4abfa0b423eab2d3d9efc5565a1b47102dfeed015a50e2cf21b1d4878",
-  "prosper/src/hle/kernel/hle_kernel.cpp": "342bf5c1fb2a14d1c9fa6317c0783e8b14c5654c0a5e001ddd82165389ad6463",
+  "prosper/src/hle/kernel/hle_kernel.cpp": "945a870e2b43cb0b57d0d29acf9fe656b5723b3509c95bef0c36e14f3d3f220a",
   "prosper/src/hle/kernel/hle_kernel_time.cpp": "eb93c4c01e1d3facc6abb4969546333a79c38d2ef337355d139143713581c18e",
   "prosper/src/hle/kernel/hle_kernel_time.hpp": "ff8e0fe309f0d4084872e134bb16f752a8f8bf22978a70bc22acb3b28a398b49",
   "prosper/src/hle/kernel/sce_errno.hpp": "207ed9b960b05574d45d1bbce0bc417070a80d9528347254c4c297feaa581b8e",
@@ -323,5 +323,7 @@
   "prosper/src/loader/support_modules.hpp": "9f552b094d35335943cfac75b7d8940e5f9f8e5065ff46506d04b3daf46e08e4",
   "prosper/src/loader/tls_layout.hpp": "a3a362d0d486c921853a2fba7376218dcd17fe27bbc26ee9963778ed4a93301d",
   "prosper/src/self/module.cpp": "acf522496aa0a911b2558304e13e22e8eb278fb95189cffc91ee5a23bb4eb6f2",
-  "prosper/src/self/module.hpp": "f77ca1108dc7a9de52b7a93946ef1cfd6356e226865a0acf936b146c60b562e2"
+  "prosper/src/self/module.hpp": "f77ca1108dc7a9de52b7a93946ef1cfd6356e226865a0acf936b146c60b562e2",
+  "prosper/src/hle/kernel/hle_kernel_system.cpp": "eb577f57bfea3f69cbda712739a14b8e8668236d3a06632c33651f1eccd60e29",
+  "prosper/src/hle/memory/hle_prt_aperture.cpp": "661f828c538fbe3d3648b954165c6114e65f8624b1e31f0033d87b6b0c5aafa8"
 }
