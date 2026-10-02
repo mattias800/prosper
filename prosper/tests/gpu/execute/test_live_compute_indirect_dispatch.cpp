@@ -270,23 +270,71 @@ int main() {
     // ---- Arm 5: a zero count is a hardware no-op decided by the device ----------------------------
     {
         const Counters before = counters();
+        const uint64_t out_base = reinterpret_cast<uint64_t>(out);
+        uint32_t output_writes = 0;
+        set_guest_gpu_write_observer([&](uint64_t address, uint64_t size, const char*) {
+            if (address < out_base + kOutputBytes && out_base < address + size) ++output_writes;
+        });
         const auto [built, ran] = produce_then_consume({0, 1, 1, 0}, args_base, true, 0x36560060u);
+        set_guest_gpu_write_observer({});
         const Counters after = counters();
         CHECK(built && ran && after.device == before.device + 1 && after.rejected == before.rejected,
               "zero counts dispatch (and launch nothing) without being reported as an error");
         CHECK(output_matches(out, 0, kConsumerPattern), "nothing was written");
+        CHECK(output_writes == 0,
+              "a zero-group launch publishes no write: nothing downstream is invalidated");
     }
 
     // ---- Arm 6: a device-produced count above the device limit is refused, not launched -----------
     {
         const Counters before = counters();
-        const auto [built, ran] =
-            produce_then_consume({0xFFFFFFFFu, 1, 1, 0}, args_base, true, 0x36560070u);
+        std::vector<ComputeItem> items = {producer({0xFFFFFFFFu, 1, 1, 0}, 0x36560070u),
+                                          consumer(args_base, 0x36560071u)};
+        reset_output(out);
+        const std::vector<bool> ran = run_submit(items);
         const Counters after = counters();
-        CHECK(built && ran, "the dispatch completes instead of hanging or losing the device");
+        CHECK(ran.size() == 2 && ran[0],
+              "the dispatch completes instead of hanging or losing the device");
         CHECK(after.device == before.device + 1 && after.rejected == before.rejected + 1,
               "the validation pass zeroed the launch and the backend reported it");
+        CHECK(ran.size() == 2 && !ran[1],
+              "the refused launch is a DECLINE, exactly like the host route's over-limit refusal");
         CHECK(output_matches(out, 0, kConsumerPattern), "no group ran: canaries intact");
+    }
+
+    // ---- Arm 6b: the limit is per AXIS ------------------------------------------------------------
+    {
+        // y = 65536 is above the 65535 that devices advertise for y, so it is refused even though
+        // x = 1 is in range.
+        std::vector<ComputeItem> items = {producer({1, 65536, 1, 0}, 0x36560072u),
+                                          consumer(args_base, 0x36560073u)};
+        reset_output(out);
+        const Counters before = counters();
+        const std::vector<bool> ran = run_submit(items);
+        const Counters after = counters();
+        CHECK(ran.size() == 2 && ran[0] && !ran[1] && after.rejected == before.rejected + 1,
+              "y above its own axis limit is refused even though x=1 is within range");
+    }
+    {
+        // x = 70000 is above the portable 65535 but legal on a device whose X limit is larger
+        // (NVIDIA, RADV advertise far more). One shared min-of-axes limit would refuse it. The
+        // property holds on every device: either the launch is refused and NOTHING is written, or
+        // it runs and writes the whole output -- never a partial or silently zeroed success.
+        std::vector<ComputeItem> items = {producer({70000, 1, 1, 0}, 0x36560074u),
+                                          consumer(args_base, 0x36560075u)};
+        reset_output(out);
+        const Counters before = counters();
+        const std::vector<bool> ran = run_submit(items);
+        const Counters after = counters();
+        const bool refused = after.rejected == before.rejected + 1;
+        CHECK(ran.size() == 2 && ran[0] && ran[1] != refused,
+              "an x count between 65535 and the device's x limit is either refused or run, "
+              "and the result says which");
+        CHECK(refused ? output_matches(out, 0, kConsumerPattern)
+                      : output_matches(out, kOutputBytes / 16, kConsumerPattern),
+              refused ? "refused on this device: nothing was written"
+                      : "legal on this device (x limit above 65535): the whole output was written");
+        std::printf("  note: x=70000 was %s on this device\n", refused ? "refused" : "run");
     }
 
     // ---- Arm 7: a range that is not wholly inside a retained buffer is resolved on the host --------

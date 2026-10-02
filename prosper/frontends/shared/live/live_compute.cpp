@@ -3959,6 +3959,15 @@ struct VulkanComputeContext {
             vkBindBufferMemory(device, indirect_scratch, indirect_scratch_memory, 0) !=
                 VK_SUCCESS)
             return false;   // the destructor releases whatever exists
+        // Words 4..6 of the record carry the per-axis device limits for the validation pass.
+        void* mapped = nullptr;
+        if (map_memory(indirect_scratch_memory, 0, IndirectDispatchValidator::kRecordBytes,
+                       &mapped) != VK_SUCCESS)
+            return false;
+        uint32_t record[8] = {};
+        for (uint32_t axis = 0; axis < 3; ++axis) record[4 + axis] = max_compute_workgroup_count[axis];
+        std::memcpy(mapped, record, sizeof(record));
+        unmap_memory(indirect_scratch_memory);
         return indirect_validator.initialize(device, pipeline_cache, indirect_scratch) ==
                VK_SUCCESS;
     }
@@ -12779,7 +12788,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             void* mapped = nullptr;
             if (ctx.map_memory(ctx.indirect_scratch_memory, 0,
                                IndirectDispatchValidator::kRecordBytes, &mapped) == VK_SUCCESS) {
-                uint32_t record[4] = {};
+                uint32_t record[8] = {};
                 std::memcpy(record, mapped, sizeof(record));
                 ctx.unmap_memory(ctx.indirect_scratch_memory);
                 if (record[3]) {
@@ -12789,9 +12798,27 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     if (warned.fetch_add(1) < 24)
                         std::fprintf(stderr,
                                      "[compute] program 0x%llx device-produced indirect counts "
-                                     "exceed workgroup-count limit %u -> dispatch not run\n",
+                                     "exceed the workgroup-count limit %ux%ux%u -> dispatch not "
+                                     "run\n",
                                      static_cast<unsigned long long>(item.code_addr),
-                                     ctx.indirect_group_count_limit());
+                                     record[4], record[5], record[6]);
+                    // Exactly what the host route does for an over-limit count: a refused dispatch,
+                    // not a successful one that happened to launch nothing. Leaving `ok` false skips
+                    // the writeback (no output was produced), invalidates the retained buffers
+                    // instead of trusting them, and makes the caller poison the producer epoch.
+                    report_compute_decline(item, "workgroup-count-limit");
+                    break;
+                } else if (!record[0] || !record[1] || !record[2]) {
+                    // A device-produced zero count launched no wave. The host route treats that as a
+                    // neutral no-op that never reaches writeback; do the same, so a zero-group
+                    // launch neither publishes a write nor invalidates what the cache retained.
+                    // Nothing ran, so every buffer is exactly as it was before the dispatch.
+                    if (trace)
+                        std::fprintf(stderr, "[compute]   indirect groups=%ux%ux%u: no-op\n",
+                                     record[0], record[1], record[2]);
+                    ok = true;
+                    phase_writeback = ComputeClock::now();
+                    break;
                 } else if (trace) {
                     std::fprintf(stderr, "[compute]   indirect groups=%ux%ux%u (device-resolved)\n",
                                  record[0], record[1], record[2]);

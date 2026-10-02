@@ -7,7 +7,7 @@
 //   1. find a retained GPU buffer that is authoritative for those 12 bytes (a persistent compute
 //      buffer, still equal to guest memory by the cache's own journal proof) and pin it;
 //   2. copy the triplet into a small device-side scratch record;
-//   3. run a one-invocation validation pass that zeroes the launch when any count exceeds the
+//   3. run a one-invocation validation pass that zeroes the launch when any count exceeds ITS AXIS's
 //      device limit (vkCmdDispatchIndirect on an out-of-range count is undefined, and a clamped
 //      kernel would silently compute part of its domain);
 //   4. dispatch with vkCmdDispatchIndirect from the scratch record.
@@ -41,7 +41,8 @@ inline IndirectDispatchBackendStats& indirect_dispatch_backend_stats() {
 
 // Owned by the compute context, which destroys it before releasing its device.
 struct IndirectDispatchValidator {
-    static constexpr VkDeviceSize kRecordBytes = 4u * sizeof(uint32_t);   // x, y, z, rejected flag
+    // x, y, z, rejected flag, then maxComputeWorkGroupCount[0..2] (host-written once), one spare.
+    static constexpr VkDeviceSize kRecordBytes = 8u * sizeof(uint32_t);
 
     VkDevice device = VK_NULL_HANDLE;
     VkDescriptorSetLayout descriptors = VK_NULL_HANDLE;
@@ -153,6 +154,8 @@ struct IndirectDispatchValidator {
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set,
                                 0, nullptr);
+        // The shader reads its limits from the record; the push block exists only because the
+        // shared in-place header declares one, and is pushed so the layout is fully populated.
         vkCmdPushConstants(command, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                            sizeof(group_count_limit), &group_count_limit);
         vkCmdDispatch(command, 1, 1, 1);
