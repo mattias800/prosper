@@ -39,6 +39,7 @@
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"     // recompile_compute
+#include "gpu/recompiler/fragment_float_flags.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "host/memory/guest_memory_map.hpp"
 #include "host/memory/guest_memory_query.hpp"
@@ -168,6 +169,7 @@ struct ShaderCompileKey {
     PixelSystemInputMapping system_inputs{};
     bool fragment_wave32 = false;
     FragmentFloatMode fragment_float_mode{};
+    FragmentFloatFlags fragment_float_flags{};
     bool has_pcrel_dispatch = false;
     uint32_t pcrel_dispatch_target = UINT32_MAX;
     // Compute modules also depend on launch ABI shape. User SGPR VALUES are push constants and stay
@@ -230,6 +232,7 @@ struct ShaderCompileKey {
                system_inputs == other.system_inputs &&
                fragment_wave32 == other.fragment_wave32 &&
                fragment_float_mode == other.fragment_float_mode &&
+               fragment_float_flags == other.fragment_float_flags &&
                has_pcrel_dispatch == other.has_pcrel_dispatch &&
                pcrel_dispatch_target == other.pcrel_dispatch_target &&
                has_compute_config == other.has_compute_config &&
@@ -317,6 +320,9 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, key.fragment_wave32);
         hash = hash_mix(hash, key.fragment_float_mode.available);
         hash = hash_mix(hash, key.fragment_float_mode.value);
+        hash = hash_mix(hash, key.fragment_float_flags.available);
+        hash = hash_mix(hash, key.fragment_float_flags.ieee_mode);
+        hash = hash_mix(hash, key.fragment_float_flags.dx10_clamp);
         hash = hash_mix(hash, key.has_pcrel_dispatch);
         if (key.has_pcrel_dispatch) hash = hash_mix(hash, key.pcrel_dispatch_target);
         hash = hash_mix(hash, key.has_compute_config);

@@ -2390,6 +2390,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_cached_shader_moves PRIVATE prosper_core)
   add_test(NAME cached_shader_moves COMMAND test_cached_shader_moves)
 
+  add_executable(test_fragment_float_flags_key tests/gpu/execute/test_fragment_float_flags_key.cpp)
+  target_link_libraries(test_fragment_float_flags_key PRIVATE prosper_core)
+  add_test(NAME fragment_float_flags_key COMMAND test_fragment_float_flags_key)
+  add_test(NAME fragment_float_flags_key_legacy_hash COMMAND test_fragment_float_flags_key)
+  set_tests_properties(fragment_float_flags_key_legacy_hash PROPERTIES
+    ENVIRONMENT "PROSPER_NO_SHADER_KEY_WORD_HASH=1")
+
   add_executable(test_shader_recompile_cache tests/gpu/execute/test_shader_recompile_cache.cpp)
   add_executable(fragment_compile_replay tools/fragment_compile_replay/main.cpp)
   target_link_libraries(fragment_compile_replay PRIVATE prosper_core)
