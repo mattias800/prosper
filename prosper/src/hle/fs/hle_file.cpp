@@ -1134,9 +1134,11 @@ HLE(f_fseek) {
 #else
     const int rc = fseek((FILE*)P(a0), (long)a1, (int)a2);
 #endif
+    const int error = rc != 0 ? errno : 0;
     if (rc != 0 && filelog())
         fprintf(stderr, "[file] fseek FAILED file=%p offset=0x%llx whence=%d errno=%d\n",
-                P(a0), (unsigned long long)a1, (int)a2, errno);
+                P(a0), (unsigned long long)a1, (int)a2, error);
+    if (rc != 0) errno = error;
     return (uint64_t)(int64_t)rc;
 }
 HLE(f_ftell) {

@@ -1135,6 +1135,7 @@ if(TARGET prosper_core)
   target_link_libraries(test_large_offset_seek PRIVATE prosper_core)
   target_include_directories(test_large_offset_seek PRIVATE src)
   add_test(NAME large_offset_seek COMMAND test_large_offset_seek)
+  set_tests_properties(large_offset_seek PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 
   # Empty PollSema returns the encoded EBUSY value that guest drain loops require (#1640).
   add_executable(test_kernel_sema_poll tests/hle/kernel/test_kernel_sema_poll.cpp)
