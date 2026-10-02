@@ -1129,6 +1129,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_sync_delete PRIVATE prosper_core)
   add_test(NAME sync_delete COMMAND test_sync_delete)
 
+  # The APR submit's result out-parameters are uint32_t*; an 8-byte store overran into the guest's
+  # stack canary and killed the title with __stack_chk_fail (#4138).
+  add_executable(test_apr_result_slot_width tests/hle/kernel/test_apr_result_slot_width.cpp)
+  target_link_libraries(test_apr_result_slot_width PRIVATE prosper_core)
+  target_include_directories(test_apr_result_slot_width PRIVATE src)
+  add_test(NAME apr_result_slot_width COMMAND test_apr_result_slot_width)
+
   # Empty PollSema returns the encoded EBUSY value that guest drain loops require (#1640).
   add_executable(test_kernel_sema_poll tests/hle/kernel/test_kernel_sema_poll.cpp)
   target_link_libraries(test_kernel_sema_poll PRIVATE prosper_core)
