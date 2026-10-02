@@ -1,0 +1,75 @@
+# Secret scan. Runs gitleaks (config: .github/gitleaks.toml) over the commits a change adds.
+#
+#   pull_request  every commit in base..head
+#   push to main  every commit in before..after (whole history if `before` is the zero SHA)
+#   schedule      the full history, weekly, so a rule added later also reads old commits
+#
+# gitleaks is downloaded as a release binary and checked against a pinned sha256 instead of using
+# gitleaks-action, which has its own licence terms for organisation repositories. No secret or
+# token is needed; the job is read-only. To bump: change GITLEAKS_VERSION and GITLEAKS_SHA256 from
+# the release's checksums file. Local run and allowlist rules: prosper/tools/ci/AGENTS.md.
+
+name: Gitleaks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  scan:
+    name: Gitleaks secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+      GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/gitleaks.tgz" "$url"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+
+      - name: Scan
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          range=""
+          case "$EVENT" in
+            pull_request) range="${PR_BASE}..${PR_HEAD}" ;;
+            push)
+              if [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+                range="${PUSH_BEFORE}..${PUSH_AFTER}"
+              fi ;;
+          esac
+          echo "scan range: ${range:-<full history>}"
+          # --redact: a real finding must not be printed into a public log.
+          # --exit-code 1 is the default; spelled out because a non-zero here is the whole point.
+          args=(git . --config .github/gitleaks.toml --redact --no-banner --exit-code 1)
+          if [ -n "$range" ]; then args+=(--log-opts "$range"); fi
+          "$RUNNER_TEMP/gitleaks" "${args[@]}"
