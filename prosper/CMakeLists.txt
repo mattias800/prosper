@@ -4343,11 +4343,6 @@ endif()
                             PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME backend_persistent_resource_lock
                COMMAND test_backend_persistent_resource_lock)
-      # RUN_SERIAL: its non-vacuity arms REQUIRE the guarded threads to overlap, and under a
-      # parallel ctest (CI runs `-j4`) three neighbouring tests can starve them into running one
-      # after another -- "guarded threads really contended" then fails with no defect present
-      # (first `-j4` CI run, #4116). Alone, the contention it measures is its own.
-      set_tests_properties(backend_persistent_resource_lock PROPERTIES RUN_SERIAL TRUE)
 
       # #2944: every GPU readback in the render backend is host-read after a fence wait, and a fence
       # orders execution rather than performing the availability operation into the host domain.
