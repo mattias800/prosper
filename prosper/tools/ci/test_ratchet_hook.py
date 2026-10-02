@@ -68,28 +68,40 @@ class Verdicts(unittest.TestCase):
         self.git("update-ref", "refs/remotes/origin/main", "HEAD")
         self.checker = Path(self.tmp, hook.CHECKER)
         self.argv_log = Path(self.tmp, "checker_argv.json")
+        # The hook trusts only the project's own origin/main; the throwaway repo IS the project.
+        self._old_project = os.environ.get("CLAUDE_PROJECT_DIR")
+        os.environ["CLAUDE_PROJECT_DIR"] = self.tmp
 
     def tearDown(self):
+        if self._old_project is None:
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        else:
+            os.environ["CLAUDE_PROJECT_DIR"] = self._old_project
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def git(self, *args):
         cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args]
         subprocess.run(cmd, cwd=self.tmp, check=True, capture_output=True)
 
-    def install_checker(self, status, output="checker said so\n"):
-        self.checker.parent.mkdir(parents=True, exist_ok=True)
-        self.checker.write_text(
-            textwrap.dedent(
-                f"""\
-                import json, sys
-                assert "--root" in sys.argv, sys.argv
-                with open({str(self.argv_log)!r}, "w") as f:
-                    json.dump(sys.argv[1:], f)
-                sys.stdout.write({output!r})
-                sys.exit({status})
-                """
-            )
+    def stand_in(self, status, output, log):
+        return textwrap.dedent(
+            f"""\
+            import json, sys
+            assert "--root" in sys.argv, sys.argv
+            with open({str(log)!r}, "w") as f:
+                json.dump(sys.argv[1:], f)
+            sys.stdout.write({output!r})
+            sys.exit({status})
+            """
         )
+
+    def install_checker(self, status, output="checker said so\n"):
+        """Commit a stand-in checker and point origin/main at it: the only copy the hook runs."""
+        self.checker.parent.mkdir(parents=True, exist_ok=True)
+        self.checker.write_text(self.stand_in(status, output, self.argv_log))
+        self.git("add", hook.CHECKER)
+        self.git("commit", "-q", "-m", "checker")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
 
     def checker_argv(self):
         if not self.argv_log.exists():
@@ -161,6 +173,46 @@ class Verdicts(unittest.TestCase):
         _status, out, err = self.run_hook("git commit -m x")
         self.assertLess(len(json.loads(out)["systemMessage"]), hook.SYSTEM_MESSAGE_LIMIT + 100)
         self.assertIn("truncated", err)
+
+    def test_a_working_tree_checker_is_never_executed(self):
+        # A PR branch or a dirty tree may carry its own check_arch_ratchet.py; the hook runs before
+        # the permission prompt, so only the copy reviewed onto origin/main may execute.
+        self.install_checker(0)
+        planted = Path(self.tmp, "planted.json")
+        self.checker.write_text(self.stand_in(0, "", planted))
+        self.run_hook("git commit -m x")
+        self.assertFalse(planted.exists(), "the working-tree checker was executed")
+        self.assertIsNotNone(self.checker_argv(), "the origin/main checker did not run")
+
+    def test_another_repository_runs_nothing(self):
+        # A scratch clone of a contributor's branch has its own origin/main and its own checker.
+        other = tempfile.mkdtemp(prefix="ratchet_other_")
+        self.addCleanup(shutil.rmtree, other, ignore_errors=True)
+        marker = Path(other, "ran.json")
+
+        def git(*args):
+            cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args]
+            subprocess.run(cmd, cwd=other, check=True, capture_output=True)
+
+        git("init", "-q")
+        Path(other, hook.CHECKER).parent.mkdir(parents=True)
+        Path(other, hook.CHECKER).write_text(self.stand_in(0, "", marker))
+        git("add", hook.CHECKER)
+        git("commit", "-q", "-m", "foreign checker")
+        git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.install_checker(0)
+        status, out, _ = self.run_hook(f"git -C {other} push")
+        self.assertEqual(0, status)
+        self.assertIn("not this project's repository", json.loads(out)["systemMessage"])
+        self.assertFalse(marker.exists(), "a foreign repository's checker was executed")
+
+    def test_no_project_dir_runs_nothing(self):
+        self.install_checker(0)
+        os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        status, out, _ = self.run_hook("git commit -m x")
+        self.assertEqual(0, status)
+        self.assertIn("CLAUDE_PROJECT_DIR", json.loads(out)["systemMessage"])
+        self.assertIsNone(self.checker_argv())
 
     def test_could_not_evaluate_fails_open(self):
         self.install_checker(2)

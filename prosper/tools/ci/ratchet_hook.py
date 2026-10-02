@@ -50,8 +50,16 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 
 CHECKER = os.path.join("prosper", "tools", "ci", "check_arch_ratchet.py")
+BASELINE = os.path.join("prosper", "tools", "ci", "arch_ratchet_baseline.txt")
+# The ONLY checker code this hook executes: the reviewed copy on the project's own origin/main, read
+# from the project repository's object store. Never the copy in the checkout a command names -- that
+# may be a contributor's PR branch or an unrelated clone, and this hook runs before the permission
+# prompt, so executing a file from it would run unreviewed code with no prompt.
+TRUSTED_CHECKER_REF = "origin/main:prosper/tools/ci/check_arch_ratchet.py"
+GIT_TIMEOUT_S = 5
 CHECKER_TIMEOUT_S = 45
 BASE_REF = "origin/main"
 # The rollout switch. False: a violation is a warning (exit 0 + systemMessage). True: it blocks
@@ -141,7 +149,7 @@ def repo_root(start):
             ["git", "-C", start, "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=GIT_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -163,32 +171,74 @@ def has_base(root, ref=BASE_REF):
             ["git", "-C", root, "rev-parse", "--verify", "--quiet", ref + "^{commit}"],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=GIT_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError):
         return False
     return out.returncode == 0
 
 
-def run_checker(root, timeout_s=CHECKER_TIMEOUT_S):
+def _git_out(path, *args):
+    """stdout of `git -C path <args>`, or None."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", path, *args], capture_output=True, text=True, timeout=GIT_TIMEOUT_S
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def common_dir(path):
+    """The shared .git directory of the checkout at `path` (equal across its worktrees), or None."""
+    out = _git_out(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return os.path.realpath(out.strip()) if out and out.strip() else None
+
+
+def trusted_checker_source(project):
+    """The reviewed checker as merged on the project's origin/main, or None."""
+    return _git_out(project, "show", TRUSTED_CHECKER_REF)
+
+
+def run_checker(root, project, timeout_s=CHECKER_TIMEOUT_S):
     """Return (status, output) from the checker, or (None, reason) when it could not run."""
-    checker = os.path.join(root, CHECKER)
-    if not os.path.isfile(checker):
-        return None, f"{CHECKER} is not in this checkout (the ratchet has not landed here)"
+    if not project:
+        return None, "CLAUDE_PROJECT_DIR is not set, so there is no trusted checker to run"
+    project_git, root_git = common_dir(project), common_dir(root)
+    if project_git is None or root_git != project_git:
+        return None, "the command targets a checkout that is not this project's repository"
+    source = trusted_checker_source(project)
+    if source is None:
+        return None, f"{CHECKER} is not on origin/main yet (the ratchet has not landed)"
     if not has_base(root):
         return None, f"{BASE_REF} is not available here, so there is no merge base to judge against"
-    try:
-        proc = subprocess.run(
-            [sys.executable, checker, "--root", root, "--base", BASE_REF],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-        )
-    except subprocess.TimeoutExpired:
-        return None, f"the checker did not finish within {timeout_s} s"
-    except OSError as error:
-        return None, f"the checker could not be started ({error})"
+    # The checker locates its defaults from __file__, so it runs from a private temporary copy;
+    # --root and --baseline point it at the target tree, whose baseline is data, not code.
+    with tempfile.TemporaryDirectory(prefix="ratchet-hook-") as tmp:
+        script = os.path.join(tmp, "check_arch_ratchet.py")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(source)
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    script,
+                    "--root",
+                    root,
+                    "--base",
+                    BASE_REF,
+                    "--baseline",
+                    os.path.join(root, BASELINE),
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            return None, f"the checker did not finish within {timeout_s} s"
+        except OSError as error:
+            return None, f"the checker could not be started ({error})"
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
@@ -215,7 +265,7 @@ def main(stdin_text):
     if root is None:
         return unverified(f"could not find the git checkout for `git {subcommand}`")
 
-    status, output = run_checker(root)
+    status, output = run_checker(root, os.environ.get("CLAUDE_PROJECT_DIR"))
     if status is None:
         return unverified(output)
     if status == 0:

@@ -1,6 +1,6 @@
 ---
 name: perf-change
-description: Make, measure and land a prosper performance change - a default-off switch, a same-binary A/B on reference workloads, and a recorded verdict either way.
+description: Make, measure and land a prosper performance change - a switch for the A/B, a same-binary A/B on reference workloads, and a recorded verdict either way.
 ---
 
 # Make a performance change
@@ -13,7 +13,7 @@ task and `prosper/docs/GAME_COMPAT_ORCHESTRATION.md` for those.
    FPS-harness warnings; `prosper/src/diagnostics/AGENTS.md` for the `[perf-alarm]` lines; the
    `## Ruled out` section of the status doc for each workload below. Name the invariant the change
    moves toward, or say that it moves none.
-2. **Make the change switchable, default off.** One `PROSPER_*` switch selects the new path, so the
+2. **Make the change switchable for the A/B (on by default once the A/B shows the win).** One `PROSPER_*` switch selects the new path, so the
    same binary runs both arms and the control arm is the change disabled. Classify it in the PR (a
    selector needs an issue that will delete it). Cache-off controls must leave results identical.
 3. **Reference workloads** — one change is measured on all three, not on the title it was written

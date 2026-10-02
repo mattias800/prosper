@@ -332,7 +332,8 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     `tests/fixtures/render_runner.h:2986` → `vkWaitForFences` in `wait_and_finish()`, `:3076`;
     staged fix #3948), and a resident-buffer hit is re-validated by a full `memcmp` (`:5462`) once
     write-watch disables itself after two dirty queries (`:5407`, #3155).
-  - **Title ids** appear in shared code only in comments naming the evidence, never in a condition.
+  - **Title ids** never appear in a condition in shared code; naming the evidence in a comment is fine,
+    and tests may use them as fixture data.
     Behaviour one title needs is a general rule the evidence supports, or isolated code with its
     measurement (`src/gpu/recompiler/gta5/`).
   - **Switches:** classify every new `PROSPER_*` in its PR as a *host-capability* switch (what this
