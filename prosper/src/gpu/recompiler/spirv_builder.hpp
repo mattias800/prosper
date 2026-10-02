@@ -52,6 +52,14 @@ std::vector<uint32_t> build_compute_depth_to_rgba8();
 // Binding 0: storage buffer of uint32 texels; push constant: texel count.
 std::vector<uint32_t> build_compute_rgba8_to_packed10();
 
+// #3656: bound a device-produced vkCmdDispatchIndirect argument record before the dispatch reads it.
+// Binding 0: storage buffer of at least seven uint32 words -- x, y, z group counts, an output flag,
+// then the per-axis limits (maxComputeWorkGroupCount[0..2]) in words 4..6. If any count exceeds its
+// own axis limit, all three become zero and word 3 is 1; otherwise word 3 is 0 and the counts are
+// untouched. The push-constant block the shared in-place header declares is unused. Dispatch
+// exactly one group; local size 128, only invocation 0 acts.
+std::vector<uint32_t> build_compute_indirect_dispatch_validate();
+
 // Exact row-major words (binding 0) -> 2D 64 KiB or standard 3D guest tiles (binding 1).
 // Push words: width, height, log2(words/texel), log2(block width), log2(block height),
 // blocks/row, then 16 packed x/y (or x/y/z) equation masks. Volume words 22..25:

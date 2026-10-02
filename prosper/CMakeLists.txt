@@ -3401,6 +3401,21 @@ endif()
       add_executable(test_game_compute_rtt_mirror tests/gpu/recompiler/test_game_compute_rtt_mirror.cpp)
       target_include_directories(test_game_compute_rtt_mirror PRIVATE tests frontends)
       target_link_libraries(test_game_compute_rtt_mirror PRIVATE prosper_live_renderer)
+      # #3656: executor half of device-resolved indirect dispatch (recording backend, no Vulkan work).
+      add_executable(test_indirect_dispatch_device_route
+                     tests/gpu/execute/test_indirect_dispatch_device_route.cpp)
+      target_link_libraries(test_indirect_dispatch_device_route PRIVATE prosper_core)
+      add_test(NAME indirect_dispatch_device_route COMMAND test_indirect_dispatch_device_route)
+      # #3656: the Vulkan half -- the production backend consuming a device-resolved dispatch with
+      # vkCmdDispatchIndirect from a retained buffer. Registered for native Windows because its
+      # discriminating arm (a stale guest triplet) is driver-sensitive.
+      add_executable(test_live_compute_indirect_dispatch
+                     tests/gpu/execute/test_live_compute_indirect_dispatch.cpp)
+      target_include_directories(test_live_compute_indirect_dispatch PRIVATE tests frontends)
+      target_link_libraries(test_live_compute_indirect_dispatch PRIVATE prosper_live_renderer)
+      add_test(NAME live_compute_indirect_dispatch COMMAND test_live_compute_indirect_dispatch)
+      set_tests_properties(live_compute_indirect_dispatch PROPERTIES TIMEOUT 120)
+
       add_test(NAME game_compute_exec COMMAND test_game_compute)
       add_test(NAME game_compute_rtt_destination_mirror COMMAND test_game_compute_rtt_mirror)
       add_test(NAME game_compute_rtt_destination_mirror_no_direct_retile
@@ -4095,6 +4110,20 @@ endif()
       target_link_libraries(test_live_compute_host_read_barrier PRIVATE prosper_live_renderer)
       add_test(NAME live_compute_host_read_barrier
                COMMAND test_live_compute_host_read_barrier)
+
+      # #3656: device-resolved indirect dispatch -- the executor half (recording backend) and the
+      # Vulkan half (the production backend consuming the argument address with
+      # vkCmdDispatchIndirect). The Windows block above registers the same two sources.
+      add_executable(test_indirect_dispatch_device_route
+                     tests/gpu/execute/test_indirect_dispatch_device_route.cpp)
+      target_link_libraries(test_indirect_dispatch_device_route PRIVATE prosper_core)
+      add_test(NAME indirect_dispatch_device_route COMMAND test_indirect_dispatch_device_route)
+      add_executable(test_live_compute_indirect_dispatch
+                     tests/gpu/execute/test_live_compute_indirect_dispatch.cpp)
+      target_include_directories(test_live_compute_indirect_dispatch PRIVATE tests frontends)
+      target_link_libraries(test_live_compute_indirect_dispatch PRIVATE prosper_live_renderer)
+      add_test(NAME live_compute_indirect_dispatch COMMAND test_live_compute_indirect_dispatch)
+      set_tests_properties(live_compute_indirect_dispatch PROPERTIES TIMEOUT 120)
 
       # Prove our own SPIR-V emitter produces valid, correct, runnable SPIR-V (execution-differential).
       add_executable(test_spirv_builder tests/gpu/recompiler/test_spirv_builder.cpp)

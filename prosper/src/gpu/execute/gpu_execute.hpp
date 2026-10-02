@@ -543,6 +543,12 @@ struct ComputeItem {
     // `indirect` cleared before it reaches this item. F8 uses this provenance to label a launch
     // shape as direct or resolved-indirect without re-reading mutable guest argument memory.
     bool indirect_dispatch = false;
+    // #3656: non-zero when the DEVICE reads the workgroup counts from the 12-byte triplet at this
+    // guest address (vkCmdDispatchIndirect) instead of the executor copying them on the CPU.
+    // `launch.groups_*` and `launch.threads_*` are then ZERO, meaning "unknown at realization", and
+    // every launch-dependent proof was refused for this item (see gpu_indirect_dispatch_launch_free).
+    // Only the group-count form is admitted, so the thread extent is always groups * local size.
+    uint64_t indirect_args_addr = 0;
     uint64_t code_addr = 0;
     uint64_t dispatch_index = 0;
     uint64_t submit_no = 0;
@@ -1219,6 +1225,29 @@ bool guest_gpu_write_tracking_active();
 // comment described a whole-submit realizer, which #3157's design then proposed to pipeline -- into
 // one fence per batch, over batches of one. The function it named had no caller and is gone.
 void set_submit_compute(LiveComputeFn fn);
+// #3656: a backend that can consume ComputeItem::indirect_args_addr declares it here. Defaults to
+// false, so a backend (or a test double) that only understands resolved launch dimensions keeps
+// receiving them. set_submit_compute() itself resets the declaration.
+void set_submit_compute_indirect_dispatch(bool supported);
+bool submit_compute_supports_indirect_dispatch();
+
+// Outcome counters for indirect dispatches, observable without a log. `device_resolved` dispatches
+// reached the backend with their counts unread; `cpu_resolved` ran through the ordered CPU copy.
+struct IndirectDispatchStats {
+    uint64_t device_resolved = 0;
+    uint64_t cpu_resolved = 0;
+    uint64_t device_refused_launch_dependent = 0;
+};
+IndirectDispatchStats indirect_dispatch_stats();
+
+// #3656: the two refusals applied to a device-resolved dispatch AFTER it was realized with an unknown
+// launch. Public so a test can hand-build an item and prove each token refuses, instead of needing a
+// guest program that happens to trigger it.
+//  * launch_free: nothing the realization produced is a proof or fast path that is only true for one
+//    thread extent. A new launch-dependent token on ComputeItem must be added here.
+//  * args_alias_resource: some bound resource also covers the 12-byte argument range.
+bool gpu_indirect_dispatch_launch_free(const ComputeItem& item);
+bool gpu_indirect_dispatch_args_alias_resource(const ComputeItem& item);
 bool have_submit_compute();
 
 // Live render-target query (#590): the compute backend must not read a sampled input from raw guest

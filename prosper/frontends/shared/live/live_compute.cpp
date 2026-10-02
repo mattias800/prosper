@@ -16,6 +16,7 @@
 #include "shared/live/cpu_rtt_snapshot_pool.hpp"
 #include "shared/live/live_target_format.hpp"
 #include "shared/live/packed_rtt_conversion.hpp"
+#include "shared/live/indirect_dispatch.hpp"   // #3656
 #include "shared/live/gpu_retile.hpp"
 #include "shared/present/compute_scanout.hpp"   // #3915: GPU-present mirror of a compute-written display buffer
 #include "shared/rtt/rtt_scale.hpp"
@@ -481,6 +482,7 @@ std::atomic<bool> g_fail_next_storage_readback_for_test{false};
 std::function<void(uint32_t, const uint8_t*, size_t)> g_image_readback_observer_for_test;
 std::function<void()> g_before_image_publish_observer_for_test;
 std::atomic<bool> g_fail_next_buffer_readback_for_test{false};
+std::atomic<bool> g_fail_next_indirect_readback_for_test{false};
 std::atomic<bool> g_leave_next_dcc_metadata_compressed_for_test{false};
 std::atomic<bool> g_disable_next_dcc_allocation_reuse_for_test{false};
 std::atomic<bool> g_limit_next_image_replacement_for_test{false};
@@ -1781,6 +1783,11 @@ struct VulkanComputeContext {
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline compare_pipeline = VK_NULL_HANDLE;
     PackedRttConversion packed_rtt_conversion;
+    // #3656: device-side bounding of a device-resolved indirect dispatch's argument record.
+    IndirectDispatchValidator indirect_validator;
+    VkBuffer indirect_scratch = VK_NULL_HANDLE;
+    VkDeviceMemory indirect_scratch_memory = VK_NULL_HANDLE;
+    bool indirect_scratch_attempted = false;
     GpuRetilePipeline retile_pipeline, volume_retile_pipeline, packed_retile_pipeline;
     GpuRetilePipeline compare_retile_pipeline;
     std::array<GpuRetilePipeline, 4> compare_image_retile_pipelines;
@@ -1915,6 +1922,9 @@ struct VulkanComputeContext {
     }
 
     ~VulkanComputeContext() {
+        indirect_validator.destroy();
+        if (indirect_scratch) vkDestroyBuffer(device, indirect_scratch, nullptr);
+        if (indirect_scratch_memory) release_memory(indirect_scratch_memory);
         release_cached_buffers();
         release_cached_images();
         release_cached_memory();
@@ -3924,6 +3934,80 @@ struct VulkanComputeContext {
                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         return prosper::gpu::select_memory_type(memory, bits, wanted,
                                                 VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    }
+
+    // #3656. Lazily builds the scratch argument record and the validation pass. False means the
+    // device-resolved route is unavailable on this context and every such dispatch is resolved on
+    // the host instead; the attempt is made once.
+    bool prepare_indirect_dispatch() {
+        if (indirect_validator.ready()) return true;
+        if (indirect_scratch_attempted) return false;
+        indirect_scratch_attempted = true;
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = IndirectDispatchValidator::kRecordBytes;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (vkCreateBuffer(device, &bci, nullptr, &indirect_scratch) != VK_SUCCESS) {
+            indirect_scratch = VK_NULL_HANDLE;
+            return false;
+        }
+        VkMemoryRequirements requirements{};
+        vkGetBufferMemoryRequirements(device, indirect_scratch, &requirements);
+        const uint32_t memory_type = host_memory_type(requirements.memoryTypeBits);
+        if (memory_type != UINT32_MAX)
+            indirect_scratch_memory = allocate_memory(requirements.size, memory_type, true);
+        if (!indirect_scratch_memory ||
+            vkBindBufferMemory(device, indirect_scratch, indirect_scratch_memory, 0) !=
+                VK_SUCCESS)
+            return false;   // the destructor releases whatever exists
+        // Words 4..6 of the record carry the per-axis device limits for the validation pass.
+        void* mapped = nullptr;
+        if (map_memory(indirect_scratch_memory, 0, IndirectDispatchValidator::kRecordBytes,
+                       &mapped) != VK_SUCCESS)
+            return false;
+        uint32_t record[8] = {};
+        for (uint32_t axis = 0; axis < 3; ++axis) record[4 + axis] = max_compute_workgroup_count[axis];
+        std::memcpy(mapped, record, sizeof(record));
+        unmap_memory(indirect_scratch_memory);
+        return indirect_validator.initialize(device, pipeline_cache, indirect_scratch) ==
+               VK_SUCCESS;
+    }
+
+    uint32_t indirect_group_count_limit() const {
+        return std::min({max_compute_workgroup_count[0], max_compute_workgroup_count[1],
+                         max_compute_workgroup_count[2]});
+    }
+
+    // #3656: pin a retained persistent buffer that is AUTHORITATIVE for `bytes` at `address`:
+    // exact identity materialization of guest memory (not a replay/owned copy), content valid, the
+    // range lies wholly inside it at a 4-byte offset, and the cache's own write journal proves
+    // nothing has written the range since the buffer was last made equal to guest memory. That is
+    // the same proof the cache accepts to skip an upload, so a pinned buffer cannot be older than
+    // what the CPU copy would have read. Anything weaker -- no containing buffer, a replay-owned
+    // buffer, a stale journal -- is a refusal, never a guess. The pin keeps the entry from being
+    // evicted until release_cached_buffer(key); nothing here allocates, uploads or evicts, so it
+    // cannot invalidate a descriptor chosen earlier.
+    bool pin_authoritative_indirect_arguments(uint64_t address, uint64_t bytes,
+                                              ComputeBufferCacheKey& pinned_key,
+                                              VkBuffer& buffer, VkDeviceSize& offset) {
+        for (auto& [key, cached] : buffer_cache) {
+            if (key.host_data || !cached.buffer || !cached.content_valid ||
+                key.materialization.semantic != prosper::gpu::StorageBufferTailSemantic::None)
+                continue;
+            if (address < key.gpu_addr) continue;
+            const uint64_t relative = address - key.gpu_addr;
+            if ((relative & 3u) || relative > key.bytes || key.bytes - relative < bytes) continue;
+            if (prosper::gpu::guest_gpu_writes_since(cached.validation_snapshot, address, bytes) !=
+                prosper::gpu::GuestGpuWriteQuery::Unchanged)
+                continue;
+            ++cached.pins;
+            cached.last_use = ++buffer_cache_clock;
+            pinned_key = key;
+            buffer = cached.buffer;
+            offset = relative;
+            return true;
+        }
+        return false;
     }
 
 };
@@ -6594,6 +6678,61 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         report_compute_decline(item, reason);
         return false;
     };
+    // #3656: a dispatch whose workgroup counts are produced on the device. Either the argument range
+    // is covered by an authoritative retained GPU buffer (device route: the counts are never read on
+    // the CPU) or the host resolves the triplet exactly as the executor used to and dispatches
+    // directly. The pin is released on every exit, including the early declines further down.
+    struct IndirectArgumentPin {
+        VulkanComputeContext& ctx;
+        ComputeBufferCacheKey key{};
+        bool held = false;
+        ~IndirectArgumentPin() { if (held) ctx.release_cached_buffer(key); }
+    } indirect_pin{ctx};
+    VkBuffer indirect_args_buffer = VK_NULL_HANDLE;
+    VkDeviceSize indirect_args_offset = 0;
+    bool device_indirect = false;
+    if (item.indirect_args_addr) {
+        constexpr uint64_t kArgumentBytes = 3u * sizeof(uint32_t);
+        // The executor already refused an aliasing table; a replayed or hand-built item has not been
+        // through it, so the backend states the same condition for itself. A dispatch that could
+        // rewrite its own counts, or whose range is image-backed, takes the host route.
+        const bool aliases_resource = item.resources &&
+            !prosper::gpu::compute_address_window_hits(
+                *item.resources, item.indirect_args_addr, kArgumentBytes).empty();
+        if (!aliases_resource && ctx.prepare_indirect_dispatch() &&
+            ctx.pin_authoritative_indirect_arguments(item.indirect_args_addr, kArgumentBytes,
+                                                     indirect_pin.key, indirect_args_buffer,
+                                                     indirect_args_offset)) {
+            indirect_pin.held = true;
+            device_indirect = true;
+        }
+        if (!device_indirect) {
+            prosper::frontend::indirect_dispatch_backend_stats().host_fallbacks.fetch_add(
+                1, std::memory_order_relaxed);
+            if (!prosper::gpu::guest_readable(item.indirect_args_addr,
+                                              static_cast<uint32_t>(kArgumentBytes)) ||
+                (item.indirect_args_addr & 3u))
+                return decline("indirect-arguments-unreadable");
+            uint32_t counts[3] = {};
+            std::memcpy(counts, reinterpret_cast<const void*>(
+                                    static_cast<uintptr_t>(item.indirect_args_addr)),
+                        sizeof(counts));
+            if (!counts[0] || !counts[1] || !counts[2]) return true;   // zero groups: hardware no-op
+            prosper::gpu::ComputeItem resolved = item;
+            resolved.indirect_args_addr = 0;
+            resolved.launch.groups_x = counts[0];
+            resolved.launch.groups_y = counts[1];
+            resolved.launch.groups_z = counts[2];
+            const auto extent = [](uint32_t groups, uint32_t local) {
+                return static_cast<uint32_t>(std::min<uint64_t>(
+                    static_cast<uint64_t>(groups) * local, UINT32_MAX));
+            };
+            resolved.launch.threads_x = extent(counts[0], resolved.launch.local_x);
+            resolved.launch.threads_y = extent(counts[1], resolved.launch.local_y);
+            resolved.launch.threads_z = extent(counts[2], resolved.launch.local_z);
+            return execute_item(ctx, resolved, known_fill);
+        }
+    }
     // Phase markers are set in order as execute_item() passes each boundary. A `break` out of the
     // do/while below leaves every later marker UNSET, so they are optional rather than defaulted to
     // phase_start: a defaulted marker made the interval spanning the break negative and booked the
@@ -6775,7 +6914,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     }
     const uint32_t dispatch_groups[3] = {
         item.launch.groups_x, item.launch.groups_y, item.launch.groups_z};
-    for (uint32_t axis = 0; axis < 3; ++axis) {
+    for (uint32_t axis = 0; axis < 3 && !device_indirect; ++axis) {   // #3656: bounded on the device
         if (dispatch_groups[axis] &&
             dispatch_groups[axis] <= ctx.max_compute_workgroup_count[axis])
             continue;
@@ -12110,6 +12249,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
                                  1, &to_general);
         }
+        // #3656: copy the device-produced counts into the scratch record and bound them before the
+        // shader's own pipeline, descriptor set and push constants are bound below.
+        if (device_indirect)
+            ctx.indirect_validator.record(command, indirect_args_buffer, indirect_args_offset,
+                                          ctx.indirect_scratch, ctx.indirect_group_count_limit());
         if (perf_gpu_timing) {
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                 ctx.dispatch_timestamp_pool, 1);
@@ -12124,7 +12268,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (const auto& buffer : buffers)
             if (buffer.alias_of == SIZE_MAX && buffer.persistent && buffer.writable)
                 ctx.forget_cached_buffer_fill(buffer.cache_key);
-        vkCmdDispatch(command, item.launch.groups_x, item.launch.groups_y, item.launch.groups_z);
+        if (device_indirect) {
+            vkCmdDispatchIndirect(command, ctx.indirect_scratch, 0);
+            prosper::frontend::indirect_dispatch_backend_stats().device_dispatches.fetch_add(
+                1, std::memory_order_relaxed);
+        } else {
+            vkCmdDispatch(command, item.launch.groups_x, item.launch.groups_y,
+                          item.launch.groups_z);
+        }
         if (perf_gpu_timing)
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                 ctx.dispatch_timestamp_pool, 2);
@@ -12631,6 +12782,57 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             break;
         }
         completion_proven = true;
+        // #3656: the completed scratch result decides refusal/no-op/writeback, not just diagnostics.
+        // Failure to read it cannot authorize publication or reconstruct an already-issued launch
+        // from mutable guest arguments. Completion stays proven, but failure cleanup must invalidate
+        // retained output authority and the caller must poison the producer epoch.
+        if (device_indirect) {
+            void* mapped = nullptr;
+            const VkResult readback_result =
+                g_fail_next_indirect_readback_for_test.exchange(false, std::memory_order_acq_rel)
+                    ? VK_ERROR_MEMORY_MAP_FAILED
+                    : ctx.map_memory(ctx.indirect_scratch_memory, 0,
+                                     IndirectDispatchValidator::kRecordBytes, &mapped);
+            if (vk_ok(readback_result, "indirect-argument-readback")) {
+                uint32_t record[8] = {};
+                std::memcpy(record, mapped, sizeof(record));
+                ctx.unmap_memory(ctx.indirect_scratch_memory);
+                if (record[3]) {
+                    prosper::frontend::indirect_dispatch_backend_stats().rejected.fetch_add(
+                        1, std::memory_order_relaxed);
+                    static std::atomic<int> warned{0};
+                    if (warned.fetch_add(1) < 24)
+                        std::fprintf(stderr,
+                                     "[compute] program 0x%llx device-produced indirect counts "
+                                     "exceed the workgroup-count limit %ux%ux%u -> dispatch not "
+                                     "run\n",
+                                     static_cast<unsigned long long>(item.code_addr),
+                                     record[4], record[5], record[6]);
+                    // Exactly what the host route does for an over-limit count: a refused dispatch,
+                    // not a successful one that happened to launch nothing. Leaving `ok` false skips
+                    // the writeback (no output was produced), invalidates the retained buffers
+                    // instead of trusting them, and makes the caller poison the producer epoch.
+                    report_compute_decline(item, "workgroup-count-limit");
+                    break;
+                } else if (!record[0] || !record[1] || !record[2]) {
+                    // A device-produced zero count launched no wave. The host route treats that as a
+                    // neutral no-op that never reaches writeback; do the same, so a zero-group
+                    // launch neither publishes a write nor invalidates what the cache retained.
+                    // Nothing ran, so every buffer is exactly as it was before the dispatch.
+                    if (trace)
+                        std::fprintf(stderr, "[compute]   indirect groups=%ux%ux%u: no-op\n",
+                                     record[0], record[1], record[2]);
+                    ok = true;
+                    phase_writeback = ComputeClock::now();
+                    break;
+                } else if (trace) {
+                    std::fprintf(stderr, "[compute]   indirect groups=%ux%ux%u (device-resolved)\n",
+                                 record[0], record[1], record[2]);
+                }
+            } else {
+                break;
+            }
+        }
         if (ledger_gpu_timing) {
             uint64_t pair[2]{};
             if (vkGetQueryPoolResults(ctx.device, ctx.dispatch_timestamp_pool, 0, 2, sizeof(pair),
@@ -14563,6 +14765,11 @@ LiveComputeStorageImageDevice live_compute_storage_image_device() {
     return mutable_storage_image_device();
 }
 
+std::array<uint32_t, 3> live_compute_workgroup_count_limits_for_test() {
+    const auto* context = g_live_compute_context.load(std::memory_order_acquire);
+    return context ? context->max_compute_workgroup_count : std::array<uint32_t, 3>{};
+}
+
 uint64_t live_compute_sampled_image_upload_skips() {
     return g_sampled_image_upload_skips.load(std::memory_order_relaxed);
 }
@@ -14624,6 +14831,14 @@ bool cold_storage_result_snapshot_can_defer(bool host_data, bool full_overwrite,
 
 void live_compute_fail_next_buffer_readback_for_test() {
     g_fail_next_buffer_readback_for_test.store(true, std::memory_order_release);
+}
+
+void live_compute_fail_next_indirect_readback_for_test() {
+    g_fail_next_indirect_readback_for_test.store(true, std::memory_order_release);
+}
+
+bool live_compute_indirect_readback_fault_pending_for_test() {
+    return g_fail_next_indirect_readback_for_test.load(std::memory_order_acquire);
 }
 
 void live_compute_set_image_readback_observer_for_test(
@@ -15226,6 +15441,7 @@ void register_live_compute() {
         return;
     }
     prosper::gpu::set_submit_compute(execute_live_compute_items);
+    prosper::gpu::set_submit_compute_indirect_dispatch(true);   // #3656
     std::fprintf(stderr, "[compute] live Vulkan compute backend registered\n");
 }
 
