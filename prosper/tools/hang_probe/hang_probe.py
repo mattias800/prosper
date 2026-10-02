@@ -18,7 +18,15 @@ Linux only (needs gdb + guest_bt; ptrace attach must be permitted - kernel.yama.
 Example:
   python3 tools/hang_probe/hang_probe.py --dump /path/PPSA01885-app0 --runs 10 --wait 35
 """
-import argparse, os, subprocess, sys, time, tempfile, shutil, signal, re
+import argparse
+import os
+import subprocess
+import sys
+import time
+import tempfile
+import shutil
+import signal
+import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
