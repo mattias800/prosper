@@ -533,6 +533,15 @@ if(Python3_Interpreter_FOUND)
   # every other arm in the file. Platform-independent: nothing here reads /proc or shells out.
   add_test(NAME pr_body_readback
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_body.py")
+  # ratchet_hook.py is the PreToolUse hook that runs check_arch_ratchet.py before an agent's
+  # `git commit` / `git push` (#4193), in delta mode against origin/main. The rollout is warn-only
+  # (BLOCK_ON_VIOLATION): a violation exits 0 with a systemMessage, and everything that is not a
+  # verdict fails open. Each case -- clean, violation (warned, and blocked with the switch on),
+  # could-not-evaluate, missing checker, no origin/main, not a checkout -- has an arm against a
+  # throwaway git repo and a stand-in checker. The last arm reads .claude/settings.json: an
+  # interpreter `||` chain there would swallow exit 2 once the switch is flipped.
+  add_test(NAME ratchet_hook
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_ratchet_hook.py")
   add_test(NAME session_start
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/test_session_start.py")
   # PROSPER_ENV_ON/_VALUE sample getenv once and return it forever. Applied to a name a TEST arms at
