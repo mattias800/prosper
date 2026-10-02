@@ -73,6 +73,16 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
     fixture=subprocess.run([FIXTURE,"--write-fixture",str(directory)],env=fixture_env,capture_output=True,text=True,timeout=120)
     check(fixture.returncode==0,"actual realization/collector fixture succeeds without Vulkan")
     if fixture.returncode: print(fixture.stdout+fixture.stderr)
+    for state in ("inventory","legacy-inventory"):
+        done=subprocess.run([REPLAY,"--inspect-only",str(directory/(state+".prgcap"))],
+                            env=env,capture_output=True,text=True,timeout=120)
+        notices=[line for line in done.stdout.splitlines() if "float-transport=" in line]
+        provenance="legacy-unknown" if state=="legacy-inventory" else "captured"
+        check(done.returncode==0 and len(notices)==18 and
+              all("source="+provenance in line for line in notices) and
+              (state!="legacy-inventory" or all("float-transport=unknown" in line for line in notices)),
+              state+" actual inspect draw/compute/failure/stage provenance uses the producing-tail version")
+        if done.returncode: print(done.stdout+done.stderr)
     for failed in (False,True):
         path=directory/("explicit-nonfinite32"+("-failed" if failed else "")+".prgcap")
         data=path.read_bytes()

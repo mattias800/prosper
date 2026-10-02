@@ -338,8 +338,9 @@ int main(int argc, char** argv) {
     table.resources.push_back(resource);
 
     const auto direct_vs = recompile_vertex(kVs, std::size(kVs), &table);
+    // Keep fixture-only subpaths short under long case-specific Windows scratch roots.
     const std::filesystem::path dump_directory =
-        prosper_test::test_scratch_dir() / "prosper-shader-dump-test";
+        prosper_test::test_scratch_dir() / "dump";
     std::error_code dump_ec;
     std::filesystem::remove_all(dump_directory, dump_ec);
     set_test_env("PROSPER_SHADER_DUMP_SUCCESS", dump_directory.string().c_str());
@@ -2525,7 +2526,7 @@ int main(int argc, char** argv) {
     // same address -- an instrument that cannot fail for the reason it is testing.
     {
         const std::filesystem::path address_dir =
-            prosper_test::test_scratch_dir() / "prosper-shader-dump-address";
+            prosper_test::test_scratch_dir() / "address";
         std::error_code address_ec;
         std::filesystem::remove_all(address_dir, address_ec);
         set_test_env("PROSPER_SHADER_DUMP_SUCCESS", address_dir.string().c_str());
