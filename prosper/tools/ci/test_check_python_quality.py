@@ -37,6 +37,13 @@ class PureRules(unittest.TestCase):
         )
         self.assertEqual([], cpq.missing_test_violations([tool], [tool, "prosper/tests/host/t.py"]))
 
+    def test_validate_ref_rejects_option_like_input(self):
+        for bad in ("--output=x", "-x", "", "a b", "a;b"):
+            with self.assertRaises(ValueError, msg=bad):
+                cpq.validate_ref(bad)
+        for good in ("origin/main", "HEAD~1", "abc123", "refs/heads/a-b"):
+            self.assertEqual(good, cpq.validate_ref(good))
+
     def test_ratchet_reason_names_both_counts(self):
         (msg,) = cpq.ratchet_violations("a.py", 2, 5)
         self.assertIn("2 -> 5", msg)

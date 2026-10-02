@@ -377,27 +377,27 @@ jobs:
           fetch-depth: 0
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.8.12"
           python-version: "3.13"
 
       - name: Install the locked dev group
-        run: uv sync --locked --group dev
+        run: uv sync --locked --no-build --group dev
 
       # The selftest and pytest run first: they hold hand-built violating inputs, so a gate that
       # stopped discriminating fails here instead of passing every PR.
       - name: Verify the checker still discriminates
-        run: uv run --locked --group dev python prosper/tools/ci/check_python_quality.py --selftest
+        run: uv run --no-sync --group dev python prosper/tools/ci/check_python_quality.py --selftest
 
       - name: Test the checker (pytest)
-        run: uv run --locked --group dev pytest
+        run: uv run --no-sync --group dev pytest
 
       - name: Ruff on changed Python files
         if: github.event_name == 'pull_request'
         run: |
           git fetch --no-tags origin "${{ github.base_ref }}"
-          uv run --locked --group dev python prosper/tools/ci/check_python_quality.py \
+          uv run --no-sync --group dev python prosper/tools/ci/check_python_quality.py \
             --base "origin/${{ github.base_ref }}"
 
   docs:

@@ -22,6 +22,7 @@ Run from anywhere inside the checkout:
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -77,6 +78,16 @@ def count_findings(source, filename):
     return len(json.loads(proc.stdout or "[]"))
 
 
+SAFE_REF = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/@~^-]*")
+
+
+def validate_ref(ref):
+    """Reject anything that could be parsed by git as an option rather than a revision."""
+    if not SAFE_REF.fullmatch(ref):
+        raise ValueError(f"refusing base ref {ref!r}: must be a plain revision name")
+    return ref
+
+
 def git(*args):
     """Run git and return stdout, raising on failure."""
     return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
@@ -114,7 +125,7 @@ def check_modified(path, base):
 
 def run(base):
     """Evaluate the whole PR; return the list of violation strings."""
-    merge_base = git("merge-base", base, "HEAD").strip()
+    merge_base = git("merge-base", validate_ref(base), "HEAD").strip()
     added, modified = changed(merge_base)
     problems = missing_test_violations(added, added + modified)
     for path in added:
