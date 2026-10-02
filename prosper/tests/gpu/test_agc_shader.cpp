@@ -1,5 +1,6 @@
 // test_agc_shader -- focused guards for sceAgcCreateShader's guest-visible side effects.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
@@ -75,8 +76,7 @@ static void make_test_tsharp(uint32_t t[8], uint64_t base, uint32_t width,
 }
 
 int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 } // namespace
 
@@ -91,7 +91,7 @@ extern "C" size_t prosper_agc_shader_headers_for_code(uint64_t code_addr, const 
 extern "C" const void* prosper_agc_fused_back_header_for_front(uint64_t front_code_addr);
 extern "C" uint64_t prosper_agc_shader_continuation_for_code(uint64_t code_addr);
 
-int main() {
+TEST(AgcShader, Contract) {
     printf("== test_agc_shader ==\n");
     register_builtin_hle();
 
@@ -109,7 +109,7 @@ int main() {
           "fused-shader size query and SDK aliases registered");
     CHECK(create_interp != nullptr && create_interp_320 != nullptr && create_interp_old != nullptr,
           "CreateInterpolantMapping SDK aliases registered");
-    if (!create_shader) return 1;
+    if (!create_shader) FAIL() << "legacy early exit";
 
     // Pathless builds GS/HS shaders from separately compiled front/back binaries. A success-only
     // stub left its stack-local fused Shader untouched, and the later register copier interpreted
@@ -1224,7 +1224,5 @@ int main() {
               filtered_shader_after.hits == filtered_shader_before.hits,
           "all-filtered parallel batch rejects no-effect draws before shader realization");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

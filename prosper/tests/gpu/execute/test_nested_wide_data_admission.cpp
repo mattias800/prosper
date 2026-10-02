@@ -1,4 +1,5 @@
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -15,13 +16,13 @@
 using namespace prosper;
 using namespace prosper::gpu;
 
-int main() {
+TEST(NestedWideDataAdmission, Contract) {
     register_builtin_hle();
     const auto allocate = Hle::lookup(nid_hash("sceKernelAllocateDirectMemory"));
     const auto map = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
     const auto unmap = Hle::lookup(nid_hash("sceKernelMunmap"));
     const auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
-    if (!allocate || !map || !unmap || !release) return 2;
+    if (!allocate || !map || !unmap || !release) FAIL() << "legacy early exit";
 
     constexpr uint64_t page = 0x10000;
     uint64_t physical = 0, parent = 0, child = 0, output = 0, alias = 0;
@@ -31,7 +32,7 @@ int main() {
         map(reinterpret_cast<uint64_t>(&child), page, 3, 0, physical + page, page) != 0 ||
         map(reinterpret_cast<uint64_t>(&output), page, 3, 0, physical + 2 * page, page) != 0 ||
         map(reinterpret_cast<uint64_t>(&alias), page, 3, 0, physical + 2 * page, page) != 0)
-        return 2;
+        FAIL() << "legacy early exit";
     int failures = 0;
     const auto expect = [&](bool okay, const char* message) {
         if (!okay) {
@@ -174,5 +175,5 @@ int main() {
     unmap(output, page, 0, 0, 0, 0);
     unmap(alias, page, 0, 0, 0, 0);
     release(physical, 4 * page, 0, 0, 0, 0);
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }

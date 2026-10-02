@@ -1,13 +1,10 @@
 #include "shared/live/texture_source_snapshot.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 
-int main()
-{
-    int failures = 0;
-    auto check = [&](bool ok, const char* description) {
-        if (!ok) { std::fprintf(stderr, "FAIL: %s\n", description); ++failures; }
-    };
+TEST(TextureSourceSnapshot, Contract) {
+    auto check = [&](bool ok, const char* description) { EXPECT_TRUE(ok) << description; };
     for (bool transfer : {false, true}) {
         std::vector<uint8_t> scratch{1, 2, 3, 4, 0xee, 0xee};
         std::vector<uint8_t> inherited(32, 0xdd);
@@ -44,5 +41,4 @@ int main()
         if (handoff.transferred)
             check(handoff.bytes.data() == populated, "already-large owner still avoids the redundant copy");
     }
-    return failures ? 1 : 0;
 }

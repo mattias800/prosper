@@ -1,4 +1,5 @@
 #include "gpu/diagnostics/compute_parent_walk.hpp"
+#include <gtest/gtest.h>
 
 #include <array>
 #include <cstdio>
@@ -8,16 +9,11 @@ using namespace prosper::gpu;
 
 namespace {
 
-int failures = 0;
-int checks = 0;
-#define CHECK(condition, message) do { \
-    ++checks; \
-    if (!(condition)) { std::printf("FAIL: %s\n", message); ++failures; } \
-} while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
 } // namespace
 
-int main() {
+TEST(ComputeParentWalk, Contract) {
     const auto selector = parse_compute_parent_walk_selector(
         "0x413dc6700:91:3:0x07ffffff");
     CHECK(selector && selector->program_addr == 0x413dc6700ull &&
@@ -74,10 +70,4 @@ int main() {
               !compute_parent_walk_suspicious(deep_report, 69u),
           "acyclic depth is diagnostic-thresholded without changing walk semantics");
 
-    if (failures) {
-        std::printf("== FAIL: %d == (%d assertions executed)\n", failures, checks);
-        return 1;
-    }
-    std::printf("== PASS == (%d assertions executed)\n", checks);
-    return 0;
 }

@@ -1,4 +1,5 @@
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -14,12 +15,7 @@ using namespace prosper::gpu;
 
 namespace {
 
-int failures = 0;
-int checks = 0;
-#define CHECK(condition, message) do { \
-    ++checks; \
-    if (!(condition)) { std::printf("FAIL: %s\n", message); ++failures; } \
-} while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
 constexpr uint64_t kRootAddress = 0x900000u;
 
@@ -57,7 +53,7 @@ size_t marker_count(const ShaderResourceTable& table) {
 
 } // namespace
 
-int main() {
+TEST(Gta5Cf9200, Contract) {
     const auto& exact = prosper::test::kGta5Cf9200Program;
     ComputeShaderConfig config = exact_config();
     auto root_bytes = prosper::test::gta5_cf9200_source_and_output_null_root();
@@ -153,10 +149,4 @@ int main() {
               GtaCf9200NoBackingAccess::DropStore,
           "site classifier distinguishes the zero load from dropped stores");
 
-    if (failures) {
-        std::printf("== FAIL: %d == (%d assertions executed)\n", failures, checks);
-        return 1;
-    }
-    std::printf("== PASS == (%d assertions executed)\n", checks);
-    return 0;
 }

@@ -18,6 +18,7 @@
 // sets query_only unconditionally; the sampling arm is what proves the flag tracks the module's
 // actual use. Both modules are identical but for the one sample instruction.
 #include "gpu/resources/shader_resources.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 #include <cstdint>
@@ -30,10 +31,7 @@ namespace {
 using Words = std::vector<uint32_t>;
 
 int failures = 0;
-void check(bool ok, const char* message) {
-    std::printf("[%s] %s\n", ok ? "ok" : "FAIL", message);
-    failures += !ok;
-}
+void check(bool ok, const char* message) { EXPECT_TRUE(ok) << message; }
 
 void put(Words& w, uint32_t op, std::initializer_list<uint32_t> args) {
     w.push_back((uint32_t(args.size() + 1) << 16) | op);
@@ -85,7 +83,7 @@ const SpirvDescriptorBinding* binding_zero(const DescriptorValidationReport& rep
 
 } // namespace
 
-int main() {
+TEST(QueryOnlyBinding, Contract) {
     std::printf("== test_query_only_binding (#657) ==\n");
 
     const Words query_only_module = module_with(false);
@@ -101,7 +99,7 @@ int main() {
 
     check(q != nullptr, "the query-only module reflects a binding at set 0 / binding 0");
     check(s != nullptr, "the sampling module reflects the same binding");
-    if (!q || !s) { std::printf("== FAIL: %d ==\n", failures ? failures : 1); return 1; }
+    if (!q || !s) { std::printf("== FAIL: %d ==\n", failures ? failures : 1); FAIL() << "legacy early exit"; }
 
     // THE ARM.
     check(q->query_only,
@@ -116,6 +114,5 @@ int main() {
     check(q->readable && s->readable,
           "both are `readable` -- so `readable` could not have told them apart");
 
-    std::printf(failures ? "== FAIL: %d ==\n" : "== PASS ==\n", failures);
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }

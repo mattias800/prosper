@@ -15,6 +15,7 @@
 // such a change fails loudly here first. Pure decode; no guest memory or GPU state involved.
 
 #include "gpu/agc/agc_shader_layout.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -22,14 +23,10 @@
 using namespace prosper::gpu;
 
 namespace {
-int g_fail = 0;
-void check(bool ok, const char* msg) {
-    std::printf("  %s %s\n", ok ? "[ok]  " : "[FAIL]", msg);
-    if (!ok) g_fail++;
-}
+void check(bool ok, const char* msg) { EXPECT_TRUE(ok) << msg; }
 }  // namespace
 
-int main() {
+TEST(DescriptorClamp, Contract) {
     std::printf("== test_descriptor_clamp (GPU descriptor bound invariant) ==\n");
 
     // 1. An all-ones T# drives every image field to its maximum. width/height are 14-bit fields with a
@@ -70,6 +67,4 @@ int main() {
               "V# max stride*records: size_bytes clamped to 0xFFFFFFFF (uint64 no-wrap)");
     }
 
-    std::printf(g_fail ? "FAILED (%d)\n" : "PASSED\n", g_fail);
-    return g_fail ? 1 : 0;
 }

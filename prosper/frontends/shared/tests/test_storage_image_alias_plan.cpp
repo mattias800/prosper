@@ -1,6 +1,7 @@
 // Metadata-only storage alias access union. Expectations are hand-built member sets and access
 // verdicts, never calls to the same identity helper used by the planner as a second oracle.
 #include "shared/compute/storage_image_alias_plan.hpp"
+#include <gtest/gtest.h>
 
 #include <array>
 #include <cstdio>
@@ -12,11 +13,8 @@ using namespace prosper::gpu;
 using prosper::frontend::StorageImageAliasPlan;
 using prosper::frontend::plan_storage_image_aliases;
 
-static int failures = 0;
 static const char* context = "initial";
-#define CHECK(condition) do { if (!(condition)) { \
-    std::fprintf(stderr, "FAIL %s:%d [%s]: %s\n", __FILE__, __LINE__, context, #condition); \
-    ++failures; } } while (0)
+#define CHECK(condition) EXPECT_TRUE(condition)
 
 static ShaderResource resource(uint32_t binding, uint64_t address = 0x10000) {
     ShaderResource r;
@@ -80,7 +78,7 @@ static void resource_split(const char* label, Mutate mutate) {
     group(plan, 1, 1, {26}, true, false, false, false);
 }
 
-int main() {
+TEST(StorageImageAliasPlan, Contract) {
     auto table = pair_resources();
     // Reverse descriptor visitation, but not the resource-table order: lookup is by binding.
     for (bool reverse : {false, true}) {
@@ -361,6 +359,4 @@ int main() {
         CHECK(!prosper::frontend::compute_native_cube_sampled(not_cube, cube_view));
     }
 
-    std::printf("storage_image_alias_plan: %d failure(s)\n", failures);
-    return failures ? 1 : 0;
 }
