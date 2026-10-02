@@ -63,24 +63,38 @@ class Verdicts(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ratchet_hook_")
-        subprocess.run(["git", "init", "-q", self.tmp], check=True)
+        self.git("init", "-q")
+        self.git("commit", "-q", "--allow-empty", "-m", "base")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
         self.checker = Path(self.tmp, hook.CHECKER)
+        self.argv_log = Path(self.tmp, "checker_argv.json")
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def git(self, *args):
+        cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args]
+        subprocess.run(cmd, cwd=self.tmp, check=True, capture_output=True)
 
     def install_checker(self, status, output="checker said so\n"):
         self.checker.parent.mkdir(parents=True, exist_ok=True)
         self.checker.write_text(
             textwrap.dedent(
                 f"""\
-                import sys
+                import json, sys
                 assert "--root" in sys.argv, sys.argv
+                with open({str(self.argv_log)!r}, "w") as f:
+                    json.dump(sys.argv[1:], f)
                 sys.stdout.write({output!r})
                 sys.exit({status})
                 """
             )
         )
+
+    def checker_argv(self):
+        if not self.argv_log.exists():
+            return None
+        return json.loads(self.argv_log.read_text())
 
     def run_hook(self, command, cwd=None, tool="Bash"):
         payload = {"tool_name": tool, "tool_input": {"command": command}, "cwd": cwd or self.tmp}
@@ -102,12 +116,51 @@ class Verdicts(unittest.TestCase):
         self.install_checker(0)
         self.assertEqual((0, "", ""), self.run_hook("git push"))
 
-    def test_violation_blocks_with_checker_output(self):
+    def test_checker_runs_in_delta_mode_against_origin_main(self):
+        self.install_checker(0)
+        self.run_hook("git commit -m x")
+        argv = self.checker_argv()
+        self.assertIsNotNone(argv, "the checker never ran")
+        self.assertEqual(["--base", "origin/main"], argv[argv.index("--base") :][:2])
+
+    def test_missing_origin_main_fails_open_without_running_the_checker(self):
+        self.install_checker(0)
+        self.git("update-ref", "-d", "refs/remotes/origin/main")
+        status, out, _ = self.run_hook("git push")
+        self.assertEqual(0, status)
+        message = json.loads(out)["systemMessage"]
+        self.assertIn("ratchet UNVERIFIED", message)
+        self.assertIn("origin/main", message)
+        self.assertIsNone(self.checker_argv())
+
+    def test_violation_warns_but_does_not_block(self):
+        self.assertFalse(hook.BLOCK_ON_VIOLATION, "the rollout is warn-only")
         self.install_checker(1, "INCREASE file-size|x 10 -> 11\n")
         status, out, err = self.run_hook("git commit -m x")
+        self.assertEqual(0, status)
+        message = json.loads(out)["systemMessage"]
+        self.assertIn("ratchet WARNING", message)
+        self.assertIn("INCREASE file-size|x 10 -> 11", message)
+        self.assertIn("arch_ratchet_baseline.txt", message)  # says how to fix it
+        self.assertIn("INCREASE file-size|x 10 -> 11", err)
+
+    def test_blocking_switch_turns_a_violation_into_exit_2(self):
+        self.install_checker(1, "INCREASE file-size|x 10 -> 11\n")
+        original = hook.BLOCK_ON_VIOLATION
+        hook.BLOCK_ON_VIOLATION = True
+        try:
+            status, out, err = self.run_hook("git commit -m x")
+        finally:
+            hook.BLOCK_ON_VIOLATION = original
         self.assertEqual(2, status)
         self.assertEqual("", out)
         self.assertIn("INCREASE file-size|x 10 -> 11", err)
+
+    def test_long_findings_are_truncated_in_the_message(self):
+        self.install_checker(1, "x" * (hook.SYSTEM_MESSAGE_LIMIT * 2))
+        _status, out, err = self.run_hook("git commit -m x")
+        self.assertLess(len(json.loads(out)["systemMessage"]), hook.SYSTEM_MESSAGE_LIMIT + 100)
+        self.assertIn("truncated", err)
 
     def test_could_not_evaluate_fails_open(self):
         self.install_checker(2)
@@ -119,12 +172,13 @@ class Verdicts(unittest.TestCase):
         self.install_checker(1)
         outside = tempfile.mkdtemp(prefix="ratchet_hook_outside_")
         try:
-            status, _, _ = self.run_hook(
+            status, out, _ = self.run_hook(
                 f"git -C {Path(self.tmp).as_posix()} commit -m x", cwd=outside
             )
         finally:
             shutil.rmtree(outside, ignore_errors=True)
-        self.assertEqual(2, status)
+        self.assertEqual(0, status)
+        self.assertIn("ratchet WARNING", json.loads(out)["systemMessage"])
 
     def test_not_a_checkout_fails_open(self):
         outside = tempfile.mkdtemp(prefix="ratchet_hook_outside_")
@@ -147,12 +201,17 @@ class Verdicts(unittest.TestCase):
             text=True,
             timeout=60,
         )
-        self.assertEqual(2, proc.returncode, proc.stderr)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("checker said so", json.loads(proc.stdout)["systemMessage"])
         self.assertIn("checker said so", proc.stderr)
 
 
 class Registration(unittest.TestCase):
-    """The settings entry must be able to block: a `||` interpreter chain would swallow exit 2."""
+    """The settings entry must be able to block once BLOCK_ON_VIOLATION is flipped.
+
+    A `||` interpreter chain would swallow exit 2, so this holds even while the rollout is
+    warn-only -- otherwise flipping the switch would silently do nothing.
+    """
 
     def test_settings_register_the_hook_for_both_shells(self):
         settings = json.loads((REPO_ROOT / ".claude" / "settings.json").read_text())

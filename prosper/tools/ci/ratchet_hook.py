@@ -8,24 +8,38 @@ but by the time CI reports, the commit exists and the PR is open. This hook runs
 the moment an agent is about to commit or push, so a new violation is answered in the session that
 made it. `.claude/settings.json` registers it for the Bash and PowerShell tools.
 
+It runs the checker in DELTA mode (`--base origin/main`): only the files this checkout changed
+since its merge base with origin/main are judged, and only a count THIS change raised past its
+baseline row is reported. Full mode would report every stale row on main -- and main's baseline
+goes stale whenever a PR grows a capped file -- so every agent's commit would be flagged for
+something it never touched.
+
+Rollout: WARN-ONLY
+------------------
+While the rollout is young, a violation does NOT block. The hook exits 0 and shows the findings,
+and how to fix them, as a JSON `systemMessage` (and on stderr). `BLOCK_ON_VIOLATION` is the one
+switch that turns a violation into a blocking exit 2; the settings entry already passes a 2
+through, so flipping it needs no other edit.
+
 Contract (Claude Code hooks, PreToolUse)
 ----------------------------------------
 stdin is one JSON object with `tool_name`, `tool_input.command` and `cwd`. Exit 0 lets the tool
-call proceed; exit 2 blocks it and stderr is shown to the model.
+call proceed (a JSON `systemMessage` on stdout is shown to the user); exit 2 blocks it and stderr
+is shown to the model.
 
-This hook exits 2 ONLY when the checker ran and reported a violation (its exit status 1).
-Everything else FAILS OPEN with exit 0: a command that is not a commit or push, a checkout without
-the checker (it lands in its own PR, and older worktrees will never have it), a checker that
-cannot be started or times out, or one that exits 2 ("could not evaluate") or any other status.
-A fail-open on a commit or push prints one `ratchet UNVERIFIED` line as a JSON `systemMessage`, so
-it is visible and never mistaken for a pass. The asymmetry is deliberate: a hook that wedged every
-agent's `git` on a broken interpreter would be switched off within the hour, and then it protects
-nothing.
+Everything that is not a verdict FAILS OPEN with exit 0: a command that is not a commit or push, a
+checkout without the checker (it lands in its own PR, and older worktrees will never have it), a
+checkout with no `origin/main` to take a merge base against, a checker that cannot be started or
+times out, or one that exits 2 ("could not evaluate") or any other status. A fail-open on a commit
+or push prints one `ratchet UNVERIFIED` line as a JSON `systemMessage`, so it is visible and never
+mistaken for a pass. The asymmetry is deliberate: a hook that wedged every agent's `git` on a
+broken interpreter would be switched off within the hour, and then it protects nothing.
 
 What it does not do
 -------------------
-It checks the working tree of the repository the command will run in, not the index, so it can
-disagree with exactly what a commit records. Command parsing is a heuristic over `;`, `&&`, `||`,
+It checks the working tree of the repository the command will run in (committed, staged, unstaged
+and untracked changes since the merge base), not the index, so it can disagree with exactly what a
+commit records. Command parsing is a heuristic over `;`, `&&`, `||`,
 `|` and newlines, following `cd` / `Set-Location` / `pushd` and `git -C`; a commit hidden behind
 an alias, a script or `sh -c` is not seen. CI is still the gate; this is the early warning.
 """
@@ -39,6 +53,11 @@ import sys
 
 CHECKER = os.path.join("prosper", "tools", "ci", "check_arch_ratchet.py")
 CHECKER_TIMEOUT_S = 45
+BASE_REF = "origin/main"
+# The rollout switch. False: a violation is a warning (exit 0 + systemMessage). True: it blocks
+# the commit or push (exit 2). Flip it in its own reviewed change once the warnings are trusted.
+BLOCK_ON_VIOLATION = False
+SYSTEM_MESSAGE_LIMIT = 4000
 GATED_SUBCOMMANDS = ("commit", "push")
 
 _GIT_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
@@ -137,14 +156,30 @@ def unverified(reason):
     return 0
 
 
+def has_base(root, ref=BASE_REF):
+    """Whether `ref` resolves to a commit in the checkout at `root`."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--verify", "--quiet", ref + "^{commit}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0
+
+
 def run_checker(root, timeout_s=CHECKER_TIMEOUT_S):
     """Return (status, output) from the checker, or (None, reason) when it could not run."""
     checker = os.path.join(root, CHECKER)
     if not os.path.isfile(checker):
         return None, f"{CHECKER} is not in this checkout (the ratchet has not landed here)"
+    if not has_base(root):
+        return None, f"{BASE_REF} is not available here, so there is no merge base to judge against"
     try:
         proc = subprocess.run(
-            [sys.executable, checker, "--root", root],
+            [sys.executable, checker, "--root", root, "--base", BASE_REF],
             cwd=root,
             capture_output=True,
             text=True,
@@ -186,12 +221,21 @@ def main(stdin_text):
     if status == 0:
         return 0
     if status == 1:
-        sys.stderr.write(
-            f"Blocked `git {subcommand}`: check_arch_ratchet.py reports a ratchet violation.\n"
-            "Fix it, or raise the baseline row in the same PR with a `# note` a reviewer reads"
-            f" (CLAUDE.md, 'Architecture and performance ratchets').\n\n{output}"
+        how = (
+            "this change raised an architecture-ratchet count past its baseline row. Fix it, or "
+            "raise the row in prosper/tools/ci/arch_ratchet_baseline.txt in the same PR with a "
+            "`# note` a reviewer reads (CLAUDE.md, 'Architecture and performance ratchets'). "
+            f"Re-check with: python3 {CHECKER.replace(os.sep, '/')} --root . --base {BASE_REF}"
         )
-        return 2
+        if BLOCK_ON_VIOLATION:
+            sys.stderr.write(f"Blocked `git {subcommand}`: {how}\n\n{output}")
+            return 2
+        message = f"ratchet WARNING (not blocking) before `git {subcommand}`: {how}\n\n{output}"
+        if len(message) > SYSTEM_MESSAGE_LIMIT:
+            message = message[:SYSTEM_MESSAGE_LIMIT] + "\n... (truncated; run the command above)"
+        sys.stderr.write(message + "\n")
+        print(json.dumps({"systemMessage": message}))
+        return 0
     return unverified(
         f"check_arch_ratchet.py exited {status} (2 = could not evaluate), which is not a verdict"
     )
