@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Unit tests for performance_capture_report.py: summarisation and the printed report."""
 
 import unittest
 

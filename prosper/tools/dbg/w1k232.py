@@ -1,6 +1,7 @@
-# gdb -p PID -batch -x w1k232.py — break on the w1KFAHVqpaU PLT (0x669a220) and its wrapper
-# (0x58df3f0), dump register + stack args, and probe candidate Dcb pointers for a PM4 stream
-# (type-3 header top bits 0b11). Runs a bounded number of hits (wrap in `timeout`).
+"""gdb -p PID -batch -x w1k232.py — break on the w1KFAHVqpaU PLT (0x669a220) and its wrapper
+(0x58df3f0), dump register + stack args, and probe candidate Dcb pointers for a PM4 stream
+(type-3 header top bits 0b11). Runs a bounded number of hits (wrap in `timeout`).
+"""
 import gdb
 
 EBOOT = 0x400000000

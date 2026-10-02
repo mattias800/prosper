@@ -1,4 +1,5 @@
-# gdb -p PID -batch -x thr232.py — list all threads: name, pc, top guest RAs from stack scan
+"""gdb -p PID -batch -x thr232.py — list all threads: name, pc, top guest RAs from stack scan
+"""
 import gdb
 
 EBOOT = 0x400000000

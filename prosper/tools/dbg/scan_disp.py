@@ -1,6 +1,7 @@
-# gdb -p PID -batch -x scan_disp.py
-# Locate the IoDispatcher backend by scanning guest memory for pointers to the stalled batch
-# (batch = last H896 tag, written to /root/batch.txt by the runner), then dump the flush gate.
+"""gdb -p PID -batch -x scan_disp.py
+Locate the IoDispatcher backend by scanning guest memory for pointers to the stalled batch
+(batch = last H896 tag, written to /root/batch.txt by the runner), then dump the flush gate.
+"""
 import gdb
 gdb.execute("set pagination off")
 batch = int(open("/root/batch.txt").read().strip(), 16)

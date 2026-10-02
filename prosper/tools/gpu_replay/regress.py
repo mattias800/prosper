@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-# regress.py (#1258) — a fast, cross-title capsule-hash regression gate.
-#
-# Replays every .prgcap in a LOCAL corpus directory through gpu_replay and diffs each capsule's
-# rendered output hash against a committed baseline. Runs in seconds (deterministic offline replay,
-# no live game boot), so a shared GPU/executor/recompiler change can be checked against many scenes
-# before the ~18-minute live-boot snapshot suite.
-#
-#   regress.py update <corpus-dir> [--baseline FILE]   # (re)record baseline hashes after an INTENDED change
-#   regress.py check  <corpus-dir> [--baseline FILE]    # compare current hashes to the baseline; exit 1 on any diff
-#   regress.py list   <corpus-dir>                      # just print each capsule's current hash
-#
-# The corpus (.prgcap files) is LOCAL and gitignored — capsules are large and carry game imagery, exactly
-# like the game dumps. Only the small baseline (basename -> hash, JSON) is meant to be committed/shared.
-#
-# SCOPE (important): a replay hash validates the TRANSLATION path (recompiler, AGC/PM4 decode, render-state
-# resolve, executor ordering, detile) — it is the right guard for changes to THAT code. It does NOT exercise
-# live GPU residency; a change to live_gpu_targets/residency can be hash-identical yet wrong (see
-# docs blind-spot note / issue #1103). Use this to catch translation regressions fast, not as full coverage.
+"""regress.py (#1258) — a fast, cross-title capsule-hash regression gate.
+
+Replays every .prgcap in a LOCAL corpus directory through gpu_replay and diffs each capsule's
+rendered output hash against a committed baseline. Runs in seconds (deterministic offline replay,
+no live game boot), so a shared GPU/executor/recompiler change can be checked against many scenes
+before the ~18-minute live-boot snapshot suite.
+
+  regress.py update <corpus-dir> [--baseline FILE]   # (re)record baseline hashes after an INTENDED change
+  regress.py check  <corpus-dir> [--baseline FILE]    # compare current hashes to the baseline; exit 1 on any diff
+  regress.py list   <corpus-dir>                      # just print each capsule's current hash
+
+The corpus (.prgcap files) is LOCAL and gitignored — capsules are large and carry game imagery, exactly
+like the game dumps. Only the small baseline (basename -> hash, JSON) is meant to be committed/shared.
+
+SCOPE (important): a replay hash validates the TRANSLATION path (recompiler, AGC/PM4 decode, render-state
+resolve, executor ordering, detile) — it is the right guard for changes to THAT code. It does NOT exercise
+live GPU residency; a change to live_gpu_targets/residency can be hash-identical yet wrong (see
+docs blind-spot note / issue #1103). Use this to catch translation regressions fast, not as full coverage.
+"""
 
 import argparse
 import json

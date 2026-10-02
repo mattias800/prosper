@@ -1,7 +1,8 @@
-# gdb -p PID -batch -x slot232.py — at the DOLL plateau, catch the RenderThread wait loop
-# (eboot+0x221d6c2: mov 0x30(%rbx),%rax ; cmpq $0,(%rax)) and dump the polled slot + context.
-# Synchronous continue/stop iterations (a python sleep would block gdb's event loop).
-# Wrap the gdb invocation in `timeout` — if the breakpoints never hit, gdb blocks in continue.
+"""gdb -p PID -batch -x slot232.py — at the DOLL plateau, catch the RenderThread wait loop
+(eboot+0x221d6c2: mov 0x30(%rbx),%rax ; cmpq $0,(%rax)) and dump the polled slot + context.
+Synchronous continue/stop iterations (a python sleep would block gdb's event loop).
+Wrap the gdb invocation in `timeout` — if the breakpoints never hit, gdb blocks in continue.
+"""
 import gdb
 import struct
 

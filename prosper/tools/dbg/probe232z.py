@@ -1,7 +1,8 @@
-# gdb -p PID -batch -x probe232z.py — issue #232:
-# 1) read the parked FAsyncLoadingThread2 (ALT) thread's regs/stack to recover `this`,
-#    then dump async-loading counters + package-state histogram.
-# 2) sample the GameThread (thread 1) 40x for a guest-RA histogram of its tick phase.
+"""gdb -p PID -batch -x probe232z.py — issue #232:
+1) read the parked FAsyncLoadingThread2 (ALT) thread's regs/stack to recover `this`,
+   then dump async-loading counters + package-state histogram.
+2) sample the GameThread (thread 1) 40x for a guest-RA histogram of its tick phase.
+"""
 import gdb
 import struct
 import time

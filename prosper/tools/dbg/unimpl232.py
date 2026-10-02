@@ -1,4 +1,5 @@
-# gdb -p PID -batch -x unimpl232.py — count prosper_on_unimpl hits (import index) per thread for 60 s.
+"""gdb -p PID -batch -x unimpl232.py — count prosper_on_unimpl hits (import index) per thread for 60 s.
+"""
 import gdb
 import time
 import collections

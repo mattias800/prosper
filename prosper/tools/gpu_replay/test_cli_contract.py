@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-# test_cli_contract.py (#3372) -- the gpu_replay CLI must SAY what its two shader dumps produce.
-#
-# This is not a style guard. --dump-shader writes prosper's recompiled SPIR-V and the raw flag
-# writes the guest's RDNA2 words that fed it; an investigation read the RDNA2 out of the flag whose
-# name suggested SPIR-V, concluded no SPIR-V was obtainable, and filed #3372 -- a session lost to a
-# usage string that listed the flags without saying which way round they go. Nothing else in the
-# tree can fail when that wording is dropped, so this does.
-#
-# It drives the real binary rather than grepping the source: the point is what an operator SEES.
+"""test_cli_contract.py (#3372) -- the gpu_replay CLI must SAY what its two shader dumps produce.
+
+This is not a style guard. --dump-shader writes prosper's recompiled SPIR-V and the raw flag
+writes the guest's RDNA2 words that fed it; an investigation read the RDNA2 out of the flag whose
+name suggested SPIR-V, concluded no SPIR-V was obtainable, and filed #3372 -- a session lost to a
+usage string that listed the flags without saying which way round they go. Nothing else in the
+tree can fail when that wording is dropped, so this does.
+
+It drives the real binary rather than grepping the source: the point is what an operator SEES.
+"""
 import os
 from pathlib import Path
 import re

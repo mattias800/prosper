@@ -1,7 +1,8 @@
-# gdb -p PID -batch -x flow232.py — issue #232 session 6: characterize the GameThread
-# flow-advance vtable call `call *0x288(%rax)` at eboot+0x5044775.
-# rdi = object (this+0x7c0 of the frame/flow fn's this=rsi), rax = vtable.
-# For N hits: dump rdi/rsi objects, the +0x288 slot target, and the returned al.
+"""gdb -p PID -batch -x flow232.py — issue #232 session 6: characterize the GameThread
+flow-advance vtable call `call *0x288(%rax)` at eboot+0x5044775.
+rdi = object (this+0x7c0 of the frame/flow fn's this=rsi), rax = vtable.
+For N hits: dump rdi/rsi objects, the +0x288 slot target, and the returned al.
+"""
 import gdb
 
 EBOOT = 0x400000000
