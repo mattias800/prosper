@@ -184,9 +184,12 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
     g_loaded.emplace_back();
     RuntimeModule& rm = g_loaded.back();
     // Publish nothing until the module is fully live. On any failure below, undo in reverse order:
-    // pop the module, drop any TLS template it appended (re-publishing the shorter list is safe —
-    // nothing was relocated against that module id), and forget any NID it claimed a stub slot for.
+    // pop the module and drop any TLS template it appended (re-publishing the shorter list is safe
+    // — nothing was relocated against that module id). Code slots and their NIDs roll back only
+    // until the backend commits their stubs; after that both remain available to later modules.
     const size_t tls_templates_before = g_prog->tls_templates.size();
+    const size_t first_new_slot = g_prog->slots.size();
+    bool stubs_appended = false;
     // The data-slot table is appended to DIRECTLY (unlike the stub table, which is staged in a local
     // vector and published in one synchronised append), so a failure between the import loop and
     // append_import_data would otherwise leave entries in it that no mapping backs -- and the next
@@ -212,7 +215,10 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
             g_prog->data_slots.resize(data_slots_before);
             for (const auto& nid : claimed_data_nids) g_nid_to_data_slot.erase(nid);
         }
-        for (const auto& nid : claimed_nids) g_nid_to_slot.erase(nid);
+        if (!stubs_appended) {
+            dispatch_rollback_slots(&g_prog->slots, first_new_slot);
+            for (const auto& nid : claimed_nids) g_nid_to_slot.erase(nid);
+        }
         return err;
     };
 
@@ -259,7 +265,6 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
                 "unapplied (#639). Report this module.\n", guest_path, tpoff);
 
     // --- Imports: an export of an already-loaded module beats a stub slot, exactly as at boot. ---
-    const size_t first_new_slot = g_prog->slots.size();
     // The data-slot append boundary is `data_slots_before`, captured above with the rollback state
     // rather than here: one value, so a rollback cannot restore to a different point than the
     // append started from.
@@ -299,7 +304,7 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
             const uint32_t idx = (uint32_t)(first_new_slot + new_slots.size());
             new_slots.push_back({ imp.lib_name, imp.nid });
             slot = g_nid_to_slot.emplace(imp.nid, idx).first;
-            claimed_nids.push_back(imp.nid);   // rolled back by abandon() if the load fails
+            claimed_nids.push_back(imp.nid);   // rolled back only before the stubs commit
         }
         img.import_addr[imp.sym_index] = g_prog->stub_base + (uint64_t)slot->second * g_prog->stub_size;
         stubbed++;
@@ -307,13 +312,13 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
     const size_t appended_at = dispatch_append_slots(&g_prog->slots, new_slots);
     (void)appended_at;   // == first_new_slot; append_stubs re-checks it
 
-    // Emit the stubs BEFORE the relocations point guest code at them. A failure here leaves the
-    // appended slots in place: they are unreferenced (nothing has been relocated to them yet) and
-    // removing them would need the same lock the dispatcher reads them under.
+    // Emit the stubs BEFORE the relocations point guest code at them. A refusal publishes no new
+    // backing or bytes, so abandon() can remove the uncommitted slots under the dispatcher lock.
     if (!append_stubs(g_prog->slots, first_new_slot, &e)) {
         fprintf(stderr, "[loadmod] '%s': %s -> ENOMEM\n", guest_path, e.c_str());
         return abandon(kEnomem);
     }
+    stubs_appended = true;
     // Same ordering rule for the data aperture: the pages must exist before apply_relocations
     // points guest code at them. Unlike the stub table this appends directly to g_prog->data_slots
     // (nothing indexes it from another thread), so the vector is already grown here.
