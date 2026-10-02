@@ -476,11 +476,11 @@ namespace prosper {
 // host HLE code kills the emulator, not just the guest.
 //
 // The result slots are 32-bit: sceKernelAprSubmitCommandBufferAndGetResult takes
-// (cb, ring, uint32_t* out1, uint32_t* out2). Evidence, strongest first: a guest caller lays the two
-// slots out as adjacent 4-byte stack locals ([rbp-0x3c] and [rbp-0x34], the second sitting directly
-// below its stack canary) and reads one back with a 32-bit load; AnyPS5's libkernel declares both
-// parameters `uint32_t*`; SharpEmu writes a UInt32 id. An 8-byte store here overwrote the four
-// bytes after the slot, which on that stack was the low half of the canary (#4138).
+// (cb, ring, uint32_t* out1, uint32_t* out2). The evidence is the guest's own code: a caller lays
+// the two slots out as adjacent 4-byte stack locals ([rbp-0x3c] and [rbp-0x34], the second sitting
+// directly below its stack canary), initialises one with a 32-bit store and reads it back with a
+// 32-bit load. An 8-byte store here overwrote the four bytes after the slot, which on that stack was
+// the low half of the canary (#4138).
 static void apr_write_result_slot(uint64_t addr, uint32_t value);
 // Diagnostic-only (PROSPER_AMPRLOG): read two guest qwords, false if not safely readable.
 static bool apr_probe_guest_pair(uint64_t addr, uint64_t out[2]);
