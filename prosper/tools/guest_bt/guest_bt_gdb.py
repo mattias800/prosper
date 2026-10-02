@@ -20,7 +20,10 @@
 # stub_ret_off is informational; the unwind rule keys only on PC being inside the stub region.
 #
 # Command:  guest-bt <thread-id-or-name>     e.g.  guest-bt GameUpdate
-import gdb, json, os, struct
+import gdb
+import json
+import os
+import struct
 import gdb.unwinder
 
 _CFG = {}

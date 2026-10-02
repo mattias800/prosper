@@ -13,7 +13,12 @@
 # title once with PROSPER_INITLOG=1). The driver flattens+sections each module (cached under --cache)
 # and, for the IL2CPP module, reuses an Il2CppDumper script.json for managed symbol names if one is
 # found next to the dump or passed via --il2cpp-script.
-import argparse, json, os, re, subprocess, sys
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PRX2ELF = os.path.join(HERE, '..', 'il2cpp', 'prx_to_elf.py')
