@@ -258,7 +258,7 @@ int main(int argc, char** argv) {
         }
         check(roundtrip && parent_reads == 0u && restored_high == 2u &&
               restored_child_high == child[8u + last],
-              "v65 capture owns highest selector and separate highest child word without guest reread");
+              "current capture owns highest selector and separate highest child word without guest reread");
         if (!roundtrip) continue;
         // The same owned parent/selected child feeds a real PS zero relation. Child words are
         // nonzero subnormal bit patterns; the incoming mode fixtures own its category oracle.
@@ -324,14 +324,14 @@ int main(int argc, char** argv) {
                 ? combined_replay.items[0].prt->by_fetch_pc(0u) : nullptr;
             const auto* restored_child = combined_ok && combined_replay.items.size() == 1u && combined_replay.items[0].prt
                 ? combined_replay.items[0].prt->by_fetch_pc(7u) : nullptr;
-            check(combined_ok && combined_decoded.format_version == 65u &&
+            check(combined_ok && combined_decoded.format_version == 66u &&
                   combined_decoded.draws.front().ps_float_mode == mode && combined_replay.items[0].ps_float_mode == mode &&
                   combined_replay.items[0].fragment_wave_config_available && !combined_replay.items[0].ps_wave32 &&
                   restored_parent && restored_parent->host_data && restored_parent->owned_raw_snapshot_bytes == size &&
                   restored_parent->host_data_size == size && std::memcmp(restored_parent->host_data, source->host_data, size) == 0 &&
                   restored_child && restored_child->host_data && restored_child->host_data_size >= size &&
                   std::memcmp(restored_child->host_data, child.data() + 8u, size) == 0,
-                  "combined v65 retains every owned parent/child byte, exact width and full producing mode");
+                  "current capture retains every owned parent/child byte, exact width and full producing mode");
             auto combined_ownerless = combined_draw;
             combined_ownerless.prt = std::make_shared<ShaderResourceTable>(table);
             combined_ownerless.prt->owned_host_data.clear();
@@ -343,7 +343,15 @@ int main(int argc, char** argv) {
               mode_modules[0] != mode_modules[1] && mode_modules[3] != mode_modules[0],
               "full mode availability/bits partition owned PS cache and preserve flush/preserve/unknown relation paths");
         const auto owned_tail_size = 4u + 4u * decoded.draws.front().vrt.resources.size();
-        auto v64_bytes = encoded;
+        const auto transport_tail_size = 12u + decoded.draws.size();
+        auto v65_bytes = encoded;
+        v65_bytes.resize(v65_bytes.size() - transport_tail_size); v65_bytes[8] = 65u;
+        GpuCaptureFile official65;
+        check(deserialize_gpu_capture(v65_bytes, official65, error) && official65.format_version == 65u &&
+              official65.draws.front().vrt.resources.front().resource.owned_raw_snapshot_bytes == size &&
+              official65.draws.front().float_transport == FloatTransportConfig{},
+              "genuine v65 retains the owned obligation but not unavailable transport authority");
+        auto v64_bytes = v65_bytes;
         v64_bytes.resize(v64_bytes.size() - owned_tail_size);
         v64_bytes[8] = 64u;
         GpuCaptureFile official64;
@@ -373,12 +381,12 @@ int main(int argc, char** argv) {
             v62_bytes[8] = 62u;
             v62_bytes[9] = v62_bytes[10] = v62_bytes[11] = 0u;
         }
-        auto bad_count = encoded;
+        auto bad_count = v65_bytes;
         if (bad_count.size() >= owned_tail_size) bad_count[bad_count.size() - owned_tail_size] ^= 1u;
         GpuCaptureFile invalid_format;
         check(!deserialize_gpu_capture(bad_count, invalid_format, error),
               "v65 reader refuses mismatched owned-obligation resource count");
-        auto cut_width = encoded;
+        auto cut_width = v65_bytes;
         cut_width.pop_back();
         check(!deserialize_gpu_capture(cut_width, invalid_format, error),
               "v65 reader refuses a truncated owned-obligation width field");

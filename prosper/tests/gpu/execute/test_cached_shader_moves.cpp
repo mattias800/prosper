@@ -37,6 +37,7 @@ static CachedShader make_entry(const SharedShaderWords& words) {
     value.writes_trip_witness = true;
     prosper::gpu::FragmentCompileCase producer;
     producer.program_address = 17; // metadata transfer only, not a complete compiler fixture
+    producer.float_transport = {prosper::gpu::FloatTransportProfile::ExplicitNonFinite32};
     value.fragment_case = std::make_shared<const prosper::gpu::FragmentCompileCase>(std::move(producer));
     value.fragment_arithmetic.producing_program = 23;
     value.fragment_arithmetic.source_fingerprint = 29;
@@ -49,6 +50,7 @@ static bool same_fields(const CachedShader& e, const SharedShaderWords& words) {
     return e.spirv == words && e.identity == 7 &&
            e.last_use.load() == 42 && e.bytes == 12 &&
            e.writes_trip_witness && e.fragment_case && e.fragment_case->program_address == 17 &&
+           e.fragment_case->float_transport.explicit_nonfinite32() &&
            e.fragment_arithmetic.producing_program == 23 && e.fragment_arithmetic.source_fingerprint == 29 &&
            e.fragment_arithmetic.float_mode == prosper::gpu::FragmentFloatMode{true, 0x31} &&
            e.fragment_arithmetic.families == 1 && e.fragment_arithmetic.site_count == 1 &&

@@ -131,8 +131,8 @@ int main() {
     std::vector<uint8_t> bytes;
     GpuCaptureFile loaded;
     CHECK(serialize_gpu_capture(capture, bytes, error) &&
-              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 65u,
-          "current capture retains the v63 realized-width tail through production codecs");
+              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 66u,
+          "current realized-width tail round-trips through production codecs");
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded, replay, error) && replay.items.size() == realized.size(),
           "production replay materializes captured launch ABI");
@@ -161,14 +161,15 @@ int main() {
         std::all_of(capture.draws.begin(), capture.draws.end(), [](const auto& draw) {
             return draw.vrt.resources.empty() && draw.prt.resources.empty();
         });
-    if (bytes.size() < 16u + 3u * realized.size() || loaded.draws.size() != realized.size() || !no_resources) {
+    if (bytes.size() < 28u + 4u * realized.size() || loaded.draws.size() != realized.size() || !no_resources) {
         CHECK(false, "codec controls require the successful bounded realized fixture");
         return 1;
     }
-    // No resources: remove U4 for an official v64 prefix, then M for genuine v63.
+    // No resources: remove transport T, owned U4, then M for genuine v63.
     const size_t mode_tail_size = 8u + 2u * realized.size();
+    const size_t transport_tail_size = 12u + realized.size();
     auto mode_bytes = bytes;
-    mode_bytes.resize(mode_bytes.size() - 4u);
+    mode_bytes.resize(mode_bytes.size() - transport_tail_size - 4u);
     set_u32(mode_bytes, 8u, 64u);
     GpuCaptureFile official64;
     CHECK(deserialize_gpu_capture(mode_bytes, official64, error) &&

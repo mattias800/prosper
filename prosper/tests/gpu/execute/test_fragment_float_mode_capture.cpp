@@ -127,8 +127,8 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> bytes;
     CHECK(capture_draw_items(realized,metadata,reader,capture,error) &&
               serialize_gpu_capture(capture,bytes,error) && deserialize_gpu_capture(bytes,loaded,error) &&
-              loaded.format_version==65 && loaded.draws.size()==realized.size(),
-          "actual collector and combined v65 production codecs round trip realized mode");
+              loaded.format_version==66 && loaded.draws.size()==realized.size(),
+          "actual collector and current production codecs round trip realized mode");
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded,replay,error) && replay.items.size()==realized.size(),
           "production replay materializes each immutable mode");
@@ -150,10 +150,11 @@ int main(int argc, char** argv) {
         std::all_of(capture.draws.begin(),capture.draws.end(),[](const auto& draw) {
             return draw.vrt.resources.empty() && draw.prt.resources.empty();
         });
-    CHECK(no_resources && bytes.size() >= 4u+8u+2u*capture.draws.size(),
+    CHECK(no_resources && bytes.size() >= 12u+capture.draws.size()+4u+8u+2u*capture.draws.size(),
           "mode controls require the resource-free combined fixture");
-    if (!no_resources || bytes.size() < 4u+8u+2u*capture.draws.size()) return 1;
-    auto mode_bytes = bytes; mode_bytes.resize(mode_bytes.size()-4u); set32(mode_bytes,8,64);
+    if (!no_resources || bytes.size() < 12u+capture.draws.size()+4u+8u+2u*capture.draws.size()) return 1;
+    auto mode_bytes = bytes;
+    mode_bytes.resize(mode_bytes.size()-12u-capture.draws.size()-4u); set32(mode_bytes,8,64);
     GpuCaptureFile official64;
     CHECK(deserialize_gpu_capture(mode_bytes,official64,error) && official64.format_version==64 &&
               official64.draws.size()==capture.draws.size(),
@@ -174,16 +175,16 @@ int main(int argc, char** argv) {
           "legacy rewrite succeeds without inventing mode authority");
     for (const auto& draw : legacy.draws) CHECK(!draw.ps_float_mode.available,"rewrite preserves unknown mode");
     for (uint32_t count : {0u,1u,UINT32_MAX}) {
-        auto corrupt=bytes; set32(corrupt,tail,count);
+        auto corrupt=mode_bytes; set32(corrupt,tail,count);
         CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="invalid realized-draw fragment float mode count",
               "hostile mode count rejected before allocating additional records");
     }
     for (uint8_t tag : {uint8_t{2},uint8_t{255}}) {
-        auto corrupt=bytes; corrupt[tail+4]=tag;
+        auto corrupt=mode_bytes; corrupt[tail+4]=tag;
         CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="invalid realized-draw fragment float mode",
               "reserved mode availability tags reject");
     }
-    auto corrupt=bytes; corrupt[tail+4]=0; corrupt[tail+5]=1;
+    auto corrupt=mode_bytes; corrupt[tail+4]=0; corrupt[tail+5]=1;
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error), "unknown nonzero mode fails closed");
     corrupt=bytes; set32(corrupt,mode_bytes.size()-4,UINT32_MAX);
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="invalid failed-draw fragment float mode count",

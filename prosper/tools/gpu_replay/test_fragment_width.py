@@ -322,6 +322,14 @@ with tempfile.TemporaryDirectory(prefix="prosper-fragment-width-", dir=scratch_r
     known32 = directory / "fragment-width-captured32.prgcap"
     if known32.is_file():
         original = known32.read_bytes()
+        transport_tail = struct.pack("<I", 1) + b"\x00" + struct.pack("<II", 0, 0)
+        genuine66 = (len(original) > 52 and struct.unpack_from("<I", original, 8)[0] == 66 and
+                     original.endswith(transport_tail))
+        check(genuine66, "current width fixture retains canonical unknown-transport v66 tail")
+        if genuine66:
+            original = bytearray(original[:-len(transport_tail)])
+            struct.pack_into("<I", original, 8, 65)
+            original = bytes(original)
         genuine65 = (len(original) > 39 and struct.unpack_from("<I", original, 8)[0] == 65 and
                      original[-4:] == struct.pack("<I", 0))
         check(genuine65, "current resource-free width fixture retains v65 zero owned obligations")

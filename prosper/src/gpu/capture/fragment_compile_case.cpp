@@ -200,6 +200,7 @@ void validate_fragment_compile_case(const FragmentCompileCase& c) {
         require(c.choices.error.empty(), "compile-case choices unavailable");
     }
     require(c.float_mode.canonical(), "compile-case noncanonical float mode");
+    require(c.float_transport.canonical(), "compile-case noncanonical float transport");
     require(c.resources.resources.size() <= kCompileCaseMaxResources &&
             c.blobs.size() <= kCompileCaseMaxBlobs && c.choices.reads.size() <= 65536,
             "compile-case collection budget");
@@ -275,7 +276,8 @@ std::vector<uint32_t> replay_fragment_compile_case(const FragmentCompileCase& c,
     TerminalRejectCapture rejection;
     auto result = recompile_fragment(c.code.data(), c.code.size(), c.has_resources ? &owned.resources : nullptr,
         c.has_system_inputs ? &c.system_inputs : nullptr, c.pcrel_target,
-        &c.interpolation, c.wave32, {RecompileDiagnosticStage::Fragment, c.program_address}, c.float_mode);
+        &c.interpolation, c.wave32, {RecompileDiagnosticStage::Fragment, c.program_address},
+        c.float_mode, nullptr, c.float_transport);
     choices.finish_replay();
     if (baseline) require(result == c.source, "baseline SOURCE differs (full word comparison)");
     const auto reject_records = rejection.take();

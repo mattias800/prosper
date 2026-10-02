@@ -2514,6 +2514,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_fragment_float_mode PRIVATE prosper_core)
   target_include_directories(test_fragment_float_mode PRIVATE tests)
   add_test(NAME fragment_float_mode COMMAND test_fragment_float_mode)
+
+  add_executable(test_fragment_float_transport tests/gpu/recompiler/test_fragment_float_transport.cpp)
+  target_link_libraries(test_fragment_float_transport PRIVATE prosper_core)
+  add_test(NAME fragment_float_transport COMMAND test_fragment_float_transport)
   add_executable(test_fragment_arithmetic_diagnostics tests/gpu/recompiler/test_fragment_arithmetic_diagnostics.cpp)
   target_link_libraries(test_fragment_arithmetic_diagnostics PRIVATE prosper_core)
   target_include_directories(test_fragment_arithmetic_diagnostics PRIVATE tests)
@@ -3002,6 +3006,11 @@ endif()
   add_executable(test_fragment_float_mode_capture tests/gpu/execute/test_fragment_float_mode_capture.cpp)
   target_link_libraries(test_fragment_float_mode_capture PRIVATE prosper_core)
   add_test(NAME fragment_float_mode_capture COMMAND test_fragment_float_mode_capture)
+  add_executable(test_float_transport_capture tests/gpu/execute/test_float_transport_capture.cpp)
+  target_link_libraries(test_float_transport_capture PRIVATE prosper_core)
+  add_test(NAME float_transport_capture COMMAND test_float_transport_capture)
+  add_test(NAME float_transport_null_export_explicit_first
+    COMMAND test_float_transport_capture --dcc-explicit-first)
 
   add_executable(test_gpu_capture_bundle tests/gpu/capture/test_gpu_capture_bundle.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
@@ -4728,6 +4737,7 @@ endif()
       target_link_libraries(test_interp_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME interp_render COMMAND test_interp_render)
 
+
       # RectList fourth-corner synthesis: the geometry stage must complete the rectangle whichever of
       # the three supplied vertices is the shared corner (#3507).
       add_executable(test_rect_synthesis_render tests/gpu/recompiler/test_rect_synthesis_render.cpp)
@@ -5620,6 +5630,14 @@ endif()
 # physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
 # silent pass) where one does not.
 if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  add_executable(test_float_transport_render tests/gpu/execute/test_float_transport_render.cpp)
+  target_include_directories(test_float_transport_render PRIVATE tests frontends)
+  target_link_libraries(test_float_transport_render PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME float_transport_pixel_oracle COMMAND test_float_transport_render --oracle-only)
+  set_tests_properties(float_transport_pixel_oracle PROPERTIES TIMEOUT 10)
+  add_test(NAME float_transport_render COMMAND test_float_transport_render)
+  set_tests_properties(float_transport_render PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
   add_executable(test_image_robustness tests/shared/device/test_image_robustness.cpp)
   # Spells `shared/...` and `gpu/...` includes, which resolve from `frontends` and `src`.
   target_include_directories(test_image_robustness PRIVATE frontends src)
@@ -5692,6 +5710,12 @@ endif()
 # has to fail when the legend is dropped; nothing else in the tree can. Behavioural rather than a
 # source grep: it runs the real binary and reads what an operator would actually see.
 if(TARGET gpu_replay AND Python3_Interpreter_FOUND)
+  add_test(NAME gpu_replay_float_transport_cli
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gpu_replay/test_float_transport.py")
+  set_tests_properties(gpu_replay_float_transport_cli PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+  set_property(TEST gpu_replay_float_transport_cli APPEND PROPERTY ENVIRONMENT
+    "PROSPER_GPU_REPLAY_BIN=$<TARGET_FILE:gpu_replay>"
+    "PROSPER_FLOAT_TRANSPORT_FIXTURE_BIN=$<TARGET_FILE:test_float_transport_capture>")
   add_test(NAME gpu_replay_fragment_float_mode_cli
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/gpu_replay/test_fragment_float_mode.py")

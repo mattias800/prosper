@@ -306,6 +306,12 @@ inline std::vector<Fixture> fixtures() {
     for (const uint32_t bound : {1u, 3u})
         out.push_back({"changing_boolean_odd_bound_" + std::to_string(bound),
                        loops::make_module(loops::Shape::BoolToggle, bound), false, true, 1, 0});
+    // Same three-word typed global definition as the first constant-TRUE positive, but
+    // OpUndef supplies no uniformity/stability certificate. Failure metadata must still name
+    // its actual defining opcode now that the transport inventory retains its type only.
+    auto global_undef = out.front().words;
+    global_undef[find(global_undef, 41)] = (3u << 16) | 1u;
+    out.push_back({"global_undef_vote_is_not_uniform", std::move(global_undef), false, false, 0, 0});
     return out;
 }
 

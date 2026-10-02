@@ -661,6 +661,19 @@ effective SPIR-V/backend subgroup width or complete compilation-input fidelity. 
 fragment retries are separate: they use their captured v61+ PS width when available and ignore this
 realized-draw override. A plain stored-SPIR-V replay does not regenerate or change shader width.
 
+Capture v66 independently retains the producing host float-transport profile for realized draws,
+compute configurations and failed compiler requests: `unknown`, `implicit`, or
+`explicit-nonfinite32`. Raw, pixel-tap and failed-stage regeneration pass that retained choice and
+report it; legacy captures remain unknown, never inferred from a stored SPIR-V capability or the
+replay device. Explicit transport requires a producing device that enabled FloatControls2 and
+supports F32 signed-zero/Inf/NaN preservation. It decorates only cross-float scalar Bitcasts and
+floating fragment Input loads with per-instruction `None`, not arithmetic or global fast math.
+Stored replay modules remain unchanged; execution checks their actual FloatControls2 capability
+against the executing device's enabled profile. Unknown/implicit regeneration visibly retains
+unverified nonfinite transport semantics. This host choice is distinct from the guest FLOAT_MODE
+retained by v64 and from either guest or effective subgroup width. Signaling NaNs may quiet; no
+arbitrary NaN-payload, uniformity, or complete guest floating arithmetic guarantee is implied.
+
 Capture v39 extends the same loop to realized compute dispatches. It retains the bounded raw RDNA2 stream,
 user SGPR push constants, launch/thread ABI, wave/TGID/LDS controls, and the capture host's optional typed-
 storage capability mask. A rendering replay initializes Vulkan before recompilation and selects storage

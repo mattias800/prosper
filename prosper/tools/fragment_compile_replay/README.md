@@ -7,6 +7,11 @@ pinned trip settings, actual consumed semantic choices, immutable linked compile
 expected complete SOURCE or refusal. It is not a frame capture.
 The actual producing key's complete guest FLOAT_MODE byte and availability are retained separately
 from wave width and host float-control publication. Unknown stays unknown; replay never infers it.
+Schema 3 appends the actual pinned host float-transport profile after the unchanged schema-2
+owned-marker tail. An explicitly producing `unknown` profile is a retained input and remains
+replayable; schema-1/2 absence is instead inspectable
+`INCOMPLETE fragment-transport-config-unavailable` and cannot enter the compiler. Neither profile
+nor SOURCE grants feature permission to a different executing Vulkan device.
 
 ```text
 fragment_compile_replay --inspect-only <CASE.prfc>
