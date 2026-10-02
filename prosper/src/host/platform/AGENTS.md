@@ -32,6 +32,12 @@ on a POSIX host at all, let alone driven through its saturating and out-of-range
 `constexpr`, platform-neutral, and exercised by `tests/host/platform/test_precise_sleep.cpp` with a
 fake clock on every platform. Put the next one here too rather than inline at a call site.
 
+**This folder is also where the host-platform seam grows**: one interface per OS service (virtual
+memory, futex, threads, fibers, fault install, clocks, files) with one backend file per OS, so
+`src/hle`, `src/loader`, `src/self` and `src/gpu` stop carrying `#ifdef _WIN32` arms. The design,
+the measured current state and the migration order are in `docs/HOST_PLATFORM_SEAM.md`; the
+`platform-ifdef` ratchet rule stops new arms appearing outside `src/host`.
+
 New code belongs here only if it is genuinely process-wide, genuinely host-level, and genuinely free
 of OS-integration dependencies. Per-platform *image* mapping and execution live in `src/host/image/`;
 memory and TLS have their own sibling folders.

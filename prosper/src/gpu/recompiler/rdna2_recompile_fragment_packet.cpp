@@ -1,6 +1,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/fragment_packet_services.hpp"
 #include <bitset>
 
 namespace prosper::gpu {
@@ -117,7 +118,7 @@ const char* packet_instruction_gap(const Rdna2Inst& in) {
 // words here may hold either data or saved masks, and initialization does not authorize a cast.
 const char* packet_scalar_initialization_gap(const std::vector<Rdna2Inst>& ins,
                                            const std::map<int, uint32_t>& supplied,
-                                           uint32_t& failure_pc) {
+                                           uint32_t& failure_pc, bool resource_variant) {
     using Words = std::bitset<106>;
     std::vector<Words> entry(ins.size());
     std::vector<bool> reachable(ins.size(), false);
@@ -135,7 +136,7 @@ const char* packet_scalar_initialization_gap(const std::vector<Rdna2Inst>& ins,
         failure_pc = in.pc;
         Words defined = entry[i];
         const auto available = [&](int first, uint32_t count) {
-            if (first < 0 || first > 105 || !count || count > 2 ||
+            if (first < 0 || first > 105 || !count || count > (resource_variant ? 8u : 2u) ||
                 first + static_cast<int>(count) > 106) return false;
             for (uint32_t word = 0; word < count; ++word)
                 if (!defined.test(first + word)) return false;
@@ -148,8 +149,12 @@ const char* packet_scalar_initialization_gap(const std::vector<Rdna2Inst>& ins,
             if (in.fmt == Rdna2Format::EXP && !(in.exp_en & (1u << source))) continue;
             const auto& operand = in.src[source];
             if (operand.kind != OperandKind::SGPR) continue;
-            const uint32_t width = scalar_alu_source_words(in, source);
-            if (!width || width == UINT32_MAX || width > 2)
+            const uint32_t width = resource_variant && in.fmt == Rdna2Format::SMEM
+                ? (source == 0 ? 4u : 1u)
+                : resource_variant && in.fmt == Rdna2Format::MIMG
+                ? (source == 1 ? 8u : source == 2 ? 4u : 1u)
+                : scalar_alu_source_words(in, source);
+            if (!width || width == UINT32_MAX || width > (resource_variant ? 8u : 2u))
                 return "packet-scalar-read-form-unimplemented";
             if (!available(operand.value, width))
                 return "packet-sgpr-read-before-definition";
@@ -174,6 +179,11 @@ const char* packet_scalar_initialization_gap(const std::vector<Rdna2Inst>& ins,
 
 FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& packet,
                                                 RecompileDiagnosticContext diagnostic) {
+    return recompile_fragment_packet_impl(packet, diagnostic, nullptr);
+}
+
+FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPacket& packet,
+    RecompileDiagnosticContext diagnostic, PacketResourceServices* services) {
     const auto reject = [&](const std::string& reason, uint32_t pc = UINT32_MAX) {
         FragmentPacketProgram result;
         result.rejection = reason;
@@ -227,7 +237,13 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
     std::map<uint32_t, uint32_t> exports;
     for (const auto& in : ins) pcs.insert(in.pc);
     for (const auto& in : ins) {
-        if (const char* gap = packet_instruction_gap(in)) return reject(gap, in.pc);
+        const char* gap = packet_instruction_gap(in);
+        if (services && gap && !packet_resource_instruction_gap(in)) gap = nullptr;
+        else if (services && in.fmt == Rdna2Format::SMEM)
+            gap = packet_resource_instruction_gap(in);
+        else if (services && in.fmt == Rdna2Format::VINTRP && in.opcode == 0 &&
+                 in.dst.value == in.src[0].value) gap = "packet-parameter-p1-alias-mode-unavailable";
+        if (gap) return reject(gap, in.pc);
         if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x0a &&
             packet.quad_topology != FragmentPacketQuadTopology::ConsecutiveLogicalQuads)
             return reject("packet-quad-topology-unavailable", in.pc);
@@ -253,9 +269,11 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
             const bool mask_pair = in.fmt == Rdna2Format::SOP1 &&
                 (in.opcode == kSop1OpcodeMovB64 || in.opcode == 0x0a) &&
                 (reg == 106 || reg == 126);
-            if ((width == 2 && (reg & 1)) || reg < 0 ||
+            const bool resource_m0 = services && in.fmt == Rdna2Format::SOP1 &&
+                in.opcode == kSop1OpcodeMovB32 && reg == 124;
+            if (!resource_m0 && ((width == 2 && (reg & 1)) || reg < 0 ||
                 (reg + static_cast<int>(width) > 106 && !mask_pair))
-                invalid_scalar_write = true;
+                ) invalid_scalar_write = true;
         });
         if (invalid_scalar_write) return reject("packet-scalar-destination-unimplemented", in.pc);
         const bool pair_source = in.fmt == Rdna2Format::SOP1 &&
@@ -278,14 +296,18 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
                 return reject("packet-scalar-pair-input-invalid", in.pc);
             if (operand.kind == OperandKind::Special && operand.value != 106 &&
                 operand.value != 107 && operand.value != 126 && operand.value != 127 &&
-                operand.value != 253)
+                operand.value != 253 && !(services && in.fmt == Rdna2Format::SMEM &&
+                    source == 1 && operand.value == 125))
                 return reject("packet-special-input-unavailable", in.pc);
         }
     }
     if (exports.empty()) return reject("packet-no-export");
     uint32_t scalar_failure_pc = UINT32_MAX;
-    if (const auto* gap = packet_scalar_initialization_gap(ins, scalars, scalar_failure_pc))
+    if (const auto* gap = packet_scalar_initialization_gap(ins, scalars, scalar_failure_pc, services != nullptr))
         return reject(gap, scalar_failure_pc);
+    if (services)
+        if (const auto* gap = packet_resource_preflight(services->input, ins, scalar_failure_pc))
+            return reject(gap, scalar_failure_pc);
 
     FragmentPacketProgram result;
     result.input_stride = static_cast<uint32_t>(columns.size()) + 4;
@@ -301,6 +323,28 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
         result.input_words[base + columns.size() + 1] = (packet.vcc_mask >> lane) & 1u;
         result.input_words[base + columns.size() + 2] = packet.scc;
         result.input_words[base + columns.size() + 3] = packet.export_enabled[lane];
+    }
+    if (services) {
+        for (const auto& buffer : services->input.buffers) {
+            services->buffer_offsets.emplace(buffer.pc, static_cast<uint32_t>(result.input_words.size()));
+            result.input_words.insert(result.input_words.end(), buffer.words.begin(), buffer.words.end());
+        }
+        // One owned coefficient tuple per lane for each exact VINTRP PC. Duplicated coefficients
+        // are input bytes, not baked output constants; the service consumes the actual I/J/old VDST.
+        for (const auto& in : ins) if (in.fmt == Rdna2Format::VINTRP) {
+            services->parameter_offsets.emplace(in.pc, static_cast<uint32_t>(result.input_words.size()));
+            for (uint32_t lane = 0; lane < 64; ++lane) {
+                const auto primitive = services->input.parameter_cache.quad_primitive[lane / 4];
+                const auto it = std::find_if(services->input.parameter_cache.parameters.begin(),
+                    services->input.parameter_cache.parameters.end(), [&](const auto& p) {
+                        return p.primitive == primitive && p.attribute == in.vintrp_attr && p.channel == in.vintrp_chan;
+                    });
+                if (it == services->input.parameter_cache.parameters.end()) return reject("packet-parameter-tuple-unavailable", in.pc);
+                result.input_words.insert(result.input_words.end(), {it->p0, it->p10, it->p20});
+            }
+        }
+        services->output.status_offset = static_cast<uint32_t>(result.output_words.size());
+        result.output_words.resize(result.output_words.size() + 64 * kFragmentResourceStatusWords, 0);
     }
     SpirvCompute b;
     b.diagnostic = diagnostic;
@@ -326,6 +370,7 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
     state.scc = b.ucmp(Op_INotEqual, b.load_input(state_base + 2), b.uconst(0));
     state.exec_narrowed = true;
     const uint32_t enabled = b.load_input(state_base + 3);
+    if (services) services->begin(b);
     const auto export_record = [&](RegState& current, const Rdna2Inst& in) {
         const uint32_t base = exports.at(in.pc) * kFragmentPacketExportWords;
         const uint32_t fields[] = {b.uconst(1), b.sel(current.exec, b.uconst(1), b.uconst(0)),
@@ -345,13 +390,18 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
     // Force the common synchronized path even for a simple forward branch. Native fragment safe-
     // branch linearization and structured subgroup votes are not packet execution authority.
     TerminalRejectCapture causes;
+    const std::function<int(RegState&, const Rdna2Inst&)> service_callback = services
+        ? std::function<int(RegState&, const Rdna2Inst&)>([&](RegState& current, const Rdna2Inst& in) {
+            return services->emit(b, current, in);
+          }) : std::function<int(RegState&, const Rdna2Inst&)>{};
     if (!emit_cfg_state_machine(b, state, ins, {}, nullptr, true, false, export_record,
-                                packet.guest_code.data(), packet.guest_code.size(), 0, false)) {
+                                packet.guest_code.data(), packet.guest_code.size(), 0, false, service_callback)) {
         const auto records = causes.take();
         return reject(records.empty() ? "packet-guest-emission-refused:no-cause-recorded"
             : "packet-guest-emission-refused:" + records.back().first + ":" +
                 records.back().second.substr(0, 1024));
     }
+    if (services) services->finish(b);
     result.spirv = b.finish();
     if (result.spirv.empty()) return reject("packet-module-finalization-refused");
     return result;

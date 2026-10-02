@@ -23,6 +23,16 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   packets. The shipping renderer companion in `tests/fixtures/raster_quad_collection_gpu.h` owns
   the actual scratch pass; it declines unproved pre-raster effects, missing producing modules and
   unsupported domains. No framebuffer export, depth/blend commit or guest-wave packing is added.
+- `fragment_resource_packet` — a separate owned-input packet compiler/transactional EXP consumer.
+  `fragment_packet_resource_preflight` checks original read-PC/descriptor/parameter/M0 ownership
+  and all-path full WAIT completion; `fragment_packet_resource_services` emits actual SMEM,
+  P1/P2, explicit-LZ/L nearest sampling and integer finite F32 operations from those inputs.
+  `fragment_packet_f32` preserves explicit input/output denorm and rounding modes in integer
+  arithmetic; nonfinite/overflow and non-exact interpolation remain named runtime failures.
+  All64 workers rendezvous and append sticky statuses; ANY failure prevents the consumer from
+  publishing ANY raw EXP record. Integer packet ABI/native paths remain separate. Complete supplied
+  VGPR backing is mandatory, and this does not initialize guest inputs from host raster records,
+  enable implicit/bias sampling, establish live resource epochs, or admit any real DrawItem.
 - `spirv_builder` — small hand-built SPIR-V modules. **These include shipped shaders**:
   `frontends/shared/live/live_compute.cpp`'s `prepare_compare_pipeline()` feeds
   `build_compute_compare_uvec4()` straight to `vkCreateShaderModule` on the live path. The GPU

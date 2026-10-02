@@ -1,4 +1,5 @@
-# Baseline for tools/ci/check_arch_ratchet.py -- six cross-title costs that may go DOWN, never UP.
+# Baseline for tools/ci/check_arch_ratchet.py -- ten cross-title and structural costs
+# that may go DOWN, never UP.
 #
 # One row per finding: `RULE|path[|token] VALUE  # optional note`. No line numbers in the key, so
 # ordinary code motion never re-keys a row. Rules and their roots are in the checker's docstring.
@@ -22,6 +23,12 @@
 # Seeded on main 3247d3a5 by `--emit-baseline`, with no violation fixed: this records the tree as
 # it was, not as anyone wants it to be. Refreshed on main 832f3aa6, where #4173 had grown two
 # capped files before the gate existed; those two rows carry a note naming it.
+#
+# platform-ifdef, layer-include, fixture-include and vk-object were seeded on main 6499c4d7, again
+# with nothing fixed. The layer-include table (LAYER_ORDER in the checker) is, lowest first:
+#   self < loader < input < diagnostics < host < gpu < hle
+# A layer may include itself and anything to its LEFT; nothing in prosper/src may include
+# frontends/ or tests/. Evidence and the target tree: prosper/docs/ARCHITECTURE_TARGET_TREE.md.
 
 title-id|prosper/frontends/prosper-app/test_frame_grab_match.cpp 1
 title-id|prosper/frontends/prosper-app/test_frame_grab_naming.cpp 29
@@ -166,7 +173,9 @@ file-size|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 5526
 file-size|prosper/src/gpu/execute/gpu_executor.cpp 13258
 file-size|prosper/src/gpu/pm4/command_processor.cpp 5539
 file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9420
-file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 9002
+# note #4192: seven net lines connect original owned packet instruction services at the existing
+# dispatcher boundary, preserving the empty native callback and scalar lifetime invalidation.
+file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 9009
 file-size|prosper/src/hle/kernel/hle_kernel.cpp 5566
 file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8625
 file-size|prosper/tests/fixtures/render_runner.h 16758  # raised from 16700: grown by #4173 (GPU breadcrumbs) before this gate landed
@@ -195,3 +204,91 @@ test-dep|prosper/frontends/shared/live/submit_renderer/timing_report.cpp 2
 test-dep|prosper/frontends/shared/present/compute_scanout.cpp 6
 test-dep|prosper/frontends/shared/present/present_blit.cpp 2
 test-dep|prosper/frontends/video_mf/test_videodec2_mf.cpp 1
+platform-ifdef|prosper/src/gpu/agc/agc_shader_layout.cpp 1
+platform-ifdef|prosper/src/gpu/capture/capture_collect.cpp 2
+platform-ifdef|prosper/src/gpu/capture/gpu_capture.cpp 2
+platform-ifdef|prosper/src/gpu/capture/gpu_capture_bundle.cpp 2
+platform-ifdef|prosper/src/gpu/capture/gpu_capture_internal.hpp 2
+platform-ifdef|prosper/src/gpu/capture/serialize/capture_codecs.hpp 2
+platform-ifdef|prosper/src/gpu/capture/serialize/capture_deserialize.cpp 2
+platform-ifdef|prosper/src/gpu/capture/serialize/capture_serialize.cpp 2
+platform-ifdef|prosper/src/gpu/capture/serialize/fragment_compile_case_codec.cpp 2
+platform-ifdef|prosper/src/gpu/execute/gpu_executor.cpp 6
+platform-ifdef|prosper/src/gpu/execute/mb3_freelist.cpp 2
+platform-ifdef|prosper/src/gpu/execute/shader_cache_internal.hpp 2
+platform-ifdef|prosper/src/gpu/timeline/gpu_timeline.cpp 2
+platform-ifdef|prosper/src/hle/audio/hle_audio.cpp 6
+platform-ifdef|prosper/src/hle/dispatch/dispatch.cpp 3
+platform-ifdef|prosper/src/hle/dispatch/dispatch.hpp 2
+platform-ifdef|prosper/src/hle/fs/guest_sync.cpp 2
+platform-ifdef|prosper/src/hle/fs/hle_file.cpp 70
+platform-ifdef|prosper/src/hle/fs/save_capacity.cpp 1
+platform-ifdef|prosper/src/hle/fs/save_param.cpp 3
+platform-ifdef|prosper/src/hle/fs/save_paths.cpp 3
+platform-ifdef|prosper/src/hle/fs/savedata.cpp 6
+platform-ifdef|prosper/src/hle/graphics/hle_agc.cpp 5
+platform-ifdef|prosper/src/hle/input/ime.cpp 11
+platform-ifdef|prosper/src/hle/kernel/guest_thread_handle.cpp 1
+platform-ifdef|prosper/src/hle/kernel/guest_thread_handle.hpp 1
+platform-ifdef|prosper/src/hle/kernel/hle_kernel.cpp 60
+platform-ifdef|prosper/src/hle/kernel/hle_kernel_time.cpp 10
+platform-ifdef|prosper/src/hle/kernel/sce_errno.hpp 1
+platform-ifdef|prosper/src/hle/libc/hle_libc.cpp 17
+platform-ifdef|prosper/src/hle/libc/libc_variadic_capture.cpp 4
+platform-ifdef|prosper/src/hle/libc/libc_variadic_capture.hpp 1
+platform-ifdef|prosper/src/hle/memory/heap_mutex.hpp 1
+platform-ifdef|prosper/src/hle/memory/hle_kernel_mem.cpp 16
+platform-ifdef|prosper/src/hle/np/np.cpp 10
+platform-ifdef|prosper/src/hle/service/hle_service.cpp 7
+platform-ifdef|prosper/src/hle/service/service_trace.hpp 1
+platform-ifdef|prosper/src/hle/sync/hle_fiber.cpp 24
+platform-ifdef|prosper/src/hle/sync/hle_ult.cpp 3
+platform-ifdef|prosper/src/hle/sync/host_tcb_scope.hpp 1
+platform-ifdef|prosper/src/hle/sync/sync_futex.cpp 23
+platform-ifdef|prosper/src/hle/sync/sync_futex.hpp 1
+platform-ifdef|prosper/src/hle/video/avplayer.cpp 26
+platform-ifdef|prosper/src/hle/video/videodec2.cpp 6
+layer-include|prosper/src/diagnostics/perf/perf_alarms.cpp|gpu 1
+layer-include|prosper/src/diagnostics/perf/wave64_refusal.hpp|gpu 1
+layer-include|prosper/src/diagnostics/readback_reason_census.cpp|frontends 1
+layer-include|prosper/src/diagnostics/readback_refusal.cpp|gpu 1
+layer-include|prosper/src/gpu/capture/capture_collect.cpp|hle 1
+layer-include|prosper/src/gpu/capture/gpu_capture.cpp|hle 1
+layer-include|prosper/src/gpu/capture/gpu_capture_internal.hpp|hle 1
+layer-include|prosper/src/gpu/capture/serialize/capture_codecs.hpp|hle 1
+layer-include|prosper/src/gpu/capture/serialize/capture_deserialize.cpp|hle 1
+layer-include|prosper/src/gpu/capture/serialize/capture_serialize.cpp|hle 1
+layer-include|prosper/src/gpu/execute/gpu_executor.cpp|hle 1
+layer-include|prosper/src/gpu/execute/graphics_nested_wide_reader.hpp|hle 1
+layer-include|prosper/src/gpu/execute/nested_wide_data_admission.cpp|hle 1
+layer-include|prosper/src/gpu/pm4/command_processor.cpp|hle 3
+layer-include|prosper/src/host/image/boot_program.cpp|hle 1
+layer-include|prosper/src/host/image/exec_image.hpp|hle 1
+layer-include|prosper/src/host/image/exec_image_linux.cpp|hle 3
+layer-include|prosper/src/host/image/exec_image_win.cpp|hle 3
+layer-include|prosper/src/host/image/runtime_module_load.cpp|hle 1
+layer-include|prosper/src/host/tls/guest_tls.cpp|hle 2
+layer-include|prosper/src/loader/linker.hpp|hle 1
+layer-include|prosper/src/loader/tls_layout.hpp|hle 1
+fixture-include|prosper/frontends/prosper-app/test_frame_grab_match.cpp 1
+fixture-include|prosper/frontends/shared/live/live_renderer.cpp 3
+fixture-include|prosper/frontends/shared/live/live_renderer_internal.hpp 3
+fixture-include|prosper/frontends/shared/live/submit_renderer/callback_types.hpp 3
+fixture-include|prosper/frontends/shared/present/compute_scanout.cpp 1
+fixture-include|prosper/frontends/shared/present/present_blit.cpp 1
+fixture-include|prosper/frontends/shared/tests/test_buffer_range_plan.cpp 1
+vk-object|prosper/frontends/prosper-app/fps_overlay.cpp|vkCreateDescriptorPool 1
+vk-object|prosper/frontends/prosper-app/library_media.cpp|vkCreateFence 1
+vk-object|prosper/frontends/prosper-app/library_ui.cpp|vkCreateDescriptorPool 1
+vk-object|prosper/frontends/prosper-app/library_ui.cpp|vkCreateFence 1
+vk-object|prosper/frontends/prosper-app/main.cpp|vkCreateFence 1
+vk-object|prosper/frontends/shared/live/gpu_retile.hpp|vkCreateDescriptorPool 1
+vk-object|prosper/frontends/shared/live/indirect_dispatch.hpp|vkCreateDescriptorPool 1
+vk-object|prosper/frontends/shared/live/live_compute.cpp|vkCreateDescriptorPool 4
+vk-object|prosper/frontends/shared/live/live_compute.cpp|vkCreateFence 1
+vk-object|prosper/frontends/shared/live/packed_rtt_conversion.hpp|vkCreateDescriptorPool 1
+vk-object|prosper/frontends/shared/present/compute_scanout.cpp|vkCreateFence 1
+vk-object|prosper/frontends/shared/present/present_blit.cpp|vkCreateFence 1
+vk-object|prosper/src/gpu/diagnostics/gpu_memory_budget_vk.hpp|vkAllocateMemory 1
+vk-object|prosper/tests/fixtures/render_runner.h|vkCreateDescriptorPool 1
+vk-object|prosper/tests/fixtures/render_runner.h|vkCreateFence 5

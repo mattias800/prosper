@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Architecture ratchet: stop six measured cross-title costs from growing.
+"""Architecture ratchet: stop ten measured cross-title and structural costs from growing.
 
 Why this exists
 ---------------
@@ -29,6 +29,25 @@ The rules (every count is per file, over tracked files only, with comments strip
                  than FILE_SIZE_THRESHOLD lines may not exceed its baselined line cap.
   test-dep       `prosper::test::` in code under prosper/frontends -- the shipping app depending on
                  the test namespace.
+  platform-ifdef preprocessor conditionals (`#if`/`#ifdef`/`#ifndef`/`#elif`...) that test a host
+                 platform macro (PLATFORM_MACROS: `_WIN32`, `_WIN64`, `__linux__`, `__APPLE__`,
+                 `__MINGW32__`, `_MSC_VER`), one per directive, in prosper/src/{hle,loader,self,
+                 gpu}. src/host is exempt: that is where host-platform code belongs. The seam this
+                 pushes code towards is prosper/docs/HOST_PLATFORM_SEAM.md.
+  layer-include  an `#include` from one prosper/src top-level layer into a layer it may not depend
+                 on, one row per (file, target layer), valued by the number of include lines.
+                 LAYER_ORDER below is the table: a layer may include itself and any layer EARLIER
+                 in the list, never a later one; nothing under prosper/src may include frontends/
+                 or tests/. Files directly in prosper/src (build_revision.hpp) belong to no layer
+                 and may be included from anywhere. `"a/b.hpp"` resolves against prosper/src (the
+                 include root); `"../x"` resolves against the including file's directory.
+  fixture-include  `#include "fixtures/..."` (prosper/tests/fixtures) from code under
+                 prosper/frontends -- the shipping renderer built out of the test tree
+                 (render_runner.h is the live Vulkan backend today).
+  vk-object      call sites of vkCreateDescriptorPool, vkAllocateMemory and vkCreateFence (one row
+                 per file per token, same roots as getenv) -- a static proxy for creating Vulkan
+                 objects per draw/submit instead of pooling them. A count, not a proof: most
+                 sites are one-time setup, which is why it is a ratchet and not a ban.
 
 Verdicts
 --------
@@ -97,6 +116,12 @@ What this CANNOT see -- read before quoting a clean run
   * A vkWaitForFences reached through a dispatch-table member (`d.vkWaitForFences`) counts; one
     through a differently named `PFN_vkWaitForFences` variable does not.
   * Only C-family suffixes are scanned (SOURCE_SUFFIXES). Shaders, assembly and Python are not.
+  * layer-include resolves `"a/b"` against prosper/src only. A quoted include the compiler would
+    find next to the including file first would be attributed to the wrong layer. Includes
+    produced by macros are not seen.
+  * platform-ifdef counts directives, not lines of platform code: a 200-line `#ifdef _WIN32`
+    block counts 1. A platform test spelled through a project macro is not counted.
+  * vk-object cannot tell a per-draw creation from a one-time one; it only stops the count rising.
   * The slug list is only as complete as prosper/scripts/. A title with no route folder is not a
     slug, so `src/.../<that-title>/` would not be caught.
 
@@ -119,7 +144,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_BASELINE = HERE / "arch_ratchet_baseline.txt"
+# The one file `--update` may write, relative to --root. Every path argument is resolved and must
+# stay inside --root (symlinks followed), so a crafted `--baseline ../x` cannot read or write
+# outside the checkout this gate was asked to judge.
+CANONICAL_BASELINE = "prosper/tools/ci/arch_ratchet_baseline.txt"
 
 SOURCE_SUFFIXES = (
     ".c",
@@ -147,6 +175,23 @@ CALL_ROOTS = (SRC, FRONTENDS)
 CALL_FILES = (RENDER_RUNNER,)
 SIZE_ROOTS = (SRC, FRONTENDS, FIXTURES)
 TEST_DEP_ROOTS = (FRONTENDS,)
+PLATFORM_ROOTS = tuple(f"{SRC}{layer}/" for layer in ("hle", "loader", "self", "gpu"))
+
+# The include-direction table for layer-include, lowest layer first. A layer may include itself
+# and anything earlier; including a later layer is a violation. Keep in sync with
+# prosper/docs/ARCHITECTURE_TARGET_TREE.md ("Layer order"), which records the evidence:
+#   self         SELF/ELF parsing into host-independent images; depends on nothing.
+#   loader       links parsed modules; "host-agnostic" (src/loader/AGENTS.md).
+#   input        platform-neutral pad state, fed by frontends.
+#   diagnostics  observer-only instrumentation every layer above may report into.
+#   host         host execution and OS services (memory, platform, abi, tls, fault, image).
+#   gpu          AGC/PM4 decode and RDNA2->SPIR-V translation, driven by the HLE graphics calls.
+#   hle          the reimplemented Sony libraries: the top of the core, calling down into the rest.
+# Baselined exceptions are the known inversions (host/image and host/tls reaching hle/dispatch,
+# loader reaching hle/dispatch for ImportSlot, gpu reaching hle for guest memory / futex / save
+# paths, diagnostics reaching gpu and frontends) -- each is debt to move, never a precedent.
+LAYER_ORDER = ("self", "loader", "input", "diagnostics", "host", "gpu", "hle")
+FORBIDDEN_LAYERS = ("frontends", "tests")  # never includable from prosper/src
 
 # 5000 lines. On the head this gate was introduced against, the files above it are the ones
 # docs/REFACTOR_PLAN_2026_09.md already names as split candidates. A lower threshold baselines many
@@ -169,8 +214,30 @@ SYNC_TOKENS = (
 )
 SYNC_RES = {token: re.compile(rf"\b{token}\b") for token in SYNC_TOKENS}
 TEST_DEP_RE = re.compile(r"\bprosper\s*::\s*test\s*::")
+PLATFORM_MACROS = ("_WIN32", "_WIN64", "__linux__", "__APPLE__", "__MINGW32__", "_MSC_VER")
+PLATFORM_IF_RE = re.compile(
+    r"^[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif|elifdef|elifndef)\b[^\n]*\b(?:"
+    + "|".join(PLATFORM_MACROS)
+    + r")\b",
+    re.MULTILINE,
+)
+INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*[<"]([^>"\n]+)[>"]', re.MULTILINE)
+FIXTURE_INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*[<"]fixtures/', re.MULTILINE)
+VK_OBJECT_TOKENS = ("vkCreateDescriptorPool", "vkAllocateMemory", "vkCreateFence")
+VK_OBJECT_RES = {token: re.compile(rf"\b{token}\s*\(") for token in VK_OBJECT_TOKENS}
 
-RULES = ("title-id", "title-dir", "getenv", "blocking-sync", "file-size", "test-dep")
+RULES = (
+    "title-id",
+    "title-dir",
+    "getenv",
+    "blocking-sync",
+    "file-size",
+    "test-dep",
+    "platform-ifdef",
+    "layer-include",
+    "fixture-include",
+    "vk-object",
+)
 CAP_RULES = ("title-dir", "file-size")
 
 # Sanity floors, far below today's tree. Tripping one means the scan is not seeing the tree (wrong
@@ -210,6 +277,25 @@ FIX_HINT = {
     "test-dep": (
         "The shipping frontend referencing prosper::test::. Move what it needs into src/ or "
         "frontends/shared/ instead of reaching into the test namespace."
+    ),
+    "platform-ifdef": (
+        "A host-platform #if in shared code. Call (or add) an interface under src/host/platform/ "
+        "with one backend per OS instead -- prosper/docs/HOST_PLATFORM_SEAM.md. Moving an "
+        "existing call site behind the seam is a behaviour-neutral change: commit it separately."
+    ),
+    "layer-include": (
+        "An include against the layer order (LAYER_ORDER in check_arch_ratchet.py; "
+        "prosper/docs/ARCHITECTURE_TARGET_TREE.md). Move the shared type down to a layer both "
+        "sides may include, or invert the call (an interface owned by the lower layer)."
+    ),
+    "fixture-include": (
+        "Shipping frontend code including prosper/tests/fixtures. The Vulkan backend is moving "
+        "out of the test tree (prosper/docs/ARCHITECTURE_TARGET_TREE.md); include it from its "
+        "new home, or add what you need there, not under tests/."
+    ),
+    "vk-object": (
+        "A new Vulkan object-creation call site. Create pools, memory and fences once and reuse "
+        "them; if this one is genuinely one-time setup, say so in a comment and raise the row."
     ),
 }
 
@@ -374,6 +460,50 @@ def _hits(regex: re.Pattern[str], view: str) -> list[int]:
     return [_line_of(view, m.start()) for m in regex.finditer(view)]
 
 
+def layer_of(path: str) -> str | None:
+    """The prosper/src top-level layer a repo path is in, `frontends`/`tests`, or None."""
+    if path.startswith(SRC):
+        rest = path[len(SRC) :]
+        return rest.split("/", 1)[0] if "/" in rest else None
+    if path.startswith(FRONTENDS):
+        return "frontends"
+    if path.startswith("prosper/tests/"):
+        return "tests"
+    return None
+
+
+def include_target(path: str, spelled: str) -> str:
+    """Repo path an include names: `../x` against the file's directory, else against src/."""
+    if spelled.startswith(("./", "../")):
+        parts = path.split("/")[:-1]
+    else:
+        parts = SRC.rstrip("/").split("/")
+    for piece in spelled.split("/"):
+        if piece == "..":
+            if parts:
+                parts.pop()
+        elif piece not in ("", "."):
+            parts.append(piece)
+    return "/".join(parts)
+
+
+def layer_violations(path: str, code: str) -> dict[str, list[int]]:
+    """{forbidden target layer: include line numbers} for a file under prosper/src."""
+    own = layer_of(path)
+    if own not in LAYER_ORDER:
+        return {}
+    rank = LAYER_ORDER.index(own)
+    out: dict[str, list[int]] = {}
+    for m in INCLUDE_RE.finditer(code):
+        target = layer_of(include_target(path, m.group(1)))
+        if target is None or target == own:
+            continue
+        later = target in LAYER_ORDER and LAYER_ORDER.index(target) > rank
+        if target in FORBIDDEN_LAYERS or later:
+            out.setdefault(target, []).append(_line_of(code, m.start()))
+    return out
+
+
 def scan(files: dict[str, str], slugs: set[str]) -> dict[str, Finding]:
     """Every finding for a tree given as {repo-relative posix path: text}."""
     found: dict[str, Finding] = {}
@@ -396,8 +526,16 @@ def scan(files: dict[str, str], slugs: set[str]) -> dict[str, Finding]:
                 add(f"getenv|{path}", _hits(GETENV_RE, bare))
                 for token, regex in SYNC_RES.items():
                     add(f"blocking-sync|{path}|{token}", _hits(regex, bare))
+                for token, regex in VK_OBJECT_RES.items():
+                    add(f"vk-object|{path}|{token}", _hits(regex, bare))
             if under(path, TEST_DEP_ROOTS):
                 add(f"test-dep|{path}", _hits(TEST_DEP_RE, bare))
+                add(f"fixture-include|{path}", _hits(FIXTURE_INCLUDE_RE, code))
+            if under(path, PLATFORM_ROOTS):
+                add(f"platform-ifdef|{path}", _hits(PLATFORM_IF_RE, bare))
+            if path.startswith(SRC):
+                for target, lines in sorted(layer_violations(path, code).items()):
+                    add(f"layer-include|{path}|{target}", lines)
         if under(path, SIZE_ROOTS):
             lines = line_count(text)
             if lines > FILE_SIZE_THRESHOLD:
@@ -773,6 +911,10 @@ POSITIVE_TREE = {
     "prosper/frontends/g.cpp": "prosper::test::RenderCtx ctx;\n",
     "prosper/tests/fixtures/big.h": BIG,
     RENDER_RUNNER: "vkQueueWaitIdle(q);\n",
+    "prosper/src/hle/p.cpp": "#ifdef _WIN32\nint w;\n#elif defined(__linux__)\nint l;\n#endif\n",
+    "prosper/src/host/l.cpp": '#include "hle/dispatch/dispatch.hpp"\n#include "self/module.hpp"\n',
+    "prosper/src/gpu/v.cpp": "vkCreateFence(d, &i, nullptr, &f);\n",
+    "prosper/frontends/k.cpp": '#include "fixtures/render_runner.h"\n',
 }
 POSITIVE_KEYS = {
     "title-id|prosper/src/a.cpp": 1,
@@ -783,6 +925,10 @@ POSITIVE_KEYS = {
     "test-dep|prosper/frontends/g.cpp": 1,
     "file-size|prosper/tests/fixtures/big.h": FILE_SIZE_THRESHOLD + 1,
     f"blocking-sync|{RENDER_RUNNER}|vkQueueWaitIdle": 1,
+    "platform-ifdef|prosper/src/hle/p.cpp": 2,
+    "layer-include|prosper/src/host/l.cpp|hle": 1,
+    "vk-object|prosper/src/gpu/v.cpp|vkCreateFence": 1,
+    "fixture-include|prosper/frontends/k.cpp": 1,
 }
 # Every rule's pattern written where it must NOT count: comments, string and raw-string literals,
 # lookalike identifiers, non-scanned roots, a non-title directory.
@@ -800,6 +946,10 @@ NEGATIVE_TREE = {
     "prosper/tests/host/t.cpp": 'auto v = getenv("X"); vkWaitForFences(); // PPSA24651\n',
     "prosper/src/my.cpp": 'my_getenv("x"); SDL_getenv("y"); PFN_vkWaitForFences p;\n',
     "prosper/frontends/s.cpp": 'puts("prosper::test::x");\n',
+    "prosper/src/host/h.cpp": '#ifdef _WIN32\n#endif\n#include "self/module.hpp"\n',
+    "prosper/src/hle/c.cpp": '// #ifdef _WIN32\n#include "host/platform/lifecycle.hpp"\n',
+    "prosper/frontends/j.cpp": '// #include "fixtures/x.h"\n#include "shared/x.h"\n',
+    "prosper/src/gpu/q.cpp": "#if PROSPER_WIN32_LIKE\n#endif\nPFN_vkCreateFence p;\n",
 }
 
 
@@ -916,10 +1066,33 @@ def run(root: Path, baseline: Path, mode: str) -> int:
     return EXIT_VIOLATION
 
 
+def contained_paths(root_arg: str, baseline_arg: str | None, update: bool) -> tuple[Path, Path]:
+    """(root, baseline), both resolved; EvaluationError if the baseline escapes the root.
+
+    `--update` additionally may write only CANONICAL_BASELINE under the root.
+    """
+    root = Path(root_arg).resolve()
+    canonical = (root / CANONICAL_BASELINE).resolve()
+    baseline = canonical if baseline_arg is None else (root / baseline_arg).resolve()
+    if not baseline.is_relative_to(root):
+        raise EvaluationError(
+            f"--baseline {baseline_arg!r} resolves outside --root {root}; refused"
+        )
+    if update and baseline != canonical:
+        raise EvaluationError(
+            f"--update writes only {CANONICAL_BASELINE} under --root; refused {baseline_arg!r}"
+        )
+    return root, baseline
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     ap.add_argument("--root", default=str(HERE.parents[2]), help="checkout root")
-    ap.add_argument("--baseline", default=str(DEFAULT_BASELINE), help="baseline file")
+    ap.add_argument(
+        "--baseline",
+        default=None,
+        help=f"baseline file inside --root (default: {CANONICAL_BASELINE})",
+    )
     group = ap.add_mutually_exclusive_group()
     group.add_argument("--selftest", action="store_true", help="run the hand-built arms")
     group.add_argument("--list", action="store_true", help="also print every finding (* = new)")
@@ -943,9 +1116,12 @@ def main(argv: list[str] | None = None) -> int:
     mode = "list" if args.list else "update" if args.update else ""
     mode = "emit" if args.emit_baseline else mode
     try:
+        root, baseline = contained_paths(args.root, args.baseline, mode == "update")
         if args.base is not None:
-            return run_delta(Path(args.root).resolve(), Path(args.baseline), args.base)
-        return run(Path(args.root).resolve(), Path(args.baseline), mode)
+            if args.base.startswith("-"):
+                raise EvaluationError(f"--base {args.base!r} looks like an option; refused")
+            return run_delta(root, baseline, args.base)
+        return run(root, baseline, mode)
     except EvaluationError as exc:
         print(f"error: could not evaluate: {exc}", file=sys.stderr)
         return EXIT_UNEVALUATED
