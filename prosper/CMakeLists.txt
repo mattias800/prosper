@@ -2543,6 +2543,19 @@ if(TARGET prosper_core)
   target_link_libraries(test_shader_dump_filter PRIVATE prosper_core)
   add_test(NAME shader_dump_filter COMMAND test_shader_dump_filter)
 
+  # PROSPER_GPU_BREADCRUMBS core + emitter against recording Vulkan entry points. No device: stock
+  # lavapipe exposes neither marker extension, so what this proves is the emitter/resolver contract,
+  # not that a real driver executes the writes before a hang (a local run, recorded in the PR).
+  add_executable(test_gpu_breadcrumbs tests/gpu/diagnostics/test_gpu_breadcrumbs.cpp)
+  target_link_libraries(test_gpu_breadcrumbs PRIVATE prosper_core)
+  add_test(NAME gpu_breadcrumbs COMMAND test_gpu_breadcrumbs)
+
+  # PROSPER_GPU_LABELS: the label text, colour class and begin/end pairing, against recording
+  # debug-utils entry points. What a capture tool DISPLAYS of them is a local look, not a ctest.
+  add_executable(test_gpu_labels tests/gpu/diagnostics/test_gpu_labels.cpp)
+  target_link_libraries(test_gpu_labels PRIVATE prosper_core)
+  add_test(NAME gpu_labels COMMAND test_gpu_labels)
+
   add_executable(test_gpu_memory_budget tests/gpu/diagnostics/test_gpu_memory_budget.cpp)
   target_include_directories(test_gpu_memory_budget PRIVATE tests)   # fixtures/test_scratch.h
   target_link_libraries(test_gpu_memory_budget PRIVATE prosper_core)
