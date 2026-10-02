@@ -80,6 +80,26 @@ class OnePositivePerRule(unittest.TestCase):
             "test-dep|prosper/frontends/shared/a.cpp",
             1,
         ),
+        "platform-ifdef": (
+            {"prosper/src/hle/sync/a.cpp": "#if defined(__linux__)\n#endif\n"},
+            "platform-ifdef|prosper/src/hle/sync/a.cpp",
+            1,
+        ),
+        "layer-include": (
+            {"prosper/src/host/image/a.cpp": '#include "hle/dispatch/dispatch.hpp"\n'},
+            "layer-include|prosper/src/host/image/a.cpp|hle",
+            1,
+        ),
+        "fixture-include": (
+            {"prosper/frontends/shared/live/a.cpp": '#include "fixtures/render_runner.h"\n'},
+            "fixture-include|prosper/frontends/shared/live/a.cpp",
+            1,
+        ),
+        "vk-object": (
+            {"prosper/src/gpu/a.cpp": "vkCreateDescriptorPool(d, &i, nullptr, &p);\n"},
+            "vk-object|prosper/src/gpu/a.cpp|vkCreateDescriptorPool",
+            1,
+        ),
     }
 
     def test_each_rule_fires_alone_and_reports_new(self):
@@ -231,7 +251,8 @@ class Cli(unittest.TestCase):
         self.write("prosper/scripts/gta5-PPSA04263/route.pad", "x\n")
         self.git("init", "-q")
         self.git("add", "-A")
-        self.baseline = self.root / "baseline.txt"
+        self.baseline = self.root / car.CANONICAL_BASELINE
+        self.baseline.parent.mkdir(parents=True, exist_ok=True)
         rows = [car.Row(k, v) for k, v in car.POSITIVE_KEYS.items()]
         self.baseline.write_text(car.format_baseline(["# test"], rows), encoding="utf-8")
 
@@ -278,6 +299,119 @@ class Cli(unittest.TestCase):
         self.assertEqual(car.EXIT_UNEVALUATED, self.gate())
 
 
+class PathContainment(unittest.TestCase):
+    """Every path argument must resolve inside --root; --update writes only the canonical file.
+
+    Addresses the SonarCloud path-injection finding on --update's baseline write (#4199).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "repo"
+        self.canonical = self.root / car.CANONICAL_BASELINE
+        self.canonical.parent.mkdir(parents=True)
+        self.canonical.write_text("# t\n", encoding="utf-8")
+        self.outside = Path(self.tmp.name) / "outside.txt"
+        self.outside.write_text("# t\n", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def refused(self, baseline, update=False):
+        with self.assertRaises(car.EvaluationError):
+            car.contained_paths(str(self.root), baseline, update)
+
+    def test_relative_traversal_is_refused(self):
+        self.refused("../outside.txt")
+        self.refused("../outside.txt", update=True)
+
+    def test_absolute_path_outside_is_refused(self):
+        self.refused(str(self.outside))
+
+    def test_symlink_escaping_the_root_is_refused(self):
+        link = self.root / "escape.txt"
+        try:
+            link.symlink_to(self.outside)
+        except (OSError, NotImplementedError):
+            self.skipTest("this host does not allow creating symlinks")
+        self.refused("escape.txt")
+
+    def test_update_writes_only_the_canonical_file(self):
+        other = self.root / "other.txt"
+        other.write_text("# t\n", encoding="utf-8")
+        self.refused("other.txt", update=True)
+        _root, baseline = car.contained_paths(str(self.root), "other.txt", False)
+        self.assertEqual(baseline, other.resolve())
+
+    def test_canonical_path_is_accepted(self):
+        for arg in (None, car.CANONICAL_BASELINE, str(self.canonical)):
+            _root, baseline = car.contained_paths(str(self.root), arg, True)
+            self.assertEqual(baseline, self.canonical.resolve())
+
+    def test_main_maps_refusal_to_two_and_writes_nothing(self):
+        rc = car.main(["--root", str(self.root), "--baseline", "../outside.txt", "--update"])
+        self.assertEqual(car.EXIT_UNEVALUATED, rc)
+        self.assertEqual("# t\n", self.outside.read_text(encoding="utf-8"))
+
+    def test_option_like_base_is_refused(self):
+        rc = car.main(["--root", str(self.root), "--base=--output=x"])
+        self.assertEqual(car.EXIT_UNEVALUATED, rc)
+
+
+class StructuralRules(unittest.TestCase):
+    """Hand-built positive and negative instances of the structural rules."""
+
+    def test_platform_ifdef_counts_directives_outside_host_only(self):
+        body = "#if defined(_MSC_VER) || defined(__MINGW32__)\n#endif\n#ifndef __APPLE__\n#endif\n"
+        files = {"prosper/src/loader/a.cpp": body, "prosper/src/host/memory/b.cpp": body}
+        self.assertEqual({"platform-ifdef|prosper/src/loader/a.cpp": 2}, car.scan_values(files))
+
+    def test_platform_ifdef_ignores_comments_and_unrelated_macros(self):
+        body = "// #ifdef _WIN32\n#ifdef NDEBUG\n#endif\n#define X _WIN32\n"
+        self.assertEqual({}, car.scan_values({"prosper/src/gpu/a.cpp": body}))
+
+    def test_layer_include_direction(self):
+        files = {
+            "prosper/src/hle/a.cpp": '#include "host/x.hpp"\n#include "gpu/y.hpp"\n',
+            "prosper/src/self/b.cpp": '#include "loader/z.hpp"\n#include "self/w.hpp"\n',
+            "prosper/src/gpu/c.cpp": '#include <hle/q.hpp>\n#include "hle/r.hpp"\n',
+        }
+        want = {
+            "layer-include|prosper/src/self/b.cpp|loader": 1,
+            "layer-include|prosper/src/gpu/c.cpp|hle": 2,
+        }
+        self.assertEqual(want, car.scan_values(files))
+
+    def test_layer_include_resolves_parent_relative_paths(self):
+        files = {
+            "prosper/src/diagnostics/d.cpp": '#include "../../frontends/shared/p.hpp"\n',
+            "prosper/src/diagnostics/core/e.cpp": '#include "../boot_phase_log.hpp"\n',
+            "prosper/src/loader/f.hpp": (
+                '#include "../self/module.hpp"\n#include "../build_revision.hpp"\n'
+            ),
+        }
+        want = {"layer-include|prosper/src/diagnostics/d.cpp|frontends": 1}
+        self.assertEqual(want, car.scan_values(files))
+
+    def test_layer_include_never_into_tests(self):
+        files = {"prosper/src/host/t.cpp": '#include "../../tests/fixtures/x.h"\n'}
+        self.assertEqual({"layer-include|prosper/src/host/t.cpp|tests": 1}, car.scan_values(files))
+
+    def test_fixture_include_only_from_frontends(self):
+        inc = '#include "fixtures/render_runner.h"\n'
+        files = {"prosper/frontends/a.cpp": inc, "prosper/tests/host/b.cpp": inc}
+        self.assertEqual({"fixture-include|prosper/frontends/a.cpp": 1}, car.scan_values(files))
+
+    def test_vk_object_counts_calls_not_types_or_strings(self):
+        body = (
+            "vkAllocateMemory(d, &i, nullptr, &m);\n"
+            "PFN_vkAllocateMemory p;\n"
+            'log("vkCreateFence(");\n'
+        )
+        want = {"vk-object|prosper/src/gpu/a.cpp|vkAllocateMemory": 1}
+        self.assertEqual(want, car.scan_values({"prosper/src/gpu/a.cpp": body}))
+
+
 class Delta(unittest.TestCase):
     """Delta mode against a throwaway repository: a base commit, then a change on top of it.
 
@@ -297,7 +431,8 @@ class Delta(unittest.TestCase):
         for n in range(car.MIN_SLUGS):
             self.write(f"prosper/scripts/title{n}/route.pad", "x\n")
         self.write("prosper/scripts/gta5-PPSA04263/route.pad", "x\n")
-        self.baseline = self.root / "baseline.txt"
+        self.baseline = self.root / car.CANONICAL_BASELINE
+        self.baseline.parent.mkdir(parents=True, exist_ok=True)
         rows = {k: car.Row(k, v) for k, v in car.POSITIVE_KEYS.items()}
         rows[self.STALE_KEY] = car.Row(self.STALE_KEY, 1)  # e.cpp really has 2
         self.write_rows(rows)

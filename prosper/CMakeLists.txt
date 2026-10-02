@@ -515,7 +515,7 @@ if(Python3_Interpreter_FOUND)
   # loudly, when ruff is absent; the python-quality CI job installs it, so there they always run.
   add_test(NAME python_quality_gate
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_check_python_quality.py")
-  # check_arch_ratchet.py: per-file counts of six cross-title costs may go down, never up. The
+  # check_arch_ratchet.py: per-file counts of ten measured costs may go down, never up. The
   # tests build one positive instance of every rule by hand, so a matcher that quietly stops
   # matching goes red here instead of reporting a clean tree. The real-tree arms need the checkout
   # (`git ls-files`): full mode must EVALUATE, and delta mode against origin/main (skipped when
