@@ -67,6 +67,20 @@ jobs:
                 range="${PUSH_BEFORE}..${PUSH_AFTER}"
               fi ;;
           esac
+          # gitleaks scans ZERO commits and exits 0 when a range end is not in the clone (a force push
+          # leaves `before` unreachable), which would read as a clean scan. Verify both ends: an
+          # unreachable start falls back to the full history; an unreachable end is an error.
+          if [ -n "$range" ]; then
+            start="${range%%..*}"; end="${range##*..}"
+            if ! git rev-parse --quiet --verify "${end}^{commit}" >/dev/null; then
+              echo "::error::scan range end ${end} is not in the clone; refusing to report a clean scan"
+              exit 1
+            fi
+            if ! git rev-parse --quiet --verify "${start}^{commit}" >/dev/null; then
+              echo "::warning::scan range start ${start} is not in the clone (force push?); scanning the full history"
+              range=""
+            fi
+          fi
           echo "scan range: ${range:-<full history>}"
           # --redact: a real finding must not be printed into a public log.
           # --exit-code 1 is the default; spelled out because a non-zero here is the whole point.

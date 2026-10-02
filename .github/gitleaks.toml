@@ -24,6 +24,8 @@ targetRules = ["generic-api-key"]
 regexTarget = "match"
 paths = [
     # JSON map of source-file names -> reader policy; the "secret" is `compiler_resource_access.cpp`.
+    # The file is deleted on main (#4186) but stays in history, which the weekly and manual
+    # full-history scans read, so this entry must stay.
     '''prosper/tools/fragment_compile_replay/reader_policy\.json''',
     # Vendored Dear ImGui: `key >= ImGuiKey_...` comparisons.
     '''prosper/third_party/imgui/''',
