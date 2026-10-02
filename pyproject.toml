@@ -37,11 +37,20 @@ indent-style = "space"
 # Measured 2026-10-02 over the 77 test_*.py files: 12 collect tests, 40 are script-style (ctest runs
 # them as programs and pytest collects nothing), 25 fail at import (module-level sys.exit / missing
 # build output). ctest stays the source of truth for the rest; widen this list as files are converted.
+# Since then a `pythonpath` entry made 8 more import (see below); test_schedstat_probe.py also
+# imports but is flaky (fails ~2 of 4 runs on main), so it stays out until fixed.
 # Left out although collected: tools/test_lanekill.py (7 errors on this host) and
 # tools/test_session_start.py (passes, but 71 s).
 testpaths = [
     "prosper/tests/tools/test_dump_hygiene.py",
     "prosper/tools/ci",
+    "prosper/tools/doctor/test_doctor.py",
+    "prosper/tools/perf/test_compare_capture_pair.py",
+    "prosper/tools/perf/test_perf_caller_report.py",
+    "prosper/tools/perf/test_perf_f8_gap.py",
+    "prosper/tools/perf/test_performance_capture_report.py",
+    "prosper/tools/perf/test_schedstat_f8.py",
+    "prosper/tools/pixel_history/test_pixel_history.py",
     "prosper/tools/gpu_replay/test_regress.py",
     "prosper/tools/guest_bt/test_guest_bt.py",
     "prosper/tools/hang_probe/test_hang_probe.py",
@@ -50,5 +59,12 @@ testpaths = [
     "prosper/tools/re/test_hle_handler_map.py",
     "prosper/tools/snapshot/test_snapshot.py",
     "prosper/tools/test_worktree_reclaim.py",
+]
+# --import-mode=importlib does not put a test's folder on sys.path, and these tests import their
+# sibling tool by bare name.
+pythonpath = [
+    "prosper/tools/doctor",
+    "prosper/tools/perf",
+    "prosper/tools/pixel_history",
 ]
 addopts = ["-p", "no:cacheprovider", "--import-mode=importlib"]
