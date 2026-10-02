@@ -133,7 +133,7 @@ class Verdicts(unittest.TestCase):
         self.run_hook("git commit -m x")
         argv = self.checker_argv()
         self.assertIsNotNone(argv, "the checker never ran")
-        self.assertEqual(["--base", "origin/main"], argv[argv.index("--base") :][:2])
+        self.assertEqual(["--base", "refs/remotes/origin/main"], argv[argv.index("--base") :][:2])
 
     def test_missing_origin_main_fails_open_without_running_the_checker(self):
         self.install_checker(0)
@@ -183,6 +183,22 @@ class Verdicts(unittest.TestCase):
         self.run_hook("git commit -m x")
         self.assertFalse(planted.exists(), "the working-tree checker was executed")
         self.assertIsNotNone(self.checker_argv(), "the origin/main checker did not run")
+
+    def test_a_tag_named_origin_main_cannot_replace_the_checker(self):
+        # git resolves `origin/main` via refs/tags/ before refs/remotes/; a fetched fork tag of that
+        # name must not swap in its own checker.
+        self.install_checker(0)
+        planted = Path(self.tmp, "planted.json")
+        self.checker.write_text(self.stand_in(0, "", planted))
+        self.git("add", hook.CHECKER)
+        self.git("commit", "-q", "-m", "fork checker")
+        self.git("tag", "origin/main")
+        self.git("checkout", "-q", "HEAD~1")
+        self.run_hook("git commit -m x")
+        self.assertFalse(planted.exists(), "a tag named origin/main supplied the checker")
+        self.assertIsNotNone(
+            self.checker_argv(), "the refs/remotes/origin/main checker did not run"
+        )
 
     def test_another_repository_runs_nothing(self):
         # A scratch clone of a contributor's branch has its own origin/main and its own checker.

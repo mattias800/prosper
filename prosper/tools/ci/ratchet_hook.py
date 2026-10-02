@@ -58,10 +58,12 @@ BASELINE = os.path.join("prosper", "tools", "ci", "arch_ratchet_baseline.txt")
 # from the project repository's object store. Never the copy in the checkout a command names -- that
 # may be a contributor's PR branch or an unrelated clone, and this hook runs before the permission
 # prompt, so executing a file from it would run unreviewed code with no prompt.
-TRUSTED_CHECKER_REF = "origin/main:prosper/tools/ci/check_arch_ratchet.py"
+# Fully spelled: git resolves `origin/main` through refs/tags/ and refs/heads/ before refs/remotes/, so a
+# local tag or branch of that name (a fork fetch can bring one) would silently replace the checker.
+TRUSTED_CHECKER_REF = "refs/remotes/origin/main:prosper/tools/ci/check_arch_ratchet.py"
 GIT_TIMEOUT_S = 5
 CHECKER_TIMEOUT_S = 45
-BASE_REF = "origin/main"
+BASE_REF = "refs/remotes/origin/main"
 # The rollout switch. False: a violation is a warning (exit 0 + systemMessage). True: it blocks
 # the commit or push (exit 2). Flip it in its own reviewed change once the warnings are trusted.
 BLOCK_ON_VIOLATION = False
