@@ -4,6 +4,23 @@ project(prosper LANGUAGES C CXX)   # C for the vendored LibAtrac9 decoder (third
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+include(cmake/WindowsGnuVariadicProducer.cmake)
+
+# #4078: the native WinLibs POSIX emutls runtime can free C++ TLS storage before its
+# destructor. This explicitly selected profile uses Clang's native Windows TLS instead.
+# Keep ordinary builds unchanged; the lifetime regression remains visible on broken runtimes.
+if(PROSPER_NATIVE_CLANG_TLS)
+  if(NOT WIN32 OR NOT MINGW OR NOT CMAKE_C_COMPILER_ID STREQUAL "Clang" OR
+     NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+     NOT CMAKE_CXX_COMPILER_TARGET STREQUAL "x86_64-w64-windows-gnu")
+    message(FATAL_ERROR "native-Clang TLS profile requires actual Windows GNU-ABI Clang compilers")
+  endif()
+  add_compile_options(-fno-emulated-tls)
+  # libstdc++/libgcc from the GNU sysroot use winpthreads. Append after the compiler's
+  # default runtime archives, rather than relying on archive order in Threads::Threads.
+  set(CMAKE_CXX_STANDARD_LIBRARIES "${CMAKE_CXX_STANDARD_LIBRARIES} -lwinpthread")
+  message(STATUS "prosper native-Clang profile: Windows GNU ABI, native TLS (not emutls)")
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
@@ -86,6 +103,9 @@ include(cmake/ProsperBuildRevision.cmake)
 prosper_add_build_revision_library(prosper_build_revision WORK_TREE "${CMAKE_SOURCE_DIR}/..")
 
 file(GLOB_RECURSE PROSPER_SRC CONFIGURE_DEPENDS src/*.cpp)
+if(PROSPER_NATIVE_CLANG_TLS)
+  list(FILTER PROSPER_SRC EXCLUDE REGEX "src/hle/libc/libc_variadic_capture\\.cpp$")
+endif()
 # Exclude the diagnostics HISTORY/REPORT layer when the feature is disabled (default). When enabled,
 # the PROSPER_DIAGNOSTICS define activates the real implementation; the headers always compile
 # (stubs when disabled).
@@ -109,6 +129,10 @@ if(PROSPER_SRC)
   target_include_directories(prosper_core PRIVATE third_party/stb)
   target_link_libraries(prosper_core PUBLIC libatrac9 PRIVATE prosper_build_revision)
   target_compile_definitions(prosper_core PRIVATE PROSPER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  if(PROSPER_NATIVE_CLANG_TLS)
+    prosper_add_gnu_variadic_producer(prosper_core
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/hle/libc/libc_variadic_capture.cpp" libc_capture)
+  endif()
   if(PROSPER_DIAGNOSTICS)
     target_compile_definitions(prosper_core PRIVATE PROSPER_DIAGNOSTICS)
   endif()
@@ -177,6 +201,12 @@ add_executable(test_compute_buffer_diff_span tests/shared/compute/test_compute_b
 target_include_directories(test_compute_buffer_diff_span PRIVATE frontends src)
 find_package(Threads REQUIRED)
 target_link_libraries(test_compute_buffer_diff_span PRIVATE Threads::Threads)
+
+# Standard-library-only host lifetime guard: no core/GPU/game and no scratch/export opt-out.
+add_executable(test_native_tls_lifetime tests/host/platform/test_native_tls_lifetime.cpp)
+target_link_libraries(test_native_tls_lifetime PRIVATE Threads::Threads)
+add_test(NAME native_tls_lifetime COMMAND test_native_tls_lifetime)
+set_tests_properties(native_tls_lifetime PROPERTIES TIMEOUT 30)
 add_test(NAME compute_buffer_diff_span COMMAND test_compute_buffer_diff_span)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -3167,6 +3197,8 @@ endif()
   # compiler's own readers here, and against the real CRT on Windows.
   add_executable(test_guest_varargs tests/host/abi/test_guest_varargs.cpp)
   target_link_libraries(test_guest_varargs PRIVATE prosper_core)
+  prosper_add_gnu_variadic_producer(test_guest_varargs
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/host/abi/guest_varargs_fixture.cpp" test_capture)
   add_test(NAME guest_varargs COMMAND test_guest_varargs)
 
   # sceImeUpdate must invoke the guest key handler on the CALLER's guest %fs, not the host %fs the
