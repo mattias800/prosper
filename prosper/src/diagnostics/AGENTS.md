@@ -63,7 +63,7 @@ consumer disposition remain UNKNOWN. Successful lookup metadata is not successfu
 
 Only the first 64 selected early-refusal records are output, after the backend helper returns and
 outside counted submission/queue-lock regions. A cap notice states subsequent suppression. The
-exit report is an unverified RUN SNAPSHOT: independent relaxed counts report seen reservations,
+exit report is an unverified RUN SNAPSHOT: independent atomic counts report seen reservations,
 accepted/failed `fputs` calls and suppression decisions, not a coherent partition, durable output
 or guest-worker quiescence. No new alarm rule, lifecycle journal, wait, pin or publication policy
 is introduced. Total selected requests are not observed; a zero refusal count is not a qualified

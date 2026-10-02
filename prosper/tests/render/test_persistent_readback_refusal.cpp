@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -37,12 +38,16 @@ constexpr VkFormat kRequestedFormat = VK_FORMAT_B8G8R8A8_UNORM;
 // Independent expectation: this guest format uses the backend's canonical RGBA8 key.
 constexpr VkFormat kCanonicalFormat = VK_FORMAT_R8G8B8A8_UNORM;
 constexpr PersistentColorTargetKey kKey{kAddress, kWidth, kHeight, kCanonicalFormat, 0};
-int failures = 0;
+
+int& failure_count() {
+    static int count = 0;
+    return count;
+}
 
 void check(bool condition, const char* message) {
     if (!condition) {
         std::fprintf(stderr, "FAIL: %s\n", message);
-        ++failures;
+        ++failure_count();
     }
 }
 
@@ -109,6 +114,47 @@ struct Control {
     uint64_t requested_address = kAddress;
 };
 
+void check_refusal_observation(const Control& control, const refusal::Record& record,
+                               uint64_t begin_us, uint64_t end_us) {
+    check(record.reason == control.expected, "actual readback records the independent refusal reason");
+    check(record.source_us >= begin_us && record.source_us <= end_us && record.source_us != 0,
+          "actual refusal carries a source monotonic timestamp within the call");
+    check(record.address == control.requested_address && record.width == kWidth && record.height == kHeight &&
+          record.volume_depth == 0 && record.requested_format == static_cast<uint32_t>(kRequestedFormat),
+          "refusal retains actual request identity and raw format");
+    check(record.canonical_known == (control.expected != Reason::GlobalUnproven) &&
+          (!record.canonical_known || record.canonical_format == static_cast<uint32_t>(kCanonicalFormat)),
+          "canonical key is observed only after the earlier unproven guard");
+    check(record.lookup.key_present == control.key_present &&
+          record.lookup.valid == control.observed_valid && record.image_present == control.image_present &&
+          record.layout_known == control.layout_known &&
+          (!record.layout_known || record.layout == static_cast<uint32_t>(control.layout)),
+          "short-circuit priority retains unknown for unevaluated operands");
+    check(record.context.caller == refusal::Caller::ComputeSnapshot &&
+          record.context.known == (refusal::SubmitKnown | refusal::ProgramKnown) &&
+          record.context.submit == 3891 && record.context.draw == 0 && record.context.program == 0x38911234 &&
+          record.context.frontend_gpu_valid == ObservedBool::Yes &&
+          record.context.frontend_cpu_pixels == ObservedBool::No, "backend preserves caller context");
+    char text[1024]{};
+    const size_t size = refusal::format_record(text, sizeof(text), record);
+    check(size > 0 && size < sizeof(text), "actual refusal formatter fits the bounded control buffer");
+    char key[96]{};
+    std::snprintf(key, sizeof(key), "key=0x%llx/16x8/requested-format=44/",
+                  static_cast<unsigned long long>(control.requested_address));
+    char stamp[64]{};
+    std::snprintf(stamp, sizeof(stamp), "source-us=%llu clock=steady-us",
+                  static_cast<unsigned long long>(record.source_us));
+    check(std::strstr(text, control.reason_text) && std::strstr(text, key) &&
+          std::strstr(text, stamp) &&
+          std::strstr(text, control.expected == Reason::GlobalUnproven
+                            ? "canonical-format=NOT_OBSERVED" : "canonical-format=37"),
+          "formatter reports the independent reason, request key and clock domain");
+    check(std::strstr(text, "history=UNKNOWN") && std::strstr(text, "producer-tokens=NOT_OBSERVED") &&
+          std::strstr(text, "pins=NOT_OBSERVED") && std::strstr(text, "gate=NOT_OBSERVED") &&
+          std::strstr(text, "final-consumer-disposition=UNKNOWN"),
+          "typed failure does not invent producer, lifecycle or final-consumer history");
+}
+
 void refused_readback(const Control& control, bool armed) {
     std::printf("control: %s\n", control.name);
     refusal::Record record{};
@@ -168,54 +214,20 @@ void refused_readback(const Control& control, bool armed) {
                     : "persistent color target is unavailable"), "original error text preserved");
     check(unchanged, "refusal preserves cache identity, validity, layout, pins, bytes and recency");
     if (!armed) {
-        check(std::memcmp(before.data(), &record, sizeof(record)) == 0,
+        std::array<unsigned char, sizeof(record)> after{};
+        std::memcpy(after.data(), &record, sizeof(record));
+        check(before == after,
               "disabled: null observation pointer leaves sentinel untouched");
         return;
     }
-    check(record.reason == control.expected, "actual readback records the independent refusal reason");
-    check(record.source_us >= begin_us && record.source_us <= end_us && record.source_us != 0,
-          "actual refusal carries a source monotonic timestamp within the call");
-    check(record.address == control.requested_address && record.width == kWidth && record.height == kHeight &&
-          record.volume_depth == 0 && record.requested_format == static_cast<uint32_t>(kRequestedFormat),
-          "refusal retains actual request identity and raw format");
-    check(record.canonical_known == (control.expected != Reason::GlobalUnproven) &&
-          (!record.canonical_known || record.canonical_format == static_cast<uint32_t>(kCanonicalFormat)),
-          "canonical key is observed only after the earlier unproven guard");
-    check(record.lookup.key_present == control.key_present &&
-          record.lookup.valid == control.observed_valid && record.image_present == control.image_present &&
-          record.layout_known == control.layout_known &&
-          (!record.layout_known || record.layout == static_cast<uint32_t>(control.layout)),
-          "short-circuit priority retains unknown for unevaluated operands");
-    check(record.context.caller == refusal::Caller::ComputeSnapshot &&
-          record.context.known == (refusal::SubmitKnown | refusal::ProgramKnown) &&
-          record.context.submit == 3891 && record.context.draw == 0 && record.context.program == 0x38911234 &&
-          record.context.frontend_gpu_valid == ObservedBool::Yes &&
-          record.context.frontend_cpu_pixels == ObservedBool::No, "backend preserves caller context");
-    char text[1024]{};
-    const size_t size = refusal::format_record(text, sizeof(text), record);
-    check(size > 0 && size < sizeof(text), "actual refusal formatter fits the bounded control buffer");
-    char key[96]{};
-    std::snprintf(key, sizeof(key), "key=0x%llx/16x8/requested-format=44/",
-                  static_cast<unsigned long long>(control.requested_address));
-    char stamp[64]{};
-    std::snprintf(stamp, sizeof(stamp), "source-us=%llu clock=steady-us",
-                  static_cast<unsigned long long>(record.source_us));
-    check(std::strstr(text, control.reason_text) && std::strstr(text, key) &&
-          std::strstr(text, stamp) &&
-          std::strstr(text, control.expected == Reason::GlobalUnproven
-                            ? "canonical-format=NOT_OBSERVED" : "canonical-format=37"),
-          "formatter reports the independent reason, request key and clock domain");
-    check(std::strstr(text, "history=UNKNOWN") && std::strstr(text, "producer-tokens=NOT_OBSERVED") &&
-          std::strstr(text, "pins=NOT_OBSERVED") && std::strstr(text, "gate=NOT_OBSERVED") &&
-          std::strstr(text, "final-consumer-disposition=UNKNOWN"),
-          "typed failure does not invent producer, lifecycle or final-consumer history");
+    check_refusal_observation(control, record, begin_us, end_us);
 }
 
-size_t occurrences(const std::string& text, const char* token) {
+size_t occurrences(std::string_view text, std::string_view token) {
     size_t count = 0, position = 0;
-    while ((position = text.find(token, position)) != std::string::npos) {
+    while ((position = text.find(token, position)) != std::string_view::npos) {
         ++count;
-        position += std::strlen(token);
+        position += token.size();
     }
     return count;
 }
@@ -305,6 +317,7 @@ int main(int argc, char** argv) {
     refused_readback({"earlier sticky-unproven", Reason::GlobalUnproven, "reason=global-unproven", true, kKey, true, true,
                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, ObservedBool::NotObserved,
                      ObservedBool::NotObserved, ObservedBool::NotObserved, false}, armed);
+    const int failures = failure_count();
     std::printf("%s: %d failure(s); CPU observation controls establish no GPU completion/pixels\n",
                 failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
