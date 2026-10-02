@@ -19,6 +19,7 @@
 #include "gpu/capture/capture_compute_policy.hpp"
 #include "gpu/diagnostics/compute_parent_walk.hpp"
 #include "gpu/diagnostics/shader_dump_filter.hpp"  // PROSPER_SHADER_DUMP_PROGRAM address filter
+#include "gpu/diagnostics/fragment_arithmetic.hpp"
 #include "gpu/diagnostics/compute_tree_watch.hpp"
 #include "gpu/present/videoout_present.hpp"   // present_write_frame
 #include "gpu/timeline/menu_capture_runtime.hpp"
@@ -1493,7 +1494,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
 // not at guest memory (#3130).
 std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const ShaderCompileKey& key,
                                               const ShaderResourceTable* resources,
-                                              uint64_t program_address) {
+                                              uint64_t program_address,
+                                              FragmentArithmeticObservation* arithmetic_observation) {
     const uint32_t* code = !key.code || key.code->empty() ? nullptr : key.code->data();
     const size_t code_size = key.code ? key.code->size() : 0u;
     if (stage == ShaderProgramStage::Vertex)
@@ -1524,7 +1526,7 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
                                   key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX,
                                   &interpolation, key.fragment_wave32,
                                   {RecompileDiagnosticStage::Fragment, program_address},
-                                  key.fragment_float_mode);
+                                  key.fragment_float_mode, arithmetic_observation);
     }
     return {};
 }
@@ -1671,8 +1673,11 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
     if (PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
         cache.bypasses.fetch_add(1, std::memory_order_relaxed);
+        FragmentArithmeticObservation arithmetic_observation;
         auto spirv = std::make_shared<const std::vector<uint32_t>>(
-            compile_graphics_shader(stage, key, resources, program_address));
+            compile_graphics_shader(stage, key, resources, program_address, &arithmetic_observation));
+        if (stage == ShaderProgramStage::Fragment)
+            observe_fragment_arithmetic(arithmetic_observation, program_address, !spirv->empty());
         maybe_dump_successful_shader(stage, key, *spirv, program_address, chain_address);
         return spirv;
     }
@@ -1686,6 +1691,9 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
             found->second.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
                                          std::memory_order_relaxed);
             if (cache_identity) *cache_identity = found->second.identity;
+            if (stage == ShaderProgramStage::Fragment)
+                observe_fragment_arithmetic(found->second.fragment_arithmetic,
+                                            program_address, !found->second.spirv->empty());
             maybe_dump_successful_shader(stage, key, *found->second.spirv, program_address,
                                         chain_address);
             return found->second.spirv;
@@ -1699,14 +1707,20 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
         double_check->second.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
                                             std::memory_order_relaxed);
         if (cache_identity) *cache_identity = double_check->second.identity;
+        if (stage == ShaderProgramStage::Fragment)
+            observe_fragment_arithmetic(double_check->second.fragment_arithmetic,
+                                        program_address, !double_check->second.spirv->empty());
         maybe_dump_successful_shader(stage, key, *double_check->second.spirv, program_address,
                                     chain_address);
         return double_check->second.spirv;
     }
 
     const auto start = std::chrono::steady_clock::now();
+    FragmentArithmeticObservation arithmetic_observation;
     auto spirv = std::make_shared<const std::vector<uint32_t>>(
-        compile_graphics_shader(stage, key, resources, program_address));
+        compile_graphics_shader(stage, key, resources, program_address, &arithmetic_observation));
+    if (stage == ShaderProgramStage::Fragment)
+        observe_fragment_arithmetic(arithmetic_observation, program_address, !spirv->empty());
     maybe_dump_successful_shader(stage, key, *spirv, program_address, chain_address);
     const auto end = std::chrono::steady_clock::now();
     ++cache.stats.misses;
@@ -1736,6 +1750,7 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
     if (bytes <= limit && max_entries != 0) {
         CachedShader value;
         value.spirv = spirv;
+        value.fragment_arithmetic = arithmetic_observation;
         value.identity = cache.next_identity++;
         value.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
                              std::memory_order_relaxed);
@@ -1920,7 +1935,11 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
         const SharedShaderAnalysis& captured_analysis,
         FragmentFloatMode fragment_float_mode) {
     if (cache_identity) *cache_identity = 0;
-    if (!fragment_float_mode.canonical()) return {};
+    if (!fragment_float_mode.canonical()) {
+        if (stage == ShaderProgramStage::Fragment)
+            observe_fragment_arithmetic({}, reinterpret_cast<uintptr_t>(code), false);
+        return {};
+    }
     ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
                                                    system_inputs, nullptr, 0,
                                                    vertex_lds_dwords, nullptr,

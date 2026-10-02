@@ -24,6 +24,10 @@
 //   * unsupported-wave64-shaders reports known Wave64 fragment/compute translation and subgroup
 //     refusals on every platform. Default-on [wave64-unsupported] lines identify failed work;
 //     wave64_refusals in JSONL counts repeated uses, separately from bounded new refusal identities.
+//   * unverified-fragment-f32-arithmetic observes direct/cached compiler requests that emitted
+//     guest F32 ADD/MUL, including requests refused later. Guest mode availability is separate
+//     from verified support. Bounded default lines precede flip windows; JSONL/alarms retain
+//     request accounting. Neither the rule nor its counts proves execution or wrong pixels.
 //   * at exit, also one census line (not a rule): the first failing field of the exact
 //     full-overwrite shape test over every tested compute result, and the destination refusals of
 //     the results that passed it -- printed only when a compute result was ever tested.

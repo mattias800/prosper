@@ -136,6 +136,16 @@ enum class Counter : uint8_t {
     Wave64UnidentifiedRefusals, // uses with neither a compile identity nor a program address
     Wave64InventoryOverflow,   // uses whose identity could not enter the full inventory
     Wave64ShaderChecks,        // known-Wave64 observations at realization/backend boundaries
+    // Actual direct/cached fragment compiler requests, NOT draws, execution or wrong pixels.
+    // Families describe emitted guest ADD/MUL sites only; other arithmetic is not inventoried.
+    FragmentArithmeticRequests,
+    FragmentArithmeticKnownMode,
+    FragmentArithmeticUnknownMode,
+    FragmentArithmeticAddRequests,
+    FragmentArithmeticMulRequests,
+    FragmentArithmeticRefusedRequests, // qualifying requests whose final module was empty
+    FragmentArithmeticTruncatedRequests,
+    FragmentArithmeticInventoryOverflowRequests,
     // Fresh direct-fold WAIT_REG_MEM predicate evaluations only. Ordered-effect acceptance,
     // queued-without-evaluation waits and deferred rechecks do not enter this denominator.
     WaitRegMemDirectEvaluations,

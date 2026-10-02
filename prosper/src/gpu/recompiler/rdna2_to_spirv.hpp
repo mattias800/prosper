@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <vector>
 #include "gpu/recompiler/fragment_float_mode.hpp"
+#include "gpu/recompiler/fragment_arithmetic_observation.hpp"
 
 namespace prosper::gpu {
 
@@ -645,6 +646,8 @@ uint32_t compute_spirv_min_subgroup_size(const std::vector<uint32_t>& spirv);
 // write vec4(src0..3) to the matching color output. NULL-only shaders retain discard/EXEC effects and
 // intentionally expose no color output. Returns {} if unsupported / no implemented export.
 // An optional ShaderResourceTable enables memory ops (SMEM/MUBUF/MTBUF) with resolved bindings.
+// A nonnull arithmetic_observation transfers reporting to the owning cache request; it must replay
+// the retained observation on every return. Default direct callers announce once per request.
 std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt = nullptr,
                                          const PixelSystemInputMapping* system_inputs = nullptr,
@@ -653,7 +656,8 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          bool wave32 = false,
                                          RecompileDiagnosticContext diagnostic = {
                                              RecompileDiagnosticStage::Fragment, 0},
-                                         FragmentFloatMode float_mode = {});
+                                         FragmentFloatMode float_mode = {},
+                                         FragmentArithmeticObservation* arithmetic_observation = nullptr);
 
 // Test hook for the low-half EXEC/VCC mask path. Production fragment compilation supplies the same
 // mode from SPI_PS_IN_CONTROL.PS_W32_EN.
