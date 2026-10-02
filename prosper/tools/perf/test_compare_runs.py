@@ -20,11 +20,23 @@ import compare_runs as cr  # noqa: E402
 
 def run_record(**over):
     record = {
-        "type": "run", "schema": 1, "title": "PPSA00000", "build_revision": "a" * 40,
-        "input_route": "route.pad", "capture_mode": "wall_seconds", "seconds": 60.0, "every": 1,
-        "requested": 60, "warmup_ms": 0, "warmup_submits": 0, "render_every": "",
-        "render_every_for_ms": "", "render_scale": "", "render_target_dim": "",
-        "render_resource_dim": "", "assertions": {"fps_overlay": False},
+        "type": "run",
+        "schema": 1,
+        "title": "PPSA00000",
+        "build_revision": "a" * 40,
+        "input_route": "route.pad",
+        "capture_mode": "wall_seconds",
+        "seconds": 60.0,
+        "every": 1,
+        "requested": 60,
+        "warmup_ms": 0,
+        "warmup_submits": 0,
+        "render_every": "",
+        "render_every_for_ms": "",
+        "render_scale": "",
+        "render_target_dim": "",
+        "render_resource_dim": "",
+        "assertions": {"fps_overlay": False},
     }
     record.update(over)
     return record
@@ -32,10 +44,18 @@ def run_record(**over):
 
 def conditions_record(**over):
     record = {
-        "type": "conditions", "schema": 1, "harness": "tools/screenshot",
-        "present_path": "forced_readback", "os": "linux", "flip_pace_fps": "",
-        "gpu_known": True, "gpu_vendor_id": 4098, "gpu_device_id": 29631,
-        "gpu_driver_version": 99, "gpu_api_version": 4202496, "gpu_device_type": 2,
+        "type": "conditions",
+        "schema": 1,
+        "harness": "tools/screenshot",
+        "present_path": "forced_readback",
+        "os": "linux",
+        "flip_pace_fps": "",
+        "gpu_known": True,
+        "gpu_vendor_id": 4098,
+        "gpu_device_id": 29631,
+        "gpu_driver_version": 99,
+        "gpu_api_version": 4202496,
+        "gpu_device_type": 2,
     }
     record.update(over)
     return record
@@ -43,9 +63,16 @@ def conditions_record(**over):
 
 def summary_record(**over):
     record = {
-        "type": "summary", "schema": 1, "status": "ok", "frame_rate_measured": True,
-        "typical_fps_measured": True, "typical_fps": 60.0, "distinct_fps": 59.0,
-        "low_1pct_fps": 50.0, "interval_p99_ms": 20.0, "interval_p95_ms": 17.5,
+        "type": "summary",
+        "schema": 1,
+        "status": "ok",
+        "frame_rate_measured": True,
+        "typical_fps_measured": True,
+        "typical_fps": 60.0,
+        "distinct_fps": 59.0,
+        "low_1pct_fps": 50.0,
+        "interval_p99_ms": 20.0,
+        "interval_p95_ms": 17.5,
         "active_fraction": 0.98,
     }
     record.update(over)
@@ -53,9 +80,11 @@ def summary_record(**over):
 
 
 def manifest(run=None, conditions=None, summary=None):
-    records = {"run": run_record(**(run or {})),
-               "conditions": conditions_record(**(conditions or {})),
-               "summary": summary_record(**(summary or {}))}
+    records = {
+        "run": run_record(**(run or {})),
+        "conditions": conditions_record(**(conditions or {})),
+        "summary": summary_record(**(summary or {})),
+    }
     return records
 
 
@@ -98,8 +127,14 @@ class Refusals(unittest.TestCase):
         self.assertTrue(any("predates the `conditions` record" in r for r in reasons), reasons)
 
     def test_unknown_gpu_is_refused_even_when_both_are_unknown(self):
-        unknown = {"gpu_known": False, "gpu_vendor_id": None, "gpu_device_id": None,
-                   "gpu_driver_version": None, "gpu_api_version": None, "gpu_device_type": None}
+        unknown = {
+            "gpu_known": False,
+            "gpu_vendor_id": None,
+            "gpu_device_id": None,
+            "gpu_driver_version": None,
+            "gpu_api_version": None,
+            "gpu_device_type": None,
+        }
         reasons = cr.refusals(manifest(conditions=unknown), manifest(conditions=unknown))
         self.assertTrue(any("device is unknown" in r for r in reasons), reasons)
 
@@ -130,12 +165,12 @@ class Comparison(unittest.TestCase):
         self.assertEqual(self.crossed(), [])
 
     def test_typical_drop_over_threshold_is_a_regression(self):
-        self.assertEqual(len(self.crossed(typical_fps=58.0)), 1)   # -3.33%
-        self.assertEqual(self.crossed(typical_fps=58.5), [])       # -2.5%
+        self.assertEqual(len(self.crossed(typical_fps=58.0)), 1)  # -3.33%
+        self.assertEqual(self.crossed(typical_fps=58.5), [])  # -2.5%
 
     def test_low_drop_over_threshold_is_a_regression(self):
         self.assertEqual(len(self.crossed(low_1pct_fps=47.0)), 1)  # -6%
-        self.assertEqual(self.crossed(low_1pct_fps=48.0), [])      # -4%
+        self.assertEqual(self.crossed(low_1pct_fps=48.0), [])  # -4%
 
     def test_an_improvement_is_not_a_regression(self):
         self.assertEqual(self.crossed(typical_fps=75.0, low_1pct_fps=70.0), [])

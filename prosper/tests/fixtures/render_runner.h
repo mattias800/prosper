@@ -38,6 +38,7 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "host/platform/gpu_submit_gate.hpp"   // refuse submits once the frontend shuts down (#3225)
 #include "shared/rtt/rtt_scale.hpp"
+#include "shared/device/device_identity.hpp"     // which device a capture manifest reports
 #include "shared/device/vulkan_device_select.hpp"
 #include "shared/device/float_transport.hpp"
 #include "shared/device/pipeline_cache_file.hpp"
@@ -1845,6 +1846,12 @@ inline const RenderVkCtx& render_vk_ctx() {
                      selection.properties.deviceName,
                      prosper::frontend::vulkan_device_type_name(selection.properties.deviceType));
         prosper::frontend::log_vulkan_runtime_device("render", r.phys, selection.properties);
+        // The graphics device IS the run's device: the compute context normally adopts it and then
+        // never reaches its own record call, so recording only there left a renderer run unknown.
+        prosper::frontend::record_device_identity(
+            selection.properties.vendorID, selection.properties.deviceID,
+            selection.properties.driverVersion, selection.properties.apiVersion,
+            static_cast<uint32_t>(selection.properties.deviceType));
         // #3873: the texture-cache budget treats every non-discrete device's device-local heap as
         // system RAM. See texture_cache_budget.hpp for why this is not read off the memory types.
         r.unified_memory =

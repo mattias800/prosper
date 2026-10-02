@@ -99,7 +99,7 @@ def load_manifest(path):
     """Return {'run': ..., 'conditions': ..., 'summary': ...}, keeping the LAST record of each type."""
     records = {}
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             for number, line in enumerate(handle, 1):
                 line = line.strip()
                 if not line:
@@ -107,11 +107,15 @@ def load_manifest(path):
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError as error:
-                    raise ManifestError(f"{path}:{number}: not valid JSON ({error.msg})")
-                if isinstance(record, dict) and record.get("type") in ("run", "conditions", "summary"):
+                    raise ManifestError(f"{path}:{number}: not valid JSON ({error.msg})") from error
+                if isinstance(record, dict) and record.get("type") in (
+                    "run",
+                    "conditions",
+                    "summary",
+                ):
                     records[record["type"]] = record
     except OSError as error:
-        raise ManifestError(f"{path}: cannot be read ({error.strerror})")
+        raise ManifestError(f"{path}: cannot be read ({error.strerror})") from error
     return records
 
 
@@ -130,8 +134,11 @@ def refusals(baseline, candidate):
     for label, records in (("baseline", baseline), ("candidate", candidate)):
         for record in ("run", "conditions", "summary"):
             if record not in records:
-                hint = (" (the manifest predates the `conditions` record; re-run it)"
-                        if record == "conditions" else "")
+                hint = (
+                    " (the manifest predates the `conditions` record; re-run it)"
+                    if record == "conditions"
+                    else ""
+                )
                 reasons.append(f"{label}: no `{record}` record{hint}")
     if reasons:
         return reasons
@@ -159,7 +166,8 @@ def refusals(baseline, candidate):
             if not isinstance(active, (int, float)) or active < MIN_ACTIVE_FRACTION:
                 reasons.append(
                     f"{label}: active fraction {active!r} is below {MIN_ACTIVE_FRACTION:.2f}; the window "
-                    f"mixed two regimes, so its rate describes neither. Narrow the route and re-run")
+                    f"mixed two regimes, so its rate describes neither. Narrow the route and re-run"
+                )
     return reasons
 
 
@@ -180,11 +188,19 @@ def compare(baseline, candidate, max_typical_drop_pct, max_low_drop_pct):
         a = baseline["summary"].get(key)
         b = candidate["summary"].get(key)
         delta = _delta(key, a, b, higher_better)
-        rows.append({"key": key, "label": label, "unit": unit, "baseline": a, "candidate": b,
-                     "delta": delta})
+        rows.append(
+            {
+                "key": key,
+                "label": label,
+                "unit": unit,
+                "baseline": a,
+                "candidate": b,
+                "delta": delta,
+            }
+        )
         if delta is None or delta[1] is None:
             continue
-        drop = -delta[1]   # positive when the candidate is lower
+        drop = -delta[1]  # positive when the candidate is lower
         if key == "typical_fps" and drop > max_typical_drop_pct:
             crossed.append(f"typical fps down {drop:.1f}% (limit {max_typical_drop_pct:g}%)")
         if key == "low_1pct_fps" and drop > max_low_drop_pct:
@@ -202,10 +218,12 @@ def render(rows, baseline, candidate):
     lines = []
     revision_a = baseline["run"].get("build_revision", "?")
     revision_b = candidate["run"].get("build_revision", "?")
-    lines.append(f"comparable: same title, route, GPU, driver, present path and pacing")
+    lines.append("comparable: same title, route, GPU, driver, present path and pacing")
     if revision_a == revision_b:
-        lines.append(f"note: both runs are build {revision_a[:12]}; this is a noise measurement, "
-                     f"not a before/after")
+        lines.append(
+            f"note: both runs are build {revision_a[:12]}; this is a noise measurement, "
+            f"not a before/after"
+        )
     else:
         lines.append(f"baseline build {revision_a[:12]}  ->  candidate build {revision_b[:12]}")
     lines.append(f"{'metric':<28}{'baseline':>16}{'candidate':>16}{'delta':>18}")
@@ -216,22 +234,33 @@ def render(rows, baseline, candidate):
         else:
             absolute, percent, _ = delta
             text = f"{absolute:+.3f}" + (f" ({percent:+.1f}%)" if percent is not None else "")
-        lines.append(f"{row['label']:<28}{_fmt(row['baseline'], row['unit']):>16}"
-                     f"{_fmt(row['candidate'], row['unit']):>16}{text:>18}")
+        lines.append(
+            f"{row['label']:<28}{_fmt(row['baseline'], row['unit']):>16}"
+            f"{_fmt(row['candidate'], row['unit']):>16}{text:>18}"
+        )
     return "\n".join(lines)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Compare two tools/screenshot manifests; refuse when the runs are not comparable.")
+        description="Compare two tools/screenshot manifests; refuse when the runs are not comparable."
+    )
     parser.add_argument("baseline")
     parser.add_argument("candidate")
-    parser.add_argument("--max-typical-drop-pct", type=float, default=3.0,
-                        help="regression when typical fps falls by more than this (proposed, not "
-                             "noise-calibrated; default 3)")
-    parser.add_argument("--max-low-drop-pct", type=float, default=5.0,
-                        help="regression when the 1%% low falls by more than this (proposed, not "
-                             "noise-calibrated; default 5)")
+    parser.add_argument(
+        "--max-typical-drop-pct",
+        type=float,
+        default=3.0,
+        help="regression when typical fps falls by more than this (proposed, not "
+        "noise-calibrated; default 3)",
+    )
+    parser.add_argument(
+        "--max-low-drop-pct",
+        type=float,
+        default=5.0,
+        help="regression when the 1%% low falls by more than this (proposed, not "
+        "noise-calibrated; default 5)",
+    )
     parser.add_argument("--json", action="store_true", help="print one JSON object instead of text")
     args = parser.parse_args(argv)
 
@@ -247,18 +276,33 @@ def main(argv=None):
         if args.json:
             print(json.dumps({"comparable": False, "refusals": reasons}, indent=2))
         else:
-            print("REFUSED: these runs are not comparable, so no delta is reported:", file=sys.stderr)
+            print(
+                "REFUSED: these runs are not comparable, so no delta is reported:", file=sys.stderr
+            )
             for reason in reasons:
                 print(f"  - {reason}", file=sys.stderr)
         return 2
 
     rows, crossed = compare(baseline, candidate, args.max_typical_drop_pct, args.max_low_drop_pct)
     if args.json:
-        print(json.dumps({"comparable": True, "regressions": crossed,
-                          "rows": [{k: r[k] for k in ("key", "baseline", "candidate")} |
-                                   {"delta": None if r["delta"] is None else
-                                    {"absolute": r["delta"][0], "percent": r["delta"][1]}}
-                                   for r in rows]}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "comparable": True,
+                    "regressions": crossed,
+                    "rows": [
+                        {k: r[k] for k in ("key", "baseline", "candidate")}
+                        | {
+                            "delta": None
+                            if r["delta"] is None
+                            else {"absolute": r["delta"][0], "percent": r["delta"][1]}
+                        }
+                        for r in rows
+                    ],
+                },
+                indent=2,
+            )
+        )
     else:
         print(render(rows, baseline, candidate))
         for item in crossed:
