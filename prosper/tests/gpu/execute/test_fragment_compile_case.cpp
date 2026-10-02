@@ -3,6 +3,7 @@
 #include "gpu/recompiler/compiler_resource_access.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/indirect/rdna2_indirect_buffer_shadow.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"
 #include "build_revision.hpp"
 #include "fixtures/test_scratch.h"
 #include <bit>
@@ -12,6 +13,11 @@
 #include <fstream>
 #include <map>
 #include <thread>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace prosper::gpu;
 static unsigned checks = 0, failures = 0, field_checks = 0;
@@ -26,6 +32,33 @@ static void env(const char* name, const char* value) {
 template<class F> static std::string error(F&& f) {
     try { f(); return {}; } catch (const std::exception& e) { return e.what(); }
 }
+template<class F> static std::string capture_stderr(F&& body) {
+    const auto path = prosper_test::test_scratch_path("case-arithmetic.log");
+    FILE* output = std::fopen(path.string().c_str(), "w+b");
+    CHECK(output != nullptr); if (!output) return {};
+    std::fflush(stderr);
+#ifdef _WIN32
+    const int fd = _fileno(stderr), saved = _dup(fd);
+    const bool redirected = saved >= 0 && _dup2(_fileno(output), fd) == 0;
+#else
+    const int fd = fileno(stderr), saved = dup(fd);
+    const bool redirected = saved >= 0 && dup2(fileno(output), fd) >= 0;
+#endif
+    CHECK(redirected);
+    const auto restore = [&] {
+        std::fflush(stderr);
+#ifdef _WIN32
+        if (saved >= 0) { CHECK(_dup2(saved, fd) == 0); _close(saved); }
+#else
+        if (saved >= 0) { CHECK(dup2(saved, fd) >= 0); close(saved); }
+#endif
+    };
+    try { if (redirected) body(); } catch (...) { restore(); std::fclose(output); throw; }
+    restore(); std::rewind(output);
+    std::string text; char bytes[4096];
+    for (size_t n; (n = std::fread(bytes, 1, sizeof bytes, output)) != 0;) text.append(bytes, n);
+    std::fclose(output); std::filesystem::remove(path); return text;
+}
 static const std::vector<uint32_t> green = {
     0x7e000280, 0x7e0202f2, 0x7e040280, 0x7e0602f2,
     0xf800180f, 0x03020100, 0xbf810000,
@@ -37,6 +70,12 @@ static const std::vector<uint32_t> mode_probe = {
     0xd402006au, 128u | (256u << 9),   // v_cmp_eq_f32_e64 VCC, 0, v0
     0xd5010000u, 128u | (242u << 9) | (106u << 18), // v0 = VCC ? 1.0 : 0.0
     0x7e0202f2u, 0x7e040280u, 0x7e0602f2u,
+    0xf800180fu, 0x03020100u, 0xbf810000u,
+};
+static const std::vector<uint32_t> add_probe = {
+    0x7e0002ffu, 0x3f800000u, 0x7e0202ffu, 0x40000000u, // v0=1, v1=2
+    0x06000300u,                                        // v_add_f32 v0,v0,v1
+    0x7e020280u, 0x7e040280u, 0x7e0602f2u,
     0xf800180fu, 0x03020100u, 0xbf810000u,
 };
 static std::string identity() {
@@ -61,7 +100,8 @@ static FragmentCompileCase produce(std::vector<uint32_t> code, bool wave32 = fal
 }
 // Fail-closed typed oracle for this project's constant MRT fixture, independent of round-trip
 // equality. Only defined constants, a bounded typed UInt32/Boolean relation, selects and
-// composites feeding the live location-0 Output qualify. Unknown/FP/Input/Undef dependencies fail.
+// composites feeding the live location-0 Output qualify. Only the exact normal 1+2 ADD fixture
+// is evaluated; arbitrary FP, Input and Undef dependencies fail. This is not a host FP interpreter.
 static bool constant_color(const std::vector<uint32_t>& w, const std::vector<uint32_t>& expected) {
     if (w.size() < 5 || w[0] != 0x07230203) return false;
     std::map<uint32_t, std::vector<uint32_t>> value;
@@ -82,7 +122,7 @@ static bool constant_color(const std::vector<uint32_t>& w, const std::vector<uin
         if ((op == 41 || op == 42) && n == 3 && types[w[k + 1]] == 3) {
             value[w[k + 2]] = {op == 41 ? 1u : 0u}; kind[w[k + 2]] = 3;
         }
-        if ((op == 80 || op == 83 || op == 124 || op == 168 || op == 169 ||
+        if ((op == 80 || op == 83 || op == 124 || op == 129 || op == 168 || op == 169 ||
              op == 170 || op == 171 || op == 174 || op == 199) && n >= 4) {
             if (types[w[k + 1]] >= 1 && types[w[k + 1]] <= 4) {
                 operands[w[k + 2]] = std::vector<uint32_t>(w.begin() + k + 3, w.begin() + k + n);
@@ -111,7 +151,12 @@ static bool constant_color(const std::vector<uint32_t>& w, const std::vector<uin
             if (op == 80) typed = result_kind == 4 && inputs.size() == 4 && v.size() == 4 &&
                 std::all_of(inputs.begin(), inputs.end(), [&](auto x) { return kind[x] == 1 && value[x].size() == 1; });
             else if (op == 83 || op == 124) typed = inputs.size() == 1 &&
-                (op == 83 ? kind[inputs[0]] == result_kind : result_kind == 1 && kind[inputs[0]] == 2);
+                (op == 83 ? kind[inputs[0]] == result_kind :
+                    (result_kind == 1 && kind[inputs[0]] == 2) || (result_kind == 2 && kind[inputs[0]] == 1));
+            else if (op == 129 && result_kind == 1 && inputs.size() == 2 && v.size() == 2 &&
+                     kind[inputs[0]] == 1 && kind[inputs[1]] == 1 && v[0] == 0x3f800000u && v[1] == 0x40000000u) {
+                typed = true; v = {0x40400000u}; // exact binary32 1+2=3, without executing host FP
+            }
             else if (op == 168 && result_kind == 3 && inputs.size() == 1 && v.size() == 1 && kind[inputs[0]] == 3) {
                 typed = true; v[0] = !v[0];
             } else if (op == 169 && inputs.size() == 3 && kind[inputs[0]] == 3 && value[inputs[0]].size() == 1 &&
@@ -439,9 +484,86 @@ static void mode_tests() {
     }
     env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", nullptr);
 }
+static std::vector<uint32_t> arithmetic_accounting_tests() {
+    namespace perf = prosper::diagnostics::perf;
+    const auto count = [](perf::Counter counter) { return perf::ledger().counters[size_t(counter)].load(); };
+    const auto requests = [&] { return count(perf::Counter::FragmentArithmeticRequests); };
+    const auto additions = [&] { return count(perf::Counter::FragmentArithmeticAddRequests); };
+    const auto color = std::vector<uint32_t>{0x40400000u, 0, 0, 0x3f800000u};
+    const auto decode = rdna2_decode_one(add_probe.data() + 4, 1);
+    CHECK(decode.fmt == Rdna2Format::VOP2 && decode.opcode == 3 && decode.dst.value == 0);
+    clear_shader_recompile_cache();
+    const auto directory = prosper_test::test_scratch_dir() / "arithmetic";
+    env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", directory.string().c_str());
+    auto code = add_probe, alias = code;
+    const auto compile = [](const std::vector<uint32_t>& input) {
+        return recompile_graphics_shader_cached_shared(ShaderProgramStage::Fragment,
+            input.data(), input.size(), nullptr, nullptr, nullptr, nullptr, false, 0, false, {}, {true, 0x31});
+    };
+    const auto before = requests(), add_before = additions();
+    SharedShaderWords cold, warm, bypass;
+    const auto cold_log = capture_stderr([&] { cold = compile(code); });
+    CHECK(cold && !cold->empty() && constant_color(*cold, color));
+    if (!cold || cold->empty()) { env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", nullptr); return {}; }
+    CHECK(requests() == before + 1 && additions() == add_before + 1); // owned auto baseline adds zero
+    CHECK(cold_log.find("family=F32-ADD") != std::string::npos && cold_log.find("pc=4 ") != std::string::npos);
+    const auto recorded = files(directory);
+    CHECK(recorded.size() == 1);
+    if (recorded.empty()) { env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", nullptr); return {}; }
+    const auto saved = read_fragment_compile_case(recorded.front());
+    CHECK(saved.complete && saved.source == *cold && saved.float_mode == FragmentFloatMode({true, 0x31}));
+    const auto warm_log = capture_stderr([&] { warm = compile(alias); });
+    CHECK(warm == cold && requests() == before + 2 && additions() == add_before + 2);
+    const auto address = [](const void* pointer) {
+        char text[32]; std::snprintf(text, sizeof text, "0x%llx", (unsigned long long)reinterpret_cast<uintptr_t>(pointer));
+        return std::string(text);
+    };
+    CHECK(warm_log.find("program=" + address(alias.data()) + " ") != std::string::npos &&
+          warm_log.find("producing-program=" + address(code.data()) + " ") != std::string::npos &&
+          warm_log.find("family=F32-ADD") != std::string::npos);
+    env("PROSPER_NO_SHADER_CACHE", "1");
+    capture_stderr([&] { bypass = compile(alias); });
+    env("PROSPER_NO_SHADER_CACHE", nullptr);
+    CHECK(bypass && *bypass == *cold && requests() == before + 3 && additions() == add_before + 3);
+    capture_stderr([&] { CHECK(replay_fragment_compile_case(saved, true) == *cold); });
+    CHECK(requests() == before + 4 && additions() == add_before + 4); // explicit replay remains visible
+    std::array<std::vector<uint32_t>, 8> aliases;
+    for (auto& input : aliases) input = code;
+    std::atomic<bool> same{true}; std::vector<std::thread> threads;
+    capture_stderr([&] {
+        for (auto& input : aliases) threads.emplace_back([&, input_pointer = &input] {
+            if (compile(*input_pointer) != cold) same.store(false);
+        });
+        for (auto& thread : threads) thread.join();
+    });
+    CHECK(same.load() && requests() == before + 12 && additions() == add_before + 12);
+    const auto exported = files(directory);
+    for (const auto& input : aliases) {
+        char prefix[32]; std::snprintf(prefix, sizeof prefix, "f_%016llx_",
+            (unsigned long long)reinterpret_cast<uintptr_t>(input.data()));
+        unsigned matches = 0;
+        for (const auto& path : exported) if (path.filename().string().starts_with(prefix)) {
+            ++matches;
+            const auto concurrent_case = read_fragment_compile_case(path);
+            CHECK(concurrent_case.complete && concurrent_case.program_address == saved.program_address &&
+                  concurrent_case.code == saved.code && concurrent_case.source == saved.source &&
+                  concurrent_case.float_mode == saved.float_mode && concurrent_case.compiler == saved.compiler);
+        }
+        CHECK(matches == 1); // every lookup exports the same immutable producing context
+    }
+    env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", nullptr);
+    auto wrong = *cold;
+    bool changed = false;
+    for (size_t k = 5; k < wrong.size(); k += wrong[k] >> 16) if ((wrong[k] & 65535u) == 129) {
+        wrong[k] = (wrong[k] & 0xffff0000u) | 133u; changed = true; break;
+    }
+    CHECK(changed && !constant_color(wrong, color)); // same operands but MUL cannot prove the ADD output
+    return *cold;
+}
 int main(int argc, char** argv) {
     try {
         env("PROSPER_FRAGMENT_COMPILE_CASE_DIR", nullptr); env("PROSPER_FS_TAP", nullptr);
+        env("PROSPER_NO_PERF_ALARMS", nullptr);
         if (argc == 3 && std::string_view(argv[1]) == "--emit-attempt") {
             // Captures the real producing outcome without prescribing Produced versus Refused.
             // This supports an executed late-refusal mutation/restored-compiler transition check.
@@ -470,6 +592,7 @@ int main(int argc, char** argv) {
             CHECK(argc == 1 || (argc == 3 && std::string_view(argv[1]) == "--dump"));
             auto c = produce(green); CHECK(c.complete);
             codec_tests(c); resource_tests(c); cache_tests(); atomic_tests(c); mode_tests();
+            const auto add = arithmetic_accounting_tests();
             auto wave32 = produce(green, true); CHECK(wave32.complete && solid_green(wave32.source));
             CHECK(wave32.wave32 && !c.wave32); // width need not alter a wave-insensitive program
             auto unknown = c; unknown.float_mode = {false, 1};
@@ -477,6 +600,7 @@ int main(int argc, char** argv) {
             if (argc == 3) { const std::filesystem::path dir = argv[2]; std::filesystem::create_directories(dir);
                 write_fragment_compile_source(dir / "wave64.spv", c.source);
                 write_fragment_compile_source(dir / "wave32.spv", wave32.source);
+                write_fragment_compile_source(dir / "arithmetic-add.spv", add);
                 for (bool narrow : {false, true}) for (uint8_t mode : {uint8_t(0), uint8_t(16)}) {
                     auto known = produce(mode_probe, narrow, nullptr, {true, mode}); CHECK(known.complete);
                     write_fragment_compile_source(dir / (std::string("mode") + std::to_string(mode) +
