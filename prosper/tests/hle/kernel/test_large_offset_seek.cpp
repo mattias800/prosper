@@ -149,7 +149,13 @@ int main() {
     CHECK(redirected, "stderr can be redirected to a valid read-only diagnostic sink");
     if (redirected) {
         errno = 0;
-        const int probe = std::fprintf(stderr, "sink refusal probe\n");
+        // The native write is the independent sink oracle. Some MinGW fprintf implementations
+        // return their formatted character count even though this write fails and changes errno.
+#ifdef _WIN32
+        const int probe = _write(_fileno(stderr), "x", 1);
+#else
+        const int probe = (int)write(fileno(stderr), "x", 1);
+#endif
         const int sink_error = errno;
         std::clearerr(stderr);
         errno = 0;
