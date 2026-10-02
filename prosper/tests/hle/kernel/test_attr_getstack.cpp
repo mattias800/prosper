@@ -11,6 +11,7 @@
 //   M3  Getstack disagrees with Getstackaddr/Getstacksize    -> the equality arms
 //   M4  Getstack dereferences a NULL output                  -> the NULL-tolerance arm (crash)
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 
 #include <cstdint>
@@ -18,11 +19,9 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(AttrGetstack, Contract) {
     printf("== test_attr_getstack ==\n");
     register_builtin_hle();
     HleFn init = Hle::lookup(nid_hash("scePthreadAttrInit"));
@@ -30,7 +29,7 @@ int main() {
     HleFn getaddr = Hle::lookup(nid_hash("scePthreadAttrGetstackaddr"));
     HleFn getsize = Hle::lookup(nid_hash("scePthreadAttrGetstacksize"));
     CHECK(getstack != nullptr, "scePthreadAttrGetstack is registered (M1)");
-    if (!init || !getstack || !getaddr || !getsize) return 1;
+    if (!init || !getstack || !getaddr || !getsize) FAIL() << "legacy early exit";
 
     uint64_t attr = 0;
     CHECK(init((uint64_t)(uintptr_t)&attr, 0, 0, 0, 0, 0) == 0 && attr != 0, "attr initialised");
@@ -50,6 +49,4 @@ int main() {
           getstack(0, (uint64_t)(uintptr_t)&a, (uint64_t)(uintptr_t)&s, 0, 0, 0) == 0,
           "NULL outputs and a NULL attr are tolerated (M4)");
 
-    printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
 }

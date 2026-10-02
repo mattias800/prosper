@@ -1150,23 +1150,23 @@ if(TARGET prosper_core)
   # sceKernelGetOperationMode, the coredump-handler pair and the PRT aperture pair are registered and
   # honour their contracts (out-parameters written, slot range checked) rather than being logged-0
   # stubs.
-  add_executable(test_kernel_system_stubs tests/hle/kernel/test_kernel_system_stubs.cpp)
-  target_link_libraries(test_kernel_system_stubs PRIVATE prosper_core)
-  target_include_directories(test_kernel_system_stubs PRIVATE src)
-  add_test(NAME kernel_system_stubs COMMAND test_kernel_system_stubs)
+  prosper_add_gtest(test_kernel_system_stubs
+    SOURCES tests/hle/kernel/test_kernel_system_stubs.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
 
   # scePthreadAttrGetstack was unregistered: both outputs were left untouched.
-  add_executable(test_attr_getstack tests/hle/kernel/test_attr_getstack.cpp)
-  target_link_libraries(test_attr_getstack PRIVATE prosper_core)
-  target_include_directories(test_attr_getstack PRIVATE src)
-  add_test(NAME attr_getstack COMMAND test_attr_getstack)
+  prosper_add_gtest(test_attr_getstack
+    SOURCES tests/hle/kernel/test_attr_getstack.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
 
   # The APR submit's result out-parameters are uint32_t*; an 8-byte store overran into the guest's
   # stack canary and killed the title with __stack_chk_fail (#4138).
-  add_executable(test_apr_result_slot_width tests/hle/kernel/test_apr_result_slot_width.cpp)
-  target_link_libraries(test_apr_result_slot_width PRIVATE prosper_core)
-  target_include_directories(test_apr_result_slot_width PRIVATE src)
-  add_test(NAME apr_result_slot_width COMMAND test_apr_result_slot_width)
+  prosper_add_gtest(test_apr_result_slot_width
+    SOURCES tests/hle/kernel/test_apr_result_slot_width.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
 
   # lseek/fseek/ftell must address offsets >= 2 GiB. MinGW's long/off_t are 32 bits, so Black Flag's
   # 30 GiB DataPS5_boot.forge allocation-table seek failed and the title aborted itself.
@@ -2164,11 +2164,11 @@ if(TARGET prosper_core)
   # twice on purpose -- the PROSPER_APR_MEASURE_READ=always run asserts the opposite outcome, which
   # is what shows the suppression actually suppressed. Pure: scratch files and generated import
   # stubs, no game dump.
-  add_executable(test_apr_measure_duplicate tests/hle/test_apr_measure_duplicate.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_apr_measure_duplicate PRIVATE tests)
-  target_link_libraries(test_apr_measure_duplicate PRIVATE prosper_core)
-  add_test(NAME apr_measure_duplicate COMMAND test_apr_measure_duplicate)
+  prosper_add_gtest(test_apr_measure_duplicate
+    SOURCES tests/hle/test_apr_measure_duplicate.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   add_test(NAME apr_measure_duplicate_forced COMMAND test_apr_measure_duplicate)
   set_tests_properties(apr_measure_duplicate_forced PROPERTIES
                        ENVIRONMENT "PROSPER_APR_MEASURE_READ=always")
