@@ -53,6 +53,26 @@ function Find-WinLibsTool {
     return $null
 }
 
+# Name of the first compiler cache found on PATH (ccache preferred), or $null.
+function Find-CompilerCache {
+    foreach ($name in 'ccache', 'sccache') {
+        if (Get-Command $name -ErrorAction SilentlyContinue) { return $name }
+    }
+    return $null
+}
+
+# True when the configure step resolved a Vulkan loader library. Without one CMake only logs
+# "Vulkan not found", never defines prosper-app, and the build fails much later with
+# "unknown target 'prosper-app'".
+function Test-VulkanConfigured {
+    param([string]$CachePath)
+    $line = Select-String -LiteralPath $CachePath -Pattern '^Vulkan_LIBRARY:[A-Z]+=' |
+        Select-Object -First 1
+    if (-not $line) { return $false }
+    $value = $line.Line.Substring($line.Line.IndexOf('=') + 1)
+    return ($value -and $value -notmatch 'NOTFOUND$')
+}
+
 if (-not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core') {
     throw 'run-windows.ps1 must be run from native Windows PowerShell, not WSL/Linux.'
 }
@@ -96,7 +116,24 @@ if (-not $NoBuild) {
         $configure += "-DCMAKE_C_COMPILER=$cc"
         $configure += "-DCMAKE_CXX_COMPILER=$cxx"
     }
+    # An already-configured build dir keeps the launcher it was configured with.
+    if (-not (Test-Path -LiteralPath $cache)) {
+        $launcher = Find-CompilerCache
+        if ($launcher) {
+            Write-Host "Using compiler cache: $launcher"
+            $configure += "-DCMAKE_C_COMPILER_LAUNCHER=$launcher"
+            $configure += "-DCMAKE_CXX_COMPILER_LAUNCHER=$launcher"
+            # The fetched SDL3 builds with a CMake precompiled header, which ccache refuses to
+            # cache (217 of 221 misses on every rebuild) unless told these are safe. Process-scoped.
+            if ($launcher -eq 'ccache' -and -not $env:CCACHE_SLOPPINESS) {
+                $env:CCACHE_SLOPPINESS = 'pch_defines,time_macros'
+            }
+        }
+    }
     Invoke-Checked $cmake $configure
+    if (-not (Test-VulkanConfigured $cache)) {
+        throw 'Vulkan SDK not found: configure did not locate a Vulkan loader, so prosper-app is not defined. Install the LunarG SDK (winget install KhronosGroup.VulkanSDK), open a new shell so VULKAN_SDK is set, and rerun. See the Windows section of BUILDING.md.'
+    }
     Invoke-Checked $cmake @('--build', $BuildDir, '--target', 'prosper-app', '--parallel', "$Jobs")
 }
 
