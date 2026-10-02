@@ -69,7 +69,7 @@
   "prosper/src/gpu/diagnostics/geometry_probe_arming.hpp": "614b6072e084607b96ce1a0cdc8ccf0454cec588bc8b434dfbb5427078ffbf15",
   "prosper/src/gpu/diagnostics/gpu_breadcrumbs.cpp": "8eb5010aa44aceaa78f80372198957442f151a7ef1e0e768c5c9451f854bf0a4",
   "prosper/src/gpu/diagnostics/gpu_breadcrumbs.hpp": "43e23e07057bf96c80477001eae1b7b49a062225c5a0fc338536768dcb7c426e",
-  "prosper/src/gpu/diagnostics/gpu_breadcrumbs_vk.hpp": "35782d752612c55214207015ea27e12666b7c64a449654c1167054be4761056d",
+  "prosper/src/gpu/diagnostics/gpu_breadcrumbs_vk.hpp": "6efec9469f74f9115358e65538b0c3bc02838f4840790c9a55ebfa1e2dfe67eb",
   "prosper/src/gpu/diagnostics/gpu_memory_budget.cpp": "11dbcb3c6056543ef45e4b72b55b16d2ef2bcde6098f81a27b35c43f914f9643",
   "prosper/src/gpu/diagnostics/gpu_memory_budget.hpp": "a2c595520159f58c439bdc4da20a9769a9a8efb4e54a69b76b7edbb9656bb92e",
   "prosper/src/gpu/diagnostics/gpu_memory_budget_vk.hpp": "c12819710c01e93e24d34819d67d604f8e3bfe964115f3ce99cf8f6c354e5aa5",

@@ -3110,7 +3110,7 @@ private:
         if (result.submit_result == VK_ERROR_DEVICE_LOST || result.wait_result == VK_ERROR_DEVICE_LOST) {
             static std::atomic<bool> breadcrumb_reported{false};
             if (!breadcrumb_reported.exchange(true)) {
-                const std::string report = prosper::gpu::breadcrumb_emitter().report_device_loss(queue);
+                const std::string report = prosper::gpu::breadcrumb_emitter().report_device_loss(dev, queue);
                 std::fputs(report.c_str(), stderr);
                 std::fflush(stderr);
             }
@@ -14795,7 +14795,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // (instrument trap 170). The site is built only when armed: this loop is the hot path.
         auto& breadcrumbs = prosper::gpu::breadcrumb_emitter();
         uint32_t breadcrumb = 0;
-        if (breadcrumbs.active()) {
+        if (breadcrumbs.armed_for(dev)) {
             prosper::gpu::BreadcrumbSite site;
             site.kind = prosper::gpu::BreadcrumbKind::draw;
             site.submit_no = draws[di].source_submit;
@@ -14803,7 +14803,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             site.draw_index = static_cast<uint32_t>(draws[di].draw_index);
             site.program_addr = draws[di].fs_guest_addr;
             site.pipeline_hash = draws[di].vs_identity ^ (draws[di].fs_identity * 1099511628211ull);
-            breadcrumb = breadcrumbs.begin(cmd, site);
+            breadcrumb = breadcrumbs.begin(dev, cmd, site);
         }
         if (v.mesh_draw) {
             ctx.cmd_draw_mesh_tasks(cmd, v.mesh_groups[0], v.mesh_groups[1], v.mesh_groups[2]);

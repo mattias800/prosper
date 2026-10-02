@@ -7354,7 +7354,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // PROSPER_GPU_BREADCRUMBS: where the GPU actually stopped. The line above names the call
             // that OBSERVED the loss, which is not necessarily the one that caused it (trap 170).
             const std::string report =
-                prosper::gpu::breadcrumb_emitter().report_device_loss(ctx.queue);
+                prosper::gpu::breadcrumb_emitter().report_device_loss(ctx.device, ctx.queue);
             std::fputs(report.c_str(), stderr);
         }
         if (trace) std::fprintf(stderr, "[compute]   Vulkan failure stage=%s result=%d\n",
@@ -12335,14 +12335,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         // site is built only when armed.
         auto& breadcrumbs = prosper::gpu::breadcrumb_emitter();
         uint32_t breadcrumb = 0;
-        if (breadcrumbs.active()) {
+        if (breadcrumbs.armed_for(ctx.device)) {
             prosper::gpu::BreadcrumbSite site;
             site.kind = prosper::gpu::BreadcrumbKind::dispatch;
             site.submit_no = item.submit_no;
             site.draw_index = static_cast<uint32_t>(item.dispatch_index);
             site.program_addr = item.code_addr;
             site.pipeline_hash = std::hash<std::string>{}(pipeline_key);
-            breadcrumb = breadcrumbs.begin(command, site);
+            breadcrumb = breadcrumbs.begin(ctx.device, command, site);
         }
         if (device_indirect) {
             vkCmdDispatchIndirect(command, ctx.indirect_scratch, 0);

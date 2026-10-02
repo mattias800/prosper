@@ -68,12 +68,16 @@ public:
 
     BreadcrumbMode mode() const { return mode_.load(std::memory_order_acquire); }
     bool active() const { return mode() != BreadcrumbMode::off; }
+    // Armed AND for this device. The emitter's buffer and entry points belong to the device that armed
+    // it, so a second device (a private compute device) must neither record through them nor read a
+    // checkpoint list with them.
+    bool armed_for(VkDevice device) const { return active() && device != VK_NULL_HANDLE && device_ == device; }
 
     // Records the BEFORE marker for `site` into `command` and returns its id; 0 when inactive, so a
     // caller can pass the result straight to end() without testing it.
-    uint32_t begin(VkCommandBuffer command, const BreadcrumbSite& site) {
+    uint32_t begin(VkDevice device, VkCommandBuffer command, const BreadcrumbSite& site) {
         const BreadcrumbMode current = mode();
-        if (current == BreadcrumbMode::off) return 0;
+        if (current == BreadcrumbMode::off || device_ != device) return 0;
         const uint32_t id = breadcrumb_table().begin_site(site);
         write(command, current, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, /*slot=*/0,
               breadcrumb_before_value(id));
@@ -137,10 +141,13 @@ public:
     // VK_EXT_device_fault is enabled. When the emitter is inactive it says so and how to arm it, rather
     // than staying silent: an absent line reads as "nothing to report", which is the wrong conclusion
     // about a run that simply was not instrumented (docs/DIAGNOSTIC_GATE_AUDIT.md, rule 1).
-    std::string report_device_loss(VkQueue queue) const {
+    std::string report_device_loss(VkDevice device, VkQueue queue) const {
         if (!active())
             return "[gpu-breadcrumb] not armed: re-run with PROSPER_GPU_BREADCRUMBS=1 to learn where "
                    "the GPU stopped (needs VK_AMD_buffer_marker or VK_NV_device_diagnostic_checkpoints)\n";
+        if (!armed_for(device))
+            return "[gpu-breadcrumb] the lost device is not the armed one; its work carried no markers "
+                   "(the other device in this process holds them)\n";
         std::string out;
         const Readback read = read_back(queue);
         if (!read.ok) {

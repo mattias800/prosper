@@ -222,18 +222,20 @@ VKAPI_ATTR VkResult VKAPI_CALL mock_fault_info(VkDevice, VkDeviceFaultCountsEXT*
 
 const VkCommandBuffer kCmd = reinterpret_cast<VkCommandBuffer>(uintptr_t{0x1000});
 const VkQueue kQueue = reinterpret_cast<VkQueue>(uintptr_t{0x2000});
+const VkDevice kDev = reinterpret_cast<VkDevice>(uintptr_t{0x9});     // the device configure() arms
+const VkDevice kOtherDev = reinterpret_cast<VkDevice>(uintptr_t{0x7});
 const VkBuffer kBuffer = reinterpret_cast<VkBuffer>(uintptr_t{0x3000});
 
 void inactive_emitter_does_nothing() {
     breadcrumb_table().reset();
     rec = {};
     BreadcrumbEmitter emitter;
-    CHECK(!emitter.active() && emitter.begin(kCmd, site(1, 0, 0)) == 0,
+    CHECK(!emitter.active() && emitter.begin(kDev, kCmd, site(1, 0, 0)) == 0,
           "an unconfigured emitter is inactive and begin() returns id 0");
     emitter.end(kCmd, 0);
     CHECK(rec.amd_values.empty() && rec.checkpoints.empty() && breadcrumb_table().sites_recorded() == 0,
           "...and records nothing: no write, no table entry");
-    const std::string hint = emitter.report_device_loss(kQueue);
+    const std::string hint = emitter.report_device_loss(kDev, kQueue);
     CHECK(hint.find("not armed") != std::string::npos && hint.find("PROSPER_GPU_BREADCRUMBS=1") != std::string::npos,
           "...and on a device loss says it was not armed and how to arm it, instead of staying silent");
 }
@@ -246,14 +248,14 @@ void amd_path() {
     d.cmd_write_buffer_marker = mock_write_marker;
     d.get_device_fault_info = mock_fault_info;
     BreadcrumbEmitter emitter;
-    emitter.configure(BreadcrumbMode::amd_buffer_marker, d, reinterpret_cast<VkDevice>(uintptr_t{0x9}),
+    emitter.configure(BreadcrumbMode::amd_buffer_marker, d, kDev,
                       kBuffer, slots, /*device_fault_enabled=*/true);
 
-    const uint32_t a = emitter.begin(kCmd, site(5, 1, 0));
+    const uint32_t a = emitter.begin(kDev, kCmd, site(5, 1, 0));
     emitter.end(kCmd, a);
-    const uint32_t b = emitter.begin(kCmd, site(5, 1, 1));
+    const uint32_t b = emitter.begin(kDev, kCmd, site(5, 1, 1));
     emitter.end(kCmd, b);
-    const uint32_t c = emitter.begin(kCmd, site(5, 1, 2));
+    const uint32_t c = emitter.begin(kDev, kCmd, site(5, 1, 2));
     CHECK(a == 1 && b == 2 && c == 3, "three sites get ids 1, 2, 3");
     CHECK(rec.amd_values.size() == 5, "begin, end, begin, end, begin write five markers");
     CHECK(rec.amd_values[0] == 1 && rec.amd_values[1] == breadcrumb_after_value(1) &&
@@ -272,7 +274,7 @@ void amd_path() {
     const auto read = emitter.read_back(kQueue);
     CHECK(read.ok && read.started == 3 && read.finished == breadcrumb_after_value(2),
           "the marker slots read back as written");
-    const std::string report = emitter.report_device_loss(kQueue);
+    const std::string report = emitter.report_device_loss(kDev, kQueue);
     CHECK(report.find("ONE site") != std::string::npos && report.find("index=2") != std::string::npos,
           "the device-loss report names the third draw as the one in flight");
     CHECK(report.find("[gpu-fault] driver: mock page fault") != std::string::npos &&
@@ -290,19 +292,19 @@ void nv_path() {
     d.cmd_set_checkpoint = mock_set_checkpoint;
     d.get_queue_checkpoint_data = mock_get_checkpoint_data;
     BreadcrumbEmitter emitter;
-    emitter.configure(BreadcrumbMode::nv_checkpoint, d, reinterpret_cast<VkDevice>(uintptr_t{0x9}),
+    emitter.configure(BreadcrumbMode::nv_checkpoint, d, kDev,
                       VK_NULL_HANDLE, nullptr, false);
 
-    const uint32_t a = emitter.begin(kCmd, site(9, 0, 10, 0x500, 0x6));
+    const uint32_t a = emitter.begin(kDev, kCmd, site(9, 0, 10, 0x500, 0x6));
     emitter.end(kCmd, a);
-    const uint32_t b = emitter.begin(kCmd, site(9, 0, 11, 0x600, 0x7));
+    const uint32_t b = emitter.begin(kDev, kCmd, site(9, 0, 11, 0x600, 0x7));
     CHECK(rec.checkpoints.size() == 3 && rec.checkpoints[0] == 1 &&
               rec.checkpoints[1] == breadcrumb_after_value(1) && rec.checkpoints[2] == 2,
           "NV writes the same marker values as checkpoints");
 
     // The queue reports what it reached: the first site finished, the second only started.
     rec.nv_reported = {breadcrumb_before_value(b), breadcrumb_after_value(a), breadcrumb_before_value(a)};
-    const std::string report = emitter.report_device_loss(kQueue);
+    const std::string report = emitter.report_device_loss(kDev, kQueue);
     CHECK(report.find("ONE site") != std::string::npos && report.find("index=11") != std::string::npos &&
               report.find("program=0x600") != std::string::npos,
           "the reached checkpoints resolve to the second draw as the one in flight");
@@ -312,12 +314,21 @@ void nv_path() {
     // not that it finished, so the first site is still open: two sites are in flight, not one.
     rec.nv_reported = {breadcrumb_before_value(b), breadcrumb_after_value(a)};
     rec.nv_stages = {VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT};
-    CHECK(emitter.report_device_loss(kQueue).find("ONE site") == std::string::npos,
-          "an after checkpoint short of BOTTOM_OF_PIPE does not close its site");
+    CHECK(emitter.report_device_loss(kDev, kQueue).find("WINDOW of 2 sites") != std::string::npos,
+          "an after checkpoint short of BOTTOM_OF_PIPE does not close its site: both are in flight");
     rec.nv_stages.clear();
 
+    // A second device in the process (a private compute device) is not the armed one: it records
+    // nothing through this emitter and its loss reports that, instead of reading the armed device's
+    // checkpoint list through the other device's entry points.
+    const size_t recorded = rec.checkpoints.size();
+    CHECK(emitter.begin(kOtherDev, kCmd, site(9, 0, 12)) == 0 && rec.checkpoints.size() == recorded,
+          "begin for a device that is not the armed one records nothing");
+    CHECK(emitter.report_device_loss(kOtherDev, kQueue).find("not the armed one") != std::string::npos,
+          "a loss on the other device says its work carried no markers");
+
     rec.nv_reported.clear();
-    CHECK(emitter.report_device_loss(kQueue).find("NO marker reached memory") != std::string::npos,
+    CHECK(emitter.report_device_loss(kDev, kQueue).find("NO marker reached memory") != std::string::npos,
           "an empty checkpoint list reports that nothing was recorded, not a suspect");
 }
 
