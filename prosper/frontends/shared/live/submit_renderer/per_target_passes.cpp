@@ -744,6 +744,7 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                     phase.authoritative_readback, cpu_needed_same_batch,
                     live_gpu_targets, producer_volume_footprint_proven,
                     primary_volume_view.tile_mode);
+            prosper::test::backend_failed_publication_generation().fetch_add(1, std::memory_order_release);
             continue;
         }
         static const bool defer_rtt_readback =
@@ -860,6 +861,7 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                 std::fprintf(stderr,
                     "[render-volume] invalid slot0 view target=0x%llx\n",
                     static_cast<unsigned long long>(base));
+                prosper::test::backend_failed_publication_generation().fetch_add(1, std::memory_order_release);
                 continue;
             }
             backend_target.volume_depth = volume_view.selected_mip_depth;
@@ -869,6 +871,16 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             backend_target.readback = false;
         }
         backend_target.persistent_id1 = use_color1 ? base1 : 0;
+        for (uint32_t slot = 0; slot < mrt_count; ++slot) {
+            if (!pass_bases[slot]) continue;
+            uint64_t physical_bytes = 0;
+            for (const auto* draw : pass) {
+                const uint64_t bytes = raw_snapshot_color_footprint(*draw, slot);
+                if (!bytes) { physical_bytes = 0; break; }
+                physical_bytes = std::max(physical_bytes, bytes);
+            }
+            backend_target.guest_footprint_bytes[slot] = physical_bytes;
+        }
         backend_target.load_existing1 = seed_rtt1;
         backend_target.readback1 = use_color1 && base1 != 0 && !defer_readback1;
         backend_target.format1 = pass_format1;
@@ -1019,6 +1031,8 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                 prosper::diagnostics::perf::Counter::CpuRttPublicationChecks);
         if (base && color_target_call.writes) {
             RttSurf& surface = g_rtt[base];
+            if (completed_target) surface.guest_origins.merge(completed_target->guest_origins);
+            else surface.guest_origins.observe(base, 0u);
             surface.w = gw;
             surface.h = gh;
             surface.samples = pass.empty()
@@ -1093,6 +1107,7 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             // unseeded clear, at the other extent -- replaced the HDR scene in the CPU
             // cache, the next 2560x1440 pass then missed its seed, and the world went black.
             RttSurf& surface = g_rtt[base];
+            surface.guest_origins.observe(base, backend_target.guest_footprint_bytes[0]);
             surface.rgba = pass_pixels;
             surface.w = gw;
             surface.h = gh;
@@ -1165,6 +1180,10 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                 }
             }
             RttSurf& surface = g_rtt[pass_bases[slot]];
+            const auto* retained = prosper::test::find_persistent_color_target(
+                pass_bases[slot], gw, gh, pass_formats[slot]);
+            if (retained && color_target_call.writes) surface.guest_origins.merge(retained->guest_origins);
+            else surface.guest_origins.observe(pass_bases[slot], backend_target.guest_footprint_bytes[slot]);
             surface.w = gw;
             surface.h = gh;
             surface.samples = pass.empty()

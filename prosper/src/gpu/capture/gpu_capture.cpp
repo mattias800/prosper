@@ -512,6 +512,79 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         }
         return true;
     };
+    auto restore_nested_inputs = [&](const std::shared_ptr<ShaderResourceTable>& resources,
+                                     const GpuCapturedTable& captured_table, uint32_t raw_index) {
+        const bool marked = resources && std::any_of(resources->resources.begin(),
+            resources->resources.end(), [](const auto& resource) {
+                return resource.owned_nested_snapshot_bytes != 0u;
+            });
+        if (raw_index >= c.raw_shader_versions.size()) {
+            if (marked) { error = "owned nested replay lacks exact raw shader provenance"; return false; }
+            return true;
+        }
+        const auto& raw = c.raw_shader_versions[raw_index].words;
+        std::vector<Rdna2Inst> decoded;
+        const size_t consumed = rdna2_walk(raw.data(), raw.size(), decoded);
+        const auto chains = rdna2_owned_nested_wide_chains(decoded);
+        const auto numeric = rdna2_raw_nested_numeric_loads(decoded);
+        if (std::any_of(numeric.begin(), numeric.end(), [&](uint32_t pc) {
+                return std::none_of(chains.begin(), chains.end(),
+                    [pc](const auto& chain) { return chain.child_pc == pc; });
+            })) {
+            error = "nested numeric replay lacks original one-hop no-writer authority";
+            return false;
+        }
+        if ((marked || !chains.empty()) && (!consumed ||
+                rdna2_recompile_code_span(raw.data(), raw.size()) != raw.size() || !resources)) {
+            error = "owned nested replay lacks complete original shader or resource table";
+            return false;
+        }
+        if (!resources) return true;
+        std::map<uint32_t, uint32_t> widths;
+        for (const auto& chain : chains)
+            for (const auto [pc, width] : {std::pair{chain.parent_pc, chain.parent_bytes},
+                                          std::pair{chain.child_pc, chain.child_bytes}}) {
+                const auto [it, inserted] = widths.emplace(pc, width);
+                if (!inserted && it->second != width) {
+                    error = "owned nested replay has conflicting original widths"; return false;
+                }
+            }
+        for (const auto& resource : resources->resources)
+            if (resource.owned_nested_snapshot_bytes && (!widths.contains(resource.fetch_pc) ||
+                    widths.at(resource.fetch_pc) != resource.owned_nested_snapshot_bytes)) {
+                error = "owned nested replay obligation is not proven by original shader";
+                return false;
+            }
+        for (const auto& [pc, width] : widths) {
+            const auto* source = owned_nested_snapshot_at(*resources, pc, width);
+            if (!source) { error = "owned nested replay lacks exact-PC owned shape"; return false; }
+            const size_t index = static_cast<size_t>(source - resources->resources.data());
+            const auto& captured = captured_table.resources[index];
+            if (captured.blob_index >= c.blobs.size() || captured.blob_offset != 0u ||
+                c.blobs[captured.blob_index].bytes_read < width) {
+                error = "owned nested replay exceeds actually observed bytes"; return false;
+            }
+        }
+        for (const auto& chain : chains) {
+            const auto* parent = owned_nested_snapshot_at(*resources, chain.parent_pc, chain.parent_bytes);
+            const auto* child = owned_nested_snapshot_at(*resources, chain.child_pc, chain.child_bytes);
+            uint64_t pointer = 0;
+            std::memcpy(&pointer, parent->host_data, sizeof(pointer));
+            if (child->gpu_addr < chain.child_offset ||
+                pointer != child->gpu_addr - chain.child_offset) {
+                error = "owned nested replay parent and child observations disagree"; return false;
+            }
+        }
+        for (const auto& [pc, width] : widths) {
+            auto* source = const_cast<ShaderResource*>(owned_nested_snapshot_at(*resources, pc, width));
+            auto owner = std::make_shared<std::vector<uint8_t>>(source->host_data,
+                                                               source->host_data + width);
+            source->host_data = owner->data(); source->host_data_size = owner->size();
+            resources->owned_host_data.push_back(std::move(owner));
+            resources->owned_nested_snapshot_requirements.emplace_back(pc, width);
+        }
+        return true;
+    };
     out.items.reserve(c.draws.size());
     for (const auto& x : c.draws) {
         if (!x.ps_launch_rsrc1.canonical()) {
@@ -575,6 +648,12 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         }
         if (!restore_owned_raw_inputs(d.vrt, x.vrt, x.vs_raw_shader_index) ||
             !restore_owned_raw_inputs(d.prt, x.prt, x.fs_raw_shader_index)) return false;
+        if (!restore_nested_inputs(d.vrt, x.vrt, x.vs_raw_shader_index) ||
+            !restore_nested_inputs(d.prt, x.prt, x.fs_raw_shader_index)) return false;
+        if (x.vs_chain_raw_shader_index != UINT32_MAX && d.vrt &&
+            !d.vrt->owned_nested_snapshot_requirements.empty()) {
+            error = "owned nested replay requires a direct vertex stage"; return false;
+        }
         if (d.vrt) d.vrt->vertices_per_instance = d.vertex_count;
         out.items.push_back(std::move(d));
     }

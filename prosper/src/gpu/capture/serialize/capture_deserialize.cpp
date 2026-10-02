@@ -1752,6 +1752,39 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 return false;
             }
     }
+    if (version >= 68u) {
+        size_t expected = 0;
+        for (const auto& draw : c.draws) expected += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes) expected += compute.resources.resources.size();
+        for (const auto& diagnostic : c.failure_diagnostics)
+            for (const auto& stage : diagnostic.stages) expected += stage.resource_table.resources.size();
+        uint32_t count = 0;
+        if (!r.u32(count) || count != expected) { error = "invalid nested snapshot count"; return false; }
+        auto read_nested_snapshots = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                uint32_t width = 0;
+                if (!r.u32(width)) return false;
+                captured.resource.owned_nested_snapshot_bytes = width;
+                if (width && ((width != 16u && width != 32u) ||
+                              !valid_owned_raw_snapshot_shape(captured.resource, width) ||
+                              captured.captured_size < width)) return false;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_nested_snapshots(draw.vrt) || !read_nested_snapshots(draw.prt)) {
+                error = "invalid owned nested snapshot state"; return false;
+            }
+        for (auto& compute : c.computes)
+            if (!read_nested_snapshots(compute.resources)) {
+                error = "invalid owned nested snapshot state"; return false;
+            }
+        for (auto& diagnostic : c.failure_diagnostics)
+            for (auto& stage : diagnostic.stages)
+                if (!read_nested_snapshots(stage.resource_table)) {
+                    error = "invalid owned nested snapshot state"; return false;
+                }
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.

@@ -1127,7 +1127,11 @@ namespace {
     }();
     // Direct ("physical") memory allocations, kept SORTED by start (first-fit allocation walks the
     // gaps). Also serves sceKernelDirectMemoryQuery.
-    struct DMem { uint64_t start, end; int type; };
+    struct DMem {
+        uint64_t start, end; int type;
+        uint64_t origin_start, origin_end, origin_id;
+    };
+    uint64_t g_next_dmem_origin = 1;
     std::mutex g_dmx;
     std::vector<DMem> g_dmem;
 
@@ -1168,7 +1172,8 @@ namespace {
         }
         return false;
     found:
-        g_dmem.insert(g_dmem.begin() + insert_at, { off_out, off_out + sz, type });
+        g_dmem.insert(g_dmem.begin() + insert_at,
+                      {off_out, off_out + sz, type, off_out, off_out + sz, g_next_dmem_origin++});
         return true;
     }
 
@@ -1207,8 +1212,8 @@ namespace {
         out.reserve(g_dmem.size());
         for (auto& d : g_dmem) {
             if (d.end <= start || d.start >= end) { out.push_back(d); continue; }
-            if (d.start < start) out.push_back({ d.start, start, d.type });
-            if (d.end > end)     out.push_back({ end, d.end, d.type });
+            if (d.start < start) out.push_back({d.start, start, d.type, d.origin_start, d.origin_end, d.origin_id});
+            if (d.end > end) out.push_back({end, d.end, d.type, d.origin_start, d.origin_end, d.origin_id});
         }
         g_dmem.swap(out);
     }
@@ -1237,11 +1242,11 @@ namespace {
                 out.push_back(d);
                 continue;
             }
-            if (d.start < start) out.push_back({d.start, start, d.type});
+            if (d.start < start) out.push_back({d.start, start, d.type, d.origin_start, d.origin_end, d.origin_id});
             const uint64_t changed_start = d.start < start ? start : d.start;
             const uint64_t changed_end = d.end > end ? end : d.end;
-            out.push_back({changed_start, changed_end, type});
-            if (d.end > end) out.push_back({end, d.end, d.type});
+            out.push_back({changed_start, changed_end, type, d.origin_start, d.origin_end, d.origin_id});
+            if (d.end > end) out.push_back({end, d.end, d.type, d.origin_start, d.origin_end, d.origin_id});
         }
         g_dmem.swap(out);
     }
@@ -4671,7 +4676,11 @@ namespace {
         }
         return 16ull * 1024 * 1024 * 1024;
     }();
-    struct DMem { uint64_t start, end; int type; };
+    struct DMem {
+        uint64_t start, end; int type;
+        uint64_t origin_start, origin_end, origin_id;
+    };
+    uint64_t g_next_dmem_origin = 1;
     std::mutex g_dmx;
     std::vector<DMem> g_dmem;
 
@@ -4704,7 +4713,8 @@ namespace {
         }
         return false;
     found:
-        g_dmem.insert(g_dmem.begin() + insert_at, { off_out, off_out + sz, type });
+        g_dmem.insert(g_dmem.begin() + insert_at,
+                      {off_out, off_out + sz, type, off_out, off_out + sz, g_next_dmem_origin++});
         return true;
     }
     void dmem_largest_free(uint64_t lo, uint64_t hi, uint64_t align, uint64_t& off_out, uint64_t& size_out) {
@@ -4734,8 +4744,8 @@ namespace {
         out.reserve(g_dmem.size());
         for (auto& d : g_dmem) {
             if (d.end <= start || d.start >= end) { out.push_back(d); continue; }
-            if (d.start < start) out.push_back({ d.start, start, d.type });
-            if (d.end > end)     out.push_back({ end, d.end, d.type });
+            if (d.start < start) out.push_back({d.start, start, d.type, d.origin_start, d.origin_end, d.origin_id});
+            if (d.end > end) out.push_back({end, d.end, d.type, d.origin_start, d.origin_end, d.origin_id});
         }
         g_dmem.swap(out);
     }
@@ -4762,11 +4772,11 @@ namespace {
                 out.push_back(d);
                 continue;
             }
-            if (d.start < start) out.push_back({d.start, start, d.type});
+            if (d.start < start) out.push_back({d.start, start, d.type, d.origin_start, d.origin_end, d.origin_id});
             const uint64_t changed_start = d.start < start ? start : d.start;
             const uint64_t changed_end = d.end > end ? end : d.end;
-            out.push_back({changed_start, changed_end, type});
-            if (d.end > end) out.push_back({end, d.end, d.type});
+            out.push_back({changed_start, changed_end, type, d.origin_start, d.origin_end, d.origin_id});
+            if (d.end > end) out.push_back({end, d.end, d.type, d.origin_start, d.origin_end, d.origin_id});
         }
         g_dmem.swap(out);
     }
@@ -8499,6 +8509,83 @@ int dmem_caller_scan_slots_for_test(const volatile uint64_t* frame, int want) {
 // Both platform implementations keep their mapping table and lock under these same names.
 // Resolve the public topology query here so one contract serves either platform.
 namespace prosper {
+namespace {
+GuestDirectAllocation direct_allocation_locked(uint64_t address, uint64_t bytes) {
+    if (!bytes || address > UINT64_MAX - bytes) return {};
+    const auto mapping = std::find_if(g_maps.begin(), g_maps.end(), [&](const auto& mapping) {
+        return mapping.committed && (mapping.query_flags & kVirtualQueryDirect) &&
+            mapping.base <= address && address - mapping.base < mapping.size &&
+            bytes <= mapping.size - (address - mapping.base);
+    });
+    if (mapping == g_maps.end() || mapping->offset > UINT64_MAX - (address - mapping->base))
+        return {};
+    const uint64_t physical = mapping->offset + address - mapping->base;
+    const auto allocation = std::find_if(g_dmem.begin(), g_dmem.end(), [&](const auto& range) {
+        return range.start <= physical && physical < range.end &&
+            range.origin_start <= physical && physical < range.origin_end &&
+            bytes <= range.origin_end - physical;
+    });
+    if (allocation == g_dmem.end() || !allocation->origin_id) return {};
+    // Type changes split the public query ledger; they do not split allocation ownership.
+    // A partially released/reused origin is not a new producer's authenticated whole backing.
+    uint64_t cursor = allocation->origin_start;
+    for (const auto& range : g_dmem) {
+        if (range.end <= cursor) continue;
+        if (range.start != cursor || range.origin_id != allocation->origin_id ||
+            range.origin_start != allocation->origin_start || range.origin_end != allocation->origin_end)
+            return {};
+        cursor = range.end;
+        if (cursor == allocation->origin_end)
+            return {address, bytes, allocation->origin_start, allocation->origin_end,
+                    allocation->origin_id};
+    }
+    return {};
+}
+} // namespace
+
+GuestDirectAllocation guest_memory_direct_allocation(const GuestMappingLease&,
+                                                     uint64_t address, uint64_t bytes) {
+    std::scoped_lock lock(g_mx, g_dmx);
+    return direct_allocation_locked(address, bytes);
+}
+
+GuestMemoryTopologyRelation guest_memory_retained_allocation_relation(
+        const GuestMappingLease&, uint64_t source_address, uint64_t source_bytes,
+        const GuestDirectAllocation& producer) {
+    if (!source_bytes || source_address > UINT64_MAX - source_bytes ||
+        !producer.identity || producer.physical_begin >= producer.physical_end)
+        return GuestMemoryTopologyRelation::Unknown;
+    // The retained owner authenticates producer birth/bounds. It may outlive its guest VA and
+    // physical release. Physical reuse still overlaps: a different allocation ID is not isolation.
+    // Only source bindings are resolved from CURRENT maps/allocations under both HLE locks.
+    std::scoped_lock lock(g_mx, g_dmx);
+    uint64_t cursor = source_address;
+    const uint64_t end = source_address + source_bytes;
+    bool overlap = false;
+    while (cursor < end) {
+        const auto source = std::find_if(g_maps.begin(), g_maps.end(), [&](const auto& mapping) {
+            return mapping.committed && (mapping.query_flags & kVirtualQueryDirect) &&
+                mapping.base <= cursor && cursor - mapping.base < mapping.size;
+        });
+        if (source == g_maps.end() || source->offset > UINT64_MAX - (cursor - source->base))
+            return GuestMemoryTopologyRelation::Unknown;
+        const uint64_t first = source->offset + cursor - source->base;
+        const uint64_t bytes = std::min(end - cursor, source->size - (cursor - source->base));
+        if (first > UINT64_MAX - bytes || !direct_allocation_locked(cursor, bytes).identity)
+            return GuestMemoryTopologyRelation::Unknown;
+        overlap |= first < producer.physical_end && producer.physical_begin < first + bytes;
+        cursor += bytes;
+    }
+    return overlap ? GuestMemoryTopologyRelation::Overlap : GuestMemoryTopologyRelation::Disjoint;
+}
+
+GuestMemoryTopologyRelation guest_memory_direct_allocation_relation(
+        const GuestMappingLease& lease, uint64_t source_address, uint64_t source_bytes,
+        uint64_t producer_address, uint64_t minimum_producer_bytes) {
+    return guest_memory_retained_allocation_relation(lease, source_address, source_bytes,
+        guest_memory_direct_allocation(lease, producer_address, minimum_producer_bytes));
+}
+
 GuestMemoryTopologyRelation guest_memory_topology_relation(
         uint64_t first_address, uint64_t first_size,
         uint64_t second_address, uint64_t second_size) {

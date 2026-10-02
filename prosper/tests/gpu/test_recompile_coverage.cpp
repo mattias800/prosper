@@ -1213,9 +1213,9 @@ int main() {
         0xf80008cfu, 0x00000000u, // exp pos0, v0, v0, v0, v0
         0xbf810000u,
     };
-    CHECK(!recompile_vertex(nested_x4_graphics.data(), nested_x4_graphics.size(),
+    CHECK(recompile_vertex(nested_x4_graphics.data(), nested_x4_graphics.size(),
                             &nested_x4_parent_table).empty(),
-          "graphics keeps #3951's compatibility placeholder for nested numeric loads");
+          "graphics refuses nested numeric loads without an owned parent and child");
     const std::array<uint32_t, 6> raw_x4_after_store = {
         0xe0700000u, 0x80000100u, // pc0: buffer_store_dword may alias raw source
         0xf4080100u, 0xfa000020u, // pc2: x4 s[4:7] from dispatch-time snapshot

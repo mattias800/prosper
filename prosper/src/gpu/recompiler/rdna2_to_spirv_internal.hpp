@@ -2893,6 +2893,7 @@ struct RegState {
     std::unordered_set<uint32_t> smem_raw_offset_scalar_source_pcs;
     std::unordered_set<uint32_t> smem_raw_owned_wide_data_loads;
     std::unordered_set<uint32_t> smem_raw_nested_wide_data_loads;
+    std::vector<RawNestedWideChain> smem_owned_nested_wide_chains;
     std::unordered_set<uint32_t> smem_raw_wide_data_loads;
     bool smem_pointer_analysis_done = false;
     // Register-offset S_LOAD_DWORDX2 is likewise typeless. GTA V uses it to fetch the first two
@@ -2946,6 +2947,14 @@ inline bool retain_original_owned_raw_wide_proof(
     for (uint32_t pc : rs.smem_raw_owned_wide_data_loads)
         if (!std::binary_search(original_pcs.begin(), original_pcs.end(), pc)) return false;
     rs.smem_raw_owned_wide_data_loads.insert(original_pcs.begin(), original_pcs.end());
+    return true;
+}
+
+inline bool retain_original_owned_nested_wide_proof(
+        RegState& rs, const std::vector<RawNestedWideChain>& original) {
+    for (const auto& chain : rs.smem_owned_nested_wide_chains)
+        if (std::find(original.begin(), original.end(), chain) == original.end()) return false;
+    rs.smem_owned_nested_wide_chains = original;
     return true;
 }
 

@@ -175,12 +175,12 @@ int main(int argc, char** argv) {
     constexpr size_t mode_tail_bytes = 8u;
     constexpr size_t width_tail_bytes = 4u;
     constexpr size_t backing_tail_bytes = 5u;
-    CHECK(encoded.size() >= flags_tail_bytes + transport_tail_bytes + owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes &&
-          encoded[8] == 67u,
+    CHECK(encoded.size() >= flags_tail_bytes + transport_tail_bytes + 2u * owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes &&
+          encoded[8] == 68u,
           "legacy controls require the current versioned capture tail");
-    if (encoded.size() >= flags_tail_bytes + transport_tail_bytes + owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes) {
+    if (encoded.size() >= flags_tail_bytes + transport_tail_bytes + 2u * owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes) {
         auto v64 = encoded;
-        v64.resize(v64.size() - flags_tail_bytes - transport_tail_bytes - owned_tail_bytes);
+        v64.resize(v64.size() - flags_tail_bytes - transport_tail_bytes - 2u * owned_tail_bytes);
         v64[8] = 64u;
         CHECK(deserialize_gpu_capture(v64, decoded, error) &&
               decoded.computes[0].resources.resources[0].resource.raw_register_snapshot &&

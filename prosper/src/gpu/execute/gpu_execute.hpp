@@ -154,6 +154,9 @@ struct DrawItem {
         uint32_t tile_mode = 0, mip_level = 0;
         bool in_mip_tail = false;
         bool native_layout_known = false; // old captures carry no CB_COLOR tiling proof
+        // Live code-derived complete physical extent; never serialized as authority. Older
+        // captures do not retain the full allocation/array programming needed to derive this.
+        uint64_t raw_snapshot_footprint_bytes = 0;
 
         constexpr void mirror_named_identity(uint64_t named_base, uint32_t named_width,
                                              uint32_t named_height) {
@@ -500,12 +503,17 @@ std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
 // by its bound code address, read its user-data SGPR block from the sh register file, decode the V#/T#/S#
 // descriptors, and assign bindings matching the recompiler+backend convention (constant buffer -> binding
 // 2, vertex buffer -> binding 3, textures -> binding 4+). Returns null if the stage has no shader header
-// or no resources. `draw_vertex_count` bounds dynamic descriptors whose V# publishes zero records;
+// or no resources, except an explicit empty table retains a nested numeric refusal. Such loads
+// require an ordered raw context and owned exact-PC parent/child observations; eager callers
+// cannot use a descriptor placeholder. `draw_vertex_count` bounds dynamic descriptors whose V# publishes zero records;
 // indexed draws are grown to their decoded max-index range later in realize_draw_item. Implemented in
 // gpu_executor.cpp (needs the AGC registry + descriptor decode).
+struct GraphicsRawSnapshotContext;
+bool draw_requires_owned_nested_snapshot(const GpuState& state);
 std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr,
                                                        bool is_ps, uint32_t draw_vertex_count = 0,
-                                                       uint64_t draw_command_order = 0);
+                                                       uint64_t draw_command_order = 0,
+                                                       const GraphicsRawSnapshotContext* raw_context = nullptr);
 
 // PROSPER_COMPUTELOG diagnostic: resolve every skipped DispatchDirect packet's compute shader and
 // AGC resource table from its retained register snapshot. PROSPER_COMPUTELOG_DIM=WxH restricts output
@@ -1974,7 +1982,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                               uint32_t max_shader_dwords, bool log, DrawItem& out,
                               OperationRealizationFailure* failure = nullptr,
                               bool retain_shared_shader_words = false,
-                              const char* const* hoisted_validate_mode = nullptr) {
+                              const char* const* hoisted_validate_mode = nullptr,
+                              const GraphicsRawSnapshotContext* raw_context = nullptr) {
     RenderState rs = extract_render_state(ds);
     // A volume color target alone does not tell the mesh translator which ancillary POS export
     // selects the destination layer. Keep this opt-in register witness at the draw snapshot, not
@@ -2032,6 +2041,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             binding.mip_level = rs.color_targets[slot].mip_level;
             binding.in_mip_tail = rs.color_targets[slot].in_mip_tail;
             binding.native_layout_known = rs.color_targets[slot].has_attrib3;
+            binding.raw_snapshot_footprint_bytes = color_target_physical_bytes(rs.color_targets[slot]);
         }
         failure->color_targets[0].mirror_named_identity(
             failure->color0_base, failure->color0_width, failure->color0_height);
@@ -2274,7 +2284,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     const uint64_t vs_program_addr = vertex_chain ? rs.es_addr : fused_back_addr;
     std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(
         ds, vertex_chain ? rs.es_addr : vs_program_addr, false, vcount_hint,
-        draw ? draw->command_order : 0);
+        draw ? draw->command_order : 0, vertex_chain ? nullptr : raw_context);
     std::shared_ptr<ShaderResourceTable> chain_vrt;
     if (vertex_chain) {
         const size_t prolog_resource_count = vrt ? vrt->resources.size() : 0;
@@ -2296,7 +2306,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             }
     }
     std::shared_ptr<ShaderResourceTable> prt = build_stage_table(
-        ds, rs.ps_addr, true, vcount_hint, draw ? draw->command_order : 0);
+        ds, rs.ps_addr, true, vcount_hint, draw ? draw->command_order : 0, raw_context);
     const bool rect_list = rs.prim_type == 7u || rs.prim_type == 17u;
     const bool rect_list_synthesis = needs_rect_list_synthesis(
         rs.prim_type, draw && draw->indexed, vcount_hint, vrt.get());
@@ -3070,6 +3080,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         binding.mip_level = rs.color_targets[slot].mip_level;
         binding.in_mip_tail = rs.color_targets[slot].in_mip_tail;
         binding.native_layout_known = rs.color_targets[slot].has_attrib3;
+        binding.raw_snapshot_footprint_bytes = color_target_physical_bytes(rs.color_targets[slot]);
     }
     // Preserve direct/synthetic callers that still populate only the named aliases.
     out.color_targets[0].mirror_named_identity(out.color0_base, out.color0_width,

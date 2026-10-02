@@ -129,15 +129,17 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
         launch=b"\x01\x00\x00\x01"+struct.pack("<I",16<<12)
         flags_tail=(struct.pack("<I",1)+launch+struct.pack("<I",0) if name=="mode16" else
                     struct.pack("<II",0,1)+launch)
-        check(struct.unpack_from("<I",data,8)[0]==67 and data.endswith(flags_tail),
-              name+" genuine independent known-clear-flags v67 tail")
+        check(struct.unpack_from("<I",data,8)[0]==68 and data.endswith(flags_tail+bytes(4)),
+              name+" exact official67 flags followed by resource-free nested68 count")
+        data=bytearray(data[:-4]); struct.pack_into("<I",data,8,67)
+        check(data.endswith(flags_tail),name+" genuine independent known-clear-flags v67 tail")
         data=bytearray(data[:-len(flags_tail)])
         struct.pack_into("<I",data,8,66)
         (directory/("official66"+("-failed" if name.endswith("failed") else "")+".prgcap")).write_bytes(data)
         transport_tail=(struct.pack("<I",1)+b"\x00"+struct.pack("<II",0,0) if name=="mode16" else
                         struct.pack("<III",0,0,1)+b"\x00"+struct.pack("<I",1)+b"\x00")
         check(struct.unpack_from("<I",data,8)[0]==66 and data.endswith(transport_tail),
-              name+" genuine canonical unknown-transport v66 tail")
+              name+" genuine official unknown-transport v66 tail")
         data=bytearray(data[:-len(transport_tail)])
         struct.pack_into("<I",data,8,65)
         expected_tail=(struct.pack("<I",1)+b"\x01\x10"+struct.pack("<I",0) if name=="mode16" else
@@ -206,28 +208,31 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
                     except ValueError as error:
                         check(False,label+" fail-closed output oracle: "+str(error))
     original=(directory/"mode16.prgcap").read_bytes()
-    # MODE precedes one zero-owned-count v65 tail and one-draw/no-compute/no-failure v66 transport.
+    # MODE precedes v65 owners, v66 transport, v67 launch flags and zero nested68 count.
     transport_tail_size=13
     flags_tail_size=16
-    start=len(original)-flags_tail_size-transport_tail_size-4-10
+    flags_start=len(original)-4-flags_tail_size
+    start=flags_start-transport_tail_size-4-10
     malformed={
         "count":original[:start]+struct.pack("<I",0)+original[start+4:],
         "tag":original[:start+4]+b"\x02"+original[start+5:],
         "unknown-value":original[:start+4]+b"\x00\x10"+original[start+6:],
         "failure-count":original[:start+6]+struct.pack("<I",1)+original[start+10:],
         "truncated-mode":original[:start+9],
-        "truncated-owned":original[:-flags_tail_size-transport_tail_size-1],
-        "truncated-transport":original[:-flags_tail_size-1],
-        "truncated-flags":original[:-1],
-        "flags-count":original[:-flags_tail_size]+struct.pack("<I",0)+original[-flags_tail_size+4:],
-        "flags-tag":original[:-12]+b"\x02"+original[-11:],
-        "flags-unknown-value":original[:-12]+b"\x00\x01\x00"+original[-9:],
-        "raw-tag":original[:-9]+b"\x02"+original[-8:],
-        "raw-unknown-value":original[:-9]+b"\x00"+struct.pack("<I",1)+original[-4:],
+        "truncated-owned":original[:flags_start-transport_tail_size-1],
+        "truncated-transport":original[:flags_start-1],
+        "truncated-flags":original[:-5],
+        "truncated-nested":original[:-1],
+        "flags-count":original[:flags_start]+struct.pack("<I",0)+original[flags_start+4:],
+        "flags-tag":original[:flags_start+4]+b"\x02"+original[flags_start+5:],
+        "flags-unknown-value":original[:flags_start+4]+b"\x00\x01\x00"+original[flags_start+7:],
+        "raw-tag":original[:flags_start+7]+b"\x02"+original[flags_start+8:],
+        "raw-unknown-value":original[:flags_start+7]+b"\x00"+struct.pack("<I",1)+original[flags_start+12:],
         "trailing":original+b"\x00",
         "relabel-only63":original[:8]+struct.pack("<I",63)+original[12:],
     }
     for name,data in malformed.items():
+        check(data != original,name+" corruption changes the actual capture")
         capture=directory/(name+".prgcap"); capture.write_bytes(data)
         for route in ("recompile-raw","fs-tap"):
             path=directory/"sentinel.spv"; path.write_bytes(b"unchanged")

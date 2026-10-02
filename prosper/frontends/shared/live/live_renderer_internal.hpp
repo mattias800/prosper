@@ -118,6 +118,13 @@ extern "C" uint64_t prosper_vo_flip_count();
 
 namespace prosper::frontend {
 
+// Only live realization has the full CB allocation/array programming. A Vulkan extent or an
+// old capture's tiling-presence bit cannot replace this nonserialized, code-derived certificate.
+inline uint64_t raw_snapshot_color_footprint(const prosper::gpu::DrawItem& draw, uint32_t slot) {
+    return slot < prosper::gpu::kColorTargetCount
+        ? draw.color_targets[slot].raw_snapshot_footprint_bytes : 0u;
+}
+
 // Default ceiling on a single non-texture (vertex/index/storage/constant) buffer upload. This is
 // not borrowed from any other path — it exists only to bound a corrupt descriptor, and it is sized
 // against what a 64 MiB read already costs elsewhere (~16K guest_readable page probes). A guest
@@ -152,6 +159,8 @@ struct RttSurf {
     uint64_t dcc_metadata_addr = 0;
     uint64_t dcc_metadata_bytes = 0;
     bool dcc_metadata_dirty = false;
+    prosper::test::BackendGuestProducerOrigins guest_origins;
+    prosper::test::BackendGuestProducerOrigins dcc_guest_origins;
 };
 // Keeps the per-resource overlap scan entirely off the ordinary 2D-only execution path.
 inline bool g_ever_volume_target = false;
