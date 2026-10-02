@@ -21,6 +21,8 @@ tests/gpu/capture/test_gpu_replay_seed_order.cpp
 tests/gpu/capture/test_interactive_capture_writer.cpp
 tests/gpu/capture/test_writer_provenance.cpp
 tests/gpu/diagnostics/test_draw_program_skip_render.cpp
+tests/gpu/diagnostics/test_gpu_breadcrumbs.cpp
+tests/gpu/diagnostics/test_gpu_labels.cpp
 tests/gpu/diagnostics/test_gpu_replay_shader_dump.cpp
 tests/gpu/execute/test_broadcast_htile_clear.cpp
 tests/gpu/execute/test_cached_compute_fill.cpp

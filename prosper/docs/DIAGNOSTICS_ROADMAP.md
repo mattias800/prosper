@@ -95,6 +95,14 @@ strategy, dependencies and what it deliberately does not do.
 - **Depends on:** a stable draw/dispatch identity (D8 shares it). **Out of scope:** vendor SDKs (Nsight
   Aftermath, Radeon GPU Detective) as linked dependencies; they are proprietary. Using them as external
   tools stays fine.
+- **Status (first slice landed):** `PROSPER_GPU_BREADCRUMBS` arms `VK_AMD_buffer_marker` or
+  `VK_NV_device_diagnostic_checkpoints` (plus `VK_EXT_device_fault` when advertised) on both the
+  renderer's device and the standalone compute device, brackets every draw and dispatch with a marker,
+  and prints a verdict on a device loss. The verdict names a **window** of sites, not one culprit.
+  **Not done:** no real AMD or NV device loss has been reproduced with it (the unit tests use recording
+  entry points, and CI cannot do better), so whether a real driver executes the writes before a hang is
+  unverified; the second draw site (`PROSPER_DRAW_ISO` replay) is deliberately not instrumented; and
+  nothing marks transfers, barriers or presents.
 
 ### D2. Crash report with a flight recorder
 
@@ -148,6 +156,10 @@ strategy, dependencies and what it deliberately does not do.
   and hashes only, never guest strings.** Zero cost off: the function pointers are not loaded.
 - **Acceptance:** a debug-messenger test checks the labels on a real (software) device; a default run
   shows no loaded debug-utils pointers.
+- **Status (command labels landed with D1):** `PROSPER_GPU_LABELS` brackets every draw and dispatch with
+  a `VK_EXT_debug_utils` label whose text is the breadcrumb site spelling. **Not done:** object names
+  beyond shader modules (buffers, images, pipelines, render targets), and no real RenderDoc or RGP
+  capture has been opened to confirm how the labels display.
 - **Enables:** D1 (shared identity), and readable captures from the existing RenderDoc in-app trigger
   (`renderdoc_capture.hpp`, #3321).
 
@@ -177,6 +189,11 @@ The prerequisite D1, D5 and the per-pass timeline (M4) all need. Define once:
 submit ordinal, packet index, draw index, pipeline key hash. Without a shared definition each
 diagnostic invents its own and their outputs cannot be joined. Run-local ordinals stay run-local (the
 charter: addresses and operation ordinals are run-local).
+
+**Status (defined for breadcrumbs):** `BreadcrumbSite` in `src/gpu/diagnostics/gpu_breadcrumbs.hpp` is
+the first shared definition: kind, run-local submit ordinal, the semantic draw/dispatch index, a
+pass-local offset (graphics), the guest program address and a pipeline hash. D5 (debug names) and M4
+(per-pass timeline) should reuse it rather than define their own.
 
 ## 4. Measurement track
 

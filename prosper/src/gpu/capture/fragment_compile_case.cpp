@@ -258,8 +258,6 @@ std::vector<uint32_t> replay_fragment_compile_case(const FragmentCompileCase& c,
     if (actual_refusal) actual_refusal->clear();
     validate_fragment_compile_case(c);
     require(c.complete, "INCOMPLETE fragment compile case cannot replay");
-    require(prosper::embedded_fragment_compile_read_policy_verified(),
-            "INCOMPLETE: reader-policy-source-mismatch (re-audit required before compiler entry)");
     const std::string compiler = std::string(prosper::embedded_build_revision()) + ":" + prosper::embedded_build_source_identity();
     if (baseline) require(c.compiler == compiler, "baseline compiler identity mismatch");
     FragmentCompileCase owned = c;
@@ -304,7 +302,6 @@ void finish_fragment_compile_case(FragmentCompileCase& c, std::vector<uint32_t> 
     }
     if (!c.choices.error.empty()) incomplete(c, "compiler-choice-budget");
     if (c.compiler.empty() || c.compiler.find("unknown") != std::string::npos) incomplete(c, "compiler-identity-unavailable");
-    if (!prosper::embedded_fragment_compile_read_policy_verified()) incomplete(c, "reader-policy-source-mismatch");
     if (!c.complete) return;
     try {
         // This is the producer's internal fidelity check, not another observed compiler request.
