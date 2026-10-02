@@ -53,6 +53,22 @@
 namespace prosper::gpu {
 namespace {
 
+const RasterQuadInputs* owned_fragment_draw_inputs(const DrawItem& draw) {
+    const auto inputs = draw.raster_quads ? draw.raster_quads->inputs : nullptr;
+    return inputs && inputs->raw_matches_producing_source && inputs->raw_code &&
+        !inputs->raw_code->empty() && inputs->source_vs && inputs->source_gs && inputs->source_fs &&
+        *inputs->source_vs == draw.vs_words() && *inputs->source_gs == draw.gs_words() &&
+        *inputs->source_fs == draw.fs_words() && inputs->entry == draw.ps_entry &&
+        inputs->launch == draw.ps_raster_launch && inputs->float_mode == draw.ps_float_mode &&
+        inputs->float_flags == draw.ps_float_flags && inputs->launch_rsrc1 == draw.ps_launch_rsrc1 &&
+        inputs->float_transport == draw.float_transport ? inputs.get() : nullptr;
+}
+const ShaderResourceTable* producing_pixel_table(const DrawItem& draw) {
+    const auto* inputs = owned_fragment_draw_inputs(draw);
+    return inputs && inputs->ps_resources.observed && inputs->ps_resources.table
+        ? inputs->ps_resources.table.get() : draw.prt.get();
+}
+
 // Resource folding owns a scalar observation when that exact value selected a later
 // register-offset load. Preserve each draw's observation independently, including when another
 // draw uses the same guest address after it changes. Ordinary guest-backed buffers keep their
@@ -225,7 +241,7 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
         return true;
     };
     for (const auto& d : draws)
-        if (!add_table(d.vrt.get(), nullptr) || !add_table(d.prt.get(), nullptr))
+        if (!add_table(d.vrt.get(), nullptr) || !add_table(producing_pixel_table(d), nullptr))
             return false;
     for (const auto& c : computes) {
         std::set<uint32_t> compute_bindings;
@@ -403,6 +419,29 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
     return true;
 }
 
+bool store_raw_shader_version(std::vector<uint32_t> words, bool has_endpgm,
+                             GpuCaptureFile& capture, uint64_t& raw_words,
+                             uint32_t& index, std::string& error) {
+    const uint64_t hash = shader_hash(words);
+    auto existing = std::find_if(capture.raw_shader_versions.begin(),
+        capture.raw_shader_versions.end(), [&](const auto& candidate) {
+            return candidate.content_hash == hash && candidate.words == words;
+        });
+    if (existing != capture.raw_shader_versions.end()) {
+        index = static_cast<uint32_t>(existing - capture.raw_shader_versions.begin());
+        return true;
+    }
+    if (words.size() > kMaxRawShaderWords || capture.raw_shader_versions.size() >= kMaxResources ||
+        raw_words > kMaxShaderWords - words.size()) {
+        error = "raw shader data exceeds its bounded limit";
+        return false;
+    }
+    index = static_cast<uint32_t>(capture.raw_shader_versions.size());
+    raw_words += words.size();
+    capture.raw_shader_versions.push_back({hash, has_endpgm, std::move(words)});
+    return true;
+}
+
 bool capture_raw_shader_version(uint64_t addr, const CaptureMemoryReader& reader,
                                 GpuCaptureFile& capture, uint64_t& raw_words,
                                 std::map<uint64_t, uint32_t>& index_by_address,
@@ -434,24 +473,8 @@ bool capture_raw_shader_version(uint64_t addr, const CaptureMemoryReader& reader
     const size_t captured_span = std::max(consumed, recompile_span);
     if (captured_span && captured_span < words.size()) words.resize(captured_span);
     const bool has_endpgm = !instructions.empty() && instructions.back().is_end;
-    const uint64_t hash = shader_hash(words);
-    auto existing = std::find_if(capture.raw_shader_versions.begin(),
-                                 capture.raw_shader_versions.end(), [&](const auto& candidate) {
-        return candidate.content_hash == hash && candidate.words == words;
-    });
-    if (existing != capture.raw_shader_versions.end()) {
-        index = static_cast<uint32_t>(existing - capture.raw_shader_versions.begin());
-        index_by_address.emplace(addr, index);
-        return true;
-    }
-    if (capture.raw_shader_versions.size() >= kMaxResources ||
-        raw_words > kMaxShaderWords - words.size()) {
-        error = "raw shader data exceeds its bounded limit";
+    if (!store_raw_shader_version(std::move(words), has_endpgm, capture, raw_words, index, error))
         return false;
-    }
-    index = static_cast<uint32_t>(capture.raw_shader_versions.size());
-    raw_words += words.size();
-    capture.raw_shader_versions.push_back({hash, has_endpgm, std::move(words)});
     index_by_address.emplace(addr, index);
     return true;
 }
@@ -661,6 +684,10 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
     uint64_t raw_shader_words = 0;
     std::map<uint64_t, uint32_t> raw_shader_index_by_address;
     for (const auto& d : draws) {
+        if (!d.ps_entry.canonical() || !d.ps_raster_launch.canonical()) {
+            error = "invalid realized-draw fragment entry evidence";
+            return false;
+        }
         if (!d.ps_launch_rsrc1.canonical()) {
             error = "invalid realized-draw RSRC1_PS evidence";
             return false;
@@ -695,13 +722,25 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.draw_index = d.draw_index; c.command_order = d.command_order;
         if (!capture_raw_shader_version(d.vs_guest_addr, reader, out, raw_shader_words,
                                         raw_shader_index_by_address,
-                                        c.vs_raw_shader_index, error) ||
-            !capture_raw_shader_version(d.fs_guest_addr, reader, out, raw_shader_words,
-                                        raw_shader_index_by_address,
-                                        c.fs_raw_shader_index, error) ||
-            !capture_raw_shader_version(d.vs_chain_guest_addr, reader, out, raw_shader_words,
-                                        raw_shader_index_by_address,
-                                        c.vs_chain_raw_shader_index, error)) return false;
+                                        c.vs_raw_shader_index, error)) return false;
+        const auto* inputs = owned_fragment_draw_inputs(d);
+        c.ps_entry_source_available = inputs && d.ps_entry.observed;
+        if (c.ps_entry_source_available) {
+            if (inputs->raw_code->size() > kMaxRawShaderWords) {
+                error = "raw shader data exceeds its bounded limit";
+                return false;
+            }
+            // Per-draw immutable version, not the address-only memo: a later draw may rewrite
+            // the same guest VA, while this draw still owns its earlier compiler input.
+            std::vector<Rdna2Inst> decoded;
+            rdna2_walk(inputs->raw_code->data(), inputs->raw_code->size(), decoded);
+            if (!store_raw_shader_version(*inputs->raw_code,
+                    !decoded.empty() && decoded.back().is_end, out, raw_shader_words,
+                    c.fs_raw_shader_index, error)) return false;
+        } else if (!capture_raw_shader_version(d.fs_guest_addr, reader, out, raw_shader_words,
+                    raw_shader_index_by_address, c.fs_raw_shader_index, error)) return false;
+        if (!capture_raw_shader_version(d.vs_chain_guest_addr, reader, out, raw_shader_words,
+                raw_shader_index_by_address, c.vs_chain_raw_shader_index, error)) return false;
         c.vertex_lds_dwords = d.vertex_lds_dwords;
         c.pixel_inputs = d.pixel_inputs;
         c.system_inputs = d.system_inputs;
@@ -712,10 +751,12 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.ps_float_mode = d.ps_float_mode;
         c.ps_float_flags = d.ps_float_flags;
         c.ps_launch_rsrc1 = d.ps_launch_rsrc1;
+        c.ps_entry = d.ps_entry;
+        c.ps_raster_launch = d.ps_raster_launch;
         c.float_transport = d.float_transport;
         if (!capture_table(d.vrt.get(), intervals, include_resource_data, false,
                            c.vrt, error, nullptr, &out) ||
-            !capture_table(d.prt.get(), intervals, include_resource_data, false,
+            !capture_table(producing_pixel_table(d), intervals, include_resource_data, false,
                            c.prt, error, nullptr, &out))
             return false;
         out.draws.push_back(std::move(c));

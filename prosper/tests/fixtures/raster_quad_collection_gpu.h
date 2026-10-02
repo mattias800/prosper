@@ -121,6 +121,13 @@ inline bool raster_quad_producing_modules_match(const BackendDraw& draw) {
         *owner->inputs->source_fs == draw.fs_words();
 }
 
+inline std::shared_ptr<const prosper::gpu::FragmentPacketPreparation>
+prepare_backend_fragment_packet_inputs(const BackendDraw& draw) {
+    return prosper::gpu::prepare_fragment_packet_inputs(
+        draw.raster_quads ? draw.raster_quads->inputs : nullptr,
+        raster_quad_producing_modules_match(draw));
+}
+
 struct RasterQuadGpuOwner {
     const RenderVkCtx* ctx = nullptr;
     std::vector<RenderHostBuffer> buffers;
@@ -159,6 +166,19 @@ inline void collect_backend_raster_quads(const RenderVkCtx& ctx, const BackendDr
     result.attempted = true; result.source_submit = draw.source_submit;
     result.draw_index = draw.draw_index; result.command_order = draw.command_order;
     result.width = width; result.height = height;
+    result.packet_preparation = prepare_backend_fragment_packet_inputs(draw);
+    // Same shipping preparation is inspectable without a device. Named obligations must not
+    // disappear behind the generic subgroup refusal that brought this draw here.
+    std::string obligations;
+    for (const auto& gap : result.packet_preparation->unmet) {
+        if (!obligations.empty()) obligations += ',';
+        obligations += gap;
+    }
+    static std::set<std::pair<uint64_t, std::string>> preparation_reports;
+    if (preparation_reports.size() < 1024 &&
+        preparation_reports.emplace(draw.fs_identity, obligations).second)
+        std::fprintf(stderr, "[fragment-packet] preparation unmet=%s; no kernel/raster admission\n",
+                     obligations.c_str());
     if (sink->inputs) result.launch = sink->inputs->launch;
     auto refuse = [&](const char* reason) {
         result.complete = false; result.quads.clear(); result.rejection = reason;

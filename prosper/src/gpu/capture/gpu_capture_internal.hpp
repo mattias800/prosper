@@ -193,7 +193,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // Older captures retain Unknown, never infer flags from known FLOAT_MODE or a host profile.
 // v68: effective owned parent/child widths for direct graphics one-hop numeric loads. Code and
 // actually observed byte owners independently authenticate the chain; no live proof is serialized.
-constexpr uint32_t kVersion = 68;
+// v69: producing draw PS USER_DATA availability/raw RSRC2, raw raster-launch presence, and an
+// independent immutable raw/SOURCE association. Older captures retain explicit unavailable facts.
+constexpr uint32_t kVersion = 69;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;

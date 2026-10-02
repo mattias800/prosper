@@ -603,6 +603,10 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             error = "invalid realized-draw fragment wave config";
             return false;
         }
+        if (!x.ps_entry.canonical() || !x.ps_raster_launch.canonical()) {
+            error = "invalid realized-draw fragment entry evidence";
+            return false;
+        }
         DrawItem d; d.vs = x.vs; d.gs = x.gs; d.fs = x.fs;
         d.ps = x.ps; d.vertex_count = x.vertex_count;
         d.instance_count = x.instance_count;
@@ -632,6 +636,8 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         d.ps_float_mode = x.ps_float_mode;
         d.ps_float_flags = x.ps_float_flags;
         d.ps_launch_rsrc1 = x.ps_launch_rsrc1;
+        d.ps_entry = x.ps_entry;
+        d.ps_raster_launch = x.ps_raster_launch;
         d.float_transport = x.float_transport;
         if (!table(x.vrt, false, d.vrt) || !table(x.prt, false, d.prt)) return false;
         if (x.vs_chain_raw_shader_index != UINT32_MAX) {
