@@ -1971,6 +1971,22 @@ HLE(k_attr_getstacksize) {
     }
     return 0;
 }
+// scePthreadAttrGetstack(attr, void** addr, size_t* size): both halves of the stack description at
+// once, with the same values the two single-field getters above report. It was unregistered, so the
+// "unimplemented, returning 0" stub left both outputs untouched and a caller read stack garbage
+// (Assassin's Creed Black Flag Resynced calls it from a worker thread's start-up). Both outputs
+// tolerate NULL. CONFIDENCE: HIGH on the shape (it is pthread_attr_getstack), MED on reusing the
+// supplied-stack-else-host values.
+HLE(k_attr_getstack) {
+    if (a0 && *(void**)a0) {
+        auto* at = (GuestPthreadAttr*)*(void**)a0;
+        void* base = at->supplied_stack; size_t sz = at->supplied_stack_size;
+        if (!base) pthread_attr_getstack(&at->host, &base, &sz);
+        if (a1) *(void**)(uintptr_t)a1 = base;
+        if (a2) *(size_t*)(uintptr_t)a2 = sz;
+    }
+    return 0;
+}
 // scePthreadAttrGetaffinity(attr, SceKernelCpumask* mask): report all 8 PS5 cores available.
 // Returning 0 (the old stub) yields an EMPTY mask -> the guest may conclude no CPUs are usable.
 // PROSPER_ONE_CPU (default off): report a SINGLE core (0x01). Unity sizes its job-system worker
@@ -5435,6 +5451,7 @@ void register_kernel_hle() {
     R("scePthreadAttrGet", k_attr_get);
     R("scePthreadAttrGetstackaddr", k_attr_getstackaddr);
     R("scePthreadAttrGetstacksize", k_attr_getstacksize);
+    R("scePthreadAttrGetstack", k_attr_getstack);
     R("scePthreadAttrGetaffinity", k_attr_getaffinity);  // report 8 cores (not an empty mask)
     R("sceKernelGetAvailableCpumask", k_get_available_cpumask);
     R("scePthreadAttrSetaffinity", k_attr_noop);         // accept affinity requests (we don't pin)

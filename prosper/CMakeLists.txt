@@ -1150,6 +1150,12 @@ if(TARGET prosper_core)
   target_include_directories(test_kernel_system_stubs PRIVATE src)
   add_test(NAME kernel_system_stubs COMMAND test_kernel_system_stubs)
 
+  # scePthreadAttrGetstack was unregistered: both outputs were left untouched.
+  add_executable(test_attr_getstack tests/hle/kernel/test_attr_getstack.cpp)
+  target_link_libraries(test_attr_getstack PRIVATE prosper_core)
+  target_include_directories(test_attr_getstack PRIVATE src)
+  add_test(NAME attr_getstack COMMAND test_attr_getstack)
+
   # The APR submit's result out-parameters are uint32_t*; an 8-byte store overran into the guest's
   # stack canary and killed the title with __stack_chk_fail (#4138).
   add_executable(test_apr_result_slot_width tests/hle/kernel/test_apr_result_slot_width.cpp)
