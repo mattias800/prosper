@@ -64,11 +64,13 @@ and raw dumping prevent a performance comparison with the earlier normal observa
 runs belong to frozen `e46523a8`, not combined current main.
 
 The owner temporarily waived all CI while clearing the queue. PRs #4158, #4118, #4063 and
-#4169 merged during that period with their actual pending gate results retained. **That blanket
-waiver has ended.** [The current directive](https://github.com/mattias800/prosper/issues/3873#issuecomment-5959705590)
-restores normal checks and the unmodified gate for future merges, retaining the existing Windows
-and macOS exceptions. Independent exact-head code approval remains required. External contributor
-drafts must be published by their authors before merge; agents must not promote them.
+#4169 merged during that period with their actual pending gate results retained. The owner then
+[restored normal checks](https://github.com/mattias800/prosper/issues/3873#issuecomment-5959705590),
+retaining the existing Windows and macOS exceptions. Later on **2026-10-02**, the owner again
+authorized merging after independent review approval without waiting for CI. A registered
+APPROVED review must match the exact current head, and blocking code findings must be resolved.
+Run the unmodified gate and preserve its actual results; waived checks are not passing checks.
+**Never merge draft PRs.** Local validation and named shared-resource scheduling remain required.
 
 The shared normal audio/input app built on frozen `e41de9f6`. Its eight-case CPU run ended with
 seven passes and one failure: three assertions in `agc_shader_create`. The passed
