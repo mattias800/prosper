@@ -2633,6 +2633,11 @@ endif()
   target_include_directories(test_fragment_packet PRIVATE tests)
   target_link_libraries(test_fragment_packet PRIVATE prosper_core)
   add_test(NAME fragment_packet_contract COMMAND test_fragment_packet)
+  add_executable(test_fragment_packet_wqm tests/gpu/recompiler/test_fragment_packet_wqm.cpp)
+  target_include_directories(test_fragment_packet_wqm PRIVATE tests)
+  target_link_libraries(test_fragment_packet_wqm PRIVATE prosper_core)
+  add_test(NAME fragment_packet_wqm_contract COMMAND test_fragment_packet_wqm)
+  set_tests_properties(fragment_packet_wqm_contract PROPERTIES TIMEOUT 90)
   set_tests_properties(portable_bpermute_contract PROPERTIES TIMEOUT 90)
 
   # #3713: a scalar branch may only be called workgroup-uniform when the value it compares is the

@@ -405,6 +405,7 @@ struct SpirvCompute {
     // compute clamp/float mode or native fragment helper assumptions from the physical shell.
     GuestShaderStage guest_stage = GuestShaderStage::Standalone;
     PhysicalExecutionDomain physical_domain = PhysicalExecutionDomain::Invocation;
+    FragmentPacketQuadTopology packet_quad_topology = FragmentPacketQuadTopology::Unknown;
     bool has_workgroup_execution() const {
         return physical_domain == PhysicalExecutionDomain::Workgroup;
     }
@@ -999,6 +1000,10 @@ struct SpirvCompute {
     uint32_t portable_ds_bpermute_b32(uint32_t address, uint32_t value,
                                       uint32_t active, uint32_t offset,
                                       uint32_t event, uint32_t metadata_base);
+    // Common Workgroup rendezvous only. Returns this logical lane's widened Bool and whole64 SCC.
+    // The caller owns mask destination/lifetime writes. No raster topology is inferred here.
+    std::pair<uint32_t, uint32_t> packet_wqm_b64(
+        uint32_t source, uint32_t pending, uint32_t event, uint32_t result_slot);
     uint32_t subgroup_permlane16(uint32_t value, uint32_t selectors_lo,
                                 uint32_t selectors_hi, bool across_rows,
                                 uint32_t* source_lane_out = nullptr) {
