@@ -22,7 +22,12 @@ usage, whether a PR is safe to merge.
   `prosper::test::` in the shipping frontend. Per-file counts may go down, never up; a count that
   fell must have its row lowered (`--update` lowers and deletes, never raises). Raising a row is a
   reviewed baseline edit with a `# note` — for a new sync, naming the guest-visible result it
-  delivers. It is not a refactoring plan; it only stops the numbers getting worse while one happens.
+  delivers. **Two modes:** `--base REF` (delta — what CI gates on) looks only at files changed
+  since the merge base of HEAD and REF, working tree included, and fails only when *this* change
+  raised a count past its row; the plain full-tree run is the baseline-maintenance report and is
+  informational in CI, because main's baseline goes stale whenever a PR grows a capped file and
+  that must not redden every unrelated PR. It is not a refactoring plan; it only stops the numbers
+  getting worse while one happens.
 - **`check_ctest_gate.py`** — finds callers that run `ctest` without `--no-tests=error`. Plain
   `ctest` exits 0 when it finds no tests, so "nothing ran" and "everything passed" share a status.
 - **`check_usage_text.py`** — finds tools whose usage block stopped being a docstring, so

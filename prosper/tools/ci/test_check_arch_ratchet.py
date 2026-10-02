@@ -278,14 +278,155 @@ class Cli(unittest.TestCase):
         self.assertEqual(car.EXIT_UNEVALUATED, self.gate())
 
 
+class Delta(unittest.TestCase):
+    """Delta mode against a throwaway repository: a base commit, then a change on top of it.
+
+    The base commits a baseline that is already STALE for e.cpp (its row is below the file's
+    real count) -- the state main is in whenever a PR grows a capped file. Full mode fails on it;
+    delta mode must not, unless the change is the one that raised it.
+    """
+
+    E_CPP = "prosper/src/e.cpp"
+    STALE_KEY = f"getenv|{E_CPP}"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        for path, text in car.POSITIVE_TREE.items():
+            self.write(path, text)
+        for n in range(car.MIN_SLUGS):
+            self.write(f"prosper/scripts/title{n}/route.pad", "x\n")
+        self.write("prosper/scripts/gta5-PPSA04263/route.pad", "x\n")
+        self.baseline = self.root / "baseline.txt"
+        rows = {k: car.Row(k, v) for k, v in car.POSITIVE_KEYS.items()}
+        rows[self.STALE_KEY] = car.Row(self.STALE_KEY, 1)  # e.cpp really has 2
+        self.write_rows(rows)
+        self.git("init", "-q")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "base")
+        self.git("branch", "base")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, path, text):
+        target = self.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def append(self, path, text):
+        self.write(path, (self.root / path).read_text(encoding="utf-8") + text)
+
+    def write_rows(self, rows):
+        self.baseline.write_text(car.format_baseline(["# t"], rows.values()), encoding="utf-8")
+
+    def raise_row(self, key, value):
+        _header, rows = car.parse_baseline(self.baseline.read_text(encoding="utf-8"))
+        rows[key] = car.Row(key, value, "justified")
+        self.write_rows(rows)
+
+    def git(self, *args):
+        cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args]
+        subprocess.run(cmd, cwd=self.root, check=True, capture_output=True)
+
+    def delta(self, base="base"):
+        return car.main(
+            ["--root", str(self.root), "--baseline", str(self.baseline), "--base", base]
+        )
+
+    def full(self):
+        return car.main(["--root", str(self.root), "--baseline", str(self.baseline)])
+
+    def test_unrelated_preexisting_over_row_file_does_not_fail(self):
+        self.append("prosper/src/a.cpp", "int unrelated;\n")
+        self.git("commit", "-qam", "unrelated")
+        self.assertEqual(car.EXIT_VIOLATION, self.full())  # the stale row is real...
+        self.assertEqual(car.EXIT_OK, self.delta())  # ...and not this change's doing
+
+    def test_each_kind_of_rise_in_a_changed_file_fails(self):
+        cases = {
+            "getenv": ("prosper/src/a.cpp", 'auto g = getenv("NEW");\n'),
+            "title-id": ("prosper/src/e.cpp", 'auto t = "PPSA99999";\n'),
+            "blocking-sync": ("prosper/src/f.cpp", "vkWaitForFences(d, 1, &f, 1, 0);\n"),
+            "file-size": ("prosper/tests/fixtures/big.h", "int y;\n"),
+            "title-dir": ("prosper/src/gpu/gta5/c.cpp", "int c;\n"),
+        }
+        for label, (path, text) in cases.items():
+            with self.subTest(label):
+                self.git("reset", "-q", "--hard", "base")
+                self.append(path, text)  # unstaged: delta mode must see the working tree
+                self.assertEqual(car.EXIT_VIOLATION, self.delta())
+
+    def test_a_raised_row_in_the_same_change_passes(self):
+        self.append("prosper/src/f.cpp", "vkWaitForFences(d, 1, &f, 1, 0);\n")
+        self.assertEqual(car.EXIT_VIOLATION, self.delta())
+        self.raise_row("blocking-sync|prosper/src/f.cpp|vkWaitForFences", 2)
+        self.assertEqual(car.EXIT_OK, self.delta())
+
+    def test_raising_an_already_stale_row_needs_to_cover_the_new_count(self):
+        self.append(self.E_CPP, 'getenv("Z");\n')  # 2 -> 3 against a stale row of 1
+        self.assertEqual(car.EXIT_VIOLATION, self.delta())
+        self.raise_row(self.STALE_KEY, 2)  # covers the merge base, not the new count
+        self.assertEqual(car.EXIT_VIOLATION, self.delta())
+        self.raise_row(self.STALE_KEY, 3)
+        self.assertEqual(car.EXIT_OK, self.delta())
+
+    def test_new_untracked_file_is_compared_against_zero(self):
+        self.write("prosper/src/brand_new.cpp", 'auto v = getenv("X");\n')
+        self.assertEqual(car.EXIT_VIOLATION, self.delta())
+
+    def test_committed_change_is_seen(self):
+        self.append("prosper/src/a.cpp", 'auto g = getenv("NEW");\n')
+        self.git("commit", "-qam", "grow")
+        self.assertEqual(car.EXIT_VIOLATION, self.delta())
+
+    def test_decrease_and_deletion_never_fail(self):
+        self.write(self.E_CPP, "int none;\n")
+        (self.root / "prosper/src/f.cpp").unlink()
+        self.assertEqual(car.EXIT_OK, self.delta())
+
+    def test_branch_behind_its_base_is_not_blamed_for_the_base(self):
+        # main moves on and removes a getenv from e.cpp (fixing its stale row); this branch, cut
+        # before that, changes a.cpp only. Diffed against main's TIP, e.cpp would read as 1 -> 2
+        # over a row of 1; against the merge base it is unchanged, which is the truth.
+        self.git("checkout", "-q", "-b", "main2")
+        self.write(self.E_CPP, 'auto v = std::getenv("X");\n')
+        self.git("commit", "-qam", "main shrinks e.cpp")
+        self.git("checkout", "-q", "-b", "topic", "base")
+        self.append("prosper/src/a.cpp", "int other;\n")
+        self.git("commit", "-qam", "topic")
+        self.assertEqual(car.EXIT_OK, self.delta("main2"))
+
+    def test_unreachable_base_is_two(self):
+        self.assertEqual(car.EXIT_UNEVALUATED, self.delta("no-such-ref"))
+        self.assertEqual(car.EXIT_UNEVALUATED, self.delta("0" * 40))
+
+
 class RealTree(unittest.TestCase):
-    """The committed baseline describes the committed tree, and the selftest passes."""
+    """The checker evaluates the committed tree, and this change raised nothing past its row.
+
+    Full mode is asserted only to EVALUATE (0 or 1, never 2): whether main's baseline is
+    currently stale is a fact about main, not about the change under test, and asserting it
+    here would redden every unrelated PR the moment another one grows a capped file.
+    """
 
     def test_selftest(self):
         self.assertEqual(car.EXIT_OK, car.selftest())
 
-    def test_repository_matches_baseline(self):
-        self.assertEqual(car.EXIT_OK, car.main(["--root", str(HERE.parents[2])]))
+    def test_full_mode_evaluates_the_repository(self):
+        rc = car.main(["--root", str(HERE.parents[2])])
+        self.assertIn(rc, (car.EXIT_OK, car.EXIT_VIOLATION))
+
+    def test_delta_mode_against_origin_main(self):
+        root = HERE.parents[2]
+        probe = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "origin/main^{commit}"],
+            cwd=root,
+            capture_output=True,
+        )
+        if probe.returncode != 0:
+            self.skipTest("origin/main is not available in this checkout")
+        self.assertEqual(car.EXIT_OK, car.main(["--root", str(root), "--base", "origin/main"]))
 
 
 if __name__ == "__main__":

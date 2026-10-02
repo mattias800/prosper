@@ -58,6 +58,32 @@ Raising a row is the escape hatch, as in every ratchet: a one-line baseline edit
 with a `# note` saying why. A new blocking-sync site in particular must name the guest-visible
 result it delivers, in a comment beside it and in the PR.
 
+Two modes: delta (what CI and the agent hook run) and full (baseline maintenance)
+--------------------------------------------------------------------------------
+FULL mode (no `--base`) is everything above: the whole tree against every row. It is the right
+tool for maintaining the baseline and the wrong one for gating a change, because the tree moves
+under every row. A PR that grows a capped file merges, the row is now stale, and from then on a
+full check fails for every unrelated change until somebody repairs a row they never touched. That
+happened on the day this gate was written (#4173 grew two capped files while it was in review).
+
+DELTA mode (`--base REF`) answers only "did THIS change make anything worse?". It takes the merge
+base of HEAD and REF (so a branch behind REF is not blamed for what REF changed since), and looks
+only at the files that differ between that merge base and the working tree -- committed, staged,
+unstaged, and untracked-but-not-ignored, so an agent is told before `git add -A` rather than after.
+For every key those files touch it computes the count at the merge base and in the working tree,
+and FAILS only when the count rose AND the working tree's baseline row does not cover the new
+value. A file that did not exist at the merge base is compared against zero. So:
+
+  * a pre-existing over-row count in a file this change did not touch never fails delta mode;
+  * a rise inside a capped file's existing headroom passes, exactly as it does in full mode;
+  * the escape hatch still works: raise the row, with its note, in the same change.
+
+A title-dir key aggregates a directory, so a change to any file inside one compares the whole
+directory's total. A moved file shows up as a NEW key under its new path: rename its row in the
+same change. Decreases are reported as a notice (lower the row with `--update` when you can) and
+never fail delta mode -- requiring them would recreate the concurrency problem full mode has.
+Base contents are read with one `git cat-file --batch`; nothing outside the changed set is read.
+
 What this CANNOT see -- read before quoting a clean run
 -------------------------------------------------------
   * It is a lexer, not a compiler. `#if 0` blocks count as live; a macro that expands to `getenv`
@@ -75,10 +101,11 @@ What this CANNOT see -- read before quoting a clean run
     slug, so `src/.../<that-title>/` would not be caught.
 
 Exit status: 0 clean, 1 violations found, 2 could not evaluate (no git, empty scan, unparseable
-baseline, a sanity floor tripped). 2 is never "clean": a scan that saw nothing proves nothing.
+baseline, a sanity floor tripped, a `--base` that is not a commit here or shares no merge base
+with HEAD). 2 is never "clean": a scan that saw nothing proves nothing.
 
-`--selftest` runs hand-built positive and negative arms; `--list` prints every finding with line
-numbers; `--emit-baseline` prints the rows for the current tree.
+`--base REF` runs delta mode; `--selftest` runs hand-built positive and negative arms; `--list`
+prints every finding with line numbers; `--emit-baseline` prints the rows for the current tree.
 """
 
 from __future__ import annotations
@@ -450,6 +477,7 @@ class Problem:
     baseline: int
     current: int
     lines: list[int] = field(default_factory=list)
+    merge_base: int | None = None  # delta mode only: the count at the merge base
 
     @property
     def rule(self) -> str:
@@ -475,6 +503,63 @@ def compare(found: dict[str, Finding], rows: dict[str, Row]) -> list[Problem]:
     return problems
 
 
+def delta_scope(changed: Iterable[str], slugs: set[str]) -> tuple[set[str], set[str]]:
+    """(changed paths in a scanned root, title-dir directories those paths sit in)."""
+    paths, dirs = set(), set()
+    for path in changed:
+        if not is_source(path):
+            continue
+        if under(path, TITLE_ID_ROOTS + CALL_ROOTS + SIZE_ROOTS) or path in CALL_FILES:
+            paths.add(path)
+        if path.startswith(SRC):
+            parts = path.split("/")
+            for depth in range(2, len(parts) - 1):
+                if is_title_dir(parts[depth], slugs):
+                    dirs.add("/".join(parts[: depth + 1]))
+    return paths, dirs
+
+
+def _key_in_scope(key: str, paths: set[str], dirs: set[str]) -> bool:
+    target = key.split("|")[1]
+    return target in dirs if rule_of(key) == "title-dir" else target in paths
+
+
+def compare_delta(
+    base_found: dict[str, Finding],
+    head_found: dict[str, Finding],
+    rows: dict[str, Row],
+    paths: set[str],
+    dirs: set[str],
+) -> tuple[list[Problem], list[Problem]]:
+    """(failures, notices) for the keys a change touches.
+
+    A key fails only when its count ROSE between the merge base and the working tree AND the
+    working tree's baseline row does not cover the new count. Rows elsewhere are not consulted,
+    so a stale row in a file this change did not touch cannot fail it. Notices are decreases
+    worth recording with `--update`; they never fail.
+    """
+    failures: list[Problem] = []
+    notices: list[Problem] = []
+    keys = {k for k in (*base_found, *head_found) if _key_in_scope(k, paths, dirs)}
+    for key in sorted(keys, key=_row_order):
+        was = base_found[key].value if key in base_found else 0
+        head = head_found.get(key)
+        now = head.value if head else 0
+        lines = head.lines if head else []
+        row = rows.get(key)
+        if now > was:
+            if row is None:
+                failures.append(Problem("new", key, 0, now, lines, was))
+            elif now > row.value:
+                failures.append(Problem("increase", key, row.value, now, lines, was))
+        elif now < was and row is not None and now < row.value:
+            if rule_of(key) in CAP_RULES and now >= row.value * (1 - SHRINK_MARGIN):
+                continue
+            kind = "decrease" if now else "stale"
+            notices.append(Problem(kind, key, row.value, now, lines, was))
+    return failures, notices
+
+
 def apply_repairs(rows: dict[str, Row], problems: list[Problem]) -> dict[str, Row]:
     """Lower `decrease` rows and delete `stale` ones. Never raises or adds a row."""
     out = {k: Row(r.key, r.value, r.note) for k, r in rows.items()}
@@ -491,6 +576,8 @@ def describe(p: Problem) -> str:
     if p.lines:
         shown = ", ".join(str(n) for n in p.lines[:12]) + (" ..." if len(p.lines) > 12 else "")
         where = f" (line {shown})"
+    if p.merge_base is not None:
+        where += f" [merge base: {p.merge_base}]"
     if p.kind == "new":
         return f"NEW       {p.key} = {p.current}{where}\n            {FIX_HINT[p.rule]}"
     if p.kind == "increase":
@@ -536,6 +623,112 @@ def load_tree(root: Path) -> tuple[dict[str, str], set[str]]:
         except OSError:
             continue  # tracked but deleted in the working tree: its counts are gone, correctly
     return files, slugs
+
+
+def _git(root: Path, *args: str, stdin: bytes | None = None) -> bytes:
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=root, input=stdin, capture_output=True, check=True
+        ).stdout
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or b"").decode("utf-8", "replace").strip() or str(exc)
+        raise EvaluationError(f"`git {' '.join(args[:3])}` failed under {root}: {detail}") from exc
+    except OSError as exc:
+        raise EvaluationError(f"could not run git under {root}: {exc}") from exc
+
+
+def _nul_split(raw: bytes) -> list[str]:
+    return [p for p in raw.decode("utf-8", "replace").split("\0") if p]
+
+
+def resolve_merge_base(root: Path, ref: str) -> str:
+    """The merge base of HEAD and `ref`, or EvaluationError (exit 2) when there is none."""
+    try:
+        sha = _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    except EvaluationError as exc:
+        raise EvaluationError(f"--base {ref!r} is not a commit in {root} (fetch it?)") from exc
+    try:
+        return _git(root, "merge-base", "HEAD", sha.decode().strip()).decode().strip()
+    except EvaluationError as exc:
+        raise EvaluationError(f"HEAD and --base {ref!r} share no merge base") from exc
+
+
+def read_blobs(root: Path, commit: str, paths: Iterable[str]) -> dict[str, str]:
+    """{path: text} for every path that exists in `commit`, via ONE `git cat-file --batch`."""
+    wanted = sorted(paths)
+    if not wanted:
+        return {}
+    request = "".join(f"{commit}:{p}\n" for p in wanted).encode("utf-8")
+    out = _git(root, "cat-file", "--batch", stdin=request)
+    blobs: dict[str, str] = {}
+    pos = 0
+    for path in wanted:
+        eol = out.index(b"\n", pos)
+        header = out[pos:eol].split()
+        pos = eol + 1
+        if len(header) == 2 and header[1] == b"missing":
+            continue
+        if len(header) != 3:
+            raise EvaluationError(f"unexpected `git cat-file --batch` header: {header!r}")
+        size = int(header[2])
+        if header[1] == b"blob":
+            blobs[path] = out[pos : pos + size].decode("utf-8", "replace")
+        pos += size + 1  # the content, then the newline cat-file appends after it
+    return blobs
+
+
+def run_delta(root: Path, baseline: Path, ref: str) -> int:
+    """Delta mode: fail only on a count this change raised past its row. See the docstring."""
+    if not baseline.is_file():
+        raise EvaluationError(f"baseline {baseline} not found")
+    _header, rows = parse_baseline(baseline.read_text(encoding="utf-8"))
+    base = resolve_merge_base(root, ref)
+    tracked = tracked_paths(root)
+    untracked = _nul_split(_git(root, "ls-files", "--others", "--exclude-standard", "-z"))
+    slugs = derive_slugs(tracked + untracked)
+    if len(slugs) < MIN_SLUGS:
+        raise EvaluationError(
+            f"derived only {len(slugs)} title slug(s) from {SCRIPTS} (floor {MIN_SLUGS})"
+        )
+    changed = _nul_split(_git(root, "diff", "--name-only", "--no-renames", "-z", base, "--"))
+    paths, dirs = delta_scope([*changed, *untracked], slugs)
+    head_paths, base_paths = set(paths), set(paths)
+    if dirs:
+        prefixes = tuple(d + "/" for d in sorted(dirs))
+        head_paths |= {p for p in (*tracked, *untracked) if p.startswith(prefixes)}
+        listed = _git(root, "ls-tree", "-r", "--name-only", "-z", base, "--", *sorted(dirs))
+        base_paths |= set(_nul_split(listed))
+    head_files: dict[str, str] = {}
+    for path in sorted(p for p in head_paths if is_source(p)):
+        try:
+            head_files[path] = (root / path).read_bytes().decode("utf-8", "replace")
+        except OSError:
+            continue  # deleted in the working tree: its counts are zero, correctly
+    base_files = read_blobs(root, base, (p for p in base_paths if is_source(p)))
+    failures, notices = compare_delta(
+        scan(base_files, slugs), scan(head_files, slugs), rows, paths, dirs
+    )
+    print(
+        f"delta vs merge base {base[:12]} ({ref}): {len(paths)} changed C/C++ file(s) in scope, "
+        f"{len(dirs)} title dir(s)"
+    )
+    for p in notices:
+        print("  notice: " + describe(p))
+    if not failures:
+        print("ok: no count this change touches rose past its baseline row")
+        return EXIT_OK
+    print(
+        f"FAIL: this change raised {len(failures)} architecture-ratchet count(s):", file=sys.stderr
+    )
+    for p in failures:
+        print("  " + describe(p), file=sys.stderr)
+    print(
+        "\nCounts here may go down, never up. If a rise is genuinely justified, raise or add the "
+        f"row in {baseline.name} in this same change, with a `# note` saying why, so a reviewer "
+        "sees it. A moved file is a NEW key: rename its row.",
+        file=sys.stderr,
+    )
+    return EXIT_VIOLATION
 
 
 def sanity(files: dict[str, str], slugs: set[str], found: dict[str, Finding]) -> None:
@@ -649,9 +842,33 @@ def selftest() -> int:
     gone = {k: v for k, v in POSITIVE_TREE.items() if k != "prosper/frontends/g.cpp"}
     expect("stale row fails", kinds(gone), ["stale"])
 
+    # Delta mode, on the same hand-built tree. The baseline is deliberately STALE for big.h (cap
+    # below the file), which full mode reports and delta mode must not -- unless big.h changed.
+    stale_rows = dict(rows)
+    big = "file-size|prosper/tests/fixtures/big.h"
+    stale_rows[big] = Row(big, FILE_SIZE_THRESHOLD - 1)
+
+    def delta_kinds(head: dict[str, str], changed: list[str], rows_: dict[str, Row]) -> list[str]:
+        paths, dirs = delta_scope(changed, SELF_SLUGS)
+        fails, _notes = compare_delta(
+            scan(POSITIVE_TREE, SELF_SLUGS), scan(head, SELF_SLUGS), rows_, paths, dirs
+        )
+        return [p.kind for p in fails]
+
+    e_cpp = "prosper/src/e.cpp"
+    full_kinds = [p.kind for p in compare(found, stale_rows)]
+    expect("full mode sees the stale row", full_kinds, ["increase"])
+    expect("delta: unrelated change passes", delta_kinds(POSITIVE_TREE, [e_cpp], stale_rows), [])
+    expect("delta: a rise fails", delta_kinds(grown, [e_cpp], stale_rows), ["increase"])
+    raised = dict(stale_rows, **{f"getenv|{e_cpp}": Row(f"getenv|{e_cpp}", 3)})
+    expect("delta: a raised row covers it", delta_kinds(grown, [e_cpp], raised), [])
+    z_cpp = "prosper/src/z.cpp"
+    added = dict(POSITIVE_TREE, **{z_cpp: 'getenv("N");\n'})
+    expect("delta: new file vs zero", delta_kinds(added, [z_cpp], stale_rows), ["new"])
+
     for message in failures:
         print(f"selftest: FAIL {message}", file=sys.stderr)
-    print(f"selftest: 8 arms, {len(failures)} failed")
+    print(f"selftest: 13 arms, {len(failures)} failed")
     return EXIT_VIOLATION if failures else EXIT_OK
 
 
@@ -714,12 +931,20 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument(
         "--emit-baseline", action="store_true", help="print the rows for the current tree"
     )
+    group.add_argument(
+        "--base",
+        metavar="REF",
+        help="delta mode: fail only on counts raised since the merge base of HEAD and REF "
+        "(e.g. origin/main, or a PR's base SHA)",
+    )
     args = ap.parse_args(argv)
     if args.selftest:
         return selftest()
     mode = "list" if args.list else "update" if args.update else ""
     mode = "emit" if args.emit_baseline else mode
     try:
+        if args.base is not None:
+            return run_delta(Path(args.root).resolve(), Path(args.baseline), args.base)
         return run(Path(args.root).resolve(), Path(args.baseline), mode)
     except EvaluationError as exc:
         print(f"error: could not evaluate: {exc}", file=sys.stderr)
