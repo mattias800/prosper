@@ -387,7 +387,6 @@ tests/host/platform/test_raw_syscall.cpp
 tests/host/platform/test_videoout.cpp
 tests/host/symbols/test_il2cpp_symbols.cpp
 tests/host/test_dmem.cpp
-tests/host/tls/test_fs_emu.cpp
 tests/host/tls/test_guest_tls_reactivate.cpp
 tests/input/test_pad.cpp
 tests/loader/test_guest_tls_align.cpp
@@ -445,7 +444,6 @@ tests/test_gpu_replay_post_compute_resource.cpp
 tests/test_gpu_replay_resource_override.cpp
 tests/test_gpu_replay_rtt_seed_rgba8.cpp
 tests/test_module.cpp
-tests/test_overlay_text.cpp
 tests/test_self_bounds.cpp
 tests/test_self_segment_key.cpp
 tests/test_setjmp.cpp

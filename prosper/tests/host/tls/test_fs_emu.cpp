@@ -4,15 +4,13 @@
 // not SPL/BPL/SIL/DIL (`mov ah, fs:[x]` must set AH, not clobber RSP's low byte).
 #include "host/tls/fs_emu.hpp"
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <cstring>
 
 using prosper::fs_emulate_access;
 using prosper::FsEmuStatus;
 
-static int g_fail = 0;
-#define CHECK(cond, name) do { \
-    if (!(cond)) { fprintf(stderr, "FAIL %s (%s:%d)\n", name, __FILE__, __LINE__); g_fail = 1; } \
-} while (0)
+#define CHECK(cond, name) EXPECT_TRUE(cond) << (name)
 
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
 
@@ -22,7 +20,7 @@ struct Ctx {
     Ctx() { for (int k = 0; k < 16; k++) regs[k] = 0x1111111111111111ull * (k + 1); memset(mem, 0, sizeof mem); }
 };
 
-int main() {
+TEST(FsEmu, GoldenVectors) {
     // --- mov eax, fs:[disp32]  (64 8b 04 25 imm32): 4-byte load, zero-extends to 64 ---
     {
         Ctx c; c.mem[0]=0x78; c.mem[1]=0x56; c.mem[2]=0x34; c.mem[3]=0x12; c.mem[4]=0xff;
@@ -142,6 +140,4 @@ int main() {
         CHECK(c.mem[0] == 0, "unhandled leaves memory alone");
     }
 
-    if (!g_fail) printf("fs_emu: all golden vectors passed\n");
-    return g_fail;
 }

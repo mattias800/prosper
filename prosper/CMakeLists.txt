@@ -881,10 +881,9 @@ if(TARGET prosper_core)
   # The burned-in fps annotation (`screenshot --fps-overlay`). Rasterizing text into an RGBA buffer
   # is pure, and an overlay that silently draws nothing looks exactly like one that was never asked
   # for -- so it is asserted on pixels, here, without a device.
-  add_executable(test_overlay_text tests/test_overlay_text.cpp
-                                   tools/screenshot/overlay_text.cpp)
-  target_include_directories(test_overlay_text PRIVATE tools/screenshot)
-  add_test(NAME overlay_text COMMAND test_overlay_text)
+  prosper_add_gtest(test_overlay_text
+    SOURCES tests/test_overlay_text.cpp tools/screenshot/overlay_text.cpp
+    INCLUDES tools/screenshot)
 
   # va2foff resolution order (issue #113): DYNAMIC/PROCPARAM/TLS must never shadow
   # the PT_LOAD that truly maps a VA. Pure unit test — no game dump required.
@@ -1022,10 +1021,8 @@ if(TARGET prosper_core)
   # macOS/Rosetta %fs trap-emulation decode core (guest-TLS access redirection). Golden
   # instruction vectors incl. the #727 no-REX AH/CH/DH/BH byte-register rules — header-only,
   # runs on Linux where the __APPLE__ handler itself never compiles.
-  add_executable(test_fs_emu tests/host/tls/test_fs_emu.cpp)
   # Does not link prosper_core, so it does not inherit its PUBLIC `src`.
-  target_include_directories(test_fs_emu PRIVATE src)
-  add_test(NAME fs_emu_decode COMMAND test_fs_emu)
+  prosper_add_gtest(test_fs_emu SOURCES tests/host/tls/test_fs_emu.cpp INCLUDES src)
 
   # Signal-handler-safe raw syscalls (src/host/platform/raw_syscall.hpp): the fault_handler's
   # PROSPER_NULL_PAGE backing must not touch errno/TLS on guest-%fs threads (issue #1071).
