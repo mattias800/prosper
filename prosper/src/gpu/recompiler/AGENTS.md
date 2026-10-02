@@ -8,7 +8,8 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   translator: register state, control-flow structurization, and per-instruction lowering.
 - `rdna2_recompile_fragment_packet` — an owned 64-slot guest-fragment executor in a physical
   64-worker compute workgroup. It directly uses the synchronized CFG services for whole-wave
-  votes, saved-mask reductions, READLANE and explicit logical-quad B64 WQM, then records raw EXP
+  votes, saved-mask reductions, canonical-half mask MBCNT, READLANE and explicit logical-quad B64 WQM,
+  alongside numeric source-word MBCNT at owned logical lane positions, then records raw EXP
   metadata/payload instead of killing physical workers or writing a framebuffer. It is NOT a
   raster fallback: missing
   register/slot state, interpolation, FP arithmetic, image/memory effects and repeated exports
