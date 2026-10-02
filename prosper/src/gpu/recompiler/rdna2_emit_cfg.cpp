@@ -3235,6 +3235,26 @@ bool emit_cfg_state_machine(
                 if (source.value == 126 || source.value == 127) return true;
                 return masks.contains(source.value);
             };
+            // Packet WQM consumes an architectural full mask OR two MUST-defined scalar words.
+            // Check the live domain before generic physical-word ambiguity handling. A destroyed
+            // saved-mask pair is neither its old mask nor the caller's initial scalar words.
+            const bool packet_wqm = packet_wqm_candidate(in);
+            const auto& wqm_source = in.src[0];
+            const bool packet_wqm_mask_source = packet_wqm &&
+                (wqm_source.kind == OperandKind::SGPR ||
+                 wqm_source.kind == OperandKind::Special) &&
+                (wqm_source.value == 126 || masks.contains(wqm_source.value)) &&
+                !ambiguous.contains(wqm_source.value);
+            const bool packet_wqm_scalar_source = packet_wqm &&
+                wqm_source.kind == OperandKind::SGPR &&
+                scalar_words.contains(wqm_source.value) &&
+                scalar_words.contains(wqm_source.value + 1);
+            const bool packet_wqm_constant_source = packet_wqm &&
+                wqm_source.kind == OperandKind::InlineInt &&
+                (wqm_source.value == 0 || wqm_source.value == -1);
+            if (packet_wqm && !packet_wqm_mask_source && !packet_wqm_scalar_source &&
+                !packet_wqm_constant_source)
+                return reject_cfg(in.pc, "packet-wqm-source-state-unavailable");
             for (uint32_t source = 0; source < in.n_src; ++source) {
                 const Operand& operand = in.src[source];
                 if (operand.kind != OperandKind::SGPR &&
@@ -3255,7 +3275,8 @@ bool emit_cfg_state_machine(
                     (operand.value == (in.opcode == 0x366 ? 127 : 126) ||
                      operand.value == (in.opcode == 0x366 ? 107 : 106) ||
                      masks.contains(mbcnt_root));
-                if (b64_logical_mask_source || mbcnt_mask_source) continue;
+                if (b64_logical_mask_source || mbcnt_mask_source ||
+                    (source == 0 && packet_wqm_mask_source)) continue;
                 const ScalarSourceRead read = scalar_source_read(in, source);
                 if (read == ScalarSourceRead::None) continue;
                 const int first = operand.value;
@@ -3358,10 +3379,6 @@ bool emit_cfg_state_machine(
             // presence can be a descriptor/scalar placeholder, so raw SGPR WQM stays compact-only.
             const bool numeric_wqm = wqm_has_numeric_destination(in) &&
                 wqm_has_intrinsic_numeric_source(in);
-            // The packet service consumes either a full live mask or a MUST-defined scalar pair
-            // and produces a full mask. Scalar Function-variable presence alone is not authority.
-            const bool packet_wqm = packet_wqm_candidate(in) &&
-                (source_is_mask(in.src[0]) || scalar_sources);
             const bool vcc_pack_scalar_pair = b.is_compute && b.wave_size == 64 &&
                 in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x32 &&
                 in.opcode <= 0x34 && in.dst.value == 106 &&
