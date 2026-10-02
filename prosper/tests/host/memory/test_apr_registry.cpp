@@ -816,7 +816,7 @@ int main() {
         if (submit_result_a) {
             out1 = out2 = kResidue;
             submit_result_a(cb, 1, (uint64_t)(uintptr_t)&out1, (uint64_t)(uintptr_t)&out2, 0, 0);
-            CHECK(out1 != kResidue && out2 != kResidue && out1 == out2,
+            CHECK(out1 != kResidue && out2 != kResidue && (uint32_t)out1 == (uint32_t)out2,
                   "#1629: AndGetResult still publishes one completion token through both out slots");
         }
 #endif
@@ -829,6 +829,34 @@ int main() {
             // guarded: POSIX suppresses the writes deliberately, Windows never had them.
             CHECK(out1 == kResidue && out2 == kResidue,
                   "#1629: the plain submit writes NO result slots -- a2/a3 are residue, not outputs");
+        }
+    }
+
+    // #4139 follow-up: out2 of sceKernelAprSubmitCommandBufferAndGetResult is a 32-bit submission id.
+    // Assassin's Creed Black Flag Resynced (PPSA28183) passes the address of a 4-byte stack int that
+    // sits directly below its stack canary; an 8-byte token store zeroed the canary's low dword and
+    // the function epilogue called __stack_chk_fail. The canary stand-in below is the adjacent
+    // dword: it must survive, and the id must still be published in the low dword. out1 stays an
+    // 8-byte slot (its own neighbour is checked too, from the other side).
+    {
+        HleFn submit = Hle::lookup("ASoW5WE-UPo");
+        CHECK(submit != nullptr, "#4139: AndGetResult resolves");
+        if (submit) {
+            struct alignas(8) Frame {
+                uint64_t out1;
+                uint32_t out2;       // the 4-byte int the guest passes
+                uint32_t canary;     // directly above out2, as in the guest frame
+            };
+            constexpr uint32_t kCanary = 0x4f525000u;
+            constexpr uint32_t kIdResidue = 0x5a5a5a5au;
+            Frame f{ 0xdeadbeefcafef00dull, kIdResidue, kCanary };
+            alignas(64) uint8_t fake_cb[256] = {};
+            submit((uint64_t)(uintptr_t)fake_cb, 1, (uint64_t)(uintptr_t)&f.out1,
+                   (uint64_t)(uintptr_t)&f.out2, 0, 0);
+            CHECK(f.canary == kCanary,
+                  "#4139: the id store must not spill past the 4-byte out2 into the adjacent canary");
+            CHECK(f.out2 != kIdResidue,
+                  "#4139: control: out2 really was written (the canary check is not vacuous)");
         }
     }
 
@@ -894,7 +922,7 @@ int main() {
             //     bound anything, and its submit must behave as unbound.
             s1 = s2 = kResidue;
             submit(cb_x, 1, p1, p2, 0, 0);
-            CHECK(s1 != kResidue && s2 != kResidue && s1 == s2,
+            CHECK(s1 != kResidue && s2 != kResidue && (uint32_t)s1 == (uint32_t)s2,
                   "#1674: a cb reusing the destructed address does NOT inherit the dead binding -- "
                   "submit hands it a fresh token instead of echoing the dead tag/equeue");
 
