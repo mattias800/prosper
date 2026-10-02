@@ -103,4 +103,27 @@ inline std::vector<uint32_t> expected(const Case& c) {
     }
     return out;
 }
+// A declared but branch-skipped WQM still allocates its common service. The service must not
+// overwrite prior SCC or EXEC when no guest invocation requests it in this dispatcher step.
+inline prosper::gpu::FragmentInvocationPacket skipped_scc_packet(bool initial_scc) {
+    auto p = fragment_packet::packet({});
+    p.quad_topology = prosper::gpu::FragmentPacketQuadTopology::ConsecutiveLogicalQuads;
+    p.exec_mask = uint64_t(1) << 63; p.scc = initial_scc;
+    p.sgprs.emplace_back(24, branch_true); p.sgprs.emplace_back(25, branch_false);
+    p.guest_code = {0xbf820001u, sop1(10, 126, 126), 0x850e1918u};
+    vmov(p.guest_code, 2, 14);
+    exp(p.guest_code, 1, 2);
+    p.guest_code.push_back(0xbf810000u);
+    return p;
+}
+inline std::vector<uint32_t> skipped_scc_expected(bool initial_scc) {
+    std::vector<uint32_t> out(64 * 12, 0);
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        const bool active = lane == 63;
+        const uint32_t record[] = {1, uint32_t(active), 1, 0, 1, 0, 1, 1,
+            active ? (initial_scc ? branch_true : branch_false) : poison_sentinel, 0, 0, 0};
+        std::copy(std::begin(record), std::end(record), out.begin() + lane * 12);
+    }
+    return out;
+}
 } // namespace prosper::test::fragment_packet::wqm

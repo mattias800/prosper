@@ -92,7 +92,7 @@ int main() {
     }
     // These are supplied logical quads, not inferred raster ownership. Execute the actual WQM
     // lowering on hardware as well as in the CPU SOURCE interpreter. Every source bit must widen
-    // its three initially EXEC-off neighbors, including quads crossing the native wave32 halves.
+    // its three initially EXEC-off neighbors, including all quads in both native wave32 halves.
     namespace w = prosper::test::fragment_packet::wqm;
     uint32_t wqm_ordinal = 0;
     const auto run_wqm = [&](const w::Case& c, const std::string& name) {
@@ -128,8 +128,14 @@ int main() {
         c.exec = uint64_t(1) << (source_lane < 32 ? 63u : 0u);
         run_wqm(c, "wqm_opposite_half_scc_" + std::to_string(source_lane));
     }
+    for (bool scc : {false, true}) {
+        const auto program = prosper::gpu::recompile_fragment_packet(w::skipped_scc_packet(scc));
+        check(!program.spirv.empty() && program.rejection.empty(), "known-topology skipped WQM emits");
+        if (!program.spirv.empty()) compare(execute(program), w::skipped_scc_expected(scc),
+            scc ? "skipped_prior_scc_true" : "skipped_prior_scc_false");
+    }
     check(wqm_ordinal == 95, "all64 WQM bits,24 source/destination,4 mask and3 SCC cases compiled");
-    check(dispatches == 120, "all24 good packets, live mutation and95 WQM packets dispatched");
+    check(dispatches == 122, "all24 good packets, live mutation,95 WQM and2 skipped WQM dispatched");
     std::printf("fragment_packet_exec: dispatches=%d checks=%d failures=%d "
                 "(owned packets only; no raster/game claim)\n", dispatches, checks, failures);
     return failures ? 1 : 0;

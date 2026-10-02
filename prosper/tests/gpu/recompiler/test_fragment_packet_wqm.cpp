@@ -100,6 +100,17 @@ int main(int argc, char** argv) {
         c.exec = uint64_t(1) << (source_lane < 32 ? 63u : 0u);
         run(c, "opposite_half_scc_" + std::to_string(source_lane), directory);
     }
+    for (bool scc : {false, true}) {
+        const auto r = prosper::gpu::recompile_fragment_packet(w::skipped_scc_packet(scc));
+        check(!r.spirv.empty() && r.rejection.empty(), "known-topology skipped WQM emits");
+        if (!r.spirv.empty()) {
+            bpermute_oracle::Interpreter vm(r.spirv);
+            const auto actual = vm.run_packet(r.input_words, r.output_words);
+            check(vm.error.empty() && actual == w::skipped_scc_expected(scc),
+                  "unrequested WQM service preserves live prior SCC and EXEC");
+            dump(directory, scc ? "skipped_prior_scc_true" : "skipped_prior_scc_false", r.spirv);
+        }
+    }
     auto good = w::packet({});
     // The same source words without topology do not become a false raster/quad authority.
     auto p = good; p.quad_topology = FragmentPacketQuadTopology::Unknown;
