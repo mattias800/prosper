@@ -51,6 +51,11 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   Unknown outside `execute_ordered_items`, so a test must run producer and consumer in one ordered
   submit. `indirect_dispatch_stats()` counts the two routes without a log.
 - `gpu_dependency_graph` — ordering and dependencies between submitted work.
+- `fragment_packet_preparation` — consumed producing-draw entry and bounded resource identity for
+  the refused-draw raster collector. Physical USER_DATA presence and raw RSRC2 are observations,
+  not a launched SGPR count/mapping or system-parameter seed. Owned buffer bytes do not prove a
+  guest fetch/read-point, producer epoch or image/sampler capability. Preparation retains named
+  unmet obligations and never grants kernel, guest-wave, helper or output-commit admission.
 - `graphics_nested_wide_reader` — one-hop direct VS/PS numeric x4/x8 parent/child ownership.
   The ordered executor retires earlier producer work before constructing its context. Exact
   original code supplies the no-writer/PC/width proof; the first checked read supplies both the

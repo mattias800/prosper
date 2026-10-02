@@ -1,6 +1,8 @@
 #pragma once
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/state/raster_launch_facts.hpp"
+#include "gpu/state/fragment_entry_facts.hpp"
+#include "gpu/execute/fragment_packet_preparation.hpp"
 #include <memory>
 #include <mutex>
 #include <string>
@@ -19,6 +21,11 @@ struct RasterQuadInputs {
     bool raw_matches_producing_source = false;
     bool generated_interpolation_geometry = false;
     FloatTransportConfig float_transport{};
+    FragmentEntryFacts entry{};
+    FragmentFloatMode float_mode{};
+    FragmentFloatFlags float_flags{};
+    FragmentLaunchRsrc1 launch_rsrc1{};
+    FragmentPacketResources ps_resources{};
 };
 
 enum class RasterQuadFieldKind : uint8_t { Interpolant, Parameter, SystemInterpolation };
@@ -53,6 +60,7 @@ std::string decode_raster_quad_records(const RasterQuadCollector& collector,
 // guest attachment effects. A consumer must still choose a guest wave policy and initialize every
 // required guest input explicitly; these are host-realized inputs, not PS5 helper/packing authority.
 struct RasterQuadResult {
+    std::shared_ptr<const FragmentPacketPreparation> packet_preparation;
     bool attempted = false, complete = false;
     uint64_t source_submit = 0, draw_index = 0, command_order = 0;
     uint32_t width = 0, height = 0, lane_words = 0;
