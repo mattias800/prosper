@@ -11,11 +11,6 @@ It is a plan, not a status report. Every "exists" and "missing" claim was checke
 2026-10-02 (grep over `src/`, `frontends/`, `tools/`); the evidence is stated per item. Re-verify before
 building: this tree moves fast, and a stale gap list is the failure this document is written to avoid.
 
-The structure (items with dependencies, parallel lanes, acceptance criteria, test strategy, explicit
-non-goals) is adapted from the diagnostics epic and performance track of the sibling PortPS5 project's
-planning beans. Those are **ideas to re-derive, not code to port**; see the evidence hierarchy in the
-charter. Where PortPS5 made a decision prosper should make differently, the item says so.
-
 Companion docs: `GPU_PROFILING_EXTERNAL.md` (vendor tools that need no prosper change),
 `DIAGNOSTIC_GATE_AUDIT.md`, `src/diagnostics/AGENTS.md`, `src/diagnostics/perf/AGENTS.md`,
 `tools/AGENTS.md`, `RENDERER_PERFORMANCE_2026_07.md`.
@@ -166,9 +161,9 @@ strategy, dependencies and what it deliberately does not do.
 
 ### D7. Survey mode for unsupported sites
 
-- **PortPS5 reference:** `survey_unsupported`: log each distinct unsupported draw, dispatch, shader or
-  export **once**, skip it, count it, and write one capped summary at exit. A survey run can never be
-  evidence of passing.
+- **Idea:** log each distinct unsupported draw, dispatch, shader or export **once**, skip it, count it,
+  and write one capped summary at exit, so one run finds every missing piece instead of the first. A
+  survey run can never be evidence of passing.
 - **Prosper state:** `[recompile-reject]`, `[compute] skip` and NID census tooling exist, but verify
   whether a single run yields a deduplicated, per-kind, capped summary before building; the charter
   already treats every reject as the next thing to implement, so the value is "all of them in one run".
@@ -177,7 +172,7 @@ strategy, dependencies and what it deliberately does not do.
 
 ### D8. Stable guest-meaningful identity for draws and dispatches
 
-Not a PortPS5 item; it is the prerequisite D1, D5 and the per-pass timeline (M4) all need. Define once:
+The prerequisite D1, D5 and the per-pass timeline (M4) all need. Define once:
 submit ordinal, packet index, draw index, pipeline key hash. Without a shared definition each
 diagnostic invents its own and their outputs cannot be joined. Run-local ordinals stay run-local (the
 charter: addresses and operation ordinals are run-local).
@@ -192,8 +187,8 @@ charter: addresses and operation ordinals are run-local).
   over `distinct` frames; report `1% low`; refuse a tail the population cannot resolve (p99 needs 100
   intervals) rather than print the maximum under a percentile's name; never fill it for a differenced
   window (the histogram is cumulative).
-- **Decision to make explicitly:** two `1% low` conventions are in use. PortPS5 uses
-  `1000 / mean(slowest 1% of frame times)`; the cheapest histogram-native form is `1 / p99`. Pick one,
+- **Decision to make explicitly:** two `1% low` conventions are in common use:
+  `1000 / mean(slowest 1% of frame times)`, and the cheapest histogram-native form, `1 / p99`. Pick one,
   state it wherever printed, and say which in every figure. They differ whenever the tail is skewed.
 - **Surfaces:** `tools/screenshot` summary and manifest; later `prosper-app` exit summary.
 - **Status:** in progress as a separate PR.
