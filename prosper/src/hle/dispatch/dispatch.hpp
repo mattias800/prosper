@@ -218,6 +218,10 @@ void dispatch_grow_slots(const std::vector<ImportSlot>* slots);
 // under `(*g_slots)[idx]`. Returns the index the first appended slot landed on.
 size_t dispatch_append_slots(std::vector<ImportSlot>* slots, const std::vector<ImportSlot>& add);
 
+// Remove an uncommitted suffix from the installed table under the dispatcher lock. Keep the
+// prefix's call counts and first-seen order; first_new must be the captured append boundary.
+void dispatch_rollback_slots(std::vector<ImportSlot>* slots, size_t first_new);
+
 // Register the built-in HLE implementations (libc thunks, CRT no-ops, libkernel
 // primitives). Call before install_stubs.
 void register_builtin_hle();

@@ -3618,6 +3618,14 @@ endif()
       target_include_directories(test_runtime_prx_load PRIVATE tests)
       target_link_libraries(test_runtime_prx_load PRIVATE prosper_core)
       add_test(NAME runtime_prx_load COMMAND test_runtime_prx_load)
+      if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(test_runtime_prx_load PRIVATE "-Wl,--wrap=mmap")
+        foreach(failure map image emission)
+          add_test(NAME runtime_prx_append_${failure}_failure
+                   COMMAND test_runtime_prx_load --append-${failure}-failure)
+          set_tests_properties(runtime_prx_append_${failure}_failure PROPERTIES TIMEOUT 20)
+        endforeach()
+      endif()
     endif()
 
     # Regression test for the real setjmp/longjmp impl (x86-64 asm; used by the GC's root scan).

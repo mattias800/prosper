@@ -18,6 +18,7 @@
 #endif
 
 #include "host/image/exec_image.hpp"
+#include "host/image/stub_append_batch.hpp"
 #include "host/fault/rbp_chain.hpp"   // guest_frames_from_rbp: the shared frame-pointer walk
 #include "host/fault/guest_stack_scan.hpp"   // the scan-based sibling, shared by both platforms
 #include "host/platform/immortal.hpp"   // #2613: registries a guest thread can reach after exit()
@@ -1267,23 +1268,30 @@ bool append_stubs(const std::vector<ImportSlot>& slots, size_t first_new, std::s
     const uint64_t n = slots.size();
     if (first_new > n || first_new != g_nstubs) return fail("append_stubs: slot table is not an extension");
     if (first_new == n) return true;
+    if (n > kStubApertureBytes / g_stub_size)
+        return fail("import stub table exceeds the stub aperture");
+    const uint64_t mapped_end = page_up(g_nstubs * g_stub_size);
+    const uint64_t need_end   = page_up(n * g_stub_size);
+    if (g_stub_base > std::numeric_limits<uint64_t>::max() - need_end)
+        return fail("import stub table address overflows");
+
+    // Refuse the whole suffix before committing pages or touching the old table's padding.
+    // Pass the scratch capacity, not the destination stride: invalid bridges report 257 bytes.
+    std::vector<detail::StagedStub<abi::kMaxBridgeBytes>> staged;
+    if (!detail::stage_stub_suffix(staged, first_new, slots.size(), g_stub_size,
+            [&slots](auto& bytes, size_t i) {
+                return emit_one_stub(bytes.data(), slots[i], (uint32_t)i, bytes.size());
+            }, "generated Windows ABI bridge exceeds staging capacity",
+            "generated Windows ABI bridge exceeds stub_size", err)) return false;
     // Commit only the pages the new slots need, inside the aperture install_stubs reserved. The
     // already-committed pages are never re-committed with different protection: relocated guest
     // code holds addresses inside them.
-    const uint64_t mapped_end = page_up(g_nstubs * g_stub_size);
-    const uint64_t need_end   = page_up(n * g_stub_size);
-    if (need_end > kStubApertureBytes) return fail("import stub table exceeds the stub aperture");
     if (need_end > mapped_end) {
         void* want = (void*)(uintptr_t)(g_stub_base + mapped_end);
         void* got = VirtualAlloc(want, need_end - mapped_end, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
         if (!got || got != want) return fail("VirtualAlloc stub region extension failed");
     }
-    for (uint64_t i = first_new; i < n; i++) {
-        const size_t emitted =
-            emit_one_stub((uint8_t*)(uintptr_t)(g_stub_base + i * g_stub_size), slots[i],
-                          (uint32_t)i, (size_t)g_stub_size);
-        if (emitted > g_stub_size) return fail("generated Windows ABI bridge exceeds stub_size");
-    }
+    detail::publish_stub_suffix(staged, g_stub_base, g_stub_size, first_new);
     g_nstubs = n;
     dispatch_grow_slots(&slots);   // publish only after every new stub is written
     if (getenv("PROSPER_STUBDUMP"))

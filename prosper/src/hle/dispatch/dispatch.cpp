@@ -1,6 +1,7 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "host/image/boot_program.hpp"   // #1659
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: unimplemented-hle-calls alarm
+#include <algorithm>
 #include <cstdlib>
 #include <unordered_map>
 #include <mutex>
@@ -225,6 +226,15 @@ size_t dispatch_append_slots(std::vector<ImportSlot>* slots, const std::vector<I
     g_slots = slots;
     if (g_count.size() < slots->size()) g_count.resize(slots->size(), 0);
     return first;
+}
+void dispatch_rollback_slots(std::vector<ImportSlot>* slots, size_t first_new) {
+    std::lock_guard<std::mutex> lk(g_unimpl_mx);
+    if (!slots || slots != g_slots || first_new > slots->size() || first_new > g_count.size()) return;
+    slots->resize(first_new);
+    g_count.resize(first_new);
+    g_order.erase(std::remove_if(g_order.begin(), g_order.end(),
+                                 [first_new](uint32_t idx) { return idx >= first_new; }),
+                  g_order.end());
 }
 void reset_call_log() { std::lock_guard<std::mutex> lk(g_unimpl_mx); g_order.clear();
                         for (auto& c : g_count) c = 0; }
