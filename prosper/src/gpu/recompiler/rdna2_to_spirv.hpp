@@ -471,13 +471,17 @@ struct PixelSystemInputMapping {
 
 // Explicitly supplied guest invocation state, not a raster-packing reconstruction. Each column
 // owns all 64 raw VGPR words; every slot must be available. The initial implementation consumes
-// these VGPRs directly and rejects VINTRP/implicit derivatives/WQM and external memory effects.
+// these VGPRs directly and rejects VINTRP/implicit derivatives and external memory effects.
 // A caller must not fill missing guest values with zero or infer a packet by pairing host subgroups.
 inline constexpr uint32_t kFragmentPacketLanes = 64;
 struct FragmentPacketVgpr {
     uint32_t reg = 0;
     std::array<uint32_t, kFragmentPacketLanes> words{};
 };
+// Supplied logical ISA topology, NOT PS5 raster-packing or native-helper capture authority.
+// ConsecutiveLogicalQuads means mask nibbles [0..3], [4..7], ..., [60..63]. Unknown is valid
+// for integer operations which do not consume quad semantics; a quad consumer must refuse it.
+enum class FragmentPacketQuadTopology : uint8_t { Unknown, ConsecutiveLogicalQuads };
 struct FragmentInvocationPacket {
     std::vector<uint32_t> guest_code;
     std::vector<FragmentPacketVgpr> vgprs;
@@ -487,6 +491,7 @@ struct FragmentInvocationPacket {
     bool mask_state_available = false;
     uint64_t exec_mask = 0, vcc_mask = 0;
     bool scc = false;
+    FragmentPacketQuadTopology quad_topology = FragmentPacketQuadTopology::Unknown;
     FragmentFloatMode float_mode{};
     FragmentFloatFlags float_flags{};
     FloatTransportConfig float_transport{};

@@ -361,7 +361,7 @@ int main(int argc, char** argv) {
     missing = clean; missing.vgprs.push_back(missing.vgprs.front());
     reject(missing, "packet-vgpr-input-invalid", "duplicate VGPR column");
     missing = clean; missing.guest_code.insert(missing.guest_code.begin(), 0xbefe0a7eu);
-    reject(missing, "packet-wqm-unimplemented", "WQM is not identity");
+    reject(missing, "packet-quad-topology-unavailable", "WQM needs supplied topology");
     for (const uint32_t op : {0x13u, 0x15u, 0x24u, 0x25u}) {
         missing = clean;
         std::vector<uint32_t> mode = op < 0x20

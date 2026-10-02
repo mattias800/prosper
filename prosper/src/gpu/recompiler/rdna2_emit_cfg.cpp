@@ -2172,6 +2172,14 @@ bool emit_cfg_state_machine(
              in.opcode == kSop1OpcodeFf1I32B64) &&
             in.dst.value != 126 && in.dst.value != 127;
     };
+    // Guest quad semantics need explicit logical ownership, not the physical GLCompute flag or
+    // an assumed relation between host subgroups. Packet preflight owns every one of these slots.
+    auto packet_wqm_candidate = [&](const Rdna2Inst& in) {
+        return b.is_fragment_packet() &&
+            b.packet_quad_topology == FragmentPacketQuadTopology::ConsecutiveLogicalQuads &&
+            b.wave_size == 64 && b.local_count == 64 && !b.native_subgroup_size &&
+            !initial_active && in.fmt == Rdna2Format::SOP1 && in.opcode == 0x0a;
+    };
     auto portable_readfirstlane_candidate = [&](const Rdna2Inst& in) {
         return b.portable_readfirstlane_shader && b.is_compute && b.wave_size == 64 &&
             !b.native_subgroup_size && b.local_count > 0 &&
@@ -2206,6 +2214,8 @@ bool emit_cfg_state_machine(
     std::set<int> portable_mask_ffbh_dsts;
     std::unordered_map<uint32_t, uint32_t> portable_mask_reduction_event_for_pc;
     std::set<int> portable_mask_reduction_dsts;
+    std::unordered_map<uint32_t, uint32_t> packet_wqm_event_for_pc;
+    std::set<int> packet_wqm_dsts;
     std::unordered_map<uint32_t, uint32_t> portable_readlane_event_for_pc;
     std::set<int> portable_readlane_dsts;
     std::unordered_map<uint32_t, uint32_t> portable_readfirstlane_event_for_pc;
@@ -2303,6 +2313,14 @@ bool emit_cfg_state_machine(
             portable_mask_reduction_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_mask_reduction_event_for_pc.size() + 1));
             portable_mask_reduction_dsts.insert(in.dst.value);
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (packet_wqm_candidate(in)) {
+            packet_wqm_event_for_pc.emplace(
+                in.pc, static_cast<uint32_t>(packet_wqm_event_for_pc.size() + 1));
+            packet_wqm_dsts.insert(in.dst.value);
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -3340,6 +3358,10 @@ bool emit_cfg_state_machine(
             // presence can be a descriptor/scalar placeholder, so raw SGPR WQM stays compact-only.
             const bool numeric_wqm = wqm_has_numeric_destination(in) &&
                 wqm_has_intrinsic_numeric_source(in);
+            // The packet service consumes either a full live mask or a MUST-defined scalar pair
+            // and produces a full mask. Scalar Function-variable presence alone is not authority.
+            const bool packet_wqm = packet_wqm_candidate(in) &&
+                (source_is_mask(in.src[0]) || scalar_sources);
             const bool vcc_pack_scalar_pair = b.is_compute && b.wave_size == 64 &&
                 in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x32 &&
                 in.opcode <= 0x34 && in.dst.value == 106 &&
@@ -3370,7 +3392,9 @@ bool emit_cfg_state_machine(
                 mask_write = in.dst.kind == OperandKind::SGPR && in.dst.value <= 105
                     ? in.dst.value : 106;
             } else if (in.fmt == Rdna2Format::SOP1 && in.dst.value <= 107) {
-                if (wave64_vcc_b32_mask_not)
+                if (packet_wqm)
+                    mask_write = in.dst.value;
+                else if (wave64_vcc_b32_mask_not)
                     mask_write = 106;
                 else if (!numeric_wqm &&
                     (in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a) &&
@@ -3594,7 +3618,7 @@ bool emit_cfg_state_machine(
                      in.opcode <= kSop1OpcodeXnorSaveexecB64) ||
                     in.opcode == kSop1OpcodeAndn1SaveexecB64 ||
                     in.opcode == kSop1OpcodeOrn1SaveexecB64;
-                if (numeric_wqm)
+                if (packet_wqm || numeric_wqm)
                     scalar_scc = true;
                 else if (in.opcode == kSop1OpcodeNotB32 ||
                     in.opcode == kSop1OpcodeAbsI32)
@@ -3935,6 +3959,7 @@ bool emit_cfg_state_machine(
                 compute_dpp_add_row_shr_pcs.contains(in.pc) ||
                 compute_dpp_row_ror8_pcs.contains(in.pc) ||
                 compute_dpp_add_row_mask_pcs.contains(in.pc) ||
+                packet_wqm_event_for_pc.contains(in.pc) ||
                 lds_fminmax_pcs.contains(in.pc) ||
                 mask_zero_compare_candidate_source(in) >= 0 ||
                 exec_saved_mask_compare_source(in) >= 0 ||
@@ -4301,6 +4326,15 @@ bool emit_cfg_state_machine(
         ? b.function_var(b.t_bool, ptr_bool) : 0;
     const uint32_t mask_reduction_dst_var = has_portable_mask_reduction
         ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const bool has_packet_wqm = !packet_wqm_event_for_pc.empty();
+    const uint32_t packet_wqm_pending_var = has_packet_wqm
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t packet_wqm_source_var = has_packet_wqm
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t packet_wqm_event_var = has_packet_wqm
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t packet_wqm_dst_var = has_packet_wqm
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
     const bool has_portable_readlane = !portable_readlane_event_for_pc.empty();
     const uint32_t readlane_pending_var = has_portable_readlane
         ? b.function_var(b.t_bool, ptr_bool) : 0;
@@ -4449,6 +4483,8 @@ bool emit_cfg_state_machine(
         b.store_function(mask_reduction_count_var, no);
         b.store_function(mask_reduction_dst_var, zero);
     }
+    if (has_packet_wqm)
+        b.store_function(packet_wqm_dst_var, zero);
     if (has_portable_readlane) {
         b.store_function(readlane_source_var, zero);
         b.store_function(readlane_selector_var, zero);
@@ -4780,6 +4816,11 @@ bool emit_cfg_state_machine(
         b.store_function(mask_reduction_mask_var, no);
         b.store_function(mask_reduction_event_var, zero);
     }
+    if (has_packet_wqm) {
+        b.store_function(packet_wqm_pending_var, no);
+        b.store_function(packet_wqm_source_var, no);
+        b.store_function(packet_wqm_event_var, zero);
+    }
     if (has_portable_readlane)
         b.store_function(readlane_pending_var, no);
     if (has_portable_readfirstlane) {
@@ -4846,6 +4887,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* dpp_add_row_mask = nullptr;
         const Rdna2Inst* mask_ffbh = nullptr;
         const Rdna2Inst* mask_reduction = nullptr;
+        const Rdna2Inst* packet_wqm = nullptr;
         const Rdna2Inst* readlane = nullptr;
         const Rdna2Inst* readfirstlane = nullptr;
         const Rdna2Inst* mask_compare = nullptr;
@@ -4873,6 +4915,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_dpp_add_row_mask = nullptr;
             const Rdna2Inst* block_mask_ffbh = nullptr;
             const Rdna2Inst* block_mask_reduction = nullptr;
+            const Rdna2Inst* block_packet_wqm = nullptr;
             const Rdna2Inst* block_readlane = nullptr;
             const Rdna2Inst* block_readfirstlane = nullptr;
             const Rdna2Inst* block_mask_compare = nullptr;
@@ -4951,6 +4994,10 @@ bool emit_cfg_state_machine(
                                      in.pc, in.dst.value, in.src[1].value,
                                      in.dpp_row_mask);
                     block_dpp_add_row_mask = &in;
+                    break;
+                }
+                if (packet_wqm_event_for_pc.contains(in.pc)) {
+                    block_packet_wqm = &in;
                     break;
                 }
                 if (portable_mask_reduction_candidate(in) &&
@@ -5145,7 +5192,8 @@ bool emit_cfg_state_machine(
                     block_swizzle || block_bpermute ||
                     block_dpp_min_row_shr || block_dpp_add_row_shr ||
                     block_dpp_row_ror8 ||
-                    block_dpp_add_row_mask || block_mask_ffbh || block_mask_reduction || block_readlane ||
+                    block_dpp_add_row_mask || block_mask_ffbh || block_mask_reduction ||
+                    block_packet_wqm || block_readlane ||
                     block_readfirstlane ||
                     block_mask_compare ||
                     block_exec_saved_mask_compare || block_saved_mask_pair_compare ||
@@ -5169,6 +5217,7 @@ bool emit_cfg_state_machine(
             dpp_add_row_mask = block_dpp_add_row_mask;
             mask_ffbh = block_mask_ffbh;
             mask_reduction = block_mask_reduction;
+            packet_wqm = block_packet_wqm;
             readlane = block_readlane;
             readfirstlane = block_readfirstlane;
             mask_compare = block_mask_compare;
@@ -5176,6 +5225,57 @@ bool emit_cfg_state_machine(
             saved_mask_pair_compare = block_saved_mask_pair_compare;
             vopc_mask_compare = block_vopc_mask_compare;
             b64_mask_scc_vote = block_b64_mask_scc_vote;
+        }
+        if (packet_wqm) {
+            // Snapshot before any destination invalidation, including EXEC/VCC and SGPR aliases.
+            const auto& source = packet_wqm->src[0];
+            uint32_t bit = 0;
+            if (source.kind == OperandKind::Special && source.value == 126)
+                bit = state.exec;
+            else if (source.kind == OperandKind::Special && source.value == 106)
+                bit = state.vcc;
+            else if (source.kind == OperandKind::InlineInt &&
+                     (source.value == 0 || source.value == -1))
+                bit = source.value ? yes : no;
+            else if (source.kind == OperandKind::SGPR) {
+                const auto mask = state.sreg_bool.find(source.value);
+                if (mask != state.sreg_bool.end() &&
+                    !state.sreg_bool_b32.contains(source.value)) {
+                    bit = mask->second;
+                } else {
+                    const auto low = state.sreg.find(source.value);
+                    const auto high = state.sreg.find(source.value + 1);
+                    if (low != state.sreg.end() && high != state.sreg.end()) {
+                        const uint32_t word = b.sel(
+                            b.ucmp(Op_ULessThan, mbcnt_lane, b.uconst(32)),
+                            low->second, high->second);
+                        bit = b.ucmp(Op_INotEqual,
+                            b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, word,
+                                b.ibin(Op_BitwiseAnd, mbcnt_lane, b.uconst(31))), b.uconst(1)),
+                            zero);
+                    }
+                }
+            }
+            if (!bit) return reject_cfg(packet_wqm->pc, "packet-wqm-source-state-unavailable");
+            b.store_function(packet_wqm_pending_var, yes);
+            b.store_function(packet_wqm_source_var, bit);
+            b.store_function(packet_wqm_event_var,
+                b.uconst(packet_wqm_event_for_pc.at(packet_wqm->pc)));
+            const int dst = packet_wqm->dst.value;
+            b.store_function(packet_wqm_dst_var, b.uconst(static_cast<uint32_t>(dst)));
+            for (int word : {dst, dst + 1}) {
+                state.sreg.erase(word);
+                state.sreg_input.erase(word);
+                state.sreg_srt.erase(word);
+            }
+            for (int base : {dst - 1, dst, dst + 1}) {
+                state.sreg_bool.erase(base);
+                state.sreg_bool_narrowed.erase(base);
+                state.sreg_bool_b32.erase(base);
+                state.sreg_wave64_mask_half.erase(base);
+                state.sreg_wave64_mask_half_index.erase(base);
+            }
+            // The common phase publishes the result after save_state, before successor dispatch.
         }
         if (mask_reduction) {
             const int source = wave64_mask_reduction_source(*mask_reduction);
@@ -5785,7 +5885,10 @@ bool emit_cfg_state_machine(
             }
         }
         save_state(state, dispatch);
-        if (mask_reduction) {
+        if (packet_wqm) {
+            if (!set_next(packet_wqm->pc + packet_wqm->len_dwords))
+                return reject_cfg(packet_wqm->pc, "packet-wqm-successor");
+        } else if (mask_reduction) {
             if (!set_next(mask_reduction->pc + mask_reduction->len_dwords))
                 return reject_cfg(mask_reduction->pc, "mask-reduction-successor");
         } else if (mask_ffbh) {
@@ -6578,6 +6681,28 @@ bool emit_cfg_state_machine(
         clear_overlapping_masks(mhv);
         return true;
     };
+
+    if (has_packet_wqm) {
+        // Only common-phase code may call this Workgroup service: every physical participant,
+        // including EXEC-off/ended workers, reaches its publish/consume barriers.
+        const uint32_t pending = b.load_function(b.t_bool, packet_wqm_pending_var);
+        const uint32_t source = b.load_function(b.t_bool, packet_wqm_source_var);
+        const uint32_t tag = b.load_function(b.t_u32, packet_wqm_event_var);
+        const auto [widened, any_result] = b.packet_wqm_b64(source, pending, tag, wave_result_base);
+        if (!widened || !any_result) return reject_cfg(0, "packet-wqm-ownership-contract");
+        b.store_function(scc_var,
+            b.bsel(pending, any_result, b.load_function(b.t_bool, scc_var)));
+        const uint32_t dst = b.load_function(b.t_u32, packet_wqm_dst_var);
+        for (int reg : packet_wqm_dsts) {
+            const uint32_t selected = b.land(pending,
+                b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))));
+            const uint32_t destination = reg == 126 ? exec_var : reg == 106 ? vcc_var :
+                mv.contains(reg) ? mv.at(reg) : 0;
+            if (!destination) return reject_cfg(0, "packet-wqm-destination-state-unavailable");
+            b.store_function(destination,
+                b.bsel(selected, widened, b.load_function(b.t_bool, destination)));
+        }
+    }
 
     if (has_portable_mask_reduction) {
         // Scalar mask operations ignore EXEC for their destination write. All launched guest

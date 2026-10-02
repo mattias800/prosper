@@ -30,6 +30,7 @@
 #include "../../tests/fixtures/spirv_fragment_neutral_fixtures.hpp"
 #include "../../tests/fixtures/portable_bpermute_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_fixture.hpp"
+#include "../../tests/fixtures/fragment_packet_wqm_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <algorithm>
 #include <array>
@@ -569,6 +570,15 @@ int main(int argc, char** argv) {
             c.second_export = true;
             const auto compiled = recompile_fragment_packet(fp::packet(c));
             const auto name = "fragment_packet_" + std::to_string(ordinal++);
+            dump(dir, name.c_str(), compiled.spirv, "recompile_fragment_packet");
+        }
+        for (const auto source : {fp::wqm::Source::Exec, fp::wqm::Source::Vcc,
+                                  fp::wqm::Source::ScalarPair, fp::wqm::Source::Empty}) {
+            fp::wqm::Case c;
+            c.source = source;
+            c.destination = source == fp::wqm::Source::Vcc ? 106 : 16;
+            const auto compiled = recompile_fragment_packet(fp::wqm::packet(c));
+            const auto name = "fragment_packet_wqm_" + std::to_string(ordinal++);
             dump(dir, name.c_str(), compiled.spirv, "recompile_fragment_packet");
         }
     }

@@ -12,8 +12,21 @@ const char* packet_instruction_gap(const Rdna2Inst& in) {
         (in.opcode == 0x13 || in.opcode == 0x15)) return "packet-mode-write";
     if (in.fmt == Rdna2Format::SOPP &&
         (in.opcode == 0x24 || in.opcode == 0x25)) return "packet-mode-write";
-    if (in.fmt == Rdna2Format::SOP1 &&
-        (in.opcode == 0x0a || in.opcode == 0x09)) return "packet-wqm-unimplemented";
+    if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x09)
+        return "packet-wqm-b32-unimplemented";
+    if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x0a) {
+        const auto pair = [](const Operand& op) {
+            return (op.kind == OperandKind::SGPR && op.value >= 0 &&
+                    op.value <= 104 && !(op.value & 1)) ||
+                   ((op.kind == OperandKind::SGPR || op.kind == OperandKind::Special) &&
+                    (op.value == 106 || op.value == 126));
+        };
+        if (!pair(in.dst)) return "packet-wqm-destination-form-unimplemented";
+        if (!pair(in.src[0]) &&
+            !(in.src[0].kind == OperandKind::InlineInt &&
+              (in.src[0].value == 0 || in.src[0].value == -1)))
+            return "packet-wqm-source-form-unimplemented";
+    }
     if (in.fmt == Rdna2Format::VINTRP) return "packet-interpolation-unavailable";
     if (in.fmt == Rdna2Format::MIMG) return "packet-image-derivative-or-effect-unimplemented";
     if (in.fmt == Rdna2Format::DS) return "packet-ds-op-unimplemented";
@@ -30,7 +43,8 @@ const char* packet_instruction_gap(const Rdna2Inst& in) {
                 ? nullptr : "packet-control-unimplemented";
         case Rdna2Format::SOP1:
             return in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64 ||
-                in.opcode == kSop1OpcodeBcnt1I32B64 || in.opcode == kSop1OpcodeFf1I32B64
+                in.opcode == kSop1OpcodeBcnt1I32B64 || in.opcode == kSop1OpcodeFf1I32B64 ||
+                in.opcode == 0x0a
                 ? nullptr : "packet-scalar-op-unimplemented";
         case Rdna2Format::SOP2:
             return in.opcode == kSop2OpcodeAddU32 || in.opcode == kSop2OpcodeCselectB32
@@ -89,6 +103,9 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
         !std::all_of(packet.slots_available.begin(), packet.slots_available.end(),
                      [](bool available) { return available; }))
         return reject("packet-invocation-state-unavailable");
+    if (packet.quad_topology != FragmentPacketQuadTopology::Unknown &&
+        packet.quad_topology != FragmentPacketQuadTopology::ConsecutiveLogicalQuads)
+        return reject("packet-quad-topology-invalid");
     if (!packet.float_mode.canonical() || !packet.float_flags.canonical() ||
         !packet.float_transport.canonical() ||
         std::any_of(packet.export_enabled.begin(), packet.export_enabled.end(),
@@ -122,6 +139,9 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
     for (const auto& in : ins) pcs.insert(in.pc);
     for (const auto& in : ins) {
         if (const char* gap = packet_instruction_gap(in)) return reject(gap, in.pc);
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x0a &&
+            packet.quad_topology != FragmentPacketQuadTopology::ConsecutiveLogicalQuads)
+            return reject("packet-quad-topology-unavailable", in.pc);
         if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
             const uint32_t target = branch_target(in);
             // Static forward order preserves every EXP occurrence; a last-value record would not
@@ -142,7 +162,8 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
         bool missing_scalar = false, invalid_scalar_write = false;
         for_each_scalar_write(in, [&](int reg, uint32_t width) {
             const bool mask_pair = in.fmt == Rdna2Format::SOP1 &&
-                in.opcode == kSop1OpcodeMovB64 && (reg == 106 || reg == 126);
+                (in.opcode == kSop1OpcodeMovB64 || in.opcode == 0x0a) &&
+                (reg == 106 || reg == 126);
             if ((width == 2 && (reg & 1)) || reg < 0 ||
                 (reg + static_cast<int>(width) > 106 && !mask_pair))
                 invalid_scalar_write = true;
@@ -154,7 +175,7 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
         if (missing_scalar) return reject("packet-sgpr-input-unavailable", in.pc);
         const bool pair_source = in.fmt == Rdna2Format::SOP1 &&
             (in.opcode == kSop1OpcodeMovB64 || in.opcode == kSop1OpcodeBcnt1I32B64 ||
-             in.opcode == kSop1OpcodeFf1I32B64);
+             in.opcode == kSop1OpcodeFf1I32B64 || in.opcode == 0x0a);
         for (uint32_t source = 0; source < in.n_src; ++source) {
             if (in.fmt == Rdna2Format::EXP && !(in.exp_en & (1u << source))) continue;
             const auto& operand = in.src[source];
@@ -167,12 +188,15 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
                     return reject("packet-sgpr-input-unavailable", in.pc);
                 if (in.fmt == Rdna2Format::SOP1 &&
                     (in.opcode == kSop1OpcodeMovB64 || in.opcode == kSop1OpcodeBcnt1I32B64 ||
-                     in.opcode == kSop1OpcodeFf1I32B64) && !scalars.contains(operand.value + 1))
+                     in.opcode == kSop1OpcodeFf1I32B64 || in.opcode == 0x0a) &&
+                    !scalars.contains(operand.value + 1))
                     return reject("packet-sgpr-input-unavailable", in.pc);
             }
             if (pair_source && operand.kind != OperandKind::SGPR &&
                 !(operand.kind == OperandKind::Special &&
-                  (operand.value == 106 || operand.value == 126)))
+                  (operand.value == 106 || operand.value == 126)) &&
+                !(in.opcode == 0x0a && operand.kind == OperandKind::InlineInt &&
+                  (operand.value == 0 || operand.value == -1)))
                 return reject("packet-scalar-pair-input-invalid", in.pc);
             if (operand.kind == OperandKind::Special && operand.value != 106 &&
                 operand.value != 107 && operand.value != 126 && operand.value != 127 &&
@@ -204,6 +228,7 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
     b.float_transport = packet.float_transport;
     b.begin(result.input_stride, nullptr, 64, 1, 1, 64, 0, true, true);
     b.guest_stage = GuestShaderStage::Fragment; // physical GLCompute/workgroup remains independent
+    b.packet_quad_topology = packet.quad_topology;
     std::vector<uint32_t> marker;
     b.pstr(marker, "Prosper.GuestFragmentPacket=64;NoRasterPackingAuthority");
     b.putv(b.debug, Op_ModuleProcessed, marker);
