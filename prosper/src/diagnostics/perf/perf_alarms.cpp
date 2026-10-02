@@ -493,7 +493,7 @@ std::string format_frame_breakdown(const FrameBreakdownTotals& t) {
     char head[256];
     std::snprintf(head, sizeof head,
                   "[perf-alarm] summary observer=frame-breakdown flips=%llu span=%.1fs "
-                  "interval=%.2fms (%.1f fps) budget=%.2fms; per flip, summed THREAD time, NOT a "
+                  "interval=%.2fms (%.1f guest-flips/s) budget=%.2fms; per flip, summed THREAD time, NOT a "
                   "partition of the frame (stages overlap across threads): ",
                   static_cast<unsigned long long>(t.flips), t.seconds, interval_ms,
                   flips / t.seconds, budget_ms);

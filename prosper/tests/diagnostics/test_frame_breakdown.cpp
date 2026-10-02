@@ -64,7 +64,7 @@ void formatting() {
 
     check("the line carries the tag, flips, interval and the budget",
           line.find("[perf-alarm] summary observer=frame-breakdown flips=3000") == 0 &&
-              line.find("interval=20.00ms (50.0 fps)") != std::string::npos &&
+              line.find("interval=20.00ms (50.0 guest-flips/s)") != std::string::npos &&
               line.find("budget=16.67ms") != std::string::npos);
     check("...says outright that it is summed thread time and not a partition",
           line.find("summed THREAD time, NOT a partition of the frame") != std::string::npos);

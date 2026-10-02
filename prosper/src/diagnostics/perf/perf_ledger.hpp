@@ -384,6 +384,13 @@ constexpr const char* kCostNames[kCostCount] = {
     "surface-readback", "hle-blocking-wait", "present-cpu", "frontend-build", "texture-ref-sample",
     "shader-compile", "pipeline-create", "gpu-wait-compute", "gpu-wait-graphics",
 };
+// A Cost added without a name would leave a null slot that the exit summary reads.
+constexpr bool all_cost_names_present() {
+    for (const char* name : kCostNames)
+        if (name == nullptr) return false;
+    return true;
+}
+static_assert(all_cost_names_present(), "every Cost needs an entry in kCostNames, in Cost order");
 constexpr size_t kCounterCount = static_cast<size_t>(Counter::Count);
 constexpr size_t kGaugeCount = static_cast<size_t>(Gauge::Count);
 constexpr size_t kPeakCount = static_cast<size_t>(Peak::Count);
