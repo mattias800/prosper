@@ -1,6 +1,7 @@
 // exec_image_linux.cpp — Linux host backing + HLE stubs (M2/M3). Compiles to nothing
 // on non-Linux so the shared (mingw) build is unaffected.
 #include "host/image/exec_image.hpp"
+#include "host/abi/sysv_ms_bridge.hpp"
 #include "host/platform/immortal.hpp"   // #2613: registries a guest thread can reach after exit()
 #include "host/x86/sse4a.hpp"
 #include "host/x86/x86_read_decode.hpp"
@@ -3062,9 +3063,8 @@ namespace {
 #endif
 
     // Emit machine code into a stub slot.
-    size_t emit_impl(uint8_t* p, uint64_t fn) {        // movabs rax,fn ; jmp rax
-        p[0] = 0x48; p[1] = 0xB8; memcpy(p + 2, &fn, 8); p[10] = 0xFF; p[11] = 0xE0;
-        return 12;
+    size_t emit_impl(uint8_t* p, uint64_t fn) {
+        return abi::emit_guest_abi_tailjump(p, fn); // preserve SysV AL, arguments and caller stack
     }
     size_t emit_unimpl(uint8_t* p, uint32_t idx, uint64_t fn) { // mov edi,idx ; movabs rax,fn ; jmp rax
         p[0] = 0xBF; memcpy(p + 1, &idx, 4);

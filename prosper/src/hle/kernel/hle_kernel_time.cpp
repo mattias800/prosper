@@ -17,6 +17,7 @@
 #include "hle/kernel/sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "hle/memory/heap_mutex.hpp"   // #707: keep hot equeue/APR mutexes off macOS __DATA
 #include "hle/sync/pthread_slot.hpp"   // #2596: resolve a guest sync slot the way libkernel does
+#include "hle/sync/host_tcb_scope.hpp"   // #3623: clock initialization under the calling host TCB
 #include "hle/sync/sync_futex.hpp"
 #include "hle/sync/sync_retire.hpp"   // #2042: a destroyed guest sync object's storage is retired, not freed
 #include "diagnostics/env_numeric.hpp"   // #3304: a mistyped PROSPER_WAITCAP must not remove the cap
@@ -1044,6 +1045,25 @@ HLE(m_mtx_init)   { if (a0) { auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthre
 // SCE_PTHREAD_ALIAS in hle_kernel.cpp) on a lock prosper REFUSED, which is a lock the guest does not
 // hold. Terminating there is the shipped wrapper's own contract; returning 0 was a corruption.
 HLE(m_mtx_lock)   { return thrd_rc_from_mutex_lock(guest_mutex_lock_slot(a0)); }
+HLE(m_mtx_trylock){ return thrd_rc_from_mutex_trylock(guest_mutex_trylock_slot(a0)); }
+// Re-derived from the shipped libc.prx wrappers of PPSA24651 and PPSA19244: signed 64-bit
+// seconds/nanoseconds, gettimeofday's wall clock, ceiling to microseconds, then low 32 bits.
+// CONFIDENCE: HIGH on that conversion. A normalization overflow is rejected as _Thrd_error;
+// the guest helper's extreme signed overflow is outside a valid C11 deadline (N1570 7.26.3.5/7.26.4.4).
+static host::C11Timeout32 c11_timeout_for_guest_deadline(uint64_t deadline_addr) {
+    [[maybe_unused]] HostTcbScope host_tcb;
+    if (!deadline_addr) return {false, 0};
+    const auto* deadline = static_cast<const int64_t*>(P(deadline_addr));
+    const uint64_t now_us = wall_now_us();
+    return host::c11_timeout_from_deadline(
+        {(int64_t)(now_us / 1000000ULL), (int64_t)(now_us % 1000000ULL) * 1000LL},
+        {deadline[0], deadline[1]});
+}
+HLE(m_mtx_timedlock) {
+    const auto timeout = c11_timeout_for_guest_deadline(a1);
+    if (!timeout.valid) return kThrdError;
+    return thrd_rc_from_timed_mutex_lock(guest_mutex_timedlock_slot(a0, timeout.usec));
+}
 HLE(m_mtx_unlock) { (void)guest_mutex_unlock_slot(a0); return 0; }
 // _Mtx_destroy / _Cnd_destroy are the guest STL's own spelling of the same objects, so they carry
 // the same lifetime rule as scePthreadMutexDestroy / scePthreadCondDestroy: quarantine the storage
@@ -1063,6 +1083,11 @@ HLE(m_cnd_broadcast){ guest_cond_broadcast_slot(a0); return 0; }
 // `guest_cond_wait_slot` takes the #2168 waiter scope, so a thread parked here is visible to every
 // cond-destroy busy check instead of having its condvar retired out from under it (#2623).
 HLE(m_cnd_wait)   { (void)guest_cond_wait_slot(a0, a1); return 0; }
+HLE(m_cnd_timedwait) {
+    const auto timeout = c11_timeout_for_guest_deadline(a2);
+    if (!timeout.valid) return kThrdError;
+    return thrd_rc_from_timed_cond_wait(guest_cond_timedwait_slot(a0, a1, timeout.usec));
+}
 // Answers 0, exactly like its `_Mtx_destroy` sibling above. The guest's eleven-byte wrapper never
 // touches eax after its call to `scePthreadCondDestroy`, and that shape does NOT establish a
 // forwarded result -- it is what a void wrapper compiles to (pthread_slot.hpp works the reading
@@ -2255,9 +2280,11 @@ void register_kernel_time_hle() {
     // (f_apr_resolve: stat each path, assign an id, record id->host-path). Registered there.
     // C11 threads
     R("_Mtx_init", m_mtx_init);   R("_Mtx_lock", m_mtx_lock);   R("_Mtx_unlock", m_mtx_unlock);
+    R("_Mtx_trylock", m_mtx_trylock); R("_Mtx_timedlock", m_mtx_timedlock);
     R("_Mtx_destroy", m_mtx_destroy);
     R("_Cnd_init", m_cnd_init);   R("_Cnd_signal", m_cnd_signal); R("_Cnd_broadcast", m_cnd_broadcast);
     R("_Cnd_wait", m_cnd_wait);   R("_Cnd_destroy", m_cnd_destroy);
+    R("_Cnd_timedwait", m_cnd_timedwait);
     // libkernel/libScePosix signal + time-conversion surface (#190)
     R("sceKernelConvertUtcToLocaltime", k_convert_utc_to_local);
     R("sceKernelConvertLocaltimeToUtc", k_convert_local_to_utc);
