@@ -98,6 +98,7 @@ bool should_log_recompile_reject(uint64_t es_addr, uint64_t ps_addr,
 namespace {
 LiveRenderFn g_live;   // empty until the runtime/test registers a device-backed renderer
 LiveComputeFn g_compute;   // synchronous compute backend, registered with the live Vulkan frontend
+std::atomic<bool> g_compute_indirect_dispatch{false};   // #3656: backend consumes indirect_args_addr
 GuestGpuWriteObserver g_guest_gpu_write_observer;
 ComputeAuthorityBoundaryObserver g_compute_authority_boundary_observer;
 std::mutex g_compute_authority_boundary_mutex;
@@ -8085,6 +8086,13 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
     const bool use_thread_dimensions = ((d.modifier >>
         P::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_SHIFT) &
         P::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_MASK) != 0;
+    if (d.indirect) {
+        // #3656: an indirect dispatch's counts live in guest memory the device may not have
+        // produced yet. Anything built from this launch before the arguments are resolved must see
+        // ZERO ("unknown"), never a dummy count: the proofs that consume a thread extent all refuse
+        // a zero extent, and the CPU resolver clears `indirect` before asking for the real shape.
+        return out;
+    }
     if (use_thread_dimensions) {
         out.threads_x = d.threads_x;
         out.threads_y = d.threads_y;
@@ -8358,7 +8366,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // push-constant SGPR block. Extra Y/Z groups merely repeat the exact same zero stores because
         // the proven kernel cannot observe them; all other oversized/formatless descriptors stay rejected.
         const bool linear_store_proof_context =
-            user_count < kUserSgprs && tgid_x_en && !tgid_y_en && !tgid_z_en;
+            user_count < kUserSgprs && tgid_x_en && !tgid_y_en && !tgid_z_en &&
+            !dispatch.indirect;   // #3656: that proof reads the thread extent
         auto table = std::make_shared<ShaderResourceTable>(
             build_shader_resources(*header, sgprs, kUserSgprs, 0));
         std::vector<SrtUse> compute_srt_uses;
@@ -8406,7 +8415,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 sgprs, fold_user_count,
                 launch.local_x, launch.threads_x,
                 linear_store_proof_context ? user_count : UINT32_MAX,
-                &resource_dispatch_context);
+                // #3656: the nullable-output proof compares the launch extent with a guest-supplied
+                // record count. With the counts unresolved there is nothing to compare.
+                dispatch.indirect ? nullptr : &resource_dispatch_context);
             const auto& srt_uses = compute_srt_uses;
             std::set<uint64_t> srt_seen;
             for (const auto& u : srt_uses) {
@@ -8992,6 +9003,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
         }
         item.resources = std::move(table);
         item.launch = launch;
+        item.indirect_args_addr = dispatch.indirect ? dispatch.indirect_args_addr : 0;
         item.code_addr = code_addr;
         item.dispatch_index = dispatch_index;
         item.submit_no = submit_no;
@@ -10417,6 +10429,10 @@ struct IndirectDispatchCensus {
     std::atomic<uint64_t> zero_groups{0};
     std::atomic<uint64_t> unreadable{0};
     std::atomic<uint64_t> direct_noop{0};
+    // #3656: outcomes of the device-resolved route, kept apart from `ready` so a route that moved
+    // to the device cannot read as a route that stopped producing counts.
+    std::atomic<uint64_t> device_resolved{0};
+    std::atomic<uint64_t> device_refused_launch_dependent{0};
     ~IndirectDispatchCensus() {
         const uint64_t seen = total.load(std::memory_order_relaxed);
         if (!seen || !PROSPER_ENV_ON("PROSPER_INDIRECTLOG")) return;
@@ -10434,6 +10450,33 @@ IndirectDispatchCensus& indirect_dispatch_census() {
     static IndirectDispatchCensus census;
     return census;
 }
+
+// #3656. A dispatch is a candidate for the device-resolved route only when every condition that
+// would make "the device reads the three dwords later" differ from "the CPU read them now" is
+// absent. Each refusal below falls back to the ordered CPU copy, which is unchanged.
+bool gpu_indirect_dispatch_candidate(const GpuState::Dispatch& source, bool capture_active) {
+    namespace P = prosper::agc::Pm4;
+    if (!source.indirect || capture_active) return false;
+    if (!submit_compute_supports_indirect_dispatch()) return false;
+    static const bool opted_out = std::getenv("PROSPER_NO_GPU_INDIRECT_DISPATCH") != nullptr;
+    // PROSPER_MAX_DISPATCH_GROUPS clamps the CPU-resolved count; the device route has no such
+    // clamp, so honouring the diagnostic means staying on the route that can.
+    static const bool group_cap = std::getenv("PROSPER_MAX_DISPATCH_GROUPS") != nullptr;
+    if (opted_out || group_cap) return false;
+    // Thread-dimension mode derives the group count with a CPU division by the local size and
+    // feeds the thread extent to exact-extent guards; the device cannot do either here.
+    const bool use_thread_dimensions = ((source.modifier >>
+        P::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_SHIFT) &
+        P::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_MASK) != 0;
+    if (use_thread_dimensions) return false;
+    constexpr uint32_t kArgumentBytes = 3u * sizeof(uint32_t);
+    const uint64_t addr = source.indirect_args_addr;
+    if (!addr || (addr & 3u) || addr > UINT64_MAX - kArgumentBytes ||
+        !guest_readable(addr, kArgumentBytes))
+        return false;
+    return true;
+}
+
 
 DispatchArgumentResolution resolve_indirect_dispatch_arguments(
         const GpuState::Dispatch& source, GpuState::Dispatch& resolved,
@@ -11579,8 +11622,56 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     break;
                 }
                 GpuState::Dispatch resolved_dispatch;
-                const DispatchArgumentResolution argument_resolution =
-                    resolve_indirect_dispatch_arguments(
+                ComputeItem item;
+                OperationRealizationFailure failure;
+                // An HLE mapping transaction cannot replace a source or destination between
+                // admission, owned snapshot construction and this dispatch's completion. Keep the
+                // lease local to the ordered dispatch, so unrelated draws, DMA and presentation
+                // do not hold it. Byte stores and lazy faults have separate admission checks.
+                std::unique_ptr<GuestMappingLease> mapping_lease;
+                RetainedComputeRealization realization = RetainedComputeRealization::Failed;
+                // #3656: try the device-resolved route first. Realization happens here, with the
+                // counts unknown, and is kept only if it proves launch-free; otherwise everything
+                // it produced is discarded and the unchanged ordered CPU copy below runs.
+                bool device_resolved = false;
+                if (indirect && compute &&
+                    gpu_indirect_dispatch_candidate(
+                        st.dispatches[operation.index],
+                        capture_trace != nullptr ||
+                            std::getenv("PROSPER_GPU_TIMELINE_CAPTURE") != nullptr ||
+                            env_gpu_capture_requires_portable_compute() ||
+                            interactive_gpu_capture_armed() ||
+                            interactive_capture_bundle_active())) {
+                    realization = realize_retained_compute(
+                        st, operation.index, st.dispatches[operation.index], submit_no, item,
+                        nullptr, defer_graphics_wait ? nullptr : &mapping_lease);
+                    if (realization == RetainedComputeRealization::Realized &&
+                        gpu_indirect_dispatch_launch_free(item) &&
+                        !gpu_indirect_dispatch_args_alias_resource(item)) {
+                        device_resolved = true;
+                        resolved_dispatch = st.dispatches[operation.index];
+                        auto& census = indirect_dispatch_census();
+                        census.total.fetch_add(1, std::memory_order_relaxed);
+                        census.device_resolved.fetch_add(1, std::memory_order_relaxed);
+                        // The same ordering boundary the CPU copy declares: every earlier
+                        // producer of this range has completed before the device consumes it.
+                        notify_compute_authority_range(
+                            ComputeAuthorityBoundaryKind::IndirectArgumentRead,
+                            submit_no, operation.command_order,
+                            item.indirect_args_addr, 3u * sizeof(uint32_t));
+                    } else {
+                        if (realization == RetainedComputeRealization::Realized)
+                            indirect_dispatch_census().device_refused_launch_dependent
+                                .fetch_add(1, std::memory_order_relaxed);
+                        item = ComputeItem{};
+                        failure = OperationRealizationFailure{};
+                        mapping_lease.reset();
+                        realization = RetainedComputeRealization::Failed;
+                    }
+                }
+                const DispatchArgumentResolution argument_resolution = device_resolved
+                    ? DispatchArgumentResolution::Ready
+                    : resolve_indirect_dispatch_arguments(
                         st.dispatches[operation.index], resolved_dispatch,
                         submit_no, operation.command_order);
                 if (argument_resolution == DispatchArgumentResolution::Noop) {
@@ -11632,21 +11723,15 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     previous_compute_executed = false;
                     break;
                 }
-                ComputeItem item;
-                OperationRealizationFailure failure;
-                // An HLE mapping transaction cannot replace a source or destination between
-                // admission, owned snapshot construction and this dispatch's completion. Keep the
-                // lease local to the ordered dispatch, so unrelated draws, DMA and presentation
-                // do not hold it. Byte stores and lazy faults have separate admission checks.
-                std::unique_ptr<GuestMappingLease> mapping_lease;
-                const RetainedComputeRealization realization = realize_retained_compute(
-                    st, operation.index, resolved_dispatch, submit_no, item,
-                    capture_trace ? &failure : nullptr,
-                    // A deferred graphics producer may still be writing a guest source. Its
-                    // bridge establishes backend ordering, but a CPU snapshot taken during
-                    // realization bypasses that bridge. Keep this opt-in mode on the existing
-                    // unresolved path until such a snapshot can await the precise producer.
-                    defer_graphics_wait ? nullptr : &mapping_lease);
+                if (!device_resolved)
+                    realization = realize_retained_compute(
+                        st, operation.index, resolved_dispatch, submit_no, item,
+                        capture_trace ? &failure : nullptr,
+                        // A deferred graphics producer may still be writing a guest source. Its
+                        // bridge establishes backend ordering, but a CPU snapshot taken during
+                        // realization bypasses that bridge. Keep this opt-in mode on the existing
+                        // unresolved path until such a snapshot can await the precise producer.
+                        defer_graphics_wait ? nullptr : &mapping_lease);
                 if (realization == RetainedComputeRealization::Realized) {
                     // `resolved_dispatch.indirect` is false after its argument dwords were read.
                     // Preserve the source form beside the resolved dimensions for bounded F8
@@ -12031,7 +12116,50 @@ void set_submit_renderer(LiveRenderFn fn) { g_live = std::move(fn); }
 bool have_submit_renderer()               { return static_cast<bool>(g_live); }
 uint8_t* compute_gds_backing()            { return g_compute_gds.data(); }
 size_t   compute_gds_size()               { return g_compute_gds.size(); }
-void set_submit_compute(LiveComputeFn fn) { g_compute = std::move(fn); }
+void set_submit_compute(LiveComputeFn fn) {
+    g_compute = std::move(fn);
+    g_compute_indirect_dispatch.store(false, std::memory_order_relaxed);
+}
+// The realization of a device-resolved dispatch was built with an UNKNOWN launch. That is only
+// sound when nothing realization produced depends on the launch: each specialization below is a
+// proof or fast path that is only true for one thread extent. The recompiler's own proofs already
+// refuse a zero extent; this predicate is the executor-side statement of the same fact, so a future
+// launch-dependent token added to ComputeItem has exactly one place to be listed.
+bool gpu_indirect_dispatch_launch_free(const ComputeItem& item) {
+    return item.cpu_fast_path == ComputeCpuFastPath::None &&
+        !item.null_guarded_raw_store_validated && !item.nullable_output_raw_buffer_validated &&
+        !item.gta5_cf9200_no_backing_validated && !item.trip_witness_instrumented &&
+        !item.recompile_config.exact_thread_extent && !item.recompile_config.threads_x &&
+        !item.recompile_config.threads_y && !item.recompile_config.threads_z &&
+        !item.launch.groups_x && !item.launch.groups_y && !item.launch.groups_z;
+}
+
+// An argument range that any bound resource also covers is an alias: the dispatch could rewrite its
+// own counts, or the range could be image-backed. Neither is admitted on the device route.
+bool gpu_indirect_dispatch_args_alias_resource(const ComputeItem& item) {
+    if (!item.resources) return false;
+    return !compute_address_window_hits(*item.resources, item.indirect_args_addr,
+                                        3u * sizeof(uint32_t)).empty();
+}
+
+IndirectDispatchStats indirect_dispatch_stats() {
+    const auto& census = indirect_dispatch_census();
+    IndirectDispatchStats stats;
+    stats.device_resolved = census.device_resolved.load(std::memory_order_relaxed);
+    stats.cpu_resolved = census.ready.load(std::memory_order_relaxed) +
+                         census.zero_args.load(std::memory_order_relaxed) +
+                         census.zero_groups.load(std::memory_order_relaxed);
+    stats.device_refused_launch_dependent =
+        census.device_refused_launch_dependent.load(std::memory_order_relaxed);
+    return stats;
+}
+void set_submit_compute_indirect_dispatch(bool supported) {
+    g_compute_indirect_dispatch.store(supported && static_cast<bool>(g_compute),
+                                      std::memory_order_relaxed);
+}
+bool submit_compute_supports_indirect_dispatch() {
+    return g_compute_indirect_dispatch.load(std::memory_order_relaxed);
+}
 bool have_submit_compute()                { return static_cast<bool>(g_compute); }
 void notify_compute_authority_boundary(
         const ComputeAuthorityBoundary& boundary) {

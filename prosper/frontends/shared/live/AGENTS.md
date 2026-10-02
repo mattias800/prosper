@@ -106,6 +106,26 @@ the arena never enters submission cleanup callbacks. `PROSPER_NO_BUFFER_LOOKUP_A
 direct PMR heap allocation; unsupported PMR deployment targets retain ordinary standard maps.
 Allocation observations count upstream heap requests/bytes, not nodes or GPU buffer traffic.
 
+## Device-resolved indirect dispatch (#3656)
+
+`indirect_dispatch.hpp` is the backend half of `ComputeItem::indirect_args_addr` (the executor half is
+in `src/gpu/execute/AGENTS.md`). `execute_item` pins a retained persistent buffer that is
+**authoritative** for the 12-byte range — identity materialization of guest memory, valid, containing
+the range at a 4-byte offset, and unchanged since it was last made equal to guest memory according to
+the in-submit write journal (the same proof that lets the cache skip an upload; it answers Unknown, so
+refuses, outside `execute_ordered_items`). It then copies the triplet to a 16-byte device scratch
+record, runs a one-invocation validation pass that zeroes the launch when any count exceeds
+`min(maxComputeWorkGroupCount)` (a clamp would silently compute part of the domain; word 3 records
+the refusal), and records `vkCmdDispatchIndirect` from that scratch record. Any other case — no
+authoritative buffer, a straddling or unaligned range, an aliasing resource, no validation pass on
+this device — resolves the triplet on the host and dispatches directly, as the executor used to.
+
+Two limits to keep in mind. Persistent buffers exist only from 1 MiB up, so a small producer buffer
+always takes the host route. And the pin scans `buffer_cache` linearly per indirect dispatch; fine at
+the cache's size, not something to call per draw. The post-fence read of the scratch record's flag
+feeds the log and `indirect_dispatch_backend_stats()` only — it is never an input to the dispatch.
+`PROSPER_NO_GPU_INDIRECT_DISPATCH=1` (executor) keeps every dispatch on the host route.
+
 ## Native BCn textures
 
 A plain 2D sampled BC texture reaches Vulkan as its detiled 4x4 blocks (`VK_FORMAT_BC*`) when the

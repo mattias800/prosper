@@ -35,6 +35,21 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   reject-reason records are replayed on every hit, so adding a fact whose derivation has another
   side effect means capturing and replaying that too. `PROSPER_NO_COMPUTE_PROGRAM_FACTS_CACHE=1`
   restores per-dispatch derivation for A/B.
+- **Device-resolved indirect dispatch (#3656)** — an eligible group-count-mode indirect dispatch is
+  realized with an UNKNOWN launch (`resolve_compute_launch` returns zero groups/threads for an
+  `indirect` dispatch) and reaches the backend as `ComputeItem::indirect_args_addr`; the backend, not
+  the executor, reads the 12 bytes. Three things are easy to get wrong. (1) **Zero means unknown,
+  never a dummy count**: every proof that consumes a thread extent refuses zero, and
+  `gpu_indirect_dispatch_launch_free` is the executor-side list of everything that must be refused —
+  a new launch-dependent token on `ComputeItem` belongs in it, and `test_indirect_dispatch_device_route`
+  has one hand-built refusal arm per entry. (2) **Refusal falls back, it does not fail**: thread-
+  dimension mode, an unaligned/unreadable range, capture armed, `PROSPER_MAX_DISPATCH_GROUPS`, a
+  backend that did not call `set_submit_compute_indirect_dispatch(true)`, an aliasing resource, or a
+  launch-dependent realization all take the unchanged ordered CPU copy. `PROSPER_NO_GPU_INDIRECT_DISPATCH`
+  forces that for an A/B. (3) **The retained buffer is only authoritative inside an ordered submit**:
+  the backend proves it from the in-submit write journal (`guest_gpu_writes_since`), which answers
+  Unknown outside `execute_ordered_items`, so a test must run producer and consumer in one ordered
+  submit. `indirect_dispatch_stats()` counts the two routes without a log.
 - `gpu_dependency_graph` — ordering and dependencies between submitted work.
 - `host_read_barrier` — the availability half of a GPU→CPU readback: the `HOST_READ`/`HOST_BIT`
   dependency that a fence wait does **not** perform (#2944/#3249). Header-only and deliberately
