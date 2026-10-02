@@ -20,6 +20,7 @@
 // What NONE of this checks is a live guest calling printf on a Windows host. Nothing here pretends to.
 #include "host/abi/guest_varargs.hpp"
 #include "host/abi/sysv_ms_bridge.hpp"
+#include "guest_varargs_fixture.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 
@@ -57,7 +58,7 @@ using namespace prosper::abi;
 #endif
 #endif
 
-namespace {
+namespace prosper_varargs_fixture {
 // PROSPER_GUEST_ABI's whole value is that it is part of the FUNCTION TYPE: that is what makes
 // `Hle::register_guest_abi` reject an untagged handler at compile time on Windows, and what makes
 // the tag a no-op everywhere else. Both halves are checked by the compiler, here, rather than
@@ -666,9 +667,10 @@ void check_executed() {
 }
 #endif  // PROSPER_TEST_X86_64
 
-} // namespace
+} // namespace prosper_varargs_fixture
 
 int main() {
+    using namespace prosper_varargs_fixture;
     check_plans();
     check_stub_and_registry();
     check_lookup_accessors();
