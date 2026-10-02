@@ -1214,13 +1214,15 @@ LONG WINAPI report_unhandled_fault(EXCEPTION_POINTERS* ep) {
                                            : EXCEPTION_CONTINUE_SEARCH;
     // One reporter. A second thread faulting meanwhile parks, so the OS cannot end the process with
     // that thread's status before the first report and _Exit(3); a fault inside the reporter itself
-    // falls through to the default handling.
+    // falls through to the default handling. The park is BOUNDED: the parked thread may hold the
+    // stdio or heap lock the reporter needs, and an unbounded wait would hang the process forever.
     static std::atomic<DWORD> reporter{0};
     DWORD expected = 0;
     const DWORD self = GetCurrentThreadId();
     if (!reporter.compare_exchange_strong(expected, self)) {
         if (expected == self) return EXCEPTION_CONTINUE_SEARCH;
-        Sleep(INFINITE);
+        Sleep(10000);
+        std::_Exit(prosper::app::kExitGuestFault);
     }
     const CONTEXT* c = ep->ContextRecord;
     const uint64_t rip = c->Rip;
