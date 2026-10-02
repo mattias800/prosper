@@ -26,6 +26,7 @@
 #include "diagnostics/perf/perf_ledger.hpp"         // #3891: always-on alarm ledger
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
+#include "gpu/recompiler/raster_quad_collector.hpp"
 #include "diagnostics/exit_census.hpp"       // one-line end-of-run reports
 #include "diagnostics/persistent_target_census.hpp"  // is the colour-target cache at its bound?
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
@@ -698,6 +699,8 @@ inline BackendColorTargetStats backend_color_target_stats() {
 // order, normally in one render pass; an attached-depth write/sample transition is the narrow case
 // that requires an ordered pass boundary. render_triangle_rgba is a thin single-draw wrapper (below).
 struct BackendDraw {
+    std::shared_ptr<prosper::gpu::RasterQuadCollection> raster_quads;
+    bool raster_quad_contract_modified = false;
     std::vector<uint32_t> vs, gs, fs;
     // For a mesh draw, `vs` carries a MeshEXT module instead of a vertex module. The group counts
     // are draw-time state, not pipeline identity. The backend refuses this path unless the optional
@@ -2006,14 +2009,20 @@ inline const RenderVkCtx& render_vk_ctx() {
         }
 
         {
+            // Core quad/subgroup support is independent of optional exact-size control. The real
+            // quad collector needs QuadBroadcast, not a request for subgroupSize=64.
+            VkPhysicalDeviceProperties2 core{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            core.pNext = &subgroup_core_properties;
+            vkGetPhysicalDeviceProperties2(r.phys, &core);
+            r.subgroup_stages = subgroup_core_properties.supportedStages;
+            r.subgroup_operations = subgroup_core_properties.supportedOperations;
             VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
             f2.pNext = &subgroup_features;
             vkGetPhysicalDeviceFeatures2(r.phys, &f2);
             if (subgroup_features.subgroupSizeControl) {
                 VkPhysicalDeviceProperties2 p2{
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-                p2.pNext = &subgroup_core_properties;
-                subgroup_core_properties.pNext = &subgroup_properties;
+                p2.pNext = &subgroup_properties;
                 vkGetPhysicalDeviceProperties2(r.phys, &p2);
                 subgroup_features.pNext = const_cast<void*>(dci.pNext);
                 dci.pNext = &subgroup_features;
@@ -2025,8 +2034,6 @@ inline const RenderVkCtx& render_vk_ctx() {
                     subgroup_properties.maxComputeWorkgroupSubgroups;
                 r.required_subgroup_size_stages =
                     subgroup_properties.requiredSubgroupSizeStages;
-                r.subgroup_stages = subgroup_core_properties.supportedStages;
-                r.subgroup_operations = subgroup_core_properties.supportedOperations;
             }
         }
 
@@ -8607,6 +8614,10 @@ inline uint64_t backend_pass_source_submit(std::span<const BackendDraw> draws) {
     return source;
 }
 
+// Shared live/test renderer owner; it deliberately uses the same device, buffer pool and ordered
+// completion machinery, not a second standalone Vulkan harness.
+#include "fixtures/raster_quad_collection_gpu.h"
+
 inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> draws,
                                                   uint32_t W, uint32_t H,
                                                   const uint8_t* seed_rgba = nullptr,
@@ -11124,6 +11135,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 }
             }
         }
+        if (fragment_subgroup_skip && required_fragment_subgroup_size == 64 && bd.raster_quads)
+            collect_backend_raster_quads(ctx, bd, W, H, active_submission);
         if (fragment_subgroup_skip &&
             (bd.allow_native_fragment_vote_width || bd.allow_partial_wave_fragment) &&
             (ctx.subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
