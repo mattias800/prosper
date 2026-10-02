@@ -195,6 +195,8 @@ inline std::vector<Case> cases() {
     Case c{128, 64, 128, 4, 0, 4};
     c.loop = shape == 0;
     c.second = shape == 1;
+    if (c.second)
+      c.mask = 1; // the second gather must consume live nonzero first-site data
     c.phased = shape == 2;
     c.in_place = shape == 3;
     v.push_back(c);
