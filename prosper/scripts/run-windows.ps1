@@ -123,12 +123,14 @@ if (-not $NoBuild) {
             Write-Host "Using compiler cache: $launcher"
             $configure += "-DCMAKE_C_COMPILER_LAUNCHER=$launcher"
             $configure += "-DCMAKE_CXX_COMPILER_LAUNCHER=$launcher"
-            # The fetched SDL3 builds with a CMake precompiled header, which ccache refuses to
-            # cache (217 of 221 misses on every rebuild) unless told these are safe. Process-scoped.
-            if ($launcher -eq 'ccache' -and -not $env:CCACHE_SLOPPINESS) {
-                $env:CCACHE_SLOPPINESS = 'pch_defines,time_macros'
-            }
         }
+    }
+    # The fetched SDL3 builds with a CMake precompiled header, which ccache refuses to cache
+    # (217 of 221 misses on every rebuild) unless told these are safe. Set on every run, not only
+    # the first configure: the launcher stays in the build dir's cache and the build step needs it.
+    # Process-scoped, and a value the user already set wins.
+    if ((Find-CompilerCache) -eq 'ccache' -and -not $env:CCACHE_SLOPPINESS) {
+        $env:CCACHE_SLOPPINESS = 'pch_defines,time_macros'
     }
     Invoke-Checked $cmake $configure
     if (-not (Test-VulkanConfigured $cache)) {
