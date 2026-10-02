@@ -1,0 +1,69 @@
+# Fragment compile replay
+
+Record once with `PROSPER_FRAGMENT_COMPILE_CASE_DIR=<PRIVATE_CASE_DIR>` before the shader's producing
+compile. Each `.prfc` is one bounded, versioned compiler attempt, including full immutable code
+(also trailing retained data), full resource/interface metadata, selected width/PC-relative target,
+pinned trip settings, actual consumed semantic choices, immutable linked compiler identity, and
+expected complete SOURCE or refusal. It is not a frame capture.
+The actual producing key's complete guest FLOAT_MODE byte and availability are retained separately
+from wave width and host float-control publication. Unknown stays unknown; replay never infers it.
+
+```text
+fragment_compile_replay --inspect-only <CASE.prfc>
+fragment_compile_replay --baseline <CASE.prfc> --output <BASELINE.spv>
+fragment_compile_replay --candidate <CASE.prfc> --output <CANDIDATE.spv>
+spirv-val --target-env vulkan1.1 <CANDIDATE.spv>
+```
+
+Baseline requires the same linked source/configuration identity and compares every output word,
+or reproduces the recorded refusal diagnostic. Candidate uses the captured inputs and semantic
+read transcript with the new compiler; a new uncaptured read refuses rather than using today's
+environment. Exit 3 means a complete candidate still refused; no empty SPIR-V file is installed.
+Exit 2 means invalid/incomplete input or replay divergence. `--compiler-identity` reports the
+immutable identity built into this tool, not a digest of files changed after it was linked.
+
+Producing cases are retained in shader-cache entries and included in the existing byte budget.
+Warm exports use only that retained context. Entries compiled before recording was armed write
+explicit `INCOMPLETE producing-context-not-retained` records; they never claim current environment
+or resource metadata as old producer inputs. The record distinguishes lookup and producing addresses;
+compact filenames retain the lookup address and only a content-hash hint.
+Both byte-exact case identity and destination participate in bounded deduplication.
+
+Ordinary image/DCC pixel content is not a compiler input and is not captured. Its pointer presence,
+allocation membership, exact pointer aliases and range metadata remain typed opaque facts, not dummy readable
+pointers. Any byte request without an owned validated span fails. Special live-revalidated carriers
+are explicitly incomplete in schema 1. No logical guest address is dereferenced during replay.
+Codec validation and independent producing baseline must pass before a record is complete. An
+actually refused compiler attempt can have complete inputs, even with no semantic reads.
+
+Unowned ordinary buffer backing is also opaque when the invocation needs metadata only. Owned
+buffer allocations are retained within the aggregate budget; any actual byte consumer of opaque
+backing refuses. This is not permission to reinterpret a guest address or invent readable storage.
+
+The linked identity covers dirty/untracked project sources, actual GCC/Clang dependency headers,
+compiler/front-end bytes and resolved compile commands/configuration. Unsupported dependency
+syntax or unavailable compile commands produce an unknown identity, not a complete case. This is
+a compiler-input fingerprint, not a claim to fingerprint every external runtime library.
+The opt-in native-Clang Windows profile also requires the actual secondary GNU production argv
+manifest, its compiler/front-end bytes and transitive headers. Its build-local manifest is never
+exported; missing/malformed producer context makes the linked identity unknown. Test-only producer
+commands are not claimed as production compiler inputs.
+
+Before candidate replay, a separately embedded reader-policy verdict must be verified. If it reports
+`reader-policy-source-mismatch`, audit every changed compiler/resource read seam, route new byte
+reads through `compiler_resource_data` and actual semantic choices through `compiler_choice`, then
+update `reader_policy.json` from the reviewed inventory in the same PR. Rebuild before replay.
+Changing the compiler identity alone never authorizes new readers. Fault controls that intentionally
+leave this policy stale test the guard; semantic outcome/full-word controls must deliberately update
+the reviewed policy so the changed compiler actually runs.
+The inventory conservatively guards `prosper/src` files matching `*.cpp`, `*.hpp`, `*.h`, and `*.inc`:
+an existing helper can add a reader
+without changing its caller. Unrelated source edits may therefore require a reviewed refresh too.
+The verifier lists changed/missing/added repository-relative paths, bounded to 32. A stale policy
+declines offline entry and completeness; it is separate from the wider transitive dependency/source
+identity fingerprint and does not authorize readers in tools, frontends, third-party or external code.
+It is not a claim that the normal compiler refused, nor
+that every listed source is semantically consumed by one attempt.
+
+These files contain private shader bytes. Do not commit or publish them. SOURCE reproduction does
+not establish buffer immutability, Wave64 admission, draw execution, or pixel correctness.

@@ -6,6 +6,9 @@ into a `.prgbundle` / `.prgcap` that `tools/gpu_replay` can reproduce offline an
 - `fold_capture` — a separate opt-in `.prfold` transcript at the resource-fold evaluator boundary;
   code/register ownership, ordered probes and consumed words, and strict offline replay. It does
   not reuse the frame materializer. See `tools/fold_replay/README.md` for its intrusive capture mode.
+- `fragment_compile_case` — opt-in owned inputs for one fragment compiler attempt and CPU-only
+  SOURCE/refusal reproduction. Its `.prfc` schema, semantic read transcript and compiler identity
+  are independent of frame/resource execution capture; they confer no draw or Wave64 authority.
 - `gpu_capture` — the capture lifecycle: begin, finish, materialize, and the pending-capture
   plumbing behind the F9 grab and the scheduled triggers.
 - `capture_collect` — gathering a frame's contents: intervals, tables, submit items, raw shader

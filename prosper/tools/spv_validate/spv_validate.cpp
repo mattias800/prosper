@@ -20,6 +20,8 @@
 // declared emitter this run did not actually emit a validated module from, and an absent spirv-val
 // is a hard failure rather than a pass.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/capture/fragment_compile_case.hpp"
+#include "build_revision.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "../../tests/fixtures/spirv_wave_width_fixtures.hpp"
@@ -1191,6 +1193,30 @@ int main(int argc, char** argv) {
            recompile_interpolation_geometry(layout, /*capture_position=*/false,
                                             /*synthesize_rect=*/true),
            "recompile_interpolation_geometry"); }
+
+    // The owned compiler-case adapter is itself a SPIR-V-producing entry point. Exercise its
+    // actual input rehydration and full-word baseline, not merely the underlying compiler.
+    for (bool wave32 : {false, true}) {
+      FragmentCompileCase c;
+      c.compiler = std::string(prosper::embedded_build_revision()) + ":" +
+                   prosper::embedded_build_source_identity();
+      c.code = {0x7e000280u,0x7e0202f2u,0x7e040280u,0x7e0602f2u,
+                0xf800180fu,0x03020100u,0xbf810000u};
+      c.wave32 = wave32;
+      c.interpolation = fragment_interpolation_layout(c.code.data(), c.code.size());
+      std::vector<uint32_t> source;
+      { CompilerChoiceScope reads(c.choices);
+        source = recompile_fragment(c.code.data(), c.code.size(), nullptr, nullptr,
+                                    UINT32_MAX, &c.interpolation, wave32); }
+      finish_fragment_compile_case(c, std::move(source));
+      try {
+        dump(dir, wave32 ? "fragment_compile_case_wave32" : "fragment_compile_case_wave64",
+             replay_fragment_compile_case(c, true), "replay_fragment_compile_case");
+      } catch (const std::exception& error) {
+        printf("  [FAIL] compiler-case baseline: %s\n", error.what());
+        ++fails;
+      }
+    }
 
     fails += check_emitter_coverage(src_root);
 

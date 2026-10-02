@@ -1,4 +1,5 @@
 #include "gpu/resources/mip_chain_plan.hpp"
+#include "gpu/recompiler/compiler_resource_access.hpp"
 
 #include "gpu/texture/tile.hpp"
 
@@ -193,7 +194,7 @@ MipChainPlan mip_chain_plan_impl(const ShaderResource& resource, uint32_t block_
 
 bool shader_resource_host_data_covers_mip_chain(const ShaderResource& resource,
                                                 const MipChainPlan& plan) {
-    if (!resource.host_data || !plan.valid || plan.levels.empty()) return false;
+    if (!compiler_resource_has_host_data(resource) || !plan.valid || plan.levels.empty()) return false;
     const uint64_t prefix = plan.levels[0].byte_offset;
     // The selected level is the allocation's LAST stored level, so this cannot underflow for any
     // plan this function accepts -- but the plan is an input, so prove it rather than assume it.
@@ -221,7 +222,7 @@ uint32_t shader_resource_compute_mip_chain_levels(const ShaderResource& resource
     // synthetic fixture, a compute-internal snapshot and a `gpu_replay --override-resource`
     // replacement do not, and they must keep declining -- the levels they do not own are not the
     // guest's bytes, and synthesizing them is the failure mode this whole path exists to avoid.
-    if (resource.host_data && !shader_resource_host_data_covers_mip_chain(resource, plan))
+    if (compiler_resource_has_host_data(resource) && !shader_resource_host_data_covers_mip_chain(resource, plan))
         return 1u;
     return plan.level_count;
 }

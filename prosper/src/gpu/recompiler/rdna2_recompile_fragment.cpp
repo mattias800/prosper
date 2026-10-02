@@ -497,11 +497,14 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // VGPR produced at that PC so the rendered frame visualises the value. The `draw:` prefix is consumed by
     // gpu_replay (which re-recompiles only that draw's FS). Parse the same complete selector here so an
     // invalid or overflowing PC cannot silently become PC zero or truncate to 32 bits.
-    if (const char* tap = getenv("PROSPER_FS_TAP")) {
+    b.tap_pc = static_cast<uint32_t>(compiler_choice(CompilerChoice::FragmentTapPc, [] {
+      if (const char* tap = getenv("PROSPER_FS_TAP")) {
         uint64_t draw = 0;
         uint32_t pc = 0;
-        if (parse_fragment_tap_selector(tap, draw, pc)) b.tap_pc = pc;
-    }
+        if (parse_fragment_tap_selector(tap, draw, pc)) return pc;
+      }
+      return UINT32_MAX;
+    }));
     b.declare_guest_scratch(scratch);
     b.fragment_interpolation = &derived_interpolation;
     // P0-only attributes retain the cheap Flat varying path. Mixed smooth/explicit-parameter reads

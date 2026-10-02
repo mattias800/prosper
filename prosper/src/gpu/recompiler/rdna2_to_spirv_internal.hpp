@@ -1,4 +1,6 @@
 #pragma once
+#include "gpu/recompiler/compiler_choices.hpp"
+#include "gpu/recompiler/compiler_resource_access.hpp"
 
 // Lifted out of rdna2_to_spirv.cpp's anonymous namespaces so the emit functions that
 // operate on them can live in their own translation units. These are INTERNAL to the
@@ -1166,6 +1168,7 @@ struct SpirvCompute {
         }
     }
     static int forced_array_layer() {
+        return static_cast<int>(compiler_choice(CompilerChoice::ForcedArrayLayer, [] {
         static const int v = [] {
             const char* e = getenv("PROSPER_FORCE_LAYER");
             if (!e || !*e) return -1;
@@ -1175,6 +1178,7 @@ struct SpirvCompute {
             return (int)n;
         }();
         return v;
+        }));
     }
     void image_sample_2d_array(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
                                uint32_t layer_bits, uint32_t out[4]);
