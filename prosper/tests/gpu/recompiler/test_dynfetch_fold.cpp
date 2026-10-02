@@ -808,6 +808,26 @@ int main() {
     const auto prior_sample_uses = split_uses(split_prior_sample, std::size(split_prior_sample));
     CHECK(find_split(prior_sample_uses, 6u) != prior_sample_uses.end(),
           "a read-only MIMG sample before the consumer preserves a split T#'s proof");
+    // A plain buffer load before the consumer only reads, so it cannot rewrite the descriptor's
+    // backing; a buffer store can, and revokes the proof.
+    const uint32_t split_prior_bufload[] = {
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        0xE030102Cu, 0x80030607u, // buffer_load_dword (MUBUF op 0xc)
+        0xF0200108u, 0x00020009u, // image_store through s[8:15] at pc 6
+        0xBF810000u,
+    };
+    const auto prior_bufload_uses = split_uses(split_prior_bufload, std::size(split_prior_bufload));
+    CHECK(find_split(prior_bufload_uses, 6u) != prior_bufload_uses.end(),
+          "a plain buffer load before the consumer preserves a split T#'s proof");
+    const uint32_t split_prior_bufstore[] = {
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        0xE0782000u, 0x80020008u, // buffer_store (MUBUF op 0x1e): may alias the backing
+        0xF0200108u, 0x00020009u, // image_store through s[8:15] at pc 6
+        0xBF810000u,
+    };
+    const auto prior_bufstore_uses = split_uses(split_prior_bufstore, std::size(split_prior_bufstore));
+    CHECK(find_split(prior_bufstore_uses, 6u) == prior_bufstore_uses.end(),
+          "a buffer store before the consumer still revokes a split T#'s proof");
     const uint32_t split_prior_imgstore[] = {
         split_t8[0], split_t8[1], split_t8[2], split_t8[3],
         0xF0200108u, 0x00020009u, // image_store at pc 4: may alias the descriptor backing
