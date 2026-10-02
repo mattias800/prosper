@@ -10,8 +10,10 @@ foreach(_tool IN ITEMS clang clang++)
     message(FATAL_ERROR "PROSPER_NATIVE_CLANG_ROOT must contain bin/${_tool}.exe")
   endif()
 endforeach()
-if(NOT EXISTS "${PROSPER_NATIVE_MINGW_ROOT}/include/windows.h" OR
-   NOT EXISTS "${PROSPER_NATIVE_MINGW_ROOT}/lib/libwinpthread.a")
+if((NOT EXISTS "${PROSPER_NATIVE_MINGW_ROOT}/include/windows.h" AND
+    NOT EXISTS "${PROSPER_NATIVE_MINGW_ROOT}/x86_64-w64-mingw32/include/windows.h") OR
+   (NOT EXISTS "${PROSPER_NATIVE_MINGW_ROOT}/lib/libwinpthread.a" AND
+    NOT EXISTS "${PROSPER_NATIVE_MINGW_ROOT}/x86_64-w64-mingw32/lib/libwinpthread.a"))
   message(FATAL_ERROR "PROSPER_NATIVE_MINGW_ROOT must contain MinGW headers and libwinpthread.a")
 endif()
 list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES
