@@ -797,7 +797,7 @@ endfunction()
 if(TARGET prosper_core)
   prosper_add_gtest(test_fragment_entry_prefix
     SOURCES tests/gpu/execute/test_fragment_entry_prefix.cpp
-    LIBRARIES prosper_core)
+    INCLUDES tests LIBRARIES prosper_core)
 
   # nid_census: every guest import that falls to the dispatcher's return-0 default (#2081).
   # Links prosper_core because both of its inputs must be the real ones — `Module::load` for the
