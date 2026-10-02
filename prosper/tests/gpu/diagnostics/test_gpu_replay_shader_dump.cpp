@@ -469,17 +469,48 @@ int main(int argc, char** argv) {
         CHECK(gpu::write_gpu_capture((directory / "fragment-wave32.prgcap").string(),
                                      fragment_fixture, error),
               "CLI fixture writes the exact captured failed-fragment ABI");
+        auto legacy_fragment_fixture = fragment_fixture;
+        // These newer producing facts must disappear at the legacy boundary, independently
+        // of the still-retained raw ISA words. Do not infer unknown policy from this raw word.
+        legacy_fragment_fixture.failure_diagnostics[0].ps_float_flags = {true, true, false};
+        legacy_fragment_fixture.failure_diagnostics[0].ps_launch_rsrc1 = {true, 0x20800000u};
         std::vector<uint8_t> legacy_fragment_bytes;
-        constexpr size_t legacy_fragment_tail_bytes = 18u + 4u + 10u + 4u + 4u + 10u;
-        CHECK(gpu::serialize_gpu_capture(fragment_fixture, legacy_fragment_bytes, error) &&
-              legacy_fragment_bytes.size() > 12u + legacy_fragment_tail_bytes &&
-              legacy_fragment_bytes[8] == 66u,
-              "CLI fixture serializes a current fragment retry for a legacy downgrade");
-        if (legacy_fragment_bytes.size() > 12u + legacy_fragment_tail_bytes &&
-            legacy_fragment_bytes[8] == 66u) {
-            // No realized draws/resources and one failure/stage: remove v66 transport,
-            // v65 owned count, v64 mode
-            // counts/unknown pair, v63/v62 zero counts and v61 retry tail for a v60 prefix.
+        constexpr uint8_t legacy_fragment_tail[] = {
+            // v61: one available fragment retry, system inputs and Wave32.
+            1u, 3u, 1u, 0u, 0u, 0u, 3u, 0u, 0u, 0u,
+            // v62/v63: no resources or realized draws.
+            0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
+            // v64: no draws; one failure with unknown FLOAT_MODE.
+            0u, 0u, 0u, 0u, 1u, 0u, 0u, 0u, 0u, 0u,
+            // v65: no owned resource obligations.
+            0u, 0u, 0u, 0u,
+            // v66: no draws/computes; one unknown failure profile and one unknown stage.
+            0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 1u, 0u, 0u, 0u,
+            0u, 1u, 0u, 0u, 0u, 0u,
+            // v67: no draws; one IEEE-on/DX10-off failure and known full RSRC1_PS evidence.
+            0u, 0u, 0u, 0u, 1u, 0u, 0u, 0u, 1u, 1u, 0u, 1u,
+            0u, 0u, 0x80u, 0x20u,
+        };
+        constexpr size_t legacy_fragment_tail_bytes = sizeof(legacy_fragment_tail);
+        static_assert(legacy_fragment_tail_bytes == 66u);
+        const bool exact_legacy_fragment_tail =
+            gpu::serialize_gpu_capture(legacy_fragment_fixture, legacy_fragment_bytes, error) &&
+            legacy_fragment_bytes.size() > 12u + legacy_fragment_tail_bytes &&
+            legacy_fragment_bytes[8] == 67u && legacy_fragment_bytes[9] == 0u &&
+            legacy_fragment_bytes[10] == 0u && legacy_fragment_bytes[11] == 0u &&
+            std::equal(std::begin(legacy_fragment_tail), std::end(legacy_fragment_tail),
+                       legacy_fragment_bytes.end() - legacy_fragment_tail_bytes);
+        CHECK(exact_legacy_fragment_tail,
+              "CLI fixture pins the exact current v61-v67 suffix before a legacy downgrade");
+        if (exact_legacy_fragment_tail) {
+            auto relabeled_fragment_bytes = legacy_fragment_bytes;
+            relabeled_fragment_bytes[8] = 60u;
+            gpu::GpuCaptureFile relabeled_fragment_capture;
+            CHECK(!gpu::deserialize_gpu_capture(relabeled_fragment_bytes,
+                                               relabeled_fragment_capture, error) &&
+                  error == "capture has trailing data",
+                  "CLI fixture rejects a version-only relabel instead of a genuine v60 prefix");
+            // Remove the independently pinned v61-v67 fields, retaining all v60 retry state.
             legacy_fragment_bytes.resize(legacy_fragment_bytes.size() - legacy_fragment_tail_bytes);
             legacy_fragment_bytes[8] = 60u;
             gpu::GpuCaptureFile legacy_fragment_capture;
@@ -493,8 +524,13 @@ int main(int argc, char** argv) {
                   legacy_fragment_capture.raw_shader_versions.size() == 1u &&
                   legacy_fragment_capture.raw_shader_versions[0].words == fragment_raw.words &&
                   !legacy_fragment_capture.failure_diagnostics[0].ps_float_mode.available &&
-                  legacy_fragment_capture.failure_diagnostics[0].ps_float_mode.value == 0u,
-                  "CLI fixture proves genuine v60 decode with unknown fragment ABI and FLOAT_MODE");
+                  legacy_fragment_capture.failure_diagnostics[0].ps_float_mode.value == 0u &&
+                  !legacy_fragment_capture.failure_diagnostics[0].ps_float_flags.available &&
+                  !legacy_fragment_capture.failure_diagnostics[0].ps_float_flags.ieee_mode &&
+                  !legacy_fragment_capture.failure_diagnostics[0].ps_float_flags.dx10_clamp &&
+                  !legacy_fragment_capture.failure_diagnostics[0].ps_launch_rsrc1.available &&
+                  legacy_fragment_capture.failure_diagnostics[0].ps_launch_rsrc1.value == 0u,
+                  "CLI fixture proves genuine v60 decode with unknown fragment ABI/MODE/flags/RSRC1");
             FILE* legacy_fragment = std::fopen(
                 (directory / "fragment-v60.prgcap").string().c_str(), "wb");
             bool legacy_written = legacy_fragment && std::fwrite(

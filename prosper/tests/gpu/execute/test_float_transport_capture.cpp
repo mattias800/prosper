@@ -203,7 +203,7 @@ int main(int argc, char** argv) {
     }
     std::vector<uint8_t> bytes;
     const bool roundtrip=serialize_gpu_capture(capture,bytes,error) && deserialize_gpu_capture(bytes,loaded,error);
-    CHECK(roundtrip && loaded.format_version==66,"current codec accepts exact bounded producing profile tails");
+    CHECK(roundtrip && loaded.format_version==67,"current codec accepts exact bounded producing profile tails");
     if (!roundtrip) { std::printf("codec error: %s\n",error.c_str()); return 1; }
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded,replay,error) && replay.items.size()==draws.size(),
@@ -233,11 +233,16 @@ int main(int argc, char** argv) {
         append32(tail,static_cast<uint32_t>(item.stages.size()));
         for (const auto& stage:item.stages) tail.push_back(static_cast<uint8_t>(stage.recompile_config.float_transport.profile));
     }
-    CHECK(bytes.size()>tail.size() && std::equal(tail.rbegin(),tail.rend(),bytes.rbegin()),
+    auto v66_bytes = bytes;
+    v66_bytes.resize(v66_bytes.size() - 8u - 8u*(capture.draws.size()+capture.failure_diagnostics.size()));
+    set32(v66_bytes,8,66);
+    CHECK(deserialize_gpu_capture(v66_bytes,loaded,error) && loaded.format_version==66,
+          "genuine v66 profile prefix survives without fabricated launch flags");
+    CHECK(v66_bytes.size()>tail.size() && std::equal(tail.rbegin(),tail.rend(),v66_bytes.rbegin()),
           "canonical tail is exact, not a version-only relabel");
     if (bytes.size()<=tail.size()) return 1;
-    const size_t start=bytes.size()-tail.size();
-    auto legacy=bytes; legacy.resize(start); set32(legacy,8,65);
+    const size_t start=v66_bytes.size()-tail.size();
+    auto legacy=v66_bytes; legacy.resize(start); set32(legacy,8,65);
     CHECK(deserialize_gpu_capture(legacy,loaded,error) && loaded.format_version==65,
           "genuine v65 prefix retains owned markers without fabricated profile authority");
     for (const auto& item:loaded.draws) CHECK(item.float_transport==unknown,"old explicit source markers do not infer producing profile");
@@ -264,7 +269,7 @@ int main(int argc, char** argv) {
     }
     corrupt=bytes; corrupt.push_back(0);
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="capture has trailing data","strict EOF after new tail");
-    corrupt=bytes; set32(corrupt,8,65);
+    corrupt=bytes; set32(corrupt,8,66);
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="capture has trailing data","version-only downgrade is not legacy");
     auto bad=capture; bad.draws[0].float_transport.profile=static_cast<FloatTransportProfile>(3);
     CHECK(!serialize_gpu_capture(bad,bytes,error) && !materialize_gpu_replay(bad,replay,error),
@@ -301,6 +306,8 @@ int main(int argc, char** argv) {
             failed.reason=RealizationFailureReason::ShaderRecompile; failed.vertex_retry_config_available=true;
             failed.fragment_retry_config_available=true; failed.ps_float_mode=item.ps_float_mode;
             failed.float_transport=item.float_transport;
+            failed.ps_float_flags=item.ps_float_flags;
+            failed.ps_launch_rsrc1=item.ps_launch_rsrc1;
             GpuCapturedStageDiagnostic stage; stage.stage=ShaderProgramStage::Fragment;
             stage.program_addr=reinterpret_cast<uint64_t>(fragment);
             stage.raw_shader_index=single.draws[0].fs_raw_shader_index;
