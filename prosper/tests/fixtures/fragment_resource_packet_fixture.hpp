@@ -1,5 +1,5 @@
 #pragma once
-#include "fixtures/fragment_packet_fixture.hpp"
+#include "fragment_packet_fixture.hpp"
 #include "gpu/recompiler/fragment_resource_packet.hpp"
 #include <bit>
 
