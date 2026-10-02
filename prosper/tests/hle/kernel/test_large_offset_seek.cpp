@@ -11,11 +11,13 @@
 //   M2  f_fseek goes back to fseek((long)offset)              -> §2 fseek arm
 //   M3  f_ftell goes back to ftell()                          -> §2 ftell arm
 //   M4  the failure logger does not restore the seek errno  -> failing-stderr arm
-// tmpfile owns unique, automatically deleted storage. On Windows explicitly mark it sparse before
+// The configured per-process scratch fixture is exclusively created and automatically cleaned.
+// On Windows explicitly mark it sparse before
 // SetEndOfFile; extending an ordinary NTFS file is not a sparse-allocation guarantee.
 // Unsupported sparse/sizing operations return CTest's explicit skip code, not success.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "../../fixtures/test_scratch.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -42,7 +44,24 @@ static int fails = 0;
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
 struct TempStream {
-    FILE* file = std::tmpfile();
+    FILE* file = nullptr;
+    TempStream() {
+        const std::string path = prosper_test::test_scratch_file("large-offset.bin");
+#ifdef _WIN32
+        const int fd = _open(path.c_str(), _O_RDWR | _O_CREAT | _O_EXCL | _O_BINARY,
+                             _S_IREAD | _S_IWRITE);
+        if (fd >= 0) {
+            file = _fdopen(fd, "w+b");
+            if (!file) _close(fd);
+        }
+#else
+        const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            file = fdopen(fd, "w+b");
+            if (!file) close(fd);
+        }
+#endif
+    }
     ~TempStream() { if (file) std::fclose(file); }
 };
 
