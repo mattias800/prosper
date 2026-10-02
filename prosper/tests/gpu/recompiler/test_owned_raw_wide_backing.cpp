@@ -294,7 +294,8 @@ int main(int argc, char** argv) {
             const auto recovered = recompile_graphics_shader_cached_shared(ShaderProgramStage::Fragment,
                 fragment_code.data(), fragment_code.size(), &table, nullptr, nullptr, &recovered_identity,
                 false, 0u, false, {}, mode);
-            check(!refused && refused_identity == 0u && recovered == module && recovered_identity == identity &&
+            check(refused && refused->empty() && refused_identity != identity &&
+                  recovered == module && recovered_identity == identity &&
                   recompile_fragment(fragment_code.data(), fragment_code.size(), &short_parent,
                       nullptr, UINT32_MAX, nullptr, false, {RecompileDiagnosticStage::Fragment, 0u}, mode).empty(),
                   "known or unknown mode cannot admit short owned PS backing after a warm valid entry");
