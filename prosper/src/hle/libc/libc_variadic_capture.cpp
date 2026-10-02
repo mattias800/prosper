@@ -1,41 +1,12 @@
-// hle_libc.cpp — HLE implementations of the common libc functions the guest imports.
-// The guest ABI == host SysV ABI, so most of these are thin thunks straight to the
-// host C library. Registered by NID so the loader binds imports directly to them.
-#include "hle/dispatch/dispatch.hpp"
-#include "hle/dispatch/nid.hpp"
-#include "host/abi/guest_varargs.hpp"   // #3246: the guest's variadic list, re-expressed for the host
+// Only the existing guest variadic capture frames. No TLS, statics, formatting or checkpoints.
 #include "hle/libc/libc_variadic_capture.hpp"
-#include "gpu/timeline/gpu_timeline.hpp"
 #include <cstring>
-#include <cstdlib>
-#include <cstdint>
 #include <cstdio>
 #include <cstdarg>
-#include <cmath>
-#include <cwchar>
-#include <cerrno>
-#include <cstddef>
-#if !defined(_WIN32)
-// malloc_usable_size / malloc_size: the only portable way to bound a copy out of a block whose
-// original request size the caller does not carry (reallocalign, #2185).
-#  if defined(__APPLE__)
-#    include <malloc/malloc.h>
-#    define PROSPER_USABLE_SIZE(p) malloc_size(p)
-#  else
-#    include <malloc.h>
-#    define PROSPER_USABLE_SIZE(p) malloc_usable_size(p)
-#  endif
-#endif
-#include <array>
-#include <limits>
-#include <atomic>
-#include <mutex>
-#include <condition_variable>
-#include <thread>
-#include <unordered_map>
-#include <vector>
-
 namespace prosper {
+#if defined(_WIN32)
+using abi::SysvVaList;
+#endif
 // The printf family: REAL C variadic functions, and PROSPER_GUEST_ABI so the import stub is the same
 // bare tail-jump on EVERY platform. That is what puts the guest's own System V frame — integer
 // registers, xmm registers, AL and the overflow area alike — in front of the compiler's variadic
