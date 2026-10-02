@@ -3228,9 +3228,6 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
             static_cast<int>((addr - first_addr) / sizeof(uint32_t));
         if (original_reg < 0 || original_reg >= 106)
             return false;
-        preserved.push_back(original_reg);
-        preserved.push_back(base_reg);
-        preserved.push_back(base_reg + 1);
         if (reaches_use(producer)) return false; // a path bypasses this load
         bool copied = original_reg == reg;
         for (size_t i = producer + 1; i < use; ++i) {
@@ -3256,9 +3253,13 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
     }
     // A loop that re-enters the consumer runs the same image instruction again, and the linear
     // fold published one binding for it. That binding stays valid only if nothing in the loop can
-    // change what the consumer reads: no write to a descriptor word, to a register one was copied
-    // from, or to the pointer it was loaded through, and no memory write that could alias the
-    // descriptor's backing (the same set the straight-line prefix is held to).
+    // change what the consumer reads: no write to a descriptor word and no memory write that could
+    // alias the descriptor's backing (the same set the straight-line prefix is held to).
+    //
+    // The registers a word was copied from, and the pointer it was loaded through, need no
+    // protection of their own. A loop that re-runs the load or a copy necessarily writes the
+    // descriptor words again (and is refused here), while a loop that runs neither cannot be
+    // affected by what later happens to the sources: a copy captures bits.
     for (const auto& loop : backedges) {
         for (size_t i = loop[0]; i <= loop[1]; ++i) {
             const auto& in = full[i];
