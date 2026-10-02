@@ -3086,6 +3086,15 @@ bool straight_line_null_chain_dominates(const std::vector<Rdna2Inst>& instructio
     return found_definition && found_use;
 }
 
+// MIMG opcodes that WRITE memory: image_store, image_store_pck and every integer image atomic. This
+// is the set the consumer classifier treats as storage-only (`is_storage_image` in the fold below,
+// opcodes verified with llvm-mc in #2275). Every other MIMG opcode -- loads, samples of every flavour,
+// gathers, size and LOD queries -- only reads, and cannot rewrite descriptor backing.
+static bool mimg_opcode_writes_memory(uint32_t opcode) {
+    return opcode == 0x08 || opcode == 0x09 || opcode == 0x0f ||
+           (opcode >= 0x11 && opcode <= 0x1a && opcode != 0x13);
+}
+
 // A split image descriptor needs a stronger proof than the scalar fold's linear walk. In
 // particular, a conditional branch can skip one of two adjacent loads while the walk still sees
 // both. This deliberately admits only direct, entry-rooted scalar loads; computed pointers and
@@ -3192,10 +3201,9 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         const auto& in = full[i];
         if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF ||
             in.fmt == Rdna2Format::FLAT ||
-            // IMAGE_LOAD and the supported IMAGE_SAMPLE opcode only read their source image.
-            // A prior store/atomic could rewrite these descriptor bytes through an alias.
-            (in.fmt == Rdna2Format::MIMG && in.opcode != 0x00u &&
-             in.opcode != 0x27u) ||
+            // Image loads, samples and gathers only read their source image. A prior store or
+            // atomic could rewrite these descriptor bytes through an alias.
+            (in.fmt == Rdna2Format::MIMG && mimg_opcode_writes_memory(in.opcode)) ||
             (in.fmt == Rdna2Format::SMEM && in.opcode >= 0x10u)) return false;
     }
     // Registers whose value the consumer's descriptor depends on: the T# words themselves, and (per
@@ -3268,7 +3276,7 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
             const auto& in = full[i];
             if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF ||
                 in.fmt == Rdna2Format::FLAT ||
-                (in.fmt == Rdna2Format::MIMG && in.opcode != 0x00u && in.opcode != 0x27u) ||
+                (in.fmt == Rdna2Format::MIMG && mimg_opcode_writes_memory(in.opcode)) ||
                 (in.fmt == Rdna2Format::SMEM && in.opcode >= 0x10u)) return false;
             for (const int reg : preserved)
                 if (may_write(in, reg)) return false;
