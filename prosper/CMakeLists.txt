@@ -3704,6 +3704,8 @@ endif()
                    COMMAND test_runtime_prx_load --append-${failure}-failure)
           set_tests_properties(runtime_prx_append_${failure}_failure PROPERTIES TIMEOUT 20)
         endforeach()
+        add_test(NAME runtime_prx_missing_data_base COMMAND test_runtime_prx_load --missing-data-base)
+        set_tests_properties(runtime_prx_missing_data_base PROPERTIES TIMEOUT 20)
       endif()
     endif()
 
