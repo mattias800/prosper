@@ -4,6 +4,7 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "host/abi/guest_varargs.hpp"   // #3246: the guest's variadic list, re-expressed for the host
+#include "hle/libc/libc_variadic_capture.hpp"
 #include "gpu/timeline/gpu_timeline.hpp"
 #include <cstring>
 #include <cstdlib>
@@ -477,7 +478,9 @@ HLE(h_wcslen)   { return (uint64_t)wcslen((const wchar_t*)P(a0)); }   // host wc
 // argument's class from the format string, and write the flat slot array that IS a Microsoft
 // `va_list`. host/abi/guest_varargs.cpp owns that; this is the wiring.
 namespace {
+#if defined(_WIN32)
 int capture_aware_vprintf(const char* format, va_list args);   // defined below, with the log capture
+#endif
 
 #if defined(_WIN32)
 using prosper::abi::FormatGrammar;
@@ -493,13 +496,12 @@ void warn_unmodelled_format(const char* fmt, const char* why) {
                     "only: \"%s\"\n", why ? why : "?", fmt ? fmt : "(null)");
 }
 
-enum class WinVariadicSink { Printf, Sprintf, Snprintf, Sscanf };
-
 // Everything the PROSPER_GUEST_ABI shims must not do in their own frames. `noinline` and `noexcept`
 // are load-bearing rather than decorative: a guest-ABI frame cannot carry SEH unwind data, so an
 // inlined callee owning a destructor — or a call that may throw — makes the function fail to
 // assemble (`.seh_handlerdata used outside of .seh_proc block`). See PROSPER_GUEST_ABI in
 // dispatch.hpp. Keeping every C++ object on this side of the call is the whole discipline.
+} // namespace
 __attribute__((noinline))
 uint64_t win_variadic_call(WinVariadicSink sink, void* buf, size_t n, const char* src,
                            const char* fmt, const SysvVaList& ap, bool run_checkpoint) noexcept {
@@ -520,6 +522,7 @@ uint64_t win_variadic_call(WinVariadicSink sink, void* buf, size_t n, const char
     if (run_checkpoint) dispatch_pending_guest_exception();
     return (uint64_t)(int64_t)r;
 }
+namespace {
 
 // A guest `va_list*`, read as the System V structure it actually is.
 SysvVaList guest_va_list_at(uint64_t guest_ptr) {
@@ -633,6 +636,9 @@ bool format_may_write_n(const char* format) {
     return false;
 }
 
+#if !defined(_WIN32)
+} // namespace
+#endif
 int capture_aware_vprintf(const char* format, va_list args) {
     if (!prosper::gpu::guest_log_capture_bundle_enabled() || format_may_write_n(format))
         return vprintf(format, args);
@@ -665,6 +671,9 @@ int capture_aware_vprintf(const char* format, va_list args) {
     }
     return result;
 }
+#if !defined(_WIN32)
+namespace {
+#endif
 
 void observe_guest_c_string(const char* text, bool known_newline,
                             prosper::gpu::GuestLogCaptureSource source) {
@@ -716,7 +725,7 @@ void observe_guest_c_string(const char* text, bool known_newline,
 // twelve-argument mixed call including System V overflow-area integers and five xmm doubles, and the
 // whole suite runs on the Windows MinGW CI host (#3246). What is NOT verified is a live guest calling
 // it on a Windows host; nobody here has one.
-static PROSPER_GUEST_ABI uint64_t h_snprintf(void* buf, size_t n, const char* fmt, ...) {
+PROSPER_GUEST_ABI uint64_t h_snprintf(void* buf, size_t n, const char* fmt, ...) {
 #if defined(_WIN32)
     __builtin_sysv_va_list ap; __builtin_sysv_va_start(ap, fmt);
     prosper::abi::SysvVaList captured; memcpy(&captured, &ap, sizeof captured);
@@ -728,7 +737,7 @@ static PROSPER_GUEST_ABI uint64_t h_snprintf(void* buf, size_t n, const char* fm
     return (uint64_t)(int64_t)r;
 #endif
 }
-static PROSPER_GUEST_ABI uint64_t h_sprintf(void* buf, const char* fmt, ...) {
+PROSPER_GUEST_ABI uint64_t h_sprintf(void* buf, const char* fmt, ...) {
 #if defined(_WIN32)
     __builtin_sysv_va_list ap; __builtin_sysv_va_start(ap, fmt);
     prosper::abi::SysvVaList captured; memcpy(&captured, &ap, sizeof captured);
@@ -740,7 +749,7 @@ static PROSPER_GUEST_ABI uint64_t h_sprintf(void* buf, const char* fmt, ...) {
     return (uint64_t)(int64_t)r;
 #endif
 }
-static PROSPER_GUEST_ABI uint64_t h_printf(const char* fmt, ...) {
+PROSPER_GUEST_ABI uint64_t h_printf(const char* fmt, ...) {
 #if defined(_WIN32)
     __builtin_sysv_va_list ap; __builtin_sysv_va_start(ap, fmt);
     prosper::abi::SysvVaList captured; memcpy(&captured, &ap, sizeof captured);
