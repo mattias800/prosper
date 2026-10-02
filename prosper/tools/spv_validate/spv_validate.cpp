@@ -131,6 +131,9 @@ static const std::vector<KnownGap> kKnownGaps = {};
 // deliberate entry here can exempt one, and it has to say why.
 struct NotAnEmitter { const char* name; const char* why; };
 static const NotAnEmitter kNotEmitters[] = {
+    {"shader_analysis_owned_words",
+     "aliases the immutable owned RAW RDNA2 analysis bytes; it neither translates instructions "
+     "nor assembles a SPIR-V module"},
     // Two SpirvCompute members became visible to this scan when the recompiler's shared internals
     // moved into rdna2_to_spirv_internal.hpp so the emit functions could be split into their own
     // translation units. Neither is a new code path -- both were always reached through the entry

@@ -153,12 +153,15 @@ std::vector<uint32_t> build_raster_quad_collector(const RasterQuadInputs& inputs
     b.put(b.code, Op_AtomicCompareExchange,
         {b.t_u32, observed, counter, b.uconst(Scope_Device), b.uconst(0), b.uconst(0), next, current});
     const uint32_t won = b.ucmp(Op_IEqual, observed, current);
-    b.put(b.code, Op_SelectionMerge, {cont, 0});
-    b.put(b.code, Op_BranchConditional, {won, done, cont});
-    b.emit_label(cont); b.emit_branch(loop);
+    // The loop's continue construct is OUTSIDE its loop construct (§2.11 SPIR-V). It cannot
+    // also be the merge of a selection headed inside that loop. Keep the CAS body linear and
+    // put the retry/exit decision in the single continue/back-edge block, whose two legal exits
+    // are the loop header and its merge. Every attempted CAS reaches this block exactly once.
+    b.emit_branch(cont); b.emit_label(cont);
+    b.put(b.code, Op_BranchConditional, {won, done, loop});
     b.emit_label(done);
     const uint32_t accepted = b.id();
-    b.put(b.code, Op_Phi, {b.t_bool, accepted, b.bfalse(), loop, b.btrue(), attempt});
+    b.put(b.code, Op_Phi, {b.t_bool, accepted, b.bfalse(), loop, b.btrue(), cont});
     const uint32_t write = b.id(), full = b.id(), finish_append = b.id();
     b.put(b.code, Op_SelectionMerge, {finish_append, 0});
     b.put(b.code, Op_BranchConditional, {accepted, write, full});

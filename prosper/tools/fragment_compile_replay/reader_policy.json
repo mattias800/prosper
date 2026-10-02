@@ -128,7 +128,7 @@
   "prosper/src/gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp": "f7c91f9a33f37c1cf60b2f75dea58b0b17925ca5551afdaa5b7f2926a9c30c6e",
   "prosper/src/gpu/recompiler/indirect/rdna2_indirect_pointer_descriptor_range.cpp": "8d8c9bb9c76df46ce08edc94e3acf30ad2963410b417e36cf4c3703defd6ad5f",
   "prosper/src/gpu/recompiler/indirect/rdna2_indirect_pointer_relocation.cpp": "bcc551629c845c7f0b985a85500725cddaf041c9e550c6db5c97ab85c49c40b1",
-  "prosper/src/gpu/recompiler/raster_quad_collector.cpp": "8235d2a15dc7bea8d3293c4e52e2bfb58316a0c259cd579bf52a1d1d9b87b9ff",
+  "prosper/src/gpu/recompiler/raster_quad_collector.cpp": "1ccb29a1ec4a50765ae1c7a100889c1f136547f4e6a4e9f46797bfbcb34c8b97",
   "prosper/src/gpu/recompiler/raster_quad_collector.hpp": "0111bb9c793153faf9e79ad325485ec0b94d1e36b0dfdc283db8c0756b5276b6",
   "prosper/src/gpu/recompiler/rdna2_alu_support.hpp": "0b8302391757414c82285ea29a3305e114fc17b763c52715b48db7923704b898",
   "prosper/src/gpu/recompiler/rdna2_cfg_support.hpp": "58e456e8e7281912aa0c3bfb42794cf808b0c4b9630290fa29a767d40880142a",

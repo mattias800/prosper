@@ -67,6 +67,58 @@ static bool quad_operand_types_ok(const std::vector<uint32_t>& words) {
     }
     return count != 0;
 }
+static bool retry_loop_scopes_ok(const std::vector<uint32_t>& words) {
+    std::set<uint32_t> continues, selections;
+    for (size_t p = 5; p < words.size();) {
+        const uint32_t n = words[p] >> 16, op = words[p] & 65535;
+        if (!n || p + n > words.size()) return false;
+        if (op == 246) {
+            if (n != 4 || words[p + 1] == words[p + 2]) return false;
+            continues.insert(words[p + 2]);
+        }
+        if (op == 247) {
+            if (n != 3) return false;
+            selections.insert(words[p + 1]);
+        }
+        p += n;
+    }
+    if (continues.size() != 1) return false; // this fixture has exactly one bounded CAS loop
+    for (uint32_t target : continues) if (selections.count(target)) return false;
+    return true;
+}
+static std::vector<uint32_t> former_cas_selection(const std::vector<uint32_t>& words) {
+    // Restore the actual former invalid CFG in emitted SOURCE, not a call-shaped assertion:
+    // CAS body selects loop-merge/continue while naming the continue as its own selection merge.
+    uint32_t block = 0, header = 0, cont = 0, done = 0, attempt = 0, won = 0;
+    for (size_t p = 5; p < words.size();) {
+        const uint32_t n = words[p] >> 16, op = words[p] & 65535;
+        if (!n || p + n > words.size()) return {};
+        if (op == 248 && n == 2) block = words[p + 1];
+        if (op == 246 && n == 4) { header = block; done = words[p + 1]; cont = words[p + 2]; }
+        if (op == 230) attempt = block;
+        if (op == 170 && n == 5 && block == attempt && attempt) won = words[p + 2];
+        p += n;
+    }
+    if (!header || !cont || !done || !attempt || !won) return {};
+    std::vector<uint32_t> out(words.begin(),words.begin() + 5);
+    block = 0;
+    for (size_t p = 5; p < words.size();) {
+        const uint32_t n = words[p] >> 16, op = words[p] & 65535;
+        if (op == 248) block = words[p + 1];
+        if (block == attempt && op == 249 && n == 2) {
+            out.insert(out.end(),{(3u << 16) | 247u,cont,0,(4u << 16) | 250u,won,done,cont});
+        } else if (block == cont && op == 250 && n == 4) {
+            out.insert(out.end(),{(2u << 16) | 249u,header});
+        } else {
+            const auto start = out.size();
+            out.insert(out.end(),words.begin() + p,words.begin() + p + n);
+            if (block == done && op == 245 && n == 7 && out[start + 6] == cont)
+                out[start + 6] = attempt;
+        }
+        p += n;
+    }
+    return out;
+}
 static void source_shape(const std::vector<uint32_t>& words, const RasterQuadCollector& contract) {
     bool before_control = true, malformed = words.size() < 5;
     uint32_t broadcasts = 0, cas = 0, load = 0, overflow = 0, adds = 0, outputs = 0;
@@ -97,6 +149,7 @@ static void source_shape(const std::vector<uint32_t>& words, const RasterQuadCol
     check(outputs == 0, "collector has no attachment, depth or coverage Output variables");
     check(fragment_spirv_required_subgroup_size(words) == 0, "collector grants no exact native64 contract");
     check(quad_operand_types_ok(words), "actual scope/index/value/result domains are all exact U32");
+    check(retry_loop_scopes_ok(words), "bounded CAS loop never aliases a selection merge with its continue construct");
 }
 static std::vector<uint32_t> wire(const RasterQuadCollector& c) {
     std::vector<uint32_t> out(kRasterQuadBufferHeaderWords + c.record_words * c.max_quads, 0);
@@ -121,6 +174,9 @@ int main(int argc, char** argv) {
     check(in.source_fs && !in.source_fs->empty() && !source.empty() && c.rejection.empty(), "actual owned guest SOURCE produces collector");
     if (source.empty()) return 1;
     source_shape(source, c); dump(directory, "raster_quad_source.spv", source);
+    const auto invalid_loop = former_cas_selection(source);
+    check(!invalid_loop.empty() && !retry_loop_scopes_ok(invalid_loop),
+        "actual former invalid CAS/selection CFG fails the loop-scope observer");
     auto wrong_type = source;
     uint32_t signed_type = 0;
     for (size_t p = 5; p < wrong_type.size();) {
@@ -181,6 +237,7 @@ int main(int argc, char** argv) {
     const auto parameter_collector = build_raster_quad_collector(parameter,2,parameter_contract);
     check(!parameter_collector.empty() && parameter_contract.rejection.empty() && !parameter_contract.fields.empty(),
         "actual parameter SOURCE uses explicit routed input fields");
+    if (!parameter_collector.empty()) source_shape(parameter_collector,parameter_contract);
     for (const auto& field : parameter_contract.fields)
         check(!field.guest_initialization_proved, "interface presence cannot prove guest register initialization");
     dump(directory,"raster_quad_parameter_source.spv",parameter_collector);
