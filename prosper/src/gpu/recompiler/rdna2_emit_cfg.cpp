@@ -1789,14 +1789,14 @@ bool emit_cfg_state_machine(
     const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
     const uint32_t* code, size_t dwords, uint32_t initial_active = 0,
     bool synchronize_lds_fminmax = false) {
-    const bool graphics = b.is_fragment || b.is_vertex;
+    const bool graphics = !b.has_workgroup_execution() && (b.is_fragment || b.is_vertex);
     auto reject_cfg = [&](uint32_t pc, const char* reason) {
         log_recompile_diagnostic(b.diagnostic,
                                  b.is_compute ? "compute-cfg-reject" : "graphics-cfg-reject",
                                  "terminal", "pc=%u reason=%s", pc, reason);
         return false;
     };
-    if ((!b.is_compute && !graphics) || ins.empty()) return false;
+    if ((!b.has_workgroup_execution() && !graphics) || ins.empty()) return false;
     if (b.ngg_workgroup_export_probe && b.is_compute && b.local_count == 64 &&
         std::all_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             if (in.is_end) return true;
@@ -1867,7 +1867,7 @@ bool emit_cfg_state_machine(
         }
         return false;
     };
-    if (b.is_compute &&
+    if (b.has_workgroup_execution() &&
         ((b.wave_size != 32 && b.wave_size != 64) || !b.local_count || b.local_count > 1024))
         return false;
     const bool has_synchronized_lds_store = synchronize_lds_fminmax &&
@@ -1886,7 +1886,7 @@ bool emit_cfg_state_machine(
     const bool proven_wave32_masks = b.allow_b32_masks &&
         (b.is_fragment || (b.is_compute && b.wave_size == 32));
     const bool compute_scalar_vcc_bridge = allows_compute_scalar_vcc_bridge(b);
-    const uint32_t wave_count = b.is_compute
+    const uint32_t wave_count = b.has_workgroup_execution()
         ? (b.local_count + b.wave_size - 1) / b.wave_size : 0;
     const uint32_t padded_lanes = wave_count * b.wave_size;
 
@@ -2162,7 +2162,7 @@ bool emit_cfg_state_machine(
             in.src[0].kind == OperandKind::SGPR && !in.has_sdwa && !in.has_dpp;
     };
     auto portable_mask_reduction_candidate = [&](const Rdna2Inst& in) {
-        return b.is_compute && b.wave_size == 64 && !b.native_subgroup_size &&
+        return b.has_workgroup_execution() && b.wave_size == 64 && !b.native_subgroup_size &&
             !initial_active && b.local_count >= 64 && b.local_count % 64 == 0 &&
             (in.src[0].kind == OperandKind::SGPR ||
              (in.src[0].kind == OperandKind::Special &&
@@ -2318,7 +2318,7 @@ bool emit_cfg_state_machine(
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
         }
-        if (b.is_compute && !b.native_subgroup_size &&
+        if (b.has_workgroup_execution() && !b.native_subgroup_size &&
             in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
             !writelane_spill_arrays.contains(in.src[0].value)) {
             portable_readlane_event_for_pc.emplace(
@@ -2403,7 +2403,7 @@ bool emit_cfg_state_machine(
           !portable_readfirstlane_event_for_pc.empty())
              ? padded_lanes : 0u);
     const uint32_t group_active_slot = wave_result_base + wave_count;
-    if (b.is_compute && !direct_dispatch &&
+    if (b.has_workgroup_execution() && !direct_dispatch &&
         !b.declare_cfg_scratch(group_active_slot + 1))
         return reject_cfg(ins.front().pc, "cfg-scratch-too-small");
     start_set.insert(end_pc);

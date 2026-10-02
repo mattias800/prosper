@@ -50,6 +50,7 @@ struct Interpreter {
   std::map<std::array<uint32_t, 3>, std::vector<uint32_t>> member_decorations;
   std::map<uint32_t, size_t> labels;
   std::map<uint32_t, Memory> shared;
+  std::map<uint32_t, bool> readonly_storage;
   std::vector<Inst> globals;
   uint32_t main = 0, storage = 0;
   size_t entry = 0;
@@ -165,6 +166,8 @@ struct Interpreter {
       fail("store type mismatch");
     if (p.root == storage && !v.defined)
       fail("poison live storage write");
+    if (readonly_storage.contains(p.root))
+      fail("write to readonly supplied storage");
     auto &m = memory(l, p.root);
     if (p.offset > m.words.size() || v.words.size() > m.words.size() - p.offset)
       fail("store out of bounds");
@@ -475,11 +478,26 @@ struct Interpreter {
   }
   std::vector<uint32_t> run(uint32_t count,
                             const std::vector<uint32_t> &buffer) {
+    return run_buffers(count, {{3, buffer}}, 3);
+  }
+  // Same typed evaluator, with two independently pinned raw-u32 blocks for packet execution.
+  // The input is read-only and the output is the sole observable sink. All supplied ABI layouts
+  // retain the exact Set0/Block/Offset0/Stride4 checks; this is not general descriptor emulation.
+  std::vector<uint32_t> run_packet(const std::vector<uint32_t> &input,
+                                   const std::vector<uint32_t> &output) {
+    return run_buffers(64, {{0, input}, {1, output}}, 1);
+  }
+  std::vector<uint32_t> run_buffers(uint32_t count,
+      const std::map<uint32_t, std::vector<uint32_t>> &buffers, uint32_t sink_binding) {
     try {
       if (!error.empty())
         fail(error);
       if (!count || count > 1024)
         fail("invalid invocation count");
+      storage = 0;
+      shared.clear();
+      readonly_storage.clear();
+      std::map<uint32_t, bool> seen_bindings;
       std::vector<Lane> lanes(count);
       for (const auto &g : globals) {
         const auto &a = g.a;
@@ -489,8 +507,11 @@ struct Interpreter {
         if (a[2] == 4)
           shared[a[1]] = make_memory(t, size(t));
         else if (a[2] == 2 || a[2] == 12) {
-          if (bindings[a[1]] == 3) {
-            if (storage)
+          const auto binding = bindings.find(a[1]);
+          const auto supplied = binding == bindings.end() ? buffers.end()
+              : buffers.find(binding->second);
+          if (supplied != buffers.end()) {
+            if (!seen_bindings.emplace(binding->second, true).second)
               fail("duplicate live buffer binding");
             // This oracle supports exactly the fixture's externally observable
             // ABI. Never silently flatten a differently laid-out Vulkan block
@@ -512,8 +533,10 @@ struct Interpreter {
                 !uint_type(ty(array).a[0]) || stride == decorations.end() ||
                 stride->second != std::vector<uint32_t>{4})
               fail("unsupported live storage ABI");
-            storage = a[1];
-            shared[a[1]] = {t, buffer, std::vector<bool>(buffer.size(), true)};
+            if (binding->second == sink_binding) storage = a[1];
+            else readonly_storage.emplace(a[1], true);
+            shared[a[1]] = {t, supplied->second,
+                std::vector<bool>(supplied->second.size(), true)};
           } else {
             // The production shell declares unused synthetic buffers too.
             // Give them no initialized bytes: any actual read/write fails.
@@ -545,6 +568,8 @@ struct Interpreter {
       }
       if (!storage)
         fail("missing live storage sink");
+      if (seen_bindings.size() != buffers.size())
+        fail("missing supplied storage binding");
       // The first function label is kept in the instruction stream, including
       // any Phi.
       for (auto &l : lanes)

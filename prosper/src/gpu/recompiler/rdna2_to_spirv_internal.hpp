@@ -393,7 +393,24 @@ inline StaticScratchLayout analyze_static_scratch(const std::vector<Rdna2Inst>& 
 
 // A compute-shader SPIR-V builder specialized for "load N floats -> compute over SSA floats ->
 // store 1 float", with helpers the VALU translator drives.
+enum class GuestShaderStage { Standalone, Compute, Vertex, Fragment };
+enum class PhysicalExecutionDomain { Invocation, Workgroup };
+
 struct SpirvCompute {
+    // Guest semantics and physical synchronization ownership are separate. The legacy is_*
+    // booleans select the existing physical stage shells; a packet is guest Fragment while its
+    // physical shell is GLCompute. Never set both legacy compute and fragment flags.
+    // Some legacy numeric/raster helpers still branch on those booleans. This packet slice refuses
+    // FP/raster instructions; extending it must select genuine guest semantics, not inherit LOD0,
+    // compute clamp/float mode or native fragment helper assumptions from the physical shell.
+    GuestShaderStage guest_stage = GuestShaderStage::Standalone;
+    PhysicalExecutionDomain physical_domain = PhysicalExecutionDomain::Invocation;
+    bool has_workgroup_execution() const {
+        return physical_domain == PhysicalExecutionDomain::Workgroup;
+    }
+    bool is_fragment_packet() const {
+        return guest_stage == GuestShaderStage::Fragment && has_workgroup_execution();
+    }
     // `exts` holds OpExtension. SPIR-V requires it AFTER every OpCapability and BEFORE
     // OpExtInstImport, which is why it is a separate section rather than appended to `caps` or
     // prepended to `extimp` -- see the module assembly order below. Getting that order wrong fails
@@ -451,6 +468,7 @@ struct SpirvCompute {
     uint32_t next_id = 1;
     uint32_t stride = 1;
     bool raw_output_words = false;
+    bool raw_input_words = false;
     // fixed ids (set in begin()):
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
     uint32_t v_gid=0, v_groupid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
@@ -1573,7 +1591,11 @@ struct SpirvCompute {
     // buffer element pointer: base[ gid.x*stride + k ]
     uint32_t elem_ptr(uint32_t bufvar, uint32_t k);
     // Load one float from the input buffer and return it as raw bits (VGPR value).
-    uint32_t load_input(uint32_t k) { uint32_t p = elem_ptr(v_in, k); uint32_t r = id(); put(code, Op_Load, {t_f32, r, p}); return bcu(r); }
+    uint32_t load_input(uint32_t k) {
+        uint32_t p = elem_ptr(v_in, k), r = id();
+        put(code, Op_Load, {raw_input_words ? t_u32 : t_f32, r, p});
+        return raw_input_words ? r : bcu(r);
+    }
     // The storage-buffer variable for a descriptor `binding`. N-buffer model: each distinct constant/
     // vertex buffer the shader reads is bound at its own descriptor binding (the executor assigns them),
     // so multiple constant buffers (e.g. Unity's per-draw transform vs per-frame) don't collapse onto one.
@@ -2058,9 +2080,10 @@ struct SpirvCompute {
     void begin(uint32_t input_stride, const ShaderResourceTable* rt = nullptr,
                uint32_t local_x = 64, uint32_t local_y = 1, uint32_t local_z = 1,
                uint32_t hardware_wave_size = 64, uint32_t push_constant_dwords = 0,
-               bool raw_word_output = false) {
+               bool raw_word_output = false, bool raw_word_input = false) {
         stride = input_stride;
         raw_output_words = raw_word_output;
+        raw_input_words = raw_word_input;
         push_constant_dword_count = push_constant_dwords;
         local_count = local_x * local_y * local_z;
         wave_size = hardware_wave_size;
@@ -2076,6 +2099,8 @@ struct SpirvCompute {
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_compute = true;
+        guest_stage = GuestShaderStage::Compute;
+        physical_domain = PhysicalExecutionDomain::Workgroup;
         exec_model = Exec_GLCompute; iface = {v_gid, v_groupid, v_localid};   // EntryPoint deferred to finish()
         // REQUIRE_FULL_SUBGROUPS constrains LocalSize X, not merely the total workgroup size. The
         // native shell never consumes Vulkan's LocalInvocationId: it reconstructs the original guest
@@ -2123,11 +2148,12 @@ struct SpirvCompute {
         put(types, Op_Variable, {t_ptr_in_v3u, v_gid, SC_Input});
         put(types, Op_Variable, {t_ptr_in_v3u, v_groupid, SC_Input});
         put(types, Op_Variable, {t_ptr_in_v3u, v_localid, SC_Input});
-        put(types, Op_TypeRuntimeArray, {t_rta, t_f32});
+        put(types, Op_TypeRuntimeArray, {t_rta, raw_input_words ? t_u32 : t_f32});
         put(types, Op_TypeStruct, {t_struct, t_rta});
         put(types, Op_TypePointer, {t_ptr_sb_struct, SC_StorageBuffer, t_struct});
         declare_external_storage_buffer(t_ptr_sb_struct, v_in);
-        put(types, Op_TypePointer, {t_ptr_sb_f32, SC_StorageBuffer, t_f32});
+        put(types, Op_TypePointer, {t_ptr_sb_f32, SC_StorageBuffer,
+                                  raw_input_words ? t_u32 : t_f32});
         if (raw_output_words) {
             declare_cbufs(rt); // supplies the uint32 Block type used by the raw export sink
             declare_external_storage_buffer(t_ptr_sb_struct_u, v_out);
@@ -2214,6 +2240,8 @@ struct SpirvCompute {
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_fragment = true;
+        guest_stage = GuestShaderStage::Fragment;
+        physical_domain = PhysicalExecutionDomain::Invocation;
         desc_set = 1;   // PS resources live in descriptor set 1 (VS owns set 0) — no cross-stage binding collision
         exec_model = Exec_Fragment;
         for (uint32_t output : v_color) if (output) iface.push_back(output); // EntryPoint deferred
@@ -2263,6 +2291,8 @@ struct SpirvCompute {
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_vertex = true;
+        guest_stage = GuestShaderStage::Vertex;
+        physical_domain = PhysicalExecutionDomain::Invocation;
         exec_model = Exec_Vertex; iface = {v_vid, v_iid, v_pos};   // EntryPoint deferred to finish()
         put(deco, Op_Decorate, {v_vid, Dec_BuiltIn, BI_VertexIndex});
         put(deco, Op_Decorate, {v_iid, Dec_BuiltIn, BI_InstanceIndex});
