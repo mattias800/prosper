@@ -7,7 +7,8 @@
 // https://gpuopen.com/machine-readable-isa/
 //
 // CTest: fragment_float_modifiers. Optional --dump <directory> retains each actual SOURCE.
-// Deliberately bounded: exact normal results, qNaN CATEGORY, and unmodified zero signs.
+// Deliberately bounded: exact normal results, qNaN CATEGORY, raw zero signs and
+// the documented active-OMOD -0 -> +0 rule with independent disabling controls.
 // No CLAMP(-0), signaling-NaN/payload, subnormal arithmetic, half-rounding boundary,
 // FP16 overflow-mode, native device execution or general guest arithmetic claim.
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -447,6 +448,10 @@ int main(int argc,char** argv) {
         add("f16_output_preserve_wrong_width",one,1,false,false,false,0x80,two);
         add("f16_input_preserve_wrong_width",one,1,false,false,false,0x40,two);
         add("clamp_independent_output_preserve",two,0,true,true,false,0x20,one);
+        add("negative_zero_active_omod",0x80000000u,1,false,false,false,0,0);
+        add("negative_zero_ieee_disables_omod",0x80000000u,1,false,true,false,0,0x80000000u);
+        add("negative_zero_output_preserve_disables_omod",0x80000000u,1,false,false,false,0x20,0x80000000u);
+        add("positive_zero_active_omod",0,1,false,false,false,0,0);
         add("qnan_passthrough_no_modifier",qnan,0,false,false,false,0,0,true);
         for(bool ieee:{false,true}) {
             add("qnan_clamp_dx0_ieee"+std::to_string(ieee),qnan,0,true,ieee,false,0,0,true);
@@ -470,11 +475,19 @@ int main(int argc,char** argv) {
             run({prefix+"_half_before_clamp",Path::ScalarF16,one_half,3,true,false,false,0,three_quarters,op},wave,dir);
         }
     }
+    // Identical negative zeros avoid min/max's unspecified mixed-zero tie.
+    // No FMA cancellation sign or half-denorm/rounding boundary is invented here.
+    for(uint32_t op:{0x351u,0x354u,0x357u}) for(unsigned wave:{32u,64u}) {
+        const std::string prefix="scalar_f16_negative_zero_"+std::to_string(op);
+        run({prefix+"_active",Path::ScalarF16,0x80000000u,1,false,false,false,0,0,op},wave,dir);
+        run({prefix+"_ieee_disables",Path::ScalarF16,0x80000000u,1,false,true,false,0,0x80000000u,op},wave,dir);
+        run({prefix+"_output_preserve_disables",Path::ScalarF16,0x80000000u,1,false,false,false,0x80,0x80000000u,op},wave,dir);
+    }
     // Only raw moves: no guessed CLAMP(-0) or OMOD-zero rounding rule is asserted.
     for(bool ieee:{false,true}) for(bool dx:{false,true}) for(uint32_t zero:{0u,0x80000000u}) for(unsigned wave:{32u,64u})
         run({"move_zero_"+std::to_string(ieee)+"_"+std::to_string(dx)+"_"+std::to_string(zero),Path::Move,zero,0,false,ieee,dx,0,zero},wave,dir);
     oracle_controls(seed,dir);
-    check(calls==216 && decoded_packets==216 && numeric_values==864,"all 216 SOURCE cases and 864 live MRT0 components checked");
+    check(calls==258 && decoded_packets==258 && numeric_values==1032,"all 258 SOURCE cases and 1032 live MRT0 components checked");
     std::printf("fragment_float_modifiers: %u translator calls, %u decoder witnesses, %u MRT0 values, %u checks, %u failures\n",
         calls,decoded_packets,numeric_values,checks,failures);
     return failures ? 1 : 0;
