@@ -8904,8 +8904,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         case Rdna2Format::DS: {
             if (in.opcode == kDsOpcodeBpermuteB32) {
                 // A native subgroup exactly matching the guest wave gives each architectural
-                // 32-lane half a valid shuffle domain. Portable compute needs a workgroup-scratch
-                // gather and remains fail-visible until that separate synchronized route exists.
+                // 32-lane half a valid shuffle domain. Portable compute is routed through the
+                // CFG common event; never put its workgroup rendezvous in this arbitrary ALU arm.
                 if (!b.is_compute || in.ds_gds || !b.native_subgroup_size ||
                     b.native_subgroup_size != b.wave_size) {
                     ok = false;
