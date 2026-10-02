@@ -32,6 +32,7 @@
 #include "../../tests/fixtures/portable_bpermute_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_wqm_fixture.hpp"
+#include "../../tests/fixtures/fragment_packet_mbcnt_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <algorithm>
 #include <array>
@@ -650,6 +651,14 @@ int main(int argc, char** argv) {
             c.destination = source == fp::wqm::Source::Vcc ? 106 : 16;
             const auto compiled = recompile_fragment_packet(fp::wqm::packet(c));
             const auto name = "fragment_packet_wqm_" + std::to_string(ordinal++);
+            dump(dir, name.c_str(), compiled.spirv, "recompile_fragment_packet");
+        }
+        for (const auto source : {fp::mbcnt::Source::Exec, fp::mbcnt::Source::SavedVcc,
+                                  fp::mbcnt::Source::Scalar, fp::mbcnt::Source::Vgpr,
+                                  fp::mbcnt::Source::Literal, fp::mbcnt::Source::Full}) {
+            fp::mbcnt::Case c; c.source = source; c.exec = uint64_t(1) << 63;
+            const auto compiled = recompile_fragment_packet(fp::mbcnt::packet(c));
+            const auto name = "fragment_packet_mbcnt_" + std::to_string(ordinal++);
             dump(dir, name.c_str(), compiled.spirv, "recompile_fragment_packet");
         }
     }

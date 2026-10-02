@@ -4951,7 +4951,12 @@ bool emit_cfg_state_machine(
                 }
                 if (in.fmt == Rdna2Format::VOP3 &&
                     (in.opcode == 0x365 || in.opcode == 0x366) &&
-                    !mbcnt_has_intrinsic_numeric_source(in)) {
+                    !mbcnt_has_intrinsic_numeric_source(in) &&
+                    !(b.is_fragment_packet() &&
+                      mbcnt_has_scalar_numeric_source(state, in.src[0]))) {
+                    // Packet load_state MUST-filters scalar words before this decision. A
+                    // definite DATA word belongs to emit_alu's numeric prefix, not a peer
+                    // population. The unresolved sibling of an overwritten mask still refuses.
                     block_mbcnt = &in;
                     break;
                 }
@@ -5419,7 +5424,13 @@ bool emit_cfg_state_machine(
             }
             const uint32_t acc = operand_bits(b, state, *mbcnt, mbcnt->src[1], &operand_ok);
             const auto event = mbcnt_event_for_pc.find(mbcnt->pc);
-            if (!mask || !operand_ok || event == mbcnt_event_for_pc.end()) return false;
+            if (!mask || !operand_ok || event == mbcnt_event_for_pc.end()) {
+                if (b.is_fragment_packet())
+                    return reject_cfg(mbcnt->pc, !mask ? "packet-mbcnt-mask-state-unavailable" :
+                        !operand_ok ? "packet-mbcnt-accumulator-state-unavailable" :
+                        "packet-mbcnt-event-unavailable");
+                return false;
+            }
             if (b.native_subgroup_size) {
                 // The switch selector is scalar within this exact-size subgroup, so every guest
                 // lane reaches the same case.  Execute the wave prefix count here and retain masked-
