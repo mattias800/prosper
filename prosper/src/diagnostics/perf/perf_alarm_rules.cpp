@@ -454,7 +454,7 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
             a.breakdown = ranked(counts, names, 2);
             a.detail = format("requests=%llu ADD-requests=%llu MUL-requests=%llu "
                 "refused-after-emission=%llu sites-truncated-requests=%llu "
-                "announcement-overflow-requests=%llu inventory=ADD/MUL-only",
+                "announcement-overflow-requests=%llu inventory=F32-ADD/MUL+F32/F16-OMOD",
                 (unsigned long long)total,
                 (unsigned long long)w.count(Counter::FragmentArithmeticAddRequests),
                 (unsigned long long)w.count(Counter::FragmentArithmeticMulRequests),
@@ -462,8 +462,9 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                 (unsigned long long)w.count(Counter::FragmentArithmeticTruncatedRequests),
                 (unsigned long long)w.count(Counter::FragmentArithmeticInventoryOverflowRequests));
             a.hint = "Default-on [fragment-arithmetic-unverified] lines name lookup/producing "
-                "program, guest PC/family and actual FLOAT_MODE availability. Retain raw program "
-                "and launch mode, then test input/output denorm and rounding requirements (#4059). "
+                "program, guest PC/family and actual launch-state availability. Retain raw program, "
+                "FLOAT_MODE and IEEE/DX10_CLAMP flags, then test arithmetic/modifier denorm, "
+                "rounding and overflow requirements (#4059). ADD/MUL counts are subsets; "
                 "Known mode does not prove arithmetic support; unavailable is not mode0. "
                 "Counts are direct/cached compiler requests, including later refusal, not "
                 "execution, unique shaders, wrong pixels or complete float-op inventory";

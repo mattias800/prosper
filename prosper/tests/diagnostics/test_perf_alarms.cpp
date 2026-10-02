@@ -1887,7 +1887,7 @@ void test_unverified_fragment_arithmetic() {
     check("absent arithmetic observations do not alarm", !fired(evaluate_rules(absent,kDefault),rule));
     auto no_arithmetic = healthy();
     set_count(no_arithmetic,Counter::FragmentArithmeticRequests,4);
-    check("requests without inventoried ADD/MUL are observed and quiet within the limited scope",
+    check("requests without inventoried ADD/MUL or active OMOD are quiet within the limited scope",
           rule_has_data(rule,no_arithmetic) && !fired(evaluate_rules(no_arithmetic,kDefault),rule));
     for (Counter mode : {Counter::FragmentArithmeticKnownMode,Counter::FragmentArithmeticUnknownMode}) {
         auto w = no_arithmetic;
@@ -1897,12 +1897,25 @@ void test_unverified_fragment_arithmetic() {
         check("a single known OR unavailable actual lowering request fires only the dedicated rule",
               only(alarms,rule) && alarms[0].value==1 && alarms[0].threshold==1 &&
               std::string(alarms[0].unit)=="unverified-compiler-requests" && alarms[0].breakdown.size()==1 &&
-              alarms[0].detail.find("inventory=ADD/MUL-only")!=std::string::npos &&
+              alarms[0].detail.find("inventory=F32-ADD/MUL+F32/F16-OMOD")!=std::string::npos &&
               std::string(alarms[0].hint).find("not execution")!=std::string::npos);
         EngineConfig config; config.log=nullptr;
         AlarmEngine engine(std::move(config));
         check("unverified semantic gap has first-window visibility", only(engine.close_window(w,5),rule));
         check("next empty observation window does not reuse lifetime counts", engine.close_window(no_arithmetic,10).empty());
+        auto modifier_only = no_arithmetic;
+        set_count(modifier_only,mode,1);
+        const auto modifier_alarms = evaluate_rules(modifier_only,kDefault);
+        check("modifier-only request fires with zero ADD/MUL counts and names the wider inventory",
+              rule_has_data(rule,modifier_only) && only(modifier_alarms,rule) &&
+              modifier_alarms[0].value==1 && modifier_alarms[0].breakdown.size()==1 &&
+              modifier_alarms[0].detail.find("ADD-requests=0 MUL-requests=0")!=std::string::npos &&
+              modifier_alarms[0].detail.find("inventory=F32-ADD/MUL+F32/F16-OMOD")!=std::string::npos &&
+              std::string(modifier_alarms[0].hint).find("ADD/MUL counts are subsets")!=std::string::npos);
+        check("modifier-only semantic gap has first-window visibility",
+              only(engine.close_window(modifier_only,15),rule));
+        check("modifier-only firing clears in the next observed quiet window",
+              engine.close_window(no_arithmetic,20).empty());
     }
     const auto path = prosper_test::test_scratch_file("fragment-arithmetic-window.jsonl");
     {
@@ -1922,7 +1935,14 @@ void test_unverified_fragment_arithmetic() {
               only(alarms,rule) && alarms[0].value==3 &&
               alarms[0].detail.find("refused-after-emission=1")!=std::string::npos &&
               alarms[0].detail.find("sites-truncated-requests=1")!=std::string::npos);
-        check("actual engine clears arithmetic firing on zero deltas", engine.on_flip(3'000'000'002ull,l,60).empty());
+        l.counters[size_t(Counter::FragmentArithmeticRequests)]+=1;
+        l.counters[size_t(Counter::FragmentArithmeticKnownMode)]+=1;
+        const auto modifier_alarms=engine.on_flip(3'000'000'002ull,l,60);
+        check("actual ledger modifier-only deltas alarm without inventing ADD/MUL counts",
+              only(modifier_alarms,rule) && modifier_alarms[0].value==1 &&
+              modifier_alarms[0].detail.find("ADD-requests=0 MUL-requests=0")!=std::string::npos &&
+              modifier_alarms[0].detail.find("inventory=F32-ADD/MUL+F32/F16-OMOD")!=std::string::npos);
+        check("actual engine clears arithmetic firing on zero deltas", engine.on_flip(4'000'000'003ull,l,60).empty());
     }
     const auto json=slurp(path);
     check("JSONL exposes arithmetic request quantities and explicit quiet zeros",

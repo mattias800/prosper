@@ -35,12 +35,15 @@ both observations and refusals; deliberate compute selectors decline before the 
 
 `unverified-fragment-f32-arithmetic` (#4062) announces the source-confirmed remaining #4059
 lowering gap, not a measured GPU failure. It counts direct/cached fragment compiler requests
-that actually reached ordinary guest F32 ADD/MUL emission, including a later refusal. Cold
+that actually reached ordinary guest F32 ADD/MUL or active F32/F16 OMOD emission, including a
+later refusal. The historical rule name remains stable; ADD/MUL request counters are subsets,
+so a modifier-only window can fire with both counters zero. Cold
 requests transfer immutable bounded site/mode provenance to the cache; warm requests replay it
 with their current lookup address. It is not a draw or execution counter, complete arithmetic
 inventory, unique-shader census or permission to infer unknown launch mode as mode0. Fixed site
 prefix truncation and announcement-inventory saturation are explicit; repeated request accounting
-continues. No observed requests means NO DATA; requests without emitted ADD/MUL are quiet within
+continues. No observed requests means NO DATA; requests without inventoried ADD/MUL or active
+OMOD are quiet within
 this limited inventory. F9 re-realization suppression applies; ordinary offline direct compiles
 still announce before flip windows. Shader words, compile keys and numeric/admission policy do not
 depend on these observations. Completing #4059 is separate from announcing it.

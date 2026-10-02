@@ -25,7 +25,8 @@
 //     refusals on every platform. Default-on [wave64-unsupported] lines identify failed work;
 //     wave64_refusals in JSONL counts repeated uses, separately from bounded new refusal identities.
 //   * unverified-fragment-f32-arithmetic observes direct/cached compiler requests that emitted
-//     guest F32 ADD/MUL, including requests refused later. Guest mode availability is separate
+//     guest F32 ADD/MUL or active F32/F16 OMOD, including requests refused later. ADD/MUL
+//     counters are subsets, not the whole inventory. Guest mode availability is separate
 //     from verified support. Bounded default lines precede flip windows; JSONL/alarms retain
 //     request accounting. Neither the rule nor its counts proves execution or wrong pixels.
 //   * at exit, also one census line (not a rule): the first failing field of the exact
