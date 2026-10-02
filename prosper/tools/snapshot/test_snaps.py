@@ -20,7 +20,6 @@ import json
 import shutil
 import os
 import struct
-import subprocess
 import sys
 import tempfile
 
@@ -484,7 +483,7 @@ def main():
 
         check(saw.get("PROSPER_FLIP_PACE_FPS") == "30",
               "an appending run is PACED at the session's own rate, not the command-line default")
-        with open(os.path.join(e2e, "session.json"), "r", encoding="utf-8") as handle:
+        with open(os.path.join(e2e, "session.json"), encoding="utf-8") as handle:
             after = json.load(handle)
         check(after.get("det_fps") == 30, "...and still records that rate")
         check(saw.get("PROSPER_FLIP_PACE_FPS") == str(after.get("det_fps")),
@@ -541,7 +540,7 @@ def main():
             stored = {}
             path = os.path.join(e2e, "session.json")
             if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as handle:
+                with open(path, encoding="utf-8") as handle:
                     stored = json.load(handle)
             return seen, stored, buf.getvalue(), raised
 
@@ -644,7 +643,7 @@ def main():
         # ---- 6a1b-iii-e. cmd_import's own refusals -------------------------------------------
         def import_dir(records, with_route=True):
             """Build a capture dir and import it; return the raised SystemExit, or None."""
-            d = os.path.join(tmp, "imp{}".format(len(records)))
+            d = os.path.join(tmp, f"imp{len(records)}")
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, "snaps.jsonl"), "w", encoding="utf-8") as handle:
                 for r in records:
@@ -654,7 +653,7 @@ def main():
 
             class IArgs(Args):
                 capture_dir = d
-                name = "imp{}".format(len(records))
+                name = f"imp{len(records)}"
             try:
                 snaps.cmd_import(IArgs())
                 return None
