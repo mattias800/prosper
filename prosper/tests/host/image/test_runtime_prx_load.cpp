@@ -649,9 +649,8 @@ int run_missing_data_base_fixture() {
         program.slots[2].nid == function && append_peek(retry.base, kGot) == BOOT_STUB + 2 * 96;
     append_check(installed_function && reinterpret_cast<HleFn>(BOOT_STUB + 2 * 96)(0, 0, 0, 0, 0, 0) ==
                  kImportMarker, "data recovery", "the staged FUNC NID recovers a real installed handler");
-    fixture.prefix_order = {1, 2};
     append_check(call_order() == fixture.prefix_order, "data recovery",
-                 "recovery adds one first-seen FUNC census entry");
+                 "a registered FUNC call preserves the unresolved prefix census");
     const bool writable = check_data_target(retry, kGot + 8, slot, "data recovery");
     const uint64_t variable = retry.mapped ? append_peek(retry.base, kGot + 8) : 0;
     append_check(writable && append_peek(variable, 0) == 0, "data recovery", "new DATA storage is really zero-filled");
