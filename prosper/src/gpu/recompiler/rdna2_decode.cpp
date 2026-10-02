@@ -97,6 +97,21 @@ bool rdna2_instruction_may_change_exec(const Rdna2Inst& in) {
     return is_exec(in.dst) || is_exec(in.sdst);
 }
 
+uint32_t rdna2_sop2_dest_dwords(uint32_t opcode) {
+    // gfx1030 SOP2: 0x00-0x09 add/sub/addc/subb/min/max, 0x0a cselect_b32, 0x0e/0x10/0x12/0x14/0x16/
+    // 0x18/0x1a/0x1c the b32 logic family, 0x1e lshl_b32, 0x20 lshr_b32, 0x22 ashr_i32, 0x24 bfm_b32,
+    // 0x26 mul_i32, 0x27 bfe_u32, 0x28 bfe_i32. Each odd opcode in the logic and shift ranges is the
+    // b64 sibling (and 0x0b, 0x25, 0x29, 0x2a are b64 forms), which stay at two dwords.
+    if (opcode <= 0x0au) return 1;
+    switch (opcode) {
+        case 0x0e: case 0x10: case 0x12: case 0x14: case 0x16: case 0x18: case 0x1a: case 0x1c:
+        case 0x1e: case 0x20: case 0x22: case 0x24: case 0x26: case 0x27: case 0x28:
+            return 1;
+        default:
+            return 2;
+    }
+}
+
 bool rdna2_instruction_may_write_memory(const Rdna2Inst& in) {
     switch (in.fmt) {
         case Rdna2Format::MIMG:

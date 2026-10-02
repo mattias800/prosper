@@ -316,6 +316,12 @@ bool rdna2_instruction_may_change_exec(const Rdna2Inst& in);
 // 0x08-0x0f, SMEM loads below 0x10. Everything else, including the D16 and cache-invalidate forms,
 // is treated as a writer. Non-memory instructions return false.
 bool rdna2_instruction_may_write_memory(const Rdna2Inst& in);
+// Number of consecutive SGPRs an SOP2 instruction writes through its SDST: 1 for the opcodes
+// positively known to produce a 32-bit result (add/sub/min/max/cselect/bit-logic/shift/bfm/mul/bfe
+// in their b32/u32/i32 forms), 2 for everything else. FAIL-CLOSED: an opcode not listed here
+// (every 64-bit form, and anything unknown) is treated as a pair write, so the result can only
+// over-approximate which registers an instruction may clobber. SCC is not an SGPR and is not counted.
+uint32_t rdna2_sop2_dest_dwords(uint32_t opcode);
 // Number of consecutive data VGPRs an instruction writes from its decoded destination. This
 // inventory is shared by control-flow analyses and instruction-scoped value proofs so scalar VALU
 // results are not mistaken for four-register memory payloads, while actual wide results still

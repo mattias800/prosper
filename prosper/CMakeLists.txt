@@ -830,6 +830,11 @@ if(TARGET prosper_core)
     INCLUDES src
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_split_t8_sop2_width
+    SOURCES tests/gpu/recompiler/test_split_t8_sop2_width.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_import_data_seed
     SOURCES tests/hle/dispatch/test_import_data_seed.cpp
     LIBRARIES prosper_core)

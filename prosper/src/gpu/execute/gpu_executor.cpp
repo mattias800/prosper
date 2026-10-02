@@ -3173,6 +3173,10 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
                    static_cast<uint32_t>(reg - dst.value) < width;
         };
         uint32_t width = 2; // conservative for ordinary scalar and vector-carry pair writes
+        // A 32-bit SOP2 result is one SGPR: counting a neighbour overlapped a pointer register
+        // that sat directly above an unrelated scalar add and refused a split T# for nothing.
+        if (in.fmt == Rdna2Format::SOP2 && in.dst.kind == OperandKind::SGPR)
+            width = rdna2_sop2_dest_dwords(in.opcode);
         if (in.fmt == Rdna2Format::SMEM) {
             switch (in.opcode & 7u) {
                 case 0: width = 1; break;
