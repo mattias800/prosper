@@ -4,6 +4,7 @@
 namespace prosper::frontend::submit_renderer {
 
 void resolve_pass(ResolvePassContext& ctx) {
+    prosper::test::BackendProducerAttempt producer_attempt;
     // Every name the moved body used from the pass loop, bound once to the same object.
     auto& batch_backend_submits = ctx.batch_backend_submits;
     auto& items = ctx.items;
@@ -124,6 +125,8 @@ void resolve_pass(ResolvePassContext& ctx) {
         // source's older unpublished volume to another address, nor does it
         // publish slices of a volume formerly owned by the destination.
         const auto old_destination = g_rtt.find(rdst);
+        resolved.guest_origins = old_destination != g_rtt.end()
+            ? old_destination->second.guest_origins : prosper::test::BackendGuestProducerOrigins{};
         resolved.volume_depth = 0;
         resolved.volume_guest_bytes = old_destination != g_rtt.end()
             ? old_destination->second.volume_guest_bytes : 0u;
@@ -134,7 +137,16 @@ void resolve_pass(ResolvePassContext& ctx) {
         resolved.dcc_metadata_addr = 0;
         resolved.dcc_metadata_bytes = 0;
         resolved.dcc_metadata_dirty = false;
+        resolved.dcc_guest_origins = {};
         const uint32_t rw = resolved.w, rh = resolved.h;
+        // The destination programming supplies its own complete physical layout. Source pixels
+        // or a Vulkan extent cannot lend their allocation proof to another guest identity.
+        uint64_t destination_bytes = 0;
+        for (const auto* draw : pass) {
+            const uint64_t bytes = raw_snapshot_color_footprint(*draw, 1u);
+            if (!bytes) { destination_bytes = 0; break; }
+            destination_bytes = std::max(destination_bytes, bytes);
+        }
         bool batched_copy_recorded = false;
         // #1334: the destination-keyed persistent GPU image did NOT receive these
         // pixels — inheriting gpu_valid from the source let a later #780 CPU-copy
@@ -173,7 +185,8 @@ void resolve_pass(ResolvePassContext& ctx) {
                     rsrc, rdst, rw, rh,
                     prosper::test::backend_color_format(resolved.format),
                     copy_error,
-                    batch_resolve_copy ? &backend_submission : nullptr);
+                    batch_resolve_copy ? &backend_submission : nullptr,
+                    destination_bytes);
             batched_copy_recorded = copy_ok && batch_resolve_copy;
             if (timing_enabled)
                 pending_timing.resolve_copy_ms +=
@@ -216,6 +229,15 @@ void resolve_pass(ResolvePassContext& ctx) {
                             copy_error.c_str());
             }
         }
+        const uint64_t expected = static_cast<uint64_t>(rw) * rh *
+            prosper::test::backend_color_bytes_per_pixel(prosper::test::backend_color_format(resolved.format));
+        producer_attempt.accepted = resolved.gpu_valid ||
+            (expected && resolved.rgba && resolved.rgba->size() == expected);
+        const auto* retained_destination = resolved.gpu_valid
+            ? prosper::test::find_persistent_color_target(rdst, rw, rh,
+                prosper::test::backend_color_format(resolved.format)) : nullptr;
+        if (retained_destination) resolved.guest_origins.merge(retained_destination->guest_origins);
+        else resolved.guest_origins.observe(rdst, destination_bytes);
         g_rtt[rdst] = std::move(resolved);    // dest inherits src content/extent/format
         // The one whole-entry copy into the cache: it may carry a footprint.
         if (g_rtt[rdst].volume_guest_bytes) g_volume_targets.note(rdst);

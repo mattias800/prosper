@@ -47,6 +47,27 @@ GuestMemoryTopologyRelation guest_memory_topology_relation(
 bool guest_memory_direct_range_fault_safe(const GuestMappingLease& lease,
                                           uint64_t address, uint64_t size);
 
+// Compare an exact committed-direct source with the WHOLE allocated physical backing that
+// contains producer_address. Retained tiled/layered images must not use their linear pixel size
+// as an alias bound. Unknown/unallocated/flexible mappings refuse. minimum_producer_bytes checks
+// the producer's complete known physical layout extent; zero is unknown. The returned isolation
+// is over its complete original allocation. Retype ledger slices retain original ownership;
+// release/reuse never makes a new allocation birth physically disjoint from a retained origin.
+struct GuestDirectAllocation {
+    uint64_t address = 0, minimum_bytes = 0;
+    uint64_t physical_begin = 0, physical_end = 0, identity = 0;
+};
+// Capture at producer realization/publication while the backing is leased. Retained renderer
+// owners keep this observation even after the old VA is unmapped; no capture file supplies it.
+GuestDirectAllocation guest_memory_direct_allocation(const GuestMappingLease& lease,
+                                                     uint64_t address, uint64_t minimum_bytes);
+GuestMemoryTopologyRelation guest_memory_retained_allocation_relation(
+    const GuestMappingLease& lease, uint64_t source_address, uint64_t source_bytes,
+    const GuestDirectAllocation& producer);
+GuestMemoryTopologyRelation guest_memory_direct_allocation_relation(
+    const GuestMappingLease& lease, uint64_t source_address, uint64_t source_bytes,
+    uint64_t producer_address, uint64_t minimum_producer_bytes);
+
 // Copy host bytes into a fully committed direct-memory mapping through prosper's authoritative
 // physical backing. This models a device write without weakening the guest VA's CPU protection.
 // Private, untracked, malformed, and cross-mapping destinations fail closed.

@@ -226,6 +226,38 @@ bool decode_clear_color(uint32_t format, uint32_t number_type, uint32_t comp_swa
 }
 }  // namespace
 
+uint64_t color_target_physical_bytes(const ColorTargetState& target) {
+    const uint32_t bpp = color_format_bytes_per_texel(target.format, target.number_type,
+                                                     target.comp_swap);
+    if (!target.base || !target.has_extent || !target.has_attrib3 || !target.width ||
+        !target.height || target.width > 16384u || target.height > 16384u || !bpp ||
+        target.mip_level || target.in_mip_tail) return 0;
+    if (target.resource_type == 2u) {
+        const auto view = color_target_volume_view(target);
+        if (!view.slice_count || target.log2_samples ||
+            !tile_mode_supports_volume(target.color_sw_mode)) return 0;
+        return tiled_volume_bytes(target.width, target.height, view.selected_mip_depth,
+                                  target.color_sw_mode, bpp);
+    }
+    if (target.resource_type != 1u || target.mip0_depth || target.slice_start || target.slice_max)
+        return 0; // no complete array/1D producer contract here
+    if (target.log2_samples) {
+        if (target.log2_samples > 3u) return 0;
+        return tiled_msaa_surface_bytes(target.width, target.height, target.color_sw_mode,
+                                        bpp, 1u << target.log2_samples);
+    }
+    switch (static_cast<TileMode>(target.color_sw_mode)) {
+        case TileMode::Linear: return linear_sampled_surface_bytes(target.width, target.height, bpp);
+        case TileMode::Sw256BS:
+        case TileMode::Sw4KbS:
+        case TileMode::Sw64KbS:
+        case TileMode::Sw64KbZX:
+        case TileMode::Sw64KbRX:
+            return tiled_surface_bytes(target.width, target.height, target.color_sw_mode, 0, bpp);
+        default: return 0;
+    }
+}
+
 // #1724 diagnostic-only escape hatch; see render_state.hpp. Read once: resolve_pipeline_state is
 // on the per-draw path.
 bool legacy_cb_disable_mask_enabled() {

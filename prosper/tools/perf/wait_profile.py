@@ -44,7 +44,11 @@ USAGE
     wait_profile.py --pid <pid> [--seconds 30] [--hz 200] [--windows 6] [--top 12]
     wait_profile.py --name prosper-app --seconds 60
 """
-import argparse, collections, os, sys, time
+import argparse
+import collections
+import os
+import sys
+import time
 
 # The /proc mount this reads. A constant rather than a literal so the self-test can build a
 # process tree BY HAND and never depend on what is running on the machine that runs it.

@@ -354,11 +354,11 @@ def parse_fps_record(body: str, where: str, name: str) -> dict | None:
     # being read as current.
     try:
         datetime.date.fromisoformat(m.group("date"))
-    except ValueError:
+    except ValueError as exc:
         raise ParseError(
             "%s (%s): the 'FPS record:' date %r is not a real calendar date."
             % (where, name, m.group("date"))
-        )
+        ) from exc
     active = int(m.group("active"))
     if active > 100:
         raise ParseError(

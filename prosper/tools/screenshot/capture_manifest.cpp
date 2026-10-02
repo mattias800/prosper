@@ -252,6 +252,28 @@ const char* capture_source_name(CaptureSource source) {
     return "raw_scanout";
 }
 
+std::string manifest_conditions_json(const CaptureConditions& c) {
+    std::ostringstream line;
+    line << "{\"type\":\"conditions\",\"schema\":1"
+         << ",\"harness\":\"" << json_escape(c.harness) << "\""
+         << ",\"present_path\":\"" << json_escape(c.present_path) << "\""
+         << ",\"os\":\"" << json_escape(c.os) << "\""
+         << ",\"flip_pace_fps\":\"" << json_escape(c.flip_pace_fps) << "\""
+         << ",\"gpu_known\":" << (c.gpu_known ? "true" : "false");
+    auto field = [&](const char* name, uint32_t value) {
+        line << ",\"" << name << "\":";
+        if (c.gpu_known) line << value;
+        else             line << "null";
+    };
+    field("gpu_vendor_id", c.gpu_vendor_id);
+    field("gpu_device_id", c.gpu_device_id);
+    field("gpu_driver_version", c.gpu_driver_version);
+    field("gpu_api_version", c.gpu_api_version);
+    field("gpu_device_type", c.gpu_device_type);
+    line << "}";
+    return line.str();
+}
+
 std::string manifest_run_json(const CaptureRunConfig& c) {
     std::ostringstream line;
     line << "{\"type\":\"run\",\"schema\":1"
@@ -388,6 +410,22 @@ std::string manifest_summary_json(int saved, int requested, SamplingStop stop,
          << ",\"typical_interval_seconds\":" << std::fixed << std::setprecision(6)
          << rate.typical_interval_seconds
          << ",\"interval_samples\":" << rate.interval_samples
+         // Frame-time tail over distinct frames, in ms; `null` when the interval population cannot
+         // resolve that tail (p90 needs 10 intervals, p95 20, p99 100), never 0.
+         << ",\"interval_p90_ms\":";
+    if (rate.p90_measured) line << std::fixed << std::setprecision(3) << rate.interval_p90_seconds * 1000.0;
+    else                   line << "null";
+    line << ",\"interval_p95_ms\":";
+    if (rate.p95_measured) line << std::fixed << std::setprecision(3) << rate.interval_p95_seconds * 1000.0;
+    else                   line << "null";
+    line << ",\"interval_p99_ms\":";
+    if (rate.p99_measured) line << std::fixed << std::setprecision(3) << rate.interval_p99_seconds * 1000.0;
+    else                   line << "null";
+    // 1 / p99 -- the histogram-native "1% low", NOT the mean fps of the slowest 1% of frames.
+    line << ",\"low_1pct_fps\":";
+    if (rate.p99_measured) line << std::fixed << std::setprecision(3) << rate.low_1pct_fps;
+    else                   line << "null";
+    line
          << ",\"active_fraction\":" << std::fixed << std::setprecision(4) << rate.active_fraction
          // Wall-clock averages over the whole window. True, and a poor summary of any route that
          // pauses -- see gpu/present/present_frame_rate.hpp.

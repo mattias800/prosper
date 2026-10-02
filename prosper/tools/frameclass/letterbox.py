@@ -30,7 +30,10 @@ Two things to know before trusting an answer, both learned the hard way on PPSA1
 And it only means anything on a title that actually bars its cutscenes. Confirm that before
 reading a bar count as a cutscene count.
 """
-import argparse, glob, os, sys
+import argparse
+import glob
+import os
+import sys
 
 import numpy as np
 from PIL import Image

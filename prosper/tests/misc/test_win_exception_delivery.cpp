@@ -1,16 +1,22 @@
 // Windows must run sceKernelRaiseException's guest handler on the requested target thread,
 // then restore the exact interrupted host context so that thread continues normally.
+// Native-created targets adopt a guest Self handle before publishing readiness: registered guest
+// HLE accepts that handle, while internal wait/trace registries and pthread_join keep native IDs.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "hle/kernel/guest_thread_handle.hpp"
 #include "hle/sync/sync_futex.hpp"
 #include "host/image/exec_image.hpp"
 #include "host/x86/sse4a.hpp"
 #include "fixtures/test_scratch.h"
 #include <pthread.h>
 #include <windows.h>
+#include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -92,6 +98,7 @@ alignas(32) static uint8_t avx_expected[32];
 alignas(32) static uint8_t avx_observed[32];
 static HleFn wait_on_address;
 static HleFn raise_fn;   // #2139: file scope so the primary-thread probers can raise
+static HleFn self_fn;
 static pthread_mutex_t wait_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wait_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t blocked_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -108,6 +115,30 @@ struct CondDestroyRace {
 
 #define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); fails++; } \
                               else        { std::printf("  [ok]   %s\n", msg); } } while (0)
+
+struct AdoptedTargetStart {
+    void* (*entry)(void*);
+    void* argument;
+    std::atomic<uint64_t>* guest_handle;
+};
+
+static void* adopted_target_start(void* raw) {
+    const AdoptedTargetStart start = *static_cast<AdoptedTargetStart*>(raw);
+    delete static_cast<AdoptedTargetStart*>(raw);
+    // The registered Self path installs native-key retirement for this normally returning worker.
+    start.guest_handle->store(self_fn(0, 0, 0, 0, 0, 0), std::memory_order_release);
+    return start.entry(start.argument);
+}
+
+static int create_adopted_target(pthread_t* host, std::atomic<uint64_t>& guest_handle,
+                                 void* (*entry)(void*), void* argument) {
+    guest_handle.store(0, std::memory_order_relaxed);
+    auto* start = new (std::nothrow) AdoptedTargetStart{entry, argument, &guest_handle};
+    if (!start) return ENOMEM;
+    const int result = pthread_create(host, nullptr, adopted_target_start, start);
+    if (result != 0) delete start;
+    return result;
+}
 
 extern "C" __attribute__((sysv_abi)) void guest_exception_handler(uint64_t type, void* raw_ctx) {
     uint64_t stack_marker = 0;
@@ -142,24 +173,24 @@ static void* worker(void*) {
 }
 
 // #2139: the PRIMARY guest thread. It never runs through win_thread_trampoline, so it never
-// published a thread handle, and in a live title every raise at it took win_raise_exception's
+// published a native exception-registration handle, and in a live title every raise at it took win_raise_exception's
 // esrch-no-handle branch -- so the IL2CPP GC could not stop it and marked the heap while it kept
 // mutating. This case covers the shape no other case here does: a raise at the thread that is
 // running the guest, rather than at a pthread_create'd worker.
-static pthread_t primary_pthread;
+static uint64_t primary_guest_thread;
 static volatile DWORD primary_tid;
 static volatile LONG primary_parked;
 static volatile uint64_t primary_raise_result;
 
 static void* primary_prober(void*) {   // raise at the primary while it is NOT parked
-    primary_raise_result = raise_fn((uint64_t)primary_pthread, 0x1e, 0, 0, 0, 0);
+    primary_raise_result = raise_fn(primary_guest_thread, 0x1e, 0, 0, 0, 0);
     return nullptr;
 }
 
 static void* primary_raiser(void*) {   // raise at the primary while it IS parked in an HLE wait
     for (WaitDeadline deadline(kWaitEventMs); !primary_parked && deadline.pending();) Sleep(1);
     Sleep(20);   // let the wait register before the raise looks for a checkpoint
-    primary_raise_result = raise_fn((uint64_t)primary_pthread, 0x1e, 0, 0, 0, 0);
+    primary_raise_result = raise_fn(primary_guest_thread, 0x1e, 0, 0, 0, 0);
     // Watchdog: a failed delivery must not hang the suite. Wake the primary so the assertions
     // below report the failure instead of the test timing out with no diagnosis.
     for (WaitDeadline deadline(kWaitDeliveryMs); !delivered && deadline.pending();) Sleep(1);
@@ -648,6 +679,7 @@ static void test_condition_slot_lifecycle() {
 }
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0); // Keep a bounded failed delivery diagnosable on timeout.
     std::printf("== test_win_exception_delivery ==\n");
 
     test_sse4a_fastpath();
@@ -659,13 +691,16 @@ int main() {
     HleFn install = Hle::lookup(nid_hash("sceKernelInstallExceptionHandler"));
     HleFn raise = Hle::lookup(nid_hash("sceKernelRaiseException"));
     raise_fn = raise;
+    self_fn = Hle::lookup(nid_hash("scePthreadSelf"));
     wait_on_address = Hle::lookup("Hc4CaR6JBL0");
-    CHECK(install && raise && wait_on_address, "exception and futex HLE functions registered");
-    if (!install || !raise || !wait_on_address) return 1;
+    CHECK(install && raise && self_fn && wait_on_address,
+          "exception, guest Self and futex HLE functions registered");
+    if (!install || !raise || !self_fn || !wait_on_address) return 1;
 
     CHECK(install(0x1e, (uint64_t)(uintptr_t)&guest_exception_handler, 0, 0, 0, 0) == 0,
           "install guest exception handler");
     pthread_t thread = 0;
+    std::atomic<uint64_t> guest_thread{0};
 
     registry_tid = 0;
     registry_done = 0;
@@ -737,11 +772,19 @@ int main() {
     if (readwrite_page) VirtualFree(readwrite_page, 0, MEM_RELEASE);
     if (executable_page) VirtualFree(executable_page, 0, MEM_RELEASE);
 
-    CHECK(pthread_create(&thread, nullptr, worker, nullptr) == 0, "create target thread");
+    CHECK(create_adopted_target(&thread, guest_thread, worker, nullptr) == 0,
+          "create target thread");
     for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
     CHECK(worker_tid != 0, "target thread entered blocking HLE futex");
 
-    uint64_t result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+    pthread_t resolved_host{};
+    CHECK(guest_thread.load(std::memory_order_acquire) != 0 &&
+              hle::guest_thread_handle_resolve(guest_thread.load(std::memory_order_acquire),
+                                               &resolved_host) && resolved_host == thread,
+          "adopted guest handle resolves to the native diagnostic/wait identity");
+    CHECK(raise((uint64_t)thread, 0x1e, 0, 0, 0, 0) == 0x80020003ull,
+          "registered guest raise refuses a raw host pthread index");
+    uint64_t result = raise(guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "raise exception to target thread");
     for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
     if (!resumed) {
@@ -760,7 +803,7 @@ int main() {
 
     reset_delivery_state();
     pthread_mutex_lock(&wait_mutex);
-    CHECK(pthread_create(&thread, nullptr, cond_worker, nullptr) == 0,
+    CHECK(create_adopted_target(&thread, guest_thread, cond_worker, nullptr) == 0,
           "create pthread-condition target thread");
     for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
     pthread_mutex_unlock(&wait_mutex);
@@ -772,7 +815,7 @@ int main() {
     pthread_mutex_unlock(&wait_mutex);
     CHECK(worker_tid != 0 && cond_ready != 0, "target entered registered pthread-condition wait");
 
-    result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+    result = raise(guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "raise exception to pthread-condition target");
     for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
     if (!resumed) interruptible_cond_broadcast(&wait_cond);
@@ -786,13 +829,13 @@ int main() {
 
     reset_delivery_state();
     pthread_mutex_lock(&blocked_mutex);
-    CHECK(pthread_create(&thread, nullptr, mutex_worker, nullptr) == 0,
+    CHECK(create_adopted_target(&thread, guest_thread, mutex_worker, nullptr) == 0,
           "create pthread-mutex target thread");
     for (WaitDeadline deadline(kWaitReadyMs); !mutex_ready && deadline.pending();) Sleep(1);
     CHECK(worker_tid != 0 && mutex_ready != 0, "target entered contended pthread-mutex lock");
     Sleep(10);
 
-    result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+    result = raise(guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "raise exception to pthread-mutex target");
     for (WaitDeadline deadline(kWaitEventMs); !delivered && deadline.pending();) Sleep(1);
     CHECK(delivered != 0, "guest handler interrupted contended pthread-mutex lock");
@@ -803,15 +846,15 @@ int main() {
 
     reset_delivery_state();
     hold_handler = 1;
-    CHECK(pthread_create(&thread, nullptr, worker, nullptr) == 0,
+    CHECK(create_adopted_target(&thread, guest_thread, worker, nullptr) == 0,
           "create nested-delivery target thread");
     for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
     CHECK(worker_tid != 0, "nested-delivery target entered blocking wait");
-    result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+    result = raise(guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "start first exception delivery");
     for (WaitDeadline deadline(kWaitEventMs); !delivered && deadline.pending();) Sleep(1);
     CHECK(delivered != 0, "first handler is active on its exception stack");
-    result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+    result = raise(guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
     CHECK(result == 0x80020010ull, "overlapping delivery to one target is rejected as EBUSY");
     InterlockedExchange(&release_handler, 1);
     for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
@@ -820,16 +863,16 @@ int main() {
     CHECK(resumed != 0, "target resumes cleanly after serialized delivery");
 
     reset_delivery_state();
-    CHECK(pthread_create(&thread, nullptr, repeat_worker, nullptr) == 0,
+    CHECK(create_adopted_target(&thread, guest_thread, repeat_worker, nullptr) == 0,
           "create repeated-delivery target thread");
     for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
     CHECK(worker_tid != 0, "repeated-delivery target entered first wait");
-    result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+    result = raise(guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "start first serialized delivery");
     for (WaitDeadline deadline(kWaitEventMs); !repeat_stage && deadline.pending();) Sleep(1);
     CHECK(repeat_stage == 1, "first delivery restored the target's original context");
     Sleep(10);
-    result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+    result = raise(guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "reuse exception stack after restored context is observed");
     for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
     if (!resumed) WakeByAddressAll((void*)&wait_word);
@@ -842,11 +885,11 @@ int main() {
         for (size_t i = 0; i < sizeof avx_expected; i++)
             avx_expected[i] = static_cast<uint8_t>(0x31u + i * 7u);
         avx_test_active = 1;
-        CHECK(pthread_create(&thread, nullptr, avx_worker, nullptr) == 0,
+        CHECK(create_adopted_target(&thread, guest_thread, avx_worker, nullptr) == 0,
               "create AVX-state target thread");
         for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
         CHECK(worker_tid != 0, "AVX-state target entered register-live loop");
-        result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+        result = raise(guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
         CHECK(result == 0, "deliver exception while YMM register is live");
         for (WaitDeadline deadline(kWaitEventMs); !delivered && deadline.pending();) Sleep(1);
         InterlockedExchange(&avx_stop, 1);
@@ -859,13 +902,13 @@ int main() {
     }
 
     reset_delivery_state();
-    CHECK(pthread_create(&thread, nullptr, gpr_worker, nullptr) == 0,
+    CHECK(create_adopted_target(&thread, guest_thread, gpr_worker, nullptr) == 0,
           "create nonvolatile-register target thread");
     for (WaitDeadline deadline(kWaitReadyMs); !gpr_ready && deadline.pending();) Sleep(1);
     CHECK(worker_tid != 0 && gpr_ready != 0, "nonvolatile R12 pattern is live");
     bool all_deliveries = true;
     for (LONG i = 1; i <= 100; ++i) {
-        result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+        result = raise(guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
         if (result != 0) { all_deliveries = false; break; }
         // Handler entry increments delivered on the exception stack, before RtlRestoreContext.
         // Only this target's restored normal-context loop can copy that generation to gpr_ack,
@@ -890,13 +933,13 @@ int main() {
     // may not reach one. The bounded queue must be withdrawn and forced-CONTEXT delivery must run the
     // handler before success is returned. Repeating on one target also proves the prior delivery
     // restored normal execution outside its exception stack and the global queued counter did not leak.
-    CHECK(pthread_create(&thread, nullptr, gpr_worker, nullptr) == 0,
+    CHECK(create_adopted_target(&thread, guest_thread, gpr_worker, nullptr) == 0,
           "create CPU-bound default-delivery target thread");
     for (WaitDeadline deadline(kWaitReadyMs); !gpr_ready && deadline.pending();) Sleep(1);
     bool cpu_fallback_ok = worker_tid != 0 && gpr_ready != 0;
     for (LONG expected_deliveries = 1; expected_deliveries <= 2 && cpu_fallback_ok;
          ++expected_deliveries) {
-        result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+        result = raise(guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
         for (WaitDeadline deadline(kWaitEventMs); gpr_ack < expected_deliveries && deadline.pending();) Sleep(1);
         cpu_fallback_ok = result == 0 && delivered == expected_deliveries &&
                           gpr_ack == expected_deliveries &&
@@ -908,16 +951,17 @@ int main() {
           "CPU-bound target receives two fallback deliveries with no queued state leak");
 
     pthread_t exited_thread{};
-    CHECK(pthread_create(&exited_thread, nullptr, exited_worker, nullptr) == 0,
+    std::atomic<uint64_t> exited_guest_thread{0};
+    CHECK(create_adopted_target(&exited_thread, exited_guest_thread, exited_worker, nullptr) == 0,
           "create target that exits before exception delivery");
     pthread_join(exited_thread, nullptr);
-    result = raise((uint64_t)exited_thread, 0x1e, 0, 0, 0, 0);
+    result = raise(exited_guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
     CHECK(result == 0x80020003ull && pending_guest_exception_count() == 0,
           "exited target returns ESRCH without publishing queued state");
 
     reset_delivery_state();
     pthread_mutex_lock(&wait_mutex);
-    CHECK(pthread_create(&thread, nullptr, cond_worker, nullptr) == 0,
+    CHECK(create_adopted_target(&thread, guest_thread, cond_worker, nullptr) == 0,
           "create cooperative-delivery target thread");
     for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
     pthread_mutex_unlock(&wait_mutex);
@@ -933,7 +977,7 @@ int main() {
           cooperative_wait.source == (uintptr_t)&wait_cond && cooperative_wait.object != 0,
           "condition wait snapshot keeps kind, object, and source in one generation");
 
-    result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+    result = raise(guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "queue cooperative exception delivery");
     for (WaitDeadline deadline(kWaitEventMs); !resumed && deadline.pending();) Sleep(1);
     if (!resumed) interruptible_cond_broadcast(&wait_cond);
@@ -957,7 +1001,7 @@ int main() {
     reset_delivery_state();
     nested_wait_enabled = 1;
     pthread_mutex_lock(&wait_mutex);
-    CHECK(pthread_create(&thread, nullptr, cond_worker, nullptr) == 0,
+    CHECK(create_adopted_target(&thread, guest_thread, cond_worker, nullptr) == 0,
           "create nested-wait cooperative target thread");
     for (WaitDeadline deadline(kWaitReadyMs); !worker_tid && deadline.pending();) Sleep(1);
     pthread_mutex_unlock(&wait_mutex);
@@ -969,7 +1013,7 @@ int main() {
           nested_outer_wait.kind == GuestWaitKind::ConditionSequence &&
           nested_outer_wait.object != 0,
           "nested-delivery target begins with one stable outer wait");
-    result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+    result = raise(guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "deliver cooperative exception whose handler performs a nested wait");
     for (WaitDeadline deadline(kWaitEventMs); !nested_wait_ready && deadline.pending();) Sleep(1);
     CHECK(nested_wait_ready != 0, "guest handler entered its nested semaphore-style wait");
@@ -1021,11 +1065,11 @@ int main() {
     CHECK(resumed != 0, "target resumed after nested-wait handler returned");
 
     reset_delivery_state();
-    CHECK(pthread_create(&thread, nullptr, prewait_worker, nullptr) == 0,
+    CHECK(create_adopted_target(&thread, guest_thread, prewait_worker, nullptr) == 0,
           "create queue-before-wait target thread");
     for (WaitDeadline deadline(kWaitReadyMs); !prewait_ready && deadline.pending();) Sleep(1);
     CHECK(prewait_ready != 0, "target paused before registering its wait");
-    result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+    result = raise(guest_thread.load(std::memory_order_acquire), 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "queue cooperative delivery before wait registration");
     InterlockedExchange(&prewait_release, 1);
     for (WaitDeadline deadline(kWaitEventMs); !delivered && deadline.pending();) Sleep(1);
@@ -1055,7 +1099,9 @@ int main() {
             break;
         }
         pthread_t race_thread{};
-        if (pthread_create(&race_thread, nullptr, cond_destroy_race_worker, &race) != 0) {
+        std::atomic<uint64_t> race_guest_thread{0};
+        if (create_adopted_target(&race_thread, race_guest_thread,
+                                  cond_destroy_race_worker, &race) != 0) {
             pthread_cond_destroy(&race.cond);
             pthread_mutex_destroy(&race.mutex);
             cond_destroy_race_ok = false;
@@ -1066,7 +1112,8 @@ int main() {
         // completed before the exception and natural signal are raced.
         pthread_mutex_lock(&race.mutex);
         pthread_mutex_unlock(&race.mutex);
-        const uint64_t race_result = raise((uint64_t)race_thread, 0x1e, 0, 0, 0, 0);
+        const uint64_t race_result = raise(race_guest_thread.load(std::memory_order_acquire),
+                                            0x1e, 0, 0, 0, 0);
         interruptible_cond_signal(&race.cond);
         pthread_join(race_thread, nullptr);
         const int cond_destroyed = pthread_cond_destroy(&race.cond);
@@ -1141,11 +1188,12 @@ int main() {
                           "semaphore wait is interruptible through its sequence");
 
     // ---- #2139: sceKernelRaiseException must reach the PRIMARY guest thread ----
-    // Every other case in this file raises at a pthread_create'd worker, which win_thread_trampoline
-    // registers. That is exactly the shape that already worked, which is why this defect survived:
+    // Other cases raise at native-created workers that adopt Self before publishing readiness.
+    // The native exception/wait registrations remain separate from their guest-visible identity:
     // no case here reached the guest primary thread at all.
     {
-        primary_pthread = pthread_self();
+        primary_guest_thread = self_fn(0, 0, 0, 0, 0, 0);
+        CHECK(primary_guest_thread != 0, "the primary thread adopts a guest Self handle");
         primary_tid = GetCurrentThreadId();
 
         // NOT a red/green guard, and it must not be read as one. In-process, this test's own main

@@ -64,9 +64,9 @@ def main(argv):
         if flag in argv:
             try:
                 return cast(argv[argv.index(flag) + 1])
-            except (IndexError, ValueError):
+            except (IndexError, ValueError) as exc:
                 print("bad value for %s" % flag, file=sys.stderr)
-                raise SystemExit(1)
+                raise SystemExit(1) from exc
         return default
 
     top = opt('--top', 5, int)

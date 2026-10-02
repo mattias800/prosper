@@ -180,7 +180,7 @@ def main() -> int:
                 print("  submit %d: extract failed, SKIPPED (not counted either way)" % ordinal)
 
     draws = []
-    for capture, label in captures:
+    for capture, _label in captures:
         done = run([args.gpu_replay, "--inspect-only", capture])
         found = DRAW.findall(done.stdout + done.stderr)
         draws.extend((capture, d[0], d[1], d[2]) for d in found)
@@ -198,7 +198,7 @@ def main() -> int:
         first_draw.setdefault(fs_hash, (capture, draw_id, int(dwords)))
 
     results = {}
-    for fs_hash, (capture, draw_id, dwords) in sorted(first_draw.items()):
+    for fs_hash, (capture, draw_id, _dwords) in sorted(first_draw.items()):
         spv = work / ("fs_%s.spv" % fs_hash)
         # --inspect-only alongside --dump-shader: the module is written from the same realization
         # either way (byte-identical output, verified), but the frame is not REPLAYED. That matters

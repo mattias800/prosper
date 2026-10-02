@@ -10,7 +10,7 @@ import re
 import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from collections.abc import Callable
 
 PROPERTY = "PROSPER_DIAG_MEMBER_FACT_DOMAIN"
 IDENT = re.compile(r"[A-Za-z_][A-Za-z_0-9.-]*\Z")

@@ -219,7 +219,7 @@ _READ_RE = re.compile(
 
 def parse_read_log(path: str):
     """Yield (offset, size, got, status) for each `[apr] read-submit` result line."""
-    with open(path, 'r', errors='replace') as f:
+    with open(path, errors='replace') as f:
         for line in f:
             m = _READ_RE.search(line)
             if m:

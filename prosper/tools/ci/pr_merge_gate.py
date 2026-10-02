@@ -113,7 +113,7 @@ def parse_checks(payload):
         try:
             payload = json.loads(payload)
         except (ValueError, TypeError) as exc:
-            raise GateError("check payload is not JSON: %s" % exc)
+            raise GateError("check payload is not JSON: %s" % exc) from exc
     if not isinstance(payload, list):
         raise GateError("check payload is not a JSON list (got %s)" % type(payload).__name__)
     out = []
@@ -178,7 +178,7 @@ def _run(cmd, cwd):
     try:
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     except OSError as exc:
-        raise GateError("could not run %s: %s" % (cmd[0], exc))
+        raise GateError("could not run %s: %s" % (cmd[0], exc)) from exc
     if p.returncode != 0:
         raise GateError("%s failed (%d): %s" % (" ".join(cmd[:3]), p.returncode, p.stderr.strip()[:300]))
     return p.stdout
@@ -213,7 +213,7 @@ def collect(pr, repo_dir):
     try:
         info = json.loads(view)
     except ValueError as exc:
-        raise GateError("could not parse PR view: %s" % exc)
+        raise GateError("could not parse PR view: %s" % exc) from exc
     pr_head, branch = info.get("headRefOid"), info.get("headRefName")
     # A null/absent head is NOT a reason to skip the comparison. Treating it as "no head
     # information" made the gate print no head line at all and exit 0 -- a silent GREEN exactly

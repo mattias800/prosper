@@ -1,6 +1,8 @@
-# gdb -p PID -batch -x probe232y.py — issue #232: dump thread1's remaining stack (to the top
-# of its mapping) qword by qword; classify guest addresses.
-import gdb, struct
+"""gdb -p PID -batch -x probe232y.py — issue #232: dump thread1's remaining stack (to the top
+of its mapping) qword by qword; classify guest addresses.
+"""
+import gdb
+import struct
 
 gdb.execute("set pagination off")
 gdb.execute("set confirm off")

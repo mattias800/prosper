@@ -732,7 +732,7 @@ def main() -> int:
     # --- check 5: read back from disk, and make it add up ----------------------------------------
     on_disk = {}
     for out in plan:
-        with open(source.parent / out, "r", encoding="utf-8", newline="") as fh:
+        with open(source.parent / out, encoding="utf-8", newline="") as fh:
             on_disk[out] = fh.read()
     problems = verify_reconstruction(map_data, plan, on_disk, original)
     if problems:

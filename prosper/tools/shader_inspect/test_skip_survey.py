@@ -19,7 +19,6 @@ which is the event that would otherwise silently zero the survey.
 
     python test_skip_survey.py            # from anywhere in the checkout
 """
-import re
 import sys
 from pathlib import Path
 

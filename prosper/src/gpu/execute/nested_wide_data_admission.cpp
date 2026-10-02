@@ -1,4 +1,5 @@
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/execute/graphics_nested_wide_reader.hpp"
 
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -169,4 +170,136 @@ bool admit_compute_nested_wide_data(const GuestMappingLease* lease,
     }
     return true;
 }
+static GraphicsRawSourceAuthorityFn g_graphics_raw_source_authority;
+void set_graphics_raw_source_authority(GraphicsRawSourceAuthorityFn fn) {
+    g_graphics_raw_source_authority = std::move(fn);
+}
+bool graphics_raw_source_is_guest_current(const GuestMappingLease& lease,
+                                          uint64_t address, uint32_t bytes) {
+    return g_graphics_raw_source_authority && g_graphics_raw_source_authority(lease, address, bytes);
+}
+static GraphicsProducerStatusFn g_graphics_producer_status;
+void set_graphics_producer_status_query(GraphicsProducerStatusFn fn) {
+    g_graphics_producer_status = std::move(fn);
+}
+GraphicsProducerStatus graphics_producer_status() {
+    return g_graphics_producer_status ? g_graphics_producer_status() : GraphicsProducerStatus{};
+}
+
+GraphicsNestedWideReader::GraphicsNestedWideReader(std::vector<RawNestedWideChain> chains,
+        const GraphicsRawSnapshotContext* context) : chains_(std::move(chains)) {
+    allowed_ = context && context->producers_complete && !chains_.empty();
+    if (context) output_allocations_ = context->output_allocations;
+    for (const auto& chain : chains_) {
+        for (const auto [pc, bytes] : {std::pair{chain.parent_pc, chain.parent_bytes},
+                                      std::pair{chain.child_pc, chain.child_bytes}}) {
+            const auto [it, inserted] = widths_.emplace(pc, bytes);
+            if (!inserted && it->second != bytes) allowed_ = false;
+        }
+    }
+    if (allowed_) lease_ = std::make_unique<GuestMappingLease>();
+}
+
+bool GraphicsNestedWideReader::probe(FoldProbe kind, uint32_t pc, uint64_t address,
+                                     uint32_t bytes) {
+    const auto width = widths_.find(pc);
+    if (width == widths_.end()) return guest_readable(address, bytes);
+    // Raw pointers may not be repaired by Base48/Base40 fallback or a readable host VMA.
+    if (!allowed_ || !lease_ || kind != FoldProbe::Raw || bytes != width->second ||
+        address <= 0x10000u || (address & 3u) || address > UINT64_MAX - bytes) return false;
+    const auto prior = observations_.find(pc);
+    if (prior != observations_.end())
+        return prior->second.address == address && prior->second.bytes->size() == bytes;
+    for (const auto& chain : chains_) {
+        if (chain.child_pc != pc) continue;
+        const auto parent = observations_.find(chain.parent_pc);
+        if (parent == observations_.end() || address < chain.child_offset) return false;
+        uint64_t pointer = 0;
+        std::memcpy(&pointer, parent->second.bytes->data(), sizeof(pointer));
+        if (pointer != address - chain.child_offset) return false;
+    }
+    if (!guest_memory_direct_range_fault_safe(*lease_, address, bytes) ||
+        guest_memory_direct_allocation_relation(*lease_, address, bytes, address, bytes) !=
+            GuestMemoryTopologyRelation::Overlap ||
+        !guest_readable(address, bytes) ||
+        !graphics_raw_source_is_guest_current(*lease_, address, bytes)) return false;
+    for (const auto [output, physical_bytes] : output_allocations_)
+        if (output && guest_memory_direct_allocation_relation(*lease_, address, bytes,
+                output, physical_bytes) != GuestMemoryTopologyRelation::Disjoint) return false;
+    auto owner = std::make_shared<std::vector<uint8_t>>(bytes);
+    std::memcpy(owner->data(), reinterpret_cast<const void*>(uintptr_t(address)), bytes);
+    observations_.emplace(pc, Observation{address, std::move(owner)});
+    return true;
+}
+
+uint32_t GraphicsNestedWideReader::word(uint32_t pc, uint64_t address) {
+    if (!owns_raw_wide(pc)) return *reinterpret_cast<const uint32_t*>(uintptr_t(address));
+    const auto it = observations_.find(pc);
+    if (it == observations_.end() || address < it->second.address ||
+        address - it->second.address > it->second.bytes->size() - sizeof(uint32_t))
+        throw std::runtime_error("nested raw fold word lacks exact observation");
+    uint32_t value = 0;
+    std::memcpy(&value, it->second.bytes->data() + address - it->second.address, sizeof(value));
+    return value;
+}
+
+void GraphicsNestedWideReader::prefix(uint32_t pc, uint64_t address, void* destination,
+                                      uint32_t bytes) {
+    if (!owns_raw_wide(pc)) {
+        std::memcpy(destination, reinterpret_cast<const void*>(uintptr_t(address)), bytes);
+        return;
+    }
+    const auto it = observations_.find(pc);
+    if (it == observations_.end() || address != it->second.address ||
+        bytes != it->second.bytes->size())
+        throw std::runtime_error("nested raw fold prefix lacks exact observation");
+    std::memcpy(destination, it->second.bytes->data(), bytes);
+}
+
+bool GraphicsNestedWideReader::publish(ShaderResourceTable& table) const {
+    table.owned_nested_snapshot_requirements.assign(widths_.begin(), widths_.end());
+    if (!allowed_ || observations_.size() != widths_.size()) return false;
+    for (const auto& chain : chains_) {
+        const auto& parent = observations_.at(chain.parent_pc);
+        const auto& child = observations_.at(chain.child_pc);
+        uint64_t pointer = 0;
+        std::memcpy(&pointer, parent.bytes->data(), sizeof(pointer));
+        if (child.address < chain.child_offset || pointer != child.address - chain.child_offset)
+            return false;
+    }
+    // Existing exact-PC resources may only be the identical owned parent from the same fold.
+    // A descriptor, duplicate, or conflicting binding cannot be replaced by a later valid owner.
+    for (const auto& [pc, observation] : observations_) {
+        size_t matches = 0;
+        for (const auto& resource : table.resources) {
+            if (resource.fetch_pc != pc) continue;
+            if (++matches > 1 || !valid_owned_raw_snapshot_resource(resource, widths_.at(pc)) ||
+                resource.gpu_addr != observation.address ||
+                std::memcmp(resource.host_data, observation.bytes->data(), widths_.at(pc)) != 0)
+                return false;
+        }
+    }
+    for (const auto& [pc, observation] : observations_) {
+        ShaderResource resource;
+        resource.cls = ResourceClass::ConstantBuffer;
+        resource.format = DataFormat::Uint32;
+        resource.num_components = 1;
+        resource.gpu_addr = observation.address;
+        resource.size = widths_.at(pc);
+        resource.fetch_pc = pc;
+        resource.owned_nested_snapshot_bytes = resource.size;
+        resource.host_data = observation.bytes->data();
+        resource.host_data_size = observation.bytes->size();
+        const auto existing = std::find_if(table.resources.begin(), table.resources.end(),
+            [pc](const ShaderResource& candidate) { return candidate.fetch_pc == pc; });
+        if (existing == table.resources.end()) table.resources.push_back(resource);
+        else {
+            resource.owned_raw_snapshot_bytes = existing->owned_raw_snapshot_bytes;
+            *existing = resource;
+        }
+        table.owned_host_data.push_back(observation.bytes);
+    }
+    return true;
+}
+
 } // namespace prosper::gpu

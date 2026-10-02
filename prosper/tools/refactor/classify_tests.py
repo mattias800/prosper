@@ -231,7 +231,7 @@ def selftest() -> int:
             print(f"  [FAIL] {name}: {got}")
             bad += 1
     if bad:
-        print(f"  the classifier's own rules are broken; its output would be confident and wrong")
+        print("  the classifier's own rules are broken; its output would be confident and wrong")
         return 1
     print(f"  [ok]   classifier self-test: {len(SELFTESTS)} placement case(s), "
           f"{len(NEGATIVE)} must-not case(s)")

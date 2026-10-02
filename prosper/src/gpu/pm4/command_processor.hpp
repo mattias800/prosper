@@ -415,6 +415,13 @@ void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect);
 size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st,
                           size_t* consumed_dwords = nullptr);
 
+struct CommandBuffer { const uint32_t* data; size_t dwords; };
+// Array entries are consecutive segments of ONE fold: register/work state, command order and
+// WAIT_REG_MEM deferral continue across their boundaries. No submit/completion policy lives here.
+// If supplied, consumed_dwords has buffer_count entries (one decode extent per segment).
+size_t run_command_buffers(const CommandBuffer* buffers, size_t buffer_count, GpuState& st,
+                           size_t* consumed_dwords = nullptr);
+
 // WAIT_REG_MEM barrier model, OPT-IN via PROSPER_WAIT_DEFER=1 (issue #312 — see the block
 // comment in command_processor.cpp, including the measured verdict on why it is not default:
 // it eliminates the canary-152 wait-ordering corruption class but a second, order-independent

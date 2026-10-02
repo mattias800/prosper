@@ -1,8 +1,9 @@
-# gdb -p PID -batch -x flow6.py — DOLL loading-progression: who pumps the per-frame unimplemented
-# calls? Break on the host dispatcher prosper_on_unimpl, capture the import index (rdi) + the guest
-# RA chain off the stack for ~40 hits, and histogram them. The two dominant chains are the
-# per-frame sceNetCtlCheckCallback and sceErrorDialogUpdateStatus pumps — their callers identify
-# the engine/game subsystem that is waiting on network-state delivery.
+"""gdb -p PID -batch -x flow6.py — DOLL loading-progression: who pumps the per-frame unimplemented
+calls? Break on the host dispatcher prosper_on_unimpl, capture the import index (rdi) + the guest
+RA chain off the stack for ~40 hits, and histogram them. The two dominant chains are the
+per-frame sceNetCtlCheckCallback and sceErrorDialogUpdateStatus pumps — their callers identify
+the engine/game subsystem that is waiting on network-state delivery.
+"""
 import gdb
 from collections import Counter
 
@@ -24,7 +25,7 @@ def sym(v):
 
 bp = gdb.Breakpoint("prosper_on_unimpl")
 chains = Counter()
-for i in range(40):
+for _i in range(40):
     gdb.execute("continue")
     try:
         idx = int(gdb.parse_and_eval("$rdi")) & 0xffffffff

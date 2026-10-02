@@ -25,7 +25,6 @@ Run directly, or via ctest as `re_nid_gate_classifier`.
 """
 import os
 import struct
-import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

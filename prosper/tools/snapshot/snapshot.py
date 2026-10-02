@@ -36,9 +36,21 @@ window of normal composited screenshots, requires multiple frames to meet `min_c
 require visible pixel changes. Its pass/fail contract uses SSIM and content coverage to catch major
 collapse without rejecting subtle pixel improvements.
 """
-import sys, os, json, time, hashlib, math, struct, subprocess, tempfile, shutil, signal, ctypes, errno
+import sys
+import os
+import json
+import time
+import hashlib
+import math
+import struct
+import subprocess
+import tempfile
+import shutil
+import signal
+import ctypes
+import errno
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROSPER_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
@@ -267,8 +279,8 @@ def utc_timestamp(now=None):
     Deliberately not a bare date like the one `review` prose carries: a manifest field exists to be
     sorted and compared, and an unqualified local date cannot be either without knowing the zone.
     """
-    now = now or datetime.now(timezone.utc)
-    return now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = now or datetime.now(UTC)
+    return now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def parse_verified_at(stamp):
@@ -284,7 +296,7 @@ def parse_verified_at(stamp):
         parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def verification_age_days(stamp, now=None):
@@ -292,7 +304,7 @@ def verification_age_days(stamp, now=None):
     parsed = parse_verified_at(stamp)
     if parsed is None:
         return None
-    return ((now or datetime.now(timezone.utc)).astimezone(timezone.utc) - parsed).days
+    return ((now or datetime.now(UTC)).astimezone(UTC) - parsed).days
 
 
 def stamp_verification(entry, verified_by=VERIFIED_BY_AGENT, now=None):
@@ -323,7 +335,7 @@ def format_verification(entry, now=None):
     parsed = parse_verified_at(stamp)
     if parsed is None:
         return f"UNPARSEABLE {who_text}"
-    return (f"{parsed.astimezone(timezone.utc).strftime('%Y-%m-%d')} {who_text:<5} "
+    return (f"{parsed.astimezone(UTC).strftime('%Y-%m-%d')} {who_text:<5} "
             f"{verification_age_days(stamp, now):>4}d")
 
 

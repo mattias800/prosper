@@ -324,7 +324,7 @@ int main(int argc, char** argv) {
                 ? combined_replay.items[0].prt->by_fetch_pc(0u) : nullptr;
             const auto* restored_child = combined_ok && combined_replay.items.size() == 1u && combined_replay.items[0].prt
                 ? combined_replay.items[0].prt->by_fetch_pc(7u) : nullptr;
-            check(combined_ok && combined_decoded.format_version == 67u &&
+            check(combined_ok && combined_decoded.format_version == 68u &&
                   combined_decoded.draws.front().ps_float_mode == mode && combined_replay.items[0].ps_float_mode == mode &&
                   combined_replay.items[0].fragment_wave_config_available && !combined_replay.items[0].ps_wave32 &&
                   restored_parent && restored_parent->host_data && restored_parent->owned_raw_snapshot_bytes == size &&
@@ -346,7 +346,7 @@ int main(int argc, char** argv) {
         const auto transport_tail_size = 12u + decoded.draws.size();
         const auto flags_tail_size = 8u + 8u * decoded.draws.size();
         auto v65_bytes = encoded;
-        v65_bytes.resize(v65_bytes.size() - flags_tail_size - transport_tail_size); v65_bytes[8] = 65u;
+        v65_bytes.resize(v65_bytes.size() - owned_tail_size - flags_tail_size - transport_tail_size); v65_bytes[8] = 65u;
         GpuCaptureFile official65;
         check(deserialize_gpu_capture(v65_bytes, official65, error) && official65.format_version == 65u &&
               official65.draws.front().vrt.resources.front().resource.owned_raw_snapshot_bytes == size &&

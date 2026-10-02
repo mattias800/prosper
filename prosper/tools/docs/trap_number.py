@@ -43,7 +43,6 @@ import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 
 DEFAULT_FILE = "prosper/docs/GAME_COMPAT_ORCHESTRATION.md"
 DEFAULT_HEADER = "Instrument"
@@ -357,7 +356,7 @@ def main() -> int:
 
     print(f"{args.file}  (table header contains {args.table_header!r})")
     print(f"  {args.base:<28} highest row {base_max}")
-    for number, title, pr_max, draft, added, dup in sorted(claims, key=lambda c: -(c[2] or 0)):
+    for number, _title, pr_max, draft, added, dup in sorted(claims, key=lambda c: -(c[2] or 0)):
         if pr_max is None:
             note = "no numbered table in its copy"
         elif clash := [n for n in dup if n in base_numbers]:

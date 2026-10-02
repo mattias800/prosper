@@ -396,6 +396,9 @@ int main() {
         live.typical_interval_seconds = 1.0 / 60.0;
         live.active_seconds = 9.8;
         live.interval_samples = 599;
+        // p99 resolved (599 >= 100 intervals), p90/p95 left unset so the same fixture covers both
+        // the measured and the null spelling of the tail fields.
+        live.interval_p99_seconds = 0.040;
         const prosper::gpu::FrameRate live_rate =
             prosper::gpu::frame_rate_since_first_publication(live);
 
@@ -422,6 +425,13 @@ int main() {
               live_summary.find("\"interval_samples\":599") != std::string::npos &&
               live_summary.find("\"active_fraction\":0.9800") != std::string::npos,
               "the measured branch of the emitter writes the typical rate and its active share");
+        // The frame-time tail: a resolved p99 is a number (and 1/p99 = 25 fps), an unresolved tail
+        // is `null`, never 0 -- the same spelling rule as the typical rate above.
+        CHECK(live_summary.find("\"interval_p99_ms\":40.000") != std::string::npos &&
+              live_summary.find("\"low_1pct_fps\":25.000") != std::string::npos &&
+              live_summary.find("\"interval_p90_ms\":null") != std::string::npos &&
+              live_summary.find("\"interval_p95_ms\":null") != std::string::npos,
+              "a resolved tail is a number and an unresolved one is null in the manifest");
 
         const std::string frozen_summary = manifest_summary_json(
             5, 5, SamplingStop::RequestSatisfied, tracker, ok_verdict, running, false, frozen_rate);
@@ -446,6 +456,9 @@ int main() {
         // ...and the stream state must not leak out of that branch onto the next field.
         CHECK(unmeasured.find("\"typical_interval_seconds\":0.000000") != std::string::npos,
               "the field after the null is still formatted with its own precision");
+        CHECK(unmeasured.find("\"interval_p99_ms\":null") != std::string::npos &&
+              unmeasured.find("\"low_1pct_fps\":null") != std::string::npos,
+              "an unmeasured run has no tail, spelled null");
 
         // A frozen title reaches the manifest through the same branch, which is the case the whole
         // `--` contract exists for.
@@ -469,6 +482,44 @@ int main() {
               "the run header records that the PNGs carry a burned-in annotation");
         CHECK(manifest_run_json(CaptureRunConfig{}).find("\"fps_overlay\":false") != std::string::npos,
               "...and that the default run's PNGs do not");
+    }
+
+    // The `conditions` record: what makes two framerates comparable, written after the renderer has
+    // chosen a GPU. An unknown device must be null, never 0 -- a zero vendor id would let two runs
+    // that never selected a device compare as equal.
+    {
+        CaptureConditions known;
+        known.os = "linux";
+        known.flip_pace_fps = "60";
+        known.gpu_known = true;
+        known.gpu_vendor_id = 0x1002;
+        known.gpu_device_id = 0x73bf;
+        known.gpu_driver_version = 99;
+        known.gpu_api_version = 4202496;
+        known.gpu_device_type = 2;
+        const std::string line = manifest_conditions_json(known);
+        CHECK(line.find("\"type\":\"conditions\"") != std::string::npos &&
+                  line.find("\"harness\":\"tools/screenshot\"") != std::string::npos &&
+                  line.find("\"present_path\":\"forced_readback\"") != std::string::npos,
+              "the harness and its forced-readback present path are named in the artifact");
+        CHECK(line.find("\"os\":\"linux\"") != std::string::npos &&
+                  line.find("\"flip_pace_fps\":\"60\"") != std::string::npos,
+              "the host OS and the flip pacing in force are recorded");
+        CHECK(line.find("\"gpu_known\":true") != std::string::npos &&
+                  line.find("\"gpu_vendor_id\":4098") != std::string::npos &&
+                  line.find("\"gpu_device_id\":29631") != std::string::npos &&
+                  line.find("\"gpu_driver_version\":99") != std::string::npos &&
+                  line.find("\"gpu_api_version\":4202496") != std::string::npos &&
+                  line.find("\"gpu_device_type\":2") != std::string::npos,
+              "a selected device is recorded as numeric ids");
+        CHECK(line.find("null") == std::string::npos, "a fully known record has no nulls");
+
+        const std::string unknown = manifest_conditions_json(CaptureConditions{});
+        CHECK(unknown.find("\"gpu_known\":false") != std::string::npos &&
+                  unknown.find("\"gpu_vendor_id\":null") != std::string::npos &&
+                  unknown.find("\"gpu_driver_version\":null") != std::string::npos &&
+                  unknown.find("\"gpu_vendor_id\":0") == std::string::npos,
+              "an unselected device is null on every GPU field, never a zero id");
     }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }

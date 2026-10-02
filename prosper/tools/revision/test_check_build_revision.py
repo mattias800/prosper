@@ -440,7 +440,7 @@ def main() -> int:
           "and the tool still asks git to resolve the ref")
 
     counted = coverage()
-    print(f"test_check_build_revision: "
+    print("test_check_build_revision: "
           + (f"{fails} FAILURE(S) ({counted})" if fails else f"all ok ({counted})"))
     return 1 if fails else 0
 

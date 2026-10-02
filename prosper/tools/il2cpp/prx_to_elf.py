@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-# prx_to_elf.py — flatten an unencrypted PS5 SELF/PRX into a loadable ET_DYN ELF
-# (p_offset == p_vaddr), the input Il2CppDumper needs. Usage:
-#   python3 prx_to_elf.py <in.prx> <out.elf> [--sections]
-# Then:
-#   printf '0\n0\n0\n' | dotnet Il2CppDumper.dll out.elf global-metadata.dat outdir
-# (answer "0" to the "dump file" prompt to force the registration auto-scan).
-# Produces dump.cs (method RVAs), script.json, il2cpp.h. Runtime addr of a method =
-# module_base (e.g. 0x440000000 for Il2CppUserAssemblies.prx) + its RVA.
-#
-# --sections synthesizes a section header table so `objdump -d` can disassemble the result (#2154).
-# OPT-IN, not the default: Il2CppDumper reads program headers and the dynamic segment and does not
-# need them, but its ELF reader does consult sections on some paths and I could not run it here, so
-# the default output is byte-for-byte what it was. Turn it on for disassembly, leave it off for a
-# dump.
-import struct, sys
+r"""prx_to_elf.py — flatten an unencrypted PS5 SELF/PRX into a loadable ET_DYN ELF
+(p_offset == p_vaddr), the input Il2CppDumper needs. Usage:
+  python3 prx_to_elf.py <in.prx> <out.elf> [--sections]
+Then:
+  printf '0\n0\n0\n' | dotnet Il2CppDumper.dll out.elf global-metadata.dat outdir
+(answer "0" to the "dump file" prompt to force the registration auto-scan).
+Produces dump.cs (method RVAs), script.json, il2cpp.h. Runtime addr of a method =
+module_base (e.g. 0x440000000 for Il2CppUserAssemblies.prx) + its RVA.
+
+--sections synthesizes a section header table so `objdump -d` can disassemble the result (#2154).
+OPT-IN, not the default: Il2CppDumper reads program headers and the dynamic segment and does not
+need them, but its ELF reader does consult sections on some paths and I could not run it here, so
+the default output is byte-for-byte what it was. Turn it on for disassembly, leave it off for a
+dump.
+"""
+import struct
+import sys
 
 def main(src, dst, want_sections=False):
     f = open(src, "rb").read()

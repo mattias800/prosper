@@ -60,7 +60,7 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
     for profile, value in (("unknown", 0), ("implicit", 1), ("explicit-nonfinite32", 2)):
         case = root / f"transport-{profile}.prfc"
         wire = case.read_bytes()
-        assert wire[8:12] == (4).to_bytes(4, "little") and wire[-17] == value and wire[-16:-8] == bytes(8), "exact schema4 independent profile/flags/evidence tails"
+        assert wire[8:12] == (5).to_bytes(4, "little") and wire[-21] == value and wire[-20:-12] == bytes(8) and wire[-12:-8] == bytes(4), "exact official profile/launch tails followed by nested5 zero count"
         source = root / f"transport-{profile}.spv"
         candidate = root / f"transport-{profile}-candidate.spv"
         report = run(replay, "--baseline", str(case), "--output", str(source))
@@ -74,7 +74,7 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
         for dx10 in (0, 1):
             case = root / f"flags-i{ieee}-d{dx10}.prfc"
             wire = case.read_bytes()
-            assert wire[-16:-13] == bytes((1, ieee, dx10)) and wire[-13:-8] == bytes(5)
+            assert wire[-20:-17] == bytes((1, ieee, dx10)) and wire[-17:-12] == bytes(5)
             for mode in ("--baseline", "--candidate"):
                 report = run(replay, mode, str(case))
                 assert "input=COMPLETE" in report and "guest_float_mode=unknown" in report
@@ -85,8 +85,8 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
         case=root/f"raw-launch-{value}.prfc"
         output=root/f"raw-launch-{value}.spv"
         wire=case.read_bytes()
-        assert wire[-16:-13]==bytes(3) and wire[-13]==1
-        assert int.from_bytes(wire[-12:-8],"little")==value
+        assert wire[-20:-17]==bytes(3) and wire[-17]==1
+        assert int.from_bytes(wire[-16:-12],"little")==value
         for mode in ("--baseline","--candidate"):
             report=run(replay,mode,str(case),*( ("--output",str(output)) if mode=="--baseline" else () ))
             assert "input=COMPLETE" in report and "guest_float_mode=unknown" in report
@@ -98,7 +98,14 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
     saved = root / "preserved.spv"
     saved.write_bytes(b"previous-output")
     current = bytearray((root / "transport-unknown.prfc").read_bytes())
-    legacy3 = bytearray(current)
+    official4 = bytearray(current)
+    del official4[-12:-8]
+    official4[8:12] = (4).to_bytes(4,"little")
+    official_case = root / "official-schema4.prfc"
+    official_case.write_bytes(rechecksum(official4))
+    report = run(replay, "--baseline", str(official_case))
+    assert "input=COMPLETE" in report and "BASELINE MATCH PRODUCED" in report
+    legacy3 = bytearray(official4)
     del legacy3[-16:-8]  # remove flags and raw evidence to recover the actual schema-3 prefix
     legacy3[8:12] = (3).to_bytes(4, "little")
     legacy3_case = root / "legacy-schema3.prfc"
@@ -134,20 +141,20 @@ with tempfile.TemporaryDirectory(prefix="fragment-case-cli-", dir=scratch) as te
     relabeled[8:12] = (2).to_bytes(4, "little")
     malformed_profiles.append((relabeled, "trailing data"))
     invalid_profile = bytearray(current)
-    invalid_profile[-17] = 255
+    invalid_profile[-21] = 255
     malformed_profiles.append((invalid_profile, "noncanonical float transport"))
     truncated_profile = bytearray(current)
-    del truncated_profile[-9]
+    del truncated_profile[-21]
     malformed_profiles.append((truncated_profile, "truncated"))
-    for offset in (-16, -15, -14, -13):
+    for offset in (-20, -19, -18, -17):
         invalid_flag = bytearray(current)
         invalid_flag[offset] = 2
         malformed_profiles.append((invalid_flag, "boolean"))
     invalid_flag = bytearray(current)
-    invalid_flag[-15] = 1  # unavailable payload must be all clear, not fabricated known IEEE
+    invalid_flag[-19] = 1  # unavailable payload must be all clear, not fabricated known IEEE
     malformed_profiles.append((invalid_flag, "noncanonical float flags"))
     invalid_raw=bytearray(current)
-    invalid_raw[-12:-8]=(1).to_bytes(4,"little")
+    invalid_raw[-16:-12]=(1).to_bytes(4,"little")
     malformed_profiles.append((invalid_raw,"noncanonical RSRC1_PS"))
     for index, (wire, reason) in enumerate(malformed_profiles):
         path = root / f"malformed-profile-{index}.prfc"

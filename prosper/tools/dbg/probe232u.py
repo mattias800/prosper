@@ -1,15 +1,17 @@
-# gdb -p PID -batch -x probe232u.py — issue #232: at the FlushAsyncLoading stall, capture
-# FAsyncLoadingThread2 state (UE 4.27 zenloader). ProcessAsyncLoading=eboot+0x25b2980 spins
-# INSIDE its do-while, so break on in-loop addresses:
-#   0x25b2ac4 loop-condition head (rbx=this, r15=ThreadState)
-#   0x25b29e0 CreateAsyncPackagesFromQueue callsite (rbx=this)
-#   0x25acf40 CreateAsyncPackagesFromQueue entry (rdi=this)
-# Layout: QueuedPackagesCounter=this+0x1b0, ExistingAsyncPackagesCounter=this+0x1b4,
-# QueuedPackages TArray={data +0x50,num +0x58}, AsyncPackageLookup TMap elements=+0xd8
-# (24-byte {u64 PackageId, FAsyncPackage2*, i32 hashnext}), slots num=+0xe0, free=+0x10c,
-# ExternalReadQueue head=+0x138, DeferredDeleteQueue=+0xa8, pkg state byte=pkg+0xe0,
-# pkg ExternalReadDependencies={data pkg+0x110, num pkg+0x118}.
-import gdb, struct, time
+"""gdb -p PID -batch -x probe232u.py — issue #232: at the FlushAsyncLoading stall, capture
+FAsyncLoadingThread2 state (UE 4.27 zenloader). ProcessAsyncLoading=eboot+0x25b2980 spins
+INSIDE its do-while, so break on in-loop addresses:
+  0x25b2ac4 loop-condition head (rbx=this, r15=ThreadState)
+  0x25b29e0 CreateAsyncPackagesFromQueue callsite (rbx=this)
+  0x25acf40 CreateAsyncPackagesFromQueue entry (rdi=this)
+Layout: QueuedPackagesCounter=this+0x1b0, ExistingAsyncPackagesCounter=this+0x1b4,
+QueuedPackages TArray={data +0x50,num +0x58}, AsyncPackageLookup TMap elements=+0xd8
+(24-byte {u64 PackageId, FAsyncPackage2*, i32 hashnext}), slots num=+0xe0, free=+0x10c,
+ExternalReadQueue head=+0x138, DeferredDeleteQueue=+0xa8, pkg state byte=pkg+0xe0,
+pkg ExternalReadDependencies={data pkg+0x110, num pkg+0x118}.
+"""
+import gdb
+import time
 
 gdb.execute("set pagination off")
 gdb.execute("set confirm off")

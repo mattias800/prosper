@@ -182,7 +182,7 @@ def report(ports, gaps=None, min_episode_us=0, active_window_us=200000):
         dry, n_idle = classify_dry_episodes(samples, all_dry, iv, active_window_us)
         thin = episodes(samples, lambda q, g: g and q < g, gap_us)
 
-        def total_us(eps):
+        def total_us(eps, iv=iv):
             return sum(e[2] * iv for e in eps)
 
         kept = [e for e in dry if e[2] * iv >= min_episode_us]
@@ -250,7 +250,7 @@ def main(argv):
     if not paths:
         print(__doc__)
         return 2
-    with open(paths[0], "r", encoding="utf-8", errors="replace") as fh:
+    with open(paths[0], encoding="utf-8", errors="replace") as fh:
         ports, gaps = parse(fh.read())
     return report(ports, gaps, min_ep, window_us)
 
