@@ -2705,12 +2705,15 @@ endif()
   target_include_directories(test_fragment_packet_wqm PRIVATE tests)
   target_link_libraries(test_fragment_packet_wqm PRIVATE prosper_core)
   add_test(NAME fragment_packet_wqm_contract COMMAND test_fragment_packet_wqm)
-  set_tests_properties(fragment_packet_wqm_contract PROPERTIES TIMEOUT 90)
+  # TIMEOUT 300, not 90: measured 62-74 s on Linux, ~70 s on Windows MinGW, and >90 s on the
+  # macOS x86_64/Rosetta 2 job, where it has timed out on every run (#4176). Same for mbcnt
+  # below (89 s on Linux under -j4). A stopgap for the test's cost, not a fix -- #4176.
+  set_tests_properties(fragment_packet_wqm_contract PROPERTIES TIMEOUT 300)
   add_executable(test_fragment_packet_mbcnt tests/gpu/recompiler/test_fragment_packet_mbcnt.cpp)
   target_include_directories(test_fragment_packet_mbcnt PRIVATE tests)
   target_link_libraries(test_fragment_packet_mbcnt PRIVATE prosper_core)
   add_test(NAME fragment_packet_mbcnt_contract COMMAND test_fragment_packet_mbcnt)
-  set_tests_properties(fragment_packet_mbcnt_contract PROPERTIES TIMEOUT 90)
+  set_tests_properties(fragment_packet_mbcnt_contract PROPERTIES TIMEOUT 300)
   set_tests_properties(portable_bpermute_contract PROPERTIES TIMEOUT 90)
 
   # #3713: a scalar branch may only be called workgroup-uniform when the value it compares is the
