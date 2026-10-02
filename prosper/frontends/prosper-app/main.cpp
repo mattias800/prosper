@@ -2779,6 +2779,8 @@ int main(int argc, char** argv) {
     const uint64_t perfLoopStartNs = prosper::perf::monotonic_now_ns();
     bool guestEndReported = false;
     while (running && !prosper_stop_requested()) {
+        drainStagedGrabCandidate();
+        expirePendingGrabProducer();
         // Surface a dead guest in the title bar (and optionally quit) so a black window is never
         // mistaken for a slow load. Reported once; later title updates may overwrite it.
         if (!guestEndReported) {
@@ -2793,8 +2795,6 @@ int main(int argc, char** argv) {
                 if (quit && quit[0] != '\0' && quit[0] != '0') running = false;
             }
         }
-        drainStagedGrabCandidate();
-        expirePendingGrabProducer();
         // Close a RenderDoc capture opened on the previous pass. Reporting the path is the whole
         // point of doing this here rather than firing and forgetting: an agent running headless has
         // no other way to learn where the capture went, and an abandoned capture (no API work
