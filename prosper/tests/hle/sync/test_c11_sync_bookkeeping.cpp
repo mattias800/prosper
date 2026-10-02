@@ -220,6 +220,7 @@ struct C11TimedArm {
     std::atomic<int> entered{0}, done{0}, stop{0};
     uint64_t result = ~0ULL, lock_result = ~0ULL, unlock_result = ~0ULL;
     int probe = -1;
+    int64_t elapsed_ms = -1;  // written by the worker before done's release store
 #ifdef _WIN32
     bool recorded_owner = false;
 #endif
@@ -704,21 +705,48 @@ int main() {
                      "_Mtx_timedlock still acquires a free mutex with an expired absolute deadline");
             lock_arm(timed_lock, true, true, false, 2, "_Mtx_timedlock maps expiration under contention to _Thrd_timedout(2)");
             lock_arm(timed_lock, true, false, true, 4, "_Mtx_timedlock maps a destroyed slot to _Thrd_error(4)");
-            auto arm = make_arm();
-            start_c11_worker(arm, [timed_lock, sce_try, sce_unlock](C11TimedArm& state) {
-                state.lock_result = call1(sce_try, &state.mutex);
-                if (state.lock_result == 0)
-                    state.result = timed_lock((uint64_t)(uintptr_t)&state.mutex,
-                                               (uint64_t)(uintptr_t)state.deadline, 0, 0, 0, 0);
-                state.probe = pthread_mutex_trylock((pthread_mutex_t*)state.mutex);
-                state.unlock_result = call1(sce_unlock, &state.mutex);
-            });
-            finish_c11_worker(arm, sce_broadcast);
-            CHECK(arm->lock_result == 0 && arm->result == 4,
-                  "_Mtx_timedlock maps an ERRORCHECK self-deadlock to error(4), unlike _Mtx_lock's busy(3)");
-            CHECK(arm->probe == EBUSY && arm->unlock_result == 0,
-                  "C11 timed self-deadlock: refusal preserves the original acquisition and permits cleanup");
-            cleanup(arm);
+            // A TIMED self-relock of an ERRORCHECK mutex is libthr's mutex_self_lock() with an
+            // abstime: it waits out the deadline and reports ETIMEDOUT, which _Mtx_timedlock maps
+            // to _Thrd_timedout(2). Only the UNTIMED relock is EDEADLK (_Mtx_lock's busy(3) above).
+            // This arm used to expect error(4) -- glibc's immediate EDEADLK, inherited rather than
+            // established for the console (#4133). Two deadlines: an expired one (the answer), and
+            // one 60 ms out (that the answer is EARNED by waiting, not returned at once -- a body
+            // that just renamed EDEADLK to ETIMEDOUT passes the first arm and fails this one).
+            for (const int deadline_ms : { -1000, 60 }) {
+                auto arm = make_arm();
+                if (!c11_deadline(get_time, arm->deadline, deadline_ms)) {
+                    CHECK(false, "C11 control: the timed self-relock deadline is constructed");
+                    cleanup(arm);
+                    continue;
+                }
+                start_c11_worker(arm, [timed_lock, sce_try, sce_unlock](C11TimedArm& state) {
+                    state.lock_result = call1(sce_try, &state.mutex);
+                    if (state.lock_result == 0) {
+                        const auto begin = std::chrono::steady_clock::now();
+                        state.result = timed_lock((uint64_t)(uintptr_t)&state.mutex,
+                                                   (uint64_t)(uintptr_t)state.deadline, 0, 0, 0, 0);
+                        state.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - begin).count();
+                    }
+                    state.probe = pthread_mutex_trylock((pthread_mutex_t*)state.mutex);
+                    state.unlock_result = call1(sce_unlock, &state.mutex);
+                });
+                finish_c11_worker(arm, sce_broadcast);
+                if (deadline_ms < 0) {
+                    CHECK(arm->lock_result == 0 && arm->result == 2,
+                          "_Mtx_timedlock maps an expired ERRORCHECK self-relock to _Thrd_timedout(2), "
+                          "as libthr does -- not glibc's immediate EDEADLK -> _Thrd_error(4)");
+                } else {
+                    // Lower bound only, with slack for wall-clock vs steady-clock granularity: load
+                    // can only make the call take LONGER, so this arm cannot flake under ctest -j.
+                    CHECK(arm->lock_result == 0 && arm->result == 2 && arm->elapsed_ms >= 50,
+                          "_Mtx_timedlock waits out a future deadline on an ERRORCHECK self-relock "
+                          "before reporting _Thrd_timedout(2)");
+                }
+                CHECK(arm->probe == EBUSY && arm->unlock_result == 0,
+                      "C11 timed self-relock: the timeout preserves the original acquisition and permits cleanup");
+                cleanup(arm);
+            }
         }
 
         // Deadline conversion failures must reach both callers without acquiring anything. Each
