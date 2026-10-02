@@ -27,6 +27,9 @@ alignas(256) constexpr uint32_t fragment[] = {
     0x7e040280u,0x7e0602f2u,0xf800180fu,0x03020100u,0xbf810000u,
 };
 alignas(256) constexpr uint32_t bad_fragment[] = {0xbfA40001u,0xbf810000u};
+alignas(256) constexpr uint32_t dcc_fragment[] = {
+    0x7e000280u,0xf8001803u,0x00000000u,0xbf810000u,
+};
 void set32(std::vector<uint8_t>& bytes, size_t at, uint32_t value) {
     for (size_t i=0; i<4; ++i) bytes[at+i] = static_cast<uint8_t>(value >> (i*8));
 }
@@ -50,7 +53,8 @@ GpuState state(const uint32_t* fs=fragment) {
 }
 size_t reader(uint64_t address, uint8_t* destination, size_t count) {
     for (const auto entry : {std::pair{vertex,sizeof(vertex)}, std::pair{fragment,sizeof(fragment)},
-                             std::pair{bad_fragment,sizeof(bad_fragment)}}) {
+                             std::pair{bad_fragment,sizeof(bad_fragment)},
+                             std::pair{dcc_fragment,sizeof(dcc_fragment)}}) {
         const auto base=reinterpret_cast<uint64_t>(entry.first);
         if (address<base || address>=base+entry.second) continue;
         count=std::min(count,entry.second-static_cast<size_t>(address-base));
@@ -134,6 +138,38 @@ int main(int argc, char** argv) {
     CHECK(modules.size()==3 && modules[0] && modules[1] && modules[2] &&
               *modules[0]==*modules[1] && *modules[1]!=*modules[2],
           "unknown and implicit can share bytes but cannot alias producing provenance; explicit changes bytes");
+    // This helper bypasses the ordinary fragment cache. Its first call must not pin later
+    // decompression draws to the wrong feature envelope, in either initialization order.
+    const bool explicit_first=argc==2 && std::strcmp(argv[1],"--dcc-explicit-first")==0;
+    const std::array<FloatTransportConfig,5> dcc_profiles = explicit_first
+        ? std::array{explicit32,unknown,implicit,explicit32,unknown}
+        : std::array{unknown,explicit32,implicit,explicit32,unknown};
+    std::array<std::vector<uint32_t>,3> dcc_sources;
+    for (const auto config:dcc_profiles) {
+        reset_float_transport_config_for_test(); publish_float_transport_config(config);
+        auto dcc_state=state(dcc_fragment);
+        dcc_state.cx[P::CB_COLOR_CONTROL]=
+            P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS << P::CB_COLOR_CONTROL_MODE_SHIFT;
+        for (bool shared:{false,true}) {
+            DrawItem item;
+            CHECK(realize_draw_item(dcc_state,nullptr,3,std::size(vertex),false,item,nullptr,shared) &&
+                      item.float_transport==config && !item.fs_words().empty() && item.fs_identity==0,
+                  "actual DCC null-export realization retains the current producing profile");
+            CHECK(controls2(item.fs_words())==config.explicit_nonfinite32(),
+                  "DCC null-export source envelope follows each profile, not the first caller");
+            auto& retained_source=dcc_sources[static_cast<size_t>(config.profile)];
+            CHECK(retained_source.empty() || retained_source==item.fs_words(),
+                  "DCC per-profile source stays immutable across warm transitions and copied/shared routes");
+            retained_source=item.fs_words();
+            DrawItem ordinary;
+            CHECK(realize_draw_item(state(dcc_fragment),nullptr,3,std::size(vertex),false,
+                      ordinary,nullptr,shared) && ordinary.fs_identity!=0 &&
+                      controls2(ordinary.fs_words())==config.explicit_nonfinite32(),
+                  "same helper program without DCC mode keeps its ordinary keyed fragment");
+        }
+    }
+    CHECK(dcc_sources[0]==dcc_sources[1] && dcc_sources[0]!=dcc_sources[2],
+          "DCC unknown/implicit legacy bytes match while explicit envelope is distinct");
     for (const auto device:{unknown,implicit,explicit32}) for (size_t i=0;i<modules.size();++i)
         if (modules[i]) CHECK(float_transport_module_supported(modules[i]->data(),modules[i]->size(),device)==
                                  (i!=2 || device.explicit_nonfinite32()),

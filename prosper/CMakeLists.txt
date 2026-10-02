@@ -2933,6 +2933,8 @@ endif()
   add_executable(test_float_transport_capture tests/gpu/execute/test_float_transport_capture.cpp)
   target_link_libraries(test_float_transport_capture PRIVATE prosper_core)
   add_test(NAME float_transport_capture COMMAND test_float_transport_capture)
+  add_test(NAME float_transport_null_export_explicit_first
+    COMMAND test_float_transport_capture --dcc-explicit-first)
 
   add_executable(test_gpu_capture_bundle tests/gpu/capture/test_gpu_capture_bundle.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.

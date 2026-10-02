@@ -2429,11 +2429,19 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         static constexpr uint32_t kNullExportProgram[] = {
             0xf8001890u, 0x00000000u, 0xbf810000u,
         };
-        static const std::vector<uint32_t> kNullExportFragment =
-            recompile_fragment(kNullExportProgram, std::size(kNullExportProgram), nullptr,
-                               nullptr, UINT32_MAX, nullptr, false, {}, {}, nullptr, float_transport);
+        // Unlike the ordinary cached fragment above, this synthesized program has no guest
+        // cache key. Retain one lazily initialized immutable source per canonical producing
+        // profile: the first decompression draw must not select every later draw's envelope.
+        static std::array<std::once_flag, 3> null_export_initialized;
+        static std::array<std::vector<uint32_t>, 3> null_export_fragments;
+        const size_t profile_index = static_cast<size_t>(float_transport.profile);
+        std::call_once(null_export_initialized.at(profile_index), [float_transport, profile_index] {
+            null_export_fragments.at(profile_index) =
+                recompile_fragment(kNullExportProgram, std::size(kNullExportProgram), nullptr,
+                                   nullptr, UINT32_MAX, nullptr, false, {}, {}, nullptr, float_transport);
+        });
         fs_shared.reset();
-        fs = kNullExportFragment;
+        fs = null_export_fragments.at(profile_index);
         fs_identity = 0;
     }
     const std::vector<uint32_t>& vs_words = vs_shared ? *vs_shared : vs;
