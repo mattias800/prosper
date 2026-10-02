@@ -10,6 +10,7 @@
 #pragma once
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/recompiler/fragment_float_mode.hpp"
+#include "gpu/recompiler/fragment_float_flags.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -131,6 +132,7 @@ struct RenderState {
     uint32_t ps_input_addr = 0;
     bool ps_wave32 = false; // SPI_PS_IN_CONTROL.PS_W32_EN
     FragmentFloatMode ps_float_mode{};
+    FragmentFloatFlags ps_float_flags{};
 
     // Color MRT 0. format/number_type/comp_swap together select the VkFormat (see vk_translate).
     uint64_t color0_base        = 0;   // byte address (CB_COLOR0_BASE + BASE_EXT)

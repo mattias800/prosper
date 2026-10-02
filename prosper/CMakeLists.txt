@@ -2313,6 +2313,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_render_state PRIVATE prosper_core)
   add_test(NAME render_state_extract COMMAND test_render_state)
 
+  # Producing fragment launch flags: no HLE registration, GPU or guest dump required.
+  add_executable(test_fragment_float_flags tests/gpu/state/test_fragment_float_flags.cpp)
+  target_link_libraries(test_fragment_float_flags PRIVATE prosper_core)
+  add_test(NAME fragment_float_flags COMMAND test_fragment_float_flags)
+
   # Messenger recompile guard (#228): committed real Messenger VS/PS RDNA2 binaries must keep
   # recompiling — a recompiler change that re-rejects one of their instructions (the #199/#201
   # blue-screen class) fails here instead of shipping. Pure (no Vulkan); needs no game dump.

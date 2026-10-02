@@ -316,6 +316,10 @@ RenderState extract_render_state(const GpuState& st) {
     if (const auto rsrc1 = st.sh.find(P::SPI_SHADER_PGM_RSRC1_PS); rsrc1 != st.sh.end()) {
         rs.ps_float_mode = {true, static_cast<uint8_t>(
             PM4_FIELD(rsrc1->second, SPI_SHADER_PGM_RSRC1_PS, FLOAT_MODE))};
+        rs.ps_float_flags = {
+            true,
+            PM4_FIELD(rsrc1->second, SPI_SHADER_PGM_RSRC1_PS, IEEE_MODE) != 0,
+            PM4_FIELD(rsrc1->second, SPI_SHADER_PGM_RSRC1_PS, DX10_CLAMP) != 0};
     }
 
     // Color MRT 0 (context register file).
