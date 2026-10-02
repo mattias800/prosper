@@ -1,5 +1,6 @@
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/fragment_packet_fixture.hpp"
+#include "fixtures/fragment_packet_scalar_fixture.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <cstdio>
 #include <cstring>
@@ -142,6 +143,28 @@ int main(int argc, char** argv) {
     std::filesystem::path directory;
     if (argc == 3 && std::strcmp(argv[1], "--dump-directory") == 0) directory = argv[2];
     else if (argc != 1) return 2;
+    namespace s = prosper::test::fragment_packet::scalar;
+    uint32_t scalar_ordinal = 0;
+    for (const auto& c : s::cases())
+        sink_case(s::packet(c),s::expected(c),"scalar_initialization_" +
+            std::to_string(scalar_ordinal++),directory,c.kind == s::Kind::Pair);
+    check(scalar_ordinal == 13,"all supplied-entry/scratch CFG scalar cases compiled");
+    for (bool initial_scc : {false,true}) {
+        auto one_arm = s::packet({s::Kind::BothArms,initial_scc});
+        one_arm.guest_code[4] = one_arm.guest_code[5] = 0xbf800000u; // exact two-word NOP twin
+        reject(one_arm,"packet-sgpr-read-before-definition","one arm missing despite known SCC");
+    }
+    auto read_first = s::packet({});
+    read_first.guest_code.insert(read_first.guest_code.begin(),0x7e02020eu); // v1 <- missing s14 before both writers
+    reject(read_first,"packet-sgpr-read-before-definition","read precedes later overwrite");
+    auto pair_high = s::packet({s::Kind::Pair});
+    pair_high.guest_code[2] = pair_high.guest_code[3] = 0xbf800000u;
+    reject(pair_high,"packet-sgpr-read-before-definition","missing physical high word before BCNT");
+    auto self_pair = s::packet({s::Kind::Pair});
+    self_pair.guest_code.insert(self_pair.guest_code.begin(),0xbe940414u); // s20:s21 <- its own absent old pair
+    reject(self_pair,"packet-sgpr-read-before-definition","pair alias reads OLD state before write");
+    auto entry_absent = s::packet({s::Kind::SuppliedEntry}); entry_absent.sgprs.clear();
+    reject(entry_absent,"packet-sgpr-read-before-definition","no invented value for a real entry read");
     uint32_t ordinal = 0;
     for (uint32_t selected : {63u, 31u, 64u})
         for (uint32_t variant = 0; variant < 8; ++variant) {
@@ -354,8 +377,8 @@ int main(int argc, char** argv) {
     missing = clean;
     missing.vgprs.erase(missing.vgprs.begin() + 5);
     reject(missing, "packet-vgpr-input-unavailable", "missing READLANE source");
-    missing = clean; missing.sgprs.erase(missing.sgprs.begin());
-    reject(missing, "packet-sgpr-input-unavailable", "undefined count destination/fallback");
+    missing = s::packet({s::Kind::Readlane}); missing.sgprs.clear();
+    reject(missing, "packet-sgpr-read-before-definition", "missing supplied scalar READLANE selector");
     missing = clean; missing.export_enabled[40] = 2;
     reject(missing, "packet-launch-state-invalid", "invalid eligibility");
     missing = clean; missing.vgprs.push_back(missing.vgprs.front());
