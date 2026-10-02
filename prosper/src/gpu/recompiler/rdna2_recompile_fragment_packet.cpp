@@ -1,6 +1,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include <bitset>
 
 namespace prosper::gpu {
 namespace {
@@ -108,6 +109,67 @@ const char* packet_instruction_gap(const Rdna2Inst& in) {
         default: return "packet-format-unimplemented";
     }
 }
+
+// Register allocation is not an entry-value proof. This packet slice admits only forward direct
+// branches, so a bounded instruction-level DAG meet can inspect every structurally reachable
+// scalar read before admitting the program. No supplied SCC/EXEC value prunes conditional arms.
+// Physical VCC/EXEC masks retain their separate dispatcher domain/lifetime proof; ordinary SGPR
+// words here may hold either data or saved masks, and initialization does not authorize a cast.
+const char* packet_scalar_initialization_gap(const std::vector<Rdna2Inst>& ins,
+                                           const std::map<int, uint32_t>& supplied,
+                                           uint32_t& failure_pc) {
+    using Words = std::bitset<106>;
+    std::vector<Words> entry(ins.size());
+    std::vector<bool> reachable(ins.size(), false);
+    std::map<uint32_t, size_t> index;
+    for (size_t i = 0; i < ins.size(); ++i) index.emplace(ins[i].pc, i);
+    for (const auto& [reg, value] : supplied) entry.front().set(reg);
+    reachable.front() = true;
+    const auto meet = [&](size_t next, const Words& defined) {
+        if (!reachable[next]) { entry[next] = defined; reachable[next] = true; }
+        else entry[next] &= defined;
+    };
+    for (size_t i = 0; i < ins.size(); ++i) {
+        if (!reachable[i]) continue;
+        const auto& in = ins[i];
+        failure_pc = in.pc;
+        Words defined = entry[i];
+        const auto available = [&](int first, uint32_t count) {
+            if (first < 0 || first > 105 || !count || count > 2 ||
+                first + static_cast<int>(count) > 106) return false;
+            for (uint32_t word = 0; word < count; ++word)
+                if (!defined.test(first + word)) return false;
+            return true;
+        };
+        const uint32_t implicit = scalar_implicit_destination_read_width(in);
+        if (implicit && !available(in.dst.value, implicit))
+            return "packet-sgpr-read-before-definition";
+        for (uint32_t source = 0; source < in.n_src; ++source) {
+            if (in.fmt == Rdna2Format::EXP && !(in.exp_en & (1u << source))) continue;
+            const auto& operand = in.src[source];
+            if (operand.kind != OperandKind::SGPR) continue;
+            const uint32_t width = scalar_alu_source_words(in, source);
+            if (!width || width == UINT32_MAX || width > 2)
+                return "packet-scalar-read-form-unimplemented";
+            if (!available(operand.value, width))
+                return "packet-sgpr-read-before-definition";
+        }
+        // Read OLD sources first (including pair overlaps); only genuine unconditional writers
+        // in the whole-program admitted packet inventory can establish a new reaching value.
+        for_each_scalar_write(in, [&](int first, uint32_t count) {
+            for (uint32_t word = 0; word < count; ++word)
+                if (first + static_cast<int>(word) <= 105)
+                    defined.set(first + word);
+        });
+        if (in.is_end) continue;
+        const bool branch = in.fmt == Rdna2Format::SOPP &&
+                            sopp_opcode_is_direct_branch(in.opcode);
+        if (branch) meet(index.at(branch_target(in)), defined);
+        if ((!branch || in.opcode != 0x02) && i + 1 < ins.size()) meet(i + 1, defined);
+    }
+    failure_pc = UINT32_MAX;
+    return nullptr;
+}
 } // namespace
 
 FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& packet,
@@ -186,7 +248,7 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
         for (uint32_t word = 0; word < rdna2_vgpr_write_count(in); ++word)
             if (!need_vgpr(in.dst.value + static_cast<int>(word)))
                 return reject("packet-vgpr-input-unavailable", in.pc);
-        bool missing_scalar = false, invalid_scalar_write = false;
+        bool invalid_scalar_write = false;
         for_each_scalar_write(in, [&](int reg, uint32_t width) {
             const bool mask_pair = in.fmt == Rdna2Format::SOP1 &&
                 (in.opcode == kSop1OpcodeMovB64 || in.opcode == 0x0a) &&
@@ -194,12 +256,8 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
             if ((width == 2 && (reg & 1)) || reg < 0 ||
                 (reg + static_cast<int>(width) > 106 && !mask_pair))
                 invalid_scalar_write = true;
-            for (uint32_t word = 0; word < width; ++word)
-                if (reg + static_cast<int>(word) <= 105 &&
-                    !scalars.contains(reg + static_cast<int>(word))) missing_scalar = true;
         });
         if (invalid_scalar_write) return reject("packet-scalar-destination-unimplemented", in.pc);
-        if (missing_scalar) return reject("packet-sgpr-input-unavailable", in.pc);
         const bool pair_source = in.fmt == Rdna2Format::SOP1 &&
             (in.opcode == kSop1OpcodeMovB64 || in.opcode == kSop1OpcodeBcnt1I32B64 ||
              in.opcode == kSop1OpcodeFf1I32B64 || in.opcode == 0x0a);
@@ -211,13 +269,6 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
             if (operand.kind == OperandKind::SGPR) {
                 if (pair_source && ((operand.value & 1) || operand.value > 104))
                     return reject("packet-scalar-pair-input-invalid", in.pc);
-                if (!scalars.contains(operand.value))
-                    return reject("packet-sgpr-input-unavailable", in.pc);
-                if (in.fmt == Rdna2Format::SOP1 &&
-                    (in.opcode == kSop1OpcodeMovB64 || in.opcode == kSop1OpcodeBcnt1I32B64 ||
-                     in.opcode == kSop1OpcodeFf1I32B64 || in.opcode == 0x0a) &&
-                    !scalars.contains(operand.value + 1))
-                    return reject("packet-sgpr-input-unavailable", in.pc);
             }
             if (pair_source && operand.kind != OperandKind::SGPR &&
                 !(operand.kind == OperandKind::Special &&
@@ -232,6 +283,9 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
         }
     }
     if (exports.empty()) return reject("packet-no-export");
+    uint32_t scalar_failure_pc = UINT32_MAX;
+    if (const auto* gap = packet_scalar_initialization_gap(ins, scalars, scalar_failure_pc))
+        return reject(gap, scalar_failure_pc);
 
     FragmentPacketProgram result;
     result.input_stride = static_cast<uint32_t>(columns.size()) + 4;
@@ -262,6 +316,9 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
     RegState state;
     for (const auto& [reg, column] : columns) state.vreg[reg] = b.load_input(column);
     for (const auto& [reg, value] : scalars) state.sreg[reg] = b.uconst(value);
+    // Missing scratch words are NOT supplied guest zeros. The dispatcher separately allocates
+    // referenced storage and MUST-filters its initialization placeholders before every guest
+    // read. The proof above demonstrates that each admitted read has a real entry/guest writer.
     state.max_vgpr = columns.empty() ? 0 : columns.rbegin()->first;
     const uint32_t state_base = static_cast<uint32_t>(columns.size());
     state.exec = b.ucmp(Op_INotEqual, b.load_input(state_base), b.uconst(0));
