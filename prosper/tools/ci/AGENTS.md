@@ -27,6 +27,19 @@ usage, whether a PR is safe to merge.
   *without applying the edit* (#2918), so `set` writes over REST and then re-reads the live body;
   the verdict is always the read-back, never the write's exit code.
 
+## Secret scan (`.github/workflows/gitleaks.yml`, `.github/gitleaks.toml`)
+
+Gitleaks reads every commit a PR adds (`base..head`), every push to `main`, and the full history
+weekly. The binary is a pinned release checked against a sha256 (no third-party action, no token);
+findings are printed redacted. The config extends the default ruleset and allowlists only measured
+false positives, scoped to one rule via `targetRules` (baseline 2026-10-02: 10 findings in 4,040
+commits, all identifiers containing "key"; NID hashes, shader hex and fixtures produced none, so they
+are not exempted). To add an entry, run the scan, open the finding unredacted **locally**, prove it is
+not a credential, then add a narrow `paths`/`regexes` line with that evidence beside it. A real secret is
+never allowlisted: rotate it and tell the owner privately. Run locally with
+`gitleaks git . --config .github/gitleaks.toml --redact` (add `--log-opts "origin/main..HEAD"` for a PR
+range). A clean zero is only meaningful once a hand-built fake token is seen to fail the same command.
+
 ## Python rule (applies to every Python file in the repository)
 
 Python behavior changes need a meaningful regression that **fails without the change**, reusing
@@ -38,7 +51,10 @@ enforced on added files). Follow the task's execution authority and resource coo
 Measured baseline, 2026-10-02: 211 tracked `.py` files, 1,520 ruff findings under the config in
 `pyproject.toml`, 209 files that `ruff format` would rewrite. That is why the gate is a ratchet and
 not a sweep: **do not mass-reformat**, and do not reformat a file you only touch for a fix. Lowering
-a file's findings is welcome; raising them fails CI. Set up with `uv sync --group dev`, run with
+a file's findings is welcome; raising them fails CI. `pytest` collects only the files listed in `testpaths` (`pyproject.toml`): of 77 `test_*.py`, 12 collect
+tests, 40 are script-style (ctest runs them as programs; pytest collects nothing) and 25 fail at import,
+so ctest stays the source of truth. When you convert a test to unittest/pytest style, add it to
+`testpaths`. Set up with `uv sync --group dev`, run with
 `uv run --group dev pytest` and `uv run --group dev ruff check <file>`.
 
 ## The property they share, and why it dictates how they are tested
