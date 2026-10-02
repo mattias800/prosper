@@ -214,11 +214,11 @@ int main(int argc, char** argv) {
     m::Case scalar; scalar.source = m::Source::Scalar;
     auto missing = m::packet(scalar);
     std::erase_if(missing.sgprs, [](const auto& value) { return value.first == 25; });
-    refuse(missing, "packet-sgpr-input-unavailable", "missing raw high source word");
+    refuse(missing, "packet-sgpr-read-before-definition", "missing raw high source word");
     m::Case addend; addend.first_accumulator = m::Accumulator::Scalar;
     missing = m::packet(addend);
     std::erase_if(missing.sgprs, [](const auto& value) { return value.first == 27; });
-    refuse(missing, "packet-sgpr-input-unavailable", "missing raw scalar accumulator");
+    refuse(missing, "packet-sgpr-read-before-definition", "missing raw scalar accumulator");
     m::Case varying; varying.source = m::Source::Vgpr;
     missing = m::packet(varying);
     std::erase_if(missing.vgprs, [](const auto& value) { return value.reg == 5; });
