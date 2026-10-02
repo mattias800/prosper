@@ -500,6 +500,8 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   without saying why in the PR. Full rules: `prosper/tests/AGENTS.md`. PR descriptions follow
   `.github/pull_request_template.md` (Context, Higher Goal, Acceptance Criteria, Out of Scope,
   Summary of Changes, Verification).
+  Skills in `.claude/skills/`: `start-task` (begin any task) and `implement-hle-function` (fix or add a
+  reimplemented Sony function, test-first).
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth
   **only with `--no-tests=error`** — plain `ctest` on a build directory with nothing registered prints
   `No tests were found!!!` and **exits 0**, so "no tests ran" and "everything passed" are the same
