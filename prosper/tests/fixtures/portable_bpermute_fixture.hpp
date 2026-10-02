@@ -185,8 +185,9 @@ inline std::vector<Case> cases() {
     for (uint32_t selector = 0; selector < 4; ++selector)
       for (uint32_t offset : {0u, 4u})
         v.push_back({64, wave, 64, offset, selector});
-  for (uint32_t mask = 1; mask <= 4; ++mask)
-    v.push_back({128, 64, 128, 4, 0, mask});
+  for (uint32_t wave : {32u, 64u})
+    for (uint32_t mask = 1; mask <= 4; ++mask)
+      v.push_back({128, wave, 128, 4, 0, mask});
   for (uint32_t local : {1u, 16u, 33u, 65u, 96u, 256u})
     v.push_back({local, 64, local, 4, 1});
   for (uint32_t threads : {1u, 16u, 33u, 65u})

@@ -46,6 +46,8 @@ struct Interpreter {
   std::map<uint32_t, Type> types;
   std::map<uint32_t, Value> constants;
   std::map<uint32_t, uint32_t> builtins, bindings;
+  std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> decorations;
+  std::map<std::array<uint32_t, 3>, std::vector<uint32_t>> member_decorations;
   std::map<uint32_t, size_t> labels;
   std::map<uint32_t, Memory> shared;
   std::vector<Inst> globals;
@@ -187,11 +189,23 @@ struct Interpreter {
           main = a[1];
         if (op >= 19 && op <= 33 && !a.empty())
           types[a[0]] = {op, {a.begin() + 1, a.end()}};
-        if (op == 71 && a.size() == 3) {
-          if (a[1] == 11)
+        if (op == 71 && a.size() >= 2) {
+          if (!decorations
+                   .emplace(std::make_pair(a[0], a[1]),
+                            std::vector<uint32_t>{a.begin() + 2, a.end()})
+                   .second)
+            fail("duplicate decoration outside oracle profile");
+          if (a.size() == 3 && a[1] == 11)
             builtins[a[0]] = a[2];
-          if (a[1] == 33)
+          if (a.size() == 3 && a[1] == 33)
             bindings[a[0]] = a[2];
+        }
+        if (op == 72 && a.size() >= 3) {
+          if (!member_decorations
+                   .emplace(std::array<uint32_t, 3>{a[0], a[1], a[2]},
+                            std::vector<uint32_t>{a.begin() + 3, a.end()})
+                   .second)
+            fail("duplicate member decoration outside oracle profile");
         }
         if (op == 41 || op == 42 || op == 43 || op == 44) {
           if (a.size() < 2)
@@ -478,6 +492,26 @@ struct Interpreter {
           if (bindings[a[1]] == 3) {
             if (storage)
               fail("duplicate live buffer binding");
+            // This oracle supports exactly the fixture's externally observable
+            // ABI. Never silently flatten a differently laid-out Vulkan block
+            // into uint words.
+            const auto set = decorations.find({a[1], 34});
+            const auto block = decorations.find({t, 2});
+            const auto offset = member_decorations.find({t, 0, 35});
+            const auto &structure = ty(t);
+            if (a[2] != 12 || ty(a[0]).a[0] != 12 || set == decorations.end() ||
+                set->second != std::vector<uint32_t>{0} ||
+                block == decorations.end() || !block->second.empty() ||
+                offset == member_decorations.end() ||
+                offset->second != std::vector<uint32_t>{0} ||
+                structure.op != 30 || structure.a.size() != 1)
+              fail("unsupported live storage ABI");
+            const auto array = structure.a[0];
+            const auto stride = decorations.find({array, 6});
+            if (ty(array).op != 29 || ty(array).a.size() != 1 ||
+                !uint_type(ty(array).a[0]) || stride == decorations.end() ||
+                stride->second != std::vector<uint32_t>{4})
+              fail("unsupported live storage ABI");
             storage = a[1];
             shared[a[1]] = {t, buffer, std::vector<bool>(buffer.size(), true)};
           } else {

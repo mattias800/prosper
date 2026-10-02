@@ -185,6 +185,44 @@ int main(int argc, char **argv) {
           "oracle refuses wholly unpublished Workgroup poison");
     check(!scope.error.empty() && scoped.empty(),
           "oracle refuses wrong barrier scope");
+
+    uint32_t live = 0, block = 0, array = 0;
+    for (const auto &g : parsed.globals)
+      if (g.a.size() >= 3 && parsed.bindings[g.a[1]] == 3) {
+        live = g.a[1];
+        block = parsed.pointee(g.a[0]);
+        array = parsed.ty(block).a.at(0);
+      }
+    for (uint32_t layout : {0u, 1u, 2u}) {
+      auto changed = clean;
+      bool mutated = false;
+      for (size_t pc = 5; pc < changed.size();) {
+        const auto n = changed[pc] >> 16, op = changed[pc] & 65535;
+        if (layout == 0 && op == 71 && n == 4 && changed[pc + 1] == array &&
+            changed[pc + 2] == 6) {
+          changed[pc + 3] = 8; // legal SPIR-V, but not tight uint words
+          mutated = true;
+        }
+        if (layout == 1 && op == 72 && n == 5 && changed[pc + 1] == block &&
+            changed[pc + 2] == 0 && changed[pc + 3] == 35) {
+          changed[pc + 4] = 4; // legal nonzero block-member offset
+          mutated = true;
+        }
+        if (layout == 2 && op == 71 && n == 4 && changed[pc + 1] == live &&
+            changed[pc + 2] == 34) {
+          changed[pc + 3] = 1; // legal different descriptor set
+          mutated = true;
+        }
+        pc += n;
+      }
+      check(mutated,
+            "oracle ABI control changes the actual live storage layout");
+      bpermute_oracle::Interpreter abi(changed);
+      const auto words = abi.run(64, input(Case{}));
+      check(words.empty() && abi.error == "unsupported live storage ABI",
+            "oracle refuses supported-opcode but unsupported live storage ABI");
+      dump(root, "bpermute_unsupported_abi_" + std::to_string(layout), changed);
+    }
   }
   std::printf("portable_bpermute_contract: %d checks, %d failures, %u portable "
               "production modules\n",
