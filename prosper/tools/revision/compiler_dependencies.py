@@ -100,12 +100,46 @@ def dependencies(command):
     return paths
 
 
-def fingerprint(commands_file, root):
+def secondary_commands(commands_path, root, required):
+    """Same-sysroot producer argv emitted by the opt-in mixed Windows build seam."""
+    directory = commands_path.parent / "gnu-variadic"
+    manifests = sorted(directory.glob("*.obj.argv"))
+    if len(manifests) > 16:
+        raise ValueError("secondary command count")
+    commands, encoded = [], bytearray()
+    for manifest in manifests:
+        if manifest.stat().st_size > 64 * 1024:
+            raise ValueError("secondary command size")
+        data = manifest.read_bytes()
+        if b"\0" in data or b"\r" in data:
+            raise ValueError("secondary command layout")
+        arguments = [line for line in data.decode("utf-8", "strict").split("\n") if line]
+        if len(arguments) > 1024 or arguments.count("-c") != 1:
+            raise ValueError("secondary command arguments")
+        index = arguments.index("-c")
+        if index + 1 >= len(arguments):
+            raise ValueError("secondary source missing")
+        source = Path(arguments[index + 1]).resolve(strict=True)
+        if not source.is_relative_to(root / "prosper"):
+            raise ValueError("secondary source ownership")
+        if source.is_relative_to(root / "prosper/src"):
+            commands.append({"file": str(source), "directory": str(commands_path.parent),
+                             "arguments": arguments})
+            encoded.extend(manifest.name.encode("utf-8") + b"\0" + data)
+    producing_source = root / "prosper/src/hle/libc/libc_variadic_capture.cpp"
+    if required and not any(Path(command["file"]) == producing_source for command in commands):
+        raise ValueError("secondary producing command unavailable")
+    return commands, encoded
+
+
+def fingerprint(commands_file, root, secondary_required=False):
     commands_path = Path(commands_file)
     if commands_path.stat().st_size > 32 * 1024 * 1024:
         raise ValueError("compile command budget")
     commands = json.loads(commands_path.read_text(encoding="utf-8"))
     selected = [c for c in commands if Path(c["file"]).resolve().is_relative_to(root / "prosper" / "src")]
+    additional, secondary = secondary_commands(commands_path, root, secondary_required)
+    selected.extend(additional)
     if not selected or len(selected) > MAX_UNITS:
         raise ValueError("core command count")
     paths = set()
@@ -115,6 +149,7 @@ def fingerprint(commands_file, root):
             if len(paths) > MAX_PATHS:
                 raise ValueError("aggregate dependency count")
     h = hashlib.sha256(commands_path.read_bytes())
+    h.update(secondary)
     size = 0
     for path in sorted(paths, key=lambda p: p.as_posix()):
         size += path.stat().st_size
@@ -129,9 +164,15 @@ def fingerprint(commands_file, root):
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) != 3:
+        if len(sys.argv) not in (3, 4):
             raise ValueError("arguments")
-        print(fingerprint(sys.argv[1], Path(sys.argv[2]).resolve(strict=True)))
+        required = False
+        if len(sys.argv) == 4:
+            value = sys.argv[3].upper()
+            if value not in ("", "0", "1", "OFF", "ON", "FALSE", "TRUE"):
+                raise ValueError("secondary policy argument")
+            required = value in ("1", "ON", "TRUE")
+        print(fingerprint(sys.argv[1], Path(sys.argv[2]).resolve(strict=True), required))
     except Exception:
         # Do not print private compiler/header paths or subprocess stderr in a public build log.
         print("compiler dependency identity unavailable", file=sys.stderr)

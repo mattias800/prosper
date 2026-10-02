@@ -44,6 +44,10 @@ The linked identity covers dirty/untracked project sources, actual GCC/Clang dep
 compiler/front-end bytes and resolved compile commands/configuration. Unsupported dependency
 syntax or unavailable compile commands produce an unknown identity, not a complete case. This is
 a compiler-input fingerprint, not a claim to fingerprint every external runtime library.
+The opt-in native-Clang Windows profile also requires the actual secondary GNU production argv
+manifest, its compiler/front-end bytes and transitive headers. Its build-local manifest is never
+exported; missing/malformed producer context makes the linked identity unknown. Test-only producer
+commands are not claimed as production compiler inputs.
 
 Before candidate replay, a separately embedded reader-policy verdict must be verified. If it reports
 `reader-policy-source-mismatch`, audit every changed compiler/resource read seam, route new byte

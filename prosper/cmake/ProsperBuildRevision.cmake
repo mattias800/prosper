@@ -43,6 +43,7 @@ function(prosper_add_build_revision_library target_name)
       "-DPROSPER_REVISION_OUTPUT=${_revision_source}"
       "-DPROSPER_REVISION_CONFIG_ID=${_identity_config_hash}"
       "-DPROSPER_REVISION_COMPILE_COMMANDS=${CMAKE_BINARY_DIR}/compile_commands.json"
+      "-DPROSPER_REVISION_GNU_VARIADIC_REQUIRED=${PROSPER_NATIVE_CLANG_TLS}"
       "-DPROSPER_REVISION_PYTHON=${Python3_EXECUTABLE}"
       "-DPROSPER_REVISION_BUILD_CONFIG=$<CONFIG>"
       -P "${_revision_script}"

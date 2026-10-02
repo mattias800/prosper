@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Small real build proves immutable source/command/dependency identity, not HEAD alone."""
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -154,6 +155,77 @@ set_target_properties(q PROPERTIES
         check(generated_identity() != original_command_identity and
               'return "unknown";' not in generated_identity(),
               "target-only resolved definition changes identity without source/config edits")
+
+        # The opt-in Windows build's GNU producer is outside compile_commands.json.
+        # Exercise its actual argv reader and compiler/header scan, not a fake digest callback.
+        dependency_module = repository / "tools/revision/compiler_dependencies.py"
+        spec = importlib.util.spec_from_file_location("compiler_dependencies", dependency_module)
+        scanner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scanner)
+        secondary = source / "src/hle/libc/libc_variadic_capture.cpp"
+        secondary.parent.mkdir(parents=True)
+        secondary_header = root / "external/secondary.hpp"
+        secondary_header.write_text("constexpr int secondary_value = 13;\n", encoding="utf-8")
+        secondary.write_text('#include "../../../../external/secondary.hpp"\n'
+                             'int capture_identity_fixture(){return secondary_value;}\n', encoding="utf-8")
+        command = next(c for c in altered if Path(c["file"]).resolve() == program.resolve())
+        arguments = command.get("arguments") or scanner.argv(command["command"])
+        arguments = [str(secondary) if Path(argument).as_posix() == program.as_posix() else argument
+                     for argument in arguments]
+        manifest_dir = build_dir / "gnu-variadic"
+        manifest_dir.mkdir()
+        manifest = manifest_dir / "libc_capture.obj.argv"
+        manifest_data = "\n".join(arguments) + "\n"
+        manifest.write_bytes(manifest_data.encode("utf-8"))
+        secondary_commands, encoded = scanner.secondary_commands(actual_commands, root, True)
+        check(len(secondary_commands) == 1 and encoded.endswith(manifest_data.encode("utf-8")),
+              "required production manifest yields exact argv")
+        fingerprint = scanner.fingerprint(actual_commands, root, True)
+        secondary_header.write_text("constexpr int secondary_value = 17;\n", encoding="utf-8")
+        header_fingerprint = scanner.fingerprint(actual_commands, root, True)
+        check(header_fingerprint != fingerprint,
+              "secondary-only external header changes dependency fingerprint")
+        manifest.write_bytes((manifest_data + "-DSECONDARY_ONLY_CHOICE=1\n").encode("utf-8"))
+        changed_flags = scanner.fingerprint(actual_commands, root, True)
+        check(changed_flags != header_fingerprint, "secondary resolved flags change dependency fingerprint")
+
+        def refuse_manifest(data, label):
+            manifest.write_bytes(data)
+            try:
+                scanner.secondary_commands(actual_commands, root, True)
+            except (ValueError, OSError, UnicodeError):
+                check(True, label)
+            else:
+                check(False, label)
+
+        refuse_manifest(manifest_data.replace("\n", "\r\n").encode(), "CRLF manifest refuses")
+        refuse_manifest(manifest_data.encode() + b"\0", "NUL manifest refuses")
+        refuse_manifest(manifest_data.encode() + b"\xff", "non-UTF8 manifest refuses")
+        refuse_manifest(manifest_data.replace("-c\n", "").encode(), "missing compile selector refuses")
+        refuse_manifest((manifest_data + "-c\n").encode(), "duplicate compile selector refuses")
+        outside_source = root / "external/secondary.cpp"
+        outside_source.write_text("int external_source;\n", encoding="utf-8")
+        refuse_manifest(manifest_data.replace(str(secondary), str(outside_source)).encode(),
+                        "unowned secondary source refuses")
+        impostor = source / "src/impostor/libc_variadic_capture.cpp"
+        impostor.parent.mkdir()
+        impostor.write_text("int impostor;\n", encoding="utf-8")
+        refuse_manifest(manifest_data.replace(str(secondary), str(impostor)).encode(),
+                        "same basename does not replace exact producing source")
+        refuse_manifest(b"x" * (64 * 1024 + 1), "secondary manifest byte budget refuses")
+        manifest.unlink()
+        try:
+            scanner.fingerprint(actual_commands, root, True)
+        except ValueError:
+            check(True, "omitted secondary production manifest fails complete identity closed")
+        else:
+            check(False, "omitted secondary production manifest fails complete identity closed")
+
+        # Invoke the real generator too: an opted-in profile without its producer manifest
+        # must embed unknown, not reuse the primary command inventory as complete authority.
+        run(base + [f"-DPROSPER_REVISION_COMPILE_COMMANDS={actual_commands}",
+                    "-DPROSPER_REVISION_GNU_VARIADIC_REQUIRED=TRUE"] + script, cwd=root)
+        check('return "unknown";' in generated_identity(), "generator requires mixed producer manifest")
     print(f"source identity: {checks} real incremental/config/dependency guards passed")
     return 0
 

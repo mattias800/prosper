@@ -56,6 +56,7 @@ if(PROSPER_REVISION_WORK_TREE AND PROSPER_REVISION_CONFIG_ID)
     execute_process(COMMAND "${PROSPER_REVISION_PYTHON}"
       "${PROSPER_REVISION_WORK_TREE}/prosper/tools/revision/compiler_dependencies.py"
       "${PROSPER_REVISION_COMPILE_COMMANDS}" "${PROSPER_REVISION_WORK_TREE}"
+      "${PROSPER_REVISION_GNU_VARIADIC_REQUIRED}"
       RESULT_VARIABLE _dependencies_result OUTPUT_VARIABLE _dependencies_hash
       OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
     string(APPEND _source_manifest "|dependencies=${_dependencies_hash}")
