@@ -16,6 +16,7 @@
 //      destroys the decoder handle and clears all pending state in g_vdecsw.
 
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "hle/video/video_backend.hpp"
 #include "hle/video/videodec2_guest_abi.hpp"
@@ -30,8 +31,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -111,7 +111,7 @@ constexpr uint64_t kVdecErrInputDepth = 0x811d0206ull;
 
 } // namespace
 
-int main() {
+TEST(VdecswDecode, Contract) {
     printf("== test_vdecsw_decode ==\n");
     register_builtin_hle();
 
@@ -131,7 +131,7 @@ int main() {
           "all 8 libSceVdecsw NIDs and lifecycle handlers resolve");
     if (!(query_compute && alloc_queue && query_decoder && create &&
           set_input && set_output && sync_input && sync_output && destroy && reset))
-        return 1;
+        FAIL() << "legacy early exit";
 
     MockVdecBackend mock;
     video::set_backend(&mock);
@@ -381,6 +381,5 @@ int main() {
           "TrySyncDecodeOutput rejects deleted decoder handle");
 
     video::set_backend(nullptr);
-    printf(fails ? "FAILED (%d)\n" : "PASSED (%d failures)\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

@@ -1,6 +1,7 @@
 // CPU-only exact ISA proofs and hosted-source admission. Renderer/upload/replay execution is
 // covered separately: these controls do not create a device or execute a captured SPIR-V module.
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <array>
@@ -32,7 +33,7 @@ static std::vector<uint32_t> program(bool wide8, uint32_t immediate, bool overwr
     return code;
 }
 
-int main() {
+TEST(RawWideReadPoint, Contract) {
     for (bool pixel : {false, true}) {
         const char* stage = pixel ? "PS" : "VS";
         const uint32_t export_word = pixel ? 0xf800180fu : 0xf80008cfu;
@@ -123,5 +124,5 @@ int main() {
                   "effective hosted source range overflow refuses admission");
         }
     }
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }

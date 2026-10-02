@@ -12,6 +12,7 @@
 // and maps anything else non-zero to Dinkumware `_Thrd_error`, which raises an uncaught
 // std::system_error. Both halves are asserted below so neither can drift into the other.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"
 #include <cstdio>
@@ -23,10 +24,9 @@ static constexpr uint64_t kSceEBUSY   = prosper::hle::kSceKernelErrorEBUSY;     
 static constexpr uint64_t kSceEDEADLK = prosper::hle::kSceKernelErrorEDEADLK;   // 0x8002000b
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(MutexTypes, Contract) {
     printf("== test_mutex_types ==\n");
     register_builtin_hle();
     auto attr_init    = Hle::lookup(nid_hash("scePthreadMutexattrInit"));
@@ -41,7 +41,7 @@ int main() {
     CHECK(attr_init && attr_settype && attr_gettype && attr_destroy &&
               m_init && m_lock && m_trylock && m_unlock && m_destroy,
           "mutex HLE functions registered");
-    if (fails) { printf("== FAIL ==\n"); return 1; }
+    if (fails) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     auto U = [](void* p) { return (uint64_t)(uintptr_t)p; };
 
@@ -151,7 +151,5 @@ int main() {
         p_destroy(U(&pmtx), 0, 0, 0, 0, 0);
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

@@ -6,6 +6,7 @@
 // says not to rely on). It exercises the exact front-half -> back-half handoff: Dcb build -> PM4 ->
 // decode -> GpuState.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "gpu/pm4/command_processor.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -27,8 +28,7 @@ extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws);
 extern "C" bool prosper_agc_submit_sh_reg(uint64_t queue, uint32_t offset, uint32_t* value);
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Game's Dcb struct (must match hle_agc.cpp's AgcDcb byte-for-byte).
 struct Dcb {
@@ -40,7 +40,7 @@ struct Packet { uint32_t* addr; uint32_t dw_num; uint8_t pad[4]; };
 using HostHle9 = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                               uint64_t, uint64_t, uint64_t, uint64_t);
 
-int main() {
+TEST(AgcSubmit, Contract) {
     printf("== test_agc_submit ==\n");
     register_builtin_hle();
 
@@ -58,7 +58,7 @@ int main() {
     CHECK(reset && setcx && setsh && setidx && draw && submit && submit_acb && regmem && maxname && release && waitmem,
           "AGC Dcb/Acb submit and resource-registration functions registered");
     if (!(reset && setcx && setsh && setidx && draw && submit && submit_acb && regmem && maxname && release && waitmem)) {
-        printf("== FAIL ==\n"); return 1;
+        printf("== FAIL ==\n"); FAIL() << "legacy early exit";
     }
 
     uint64_t registration_bytes = 0x7a2a67fe6900ull;
@@ -342,7 +342,5 @@ int main() {
               "outer return hook retires the final matching scope");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

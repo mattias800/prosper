@@ -34,6 +34,7 @@
 // wakeup, a deadline already in the past, a clock that runs backwards, the slice clamp binding, and
 // arithmetic within a few nanoseconds of UINT64_MAX. Mutation results are in the PR.
 #include "host/platform/precise_sleep.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -42,8 +43,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // A fake clock/sleeper pair, file-scope so they can be plain function pointers (the API
 // sleep_until_deadline_retry() takes, matching the real steady_now_ns()/sleep_until_with_std()
@@ -133,7 +133,7 @@ static LoopStats drive_poll_loop(uint64_t start_ns, uint64_t timeout_us, Wake wa
     return st;
 }
 
-int main() {
+TEST(PreciseSleep, Contract) {
     printf("== test_precise_sleep ==\n");
 
     // 1. THE #3074 CASE: each fake sleep advances less than the full gap to the deadline, so a
@@ -860,6 +860,5 @@ int main() {
         }
     }
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

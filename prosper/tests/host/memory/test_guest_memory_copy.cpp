@@ -7,6 +7,7 @@
 // preserved. A regression that faulted would take the test process down rather than print [FAIL],
 // which ctest reports just the same.
 #include "host/memory/guest_memory_copy.hpp"
+#include <gtest/gtest.h>
 
 #include <cerrno>
 #include <cstdint>
@@ -25,9 +26,7 @@
 
 using namespace prosper::host;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 constexpr size_t kPage = 0x1000;
@@ -51,11 +50,11 @@ bool no_access(uint8_t* page) {
 uint64_t addr(const void* p) { return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)); }
 }  // namespace
 
-int main() {
+TEST(GuestMemoryCopy, Contract) {
     printf("== test_guest_memory_copy ==\n");
     // [0] RW, [1] RW, [2] NO ACCESS, [3] RW, [4] RO (POSIX only)
     uint8_t* base = map_pages(5);
-    if (!base) { printf("  [FAIL] fixture mapping\n"); return 1; }
+    if (!base) { printf("  [FAIL] fixture mapping\n"); FAIL() << "legacy early exit"; }
     for (size_t i = 0; i < 2 * kPage; ++i) base[i] = static_cast<uint8_t>(i * 7 + 3);
     CHECK(no_access(base + 2 * kPage), "CONTROL: the hole page is made inaccessible");
 #ifndef _WIN32
@@ -122,7 +121,4 @@ int main() {
     (void)guest_write_exact(addr(base + 2 * kPage), pattern, 8);
     CHECK(errno == 1234, "a failing copy leaves errno as the caller had it");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

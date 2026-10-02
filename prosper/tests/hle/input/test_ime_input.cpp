@@ -5,6 +5,7 @@
 // A no-event stub (the old behavior) delivered no input, so titles reading input through the IME
 // keyboard path never saw a keypress. Drives the real HLE via the NID registry.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "hle/input/ime_input.hpp"
 #include <cstdio>
@@ -20,8 +21,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Fake guest handler: records each delivered event's id + keycode.
 struct Rec { uint64_t arg; uint32_t id; uint16_t keycode; };
@@ -40,7 +40,7 @@ static void fake_handler(uint64_t arg, void* ev) {
     }
 }
 
-int main() {
+TEST(ImeInput, Contract) {
     printf("== test_ime_input ==\n");
     const std::filesystem::path script_path =
         prosper_test::test_scratch_dir() / "prosper_test_ime_input.route";
@@ -58,7 +58,7 @@ int main() {
     CHECK(open != nullptr, "sceImeKeyboardOpen registered");
     CHECK(close != nullptr, "sceImeKeyboardClose registered");
     CHECK(update != nullptr, "sceImeUpdate registered");
-    if (!open || !close || !update) { printf("fails=%d\n", fails); return 1; }
+    if (!open || !close || !update) { printf("fails=%d\n", fails); FAIL() << "legacy early exit"; }
     const uint64_t H = (uint64_t)(uintptr_t)&fake_handler;
     constexpr uint64_t CallbackArg = 0x123456789abcdef0ull;
     struct KeyboardParam {
@@ -147,6 +147,5 @@ int main() {
 
     std::error_code remove_error;
     std::filesystem::remove(script_path, remove_error);
-    printf("fails=%d\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

@@ -52,6 +52,7 @@
 // `s_or_b64` (0x11) contributes the base register alone. The witness's high word comes from the
 // earlier wide load. A case with both scalar words present is not exercised here.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -62,8 +63,7 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // pc  instruction                                     (branch targets computed, not hand-counted)
 //  0  s_mov_b64  s[86:87], exec                       E := entry EXEC
@@ -92,7 +92,7 @@ static const uint32_t kUndefAccumulatorPs[] = {
     0xF800180Fu, 0x03020100u, 0xBF810000u,
 };
 
-int main() {
+TEST(UndefLoopAccumulator, Contract) {
     printf("== test_undef_loop_accumulator ==\n");
 
     const uint64_t addr = 0xA1A1A1A1ull;
@@ -125,5 +125,5 @@ int main() {
 
     if (fails) printf("== FAIL: %d ==\n", fails);
     else       printf("== all passed ==\n");
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

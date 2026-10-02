@@ -4,14 +4,13 @@
 // guards the glue wiring (config parse, per-frame superframe iteration, output layout) and the vendored
 // build integration; pure and self-contained (no game dump), so it runs in CI.
 #include "hle/audio/atrac9_decode.hpp"
+#include <gtest/gtest.h>
 #include "fixtures/at9_testvec.h"
 #include <cstdio>
 #include <cstdint>
 #include <vector>
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 static uint32_t crc32(const uint8_t* p, size_t n) {
     uint32_t c = 0xFFFFFFFFu;
@@ -22,10 +21,10 @@ static uint32_t crc32(const uint8_t* p, size_t n) {
     return ~c;
 }
 
-int main() {
+TEST(Atrac9, Contract) {
     prosper::Atrac9Decoder dec;
     CHECK(dec.init(kAt9Config), "init from 4-byte config");
-    if (!dec.valid()) { printf("test_atrac9: init failed, aborting\n"); return 1; }
+    if (!dec.valid()) { printf("test_atrac9: init failed, aborting\n"); FAIL() << "legacy early exit"; }
 
     CHECK(dec.channels() == 2, "channels == 2 (stereo)");
     CHECK(dec.sample_rate() == 48000, "sample rate == 48000");
@@ -58,6 +57,4 @@ int main() {
     // consumes exactly N*superframe_bytes().
     CHECK(nsf * sf_bytes == kAt9DataLen, "superframe stride tiles the stream exactly (safe advance unit)");
 
-    printf(fails ? "test_atrac9: %d FAILURE(S)\n" : "test_atrac9: all ok\n", fails);
-    return fails ? 1 : 0;
 }

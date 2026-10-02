@@ -5,6 +5,7 @@
 // on it). This verifies the real backend: a triggered user event and an expired timer both post a
 // SceKernelEvent that WaitEqueue then returns, with the FreeBSD-style filter ids and udata intact.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -19,15 +20,14 @@ using namespace prosper;
 namespace prosper { void prosper_eq_trigger_eop(); }
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // SceKernelEvent (FreeBSD kevent layout, 0x20 bytes): ident@0, filter@8(i16), flags@0xA, fflags@0xC,
 // data@0x10, udata@0x18. Must match the backend's struct exactly.
 struct KEvent { int64_t ident; int16_t filter; uint16_t flags; uint32_t fflags; int64_t data; uint64_t udata; };
 static_assert(sizeof(KEvent) == 0x20, "SceKernelEvent must be 0x20 bytes");
 
-int main() {
+TEST(EqueueEvents, Contract) {
     printf("== test_equeue_events ==\n");
 #ifdef _WIN32
     _putenv_s("PROSPER_EOP_SYNC", "1");
@@ -45,7 +45,7 @@ int main() {
     CHECK(create && adduser && trigger && addhrt && wait && getcount,
           "all equeue event fns registered");
     if (!(create && adduser && trigger && addhrt && wait && getcount)) {
-        printf("== FAIL ==\n"); return 1;
+        printf("== FAIL ==\n"); FAIL() << "legacy early exit";
     }
 
     // Create an equeue: the handle is written to *arg0.
@@ -316,7 +316,6 @@ int main() {
         CHECK((uint32_t)wret == 0x80020009u && wout == 0, "DeleteEqueue wakes an infinite waiter with EBADF");
     }
 
-    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
+    EXPECT_EQ(fails, 0);
 }

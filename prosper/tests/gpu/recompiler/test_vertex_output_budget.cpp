@@ -21,6 +21,7 @@
 // the interface really does blow the limit. Without that arm "1 location" would be consistent with a
 // program that never had 32 in the first place, and the guard would be untested.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -29,9 +30,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -95,7 +94,7 @@ size_t stores_to_location(const std::vector<uint32_t>& spirv, uint32_t location)
 
 }  // namespace
 
-int main() {
+TEST(VertexOutputBudget, Contract) {
     printf("== test_vertex_output_budget ==\n");
 
     // VS: fullscreen triangle from gl_VertexIndex, plus EXP PARAM0 = (float(vid), 0, 0, 1).
@@ -150,7 +149,7 @@ int main() {
     if (!bounded.consumed_known) {
         printf("  [SKIP] PROSPER_NO_DEAD_VARYING_ELIM is set; this test measures the bound it "
                "disables\n== SKIP ==\n");
-        return 0;
+        return;
     }
     CHECK(bounded.consumed_mask == 1u, "the stamped mapping carries the fragment program's {0}");
     CHECK(bounded.valid_mask == 0xffffffffu,
@@ -212,6 +211,4 @@ int main() {
           "MUTATION ARM: that interface exceeds maxVertexOutputComponents, so the assertions above "
           "are testing a real guard");
 
-    printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
 }

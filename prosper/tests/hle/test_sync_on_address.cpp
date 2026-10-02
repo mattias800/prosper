@@ -1,5 +1,6 @@
 // test_sync_on_address -- basic behavior for the raw wait/wake-by-address HLE NIDs.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include <atomic>
 #include <climits>
 #include <chrono>
@@ -8,18 +9,16 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
-int main() {
+TEST(SyncOnAddress, Contract) {
     printf("== test_sync_on_address ==\n");
     register_builtin_hle();
 
     HleFn wait = Hle::lookup("Hc4CaR6JBL0");
     HleFn wake = Hle::lookup("q2y-wDIVWZA");
     CHECK(wait && wake, "wait/wake-by-address NIDs registered");
-    if (!wait || !wake) return 1;
+    if (!wait || !wake) FAIL() << "legacy early exit";
 
     alignas(4) uint32_t word = 2;
     std::atomic_ref<uint32_t> word_atomic(word);
@@ -90,7 +89,4 @@ int main() {
               "maximum uint32 timeout remains blocked until an explicit wake");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

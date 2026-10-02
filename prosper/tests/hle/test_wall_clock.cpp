@@ -10,6 +10,7 @@
 // monotonic sources (ptc/tsc/MONOTONIC) still count uptime and never go backwards.
 // Deliberately no exact-time asserts — everything is tolerance-based.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -19,8 +20,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static int64_t iabs64(int64_t v) { return v < 0 ? -v : v; }
 
@@ -28,7 +28,7 @@ static int64_t iabs64(int64_t v) { return v < 0 ? -v : v; }
 struct RtcDateTime { uint16_t year, month, day, hour, minute, second; uint32_t microsecond; };
 static_assert(sizeof(RtcDateTime) == 16, "SceRtcDateTime must be 16 bytes");
 
-int main() {
+TEST(WallClock, Contract) {
     printf("== test_wall_clock ==\n");
     register_builtin_hle();
 
@@ -43,7 +43,7 @@ int main() {
     auto tsc_fn           = Hle::lookup(nid_hash("sceKernelReadTsc"));
     CHECK(clock_gettime_fn && gettimeofday_fn && time_fn && rtc_tick_fn && rtc_local_fn &&
           rtc_clock_fn && rtc_utc_fn && ptc_fn && tsc_fn, "all time fns registered");
-    if (fails) { printf("== FAIL ==\n"); return 1; }
+    if (fails) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // --- CLOCK_REALTIME (FreeBSD id 0) tracks the HOST's real now (± seconds, not ± decades). ---
     int64_t ts[2] = { 0, 0 };
@@ -131,5 +131,5 @@ int main() {
 
     if (fails) printf("== FAIL (%d) ==\n", fails);
     else       printf("== PASS ==\n");
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

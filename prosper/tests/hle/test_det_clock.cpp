@@ -1,5 +1,6 @@
 // test_det_clock - opt-in flip-paced guest monotonic time (#240).
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <algorithm>
 #include <atomic>
@@ -15,10 +16,9 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx,
                                            uint32_t flip_mode, int64_t flip_arg);
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(DetClock, Contract) {
     std::printf("== test_det_clock ==\n");
 #ifdef _WIN32
     _putenv_s("PROSPER_DET_CLOCK", "1");
@@ -33,10 +33,10 @@ int main() {
     auto clock_gettime_fn = Hle::lookup(nid_hash("sceKernelClockGettime"));
     CHECK(videoout_open && ptc && clock_gettime_fn,
           "VideoOut and monotonic/realtime entry points registered");
-    if (fails) return 1;
+    if (fails) FAIL() << "legacy early exit";
     const uint64_t handle = videoout_open(0, 0, 0, 0, 0, 0);
     CHECK((int64_t)handle > 0, "opened a live VideoOut handle for flip pacing");
-    if (fails) return 1;
+    if (fails) FAIL() << "legacy early exit";
 
     uint64_t pre0 = ptc(0, 0, 0, 0, 0, 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -84,5 +84,5 @@ int main() {
 
     if (fails) std::printf("== FAIL (%d) ==\n", fails);
     else       std::printf("== PASS ==\n");
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

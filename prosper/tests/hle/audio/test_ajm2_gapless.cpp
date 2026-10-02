@@ -12,6 +12,7 @@
 // the shared 16-superframe test vector, with reference PCM built by the same Atrac9Decoder glue
 // that test_atrac9 proves bit-exact against LibAtrac9.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "hle/audio/atrac9_decode.hpp"
 #include "fixtures/at9_testvec.h"
@@ -22,9 +23,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 using Hle10Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                              uint64_t, uint64_t, uint64_t, uint64_t);
@@ -39,7 +38,7 @@ static_assert(sizeof(Sideband) == 32, "AJM decode sideband includes the MFrame r
 
 static uint64_t addr(const void* p) { return (uint64_t)(uintptr_t)p; }
 
-int main() {
+TEST(Ajm2Gapless, Contract) {
     printf("== test_ajm2_gapless ==\n");
     register_builtin_hle();
 
@@ -48,12 +47,12 @@ int main() {
     auto job_dec  = reinterpret_cast<Hle10Fn>(Hle::lookup(nid_hash("sceAjmBatchJobDecode")));
     auto batch_go = reinterpret_cast<Hle10Fn>(Hle::lookup(nid_hash("sceAjmBatchStart")));
     CHECK(job_init && job_gapl && job_dec && batch_go, "batch-2.0 handlers registered");
-    if (!(job_init && job_gapl && job_dec && batch_go)) return 1;
+    if (!(job_init && job_gapl && job_dec && batch_go)) FAIL() << "legacy early exit";
 
     // Reference PCM: the full 16-superframe decode, bit-exact per test_atrac9.
     Atrac9Decoder ref;
     CHECK(ref.init(kAt9Config), "reference decoder init");
-    if (!ref.valid()) return 1;
+    if (!ref.valid()) FAIL() << "legacy early exit";
     const int ch = ref.channels();
     const uint32_t frame_bytes = (uint32_t)ch * sizeof(int16_t);
     const int sfb = ref.superframe_bytes();
@@ -237,6 +236,4 @@ int main() {
           terminal_third.front() == (int16_t)0x7777,
           "terminal ATRAC9 state persists across batches with a stable cumulative total");
 
-    printf(fails ? "test_ajm2_gapless: %d FAILURE(S)\n" : "test_ajm2_gapless: all ok\n", fails);
-    return fails ? 1 : 0;
 }

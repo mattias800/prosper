@@ -37,6 +37,7 @@
 // non-zero — and deliberately do not pin the constant, so recovering the real error space later is a
 // one-line change rather than a test rewrite.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -44,8 +45,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // The two NIDs PPSA20447 reaches during boot. libScePsml is not in the reference set, so the raw
 // NIDs are the only identity these functions have.
@@ -58,7 +58,7 @@ static bool guest_takes_allocation_branch(uint64_t init_rc, uint64_t query_rc) {
     return ((uint32_t)init_rc | (uint32_t)query_rc) == 0;
 }
 
-int main() {
+TEST(PsmlUnimplemented, Contract) {
     std::printf("== test_psml_unimplemented ==\n");
     // libScePsml moved to src/hle/video/videodec2.cpp with the decode libraries (#3735), so its
     // NIDs are bound by register_videodec_hle() now. register_service_hle() alone no longer
@@ -70,7 +70,7 @@ int main() {
     HleFn query = Hle::lookup(kPsmlQuery);
     CHECK(init != nullptr,  "libScePsml::3WVD91e12ZQ is registered (unregistered == answering SCE_OK)");
     CHECK(query != nullptr, "libScePsml::+2KpvixvL6E is registered");
-    if (!init || !query) { std::printf("== FAIL: %d ==\n", ++fails); return 1; }
+    if (!init || !query) { std::printf("== FAIL: %d ==\n", ++fails); FAIL() << "legacy early exit"; }
 
     const uint64_t init_rc  = init(0, 0, 0, 0, 0, 0);
     // The real call is (&out_struct, &buffer). Pass plausible pointers so a handler that dereferenced
@@ -108,6 +108,5 @@ int main() {
           "the handler writes NOTHING through either pointer -- the struct layout is unknown, so "
           "guessing at it would replace one fabrication with another");
 
-    std::printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

@@ -4,6 +4,7 @@
 // every packet is recognized with the correct operands. This exercises the decoder end-to-end against
 // the real emitters (hle_agc.cpp) with no fabricated data, independent of the (SDK-gated) boot.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "gpu/pm4/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -13,9 +14,7 @@
 using namespace prosper;
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Mirror of hle_agc.cpp's AgcDcb layout (must match byte-for-byte).
 struct Dcb {
@@ -28,7 +27,7 @@ static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
            ((op & 0xffu) << 8u) | ((r & (R_NUM - 1u)) << 2u);
 }
 
-int main() {
+TEST(Pm4Decode, Contract) {
     printf("== test_pm4_decode ==\n");
     register_builtin_hle();
 
@@ -58,7 +57,7 @@ int main() {
     if (!(reset && idx && setcx && p_add && p_adr && draw && drawi && evt && push && pop && instances &&
           setcx_direct && setsh_direct && setuc_direct && set_indirect_base && stall_parser &&
           draw_indirect && dispatch_indirect && draw_nonindexed_indirect)) {
-        printf("== FAIL ==\n"); return 1;
+        printf("== FAIL ==\n"); FAIL() << "legacy early exit";
     }
 
     uint32_t buffer[256];
@@ -103,7 +102,7 @@ int main() {
     size_t consumed = decode_pm4(buffer, 256, ops);   // pass full buffer; decoder stops at the zero tail
     CHECK(consumed == used_dw, "decoder consumed exactly the built dwords (stops at zero pad)");
     CHECK(ops.size() == 18, "decoded 18 packets");
-    if (ops.size() != 18) { printf("== FAIL: got %zu packets ==\n", ops.size()); return 1; }
+    if (ops.size() != 18) { printf("== FAIL: got %zu packets ==\n", ops.size()); FAIL() << "legacy early exit"; }
 
     using K = Pm4Command::Kind;
     CHECK(ops[0].kind == K::PushMarker && ops[0].marker_label &&
@@ -256,7 +255,4 @@ int main() {
               "WRITE_DATA decoder marks a complete declared-two payload valid");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }
