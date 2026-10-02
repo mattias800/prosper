@@ -4754,26 +4754,6 @@ endif()
       target_link_libraries(test_storage_image_copy PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME storage_image_copy COMMAND test_storage_image_copy)
 
-      # Interpolation: a recompiled VS exports EXP PARAM0, a recompiled PS reads it via v_interp.
-      add_executable(test_interp_render tests/gpu/recompiler/test_interp_render.cpp)
-      # Includes a shared fixture, which resolves from the `tests` root.
-      target_include_directories(test_interp_render PRIVATE tests)
-      # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
-      target_include_directories(test_interp_render PRIVATE frontends)
-      target_link_libraries(test_interp_render PRIVATE prosper_core Vulkan::Vulkan)
-      add_test(NAME interp_render COMMAND test_interp_render)
-
-
-      # RectList fourth-corner synthesis: the geometry stage must complete the rectangle whichever of
-      # the three supplied vertices is the shared corner (#3507).
-      add_executable(test_rect_synthesis_render tests/gpu/recompiler/test_rect_synthesis_render.cpp)
-      # Includes a shared fixture, which resolves from the `tests` root.
-      target_include_directories(test_rect_synthesis_render PRIVATE tests)
-      # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
-      target_include_directories(test_rect_synthesis_render PRIVATE frontends)
-      target_link_libraries(test_rect_synthesis_render PRIVATE prosper_core Vulkan::Vulkan)
-      add_test(NAME rect_synthesis_render COMMAND test_rect_synthesis_render)
-
       # Full textured-draw path: VS exports interpolated UVs, PS samples a texture at them (+screenshot).
       add_executable(test_textured_interp_render tests/gpu/test_textured_interp_render.cpp)
       # Includes a shared fixture, which resolves from the `tests` root.
@@ -4892,6 +4872,26 @@ endif()
 endif()
 
 if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
+  # Interpolation: a recompiled VS exports EXP PARAM0, a recompiled PS reads it via v_interp.
+  add_executable(test_interp_render tests/gpu/recompiler/test_interp_render.cpp)
+  # Includes a shared fixture, which resolves from the `tests` root.
+  target_include_directories(test_interp_render PRIVATE tests)
+  # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
+  target_include_directories(test_interp_render PRIVATE frontends)
+  target_link_libraries(test_interp_render PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME interp_render COMMAND test_interp_render)
+
+
+  # RectList fourth-corner synthesis: the geometry stage must complete the rectangle whichever of
+  # the three supplied vertices is the shared corner (#3507).
+  add_executable(test_rect_synthesis_render tests/gpu/recompiler/test_rect_synthesis_render.cpp)
+  # Includes a shared fixture, which resolves from the `tests` root.
+  target_include_directories(test_rect_synthesis_render PRIVATE tests)
+  # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
+  target_include_directories(test_rect_synthesis_render PRIVATE frontends)
+  target_link_libraries(test_rect_synthesis_render PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME rect_synthesis_render COMMAND test_rect_synthesis_render)
+
   # A compute full-overwrite destination at the colour-target COUNT bound evicts under the graphics
   # admission predicate instead of refusing (#3873).
   # BackendSubmissionBatch's timestamp envelope reuses one query pool across batches (#3948).
