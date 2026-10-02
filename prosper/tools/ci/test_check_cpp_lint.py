@@ -6,10 +6,16 @@ the python-quality job may not have them. It is not left unexercised: the Linux 
 group and runs `check_cpp_lint.py --selftest` directly, where a missing tool is exit 2.
 """
 
+import contextlib
+import io
+import os
 import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -67,6 +73,79 @@ class Parsers(unittest.TestCase):
     def test_ref_that_looks_like_an_option_is_refused(self):
         with self.assertRaises(ValueError):
             lint.validate_ref("--output=/tmp/x")
+
+    def test_git_quoted_and_space_paths_are_not_silently_dropped(self):
+        # These are Git's actual headers: UTF-8 bytes are octal-escaped, a tab is C-escaped,
+        # and a name containing only spaces stays unquoted but gains a terminating tab.
+        diff = (
+            '+++ "b/prosper/src/na\\303\\257ve.cpp"\n@@ -0,0 +1 @@\n+x\n'
+            '+++ "b/prosper/src/tab\\tname.cpp"\n@@ -0,0 +1 @@\n+x\n'
+            "+++ b/prosper/src/space name.cpp\t\n@@ -0,0 +1 @@\n+x\n"
+        )
+        self.assertEqual(
+            lint.parse_diff(diff),
+            {
+                "prosper/src/naïve.cpp": [(1, 1)],
+                "prosper/src/tab\tname.cpp": [(1, 1)],
+                "prosper/src/space name.cpp": [(1, 1)],
+            },
+        )
+
+
+class ToolOutcomes(unittest.TestCase):
+    """A failed clang process must not look like a clean or analysable translation unit."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.build = self.root / "build"
+        self.path = "prosper/src/probe.cpp"
+        self.target = self.root / self.path
+        self.ranges = {self.path: [(1, 1)]}
+        db = mock.patch.object(
+            lint, "compile_db_files", return_value={os.path.normcase(str(self.target))}
+        )
+        db.start()
+        self.addCleanup(db.stop)
+
+    def tidy(self, returncode, output):
+        proc = subprocess.CompletedProcess(["clang-tidy"], returncode, output, "")
+        with mock.patch.object(lint.subprocess, "run", return_value=proc):
+            return lint.check_tidy(self.root, self.ranges, self.build, "clang-tidy", [], 1)
+
+    def database_probe(self, returncode, output):
+        proc = subprocess.CompletedProcess(["clang-tidy"], returncode, output, "")
+        with (
+            mock.patch.object(lint.subprocess, "run", return_value=proc),
+            mock.patch.object(lint, "tool", return_value="clang-tidy"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            return lint.check_db(self.root, self.build, [])
+
+    def test_failed_invocation_and_crash_are_not_clean(self):
+        for code, text in ((1, "Error parsing .clang-tidy: Invalid argument"), (-11, "crash")):
+            for gate in (self.tidy, self.database_probe):
+                with self.subTest(returncode=code, gate=gate.__name__):
+                    with self.assertRaisesRegex(RuntimeError, "clang-tidy failed"):
+                        gate(code, text)
+
+    def test_success_check_error_warning_and_compile_skip_remain_distinct(self):
+        self.assertEqual(self.tidy(0, ""), ([], [], []))
+        self.assertEqual(self.database_probe(0, ""), 0)
+        prefix = f"{self.target}:1:1: "
+        error = prefix + "error: unsafe call [concurrency-mt-unsafe,-warnings-as-errors]"
+        errors, warnings, skips = self.tidy(1, error)
+        self.assertEqual((len(errors), len(warnings), len(skips)), (1, 0, 0))
+        # A promoted tidy finding proves the database compiled; it is not a compiler failure.
+        self.assertEqual(self.database_probe(1, error), 0)
+        warning = prefix + "warning: missing include [misc-include-cleaner]"
+        errors, warnings, skips = self.tidy(0, warning)
+        self.assertEqual((len(errors), len(warnings), len(skips)), (0, 1, 0))
+        compile_error = prefix + "error: missing header [clang-diagnostic-error]"
+        errors, warnings, skips = self.tidy(1, compile_error)
+        self.assertEqual((len(errors), len(warnings), len(skips)), (0, 0, 1))
+        self.assertEqual(self.database_probe(1, compile_error), 1)
 
 
 @unittest.skipUnless(have_tools(), "clang tools not installed (uv sync --group cpp-lint)")

@@ -27,6 +27,7 @@ Run from anywhere inside the checkout:
 """
 
 import argparse
+import codecs
 import json
 import os
 import re
@@ -58,7 +59,13 @@ def parse_diff(text):
     ranges, path = {}, None
     for line in text.splitlines():
         if line.startswith("+++ "):
-            target = line[4:]
+            # Git terminates unquoted names containing spaces with a tab, and C-quotes names
+            # containing tabs/non-ASCII bytes. Decode those before testing the source suffix.
+            target = line[4:].split("\t", 1)[0]
+            if target.startswith('"'):
+                if not target.endswith('"'):
+                    raise ValueError(f"invalid quoted diff path: {target!r}")
+                target = os.fsdecode(codecs.escape_decode(os.fsencode(target[1:-1]))[0])
             path = target[2:] if target.startswith("b/") else None
             continue
         m = HUNK.match(line)
@@ -167,17 +174,23 @@ def check_tidy(root, ranges, build, clang_tidy, extra_args, jobs):
             encoding="utf-8",
             errors="replace",
         )
-        return path, proc.stdout + proc.stderr
+        return path, proc.returncode, proc.stdout + proc.stderr
 
     errors, warnings, seen = [], [], set()
     with ThreadPoolExecutor(max(1, jobs)) as ex:
-        for path, out in ex.map(one, targets):
+        for path, returncode, out in ex.map(one, targets):
             findings = parse_findings(out)
+            if returncode < 0:
+                raise RuntimeError(f"clang-tidy failed for {path} (exit {returncode})\n{out}")
             if any(check == "clang-diagnostic-error" for _, _, _, check, _ in findings):
                 skipped.append(
                     f"{path}: does not compile under clang-tidy here (see output)\n{out}"
                 )
                 continue
+            # clang-tidy returns nonzero for warnings promoted to errors, which are findings.
+            # A failure with no parsed error is an invocation/configuration failure, not clean.
+            if returncode and not any(level == "error" for _, _, level, _, _ in findings):
+                raise RuntimeError(f"clang-tidy failed for {path} (exit {returncode})\n{out}")
             for where, line, level, check, message in findings:
                 key = (os.path.normcase(where), line, check)
                 if key in seen:
@@ -210,9 +223,18 @@ def check_db(root, build, extra_args):
         errors="replace",
     )
     out = proc.stdout + proc.stderr
-    if any(c == "clang-diagnostic-error" for _, _, _, c, _ in parse_findings(out)):
+    findings = parse_findings(out)
+    if proc.returncode < 0:
+        raise RuntimeError(
+            f"clang-tidy failed during database probe (exit {proc.returncode})\n{out}"
+        )
+    if any(c == "clang-diagnostic-error" for _, _, _, c, _ in findings):
         print(f"compile database NOT analysable: {candidates[0]}\n{out}")
         return 1
+    if proc.returncode and not any(level == "error" for _, _, level, _, _ in findings):
+        raise RuntimeError(
+            f"clang-tidy failed during database probe (exit {proc.returncode})\n{out}"
+        )
     print(
         f"compile database analysable ({len(candidates)} prosper/src TUs; probed {candidates[0]})"
     )
