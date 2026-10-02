@@ -7,6 +7,7 @@
 // polling IsActive, so synthetic EOF must be driven by GetVideoData[Ex] and fire STOP outside the
 // player mutex. This locks both contracts.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "hle/video/video_backend.hpp"
 #include "gpu/texture/guest_texture_layout.hpp"
@@ -27,8 +28,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 struct AvpInitData {
     struct { void* obj; void* allocate; void* deallocate; void* allocate_texture; void* deallocate_texture; } memory{};
@@ -477,7 +477,7 @@ static void PROSPER_SYSV_ABI on_avplayer_texture_deallocate(void* object, void* 
 }
 #endif
 
-int main() {
+TEST(Avplayer, Contract) {
     printf("== test_avplayer ==\n");
     register_builtin_hle();
 
@@ -501,7 +501,7 @@ int main() {
           "AvPlayer lifecycle and stream functions registered");
     if (!(init && initex && active && add && start && video_basic && video && audio && streams &&
           infoex && pause && resume && close)) {
-        printf("== FAIL ==\n"); return 1;
+        printf("== FAIL ==\n"); FAIL() << "legacy early exit";
     }
 
     // sceAvPlayerInit(data) -> handle (the RETURN value is the handle; non-NULL so the game proceeds).
@@ -1293,7 +1293,5 @@ int main() {
         }
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

@@ -1,4 +1,5 @@
 #include "gpu/capture/gpu_capture_bundle.hpp"
+#include <gtest/gtest.h>
 #include "gpu/timeline/gpu_timeline.hpp"     // interactive F9 whole-frame grab state machine
 #include "gpu/texture/tile.hpp"
 
@@ -14,11 +15,9 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(GpuCaptureBundle, Contract) {
     std::printf("== test_gpu_capture_bundle ==\n");
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto path = prosper_test::test_scratch_dir() /
@@ -645,6 +644,4 @@ int main() {
 #endif
     std::filesystem::remove(producer_multi_path, ec);
 
-    if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
-    std::printf("== PASS ==\n"); return 0;
 }

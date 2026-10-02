@@ -12,6 +12,7 @@
 // base moves again.
 
 #include "host/image/boot_program.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -19,11 +20,9 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(GuestModuleLabel, Contract) {
     std::printf("== test_guest_module_label ==\n");
 
     // ---- the contract, for each module a diagnostic can name -------------------------------
@@ -142,6 +141,4 @@ int main() {
               "a non-guest rip renders as mapped/host+<the address>, not a fabricated RVA");
     }
 
-    std::printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
 }

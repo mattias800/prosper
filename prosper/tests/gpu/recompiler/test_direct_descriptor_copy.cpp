@@ -13,6 +13,7 @@
 //
 // Pure (no Vulkan), so it runs in CI.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 
 #include <cstdio>
@@ -21,9 +22,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -67,7 +66,7 @@ bool recompiles(const std::vector<uint32_t>& code) {
 
 }  // namespace
 
-int main() {
+TEST(DirectDescriptorCopy, Contract) {
     printf("== test_direct_descriptor_copy ==\n");
 
     // --- Positive control, constructed independently of the copy case ------------------------
@@ -246,6 +245,4 @@ int main() {
     CHECK(!recompiles(loop_staged),
           "a copy staged inside a loop body does not resolve after the loop");
 
-    printf("%s\n", fails ? "FAILED" : "OK");
-    return fails ? 1 : 0;
 }

@@ -15,6 +15,7 @@
 // compiled on BOTH sides of the fix, because the structured routes claim them before the dispatcher
 // ever runs. So this pins the exact production kernel and its exact routed resource table.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include "fixtures/test_data.h"
 
@@ -31,10 +32,7 @@ using namespace prosper::gpu;
 
 namespace {
 
-int failures = 0;
-#define CHECK(condition, message) do { \
-    if (!(condition)) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; } \
-} while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
 uint8_t nibble(char value) {
     return value >= '0' && value <= '9' ? static_cast<uint8_t>(value - '0')
@@ -157,7 +155,7 @@ ComputeShaderConfig routed_config() {
 
 } // namespace
 
-int main() {
+TEST(ExecPopulationCount, Contract) {
     const std::vector<uint32_t> code = program();
     ShaderResourceTable table = routed_table();
     const ComputeShaderConfig config = routed_config();
@@ -177,7 +175,4 @@ int main() {
     CHECK(narrow_spirv.empty(),
           "a narrower native subgroup keeps the population count fail-visible");
 
-    if (failures) { std::fprintf(stderr, "== FAIL: %d ==\n", failures); return 1; }
-    std::fprintf(stderr, "== PASS ==\n");
-    return 0;
 }

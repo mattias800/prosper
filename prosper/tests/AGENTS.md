@@ -1,8 +1,19 @@
 # tests — what a test here must do
 
-Rules for tests under `prosper/tests/`. Tests are standalone executables registered with `add_test` in
-`prosper/CMakeLists.txt` (there is no GoogleTest dependency), reporting through a local `CHECK`
-macro or `tests/support/`.
+Rules for tests under `prosper/tests/`. **New tests use GoogleTest** (`TEST`/`TEST_F`,
+`EXPECT_*`/`ASSERT_*`), registered with `prosper_add_gtest(<target> SOURCES ... INCLUDES ... LIBRARIES ...)`
+from `prosper/cmake/ProsperGTest.cmake`; each `TEST` is its own ctest case (`Suite.Name`).
+Older tests are standalone executables registered with `add_test` and a local `CHECK` macro.
+
+## GoogleTest policy
+
+- Do not add a file with its own `int main()` and a home-made `CHECK`. The ctest `gtest_policy`
+  (`tools/ci/check_gtest_policy.py`) fails on it.
+- Legacy hand-rolled tests are listed in `tools/ci/gtest_legacy_allowlist.txt`. When you migrate one,
+  delete its line (the check fails if a listed file no longer has `main()`).
+- Prefer one `TEST` per behaviour, with a message on `EXPECT_*` (`<< "why"`), not one giant test.
+- A test that must compile standalone (e.g. `tools/perf/mutate_*.sh` use plain g++) may stay legacy.
+- Dump- or Vulkan-gated tests keep their gating in CMake, not inside gtest.
 
 ## Rules
 

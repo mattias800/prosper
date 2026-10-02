@@ -3,6 +3,7 @@
 // VirtualQuery to decide whether a later commit is necessary; a false committed result skips that
 // commit and leaves the first access faulting.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -18,8 +19,7 @@ using namespace prosper;
 extern "C" int prosper_reserved_range_state(uint64_t addr);
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 #ifdef _WIN32
 static uint64_t find_free_guest_span(uint64_t len) {
@@ -45,7 +45,7 @@ static uint64_t find_free_guest_span(uint64_t len) {
 }
 #endif
 
-int main() {
+TEST(RetrackReservation, Contract) {
     printf("== test_retrack_reservation ==\n");
     register_builtin_hle();
     auto reserve  = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
@@ -62,7 +62,7 @@ int main() {
     CHECK(reserve && protect && mtypeprotect && batch && query && query_protection && flexible &&
               flexible_noname && unmap,
           "memory HLE functions registered");
-    if (fails) return 1;
+    if (fails) FAIL() << "legacy early exit";
 
     constexpr uint64_t page = 0x10000;
 
@@ -167,7 +167,7 @@ int main() {
     uint64_t base = 0;
     CHECK(reserve((uint64_t)(uintptr_t)&base, len, 0, page, 0, 0) == 0 && base,
           "reserve three uncommitted pages");
-    if (!base) return 1;
+    if (!base) FAIL() << "legacy early exit";
 
     // #387 F3: a host protection failure must reach the guest and must not retag the tracked
     // reservation. The old handler returned success and split/renamed the mapping even though no
@@ -394,7 +394,6 @@ int main() {
               protection_start == UINT64_MAX && protection_end == UINT64_MAX &&
               protection_value == UINT32_MAX,
           "QueryMemoryProtection rejects an untracked address without writing outputs");
-    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); FAIL() << "legacy early exit"; }
+    EXPECT_EQ(fails, 0);
 }

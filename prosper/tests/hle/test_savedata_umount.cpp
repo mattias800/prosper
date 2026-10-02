@@ -43,6 +43,7 @@
 //  arm 9  codes are distinct  [G]  two constants compared -- it cannot redden against the unfixed
 //                                  handler, and says so. (#3665 shipped this arm mis-tagged [D].)
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "fixtures/test_scratch.h"
 
 #include <cstdint>
@@ -59,8 +60,7 @@ namespace fs = std::filesystem;
 
 static int fails = 0;
 static int checks = 0;
-#define CHECK(c, m) do { ++checks; if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -142,7 +142,7 @@ std::string make_app0(const fs::path& base, const char* name, const std::string&
 
 }   // namespace
 
-int main() {
+TEST(SavedataUmount, Contract) {
     printf("== test_savedata_umount ==\n");
     register_builtin_hle();
 
@@ -157,7 +157,7 @@ int main() {
     CHECK(g_get_event != nullptr, "[G] sceSaveDataGetEventResult is registered");
     if (!g_mount3 || !g_umount || !g_umount2 || !g_get_event) {
         printf("== FAIL: %d == (%d assertions executed)\n", fails, checks);
-        return 1;
+        FAIL() << "legacy early exit";
     }
 
     // A disposable save root: this fixture never touches a game dump or a developer's real saves.
@@ -331,7 +331,5 @@ int main() {
 
     savedata0_umount();
     drain_events();
-    if (fails) { printf("== FAIL: %d == (%d assertions executed)\n", fails, checks); return 1; }
-    printf("== PASS == (%d assertions executed)\n", checks);
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

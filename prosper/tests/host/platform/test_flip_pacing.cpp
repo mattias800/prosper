@@ -20,6 +20,7 @@
 // the advertised display mode resolves ONCE per process, and these arms want a process whose
 // environment is untouched so the `legacy` 59.94 Hz default is what the derivation is read against.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <chrono>
 #include <cstdint>
@@ -39,9 +40,7 @@ extern "C" void     prosper_vo_set_flip_pacing_unpaced_default();
 extern "C" void     prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx,
                                              uint32_t flip_mode, int64_t flip_arg);
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static void set_pace_env(const char* value) {
 #ifdef _WIN32
@@ -57,14 +56,14 @@ static uint64_t steady_ns() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-int main() {
+TEST(FlipPacing, Contract) {
     printf("== test_flip_pacing ==\n");
     register_builtin_hle();
     set_pace_env(nullptr);   // start from "nobody named a rate", whatever the caller's env held
 
     auto open    = Hle::lookup(nid_hash("sceVideoOutOpen"));
     auto setrate = Hle::lookup(nid_hash("sceVideoOutSetFlipRate"));
-    if (!open || !setrate) { printf("== FAIL: VideoOut entry points missing ==\n"); return 1; }
+    if (!open || !setrate) { printf("== FAIL: VideoOut entry points missing ==\n"); FAIL() << "legacy early exit"; }
 
     const uint64_t handle = open(0, 0, 0, 0, 0, 0);
     CHECK((int64_t)handle > 0, "VideoOutOpen returns a live positive handle");
@@ -188,7 +187,4 @@ int main() {
           "an explicit rate still wins over the harness opt-out");
     set_pace_env(nullptr);
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

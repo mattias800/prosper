@@ -6,15 +6,14 @@
 // (the #304 "flat wedge"). index_buffer_is_unannounced_32bit() recovers the real size from the
 // buffer bytes. These vectors are the exact ones captured live from the DOLL boot.
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 #include <cstdint>
 #include <vector>
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Run the fingerprint over a 32-bit index vector: p32 reads the dwords, p16 aliases the same bytes.
 static bool detect32(const std::vector<uint32_t>& i32, uint32_t n) {
@@ -29,7 +28,7 @@ static bool detect16(std::vector<uint16_t> i16, uint32_t n) {
     return index_buffer_is_unannounced_32bit(i16.data(), p32, n);
 }
 
-int main() {
+TEST(IndexSizeDetect, Contract) {
     printf("== test_index_size_detect ==\n");
 
     // The real banner quad, stored 32-bit: [0,1,2,2,1,3] (two triangles over 4 verts). Detected 32-bit.
@@ -270,6 +269,4 @@ int main() {
               "#3009: ...and is unreachable for a title that announced its index size");
     }
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

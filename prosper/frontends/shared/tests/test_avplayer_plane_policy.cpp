@@ -6,6 +6,7 @@
 // single green<->magenta axis, so no draw census, colour count or non-black metric can detect it.
 // The descriptor-level classification is therefore what has to be asserted.
 #include "shared/media/avplayer_plane_policy.hpp"
+#include <gtest/gtest.h>
 
 #include "gpu/texture/guest_texture_layout.hpp"
 
@@ -18,9 +19,7 @@ using prosper::gpu::DataFormat;
 using prosper::gpu::ResourceClass;
 using prosper::gpu::ShaderResource;
 
-static int failures = 0;
-#define CHECK(cond) do { if (!(cond)) { \
-    std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
+#define CHECK(cond) EXPECT_TRUE(cond)
 
 namespace {
 
@@ -147,7 +146,7 @@ auto classify(const ShaderResource& r, const std::vector<ShaderResource>& table)
 
 } // namespace
 
-int main() {
+TEST(AvplayerPlanePolicy, Contract) {
     // ---- 1. The live R-Type descriptors, with AvPlayer's exact pitch provenance registered. ----
     // This is the arm that fails when the classifier demands DIM=2D: the plane is real, its bytes
     // are correct, and it would silently take the coverage broadcast.
@@ -402,6 +401,4 @@ int main() {
         CHECK(v.reason == AvpChromaReason::NoSiblingLumaPlane);
     }
 
-    if (!failures) std::printf("avplayer_plane_policy: OK\n");
-    return failures ? 1 : 0;
 }

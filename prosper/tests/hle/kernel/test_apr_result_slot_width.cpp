@@ -14,6 +14,7 @@
 // The layout is the failing guest's: out1 at +4 and out2 at +12 of a 24-byte region (both 4 mod 8,
 // 8 bytes apart), every other byte pre-filled with a sentinel.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 
 #include <cstdint>
@@ -22,9 +23,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 bool all_bytes(const uint8_t* p, size_t n, uint8_t v) {
@@ -34,13 +33,13 @@ bool all_bytes(const uint8_t* p, size_t n, uint8_t v) {
 }
 }   // namespace
 
-int main() {
+TEST(AprResultSlotWidth, Contract) {
     printf("== test_apr_result_slot_width ==\n");
     register_builtin_hle();
 
     HleFn submit = Hle::lookup(nid_hash("sceKernelAprSubmitCommandBufferAndGetResult"));
     CHECK(submit != nullptr, "sceKernelAprSubmitCommandBufferAndGetResult is registered");
-    if (!submit) return 1;
+    if (!submit) FAIL() << "legacy early exit";
 
     // The command buffer is never bound to an event queue, so the submit takes the path that
     // writes the result slots. Its contents are not read by that path.
@@ -66,6 +65,4 @@ int main() {
     CHECK(all_bytes(region + 16, 8, 0xA5),
           "the bytes after out2 (the stack canary's place in the failing guest) are untouched (M1)");
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

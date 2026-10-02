@@ -20,6 +20,7 @@
 // ending dismissed is what a real user declining it produces. The title then shows its own
 // "Unable to connect to the PlayStation Network" page and continues offline.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -27,13 +28,12 @@
 using namespace prosper;
 
 // `fails` is a local of main(); CHECK is only used there.
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // The title's decision at eboot+0x863e92, transcribed.
 static bool guest_sees_dialog_finished(uint64_t status) { return (uint32_t)status == 3u; }
 
-int main() {
+TEST(SigninDialog, Contract) {
     int fails = 0;
     std::printf("== test_signin_dialog ==\n");
     register_np_hle();
@@ -48,7 +48,7 @@ int main() {
           "the six lifecycle NIDs are registered (unregistered == NONE forever)");
     if (!init || !open || !update || !status || !close || !term) {
         std::printf("== FAIL: %d ==\n", fails);
-        return 1;
+        FAIL() << "legacy early exit";
     }
 
     // Before Initialize there is no dialog: a poll must NOT read as finished, or a title that polls
@@ -79,6 +79,5 @@ int main() {
           "Close leaves the dialog FINISHED");
     term(0, 0, 0, 0, 0, 0);
 
-    std::printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

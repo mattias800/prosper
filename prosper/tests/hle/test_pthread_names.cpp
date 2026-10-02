@@ -1,6 +1,7 @@
 // test_pthread_names -- guest-visible names must round-trip instead of returning success with an
 // untouched output buffer. The contract is intentionally independent of host name limits/APIs.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <array>
 #include <atomic>
@@ -14,8 +15,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static std::atomic<bool> worker_started{false};
 static std::atomic<bool> worker_release{false};
@@ -61,7 +61,7 @@ static void* named_worker(void*) {
     return named_worker_body();
 }
 
-int main() {
+TEST(PthreadNames, Contract) {
     printf("== test_pthread_names ==\n");
     register_builtin_hle();
 
@@ -79,7 +79,7 @@ int main() {
           "Sony and POSIX thread-name functions are registered");
     if (!self || !getname || !rename || !set_name || !posix_get || !posix_rename ||
         !posix_set_name || !create || !join)
-        return 1;
+        FAIL() << "legacy early exit";
 
     const uint64_t thread = self(0, 0, 0, 0, 0, 0);
     CHECK(thread != 0, "scePthreadSelf returns a usable thread handle");
@@ -189,7 +189,5 @@ int main() {
     CHECK(getname(worker, (uint64_t)(uintptr_t)sony_out.data(), 0, 0, 0, 0) == 3,
           "exited thread name is retired before pthread_t reuse");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

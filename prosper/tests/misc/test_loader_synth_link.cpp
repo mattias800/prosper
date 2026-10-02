@@ -25,6 +25,7 @@
 //     diverge — a geometry `synth_prx.h` cannot express. A positive control drawn from the same
 //     source as the null it validates tests the discriminator, never the domain.
 #include "hle/dispatch/nid.hpp"
+#include <gtest/gtest.h>
 #include "loader/linker.hpp"
 #include "self/module.hpp"
 #include "fixtures/handmade_prx.h"
@@ -41,8 +42,7 @@ using namespace prosper;
 using prosper_test::SynthModuleSpec;
 
 static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 // Module bases, far enough apart that an address can be attributed to exactly one image. Typed
 // constants rather than an enum: these are added to the fixtures' own layout enums, and enum + enum
@@ -68,7 +68,7 @@ static uint64_t export_of(const Program& p, const std::string& nid) {
     return it == p.exports.end() ? 0 : it->second;
 }
 
-int main() {
+TEST(LoaderSynthLink, Contract) {
     printf("== test_loader_synth_link ==\n");
 
     // Distinct synthetic symbol names, hashed with prosper's own NID function so the fixtures carry
@@ -125,7 +125,7 @@ int main() {
     const std::string alt_path       = emit("synth_alt.prx",       alt_spec);
     const std::string subsumed_path  = emit("synth_subsumed.prx",  subsumed_spec);
     const std::string valueless_path = emit("synth_valueless.prx", valueless_spec);
-    if (fails) { printf("FAILED (%d) -- fixtures were not written\n", fails); return 1; }
+    if (fails) { printf("FAILED (%d) -- fixtures were not written\n", fails); FAIL() << "legacy early exit"; }
 
     const uint64_t kExp0 = prosper_test::synth_export_va(0);
     const uint64_t kExp1 = prosper_test::synth_export_va(1);
@@ -142,7 +142,7 @@ int main() {
         Program p; std::string err;
         const bool ok = link_program(inputs, kStubBase, kDataBase, p, &err);
         CHECK(ok, "control: link_program succeeds on three synthetic modules");
-        if (!ok) { printf("  link error: %s\n", err.c_str()); printf("FAILED\n"); return 1; }
+        if (!ok) { printf("  link error: %s\n", err.c_str()); printf("FAILED\n"); FAIL() << "legacy early exit"; }
 
         CHECK(p.mods.size() == 3, "control: three modules linked");
         CHECK(p.skipped_modules.empty(), "control: an unflagged duplicate is still linked");
@@ -455,6 +455,5 @@ int main() {
               "defined variable: the GOT slot points at the provider's definition");
     }
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

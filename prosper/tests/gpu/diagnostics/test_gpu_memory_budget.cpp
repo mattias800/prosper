@@ -11,6 +11,7 @@
 // charter's positive-control rule: the property under test is exactly the bookkeeping the allocator
 // would be trusted to get right.
 #include "gpu/diagnostics/gpu_memory_budget.hpp"
+#include <gtest/gtest.h>
 
 #include "fixtures/test_scratch.h"
 
@@ -26,8 +27,7 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static constexpr uint64_t kMiB = 1024ull * 1024ull;
 
@@ -48,7 +48,7 @@ static std::string captured_output(const char* path) {
     return text;
 }
 
-int main() {
+TEST(GpuMemoryBudget, Contract) {
     // A 1 MiB step so the ordinary test sizes below cross it, and stderr into a file so the crossings
     // can be asserted rather than assumed. Both must happen before any other call: the step is read
     // from the environment once, lazily, on the first allocation.
@@ -275,6 +275,5 @@ int main() {
         std::remove(capture_path);
     }
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

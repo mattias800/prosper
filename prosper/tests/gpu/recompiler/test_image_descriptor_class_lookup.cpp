@@ -16,6 +16,7 @@
 // descriptor is absent" while the descriptor was present the whole time. Same signature as #1634
 // (The Oregon Trail), so this is cross-title. Pure (no Vulkan), so it runs in CI.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 
 #include <cstdio>
@@ -23,9 +24,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -102,7 +101,7 @@ bool recompiles(const std::vector<uint32_t>& code, const ShaderResourceTable& rt
 
 }  // namespace
 
-int main() {
+TEST(ImageDescriptorClassLookup, Contract) {
     printf("== test_image_descriptor_class_lookup ==\n");
 
     const std::vector<uint32_t> sample_s8 = {
@@ -315,6 +314,4 @@ int main() {
               "Either admits both image classes and no buffer class");
     }
 
-    printf("%s\n", fails ? "FAILED" : "PASSED");
-    return fails ? 1 : 0;
 }

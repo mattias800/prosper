@@ -9,17 +9,16 @@
 // As an exhaustive switch with no `default:`, adding a member is a compile error. This test pins the
 // TABLE; the compiler pins the exhaustiveness.
 #include "shared/live/live_target_format.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 
 using prosper::gpu::LiveTargetPixelFormat;
 using prosper::gpu::DataFormat;
 using prosper::frontend::live_target_format_matches_declaration;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); ++fails; } \
-                         else printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(LiveTargetFormatMatch, Contract) {
     printf("== live target format match (#3204) ==\n");
 
     // Every member's positive case: the declaration the target actually accepts.
@@ -53,6 +52,4 @@ int main() {
     // Zero components is normalised to one, matching the `nc` the call site computed.
     CHECK(live_target_format_matches_declaration(LiveTargetPixelFormat::R8Unorm, DataFormat::Unorm8, 0), "zero components reads as one");
 
-    printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
 }

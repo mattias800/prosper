@@ -33,6 +33,7 @@
 #include "host/image/exec_image.hpp"
 
 #include <cstdint>
+#include <gtest/gtest.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -42,9 +43,7 @@
 #include <pthread.h>
 #endif
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); fails++; } \
-                              else std::printf("  [ok]   %s\n", msg); } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 #ifdef _WIN32
 namespace {
@@ -78,11 +77,9 @@ std::string nth_signal_line(const std::string& dump, int n) {
 }   // namespace
 #endif
 
-int main() {
+TEST(SyncRingCallers, Contract) {
 #ifndef _WIN32
-    std::printf("  [skip] PROSPER_SYNC_RING is a Windows-only diagnostic\n");
-    std::printf("== PASS ==\n");
-    return 0;
+    GTEST_SKIP() << "PROSPER_SYNC_RING is a Windows-only diagnostic";
 #else
     const char* path = "test_sync_ring_callers.out";
     std::remove(path);
@@ -96,7 +93,7 @@ int main() {
                               MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     CHECK(page == reinterpret_cast<void*>(static_cast<uintptr_t>(stub_address)),
           "the stub page is mapped at a guest code address");
-    if (page != reinterpret_cast<void*>(static_cast<uintptr_t>(stub_address))) return 1;
+    if (page != reinterpret_cast<void*>(static_cast<uintptr_t>(stub_address))) return;
 
     uint8_t code[] = {
         0x48, 0x83, 0xEC, 0x28,                                            // sub rsp,0x28
@@ -129,8 +126,5 @@ int main() {
           "an event from plain host code carries no caller, not a stale stack value (M3)");
 
     std::remove(path);
-    if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
-    std::printf("== PASS ==\n");
-    return 0;
 #endif
 }

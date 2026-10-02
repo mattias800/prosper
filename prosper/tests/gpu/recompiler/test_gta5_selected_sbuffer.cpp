@@ -1,4 +1,5 @@
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -13,10 +14,7 @@ using namespace prosper::gpu;
 
 namespace {
 
-int failures = 0;
-#define CHECK(condition, message) do { \
-    if (!(condition)) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; } \
-} while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
 // Exact 276-dword consumed prefix of routed GTA V 0x413ce6000. Hex keeps the fixture compact while
 // still making packet mutations address the production word PCs directly.
@@ -103,7 +101,7 @@ size_t marker_count(const ShaderResourceTable& table) {
 
 } // namespace
 
-int main() {
+TEST(Gta5SelectedSbuffer, Contract) {
     const std::vector<uint32_t> exact = program();
     Fixture valid;
     CHECK(rdna2_gta5_selected_sbuffer_shader(exact.data(), exact.size()),
@@ -412,10 +410,4 @@ int main() {
                exact.data(), exact.size(), launch_mutation.config, launch_mutation.table),
           "non-observed launch cannot acquire the marker");
 
-    if (failures) {
-        std::fprintf(stderr, "%d selected-SBUFFER contract assertion(s) failed\n", failures);
-        return 1;
-    }
-    std::puts("GTA V selected-SBUFFER contract tests passed");
-    return 0;
 }

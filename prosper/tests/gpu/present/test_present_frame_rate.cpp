@@ -19,6 +19,7 @@
 // Neither direction can be removed without a red test, which is the property that makes the number
 // quotable. Pure: no Vulkan, no game dump, no renderer.
 #include "gpu/present/present_frame_rate.hpp"
+#include <gtest/gtest.h>
 #include "gpu/present/videoout_present.hpp"
 
 #include <cmath>
@@ -32,8 +33,7 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -690,7 +690,7 @@ void unmeasured_populations_report_no_percentiles() {
 
 } // namespace
 
-int main() {
+TEST(PresentFrameRate, Contract) {
     std::printf("== content signature ==\n");            signature_discriminates();
     std::printf("== live title ==\n");                   live_title_reports_its_real_rate();
     std::printf("== FROZEN title (the arm) ==\n");       frozen_title_does_not_report_full_speed();
@@ -705,7 +705,6 @@ int main() {
     std::printf("== windowed active share (#3027) ==\n"); a_windowed_active_share_cannot_be_differenced();
     std::printf("== static vs dead (the arm, #3027) ==\n"); the_unchanged_picture_verdict_separates_static_from_dead();
     std::printf("== present-layer wiring ==\n");         present_layer_wiring();
-    std::printf("== dense signature (GPU path) ==\n"); dense_signature_pins_the_gpu_path();
-    std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
+    dense_signature_pins_the_gpu_path();
+    EXPECT_EQ(fails, 0);
 }

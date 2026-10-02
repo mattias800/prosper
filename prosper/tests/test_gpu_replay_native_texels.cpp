@@ -6,6 +6,7 @@
 // is Sonic Frontiers' band excessive HDR, or excessive exposure?). Every assertion below is
 // chosen so that it FAILS if the value is routed through a normalized 8-bit conversion.
 #include "../tools/gpu_replay/native_texels.hpp"
+#include <gtest/gtest.h>
 
 #include <cmath>
 #include <cstdio>
@@ -49,7 +50,7 @@ static std::vector<uint8_t> f32_bytes(const std::vector<float>& values) {
     return out;
 }
 
-int main() {
+TEST(GpuReplayNativeTexels, Contract) {
     std::printf("gpu_replay native texel readback\n");
 
     // The discriminating case: three values an 8-bit normalized conversion collapses together.
@@ -232,6 +233,5 @@ int main() {
         check("a point report on an unhandled format says so", has(bogus, "not handled here"));
     }
 
-    std::printf("%s\n", failures ? "FAILURES PRESENT" : "all passed");
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }

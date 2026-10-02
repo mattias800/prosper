@@ -10,6 +10,7 @@
 // below are watchdogged — a CI timeout with no message is strictly worse than a failure.
 
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 
 #include <atomic>
@@ -19,10 +20,7 @@
 #include <thread>
 
 static int failures = 0;
-static void check(bool ok, const char* what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++failures; }
-    else std::fprintf(stderr, "ok: %s\n", what);
-}
+static void check(bool ok, const char* what) { EXPECT_TRUE(ok) << what; }
 
 using prosper::Hle;
 using prosper::HleFn;
@@ -31,7 +29,7 @@ static uint64_t call(HleFn fn, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0
     return fn(a0, a1, a2, 0, 0, 0);
 }
 
-int main() {
+TEST(BarrierDestroyBusy, Contract) {
     std::fprintf(stderr, "== test_barrier_destroy_busy ==\n");
     prosper::register_kernel_hle();
 
@@ -40,7 +38,7 @@ int main() {
     HleFn wait    = by_name("scePthreadBarrierWait");
     HleFn destroy = by_name("scePthreadBarrierDestroy");
     check(init && wait && destroy, "the barrier entry points are registered");
-    if (failures) { std::fprintf(stderr, "== FAIL ==\n"); return 1; }
+    if (failures) { std::fprintf(stderr, "== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // --- the control FIRST: a barrier with no waiters must still destroy cleanly ----------------
     // Asserted before the busy case so a change returning EBUSY unconditionally cannot pass this
@@ -95,12 +93,11 @@ int main() {
                      "under a parked thread, so arriving reached nothing (#2168 regressed)");
         waiter.detach();
         std::fprintf(stderr, "== FAIL ==\n");
-        return 1;
+        FAIL() << "legacy early exit";
     }
     waiter.join();
     check(call(destroy, (uint64_t)(uintptr_t)&slot) == 0,
           "once the waiter has left, the destroy succeeds");
 
-    std::fprintf(stderr, failures ? "== FAIL ==\n" : "== PASS ==\n");
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }

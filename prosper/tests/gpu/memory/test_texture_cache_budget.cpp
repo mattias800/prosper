@@ -6,17 +6,14 @@
 // removing the unified cap, the floor, the heap ceiling, the texture subtraction or the max() of the
 // two usage figures, or changing the 80% target, each reddens at least one arm here.
 #include "gpu/memory/texture_cache_budget.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-static void check(bool ok, const char* what) {
-    std::printf("%s %s\n", ok ? "[ok]  " : "[FAIL]", what);
-    if (!ok) ++fails;
-}
+static void check(bool ok, const char* what) { EXPECT_TRUE(ok) << what; }
 
 static constexpr uint64_t MiB = 1024ull * 1024ull;
 static constexpr uint64_t GiB = 1024ull * MiB;
@@ -37,7 +34,7 @@ static TextureCacheBudgetInputs discrete(uint64_t heap, uint64_t budget, uint64_
     return in;
 }
 
-int main() {
+TEST(TextureCacheBudget, Contract) {
     // --- the old rule, which is still the fallback --------------------------------------------
     check(texture_cache_heuristic_budget(8 * GiB) == 1 * GiB, "heuristic: 8 GiB heap -> 1 GiB");
     check(texture_cache_heuristic_budget(16 * GiB) == 2 * GiB, "heuristic: 16 GiB heap -> 2 GiB");
@@ -212,6 +209,4 @@ int main() {
               "UINT64_MAX heap and budget: percentages do not overflow");
     }
 
-    std::printf("%s (%d failure%s)\n", fails ? "FAILED" : "PASSED", fails, fails == 1 ? "" : "s");
-    return fails ? 1 : 0;
 }

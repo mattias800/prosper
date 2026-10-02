@@ -4,17 +4,16 @@
 // registered, and the real behavior: the UTC<->localtime pair round-trips and fills its out-param,
 // and pthread_setcancelstate reports the previous state + rejects a bad state.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(KernelSignalTime, Contract) {
     printf("== test_kernel_signal_time ==\n");
     register_builtin_hle();
 
@@ -37,7 +36,7 @@ int main() {
     HleFn utc2local = Hle::lookup("-o5uEDpN+oY");
     HleFn local2utc = Hle::lookup("0NTHN1NKONI");
     HleFn setcancel = Hle::lookup("lZzFeSxPl08");
-    if (!utc2local || !local2utc || !setcancel) { printf("== FAIL (unresolved) ==\n"); return 1; }
+    if (!utc2local || !local2utc || !setcancel) { printf("== FAIL (unresolved) ==\n"); FAIL() << "legacy early exit"; }
 
     // UTC -> localtime -> UTC round-trips exactly (tz-independent: whatever the host offset is, the
     // inverse conversion undoes it). Also proves both fill their primary out-param (pre-seeded with a
@@ -82,7 +81,4 @@ int main() {
     // depends on — is that a POSIX-only spelling reports the bare errno. (#2178)
     CHECK(c3 == 22ull, "setcancelstate(invalid) -> EINVAL (POSIX contract: a plain errno)");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

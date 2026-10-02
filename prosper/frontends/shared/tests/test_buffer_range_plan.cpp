@@ -1,13 +1,10 @@
 #include "fixtures/buffer_range_plan.h"
+#include <gtest/gtest.h>
 #include <cstdio>
 #include <limits>
 using namespace prosper::test;
-int main() {
-    int failures = 0;
-    auto check = [&](bool ok, const char* message) {
-        std::printf("[%s] %s\n", ok ? "ok" : "FAIL", message);
-        failures += !ok;
-    };
+TEST(BufferRangePlan, Contract) {
+    auto check = [&](bool ok, const char* message) { EXPECT_TRUE(ok) << message; };
     constexpr uint64_t Max = 65536;
     auto groups = plan_buffer_ranges({{4096,8192},{5120,8192},{4096,8192}},256,Max);
     check(groups.size() == 1 && groups[0].address == 4096 && groups[0].bytes == 9216 &&
@@ -42,5 +39,4 @@ int main() {
                              {4096,U64}},4,Max).empty() &&
           plan_buffer_ranges({{4096,8192},{4100,8192}},0,Max).empty(),
           "invalid, small, overflowing and zero-alignment metadata is declined");
-    return failures ? 1 : 0;
 }

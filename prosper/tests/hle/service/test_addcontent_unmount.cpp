@@ -11,6 +11,7 @@
 // returns 0 proves nothing on its own, because the unregistered stub returned 0 too. Only the
 // re-mount separates "released the claim" from "said it did".
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/service/hle_addcontent.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "fixtures/test_scratch.h"
@@ -26,8 +27,7 @@ using namespace prosper;
 namespace fs = std::filesystem;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 constexpr const char* kAddcontMount   = "VANhIWcqYak";  // sceAppContentAddcontMount
@@ -37,7 +37,7 @@ constexpr uint64_t kErrNotFound  = 0x80D90005ull;
 constexpr uint64_t kErrParameter = 0x80D90002ull;
 } // namespace
 
-int main() {
+TEST(AddcontentUnmount, Contract) {
     printf("== test_addcontent_unmount ==\n");
     register_builtin_hle();
 
@@ -63,7 +63,7 @@ int main() {
     // Kills: leaving the NID unregistered — the bug itself. Unregistered, Hle::lookup is null and
     // the guest would have reached the dispatcher's SCE_OK.
     CHECK(unmount != nullptr, "sceAppContentAddcontUnmount is registered");
-    if (!mount || !unmount) { printf("== FAIL: %d ==\n", fails); return 1; }
+    if (!mount || !unmount) { printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
 
     // The entitlement label the manifest declares, as a 20-byte SceNpUnifiedEntitlementLabel.
     char label[20]; memset(label, 0, sizeof(label));
@@ -112,7 +112,6 @@ int main() {
     CHECK(unmount(0, 0, 0, 0, 0, 0) == kErrParameter, "a null mount point reports PARAMETER");
 
     fs::remove_all(scratch, ec);
-    if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); FAIL() << "legacy early exit"; }
+    EXPECT_EQ(fails, 0);
 }

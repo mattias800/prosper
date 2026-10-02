@@ -1,4 +1,5 @@
 #include "shared/rtt/rtt_injection.hpp"
+#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -10,8 +11,7 @@ using prosper::frontend::fill_repeating_pixel;
 using prosper::frontend::RttInjectionCache;
 
 static int failures = 0;
-#define CHECK(cond) do { if (!(cond)) { \
-    std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
+#define CHECK(cond) EXPECT_TRUE(cond)
 
 static void check_scale(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
                         uint32_t bpp) {
@@ -90,7 +90,7 @@ static void check_scaling_rejections() {
     reject(5, 5, UINT32_MAX, UINT32_MAX, 4, source);
 }
 
-int main() {
+TEST(RttInjection, Contract) {
     check_scaling_shapes();
     check_scaling_rejections();
     const uint8_t rgba_pixel[] = {0x12, 0x34, 0x56, 0x78};
@@ -192,6 +192,5 @@ int main() {
         std::make_shared<const std::vector<uint8_t>>(malformed), 1, 1, 1, 1, 8));
     CHECK(cache.size() == 3);
 
-    if (!failures) std::printf("rtt_injection: OK\n");
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }

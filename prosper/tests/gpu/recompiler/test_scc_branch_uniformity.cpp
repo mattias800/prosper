@@ -31,6 +31,7 @@
 // unexercised here. It establishes that the guest shape is admitted and that these specific
 // counterexamples are not.
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_decode.hpp"
 
 #include <cstdint>
@@ -40,9 +41,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static std::vector<Rdna2Inst> walk(const uint32_t* code, size_t dwords) {
     std::vector<Rdna2Inst> ins;
@@ -50,7 +49,7 @@ static std::vector<Rdna2Inst> walk(const uint32_t* code, size_t dwords) {
     return ins;
 }
 
-int main() {
+TEST(SccBranchUniformity, Contract) {
     printf("scc_branch_uniformity\n");
 
     // ---- the guest shape, positive -------------------------------------------------------------
@@ -197,6 +196,4 @@ int main() {
               "a scalar branch whose load address came from v_readfirstlane is NOT uniform");
     }
 
-    printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
 }

@@ -9,6 +9,7 @@
 // the stub path compiles and behaves correctly without the feature.
 
 #include <cstdio>
+#include <gtest/gtest.h>
 #include "diagnostics/diagnostics.hpp"
 
 // The diagnostics types live in prosper::diagnostics namespace.
@@ -16,11 +17,9 @@ using prosper::diagnostics::DiagnosticContext;
 using prosper::diagnostics::record_boot_phase;
 using prosper::diagnostics::BootPhase;
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
-int main() {
+TEST(DiagnosticsDisabled, Contract) {
     printf("== test_diagnostics_disabled: verifying stub behavior ==\n");
 
     auto& ctx = DiagnosticContext::instance();
@@ -44,7 +43,4 @@ int main() {
     ctx.disable();
     CHECK(!ctx.is_enabled(), "disable() is no-op on stub");
 
-    printf(fails ? "\ntest_diagnostics_disabled: %d FAILURE(S)\n"
-                 : "\ntest_diagnostics_disabled: all ok\n", fails);
-    return fails ? 1 : 0;
 }

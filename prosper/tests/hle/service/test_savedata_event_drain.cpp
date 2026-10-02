@@ -35,6 +35,7 @@
 // queued-event checks kill "always answer drained", which would silently discard the completion
 // Dead Cells consumes.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "fixtures/test_scratch.h"
 #include <cstdint>
 #include <cstdio>
@@ -46,8 +47,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // PPSA20447's loop, transcribed: it leaves the wait only when the call returns exactly this.
 static constexpr uint64_t kKhazanDrainCode = 0x809F0008ull;
@@ -55,7 +55,7 @@ static constexpr uint64_t kKhazanDrainCode = 0x809F0008ull;
 // no path here may return it.
 static constexpr uint64_t kInFlightCode = 0x809F0018ull;
 
-int main() {
+TEST(SavedataEventDrain, Contract) {
     std::printf("== test_savedata_event_drain ==\n");
     // libSceSaveData moved to src/hle/fs/savedata.cpp with its own entry point (#3735), so
     // register_service_hle() alone no longer binds its NIDs.
@@ -66,7 +66,7 @@ int main() {
     HleFn umount2   = Hle::lookup("uW4vfTwMQVo");   // sceSaveDataUmount2
     CHECK(get_event != nullptr, "sceSaveDataGetEventResult is registered");
     CHECK(umount2 != nullptr, "sceSaveDataUmount2 is registered");
-    if (!get_event || !umount2) { std::printf("FAILED (%d)\n", fails + 1); return 1; }
+    if (!get_event || !umount2) { std::printf("FAILED (%d)\n", fails + 1); FAIL() << "legacy early exit"; }
 
     // A disposable save root, so queueing an event never touches the developer's real saves.
     namespace fs = std::filesystem;
@@ -159,6 +159,5 @@ int main() {
     CHECK(!any_in_flight,
           "no queue state reports 0x809F0018 -- nothing in prosper is ever in flight");
 
-    std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

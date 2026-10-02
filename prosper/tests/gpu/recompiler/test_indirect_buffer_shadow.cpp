@@ -1,4 +1,5 @@
 #include "gpu/recompiler/indirect/rdna2_indirect_buffer_shadow.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 
 #include <array>
@@ -12,10 +13,7 @@ using namespace prosper::gpu;
 
 namespace {
 
-int failures = 0;
-#define CHECK(condition, message) do { \
-    if (!(condition)) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; } \
-} while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
 void store_u64(uint8_t* bytes, size_t offset, uint64_t value) {
     std::memcpy(bytes + offset, &value, sizeof(value));
@@ -33,7 +31,7 @@ void store_u32(uint8_t* bytes, size_t offset, uint32_t value) {
 
 } // namespace
 
-int main() {
+TEST(IndirectBufferShadow, Contract) {
     using SourceAddressKind = IndirectBufferRelocationRecord::SourceAddressKind;
 
     std::vector<uint8_t> source_bytes(64u, 0x5au);
@@ -75,7 +73,7 @@ int main() {
           "overlapping and null records build one preserved-source relocation shadow");
     if (!owner) {
         std::fputs("FAIL: relocation shadow owner was not produced\n", stderr);
-        return 1;
+        FAIL() << "legacy early exit";
     }
     CHECK(owner && info.records.size() == 4u && info.segments.size() == 1u &&
               info.segments[0].guest_address == pointer0 &&
@@ -144,7 +142,7 @@ int main() {
     const size_t segment_base = source_bytes.size() + 40u + records.size() * 24u;
     if (segment_base + 16u > corrupt.size()) {
         std::fputs("FAIL: relocation segment directory is truncated\n", stderr);
-        return 1;
+        FAIL() << "legacy early exit";
     }
     store_u32(corrupt.data(), segment_base + 12u,
               load_u32(corrupt.data(), segment_base + 12u) + 4u);
@@ -278,7 +276,7 @@ int main() {
         descriptor_owner->size() < descriptor_record_base +
             kIndirectBufferRelocationRecordBytes) {
         std::fputs("FAIL: version-3 relocation record directory is truncated\n", stderr);
-        return 1;
+        FAIL() << "legacy early exit";
     }
     CHECK(load_u32(descriptor_owner->data(), descriptor_record_base + 20u) ==
                   static_cast<uint32_t>(SourceAddressKind::BufferDescriptorBase48) &&
@@ -332,10 +330,4 @@ int main() {
               canonical_high_records, {}, descriptor_owner, descriptor_info),
           "unsupported canonical-high Base48 descriptor fails closed");
 
-    if (failures) {
-        std::fprintf(stderr, "%d indirect-buffer shadow assertion(s) failed\n", failures);
-        return 1;
-    }
-    std::puts("indirect-buffer relocation shadow tests passed");
-    return 0;
 }

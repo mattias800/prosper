@@ -10,6 +10,7 @@
 //   * an imported image only counts when it is the representation ACTUALLY SELECTED. An import a
 //     recovery switch has chosen to bypass is the opposite of permission to read guest bytes.
 #include "gpu/resources/compressed_source_authority.hpp"
+#include <gtest/gtest.h>
 
 #include "gpu/texture/tile.hpp"
 #include "gpu/execute/gpu_execute.hpp"
@@ -22,9 +23,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -100,7 +99,7 @@ bool is(const SampledSourceDecision& d, SampledSourceRepresentation r, SampledSo
 
 }  // namespace
 
-int main() {
+TEST(CompressedSourceAuthority, Contract) {
     printf("== test_compressed_source_authority ==\n");
 
     // THE CONCRETE WRONG ROUTE the old code took, and the arm that proves the interface forbids it.
@@ -470,7 +469,4 @@ int main() {
               "representations, reasons and proofs report distinct stable names");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }
