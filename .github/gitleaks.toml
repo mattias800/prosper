@@ -1,0 +1,38 @@
+# Gitleaks configuration for prosper.
+#
+# Extends the built-in ruleset; nothing here switches a default rule off. Every allowlist entry
+# below is a measured false positive, and each carries the evidence that it is one. To add one, see
+# "Secret scan" in prosper/tools/ci/AGENTS.md.
+#
+# Baseline, 2026-10-02, gitleaks 8.30.1, full history (4,040 commits), defaults only: 10 findings,
+# all rule `generic-api-key`, all identifiers that merely contain the word "key". After the entries
+# below: 0. Entries are scoped to that one rule (targetRules) so every other rule, and
+# generic-api-key everywhere else, keeps scanning the whole tree.
+#
+# Deliberately NOT allowlisted: NID hashes, shader/capture hex, test fixtures, docs. The baseline
+# found no false positive in any of them, so exempting them would only hide a real secret later.
+
+title = "prosper gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Source identifiers/prose that merely contain the word 'key' (measured false positives)"
+targetRules = ["generic-api-key"]
+# `regexes` run against the whole match (regexTarget), not just the captured secret.
+regexTarget = "match"
+paths = [
+    # JSON map of source-file names -> reader policy; the "secret" is `compiler_resource_access.cpp`.
+    # The file is deleted on main (#4186) but stays in history, which the weekly and manual
+    # full-history scans read, so this entry must stay.
+    '''prosper/tools/fragment_compile_replay/reader_policy\.json''',
+    # Vendored Dear ImGui: `key >= ImGuiKey_...` comparisons.
+    '''prosper/third_party/imgui/''',
+]
+regexes = [
+    # prosper/frontends/prosper-app/app_config.hpp: comment "key spelling: `...`".
+    '''key spelling: `[A-Za-z0-9_.]+`''',
+    # prosper/src/gpu/gpu_executor.cpp: local bool `descr8_key_known = <identifier>;`.
+    '''descr8_key_known = [A-Za-z0-9_.]+;''',
+]
