@@ -67,9 +67,12 @@ ALLOWED_TOP_LEVEL = {
     "scripts",
 }
 
-# Root-level files that are fine regardless of the set above (documentation and licensing).
+# Root-level files that are fine regardless of the set above (documentation and licensing, plus
+# the uv project for the Python tooling: pyproject.toml carries the ruff config, which ruff resolves
+# from each file's ancestors, so it sits above every tracked .py; uv.lock is its lockfile (#4126).
+# Neither is a build input, so rule 1's "CI would go green without building it" does not apply).
 ALLOWED_ROOT_SUFFIXES = (".md",)
-ALLOWED_ROOT_NAMES = {"LICENSE", "LICENSE.txt", "LICENSE.md", "NOTICE"}
+ALLOWED_ROOT_NAMES = {"LICENSE", "LICENSE.txt", "LICENSE.md", "NOTICE", "pyproject.toml", "uv.lock"}
 
 
 def top_level(path):
@@ -159,8 +162,11 @@ def selftest():
         ("rule 1: header at the repo root (#2507)", [("A", "core/event_bus.hpp")]),
         ("rule 1: plugin dir at the repo root (#2508)", [("A", "plugins/boot_state_machine_plugin.hpp")]),
         ("rule 1: a new top-level directory", [("A", "framework/thing.hpp")]),
+        ("rule 1: a root-level file that is not on the list", [("A", "setup.py")]),
         ("rule 2: new source, no test touched", [("A", "prosper/src/diagnostics/foo.cpp")]),
         ("both rules at once", [("A", "core/x.hpp"), ("A", "prosper/src/y.cpp")]),
+        ("unreviewed root config", [("A", "private.toml")]),
+        ("unreviewed root lockfile", [("A", "other.lock")]),
     ]
     must_pass = [
         ("project startup hook", [("A", ".claude/settings.json")]),
@@ -173,10 +179,13 @@ def selftest():
         ("modifying an existing source, no test", [("M", "prosper/src/gpu/capture/gpu_capture.cpp")]),
         ("docs only", [("M", "prosper/docs/GAME_COMPAT_ORCHESTRATION.md")]),
         ("root-level markdown", [("A", "CONTRIBUTING.md")]),
+        ("the root uv project (#4126)", [("A", "pyproject.toml"), ("A", "uv.lock")]),
         ("workflow change", [("M", ".github/workflows/ci.yml")]),
         ("a new header under prosper/src (no .cpp)", [("A", "prosper/src/diagnostics/x.hpp")]),
         ("scripts and assets", [("A", "scripts/x.sh"), ("A", "assets/x.png")]),
         ("a deleted root file", [("D", "core/old.hpp")]),
+        ("project Python config", [("A", "pyproject.toml")]),
+        ("project Python lockfile", [("A", "uv.lock")]),
     ]
 
     failures = 0

@@ -3314,7 +3314,6 @@ bool append_import_data(const std::vector<ImportSlot>& slots, size_t first_new, 
     if (!g_data_stride) return fail("append_import_data before install_import_data");
     if (first_new > n || first_new != g_ndata)
         return fail("append_import_data: slot table is not an extension");
-    if (first_new == n) return true;
     // Grow by the pages the new slots need only. The mapped pages are NEVER remapped: guest code is
     // already relocated against them and they hold whatever the guest has stored so far.
     const uint64_t mapped_end = page_up(g_ndata * g_data_stride);

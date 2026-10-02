@@ -20,6 +20,7 @@
 // declared emitter this run did not actually emit a validated module from, and an absent spirv-val
 // is a hard failure rather than a pass.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/raster_quad_collector.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "build_revision.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -119,10 +120,10 @@ static void dump(const std::string& dir, const char* name, const std::vector<uin
 //
 // The list of gaps is EMPTY, and that is the intended state. A gap belongs here only with the issue
 // that tracks it, never as a silent omission.
-// (#1715 — the generated geometry stage's missing OpExecutionMode Invocations — is deliberately NOT
-// a gap: measured, that module passes spirv-val under both the universal and the vulkan1.1
-// environments. 00715 is a Vulkan pipeline-creation rule that spirv-val does not check, so it is the
-// validation layer's to catch, and the emitter is covered here regardless.)
+// (#1715's former missing geometry Invocations passed spirv-val under both universal and vulkan1.1.
+// The shared emitter now declares Invocations 1 explicitly; raster_quad_collector_contract pins
+// the actual Geometry entry's count on every generated form. Pipeline rule stage-00715 still
+// needs the Vulkan validation layer: strict module legality alone cannot prove its absence.)
 struct KnownGap { const char* emitter; const char* reason; };
 static const std::vector<KnownGap> kKnownGaps = {};
 
@@ -131,6 +132,9 @@ static const std::vector<KnownGap> kKnownGaps = {};
 // deliberate entry here can exempt one, and it has to say why.
 struct NotAnEmitter { const char* name; const char* why; };
 static const NotAnEmitter kNotEmitters[] = {
+    {"shader_analysis_owned_words",
+     "aliases the immutable owned RAW RDNA2 analysis bytes; it neither translates instructions "
+     "nor assembles a SPIR-V module"},
     // Two SpirvCompute members became visible to this scan when the recompiler's shared internals
     // moved into rdna2_to_spirv_internal.hpp so the emit functions could be split into their own
     // translation units. Neither is a new code path -- both were always reached through the entry
@@ -1311,7 +1315,42 @@ int main(int argc, char** argv) {
       dump(dir, "geometry_interpolation_rect",
            recompile_interpolation_geometry(layout, /*capture_position=*/false,
                                             /*synthesize_rect=*/true),
-           "recompile_interpolation_geometry"); }
+           "recompile_interpolation_geometry");
+      const FloatTransportConfig profile{FloatTransportProfile::ExplicitNonFinite32};
+      dump(dir, "geometry_interpolation_primitive_id",
+           recompile_interpolation_geometry(layout, false, false, profile, true),
+           "recompile_interpolation_geometry");
+      RasterQuadInputs inputs;
+      inputs.raw_code = std::make_shared<const std::vector<uint32_t>>(ps, ps + std::size(ps));
+      inputs.raw_matches_producing_source = true;
+      inputs.system_inputs = perspective_center; inputs.has_system_inputs = true;
+      inputs.launch.input_ena_available = inputs.launch.input_addr_available = true;
+      inputs.launch.input_ena = perspective_center.ena;
+      inputs.launch.input_addr = perspective_center.addr;
+      inputs.pixel_inputs.valid_mask = 1; inputs.has_pixel_inputs = true;
+      inputs.interpolation = layout; inputs.generated_interpolation_geometry = true;
+      inputs.float_transport = profile;
+      inputs.source_fs = std::make_shared<const std::vector<uint32_t>>(recompile_fragment(
+          ps, std::size(ps), nullptr, &perspective_center, UINT32_MAX, &layout, false, {}, {}, nullptr, profile));
+      RasterQuadCollector collector;
+      dump(dir, "raster_quad_interpolation", build_raster_quad_collector(inputs, 2, collector),
+           "build_raster_quad_collector"); }
+    { const uint32_t ps[]{0xd7600014u,256u | (168u << 9),0x7e080214u,
+                         0xf800180fu,0x04040404u,0xbf810000u};
+      RasterQuadInputs inputs;
+      inputs.raw_code = std::make_shared<const std::vector<uint32_t>>(ps, ps + std::size(ps));
+      inputs.raw_matches_producing_source = true;
+      inputs.system_inputs = {0x300u, 0x300u}; inputs.has_system_inputs = true;
+      inputs.launch.input_ena_available = inputs.launch.input_addr_available = true;
+      inputs.launch.input_ena = inputs.launch.input_addr = 0x300u;
+      inputs.float_transport = {FloatTransportProfile::ExplicitNonFinite32};
+      inputs.interpolation = fragment_interpolation_layout(ps, std::size(ps), &inputs.system_inputs);
+      inputs.source_fs = std::make_shared<const std::vector<uint32_t>>(recompile_fragment(
+          ps, std::size(ps), nullptr, &inputs.system_inputs, UINT32_MAX, &inputs.interpolation,
+          false, {}, {}, nullptr, inputs.float_transport));
+      RasterQuadCollector collector;
+      dump(dir, "raster_quad_builtin", build_raster_quad_collector(inputs, 2, collector),
+           "build_raster_quad_collector"); }
 
     // The owned compiler-case adapter is itself a SPIR-V-producing entry point. Exercise its
     // actual input rehydration and full-word baseline, not merely the underlying compiler.
