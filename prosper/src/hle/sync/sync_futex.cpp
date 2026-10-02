@@ -4,6 +4,7 @@
 #endif
 #include "hle/sync/sync_futex.hpp"
 #include "hle/dispatch/dispatch.hpp"
+#include "host/image/exec_image.hpp"      // guest_frames_on_stack, describe_code_address (sync-ring callers)
 #include "host/platform/precise_sleep.hpp"   // #3056: the ms conversion, and a relock that is not on the tick
 #include <atomic>
 #include <chrono>
@@ -80,6 +81,10 @@ struct SyncTraceEvent {
     uintptr_t object = 0;
     uintptr_t source = 0;
     uint32_t value = 0;   // the slot's sequence counter as this event observed it
+    // Innermost guest return addresses on the calling thread's stack when the event was recorded
+    // (PROSPER_SYNC_RING_CALLERS=1), 0 when not captured or none was recoverable. Each one has a
+    // `call` instruction ending just before it, so it names a guest call SITE, not a proven frame.
+    uint64_t guest_caller[2] = {0, 0};
 };
 
 // Sized by the caller, because the right size is a property of the run being diagnosed rather than
@@ -105,6 +110,12 @@ SyncTraceEvent* const g_sync_trace =
     g_sync_trace_capacity ? new SyncTraceEvent[g_sync_trace_capacity] : nullptr;
 std::atomic<uint64_t> g_sync_trace_sequence{0};
 const bool g_sync_trace_enabled = g_sync_trace != nullptr;
+// Opt-in because it is not "plain stores": each event scans the stack for guest return addresses.
+// That changes timing on paths the ring exists to observe, so it is a separate switch from the ring.
+const bool g_sync_trace_callers = [] {
+    const char* v = std::getenv("PROSPER_SYNC_RING_CALLERS");
+    return v && *v && *v != '0';
+}();
 
 void sync_trace(SyncTraceKind kind, uintptr_t object, uintptr_t source, uint32_t value) {
     if (!g_sync_trace_enabled) return;
@@ -113,6 +124,11 @@ void sync_trace(SyncTraceKind kind, uintptr_t object, uintptr_t source, uint32_t
     // Publish the generation LAST, so a reader that races a writer discards a torn entry rather
     // than reporting half of one. Same contract as the exception ring in hle_kernel.cpp.
     event.published.store(0, std::memory_order_relaxed);
+    uint64_t callers[2] = {0, 0};
+    if (g_sync_trace_callers)
+        prosper::guest_frames_on_stack((uint64_t)(uintptr_t)__builtin_frame_address(0), callers, 2);
+    event.guest_caller[0] = callers[0];
+    event.guest_caller[1] = callers[1];
     event.sequence = sequence;
     event.kind = kind;
     event.windows_tid = GetCurrentThreadId();
@@ -771,14 +787,22 @@ void dump_guest_sync_trace(const char* path) {
         const uintptr_t object = event.object;
         const uintptr_t source = event.source;
         const uint32_t value = event.value;
+        const uint64_t caller0 = event.guest_caller[0];
+        const uint64_t caller1 = event.guest_caller[1];
         if (event.published.load(std::memory_order_acquire) != sequence) continue;
         std::fprintf(out,
                      "[sync-trace] seq=%llu kind=%-10s tid=%lu pthread=0x%llx object=0x%llx "
-                     "source=0x%llx value=%lu\n",
+                     "source=0x%llx value=%lu",
                      (unsigned long long)sequence, sync_trace_kind_name(kind),
                      (unsigned long)windows_tid, (unsigned long long)pthread_id,
                      (unsigned long long)object, (unsigned long long)source,
                      (unsigned long)value);
+        // Named at print time, off the recording path. Absent when callers were not captured.
+        if (caller0) {
+            std::fprintf(out, " caller=%s", prosper::describe_code_address(caller0).c_str());
+            if (caller1) std::fprintf(out, ",%s", prosper::describe_code_address(caller1).c_str());
+        }
+        std::fputc('\n', out);
     }
     if (opened) std::fclose(opened);
 #else
