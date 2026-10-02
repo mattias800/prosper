@@ -35,6 +35,7 @@
 // Capacity ACCOUNTING is out of scope here and is tested by test_savedata_capacity (#3654): this
 // fixture asserts that the figures are present and self-consistent.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "fixtures/test_scratch.h"
 
 #include <cstdint>
@@ -51,8 +52,7 @@ namespace fs = std::filesystem;
 
 static int fails = 0;
 static int checks = 0;
-#define CHECK(c, m) do { ++checks; if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -157,7 +157,7 @@ std::string make_app0(const fs::path& base, const char* name, const std::string&
 
 }   // namespace
 
-int main() {
+TEST(SavedataMountinfo, Contract) {
     printf("== test_savedata_mountinfo ==\n");
     register_builtin_hle();
 
@@ -170,7 +170,7 @@ int main() {
     CHECK(g_umount != nullptr, "[G] sceSaveDataUmount is registered");
     if (!g_mount_info || !g_mount3 || !g_umount) {
         printf("== FAIL: %d == (%d assertions executed)\n", fails, checks);
-        return 1;
+        FAIL() << "legacy early exit";
     }
 
     // A disposable save root: this fixture never touches a game dump and never touches the
@@ -309,7 +309,5 @@ int main() {
           "[G] SceSaveDataMountInfo: blocks@0, freeBlocks@8, reserved[32]@16, 48 bytes");
 
     savedata0_umount();
-    if (fails) { printf("== FAIL: %d == (%d assertions executed)\n", fails, checks); return 1; }
-    printf("== PASS == (%d assertions executed)\n", checks);
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

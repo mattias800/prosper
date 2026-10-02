@@ -1,6 +1,7 @@
 // test_shader_resources — fixes the resource-binding contract (shader_resources.hpp): format sizing
 // and the recompiler/pipeline lookups both halves rely on. Pure (no Vulkan), runs in CI.
 #include "gpu/resources/mip_chain_plan.hpp"
+#include <gtest/gtest.h>
 #include "gpu/texture/tile.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/texture/bc_decode.hpp"
@@ -15,9 +16,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static void emit(std::vector<uint32_t>& spv, uint16_t op, std::initializer_list<uint32_t> words) {
     spv.push_back((static_cast<uint32_t>(words.size() + 1) << 16) | op);
@@ -419,7 +418,7 @@ static void set_descriptor_mode(const char* value) {
 #endif
 }
 
-int main() {
+TEST(ShaderResources, Contract) {
     {
         // A metadata texture can be reused for an exact instruction-time T# match. Its paired
         // metadata sampler is not authoritative in that case: scalar code may have loaded or
@@ -1619,7 +1618,4 @@ int main() {
               "#3134: a tail chain's owned allocation is the block itself, with no prefix");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

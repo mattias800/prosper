@@ -3,6 +3,7 @@
 // This drives the sceImeDialog* HLE handlers both ways: no backend -> headless FINISHED; a registered
 // backend -> Init/Status/Result/Close route to it (a real dialog's timing + outcome).
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/service/platform_ui.hpp"
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
@@ -11,9 +12,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // A stand-in frontend: takes ownership of the dialog, stays RUNNING until the test advances it, and
 // reports USER_CANCELED with the entered (empty) text.
@@ -66,14 +65,14 @@ struct MockUi : PlatformUi {
     void saveDataDialogClose() override { save_closes++; save_status = 0; }
 };
 
-int main() {
+TEST(PlatformUi, Contract) {
     printf("== test_platform_ui ==\n");
     register_builtin_hle();
 
     HleFn init = Hle::lookup("NUeBrN7hzf0"), status = Hle::lookup("IADmD4tScBY"),
           result = Hle::lookup("x01jxu+vxlc"), term = Hle::lookup("gyTyVn+bXMw");
     CHECK(init && status && result && term, "ImeDialog handlers registered");
-    if (!(init && status && result && term)) { printf("== FAIL ==\n"); return 1; }
+    if (!(init && status && result && term)) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // --- No backend (headless default): Init -> FINISHED immediately; result writes OK(0). ---
     set_platform_ui(nullptr);
@@ -300,7 +299,4 @@ int main() {
     }
     set_platform_ui(nullptr);
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

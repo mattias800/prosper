@@ -11,6 +11,7 @@
 // implementation that never grew the guard at all.
 
 #include "shared/rtt/mrt_extent.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -24,11 +25,9 @@ static constexpr bool legacy_extent_conflicts(uint32_t slot_w, uint32_t slot_h,
     return slot_w != pass_w || slot_h != pass_h;
 }
 
-static int failures = 0;
-#define CHECK(cond) do { if (!(cond)) { \
-    std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
+#define CHECK(cond) EXPECT_TRUE(cond)
 
-int main() {
+TEST(MrtExtent, Contract) {
     // --- mrt_extent_known: 0 on either axis is the "never measured" sentinel. ---
     CHECK(mrt_extent_known(1920, 1080));
     CHECK(mrt_extent_known(1, 1));            // CB_COLORn_ATTRIB2 is biased by one: a written
@@ -155,6 +154,4 @@ int main() {
     // #2550 review rounds, so a new failure exited non-zero while still reporting OK --
     // the third instance in this branch of a success signal placed ahead of the work it
     // claims to describe.
-    if (failures == 0) std::printf("mrt_extent: OK\n");
-    return failures == 0 ? 0 : 1;
 }

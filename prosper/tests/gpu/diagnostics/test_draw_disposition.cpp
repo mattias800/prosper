@@ -14,6 +14,7 @@
 //     path and the report would keep printing plausible numbers.
 
 #include "gpu/diagnostics/draw_disposition.hpp"
+#include <gtest/gtest.h>
 #include "diagnostics/exit_reports.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"
 
@@ -28,10 +29,7 @@
 using namespace prosper::gpu;
 
 static int failures = 0;
-static void check(bool ok, const char* name) {
-    printf("%s: %s\n", ok ? "PASS" : "FAIL", name);
-    if (!ok) failures++;
-}
+static void check(bool ok, const char* name) { EXPECT_TRUE(ok) << name; }
 
 // Capture actual report output, including the registered exit flush below.
 template<typename Report>
@@ -58,7 +56,7 @@ static std::string capture_pass() {
     return capture_report([] { draw_disposition_census().report_pass(); });
 }
 
-int main() {
+TEST(DrawDisposition, Contract) {
     auto& c = draw_disposition_census();
     bool empty_reported = true;
     const std::string empty = capture_report([&] { empty_reported = c.report_totals(); });
@@ -210,6 +208,5 @@ int main() {
           joined.find("quiescence=unverified") != std::string::npos,
           "balanced post-join loads still require an explicit quiescence proof");
 
-    printf("%s\n", failures ? "FAILURES" : "ALL PASS");
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }

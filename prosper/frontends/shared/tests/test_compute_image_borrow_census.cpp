@@ -13,6 +13,7 @@
 // formatted report carries its own denominators.
 
 #include "shared/compute/compute_image_borrow_census.hpp"
+#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -33,8 +34,7 @@ using prosper::frontend::classify_compute_image_publish;
 using prosper::frontend::format_compute_image_borrow_census;
 
 static int failures = 0;
-#define CHECK(cond) do { if (!(cond)) { \
-    std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
+#define CHECK(cond) EXPECT_TRUE(cond)
 
 // The precondition exactly as `import_live_compute_storage_image` used to spell it, transcribed
 // from the shape of that expression rather than from the classifier. `true` means "declined".
@@ -81,7 +81,7 @@ static ComputeImageImportInputs accepting_import_inputs() {
     return in;
 }
 
-int main() {
+TEST(ComputeImageBorrowCensus, Contract) {
     // ---- 1. Equivalence over the complete boolean product ---------------------------------
     constexpr unsigned kImportTerms = 11;
     unsigned accepted = 0, declined = 0;
@@ -471,8 +471,7 @@ int main() {
 
     if (failures) {
         std::fprintf(stderr, "compute_image_borrow_census: %d check(s) failed\n", failures);
-        return 1;
+        FAIL() << "legacy early exit";
     }
-    std::printf("compute_image_borrow_census: all checks passed\n");
-    return 0;
+    EXPECT_EQ(failures, 0);
 }

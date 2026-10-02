@@ -1,4 +1,5 @@
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/net/hle_http.hpp"
 
 #include <array>
@@ -8,16 +9,15 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(Http, Contract) {
     std::printf("== test_http ==\n");
     register_builtin_hle();
     HleFn parse = Hle::lookup("IWalAn-guFs");
     CHECK(parse && std::strcmp(Hle::name_of("IWalAn-guFs"), "sceHttpUriParse") == 0,
           "sceHttpUriParse registered by its PS5 NID");
-    if (!parse) return 1;
+    if (!parse) FAIL() << "legacy early exit";
 
     const char* url = "https://events.backtrace.io/api/unique-events/submit?token=abc&universe=nimble";
     uint64_t required = 0;
@@ -68,7 +68,7 @@ int main() {
     HleFn build = Hle::lookup("5LZA+KPISVA");
     CHECK(build && std::strcmp(Hle::name_of("5LZA+KPISVA"), "sceHttpUriBuild") == 0,
           "sceHttpUriBuild registered by its PS5 NID");
-    if (!build) { std::printf("== FAIL: %d ==\n", fails + 1); return 1; }
+    if (!build) { std::printf("== FAIL: %d ==\n", fails + 1); FAIL() << "legacy early exit"; }
 
     // Round-trip the telemetry URL through parse -> build. The default port must NOT reappear.
     std::memset(&uri, 0, sizeof(uri));
@@ -424,7 +424,5 @@ int main() {
         }
     }
 
-    if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
-    std::printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

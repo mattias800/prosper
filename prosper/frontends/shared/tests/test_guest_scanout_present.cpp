@@ -14,13 +14,12 @@
 // and each is written so that flipping the input flips the verdict — a test that cannot show its
 // lever moved proves nothing about the mechanism.
 #include "shared/present/guest_scanout_present.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 #include <string_view>
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); ++fails; } \
-                              else         { std::printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 namespace {
 
@@ -39,7 +38,7 @@ constexpr size_t kScaled = bytes_for(960, 540);
 
 } // namespace
 
-int main() {
+TEST(GuestScanoutPresent, Contract) {
     std::printf("== test_guest_scanout_present ==\n");
 
     // ---- stage 1: is the read even warranted? ------------------------------------------------
@@ -120,6 +119,4 @@ int main() {
     static_assert(guest_scanout_publishable(k4k, k4k, true, false, false) ==
                   GuestScanoutDecision::SkipNotAuthored);
 
-    std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

@@ -10,6 +10,7 @@
 // header the refcount checks and the trait checks all fail (a move silently degrades to a copy); the
 // copy checks pass either way and pin that the copy pair still behaves as a copy.
 #include "gpu/execute/shader_cache_internal.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 #include <memory>
@@ -23,10 +24,7 @@ using prosper::gpu::CachedShader;
 using prosper::gpu::SharedShaderWords;
 
 // `failures` is main()'s local; CHECK is only used there.
-#define CHECK(condition, message) do { \
-    if (!(condition)) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; } \
-    else { std::printf("ok: %s\n", message); } \
-} while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
 static CachedShader make_entry(const SharedShaderWords& words) {
     CachedShader value;
@@ -58,7 +56,7 @@ static bool same_fields(const CachedShader& e, const SharedShaderWords& words) {
            e.fragment_arithmetic.sites[0].family == prosper::gpu::FragmentArithmeticFamily::Add;
 }
 
-int main() {
+TEST(CachedShaderMoves, Contract) {
     int failures = 0;
     // Traits: a trait query cannot distinguish "moved" from "copied through const&" for plain
     // is_move_constructible (both are true today), so ask for noexcept, which the hand-written
@@ -116,10 +114,5 @@ int main() {
               "copy assignment duplicates and shares the words");
     }
 
-    if (failures) {
-        std::fprintf(stderr, "%d failure(s)\n", failures);
-        return 1;
-    }
-    std::printf("all CachedShader move checks passed\n");
-    return 0;
+    EXPECT_EQ(failures, 0);
 }

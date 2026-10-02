@@ -180,6 +180,11 @@ int main(int argc, char** argv) {
     draw.pixel_inputs.controls[1] = 1;
     draw.has_system_inputs = true;
     draw.system_inputs = {0x1fu, 0x1fu};
+    draw.ps_entry.observed = true;
+    draw.ps_entry.user_data_available = 0x80000001u;
+    draw.ps_entry.user_data[31] = 0x7f123456u;
+    draw.ps_entry.rsrc2_available = true; // known zero; word1 remains unavailable
+    draw.ps_raster_launch = {true,true,0,0xa5000000u,true,true,0,0x300u};
     draw.vertex_count = 6; draw.instance_count = 3;
     draw.raw_draw_count = 6; draw.raw_indexed = false;   // #1256: raw draw-packet state (v23)
     draw.raw_draw_modifier = 0x1122334455667788ull;
@@ -272,6 +277,10 @@ int main(int argc, char** argv) {
           captured.draws[0].pixel_inputs == draw.pixel_inputs &&
           captured.draws[0].system_inputs == draw.system_inputs,
           "realized draw captures the exact fixed-function pixel-stage ABI");
+    CHECK(captured.draws[0].ps_entry == draw.ps_entry &&
+          captured.draws[0].ps_raster_launch == draw.ps_raster_launch &&
+          !captured.draws[0].ps_entry_source_available,
+          "actual capture retains raw presence-zero entry facts without inventing producing association");
 
     // #1849: one opt-in semantic resource snapshot must sample the bytes at draw realization,
     // independently of ordinary deferred materialization after the submit.
@@ -506,6 +515,7 @@ int main(int argc, char** argv) {
         for (const auto& failure : f.failure_diagnostics)
             bytes += 5u + failure.stages.size(); // parent profile, stage count/profiles
         bytes += 8u + 8u * (f.draws.size() + f.failure_diagnostics.size()); // v67 flags/full word
+        bytes += 4u + kGpuCaptureFragmentEntryRecordBytes * f.draws.size(); // v69 raw entry
         for (const auto& failure : f.failure_diagnostics) {
             ++bytes; // availability, including early failures
             if (!failure.fragment_retry_config_available) continue;
@@ -904,7 +914,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame descriptor_array_replay;
     CHECK(serialize_gpu_capture(descriptor_array_capture, descriptor_array_bytes, error) &&
               deserialize_gpu_capture(descriptor_array_bytes, descriptor_array_loaded, error) &&
-              descriptor_array_loaded.format_version == 68 &&
+              descriptor_array_loaded.format_version == 69 &&
               materialize_gpu_replay(descriptor_array_loaded, descriptor_array_replay, error) &&
               descriptor_array_replay.computes.size() == 1 &&
               descriptor_array_replay.computes[0].resources &&
@@ -1423,7 +1433,7 @@ int main(int argc, char** argv) {
         deserialize_gpu_capture(msaa_bytes, msaa_loaded, error);
     if (!msaa_deserialized) std::printf("  [diag] MSAA capture deserialization: %s\n", error.c_str());
     CHECK(msaa_deserialized &&
-              msaa_loaded.format_version == 68 &&
+              msaa_loaded.format_version == 69 &&
               msaa_loaded.draws[0].vrt.resources[0].resource.sample_count == 4 &&
               msaa_loaded.blobs.size() == 2 &&
               msaa_loaded.blobs[1].bytes.size() == 32768u &&
@@ -1549,7 +1559,7 @@ int main(int argc, char** argv) {
     };
     GpuCaptureFile video_capture;
     CHECK(capture_draw_items({video_draw}, meta, video_reader, video_capture, error) &&
-              video_capture.format_version == 68 && video_capture.blobs.size() == 1 &&
+              video_capture.format_version == 69 && video_capture.blobs.size() == 1 &&
               video_capture.blobs[0].bytes.size() == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_capture.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048,
@@ -1560,7 +1570,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame video_replay;
     CHECK(serialize_gpu_capture(video_capture, video_capture_bytes, error) &&
               deserialize_gpu_capture(video_capture_bytes, video_loaded, error) &&
-              video_loaded.format_version == 68 &&
+              video_loaded.format_version == 69 &&
               video_loaded.draws[0].prt.resources[0].resource.proven_zero_mip &&
               video_loaded.draws[0].prt.resources[0].captured_size == video_memory.size() &&
               video_loaded.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
@@ -1604,7 +1614,7 @@ int main(int argc, char** argv) {
     GpuReplayFrame upgraded_video_replay;
     CHECK(serialize_gpu_capture(legacy_video, upgraded_video_bytes, error) &&
               deserialize_gpu_capture(upgraded_video_bytes, upgraded_video, error) &&
-              upgraded_video.format_version == 68 &&
+              upgraded_video.format_version == 69 &&
               upgraded_video.draws[0].prt.resources[0].captured_size == video_chroma.size &&
               upgraded_video.draws[0].prt.resources[0].resource.linear_row_pitch_bytes == 2048 &&
               materialize_gpu_replay(upgraded_video, upgraded_video_replay, error) &&
@@ -1686,7 +1696,7 @@ int main(int argc, char** argv) {
           "Plucky RGBA16 32-cubed S3 capture uses its four true 3D macroblocks");
     CHECK(serialize_gpu_capture(array_layout_capture, array_layout_bytes, error) &&
               deserialize_gpu_capture(array_layout_bytes, array_layout_loaded, error) &&
-              array_layout_loaded.format_version == 68 &&
+              array_layout_loaded.format_version == 69 &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_stride_bytes == 720896u &&
               array_layout_loaded.draws[0].vrt.resources[0].resource.layer_mip_offset_bytes == 65536u,
           "v32 capture round-trips thin-array slice stride and selected-mip offset");
@@ -1914,7 +1924,7 @@ int main(int argc, char** argv) {
     CHECK(write_gpu_capture(path.string(), captured, error), "versioned capture writes atomically");
     GpuCaptureFile loaded;
     CHECK(read_gpu_capture(path.string(), loaded, error), "versioned capture reads back");
-    CHECK(loaded.format_version == 68 &&
+    CHECK(loaded.format_version == 69 &&
               loaded.draws[0].vrt.resources[1].resource.size == 16u &&
               loaded.draws[0].vrt.resources[1].resource.scalar_buffer_dword_count == 4u &&
               shader_resource_buffer_binding_bytes(
@@ -3606,7 +3616,7 @@ int main(int argc, char** argv) {
     GpuCaptureFile failed_compute_loaded;
     CHECK(serialize_gpu_capture(failed_compute_capture, failed_compute_bytes, error) &&
               deserialize_gpu_capture(failed_compute_bytes, failed_compute_loaded, error) &&
-              failed_compute_loaded.format_version == 68 &&
+              failed_compute_loaded.format_version == 69 &&
               failed_compute_loaded.failure_diagnostics[0].compute_launch.threads_x == 37 &&
               failed_compute_loaded.failure_diagnostics[0].stages[0]
                       .recompile_config.user_sgprs ==
@@ -3970,7 +3980,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> rewritten_v58_bytes;
     CHECK(serialize_gpu_capture(pre_v58_failure, rewritten_v58_bytes, error) &&
           deserialize_gpu_capture(rewritten_v58_bytes, rewritten_v58_failure, error) &&
-          rewritten_v58_failure.format_version == 68u &&
+          rewritten_v58_failure.format_version == 69u &&
           rewritten_v58_failure.failure_diagnostics.size() == 1u &&
           rewritten_v58_failure.failure_diagnostics[0].instance_count == 0u,
           "v57-to-current rewrite preserves the zero sentinel for an unavailable count");
@@ -3989,7 +3999,7 @@ int main(int argc, char** argv) {
                 loaded_failed_msaa = &resource;
         }
     }
-    CHECK(failed_loaded.format_version == 68 && loaded_shadow &&
+    CHECK(failed_loaded.format_version == 69 && loaded_shadow &&
           loaded_shadow->resource.depth == 4 &&
           loaded_shadow->resource.max_uncompressed_block_size == 2 &&
           loaded_shadow->resource.max_compressed_block_size == 1 &&

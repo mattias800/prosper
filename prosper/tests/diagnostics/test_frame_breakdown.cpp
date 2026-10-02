@@ -7,6 +7,8 @@
 #include "diagnostics/perf/perf_alarms.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"
 
+#include <gtest/gtest.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -16,12 +18,7 @@ using namespace prosper::diagnostics::perf;
 
 namespace {
 
-int g_failures = 0;
-
-void check(const char* what, bool ok) {
-    std::printf("  %s  %s\n", ok ? "PASS" : "FAIL", what);
-    if (!ok) ++g_failures;
-}
+void check(const char* what, bool ok) { EXPECT_TRUE(ok) << what; }
 
 std::string summary_of(AlarmEngine& engine) {
     // write_summary takes a FILE*; a tmpfile keeps the test off the real disk's named paths.
@@ -151,9 +148,6 @@ void through_the_engine() {
 
 }  // namespace
 
-int main() {
-    formatting();
-    through_the_engine();
-    std::printf(g_failures ? "FAILED (%d)\n" : "PASSED\n", g_failures);
-    return g_failures ? 1 : 0;
-}
+TEST(FrameBreakdown, Formatting) { formatting(); }
+
+TEST(FrameBreakdown, ThroughTheEngine) { through_the_engine(); }

@@ -27,6 +27,7 @@
 // where this project's automated checks run. Asserting on the declaration itself fails on every
 // platform when the declaration is removed, which is the property a regression arm needs.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -42,12 +43,7 @@ int checks = 0;
 
 // Counts assertions ACTUALLY EXECUTED. A deleted block leaves `failures` at zero, which is
 // indistinguishable from a passing run; the count is the falsifiable half.
-void check(bool ok, const std::string& label) {
-    ++checks;
-    if (ok) { std::printf("  [ok]   %s\n", label.c_str()); return; }
-    ++failures;
-    std::printf("  [FAIL] %s\n", label.c_str());
-}
+void check(bool ok, const std::string& label) { EXPECT_TRUE(ok) << label; }
 
 constexpr uint32_t kOpExtension = 10;
 constexpr uint32_t kOpEntryPoint = 15;
@@ -183,7 +179,7 @@ void assert_all_stages(const char* arm, bool declared) {
 }
 } // namespace
 
-int main() {
+TEST(FloatControls, Contract) {
     std::printf("== test_float_controls ==\n");
 
     // ARM 1 -- a device that can execute the mode. What the live renderer publishes on NVIDIA and
@@ -241,10 +237,5 @@ int main() {
                 failures ? "FAIL" : "PASS", checks, failures);
     // A run that executed nothing is a failure, not a pass: see the comment on `checks`.
     constexpr int kExpectedChecks = 74;
-    if (checks < kExpectedChecks) {
-        std::printf("== FAIL: expected at least %d executed checks, ran %d ==\n",
-                    kExpectedChecks, checks);
-        return 1;
-    }
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }

@@ -31,6 +31,7 @@
 // The mutation was run: replacing the body with plain `guest_realloc_portable` turns
 // "the failed resize RELEASED the original block" red while every other arm stays green.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -39,12 +40,11 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static uint64_t U(const void* p) { return (uint64_t)(uintptr_t)p; }
 
-int main() {
+TEST(Reallocf, Contract) {
     printf("== test_reallocf ==\n");
     register_builtin_hle();
 
@@ -57,7 +57,7 @@ int main() {
     CHECK(malloc_fn != nullptr && free_fn != nullptr, "malloc/free are registered");
     if (!reallocf_fn || !malloc_fn || !free_fn) {
         printf("== %d failure(s) ==\n", fails);
-        return 1;
+        FAIL() << "legacy early exit";
     }
 
     // The name the guest imports must hash to the NID libSceLibcInternal actually exports. A
@@ -159,6 +159,5 @@ int main() {
         }
     }
 
-    printf("== %d failure(s) ==\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

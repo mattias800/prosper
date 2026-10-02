@@ -1,4 +1,5 @@
 #include "../tools/gpu_replay/post_compute_resource.hpp"
+#include <gtest/gtest.h>
 
 #include <array>
 #include <cmath>
@@ -10,9 +11,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static uint32_t pack_r11(float r, float g, float b) {
     return static_cast<uint32_t>(gpu::float_to_f11(r)) |
@@ -38,7 +37,7 @@ static gpu::ShaderResource r11_storage(uint8_t* bytes, size_t byte_count,
     return resource;
 }
 
-int main() {
+TEST(GpuReplayPostComputeResource, Contract) {
     std::printf("== test_gpu_replay_post_compute_resource ==\n");
 
     const std::array<uint32_t, 2> numeric_words = {
@@ -193,6 +192,4 @@ int main() {
                   buffer_before, buffer_before, buffer_after).selected_changed,
           "same-site storage-buffer mutation moves post-compute change evidence");
 
-    std::printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
 }

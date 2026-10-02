@@ -1,4 +1,5 @@
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -11,9 +12,7 @@
 #include <vector>
 
 using namespace prosper::gpu;
-static int failures = 0;
-#define CHECK(c, text) do { if (!(c)) { std::printf("[FAIL] %s\n", text); ++failures; } \
-    else std::printf("[ok] %s\n", text); } while (0)
+#define CHECK(c, text) EXPECT_TRUE(c) << (text)
 
 static std::vector<uint32_t> proof(const std::vector<uint32_t>& code) {
     std::vector<Rdna2Inst> decoded;
@@ -21,7 +20,7 @@ static std::vector<uint32_t> proof(const std::vector<uint32_t>& code) {
     return rdna2_proven_raw_register_wide_data_loads(decoded);
 }
 
-int main() {
+TEST(MemoryFedRawWide, Contract) {
     alignas(16) std::array<uint32_t, 128> bytes{};
     for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = 100u + static_cast<uint32_t>(i);
     uint32_t selector = 2u;
@@ -294,6 +293,4 @@ int main() {
     add_compute_buffer_resources(invalid_wide, code.data(), code.size(),
                                  invalid_user.data(), invalid_user.size());
     CHECK(!invalid_wide.by_fetch_pc(7u), "an overflowing selected wide range stays unbacked");
-    std::printf("memory-fed raw wide failures: %d\n", failures);
-    return failures != 0;
 }

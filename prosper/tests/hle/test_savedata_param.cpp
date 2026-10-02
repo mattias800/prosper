@@ -32,6 +32,7 @@
 //  8. ABI offsets    — the TYPE_ALL layout constants, pinned so a future live capture that
 //                      contradicts one reddens a named arm instead of silently disagreeing.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/fs/save_param.hpp"
 #include "hle/fs/save_paths.hpp"
 #include "hle/service/hle_addcontent.hpp"
@@ -52,8 +53,7 @@ namespace fs = std::filesystem;
 
 static int fails = 0;
 static int checks = 0;
-#define CHECK(c, m) do { ++checks; if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -132,7 +132,7 @@ std::string get_text(const MountPoint& mp, uint32_t type, size_t capacity, uint6
 
 }   // namespace
 
-int main() {
+TEST(SavedataParam, Contract) {
     printf("== test_savedata_param ==\n");
     register_builtin_hle();
 
@@ -140,7 +140,7 @@ int main() {
     g_get = Hle::lookup("XgvSuIdnMlw");
     CHECK(g_set != nullptr, "sceSaveDataSetParam is registered");
     CHECK(g_get != nullptr, "sceSaveDataGetParam is registered");
-    if (!g_set || !g_get) { printf("== FAIL: %d == (%d assertions executed)\n", fails, checks); return 1; }
+    if (!g_set || !g_get) { printf("== FAIL: %d == (%d assertions executed)\n", fails, checks); FAIL() << "legacy early exit"; }
 
     const fs::path scratch = prosper_test::test_scratch_dir() / "savedata-param";
     std::error_code ec;
@@ -380,7 +380,5 @@ int main() {
     }
 
     savedata0_umount();
-    if (fails) { printf("== FAIL: %d == (%d assertions executed)\n", fails, checks); return 1; }
-    printf("== PASS == (%d assertions executed)\n", checks);
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

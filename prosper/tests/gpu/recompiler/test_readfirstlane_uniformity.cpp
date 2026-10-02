@@ -23,6 +23,7 @@
 // the residual recorded in #3596. It establishes that the one demonstrated counterexample no longer
 // passes, and it is built as a PAIR so it cannot pass by the escape simply never firing.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 
@@ -35,8 +36,7 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static uint32_t count_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     if (spv.size() < 5) return 0;
@@ -53,7 +53,7 @@ static uint32_t count_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) 
 constexpr uint32_t kOpSwitch = 251;
 constexpr uint32_t kOpGroupNonUniformAny = 335;
 
-int main() {
+TEST(ReadfirstlaneUniformity, Contract) {
     printf("== test_readfirstlane_uniformity ==\n");
 
     // An irreducible fragment CFG -- pc1 branches INTO the region the back-edge closes, giving it two
@@ -95,7 +95,7 @@ int main() {
     const std::vector<uint32_t> spv_rfl = recompile_fragment(rfl.data(), rfl.size());
 
     CHECK(!spv_imm.empty() && !spv_rfl.empty(), "both variants recompile");
-    if (spv_imm.empty() || spv_rfl.empty()) { printf("== FAIL: %d ==\n", fails + 1); return 1; }
+    if (spv_imm.empty() || spv_rfl.empty()) { printf("== FAIL: %d ==\n", fails + 1); FAIL() << "legacy early exit"; }
 
     // CONTROLS FIRST. If either program failed to reach the dispatcher, the comparison below would be
     // about routing rather than about the uniformity proof.
@@ -256,7 +256,5 @@ int main() {
         }
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

@@ -19,6 +19,7 @@
 // untouched `legacy` default, in a process where these variables are unset.
 
 #include "hle/graphics/display_mode.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/dispatch.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -32,9 +33,7 @@ using namespace prosper::hle::graphics;
 // what proves the PACING half moved, not merely the status struct the title reads.
 extern "C" uint64_t prosper_vo_vblank_period_ns();
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static void set_env(const char* name, const char* value) {
 #ifdef _WIN32
@@ -44,7 +43,7 @@ static void set_env(const char* name, const char* value) {
 #endif
 }
 
-int main() {
+TEST(DisplayMode, Contract) {
     printf("== test_display_mode ==\n");
 
     // ---- Part A: the pure derivation -------------------------------------------------------
@@ -269,6 +268,4 @@ int main() {
         }
     }
 
-    printf("%s: %d failure(s)\n", fails ? "FAILED" : "PASSED", fails);
-    return fails ? 1 : 0;
 }

@@ -4,6 +4,7 @@
 // libkernel registration/hook calls must resolve to a benign OK-returning no-op. Registered by raw
 // NID, so this looks them up by NID and exercises the output contract.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "hle/dispatch/callback_fs.hpp"
 #include <cstdlib>
@@ -18,8 +19,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Call an (userId, int* out) getter and return the value it wrote (sentinel-initialized to catch a
 // no-write).
@@ -38,7 +38,7 @@ static void set_game_intent_activity(const char* value) {
 #endif
 }
 
-int main() {
+TEST(ServiceGetters, Contract) {
     printf("== test_service_getters ==\n");
     register_builtin_hle();
 
@@ -1549,7 +1549,5 @@ int main() {
         }
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

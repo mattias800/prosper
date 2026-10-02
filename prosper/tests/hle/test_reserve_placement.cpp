@@ -12,6 +12,7 @@
 // 1-8 TiB gap and was rejected in #982 review). Smaller and MAP_FIXED reservations keep their
 // existing hint semantics, and the vacated low hint stays available for the metadata pool.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -25,8 +26,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 // Every reserve call logs its outcome so a platform-specific CI failure is attributable from the
 // test output alone (address-space contents differ per host process; see the case-0 comment).
 #define LOGV(tag, rc, val) printf("  %-10s rc=0x%llx addr=0x%llx\n", tag, \
@@ -107,13 +107,13 @@ static constexpr uint64_t kArenaLen   = 0x2800000000ull;   // 160 GiB (>= 128 Gi
 int main() { printf("reserve_placement: skipped under Rosetta (giant-reservation VM-tracking "
                     "pathology); contract covered by the Linux and Windows jobs\n"); return 0; }
 #else
-int main() {
+TEST(ReservePlacement, Contract) {
     printf("== test_reserve_placement ==\n");
     register_builtin_hle();
     auto reserve = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
     auto unmap   = Hle::lookup(nid_hash("sceKernelMunmap"));
     CHECK(reserve && unmap, "reserve + munmap HLEs registered");
-    if (!reserve || !unmap) { printf("fails=%d\n", fails); return 1; }
+    if (!reserve || !unmap) { printf("fails=%d\n", fails); FAIL() << "legacy early exit"; }
 
     // 0) Threshold boundary, just-below side FIRST, on pristine address space: later cases
     //    reserve/unmap huge in-window spans, and on Windows an unmapped span's VA stays
@@ -274,7 +274,6 @@ int main() {
     }
 #endif
 
-    printf("fails=%d\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }
 #endif // __APPLE__

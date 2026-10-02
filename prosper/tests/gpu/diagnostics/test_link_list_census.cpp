@@ -12,6 +12,7 @@
 // null, per the charter's positive-control rule: an unpopulated pool of zeros is not "an empty
 // list", it is an infinite one, and no trip bound can end it.
 #include "gpu/diagnostics/link_list_census.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -19,9 +20,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -46,7 +45,7 @@ std::vector<uint32_t> pool(std::initializer_list<uint32_t> next_links) {
 
 }  // namespace
 
-int main() {
+TEST(LinkListCensus, Contract) {
     printf("== test_link_list_census ==\n");
     const auto enc = astro_encoding();
 
@@ -238,7 +237,4 @@ int main() {
               "nothing on a title that reallocates every frame");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

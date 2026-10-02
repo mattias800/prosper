@@ -8,6 +8,7 @@
 // which the fast path can differ — a pristine pool hands out zeroed pages and would pass whatever
 // the tail contract said.
 #include "shared/live/decode_scratch.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,8 +21,7 @@ using prosper::frontend::decode_scratch_budget_bytes;
 using prosper::frontend::decode_scratch_pool;
 
 static int failures = 0;
-#define CHECK(cond) do { if (!(cond)) { \
-    std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
+#define CHECK(cond) EXPECT_TRUE(cond)
 
 // The shape every converted call site has: stage `filled` bytes into a buffer of `n`, and leave the
 // rest zero. Returns what the decoder would then read.
@@ -31,7 +31,7 @@ static std::vector<uint8_t> reference_fill(size_t n, size_t filled, uint8_t valu
     return buffer;
 }
 
-int main() {
+TEST(DecodeScratch, Contract) {
     // --- retention: a returned lease keeps its pages, a re-take of the same size reuses them -----
     {
         DecodeScratchPool pool(64u << 20);
@@ -274,7 +274,6 @@ int main() {
         CHECK(decode_scratch_pool().retained_buffers() == retained_before);
     }
 
-    if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
-    std::printf("decode scratch pool: all checks passed\n");
-    return 0;
+    if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); FAIL() << "legacy early exit"; }
+    EXPECT_EQ(failures, 0);
 }

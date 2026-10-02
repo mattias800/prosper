@@ -7,17 +7,16 @@
 // offline capsule investigation needs answered, so every branch is asserted here.
 
 #include "../tools/gpu_replay/pixel_input_linkage.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 
 using namespace prosper::gpu;
 using namespace prosper::gpu::replay_tool;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(GpuReplayPixelInputs, Contract) {
     std::printf("== test_gpu_replay_pixel_inputs ==\n");
 
     {
@@ -119,6 +118,4 @@ int main() {
         CHECK(linkage.kind == PixelInputKind::Unused, "slot 32 is out of range and reports Unused");
     }
 
-    std::printf(fails ? "== FAILED (%d) ==\n" : "== PASSED ==\n", fails);
-    return fails ? 1 : 0;
 }

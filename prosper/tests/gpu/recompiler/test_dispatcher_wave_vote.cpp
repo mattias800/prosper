@@ -23,6 +23,7 @@
 // compute-only (workgroup barriers / a compute-only gate) and the third pins a fragment-stage backend
 // contract. That gap is real and is left open on #3573.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -32,8 +33,7 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static uint32_t count_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     if (spv.size() < 5) return 0;
@@ -50,7 +50,7 @@ static uint32_t count_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) 
 constexpr uint32_t kOpSwitch = 251;
 constexpr uint32_t kOpGroupNonUniformAny = 335;
 
-int main() {
+TEST(DispatcherWaveVote, Contract) {
     printf("== test_dispatcher_wave_vote ==\n");
 
     // A fragment CFG the narrow structurizer rejects, which is what routes a GRAPHICS stage to the
@@ -86,7 +86,7 @@ int main() {
     const std::vector<uint32_t> frag =
         recompile_fragment(irreducible_vccz_ps, std::size(irreducible_vccz_ps));
     CHECK(!frag.empty(), "the irreducible vccz fragment recompiles");
-    if (frag.empty()) { printf("== FAIL: %d ==\n", fails + 1); return 1; }
+    if (frag.empty()) { printf("== FAIL: %d ==\n", fails + 1); FAIL() << "legacy early exit"; }
 
     // THE CONTROL, and it is load-bearing. If this program did not actually take the dispatcher
     // route, the arm below would be asserting something about the structurizer instead -- which
@@ -255,7 +255,5 @@ int main() {
         }
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

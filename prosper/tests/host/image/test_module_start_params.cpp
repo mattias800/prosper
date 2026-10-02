@@ -15,8 +15,8 @@
 // answered true for everything would satisfy the inclusion arm perfectly while silently changing
 // the entry ABI of every module prosper links.
 
-#include <cstdio>
 #include <cstdint>
+#include <gtest/gtest.h>
 
 #include "host/image/boot_program.hpp"
 #include "host/image/module_start_params.hpp"
@@ -24,17 +24,14 @@
 using prosper::module_start_param_ranges;
 using prosper::module_start_wants_param_descriptor;
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 // Every module prosper links has DT_INIT at image+0x10 and an empty DT_INIT_ARRAY (measured with
 // PROSPER_INITLOG=1 across all ten of PPSA17952's modules), so a module's single init function is
 // its base + 0x10. Query that address rather than the bare base: it is what run_guest_inits sees.
 static constexpr uint64_t kInit = 0x10;
 
-int main() {
-    printf("module_start param ranges\n");
+TEST(ModuleStartParams, RangesIncludeHandshakeModulesOnly) {
 
     // --- INCLUSION: modules whose module_start performs the handshake. ---
     CHECK(module_start_wants_param_descriptor(prosper::BOOT_IL2CPP + kInit),
@@ -76,6 +73,4 @@ int main() {
     CHECK(!module_start_wants_param_descriptor(prosper::BOOT_IL2CPP - 1),
           "the Il2cpp range does not extend below BOOT_IL2CPP");
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

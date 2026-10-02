@@ -11,6 +11,7 @@
 // that fixed mapping isn't available (e.g. Windows/MinGW) — the lifecycle assertions still run there.
 
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <cstdint>
 #include <cstring>
 #include <thread>
@@ -24,9 +25,7 @@
 #include "hle/dispatch/nid.hpp"
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); fails++; } \
-                              else          { std::printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 static int64_t call_raw(const char* nid, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0,
                         uint64_t a3 = 0, uint64_t a4 = 0, uint64_t a5 = 0) {
@@ -40,7 +39,7 @@ struct RackOption { uint64_t size; char name[16]; uint32_t flags, max_grain, max
                     max_delay, max_matrices, max_ports, reserved[20]; };
 struct RenderInfo { uint64_t buffer, size; uint32_t waveform_type, channels; };
 
-int main() {
+TEST(Ngs2Streaming, Contract) {
     std::printf("== test_ngs2_streaming (#1060: fed block -> Playing + advancing num_decoded_samples) ==\n");
     register_builtin_hle();
 
@@ -126,6 +125,4 @@ int main() {
     std::printf("  [skip] Windows: fixed high-address mapping not set up; streaming validated on POSIX CI\n");
 #endif
 
-    std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

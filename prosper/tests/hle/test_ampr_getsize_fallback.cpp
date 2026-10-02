@@ -23,16 +23,15 @@
 //   - the cb the global was actually recorded against must still get 129 (this FAILS if the fix is
 //     over-applied and drops the legacy path altogether).
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include <cstdint>
 #include <cstdio>
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(AmprGetsizeFallback, Contract) {
     std::printf("== test_ampr_getsize_fallback ==\n");
     register_builtin_hle();
 
@@ -40,7 +39,7 @@ int main() {
     HleFn get_size   = Hle::lookup("tZDDEo2tE5k");
     HleFn get_offset = Hle::lookup("GnxKOHEawhk");
     CHECK(construct && get_size && get_offset, "the three AMPR command-buffer NIDs are registered");
-    if (!construct || !get_size || !get_offset) return 1;
+    if (!construct || !get_size || !get_offset) FAIL() << "legacy early exit";
 
     // A construction whose capacity IS legible, and which therefore also records the legacy
     // (g_apr_last_cb = a3, g_apr_last_cb_size = a1) pair. Shape taken from a live PPSA03026 boot.
@@ -78,6 +77,4 @@ int main() {
     CHECK(size - offset > 0xff,
           "an unknown-capacity cb reports enough free space to clear the guest's 0xff append gate");
 
-    std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

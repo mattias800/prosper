@@ -34,6 +34,7 @@
 // the lever moved: a suppression that never suppressed would pass the always-run and fail the
 // default one. The never-run covers the third mode, which nothing else executes.
 #include <array>
+#include <gtest/gtest.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -60,8 +61,7 @@ static int fails = 0;
 // would print 200 rows and bury everything else.
 static bool quiet_ok = true;
 #define CHECK_QUIET(cond) do { if (!(cond)) quiet_ok = false; } while (0)
-#define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { std::printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 // The plain ReadFile takes its file offset in a stack slot, so it is entered the way the guest
 // enters it. sysv_abi is a no-op on Linux and forces the guest convention on MinGW.
@@ -85,7 +85,7 @@ struct Dest {
     }
 };
 
-int main() {
+TEST(AprMeasureDuplicate, Contract) {
     const char* mode_env = std::getenv("PROSPER_APR_MEASURE_READ");
     const bool forced_always = mode_env && std::strcmp(mode_env, "always") == 0;
     const bool forced_never  = mode_env && std::strcmp(mode_env, "never") == 0;
@@ -95,7 +95,7 @@ int main() {
 
     HleFn measure = Hle::lookup("vWU-odnS+fU");
     CHECK(measure != nullptr, "sceAmprMeasureCommandSizeReadFile is registered");
-    if (!measure) { std::printf("== FAIL ==\n"); return 1; }
+    if (!measure) { std::printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // ---- Fixtures: two distinct containers, so the per-container scoping can be exercised -------
     const std::string path_a_storage =
@@ -191,7 +191,7 @@ int main() {
         std::remove(path_a_storage.c_str());
         std::remove(path_b_storage.c_str());
         std::printf("== %s ==\n", fails ? "FAIL" : "PASS");
-        return fails ? 1 : 0;
+        return;
     }
 
     // ---- A submit that does NOT match the measured read must not latch either -------------------
@@ -512,6 +512,5 @@ int main() {
     prosper_apr_reset_for_test();
     std::remove(path_a_storage.c_str());
     std::remove(path_b_storage.c_str());
-    std::printf("== %s ==\n", fails ? "FAIL" : "PASS");
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

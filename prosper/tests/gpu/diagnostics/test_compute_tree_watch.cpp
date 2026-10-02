@@ -7,6 +7,7 @@
 // produced a value the comparison rejected anyway). Where an arm could pass for the wrong reason,
 // it carries a companion arm that must fail if the mechanism is removed.
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -17,13 +18,8 @@ using namespace prosper::gpu;
 
 namespace {
 
-int g_failures = 0;
 
-void check(bool condition, const char* what) {
-    if (condition) return;
-    std::fprintf(stderr, "  %s -> FAILED\n", what);
-    ++g_failures;
-}
+void check(bool condition, const char* what) { EXPECT_TRUE(condition) << what; }
 
 void test_selector_parsing() {
     const auto minimal = parse_compute_tree_watch_selector("0x20f848417c:2063");
@@ -207,17 +203,11 @@ void test_walk_agrees_on_a_guest_shaped_table() {
 
 } // namespace
 
-int main() {
+TEST(ComputeTreeWatch, Contract) {
     std::printf("test_compute_tree_watch\n");
     test_selector_parsing();
     test_deltas();
     test_transition_classification();
     test_sibling_structure();
     test_walk_agrees_on_a_guest_shaped_table();
-    if (g_failures) {
-        std::fprintf(stderr, "== FAILURES: %d ==\n", g_failures);
-        return 1;
-    }
-    std::printf("  all passed\n");
-    return 0;
 }

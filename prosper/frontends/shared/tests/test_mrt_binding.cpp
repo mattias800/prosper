@@ -6,13 +6,12 @@
 // classifies stale named state as a live binding, which denies the authoritative direct-GPU path --
 // and where no CPU snapshot exists, degrades to guest bytes rather than to a slower correct source.
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <cstdint>
 
 #include "shared/rtt/mrt_binding.hpp"
 
-static int failures = 0;
-#define CHECK(cond) do { if (!(cond)) { \
-    std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
+#define CHECK(cond) EXPECT_TRUE(cond)
 
 namespace {
 
@@ -45,7 +44,7 @@ prosper::gpu::DrawItem make_draw() {
 
 }  // namespace
 
-int main() {
+TEST(MrtBinding, Contract) {
     using prosper::frontend::mrt_active_color;
     using prosper::frontend::mrt_active_color_count;
     using prosper::frontend::mrt_draw_binds_target;
@@ -488,6 +487,4 @@ int main() {
         CHECK(mrt_same_resolve_pass(scene, scene_other_c1));
     }
 
-    if (failures == 0) std::printf("mrt_binding: OK\n");
-    return failures == 0 ? 0 : 1;
 }

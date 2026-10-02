@@ -177,6 +177,8 @@ struct GpuCapturedTable {
     std::vector<GpuCapturedResource> resources;
 };
 
+// v69 field-wise wire record size, excluding its draw-count prefix. Not sizeof a C++ struct.
+inline constexpr size_t kGpuCaptureFragmentEntryRecordBytes = 159;
 struct GpuCapturedDraw {
     std::vector<uint32_t> vs;
     std::vector<uint32_t> gs;
@@ -223,6 +225,9 @@ struct GpuCapturedDraw {
     FloatTransportConfig float_transport{};
     FragmentFloatFlags ps_float_flags{}; // v67: independent producing launch flags
     FragmentLaunchRsrc1 ps_launch_rsrc1{}; // v67: exact observed word, not inferred policy
+    FragmentEntryFacts ps_entry{}; // v69: observed window, not launched/required SGPRs
+    RasterLaunchFacts ps_raster_launch{};
+    bool ps_entry_source_available = false; // immutable producing raw/SOURCE pair retained
 };
 
 struct GpuCapturedCompute {

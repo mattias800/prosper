@@ -9,6 +9,7 @@
 // fails on both fields; reverting the change reddens it. The refusal arms are the opposite shape:
 // they hold the unchanged ordered CPU copy to its old contract (groups == the guest triplet).
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/pm4/pm4_registers.hpp"
 #include "hle/dispatch/dispatch.hpp"
 
@@ -21,8 +22,7 @@ using namespace prosper::gpu;
 namespace P = prosper::agc::Pm4;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 alignas(256) static const uint32_t kNoopCs[] = {0xBF810000u};
 struct Recorded {
@@ -88,12 +88,12 @@ static Recorded run(const GpuState& st, bool device_capable, bool* executed = nu
     return rec;
 }
 
-int main() {
+TEST(IndirectDispatchDeviceRoute, Contract) {
     std::printf("== test_indirect_dispatch_device_route ==\n");
     prosper::register_agc_hle();   // the shader registry sceAgcCreateShader fills
     Fixture noop(kNoopCs, sizeof(kNoopCs));
     CHECK(noop.ok, "register a descriptor-free compute program");
-    if (!noop.ok) return 1;
+    if (!noop.ok) FAIL() << "legacy early exit";
 
     alignas(4) uint32_t wrong[3] = {7, 7, 7};        // never a valid launch for these tests
     alignas(4) uint32_t four_words[4] = {2, 3, 4, 5};
@@ -240,6 +240,5 @@ int main() {
         CHECK(gpu_indirect_dispatch_args_alias_resource(item), "a resource overlapping the tail is an alias");
     }
 
-    std::printf(fails ? "== FAIL ==\n" : "== PASS ==\n");
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

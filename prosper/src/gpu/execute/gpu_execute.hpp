@@ -109,6 +109,8 @@ struct DrawItem {
     FloatTransportConfig float_transport{}; // actual producing host profile, not guest MODE
     FragmentFloatFlags ps_float_flags{};
     FragmentLaunchRsrc1 ps_launch_rsrc1{};
+    FragmentEntryFacts ps_entry{};
+    RasterLaunchFacts ps_raster_launch{};
     // Process-unique identities supplied by the exact shader-recompile cache. Zero means the
     // shader came from an external/replay path, so persistent backend caches must compare words.
     uint64_t vs_identity = 0, fs_identity = 0;
@@ -3027,6 +3029,23 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.ps_float_flags = rs.ps_addr ? rs.ps_float_flags : FragmentFloatFlags{};
     out.ps_launch_rsrc1 = rs.ps_addr ? rs.ps_launch_rsrc1 : FragmentLaunchRsrc1{};
     out.float_transport = float_transport;
+    out.ps_entry = {};
+    out.ps_raster_launch = rs.ps_addr ? rs.ps_raster_launch : RasterLaunchFacts{};
+    if (rs.ps_addr) {
+        out.ps_entry.observed = true;
+        for (uint32_t i = 0; i < out.ps_entry.user_data.size(); ++i) {
+            const auto word = ds.sh.find(prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + i);
+            if (word != ds.sh.end()) {
+                out.ps_entry.user_data_available |= uint32_t(1) << i;
+                out.ps_entry.user_data[i] = word->second;
+            }
+        }
+        const auto rsrc2 = ds.sh.find(prosper::agc::Pm4::SPI_SHADER_PGM_RSRC2_PS);
+        if (rsrc2 != ds.sh.end()) {
+            out.ps_entry.rsrc2_available = true;
+            out.ps_entry.rsrc2 = rsrc2->second;
+        }
+    }
     out.raster_quads.reset();
     // Pin activation and producing inputs here, before the renderer can select a different phase.
     // Analysis reuse off deliberately supplies no raw-version authority instead of rereading VA.
@@ -3045,6 +3064,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         inputs->generated_interpolation_geometry = !out.gs.empty() &&
             interpolation.requires_geometry && !rect_list_synthesis;
         inputs->float_transport = float_transport;
+        inputs->entry = out.ps_entry;
+        inputs->float_mode = out.ps_float_mode;
+        inputs->float_flags = out.ps_float_flags;
+        inputs->launch_rsrc1 = out.ps_launch_rsrc1;
+        inputs->ps_resources = own_fragment_packet_resources(prt.get());
         out.raster_quads = std::make_shared<RasterQuadCollection>();
         out.raster_quads->inputs = std::move(inputs);
     }

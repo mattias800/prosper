@@ -1,4 +1,5 @@
 #include "shared/present/readback_policy.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 #include <initializer_list>
@@ -10,10 +11,9 @@ using prosper::frontend::effective_color_target_readback_reason;
 using prosper::frontend::ColorReadbackReason;
 
 static int failures = 0;
-#define CHECK(cond) do { if (!(cond)) { \
-    std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
+#define CHECK(cond) EXPECT_TRUE(cond)
 
-int main() {
+TEST(ReadbackPolicy, Contract) {
     CHECK(can_defer_scanout_readback(true, false, true, false));
     CHECK(can_defer_scanout_readback(false, true, true, false));
 
@@ -110,5 +110,5 @@ int main() {
                                    has, id, persistent, req)));
                 }
 
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }

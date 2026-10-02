@@ -17,23 +17,20 @@
 // check that can run here and the only one that would fail if the widening leaked.
 
 #include "hle/memory/guest_memory_topology.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
 
-static int failures = 0;
-static void check(bool ok, const std::string& what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what.c_str()); ++failures; }
-    else std::fprintf(stderr, "ok: %s\n", what.c_str());
-}
+static void check(bool ok, const std::string& what) { EXPECT_TRUE(ok) << what; }
 
 static std::string hex(uint64_t v) {
     char b[32]; std::snprintf(b, sizeof b, "0x%llx", (unsigned long long)v); return b;
 }
 
-int main() {
+TEST(AmprTracksOffset, Contract) {
     std::fprintf(stderr, "== test_ampr_tracks_offset ==\n");
     const auto tracks = &prosper::ampr_cb_tracks_offset_arg_for_test;
 
@@ -127,6 +124,4 @@ int main() {
           "...while count=0xffff with the same capacity IS accepted, so the bound is a boundary "
           "rather than a blanket rejection");
 
-    std::fprintf(stderr, failures ? "== FAIL ==\n" : "== PASS ==\n");
-    return failures ? 1 : 0;
 }

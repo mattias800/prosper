@@ -14,6 +14,7 @@
 // running the real emitted bytes and capturing the live frame inside the handler; closing it
 // automatically needs an arm that executes those bytes rather than a transcription of them.
 #include "hle/dispatch/callback_fs.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/dispatch.hpp"
 
 #include <cstdint>
@@ -24,9 +25,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else std::printf("  [ok]   %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // A stand-in for one of prosper's guest TCBs: 16-byte aligned, self-pointer at +0, "PROS" at +0x108.
 struct FakeTcb {
@@ -108,7 +107,7 @@ static void migration_arms() {
 static void migration_arms() {}
 #endif
 
-int main() {
+TEST(FiberGuestTpStash, Contract) {
     const uint64_t kGoodShimRet = 0x600001000ull;   // inside the emitted-stub aperture
 
     // ---- locating the slot -------------------------------------------------------------------
@@ -177,6 +176,4 @@ int main() {
 
     migration_arms();
 
-    std::printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
-    return fails ? 1 : 0;
 }

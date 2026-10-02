@@ -12,6 +12,7 @@
 // makes the two disagree. The read-count arms come last and are a work counter: correct settings
 // cannot show that the sampling happened once rather than four times.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "diagnostics/env_submit.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -25,9 +26,7 @@ using prosper::gpu::compute_trip_bound_settings;
 using prosper::gpu::parse_trip_bound_settings;
 using prosper::gpu::trip_bound_parses;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static void set_env(const char* name, const char* value) {
 #ifdef _WIN32
@@ -59,7 +58,7 @@ static void arm(const char* bound, const char* program, const char* phase, const
     set_env("PROSPER_CFG_TRIP_BOUND_ORDINAL", ordinal);
 }
 
-int main() {
+TEST(TripBoundOperation, Contract) {
     printf("== test_trip_bound_operation ==\n");
     clear_all();
 
@@ -196,7 +195,4 @@ int main() {
     }
 
     clear_all();
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

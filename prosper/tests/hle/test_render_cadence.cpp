@@ -15,18 +15,17 @@
 // still passes.
 
 #include "hle/graphics/render_cadence.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else std::printf("  [ok] %s\n", m); } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 using prosper::RenderCadenceCounters;
 using prosper::render_cadence_is_inert;
 using prosper::render_cadence_override_percent;
 
-int main() {
+TEST(RenderCadence, Contract) {
     constexpr uint64_t kMin = 256;
 
     // No cadence requested -> "inert" is not a verdict the run can earn, however DMA behaves. The
@@ -77,7 +76,4 @@ int main() {
               "override percent is 0 (not NaN) when no skip was ever requested");
     }
 
-    if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
-    std::printf("== PASS ==\n");
-    return 0;
 }

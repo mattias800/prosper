@@ -17,6 +17,7 @@
 // /proc/self/maps, and that the pages OUTSIDE the normalized span did NOT. Those two together
 // separate the fix from both trivial mutations: answering blind, and widening to the whole mapping.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -30,8 +31,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 constexpr uint64_t kGuestPage = 0x4000ull;      // the PS5's 16 KiB page, as hle_kernel_mem.cpp has it
@@ -66,7 +66,7 @@ bool range_is_writable(uint64_t addr, uint64_t len, bool& known) {
 #endif
 }  // namespace
 
-int main() {
+TEST(MprotectUnaligned, Contract) {
     std::printf("== test_mprotect_unaligned ==\n");
     register_builtin_hle();
 
@@ -74,7 +74,7 @@ int main() {
     // drift from the handler by transcribing a NID.
     HleFn mprot = Hle::lookup(nid_hash("sceKernelMprotect"));
     CHECK(mprot != nullptr, "sceKernelMprotect is registered");
-    if (!mprot) { std::printf("FAILED\n"); return 1; }
+    if (!mprot) { std::printf("FAILED\n"); FAIL() << "legacy early exit"; }
 
 #if defined(__linux__)
     // Four guest pages, read-only to start, with a fifth kept read-only as the untouched neighbour
@@ -82,7 +82,7 @@ int main() {
     const size_t span = (size_t)(kGuestPage * 8);
     void* raw = mmap(nullptr, span, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     CHECK(raw != MAP_FAILED, "test fixture: reserved a read-only span");
-    if (raw == MAP_FAILED) { std::printf("FAILED\n"); return 1; }
+    if (raw == MAP_FAILED) { std::printf("FAILED\n"); FAIL() << "legacy early exit"; }
     // Align the working base up to a guest page so the offsets below are the only misalignment.
     const uint64_t base = ((uint64_t)(uintptr_t)raw + kGuestPage - 1) & ~(kGuestPage - 1);
 
@@ -125,6 +125,5 @@ int main() {
                 "normalization itself is shared with the Windows half\n");
 #endif
 
-    std::printf("%s\n", fails ? "FAILED" : "PASSED");
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

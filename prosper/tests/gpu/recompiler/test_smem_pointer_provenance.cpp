@@ -17,6 +17,7 @@
 //
 // Pure (no Vulkan), so it runs in CI.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 
 #include <cstdio>
@@ -24,9 +25,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -88,7 +87,7 @@ std::vector<uint32_t> pointer_chase(std::vector<uint32_t> extra) {
 
 }  // namespace
 
-int main() {
+TEST(SmemPointerProvenance, Contract) {
     printf("test_smem_pointer_provenance\n");
 
     // Arm 1 — control. Nothing reads the pair as data, so the pointer is provenance and the shader
@@ -116,6 +115,4 @@ int main() {
     CHECK(!recompiles(pointer_chase({sopk(kSopkCmpkEqI32, /*sdst=*/3, 0)})),
           "the high word of the pair is covered too, not just the base register");
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
 }

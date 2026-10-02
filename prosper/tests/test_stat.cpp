@@ -2,6 +2,7 @@
 // Getting this layout wrong once overran a guest stack buffer's canary (fstat crash). This locks
 // in the critical offsets: st_mode@0x08 (16-bit), st_size@0x48 (64-bit), total size 0x78.
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <cstdint>
 #include <cstring>
 #include <sys/stat.h>
@@ -14,11 +15,9 @@ namespace prosper { void to_sce_stat(const struct stat& s, uint8_t* out); }
 namespace prosper { void to_sce_stat64(const struct _stat64& s, uint8_t* out); }
 #endif
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
-int main() {
+TEST(Stat, Contract) {
     printf("== test_stat ==\n");
 #ifndef _WIN32
     struct stat s; memset(&s, 0, sizeof s);
@@ -58,7 +57,4 @@ int main() {
     bool clean = true; for (int i = 0x78; i < 0x80; i++) if (buf[i] != SENT) clean = false;
     CHECK(clean, "no write past 0x78 (stack canary safe)");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

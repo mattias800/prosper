@@ -4,6 +4,7 @@
 // are validated, and a batch reports started->complete so the guest's audio pipeline proceeds. Names
 // hash to the game's import NIDs, so R()-registration reaches the guest.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -11,9 +12,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static constexpr uint64_t kInvalidContext   = 0xffffffff80930002ull;
 static constexpr uint64_t kInvalidInstance  = 0xffffffff80930003ull;
@@ -42,7 +41,7 @@ static T chunk_at(const uint8_t* bytes, size_t offset) {
     return value;
 }
 
-int main() {
+TEST(Ajm, Contract) {
     printf("== test_ajm ==\n");
     register_builtin_hle();
 
@@ -74,7 +73,7 @@ int main() {
     CHECK(init && modreg && icreate && idestroy && bstart && bwait && bcancel && control &&
           inline_buffer && run && run_split && fin, "AJM functions registered");
     if (!(init && modreg && icreate && idestroy && bstart && bwait && bcancel && control &&
-          inline_buffer && run && run_split && fin)) { printf("== FAIL ==\n"); return 1; }
+          inline_buffer && run && run_split && fin)) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // Initialize fills a valid (non-zero) context handle.
     uint32_t ctx = 0xDEAD;
@@ -236,7 +235,4 @@ int main() {
     CHECK(idestroy(ctx, 0, 0, 0, 0, 0) == kInvalidInstance, "InstanceDestroy(instance 0) -> INVALID_INSTANCE");
     CHECK(fin(0, 0, 0, 0, 0, 0) == 0, "sceAjmFinalize -> OK");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

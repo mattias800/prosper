@@ -1,4 +1,5 @@
 #include "hle/memory/dmem_caller_chain.hpp"
+#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <array>
@@ -15,14 +16,10 @@ using prosper::dmem_caller_chain_correlates_allocation;
 using prosper::format_dmem_caller_chain_definition;
 using prosper::write_dmem_caller_chain_definition;
 
-static int failures = 0;
 
-static void check(bool ok, const char* name) {
-    std::printf("%s: %s\n", ok ? "PASS" : "FAIL", name);
-    if (!ok) ++failures;
-}
+static void check(bool ok, const char* name) { EXPECT_TRUE(ok) << name; }
 
-int main() {
+TEST(DmemCallerChain, Contract) {
     DmemCallerChainInterner<2> chains;
 
     const DmemCallerChainResult unknown = chains.intern(0, 0);
@@ -166,6 +163,4 @@ int main() {
         std::fclose(definitions);
     }
 
-    std::printf("%s\n", failures ? "FAILED" : "OK");
-    return failures ? 1 : 0;
 }

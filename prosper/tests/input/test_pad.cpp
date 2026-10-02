@@ -4,6 +4,7 @@
 // (3) axis normalization + dead-zone math, and (4) the HLE functions are registered and fill the
 // FULL 120-byte struct (the old stub only wrote 48 bytes, leaving connected/timestamp garbage).
 #include "input/pad.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
@@ -20,9 +21,7 @@
 using namespace prosper;
 using namespace prosper::input;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static void set_test_env(const char* name, const char* value) {
 #ifdef _WIN32
@@ -32,7 +31,7 @@ static void set_test_env(const char* name, const char* value) {
 #endif
 }
 
-int main() {
+TEST(Pad, Contract) {
     printf("== test_pad ==\n");
 
     // (1) Layout — the exact Sony/Kyty ScePadData.
@@ -795,7 +794,4 @@ int main() {
               "stick: a wholly neutral interval emits nothing");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

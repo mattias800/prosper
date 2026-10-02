@@ -18,14 +18,13 @@
 // because it is a real path — gpu_replay's ordered-prefix inspection and the render_submit_items
 // tests consume the last pass at its own extent — not a degenerate one.
 #include "shared/present/present_extent.hpp"
+#include <gtest/gtest.h>
 #include "shared/present/selected_source_identity.hpp"
 
 #include <cstdio>
 #include <string_view>
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); ++fails; } \
-                              else         { std::printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 namespace {
 
@@ -48,7 +47,7 @@ constexpr size_t k4kTall = bytes_for(3840, 3072);
 
 } // namespace
 
-int main() {
+TEST(PresentExtent, Contract) {
     std::printf("== test_present_extent ==\n");
 
     // ---- selection, under the contract -------------------------------------------------------
@@ -151,7 +150,4 @@ int main() {
     CHECK(selected_source_submit(fresh, sources) == 0,
           "a rendered image with unknown producer remains unknown");
 
-    std::printf(fails ? "test_present_extent: %d FAILURE(S)\n" : "test_present_extent: all ok\n",
-                fails);
-    return fails ? 1 : 0;
 }

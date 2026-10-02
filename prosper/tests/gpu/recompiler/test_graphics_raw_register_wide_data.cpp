@@ -1,6 +1,7 @@
 // Numeric raw register-offset loads need exact backing in both graphics stages. Descriptor-only
 // assembly remains the independently resolved consumer route. No Vulkan device is created here.
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <algorithm>
@@ -30,7 +31,7 @@ static std::vector<uint32_t> compile(ShaderProgramStage stage,
         : recompile_fragment(code.data(), code.size(), &table);
 }
 
-int main() {
+TEST(GraphicsRawRegisterWideData, Contract) {
     alignas(16) std::array<uint32_t, 128> words{};
     for (size_t i = 0; i < words.size(); ++i) words[i] = 100u + static_cast<uint32_t>(i);
     const uint64_t address = reinterpret_cast<uint64_t>(words.data());
@@ -410,6 +411,5 @@ int main() {
         check(compile(stage, descriptor, missing_consumer).empty(), name,
               "missing exact descriptor consumer refuses independently of raw numeric policy");
     }
-    std::printf("graphics raw register-wide failures: %d\n", failures);
-    return failures != 0;
+    EXPECT_EQ(failures, 0);
 }

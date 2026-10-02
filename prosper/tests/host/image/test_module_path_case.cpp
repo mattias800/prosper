@@ -7,6 +7,7 @@
 // file directly, so resolution legitimately returns the input unchanged — both outcomes are accepted
 // where they are equivalent, and the "present either way" checks are the cross-platform contract.
 #include "host/image/boot_program.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -16,11 +17,9 @@
 namespace fs = std::filesystem;
 using prosper::resolve_host_path_case;
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
-int main() {
+TEST(ModulePathCase, Contract) {
     std::error_code ec;
     const fs::path root = prosper_test::test_scratch_dir() / "prosper_test_module_path_case";
     fs::remove_all(root, ec);                       // stale run debris
@@ -80,6 +79,4 @@ int main() {
     CHECK(resolve_host_path_case("").empty(), "empty path returned unchanged");
 
     fs::remove_all(root, ec);
-    printf(fails ? "test_module_path_case: %d FAILURE(S)\n" : "test_module_path_case: all ok\n", fails);
-    return fails ? 1 : 0;
 }

@@ -10,6 +10,7 @@
 // that the answer must not depend on which spelling the guest happened to call.
 
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 
 #include <atomic>
@@ -19,10 +20,7 @@
 #include <thread>
 
 static int failures = 0;
-static void check(bool ok, const char* what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++failures; }
-    else std::fprintf(stderr, "ok: %s\n", what);
-}
+static void check(bool ok, const char* what) { EXPECT_TRUE(ok) << what; }
 
 using prosper::Hle;
 using prosper::HleFn;
@@ -31,7 +29,7 @@ static uint64_t call(HleFn fn, uint64_t a0 = 0, uint64_t a1 = 0) {
     return fn(a0, a1, 0, 0, 0, 0);
 }
 
-int main() {
+TEST(CondDestroyBusy, Contract) {
     std::fprintf(stderr, "== test_cond_destroy_busy ==\n");
 
     // The dispatch table is populated by the registrar, not statically -- without this every
@@ -55,7 +53,7 @@ int main() {
     check(cond_init && cond_wait && cond_broadcast && cond_destroy &&
           mutex_init && mutex_lock && mutex_unlock,
           "every pthread entry point this test needs is registered");
-    if (failures) { std::fprintf(stderr, "== FAIL ==\n"); return 1; }
+    if (failures) { std::fprintf(stderr, "== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // Guest-visible slots: the HLE takes the ADDRESS of a pointer-sized slot, not the object.
     uint64_t cond_slot = 0, mutex_slot = 0;
@@ -144,7 +142,7 @@ int main() {
                      "under a parked thread, so the broadcast reached nothing (#2168 regressed)");
         waiter.detach();
         std::fprintf(stderr, "== FAIL ==\n");
-        return 1;
+        FAIL() << "legacy early exit";
     }
     waiter.join();
     check(waiter_done.load(std::memory_order_acquire),
@@ -194,13 +192,12 @@ int main() {
             check(false, "the timedwait waiter did not wake within 5 s (#2168 regressed)");
             waiter2.detach();
             std::fprintf(stderr, "== FAIL ==\n");
-            return 1;
+            FAIL() << "legacy early exit";
         }
         waiter2.join();
         check(call(cond_destroy, (uint64_t)(uintptr_t)&cond2) == 0,
               "and once it has left, that condvar destroys cleanly too");
     }
 
-    std::fprintf(stderr, failures ? "== FAIL ==\n" : "== PASS ==\n");
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }
