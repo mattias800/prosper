@@ -30,10 +30,13 @@ const char* image_gap(const FragmentPacketImageRead& image) {
         (t[1] & 0x000fff00u) || (t[2] & 0xf0003000u) ||
         t[3] != (0x90000facu | (last << 16)) || t[4] || t[5] != (last << 4) || t[6] || t[7])
         return "packet-image-descriptor-domain-unimplemented";
-    if (!width || !height || width > 8 || height > 8 ||
+    if (!width || !height ||
         (width & (width - 1)) || (height & (height - 1)) ||
-        last > 3 || image.mips.size() != last + 1)
+        image.mips.size() != last + 1)
         return "packet-image-mip-domain-unimplemented";
+    uint32_t extent = std::max(width, height), levels = 0;
+    do { ++levels; extent >>= 1; } while (extent);
+    if (last >= levels) return "packet-image-mip-domain-unimplemented";
     // AMD 70648 Table46: mip_filter=0 DISABLES mipmapping, 1=POINT, 2=LINEAR.
     // Do not inherit apply_sampler_descriptor's nonzero->linear collapse. Here XY and mip POINT,
     // CLAMP_LAST_TEXEL on all axes, zero bias/minLOD, exact last-level maxLOD, no hidden controls.
@@ -56,10 +59,18 @@ const char* image_gap(const FragmentPacketImageRead& image) {
 
 const char* packet_resource_instruction_gap(const Rdna2Inst& in) {
     if (modifiers(in)) return "packet-resource-modifier-unimplemented";
-    if (in.fmt == Rdna2Format::VINTRP)
+    if (in.fmt == Rdna2Format::VINTRP) {
+        // RDNA2 70648 12.11: P1 destination/source alias is not independent of HALF_LDS mode.
+        // This API owns parameter tuples but does not supply that launch-mode authority.
+        if (in.opcode == 0 && in.dst.value == in.src[0].value)
+            return "packet-parameter-p1-alias-mode-unavailable";
         return in.opcode <= 1 && in.vintrp_attr < 32 && in.src[0].kind == OperandKind::VGPR
             ? nullptr : "packet-parameter-form-unimplemented";
+    }
     if (in.fmt == Rdna2Format::SMEM) {
+        if (in.opcode >= 8 && in.opcode <= 10 &&
+            (in.dst.value & ((1u << (in.opcode - 8)) - 1u)))
+            return "packet-smem-destination-alignment-invalid";
         if (in.opcode < 8 || in.opcode > 10 || in.src[0].kind != OperandKind::SGPR ||
             (in.src[0].value & 3) || in.src[0].value > 102 || in.dst.value > 102 ||
             in.src[1].kind != OperandKind::Special || in.src[1].value != 125 ||
@@ -93,6 +104,13 @@ const char* packet_resource_preflight(const FragmentResourcePacket& packet,
         return "packet-enabled-int64-device-unavailable";
     if (!guest.float_mode.available || !guest.float_flags.available)
         return "packet-f32-launch-mode-or-flags-unavailable";
+    if (!packet.launch_rsrc1.available || !packet.launch_rsrc1.canonical())
+        return "packet-f32-launch-rsrc1-unavailable";
+    const auto raw = packet.launch_rsrc1.value;
+    if (((raw >> 12) & 255u) != guest.float_mode.value ||
+        ((raw >> 21) & 1u) != guest.float_flags.dx10_clamp ||
+        ((raw >> 23) & 1u) != guest.float_flags.ieee_mode)
+        return "packet-f32-launch-rsrc1-association-mismatch";
     if (!guest.float_flags.ieee_mode)
         return "packet-f32-non-ieee-mode-unimplemented";
     if (packet.buffers.size() > 64 || packet.images.size() > 16 ||
@@ -114,6 +132,13 @@ const char* packet_resource_preflight(const FragmentResourcePacket& packet,
     if (total_words > 1048576) return "packet-resource-input-budget";
     for (const auto& image : packet.images) {
         if (!images.emplace(image.pc, &image).second) return "packet-image-readpoint-duplicate";
+        // Bound owned bytes, not a convenient test dimension. Device image limits are separately
+        // checked by the executing owner. Inspect this bound before scanning any texel payload.
+        for (const auto& mip : image.mips) {
+            if (mip.texels.size() > 262144) return "packet-resource-input-budget";
+            total_words += uint64_t(mip.texels.size()) * 4u;
+            if (total_words > 1048576) return "packet-resource-input-budget";
+        }
         if (const auto* gap = image_gap(image)) return gap;
     }
     if (!images.empty() && !packet.device.rgba32_sfloat_sampled)

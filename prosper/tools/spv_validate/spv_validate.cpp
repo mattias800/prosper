@@ -702,6 +702,9 @@ int main(int argc, char** argv) {
             dump(dir, lod ? "fragment_resource_packet_l" : "fragment_resource_packet_lz",
                  packet.packet.spirv, "recompile_fragment_resource_packet");
         }
+        const auto rectangular = recompile_fragment_resource_packet(resources::rectangular_chain());
+        dump(dir, "fragment_resource_packet_rectangular_l4", rectangular.packet.spirv,
+             "recompile_fragment_resource_packet");
     }
     {
         namespace fp = prosper::test::fragment_packet;

@@ -43,6 +43,7 @@ struct FragmentPacketDeviceContract {
 };
 struct FragmentResourcePacket {
     FragmentInvocationPacket invocation;
+    FragmentLaunchRsrc1 launch_rsrc1{}; // complete ORIGINAL launch word, not a host mode verdict
     FragmentPacketParameterCache parameter_cache;
     std::vector<FragmentPacketBufferRead> buffers;
     std::vector<FragmentPacketImageRead> images;
@@ -63,6 +64,9 @@ struct FragmentResourcePacketProgram {
     std::vector<FragmentPacketImageRead> images; // binding 16+i, complete immutable upload plan
     FragmentPacketDeviceContract device;
     uint32_t status_offset = 0;
+    FragmentLaunchRsrc1 launch_rsrc1{};
+    FragmentFloatMode float_mode{};
+    FragmentFloatFlags float_flags{};
     std::vector<uint32_t> runtime_failure_pcs; // exact original service PCs, never caller guesses
 };
 struct FragmentResourcePacketResult {

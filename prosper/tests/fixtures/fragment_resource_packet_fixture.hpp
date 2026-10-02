@@ -20,6 +20,7 @@ inline FragmentResourcePacket base() {
     g.quad_topology = FragmentPacketQuadTopology::ConsecutiveLogicalQuads;
     g.float_mode = {true, 0x30}; // RNE, preserve F32 input/output denorms
     g.float_flags = {true, true, false};
+    p.launch_rsrc1 = {true, (0x30u << 12) | (1u << 23)};
     // CPU interpreter witness ONLY. GPU companion replaces it after actual feature enablement.
     p.device = {0x4192, true, true};
     for (uint32_t reg = 0; reg <= 24; ++reg) {
@@ -118,10 +119,56 @@ inline std::vector<uint32_t> expected_chain(const FragmentResourcePacket& p, boo
 }
 inline FragmentResourcePacket arithmetic(uint32_t opcode, uint32_t a, uint32_t c, uint8_t mode) {
     auto p = base(); p.invocation.float_mode.value = mode;
+    p.launch_rsrc1.value = (uint32_t(mode) << 12) | (1u << 23);
     p.invocation.vgprs[0].words.fill(a); p.invocation.vgprs[1].words.fill(c);
     valu(p.invocation.guest_code, opcode, 2, 256, 1);
     fragment_packet::exp(p.invocation.guest_code, 1, 2);
     p.invocation.guest_code.push_back(0xbf810000u);
     return p;
+}
+inline FragmentResourcePacket rectangular_chain(uint32_t data_variant = 0) {
+    auto p = chain(true, false, data_variant);
+    // Original explicit _L consumes the SMEM-loaded LOD4. A 128x64, six-level image exercises
+    // nontrivial dimensions, rectangular mip extents and real changed resource words.
+    p.buffers[0].words[2] = bits(4.0f);
+    auto& image = p.images[0];
+    image.descriptor = {0x2000, (77u << 20) | (3u << 30), 31u | (63u << 14),
+                        0x90050facu, 0, 0x50, 0, 0};
+    image.sampler = {0xdb, 1280u << 12, 1u << 26, 0};
+    image.mips.clear();
+    for (uint32_t level = 0; level < 6; ++level) {
+        FragmentPacketImageMip mip; mip.width = 128u >> level; mip.height = 64u >> level;
+        for (uint32_t t = 0; t < mip.width * mip.height; ++t) {
+            const float value = float(1 + t + level * 2048 + data_variant * 10000);
+            mip.texels.push_back({bits(value), bits(value + 1), bits(value + 2), bits(value + 3)});
+        }
+        image.mips.push_back(std::move(mip));
+    }
+    for (auto& [reg, value] : p.invocation.sgprs) {
+        if (reg >= 4 && reg < 12) value = image.descriptor[reg - 4];
+        if (reg >= 12 && reg < 16) value = image.sampler[reg - 12];
+    }
+    for (uint32_t quad = 0; quad < 16; ++quad) {
+        const float x = float(2 * (quad % 4)), y = float(2 * (quad / 8));
+        p.parameter_cache.parameters[quad * 2] = {100 + quad, 0, 0,
+            bits((x + 0.5f) / 8), bits(1.0f / 8), bits(0.0f)};
+        p.parameter_cache.parameters[quad * 2 + 1] = {100 + quad, 0, 1,
+            bits((y + 0.5f) / 4), bits(0.0f), bits(1.0f / 4)};
+    }
+    return p;
+}
+inline std::vector<uint32_t> expected_rectangular_chain(uint32_t data_variant = 0) {
+    auto words = expected_chain(chain(true, false, data_variant), true, data_variant);
+    const uint32_t peer_texel = 4 + 8 * 2; // lane40: quad10, I=J=0
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        const uint32_t quad = lane / 4;
+        const uint32_t x = 2 * (quad % 4) + (lane & 1), y = 2 * (quad / 8) + ((lane >> 1) & 1);
+        words[lane * 36 + 8] = bits((float(x) + 0.5f) / 8);
+        words[lane * 36 + 9] = bits((float(y) + 0.5f) / 4);
+        for (uint32_t c = 0; c < 4; ++c)
+            words[lane * 36 + 20 + c] = bits(float(1 + x + 8 * y + 8192 + data_variant * 10000 + c));
+        words[lane * 36 + 32] = bits(float(1 + peer_texel + 8192 + data_variant * 10000));
+    }
+    return words;
 }
 } // namespace prosper::test::fragment_resource_packet

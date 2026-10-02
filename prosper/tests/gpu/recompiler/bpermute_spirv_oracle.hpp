@@ -428,10 +428,14 @@ struct Interpreter {
         } else fail("unsupported live ExtInst");
       } else if (op == 88) {
         if (a.size() != 6 || a[4] != 2 || ty(a[0]).op != 23 || ty(a[0]).a.size() != 2 ||
-            ty(a[0]).a[1] != 4 || ty(ty(a[0]).a[0]).op != 22)
+            ty(a[0]).a[1] != 4 || ty(ty(a[0]).a[0]).op != 22 ||
+            ty(ty(a[0]).a[0]).a != std::vector<uint32_t>{32})
           fail("unsupported sampled result/profile");
         const auto handle = value(l, a[2]), coord = value(l, a[3]), lod = value(l, a[5]);
-        if (ty(handle.type).op != 27 || handle.words.size() != 1 || !handle.defined ||
+        if (ty(handle.type).op != 27 || ty(handle.type).a.size() != 1 ||
+            ty(ty(handle.type).a[0]).op != 25 || ty(ty(handle.type).a[0]).a.empty() ||
+            ty(ty(handle.type).a[0]).a[0] != ty(a[0]).a[0] ||
+            handle.words.size() != 1 || !handle.defined ||
             ty(coord.type).op != 23 || ty(coord.type).a != std::vector<uint32_t>{ty(a[0]).a[0], 2} ||
             !coord.defined || lod.type != ty(a[0]).a[0] || lod.words.size() != 1 || !lod.defined)
           fail("sample operand type/definition");
@@ -589,6 +593,7 @@ struct Interpreter {
       shared.clear();
       readonly_storage.clear();
       std::map<uint32_t, bool> seen_bindings;
+      std::map<uint32_t, bool> seen_sampled_bindings;
       std::vector<Lane> lanes(count);
       for (const auto &g : globals) {
         const auto &a = g.a;
@@ -641,6 +646,8 @@ struct Interpreter {
               set == decorations.end() || set->second != std::vector<uint32_t>{0} ||
               ty(a[0]).a[0] != 0 || sampled.op != 27 || sampled.a.size() != 1)
             fail("unsupported sampled image ABI");
+          if (!seen_sampled_bindings.emplace(binding->second, true).second)
+            fail("duplicate sampled image binding");
           const auto &image = ty(sampled.a[0]);
           if (image.op != 25 || image.a.size() != 7 || ty(image.a[0]).op != 22 ||
               ty(image.a[0]).a != std::vector<uint32_t>{32} ||
@@ -675,6 +682,8 @@ struct Interpreter {
         fail("missing live storage sink");
       if (seen_bindings.size() != buffers.size())
         fail("missing supplied storage binding");
+      if (seen_sampled_bindings.size() != sampled_images.size())
+        fail("missing supplied sampled image binding");
       // The first function label is kept in the instruction stream, including
       // any Phi.
       for (auto &l : lanes)

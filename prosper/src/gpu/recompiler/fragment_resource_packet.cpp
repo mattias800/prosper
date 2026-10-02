@@ -6,6 +6,9 @@ FragmentResourcePacketProgram recompile_fragment_resource_packet(const FragmentR
     FragmentResourcePacketProgram result;
     result.images = input.images;
     result.device = input.device;
+    result.launch_rsrc1 = input.launch_rsrc1;
+    result.float_mode = input.invocation.float_mode;
+    result.float_flags = input.invocation.float_flags;
     PacketResourceServices services{input, result};
     result.packet = recompile_fragment_packet_impl(input.invocation, diagnostic, &services);
     if (result.packet.spirv.empty()) { result.images.clear(); result.status_offset = 0; }
@@ -75,6 +78,11 @@ FragmentResourcePacketResult decode_fragment_resource_packet(const FragmentResou
             words[offset + 4] > 15 || words[offset + 5] || words[offset + 6] > 1 || words[offset + 7] > 1 ||
             (words[offset + 3] >= kFragmentColorOutputs && words[offset + 3] != 8 && words[offset + 3] != 9))
             return reject("packet-export-record-invalid");
+        if ((words[offset + 3] == 8 && (!words[offset + 4] || (words[offset + 4] & ~5u))) ||
+            (words[offset + 3] == 9 && words[offset + 4])) return reject("packet-export-record-invalid");
+        for (uint32_t c = 0; c < 4; ++c)
+            if (!(words[offset + 4] & (1u << c)) && words[offset + 8 + c])
+                return reject("packet-disabled-export-payload-invalid");
     }
     result.exports.assign(words.begin(), words.begin() + program.status_offset);
     return result;

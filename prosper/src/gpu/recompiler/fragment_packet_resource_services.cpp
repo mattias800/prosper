@@ -1,4 +1,6 @@
 #include "gpu/recompiler/fragment_packet_services.hpp"
+#include "gpu/recompiler/rdna2_alu_support.hpp"
+#include <bit>
 
 namespace prosper::gpu {
 namespace {
@@ -15,19 +17,39 @@ uint32_t normal_or_zero(SpirvCompute& b, uint32_t bits) {
         and_(b, b.ucmp(Op_UGreaterThanEqual, mag, b.uconst(0x800000u)),
                 b.ucmp(Op_ULessThan, mag, b.uconst(0x7f800000u))));
 }
+uint32_t exact_center(SpirvCompute& b, uint32_t bits, uint32_t extent) {
+    // For W=2^n and 0<u<1, u is (2*x+1)/(2*W) iff its full significand has
+    // r=149-n-E low zero bits followed by an odd bit. Descriptor dimensions fit 14 bits;
+    // the range guard therefore gives 9<=r<=23. Sanitize before EVERY emitted shift so
+    // even a failing operand executes defined integer code while all workers rendezvous.
+    const uint32_t n = std::countr_zero(extent);
+    const auto e = b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, bits, b.uconst(23)), b.uconst(255));
+    const auto range = and_(b, b.ucmp(Op_UGreaterThanEqual, e, b.uconst(126 - n)),
+        b.ucmp(Op_ULessThanEqual, e, b.uconst(126)));
+    const auto r = b.sel(range, b.ibin(Op_ISub, b.uconst(149 - n), e), b.uconst(0));
+    const auto bit = b.ibin(Op_ShiftLeftLogical, b.uconst(1), r);
+    const auto sig = b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, bits, b.uconst(0x7fffff)), b.uconst(0x800000));
+    return and_(b, and_(b, range, b.ucmp(Op_IEqual,
+        b.ibin(Op_BitwiseAnd, bits, b.uconst(0x80000000)), b.uconst(0))),
+        and_(b, b.ucmp(Op_IEqual, b.ibin(Op_BitwiseAnd, sig,
+            b.ibin(Op_ISub, bit, b.uconst(1))), b.uconst(0)),
+            b.ucmp(Op_INotEqual, b.ibin(Op_BitwiseAnd, sig, bit), b.uconst(0))));
+}
 void write_vector(SpirvCompute& b, RegState& state, int reg, uint32_t bits) {
     // The packet inventory REQUIRED the genuine old value, including inactive lanes. A service
     // cannot manufacture backing for an EXEC-off write or a subsequent EXEC-ignoring READLANE.
     state.vreg[reg] = b.sel(state.exec, bits, state.vreg.at(reg));
 }
 template <size_t N>
-uint32_t descriptor_equal(SpirvCompute& b, const RegState& state, int base,
+uint32_t descriptor_equal(SpirvCompute& b, RegState& state, const Rdna2Inst& in, int base,
                           const std::array<uint32_t, N>& descriptor) {
     auto equal = b.btrue();
     for (uint32_t c = 0; c < N; ++c) {
-        const auto found = state.sreg.find(base + static_cast<int>(c));
-        if (found == state.sreg.end()) return 0;
-        equal = and_(b, equal, b.ucmp(Op_IEqual, found->second, b.uconst(descriptor[c])));
+        Operand operand; operand.kind = OperandKind::SGPR; operand.value = base + static_cast<int>(c);
+        bool available = true;
+        const auto bits = operand_bits(b, state, in, operand, &available);
+        if (!available) return 0; // MUST/lifetime filtering, not Function-variable presence
+        equal = and_(b, equal, b.ucmp(Op_IEqual, bits, b.uconst(descriptor[c])));
     }
     return equal;
 }
@@ -73,7 +95,7 @@ int PacketResourceServices::emit(SpirvCompute& b, RegState& state, const Rdna2In
         const auto found = std::find_if(input.buffers.begin(), input.buffers.end(),
             [&](const auto& resource) { return resource.pc == in.pc; });
         if (found == input.buffers.end()) return -1;
-        const auto equal = descriptor_equal(b, state, in.src[0].value, found->descriptor);
+        const auto equal = descriptor_equal(b, state, in, in.src[0].value, found->descriptor);
         if (!equal) return -1;
         // Scalar loads execute even when EXEC=0. Descriptor failure is a packet failure, not an
         // unobservable inactive-vector failure; read ONLY the separately owned bounded snapshot.
@@ -111,6 +133,10 @@ int PacketResourceServices::emit(SpirvCompute& b, RegState& state, const Rdna2In
         auto exact = and_(b, normal_or_zero(b, barycentric), and_(b, product.valid, product.exact));
         exact = and_(b, exact, and_(b, normal_or_zero(b, product.bits), and_(b, sum.valid, sum.exact)));
         exact = and_(b, exact, normal_or_zero(b, sum.bits));
+        // Exact nonzero sums are independent of staged/fused rounding. A final zero also needs
+        // interpolation-specific signed-zero/rounding authority, which this first slice lacks.
+        exact = and_(b, exact, b.ucmp(Op_INotEqual,
+            b.ibin(Op_BitwiseAnd, sum.bits, b.uconst(0x7fffffffu)), b.uconst(0)));
         if (in.opcode == 1) exact = and_(b, exact, normal_or_zero(b, old));
         fail(b, consumed(b.logical_not(exact)), in.pc, FragmentPacketRuntimeFailure::InterpolationNotExact);
         write_vector(b, state, in.dst.value, sum.bits);
@@ -121,8 +147,8 @@ int PacketResourceServices::emit(SpirvCompute& b, RegState& state, const Rdna2In
             [&](const auto& resource) { return resource.pc == in.pc; });
         if (found == input.images.end()) return -1;
         const uint32_t binding = 16 + static_cast<uint32_t>(found - input.images.begin());
-        const auto image_equal = descriptor_equal(b, state, in.src[1].value, found->descriptor);
-        const auto sampler_equal = descriptor_equal(b, state, in.src[2].value, found->sampler);
+        const auto image_equal = descriptor_equal(b, state, in, in.src[1].value, found->descriptor);
+        const auto sampler_equal = descriptor_equal(b, state, in, in.src[2].value, found->sampler);
         if (!image_equal || !sampler_equal) return -1;
         fail(b, consumed(b.logical_not(and_(b, image_equal, sampler_equal))), in.pc,
              FragmentPacketRuntimeFailure::DescriptorMismatch);
@@ -135,13 +161,7 @@ int PacketResourceServices::emit(SpirvCompute& b, RegState& state, const Rdna2In
             const auto selected = b.ucmp(Op_IEqual, lod, b.uconst(fbits(static_cast<float>(level))));
             valid_lod = b.ucmp(Op_LogicalOr, valid_lod, selected);
             const auto& mip = found->mips[level];
-            auto valid_u = b.bfalse(), valid_v = b.bfalse();
-            for (uint32_t x = 0; x < mip.width; ++x)
-                valid_u = b.ucmp(Op_LogicalOr, valid_u, b.ucmp(Op_IEqual, u,
-                    b.uconst(fbits((static_cast<float>(x) + 0.5f) / static_cast<float>(mip.width)))));
-            for (uint32_t y = 0; y < mip.height; ++y)
-                valid_v = b.ucmp(Op_LogicalOr, valid_v, b.ucmp(Op_IEqual, v,
-                    b.uconst(fbits((static_cast<float>(y) + 0.5f) / static_cast<float>(mip.height)))));
+            const auto valid_u = exact_center(b, u, mip.width), valid_v = exact_center(b, v, mip.height);
             valid_coordinate = b.ucmp(Op_LogicalOr, valid_coordinate, and_(b, selected, and_(b, valid_u, valid_v)));
         }
         fail(b, consumed(b.logical_not(valid_lod)), in.pc, FragmentPacketRuntimeFailure::SampleLodDomain);

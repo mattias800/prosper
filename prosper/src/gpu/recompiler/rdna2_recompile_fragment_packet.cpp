@@ -239,6 +239,10 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     for (const auto& in : ins) {
         const char* gap = packet_instruction_gap(in);
         if (services && gap && !packet_resource_instruction_gap(in)) gap = nullptr;
+        else if (services && in.fmt == Rdna2Format::SMEM)
+            gap = packet_resource_instruction_gap(in);
+        else if (services && in.fmt == Rdna2Format::VINTRP && in.opcode == 0 &&
+                 in.dst.value == in.src[0].value) gap = "packet-parameter-p1-alias-mode-unavailable";
         if (gap) return reject(gap, in.pc);
         if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x0a &&
             packet.quad_topology != FragmentPacketQuadTopology::ConsecutiveLogicalQuads)

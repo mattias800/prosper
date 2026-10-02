@@ -7,14 +7,22 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
+#include <cstdlib>
+#include <gtest/gtest.h>
 
 namespace {
 using namespace prosper::gpu;
 namespace fixture = prosper::test::fragment_resource_packet;
-int checks = 0, failures = 0;
 void check(bool value, const std::string& name) {
-    ++checks;
-    if (!value) { ++failures; std::fprintf(stderr, "[FAIL] %s\n", name.c_str()); }
+    EXPECT_TRUE(value) << name;
+}
+std::filesystem::path dump_directory() {
+    // Author explicitly supplies an owned dump root; ordinary registered tests create no files.
+    const char* root = std::getenv("PROSPER_RESOURCE_PACKET_SPV_DIRECTORY");
+    if (!root || !*root) return {};
+    std::filesystem::path directory(root);
+    std::filesystem::create_directories(directory);
+    return directory;
 }
 FragmentResourcePacketProgram compile(const FragmentResourcePacket& p) {
     return recompile_fragment_resource_packet(p, {RecompileDiagnosticStage::Fragment, 0x4192});
@@ -84,11 +92,8 @@ void update_image_pc(FragmentResourcePacket& p) {
 }
 } // namespace
 
-int main(int argc, char** argv) {
-    std::filesystem::path directory;
-    if (argc == 3 && std::string(argv[1]) == "--dump-directory") {
-        directory = argv[2]; std::filesystem::create_directories(directory);
-    } else if (argc != 1) return 2;
+TEST(FragmentResourcePacket, OriginalOwnedChainsAndTransactionalConsumer) {
+    const auto directory = dump_directory();
     for (bool lod : {false, true}) for (bool inactive : {false, true}) for (uint32_t variant : {0u, 1u}) {
         const auto p = fixture::chain(lod, inactive, variant);
         const auto name = "chain_" + std::to_string(lod) + "_inactive" + std::to_string(inactive) + "_data" + std::to_string(variant);
@@ -101,6 +106,9 @@ int main(int argc, char** argv) {
         check(decode_fragment_resource_packet(program, bad, true, p.device.device_identity).exports.empty(), name + " truncation publishes nothing");
         bad = words; bad[program.status_offset + 63 * 3] ^= 1;
         check(decode_fragment_resource_packet(program, bad, true, p.device.device_identity).exports.empty(), name + " last lane magic required");
+        bad = words; bad[63 * 36 + 33] = 0xfeed0001;
+        check(decode_fragment_resource_packet(program, bad, true, p.device.device_identity).rejection == "packet-disabled-export-payload-invalid",
+              name + " malformed last disabled EXP channel publishes nothing");
         bad = words; bad[program.status_offset + 63 * 3 + 1] = 0x12345678; bad[program.status_offset + 63 * 3 + 2] = 3;
         check(decode_fragment_resource_packet(program, bad, true, p.device.device_identity).rejection == "packet-status-record-invalid", name + " invalid guest-PC refuses");
         // A valid typed arithmetic omission must alter the executed SOURCE, not just the oracle's
@@ -125,12 +133,38 @@ int main(int argc, char** argv) {
             check(!error.empty(), name + " wrong uint64 result type fails closed");
         }
     }
+}
+TEST(FragmentResourcePacket, LargerRectangularMipAndResourceChanges) {
+    const auto directory = dump_directory();
+    std::vector<uint32_t> baseline_spirv, baseline_sink;
+    for (uint32_t variant : {0u, 1u}) {
+        const auto p = fixture::rectangular_chain(variant);
+        const auto words = sink(p, fixture::expected_rectangular_chain(variant),
+            "rectangular_mip4_data" + std::to_string(variant), directory);
+        const auto module = compile(p).packet.spirv;
+        if (!variant) { baseline_spirv = module; baseline_sink = words; }
+        else {
+            EXPECT_EQ(module, baseline_spirv) << "owned texel words are not baked into SOURCE";
+            EXPECT_NE(words, baseline_sink) << "changed owned buffer/image reaches actual raw EXP";
+        }
+    }
+}
+TEST(FragmentResourcePacket, FiniteArithmeticAllRoundingAndDenormalModes) {
+    const auto directory = dump_directory();
     // Independent hand-derived IEEE bit rails; integer SOURCE does not inherit device FTZ or RTE.
     for (uint32_t denorm = 0; denorm < 4; ++denorm) for (uint32_t round = 0; round < 4; ++round) {
         const auto mode = static_cast<uint8_t>((denorm << 4) | round);
         const auto suffix = std::to_string(mode);
         sink(fixture::arithmetic(3, 0x3f800000, 0x33800000, mode),
              arithmetic_expected(round == 1 ? 0x3f800001 : 0x3f800000), "halfway_positive_" + suffix, directory);
+        sink(fixture::arithmetic(3, 0x3f800001, 0x33800000, mode),
+             arithmetic_expected(round == 0 || round == 1 ? 0x3f800002 : 0x3f800001), "halfway_odd_" + suffix, directory);
+        sink(fixture::arithmetic(3, 0x3fffffff, 0x33800000, mode),
+             arithmetic_expected(round == 0 || round == 1 ? 0x40000000 : 0x3fffffff), "halfway_carry_" + suffix, directory);
+        sink(fixture::arithmetic(3, 0x80000000, 0x80000000, mode),
+             arithmetic_expected(0x80000000), "same_negative_zeros_" + suffix, directory);
+        sink(fixture::arithmetic(3, 0, 0x80000000, mode),
+             arithmetic_expected(round == 2 ? 0x80000000 : 0), "opposite_signed_zeros_" + suffix, directory);
         sink(fixture::arithmetic(3, 0xbf800000, 0xb3800000, mode),
              arithmetic_expected(round == 2 ? 0xbf800001 : 0xbf800000), "halfway_negative_" + suffix, directory);
         sink(fixture::arithmetic(8, 0x00800000, 0x3f000000, mode),
@@ -149,7 +183,16 @@ int main(int argc, char** argv) {
              arithmetic_expected(round == 1 || round == 3 ? 0xbf7fffff : 0xbf800000), "distant_negative_subtract_" + suffix, directory);
         sink(fixture::arithmetic(3, 0x00800000, 1, mode),
              arithmetic_expected(denorm & 1 ? 0x00800001 : 0x00800000), "normal_subnormal_exact_" + suffix, directory);
+        sink(fixture::arithmetic(3, 0x3f800000, 1, mode),
+             arithmetic_expected((denorm & 1) && round == 1 ? 0x3f800001 : 0x3f800000),
+             "saturated_alignment_positive_" + suffix, directory);
+        sink(fixture::arithmetic(3, 0x3f800000, 0x80000001, mode),
+             arithmetic_expected((denorm & 1) && (round == 2 || round == 3) ? 0x3f7fffff : 0x3f800000),
+             "saturated_alignment_subtract_" + suffix, directory);
     }
+}
+TEST(FragmentResourcePacket, RuntimeFailureIsStickyAndSuppressesWholePacket) {
+    const auto directory = dump_directory();
     runtime_reject(fixture::arithmetic(8, 0x7f7fffff, 0x40000000, 0x30), FragmentPacketRuntimeFailure::FiniteOverflow, "finite_overflow", directory);
     runtime_reject(fixture::arithmetic(3, 0x7fc00001, 0x3f800000, 0x30), FragmentPacketRuntimeFailure::NonFinite, "nonfinite_no_fake_canonical_nan", directory);
     auto p = fixture::chain();
@@ -167,7 +210,33 @@ int main(int argc, char** argv) {
     p = fixture::chain(); for (auto& t : p.parameter_cache.parameters) t.p10 = 0x00800000;
     p.invocation.vgprs[0].words.fill(0x3f000000);
     runtime_reject(p, FragmentPacketRuntimeFailure::InterpolationNotExact, "interpolation_underflow_not_normal", directory);
-    p = fixture::chain(); p.invocation.guest_code[3] = 0xbf800000;
+    p = fixture::chain(true); p.buffers[0].words[2] = fixture::bits(0.0f);
+    runtime_reject(p, FragmentPacketRuntimeFailure::SampleCoordinateDomain, "original_explicit_lod_changes_coordinate_obligation", directory);
+    p = fixture::chain(true); p.buffers[0].words[2] = fixture::bits(0.5f);
+    runtime_reject(p, FragmentPacketRuntimeFailure::SampleLodDomain, "fractional_lod_named_not_rounded", directory);
+    p = fixture::chain();
+    const auto sample_pc = p.images[0].pc;
+    p.invocation.guest_code.insert(p.invocation.guest_code.begin() + sample_pc,
+        {0x7e1402ffu, fixture::bits(0.125f) + 1}); // original v10 <- literal adjacent ULP
+    update_image_pc(p);
+    runtime_reject(p, FragmentPacketRuntimeFailure::SampleCoordinateDomain, "adjacent_ulp_not_exact_texel_center", directory);
+    p = fixture::chain();
+    for (auto& parameter : p.parameter_cache.parameters) parameter.p0 = parameter.p10 = parameter.p20 = 0;
+    runtime_reject(p, FragmentPacketRuntimeFailure::InterpolationNotExact, "interpolation_zero_sign_authority_unavailable", directory);
+}
+TEST(FragmentResourcePacket, CompletionAndOwnershipAreCompileTimeObligations) {
+    auto p = fixture::chain();
+    for (uint32_t destination : {17u, 18u, 19u}) {
+        auto bad = p;
+        bad.invocation.guest_code[1] = (bad.invocation.guest_code[1] & ~(127u << 6)) | (destination << 6);
+        std::vector<Rdna2Inst> decoded;
+        rdna2_walk(bad.invocation.guest_code.data(), bad.invocation.guest_code.size(), decoded);
+        ASSERT_GT(decoded.size(), 1u);
+        EXPECT_EQ(decoded[1].fmt, Rdna2Format::SMEM);
+        EXPECT_EQ(decoded[1].dst.value, static_cast<int>(destination));
+        reject(bad, "packet-smem-destination-alignment-invalid", "actual x4 unaligned SGPR destination");
+    }
+    p.invocation.guest_code[3] = 0xbf800000;
     reject(p, "packet-smem-result-read-before-wait", "SMEM original completion required");
     p = fixture::chain(); p.invocation.guest_code[3] = 0xbf850001;
     p.invocation.guest_code.insert(p.invocation.guest_code.begin() + 4, 0xbf8c0000); update_image_pc(p);
@@ -183,8 +252,44 @@ int main(int argc, char** argv) {
     reject(p, "packet-enabled-int64-device-unavailable", "device must actually enable shaderInt64");
     p = fixture::chain(); p.invocation.float_mode = {};
     reject(p, "packet-f32-launch-mode-or-flags-unavailable", "unknown mode not mode0");
+    p = fixture::chain(); p.launch_rsrc1 = {};
+    reject(p, "packet-f32-launch-rsrc1-unavailable", "missing complete original launch word");
+    p = fixture::chain(); p.launch_rsrc1.value ^= 1u << 12;
+    reject(p, "packet-f32-launch-rsrc1-association-mismatch", "mode must join actual raw launch word");
     p = fixture::chain(); p.invocation.guest_code[p.images[0].pc] ^= (0x27u ^ 0x20u) << 18;
     reject(p, "packet-image-derivative-or-effect-unimplemented", "implicit SAMPLE not replaced with LOD0");
-    std::printf("fragment_resource_packet checks=%d failures=%d\n", checks, failures);
-    return failures ? 1 : 0;
+    p = fixture::chain(); p.images[0].sampler[2] = 2u << 26;
+    reject(p, "packet-sampler-domain-unimplemented", "linear mip filter is not nearest");
+    p = fixture::chain(); p.device.rgba32_sfloat_sampled = false;
+    reject(p, "packet-enabled-image-format-device-unavailable", "format witness not inferred from Int64");
+    p = fixture::chain(); p.images[0].mips[0].texels.resize(262145);
+    reject(p, "packet-resource-input-budget", "owned payload budget not convenient image dimension");
+    p = fixture::chain(); p.invocation.guest_code[4] &= ~(255u << 18); // actual P1 VDST=VSRC=v0
+    reject(p, "packet-parameter-p1-alias-mode-unavailable", "P1 alias cannot assume unknown HALF_LDS mode");
+}
+TEST(FragmentResourcePacket, AlignedSmemWriterAndActualReachingP2Destination) {
+    const auto directory = dump_directory();
+    auto p = fixture::chain();
+    p.invocation.guest_code[1] = (p.invocation.guest_code[1] & ~(127u << 6)) | (20u << 6);
+    std::vector<Rdna2Inst> decoded;
+    rdna2_walk(p.invocation.guest_code.data(), p.invocation.guest_code.size(), decoded);
+    for (const auto& in : decoded) {
+        if ((in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2) &&
+            in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 16 && in.src[0].value <= 18)
+            p.invocation.guest_code[in.pc] = (p.invocation.guest_code[in.pc] & ~511u) | uint32_t(in.src[0].value + 4);
+    }
+    sink(p, fixture::expected_chain(p, false), "aligned_smem_s20", directory);
+    p = fixture::chain();
+    // An original V_MOV overwrites the P1 destination before P2. P2 must consume the reaching
+    // VDST, not remember P1 or substitute a host-final interpolant. Sampling remains valid.
+    p.invocation.guest_code.insert(p.invocation.guest_code.begin() + 5, {0x7e1402ffu, fixture::bits(0.125f)});
+    update_image_pc(p);
+    auto wanted = fixture::expected_chain(p, false);
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        const uint32_t i = lane & 1, j = (lane >> 1) & 1;
+        wanted[lane * 36 + 8] = fixture::bits(0.125f + 0.25f * float(j));
+        for (uint32_t c = 0; c < 4; ++c)
+            wanted[lane * 36 + 20 + c] = fixture::bits(float(1 + j + 4 * (i + 2 * j) + c));
+    }
+    sink(p, wanted, "p2_actual_overwritten_destination", directory);
 }
