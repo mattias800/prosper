@@ -377,29 +377,6 @@ void capture_and_pack(const char* fmt, const SysvVaList& ap) {
     snprintf(g_fallback_format, sizeof g_fallback_format, "%s", call.format());
 }
 
-// The guest side: an ordinary C variadic call, placed by System V. What it captures is exactly what
-// h_printf captures.
-TEST_GUEST_ABI void guest_call(const char* fmt, ...) {
-    TEST_GUEST_VA_LIST ap;
-    TEST_GUEST_VA_START(ap, fmt);
-    SysvVaList captured;
-    memcpy(&captured, &ap, sizeof captured);
-    TEST_GUEST_VA_END(ap);
-    capture_and_pack(fmt, captured);
-}
-
-// The same frame, read by the COMPILER's own System V va_arg instead of by sysv_va_arg — the
-// independently produced positive instance that stops arm (1) being checked against itself.
-TEST_GUEST_ABI void guest_call_reference(const char* fmt, ...) {
-    TEST_GUEST_VA_LIST ap;
-    TEST_GUEST_VA_START(ap, fmt);
-    for (unsigned i = 0; i < g_ref_n; ++i) {
-        if (g_cls[i] == VarargClass::Sse) g_ref_d[i] = __builtin_va_arg(ap, double);
-        else                              g_ref_u[i] = __builtin_va_arg(ap, uint64_t);
-    }
-    TEST_GUEST_VA_END(ap);
-}
-
 // Consume a packed Microsoft va_list image with the COMPILER's own Microsoft va_arg. This is what
 // makes the layout claim — "a Microsoft va_list is a flat array of 8-byte slots" — checkable without
 // a Windows host: were it wrong, GCC's own reader would disagree with this file's writer.
