@@ -807,10 +807,17 @@ if(TARGET prosper_core)
   # fixture is committed and synthetic — no game dump, no Il2CppDumper — so this never degrades
   # into a silent skip. The binary doubles as the probe the agreement test drives.
   add_executable(test_il2cpp_symbols tests/host/symbols/test_il2cpp_symbols.cpp)
+  target_include_directories(test_il2cpp_symbols PRIVATE tests)
   target_link_libraries(test_il2cpp_symbols PRIVATE prosper_core)
   add_test(NAME il2cpp_symbol_resolution
            COMMAND test_il2cpp_symbols
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/il2cpp_symtab_fixture.symtab")
+  # Each synthetic boot owns fixed guest mappings, so run the wiring controls in fresh processes.
+  foreach(mode valid oversized absent)
+    add_test(NAME il2cpp_symbol_boot_${mode}
+             COMMAND test_il2cpp_symbols --boot-bounds ${mode})
+    set_tests_properties(il2cpp_symbol_boot_${mode} PROPERTIES TIMEOUT 20)
+  endforeach()
   if(Python3_Interpreter_FOUND)
     # ...and the runtime resolver must answer exactly what tools/il2cpp/resolve.py answers. They
     # share the record set by construction (resolve.py emits the table the runtime reads), but the
