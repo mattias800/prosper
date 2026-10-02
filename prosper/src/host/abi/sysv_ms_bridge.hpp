@@ -96,9 +96,10 @@ size_t emit_legacy_integer_prologue(uint8_t* out);
 // and clear today: the widest HLE macro in the tree is `HLE10`, which is exactly this many.
 inline constexpr unsigned kLegacyForwardedArgs = 10;
 
-// `movabs rax, handler ; jmp rax` — the bare tail-jump, byte-identical to the LINUX import stub
-// (host/image/exec_image_linux.cpp's emit_impl). Emitted on Windows only for a handler compiled in
-// the guest's own convention, where there is nothing to convert.
+// `movabs r11, handler ; jmp r11` — the bare tail-jump, also used by the plain POSIX import stub
+// (host/image/exec_image_linux.cpp's emit_impl). R11 is SysV non-argument scratch; unlike RAX it
+// does not overwrite the variadic vector-register count in AL, or R10's static-chain carrier.
+// Emitted on Windows only for a guest-convention handler, where there is nothing to convert.
 //
 // The cost is the return checkpoint: a tail-jump returns straight to the guest, so a guest-ABI
 // handler that wants the pending-guest-exception poll must call
