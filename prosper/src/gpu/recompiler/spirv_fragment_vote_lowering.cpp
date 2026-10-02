@@ -698,7 +698,7 @@ FragmentVoteLowering lower_fragment_votes(const std::vector<uint32_t>& source,
             // collision. This adds no facts to the proof and never rewrites SOURCE or EFFECTIVE.
             for (const auto& in : instructions) {
                 if (((in.in_function && !no_result(in.op) && in.op != 248 && in.count >= 3) ||
-                     ((in.op >= 41 && in.op <= 52) && in.count >= 3)) &&
+                     ((in.op == 1 || (in.op >= 41 && in.op <= 52)) && in.count >= 3)) &&
                     source[in.at + 2] == result.failed_vote.predicate_id) {
                     result.failed_vote.predicate_opcode = in.op;
                     break;
