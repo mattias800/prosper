@@ -16,6 +16,7 @@
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
 #include "gpu/resources/fold_control_plan.hpp"
 #include "gpu/capture/fold_capture.hpp"
+#include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
@@ -438,6 +439,7 @@ struct ShaderCompileKeyHash {
 struct CachedShader {
     SharedShaderWords spirv;
     FragmentArithmeticObservation fragment_arithmetic;
+    std::shared_ptr<const FragmentCompileCase> fragment_case;
     uint64_t identity = 0;
     mutable std::atomic<uint64_t> last_use{0};
     uint64_t bytes = 0;
@@ -452,13 +454,15 @@ struct CachedShader {
     // ordering is irrelevant to correctness and the stronger one costs nothing measurable here.
     CachedShader() = default;
     CachedShader(CachedShader&& other) noexcept
-        : spirv(std::move(other.spirv)), fragment_arithmetic(other.fragment_arithmetic), identity(other.identity),
+        : spirv(std::move(other.spirv)), fragment_arithmetic(other.fragment_arithmetic),
+          fragment_case(std::move(other.fragment_case)), identity(other.identity),
           last_use(other.last_use.load()),
           bytes(other.bytes), writes_trip_witness(other.writes_trip_witness) {}
     CachedShader& operator=(CachedShader&& other) noexcept {
         if (this != &other) {
             spirv = std::move(other.spirv);
             fragment_arithmetic = other.fragment_arithmetic;
+            fragment_case = std::move(other.fragment_case);
             identity = other.identity;
             last_use.store(other.last_use.load());
             bytes = other.bytes;
@@ -467,13 +471,15 @@ struct CachedShader {
         return *this;
     }
     CachedShader(const CachedShader& other)
-        : spirv(other.spirv), fragment_arithmetic(other.fragment_arithmetic), identity(other.identity),
+        : spirv(other.spirv), fragment_arithmetic(other.fragment_arithmetic),
+          fragment_case(other.fragment_case), identity(other.identity),
           last_use(other.last_use.load(std::memory_order_relaxed)),
           bytes(other.bytes), writes_trip_witness(other.writes_trip_witness) {}
     CachedShader& operator=(const CachedShader& other) {
         if (this != &other) {
             spirv = other.spirv;
             fragment_arithmetic = other.fragment_arithmetic;
+            fragment_case = other.fragment_case;
             identity = other.identity;
             last_use.store(other.last_use.load(std::memory_order_relaxed), std::memory_order_relaxed);
             bytes = other.bytes;

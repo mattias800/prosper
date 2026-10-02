@@ -1172,8 +1172,12 @@ inline std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& i
                     // rejects that join deliberately. Keeping it behind a switch also makes the A/B
                     // have a lever that can be shown to have moved, which a byte-identical module
                     // has already cost this investigation once.
-                    static const bool relax_vcc_scalar_data =
-                        std::getenv("PROSPER_VCC_SCALAR_DATA_MERGE") != nullptr;
+                    const bool relax_vcc_scalar_data = compiler_choice(
+                        CompilerChoice::VccScalarMerge, [] {
+                            static const bool value =
+                                std::getenv("PROSPER_VCC_SCALAR_DATA_MERGE") != nullptr;
+                            return value;
+                        });
                     const ScalarMergeProof proof = relax_vcc_scalar_data
                         ? ScalarMergeProof::MaskDomainOnly : ScalarMergeProof::AnyRead;
                     ScalarMergeBlocker blocker;

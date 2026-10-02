@@ -5,6 +5,7 @@
 // pure. No Vulkan here — the backend is a std::function injected by whoever owns a device (the runtime
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
 #include "gpu/resources/fold_control_plan.hpp"
+#include "build_revision.hpp"
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/compute_program_facts.hpp"
@@ -1495,7 +1496,8 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
 std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const ShaderCompileKey& key,
                                               const ShaderResourceTable* resources,
                                               uint64_t program_address,
-                                              FragmentArithmeticObservation* arithmetic_observation) {
+                                              FragmentArithmeticObservation* arithmetic_observation,
+                                              std::shared_ptr<const FragmentCompileCase>* producer = nullptr) {
     const uint32_t* code = !key.code || key.code->empty() ? nullptr : key.code->data();
     const size_t code_size = key.code ? key.code->size() : 0u;
     if (stage == ShaderProgramStage::Vertex)
@@ -1521,12 +1523,52 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
             code, code_size,
             key.has_system_inputs ? &key.system_inputs : nullptr,
             key.has_pixel_inputs ? &key.pixel_inputs : nullptr);
-        return recompile_fragment(code, code_size, resources,
+        std::shared_ptr<FragmentCompileCase> record;
+        if (producer && fragment_compile_case_recording_enabled()) {
+            record = std::make_shared<FragmentCompileCase>();
+            record->compiler = std::string(prosper::embedded_build_revision()) + ":" +
+                               prosper::embedded_build_source_identity();
+            record->program_address = program_address;
+            record->has_pixel_inputs = key.has_pixel_inputs; record->pixel_inputs = key.pixel_inputs;
+            record->has_system_inputs = key.has_system_inputs; record->system_inputs = key.system_inputs;
+            record->interpolation = interpolation; record->wave32 = key.fragment_wave32;
+            record->float_mode = key.fragment_float_mode;
+            record->pcrel_target = key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX;
+            record->trip = key.trip_bound;
+            try {
+                if (!key.code || key.code->empty() || key.code->size() > kCompileCaseMaxWords)
+                    throw std::runtime_error("raw-code-unavailable-or-budget");
+                record->code = *key.code;
+                own_fragment_compile_case_resources(*record, resources);
+            } catch (const std::exception& e) {
+                record->complete = false; record->reason = e.what();
+                record->resources = {}; record->backing.clear(); record->blobs.clear();
+            }
+        }
+        // The normal compiler still consumes its existing inputs. The case's independent owned
+        // replay must reproduce the whole resulting SOURCE (or refusal) before it is COMPLETE.
+        CompilerChoiceTrace trace;
+        auto compile = [&] { return recompile_fragment(code, code_size, resources,
                                   key.has_system_inputs ? &key.system_inputs : nullptr,
                                   key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX,
                                   &interpolation, key.fragment_wave32,
                                   {RecompileDiagnosticStage::Fragment, program_address},
-                                  key.fragment_float_mode, arithmetic_observation);
+                                  key.fragment_float_mode, arithmetic_observation); };
+        std::vector<uint32_t> result;
+        if (record) {
+            std::vector<std::pair<std::string, std::string>> rejects;
+            { CompilerChoiceScope reads(trace); TerminalRejectCapture rejection;
+              result = compile(); rejects = rejection.take(); }
+            record->expected_reject = rejects.empty() ? std::string{} :
+                rejects.back().first + " " + rejects.back().second;
+            record->choices = std::move(trace);
+            finish_fragment_compile_case(*record, result);
+            // Nested capture keeps the independent baseline out of the cache's producer reasons.
+            // Forward only the records from the ACTUAL producing attempt to the outer cache scope.
+            replay_terminal_reject_reasons(program_address, rejects);
+            *producer = std::move(record);
+        } else result = compile();
+        return result;
     }
     return {};
 }
@@ -1674,10 +1716,12 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
         auto& cache = shader_cache();
         cache.bypasses.fetch_add(1, std::memory_order_relaxed);
         FragmentArithmeticObservation arithmetic_observation;
+        std::shared_ptr<const FragmentCompileCase> producer;
         auto spirv = std::make_shared<const std::vector<uint32_t>>(
-            compile_graphics_shader(stage, key, resources, program_address, &arithmetic_observation));
+            compile_graphics_shader(stage, key, resources, program_address, &arithmetic_observation, &producer));
         if (stage == ShaderProgramStage::Fragment)
             observe_fragment_arithmetic(arithmetic_observation, program_address, !spirv->empty());
+        if (stage == ShaderProgramStage::Fragment) maybe_dump_fragment_compile_case(producer, program_address, *spirv);
         maybe_dump_successful_shader(stage, key, *spirv, program_address, chain_address);
         return spirv;
     }
@@ -1694,6 +1738,8 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
             if (stage == ShaderProgramStage::Fragment)
                 observe_fragment_arithmetic(found->second.fragment_arithmetic,
                                             program_address, !found->second.spirv->empty());
+            if (stage == ShaderProgramStage::Fragment)
+                maybe_dump_fragment_compile_case(found->second.fragment_case, program_address, *found->second.spirv);
             maybe_dump_successful_shader(stage, key, *found->second.spirv, program_address,
                                         chain_address);
             return found->second.spirv;
@@ -1710,6 +1756,8 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
         if (stage == ShaderProgramStage::Fragment)
             observe_fragment_arithmetic(double_check->second.fragment_arithmetic,
                                         program_address, !double_check->second.spirv->empty());
+        if (stage == ShaderProgramStage::Fragment)
+            maybe_dump_fragment_compile_case(double_check->second.fragment_case, program_address, *double_check->second.spirv);
         maybe_dump_successful_shader(stage, key, *double_check->second.spirv, program_address,
                                     chain_address);
         return double_check->second.spirv;
@@ -1717,10 +1765,12 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
 
     const auto start = std::chrono::steady_clock::now();
     FragmentArithmeticObservation arithmetic_observation;
+    std::shared_ptr<const FragmentCompileCase> producer;
     auto spirv = std::make_shared<const std::vector<uint32_t>>(
-        compile_graphics_shader(stage, key, resources, program_address, &arithmetic_observation));
+        compile_graphics_shader(stage, key, resources, program_address, &arithmetic_observation, &producer));
     if (stage == ShaderProgramStage::Fragment)
         observe_fragment_arithmetic(arithmetic_observation, program_address, !spirv->empty());
+    if (stage == ShaderProgramStage::Fragment) maybe_dump_fragment_compile_case(producer, program_address, *spirv);
     maybe_dump_successful_shader(stage, key, *spirv, program_address, chain_address);
     const auto end = std::chrono::steady_clock::now();
     ++cache.stats.misses;
@@ -1734,7 +1784,8 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
 
     scratch.prepare_for_cache();
     constexpr size_t max_entries = 4096;
-    const uint64_t bytes = shader_cache_entry_bytes(key, *spirv);
+    const uint64_t bytes = shader_cache_entry_bytes(key, *spirv) +
+        (producer ? fragment_compile_case_retained_bytes(*producer) : 0u);
     const uint64_t limit = shader_cache_limit_bytes();
     while (!cache.entries.empty() &&
            (cache.entries.size() >= max_entries || cache.stats.bytes + bytes > limit)) {
@@ -1751,6 +1802,7 @@ SharedShaderWords cache_compiled_graphics_shader(ShaderProgramStage stage, Shade
         CachedShader value;
         value.spirv = spirv;
         value.fragment_arithmetic = arithmetic_observation;
+        value.fragment_case = std::move(producer);
         value.identity = cache.next_identity++;
         value.last_use.store(cache.use_counter.fetch_add(1, std::memory_order_relaxed),
                              std::memory_order_relaxed);

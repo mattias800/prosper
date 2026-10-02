@@ -666,6 +666,12 @@ if(Python3_Interpreter_FOUND)
                --module "${CMAKE_SOURCE_DIR}/cmake/ProsperBuildRevision.cmake"
                --scratch-root "${CMAKE_CURRENT_BINARY_DIR}/build-revision-regression"
                --generator "${CMAKE_GENERATOR}")
+    add_test(NAME compiler_source_identity
+             COMMAND "${Python3_EXECUTABLE}"
+               "${CMAKE_SOURCE_DIR}/tools/revision/test_source_identity.py"
+               --cmake "${CMAKE_COMMAND}"
+               --module "${CMAKE_SOURCE_DIR}/cmake/ProsperBuildRevision.cmake"
+               --generator "${CMAKE_GENERATOR}")
   endif()
 endif()
 # Path to the (gitignored) local game dump; override with -DGAME_DUMP=...
@@ -2385,6 +2391,19 @@ if(TARGET prosper_core)
   add_test(NAME cached_shader_moves COMMAND test_cached_shader_moves)
 
   add_executable(test_shader_recompile_cache tests/gpu/execute/test_shader_recompile_cache.cpp)
+  add_executable(fragment_compile_replay tools/fragment_compile_replay/main.cpp)
+  target_link_libraries(fragment_compile_replay PRIVATE prosper_core)
+  add_executable(test_fragment_compile_case tests/gpu/execute/test_fragment_compile_case.cpp)
+  target_include_directories(test_fragment_compile_case PRIVATE tests)
+  target_link_libraries(test_fragment_compile_case PRIVATE prosper_core)
+  add_test(NAME fragment_compile_case COMMAND test_fragment_compile_case)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME fragment_compile_read_policy COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_SOURCE_DIR}/tools/fragment_compile_replay/reader_policy.py" "${CMAKE_SOURCE_DIR}/..")
+    add_test(NAME fragment_compile_case_cli COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_SOURCE_DIR}/tools/fragment_compile_replay/test_cli.py"
+      "$<TARGET_FILE:test_fragment_compile_case>" "$<TARGET_FILE:fragment_compile_replay>")
+  endif()
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_shader_recompile_cache PRIVATE tests)
   target_link_libraries(test_shader_recompile_cache PRIVATE prosper_core)
