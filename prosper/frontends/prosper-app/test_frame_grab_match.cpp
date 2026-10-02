@@ -75,6 +75,39 @@ static bool gpu_close_wired(const std::string& source) {
            second != std::string::npos;
 }
 
+static bool loop_expiry_wired(const std::string& source, size_t loop) {
+    const size_t open = source.find('{', loop);
+    const size_t close = matching_brace(source, open);
+    if (close == std::string::npos) return false;
+    size_t statement_begin = open + 1;
+    char quote = 0;
+    bool escaped = false;
+    // Bound the search by the actual loop, not a character prefix. Nested blocks cannot make a
+    // conditional expiry call unconditional; quoted braces/semicolons are not statement bounds.
+    for (size_t i = statement_begin; i < close; ++i) {
+        const char c = source[i];
+        if (quote) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == quote) quote = 0;
+        } else if (c == '"' || c == '\'') {
+            quote = c;
+        } else if (c == '{') {
+            i = matching_brace(source, i);
+            if (i == std::string::npos || i >= close) return false;
+            statement_begin = i + 1;
+        } else if (c == ';') {
+            const std::string_view statement(source.data() + statement_begin,
+                                              i - statement_begin + 1);
+            const size_t begin = statement.find_first_not_of(" \t\r\n");
+            if (begin != std::string::npos &&
+                statement.substr(begin) == "expirePendingGrabProducer();") return true;
+            statement_begin = i + 1;
+        }
+    }
+    return false;
+}
+
 static bool fallback_and_expiry_wired(const std::string& source) {
     const size_t begin = source.find("} else if (gpu::present_frame_seq() != lastFrameSeq)");
     const size_t end = source.find("} else {\n        bool newFrame", begin);
@@ -85,8 +118,6 @@ static bool fallback_and_expiry_wired(const std::string& source) {
     const std::string_view fallback(source.data() + begin, end - begin);
     const size_t convert = fallback.find("interactive_grab_on_cpu_fallback(");
     const size_t bmp = fallback.find("flushGrabScreenshot(cf.rgba->data()");
-    const std::string_view loop_entry(source.data() + loop,
-                                      std::min<size_t>(source.size() - loop, 250));
     const size_t expiry_open = source.find('{', expiry);
     const size_t expiry_close = matching_brace(source, expiry_open);
     if (expiry_close == std::string::npos) return false;
@@ -96,7 +127,7 @@ static bool fallback_and_expiry_wired(const std::string& source) {
     const size_t expire_call = expiry_body.find("interactive_grab_expire_producer_wait(");
     const size_t early_return = expiry_body.find("return;");
     return convert != std::string::npos && bmp != std::string::npos && convert < bmp &&
-           loop_entry.find("expirePendingGrabProducer();") != std::string::npos &&
+           loop_expiry_wired(source, loop) &&
            owned_poll != std::string::npos && expire_call > owned_poll &&
            expire_call != std::string::npos &&
            (early_return == std::string::npos || early_return > expire_call);
@@ -149,6 +180,43 @@ int main() {
                                  "omitted_cpu_fallback");
     CHECK(!fallback_and_expiry_wired(omitted_fallback),
           "#3828: removing the live CPU fallback transition makes the wiring gate fail");
+    const size_t loop = app_source.find("while (running && !prosper_stop_requested()) {");
+    const size_t loop_expiry = app_source.find("expirePendingGrabProducer();", loop);
+    CHECK(loop != std::string::npos && loop_expiry != std::string::npos,
+          "#3828: the expiry mutation controls locate the actual loop call");
+    if (loop != std::string::npos && loop_expiry != std::string::npos) {
+        const std::string call = "expirePendingGrabProducer();";
+        std::string omitted_expiry = app_source;
+        omitted_expiry.erase(loop_expiry, call.size());
+        CHECK(!fallback_and_expiry_wired(omitted_expiry),
+              "#3828: removing the loop expiry call fails the gate");
+        for (const std::string& gated_call : {
+                 "if (pendingGrabReserved) { " + call + " }",
+                 "if (pendingGrabReserved) " + call}) {
+            std::string gated_expiry = app_source;
+            gated_expiry.replace(loop_expiry, call.size(), gated_call);
+            CHECK(!fallback_and_expiry_wired(gated_expiry),
+                  "#3828: conditional loop expiry polling fails the gate");
+        }
+        std::string outside_loop = omitted_expiry;
+        const size_t loop_close = matching_brace(outside_loop, outside_loop.find('{', loop));
+        CHECK(loop_close != std::string::npos, "#3828: the loop boundary is available");
+        if (loop_close != std::string::npos) outside_loop.insert(loop_close + 1, "\n" + call);
+        CHECK(!fallback_and_expiry_wired(outside_loop),
+              "#3828: an expiry call after the loop cannot replace per-iteration polling");
+        std::string quoted_expiry = omitted_expiry;
+        quoted_expiry.insert(quoted_expiry.find('{', loop) + 1,
+            "\n        const char* unrelatedText = \"; expirePendingGrabProducer();\";\n");
+        CHECK(!fallback_and_expiry_wired(quoted_expiry),
+              "#3828: a quoted expiry call cannot replace per-iteration polling");
+        std::string longer_prelude = app_source;
+        longer_prelude.insert(longer_prelude.find('{', loop) + 1,
+            "\n        if (unrelatedPrelude) {\n" + std::string(512, ' ') +
+            "observeUnrelatedState();\n        }\n"
+            "        const char* unrelatedText = \"{ ; expirePendingGrabProducer(); }\";\n");
+        CHECK(fallback_and_expiry_wired(longer_prelude),
+              "#3828: harmless loop prelude growth preserves unconditional expiry polling");
+    }
     std::string bmp_gated_expiry = app_source;
     if (const size_t expiry = bmp_gated_expiry.find("auto expirePendingGrabProducer = [&] {");
             expiry != std::string::npos) {
