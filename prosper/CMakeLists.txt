@@ -975,7 +975,9 @@ if(TARGET prosper_core)
   # the headroom cannot be checked without reddening the job first -- the #3208 defect (a threshold
   # whose margin nobody has measured recently) with the measurement one flag away.
   #
-  # The CI jobs re-run this label with `-V` after the suite, so every green log carries the figures.
+  # The CI jobs exclude this label from the parallel suite (`-LE timing-margin -j4`, so a margin is
+  # not measured beside other load) and run it serially with `-V` instead, so every log carries the
+  # figures.
   # `kernel_nanosleep` is deliberately NOT labelled: its wall-clock bounds are 500 ms order-of-
   # magnitude guards against a ~292-year sleep and it prints no measured value, so a verbose re-run
   # would report nothing. Add the label when a test both DEPENDS ON and PRINTS a margin.

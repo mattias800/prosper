@@ -206,6 +206,7 @@ jobs:
           fi
 
       - name: Build
+        id: build
         run: cmake --build prosper/build-ci
 
       # The runner has no GPU, so this is Mesa's lavapipe software rasteriser. Four tests were once
@@ -273,6 +274,9 @@ jobs:
       # `-L` together with `--no-tests=error` is the self-checking half: if the label is renamed or
       # dropped, this step fails loudly instead of silently reporting nothing for ever after.
       - name: Report the measured wait margins
+        # Runs even when the parallel suite failed, so a timing regression is not hidden behind
+        # an unrelated red test -- but only on a binary that actually built.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: ctest --test-dir prosper/build-ci -L timing-margin -V --no-tests=error
 
       # #1704: until this step existed, no Vulkan validation layer ran anywhere in the project.
@@ -303,7 +307,7 @@ jobs:
         if: always()
         run: ccache -s
 
-      # Written only from main: per-PR writes evicted the shared 10 GB account cache and
+      # Written only from main: per-PR writes evicted the shared 10 GB repository cache and
       # PRs restore main's warm objects through restore-keys anyway.
       - name: Save ccache
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -702,7 +706,7 @@ jobs:
         if: always()
         run: ccache -s
 
-      # Written only from main: per-PR writes evicted the shared 10 GB account cache and
+      # Written only from main: per-PR writes evicted the shared 10 GB repository cache and
       # PRs restore main's warm objects through restore-keys anyway.
       - name: Save ccache
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -841,6 +845,7 @@ jobs:
         run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON
 
       - name: Build
+        id: build
         shell: msys2 {0}
         run: cmake --build prosper/build-ci
 
@@ -851,6 +856,9 @@ jobs:
 
       # Same measured-margin report as the Linux job -- see the long note there (#3067/#3208).
       - name: Report the measured wait margins
+        # Runs even when the parallel suite failed, so a timing regression is not hidden behind
+        # an unrelated red test -- but only on a binary that actually built.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: msys2 {0}
         run: ctest --test-dir prosper/build-ci -L timing-margin -V --no-tests=error
 
@@ -859,7 +867,7 @@ jobs:
         shell: msys2 {0}
         run: ccache -s
 
-      # Written only from main: per-PR writes evicted the shared 10 GB account cache and
+      # Written only from main: per-PR writes evicted the shared 10 GB repository cache and
       # PRs restore main's warm objects through restore-keys anyway.
       - name: Save ccache
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -1008,7 +1016,7 @@ jobs:
         shell: msys2 {0}
         run: ccache -s
 
-      # Written only from main: per-PR writes evicted the shared 10 GB account cache and
+      # Written only from main: per-PR writes evicted the shared 10 GB repository cache and
       # PRs restore main's warm objects through restore-keys anyway.
       - name: Save ccache
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -1060,6 +1068,7 @@ jobs:
         run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON
 
       - name: Build
+        id: build
         run: cmake --build prosper/build-ci
 
       - name: Test
@@ -1071,13 +1080,16 @@ jobs:
 
       # Same measured-margin report as the Linux job -- see the long note there (#3067/#3208).
       - name: Report the measured wait margins
+        # Runs even when the parallel suite failed, so a timing regression is not hidden behind
+        # an unrelated red test -- but only on a binary that actually built.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: ctest --test-dir prosper/build-ci -L timing-margin -V --no-tests=error
 
       - name: ccache statistics
         if: always()
         run: ccache -s
 
-      # Written only from main: per-PR writes evicted the shared 10 GB account cache and
+      # Written only from main: per-PR writes evicted the shared 10 GB repository cache and
       # PRs restore main's warm objects through restore-keys anyway.
       - name: Save ccache
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -1134,7 +1146,7 @@ jobs:
         if: always()
         run: ccache -s
 
-      # Written only from main: per-PR writes evicted the shared 10 GB account cache and
+      # Written only from main: per-PR writes evicted the shared 10 GB repository cache and
       # PRs restore main's warm objects through restore-keys anyway.
       - name: Save ccache
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
