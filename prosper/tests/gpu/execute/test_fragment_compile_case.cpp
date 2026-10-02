@@ -588,13 +588,14 @@ static void nested_marker_tests() {
             code.data(), code.size(), &table, nullptr, nullptr, &identity,
             false, 0u, false, {}, {}, explicit_transport);
         CHECK(warm_source == positive.source && identity != 0u);
+        const uint64_t valid_identity = identity;
         ShaderResourceTable empty;
         CHECK(recompile_graphics_shader_cached(ShaderProgramStage::Fragment,
             code.data(), code.size(), &empty, nullptr, nullptr, &identity,
-            false, 0u, false, {}, {}, explicit_transport).empty() && identity == 0u);
+            false, 0u, false, {}, {}, explicit_transport).empty() && identity != 0u && identity != valid_identity);
         CHECK(recompile_graphics_shader_cached(ShaderProgramStage::Fragment,
             code.data(), code.size(), &table, nullptr, nullptr, &identity,
-            false, 0u, false, {}, {}, explicit_transport) == warm_source && identity != 0u);
+            false, 0u, false, {}, {}, explicit_transport) == warm_source && identity == valid_identity);
         auto opaque = table; opaque.owned_host_data.clear();
         const auto opaque_positive = roundtrip(opaque, true);
         CHECK(opaque_positive.source == positive.source && opaque_positive.blobs.size() == 2u);
