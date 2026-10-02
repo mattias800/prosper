@@ -3189,17 +3189,38 @@ static timespec abs_deadline_us(uint64_t usec) {
 // maps anything else non-zero to Dinkumware `_Thrd_error`, which throws — so a plain 60 turned an
 // ordinary lock timeout into an uncaught std::system_error. Same contract as the mutex lock/trylock
 // aliases above (#1945).
+//
+// A TIMED relock of an ERRORCHECK mutex the caller already holds waits out the deadline and then
+// reports ETIMEDOUT (#4133). That is FreeBSD libthr's answer -- mutex_self_lock() in
+// lib/libthr/thread/thr_mutex.c, the library libkernel's pthreads derive from: with an abstime it
+// sleeps to the deadline and returns ETIMEDOUT, and only the UNTIMED lock answers EDEADLK. This
+// body used to answer EDEADLK at once on Linux (glibc's) and on Windows (the ownership registry,
+// which copied glibc in #793), while Darwin's posix_shim loop happened to match libthr. The old
+// answer was inherited, never established for the console (the trail is in #4133), and it is not a
+// harmless difference: Sony's _Mtx_timedlock maps encoded ETIMEDOUT to _Thrd_timedout and anything
+// else to _Thrd_error, which Dinkumware THROWS -- so a guest that merely stalls on the console
+// would die here. CONFIDENCE: MED -- libthr is the published ancestor, not a title trace.
+static uint32_t timed_self_relock(uint64_t steady_deadline_ns) {
+    prosper::host::sleep_until_steady_ns(steady_deadline_ns);
+    return static_cast<uint32_t>(hle::FreeBsdErrno::ETimedOut);
+}
 uint64_t guest_mutex_timedlock_slot(uint64_t slot_addr, uint64_t timeout_us) {
     HostTcbScope host_tcb;                      // #3623: ownership is resolved through %fs
     auto* m = ensure_mutex(slot_addr);
     if (!m) return static_cast<uint32_t>(hle::FreeBsdErrno::EInval);
-    if (guest_mutex_self_deadlock(m)) return static_cast<uint32_t>(hle::FreeBsdErrno::EDeadlk);
     // Saturating for the same reason k_sem_timedwait's is (#3022's rule for the whole family):
     // `timeout_us * 1000` wraps for a guest-supplied microsecond count above ~1.8e16.
-    hle::WaitCensusScope census(hle::WaitKind::MutexTimedlock,
-                                prosper::host::timeout_ns_from_us(timeout_us));
+    const uint64_t timeout_ns = prosper::host::timeout_ns_from_us(timeout_us);
+    hle::WaitCensusScope census(hle::WaitKind::MutexTimedlock, timeout_ns);
+    const uint64_t now_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const uint64_t steady_deadline_ns = prosper::host::deadline_ns_from(now_ns, timeout_ns);
+    // Windows: winpthreads cannot report the relock itself, so the registry answers first.
+    if (guest_mutex_self_deadlock(m)) return timed_self_relock(steady_deadline_ns);
     timespec dl = abs_deadline_us(timeout_us);
     int rc = pthread_mutex_timedlock(m, &dl);
+    // glibc reports an ERRORCHECK self-relock as EDEADLK immediately; libthr waits it out.
+    if (rc == EDEADLK) return timed_self_relock(steady_deadline_ns);
     if (rc == 0) guest_mutex_acquired(m);
     return fbsd_errno(rc);   // the table maps host ETIMEDOUT -> FreeBSD 60
 }

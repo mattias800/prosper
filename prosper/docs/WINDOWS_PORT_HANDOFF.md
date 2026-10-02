@@ -400,3 +400,13 @@ that thread waits on becomes the focus, so matching signals from other threads a
   anything untracked preceded the reservation.
 - Note that #2117 narrowed the allowance during review: its PR body still describes the withdrawn first
   cut, which accepted any committed page.
+
+## Ruled out
+
+- **A positive `fprintf` character count proves a Windows diagnostic write succeeded.** Falsified
+  by the native large-seek fixture on 2026-10-02 (MinGW GCC 16.1/UCRT): redirected to a read-only
+  regular-file descriptor, `fprintf` returned 19 while setting `errno=EBADF` (9). The independent
+  sink oracle is the native write refusal, not the formatter's return convention. With only the
+  HLE seek's errno restoration removed, the registered test fails its EINVAL assertion (0/1, exit 1);
+  restoring identical source passes the seek/file/sync subset (3/3, exit 0). This is a diagnostic
+  control and guest-error result, not a game or graphics observation (#4137, #4147).
