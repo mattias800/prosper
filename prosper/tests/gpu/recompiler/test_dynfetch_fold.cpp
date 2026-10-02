@@ -796,6 +796,27 @@ int main() {
     const auto copy_skipped_uses = split_uses(copy_skipped_code, std::size(copy_skipped_code));
     CHECK(find_split(copy_skipped_uses, 9u) == copy_skipped_uses.end(),
           "a branch that may skip a descriptor-word copy cannot publish the descriptor");
+    // Only MIMG operations that WRITE memory (image_store and the integer atomics) can rewrite a
+    // descriptor's backing. A sample or gather executed before the consumer cannot, and must not
+    // revoke a split T#'s proof (every sample flavour other than image_load/image_sample used to).
+    const uint32_t split_prior_sample[] = {
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        0xF11C0108u, 0x00070103u, // an image_sample variant (opcode 0x47) that only reads
+        0xF0200108u, 0x00020009u, // image_store v0, v[9:10], s[8:15] at pc 6
+        0xBF810000u,
+    };
+    const auto prior_sample_uses = split_uses(split_prior_sample, std::size(split_prior_sample));
+    CHECK(find_split(prior_sample_uses, 6u) != prior_sample_uses.end(),
+          "a read-only MIMG sample before the consumer preserves a split T#'s proof");
+    const uint32_t split_prior_imgstore[] = {
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        0xF0200108u, 0x00020009u, // image_store at pc 4: may alias the descriptor backing
+        0xF0200108u, 0x00020009u, // image_store at pc 6 through the same T#
+        0xBF810000u,
+    };
+    const auto prior_imgstore_uses = split_uses(split_prior_imgstore, std::size(split_prior_imgstore));
+    CHECK(find_split(prior_imgstore_uses, 6u) == prior_imgstore_uses.end(),
+          "an image store before the consumer still revokes a split T#'s proof");
     struct CodeRewriteReader final : FoldReader {
         uint32_t* code;
         bool rewrote = false;
