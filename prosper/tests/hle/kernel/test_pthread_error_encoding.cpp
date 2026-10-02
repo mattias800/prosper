@@ -76,6 +76,7 @@
 // thread, which is not an errno at all, and over-applying the encoding would corrupt it.
 
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/sce_errno.hpp"
 #include <atomic>
@@ -90,8 +91,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -270,7 +270,7 @@ const char* const kFallibleButNullSucceeds[] = {
 
 }  // namespace
 
-int main() {
+TEST(PthreadErrorEncoding, Contract) {
     printf("== test_pthread_error_encoding ==\n");
     register_builtin_hle();
 
@@ -759,5 +759,5 @@ int main() {
 
     if (fails) printf("== FAIL (%d) ==\n", fails);
     else       printf("== PASS ==\n");
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

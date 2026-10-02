@@ -17,6 +17,7 @@
 // `b + n` (already past the end) — an out-of-bounds write onto the signal stack. Those arms put
 // the buffer against a PROT_NONE page so an overflowing append faults the test.
 #include "host/platform/raw_syscall.hpp"
+#include <gtest/gtest.h>
 
 #include <cerrno>
 #include <cstdint>
@@ -30,9 +31,7 @@
 #include "support/death_test.hpp"
 
 static int failures = 0;
-#define CHECK(cond, ...) do { if (!(cond)) { failures++; \
-    fprintf(stderr, "FAIL %s:%d: %s\n  ", __FILE__, __LINE__, #cond); \
-    fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
+#define CHECK(cond, ...) EXPECT_TRUE(cond) << (...)
 
 // --- raw_fmt_len: pure arithmetic, so it is checked on every host ---------------------------
 // The clamp contract: snprintf's return `n` against a destination of `cap` bytes yields the
@@ -56,11 +55,12 @@ static void check_fmt_len() {
 }
 
 #if !defined(__linux__) || !defined(__x86_64__)
-int main() {
+TEST(RawSyscall, Contract) {
     check_fmt_len();
-    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
+    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); FAIL() << "legacy early exit"; }
     printf("raw_syscall: raw_fmt_len checked; syscall paths skipped (Linux x86-64 only)\n");
-    return 0;
+    return;
+    EXPECT_EQ(failures, 0);
 }
 #else
 
@@ -82,8 +82,8 @@ static const size_t kPage = 4096;
 static char* guard_backed(size_t cap, void** region) {
     char* r = (char*)mmap(nullptr, 2 * kPage, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (r == MAP_FAILED) return nullptr;
-    if (mprotect(r + kPage, kPage, PROT_NONE) != 0) { munmap(r, 2 * kPage); return nullptr; }
+    if (r == MAP_FAILED) return;
+    if (mprotect(r + kPage, kPage, PROT_NONE) != 0) { munmap(r, 2 * kPage); return; }
     *region = r;
     return r + kPage - cap;
 }
@@ -105,7 +105,7 @@ __attribute__((noinline)) static int chain_unclamped(char* sb, size_t cap) {
     for (int i = 0; i < kFrames; i++)
         sn += snprintf(sb + sn, cap - (size_t)sn, " %s+0x%llx", kModName, kOff);
     sn += snprintf(sb + sn, cap - (size_t)sn, "\n");
-    return sn;
+    return;
 }
 
 // The same chain with the fix: every cursor advance goes through raw_fmt_advance.
@@ -115,7 +115,7 @@ __attribute__((noinline)) static int chain_clamped(char* sb, size_t cap) {
         sn = prosper::raw_fmt_advance(
             sn, snprintf(sb + sn, cap - (size_t)sn, " %s+0x%llx", kModName, kOff), cap);
     sn = prosper::raw_fmt_advance(sn, snprintf(sb + sn, cap - (size_t)sn, "\n"), cap);
-    return sn;
+    return;
 }
 
 // Run `fn` in a child and report how it died. Returns the terminating signal, 0 for a clean
@@ -148,7 +148,7 @@ template <typename F>
 static Captured capture_stderr(F body) {
     Captured out{};
     int fds[2];
-    if (pipe(fds) != 0) { failures++; fprintf(stderr, "FAIL pipe: %s\n", strerror(errno)); return out; }
+    if (pipe(fds) != 0) { failures++; fprintf(stderr, "FAIL pipe: %s\n", strerror(errno)); return; }
     const int saved = dup(2);
     dup2(fds[1], 2);
     body();
@@ -161,7 +161,7 @@ static Captured capture_stderr(F body) {
            (got = read(fds[0], out.buf + out.n, sizeof out.buf - 1 - out.n)) > 0)
         out.n += (size_t)got;
     close(fds[0]);
-    return out;
+    return;
 }
 
 int main() {
@@ -398,8 +398,5 @@ int main() {
     CHECK(prosper::raw_fmt_advance(-5, 3, 64) == 3, "a negative cursor must be treated as 0");
     CHECK(prosper::raw_fmt_advance(64, 5, 64) == 64, "an already-saturated cursor must not move");
 
-    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    printf("raw_syscall: all checks passed\n");
-    return 0;
 }
 #endif

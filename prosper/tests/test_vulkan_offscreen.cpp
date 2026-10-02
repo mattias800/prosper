@@ -6,14 +6,13 @@
 // window, no eyeballing. It intentionally uses vkCmdClearColorImage (no pipeline/shaders yet) so it
 // stays a pure environment/harness smoke test.
 #include <vulkan/vulkan.h>
+#include <gtest/gtest.h>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 #define VKCHECK(e, m) CHECK((e) == VK_SUCCESS, m)
 
 static uint32_t crc32(const uint8_t* p, size_t n) {
@@ -23,7 +22,7 @@ static uint32_t crc32(const uint8_t* p, size_t n) {
     return ~c;
 }
 
-int main() {
+TEST(VulkanOffscreen, Contract) {
     printf("== test_vulkan_offscreen ==\n");
     const uint32_t W = 64, H = 64;
 
@@ -32,11 +31,11 @@ int main() {
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
     VkInstance inst = VK_NULL_HANDLE;
     VKCHECK(vkCreateInstance(&ici, nullptr, &inst), "vkCreateInstance");
-    if (!inst) { printf("== FAIL: no instance ==\n"); return 1; }
+    if (!inst) { printf("== FAIL: no instance ==\n"); FAIL() << "legacy early exit"; }
 
     uint32_t ndev = 0; vkEnumeratePhysicalDevices(inst, &ndev, nullptr);
     CHECK(ndev > 0, "at least one physical device");
-    if (!ndev) { printf("== FAIL: no device ==\n"); return 1; }
+    if (!ndev) { printf("== FAIL: no device ==\n"); FAIL() << "legacy early exit"; }
     std::vector<VkPhysicalDevice> devs(ndev);
     vkEnumeratePhysicalDevices(inst, &ndev, devs.data());
     VkPhysicalDevice phys = devs[0];
@@ -51,7 +50,7 @@ int main() {
     uint32_t qfi = UINT32_MAX;
     for (uint32_t i = 0; i < nqf; i++) if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { qfi = i; break; }
     CHECK(qfi != UINT32_MAX, "found a graphics queue family");
-    if (qfi == UINT32_MAX) { printf("== FAIL ==\n"); return 1; }
+    if (qfi == UINT32_MAX) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -60,7 +59,7 @@ int main() {
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
     VkDevice dev = VK_NULL_HANDLE;
     VKCHECK(vkCreateDevice(phys, &dci, nullptr, &dev), "vkCreateDevice");
-    if (!dev) { printf("== FAIL ==\n"); return 1; }
+    if (!dev) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
     VkQueue queue; vkGetDeviceQueue(dev, qfi, 0, &queue);
 
     VkPhysicalDeviceMemoryProperties memp; vkGetPhysicalDeviceMemoryProperties(phys, &memp);
@@ -149,7 +148,4 @@ int main() {
     vkDestroyImage(dev, img, nullptr); vkFreeMemory(dev, imem, nullptr);
     vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr);
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

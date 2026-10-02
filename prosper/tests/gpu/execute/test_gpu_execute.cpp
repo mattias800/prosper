@@ -3,6 +3,7 @@
 // a caller-supplied Vulkan render -> present_write_frame -> present_readback. Proves the executor entry
 // point that agc_driver_submit_dcb will call, and the scanout round-trip, end to end on llvmpipe.
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "diagnostics/perf/perf_ledger.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/present/videoout_present.hpp"
@@ -49,8 +50,7 @@ using namespace prosper::gpu;
 namespace P = prosper::agc::Pm4;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Fullscreen-triangle VS + solid-green PS (llvm-mc gfx1030), 256-aligned so their host addresses round-trip
 // through the RDNA2 (lo<<8)|((hi&0xff)<<40) SHADER_PGM encoding. (Same blobs as test_gpustate_render.)
@@ -111,7 +111,7 @@ static void make_zero_mip_tsharp(uint32_t t[8], uint64_t base,
     t[3] = (9u << 28) | 0xfacu;               // 2D, linear, identity component selection
 }
 
-int main() {
+TEST(GpuExecute, Contract) {
     printf("== test_gpu_execute ==\n");
     prosper::register_agc_hle();
     const uint32_t W = 64, H = 64;
@@ -274,7 +274,7 @@ int main() {
     };
     std::vector<uint8_t> px = execute_gpustate(st, backend);
     CHECK(px.size() == (size_t)W * H * 4, "execute_gpustate rendered a frame from the GpuState");
-    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: executor produced no frame ==\n"); return 1; }
+    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: executor produced no frame ==\n"); FAIL() << "legacy early exit"; }
 
     auto isGreen = [&](uint32_t x, uint32_t y){ const uint8_t* p = &px[((size_t)y*W+x)*4]; return p[1] > 0x80 && p[0] < 0x40 && p[2] < 0x40; };
     uint32_t green = 0, total = 0;
@@ -861,13 +861,13 @@ int main() {
         const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
         const auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
         CHECK(map && unmap, "tracked guest mapping APIs serve DS invalidation fixture");
-        if (!map || !unmap) return 1;
+        if (!map || !unmap) FAIL() << "legacy early exit";
         uint64_t mapped_base = 0;
         constexpr uint64_t mapped_bytes = 0x400000;
         CHECK(map(reinterpret_cast<uint64_t>(&mapped_base), mapped_bytes, 2, 0,
                   reinterpret_cast<uint64_t>("gpu-execute-ds"), 0) == 0 && mapped_base,
               "DS invalidation fixture has tracked disjoint guest ranges");
-        if (!mapped_base) return 1;
+        if (!mapped_base) FAIL() << "legacy early exit";
         struct MappingGuard {
             prosper::HleFn unmap;
             uint64_t base, bytes;
@@ -1492,7 +1492,7 @@ int main() {
                     const auto& dma = indirect_capture.dma_copies[0];
                     const auto& blob = indirect_capture.blobs[dma.destination_blob_index];
                     if (dma.destination_blob_offset + sizeof(consumed_args) > blob.bytes.size())
-                        return false;
+                        return;
                     return std::all_of(
                         blob.bytes.begin() + static_cast<ptrdiff_t>(dma.destination_blob_offset),
                         blob.bytes.begin() + static_cast<ptrdiff_t>(
@@ -2699,7 +2699,5 @@ int main() {
         std::filesystem::remove(capture_path, filesystem_error);
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

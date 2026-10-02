@@ -3,6 +3,7 @@
 // block at the wrong distance below the thread pointer and every initial-exec %fs:-N access resolves
 // off. Drives guest_tls_set_templates and reads back the per-module offsets. Linux-only.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "loader/tls_layout.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -11,13 +12,11 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
 
-int main() {
+TEST(GuestTlsAlign, Contract) {
     printf("== test_guest_tls_align ==\n");
 #if defined(__linux__)
     unsetenv("PROSPER_NO_GUEST_FS");
@@ -68,7 +67,4 @@ int main() {
     guest_tls_set_templates(descs0.data(), descs0.size());
     CHECK(guest_tls_module_below(1) == 0x10, "zero p_align falls back to 16-byte rounding");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

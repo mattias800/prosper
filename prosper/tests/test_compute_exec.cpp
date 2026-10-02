@@ -5,18 +5,17 @@
 // compute shader (b[i] = a[i]*2 + 1); once the RDNA2->SPIR-V recompiler lands, its emitted SPIR-V
 // swaps in here and the same assertions verify the recompile is numerically correct.
 #include <vulkan/vulkan.h>
+#include <gtest/gtest.h>
 #include "fixtures/spirv_compute.h"
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
 #include <vector>
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 #define VKCHECK(e, m) CHECK((e) == VK_SUCCESS, m)
 
-int main() {
+TEST(ComputeExec, Contract) {
     printf("== test_compute_exec ==\n");
     const uint32_t N = 256;   // 4 groups of local_size_x=64
 
@@ -25,10 +24,10 @@ int main() {
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
     VkInstance inst = VK_NULL_HANDLE;
     VKCHECK(vkCreateInstance(&ici, nullptr, &inst), "vkCreateInstance");
-    if (!inst) { printf("== FAIL: no instance ==\n"); return 1; }
+    if (!inst) { printf("== FAIL: no instance ==\n"); FAIL() << "legacy early exit"; }
 
     uint32_t ndev = 0; vkEnumeratePhysicalDevices(inst, &ndev, nullptr);
-    if (!ndev) { printf("== FAIL: no device ==\n"); return 1; }
+    if (!ndev) { printf("== FAIL: no device ==\n"); FAIL() << "legacy early exit"; }
     std::vector<VkPhysicalDevice> devs(ndev);
     vkEnumeratePhysicalDevices(inst, &ndev, devs.data());
     VkPhysicalDevice phys = devs[0];
@@ -38,7 +37,7 @@ int main() {
     vkGetPhysicalDeviceQueueFamilyProperties(phys, &nqf, qf.data());
     uint32_t qfi = UINT32_MAX;
     for (uint32_t i = 0; i < nqf; i++) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { qfi = i; break; }
-    if (qfi == UINT32_MAX) { printf("== FAIL: no compute queue ==\n"); return 1; }
+    if (qfi == UINT32_MAX) { printf("== FAIL: no compute queue ==\n"); FAIL() << "legacy early exit"; }
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = qfi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
@@ -46,7 +45,7 @@ int main() {
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
     VkDevice dev = VK_NULL_HANDLE;
     VKCHECK(vkCreateDevice(phys, &dci, nullptr, &dev), "vkCreateDevice");
-    if (!dev) { printf("== FAIL ==\n"); return 1; }
+    if (!dev) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
     VkQueue queue; vkGetDeviceQueue(dev, qfi, 0, &queue);
 
     VkPhysicalDeviceMemoryProperties memp; vkGetPhysicalDeviceMemoryProperties(phys, &memp);
@@ -144,7 +143,4 @@ int main() {
     vkDestroyBuffer(dev, outBuf, nullptr); vkFreeMemory(dev, outMem, nullptr);
     vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr);
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

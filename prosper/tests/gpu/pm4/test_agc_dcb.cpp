@@ -4,6 +4,7 @@
 // the indirect-register patch helpers modify a previously-returned packet. This validates the port
 // independently of the (locale-blocked) boot.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "gpu/pm4/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -17,8 +18,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Mirror of hle_agc.cpp's AgcDcb layout (game's own struct; must match byte-for-byte).
 struct Dcb {
@@ -94,7 +94,7 @@ static bool capture_stderr(F&& body, char* out, size_t out_size) {
     return restored;
 }
 
-int main() {
+TEST(AgcDcb, Contract) {
     printf("== test_agc_dcb ==\n");
     register_builtin_hle();
 
@@ -113,7 +113,7 @@ int main() {
           "AGC Dcb functions registered (override the glog stubs)");
     if (!(reset && setcx && p_add && p_addr && p_dma_src &&
           setcx_direct && setsh_direct && setuc_direct && type2 && interpolants)) {
-        printf("== FAIL ==\n"); return 1;
+        printf("== FAIL ==\n"); FAIL() << "legacy early exit";
     }
 
     uint32_t buffer[256];
@@ -868,7 +868,5 @@ int main() {
         }
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

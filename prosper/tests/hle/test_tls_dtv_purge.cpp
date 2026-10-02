@@ -9,6 +9,7 @@
 // through the trampoline) purges, (5) main/host threads with no DTV entries purge as a no-op,
 // (6) a normal-return thread leaves guest %fs before returning to the host pthread runtime (#644).
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -18,8 +19,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static HleFn TLSGET, CREATE, JOIN, EXITF;
 
@@ -59,7 +59,7 @@ static void* worker_guest_fs_return(void*) {
     return (void*)0x644;
 }
 
-int main() {
+TEST(TlsDtvPurge, Contract) {
     printf("== test_tls_dtv_purge ==\n");
     register_builtin_hle();
 
@@ -68,7 +68,7 @@ int main() {
     JOIN   = Hle::lookup(nid_hash("scePthreadJoin"));
     EXITF  = Hle::lookup(nid_hash("scePthreadExit"));
     CHECK(TLSGET && CREATE && JOIN && EXITF, "__tls_get_addr + scePthreadCreate/Join/Exit registered");
-    if (!(TLSGET && CREATE && JOIN && EXITF)) { printf("== FAIL ==\n"); return 1; }
+    if (!(TLSGET && CREATE && JOIN && EXITF)) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     TlsModuleDesc desc; desc.init_va = (uint64_t)(uintptr_t)g_tdata; desc.filesz = kFilesz; desc.memsz = kMemsz;
     set_tls_modules(&desc, 1);
@@ -133,7 +133,5 @@ int main() {
     }
 #endif
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

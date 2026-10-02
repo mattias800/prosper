@@ -4,6 +4,7 @@
 // layer scans out the flipped buffer and reads back exactly its pixels. This proves the present
 // plumbing end-to-end headlessly — the surface the renderer will present real frames to.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "gpu/present/videoout_present.hpp"
 #include "host/platform/lifecycle.hpp"
 #include <chrono>
@@ -17,14 +18,12 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 using Hle8Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t,
                             uint64_t, uint64_t, uint64_t, uint64_t);
 
-int main() {
+TEST(Present, Contract) {
     printf("== test_present ==\n");
     register_builtin_hle();
     gpu::present_reset();
@@ -36,7 +35,7 @@ int main() {
     auto unreg  = Hle::lookup("N5KDtkIjjJ4");   // UnregisterBuffers
     auto flip   = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
     CHECK(open && setba2 && regb2 && unreg && flip, "VideoOut functions registered");
-    if (!(open && setba2 && regb2 && unreg && flip)) { printf("== FAIL ==\n"); return 1; }
+    if (!(open && setba2 && regb2 && unreg && flip)) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
     const uint64_t handle = open(0, 0, 0, 0, 0, 0);
     CHECK((int64_t)handle > 0, "opened a live VideoOut handle");
 
@@ -145,7 +144,7 @@ int main() {
     const uint64_t paused_count = gpu::present_count();
     auto paused_flip = std::async(std::launch::async, [&] {
         flip(handle, 1, 0, 0xCAFE, 0, 0);
-        return true;
+        return;
     });
     const auto publish_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     while (gpu::present_count() == paused_count &&
@@ -237,7 +236,4 @@ int main() {
     CHECK(lease.rgba->data() == shared_data && *lease.rgba == rendered,
           "rendered-frame lease remains valid after present reset");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

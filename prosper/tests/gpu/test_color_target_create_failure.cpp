@@ -16,6 +16,7 @@
 // 2D color attachments at the test's own 64x64 extent, so no real device can be made to refuse one
 // on demand.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/state/render_state.hpp"
 #include "fixtures/render_runner.h"
 #include <cstdio>
@@ -28,8 +29,7 @@ using namespace prosper::gpu;
 using prosper::test::RenderColorTargetCreateSite;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static void set_env(const char* name, const char* value) {
 #ifdef _WIN32
@@ -64,7 +64,7 @@ static std::string capture_stderr(const char* scratch, Body&& body) {
     return text;
 }
 
-int main() {
+TEST(ColorTargetCreateFailure, Contract) {
     printf("== test_color_target_create_failure (#3180) ==\n");
 
     // Must precede every render: persistent_color_target_limit() memoizes the environment on its
@@ -80,7 +80,7 @@ int main() {
                                       0xF800180Fu, 0x03020100u, 0xBF810000u};
     const std::vector<uint32_t> fs = recompile_fragment(kRedPs, sizeof(kRedPs) / 4, nullptr);
     CHECK(!vs.empty() && !fs.empty(), "fullscreen VS + solid-red PS available");
-    if (vs.empty() || fs.empty()) { printf("FAILED (%d)\n", fails); return 1; }
+    if (vs.empty() || fs.empty()) { printf("FAILED (%d)\n", fails); FAIL() << "legacy early exit"; }
 
     ResolvedPipelineState opaque{};
     opaque.topology = 3 /*VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST*/;
@@ -199,6 +199,5 @@ int main() {
               "the None site never fires");
     }
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

@@ -36,6 +36,7 @@
 // equal the guest V#'s `num_records x stride` on a real dispatch. A regression THERE would not be
 // caught here. That remains the open coverage gap on #2795.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include "fixtures/compute_runner.h"
 
@@ -46,9 +47,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // v1 arrives as a float (the harness loads storage-buffer floats into v0..vN) and leaves as one, so
 // the walk is bracketed by converts — the same convention test_cfg_trip_bound uses.
@@ -112,13 +111,13 @@ uint32_t mismatches(const std::vector<float>& got, const std::vector<uint32_t>& 
 
 }  // namespace
 
-int main() {
+TEST(TraversalChase, Contract) {
     printf("== test_traversal_chase ==\n");
 
     const std::vector<uint32_t> spv = chase_module();
     CHECK(!spv.empty() && spv[0] == 0x07230203u,
           "the buffer-chasing EXEC walk recompiles to a SPIR-V module");
-    if (spv.empty()) { printf("== FAIL: recompile produced nothing ==\n"); return 1; }
+    if (spv.empty()) { printf("== FAIL: recompile produced nothing ==\n"); FAIL() << "legacy early exit"; }
 
     // The load must actually be EMITTED. A V# that decoded to NUM_RECORDS=0 would fold the load to a
     // constant zero, and then every arm below would pass for the wrong reason: the walk would exit
@@ -198,7 +197,4 @@ int main() {
               "an index past NUM_RECORDS reads 0 and ends the walk in exactly two steps");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

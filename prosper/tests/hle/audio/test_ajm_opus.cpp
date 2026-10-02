@@ -12,6 +12,7 @@
 // Input: 51 raw Opus packets generated with ffmpeg libopus from a 1 kHz sine (48 kHz stereo,
 // 20 ms frames) — see opus_packets.h. The OpusHead feeds the libopus decoder as extradata.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/audio/ajm_decoder.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "ajm_ffmpeg.hpp"
@@ -27,8 +28,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 using HleFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 using Hle10Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
@@ -189,18 +189,17 @@ void run_batch_case(ajm::Codec codec, const char* name) {
 
 } // namespace
 
-int main() {
+TEST(AjmOpus, Contract) {
     std::puts("== test_ajm_opus ==");
     register_builtin_hle();
     if (!ajm::install_ffmpeg_decoder_backend()) {
         std::printf("  [SKIP] FFmpeg Ajm backend unavailable\n");
-        return 0;
+        return;
     }
 
     run_stream_case(ajm::Codec::Opus, "Opus");
     run_stream_case(ajm::Codec::OpusAlt, "OpusAlt");
     run_batch_case(ajm::Codec::Opus, "Opus");
 
-    if (fails) std::printf("FAILURES: %d\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

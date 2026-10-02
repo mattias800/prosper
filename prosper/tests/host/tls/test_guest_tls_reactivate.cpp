@@ -16,14 +16,14 @@
 // Nothing between an activation and the swap back may touch host TLS: with the guest TCB installed,
 // errno and thread_locals resolve into guest memory. Every host-libc call is outside those windows.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
 // `fails` is main()'s local; CHECK is only used there.
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 #if defined(__linux__) && defined(__x86_64__)
 static inline uint64_t rd_fs() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
@@ -35,11 +35,11 @@ alignas(16) static const uint8_t kTdata[16] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x6
                                                0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xf0, 0x01};
 #endif
 
-int main() {
+TEST(GuestTlsReactivate, Contract) {
     printf("== test_guest_tls_reactivate ==\n");
 #if !defined(__linux__) || !defined(__x86_64__)
     printf("  [skip] the wrfsbase activation path is x86-64 Linux only\n== PASS ==\n");
-    return 0;
+    return;
 #else
     int fails = 0;
     unsetenv("PROSPER_NO_GUEST_FS");   // the Linux path is on by default; make sure a caller's env
@@ -98,8 +98,9 @@ int main() {
           "#3635: a value the guest stored over tdata is not re-initialised from the template");
     CHECK(prosper::guest_tls_own_tp() == tp1, "#3635: the thread's own TCB is unchanged");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
+    if (fails) { printf("== FAIL: %d ==\n", fails); FAIL() << "legacy early exit"; }
     printf("== PASS ==\n");
-    return 0;
+    return;
 #endif
+    EXPECT_EQ(fails, 0);
 }
