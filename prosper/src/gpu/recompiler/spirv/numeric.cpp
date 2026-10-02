@@ -23,6 +23,12 @@ uint32_t SpirvCompute::f32_nonzero_bits(uint32_t word) {
     return ucmp(Op_INotEqual, product, uconst(0));
 }
 
+uint32_t SpirvCompute::find_ilsb(uint32_t word) {
+    const uint32_t result = id();
+    putv(code, Op_ExtInst, {t_i32, result, glsl, Glsl_FindILsb, word});
+    return i2u(result);
+}
+
 uint32_t SpirvCompute::f32_abs_normal_le_bits(uint32_t word, uint32_t bound) {
     uint32_t bits = 0;
     if (!uconst_literal(bound, &bits) || bits < 0x00800000u || bits >= 0x7f800000u)
