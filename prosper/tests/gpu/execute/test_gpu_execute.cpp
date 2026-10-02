@@ -317,13 +317,26 @@ int main() {
         set_pgm(versioned, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS, versioned_ps);
         clear_shader_recompile_cache();
         clear_shader_analysis_cache();
+        // Vulkan was initialized above, so the producing host profile can differ from the
+        // direct compiler's Unknown default. Reproduce the exact realized compile inputs;
+        // keep byte equality as the version/cache oracle rather than ignoring declarations.
+        const auto expected_fragment = [](const uint32_t* code, size_t dwords,
+                                          const DrawItem& item) {
+            const auto* system = item.has_system_inputs ? &item.system_inputs : nullptr;
+            const auto* pixels = item.has_pixel_inputs ? &item.pixel_inputs : nullptr;
+            const auto interpolation = fragment_interpolation_layout(code, dwords, system, pixels);
+            return recompile_fragment(code, dwords, item.prt.get(), system, UINT32_MAX,
+                                      &interpolation, item.ps_wave32,
+                                      {RecompileDiagnosticStage::Fragment, item.fs_guest_addr},
+                                      item.ps_float_mode, nullptr, item.float_transport);
+        };
         DrawItem first_version;
         const bool made_first = realize_draw_item(
             versioned, &versioned.draws[0], versioned.draws[0].index_count,
             0x10000u, false, first_version);
         const ShaderAnalysisCacheStats first_analysis = shader_analysis_cache_stats();
-        const std::vector<uint32_t> expected_first = recompile_fragment(
-            versioned_ps, std::size(versioned_ps));
+        const std::vector<uint32_t> expected_first = expected_fragment(
+            versioned_ps, std::size(versioned_ps), first_version);
         if (first_analysis.misses != 2 || first_analysis.hits != 0)
             std::printf("  fragment analysis acquisitions: hits=%llu misses=%llu\n",
                         static_cast<unsigned long long>(first_analysis.hits),
@@ -336,8 +349,8 @@ int main() {
             versioned, &versioned.draws[0], versioned.draws[0].index_count,
             0x10000u, false, second_version);
         const ShaderAnalysisCacheStats second_analysis = shader_analysis_cache_stats();
-        const std::vector<uint32_t> expected_second = recompile_fragment(
-            replacement_ps, std::size(replacement_ps));
+        const std::vector<uint32_t> expected_second = expected_fragment(
+            replacement_ps, std::size(replacement_ps), second_version);
         const bool rewrite_ok = made_first && made_second &&
             first_version.fs_words() == expected_first &&
             second_version.fs_words() == expected_second &&
