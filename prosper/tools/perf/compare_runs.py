@@ -42,6 +42,7 @@ it does not look at image content.
 
 import argparse
 import json
+import math
 import sys
 
 # Conditions that must be IDENTICAL, and present, in both runs. Each is a way two rates have been
@@ -95,6 +96,10 @@ class ManifestError(Exception):
     """A manifest that cannot be read at all (as opposed to one that is merely not comparable)."""
 
 
+def _reject_nonfinite_json(value):
+    raise ValueError(f"non-finite JSON number {value}")
+
+
 def load_manifest(path):
     """Return {'run': ..., 'conditions': ..., 'summary': ...}, keeping the LAST record of each type."""
     records = {}
@@ -105,9 +110,9 @@ def load_manifest(path):
                 if not line:
                     continue
                 try:
-                    record = json.loads(line)
-                except json.JSONDecodeError as error:
-                    raise ManifestError(f"{path}:{number}: not valid JSON ({error.msg})") from error
+                    record = json.loads(line, parse_constant=_reject_nonfinite_json)
+                except ValueError as error:
+                    raise ManifestError(f"{path}:{number}: not valid JSON ({error})") from error
                 if isinstance(record, dict) and record.get("type") in (
                     "run",
                     "conditions",
@@ -116,6 +121,8 @@ def load_manifest(path):
                     records[record["type"]] = record
     except OSError as error:
         raise ManifestError(f"{path}: cannot be read ({error.strerror})") from error
+    except UnicodeError as error:
+        raise ManifestError(f"{path}: not valid UTF-8 ({error})") from error
     return records
 
 
@@ -124,8 +131,18 @@ def _get(records, record, key):
     if entry is None:
         return None
     if record == "run" and key in ASSERTION_MATCH_KEYS:
-        return (entry.get("assertions") or {}).get(key)
+        assertions = entry.get("assertions")
+        return assertions.get(key) if isinstance(assertions, dict) else None
     return entry.get(key)
+
+
+def _finite_number(value):
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def refusals(baseline, candidate):
@@ -153,6 +170,9 @@ def refusals(baseline, candidate):
 
     for label, records in (("baseline", baseline), ("candidate", candidate)):
         conditions, summary = records["conditions"], records["summary"]
+        revision = records["run"].get("build_revision")
+        if not isinstance(revision, str) or not revision:
+            reasons.append(f"{label}: build revision must be a nonempty string")
         if conditions.get("gpu_known") is not True:
             reasons.append(f"{label}: the renderer never selected a GPU, so the device is unknown")
         if summary.get("status") != "ok":
@@ -162,12 +182,24 @@ def refusals(baseline, candidate):
         elif summary.get("typical_fps_measured") is not True:
             reasons.append(f"{label}: fewer than two distinct frames, so there is no typical rate")
         else:
+            for key in ("typical_fps", "distinct_fps"):
+                value = summary.get(key)
+                if not _finite_number(value) or value <= 0:
+                    reasons.append(f"{label}: {key} must be a finite positive measured rate")
             active = summary.get("active_fraction")
-            if not isinstance(active, (int, float)) or active < MIN_ACTIVE_FRACTION:
+            if not _finite_number(active) or not 0 <= active <= 1:
+                reasons.append(f"{label}: active fraction must be a finite number in [0, 1]")
+            elif active < MIN_ACTIVE_FRACTION:
                 reasons.append(
                     f"{label}: active fraction {active!r} is below {MIN_ACTIVE_FRACTION:.2f}; the window "
                     f"mixed two regimes, so its rate describes neither. Narrow the route and re-run"
                 )
+        # Short valid captures can leave tail metrics null. A reported tail still has to be usable
+        # arithmetic; strings, booleans and non-finite values must not bypass a threshold.
+        for key in ("low_1pct_fps", "interval_p99_ms", "interval_p95_ms"):
+            value = summary.get(key)
+            if value is not None and (not _finite_number(value) or value < 0):
+                reasons.append(f"{label}: {key} must be null or a finite nonnegative number")
     return reasons
 
 
@@ -241,6 +273,16 @@ def render(rows, baseline, candidate):
     return "\n".join(lines)
 
 
+def _threshold(value):
+    try:
+        number = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("threshold must be a finite nonnegative number") from error
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("threshold must be a finite nonnegative number")
+    return number
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Compare two tools/screenshot manifests; refuse when the runs are not comparable."
@@ -249,14 +291,14 @@ def main(argv=None):
     parser.add_argument("candidate")
     parser.add_argument(
         "--max-typical-drop-pct",
-        type=float,
+        type=_threshold,
         default=3.0,
         help="regression when typical fps falls by more than this (proposed, not "
         "noise-calibrated; default 3)",
     )
     parser.add_argument(
         "--max-low-drop-pct",
-        type=float,
+        type=_threshold,
         default=5.0,
         help="regression when the 1%% low falls by more than this (proposed, not "
         "noise-calibrated; default 5)",
