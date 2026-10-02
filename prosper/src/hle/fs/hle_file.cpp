@@ -2940,37 +2940,18 @@ HLE(f_apr_get_file_stat) {
     return 0;
 }
 
-// libSceAmpr::mQ16-QdKv7k — the APR read SUBMIT (identified by tracing readFile eboot 0x59b6110 ->
-// this import). Call shape: mQ16(reqFrame, outScratchPtr /*a1*/, outRecord /*a2*/, fileId /*a3*/,
-// descBuf /*a4*/, descSize /*a5: 0x90, 0x90, 0xdd in the three boot captures*/).
+// libSceAmpr::mQ16-QdKv7k — sceAmprAprCommandBufferReadFile:
+// (cb, out1, out2, fileId, dst, size, offset). The SDK's inline wrappers pass the persistent
+// single-qword fields cb+0x18 and cb+0x20 as out1/out2. An independently allocated SDK object is
+// only 0x28 bytes, so out2+8 is outside it (#4044). Constructor/destructor wrappers forward the
+// same pair; their cursor types and advancement are not inferred here.
 //
-// CORRECT CONTRACT (established 2026-07-08 on this branch, by A/B experiment over three live
-// reads): a3 is the APR file id from sceKernelAprResolveFilepathsToIdsAndFileSizes (read1 id=1
-// global.utoc, read2 id=3 pakchunk2-ps5.utoc, read3 id=4 pakchunk1-ps5.pak), and a2 points at a
-// COMPLETION RECORD the LIBRARY must fill:
-//   a2+0x00  OUT data pointer  — WHERE THE LIBRARY PUT THE BYTES (library-chosen pages)
-//   a2+0x08  OUT status        — 0 = success; on failure {low32 err, high32 CB offset}, exactly
-//            what the guest's "Apr read failure %x at CB offset %d" fatal prints (read1 24|40,
-//            read2 2b|48); checked at eboot 0x22738a5 after the guest's completion wait
-//   a2+0x10  OUT bytes transferred
-// Every one of those stack slots is FRAME RESIDUE at submit (read3's record held code addresses
-// and stack pointers), so nothing in the record is a usable input; the byte count is the whole
-// resolved file (the engine got sizes from resolve).
-//
-// The READ DESTINATION IS LIBRARY-CHOSEN, not an engine input. The old model treated the residue
-// at a2+0 as the destination and pread() the TOC into it in place — that pointer was the freed
-// resolve-path-string block sitting as the LIVE HEAD of a guest pool freelist class
-// (PROSPER_APR_POOLSCAN: "dest-on-list=YES(head-eq)"; the block still held UTF-16
-// "…ll/content/paks/global.utoc" residue), so the TOC magic landed in a free node's next-pointer
-// and the pool pop dereferenced it -> the crash at eboot+0x2316c91. Publishing a prosper-owned
-// buffer through the record instead: the engine parses the TOC from the published pointer, the
-// crash vanishes, and boot advances through the next containers — proving the record-output
-// model both ways. We model the Ampr engine's page pool with per-read host mmaps that are never
-// freed (the engine treats the pages as library-owned). Zero-byte files (the dump's empty
-// pakchunk2 placeholders) complete trivially with size 0.
-// CONFIDENCE: HIGH on id=a3 + record-output via a2 (three callsites, A/B-tested); MED on
-// whole-file semantics — a partial/offset read has not been observed yet (fine for TOC/pak-header
-// reads; revisit at the first .ucas chunk read).
+// Preserve the existing data-pointer publication through out2 and DMA into the explicit dst.
+// Publishing a staging pointer instead of treating stale out2 contents as a destination avoided
+// overwriting a freed path-string pool node in the earlier UE4 bring-up. That evidence does not
+// give the SDK field an adjacent status/count record: the inspected UE4 failure status belongs to
+// separately supplied SubmitAndGetResult outputs. Independent three-qword completion records keep
+// their existing compatibility behavior; their extent is not generalized to this SDK pair.
 // --- Stack-argument capture for sceAmprAprCommandBufferReadFile ---------------------------------
 // The NID reverses to the real Sony name (brute-forced against nid_hash):
 //   mQ16-QdKv7k = sceAmprAprCommandBufferReadFile   (and the rest of the flow:
@@ -3771,12 +3752,20 @@ struct AprReadOutcome {
     bool in_dst = false;      // ...into the guest's own destination, rather than staging
     uint64_t offset = 0;      // clamped
     uint64_t size = 0;        // clamped
-    uint64_t published = 0;   // what the completion record's data pointer was set to
+    uint64_t published = 0;   // data pointer published through the caller's out2 slot
     int64_t  got = 0;         // bytes the host read actually returned; `ok` is (got == size)
 };
-// `cb` is the APR command buffer (a0 of either builder), `record` its completion-record out-pointer
-// (a2, always &cb[0x20] in the SDK's own inline wrappers), `dst`/`requested`/`offset` the read.
-static AprReadOutcome apr_execute_read(uint64_t cb, uint64_t record, const std::string& host,
+enum class AprReadOutputKind { SdkInlinePointer, CompletionRecord };
+
+static AprReadOutputKind apr_read_output_kind(uint64_t cb, uint64_t out1, uint64_t out2) {
+    return out1 == cb + 0x18 && out2 == cb + 0x20
+        ? AprReadOutputKind::SdkInlinePointer : AprReadOutputKind::CompletionRecord;
+}
+
+// `record` is out2 of either builder. Only the proven SDK pair owns a single qword; independent
+// completion records retain their existing publication behavior without guessing a request extent.
+static AprReadOutcome apr_execute_read(uint64_t cb, uint64_t record, AprReadOutputKind output_kind,
+                                       const std::string& host,
                                        uint64_t dst, uint64_t requested, uint64_t offset,
                                        uint64_t fsize) {
     AprReadOutcome out;
@@ -3819,9 +3808,8 @@ static AprReadOutcome apr_execute_read(uint64_t cb, uint64_t record, const std::
     out.got = (int64_t)got;
     out.ok = ((uint64_t)got == size);
 #endif
-    // `dst` is the caller's DESTINATION buffer -- on real hardware the DMA engine fills it and the
-    // completion record's data pointer equals it. Some callsites consume the data through the
-    // record pointer and some read their own dst buffer directly, so write BOTH: copy into dst
+    // `dst` is the caller's DESTINATION buffer. Some callsites consume the published data pointer
+    // and some read their own dst buffer directly, so write BOTH: copy into dst
     // fault-safely and publish record[0] = dst, falling back to the prosper-owned staging buffer
     // only if dst is absent or unmapped.
     out.in_dst = out.ok && dst > 0xffff && apr_write_guest_dst(dst, slot, size);
@@ -3831,24 +3819,16 @@ static AprReadOutcome apr_execute_read(uint64_t cb, uint64_t record, const std::
     // #2924). The record write below publishes the same value.
     out.published = out.in_dst ? dst : (uint64_t)(uintptr_t)slot;
     if (out.ok && record) {
-        // Complete the record through the caller-supplied out-pointer: [0] data pointer,
-        // [+8] status (0 = success; on failure holds {err, CB offset} that the guest's fatal
-        // prints), [+0x10] bytes transferred.
+        // Both layouts retain the in-bounds data-pointer publication. The SDK out2 field ends at
+        // cb+0x28; adjacent status/count writes would overwrite storage its caller still owns.
         *(uint64_t*)(uintptr_t)(record + 0x00) = out.published;
-        *(uint64_t*)(uintptr_t)(record + 0x08) = 0;
-        // The bytes-transferred qword at record+0x10 completes a 3-qword record (Evergate reads
-        // it). The other shape is record == cb+0x20, where record+0x10 == cb+0x30 is a LIVE pointer
-        // the guest still uses. That shape is NOT a Terminator 2D quirk despite the evidence coming
-        // from there: it is what the SDK's own inline wrappers produce (`lea rdx,[rdi+0x20]`), so on
-        // Yakuza Kiwami it holds for EVERY read of BOTH builders and this qword is never written.
-        // Terminator 2D (Unity IL2CPP, PPSA25872) is simply where the consequence was captured. A live capture proved that writing read id=7's size (9612 = 0x258c) there led the
-        // guest to free 0x258c and later fault while popping that corrupted allocator freelist
-        // (eboot+0x7c4a39). Skip only that proven shape: the size and meaning of other request
-        // layouts are unknown, so mere address overlap is not evidence that a caller-supplied
-        // output slot is invalid. CONFIDENCE: HIGH for the exact Terminator shape (live A/B
-        // advances to the frame loop).
-        if (record != cb + 0x20)
-            *(uint64_t*)(uintptr_t)(record + 0x10) = size;
+        if (output_kind == AprReadOutputKind::CompletionRecord) {
+            *(uint64_t*)(uintptr_t)(record + 0x08) = 0;
+            // Preserve the existing narrow count safeguard (#1107) for other callers that supply
+            // cb+0x20 without the paired SDK out1. No broader overlap or object extent is assumed.
+            if (record != cb + 0x20)
+                *(uint64_t*)(uintptr_t)(record + 0x10) = size;
+        }
     }
 #ifndef _WIN32
     // failure: record stays incomplete -> the guest reports it; success-into-dst: staging is no
@@ -4143,7 +4123,8 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     }
     // The read, the DMA into the guest's destination and the record completion are the shared
     // contract every APR read builder implements: apr_execute_read (above).
-    AprReadOutcome r = apr_execute_read(a0, a2, host, /*dst=*/a4, requested_size, offset, fsize);
+    AprReadOutcome r = apr_execute_read(a0, a2, apr_read_output_kind(a0, a1, a2),
+                                       host, /*dst=*/a4, requested_size, offset, fsize);
     if (filelog()) fprintf(stderr, "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) "
                    "off=0x%llx size=%llu got=%lld %s method=%s requested=%llu\n",
                    (unsigned long long)id, host.c_str(),
@@ -4161,7 +4142,8 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     (void)dest;
     // Windows host: the same shared core. The record-completion and DMA-destination model is not
     // per-platform, and it used to be written out twice here.
-    AprReadOutcome r = apr_execute_read(a0, a2, host, /*dst=*/a4, requested_size, offset, fsize);
+    AprReadOutcome r = apr_execute_read(a0, a2, apr_read_output_kind(a0, a1, a2),
+                                       host, /*dst=*/a4, requested_size, offset, fsize);
     if (filelog()) fprintf(stderr,
         "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) off=0x%llx size=%llu got=%lld "
         "%s method=%s requested=%llu\n",
@@ -4270,7 +4252,6 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
 // …ResetGatherScatterState export). LOW on chain lifetime — not MED, because no observation
 // discriminates: the width above is a deliberate fail-loud choice, not a derived contract.
 HLE(f_apr_read_gather_scatter) {
-    (void)a1;
     const uint64_t cb = a0, record = a2, dst = a3, requested = a4, offset = a5;
     // Bounded: a title that issues gather/scatter with no chain would otherwise emit one line per
     // segment for the life of the process, and a diagnostic that drowns the log is one nobody reads.
@@ -4309,7 +4290,8 @@ HLE(f_apr_read_gather_scatter) {
         log_refusal(msg);
         return 0x80020016ull;
     }
-    AprReadOutcome r = apr_execute_read(cb, record, chain.host, dst, requested, offset, chain.fsize);
+    AprReadOutcome r = apr_execute_read(cb, record, apr_read_output_kind(cb, a1, record),
+                                       chain.host, dst, requested, offset, chain.fsize);
     // DELIVERY, not merely a successful host read (#2928). `r.ok` says the bytes came off the host
     // file; `r.in_dst` says they reached the guest's OWN destination. For the plain ReadFile the
     // difference is defensible — it has known callsites that consume the completion record's data
