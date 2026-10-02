@@ -1,9 +1,11 @@
 #include "gpu/recompiler/raster_quad_collector.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
-#include <set>
+#include <cstdio>
+#include <map>
 
 namespace prosper::gpu {
 std::vector<uint32_t> build_raster_quad_collector(const RasterQuadInputs& inputs,
@@ -197,10 +199,16 @@ std::string decode_raster_quad_records(const RasterQuadCollector& collector,
         return "quad-collector-output-header-malformed";
     if (words[1]) return "quad-collector-output-overflow";
     std::vector<std::vector<uint32_t>> pending;
-    std::set<std::array<uint32_t, 3>> keys;
+    // A geometric key is not a unique Vulkan quad scope: helper-backed scopes may revisit the
+    // same locations. Retain separate scopes whose nonhelper observations are disjoint; never
+    // merge their possibly different helper/input words into invented invocation state.
+    // Vulkan also permits repeated fragment invocations. Overlap is therefore a conservative
+    // supported-domain refusal here, not proof of a driver or publisher error.
+    struct Seen { uint32_t nonhelper_mask = 0, first_record = 0; };
+    std::map<std::array<uint32_t, 3>, Seen> keys;
     for (uint32_t q = 0; q < words[0]; ++q) {
         const auto* row = words + kRasterQuadBufferHeaderWords + size_t(q) * collector.record_words;
-        bool covered = false;
+        uint32_t nonhelper_mask = 0;
         const float x = std::bit_cast<float>(row[5]), y = std::bit_cast<float>(row[6]);
         if (!std::isfinite(x) || !std::isfinite(y)) return "quad-collector-output-topology-malformed";
         for (uint32_t lane = 0; lane < 4; ++lane) {
@@ -216,12 +224,41 @@ std::string decode_raster_quad_records(const RasterQuadCollector& collector,
             if (!std::isfinite(lx) || !std::isfinite(ly) ||
                 lx != x + float(lane & 1) || ly != y + float(lane >> 1))
                 return "quad-collector-output-topology-malformed";
-            covered |= !value[0];
+            if (!value[0]) nonhelper_mask |= 1u << lane;
         }
-        if (!covered) return "quad-collector-helper-only-publication";
-        // An unexpected duplicate is a conservative incomplete result, not a guessed raster order.
-        if (!keys.insert({row[4], row[5], row[6]}).second)
-            return "quad-collector-duplicate-quad-unproved";
+        if (!nonhelper_mask) return "quad-collector-helper-only-publication";
+        const auto [previous, first] = keys.try_emplace(
+            std::array<uint32_t, 3>{row[4], row[5], row[6]}, Seen{nonhelper_mask, q});
+        if (!first) {
+            const uint32_t seen_mask = previous->second.nonhelper_mask;
+            const bool overlap = (seen_mask & nonhelper_mask) != 0;
+            // Preserve bounded actual-wire evidence before a refusal. A CI failure containing only
+            // the old duplicate-key reason could not distinguish disjoint helper-backed scopes
+            // from overlapping observations or an incorrect primitive identity.
+            static std::atomic<uint32_t> collision_reports{0};
+            uint32_t report = collision_reports.load(std::memory_order_relaxed);
+            while (report < 32 && !collision_reports.compare_exchange_weak(
+                    report, report + 1, std::memory_order_relaxed)) {}
+            if (report < 32) {
+                std::fprintf(stderr,
+                    "[raster-quad-collision] primitive=%u origin_bits=%08x,%08x seen_mask=0x%x next_mask=0x%x first_record=%u record=%u decision=%s; host scopes, no guest packing/order authority\n",
+                    row[4], row[5], row[6], seen_mask, nonhelper_mask,
+                    previous->second.first_record, q, overlap ? "refused-overlap-unproved" : "retained-disjoint");
+                if (report < 4) {
+                    for (uint32_t record : {previous->second.first_record, q}) {
+                        const auto* raw = words + kRasterQuadBufferHeaderWords + size_t(record) * collector.record_words;
+                        for (uint32_t lane = 0; lane < 4; ++lane) {
+                            std::fprintf(stderr, "[raster-quad-collision-wire] record=%u lane=%u words=", record, lane);
+                            for (uint32_t word = 0; word < collector.lane_words; ++word)
+                                std::fprintf(stderr, "%s%08x", word ? "," : "", raw[size_t(lane) * collector.lane_words + word]);
+                            std::fputc('\n', stderr);
+                        }
+                    }
+                }
+            }
+            if (overlap) return "quad-collector-overlapping-nonhelper-scopes-unproved";
+            previous->second.nonhelper_mask |= nonhelper_mask;
+        }
         pending.emplace_back(row, row + collector.record_words);
     }
     quads = std::move(pending);

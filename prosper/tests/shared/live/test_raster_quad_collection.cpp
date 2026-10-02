@@ -222,6 +222,42 @@ static void observe_complete(const RasterQuadResult& result) {
     for (const auto& field : result.fields)
         check(!field.guest_initialization_proved, "observed varying never becomes MUST-defined guest input");
 }
+static void observe_capacity(const Owners& owners) {
+    // Never infer the next draw's helper-scope population from a previous append count. These
+    // two primitives each cover only (.5,.5) under the explicit guest scissor. In the supported
+    // nonhelper-unique domain, each must publish exactly one separate helper-backed scope.
+    auto state = state_for(owners);
+    state.cx[P::PA_SC_GENERIC_SCISSOR_TL] = 0x80000000u; // disable window offset; x=y=0
+    state.cx[P::PA_SC_GENERIC_SCISSOR_BR] = 0x00010001u; // exclusive right=bottom=1
+    DrawItem draw;
+    const bool realized = realize_draw_item(state,&state.draws[0],6,64,false,draw,nullptr,true);
+    check(realized && draw.raster_quads && draw.ps.has_scissor &&
+        draw.ps.scissor_left == 0 && draw.ps.scissor_top == 0 &&
+        draw.ps.scissor_right == 1 && draw.ps.scissor_bottom == 1 &&
+        draw.raster_quads->inputs && draw.raster_quads->inputs->raw_matches_producing_source &&
+        draw.raster_quads->inputs->source_fs &&
+        *draw.raster_quads->inputs->source_fs == draw.fs_words(),
+        "capacity fixture freshly realizes owned producing SOURCE and its actual guest scissor");
+    if (!realized || !draw.raster_quads) return;
+    const auto exact = observe(draw,2);
+    std::set<uint32_t> primitives;
+    bool valid = exact.complete && exact.rejection.empty() && exact.quads.size() == 2;
+    uint32_t covered = 0;
+    for (const auto& quad : exact.quads) for (uint32_t lane = 0; lane < 4; ++lane) {
+        const auto* value = quad.data() + lane * exact.lane_words;
+        if (value[0]) { valid &= value[1] == 0; continue; }
+        ++covered;
+        valid &= value[1] == 1 && value[2] == 1 && value[4] < 2 &&
+            value[5] == std::bit_cast<uint32_t>(0.5f) && value[6] == std::bit_cast<uint32_t>(0.5f) &&
+            primitives.insert(value[4]).second;
+    }
+    check(valid && covered == 2 && primitives.size() == 2,
+        "actual exact-capacity CAS retains the two independently known single-pixel primitive scopes");
+    const auto overflow = observe(draw,1);
+    check(overflow.attempted && !overflow.complete && overflow.quads.empty() &&
+        overflow.rejection == "quad-collector-output-overflow",
+        "actual capacity+1 overflow discards whole record transaction");
+}
 static void observe_fields(const RasterQuadResult& result, bool parameter) {
     // This is a host-input oracle, not a guest interpolation/register oracle. Independently:
     // clip vertices(-1,-1),(3,-1),(-1,3), w=1 map to (0,0),(2W,0),(0,2H).
@@ -368,15 +404,8 @@ int main(int argc, char** argv) {
     } else if (!cpu) {
         const auto completed = observe(draw,256); observe_complete(completed);
         dump_sources(dump_directory,"position",draw,&completed);
-        // A second actual call learns its exact prior population. Saturation is all-or-nothing:
-        // one fewer slot must return no quads, not a plausible partial batch or wrapping counter.
-        if (completed.complete && completed.quads.size() > 1) {
-            const auto exact = observe(draw,static_cast<uint32_t>(completed.quads.size()));
-            check(exact.complete && exact.quads.size() == completed.quads.size(), "actual exact-capacity CAS publication completes");
-            const auto overflow = observe(draw,static_cast<uint32_t>(completed.quads.size() - 1));
-            check(overflow.attempted && !overflow.complete && overflow.quads.empty() &&
-                overflow.rejection == "quad-collector-output-overflow", "actual capacity+1 overflow discards whole record transaction");
-        }
+        // Saturation is all-or-nothing without assuming repeated full-frame scope packing.
+        observe_capacity(owner);
         auto replacement = draw.fs_words(); replacement[3] ^= 1; // valid module, different generator tag only
         draw.set_fs(std::move(replacement));
         const auto mismatch = observe(draw,256);

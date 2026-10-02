@@ -42,7 +42,9 @@ struct RasterQuadCollector {
 std::vector<uint32_t> build_raster_quad_collector(const RasterQuadInputs& inputs,
     uint32_t max_quads, RasterQuadCollector& contract);
 // A completed device write still needs this bounded, transactional wire/provenance check. On
-// refusal no records are returned. It does not turn host quad topology into guest wave authority.
+// refusal no records are returned. Same-origin scopes with disjoint nonhelper masks retain their
+// separate raw records; overlapping masks remain an unproved supported-domain refusal. Neither
+// coordinate equality nor append order establishes guest invocation or wave membership.
 std::string decode_raster_quad_records(const RasterQuadCollector& collector,
     const uint32_t* words, size_t word_count, uint32_t primitive_count,
     std::vector<std::vector<uint32_t>>& quads);

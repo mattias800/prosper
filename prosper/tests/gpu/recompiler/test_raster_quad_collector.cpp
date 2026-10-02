@@ -3,6 +3,7 @@
 #include "gpu/recompiler/raster_quad_collector.hpp"
 #include "gpu/state/render_state.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdio>
@@ -308,7 +309,8 @@ int main(int argc, char** argv) {
     const auto parameter_collector = build_raster_quad_collector(parameter,2,parameter_contract);
     check(!parameter_collector.empty() && parameter_contract.rejection.empty() && !parameter_contract.fields.empty(),
         "actual parameter SOURCE uses explicit routed input fields");
-    if (!parameter_collector.empty()) source_shape(parameter_collector,parameter_contract);
+    if (parameter_collector.empty()) return 1;
+    source_shape(parameter_collector,parameter_contract);
     for (const auto& field : parameter_contract.fields)
         check(!field.guest_initialization_proved, "interface presence cannot prove guest register initialization");
     dump(directory,"raster_quad_parameter_source.spv",parameter_collector);
@@ -352,9 +354,53 @@ int main(int argc, char** argv) {
     reject_wire(damaged, damaged.size(), 2, "quad-collector-output-provenance-malformed");
     damaged = original; damaged[4 + 2] = 0;
     reject_wire(damaged, damaged.size(), 2, "quad-collector-output-provenance-malformed");
-    damaged = original;
-    for (uint32_t lane = 0; lane < 4; ++lane) damaged[4 + c.record_words + lane * c.lane_words + 4] = 0;
-    reject_wire(damaged, damaged.size(), 2, "quad-collector-duplicate-quad-unproved");
+    auto partitioned = original;
+    for (uint32_t lane = 0; lane < 4; ++lane) partitioned[4 + c.record_words + lane * c.lane_words + 4] = 0;
+    // Two distinct Vulkan scopes can observe the same geometric quad with complementary
+    // nonhelper lanes. Their helper values need not coincide and must never be coalesced.
+    partitioned[4 + c.lane_words + 7] = 0x7fc12345u; // first scope's helper lane1 raw Z
+    partitioned[4 + c.record_words + 7] = 0x80000001u; // second scope's helper lane0 raw Z
+    for (bool reverse : {false,true}) {
+        auto ordered = partitioned;
+        if (reverse) for (uint32_t word = 0; word < c.record_words; ++word)
+            std::swap(ordered[4 + word],ordered[4 + c.record_words + word]);
+        const bool accepted = decode_raster_quad_records(c, ordered.data(), ordered.size(), 2, quads).empty();
+        check(accepted && quads.size() == 2,
+            "same-origin disjoint nonhelper scopes remain separate in either append order");
+        check(accepted && quads.size() == 2 &&
+            quads[0] == std::vector<uint32_t>(ordered.begin() + 4,ordered.begin() + 4 + c.record_words) &&
+            quads[1] == std::vector<uint32_t>(ordered.begin() + 4 + c.record_words,ordered.end()),
+            "every scope word including distinct helper inputs survives without merging");
+    }
+    auto parameter_wire = wire(parameter_contract);
+    for (uint32_t q = 0; q < 2; ++q) for (uint32_t lane = 0; lane < 4; ++lane) {
+        auto* row = parameter_wire.data() + 4 + q * parameter_contract.record_words + lane * parameter_contract.lane_words;
+        row[4] = 0;
+        for (uint32_t word = kRasterQuadLaneFixedWords; word < parameter_contract.lane_words; ++word)
+            row[word] = 0x3f800000u + 0x10000u * q + 0x100u * lane + word;
+    }
+    const bool parameter_retained = decode_raster_quad_records(parameter_contract,
+        parameter_wire.data(),parameter_wire.size(),2,quads).empty();
+    check(parameter_retained && quads.size() == 2 &&
+        quads[0] == std::vector<uint32_t>(parameter_wire.begin() + 4,parameter_wire.begin() + 4 + parameter_contract.record_words) &&
+        quads[1] == std::vector<uint32_t>(parameter_wire.begin() + 4 + parameter_contract.record_words,parameter_wire.end()),
+        "disjoint scopes retain every distinct parameter/system field word for helpers and nonhelpers");
+    damaged = partitioned;
+    damaged[4 + c.record_words] = 0;
+    damaged[4 + c.record_words + 1] = 1;
+    damaged[4 + c.record_words + 2] = 1;
+    reject_wire(damaged, damaged.size(), 2, "quad-collector-overlapping-nonhelper-scopes-unproved");
+    damaged = partitioned;
+    std::copy_n(damaged.begin() + 4,c.record_words,damaged.begin() + 4 + c.record_words);
+    reject_wire(damaged, damaged.size(), 2, "quad-collector-overlapping-nonhelper-scopes-unproved");
+    auto three_contract = c; three_contract.max_quads = 3;
+    auto three = wire(three_contract); three[0] = 3;
+    std::copy(partitioned.begin() + 4,partitioned.end(),three.begin() + 4);
+    std::copy_n(partitioned.begin() + 4 + c.record_words,c.record_words,three.begin() + 4 + 2 * c.record_words);
+    quads = {{0xa5a5a5a5u}};
+    check(decode_raster_quad_records(three_contract,three.data(),three.size(),2,quads) ==
+        "quad-collector-overlapping-nonhelper-scopes-unproved" && quads.empty(),
+        "third scope overlap with the accumulated second mask discards the entire transaction");
     damaged = original;
     for (uint32_t lane = 0; lane < 4; ++lane) {
         damaged[4 + c.record_words + lane * c.lane_words] = 1;
