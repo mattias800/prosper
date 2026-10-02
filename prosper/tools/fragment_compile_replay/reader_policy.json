@@ -225,13 +225,9 @@
   "prosper/src/hle/input/hle_pad.cpp": "324d127996cc0ab79cb770217eb16572cecdc2005387ed6213ea5c768adf2fd6",
   "prosper/src/hle/input/ime.cpp": "514f89c5ce03ca778840ce7686d81096aaf6bbe65d227460d7aa1b59d898f5e2",
   "prosper/src/hle/input/ime_input.hpp": "75c3ecc4abfa0b423eab2d3d9efc5565a1b47102dfeed015a50e2cf21b1d4878",
-<<<<<<< HEAD
-  "prosper/src/hle/kernel/hle_kernel.cpp": "68e7f655411349f9626e3601f7b88f66849d98548c61c1702db8e3e11fc310d2",
-=======
   "prosper/src/hle/kernel/guest_thread_handle.cpp": "7803c4d7a6b1e8ab279637edf23596cacc3889488027c153fd8157b2c142eb5d",
   "prosper/src/hle/kernel/guest_thread_handle.hpp": "5be6d4eb1bec721033e5b573269570b29538687a9a570f58b66ac51cd37a6ca1",
   "prosper/src/hle/kernel/hle_kernel.cpp": "47a68a70adff1021c83c7b18e63c19bee856d9eb93cd84720cb87b44cdb86c78",
->>>>>>> 3b9e8052ab89e762c04a6530b2d0f1db167e3f2a
   "prosper/src/hle/kernel/hle_kernel_time.cpp": "eb93c4c01e1d3facc6abb4969546333a79c38d2ef337355d139143713581c18e",
   "prosper/src/hle/kernel/hle_kernel_time.hpp": "ff8e0fe309f0d4084872e134bb16f752a8f8bf22978a70bc22acb3b28a398b49",
   "prosper/src/hle/kernel/sce_errno.hpp": "207ed9b960b05574d45d1bbce0bc417070a80d9528347254c4c297feaa581b8e",
@@ -329,7 +325,5 @@
   "prosper/src/loader/support_modules.hpp": "9f552b094d35335943cfac75b7d8940e5f9f8e5065ff46506d04b3daf46e08e4",
   "prosper/src/loader/tls_layout.hpp": "a3a362d0d486c921853a2fba7376218dcd17fe27bbc26ee9963778ed4a93301d",
   "prosper/src/self/module.cpp": "acf522496aa0a911b2558304e13e22e8eb278fb95189cffc91ee5a23bb4eb6f2",
-  "prosper/src/self/module.hpp": "f77ca1108dc7a9de52b7a93946ef1cfd6356e226865a0acf936b146c60b562e2",
-  "prosper/src/hle/kernel/guest_thread_handle.cpp": "49ab264a5276452524d3e650e9c4c0b66c05e316206e3ba7c00f6d7f35cddb91",
-  "prosper/src/hle/kernel/guest_thread_handle.hpp": "59afd61d3dbc729b3578b8eb51186cb98b201d94d9675c6d242203a11c731bd5"
+  "prosper/src/self/module.hpp": "f77ca1108dc7a9de52b7a93946ef1cfd6356e226865a0acf936b146c60b562e2"
 }
