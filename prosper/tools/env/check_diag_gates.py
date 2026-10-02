@@ -1769,7 +1769,7 @@ def scan_tree(root: Path, follow_members: bool = True, follow_getters: bool = Tr
     shared_writes: dict[str, list[frozenset]] = {}
     for path, lines in files.items():
         file_writes: dict[str, list[frozenset]] = {}
-        FileScanner(str(path.relative_to(root)), lines, preds, {}, printing,
+        FileScanner(path.relative_to(root).as_posix(), lines, preds, {}, printing,
                     None, flag_writes, None, file_writes, getters).run()
         for name, writes in file_writes.items():
             member_writes.setdefault(name, []).extend(writes)
@@ -1794,18 +1794,18 @@ def scan_tree(root: Path, follow_members: bool = True, follow_getters: bool = Tr
     # These discarded walks have no source writes yet, so refusal is all-or-nothing.
     for path in {root / rel for record in admitted for rel, _line in record.calls}:
         members = all_members if path in test_local else shared_members
-        FileScanner(str(path.relative_to(root)), files[path], preds, {}, printing,
+        FileScanner(path.relative_to(root).as_posix(), files[path], preds, {}, printing,
                     flags, None, members, None, getters, admitted).run()
     admitted = [record for record in admitted if record.admitted]
     for path in {root / record.source_path for record in admitted}:
         members = all_members if path in test_local else shared_members
-        FileScanner(str(path.relative_to(root)), files[path], preds, {}, printing,
+        FileScanner(path.relative_to(root).as_posix(), files[path], preds, {}, printing,
                     flags, None, members, None, getters, admitted, True).run()
 
     call_sites: dict[str, list[tuple[str, frozenset]]] = {}
     findings: list[Finding] = []
     for path, lines in files.items():
-        rel = str(path.relative_to(root))
+        rel = path.relative_to(root).as_posix()
         members = all_members if path in test_local else shared_members
         findings += FileScanner(rel, lines, preds, call_sites, printing, flags, None,
                                 members, None, getters, admitted).run()

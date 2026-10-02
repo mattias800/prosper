@@ -111,7 +111,7 @@ def scan(root: Path):
             except OSError:
                 continue
             for lineno, line in enumerate(text.split("\n"), 1):
-                where = f"{path.relative_to(root)}:{lineno}"
+                where = f"{path.relative_to(root).as_posix()}:{lineno}"
                 for m in CACHED_RE.finditer(line):
                     cached.setdefault(m.group(1), []).append(where)
                 for m in PER_SUBMIT_RE.finditer(line):
