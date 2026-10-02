@@ -2578,6 +2578,12 @@ endif()
   target_link_libraries(test_readfirstlane_uniformity PRIVATE prosper_core)
   add_test(NAME readfirstlane_uniformity COMMAND test_readfirstlane_uniformity)
 
+  add_executable(test_portable_bpermute tests/gpu/recompiler/test_portable_bpermute.cpp)
+  target_include_directories(test_portable_bpermute PRIVATE tests)
+  target_link_libraries(test_portable_bpermute PRIVATE prosper_core)
+  add_test(NAME portable_bpermute_contract COMMAND test_portable_bpermute)
+  set_tests_properties(portable_bpermute_contract PROPERTIES TIMEOUT 90)
+
   # #3713: a scalar branch may only be called workgroup-uniform when the value it compares is the
   # same for every wave along every path. Built as positive/negative pairs -- a proof that never
   # fires would otherwise pass the suite.
@@ -3470,6 +3476,12 @@ endif()
       add_test(NAME portable_wave64_readfirstlane COMMAND test_portable_wave64_readfirstlane)
       set_tests_properties(portable_wave64_readfirstlane PROPERTIES TIMEOUT 60)
 
+      add_executable(test_portable_bpermute_execution tests/gpu/execute/test_portable_bpermute.cpp)
+      target_include_directories(test_portable_bpermute_execution PRIVATE tests)
+      target_link_libraries(test_portable_bpermute_execution PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME portable_bpermute_execution COMMAND test_portable_bpermute_execution)
+      set_tests_properties(portable_bpermute_execution PROPERTIES TIMEOUT 90)
+
       # #3425: registered on Windows as well as in the UNIX block below, deliberately. This
       # defect is about the WINDOWS/NVIDIA frontend's _Exit path and the cost it recovers was
       # measured there (#3450), so a Linux-only guard would test the fix everywhere except
@@ -4091,6 +4103,12 @@ endif()
       target_link_libraries(test_portable_wave64_readfirstlane PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME portable_wave64_readfirstlane COMMAND test_portable_wave64_readfirstlane)
       set_tests_properties(portable_wave64_readfirstlane PROPERTIES TIMEOUT 60)
+
+      add_executable(test_portable_bpermute_execution tests/gpu/execute/test_portable_bpermute.cpp)
+      target_include_directories(test_portable_bpermute_execution PRIVATE tests)
+      target_link_libraries(test_portable_bpermute_execution PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME portable_bpermute_execution COMMAND test_portable_bpermute_execution)
+      set_tests_properties(portable_bpermute_execution PROPERTIES TIMEOUT 90)
       add_executable(ngg_capture_probe tools/ngg_probe/ngg_capture_probe.cpp)
       target_include_directories(ngg_capture_probe PRIVATE tests)
       target_link_libraries(ngg_capture_probe PRIVATE prosper_core Vulkan::Vulkan)

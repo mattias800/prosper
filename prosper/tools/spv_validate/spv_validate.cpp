@@ -28,6 +28,7 @@
 #include "../../tests/fixtures/spirv_fragment_vote_fixtures.hpp"
 #include "../../tests/fixtures/spirv_fragment_vote_execution.hpp"
 #include "../../tests/fixtures/spirv_fragment_neutral_fixtures.hpp"
+#include "../../tests/fixtures/portable_bpermute_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <algorithm>
 #include <array>
@@ -553,6 +554,14 @@ int main(int argc, char** argv) {
         }
     }
     namespace neutral = prosper::test::fragment_neutral;
+    {
+        namespace bp = prosper::test::bpermute;
+        uint32_t ordinal = 0;
+        for (const auto& c : bp::cases()) {
+            const auto name = "portable_bpermute_" + std::to_string(ordinal++);
+            dump(dir, name.c_str(), bp::compile(c), "recompile_compute");
+        }
+    }
     for (const auto& fixture : neutral::fixtures()) {
         if (!fixture.strict) continue;
         const std::string name = std::string("fragment_neutral_") + fixture.name;
