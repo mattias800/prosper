@@ -116,6 +116,7 @@ static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before
 #include <cmath>
 #include <chrono>
 #include <thread>
+#include <atomic>
 #include <mutex>
 #include <sys/stat.h>                  // the host filesystem probe behind resolve_app0_root()
 #include <filesystem>                  // directory listing behind the library scan
@@ -1188,6 +1189,13 @@ static std::string window_title_for(const std::string& dump, bool test_pattern) 
 Program g_prog;
 std::thread g_guest_thread;
 bool g_guest_started = false;
+// How the guest's entry thread ended, published for the event loop. -1 = still running; otherwise
+// BootResult::kind (0 = returned, non-zero = fault/abort). Without it a guest whose main thread
+// dies in the first seconds leaves a live window painting nothing and no message saying so: the
+// "black screen" is indistinguishable from a slow load (an AC Black Flag Resynced run sat in that
+// state for 72 minutes). The detail string is written before the kind is released.
+std::atomic<int> g_guest_end_kind{-1};
+std::string g_guest_end_detail;
 // True when THIS process authored PROSPER_GUEST_ARGS from the settings file (start_guest). A
 // relaunch must strip an app-authored value so the next title re-resolves its own (#2973 review).
 bool g_guest_args_app_set = false;
@@ -1319,6 +1327,12 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
             fprintf(stderr, "[app] guest backtrace: 0x%llx (%s)\n",
                     static_cast<unsigned long long>(address),
                     describe_code_address(address).c_str());
+        g_guest_end_detail = result.detail;
+        g_guest_end_kind.store(result.kind, std::memory_order_release);
+        fprintf(stderr,
+                "[app] GUEST ENTRY THREAD ENDED (kind=%d): guest workers may still be running. "
+                "Set PROSPER_EXIT_ON_GUEST_END=1 to quit instead.\n",
+                result.kind);
     });   // runs the guest frame loop
     fprintf(stderr, "[app] guest booted; presenting its frames.\n");
     return true;
@@ -2715,7 +2729,22 @@ int main(int argc, char** argv) {
     // The automatic capture delay starts at app-loop entry, not process start or guest boot. This
     // gives unattended routes one explicit, repeatable host-time origin without desktop input.
     const uint64_t perfLoopStartNs = prosper::perf::monotonic_now_ns();
+    bool guestEndReported = false;
     while (running && !prosper_stop_requested()) {
+        // Surface a dead guest in the title bar (and optionally quit) so a black window is never
+        // mistaken for a slow load. Reported once; later title updates may overwrite it.
+        if (!guestEndReported) {
+            const int endKind = g_guest_end_kind.load(std::memory_order_acquire);
+            if (endKind >= 0) {
+                guestEndReported = true;
+                if (win)
+                    SDL_SetWindowTitle(win, (title + (endKind != 0 ? " - GUEST CRASHED: "
+                                                                   : " - guest exited: ") +
+                                             g_guest_end_detail).c_str());
+                const char* quit = getenv("PROSPER_EXIT_ON_GUEST_END");
+                if (quit && quit[0] != '\0' && quit[0] != '0') running = false;
+            }
+        }
         drainStagedGrabCandidate();
         expirePendingGrabProducer();
         // Close a RenderDoc capture opened on the previous pass. Reporting the path is the whole

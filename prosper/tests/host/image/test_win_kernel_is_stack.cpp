@@ -1,11 +1,14 @@
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
+// Registered AttrGet consumes a guest Self handle; internal stack lookup still consumes the
+// native pthread/Windows IDs. Mixing them silently substitutes missing or wrong GC stack bounds.
 #include "host/image/exec_image.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include <windows.h>
 #include <pthread.h>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <thread>
@@ -13,6 +16,8 @@
 using namespace prosper;
 
 struct WorkerStackProbe {
+    HleFn self = nullptr;
+    std::atomic<uint64_t> guest_handle{0};
     volatile LONG ready = 0;
     volatile LONG release = 0;
     void* base = nullptr;
@@ -59,6 +64,7 @@ static void* __attribute__((sysv_abi)) prepared_guest_worker(void* raw) {
 
 static void* registered_worker(void* raw) {
     auto* probe = static_cast<WorkerStackProbe*>(raw);
+    probe->guest_handle.store(probe->self(0, 0, 0, 0, 0, 0), std::memory_order_release);
     ULONG_PTR low = 0, high = 0;
     GetCurrentThreadStackLimits(&low, &high);
     probe->base = (void*)low;
@@ -81,8 +87,9 @@ int main() {
     auto attr_destroy = Hle::lookup(nid_hash("scePthreadAttrDestroy"));
     auto thread_create = Hle::lookup(nid_hash("scePthreadCreate"));
     auto thread_join = Hle::lookup(nid_hash("scePthreadJoin"));
+    auto thread_self = Hle::lookup(nid_hash("scePthreadSelf"));
     if (!is_stack || !attr_init || !attr_get || !attr_getaddr || !attr_getsize || !attr_setsize ||
-        !attr_destroy || !thread_create || !thread_join) {
+        !attr_destroy || !thread_create || !thread_join || !thread_self) {
         std::fprintf(stderr, "required stack HLE is not registered\n");
         return 1;
     }
@@ -100,14 +107,18 @@ int main() {
     void* reported_base = nullptr;
     size_t reported_size = 0;
     attr_init((uint64_t)(uintptr_t)&attr, 0, 0, 0, 0, 0);
-    attr_get((uint64_t)pthread_self(), (uint64_t)(uintptr_t)&attr, 0, 0, 0, 0);
+    const uint64_t self_handle = thread_self(0, 0, 0, 0, 0, 0);
+    const bool self_query_ok = self_handle != 0 &&
+        attr_get(self_handle, (uint64_t)(uintptr_t)&attr, 0, 0, 0, 0) == 0;
     attr_getaddr((uint64_t)(uintptr_t)&attr, (uint64_t)(uintptr_t)&reported_base, 0, 0, 0, 0);
     attr_getsize((uint64_t)(uintptr_t)&attr, (uint64_t)(uintptr_t)&reported_size, 0, 0, 0, 0);
-    bool attr_bounds = reported_base == (void*)(uintptr_t)base && reported_size == 0x2000;
+    bool attr_bounds = self_query_ok && reported_base == (void*)(uintptr_t)base &&
+                       reported_size == 0x2000;
 
-    // The guest passes a winpthreads pthread_t handle for another thread, while Windows stack
-    // registration is keyed by GetCurrentThreadId(). The registry must bridge those identities.
+    // The guest passes the native worker's adopted Self handle, while internal stack registration
+    // remains keyed by GetCurrentThreadId()/pthread_t. Both identity bridges must keep this owner.
     WorkerStackProbe probe;
+    probe.self = thread_self;
     pthread_t worker = 0;
     bool worker_created = pthread_create(&worker, nullptr, registered_worker, &probe) == 0;
     for (int i = 0; worker_created && i < 2000 && !probe.ready; ++i) Sleep(1);
@@ -119,10 +130,13 @@ int main() {
 
     reported_base = nullptr;
     reported_size = 0;
-    attr_get((uint64_t)worker, (uint64_t)(uintptr_t)&attr, 0, 0, 0, 0);
+    const uint64_t worker_handle = probe.guest_handle.load(std::memory_order_acquire);
+    const bool target_query_ok = worker_handle != 0 &&
+        attr_get(worker_handle, (uint64_t)(uintptr_t)&attr, 0, 0, 0, 0) == 0;
     attr_getaddr((uint64_t)(uintptr_t)&attr, (uint64_t)(uintptr_t)&reported_base, 0, 0, 0, 0);
     attr_getsize((uint64_t)(uintptr_t)&attr, (uint64_t)(uintptr_t)&reported_size, 0, 0, 0, 0);
-    bool target_attr_bounds = reported_base == probe.base && reported_size == probe.size;
+    bool target_attr_bounds = target_query_ok && reported_base == probe.base &&
+                              reported_size == probe.size;
 
     InterlockedExchange(&probe.release, 1);
     if (worker_created) pthread_join(worker, nullptr);
@@ -157,10 +171,12 @@ int main() {
         pthread_attr_setstack((pthread_attr_t*)attr, sentinel_stack, 1024 * 1024) == 0;
     reported_base = nullptr;
     reported_size = 0;
-    attr_get((uint64_t)worker, (uint64_t)(uintptr_t)&attr, 0, 0, 0, 0);
+    const bool retired_query_refused =
+        attr_get(worker_handle, (uint64_t)(uintptr_t)&attr, 0, 0, 0, 0) == 3;
     attr_getaddr((uint64_t)(uintptr_t)&attr, (uint64_t)(uintptr_t)&reported_base, 0, 0, 0, 0);
     attr_getsize((uint64_t)(uintptr_t)&attr, (uint64_t)(uintptr_t)&reported_size, 0, 0, 0, 0);
-    bool missing_target_unchanged = sentinel_set && reported_base == sentinel_stack &&
+    bool missing_target_unchanged = retired_query_refused && sentinel_set &&
+                                    reported_base == sentinel_stack &&
                                     reported_size == 1024 * 1024;
     attr_destroy((uint64_t)(uintptr_t)&attr, 0, 0, 0, 0, 0);
     if (sentinel_stack) VirtualFree(sentinel_stack, 0, MEM_RELEASE);
