@@ -40,7 +40,7 @@ def is_python(path):
 def is_test_file(path):
     """True for a file that counts as a test for the presence rule."""
     name = path.rsplit("/", 1)[-1]
-    return name.startswith("test_") or path.startswith(TEST_TREE_PREFIX)
+    return (name.startswith("test_") and name.endswith(".py")) or path.startswith(TEST_TREE_PREFIX)
 
 
 def missing_test_violations(added, touched):
@@ -58,14 +58,25 @@ def ratchet_violations(path, base_count, head_count):
     return []
 
 
+def toplevel():
+    """The checkout root. Paths from `git diff` are relative to it, and ruff resolves a relative
+    `--stdin-filename` against its cwd only, so both ruff and file reads run from here: from a
+    subdirectory (ctest runs in the build tree) ruff would silently fall back to its defaults."""
+    out = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True
+    )
+    return Path(out.stdout.strip())
+
+
 def ruff(args, stdin=None):
-    """Run ruff from the dev environment; return the completed process."""
+    """Run ruff from the dev environment at the checkout root; return the completed process."""
     return subprocess.run(
         [sys.executable, "-m", "ruff", *args],
         input=stdin,
         capture_output=True,
         text=True,
         check=False,
+        cwd=toplevel(),
     )
 
 
@@ -75,7 +86,17 @@ def count_findings(source, filename):
         ["check", "--output-format", "json", "--stdin-filename", filename, "-"],
         stdin=source,
     )
-    return len(json.loads(proc.stdout or "[]"))
+    if proc.returncode not in (0, 1) or not proc.stdout.strip():
+        raise RuntimeError(
+            f"ruff could not evaluate {filename} (exit {proc.returncode}): {proc.stderr.strip()}"
+        )
+    try:
+        findings = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ruff could not evaluate {filename}: invalid JSON") from exc
+    if not isinstance(findings, list) or any(not isinstance(item, dict) for item in findings):
+        raise RuntimeError(f"ruff could not evaluate {filename}: invalid finding list")
+    return len(findings)
 
 
 SAFE_REF = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/@~^-]*")
@@ -89,19 +110,43 @@ def validate_ref(ref):
 
 
 def git(*args):
-    """Run git and return stdout, raising on failure."""
-    return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
+    """Run git at the checkout root and return stdout, raising on failure."""
+    return subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=True, cwd=toplevel()
+    ).stdout
+
+
+def parse_changes(out):
+    """Decode NUL-delimited changes, retaining rename origins and all touched test paths."""
+    if out and not out.endswith("\0"):
+        raise ValueError("incomplete git name-status output")
+    fields = iter(out.split("\0")[:-1])
+    added, modified, touched = [], {}, []
+    try:
+        for status in fields:
+            old_path = path = next(fields)
+            if status.startswith("R") and status[1:].isdigit():
+                path = next(fields)
+            elif status not in ("A", "M"):
+                raise ValueError(f"unexpected git change status {status!r}")
+            touched.append(path)
+            if not is_python(path):
+                continue
+            if status == "A" or not is_python(old_path):
+                added.append(path)
+            else:
+                modified[path] = old_path
+    except StopIteration as exc:
+        raise ValueError("incomplete git name-status output") from exc
+    return added, modified, touched
 
 
 def changed(base):
-    """Return (added, modified) .py paths of HEAD against the merge base with `base`."""
-    out = git("diff", "--name-status", "--diff-filter=AM", f"{base}...HEAD")
-    added, modified = [], []
-    for line in out.splitlines():
-        status, _, path = line.partition("\t")
-        if is_python(path):
-            (added if status == "A" else modified).append(path)
-    return added, modified
+    """Return added Python paths, modified/renamed origins and all touched paths."""
+    out = git(
+        "diff", "--name-status", "-z", "--find-renames", "--diff-filter=AMR", f"{base}...HEAD"
+    )
+    return parse_changes(out)
 
 
 def check_added(path):
@@ -116,22 +161,22 @@ def check_added(path):
     return problems
 
 
-def check_modified(path, base):
+def check_modified(path, base, base_path):
     """Ratchet for an existing file against its base version."""
-    base_src = git("show", f"{base}:{path}")
-    head_src = Path(path).read_text(encoding="utf-8")
+    base_src = git("show", f"{base}:{base_path}")
+    head_src = (toplevel() / path).read_text(encoding="utf-8")
     return ratchet_violations(path, count_findings(base_src, path), count_findings(head_src, path))
 
 
 def run(base):
     """Evaluate the whole PR; return the list of violation strings."""
     merge_base = git("merge-base", validate_ref(base), "HEAD").strip()
-    added, modified = changed(merge_base)
-    problems = missing_test_violations(added, added + modified)
+    added, modified, touched = changed(merge_base)
+    problems = missing_test_violations(added, touched)
     for path in added:
         problems += check_added(path)
-    for path in modified:
-        problems += check_modified(path, merge_base)
+    for path, base_path in modified.items():
+        problems += check_modified(path, merge_base, base_path)
     print(f"checked {len(added)} added, {len(modified)} modified Python file(s)")
     return problems
 
@@ -180,9 +225,13 @@ def main():
     ap.add_argument("--base", default="origin/main")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
-    if args.selftest:
-        return selftest()
-    problems = run(args.base)
+    try:
+        if args.selftest:
+            return selftest()
+        problems = run(args.base)
+    except (RuntimeError, ValueError, OSError, subprocess.CalledProcessError) as exc:
+        print(f"COULD NOT EVALUATE: {exc}", file=sys.stderr)
+        return 2
     if problems:
         print("\n".join(problems))
         return 1

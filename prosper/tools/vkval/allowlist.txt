@@ -81,5 +81,5 @@ VUID-vkCmdDispatch-maintenance4-08602 | environment-dependent | game_compute_exe
 # check caught the stale entry on the same change that fixed the defect, which is exactly what it
 # is for -- entry deleted rather than downgraded.
 
-# ---- #1715: generated geometry stage declares no invocation count -------------------------------
-VUID-VkPipelineShaderStageCreateInfo-stage-00715 | required | interp_render, rect_synthesis_render | The synthesised geometry entry point has no OpExecutionMode Invocations, so the declared count is 0 (#1715)
+# ---- #1715: shared generated geometry now explicitly declares Invocations 1 ---------------------
+# No allowance remains: any recurrence in interpolation, RectList or the quad producer fails.

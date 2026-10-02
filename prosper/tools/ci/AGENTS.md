@@ -29,9 +29,11 @@ usage, whether a PR is safe to merge.
 
 ## Python rule (applies to every Python file in the repository)
 
-Every new or changed Python tool gets a test that **fails without the change** — a pytest function or
-a stdlib `unittest`/`--selftest` case, registered in ctest when it is a host-side tool — and every new
-`.py` file opens with a docstring stating its purpose (ruff `D100`, enforced on added files).
+Python behavior changes need a meaningful regression that **fails without the change**, reusing
+applicable pytest or stdlib `unittest`/`--selftest` cases. Register host-side cases in ctest.
+Mechanical changes use relevant checks and state their scope and execution limits; they need no
+test mirroring the implementation. Every new `.py` file opens with a purpose docstring (ruff `D100`,
+enforced on added files). Follow the task's execution authority and resource coordination.
 
 Measured baseline, 2026-10-02: 211 tracked `.py` files, 1,520 ruff findings under the config in
 `pyproject.toml`, 209 files that `ruff format` would rewrite. That is why the gate is a ratchet and

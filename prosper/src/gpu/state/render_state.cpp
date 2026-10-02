@@ -310,7 +310,23 @@ RenderState extract_render_state(const GpuState& st) {
         rs.ps_input_cntl_valid_mask |= 1u << i;
     }
     rs.ps_input_ena = rd(st.cx, P::SPI_PS_INPUT_ENA);
+    if (const auto value = st.cx.find(P::SPI_PS_INPUT_ENA); value != st.cx.end()) {
+        rs.ps_raster_launch.input_ena_available = true;
+        rs.ps_raster_launch.input_ena = value->second;
+    }
+    if (const auto value = st.cx.find(P::SPI_PS_INPUT_ADDR); value != st.cx.end()) {
+        rs.ps_raster_launch.input_addr_available = true;
+        rs.ps_raster_launch.input_addr = value->second;
+    }
     rs.ps_input_addr = rd(st.cx, P::SPI_PS_INPUT_ADDR);
+    if (const auto value = st.cx.find(P::SPI_PS_IN_CONTROL); value != st.cx.end()) {
+        rs.ps_raster_launch.ps_in_control_available = true;
+        rs.ps_raster_launch.ps_in_control = value->second;
+    }
+    if (const auto value = st.cx.find(P::SPI_BARYC_CNTL); value != st.cx.end()) {
+        rs.ps_raster_launch.baryc_cntl_available = true;
+        rs.ps_raster_launch.baryc_cntl = value->second;
+    }
     rs.ps_wave32 = PM4_FIELD(rd(st.cx, P::SPI_PS_IN_CONTROL),
                              SPI_PS_IN_CONTROL, PS_W32_EN) != 0;
     if (const auto rsrc1 = st.sh.find(P::SPI_SHADER_PGM_RSRC1_PS); rsrc1 != st.sh.end()) {

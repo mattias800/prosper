@@ -346,6 +346,10 @@ void register_agc_hle();
 void register_kernel_mem_hle();
 // libkernel time/clock + C11 threads + assorted stubs; called by register_kernel_hle().
 void register_kernel_time_hle();
+// libkernel system-state entry points (operation mode, coredump handler); called by register_kernel_hle().
+void register_kernel_system_hle();
+// sceKernelSetPrtAperture / sceKernelGetPrtAperture; called by register_kernel_hle().
+void register_prt_aperture_hle();
 
 #ifdef _WIN32
 // Windows pthread-key lifecycle probes used by the focused concurrency regression.

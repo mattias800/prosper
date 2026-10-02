@@ -2080,6 +2080,11 @@ bool shader_analysis_has_prefix(const SharedShaderAnalysis& analysis,
            std::equal(words, words + dwords, analysis->code.begin());
 }
 
+SharedShaderWords shader_analysis_owned_words(const SharedShaderAnalysis& analysis) {
+    return analysis && !analysis->code.empty()
+        ? SharedShaderWords(analysis, &analysis->code) : SharedShaderWords{};
+}
+
 SharedShaderWords recompile_graphics_shader_cached_shared(
         ShaderProgramStage stage, const uint32_t* code, size_t dwords,
         const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,

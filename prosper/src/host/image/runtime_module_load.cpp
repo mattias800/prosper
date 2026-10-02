@@ -285,6 +285,12 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
         // A DATA import goes to the writable aperture, never to an executable stub (#3529) --
         // the same rule link_program applies at boot, applied to a module loaded later.
         if (imp.elf_type == STT_OBJECT) {
+            // Refuse before claiming a slot or binding a relocation: the backend's aperture
+            // state alone cannot make a zero Program base a valid guest object address.
+            if (!g_prog->data_base) {
+                fprintf(stderr, "[loadmod] '%s': import-data base is 0 -> ENOMEM\n", guest_path);
+                return abandon(kEnomem);
+            }
             auto dslot = g_nid_to_data_slot.find(imp.nid);
             if (dslot == g_nid_to_data_slot.end()) {
                 const uint32_t idx = (uint32_t)g_prog->data_slots.size();

@@ -474,7 +474,14 @@ namespace prosper {
 
 // Both touch guest memory, so each half defines them with its own fault-safety rules: a fault in
 // host HLE code kills the emulator, not just the guest.
-static void apr_write_result_slot(uint64_t addr, uint64_t value);
+//
+// The result slots are 32-bit: sceKernelAprSubmitCommandBufferAndGetResult takes
+// (cb, ring, uint32_t* out1, uint32_t* out2). The evidence is the guest's own code: a caller lays
+// the two slots out as adjacent 4-byte stack locals ([rbp-0x3c] and [rbp-0x34], the second sitting
+// directly below its stack canary), initialises one with a 32-bit store and reads it back with a
+// 32-bit load. An 8-byte store here overwrote the four bytes after the slot, which on that stack was
+// the low half of the canary (#4138).
+static void apr_write_result_slot(uint64_t addr, uint32_t value);
 // Diagnostic-only (PROSPER_AMPRLOG): read two guest qwords, false if not safely readable.
 static bool apr_probe_guest_pair(uint64_t addr, uint64_t out[2]);
 
@@ -763,8 +770,10 @@ static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
     const bool tag_echo = bound && bc.eq;
     uint64_t token = tag_echo ? bc.tag : prosper_apr_next_token(ring);
     if (!bound && write_result_outputs) {
-        if (a2 > 0xffff) apr_write_result_slot(a2, token);
-        if (a3 > 0xffff) apr_write_result_slot(a3, token);
+        // The slots are 32 bits wide, so the guest only ever observed the low half of a 64-bit
+        // token through them; storing exactly that keeps what it saw and stops the overrun.
+        if (a2 > 0xffff) apr_write_result_slot(a2, (uint32_t)token);
+        if (a3 > 0xffff) apr_write_result_slot(a3, (uint32_t)token);
     }
     if (amprlog()) fprintf(stderr, "[amprlog] AprSubmit%s cb=0x%llx ring1b=%llu out1=0x%llx out2=0x%llx -> token=0x%llx%s%s\n",
                            write_result_outputs ? "AndGetResult" : "",
@@ -814,8 +823,8 @@ namespace prosper {
 
 // #2139: unchanged from the pre-hoist code -- a plain store, exactly as the POSIX submit path has
 // always written its result slots. The caller already rejected obviously bogus addresses (<=0xffff).
-static void apr_write_result_slot(uint64_t addr, uint64_t value) {
-    *(uint64_t*)(uintptr_t)addr = value;
+static void apr_write_result_slot(uint64_t addr, uint32_t value) {
+    *(uint32_t*)(uintptr_t)addr = value;
 }
 
 // #2139 POSIX sibling: process_vm_readv reports EFAULT instead of faulting (all-or-nothing per
@@ -1554,6 +1563,23 @@ namespace {
                         if (past > next) next = past;
                     }
                 }
+            }
+            // An occupant the tracker does not know -- a host mapping -- is skipped the same way,
+            // when the host can say where it ends (Darwin; see prosper_host_occupant_end, #4043).
+            // Still only a starting hint: the next iteration claims with NOREPLACE semantics again.
+            if (const uint64_t host_end = prosper_host_occupant_end(cand, cand + len);
+                host_end > next && host_end <= UINT64_MAX - (align - 1)) {
+                const uint64_t past = align_up(host_end, align);
+                static std::atomic<bool> reported{false};
+                if (past - cand >= (1ull << 30) && !reported.exchange(true))
+                    fprintf(stderr, "[mem] auto-map: skipped an untracked host mapping ending at "
+                                    "0x%llx (%llu MiB past the probe at 0x%llx) in one step "
+                                    "instead of %llu 64 KiB probes (#4043; reported once)\n",
+                            (unsigned long long)host_end,
+                            (unsigned long long)((past - cand) >> 20),
+                            (unsigned long long)cand,
+                            (unsigned long long)((past - cand) / step));
+                next = past;
             }
             if (next <= cand) return nullptr;
             cand = next;
@@ -4294,14 +4320,14 @@ namespace prosper {
 // one, so if a title ever stalls waiting on that value the log is what points at this line; a
 // silent skip would leave it looking like the write happened. Bounded so a pathological caller
 // cannot flood the log. POSIX cannot reach this state: its store faults instead of skipping.
-static void apr_write_result_slot(uint64_t addr, uint64_t value) {
+static void apr_write_result_slot(uint64_t addr, uint32_t value) {
     MEMORY_BASIC_INFORMATION mbi{};
     constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY |
                                 PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
     const bool writable =
         VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)), &mbi, sizeof(mbi)) &&
         mbi.State == MEM_COMMIT && (mbi.Protect & kWritable) &&
-        static_cast<uintptr_t>(addr) + sizeof(uint64_t) <=
+        static_cast<uintptr_t>(addr) + sizeof(uint32_t) <=
             reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
     if (!writable) {
         static std::atomic<int> skipped{0};
@@ -4316,7 +4342,7 @@ static void apr_write_result_slot(uint64_t addr, uint64_t value) {
             fprintf(stderr, "[ampr] further APR result-slot drops suppressed\n");
         return;
     }
-    *reinterpret_cast<uint64_t*>(static_cast<uintptr_t>(addr)) = value;
+    *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(addr)) = value;
 }
 
 // #2139 Windows sibling: prove the whole pair is committed and readable before touching it.
