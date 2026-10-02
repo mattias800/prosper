@@ -45,10 +45,7 @@ tests/gpu/capture/test_gpu_replay_seed_order.cpp
 tests/gpu/capture/test_interactive_capture_writer.cpp
 tests/gpu/capture/test_writer_provenance.cpp
 tests/gpu/diagnostics/test_draw_program_skip_render.cpp
-tests/gpu/diagnostics/test_gpu_breadcrumbs.cpp
-tests/gpu/diagnostics/test_gpu_labels.cpp
 tests/gpu/diagnostics/test_gpu_replay_shader_dump.cpp
-tests/gpu/execute/test_broadcast_htile_clear.cpp
 tests/gpu/execute/test_cached_compute_fill.cpp
 tests/gpu/execute/test_compute_buffer_residency.cpp
 tests/gpu/execute/test_compute_buffer_timing.cpp
@@ -71,7 +68,6 @@ tests/gpu/execute/test_fragment_proven_votes.cpp
 tests/gpu/execute/test_fragment_vote_refusal_reporting.cpp
 tests/gpu/execute/test_gpu_detile.cpp
 tests/gpu/execute/test_gpu_detile_render.cpp
-tests/gpu/execute/test_gpu_detile_storage.cpp
 tests/gpu/execute/test_gpu_execute.cpp
 tests/gpu/execute/test_gpu_retile.cpp
 tests/gpu/execute/test_index_expand.cpp
@@ -115,7 +111,6 @@ tests/gpu/recompiler/test_game_compute.cpp
 tests/gpu/recompiler/test_game_compute_rtt_mirror.cpp
 tests/gpu/recompiler/test_indirect_pointer_descriptor_range.cpp
 tests/gpu/recompiler/test_indirect_pointer_static_footprint.cpp
-tests/gpu/recompiler/test_interp_render.cpp
 tests/gpu/recompiler/test_mesh_backend.cpp
 tests/gpu/recompiler/test_messenger_recompile_guard.cpp
 tests/gpu/recompiler/test_normal_magnitude_predicate.cpp
@@ -126,7 +121,6 @@ tests/gpu/recompiler/test_raw_register_wide_data.cpp
 tests/gpu/recompiler/test_raw_wide_mask_lifetime.cpp
 tests/gpu/recompiler/test_rdna2_decode.cpp
 tests/gpu/recompiler/test_rdna2_to_spirv.cpp
-tests/gpu/recompiler/test_rect_synthesis_render.cpp
 tests/gpu/recompiler/test_replay_fragment_width.cpp
 tests/gpu/recompiler/test_shader_property_scans.cpp
 tests/gpu/recompiler/test_wave_width_independent.cpp
@@ -225,15 +219,12 @@ tests/shared/live/test_graphics_raw_wide_upload.cpp
 tests/shared/live/test_guest_write_drain.cpp
 tests/shared/live/test_live_compute_host_read_barrier.cpp
 tests/shared/live/test_live_renderer_registration_statics.cpp
-tests/shared/live/test_live_target_format.cpp
 tests/shared/live/test_native_bc_upload.cpp
 tests/shared/live/test_raster_quad_collection.cpp
 tests/shared/live/test_render_buffer_capture.cpp
-tests/shared/live/test_shared_vulkan_device.cpp
 tests/shared/live/test_storage_float_roundtrip.cpp
 tests/shared/live/test_texture_preparation.cpp
 tests/shared/present/test_compute_scanout.cpp
-tests/shared/present/test_present_blit.cpp
 tests/test_capture_manifest.cpp
 tests/test_dmem_caller_walk.cpp
 tests/test_gpu_replay_rtt_seed_rgba8.cpp

@@ -2549,15 +2549,15 @@ if(TARGET prosper_core)
   # PROSPER_GPU_BREADCRUMBS core + emitter against recording Vulkan entry points. No device: stock
   # lavapipe exposes neither marker extension, so what this proves is the emitter/resolver contract,
   # not that a real driver executes the writes before a hang (a local run, recorded in the PR).
-  add_executable(test_gpu_breadcrumbs tests/gpu/diagnostics/test_gpu_breadcrumbs.cpp)
-  target_link_libraries(test_gpu_breadcrumbs PRIVATE prosper_core)
-  add_test(NAME gpu_breadcrumbs COMMAND test_gpu_breadcrumbs)
+  prosper_add_gtest(test_gpu_breadcrumbs
+    SOURCES tests/gpu/diagnostics/test_gpu_breadcrumbs.cpp
+    LIBRARIES prosper_core)
 
   # PROSPER_GPU_LABELS: the label text, colour class and begin/end pairing, against recording
   # debug-utils entry points. What a capture tool DISPLAYS of them is a local look, not a ctest.
-  add_executable(test_gpu_labels tests/gpu/diagnostics/test_gpu_labels.cpp)
-  target_link_libraries(test_gpu_labels PRIVATE prosper_core)
-  add_test(NAME gpu_labels COMMAND test_gpu_labels)
+  prosper_add_gtest(test_gpu_labels
+    SOURCES tests/gpu/diagnostics/test_gpu_labels.cpp
+    LIBRARIES prosper_core)
 
   prosper_add_gtest(test_gpu_memory_budget
     SOURCES tests/gpu/diagnostics/test_gpu_memory_budget.cpp
@@ -4973,24 +4973,22 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
   target_link_libraries(vkval_sync_probe PRIVATE Vulkan::Vulkan)
 
   # Interpolation: a recompiled VS exports EXP PARAM0, a recompiled PS reads it via v_interp.
-  add_executable(test_interp_render tests/gpu/recompiler/test_interp_render.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_interp_render PRIVATE tests)
   # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
-  target_include_directories(test_interp_render PRIVATE frontends)
-  target_link_libraries(test_interp_render PRIVATE prosper_core Vulkan::Vulkan)
-  add_test(NAME interp_render COMMAND test_interp_render)
+  prosper_add_gtest(test_interp_render
+    SOURCES tests/gpu/recompiler/test_interp_render.cpp
+    INCLUDES tests frontends
+    LIBRARIES prosper_core Vulkan::Vulkan)
 
 
   # RectList fourth-corner synthesis: the geometry stage must complete the rectangle whichever of
   # the three supplied vertices is the shared corner (#3507).
-  add_executable(test_rect_synthesis_render tests/gpu/recompiler/test_rect_synthesis_render.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_rect_synthesis_render PRIVATE tests)
   # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
-  target_include_directories(test_rect_synthesis_render PRIVATE frontends)
-  target_link_libraries(test_rect_synthesis_render PRIVATE prosper_core Vulkan::Vulkan)
-  add_test(NAME rect_synthesis_render COMMAND test_rect_synthesis_render)
+  prosper_add_gtest(test_rect_synthesis_render
+    SOURCES tests/gpu/recompiler/test_rect_synthesis_render.cpp
+    INCLUDES tests frontends
+    LIBRARIES prosper_core Vulkan::Vulkan)
 
   # CPU-only controls drive the shipping persistent-color lookup/readback refusal branches.
   # Vulkan dev files satisfy the backend header; no usable device or GPU execution is required.
@@ -5366,20 +5364,20 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   set_tests_properties(gpu_detile_render PROPERTIES ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1")
   add_test(NAME gpu_detile_render_pressure COMMAND test_gpu_detile_render --staging-pressure)
   set_tests_properties(gpu_detile_render_pressure PROPERTIES ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_MAPPED_STAGING_MB=4")
-  add_executable(test_gpu_detile_storage tests/gpu/execute/test_gpu_detile_storage.cpp)
-  target_include_directories(test_gpu_detile_storage PRIVATE tests frontends)
-  target_link_libraries(test_gpu_detile_storage PRIVATE prosper_live_renderer Vulkan::Vulkan)
-  add_test(NAME gpu_detile_storage COMMAND test_gpu_detile_storage)
+  prosper_add_gtest(test_gpu_detile_storage
+    SOURCES tests/gpu/execute/test_gpu_detile_storage.cpp
+    INCLUDES tests frontends
+    LIBRARIES prosper_live_renderer Vulkan::Vulkan)
   add_test(NAME gpu_detile_storage_cpu COMMAND test_gpu_detile_storage)
   add_test(NAME gpu_detile_storage_unshared COMMAND test_gpu_detile_storage)
   set_tests_properties(gpu_detile_storage_unshared PROPERTIES ENVIRONMENT "PROSPER_NO_BACKEND_TEXTURE_SHARE=1")
   set_tests_properties(gpu_detile_storage_cpu PROPERTIES ENVIRONMENT "PROSPER_NO_GPU_DETILE_2D=1")
   add_test(NAME gpu_detile_render_cpu_2d COMMAND test_gpu_detile_render)
   set_tests_properties(gpu_detile_render_cpu_2d PROPERTIES ENVIRONMENT "PROSPER_NO_LIVE_PERSISTENT_COLOR_TARGETS=1;PROSPER_NO_GPU_DETILE_2D=1")
-  add_executable(test_broadcast_htile_clear tests/gpu/execute/test_broadcast_htile_clear.cpp)
-  target_include_directories(test_broadcast_htile_clear PRIVATE tests frontends)
-  target_link_libraries(test_broadcast_htile_clear PRIVATE prosper_live_renderer Vulkan::Vulkan)
-  add_test(NAME broadcast_htile_clear COMMAND test_broadcast_htile_clear)
+  prosper_add_gtest(test_broadcast_htile_clear
+    SOURCES tests/gpu/execute/test_broadcast_htile_clear.cpp
+    INCLUDES tests frontends
+    LIBRARIES prosper_live_renderer Vulkan::Vulkan)
 endif()
 
 # Normal sampled-render capture on every host with the live renderer. Unix writes PNG through zlib;
@@ -5838,24 +5836,21 @@ endif()
 # configurations and is defined later in this file than the core test block, so register this
 # after the fact and only when the target is actually present.
 if(TARGET prosper_live_renderer AND TARGET prosper_core)
-  add_executable(test_shared_vulkan_device tests/shared/live/test_shared_vulkan_device.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
-  target_include_directories(test_shared_vulkan_device PRIVATE tests)
   # Spells a `shared/...` include, which resolves from `frontends`.
-  target_include_directories(test_shared_vulkan_device PRIVATE frontends)
-  target_link_libraries(test_shared_vulkan_device PRIVATE prosper_live_renderer prosper_core)
-  add_test(NAME shared_vulkan_device COMMAND test_shared_vulkan_device)
+  prosper_add_gtest(test_shared_vulkan_device
+    SOURCES tests/shared/live/test_shared_vulkan_device.cpp
+    INCLUDES tests frontends
+    LIBRARIES prosper_live_renderer prosper_core)
 
   # Live-target format round trip: every LiveTargetPixelFormat a compute dispatch can import must
   # survive the write-back notifier. An unnamed format is reported as RGBA8, fails the mirror
   # identity check, and silently leaves the renderer's target invalidated (#773's family).
-  add_executable(test_live_target_format tests/shared/live/test_live_target_format.cpp)
   # Spells a `shared/...` include, which resolves from `frontends`.
-  target_include_directories(test_live_target_format PRIVATE frontends)
-  target_include_directories(test_live_target_format PRIVATE src tests)
-  target_link_libraries(test_live_target_format PRIVATE prosper_live_renderer prosper_core
-                                                        Vulkan::Vulkan)
-  add_test(NAME live_target_format COMMAND test_live_target_format)
+  prosper_add_gtest(test_live_target_format
+    SOURCES tests/shared/live/test_live_target_format.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
 
   add_executable(test_guest_write_drain tests/shared/live/test_guest_write_drain.cpp)
   target_include_directories(test_guest_write_drain PRIVATE frontends src tests)
@@ -5872,12 +5867,11 @@ if(TARGET prosper_live_renderer AND TARGET prosper_core)
 
   # GPU scanout handoff (#1270): the front-buffer image blits into a scanout slot byte-exactly, and the
   # producer/consumer slot handoff never tears or reuses an image in flight. Headless (no surface).
-  add_executable(test_present_blit tests/shared/present/test_present_blit.cpp)
   # Spells a `shared/...` include, which resolves from `frontends`.
-  target_include_directories(test_present_blit PRIVATE frontends)
-  target_include_directories(test_present_blit PRIVATE src tests)
-  target_link_libraries(test_present_blit PRIVATE prosper_live_renderer prosper_core Vulkan::Vulkan)
-  add_test(NAME present_blit COMMAND test_present_blit)
+  prosper_add_gtest(test_present_blit
+    SOURCES tests/shared/present/test_present_blit.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
 
   # #3915: a display buffer written by a compute storage store is presented through GPU present from
   # a mirror of the dispatch's own result, byte-identical to the CPU fallback, and never after the

@@ -12,6 +12,7 @@
 // Source fixtures carry SAMPLED_BIT because they model the renderer's shader-read layout.
 // Strict core/synchronization validation is the regression guard for that usage contract (#1716).
 #include "fixtures/render_runner.h"
+#include <gtest/gtest.h>
 #include "fixtures/spirv_triangle.h"
 #include "shared/live/live_renderer.hpp"
 #include "shared/present/present_blit.hpp"
@@ -33,8 +34,7 @@ namespace {
 constexpr uint32_t W = 96, H = 54;
 constexpr uint64_t FRAMES = 48;
 
-int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 // The per-frame source pattern (spatially varied + frame-varied so a torn/stale/reused frame is visible).
 inline void fill_pattern(uint8_t* p, uint32_t w, uint32_t h, uint64_t seq) {
@@ -82,10 +82,10 @@ void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout 
 }
 } // namespace
 
-int main() {
+TEST(PresentBlit, Contract) {
     frontend::register_live_renderer(std::string(), false);
     const test::RenderVkCtx& ctx = test::render_vk_ctx();
-    if (!ctx.ok) { printf("test_present_blit: no Vulkan device, skipping\n"); return 0; }
+    if (!ctx.ok) { printf("test_present_blit: no Vulkan device, skipping\n"); return; }
 
     gpu::set_shared_present_active(true);   // exercise the shared-queue submit-mutex path
 
@@ -637,6 +637,4 @@ int main() {
     vkDestroyBuffer(ctx.dev, stage, nullptr); vkFreeMemory(ctx.dev, stageMem, nullptr);
     vkDestroyImage(ctx.dev, src, nullptr); vkFreeMemory(ctx.dev, srcMem, nullptr);
 
-    printf(fails ? "test_present_blit: %d FAILURE(S)\n" : "test_present_blit: all ok\n", fails);
-    return fails ? 1 : 0;
 }
