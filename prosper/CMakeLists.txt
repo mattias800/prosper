@@ -1735,6 +1735,15 @@ if(TARGET prosper_core)
   add_test(NAME sync_ring COMMAND test_sync_ring)
   set_tests_properties(sync_ring PROPERTIES ENVIRONMENT "PROSPER_SYNC_RING=64")
 
+  # PROSPER_SYNC_RING_CALLERS: ring events carry the guest call site that reached them, so a total
+  # deadlock can be traced back to the guest function that was supposed to signal.
+  add_executable(test_sync_ring_callers tests/hle/sync/test_sync_ring_callers.cpp)
+  target_link_libraries(test_sync_ring_callers PRIVATE prosper_core)
+  target_include_directories(test_sync_ring_callers PRIVATE src)
+  add_test(NAME sync_ring_callers COMMAND test_sync_ring_callers)
+  set_tests_properties(sync_ring_callers PROPERTIES
+                       ENVIRONMENT "PROSPER_SYNC_RING=256;PROSPER_SYNC_RING_CALLERS=1")
+
   add_executable(test_mutex_host_tcb_identity tests/hle/sync/test_mutex_host_tcb_identity.cpp)
   target_link_libraries(test_mutex_host_tcb_identity PRIVATE prosper_core)
   add_test(NAME mutex_host_tcb_identity COMMAND test_mutex_host_tcb_identity)
