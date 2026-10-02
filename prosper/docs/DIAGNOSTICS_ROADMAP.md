@@ -7,8 +7,9 @@
 - **Measurement:** make a performance claim a mechanical comparison against a stored baseline, with
   refusal when the run conditions differ, instead of a figure quoted from whichever harness was open.
 
-It is a plan, not a status report. Every "exists" and "missing" claim was checked against the tree on
-2026-10-02 (grep over `src/`, `frontends/`, `tools/`); the evidence is stated per item. Re-verify before
+It is a plan, not a status report. The "exists" and "missing" claims were checked against the tree on
+2026-10-02 (grep over `src/`, `frontends/`, `tools/`, three corrected in review); the evidence is
+stated per item. Re-verify before
 building: this tree moves fast, and a stale gap list is the failure this document is written to avoid.
 
 Companion docs: `GPU_PROFILING_EXTERNAL.md` (vendor tools that need no prosper change),
@@ -52,7 +53,8 @@ These are the contract. An item that cannot meet them is redesigned, not waived.
 
 | Capability | Where | What it does not do |
 | --- | --- | --- |
-| Frame grab + offline replay | F9 `.prgbundle`, `tools/gpu_replay` | Schedulable headless (`PROSPER_GRAB_BUNDLE_*`). |
+| Frame grab + offline replay | F9 `.prgbundle`, `tools/gpu_replay` (schedulable headless via `PROSPER_GRAB_BUNDLE_*`) | Captures rendered-frame bugs only; not CPU, logic or audio. |
+| RenderDoc in-app capture | `frontends/shared/diagnostics/renderdoc_capture.hpp`, `PROSPER_RENDERDOC_AFTER_MS` / `_AT_FRAME` / `_AT_PAD_FLIP` (#3321) | Needs RenderDoc already injected; nothing bundled. |
 | Bounded perf capture | F8 `.prperf`, `tools/perf/performance_capture_report.py` | Reports by time; six timestamp brackets per **compute** dispatch. |
 | Always-on alarms | `[perf-alarm]`, `src/diagnostics/perf/` | Names a cost per window; no per-frame cause code. |
 | Stage buckets | `PROSPER_RENDER_TIMING` | Setup/resource breakdown; not a per-frame guest/driver/GPU/wait/present split. |
@@ -60,7 +62,7 @@ These are the contract. An item that cannot meet them is redesigned, not waived.
 | Guest frame pacing | `tools/perf/flip_pacing_report.py` | Interval distribution of guest flips from `PROSPER_EVLOG`; names the limiter class. |
 | Distinct-frame rate | `src/gpu/present/present_frame_rate.*` | Median interval, run average, active fraction. **No tail percentile and no `1% low`.** |
 | Compute-dispatch GPU time | `frontends/shared/live/live_compute.cpp` | `vkCmdWriteTimestamp` around dispatches only; no graphics-pass timestamps. |
-| CPU/GPU clock correlation | calibrated timestamps, 7 files | Present, not exposed as a per-frame series. |
+| CPU/GPU clock correlation | **missing**: no `VK_EXT_calibrated_timestamps` / `vkGetCalibratedTimestamps` use outside docs | M2 and M4 need it; add it with whichever lands first. |
 | Validation layer on tests | `tools/vkval/` | Runs ctest under `VK_LAYER_KHRONOS_validation`; **not** a runtime key for a live title. |
 | Vulkan object names | `src/gpu/diagnostics/vk_object_names.hpp` | Guest shader modules only. |
 | VRAM budget | `src/gpu/diagnostics/gpu_memory_budget.hpp` | `VK_EXT_memory_budget` read; no per-run peak series. |
@@ -146,9 +148,8 @@ strategy, dependencies and what it deliberately does not do.
   and hashes only, never guest strings.** Zero cost off: the function pointers are not loaded.
 - **Acceptance:** a debug-messenger test checks the labels on a real (software) device; a default run
   shows no loaded debug-utils pointers.
-- **Enables:** D1 (shared identity), and a RenderDoc in-app capture trigger if one is ever wanted
-  (frame-number-selected capture via `renderdoc_app.h` when RenderDoc is already injected; nothing
-  linked, nothing bundled).
+- **Enables:** D1 (shared identity), and readable captures from the existing RenderDoc in-app trigger
+  (`renderdoc_capture.hpp`, #3321).
 
 ### D6. Per-pipeline shader statistics
 
@@ -199,15 +200,17 @@ charter: addresses and operation ordinals are run-local).
 - **Design:** per frame, numeric `cpu_ms` (guest until submit), `rec_ms` (driver record/submit),
   `gpu_ms` (timestamp queries around the frame's submits, converted with `timestampPeriod`; omitted when
   the queue lacks timestamp support), `wait_ms` (blocked on a fence), `present_ms`; plus per-frame
-  means in the report. Calibrated timestamps correlate GPU time to the CPU clock.
+  means in the report. Correlating GPU time to the CPU clock needs `VK_EXT_calibrated_timestamps`,
+  which prosper does not use yet (§2).
 - **Acceptance:** conversion and schema unit-tested with a synthetic clock; a software-device test that
   a submit yields a `gpu_ms`; harness-forced readback is flagged in the record (rule 7).
 - **Out of scope here:** per-pass timelines (M4).
 
 ### M3. Run metadata and baseline compare with refusal
 
-- **Evidence missing:** `tools/screenshot` records no build preset, commit, driver version, present
-  mode or resolution scale (0 hits), and no tool refuses to compare mismatched runs.
+- **Evidence missing:** `tools/screenshot` records no build preset, commit, driver version or present
+  mode (0 hits; resolution scale IS recorded, as `render_scale` from `PROSPER_RENDER_SCALE`), and no
+  tool refuses to compare mismatched runs.
 - **Design:** the runtime writes its own run conditions (build preset, short commit baked at build,
   Vulkan vendor id and driver version, present mode, resolution scale, harness id, route/scene id and
   duration, config hash). A `compare --baseline --result` mode prints per-field deltas and **refuses**
@@ -254,7 +257,8 @@ charter: addresses and operation ordinals are run-local).
 
 ### M8. Structured logging sink
 
-- **Evidence:** ~1,491 `fprintf(stderr|stdout)` call sites and ~698 `getenv("PROSPER_*")` gates.
+- **Evidence:** ~1,491 `fprintf(stderr|stdout)` call sites and ~698 `getenv("PROSPER_*")` gates in
+  `prosper/src` alone (about 2,700 and 1,100 across `src/`, `frontends/` and `tools/`).
 - **Design:** a thin in-tree `LOG(subsystem, level, ...)` that **keeps the exact `[tag]` prefix** (tools
   and docs grep it), adds one `PROSPER_LOG=gpu=debug,hle=warn` knob, an in-memory ring (feeds D2) and a
   single sink. Fault and signal paths stay on raw `write(2)`: allocation and locks are not
