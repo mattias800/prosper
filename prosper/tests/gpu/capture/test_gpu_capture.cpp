@@ -4279,7 +4279,7 @@ int main(int argc, char** argv) {
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
     if (legacy_bytes.size() >= 12) legacy_bytes[8] = 68;   // kVersion + 1: a future version
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 67",
+          error == "unsupported capture version 68",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;
