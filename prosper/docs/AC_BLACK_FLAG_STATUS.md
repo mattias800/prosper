@@ -95,6 +95,19 @@ Unexplained and not yet shown to matter:
   That change would alter init timing for every title that auto-links a module, so it needs a
   cross-title census before landing. Evidence: gdb and disassembly of the SELF modules flattened with
   `tools/il2cpp/prx_to_elf.py`, 2026-10-02, main `4a2ea88d` plus #4129 and #4137.
+- The `__stack_chk_fail` that ended the "Loading Thread" right after `sceUltInitialize` is explained
+  and fixed on the fork (`fix/apr-submit-id-width`): `sceKernelAprSubmitCommandBufferAndGetResult`
+  (`ASoW5WE-UPo`) takes `(cb, ring, result*, uint32_t* id)`, the title passes a 4-byte stack int
+  for the id (`eboot+0x24511b0`) directly under its canary, and prosper stored an 8-byte token
+  there, zeroing the canary's low dword. Evidence: the stack copy of the canary read
+  `0x5245505300000000` against the expected `0x524550534F525000`. Not yet checked against the UE4
+  titles that treat both slots as 8-byte records.
+- With that and the deferral prototype applied the process no longer dies: about 25 guest threads
+  (`TaskThread00..11`, `IdleThread00..02`, `Loading Thread`, `SaveGameThread`) all sit in
+  `sceKernelWaitCond`/timed waits and the guest main thread waits on a condition variable that a
+  worker had already broadcast before it began waiting. `kqueue` and `kevent` (`libScePosix`)
+  still return 0 through the unimplemented stub, so a descriptor of 0 comes back from `kqueue`;
+  whether the stall is an engine file-completion path waiting on them is a hypothesis, not a result.
 - `scePthreadAttrGetstack` is unimplemented and returns 0 without filling its outputs. The
   `SystemLogger` thread called it right before the crash; that is a suspicion, not a result.
 - Unimplemented calls returning 0, names from `ps5rs/data/nids.csv`: `kqueue`, `kevent`
