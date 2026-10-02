@@ -25,6 +25,7 @@ static constexpr uint64_t kEinvalPool = 0x80020016ull;   // SCE_KERNEL_ERROR_EIN
 
 extern "C" int prosper_reserved_range_state(uint64_t addr);
 
+static int fails = 0;
 #define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
@@ -635,4 +636,6 @@ TEST(FalseSuccessNids, Contract) {
     test_apr_submit_and_get_id();
     test_pool_decommit();
     test_kernel_memory_pool();
+    if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); FAIL() << "legacy early exit"; }
+    EXPECT_EQ(fails, 0);
 }

@@ -12,6 +12,7 @@
 
 using namespace prosper::gpu;
 
+static int fails = 0;
 #define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Build a 4-dword V# (buffer resource): Base48, 14-bit stride @[16:29] of word1, num_records=word2,
@@ -1193,4 +1194,42 @@ TEST(BuildShaderResources, Contract) {
     // default `true` and the guard below stopped rejecting anything -- with no compiler diagnostic,
     // because `bool -> uint32_t` is a promotion. These arms pin the contract at the function the
     // production path now calls, so the same mistake reddens here instead of binding slice zero.
+    {
+        DecodedImageDescriptor unmapped{};
+        unmapped.base = 0x2026900000ull;
+        unmapped.width = 1920;
+        unmapped.height = 1080;
+        unmapped.depth = 1;
+
+        const DecodedImageView plain = unmapped_format_image_view(unmapped);
+        CHECK(plain.supported && plain.base == unmapped.base &&
+                  plain.width == 1920u && plain.height == 1080u,
+              "unmapped format at level zero of slice zero yields a supported allocation-base view");
+        CHECK(plain.mip_offset == 0 && !plain.in_mip_tail && plain.mip_tail_bytes == 0 &&
+                  plain.mip_tail_x == 0 && plain.mip_tail_y == 0 &&
+                  plain.layer_stride == 0 && plain.layer_mip_offset == 0,
+              "the unmapped-format view claims no mip or layer placement");
+        CHECK(plain.chain_element_width == 0 && plain.chain_element_height == 0 &&
+                  plain.chain_bytes_per_block == 0 && plain.chain_max_mip == 0 &&
+                  plain.chain_base_level == 0,
+              "the unmapped-format view reports its mip chain as NOT MODELLED (#3048)");
+
+        DecodedImageDescriptor shifted_level = unmapped;
+        shifted_level.base_level = 1;
+        CHECK(!unmapped_format_image_view(shifted_level).supported,
+              "unmapped format with a selected BASE_LEVEL fails closed (no mip offset is derivable)");
+
+        DecodedImageDescriptor shifted_slice = unmapped;
+        shifted_slice.base_array = 1;
+        CHECK(!unmapped_format_image_view(shifted_slice).supported,
+              "unmapped format with a selected BASE_ARRAY fails closed (it would bind slice ZERO)");
+
+        DecodedImageDescriptor shifted_both = unmapped;
+        shifted_both.base_level = 2;
+        shifted_both.base_array = 3;
+        CHECK(!unmapped_format_image_view(shifted_both).supported,
+              "unmapped format with both selectors set fails closed");
+    }
+
+    EXPECT_EQ(fails, 0);
 }

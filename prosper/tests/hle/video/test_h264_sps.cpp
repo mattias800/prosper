@@ -20,6 +20,7 @@
 #include <cstring>
 #include <vector>
 
+static int fails = 0;
 #define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 using prosper::h264::SpsPictureMeta;
@@ -439,4 +440,9 @@ TEST(H264Sps, Contract) {
     test_fill_rejects_undersized_block();
     test_fill_tiers_for_the_0x58_variant();
 
+    if (fails) {
+        printf("%d check(s) FAILED\n", fails);
+        FAIL() << "legacy early exit";
+    }
+    EXPECT_EQ(fails, 0);
 }
