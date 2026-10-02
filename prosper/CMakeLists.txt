@@ -515,6 +515,13 @@ if(Python3_Interpreter_FOUND)
   # loudly, when ruff is absent; the python-quality CI job installs it, so there they always run.
   add_test(NAME python_quality_gate
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_check_python_quality.py")
+  # check_arch_ratchet.py: per-file counts of six cross-title costs may go down, never up. The
+  # tests build one positive instance of every rule by hand, so a matcher that quietly stops
+  # matching goes red here instead of reporting a clean tree. The real-tree arms need the checkout
+  # (`git ls-files`): full mode must EVALUATE, and delta mode against origin/main (skipped when
+  # that ref is absent) must pass -- a stale row on main is not this build's failure.
+  add_test(NAME arch_ratchet_gate
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_check_arch_ratchet.py")
   # pr_body.py answers "is the PR body actually what I published?" (#2918). `gh pr edit --body-file`
   # was observed returning rc=1 on a GraphQL projects-deprecation error WITHOUT applying the edit,
   # leaving a stale body the author believed was corrected -- and a PR body is where reviewers and
