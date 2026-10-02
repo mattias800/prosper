@@ -66,6 +66,7 @@
 #include "overlay_text.hpp"                   // --fps-overlay: burn the rate into the image
 #include "build_revision.hpp"                // the revision the overlay reports for this binary
 #include "gpu/timeline/gpu_timeline.hpp"
+#include "shared/device/device_identity.hpp"
 #include "shared/live/live_renderer.hpp"           // register_live_renderer (frontends/shared)
 #include "capture_manifest.hpp"
 #ifdef PROSPER_VIDEO_MF
@@ -941,6 +942,26 @@ int main(int argc, char** argv) {
     screenshot::RunVerdict verdict =
         screenshot::decide_run_verdict(exit_code != 0, guest_outcome, allow_guest_fault);
     if (manifest) {
+        // The conditions the framerate below depends on, just before the summary so the device the
+        // renderer actually selected is known by now. A failed write here is not fatal on its own:
+        // the summary write below still decides the manifest's fate.
+        screenshot::CaptureConditions conditions;
+#if defined(_WIN32)
+        conditions.os = "windows";
+#elif defined(__APPLE__)
+        conditions.os = "macos";
+#else
+        conditions.os = "linux";
+#endif
+        if (const char* pace = getenv("PROSPER_FLIP_PACE_FPS")) conditions.flip_pace_fps = pace;
+        const prosper::frontend::DeviceIdentity gpu = prosper::frontend::device_identity();
+        conditions.gpu_known = gpu.known;
+        conditions.gpu_vendor_id = gpu.vendor_id;
+        conditions.gpu_device_id = gpu.device_id;
+        conditions.gpu_driver_version = gpu.driver_version;
+        conditions.gpu_api_version = gpu.api_version;
+        conditions.gpu_device_type = gpu.device_type;
+        fprintf(manifest, "%s\n", screenshot::manifest_conditions_json(conditions).c_str());
         const std::string summary = screenshot::manifest_summary_json(
             saved, count, stop, tracker, verdict, guest_outcome, allow_guest_fault, run_rate);
         if (fprintf(manifest, "%s\n", summary.c_str()) < 0 || fclose(manifest) != 0) {

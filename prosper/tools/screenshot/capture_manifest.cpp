@@ -252,6 +252,28 @@ const char* capture_source_name(CaptureSource source) {
     return "raw_scanout";
 }
 
+std::string manifest_conditions_json(const CaptureConditions& c) {
+    std::ostringstream line;
+    line << "{\"type\":\"conditions\",\"schema\":1"
+         << ",\"harness\":\"" << json_escape(c.harness) << "\""
+         << ",\"present_path\":\"" << json_escape(c.present_path) << "\""
+         << ",\"os\":\"" << json_escape(c.os) << "\""
+         << ",\"flip_pace_fps\":\"" << json_escape(c.flip_pace_fps) << "\""
+         << ",\"gpu_known\":" << (c.gpu_known ? "true" : "false");
+    auto field = [&](const char* name, uint32_t value) {
+        line << ",\"" << name << "\":";
+        if (c.gpu_known) line << value;
+        else             line << "null";
+    };
+    field("gpu_vendor_id", c.gpu_vendor_id);
+    field("gpu_device_id", c.gpu_device_id);
+    field("gpu_driver_version", c.gpu_driver_version);
+    field("gpu_api_version", c.gpu_api_version);
+    field("gpu_device_type", c.gpu_device_type);
+    line << "}";
+    return line.str();
+}
+
 std::string manifest_run_json(const CaptureRunConfig& c) {
     std::ostringstream line;
     line << "{\"type\":\"run\",\"schema\":1"

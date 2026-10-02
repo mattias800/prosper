@@ -604,6 +604,11 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME flip_pacing_report_logic
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/perf/test_flip_pacing_report.py")
+  # compare_runs.py: refuses two screenshot manifests whose run conditions differ. Synthetic
+  # manifests; every refusal arm differs from the matching pair in exactly one condition.
+  add_test(NAME compare_runs_logic
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_runs.py")
   # The two /proc samplers (#3400 / #3401). Both run against a /proc tree the test BUILDS, so they
   # need no target process, no privileges and no sleeping: wait_profile's arms pin per-thread
   # identity (same-name threads, TID reuse, renames, PID reuse), and lock_holder's pin that a run

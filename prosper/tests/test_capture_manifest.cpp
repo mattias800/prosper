@@ -484,6 +484,44 @@ int main() {
               "...and that the default run's PNGs do not");
     }
 
+    // The `conditions` record: what makes two framerates comparable, written after the renderer has
+    // chosen a GPU. An unknown device must be null, never 0 -- a zero vendor id would let two runs
+    // that never selected a device compare as equal.
+    {
+        CaptureConditions known;
+        known.os = "linux";
+        known.flip_pace_fps = "60";
+        known.gpu_known = true;
+        known.gpu_vendor_id = 0x1002;
+        known.gpu_device_id = 0x73bf;
+        known.gpu_driver_version = 99;
+        known.gpu_api_version = 4202496;
+        known.gpu_device_type = 2;
+        const std::string line = manifest_conditions_json(known);
+        CHECK(line.find("\"type\":\"conditions\"") != std::string::npos &&
+                  line.find("\"harness\":\"tools/screenshot\"") != std::string::npos &&
+                  line.find("\"present_path\":\"forced_readback\"") != std::string::npos,
+              "the harness and its forced-readback present path are named in the artifact");
+        CHECK(line.find("\"os\":\"linux\"") != std::string::npos &&
+                  line.find("\"flip_pace_fps\":\"60\"") != std::string::npos,
+              "the host OS and the flip pacing in force are recorded");
+        CHECK(line.find("\"gpu_known\":true") != std::string::npos &&
+                  line.find("\"gpu_vendor_id\":4098") != std::string::npos &&
+                  line.find("\"gpu_device_id\":29631") != std::string::npos &&
+                  line.find("\"gpu_driver_version\":99") != std::string::npos &&
+                  line.find("\"gpu_api_version\":4202496") != std::string::npos &&
+                  line.find("\"gpu_device_type\":2") != std::string::npos,
+              "a selected device is recorded as numeric ids");
+        CHECK(line.find("null") == std::string::npos, "a fully known record has no nulls");
+
+        const std::string unknown = manifest_conditions_json(CaptureConditions{});
+        CHECK(unknown.find("\"gpu_known\":false") != std::string::npos &&
+                  unknown.find("\"gpu_vendor_id\":null") != std::string::npos &&
+                  unknown.find("\"gpu_driver_version\":null") != std::string::npos &&
+                  unknown.find("\"gpu_vendor_id\":0") == std::string::npos,
+              "an unselected device is null on every GPU field, never a zero id");
+    }
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n");
     return 0;
