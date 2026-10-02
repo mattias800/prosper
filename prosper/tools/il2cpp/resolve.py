@@ -30,7 +30,11 @@ rest of what makes them agree, and il2cpp_symtab_agreement pins it.
 # again. The guard is now mechanical rather than advisory — tools/ci/check_usage_text.py
 # (ctest `tools_usage_text`) rejects any module under prosper/ that reads `__doc__` without having
 # one, and test_symtab_agreement.py runs this file with no arguments and reads what comes out.
-import json, bisect, os, re, sys
+import json
+import bisect
+import os
+import re
+import sys
 
 # Nearest-preceding acceptance window: an offset further than this past a method's start is reported
 # as "no managed method" rather than attributed to that method. script.json gives starts only, never
