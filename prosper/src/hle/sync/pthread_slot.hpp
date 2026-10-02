@@ -170,9 +170,12 @@ pthread_cond_t*  guest_cond_from_slot(uint64_t slot_addr);
 // --- whole operations, shared by the Sony spelling and the C11 spelling (#2619 / #2623) ----------
 // Each is the ENTIRE body of the scePthread* / pthread_* handler of the same name, bookkeeping
 // included, so the two spellings cannot drift again. Results are the BARE FreeBSD errno; the
-// libkernel encoding is applied by SCE_PTHREAD_ALIAS at the Sony spelling, and by the C11 wrapper's
+// libkernel encoding is applied by the Sony alias/wrapper, and by the C11 wrapper's
 // own result transform (the table above) at the C11 one.
 uint64_t guest_mutex_lock_slot(uint64_t slot_addr);
+uint64_t guest_mutex_trylock_slot(uint64_t slot_addr);
+// Timed operations take the Sony spelling's RELATIVE microsecond interval.
+uint64_t guest_mutex_timedlock_slot(uint64_t slot_addr, uint64_t timeout_us);
 uint64_t guest_mutex_unlock_slot(uint64_t slot_addr);
 // `kind` selects the retirement CENSUS bucket only (`_Mtx` vs `mutex`); the lifetime policy is
 // identical. Keeping the buckets apart is what let #2619 establish that no title on this machine
@@ -183,6 +186,7 @@ void     guest_cond_broadcast_slot(uint64_t slot_addr);
 // The ONE body that parks on a condition variable without a deadline, so `GuestCondWaiterScope`
 // (#2168) is taken here rather than remembered by each caller. EINVAL(22) if either slot is unusable.
 uint64_t guest_cond_wait_slot(uint64_t cond_slot, uint64_t mutex_slot);
+uint64_t guest_cond_timedwait_slot(uint64_t cond_slot, uint64_t mutex_slot, uint64_t timeout_us);
 // EBUSY(16) when the condvar still has waiters — checked BEFORE the slot is claimed, so a refusal
 // leaves the guest a handle that still works (#2168).
 uint64_t guest_cond_destroy_slot(uint64_t slot_addr, SyncObjectKind kind);
@@ -228,10 +232,9 @@ inline uint64_t sce_pthread_rc(uint64_t posix_rc) {
     return hle::sce_kernel_error(static_cast<hle::FreeBsdErrno>(static_cast<uint32_t>(posix_rc)));
 }
 
-// Dinkumware's C11 result enum, in its declaration order. Only the three the mutex-lock transform
-// can produce are reachable from here; the other two are spelled out so a future `_Mtx_timedlock`
-// transform does not have to re-guess the ordering. Every value below is PINNED BY THE GUEST'S OWN
-// BYTES rather than by analogy to a published header — each is the constant a decoded wrapper in the
+// Dinkumware's C11 result enum, in its declaration order. The wrappers below use success, timedout,
+// busy and error; nomem is retained to record the ordering. Every value below is PINNED BY THE
+// GUEST'S OWN BYTES rather than by analogy to a published header — each is the constant a decoded wrapper in the
 // shipped `libc.prx` of PPSA24651 actually produces (#2626):
 //
 //   0 success   every wrapper: `test eax,eax` then `cmove`/`je` — success passes through untouched
@@ -255,7 +258,7 @@ inline uint64_t sce_pthread_rc(uint64_t posix_rc) {
 // So its full transform is `0->0, ETIMEDOUT->2, EPERM->5, else->4`. That it discriminates EPERM at
 // all agrees with the #2327 note above `guest_mutex_not_owned_by_self` in hle_kernel.cpp, which
 // records Sony's own `_Cnd_timedwait` testing for it — two independent readings of the same
-// behaviour. The 5 is recorded here so the follow-up does not re-derive it, and deliberately NOT
+// behaviour. The 5 is used by the timed-wait transform below, and deliberately NOT
 // added to the enum below: the bytes give the NUMBER, and Dinkumware's spelling for it has not been
 // traced in this repository. Naming it would be the same unforced guess the block above
 // `thrd_rc_from_mutex_lock` declines to make about which exception `_Thrd_busy` raises.
@@ -284,6 +287,25 @@ inline uint64_t thrd_rc_from_mutex_lock(uint64_t posix_rc) {
     const uint64_t sce = sce_pthread_rc(posix_rc);
     if (sce == 0) return kThrdSuccess;
     return sce == hle::kSceKernelErrorEDEADLK ? kThrdBusy : kThrdError;
+}
+
+inline uint64_t thrd_rc_from_mutex_trylock(uint64_t posix_rc) {
+    const uint64_t sce = sce_pthread_rc(posix_rc);
+    if (sce == 0) return kThrdSuccess;
+    return sce == hle::kSceKernelErrorEBUSY ? kThrdBusy : kThrdError;
+}
+
+inline uint64_t thrd_rc_from_timed_mutex_lock(uint64_t posix_rc) {
+    const uint64_t sce = sce_pthread_rc(posix_rc);
+    if (sce == 0) return kThrdSuccess;
+    return sce == hle::kSceKernelErrorETIMEDOUT ? kThrdTimedout : kThrdError;
+}
+
+inline uint64_t thrd_rc_from_timed_cond_wait(uint64_t posix_rc) {
+    const uint64_t sce = sce_pthread_rc(posix_rc);
+    if (sce == 0) return kThrdSuccess;
+    if (sce == hle::kSceKernelErrorETIMEDOUT) return kThrdTimedout;
+    return sce == hle::kSceKernelErrorEPERM ? 5 : kThrdError;
 }
 
 // Test-only. The missed-wakeup generation counter is bumped by exactly one function
