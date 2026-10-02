@@ -5462,6 +5462,8 @@ void register_kernel_hle() {
     #undef R
     register_kernel_mem_hle();    // virtual/direct memory
     register_kernel_time_hle();   // time/clock + C11 threads + stubs
+    register_kernel_system_hle(); // operation mode, coredump handler
+    register_prt_aperture_hle();  // PRT aperture slots
 }
 
 } // namespace prosper
