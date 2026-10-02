@@ -23,6 +23,11 @@ counter. Inventory saturation and unidentified uses remain explicit. No known-Wa
 is NO DATA, not evidence that every shader is supported. Observation counts cover realization and
 backend boundaries and must not be called distinct shader counts.
 
+Fragment subgroup refusals additionally retain the actual lowering verdict and, for an unproved
+vote, the first failed vote's SOURCE SPIR-V dword offset/result/predicate IDs and defining opcode.
+This is not a guest instruction PC or proof of a varying/undefined predicate. Not-attempted and
+unavailable vote metadata remain explicit; the existing bounded announcement inventory is reused.
+
 Unplumbed vertex guest wave width is deliberately not inferred from the translator's Wave64
 default; its failures remain covered by `dropped-draws`. The known-width scope does not mean all
 Wave64 gaps have been implemented or detected. Capture re-realization suppression applies to
