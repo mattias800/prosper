@@ -38,7 +38,10 @@ enforced on added files). Follow the task's execution authority and resource coo
 Measured baseline, 2026-10-02: 211 tracked `.py` files, 1,520 ruff findings under the config in
 `pyproject.toml`, 209 files that `ruff format` would rewrite. That is why the gate is a ratchet and
 not a sweep: **do not mass-reformat**, and do not reformat a file you only touch for a fix. Lowering
-a file's findings is welcome; raising them fails CI. Set up with `uv sync --group dev`, run with
+a file's findings is welcome; raising them fails CI. `pytest` collects only the files listed in `testpaths` (`pyproject.toml`): of 77 `test_*.py`, 12 collect
+tests, 40 are script-style (ctest runs them as programs; pytest collects nothing) and 25 fail at import,
+so ctest stays the source of truth. When you convert a test to unittest/pytest style, add it to
+`testpaths`. Set up with `uv sync --group dev`, run with
 `uv run --group dev pytest` and `uv run --group dev ruff check <file>`.
 
 ## The property they share, and why it dictates how they are tested
