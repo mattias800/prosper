@@ -112,6 +112,9 @@ std::atomic<uint64_t> g_sync_trace_sequence{0};
 const bool g_sync_trace_enabled = g_sync_trace != nullptr;
 // Opt-in because it is not "plain stores": each event scans the stack for guest return addresses.
 // That changes timing on paths the ring exists to observe, so it is a separate switch from the ring.
+// Scale: every stack word is probed with VirtualQuery, and a thread with no guest frames (a host
+// signaller) scans up to the whole 64 KiB window, ~8,000 probes per event, plus a registry lock.
+// A deadlock that needs tight timing to reproduce may hide with this on; try the ring alone first.
 const bool g_sync_trace_callers = [] {
     const char* v = std::getenv("PROSPER_SYNC_RING_CALLERS");
     return v && *v && *v != '0';

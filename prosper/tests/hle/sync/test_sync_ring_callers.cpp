@@ -20,12 +20,14 @@
 // WHAT EACH ARM KILLS (mutations that must turn this test red):
 //   M1  sync_trace stops capturing callers (or capture is left off)         -> the guest-event arm
 //   M2  the dump omits the caller text                                      -> the guest-event arm
-//   M3  capture reports a stale/dead stack value as a caller (no `call`     -> the CONTROL arm: an
-//       validation)                                                            event from plain host
-//                                                                              code must carry none
-// The control event is emitted BEFORE the guest stub runs, deliberately: the stub leaves a dead
-// return address in stack slots below main()'s live frames, and an event recorded afterwards from
-// the same depth could re-validate it.
+// The control arm (an event from plain host code must carry no caller) is emitted BEFORE the guest
+// stub runs, deliberately: the stub leaves a dead return address in stack slots below main()'s live
+// frames, and an event recorded afterwards from the same depth could re-validate it.
+//
+// NOT KILLED HERE: dropping the `call`-instruction validation (a stale stack value reported as a
+// caller). At the control event the stack holds no value in any guest module's range at all, so the
+// control stays green with or without the check; that validation is shared with the fault
+// backtraces and is not exercised by this test.
 #include "hle/sync/sync_futex.hpp"
 #include "host/image/boot_program.hpp"
 #include "host/image/exec_image.hpp"
