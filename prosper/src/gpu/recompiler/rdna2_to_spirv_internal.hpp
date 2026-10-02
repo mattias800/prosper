@@ -237,6 +237,7 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
                   Glsl_Exp2=29, Glsl_Log2=30,
                   Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_UMin=38, Glsl_SMin=39, Glsl_FMax=40,
                   Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58, Glsl_UnpackHalf2x16=62,
+                  Glsl_FindILsb=73,   // lowest set bit of a 32-bit word, all ones at zero
                   Glsl_FindUMsb=75,   // bit index of the highest set bit (undefined at zero)
                   Glsl_NMin=79, Glsl_NMax=80 };   // NaN-aware min/max: one-NaN operand -> the other operand
 enum : uint32_t {
@@ -722,6 +723,9 @@ struct SpirvCompute {
     uint32_t iun(uint32_t op, uint32_t a) { uint32_t r = id(); put(code, op, {t_u32, r, a}); return r; }
     // GLSL.std.450 uint ext-instruction (UMin/UMax) on bit-operands -> bit-result (no bitcast).
     uint32_t uext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t r = id(); putv(code, Op_ExtInst, {t_u32, r, glsl, inst, a, b}); return r; }
+    // GLSL.std.450 FindILsb scans all 32 operand bits; zero returns -1. Preserve its signed
+    // result as raw uint bits for the guest scalar register file.
+    uint32_t find_ilsb(uint32_t a);
     // GLSL.std.450 FindUMsb: bit index of the most significant 1. glslang emits this with a
     // SIGNED result and an unsigned operand, which is the form drivers are exercised on, so
     // mirror it exactly and bitcast back. The result is UNDEFINED when the operand is zero —
@@ -2806,9 +2810,10 @@ struct RegState {
     // `s_mov_b32` lowers as `d = a`, so a tainted value stays tainted through any number of scalar
     // moves, and an overwrite installs a fresh id that is naturally clean.
     //
-    // THE TAINT SURVIVES COPIES AND NOTHING ELSE, and the gap is wider than a round-trip through a
-    // dispatcher variable. Any scalar ALU that COMPUTES from a tainted value produces a fresh id that
-    // is clean: `s_add_u32 s3, s0, s5` launders it, and so does an `s_cselect_b32` on SCC. SCC itself
+    // Numeric S_FF1_I32_B32 also carries known source taint to its fresh result (#4060). General
+    // ALU propagation remains incomplete, and the gap is wider than a round-trip through a
+    // dispatcher variable: `s_add_u32 s3, s0, s5` launders taint by producing a clean fresh id,
+    // and so does an `s_cselect_b32` on SCC. SCC itself
     // is a third route -- a compare on tainted operands sets SCC, and SCC read as a VOPC source
     // returns from `scalar_data_operand` one line BEFORE the lane-local check. So this closes the
     // direct and copy-laundered shapes, not the class. #3606 carries the propagation work.

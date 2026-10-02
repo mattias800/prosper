@@ -2605,6 +2605,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_entry_m0_dispatcher PRIVATE prosper_core)
   add_test(NAME entry_m0_dispatcher COMMAND test_entry_m0_dispatcher)
 
+  add_executable(test_scalar_ff1_b32 tests/gpu/recompiler/test_scalar_ff1_b32.cpp)
+  target_link_libraries(test_scalar_ff1_b32 PRIVATE prosper_core)
+  add_test(NAME scalar_ff1_b32 COMMAND test_scalar_ff1_b32)
+
   # #3231: the CFG dispatcher's `missing-entry-vcc` gate and the entry-block-dominance case it may
   # now admit. Both directions, in its own binary for the same reason as the file above.
   add_executable(test_entry_vcc_dead tests/gpu/recompiler/test_entry_vcc_dead.cpp)
@@ -4246,6 +4250,11 @@ endif()
       target_include_directories(test_rdna2_to_spirv PRIVATE tests)
       target_link_libraries(test_rdna2_to_spirv PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME rdna2_to_spirv_exec COMMAND test_rdna2_to_spirv)
+      add_executable(test_scalar_ff1_b32_exec tests/gpu/execute/test_scalar_ff1_b32_exec.cpp)
+      target_include_directories(test_scalar_ff1_b32_exec PRIVATE tests)
+      target_link_libraries(test_scalar_ff1_b32_exec PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME scalar_ff1_b32_exec COMMAND test_scalar_ff1_b32_exec)
+      set_tests_properties(scalar_ff1_b32_exec PROPERTIES TIMEOUT 120)
       add_executable(test_raw_register_wide_exec tests/gpu/execute/test_raw_register_wide_exec.cpp)
       target_include_directories(test_raw_register_wide_exec PRIVATE tests)
       target_link_libraries(test_raw_register_wide_exec PRIVATE prosper_core Vulkan::Vulkan)
