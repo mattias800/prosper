@@ -9,9 +9,11 @@ scan exists to prevent.
 
 import contextlib
 import io
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -151,8 +153,121 @@ End testing: Sep 02 20:00 UTC
 """
 
 
+def probe_controls():
+    """Exercise the real control entry points; mocked output is not GPU evidence."""
+    layer_line = f"INFO | LAYER: Insert instance layer \"{scan.LAYER}\""
+    hazard_line = "Validation Error: [ SYNC-HAZARD-WRITE-AFTER-WRITE ] control"
+    for suffix in ("", ".exe"):
+        with tempfile.TemporaryDirectory() as td:
+            build = Path(td)
+            layer = build / f"layer_control{suffix}"
+            sync = build / f"{scan.SYNC_PROBE}{suffix}"
+            layer.touch()
+            sync.touch()
+
+            def completed(cmd, layer_path=layer, **kwargs):
+                output = layer_line if cmd == [str(layer_path)] else hazard_line
+                return subprocess.CompletedProcess(cmd, 0, output)
+
+            with patch.object(scan.subprocess, "run", side_effect=completed) as run:
+                try:
+                    loaded = scan.prove_layer_loads(build, "layer_control")
+                    armed = scan.prove_sync_validation_arms(build)
+                    passed = loaded == layer_line and armed.startswith("VK_LAYER_VALIDATE_SYNC:")
+                except SystemExit:
+                    passed = False
+                check(passed, f"{suffix or 'exact-name'} artifacts reach both positive controls")
+                check([call.args[0] for call in run.call_args_list] ==
+                      [[str(layer)], [str(sync)]],
+                      f"{suffix or 'exact-name'} controls launch the actual selected files")
+
+            # Exercise the public --build-dir/--sync path, not just helper calls.
+            log = build / "Testing" / "Temporary" / "LastTest.log"
+            log.parent.mkdir(parents=True)
+            log.write_text("1/1 Testing: unit_control\n== PASS ==\n", encoding="utf-8")
+            ledger = build / "empty-ledger.txt"
+            ledger.touch()
+
+            def cli_completed(cmd, complete=completed, **kwargs):
+                if cmd[0] == "ctest":
+                    return subprocess.CompletedProcess(cmd, 0, "1/1 Test passed\n")
+                return complete(cmd, **kwargs)
+
+            with patch.object(scan.subprocess, "run", side_effect=cli_completed) as run:
+                try:
+                    rc = run_main(["--build-dir", td, "--probe", "layer_control", "--sync",
+                                   "--allowlist", str(ledger), "--ctest-arg=-R",
+                                   "--ctest-arg=^unit_control$"])
+                except SystemExit:
+                    rc = 1
+                calls = run.call_args_list
+                check(rc == 0 and len(calls) == 3 and
+                      [call.args[0] for call in calls[:2]] == [[str(layer)], [str(sync)]] and
+                      calls[-1].args[0] == ["ctest", "--timeout", "600", "--no-tests=error",
+                                            "--output-on-failure", "-R", "^unit_control$"] and
+                      calls[-1].kwargs["env"].get("VK_LAYER_VALIDATE_SYNC") == "1" and
+                      "VK_LAYER_ENABLES" not in calls[-1].kwargs["env"],
+                      f"{suffix or 'exact-name'} public sync scan reaches ctest with the proven setting")
+
+    with tempfile.TemporaryDirectory() as td:
+        build = Path(td)
+        for name in ("preferred", "preferred.exe", "explicit.exe", "explicit.exe.exe"):
+            (build / name).touch()
+        with patch.object(scan.subprocess, "run", return_value=
+                          subprocess.CompletedProcess([], 0, layer_line)) as run:
+            scan.prove_layer_loads(build, "preferred")
+            scan.prove_layer_loads(build, "explicit.exe")
+            check([call.args[0] for call in run.call_args_list] ==
+                  [[str(build / "preferred")], [str(build / "explicit.exe")]],
+                  "exact names take precedence and explicit exe names are not doubled")
+
+        (build / "missing.exe.exe").touch()
+        with patch.object(scan.subprocess, "run") as run:
+            try:
+                scan.prove_layer_loads(build, "missing.exe")
+                refused = False
+            except SystemExit as error:
+                refused = "probe binary" in str(error) and "missing.exe" in str(error)
+            check(refused and run.call_count == 0,
+                  "a missing explicit exe refuses rather than launching a doubled suffix")
+
+        # Filesystem presence alone must never stand in for either positive control.
+        with patch.object(scan.subprocess, "run", return_value=
+                          subprocess.CompletedProcess([], 0, "no layer or hazard\n")) as run:
+            for control, args, reason in (
+                    (scan.prove_layer_loads, (build, "explicit.exe"), "never inserted"),
+                    (scan.prove_sync_validation_arms, (build,), "NOT reported back")):
+                (build / f"{scan.SYNC_PROBE}.exe").touch()
+                try:
+                    control(*args)
+                    refused = False
+                except SystemExit as error:
+                    refused = reason in str(error)
+                check(refused, f"a present artifact still refuses an unproved {control.__name__}")
+
+        # Neither missing artifacts nor directories are executable controls.
+        for directory in (False, True):
+            with tempfile.TemporaryDirectory() as empty:
+                absent = Path(empty)
+                if directory:
+                    (absent / "missing").mkdir()
+                    (absent / scan.SYNC_PROBE).mkdir()
+                with patch.object(scan.subprocess, "run") as run:
+                    for control, args, reason in (
+                            (scan.prove_layer_loads, (absent, "missing"), "probe binary"),
+                            (scan.prove_sync_validation_arms, (absent,), "which is not built")):
+                        try:
+                            control(*args)
+                            refused = False
+                        except SystemExit as error:
+                            refused = reason in str(error)
+                        check(refused and run.call_count == 0,
+                              f"{'directory' if directory else 'missing'} control refuses before launch")
+
+
 def main():
     say("== test_vk_validation_scan ==")
+    probe_controls()
 
     findings = scan.parse_log(SAMPLE_LOG)
     check(set(findings) == {"VUID-vkCmdDraw-format-07753", "VUID-vkCmdDispatch-viewType-07752"},
