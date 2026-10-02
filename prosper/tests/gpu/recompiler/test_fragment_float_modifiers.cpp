@@ -339,7 +339,8 @@ std::vector<uint32_t> program(const Case& c) {
         check(d.vop3p_opsel==0,c.name+" actual unpacked scalar F16 low-half source/destination selectors");
     if(c.path==Path::Vop2Sdwa || c.path==Path::Vop3 || c.path==Path::ScalarF16)
         check(d.src[1].kind==OperandKind::VGPR && d.src[1].value==2 &&
-            (c.path==Path::Vop2Sdwa || (d.src[2].kind==OperandKind::VGPR && d.src[2].value==3)),
+            (c.path!=Path::ScalarF16 || (d.src[2].kind==OperandKind::VGPR && d.src[2].value==3)) &&
+            d.n_src==(c.path==Path::ScalarF16 ? 3 : 2),
             c.name+" actual remaining arithmetic operands");
     w.insert(w.end(),packet.begin(),packet.end());
     const uint32_t sink_move=0x7e000000u|(5u<<17)|((c.path==Path::ScalarF16?0x0bu:1u)<<9)|260u;
