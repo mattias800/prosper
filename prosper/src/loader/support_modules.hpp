@@ -68,4 +68,11 @@ std::vector<size_t> unimported_support_module_indices(
     const std::vector<LinkInput>& in,
     const std::vector<std::vector<std::string>>& imports_by_index);
 
+// Clears `init_on_load` on every input some OTHER module in `in` imports by library name. A module
+// with an importer must be initialised before that importer runs, so only a module nobody links
+// against may wait for the guest's own sceKernelLoadStartModule. `imports_by_index` is parallel to
+// `in`; a module's own imports never vouch for it. Returns the indices that were cleared.
+std::vector<size_t> veto_imported_init_on_load(std::vector<LinkInput>& in,
+    const std::vector<std::vector<std::string>>& imports_by_index);
+
 } // namespace prosper

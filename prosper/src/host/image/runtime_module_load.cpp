@@ -119,6 +119,22 @@ void runtime_module_loader_init(Program* p) {
     }
 }
 
+void run_deferred_module_init(const char* guest_path, uint64_t args, uint64_t argp, uint64_t guest_fs) {
+    if (!guest_path || !*guest_path) return;
+    std::vector<uint64_t> fns;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        if (!g_prog) return;
+        std::string b = basename_of(guest_path);
+        for (auto& c : b) c = (char)std::tolower((unsigned char)c);
+        for (auto& d : g_prog->deferred_inits)
+            if (d.first == b) { fns.swap(d.second); break; }   // taken exactly once
+        if (fns.empty()) return;
+        if (modlog()) fprintf(stderr, "[loadmod] starting deferred init of '%s' (%zu fns)\n", b.c_str(), fns.size());
+        for (uint64_t f : fns) call_module_entry(f, args, argp, guest_fs);
+    }
+}
+
 size_t runtime_loaded_module_count() {
     std::lock_guard<std::recursive_mutex> lk(g_mx);
     return g_loaded.size();

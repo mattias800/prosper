@@ -840,6 +840,7 @@ static uint64_t load_start_mod_run(uint64_t a0, uint64_t a1, uint64_t a2, uint64
     // repeat load of a runtime-loaded module idempotent — it is registered here too, by basename,
     // which is the PS5's own module identity.
     if (uint64_t h = module_handle_for_path(path)) {
+        run_deferred_module_init(path, a1, a2, guest_fs);   // no-op unless init was deferred
         if (a5) *(int32_t*)P(a5) = 0;
         return h;
     }

@@ -191,6 +191,26 @@ void drop_unimported_support_modules(std::vector<LinkInput>& in, const Say& say)
     }
 }
 
+template <typename Say>
+void veto_init_on_load_for_imported(std::vector<LinkInput>& in, const Say& say) {
+    if (std::none_of(in.begin(), in.end(), [](const LinkInput& e) { return e.init_on_load; })) return;
+    std::vector<std::vector<std::string>> imports_by_index(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        std::string perr;
+        if (auto m = Module::load(in[i].path, &perr)) {
+            for (const auto& imp : m->imports) imports_by_index[i].push_back(imp.lib_name);
+        } else {
+            // Unknown importer: stay eager everywhere rather than risk starving a real dependency.
+            say("init-on-load: cannot parse %s (%s); keeping all module init eager\n", in[i].path.c_str(), perr.c_str());
+            for (auto& e : in) e.init_on_load = false;
+            return;
+        }
+    }
+    veto_imported_init_on_load(in, imports_by_index);
+    for (const auto& e : in)
+        if (e.init_on_load) say("init DEFERRED until the guest loads it: %s\n", e.path.c_str());
+}
+
 std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
     // `verbose` exists only so a TOOL can call this without corrupting its own stdout: the
     // four prints below are the loader's, and nid_census --tsv writes machine-readable rows to
@@ -273,7 +293,12 @@ std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
             // NIDs); linking both would run two init_arrays and make dlsym answer differently per
             // module handle. Deduplicating on exports rather than on a filename suffix also degrades
             // correctly for a title that ships only the debug variant — nothing collides, so it links.
-            in.insert(in.begin() + (ptrdiff_t)(insert_at + slot), { path, base, true });
+            LinkInput li{ path, base, true };
+            // A PRX beside the eboot that nothing imports is one the title loads itself, so its
+            // constructors belong to that sceKernelLoadStartModule call, not to boot. Imported ones
+            // are vetoed below once the link list is complete.
+            li.init_on_load = true;
+            in.insert(in.begin() + (ptrdiff_t)(insert_at + slot), li);
             slot++;
         }
     }
@@ -311,6 +336,7 @@ std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
         }
     }
     drop_unimported_support_modules(in, say);
+    veto_init_on_load_for_imported(in, say);
     return in;
 }
 

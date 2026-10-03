@@ -129,3 +129,25 @@ TEST(SupportModules, Contract) {
     }
 
 }
+
+TEST(SupportModules, InitOnLoadVetoedWhenImported) {
+    LinkInput eboot = ordinary("/d/eboot.bin");
+    LinkInput imported = ordinary("/d/libA.prx"); imported.init_on_load = true;
+    LinkInput lone = ordinary("/d/libB.prx");     lone.init_on_load = true;
+    std::vector<LinkInput> in = {eboot, imported, lone};
+    // eboot imports libA; libB's own import of itself must not vouch for it.
+    std::vector<std::vector<std::string>> imports = {{"libA"}, {}, {"libB"}};
+    const auto cleared = prosper::veto_imported_init_on_load(in, imports);
+    EXPECT_EQ(cleared.size(), 1u);
+    EXPECT_FALSE(in[1].init_on_load) << "an imported module must init eagerly";
+    EXPECT_TRUE(in[2].init_on_load) << "an unimported module keeps deferral";
+}
+
+TEST(SupportModules, InitOnLoadVetoedByDeferredImporter) {
+    LinkInput a = ordinary("/d/libA.prx"); a.init_on_load = true;
+    LinkInput b = ordinary("/d/libB.prx"); b.init_on_load = true;
+    std::vector<LinkInput> in = {ordinary("/d/eboot.bin"), a, b};
+    prosper::veto_imported_init_on_load(in, {{}, {"libB"}, {}});
+    EXPECT_TRUE(in[1].init_on_load);
+    EXPECT_FALSE(in[2].init_on_load) << "B is a dependency of A, so it must init at boot";
+}

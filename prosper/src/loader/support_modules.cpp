@@ -46,4 +46,23 @@ std::vector<size_t> unimported_support_module_indices(
     return drop;
 }
 
+std::vector<size_t> veto_imported_init_on_load(std::vector<LinkInput>& in,
+    const std::vector<std::vector<std::string>>& imports_by_index) {
+    std::vector<size_t> cleared;
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (!in[i].init_on_load) continue;
+        const std::string lib = support_module_lib_name(in[i].path);
+        for (size_t j = 0; j < in.size() && j < imports_by_index.size(); ++j) {
+            if (j == i) continue;
+            const auto& v = imports_by_index[j];
+            if (std::find(v.begin(), v.end(), lib) != v.end()) {
+                in[i].init_on_load = false;
+                cleared.push_back(i);
+                break;
+            }
+        }
+    }
+    return cleared;
+}
+
 } // namespace prosper
