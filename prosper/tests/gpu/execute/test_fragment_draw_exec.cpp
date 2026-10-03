@@ -201,6 +201,9 @@ TEST_F(FragmentDrawExec, DeadSourceRetirementPreservesRetainedPipelinePayloads) 
         ASSERT_NE(original_compute, VK_NULL_HANDLE);
         ASSERT_NE(original_collect, VK_NULL_HANDLE);
         ASSERT_NE(original_framebuffer, VK_NULL_HANDLE);
+        // A normal ShaderCompileKey pins the same analysis independently of these payloads.
+        // Retain the draw while releasing both caches, then exercise its actual alias expiry.
+        g::clear_shader_recompile_cache();
         g::clear_shader_analysis_cache();
         EXPECT_FALSE(source.expired()) << "the real producing draw still owns its analysis";
     }

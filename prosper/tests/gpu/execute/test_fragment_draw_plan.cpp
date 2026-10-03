@@ -7,14 +7,18 @@
 namespace {
 namespace g = prosper::gpu;
 namespace f = prosper::test::fragment_draw;
-void retain_plan(const g::FragmentDrawProgramPlan& plan) {
-    f::retain_source(plan.collect_words(), "collector");
-    f::retain_source(plan.count_words(), "count");
-    f::retain_source(plan.assembly_words(), "assembly");
+void retain_plan(const g::FragmentDrawProgramPlan& plan, const char* prefix = "") {
+    const auto retain = [&](const auto& words, const char* kind) {
+        const auto name = std::string(prefix) + kind;
+        f::retain_source(words, name.c_str());
+    };
+    retain(plan.collect_words(), "collector");
+    retain(plan.count_words(), "count");
+    retain(plan.assembly_words(), "assembly");
     if (plan.capacity_owner())
-        f::retain_source(plan.capacity_owner()->kernel()->program.packet.spirv, "original_ps");
-    f::retain_source(plan.validation_words(), "validation");
-    f::retain_source(plan.replay_words(), "replay");
+        retain(plan.capacity_owner()->kernel()->program.packet.spirv, "original_ps");
+    retain(plan.validation_words(), "validation");
+    retain(plan.replay_words(), "replay");
 }
 class FragmentDrawPlan : public ::testing::Test {
 protected:
@@ -131,7 +135,12 @@ TEST_F(FragmentDrawPlan, UnsupportedAttachmentControlsNameOriginalSiteWithoutInv
         ASSERT_EQ(original[5], 0xf800180fu);
         original[5] ^= control;
         g::DrawItem unsupported;
-        ASSERT_TRUE(f::realize(unsupported, f::color_a, original));
+        const uint32_t masks = control == (1u << 4) ? 0xf0u : 0xfu;
+        ASSERT_TRUE(f::realize(unsupported, f::color_a, original, f::ieee_rsrc1, masks));
+        ASSERT_TRUE(unsupported.ps.has_cb_target_mask && unsupported.ps.has_cb_shader_mask);
+        EXPECT_EQ(unsupported.ps.cb_target_mask, masks);
+        EXPECT_EQ(unsupported.ps.cb_shader_mask, masks);
+        EXPECT_EQ(unsupported.ps.color_targets[control == (1u << 4) ? 1u : 0u].write_mask, 15u);
         const auto input = f::prepare(unsupported);
         ASSERT_TRUE(input && unsupported.fragment_draw_inputs);
         ASSERT_EQ(*unsupported.fragment_draw_inputs->raw_code, original);
@@ -196,6 +205,9 @@ TEST_F(FragmentDrawPlan, DeadOriginalGenerationRetiresWithoutRetainingItsOwnAnal
         ASSERT_TRUE(completion_plan && completion_plan->rejection_reason().empty());
         retain_plan(*completion_plan);
         completion_inputs = draw.fragment_draw_inputs;   // genuine draw/completion producer lease
+        // Normal compiled keys independently retain the analysis. Release BOTH external caches;
+        // the real draw/completion lease must remain, but our copied plan must not own its tracker.
+        g::clear_shader_recompile_cache();
         g::clear_shader_analysis_cache();
         EXPECT_FALSE(source.expired());
     }
@@ -211,7 +223,7 @@ TEST_F(FragmentDrawPlan, DeadOriginalGenerationRetiresWithoutRetainingItsOwnAnal
     const auto next_plan =
         g::cached_fragment_draw_program(*next.fragment_draw_inputs, *prepared, source_device, 50);
     ASSERT_TRUE(next_plan && next_plan->rejection_reason().empty());
-    retain_plan(*next_plan);
+    retain_plan(*next_plan, "next_");   // preserve both real generations, never overwrite six forms
     EXPECT_GT(g::fragment_draw_cache_stats().program_retired, before);
     EXPECT_FALSE(completion_plan->replay_words().empty())
         << "retiring residence cannot revoke a retained completion payload";

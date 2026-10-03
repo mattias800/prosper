@@ -39,7 +39,7 @@ struct Owners {
 
 inline bool realize(g::DrawItem& draw, const std::array<float, 4>& color = color_a,
                     const std::vector<uint32_t>& ps_words = fragment_words(),
-                    uint32_t ps_rsrc1 = ieee_rsrc1) {
+                    uint32_t ps_rsrc1 = ieee_rsrc1, uint32_t color_masks = 15u) {
     prosper::register_builtin_hle();
     const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
     uint64_t address = 0;
@@ -60,7 +60,9 @@ inline bool realize(g::DrawItem& draw, const std::array<float, 4>& color = color
     for (const auto* program : {&owner.vs, &owner.ps})
         for (const auto& reg : program->registers) state.sh[reg.offset] = reg.value;
     state.uc[p::VGT_PRIMITIVE_TYPE] = 4;
-    state.cx[p::CB_TARGET_MASK] = state.cx[p::CB_SHADER_MASK] = 15;
+    // Physical attachment gates must enable the original target BEFORE realization. An MRT1
+    // export with only MRT0 enabled is correctly a no-effect draw, not a replay-recipe refusal.
+    state.cx[p::CB_TARGET_MASK] = state.cx[p::CB_SHADER_MASK] = color_masks;
     state.cx[p::SPI_PS_IN_CONTROL] = 0;   // actual Wave64
     state.cx[p::SPI_BARYC_CNTL] = 0;
     state.cx[p::SPI_PS_INPUT_ENA] = state.cx[p::SPI_PS_INPUT_ADDR] = 0;   // actual input-free ABI
