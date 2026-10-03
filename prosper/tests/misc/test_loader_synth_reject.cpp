@@ -139,6 +139,42 @@ TEST(LoaderSynthReject, Contract) {
     // ---- module-level rejections. Each spec differs from `good_spec` in exactly one field. -------
     CHECK(link_error(good_path).empty(), "control: an unmodified fixture links");
 
+    // ELF requires p_filesz <= p_memsz. The bad fixture differs from its control in p_memsz only;
+    // both values still fit inside the same 16 KiB page-aligned image, so checking only image bounds
+    // would accept it and copy bytes past the segment's declared memory range.
+    {
+        std::string err;
+        auto control = Module::load(good_path, &err);
+        CHECK(control && control->segments.size() >= 1 &&
+                  control->segments[0].filesz == control->segments[0].memsz,
+              "PT_LOAD size control: file and memory extents are equal");
+        LoadedImage control_image;
+        CHECK(control && build_image(*control, kBase0, control_image, &err),
+              "PT_LOAD size control: a segment with filesz == memsz builds");
+        if (control && control_image.at(kBase0 + prosper_test::synth_export_va(0)))
+            CHECK(*control_image.at(kBase0 + prosper_test::synth_export_va(0)) == 0xc3,
+                  "PT_LOAD size control: file bytes reach the built image");
+
+        auto malformed = prosper_test::synth_prx_bytes(good_spec);
+        prosper_test::detail::sput64(malformed, 0x40 + 40, 0x800); // PT_LOAD p_memsz only
+        const std::string malformed_path = dir + "/reject_filesz_gt_memsz.prx";
+        CHECK(prosper_test::write_module_bytes(malformed_path, malformed, &err),
+              "PT_LOAD size rejection: the malformed fixture is written");
+        auto parsed = Module::load(malformed_path, &err);
+        CHECK(parsed && parsed->segments[0].filesz == prosper_test::kSynthFileSize &&
+                  parsed->segments[0].memsz == 0x800,
+              "PT_LOAD size rejection: parsing preserves the declared segment extents");
+        LoadedImage rejected_image;
+        err.clear();
+        CHECK(parsed && !build_image(*parsed, kBase0, rejected_image, &err),
+              "PT_LOAD size rejection: filesz larger than memsz is refused despite page padding");
+        CHECK(err.find("PT_LOAD (program header 0) filesz 0x1000 exceeds memsz 0x800") !=
+                  std::string::npos,
+              "PT_LOAD size rejection: error identifies the violated structural invariant");
+        CHECK(rejected_image.mem.empty(),
+              "PT_LOAD size rejection: failed construction publishes no partial image");
+    }
+
     // ---- SELF backing (#2686): recognized wrappers never borrow raw-ELF fallback bytes. --------
     for (const uint32_t magic : { 0x1d3d154fu, 0xeef51454u }) {
         const std::string prefix = magic == 0x1d3d154fu ? "self_a_" : "self_b_";
