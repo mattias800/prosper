@@ -14,6 +14,32 @@ dated historical records; they retain valuable falsifications and apparatus less
 or ownership changes. Do not let this document replace issue comments: issues are the durable evidence log, while
 this document is the map that helps the next orchestrator find and interpret that evidence.
 
+## Current scheduling policy (owner update, 2026-10-03)
+
+Compatibility game runs and correctness tests may proceed concurrently. They need no exclusive
+workload slot, orchestrator grant, canonical scheduling wrapper or `measure.sh` lock. Foreign games
+and builds are observations, not admission failures. Concurrent-run timings are not performance
+evidence. This supersedes the older scheduling instructions in the dated checkpoints below;
+their recorded runs, failures and measurements remain unchanged.
+
+Only performance measurements require a coordinated quiet exclusive interval and the canonical
+`measure.sh` wrapper configured in the worktree's ignored `LOCAL.md`. Agree on the owner, purpose
+and bounded duration; other lanes park games and heavy builds/tests during that interval. The
+lock alone cannot prevent uncoordinated workloads.
+
+All lanes still share CPU, GPU, memory and storage. Follow `LOCAL.md` for RAM and quota limits;
+on this host, build outputs, compiler caches, temporaries and run artifacts belong under `/tmp`.
+Check quota and memory headroom before a heavy phase, and build with `-j1` unless more parallelism
+has been coordinated. Preserve other lanes' builds and evidence. Track each owned process by
+PID and birth identity, drain its workers before reuse or cleanup, and never signal foreign work.
+Unresolved owned workers still block the next command; unrelated workers do not.
+
+Every game run must show the normal visible `prosper-app` window on the user's desktop, including
+compatibility, snapshot and performance checks. Do not substitute hidden, headless, Xvfb or
+offscreen launches. Standalone synthetic fixtures and unit tests are separate. Attribute every
+result to the actual source revision and executed binary; preserve older results as historical
+cohorts. Propagate this policy to subagents and each active worktree's local instructions.
+
 ## Current checkpoint
 
 - Latest title-wave integration: `e41de9f6fa5ca80ef78b88c846a7a62a7852ebed` on `main`.
@@ -24,10 +50,10 @@ this document is the map that helps the next orchestrator find and interpret tha
   **None has met that acceptance target.** *The Messenger* remains the user-confirmed interactive
   control. Warnings, setup menus, host presentation counts and successful cleanup do not establish
   a correctly rendered title screen.
-- The orchestrator retains merge ownership and rotates bounded investigations through the worker
-  slots. Authors keep their worktrees and artifacts isolated. Shared-machine configure/build/test
-  sequences and app/device runs require the canonical scheduling wrapper and an explicit named
-  resource grant; source preparation can continue while another lane holds the slot.
+- The orchestrator retains merge ownership and assigns bounded investigations to workers.
+  Authors keep their worktrees and artifacts isolated. Compatibility and correctness work
+  follows the current concurrent scheduling policy above; only performance measurements reserve
+  a quiet exclusive interval.
 
 | Title / owner | Tracker | Current evidence and next frontier |
 | --- | --- | --- |
@@ -70,7 +96,7 @@ retaining the existing Windows and macOS exceptions. Later on **2026-10-02**, th
 authorized merging after independent review approval without waiting for CI. A registered
 APPROVED review must match the exact current head, and blocking code findings must be resolved.
 Run the unmodified gate and preserve its actual results; waived checks are not passing checks.
-**Never merge draft PRs.** Local validation and named shared-resource scheduling remain required.
+**Never merge draft PRs.** Local validation and the current scheduling policy above remain required.
 
 The shared normal audio/input app built on frozen `e41de9f6`. Its eight-case CPU run ended with
 seven passes and one failure: three assertions in `agc_shader_create`. The passed
@@ -79,9 +105,9 @@ Source inspection identified
 absolute low-address fixture pointers that `CreateShader` treats as self-relative offsets, so
 registration success did not establish the metadata required by those assertions. A test-only
 correction must preserve the assertions, prove pointer relocation, and recheck the intended
-consumer-PC regression. No corrected test result or fresh game validation is accepted yet. Game
-runs remain separate named resource intervals. Preserve the failed cohort, attribute results to
-their actual revisions, and carry review forward only through inspected source deltas.
+consumer-PC regression. No corrected test result or fresh game validation is accepted yet. Preserve
+the failed cohort, attribute results to their actual revisions, and carry review forward only
+through inspected source deltas.
 
 ## Earlier title-wave checkpoint (2026-10-01)
 
@@ -1015,20 +1041,23 @@ The orchestrator owns integration and scheduling, not every line of investigatio
 4. Prevent duplicated hypotheses by requiring agents to read the current issue evidence before running anything.
 5. Keep each agent on an evidence ladder: retained offline artifact first, bounded live capture only when the artifact
    cannot answer the question, implementation only after a generic behavioral contract is identified.
-6. Decide GPU scheduling. Ordinary correctness replays may overlap; reserve exclusivity only when measurements,
-   memory pressure, or observed interference require it.
+6. Coordinate quiet exclusive intervals for performance measurements. Compatibility and correctness runs
+   proceed concurrently under the shared RAM/quota limits, without a workload grant or foreign-process veto.
 7. Review every proposed diff itself, including assumptions, scope, tests, `git diff --check`, and exact base/head.
-8. Open short-lived PRs for proven progress, wait for every applicable CI job, confirm release publication skipped on
-   an ordinary PR, then merge when authorized.
+8. Open short-lived PRs for proven progress, obtain independent exact-head approval and resolve blockers.
+   Under the current owner CI-wait waiver, merge approved non-draft PRs without waiting for CI; run the
+   unmodified merge gate and retain its actual results rather than describing waived checks as passing.
 9. Keep issues and PR descriptions self-contained. Post exact commands, hashes, conclusions, and falsified hypotheses.
 10. Update compatibility docs and representative screenshots when a title reaches a new visible checkpoint.
 11. Rebase or restart long-lived investigation branches from current `main` before they drift.
-12. Stop stale processes and keep evidence off the repository and off RAM-backed `/tmp`.
+12. Drain and clean up only owned process identities and inactive owned paths. Keep run artifacts out of git
+    and under `/tmp` on this host, preserving evidence still needed by another lane.
 
-The current user explicitly authorized the orchestrator/subagent arrangement as pair programming and allowed the
-independent-review step to be skipped for PRs produced by this coordinated work. The orchestrator still has to inspect
-the complete diff, verify the exact head, wait for all CI, and merge deliberately. Treat this as engagement-specific
-authorization: if a future user has not granted it, follow the independent-review default in `CLAUDE.md`.
+The current owner requires independent code review for every PR. A registered literal `APPROVED`
+review must match the exact current head, and blocking findings must be resolved before merge.
+The owner waives the CI wait, not review or truthful gate reporting; drafts remain excluded.
+Treat the CI waiver as engagement-specific authorization. If a future owner has not granted it,
+follow the normal CI policy in `CLAUDE.md`.
 
 ### Subagent responsibilities
 
@@ -1039,7 +1068,10 @@ Every game subagent should receive and follow this contract:
 - Read the title issue and status docs before running a new experiment.
 - State one falsifiable question before each run and the outcome that would distinguish the competing explanations.
 - Prefer immutable F9/timeline/capsule evidence and offline `gpu_replay` over repeated game boots.
-- Put captures, logs, screenshots, raw shaders, and scratch analysis under `~/`, never in git and never in `/tmp`.
+- Put captures, logs, screenshots, raw shaders, and scratch analysis in an owned `/tmp` directory on this host,
+  never in git; follow the worktree's `LOCAL.md` for quota and retention constraints.
+- Show every game run in the normal visible desktop `prosper-app` window. Record the actual executed binary's
+  revision and track owned PID/birth identities through final worker cleanup.
 - Never publish private absolute host paths. Public text uses `~/`, `<REPO_ROOT>`, `<WORKTREE>`, and `<DUMP_ROOT>`.
 - Do not make title-address special cases. Shared GPU/recompiler behavior needs a generic contract and regression tests.
 - Do not silently skip unsupported guest behavior. Retain fail-visible rejection until semantics are proven.
@@ -1064,14 +1096,16 @@ git status --short --branch
 git rev-parse HEAD
 ```
 
-Each worktree gets its own build directory. Put compiler temporaries on real disk:
+Each worktree gets its own build directory. On this host, put outputs, compiler temporaries and
+caches under `/tmp`; check RAM and quota headroom first:
 
 ```bash
-mkdir -p prosper/build-linux/tmpdir
-TMPDIR="$PWD/prosper/build-linux/tmpdir" \
-  cmake -S prosper -B prosper/build-linux -DGAME_DUMP=<DUMP_ROOT>/<TITLE>-app0
-TMPDIR="$PWD/prosper/build-linux/tmpdir" \
-  cmake --build prosper/build-linux -j6
+BUILD_DIR=/tmp/prosper-build-<agent-title>
+mkdir -p "$BUILD_DIR/tmpdir" "$BUILD_DIR/ccache"
+TMPDIR="$BUILD_DIR/tmpdir" CCACHE_DIR="$BUILD_DIR/ccache" \
+  cmake -S prosper -B "$BUILD_DIR" -DGAME_DUMP=<DUMP_ROOT>/<TITLE>-app0
+TMPDIR="$BUILD_DIR/tmpdir" CCACHE_DIR="$BUILD_DIR/ccache" \
+  cmake --build "$BUILD_DIR" -j1
 ```
 
 Before publishing, fetch `main`, inspect divergence, synchronize when needed, rerun the relevant checks on the exact
@@ -1092,12 +1126,17 @@ next hypothesis.
 
 Exclusive GPU ownership is **not** the default.
 
-Safe to overlap in normal circumstances:
+Compatibility and correctness work proceeds concurrently without a workload grant, lock or
+foreign-process veto. This includes:
 
 - `shader_inspect`, graph generation, disassembly, capture inspection, and CPU analysis;
 - short deterministic correctness replays where timing is irrelevant;
 - game-list or no-game frontend tests that only render light ImGui content;
 - builds and non-Vulkan tests.
+
+Use the current scheduling policy above for resource budgets, visible game windows and owned
+worker cleanup. The quiet-host checks and timing cautions below apply to performance evidence,
+not admission of compatibility or correctness runs.
 
 **Omitting `PROSPER_RENDER` does NOT make a run GPU-free.** This has been read as "no GPU" in
 briefs and in lane planning, and it is wrong. `tools/boot_trace/boot_trace.cpp:285` gates only the
@@ -1155,20 +1194,21 @@ So the honest classification is:
 | `gpu_replay`, `screenshot`, `prosper-app` | yes |
 | `gpu_timeline`, `self_dump`, `shader_histo`, `tools/re/*`, `tools/il2cpp/*` | no |
 
-Ask the orchestrator for an exclusive lease when:
+Coordinate a quiet exclusive measurement interval when:
 
 - profiling or reporting FPS/frame time;
 - comparing small performance changes where contention would swamp the signal;
-- a capture/replay has unusually high VRAM or host-memory demand;
-- concurrent jobs have already caused timeouts, device loss, or unstable images;
-- the user specifically asks to watch one live run without interference.
 
-An exclusive lease has an owner, purpose, start time, and bounded expected duration. The owner announces when it is
-released. Correctness replays do not become exclusive merely because they use Vulkan.
+The interval has an owner, purpose, start time and bounded expected duration, uses the canonical
+`measure.sh` wrapper, and ends only after owned workers drain. Correctness replays do not become
+exclusive merely because they use Vulkan. For memory pressure or observed interference, retain
+the actual failed result and coordinate resource budgets; do not turn foreign work into a
+compatibility admission failure or publish concurrent timings as performance evidence.
 
-Before starting a GPU run, inspect existing processes. A Prosper process older than roughly 30 minutes is presumed
-stale because known tests should finish in minutes. Resolve the exact command and owner, then terminate that exact
-process safely. Never use a broad pattern that could kill another agent's unrelated work.
+Inspect processes to identify your own workers and record contention. Age or a matching process
+name does not grant cleanup ownership. Verify the exact owned PID and birth identity before
+signaling it; never terminate another lane's process or use a broad kill pattern. Only unresolved
+owned workers or violated resource budgets block a compatibility/correctness command.
 
 **Count with `pgrep -x`. Both `ps | grep` idioms are wrong, in opposite directions.** This is a safety rule, not a
 style preference: a wrong count either blocks you from a free GPU or makes you kill a peer's live run.
@@ -1232,7 +1272,7 @@ For rendering correctness, use this order:
 4. Use a narrowly scoped diagnostic substitution with a selector-miss control.
 5. Add a reusable diagnostic seam only if current tools cannot separate the remaining stages.
 6. Run the title live only to capture missing state or validate the integrated fix.
-7. Measure performance only after correctness and with an exclusive GPU window when precision matters.
+7. Measure performance only after correctness, in a coordinated quiet exclusive interval.
 
 Every A/B must hold incidental behavior constant. For example, `PROSPER_TESTTEX` enables a generic CPU diagnostic
 copy path, so a binding-miss run with the same environment is the control for a binding-hit run.
@@ -2194,7 +2234,8 @@ titles beyond the lane that found it.
 ## Ready-to-send subagent prompts
 
 Give every agent: its worktree path, its branch, the exact `origin/main` SHA, the dump root, the **distrobox**
-build command, and the instruction to keep evidence under `~/` and out of `/tmp`, the repo, and public text.
+build command, the current scheduling policy, and an owned `/tmp` artifact directory on this host.
+Keep guest content out of git and private host paths out of public text.
 
 ### Astro Bot
 
@@ -2273,7 +2314,8 @@ A useful cadence is:
    depending on the unmerged result.
 5. After every merge, fetch `main` and restart dependent branches from the new exact head.
 6. Report to the user in plain language: what became visible/correct, what was ruled out, what is running, and whether
-   the GPU is shared or exclusive. Performance numbers are ballpark unless the GPU was isolated.
+   the GPU is shared or exclusive. Concurrent-run timings are execution context; performance
+   numbers require the coordinated quiet exclusive interval.
 
 When an agent appears frozen, distinguish a real long computation from a helper blocked on stdin. Avoid `gh ...
 --body-file -` in unattended commands; use a real bounded argument/file so the process cannot wait forever for input.

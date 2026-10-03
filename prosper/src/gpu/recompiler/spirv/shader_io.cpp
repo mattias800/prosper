@@ -173,7 +173,7 @@ uint32_t SpirvCompute::system_interpolation_component(uint32_t field, uint32_t c
             }
             variable = id(); put(types, Op_Variable, {t_ptr_in_v4f, variable, SC_Input});
             put(deco, Op_Decorate, {variable, Dec_Location, location});
-            if (field >= 4) put(deco, Op_Decorate, {variable, Dec_NoPerspective});
+            if (field == 3 || field >= 4) put(deco, Op_Decorate, {variable, Dec_NoPerspective});
             if (field == 0 || field == 4) put(deco, Op_Decorate, {variable, Dec_Sample});
             if (field == 2 || field == 6) put(deco, Op_Decorate, {variable, Dec_Centroid});
             in_varying[0x20000u | location] = variable; iface.push_back(variable);

@@ -327,16 +327,23 @@ static void capture_entry_controls(const DrawItem& draw, Owners& owner) {
     invalid = captured; invalid.draws[0].fs_raw_shader_index = UINT32_MAX;
     check(!serialize_gpu_capture(invalid,refused_bytes,error),
         "producing association requires retained raw words, not merely SOURCE or an entry marker");
-    const size_t entry_start = bytes.size() - (4u + kGpuCaptureFragmentEntryRecordBytes);
-    auto corrupt = bytes; corrupt[entry_start] ^= 1u;
+    auto entry_bytes = bytes;
+    entry_bytes.resize(entry_bytes.size() - 5u);   // one absent v70 wave record
+    entry_bytes[8] = 69;
+    entry_bytes[9] = entry_bytes[10] = entry_bytes[11] = 0;
+    const size_t entry_start = entry_bytes.size() - (4u + kGpuCaptureFragmentEntryRecordBytes);
+    auto corrupt = entry_bytes;
+    corrupt[entry_start] ^= 1u;
     GpuCaptureFile refused;
     check(!deserialize_gpu_capture(corrupt,refused,error),
         "entry count is checked against the already bounded actual draw inventory");
-    corrupt = bytes; corrupt[entry_start + 4u] = 2u;
+    corrupt = entry_bytes;
+    corrupt[entry_start + 4u] = 2u;
     check(!deserialize_gpu_capture(corrupt,refused,error),
         "nonboolean observed-entry tag refuses before materialization");
-    for (size_t end = entry_start; end < bytes.size(); ++end) {
-        corrupt = bytes; corrupt.resize(end);
+    for (size_t end = entry_start; end < entry_bytes.size(); ++end) {
+        corrupt = entry_bytes;
+        corrupt.resize(end);
         check(!deserialize_gpu_capture(corrupt,refused,error),
             "every truncated v69 entry byte refuses without guessed defaults");
     }
@@ -349,19 +356,24 @@ static void capture_entry_controls(const DrawItem& draw, Owners& owner) {
           !has_gap(*prepared,"packet-entry-ps-rsrc2-unavailable"),
           "test-reconstructed v69 facts reach preparation with known empty prefix, not system ABI");
     // v69 is an append-only 4-byte count plus 159 bytes per draw; remove exactly that suffix.
-    auto legacy = bytes; legacy.resize(legacy.size() - (4u + kGpuCaptureFragmentEntryRecordBytes));
-    legacy[8] = 68; legacy[9] = legacy[10] = legacy[11] = 0;
-    const bool old_ok = deserialize_gpu_capture(legacy,decoded,error) &&
-        materialize_gpu_replay(decoded,replay,error) && replay.items.size() == 1;
-    check(old_ok && !decoded.draws[0].ps_entry_source_available && !replay.items[0].ps_entry.observed,
-        "actual pre-v69 capture remains readable with explicit unavailable entry/source facts");
-    if (!old_ok) return;
-    restored_backend = captured_backend_contract(replay.items[0],decoded.draws[0],decoded);
-    const auto old = prosper::test::prepare_backend_fragment_packet_inputs(restored_backend);
-    check(old && has_gap(*old,"packet-entry-register-observation-unavailable") &&
-        has_gap(*old,"packet-entry-ps-rsrc2-unavailable") &&
-        has_gap(*old,"packet-producing-source-unavailable") && !old->ready,
-        "legacy absence stays a named shipping preparation refusal, never an inferred zero seed");
+      auto legacy = entry_bytes;
+      legacy.resize(legacy.size() - (4u + kGpuCaptureFragmentEntryRecordBytes));
+      legacy[8] = 68;
+      legacy[9] = legacy[10] = legacy[11] = 0;
+      const bool old_ok = deserialize_gpu_capture(legacy, decoded, error) &&
+                          materialize_gpu_replay(decoded, replay, error) &&
+                          replay.items.size() == 1;
+      check(old_ok && !decoded.draws[0].ps_entry_source_available &&
+                !replay.items[0].ps_entry.observed,
+            "actual pre-v69 capture remains readable with explicit unavailable entry/source facts");
+      if (!old_ok) return;
+      restored_backend = captured_backend_contract(replay.items[0], decoded.draws[0], decoded);
+      const auto old = prosper::test::prepare_backend_fragment_packet_inputs(restored_backend);
+      check(
+          old && has_gap(*old, "packet-entry-register-observation-unavailable") &&
+              has_gap(*old, "packet-entry-ps-rsrc2-unavailable") &&
+              has_gap(*old, "packet-producing-source-unavailable") && !old->ready,
+          "legacy absence stays a named shipping preparation refusal, never an inferred zero seed");
 }
 static void ownership_controls(DrawItem& draw, Owners& owner) {
     const auto sink = draw.raster_quads;

@@ -31,13 +31,13 @@ void evaluate(const f::Case& c) {
     SCOPED_TRACE(c.name);
     const auto program = recompile_fragment_packet(c.packet);
     ASSERT_FALSE(program.spirv.empty()) << program.rejection;
+    retain(program, c.name);   // retain produced SOURCE even if VM/consumer evaluation fails
     bpermute_oracle::Interpreter vm(program.spirv);
     const auto words = vm.run_packet(program.input_words, program.output_words);
     ASSERT_TRUE(vm.error.empty()) << vm.error;
     const auto result = decode_fragment_packet(program, words, true);
     ASSERT_TRUE(result.rejection.empty()) << result.rejection;
     EXPECT_EQ(result.exports, c.expected) << "all64 independent original raw EXP sinks";
-    retain(program, c.name);
 }
 bool gap(const FragmentPacketPreparation& prepared, const char* value) {
     return std::find(prepared.unmet.begin(), prepared.unmet.end(), value) != prepared.unmet.end();
@@ -77,6 +77,14 @@ TEST(FragmentPacketMaskEntry, AbsenceCannotBorrowZeroStorageOrPruneABypass) {
     EXPECT_EQ(bypass.first_read_pc[1], 6u);
     EXPECT_EQ(recompile_fragment_packet(p).rejection, "packet-entry-vcc-unavailable")
         << "supplied SCC1 cannot discard the structural SCC0 predecessor";
+    for (uint32_t missing_word : {20u, 21u}) {
+        p = f::scalar_vcc(0, true).packet;   // present zero is valid; an absent half is not
+        std::erase_if(p.sgprs, [&](const auto& value) { return value.first == missing_word; });
+        const auto refused = recompile_fragment_packet(p);
+        EXPECT_TRUE(refused.spirv.empty());
+        EXPECT_EQ(refused.rejection, "packet-sgpr-read-before-definition")
+            << "opposite supplied VCC cannot manufacture missing s" << missing_word;
+    }
     // Partial physical VCC definitions are still outside the executable packet DATA domain;
     // nevertheless the demanded-state proof must not count a low-only writer as a whole pair.
     p = f::base();
@@ -129,6 +137,52 @@ TEST(FragmentPacketMaskEntry, LegacyBundledAndExplicitFullAvailabilityStayIdenti
     EXPECT_EQ(old.output_words, explicit_full.output_words);
     retain(old, "legacy_bundled_full");
     retain(explicit_full, "explicit_full_same_legacy_bytes");
+
+    // The independently admitted owned stage domain includes READFIRST, which is outside this
+    // PR's forward mask inventory. Keep its genuine full profile, never infer absence is unused.
+    auto wider = f::base();
+    wider.mask_state_available = true;
+    f::fd::column(wider, 8, 0x71330008u);
+    wider.guest_code = {0x7e080508u};   // original READFIRST s4,v8
+    f::finish(wider, 4);
+    const auto expected = f::fd::expected(UINT64_MAX, 0x71330008u);
+    evaluate({"wider_owned_bundled_full", wider, expected});
+    const auto bundled_wider = recompile_fragment_packet(wider);
+    ASSERT_FALSE(bundled_wider.spirv.empty()) << bundled_wider.rejection;
+    EXPECT_EQ(bundled_wider.initial_mask_availability, 7u);
+    EXPECT_EQ(bundled_wider.demanded_initial_masks, 7u)
+        << "conservative wider-domain compatibility requirement, not a narrow mask proof";
+    wider.mask_state_available = false;
+    wider.exec_available = wider.vcc_available = wider.scc_available = true;
+    evaluate({"wider_owned_explicit_full", wider, expected});
+    const auto explicit_wider = recompile_fragment_packet(wider);
+    ASSERT_FALSE(explicit_wider.spirv.empty()) << explicit_wider.rejection;
+    EXPECT_EQ(bundled_wider.spirv, explicit_wider.spirv);
+    EXPECT_EQ(bundled_wider.input_words, explicit_wider.input_words);
+    EXPECT_EQ(bundled_wider.output_words, explicit_wider.output_words);
+    wider.scc_available = false;
+    EXPECT_EQ(recompile_fragment_packet(wider).rejection,
+              "packet-mask-instruction-effects-unimplemented");
+
+    // The stage-local proof consumes individual presence independently of its live flag witness.
+    // A present zero is supplied, whereas entry_flags_observed=false cannot bless offline storage.
+    auto partial = f::old_scc(false).packet;
+    std::string refusal;
+    EXPECT_TRUE(complete_graphics_packet_locals(partial, refusal)) << refusal;
+    const auto scc_gap =
+        "stage-input-scc-uninitialized:pc=" + std::to_string(facts(partial).first_read_pc[2]);
+    partial.scc_available = false;
+    EXPECT_FALSE(complete_graphics_packet_locals(partial, refusal));
+    EXPECT_EQ(refusal, scc_gap);
+    partial.scc_available = true;
+    EXPECT_FALSE(complete_graphics_packet_locals(partial, refusal, false));
+    EXPECT_EQ(refusal, scc_gap);
+    partial = f::new_scc(false).packet;
+    EXPECT_TRUE(complete_graphics_packet_locals(partial, refusal, false)) << refusal;
+    partial.exec_available = false;
+    EXPECT_FALSE(complete_graphics_packet_locals(partial, refusal));
+    EXPECT_EQ(refusal, "stage-input-original-unavailable:pc=4294967295")
+        << "missing EXEC cannot become certain zero execution in the inherited stage proof";
 }
 TEST(FragmentPacketMaskEntry, CachedCodeConsumesDifferentSuppliedDataAndExactPresenceProfile) {
     const auto c = f::cases().front();

@@ -376,11 +376,13 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
             return std::pair{std::move(raw_vs), std::move(raw_fs)};
         };
         const auto [raw_vs, raw_fs] = recompile_pair(item);
-        check(decoded.format_version == 69u && !raw_vs.empty() && !raw_fs.empty() &&
-              raw_vs == item.vs_words() && raw_fs == item.fs_words() &&
-              owned_nested_snapshot_at(*table, parent_pc, size) &&
-              owned_nested_snapshot_at(*table, child_pc, size), arm,
-              "fresh owned nested capture raw/stored paired SOURCE is exact after guest A changed to B");
+        check(decoded.format_version == 70u && !raw_vs.empty() && !raw_fs.empty() &&
+                  raw_vs == item.vs_words() && raw_fs == item.fs_words() &&
+                  owned_nested_snapshot_at(*table, parent_pc, size) &&
+                  owned_nested_snapshot_at(*table, child_pc, size),
+              arm,
+              "fresh owned nested capture raw/stored paired SOURCE is exact after guest A changed "
+              "to B");
         // Replay owns its raw versions by index, but never publishes their old guest addresses
         // as live capture origins. Retained modules/owners cannot replace that missing provenance.
         GpuCaptureFile absent_origin, absent_origin_loaded;
@@ -422,19 +424,22 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
             ? (vertex ? combined_replay.items[0].vrt : combined_replay.items[0].prt) : nullptr;
         const auto* combined_parent = combined_table ? owned_nested_snapshot_at(*combined_table, parent_pc, size) : nullptr;
         const auto* combined_child = combined_table ? owned_nested_snapshot_at(*combined_table, child_pc, size) : nullptr;
-        check(combined_ok && combined_loaded.format_version == 69u && combined_parent && combined_child &&
-              combined_loaded.draws[0].float_transport == explicit_item.float_transport &&
-              combined_replay.items[0].float_transport == explicit_item.float_transport &&
-              combined_loaded.draws[0].ps_float_flags == explicit_item.ps_float_flags &&
-              combined_loaded.draws[0].ps_launch_rsrc1 == explicit_item.ps_launch_rsrc1 &&
-              combined_replay.items[0].ps_float_flags == explicit_item.ps_float_flags &&
-              combined_replay.items[0].ps_launch_rsrc1 == explicit_item.ps_launch_rsrc1 &&
-              std::memcmp(combined_parent->host_data, parent->host_data, size) == 0 &&
-              std::memcmp(combined_child->host_data, child->host_data, size) == 0 &&
-              combined_replay.items[0].vs_words() == explicit_item.vs_words() &&
-              combined_replay.items[0].fs_words() == explicit_item.fs_words() &&
-              parent_reads == 0u && child_reads == 0u, arm,
-              "same roundtrip retains producing profile, launch context and immutable owned parent/child SOURCE");
+        check(combined_ok && combined_loaded.format_version == 70u && combined_parent &&
+                  combined_child &&
+                  combined_loaded.draws[0].float_transport == explicit_item.float_transport &&
+                  combined_replay.items[0].float_transport == explicit_item.float_transport &&
+                  combined_loaded.draws[0].ps_float_flags == explicit_item.ps_float_flags &&
+                  combined_loaded.draws[0].ps_launch_rsrc1 == explicit_item.ps_launch_rsrc1 &&
+                  combined_replay.items[0].ps_float_flags == explicit_item.ps_float_flags &&
+                  combined_replay.items[0].ps_launch_rsrc1 == explicit_item.ps_launch_rsrc1 &&
+                  std::memcmp(combined_parent->host_data, parent->host_data, size) == 0 &&
+                  std::memcmp(combined_child->host_data, child->host_data, size) == 0 &&
+                  combined_replay.items[0].vs_words() == explicit_item.vs_words() &&
+                  combined_replay.items[0].fs_words() == explicit_item.fs_words() &&
+                  parent_reads == 0u && child_reads == 0u,
+              arm,
+              "same roundtrip retains producing profile, launch context and immutable owned "
+              "parent/child SOURCE");
         if (combined_ok) {
             const auto paired = recompile_pair(combined_replay.items[0]);
             check(paired.first == explicit_item.vs_words() && paired.second == explicit_item.fs_words(), arm,

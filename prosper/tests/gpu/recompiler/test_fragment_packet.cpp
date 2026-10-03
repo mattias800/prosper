@@ -165,6 +165,291 @@ int main(int argc, char** argv) {
     reject(self_pair,"packet-sgpr-read-before-definition","pair alias reads OLD state before write");
     auto entry_absent = s::packet({s::Kind::SuppliedEntry}); entry_absent.sgprs.clear();
     reject(entry_absent,"packet-sgpr-read-before-definition","no invented value for a real entry read");
+    {
+        auto live = packet({});
+        std::string failure;
+        live.guest_code = {0x7e0202fdu, 0xf8001801u, 1u, 0xbf810000u};
+        check(!prosper::gpu::complete_graphics_packet_locals(live, failure, false) &&
+                  failure == "stage-input-scc-uninitialized:pc=0",
+              "live stage cannot manufacture zero entry SCC from packet storage");
+        check(prosper::gpu::complete_graphics_packet_locals(live, failure),
+              "explicit offline packet SCC remains an independent supplied-input contract");
+        live.guest_code.insert(live.guest_code.begin(), 0x87148f14u);   // real AND defines SCC
+        check(prosper::gpu::complete_graphics_packet_locals(live, failure, false),
+              "dominating original scalar instruction defines live SCC before its read");
+        live.guest_code = {0xbe94046au, 0x7e020214u, 0xf8001801u, 1u, 0xbf810000u};
+        check(!prosper::gpu::complete_graphics_packet_locals(live, failure, false) &&
+                  failure == "stage-input-vcc-uninitialized:pc=0",
+              "live stage cannot manufacture entry VCC before a complete physical pair read");
+        live.guest_code.insert(live.guest_code.begin(), 0xbeea047eu);   // VCC <- observed EXEC
+        check(prosper::gpu::complete_graphics_packet_locals(live, failure, false),
+              "complete original mask writer defines both live VCC halves");
+    }
+    for (uint32_t first : {0u, 31u, 32u, 63u, 64u}) {
+        auto input = packet({});
+        input.exec_mask = first == 64u ? 0u : uint64_t(1) << first;
+        input.scc = true;
+        input.export_enabled.fill(1);
+        if (first < 64u) input.export_enabled[first] = 0;   // helper still selects
+        for (auto& [reg, value] : input.sgprs)
+            if (reg == 16u || reg == 17u) value = UINT32_MAX;
+        input.guest_code = {0x7e1e0508u,   // READFIRST s15,v8
+                            0xbefe0410u,   // restore full EXEC from explicit s[16:17]
+                            0x7e02020fu,   // v1=s15: all slots must observe selected raw word
+                            0x7e0402fdu,   // v2=SCC: READFIRST must leave true SCC unchanged
+                            0xf8001803u, 0x00000201u,
+                            0x7e100300u,   // v8=v0 changes current source after first event
+                            0x7e260508u,   // distinct dynamic event READFIRST s19,v8
+                            0x7e0a0213u, 0xf8001801u, 5u, 0xbf810000u};
+        std::vector<uint32_t> want(24u * 64u, 0u);
+        const uint32_t selected = first == 64u ? 0u : first;
+        for (uint32_t lane = 0; lane < 64u; ++lane) {
+            const uint32_t base = lane * 24u;
+            const uint32_t header[] = {1u, 1u, input.export_enabled[lane], 0u, 3u, 0u, 1u, 1u};
+            std::copy(std::begin(header), std::end(header), want.begin() + base);
+            want[base + 8u] = 0x51000000u + selected * 17u;
+            want[base + 9u] = 1u;
+            std::copy(std::begin(header), std::end(header), want.begin() + base + 12u);
+            want[base + 16u] = 1u;   // second EXP enables just its first component
+            want[base + 20u] = 0u;   // after restoring EXEC, actual lane0 now contains v0=0
+        }
+        sink_case(input, want, "first_active_" + std::to_string(first), directory);
+        const auto module = prosper::gpu::recompile_fragment_packet(input);
+        check(count(module.spirv, 224u) >= 4u && count(module.spirv, 338u) == 0u &&
+                  count(module.spirv, 337u) == 0u && count(module.spirv, 252u) == 0u,
+              "owned READFIRST uses common barriers, never native Broadcast or worker Kill");
+    }
+    for (bool width8 : {false, true})
+        for (uint32_t first : {0u, 31u, 32u, 63u, 64u}) {
+            prosper::gpu::FragmentInvocationPacket input;
+            input.slots_available.fill(true);
+            input.mask_state_available = true;
+            input.export_enabled.fill(1);
+            input.exec_mask = first == 64u ? 0u : uint64_t(1) << first;
+            if (first < 64u) input.export_enabled[first] = 0;
+            input.guest_code = {0x7e280500u,
+                                0x87148f14u,
+                                0x8f148414u,
+                                width8 ? 0xf40c0200u : 0xf4080200u,
+                                0x28000010u,
+                                0xbefe0410u,
+                                width8 ? 0x7e02020fu : 0x7e02020bu,
+                                0x7e0402fdu,
+                                0xf8001803u,
+                                0x00000201u,
+                                0xbf810000u};
+            for (uint32_t reg : {0u, 1u, 2u}) {
+                prosper::gpu::FragmentPacketVgpr column;
+                column.reg = reg;
+                for (uint32_t lane = 0; lane < 64u; ++lane)
+                    column.words[lane] = reg == 0u ? lane : poison_sentinel;
+                input.vgprs.push_back(column);
+            }
+            // Only actual entry words are supplied. READFIRST, its bounded selector and raw SMEM
+            // establish their own scratch definitions; storage allocation cannot supply guest zero.
+            input.sgprs = {{0u, 0u}, {1u, 1u}, {16u, UINT32_MAX}, {17u, UINT32_MAX}};
+            prosper::gpu::PacketRawWaveWindow owner;
+            owner.load_pc = 3u;
+            owner.guest_base = 0x100000000ull;
+            owner.guest_begin = owner.guest_base + 16u;
+            owner.words.resize((240u + (width8 ? 32u : 16u)) / 4u);
+            for (uint32_t word = 0; word < owner.words.size(); ++word)
+                owner.words[word] = 0x97000000u + word * 101u;
+            input.raw_windows.push_back(owner);
+            const uint32_t selected = first == 64u ? 0u : first;
+            const uint32_t last = (selected & 15u) * 4u + (width8 ? 7u : 3u);
+            std::vector<uint32_t> want(12u * 64u, 0u);
+            for (uint32_t lane = 0; lane < 64u; ++lane) {
+                const uint32_t header[] = {1u, 1u, input.export_enabled[lane], 0u, 3u, 0u, 1u, 1u};
+                std::copy(std::begin(header), std::end(header), want.begin() + lane * 12u);
+                want[lane * 12u + 8u] = owner.words[last];
+                want[lane * 12u + 9u] = (selected & 15u) != 0u;   // SMEM preserves shift's SCC
+            }
+            const std::string name = "raw_window_x" + std::to_string(width8 ? 8u : 4u) + "_first_" +
+                                     std::to_string(first);
+            auto stage_input = input;
+            std::string input_refusal;
+            check(prosper::gpu::complete_graphics_packet_locals(stage_input, input_refusal) &&
+                      stage_input.sgprs == input.sgprs,
+                  name + " independent initialization never fabricates supplied SGPR scratch");
+            for (uint32_t absent : {0u, 1u}) {
+                auto missing_base = input;
+                std::erase_if(missing_base.sgprs,
+                              [absent](const auto& word) { return word.first == absent; });
+                const auto original_scalars = missing_base.sgprs;
+                check(!prosper::gpu::complete_graphics_packet_locals(missing_base, input_refusal) &&
+                          input_refusal == "stage-input-scalar-uninitialized:pc=3" &&
+                          missing_base.sgprs == original_scalars,
+                      name + " missing physical base word before raw window use=" +
+                          std::to_string(absent));
+            }
+            auto skipped_selector = input;
+            skipped_selector.guest_code.insert(skipped_selector.guest_code.begin(), 0xbf840001u);
+            skipped_selector.raw_windows.front().load_pc = 4u;
+            check(!prosper::gpu::complete_graphics_packet_locals(skipped_selector, input_refusal) &&
+                      input_refusal == "stage-input-scalar-uninitialized:pc=2",
+                  name + " structurally bypassed READFIRST cannot initialize register OFFSET");
+            sink_case(input, want, name, directory);
+            const auto prior = prosper::gpu::recompile_fragment_packet(input);
+            for (auto& word : input.raw_windows.front().words) word ^= 0x01010101u;
+            const auto changed = prosper::gpu::recompile_fragment_packet(input);
+            check(!prior.spirv.empty() && !changed.spirv.empty(),
+                  name + " immutable A/B comparison requires BOTH real compiled programs");
+            if (!prior.spirv.empty() && !changed.spirv.empty()) {
+                bpermute_oracle::Interpreter old_vm(prior.spirv), new_vm(changed.spirv);
+                const auto old_sink = old_vm.run_packet(prior.input_words, prior.output_words);
+                const auto new_sink = new_vm.run_packet(changed.input_words, changed.output_words);
+                check(old_vm.error.empty() && new_vm.error.empty() && old_sink == want &&
+                          new_sink != want && prior.spirv == changed.spirv,
+                      name + " old ownerA remains immutable after inputB");
+            }
+            auto invalid = input;
+            invalid.raw_windows.clear();
+            reject(invalid, "packet-raw-window-unavailable", name + " no owned window");
+            invalid = input;
+            invalid.raw_windows.front().words.pop_back();
+            reject(invalid, "packet-window-shape-invalid", name + " last possible word missing");
+            invalid = input;
+            invalid.raw_windows.front().words.push_back(0u);
+            reject(invalid, "packet-window-shape-invalid",
+                   name + " no inferred larger allocation extent");
+            invalid = input;
+            invalid.raw_windows.front().load_pc = 2u;
+            reject(invalid, "packet-window-code-or-base-unproved", name + " wrong exact loadPC");
+        }
+    // The SAME static READFIRST/load PCs execute twice. Current source v0 changes after the
+    // first visit; a cached first-event result or current-lane substitute produces another word.
+    // Export lies outside the loop, so its complete single-occurrence ABI remains authentic.
+    for (bool width8 : {false, true})
+        for (uint32_t selected : {31u, 32u, 63u}) {
+            prosper::gpu::FragmentInvocationPacket input;
+            input.slots_available.fill(true);
+            input.mask_state_available = true;
+            input.export_enabled.fill(1u);
+            input.export_enabled[selected] = 0u;
+            input.exec_mask = uint64_t(1) << selected;
+            input.sgprs = {{0u, 0u}, {1u, 1u}, {16u, UINT32_MAX}, {17u, UINT32_MAX}};
+            prosper::gpu::FragmentPacketVgpr source;
+            source.reg = 0;
+            for (uint32_t lane = 0; lane < 64u; ++lane) source.words[lane] = lane;
+            input.vgprs.push_back(source);
+            input.guest_code = {0xbe9e0380u,   // s30=0, actual loop counter definition
+                                0x7e280500u,
+                                0x87148f14u,
+                                0x8f148414u,
+                                width8 ? 0xf40c0200u : 0xf4080200u,
+                                0x28000010u,
+                                0x801e811eu,   // s30=s30+1
+                                0x7e00021eu,   // v0=s30 in the actually active guest slot
+                                0xbf0a821eu,   // SCC=(s30<2), full unsigned scalar compare
+                                0xbf85fff7u,   // if SCC, return to SAME READFIRST pc1
+                                0xbefe0410u,   // restore complete EXEC for observable exports
+                                width8 ? 0x7e02020fu : 0x7e02020bu,
+                                0x7e0402fdu,
+                                0xf8001803u,
+                                0x00000201u,
+                                0xbf810000u};
+            prosper::gpu::PacketRawWaveWindow window;
+            window.load_pc = 4u;
+            window.guest_base = 0x100000000ull;
+            window.guest_begin = window.guest_base + 16u;
+            window.words.resize((240u + (width8 ? 32u : 16u)) / 4u);
+            for (uint32_t word = 0; word < window.words.size(); ++word)
+                window.words[word] = 0x83000000u + word * 117u;
+            input.raw_windows.push_back(window);
+            std::vector<uint32_t> want(64u * 12u, 0u);
+            for (uint32_t lane = 0; lane < 64u; ++lane) {
+                const uint32_t header[] = {1u, 1u, input.export_enabled[lane], 0u, 3u, 0u, 1u, 1u};
+                std::copy_n(header, 8u, want.begin() + lane * 12u);
+                // Visit two selects current v0=1 in the same lowest EXEC slot. The loop compare
+                // then leaves SCC=0, and scalar SMEM/READFIRST must not manufacture another flag.
+                want[lane * 12u + 8u] = window.words[4u + (width8 ? 7u : 3u)];
+            }
+            const std::string name = "same_pc_window_x" + std::to_string(width8 ? 8u : 4u) +
+                                     "_first_" + std::to_string(selected);
+            sink_case(input, want, name, directory);
+            auto bypass = input;
+            bypass.guest_code[0] =
+                0xbf820001u;   // skip the first READFIRST, reach AND with absent s20
+            std::string refusal;
+            check(!prosper::gpu::complete_graphics_packet_locals(bypass, refusal) &&
+                      refusal == "stage-input-scalar-uninitialized:pc=2",
+                  name + " backedge definition cannot authenticate the bypassed first event");
+        }
+    {
+        prosper::gpu::FragmentInvocationPacket observed;
+        observed.slots_available.fill(true);
+        observed.mask_state_available = true;
+        observed.export_enabled.fill(1);
+        observed.export_enabled[60] = 0;
+        observed.exec_mask = uint64_t(1) << 63;
+        observed.quad_topology = prosper::gpu::FragmentPacketQuadTopology::ConsecutiveLogicalQuads;
+        observed.sgprs = {{16u, UINT32_MAX}, {17u, UINT32_MAX}};
+        prosper::gpu::FragmentPacketVgpr entry;
+        entry.reg = 0;
+        for (uint32_t lane = 0; lane < 64u; ++lane) entry.words[lane] = 0x52100000u + lane;
+        observed.vgprs = {entry};
+        // A scratch definition under partial EXEC does not initialize its newly WQM-active peers.
+        observed.guest_code = {0x7e100300u, 0xbefe0a7eu, 0x7e280508u, 0xbefe0410u,
+                               0x7e020214u, 0xf8001801u, 1u,          0xbf810000u};
+        std::string refusal;
+        auto missing_peers = observed;
+        check(!prosper::gpu::complete_graphics_packet_locals(missing_peers, refusal) &&
+                  refusal == "stage-input-vector-uninitialized:pc=2" &&
+                  missing_peers.vgprs.size() == 1u && missing_peers.sgprs == observed.sgprs,
+              "WQM expansion cannot promote unwritten peer scratch into a READFIRST input");
+        std::swap(observed.guest_code[0], observed.guest_code[1]);
+        auto complete = observed;
+        check(prosper::gpu::complete_graphics_packet_locals(complete, refusal) &&
+                  complete.sgprs == observed.sgprs,
+              "WQM before the actual write initializes every selectable guest quad slot");
+        std::vector<uint32_t> want(12u * 64u, 0u);
+        for (uint32_t lane = 0; lane < 64u; ++lane) {
+            const uint32_t header[] = {1u, 1u, observed.export_enabled[lane], 0u, 1u, 0u, 1u, 1u};
+            std::copy(std::begin(header), std::end(header), want.begin() + lane * 12u);
+            want[lane * 12u + 8u] =
+                entry.words[60];   // selected helper participates, never exports
+        }
+        sink_case(complete, want, "stage_quad_initialized_before_first", directory);
+        auto partial_entry = complete;
+        partial_entry.vgprs[0].available_mask = uint64_t(15u) << 60u;
+        check(prosper::gpu::complete_graphics_packet_locals(partial_entry, refusal),
+              "genuine quad input availability admits only its actual selected slots");
+        sink_case(partial_entry, want, "stage_quad_partial_genuine_inputs", directory);
+        partial_entry.vgprs[0].available_mask &= ~(uint64_t(1) << 61u);
+        check(!prosper::gpu::complete_graphics_packet_locals(partial_entry, refusal) &&
+                  refusal == "stage-input-vector-uninitialized:pc=1",
+              "zero storage cannot replace one absent WQM-active input lane");
+        auto raw_export = observed;
+        raw_export.guest_code = {0x7e100300u, 0x7e280508u, 0xf8001801u, 8u, 0xbf810000u};
+        check(!prosper::gpu::complete_graphics_packet_locals(raw_export, refusal) &&
+                  refusal == "stage-input-vector-uninitialized:pc=2" &&
+                  prosper::gpu::recompile_fragment_packet(raw_export).spirv.empty(),
+              "raw EXP observes inactive scratch payload before any module or publication");
+        auto genuine_inactive = entry;
+        genuine_inactive.reg = 8u;
+        raw_export.vgprs.push_back(genuine_inactive);
+        check(prosper::gpu::complete_graphics_packet_locals(raw_export, refusal) &&
+                  !prosper::gpu::recompile_fragment_packet(raw_export).spirv.empty(),
+              "same raw EXP accepts genuine old inactive payload beside its masked writer");
+        auto absent_entry = observed;
+        absent_entry.vgprs.clear();
+        check(!prosper::gpu::complete_graphics_packet_locals(absent_entry, refusal) &&
+                  refusal == "stage-input-vector-uninitialized:pc=1" && absent_entry.vgprs.empty(),
+              "storage cannot supply a missing observed vertex/fragment entry word");
+        auto empty_exec = observed;
+        empty_exec.exec_mask = 0;
+        check(!prosper::gpu::complete_graphics_packet_locals(empty_exec, refusal) &&
+                  refusal == "stage-input-vector-uninitialized:pc=2",
+              "empty EXEC still requires genuinely initialized logical lane0 for READFIRST");
+        auto actual_lane0 = entry;
+        actual_lane0.reg = 8;
+        empty_exec.vgprs.push_back(actual_lane0);
+        check(prosper::gpu::complete_graphics_packet_locals(empty_exec, refusal),
+              "empty EXEC accepts actual owned lane0 beside the missing scratch refusal");
+        for (uint32_t lane = 0; lane < 64u; ++lane) want[lane * 12u + 8u] = entry.words[0];
+        sink_case(empty_exec, want, "stage_exec0_actual_lane0", directory);
+    }
     uint32_t ordinal = 0;
     for (uint32_t selected : {63u, 31u, 64u})
         for (uint32_t variant = 0; variant < 8; ++variant) {
@@ -340,40 +625,34 @@ int main(int argc, char** argv) {
                           : "packet-readlane-selector-kind-unimplemented",
                "READLANE bank/domain control " + std::to_string(arm));
     }
-    // A supplied initial scalar word is NOT authority for stale data after a saved-mask write.
-    // Keep the extra read live in EXP. The count destination is a real data word (positive);
-    // the saved mask's unmaterialized low word must refuse, never use the CFG placeholder zero.
-    for (uint32_t source : {12u, 20u}) {
-        auto p = clean;
-        const auto first_exp = std::find(p.guest_code.begin(), p.guest_code.end(), 0xf800180fu);
-        check(first_exp != p.guest_code.end(), "live count/mask control retains EXP fixture");
-        if (first_exp == p.guest_code.end()) continue;
-        const size_t pc = static_cast<size_t>(first_exp - p.guest_code.begin());
-        p.guest_code.insert(p.guest_code.begin() + pc, 0x7e0a0200u | source); // v_mov v5,sSOURCE
-        p.guest_code[pc + 2] = (p.guest_code[pc + 2] & ~0xffu) | 5u; // live MRT channel0
-        const auto r = prosper::gpu::recompile_fragment_packet(
-            p, {prosper::gpu::RecompileDiagnosticStage::Fragment, 0x4093});
-        if (source == 12) {
-            check(!r.spirv.empty() && r.rejection.empty(), "defined count word echo emits");
-            if (!r.spirv.empty()) {
-                bpermute_oracle::Interpreter vm(r.spirv);
-                const auto actual = vm.run_packet(r.input_words, r.output_words);
-                check(vm.error.empty() && actual == expected({}, p),
-                      "defined count word echo reaches actual EXP sink");
-            }
-        } else {
-            check(r.spirv.empty() && r.input_words.empty() && r.output_words.empty(),
-                  "saved mask word never becomes a defined zero");
-            check(r.rejection.starts_with("packet-guest-emission-refused:") &&
-                  r.rejection != "packet-guest-emission-refused:no-cause-recorded",
-                  "saved mask data read has a named emission cause: " + r.rejection);
+    // A saved mask now defines its physical words, not the supplied initial poison. Keep both
+    // the zero low half (bit63) and nonzero low half (bit31) live in EXP beside the count twin.
+    for (uint32_t selected : {31u, 63u})
+        for (uint32_t source : {12u, 20u}) {
+            Case c;
+            c.selected_lane = selected;
+            auto p = packet(c);
+            const auto first_exp = std::find(p.guest_code.begin(), p.guest_code.end(), 0xf800180fu);
+            check(first_exp != p.guest_code.end(), "live count/mask control retains EXP fixture");
+            if (first_exp == p.guest_code.end()) continue;
+            const size_t pc = static_cast<size_t>(first_exp - p.guest_code.begin());
+            p.guest_code.insert(p.guest_code.begin() + pc,
+                                0x7e0a0200u | source);   // v_mov v5,sSOURCE
+            p.guest_code[pc + 2] = (p.guest_code[pc + 2] & ~0xffu) | 5u;   // live MRT channel0
+            auto want = expected(c, p);
+            if (source == 20)
+                for (uint32_t lane = 0; lane < 64; ++lane)
+                    want[lane * 12 + 8] = uint32_t(uint64_t(1) << selected);
+            sink_case(p, want,
+                      "saved_mask_word_echo_" + std::to_string(selected) + "_" +
+                          std::to_string(source),
+                      directory);
         }
-    }
     auto missing = clean;
     missing.slots_available[63] = false;
     reject(missing, "packet-invocation-state-unavailable", "missing high-half slot");
     missing = clean; missing.mask_state_available = false;
-    reject(missing, "packet-invocation-state-unavailable", "missing masks");
+    reject(missing, "packet-entry-exec-unavailable", "missing demanded initial EXEC");
     missing = clean;
     missing.vgprs.erase(missing.vgprs.begin() + 5);
     {
@@ -453,8 +732,21 @@ int main(int argc, char** argv) {
     reject(missing, "packet-fp-or-compare-unimplemented", "no guest FP mode substitution");
     missing = clean; missing.guest_code.insert(missing.guest_code.begin(), 0xbf8200ffu);
     reject(missing, "packet-branch-target-invalid", "no guessed branch exit");
-    missing = clean; missing.guest_code.insert(missing.guest_code.begin(), 0xbf82ffffu);
-    reject(missing, "packet-backedge-unimplemented", "no repeated export overwrite");
+    missing = clean;
+    {
+        std::vector<prosper::gpu::Rdna2Inst> decoded;
+        prosper::gpu::rdna2_walk(missing.guest_code.data(), missing.guest_code.size(), decoded);
+        const auto exp = std::find_if(decoded.begin(), decoded.end(), [](const auto& in) {
+            return in.fmt == prosper::gpu::Rdna2Format::EXP;
+        });
+        check(exp != decoded.end(), "cycle refusal control retains a real export");
+        if (exp != decoded.end()) {
+            const int32_t displacement = int32_t(exp->pc) - int32_t(missing.guest_code.size());
+            missing.guest_code.insert(missing.guest_code.end() - 1,
+                                      0xbf820000u | uint16_t(displacement));
+            reject(missing, "packet-repeated-export-unimplemented", "no repeated export overwrite");
+        }
+    }
     missing = clean; missing.guest_code.pop_back();
     reject(missing, "packet-code-not-one-complete-program", "unterminated input");
     {

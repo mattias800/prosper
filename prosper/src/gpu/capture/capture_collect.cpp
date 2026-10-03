@@ -720,9 +720,20 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.color_targets[1].mirror_named_identity(c.color1_base, c.color1_width,
                                                   c.color1_height);
         c.draw_index = d.draw_index; c.command_order = d.command_order;
-        if (!capture_raw_shader_version(d.vs_guest_addr, reader, out, raw_shader_words,
-                                        raw_shader_index_by_address,
-                                        c.vs_raw_shader_index, error)) return false;
+        if (d.owned_waves && !include_resource_data) {
+            error = "owned logical-wave capture requires complete input bytes";
+            return false;
+        }
+        c.owned_waves = d.owned_waves;
+        if (d.owned_waves && d.owned_waves->vertex_pending) {
+            if (d.owned_waves->vertex.packets.empty() ||
+                !store_raw_shader_version(d.owned_waves->vertex.packets.front().guest_code, true,
+                                          out, raw_shader_words, c.vs_raw_shader_index, error))
+                return false;
+        } else if (!capture_raw_shader_version(d.vs_guest_addr, reader, out, raw_shader_words,
+                                               raw_shader_index_by_address, c.vs_raw_shader_index,
+                                               error))
+            return false;
         const auto* inputs = owned_fragment_draw_inputs(d);
         c.ps_entry_source_available = inputs && d.ps_entry.observed;
         if (c.ps_entry_source_available) {
@@ -737,8 +748,15 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
             if (!store_raw_shader_version(*inputs->raw_code,
                     !decoded.empty() && decoded.back().is_end, out, raw_shader_words,
                     c.fs_raw_shader_index, error)) return false;
+        } else if (d.owned_waves && d.owned_waves->fragment_pending) {
+            if (!d.owned_waves->fragment_code ||
+                !store_raw_shader_version(*d.owned_waves->fragment_code, true, out,
+                                          raw_shader_words, c.fs_raw_shader_index, error))
+                return false;
         } else if (!capture_raw_shader_version(d.fs_guest_addr, reader, out, raw_shader_words,
-                    raw_shader_index_by_address, c.fs_raw_shader_index, error)) return false;
+                                               raw_shader_index_by_address, c.fs_raw_shader_index,
+                                               error))
+            return false;
         if (!capture_raw_shader_version(d.vs_chain_guest_addr, reader, out, raw_shader_words,
                 raw_shader_index_by_address, c.vs_chain_raw_shader_index, error)) return false;
         c.vertex_lds_dwords = d.vertex_lds_dwords;

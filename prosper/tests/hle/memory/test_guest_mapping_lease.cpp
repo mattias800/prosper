@@ -86,6 +86,129 @@ int main() {
     }
 #endif
 
+    // Per-wave scalar inputs need a finite same-origin readable domain, not the containing VMA
+    // or the original allocation size. Drive the real HLE splits/aliases while no bytes are read
+    // by the query; windows remain topology observations until a producer-isolated owner copies.
+    const auto window_controls = [&] {
+        uint64_t origin_physical = 0, neighbor_physical = 0, view = 0, alias = 0;
+        const auto cleanup = [&] {
+            if (view) unmap(view, 4 * page, 0, 0, 0, 0);
+            if (alias) unmap(alias, 3 * page, 0, 0, 0, 0);
+            if (origin_physical) release(origin_physical, 3 * page, 0, 0, 0, 0);
+            if (neighbor_physical) release(neighbor_physical, page, 0, 0, 0, 0);
+        };
+        const bool setup =
+            allocate(0, 0x200000000ull, 3 * page, page, 0,
+                     reinterpret_cast<uint64_t>(&origin_physical)) == 0 &&
+            allocate(0, 0x200000000ull, page, page, 0,
+                     reinterpret_cast<uint64_t>(&neighbor_physical)) == 0 &&
+            reserve(reinterpret_cast<uint64_t>(&view), 4 * page, 0, page, 0, 0) == 0 &&
+            map(reinterpret_cast<uint64_t>(&view), 3 * page, 3, 0x10, origin_physical, page) == 0;
+        expect(setup, "create direct window and distinct neighboring allocation");
+        if (!setup) {
+            cleanup();
+            return;
+        }
+        uint64_t neighbor = view + 3 * page;
+        const bool neighbor_mapped =
+            map(reinterpret_cast<uint64_t>(&neighbor), page, 3, 0x10, neighbor_physical, page) == 0;
+        expect(neighbor_mapped, "map the distinct physical allocation at an adjacent VA");
+        if (!neighbor_mapped) {
+            cleanup();
+            return;
+        }
+        // Make native section pages current before observing them; Windows sparse reservations
+        // alone cannot grant read safety. No query is permitted to commit missing pages itself.
+        std::memset(reinterpret_cast<void*>(view), 0x5a, 3 * page);
+        std::memset(reinterpret_cast<void*>(neighbor), 0xa5, page);
+        GuestDirectAllocation retained;
+        {
+            GuestMappingLease lease;
+            const auto whole = guest_memory_direct_readable_window(lease, view + 12u);
+            expect(whole && whole.virtual_begin == view && whole.virtual_end == view + 3 * page &&
+                       whole.physical_begin == origin_physical &&
+                       whole.physical_end == origin_physical + 3 * page,
+                   "readable window ends at its original allocation despite an adjacent mapping");
+            retained = whole.allocation;
+            const auto last = guest_memory_direct_readable_window(lease, view + 3 * page - 32u);
+            expect(last && last.virtual_end == view + 3 * page &&
+                       last.allocation.identity == retained.identity,
+                   "last complete x8 load belongs to the same finite window");
+            const auto distinct = guest_memory_direct_readable_window(lease, neighbor);
+            expect(distinct && distinct.virtual_begin == neighbor &&
+                       distinct.virtual_end == neighbor + page &&
+                       distinct.allocation.identity != retained.identity &&
+                       guest_memory_retained_allocation_relation(lease, neighbor, page, retained) ==
+                           GuestMemoryTopologyRelation::Disjoint,
+                   "a neighboring real allocation has a distinct admissible window");
+            expect(!guest_memory_direct_readable_window(lease, 0u) &&
+                       !guest_memory_direct_readable_window(lease, reservation),
+                   "null and an uncommitted reservation supply no readable window");
+        }
+        expect(protect(view + page, page, 1, 0, 0, 0) == 0,
+               "split the direct mapping at a readable protection boundary");
+        {
+            GuestMappingLease lease;
+            const auto split = guest_memory_direct_readable_window(lease, view + page + 4u);
+            expect(split && split.virtual_begin == view && split.virtual_end == view + 3 * page &&
+                       split.allocation.identity == retained.identity,
+                   "readable splits preserve contiguous physical progression and allocation birth");
+        }
+        expect(protect(view + page, page, 0, 0, 0, 0) == 0,
+               "create a CPU-unreadable hole inside the original allocation");
+        {
+            GuestMappingLease lease;
+            const auto left = guest_memory_direct_readable_window(lease, view);
+            const auto right = guest_memory_direct_readable_window(lease, view + 2 * page);
+            expect(left && left.virtual_begin == view && left.virtual_end == view + page && right &&
+                       right.virtual_begin == view + 2 * page &&
+                       right.virtual_end == view + 3 * page &&
+                       !guest_memory_direct_readable_window(lease, view + page),
+                   "an unreadable hole bounds both windows even though its allocation stays live");
+        }
+        expect(protect(view + page, page, 3, 0, 0, 0) == 0 &&
+                   reserve(reinterpret_cast<uint64_t>(&alias), 3 * page, 0, page, 0, 0) == 0 &&
+                   map(reinterpret_cast<uint64_t>(&alias), 3 * page, 3, 0x10, origin_physical,
+                       page) == 0,
+               "restore readability and create another VA for the same physical allocation");
+        {
+            GuestMappingLease lease;
+            const auto other_va = guest_memory_direct_readable_window(lease, alias);
+            expect(
+                other_va && other_va.virtual_begin == alias &&
+                    other_va.virtual_end == alias + 3 * page &&
+                    other_va.physical_begin == origin_physical &&
+                    other_va.allocation.identity == retained.identity &&
+                    guest_memory_retained_allocation_relation(lease, alias, 3 * page, retained) ==
+                        GuestMemoryTopologyRelation::Overlap,
+                "a different VA window cannot hide a physical alias of the retained producer");
+        }
+        expect(release(origin_physical + page, page, 0, 0, 0, 0) == 0,
+               "release a middle slice of the original allocation");
+        uint64_t replacement = 0;
+        expect(allocate(origin_physical + page, origin_physical + 2 * page, page, page, 0,
+                        reinterpret_cast<uint64_t>(&replacement)) == 0 &&
+                   replacement == origin_physical + page,
+               "reuse exactly that physical slice with a new allocation birth");
+        {
+            GuestMappingLease lease;
+            expect(!guest_memory_direct_readable_window(lease, view),
+                   "partial release/reuse cannot authenticate the old whole allocation");
+            const auto reused = guest_memory_direct_readable_window(lease, view + page);
+            expect(
+                reused && reused.virtual_begin == view + page &&
+                    reused.virtual_end == view + 2 * page &&
+                    reused.allocation.identity != retained.identity &&
+                    guest_memory_retained_allocation_relation(lease, view + page, page, retained) ==
+                        GuestMemoryTopologyRelation::Overlap,
+                "new birth still physically overlaps the retained producer's original interval");
+            expect(static_cast<bool>(guest_memory_direct_readable_window(lease, neighbor)),
+                   "an old released producer does not veto a distinct readable allocation");
+        }
+        cleanup();
+    };
+    window_controls();
+
     // The worker announces that it is about to enter the real HLE operation. A held lease must
     // keep the OS mapping and the tracker unchanged until that entire operation can finish.
     const auto blocked_mutation = [&](auto operation, auto while_leased,

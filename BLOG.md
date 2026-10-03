@@ -19,6 +19,25 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-03
+
+### 007 First Light reaches its title screen
+
+007 First Light now reaches its full title screen, with Bond's artwork and the “Press X to play” prompt rendering correctly ([tracker #4021](https://github.com/mattias800/prosper/issues/4021#issuecomment-5968286196)).
+
+<p align="center"><img src="assets/screenshots/007-first-light-title-2026-10-03.webp" alt="007 First Light — complete title artwork and Press X to play prompt in the normal visible Linux prosper-app SDL/X11 window, captured near the end of a ten-minute run without input injection"></p>
+
+### Hollow Knight: Silksong reaches gameplay
+
+The owner has played Hollow Knight: Silksong and describes its gameplay visuals as nearly perfect, with some main-menu UI elements still missing ([tracker #4121](https://github.com/mattias800/prosper/issues/4121), [menu issue #4120](https://github.com/mattias800/prosper/issues/4120)).
+
+### Silent Hill 2 renders its legal splash again
+
+The normal Linux `prosper-app` route gets past the startup read failure and renders the legal splash; the earlier scheduled frame is black, and a correct title screen remains unverified ([tracker #4024](https://github.com/mattias800/prosper/issues/4024)).
+
+<p align="center"><img src="assets/screenshots/silent-hill-2-apr-restored-legal-2026-10-03.webp" alt="Silent Hill 2 — readable legal splash and Wwise logo in the normal visible Linux prosper-app SDL/X11 window, without input injection or an overlay"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-apr-restored-early-black-2026-10-03.webp" alt="Silent Hill 2 — black scheduled prosper-app screenshot, armed at presentation 120 and written at 226, before the later legal-splash window capture; this is not title evidence"></p>
+
 ## 2026-10-01
 
 ### Silent Hill 2 renders its first-boot setup

@@ -13,6 +13,7 @@
 #endif
 #endif
 #include "hle/dispatch/dispatch.hpp"
+#include "hle/kernel/apr_submission.hpp"
 #include "hle/kernel/apr_event_dialect.hpp"   // AprDialect, stored on each binding
 #include "diagnostics/diag_clock.hpp"
 #include "diagnostics/env_numeric.hpp"   // #3267: -1 here overflowed the MiB multiply
@@ -337,6 +338,7 @@ void ampr_cb_construct(uint64_t cb, uint64_t capacity, bool tracks_offset) {
     // buffer at an old address inherits the old file, and the gather/scatter range guard only
     // catches that when the newly named file happens to be smaller (review of #2924).
     prosper_apr_chain_reset(cb);
+    apr_execution_reset(cb);
     std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
     if (g_ampr_cb_state.size() >= 4096 && !g_ampr_cb_state.count(cb))
         g_ampr_cb_state.erase(g_ampr_cb_state.begin());
@@ -364,6 +366,7 @@ void ampr_cb_reset(uint64_t cb) {
     // out once, on f_apr_read_gather_scatter in src/hle/fs/hle_file.cpp, which owns APR file
     // identity. Read it before narrowing this; tests/hle/test_apr_gather_scatter.cpp pins the set.
     prosper_apr_chain_reset(cb);
+    apr_execution_reset(cb);
     std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
     auto it = g_ampr_cb_state.find(cb);
     if (it != g_ampr_cb_state.end()) it->second.offset = 0;
@@ -371,7 +374,8 @@ void ampr_cb_reset(uint64_t cb) {
 
 void ampr_cb_destroy_320(uint64_t cb) {
     if (!cb) return;
-    prosper_apr_chain_reset(cb);   // the chain cannot outlive the command buffer it is recorded on
+    prosper_apr_chain_reset(cb);
+    apr_execution_reset(cb);   // the chain cannot outlive the command buffer it is recorded on
     std::lock_guard<std::mutex> lock(g_ampr_cb_state_mx);
     auto it = g_ampr_cb_state.find(cb);
     if (it != g_ampr_cb_state.end() && it->second.tracks_offset)
@@ -473,16 +477,7 @@ void prosper_ampr_advance(uint64_t cb, uint64_t bytes) {
 // ============================================================================================
 namespace prosper {
 
-// Both touch guest memory, so each half defines them with its own fault-safety rules: a fault in
-// host HLE code kills the emulator, not just the guest.
-//
-// The result slots are 32-bit: sceKernelAprSubmitCommandBufferAndGetResult takes
-// (cb, ring, uint32_t* out1, uint32_t* out2). The evidence is the guest's own code: a caller lays
-// the two slots out as adjacent 4-byte stack locals ([rbp-0x3c] and [rbp-0x34], the second sitting
-// directly below its stack canary), initialises one with a 32-bit store and reads it back with a
-// 32-bit load. An 8-byte store here overwrote the four bytes after the slot, which on that stack was
-// the low half of the canary (#4138).
-static void apr_write_result_slot(uint64_t addr, uint32_t value);
+// Diagnostic reads must not fault host HLE code.
 // Diagnostic-only (PROSPER_AMPRLOG): read two guest qwords, false if not safely readable.
 static bool apr_probe_guest_pair(uint64_t addr, uint64_t out[2]);
 
@@ -723,27 +718,11 @@ static uint64_t apr_cb_set_equeue(uint64_t command_size, bool eager_completion,
 }
 
 static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
-                                  bool write_result_outputs, uint64_t* token_out = nullptr) {
-    unsigned ring = a1 ? (unsigned)(a1 - 1) & 0x3f : 0;
-    // Completion-token contract (issues #180/#208 — guest submit path eboot+0x22a02b0, handler
-    // +0x229dcb0, listener +0x22740b0, listener-ctx ctor +0x22a0670; full write-up in
-    // hle_kernel_time.cpp and docs/engines/UE4_APR_IOSTORE_BRINGUP.md):
-    //   - H896-BOUND cb (the batched/streaming channel): the completion token IS the binding tag,
-    //     (ring<<58)|counter with the counter drawn from the guest's own per-ring sequence seeded
-    //     at 1000 ([ctx+0xc0+ring*0x28], ctor-initialized 0x3e8). The guest tracks it at
-    //     [slot+0x10] AND in a {token -> callback} hash; the listener's walk is ctor-seeded to
-    //     start exactly at 1000 (last-processed = 0x3e7). We post the tag VERBATIM (deferred) on
-    //     the binding's own equeue — nothing else. The out slots are NOT written: a2/a3 alias the
-    //     request's completion RECORD ({status@req+0x28, bytes@req+0x30}, already completed
-    //     {0,size} by ReadFile) — writing a token there marks the record FAILED (nonzero status,
-    //     checked at eboot+0x22738a5; live-verified "GEngineLoop.PreInit Failed!").
-    //   - UNBOUND cb (mount-era sync flow, ring_1b=6 async-archive flow): hand out our own
-    //     per-ring counter token through the out slots (the engine stores it verbatim where it
-    //     tracks the read) and post NO event — these flows are completion-record-polled, and any
-    //     invented-counter event would REGRESS the listener's ctor-seeded last-processed via its
-    //     unconditional last:=cnt store (+0x2274143), setting up the fatal +0x229df3e walk (the
-    //     #180 residual fault). CONFIDENCE: HIGH (static disassembly + live tag-echo runs).
-    //
+                                  bool write_result_outputs) {
+    // Status/offset result and kernel submit ID are separate from the event binding tag.
+    // Snapshot actual eager execution before the submit rewinds this command buffer.
+    const uint32_t execution_status = apr_execution_status(a0);
+    if (execution_status) return execution_status;
     // What makes a cb "bound" is the EQUEUE, not a nonzero tag. CRI ADX2 (cri_ware_unity.prx, first
     // seen in Tales of Graces f Remastered PPSA19991) registers its APR id with
     // sceKernelAddAmprEvent, binds with H896Pt-yB4I(cb, eq, id, tag=0, ...) — the tag argument is a
@@ -779,22 +758,19 @@ static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
     // bind a 3.20 buffer with a zero tag and then never submit it, and firing it without evidence
     // would post events no guest asked for.
     AprBoundCb bc{};
-    bool should_post = false;
-    const bool bound = apr_cb_submit_state(a0, &bc, &should_post);
+    const bool bound = apr_cb_submit_state(a0, &bc, nullptr);
     const bool tag_echo = bound && bc.eq;
-    uint64_t token = tag_echo ? bc.tag : prosper_apr_next_token(ring);
-    if (!bound && write_result_outputs) {
-        // The slots are 32 bits wide, so the guest only ever observed the low half of a 64-bit
-        // token through them; storing exactly that keeps what it saw and stops the overrun.
-        if (a2 > 0xffff) apr_write_result_slot(a2, (uint32_t)token);
-        if (a3 > 0xffff) apr_write_result_slot(a3, (uint32_t)token);
-    }
-    if (amprlog()) fprintf(stderr, "[amprlog] AprSubmit%s cb=0x%llx ring1b=%llu out1=0x%llx out2=0x%llx -> token=0x%llx%s%s\n",
+    uint32_t id = 0;
+    const uint64_t publication = apr_publish_completed_submit(
+        write_result_outputs ? a2 : 0, a3, &id);
+    if (publication) return publication;
+    if (amprlog()) fprintf(stderr, "[amprlog] AprSubmit%s cb=0x%llx ring1b=%llu out1=0x%llx out2=0x%llx -> id=0x%llx%s%s\n",
                            write_result_outputs ? "AndGetResult" : "",
                            (unsigned long long)a0, (unsigned long long)a1,
-                           (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)token,
+                           (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)id,
                            bound ? " (bound)" : "", apr_req_eventful(a0) ? " (arg8-async)" : "");
-    if (token_out) *token_out = token;
+    bool should_post = false;
+    if (tag_echo) apr_cb_submit_state(a0, &bc, &should_post);
     if (tag_echo && should_post)
         prosper_eq_post_apr_event(bc.eq, bc.eq_identity, bc.id, bc.tag, bc.dialect);
     // Submit consumes the encoded commands. Pathless reuses completed pool buffers without calling
@@ -834,12 +810,6 @@ static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
 #include <vector>
 
 namespace prosper {
-
-// #2139: unchanged from the pre-hoist code -- a plain store, exactly as the POSIX submit path has
-// always written its result slots. The caller already rejected obviously bogus addresses (<=0xffff).
-static void apr_write_result_slot(uint64_t addr, uint32_t value) {
-    *(uint32_t*)(uintptr_t)addr = value;
-}
 
 // #2139 POSIX sibling: process_vm_readv reports EFAULT instead of faulting (all-or-nothing per
 // iovec, so a partially mapped pair reports unreadable -- acceptable for a diagnostic).
@@ -2979,55 +2949,13 @@ HLE(k_apr_cb_set_equeue_320) {   // o67gODLFpls: PS5 3.20 0x20-byte completion c
 //   sceKernelAprSubmitCommandBufferAndGetResult  ASoW5WE-UPo, 0ers1N4C9CY   (cb, ring, out1, out2)
 //   sceKernelAprSubmitCommandBuffer              eE4Szl8sil8, Omr9X+YmT7I   (cb, ring)
 //
-// The plain form has NO result out-parameters, so a2/a3 hold whatever the caller's registers happened
-// to contain. Writing a token through those would be writing through residue — and this file already
-// documents that a nonzero value landing in a request's completion record marks the read FAILED
-// (eboot+0x22738a5). That is why the plain variant is a separate entry rather than an alias.
+// The plain form has no output slots. AndGetResult publishes an eight-byte status/offset
+// result and a separate four-byte kernel submit ID (#4042).
 
-// sceKernelAprSubmitCommandBufferAndGetId(cb, ring_1based) -> id.
-//
-// The THIRD member of the submit family, and the one this file did not have. Same submit as its two
-// siblings; only how the completion token reaches the caller differs -- AndGetResult writes it
-// through two out-parameters, the plain form does not return it at all, and this one returns it in
-// rax. There are therefore no out-parameters to position wrongly, which is the hazard that made
-// #3502 probe before implementing. The token is the same prosper_apr_next_token(ring) value the
-// AndGetResult path already hands out, so the three entry points cannot disagree about which id
-// names a submit.
-//
-// Leaving it unregistered was NOT neutral, and the damage is the SUBMIT rather than the id. The
-// dispatcher's `return 0` skipped ampr_cb_reset, so the command buffer's cursor was never released:
-// the guest's append loop polls GetSize - GetUsed and appends only when the difference is large
-// enough, which is exactly the spin k_ampr_init's comment records parking an IoStore thread. No
-// completion event was posted either. FINAL FANTASY TACTICS - The Ivalice Chronicles (PPSA21783)
-// streams its assets through this entry point (#3498).
-//
-// CONFIDENCE: HIGH on the submit (shared body with both siblings). CONFIDENCE: MED on the arity --
-// the 3.20 database gives this entry point's name and not its signature, so a2..a5 are logged
-// rather than used, on the same reasoning the plain form states for its own discarded pair. If they
-// ever read as consistently valid, aligned guest pointers across a run, this entry has
-// out-parameters after all and this handler is wrong.
+// AndGetId(cb, ring_1based, uint32_t* id): returns SCE status, no result structure.
 HLE(k_apr_submit_and_get_id) {
-    uint64_t token = 0;
-    const uint64_t rc = apr_submit_common(a0, a1, /*out1=*/0, /*out2=*/0,
-                                          /*write_result_outputs=*/false, &token);
-    if (amprlog())
-        fprintf(stderr, "[amprlog] AprSubmitAndGetId qvMUCyyaCSI cb=0x%llx ring1b=%llu -> id=0x%llx "
-                        "(rc=0x%llx; unused a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx)\n",
-                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)token,
-                (unsigned long long)rc, (unsigned long long)a2, (unsigned long long)a3,
-                (unsigned long long)a4, (unsigned long long)a5);
-    // A failed submit must not hand back an id the guest would then wait on.
-    if (rc != 0) return rc;
-    // The token is whatever the family computed, INCLUDING 0. An earlier revision substituted this
-    // ring's own counter when the token came back 0, on the reasoning that 0 is the value the missing
-    // handler returned. That is reachable only for a cb BOUND with a zero tag -- and for a bound cb
-    // this file's own contract (see apr_submit_common) is that the token IS the binding tag, which
-    // the guest chose. Handing back the unbound counter dialect instead would answer a bound
-    // buffer in a dialect it never asked for, and would advance ring state as a side effect of a
-    // read. CRI ADX2 is the known zero-tag binder and its waiter tests the event IDENT, never the
-    // tag, so 0 is a legitimate payload there rather than an ambiguous one. Reverted in review of
-    // #3530; no title is known to bind with a zero tag AND use this entry point.
-    return token;
+    if (!a2) return hle::sce_kernel_error(hle::FreeBsdErrno::EFault);
+    return apr_submit_common(a0, a1, 0, a2, /*write_result_outputs=*/false);
 }
 HLE(k_apr_submit) {   // sceKernelAprSubmitCommandBufferAndGetResult (cb, ring_1based, out1, out2)
     return apr_submit_common(a0, a1, a2, a3, /*write_result_outputs=*/true);
@@ -4331,38 +4259,6 @@ int dmem_caller_scan_slots_for_test(const volatile uint64_t* frame, int want) {
 #include <vector>
 
 namespace prosper {
-
-// #2139: Windows sibling. Same contract, but fault-safe: this half never dereferences a guest
-// pointer it has not proven writable, because a fault here kills the emulator rather than the
-// guest (same rule as k_ampr_write_address below). A slot that is not committed and writable is
-// skipped -- but the skip is REPORTED, not silent. The guest asked for a result and did not get
-// one, so if a title ever stalls waiting on that value the log is what points at this line; a
-// silent skip would leave it looking like the write happened. Bounded so a pathological caller
-// cannot flood the log. POSIX cannot reach this state: its store faults instead of skipping.
-static void apr_write_result_slot(uint64_t addr, uint32_t value) {
-    MEMORY_BASIC_INFORMATION mbi{};
-    constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY |
-                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    const bool writable =
-        VirtualQuery(reinterpret_cast<void*>(static_cast<uintptr_t>(addr)), &mbi, sizeof(mbi)) &&
-        mbi.State == MEM_COMMIT && (mbi.Protect & kWritable) &&
-        static_cast<uintptr_t>(addr) + sizeof(uint32_t) <=
-            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-    if (!writable) {
-        static std::atomic<int> skipped{0};
-        const int n = skipped.fetch_add(1, std::memory_order_relaxed);
-        if (n < 8)
-            fprintf(stderr,
-                    "[ampr] APR result slot 0x%llx NOT WRITABLE (state=0x%lx prot=0x%lx) -- the "
-                    "guest's result value 0x%llx was dropped\n",
-                    (unsigned long long)addr, (unsigned long)mbi.State, (unsigned long)mbi.Protect,
-                    (unsigned long long)value);
-        else if (n == 8)
-            fprintf(stderr, "[ampr] further APR result-slot drops suppressed\n");
-        return;
-    }
-    *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(addr)) = value;
-}
 
 // #2139 Windows sibling: prove the whole pair is committed and readable before touching it.
 static bool apr_probe_guest_pair(uint64_t addr, uint64_t out[2]) {
@@ -8103,50 +7999,10 @@ HLE(k_ampr_append_equeue_legacy) {   // H896Pt-yB4I: legacy eager path keeps zer
 HLE(k_ampr_append_equeue_320) {      // o67gODLFpls: PS5 3.20 0x20-byte completion command
     return apr_cb_set_equeue(0x20, true, a0, a1, a2, a3, a4, a5);
 }
-// sceKernelAprSubmitCommandBufferAndGetId(cb, ring_1based) -> id.
-//
-// The THIRD member of the submit family, and the one this file did not have. Same submit as its two
-// siblings; only how the completion token reaches the caller differs -- AndGetResult writes it
-// through two out-parameters, the plain form does not return it at all, and this one returns it in
-// rax. There are therefore no out-parameters to position wrongly, which is the hazard that made
-// #3502 probe before implementing. The token is the same prosper_apr_next_token(ring) value the
-// AndGetResult path already hands out, so the three entry points cannot disagree about which id
-// names a submit.
-//
-// Leaving it unregistered was NOT neutral, and the damage is the SUBMIT rather than the id. The
-// dispatcher's `return 0` skipped ampr_cb_reset, so the command buffer's cursor was never released:
-// the guest's append loop polls GetSize - GetUsed and appends only when the difference is large
-// enough, which is exactly the spin k_ampr_init's comment records parking an IoStore thread. No
-// completion event was posted either. FINAL FANTASY TACTICS - The Ivalice Chronicles (PPSA21783)
-// streams its assets through this entry point (#3498).
-//
-// CONFIDENCE: HIGH on the submit (shared body with both siblings). CONFIDENCE: MED on the arity --
-// the 3.20 database gives this entry point's name and not its signature, so a2..a5 are logged
-// rather than used, on the same reasoning the plain form states for its own discarded pair. If they
-// ever read as consistently valid, aligned guest pointers across a run, this entry has
-// out-parameters after all and this handler is wrong.
+// AndGetId(cb, ring_1based, uint32_t* id): returns SCE status, no result structure.
 HLE(k_ampr_submit_and_get_id) {
-    uint64_t token = 0;
-    const uint64_t rc = apr_submit_common(a0, a1, /*out1=*/0, /*out2=*/0,
-                                          /*write_result_outputs=*/false, &token);
-    if (amprlog())
-        fprintf(stderr, "[amprlog] AprSubmitAndGetId qvMUCyyaCSI cb=0x%llx ring1b=%llu -> id=0x%llx "
-                        "(rc=0x%llx; unused a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx)\n",
-                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)token,
-                (unsigned long long)rc, (unsigned long long)a2, (unsigned long long)a3,
-                (unsigned long long)a4, (unsigned long long)a5);
-    // A failed submit must not hand back an id the guest would then wait on.
-    if (rc != 0) return rc;
-    // The token is whatever the family computed, INCLUDING 0. An earlier revision substituted this
-    // ring's own counter when the token came back 0, on the reasoning that 0 is the value the missing
-    // handler returned. That is reachable only for a cb BOUND with a zero tag -- and for a bound cb
-    // this file's own contract (see apr_submit_common) is that the token IS the binding tag, which
-    // the guest chose. Handing back the unbound counter dialect instead would answer a bound
-    // buffer in a dialect it never asked for, and would advance ring state as a side effect of a
-    // read. CRI ADX2 is the known zero-tag binder and its waiter tests the event IDENT, never the
-    // tag, so 0 is a legitimate payload there rather than an ambiguous one. Reverted in review of
-    // #3530; no title is known to bind with a zero tag AND use this entry point.
-    return token;
+    if (!a2) return hle::sce_kernel_error(hle::FreeBsdErrno::EFault);
+    return apr_submit_common(a0, a1, 0, a2, /*write_result_outputs=*/false);
 }
 HLE(k_ampr_submit) {                 // ASoW5WE-UPo: …AndGetResult — writes the result slots
     return apr_submit_common(a0, a1, a2, a3, /*write_result_outputs=*/true);
@@ -8561,6 +8417,124 @@ GuestDirectAllocation guest_memory_direct_allocation(const GuestMappingLease&,
                                                      uint64_t address, uint64_t bytes) {
     std::scoped_lock lock(g_mx, g_dmx);
     return direct_allocation_locked(address, bytes);
+}
+
+GuestDirectReadableWindow guest_memory_direct_readable_window(const GuestMappingLease& lease,
+                                                              uint64_t address) {
+    GuestDirectReadableWindow window;
+    if (address < 0x1000) return {};
+    {
+        std::scoped_lock lock(g_mx, g_dmx);
+        const auto origin = direct_allocation_locked(address, 1u);
+        if (!origin.identity) return {};
+        const auto after = std::upper_bound(
+            g_maps.begin(), g_maps.end(), address,
+            [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
+        if (after == g_maps.begin()) return {};
+        const auto center = std::prev(after);
+        // prot is the normalized CPU mask in both platform trackers; bit 0 is readable.
+        // Allocation identity/bounds come from g_dmem, not host region metadata.
+        const auto interval = [&](const Mapping& mapping) {
+            GuestDirectReadableWindow slice;
+            if (!mapping.committed || !(mapping.query_flags & kVirtualQueryDirect) ||
+                !(mapping.prot & 0x1) || !mapping.size ||
+                mapping.base > UINT64_MAX - mapping.size ||
+                mapping.offset > UINT64_MAX - mapping.size)
+                return slice;
+            slice.physical_begin = std::max(mapping.offset, origin.physical_begin);
+            slice.physical_end = std::min(mapping.offset + mapping.size, origin.physical_end);
+            if (slice.physical_begin >= slice.physical_end) return GuestDirectReadableWindow{};
+            slice.virtual_begin = mapping.base + (slice.physical_begin - mapping.offset);
+            slice.virtual_end = mapping.base + (slice.physical_end - mapping.offset);
+            const auto observed = direct_allocation_locked(slice.virtual_begin, 1u);
+            if (observed.identity != origin.identity ||
+                observed.physical_begin != origin.physical_begin ||
+                observed.physical_end != origin.physical_end)
+                return GuestDirectReadableWindow{};
+            slice.allocation = origin;
+            return slice;
+        };
+        window = interval(*center);
+        if (!window || address < window.virtual_begin || address >= window.virtual_end) return {};
+        auto before = center;
+        while (before != g_maps.begin()) {
+            const auto slice = interval(*std::prev(before));
+            if (!slice || slice.virtual_end != window.virtual_begin ||
+                slice.physical_end != window.physical_begin)
+                break;
+            window.virtual_begin = slice.virtual_begin;
+            window.physical_begin = slice.physical_begin;
+            --before;
+        }
+        auto next = std::next(center);
+        while (next != g_maps.end()) {
+            const auto slice = interval(*next);
+            if (!slice || slice.virtual_begin != window.virtual_end ||
+                slice.physical_begin != window.physical_end)
+                break;
+            window.virtual_end = slice.virtual_end;
+            window.physical_end = slice.physical_end;
+            ++next;
+        }
+    }
+    const uint64_t mapped_begin = window.virtual_begin, mapped_end = window.virtual_end;
+#if defined(__linux__)
+    // A neighboring reservation fault can replace a whole 64 KiB granule. Exclude an unsafe edge,
+    // then prove the complete returned domain; never read bytes to trigger lazy commitment.
+    constexpr uint64_t granule = 0x10000;
+    if (!guest_memory_direct_range_fault_safe(lease, window.virtual_begin, 1u)) {
+        const uint64_t aligned = window.virtual_begin & ~(granule - 1u);
+        if (aligned > UINT64_MAX - granule) return {};
+        window.virtual_begin = aligned + granule;
+    }
+    if (!guest_memory_direct_range_fault_safe(lease, window.virtual_end - 1u, 1u))
+        window.virtual_end = (window.virtual_end - 1u) & ~(granule - 1u);
+    if (window.virtual_begin >= window.virtual_end || address < window.virtual_begin ||
+        address >= window.virtual_end ||
+        !guest_memory_direct_range_fault_safe(lease, window.virtual_begin,
+                                              window.virtual_end - window.virtual_begin))
+        return {};
+#elif defined(_WIN32)
+    // SEC_RESERVE views are guest-committed before every physical page is host-committed. Native
+    // metadata narrows an ALREADY authenticated direct allocation; it never establishes one.
+    const auto committed_region = [](uint64_t at, uint64_t& begin, uint64_t& end) {
+        MEMORY_BASIC_INFORMATION info{};
+        constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                   PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                   PAGE_EXECUTE_WRITECOPY;
+        if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(at)), &info,
+                          sizeof(info)) ||
+            info.State != MEM_COMMIT || info.Type != MEM_MAPPED ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !(info.Protect & readable))
+            return false;
+        begin = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(info.BaseAddress));
+        if (!info.RegionSize || begin > UINT64_MAX - info.RegionSize) return false;
+        end = begin + info.RegionSize;
+        return begin <= at && at < end;
+    };
+    uint64_t first = 0, last = 0;
+    if (!committed_region(address, first, last)) return {};
+    window.virtual_begin = std::max(mapped_begin, first);
+    window.virtual_end = std::min(mapped_end, last);
+    while (window.virtual_begin > mapped_begin) {
+        if (!committed_region(window.virtual_begin - 1u, first, last) ||
+            last < window.virtual_begin || first >= window.virtual_begin)
+            break;
+        window.virtual_begin = std::max(mapped_begin, first);
+    }
+    while (window.virtual_end < mapped_end) {
+        if (!committed_region(window.virtual_end, first, last) || first > window.virtual_end ||
+            last <= window.virtual_end)
+            break;
+        window.virtual_end = std::min(mapped_end, last);
+    }
+#else
+    (void)lease;
+    return {}; // no native commitment/fault proof on this host
+#endif
+    window.physical_begin += window.virtual_begin - mapped_begin;
+    window.physical_end -= mapped_end - window.virtual_end;
+    return window;
 }
 
 GuestMemoryTopologyRelation guest_memory_retained_allocation_relation(

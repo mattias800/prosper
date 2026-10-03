@@ -77,15 +77,25 @@ struct GuestFsScope {
 struct GuestFsScope { explicit GuestFsScope(uint64_t) {} };
 #endif
 
-// Call one module entry with the PS5 module-entry ABI, module_start(size_t argc, const void* argp).
-// Plain init_array ctors take no arguments and ignore rdi/rsi; a real module_start reads both, so
-// passing the guest's own (args, argp) through is what the module was asked to start with.
-uint64_t call_module_entry(uint64_t fn, uint64_t args, uint64_t argp, uint64_t guest_fs) {
-    GuestFsScope fs(guest_fs);
-    return ((uint64_t (*)(uint64_t, uint64_t))(uintptr_t)fn)(args, argp);
-}
+#ifdef _WIN32
+extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t a0, uint64_t a1);
+#endif
 
 } // namespace
+
+// The entry is guest code compiled for System V. On Windows the host ABI is Microsoft x64, so a plain
+// function-pointer call would put the arguments in RCX/RDX and let the guest clobber registers the
+// host expects preserved; the platform bridge is the one place that translates both. Other hosts run
+// System V natively.
+uint64_t call_guest_module_entry(uint64_t fn, uint64_t args, uint64_t argp, uint64_t guest_fs) {
+    GuestFsScope fs(guest_fs);
+#ifdef _WIN32
+    return prosper_call_guest_sysv(fn, args, argp);
+#else
+    return ((uint64_t (*)(uint64_t, uint64_t))(uintptr_t)fn)(
+        args, argp);   // host ABI is already System V
+#endif
+}
 
 void runtime_module_loader_init(Program* p) {
     std::lock_guard<std::recursive_mutex> lk(g_mx);
@@ -116,6 +126,28 @@ void runtime_module_loader_init(Program* p) {
         for (const auto& s : p->mods[i]->symbols)
             if (!s.is_import && !s.nid.empty())
                 g_tls_symbols.emplace(s.nid, TlsSymbolLocation{ mid, s.value });
+    }
+}
+
+void run_deferred_module_init(const char* guest_path, uint64_t args, uint64_t argp,
+                              uint64_t guest_fs) {
+    if (!guest_path || !*guest_path) return;
+    std::vector<uint64_t> fns;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        if (!g_prog) return;
+        std::string b = basename_of(guest_path);
+        for (auto& c : b) c = (char)std::tolower((unsigned char)c);
+        for (auto& d : g_prog->deferred_inits)
+            if (d.first == b) {
+                fns.swap(d.second);
+                break;
+            }   // taken exactly once
+        if (fns.empty()) return;
+        if (modlog())
+            fprintf(stderr, "[loadmod] starting deferred init of '%s' (%zu fns)\n", b.c_str(),
+                    fns.size());
+        for (uint64_t f : fns) call_guest_module_entry(f, args, argp, guest_fs);
     }
 }
 
@@ -385,12 +417,12 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
     uint64_t res = 0;
     const std::string guest_path_copy = rm.guest_path;   // rm may be referenced across the calls below
     const uint64_t init_va = rm.mod->init_va, ia_va = rm.mod->init_array_va, ia_sz = rm.mod->init_array_sz;
-    if (init_va) res = call_module_entry(base + init_va, args, argp, guest_fs);
+    if (init_va) res = call_guest_module_entry(base + init_va, args, argp, guest_fs);
     for (uint64_t off = 0; off + 8 <= ia_sz; off += 8) {
         const uint64_t slot_va = base + ia_va + off;
         if (slot_va < rm.lo || slot_va + 8 > rm.hi) break;
         uint64_t fn = 0; memcpy(&fn, (const void*)(uintptr_t)slot_va, 8);
-        if (fn) call_module_entry(fn, 0, 0, guest_fs);
+        if (fn) call_guest_module_entry(fn, 0, 0, guest_fs);
     }
     if (modlog())
         fprintf(stderr, "[loadmod] started '%s' module_start(0x%llx, 0x%llx) -> 0x%llx\n",

@@ -82,6 +82,12 @@ TEST(FragmentPacketExports, EntirelyInactiveMayHaveNoPayloadButKeepsControl) {
 }
 TEST(FragmentPacketExports, OnlyDemandedInitialMasksSupplyArchitecturalAuthority) {
     auto input = f::scratch().invocation;
+    auto vertex = input;
+    vertex.stage = GraphicsPacketStage::Vertex;
+    const auto wrong_stage = recompile_fragment_packet(vertex);
+    EXPECT_TRUE(wrong_stage.spirv.empty());
+    EXPECT_EQ(wrong_stage.rejection, "packet-architectural-export-stage-unimplemented")
+        << "the explicit PS observation contract cannot admit vertex exports";
     input.mask_state_available = false;
     input.exec_available = true;
     input.vcc_mask = UINT64_MAX; // deliberately absent, NOT a value used to seed the compiler

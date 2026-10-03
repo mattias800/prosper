@@ -429,10 +429,9 @@ void test_capture_roundtrip(const Shape& shape, const std::vector<uint32_t>& exa
     GpuCaptureFile captured;
     GpuCaptureMetadata metadata;
     std::string error;
-    CHECK(capture_submit_items(
-              {}, {compute}, {{SubmitOperationKind::Dispatch, 0u, 1u}},
-              metadata, capture_reader, captured, error) &&
-              captured.format_version == 69u,
+    CHECK(capture_submit_items({}, {compute}, {{SubmitOperationKind::Dispatch, 0u, 1u}}, metadata,
+                               capture_reader, captured, error) &&
+              captured.format_version == 70u,
           "current capture stores a DescriptorRange dispatch without reading unused candidates");
     const GpuCapturedResource* captured_unused = captured_resource_at(
         captured, unused_large_pc);

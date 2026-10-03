@@ -311,12 +311,13 @@ TEST(AmprMeasure, Contract) {
                   get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
               "destroying a PS5 3.20 command buffer cancels its pending tail");
         construct(destroyed_cb, 0, 0, 0, 0, 0);
-        uint64_t unbound_out1 = 0, unbound_out2 = 0;
+        uint64_t unbound_out1 = UINT64_MAX;
+        uint32_t unbound_out2 = 0;
         submit(destroyed_cb, 1, (uint64_t)(uintptr_t)&unbound_out1,
                (uint64_t)(uintptr_t)&unbound_out2, 0, 0);
-        CHECK(unbound_out1 && unbound_out1 == unbound_out2,
+        CHECK(unbound_out1 == 0 && unbound_out2 != 0,
               "reconstructed command buffer is unbound after PS5 3.20 destruction");
-        // #180's rule: an UNBOUND submit hands its invented counter through the out slots and must
+        // #180's event rule: an UNBOUND submit publishes a separate kernel ID and must
         // post NO event, because an invented token would regress the UE4 listener's ctor-seeded
         // last-processed counter. Pin it directly — the out-slot check above does not.
         // Scope note: this pins "an unbound submit posts no event". It does NOT pin the *bound*

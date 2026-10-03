@@ -324,6 +324,19 @@ with tempfile.TemporaryDirectory(prefix="prosper-fragment-width-", dir=scratch_r
         original = known32.read_bytes()
         flags_tail = struct.pack("<I", 1) + bytes(8) + struct.pack("<I", 0)
         transport_tail = struct.pack("<I", 1) + b"\x00" + struct.pack("<II", 0, 0)
+        wave_tail = struct.pack("<I", 1) + b"\x00"
+        genuine70 = (len(original) > 4+159+5 and struct.unpack_from("<I", original, 8)[0] == 70 and
+                     original.endswith(wave_tail))
+        check(genuine70, "ordinary width fixture retains exact absent wave70 record")
+        if genuine70:
+            original = bytearray(original[:-len(wave_tail)])
+            struct.pack_into("<I", original, 8, 69)
+            entry_start = len(original)-4-159
+            check(struct.unpack_from("<I", original, entry_start)[0] == 1,
+                  "official69 entry count retains the one producing draw")
+            original = original[:entry_start]
+            struct.pack_into("<I", original, 8, 68)
+            original = bytes(original)
         genuine68 = (len(original) > 67 and struct.unpack_from("<I", original, 8)[0] == 68 and
                      original.endswith(flags_tail + bytes(4)))
         check(genuine68, "current width fixture appends zero nested68 count after official67 flags")
