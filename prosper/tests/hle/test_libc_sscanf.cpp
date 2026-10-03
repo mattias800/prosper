@@ -8,7 +8,10 @@
 // would test the host library instead of the handler.
 //
 // What the handler itself owns is the variadic capture and the conversion of vsscanf's int result
-// to the 64-bit register the guest reads. Expectations come from the C standard (N1570 7.21.6.2):
+// to the 64-bit register the guest reads. The conversions themselves run in whatever host C runtime
+// prosper is built against, and the guest's format string reaches it unchanged, so a host runtime
+// that parses differently from the guest's libc is prosper's bug (e.g. #4341). That is why these
+// cases cover conversions too, not only the handler's own code. Expectations come from the C standard (N1570 7.21.6.2):
 // the return value is the number of input items ASSIGNED, or EOF if an input failure occurs before
 // the first conversion; %n assigns the characters consumed so far and does not count; `*`
 // suppresses assignment and does not count; a matching failure stops the scan and leaves later
@@ -88,14 +91,15 @@ TEST_F(LibcSscanf, IntegerBasesUseUnsignedDestinations) {
     EXPECT_EQ(i_dec, -9);
 }
 
-TEST_F(LibcSscanf, NegativeInputToUnsignedConversionsWrapsLikeStrtoul) {
+TEST_F(LibcSscanf, NegativeInputToUnsignedConversionsWrapsLikeStrtoull) {
     // N1570 7.21.6.2p12: %o/%u/%x match the subject sequence of strtoul, which negates in the
-    // unsigned type.
-    unsigned o = 0, x = 0, u = 0;
-    EXPECT_EQ(r64(sscanf_("-10 -1 -2", "%o %x %u", &o, &x, &u)), 3);
-    EXPECT_EQ(o, 0u - 010u);
-    EXPECT_EQ(x, UINT_MAX);
-    EXPECT_EQ(u, 0u - 2u);
+    // unsigned type. With `ll` the destination is unsigned long long, which holds the negated
+    // value on every host; a plain unsigned int would not (p10: undefined).
+    unsigned long long o = 0, x = 0, u = 0;
+    EXPECT_EQ(r64(sscanf_("-10 -1 -2", "%llo %llx %llu", &o, &x, &u)), 3);
+    EXPECT_EQ(o, 0ull - 010ull);
+    EXPECT_EQ(x, ULLONG_MAX);
+    EXPECT_EQ(u, 0ull - 2ull);
 }
 
 TEST_F(LibcSscanf, LengthModifiersSelectTheDestinationWidth) {

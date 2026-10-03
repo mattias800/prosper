@@ -835,6 +835,11 @@ if(TARGET prosper_core)
              COMMAND test_nid "${GAME_DUMP}/eboot.bin")
   endif()
 
+  # Dump-independent golden vectors pin NID hashing in the default unit-test set.
+  prosper_add_gtest(test_nid_vectors
+    SOURCES tests/hle/dispatch/test_nid_vectors.cpp
+    LIBRARIES prosper_core)
+
   # Split-T# provenance proof (#4197): pure decoder/fold cases, no dump.
   # #4120/#4274: storage-image DST_SEL routing rules (pure).
   prosper_add_gtest(test_storage_dst_sel
@@ -1921,6 +1926,15 @@ if(TARGET prosper_core)
     SOURCES tests/hle/kernel/test_mutex_types.cpp
     LIBRARIES prosper_core)
 
+  # pthread key destructor teardown at thread exit through the scePthread* HLE,
+  # including the Windows (winpthreads) path: single fire, reinstall
+  # refire/stop, iteration bound, deleted-key silence, all keys fire with no
+  # order asserted, NULL destructor silence. Pure, no game dump.
+  prosper_add_gtest(test_pthread_key_teardown
+    SOURCES tests/hle/kernel/test_pthread_key_teardown.cpp
+    LIBRARIES prosper_core
+    PROPERTIES TIMEOUT 60)
+
   prosper_add_gtest(test_agc_shader
     SOURCES tests/gpu/test_agc_shader.cpp
     LIBRARIES prosper_core)
@@ -2417,6 +2431,14 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_nested_wide_data_admission
     SOURCES tests/gpu/execute/test_nested_wide_data_admission.cpp
     LIBRARIES prosper_core)
+  # Registered nested snapshot admission uses the Linux direct-memory lazy-fault proof.
+  # Callback/compute stand-ins exercise ordered execution without creating a Vulkan device.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    prosper_add_gtest(test_ordered_render_finality
+      SOURCES tests/gpu/execute/test_ordered_render_finality.cpp
+      INCLUDES frontends
+      LIBRARIES prosper_core)
+  endif()
 
   # Hinted map must not clobber a live mapping (#137): MAP_FIXED_NOREPLACE unless the hint is our
   # own uncommitted reservation. Drives the real map HLE handlers. Linux-only (mmap semantics).
@@ -3440,6 +3462,14 @@ endif()
   # Compile-only synthetic reject-route guard for #2790; not an executable real-shader reproducer.
   prosper_add_gtest(test_undef_loop_accumulator
     SOURCES tests/gpu/recompiler/test_undef_loop_accumulator.cpp
+    LIBRARIES prosper_core)
+
+  # Fail-visible refusal pins for gap opcodes (v_perm_b32, v_mad_i64_i32,
+  # v_div_fixup_f32, v_sad_u8, s_movrels_b32, image_gather4): empty module,
+  # never a silent mistranslation. Compile-only, no device. Any later
+  # lowering replaces these arms with execution tests.
+  prosper_add_gtest(test_gap_opcode_refusals
+    SOURCES tests/gpu/recompiler/test_gap_opcode_refusals.cpp
     LIBRARIES prosper_core)
 
   add_executable(test_fragment_loop_mask tests/gpu/recompiler/test_fragment_loop_mask.cpp)

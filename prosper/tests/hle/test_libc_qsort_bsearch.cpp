@@ -133,8 +133,9 @@ PROSPER_GUEST_ABI int cmp_int_desc_plain(const void* a, const void* b) {
 const int kInnerTableDesc[] = {10, 8, 6, 4, 2};
 PROSPER_GUEST_ABI int cmp_int_asc_nesting(const void* a, const void* b) {
     ++g_calls;
-    const int probe = 6;
-    // Descending table + descending comparator: only the inner comparator finds 6 here.
+    const int probe = 8;
+    // Descending table + descending comparator: only the inner comparator finds 8 here. (Not the
+    // midpoint 6, which any comparator finds on the first probe.)
     if (g_bsearch(U(&probe), U(kInnerTableDesc), 5, sizeof(int), U(&cmp_int_desc_plain), 0) != 0)
         ++g_inner_hits;
     const int x = *static_cast<const int*>(a), y = *static_cast<const int*>(b);

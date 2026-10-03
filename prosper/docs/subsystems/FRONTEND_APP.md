@@ -935,6 +935,19 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
 
 ## Ruled out
 
+- **“The X11 map stall requires guest startup, SDL, or DirectColor.”** On 2026-10-03,
+  the frozen `7a6a3677` normal app reproduced #4079 with `--test-pattern`, without a guest:
+  its owned managed window remained unmapped while the main thread waited in SDL's
+  `X11_ShowWindow` → `XIfEvent`. An independent native TrueColor X11 client also stayed
+  unmapped. On one known creation connection, a managed control remained unmapped while
+  an otherwise comparable override-redirect control became viewable and delivered its
+  exact-window `MapNotify`. These factors are therefore unnecessary for this host occurrence;
+  the remaining cause is within the managed mapping path and has not been identified.
+  The same app completed a strict native Wayland no-guest control with an owned, non-minimized
+  KWin window, native surface/buffer submissions and exit 0. That establishes a startup
+  continuation route, not game rendering parity, an X11 fix, or performance equivalence
+  ([#4079](https://github.com/mattias800/prosper/issues/4079#issuecomment-5972357076)).
+
 - **“Fusing result comparison into retile requires scattered reads of a padded baseline.”**
   The live comparator binds `staging[i]` over `exact_result_bytes`, and baseline retention adopts
   that same **linear** staging allocation. The retile emitter's valid-pixel block already computes
