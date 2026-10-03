@@ -1603,6 +1603,15 @@ TEST(Rdna2DecodeSweep, WriteCountForMubufD16FormatStoresIsZero) {
     }
 }
 
+TEST(Rdna2DecodeSweep, WriteCountForMubufByteShortStoresIsZero) {
+    // #4243: buffer_store_byte (0x18), its _d16_hi form (0x19), buffer_store_short (0x1A) and
+    // its _d16_hi form (0x1B) read VDATA; they were falling through to `return 1`.
+    for (uint32_t op = 0x18; op <= 0x1B; ++op) {
+        EXPECT_EQ(rdna2_vgpr_write_count(mubuf(op)), 0u) << op;
+        EXPECT_EQ(rdna2_vgpr_destination_span(mubuf(op)), 1u) << "span op=" << op;
+    }
+}
+
 TEST(Rdna2DecodeSweep, WriteCountForMtbufLoadsAndPackedD16Loads) {
     for (uint32_t op = 0; op <= 3; ++op) EXPECT_EQ(rdna2_vgpr_write_count(mtbuf(op)), op + 1) << op;
     for (uint32_t op = 4; op <= 7; ++op) EXPECT_EQ(rdna2_vgpr_write_count(mtbuf(op)), 0u) << op;
@@ -1620,6 +1629,16 @@ TEST(Rdna2DecodeSweep, WriteCountForFlatLoadsAndStores) {
     EXPECT_EQ(rdna2_vgpr_write_count(flat(0x0E)), 4u);
     EXPECT_EQ(rdna2_vgpr_write_count(flat(0x0F)), 3u);
     for (uint32_t op = 0x18; op <= 0x1F; ++op) EXPECT_EQ(rdna2_vgpr_write_count(flat(op)), 0u) << op;
+}
+
+TEST(Rdna2DecodeSweep, WriteCountForFlatD16LoadsIsOne) {
+    // #4243: FLAT D16 narrow loads write one VGPR (read-modify-write of the destination half).
+    // 0x20 ubyte_d16, 0x21 ubyte_d16_hi, 0x22 sbyte_d16, 0x23 sbyte_d16_hi, 0x24 short_d16,
+    // 0x25 short_d16_hi. Previously the FLAT arm returned 0 for every opcode outside 0x08-0x0F.
+    for (uint32_t op = 0x20; op <= 0x25; ++op) {
+        EXPECT_EQ(rdna2_vgpr_write_count(flat(op)), 1u) << op;
+        EXPECT_EQ(rdna2_vgpr_destination_span(flat(op)), 1u) << "span op=" << op;
+    }
 }
 
 TEST(Rdna2DecodeSweep, WriteCountForDsResultOpcodes) {

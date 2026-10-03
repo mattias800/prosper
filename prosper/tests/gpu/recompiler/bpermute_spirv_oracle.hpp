@@ -483,90 +483,98 @@ struct Interpreter {
         if (a.size() != 3 || ty(a[0]).op != 20)
           fail("LogicalNot type mismatch");
         set(l, a[1], a[0], {uint32_t(!boolean(l, a[2]))});
+      } else if (op == 230) {
+          // Narrow SOURCE-only uint32 Device/Relaxed compare-exchange. The evaluator serializes
+          // workers; this checks actual instructions, bounds and readonly ownership, NOT Vulkan
+          // atomic ordering or inter-workgroup synchronization (those need real GPU controls).
+          if (a.size() != 8 || !uint_type(a[0]) || word(l, a[3]) != 1 || word(l, a[4]) != 0 ||
+              word(l, a[5]) != 0)
+              fail("unsupported compare-exchange profile");
+          const auto p = pointer(l, a[2]);
+          if (p.type != a[0] || readonly_storage.contains(p.root))
+              fail("compare-exchange type/readonly mismatch");
+          const auto previous = read(l, p), desired = value(l, a[6]), compare = value(l, a[7]);
+          if (previous.type != a[0] || desired.type != a[0] || compare.type != a[0] ||
+              !previous.defined || !desired.defined || !compare.defined)
+              fail("compare-exchange undefined/type mismatch");
+          set(l, a[1], a[0], previous.words);
+          if (previous.words == compare.words) write(l, p, desired);
       } else if (op == 205) {
-        if (a.size() != 3 || !uint_type(a[0]))
-          fail("unsupported BitCount result");
-        const auto x = value(l, a[2]);
-        if (x.type != a[0] || x.words.size() != 1)
-          fail("BitCount operand type mismatch");
-        uint32_t bits = 0;
-        for (uint32_t position = 0; position < 32; ++position)
-          bits += (x.words[0] >> position) & 1u;
-        set(l, a[1], a[0], {bits}, x.defined);
-      } else if (op == 170 || op == 171 || op == 172 || op == 174 ||
-                 op == 176 || op == 178 || op == 128 || op == 130 ||
-                 op == 132 || op == 134 || op == 137 || op == 194 ||
+          if (a.size() != 3 || !uint_type(a[0])) fail("unsupported BitCount result");
+          const auto x = value(l, a[2]);
+          if (x.type != a[0] || x.words.size() != 1) fail("BitCount operand type mismatch");
+          uint32_t bits = 0;
+          for (uint32_t position = 0; position < 32; ++position)
+              bits += (x.words[0] >> position) & 1u;
+          set(l, a[1], a[0], {bits}, x.defined);
+      } else if (op == 170 || op == 171 || op == 172 || op == 174 || op == 176 || op == 178 ||
+                 op == 128 || op == 130 || op == 132 || op == 134 || op == 137 || op == 194 ||
                  op == 196 || op == 197 || op == 198 || op == 199) {
-        if (a.size() != 4)
-          fail("malformed integer instruction");
-        const auto x = value(l, a[2]), y = value(l, a[3]);
-        if (!unsigned_type(x.type) || x.type != y.type || x.words.size() != size(x.type) ||
-            y.words.size() != size(y.type))
-          fail("integer operand types");
-        const bool comparison = op >= 170 && op <= 178;
-        if (comparison ? ty(a[0]).op != 20 : a[0] != x.type)
-          fail("integer result type");
-        if (!x.defined || !y.defined) {
-          set(l, a[1], a[0], std::vector<uint32_t>(size(a[0]), 0), false);
-          continue;
-        }
-        const uint64_t u = unsigned_value(x), v = unsigned_value(y);
-        uint64_t r = 0;
-        if (op == 170)
-          r = u == v;
-        else if (op == 171)
-          r = u != v;
-        else if (op == 172)
-          r = u > v;
-        else if (op == 174)
-          r = u >= v;
-        else if (op == 176)
-          r = u < v;
-        else if (op == 178)
-          r = u <= v;
-        else if (op == 128)
-          r = u + v;
-        else if (op == 130)
-          r = u - v;
-        else if (op == 132)
-          r = u * v;
-        else if (op == 134 || op == 137) {
-          if (!v)
-            fail("division by zero");
-          r = op == 134 ? u / v : u % v;
-        } else if (op == 194 || op == 196) {
-          if (v >= 32 * size(x.type))
-            fail("poison shift");
-          r = op == 194 ? u >> v : u << v;
-        } else if (op == 197)
-          r = u | v;
-        else if (op == 198)
-          r = u ^ v;
-        else
-          r = u & v;
-        if (comparison) set(l, a[1], a[0], {static_cast<uint32_t>(r)});
-        else set_unsigned(l, a[1], a[0], r);
-      } else if (op == 250) {
-        if (a.size() < 3)
-          fail("malformed BranchConditional");
-        jump(l, boolean(l, a[0]) ? a[1] : a[2]);
-      } else if (op == 249) {
-        if (a.size() != 1)
-          fail("malformed Branch");
-        jump(l, a[0]);
-      } else if (op == 251) {
-        if (a.size() < 2 || a.size() % 2)
-          fail("malformed Switch");
-        const auto selector = word(l, a[0]);
-        uint32_t target = a[1];
-        for (size_t j = 2; j < a.size(); j += 2)
-          if (a[j] == selector) {
-            target = a[j + 1];
-            break;
+          if (a.size() != 4) fail("malformed integer instruction");
+          const auto x = value(l, a[2]), y = value(l, a[3]);
+          if (!unsigned_type(x.type) || x.type != y.type || x.words.size() != size(x.type) ||
+              y.words.size() != size(y.type))
+              fail("integer operand types");
+          const bool comparison = op >= 170 && op <= 178;
+          if (comparison ? ty(a[0]).op != 20 : a[0] != x.type) fail("integer result type");
+          if (!x.defined || !y.defined) {
+              set(l, a[1], a[0], std::vector<uint32_t>(size(a[0]), 0), false);
+              continue;
           }
-        jump(l, target);
+          const uint64_t u = unsigned_value(x), v = unsigned_value(y);
+          uint64_t r = 0;
+          if (op == 170)
+              r = u == v;
+          else if (op == 171)
+              r = u != v;
+          else if (op == 172)
+              r = u > v;
+          else if (op == 174)
+              r = u >= v;
+          else if (op == 176)
+              r = u < v;
+          else if (op == 178)
+              r = u <= v;
+          else if (op == 128)
+              r = u + v;
+          else if (op == 130)
+              r = u - v;
+          else if (op == 132)
+              r = u * v;
+          else if (op == 134 || op == 137) {
+              if (!v) fail("division by zero");
+              r = op == 134 ? u / v : u % v;
+          } else if (op == 194 || op == 196) {
+              if (v >= 32 * size(x.type)) fail("poison shift");
+              r = op == 194 ? u >> v : u << v;
+          } else if (op == 197)
+              r = u | v;
+          else if (op == 198)
+              r = u ^ v;
+          else
+              r = u & v;
+          if (comparison)
+              set(l, a[1], a[0], {static_cast<uint32_t>(r)});
+          else
+              set_unsigned(l, a[1], a[0], r);
+      } else if (op == 250) {
+          if (a.size() < 3) fail("malformed BranchConditional");
+          jump(l, boolean(l, a[0]) ? a[1] : a[2]);
+      } else if (op == 249) {
+          if (a.size() != 1) fail("malformed Branch");
+          jump(l, a[0]);
+      } else if (op == 251) {
+          if (a.size() < 2 || a.size() % 2) fail("malformed Switch");
+          const auto selector = word(l, a[0]);
+          uint32_t target = a[1];
+          for (size_t j = 2; j < a.size(); j += 2)
+              if (a[j] == selector) {
+                  target = a[j + 1];
+                  break;
+              }
+          jump(l, target);
       } else if (op == 253)
-        l.done = true;
+          l.done = true;
       else if (op != 246 && op != 247 && op != 8 && op != 317 && op != 0)
         fail("unsupported live opcode " + std::to_string(op));
     }

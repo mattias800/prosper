@@ -1407,6 +1407,12 @@ if(TARGET prosper_core)
     SOURCES tests/host/image/test_guest_module_label.cpp
     LIBRARIES prosper_core)
 
+  # The guest-FS swap stub's saved-base slot is consumed by callback_fs.hpp. Inspect emitted bytes
+  # without executing FSGSBASE instructions, and pin both the handler offset and call alignment.
+  prosper_add_gtest(test_guest_fs_swap_stub
+    SOURCES tests/host/image/test_guest_fs_swap_stub.cpp
+    LIBRARIES prosper_core)
+
   # The frame-pointer walk shared by the fault reporter and PROSPER_HWBP_STACK. It dereferences
   # guest-controlled pointers inside a signal handler, so every stop condition (cycle, unreadable
   # frame, depth cap) is a safety property. Header-only; no dump, no device.
@@ -2670,9 +2676,13 @@ if(TARGET prosper_core)
       LIBRARIES prosper_core Vulkan::Vulkan)
   endif()
 
-  add_executable(test_rdna2_decode tests/gpu/recompiler/test_rdna2_decode.cpp)
-  target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
-  add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
+  prosper_add_gtest(test_rdna2_decode
+    SOURCES tests/gpu/recompiler/test_rdna2_decode.cpp
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_rdna2_predicate_tables
+    SOURCES tests/gpu/recompiler/test_rdna2_predicate_tables.cpp
+    LIBRARIES prosper_core)
 
   # Exhaustive per-family opcode/length sweep of the walker (words built from the encoding layout).
   prosper_add_gtest(test_rdna2_decode_sweep
@@ -2879,6 +2889,11 @@ endif()
   # fires would otherwise pass the suite.
   prosper_add_gtest(test_scc_branch_uniformity
     SOURCES tests/gpu/recompiler/test_scc_branch_uniformity.cpp
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_fragment_draw_capacity
+    SOURCES tests/gpu/recompiler/test_fragment_draw_capacity.cpp
+    INCLUDES src tests
     LIBRARIES prosper_core)
 
   # #3573: the CFG dispatcher must lower a fragment exec/vcc branch as a wave vote.
@@ -5989,6 +6004,12 @@ endif()
 # physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
 # silent pass) where one does not.
 if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  prosper_add_gtest(test_fragment_draw_plan
+    SOURCES tests/gpu/execute/test_fragment_draw_plan.cpp
+    INCLUDES tests frontends LIBRARIES prosper_core Vulkan::Vulkan LABELS unit PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_draw_exec
+    SOURCES tests/gpu/execute/test_fragment_draw_exec.cpp
+    INCLUDES tests frontends LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_ps_pull_model_exec
     SOURCES tests/gpu/execute/test_ps_pull_model_exec.cpp
     INCLUDES tests frontends LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)

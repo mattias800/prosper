@@ -77,6 +77,8 @@ inline constexpr uint32_t kSop1OpcodeQuadmaskB64 = 0x2d;
 inline constexpr uint32_t kSop1OpcodeAbsI32 = 0x34;
 inline constexpr uint32_t kSop1OpcodeAndn1SaveexecB64 = 0x37;
 inline constexpr uint32_t kSop1OpcodeOrn1SaveexecB64 = 0x38;
+inline constexpr uint32_t kSop1OpcodeAndn1WrexecB64 = 0x39;
+inline constexpr uint32_t kSop1OpcodeAndn2WrexecB64 = 0x3A;
 inline constexpr uint32_t kSop1OpcodeAndSaveexecB32 = 0x3c;
 inline constexpr uint32_t kSop1OpcodeOrSaveexecB32 = 0x3d;
 inline constexpr uint32_t kSop1OpcodeXorSaveexecB32 = 0x3e;
@@ -152,6 +154,26 @@ inline constexpr bool sop1_opcode_is_wrexec_b32(uint32_t opcode) {
 
 inline constexpr bool sop1_opcode_writes_exec_b32(uint32_t opcode) {
     return sop1_opcode_is_saveexec_b32(opcode) || sop1_opcode_is_wrexec_b32(opcode);
+}
+
+// The B64 EXEC-writing family, derived from the same LLVM TableGen source as the opcode numbers
+// above (`SOPInstructions.td`: `SOP1_Real_gfx6_gfx7_gfx10_gfx13<0x024..0x02B>` for the eight
+// AND/OR/XOR/ANDN2/ORN2/NAND/NOR/XNOR SAVEEXEC ops, plus the gfx9+ `Defs = [EXEC, SCC]` ops
+// `S_ANDN1/ORN1_SAVEEXEC_B64` at 0x37/0x38 and `S_ANDN1/ANDN2_WREXEC_B64` at 0x39/0x3A). Split by
+// operation rather than one range because 0x24-0x2B, 0x37-0x38 and 0x39-0x3A are three
+// non-contiguous groups (QUADMASK/MOVRELS/MOVRELD/ABS sit between them and do not write EXEC),
+// which is exactly how the 0x39/0x3A WREXEC pair was missed by the old inline range (#2120 class).
+inline constexpr bool sop1_opcode_is_saveexec_b64(uint32_t opcode) {
+    return (opcode >= kSop1OpcodeAndSaveexecB64 && opcode <= kSop1OpcodeXnorSaveexecB64) ||
+           opcode == kSop1OpcodeAndn1SaveexecB64 || opcode == kSop1OpcodeOrn1SaveexecB64;
+}
+
+inline constexpr bool sop1_opcode_is_wrexec_b64(uint32_t opcode) {
+    return opcode == kSop1OpcodeAndn1WrexecB64 || opcode == kSop1OpcodeAndn2WrexecB64;
+}
+
+inline constexpr bool sop1_opcode_writes_exec_b64(uint32_t opcode) {
+    return sop1_opcode_is_saveexec_b64(opcode) || sop1_opcode_is_wrexec_b64(opcode);
 }
 
 // The emitter currently implements only the three B32 forms observed in guest shaders. Width and
