@@ -76,6 +76,9 @@ SharedShaderAnalysis acquire_shader_analysis(const uint32_t* code, size_t dwords
 struct DrawItem {
     // Development-activated real raster producer. No automatic fragment admission authority.
     std::shared_ptr<RasterQuadCollection> raster_quads;
+    // Shipping logical64 candidate: immutable original producing modules/code/raw launch. This
+    // does not mark a draw ready or promote host raster observations to guest entry values.
+    std::shared_ptr<const RasterQuadInputs> fragment_draw_inputs;
     std::shared_ptr<const GraphicsOwnedWaveDraw> owned_waves;
     std::vector<uint32_t> vs, gs, fs;                 // recompiled/generated SPIR-V
     // The live path can retain warm-cache shader modules by shared ownership instead of copying the
@@ -3130,9 +3133,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         out.owned_waves = std::move(pinned);
     }
     out.raster_quads.reset();
+    out.fragment_draw_inputs.reset();
     // Pin activation and producing inputs here, before the renderer can select a different phase.
     // Analysis reuse off deliberately supplies no raw-version authority instead of rereading VA.
-    if (PROSPER_ENV_ON("PROSPER_FRAGMENT_QUAD_COLLECT")) {
+    const bool diagnostic_quad_collection = PROSPER_ENV_ON("PROSPER_FRAGMENT_QUAD_COLLECT");
+    if (diagnostic_quad_collection || (!rs.ps_wave32 && !out.owned_waves)) {
         auto inputs = std::make_shared<RasterQuadInputs>();
         inputs->source_vs = out.vs_shared ? out.vs_shared :
             std::make_shared<const std::vector<uint32_t>>(out.vs);
@@ -3152,9 +3157,24 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         inputs->float_mode = out.ps_float_mode;
         inputs->float_flags = out.ps_float_flags;
         inputs->launch_rsrc1 = out.ps_launch_rsrc1;
-        inputs->ps_resources = own_fragment_packet_resources(prt.get());
-        out.raster_quads = std::make_shared<RasterQuadCollection>();
-        out.raster_quads->inputs = std::move(inputs);
+        if (diagnostic_quad_collection) {
+            inputs->ps_resources = own_fragment_packet_resources(prt.get());
+        } else {
+            // No new whole-resource host copy on the shipping hot path. This first transaction
+            // recipe is PS-resource-free; a retained normalized table is identity, NOT a live
+            // content/read-PC/epoch lease. Resource-bearing programs keep that explicit gap.
+            inputs->ps_resources.observed = true;
+            inputs->ps_resources.table = prt ? prt : std::make_shared<const ShaderResourceTable>();
+            if (prt && !prt->resources.empty())
+                inputs->ps_resources.rejection = "fragment-draw-live-resource-lease-unimplemented";
+        }
+        // The independently admitted owned-stage route keeps its own complete stage/event plan.
+        // Do not recompile its transformed output or attempt a second fragment transaction.
+        if (!rs.ps_wave32 && !out.owned_waves) out.fragment_draw_inputs = inputs;
+        if (diagnostic_quad_collection) {
+            out.raster_quads = std::make_shared<RasterQuadCollection>();
+            out.raster_quads->inputs = std::move(inputs);
+        }
     }
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;

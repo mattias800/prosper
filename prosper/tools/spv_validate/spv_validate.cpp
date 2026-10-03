@@ -21,6 +21,8 @@
 // is a hard failure rather than a pass.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
+#include "gpu/recompiler/fragment_draw_capacity.hpp"
+#include "gpu/recompiler/fragment_draw_gpu.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "build_revision.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -773,6 +775,51 @@ int main(int argc, char** argv) {
             prosper::test::fragment_packet_wave::scalar_exec_packet(0));
         dump(dir, "fragment_packet_wave_scalar_exec_kernel",
              scalar_exec_kernel.program.packet.spirv, "recompile_fragment_packet_kernel");
+        // A separate original resource-free PS represents the first assembly recipe. The wave
+        // fixture above genuinely consumes SMEM/M0/P1/P2 and must not have its resources stripped
+        // to make this representative emit. Hand-owned user words remain distinct from WAT2
+        // placement authority; this factory does not establish shipping launch or attachment data.
+        auto draw_schema = resources::base();
+        auto& draw_invocation = draw_schema.invocation;
+        draw_invocation.export_observation = FragmentPacketExportObservation::Architectural;
+        draw_invocation.mask_state_available = false;
+        draw_invocation.vgprs.clear();
+        draw_invocation.sgprs = {{0, resources::bits(.25f)},
+                                 {1, resources::bits(.5f)},
+                                 {2, resources::bits(.75f)},
+                                 {3, resources::bits(1.0f)}};
+        // The original EXEC=-1 dominates every vector writer/export. No guest initial mask,
+        // system input, helper value, parameter coefficient or scratch VGPR is invented.
+        draw_invocation.guest_code = {0xbefe04c1u, 0x7e000200u, 0x7e020201u, 0x7e040202u,
+                                      0x7e060203u, 0xf800180fu, 0x03020100u, 0xbf810000u};
+        auto draw_kernel = std::make_shared<const FragmentPacketKernel>(
+            recompile_fragment_packet_capacity_kernel(draw_schema));
+        dump(dir, "fragment_draw_capacity_kernel", draw_kernel->program.packet.spirv,
+             "recompile_fragment_packet_capacity_kernel");
+        RasterQuadCollector draw_collector;
+        draw_collector.max_quads = 48;
+        draw_collector.lane_words = kRasterQuadLaneFixedWords;
+        draw_collector.record_words = 4 * draw_collector.lane_words;
+        std::string draw_rejection;
+        const auto draw_capacity =
+            fragment_draw_capacity(draw_kernel, draw_collector, draw_rejection);
+        if (!draw_capacity) {
+            printf("  [FAIL] fragment draw capacity: %s\n", draw_rejection.c_str());
+            ++fails;
+        } else {
+            dump(dir, "fragment_draw_count",
+                 build_fragment_draw_count(*draw_capacity, draw_collector),
+                 "build_fragment_draw_count");
+            dump(dir, "fragment_draw_assembly",
+                 build_fragment_draw_assembly(*draw_capacity, draw_collector),
+                 "build_fragment_draw_assembly");
+            dump(dir, "fragment_draw_validation",
+                 build_fragment_draw_validation(*draw_capacity, draw_collector),
+                 "build_fragment_draw_validation");
+            dump(dir, "fragment_draw_replay",
+                 build_fragment_draw_replay(*draw_capacity, draw_collector),
+                 "build_fragment_draw_replay");
+        }
         namespace architectural = prosper::test::fragment_packet_exports;
         for (const auto& [name, input] :
              std::vector<std::pair<const char*, FragmentResourcePacket>>{
