@@ -2303,6 +2303,12 @@ if(TARGET prosper_core)
     SOURCES tests/host/test_dmem.cpp
     LIBRARIES prosper_core)
 
+  # MapDirectMemory2 changes physical-allocation type only when its mapping succeeds; exercise the
+  # refused fixed-map path against a live host mapping and pair it with a successful type control.
+  prosper_add_gtest(test_map_direct_memory2_failure
+    SOURCES tests/hle/memory/test_map_direct_memory2_failure.cpp
+    LIBRARIES prosper_core)
+
   # PROSPER_DMEM_CALLER stack walk (issue #1755): the diagnostic scans up to 160 slots above its
   # frame and used to read straight off the top of a thread stack, dying with a SIGSEGV that reads
   # as a guest fault.
