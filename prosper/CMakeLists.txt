@@ -1321,6 +1321,16 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_reallocf.cpp
     LIBRARIES prosper_core)
 
+  # Guest libc contracts prosper implements itself (not host forwarders), called through the
+  # registered handlers. strlcpy/strlcat are prosper's own code; qsort/bsearch own the guest
+  # comparator's calling convention, which differs from the host's on Windows. Pure, no game dump.
+  prosper_add_gtest(test_libc_strlcpy
+    SOURCES tests/hle/test_libc_strlcpy.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_libc_qsort_bsearch
+    SOURCES tests/hle/test_libc_qsort_bsearch.cpp
+    LIBRARIES prosper_core)
+
   # #2081 FALSE SUCCESS: an unregistered NID answers the dispatcher's 0, which for an SCE_OK
   # contract is a success report over an out-parameter nothing wrote. Pure, no game dump.
   prosper_add_gtest(test_false_success_nids
