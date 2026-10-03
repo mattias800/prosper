@@ -729,3 +729,223 @@ TEST(Rdna2DecodeSweep, VintrpDecodesOpcodeDestinationAttributeAndChannel) {
     EXPECT_EQ(in.src[0].value, 7);
     EXPECT_EQ(in.n_src, 1);
 }
+
+// ---- MIMG control fields and mip-operand shape helpers ---------------------------------------
+// dword0: OP[0] at bit 0, NSA[2:1], DIM[5:3], DLC[7], DMASK[11:8], UNORM[12], GLC[13], R128[15],
+//         TFE[16], LWE[17], OP[7:1] at [24:18], SLC[25]; bits 6 and 14 are reserved.
+// dword1: VADDR[7:0], VDATA[15:8], SRSRC[20:16] (x4), SSAMP[25:21] (x4), reserved [29:26],
+//         A16[30], D16[31].
+
+namespace {
+constexpr uint32_t kMimg = 0xF0000000u;
+constexpr uint32_t mimg_op(uint32_t op) { return ((op >> 7) & 1u) | ((op & 0x7Fu) << 18); }
+constexpr uint32_t kMimgLoadMip = 0x01u;
+constexpr uint32_t kMimgStoreMip = 0x09u;
+}  // namespace
+
+TEST(Rdna2DecodeSweep, MimgOpcodeUsesBitZeroAsItsMostSignificantBit) {
+    // Dropping dword0 bit 0 would alias IMAGE_MSAA_LOAD (128) onto IMAGE_LOAD (0): every opcode in
+    // 0..255 must round-trip, not just the low half.
+    for (uint32_t op = 0; op <= 0xFF; ++op) {
+        const uint32_t w = kMimg | ((op >> 7) & 1u) | (((op & 0x7Fu)) << 18);
+        const Rdna2Inst in = decode(w);
+        ASSERT_EQ(in.fmt, Rdna2Format::MIMG);
+        EXPECT_EQ(in.opcode, op) << "op=" << op;
+    }
+}
+
+TEST(Rdna2DecodeSweep, MimgDmaskDimAndNsaFieldsRoundTrip) {
+    for (uint32_t dmask = 0; dmask < 16; ++dmask) {
+        EXPECT_EQ(decode(kMimg | (dmask << 8)).mimg_dmask, dmask) << dmask;
+    }
+    for (uint32_t dim = 0; dim < 8; ++dim) {
+        EXPECT_EQ(decode(kMimg | (dim << 3)).mimg_dim, dim) << dim;
+    }
+    for (uint32_t nsa = 0; nsa < 4; ++nsa) {
+        EXPECT_EQ(decode(kMimg | (nsa << 1)).mimg_nsa, nsa) << nsa;
+    }
+}
+
+TEST(Rdna2DecodeSweep, MimgEachControlBitMapsToExactlyItsOwnField) {
+    struct Bit { uint32_t dword; uint32_t bit; bool Rdna2Inst::*field; const char* name; };
+    const Bit bits[] = {
+        {0, 7, &Rdna2Inst::mimg_dlc, "dlc"},    {0, 12, &Rdna2Inst::mimg_unorm, "unorm"},
+        {0, 13, &Rdna2Inst::mimg_glc, "glc"},   {0, 15, &Rdna2Inst::mimg_r128, "r128"},
+        {0, 16, &Rdna2Inst::mimg_tfe, "tfe"},   {0, 17, &Rdna2Inst::mimg_lwe, "lwe"},
+        {0, 25, &Rdna2Inst::mimg_slc, "slc"},   {1, 30, &Rdna2Inst::mimg_a16, "a16"},
+        {1, 31, &Rdna2Inst::mimg_d16, "d16"},
+    };
+    for (const Bit& set : bits) {
+        const Rdna2Inst in = set.dword == 0 ? decode(kMimg | (1u << set.bit), 0u)
+                                             : decode(kMimg, 1u << set.bit);
+        for (const Bit& probe : bits) {
+            const bool expected = &probe == &set;
+            EXPECT_EQ(static_cast<bool>(in.*probe.field), expected)
+                << "setting " << set.name << " read back through " << probe.name;
+        }
+        EXPECT_FALSE(in.mimg_reserved) << set.name << " is a defined control, not a reserved bit";
+    }
+    const Rdna2Inst clear = decode(kMimg, 0u);
+    for (const Bit& b : bits) EXPECT_FALSE(static_cast<bool>(clear.*b.field)) << b.name;
+}
+
+TEST(Rdna2DecodeSweep, MimgReservedHolesAreFlaggedAndOnlyThose) {
+    // dword0 bits 6 and 14, dword1 bits 26..29 are reserved: an unsupported raw packet must not be
+    // mistaken for the ordinary form.
+    EXPECT_FALSE(decode(kMimg, 0u).mimg_reserved);
+    EXPECT_TRUE(decode(kMimg | (1u << 6), 0u).mimg_reserved);
+    EXPECT_TRUE(decode(kMimg | (1u << 14), 0u).mimg_reserved);
+    for (uint32_t bit = 26; bit <= 29; ++bit) {
+        EXPECT_TRUE(decode(kMimg, 1u << bit).mimg_reserved) << "d1 bit " << bit;
+    }
+    // Neighbours of the holes are defined fields, not reserved.
+    for (uint32_t bit : {5u, 7u, 13u, 15u}) {
+        EXPECT_FALSE(decode(kMimg | (1u << bit), 0u).mimg_reserved) << "d0 bit " << bit;
+    }
+    for (uint32_t bit : {25u, 30u, 31u}) {
+        EXPECT_FALSE(decode(kMimg, 1u << bit).mimg_reserved) << "d1 bit " << bit;
+    }
+}
+
+TEST(Rdna2DecodeSweep, MimgDataAddressAndDescriptorRegistersScaleCorrectly) {
+    // SRSRC and SSAMP are x4 SGPR bases: a T# is 8 SGPRs and an S# is 4, both 4-aligned.
+    for (uint32_t srsrc = 0; srsrc < 32; ++srsrc) {
+        for (uint32_t ssamp : {0u, 5u, 31u}) {
+            const Rdna2Inst in = decode(kMimg, 0x07u | (0x09u << 8) | (srsrc << 16) | (ssamp << 21));
+            EXPECT_EQ(in.src[0].kind, OperandKind::VGPR);
+            EXPECT_EQ(in.src[0].value, 7);
+            EXPECT_EQ(in.dst.value, 9);
+            EXPECT_EQ(in.src[1].kind, OperandKind::SGPR);
+            EXPECT_EQ(in.src[1].value, static_cast<int32_t>(srsrc * 4)) << srsrc;
+            EXPECT_EQ(in.src[2].value, static_cast<int32_t>(ssamp * 4)) << ssamp;
+            EXPECT_EQ(in.n_src, 3);
+        }
+    }
+}
+
+TEST(Rdna2DecodeSweep, MimgNsaExtraDwordsAreKeptInOrder) {
+    const uint32_t code[5] = {kMimg | (3u << 1), 0x11u, 0xA1A2A3A4u, 0xB1B2B3B4u, 0xC1C2C3C4u};
+    const Rdna2Inst in = rdna2_decode_one(code, 5);
+    EXPECT_EQ(in.len_dwords, 5u);
+    EXPECT_EQ(in.words[2], 0xA1A2A3A4u);
+    EXPECT_EQ(in.words[3], 0xB1B2B3B4u);
+    EXPECT_EQ(in.words[4], 0xC1C2C3C4u);
+    // A stream too short for the declared NSA dwords must not read past its end.
+    const Rdna2Inst cut = rdna2_decode_one(code, 3);
+    EXPECT_EQ(cut.words[2], 0xA1A2A3A4u);
+    EXPECT_EQ(cut.words[3], 0u);
+    EXPECT_EQ(cut.words[4], 0u);
+}
+
+// ---- mip-operand shape helpers ---------------------------------------------------------------
+
+namespace {
+Rdna2Inst mimg_load_mip(uint32_t dim, uint32_t vaddr, uint32_t dmask = 0xFu, uint32_t extra0 = 0u,
+                        uint32_t extra1 = 0u) {
+    return decode(kMimg | mimg_op(kMimgLoadMip) | (dim << 3) | (dmask << 8) | extra0,
+                  vaddr | extra1);
+}
+}  // namespace
+
+TEST(Rdna2DecodeSweep, DynamicMipShapeConsecutiveFormPutsMipLast) {
+    uint32_t reg = 999;
+    ASSERT_TRUE(rdna2_mimg_dynamic_mip_shape(mimg_load_mip(1, 10), &reg));   // 2D = [x, y, mip]
+    EXPECT_EQ(reg, 12u);
+    ASSERT_TRUE(rdna2_mimg_dynamic_mip_shape(mimg_load_mip(5, 10), &reg));   // 2D_ARRAY adds slice
+    EXPECT_EQ(reg, 13u);
+    EXPECT_TRUE(rdna2_mimg_dynamic_mip_shape(mimg_load_mip(1, 10)));          // out param optional
+}
+
+TEST(Rdna2DecodeSweep, DynamicMipShapeRejectsOtherDimsAndOpcodes) {
+    for (uint32_t dim = 0; dim < 8; ++dim) {
+        const bool admitted = rdna2_mimg_dynamic_mip_shape(mimg_load_mip(dim, 4));
+        EXPECT_EQ(admitted, dim == 1 || dim == 5) << "dim=" << dim;
+    }
+    for (uint32_t op = 0; op <= 0xFF; ++op) {
+        const Rdna2Inst in = decode(kMimg | ((op >> 7) & 1u) | ((op & 0x7Fu) << 18) | (1u << 3), 4u);
+        EXPECT_EQ(rdna2_mimg_dynamic_mip_shape(in), op == kMimgLoadMip) << "op=" << op;
+    }
+    EXPECT_FALSE(rdna2_mimg_dynamic_mip_shape(decode(0x7E000000u)));   // not MIMG at all
+}
+
+TEST(Rdna2DecodeSweep, DynamicMipShapeRejectsLayoutChangingModifiersButAdmitsCacheHints) {
+    // R128/TFE/LWE/A16/D16 and reserved bits change the address or data layout.
+    EXPECT_FALSE(rdna2_mimg_dynamic_mip_shape(mimg_load_mip(1, 4, 0xF, 1u << 15)));   // r128
+    EXPECT_FALSE(rdna2_mimg_dynamic_mip_shape(mimg_load_mip(1, 4, 0xF, 1u << 16)));   // tfe
+    EXPECT_FALSE(rdna2_mimg_dynamic_mip_shape(mimg_load_mip(1, 4, 0xF, 1u << 17)));   // lwe
+    EXPECT_FALSE(rdna2_mimg_dynamic_mip_shape(mimg_load_mip(1, 4, 0xF, 0u, 1u << 30)));  // a16
+    EXPECT_FALSE(rdna2_mimg_dynamic_mip_shape(mimg_load_mip(1, 4, 0xF, 0u, 1u << 31)));  // d16
+    EXPECT_FALSE(rdna2_mimg_dynamic_mip_shape(mimg_load_mip(1, 4, 0xF, 1u << 6)));       // reserved
+    // GLC/SLC/DLC/UNORM are addressing and cache hints: the mip operand does not move.
+    for (uint32_t bit : {7u, 12u, 13u, 25u}) {
+        EXPECT_TRUE(rdna2_mimg_dynamic_mip_shape(mimg_load_mip(1, 4, 0xF, 1u << bit))) << bit;
+    }
+}
+
+TEST(Rdna2DecodeSweep, DynamicMipShapeNsaFormReadsTheMipByte) {
+    // Byte-for-byte shape of a live NSA 2D load: image_load_mip v[5:7], [v0, v42, v5], dmask:0x7.
+    // Address 0 is VADDR, then word2 byte0 names y and byte1 names the mip VGPR.
+    const uint32_t code[3] = {0xF004070Au, 0x00080500u, 0x0000052Au};
+    const Rdna2Inst in = rdna2_decode_one(code, 3);
+    ASSERT_EQ(in.fmt, Rdna2Format::MIMG);
+    ASSERT_EQ(in.len_dwords, 3u);
+    uint32_t reg = 0;
+    ASSERT_TRUE(rdna2_mimg_dynamic_mip_shape(in, &reg));
+    EXPECT_EQ(reg, 5u);
+
+    // 2D_ARRAY adds a slice byte, so the mip is byte 2 and a nonzero byte 3 is not this shape.
+    uint32_t arr[3] = {kMimg | mimg_op(kMimgLoadMip) | (1u << 1) | (5u << 3) | (0xFu << 8), 0u,
+                       0x00071A2Au};
+    ASSERT_TRUE(rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(arr, 3), &reg));
+    EXPECT_EQ(reg, 7u);
+    arr[2] = 0x01071A2Au;
+    EXPECT_FALSE(rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(arr, 3)));
+    // NSA=2 on this operand count is not something a compiler emits; it stays fail-closed.
+    const uint32_t big[4] = {kMimg | mimg_op(kMimgLoadMip) | (2u << 1) | (1u << 3), 0u, 0u, 0u};
+    EXPECT_FALSE(rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(big, 4)));
+}
+
+TEST(Rdna2DecodeSweep, ZeroMipShapeAdmitsOnlyTheEvidencedPackets) {
+    // Branch 1: IMAGE_LOAD_MIP, UNORM+GLC, dmask 1 or 0xF, 2D/2D_ARRAY, consecutive.
+    const uint32_t unorm_glc = (1u << 12) | (1u << 13);
+    uint32_t reg = 999;
+    ASSERT_TRUE(rdna2_mimg_zero_mip_shape(mimg_load_mip(1, 10, 0xF, unorm_glc), &reg));
+    EXPECT_EQ(reg, 12u);
+    ASSERT_TRUE(rdna2_mimg_zero_mip_shape(mimg_load_mip(5, 10, 0x1, unorm_glc), &reg));
+    EXPECT_EQ(reg, 13u);
+    EXPECT_FALSE(rdna2_mimg_zero_mip_shape(mimg_load_mip(1, 10, 0xF, 0u)));            // needs UNORM+GLC
+    EXPECT_FALSE(rdna2_mimg_zero_mip_shape(mimg_load_mip(1, 10, 0x3, unorm_glc)));     // dmask 3
+    EXPECT_FALSE(rdna2_mimg_zero_mip_shape(mimg_load_mip(2, 10, 0xF, unorm_glc)));     // wrong dim
+}
+
+TEST(Rdna2DecodeSweep, ZeroMipShapeRejectsAnyLayoutOrCacheModifier) {
+    const uint32_t unorm_glc = (1u << 12) | (1u << 13);
+    for (uint32_t bit : {7u, 15u, 16u, 17u, 25u, 6u, 14u}) {   // dlc r128 tfe lwe slc + reserved
+        EXPECT_FALSE(rdna2_mimg_zero_mip_shape(mimg_load_mip(1, 10, 0xF, unorm_glc | (1u << bit))))
+            << "d0 bit " << bit;
+    }
+    EXPECT_FALSE(rdna2_mimg_zero_mip_shape(mimg_load_mip(1, 10, 0xF, unorm_glc, 1u << 30)));  // a16
+    EXPECT_FALSE(rdna2_mimg_zero_mip_shape(mimg_load_mip(1, 10, 0xF, unorm_glc, 1u << 31)));  // d16
+}
+
+TEST(Rdna2DecodeSweep, ZeroMipShapeStoreMipNsaReadsWordTwoByteOne) {
+    const uint32_t unorm_glc = (1u << 12) | (1u << 13);
+    const uint32_t w0 = kMimg | mimg_op(kMimgStoreMip) | (1u << 1) | (1u << 3) | (0xFu << 8) | unorm_glc;
+    const uint32_t ok[3] = {w0, 0u, 0x00005A33u};
+    uint32_t reg = 0;
+    ASSERT_TRUE(rdna2_mimg_zero_mip_shape(rdna2_decode_one(ok, 3), &reg));
+    EXPECT_EQ(reg, 0x5Au);
+    const uint32_t high[3] = {w0, 0u, 0x00015A33u};   // bytes above the two modelled ones must be 0
+    EXPECT_FALSE(rdna2_mimg_zero_mip_shape(rdna2_decode_one(high, 3)));
+}
+
+TEST(Rdna2DecodeSweep, ZeroMipShapeLoadMipNsaRequiresClearUnormAndGlc) {
+    const uint32_t w0 = kMimg | mimg_op(kMimgLoadMip) | (1u << 1) | (1u << 3) | (0x7u << 8);
+    const uint32_t code[3] = {w0, 0u, 0x0000052Au};
+    uint32_t reg = 0;
+    ASSERT_TRUE(rdna2_mimg_zero_mip_shape(rdna2_decode_one(code, 3), &reg));
+    EXPECT_EQ(reg, 5u);
+    const uint32_t with_glc[3] = {w0 | (1u << 13), 0u, 0x0000052Au};
+    EXPECT_FALSE(rdna2_mimg_zero_mip_shape(rdna2_decode_one(with_glc, 3)));
+    EXPECT_FALSE(rdna2_mimg_zero_mip_shape(decode(0x7E000000u)));   // not MIMG
+}
