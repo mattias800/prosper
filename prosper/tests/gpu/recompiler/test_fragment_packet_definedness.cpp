@@ -175,6 +175,12 @@ TEST(FragmentPacketDefinedness, WholeStatusTailRequiredBeforeAnyExportPublicatio
         const auto result = decode_fragment_packet(program, words, completed);
         EXPECT_TRUE(result.exports.empty());
         EXPECT_FALSE(result.rejection.empty());
+        return result;
+    };
+    const auto malformed_status = [&](const auto& words) {
+        const auto result = refused(p, words);
+        EXPECT_EQ(result.rejection, "packet-vgpr-status-record-invalid");
+        EXPECT_FALSE(result.vgpr_status_validated);
     };
     refused(p, good, false);
     auto short_tail = good;
@@ -182,13 +188,13 @@ TEST(FragmentPacketDefinedness, WholeStatusTailRequiredBeforeAnyExportPublicatio
     refused(p, short_tail);
     auto bad = good;
     bad[p.vgpr_status_offset + 63 * 4] ^= 1u;
-    refused(p, bad);
+    malformed_status(bad);
     bad = good;
     bad[p.vgpr_status_offset + 63 * 4 + 1] = 0;
-    refused(p, bad);   // success cannot name a PC
+    malformed_status(bad);   // success cannot name a PC
     bad = good;
     bad[p.vgpr_status_offset + 63 * 4 + 3] = 99;
-    refused(p, bad);
+    malformed_status(bad);
     bad = good;
     const auto late = p.vgpr_status_offset + 63 * 4;
     bad[late + 1] = 1;
@@ -196,13 +202,17 @@ TEST(FragmentPacketDefinedness, WholeStatusTailRequiredBeforeAnyExportPublicatio
     bad[late + 3] = 4;   // exact real EXP site, late lane
     const auto failed = decode_fragment_packet(p, bad, true);
     EXPECT_TRUE(failed.exports.empty());
+    EXPECT_TRUE(failed.vgpr_status_validated);
+    EXPECT_EQ(failed.rejection, "packet-vgpr-raw-export-unavailable");
     EXPECT_EQ(failed.lane, 63u);
     EXPECT_EQ(failed.pc, 1u);
+    EXPECT_EQ(failed.reg, 1u);
+    EXPECT_EQ(failed.kind, 4u);
     bad[late + 1] = 4095;
-    refused(p, bad);   // plausible range != actual original read PC
+    malformed_status(bad);   // plausible range != actual original read PC
     bad[late + 1] = 1;
     bad[late + 2] = 2;
-    refused(p, bad);   // known PC != this register/read form
+    malformed_status(bad);   // known PC != this register/read form
     auto bypass = p;
     bypass.vgpr_status_offset = UINT32_MAX;
     bypass.vgpr_failure_sites.clear();
