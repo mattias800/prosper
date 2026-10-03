@@ -2,6 +2,9 @@
 // A last 32-byte return-hook stub at stride 24 otherwise writes eight bytes into a neighbour.
 // The neighbour here is our writable sentinel, so the old defect is observable without a fault.
 #include "host/image/exec_image.hpp"
+#include "hle/dispatch/dispatch.hpp"
+#include <sys/types.h>
+#include <stdlib.h>
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
@@ -21,8 +24,8 @@ namespace {
 constexpr size_t kPage = 4096;
 constexpr uint8_t kSentinel = 0xA5;
 constexpr uint64_t kResult = 0x123456789ABCDEF0ULL;
-const std::string kPlain = "initial-stub-plain";
-const std::string kHooked = "initial-stub-hooked";
+constexpr char kPlain[] = "initial-stub-plain";
+constexpr char kHooked[] = "initial-stub-hooked";
 unsigned handler_calls = 0, hook_calls = 0;
 unsigned hook_handler_calls = 0;
 
@@ -94,10 +97,12 @@ bool observed_install(const std::vector<ImportSlot>& slots, uint64_t base, uint6
 class InitialStubInstall : public ::testing::Test {
 protected:
     void SetUp() override {
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): environment access stays in this single-threaded process.
         const char* original = std::getenv("PROSPER_NO_GUEST_FS");
         had_opt_out_ = original != nullptr;
         if (original) opt_out_ = original;
         ASSERT_EQ(sysconf(_SC_PAGESIZE), static_cast<long>(kPage)) << "fixture page geometry";
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): environment access stays in this single-threaded process.
         ASSERT_EQ(setenv("PROSPER_NO_GUEST_FS", "1", 1), 0) << "select host stubs";
         const TlsModuleDesc empty{};
         guest_tls_set_templates(&empty, 1);
@@ -115,8 +120,10 @@ protected:
         dispatch_grow_slots(nullptr);
         reset_call_log();
         if (had_opt_out_)
+            // NOLINTNEXTLINE(concurrency-mt-unsafe): environment access stays in this single-threaded process.
             setenv("PROSPER_NO_GUEST_FS", opt_out_.c_str(), 1);
         else
+            // NOLINTNEXTLINE(concurrency-mt-unsafe): environment access stays in this single-threaded process.
             unsetenv("PROSPER_NO_GUEST_FS");
         const TlsModuleDesc empty{};
         guest_tls_set_templates(&empty, 1);
@@ -126,7 +133,7 @@ private:
     bool had_opt_out_ = false;
     std::string opt_out_;
 };
-} // namespace
+}   // namespace
 
 // Target-only GNU --wrap=mmap observes all six operands. Unrelated allocations pass through.
 extern "C" void* __real_mmap(void*, size_t, int, int, int, off_t);
@@ -194,7 +201,8 @@ TEST_F(InitialStubInstall, LateHookRefusalPreservesSentinelAndDispatcherThenReco
     EXPECT_EQ(table.probe.successes, 1U) << "fitting retry owns exactly three pages";
     EXPECT_TRUE(table.sentinel_intact()) << "retry preserves the adjacent owner";
     if (recovered) {
-        EXPECT_EQ(stub_addr(511), table.base() + 511 * 24) << "last fitting slot is published";
+        EXPECT_EQ(stub_addr(511), table.base() + uint64_t{511} * 24)
+            << "last fitting slot is published";
         EXPECT_EQ(invoke_stub(511), kResult) << "recovered last slot executes the real handler";
     }
 }
@@ -231,6 +239,7 @@ TEST_F(InitialStubInstall, ReturnHookFits32AndRunsAfterHandler) {
 }
 
 TEST_F(InitialStubInstall, GuestFsEmissionFits96AndRejectsShortStrideBeforeMapping) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): environment access stays in this single-threaded process.
     ASSERT_EQ(unsetenv("PROSPER_NO_GUEST_FS"), 0) << "select guest-FS emission";
     const TlsModuleDesc empty{};
     guest_tls_set_templates(&empty, 1);
@@ -257,6 +266,7 @@ TEST_F(InitialStubInstall, GuestFsEmissionFits96AndRejectsShortStrideBeforeMappi
 }
 
 TEST_F(InitialStubInstall, Empty24RemainsValidWithGuestFsButMinimumStrideStillApplies) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): environment access stays in this single-threaded process.
     ASSERT_EQ(unsetenv("PROSPER_NO_GUEST_FS"), 0) << "select guest-FS empty-table mode";
     const TlsModuleDesc empty{};
     guest_tls_set_templates(&empty, 1);
