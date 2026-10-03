@@ -32,9 +32,9 @@ enum class AprDialect : uint8_t {
 constexpr AprDialect classify_apr_dialect(int64_t id, uint64_t tag) {
     if (id == 0) return AprDialect::RequestPointer;
     const uint64_t cnt = tag & ((1ull << 58) - 1);
-    if (cnt == 0) return AprDialect::ConstantZero;       // the listener's counters start at 1000
+    if (cnt == 0) return AprDialect::ConstantZero;   // the listener's counters start at 1000
     if (cnt >= (1ull << 32)) return AprDialect::RequestPointer;   // heap pointer, not a counter
     return AprDialect::Counter;
 }
 
-}  // namespace prosper
+}   // namespace prosper

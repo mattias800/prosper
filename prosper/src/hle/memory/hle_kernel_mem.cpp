@@ -514,8 +514,8 @@ static uint64_t ampr_arglog(const char* tag, uint64_t a0, uint64_t a1, uint64_t 
 uint64_t prosper_apr_next_token(unsigned ring);                          // hle_kernel_time.cpp
 void prosper_eq_add_apr(uint64_t eq, int64_t id, uint64_t udata);        // "
 uint64_t prosper_eq_identity(uint64_t eq);                               // " (lifetime guard)
-void prosper_eq_post_apr_event(uint64_t eq, uint64_t eq_identity, int64_t id,
-                               uint64_t token, AprDialect dialect);      // " (tag echo, #208)
+void prosper_eq_post_apr_event(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t token,
+                               AprDialect dialect);   // " (tag echo, #208)
 namespace {
     // Command-buffer ctxs bound to the APR event queue via H896Pt-yB4I, with the binding's a3 TAG
     // and target equeue. The tag IS the guest-chosen completion token for that cb ((ring<<58)|n,
@@ -655,7 +655,11 @@ size_t prosper_apr_binding_count_for_test(uint64_t cb) {
 bool prosper_apr_binding_dialect_for_test(uint64_t cb, AprDialect* out) {
     AprBoundState& state = apr_bound_state();
     std::lock_guard<std::mutex> lk(state.mx);
-    for (const auto& b : state.cbs) if (b.cb == cb) { *out = b.dialect; return true; }
+    for (const auto& b : state.cbs)
+        if (b.cb == cb) {
+            *out = b.dialect;
+            return true;
+        }
     return false;
 }
 void prosper_apr_mark_eventful(uint64_t req, bool eventful) {
@@ -695,12 +699,10 @@ static uint64_t apr_cb_set_equeue(uint64_t command_size, bool eager_completion,
                 break;
             }
         if (!seen)
-            state.cbs.push_back({ a0, a3, a1, prosper_eq_identity(a1), (int64_t)a2,
-                                  eager_completion, false,
-                                  eager_completion && a1 && a3,
-                                  std::chrono::steady_clock::now() +
-                                      std::chrono::milliseconds(10),
-                                  classify_apr_dialect((int64_t)a2, a3) });
+            state.cbs.push_back({a0, a3, a1, prosper_eq_identity(a1), (int64_t)a2, eager_completion,
+                                 false, eager_completion && a1 && a3,
+                                 std::chrono::steady_clock::now() + std::chrono::milliseconds(10),
+                                 classify_apr_dialect((int64_t)a2, a3)});
         if (eager_completion && !state.worker_started) {
             state.worker_started = true;
             start_worker = true;

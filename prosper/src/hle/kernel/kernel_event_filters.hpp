@@ -13,4 +13,4 @@ namespace prosper {
 // assumed never to read it; -25 also matches a secondary implementation (verification only).
 constexpr int16_t EVFILT_AMPR = -25;
 
-}  // namespace prosper
+}   // namespace prosper

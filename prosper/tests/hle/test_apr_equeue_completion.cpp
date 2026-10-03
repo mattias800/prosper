@@ -42,7 +42,7 @@ using namespace prosper;
 namespace prosper {
 // Test seam (hle_kernel_mem.cpp): the dialect recorded on a command buffer's binding at bind time.
 bool prosper_apr_binding_dialect_for_test(uint64_t cb, AprDialect* out);
-}
+}   // namespace prosper
 
 #define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
@@ -195,7 +195,8 @@ TEST(AprEqueueCompletion, Contract) {
         const uint64_t n = getcount(eq, 0, 0, 0, 0, 0);
         CHECK(n == 2, "id != 0 pointer-tag completions are individually delivered, not coalesced");
         std::vector<KEvent> ev(128);
-        int32_t out = -1; uint32_t cap = 1000;
+        int32_t out = -1;
+        uint32_t cap = 1000;
         wait(eq, (uint64_t)(uintptr_t)ev.data(), ev.size(), (uint64_t)(uintptr_t)&out,
              (uint64_t)(uintptr_t)&cap, 0);
         bool a = false, b = false, filt = out == 2;
@@ -234,9 +235,12 @@ TEST(AprEqueueCompletion, Contract) {
         CHECK(dialect_of(0x205dfa0078ull, &d) && d == AprDialect::Counter,
               "a rebind replaces the recorded dialect");
         CHECK(!dialect_of(0x205dfaffffull, &d), "an unbound command buffer has no dialect");
-        static_assert(classify_apr_dialect(0, 0) == AprDialect::RequestPointer, "id 0 is always a pointer");
-        static_assert(classify_apr_dialect(5, (1ull << 32) - 1) == AprDialect::Counter, "below 2^32 is a counter");
-        static_assert(classify_apr_dialect(5, 1ull << 32) == AprDialect::RequestPointer, "2^32 is a pointer");
+        static_assert(classify_apr_dialect(0, 0) == AprDialect::RequestPointer,
+                      "id 0 is always a pointer");
+        static_assert(classify_apr_dialect(5, (1ull << 32) - 1) == AprDialect::Counter,
+                      "below 2^32 is a counter");
+        static_assert(classify_apr_dialect(5, 1ull << 32) == AprDialect::RequestPointer,
+                      "2^32 is a pointer");
         drain(wait, eq);
     }
 
@@ -258,7 +262,8 @@ TEST(AprEqueueCompletion, Contract) {
         submit(cbc, 1, 0, 0, 0, 0);
         settle();
         std::vector<KEvent> ev(8);
-        int32_t out = -1; uint32_t cap = 50000;
+        int32_t out = -1;
+        uint32_t cap = 50000;
         wait(eq2, (uint64_t)(uintptr_t)ev.data(), ev.size(), (uint64_t)(uintptr_t)&out,
              (uint64_t)(uintptr_t)&cap, 0);
         bool ptr_ok = false, ctr_ok = false;
@@ -269,5 +274,4 @@ TEST(AprEqueueCompletion, Contract) {
         CHECK(out == 2 && ptr_ok, "the pointer completion carries its own pointer");
         CHECK(ctr_ok, "the counter completion still carries its own counter, not the pointer");
     }
-
 }
