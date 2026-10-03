@@ -80,7 +80,7 @@ Last updated: 2026-10-01
 | *PGA TOUR 2K25* | `PPSA17952` | Unity 6 / IL2CPP | 🔬 Rung 0 — boots in 437 ms, streams its Unity assets and submits real draws, but every frame is black and a worker thread dies parsing a NULL HTTP response header ([#2894](https://github.com/mattias800/prosper/issues/2894)). The PSN `module_start` handshake that killed it at 1.2 s is fixed | [#2895](https://github.com/mattias800/prosper/issues/2895) |
 | *Beast of Reincarnation* | `PPSA29343` | Unreal Engine 5 | 🔬 Rung 1 — the GAME FREAK logo and the game's own Digital Deluxe bonus dialog render at 4K, but only with `PROSPER_CB_EFC_NO_COLOR=1`: on a default launch prosper's unmodelled ELIMINATE_FAST_CLEAR passes paint over the composite and every frame is a flat clear ([#1588](https://github.com/mattias800/prosper/issues/1588)). The pixel shader that writes both scanout buffers now recompiles | [#2916](https://github.com/mattias800/prosper/issues/2916) |
 | *Tomb Raider I-III Remastered* | `PPSA16901` | Custom (Saber) | 🚧 Rung 3 — a pad route clears the title's own 40-page EULA gate (Cross is inert until page 40), reaches the rendered title screen, and enters **Croft Manor**, which now renders with correct geometry — steps, walls, hedges, trees, Lara and Winston all correctly shaped and animating. **The world now renders correctly textured** — Croft Manor's assault course draws its brickwork, sandstone, mossy platforms, gravel and foliage, with Lara and Winston (screenshot: `assets/screenshots/tomb-raider-croft-manor-assault-course.webp`, a genuine render confirmed against the dump's own picture assets). The wrong-texture defect is fixed ([#2998](https://github.com/mattias800/prosper/issues/2998)): the decode cache validated one surface of a 256-layer array — 0.29% of the atlas — so a decode taken while it was nearly empty was reused all run; some text draws the wrong glyphs ([#2999](https://github.com/mattias800/prosper/issues/2999)). The shattered world was one defect: the title's 32-bit index buffers are never announced and were read as 16-bit. Route: `prosper/scripts/tomb-raider-PPSA16901/` | [#2990](https://github.com/mattias800/prosper/issues/2990) |
-| *Outer Wilds* | `PPSA08102` | Unity 2019.4 / IL2CPP | 🚧 Rung 3 — a fresh-save route accepts NEW EXPEDITION, clears the Wake Up prompt and reaches a recognizable wooded first-person scene with Look Around / Move prompts. The owner saw the in-game world and reported largely correct rendering, but an F9 frame has a large white blob. The title wordmark is absent against the supplied PS5 title oracle; gameplay has no matching PS5 oracle, and speed remains unverified against hardware. Route: `prosper/scripts/outer-wilds-PPSA08102/`. [Evidence and limits](prosper/docs/OUTER_WILDS_STATUS.md) | [#3804](https://github.com/mattias800/prosper/issues/3804) |
+| *Outer Wilds* | `PPSA08102` | Unity 2019.4 / IL2CPP | 🚧 Rung 3 — a fresh-save route accepts NEW EXPEDITION, clears the Wake Up prompt and reaches a recognizable wooded first-person scene with Look Around / Move prompts. The owner saw the in-game world and reported largely correct rendering, but an F9 frame has a large white blob. The title wordmark is absent against the supplied PS5 title oracle; gameplay has no matching PS5 oracle, and speed remains unverified against hardware. Route: `prosper/scripts/outer-wilds-PPSA08102/`. [Evidence and limits](prosper/docs/games/OUTER_WILDS_STATUS.md) | [#3804](https://github.com/mattias800/prosper/issues/3804) |
 | *Kena: Bridge of Spirits* | `PPSA01802` | Unreal Engine 4 | 🔬 Rung 2 — on Windows/NVIDIA a pad route reaches the main menu, the difficulty picker, the brightness calibration screen, the first level load, the full intro narration and the first gameplay prompt (*"Press … to Pulse"*, the button drawn as a pad glyph) — but **the world behind the prompt does not draw**: every sampled gameplay frame is black apart from the prompt. The leading suspect is the title's wave64 fragment shaders, which a 32-wide NVIDIA device skips ([#2147](https://github.com/mattias800/prosper/issues/2147)), but that is not established per draw, and a Linux trace of the menu scene ([#3813](https://github.com/mattias800/prosper/pull/3813)) is a reason to check composition first. The two crashes before this point are fixed on `main` ([#3814](https://github.com/mattias800/prosper/pull/3814), [#3817](https://github.com/mattias800/prosper/pull/3817)). Route: `prosper/scripts/kena/` | [#3787](https://github.com/mattias800/prosper/issues/3787) |
 | *Marvel's Wolverine* | `PPSA03671` | — | 🔬 Rung 0 — guest boots and submits compute work, but presents no frame; main and render threads remain in startup polling/wait loops | [#4019](https://github.com/mattias800/prosper/issues/4019) |
 | *007 First Light* | `PPSA11386` | — | 🔬 Rung 0 — main guest thread faults at a null address during startup, before the first frame | [#4021](https://github.com/mattias800/prosper/issues/4021) |
@@ -117,7 +117,7 @@ a rounding error.
 
 **The "not yet booted" bucket emptied on 2026-08-22.** Seven of its eight titles were run by the
 never-booted survey
-([`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md)) —
+([`prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md)) —
 three landed at rung 2, one at rung 1 and three at rung 0 — and *Judgment* (`PPSA02739`) was booted
 the same day by a separate lane ([#2923](https://github.com/mattias800/prosper/issues/2923)).
 
@@ -173,8 +173,8 @@ symptoms and share latent defects, and every rung-0 wall in it is title-specific
 *Nikoderiko*, *ArcRunner*, *Crisis Core*, *Little Nightmares III* and *The Oregon Trail* is still
 recorded separately for each, in the sections below and in their tracker issues. What the grouping does say
 is that the shared UE bring-up surface —
-[`prosper/docs/UE4_APR_IOSTORE_BRINGUP.md`](prosper/docs/UE4_APR_IOSTORE_BRINGUP.md) and
-[`prosper/docs/CROSS_ENGINE_UE4.md`](prosper/docs/CROSS_ENGINE_UE4.md) — carries the largest single
+[`prosper/docs/engines/UE4_APR_IOSTORE_BRINGUP.md`](prosper/docs/engines/UE4_APR_IOSTORE_BRINGUP.md) and
+[`prosper/docs/engines/CROSS_ENGINE_UE4.md`](prosper/docs/engines/CROSS_ENGINE_UE4.md) — carries the largest single
 block of titles waiting to reach gameplay.
 
 ## Screenshots and short descriptions
@@ -232,7 +232,7 @@ every seek — measured at 15,003 ms — and then stopped asking for video frame
 published, the same guard route goes from **1 of 26 pixel-distinct samples to 26 of 26** and reaches
 the desert level. The guard still fails, now on `structural matches` **alone**. The two screenshots
 above are the reviewed rung-6 state from before the regression;
-[`GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md) carries the mechanism, and
+[`GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/games/GRIS_SONIC_COBRA_BRINGUP.md) carries the mechanism, and
 everything below that section's 2026-09-05 banner describes the pre-fix state and is superseded by
 it.
 
@@ -290,7 +290,7 @@ by its geometry) and [#2910](https://github.com/mattias800/prosper/pull/2910)
 title has a `sceKernelSleep(1)` re-poll loop at `eboot+0x940380` that nothing but a different return
 value can leave).
 
-See [`prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/GRIS_SONIC_COBRA_BRINGUP.md) and the
+See [`prosper/docs/games/GRIS_SONIC_COBRA_BRINGUP.md`](prosper/docs/games/GRIS_SONIC_COBRA_BRINGUP.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/1871).
 
 ## Sonic Frontiers — `PPSA03831`
@@ -336,7 +336,7 @@ frame byte-identical, which is what removed them from the suspect list
 a scene a person would recognise as the game and this one is not yet, degraded though that bar
 deliberately is. That is the frontier for this title,
 and the Needle stack is shared with *Sonic Origins* and *Sonic Racing: CrossWorlds*. See
-[`docs/SONIC_FRONTIERS_STATUS.md`](prosper/docs/SONIC_FRONTIERS_STATUS.md) and the
+[`docs/games/SONIC_FRONTIERS_STATUS.md`](prosper/docs/games/SONIC_FRONTIERS_STATUS.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/1891).
 
 ## Sonic Racing: CrossWorlds — `PPSA08804`
@@ -358,7 +358,7 @@ advances nothing; the guest needs a neutral→pressed transition, so the route u
 
 Beyond the title screen the profile menu renders its UI correctly but leaves the central content panel
 black, and the sequence eventually holds on white. See
-[`docs/SONIC_CROSSWORLDS_STATUS.md`](prosper/docs/SONIC_CROSSWORLDS_STATUS.md) and the
+[`docs/games/SONIC_CROSSWORLDS_STATUS.md`](prosper/docs/games/SONIC_CROSSWORLDS_STATUS.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/1895).
 
 ## Terminator 2D: NO FATE — `PPSA25872`
@@ -389,7 +389,7 @@ full colour, with the HUD and radar over it.
 before the world loads; the default is Fidelity, where a run started straight into Story shows the HUD
 over a dark scene and looks exactly like a renderer regression. That is a route property, not a build
 property. Framerate is the open frontier, not the picture. See
-[`docs/GTA5_STATUS.md`](prosper/docs/GTA5_STATUS.md), which is authoritative for this title, and the
+[`docs/games/GTA5_STATUS.md`](prosper/docs/games/GTA5_STATUS.md), which is authoritative for this title, and the
 [tracker](https://github.com/mattias800/prosper/issues/1873). The compute-failure census in #2481 is
 closed and superseded by [#2542](https://github.com/mattias800/prosper/issues/2542) and
 [#2690](https://github.com/mattias800/prosper/issues/2690).
@@ -565,7 +565,7 @@ unplugged.*
 
 The route [`prosper/scripts/talesgraces/reach-gameplay.pad`](prosper/scripts/talesgraces/reach-gameplay.pad) reaches the **Lhant Hill prologue** — Asbel in a live 3D field at native 1920×1080 — reproduced 2 of 2, with no rejected shader or skipped dispatch in any run. A default launch with no input route still reaches the **title screen** on its own at roughly 220 s, then the EULA, main menu and new-game Options screen.
 
-**What held this title at a menu was input, not the renderer.** Two new-game screens bind their confirm action to the **OPTIONS** button and each raises a Yes/No dialog defaulting to **No**, so a Cross-only route loops forever and an OPTIONS+Cross route answers *No*. Movie frames composite with their chroma collapsed ([#2731](https://github.com/mattias800/prosper/issues/2731)). See [`prosper/docs/TALES_GRACES_STATUS.md`](prosper/docs/TALES_GRACES_STATUS.md) and the [tracker](https://github.com/mattias800/prosper/issues/1889).
+**What held this title at a menu was input, not the renderer.** Two new-game screens bind their confirm action to the **OPTIONS** button and each raises a Yes/No dialog defaulting to **No**, so a Cross-only route loops forever and an OPTIONS+Cross route answers *No*. Movie frames composite with their chroma collapsed ([#2731](https://github.com/mattias800/prosper/issues/2731)). See [`prosper/docs/games/TALES_GRACES_STATUS.md`](prosper/docs/games/TALES_GRACES_STATUS.md) and the [tracker](https://github.com/mattias800/prosper/issues/1889).
 
 ## Astro Bot — `PPSA21564`
 
@@ -620,7 +620,7 @@ by another Unreal title, declared it corrupt and deleted it — and then held on
 `Your options save has corrupted and has been deleted` dialog that a run with no input cannot
 dismiss. Save data is now namespaced by title id
 ([#2734](https://github.com/mattias800/prosper/issues/2734),
-`prosper/docs/SAVE_DATA_LAYOUT.md`), so a default launch no longer meets another title's save. Saves
+`prosper/docs/subsystems/SAVE_DATA_LAYOUT.md`), so a default launch no longer meets another title's save. Saves
 written before that change stay in the old flat directory, untouched and unread; prosper reports
 where they are on first use. See the [tracker](https://github.com/mattias800/prosper/issues/1893).
 
@@ -645,7 +645,7 @@ the run, and in some runs the game's own allocator catches it first. Holding the
 few extra milliseconds avoids it, which is how the captures above were taken; that is a stopgap while the race
 is fixed. Two rendering defects remain on the reached screens: the title screen's key art never draws, and most
 published frames select a non-scanout composite source while the real screen exists. See
-[`docs/CRISIS_CORE_STATUS.md`](prosper/docs/CRISIS_CORE_STATUS.md) and the
+[`docs/games/CRISIS_CORE_STATUS.md`](prosper/docs/games/CRISIS_CORE_STATUS.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/1894).
 
 ## The House of the Dead 2: Remake — `PPSA24203`
@@ -667,7 +667,7 @@ banner. **No prosper code change was required**; the title was one input route a
 runs, two of which share 5 of 8 byte-identical frame CRCs.
 
 The menu's background video is still not composited, so the BEGIN menu sits on a flat grey background. See
-[`prosper/docs/BENDY_DARK_REVIVAL_STATUS.md`](prosper/docs/BENDY_DARK_REVIVAL_STATUS.md) and the
+[`prosper/docs/games/BENDY_DARK_REVIVAL_STATUS.md`](prosper/docs/games/BENDY_DARK_REVIVAL_STATUS.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/1897).
 
 ## Beneath — `PPSA27640`
@@ -682,7 +682,7 @@ waypoint HUD counts down as the route moves, and the title's own dialogue subtit
 
 This title needs `PROSPER_NULL_PAGE=1` to boot — the Unity player walks its frame-pointer chain one
 hop past the terminal NULL frame pointer and reads the return-address slot at address `0x8`.
-See [`prosper/docs/BENEATH_STATUS.md`](prosper/docs/BENEATH_STATUS.md) and the
+See [`prosper/docs/games/BENEATH_STATUS.md`](prosper/docs/games/BENEATH_STATUS.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/1898).
 
 ## Unbound: Worlds Apart — `PPSA03274`
@@ -695,7 +695,7 @@ master it renders **continuously**: 40 of 40 samples over 200 s, with 354 distin
 The ~9% duty cycle and the 5 s cadence recorded in the 2026-08-22 survey
 ([#2932](https://github.com/mattias800/prosper/issues/2932)) no longer reproduce here. The prompt is
 waiting for Cross.
-See [`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and
+See [`prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) and
 the [tracker](https://github.com/mattias800/prosper/issues/2886).
 
 <p align="center"><img src="assets/screenshots/unbound-worlds-apart-intro-cinematic-village.webp" alt="Unbound: Worlds Apart — a later moment of the intro cinematic at 3840x2160: a sunlit village clearing of thatched huts strung with orange bunting, tall trees and fireflies, pink mushrooms in the foreground grass and the small red-cloaked character at the right, with a prompt reading Press Square to skip"></p>
@@ -729,7 +729,7 @@ This is the game's own first-boot language menu, not its title screen: all 24 la
 including CJK, Thai, Greek, Cyrillic and Arabic, and the prompt bar names the buttons it wants. About
 82% of frames are a flat white 4K clear instead
 ([#2932](https://github.com/mattias800/prosper/issues/2932)). See
-[`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and the
+[`prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/2882).
 
 <p align="center"><img src="assets/screenshots/balan-wonderworld-main-menu.webp" alt="BALAN WONDERWORLD — the main menu at 3840x2160: a red and gold theatre interior with a lit proscenium and drawn curtains, a menu column on the right reading Language Settings, Settings, Credits and Copyright Information, and a 2021 Square Enix copyright line"></p>
@@ -759,7 +759,7 @@ accepts the screen and carries the main menu behind it, and the first map load
 no capture of what is behind it because there is nothing to show: the frames after the load are
 letterboxed with a flat single-colour fill between the bars, and a flat clear is not progression
 evidence. See
-[`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and the
+[`prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/2883).
 
 ## Little Nightmares II — `PPSA02154`
@@ -771,7 +771,7 @@ The boot logo sequence advances — Bandai Namco, then Tarsier Studios, then Unr
 the first ~130 s. After that the composite is a flat white 4K clear for the remaining 260 s of a
 390 s run, and no title screen is reached
 ([#2932](https://github.com/mattias800/prosper/issues/2932)). See
-[`prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md) and the
+[`prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/2884).
 
 ## Outer Wilds — `PPSA08102`
@@ -786,7 +786,7 @@ the Square Wake Up prompt; by about 122 seconds the native frame shows a wooded 
 The owner observed the world in-game and reported largely correct rendering. A separate F9 frame
 contains a large white blob; the game wordmark is absent against the supplied PS5 title oracle.
 There is no matching PS5 gameplay oracle or hardware speed comparison yet. See the
-[status record](prosper/docs/OUTER_WILDS_STATUS.md) and
+[status record](prosper/docs/games/OUTER_WILDS_STATUS.md) and
 [tracker](https://github.com/mattias800/prosper/issues/3804).
 
 ## Kena: Bridge of Spirits — `PPSA01802`
@@ -797,7 +797,7 @@ There is no matching PS5 gameplay oracle or hardware speed comparison yet. See t
 Direct, unmodified Windows `screenshot.exe` captures (RTX 4090) on the route in `prosper/scripts/kena/`. The main menu
 and every menu after it render over black — the animated background never draws — and after the intro narration the
 first gameplay prompt appears over an **absent world**, so this is rung 2. See
-[`prosper/docs/KENA_STATUS.md`](prosper/docs/KENA_STATUS.md) and the
+[`prosper/docs/games/KENA_STATUS.md`](prosper/docs/games/KENA_STATUS.md) and the
 [tracker](https://github.com/mattias800/prosper/issues/3787).
 
 ## October 1 first-launch checks

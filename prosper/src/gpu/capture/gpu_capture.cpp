@@ -120,7 +120,7 @@ uint64_t gpu_capture_dcc_metadata_footprint(const ShaderResource& resource) {
 // evidence trail — changing it would invalidate all of them for a cosmetic gain. It is recorded
 // here because the dropped digit reads as a typo, and because anyone verifying one of these hashes
 // offline with a stock FNV-1a 64 gets a value that can never match and is liable to read the
-// mismatch as "this buffer is not zero" (#1968, `docs/GRAPHICS.md` § Ruled out).
+// mismatch as "this buffer is not zero" (#1968, `docs/gpu/GRAPHICS.md` § Ruled out).
 uint64_t gpu_capture_hash(const uint8_t* data, size_t size) {
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < size; ++i) { h ^= data[i]; h *= 1099511628211ull; }

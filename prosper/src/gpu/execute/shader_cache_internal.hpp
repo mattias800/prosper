@@ -8,7 +8,7 @@
 // them by declaration. Promoting a 177-line function into a header parsed by every includer is the
 // opposite of what this split is for.
 
-// gpu_executor.cpp — the live-submit half of the GPU executor (Stage A of docs/GPU_EXECUTOR_DESIGN.md).
+// gpu_executor.cpp — the live-submit half of the GPU executor (Stage A of docs/gpu/GPU_EXECUTOR_DESIGN.md).
 //
 // Holds the process-wide live render backend and drives it on each AGC submit. This is deliberately the
 // ONLY place the executor touches process-global state; execute_gpustate() itself (gpu_execute.hpp) stays

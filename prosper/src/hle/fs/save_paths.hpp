@@ -42,7 +42,7 @@
 //
 // ## Existing saves are NOT migrated, on purpose
 //
-// See the `## Ruled out` notes in docs/SAVE_DATA_LAYOUT.md. Briefly: nothing on disk records which
+// See the `## Ruled out` notes in docs/subsystems/SAVE_DATA_LAYOUT.md. Briefly: nothing on disk records which
 // title wrote a flat slot directory, so neither of the obvious migrations is safe. A move-on-first-
 // use hands `OptionSettings` to whichever title happens to boot first, destructively and
 // irreversibly — the same data-loss bug wearing a fix's clothes. A read-fallback to the flat path

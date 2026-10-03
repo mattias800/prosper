@@ -16,7 +16,7 @@ merging, or running workloads; preserve the task's existing authority and resour
    git worktree add .claude/worktrees/<slug> -b <branch> origin/main
    ```
    Use the exact requested revision for a pinned review. Do not `git stash`; use `prosper/tools/wt_stash.py` or a temporary commit in your own worktree.
-5. **Read before hypothesising.** The applicable nested `AGENTS.md`, the relevant status doc, and its `## Ruled out` section. Game work starts with `prosper/docs/GAME_COMPAT_ORCHESTRATION.md`.
+5. **Read before hypothesising.** The applicable nested `AGENTS.md`, the relevant status doc, and its `## Ruled out` section. Game work starts with `prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md`.
 6. **Plan to the scope.** The PR template headings can help; a small change needs only its problem, behavior, and relevant verification.
 7. **Relevant baseline.** Reuse applicable author evidence. For behavior changes, run only needed focused checks in an owned build when execution is authorized and coordinated; use `ctest --test-dir <BUILD_DIR> --no-tests=error` and report counts and failures. Read-only and documentation tasks need no configure/build baseline. Follow `LOCAL.md` and the task's rules for `TMPDIR`, build and artifact locations.
 8. **Regressions come with behavior changes.** Add or extend a meaningful test that fails without the fix; document nonbehavioral scope and verification limits (`prosper/tests/AGENTS.md`).

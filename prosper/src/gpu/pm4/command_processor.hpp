@@ -454,7 +454,7 @@ void submit_completion_pulse(bool submit_rejected = false);
 // `Cx:*` (class + `*`) watches every offset of that class — use it to census which registers a title
 // programs at all, then narrow to specific offsets. High volume by construction; the emitter is
 // capped, so treat a whole-class census as a shape, not a rate (see the print-cap trap in
-// docs/GAME_COMPAT_ORCHESTRATION.md).
+// docs/process/GAME_COMPAT_ORCHESTRATION.md).
 //
 // Resolved state alone cannot answer "which packet wrote this register, and was it ever written at
 // all?" — a register the guest never programs and one it programs to a value that happens to look

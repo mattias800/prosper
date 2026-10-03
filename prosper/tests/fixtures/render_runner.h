@@ -9439,7 +9439,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // Stray the answer is no -- and the same census answered a question it was not built for,
         // which is why it is still here: the flipped VAs 0x9fc0000000 / 0x9fc2000000 turn up in this
         // very census as 4K colour attachments, so those buffers are render targets rather than a
-        // separate region the renderer never touches (`docs/STRAY_STATUS.md`, § Ruled out).
+        // separate region the renderer never touches (`docs/games/STRAY_STATUS.md`, § Ruled out).
         //
         // What a line here does and does not license: it is printed after the empty-draw early-out,
         // so the target was BOUND as an attachment of a pass carrying at least one draw. It does not

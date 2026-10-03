@@ -35,7 +35,7 @@ fake clock on every platform. Put the next one here too rather than inline at a 
 **This folder is also where the host-platform seam grows**: one interface per OS service (virtual
 memory, futex, threads, fibers, fault install, clocks, files) with one backend file per OS, so
 `src/hle`, `src/loader`, `src/self` and `src/gpu` stop carrying `#ifdef _WIN32` arms. The design,
-the measured current state and the migration order are in `docs/HOST_PLATFORM_SEAM.md`; the
+the measured current state and the migration order are in `docs/architecture/HOST_PLATFORM_SEAM.md`; the
 `platform-ifdef` ratchet rule stops new arms appearing outside `src/host`.
 
 New code belongs here only if it is genuinely process-wide, genuinely host-level, and genuinely free

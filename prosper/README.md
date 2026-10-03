@@ -14,26 +14,26 @@ Dumps are user-supplied and gitignored.
 
 ## Orientation
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the layers fit together.
+- [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md) — how the layers fit together.
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — what is planned.
-- [`docs/GRAPHICS.md`](docs/GRAPHICS.md), [`docs/RESOURCE_BINDING.md`](docs/RESOURCE_BINDING.md),
-  [`docs/RECOMPILER_REMAINING.md`](docs/RECOMPILER_REMAINING.md) — the AGC → Vulkan pipeline, its
+- [`docs/gpu/GRAPHICS.md`](docs/gpu/GRAPHICS.md), [`docs/gpu/RESOURCE_BINDING.md`](docs/gpu/RESOURCE_BINDING.md),
+  [`docs/gpu/RECOMPILER_REMAINING.md`](docs/gpu/RECOMPILER_REMAINING.md) — the AGC → Vulkan pipeline, its
   descriptor model, and the shader recompiler's remaining gaps.
-- [`docs/VERIFICATION.md`](docs/VERIFICATION.md) — the programmatic, no-manual-eyeballing
+- [`docs/process/VERIFICATION.md`](docs/process/VERIFICATION.md) — the programmatic, no-manual-eyeballing
   verification strategy every change is held to.
-- [`docs/PORTING.md`](docs/PORTING.md) — per-platform substrate notes (Linux, Windows, macOS/Rosetta).
+- [`docs/platforms/PORTING.md`](docs/platforms/PORTING.md) — per-platform substrate notes (Linux, Windows, macOS/Rosetta).
 - [`tools/AGENTS.md`](tools/AGENTS.md) — what each tool is for and which question it answers.
-- [`docs/DEBUGGING_WORKFLOWS.md`](docs/DEBUGGING_WORKFLOWS.md) — question-to-tool recipes,
+- [`docs/process/DEBUGGING_WORKFLOWS.md`](docs/process/DEBUGGING_WORKFLOWS.md) — question-to-tool recipes,
   capability controls, host sanitizer checks and GPU capture analysis. Start here for development.
-- [`docs/VULKAN_RUNTIME.md`](docs/VULKAN_RUNTIME.md) — the Vulkan 1.4 runtime floor the live
+- [`docs/gpu/VULKAN_RUNTIME.md`](docs/gpu/VULKAN_RUNTIME.md) — the Vulkan 1.4 runtime floor the live
   graphics and compute backends require, and the capability policy behind it.
-- [`docs/GAME_COMPAT_ORCHESTRATION.md`](docs/GAME_COMPAT_ORCHESTRATION.md) — concurrent title work,
+- [`docs/process/GAME_COMPAT_ORCHESTRATION.md`](docs/process/GAME_COMPAT_ORCHESTRATION.md) — concurrent title work,
   and the numbered list of instrument traps: measurements that turned out to come from the
   apparatus rather than the subject.
 - `docs/<TITLE>_STATUS.md` — the investigation record for one title. Read its `## Ruled out`
   section before forming a hypothesis; it lists the hypotheses already falsified and the evidence
   that settled them. Closed investigations keep theirs too, including
-  [`docs/MESSENGER_BLACK_RENDER.md`](docs/MESSENGER_BLACK_RENDER.md). Current per-title state lives
+  [`docs/games/messenger/MESSENGER_BLACK_RENDER.md`](docs/games/messenger/MESSENGER_BLACK_RENDER.md). Current per-title state lives
   in the `tracker:game` issues, not in this tree.
 
 Folders that hold real content carry an `AGENTS.md` describing what belongs in them. It is a map,

@@ -1,6 +1,7 @@
 // Cache/data boundary: one actual SOURCE module, independently executed workgroup ordinals,
 // different scalar/primitive/resource facts and all-wave transactional production publication.
 #include "fixtures/fragment_packet_wave_fixture.hpp"
+#include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "bpermute_spirv_oracle.hpp"
 #include <gtest/gtest.h>
 #include <cstdlib>
@@ -79,6 +80,51 @@ TEST(FragmentPacketWaveData, SharedImageBindingIsDataNotCachedPrototype) {
     waves[2].images[0].mips[0].texels[0][0] ^= 1;
     EXPECT_EQ(pack_fragment_packet_waves(code, waves).rejection,
               "packet-wave-independent-image-binding-unimplemented");
+}
+TEST(FragmentPacketWaveData, OwnedInterpolationHasStorageNotFabricatedEntryAuthority) {
+    const auto input = fixture::packet();
+    std::vector<Rdna2Inst> ins;
+    ASSERT_TRUE(
+        rdna2_walk(input.invocation.guest_code.data(), input.invocation.guest_code.size(), ins));
+    std::set<int> legacy_vectors, packet_vectors, legacy_scalars, packet_scalars;
+    loop_written_regs(ins, 0, 7, legacy_vectors, legacy_scalars);
+    loop_written_regs(ins, 0, 7, packet_vectors, packet_scalars, true);
+    EXPECT_FALSE(legacy_vectors.contains(10)) << "native inventory remains unchanged";
+    EXPECT_TRUE(packet_vectors.contains(10))
+        << "real VINTRP OLD VDST storage before READLANE boundary";
+    EXPECT_TRUE(legacy_vectors.contains(12));
+    EXPECT_TRUE(packet_vectors.contains(12));
+    EXPECT_EQ(legacy_scalars, packet_scalars);
+    const auto old = std::find_if(input.invocation.vgprs.begin(), input.invocation.vgprs.end(),
+                                  [](const auto& column) { return column.reg == 10; });
+    ASSERT_NE(old, input.invocation.vgprs.end());
+    EXPECT_EQ(old->available_mask, 0u) << "allocated storage is not a supplied guest entry word";
+    const auto code = kernel();
+    ASSERT_FALSE(code->program.packet.spirv.empty()) << code->program.packet.rejection;
+    auto waves = inputs();
+    for (auto& column : waves[2].invocation.vgprs)
+        if (column.reg == 10) column.words[40] = 0x51403011u;
+    auto batch = pack_fragment_packet_waves(code, waves, fixture::placements(*code, 3));
+    ASSERT_TRUE(batch.rejection.empty()) << batch.rejection;
+    auto decoded =
+        decode_fragment_packet_waves(batch, execute(batch), true, waves[0].device.device_identity);
+    ASSERT_EQ(decoded.exports.size(), 3u) << decoded.rejection;
+    for (uint32_t wave = 0; wave < 3; ++wave) {
+        auto expected = fixture::expected(wave);
+        if (wave == 2) expected[40 * 12 + 8] = 0x51403011u;
+        EXPECT_EQ(decoded.exports[wave], expected);
+    }
+    for (auto& column : waves[2].invocation.vgprs)
+        if (column.reg == 10) column.available_mask &= ~(uint64_t{1} << 40);
+    batch = pack_fragment_packet_waves(code, waves, fixture::placements(*code, 3));
+    ASSERT_TRUE(batch.rejection.empty());
+    decoded =
+        decode_fragment_packet_waves(batch, execute(batch), true, waves[0].device.device_identity);
+    EXPECT_EQ(decoded.rejection, "packet-runtime-vgpr-read-before-definition");
+    EXPECT_EQ(decoded.wave, 2u);
+    EXPECT_EQ(decoded.lane, 40u);
+    EXPECT_EQ(decoded.pc, 11u) << "actual inactive raw EXP read, not storage allocation";
+    EXPECT_TRUE(decoded.exports.empty());
 }
 TEST(FragmentPacketWaveData, OneCachedProgramDistinctWavesAndBases) {
     const auto code = kernel();

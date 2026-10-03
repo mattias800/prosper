@@ -10,7 +10,7 @@
 //   `valid_mask == 0xffffffff`. The vertex emitter fans a single `EXP PARAM0` out to every valid
 //   slot, so that stale mask turns one export into 32 output varyings = 128 components; with
 //   gl_Position's 4 that is 132 components. The layer rejects it. Its verbatim message, and the
-//   caveat about reading the arithmetic beside it, are recorded once in `docs/GRAPHICS.md`; this
+//   caveat about reading the arithmetic beside it, are recorded once in `docs/gpu/GRAPHICS.md`; this
 //   test pins the LOCATION COUNT, which is the thing the emitter controls.
 //
 // The mask used here — every slot valid, every control selecting PARAM0 — is exactly the shape the

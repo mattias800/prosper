@@ -27,7 +27,7 @@ namespace prosper::gpu {
 // u16->u32 store and the unsigned-max reduction are both idioms GCC recognizes. At plain `-O2` it
 // emits `movdqu` -> `punpcklwd`/`punpckhwd` -> two `movups`, i.e. 8 indices per iteration; given
 // AVX2 it goes to 16. Check the emitted code before assuming a hand-written kernel has anything
-// to beat -- see `docs/OUTER_WILDS_STATUS.md` § Ruled out, where one already lost.
+// to beat -- see `docs/games/OUTER_WILDS_STATUS.md` § Ruled out, where one already lost.
 inline uint32_t copy_indices_u16_max(uint32_t* dst, const uint16_t* src, size_t count) {
     uint32_t maximum = 0;
     for (size_t i = 0; i < count; ++i) {
@@ -47,7 +47,7 @@ inline bool index_expand_avx2_available() {
 
 // NOT CALLED BY THE EMULATOR, and that is deliberate rather than an oversight.
 //
-// It is retained as the executable half of the falsification in `docs/OUTER_WILDS_STATUS.md`
+// It is retained as the executable half of the falsification in `docs/games/OUTER_WILDS_STATUS.md`
 // § Ruled out: `test_index_expand --bench` interleaves it against the loop above in one binary
 // and prints each kernel's per-index cost, which is the measurement that row's third reason
 // rests on. Anyone re-opening "should index expansion be hand-vectorized?" can re-run that in

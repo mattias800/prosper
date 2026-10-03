@@ -15,7 +15,7 @@ identity and materialization belong to the callers; media plane classification l
 **The one thing a newcomer gets wrong.** `should_promote_write_watch` takes both a size threshold and a
 stability threshold and promotes on *either*, and the two call sites pass different sizes. The renderer
 passes 8 MiB, so a 1-8 MiB texture arms on first sight — a decision measured, and its opposite rejected,
-in `docs/RENDERER_PERFORMANCE_2026_07.md`. The compute path passes **1**, which makes the size exemption
+in `docs/performance/RENDERER_PERFORMANCE_2026_07.md`. The compute path passes **1**, which makes the size exemption
 unreachable and leaves the stability ladder as its only route to a watch. That asymmetry is real, mostly
 accidental, and unresolved (#3155). So read the *call site's arguments* before concluding what the policy
 does for a given path; the header describes a contract only one caller uses in full.
