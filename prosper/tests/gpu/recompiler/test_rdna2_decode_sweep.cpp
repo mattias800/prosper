@@ -398,3 +398,135 @@ TEST(Rdna2DecodeSweep, SoppSimm16IsSignExtended) {
     EXPECT_EQ(decode(0xBF820000u | 0xFFFEu).simm16, -2);
     EXPECT_EQ(decode(0xBF820000u | 0x8000u).simm16, -32768);
 }
+
+// ---- VOP3 operand decode ---------------------------------------------------------------------
+// VOP3A layout: dword0 = VDST[7:0], ABS[10:8], OPSEL[14:11], CLAMP[15], OP[25:16];
+//               dword1 = SRC0[8:0], SRC1[17:9], SRC2[26:18], OMOD[28:27], NEG[31:29].
+// 0x14B is v_fma_f32 (three real sources, no 16-bit select, not VOP3B).
+
+namespace {
+constexpr uint32_t kVop3Fma = 0x14Bu;
+constexpr uint32_t vop3_w0(uint32_t op, uint32_t vdst = 0u, uint32_t mid = 0u) {
+    return 0xD4000000u | (op << 16) | mid | vdst;
+}
+constexpr uint32_t vop3_srcs(uint32_t s0, uint32_t s1, uint32_t s2) {
+    return s0 | (s1 << 9) | (s2 << 18);
+}
+}  // namespace
+
+TEST(Rdna2DecodeSweep, Vop3DecodesDestinationAndThreeSources) {
+    const Rdna2Inst in = decode(vop3_w0(kVop3Fma, 9u), vop3_srcs(256u + 1u, 5u, 0xF2u));
+    ASSERT_EQ(in.fmt, Rdna2Format::VOP3);
+    EXPECT_EQ(in.opcode, kVop3Fma);
+    EXPECT_EQ(in.dst.kind, OperandKind::VGPR);
+    EXPECT_EQ(in.dst.value, 9);
+    ASSERT_EQ(in.n_src, 3);
+    EXPECT_EQ(in.src[0].kind, OperandKind::VGPR);
+    EXPECT_EQ(in.src[0].value, 1);
+    EXPECT_EQ(in.src[1].kind, OperandKind::SGPR);
+    EXPECT_EQ(in.src[1].value, 5);
+    EXPECT_EQ(in.src[2].kind, OperandKind::InlineFloat);
+    EXPECT_EQ(in.src[2].value, 0xF2);   // 1.0
+}
+
+TEST(Rdna2DecodeSweep, Vop3AbsAndNegAreIndependentPerSource) {
+    // Every one of the 64 abs x neg combinations must land on exactly its own sources.
+    for (uint32_t abs = 0; abs < 8; ++abs) {
+        for (uint32_t neg = 0; neg < 8; ++neg) {
+            const Rdna2Inst in = decode(vop3_w0(kVop3Fma, 0u, abs << 8),
+                                        vop3_srcs(256u, 257u, 258u) | (neg << 29));
+            for (uint32_t k = 0; k < 3; ++k) {
+                EXPECT_EQ(in.src_abs[k], ((abs >> k) & 1u) != 0) << "abs=" << abs << " k=" << k;
+                EXPECT_EQ(in.src_neg[k], ((neg >> k) & 1u) != 0) << "neg=" << neg << " k=" << k;
+            }
+        }
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop3ClampAndOmodFields) {
+    EXPECT_FALSE(decode(vop3_w0(kVop3Fma), vop3_srcs(256, 257, 258)).clamp);
+    EXPECT_TRUE(decode(vop3_w0(kVop3Fma, 0, 1u << 15), vop3_srcs(256, 257, 258)).clamp);
+    for (uint32_t omod = 0; omod < 4; ++omod) {
+        const Rdna2Inst in = decode(vop3_w0(kVop3Fma), vop3_srcs(256, 257, 258) | (omod << 27));
+        EXPECT_EQ(in.omod, omod) << "omod=" << omod;
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop3bFamilyReadsSdstAndClearsAbs) {
+    // For VOP3B, dword0[14:8] is a scalar carry/flag destination, not three abs bits. CLAMP (bit 15)
+    // stays meaningful and NEG stays in dword1.
+    for (uint32_t op : {0x128u, 0x129u, 0x12Au, 0x16Du, 0x16Eu, 0x176u, 0x177u, 0x30Fu, 0x310u, 0x319u}) {
+        const Rdna2Inst in = decode(vop3_w0(op, 3u, 42u << 8 | (1u << 15)),
+                                    vop3_srcs(256, 257, 258) | (1u << 29));
+        EXPECT_EQ(in.sdst.kind, OperandKind::SGPR) << "op=" << op;
+        EXPECT_EQ(in.sdst.value, 42) << "op=" << op;
+        for (uint32_t k = 0; k < 3; ++k) EXPECT_FALSE(in.src_abs[k]) << "op=" << op << " k=" << k;
+        EXPECT_TRUE(in.clamp) << "op=" << op;
+        EXPECT_TRUE(in.src_neg[0]) << "op=" << op;
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop3aOpcodesOutsideTheVop3bListKeepAbsAndHaveNoSdst) {
+    const Rdna2Inst in = decode(vop3_w0(kVop3Fma, 0u, 0x7u << 8), vop3_srcs(256, 257, 258));
+    EXPECT_EQ(in.sdst.kind, OperandKind::None);
+    for (uint32_t k = 0; k < 3; ++k) EXPECT_TRUE(in.src_abs[k]) << k;
+}
+
+TEST(Rdna2DecodeSweep, Vop3TwoSourceOpcodesDropTheReservedThirdSource) {
+    // v_mul_lo_u32 (0x169) has two data sources. SRC2 is reserved and commonly reads as s0; exposing
+    // it would invent a scalar dependency, so the decoder must report two sources.
+    const Rdna2Inst two = decode(vop3_w0(kVop3OpcodeMulLoU32), vop3_srcs(256, 257, 0));
+    EXPECT_EQ(two.n_src, 2);
+    EXPECT_EQ(two.src[2].kind, OperandKind::None);
+    const Rdna2Inst three = decode(vop3_w0(kVop3Fma), vop3_srcs(256, 257, 0));
+    EXPECT_EQ(three.n_src, 3);
+    EXPECT_EQ(three.src[2].kind, OperandKind::SGPR);
+}
+
+TEST(Rdna2DecodeSweep, Vop3OpselIsCapturedOnlyForTheSixteenBitFamily) {
+    // OPSEL[2:0] pick each source half, OPSEL[3] the destination half. Only the 16-bit integer / f16
+    // scalar family honours it; elsewhere the bits must not leak into the selector.
+    for (uint32_t op : {0x311u, 0x34Bu, 0x351u, 0x352u, 0x353u, 0x354u, 0x355u, 0x356u, 0x357u,
+                        0x358u, 0x359u, 0x303u, 0x30Eu, 0x314u, 0x340u, 0x35Eu}) {
+        for (uint32_t sel = 0; sel < 16; ++sel) {
+            const Rdna2Inst in = decode(vop3_w0(op, 0u, sel << 11), vop3_srcs(256, 257, 258));
+            EXPECT_EQ(in.vop3p_opsel, sel) << "op=" << op << " sel=" << sel;
+        }
+    }
+    // 0x306 sits inside the 0x303..0x30E window but is not an instruction; it is excluded.
+    EXPECT_EQ(decode(vop3_w0(0x306u, 0u, 0xFu << 11), vop3_srcs(256, 257, 258)).vop3p_opsel, 0);
+    EXPECT_EQ(decode(vop3_w0(kVop3Fma, 0u, 0xFu << 11), vop3_srcs(256, 257, 258)).vop3p_opsel, 0);
+}
+
+TEST(Rdna2DecodeSweep, PermlaneOverloadsOpselAsFetchInactiveAndBoundCtrl) {
+    for (uint32_t op : {0x377u, 0x378u}) {
+        for (uint32_t bits = 0; bits < 4; ++bits) {
+            const Rdna2Inst in = decode(vop3_w0(op, 0u, bits << 11), vop3_srcs(256, 257, 258));
+            EXPECT_EQ(in.permlane_fetch_inactive, (bits & 1u) != 0) << "op=" << op << " bits=" << bits;
+            EXPECT_EQ(in.permlane_bound_ctrl, (bits & 2u) != 0) << "op=" << op << " bits=" << bits;
+        }
+    }
+    const Rdna2Inst other = decode(vop3_w0(kVop3Fma, 0u, 3u << 11), vop3_srcs(256, 257, 258));
+    EXPECT_FALSE(other.permlane_fetch_inactive);
+    EXPECT_FALSE(other.permlane_bound_ctrl);
+}
+
+TEST(Rdna2DecodeSweep, Vop3EncodedCompareUsesAScalarMaskDestination) {
+    // The e64 compare encoding (opcodes 0x00..0xFF): dword0[6:0] is an SGPR mask destination, not
+    // VDST, and only two data sources exist.
+    const Rdna2Inst in = decode(vop3_w0(0xC4u /*v_cmp_*_u32*/, 0x2Au), vop3_srcs(256, 257, 258));
+    ASSERT_EQ(in.fmt, Rdna2Format::VOPC);
+    EXPECT_EQ(in.dst.kind, OperandKind::SGPR);
+    EXPECT_EQ(in.dst.value, 0x2A);
+    EXPECT_EQ(in.n_src, 2);
+    EXPECT_EQ(in.src[2].kind, OperandKind::None);
+}
+
+TEST(Rdna2DecodeSweep, Vop3LiteralOperandReportsItsValue) {
+    const uint32_t code[3] = {vop3_w0(kVop3Fma), vop3_srcs(256, kLiteralSrc, 258), 0x40490FDBu};
+    const Rdna2Inst in = rdna2_decode_one(code, 3);
+    ASSERT_EQ(in.len_dwords, 3u);
+    EXPECT_TRUE(in.has_literal);
+    EXPECT_EQ(in.literal, 0x40490FDBu);
+    EXPECT_EQ(in.src[1].kind, OperandKind::Literal);
+}
