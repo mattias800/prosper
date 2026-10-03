@@ -1,13 +1,13 @@
 // test_pthread_key_teardown — pthread key destructor conformance at thread
 // exit, re-derived as prosper tests against the Windows (winpthreads) path.
 //
-// PROVENANCE. FreeBSD lib/libthr/thread/thr_spec.c `_thread_cleanupspecific`
-// (value cleared to NULL *before* the destructor runs, so only a reinstalled
-// non-NULL value refires; at most PTHREAD_DESTRUCTOR_ITERATIONS passes; a
-// deleted key's leftover value is dropped WITHOUT calling its destructor)
-// plus the musl libc-test pthread_key cases (destructor runs on thread exit,
-// reinstall refires) and POSIX.1 (fire for non-NULL values, order across keys
-// unspecified, PTHREAD_DESTRUCTOR_ITERATIONS == 4 minimum-maximum).
+// CONTRACT. POSIX.1 pthread_key_create/pthread_key_delete (fire for non-NULL
+// values, order across keys unspecified, at least PTHREAD_DESTRUCTOR_ITERATIONS
+// = 4 passes, a deleted key's destructor never called), cross-checked against
+// FreeBSD lib/libthr/thread/thr_spec.c `_thread_cleanupspecific`, the guest's
+// libc lineage (value cleared to NULL *before* the destructor runs, so only a
+// reinstalled non-NULL value refires; exactly 4 passes). The cases are written
+// against prosper's scePthread* handlers, not taken from any test suite.
 //
 // WHY THIS PINS prosper: h_key_create hands the guest the raw host key and,
 // on Windows, a generated thunk that discards winpthreads' spurious NULL
@@ -16,15 +16,16 @@
 // in two measured ways (below). A teardown change that drops a destructor
 // leaks guest per-thread state; one that adds a call corrupts it.
 //
-// MEASURED on Windows MinGW winpthreads (scratch probe, Oct 2026):
-//   M1  reinstall-forever destructor: 256 calls, then stops (NOT 4).
-//   M2  key deleted while a thread holds a value: destructor STILL fires
-//       once — POSIX/FreeBSD require silence (thr_spec.c:133-144).
-//   M3  three keys with values: each destructor exactly once.
-//   M4  NULL destructor with a value: clean exit, nothing fires.
-// M1/M2 are DIVERGENCES, not contracts: they are asserted with the measured
-// values plus this comment so a winpthreads upgrade (or an HLE-side fix)
-// turns them red instead of silently changing guest-visible behaviour.
+// WINDOWS (MinGW winpthreads):
+//   M1  reinstall-forever destructor: 256 passes, then stops. winpthreads'
+//       pthread.h defines PTHREAD_DESTRUCTOR_ITERATIONS as 256, which POSIX
+//       allows (4 is a minimum); it differs only from FreeBSD's 4, which is
+//       what the guest's own libc would do. Pinned so a change turns red.
+//   M2  deleted key: the author's scratch probe saw one call, but that probe
+//       predates the handshake below and so may have measured the teardown
+//       race. Current winpthreads clears the destructor on delete, and prosper
+//       frees its Windows trampoline at delete, so a real post-delete call
+//       would crash rather than count. The case therefore runs on Windows too.
 #include <gtest/gtest.h>
 
 #include "hle/dispatch/dispatch.hpp"
@@ -39,11 +40,8 @@
 
 using namespace prosper;
 
-#ifdef _WIN32
-#define GUEST_ABI __attribute__((sysv_abi))
-#else
-#define GUEST_ABI
-#endif
+// Guest entry points and destructors: System V on Windows, see dispatch.hpp.
+#define GUEST_ABI PROSPER_GUEST_ABI
 
 namespace {
 
@@ -77,9 +75,10 @@ uint32_t make_key(void* dtor) {
 
 uint64_t run_worker(void* entry) {
     uint64_t thread = 0;
-    EXPECT_EQ(g_thread_create((uint64_t)(uintptr_t)&thread, 0, (uint64_t)(uintptr_t)entry, 0, 0, 0),
-              0ull)
-        << "thread create must succeed";
+    const uint64_t created =
+        g_thread_create((uint64_t)(uintptr_t)&thread, 0, (uint64_t)(uintptr_t)entry, 0, 0, 0);
+    EXPECT_EQ(created, 0ull) << "thread create must succeed";
+    if (created != 0) return 0;
     EXPECT_EQ(g_thread_join(thread, 0, 0, 0, 0, 0), 0ull)
         << "join must succeed (destructors run before it returns)";
     return thread;
@@ -143,8 +142,9 @@ extern "C" GUEST_ABI void* worker_deleted(void*) {
     g_armed4.store(true, std::memory_order_release);
     // Stay alive until the main thread has deleted the key. Returning earlier would run
     // teardown -- and a correct destructor call -- BEFORE the delete, which reads exactly like
-    // a deleted-key destructor firing. Bounded so a broken main thread cannot hang the test.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    // a deleted-key destructor firing. Bounded so a broken main thread cannot hang the test;
+    // longer than main's own wait so a slow main thread cannot outlast it.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (!g_release4.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < deadline)
         std::this_thread::yield();
@@ -218,10 +218,9 @@ TEST(PthreadKeyTeardown, ReinstallForeverIsBounded) {
     // Reaching the join IS the first assertion: an unbounded iteration would
     // hang here, not fail. The count pins the bound in force.
 #ifdef _WIN32
-    // M1 DIVERGENCE: winpthreads stops at 256, not PTHREAD_DESTRUCTOR_-
-    // ITERATIONS (4). Asserted as measured so a winpthreads upgrade or an
-    // HLE-side iteration fix turns red instead of drifting silently.
-    EXPECT_EQ(calls, 256u) << "winpthreads re-entry bound (measured M1)";
+    // M1: winpthreads' PTHREAD_DESTRUCTOR_ITERATIONS is 256 (POSIX-conforming;
+    // FreeBSD uses 4). Pinned so a winpthreads or HLE-side change turns red.
+    EXPECT_EQ(calls, 256u) << "winpthreads PTHREAD_DESTRUCTOR_ITERATIONS (M1)";
 #else
     // FreeBSD thr_spec.c loop bound + POSIX: at most 4 passes while data
     // remains; an always-reinstalling destructor takes all of them.
@@ -230,17 +229,6 @@ TEST(PthreadKeyTeardown, ReinstallForeverIsBounded) {
 }
 
 TEST(PthreadKeyTeardown, DeletedKeyDropsValueSilently) {
-#ifdef _WIN32
-    // M2 DIVERGENCE (measured): winpthreads fires the destructor once for a
-    // deleted key; POSIX and FreeBSD (thr_spec.c:133-144) require silence.
-    // M2 was measured before the worker was held alive across the delete, so it
-    // may be the teardown race this case now excludes; re-measure before relying on it.
-    // Skipped loudly rather than blessed: encoding `1` would pin a POSIX
-    // violation as the contract, and asserting `0` would go red on every
-    // Windows run. An HLE-side pre-clear would fix this for real.
-    GTEST_SKIP() << "winpthreads fires deleted-key destructors (measured M2); "
-                    "POSIX/FreeBSD require 0 calls";
-#else
     init_hle();
     g_n4.store(0);
     g_armed4.store(false);
@@ -263,7 +251,6 @@ TEST(PthreadKeyTeardown, DeletedKeyDropsValueSilently) {
     ASSERT_TRUE(armed) << "worker armed its value";
     EXPECT_EQ(deleted, 0ull);
     EXPECT_EQ(g_n4.load(), 0u) << "deleted key: value dropped, destructor silent";
-#endif
 }
 
 TEST(PthreadKeyTeardown, AllKeysFireOnceOrderUnspecified) {
@@ -287,10 +274,10 @@ TEST(PthreadKeyTeardown, NullDestructorIsSilent) {
     // cleanly and release the thread.
 }
 
-TEST(PthreadKeyTeardown, PositiveControl) {
-    // A worker that sets NOTHING must produce no calls: if the harness ever
-    // reported destructor activity here, every "exactly once" arm above
-    // would be suspect.
+TEST(PthreadKeyTeardown, NoValueNoCall) {
+    // Negative control: a worker that sets NOTHING must produce no calls. If the
+    // harness ever reported destructor activity here, every "exactly once" arm
+    // above would be suspect. (DestructorRunsOnceWithValue is the positive one.)
     init_hle();
     g_n1.store(0);
     g_k1 = (pthread_key_t)make_key((void*)dtor_once);
