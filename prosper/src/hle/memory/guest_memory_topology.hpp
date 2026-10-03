@@ -1,5 +1,6 @@
 #pragma once
 
+#include "host/memory/guest_direct_allocation.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <shared_mutex>
@@ -58,10 +59,6 @@ bool guest_memory_direct_range_fault_safe(const GuestMappingLease& lease, uint64
 // the producer's complete known physical layout extent; zero is unknown. The returned isolation
 // is over its complete original allocation. Retype ledger slices retain original ownership;
 // release/reuse never makes a new allocation birth physically disjoint from a retained origin.
-struct GuestDirectAllocation {
-    uint64_t address = 0, minimum_bytes = 0;
-    uint64_t physical_begin = 0, physical_end = 0, identity = 0;
-};
 // Capture at producer realization/publication while the backing is leased. Retained renderer
 // owners keep this observation even after the old VA is unmapped; no capture file supplies it.
 GuestDirectAllocation guest_memory_direct_allocation(const GuestMappingLease& lease,
