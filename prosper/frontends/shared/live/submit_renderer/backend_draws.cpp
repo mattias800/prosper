@@ -218,6 +218,7 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
         bd.vertex_offset = refvs ? 0 : it.vertex_offset;
         bd.ps     = nops ? nullptr : &it.ps;
         bd.raster_quads = it.raster_quads;
+        bd.fragment_draw_inputs = it.fragment_draw_inputs;
         bd.raster_quad_contract_modified = refvs || fs_ov || nops ||
             (descriptor_validate_mode && !strcmp(descriptor_validate_mode, "poison"));
         if (it.owned_waves && bd.raster_quad_contract_modified) {
