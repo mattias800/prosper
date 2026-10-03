@@ -3158,6 +3158,10 @@ endif()
   target_include_directories(test_gpu_capture PRIVATE tests)
   target_link_libraries(test_gpu_capture PRIVATE prosper_core)
   add_test(NAME gpu_capture_roundtrip COMMAND test_gpu_capture)
+  prosper_add_gtest(test_gpu_capture_observation
+    SOURCES tests/gpu/capture/test_gpu_capture_observation.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   # Actual CPU draw realization -> capture -> replay retains guest width independently of SPIR-V.
   prosper_add_gtest(test_realized_fragment_width
@@ -6003,6 +6007,18 @@ if(TARGET gpu_replay AND Python3_Interpreter_FOUND)
   endif()
 endif()
 
+
+# The common-v69 metadata controls launch the actual tool, so keep them behind its build gate.
+if(TARGET gpu_replay)
+  prosper_add_gtest(test_gpu_capture_observation_cli
+    SOURCES tests/gpu/capture/test_gpu_capture_observation.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core
+    ENVIRONMENT "PROSPER_GPU_REPLAY_TEST_BINARY=$<TARGET_FILE:gpu_replay>"
+    PROPERTIES TIMEOUT 60)
+  target_compile_definitions(test_gpu_capture_observation_cli PRIVATE PROSPER_OBSERVATION_CLI_TESTS=1)
+  add_dependencies(test_gpu_capture_observation_cli gpu_replay)
+endif()
 
 # ---------------------------------------------------------------------------
 # Per-case scratch directory for every registered test (#1613).

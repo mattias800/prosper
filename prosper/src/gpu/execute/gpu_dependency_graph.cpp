@@ -381,4 +381,14 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
     return true;
 }
 
+bool build_gpu_capture_observation_graph(const GpuCaptureObservation& observation,
+                                         GpuDependencyGraph& graph, std::string& error) {
+    if (!observation.available_) {
+        graph = {};
+        error = "capture observation is unavailable";
+        return false;
+    }
+    return build_gpu_dependency_graph(observation.normalized_, graph, error);
+}
+
 } // namespace prosper::gpu

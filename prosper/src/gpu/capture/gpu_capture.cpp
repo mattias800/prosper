@@ -290,42 +290,43 @@ bool read_gpu_capture(const std::string& path, GpuCaptureFile& c, std::string& e
     return deserialize_gpu_capture(bytes, c, error);
 }
 
-bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::string& error) {
-    error.clear();
-    out = {};
-    if (!validate_dma_copies(c, error) ||
-        (c.format_version >= 7u && !validate_failure_diagnostics(c, error)))
-        return false;
-    out.metadata = c.metadata; out.blobs = c.blobs;
-    out.rtt_seeds = c.rtt_seeds; out.ds_seeds = c.ds_seeds;
-    out.raw_shader_versions = c.raw_shader_versions;
-    out.failure_diagnostics = c.failure_diagnostics;
-    out.resource_provenance = c.resource_provenance;
-    out.failure_diagnostics_available = c.failure_diagnostics_available;
-    out.expected_output_valid = c.expected_output_valid;
-    out.expected_output_hash = c.expected_output_hash; out.expected_output_bytes = c.expected_output_bytes;
-    size_t resource_reference_count = 0;
-    for (const auto& draw : c.draws)
-        for (const GpuCapturedTable* table : {&draw.vrt, &draw.prt})
-            for (const auto& resource : table->resources)
+namespace {
+
+// Shared byte/descriptor normalization. Strict admission stays interleaved at its original
+// per-item positions, so later metadata errors do not hide an earlier execution refusal.
+class CaptureNormalizer {
+public:
+    CaptureNormalizer(const GpuCaptureFile& capture, GpuReplayFrame& frame, std::string& message)
+        : c(capture), out(frame), error(message) {}
+
+    bool initialize() {
+        if (!validate_dma_copies(c, error) ||
+            (c.format_version >= 7u && !validate_failure_diagnostics(c, error)))
+            return false;
+        out.metadata = c.metadata; out.blobs = c.blobs;
+        out.rtt_seeds = c.rtt_seeds; out.ds_seeds = c.ds_seeds;
+        out.raw_shader_versions = c.raw_shader_versions;
+        out.failure_diagnostics = c.failure_diagnostics;
+        out.resource_provenance = c.resource_provenance;
+        out.failure_diagnostics_available = c.failure_diagnostics_available;
+        out.expected_output_valid = c.expected_output_valid;
+        out.expected_output_hash = c.expected_output_hash; out.expected_output_bytes = c.expected_output_bytes;
+        size_t resource_reference_count = 0;
+        for (const auto& draw : c.draws)
+            for (const GpuCapturedTable* table : {&draw.vrt, &draw.prt})
+                for (const auto& resource : table->resources)
+                    resource_reference_count += 1u + resource.resource.table_entries.size();
+        for (const auto& compute : c.computes)
+            for (const auto& resource : compute.resources.resources)
                 resource_reference_count += 1u + resource.resource.table_entries.size();
-    for (const auto& compute : c.computes)
-        for (const auto& resource : compute.resources.resources)
-            resource_reference_count += 1u + resource.resource.table_entries.size();
-    resource_reference_count += c.dma_copies.size() * 2;
-    out.resource_instances.reserve(resource_reference_count * 2);
-    std::map<std::pair<uint32_t, uint64_t>, size_t> instance_by_version_and_base;
-    std::map<uint32_t, size_t> internal_instance_by_binding;
-    // `prefix_bytes`, when supplied, receives how many bytes of the SAME allocation precede
-    // `guest_addr` inside this blob. That is exactly `blob_offset`: a blob's byte i is the guest
-    // byte at `blob.guest_addr + i` by construction (`collect_intervals` merges ranges and reads
-    // them contiguously, and blob dedup only shares byte-identical content), so the bytes before
-    // the resource's own address really are the guest's bytes at those addresses. A tiled mip
-    // chain needs them -- it stores level zero last (#3202).
-    auto bind_range = [&](uint32_t blob_index, uint64_t blob_offset, uint64_t guest_addr,
-                          uint64_t need, uint8_t*& host_data, uint64_t& host_data_size,
-                          const char* invalid_error, const char* exceeds_error,
-                          const char* offset_error, uint64_t* prefix_bytes = nullptr) {
+        resource_reference_count += c.dma_copies.size() * 2;
+        out.resource_instances.reserve(resource_reference_count * 2);
+        return true;
+    }
+    bool bind_range(uint32_t blob_index, uint64_t blob_offset, uint64_t guest_addr,
+                    uint64_t need, uint8_t*& host_data, uint64_t& host_data_size,
+                    const char* invalid_error, const char* exceeds_error,
+                    const char* offset_error, uint64_t* prefix_bytes = nullptr) {
         if (blob_index == 0xFFFFFFFFu) return true;
         if (blob_index >= out.blobs.size() || blob_offset > out.blobs[blob_index].bytes.size()) {
             error = invalid_error; return false;
@@ -343,9 +344,9 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         host_data_size = need;
         if (prefix_bytes) *prefix_bytes = blob_offset;
         return true;
-    };
-    auto table = [&](const GpuCapturedTable& src, bool allow_packed_pointer,
-                     std::shared_ptr<ShaderResourceTable>& dst) -> bool {
+    }
+    bool table(const GpuCapturedTable& src, bool allow_packed_pointer,
+               std::shared_ptr<ShaderResourceTable>& dst) {
         if (!src.present) { dst.reset(); return src.resources.empty(); }
         dst = std::make_shared<ShaderResourceTable>();
         for (const auto& x : src.resources) {
@@ -448,12 +449,9 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             dst->resources.push_back(r);
         }
         return true;
-    };
-    // Stored SPIR-V replay bypasses raw recompilation. Authenticate required read-point inputs
-    // here as well, before either replay route can consume the module. The serialized obligation
-    // can require refusal without raw provenance, but cannot grant admission or hide a code PC.
-    auto restore_owned_raw_inputs = [&](const std::shared_ptr<ShaderResourceTable>& resources,
-                                        const GpuCapturedTable& captured_table, uint32_t raw_index) {
+    }
+    bool restore_owned_raw_inputs(const std::shared_ptr<ShaderResourceTable>& resources,
+                                  const GpuCapturedTable& captured_table, uint32_t raw_index) {
         const bool marked = resources && std::any_of(
             resources->resources.begin(), resources->resources.end(),
             [](const auto& resource) { return resource.owned_raw_snapshot_bytes != 0u; });
@@ -512,9 +510,9 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             resources->owned_raw_snapshot_requirements.emplace_back(pc, bytes);
         }
         return true;
-    };
-    auto restore_nested_inputs = [&](const std::shared_ptr<ShaderResourceTable>& resources,
-                                     const GpuCapturedTable& captured_table, uint32_t raw_index) {
+    }
+    bool restore_nested_inputs(const std::shared_ptr<ShaderResourceTable>& resources,
+                               const GpuCapturedTable& captured_table, uint32_t raw_index) {
         const bool marked = resources && std::any_of(resources->resources.begin(),
             resources->resources.end(), [](const auto& resource) {
                 return resource.owned_nested_snapshot_bytes != 0u;
@@ -585,9 +583,8 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             resources->owned_nested_snapshot_requirements.emplace_back(pc, width);
         }
         return true;
-    };
-    out.items.reserve(c.draws.size());
-    for (const auto& x : c.draws) {
+    }
+    bool normalize_draw(const GpuCapturedDraw& x, DrawItem& d) {
         if (!x.ps_launch_rsrc1.canonical()) {
             error = "invalid realized-draw RSRC1_PS evidence";
             return false;
@@ -608,7 +605,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             error = "invalid realized-draw fragment entry evidence";
             return false;
         }
-        DrawItem d; d.vs = x.vs; d.gs = x.gs; d.fs = x.fs;
+        d.vs = x.vs; d.gs = x.gs; d.fs = x.fs;
         d.ps = x.ps; d.vertex_count = x.vertex_count;
         d.instance_count = x.instance_count;
         d.raw_draw_count = x.raw_draw_count; d.raw_indexed = x.raw_indexed;   // #1256
@@ -641,6 +638,9 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         d.ps_raster_launch = x.ps_raster_launch;
         d.float_transport = x.float_transport;
         if (!table(x.vrt, false, d.vrt) || !table(x.prt, false, d.prt)) return false;
+        return true;
+    }
+    bool admit_draw(const GpuCapturedDraw& x, DrawItem& d) {
         if (x.vs_chain_raw_shader_index != UINT32_MAX) {
             const auto* prolog = x.vs_raw_shader_index < c.raw_shader_versions.size()
                 ? &c.raw_shader_versions[x.vs_raw_shader_index].words : nullptr;
@@ -871,15 +871,9 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             }
             d.owned_waves = std::move(owner);
         }
-        out.items.push_back(std::move(d));
+        return true;
     }
-    out.computes.reserve(c.computes.size());
-    for (const auto& x : c.computes) {
-        if (!validate_captured_null_guarded_raw_store(c, x, error)) return false;
-        if (!validate_captured_nullable_output_raw_buffer(c, x, error)) return false;
-        if (!validate_captured_gta5_cf9200_no_backing(c, x, error)) return false;
-        if (!validate_captured_indirect_pointer_relocations(c, x, error)) return false;
-        ComputeItem compute;
+    void normalize_compute_fields(const GpuCapturedCompute& x, ComputeItem& compute) {
         compute.spirv = x.spirv;
         compute.launch = x.launch;
         compute.code_addr = x.code_addr;
@@ -890,6 +884,13 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         compute.raw_shader_index = x.raw_shader_index;
         compute.recompile_config = x.recompile_config;
         compute.recompile_config_available = x.recompile_config_available;
+    }
+    bool admit_compute(const GpuCapturedCompute& x, ComputeItem& compute) {
+        if (!validate_captured_null_guarded_raw_store(c, x, error)) return false;
+        if (!validate_captured_nullable_output_raw_buffer(c, x, error)) return false;
+        if (!validate_captured_gta5_cf9200_no_backing(c, x, error)) return false;
+        if (!validate_captured_indirect_pointer_relocations(c, x, error)) return false;
+        normalize_compute_fields(x, compute);
         compute.null_guarded_raw_store_validated =
             captured_compute_has_null_guarded_raw_store(x);
         compute.nullable_output_raw_buffer_validated =
@@ -975,11 +976,59 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
                 return false;
             }
         }
-        out.computes.push_back(std::move(compute));
+        return true;
     }
-    out.dma_copies.reserve(c.dma_copies.size());
-    for (const auto& captured : c.dma_copies) {
-        ReplayDmaCopy copy;
+    bool normalize_compute(const GpuCapturedCompute& x, ComputeItem& compute) {
+        // Retain pre-existing capture-provenance validation, including legacy in-memory inputs.
+        // Observation omits execution proof construction, not structural carrier validation.
+        if (!validate_captured_null_guarded_raw_store(c, x, error)) return false;
+        if (!validate_captured_nullable_output_raw_buffer(c, x, error)) return false;
+        if (!validate_captured_gta5_cf9200_no_backing(c, x, error)) return false;
+        if (!validate_captured_indirect_pointer_relocations(c, x, error)) return false;
+        normalize_compute_fields(x, compute);
+        if (compute.recompile_config_available)
+            compute.user_sgprs = compute.recompile_config.user_sgprs;
+        if (!table(x.resources, true, compute.resources)) return false;
+        if (!compute.resources) return true;
+        // Report-only structural metadata from already-owned capture bytes. The codec omits
+        // dispatch-derived markers. This private frame never reaches executable consumers:
+        // no shader proof, guest read, relocation construction or live-state discovery occurs.
+        for (auto& resource : compute.resources->resources) {
+            if (is_gta5_packed_pointer_serialized_shadow(
+                    resource, resource.host_data, resource.host_data_size)) {
+                resource.indirect_buffer_contract_tag = kGta5PackedPointerTag;
+                resource.indirect_buffer_binding_bytes = resource.host_data_size;
+                resource.indirect_buffer_slot_count =
+                    (resource.host_data_size - resource.size - kGta5PackedPointerHeaderBytes) /
+                    kGta5PackedPointerSlotBytes;
+                resource.indirect_buffer_header_bytes = kGta5PackedPointerHeaderBytes;
+                resource.indirect_buffer_slot_bytes = kGta5PackedPointerSlotBytes;
+            }
+            if (!is_indirect_pointer_relocation_serialized(
+                    resource, resource.host_data, resource.host_data_size)) continue;
+            for (const auto* layout : {&kIndirectPointerStaticFootprintLayout,
+                                       &kIndirectPointerDescriptorRangeLayout}) {
+                IndirectBufferRelocationInfo info;
+                if (!inspect_indirect_buffer_relocation(
+                        resource, resource.host_data, resource.host_data_size, *layout, info))
+                    continue;
+                const uint64_t directory = resource.size + kIndirectBufferRelocationHeaderBytes +
+                    info.records.size() * kIndirectBufferRelocationRecordBytes;
+                if (directory > UINT32_MAX || info.witness_words.size() != 4u) continue;
+                resource.indirect_pointer_relocation = {
+                    layout->version, kIndirectPointerProofSchema,
+                    static_cast<uint32_t>(resource.host_data_size),
+                    static_cast<uint32_t>(info.records.size()),
+                    static_cast<uint32_t>(info.segments.size()),
+                    static_cast<uint32_t>(directory),
+                    static_cast<uint64_t>(info.witness_words[1]) |
+                        (static_cast<uint64_t>(info.witness_words[2]) << 32u)};
+                break;
+            }
+        }
+        return true;
+    }
+    bool normalize_dma(const GpuCapturedDmaCopy& captured, ReplayDmaCopy& copy) {
         copy.dst = captured.dst; copy.src = captured.src; copy.bytes = captured.bytes;
         copy.sels = captured.sels; copy.command_order = captured.command_order;
         copy.packet_addr = captured.packet_addr;
@@ -1033,9 +1082,90 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
                         "ordered DMA source blob offset exceeds its logical address"))
             return false;
         copy.source_data = source;
+        return true;
+    }
+private:
+    const GpuCaptureFile& c;
+    GpuReplayFrame& out;
+    std::string& error;
+    std::map<std::pair<uint32_t, uint64_t>, size_t> instance_by_version_and_base;
+    std::map<uint32_t, size_t> internal_instance_by_binding;
+};
+
+} // namespace
+
+bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::string& error) {
+    error.clear();
+    out = {};
+    CaptureNormalizer normalizer(c, out, error);
+    if (!normalizer.initialize()) return false;
+    out.items.reserve(c.draws.size());
+    for (const auto& captured : c.draws) {
+        DrawItem draw;
+        if (!normalizer.normalize_draw(captured, draw) ||
+            !normalizer.admit_draw(captured, draw)) return false;
+        out.items.push_back(std::move(draw));
+    }
+    out.computes.reserve(c.computes.size());
+    for (const auto& captured : c.computes) {
+        ComputeItem compute;
+        if (!normalizer.admit_compute(captured, compute)) return false;
+        out.computes.push_back(std::move(compute));
+    }
+    out.dma_copies.reserve(c.dma_copies.size());
+    for (const auto& captured : c.dma_copies) {
+        ReplayDmaCopy copy;
+        if (!normalizer.normalize_dma(captured, copy)) return false;
         out.dma_copies.push_back(copy);
     }
     out.operations = c.operations;
+    return true;
+}
+
+GpuCaptureObservation::GpuCaptureObservation(GpuCaptureObservation&& other) noexcept
+    : normalized_(std::move(other.normalized_)),
+      pending_stages_(std::move(other.pending_stages_)),
+      format_version_(other.format_version_), available_(std::exchange(other.available_, false)) {}
+
+GpuCaptureObservation& GpuCaptureObservation::operator=(GpuCaptureObservation&& other) noexcept {
+    if (this != &other) {
+        normalized_ = std::move(other.normalized_);
+        pending_stages_ = std::move(other.pending_stages_);
+        format_version_ = other.format_version_;
+        available_ = std::exchange(other.available_, false);
+    }
+    return *this;
+}
+
+bool materialize_gpu_capture_observation(const GpuCaptureFile& c,
+                                        GpuCaptureObservation& observation, std::string& error) {
+    error.clear();
+    observation = {};
+    auto& out = observation.normalized_;
+    CaptureNormalizer normalizer(c, out, error);
+    if (!normalizer.initialize()) return false;
+    for (const auto& captured : c.draws) {
+        DrawItem draw;
+        if (!normalizer.normalize_draw(captured, draw)) return false;
+        if (draw.vrt) draw.vrt->vertices_per_instance = draw.vertex_count;
+        out.items.push_back(std::move(draw));
+        observation.pending_stages_.push_back({
+            captured.owned_waves && captured.owned_waves->vertex_pending,
+            captured.owned_waves && captured.owned_waves->fragment_pending});
+    }
+    for (const auto& captured : c.computes) {
+        ComputeItem compute;
+        if (!normalizer.normalize_compute(captured, compute)) return false;
+        out.computes.push_back(std::move(compute));
+    }
+    for (const auto& captured : c.dma_copies) {
+        ReplayDmaCopy copy;
+        if (!normalizer.normalize_dma(captured, copy)) return false;
+        out.dma_copies.push_back(copy);
+    }
+    out.operations = c.operations;
+    observation.format_version_ = c.format_version;
+    observation.available_ = true;
     return true;
 }
 
