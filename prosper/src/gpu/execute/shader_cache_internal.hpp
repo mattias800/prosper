@@ -40,6 +40,7 @@
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"     // recompile_compute
+#include "gpu/recompiler/fragment_packet_vgpr_requirements.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "host/memory/guest_memory_map.hpp"
 #include "host/memory/guest_memory_query.hpp"
@@ -559,6 +560,7 @@ struct ShaderCodeAnalysis {
     uint64_t code_hash = 0;
     PcrelDispatchInfo pcrel_dispatch;
     uint32_t fragment_color_export_mask = 0;
+    FragmentPacketVgprRequirements packet_vgpr_requirements;
     uint64_t identity = 0;
     size_t source_dwords = 0;
     bool bounded_span = false;

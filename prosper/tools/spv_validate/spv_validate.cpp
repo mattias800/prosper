@@ -35,6 +35,7 @@
 #include "../../tests/fixtures/fragment_packet_wqm_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_mbcnt_fixture.hpp"
 #include "../../tests/fixtures/fragment_resource_packet_fixture.hpp"
+#include "../../tests/fixtures/fragment_packet_definedness_fixture.hpp"
 #include "../../tests/fixtures/fragment_special_f32_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <algorithm>
@@ -706,6 +707,19 @@ int main(int argc, char** argv) {
         const auto rectangular = recompile_fragment_resource_packet(resources::rectangular_chain());
         dump(dir, "fragment_resource_packet_rectangular_l4", rectangular.packet.spirv,
              "recompile_fragment_resource_packet");
+        namespace definedness = prosper::test::fragment_definedness;
+        for (bool lod : {false, true})
+            for (bool inactive : {false, true}) {
+                const auto packet =
+                    recompile_fragment_resource_packet(definedness::resource_chain(lod, inactive));
+                const auto name = "fragment_resource_definedness_" + std::to_string(lod) + "_" +
+                                  std::to_string(inactive);
+                dump(dir, name.c_str(), packet.packet.spirv, "recompile_fragment_resource_packet");
+            }
+        const auto missing_lod =
+            recompile_fragment_resource_packet(definedness::resource_missing_lod());
+        dump(dir, "fragment_resource_definedness_third_lod_absent", missing_lod.packet.spirv,
+             "recompile_fragment_resource_packet");
         namespace special = prosper::test::fragment_special_f32;
         for (uint32_t op : {0x2au, 0x2eu, 0x33u}) {
             const auto p =
@@ -717,6 +731,11 @@ int main(int argc, char** argv) {
     {
         namespace fp = prosper::test::fragment_packet;
         uint32_t ordinal = 0;
+        for (const auto& c : prosper::test::fragment_definedness::cases()) {
+            const auto packet = recompile_fragment_packet(c.packet);
+            const auto name = "fragment_definedness_" + c.name;
+            dump(dir, name.c_str(), packet.spirv, "recompile_fragment_packet");
+        }
         for (uint32_t selected : {63u, 64u}) for (bool inactive : {false, true}) {
             fp::Case c;
             c.selected_lane = selected;

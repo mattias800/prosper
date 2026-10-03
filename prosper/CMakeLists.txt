@@ -2748,6 +2748,9 @@ endif()
   prosper_add_gtest(test_fragment_resource_packet
     SOURCES tests/gpu/recompiler/test_fragment_resource_packet.cpp
     INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_packet_definedness
+    SOURCES tests/gpu/recompiler/test_fragment_packet_definedness.cpp
+    INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_fragment_special_f32
     SOURCES tests/gpu/recompiler/test_fragment_special_f32.cpp
     INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
@@ -5854,6 +5857,9 @@ if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
     LIBRARIES prosper_core Vulkan::Vulkan
     LABELS gpu
     PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_packet_definedness_exec
+    SOURCES tests/gpu/execute/test_fragment_packet_definedness_exec.cpp
+    INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
 
   add_executable(test_fragment_packet_exec tests/gpu/execute/test_fragment_packet_exec.cpp)
   target_include_directories(test_fragment_packet_exec PRIVATE tests)

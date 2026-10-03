@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
+#include <span>
 #include "gpu/recompiler/fragment_float_mode.hpp"
 #include "gpu/recompiler/fragment_float_flags.hpp"
 #include "gpu/recompiler/fragment_arithmetic_observation.hpp"
@@ -501,6 +502,9 @@ inline constexpr uint32_t kFragmentPacketLanes = 64;
 struct FragmentPacketVgpr {
     uint32_t reg = 0;
     std::array<uint32_t, kFragmentPacketLanes> words{};
+    // Availability is independent of both EXEC and raw bits. Legacy callers supply all64 words;
+    // a partial column must explicitly leave absent lanes absent, even when storage contains zero.
+    uint64_t available_mask = UINT64_MAX;
 };
 // Supplied logical ISA topology, NOT PS5 raster-packing or native-helper capture authority.
 // ConsecutiveLogicalQuads means mask nibbles [0..3], [4..7], ..., [60..63]. Unknown is valid
@@ -533,8 +537,29 @@ struct FragmentPacketProgram {
     std::vector<uint32_t> input_words;  // owned raw-u32 set0/binding0, lane-major
     std::vector<uint32_t> output_words; // owned initialized records, set0/binding1
     uint32_t input_stride = 0, exports_per_lane = 0;
+    // Optional appended VGPR-definedness status. Fully supplied legacy packets retain their old
+    // wire bytes. Scratch/partial packets MUST pass decode_fragment_packet before publishing EXP.
+    uint32_t vgpr_status_offset = UINT32_MAX;
+    struct VgprFailureSite {
+        uint32_t pc = 0, reg = 0, kind = 0;
+        bool operator==(const VgprFailureSite&) const = default;
+    };
+    std::vector<VgprFailureSite> vgpr_failure_sites;
     std::string rejection;
 };
+
+inline constexpr uint32_t kFragmentPacketVgprStatusMagic = 0x56475031u;   // VGP1
+inline constexpr uint32_t kFragmentPacketVgprStatusWords = 4;
+struct FragmentPacketResult {
+    std::vector<uint32_t> exports;   // empty on ANY absent/malformed/failing worker
+    std::string rejection;
+    bool vgpr_status_validated =
+        false;   // true only after EVERY present worker record is validated
+    uint32_t lane = UINT32_MAX, pc = UINT32_MAX, reg = UINT32_MAX, kind = 0;
+};
+FragmentPacketResult decode_fragment_packet(const FragmentPacketProgram&,
+                                            std::span<const uint32_t> readback,
+                                            bool completion_and_host_availability);
 
 // Actual guest instruction emission into a 64-worker logical-wave executor. No native subgroup64
 // requirement and no native fragment invocation pairing. This entry does not rasterize, interpolate,
