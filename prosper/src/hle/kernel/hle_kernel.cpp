@@ -2993,6 +2993,26 @@ HLE(k_key_delete)    {
             if (it != g_win_key_thunks.end()) {
                 thunk = it->second;
                 g_win_key_thunks.erase(it);
+                // #4319: winpthreads still fires a deleted key's destructor once when a
+                // thread holds a value; POSIX and FreeBSD (_thread_cleanupspecific)
+                // drop it silently. pthread_setspecific only affects the calling
+                // thread, so other threads' values cannot be pre-cleared here --
+                // instead disarm this key's thunk (patch its entry to ret) so any
+                // destructor winpthreads still invokes is a silent no-op. After a
+                // successful host delete only, so a refused delete keeps a live thunk.
+                // Residual race, documented honestly: a destructor already executing
+                // past the patched byte still runs once. That is a single benign call
+                // -- no crash, no double-free -- and the execute-after-free window
+                // below is pre-existing, unchanged by this patch. EXECUTE_READWRITE
+                // (not READWRITE) for the transition so the page is never left
+                // non-executable under a concurrently exiting thread.
+                DWORD old_protect = 0;
+                if (VirtualProtect(thunk, 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+                    static_cast<uint8_t*>(thunk)[0] = 0xC3;
+                    FlushInstructionCache(GetCurrentProcess(), thunk, 1);
+                    DWORD ignored = 0;
+                    VirtualProtect(thunk, 1, old_protect, &ignored);
+                }
             }
         }
     }
