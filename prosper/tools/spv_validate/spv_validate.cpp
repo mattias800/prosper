@@ -712,6 +712,9 @@ int main(int argc, char** argv) {
             const auto name = "fragment_resource_definedness_" + std::to_string(lod) + "_" + std::to_string(inactive);
             dump(dir, name.c_str(), packet.packet.spirv, "recompile_fragment_resource_packet");
         }
+        const auto missing_lod = recompile_fragment_resource_packet(definedness::resource_missing_lod());
+        dump(dir, "fragment_resource_definedness_third_lod_absent", missing_lod.packet.spirv,
+             "recompile_fragment_resource_packet");
     }
     {
         namespace fp = prosper::test::fragment_packet;

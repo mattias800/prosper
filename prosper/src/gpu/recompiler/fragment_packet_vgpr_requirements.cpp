@@ -4,11 +4,17 @@
 
 namespace prosper::gpu {
 uint64_t FragmentPacketVgprRequirements::retained_bytes() const {
-    uint64_t bytes = sizeof(*this) + rejection.capacity();
+    using ReadMap = decltype(reads);
+    constexpr uint64_t alignment = alignof(ReadMap::value_type);
+    // Cache-budget estimate, NOT an exact allocator census. Count the complete aligned pair
+    // (key/vector padding included) plus a deliberately generous eight-pointer allowance for
+    // tree links, bookkeeping and allocation overhead, then align the complete estimate.
+    constexpr uint64_t node_allowance = 8 * sizeof(void*);
+    constexpr uint64_t node_estimate =
+        ((sizeof(ReadMap::value_type) + node_allowance + alignment - 1) / alignment) * alignment;
+    uint64_t bytes = sizeof(*this) + rejection.capacity() + 1;
     for (const auto& [pc, accesses] : reads)
-        // Conservative node accounting includes tree links/alignment, not just the pair payload.
-        bytes += sizeof(pc) + sizeof(accesses) + 4 * sizeof(void*) +
-            accesses.capacity() * sizeof(FragmentPacketVgprAccess);
+        bytes += node_estimate + accesses.capacity() * sizeof(FragmentPacketVgprAccess);
     return bytes;
 }
 

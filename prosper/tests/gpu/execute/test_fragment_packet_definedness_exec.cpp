@@ -26,7 +26,7 @@ std::vector<uint32_t> dispatch(prosper::test::ComputeOwnedDispatch& owner, uint3
 
 TEST(FragmentPacketDefinednessExec, ActualMaskBranchPeerAndInactiveRawOutput) {
     const auto queried = prosper::test::default_compute_subgroup_properties();
-    std::fprintf(stderr, "[vgpr-definedness-gpu] queried_physical_subgroup_size=%u expected_dispatch_attempts=15\n", queried.size);
+    std::fprintf(stderr, "[vgpr-definedness-gpu] queried_physical_subgroup_size=%u expected_dispatch_attempts=16\n", queried.size);
     ASSERT_GT(queried.size, 0u) << "no runtime cannot pass";
     reset_float_controls_support_for_test();
     uint32_t attempts = 0;
@@ -45,18 +45,16 @@ TEST(FragmentPacketDefinednessExec, ActualMaskBranchPeerAndInactiveRawOutput) {
             EXPECT_EQ(result.reg, c.failure_reg); EXPECT_EQ(result.kind, c.failure_kind);
         } else EXPECT_TRUE(result.rejection.empty()) << result.rejection;
     }
-    EXPECT_EQ(attempts, 15u);
-    std::fprintf(stderr, "[vgpr-definedness-gpu] integer_dispatch_attempts=%u expected=15\n", attempts);
+    EXPECT_EQ(attempts, 16u);
+    std::fprintf(stderr, "[vgpr-definedness-gpu] integer_dispatch_attempts=%u expected=16\n", attempts);
 }
 
 TEST(FragmentPacketDefinednessExec, ActualOwnedResourceWriterAndPartialEntryChain) {
     const auto queried = prosper::test::default_compute_subgroup_properties();
-    std::fprintf(stderr, "[vgpr-definedness-gpu] queried_physical_subgroup_size=%u expected_dispatch_attempts=4\n", queried.size);
+    std::fprintf(stderr, "[vgpr-definedness-gpu] queried_physical_subgroup_size=%u expected_dispatch_attempts=5\n", queried.size);
     ASSERT_GT(queried.size, 0u) << "no runtime cannot pass";
     uint32_t attempts = 0;
-    for (bool lod : {false, true}) for (bool inactive : {false, true}) {
-        auto input = f::resource_chain(lod, inactive);
-        const auto expected = r::expected_chain(input, lod);
+    const auto execute = [&](auto input, const auto& expected, bool absent_lod) {
         FragmentResourcePacketProgram p;
         prosper::test::ComputeOwnedDispatch owner;
         owner.prepare = [&](const auto& enabled, auto& plan) {
@@ -75,9 +73,18 @@ TEST(FragmentPacketDefinednessExec, ActualOwnedResourceWriterAndPartialEntryChai
         EXPECT_FALSE(p.packet.spirv.empty()) << p.packet.rejection;
         const auto result = decode_fragment_resource_packet(p, words, owner.completion_and_host_availability,
                                                            owner.enabled.device_identity);
-        EXPECT_TRUE(result.rejection.empty()) << result.rejection;
+        if (absent_lod) {
+            EXPECT_FALSE(result.rejection.empty()); EXPECT_TRUE(result.exports.empty());
+            EXPECT_EQ(result.failure, FragmentPacketRuntimeFailure::UndefinedVgpr);
+            EXPECT_EQ(result.pc, input.images[0].pc); EXPECT_EQ(result.vgpr, 12u);
+        } else EXPECT_TRUE(result.rejection.empty()) << result.rejection;
         EXPECT_EQ(result.exports, expected) << "actual P1/P2/FP/resource/wide/peer all64 raw sink";
+    };
+    for (bool lod : {false, true}) for (bool inactive : {false, true}) {
+        const auto input = f::resource_chain(lod, inactive);
+        execute(input, r::expected_chain(input, lod), false);
     }
-    EXPECT_EQ(attempts, 4u);
-    std::fprintf(stderr, "[vgpr-definedness-gpu] resource_dispatch_attempts=%u expected=4\n", attempts);
+    execute(f::resource_missing_lod(), std::vector<uint32_t>{}, true);
+    EXPECT_EQ(attempts, 5u);
+    std::fprintf(stderr, "[vgpr-definedness-gpu] resource_dispatch_attempts=%u expected=5\n", attempts);
 }

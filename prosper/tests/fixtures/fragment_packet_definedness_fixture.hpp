@@ -90,6 +90,10 @@ inline std::vector<Case> cases() {
         out.push_back({source == fp::mbcnt::Source::Exec ? "common_mask_counter_writer_only" : "numeric_counter_writer_only",
                        counter, fp::mbcnt::expected(c)});
     }
+    fp::Case later; later.second_export = true;
+    auto events = fp::packet(later);
+    std::erase_if(events.vgprs, [](const auto& c) { return c.reg != 0 && c.reg != 8; });
+    out.push_back({"distinct_readlane_event_after_source_change", events, fp::expected(later, events)});
     return out;
 }
 inline FragmentResourcePacket resource_chain(bool lod, bool inactive) {
@@ -107,6 +111,15 @@ inline FragmentResourcePacket resource_chain(bool lod, bool inactive) {
         if (inactive && observed) return false;
         return true;
     });
+    return p;
+}
+inline FragmentResourcePacket resource_missing_lod() {
+    auto p = resource_chain(true, false);
+    // Remove BOTH definitions of v12. Preserve the earlier arithmetic sink using real loaded
+    // s16 rather than consuming v12 first; only IMAGE_SAMPLE_L's third coordinate reads it.
+    p.invocation.guest_code[8] = 0x7e260280u; // MOV v19,inline0 instead of MOV v12,s16
+    p.invocation.guest_code[9] = 0x7e1a0210u; // MOV v13,s16 instead of MUL from absent v12
+    p.invocation.guest_code[13] = 0x7e260280u; // MOV v19,inline0 instead of MOV v12,s18
     return p;
 }
 } // namespace prosper::test::fragment_definedness

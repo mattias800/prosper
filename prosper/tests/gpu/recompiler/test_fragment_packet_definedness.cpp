@@ -61,8 +61,8 @@ TEST(FragmentPacketDefinedness, ActualSourceMaskBranchPeerAndRawOutputRails) {
             EXPECT_EQ(result.reg, c.failure_reg); EXPECT_EQ(result.kind, c.failure_kind);
         } else EXPECT_TRUE(result.rejection.empty()) << result.rejection;
     }
-    EXPECT_EQ(attempts, 15u);
-    std::fprintf(stderr, "[vgpr-definedness-source] integer_evaluation_attempts=%u expected=15\n", attempts);
+    EXPECT_EQ(attempts, 16u);
+    std::fprintf(stderr, "[vgpr-definedness-source] integer_evaluation_attempts=%u expected=16\n", attempts);
 }
 
 TEST(FragmentPacketDefinedness, OwnedResourceChainUsesWriterOnlyAndInactiveObservedWords) {
@@ -101,6 +101,26 @@ TEST(FragmentPacketDefinedness, ImplicitP2AndWideImageReadsCannotBorrowAllocated
     // source range, not an earlier raw-export observation, is the actual first failing read.
     wide.invocation.guest_code[11] &= ~2u;
     check(wide, wide.images[0].pc, 11, "wide_image_middle_coordinate_absent");
+    auto lod = f::resource_missing_lod();
+    check(lod, lod.images[0].pc, 12, "explicit_lod_third_coordinate_absent");
+}
+
+TEST(FragmentPacketDefinedness, CacheBudgetCoversCompleteAlignedMapNodes) {
+    const auto input = f::cases()[1].packet;
+    const auto requirements = fragment_packet_vgpr_requirements(input.guest_code);
+    ASSERT_TRUE(requirements.rejection.empty()); ASSERT_EQ(requirements.reads.size(), 3u);
+    using ReadMap = decltype(requirements.reads);
+    // Independent lower budget: aligned WHOLE pair plus four pointer words, not separately
+    // summed key/vector sizes. The former 60-byte estimate fails this 64-bit 64-byte floor.
+    constexpr uint64_t alignment = alignof(ReadMap::value_type);
+    constexpr uint64_t minimum_node =
+        ((sizeof(ReadMap::value_type) + 4 * sizeof(void*) + alignment - 1) / alignment) * alignment;
+    uint64_t minimum = sizeof(requirements) + requirements.rejection.capacity();
+    for (const auto& [pc, accesses] : requirements.reads)
+        minimum += minimum_node + accesses.capacity() * sizeof(FragmentPacketVgprAccess);
+    EXPECT_GE(requirements.retained_bytes(), minimum);
+    if constexpr (sizeof(void*) == 8)
+        EXPECT_GT(minimum_node, sizeof(uint32_t) + sizeof(std::vector<FragmentPacketVgprAccess>) + 4 * sizeof(void*));
 }
 
 TEST(FragmentPacketDefinedness, FirstFailureAcrossResourceAndValidityChannelsIsChronological) {
