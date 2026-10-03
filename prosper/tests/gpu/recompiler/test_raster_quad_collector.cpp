@@ -356,8 +356,10 @@ int main(int argc, char** argv) {
     reject_wire(damaged, damaged.size(), 2, "quad-collector-output-provenance-malformed");
     auto partitioned = original;
     for (uint32_t lane = 0; lane < 4; ++lane) partitioned[4 + c.record_words + lane * c.lane_words + 4] = 0;
-    // Two distinct Vulkan scopes can observe the same geometric quad with complementary
-    // nonhelper lanes. Their helper values need not coincide and must never be coalesced.
+    // Two Vulkan scopes can observe the same geometric quad with complementary nonhelper lanes
+    // (llvmpipe runs one quad this way, #4277). They are reassembled into ONE record, each lane
+    // taken from the scope that ran it as a nonhelper; a lane's helper observation in the other
+    // scope is not a guest input and is dropped. Lanes 2/3 are helpers in both and agree.
     partitioned[4 + c.lane_words + 7] = 0x7fc12345u; // first scope's helper lane1 raw Z
     partitioned[4 + c.record_words + 7] = 0x80000001u; // second scope's helper lane0 raw Z
     for (bool reverse : {false,true}) {
@@ -365,12 +367,19 @@ int main(int argc, char** argv) {
         if (reverse) for (uint32_t word = 0; word < c.record_words; ++word)
             std::swap(ordered[4 + word],ordered[4 + c.record_words + word]);
         const bool accepted = decode_raster_quad_records(c, ordered.data(), ordered.size(), 2, quads).empty();
-        check(accepted && quads.size() == 2,
-            "same-origin disjoint nonhelper scopes remain separate in either append order");
-        check(accepted && quads.size() == 2 &&
-            quads[0] == std::vector<uint32_t>(ordered.begin() + 4,ordered.begin() + 4 + c.record_words) &&
-            quads[1] == std::vector<uint32_t>(ordered.begin() + 4 + c.record_words,ordered.end()),
-            "every scope word including distinct helper inputs survives without merging");
+        check(accepted && quads.size() == 1,
+            "same-origin disjoint nonhelper scopes reassemble into one record in either append order");
+        std::vector<uint32_t> expected(ordered.begin() + 4, ordered.begin() + 4 + c.record_words);
+        for (uint32_t lane = 0; lane < 4; ++lane) {
+            const auto* second = ordered.data() + 4 + c.record_words + lane * c.lane_words;
+            if (second[0] == 0)
+                std::copy_n(second, c.lane_words, expected.begin() + lane * c.lane_words);
+        }
+        check(accepted && quads.size() == 1 && quads[0] == expected,
+            "each lane comes from the scope that ran it as a nonhelper; first-scope order kept");
+        check(accepted && quads.size() == 1 && quads[0][7] != 0x80000001u &&
+            quads[0][c.lane_words + 7] != 0x7fc12345u,
+            "neither scope's helper observation of a lane the other ran replaces the real input");
     }
     auto parameter_wire = wire(parameter_contract);
     for (uint32_t q = 0; q < 2; ++q) for (uint32_t lane = 0; lane < 4; ++lane) {
@@ -379,12 +388,24 @@ int main(int argc, char** argv) {
         for (uint32_t word = kRasterQuadLaneFixedWords; word < parameter_contract.lane_words; ++word)
             row[word] = 0x3f800000u + 0x10000u * q + 0x100u * lane + word;
     }
-    const bool parameter_retained = decode_raster_quad_records(parameter_contract,
+    // Lanes 2/3 are helpers in both scopes but carry different parameter words: reassembly would
+    // have to choose one, so the whole collection is refused rather than invent an input.
+    quads = {{0xa5a5a5a5u}};
+    check(decode_raster_quad_records(parameter_contract, parameter_wire.data(), parameter_wire.size(), 2, quads) ==
+        "quad-collector-split-scope-helper-inputs-disagree" && quads.empty(),
+        "split scopes whose shared helper lanes disagree discard the entire transaction");
+    // Equal helper observations reassemble, keeping each nonhelper lane's own parameter words.
+    for (uint32_t lane = 2; lane < 4; ++lane) {
+        const auto* first = parameter_wire.data() + 4 + lane * parameter_contract.lane_words;
+        std::copy_n(first, parameter_contract.lane_words,
+            parameter_wire.data() + 4 + parameter_contract.record_words + lane * parameter_contract.lane_words);
+    }
+    const bool parameter_merged = decode_raster_quad_records(parameter_contract,
         parameter_wire.data(),parameter_wire.size(),2,quads).empty();
-    check(parameter_retained && quads.size() == 2 &&
-        quads[0] == std::vector<uint32_t>(parameter_wire.begin() + 4,parameter_wire.begin() + 4 + parameter_contract.record_words) &&
-        quads[1] == std::vector<uint32_t>(parameter_wire.begin() + 4 + parameter_contract.record_words,parameter_wire.end()),
-        "disjoint scopes retain every distinct parameter/system field word for helpers and nonhelpers");
+    check(parameter_merged && quads.size() == 1 &&
+        std::equal(quads[0].begin() + parameter_contract.lane_words, quads[0].begin() + 2 * parameter_contract.lane_words,
+                   parameter_wire.begin() + 4 + parameter_contract.record_words + parameter_contract.lane_words),
+        "a reassembled lane keeps every parameter/system field word of the scope that ran it");
     damaged = partitioned;
     damaged[4 + c.record_words] = 0;
     damaged[4 + c.record_words + 1] = 1;

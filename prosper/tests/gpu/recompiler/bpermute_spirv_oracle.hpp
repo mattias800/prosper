@@ -9,6 +9,7 @@
 #include <bit>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -53,6 +54,7 @@ struct Interpreter {
   std::map<uint32_t, size_t> labels;
   std::map<uint32_t, Memory> shared;
   std::map<uint32_t, bool> readonly_storage;
+  std::map<uint32_t, uint32_t> extra_writable_roots;   // binding -> storage variable
   std::vector<Inst> globals;
   uint32_t main = 0, storage = 0;
   size_t entry = 0;
@@ -590,6 +592,15 @@ struct Interpreter {
                                    const std::vector<uint32_t>& output, uint32_t workgroup_x = 0) {
       return run_buffers(64, {{0, input}, {1, output}}, 1, workgroup_x);
   }
+  // Bindings besides the sink that the shader may legitimately write (an in-place pass). Their
+  // final contents are read back with writable_result() after the run.
+  std::set<uint32_t> extra_writable_bindings;
+  std::vector<uint32_t> writable_result(uint32_t binding) const {
+      const auto root = extra_writable_roots.find(binding);
+      if (root == extra_writable_roots.end()) return {};
+      const auto value = shared.find(root->second);
+      return value == shared.end() ? std::vector<uint32_t>{} : value->second.words;
+  }
   std::vector<uint32_t> run_buffers(uint32_t count,
                                     const std::map<uint32_t, std::vector<uint32_t>>& buffers,
                                     uint32_t sink_binding, uint32_t workgroup_x = 0) {
@@ -599,6 +610,7 @@ struct Interpreter {
           storage = 0;
           shared.clear();
           readonly_storage.clear();
+          extra_writable_roots.clear();
           std::map<uint32_t, bool> seen_bindings;
           std::map<uint32_t, bool> seen_sampled_bindings;
           std::vector<Lane> lanes(count);
@@ -636,6 +648,8 @@ struct Interpreter {
                           fail("unsupported live storage ABI");
                       if (binding->second == sink_binding)
                           storage = a[1];
+                      else if (extra_writable_bindings.contains(binding->second))
+                          extra_writable_roots[binding->second] = a[1];
                       else
                           readonly_storage.emplace(a[1], true);
                       shared[a[1]] = {t, supplied->second,
