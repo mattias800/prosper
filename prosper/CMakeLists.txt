@@ -3225,6 +3225,10 @@ endif()
   target_include_directories(test_gpu_capture PRIVATE tests)
   target_link_libraries(test_gpu_capture PRIVATE prosper_core)
   add_test(NAME gpu_capture_roundtrip COMMAND test_gpu_capture)
+  prosper_add_gtest(test_gpu_capture_observation
+    SOURCES tests/gpu/capture/test_gpu_capture_observation.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
 
   # Actual CPU draw realization -> capture -> replay retains guest width independently of SPIR-V.
   prosper_add_gtest(test_realized_fragment_width
@@ -4196,6 +4200,10 @@ endif()
         INCLUDES frontends src tests
         LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_executable(test_graphics_raw_wide_upload tests/shared/live/test_graphics_raw_wide_upload.cpp)
+      prosper_add_gtest(test_owned_graphics_wave_live
+        SOURCES tests/shared/live/test_owned_graphics_wave_live.cpp
+        INCLUDES frontends src tests
+        LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan)
       target_include_directories(test_graphics_raw_wide_upload PRIVATE frontends src tests)
       target_link_libraries(test_graphics_raw_wide_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME graphics_raw_wide_upload COMMAND test_graphics_raw_wide_upload)
@@ -6066,6 +6074,18 @@ if(TARGET gpu_replay AND Python3_Interpreter_FOUND)
   endif()
 endif()
 
+
+# The common-v69 metadata controls launch the actual tool, so keep them behind its build gate.
+if(TARGET gpu_replay)
+  prosper_add_gtest(test_gpu_capture_observation_cli
+    SOURCES tests/gpu/capture/test_gpu_capture_observation.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core
+    ENVIRONMENT "PROSPER_GPU_REPLAY_TEST_BINARY=$<TARGET_FILE:gpu_replay>"
+    PROPERTIES TIMEOUT 60)
+  target_compile_definitions(test_gpu_capture_observation_cli PRIVATE PROSPER_OBSERVATION_CLI_TESTS=1)
+  add_dependencies(test_gpu_capture_observation_cli gpu_replay)
+endif()
 
 # ---------------------------------------------------------------------------
 # Per-case scratch directory for every registered test (#1613).

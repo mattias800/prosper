@@ -203,7 +203,8 @@ int main(int argc, char** argv) {
     }
     std::vector<uint8_t> bytes;
     const bool roundtrip=serialize_gpu_capture(capture,bytes,error) && deserialize_gpu_capture(bytes,loaded,error);
-    CHECK(roundtrip && loaded.format_version==69,"current codec accepts exact bounded producing profile tails");
+    CHECK(roundtrip && loaded.format_version == 70,
+          "current codec accepts exact bounded producing profile tails");
     if (!roundtrip) { std::printf("codec error: %s\n",error.c_str()); return 1; }
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded,replay,error) && replay.items.size()==draws.size(),
@@ -233,7 +234,14 @@ int main(int argc, char** argv) {
         append32(tail,static_cast<uint32_t>(item.stages.size()));
         for (const auto& stage:item.stages) tail.push_back(static_cast<uint8_t>(stage.recompile_config.float_transport.profile));
     }
-    auto official68 = bytes;
+    // These ordinary draws have no wave plan: v70 is exactly count plus zero flags.
+    const size_t wave_tail = 4u + capture.draws.size();
+    auto official69 = bytes;
+    official69.resize(official69.size() - wave_tail);
+    set32(official69, 8, 69);
+    CHECK(deserialize_gpu_capture(official69, loaded, error) && loaded.format_version == 69,
+          "genuine official v69 retains entry facts without owned-wave authority");
+    auto official68 = official69;
     official68.resize(official68.size() - 4u - kGpuCaptureFragmentEntryRecordBytes*capture.draws.size());
     set32(official68,8,68);
     CHECK(deserialize_gpu_capture(official68,loaded,error) && loaded.format_version==68 &&
@@ -280,7 +288,8 @@ int main(int argc, char** argv) {
     }
     for (size_t end=v66_bytes.size();end<bytes.size();++end) {
         corrupt=bytes; corrupt.resize(end);
-        CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"every truncated v67 launch/v68 nested/v69 entry suffix refuses");
+        CHECK(!deserialize_gpu_capture(corrupt, loaded, error),
+              "every truncated v67 launch/v68 nested/v69 entry/v70 wave suffix refuses");
     }
     corrupt=bytes; corrupt.push_back(0);
     CHECK(!deserialize_gpu_capture(corrupt,loaded,error) && error=="capture has trailing data","strict EOF after new tail");

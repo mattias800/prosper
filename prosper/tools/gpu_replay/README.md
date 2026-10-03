@@ -104,6 +104,11 @@ Normal capture preflights merged resource ranges and rejects plans above 512 MiB
 need, `PROSPER_GPU_CAPTURE_METADATA_ONLY=1` writes a thin capsule with shaders, operations, pipeline
 state, and resource descriptors but no guest resource or RTT bytes. Thin capsules support
 `--inspect-only`, `--validate`, and `--graph`; rendering exits with a concrete error.
+These terminal reports normalize retained metadata and owned bytes without granting raw-stage or
+logical-wave execution admission. `--validate` checks stored SPIR-V descriptor interfaces; it does
+not certify executable raw provenance, and pending stages without stored modules are unavailable.
+Combining a report with raw recompilation, overrides, predecessor replay or exports keeps strict
+materialization and its existing refusal checks. `--graph-json` writes the same dependency report.
 Inspection reports each descriptor's declared size, capture-planned footprint, and captured byte
 count separately, so a thin capsule can still expose a pathological range. Capture v28+ retains the exact
 planned span and reports the resolved `row-pitch` for linear sampled images; older captures derive the

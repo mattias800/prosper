@@ -2986,25 +2986,6 @@ bool guest_writable(uint64_t a, uint32_t n) {
 #endif
 }
 
-// Registered AGC headers publish the shader blob size in bytes. Dynamic descriptor folding used to
-// ignore it and hand the decoder a fixed 0x4000-dword window, allowing the walk to read up to 64 KiB
-// past a short shader. Retain that historical 64 KiB ceiling as a WORK bound too: CreateShader accepts
-// guest metadata, so a corrupt multi-gigabyte shader_size must not become a page-probe/decode/OOM budget.
-// Truncate a non-dword-aligned tail rather than reading one byte beyond the blob, and refuse the bounded
-// span if it is not wholly readable. A zero result safely disables only the optional fold;
-// metadata-described resources remain available to build_stage_table.
-size_t dynamic_fold_shader_dwords(uint32_t shader_size_bytes) {
-    constexpr size_t kMaxDynamicFoldDwords = 0x4000;
-    return std::min<size_t>(shader_size_bytes / sizeof(uint32_t), kMaxDynamicFoldDwords);
-}
-
-size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_addr) {
-    const size_t dwords = dynamic_fold_shader_dwords(header.shader_size);
-    const uint32_t bounded_bytes = static_cast<uint32_t>(dwords * sizeof(uint32_t));
-    if (!bounded_bytes || !guest_readable(code_addr, bounded_bytes)) return 0;
-    return dwords;
-}
-
 // A null BVH marker is only safe when the static ray instruction is inside a real EXEC region. Prove
 // the narrow compiler shape `EXEC writer; s_cbranch_execz MERGE; ... ray ...; MERGE`, and reject any
 // external branch edge into the region. This is intentionally stronger than merely observing an
@@ -7165,9 +7146,21 @@ std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
     return merged;
 }
 
+SharedShaderWords registered_graphics_original(uint64_t address) {
+    const auto* header =
+        static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(address));
+    if (!header) return {};
+    const auto count = registered_shader_dwords(*header, address);
+    if (!count) return {};
+    const auto analysis =
+        decode_shader_cached(reinterpret_cast<const uint32_t*>(uintptr_t(address)), count);
+    return SharedShaderWords(analysis, &analysis->code);
+}
+
 bool draw_requires_owned_nested_snapshot(const GpuState& state) {
     const auto render = extract_render_state(state);
     for (uint64_t address : {render.es_addr, render.ps_addr}) {
+        if (graphics_program_requires_owned_waves(address)) return true;
         const auto* header = static_cast<const AgcShaderHeader*>(
             prosper_agc_shader_header_for_code(address));
         if (!header) continue;

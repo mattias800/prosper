@@ -1820,14 +1820,6 @@ bool emit_cfg_state_machine(
             b.wave_size == 64 && b.local_count == 64 && !b.native_subgroup_size &&
             !initial_active && in.fmt == Rdna2Format::SOP1 && in.opcode == 0x0a;
     };
-    auto portable_readfirstlane_candidate = [&](const Rdna2Inst& in) {
-        return b.portable_readfirstlane_shader && b.is_compute && b.wave_size == 64 &&
-            !b.native_subgroup_size && b.local_count > 0 &&
-            in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02 &&
-            in.src[0].kind == OperandKind::VGPR && in.dst.value >= 0 && in.dst.value <= 107 &&
-            !in.has_sdwa && !in.has_dpp && !in.src_abs[0] && !in.src_neg[0] &&
-            !in.clamp && !in.omod;
-    };
 
     // Split at every branch target/fallthrough and around every cross-lane operation. Case values are
     // dense block indices, not guest PCs. A cross-lane op must end its block so the common synchronized
@@ -1969,9 +1961,9 @@ bool emit_cfg_state_machine(
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
         }
-        if (b.portable_readfirstlane_shader && in.fmt == Rdna2Format::VOP1 &&
+        if (owned_or_portable_readfirstlane_enabled(b) && in.fmt == Rdna2Format::VOP1 &&
             in.opcode == 0x02) {
-            if (!portable_readfirstlane_candidate(in))
+            if (!owned_or_portable_readfirstlane_candidate(b, in))
                 return reject_cfg(in.pc, "portable-readfirstlane-form");
             portable_readfirstlane_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_readfirstlane_event_for_pc.size() + 1));
@@ -6461,6 +6453,9 @@ bool emit_cfg_state_machine(
         // Access and scalar destination writes ignore EXEC. Every invocation publishes its raw
         // value and event/EXEC metadata, including inactive lanes and ended waves. All barriers
         // are in this common dispatcher phase, never beneath guest-wave control flow.
+        // pending/tag are reset on EACH common dispatcher iteration and the source is sampled
+        // anew at its current guest visit. This barrier phase is the dynamic event instance;
+        // the static tag identifies a site, never a memoized value across a backedge.
         const uint32_t pending = b.load_function(b.t_bool, first_pending_var);
         const uint32_t tag = b.load_function(b.t_u32, first_event_var);
         const uint32_t encoded = b.sel(pending,
@@ -6895,7 +6890,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                  (in.src[0].kind == OperandKind::Special &&
                   (in.src[0].value == 106 || in.src[0].value == 126)));
         });
-    const bool portable_compute_readfirstlane = b.portable_readfirstlane_shader &&
+    const bool portable_compute_readfirstlane =
+        owned_or_portable_readfirstlane_enabled(b) &&
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02;
         });

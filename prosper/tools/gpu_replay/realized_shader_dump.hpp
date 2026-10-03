@@ -103,6 +103,11 @@ inline const std::vector<uint32_t>* select_recompiled_shader(
         return nullptr;
     }
     const auto selection = recompiled_shader_view(replay.items[raw(item_index)], selector.vertex);
+    if (!selection.words || selection.words->empty()) {
+        shared = false;
+        error = "realized shader " + spec + " has no available compiled module";
+        return nullptr;
+    }
     shared = selection.shared;
     error.clear();
     return selection.words;
