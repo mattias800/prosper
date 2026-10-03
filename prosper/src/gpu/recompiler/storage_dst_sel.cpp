@@ -5,8 +5,8 @@
 
 namespace prosper::gpu {
 namespace {
-// A refusal drops the whole program, so say which selector caused it. Bounded: one line per
-// distinct (direction, selector word), capped, because the same descriptor recurs every dispatch.
+// A refusal drops the whole program, so say which selector caused it. Capped at 32 lines in total;
+// a refusal happens once per compile-key miss, not once per dispatch.
 void report_refusal(const char* direction, const uint32_t (&swizzle)[4], uint32_t components,
                     const char* why) {
     static std::atomic<unsigned> reported{0};

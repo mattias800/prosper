@@ -56,7 +56,7 @@ std::string make_directory(DumpState& s) {
     const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::high_resolution_clock::now().time_since_epoch()).count();
     char name[96];
-    std::snprintf(name, sizeof name, "refused_shaders_%04d%02u%02u-%02dZ%02d%02d_%06llu",
+    std::snprintf(name, sizeof name, "refused_shaders_%04d%02u%02u-%02d%02d%02dZ_%06llu",
                   (int)ymd.year(), (unsigned)ymd.month(), (unsigned)ymd.day(),
                   (int)hms.hours().count(), (int)hms.minutes().count(),
                   (int)hms.seconds().count(), (unsigned long long)(ns % 1000000));
@@ -84,6 +84,9 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
     const uint64_t hash = hash_code(code, dwords);
     DumpState& s = state();
     std::lock_guard lock(s.mutex);
+    // Record the address for the draw hook's quick skip even when the code is already known: the
+    // same program refused at a second address must not be re-scanned and re-hashed every draw.
+    s.quick.insert({stage, address, code[0]});
     if (s.seen.count({stage, hash})) return false;
     if (s.seen.size() >= kRefusedShaderDumpMaxPrograms) {
         if (!s.cap_announced) {
@@ -95,7 +98,6 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
         return false;
     }
     s.seen.insert({stage, hash});
-    s.quick.insert({stage, address, code[0]});
     if (s.seen.size() >= kRefusedShaderDumpMaxPrograms) s.full.store(true, std::memory_order_relaxed);
     const std::string dir = make_directory(s);
     if (dir.empty()) return false;
