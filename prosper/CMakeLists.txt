@@ -802,6 +802,9 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_fragment_entry_prefix
     SOURCES tests/gpu/execute/test_fragment_entry_prefix.cpp
     INCLUDES tests LIBRARIES prosper_core)
+  prosper_add_gtest(test_ps_pull_model
+    SOURCES tests/gpu/execute/test_ps_pull_model.cpp
+    INCLUDES tests LIBRARIES prosper_core)
 
   # nid_census: every guest import that falls to the dispatcher's return-0 default (#2081).
   # Links prosper_core because both of its inputs must be the real ones — `Module::load` for the
@@ -1169,6 +1172,12 @@ if(TARGET prosper_core)
     add_test(NAME ampr_udata COMMAND test_ampr_udata)
     set_tests_properties(ampr_udata PROPERTIES TIMEOUT 20)
   endif()
+
+  # #4103: force a real equeue allocation to reuse its handle and verify APR lifetime isolation.
+  prosper_add_gtest(test_apr_equeue_lifetime
+    SOURCES tests/hle/kernel/test_apr_equeue_lifetime.cpp
+    LIBRARIES prosper_core
+    PROPERTIES TIMEOUT 20)
 
   # Variadic libc formatters (issue #122): real va_list capture so %f/XMM + stack + %s-past-4th
   # args format correctly (was a 3-integer-register forward). Cross-platform (host libc printf).
@@ -2624,6 +2633,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
   add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
 
+  # Exhaustive per-family opcode/length sweep of the walker (words built from the encoding layout).
+  prosper_add_gtest(test_rdna2_decode_sweep
+    SOURCES tests/gpu/recompiler/test_rdna2_decode_sweep.cpp
+    LIBRARIES prosper_core)
+
   # Structural RDNA2->SPIR-V validation that does not require Vulkan runtime support.
   add_executable(test_rdna2_spirv_struct tests/gpu/test_rdna2_spirv_struct.cpp)
   target_link_libraries(test_rdna2_spirv_struct PRIVATE prosper_core)
@@ -2699,6 +2713,11 @@ if(TARGET prosper_core)
   add_executable(test_raw_register_wide_data tests/gpu/recompiler/test_raw_register_wide_data.cpp)
   target_link_libraries(test_raw_register_wide_data PRIVATE prosper_core)
   add_test(NAME raw_register_wide_data COMMAND test_raw_register_wide_data)
+  prosper_add_gtest(test_raw_wide_flat_read_effects
+    SOURCES tests/gpu/recompiler/test_raw_wide_flat_read_effects.cpp
+            src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_raw_wide_data.cpp
+    INCLUDES src)
   prosper_add_gtest(test_graphics_raw_register_wide_data
     SOURCES tests/gpu/recompiler/test_graphics_raw_register_wide_data.cpp
     LIBRARIES prosper_core)
@@ -5855,6 +5874,9 @@ endif()
 # physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
 # silent pass) where one does not.
 if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  prosper_add_gtest(test_ps_pull_model_exec
+    SOURCES tests/gpu/execute/test_ps_pull_model_exec.cpp
+    INCLUDES tests frontends LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_fragment_entry_prefix_exec
     SOURCES tests/gpu/execute/test_fragment_entry_prefix_exec.cpp
     INCLUDES tests
