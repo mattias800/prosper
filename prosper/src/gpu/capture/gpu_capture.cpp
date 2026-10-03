@@ -19,6 +19,7 @@
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/texture/tile.hpp"
 #include "gpu/present/videoout_present.hpp"
@@ -661,6 +662,215 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
             error = "owned nested replay requires a direct vertex stage"; return false;
         }
         if (d.vrt) d.vrt->vertices_per_instance = d.vertex_count;
+        // A stored native module or a historical format cannot replace the full logical-wave
+        // observation required by this original program. Re-derive the obligation from code.
+        const auto needs_wave_owner = [&](uint32_t raw_index, bool vertex, uint32_t& pc) {
+            pc = UINT32_MAX;
+            if (raw_index == UINT32_MAX) {
+                if (vertex && x.vs_chain_raw_shader_index != UINT32_MAX) {
+                    error = "logical-wave replay linked vertex provenance unavailable stage=vs";
+                    return false;
+                }
+                return true;   // legacy stored stage has no raw observation
+            }
+            if (raw_index >= c.raw_shader_versions.size()) {
+                error = "logical-wave replay original raw index unavailable stage=" +
+                        std::string(vertex ? "vs" : "fs");
+                return false;
+            }
+            const auto& code = c.raw_shader_versions[raw_index].words;
+            std::vector<Rdna2Inst> decoded;
+            const auto inventory = [&](const std::vector<uint32_t>& original, const char* stage,
+                                       std::vector<Rdna2Inst>& instructions) {
+                uint32_t unavailable_pc = UINT32_MAX;
+                if (rdna2_recompile_executable_instructions(original.data(), original.size(),
+                                                            instructions, unavailable_pc))
+                    return true;
+                error =
+                    "logical-wave replay original decode unavailable stage=" + std::string(stage) +
+                    " pc=" +
+                    (unavailable_pc == UINT32_MAX ? "unavailable" : std::to_string(unavailable_pc));
+                return false;
+            };
+            if (vertex && x.vs_chain_raw_shader_index != UINT32_MAX) {
+                const auto prolog = rdna2_vertex_prolog_info(code.data(), code.size());
+                if (!prolog.valid || x.vs_chain_raw_shader_index >= c.raw_shader_versions.size() ||
+                    rdna2_walk(code.data(), prolog.prefix_dwords, decoded) !=
+                        prolog.prefix_dwords ||
+                    decoded.empty() ||
+                    std::any_of(decoded.begin(), decoded.end(), [&](const auto& in) {
+                        if (in.fmt == Rdna2Format::SOP1 && in.opcode >= kSop1OpcodeSetpcB64 &&
+                            in.opcode <= kSop1OpcodeRfeB64)
+                            return true;
+                        if (in.fmt == Rdna2Format::SOPK &&
+                            (in.opcode == kSopkOpcodeCallB64 ||
+                             in.opcode == kSopkOpcodeSubvectorLoopBegin ||
+                             in.opcode == kSopkOpcodeSubvectorLoopEnd))
+                            return true;
+                        if (in.fmt == Rdna2Format::SOPP &&
+                            (in.opcode == 0x11 || in.opcode == kSoppOpcodeTrap ||
+                             (in.opcode >= kSoppOpcodeCbranchCdbgsys &&
+                              in.opcode <= kSoppOpcodeCbranchCdbgsysAndUser)))
+                            return true;
+                        if (in.fmt != Rdna2Format::SOPP || !sopp_opcode_is_direct_branch(in.opcode))
+                            return false;
+                        const int64_t target = int64_t(in.pc) + in.len_dwords + in.simm16;
+                        return target != int64_t(prolog.prefix_dwords) &&
+                               std::none_of(decoded.begin(), decoded.end(), [&](const auto& at) {
+                                   return target == int64_t(at.pc);
+                               });
+                    })) {
+                    error = "logical-wave replay linked vertex provenance unavailable stage=vs";
+                    return false;
+                }
+                std::vector<Rdna2Inst> main;
+                if (!inventory(c.raw_shader_versions[x.vs_chain_raw_shader_index].words, "vs-chain",
+                               main))
+                    return false;
+                // Inventory both linked components, including cross-component READFIRST uses.
+                // The recognized terminal s[6:7] transfer is replaced by fallthrough exactly as
+                // in recompile_vertex_chain; never exempt an arbitrary declared chain index.
+                for (auto& in : main) in.pc += static_cast<uint32_t>(prolog.prefix_dwords);
+                decoded.insert(decoded.end(), main.begin(), main.end());
+            } else if (!inventory(code, vertex ? "vs" : "fs", decoded))
+                return false;
+            const auto required = rdna2_raw_wave_wide_data_loads(decoded);
+            if (!required.empty()) pc = required.front();
+            return true;
+        };
+        for (bool vertex : {true, false}) {
+            uint32_t pc = UINT32_MAX;
+            if (!needs_wave_owner(vertex ? x.vs_raw_shader_index : x.fs_raw_shader_index, vertex,
+                                  pc))
+                return false;
+            if (pc != UINT32_MAX &&
+                (!x.owned_waves ||
+                 !(vertex ? x.owned_waves->vertex_pending : x.owned_waves->fragment_pending))) {
+                error = "logical-wave replay lacks original exact-PC window owners stage=" +
+                        std::string(vertex ? "vs" : "fs") + " pc=" + std::to_string(pc);
+                return false;
+            }
+        }
+        if (x.owned_waves) {
+            if (x.vs_chain_raw_shader_index != UINT32_MAX ||
+                (!x.owned_waves->vertex_pending && !x.owned_waves->fragment_pending)) {
+                error = "owned logical-wave replay lacks a direct stage contract";
+                return false;
+            }
+            auto owner = std::make_shared<GraphicsOwnedWaveDraw>(*x.owned_waves);
+            owner->has_pixel_inputs = d.has_pixel_inputs;
+            owner->pixel_inputs = d.pixel_inputs;
+            owner->fragment_float_mode = d.ps_float_mode;
+            owner->fragment_float_flags = d.ps_float_flags;
+            if (owner->vertex_pending) {
+                if (!d.vs_words().empty() ||
+                    owner->vertex.assembly != GraphicsWaveAssembly::VertexDrawOrder ||
+                    owner->vertex.packets.empty() || owner->vertex.packets.size() > 64u ||
+                    owner->vertex.packets.size() != owner->vertex.invocations.size() ||
+                    x.vs_raw_shader_index >= c.raw_shader_versions.size()) {
+                    error = "owned vertex-wave replay lacks exact raw stage provenance";
+                    return false;
+                }
+                const uint64_t vertices = d.indices.empty() ? d.vertex_count : d.indices.size();
+                if (!vertices || vertices != d.vertex_count || !d.instance_count ||
+                    vertices > 4096u || d.instance_count > 64u ||
+                    vertices * d.instance_count != owner->vertex.packets.size() * uint64_t(64)) {
+                    error = "owned vertex-wave replay draw domain disagrees";
+                    return false;
+                }
+                for (size_t wave = 0; wave < owner->vertex.invocations.size(); ++wave)
+                    for (uint32_t lane = 0; lane < 64u; ++lane) {
+                        const uint64_t ordinal = wave * uint64_t(64) + lane;
+                        const uint64_t occurrence = ordinal % vertices;
+                        const int64_t index =
+                            int64_t(d.indices.empty() ? occurrence : d.indices[occurrence]) +
+                            d.vertex_offset;
+                        const auto& identity = owner->vertex.invocations[wave][lane];
+                        if (index < 0 || index > UINT32_MAX ||
+                            identity.vertex_index != uint32_t(index) ||
+                            identity.instance_index != ordinal / vertices) {
+                            error = "owned vertex-wave replay invocation identity disagrees";
+                            return false;
+                        }
+                    }
+                for (const auto& packet : owner->vertex.packets) {
+                    if (packet.stage != GraphicsPacketStage::Vertex ||
+                        packet.guest_code != c.raw_shader_versions[x.vs_raw_shader_index].words ||
+                        packet.float_transport != d.float_transport ||
+                        !complete_graphics_packet_locals(packet, error, false) ||
+                        !validate_graphics_raw_wave_windows(packet.guest_code, packet.sgprs,
+                                                            packet.raw_windows, error) ||
+                        recompile_fragment_packet(packet).spirv.empty()) {
+                        if (error.empty())
+                            error = "owned vertex-wave replay input admission refused";
+                        return false;
+                    }
+                }
+            }
+            if (owner->fragment_pending) {
+                if (!d.fs_words().empty() || !d.fragment_wave_config_available || d.ps_wave32 ||
+                    !d.ps_launch_rsrc1.available || !d.ps_entry.observed ||
+                    !d.ps_entry.rsrc2_available || !owner->fragment_code ||
+                    x.fs_raw_shader_index >= c.raw_shader_versions.size() ||
+                    *owner->fragment_code != c.raw_shader_versions[x.fs_raw_shader_index].words ||
+                    !validate_graphics_raw_wave_windows(*owner->fragment_code,
+                                                        owner->fragment_scalars,
+                                                        owner->fragment_windows, error)) {
+                    if (error.empty())
+                        error = "owned fragment-wave replay lacks exact raw stage provenance";
+                    return false;
+                }
+                // Keep the producing PS0 loaded-prefix contract independent from mere physical
+                // USER_DATA presence. Captured owners retain its actual normalized entry words.
+                namespace P = prosper::agc::Pm4;
+                const uint32_t loaded =
+                    ((d.ps_entry.rsrc2 >> P::SPI_SHADER_PGM_RSRC2_PS_USER_SGPR_SHIFT) &
+                     P::SPI_SHADER_PGM_RSRC2_PS_USER_SGPR_MASK) |
+                    (((d.ps_entry.rsrc2 >> P::SPI_SHADER_PGM_RSRC2_PS_USER_SGPR_MSB_SHIFT) &
+                      P::SPI_SHADER_PGM_RSRC2_PS_USER_SGPR_MSB_MASK)
+                     << 5u);
+                if (loaded > d.ps_entry.user_data.size()) {
+                    error = "owned fragment-wave replay user prefix count out of range";
+                    return false;
+                }
+                std::vector<std::pair<uint32_t, uint32_t>> observed_scalars;
+                for (uint32_t word = 0; word < loaded; ++word)
+                    if (d.ps_entry.user_data_available & (uint32_t(1) << word))
+                        observed_scalars.emplace_back(word, d.ps_entry.user_data[word]);
+                if (!loaded || observed_scalars != owner->fragment_scalars) {
+                    error = "owned fragment-wave replay entry observation disagrees";
+                    return false;
+                }
+                auto inputs = std::make_shared<RasterQuadInputs>();
+                inputs->source_vs = std::make_shared<const std::vector<uint32_t>>(d.vs_words());
+                inputs->source_gs = std::make_shared<const std::vector<uint32_t>>(d.gs_words());
+                inputs->source_fs = std::make_shared<const std::vector<uint32_t>>();
+                inputs->raw_code = owner->fragment_code;
+                inputs->raw_matches_producing_source = true;
+                inputs->owned_wave_pending = true;
+                inputs->pixel_inputs = d.pixel_inputs;
+                inputs->has_pixel_inputs = d.has_pixel_inputs;
+                inputs->system_inputs = d.system_inputs;
+                inputs->has_system_inputs = d.has_system_inputs;
+                inputs->launch = d.ps_raster_launch;
+                inputs->entry = d.ps_entry;
+                inputs->float_mode = d.ps_float_mode;
+                inputs->float_flags = d.ps_float_flags;
+                inputs->launch_rsrc1 = d.ps_launch_rsrc1;
+                inputs->float_transport = d.float_transport;
+                inputs->ps_resources = own_fragment_packet_resources(d.prt.get());
+                inputs->interpolation = fragment_interpolation_layout(
+                    owner->fragment_code->data(), owner->fragment_code->size(),
+                    d.has_system_inputs ? &d.system_inputs : nullptr,
+                    d.has_pixel_inputs ? &d.pixel_inputs : nullptr);
+                // Geometry remains an independent producing-stage contract. Unsupported topology
+                // is refused by collection instead of inferring initialization from its presence.
+                inputs->generated_interpolation_geometry =
+                    !d.gs.empty() && inputs->interpolation.requires_geometry;
+                owner->fragment_raster_inputs = std::move(inputs);
+            }
+            d.owned_waves = std::move(owner);
+        }
         out.items.push_back(std::move(d));
     }
     out.computes.reserve(c.computes.size());

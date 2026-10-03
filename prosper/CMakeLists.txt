@@ -4116,6 +4116,10 @@ endif()
       target_link_libraries(test_float32_array_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME float32_array_upload COMMAND test_float32_array_upload)
       add_executable(test_graphics_raw_wide_upload tests/shared/live/test_graphics_raw_wide_upload.cpp)
+      prosper_add_gtest(test_owned_graphics_wave_live
+        SOURCES tests/shared/live/test_owned_graphics_wave_live.cpp
+        INCLUDES frontends src tests
+        LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan)
       target_include_directories(test_graphics_raw_wide_upload PRIVATE frontends src tests)
       target_link_libraries(test_graphics_raw_wide_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME graphics_raw_wide_upload COMMAND test_graphics_raw_wide_upload)

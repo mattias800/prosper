@@ -39,6 +39,90 @@ using GraphicsProducerStatusFn = std::function<GraphicsProducerStatus()>;
 void set_graphics_producer_status_query(GraphicsProducerStatusFn fn);
 GraphicsProducerStatus graphics_producer_status();
 
+// Observe the complete certified runtime domain BEFORE any compiler/stage consumes source bytes.
+// This produces packet inputs, not a live stage membership or output-commit certificate. A caller
+// without a complete ordered producer context or authenticated direct allocation gets no owners.
+bool observe_graphics_raw_wave_windows(
+    const std::vector<uint32_t>& original,
+    const std::vector<std::pair<uint32_t, uint32_t>>& entry_scalars,
+    const GraphicsRawSnapshotContext* context, std::vector<PacketRawWaveWindow>& windows,
+    std::string& refusal);
+// Captured/owned bytes are inputs, not a proof token. This independently rederives every exact
+// PC, original no-writer certificate, entry base and complete selected byte domain.
+bool validate_graphics_raw_wave_windows(
+    const std::vector<uint32_t>& original,
+    const std::vector<std::pair<uint32_t, uint32_t>>& entry_scalars,
+    const std::vector<PacketRawWaveWindow>& windows, std::string& refusal);
+
+// Explicit MED logical assembly policy. It owns architectural invocation identities and the
+// selected inputs; it makes no claim about PS5 physical scheduler occupancy/quad interleave.
+// Full64 currently means every slot is an actual initialized invocation. Partial final groups
+// are refused here rather than filled with invented inputs or called a complete Wave64.
+enum class GraphicsWaveAssembly : uint8_t { VertexDrawOrder, FragmentPrimitiveQuadOrder };
+struct GraphicsWaveInvocation {
+    uint32_t vertex_index = 0, instance_index = 0, primitive_index = 0;
+    std::array<uint32_t, 4> fragcoord{};
+    bool helper = false;
+};
+struct GraphicsWaveStagePlan {
+    GraphicsWaveAssembly assembly = GraphicsWaveAssembly::VertexDrawOrder;
+    std::vector<FragmentInvocationPacket> packets;
+    std::vector<std::array<GraphicsWaveInvocation, kFragmentPacketLanes>> invocations;
+};
+// Completed private scratch records, validated against the exact chosen ISA/input plan before
+// any guest attachment is touched. Failure never publishes a partial earlier wave transaction.
+struct GraphicsWaveOutputTransaction {
+    std::vector<std::vector<uint32_t>> records;
+};
+// Immutable deferred live-stage input. A missing native module is permitted only with this
+// typed plan; every byte was admitted at the ordered producer boundary, not at backend lookup.
+struct GraphicsOwnedWaveDraw {
+    bool vertex_pending = false, fragment_pending = false;
+    GraphicsWaveStagePlan vertex;
+    std::shared_ptr<const std::vector<uint32_t>> fragment_code;
+    std::vector<std::pair<uint32_t, uint32_t>> fragment_scalars;
+    std::vector<PacketRawWaveWindow> fragment_windows;
+    PixelInputMapping pixel_inputs{};
+    bool has_pixel_inputs = false;
+    FragmentFloatMode fragment_float_mode{};
+    FragmentFloatFlags fragment_float_flags{};
+    std::shared_ptr<const struct RasterQuadInputs> fragment_raster_inputs;
+};
+bool validate_graphics_wave_outputs(const GraphicsWaveStagePlan& plan,
+                                    const std::vector<std::vector<uint32_t>>& completed_records,
+                                    GraphicsWaveOutputTransaction& transaction,
+                                    std::string& refusal);
+struct GraphicsVertexExportCommit {
+    std::vector<uint32_t> shader, words;
+    uint32_t vertices_per_instance = 0, instances = 0, record_words = 0;
+};
+bool prepare_owned_vertex_export_commit(const GraphicsWaveStagePlan& plan,
+                                        const GraphicsWaveOutputTransaction& transaction,
+                                        const PixelInputMapping* pixel_inputs,
+                                        GraphicsVertexExportCommit& commit, std::string& refusal);
+struct GraphicsFragmentExportCommit {
+    std::vector<uint32_t> shader, words;
+    uint32_t records = 0;
+};
+bool prepare_owned_fragment_export_commit(const GraphicsWaveStagePlan& plan,
+                                          const GraphicsWaveOutputTransaction& transaction,
+                                          GraphicsFragmentExportCommit& commit,
+                                          std::string& refusal);
+struct RasterQuadInputs;
+struct RasterQuadResult;
+bool prepare_owned_vertex_waves(const std::vector<uint32_t>& original,
+                                const std::vector<std::pair<uint32_t, uint32_t>>& entry_scalars,
+                                const std::vector<uint32_t>& owned_indices,
+                                uint32_t nonindexed_count, int32_t vertex_offset,
+                                uint32_t instance_count, FloatTransportConfig profile,
+                                const GraphicsRawSnapshotContext* context,
+                                GraphicsWaveStagePlan& plan, std::string& refusal);
+bool prepare_owned_fragment_waves(const RasterQuadInputs& inputs, const RasterQuadResult& raster,
+                                  const std::vector<std::pair<uint32_t, uint32_t>>& entry_scalars,
+                                  const std::vector<PacketRawWaveWindow>& observed_windows,
+                                  FragmentFloatMode float_mode, FragmentFloatFlags float_flags,
+                                  GraphicsWaveStagePlan& plan, std::string& refusal);
+
 // One reader/lease per stage realization. The first exact-PC probe copies the effective load;
 // the scalar fold and emitted resource consume that same owner, never a second guest read.
 class GraphicsNestedWideReader final : public FoldReader {

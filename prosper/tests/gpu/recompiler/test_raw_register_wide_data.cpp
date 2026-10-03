@@ -84,6 +84,104 @@ int main(int argc, char** argv) {
     firstlane.insert(firstlane.begin(), 0x7e040500u); // v_readfirstlane_b32 s2,v0
     CHECK(proof(firstlane).empty() && !table_for(firstlane).by_fetch_pc(2),
           "offset dependency from readfirstlane remains unbacked");
+    // A code certificate is separate from realizing memory or stage membership. The raw source
+    // can be any u32 in any guest lane; AND bounds every selected value and the checked shift
+    // proves alignment without looking at synthetic inputs. No graphics first-lane shortcut is
+    // enabled by these pure proof controls.
+    const auto wave_proof = [](const std::vector<uint32_t>& code) {
+        std::vector<Rdna2Inst> decoded;
+        rdna2_walk(code.data(), code.size(), decoded);
+        return rdna2_raw_wave_wide_certificates(decoded);
+    };
+    const auto obligation = [](const std::vector<uint32_t>& code) {
+        std::vector<Rdna2Inst> decoded;
+        rdna2_walk(code.data(), code.size(), decoded);
+        return rdna2_raw_wave_wide_data_loads(decoded);
+    };
+    CHECK(
+        obligation(x4).empty() && obligation(firstlane) == std::vector<uint32_t>{2u},
+        "ordinary backing stays independent; unbounded READFIRST retains its original obligation");
+    for (bool width8 : {false, true}) {
+        const std::vector<uint32_t> bounded{
+            0x7e280500u,              // READFIRST s20,v0 (no source range premise)
+            0x87148f14u,              // AND s20,s20,15
+            0x8f148414u,              // LSHL s20,s20,4
+            width8 ? 0xf40c0200u : 0xf4080200u,
+            0x28000010u,
+            width8 ? 0x7e00020fu : 0x7e00020bu,
+            0xbf810000u};
+        const auto certificate = wave_proof(bounded);
+        CHECK(
+            certificate.size() == 1u && certificate[0].load_pc == 3u &&
+                certificate[0].base_sgpr == 0u && certificate[0].offset_sgpr == 20u &&
+                certificate[0].bytes == (width8 ? 32u : 16u) && certificate[0].offset_min == 0u &&
+                certificate[0].offset_max == 240u && certificate[0].immediate == 16 &&
+                certificate[0].alignment == 16u &&
+                certificate[0].event_pcs == std::vector<uint32_t>{0u} &&
+                certificate[0].definition_pcs == std::vector<uint32_t>({0u, 1u, 2u}),
+            "raw x4/x8 complete selector certificate includes event, bounds and final load width");
+        auto unbounded = bounded;
+        unbounded.erase(unbounded.begin() + 1);
+        CHECK(wave_proof(unbounded).empty(),
+              "unbounded selected word cannot be shifted into a window");
+        CHECK(obligation(unbounded) == std::vector<uint32_t>{2u},
+              "a refused selector bound cannot erase raw replay ownership");
+        auto over_budget = bounded;
+        over_budget.insert(over_budget.end() - 1, 513u, 0xbf800000u);
+        CHECK(wave_proof(over_budget).empty() &&
+                  obligation(over_budget) == std::vector<uint32_t>{3u},
+              "proof-size refusal leaves the exact original raw load visible");
+        auto unsupported_ds = bounded;
+        unsupported_ds.insert(unsupported_ds.end() - 1, {0xd8000000u, 0u});
+        CHECK(wave_proof(unsupported_ds).empty() &&
+                  obligation(unsupported_ds) == std::vector<uint32_t>{3u},
+              "unimplemented DS cannot downgrade a numeric-load obligation into stored authority");
+        auto wrap = bounded;
+        wrap[2] = 0x8f149f14u; // shift31: max15 cannot fit u32
+        CHECK(wave_proof(wrap).empty(),
+              "selector unsigned wrap is a refusal, not interval truncation");
+        auto unaligned = bounded;
+        unaligned.erase(unaligned.begin() + 2);
+        CHECK(wave_proof(unaligned).empty(), "unaligned AND15 offsets cannot claim dword loads");
+        auto crossed = bounded;
+        crossed[3] = (crossed[3] & ~(0x7fu << 6u)) | ((width8 ? 100u : 104u) << 6u);
+        CHECK(wave_proof(crossed).empty(), "wave numeric destination crossing VCC remains refused");
+        auto legal = bounded;
+        legal[3] = (legal[3] & ~(0x7fu << 6u)) | ((width8 ? 98u : 102u) << 6u);
+        legal[5] = 0x7e000269u; // final ordinary SGPR105
+        CHECK(wave_proof(legal).size() == 1u,
+              "highest ordinary x4/x8 destination endpoint stays eligible");
+        auto bypass = bounded;
+        bypass.insert(bypass.begin(), 0xbf840001u); // skip READFIRST on one path
+        CHECK(wave_proof(bypass).empty(),
+              "a bypassed READFIRST cannot borrow another path's event");
+        auto pointer_clobber = bounded;
+        pointer_clobber.insert(pointer_clobber.end() - 1, 0xbe800380u);
+        CHECK(wave_proof(pointer_clobber).empty(),
+              "full original code authenticates both entry base words");
+        auto writer = bounded;
+        writer.insert(writer.end() - 1, {0xe0700000u, 0x80000000u});
+        CHECK(wave_proof(writer).empty(),
+              "a later original-program guest writer vetoes snapshot authority");
+        auto joined = bounded;
+        joined.insert(joined.begin() + 2, {0xbf840002u, 0x8f148414u, 0xbf820001u});
+        joined[5] = 0x8f148514u; // other arm shifts5, so the union must include offset480
+        const auto union_certificate = wave_proof(joined);
+        CHECK(union_certificate.size() == 1u && union_certificate[0].offset_max == 480u &&
+                  union_certificate[0].alignment == 16u &&
+                  union_certificate[0].control_pcs == std::vector<uint32_t>({2u, 4u}),
+              "forward join retains the complete offset union rather than the first reaching arm");
+        // A hidden SCC dependency must not be washed away by a later ordinary scalar cselect.
+        auto scc = bounded;
+        scc.insert(scc.begin() + 2, {0x8514fd14u});   // CSELECT s20,s20,Special253
+        CHECK(!wave_proof(scc).empty(),
+              "modeled AND SCC and direct Special253 remain in the closure");
+        auto poisoned_scc = scc;
+        poisoned_scc.insert(poisoned_scc.begin() + 2,
+                            0xbe95106au);   // BCNT VCC is outside scalar grammar
+        CHECK(wave_proof(poisoned_scc).empty(),
+              "unproved implicit SCC cannot launder a bounded selector");
+    }
     auto vcc = x4;
     vcc[0] = 0x8f6b8402u; // s_lshl_b32 vcc_hi,s2,4
     vcc[2] = 0xd6000010u;
@@ -168,22 +266,23 @@ int main(int argc, char** argv) {
           std::memcmp(replay.computes[0].resources->resources[0].host_data,
                       blob.bytes.data(), blob.bytes.size()) == 0,
           "replay preserves the rebased range and its owned current bytes");
-    // One compute resource, no draw/failure records: flags F8, transport T13, owned U8, mode M8, width W4;
-    // the v68 nested-snapshot tail adds a second owned-width U8 and the v69 realized-draw fragment-entry tail is
-    // just its u32 count (4 bytes) because this capture has no draws.
+    // No draws: entry69 and wave70 each append only their independently framed zero count.
+    constexpr size_t empty_draw_tail_bytes = 8u;
     constexpr size_t flags_tail_bytes = 8u;
     constexpr size_t transport_tail_bytes = 13u;
     constexpr size_t owned_tail_bytes = 8u;
     constexpr size_t mode_tail_bytes = 8u;
     constexpr size_t width_tail_bytes = 4u;
-    constexpr size_t entry_tail_bytes = 4u;
     constexpr size_t backing_tail_bytes = 5u;
-    CHECK(encoded.size() >= flags_tail_bytes + transport_tail_bytes + 2u * owned_tail_bytes + entry_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes &&
-          encoded[8] == 69u,
+    CHECK(encoded.size() >= empty_draw_tail_bytes + flags_tail_bytes + transport_tail_bytes + 2u * owned_tail_bytes +
+                                mode_tail_bytes + width_tail_bytes + backing_tail_bytes &&
+              encoded[8] == 70u,
           "legacy controls require the current versioned capture tail");
-    if (encoded.size() >= flags_tail_bytes + transport_tail_bytes + 2u * owned_tail_bytes + entry_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes) {
+    if (encoded.size() >= empty_draw_tail_bytes + flags_tail_bytes + transport_tail_bytes +
+                              2u * owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes) {
         auto v64 = encoded;
-        v64.resize(v64.size() - flags_tail_bytes - transport_tail_bytes - 2u * owned_tail_bytes - entry_tail_bytes);
+        v64.resize(v64.size() - empty_draw_tail_bytes - flags_tail_bytes - transport_tail_bytes -
+                   2u * owned_tail_bytes);
         v64[8] = 64u;
         CHECK(deserialize_gpu_capture(v64, decoded, error) &&
               decoded.computes[0].resources.resources[0].resource.raw_register_snapshot &&

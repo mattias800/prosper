@@ -228,6 +228,10 @@ struct GpuCapturedDraw {
     FragmentEntryFacts ps_entry{}; // v69: observed window, not launched/required SGPRs
     RasterLaunchFacts ps_raster_launch{};
     bool ps_entry_source_available = false; // immutable producing raw/SOURCE pair retained
+    // v70: exact chosen logical-wave inputs and immutable complete raw windows. No serialized
+    // proof grants admission: materialization/compiler independently rederive original-PC bounds
+    // and initialization; stored and raw rendering use the same owned execution transaction.
+    std::shared_ptr<const GraphicsOwnedWaveDraw> owned_waves;
 };
 
 struct GpuCapturedCompute {

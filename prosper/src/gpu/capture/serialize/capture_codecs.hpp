@@ -117,6 +117,177 @@ struct Reader {
     }
 };
 
+// v70 uses a separate owned input tail. The official v69 entry/launch prefix is unchanged.
+// Wire bounds are storage limits, not selector/byte authority; the compiler rederives that from
+// the complete original stream and exact entry base before any execution or output publication.
+inline bool write_owned_wave_inputs(Writer& w, const std::vector<uint32_t>& code,
+                                    const std::vector<std::pair<uint32_t, uint32_t>>& scalars,
+                                    const std::vector<PacketRawWaveWindow>& windows) {
+    if (code.empty() || code.size() > 4096u || scalars.size() > 106u || windows.empty() ||
+        windows.size() > 8u)
+        return false;
+    uint64_t words = 0;
+    for (const auto& window : windows) {
+        words += window.words.size();
+        if (window.words.empty() || words > 16u * 1024u * 1024u) return false;
+    }
+    w.words(code);
+    w.u32(uint32_t(scalars.size()));
+    for (const auto& [reg, value] : scalars) {
+        w.u32(reg);
+        w.u32(value);
+    }
+    w.u32(uint32_t(windows.size()));
+    for (const auto& window : windows) {
+        w.u32(window.load_pc);
+        w.u64(window.guest_base);
+        w.u64(window.guest_begin);
+        w.words(window.words);
+    }
+    return true;
+}
+inline bool read_owned_wave_inputs(Reader& r, std::vector<uint32_t>& code,
+                                   std::vector<std::pair<uint32_t, uint32_t>>& scalars,
+                                   std::vector<PacketRawWaveWindow>& windows) {
+    uint32_t count = 0;
+    if (!r.words_bounded(code, 4096u, "invalid logical-wave code extent") || code.empty() ||
+        !r.u32(count) || count > 106u || uint64_t(count) * 8u > r.left)
+        return false;
+    scalars.resize(count);
+    for (auto& [reg, value] : scalars)
+        if (!r.u32(reg) || !r.u32(value)) return false;
+    if (!r.u32(count) || !count || count > 8u) return false;
+    windows.resize(count);
+    uint64_t words = 0;
+    for (auto& window : windows) {
+        if (!r.u32(window.load_pc) || !r.u64(window.guest_base) || !r.u64(window.guest_begin) ||
+            !r.words_bounded(window.words, 16u * 1024u * 1024u,
+                             "invalid logical-wave window extent") ||
+            window.words.empty())
+            return false;
+        words += window.words.size();
+        if (words > 16u * 1024u * 1024u) return false;
+    }
+    return true;
+}
+inline bool write_owned_wave_draw(Writer& w, const GpuCapturedDraw& draw, std::string& error) {
+    const auto& owner = draw.owned_waves;
+    if (!owner) {
+        w.u8(0u);
+        return true;
+    }
+    const uint8_t flags = uint8_t(owner->vertex_pending) | (uint8_t(owner->fragment_pending) << 1u);
+    if (!flags || draw.vs_chain_raw_shader_index != UINT32_MAX) return false;
+    w.u8(flags);
+    if (owner->vertex_pending) {
+        const auto& plan = owner->vertex;
+        if (plan.assembly != GraphicsWaveAssembly::VertexDrawOrder || plan.packets.empty() ||
+            plan.packets.size() > 64u || plan.packets.size() != plan.invocations.size())
+            return false;
+        const auto& first = plan.packets.front();
+        if (!write_owned_wave_inputs(w, first.guest_code, first.sgprs, first.raw_windows))
+            return false;
+        uint64_t window_words = 0;
+        for (const auto& window : first.raw_windows) window_words += window.words.size();
+        if (window_words * plan.packets.size() > 16u * 1024u * 1024u) return false;
+        w.u32(uint32_t(plan.packets.size()));
+        for (size_t wave = 0; wave < plan.packets.size(); ++wave) {
+            const auto& packet = plan.packets[wave];
+            if (packet.float_mode != FragmentFloatMode{} ||
+                packet.float_flags != FragmentFloatFlags{} ||
+                packet.quad_topology != FragmentPacketQuadTopology::Unknown) {
+                error =
+                    "owned logical-wave VS codec cannot retain mode/flags/topology wave=" +
+                    std::to_string(wave) + " pc=" +
+                    std::to_string(packet.raw_windows.empty() ? UINT32_MAX
+                                                              : packet.raw_windows.front().load_pc);
+                return false;
+            }
+            if (packet.stage != GraphicsPacketStage::Vertex ||
+                packet.guest_code != first.guest_code || packet.sgprs != first.sgprs ||
+                packet.raw_windows.size() != first.raw_windows.size() ||
+                packet.float_transport != draw.float_transport || packet.vgprs.size() != 2u ||
+                packet.vgprs[0].reg != 0u || packet.vgprs[1].reg != 3u ||
+                packet.exec_mask != UINT64_MAX || packet.vcc_mask || packet.scc ||
+                !packet.mask_state_available ||
+                !std::all_of(packet.slots_available.begin(), packet.slots_available.end(),
+                             [](bool b) { return b; }) ||
+                !std::all_of(packet.export_enabled.begin(), packet.export_enabled.end(),
+                             [](uint32_t b) { return b == 1u; }))
+                return false;
+            for (size_t index = 0; index < first.raw_windows.size(); ++index) {
+                const auto& a = packet.raw_windows[index];
+                const auto& b = first.raw_windows[index];
+                if (a.load_pc != b.load_pc || a.guest_base != b.guest_base ||
+                    a.guest_begin != b.guest_begin || a.words != b.words)
+                    return false;
+            }
+            for (uint32_t lane = 0; lane < kFragmentPacketLanes; ++lane) {
+                const auto& invocation = plan.invocations[wave][lane];
+                if (invocation.helper || invocation.vertex_index != packet.vgprs[0].words[lane] ||
+                    invocation.instance_index != packet.vgprs[1].words[lane])
+                    return false;
+                w.u32(invocation.vertex_index);
+                w.u32(invocation.instance_index);
+            }
+        }
+    }
+    return !owner->fragment_pending ||
+           (owner->fragment_code &&
+            write_owned_wave_inputs(w, *owner->fragment_code, owner->fragment_scalars,
+                                    owner->fragment_windows));
+}
+inline bool read_owned_wave_draw(Reader& r, GpuCapturedDraw& draw) {
+    uint8_t flags = 0;
+    if (!r.u8(flags) || flags > 3u) return false;
+    if (!flags) return true;
+    if (draw.vs_chain_raw_shader_index != UINT32_MAX) return false;
+    auto owner = std::make_shared<GraphicsOwnedWaveDraw>();
+    owner->vertex_pending = flags & 1u;
+    owner->fragment_pending = flags & 2u;
+    if (owner->vertex_pending) {
+        FragmentInvocationPacket first;
+        if (!read_owned_wave_inputs(r, first.guest_code, first.sgprs, first.raw_windows))
+            return false;
+        uint32_t count = 0;
+        if (!r.u32(count) || !count || count > 64u || uint64_t(count) * 512u > r.left) return false;
+        uint64_t window_words = 0;
+        for (const auto& window : first.raw_windows) window_words += window.words.size();
+        if (window_words * count > 16u * 1024u * 1024u) return false;
+        first.stage = GraphicsPacketStage::Vertex;
+        first.float_transport = draw.float_transport;
+        first.exec_mask = UINT64_MAX;
+        first.mask_state_available = true;
+        first.slots_available.fill(true);
+        first.export_enabled.fill(1u);
+        auto& plan = owner->vertex;
+        plan.assembly = GraphicsWaveAssembly::VertexDrawOrder;
+        for (uint32_t wave = 0; wave < count; ++wave) {
+            auto packet = first;
+            FragmentPacketVgpr vertex, instance;
+            vertex.reg = 0u;
+            instance.reg = 3u;
+            std::array<GraphicsWaveInvocation, kFragmentPacketLanes> invocations;
+            for (uint32_t lane = 0; lane < kFragmentPacketLanes; ++lane) {
+                if (!r.u32(vertex.words[lane]) || !r.u32(instance.words[lane])) return false;
+                invocations[lane].vertex_index = vertex.words[lane];
+                invocations[lane].instance_index = instance.words[lane];
+            }
+            packet.vgprs = {std::move(vertex), std::move(instance)};
+            plan.packets.push_back(std::move(packet));
+            plan.invocations.push_back(invocations);
+        }
+    }
+    if (owner->fragment_pending) {
+        std::vector<uint32_t> code;
+        if (!read_owned_wave_inputs(r, code, owner->fragment_scalars, owner->fragment_windows))
+            return false;
+        owner->fragment_code = std::make_shared<const std::vector<uint32_t>>(std::move(code));
+    }
+    draw.owned_waves = std::move(owner);
+    return true;
+}
+
 // v43 (#1459): the raw color-state triple behind a resolved color write mask. Presence is packed
 // alongside the values because "absent" and "present with value 0" resolve to opposite masks —
 // write-all versus write-nothing — and only the raw registers distinguish them offline.

@@ -292,6 +292,23 @@ TEST(FragmentResourcePacket, CompletionAndOwnershipAreCompileTimeObligations) {
     p = fixture::chain(); p.invocation.guest_code[4] &= ~(255u << 18); // actual P1 VDST=VSRC=v0
     reject(p, "packet-parameter-p1-alias-mode-unavailable", "P1 alias cannot assume unknown HALF_LDS mode");
 }
+TEST(FragmentResourcePacket, IntegerWaveExtensionsDoNotExpandResourceInputAuthority) {
+    const auto good = fixture::arithmetic(3u, fixture::bits(0.25f), fixture::bits(0.5f), 0x30u);
+    ASSERT_FALSE(compile(good).packet.spirv.empty());
+    auto bad = good;
+    bad.invocation.raw_windows.emplace_back();
+    reject(bad, "packet-resource-raw-window-domain-unimplemented",
+           "raw-window authority does not mix with resource packet ownership");
+    bad = good;
+    std::erase_if(bad.invocation.vgprs, [](const auto& column) { return column.reg == 2u; });
+    reject(bad, "packet-vgpr-input-unavailable",
+           "resource packet still requires supplied destination storage despite a guest writer");
+    for (uint32_t opcode : {0x04u, 0x16u, 0x1bu}) {
+        bad = fixture::arithmetic(opcode, fixture::bits(0.25f), fixture::bits(0.5f), 0x30u);
+        reject(bad, "packet-valu-op-unimplemented",
+               "integer live bridge opcode does not widen the closed resource packet slice");
+    }
+}
 TEST(FragmentResourcePacket, AlignedSmemWriterAndActualReachingP2Destination) {
     const auto directory = dump_directory();
     auto p = fixture::chain();

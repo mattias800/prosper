@@ -789,6 +789,318 @@ std::vector<uint32_t> rdna2_owned_raw_wide_data_loads(const std::vector<Rdna2Ins
     return owned;
 }
 
+std::vector<uint32_t> rdna2_raw_wave_wide_data_loads(const std::vector<Rdna2Inst>& ins) {
+    if (std::none_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+            return in.fmt == Rdna2Format::VOP1 && in.opcode == 2u;
+        }))
+        return {};
+    const auto numeric = rdna2_raw_wide_data_loads(ins);
+    const auto immediate = rdna2_proven_raw_immediate_wide_data_loads(ins);
+    const auto ordinary = rdna2_proven_raw_register_wide_data_loads(ins);
+    const auto nested = rdna2_proven_raw_nested_wide_data_loads(ins);
+    std::vector<uint32_t> required;
+    for (uint32_t pc : numeric)
+        if (!std::binary_search(immediate.begin(), immediate.end(), pc) &&
+            !std::binary_search(ordinary.begin(), ordinary.end(), pc) &&
+            !std::binary_search(nested.begin(), nested.end(), pc))
+            required.push_back(pc);
+    // MAY population, not an admission certificate: independently proved ordinary paths keep
+    // their own owners; every remaining numeric load coexisting with a guest-wave read needs
+    // logical-wave admission. Unknown instructions and certificate budgets never erase this.
+    return required;
+}
+
+std::vector<RawWaveWideCertificate>
+rdna2_raw_wave_wide_certificates(const std::vector<Rdna2Inst>& ins) {
+    // Bounded abstract interpretation, not the emitter's copying-only lane-local taint. Unknown
+    // reaching definitions, implicit SCC dependencies and unsigned wrap cannot acquire a bound.
+    // Forward joins union BOTH definitions; a loop must reach a finite fixed point without a cap
+    // changing guest execution. The budget below declines a proof, never truncates execution/data.
+    if (ins.empty() || ins.size() > 512 || !ins.back().is_end) return {};
+    struct Value {
+        bool uniform = false;
+        uint32_t lo = 0, hi = UINT32_MAX, alignment = 1;
+        std::vector<uint32_t> events, definitions;
+        bool event_defined = false;   // MUST, unlike the MAY dependency inventory
+        bool operator==(const Value&) const = default;
+    };
+    struct State {
+        std::array<Value, 106> scalar;
+        Value scc;
+        bool operator==(const State&) const = default;
+    };
+    const auto unite = [](std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
+        a.insert(a.end(), b.begin(), b.end());
+        std::sort(a.begin(), a.end());
+        a.erase(std::unique(a.begin(), a.end()), a.end());
+    };
+    const auto join = [&](Value a, const Value& b) {
+        a.uniform &= b.uniform;
+        a.lo = std::min(a.lo, b.lo);
+        a.hi = std::max(a.hi, b.hi);
+        a.alignment = std::min(a.alignment, b.alignment);
+        unite(a.events, b.events);
+        unite(a.definitions, b.definitions);
+        a.event_defined &= b.event_defined;
+        return a;
+    };
+    const auto constant = [](uint32_t bits) {
+        return Value{true, bits, bits, bits ? (bits & (0u - bits)) : 0x80000000u, {}, {}};
+    };
+    std::unordered_map<uint32_t, size_t> by_pc;
+    std::vector<std::vector<size_t>> edges(ins.size());
+    std::vector<uint32_t> controls;
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const auto& in = ins[i];
+        if (!in.len_dwords || in.fmt == Rdna2Format::Unknown || rdna2_may_write_guest_memory(in) ||
+            in.fmt == Rdna2Format::DS || !by_pc.emplace(in.pc, i).second ||
+            (i && ins[i - 1].pc + ins[i - 1].len_dwords != in.pc))
+            return {};
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u)
+            return {};   // indirect control cannot be represented by the complete edge inventory
+    }
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const auto& in = ins[i];
+        if (in.is_end) continue;
+        bool fallthrough = true;
+        if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
+            const int64_t target = int64_t(in.pc) + in.len_dwords + in.simm16;
+            if (target < 0 || target > UINT32_MAX || !by_pc.contains(uint32_t(target))) return {};
+            edges[i].push_back(by_pc.at(uint32_t(target)));
+            fallthrough = in.opcode != kSoppOpcodeBranch;
+            controls.push_back(in.pc);
+        } else if (in.fmt == Rdna2Format::SOPP && !sopp_is_noop(in) && in.opcode != 0x10u &&
+                   in.opcode != 0x16u && in.opcode != 0x17u)
+            return {};
+        if (rdna2_instruction_may_change_exec(in)) controls.push_back(in.pc);
+        if (fallthrough) {
+            if (i + 1 == ins.size()) return {};
+            edges[i].push_back(i + 1);
+        }
+    }
+    std::sort(controls.begin(), controls.end());
+    controls.erase(std::unique(controls.begin(), controls.end()), controls.end());
+    std::vector<State> incoming(ins.size());
+    std::vector<bool> reached(ins.size(), false);
+    for (auto& value : incoming[0].scalar) value.uniform = true;   // explicit wave entry words
+    incoming[0].scc = Value{true, 0, 1, 1, {}, {}};
+    reached[0] = true;
+    std::vector<size_t> pending{0};
+    size_t transfers = 0;
+    bool unknown_scc_control = false;
+    while (!pending.empty()) {
+        if (++transfers > ins.size() * 64u) return {};
+        const size_t index = pending.back();
+        pending.pop_back();
+        const auto& in = ins[index];
+        State next = incoming[index];
+        const auto read = [&](const Operand& operand) -> Value {
+            if (operand.kind == OperandKind::InlineInt) return constant(uint32_t(operand.value));
+            if (operand.kind == OperandKind::Literal) return constant(in.literal);
+            if (operand.kind == OperandKind::Special && operand.value == 125) return constant(0);
+            if (operand.kind == OperandKind::Special && operand.value == 253) return next.scc;
+            if (operand.kind == OperandKind::SGPR && operand.value >= 0 && operand.value < 106)
+                return next.scalar[operand.value];
+            return {};
+        };
+        Value result;
+        bool modeled = false, writes_scc = false, preserves_scc = false;
+        uint32_t arithmetic_carry_max = 1;
+        if (in.fmt == Rdna2Format::VOP1 && in.opcode == 2u && in.src[0].kind == OperandKind::VGPR &&
+            !in.has_sdwa && !in.has_dpp && !in.has_modifier && !in.src_abs[0] && !in.src_neg[0] &&
+            !in.clamp && !in.omod) {
+            result = Value{true, 0, UINT32_MAX, 1, {in.pc}, {in.pc}};
+            result.event_defined = true;
+            modeled = true;
+            preserves_scc = true;
+        } else if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32) {
+            result = read(in.src[0]);
+            modeled = true;
+            preserves_scc = true;
+        } else if (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeMovkI32) {
+            result = constant(uint32_t(int32_t(in.simm16)));
+            modeled = true;
+            preserves_scc = true;
+        } else if (in.fmt == Rdna2Format::SOP2 && scalar_write_width(in) == 1u) {
+            const Value a = read(in.src[0]), c = read(in.src[1]);
+            if (a.uniform && c.uniform) {
+                result = join(a, c);
+                result.event_defined = a.event_defined || c.event_defined;
+                switch (in.opcode) {
+                    case kSop2OpcodeAndB32: {
+                        const Value* mask = c.lo == c.hi ? &c : a.lo == a.hi ? &a : nullptr;
+                        if (!mask) break;
+                        result.lo = 0;
+                        result.hi = mask->lo;
+                        result.alignment = mask->lo ? (mask->lo & (0u - mask->lo)) : 0x80000000u;
+                        modeled = true;
+                        writes_scc = true;
+                        break;
+                    }
+                    case 0x1eu:
+                    case 0x20u:
+                        if (c.lo != c.hi) break;
+                        if (in.opcode == 0x1eu) {
+                            const uint32_t shift = c.lo & 31u;
+                            if (uint64_t(a.hi) << shift > UINT32_MAX) break;
+                            result.lo = a.lo << shift;
+                            result.hi = a.hi << shift;
+                            result.alignment = uint32_t(
+                                std::min(uint64_t(a.alignment) << shift, uint64_t(0x80000000u)));
+                        } else {
+                            result.lo = a.lo >> (c.lo & 31u);
+                            result.hi = a.hi >> (c.lo & 31u);
+                            result.alignment = std::max(1u, a.alignment >> (c.lo & 31u));
+                        }
+                        modeled = true;
+                        writes_scc = true;
+                        break;
+                    case 0x27u: {
+                        if (c.lo != c.hi) break;
+                        const uint32_t offset = c.lo & 31u, width = (c.lo >> 16u) & 0x7fu;
+                        if (width > 32u || width > 32u - offset) break;
+                        result.lo = 0;
+                        result.hi = width == 32u ? UINT32_MAX : (1u << width) - 1u;
+                        result.alignment = 1;
+                        modeled = true;
+                        writes_scc = true;
+                        break;
+                    }
+                    case kSop2OpcodeAddU32:
+                    case kSop2OpcodeAddcU32: {
+                        const Value carry =
+                            in.opcode == kSop2OpcodeAddcU32 ? next.scc : constant(0);
+                        if (!carry.uniform) break;
+                        if (uint64_t(a.hi) + c.hi + carry.hi > UINT32_MAX) {
+                            // Wrapping arithmetic is still wave-uniform. Preserve that control
+                            // fact, but it supplies no finite address interval without a later
+                            // authentic mask/extract. Never authorize an unchecked wrapped span.
+                            result.lo = 0;
+                            result.hi = UINT32_MAX;
+                            result.alignment = 1;
+                        } else {
+                            result.lo = a.lo + c.lo + carry.lo;
+                            result.hi = a.hi + c.hi + carry.hi;
+                            arithmetic_carry_max = 0;
+                        }
+                        result.alignment = std::min(result.alignment, carry.alignment);
+                        unite(result.events, carry.events);
+                        unite(result.definitions, carry.definitions);
+                        result.event_defined |= carry.event_defined;
+                        modeled = true;
+                        writes_scc = true;
+                        break;
+                    }
+                    case kSop2OpcodeCselectB32:
+                        if (!next.scc.uniform) break;
+                        unite(result.events, next.scc.events);
+                        unite(result.definitions, next.scc.definitions);
+                        result.event_defined =
+                            next.scc.event_defined || (a.event_defined && c.event_defined);
+                        modeled = true;
+                        preserves_scc = true;
+                        break;
+                    default: break;
+                }
+            }
+        }
+        if (modeled) unite(result.definitions, {in.pc});
+        for_each_scalar_write(in, [&](int base, uint32_t width) {
+            for (uint32_t word = 0; word < width; ++word)
+                if (base + int(word) >= 0 && base + int(word) < 106)
+                    next.scalar[base + int(word)] = modeled && width == 1u ? result : Value{};
+        });
+        // Close the implicit SCC dependency independently of ordinary SGPR writes. Integer CMP
+        // and the admitted arithmetic have wave-uniform operands; unmodeled definitions poison it.
+        if (in.fmt == Rdna2Format::SOPC) {
+            const Value a = read(in.src[0]), c = read(in.src[1]);
+            next.scc = join(a, c);
+            next.scc.uniform = a.uniform && c.uniform && in.opcode <= 0x0bu;
+            next.scc.event_defined = a.event_defined || c.event_defined;
+            next.scc.lo = 0;
+            next.scc.hi = 1;
+            next.scc.alignment = 1;
+            unite(next.scc.definitions, {in.pc});
+        } else if (writes_scc) {
+            next.scc = result;
+            // Checked ADD/ADDC cannot carry; a widened wrapping result retains both carry cases.
+            next.scc.lo = 0;
+            next.scc.hi = (in.opcode == kSop2OpcodeAddU32 || in.opcode == kSop2OpcodeAddcU32)
+                              ? arithmetic_carry_max
+                              : 1;
+            next.scc.alignment = 1;
+        } else if (!preserves_scc && (in.fmt == Rdna2Format::SOP2 || in.fmt == Rdna2Format::SOPK ||
+                                      (in.fmt == Rdna2Format::SOP1 &&
+                                       !sop1_opcode_leaves_scc_unmodified(in.opcode)))) {
+            next.scc = {};
+        }
+        if (in.fmt == Rdna2Format::SOPP &&
+            (in.opcode == kSoppOpcodeCbranchScc0 || in.opcode == kSoppOpcodeCbranchScc0 + 1u) &&
+            !next.scc.uniform)
+            unknown_scc_control = true;
+        for (size_t target : edges[index]) {
+            State merged = next;
+            if (reached[target]) {
+                for (size_t reg = 0; reg < merged.scalar.size(); ++reg)
+                    merged.scalar[reg] = join(incoming[target].scalar[reg], next.scalar[reg]);
+                merged.scc = join(incoming[target].scc, next.scc);
+                if (target <= index)
+                    for (size_t reg = 0; reg < merged.scalar.size(); ++reg) {
+                        auto& value = merged.scalar[reg];
+                        const auto& previous = incoming[target].scalar[reg];
+                        // Finite conservative widening closes unrelated loop counters. MAY event/
+                        // definition closure and MUST event presence remain independently joined.
+                        // A selector must still regain a complete aligned finite interval at its load.
+                        if (value.lo < previous.lo) {
+                            value.lo = 0;
+                            value.alignment = 1;
+                        }
+                        if (value.hi > previous.hi) {
+                            value.hi = UINT32_MAX;
+                            value.alignment = 1;
+                        }
+                    }
+            }
+            if (!reached[target] || merged != incoming[target]) {
+                incoming[target] = std::move(merged);
+                reached[target] = true;
+                pending.push_back(target);
+            }
+        }
+    }
+    if (unknown_scc_control) return {};
+    const auto numeric = rdna2_raw_wide_data_loads(ins);
+    std::vector<RawWaveWideCertificate> certificates;
+    for (size_t index = 0; index < ins.size(); ++index) {
+        const auto& load = ins[index];
+        const uint32_t bytes = load.opcode == 2u ? 16u : 32u;
+        if (!reached[index] || load.fmt != Rdna2Format::SMEM ||
+            (load.opcode != 2u && load.opcode != 3u) || load.dst.kind != OperandKind::SGPR ||
+            load.dst.value < 0 || load.dst.value + int(bytes / 4u) > 106 ||
+            load.src[0].kind != OperandKind::SGPR || load.src[0].value < 0 ||
+            load.src[0].value > 104 || load.src[1].kind != OperandKind::SGPR ||
+            load.src[1].value < 0 || load.src[1].value > 105 ||
+            !std::binary_search(numeric.begin(), numeric.end(), load.pc))
+            continue;
+        bool stable_base = true;
+        for (const auto& in : ins)
+            for_each_scalar_write(in, [&](int reg, uint32_t width) {
+                if (reg < load.src[0].value + 2 && load.src[0].value < reg + int(width))
+                    stable_base = false;
+            });
+        const Value& offset = incoming[index].scalar[load.src[1].value];
+        const int32_t immediate = int32_t(load.literal);
+        if (!stable_base || !offset.uniform || !offset.event_defined || offset.events.empty() ||
+            offset.hi == UINT32_MAX || offset.alignment < 4u || (load.literal & 3u) ||
+            int64_t(offset.lo) + immediate < 0)
+            continue;
+        certificates.push_back({load.pc, uint32_t(load.src[0].value), uint32_t(load.src[1].value),
+                                bytes, immediate, offset.lo, offset.hi, offset.alignment,
+                                offset.events, offset.definitions, controls});
+    }
+    return certificates;
+}
+
 std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(
         const std::vector<Rdna2Inst>& ins) {
     std::vector<uint32_t> proven;

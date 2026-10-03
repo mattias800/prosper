@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <type_traits>
 
 using namespace prosper;
@@ -183,6 +184,14 @@ int main(int argc, char** argv) {
     CHECK(!tools::select_recompiled_shader(shared_replay, "20:vs", shared, error) &&
               error.find("realized draw 20 not found") != std::string::npos,
           "recompiled shader selection rejects an absent semantic draw");
+    shared_replay.items[0].fs_shared = std::make_shared<const std::vector<uint32_t>>();
+    shared_replay.items[0].fs.clear();
+    CHECK(!tools::select_recompiled_shader(shared_replay, "19:fs", shared, error) &&
+              error == "realized shader 19:fs has no available compiled module" && !shared,
+          "an owned-wave pending empty shared FS is unavailable before any output is opened");
+    shared_replay.items[0].fs_shared.reset();
+    CHECK(!tools::select_recompiled_shader(shared_replay, "19:fs", shared, error) && !shared,
+          "an empty owned-vector FS cannot become a successful zero-byte dump");
 
     gpu::ComputeItem raw_compute;
     raw_compute.spirv = {0x07230203u, 0u};
@@ -270,6 +279,28 @@ int main(int argc, char** argv) {
         // The CLI test uses the production capture writer rather than duplicating its versioned
         // wire format. No Vulkan device or captured game bytes are needed for this fixture.
         const std::filesystem::path directory(argv[2]);
+        gpu::GpuCaptureFile dump_fixture;
+        dump_fixture.metadata.width = dump_fixture.metadata.height = 1;
+        gpu::GpuCapturedDraw dump_draw;
+        dump_draw.draw_index = 19;
+        const uint32_t plain_ps[]{0x7e000280u, 0x7e0202f2u, 0x7e040280u, 0x7e0602f2u,
+                                  0xf800180fu, 0x03020100u, 0xbf810000u};
+        dump_draw.fs = gpu::recompile_fragment(plain_ps, std::size(plain_ps));
+        CHECK(!dump_draw.fs.empty(), "CLI dump positive owns a real nonempty compiled fragment");
+        dump_fixture.draws.push_back(dump_draw);
+        CHECK(gpu::write_gpu_capture((directory / "compiled-stage.prgcap").string(), dump_fixture,
+                                     error),
+              "write actual nonempty stored-stage dump fixture");
+        {
+            std::ofstream expected(directory / "compiled-stage.spv", std::ios::binary);
+            expected.write(reinterpret_cast<const char*>(dump_draw.fs.data()),
+                           static_cast<std::streamsize>(dump_draw.fs.size() * sizeof(uint32_t)));
+            CHECK(bool(expected), "pin exact positive compiled module bytes");
+        }
+        dump_fixture.draws[0].fs.clear();
+        CHECK(gpu::write_gpu_capture((directory / "unavailable-stage.prgcap").string(),
+                                     dump_fixture, error),
+              "write a realized stage with no compiled module");
         gpu::GpuCaptureFile fixture;
         fixture.metadata.width = fixture.metadata.height = 1;
         fixture.failure_diagnostics_available = true;
@@ -477,33 +508,103 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> legacy_fragment_bytes;
         constexpr uint8_t legacy_fragment_tail[] = {
             // v61: one available fragment retry, system inputs and Wave32.
-            1u, 3u, 1u, 0u, 0u, 0u, 3u, 0u, 0u, 0u,
+            1u,
+            3u,
+            1u,
+            0u,
+            0u,
+            0u,
+            3u,
+            0u,
+            0u,
+            0u,
             // v62/v63: no resources or realized draws.
-            0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
             // v64: no draws; one failure with unknown FLOAT_MODE.
-            0u, 0u, 0u, 0u, 1u, 0u, 0u, 0u, 0u, 0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            1u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
             // v65: no owned resource obligations.
-            0u, 0u, 0u, 0u,
+            0u,
+            0u,
+            0u,
+            0u,
             // v66: no draws/computes; one unknown failure profile and one unknown stage.
-            0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 1u, 0u, 0u, 0u,
-            0u, 1u, 0u, 0u, 0u, 0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            1u,
+            0u,
+            0u,
+            0u,
+            0u,
+            1u,
+            0u,
+            0u,
+            0u,
+            0u,
             // v67: no draws; one IEEE-on/DX10-off failure and known full RSRC1_PS evidence.
-            0u, 0u, 0u, 0u, 1u, 0u, 0u, 0u, 1u, 1u, 0u, 1u,
-            0u, 0u, 0x80u, 0x20u,
+            0u,
+            0u,
+            0u,
+            0u,
+            1u,
+            0u,
+            0u,
+            0u,
+            1u,
+            1u,
+            0u,
+            1u,
+            0u,
+            0u,
+            0x80u,
+            0x20u,
             // v68: no nested resource obligations.
-            0u, 0u, 0u, 0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            // v69/v70: no realized entry or logical-wave records.
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
+            0u,
         };
         constexpr size_t legacy_fragment_tail_bytes = sizeof(legacy_fragment_tail);
-        static_assert(legacy_fragment_tail_bytes == 70u);
+        static_assert(legacy_fragment_tail_bytes == 78u);
         const bool exact_legacy_fragment_tail =
             gpu::serialize_gpu_capture(legacy_fragment_fixture, legacy_fragment_bytes, error) &&
             legacy_fragment_bytes.size() > 12u + legacy_fragment_tail_bytes &&
-            legacy_fragment_bytes[8] == 68u && legacy_fragment_bytes[9] == 0u &&
+            legacy_fragment_bytes[8] == 70u && legacy_fragment_bytes[9] == 0u &&
             legacy_fragment_bytes[10] == 0u && legacy_fragment_bytes[11] == 0u &&
             std::equal(std::begin(legacy_fragment_tail), std::end(legacy_fragment_tail),
                        legacy_fragment_bytes.end() - legacy_fragment_tail_bytes);
         CHECK(exact_legacy_fragment_tail,
-              "CLI fixture pins the exact current v61-v68 suffix before a legacy downgrade");
+              "CLI fixture pins the exact current v61-v70 suffix before a legacy downgrade");
         if (exact_legacy_fragment_tail) {
             auto relabeled_fragment_bytes = legacy_fragment_bytes;
             relabeled_fragment_bytes[8] = 60u;
@@ -512,7 +613,7 @@ int main(int argc, char** argv) {
                                                relabeled_fragment_capture, error) &&
                   error == "capture has trailing data",
                   "CLI fixture rejects a version-only relabel instead of a genuine v60 prefix");
-            // Remove the independently pinned v61-v68 fields, retaining all v60 retry state.
+            // Remove the independently pinned v61-v70 fields, retaining all v60 retry state.
             legacy_fragment_bytes.resize(legacy_fragment_bytes.size() - legacy_fragment_tail_bytes);
             legacy_fragment_bytes[8] = 60u;
             gpu::GpuCaptureFile legacy_fragment_capture;

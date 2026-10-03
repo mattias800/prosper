@@ -324,14 +324,20 @@ int main(int argc, char** argv) {
                 ? combined_replay.items[0].prt->by_fetch_pc(0u) : nullptr;
             const auto* restored_child = combined_ok && combined_replay.items.size() == 1u && combined_replay.items[0].prt
                 ? combined_replay.items[0].prt->by_fetch_pc(7u) : nullptr;
-            check(combined_ok && combined_decoded.format_version == 69u &&
-                  combined_decoded.draws.front().ps_float_mode == mode && combined_replay.items[0].ps_float_mode == mode &&
-                  combined_replay.items[0].fragment_wave_config_available && !combined_replay.items[0].ps_wave32 &&
-                  restored_parent && restored_parent->host_data && restored_parent->owned_raw_snapshot_bytes == size &&
-                  restored_parent->host_data_size == size && std::memcmp(restored_parent->host_data, source->host_data, size) == 0 &&
-                  restored_child && restored_child->host_data && restored_child->host_data_size >= size &&
-                  std::memcmp(restored_child->host_data, child.data() + 8u, size) == 0,
-                  "current capture retains every owned parent/child byte, exact width and full producing mode");
+            check(combined_ok && combined_decoded.format_version == 70u &&
+                      combined_decoded.draws.front().ps_float_mode == mode &&
+                      combined_replay.items[0].ps_float_mode == mode &&
+                      combined_replay.items[0].fragment_wave_config_available &&
+                      !combined_replay.items[0].ps_wave32 && restored_parent &&
+                      restored_parent->host_data &&
+                      restored_parent->owned_raw_snapshot_bytes == size &&
+                      restored_parent->host_data_size == size &&
+                      std::memcmp(restored_parent->host_data, source->host_data, size) == 0 &&
+                      restored_child && restored_child->host_data &&
+                      restored_child->host_data_size >= size &&
+                      std::memcmp(restored_child->host_data, child.data() + 8u, size) == 0,
+                  "current capture retains every owned parent/child byte, exact width and full "
+                  "producing mode");
             auto combined_ownerless = combined_draw;
             combined_ownerless.prt = std::make_shared<ShaderResourceTable>(table);
             combined_ownerless.prt->owned_host_data.clear();

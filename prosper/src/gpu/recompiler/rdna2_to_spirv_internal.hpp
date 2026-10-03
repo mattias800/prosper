@@ -396,6 +396,9 @@ inline StaticScratchLayout analyze_static_scratch(const std::vector<Rdna2Inst>& 
 // store 1 float", with helpers the VALU translator drives.
 enum class GuestShaderStage { Standalone, Compute, Vertex, Fragment };
 enum class PhysicalExecutionDomain { Invocation, Workgroup };
+// Only an entry owning every guest slot may select through cross-worker register state. Native
+// subgroup width, the physical compute flag and copying-only scalar taint grant no such authority.
+enum class GuestWaveEventDomain { None, Owned64 };
 
 struct SpirvCompute {
     // Guest semantics and physical synchronization ownership are separate. The legacy is_*
@@ -406,6 +409,10 @@ struct SpirvCompute {
     // compute clamp/float mode or native fragment helper assumptions from the physical shell.
     GuestShaderStage guest_stage = GuestShaderStage::Standalone;
     PhysicalExecutionDomain physical_domain = PhysicalExecutionDomain::Invocation;
+    GuestWaveEventDomain guest_wave_event_domain = GuestWaveEventDomain::None;
+    // Set only after complete packet window admission. Raw loads address one immutable interval
+    // appended to binding0, not a per-invocation source pointer or the descriptor fallback bank.
+    std::map<uint32_t, std::pair<RawWaveWideCertificate, uint32_t>> packet_raw_windows;
     FragmentPacketQuadTopology packet_quad_topology = FragmentPacketQuadTopology::Unknown;
     bool has_workgroup_execution() const {
         return physical_domain == PhysicalExecutionDomain::Workgroup;
@@ -1607,6 +1614,14 @@ struct SpirvCompute {
         uint32_t p = elem_ptr(v_in, k), r = id();
         put(code, Op_Load, {raw_input_words ? t_u32 : t_f32, r, p});
         return raw_input_words ? r : bcu(r);
+    }
+    uint32_t load_owned_packet_word(uint32_t absolute_word) {
+        // This entry owns raw-u32 binding0. A float cross-bitcast/native input envelope would be a
+        // different contract; do not make this a generic buffer helper with a fallback binding.
+        uint32_t pointer = id(), result = id();
+        put(code, Op_AccessChain, {t_ptr_sb_f32, pointer, v_in, uconst(0), absolute_word});
+        put(code, Op_Load, {t_u32, result, pointer});
+        return result;
     }
     // The storage-buffer variable for a descriptor `binding`. N-buffer model: each distinct constant/
     // vertex buffer the shader reads is bound at its own descriptor binding (the executor assigns them),
@@ -3469,6 +3484,12 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
 
     if (ud_alias_dst >= 0) rs.sreg_ud_alias[ud_alias_dst] = ud_alias_origin;
 }
+
+// Exact-PC complete owned windows are a separate admission from resource-table SMEM.
+bool emit_owned_raw_window(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, uint32_t words,
+                           bool& ok);
+bool owned_or_portable_readfirstlane_enabled(const SpirvCompute& b);
+bool owned_or_portable_readfirstlane_candidate(const SpirvCompute& b, const Rdna2Inst& in);
 
 // emit_alu lives in rdna2_emit_alu.cpp -- 7,676 lines of instruction-family translation that is
 // the single largest thing in the recompiler. Its callers stayed behind, so the declaration lives

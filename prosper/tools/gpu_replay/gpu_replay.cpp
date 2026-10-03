@@ -3187,9 +3187,27 @@ int main(int argc, char** argv) {
         if (tap_env_raw) clear_environment("PROSPER_FS_TAP");
         size_t vs_swapped = 0, fs_swapped = 0, vs_kept = 0, fs_kept = 0;
         for (auto& it : replay.items) {
+            const bool owned_vertex = it.owned_waves && it.owned_waves->vertex_pending;
+            const bool owned_fragment = it.owned_waves && it.owned_waves->fragment_pending;
+            if (it.owned_waves) {
+                // Materialization already rederived full-original PC/window/input admission.
+                // Both routes execute those SAME captured owners on the actual graphics device;
+                // ordinary native recompile cannot replace a logical64 plan with THIS-lane SMEM.
+                if (it.owned_waves->fragment_pending) {
+                    const auto wave = prosper::tools::resolve_replay_fragment_wave_size(
+                        raw_fragment_wave, it.fragment_wave_config_available, it.ps_wave32);
+                    if (wave.wave32()) {
+                        std::fprintf(
+                            stderr,
+                            "owned fragment-wave replay requires its producing logical64 launch\n");
+                        return 2;
+                    }
+                }
+            }
             // #2945: the same dead-varying bound the live path applies, or this mode recompiles a
             // vertex interface the live renderer would never build.
-            if (it.has_pixel_inputs && it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
+            if (!owned_fragment && it.has_pixel_inputs &&
+                it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& fs_raw = replay.raw_shader_versions[it.fs_raw_shader_index];
                 prosper::gpu::apply_fragment_consumption(
                     it.pixel_inputs, fs_raw.words.data(), fs_raw.words.size());
@@ -3198,7 +3216,7 @@ int main(int argc, char** argv) {
             const auto* system_inputs = it.has_system_inputs ? &it.system_inputs : nullptr;
             std::vector<uint32_t> vs, fs, gs;
             bool requires_geometry = false;
-            if (it.vs_raw_shader_index < replay.raw_shader_versions.size()) {
+            if (!owned_vertex && it.vs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.vs_raw_shader_index];
                 if (it.vs_chain_raw_shader_index < replay.raw_shader_versions.size()) {
                     const auto& main = replay.raw_shader_versions[it.vs_chain_raw_shader_index];
@@ -3213,8 +3231,9 @@ int main(int argc, char** argv) {
                                                         {prosper::gpu::RecompileDiagnosticStage::Vertex, 0},
                                                         it.float_transport);
                 }
-            } else ++vs_kept;
-            if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
+            } else if (!owned_vertex)
+                ++vs_kept;
+            if (!owned_fragment && it.fs_raw_shader_index < replay.raw_shader_versions.size()) {
                 const auto& raw = replay.raw_shader_versions[it.fs_raw_shader_index];
                 const auto interpolation = prosper::gpu::fragment_interpolation_layout(
                     raw.words.data(), raw.words.size(), system_inputs, pixel_inputs);
@@ -3232,16 +3251,22 @@ int main(int argc, char** argv) {
                         gs = prosper::gpu::recompile_interpolation_geometry(
                             interpolation, false, false, it.float_transport);
                 }
-            } else ++fs_kept;
-            if (!vs.empty() && !fs.empty() && (!requires_geometry || !gs.empty())) {
-                it.set_vs(std::move(vs));
-                it.set_fs(std::move(fs));
-                it.gs = std::move(gs);
+            } else if (!owned_fragment)
+                ++fs_kept;
+            if ((owned_vertex || !vs.empty()) && (owned_fragment || !fs.empty()) &&
+                (!requires_geometry || !gs.empty())) {
+                if (!owned_vertex) it.set_vs(std::move(vs));
+                if (!owned_fragment) {
+                    it.set_fs(std::move(fs));
+                    it.gs = std::move(gs);
+                }
                 ++vs_swapped;
                 ++fs_swapped;
             } else {
-                if (it.vs_raw_shader_index < replay.raw_shader_versions.size()) ++vs_kept;
-                if (it.fs_raw_shader_index < replay.raw_shader_versions.size()) ++fs_kept;
+                if (owned_vertex || it.vs_raw_shader_index < replay.raw_shader_versions.size())
+                    ++vs_kept;
+                if (owned_fragment || it.fs_raw_shader_index < replay.raw_shader_versions.size())
+                    ++fs_kept;
             }
         }
         if (tap_env_raw) set_environment("PROSPER_FS_TAP", tap_env.c_str());

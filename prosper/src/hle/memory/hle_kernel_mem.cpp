@@ -8563,6 +8563,124 @@ GuestDirectAllocation guest_memory_direct_allocation(const GuestMappingLease&,
     return direct_allocation_locked(address, bytes);
 }
 
+GuestDirectReadableWindow guest_memory_direct_readable_window(const GuestMappingLease& lease,
+                                                              uint64_t address) {
+    GuestDirectReadableWindow window;
+    if (address < 0x1000) return {};
+    {
+        std::scoped_lock lock(g_mx, g_dmx);
+        const auto origin = direct_allocation_locked(address, 1u);
+        if (!origin.identity) return {};
+        const auto after = std::upper_bound(
+            g_maps.begin(), g_maps.end(), address,
+            [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
+        if (after == g_maps.begin()) return {};
+        const auto center = std::prev(after);
+        // prot is the normalized CPU mask in both platform trackers; bit 0 is readable.
+        // Allocation identity/bounds come from g_dmem, not host region metadata.
+        const auto interval = [&](const Mapping& mapping) {
+            GuestDirectReadableWindow slice;
+            if (!mapping.committed || !(mapping.query_flags & kVirtualQueryDirect) ||
+                !(mapping.prot & 0x1) || !mapping.size ||
+                mapping.base > UINT64_MAX - mapping.size ||
+                mapping.offset > UINT64_MAX - mapping.size)
+                return slice;
+            slice.physical_begin = std::max(mapping.offset, origin.physical_begin);
+            slice.physical_end = std::min(mapping.offset + mapping.size, origin.physical_end);
+            if (slice.physical_begin >= slice.physical_end) return GuestDirectReadableWindow{};
+            slice.virtual_begin = mapping.base + (slice.physical_begin - mapping.offset);
+            slice.virtual_end = mapping.base + (slice.physical_end - mapping.offset);
+            const auto observed = direct_allocation_locked(slice.virtual_begin, 1u);
+            if (observed.identity != origin.identity ||
+                observed.physical_begin != origin.physical_begin ||
+                observed.physical_end != origin.physical_end)
+                return GuestDirectReadableWindow{};
+            slice.allocation = origin;
+            return slice;
+        };
+        window = interval(*center);
+        if (!window || address < window.virtual_begin || address >= window.virtual_end) return {};
+        auto before = center;
+        while (before != g_maps.begin()) {
+            const auto slice = interval(*std::prev(before));
+            if (!slice || slice.virtual_end != window.virtual_begin ||
+                slice.physical_end != window.physical_begin)
+                break;
+            window.virtual_begin = slice.virtual_begin;
+            window.physical_begin = slice.physical_begin;
+            --before;
+        }
+        auto next = std::next(center);
+        while (next != g_maps.end()) {
+            const auto slice = interval(*next);
+            if (!slice || slice.virtual_begin != window.virtual_end ||
+                slice.physical_begin != window.physical_end)
+                break;
+            window.virtual_end = slice.virtual_end;
+            window.physical_end = slice.physical_end;
+            ++next;
+        }
+    }
+    const uint64_t mapped_begin = window.virtual_begin, mapped_end = window.virtual_end;
+#if defined(__linux__)
+    // A neighboring reservation fault can replace a whole 64 KiB granule. Exclude an unsafe edge,
+    // then prove the complete returned domain; never read bytes to trigger lazy commitment.
+    constexpr uint64_t granule = 0x10000;
+    if (!guest_memory_direct_range_fault_safe(lease, window.virtual_begin, 1u)) {
+        const uint64_t aligned = window.virtual_begin & ~(granule - 1u);
+        if (aligned > UINT64_MAX - granule) return {};
+        window.virtual_begin = aligned + granule;
+    }
+    if (!guest_memory_direct_range_fault_safe(lease, window.virtual_end - 1u, 1u))
+        window.virtual_end = (window.virtual_end - 1u) & ~(granule - 1u);
+    if (window.virtual_begin >= window.virtual_end || address < window.virtual_begin ||
+        address >= window.virtual_end ||
+        !guest_memory_direct_range_fault_safe(lease, window.virtual_begin,
+                                              window.virtual_end - window.virtual_begin))
+        return {};
+#elif defined(_WIN32)
+    // SEC_RESERVE views are guest-committed before every physical page is host-committed. Native
+    // metadata narrows an ALREADY authenticated direct allocation; it never establishes one.
+    const auto committed_region = [](uint64_t at, uint64_t& begin, uint64_t& end) {
+        MEMORY_BASIC_INFORMATION info{};
+        constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                   PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                   PAGE_EXECUTE_WRITECOPY;
+        if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(at)), &info,
+                          sizeof(info)) ||
+            info.State != MEM_COMMIT || info.Type != MEM_MAPPED ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !(info.Protect & readable))
+            return false;
+        begin = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(info.BaseAddress));
+        if (!info.RegionSize || begin > UINT64_MAX - info.RegionSize) return false;
+        end = begin + info.RegionSize;
+        return begin <= at && at < end;
+    };
+    uint64_t first = 0, last = 0;
+    if (!committed_region(address, first, last)) return {};
+    window.virtual_begin = std::max(mapped_begin, first);
+    window.virtual_end = std::min(mapped_end, last);
+    while (window.virtual_begin > mapped_begin) {
+        if (!committed_region(window.virtual_begin - 1u, first, last) ||
+            last < window.virtual_begin || first >= window.virtual_begin)
+            break;
+        window.virtual_begin = std::max(mapped_begin, first);
+    }
+    while (window.virtual_end < mapped_end) {
+        if (!committed_region(window.virtual_end, first, last) || first > window.virtual_end ||
+            last <= window.virtual_end)
+            break;
+        window.virtual_end = std::min(mapped_end, last);
+    }
+#else
+    (void)lease;
+    return {}; // no native commitment/fault proof on this host
+#endif
+    window.physical_begin += window.virtual_begin - mapped_begin;
+    window.physical_end -= mapped_end - window.virtual_end;
+    return window;
+}
+
 GuestMemoryTopologyRelation guest_memory_retained_allocation_relation(
         const GuestMappingLease&, uint64_t source_address, uint64_t source_bytes,
         const GuestDirectAllocation& producer) {

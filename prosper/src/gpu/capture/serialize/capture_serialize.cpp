@@ -1289,6 +1289,13 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u8(launch.input_ena_available ? 1u : 0u); w.u32(launch.input_ena);
         w.u8(launch.input_addr_available ? 1u : 0u); w.u32(launch.input_addr);
     }
+    // v70 appends independently owned logical-wave inputs after the complete official v69 prefix.
+    w.u32(uint32_t(c.draws.size()));
+    for (const auto& draw : c.draws)
+        if (!write_owned_wave_draw(w, draw, error)) {
+            if (error.empty()) error = "invalid owned logical-wave input state";
+            return false;
+        }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces
