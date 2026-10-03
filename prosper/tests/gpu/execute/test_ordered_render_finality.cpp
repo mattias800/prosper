@@ -21,8 +21,8 @@ namespace P = prosper::agc::Pm4;
 
 struct Program {
     alignas(256) std::array<uint32_t, 32> code{};
-    std::array<ShaderReg, 2> registers{};
     AgcShaderHeader header{};
+    std::array<ShaderReg, 2> registers{};
 };
 
 class OrderedRenderFinality : public testing::Test {
@@ -51,7 +51,11 @@ protected:
             program.header.version = 0x18u;
             program.header.type = type;
             program.header.shader_size = static_cast<uint32_t>(code.size() * sizeof(uint32_t));
-            program.header.sh_registers = program.registers.data();
+            // Static test storage can live below 4 GiB, where CreateShader expects a self-relative
+            // SDK pointer. Put registers after the header and use that actual constructor format.
+            program.header.sh_registers = reinterpret_cast<const void*>(
+                reinterpret_cast<uintptr_t>(program.registers.data()) -
+                reinterpret_cast<uintptr_t>(&program.header.sh_registers));
             program.header.num_sh_registers = 2;
             void* registered = nullptr;
             EXPECT_EQ(create(reinterpret_cast<uint64_t>(&registered),
@@ -59,6 +63,10 @@ protected:
                              reinterpret_cast<uint64_t>(program.code.data()), 0, 0, 0),
                       0u);
             EXPECT_EQ(registered, &program.header);
+            EXPECT_EQ(program.header.sh_registers, program.registers.data());
+            const uint64_t address = reinterpret_cast<uint64_t>(program.code.data());
+            EXPECT_EQ(program.registers[0].value, static_cast<uint32_t>(address >> 8u));
+            EXPECT_EQ(program.registers[1].value, static_cast<uint32_t>((address >> 40u) & 0xffu));
         };
         register_program(vertex_, vs, 2, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES);
         register_program(fragment_, ps, 1, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS);
