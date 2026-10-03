@@ -804,8 +804,7 @@ TEST(AprRegistry, Contract) {
         CHECK(Hle::lookup("Omr9X+YmT7I") == nullptr && Hle::lookup("0ers1N4C9CY") == nullptr,
               "#1629: the _TEST-suffixed submit NIDs are left unimplemented, not aliased");
 
-        // An unbound command buffer is the case that hands a token back through the out slots, so it
-        // is the one that can demonstrate the difference.
+        // Only AndGetResult has result slots; the plain form must leave its argument registers alone.
         alignas(8) uint64_t out1 = 0xdeadbeefcafef00dull;
         alignas(8) uint64_t out2 = 0xdeadbeefcafef00dull;
         constexpr uint64_t kResidue = 0xdeadbeefcafef00dull;
@@ -824,6 +823,9 @@ TEST(AprRegistry, Contract) {
             HleFn wait_submit = Hle::lookup("rqwFKI4PAiM");
             CHECK(wait_submit && wait_submit((uint32_t)out2, 0, 0, 0, 0, 0) == 0,
                   "APR wait observes the eagerly completed submit by the ID it returned");
+            CHECK(wait_submit && wait_submit(0, 0, 0, 0, 0, 0) != 0 &&
+                      wait_submit(0xffffffffu, 0, 0, 0, 0, 0) != 0,
+                  "APR wait refuses a submit ID it never issued");
         }
 #endif
         if (submit_plain) {
@@ -849,16 +851,14 @@ TEST(AprRegistry, Contract) {
     //     binding's equeue/id/tag, so its submit echoes the dead tag to the dead queue instead of
     //     handing the caller a fresh token through the result slots.
     //
-    // The observable for the second harm is the submit path's own branch: a BOUND cb (nonzero
-    // equeue) suppresses the result slots and posts the tag; an UNBOUND cb writes a fresh token
-    // into both slots and posts nothing. So "the slots were written" IS "no binding was found",
-    // which is exactly the property under test — no equeue, no worker thread, no timing.
+    // Since 5e1c2120e AndGetResult publishes its result and ID whether or not the cb is bound, so
+    // the result slots no longer reveal which branch submit took. The observable is the registry
+    // itself (prosper_apr_binding_count_for_test): a dead binding that survives its destructor is
+    // exactly what a reused address would inherit.
     //
-    // The equeue used here is a plain nonzero sentinel, never a real SceKernelEqueue: that keeps
-    // the binding on the `tag_echo` branch (which is what suppresses the slots) while
-    // prosper_eq_post_apr_token's identity guard rejects the post, so the test cannot deliver an
-    // event to anything. The point being tested is which BRANCH submit takes, not what the queue
-    // receives.
+    // The equeue used here is a plain nonzero sentinel, never a real SceKernelEqueue, so
+    // prosper_eq_post_apr_token's identity guard rejects any post and the test cannot deliver an
+    // event to anything.
     {
         HleFn bind_legacy  = Hle::lookup("H896Pt-yB4I");    // legacy: deduplicate_completion=false
         HleFn bind_320     = Hle::lookup("o67gODLFpls");    // PS5 3.20: deduplicate_completion=true
@@ -887,7 +887,6 @@ TEST(AprRegistry, Contract) {
                   "#1674: a legacy H896Pt-yB4I bind records exactly one binding for the cb");
             // Since 5e1c2120e AndGetResult publishes its result and ID whether or not the buffer is
             // bound, so the slots no longer reveal the binding; the registry count is the observable.
-            s1 = s2 = kResidue;
             submit(cb_x, 1, p1, p2, 0, 0);
             CHECK(prosper_apr_binding_count_for_test(cb_x) == 1,
                   "#1674 control: submitting a bound cb leaves its binding in place");
@@ -899,7 +898,6 @@ TEST(AprRegistry, Contract) {
 
             // --- the aliasing half: the address is reused by an unrelated buffer that never
             //     bound anything, and its submit must behave as unbound.
-            s1 = s2 = kResidue;
             submit(cb_x, 1, p1, p2, 0, 0);
             CHECK(prosper_apr_binding_count_for_test(cb_x) == 0,
                   "#1674: a cb reusing the destructed address does NOT inherit the dead binding -- "
@@ -922,7 +920,6 @@ TEST(AprRegistry, Contract) {
             CHECK(prosper_apr_binding_count_for_test(cb_x) == 0 &&
                   prosper_apr_binding_count_for_test(cb_y) == 1,
                   "#1674: destroying one cb leaves an unrelated cb's binding intact");
-            s1 = s2 = kResidue;
             submit(cb_y, 1, p1, p2, 0, 0);
             CHECK(prosper_apr_binding_count_for_test(cb_y) == 1,
                   "#1674: the surviving binding is still recorded after cb_y's submit");

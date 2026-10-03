@@ -1341,11 +1341,13 @@ enum class LiveTargetPixelFormat : uint8_t {
     R16Float,
 };
 struct LiveTargetSnapshot {
-    // `pixels` are in the guest's component order: a BGRA target kept as canonical RGBA8 by the
-    // renderer arrives B,G,R,A (#4291).
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
-    std::shared_ptr<const std::vector<uint8_t>> pixels;
+    std::shared_ptr<const std::vector<uint8_t>> pixels;  // canonical host order, as rendered
+    // The guest stores this target as BGRA while `pixels` are canonical RGBA8 (#4291). A consumer
+    // that decodes the bytes as GUEST memory (live compute) must swap R and B; one that shows the
+    // rendered picture (replay dumps, hashes) must not.
+    bool component_order_bgra = false;
 };
 using LiveTargetReaderFn = std::function<bool(uint64_t gpu_addr, LiveTargetSnapshot& snapshot)>;
 void set_live_target_reader(LiveTargetReaderFn fn);

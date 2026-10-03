@@ -1,6 +1,7 @@
 // #4291: a CB_COLOR ALT (BGRA) render target is kept by the renderer as canonical RGBA8. Compute
 // must still observe the GUEST's component order through every handoff the live renderer offers:
-// the CPU snapshot, the in-place sampled view, the exact-bits copy and the storage seed. Drives the
+// the CPU snapshot, the in-place sampled view, the exact-bits and packed-10 copies and the storage
+// seeds -- while the snapshot itself stays the canonical picture for replay dumps. Drives the
 // real live renderer and live compute backend, so each arm reaches the production path; the
 // mutation that removes each path's order handling turns its arm red.
 #include "fixtures/render_runner.h"
@@ -120,13 +121,13 @@ TEST(LiveComputeBgraTarget, ComputeObservesGuestComponentOrder) {
     std::vector<uint8_t> guest_order = canonical;
     for (size_t i = 0; i < guest_order.size(); i += 4) std::swap(guest_order[i], guest_order[i + 2]);
 
-    // Snapshot: compute decodes these bytes as guest memory, so they arrive B,G,R,A -- and
-    // reading twice must not swap twice (the cached surface stays canonical).
-    for (int read = 0; read < 2; ++read) {
+    // Snapshot: the rendered picture, unchanged, plus the order flag. Replay dumps and hashes read
+    // these bytes as RGBA, so the reader must not reorder them; live compute swaps (arms below).
+    {
         LiveTargetSnapshot snapshot;
         ASSERT_TRUE(read_live_render_target(color, snapshot) && snapshot.pixels);
-        EXPECT_EQ(*snapshot.pixels, guest_order)
-            << "snapshot read " << read << " hands compute the guest's BGRA byte order";
+        EXPECT_EQ(*snapshot.pixels, canonical) << "snapshot keeps the canonical rendered bytes";
+        EXPECT_TRUE(snapshot.component_order_bgra) << "snapshot reports the BGRA guest order";
     }
 
     std::vector<uint32_t> indices(Width), dummy(4, 0);

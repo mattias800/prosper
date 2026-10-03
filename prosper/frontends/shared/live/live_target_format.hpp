@@ -42,9 +42,10 @@ constexpr uint32_t live_target_host_selector(uint32_t selector, bool component_o
 }
 
 // A raw bit copy, the packed-10 conversion and a storage seed all move components in the order
-// they sit in, so a BGRA-as-RGBA target would arrive with R and B exchanged; those decline and take
-// the CPU snapshot, which the renderer hands over in guest order. Only a sampled view can compose
-// the swap (above).
+// they sit in, so a BGRA-as-RGBA target would arrive with R and B exchanged. Those decline and take
+// the CPU snapshot, which live compute swaps into guest order (below). Only a sampled view can
+// compose the swap into its selector (above).
+
 // Converts canonical RGBA8 texels to the guest's BGRA byte order (the swap is its own inverse). A
 // trailing partial texel is left alone; callers pass whole-image buffers.
 inline void swap_rgba8_red_blue(std::vector<uint8_t>& pixels) {

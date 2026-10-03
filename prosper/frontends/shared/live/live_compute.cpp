@@ -8549,6 +8549,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
                     skip_image(r, "renderer-owned RTT has no readable snapshot"); break;
                 }
+                // #4291: the snapshot is canonical; compute decodes it as guest (BGRA) memory.
+                if (live_target.component_order_bgra &&
+                    live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
+                    auto guest_order = std::make_shared<std::vector<uint8_t>>(*live_target.pixels);
+                    prosper::frontend::swap_rgba8_red_blue(*guest_order);
+                    live_target.pixels = std::move(guest_order);
+                }
                 // A dimension mismatch is either (a) an exact PROSPER_RENDER_SCALE downscale (the renderer
                 // rendered this same target at 1/scale; a compute op sampling it at native res sees e.g.
                 // 480x270 cached for a 1920x1080 request), or (b) a genuine view ALIAS at a reused base
