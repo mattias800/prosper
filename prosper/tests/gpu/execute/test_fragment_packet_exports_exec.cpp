@@ -22,14 +22,16 @@ Execution execute(uint32_t family, bool missing = false, uint32_t en = 15) {
         }
         std::vector<FragmentResourcePacket> waves;
         for (uint32_t wave = 0; wave < 3; ++wave) {
-            auto input = family == 1   ? f::scratch(wave, true)
-                         : family == 2 ? f::multiple()
-                         : family == 3 ? f::compressed(en)
-                         : family == 4 ? f::missing_active(missing && wave == 2)
-                         : family == 5 ? f::peer(missing && wave == 2)
-                         : family == 6 ? f::wqm(missing && wave == 2)
-                         : family == 7 ? f::previous_destination(missing && wave == 2)
-                                       : f::scratch(wave);
+            auto input = family >= 8 && family <= 14 ? f::pending_write(family - 8, true, wave)
+                         : family == 15              ? f::pending_join(true, en != 0, wave)
+                         : family == 1               ? f::scratch(wave, true)
+                         : family == 2               ? f::multiple()
+                         : family == 3               ? f::compressed(en)
+                         : family == 4               ? f::missing_active(missing && wave == 2)
+                         : family == 5               ? f::peer(missing && wave == 2)
+                         : family == 6               ? f::wqm(missing && wave == 2)
+                         : family == 7               ? f::previous_destination(missing && wave == 2)
+                                                     : f::scratch(wave);
             input.device = {enabled.device_identity, enabled.shader_int64_enabled,
                             enabled.rgba32_sfloat_sampled};
             waves.push_back(std::move(input));
@@ -133,6 +135,54 @@ TEST(FragmentPacketExportExecution, CompressedRgbaUsesOriginalPackedSourcePair) 
                         EXPECT_EQ(component->width, 16u);
                     }
                 }
+    }
+}
+TEST(FragmentPacketExportExecution, RealWaitProtectsOriginalPayloadAgainstEveryExecWriter) {
+    for (uint32_t family = 0; family < 7; ++family) {
+        const auto actual = execute(8 + family);
+        if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
+        ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
+        ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
+        for (uint32_t wave = 0; wave < 3; ++wave) {
+            const auto expected = f::pending_records(family, wave);
+            const auto offset = actual.batch.placements[wave].output_base + 128;
+            ASSERT_GE(actual.words.size(), offset + expected.size());
+            EXPECT_TRUE(
+                std::equal(expected.begin(), expected.end(), actual.words.begin() + offset));
+            for (uint32_t lane = 0; lane < 64; ++lane) {
+                const auto& events = actual.result.architectural_exports[wave][lane].events;
+                ASSERT_EQ(events.size(), 2u);
+                EXPECT_EQ(events[0].exec, f::active(lane));
+                if (f::active(lane)) EXPECT_EQ(*events[0].source_words[0], 0x87000000u + lane);
+                const bool on = family == 3   ? f::active(lane) && lane != 40
+                                : family == 4 ? lane < 4 || (lane >= 28 && lane < 36) ||
+                                                    (lane >= 40 && lane < 44) || lane >= 60
+                                              : f::active(lane);
+                EXPECT_EQ(events[1].exec, on);
+                EXPECT_EQ(events[1].source_words[0].has_value(), on);
+                if (on)
+                    EXPECT_EQ(*events[1].source_words[0],
+                              family == 0 ? f::value(wave) : 0x87000000u + lane);
+            }
+        }
+    }
+}
+TEST(FragmentPacketExportExecution, BothConditionalWaitPathsPreservePreOverwritePayload) {
+    for (uint32_t scc : {0u, 1u}) {
+        const auto actual = execute(15, false, scc);
+        if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
+        ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
+        ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
+        for (uint32_t wave = 0; wave < 3; ++wave)
+            for (uint32_t lane = 0; lane < 64; ++lane) {
+                const auto& output = actual.result.architectural_exports[wave][lane];
+                ASSERT_EQ(output.events.size(), 2u);
+                EXPECT_EQ(output.events[0].exec, f::active(lane));
+                if (f::active(lane)) {
+                    EXPECT_EQ(*output.events[0].source_words[0], 0x87000000u + lane);
+                    EXPECT_EQ(output.colors[0][0]->bits, f::value(wave));
+                }
+            }
     }
 }
 TEST(FragmentPacketExportExecution, ActiveUnavailableLateWordCannotHideBehindVmOrHostMask) {

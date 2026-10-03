@@ -1,5 +1,6 @@
 #include "fixtures/fragment_packet_exports_fixture.hpp"
 #include "bpermute_spirv_oracle.hpp"
+#include "gpu/recompiler/fragment_packet_mask_requirements.hpp"
 #include <gtest/gtest.h>
 #include <cstdlib>
 #include <filesystem>
@@ -79,6 +80,36 @@ TEST(FragmentPacketExports, EntirelyInactiveMayHaveNoPayloadButKeepsControl) {
         EXPECT_FALSE(lane.events[0].source_words[0].has_value());
     }
 }
+TEST(FragmentPacketExports, OnlyDemandedInitialMasksSupplyArchitecturalAuthority) {
+    auto input = f::scratch().invocation;
+    input.mask_state_available = false;
+    input.exec_available = true;
+    input.vcc_mask = UINT64_MAX; // deliberately absent, NOT a value used to seed the compiler
+    input.scc = true;
+    const auto exec_only = compile(input, "only_exec_present");
+    ASSERT_FALSE(exec_only.spirv.empty()) << exec_only.rejection;
+    EXPECT_EQ(exec_only.initial_mask_availability, kPacketInitialExec);
+    EXPECT_EQ(exec_only.demanded_initial_masks, kPacketInitialExec);
+    const auto first_words = execute(exec_only);
+    const auto first_expected = f::scratch_records(0);
+    ASSERT_GE(first_words.size(), first_expected.size());
+    EXPECT_TRUE(std::equal(first_expected.begin(), first_expected.end(), first_words.begin()));
+    input.exec_available = false;
+    EXPECT_EQ(recompile_fragment_packet(input).rejection, "packet-entry-exec-unavailable");
+    input.guest_code.insert(input.guest_code.begin(), 0xbefe0414u);   // real entry-independent EXEC
+    const auto writer = compile(input, "genuine_exec_writer");
+    ASSERT_FALSE(writer.spirv.empty()) << writer.rejection;
+    EXPECT_EQ(writer.initial_mask_availability, 0u);
+    EXPECT_EQ(writer.demanded_initial_masks, 0u);
+    auto expected = f::scratch_records(0);
+    for (uint32_t lane = 0; lane < 64; ++lane) expected[lane * 14 + 12] = 2;
+    const auto words = execute(writer);
+    ASSERT_GE(words.size(), expected.size());
+    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), words.begin()));
+    const auto decoded = decode_fragment_packet(writer, words, true);
+    ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+    EXPECT_EQ(decoded.architectural_exports[63].colors[0][0]->bits, f::value(0));
+}
 TEST(FragmentPacketExports, ActiveReadIgnoresHostEligibilityAndLaterVm) {
     for (bool missing : {false, true}) {
         const auto p =
@@ -129,9 +160,9 @@ TEST(FragmentPacketExports, ChannelAccumulationNullAndLastVmAreNotFinalExec) {
         const auto& out = decoded.architectural_exports[lane];
         ASSERT_EQ(out.events.size(), 4u);
         EXPECT_EQ(out.events[0].site.pc, 0u);
-        EXPECT_EQ(out.events[1].site.pc, 3u);
-        EXPECT_EQ(out.events[2].site.pc, 5u);
-        EXPECT_EQ(out.events[3].site.pc, 8u);
+        EXPECT_EQ(out.events[1].site.pc, 4u);
+        EXPECT_EQ(out.events[2].site.pc, 6u);
+        EXPECT_EQ(out.events[3].site.pc, 10u);
         EXPECT_TRUE(out.events[3].exec);
         EXPECT_EQ(out.valid_mask, f::active(lane));
         EXPECT_EQ(out.commit_eligible, f::active(lane) && lane != 40);
@@ -145,6 +176,88 @@ TEST(FragmentPacketExports, ChannelAccumulationNullAndLastVmAreNotFinalExec) {
     words[63 * 56 + 12] ^= 1;
     EXPECT_EQ(decode_fragment_packet(p, words, true).rejection,
               "packet-architectural-export-record-invalid");
+}
+TEST(FragmentPacketExports, PendingWordsAndEveryExecWriterNeedActualCompletion) {
+    EXPECT_EQ(recompile_fragment_packet(f::multiple(false).invocation).rejection,
+              "packet-export-exec-overwrite-before-wait");   // historical unsafe snapshot refused
+    for (uint32_t family = 0; family < 7; ++family) {
+        const auto unsafe = f::pending_write(family, false).invocation;
+        const auto refused = recompile_fragment_packet(unsafe);
+        if (family < 5) {
+            EXPECT_EQ(refused.rejection, family == 0 ? "packet-export-source-overwrite-before-wait"
+                                                     : "packet-export-exec-overwrite-before-wait");
+            EXPECT_TRUE(refused.spirv.empty());
+        } else {
+            ASSERT_FALSE(refused.spirv.empty()) << refused.rejection;
+            retain(refused.spirv, family == 5 ? "vcc_not_exec" : "disjoint_word");
+            EXPECT_TRUE(decode_fragment_packet(refused, execute(refused), true).rejection.empty());
+        }
+        const auto good = compile(f::pending_write(family, true).invocation,
+                                  ("wait_writer_" + std::to_string(family)).c_str());
+        ASSERT_FALSE(good.spirv.empty()) << good.rejection;
+        const auto words = execute(good);
+        const auto expected = f::pending_records(family, 0);
+        ASSERT_GE(words.size(), expected.size());
+        EXPECT_TRUE(std::equal(expected.begin(), expected.end(), words.begin()));
+        const auto decoded = decode_fragment_packet(good, words, true);
+        ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+        ASSERT_EQ(decoded.architectural_exports.size(), 64u);
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            const auto& events = decoded.architectural_exports[lane].events;
+            ASSERT_EQ(events.size(), 2u);
+            EXPECT_EQ(events[0].exec, f::active(lane));
+            if (f::active(lane)) EXPECT_EQ(*events[0].source_words[0], 0x87000000u + lane);
+            const bool on = family == 3   ? f::active(lane) && lane != 40
+                            : family == 4 ? lane < 4 || (lane >= 28 && lane < 36) ||
+                                                (lane >= 40 && lane < 44) || lane >= 60
+                                          : f::active(lane);
+            EXPECT_EQ(events[1].exec, on);
+            EXPECT_EQ(events[1].source_words[0].has_value(), on);
+            if (on)
+                EXPECT_EQ(*events[1].source_words[0],
+                          family == 0 ? f::value(0) : 0x87000000u + lane);
+        }
+    }
+    auto done = f::pending_write(0, false).invocation;
+    done.guest_code[0] |= 1u << 11;   // DONE alone cannot protect the pending payload overwrite
+    EXPECT_EQ(recompile_fragment_packet(done).rejection,
+              "packet-export-source-overwrite-before-wait");
+}
+TEST(FragmentPacketExports, EveryConditionalPathAndPackedPhysicalWordMustStayStable) {
+    for (bool scc : {false, true}) {
+        EXPECT_EQ(recompile_fragment_packet(f::pending_join(false, scc).invocation).rejection,
+                  "packet-export-source-overwrite-before-wait");
+        const auto good = compile(f::pending_join(true, scc).invocation,
+                                  scc ? "both_paths_one" : "both_paths_zero");
+        ASSERT_FALSE(good.spirv.empty()) << good.rejection;
+        const auto decoded = decode_fragment_packet(good, execute(good), true);
+        ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+        for (uint32_t lane = 0; lane < 64; ++lane)
+            if (f::active(lane)) {
+                EXPECT_EQ(*decoded.architectural_exports[lane].events[0].source_words[0],
+                          0x87000000u + lane);
+                EXPECT_EQ(decoded.architectural_exports[lane].colors[0][0]->bits, f::value(0));
+            }
+    }
+    for (uint32_t reg : {6u, 7u}) {
+        auto input = f::compressed(12).invocation;
+        input.guest_code[0] &= ~((1u << 11) | (1u << 12));
+        input.guest_code.pop_back();
+        f::fp::vmov(input.guest_code, reg, 0);
+        f::exp(input.guest_code, 9, 0, 0, true, true);
+        input.guest_code.push_back(0xbf810000u);
+        const auto actual = compile(input, reg == 6 ? "packed_pending" : "packed_disjoint");
+        if (reg == 6) {
+            EXPECT_EQ(actual.rejection, "packet-export-source-overwrite-before-wait");
+            EXPECT_TRUE(actual.spirv.empty());
+        } else {
+            ASSERT_FALSE(actual.spirv.empty()) << actual.rejection;
+            const auto decoded = decode_fragment_packet(actual, execute(actual), true);
+            ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+            EXPECT_EQ(decoded.architectural_exports[63].colors[3][2]->bits, 63u);
+            EXPECT_EQ(decoded.architectural_exports[63].colors[3][3]->bits, 0x7fffu);
+        }
+    }
 }
 TEST(FragmentPacketExports, CompressedReadsTwoPhysicalWordsAndKeepsRaw16BitChannels) {
     for (uint32_t en : {0u, 3u, 12u, 15u}) {
@@ -273,4 +386,4 @@ TEST(FragmentPacketExports, ReactivatedP2OldDestinationRemainsAReadNotExportExem
         }
     }
 }
-} // namespace
+}   // namespace

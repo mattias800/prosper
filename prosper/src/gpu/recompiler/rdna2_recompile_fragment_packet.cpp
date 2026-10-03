@@ -4,6 +4,7 @@
 #include "gpu/recompiler/fragment_packet_services.hpp"
 #include "gpu/recompiler/fragment_packet_definedness.hpp"
 #include "gpu/recompiler/fragment_packet_exports_internal.hpp"
+#include "gpu/recompiler/fragment_packet_export_timing.hpp"
 #include <bitset>
 
 namespace prosper::gpu {
@@ -250,6 +251,9 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
             gap = fragment_packet_architectural_export_gap({in.pc, in.exp_target, in.exp_en,
                                                             in.exp_compr, (in.words[0] >> 11) & 1u,
                                                             (in.words[0] >> 12) & 1u});
+        if (packet.export_observation == FragmentPacketExportObservation::Architectural &&
+            in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c && in.simm16 == 0)
+            gap = nullptr;   // real full WAIT completion for architectural pending exports
         if (services && gap && !packet_resource_instruction_gap(in)) gap = nullptr;
         else if (services && in.fmt == Rdna2Format::SMEM)
             gap = packet_resource_instruction_gap(in);
@@ -313,6 +317,9 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         return reject(gap, scalar_failure_pc);
     if (services)
         if (const auto* gap = packet_resource_preflight(services->input, ins, scalar_failure_pc))
+            return reject(gap, scalar_failure_pc);
+    if (packet.export_observation == FragmentPacketExportObservation::Architectural)
+        if (const auto* gap = fragment_packet_export_timing_gap(ins, scalar_failure_pc))
             return reject(gap, scalar_failure_pc);
 
     const auto requirements =

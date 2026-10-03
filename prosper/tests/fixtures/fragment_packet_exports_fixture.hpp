@@ -75,19 +75,100 @@ inline FragmentResourcePacket wqm(bool missing = false) {
     p.invocation.guest_code.push_back(0xbf810000u);
     return p;
 }
-inline FragmentResourcePacket multiple() {
+inline FragmentResourcePacket multiple(bool drain = true) {
     auto p = base();
     p.invocation.exec_mask = UINT64_MAX;
     for (uint32_t reg : {1u, 2u, 3u}) column(p, reg, 0x80000000u + reg * 0x10000);
     auto& code = p.invocation.guest_code;
     exp(code, 2, 3, 0x00000201u, false, true); // PC0, full EXEC, R/G
-    code.push_back(0xbefe0414u); // PC2, genuine supplied sparse s20:21
-    exp(code, 2, 4, 0x00030000u, false, false); // PC3, sparse B, does not update VM
-    exp(code, 9, 0, 0, false, true); // PC5, last VM sparse, NO payload
-    code.push_back(0xbefe0416u); // PC7, genuine supplied full s22:23
-    exp(code, 9, 0, 0, true, false); // PC8, final EXEC full, last VM still sparse
+    if (drain) code.push_back(0xbf8c0000u); // actual full WAIT before altering pending EXEC
+    code.push_back(0xbefe0414u); // PC3 when drained, genuine supplied sparse s20:21
+    exp(code, 2, 4, 0x00030000u, false, false); // PC4, sparse B, does not update VM
+    exp(code, 9, 0, 0, false, true); // PC6, last VM sparse, NO payload
+    if (drain) code.push_back(0xbf8c0000u);
+    code.push_back(0xbefe0416u); // PC9, genuine supplied full s22:23
+    exp(code, 9, 0, 0, true, false); // PC10, final EXEC full, last VM still sparse
     code.push_back(0xbf810000u);
     return p;
+}
+// Every original writer remains identical between the unsafe and WAIT-completed programs. No
+// supplied branch/mask value certifies timing: even a same-valued EXEC replacement must drain.
+inline FragmentResourcePacket pending_write(uint32_t family, bool drain, uint32_t wave = 0) {
+    auto p = base(wave);
+    column(p, 1, 0x87000000u);
+    column(p, 0, 0);
+    exp(p.invocation.guest_code, 0, 1, 1, false, false);
+    if (drain) p.invocation.guest_code.push_back(0xbf8c0000u);
+    auto& code = p.invocation.guest_code;
+    switch (family) {
+        case 0: fp::vmov(code, 1, 0); break; // pending physical source word
+        case 1: code.push_back(0xbefe0414u); break; // explicit numeric EXEC pair
+        case 2: code.push_back(0xbe9e2414u); break; // SAVEEXEC s30:31,s20:21 implicit EXEC
+        case 3: code.insert(code.end(), {0x7daa00ffu, 40}); break; // CMPX implicit EXEC
+        case 4: code.push_back(0xbefe0a7eu); break; // WQM explicit EXEC pair
+        case 5: code.insert(code.end(), {0x7d8400ffu, 40}); break; // ordinary CMP only VCC
+        case 6: fp::vmov(code, 2, 0); break; // disjoint VGPR never pending
+    }
+    exp(code, 0, 1, 1, true, true);
+    code.push_back(0xbf810000u);
+    return p;
+}
+inline FragmentResourcePacket pending_join(bool both_wait, bool scc, uint32_t wave = 0) {
+    auto p = base(wave);
+    p.invocation.scc = scc;
+    column(p, 1, 0x87000000u);
+    auto& code = p.invocation.guest_code;
+    exp(code, 0, 1, 1, false, false); // PC0
+    code.push_back(0xbf840002u); // PC2, SCC0 -> PC5
+    code.push_back(0xbf8c0000u); // PC3, first arm genuinely drains
+    code.push_back(0xbf820001u); // PC4 -> PC6
+    code.push_back(both_wait ? 0xbf8c0000u : 0xbf800000u); // PC5, second arm
+    fp::vmov(code, 1, 0); // PC6, join writer
+    exp(code, 0, 1, 1, true, true); // PC7
+    code.push_back(0xbf810000u);
+    return p;
+}
+// Independent original-word oracle: full 14-word transport at BOTH sites and all64 lanes.
+// No production decoder, source-mask helper or decoded PCs enter these expectations.
+inline std::vector<uint32_t> pending_records(uint32_t family, uint32_t wave) {
+    std::vector<uint32_t> words(64 * 28);
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        const bool before = active(lane);
+        const bool after = family == 3   ? before && lane != 40
+                           : family == 4 ? lane < 4 || (lane >= 28 && lane < 36) ||
+                                               (lane >= 40 && lane < 44) || lane >= 60
+                                         : before;
+        const uint32_t row[]{1,
+                             uint32_t(before),
+                             uint32_t(lane != 40),
+                             0,
+                             1,
+                             0,
+                             0,
+                             0,
+                             before ? 0x87000000u + lane : 0,
+                             0,
+                             0,
+                             0,
+                             0,
+                             uint32_t(before),
+                             1,
+                             uint32_t(after),
+                             uint32_t(lane != 40),
+                             0,
+                             1,
+                             0,
+                             1,
+                             1,
+                             after ? family == 0 ? value(wave) : 0x87000000u + lane : 0,
+                             0,
+                             0,
+                             0,
+                             family == 3 || family == 5 ? 5u : 4u,
+                             uint32_t(after)};
+        std::copy(std::begin(row), std::end(row), words.begin() + lane * 28);
+    }
+    return words;
 }
 inline FragmentResourcePacket compressed(uint32_t en = 15) {
     auto p = base();
