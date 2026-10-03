@@ -12,9 +12,10 @@
 // WHAT EACH TEST KILLS:
 //   DeliversSysvArguments        a plain-pointer call: the stub would read RDI/RSI as garbage on Windows
 //   PreservesHostCalleeSavedRegs the stub clobbers RSI/RDI/XMM6/7; a missing save/restore corrupts the loop
-#include "host/image/runtime_module_load.hpp"
+#include "host/image/boot_program.hpp"
 #include "host/image/exec_image.hpp"
 #include "host/image/module_start_params.hpp"
+#include "host/image/runtime_module_load.hpp"
 
 #include <gtest/gtest.h>
 
