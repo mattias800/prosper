@@ -1170,6 +1170,12 @@ if(TARGET prosper_core)
     set_tests_properties(ampr_udata PROPERTIES TIMEOUT 20)
   endif()
 
+  # #4103: force a real equeue allocation to reuse its handle and verify APR lifetime isolation.
+  prosper_add_gtest(test_apr_equeue_lifetime
+    SOURCES tests/hle/kernel/test_apr_equeue_lifetime.cpp
+    LIBRARIES prosper_core
+    PROPERTIES TIMEOUT 20)
+
   # Variadic libc formatters (issue #122): real va_list capture so %f/XMM + stack + %s-past-4th
   # args format correctly (was a 3-integer-register forward). Cross-platform (host libc printf).
   prosper_add_gtest(test_printf

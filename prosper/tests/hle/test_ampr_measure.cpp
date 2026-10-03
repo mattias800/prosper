@@ -346,19 +346,18 @@ TEST(AmprMeasure, Contract) {
         // completed. Binding to a real equeue is the guest asking for completion delivery. Unbound
         // buffers still post nothing (issue #180's invented-counter regression), asserted above.
         //
-        // Cover BOTH delivery dialects, because a live PPSA19991 boot uses both on one equeue: of
-        // its 20 observed bindings, 9 pass id 0 and the rest ids 1..5. prosper_eq_post_apr_token
-        // branches on exactly that (hle_kernel_time.cpp): id 0 takes the #210 pointer dialect and
-        // delivers the exact token, while id != 0 takes the #208 counter dialect and delivers
-        // (ring << 58) | per-(eq,ring) high-water mark. So this asserts what is actually
-        // contractual for CRI — the event ARRIVES carrying its own ident — and deliberately does not
-        // assert a verbatim tag in the counter branch, where the delivered data is a counter and any
-        // zero would be an artifact of a fresh queue rather than an echo.
+        // Cover both zero-tag delivery dialects: id 0 selects RequestPointer, while a nonzero id
+        // selects ConstantZero. Both deliver distinct events. The contract asserted for CRI is
+        // that the event arrives carrying its own ident, independent of its completion tag.
         // CONFIDENCE: HIGH (guest disassembly + firmware NID database + live boot capture).
         if (submit_plain && add_ampr_event) {
-            const struct { int64_t id; const char* what; } cri_cases[] = {
-                { 0,      "zero-tag binding delivers its completion event (id 0, pointer dialect)" },
-                { 0x74fe, "zero-tag binding delivers its completion event (id != 0, counter dialect)" },
+            const struct {
+                int64_t id;
+                const char* what;
+            } cri_cases[] = {
+                {0, "zero-tag binding delivers its completion event (id 0, pointer dialect)"},
+                {0x74fe,
+                 "zero-tag binding delivers its completion event (id != 0, constant-zero dialect)"},
             };
             for (const auto& c : cri_cases) {
                 uint64_t cri_eq = 0;
