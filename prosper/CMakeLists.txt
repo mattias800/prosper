@@ -2352,6 +2352,11 @@ if(TARGET prosper_core)
     SOURCES tests/host/test_dmem.cpp
     LIBRARIES prosper_core)
 
+  # A refused fixed direct-memory map must preserve the allocation for a later retry.
+  prosper_add_gtest(test_dmem_map_failure_rollback
+    SOURCES tests/hle/memory/test_dmem_map_failure_rollback.cpp
+    LIBRARIES prosper_core)
+
   # PROSPER_DMEM_CALLER stack walk (issue #1755): the diagnostic scans up to 160 slots above its
   # frame and used to read straight off the top of a thread stack, dying with a SIGSEGV that reads
   # as a guest fault.
