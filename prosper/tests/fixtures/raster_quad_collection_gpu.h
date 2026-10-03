@@ -453,6 +453,23 @@ inline void collect_backend_raster_quads(const RenderVkCtx& ctx, const BackendDr
     const auto decode_error = decode_raster_quad_records(collector, output,
         static_cast<size_t>(output_bytes / 4), primitive_count, result.quads);
     if (!decode_error.empty()) return refuse(decode_error.c_str());
+    const float min_x = ps.has_scissor ? float(std::clamp<int64_t>(ps.scissor_left, 0, width)) : 0.0f;
+    const float min_y = ps.has_scissor ? float(std::clamp<int64_t>(ps.scissor_top, 0, height)) : 0.0f;
+    const float max_x = ps.has_scissor ? float(std::clamp<int64_t>(ps.scissor_right, int64_t(min_x), width)) : float(width);
+    const float max_y = ps.has_scissor ? float(std::clamp<int64_t>(ps.scissor_bottom, int64_t(min_y), height)) : float(height);
+    std::erase_if(result.quads, [&](const std::vector<uint32_t>& quad) {
+        if (quad.size() < collector.lane_words * 4) return true;
+        for (uint32_t lane = 0; lane < 4; ++lane) {
+            const auto* value = quad.data() + lane * collector.lane_words;
+            if (value[0] == 0) {
+                const float fx = std::bit_cast<float>(value[5]);
+                const float fy = std::bit_cast<float>(value[6]);
+                if (fx >= min_x && fx < max_x && fy >= min_y && fy < max_y)
+                    return false;
+            }
+        }
+        return true;
+    });
     result.complete = true;
     result.host_raster_domain_available = true;
     result.host_sample_count = 1; result.host_sample_index = 0;
