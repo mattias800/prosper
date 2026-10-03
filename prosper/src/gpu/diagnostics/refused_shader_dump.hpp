@@ -25,6 +25,12 @@ inline constexpr size_t kRefusedShaderDumpMaxPrograms = 64;
 bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* code, size_t dwords,
                          const std::string& detail);
 
+// Cheap pre-check for per-draw call sites: true when this (stage, address, first word) was already
+// recorded, the cap is reached, or the dump is disabled -- so a title that refuses one shader every
+// frame does not re-measure and re-hash it every frame. A program rewritten in place at the same
+// address with the same first word is missed; the full check inside note_refused_shader is by hash.
+bool refused_shader_already_noted(const char* stage, uint64_t address, uint32_t first_word);
+
 // Test hooks: where the current run writes, and resetting the per-run state with a new root.
 std::string refused_shader_dump_directory();
 void reset_refused_shader_dump_for_test(const std::string& root);

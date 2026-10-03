@@ -2682,6 +2682,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                                          std::tuple{"ps", rs.ps_addr, fs_words.empty()}}) {
             if (!failed || !addr || !guest_readable(addr, sizeof(uint32_t))) continue;
             const uint32_t* program = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(addr));
+            if (refused_shader_already_noted(tag, addr, program[0])) continue;
             const size_t span = rdna2_recompile_code_span(program, max_shader_dwords);
             if (!span || !guest_readable(addr, static_cast<uint32_t>(span * sizeof(uint32_t))))
                 continue;

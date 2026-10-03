@@ -8,7 +8,9 @@
 #include <ctime>
 #include <filesystem>
 #include <mutex>
+#include <atomic>
 #include <set>
+#include <tuple>
 #include <utility>
 
 namespace prosper::gpu {
@@ -20,6 +22,9 @@ struct DumpState {
     std::string directory;       // created lazily on the first refusal
     std::set<std::pair<std::string, uint64_t>> seen;   // (stage, code hash)
     bool cap_announced = false;
+    bool dir_failure_announced = false;
+    std::set<std::tuple<std::string, uint64_t, uint32_t>> quick;   // (stage, addr, first word)
+    std::atomic<bool> full{false};
 };
 
 DumpState& state() {
@@ -43,20 +48,29 @@ std::string make_directory(DumpState& s) {
         const char* capture = PROSPER_ENV_VALUE("PROSPER_CAPTURE_DIR");
         root = capture && *capture ? capture : ".";
     }
-    char name[96];
-    const std::time_t now = std::time(nullptr);
-    // std::localtime's static buffer is safe here: every caller holds DumpState::mutex. The
-    // nanosecond suffix keeps two runs started in the same second apart.
-    const std::tm tm = *std::localtime(&now);
+    // UTC from std::chrono's calendar: no localtime (not thread-safe) and no platform #if.
+    const auto now = std::chrono::system_clock::now();
+    const auto day = std::chrono::floor<std::chrono::days>(now);
+    const std::chrono::year_month_day ymd{day};
+    const std::chrono::hh_mm_ss hms{std::chrono::floor<std::chrono::seconds>(now - day)};
     const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-    std::snprintf(name, sizeof name, "refused_shaders_%04d%02d%02d-%02d%02d%02d_%06llu",
-                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
-                  (unsigned long long)(ns % 1000000));
+    char name[96];
+    std::snprintf(name, sizeof name, "refused_shaders_%04d%02u%02u-%02dZ%02d%02d_%06llu",
+                  (int)ymd.year(), (unsigned)ymd.month(), (unsigned)ymd.day(),
+                  (int)hms.hours().count(), (int)hms.minutes().count(),
+                  (int)hms.seconds().count(), (unsigned long long)(ns % 1000000));
     std::error_code ec;
     const std::filesystem::path dir = std::filesystem::path(root) / name;
     std::filesystem::create_directories(dir, ec);
-    if (ec) return {};
+    if (ec) {
+        if (!s.dir_failure_announced) {
+            s.dir_failure_announced = true;
+            std::fprintf(stderr, "[refused-shader] cannot create %s (%s); refused shaders are not "
+                                 "dumped this run\n", dir.string().c_str(), ec.message().c_str());
+        }
+        return {};
+    }
     s.directory = dir.string();
     return s.directory;
 }
@@ -81,6 +95,8 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
         return false;
     }
     s.seen.insert({stage, hash});
+    s.quick.insert({stage, address, code[0]});
+    if (s.seen.size() >= kRefusedShaderDumpMaxPrograms) s.full.store(true, std::memory_order_relaxed);
     const std::string dir = make_directory(s);
     if (dir.empty()) return false;
     char file[64];
@@ -108,6 +124,14 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
     return written;
 }
 
+bool refused_shader_already_noted(const char* stage, uint64_t address, uint32_t first_word) {
+    if (PROSPER_ENV_ON("PROSPER_NO_REFUSED_SHADER_DUMP")) return true;
+    DumpState& s = state();
+    if (s.full.load(std::memory_order_relaxed)) return true;
+    std::lock_guard lock(s.mutex);
+    return s.quick.count({stage, address, first_word}) != 0;
+}
+
 std::string refused_shader_dump_directory() {
     DumpState& s = state();
     std::lock_guard lock(s.mutex);
@@ -120,7 +144,10 @@ void reset_refused_shader_dump_for_test(const std::string& root) {
     s.root = root;
     s.directory.clear();
     s.seen.clear();
+    s.quick.clear();
+    s.full.store(false);
     s.cap_announced = false;
+    s.dir_failure_announced = false;
 }
 
 }  // namespace prosper::gpu

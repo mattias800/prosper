@@ -105,3 +105,30 @@ TEST(NpUdsProperties, SessionSignalingInitialize) {
     EXPECT_EQ(init(ptr(param), 0, 0, 0, 0, 0), 0u);
     EXPECT_EQ(init(0, 0, 0, 0, 0, 0), kInvalidArgument);
 }
+
+// Review of #4290: CreateEvent's property-object out must be accepted by ObjectSetArray. Metaphor
+// attaches arrays only to objects from CreateEvent, and a validator that only knew
+// CreateEventPropertyObject's handles refused all of them. The event owns the object, so
+// DestroyEventPropertyObject must refuse it rather than free a handle it never allocated.
+TEST(NpUdsProperties, CreateEventObjectsAcceptArrays) {
+    const Uds u = registered();
+    ASSERT_TRUE(u.all());
+    HleFn create_event = Hle::lookup("p+GcLqwpL9M");
+    ASSERT_NE(create_event, nullptr);
+    uint64_t array = 0;
+    ASSERT_EQ(u.create_array(ptr(&array), 0, 0, 0, 0, 0), 0u);
+    ASSERT_EQ(u.array_set_string(array, ptr("PlayStation"), 0, 0, 0, 0), 0u);
+    // Dead Cells' shape: properties out in a3.
+    uint64_t event = 0, properties = 0;
+    ASSERT_EQ(create_event(ptr("activityStart"), 0, ptr(&event), ptr(&properties), 0, 0), 0u);
+    ASSERT_NE(properties, 0u);
+    EXPECT_EQ(u.object_set_array(properties, ptr("platforms"), array, 0, 0, 0), 0u);
+    EXPECT_EQ(u.destroy_object(properties, 0, 0, 0, 0, 0), kInvalidArgument)
+        << "the event owns its property object";
+    // Alex Kidd's shape: properties out in a4, with a3 and a5 zero.
+    uint64_t event2 = 0, properties2 = 0;
+    ASSERT_EQ(create_event(ptr("activityTerminate"), 0, ptr(&event2), 0, ptr(&properties2), 0), 0u);
+    ASSERT_NE(properties2, 0u);
+    EXPECT_EQ(u.object_set_array(properties2, ptr("platforms"), array, 0, 0, 0), 0u);
+    EXPECT_EQ(u.destroy_array(array, 0, 0, 0, 0, 0), 0u);
+}

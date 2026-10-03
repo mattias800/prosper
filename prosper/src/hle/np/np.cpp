@@ -247,7 +247,11 @@ HLE(s_share_content_param) {
 // CONFIDENCE: HIGH for the argument shapes (live capture), MED for the invalid-argument code
 // (shared with the rest of this library's handlers).
 namespace {
-enum class UdsKind : uint8_t { Object, Array };
+// EventObject: a property object handed out by sceNpUniversalDataSystemCreateEvent. It is an object
+// to the setters, but the event owns it, so DestroyEventPropertyObject refuses it and it is never
+// freed here. Those handles come from a counter, not an allocation; the record of them is bounded
+// (oldest dropped first) because a title may create events for the whole session.
+enum class UdsKind : uint8_t { Object, Array, EventObject };
 std::mutex g_uds_mx;
 std::unordered_map<uint64_t, UdsKind>& uds_live() {
     static std::unordered_map<uint64_t, UdsKind> live;
@@ -270,7 +274,20 @@ uint64_t uds_create(uint64_t out, UdsKind kind) {
 bool uds_is(uint64_t handle, UdsKind kind) {
     std::lock_guard lock(g_uds_mx);
     const auto it = uds_live().find(handle);
-    return it != uds_live().end() && it->second == kind;
+    if (it == uds_live().end()) return false;
+    return it->second == kind || (kind == UdsKind::Object && it->second == UdsKind::EventObject);
+}
+constexpr size_t kUdsEventObjectRecord = 1024;
+void uds_note_event_object(uint64_t handle) {
+    static std::deque<uint64_t> order;
+    std::lock_guard lock(g_uds_mx);
+    uds_live()[handle] = UdsKind::EventObject;
+    order.push_back(handle);
+    if (order.size() > kUdsEventObjectRecord) {
+        const auto it = uds_live().find(order.front());
+        if (it != uds_live().end() && it->second == UdsKind::EventObject) uds_live().erase(it);
+        order.pop_front();
+    }
 }
 uint64_t uds_destroy(uint64_t handle, UdsKind kind) {
     {
@@ -346,8 +363,12 @@ HLE(s_npuds_create_event) {
     svc_log("sceNpUniversalDataSystemCreateEvent", a0,a1,a2,a3,a4,a5);
     if (!svc_ptrish(a2)) return 0x80550003ull; // NP invalid argument
     *(uint64_t*)PW(a2) = g_handle.fetch_add(1);
-    if (svc_ptrish(a3))                                *(uint64_t*)PW(a3) = g_handle.fetch_add(1);
-    else if (a3 == 0 && a5 == 0 && svc_ptrish(a4))     *(uint64_t*)PW(a4) = g_handle.fetch_add(1);
+    // The property object is recorded so EventPropertyObjectSetArray accepts it (#4275 review):
+    // Metaphor attaches arrays only to objects that came from here.
+    uint64_t properties = 0;
+    if (svc_ptrish(a3))                                *(uint64_t*)PW(a3) = properties = g_handle.fetch_add(1);
+    else if (a3 == 0 && a5 == 0 && svc_ptrish(a4))     *(uint64_t*)PW(a4) = properties = g_handle.fetch_add(1);
+    if (properties) uds_note_event_object(properties);
     return 0;
 }
 HLE(s_npuds_post_event) {

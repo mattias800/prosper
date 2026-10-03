@@ -969,13 +969,13 @@ HLE(s_savedata_setparam) {
 // file's existing Set/GetParam contract.
 HLE(s_savedata_saveicon) {
     svc_log("sceSaveDataSaveIcon", a0,a1,a2,a3,a4,a5);
-    if (!savedata_mount_point_ok(a0) || !a1) return SAVE_DATA_ERR_PARAMETER;
+    if (!savedata_mount_point_ok(a0) || !svc_ptrish(a1)) return SAVE_DATA_ERR_PARAMETER;
     const uint8_t* icon = (const uint8_t*)PW(a1);
     uint64_t buf = 0, buf_size = 0, data_size = 0;
     memcpy(&buf, icon + 0x00, sizeof buf);
     memcpy(&buf_size, icon + 0x08, sizeof buf_size);
     memcpy(&data_size, icon + 0x10, sizeof data_size);
-    if (!buf || !data_size || data_size > buf_size) return SAVE_DATA_ERR_PARAMETER;
+    if (!svc_ptrish(buf) || !data_size || data_size > buf_size) return SAVE_DATA_ERR_PARAMETER;
     const std::string dir = savedata0_mounted_dir();
     if (dir.empty()) return SAVE_DATA_ERR_NOT_MOUNTED;
     const std::filesystem::path sys = std::filesystem::path(dir) / "sce_sys";
