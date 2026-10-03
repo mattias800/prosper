@@ -241,6 +241,101 @@ TEST_F(OwnedRawX2Mapped, MissingEpochCurrentBytesAndPointerEquationRefuse) {
         wrong_child.publish_compute_x2(table, raw_snapshot_write_plan(decode(program())), {}));
     EXPECT_TRUE(table.resources.empty());
 }
+TEST_F(OwnedRawX2Mapped, DiagnosticNamesRealRefusalWithoutExtraAuthorityQueries) {
+    GuestMappingLease lease;
+    const auto decoded = decode(program());
+    GraphicsRawSnapshotContext context{true, {}};
+    uint32_t checks = 0;
+    set_graphics_raw_source_authority([&](const GuestMappingLease&, uint64_t, uint32_t) {
+        ++checks;
+        return false;
+    });
+    GraphicsNestedWideReader ordinary(chains(program()), &context, &lease);
+    EXPECT_FALSE(observe(ordinary));
+    ASSERT_EQ(checks, 1u);
+    checks = 0;
+    RawSnapshotDiagnostic report;
+    GraphicsNestedWideReader observed(chains(program()), &context, &lease, &report);
+    EXPECT_FALSE(observe(observed));
+    EXPECT_EQ(checks, 1u) << "the diagnostic must not retry an ownership check or source read";
+    EXPECT_EQ(report.first_refusal, RawSnapshotGate::CurrentSourceUnproved);
+    EXPECT_EQ(report.refusal_pc, 0u);
+    EXPECT_EQ(report.refusal_address, parent + 4u);
+    EXPECT_EQ(report.refusal_bytes, 8u);
+    EXPECT_EQ(report.load_count, 0u);
+    ShaderResourceTable table;
+    EXPECT_FALSE(observed.publish_compute_x2(table, raw_snapshot_write_plan(decoded), {}));
+    EXPECT_EQ(report.first_refusal, RawSnapshotGate::CurrentSourceUnproved)
+        << "missing publication observations must not overwrite the actual first gate";
+    EXPECT_TRUE(table.resources.empty());
+    EXPECT_FALSE(report.published);
+    EXPECT_NE(format_raw_snapshot_diagnostic(report).find("first=CurrentSourceUnproved"),
+              std::string::npos);
+}
+TEST_F(OwnedRawX2Mapped, DiagnosticKeepsSameOwnedBytesAndActualPublication) {
+    GuestMappingLease lease;
+    const auto decoded = decode(program());
+    GraphicsRawSnapshotContext context{true, {}};
+    uint32_t checks = 0;
+    set_graphics_raw_source_authority([&](const GuestMappingLease&, uint64_t, uint32_t) {
+        ++checks;
+        return true;
+    });
+    GraphicsNestedWideReader ordinary(chains(program()), &context, &lease);
+    ASSERT_TRUE(observe(ordinary));
+    ShaderResourceTable control;
+    ASSERT_TRUE(ordinary.publish_compute_x2(control, raw_snapshot_write_plan(decoded), {}));
+    ASSERT_EQ(checks, 2u);
+    checks = 0;
+    RawSnapshotDiagnostic report;
+    GraphicsNestedWideReader observed(chains(program()), &context, &lease, &report);
+    ASSERT_TRUE(observe(observed));
+    ShaderResourceTable table;
+    ASSERT_TRUE(observed.publish_compute_x2(table, raw_snapshot_write_plan(decoded), {}));
+    EXPECT_EQ(checks, 2u);
+    EXPECT_EQ(report.first_refusal, RawSnapshotGate::None);
+    EXPECT_TRUE(report.published);
+    ASSERT_EQ(report.load_count, 2u);
+    EXPECT_EQ(report.loads[0].pc, 0u);
+    EXPECT_EQ(report.loads[0].address, parent + 4u);
+    EXPECT_EQ(report.loads[1].pc, 2u);
+    EXPECT_EQ(report.loads[1].words, (std::array<uint32_t, 2>{60, 68}));
+    for (uint32_t pc : {0u, 2u}) {
+        const auto* actual = owned_nested_snapshot_at(table, pc, 8);
+        const auto* prior = owned_nested_snapshot_at(control, pc, 8);
+        ASSERT_TRUE(actual && prior);
+        EXPECT_EQ(actual->gpu_addr, prior->gpu_addr);
+        EXPECT_EQ(std::memcmp(actual->host_data, prior->host_data, 8), 0);
+    }
+    const uint32_t changed[2] = {111, 222};
+    std::memcpy(reinterpret_cast<void*>(child + 0x38), changed, 8);
+    EXPECT_EQ(report.loads[1].words, (std::array<uint32_t, 2>{60, 68}))
+        << "reported words come from the observed owner, never a later guest reread";
+}
+TEST_F(OwnedRawX2Mapped, DiagnosticProducerFieldsCannotGrantAdmission) {
+    GuestMappingLease lease;
+    GraphicsRawSnapshotContext context{false, {}};
+    context.observation = {true, false, true, true, true, true, true, false, 0, 0};
+    uint32_t checks = 0;
+    set_graphics_raw_source_authority([&](const GuestMappingLease&, uint64_t, uint32_t) {
+        ++checks;
+        return true;
+    });
+    GraphicsNestedWideReader control(chains(program()), &context, &lease);
+    EXPECT_FALSE(observe(control));
+    RawSnapshotDiagnostic report;
+    GraphicsNestedWideReader observed(chains(program()), &context, &lease, &report);
+    EXPECT_FALSE(observe(observed));
+    EXPECT_EQ(checks, 0u) << "an unavailable actual epoch refuses before any guest source check";
+    EXPECT_EQ(report.first_refusal, RawSnapshotGate::ProducerIncomplete);
+    EXPECT_TRUE(report.producer.available);
+    EXPECT_TRUE(report.producer.producer_epoch_ok);
+    ShaderResourceTable table;
+    EXPECT_FALSE(
+        observed.publish_compute_x2(table, raw_snapshot_write_plan(decode(program())), {}));
+    EXPECT_TRUE(table.resources.empty());
+    EXPECT_FALSE(report.published);
+}
 TEST_F(OwnedRawX2Mapped, PhysicalStoreAliasAndDescriptorChangesRefuse) {
     auto code = program();
     code.insert(code.end() - 1, {0xf0200f08u, 0x00060004u});
@@ -265,11 +360,14 @@ TEST_F(OwnedRawX2Mapped, PhysicalStoreAliasAndDescriptorChangesRefuse) {
     target.size = 64 * 64;
     GuestMappingLease lease;
     GraphicsRawSnapshotContext context{true, {}};
-    GraphicsNestedWideReader reader(rdna2_owned_raw_x2_chains(decoded), &context, &lease);
+    RawSnapshotDiagnostic report;
+    GraphicsNestedWideReader reader(rdna2_owned_raw_x2_chains(decoded), &context, &lease, &report);
     ASSERT_TRUE(observe(reader));
     ShaderResourceTable okay;
     okay.resources.push_back(target);
     ASSERT_TRUE(reader.publish_compute_x2(okay, raw_snapshot_write_plan(decoded), {use}));
+    EXPECT_TRUE(report.published);
+    EXPECT_EQ(report.first_refusal, RawSnapshotGate::None);
     ShaderResourceTable bad;
     target.gpu_addr = alias;
     bad.resources.push_back(target);
@@ -277,6 +375,8 @@ TEST_F(OwnedRawX2Mapped, PhysicalStoreAliasAndDescriptorChangesRefuse) {
         << "different VAs backed by the same physical page must remain an alias";
     EXPECT_EQ(bad.resources.size(), 1u);
     EXPECT_TRUE(bad.owned_host_data.empty());
+    EXPECT_FALSE(report.published);
+    EXPECT_EQ(report.first_refusal, RawSnapshotGate::PhysicalNotDisjoint);
     bad.resources[0].gpu_addr = output;
     bad.resources[0].metadata_addr = output;
     EXPECT_FALSE(reader.publish_compute_x2(bad, raw_snapshot_write_plan(decoded), {use}));

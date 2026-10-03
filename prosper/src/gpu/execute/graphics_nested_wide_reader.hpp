@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gpu/diagnostics/raw_snapshot_diagnostic.hpp"
 #include "gpu/resources/fold_reader.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -35,6 +36,7 @@ struct GraphicsRawSnapshotContext {
     // Even a shader with no explicit stores writes its framebuffer through exports; a same-
     // allocation scalar input cannot be a wave-invariant snapshot during that write.
     std::vector<std::pair<uint64_t, uint64_t>> output_allocations;
+    RawSnapshotProducerObservation observation; // never read by admission
 };
 
 // The live renderer must prove that raw guest bytes are current, including physical aliases of
@@ -151,10 +153,13 @@ class GraphicsNestedWideReader final : public FoldReader {
     std::unique_ptr<prosper::GuestMappingLease> owned_lease_;
     const prosper::GuestMappingLease* lease_ = nullptr;
     bool allowed_ = false;
+    RawSnapshotDiagnostic* diagnostic_ = nullptr;
+
 public:
     GraphicsNestedWideReader(std::vector<RawNestedWideChain> chains,
                              const GraphicsRawSnapshotContext* context,
-                             const prosper::GuestMappingLease* borrowed_lease = nullptr);
+                             const prosper::GuestMappingLease* borrowed_lease = nullptr,
+                             RawSnapshotDiagnostic* diagnostic = nullptr);
     bool owns_raw_wide(uint32_t pc) const override { return widths_.contains(pc); }
     bool probe(FoldProbe kind, uint32_t pc, uint64_t address, uint32_t bytes) override;
     uint32_t word(uint32_t pc, uint64_t address) override;

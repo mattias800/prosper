@@ -8549,7 +8549,9 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
             (!raw_source->raw_nested_wide_data_load_pcs.empty() ||
              !raw_source->owned_raw_x2_chains.empty()))
             *mapping_lease = std::make_unique<GuestMappingLease>();
+        RawSnapshotDiagnostic raw_x2_diagnostic;
         std::unique_ptr<GraphicsNestedWideReader> raw_x2_reader;
+        const bool observe_raw_x2 = raw_snapshot_diagnostic_enabled();
 
         uint32_t range_start = 0;
         if (header->specials && guest_readable((uint64_t)(uintptr_t)header->specials,
@@ -8567,6 +8569,18 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
         // PM4 storage past the declared user block is not a hardware entry value. Keep exact-PC
         // ownership on refusal, so padded/stale SH words cannot acquire a nested snapshot.
         if (raw_source && !raw_source->owned_raw_x2_chains.empty()) {
+            if (observe_raw_x2) {
+                raw_x2_diagnostic.required_user_words =
+                    raw_source->owned_raw_x2_write_plan.required_user_words;
+                raw_x2_diagnostic.actual_user_words = std::min(user_count, kUserSgprs);
+                raw_x2_diagnostic.ordered_lease_available = mapping_lease && *mapping_lease;
+                if (raw_context) raw_x2_diagnostic.producer = raw_context->observation;
+                if (!raw_x2_diagnostic.ordered_lease_available)
+                    raw_x2_diagnostic.refuse(RawSnapshotGate::LeaseUnavailable);
+                else if (raw_x2_diagnostic.required_user_words >
+                         raw_x2_diagnostic.actual_user_words)
+                    raw_x2_diagnostic.refuse(RawSnapshotGate::EntryUnavailable);
+            }
             raw_x2_reader = std::make_unique<GraphicsNestedWideReader>(
                 raw_source->owned_raw_x2_chains,
                 mapping_lease && *mapping_lease &&
@@ -8574,7 +8588,8 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
                             std::min(user_count, kUserSgprs)
                     ? raw_context
                     : nullptr,
-                mapping_lease ? mapping_lease->get() : nullptr);
+                mapping_lease ? mapping_lease->get() : nullptr,
+                observe_raw_x2 ? &raw_x2_diagnostic : nullptr);
             raw_x2_reader->branch_exclusive_disabled =
                 // NOLINTNEXTLINE(concurrency-mt-unsafe): Existing helper samples per submit; environment arms occur between submissions.
                 PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_BRANCH_EXCLUSIVE");
@@ -8860,9 +8875,13 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
             // The fold already resolved each child's exact current pointer. Only the ordered
             // live path carries a mapping lease; offline realization remains fail-closed. The
             // admission helper freezes parent/child bytes and rejects any possible write alias.
-            if (raw_x2_reader)
+            if (raw_x2_reader) {
                 (void)raw_x2_reader->publish_compute_x2(*table, raw_source->owned_raw_x2_write_plan,
                                                         compute_srt_uses);
+                if (observe_raw_x2)
+                    log_raw_snapshot_diagnostic(code_addr, submit_no, dispatch.command_order,
+                                                raw_source->code, raw_x2_diagnostic);
+            }
             (void)admit_compute_nested_wide_data(
                 mapping_lease ? mapping_lease->get() : nullptr,
                 facts->decoded, compute_srt_uses, *table);
@@ -11890,7 +11909,10 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     !defer_graphics_wait && producer_epoch_ok && graphics_epoch_ok &&
                         indirect_dependencies_ok && graphics_epoch.known && completed.known &&
                         !completed.pending && graphics_epoch.failures == completed.failures,
-                    {}};
+                    {},
+                    {true, defer_graphics_wait, producer_epoch_ok, graphics_epoch_ok,
+                     indirect_dependencies_ok, graphics_epoch.known, completed.known,
+                     completed.pending, graphics_epoch.failures, completed.failures}};
                 RetainedComputeRealization realization = RetainedComputeRealization::Failed;
                 // #3656: try the device-resolved route first. Realization happens here, with the
                 // counts unknown, and is kept only if it proves launch-free; otherwise everything

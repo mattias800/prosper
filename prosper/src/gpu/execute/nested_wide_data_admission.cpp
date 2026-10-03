@@ -730,15 +730,32 @@ bool prepare_owned_fragment_export_commit(const GraphicsWaveStagePlan& plan,
 
 GraphicsNestedWideReader::GraphicsNestedWideReader(std::vector<RawNestedWideChain> chains,
                                                    const GraphicsRawSnapshotContext* context,
-                                                   const GuestMappingLease* borrowed_lease)
-    : chains_(std::move(chains)) {
+                                                   const GuestMappingLease* borrowed_lease,
+                                                   RawSnapshotDiagnostic* diagnostic)
+    : chains_(std::move(chains)), diagnostic_(diagnostic) {
     allowed_ = context && context->producers_complete && !chains_.empty();
+    if (diagnostic_) {
+        diagnostic_->chain_count = static_cast<uint32_t>(chains_.size());
+        if (!chains_.empty()) {
+            diagnostic_->first_parent_pc = chains_.front().parent_pc;
+            diagnostic_->first_child_pc = chains_.front().child_pc;
+        }
+        diagnostic_->context_supplied = context != nullptr;
+        if (context) diagnostic_->producer = context->observation;
+        if (!context)
+            diagnostic_->refuse(RawSnapshotGate::ContextUnavailable);
+        else if (!context->producers_complete)
+            diagnostic_->refuse(RawSnapshotGate::ProducerIncomplete);
+    }
     if (context) output_allocations_ = context->output_allocations;
     for (const auto& chain : chains_) {
         for (const auto [pc, bytes] : {std::pair{chain.parent_pc, chain.parent_bytes},
                                       std::pair{chain.child_pc, chain.child_bytes}}) {
             const auto [it, inserted] = widths_.emplace(pc, bytes);
-            if (!inserted && it->second != bytes) allowed_ = false;
+            if (!inserted && it->second != bytes) {
+                allowed_ = false;
+                if (diagnostic_) diagnostic_->refuse(RawSnapshotGate::WidthConflict, pc);
+            }
         }
     }
     if (allowed_) {
@@ -749,32 +766,48 @@ GraphicsNestedWideReader::GraphicsNestedWideReader(std::vector<RawNestedWideChai
 
 bool GraphicsNestedWideReader::probe(FoldProbe kind, uint32_t pc, uint64_t address,
                                      uint32_t bytes) {
+    const auto reject = [&](RawSnapshotGate gate, uint64_t other = 0) {
+        if (diagnostic_) diagnostic_->refuse(gate, pc, address, bytes, other);
+        return false;
+    };
     const auto width = widths_.find(pc);
     if (width == widths_.end()) return guest_readable(address, bytes);
     // Raw pointers may not be repaired by Base48/Base40 fallback or a readable host VMA.
     if (!allowed_ || !lease_ || kind != FoldProbe::Raw || bytes != width->second ||
-        address <= 0x10000u || (address & 3u) || address > UINT64_MAX - bytes) return false;
+        address <= 0x10000u || (address & 3u) || address > UINT64_MAX - bytes)
+        return reject(RawSnapshotGate::ProbeShape);
     const auto prior = observations_.find(pc);
-    if (prior != observations_.end())
-        return prior->second.address == address && prior->second.bytes->size() == bytes;
+    if (prior != observations_.end()) {
+        if (prior->second.address != address || prior->second.bytes->size() != bytes)
+            return reject(RawSnapshotGate::ObservationChanged, prior->second.address);
+        return true;
+    }
     for (const auto& chain : chains_) {
         if (chain.child_pc != pc) continue;
         const auto parent = observations_.find(chain.parent_pc);
-        if (parent == observations_.end() || address < chain.child_offset) return false;
+        if (parent == observations_.end() || address < chain.child_offset)
+            return reject(RawSnapshotGate::ParentMissing);
         uint64_t pointer = 0;
         std::memcpy(&pointer, parent->second.bytes->data(), sizeof(pointer));
-        if (pointer != address - chain.child_offset) return false;
+        if (pointer != address - chain.child_offset)
+            return reject(RawSnapshotGate::PointerMismatch, pointer);
     }
-    if (!guest_memory_direct_range_fault_safe(*lease_, address, bytes) ||
-        guest_memory_direct_allocation_relation(*lease_, address, bytes, address, bytes) !=
-            GuestMemoryTopologyRelation::Overlap ||
-        !guest_readable(address, bytes) ||
-        !graphics_raw_source_is_guest_current(*lease_, address, bytes)) return false;
+    if (!guest_memory_direct_range_fault_safe(*lease_, address, bytes))
+        return reject(RawSnapshotGate::FaultUnsafe);
+    if (guest_memory_direct_allocation_relation(*lease_, address, bytes, address, bytes) !=
+        GuestMemoryTopologyRelation::Overlap)
+        return reject(RawSnapshotGate::AllocationUnknown);
+    if (!guest_readable(address, bytes)) return reject(RawSnapshotGate::Unreadable);
+    if (!graphics_raw_source_is_guest_current(*lease_, address, bytes))
+        return reject(RawSnapshotGate::CurrentSourceUnproved);
     for (const auto [output, physical_bytes] : output_allocations_)
-        if (output && guest_memory_direct_allocation_relation(*lease_, address, bytes,
-                output, physical_bytes) != GuestMemoryTopologyRelation::Disjoint) return false;
+        if (output && guest_memory_direct_allocation_relation(*lease_, address, bytes, output,
+                                                              physical_bytes) !=
+                          GuestMemoryTopologyRelation::Disjoint)
+            return reject(RawSnapshotGate::OutputNotDisjoint, output);
     auto owner = std::make_shared<std::vector<uint8_t>>(bytes);
     std::memcpy(owner->data(), reinterpret_cast<const void*>(uintptr_t(address)), bytes);
+    if (diagnostic_) diagnostic_->observed(pc, address, *owner);
     observations_.emplace(pc, Observation{address, std::move(owner)});
     return true;
 }
@@ -804,15 +837,21 @@ void GraphicsNestedWideReader::prefix(uint32_t pc, uint64_t address, void* desti
 }
 
 bool GraphicsNestedWideReader::publish(ShaderResourceTable& table) const {
+    if (diagnostic_) diagnostic_->published = false;
+    const auto reject = [&](RawSnapshotGate gate, uint32_t pc = UINT32_MAX) {
+        if (diagnostic_) diagnostic_->refuse(gate, pc);
+        return false;
+    };
     table.owned_nested_snapshot_requirements.assign(widths_.begin(), widths_.end());
-    if (!allowed_ || observations_.size() != widths_.size()) return false;
+    if (!allowed_ || observations_.size() != widths_.size())
+        return reject(RawSnapshotGate::MissingObservation);
     for (const auto& chain : chains_) {
         const auto& parent = observations_.at(chain.parent_pc);
         const auto& child = observations_.at(chain.child_pc);
         uint64_t pointer = 0;
         std::memcpy(&pointer, parent.bytes->data(), sizeof(pointer));
         if (child.address < chain.child_offset || pointer != child.address - chain.child_offset)
-            return false;
+            return reject(RawSnapshotGate::PointerMismatch, chain.child_pc);
     }
     // Existing exact-PC resources may only be the identical owned parent from the same fold.
     // A descriptor, duplicate, or conflicting binding cannot be replaced by a later valid owner.
@@ -823,7 +862,7 @@ bool GraphicsNestedWideReader::publish(ShaderResourceTable& table) const {
             if (++matches > 1 || !valid_owned_raw_snapshot_resource(resource, widths_.at(pc)) ||
                 resource.gpu_addr != observation.address ||
                 std::memcmp(resource.host_data, observation.bytes->data(), widths_.at(pc)) != 0)
-                return false;
+                return reject(RawSnapshotGate::ResourceConflict, pc);
         }
     }
     for (const auto& [pc, observation] : observations_) {
@@ -846,6 +885,7 @@ bool GraphicsNestedWideReader::publish(ShaderResourceTable& table) const {
         }
         table.owned_host_data.push_back(observation.bytes);
     }
+    if (diagnostic_) diagnostic_->published = true;
     return true;
 }
 
