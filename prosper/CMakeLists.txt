@@ -1994,6 +1994,14 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_file_binary.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+
+  # The guest's fopen and stdio stream handlers, against N1570 7.21.5.3 and the guest libc's own
+  # Dinkumware `_Foprep` mode loop (guest_fopen_mode.hpp):
+  # guest-path translation, mode semantics, EINVAL for a bad mode. Scratch files only, no dump.
+  prosper_add_gtest(test_hle_fopen_modes
+    SOURCES tests/hle/test_hle_fopen_modes.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   if(UNIX)
     # Intercepts both the old host-wide and new filesystem-wide barrier; no real writeback.
     add_executable(test_file_sync tests/hle/test_file_sync.cpp)
