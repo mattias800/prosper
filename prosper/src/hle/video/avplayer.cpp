@@ -501,7 +501,7 @@ uint64_t avp_ms() {
 // frames after the guest's seek, yet sceAvPlayerResume is still never called, all AvPlayer traffic
 // then stops, and the output stays uniformly black (max_rgb=0). The actual blocker was that
 // sceAvPlayerJumpToTime (NID XC9wM+xULz8) was unimplemented, so the dispatcher's default 0 was read
-// as a successful seek: #1949, and prosper/docs/ASTERIX_BABYLON_STATUS.md § Ruled out.
+// as a successful seek: #1949, and prosper/docs/games/ASTERIX_BABYLON_STATUS.md § Ruled out.
 //
 // #1949 has since landed and the title now reaches its title screen. Note carefully what that did
 // and did not vindicate: a *seek* legitimately publishes its landing frame while paused, and
@@ -1966,7 +1966,7 @@ namespace {
 // ===== Issue #306: honest OFFLINE console for the online/update/entitlement boot chain. =========
 // DOLL's UE4 front-end runs a patch/entitlement check before the title screen; every subsystem in
 // that chain answered success-with-garbage, so the check could neither succeed nor FAIL — the flow
-// waited forever (docs/DOLL_LOADING_PROGRESSION.md). The blocks below give the chain the answers a
+// waited forever (docs/games/DOLL_LOADING_PROGRESSION.md). The blocks below give the chain the answers a
 // real, network-disconnected, signed-out console gives.
 
 // --- Guest-callback delivery discipline (shared by NetCtl + Np state callbacks). ----------------

@@ -1023,48 +1023,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
                 if (in.opcode == 0x04) {                    // s_mov_b64
-                    if (is_exec(in.dst)) {                  // set/restore EXEC
-                        if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
-                            rs.exec = b.btrue(); rs.exec_narrowed = false;   // exec = all lanes on
-                        } else {
-                            uint32_t m = src_mask(in.src[0]);
-                            // A fragment compiler may restore EXEC from two ordinary scalar words,
-                            // notably after round-tripping a saved ballot pair through fixed
-                            // V_WRITELANE/V_READLANE slots. Reconstruct this invocation's mask bit
-                            // from the exact physical half. subgroup_local_id records the required
-                            // guest-Wave64 contract; a missing half or another stage remains
-                            // fail-visible instead of treating an arbitrary scalar as a Bool alias.
-                            if (!m && b.is_fragment && b.wave_size == 64 &&
-                                (in.src[0].kind == OperandKind::SGPR ||
-                                 (in.src[0].kind == OperandKind::Special &&
-                                  in.src[0].value >= 106 && in.src[0].value <= 123))) {
-                                auto scalar_word = [&](int reg) -> uint32_t {
-                                    const auto current = rs.sreg.find(reg);
-                                    if (current != rs.sreg.end()) return current->second;
-                                    const auto input = rs.sreg_input.find(reg);
-                                    return input != rs.sreg_input.end() ? input->second : 0;
-                                };
-                                const uint32_t lo = scalar_word(in.src[0].value);
-                                const uint32_t hi = scalar_word(in.src[0].value + 1);
-                                if (lo && hi) {
-                                    const uint32_t lane = b.ibin(
-                                        Op_BitwiseAnd, b.subgroup_local_id(), b.uconst(63));
-                                    const uint32_t word = b.sel(
-                                        b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)), hi, lo);
-                                    const uint32_t bit = b.ibin(
-                                        Op_BitwiseAnd, lane, b.uconst(31));
-                                    m = b.ucmp(
-                                        Op_INotEqual,
-                                        b.ibin(Op_BitwiseAnd,
-                                               b.ibin(Op_ShiftRightLogical, word, bit),
-                                               b.uconst(1)),
-                                        b.uconst(0));
-                                }
-                            }
-                            if (!m) ok = false;
-                            else { rs.exec = m; rs.exec_narrowed = saved_narrowed(in.src[0]); }
-                        }
-                    } else {                                // s_mov_b64 sDST, <mask-or-data> : save a mask / copy a pair
+                    if (is_exec(in.dst)) {   // set/restore EXEC
+                        ok = emit_s_mov_b64_exec(b, rs, in);
+                    } else {   // s_mov_b64 sDST, <mask-or-data> : save a mask / copy a pair
                         uint32_t m = src_mask(in.src[0]);
                         if (m) { rs.sreg_bool[in.dst.value] = m;
                                  rs.sreg_bool_narrowed[in.dst.value] = is_exec(in.src[0]) ? rs.exec_narrowed : saved_narrowed(in.src[0]);

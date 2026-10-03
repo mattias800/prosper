@@ -35,6 +35,12 @@
 
 namespace prosper::gpu {
 
+// Complete S_MOV_B64-to-EXEC transfer, including owned logical-Wave64 numeric scalar pairs.
+bool emit_s_mov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in);
+const char* packet_exec_mask_source_gap(const SpirvCompute& b, const Rdna2Inst& in,
+                                        const std::set<int>& masks,
+                                        const std::set<int>& scalar_words,
+                                        const std::set<int>& ambiguous);
 
 // A scalar inline integer used by a B64 mask operation is sign-extended to 64 bits.  Return the bit
 // belonging to this emulated hardware lane without ever issuing an undefined >=32 SPIR-V shift.

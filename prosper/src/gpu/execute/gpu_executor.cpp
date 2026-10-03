@@ -1,4 +1,4 @@
-// gpu_executor.cpp — the live-submit half of the GPU executor (Stage A of docs/GPU_EXECUTOR_DESIGN.md).
+// gpu_executor.cpp — the live-submit half of the GPU executor (Stage A of docs/gpu/GPU_EXECUTOR_DESIGN.md).
 //
 // Holds the process-wide live render backend and drives it on each AGC submit. This is deliberately the
 // ONLY place the executor touches process-global state; execute_gpustate() itself (gpu_execute.hpp) stays
@@ -1146,18 +1146,18 @@ std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint3
         result->bounded_span = span < dwords;
         if (code && span) result->code.assign(code, code + span);
         result->code_hash = hash_shader_code(result->code);
-        // Every property in an analysis must describe the same owned byte version. Reading the
-        // guest pointer again here allowed a concurrent rewrite to pair new dispatch metadata with
-        // the old code copy even though later users retained this object as one immutable version.
+        // All code facts describe this immutable byte version, never a second read from guest VA.
         const uint32_t* owned_code = result->code.empty() ? nullptr : result->code.data();
         result->pcrel_dispatch = rdna2_pcrel_dispatch_info(owned_code, result->code.size());
         result->fragment_color_export_mask =
             fragment_color_export_mask(owned_code, result->code.size());
+        result->packet_vgpr_requirements = fragment_packet_vgpr_requirements(result->code);
         result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
                         static_cast<uint64_t>(result->pcrel_dispatch.target_pcs.size()) *
                             sizeof(uint32_t) +
                         static_cast<uint64_t>(result->pcrel_dispatch.setup_pcs.size()) *
                             sizeof(uint32_t);
+        result->bytes += result->packet_vgpr_requirements.retained_bytes();
         return result;
     };
 

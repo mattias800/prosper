@@ -1,9 +1,11 @@
 #include "gpu/execute/fragment_packet_preparation.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
+#include "gpu/pm4/pm4_registers.hpp"
 #include <exception>
 
 namespace prosper::gpu {
+namespace P = prosper::agc::Pm4;
 FragmentPacketResources own_fragment_packet_resources(const ShaderResourceTable* table) {
     FragmentPacketResources result;
     try {
@@ -38,10 +40,37 @@ std::shared_ptr<const FragmentPacketPreparation> prepare_fragment_packet_inputs(
         return result;
     }
     const auto& in = *result->inputs;
-    if (!producing_modules_match || !in.raw_matches_producing_source || !in.raw_code || in.raw_code->empty() ||
-        !in.source_fs || in.source_fs->empty()) gap("packet-producing-source-unavailable");
-    if (!in.entry.observed || !in.entry.canonical()) gap("packet-entry-register-observation-unavailable");
+    const bool source_available = producing_modules_match && in.raw_matches_producing_source &&
+        in.raw_code && !in.raw_code->empty() && in.source_fs && !in.source_fs->empty();
+    const bool entry_available = in.entry.observed && in.entry.canonical();
+    if (!source_available) gap("packet-producing-source-unavailable");
+    if (!entry_available) gap("packet-entry-register-observation-unavailable");
     if (!in.entry.rsrc2_available) gap("packet-entry-ps-rsrc2-unavailable");
+    if (source_available && entry_available && in.entry.rsrc2_available) {
+        // CONFIDENCE: HIGH. AMD RDNA2 ISA 70648 section 3.12.2 defines the consecutive PS user
+        // prefix, followed by system words. PAL's SPI_SHADER_PGM_RSRC2_PS fields independently
+        // verify USER_SGPR[4:0] at bit1 and USER_SGPR_MSB at bit27. Do not copy physical UD[N]
+        // into system sN, infer an M0/parameter association, or clamp invalid six-bit counts.
+        const uint32_t count =
+            ((in.entry.rsrc2 >> P::SPI_SHADER_PGM_RSRC2_PS_USER_SGPR_SHIFT) &
+                P::SPI_SHADER_PGM_RSRC2_PS_USER_SGPR_MASK) |
+            (((in.entry.rsrc2 >> P::SPI_SHADER_PGM_RSRC2_PS_USER_SGPR_MSB_SHIFT) &
+                P::SPI_SHADER_PGM_RSRC2_PS_USER_SGPR_MSB_MASK) << 5);
+        if (count > in.entry.user_data.size()) {
+            gap("packet-entry-user-sgpr-count-out-of-range");
+        } else {
+            result->user_sgpr_count_available = true;
+            result->user_sgpr_count = count;
+            for (uint32_t reg = 0; reg < count; ++reg) {
+                const uint32_t bit = uint32_t(1) << reg;
+                if (in.entry.user_data_available & bit)
+                    result->initial_user_sgprs.emplace_back(reg, in.entry.user_data[reg]);
+                else
+                    result->missing_user_sgprs |= bit;
+            }
+            if (result->missing_user_sgprs) gap("packet-entry-user-sgpr-words-unavailable");
+        }
+    }
     if (!in.launch.canonical() || !in.launch.ps_in_control_available || !in.launch.baryc_cntl_available ||
         !in.launch.input_ena_available || !in.launch.input_addr_available)
         gap("packet-entry-raster-launch-unavailable");
@@ -70,10 +99,23 @@ std::shared_ptr<const FragmentPacketPreparation> prepare_fragment_packet_inputs(
                 !in.ps_resources.host_backing_owned[i];
         if (content_unproved) gap("packet-resource-content-authority-unproved");
     }
-    // The availability mask is evidence, not a required/launch count. Even a fully present
-    // physical window does not prove the guest SGPR ABI or justify absent-word zero filling.
-    gap("packet-entry-userdata-required-set-and-mapping-unproved");
-    gap("packet-entry-vgpr-and-mask-abi-unproved");
+    // User-prefix authority does not supply per-wave primitive/LDS/system values or M0. A true
+    // user s16 when N>=17 still says nothing about parameter-cache ownership or interpolation.
+    gap("packet-entry-system-sgprs-and-m0-unproved");
+    if (!source_available || !in.vgpr_requirements ||
+        in.vgpr_requirements->source_words != in.raw_code.get()) {
+        gap("packet-vgpr-program-requirements-unavailable");
+        gap("packet-entry-vgpr-and-mask-abi-unproved");
+    } else if (!in.vgpr_requirements->rejection.empty()) {
+        result->unmet.push_back(in.vgpr_requirements->rejection);
+    } else {
+        result->vgpr_requirements = in.vgpr_requirements;
+        if (in.vgpr_requirements->possible_entry.any()) gap("packet-entry-vgpr-values-unproved");
+        // A structural writer is not a definition on EXEC-off lanes. This includes the existing
+        // raw EXP observation and selected inactive peers; don't demand ALL allocated scratch.
+        if (!in.vgpr_requirements->reads.empty()) gap("packet-vgpr-runtime-read-validity-unproved");
+        gap("packet-entry-mask-abi-unproved");
+    }
     gap("packet-guest-helper-and-coverage-unproved");
     gap("packet-logical64-composition-unproved");
     gap("packet-ordered-export-commit-unimplemented");

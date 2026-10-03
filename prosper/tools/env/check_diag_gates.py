@@ -2854,7 +2854,7 @@ def baseline_integrity(text: str, budget: int | None = None) -> list[str]:
       1. every row carries a class from BASELINE_CLASSES;
       2. the header's own class counts match the rows, for all four classes -- a summary nobody
          checks is the same silent-drift door one level up, and this file's header is quoted
-         verbatim in docs/DIAGNOSTIC_GATE_AUDIT.md;
+         verbatim in docs/process/DIAGNOSTIC_GATE_AUDIT.md;
       3. the `unreviewed` count equals UNREVIEWED_BUDGET exactly (see that constant);
       4. every `benign` note names a file:line and an issue (see BENIGN_CITATION_RE) -- the class
          whose whole content is an argument is the class where a note can be replaced by `ok` and

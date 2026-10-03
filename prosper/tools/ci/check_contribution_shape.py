@@ -71,8 +71,11 @@ ALLOWED_TOP_LEVEL = {
 # the uv project for the Python tooling: pyproject.toml carries the ruff config, which ruff resolves
 # from each file's ancestors, so it sits above every tracked .py; uv.lock is its lockfile (#4126).
 # Neither is a build input, so rule 1's "CI would go green without building it" does not apply).
+# .clang-format/.clang-tidy are the same case for C++: clang resolves them from each file's
+# ancestors, and they configure the changed-lines lint gate, not the build (#4210).
 ALLOWED_ROOT_SUFFIXES = (".md",)
-ALLOWED_ROOT_NAMES = {"LICENSE", "LICENSE.txt", "LICENSE.md", "NOTICE", "pyproject.toml", "uv.lock"}
+ALLOWED_ROOT_NAMES = {"LICENSE", "LICENSE.txt", "LICENSE.md", "NOTICE", "pyproject.toml", "uv.lock",
+                      ".clang-format", ".clang-tidy"}
 
 
 def top_level(path):
@@ -167,6 +170,7 @@ def selftest():
         ("both rules at once", [("A", "core/x.hpp"), ("A", "prosper/src/y.cpp")]),
         ("unreviewed root config", [("A", "private.toml")]),
         ("unreviewed root lockfile", [("A", "other.lock")]),
+        ("a root dotfile that is not on the list", [("A", ".clang-tidy.bak")]),
     ]
     must_pass = [
         ("project startup hook", [("A", ".claude/settings.json")]),
@@ -177,7 +181,7 @@ def selftest():
         ("source plus a MODIFIED test", [("A", "prosper/src/foo.cpp"),
                                          ("M", "prosper/tests/gpu/capture/test_gpu_capture.cpp")]),
         ("modifying an existing source, no test", [("M", "prosper/src/gpu/capture/gpu_capture.cpp")]),
-        ("docs only", [("M", "prosper/docs/GAME_COMPAT_ORCHESTRATION.md")]),
+        ("docs only", [("M", "prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md")]),
         ("root-level markdown", [("A", "CONTRIBUTING.md")]),
         ("the root uv project (#4126)", [("A", "pyproject.toml"), ("A", "uv.lock")]),
         ("workflow change", [("M", ".github/workflows/ci.yml")]),
@@ -186,6 +190,7 @@ def selftest():
         ("a deleted root file", [("D", "core/old.hpp")]),
         ("project Python config", [("A", "pyproject.toml")]),
         ("project Python lockfile", [("A", "uv.lock")]),
+        ("root C++ lint configs (#4210)", [("A", ".clang-format"), ("A", ".clang-tidy")]),
     ]
 
     failures = 0

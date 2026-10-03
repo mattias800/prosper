@@ -7,7 +7,7 @@
 # is #2945.
 #
 # WHY IT IS A SCRIPT AND NOT A `for` LOOP. Three rules, each learned by a campaign that got the
-# answer wrong without them (docs/GRAPHICS.md, "Renderer determinism"):
+# answer wrong without them (docs/gpu/GRAPHICS.md, "Renderer determinism"):
 #
 #   1. A CONTROL RUNS BESIDE THE SUBJECT, IN THE SAME ROUND. The rate drifts machine-wide over
 #      minutes -- the identical command measured 0 of 20 in one window and 12 of 12 in the next --

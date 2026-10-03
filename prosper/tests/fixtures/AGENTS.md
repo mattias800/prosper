@@ -109,7 +109,7 @@ diverge. Fixtures that only one test uses belong beside that test, not here.
 
 ## Retained buffer inputs
 
-The [measurement and contract notes](../../docs/RENDERER_BUFFER_RESIDENCY_2026_09.md) retain
+The [measurement and contract notes](../../docs/gpu/RENDERER_BUFFER_RESIDENCY_2026_09.md) retain
 accepted mechanism evidence, adverse game comparisons and their limits.
 
 Cross-call storage uploads own whole Vulkan buffers; they never retain a guest pointer or an arena

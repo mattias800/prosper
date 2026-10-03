@@ -7,7 +7,7 @@ A guest's `read`/`pread` is served from the **host page cache** on every run aft
 title's asset load can be several times faster on prosper than the same bytes off real storage. For
 most work that is invisible. For a title whose startup is a *race* it is decisive: PPSA26414
 (R-Type Delta) reaches its `DLLInit` in 289-362 ms warm and 779-1158 ms with the dump evicted, and
-it faults in the first case and boots in the second (`docs/R_TYPE_DELTA_STATUS.md`). Any startup
+it faults in the first case and boots in the second (`docs/games/R_TYPE_DELTA_STATUS.md`). Any startup
 timing taken without recording cache state is therefore unreproducible.
 
 Scope, and the hazard it does NOT remove

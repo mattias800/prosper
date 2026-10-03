@@ -1,5 +1,5 @@
 // test_compute_exec — the execution-differential verification harness (verification layer 4, see
-// docs/VERIFICATION.md). It runs a shader on real Vulkan compute with known input values and asserts
+// docs/process/VERIFICATION.md). It runs a shader on real Vulkan compute with known input values and asserts
 // the numeric outputs against the expected math — the pattern that proves shader CORRECTNESS (not
 // just structural plausibility) with zero manual inspection. Today it runs a placeholder glslang
 // compute shader (b[i] = a[i]*2 + 1); once the RDNA2->SPIR-V recompiler lands, its emitted SPIR-V

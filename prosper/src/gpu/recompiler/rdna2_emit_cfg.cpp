@@ -2,9 +2,11 @@
 // rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/fragment_packet_definedness.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -1430,24 +1432,6 @@ std::vector<uint32_t> rdna2_proven_raw_x2_data_loads(const std::vector<Rdna2Inst
     return proven_raw_x2_data_loads_impl(ins);
 }
 
-int shader_max_vgpr(const std::vector<Rdna2Inst>& ins) {
-    int highest = 0;
-    for (const auto& in : ins) {
-        if (in.is_end) break;
-        for (uint32_t source = 0; source < in.n_src; ++source) {
-            const uint32_t source_span = rdna2_vgpr_source_span(in, source);
-            if (source_span)
-                highest = std::max(highest,
-                    in.src[source].value + static_cast<int>(source_span) - 1);
-        }
-        const uint32_t destination_span = rdna2_vgpr_destination_span(in);
-        if (destination_span)
-            highest = std::max(highest,
-                in.dst.value + static_cast<int>(destination_span) - 1);
-    }
-    return highest;
-}
-
 // Does [lo, hi) contain a `s_mov_b32 sX, m0` -- the instruction that starts an entry-M0 token
 // lifetime (#3133)? A STATIC property of the decoded stream, so it can be asked before any block is
 // emitted, which is what the loop emitters need: their header phis are built before the body runs,
@@ -1462,70 +1446,6 @@ int entry_m0_save_in_range(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint3
             return in.dst.value;
     }
     return -1;
-}
-
-// Registers WRITTEN in the pc range [lo, hi): candidates for an OpPhi at the loop header. Over-
-// approximation is safe (an extra phi for a non-carried value merges equal values). Mirrors emit_alu's
-// write targets, INCLUDING multi-register writes (MIMG dmask -> N consecutive VGPRs, SMEM -> N SGPRs) so
-// no genuinely-carried register is missed (a missing phi = an undominated use = invalid SPIR-V).
-void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t hi,
-                       std::set<int>& vregs, std::set<int>& sregs) {
-    for (const auto& in : ins) {
-        if (in.pc < lo || in.pc >= hi) continue;
-        switch (in.fmt) {
-            case Rdna2Format::VOP1:
-                if (in.opcode == 0x02) sregs.insert(in.dst.value);        // v_readfirstlane -> SGPR
-                else if (in.opcode == kVop1OpcodeMovreldB32)             // v_movreld: any observable
-                    for (int reg = in.dst.value; reg <= shader_max_vgpr(ins); ++reg)
-                        vregs.insert(reg);                               // VDST+M0 target
-                else vregs.insert(in.dst.value); break;
-            case Rdna2Format::VOP2: case Rdna2Format::VOP3P:
-                vregs.insert(in.dst.value); break;
-            case Rdna2Format::VOP3:
-                if (in.opcode == 0x360) sregs.insert(in.dst.value);       // v_readlane -> SGPR
-                else {
-                    for (uint32_t k = 0; k < rdna2_vgpr_write_count(in); ++k)
-                        vregs.insert(in.dst.value + (int)k);
-                }
-                break;                                                    // (writelane: slots, not SSA)
-            case Rdna2Format::DS:
-                for (uint32_t k = 0; k < rdna2_vgpr_write_count(in); ++k)
-                    vregs.insert(in.dst.value + (int)k);
-                break;
-            case Rdna2Format::MUBUF: case Rdna2Format::MTBUF: case Rdna2Format::MIMG:
-            case Rdna2Format::FLAT:
-                for (uint32_t k = 0; k < rdna2_vgpr_write_count(in); ++k)
-                    vregs.insert(in.dst.value + (int)k);
-                if (const int tfe_status = rdna2_tfe_status_vgpr(in); tfe_status >= 0)
-                    vregs.insert(tfe_status);
-                break;
-            case Rdna2Format::SOP1:
-                sregs.insert(in.dst.value); break;
-            case Rdna2Format::SOPK:
-                if (sopk_writes_scalar_data(in.opcode)) sregs.insert(in.dst.value);
-                break;
-            case Rdna2Format::SOP2:
-                // s_lshr_b64 -> EXEC is modeled only in the per-lane mask domain. It does not
-                // produce scalar SGPR data, so carrying a scalar value through a loop/if merge is
-                // both unnecessary and semantically wrong.
-                if (in.opcode != 0x21 || (in.dst.value != 126 && in.dst.value != 127)) {
-                    uint32_t words = 1;
-                    if (in.opcode == 0x0b)
-                        words = scalar_write_width(in);
-                    else if (in.opcode == 0x1f || in.opcode == 0x21)
-                        words = 2;
-                    for (uint32_t word = 0; word < words; ++word)
-                        sregs.insert(in.dst.value + static_cast<int>(word));
-                }
-                break;
-            case Rdna2Format::SMEM: {                                      // s_load/s_buffer_load: N consecutive SGPRs
-                uint32_t n = 1; switch (in.opcode) { case 0x1: case 0x9: n=2; break; case 0x2: case 0xA: n=4; break;
-                    case 0x3: case 0xB: n=8; break; case 0x4: case 0xC: n=16; break; }
-                for (uint32_t k = 0; k < n; k++) sregs.insert(in.dst.value + (int)k); break;
-            }
-            default: break;                          // VOPC/SOPC write VCC/SCC — handled by their own phis
-        }
-    }
 }
 
 namespace {
@@ -1787,12 +1707,11 @@ void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& in
 
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
-    const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
-    bool allow_exec_update, bool allow_smem,
-    const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
-    const uint32_t* code, size_t dwords, uint32_t initial_active,
-    bool synchronize_lds_fminmax,
-    const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction) {
+    const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt, bool allow_exec_update,
+    bool allow_smem, const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
+    const uint32_t* code, size_t dwords, uint32_t initial_active, bool synchronize_lds_fminmax,
+    const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction,
+    PacketVgprDefinedness* packet_definedness) {
     const bool graphics = !b.has_workgroup_execution() && (b.is_fragment || b.is_vertex);
     auto reject_cfg = [&](uint32_t pc, const char* reason) {
         log_recompile_diagnostic(b.diagnostic,
@@ -2425,8 +2344,9 @@ bool emit_cfg_state_machine(
           !portable_readfirstlane_event_for_pc.empty())
              ? padded_lanes : 0u);
     const uint32_t group_active_slot = wave_result_base + wave_count;
+    if (packet_definedness) packet_definedness->peer_scratch_base = group_active_slot + 1;
     if (b.has_workgroup_execution() && !direct_dispatch &&
-        !b.declare_cfg_scratch(group_active_slot + 1))
+        !b.declare_cfg_scratch(group_active_slot + 1 + (packet_definedness ? b.local_count : 0u)))
         return reject_cfg(ins.front().pc, "cfg-scratch-too-small");
     start_set.insert(end_pc);
     std::vector<uint32_t> starts(start_set.begin(), start_set.end());
@@ -2436,7 +2356,7 @@ bool emit_cfg_state_machine(
 
     // Persist only registers that the stream reads or writes, plus the caller's initialized inputs.
     std::set<int> vregs, sregs;
-    loop_written_regs(ins, 0, end_pc, vregs, sregs);
+    loop_written_regs(ins, 0, end_pc, vregs, sregs, b.is_fragment_packet());
     for (const auto& in : ins) {
         if (in.is_end) break;
         for (uint32_t k = 0; k < in.n_src; ++k) {
@@ -2530,7 +2450,8 @@ bool emit_cfg_state_machine(
         const uint32_t lo = starts[block];
         const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
         std::set<int> ignored_scalar_writes;
-        loop_written_regs(ins, lo, hi, vector_writes[block], ignored_scalar_writes);
+        loop_written_regs(ins, lo, hi, vector_writes[block], ignored_scalar_writes,
+                          b.is_fragment_packet());
         vector_reads[block] = vector_writes[block];
         bool reads_dynamic_vector_range = false;
         for (const auto& in : ins) {
@@ -3259,6 +3180,9 @@ bool emit_cfg_state_machine(
             if (packet_wqm && !packet_wqm_mask_source && !packet_wqm_scalar_source &&
                 !packet_wqm_constant_source)
                 return reject_cfg(in.pc, "packet-wqm-source-state-unavailable");
+            if (const char* gap =
+                    packet_exec_mask_source_gap(b, in, masks, scalar_words, ambiguous))
+                return reject_cfg(in.pc, gap);
             for (uint32_t source = 0; source < in.n_src; ++source) {
                 const Operand& operand = in.src[source];
                 if (operand.kind != OperandKind::SGPR &&
@@ -4956,6 +4880,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_b64_mask_scc_vote = nullptr;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi) continue;
+                if (packet_definedness) packet_definedness->instruction(b, state, in);
                 if (cfg_terminator(in)) {
                     block_terminator = &in;
                     break;
@@ -6961,71 +6886,10 @@ bool emit_cfg_state_machine(
     }
 
     if (has_portable_readlane) {
-    // Every invocation publishes its ordinary VGPR value unconditionally; V_READLANE ignores EXEC.
-    // A pending wave then reads the selected lane from its own guest-wave slice. This common region
-    // is reached uniformly by every dispatcher invocation, so the workgroup barriers are exact even
-    // when the host subgroup is narrower than the guest Wave64.
-    const uint32_t readlane_pending = b.load_function(b.t_bool, readlane_pending_var);
-    const uint32_t readlane_source = b.load_function(b.t_u32, readlane_source_var);
-    b.cfg_scratch_store(b.linear_localid, readlane_source);
-    b.barrier();
-
-    const uint32_t readlane_shift = b.uconst(b.wave_size == 32 ? 5u : 6u);
-    const uint32_t readlane_wave_base = b.ibin(
-        Op_ShiftLeftLogical,
-        b.ibin(Op_ShiftRightLogical, b.linear_localid, readlane_shift),
-        readlane_shift);
-    const uint32_t readlane_lane = b.ibin(
-        Op_BitwiseAnd, b.load_function(b.t_u32, readlane_selector_var),
-        b.uconst(b.wave_size - 1u));
-    const uint32_t readlane_index = b.ibin(
-        Op_IAdd, readlane_wave_base, readlane_lane);
-    const uint32_t readlane_valid = b.ucmp(
-        Op_ULessThan, readlane_index, b.uconst(b.local_count));
-    const uint32_t readlane_result = b.sel(
-        readlane_valid,
-        b.cfg_scratch_load(b.sel(readlane_valid, readlane_index, zero)), zero);
-    const uint32_t readlane_dst = b.load_function(b.t_u32, readlane_dst_var);
-    for (int reg : portable_readlane_dsts) {
-        const auto destination = sv.find(reg);
-        if (destination == sv.end())
+        if (!emit_cfg_readlane_phase(b, packet_definedness, readlane_pending_var,
+                                     readlane_source_var, readlane_selector_var, readlane_dst_var,
+                                     portable_readlane_dsts, sv, mv, mhv, vcc_var))
             return reject_cfg(0, "missing-portable-readlane-dst");
-        const uint32_t selected = b.land(
-            readlane_pending,
-            b.ucmp(Op_IEqual, readlane_dst,
-                   b.uconst(static_cast<uint32_t>(reg))));
-        const uint32_t old = b.load_function(b.t_u32, destination->second);
-        b.store_function(destination->second, b.sel(selected, readlane_result, old));
-    }
-    for (const auto& kv : mv) {
-        if (!portable_readlane_dsts.contains(kv.first)) continue;
-        const uint32_t selected = b.land(
-            readlane_pending,
-            b.ucmp(Op_IEqual, readlane_dst,
-                   b.uconst(static_cast<uint32_t>(kv.first))));
-        const uint32_t old = b.load_function(b.t_bool, kv.second);
-        b.store_function(kv.second, b.bsel(selected, no, old));
-    }
-    for (const auto& kv : mhv) {
-        if (!portable_readlane_dsts.contains(kv.first)) continue;
-        const uint32_t selected = b.land(
-            readlane_pending,
-            b.ucmp(Op_IEqual, readlane_dst,
-                   b.uconst(static_cast<uint32_t>(kv.first))));
-        const uint32_t old = b.load_function(b.t_bool, kv.second);
-        b.store_function(kv.second, b.bsel(selected, no, old));
-    }
-    if (portable_readlane_dsts.contains(106)) {
-        const uint32_t selected = b.land(
-            readlane_pending,
-            b.ucmp(Op_IEqual, readlane_dst, b.uconst(106u)));
-        const uint32_t bit = b.ucmp(
-            Op_INotEqual,
-            b.ibin(Op_BitwiseAnd, readlane_result, b.uconst(1u)), zero);
-        const uint32_t old = b.load_function(b.t_bool, vcc_var);
-        b.store_function(vcc_var, b.bsel(selected, bit, old));
-    }
-    b.barrier();
     }
 
     if (!mbcnt_event_for_pc.empty()) {

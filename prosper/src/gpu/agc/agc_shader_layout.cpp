@@ -491,7 +491,7 @@ const char* image_descriptor_reject_reason(const DecodedImageDescriptor& d) {
     //
     // This screens the ENCODING, not the routing. A T# is free to name any permutation of the six
     // defined selectors, constants included, and a one-component surface declaring identity
-    // (R,G,B,A) is an ordinary descriptor -- `docs/RESOURCE_BINDING.md` § Ruled out records the
+    // (R,G,B,A) is an ordinary descriptor -- `docs/gpu/RESOURCE_BINDING.md` § Ruled out records the
     // falsification of the opposite claim (#2731). Nothing here constrains which defined selector a
     // channel may carry.
     //

@@ -1992,7 +1992,7 @@ HLE(k_attr_getstack) {
 // PROSPER_ONE_CPU (default off): report a SINGLE core (0x01). Unity sizes its job-system worker
 // pool from the available-core mask; a 1-core mask makes it run jobs on the main thread instead of
 // spawning ~8 worker threads. That eliminates the async-load thread races (e.g. a WorkerThread whose
-// Stopwatch/+0x40 isn't created yet when the main thread times it — see docs/CUTSCENE_PROGRESSION.md).
+// Stopwatch/+0x40 isn't created yet when the main thread times it — see docs/games/messenger/CUTSCENE_PROGRESSION.md).
 // CONFIDENCE: MED — the mask→worker-count coupling is the standard Unity behavior; gated so default
 // boot (0xff) is unchanged.
 static uint64_t available_guest_cpumask() {

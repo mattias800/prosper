@@ -13,7 +13,7 @@ seconds, `f` is guest flips, `p` is pad reads).
 ## Launching
 
 This title must have its dump **evicted from the host page cache** before every launch or it loses its own
-startup race (#1746 — a product decision, not an open investigation; `docs/R_TYPE_DELTA_STATUS.md`
+startup race (#1746 — a product decision, not an open investigation; `docs/games/R_TYPE_DELTA_STATUS.md`
 § *Host page-cache state decides the race*):
 
 ```bash

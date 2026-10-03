@@ -24,6 +24,12 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
 - `gpu_execute.hpp` — the shared contracts, including **`SrtUse`**: a descriptor use recovered by the
   const-fold, keyed by the `s_load` immediate byte offset. Read this before assuming prosper cannot
   see a descriptor channel.
+- `fragment_packet_analysis` aliases exact immutable ShaderCodeAnalysis-owned VGPR requirements
+  into the producing collector capsule. `fragment_packet_preparation` consumes those code facts
+  without warm per-draw reparse or added global lock: writer-only scratch is not an entry input,
+  and absent analysis/replaced raw source never grants program authority. Runtime per-lane read
+  validity is separate from real mask/helper/system/composition/commit inputs; preparation remains
+  refused until those obligations have actual evidence, not host-raster zero defaults.
 - `index_expand` — the guest's validated 16-bit index range widened to the 32-bit indices the
   backend uploads, and the maximum that sizes the vertex buffer. Two things about it are easy to
   get wrong and both are load-bearing. The maximum must be reduced from the **same** loaded values
@@ -34,7 +40,7 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   The AVX2 kernel beside it is **not** an optimization and **nothing in the emulator calls it** —
   the portable loop is already auto-vectorized, and given the same ISA the compiler produces a
   wider loop than the intrinsics do. It survives only so that `test_index_expand --bench` keeps
-  the falsifying A/B executable; see `docs/OUTER_WILDS_STATUS.md` § Ruled out before spending any
+  the falsifying A/B executable; see `docs/games/OUTER_WILDS_STATUS.md` § Ruled out before spending any
   time here. `PROSPER_INDEX_EXPAND_STATS=1` reports the index volume that would have to be large
   for any of this to matter.
 - `compute_program_facts` — what a compute dispatch needs to know about its PROGRAM (decoded
@@ -61,8 +67,9 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   submit. `indirect_dispatch_stats()` counts the two routes without a log.
 - `gpu_dependency_graph` — ordering and dependencies between submitted work.
 - `fragment_packet_preparation` — consumed producing-draw entry and bounded resource identity for
-  the refused-draw raster collector. Physical USER_DATA presence and raw RSRC2 are observations,
-  not a launched SGPR count/mapping or system-parameter seed. Owned buffer bytes do not prove a
+  the refused-draw raster collector. A canonical source-associated RSRC2 count proves only the
+  consecutive PS user-SGPR prefix; missing physical words remain absent. The following system
+  SGPRs and M0/parameter state are not seeded from physical USER_DATA. Owned buffer bytes do not prove a
   guest fetch/read-point, producer epoch or image/sampler capability. Preparation retains named
   unmet obligations and never grants kernel, guest-wave, helper or output-commit admission.
 - `graphics_nested_wide_reader` — one-hop direct VS/PS numeric x4/x8 parent/child ownership.

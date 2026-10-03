@@ -28,7 +28,7 @@
 # with nothing fixed. The layer-include table (LAYER_ORDER in the checker) is, lowest first:
 #   self < loader < input < diagnostics < host < gpu < hle
 # A layer may include itself and anything to its LEFT; nothing in prosper/src may include
-# frontends/ or tests/. Evidence and the target tree: prosper/docs/ARCHITECTURE_TARGET_TREE.md.
+# frontends/ or tests/. Evidence and the target tree: prosper/docs/architecture/ARCHITECTURE_TARGET_TREE.md.
 
 title-id|prosper/frontends/prosper-app/test_frame_grab_match.cpp 1
 title-id|prosper/frontends/prosper-app/test_frame_grab_naming.cpp 29
@@ -175,9 +175,11 @@ file-size|prosper/src/gpu/pm4/command_processor.cpp 5539
 file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9420
 # note #4192: seven net lines connect original owned packet instruction services at the existing
 # dispatcher boundary, preserving the empty native callback and scalar lifetime invalidation.
-file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 9009
+file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 8873
 file-size|prosper/src/hle/kernel/hle_kernel.cpp 5566
-file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8625
+# note #4200: fourteen net lines retain the APR binding/submit/tail dialect and test observer,
+# including changed-line formatting; other memory behavior is unchanged.
+file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8639
 file-size|prosper/tests/fixtures/render_runner.h 16758  # raised from 16700: grown by #4173 (GPU breadcrumbs) before this gate landed
 test-dep|prosper/frontends/shared/live/live_renderer.cpp 73
 test-dep|prosper/frontends/shared/live/live_renderer_internal.hpp 20

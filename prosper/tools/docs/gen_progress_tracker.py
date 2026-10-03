@@ -88,6 +88,9 @@ import sys
 from pathlib import Path
 
 REPO = "mattias800/prosper"
+DOCS_ROOT = Path(__file__).resolve().parents[2] / "docs"
+DOC_TOPICS = ("process", "architecture", "gpu", "performance", "subsystems", "platforms",
+              "engines", "games", "games/messenger")
 TRACKER_LABEL = "tracker:game"
 
 # Repo-relative, resolved from this file so the tool works from any cwd.
@@ -161,7 +164,7 @@ RESOLUTION_NAMES = {
 BLOCKER_HEADING_RE = re.compile(r"^#{2,3}\s+Current blockers?\s*$", re.M | re.I)
 ANY_HEADING_RE = re.compile(r"^#{1,6}\s+", re.M)
 ISSUE_REF_RE = re.compile(r"#(\d{2,6})\b")
-DOCS_PATH_RE = re.compile(r"prosper/docs/[A-Za-z0-9_.\-]+\.md")
+DOCS_PATH_RE = re.compile(r"prosper/docs/(?:[A-Za-z0-9_.\-]+/)*[A-Za-z0-9_.\-]+\.md")
 
 EXPECTED_RUNGS = 6
 
@@ -177,6 +180,19 @@ RUNG_NAMES = {
 
 class ParseError(Exception):
     """A required field is missing or malformed. Names the tracker; aborts the run."""
+
+
+def current_doc_path(path: str) -> str:
+    """Resolve known flat-document citations against the relocated files; never guess a target."""
+    if not re.fullmatch(r"prosper/docs/[A-Za-z0-9_.\-]+\.md", path):
+        return path
+    name = path.rsplit("/", 1)[1]
+    if (DOCS_ROOT / name).is_file():
+        return path
+    found = [topic for topic in DOC_TOPICS if (DOCS_ROOT / topic / name).is_file()]
+    if len(found) > 1:
+        raise ParseError(f"ambiguous relocated document citation: {path}")
+    return f"prosper/docs/{found[0]}/{name}" if found else path
 
 
 # --------------------------------------------------------------------------------------
@@ -469,6 +485,8 @@ def parse_tracker(issue: dict, guards_by_title: dict[str, list[str]]) -> dict:
     docs = DOCS_PATH_RE.findall(body)
     status_docs = [d for d in docs if d.endswith("_STATUS.md")]
     status_doc = (status_docs or docs or [None])[0]
+    if status_doc is not None:
+        status_doc = current_doc_path(status_doc)
 
     return {
         "number": number,
@@ -1027,6 +1045,17 @@ def selftest() -> int:
     for field, got, want in checks:
         if got != want:
             failures.append("parsed %s = %r, expected %r" % (field, got, want))
+
+    legacy = "prosper/docs/DEAD_CELLS_STATUS.md"
+    current = "prosper/docs/games/DEAD_CELLS_STATUS.md"
+    if current_doc_path(legacy) != current or current_doc_path(current) != current:
+        failures.append("known legacy/current document citations did not select the current file")
+    legacy_rec = parse_tracker(_issue(body=_GOOD_BODY.replace(
+        "prosper/docs/EXAMPLE_STATUS.md", legacy)), {})
+    if legacy_rec["status_doc"] != current or current not in render([legacy_rec], {}):
+        failures.append("a legacy tracker citation was not normalized in the generated link")
+    if current_doc_path("prosper/docs/UNKNOWN_STATUS.md") != "prosper/docs/UNKNOWN_STATUS.md":
+        failures.append("an unrelated missing document was given an invented target")
 
     # Closed citations must be dropped from the rendered row, or the column reports
     # resolved work as a live blocker.

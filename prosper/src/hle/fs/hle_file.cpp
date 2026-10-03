@@ -626,7 +626,7 @@ namespace {
     std::mutex g_save0_mx;
     std::string g_save0;   // host dir for the CURRENT /savedata0 mount ("" = nothing mounted)
     // Never creates anything. A UE4 title probes open-mode several times before it ever creates a
-    // save (see docs/UE4_APR_IOSTORE_BRINGUP.md), and a probe that manufactures an empty directory
+    // save (see docs/engines/UE4_APR_IOSTORE_BRINGUP.md), and a probe that manufactures an empty directory
     // for the title makes a later "does this save exist?" answer depend on how often it was asked.
     std::string save0_base() { return savedata0_dir(); }
     // PROSPER_DENY_SUBSTR: comma-separated substrings; any guest path containing one is
@@ -2444,7 +2444,7 @@ extern "C" void prosper_apr_chain_reset(uint64_t cb) {
 // the described read and DMAs it into the guest destination, because DOLL's (PPSA17942) older SDK
 // wrapper consumes the destination from the measure call and never records a ReadFile command for
 // it, so the measure is prosper's only hook on those bytes. That is a real, live requirement; see
-// docs/UE4_APR_IOSTORE_BRINGUP.md.
+// docs/engines/UE4_APR_IOSTORE_BRINGUP.md.
 //
 // The problem (#3245) is that the gate was only "does the file id resolve", so the read fired for
 // EVERY APR title. On a title that also submits the read normally the same bytes are pread and

@@ -1,0 +1,78 @@
+# prosper clang-tidy. Enforced on CHANGED LINES ONLY (prosper/tools/ci/check_cpp_lint.py): a finding
+# fails CI only when it lands on a line the change added or modified, so existing code never blocks.
+#
+# Chosen from a census on 2026-10-02: clang-tidy 22.1.8 over the 224 prosper/src + prosper/frontends
+# translation units, 7,196 unique findings with every candidate check on. The counts below are that
+# census (unique file:line:check, headers counted once). A check is ON when its findings are
+# usually real defects or cheap to avoid in new code; it is OFF when its findings are inherent to an
+# emulator (guest addresses, bit-exact ABI types) or are a style heuristic. Re-run the census before
+# turning one on: see prosper/tools/ci/AGENTS.md.
+#
+# Suppress a single finding with `// NOLINT(check-name): reason` (or NOLINTNEXTLINE). A bare NOLINT
+# with no check name and no reason is not acceptable in review. The count is meant to go DOWN.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-casting-through-void,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-reserved-identifier,
+  -bugprone-switch-missing-default-case,
+  -bugprone-branch-clone,
+  performance-*,
+  -performance-no-int-to-ptr,
+  -performance-enum-size,
+  concurrency-mt-unsafe,
+  readability-function-size,
+  misc-include-cleaner,
+  modernize-use-override,
+  modernize-use-nullptr
+# OFF, with census count and reason:
+#   bugprone-easily-swappable-parameters   510  heuristic on adjacent same-typed params; every HLE
+#                                               entry point mirrors a Sony signature we do not choose
+#   bugprone-narrowing-conversions         276  deliberate in register/bit-field and format math
+#   bugprone-casting-through-void          220  the guest/host pointer boundary is made of these
+#   bugprone-multi-level-implicit-pointer-conversion 12  same boundary (void** out-params of the ABI)
+#   bugprone-reserved-identifier            23  _GNU_SOURCE and ABI names Sony's headers define
+#   bugprone-switch-missing-default-case    17  contradicts -Werror=switch: a `default:` hides a newly
+#                                               added enumerator from the exhaustiveness check
+#   bugprone-branch-clone                   33  fires on decode/lookup tables whose arms are equal by design
+#   performance-no-int-to-ptr              984  guest addresses arrive as integers; that is the model
+#   performance-enum-size                  155  enum widths are ABI or wire formats, not a free choice
+#
+# ON. Census counts for the noisy ones, so nobody is surprised by them:
+#   concurrency-mt-unsafe                 1023  almost all getenv(); new code should read the
+#                                               environment once through the diagnostics env helpers
+#   bugprone-implicit-widening-of-multiplication-result 115  32-bit products used as 64-bit sizes
+#                                               and offsets; the overflow is real
+#   bugprone-unchecked-string-to-number-conversion 53  atoi/strtoul with no error check
+#   readability-function-size               34  at the thresholds below. Reported at the function's
+#                                               name, so it fires for a NEW function (or a changed
+#                                               signature); growing an existing giant does not trip it
+#   modernize-use-override, modernize-use-nullptr  0  already clean; keep them that way
+#   everything else in bugprone-*/performance-*: 180 findings across 25 checks
+#
+# misc-include-cleaner is ON but a WARNING, not an error (not in WarningsAsErrors): 3,552 findings,
+# 3,168 of them "no header directly provides X", mostly prosper:: and std:: names reached through
+# umbrella headers, plus <cstdint> fixed-width types. It is printed for changed lines so new code can
+# include what it uses, but it does not fail CI until the header-cost work decides the umbrella
+# policy (include-what-you-use is out of scope here).
+WarningsAsErrors: >
+  bugprone-*,
+  performance-*,
+  concurrency-mt-unsafe,
+  readability-function-size,
+  modernize-use-override,
+  modernize-use-nullptr
+CheckOptions:
+  # The tree's own outliers run to 10,000 lines. 400 lines / 800 statements flags the worst 34
+  # functions today; ratchet it down once those are split.
+  readability-function-size.LineThreshold: 400
+  readability-function-size.StatementThreshold: 800
+  # Third-party and SDK headers are not ours to include-clean.
+  misc-include-cleaner.IgnoreHeaders: 'vulkan/.*;SDL3/.*;libav.*/.*;windows\.h;.*third_party/.*'
+# Findings in prosper's own headers are reported too (the line filter still limits them to changed
+# lines). Both separators: compile_commands.json uses backslashes on Windows.
+HeaderFilterRegex: '.*[/\\]prosper[/\\](src|frontends|tests|tools)[/\\].*'
+SystemHeaders: false

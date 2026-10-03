@@ -5,10 +5,7 @@
 namespace prosper::gpu {
 namespace {
 uint32_t input_word(SpirvCompute& b, uint32_t index) {
-    const auto pointer = b.id(), value = b.id();
-    b.put(b.code, Op_AccessChain, {b.t_ptr_sb_f32, pointer, b.v_in, b.uconst(0), index});
-    b.put(b.code, Op_Load, {b.t_u32, value, pointer});
-    return value;
+    return b.load_packet_word(index);
 }
 uint32_t and_(SpirvCompute& b, uint32_t a, uint32_t c) { return b.ucmp(Op_LogicalAnd, a, c); }
 uint32_t normal_or_zero(SpirvCompute& b, uint32_t bits) {
@@ -36,20 +33,22 @@ uint32_t exact_center(SpirvCompute& b, uint32_t bits, uint32_t extent) {
             b.ucmp(Op_INotEqual, b.ibin(Op_BitwiseAnd, sig, bit), b.uconst(0))));
 }
 void write_vector(SpirvCompute& b, RegState& state, int reg, uint32_t bits) {
-    // The packet inventory REQUIRED the genuine old value, including inactive lanes. A service
-    // cannot manufacture backing for an EXEC-off write or a subsequent EXEC-ignoring READLANE.
+    // Preserve inactive storage. Separate packet validity decides whether that old word exists;
+    // a placeholder never grants authority to a later inactive export or selected READLANE peer.
     state.vreg[reg] = b.sel(state.exec, bits, state.vreg.at(reg));
 }
 template <size_t N>
 uint32_t descriptor_equal(SpirvCompute& b, RegState& state, const Rdna2Inst& in, int base,
-                          const std::array<uint32_t, N>& descriptor) {
+                          const std::array<uint32_t, N>& descriptor, uint32_t dynamic_offset = 0) {
     auto equal = b.btrue();
     for (uint32_t c = 0; c < N; ++c) {
         Operand operand; operand.kind = OperandKind::SGPR; operand.value = base + static_cast<int>(c);
         bool available = true;
         const auto bits = operand_bits(b, state, in, operand, &available);
         if (!available) return 0; // MUST/lifetime filtering, not Function-variable presence
-        equal = and_(b, equal, b.ucmp(Op_IEqual, bits, b.uconst(descriptor[c])));
+        const auto expected =
+            dynamic_offset ? input_word(b, b.uconst(dynamic_offset + c)) : b.uconst(descriptor[c]);
+        equal = and_(b, equal, b.ucmp(Op_IEqual, bits, expected));
     }
     return equal;
 }
@@ -62,8 +61,11 @@ void PacketResourceServices::begin(SpirvCompute& b) {
     m0_var = b.function_var(b.t_u32, pointer_type);
     b.store_function(failure_var, b.uconst(0));
     b.store_function(failure_pc_var, b.uconst(UINT32_MAX));
-    b.store_function(m0_var, b.uconst(input.parameter_cache.entry_m0_available
-        ? input.parameter_cache.entry_m0 : 0)); // allocation only; MUST proof protects every read
+    b.store_function(m0_var, wave_data && input.parameter_cache.entry_m0_available
+                                 ? input_word(b, b.uconst(wave_data->entry_m0))
+                                 : b.uconst(input.parameter_cache.entry_m0_available
+                                                ? input.parameter_cache.entry_m0
+                                                : 0));   // MUST proof protects every read
     for (uint32_t image = 0; image < input.images.size(); ++image)
         b.declare_texture(16 + image, Dim_2D, false, false, false);
 }
@@ -95,7 +97,13 @@ int PacketResourceServices::emit(SpirvCompute& b, RegState& state, const Rdna2In
         const auto found = std::find_if(input.buffers.begin(), input.buffers.end(),
             [&](const auto& resource) { return resource.pc == in.pc; });
         if (found == input.buffers.end()) return -1;
-        const auto equal = descriptor_equal(b, state, in, in.src[0].value, found->descriptor);
+        const auto dynamic =
+            wave_data ? std::find_if(wave_data->buffers.begin(), wave_data->buffers.end(),
+                                     [&](const auto& buffer) { return buffer.pc == in.pc; })
+                            ->descriptor
+                      : 0;
+        const auto equal =
+            descriptor_equal(b, state, in, in.src[0].value, found->descriptor, dynamic);
         if (!equal) return -1;
         // Scalar loads execute even when EXEC=0. Descriptor failure is a packet failure, not an
         // unobservable inactive-vector failure; read ONLY the separately owned bounded snapshot.
@@ -115,10 +123,22 @@ int PacketResourceServices::emit(SpirvCompute& b, RegState& state, const Rdna2In
         write_vector(b, state, in.dst.value, value.bits);
         return 1;
     }
+    if (in.fmt == Rdna2Format::VOP1 && packet_special_f32_opcode(in.opcode)) {
+        bool available = true;
+        const auto source = operand_bits(b, state, in, in.src[0], &available);
+        if (!available) return -1;
+        const auto value = packet_f32_special(b, source, in.opcode, input.invocation.float_mode);
+        fail(b, consumed(value.nonfinite), in.pc,
+             FragmentPacketRuntimeFailure::SpecialNanOrNegativeRoot);
+        write_vector(b, state, in.dst.value, value.bits);
+        return 1;
+    }
     if (in.fmt == Rdna2Format::VINTRP) {
         const auto m0 = b.load_function(b.t_u32, m0_var);
-        fail(b, consumed(b.ucmp(Op_INotEqual, m0, b.uconst(input.parameter_cache.m0))),
-            in.pc, FragmentPacketRuntimeFailure::M0Mismatch);
+        const auto expected_m0 = wave_data ? input_word(b, b.uconst(wave_data->expected_m0))
+                                           : b.uconst(input.parameter_cache.m0);
+        fail(b, consumed(b.ucmp(Op_INotEqual, m0, expected_m0)), in.pc,
+             FragmentPacketRuntimeFailure::M0Mismatch);
         const auto coefficient = b.ibin(Op_IAdd, b.uconst(parameter_offsets.at(in.pc)),
             b.ibin(Op_IMul, b.linear_localid, b.uconst(3)));
         const auto p0 = input_word(b, coefficient);
@@ -147,8 +167,13 @@ int PacketResourceServices::emit(SpirvCompute& b, RegState& state, const Rdna2In
             [&](const auto& resource) { return resource.pc == in.pc; });
         if (found == input.images.end()) return -1;
         const uint32_t binding = 16 + static_cast<uint32_t>(found - input.images.begin());
-        const auto image_equal = descriptor_equal(b, state, in, in.src[1].value, found->descriptor);
-        const auto sampler_equal = descriptor_equal(b, state, in, in.src[2].value, found->sampler);
+        const auto slot = static_cast<uint32_t>(found - input.images.begin());
+        const auto image_equal =
+            descriptor_equal(b, state, in, in.src[1].value, found->descriptor,
+                             wave_data ? wave_data->image_descriptor_offsets.at(slot) : 0);
+        const auto sampler_equal =
+            descriptor_equal(b, state, in, in.src[2].value, found->sampler,
+                             wave_data ? wave_data->sampler_offsets.at(slot) : 0);
         if (!image_equal || !sampler_equal) return -1;
         fail(b, consumed(b.logical_not(and_(b, image_equal, sampler_equal))), in.pc,
              FragmentPacketRuntimeFailure::DescriptorMismatch);

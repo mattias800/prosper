@@ -16,5 +16,5 @@ decoded here, so a decode error does not look like a decode error — it looks l
 wrong extent, or a resource bound from the wrong address.
 
 **A builder's dword count is an ABI contract with the guest's own reservations.** See
-`docs/AGC_PACKET_SIZES.md` before changing any packet's size; getting it wrong desynchronises the
+`docs/gpu/AGC_PACKET_SIZES.md` before changing any packet's size; getting it wrong desynchronises the
 stream rather than failing locally.

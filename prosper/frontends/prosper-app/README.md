@@ -1,7 +1,7 @@
 # prosper-app
 
 The OS-integration frontend: an SDL3 window + Vulkan swapchain that runs a PS5 title on the desktop —
-rendering, audio out, and controller in. See `prosper/docs/FRONTEND_APP.md` for the design and issue
+rendering, audio out, and controller in. See `prosper/docs/subsystems/FRONTEND_APP.md` for the design and issue
 #164 for the plan.
 
 **Status:** boots and displays the game natively on Linux, Windows, and macOS, with audio and
@@ -41,7 +41,7 @@ Pass `-PresentMode mailbox` (low-latency vsync) or `-PresentMode immediate` (tea
 the Windows launcher when the driver supports it. The default is FIFO.
 
 WSLg remains an alternate way to run the Linux build, but it is no longer the primary Windows path.
-Prebuilt Windows archives include `start-prosper.ps1`; see `prosper/docs/WINDOWS_RELEASE.md` for the
+Prebuilt Windows archives include `start-prosper.ps1`; see `prosper/docs/platforms/WINDOWS_RELEASE.md` for the
 no-UI launch command, save-data selection, keyboard map, and runtime requirements.
 
 ## Run
@@ -300,7 +300,7 @@ an optional new-save item; prosper never exposes a host path or opens an arbitra
 Progress uses a non-focusable utility window updated from the app's main thread, so the title keeps
 presenting and retains keyboard/controller focus.
 
-- Two Vulkan contexts by design (`docs/FRONTEND_APP.md`), but since #1270 (2026-07-24) that is the
+- Two Vulkan contexts by design (`docs/subsystems/FRONTEND_APP.md`), but since #1270 (2026-07-24) that is the
   **fallback**, not the default: for a real game boot the app adopts the renderer's own device and
   GPU-blits its front-buffer image straight to the swapchain, with no CPU round-trip
   (`PROSPER_APP_GPU_PRESENT=0` opts out). The private-device path — the core renders headless, the app

@@ -22,7 +22,7 @@ namespace prosper {
 // the HLE handlers and any host callback the guest invokes — MUST be tagged SysV, or the six
 // integer args (guest: rdi/rsi/rdx/rcx/r8/r9) are read from the wrong registers (MS: rcx/rdx/r8/r9
 // + stack). PROSPER_SYSV_ABI is that tag: `__attribute__((sysv_abi))` on Windows, empty elsewhere.
-// See docs/PORTING.md "Windows". NOTE: we do NOT tag handlers `__attribute__((sysv_abi))` on
+// See docs/platforms/PORTING.md "Windows". NOTE: we do NOT tag handlers `__attribute__((sysv_abi))` on
 // Windows — that conflicts with SEH-based C++ exception unwinding in MinGW ("`.seh_handlerdata`
 // used outside of `.seh_proc` block"), and 537 STL-using handlers can't all drop exceptions.
 // Instead the guest↔host ABI conversion is done in the emitted import-stub trampoline

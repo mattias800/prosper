@@ -1,4 +1,4 @@
-// gpu_execute.hpp — the stage-independent core of the GPU executor (Stage A of docs/GPU_EXECUTOR_DESIGN.md).
+// gpu_execute.hpp — the stage-independent core of the GPU executor (Stage A of docs/gpu/GPU_EXECUTOR_DESIGN.md).
 //
 // Turns a folded GpuState (exactly what agc_driver_submit_dcb produces via run_command_buffer) into a
 // rendered frame: extract the RDNA2 render-state, recompile the vertex+pixel shaders straight from their
@@ -803,6 +803,9 @@ uint32_t fragment_color_export_mask_cached(const SharedShaderAnalysis& analysis)
 bool shader_analysis_has_prefix(const SharedShaderAnalysis& analysis,
                                 const uint32_t* words, size_t dwords);
 SharedShaderWords shader_analysis_owned_words(const SharedShaderAnalysis& analysis);
+struct FragmentPacketVgprRequirements;
+std::shared_ptr<const FragmentPacketVgprRequirements>
+shader_analysis_packet_vgpr_requirements(const SharedShaderAnalysis& analysis);
 
 // apply_fragment_consumption over the memoized mask. Honours PROSPER_NO_DEAD_VARYING_ELIM through
 // dead_varying_elimination_enabled(), so the live path and the uncached form cannot drift on the
@@ -3057,6 +3060,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         inputs->source_fs = out.fs_shared ? out.fs_shared :
             std::make_shared<const std::vector<uint32_t>>(out.fs);
         inputs->raw_code = shader_analysis_owned_words(fragment_analysis);
+        inputs->vgpr_requirements = shader_analysis_packet_vgpr_requirements(fragment_analysis);
         inputs->raw_matches_producing_source = bool(fragment_analysis) && !dcc_decompress;
         inputs->has_pixel_inputs = out.has_pixel_inputs; inputs->pixel_inputs = out.pixel_inputs;
         inputs->has_system_inputs = out.has_system_inputs; inputs->system_inputs = out.system_inputs;
@@ -3131,7 +3135,7 @@ std::vector<DrawItem> realize_gpustate_draws_parallel(
 // quad, which now renders through the real indexed path.) PROSPER_PERDRAW=1: ONE item per draw, each
 // realized from ITS OWN register snapshot (Draw::state), so per-draw masks/blends/shaders composite
 // correctly — the path for multi-geometry scenes (opt-in until the AGC context-log section semantics
-// that stage duplicate register writes are fully RE'd; see docs/REAL_FRAMES_FINDINGS.md).
+// that stage duplicate register writes are fully RE'd; see docs/archive/REAL_FRAMES_FINDINGS.md).
 // `max_shader_dwords` bounds the recompiler's walk (it stops at S_ENDPGM).
 // vp_scale_{x,y}: scale each draw's guest viewport by this factor. The guest programs PA_CL_VPORT in
 // full present-resolution pixels; when we render into a reduced-resolution framebuffer (PROSPER_RENDER_SCALE)

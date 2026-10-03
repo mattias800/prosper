@@ -472,6 +472,8 @@ struct SpirvCompute {
     uint32_t stride = 1;
     bool raw_output_words = false;
     bool raw_input_words = false;
+    uint32_t packet_input_base = 0, packet_output_base = 0;   // optional dynamic wave ABI SSA ids
+    uint32_t load_packet_word(uint32_t index);
     // fixed ids (set in begin()):
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
     uint32_t v_gid=0, v_groupid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
@@ -3478,14 +3480,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 
 // emit_body and the CFG state machine it drives live in rdna2_emit_cfg.cpp. As with emit_alu, the
 // default arguments are stated here and nowhere else.
+struct PacketVgprDefinedness;
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
-    const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
-    bool allow_exec_update, bool allow_smem,
-    const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
+    const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt, bool allow_exec_update,
+    bool allow_smem, const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
     const uint32_t* code, size_t dwords, uint32_t initial_active = 0,
     bool synchronize_lds_fminmax = false,
-    const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction = {});
+    const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction = {},
+    PacketVgprDefinedness* packet_definedness = nullptr);
 
 bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,

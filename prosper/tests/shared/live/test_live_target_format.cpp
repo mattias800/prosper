@@ -89,7 +89,7 @@ bool notifier_republishes(const FormatCase& c, uint64_t base, uint32_t width, ui
 }
 
 // setenv() does not exist in the MinGW UCRT headers, so this file failed to COMPILE on the
-// toolchain docs/WINDOWS_PORT_HANDOFF.md prescribes -- aborting `cmake --build all` and skipping
+// toolchain docs/platforms/WINDOWS_PORT_HANDOFF.md prescribes -- aborting `cmake --build all` and skipping
 // every target after it (#2142's second instance; CI's MSYS2 gcc has the same gap and the job
 // never reached this file because the SEH abort came first). Same shape as the helper
 // test_apr_registry.cpp:38 already uses; kept local rather than shared because a two-line
