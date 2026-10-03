@@ -27,7 +27,10 @@ void* occupy_aligned_span() {
 #else
     const long host_page = sysconf(_SC_PAGESIZE);
     if (host_page <= 0) return MAP_FAILED;
-    const size_t reserve_size = static_cast<size_t>(kSpan + 2 * host_page);
+    // Aligning up to kSpan can skip up to kSpan - host_page bytes, so reserve a whole extra kSpan.
+    // Two host pages of slack let the span run past the reservation, and the suffix size then
+    // underflowed, unmapping unrelated memory (heap included).
+    const size_t reserve_size = static_cast<size_t>(2 * kSpan);
     void* raw = mmap(nullptr, reserve_size, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (raw == MAP_FAILED) return MAP_FAILED;

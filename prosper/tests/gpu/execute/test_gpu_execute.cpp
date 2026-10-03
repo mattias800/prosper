@@ -2191,8 +2191,8 @@ int main() {
     }
 
     // Lazy realization can drop a semantic draw only after earlier spans have already executed.
-    // If the dropped record was counted as the final span, send an empty terminal callback so the
-    // renderer finalizes cached scanout rather than losing the successful work or hanging timing.
+    // Finality follows actual ordered execution: a successful terminal span finalizes directly;
+    // an earlier flushed span needs an empty terminal callback after the refused trailing draw.
     for (bool failed_first : {false, true}) {
         uint8_t source = 0x7A, target = 0;
         GpuState ordered = st;
@@ -2225,15 +2225,15 @@ int main() {
         });
         execute_ordered_and_present(ordered, 1, 1, 78 + failed_first, /*publish=*/false);
         set_submit_renderer({});
-        CHECK(realized_callbacks == 1 && terminal_callbacks == 1 && phases.size() == 2,
-              failed_first
-                  ? "failed leading span still finalizes the later successful span"
-                  : "failed trailing span still finalizes the earlier successful span");
-        CHECK(phases[0].first_span && !phases[0].final_span &&
-              !phases[1].first_span && phases[1].final_span,
+        CHECK(realized_callbacks == 1 && terminal_callbacks == (failed_first ? 0u : 1u) &&
+                  phases.size() == (failed_first ? 1u : 2u),
+              failed_first ? "failed leading span still finalizes the later successful span"
+                           : "failed trailing span still finalizes the earlier successful span");
+        CHECK(phases.front().first_span && phases.back().final_span &&
+                  (failed_first || (!phases.front().final_span && !phases.back().first_span)),
               "lazy-span terminal callback closes the submit exactly once");
-        CHECK(phases[0].allows_deferred_scanout_readback() == failed_first &&
-              !phases[1].allows_deferred_scanout_readback(),
+        CHECK(!phases.front().allows_deferred_scanout_readback() &&
+                  !phases.back().allows_deferred_scanout_readback(),
               "terminal finalization preserves the prior span's readback requirement");
     }
 
@@ -2277,6 +2277,7 @@ int main() {
         });
         set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
             const LiveRenderPhase phase = live_render_phase();
+            if (phase.final_span) events.push_back("F");
             if (!items.empty())
                 events.push_back(std::string("R") + (phase.defer_batch_completion ? "d" : "-") +
                                  (phase.final_span ? "f" : "-"));
@@ -2300,14 +2301,20 @@ int main() {
         CHECK(deferred == (enabled ? 1 : 0),
               enabled ? "the span before a dispatch requests deferred completion"
                       : "with the switch off no span requests deferred completion");
+        const long final_callback = at("F");
+        CHECK(std::count(events.begin(), events.end(), "F") == 1 &&
+                  std::count(events.begin(), events.end(), "R-f") == 1 &&
+                  final_callback + 1 == at("R-f"),
+              "deferred-wait submit finalizes its pending third draw exactly once");
         if (enabled) {
             const long first_render = at("Rd-");
             const long label_retire = at("X0");
-            const long final_render = at("R-f");
-            CHECK(first_render == 0 && label_retire > first_render &&
-                      label_retire < final_render,
+            CHECK(first_render == 0 && label_retire > first_render && label_retire < final_callback,
                   "a deferred batch is retired before the ordered label write lands");
-            CHECK(!events.empty() && events.back() == "X1" && at("X1") > final_render,
+            CHECK(at("X1") > label_retire && at("X1") < final_callback,
+                  "post-label deferred work retires before final publication");
+            CHECK(!events.empty() && events.back() == "X1" &&
+                      static_cast<long>(events.size() - 1) > final_callback,
                   "a deferred batch is retired again before the submit returns");
         }
         if (!(renders == 3 && deferred == (enabled ? 1 : 0)))
@@ -2634,9 +2641,23 @@ int main() {
         request_interactive_gpu_capture(capture_path.string());
         bool renderer_saw_resource = false;
         bool compute_executed = false;
+        unsigned producer_callbacks = 0;
+        unsigned empty_terminal_callbacks = 0;
+        bool producer_shape = true;
+        bool empty_terminal_shape = true;
         set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
-            renderer_saw_resource = !items.empty() && items.front().prt &&
-                items.front().prt->by_binding(32) != nullptr;
+            if (items.empty()) {
+                ++empty_terminal_callbacks;
+                const auto phase = live_render_phase();
+                empty_terminal_shape &= phase.final_span && !phase.first_span &&
+                                        phase.source_submit == 781 && !phase.defer_batch_completion;
+                return RenderedFrame{};
+            }
+            ++producer_callbacks;
+            const auto phase = live_render_phase();
+            producer_shape &= phase.first_span && !phase.final_span && phase.source_submit == 781;
+            renderer_saw_resource =
+                items.front().prt && items.front().prt->by_binding(32) != nullptr;
             cbuffer = post_bytes;
             return RenderedFrame{};
         });
@@ -2650,6 +2671,9 @@ int main() {
         set_test_env(kGpuCaptureResourceProvenanceEnv,
                      had_original_selector ? original_selector.c_str() : nullptr);
 
+        CHECK(producer_callbacks == 1 && producer_shape && renderer_saw_resource &&
+                  empty_terminal_callbacks == 1 && empty_terminal_shape,
+              "temporal capture sees one resource producer and one empty final callback");
         GpuCaptureFile captured;
         std::string capture_error;
         const bool read = read_gpu_capture(capture_path.string(), captured, capture_error);

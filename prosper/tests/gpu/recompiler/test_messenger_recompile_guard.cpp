@@ -16,6 +16,7 @@
 // Messenger uses into `unsupported`, which this test catches. The with-table recompile is covered by
 // the local golden-image snapshot guard (tools/snapshot, from #227); this is its dump-free CI half.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include <cstdio>
 #include <cstdint>
 #include <string>
@@ -23,9 +24,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static std::vector<uint32_t> load_shader(const char* path) {
     FILE* f = fopen(path, "rb");
@@ -38,26 +37,19 @@ static std::vector<uint32_t> load_shader(const char* path) {
     return v;
 }
 
-int main() {
-    printf("== test_messenger_recompile_guard ==\n");
+TEST(MessengerRecompileGuard, VsCoverageBaseline) {
     const std::string dir = PROSPER_TEST_DATA_DIR;
     auto vs = load_shader((dir + "/messenger_scene_vs.bin").c_str());
-    auto ps = load_shader((dir + "/messenger_scene_ps.bin").c_str());
 
-    // The captured fixtures must be present and intact (a truncated/empty fixture would make the
+    // The captured fixture must be present and intact (a truncated/empty fixture would make the
     // coverage numbers meaningless — fail loudly instead of silently passing on nothing).
-    CHECK(!vs.empty(), "committed Messenger scene VS binary present + readable");
-    CHECK(!ps.empty(), "committed Messenger scene PS binary present + readable");
-    CHECK(vs.size() == 555, "VS fixture is the expected 555 dwords (captured length to last s_endpgm)");
-    CHECK(ps.size() == 43,  "PS fixture is the expected 43 dwords");
-    if (vs.empty() || ps.empty()) { printf("== FAIL ==\n"); return 1; }
+    ASSERT_FALSE(vs.empty()) << "committed Messenger scene VS binary present + readable";
+    ASSERT_EQ(vs.size(), 555u)
+        << "VS fixture is the expected 555 dwords (captured length to last s_endpgm)";
 
     RecompileCoverage cv = recompile_coverage(vs.data(), vs.size());
-    RecompileCoverage cp = recompile_coverage(ps.data(), ps.size());
     printf("  VS coverage: total=%u alu=%u exports=%u table_dependent=%u unsupported=%u first_bad(fmt=%d op=0x%x)\n",
            cv.total, cv.alu, cv.exports, cv.table_dependent, cv.unsupported, cv.first_bad_fmt, cv.first_bad_op);
-    printf("  PS coverage: total=%u alu=%u exports=%u table_dependent=%u unsupported=%u first_bad(fmt=%d op=0x%x)\n",
-           cp.total, cp.alu, cp.exports, cp.table_dependent, cp.unsupported, cp.first_bad_fmt, cp.first_bad_op);
 
     // Baseline captured on master at the time this fixture landed (2026-07-10). `total`/`exports` are
     // pure properties of the bytecode — a change here means the DECODER mis-parsed the stream (a real
@@ -65,27 +57,43 @@ int main() {
     // an INCREASE is the #199/#201 blue-screen class — an instruction the game needs became unsupported.
     // So: total/exports are pinned exactly, unsupported is bounded above by its baseline.
     const uint32_t VS_TOTAL = 157, VS_EXPORTS = 6, VS_UNSUP_MAX = 3;
-    const uint32_t PS_TOTAL = 37,  PS_EXPORTS = 1, PS_UNSUP_MAX = 0;
 
     CHECK(cv.total == VS_TOTAL, "VS: decoded instruction count stable (decoder intact)");
     CHECK(cv.exports == VS_EXPORTS, "VS: export count stable (position/param exports still recognized)");
     CHECK(cv.unsupported <= VS_UNSUP_MAX,
           "VS: no NEW unsupported instruction (the #199/#201 re-blue regression class)");
 
+    // Document (and lock) that this real stage needs its resource table: table-less recompile is
+    // empty. If a future change makes it recompile table-less, that's fine — this is a soft print,
+    // not a regression signal.
+    auto rv = recompile_vertex(vs.data(), vs.size(), nullptr);
+    printf("  (table-less recompile: vs=%zu dwords -- the stage resolves memory ops via its "
+           "per-draw ShaderResourceTable, so table-less is expected empty)\n", rv.size());
+}
+
+TEST(MessengerRecompileGuard, PsCoverageBaseline) {
+    const std::string dir = PROSPER_TEST_DATA_DIR;
+    auto ps = load_shader((dir + "/messenger_scene_ps.bin").c_str());
+
+    ASSERT_FALSE(ps.empty()) << "committed Messenger scene PS binary present + readable";
+    ASSERT_EQ(ps.size(), 43u) << "PS fixture is the expected 43 dwords";
+
+    RecompileCoverage cp = recompile_coverage(ps.data(), ps.size());
+    printf("  PS coverage: total=%u alu=%u exports=%u table_dependent=%u unsupported=%u first_bad(fmt=%d op=0x%x)\n",
+           cp.total, cp.alu, cp.exports, cp.table_dependent, cp.unsupported, cp.first_bad_fmt, cp.first_bad_op);
+
+    // Baseline captured on master at the time this fixture landed (2026-07-10). `total`/`exports`
+    // are pure properties of the bytecode — a change here means the DECODER mis-parsed the stream
+    // (a real regression). `unsupported` may only legitimately DROP (a recompiler improvement adds
+    // a lowering); an INCREASE is the #199/#201 blue-screen class.
+    const uint32_t PS_TOTAL = 37,  PS_EXPORTS = 1, PS_UNSUP_MAX = 0;
+
     CHECK(cp.total == PS_TOTAL, "PS: decoded instruction count stable (decoder intact)");
     CHECK(cp.exports >= PS_EXPORTS, "PS: MRT export still recognized");
     CHECK(cp.unsupported <= PS_UNSUP_MAX,
           "PS: no NEW unsupported instruction (every PS op still has a lowering)");
 
-    // Document (and lock) that both real stages need their resource tables: table-less recompile is
-    // empty. If a future change makes a stage recompile table-less, that's fine — this assertion just
-    // records today's reality and isn't a regression signal, so keep it a soft print, not a hard fail.
-    auto rv = recompile_vertex(vs.data(), vs.size(), nullptr);
     auto rf = recompile_fragment(ps.data(), ps.size(), nullptr);
-    printf("  (table-less recompile: vs=%zu fs=%zu dwords -- both stages resolve memory ops via their "
-           "per-draw ShaderResourceTable, so table-less is expected empty)\n", rv.size(), rf.size());
-
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    printf("  (table-less recompile: fs=%zu dwords -- same table-less expectation as above)\n",
+           rf.size());
 }
