@@ -2684,6 +2684,18 @@ if(TARGET prosper_core)
   target_link_libraries(test_rdna2_spirv_struct PRIVATE prosper_core)
   add_test(NAME rdna2_spirv_struct COMMAND test_rdna2_spirv_struct)
 
+  prosper_add_gtest(test_compute_dpp_row_max
+    SOURCES tests/gpu/recompiler/test_compute_dpp_row_max.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  if(Vulkan_FOUND)
+    prosper_add_gtest(test_compute_dpp_row_max_execution
+      SOURCES tests/gpu/execute/test_compute_dpp_row_max.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 60)
+  endif()
+
   # #4007: strict-valid, paired address/control counterexamples for the load-bearing width proof.
   add_executable(test_wave_width_independent tests/gpu/recompiler/test_wave_width_independent.cpp)
   target_link_libraries(test_wave_width_independent PRIVATE prosper_core)
@@ -3770,6 +3782,7 @@ endif()
         ENVIRONMENT "PROSPER_NO_ROBUST_BUFFER_ACCESS2=1")
 
       add_executable(test_numeric_mbcnt tests/gpu/execute/test_numeric_mbcnt.cpp)
+
       target_include_directories(test_numeric_mbcnt PRIVATE tests)
       target_link_libraries(test_numeric_mbcnt PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME numeric_mbcnt COMMAND test_numeric_mbcnt)

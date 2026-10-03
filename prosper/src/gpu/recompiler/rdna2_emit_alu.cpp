@@ -6,6 +6,7 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/storage_dst_sel.hpp"
+#include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
 #include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#325)
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -3521,21 +3522,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         case Rdna2Format::VOP2: {
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
             uint32_t dpp_active = 0;
-            // The non-dispatch GTA V cohort uses the exact {1,2,4,8} ROW_SHR reduction ladder.
-            // FI=0 makes an EXEC-inactive source invalid, BC0 preserves VDST at the row
-            // edge/invalid source, and the destination write remains independently
-            // EXEC-predicated. Other shift amounts remain limited to the event-isolated CFG
-            // dispatcher below.
-            const bool compute_inplace_add_row_shr = b.is_compute &&
-                is_inplace_vadd_nc_u32_dpp_row_shr(in) &&
-                (in.dpp_ctrl == 0x111u || in.dpp_ctrl == 0x112u ||
-                 in.dpp_ctrl == 0x114u || in.dpp_ctrl == 0x118u);
-            if (compute_inplace_add_row_shr) {
-                uint32_t valid_source = 0;
-                const uint32_t shifted = b.subgroup_row_shr(
-                    a, rs.exec, in.dpp_ctrl - 0x110u, &valid_source);
-                const uint32_t result = b.ibin(Op_IAdd, a, shifted);
-                vreg[in.dst.value] = b.sel(valid_source, result, old_d);
+            uint32_t row_result = 0;
+            if (ok && emit_compute_inplace_dpp_row_shr(
+                    b, rs, in, a, old_d, allow_wave, row_result)) {
+                vreg[in.dst.value] = row_result;
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
