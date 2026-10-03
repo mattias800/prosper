@@ -225,9 +225,9 @@ TEST_F(ScanfFamily, FloatingConversions) {
     // "infinity" is consumed whole, and %s then skips white space and reads ONE word.
     double inf = 0;
     char tail[8] = {};
-    EXPECT_EQ(scan_result(ssf()("iNfInItY and beyond", "%le%7s", &inf, tail)), 2);
+    EXPECT_EQ(scan_result(ssf()("InFiNiTy then more", "%le%7s", &inf, tail)), 2);
     EXPECT_TRUE(std::isinf(inf) && inf > 0);
-    EXPECT_STREQ(tail, "and");
+    EXPECT_STREQ(tail, "then");
 
     double minus_inf = 0, nan = 0;
     EXPECT_EQ(scan_result(ssf()("-INF NaN", "%lf %lf", &minus_inf, &nan)), 2);
@@ -268,11 +268,11 @@ TEST_F(ScanfFamily, LongStoresTheGuestsSixtyFourBitLong) {
     GTEST_SKIP() << "Windows scans a guest %ld/%lu with the host CRT's 32-bit long and stores only "
                     "four bytes (known gap, #4341)";
 #else
-    int64_t l = 0x5555555555555555LL;
-    uint64_t lu = 0x5555555555555555ULL;
+    long l = 0x5555555555555555L;  // the host long is the guest's 64-bit long here
+    unsigned long lu = 0x5555555555555555UL;
     EXPECT_EQ(scan_result(ssf()("-1099511627776 1099511627777", "%ld %lu", &l, &lu)), 2);
-    EXPECT_EQ(l, -((int64_t)1 << 40));
-    EXPECT_EQ(lu, ((uint64_t)1 << 40) + 1);
+    EXPECT_EQ(l, -(1L << 40));
+    EXPECT_EQ(lu, (1UL << 40) + 1);
 #endif
 }
 

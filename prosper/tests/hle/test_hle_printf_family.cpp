@@ -147,8 +147,8 @@ std::string field(const std::string& s, size_t index) {
 
 // Every length modifier C defines for integers, each with an extreme of its own type, and the
 // narrowing hh/h conversions given a value OUTSIDE the narrow type: the value is converted to the
-// narrow type before printing (§7.21.6.1p7), which separates them from a plain %u. Fourteen
-// arguments: three in registers, eleven in the overflow area.
+// narrow type before printing (§7.21.6.1p7), which separates them from a plain %u. Sixteen
+// arguments: three in registers, thirteen in the overflow area.
 TEST_F(PrintfFamily, IntegerLengthModifiersKeepLaterArgumentsInStep) {
     using ssize = std::make_signed_t<size_t>;
     const int r =
@@ -265,7 +265,7 @@ TEST_F(PrintfFamily, SnprintfBoundAndReturnValue) {
     EXPECT_EQ(buf[5], 'Z');
 }
 
-// The v* entry points take the guest's va_list by ADDRESS. Seven integer-class and nine SSE
+// The v* entry points take the guest's va_list by ADDRESS. Eight integer-class and nine SSE
 // arguments behind the fixed ones exhaust both register files, so the handler must walk the
 // register save area AND the overflow area of the guest's structure, in the order the format
 // demands — and the `*`/length-modifier conversions exercise the same classification as above.
@@ -329,10 +329,9 @@ TEST_F(PrintfFamily, LongIsTheGuestsSixtyFourBitLong) {
     GTEST_SKIP() << "Windows formats a guest %ld/%lu/%lx with the host CRT's 32-bit long and "
                     "drops the high half (known gap, #4341)";
 #else
-    const int64_t neg = -((int64_t)1 << 40);
-    const uint64_t pos = ((uint64_t)1 << 40) + 1;
-    const int r =
-        snf()(buf, sizeof buf, "%ld|%lu|%lx|%s", neg, pos, (uint64_t)0x1234567890ULL, "end");
+    const long neg = -(1L << 40);  // the host long is the guest's 64-bit long here
+    const unsigned long pos = (1UL << 40) + 1;
+    const int r = snf()(buf, sizeof buf, "%ld|%lu|%lx|%s", neg, pos, 0x1234567890UL, "end");
     EXPECT_STREQ(buf, "-1099511627776|1099511627777|1234567890|end");
     EXPECT_EQ(r, 43);
 #endif
