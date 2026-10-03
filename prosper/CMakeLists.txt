@@ -1316,27 +1316,14 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_reallocf.cpp
     LIBRARIES prosper_core)
 
-  # FreeBSD libc contracts, ported from freebsd-src lib/libc/tests (ATF) to
-  # gtest. prosper's libSceLibcInternal is FreeBSD-lineage, and hle_libc.cpp
-  # forwards these exact functions to the host — so the FreeBSD sign/span/
-  # return semantics are the guest-visible contract. Pure, no game dump.
-  prosper_add_gtest(test_freebsd_memcmp
-    SOURCES tests/hle/test_freebsd_memcmp.cpp
+  # Guest libc contracts prosper implements itself (not host forwarders), called through the
+  # registered handlers. strlcpy/strlcat are prosper's own code; qsort/bsearch own the guest
+  # comparator's calling convention, which differs from the host's on Windows. Pure, no game dump.
+  prosper_add_gtest(test_libc_strlcpy
+    SOURCES tests/hle/test_libc_strlcpy.cpp
     LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_strcmp
-    SOURCES tests/hle/test_freebsd_strcmp.cpp
-    LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_strspan
-    SOURCES tests/hle/test_freebsd_strspan.cpp
-    LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_strlcpy
-    SOURCES tests/hle/test_freebsd_strlcpy.cpp
-    LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_bsearch
-    SOURCES tests/hle/test_freebsd_bsearch.cpp
-    LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_qsort
-    SOURCES tests/hle/test_freebsd_qsort.cpp
+  prosper_add_gtest(test_libc_qsort_bsearch
+    SOURCES tests/hle/test_libc_qsort_bsearch.cpp
     LIBRARIES prosper_core)
 
   # #2081 FALSE SUCCESS: an unregistered NID answers the dispatcher's 0, which for an SCE_OK
