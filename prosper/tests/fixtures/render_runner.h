@@ -30,6 +30,7 @@
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
+#include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "diagnostics/exit_census.hpp"       // one-line end-of-run reports
 #include "diagnostics/persistent_target_census.hpp"  // is the colour-target cache at its bound?
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
@@ -706,6 +707,7 @@ inline BackendColorTargetStats backend_color_target_stats() {
 // that requires an ordered pass boundary. render_triangle_rgba is a thin single-draw wrapper (below).
 struct BackendDraw {
     std::shared_ptr<prosper::gpu::RasterQuadCollection> raster_quads;
+    std::shared_ptr<const prosper::gpu::GraphicsOwnedWaveDraw> owned_waves;
     bool raster_quad_contract_modified = false;
     std::vector<uint32_t> vs, gs, fs;
     // For a mesh draw, `vs` carries a MeshEXT module instead of a vertex module. The group counts
@@ -8795,6 +8797,7 @@ inline uint64_t backend_pass_source_submit(std::span<const BackendDraw> draws) {
 // Shared live/test renderer owner; it deliberately uses the same device, buffer pool and ordered
 // completion machinery, not a second standalone Vulkan harness.
 #include "fixtures/raster_quad_collection_gpu.h"
+#include "fixtures/owned_graphics_wave_gpu.h"
 
 inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> draws,
                                                   uint32_t W, uint32_t H,
@@ -8923,6 +8926,21 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     BackendSubmissionBatch direct_submission;
     BackendSubmissionBatch& active_submission = submission_batch
         ? *submission_batch : direct_submission;
+    std::vector<BackendDraw> completed_owned_draws;
+    if (std::any_of(draws.begin(), draws.end(),
+                    [](const auto& draw) { return bool(draw.owned_waves); })) {
+        completed_owned_draws.assign(draws.begin(), draws.end());
+        for (auto& draw : completed_owned_draws) {
+            std::string refusal;
+            if (!materialize_owned_graphics_draw(ctx, draw, W, H, active_submission, refusal)) {
+                std::fprintf(
+                    stderr, "[graphics-wave] refused draw=%llu reason=%s; no guest output commit\n",
+                    static_cast<unsigned long long>(draw.draw_index), refusal.c_str());
+                return out;
+            }
+        }
+        draws = completed_owned_draws;
+    }
     bool avoid_cache_eviction = active_submission.pending() ||
                                 backend_has_unproven_submission();
     const bool persistent_color_targets_enabled =
