@@ -13,10 +13,11 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
 
 - **The H896Pt-yB4I / o67gODLFpls bind carries a dialect marker in a4/a5 — not observed.** The
   bind is `(cb, equeue, id, data, a4, a5)` and an earlier note read `7|0xf` in a4/a5 on the
-  IoDispatcher channel against 0 elsewhere. On *Tales of Graces f* `PPSA19990` (60 s windowed run
-  plus a 90 s headless run, `PROSPER_AMPRLOG=1 PROSPER_EVLOG=1`) all 197 binds have a4 = a5 = 0,
-  on the id 0 channel and the id 1-6 CRI channel alike, so nothing but `id` and the tag tells
-  the consumers apart. The dialect is therefore inferred from `(id, tag)` once at bind time by
+  IoDispatcher channel against 0 elsewhere. The author reports that on *Tales of Graces f*
+  `PPSA19990` (60 s windowed run plus a 90 s headless run,
+  `PROSPER_AMPRLOG=1 PROSPER_EVLOG=1`) all 197 binds have a4 = a5 = 0, on the id 0 channel and
+  the id 1-6 CRI channel alike. These observations do not establish a4/a5 as a discriminator;
+  the current classifier still uses `(id, tag)` once at bind time via
   `classify_apr_dialect` (`src/hle/kernel/apr_event_dialect.hpp`). Not re-measured on UE4/IoStore
   or Black Flag (no dump available), so that half stays inferred. Also: the id 0 binds there carry
   tag 0, not a pointer, which the RequestPointer dialect delivers exactly.

@@ -2,10 +2,9 @@
 // sceAmprCommandBufferWriteKernelEventQueue bind, NID H896Pt-yB4I / o67gODLFpls) must be delivered.
 //
 // The bind call is (cb, equeue, id, data, ...). Three guest consumers share it and need different
-// completion semantics, and NOTHING in the call says which one is calling: no argument other than
-// `id` and `data` is read by this project or by either secondary implementation consulted
-// (verification only), and the observed a4/a5 values (0, 7|0xf) were not shown to track the
-// consumer. So the dialect is derived from (id, data) alone, ONCE, at bind time, by
+// completion semantics. This classification currently uses only `id` and `data`; the observed
+// a4/a5 values (0, 7|0xf) were not shown to track the consumer. So the dialect is derived from
+// (id, data) alone, ONCE, at bind time, by
 // classify_apr_dialect below -- the single place the heuristic lives -- and stored on the binding.
 // Delivery then switches on the stored enum, never on a tag magnitude.
 #pragma once

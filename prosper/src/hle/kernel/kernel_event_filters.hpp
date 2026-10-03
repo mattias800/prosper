@@ -10,7 +10,7 @@ namespace prosper {
 // Resynced's IOCompleteEventQueue consumer (eboot+0xacb370) dispatches on `filter == 0xffe7` (-25)
 // and treats every other APR event as not its own, so a completion posted with any other filter was
 // dropped and the title's boot stalled with every thread idle. The value was -24 while the guest was
-// assumed never to read it; -25 also matches a secondary implementation (verification only).
+// assumed never to read it.
 constexpr int16_t EVFILT_AMPR = -25;
 
 }   // namespace prosper
