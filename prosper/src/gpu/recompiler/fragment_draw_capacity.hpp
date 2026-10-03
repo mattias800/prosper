@@ -25,6 +25,7 @@ enum class FragmentDrawFailure : uint32_t {
     GuestExport = 7,
     DuplicatePixel = 8,
     PixelIndexCapacity = 9,
+    OccupiedExportUnavailable = 10,
 };
 
 class FragmentDrawCapacity {

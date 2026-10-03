@@ -92,6 +92,33 @@ TEST_F(FragmentDrawPlan, ForeignProducerDeviceAndDynamicPrefixCannotBorrowAuthor
                   .rejection(),
               "fragment-draw-raster-extent-invalid");
 }
+TEST_F(FragmentDrawPlan, UnsupportedAttachmentControlsNameOriginalSiteWithoutInventingOutput) {
+    g::DrawItem good;
+    ASSERT_TRUE(f::realize(good));
+    const auto prepared = f::prepare(good);
+    ASSERT_TRUE(prepared && good.fragment_draw_inputs);
+    const auto plan =
+        g::compile_fragment_draw_program(*good.fragment_draw_inputs, *prepared, source_device, 48);
+    retain_plan(plan);
+    ASSERT_TRUE(plan.rejection_reason().empty()) << plan.rejection_reason();
+    for (uint32_t control : {1u << 4, 1u << 12}) { // MRT1 and VM0, respectively
+        auto original = f::fragment_words();
+        ASSERT_EQ(original[5], 0xf800180fu);
+        original[5] ^= control;
+        g::DrawItem unsupported;
+        ASSERT_TRUE(f::realize(unsupported, f::color_a, original));
+        const auto input = f::prepare(unsupported);
+        ASSERT_TRUE(input && unsupported.fragment_draw_inputs);
+        ASSERT_EQ(*unsupported.fragment_draw_inputs->raw_code, original);
+        const auto refused = g::compile_fragment_draw_program(*unsupported.fragment_draw_inputs,
+                                                              *input, source_device, 48);
+        EXPECT_EQ(refused.rejection_reason(),
+                  "fragment-draw-attachment-export-recipe-unimplemented:pc=5");
+        EXPECT_FALSE(refused.capacity_owner());
+        EXPECT_TRUE(refused.validation_words().empty());
+        EXPECT_TRUE(refused.replay_words().empty());
+    }
+}
 TEST_F(FragmentDrawPlan, SeventeenLiveOriginalProgramsNeverRecompileAfterWarmup) {
     std::array<g::DrawItem, 17> draws;
     std::array<std::shared_ptr<const g::FragmentPacketPreparation>, 17> prepared;

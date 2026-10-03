@@ -284,8 +284,9 @@ std::vector<uint32_t> build_fragment_draw_validation(const FragmentDrawCapacity&
         const auto occupied_export =
             b.land(reached, b.land(b.ucmp(Op_IEqual, value(1), b.uconst(1)),
                                    b.ucmp(Op_IEqual, value(13), b.uconst(15))));
-        export_valid = b.land(export_valid, b.lor(b.logical_not(occupied), occupied_export));
         note(b.logical_not(export_valid), FragmentDrawFailure::GuestExport);
+        note(b.land(occupied, b.logical_not(occupied_export)),
+             FragmentDrawFailure::OccupiedExportUnavailable);
         const auto active = begin_if(b, occupied);
         const auto coordinate = [&](uint32_t field) {
             return source.load(collector_address(b, collector, worker, field));

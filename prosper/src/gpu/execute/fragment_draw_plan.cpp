@@ -47,6 +47,20 @@ bool resource_free(const RasterQuadInputs& in) {
     return in.ps_resources.observed && in.ps_resources.table && in.ps_resources.rejection.empty() &&
            in.ps_resources.table->resources.empty() && in.ps_resources.host_backing_owned.empty();
 }
+// Replay currently has one complete uncompressed color event. Other genuine EXP controls are
+// recipe gaps, not corrupt output or a general Architectural EXP restriction. Name the original
+// site BEFORE the broader packing proof can hide the reason behind an entry/composition gap.
+std::optional<uint32_t> attachment_export_recipe_gap(const std::vector<Rdna2Inst>& instructions) {
+    uint32_t sites = 0, end_pc = UINT32_MAX;
+    for (const auto& in : instructions) {
+        if (in.is_end) end_pc = in.pc;
+        if (in.fmt == Rdna2Format::EXP &&
+            (++sites > 1 || in.exp_target != 0 || in.exp_en != 15 || in.exp_compr ||
+             !(in.words[0] & (1u << 11)) || !(in.words[0] & (1u << 12))))
+            return in.pc;
+    }
+    return sites ? std::nullopt : std::optional<uint32_t>{end_pc};
+}
 // A FIRST recipe proof, not a title/opcode allowlist in the general packet compiler. This narrow
 // fragment is insensitive to inter-quad placement and cannot observe private scratch workers.
 // Wider recipes must establish the extra composition/input/resource facts, not pretend this is
@@ -160,7 +174,7 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
     ++fragment_draw_cache_stats().program_compile_calls;
     FragmentDrawProgramPlan result;
     result.source_generations->remember(in.raw_code);
-    const auto refuse = [&](const char* reason) {
+    const auto refuse = [&](const std::string& reason) {
         FragmentDrawProgramPlan failed;
         failed.source_generations = result.source_generations;
         failed.rejection = reason;
@@ -177,6 +191,9 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
     result.user_prefix_presence = user_presence(prepared);
     std::vector<Rdna2Inst> instructions;
     rdna2_walk(in.raw_code->data(), in.raw_code->size(), instructions);
+    if (const auto pc = attachment_export_recipe_gap(instructions))
+        return refuse("fragment-draw-attachment-export-recipe-unimplemented:pc=" +
+                      std::to_string(*pc));
     if (!packing_unobservable(instructions, static_cast<uint32_t>(in.raw_code->size()),
                               result.user_prefix_presence, result.full_masks))
         return refuse("fragment-draw-entry-and-composition-recipe-unproved");

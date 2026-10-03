@@ -441,7 +441,7 @@ TEST(FragmentDrawCapacity, GenuineZeroAndInactiveOrMissingLatePixelsRemainDistin
         ASSERT_EQ(refused.size(), good.capacity->commit_words());
         EXPECT_EQ(refused[0], 0u)
             << "wave2/lane40 cannot turn earlier good pixels into partial output";
-        EXPECT_EQ(refused[1], uint32_t(FragmentDrawFailure::GuestExport));
+        EXPECT_EQ(refused[1], uint32_t(FragmentDrawFailure::OccupiedExportUnavailable));
     }
     for (uint32_t field : {2u, 3u, 4u, 5u, 6u, 7u, 12u, 13u}) {
         auto malformed = good;
