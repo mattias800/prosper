@@ -530,3 +530,202 @@ TEST(Rdna2DecodeSweep, Vop3LiteralOperandReportsItsValue) {
     EXPECT_EQ(in.literal, 0x40490FDBu);
     EXPECT_EQ(in.src[1].kind, OperandKind::Literal);
 }
+
+// ---- Memory / export / interpolation format fields -------------------------------------------
+// Each field is exercised across its full range so a shifted or mis-masked field cannot hide behind
+// one lucky value. Layouts follow the RDNA2 ISA reference encoding tables.
+
+namespace {
+constexpr uint32_t kTop6Ds = 0x36u << 26, kTop6Flat = 0x37u << 26, kTop6Mubuf = 0x38u << 26,
+                   kTop6Mtbuf = 0x3Au << 26, kTop6Smem = 0x3Du << 26, kTop6Exp = 0x3Eu << 26,
+                   kTop6Vintrp = 0x32u << 26;
+}  // namespace
+
+TEST(Rdna2DecodeSweep, ExpDecodesTargetEnableComprAndFourVgprs) {
+    for (uint32_t target = 0; target < 64; ++target) {
+        const Rdna2Inst in = decode(kTop6Exp | (target << 4) | 0xAu, 0x04030201u);
+        ASSERT_EQ(in.fmt, Rdna2Format::EXP);
+        EXPECT_EQ(in.exp_target, target);
+        EXPECT_EQ(in.exp_en, 0xAu);
+        EXPECT_FALSE(in.exp_compr);
+    }
+    for (uint32_t en = 0; en < 16; ++en) EXPECT_EQ(decode(kTop6Exp | en).exp_en, en);
+    EXPECT_TRUE(decode(kTop6Exp | (1u << 10)).exp_compr);
+    const Rdna2Inst in = decode(kTop6Exp, 0x04030201u);
+    ASSERT_EQ(in.n_src, 4);
+    for (int k = 0; k < 4; ++k) {
+        EXPECT_EQ(in.src[k].kind, OperandKind::VGPR) << k;
+        EXPECT_EQ(in.src[k].value, k + 1) << k;
+    }
+}
+
+TEST(Rdna2DecodeSweep, SmemDecodesOpcodeBaseDestinationAndSignedOffset) {
+    for (uint32_t op = 0; op <= 0xFF; ++op) {
+        const Rdna2Inst in = decode(kTop6Smem | (op << 18) | (12u << 6) | 3u, 0u);
+        ASSERT_EQ(in.fmt, Rdna2Format::SMEM);
+        EXPECT_EQ(in.opcode, op);
+        EXPECT_EQ(in.dst.value, 12);
+        EXPECT_EQ(in.src[0].value, 6) << "SBASE field is a pair index, so 3 -> s6";
+    }
+    // OFFSET is a signed 21-bit byte immediate, sign-extended into `literal`.
+    EXPECT_EQ(decode(kTop6Smem, 0x000010u).literal, 0x10u);
+    EXPECT_EQ(decode(kTop6Smem, 0x0FFFFFu).literal, 0x0FFFFFu);
+    EXPECT_EQ(static_cast<int32_t>(decode(kTop6Smem, 0x100000u).literal), -0x100000);
+    EXPECT_EQ(static_cast<int32_t>(decode(kTop6Smem, 0x1FFFFFu).literal), -1);
+    // SOFFSET lives in d1[31:25]; 125 is NULL (immediate-only).
+    EXPECT_EQ(decode(kTop6Smem, 125u << 25).src[1].value, 125);
+    EXPECT_EQ(decode(kTop6Smem, 7u << 25).src[1].kind, OperandKind::SGPR);
+}
+
+TEST(Rdna2DecodeSweep, MubufDecodesOpcodeFlagsAndAddressFields) {
+    for (uint32_t op = 0; op <= 0xFF; ++op) {
+        EXPECT_EQ(decode(kTop6Mubuf | (op << 18), 0u).opcode, op) << "8-bit opcode, op=" << op;
+    }
+    struct Flag { uint32_t bit; bool Rdna2Inst::*field; const char* name; };
+    const Flag flags[] = {{14, &Rdna2Inst::mubuf_glc, "glc"}, {15, &Rdna2Inst::mubuf_dlc, "dlc"},
+                          {16, &Rdna2Inst::mubuf_lds, "lds"}};
+    for (const Flag& f : flags) {
+        EXPECT_TRUE(decode(kTop6Mubuf | (1u << f.bit)).*f.field) << f.name;
+        EXPECT_FALSE(decode(kTop6Mubuf).*f.field) << f.name;
+        for (const Flag& other : flags) {
+            if (&other != &f) {
+                EXPECT_FALSE(decode(kTop6Mubuf | (1u << f.bit)).*other.field)
+                    << f.name << " leaked into " << other.name;
+            }
+        }
+    }
+    EXPECT_TRUE(decode(kTop6Mubuf, 1u << 23).mubuf_tfe);
+    EXPECT_FALSE(decode(kTop6Mubuf, 0u).mubuf_tfe);
+
+    const Rdna2Inst in = decode(kTop6Mubuf, 0x03u | (0x05u << 8) | (6u << 16) | (0x80u << 24));
+    EXPECT_EQ(in.src[0].value, 3);        // VADDR
+    EXPECT_EQ(in.dst.value, 5);           // VDATA
+    EXPECT_EQ(in.src[1].value, 24);       // SRSRC is a x4 SGPR base
+    EXPECT_EQ(in.src[2].kind, OperandKind::InlineInt);   // SOFFSET 0x80 = inline 0, not s0
+    EXPECT_EQ(in.src[2].value, 0);
+}
+
+TEST(Rdna2DecodeSweep, MubufOffsetOffenAndIdxenPackIntoLiteral) {
+    for (uint32_t off : {0u, 1u, 0x7FFu, 0xFFFu}) {
+        EXPECT_EQ(decode(kTop6Mubuf | off).literal, off) << off;
+    }
+    EXPECT_EQ(decode(kTop6Mubuf | (1u << 12)).literal, 1u << 12);   // OFFEN
+    EXPECT_EQ(decode(kTop6Mubuf | (1u << 13)).literal, 1u << 13);   // IDXEN
+    EXPECT_EQ(decode(kTop6Mubuf | 0x3FFFu).literal, 0x3FFFu);
+    // glc/dlc/lds sit above the packed bits and must not leak into them.
+    EXPECT_EQ(decode(kTop6Mubuf | (7u << 14)).literal, 0u);
+}
+
+TEST(Rdna2DecodeSweep, MtbufOpcodeSplitsAcrossDword0AndDword1) {
+    // gfx10 keeps OP[2:0] in dword0[18:16] and OP[3] in dword1 bit 21; opcodes 8..15 are packed-D16.
+    for (uint32_t op = 0; op < 16; ++op) {
+        const Rdna2Inst in = decode(kTop6Mtbuf | ((op & 7u) << 16), (op >> 3) << 21);
+        ASSERT_EQ(in.fmt, Rdna2Format::MTBUF);
+        EXPECT_EQ(in.opcode, op) << "op=" << op;
+    }
+}
+
+TEST(Rdna2DecodeSweep, MtbufCombinedFormatIsSevenBits) {
+    for (uint32_t fmt = 0; fmt < 128; ++fmt) {
+        EXPECT_EQ(decode(kTop6Mtbuf | (fmt << 19)).mtbuf_format, fmt) << "fmt=" << fmt;
+    }
+    // 32_FLOAT is combined format 22 on gfx10; the older DFMT/NFMT split would read it wrongly.
+    EXPECT_EQ(decode(kTop6Mtbuf | (22u << 19)).mtbuf_format, 22u);
+}
+
+TEST(Rdna2DecodeSweep, MtbufFlagsTfeAndOperands) {
+    EXPECT_TRUE(decode(kTop6Mtbuf | (1u << 14)).mubuf_glc);
+    EXPECT_TRUE(decode(kTop6Mtbuf | (1u << 15)).mubuf_dlc);
+    EXPECT_TRUE(decode(kTop6Mtbuf, 1u << 23).mtbuf_tfe);
+    EXPECT_FALSE(decode(kTop6Mtbuf, 0u).mtbuf_tfe);
+    const Rdna2Inst in =
+        decode(kTop6Mtbuf | 0x2345u, 0x01u | (0x02u << 8) | (3u << 16) | (0x84u << 24));
+    EXPECT_EQ(in.src[0].value, 1);
+    EXPECT_EQ(in.dst.value, 2);
+    EXPECT_EQ(in.src[1].value, 12);
+    EXPECT_EQ(in.src[2].kind, OperandKind::InlineInt);
+    EXPECT_EQ(in.src[2].value, 4);
+    EXPECT_EQ(in.literal, 0x2345u);
+}
+
+TEST(Rdna2DecodeSweep, FlatSegmentFlagsAndSignedOffset) {
+    for (uint32_t seg = 0; seg < 4; ++seg) {
+        EXPECT_EQ(decode(kTop6Flat | (seg << 14)).flat_segment, seg) << seg;
+    }
+    EXPECT_TRUE(decode(kTop6Flat | (1u << 16)).flat_glc);
+    EXPECT_TRUE(decode(kTop6Flat | (1u << 17)).flat_slc);
+    EXPECT_TRUE(decode(kTop6Flat | (1u << 12)).flat_dlc);
+    EXPECT_TRUE(decode(kTop6Flat | (1u << 13)).flat_lds);
+    const Rdna2Inst none = decode(kTop6Flat);
+    EXPECT_FALSE(none.flat_glc);
+    EXPECT_FALSE(none.flat_slc);
+    EXPECT_FALSE(none.flat_dlc);
+    EXPECT_FALSE(none.flat_lds);
+    // OFFSET[11:0] is signed (the gfx10 immediate range is -2048..2047).
+    EXPECT_EQ(decode(kTop6Flat | 0x7FFu).literal, 0x7FFu);
+    EXPECT_EQ(static_cast<int32_t>(decode(kTop6Flat | 0x800u).literal), -2048);
+    EXPECT_EQ(static_cast<int32_t>(decode(kTop6Flat | 0xFFFu).literal), -1);
+}
+
+TEST(Rdna2DecodeSweep, FlatStoresTakeVdataAndLoadsTakeVdst) {
+    // d1: VADDR[7:0], VDATA[15:8], SADDR[22:16], VDST[31:24].
+    const uint32_t d1 = 0x01u | (0x02u << 8) | (125u << 16) | (0x03u << 24);
+    for (uint32_t op = 0; op < 0x80; ++op) {
+        const Rdna2Inst in = decode(kTop6Flat | (op << 18), d1);
+        const bool store = op >= 0x18 && op <= 0x1F;
+        EXPECT_EQ(in.opcode, op);
+        EXPECT_EQ(in.dst.value, store ? 2 : 3) << "op=" << op;
+    }
+}
+
+TEST(Rdna2DecodeSweep, FlatScratchOffFormDropsTheVaddrOperand) {
+    // Scratch segment (1) with an SGPR SADDR and VADDR 0 is the canonical `off, sN` form.
+    const Rdna2Inst off = decode(kTop6Flat | (1u << 14), 0u | (8u << 16));
+    EXPECT_EQ(off.src[0].kind, OperandKind::None);
+    EXPECT_EQ(off.src[1].kind, OperandKind::SGPR);
+    EXPECT_EQ(off.src[1].value, 8);
+    // SADDR=NULL (125) is the `vN, off` form and keeps VADDR.
+    const Rdna2Inst vaddr = decode(kTop6Flat | (1u << 14), 4u | (125u << 16));
+    EXPECT_EQ(vaddr.src[0].kind, OperandKind::VGPR);
+    EXPECT_EQ(vaddr.src[0].value, 4);
+    // Global (2) always keeps VADDR.
+    EXPECT_EQ(decode(kTop6Flat | (2u << 14), 0u | (8u << 16)).src[0].kind, OperandKind::VGPR);
+}
+
+TEST(Rdna2DecodeSweep, DsDecodesOpcodeOffsetAndFourVgprFields) {
+    for (uint32_t op = 0; op <= 0xFF; ++op) {
+        EXPECT_EQ(decode(kTop6Ds | (op << 18)).opcode, op) << op;
+    }
+    EXPECT_EQ(decode(kTop6Ds | 0x1234u).literal, 0x1234u);
+    EXPECT_EQ(decode(kTop6Ds | 0xFFFFu).literal, 0xFFFFu);
+    const Rdna2Inst in = decode(kTop6Ds, 0x01u | (0x02u << 8) | (0x03u << 16) | (0x04u << 24));
+    EXPECT_EQ(in.src[0].value, 1);   // ADDR
+    EXPECT_EQ(in.src[1].value, 2);   // DATA0
+    EXPECT_EQ(in.src[2].value, 3);   // DATA1
+    EXPECT_EQ(in.dst.value, 4);      // VDST
+}
+
+TEST(Rdna2DecodeSweep, DsGdsFlagCapturesBothCandidateBits) {
+    // llvm-mc places GDS at bit 17; bit 16 is captured too so an unknown flag is rejected visibly
+    // rather than silently running a device-global op against workgroup LDS.
+    EXPECT_FALSE(decode(kTop6Ds).ds_gds);
+    EXPECT_TRUE(decode(kTop6Ds | (1u << 17)).ds_gds);
+    EXPECT_TRUE(decode(kTop6Ds | (1u << 16)).ds_gds);
+    EXPECT_TRUE(decode(kTop6Ds | (3u << 16)).ds_gds);
+}
+
+TEST(Rdna2DecodeSweep, VintrpDecodesOpcodeDestinationAttributeAndChannel) {
+    for (uint32_t op = 0; op < 4; ++op) {
+        EXPECT_EQ(decode(kTop6Vintrp | (op << 16)).opcode, op) << op;
+    }
+    for (uint32_t attr = 0; attr < 64; ++attr) {
+        EXPECT_EQ(decode(kTop6Vintrp | (attr << 10)).vintrp_attr, attr) << attr;
+    }
+    for (uint32_t chan = 0; chan < 4; ++chan) {
+        EXPECT_EQ(decode(kTop6Vintrp | (chan << 8)).vintrp_chan, chan) << chan;
+    }
+    const Rdna2Inst in = decode(kTop6Vintrp | (9u << 18) | 0x7u);
+    EXPECT_EQ(in.dst.value, 9);
+    EXPECT_EQ(in.src[0].value, 7);
+    EXPECT_EQ(in.n_src, 1);
+}
