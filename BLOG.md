@@ -19,6 +19,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-03
+
+### Silent Hill 2 renders its legal splash again
+
+The normal Linux `prosper-app` route gets past the startup read failure and renders the legal splash; the earlier scheduled frame is black, and a correct title screen remains unverified ([tracker #4024](https://github.com/mattias800/prosper/issues/4024)).
+
+<p align="center"><img src="assets/screenshots/silent-hill-2-apr-restored-legal-2026-10-03.webp" alt="Silent Hill 2 — readable legal splash and Wwise logo in the normal visible Linux prosper-app SDL/X11 window, without input injection or an overlay"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-apr-restored-early-black-2026-10-03.webp" alt="Silent Hill 2 — black scheduled prosper-app screenshot, armed at presentation 120 and written at 226, before the later legal-splash window capture; this is not title evidence"></p>
+
 ## 2026-10-01
 
 ### Silent Hill 2 renders its first-boot setup

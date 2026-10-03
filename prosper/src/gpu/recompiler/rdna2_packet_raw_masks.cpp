@@ -122,9 +122,9 @@ void PacketRawMasks::phase(SpirvCompute& b, const std::map<int, uint32_t>& scala
     // Only the logical wave leader assembles the pair: O(64) LDS reads, not O(64*64). The two
     // result slots are private and disjoint from the reused input plane and definedness metadata.
     const auto leader = b.id(), assembled = b.id();
+    const auto is_leader = b.land(pending, b.ucmp(Op_IEqual, b.linear_localid, zero));
     b.emit_selmerge(assembled);
-    b.emit_condbranch(b.land(pending, b.ucmp(Op_IEqual, b.linear_localid, zero)), leader,
-                      assembled);
+    b.emit_condbranch(is_leader, leader, assembled);
     b.emit_label(leader);
     uint32_t words[2]{zero, zero};
     for (uint32_t lane = 0; lane < 64; ++lane) {

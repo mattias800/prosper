@@ -340,35 +340,29 @@ int main(int argc, char** argv) {
                           : "packet-readlane-selector-kind-unimplemented",
                "READLANE bank/domain control " + std::to_string(arm));
     }
-    // A supplied initial scalar word is NOT authority for stale data after a saved-mask write.
-    // Keep the extra read live in EXP. The count destination is a real data word (positive);
-    // the saved mask's unmaterialized low word must refuse, never use the CFG placeholder zero.
-    for (uint32_t source : {12u, 20u}) {
-        auto p = clean;
-        const auto first_exp = std::find(p.guest_code.begin(), p.guest_code.end(), 0xf800180fu);
-        check(first_exp != p.guest_code.end(), "live count/mask control retains EXP fixture");
-        if (first_exp == p.guest_code.end()) continue;
-        const size_t pc = static_cast<size_t>(first_exp - p.guest_code.begin());
-        p.guest_code.insert(p.guest_code.begin() + pc, 0x7e0a0200u | source); // v_mov v5,sSOURCE
-        p.guest_code[pc + 2] = (p.guest_code[pc + 2] & ~0xffu) | 5u; // live MRT channel0
-        const auto r = prosper::gpu::recompile_fragment_packet(
-            p, {prosper::gpu::RecompileDiagnosticStage::Fragment, 0x4093});
-        if (source == 12) {
-            check(!r.spirv.empty() && r.rejection.empty(), "defined count word echo emits");
-            if (!r.spirv.empty()) {
-                bpermute_oracle::Interpreter vm(r.spirv);
-                const auto actual = vm.run_packet(r.input_words, r.output_words);
-                check(vm.error.empty() && actual == expected({}, p),
-                      "defined count word echo reaches actual EXP sink");
-            }
-        } else {
-            check(r.spirv.empty() && r.input_words.empty() && r.output_words.empty(),
-                  "saved mask word never becomes a defined zero");
-            check(r.rejection.starts_with("packet-guest-emission-refused:") &&
-                  r.rejection != "packet-guest-emission-refused:no-cause-recorded",
-                  "saved mask data read has a named emission cause: " + r.rejection);
+    // A saved mask now defines its physical words, not the supplied initial poison. Keep both
+    // the zero low half (bit63) and nonzero low half (bit31) live in EXP beside the count twin.
+    for (uint32_t selected : {31u, 63u})
+        for (uint32_t source : {12u, 20u}) {
+            Case c;
+            c.selected_lane = selected;
+            auto p = packet(c);
+            const auto first_exp = std::find(p.guest_code.begin(), p.guest_code.end(), 0xf800180fu);
+            check(first_exp != p.guest_code.end(), "live count/mask control retains EXP fixture");
+            if (first_exp == p.guest_code.end()) continue;
+            const size_t pc = static_cast<size_t>(first_exp - p.guest_code.begin());
+            p.guest_code.insert(p.guest_code.begin() + pc,
+                                0x7e0a0200u | source);   // v_mov v5,sSOURCE
+            p.guest_code[pc + 2] = (p.guest_code[pc + 2] & ~0xffu) | 5u;   // live MRT channel0
+            auto want = expected(c, p);
+            if (source == 20)
+                for (uint32_t lane = 0; lane < 64; ++lane)
+                    want[lane * 12 + 8] = uint32_t(uint64_t(1) << selected);
+            sink_case(p, want,
+                      "saved_mask_word_echo_" + std::to_string(selected) + "_" +
+                          std::to_string(source),
+                      directory);
         }
-    }
     auto missing = clean;
     missing.slots_available[63] = false;
     reject(missing, "packet-invocation-state-unavailable", "missing high-half slot");

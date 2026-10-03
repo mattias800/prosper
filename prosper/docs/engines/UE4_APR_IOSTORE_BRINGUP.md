@@ -11,6 +11,15 @@ default since #825 and needs no switch; `PROSPER_NO_GUEST_FS=1` turns it off for
 
 ## Ruled out
 
+- **Both `AndGetResult` outputs carry the event token — false.** Original callers read an
+  eight-byte `{status32, failing_offset32}` result and a separate four-byte submit ID, which
+  they pass to the wait function. Silent Hill 2 reads its status at `eboot+0x230e7d4` and the
+  failing offset at `+0x230e7db`; putting token 1 into status made a real completed 144-byte
+  read fatal. The earlier output-token and aliased-byte-count descriptions below are historical
+  interpretations superseded by [#4042](https://github.com/mattias800/prosper/issues/4042).
+  Event binding tags retain their independent delivery dialect; console ID encoding/reuse and
+  APR-engine failure-result enums remain unmeasured.
+
 - **The H896Pt-yB4I / o67gODLFpls bind carries a dialect marker in a4/a5 — not observed.** The
   bind is `(cb, equeue, id, data, a4, a5)` and an earlier note read `7|0xf` in a4/a5 on the
   IoDispatcher channel against 0 elsewhere. The author reports that on *Tales of Graces f*

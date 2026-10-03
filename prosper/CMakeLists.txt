@@ -802,6 +802,9 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_fragment_entry_prefix
     SOURCES tests/gpu/execute/test_fragment_entry_prefix.cpp
     INCLUDES tests LIBRARIES prosper_core)
+  prosper_add_gtest(test_ps_pull_model
+    SOURCES tests/gpu/execute/test_ps_pull_model.cpp
+    INCLUDES tests LIBRARIES prosper_core)
 
   # nid_census: every guest import that falls to the dispatcher's return-0 default (#2081).
   # Links prosper_core because both of its inputs must be the real ones — `Module::load` for the
@@ -1170,6 +1173,12 @@ if(TARGET prosper_core)
     set_tests_properties(ampr_udata PROPERTIES TIMEOUT 20)
   endif()
 
+  # #4103: force a real equeue allocation to reuse its handle and verify APR lifetime isolation.
+  prosper_add_gtest(test_apr_equeue_lifetime
+    SOURCES tests/hle/kernel/test_apr_equeue_lifetime.cpp
+    LIBRARIES prosper_core
+    PROPERTIES TIMEOUT 20)
+
   # Variadic libc formatters (issue #122): real va_list capture so %f/XMM + stack + %s-past-4th
   # args format correctly (was a 3-integer-register forward). Cross-platform (host libc printf).
   prosper_add_gtest(test_printf
@@ -1204,11 +1213,16 @@ if(TARGET prosper_core)
     INCLUDES src
     LIBRARIES prosper_core)
 
-  # The APR submit's result out-parameters are uint32_t*; an 8-byte store overran into the guest's
-  # stack canary and killed the title with __stack_chk_fail (#4138).
+  # APR status/offset uses 8 bytes and the separate submit ID uses 4; widening the ID
+  # overwrites the adjacent guest flag/canary (#4138, #4042).
   prosper_add_gtest(test_apr_result_slot_width
     SOURCES tests/hle/kernel/test_apr_result_slot_width.cpp
     INCLUDES src
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_apr_submission
+    SOURCES tests/hle/kernel/test_apr_submission.cpp
+    INCLUDES src tests
     LIBRARIES prosper_core)
 
   # lseek/fseek/ftell must address offsets >= 2 GiB. MinGW's long/off_t are 32 bits, so Black Flag's
@@ -2298,6 +2312,13 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/diagnostics/test_diag_ratelimit.cpp
     INCLUDES src)
 
+  # The build journal must not crash on an unreadable label or present a partial/old
+  # sample as an observed fence value. CPU-only: no command processor or Vulkan device.
+  prosper_add_gtest(test_fence_build_journal
+    SOURCES tests/gpu/diagnostics/test_fence_build_journal.cpp
+            src/gpu/diagnostics/fence_build_journal.cpp src/host/memory/guest_memory_copy.cpp
+    INCLUDES src)
+
   # Readback-reason policy: the verdict is expressed in terms of the reason, so a future edit
   # cannot change what is counted without changing what is decided.
   target_sources(test_cpu_rtt_snapshot_pool PRIVATE src/diagnostics/readback_reason_census.cpp)
@@ -2624,6 +2645,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
   add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
 
+  # Exhaustive per-family opcode/length sweep of the walker (words built from the encoding layout).
+  prosper_add_gtest(test_rdna2_decode_sweep
+    SOURCES tests/gpu/recompiler/test_rdna2_decode_sweep.cpp
+    LIBRARIES prosper_core)
+
   # Structural RDNA2->SPIR-V validation that does not require Vulkan runtime support.
   add_executable(test_rdna2_spirv_struct tests/gpu/test_rdna2_spirv_struct.cpp)
   target_link_libraries(test_rdna2_spirv_struct PRIVATE prosper_core)
@@ -2699,6 +2725,11 @@ if(TARGET prosper_core)
   add_executable(test_raw_register_wide_data tests/gpu/recompiler/test_raw_register_wide_data.cpp)
   target_link_libraries(test_raw_register_wide_data PRIVATE prosper_core)
   add_test(NAME raw_register_wide_data COMMAND test_raw_register_wide_data)
+  prosper_add_gtest(test_raw_wide_flat_read_effects
+    SOURCES tests/gpu/recompiler/test_raw_wide_flat_read_effects.cpp
+            src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_raw_wide_data.cpp
+    INCLUDES src)
   prosper_add_gtest(test_graphics_raw_register_wide_data
     SOURCES tests/gpu/recompiler/test_graphics_raw_register_wide_data.cpp
     LIBRARIES prosper_core)
@@ -3829,6 +3860,12 @@ endif()
       target_link_libraries(test_runtime_prx_load PRIVATE prosper_core)
       add_test(NAME runtime_prx_load COMMAND test_runtime_prx_load)
       if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # Initial installation must reject an oversized last-slot hook before touching live pages.
+        prosper_add_gtest(test_initial_stub_install
+          SOURCES tests/host/image/test_initial_stub_install.cpp
+          LIBRARIES prosper_core
+          PROPERTIES TIMEOUT 20)
+        target_link_options(test_initial_stub_install PRIVATE "-Wl,--wrap=mmap")
         target_link_options(test_runtime_prx_load PRIVATE "-Wl,--wrap=mmap")
         foreach(failure map image emission)
           add_test(NAME runtime_prx_append_${failure}_failure
@@ -5858,6 +5895,9 @@ endif()
 # physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
 # silent pass) where one does not.
 if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  prosper_add_gtest(test_ps_pull_model_exec
+    SOURCES tests/gpu/execute/test_ps_pull_model_exec.cpp
+    INCLUDES tests frontends LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_fragment_entry_prefix_exec
     SOURCES tests/gpu/execute/test_fragment_entry_prefix_exec.cpp
     INCLUDES tests

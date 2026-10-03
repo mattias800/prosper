@@ -4,7 +4,7 @@
 with nothing armed, code in this folder can be removed or rate-limited without changing a single
 rendered pixel.
 
-**Three entries break the stronger form of that rule and you must know about them.**
+**Four entries break the stronger form of that rule and you must know about them.**
 `compute_parent_walk_suspicious()` in `compute_parent_walk.cpp` reaches the site in
 `execute/gpu_executor.cpp` that prints `[compute-parent-walk] DIAGNOSTIC-ONLY skip suspicious`
 and then **does not run the dispatch** — grep `DIAGNOSTIC-ONLY skip suspicious`, which is unique
@@ -30,7 +30,14 @@ it exists because this machine hard-froze five times under ordinary prosper GPU 
 three wrong published root causes, and a diagnostic that must be switched on is one nobody had
 switched on for the run that mattered (#3533). `PROSPER_GPU_MEM_LOG=0` silences it.
 
+The fourth default-path entry is `fence_build_journal`: it samples a label at packet build
+time and retains diagnostic metadata. It does not validate or complete a guest fence.
+
 - `diagnostic_selectors` — choosing what to observe.
+- `fence_build_journal` — default-on, bounded build-time label observations used by the command
+  processor's diagnostics. It never rewrites a packet or completes a fence. Lookup requires a
+  complete fault-safe eight-byte sample; unavailable and colliding replacements cannot expose
+  a previous sample. Each direct-mapped slot has its own lock, with process-lifetime storage.
 - `gpu_memory_budget` / `gpu_memory_budget_vk` — how many bytes prosper itself holds on each device
   heap, against that heap's size, with a peak. The split is deliberate: the first header is free of
   Vulkan types so it can be included anywhere, and the second carries the two wrappers every shipped
