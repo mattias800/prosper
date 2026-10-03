@@ -55,6 +55,10 @@ TEST(FragmentPacketRawMasks, SaveexecMaterializesOldMaskButSccTestsNewExec) {
 TEST(FragmentPacketRawMasks, PhysicalWordsFeedScalarDataWrappingArithmetic) {
     evaluate(f::scalar_data_add());
 }
+TEST(FragmentPacketRawMasks, NotSccTestsTheCompleteCurrentInvertedMask) {
+    evaluate(f::not_scc(false));
+    evaluate(f::not_scc(true));
+}
 TEST(FragmentPacketRawMasks, CompleteWriterDoesNotResurrectEntryWordsAndAbsenceStillRefuses) {
     auto c = f::overwritten(f::asymmetric, true, true);
     std::erase_if(c.packet.sgprs,

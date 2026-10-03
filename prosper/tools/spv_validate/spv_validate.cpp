@@ -725,9 +725,10 @@ int main(int argc, char** argv) {
              "recompile_fragment_resource_packet");
         namespace special = prosper::test::fragment_special_f32;
         namespace raw_masks = prosper::test::fragment_raw_masks;
-        for (const auto& c : {raw_masks::overwritten(raw_masks::asymmetric, false, false),
-                              raw_masks::overwritten(raw_masks::asymmetric, true, true),
-                              raw_masks::wqm_saved(), raw_masks::saveexec_scc(false)}) {
+        for (const auto& c :
+             {raw_masks::overwritten(raw_masks::asymmetric, false, false),
+              raw_masks::overwritten(raw_masks::asymmetric, true, true), raw_masks::wqm_saved(),
+              raw_masks::saveexec_scc(false), raw_masks::not_scc(false)}) {
             const auto packet = recompile_fragment_packet(c.packet);
             dump(dir, ("fragment_raw_masks_" + c.name).c_str(), packet.spirv,
                  "recompile_fragment_packet");

@@ -7,6 +7,7 @@ namespace prosper::gpu {
 struct PacketRawMasks {
     std::set<int> roots;
     std::map<uint32_t, int> sites;
+    std::set<uint32_t> scc_sites;
     uint32_t pending_var = 0, mask_var = 0, event_var = 0, dst_var = 0, deferred_var = 0;
     uint32_t result_base = 0;
     PacketRawMasks(const SpirvCompute&, const std::vector<Rdna2Inst>&);
@@ -19,6 +20,9 @@ struct PacketRawMasks {
     void phase(SpirvCompute&, const std::map<int, uint32_t>& scalar_vars,
                const std::map<int, uint32_t>& mask_vars);
 };
+// SAVEEXEC's SCC observes NEW EXEC, not the separately saved OLD mask. Native callers keep their
+// existing destination reduction; the exact owned packet routes these producers through its vote.
+uint32_t cfg_b64_mask_scc_value(const Rdna2Inst&, const RegState&, bool owned_packet);
 // Existing portable FFBH phase extracted without changing its native/legacy instruction stream.
 bool emit_cfg_mask_ffbh_phase(SpirvCompute&, uint32_t pending_var, uint32_t mask_var,
                               uint32_t write_var, uint32_t event_var, uint32_t half_var,

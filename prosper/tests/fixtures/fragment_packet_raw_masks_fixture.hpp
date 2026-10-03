@@ -173,6 +173,7 @@ inline Case wqm_saved() {
 inline Case saveexec_scc(bool nonzero) {
     auto c = overwritten(asymmetric, true, true);
     c.packet.vcc_mask = nonzero ? asymmetric : 0;
+    c.packet.scc = !nonzero;   // stale entry SCC must not satisfy either original branch
     c.packet.sgprs.emplace_back(6, 0x51000000u);
     f::column(c.packet, 6, fp::poison_sentinel);
     c.packet.guest_code[0] = 0xbe94246au;   // S_AND_SAVEEXEC saves OLD EXEC, SCC tests NEW EXEC
@@ -202,6 +203,40 @@ inline Case saveexec_scc(bool nonzero) {
         std::copy(std::begin(row), std::end(row), c.expected.begin() + lane * 36 + 24);
     }
     c.name = nonzero ? "saveexec_scc_new_nonzero_old_saved" : "saveexec_scc_new_zero_old_saved";
+    return c;
+}
+inline Case not_scc(bool nonzero) {
+    auto c = overwritten(nonzero ? asymmetric : UINT64_MAX, true, true, true);
+    c.packet.scc = !nonzero;
+    c.packet.sgprs.emplace_back(6, 0x51000000u);
+    f::column(c.packet, 6, fp::poison_sentinel);
+    // Observe actual NOT SCC after SCC-preserving MOV EXEC, independently of the later half write.
+    std::vector<uint32_t> branch{0xbf840002u};
+    fp::smov(branch, 6, 0x61000000u);
+    fp::vmov(branch, 6, 6);
+    c.packet.guest_code.insert(c.packet.guest_code.begin() + 3, branch.begin(), branch.end());
+    std::vector<uint32_t> sink;
+    fp::exp(sink, 1, 6);
+    c.packet.guest_code.insert(c.packet.guest_code.end() - 1, sink.begin(), sink.end());
+    const auto old = c.expected;
+    c.expected.assign(64 * 36, 0);
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        std::copy_n(old.begin() + lane * 24, 24, c.expected.begin() + lane * 36);
+        const uint32_t row[]{1,
+                             old[lane * 24 + 1],
+                             c.packet.export_enabled[lane],
+                             0,
+                             1,
+                             0,
+                             1,
+                             1,
+                             nonzero ? 0x61000000u : 0x51000000u,
+                             0,
+                             0,
+                             0};
+        std::copy(std::begin(row), std::end(row), c.expected.begin() + lane * 36 + 24);
+    }
+    c.name = nonzero ? "not_scc_current_nonzero" : "not_scc_current_zero";
     return c;
 }
 inline Case scalar_data_add() {

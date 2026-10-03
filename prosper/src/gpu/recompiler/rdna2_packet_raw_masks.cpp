@@ -7,6 +7,10 @@ PacketRawMasks::PacketRawMasks(const SpirvCompute& b, const std::vector<Rdna2Ins
     if (!b.is_fragment_packet() || b.wave_size != 64 || b.native_subgroup_size ||
         b.local_count != 64)
         return;
+    for (const auto& in : ins)
+        if (in.fmt == Rdna2Format::SOP1 &&
+            (in.opcode == 0x08 || in.opcode == kSop1OpcodeAndSaveexecB64))
+            scc_sites.insert(in.pc);
     std::set<int> possible;
     for (const auto& in : ins)
         for_each_scalar_write(in, [&](int base, uint32_t width) {
@@ -35,6 +39,14 @@ PacketRawMasks::PacketRawMasks(const SpirvCompute& b, const std::vector<Rdna2Ins
             if (width == 2 && roots.contains(base) && scalar_write_is_b64_mask(in, base))
                 sites.emplace(in.pc, base);
         });
+}
+uint32_t cfg_b64_mask_scc_value(const Rdna2Inst& in, const RegState& state, bool owned_packet) {
+    if ((owned_packet && in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeAndSaveexecB64) ||
+        in.dst.value == 126 || in.dst.value == 127)
+        return state.exec;
+    if (in.dst.value == 106 || in.dst.value == 107) return state.vcc;
+    const auto saved = state.sreg_bool.find(in.dst.value);
+    return saved != state.sreg_bool.end() ? saved->second : 0;
 }
 void PacketRawMasks::begin(SpirvCompute& b, uint32_t base) {
     if (sites.empty()) return;

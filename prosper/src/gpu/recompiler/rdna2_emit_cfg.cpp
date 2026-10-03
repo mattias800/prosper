@@ -2117,7 +2117,11 @@ bool emit_cfg_state_machine(
         if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
             scalar_block_starts.insert(ins[i + 1].pc);
     }
+    PacketRawMasks packet_raw_masks(b, ins);
     std::unordered_set<uint32_t> b64_mask_scc_vote_pcs;
+    // Newly admitted packet SOP1 masks need real SCC even across a preserving MOV/dispatcher.
+    b64_mask_scc_vote_pcs.insert(packet_raw_masks.scc_sites.begin(),
+                                 packet_raw_masks.scc_sites.end());
     for (size_t i = 0; i < ins.size(); ++i) {
         const Rdna2Inst& consumer = ins[i];
         if (consumer.is_end) break;
@@ -2215,7 +2219,6 @@ bool emit_cfg_state_machine(
     std::set<int> compute_dpp_row_ror8_dsts;
     uint32_t next_compute_dpp_event = 1;
     std::unordered_set<uint32_t> compute_dpp_add_row_mask_pcs;
-    PacketRawMasks packet_raw_masks(b, ins);
     std::unordered_map<uint32_t, uint32_t> portable_mask_ffbh_event_for_pc;
     std::set<int> portable_mask_ffbh_dsts;
     std::unordered_map<uint32_t, uint32_t> portable_mask_reduction_event_for_pc;
@@ -5925,17 +5928,8 @@ bool emit_cfg_state_machine(
             }
         }
         if (b64_mask_scc_vote) {
-            uint32_t value = 0;
-            if (b64_mask_scc_vote->dst.value == 126 ||
-                b64_mask_scc_vote->dst.value == 127) {
-                value = state.exec;
-            } else if (b64_mask_scc_vote->dst.value == 106 ||
-                       b64_mask_scc_vote->dst.value == 107) {
-                value = state.vcc;
-            } else {
-                const auto saved = state.sreg_bool.find(b64_mask_scc_vote->dst.value);
-                if (saved != state.sreg_bool.end()) value = saved->second;
-            }
+            const uint32_t value =
+                cfg_b64_mask_scc_value(*b64_mask_scc_vote, state, b.is_fragment_packet());
             if (!value)
                 return reject_cfg(b64_mask_scc_vote->pc, "missing-b64-mask-scc-source");
             if (b.native_subgroup_size || b.is_fragment) {

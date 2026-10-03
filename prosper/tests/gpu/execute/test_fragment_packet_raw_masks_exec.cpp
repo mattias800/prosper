@@ -19,6 +19,8 @@ TEST(FragmentPacketRawMasksExec, BothCurrentHalvesOverwriteTransferAndLogicalPos
     cases.push_back(f::saveexec_scc(false));
     cases.push_back(f::saveexec_scc(true));
     cases.push_back(f::scalar_data_add());
+    cases.push_back(f::not_scc(false));
+    cases.push_back(f::not_scc(true));
     for (const auto& c : cases) {
         SCOPED_TRACE(c.name);
         const auto p = recompile_fragment_packet(c.packet);
@@ -42,10 +44,10 @@ TEST(FragmentPacketRawMasksExec, BothCurrentHalvesOverwriteTransferAndLogicalPos
         EXPECT_TRUE(result.rejection.empty()) << result.rejection;
         EXPECT_EQ(result.exports, c.expected) << "all64 independent raw EXP words";
     }
-    EXPECT_EQ(attempts, f::kCases + 9);
+    EXPECT_EQ(attempts, f::kCases + 11);
     std::fprintf(stderr,
                  "[raw-mask-gpu] queried_physical_subgroup_size=%u attempts=%u expected=%u\n",
-                 queried.size, attempts, f::kCases + 9);
+                 queried.size, attempts, f::kCases + 11);
 }
 TEST(FragmentPacketRawMasksExec, CachedMaskMaterializationIsWorkgroupIndependent) {
     using namespace prosper::gpu;
