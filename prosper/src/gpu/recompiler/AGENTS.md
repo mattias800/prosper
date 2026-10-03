@@ -60,6 +60,14 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   initial domain. Private readonly binding2 placement ownership guards mutable binding0 routes
   uniformly before guest/barriers/stores; that retained dispatcher authority is not a live P5 lease.
   It grants no raster scheduling, system-entry derivation or shipping admission.
+- `fragment_draw_capacity` and `_emission` define a separate WAT2 immutable GPU-capacity/placement
+  contract. It binds the complete collector shape before shader address generation; capacity and
+  zero storage never authenticate guest entry state. The default WAT1 compiler/wire stay unchanged.
+  `fragment_draw_gpu` emits count/indirect-dispatch and genuine-quad assembly; `_commit_gpu` checks
+  every original worker status/site plus retained raster provenance and unique pixel indexing
+  before publishing one device whole-draw gate. Replay writes through normal fixed-function
+  attachments only after that gate. Genuine helper/system/M0/coefficients/resources and observable
+  cross-quad composition are separate future recipes, not padded values or waived requirements.
 - `rdna2_mask_move` supplies the shared S_MOV_B64-to-EXEC lowering. Owned Wave64 packets consume
   two genuine instruction-order MUST scalar words at their logical lane position, independently
   of old EXEC, and preserve SCC. A partial numeric overwrite of a saved Bool mask remains a named

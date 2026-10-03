@@ -55,6 +55,7 @@ struct RenderVkCtx {
     bool logic_op_enabled = false; bool ok = false;
     bool geometry_shader_enabled = false;
     bool fragment_stores_atomics = false;
+    bool shader_int64_enabled = false;   // successful vkCreateDevice feature, never advertised-only
     // Enabled robust2 plus <=4-byte range rounding: word-buffer OOB reads deterministically zero.
     bool deterministic_storage_reads = false;
     prosper::gpu::FloatTransportConfig float_transport{};

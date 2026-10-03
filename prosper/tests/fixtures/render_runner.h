@@ -30,6 +30,7 @@
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
+#include "gpu/execute/fragment_draw_plan.hpp"
 #include "diagnostics/exit_census.hpp"       // one-line end-of-run reports
 #include "diagnostics/persistent_target_census.hpp"  // is the colour-target cache at its bound?
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
@@ -73,6 +74,7 @@
 #include <iterator>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -166,6 +168,7 @@ inline uint64_t hash_buffer_words(const uint32_t* words, size_t count) {
 // texture-capable object (currently 512 bytes) for every one only to leave all image state empty is
 // measurable resource-preparation work. Tests and replay inputs may continue putting buffers in
 // FrameResource; the backend accepts both representations through the same upload path.
+#include "fixtures/fragment_draw_buffer_binding.h"
 struct FrameBufferResource {
     uint32_t binding = 0;
     uint32_t set = 0;               // descriptor set: VS resources -> 0, PS resources -> 1 (they must not
@@ -192,6 +195,9 @@ struct FrameBufferResource {
     // state any producer creates today -- means an ordinary single descriptor and every path below
     // behaves exactly as before.
     std::vector<std::vector<uint32_t>> table_entries;
+    // Internal immutable device-local transaction plane. No host/guest payload is uploaded for
+    // this binding. Its private owner prevents pool reuse until the ordered replay completes.
+    std::shared_ptr<const FragmentDrawGpuBuffer> fragment_draw_buffer;
     const uint32_t* buffer_words_data() const {
         return dwords_view && dwords_view_count
             ? dwords_view : (dwords.empty() ? nullptr : dwords.data());
@@ -706,6 +712,7 @@ inline BackendColorTargetStats backend_color_target_stats() {
 // that requires an ordered pass boundary. render_triangle_rgba is a thin single-draw wrapper (below).
 struct BackendDraw {
     std::shared_ptr<prosper::gpu::RasterQuadCollection> raster_quads;
+    std::shared_ptr<const prosper::gpu::RasterQuadInputs> fragment_draw_inputs;
     bool raster_quad_contract_modified = false;
     std::vector<uint32_t> vs, gs, fs;
     // For a mesh draw, `vs` carries a MeshEXT module instead of a vertex module. The group counts
@@ -2064,6 +2071,7 @@ inline const RenderVkCtx& render_vk_ctx() {
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
+        r.shader_int64_enabled = feats.shaderInt64;
         if (prosper::gpu::breadcrumbs_requested())
             prosper::gpu::breadcrumb_arm_device(r.dev, r.phys, breadcrumb_support,
                                                 breadcrumb_fault_enabled, "render");
@@ -8418,6 +8426,10 @@ inline uint64_t backend_pass_source_submit(std::span<const BackendDraw> draws) {
 // Shared live/test renderer owner; it deliberately uses the same device, buffer pool and ordered
 // completion machinery, not a second standalone Vulkan harness.
 #include "fixtures/raster_quad_collection_gpu.h"
+#include "fixtures/fragment_draw_storage_gpu.h"
+#include "fixtures/fragment_draw_compute_gpu.h"
+#include "fixtures/fragment_draw_collect_gpu.h"
+#include "fixtures/fragment_draw_backend_transaction.h"
 
 inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> draws,
                                                   uint32_t W, uint32_t H,
@@ -8459,6 +8471,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     resource_reuse_stats = {};
     BackendTextureUploadStats& texture_stats = backend_texture_upload_stats_storage();
     texture_stats = {}; // An empty or failed pass must not report the previous call's uploads.
+    fragment_draw_backend_stats() =
+        {};   // recorded transaction counters never imply GPU completion
     maybe_report_hash_stats();   // gated cumulative hashing economics (#1268)
     std::vector<uint8_t> out;
     if (out_rgba1) out_rgba1->clear();
@@ -10374,6 +10388,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         return bits;
     };
     std::vector<DV> dv(draws.size());
+    std::shared_ptr<FragmentDrawBackendBatch> fragment_draw_batch;
+    if (std::any_of(draws.begin(), draws.end(),
+                    [](const BackendDraw& draw) { return bool(draw.fragment_draw_inputs); }))
+        fragment_draw_batch =
+            std::make_shared<FragmentDrawBackendBatch>(ctx, draws, W, H, color_count);
     // Preserve the frontend's exact descriptor order while borrowing either the complete resource or
     // its compact buffer-only carrier. The references are synchronous: every pointed-to vector belongs
     // to `draws`, which outlives this call. Synthetic GDS entries are owned alongside these views.
@@ -10386,7 +10405,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     std::vector<FrameBufferResource> synthetic_gds(draws.size());
     std::vector<std::vector<EffectiveResource>> effective_resources(draws.size());
     for (size_t i = 0; i < draws.size(); ++i) {
-        const BackendDraw& draw = draws[i];
+        const BackendDraw& draw =
+            fragment_draw_batch ? fragment_draw_batch->draw(i, draws[i]) : draws[i];
         auto& effective = effective_resources[i];
         effective.reserve(draw.R.size() + draw.B.size() + 1);
         if (draw.resource_order.empty()) {
@@ -10400,7 +10420,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 else effective.push_back({&draw.R[index], nullptr});
             }
         }
-        if (fragment_uses_internal_gds_memoized(draws[i].fs_identity, draws[i].fs_words())) {
+        if ((!fragment_draw_batch || !fragment_draw_batch->replay(i)) &&
+            fragment_uses_internal_gds_memoized(draw.fs_identity, draw.fs_words())) {
             FrameBufferResource& gds = synthetic_gds[i];
             gds.set = 1;
             gds.binding = 0;
@@ -10629,7 +10650,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         descriptor_sets += set_count;
     }
     VkDescriptorPool shared_descriptor_pool = VK_NULL_HANDLE;
-    if (descriptor_sets) {
+    if (fragment_draw_batch) {
+        descriptor_sets += fragment_draw_batch->additional_sets();
+        storage_buffers += fragment_draw_batch->additional_storage_descriptors();
+    }
+    const bool descriptor_pool_counts_fit =
+        descriptor_sets <= UINT32_MAX && storage_buffers <= UINT32_MAX &&
+        sampled_images <= UINT32_MAX && storage_images <= UINT32_MAX;
+    if (!descriptor_pool_counts_fit)
+        std::fprintf(
+            stderr,
+            "[render] descriptor pool count overflow; no descriptor-bearing draw admission\n");
+    if (descriptor_sets && descriptor_pool_counts_fit) {
         VkDescriptorPoolSize sizes[3] = {
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
              static_cast<uint32_t>(std::max<uint64_t>(storage_buffers, 1))},
@@ -10754,7 +10786,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (wave64_census) wave64_stats.note_draw(W, H);
         prosper::gpu::draw_disposition_census().note_seen();
         const auto setup_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-        const BackendDraw& bd = draws[di];
+        const BackendDraw& bd =
+            fragment_draw_batch ? fragment_draw_batch->draw(di, draws[di]) : draws[di];
         const std::vector<uint32_t>& bd_vs = bd.vs_words();
         const std::vector<uint32_t>& bd_gs = bd.gs_words();
         const std::vector<uint32_t>& bd_fs = bd.fs_words();
@@ -10834,7 +10867,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // ONE binary rather than a comparison of two builds. Kept as a permanent bisection lever for
         // the same reason PROSPER_NO_INDEX_ARENA (#2258) and the PROSPER_NO_BACKEND_* family exist.
         static const bool no_subgroup_scan_memo = getenv("PROSPER_NO_SUBGROUP_SCAN_MEMO") != nullptr;
-        bool subgroup_scan_memoized = false;
+        bool subgroup_scan_memoized = fragment_draw_batch && fragment_draw_batch->replay(di);
         if (bd.fs_identity && !no_subgroup_scan_memo) {
             const auto found = subgroup_scan_memo.find(bd.fs_identity);
             if (found != subgroup_scan_memo.end()) {
@@ -10872,8 +10905,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupShuffle;
         if (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_BALLOT_BIT)
             available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupBallot;
-        const bool uses_internal_gds =
-            fragment_uses_internal_gds_memoized(bd.fs_identity, bd_fs);
+        const bool uses_internal_gds = (!fragment_draw_batch || !fragment_draw_batch->replay(di)) &&
+                                       fragment_uses_internal_gds_memoized(bd.fs_identity, bd_fs);
         bool fragment_subgroup_skip = required_fragment_subgroup_size &&
             (!ctx.subgroup_size_control ||
              required_fragment_subgroup_size < ctx.min_subgroup_size ||
@@ -12861,6 +12894,23 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     draw_lb[i].stageFlags = (bd.mesh_draw ? VK_SHADER_STAGE_MESH_BIT_EXT
                                                          : VK_SHADER_STAGE_VERTEX_BIT) |
                                              VK_SHADER_STAGE_FRAGMENT_BIT;
+                    if (r.fragment_draw_buffer) {
+                        if (r.is_internal_gds || !r.table_entries.empty() ||
+                            r.buffer_words_data() || r.direct_guest_buffer_addr ||
+                            !r.fragment_draw_buffer->valid_for(
+                                dev, ctx.detile_limits.maxStorageBufferRange)) {
+                            buffer_resources_ready = false;
+                            break;
+                        }
+                        draw_dbi[draw_dbi_offset[i]] = {r.fragment_draw_buffer->buffer(), 0,
+                                                        r.fragment_draw_buffer->bytes()};
+                        draw_wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                        draw_wr[i].dstBinding = r.binding;
+                        draw_wr[i].descriptorCount = 1;
+                        draw_wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                        draw_wr[i].pBufferInfo = &draw_dbi[draw_dbi_offset[i]];
+                        continue;
+                    }
                     if (r.is_internal_gds) {
                         const RenderHostBuffer& gds = render_internal_gds_buffer();
                         draw_dbi[i] = {gds.buffer, 0, 64u * 1024u};
@@ -13032,6 +13082,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             for (size_t i = 0; i < R.size(); i++)
                 draw_wr[i].dstSet = v.dsets[R[i].common().set];
             vkUpdateDescriptorSets(dev, static_cast<uint32_t>(draw_wr.size()), draw_wr.data(), 0, nullptr);
+        }
+        if (fragment_draw_batch && !fragment_draw_batch->allocate(di, shared_descriptor_pool)) {
+            texture_path_census.skipped_draw();
+            prosper::gpu::draw_disposition_census().note_dropped(
+                prosper::gpu::DrawDrop::PipelineCreation);
+            continue;
         }
         const auto setup_resources_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) setup_resources_ms += setup_elapsed_ms(setup_fixed_ready, setup_resources_ready);
@@ -14317,10 +14373,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         record_stencil_dynamic_state(command, v);
         record_pipeline_dynamic_state(command, v);
     };
+    if (fragment_draw_batch) fragment_draw_batch->record(cmd, std::span<const DV>(dv));
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {
         auto& v = dv[di];
         const auto* ps = draws[di].ps;
+        // Failed whole-draw emulation may not execute unconditional DS clears before v.ok.
+        // Admitted first-recipe replays have all DS tests/writes/clears disabled independently.
+        if (fragment_draw_batch && fragment_draw_batch->attachment_guard(di) && !v.ok) continue;
         if (use_ds && ps &&
             (effective_depth_clear(ps) ||
              stencil_clear_effective(ps->stencil_clear_enable, ps->stencil_enable,
@@ -15620,18 +15680,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     command_pool_lease.dismiss();
     active_submission.add_cleanup(
         [dev, qfi, pool, cmd, dv = std::move(dv), shared_descriptor_pool,
+         fragment_draw_batch = std::move(fragment_draw_batch),
          shared_pipeline_layouts = std::move(shared_pipeline_layouts),
          shared_descriptor_set_layouts = std::move(shared_descriptor_set_layouts),
          shared_texture_bindings = std::move(shared_texture_bindings),
          shared_buffers = std::move(shared_buffers),
          shared_buffer_arenas = std::move(shared_buffer_arenas),
          texture_uploads = std::move(texture_uploads), seedbuf, seedmem, seedbuf1, seedmem1,
-         extra_seedbufs, extra_seedmems,
-         rb, bmem, fb, rp, transient_color, volume_color, view, img, imem,
-         transient_color1, view1, img1,
-         transient_extra,
-         imem1, color_count, extra_views, extra_images, extra_memories,
-         transient_ds, dview, dimg, dmem, ds_stats_pool, ds_occ_pool,
+         extra_seedbufs, extra_seedmems, rb, bmem, fb, rp, transient_color, volume_color, view, img,
+         imem, transient_color1, view1, img1, transient_extra, imem1, color_count, extra_views,
+         extra_images, extra_memories, transient_ds, dview, dimg, dmem, ds_stats_pool, ds_occ_pool,
          geom_buf, geom_mem, geom_counter, geom_counter_mem, ctx_ptr,
          color_target_generation]() mutable {
             release_render_command_pool(dev, qfi, RenderCommandPoolLease{pool, cmd});
@@ -15659,7 +15717,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 if (layout.handle && !layout.persistent)
                     vkDestroyPipelineLayout(dev, layout.handle, nullptr);
             for (const auto& [key, layout] : shared_descriptor_set_layouts)
-                if (layout.handle && !layout.persistent) vkDestroyDescriptorSetLayout(dev, layout.handle, nullptr);
+                if (layout.handle && !layout.persistent)
+                    vkDestroyDescriptorSetLayout(dev, layout.handle, nullptr);
             for (const SharedTextureBinding& binding : shared_texture_bindings) {
                 if (!binding.persistent) {
                     if (binding.sampler) vkDestroySampler(dev, binding.sampler, nullptr);
@@ -15686,8 +15745,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     !upload.borrowed_compute && !upload.borrowed_ds)
                     vkDestroyImage(dev, upload.image, nullptr);
                 if (upload.memory) {
-                    if (upload.direct_memory) prosper::gpu::free_device_memory(dev, upload.memory);
-                    else release_transient_render_memory(dev, upload.memory);
+                    if (upload.direct_memory)
+                        prosper::gpu::free_device_memory(dev, upload.memory);
+                    else
+                        release_transient_render_memory(dev, upload.memory);
                 }
                 // #3405: the cache owns its blocks and answers true even for a duplicate
                 // release, so the generic teardown can never free an allocation it still maps.

@@ -34,6 +34,13 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   and absent analysis/replaced raw source never grants program authority. Runtime per-lane read
   validity is separate from real mask/helper/system/composition/commit inputs; preparation remains
   refused until those obligations have actual evidence, not host-raster zero defaults.
+- `fragment_draw_plan` owns an immutable original-PS code/profile transaction plan and checked
+  per-draw producing/user-prefix upload. It never derives initial masks from collected coverage.
+  The first input/resource-free, packing-unobservable recipe requires an original dominating
+  full EXEC definition; helper/system/M0/parameter/resource and attachment recipes remain named
+  obligations. Architectural EXP policy is mandatory before live transaction admission. The normal
+  renderer companions record collection, indirect assembly/original PS and whole-draw validation
+  in one submission, then replay pure geometry in attachment order without a diagnostic readback.
 - `index_expand` — the guest's validated 16-bit index range widened to the 32-bit indices the
   backend uploads, and the maximum that sizes the vertex buffer. Two things about it are easy to
   get wrong and both are load-bearing. The maximum must be reduced from the **same** loaded values

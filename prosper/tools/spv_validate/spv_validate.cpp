@@ -21,6 +21,8 @@
 // is a hard failure rather than a pass.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
+#include "gpu/recompiler/fragment_draw_capacity.hpp"
+#include "gpu/recompiler/fragment_draw_gpu.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "build_revision.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -739,6 +741,37 @@ int main(int argc, char** argv) {
             prosper::test::fragment_packet_wave::scalar_exec_packet(0));
         dump(dir, "fragment_packet_wave_scalar_exec_kernel",
              scalar_exec_kernel.program.packet.spirv, "recompile_fragment_packet_kernel");
+        // Hand-owned fixture entry values remain distinct from the WAT2 GPU capacity authority.
+        // These are actual producer representatives, not shipping launch or attachment evidence.
+        auto draw_kernel =
+            std::make_shared<const FragmentPacketKernel>(recompile_fragment_packet_capacity_kernel(
+                prosper::test::fragment_packet_wave::packet()));
+        dump(dir, "fragment_draw_capacity_kernel", draw_kernel->program.packet.spirv,
+             "recompile_fragment_packet_capacity_kernel");
+        RasterQuadCollector draw_collector;
+        draw_collector.max_quads = 48;
+        draw_collector.lane_words = kRasterQuadLaneFixedWords;
+        draw_collector.record_words = 4 * draw_collector.lane_words;
+        std::string draw_rejection;
+        const auto draw_capacity =
+            fragment_draw_capacity(draw_kernel, draw_collector, draw_rejection);
+        if (!draw_capacity) {
+            printf("  [FAIL] fragment draw capacity: %s\n", draw_rejection.c_str());
+            ++fails;
+        } else {
+            dump(dir, "fragment_draw_count",
+                 build_fragment_draw_count(*draw_capacity, draw_collector),
+                 "build_fragment_draw_count");
+            dump(dir, "fragment_draw_assembly",
+                 build_fragment_draw_assembly(*draw_capacity, draw_collector),
+                 "build_fragment_draw_assembly");
+            dump(dir, "fragment_draw_validation",
+                 build_fragment_draw_validation(*draw_capacity, draw_collector),
+                 "build_fragment_draw_validation");
+            dump(dir, "fragment_draw_replay",
+                 build_fragment_draw_replay(*draw_capacity, draw_collector),
+                 "build_fragment_draw_replay");
+        }
         for (uint32_t op : {0x2au, 0x2eu, 0x33u}) {
             const auto p =
                 recompile_fragment_resource_packet(special::packet(op, special::rails(op)));

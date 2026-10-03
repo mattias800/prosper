@@ -80,6 +80,21 @@ Consequences for anything you change in it:
 
 ## Adding to it
 
+`fragment_draw_backend_transaction.h`, `_collect_gpu.h`, `_compute_gpu.h`, `_storage_gpu.h` and
+`_buffer_binding.h` are SHIPPING same-TU companions of the normal renderer, not a second renderer.
+They retain the same uploaded geometry/index and dynamic raster state across collection/replay,
+use completion-owned pooled private planes and the normal descriptor/command pools, and record
+explicit recycle/clear/collector/compute/indirect/fragment dependencies. No per-draw CPU count,
+readback, wait or module compile is permitted. WAT2 capacity is not guest entry authority. The
+bounded first recipe is not Kena/general-helper completion; unsupported attachments, producer
+effects and helper/input/resource recipes must remain named refusals before attachment mutation.
+`fragment_draw_source.hpp` is separately CPU-test-only optional SOURCE retention, controlled by
+`PROSPER_FRAGMENT_DRAW_SPV_DIRECTORY`; unset writes nothing and changes no lowering/admission.
+
+`render_vk_context.h` and `render_host_buffer_pool.h` are mechanical same-TU companions at their
+original declaration sites. Their explicit enabled-device facts and owner lifetimes remain shared
+by the normal backend; neither is a new device, allocator policy or independent test context.
+
 `raster_quad_collection_gpu.h` is a SHIPPING companion of `render_runner.h`, not a second device or
 test-only renderer. Development activation `PROSPER_FRAGMENT_QUAD_COLLECT=1` is pinned at real
 DrawItem realization. Only a refused exact-Wave64 draw can enter its scratch-only input pass;
