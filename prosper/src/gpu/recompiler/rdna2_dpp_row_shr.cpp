@@ -27,8 +27,8 @@ bool emit_compute_inplace_dpp_row_shr(SpirvCompute& b, const RegState& rs, const
     if (!add && !maximum) return false;
 
     // DPP16 ROW_SHR selects lane-N inside its 16-lane row. BC0 keeps VDST at a row edge.
-    // FI0 supplies zero for an inactive source. For this in-place unsigned maximum,
-    // max(own, 0) == own, so preserving VDST there is exact as well. Destination EXEC is a
+    // Preserve VDST for an invalid source under this encoded BC0/FI0 contract. For an
+    // in-place unsigned maximum, max(own, 0) == own as well. Destination EXEC is a
     // separate write condition applied by the caller, including when its peer is active.
     uint32_t valid_source = 0;
     const uint32_t shifted =
@@ -39,6 +39,8 @@ bool emit_compute_inplace_dpp_row_shr(SpirvCompute& b, const RegState& rs, const
     return true;
 }
 
+
+// Publish event/EXEC metadata for every worker, including nonpending and completed waves.
 // Two barriers bound reuse of the value plane by later wave services and loop iterations.
 bool emit_portable_compute_dpp_row_shr_phase(
     SpirvCompute& b, const ComputeDppRowShrPhaseVariables& variables,
@@ -95,9 +97,15 @@ bool emit_portable_compute_dpp_row_shr_phase(
         dpp_in_bounds, dpp_source_active);
     dpp_valid_source = b.land(
         dpp_valid_source, b.ucmp(Op_IEqual, dpp_source_event, dpp_event));
-    const uint32_t dpp_result = b.ibin(Op_IAdd, dpp_source,
+    uint32_t dpp_result = b.ibin(Op_IAdd, dpp_source,
         b.ngg_workgroup_export_probe
             ? b.sel(dpp_valid_source, dpp_shifted, zero) : dpp_shifted);
+    // Allocate and consume an operation field only for streams containing MAX. An ADD-only
+    // stream retains its previous IDs and graph exactly. Static events isolate different sites.
+    if (variables.maximum) {
+        const uint32_t maximum = b.load_function(b.t_bool, variables.maximum);
+        dpp_result = b.sel(maximum, b.uext2(Glsl_UMax, dpp_source, dpp_shifted), dpp_result);
+    }
     const uint32_t dpp_write = b.land(b.land(dpp_pending, dpp_active),
         b.ngg_workgroup_export_probe
             ? b.lor(dpp_bounded, dpp_valid_source) : dpp_valid_source);

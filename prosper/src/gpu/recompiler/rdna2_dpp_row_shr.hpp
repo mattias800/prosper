@@ -19,9 +19,10 @@ bool emit_compute_inplace_dpp_row_shr(SpirvCompute& builder, const RegState& reg
                                       const Rdna2Inst& instruction, uint32_t source,
                                       uint32_t old_destination, bool wave_uniform,
                                       uint32_t& result);
-// Function-variable IDs shared by the event-isolated dispatcher phase.
+// Function-variable IDs shared by the synchronized dispatcher. maximum=0 preserves the
+// established ADD-only emission; otherwise each pending static site supplies ADD=false/MAX=true.
 struct ComputeDppRowShrPhaseVariables {
-    uint32_t pending, active, source, amount, destination, event;
+    uint32_t pending, active, source, amount, destination, event, maximum;
 };
 
 bool emit_portable_compute_dpp_row_shr_phase(

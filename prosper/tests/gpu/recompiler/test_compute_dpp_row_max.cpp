@@ -31,7 +31,12 @@ TEST(ComputeDppRowMax, RecognizesEveryLegalShiftAndRejectsUnownedForms) {
         const auto code = prosper::test::dpp_row_max_program({shift});
         const auto in = rdna2_decode_one(code.data(), code.size());
         ASSERT_TRUE(is_inplace_vmax_u32_dpp_row_shr(in)) << "shift " << shift;
-        for (uint32_t mutation = 0; mutation < 12; ++mutation) {
+        auto inactive_fetch = code;
+        inactive_fetch[1] |= 1u << 18;
+        EXPECT_FALSE(is_inplace_vmax_u32_dpp_row_shr(
+            rdna2_decode_one(inactive_fetch.data(), inactive_fetch.size())))
+            << "FI1 must not acquire the encoded BC0/FI0 service";
+        for (uint32_t mutation = 0; mutation < 17; ++mutation) {
             auto altered = in;
             switch (mutation) {
                 case 0: altered.dst.value = 2; break;
@@ -46,6 +51,11 @@ TEST(ComputeDppRowMax, RecognizesEveryLegalShiftAndRejectsUnownedForms) {
                 case 9: altered.dpp_ctrl = 0x110; break;
                 case 10: altered.dpp_ctrl = 0x120; break;
                 case 11: altered.opcode = 0x13; break;
+                case 12: altered.clamp = true; break;
+                case 13: altered.omod = 1; break;
+                case 14: altered.has_sdwa = true; break;
+                case 15: altered.src_neg[1] = true; break;
+                case 16: altered.src_abs[0] = true; break;
             }
             EXPECT_FALSE(is_inplace_vmax_u32_dpp_row_shr(altered))
                 << "shift " << shift << ", mutation " << mutation;
@@ -84,15 +94,36 @@ TEST(ComputeDppRowMax, RefusesUnresolvedSpillSourcesBeforeWriting) {
     EXPECT_EQ(b.compute_min_subgroup_size, 0u) << "refusal emitted no cross-lane maximum";
 }
 
-TEST(ComputeDppRowMax, DispatcherRemainsRefusedUntilEventPhaseIsIntegrated) {
-    const auto maximum = prosper::test::dpp_row_max_program({1, 2, 4, 8});
-    const auto addition = prosper::test::dpp_row_max_program({1, 2, 4, 8}, false, true);
-    EXPECT_TRUE(compile(maximum, true).empty())
-        << "linear shuffles must never bypass the CFG static-event contract";
-    const auto control = compile(addition, true);
-    ASSERT_FALSE(control.empty())
-        << "same CFG and sources are supported for the existing ADD phase";
-    EXPECT_GT(count(control, Op_Switch), 0u);
+TEST(ComputeDppRowMax, DispatcherUsesTaggedPortablePhaseInsteadOfHostShuffles) {
+    for (bool add : {false, true}) {
+        const auto code = prosper::test::dpp_row_max_program({1, 2, 4, 8}, false, add);
+        const auto module = compile(code, true);
+        ASSERT_FALSE(module.empty()) << "MAX and the established ADD control both compile";
+        EXPECT_GT(count(module, Op_Switch), 0u);
+        EXPECT_GE(count(module, Op_ControlBarrier), 2u);
+        EXPECT_EQ(count(module, Op_GroupNonUniformShuffle), 0u)
+            << "portable CFG peers are addressed through event/EXEC scratch";
+        EXPECT_EQ(count(module, Op_ExtInst, Glsl_UMax), add ? 0u : 1u)
+            << "one common phase services every static site";
+    }
+}
+
+TEST(ComputeDppRowMax, MixedBranchesLoopsAndLaterBarrierCompileBothProfiles) {
+    using prosper::test::DppRowCfgCase;
+    for (const auto shape : {DppRowCfgCase::Mixed, DppRowCfgCase::DivergentSites,
+                             DppRowCfgCase::LoopAndCompletedPeer,
+                             DppRowCfgCase::LaterBarrierPhase}) {
+        const auto code = prosper::test::dpp_row_cfg_export_program(shape);
+        for (bool native : {false, true}) {
+            const auto module = recompile_ngg_exports_for_test(
+                code.data(), code.size(), 10, 0, nullptr, 4, 0, {}, true, true, native);
+            ASSERT_FALSE(module.empty()) << "shape " << static_cast<int>(shape)
+                                         << ", exact native " << native;
+            EXPECT_GT(count(module, Op_Switch), 0u);
+            EXPECT_GT(count(module, Op_ExtInst, Glsl_UMax), 0u);
+            EXPECT_EQ(count(module, Op_GroupNonUniformShuffle) != 0, native);
+        }
+    }
 }
 
 TEST(ComputeDppRowMax, ProductionComputeCompilesDefaultAndExactNativeProfiles) {

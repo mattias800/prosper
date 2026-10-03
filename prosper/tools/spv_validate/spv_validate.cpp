@@ -31,6 +31,7 @@
 #include "../../tests/fixtures/spirv_fragment_vote_execution.hpp"
 #include "../../tests/fixtures/spirv_fragment_neutral_fixtures.hpp"
 #include "../../tests/fixtures/portable_bpermute_fixture.hpp"
+#include "../../tests/fixtures/dpp_row_max.hpp"
 #include "../../tests/fixtures/fragment_packet_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_wqm_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_mbcnt_fixture.hpp"
@@ -1524,6 +1525,25 @@ int main(int argc, char** argv) {
       dump(dir, "ngg_workgroup_bounded_row_shr",
            recompile_ngg_exports_for_test(c, std::size(c), 1),
            "recompile_ngg_exports_for_test"); }
+    // Unsigned row scans need both the ordinary uniform route and event-isolated CFG routes.
+    { const auto c = prosper::test::dpp_row_max_program({1, 2, 4, 8});
+      dump(dir, "compute_dpp_row_max_linear", recompile_valu(c.data(), c.size(), 3, 1)); }
+    { using prosper::test::DppRowCfgCase;
+      const std::pair<DppRowCfgCase, const char*> cases[] = {
+          {DppRowCfgCase::Mixed, "mixed"}, {DppRowCfgCase::DivergentSites, "sites"},
+          {DppRowCfgCase::LoopAndCompletedPeer, "loop"},
+          {DppRowCfgCase::LaterBarrierPhase, "later_phase"}};
+      for (const auto& [shape, name] : cases) {
+          const auto c = prosper::test::dpp_row_cfg_export_program(shape);
+          for (bool native : {false, true}) {
+              const std::string id = std::string("compute_dpp_row_max_") + name +
+                  (native ? "_native64" : "_portable");
+              dump(dir, id.c_str(), recompile_ngg_exports_for_test(
+                  c.data(), c.size(), 10, 0, nullptr, 4, 0, {}, true, true, native),
+                  "recompile_ngg_exports_for_test");
+          }
+      }
+    }
     // Generated interpolation geometry stage: AMD's explicit-parameter form publishes P0/P10/P20
     // plus perspective-center I/J from a synthesised Geometry entry point.
     { const uint32_t ps[] = {0xc80e0000u,0xc8120001u,0xc8160002u,
