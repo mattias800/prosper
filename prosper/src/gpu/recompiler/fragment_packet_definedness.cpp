@@ -54,7 +54,10 @@ void PacketVgprDefinedness::instruction(SpirvCompute& b, const RegState& state,
             // Existing raw-EXP ABI observes enabled payload even EXEC-off. Preserve that stronger
             // observation contract: an absent inactive payload is a named failure, not a zero.
             const auto consumed =
-                read.kind == FragmentPacketVgprRead::RawExport ? b.btrue() : state.exec;
+                read.kind == FragmentPacketVgprRead::RawExport &&
+                        export_observation == FragmentPacketExportObservation::LegacyRaw
+                    ? b.btrue()
+                    : state.exec;
             fail(b, b.land(consumed, b.logical_not(valid)), b.uconst(in.pc), b.uconst(read.reg),
                  b.uconst(static_cast<uint32_t>(read.kind)));
         }
@@ -165,13 +168,15 @@ FragmentPacketResult decode_fragment_packet(const FragmentPacketProgram& program
                      reason, result.lane, result.pc, result.reg, result.kind);
         return result;
     };
-    const uint64_t exports = uint64_t(program.exports_per_lane) * 64 * kFragmentPacketExportWords;
+    const uint64_t exports =
+        uint64_t(program.exports_per_lane) * 64 * program.export_record_words();
     if (!completed) return reject("packet-completion-or-host-availability-unproved");
     if (program.spirv.size() < 5 || program.spirv[0] != 0x07230203u || !program.rejection.empty() ||
         !program.exports_per_lane || program.exports_per_lane > 64 ||
         words.size() != program.output_words.size() || words.size() < exports)
         return reject("packet-output-abi-invalid");
-    bool marked = false;
+    bool marked = false, architectural_marked = false;
+    const auto architectural_marker = fragment_packet_export_schema_marker(program.export_sites);
     for (size_t pc = 5; pc < program.spirv.size();) {
         const auto count = program.spirv[pc] >> 16;
         if (!count || count > program.spirv.size() - pc) return reject("packet-module-abi-invalid");
@@ -182,9 +187,22 @@ FragmentPacketResult decode_fragment_packet(const FragmentPacketProgram& program
             if (!end) return reject("packet-module-abi-invalid");
             marked |= std::string_view(text, static_cast<size_t>(end - text)) ==
                       kPacketVgprValidityMarker;
+            const std::string_view marker(text, static_cast<size_t>(end - text));
+            if (marker.starts_with("Prosper.GuestFragmentPacket.ExportObservation=")) {
+                if (architectural_marked || marker != architectural_marker)
+                    return reject("packet-export-observation-schema-mismatch");
+                architectural_marked = true;
+            }
         }
         pc += count;
     }
+    if ((program.export_observation != FragmentPacketExportObservation::LegacyRaw &&
+         program.export_observation != FragmentPacketExportObservation::Architectural) ||
+        architectural_marked !=
+            (program.export_observation == FragmentPacketExportObservation::Architectural) ||
+        (architectural_marked && program.export_sites.size() != program.exports_per_lane) ||
+        (!architectural_marked && !program.export_sites.empty()))
+        return reject("packet-export-observation-schema-mismatch");
     if (marked != (program.vgpr_status_offset != UINT32_MAX) ||
         (!marked && !program.vgpr_failure_sites.empty()))
         return reject("packet-vgpr-status-abi-invalid");
@@ -216,8 +234,20 @@ FragmentPacketResult decode_fragment_packet(const FragmentPacketProgram& program
             return reject(result.kind == static_cast<uint32_t>(FragmentPacketVgprRead::SelectedPeer)
                               ? "packet-vgpr-selected-peer-unavailable"
                           : result.kind == static_cast<uint32_t>(FragmentPacketVgprRead::RawExport)
-                              ? "packet-vgpr-raw-export-unavailable"
+                              ? program.export_observation ==
+                                        FragmentPacketExportObservation::Architectural
+                                    ? "packet-vgpr-architectural-export-unavailable"
+                                    : "packet-vgpr-raw-export-unavailable"
                               : "packet-vgpr-read-before-definition");
+    }
+    if (architectural_marked) {
+        auto decoded = decode_fragment_packet_architectural_exports(
+            program.export_sites, words.first(static_cast<size_t>(exports)));
+        result.lane = decoded.lane;
+        result.pc = decoded.pc;
+        if (!decoded.rejection.empty()) return reject(decoded.rejection.c_str());
+        result.architectural_exports = std::move(decoded.lanes);
+        return result;
     }
     for (uint64_t offset = 0; offset < exports; offset += kFragmentPacketExportWords) {
         if (!words[offset]) {
