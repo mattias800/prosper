@@ -5730,6 +5730,42 @@ if(UNIX AND PROSPER_AUDIO_FFMPEG AND TARGET prosper_core)
     pkg_check_modules(PROSPER_AJM_FFMPEG QUIET IMPORTED_TARGET
                       libavcodec libavutil libswresample)
   endif()
+  # On Apple Silicon the macOS build is x86_64 (Rosetta), while Homebrew's FFmpeg is arm64-only:
+  # pkg-config finds it, and the build then fails at the final link with undefined _swr_init and
+  # friends. Ask the linker before adopting it, so a mismatched FFmpeg is reported here and skipped
+  # rather than breaking every executable that links the backend.
+  set(_prosper_ffmpeg_wrong_arch FALSE)
+  if(PROSPER_AJM_FFMPEG_FOUND AND APPLE)
+    include(CheckCXXSourceCompiles)
+    # Re-probe on every configure: the verdict depends on CMAKE_OSX_ARCHITECTURES and on which FFmpeg
+    # is installed, and a cached result would survive a change to either.
+    unset(PROSPER_AJM_FFMPEG_LINKS_FOR_TARGET_ARCH CACHE)
+    set(_prosper_saved_required_includes "${CMAKE_REQUIRED_INCLUDES}")
+    set(_prosper_saved_required_libraries "${CMAKE_REQUIRED_LIBRARIES}")
+    set(CMAKE_REQUIRED_INCLUDES ${PROSPER_AJM_FFMPEG_INCLUDE_DIRS})
+    set(CMAKE_REQUIRED_LIBRARIES ${PROSPER_AJM_FFMPEG_LINK_LIBRARIES})
+    check_cxx_source_compiles([=[
+      extern "C" {
+      #include <libavcodec/avcodec.h>
+      #include <libswresample/swresample.h>
+      }
+      int main() { return avcodec_version() != 0 && swr_alloc() != nullptr ? 0 : 1; }
+    ]=] PROSPER_AJM_FFMPEG_LINKS_FOR_TARGET_ARCH)
+    set(CMAKE_REQUIRED_INCLUDES "${_prosper_saved_required_includes}")
+    set(CMAKE_REQUIRED_LIBRARIES "${_prosper_saved_required_libraries}")
+    if(NOT PROSPER_AJM_FFMPEG_LINKS_FOR_TARGET_ARCH)
+      set(_prosper_ffmpeg_arch "${CMAKE_OSX_ARCHITECTURES}")
+      if(NOT _prosper_ffmpeg_arch)
+        set(_prosper_ffmpeg_arch "${CMAKE_SYSTEM_PROCESSOR}")
+      endif()
+      list(GET PROSPER_AJM_FFMPEG_LINK_LIBRARIES 0 _prosper_ffmpeg_first_lib)
+      message(WARNING "FFmpeg (${_prosper_ffmpeg_first_lib}) does not link for "
+                      "${_prosper_ffmpeg_arch} (an arm64-only Homebrew FFmpeg cannot serve the "
+                      "x86_64 Rosetta build) - AJM MP3/Opus decoding disabled")
+      set(PROSPER_AJM_FFMPEG_FOUND FALSE)
+      set(_prosper_ffmpeg_wrong_arch TRUE)
+    endif()
+  endif()
   if(PROSPER_AJM_FFMPEG_FOUND)
     add_library(prosper_ajm_ffmpeg STATIC
                 frontends/audio_ffmpeg/ajm_ffmpeg.cpp)
@@ -5763,7 +5799,9 @@ if(UNIX AND PROSPER_AUDIO_FFMPEG AND TARGET prosper_core)
       target_compile_definitions(screenshot PRIVATE PROSPER_AUDIO_FFMPEG=1)
     endif()
   else()
-    message(WARNING "FFmpeg audio development packages not found - AJM MP3 decoding disabled")
+    if(NOT _prosper_ffmpeg_wrong_arch)   # the probe above already explained a wrong-arch skip
+      message(WARNING "FFmpeg audio development packages not found - AJM MP3 decoding disabled")
+    endif()
   endif()
 endif()
 
