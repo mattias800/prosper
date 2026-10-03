@@ -3,13 +3,37 @@
 #include "fixtures/fragment_packet_wave_fixture.hpp"
 #include "bpermute_spirv_oracle.hpp"
 #include <gtest/gtest.h>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 
 namespace {
 using namespace prosper::gpu;
 namespace fixture = prosper::test::fragment_packet_wave;
+FragmentPacketKernel compile_kernel(const FragmentResourcePacket& input, const char* scenario) {
+    auto compiled = recompile_fragment_packet_kernel(input);
+    // Diagnostic CPU-test-only retention at actual compile success. No default files, no changed
+    // lowering, and no assumption that factory representatives equal these actual test modules.
+    const char* root = std::getenv("PROSPER_PACKET_WAVE_SPV_DIRECTORY");
+    if (compiled.program.packet.spirv.empty() || !root || !*root) return compiled;
+    const auto* test = ::testing::UnitTest::GetInstance()->current_test_info();
+    EXPECT_NE(test, nullptr);
+    if (!test) return compiled;
+    const auto name = std::string(test->name()) + "_" + scenario;
+    std::error_code error;
+    std::filesystem::create_directories(root, error);
+    EXPECT_FALSE(error) << name << ": SOURCE directory: " << error.message();
+    if (error) return compiled;
+    std::ofstream file(std::filesystem::path(root) / (name + ".spv"), std::ios::binary);
+    const auto& words = compiled.program.packet.spirv;
+    file.write(reinterpret_cast<const char*>(words.data()),
+               static_cast<std::streamsize>(words.size() * sizeof(uint32_t)));
+    file.close();
+    EXPECT_TRUE(bool(file)) << name << ": actual cached-kernel SOURCE retention";
+    return compiled;
+}
 std::shared_ptr<const FragmentPacketKernel> kernel() {
-    return std::make_shared<const FragmentPacketKernel>(
-        recompile_fragment_packet_kernel(fixture::packet()));
+    return std::make_shared<const FragmentPacketKernel>(compile_kernel(fixture::packet(), "base"));
 }
 std::vector<FragmentResourcePacket> inputs() {
     return {fixture::packet(0), fixture::packet(1), fixture::packet(2)};
@@ -38,7 +62,7 @@ std::vector<uint32_t> execute(const FragmentPacketWaveBatch& batch,
 TEST(FragmentPacketWaveData, SharedImageBindingIsDataNotCachedPrototype) {
     auto original = fixture::resource::chain();
     const auto code =
-        std::make_shared<const FragmentPacketKernel>(recompile_fragment_packet_kernel(original));
+        std::make_shared<const FragmentPacketKernel>(compile_kernel(original, "shared_image"));
     ASSERT_FALSE(code->program.packet.spirv.empty());
     auto waves = std::vector<FragmentResourcePacket>{original, original, original};
     waves[1].buffers[0].words[1] = fixture::resource::bits(0.5f);
@@ -73,14 +97,14 @@ TEST(FragmentPacketWaveData, OneCachedProgramDistinctWavesAndBases) {
     EXPECT_TRUE(code->program.packet.input_words.empty())
         << "cached code retains no prototype launch bytes";
     EXPECT_EQ(batch.kernel.get(), code.get());
-    const auto other = recompile_fragment_packet_kernel(waves[2]);
+    const auto other = compile_kernel(waves[2], "different_wave");
     EXPECT_EQ(other.program.packet.spirv, code->program.packet.spirv)
         << "values/EXEC/availability/M0 must not enter code";
     auto changed_mode = waves[0];
     changed_mode.invocation.float_mode.value = 0x31;
     changed_mode.launch_rsrc1.value =
         (changed_mode.launch_rsrc1.value & ~(255u << 12)) | (0x31u << 12);
-    const auto mode_kernel = recompile_fragment_packet_kernel(changed_mode);
+    const auto mode_kernel = compile_kernel(changed_mode, "changed_mode");
     ASSERT_FALSE(mode_kernel.program.packet.spirv.empty());
     EXPECT_NE(mode_kernel.program.packet.spirv, code->program.packet.spirv)
         << "an actual code-generation mode must not share the old cached module";
@@ -103,7 +127,7 @@ TEST(FragmentPacketWaveData, GenuineDynamicEntryM0AndLateDescriptorMismatch) {
     std::vector<FragmentResourcePacket> waves;
     for (uint32_t wave = 0; wave < 3; ++wave) waves.push_back(fixture::entry_m0_packet(wave));
     const auto code =
-        std::make_shared<const FragmentPacketKernel>(recompile_fragment_packet_kernel(waves[0]));
+        std::make_shared<const FragmentPacketKernel>(compile_kernel(waves[0], "entry_m0"));
     ASSERT_FALSE(code->program.packet.spirv.empty());
     auto batch = pack_fragment_packet_waves(code, waves, fixture::placements(*code, 3));
     ASSERT_TRUE(batch.rejection.empty()) << batch.rejection;
@@ -136,9 +160,9 @@ TEST(FragmentPacketWaveData, DynamicScalarPairRestoresExecInBothLogicalHalves) {
     std::vector<FragmentResourcePacket> waves;
     for (uint32_t wave = 0; wave < 3; ++wave) waves.push_back(fixture::scalar_exec_packet(wave));
     const auto code =
-        std::make_shared<const FragmentPacketKernel>(recompile_fragment_packet_kernel(waves[0]));
+        std::make_shared<const FragmentPacketKernel>(compile_kernel(waves[0], "scalar_exec"));
     ASSERT_FALSE(code->program.packet.spirv.empty());
-    const auto other = recompile_fragment_packet_kernel(waves[2]);
+    const auto other = compile_kernel(waves[2], "different_wave");
     EXPECT_EQ(other.program.packet.spirv, code->program.packet.spirv);
     const auto batch = pack_fragment_packet_waves(code, waves, fixture::placements(*code, 3));
     ASSERT_TRUE(batch.rejection.empty()) << batch.rejection;
