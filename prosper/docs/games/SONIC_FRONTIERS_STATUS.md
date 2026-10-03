@@ -864,6 +864,19 @@ being closed; the rest are this document's own. **Do not restate the row count i
 a stated total is stale as soon as the next lane appends, and every lane that adds a row would have
 to remember to update it. The last one did not (review of #2820).
 
+- **"In retained D14, binding 6 is pink, or the normalized colour fetch contradicts the
+  retained attribute specifications and stored programs."** False within the retained capture
+  (2026-10-03, [#3948](https://github.com/mattias800/prosper/issues/3948)). In submit 184554,
+  draw 14, VS binding 7 holds `0xff643eef` at all four vertices: RGBA `(239, 62, 100, 255)`;
+  binding 6 holds `0xff000000`, with zero additive RGB. Their record offsets are respectively
+  12 and 16 bytes at stride 36. The requested offsets, UNORM8x4 format and identity swizzle
+  agree with the retained specifications and stored VS/FS: binding 7 supplies the colour
+  multiplier, while binding 6 supplies zero additive RGB. No fetch-decoding mismatch is
+  demonstrated in these normalized inputs/programs. This does **not** establish the original
+  SGPR descriptor-read values, that the retained raw code produced the stored program, the
+  uploaded GPU byte version, or that D14 wrote the pictured rings: the screenshot join remains
+  `unknown_source`. No corresponding same-state ON input is retained, so the OFF/ON cause
+  remains unknown; this is not a rendering, performance or default-setting acceptance.
 - **"Every flip goes through the GPU-present CPU fallback because of the 4K scanout's format, its
   HDR/buffer attributes, or a flip-source mismatch."** False (#3915). The renderer's decline reason,
   now named, was `no-render-target` on every flip: the renderer holds no target at either display
