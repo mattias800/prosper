@@ -578,136 +578,130 @@ struct Interpreter {
   // Same typed evaluator, with two independently pinned raw-u32 blocks for packet execution.
   // The input is read-only and the output is the sole observable sink. All supplied ABI layouts
   // retain the exact Set0/Block/Offset0/Stride4 checks; this is not general descriptor emulation.
-  std::vector<uint32_t> run_packet(const std::vector<uint32_t> &input,
-                                   const std::vector<uint32_t> &output) {
-    return run_buffers(64, {{0, input}, {1, output}}, 1);
+  std::vector<uint32_t> run_packet(const std::vector<uint32_t>& input,
+                                   const std::vector<uint32_t>& output, uint32_t workgroup_x = 0) {
+      return run_buffers(64, {{0, input}, {1, output}}, 1, workgroup_x);
   }
   std::vector<uint32_t> run_buffers(uint32_t count,
-      const std::map<uint32_t, std::vector<uint32_t>> &buffers, uint32_t sink_binding) {
-    try {
-      if (!error.empty())
-        fail(error);
-      if (!count || count > 1024)
-        fail("invalid invocation count");
-      storage = 0;
-      shared.clear();
-      readonly_storage.clear();
-      std::map<uint32_t, bool> seen_bindings;
-      std::map<uint32_t, bool> seen_sampled_bindings;
-      std::vector<Lane> lanes(count);
-      for (const auto &g : globals) {
-        const auto &a = g.a;
-        if (a.size() < 3)
-          fail("malformed global Variable");
-        const auto t = pointee(a[0]);
-        if (a[2] == 4)
-          shared[a[1]] = make_memory(t, size(t));
-        else if (a[2] == 2 || a[2] == 12) {
-          const auto binding = bindings.find(a[1]);
-          const auto supplied = binding == bindings.end() ? buffers.end()
-              : buffers.find(binding->second);
-          if (supplied != buffers.end()) {
-            if (!seen_bindings.emplace(binding->second, true).second)
-              fail("duplicate live buffer binding");
-            // This oracle supports exactly the fixture's externally observable
-            // ABI. Never silently flatten a differently laid-out Vulkan block
-            // into uint words.
-            const auto set = decorations.find({a[1], 34});
-            const auto block = decorations.find({t, 2});
-            const auto offset = member_decorations.find({t, 0, 35});
-            const auto &structure = ty(t);
-            if (a[2] != 12 || ty(a[0]).a[0] != 12 || set == decorations.end() ||
-                set->second != std::vector<uint32_t>{0} ||
-                block == decorations.end() || !block->second.empty() ||
-                offset == member_decorations.end() ||
-                offset->second != std::vector<uint32_t>{0} ||
-                structure.op != 30 || structure.a.size() != 1)
-              fail("unsupported live storage ABI");
-            const auto array = structure.a[0];
-            const auto stride = decorations.find({array, 6});
-            if (ty(array).op != 29 || ty(array).a.size() != 1 ||
-                !uint_type(ty(array).a[0]) || stride == decorations.end() ||
-                stride->second != std::vector<uint32_t>{4})
-              fail("unsupported live storage ABI");
-            if (binding->second == sink_binding) storage = a[1];
-            else readonly_storage.emplace(a[1], true);
-            shared[a[1]] = {t, supplied->second,
-                std::vector<bool>(supplied->second.size(), true)};
-          } else {
-            // The production shell declares unused synthetic buffers too.
-            // Give them no initialized bytes: any actual read/write fails.
-            shared[a[1]] = {t, {}, {}};
+                                    const std::map<uint32_t, std::vector<uint32_t>>& buffers,
+                                    uint32_t sink_binding, uint32_t workgroup_x = 0) {
+      try {
+          if (!error.empty()) fail(error);
+          if (!count || count > 1024) fail("invalid invocation count");
+          storage = 0;
+          shared.clear();
+          readonly_storage.clear();
+          std::map<uint32_t, bool> seen_bindings;
+          std::map<uint32_t, bool> seen_sampled_bindings;
+          std::vector<Lane> lanes(count);
+          for (const auto& g : globals) {
+              const auto& a = g.a;
+              if (a.size() < 3) fail("malformed global Variable");
+              const auto t = pointee(a[0]);
+              if (a[2] == 4)
+                  shared[a[1]] = make_memory(t, size(t));
+              else if (a[2] == 2 || a[2] == 12) {
+                  const auto binding = bindings.find(a[1]);
+                  const auto supplied =
+                      binding == bindings.end() ? buffers.end() : buffers.find(binding->second);
+                  if (supplied != buffers.end()) {
+                      if (!seen_bindings.emplace(binding->second, true).second)
+                          fail("duplicate live buffer binding");
+                      // This oracle supports exactly the fixture's externally observable
+                      // ABI. Never silently flatten a differently laid-out Vulkan block
+                      // into uint words.
+                      const auto set = decorations.find({a[1], 34});
+                      const auto block = decorations.find({t, 2});
+                      const auto offset = member_decorations.find({t, 0, 35});
+                      const auto& structure = ty(t);
+                      if (a[2] != 12 || ty(a[0]).a[0] != 12 || set == decorations.end() ||
+                          set->second != std::vector<uint32_t>{0} || block == decorations.end() ||
+                          !block->second.empty() || offset == member_decorations.end() ||
+                          offset->second != std::vector<uint32_t>{0} || structure.op != 30 ||
+                          structure.a.size() != 1)
+                          fail("unsupported live storage ABI");
+                      const auto array = structure.a[0];
+                      const auto stride = decorations.find({array, 6});
+                      if (ty(array).op != 29 || ty(array).a.size() != 1 ||
+                          !uint_type(ty(array).a[0]) || stride == decorations.end() ||
+                          stride->second != std::vector<uint32_t>{4})
+                          fail("unsupported live storage ABI");
+                      if (binding->second == sink_binding)
+                          storage = a[1];
+                      else
+                          readonly_storage.emplace(a[1], true);
+                      shared[a[1]] = {t, supplied->second,
+                                      std::vector<bool>(supplied->second.size(), true)};
+                  } else {
+                      // The production shell declares unused synthetic buffers too.
+                      // Give them no initialized bytes: any actual read/write fails.
+                      shared[a[1]] = {t, {}, {}};
+                  }
+              } else if (a[2] == 0) {
+                  const auto binding = bindings.find(a[1]);
+                  const auto set = decorations.find({a[1], 34});
+                  const auto& sampled = ty(t);
+                  if (binding == bindings.end() || !sampled_images.contains(binding->second) ||
+                      set == decorations.end() || set->second != std::vector<uint32_t>{0} ||
+                      ty(a[0]).a[0] != 0 || sampled.op != 27 || sampled.a.size() != 1)
+                      fail("unsupported sampled image ABI");
+                  if (!seen_sampled_bindings.emplace(binding->second, true).second)
+                      fail("duplicate sampled image binding");
+                  const auto& image = ty(sampled.a[0]);
+                  if (image.op != 25 || image.a.size() != 7 || ty(image.a[0]).op != 22 ||
+                      ty(image.a[0]).a != std::vector<uint32_t>{32} ||
+                      std::vector<uint32_t>(image.a.begin() + 1, image.a.end()) !=
+                          std::vector<uint32_t>{1, 0, 0, 0, 1, 0})
+                      fail("unsupported sampled image type");
+                  shared[a[1]] = {t, {binding->second}, {true}};
+              } else if (a[2] != 1)
+                  fail("unsupported global storage class");
+              for (uint32_t lane = 0; lane < count; ++lane) {
+                  auto& l = lanes[lane];
+                  l.p[a[1]] = {a[1], 0, t};
+                  if (a[2] == 1) {
+                      auto b = builtins.find(a[1]);
+                      if (b == builtins.end()) fail("Input without builtin");
+                      std::vector<uint32_t> v;
+                      if (b->second == 26)
+                          v = {workgroup_x, 0, 0};
+                      else if (b->second == 28)
+                          v = {workgroup_x * 64 + lane, 0, 0};
+                      else if (b->second == 27)
+                          v = {lane, 0, 0};
+                      else if (b->second == 29)
+                          v = {lane};
+                      else
+                          fail("unsupported builtin");
+                      if (size(t) != v.size()) fail("Input shape mismatch");
+                      l.memory[a[1]] = {t, v, std::vector<bool>(v.size(), true)};
+                  }
+              }
           }
-        } else if (a[2] == 0) {
-          const auto binding = bindings.find(a[1]);
-          const auto set = decorations.find({a[1], 34});
-          const auto &sampled = ty(t);
-          if (binding == bindings.end() || !sampled_images.contains(binding->second) ||
-              set == decorations.end() || set->second != std::vector<uint32_t>{0} ||
-              ty(a[0]).a[0] != 0 || sampled.op != 27 || sampled.a.size() != 1)
-            fail("unsupported sampled image ABI");
-          if (!seen_sampled_bindings.emplace(binding->second, true).second)
-            fail("duplicate sampled image binding");
-          const auto &image = ty(sampled.a[0]);
-          if (image.op != 25 || image.a.size() != 7 || ty(image.a[0]).op != 22 ||
-              ty(image.a[0]).a != std::vector<uint32_t>{32} ||
-              std::vector<uint32_t>(image.a.begin() + 1, image.a.end()) !=
-                  std::vector<uint32_t>{1, 0, 0, 0, 1, 0}) fail("unsupported sampled image type");
-          shared[a[1]] = {t, {binding->second}, {true}};
-        } else if (a[2] != 1)
-          fail("unsupported global storage class");
-        for (uint32_t lane = 0; lane < count; ++lane) {
-          auto &l = lanes[lane];
-          l.p[a[1]] = {a[1], 0, t};
-          if (a[2] == 1) {
-            auto b = builtins.find(a[1]);
-            if (b == builtins.end())
-              fail("Input without builtin");
-            std::vector<uint32_t> v;
-            if (b->second == 26)
-              v = {0, 0, 0};
-            else if (b->second == 27 || b->second == 28)
-              v = {lane, 0, 0};
-            else if (b->second == 29)
-              v = {lane};
-            else
-              fail("unsupported builtin");
-            if (size(t) != v.size())
-              fail("Input shape mismatch");
-            l.memory[a[1]] = {t, v, std::vector<bool>(v.size(), true)};
+          if (!storage) fail("missing live storage sink");
+          if (seen_bindings.size() != buffers.size()) fail("missing supplied storage binding");
+          if (seen_sampled_bindings.size() != sampled_images.size())
+              fail("missing supplied sampled image binding");
+          // The first function label is kept in the instruction stream, including
+          // any Phi.
+          for (auto& l : lanes) l.pc = entry - 1;
+          for (size_t phase = 0; phase < 10000; ++phase) {
+              for (auto& l : lanes) advance(l);
+              bool all_done = true;
+              for (const auto& l : lanes) all_done &= l.done;
+              if (all_done) return shared.at(storage).words;
+              const size_t site = lanes.front().pc;
+              for (auto& l : lanes) {
+                  if (l.done || l.pc != site || ins[l.pc].op != 224)
+                      fail("nonuniform Workgroup barrier");
+                  ++l.pc;
+              }
           }
-        }
+          fail("too many barrier phases");
+      } catch (const std::exception& e) {
+          error = e.what();
+          return {};
       }
-      if (!storage)
-        fail("missing live storage sink");
-      if (seen_bindings.size() != buffers.size())
-        fail("missing supplied storage binding");
-      if (seen_sampled_bindings.size() != sampled_images.size())
-        fail("missing supplied sampled image binding");
-      // The first function label is kept in the instruction stream, including
-      // any Phi.
-      for (auto &l : lanes)
-        l.pc = entry - 1;
-      for (size_t phase = 0; phase < 10000; ++phase) {
-        for (auto &l : lanes)
-          advance(l);
-        bool all_done = true;
-        for (const auto &l : lanes)
-          all_done &= l.done;
-        if (all_done)
-          return shared.at(storage).words;
-        const size_t site = lanes.front().pc;
-        for (auto &l : lanes) {
-          if (l.done || l.pc != site || ins[l.pc].op != 224)
-            fail("nonuniform Workgroup barrier");
-          ++l.pc;
-        }
-      }
-      fail("too many barrier phases");
-    } catch (const std::exception &e) {
-      error = e.what();
-      return {};
-    }
   }
 };
 } // namespace bpermute_oracle

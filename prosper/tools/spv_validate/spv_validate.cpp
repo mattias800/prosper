@@ -37,6 +37,7 @@
 #include "../../tests/fixtures/fragment_resource_packet_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_definedness_fixture.hpp"
 #include "../../tests/fixtures/fragment_special_f32_fixture.hpp"
+#include "../../tests/fixtures/fragment_packet_wave_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <algorithm>
 #include <array>
@@ -216,7 +217,8 @@ static std::vector<std::string> declared_emitters(const std::string& header_text
     // FragmentPacketProgram owns the module plus its exact raw input/output buffers. Its different
     // return shape must not remove the genuine packet compiler entry from strict emitter coverage.
     static const char* const kReturnTypes[] = {
-        "std::vector<uint32_t>", "SharedShaderWords", "FragmentPacketProgram", "FragmentResourcePacketProgram"};
+        "std::vector<uint32_t>", "SharedShaderWords", "FragmentPacketProgram",
+        "FragmentResourcePacketProgram", "FragmentPacketKernel"};
     std::vector<std::string> names;
     for (const char* ret_type : kReturnTypes) {
         const std::string kRet = ret_type;
@@ -721,6 +723,22 @@ int main(int argc, char** argv) {
         dump(dir, "fragment_resource_definedness_third_lod_absent", missing_lod.packet.spirv,
              "recompile_fragment_resource_packet");
         namespace special = prosper::test::fragment_special_f32;
+        const auto wave_kernel =
+            recompile_fragment_packet_kernel(prosper::test::fragment_packet_wave::packet());
+        dump(dir, "fragment_packet_wave_kernel", wave_kernel.program.packet.spirv,
+             "recompile_fragment_packet_kernel");
+        const auto wave_image_kernel = recompile_fragment_packet_kernel(
+            prosper::test::fragment_packet_wave::resource::chain());
+        dump(dir, "fragment_packet_wave_image_kernel", wave_image_kernel.program.packet.spirv,
+             "recompile_fragment_packet_kernel");
+        const auto entry_m0_kernel = recompile_fragment_packet_kernel(
+            prosper::test::fragment_packet_wave::entry_m0_packet(0));
+        dump(dir, "fragment_packet_wave_entry_m0_kernel", entry_m0_kernel.program.packet.spirv,
+             "recompile_fragment_packet_kernel");
+        const auto scalar_exec_kernel = recompile_fragment_packet_kernel(
+            prosper::test::fragment_packet_wave::scalar_exec_packet(0));
+        dump(dir, "fragment_packet_wave_scalar_exec_kernel",
+             scalar_exec_kernel.program.packet.spirv, "recompile_fragment_packet_kernel");
         for (uint32_t op : {0x2au, 0x2eu, 0x33u}) {
             const auto p =
                 recompile_fragment_resource_packet(special::packet(op, special::rails(op)));
