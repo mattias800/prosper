@@ -2357,6 +2357,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/memory/test_dmem_map_failure_rollback.cpp
     LIBRARIES prosper_core)
 
+  # BatchMap is prefix-committing: a later refused mapping reports how many prior entries took
+  # effect. Keep the failure count and retained direct mapping contract independently executable.
+  prosper_add_gtest(test_batchmap_prefix_failure
+    SOURCES tests/hle/memory/test_batchmap_prefix_failure.cpp
+    LIBRARIES prosper_core)
+
   # PROSPER_DMEM_CALLER stack walk (issue #1755): the diagnostic scans up to 160 slots above its
   # frame and used to read straight off the top of a thread stack, dying with a SIGSEGV that reads
   # as a guest fault.
