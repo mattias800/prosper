@@ -246,9 +246,9 @@ platform-ifdef|prosper/src/hle/libc/hle_libc.cpp 17
 platform-ifdef|prosper/src/hle/libc/libc_variadic_capture.cpp 4
 platform-ifdef|prosper/src/hle/libc/libc_variadic_capture.hpp 1
 platform-ifdef|prosper/src/hle/memory/heap_mutex.hpp 1
-# note #3951: Linux lazy-fault granules and Windows committed/readable narrowing supplement the
-# same HLE origin proof; the query never commits or repairs guest mappings.
-platform-ifdef|prosper/src/hle/memory/hle_kernel_mem.cpp 18
+# note #3951: Linux lazy-fault granules, Windows committed/readable and Darwin mach_vm_region narrowing
+# supplement the same HLE origin proof; the query never commits or repairs guest mappings.
+platform-ifdef|prosper/src/hle/memory/hle_kernel_mem.cpp 19
 platform-ifdef|prosper/src/hle/np/np.cpp 10
 platform-ifdef|prosper/src/hle/service/hle_service.cpp 7
 platform-ifdef|prosper/src/hle/service/service_trace.hpp 1
