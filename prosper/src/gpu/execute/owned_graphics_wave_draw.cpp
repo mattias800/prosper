@@ -9,6 +9,7 @@
 #include "hle/memory/guest_memory_topology.hpp"
 extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr);
 namespace prosper::gpu {
+static constexpr uint32_t kUserSgprs = 32;
 // Registered AGC headers publish the shader blob size in bytes. Dynamic descriptor folding used to
 // ignore it and hand the decoder a fixed 0x4000-dword window, allowing the walk to read up to 64 KiB
 // past a short shader. Retain that historical 64 KiB ceiling as a WORK bound too: CreateShader accepts
