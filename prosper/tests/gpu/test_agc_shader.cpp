@@ -1251,9 +1251,13 @@ TEST(AgcShader, Contract) {
     }
     prosper::gpu::clear_shader_recompile_cache();
     prosper::gpu::clear_shader_decode_cache();
+    prosper::gpu::clear_shader_analysis_cache();
     const auto serial_draws = prosper::gpu::realize_gpustate_draws(
         parallel_state, 0x10000, 1.0f, 1.0f, nullptr, false, false);
     const auto serial_decode = prosper::gpu::shader_decode_cache_stats();
+    // The cold serial analysis is the byte oracle. An analysis retains more than its code (#4236
+    // added the fragment packet VGPR requirements), so the code size is only a floor.
+    const auto serial_analysis = prosper::gpu::shader_analysis_cache_stats();
     // Cold-start the address-local decode and analysis layers so parallel workers race their two
     // inserts while retaining warm compiled shaders. Entry bytes must remain exact under both races.
     prosper::gpu::clear_shader_decode_cache();
@@ -1294,9 +1298,12 @@ TEST(AgcShader, Contract) {
                   parallel_before.semantic_draws + parallel_state.draws.size() &&
               parallel_after.worker_threads > parallel_before.worker_threads,
           "dense draw realization records one multi-threaded batch");
-    CHECK(parallel_analysis.entries == 2 &&
-              parallel_analysis.bytes == sizeof(parallel_vs) + sizeof(parallel_ps),
-          "parallel cold analysis keeps exact entry and byte accounting");
+    CHECK(serial_analysis.entries == 2 &&
+              serial_analysis.bytes >= sizeof(parallel_vs) + sizeof(parallel_ps),
+          "serial cold analysis holds both programs and at least their code bytes");
+    CHECK(parallel_analysis.entries == serial_analysis.entries &&
+              parallel_analysis.bytes == serial_analysis.bytes,
+          "parallel cold analysis keeps exact entry and byte accounting (no double insert)");
     CHECK(serial_decode.entries == 2 && parallel_decode.entries == serial_decode.entries &&
               parallel_decode.bytes == serial_decode.bytes,
           "parallel cold decode keeps exact entry and byte accounting");
