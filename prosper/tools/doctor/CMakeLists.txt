@@ -51,6 +51,14 @@ endfunction()
 # is title- or dump-specific, so a link error is a stale list and never a missing fixture.
 host_test(self_segment_key "${PROSPER_ROOT}/tests/test_self_segment_key.cpp"
                           "${PROSPER_ROOT}/src/self/module.cpp")
+# Run the production SELF/ELF parser and image builder through their existing malformed-input
+# bounds regression suite, and exercise VA-to-file-offset resolution under the same sanitizers.
+# These synthetic tests need no game dump or Vulkan; keeping them here puts ELF metadata reads and
+# loader-facing image construction under ASan + UBSan in CI (#4338).
+host_test(self_bounds "${PROSPER_ROOT}/tests/test_self_bounds.cpp"
+                      "${PROSPER_ROOT}/src/self/module.cpp")
+host_test(va2foff "${PROSPER_ROOT}/tests/test_va2foff.cpp"
+                  "${PROSPER_ROOT}/src/self/module.cpp")
 host_test(rdna2_decode "${PROSPER_ROOT}/tests/gpu/recompiler/test_rdna2_decode.cpp"
                       "${PROSPER_ROOT}/src/gpu/recompiler/rdna2_decode.cpp")
 target_link_libraries(rdna2_decode PRIVATE GTest::gtest GTest::gtest_main)
