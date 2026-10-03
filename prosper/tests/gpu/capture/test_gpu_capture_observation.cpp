@@ -23,22 +23,26 @@ static_assert(!std::is_copy_constructible_v<GpuCaptureObservation>);
 static_assert(std::is_move_constructible_v<GpuCaptureObservation>);
 static_assert(!std::is_convertible_v<GpuCaptureObservation, GpuReplayFrame>);
 static_assert(!std::is_assignable_v<GpuReplayFrame&, GpuCaptureObservation>);
-template<class T> concept PublishesItems = requires(T& value) { value.items; };
-template<class T> concept PublishesFrame = requires(T& value) { value.normalized_; };
+template <class T>
+concept PublishesItems = requires(T& value) { value.items; };
+template <class T>
+concept PublishesFrame = requires(T& value) { value.normalized_; };
 static_assert(!PublishesItems<GpuCaptureObservation> && !PublishesFrame<GpuCaptureObservation>);
-static_assert(!std::is_invocable_v<decltype(build_gpu_dependency_graph),
-              const GpuCaptureObservation&, GpuDependencyGraph&, std::string&>);
+static_assert(
+    !std::is_invocable_v<decltype(build_gpu_dependency_graph), const GpuCaptureObservation&,
+                         GpuDependencyGraph&, std::string&>);
 
 namespace {
 std::vector<uint32_t> stored_stage(uint32_t stage) {
-    std::vector<uint32_t> words = {
-        0x07230203, 0x00010000, 0, 5, 0,
-        0x0003000e, 0, 1,                         // Logical GLSL450 memory model
-        0x0005000f, stage, 1, 0x6e69616d, 0,      // main entry point
-        0x00020013, 2,                           // void
-        0x00030021, 3, 2,                        // function type
-        0x00050036, 2, 1, 0, 3,
-        0x000200f8, 4, 0x000100fd, 0x00010038};
+    std::
+        vector<uint32_t>
+            words = {0x07230203, 0x00010000, 0,          5,          0,
+                     0x0003000e, 0,          1,   // Logical GLSL450 memory model
+                     0x0005000f, stage,      1,          0x6e69616d, 0,   // main entry point
+                     0x00020013, 2,   // void
+                     0x00030021, 3,          2,   // function type
+                     0x00050036, 2,          1,          0,          3,
+                     0x000200f8, 4,          0x000100fd, 0x00010038};
     if (stage == 4) words.insert(words.begin() + 13, {0x00030010, 1, 7});
     return words;
 }
@@ -98,13 +102,19 @@ std::string quote(const std::string& value) {
     return result + "'";
 #endif
 }
-struct CliResult { int code; std::string output; };
+struct CliResult {
+    int code;
+    std::string output;
+};
 CliResult cli(const std::filesystem::path& input, const std::string& arguments,
               const std::filesystem::path& log) {
     const char* executable = std::getenv("PROSPER_GPU_REPLAY_TEST_BINARY");
-    if (!executable) { ADD_FAILURE() << "CMake must bind the actual gpu_replay executable"; return {-1, {}}; }
-    const auto command = quote(executable) + " " + arguments + " " + quote(input.string()) +
-                         " > " + quote(log.string()) + " 2>&1";
+    if (!executable) {
+        ADD_FAILURE() << "CMake must bind the actual gpu_replay executable";
+        return {-1, {}};
+    }
+    const auto command = quote(executable) + " " + arguments + " " + quote(input.string()) + " > " +
+                         quote(log.string()) + " 2>&1";
     int status = std::system(command.c_str());
 #ifndef _WIN32
     status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
@@ -119,11 +129,12 @@ std::filesystem::path write_common69(const GpuCaptureFile& capture, const char* 
     EXPECT_TRUE(deserialize_gpu_capture(bytes, decoded, error)) << error;
     EXPECT_EQ(decoded.format_version, 69);
     std::ofstream file(path, std::ios::binary);
-    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    file.write(reinterpret_cast<const char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
     EXPECT_TRUE(file.good());
     return path;
 }
-}
+}   // namespace
 
 #ifndef PROSPER_OBSERVATION_CLI_TESTS
 TEST(GpuCaptureObservation, Common69ReportsDoNotGrantRawExecution) {
@@ -205,7 +216,10 @@ TEST(GpuCaptureObservation, GraphPreservesDrawDmaOverlapAndMovedOwner) {
     consumer.prt.resources = {image, buffer(0x3004, 8, 5)};
     capture.draws.push_back(consumer);
     GpuCapturedDmaCopy dma;
-    dma.src = 0x5000; dma.dst = 0x3000; dma.bytes = 16; dma.command_order = 20;
+    dma.src = 0x5000;
+    dma.dst = 0x3000;
+    dma.bytes = 16;
+    dma.command_order = 20;
     capture.dma_copies.push_back(dma);
     capture.operations = {{SubmitOperationKind::Draw, 0, 10, true},
                           {SubmitOperationKind::DmaCopy, 0, 20, true},
@@ -213,7 +227,7 @@ TEST(GpuCaptureObservation, GraphPreservesDrawDmaOverlapAndMovedOwner) {
     GpuCaptureObservation observation;
     std::string error;
     ASSERT_TRUE(materialize_gpu_capture_observation(capture, observation, error)) << error;
-    capture = {}; // Observation owns all normalized metadata independently.
+    capture = {};   // Observation owns all normalized metadata independently.
     auto moved = std::move(observation);
     GpuDependencyGraph graph;
     EXPECT_FALSE(build_gpu_capture_observation_graph(observation, graph, error));
@@ -246,14 +260,14 @@ TEST(GpuCaptureObservation, GraphRetainsSerializedRelocationLogicalAndSegmentByt
     source.size = source_bytes.size();
     source.stride = 16;
     const auto& layout = kIndirectPointerStaticFootprintLayout;
-    const std::array<uint32_t, 4> witnesses{
-        kIndirectPointerProofSchema, 0x1234, 0x5678,
-        layout.tag ^ kIndirectPointerProofSchema ^ 0x1234 ^ 0x5678};
+    const std::array<uint32_t, 4> witnesses{kIndirectPointerProofSchema, 0x1234, 0x5678,
+                                            layout.tag ^ kIndirectPointerProofSchema ^ 0x1234 ^
+                                                0x5678};
     const std::array<IndirectBufferRelocationRecord, 1> records{{{0, address, 8}}};
     std::shared_ptr<std::vector<uint8_t>> owner;
     IndirectBufferRelocationInfo info;
-    ASSERT_TRUE(build_indirect_buffer_relocation(source, source_bytes.data(), layout,
-                                               records, witnesses, owner, info));
+    ASSERT_TRUE(build_indirect_buffer_relocation(source, source_bytes.data(), layout, records,
+                                                 witnesses, owner, info));
     GpuCapturedResource carrier;
     carrier.resource = source;
     carrier.internal_bytes = *owner;
@@ -279,13 +293,15 @@ TEST(GpuCaptureObservation, GraphRetainsSerializedRelocationLogicalAndSegmentByt
     std::string error;
     const auto bytes = common69_bytes(capture);
     ASSERT_TRUE(deserialize_gpu_capture(bytes, capture, error)) << error;
-    ASSERT_EQ(capture.computes[0].resources.resources[0].resource.
-                  indirect_pointer_relocation.carrier_version, 0);
+    ASSERT_EQ(capture.computes[0]
+                  .resources.resources[0]
+                  .resource.indirect_pointer_relocation.carrier_version,
+              0);
     GpuCaptureObservation observation;
     ASSERT_TRUE(materialize_gpu_capture_observation(capture, observation, error)) << error;
     capture = {};
     owner.reset();
-    pointee.fill(0); // Reporting depends on captured bytes, never the live pointee.
+    pointee.fill(0);   // Reporting depends on captured bytes, never the live pointee.
     GpuDependencyGraph graph;
     ASSERT_TRUE(build_gpu_capture_observation_graph(observation, graph, error)) << error;
     ASSERT_EQ(graph.external_leaves.size(), 2);
@@ -310,9 +326,12 @@ TEST(GpuCaptureObservationCli, Common69TerminalReportsUseActualTool) {
     for (const std::string arguments : {"--inspect-only", "--validate", "--graph"}) {
         const auto result = cli(input, arguments, log);
         EXPECT_EQ(result.code, 0) << arguments << "\n" << result.output;
-        if (arguments == "--inspect-only") EXPECT_NE(result.output.find("draw[7]"), std::string::npos);
-        if (arguments == "--validate") EXPECT_NE(result.output.find("result=accept"), std::string::npos);
-        if (arguments == "--graph") EXPECT_NE(result.output.find("operations=1"), std::string::npos);
+        if (arguments == "--inspect-only")
+            EXPECT_NE(result.output.find("draw[7]"), std::string::npos);
+        if (arguments == "--validate")
+            EXPECT_NE(result.output.find("result=accept"), std::string::npos);
+        if (arguments == "--graph")
+            EXPECT_NE(result.output.find("operations=1"), std::string::npos);
     }
     const auto json = prosper_test::test_scratch_path("graph.json");
     const auto result = cli(input, "--graph-json " + quote(json.string()), log);
@@ -324,14 +343,19 @@ TEST(GpuCaptureObservationCli, MixedExecutableCommandsKeepStrictRefusal) {
     const auto input = write_common69(capsule(), "thin69.prgcap");
     const auto log = prosper_test::test_scratch_path("mixed.log");
     const auto output = prosper_test::test_scratch_path("sentinel.spv");
-    { std::ofstream sentinel(output); sentinel << "retained sentinel"; }
-    for (const std::string extra : std::vector<std::string>{"--recompile-raw", "--prepend " + quote(input.string()),
-                                   "--dump-shader 0:vs " + quote(output.string()),
-                                   "--allow-mismatch"}) {
+    {
+        std::ofstream sentinel(output);
+        sentinel << "retained sentinel";
+    }
+    for (const std::string extra : std::vector<std::string>{
+             "--recompile-raw", "--prepend " + quote(input.string()),
+             "--dump-shader 0:vs " + quote(output.string()), "--allow-mismatch"}) {
         const auto result = cli(input, "--inspect-only " + extra, log);
         EXPECT_EQ(result.code, 2) << extra << "\n" << result.output;
-        EXPECT_NE(result.output.find("logical-wave replay original decode unavailable stage=vs pc=0"),
-                  std::string::npos) << result.output;
+        EXPECT_NE(
+            result.output.find("logical-wave replay original decode unavailable stage=vs pc=0"),
+            std::string::npos)
+            << result.output;
     }
     EXPECT_EQ(read_text(output), "retained sentinel");
     const auto complete = write_common69(capsule(true), "complete69.prgcap");
@@ -364,10 +388,12 @@ TEST(GpuCaptureObservationCli, OwnedBlobOffsetAndScalarSpanReachOriginalFormatte
     const auto result = cli(input, "--inspect-only", log);
     EXPECT_EQ(result.code, 0) << result.output;
     EXPECT_NE(result.output.find(std::string("captured=32 nz=32 hash=") + bounded_hash),
-              std::string::npos) << result.output;
+              std::string::npos)
+        << result.output;
     const auto graph = cli(input, "--graph", log);
     EXPECT_EQ(graph.code, 0) << graph.output;
-    EXPECT_NE(graph.output.find("addr=0000000000008008 bytes=32"), std::string::npos) << graph.output;
+    EXPECT_NE(graph.output.find("addr=0000000000008008 bytes=32"), std::string::npos)
+        << graph.output;
 }
 
 TEST(GpuCaptureObservationCli, MissingStoredStagesAreUnavailableInsteadOfPass) {
@@ -377,7 +403,8 @@ TEST(GpuCaptureObservationCli, MissingStoredStagesAreUnavailableInsteadOfPass) {
     auto result = cli(input, "--validate", prosper_test::test_scratch_path("missing.log"));
     EXPECT_EQ(result.code, 1) << result.output;
     EXPECT_NE(result.output.find("VS descriptor validation unavailable: missing stored stage"),
-              std::string::npos) << result.output;
+              std::string::npos)
+        << result.output;
     capture.draws.clear();
     capture.raw_shader_versions.clear();
     GpuCapturedCompute compute;
@@ -388,7 +415,8 @@ TEST(GpuCaptureObservationCli, MissingStoredStagesAreUnavailableInsteadOfPass) {
     result = cli(input, "--validate", prosper_test::test_scratch_path("missing-cs.log"));
     EXPECT_EQ(result.code, 1) << result.output;
     EXPECT_NE(result.output.find("CS descriptor validation unavailable: missing stored stage"),
-              std::string::npos) << result.output;
+              std::string::npos)
+        << result.output;
     EXPECT_EQ(result.output.find("result=accept"), std::string::npos) << result.output;
 }
 
@@ -400,7 +428,8 @@ TEST(GpuCaptureObservationCli, MissingAndCapturedPendingFragmentStagesStayUnavai
     auto result = cli(input, "--validate", log);
     EXPECT_EQ(result.code, 1) << result.output;
     EXPECT_NE(result.output.find("PS descriptor validation unavailable: missing stored stage"),
-              std::string::npos) << result.output;
+              std::string::npos)
+        << result.output;
     EXPECT_EQ(result.output.find(" PS descriptors="), std::string::npos) << result.output;
 
     capture = capsule(true);
@@ -408,8 +437,8 @@ TEST(GpuCaptureObservationCli, MissingAndCapturedPendingFragmentStagesStayUnavai
     capture.draws[0].fs_raw_shader_index = 0;
     auto owner = std::make_shared<GraphicsOwnedWaveDraw>();
     owner->fragment_pending = true;
-    owner->fragment_code = std::make_shared<const std::vector<uint32_t>>(
-        capture.raw_shader_versions[0].words);
+    owner->fragment_code =
+        std::make_shared<const std::vector<uint32_t>>(capture.raw_shader_versions[0].words);
     PacketRawWaveWindow window;
     window.load_pc = 0;
     window.guest_base = window.guest_begin = 0x1000;
@@ -427,19 +456,23 @@ TEST(GpuCaptureObservationCli, MissingAndCapturedPendingFragmentStagesStayUnavai
     ASSERT_TRUE(decoded.draws[0].owned_waves->fragment_pending);
     ASSERT_TRUE(decoded.draws[0].fs.empty());
     const auto pending = prosper_test::test_scratch_path("pending-ps70.prgcap");
-    { std::ofstream file(pending, std::ios::binary);
-      file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-      ASSERT_TRUE(file.good()); }
+    {
+        std::ofstream file(pending, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        ASSERT_TRUE(file.good());
+    }
     result = cli(pending, "--validate", log);
     EXPECT_EQ(result.code, 1) << result.output;
-    EXPECT_NE(result.output.find("PS descriptor validation unavailable: captured pending stored stage"),
-              std::string::npos) << result.output;
+    EXPECT_NE(
+        result.output.find("PS descriptor validation unavailable: captured pending stored stage"),
+        std::string::npos)
+        << result.output;
     EXPECT_EQ(result.output.find(" PS descriptors="), std::string::npos) << result.output;
 }
 
 TEST(GpuCaptureObservationCli, DescriptorValidationHasARealNegativeControl) {
     auto capture = capsule();
-    capture.draws[0].vs = stored_stage(4); // A fragment entry cannot satisfy the VS interface.
+    capture.draws[0].vs = stored_stage(4);   // A fragment entry cannot satisfy the VS interface.
     const auto input = write_common69(capture, "wrong-stage69.prgcap");
     const auto result = cli(input, "--validate", prosper_test::test_scratch_path("invalid.log"));
     EXPECT_EQ(result.code, 1) << result.output;

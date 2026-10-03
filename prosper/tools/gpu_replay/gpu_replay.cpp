@@ -699,28 +699,28 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
 }
 
 bool capture_metadata_only(const prosper::gpu::GpuCaptureMetadata& metadata) {
-    return std::any_of(metadata.renderer_env.begin(), metadata.renderer_env.end(),
-                       [](const auto& entry) {
-        return entry.first == "PROSPER_GPU_CAPTURE_METADATA_ONLY" &&
-               !entry.second.empty() && entry.second != "0" && entry.second != "off";
-    });
+    return std::any_of(
+        metadata.renderer_env.begin(), metadata.renderer_env.end(), [](const auto& entry) {
+            return entry.first == "PROSPER_GPU_CAPTURE_METADATA_ONLY" && !entry.second.empty() &&
+                   entry.second != "0" && entry.second != "off";
+        });
 }
 
-void print_frame_summary(const prosper::gpu::GpuReplayFrame& replay,
-                         size_t shader_count, bool metadata_only) {
+void print_frame_summary(const prosper::gpu::GpuReplayFrame& replay, size_t shader_count,
+                         bool metadata_only) {
     const auto& m = replay.metadata;
-    std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu computes=%zu "
-                         "operations=%zu shaders=%zu failed=%zu raw-shaders=%zu blobs=%zu "
-                         "RTT-seeds=%zu DS-seeds=%zu oracle=%s resource-data=%s\n",
-                 m.revision.c_str(), m.title_id.c_str(), static_cast<unsigned long long>(m.submit_index),
-                 m.width, m.height, replay.items.size(), replay.computes.size(), replay.operations.size(),
-                 shader_count, replay.failure_diagnostics.size(),
-                 replay.raw_shader_versions.size(), replay.blobs.size(), replay.rtt_seeds.size(),
-                 replay.ds_seeds.size(),
-                 replay.expected_output_valid ? "yes" : "no",
-                 metadata_only ? "omitted" : "present");
-    const auto history_lower_bound = std::find_if(
-        m.renderer_env.begin(), m.renderer_env.end(), [](const auto& entry) {
+    std::fprintf(
+        stderr,
+        "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu computes=%zu "
+        "operations=%zu shaders=%zu failed=%zu raw-shaders=%zu blobs=%zu "
+        "RTT-seeds=%zu DS-seeds=%zu oracle=%s resource-data=%s\n",
+        m.revision.c_str(), m.title_id.c_str(), static_cast<unsigned long long>(m.submit_index),
+        m.width, m.height, replay.items.size(), replay.computes.size(), replay.operations.size(),
+        shader_count, replay.failure_diagnostics.size(), replay.raw_shader_versions.size(),
+        replay.blobs.size(), replay.rtt_seeds.size(), replay.ds_seeds.size(),
+        replay.expected_output_valid ? "yes" : "no", metadata_only ? "omitted" : "present");
+    const auto history_lower_bound =
+        std::find_if(m.renderer_env.begin(), m.renderer_env.end(), [](const auto& entry) {
             return entry.first == "PROSPER_CAPTURE_HISTORY_LOWER_BOUND_SUBMIT";
         });
     if (history_lower_bound != m.renderer_env.end())
@@ -728,13 +728,14 @@ void print_frame_summary(const prosper::gpu::GpuReplayFrame& replay,
                      "[gpureplay] producer history is phase-bounded at submit=%s; "
                      "unseeded earlier temporal provenance is unknown\n",
                      history_lower_bound->second.c_str());
-    const auto save0 = std::find_if(
-        m.renderer_env.begin(), m.renderer_env.end(), [](const auto& entry) {
+    const auto save0 =
+        std::find_if(m.renderer_env.begin(), m.renderer_env.end(), [](const auto& entry) {
             return entry.first == prosper::gpu::kGpuCaptureSave0Env;
         });
     if (save0 != m.renderer_env.end() || !m.savedata_dir.empty())
-        std::fprintf(stderr, "[gpureplay] capture save roots (saves sit in a per-title <root>/"
-                             "<TITLE_ID>/ subdirectory, #2734): save0=%s savedata-memory=%s\n",
+        std::fprintf(stderr,
+                     "[gpureplay] capture save roots (saves sit in a per-title <root>/"
+                     "<TITLE_ID>/ subdirectory, #2734): save0=%s savedata-memory=%s\n",
                      save0 == m.renderer_env.end() ? "unknown" : save0->second.c_str(),
                      m.savedata_dir.empty() ? "unknown" : m.savedata_dir.c_str());
 }
@@ -1313,29 +1314,27 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay, uint32_t format_v
     }
 }
 
-bool validate_stored_stage(const char* operation, uint64_t index, size_t item,
-                           const char* name, const std::vector<uint32_t>& spirv,
+bool validate_stored_stage(const char* operation, uint64_t index, size_t item, const char* name,
+                           const std::vector<uint32_t>& spirv,
                            const prosper::gpu::ShaderResourceTable* table, uint32_t set,
                            prosper::gpu::SpirvShaderStage stage) {
     auto report = prosper::gpu::validate_spirv_descriptor_interface(spirv, table, set, stage, true);
-    std::printf("%s[%llu] item=%zu %s descriptors=%zu runtime=%zu result=%s\n",
-                operation, static_cast<unsigned long long>(index), item, name,
-                report.descriptors.size(), table ? table->resources.size() : 0,
-                report.ok() ? "accept" : "reject");
+    std::printf("%s[%llu] item=%zu %s descriptors=%zu runtime=%zu result=%s\n", operation,
+                static_cast<unsigned long long>(index), item, name, report.descriptors.size(),
+                table ? table->resources.size() : 0, report.ok() ? "accept" : "reject");
     for (const auto& binding : report.descriptors)
-        std::printf("  set=%u binding=%u type=%s required=%llu%s\n",
-                    binding.set, binding.binding,
+        std::printf("  set=%u binding=%u type=%s required=%llu%s\n", binding.set, binding.binding,
                     prosper::gpu::spirv_descriptor_kind_name(binding.kind),
                     static_cast<unsigned long long>(binding.required_bytes),
                     binding.dynamic_access ? "+dynamic" : "");
     for (const auto& issue : report.issues) {
-        std::printf("  %s %s set=%u binding=%u expected=%s actual=%s required=%llu available=%llu\n",
-                    issue.error ? "ERROR" : "warn",
-                    prosper::gpu::descriptor_issue_name(issue.code), issue.set, issue.binding,
-                    prosper::gpu::spirv_descriptor_kind_name(issue.expected),
-                    prosper::gpu::spirv_descriptor_kind_name(issue.actual),
-                    static_cast<unsigned long long>(issue.required_bytes),
-                    static_cast<unsigned long long>(issue.available_bytes));
+        std::printf(
+            "  %s %s set=%u binding=%u expected=%s actual=%s required=%llu available=%llu\n",
+            issue.error ? "ERROR" : "warn", prosper::gpu::descriptor_issue_name(issue.code),
+            issue.set, issue.binding, prosper::gpu::spirv_descriptor_kind_name(issue.expected),
+            prosper::gpu::spirv_descriptor_kind_name(issue.actual),
+            static_cast<unsigned long long>(issue.required_bytes),
+            static_cast<unsigned long long>(issue.available_bytes));
     }
     return report.ok();
 }
@@ -1357,8 +1356,8 @@ bool validate_frame(const prosper::gpu::GpuReplayFrame& replay) {
             {"PS", fs.words, d.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment},
         };
         for (const auto& s : stages) {
-            valid &= validate_stored_stage("draw", d.draw_index, i, s.name, *s.spirv,
-                                           s.table, s.set, s.stage);
+            valid &= validate_stored_stage("draw", d.draw_index, i, s.name, *s.spirv, s.table,
+                                           s.set, s.stage);
         }
     }
     return valid;
@@ -2382,7 +2381,8 @@ public:
     static void summary(const GpuCaptureObservation& observation, size_t shader_count,
                         bool metadata_only) {
         print_frame_summary(observation.normalized_, shader_count, metadata_only);
-        std::fprintf(stderr, "[gpureplay] capture observation; execution admission not evaluated\n");
+        std::fprintf(stderr,
+                     "[gpureplay] capture observation; execution admission not evaluated\n");
     }
     static void inspect(const GpuCaptureObservation& observation) {
         inspect_frame(observation.normalized_, observation.format_version_);
@@ -2397,27 +2397,31 @@ public:
                 const auto* table = vertex ? draw.vrt.get() : draw.prt.get();
                 const auto* name = vertex ? "VS" : "PS";
                 if (words.empty()) {
-                    std::printf("draw[%llu] %s descriptor validation unavailable: %s stored stage\n",
-                                static_cast<unsigned long long>(draw.draw_index), name,
-                                (vertex ? pending.vertex : pending.fragment) ?
-                                    "captured pending" : "missing");
+                    std::printf(
+                        "draw[%llu] %s descriptor validation unavailable: %s stored stage\n",
+                        static_cast<unsigned long long>(draw.draw_index), name,
+                        (vertex ? pending.vertex : pending.fragment) ? "captured pending"
+                                                                     : "missing");
                     valid = false;
                     continue;
                 }
-                valid &= validate_stored_stage("draw", draw.draw_index, i, name, words, table,
-                    vertex ? 0 : 1, vertex ? SpirvShaderStage::Vertex : SpirvShaderStage::Fragment);
+                valid &= validate_stored_stage(
+                    "draw", draw.draw_index, i, name, words, table, vertex ? 0 : 1,
+                    vertex ? SpirvShaderStage::Vertex : SpirvShaderStage::Fragment);
             }
         }
         for (size_t i = 0; i < observation.normalized_.computes.size(); ++i) {
             const auto& compute = observation.normalized_.computes[i];
             if (compute.spirv.empty()) {
-                std::printf("compute[%llu] CS descriptor validation unavailable: missing stored stage\n",
-                            static_cast<unsigned long long>(compute.dispatch_index));
+                std::printf(
+                    "compute[%llu] CS descriptor validation unavailable: missing stored stage\n",
+                    static_cast<unsigned long long>(compute.dispatch_index));
                 valid = false;
                 continue;
             }
-            valid &= validate_stored_stage("compute", compute.dispatch_index, i, "CS",
-                compute.spirv, compute.resources.get(), 0, SpirvShaderStage::Compute);
+            valid &=
+                validate_stored_stage("compute", compute.dispatch_index, i, "CS", compute.spirv,
+                                      compute.resources.get(), 0, SpirvShaderStage::Compute);
         }
         return valid;
     }
@@ -2426,7 +2430,7 @@ public:
     }
 };
 
-} // namespace prosper::gpu
+}   // namespace prosper::gpu
 
 // MinGW's UCRT headers have no setenv/unsetenv, so gpu_replay did not COMPILE on Windows --
 // which is why it was Linux-only. Same shape tools/screenshot/screenshot.cpp already uses.
@@ -3131,12 +3135,15 @@ int main(int argc, char** argv) {
         if (graph_only) {
             prosper::gpu::GpuDependencyGraph graph;
             if (!prosper::gpu::build_gpu_capture_observation_graph(observation, graph, error)) {
-                std::fprintf(stderr, "gpu_replay: cannot build dependency graph: %s\n", error.c_str());
+                std::fprintf(stderr, "gpu_replay: cannot build dependency graph: %s\n",
+                             error.c_str());
                 return 2;
             }
-            if (graph_json_path.empty()) Reports::graph(observation, graph);
+            if (graph_json_path.empty())
+                Reports::graph(observation, graph);
             else if (!write_graph_json(graph_json_path, graph)) {
-                std::fprintf(stderr, "gpu_replay: cannot write graph JSON %s\n", graph_json_path.c_str());
+                std::fprintf(stderr, "gpu_replay: cannot write graph JSON %s\n",
+                             graph_json_path.c_str());
                 return 2;
             }
             return 0;

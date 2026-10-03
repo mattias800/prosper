@@ -303,14 +303,17 @@ public:
         if (!validate_dma_copies(c, error) ||
             (c.format_version >= 7u && !validate_failure_diagnostics(c, error)))
             return false;
-        out.metadata = c.metadata; out.blobs = c.blobs;
-        out.rtt_seeds = c.rtt_seeds; out.ds_seeds = c.ds_seeds;
+        out.metadata = c.metadata;
+        out.blobs = c.blobs;
+        out.rtt_seeds = c.rtt_seeds;
+        out.ds_seeds = c.ds_seeds;
         out.raw_shader_versions = c.raw_shader_versions;
         out.failure_diagnostics = c.failure_diagnostics;
         out.resource_provenance = c.resource_provenance;
         out.failure_diagnostics_available = c.failure_diagnostics_available;
         out.expected_output_valid = c.expected_output_valid;
-        out.expected_output_hash = c.expected_output_hash; out.expected_output_bytes = c.expected_output_bytes;
+        out.expected_output_hash = c.expected_output_hash;
+        out.expected_output_bytes = c.expected_output_bytes;
         size_t resource_reference_count = 0;
         for (const auto& draw : c.draws)
             for (const GpuCapturedTable* table : {&draw.vrt, &draw.prt})
@@ -323,10 +326,10 @@ public:
         out.resource_instances.reserve(resource_reference_count * 2);
         return true;
     }
-    bool bind_range(uint32_t blob_index, uint64_t blob_offset, uint64_t guest_addr,
-                    uint64_t need, uint8_t*& host_data, uint64_t& host_data_size,
-                    const char* invalid_error, const char* exceeds_error,
-                    const char* offset_error, uint64_t* prefix_bytes = nullptr) {
+    bool bind_range(uint32_t blob_index, uint64_t blob_offset, uint64_t guest_addr, uint64_t need,
+                    uint8_t*& host_data, uint64_t& host_data_size, const char* invalid_error,
+                    const char* exceeds_error, const char* offset_error,
+                    uint64_t* prefix_bytes = nullptr) {
         if (blob_index == 0xFFFFFFFFu) return true;
         if (blob_index >= out.blobs.size() || blob_offset > out.blobs[blob_index].bytes.size()) {
             error = invalid_error; return false;
@@ -605,7 +608,9 @@ public:
             error = "invalid realized-draw fragment entry evidence";
             return false;
         }
-        d.vs = x.vs; d.gs = x.gs; d.fs = x.fs;
+        d.vs = x.vs;
+        d.gs = x.gs;
+        d.fs = x.fs;
         d.ps = x.ps; d.vertex_count = x.vertex_count;
         d.instance_count = x.instance_count;
         d.raw_draw_count = x.raw_draw_count; d.raw_indexed = x.raw_indexed;   // #1256
@@ -994,8 +999,8 @@ public:
         // dispatch-derived markers. This private frame never reaches executable consumers:
         // no shader proof, guest read, relocation construction or live-state discovery occurs.
         for (auto& resource : compute.resources->resources) {
-            if (is_gta5_packed_pointer_serialized_shadow(
-                    resource, resource.host_data, resource.host_data_size)) {
+            if (is_gta5_packed_pointer_serialized_shadow(resource, resource.host_data,
+                                                         resource.host_data_size)) {
                 resource.indirect_buffer_contract_tag = kGta5PackedPointerTag;
                 resource.indirect_buffer_binding_bytes = resource.host_data_size;
                 resource.indirect_buffer_slot_count =
@@ -1004,19 +1009,22 @@ public:
                 resource.indirect_buffer_header_bytes = kGta5PackedPointerHeaderBytes;
                 resource.indirect_buffer_slot_bytes = kGta5PackedPointerSlotBytes;
             }
-            if (!is_indirect_pointer_relocation_serialized(
-                    resource, resource.host_data, resource.host_data_size)) continue;
-            for (const auto* layout : {&kIndirectPointerStaticFootprintLayout,
-                                       &kIndirectPointerDescriptorRangeLayout}) {
+            if (!is_indirect_pointer_relocation_serialized(resource, resource.host_data,
+                                                           resource.host_data_size))
+                continue;
+            for (const auto* layout :
+                 {&kIndirectPointerStaticFootprintLayout, &kIndirectPointerDescriptorRangeLayout}) {
                 IndirectBufferRelocationInfo info;
-                if (!inspect_indirect_buffer_relocation(
-                        resource, resource.host_data, resource.host_data_size, *layout, info))
+                if (!inspect_indirect_buffer_relocation(resource, resource.host_data,
+                                                        resource.host_data_size, *layout, info))
                     continue;
-                const uint64_t directory = resource.size + kIndirectBufferRelocationHeaderBytes +
+                const uint64_t directory =
+                    resource.size + kIndirectBufferRelocationHeaderBytes +
                     info.records.size() * kIndirectBufferRelocationRecordBytes;
                 if (directory > UINT32_MAX || info.witness_words.size() != 4u) continue;
                 resource.indirect_pointer_relocation = {
-                    layout->version, kIndirectPointerProofSchema,
+                    layout->version,
+                    kIndirectPointerProofSchema,
                     static_cast<uint32_t>(resource.host_data_size),
                     static_cast<uint32_t>(info.records.size()),
                     static_cast<uint32_t>(info.segments.size()),
@@ -1084,6 +1092,7 @@ public:
         copy.source_data = source;
         return true;
     }
+
 private:
     const GpuCaptureFile& c;
     GpuReplayFrame& out;
@@ -1092,7 +1101,7 @@ private:
     std::map<uint32_t, size_t> internal_instance_by_binding;
 };
 
-} // namespace
+}   // namespace
 
 bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::string& error) {
     error.clear();
@@ -1102,8 +1111,8 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
     out.items.reserve(c.draws.size());
     for (const auto& captured : c.draws) {
         DrawItem draw;
-        if (!normalizer.normalize_draw(captured, draw) ||
-            !normalizer.admit_draw(captured, draw)) return false;
+        if (!normalizer.normalize_draw(captured, draw) || !normalizer.admit_draw(captured, draw))
+            return false;
         out.items.push_back(std::move(draw));
     }
     out.computes.reserve(c.computes.size());
@@ -1123,8 +1132,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
 }
 
 GpuCaptureObservation::GpuCaptureObservation(GpuCaptureObservation&& other) noexcept
-    : normalized_(std::move(other.normalized_)),
-      pending_stages_(std::move(other.pending_stages_)),
+    : normalized_(std::move(other.normalized_)), pending_stages_(std::move(other.pending_stages_)),
       format_version_(other.format_version_), available_(std::exchange(other.available_, false)) {}
 
 GpuCaptureObservation& GpuCaptureObservation::operator=(GpuCaptureObservation&& other) noexcept {
@@ -1138,7 +1146,7 @@ GpuCaptureObservation& GpuCaptureObservation::operator=(GpuCaptureObservation&& 
 }
 
 bool materialize_gpu_capture_observation(const GpuCaptureFile& c,
-                                        GpuCaptureObservation& observation, std::string& error) {
+                                         GpuCaptureObservation& observation, std::string& error) {
     error.clear();
     observation = {};
     auto& out = observation.normalized_;
@@ -1149,9 +1157,9 @@ bool materialize_gpu_capture_observation(const GpuCaptureFile& c,
         if (!normalizer.normalize_draw(captured, draw)) return false;
         if (draw.vrt) draw.vrt->vertices_per_instance = draw.vertex_count;
         out.items.push_back(std::move(draw));
-        observation.pending_stages_.push_back({
-            captured.owned_waves && captured.owned_waves->vertex_pending,
-            captured.owned_waves && captured.owned_waves->fragment_pending});
+        observation.pending_stages_.push_back(
+            {captured.owned_waves && captured.owned_waves->vertex_pending,
+             captured.owned_waves && captured.owned_waves->fragment_pending});
     }
     for (const auto& captured : c.computes) {
         ComputeItem compute;

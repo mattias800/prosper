@@ -504,21 +504,24 @@ public:
     GpuCaptureObservation& operator=(GpuCaptureObservation&&) noexcept;
 
 private:
-    struct PendingStages { bool vertex = false; bool fragment = false; };
+    struct PendingStages {
+        bool vertex = false;
+        bool fragment = false;
+    };
     GpuReplayFrame normalized_;
     std::vector<PendingStages> pending_stages_;
     uint32_t format_version_ = 0;
     bool available_ = false;
 
-    friend bool materialize_gpu_capture_observation(
-        const GpuCaptureFile&, GpuCaptureObservation&, std::string&);
-    friend bool build_gpu_capture_observation_graph(
-        const GpuCaptureObservation&, GpuDependencyGraph&, std::string&);
+    friend bool materialize_gpu_capture_observation(const GpuCaptureFile&, GpuCaptureObservation&,
+                                                    std::string&);
+    friend bool build_gpu_capture_observation_graph(const GpuCaptureObservation&,
+                                                    GpuDependencyGraph&, std::string&);
     friend class GpuCaptureObservationReports;
 };
 
 bool materialize_gpu_capture_observation(const GpuCaptureFile& capture,
-                                        GpuCaptureObservation& observation, std::string& error);
+                                         GpuCaptureObservation& observation, std::string& error);
 
 // Byte range the capture planner reserves for one descriptor. This includes decoded/tiled image
 // storage when it is larger than the descriptor's declared byte count.
