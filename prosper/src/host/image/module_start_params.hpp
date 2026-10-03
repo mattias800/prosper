@@ -12,11 +12,27 @@
 // everything would satisfy the first arm perfectly while changing the entry ABI of every module
 // prosper links.
 #pragma once
+#include <cstddef>
 #include <cstdint>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace prosper {
+
+// The existing 0x200 handshake: original guest consumers read two dwords followed by one qword,
+// not three qwords. Keep this shared between hosts so layout changes cannot silently diverge.
+struct ModuleStartDescriptor {
+    uint32_t size;
+    uint32_t version;
+    uint64_t callback;
+};
+static_assert(std::is_standard_layout_v<ModuleStartDescriptor>);
+static_assert(sizeof(ModuleStartDescriptor) == 16);
+static_assert(offsetof(ModuleStartDescriptor, size) == 0);
+static_assert(offsetof(ModuleStartDescriptor, version) == 4);
+static_assert(offsetof(ModuleStartDescriptor, callback) == 8);
+inline constexpr ModuleStartDescriptor kModuleStartDescriptor{0x10, 0x200, 0};
 
 // Guest [begin, end) ranges whose module_start must receive the descriptor. See the .cpp for why
 // each one is here.

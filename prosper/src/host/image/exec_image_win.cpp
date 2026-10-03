@@ -18,6 +18,8 @@
 #endif
 
 #include "host/image/exec_image.hpp"
+#include "host/image/module_start_params.hpp"
+#include "host/image/runtime_module_load.hpp"
 #include "host/image/stub_append_batch.hpp"
 #include "host/image/win_data_watch.hpp"
 #include "host/fault/rbp_chain.hpp"   // guest_frames_from_rbp: the shared frame-pointer walk
@@ -296,7 +298,7 @@ namespace {
     thread_local InitThreadStackRegistration t_init_stack_registration;
 
     std::vector<std::pair<uint64_t, uint64_t>> g_modstart_param_ranges;
-    struct ModStartDesc { uint64_t a, b, c; } g_modstart_desc = { 0x10, 0x200, 0 };
+    ModuleStartDescriptor g_modstart_desc = kModuleStartDescriptor;
 
     inline uint64_t cur_tid() { return (uint64_t)GetCurrentThreadId(); }
     inline uint64_t page_up(uint64_t v) { return (v + 0xfffull) & ~0xfffull; }
@@ -1598,7 +1600,7 @@ size_t run_guest_inits(const std::vector<uint64_t>& fns) {
         for (auto& r : g_modstart_param_ranges)
             if (f >= r.first && f < r.second) { argc = 0x10; argp = (uint64_t)&g_modstart_desc; break; }
         if (host::prosper_win_recovery_save(&t_recovery) == 0) {
-            prosper_call_guest_sysv(f, argc, argp);
+            call_guest_module_entry(f, argc, argp, 0);
             ok++;
         }
         t_armed = 0;
