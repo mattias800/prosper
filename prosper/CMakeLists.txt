@@ -5839,7 +5839,7 @@ if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
   prosper_add_gtest(test_fragment_resource_packet_exec
     SOURCES tests/gpu/execute/test_fragment_resource_packet_exec.cpp
     INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
-    PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION "[[]  SKIPPED []]")
+    PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
 
   add_executable(test_float_transport_render tests/gpu/execute/test_float_transport_render.cpp)
   target_include_directories(test_float_transport_render PRIVATE tests frontends)
