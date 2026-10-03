@@ -1205,6 +1205,16 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_printf.cpp
     LIBRARIES prosper_core)
 
+  # The guest's printf/scanf/strtod family through the REGISTERED handlers (guest-ABI variadic
+  # capture, guest va_list hand-off, declared xmm0 returns), against N1570 7.21.6 / 7.22.1.3.
+  # Pure, no game dump.
+  prosper_add_gtest(test_hle_printf_family
+    SOURCES tests/hle/test_hle_printf_family.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_hle_scanf_family
+    SOURCES tests/hle/test_hle_scanf_family.cpp
+    LIBRARIES prosper_core)
+
   # Windows' aligned allocator family must remain paired end-to-end. Mixing _aligned_malloc with
   # plain free corrupts the heap under aligned game-buffer churn; ordinary and aligned guest
   # allocations intentionally share one compatible family on that host.
