@@ -2510,11 +2510,11 @@ if(TARGET prosper_core)
   # Messenger recompile guard (#228): committed real Messenger VS/PS RDNA2 binaries must keep
   # recompiling — a recompiler change that re-rejects one of their instructions (the #199/#201
   # blue-screen class) fails here instead of shipping. Pure (no Vulkan); needs no game dump.
-  add_executable(test_messenger_recompile_guard tests/gpu/recompiler/test_messenger_recompile_guard.cpp)
-  target_link_libraries(test_messenger_recompile_guard PRIVATE prosper_core)
+  prosper_add_gtest(test_messenger_recompile_guard
+    SOURCES tests/gpu/recompiler/test_messenger_recompile_guard.cpp
+    LIBRARIES prosper_core)
   target_compile_definitions(test_messenger_recompile_guard PRIVATE
       PROSPER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
-  add_test(NAME messenger_recompile_guard COMMAND test_messenger_recompile_guard)
 
   # libkernel/libScePosix signal + time-conversion surface (#190): NID match, registration, and real
   # behavior (UTC<->localtime round-trip fills its out-param; pthread_setcancelstate old-state + EINVAL).
@@ -2727,9 +2727,9 @@ if(TARGET prosper_core)
   add_test(NAME fragment_neutral_selection COMMAND test_fragment_neutral_selection)
 
   # #4016: exact compare-mask SSA, CMPX VCC preservation, and strict scalar-AND controls.
-  add_executable(test_compare_exec_masking tests/gpu/recompiler/test_compare_exec_masking.cpp)
-  target_link_libraries(test_compare_exec_masking PRIVATE prosper_core)
-  add_test(NAME compare_exec_masking COMMAND test_compare_exec_masking)
+  prosper_add_gtest(test_compare_exec_masking
+    SOURCES tests/gpu/recompiler/test_compare_exec_masking.cpp
+    LIBRARIES prosper_core)
 
   add_executable(test_normal_magnitude_predicate tests/gpu/recompiler/test_normal_magnitude_predicate.cpp)
   target_link_libraries(test_normal_magnitude_predicate PRIVATE prosper_core)
