@@ -832,6 +832,25 @@ if(TARGET prosper_core)
              COMMAND test_nid "${GAME_DUMP}/eboot.bin")
   endif()
 
+  # Split-T# provenance proof (#4197): pure decoder/fold cases, no dump.
+  prosper_add_gtest(test_split_t8_dataflow
+    SOURCES tests/gpu/recompiler/test_split_t8_dataflow.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_split_t8_loop_defs
+    SOURCES tests/gpu/recompiler/test_split_t8_loop_defs.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_split_t8_sop2_width
+    SOURCES tests/gpu/recompiler/test_split_t8_sop2_width.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_split_t8_tail_blocks
+    SOURCES tests/gpu/recompiler/test_split_t8_tail_blocks.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
+
   # #3529: the initial value of an unresolved DATA import. Pure -- no dump, no mapping.
   prosper_add_gtest(test_import_data_seed
     SOURCES tests/hle/dispatch/test_import_data_seed.cpp
