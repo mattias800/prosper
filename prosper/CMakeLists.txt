@@ -1407,6 +1407,12 @@ if(TARGET prosper_core)
     SOURCES tests/host/image/test_guest_module_label.cpp
     LIBRARIES prosper_core)
 
+  # The guest-FS swap stub's saved-base slot is consumed by callback_fs.hpp. Inspect emitted bytes
+  # without executing FSGSBASE instructions, and pin both the handler offset and call alignment.
+  prosper_add_gtest(test_guest_fs_swap_stub
+    SOURCES tests/host/image/test_guest_fs_swap_stub.cpp
+    LIBRARIES prosper_core)
+
   # The frame-pointer walk shared by the fault reporter and PROSPER_HWBP_STACK. It dereferences
   # guest-controlled pointers inside a signal handler, so every stop condition (cycle, unreadable
   # frame, depth cap) is a safety property. Header-only; no dump, no device.
