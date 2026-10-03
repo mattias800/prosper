@@ -28,6 +28,8 @@
 #include "hle/dispatch/dispatch.hpp"
 #include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
+#include "hle/kernel/apr_event_dialect.hpp"
+#include "hle/kernel/kernel_event_filters.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -37,16 +39,24 @@
 
 using namespace prosper;
 
+namespace prosper {
+// Test seam (hle_kernel_mem.cpp): the dialect recorded on a command buffer's binding at bind time.
+bool prosper_apr_binding_dialect_for_test(uint64_t cb, AprDialect* out);
+}   // namespace prosper
+
 #define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // SceKernelEvent (FreeBSD kevent layout, 0x20 bytes) — must match the backend's struct exactly.
 struct KEvent { int64_t ident; int16_t filter; uint16_t flags; uint32_t fflags; int64_t data; uint64_t udata; };
 static_assert(sizeof(KEvent) == 0x20, "SceKernelEvent must be 0x20 bytes");
 
-// The APR completion filter the backend posts (EVFILT_AMPR_MODELED). The guest never reads it;
-// asserting it here is what proves the counted entries are APR completions and not some other
-// source that merely happened to raise the queue depth.
-static constexpr int16_t kAprFilter = -24;
+// The APR completion filter the backend posts (SCE_KERNEL_EVFILT_AMPR, -25). Some guests read it:
+// Black Flag Resynced's completion consumer dispatches on filter == 0xffe7 and ignores every other
+// event, so the exact value is part of the contract (#4139). Asserting it here is also what proves
+// the counted entries are APR completions and not some other source that merely happened to raise
+// the queue depth.
+static constexpr int16_t kAprFilter = EVFILT_AMPR;   // shared constant, pinned to -25 here
+static_assert(EVFILT_AMPR == -25, "the guest dispatches on filter 0xffe7");
 
 // Drain whatever is queued so each scenario starts from an empty queue.
 static void drain(HleFn wait, uint64_t eq) {
@@ -169,4 +179,99 @@ TEST(AprEqueueCompletion, Contract) {
         drain(wait, eq);
     }
 
+    // --- Black Flag Resynced's shape: id != 0 with a HEAP-POINTER tag. ----------------------------
+    // Its IOComplete consumer reads event.data as the request pointer and filter as 0xffe7. Two
+    // outstanding requests must arrive as two events, each carrying ITS OWN pointer: treating the
+    // pointer as a counter would coalesce them and deliver the high-water mark (the other request).
+    {
+        const uint64_t cb7 = 0x205df97000ull, cb8 = 0x205df97028ull;
+        constexpr uint64_t kPtrA = 0x4080041240ull, kPtrB = 0x4080052380ull;
+        addampr(eq, 1, 0, 0, 0, 0);
+        bind(cb7, eq, /*id=*/1, /*tag=*/kPtrA, 0, 0);
+        bind(cb8, eq, /*id=*/1, /*tag=*/kPtrB, 0, 0);
+        submit(cb7, 1, 0, 0, 0, 0);
+        submit(cb8, 1, 0, 0, 0, 0);
+        settle();
+        const uint64_t n = getcount(eq, 0, 0, 0, 0, 0);
+        CHECK(n == 2, "id != 0 pointer-tag completions are individually delivered, not coalesced");
+        std::vector<KEvent> ev(128);
+        int32_t out = -1;
+        uint32_t cap = 1000;
+        wait(eq, (uint64_t)(uintptr_t)ev.data(), ev.size(), (uint64_t)(uintptr_t)&out,
+             (uint64_t)(uintptr_t)&cap, 0);
+        bool a = false, b = false, filt = out == 2;
+        for (int i = 0; i < out && i < 2; i++) {
+            a |= (uint64_t)ev[i].data == kPtrA;
+            b |= (uint64_t)ev[i].data == kPtrB;
+            filt &= (uint16_t)ev[i].filter == 0xffe7;
+        }
+        CHECK(a && b, "each pointer-tag event carries its own request pointer in data");
+        CHECK(filt, "the posted filter is 0xffe7 (-25), the value the guest dispatches on");
+        drain(wait, eq);
+    }
+
+    // --- Dialect is recorded on the binding at bind time. ------------------------------------------
+    // One bind per dialect, then read the stored enum. Pins the classification each live consumer
+    // needs: UE4 listener counter, IoDispatcher / Black Flag request pointer, CRI constant zero.
+    {
+        const auto dialect_of = [&](uint64_t cb, AprDialect* d) {
+            return prosper_apr_binding_dialect_for_test(cb, d);
+        };
+        AprDialect d = AprDialect::Counter;
+        bind(0x205dfa0000ull, eq, 0x74fe + 4, (4ull << 58) | 1000, 0, 0);
+        CHECK(dialect_of(0x205dfa0000ull, &d) && d == AprDialect::Counter,
+              "UE4 listener bind (id 0x74fe+ring, dense counter tag) is the Counter dialect");
+        bind(0x205dfa0028ull, eq, 0, 0x4080041240ull, 0, 7 | 0xf);
+        CHECK(dialect_of(0x205dfa0028ull, &d) && d == AprDialect::RequestPointer,
+              "IoDispatcher bind (id 0, pointer tag) is the RequestPointer dialect");
+        bind(0x205dfa0050ull, eq, 1, 0x4080052380ull, 0, 0);
+        CHECK(dialect_of(0x205dfa0050ull, &d) && d == AprDialect::RequestPointer,
+              "Black Flag bind (id 1, heap-pointer tag) is the RequestPointer dialect");
+        bind(0x205dfa0078ull, eq, 1, 0, 0, 0);
+        CHECK(dialect_of(0x205dfa0078ull, &d) && d == AprDialect::ConstantZero,
+              "CRI bind (id != 0, tag 0) is the ConstantZero dialect");
+        // Rebinding the same command buffer re-classifies it: the dialect follows the latest bind.
+        bind(0x205dfa0078ull, eq, 0x74fe, 1000, 0, 0);
+        CHECK(dialect_of(0x205dfa0078ull, &d) && d == AprDialect::Counter,
+              "a rebind replaces the recorded dialect");
+        CHECK(!dialect_of(0x205dfaffffull, &d), "an unbound command buffer has no dialect");
+        static_assert(classify_apr_dialect(0, 0) == AprDialect::RequestPointer,
+                      "id 0 is always a pointer");
+        static_assert(classify_apr_dialect(5, (1ull << 32) - 1) == AprDialect::Counter,
+                      "below 2^32 is a counter");
+        static_assert(classify_apr_dialect(5, 1ull << 32) == AprDialect::RequestPointer,
+                      "2^32 is a pointer");
+        drain(wait, eq);
+    }
+
+    // --- A pointer-dialect tag must not poison the Counter dialect's high-water mark. --------------
+    // Both bind on ONE equeue and the pointer tag's ring bits are 0, the same ring as a ring-0
+    // listener counter. Feeding the pointer into the counter's high-water mark would make the next
+    // counter completion deliver the POINTER as its "completed up to" value.
+    {
+        uint64_t eq2 = 0;
+        create((uint64_t)(uintptr_t)&eq2, 0, 0, 0, 0, 0);
+        constexpr uint64_t kPtr = 0x4080099000ull;
+        const uint64_t cbp = 0x205dfb0000ull, cbc = 0x205dfb0028ull;
+        addampr(eq2, 1, 0, 0, 0, 0);
+        addampr(eq2, 0x74fe, 0, 0, 0, 0);
+        bind(cbp, eq2, 1, kPtr, 0, 0);
+        bind(cbc, eq2, 0x74fe, 1000, 0, 0);
+        submit(cbp, 1, 0, 0, 0, 0);
+        settle();
+        submit(cbc, 1, 0, 0, 0, 0);
+        settle();
+        std::vector<KEvent> ev(8);
+        int32_t out = -1;
+        uint32_t cap = 50000;
+        wait(eq2, (uint64_t)(uintptr_t)ev.data(), ev.size(), (uint64_t)(uintptr_t)&out,
+             (uint64_t)(uintptr_t)&cap, 0);
+        bool ptr_ok = false, ctr_ok = false;
+        for (int i = 0; i < out && i < 8; i++) {
+            if (ev[i].ident == 1) ptr_ok |= (uint64_t)ev[i].data == kPtr;
+            if (ev[i].ident == 0x74fe) ctr_ok |= (uint64_t)ev[i].data == 1000;
+        }
+        CHECK(out == 2 && ptr_ok, "the pointer completion carries its own pointer");
+        CHECK(ctr_ok, "the counter completion still carries its own counter, not the pointer");
+    }
 }

@@ -4,6 +4,8 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
+#include "hle/kernel/apr_event_dialect.hpp"   // per-binding completion dialect
+#include "hle/kernel/kernel_event_filters.hpp"   // EVFILT_AMPR
 #include "hle/graphics/videoout_event_data.hpp"   // #3668: the flip event data layout
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "host/image/exec_image.hpp"      // guest_frames_from_rbp / describe_code_address
@@ -1208,7 +1210,7 @@ namespace {
                     // noise; for a COUNTED completion source it is a lost wakeup, and this is the only
                     // place that can see it — by the time a consumer notices, the evidence is a thread
                     // blocked in WaitEqueue with nothing to say why. Printed with ident/filter so the
-                    // APR completion filter (-24) is separable from the 60 Hz pump. Same gate as every
+                    // APR completion filter (-25) is separable from the 60 Hz pump. Same gate as every
                     // other producer here, so the count can never be an unarmed zero.
                     if (evlog() && e.filter != -7 && e.filter != -15)
                         fprintf(stderr, "[ev] coalesce-replace eq=0x%llx ident=%lld filter=%d "
@@ -1779,7 +1781,6 @@ HLE(k_eq_getcount){
 uint64_t prosper_eq_apr_udata(uint64_t eq, int64_t id);   // defined below, with the registry
 
 namespace {
-    constexpr int16_t EVFILT_AMPR_MODELED = -24;   // guest never reads filter; distinct on purpose
     // udata is the guest's own pointer, handed to sceKernelAddAmprEvent and handed BACK on every
     // completion event through sceKernelGetEventUserData. It is not decoration: NINJA GAIDEN 4's
     // Wwise I/O hook dereferences it directly (`call sceKernelGetEventUserData; mov edi,[rax]` at
@@ -1804,59 +1805,52 @@ namespace {
     }
     void apr_post(uint64_t eq, uint64_t eq_identity, int64_t id,
                   unsigned ring, uint64_t token, bool coalesce, uint64_t udata) {   // no APR lock held
-        SceKEvent e{}; e.ident = id + (int64_t)ring; e.filter = EVFILT_AMPR_MODELED;
+        SceKEvent e{};
+        e.ident = id + (int64_t)ring;
+        e.filter = EVFILT_AMPR;
         e.data = (int64_t)token; e.udata = udata;
         eq_post(eq, e, coalesce, eq_identity);
     }
 }
-// Post an EXACT guest-chosen completion token (the H896Pt-yB4I binding tag) to the binding's own
-// equeue — the completion signal for the bound/batched APR channel. Deferred ~2 ms so the guest
-// finishes installing its tracking slot/hash entry first (real DMA latency the submitter's few
-// bookkeeping instructions never race). The deferred thread posts the ring's HIGHEST tag counter
-// recorded at post time, not the captured token: two deferred posts can run out of order, and the
-// coalesced knote must never regress the "completed up to" counter (the listener walks
-// last+1..cnt, so the highest counter covers every pending batch on the ring).
-void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
-                               int64_t id, uint64_t token) {
-    if (!eq_identity || prosper_eq_identity(eq) != eq_identity) return;
-    // TWO tag dialects share the H896 binding call, discriminated by the binding's id (a2):
-    //   id = 0x74fe+ring (the FAPREventQueueListener channel, #208): tag = (ring<<58)|counter with
-    //     a ctor-seeded dense per-ring counter. The listener range-walks last+1..cnt, so the knote
-    //     coalesces per ring to the HIGHEST counter ("completed up to" — the kqueue semantics the
-    //     walk implements). Handled below with the per-ring HWM.
-    //   id = 0 (the IoDispatcher direct channel, #210 — live capture: H896(cb, ioDispatcherEq,
-    //     id=0, tag=REQUEST POINTER, 0, 7|0xf)): the tag is an opaque per-request pointer, NOT a
-    //     counter. Ring/HWM math on a pointer is nonsense (every post regressed to the max pointer
-    //     ever seen, and eq_post's (ident,filter) coalescing replaced still-pending completions —
-    //     two of the last three in-flight IoDispatcher reads never completed, which is exactly the
-    //     post-first-flip flush-async-loading hang: the packages behind those reads never advanced).
-    //     Post the EXACT tag, one distinct queued event per submit, no coalescing.
-    // CONFIDENCE: HIGH on the discrimination (both dialects live-captured; id 0x7501 tags are
-    // counters, id 0 tags are request pointers in every capture); MED on the id-0 event shape
-    // (ident=id=0 kept, guest consumes via GetEventData like the #208 listener).
-    if (id == 0) {
-        // ORDERED delivery is load-bearing here (issue #232, the DOLL FlushAsyncLoading wall). The
-        // ptr-tag is the guest's BATCH object pointer, and the consumer (eboot+0x22aa7d0 ->
-        // batch-retire 0x227e8e0) retires its in-flight list FROM THE HEAD *up to* the tagged batch,
-        // decrementing the in-flight batch counter [disp+0x30] once per retired node. Submission
-        // order == list order, so an event delivered OUT of submission order over-retires: the walk
-        // for the earlier batch's late event no longer finds it and marches through batches that are
-        // still in flight, driving [disp+0x30] past zero. The tail-flush gate
-        // (`if ([disp+0x30] <= 1) flush()` at eboot+0x227e7d3, UNSIGNED compare) then never passes
-        // again, the final partial batch never submits, and the GameThread spins in
-        // FlushAsyncLoading forever (~16k gettid/s) while every IO thread idles — 0 scene draws.
-        // The old per-post detached threads (independent 2 ms sleeps) made cross-post ordering a
-        // scheduler coin toss exactly under IO bursts. One FIFO worker + one modeled-latency sleep
-        // per batch preserves submission order by construction. CONFIDENCE: HIGH (retire-walk
-        // semantics from static disassembly; the stall's log signature — final ReadFile appended,
-        // no H896/ASoW after it, all delivered events balanced — matches exactly).
-        if (evlog()) fprintf(stderr, "[ev] AprPtrTagComplete tag=0x%llx -> eq=0x%llx scheduled\n",
-                             (unsigned long long)token, (unsigned long long)eq);
-        struct PtrPost { uint64_t eq, eq_identity, token; };
-        struct PtrQueue { std::mutex mx; std::condition_variable cv; std::deque<PtrPost> q; };
-        static PtrQueue* pq = new PtrQueue;   // immortal: the worker is detached and outlives exit
-        static std::atomic<bool> started{false};
-        if (!started.exchange(true)) std::thread([] {
+namespace {
+// RequestPointer dialect. The tag is the guest's own request/batch pointer, delivered exactly,
+// one distinct queued event per submit, never coalesced.
+//
+// ORDERED delivery is load-bearing here (issue #232, the DOLL FlushAsyncLoading wall). The
+// ptr-tag is the guest's BATCH object pointer, and the consumer (eboot+0x22aa7d0 ->
+// batch-retire 0x227e8e0) retires its in-flight list FROM THE HEAD *up to* the tagged batch,
+// decrementing the in-flight batch counter [disp+0x30] once per retired node. Submission
+// order == list order, so an event delivered OUT of submission order over-retires: the walk
+// for the earlier batch's late event no longer finds it and marches through batches that are
+// still in flight, driving [disp+0x30] past zero. The tail-flush gate
+// (`if ([disp+0x30] <= 1) flush()` at eboot+0x227e7d3, UNSIGNED compare) then never passes
+// again, the final partial batch never submits, and the GameThread spins in
+// FlushAsyncLoading forever (~16k gettid/s) while every IO thread idles -- 0 scene draws.
+// Independent per-post detached threads made cross-post ordering a scheduler coin toss under IO
+// bursts; one FIFO worker + one modeled-latency sleep per batch preserves submission order by
+// construction. Black Flag Resynced (id=1, heap-pointer tag, consumer dereferences event.data as
+// the request, eboot+0xacb3da) has the same shape and shares this path; ident is the binding's
+// id (0 for the IoDispatcher), which a pointer tag's ring bits (0 for any heap pointer) never
+// moved. CONFIDENCE: HIGH (retire-walk semantics from static disassembly; the stall's log
+// signature matches exactly); MED that Black Flag needs the ordering too (it is the same
+// consumer shape, not separately proven).
+void post_apr_request_pointer(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t token) {
+    if (evlog())
+        fprintf(stderr, "[ev] AprPtrTagComplete tag=0x%llx id=%lld -> eq=0x%llx scheduled\n",
+                (unsigned long long)token, (long long)id, (unsigned long long)eq);
+    struct PtrPost {
+        uint64_t eq, eq_identity, token;
+        int64_t id;
+    };
+    struct PtrQueue {
+        std::mutex mx;
+        std::condition_variable cv;
+        std::deque<PtrPost> q;
+    };
+    static PtrQueue* pq = new PtrQueue;   // immortal: the worker is detached and outlives exit
+    static std::atomic<bool> started{false};
+    if (!started.exchange(true))
+        std::thread([] {
             std::unique_lock<std::mutex> lk(pq->mx);
             for (;;) {
                 pq->cv.wait(lk, [] { return !pq->q.empty(); });
@@ -1866,70 +1860,74 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
                 struct timespec ts{ 0, 2000000 };   // 2 ms modeled DMA latency (as the #208 path)
                 nanosleep(&ts, nullptr);
                 for (auto& p : batch) {
-                    SceKEvent e{}; e.ident = 0; e.filter = EVFILT_AMPR_MODELED; e.data = (int64_t)p.token;
-                    // Both dialects hand the udata back; the guest reads it through the same
+                    SceKEvent e{};
+                    e.ident = p.id;
+                    e.filter = EVFILT_AMPR;
+                    e.data = (int64_t)p.token;
+                    // Every dialect hands the udata back; the guest reads it through the same
                     // accessor regardless of which one delivered the event.
-                    e.udata = prosper_eq_apr_udata(p.eq, 0);
+                    e.udata = prosper_eq_apr_udata(p.eq, p.id);
                     eq_post(p.eq, e, /*coalesce=*/false, p.eq_identity);
                 }
                 lk.lock();
             }
         }).detach();
-        { std::lock_guard<std::mutex> lk(pq->mx); pq->q.push_back({ eq, eq_identity, token }); }
-        pq->cv.notify_one();
-        return;
+    {
+        std::lock_guard<std::mutex> lk(pq->mx);
+        pq->q.push_back({eq, eq_identity, token, id});
     }
-    unsigned ring = (unsigned)(token >> 58) & 0x3f;
-    uint64_t cnt = token & ((1ull << 58) - 1);
-    // A THIRD consumer shares this id != 0 branch, and level coalescing is wrong for it (#1673).
-    //
-    // The branch's coalescing is justified by the #208 listener's range walk: it consumes
-    // `last+1 ..= cnt` and stores `last := cnt`, so one knote carrying the HIGHEST counter retires
-    // every batch below it — genuine kqueue "completed up to" level semantics. That justification
-    // rests entirely on the tag BEING a counter.
-    //
-    // CRI ADX2 (cri_ware_unity.prx; Tales of Graces f Remastered PPSA19991, Sonic Origins
-    // PPSA05325) binds through the same NID with a tag that is a literal ZERO (`xor ecx,ecx` at
-    // cri+0x11b88f) and waits with sceKernelWaitEqueue(..., NULL timeout), retrying until
-    // sceKernelGetEventId matches its id (cri+0x11ba65). Its "counter" therefore never advances:
-    // the high-water mark stays 0, every completion posts an IDENTICAL (ident, filter, data=0)
-    // event, and level coalescing collapses N discrete completions into ONE delivery. A CRI waiter
-    // that does not receive one blocks forever — there is no timeout to rescue it and no range walk
-    // to make the lost event redundant.
-    //
-    // So coalesce only when the tag really is a counter, and use the counter itself as the test.
-    // cnt == 0 cannot be a legitimate value in the #208 dialect: the guest's listener ctor seeds the
-    // per-ring counters at 0x3e8 (1000) with last-processed 0x3e7, counters are dense upward from
-    // there, and #180 already forbids posting cnt < 1000 on that channel because the listener's
-    // unconditional `last := cnt` store would REGRESS the seed. Every token with a nonzero counter
-    // therefore takes the pre-existing path with bit-identical behaviour — this cannot perturb the
-    // UE4/IoStore channel, which is the one #180 and #208 constrain.
-    //
-    // Live shape (PPSA19991, headless boot_trace, PROSPER_AMPRLOG=1 PROSPER_EVLOG=1): one shared
-    // equeue, 471 bound submits — 437 on the id == 0 pointer dialect (already non-coalescing since
-    // #210) and 34 on this branch, every one of them `token=0x0 (ring=0)`, with 22 sharing id=1 and
-    // so sharing one coalescing key.
-    //
-    // This restores the rule the other two completion sources already follow: a completion is a
-    // discrete COUNT, never a level (EOP #234, APR pointer-tag #210). The counter dialect is the
-    // single genuine exception, because there the counter value itself carries "completed up to".
-    // CONFIDENCE: HIGH on the CRI half (guest disassembly for the zero tag and the ident-only
-    // waiter, plus the live token census above); HIGH that the counter dialect is untouched (the
-    // predicate is false for every token it can produce).
-    const bool counter_dialect = cnt != 0;
+    pq->cv.notify_one();
+}
+
+// ConstantZero dialect (#1673). CRI ADX2 (cri_ware_unity.prx; Tales of Graces f Remastered
+// PPSA19991, Sonic Origins PPSA05325) binds with a tag that is a literal ZERO (`xor ecx,ecx` at
+// cri+0x11b88f), submits with the two-argument sceKernelAprSubmitCommandBuffer (cri+0x11b90b)
+// and blocks in sceKernelWaitEqueue(..., NULL timeout), retrying until sceKernelGetEventId
+// matches its id (cri+0x11ba65). The wait tests the event IDENT, never the tag, and nothing
+// advances, so every completion is an IDENTICAL (ident, filter, data) event and level
+// coalescing would collapse N discrete completions into one -- a waiter that misses one blocks
+// forever. Posted individually, with the tag's own ring bits as before.
+// Live shape (PPSA19991, headless boot_trace): one shared equeue, 471 bound submits -- 437 on
+// the id == 0 pointer dialect and 34 here, all `token=0x0`, 22 sharing id=1.
+// CONFIDENCE: HIGH (guest disassembly for the zero tag and the ident-only waiter, plus the census).
+void post_apr_constant_zero(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t token) {
+    const unsigned ring = (unsigned)(token >> 58) & 0x3f;
+    if (evlog())
+        fprintf(stderr,
+                "[ev] AprTagComplete token=0x%llx (ring=%u id=%lld) -> eq=0x%llx scheduled\n",
+                (unsigned long long)token, ring, (long long)id, (unsigned long long)eq);
+    std::thread([eq, eq_identity, id, ring, token] {
+        struct timespec ts{0, 2000000};   // 2 ms
+        nanosleep(&ts, nullptr);
+        apr_post(eq, eq_identity, id, ring, token, /*coalesce=*/false,
+                 prosper_eq_apr_udata(eq, id));
+    }).detach();
+}
+
+// Counter dialect (#180/#208, the UE4 FAPREventQueueListener channel). The listener consumes
+// `last+1 ..= cnt` and stores `last := cnt`, so one knote carrying the HIGHEST counter retires
+// every batch below it -- genuine kqueue "completed up to" level semantics, which is why this is
+// the ONLY dialect that coalesces. The deferred thread posts the ring's highest counter recorded
+// at post time, not the captured token: two deferred posts can run out of order, and the
+// coalesced knote must never regress the counter. Only this dialect feeds the high-water mark;
+// a pointer or zero tag on the same (eq, ring) must not poison it.
+// CONFIDENCE: HIGH (both ends live-captured and disassembled; see the block comment above).
+void post_apr_counter(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t token) {
+    const unsigned ring = (unsigned)(token >> 58) & 0x3f;
+    const uint64_t cnt = token & ((1ull << 58) - 1);
     const uint64_t hwm_key = apr_hwm_key(eq_identity, ring);
     {
         AprTokenState& state = apr_token_state();
         std::lock_guard lk(state.mx);
         if (cnt > state.tag_hwm[hwm_key]) state.tag_hwm[hwm_key] = cnt;
     }
-    // `id` is on this line because it is the COALESCING KEY (apr_post posts ident = id + ring) and
-    // was previously unprintable: joining a completion back to its binding meant guessing from the
-    // interleaving of a multi-threaded log, which silently mis-attributes every post.
-    if (evlog()) fprintf(stderr, "[ev] AprTagComplete token=0x%llx (ring=%u id=%lld) -> eq=0x%llx scheduled\n",
-                         (unsigned long long)token, ring, (long long)id, (unsigned long long)eq);
-    std::thread([eq, eq_identity, id, ring, hwm_key, counter_dialect] {
-        struct timespec ts{ 0, 2000000 };   // 2 ms
+    // `id` is on this line because it is the COALESCING KEY (apr_post posts ident = id + ring).
+    if (evlog())
+        fprintf(stderr,
+                "[ev] AprTagComplete token=0x%llx (ring=%u id=%lld) -> eq=0x%llx scheduled\n",
+                (unsigned long long)token, ring, (long long)id, (unsigned long long)eq);
+    std::thread([eq, eq_identity, id, ring, hwm_key] {
+        struct timespec ts{0, 2000000};   // 2 ms
         nanosleep(&ts, nullptr);
         uint64_t hwm;
         {
@@ -1937,10 +1935,29 @@ void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity,
             std::lock_guard lk(state.mx);
             hwm = state.tag_hwm[hwm_key];
         }
-        // Resolved BEFORE the post, not inside it: apr_post runs with no APR lock held on purpose.
-        apr_post(eq, eq_identity, id, ring, ((uint64_t)ring << 58) | hwm, counter_dialect,
+        // Resolved BEFORE the post: apr_post runs with no APR lock held on purpose.
+        apr_post(eq, eq_identity, id, ring, ((uint64_t)ring << 58) | hwm, /*coalesce=*/true,
                  prosper_eq_apr_udata(eq, id));
     }).detach();
+}
+}   // namespace
+// Post the completion for a bound command buffer, delivered per the binding's DIALECT (classified
+// once at bind time, apr_event_dialect.hpp). Deferred ~2 ms so the guest finishes installing its
+// tracking slot/hash entry first (real DMA latency the submitter's bookkeeping never races).
+void prosper_eq_post_apr_event(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t token,
+                               AprDialect dialect) {
+    if (!eq_identity || prosper_eq_identity(eq) != eq_identity) return;
+    switch (dialect) {
+        case AprDialect::RequestPointer:
+            post_apr_request_pointer(eq, eq_identity, id, token);
+            return;
+        case AprDialect::ConstantZero: post_apr_constant_zero(eq, eq_identity, id, token); return;
+        case AprDialect::Counter: post_apr_counter(eq, eq_identity, id, token); return;
+    }
+}
+// Dialect-less entry for callers that hold only the bind arguments (tests, the deferred tail).
+void prosper_eq_post_apr_token(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t token) {
+    prosper_eq_post_apr_event(eq, eq_identity, id, token, classify_apr_dialect(id, token));
 }
 // Assign the next completion token for `ring` (0-based, 6 bits) — for UNBOUND submits only, whose
 // token the engine consumes through the ASoW out slots / completion record (record-polled; no
