@@ -21,6 +21,20 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-03
 
+### Hollow Knight: Silksong's menu text is back
+
+Every menu string in Silksong was missing; it now renders, from the title menu through profile select, the setup screens, the pause menu and the inventory ([tracker #4121](https://github.com/mattias800/prosper/issues/4121)).
+
+<p align="center"><img src="assets/screenshots/silksong-title-menu-before.webp" alt="Hollow Knight: Silksong title screen before the fix: logo and selection cursors render but the Start Game, Options and Extras labels are missing; Linux prosper-app, recorded snaps route, flip 1398"></p>
+<p align="center"><img src="assets/screenshots/silksong-title-menu.webp" alt="Hollow Knight: Silksong title screen after the fix with Start Game, Options and Extras and the 1.0.30021 version label; headless Linux prosper-app replay of the recorded snaps route, flip 1398"></p>
+<p align="center"><img src="assets/screenshots/silksong-select-profile.webp" alt="Hollow Knight: Silksong Select Profile screen with four New Game cards numbered 1 to 4 and Back; headless Linux prosper-app replay of the recorded snaps route, flip 5519"></p>
+<p align="center"><img src="assets/screenshots/silksong-brightness-setup.webp" alt="Hollow Knight: Silksong brightness setup with the Adjust brightness text, the Brightness 100% slider and Done; headless Linux prosper-app replay of the recorded snaps route, flip 6846"></p>
+<p align="center"><img src="assets/screenshots/silksong-moss-grotto.webp" alt="Hollow Knight: Silksong, Hornet in Moss Grotto under the MOSS GROTTO area title with the HUD; Linux prosper-app, the owner playing"></p>
+<p align="center"><img src="assets/screenshots/silksong-gameplay-hornet.webp" alt="Hollow Knight: Silksong gameplay, Hornet beside the shrine in Moss Grotto; Linux prosper-app, the owner playing"></p>
+<p align="center"><img src="assets/screenshots/silksong-pause-menu.webp" alt="Hollow Knight: Silksong pause menu with Continue, Options and Quit to Menu; Linux prosper-app, the owner playing"></p>
+<p align="center"><img src="assets/screenshots/silksong-inventory.webp" alt="Hollow Knight: Silksong inventory showing Hunter's Cloak and its description; Linux prosper-app, the owner playing"></p>
+<p align="center"><img src="assets/screenshots/silksong-gameplay-credits.webp" alt="Hollow Knight: Silksong gameplay in Moss Grotto with the opening credit overlay; Linux prosper-app, the owner playing"></p>
+
 ### 007 First Light reaches its title screen
 
 007 First Light now reaches its full title screen, with Bond's artwork and the “Press X to play” prompt rendering correctly ([tracker #4021](https://github.com/mattias800/prosper/issues/4021#issuecomment-5968286196)).

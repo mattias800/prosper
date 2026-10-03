@@ -1613,6 +1613,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
             compiled.addr_v = manual_compare ? resource.addr_uvw[1] : 0u;
             compiled.border_color_type = manual_compare ? resource.border_color_type : 0u;
             compiled.normalize_unnormalized_coordinates = normalize_unnormalized;
+            compiled.emitted_dst_sel = compile_key_dst_sel(resource);
             key.resources.push_back(compiled);
         }
     }
@@ -9394,6 +9395,16 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
                 // (registered_shader_dwords is guest_readable-checked and capped at 0x4000 dwords ==
                 // 64 KiB), not a fixed 0x10000 — a short shader at the tail of its mapping would
                 // otherwise over-read past the mapped page into a SIGSEGV inside the dump (#1209).
+                // #4273: keep each distinct refused compute program by default, bounded.
+                if (shader_dwords) {
+                    char detail[96];
+                    snprintf(detail, sizeof detail, "dispatch groups=%ux%ux%u",
+                             launch.groups_x, launch.groups_y, launch.groups_z);
+                    note_refused_shader(
+                        "cs", code_addr,
+                        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                        std::min(shader_dwords, size_t(0x4000)), detail);
+                }
                 if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
                     const size_t dump_bytes = std::min(shader_dwords * sizeof(uint32_t), size_t(0x10000));
                     char fn[512];

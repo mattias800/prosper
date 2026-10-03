@@ -231,6 +231,97 @@ HLE(s_share_content_param) {
     return a0 ? 0 : 0x81960002ull; // SCE_SHARE_ERROR_INVALID_PARAM (Kyty libShare.cpp)
 }
 
+
+// --- libSceNpUniversalDataSystem event property objects and arrays (#4275). -------------------------
+// Silksong builds activity telemetry from standalone property objects and arrays. Live shapes
+// (PROSPER_SVCLOG-equivalent probe, PPSA12544):
+//   CreateEventPropertyObject(Object** out)     CreateEventPropertyArray(Array** out)
+//   EventPropertyArraySetString(Array*, const char* value)
+//   EventPropertyObjectSetArray(Object*, const char* key, Array*)
+//   DestroyEventPropertyObject(Object*)         DestroyEventPropertyArray(Array*)
+// Unregistered, the Create calls returned SCE_OK without writing *out, and the guest went on to
+// set, attach and destroy whatever stale value that slot already held (Destroy received exactly the
+// out-slot's previous contents). Each handle is a real zeroed host block -- in case a title reads
+// through it -- recorded with its kind, so set/attach/destroy can be validated against what was
+// actually created. Nothing is recorded or transmitted: an offline console keeps no telemetry.
+// CONFIDENCE: HIGH for the argument shapes (live capture), MED for the invalid-argument code
+// (shared with the rest of this library's handlers).
+namespace {
+enum class UdsKind : uint8_t { Object, Array };
+std::mutex g_uds_mx;
+std::unordered_map<uint64_t, UdsKind>& uds_live() {
+    static std::unordered_map<uint64_t, UdsKind> live;
+    return live;
+}
+constexpr uint64_t kUdsInvalidArgument = 0x80550003ull;   // SCE_NP_ERROR_INVALID_ARGUMENT
+constexpr size_t kUdsHandleBytes = 256;
+uint64_t uds_create(uint64_t out, UdsKind kind) {
+    if (!svc_ptrish(out)) return kUdsInvalidArgument;
+    void* block = std::calloc(1, kUdsHandleBytes);
+    if (!block) return 0x80550001ull;   // SCE_NP_ERROR_OUT_OF_MEMORY
+    const uint64_t handle = (uint64_t)(uintptr_t)block;
+    {
+        std::lock_guard lock(g_uds_mx);
+        uds_live()[handle] = kind;
+    }
+    *(uint64_t*)PW(out) = handle;
+    return 0;
+}
+bool uds_is(uint64_t handle, UdsKind kind) {
+    std::lock_guard lock(g_uds_mx);
+    const auto it = uds_live().find(handle);
+    return it != uds_live().end() && it->second == kind;
+}
+uint64_t uds_destroy(uint64_t handle, UdsKind kind) {
+    {
+        std::lock_guard lock(g_uds_mx);
+        const auto it = uds_live().find(handle);
+        if (it == uds_live().end() || it->second != kind) return kUdsInvalidArgument;
+        uds_live().erase(it);
+    }
+    std::free(PW(handle));
+    return 0;
+}
+}  // namespace
+HLE(s_npuds_create_property_object) {
+    svc_log("sceNpUniversalDataSystemCreateEventPropertyObject", a0,a1,a2,a3,a4,a5);
+    return uds_create(a0, UdsKind::Object);
+}
+HLE(s_npuds_create_property_array) {
+    svc_log("sceNpUniversalDataSystemCreateEventPropertyArray", a0,a1,a2,a3,a4,a5);
+    return uds_create(a0, UdsKind::Array);
+}
+HLE(s_npuds_array_set_string) {
+    svc_log("sceNpUniversalDataSystemEventPropertyArraySetString", a0,a1,a2,a3,a4,a5);
+    if (!uds_is(a0, UdsKind::Array) || !svc_ptrish(a1)) return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_object_set_array) {
+    svc_log("sceNpUniversalDataSystemEventPropertyObjectSetArray", a0,a1,a2,a3,a4,a5);
+    if (!uds_is(a0, UdsKind::Object) || !svc_ptrish(a1) || !uds_is(a2, UdsKind::Array))
+        return kUdsInvalidArgument;
+    return 0;
+}
+HLE(s_npuds_destroy_property_object) {
+    svc_log("sceNpUniversalDataSystemDestroyEventPropertyObject", a0,a1,a2,a3,a4,a5);
+    return uds_destroy(a0, UdsKind::Object);
+}
+HLE(s_npuds_destroy_property_array) {
+    svc_log("sceNpUniversalDataSystemDestroyEventPropertyArray", a0,a1,a2,a3,a4,a5);
+    return uds_destroy(a0, UdsKind::Array);
+}
+
+// sceNpSessionSignalingInitialize(const InitParam*): Silksong passes an input-only parameter block
+// (a version word, a size and thread attributes) and reads no out-parameter. Signaling is the
+// peer-connection layer of online sessions; initialising it needs no network, so an offline console
+// succeeds here and fails later, at the first call that would actually reach a peer. A null block is
+// refused. CONFIDENCE: MED (live call shape; no reference for the error value beyond the library's
+// family code).
+HLE(s_np_session_signaling_initialize) {
+    svc_log("sceNpSessionSignalingInitialize", a0,a1,a2,a3,a4,a5);
+    return svc_ptrish(a0) ? 0 : kUdsInvalidArgument;
+}
+
 // --- libSceNpUniversalDataSystem (PS5 telemetry/activities): hand out ids, stay inert. ----------
 // PS5-only, no reference implementation; by symmetry with every Np Create* API the first arg of
 // CreateContext/CreateHandle is the out-id pointer (pointer-range-guarded so a wrong guess can't
@@ -570,6 +661,13 @@ void register_np_hle() {
                      "sceNpUniversalDataSystemDestroyEvent");
     Hle::register_fn("MfDb+4Nln64", (HleFn)s_npuds_object_set_string,
                      "sceNpUniversalDataSystemEventPropertyObjectSetString");
+    Hle::register_fn("ysmw6J-P8Ak", (HleFn)s_np_session_signaling_initialize, "sceNpSessionSignalingInitialize");
+    Hle::register_fn("4llLk7YJRTE", (HleFn)s_npuds_array_set_string, "sceNpUniversalDataSystemEventPropertyArraySetString");
+    Hle::register_fn("Wxbg5x3pTXA", (HleFn)s_npuds_object_set_array, "sceNpUniversalDataSystemEventPropertyObjectSetArray");
+    Hle::register_fn("kKUH0Viib3c", (HleFn)s_npuds_destroy_property_object, "sceNpUniversalDataSystemDestroyEventPropertyObject");
+    Hle::register_fn("W-0xwY0ZMjw", (HleFn)s_npuds_destroy_property_array, "sceNpUniversalDataSystemDestroyEventPropertyArray");
+    Hle::register_fn("Hm7qubT3b70", (HleFn)s_npuds_create_property_array, "sceNpUniversalDataSystemCreateEventPropertyArray");
+    Hle::register_fn("s6W4Zl4Slgk", (HleFn)s_npuds_create_property_object, "sceNpUniversalDataSystemCreateEventPropertyObject");
 #ifndef _WIN32
     // NetCtl offline-console state delivery — default ON since #306 (see block comment above).
     // PROSPER_NETCTL_CB=0 restores the previous unimplemented behavior.

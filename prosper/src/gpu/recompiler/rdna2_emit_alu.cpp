@@ -5,6 +5,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/storage_dst_sel.hpp"
 #include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#325)
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -8206,7 +8207,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t sample = ms ? vread(coord_vgpr(ncoord)) : 0;   // MSAA sample index = coord after the spatial ones
                 if (is_ld) {
                     uint32_t out[4]; b.image_read(res->binding, dim, arrayed, ncoord, coords, out, ms, sample);
-                    if (!write_mimg_results(out)) { ok = false; return true; }
+                    // T# DST_SEL, forward (#4274): see storage_dst_sel.hpp.
+                    int channel[4]; uint32_t constant[4];
+                    if (!storage_load_selects(res->swizzle, res->format, channel, constant)) { ok = false; return true; }
+                    uint32_t routed_out[4];
+                    for (uint32_t k = 0; k < 4u; ++k)
+                        routed_out[k] = channel[k] >= 0 ? out[channel[k]] : b.uconst(constant[k]);
+                    if (!write_mimg_results(routed_out)) { ok = false; return true; }
                 } else if (is_st) {
                     // image_store: gather the VDATA VGPRs selected by dmask into an RGBA texel (channels
                     // absent from dmask store as 0). Under a narrowed EXEC (e.g. a grid-tail bounds check),
@@ -8220,7 +8227,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             : vread(vd + w);
                         ++w;
                     }
-                    b.image_write(res->binding, dim, arrayed, ncoord, coords, vals, rs.exec_narrowed, rs.exec);
+                    // T# DST_SEL, inverse (#4120): stored channel c receives the VDATA component whose
+                    // selector names c. See storage_dst_sel.hpp for the evidence and refusals.
+                    int source[4];
+                    if (!storage_store_sources(res->swizzle, components, source)) { ok = false; return true; }
+                    uint32_t routed[4];
+                    for (uint32_t c = 0; c < 4u; ++c)
+                        routed[c] = source[c] >= 0 ? vals[source[c]] : b.uconst(0);
+                    b.image_write(res->binding, dim, arrayed, ncoord, coords, routed, rs.exec_narrowed, rs.exec);
                 } else {
                     // IMAGE_ATOMIC_SWAP/ADD reads its operand from VDATA. GLC=1 overwrites that VGPR
                     // with the pre-operation texel; GLC=0 leaves VDATA unchanged. The helper's phi

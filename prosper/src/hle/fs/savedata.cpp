@@ -955,6 +955,55 @@ HLE(s_savedata_setparam) {
     return 0;
 }
 
+// sceSaveDataSaveIcon(const SceSaveDataMountPoint* mp, const SceSaveDataIcon* icon) (#4275).
+// Live shape (Silksong, PPSA12544): mp is "/savedata0"; icon is { void* buf @+0x00, size_t bufSize
+// @+0x08, size_t dataSize @+0x10, reserved }, with buf holding a PNG (776x436 in that capture). The
+// icon is part of the save, so it is written beside the save's parameter block at
+// `<save dir>/sce_sys/icon0.png`, the same `sce_sys` directory a console save carries. It was
+// unregistered, so the dispatcher answered SCE_OK and the icon was silently discarded.
+//   null/wrong mount point, null icon, null buffer, empty data, dataSize > bufSize  -> PARAMETER
+//   nothing mounted                                                                    -> NOT_MOUNTED
+//   the host write failed                                                              -> INTERNAL
+// The file is written to a temporary name and renamed, so a failed write never leaves a truncated
+// icon behind. CONFIDENCE: HIGH for the struct (live), MED for the refusal codes, which follow this
+// file's existing Set/GetParam contract.
+HLE(s_savedata_saveicon) {
+    svc_log("sceSaveDataSaveIcon", a0,a1,a2,a3,a4,a5);
+    if (!savedata_mount_point_ok(a0) || !a1) return SAVE_DATA_ERR_PARAMETER;
+    const uint8_t* icon = (const uint8_t*)PW(a1);
+    uint64_t buf = 0, buf_size = 0, data_size = 0;
+    memcpy(&buf, icon + 0x00, sizeof buf);
+    memcpy(&buf_size, icon + 0x08, sizeof buf_size);
+    memcpy(&data_size, icon + 0x10, sizeof data_size);
+    if (!buf || !data_size || data_size > buf_size) return SAVE_DATA_ERR_PARAMETER;
+    const std::string dir = savedata0_mounted_dir();
+    if (dir.empty()) return SAVE_DATA_ERR_NOT_MOUNTED;
+    const std::filesystem::path sys = std::filesystem::path(dir) / "sce_sys";
+    std::error_code ec;
+    std::filesystem::create_directories(sys, ec);
+    const std::filesystem::path final_path = sys / "icon0.png";
+    const std::filesystem::path temp_path = sys / "icon0.png.tmp";
+    bool written = false;
+    if (FILE* f = fopen(temp_path.string().c_str(), "wb")) {
+        written = fwrite(PW(buf), 1, (size_t)data_size, f) == (size_t)data_size;
+        written = (fclose(f) == 0) && written;
+    }
+    if (written) {
+        std::filesystem::rename(temp_path, final_path, ec);
+        written = !ec;
+    }
+    if (!written) {
+        std::filesystem::remove(temp_path, ec);
+        fprintf(stderr, "[svc] sceSaveDataSaveIcon: could not write \"%s\"\n",
+                final_path.string().c_str());
+        return SAVE_DATA_ERR_INTERNAL;
+    }
+    if (svclog())
+        fprintf(stderr, "[svc]   SaveIcon %llu bytes -> %s\n", (unsigned long long)data_size,
+                final_path.string().c_str());
+    return 0;
+}
+
 HLE(s_savedata_getparam) {
     svc_log("sceSaveDataGetParam", a0,a1,a2,a3,a4,a5);
     const uint32_t type = (uint32_t)a1;
@@ -1297,6 +1346,7 @@ void register_savedata_hle() {
     Hle::register_fn("ie7qhZ4X0Cc", (HleFn)s_savedata_commit,    "sceSaveDataCommit");
     // #2786: both were unregistered, so both answered SCE_OK while storing and reading nothing.
     Hle::register_fn("85zul--eGXs", (HleFn)s_savedata_setparam,  "sceSaveDataSetParam");
+    Hle::register_fn("c88Yy54Mx0w", (HleFn)s_savedata_saveicon,  "sceSaveDataSaveIcon");
     Hle::register_fn("XgvSuIdnMlw", (HleFn)s_savedata_getparam,  "sceSaveDataGetParam");
     Hle::register_fn("dyIhnXq-0SM", (HleFn)s_savedata_dirsearch, "sceSaveDataDirNameSearch");
     Hle::register_fn("65VH0Qaaz6s", (HleFn)s_savedata_mountinfo, "sceSaveDataGetMountInfo");  // was MISSING -> garbage free-space

@@ -94,6 +94,7 @@ time and retains diagnostic metadata. It does not validate or complete a guest f
   parentage.
 - `draw_program_skip` — naming a graphics shader program, to census it or to decline every draw
   that uses it.
+- `refused_shader_dump` — on by default: each distinct refused shader (vertex, pixel or compute) is written once per run, with an index line naming its first unsupported instruction, into `refused_shaders_*/` under `PROSPER_CAPTURE_DIR`. Bounded and deduplicated by code hash, so it costs nothing on a clean run. `PROSPER_SHADER_DUMP` remains the unbounded opt-in.
 - `shader_dump_filter` — `PROSPER_SHADER_DUMP_PROGRAM`, which narrows `PROSPER_SHADER_DUMP_SUCCESS`
   to named guest programs. It fails **open** where the skip selectors fail closed, and the header
   explains why: an empty dump directory reads as "that program never compiled".
