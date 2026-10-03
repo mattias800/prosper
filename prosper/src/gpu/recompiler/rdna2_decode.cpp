@@ -205,8 +205,11 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
             if (in.opcode == 0x77u || in.opcode == 0xffu) return 4;
             return 0;
         case Rdna2Format::MUBUF:
-            // Format and raw stores read VDATA. Loads use the gfx10 ordering where x3 follows x4.
+            // Format, byte/short and raw stores read VDATA. Loads use the gfx10 ordering where
+            // x3 follows x4. The byte/short stores are 0x18 buffer_store_byte, 0x19 its _d16_hi
+            // form, 0x1a buffer_store_short and 0x1b its _d16_hi form (#4243).
             if ((in.opcode >= 0x04u && in.opcode <= 0x07u) ||
+                (in.opcode >= 0x18u && in.opcode <= 0x1bu) ||
                 (in.opcode >= 0x1cu && in.opcode <= 0x1fu))
                 return 0;
             if (in.opcode <= 0x03u) return in.opcode + 1u;
@@ -237,6 +240,19 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
                 case 0x0du: return 2;
                 case 0x0eu: return 4;
                 case 0x0fu: return 3;
+                // D16 narrow loads write one VGPR, preserving the other half of the destination,
+                // so they are a read-modify-write of one register (#4243: 0x20 ubyte_d16,
+                // 0x21 ubyte_d16_hi, 0x22 sbyte_d16, 0x23 sbyte_d16_hi, 0x24 short_d16,
+                // 0x25 short_d16_hi). Atomics with GLC also return a value but stay uncounted:
+                // FLAT/GLOBAL address forms stay fail-closed in the recompiler, so counting the
+                // loads is the only lowering-reachable fix; the atomic policy is decided when an
+                // atomic lowering lands.
+                case 0x20u:
+                case 0x21u:
+                case 0x22u:
+                case 0x23u:
+                case 0x24u:
+                case 0x25u: return 1;
                 default: return 0; // audited store/deferred forms do not produce a VGPR result.
             }
         case Rdna2Format::MIMG: {
@@ -286,6 +302,8 @@ uint32_t rdna2_vgpr_destination_span(const Rdna2Inst& in) {
         case Rdna2Format::MUBUF:
             if (in.opcode >= 0x04u && in.opcode <= 0x07u) span = in.opcode - 3u;
             else if (in.opcode == 0x1cu) span = 1;
+            else if (in.opcode >= 0x18u && in.opcode <= 0x1bu)
+                span = 1;   // byte/short stores (#4243)
             else if (in.opcode == 0x1du) span = 2;
             else if (in.opcode == 0x1eu) span = 4;
             else if (in.opcode == 0x1fu) span = 3;
