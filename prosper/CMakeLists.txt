@@ -3113,6 +3113,12 @@ endif()
     SOURCES tests/gpu/execute/test_compute_program_facts.cpp
     LIBRARIES prosper_core)
 
+  # Actual CPU draw/dispatch refusal producers: original versions, warm observation and cap evidence.
+  prosper_add_gtest(test_refused_shader_producer
+    SOURCES tests/gpu/execute/test_refused_shader_producer.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
   # shader_histo: data-driven recompiler-coverage report over the game's real embedded RDNA2 shaders.
   add_executable(shader_histo tools/shader_histo/shader_histo.cpp)
   target_link_libraries(shader_histo PRIVATE prosper_core)
