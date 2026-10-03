@@ -12,7 +12,7 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   alongside numeric source-word MBCNT at owned logical lane positions, then records raw EXP
   metadata/payload instead of killing physical workers or writing a framebuffer. It is NOT a
   raster fallback: missing
-  register/slot state, interpolation, FP arithmetic, image/memory effects and repeated exports
+  slot/mask/scalar state, unsupported interpolation, FP arithmetic, image/memory effects and repeated exports
   refuse transactionally. `fragment_packet_contract` evaluates actual emitted uint sinks from
   project-owned packets; `spv_validate` emits this entry separately. No live DrawItem enters it.
   Quad consumers additionally require the supplied consecutive-logical-quad topology tag; it grants
@@ -30,8 +30,14 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   `fragment_packet_f32` preserves explicit input/output denorm and rounding modes in integer
   arithmetic; nonfinite/overflow and non-exact interpolation remain named runtime failures.
   All64 workers rendezvous and append sticky statuses; ANY failure prevents the consumer from
-  publishing ANY raw EXP record. Integer packet ABI/native paths remain separate. Complete supplied
-  VGPR backing is mandatory, and this does not initialize guest inputs from host raster records,
+  publishing ANY raw EXP record. Integer packet ABI/native paths remain separate. Missing/partial
+  VGPR columns activate the appended VGP1 per-logical-lane validity contract; full-dword masked
+  writers establish scratch definitions, never launch input authority. Direct/implicit P2/wide
+  image reads, EXEC-ignoring selected peers and even inactive enabled raw EXP payload must have
+  genuine values. `fragment_packet_definedness` checks reads before overlapping writes and keeps
+  the first failure; READLANE validity uses the existing uniform phase. Completed consumers must
+  validate all64 records and the original-site whitelist before publishing any EXP. Fully supplied
+  legacy packets keep their unextended wire format. This does not initialize inputs from host raster records,
   enable implicit/bias sampling, establish live resource epochs, or admit any real DrawItem.
   `fragment_packet_special_f32` supplies integer-backed RCP/SQRT/direct RSQ, choosing correctly
   rounded software results within the published approximation envelope, not AMD-unit bit identity.
@@ -39,6 +45,12 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   Retained producing PS RSRC2 must prove no handler, or disabled relevant floating exceptions and
   DEBUG; MODE/STATUS observation remains unsupported. NaN payloads and negative roots remain
   transactional named runtime failures, not guessed canonical values. This is not full special FP.
+- `fragment_packet_vgpr_requirements` inventories exact immutable raw program storage/read facts,
+  pinned by the existing ShaderCodeAnalysis owner and consumed by shipping draw preparation.
+  A structural writer is not proof of a value on EXEC-off lanes; runtime validity and real entry
+  mask/helper/system/composition/commit authority remain separate obligations. The CPU-only
+  `PROSPER_VGPR_DEFINEDNESS_SPV_DIRECTORY` diagnostic retains actual emitted SOURCE for validation;
+  unset writes no files and never changes guest lowering or admission.
 - `spirv_builder` — small hand-built SPIR-V modules. **These include shipped shaders**:
   `frontends/shared/live/live_compute.cpp`'s `prepare_compare_pipeline()` feeds
   `build_compute_compare_uvec4()` straight to `vkCreateShaderModule` on the live path. The GPU

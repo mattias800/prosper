@@ -222,7 +222,19 @@ int main(int argc, char** argv) {
     m::Case varying; varying.source = m::Source::Vgpr;
     missing = m::packet(varying);
     std::erase_if(missing.vgprs, [](const auto& value) { return value.reg == 5; });
-    refuse(missing, "packet-vgpr-input-unavailable", "missing supplied vector source");
+    const auto runtime_refuse = [&](const auto& input, const std::string& reason,
+                                    const char* name) {
+        const auto program = prosper::gpu::recompile_fragment_packet(input);
+        check(!program.spirv.empty(), std::string(name) + " emits actual validity obligation");
+        if (program.spirv.empty()) return;
+        bpermute_oracle::Interpreter vm(program.spirv);
+        const auto words = vm.run_packet(program.input_words, program.output_words);
+        const auto result = prosper::gpu::decode_fragment_packet(program, words, vm.error.empty());
+        check(vm.error.empty(), std::string(name) + " completes typed SOURCE");
+        check(result.exports.empty() && result.rejection == reason,
+              std::string(name) + " refuses ALL output");
+    };
+    runtime_refuse(missing, "packet-vgpr-read-before-definition", "missing supplied vector source");
     m::Case only63 = varying; only63.exec = uint64_t(1) << 63;
     const auto owned_inactive = m::packet(only63);
     check(!(owned_inactive.exec_mask & (uint64_t(1) << 31)) &&
@@ -233,7 +245,24 @@ int main(int argc, char** argv) {
     refuse(missing, "packet-invocation-state-unavailable", "missing EXEC-off/export-ineligible slot");
     missing = m::packet(varying);
     std::erase_if(missing.vgprs, [](const auto& value) { return value.reg == 1; });
-    refuse(missing, "packet-vgpr-input-unavailable", "missing predicated old destination");
+    {
+        const auto program = prosper::gpu::recompile_fragment_packet(missing);
+        check(!program.spirv.empty(),
+              "full EXEC writer-only MBCNT destination does not need entry input");
+        if (!program.spirv.empty()) {
+            bpermute_oracle::Interpreter vm(program.spirv);
+            const auto words = vm.run_packet(program.input_words, program.output_words);
+            const auto result =
+                prosper::gpu::decode_fragment_packet(program, words, vm.error.empty());
+            check(vm.error.empty() && result.rejection.empty(),
+                  "writer-only MBCNT typed SOURCE completes");
+            compare(result.exports, m::expected(varying), "writer-only MBCNT all64 raw EXP");
+        }
+    }
+    missing = m::packet(only63);
+    std::erase_if(missing.vgprs, [](const auto& value) { return value.reg == 1; });
+    runtime_refuse(missing, "packet-vgpr-raw-export-unavailable",
+                   "missing predicated old inactive destination");
 
     const auto operand_control = [&](uint32_t source, bool accumulator, const std::string& reason,
                                      const std::string& name, bool exact = true) {

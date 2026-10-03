@@ -2,6 +2,7 @@
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/fragment_packet_services.hpp"
+#include "gpu/recompiler/fragment_packet_definedness.hpp"
 #include <bitset>
 
 namespace prosper::gpu {
@@ -258,12 +259,6 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
             if (exports.size() >= 64) return reject("packet-export-budget", in.pc);
             exports.emplace(in.pc, static_cast<uint32_t>(exports.size()));
         }
-        const auto need_vgpr = [&](int reg) { return columns.contains(reg); };
-        // VOP3 storage calls the low field VDST, but READLANE architecturally writes an SGPR.
-        // Use the decoder's opcode-aware writer inventory, not its overlapping field spelling.
-        for (uint32_t word = 0; word < rdna2_vgpr_write_count(in); ++word)
-            if (!need_vgpr(in.dst.value + static_cast<int>(word)))
-                return reject("packet-vgpr-input-unavailable", in.pc);
         bool invalid_scalar_write = false;
         for_each_scalar_write(in, [&](int reg, uint32_t width) {
             const bool mask_pair = in.fmt == Rdna2Format::SOP1 &&
@@ -282,8 +277,6 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         for (uint32_t source = 0; source < in.n_src; ++source) {
             if (in.fmt == Rdna2Format::EXP && !(in.exp_en & (1u << source))) continue;
             const auto& operand = in.src[source];
-            if (operand.kind == OperandKind::VGPR && !need_vgpr(operand.value))
-                return reject("packet-vgpr-input-unavailable", in.pc);
             if (operand.kind == OperandKind::SGPR) {
                 if (pair_source && ((operand.value & 1) || operand.value > 104))
                     return reject("packet-scalar-pair-input-invalid", in.pc);
@@ -309,8 +302,20 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         if (const auto* gap = packet_resource_preflight(services->input, ins, scalar_failure_pc))
             return reject(gap, scalar_failure_pc);
 
+    const auto requirements = fragment_packet_vgpr_requirements(packet.guest_code, ins);
+    if (!requirements.rejection.empty()) return reject(requirements.rejection);
+    bool runtime_definedness = false;
+    for (uint32_t reg = 0; reg < 256; ++reg)
+        if (requirements.storage.test(reg)) {
+            const auto column = columns.find(reg);
+            runtime_definedness |= column == columns.end() ||
+                                   packet.vgprs[column->second].available_mask != UINT64_MAX;
+        }
+    runtime_definedness &= !requirements.reads.empty();
+
     FragmentPacketProgram result;
-    result.input_stride = static_cast<uint32_t>(columns.size()) + 4;
+    result.input_stride =
+        static_cast<uint32_t>(columns.size()) * (runtime_definedness ? 2u : 1u) + 4;
     result.exports_per_lane = static_cast<uint32_t>(exports.size());
     const uint32_t record_stride = result.exports_per_lane * kFragmentPacketExportWords;
     result.input_words.resize(kFragmentPacketLanes * result.input_stride);
@@ -319,10 +324,15 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         const uint32_t base = lane * result.input_stride;
         for (const auto& [reg, column] : columns)
             result.input_words[base + column] = packet.vgprs[column].words[lane];
-        result.input_words[base + columns.size()] = (packet.exec_mask >> lane) & 1u;
-        result.input_words[base + columns.size() + 1] = (packet.vcc_mask >> lane) & 1u;
-        result.input_words[base + columns.size() + 2] = packet.scc;
-        result.input_words[base + columns.size() + 3] = packet.export_enabled[lane];
+        if (runtime_definedness)
+            for (const auto& [reg, column] : columns)
+                result.input_words[base + columns.size() + column] =
+                    (packet.vgprs[column].available_mask >> lane) & 1u;
+        const auto state_base = columns.size() * (runtime_definedness ? 2u : 1u);
+        result.input_words[base + state_base] = (packet.exec_mask >> lane) & 1u;
+        result.input_words[base + state_base + 1] = (packet.vcc_mask >> lane) & 1u;
+        result.input_words[base + state_base + 2] = packet.scc;
+        result.input_words[base + state_base + 3] = packet.export_enabled[lane];
     }
     if (services) {
         for (const auto& buffer : services->input.buffers) {
@@ -346,6 +356,15 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         services->output.status_offset = static_cast<uint32_t>(result.output_words.size());
         result.output_words.resize(result.output_words.size() + 64 * kFragmentResourceStatusWords, 0);
     }
+    if (runtime_definedness) {
+        result.vgpr_status_offset = static_cast<uint32_t>(result.output_words.size());
+        result.output_words.resize(result.output_words.size() + 64 * kFragmentPacketVgprStatusWords,
+                                   0);
+        for (const auto& [pc, reads] : requirements.reads)
+            for (const auto& read : reads)
+                result.vgpr_failure_sites.push_back(
+                    {pc, read.reg, static_cast<uint32_t>(read.kind)});
+    }
     SpirvCompute b;
     b.diagnostic = diagnostic;
     b.fragment_float_mode = packet.float_mode;
@@ -357,20 +376,33 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     std::vector<uint32_t> marker;
     b.pstr(marker, "Prosper.GuestFragmentPacket=64;NoRasterPackingAuthority");
     b.putv(b.debug, Op_ModuleProcessed, marker);
+    if (runtime_definedness) {
+        marker.clear();
+        b.pstr(marker, kPacketVgprValidityMarker);
+        b.putv(b.debug, Op_ModuleProcessed, marker);
+    }
     RegState state;
     for (const auto& [reg, column] : columns) state.vreg[reg] = b.load_input(column);
     for (const auto& [reg, value] : scalars) state.sreg[reg] = b.uconst(value);
-    // Missing scratch words are NOT supplied guest zeros. The dispatcher separately allocates
-    // referenced storage and MUST-filters its initialization placeholders before every guest
-    // read. The proof above demonstrates that each admitted read has a real entry/guest writer.
+    // Allocated missing storage is an INTERNAL placeholder, never entry authority. Per-logical-
+    // lane validity checks every actual read before transactional publication, including implicit
+    // P2/wide resource ranges, EXEC-ignoring peer selection and the unchanged raw inactive EXP ABI.
     state.max_vgpr = columns.empty() ? 0 : columns.rbegin()->first;
-    const uint32_t state_base = static_cast<uint32_t>(columns.size());
+    for (uint32_t reg = 0; reg < 256; ++reg)
+        if (requirements.storage.test(reg)) {
+            if (!state.vreg.contains(reg)) state.vreg.emplace(reg, b.uconst(0));
+            state.max_vgpr = std::max(state.max_vgpr, static_cast<int>(reg));
+        }
+    const uint32_t state_base =
+        static_cast<uint32_t>(columns.size()) * (runtime_definedness ? 2u : 1u);
     state.exec = b.ucmp(Op_INotEqual, b.load_input(state_base), b.uconst(0));
     state.vcc = b.ucmp(Op_INotEqual, b.load_input(state_base + 1), b.uconst(0));
     state.scc = b.ucmp(Op_INotEqual, b.load_input(state_base + 2), b.uconst(0));
     state.exec_narrowed = true;
     const uint32_t enabled = b.load_input(state_base + 3);
     if (services) services->begin(b);
+    PacketVgprDefinedness definedness{requirements};
+    if (runtime_definedness) definedness.begin(b, columns);
     const auto export_record = [&](RegState& current, const Rdna2Inst& in) {
         const uint32_t base = exports.at(in.pc) * kFragmentPacketExportWords;
         const uint32_t fields[] = {b.uconst(1), b.sel(current.exec, b.uconst(1), b.uconst(0)),
@@ -395,13 +427,15 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
             return services->emit(b, current, in);
           }) : std::function<int(RegState&, const Rdna2Inst&)>{};
     if (!emit_cfg_state_machine(b, state, ins, {}, nullptr, true, false, export_record,
-                                packet.guest_code.data(), packet.guest_code.size(), 0, false, service_callback)) {
+                                packet.guest_code.data(), packet.guest_code.size(), 0, false,
+                                service_callback, runtime_definedness ? &definedness : nullptr)) {
         const auto records = causes.take();
         return reject(records.empty() ? "packet-guest-emission-refused:no-cause-recorded"
             : "packet-guest-emission-refused:" + records.back().first + ":" +
                 records.back().second.substr(0, 1024));
     }
     if (services) services->finish(b);
+    if (runtime_definedness) definedness.finish(b, result.vgpr_status_offset);
     result.spirv = b.finish();
     if (result.spirv.empty()) return reject("packet-module-finalization-refused");
     return result;
