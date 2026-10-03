@@ -931,7 +931,8 @@ std::vector<uint32_t> build_owned_fragment_export_commit(uint32_t records,
     b.put(b.deco, Op_MemberDecorate, {block, 0, Dec_Offset, 0});
     b.put(b.deco, Op_Decorate, {block, Dec_Block});
     b.put(b.deco, Op_Decorate, {storage, Dec_DescriptorSet, 1u});
-    b.put(b.deco, Op_Decorate, {storage, Dec_Binding, 0u});
+    // Set1/binding0 is reserved for the renderer's persistent internal GDS buffer.
+    b.put(b.deco, Op_Decorate, {storage, Dec_Binding, 1u});
     b.put(b.deco, Op_Decorate, {storage, 24u});   // NonWritable
     b.put(b.types, Op_TypeRuntimeArray, {array, b.t_u32});
     b.put(b.types, Op_TypeStruct, {block, array});

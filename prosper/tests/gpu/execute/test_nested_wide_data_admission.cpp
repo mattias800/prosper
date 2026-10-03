@@ -22,6 +22,17 @@ using namespace prosper;
 using namespace prosper::gpu;
 
 TEST(NestedWideDataAdmission, Contract) {
+    const auto fragment_commit = build_owned_fragment_export_commit(128u, {});
+    ASSERT_FALSE(fragment_commit.empty());
+    EXPECT_FALSE(fragment_spirv_uses_internal_gds(fragment_commit))
+        << "completed raw fragment exports must not request a synthetic zero GDS binding";
+    const std::vector<uint32_t> reserved_gds{
+        0x07230203u,      0x00010000u, 0u,  8u, 0u,
+        (4u << 16) | 71u, 1u,          34u, 1u,   // DescriptorSet1
+        (4u << 16) | 71u, 1u,          33u, 0u,   // reserved Binding0
+    };
+    EXPECT_TRUE(fragment_spirv_uses_internal_gds(reserved_gds))
+        << "real internal GDS identity remains reserved and detectable";
     register_builtin_hle();
     const auto allocate = Hle::lookup(nid_hash("sceKernelAllocateDirectMemory"));
     const auto map = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));

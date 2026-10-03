@@ -209,13 +209,13 @@ inline bool execute_owned_graphics_waves(const RenderVkCtx& ctx,
 // Replace only the selected stage's binding bank. The new module reads completed immutable
 // exports, never a nominal guest address or a warm shader-cache entry. Other-stage bindings keep
 // their original owners. Binding order has no authority beyond the already unique contract.
-inline void bind_owned_graphics_exports(BackendDraw& draw, uint32_t set,
+inline void bind_owned_graphics_exports(BackendDraw& draw, uint32_t set, uint32_t binding,
                                         std::vector<uint32_t> words) {
     std::erase_if(draw.R, [set](const auto& resource) { return resource.set == set; });
     std::erase_if(draw.B, [set](const auto& resource) { return resource.set == set; });
     FrameBufferResource resource;
     resource.set = set;
-    resource.binding = 0;
+    resource.binding = binding;
     resource.dwords = std::move(words);
     draw.B.push_back(std::move(resource));
     draw.resource_order.clear();
@@ -250,7 +250,7 @@ inline bool materialize_owned_graphics_draw(const RenderVkCtx& ctx, BackendDraw&
                 commit, refusal))
             return false;
         draw.set_vs(std::move(commit.shader));
-        bind_owned_graphics_exports(draw, 0u, std::move(commit.words));
+        bind_owned_graphics_exports(draw, 0u, 0u, std::move(commit.words));
         // This native pass consumes occurrence-ordered completed exports. Guest indexed identity
         // was already supplied to the full64 execution; do not apply the index/base twice.
         draw.indices.clear();
@@ -297,7 +297,8 @@ inline bool materialize_owned_graphics_draw(const RenderVkCtx& ctx, BackendDraw&
             !prepare_owned_fragment_export_commit(plan, completed, commit, refusal))
             return false;
         draw.set_fs(std::move(commit.shader));
-        bind_owned_graphics_exports(draw, 1u, std::move(commit.words));
+        // Match the commit module's storage identity without occupying internal GDS at1/0.
+        bind_owned_graphics_exports(draw, 1u, 1u, std::move(commit.words));
         // The collector is an inspectable immutable input witness, not a second request on the
         // commit shader. Normal rasterization now consumes only authenticated completed rows.
         draw.raster_quads.reset();
