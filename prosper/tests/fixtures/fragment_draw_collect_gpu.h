@@ -56,13 +56,23 @@ public:
             cache;
         const Key key{reinterpret_cast<uintptr_t>(context.dev), program.get(), vertex.get(),
                       bindings, depth_bias};
-        if (const auto found = cache.find(key); found != cache.end()) return found->second;
+        if (const auto found = cache.find(key); found != cache.end()) {
+            // Pointer reuse is not source-generation identity. Retained copied VS bytes do
+            // not hold the incoming analysis owner alive, even when it aliases the PS owner.
+            if (!found->second->vertex_generation_.owner_before(vertex) &&
+                !vertex.owner_before(found->second->vertex_generation_))
+                return found->second;
+            cache.erase(found);
+        }
+        auto& stats = prosper::gpu::fragment_draw_cache_stats();
+        prosper::gpu::retire_dead_fragment_draw_entries(cache, stats.collector_retired);
         if (!raster_quad_pre_raster_readonly(*vertex)) {
             refusal = "fragment-draw-collector-pre-raster-effects-unproved";
             return {};
         }
         auto result = std::shared_ptr<FragmentDrawCollectGpuProgram>(
             new FragmentDrawCollectGpuProgram(context, std::move(program), std::move(vertex)));
+        ++stats.collector_cold_builds;
         const auto reflected = prosper::gpu::validate_spirv_descriptor_interface(
             *result->vertex_, nullptr, 0, prosper::gpu::SpirvShaderStage::Vertex, false);
         if (!prosper::gpu::spirv_descriptor_reflection_complete(reflected)) {
@@ -89,6 +99,7 @@ public:
                 VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
             info.bindingCount = uint32_t(layouts[set].size());
             info.pBindings = layouts[set].data();
+            ++stats.vk_object_create_calls;
             if (vkCreateDescriptorSetLayout(context.dev, &info, nullptr,
                                             &result->descriptors_[set]) != VK_SUCCESS) {
                 refusal = "fragment-draw-collector-descriptor-layout-failed";
@@ -98,6 +109,7 @@ public:
         VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout.setLayoutCount = uint32_t(result->descriptors_.size());
         layout.pSetLayouts = result->descriptors_.data();
+        ++stats.vk_object_create_calls;
         if (vkCreatePipelineLayout(context.dev, &layout, nullptr, &result->layout_) != VK_SUCCESS) {
             refusal = "fragment-draw-collector-pipeline-layout-failed";
             return {};
@@ -107,6 +119,7 @@ public:
         VkRenderPassCreateInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
         pass.subpassCount = 1;
         pass.pSubpasses = &subpass;
+        ++stats.vk_object_create_calls;
         if (vkCreateRenderPass(context.dev, &pass, nullptr, &result->pass_) != VK_SUCCESS) {
             refusal = "fragment-draw-collector-render-pass-failed";
             return {};
@@ -120,6 +133,7 @@ public:
             VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             module.codeSize = sources[index]->size() * 4;
             module.pCode = sources[index]->data();
+            ++stats.checked_shader_module_calls;
             if (create_render_shader_module_checked(context.dev, module, &modules[index]) !=
                 VK_SUCCESS) {
                 modules_ready = false;
@@ -173,6 +187,8 @@ public:
             pipeline.layout = result->layout_;
             pipeline.renderPass = result->pass_;
             const std::lock_guard driver_guard(graphics_driver_cache_mutex());
+            ++stats.vk_object_create_calls;
+            ++stats.vk_pipeline_create_calls;
             created = vkCreateGraphicsPipelines(context.dev, context.driver_pipeline_cache, 1,
                                                 &pipeline, nullptr, &result->pipeline_);
         }
@@ -182,8 +198,7 @@ public:
             refusal = "fragment-draw-collector-pipeline-failed";
             return {};
         }
-        // Every cached object owns its exact immutable sources; completion additionally owns it.
-        if (cache.size() >= 16) cache.clear();
+        // Own immutable snapshots, not analysis source owners; completions own this payload.
         cache.emplace(key, result);
         return result;
     }
@@ -199,15 +214,18 @@ public:
     VkPipelineLayout layout() const { return layout_; }
     VkDescriptorSetLayout collector_descriptors() const { return descriptors_[1]; }
     const auto& required_bytes() const { return required_bytes_; }
+    bool source_live() const { return program_->source_live() && !vertex_generation_.expired(); }
 
 private:
     FragmentDrawCollectGpuProgram(
         const RenderVkCtx& context,
         std::shared_ptr<const prosper::gpu::FragmentDrawProgramPlan> program,
         prosper::gpu::SharedShaderWords vertex)
-        : context_(&context), program_(std::move(program)), vertex_(std::move(vertex)) {}
+        : context_(&context), program_(std::move(program)), vertex_generation_(vertex),
+          vertex_(std::make_shared<const std::vector<uint32_t>>(*vertex)) {}
     const RenderVkCtx* const context_;
     const std::shared_ptr<const prosper::gpu::FragmentDrawProgramPlan> program_;
+    const std::weak_ptr<const std::vector<uint32_t>> vertex_generation_;
     const prosper::gpu::SharedShaderWords vertex_;
     std::vector<std::pair<uint32_t, uint64_t>> required_bytes_;
     std::array<VkDescriptorSetLayout, 2> descriptors_{};
@@ -230,6 +248,9 @@ public:
             cache;
         const Key key{reinterpret_cast<uintptr_t>(context.dev), program.get(), width, height};
         if (const auto found = cache.find(key); found != cache.end()) return found->second;
+        auto& stats = prosper::gpu::fragment_draw_cache_stats();
+        prosper::gpu::retire_dead_fragment_draw_entries(cache, stats.framebuffer_retired);
+        ++stats.framebuffer_cold_builds;
         auto result = std::shared_ptr<FragmentDrawCollectFramebuffer>(
             new FragmentDrawCollectFramebuffer(context.dev, std::move(program)));
         VkFramebufferCreateInfo framebuffer{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -237,10 +258,10 @@ public:
         framebuffer.width = width;
         framebuffer.height = height;
         framebuffer.layers = 1;
+        ++stats.vk_object_create_calls;
         if (vkCreateFramebuffer(context.dev, &framebuffer, nullptr, &result->framebuffer_) !=
             VK_SUCCESS)
             return {};
-        if (cache.size() >= 16) cache.clear();
         cache.emplace(key, result);
         return result;
     }
@@ -249,6 +270,7 @@ public:
     }
     VkFramebuffer framebuffer() const { return framebuffer_; }
     const FragmentDrawCollectGpuProgram& program() const { return *program_; }
+    bool source_live() const { return program_->source_live(); }
 
 private:
     FragmentDrawCollectFramebuffer(VkDevice device,

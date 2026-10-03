@@ -28,6 +28,9 @@ public:
             cache;
         const Key key{reinterpret_cast<uintptr_t>(context.dev), program.get()};
         if (const auto found = cache.find(key); found != cache.end()) return found->second;
+        auto& stats = prosper::gpu::fragment_draw_cache_stats();
+        prosper::gpu::retire_dead_fragment_draw_entries(cache, stats.compute_retired);
+        ++stats.compute_cold_builds;
         auto result = std::shared_ptr<FragmentDrawComputeGpuProgram>(
             new FragmentDrawComputeGpuProgram(context, std::move(program)));
         std::array<VkDescriptorSetLayoutBinding, 5> bindings{};
@@ -38,6 +41,7 @@ public:
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         descriptors.bindingCount = uint32_t(bindings.size());
         descriptors.pBindings = bindings.data();
+        ++stats.vk_object_create_calls;
         if (vkCreateDescriptorSetLayout(context.dev, &descriptors, nullptr,
                                         &result->descriptors_) != VK_SUCCESS) {
             refusal = "fragment-draw-compute-descriptor-layout-failed";
@@ -46,6 +50,7 @@ public:
         VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout.setLayoutCount = 1;
         layout.pSetLayouts = &result->descriptors_;
+        ++stats.vk_object_create_calls;
         if (vkCreatePipelineLayout(context.dev, &layout, nullptr, &result->layout_) != VK_SUCCESS) {
             refusal = "fragment-draw-compute-pipeline-layout-failed";
             return {};
@@ -63,6 +68,7 @@ public:
             module.codeSize = sources[stage]->size() * sizeof(uint32_t);
             module.pCode = sources[stage]->data();
             VkShaderModule shader = VK_NULL_HANDLE;
+            ++stats.checked_shader_module_calls;
             if (create_render_shader_module_checked(context.dev, module, &shader) != VK_SUCCESS) {
                 refusal = "fragment-draw-compute-device-module-refused";
                 return {};
@@ -76,6 +82,8 @@ public:
             VkResult created;
             {
                 const std::lock_guard driver_guard(graphics_driver_cache_mutex());
+                ++stats.vk_object_create_calls;
+                ++stats.vk_pipeline_create_calls;
                 created = vkCreateComputePipelines(context.dev, context.driver_pipeline_cache, 1,
                                                    &pipeline, nullptr, &result->pipelines_[stage]);
             }
@@ -85,9 +93,8 @@ public:
                 return {};
             }
         }
-        // Source-plan and completion owners prevent pointer reuse/cold-cache eviction from
-        // destroying a live pipeline. A finite cache does not turn per-wave data into keys.
-        if (cache.size() >= 16) cache.clear();
+        // This strong copied-plan payload owns no original analysis generation. Retirement
+        // consults weak source authority; live working sets have no synthetic 16-key limit.
         cache.emplace(key, result);
         return result;
     }
@@ -100,6 +107,7 @@ public:
     VkDescriptorSetLayout descriptors() const { return descriptors_; }
     VkPipelineLayout layout() const { return layout_; }
     VkPipeline pipeline(Stage stage) const { return pipelines_[stage]; }
+    bool source_live() const { return program_->source_live(); }
 
 private:
     FragmentDrawComputeGpuProgram(

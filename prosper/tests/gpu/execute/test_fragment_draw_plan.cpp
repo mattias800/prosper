@@ -87,4 +87,97 @@ TEST_F(FragmentDrawPlan, ForeignProducerDeviceAndDynamicPrefixCannotBorrowAuthor
                   .rejection(),
               "fragment-draw-raster-extent-invalid");
 }
-} // namespace
+TEST_F(FragmentDrawPlan, SeventeenLiveOriginalProgramsNeverRecompileAfterWarmup) {
+    std::array<g::DrawItem, 17> draws;
+    std::array<std::shared_ptr<const g::FragmentPacketPreparation>, 17> prepared;
+    std::array<std::shared_ptr<const g::FragmentDrawProgramPlan>, 17> plans;
+    const auto before = g::fragment_draw_cache_stats().program_compile_calls;
+    for (uint32_t index = 0; index < draws.size(); ++index) {
+        ASSERT_TRUE(f::realize(draws[index], f::color_a, f::distinct_fragment_words(index)));
+        prepared[index] = f::prepare(draws[index]);
+        ASSERT_TRUE(prepared[index] && draws[index].fragment_draw_inputs);
+        ASSERT_EQ(*draws[index].fragment_draw_inputs->raw_code, f::distinct_fragment_words(index));
+        plans[index] = g::cached_fragment_draw_program(*draws[index].fragment_draw_inputs,
+                                                       *prepared[index], source_device, 49);
+        ASSERT_TRUE(plans[index]);
+        ASSERT_TRUE(plans[index]->rejection_reason().empty()) << plans[index]->rejection_reason();
+        ASSERT_TRUE(plans[index]->capacity_owner() && plans[index]->capacity_owner()->kernel());
+        ASSERT_TRUE(plans[index]->source_live());
+        // Every actual emitted form is retained separately, not overwritten by the next key.
+        const auto prefix = "warm17_" + std::to_string(index) + '_';
+        f::retain_source(plans[index]->collect_words(), (prefix + "collector").c_str());
+        f::retain_source(plans[index]->count_words(), (prefix + "count").c_str());
+        f::retain_source(plans[index]->assembly_words(), (prefix + "assembly").c_str());
+        f::retain_source(plans[index]->capacity_owner()->kernel()->program.packet.spirv,
+                         (prefix + "original_ps").c_str());
+        f::retain_source(plans[index]->validation_words(), (prefix + "validation").c_str());
+        f::retain_source(plans[index]->replay_words(), (prefix + "replay").c_str());
+    }
+    EXPECT_EQ(g::fragment_draw_cache_stats().program_compile_calls - before, 17u);
+    for (uint32_t frame = 0; frame < 4; ++frame)
+        for (uint32_t index = 0; index < draws.size(); ++index)
+            EXPECT_EQ(g::cached_fragment_draw_program(*draws[index].fragment_draw_inputs,
+                                                      *prepared[index], source_device, 49),
+                      plans[index]);
+    EXPECT_EQ(g::fragment_draw_cache_stats().program_compile_calls - before, 17u)
+        << "all-clear16 would recompile on every repeated frame";
+}
+TEST_F(FragmentDrawPlan, DeadOriginalGenerationRetiresWithoutRetainingItsOwnAnalysis) {
+    std::shared_ptr<const g::FragmentDrawProgramPlan> completion_plan;
+    std::shared_ptr<const g::RasterQuadInputs> completion_inputs;
+    std::weak_ptr<const std::vector<uint32_t>> source;
+    {
+        g::DrawItem draw;
+        ASSERT_TRUE(f::realize(draw, f::color_a, f::distinct_fragment_words(100)));
+        const auto prepared = f::prepare(draw);
+        ASSERT_TRUE(prepared && draw.fragment_draw_inputs);
+        source = draw.fragment_draw_inputs->raw_code;
+        completion_plan = g::cached_fragment_draw_program(*draw.fragment_draw_inputs, *prepared,
+                                                          source_device, 50);
+        ASSERT_TRUE(completion_plan && completion_plan->rejection_reason().empty());
+        retain_plan(*completion_plan);
+        completion_inputs = draw.fragment_draw_inputs;   // genuine draw/completion producer lease
+        g::clear_shader_analysis_cache();
+        EXPECT_FALSE(source.expired());
+    }
+    EXPECT_TRUE(completion_plan->source_live());
+    completion_inputs.reset();
+    EXPECT_TRUE(source.expired()) << "cached copied plan must not retain the retired analysis";
+    EXPECT_FALSE(completion_plan->source_live());
+    const auto before = g::fragment_draw_cache_stats().program_retired;
+    g::DrawItem next;
+    ASSERT_TRUE(f::realize(next, f::color_a, f::distinct_fragment_words(101)));
+    const auto prepared = f::prepare(next);
+    ASSERT_TRUE(prepared && next.fragment_draw_inputs);
+    const auto next_plan =
+        g::cached_fragment_draw_program(*next.fragment_draw_inputs, *prepared, source_device, 50);
+    ASSERT_TRUE(next_plan && next_plan->rejection_reason().empty());
+    retain_plan(*next_plan);
+    EXPECT_GT(g::fragment_draw_cache_stats().program_retired, before);
+    EXPECT_FALSE(completion_plan->replay_words().empty())
+        << "retiring residence cannot revoke a retained completion payload";
+}
+TEST(FragmentDrawResidency, AliasedOwnersAndIndeterminateLifetimeNeverLaunderEviction) {
+    auto owner = std::make_shared<const std::array<uint32_t, 2>>();
+    g::FragmentDrawSourceGenerations exact;
+    for (uint32_t index = 0; index < 100; ++index)
+        exact.remember(std::shared_ptr<const void>(owner, &(*owner)[index % 2]));
+    EXPECT_TRUE(exact.live());
+    EXPECT_FALSE(exact.indeterminate()) << "aliases share a generation, not separate slots";
+    owner.reset();
+    EXPECT_FALSE(exact.live());
+    g::FragmentDrawSourceGenerations absent;
+    absent.remember({});
+    EXPECT_TRUE(absent.live());
+    EXPECT_TRUE(absent.indeterminate());
+    g::FragmentDrawSourceGenerations overflow;
+    std::vector<std::shared_ptr<const uint32_t>> generations;
+    for (uint32_t index = 0; index < 65; ++index) {
+        generations.push_back(std::make_shared<const uint32_t>(index));
+        overflow.remember(generations.back());
+    }
+    generations.clear();
+    EXPECT_TRUE(overflow.indeterminate());
+    EXPECT_TRUE(overflow.live()) << "unknown ownership is not proof a generation is dead";
+}
+}   // namespace

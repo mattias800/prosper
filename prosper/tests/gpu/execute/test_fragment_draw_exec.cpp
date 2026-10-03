@@ -119,6 +119,106 @@ TEST_F(FragmentDrawExec, APartialHostQuadRefusesTheWholeDrawAfterAPooledSuccess)
     pixels(render({original}, f::width - 1), f::width - 1, f::height, seed);
     pixels(render({original}), f::width, f::height, f::color_a);
 }
+TEST_F(FragmentDrawExec, SeventeenOriginalProgramsKeepVulkanObjectsWarmAcrossFrames) {
+    std::array<g::DrawItem, 17> draws;
+    std::vector<r::BackendDraw> batch;
+    for (uint32_t index = 0; index < draws.size(); ++index) {
+        ASSERT_TRUE(f::realize(draws[index], f::color_a, f::distinct_fragment_words(index + 200)));
+        ASSERT_TRUE(draws[index].fragment_draw_inputs);
+        ASSERT_EQ(*draws[index].fragment_draw_inputs->raw_code,
+                  f::distinct_fragment_words(index + 200));
+        batch.push_back(backend(draws[index]));
+    }
+    const auto before = g::fragment_draw_cache_stats();
+    pixels(render(batch), f::width, f::height, f::color_a);
+    const auto warm = g::fragment_draw_cache_stats();
+    EXPECT_EQ(warm.program_compile_calls - before.program_compile_calls, 17u);
+    EXPECT_EQ(warm.compute_cold_builds - before.compute_cold_builds, 17u);
+    EXPECT_EQ(warm.collector_cold_builds - before.collector_cold_builds, 17u);
+    EXPECT_EQ(warm.framebuffer_cold_builds - before.framebuffer_cold_builds, 17u);
+    EXPECT_GT(warm.vk_object_create_calls, before.vk_object_create_calls);
+    EXPECT_GT(warm.vk_pipeline_create_calls, before.vk_pipeline_create_calls);
+    EXPECT_GT(warm.checked_shader_module_calls, before.checked_shader_module_calls);
+    for (uint32_t frame = 0; frame < 3; ++frame)
+        pixels(render(batch), f::width, f::height, f::color_a);
+    const auto after = g::fragment_draw_cache_stats();
+    EXPECT_EQ(after.program_compile_calls, warm.program_compile_calls);
+    EXPECT_EQ(after.compute_cold_builds, warm.compute_cold_builds);
+    EXPECT_EQ(after.collector_cold_builds, warm.collector_cold_builds);
+    EXPECT_EQ(after.framebuffer_cold_builds, warm.framebuffer_cold_builds);
+    EXPECT_EQ(after.vk_object_create_calls, warm.vk_object_create_calls)
+        << "counts actual shipping companion Vulkan call sites, including failed attempts";
+    EXPECT_EQ(after.vk_pipeline_create_calls, warm.vk_pipeline_create_calls);
+    EXPECT_EQ(after.checked_shader_module_calls, warm.checked_shader_module_calls);
+}
+TEST_F(FragmentDrawExec, DeadSourceRetirementPreservesRetainedPipelinePayloads) {
+    const auto& context = r::render_vk_ctx();
+    const g::FragmentPacketDeviceContract device{reinterpret_cast<uintptr_t>(context.dev),
+                                                 context.shader_int64_enabled, false};
+    std::shared_ptr<const r::FragmentDrawComputeGpuProgram> compute;
+    std::shared_ptr<const r::FragmentDrawCollectGpuProgram> collect;
+    std::shared_ptr<const r::FragmentDrawCollectFramebuffer> framebuffer;
+    std::weak_ptr<const std::vector<uint32_t>> source;
+    VkPipeline original_compute = VK_NULL_HANDLE, original_collect = VK_NULL_HANDLE;
+    VkFramebuffer original_framebuffer = VK_NULL_HANDLE;
+    {
+        g::DrawItem draw;
+        ASSERT_TRUE(f::realize(draw, f::color_a, f::distinct_fragment_words(400)));
+        const auto prepared = f::prepare(draw);
+        ASSERT_TRUE(prepared && draw.fragment_draw_inputs && draw.vs_shared);
+        source = draw.fragment_draw_inputs->raw_code;
+        const auto plan =
+            g::cached_fragment_draw_program(*draw.fragment_draw_inputs, *prepared, device, 51);
+        ASSERT_TRUE(plan && plan->rejection_reason().empty());
+        std::string refusal;
+        compute = r::FragmentDrawComputeGpuProgram::acquire(context, plan, refusal);
+        ASSERT_TRUE(compute) << refusal;
+        collect = r::FragmentDrawCollectGpuProgram::acquire(context, plan, draw.vs_shared, {},
+                                                            false, refusal);
+        ASSERT_TRUE(collect) << refusal;
+        framebuffer =
+            r::FragmentDrawCollectFramebuffer::acquire(context, collect, f::width, f::height);
+        ASSERT_TRUE(framebuffer);
+        original_compute = compute->pipeline(r::FragmentDrawComputeGpuProgram::OriginalPs);
+        original_collect = collect->pipeline();
+        original_framebuffer = framebuffer->framebuffer();
+        ASSERT_NE(original_compute, VK_NULL_HANDLE);
+        ASSERT_NE(original_collect, VK_NULL_HANDLE);
+        ASSERT_NE(original_framebuffer, VK_NULL_HANDLE);
+        g::clear_shader_analysis_cache();
+        EXPECT_FALSE(source.expired()) << "the real producing draw still owns its analysis";
+    }
+    EXPECT_TRUE(source.expired()) << "copied pipeline/VS payloads must not retain analysis";
+    EXPECT_FALSE(compute->source_live());
+    EXPECT_FALSE(collect->source_live());
+    EXPECT_FALSE(framebuffer->source_live());
+    const auto before = g::fragment_draw_cache_stats();
+    g::DrawItem next;
+    ASSERT_TRUE(f::realize(next, f::color_a, f::distinct_fragment_words(401)));
+    const auto prepared = f::prepare(next);
+    ASSERT_TRUE(prepared && next.fragment_draw_inputs && next.vs_shared);
+    const auto plan =
+        g::cached_fragment_draw_program(*next.fragment_draw_inputs, *prepared, device, 51);
+    ASSERT_TRUE(plan && plan->rejection_reason().empty());
+    std::string refusal;
+    const auto next_compute = r::FragmentDrawComputeGpuProgram::acquire(context, plan, refusal);
+    ASSERT_TRUE(next_compute) << refusal;
+    const auto next_collect = r::FragmentDrawCollectGpuProgram::acquire(
+        context, plan, next.vs_shared, {}, false, refusal);
+    ASSERT_TRUE(next_collect) << refusal;
+    const auto next_framebuffer =
+        r::FragmentDrawCollectFramebuffer::acquire(context, next_collect, f::width, f::height);
+    ASSERT_TRUE(next_framebuffer);
+    const auto after = g::fragment_draw_cache_stats();
+    EXPECT_GT(after.compute_retired, before.compute_retired);
+    EXPECT_GT(after.collector_retired, before.collector_retired);
+    EXPECT_GT(after.framebuffer_retired, before.framebuffer_retired);
+    // Strong completion-style payload leases survive actual residence retirement. This case
+    // creates/retains objects but does not claim that an unsubmitted completion ran on the GPU.
+    EXPECT_EQ(compute->pipeline(r::FragmentDrawComputeGpuProgram::OriginalPs), original_compute);
+    EXPECT_EQ(collect->pipeline(), original_collect);
+    EXPECT_EQ(framebuffer->framebuffer(), original_framebuffer);
+}
 TEST(FragmentDrawReplayLimits, AllFivePrivatePlanesCountBeforeLayoutCreation) {
     VkPhysicalDeviceLimits limits{};
     limits.maxBoundDescriptorSets = 2;

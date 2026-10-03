@@ -156,9 +156,12 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
                                                       FragmentPacketDeviceContract device,
                                                       uint32_t max_quads,
                                                       RecompileDiagnosticContext diagnostic) {
+    ++fragment_draw_cache_stats().program_compile_calls;
     FragmentDrawProgramPlan result;
+    result.source_generations->remember(in.raw_code);
     const auto refuse = [&](const char* reason) {
         FragmentDrawProgramPlan failed;
+        failed.source_generations = result.source_generations;
         failed.rejection = reason;
         return failed;
     };
@@ -234,63 +237,26 @@ std::shared_ptr<const FragmentDrawProgramPlan>
 cached_fragment_draw_program(const RasterQuadInputs& in, const FragmentPacketPreparation& prepared,
                              FragmentPacketDeviceContract device, uint32_t max_quads,
                              RecompileDiagnosticContext diagnostic) {
-    struct Cache {
-        std::map<std::vector<uint32_t>, std::shared_ptr<const FragmentDrawProgramPlan>> entries;
-        size_t bytes = 0;
-    };
-    static thread_local Cache cache;
+    static thread_local std::map<std::vector<uint32_t>,
+                                 std::shared_ptr<const FragmentDrawProgramPlan>>
+        cache;
     auto key = profile_key(in, prepared, device, max_quads);
     if (!key.empty()) {
-        const auto found = cache.entries.find(key);
-        if (found != cache.entries.end()) return found->second;
+        const auto found = cache.find(key);
+        if (found != cache.end()) {
+            found->second->source_generations->remember(in.raw_code);
+            ++fragment_draw_cache_stats().program_hits;
+            return found->second;
+        }
     }
+    retire_dead_fragment_draw_entries(cache, fragment_draw_cache_stats().program_retired);
     auto compiled = compile_fragment_draw_program(in, prepared, device, max_quads, diagnostic);
-    size_t bytes = sizeof(compiled) + key.capacity() * sizeof(uint32_t) +
-                   compiled.full_masks.capacity() * sizeof(FragmentDrawFullMask) +
-                   compiled.collector.fields.capacity() * sizeof(RasterQuadField) +
-                   compiled.collector.rejection.capacity() + compiled.rejection.capacity() + 2 +
-                   256;
-    for (const auto* words : {&compiled.collect, &compiled.count, &compiled.assemble,
-                              &compiled.validate, &compiled.replay})
-        bytes += words->capacity() * sizeof(uint32_t);
-    if (compiled.capacity) {
-        const auto& kernel = *compiled.capacity->kernel();
-        bytes += sizeof(kernel) + kernel.guest_code.capacity() * sizeof(uint32_t) +
-                 kernel.instructions.capacity() * sizeof(Rdna2Inst) +
-                 kernel.program.packet.spirv.capacity() * sizeof(uint32_t) +
-                 kernel.program.packet.input_words.capacity() * sizeof(uint32_t) +
-                 kernel.program.packet.output_words.capacity() * sizeof(uint32_t) +
-                 kernel.program.packet.vgpr_failure_sites.capacity() *
-                     sizeof(FragmentPacketProgram::VgprFailureSite) +
-                 kernel.program.packet.rejection.capacity() + 1 +
-                 kernel.program.runtime_failure_pcs.capacity() * sizeof(uint32_t) +
-                 sizeof(FragmentDrawCapacity) +
-                 compiled.capacity->collector().fields.capacity() * sizeof(RasterQuadField) +
-                 compiled.capacity->collector().rejection.capacity() + 1;
-        for (const auto* offsets :
-             {&kernel.layout.vgprs, &kernel.layout.sgprs, &kernel.layout.scalar_offsets,
-              &kernel.layout.scalar_available_offsets, &kernel.layout.image_descriptor_offsets,
-              &kernel.layout.sampler_offsets})
-            bytes += offsets->capacity() * sizeof(uint32_t);
-        bytes += kernel.layout.buffers.capacity() * sizeof(PacketWaveDataLayout::Buffer) +
-                 kernel.layout.parameters.capacity() * sizeof(PacketWaveDataLayout::Parameter);
-    }
-    constexpr size_t budget = 16 * 1024 * 1024;
-    if (bytes > budget) {
-        compiled = {};
-        compiled.rejection = "fragment-draw-program-cache-budget";
-        bytes = sizeof(compiled) + key.capacity() * sizeof(uint32_t);
-    }
     auto result = std::make_shared<const FragmentDrawProgramPlan>(std::move(compiled));
     if (!key.empty()) {
-        // Shared completion owners survive eviction. No per-draw hot global mutex or compile.
-        // A failed profile is cached too, so an honest named gap cannot become a compile loop.
-        if (cache.entries.size() >= 16 || cache.bytes > budget - bytes) {
-            cache.entries.clear();
-            cache.bytes = 0;
-        }
-        cache.entries.emplace(std::move(key), result);
-        cache.bytes += bytes;
+        // All live source/profile generations stay warm, including named refused profiles.
+        // No cached payload retains its own weakly tracked source owner. Completion leases
+        // may outlive retirement without causing recompilation of another live generation.
+        cache.emplace(std::move(key), result);
     }
     return result;
 }

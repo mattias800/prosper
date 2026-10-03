@@ -41,6 +41,10 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   obligations. Architectural EXP policy is mandatory before live transaction admission. The normal
   renderer companions record collection, indirect assembly/original PS and whole-draw validation
   in one submission, then replay pure geometry in attachment order without a diagnostic readback.
+- `fragment_draw_residency` tracks weak immutable analysis generations for those copied program
+  and pipeline payloads. Live working sets stay resident without a shader-count admission cap;
+  genuinely dead generations retire only on cold insertion, while completion leases retain their
+  payloads. A cached payload must not strongly retain the source owner whose expiry it observes.
 - `index_expand` — the guest's validated 16-bit index range widened to the 32-bit indices the
   backend uploads, and the maximum that sizes the vertex buffer. Two things about it are easy to
   get wrong and both are load-bearing. The maximum must be reduced from the **same** loaded values

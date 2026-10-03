@@ -25,11 +25,19 @@ inline std::vector<uint32_t> fragment_words() {
     return {0xbefe04c1u, 0x7e000200u, 0x7e020201u, 0x7e040202u,
             0x7e060203u, 0xf800180fu, 0x03020100u, 0xbf810000u};
 }
+inline std::vector<uint32_t> distinct_fragment_words(uint32_t variant) {
+    auto words = fragment_words();
+    // Distinct ORIGINAL S_NOP immediate, before the genuine EXEC writer. This is not a change
+    // to a dynamic scalar, a host specialization, or a replacement shader after realization.
+    words.insert(words.begin(), 0xbf800000u | (variant & 0xffffu));
+    return words;
+}
 struct Owners {
     ps_pull::Program vs, ps;
 };
 
-inline bool realize(g::DrawItem& draw, const std::array<float, 4>& color = color_a) {
+inline bool realize(g::DrawItem& draw, const std::array<float, 4>& color = color_a,
+                    const std::vector<uint32_t>& ps_words = fragment_words()) {
     prosper::register_builtin_hle();
     const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
     uint64_t address = 0;
@@ -44,7 +52,7 @@ inline bool realize(g::DrawItem& draw, const std::array<float, 4>& color = color
     // rewrites registered words, and never treats released VA as another producer generation.
     auto& owner = *std::construct_at(reinterpret_cast<Owners*>(address));
     if (!ps_pull::register_program(owner.vs, true, vertex_words()) ||
-        !ps_pull::register_program(owner.ps, false, fragment_words()))
+        !ps_pull::register_program(owner.ps, false, ps_words))
         return false;
     g::GpuState state;
     for (const auto* program : {&owner.vs, &owner.ps})

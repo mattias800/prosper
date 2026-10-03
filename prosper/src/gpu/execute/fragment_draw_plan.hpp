@@ -1,5 +1,6 @@
 #pragma once
 #include "gpu/recompiler/fragment_draw_gpu.hpp"
+#include "gpu/execute/fragment_draw_residency.hpp"
 #include <memory>
 #include <span>
 
@@ -37,6 +38,7 @@ public:
     const auto& replay_owner() const { return replay_shared; }
     const auto& rejection_reason() const { return rejection; }
     const auto& device_contract() const { return device; }
+    bool source_live() const { return source_generations->live(); }
 
 private:
     friend FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs&,
@@ -55,6 +57,9 @@ private:
     // Only original-program compilation constructs this complete code/profile owner. Const
     // getters cannot turn a copied public plan into a different shader or attachment authority.
     std::shared_ptr<const FragmentDrawCapacity> capacity;
+    // Weak source tracking cannot be kept alive by this plan's own copied ISA/SPIR-V payload.
+    std::shared_ptr<FragmentDrawSourceGenerations> source_generations =
+        std::make_shared<FragmentDrawSourceGenerations>();
     RasterQuadCollector collector;
     std::vector<uint32_t> collect, count, assemble, validate, replay;
     std::shared_ptr<const std::vector<uint32_t>> replay_shared;
@@ -110,13 +115,14 @@ private:
     std::string rejection_;
 };
 
-// Program-only compilation, called from a bounded calling-thread cache. Draw-dependent values
+// Program-only compilation, called from a source-generation calling-thread cache. Draw-dependent values
 // must never be specialization keys or be substituted for unavailable guest entry values.
 FragmentDrawProgramPlan
 compile_fragment_draw_program(const RasterQuadInputs&, const FragmentPacketPreparation&,
                               FragmentPacketDeviceContract, uint32_t max_quads,
                               RecompileDiagnosticContext = {RecompileDiagnosticStage::Fragment, 0});
-// Bounded calling-thread code/profile cache. Initial/user scalar VALUES never enter its key.
+// Calling-thread code/profile cache: all live original generations remain resident; dead ones retire.
+// Initial/user scalar VALUES never enter its key. There is no permanent shader-count admission cap.
 std::shared_ptr<const FragmentDrawProgramPlan>
 cached_fragment_draw_program(const RasterQuadInputs&, const FragmentPacketPreparation&,
                              FragmentPacketDeviceContract, uint32_t max_quads,
