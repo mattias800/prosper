@@ -8,7 +8,7 @@
 // device (the app/HLE, or tests via render_runner.h). agc_driver_submit_dcb calls this with the live
 // renderer once the device is wired; tests call it with the offscreen renderer to verify the spine.
 #pragma once
-#include "gpu/diagnostics/refused_shader_dump.hpp"   // #4273: default refused-shader evidence
+#include "gpu/execute/refused_shader_source.hpp"   // default original refused-shader evidence
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include <map>
 #include <atomic>
@@ -646,34 +646,24 @@ struct ShaderRecompileCacheStats {
     uint64_t compute_witness_analyses = 0;
     double compile_ms = 0.0;
 };
-std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
-                                                       const uint32_t* code, size_t dwords,
-                                                       const ShaderResourceTable* resources = nullptr,
-                                                       const PixelInputMapping* pixel_inputs = nullptr,
-                                                       const PixelSystemInputMapping* system_inputs = nullptr,
-                                                       uint64_t* cache_identity = nullptr,
-                                                       bool fragment_wave32 = false,
-                                                       uint32_t vertex_lds_dwords = 0,
-                                                       bool vertex_capture_position = false,
-                                                       const SharedShaderAnalysis& captured_analysis = {},
-                                                       FragmentFloatMode fragment_float_mode = {},
-                                                       FloatTransportConfig float_transport = {},
-                                                       FragmentFloatFlags fragment_float_flags = {},
-                                                       FragmentLaunchRsrc1 fragment_launch_rsrc1 = {});
+std::vector<uint32_t> recompile_graphics_shader_cached(
+    ShaderProgramStage stage, const uint32_t* code, size_t dwords,
+    const ShaderResourceTable* resources = nullptr, const PixelInputMapping* pixel_inputs = nullptr,
+    const PixelSystemInputMapping* system_inputs = nullptr, uint64_t* cache_identity = nullptr,
+    bool fragment_wave32 = false, uint32_t vertex_lds_dwords = 0,
+    bool vertex_capture_position = false, const SharedShaderAnalysis& captured_analysis = {},
+    FragmentFloatMode fragment_float_mode = {}, FloatTransportConfig float_transport = {},
+    FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
+    RefusedShaderSource* original_source = nullptr);
 SharedShaderWords recompile_graphics_shader_cached_shared(
     ShaderProgramStage stage, const uint32_t* code, size_t dwords,
-    const ShaderResourceTable* resources = nullptr,
-    const PixelInputMapping* pixel_inputs = nullptr,
-    const PixelSystemInputMapping* system_inputs = nullptr,
-    uint64_t* cache_identity = nullptr,
-    bool fragment_wave32 = false,
-    uint32_t vertex_lds_dwords = 0,
-    bool vertex_capture_position = false,
-    const SharedShaderAnalysis& captured_analysis = {},
-    FragmentFloatMode fragment_float_mode = {},
-    FloatTransportConfig float_transport = {},
-    FragmentFloatFlags fragment_float_flags = {},
-    FragmentLaunchRsrc1 fragment_launch_rsrc1 = {});
+    const ShaderResourceTable* resources = nullptr, const PixelInputMapping* pixel_inputs = nullptr,
+    const PixelSystemInputMapping* system_inputs = nullptr, uint64_t* cache_identity = nullptr,
+    bool fragment_wave32 = false, uint32_t vertex_lds_dwords = 0,
+    bool vertex_capture_position = false, const SharedShaderAnalysis& captured_analysis = {},
+    FragmentFloatMode fragment_float_mode = {}, FloatTransportConfig float_transport = {},
+    FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
+    RefusedShaderSource* original_source = nullptr);
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; ordinary per-dispatch push-constant values do not.
 // Conditional marker lowerings validate their value-dependent dispatch proof before cache lookup.
@@ -778,14 +768,11 @@ inline std::vector<ComputeAddressWatchHit> compute_address_watch_hits(
     return hits;
 }
 SharedShaderWords recompile_vertex_chain_cached_shared(
-    const uint32_t* prolog, size_t prolog_dwords,
-    const uint32_t* main, size_t main_dwords,
-    const ShaderResourceTable* resources = nullptr,
-    const PixelInputMapping* pixel_inputs = nullptr,
-    uint64_t* cache_identity = nullptr,
-    uint32_t vertex_lds_dwords = 0,
-    bool capture_position = false,
-    FloatTransportConfig float_transport = {});
+    const uint32_t* prolog, size_t prolog_dwords, const uint32_t* main, size_t main_dwords,
+    const ShaderResourceTable* resources = nullptr, const PixelInputMapping* pixel_inputs = nullptr,
+    uint64_t* cache_identity = nullptr, uint32_t vertex_lds_dwords = 0,
+    bool capture_position = false, FloatTransportConfig float_transport = {},
+    RefusedShaderSource* original_source = nullptr);
 ShaderRecompileCacheStats shader_recompile_cache_stats();
 void clear_shader_recompile_cache();
 
@@ -2471,6 +2458,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         failure->ps_wave32 = rs.ps_wave32;
     }
     uint64_t vs_identity = 0, fs_identity = 0;
+    RefusedShaderSource vs_original, fs_original;
     SharedShaderWords vs_shared, fs_shared;
     std::vector<uint32_t> vs, fs;
     if (retain_shared_shader_words) {
@@ -2478,43 +2466,47 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }   // typed deferred stage; no native placeholder or module-cache admission
         else if (vertex_chain)
             vs_shared = recompile_vertex_chain_cached_shared(
-                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)), vertex_dwords,
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)),
+                vertex_dwords,
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)), chain_dwords,
                 vrt.get(), pixel_input_ptr, &vs_identity, vertex_lds_dwords,
-                capture_vertex_position, float_transport);
+                capture_vertex_position, float_transport, &vs_original);
         else
             vs_shared = recompile_graphics_shader_cached_shared(
                 ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
-                max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity,
-                false, vertex_lds_dwords, capture_vertex_position, {}, {}, float_transport);
+                max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity, false,
+                vertex_lds_dwords, capture_vertex_position, {}, {}, float_transport, {}, {},
+                &vs_original);
         if (!owned_fragment)
             fs_shared = recompile_graphics_shader_cached_shared(
                 ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
                 max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
                 rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode, float_transport,
-                rs.ps_float_flags, rs.ps_launch_rsrc1);
+                rs.ps_float_flags, rs.ps_launch_rsrc1, &fs_original);
     } else {
         if (owned_vertex) {
         }   // execution and native export commit happen at the actual device owner
         else if (vertex_chain) {
             const SharedShaderWords linked = recompile_vertex_chain_cached_shared(
-                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)), vertex_dwords,
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(rs.es_addr)),
+                vertex_dwords,
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)), chain_dwords,
                 vrt.get(), pixel_input_ptr, &vs_identity, vertex_lds_dwords,
-                capture_vertex_position, float_transport);
+                capture_vertex_position, float_transport, &vs_original);
             if (linked) vs = *linked;
         } else {
             vs = recompile_graphics_shader_cached(
                 ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
-                max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity,
-                false, vertex_lds_dwords, capture_vertex_position, {}, {}, float_transport);
+                max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity, false,
+                vertex_lds_dwords, capture_vertex_position, {}, {}, float_transport, {}, {},
+                &vs_original);
         }
         if (!owned_fragment)
             fs = recompile_graphics_shader_cached(
                 ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
                 max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
                 rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode, float_transport,
-                rs.ps_float_flags, rs.ps_launch_rsrc1);
+                rs.ps_float_flags, rs.ps_launch_rsrc1, &fs_original);
     }
     // CB_COLOR_CONTROL.DCC_DECOMPRESS interprets the bound AGC metadata helper, rather than its
     // ordinary fragment-color export. The operation bits can remain folded into a later graphics
@@ -2684,23 +2676,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 }
             }
         }
-        // #4273: keep each distinct refused stage's code by default, bounded, so a dropped draw
-        // leaves its evidence without a diagnostic rerun.
-        for (auto [tag, addr, failed] : {std::tuple{"vs", vs_program_addr, vs_words.empty()},
-                                         std::tuple{"ps", rs.ps_addr, fs_words.empty()}}) {
-            if (!failed || !addr || !guest_readable(addr, sizeof(uint32_t))) continue;
-            const uint32_t* program = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(addr));
-            if (refused_shader_already_noted(tag, addr, program[0])) continue;
-            const size_t span = rdna2_recompile_code_span(program, max_shader_dwords);
-            if (!span || !guest_readable(addr, static_cast<uint32_t>(span * sizeof(uint32_t))))
-                continue;
-            char detail[160];
-            snprintf(detail, sizeof detail, "draw-order=%llu vs=%zu gs=%zu fs=%zu es=0x%llx ps=0x%llx",
-                     (unsigned long long)(draw ? draw->command_order : 0), vs_words.size(),
-                     gs.size(), fs_words.size(), (unsigned long long)rs.es_addr,
-                     (unsigned long long)rs.ps_addr);
-            note_refused_shader(tag, addr, program, span, detail);
-        }
+        note_refused_draw_shaders({vs_original, fs_original, fragment_analysis, vs_program_addr,
+                                   rs.ps_addr, rs.es_addr, draw ? draw->command_order : 0,
+                                   max_shader_dwords, vs_words.size(), gs.size(), fs_words.size(),
+                                   vs_words.empty() && !owned_vertex,
+                                   fs_words.empty() && !owned_fragment});
         if (log) {
             fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu gs=%zu fs=%zu; order=%llu "
                             "es=0x%llx ps=0x%llx color0=0x%llx/%ux%u "
