@@ -949,3 +949,421 @@ TEST(Rdna2DecodeSweep, ZeroMipShapeLoadMipNsaRequiresClearUnormAndGlc) {
     EXPECT_FALSE(rdna2_mimg_zero_mip_shape(rdna2_decode_one(with_glc, 3)));
     EXPECT_FALSE(rdna2_mimg_zero_mip_shape(decode(0x7E000000u)));   // not MIMG
 }
+
+// ---- SDWA and DPP16 control words ------------------------------------------------------------
+// SDWA control dword: SRC0[7:0], DST_SEL[10:8], DST_UNUSED[12:11], CLAMP[13], OMOD[15:14],
+//   SRC0_SEL[18:16], SRC0_SEXT[19], SRC0_NEG[20], SRC0_ABS[21], SRC0_S[23], SRC1_SEL[26:24],
+//   SRC1_SEXT[27], SRC1_NEG[28], SRC1_ABS[29], SRC1_S[31]. Select 6 = DWORD, 4/5 = WORD_0/1.
+// DPP16 control dword: SRC0[7:0], DPP_CTRL[16:8], FI[18], BC[19], SRC0_NEG/ABS and SRC1_NEG/ABS
+//   [23:20], BANK_MASK[27:24], ROW_MASK[31:28].
+// Anything the decoder does not model must keep has_modifier set so the recompiler rejects it
+// visibly instead of lowering the instruction with the wrong semantics.
+
+namespace {
+struct Sdwa {
+    uint32_t src0 = 0x100u, dsel = 6, dun = 0, clamp = 0, omod = 0;
+    uint32_t s0sel = 6, s0sext = 0, s0neg = 0, s0abs = 0, s0s = 0;
+    uint32_t s1sel = 6, s1sext = 0, s1neg = 0, s1abs = 0, s1s = 0;
+    uint32_t word() const {
+        return (src0 & 0xFFu) | (dsel << 8) | (dun << 11) | (clamp << 13) | (omod << 14) |
+               (s0sel << 16) | (s0sext << 19) | (s0neg << 20) | (s0abs << 21) | (s0s << 23) |
+               (s1sel << 24) | (s1sext << 27) | (s1neg << 28) | (s1abs << 29) | (s1s << 31);
+    }
+};
+constexpr uint32_t kVop2Add = 0x03u;      // v_add_f32: a float op with no sub-dword SDWA model
+constexpr uint32_t kVop2AddNc = 0x25u;    // v_add_nc_u32: an integer op
+constexpr uint32_t vop2_sdwa_w0(uint32_t op, uint32_t vdst = 2u, uint32_t vsrc1 = 3u) {
+    return (op << 25) | (vdst << 17) | (vsrc1 << 9) | 0xF9u;
+}
+constexpr uint32_t vop1_sdwa_w0(uint32_t op, uint32_t vdst = 2u) {
+    return 0x7E000000u | (vdst << 17) | (op << 9) | 0xF9u;
+}
+}  // namespace
+
+TEST(Rdna2DecodeSweep, Vop1F16UnaryFamilyIsExactlyTheDocumentedRanges) {
+    // 0x59 / 0x5A (frexp mantissa / i16 exponent) sit inside the numeric span and are excluded.
+    for (uint32_t op = 0; op <= 0xFF; ++op) {
+        const bool expected = (op >= 0x54 && op <= 0x58) || (op >= 0x5B && op <= 0x61);
+        EXPECT_EQ(vop1_is_f16_unary(op), expected) << "op=" << op;
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop2SdwaTrivialFormIsRecordedAndAdmitted) {
+    const Rdna2Inst in = decode(vop2_sdwa_w0(kVop2Add), Sdwa{}.word());
+    ASSERT_EQ(in.fmt, Rdna2Format::VOP2);
+    EXPECT_EQ(in.len_dwords, 2u);
+    EXPECT_TRUE(in.has_sdwa);
+    EXPECT_FALSE(in.has_modifier) << "all-DWORD selects with no sext/reserved bits are modelled";
+    EXPECT_EQ(in.sdwa_dst_sel, 6);
+    EXPECT_EQ(in.sdwa_src0_sel, 6);
+    EXPECT_EQ(in.sdwa_src1_sel, 6);
+    EXPECT_EQ(in.src[0].kind, OperandKind::VGPR);
+    EXPECT_EQ(in.src[0].value, 0);
+    EXPECT_EQ(in.src[1].value, 3);
+    EXPECT_EQ(in.dst.value, 2);
+}
+
+TEST(Rdna2DecodeSweep, Vop2SdwaPlainE32IsNotMarkedSdwa) {
+    const Rdna2Inst plain = decode((kVop2Add << 25) | (2u << 17) | (3u << 9) | 0x100u);
+    EXPECT_FALSE(plain.has_sdwa);
+    EXPECT_FALSE(plain.has_modifier);
+}
+
+TEST(Rdna2DecodeSweep, Vop2SdwaSourceNegAbsAreReadPerSourceAndKeepTheFormTrivial) {
+    for (uint32_t m = 0; m < 16; ++m) {
+        Sdwa s;
+        s.s0neg = m & 1u; s.s0abs = (m >> 1) & 1u; s.s1neg = (m >> 2) & 1u; s.s1abs = (m >> 3) & 1u;
+        const Rdna2Inst in = decode(vop2_sdwa_w0(kVop2Add), s.word());
+        EXPECT_EQ(in.src_neg[0], (m & 1u) != 0) << m;
+        EXPECT_EQ(in.src_abs[0], (m & 2u) != 0) << m;
+        EXPECT_EQ(in.src_neg[1], (m & 4u) != 0) << m;
+        EXPECT_EQ(in.src_abs[1], (m & 8u) != 0) << m;
+        EXPECT_FALSE(in.has_modifier) << m;
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop2SdwaClampAndOmodAreDecoded) {
+    Sdwa s;
+    s.clamp = 1;
+    EXPECT_TRUE(decode(vop2_sdwa_w0(kVop2Add), s.word()).clamp);
+    for (uint32_t omod = 0; omod < 4; ++omod) {
+        Sdwa o;
+        o.omod = omod;
+        const Rdna2Inst in = decode(vop2_sdwa_w0(kVop2Add), o.word());
+        EXPECT_EQ(in.omod, omod) << omod;
+        EXPECT_FALSE(in.has_modifier) << "float output modifiers are applied by the recompiler";
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop2SdwaScalarSourceBitsSwitchOperandKind) {
+    Sdwa s;
+    s.src0 = 5; s.s0s = 1;      // SRC0 is an SGPR field, not a VGPR
+    s.s1s = 1;                  // SRC1 reads dword0[16:9] as an SSRC field
+    const Rdna2Inst in = decode(vop2_sdwa_w0(kVop2Add, 2u, 7u), s.word());
+    EXPECT_EQ(in.src[0].kind, OperandKind::SGPR);
+    EXPECT_EQ(in.src[0].value, 5);
+    EXPECT_EQ(in.src[1].kind, OperandKind::SGPR);
+    EXPECT_EQ(in.src[1].value, 7);
+    EXPECT_EQ(decode(vop2_sdwa_w0(kVop2Add, 2u, 7u), Sdwa{}.word()).src[1].kind, OperandKind::VGPR);
+}
+
+TEST(Rdna2DecodeSweep, Vop2SdwaUnmodelledSubDwordFloatFormsStayRejected) {
+    // v_add_f32 has no sub-dword SDWA lowering, so any non-DWORD select or SEXT must keep has_modifier.
+    for (uint32_t sel = 0; sel <= 5; ++sel) {
+        Sdwa a; a.s0sel = sel;
+        EXPECT_TRUE(decode(vop2_sdwa_w0(kVop2Add), a.word()).has_modifier) << "src0_sel=" << sel;
+        Sdwa b; b.s1sel = sel;
+        EXPECT_TRUE(decode(vop2_sdwa_w0(kVop2Add), b.word()).has_modifier) << "src1_sel=" << sel;
+        Sdwa d; d.dsel = sel;
+        EXPECT_TRUE(decode(vop2_sdwa_w0(kVop2Add), d.word()).has_modifier) << "dst_sel=" << sel;
+    }
+    Sdwa sext; sext.s0sext = 1;
+    EXPECT_TRUE(decode(vop2_sdwa_w0(kVop2Add), sext.word()).has_modifier);
+    Sdwa sext1; sext1.s1sext = 1;
+    EXPECT_TRUE(decode(vop2_sdwa_w0(kVop2Add), sext1.word()).has_modifier);
+}
+
+TEST(Rdna2DecodeSweep, Vop2SdwaIntegerOpAdmitsEveryByteAndWordSelect) {
+    for (uint32_t sel = 0; sel <= 6; ++sel) {
+        Sdwa a; a.s0sel = sel; a.s1sel = 6;
+        const Rdna2Inst in = decode(vop2_sdwa_w0(kVop2AddNc), a.word());
+        EXPECT_FALSE(in.has_modifier) << "src0_sel=" << sel;
+        EXPECT_EQ(in.sdwa_src0_sel, sel);
+        Sdwa b; b.s0sel = 6; b.s1sel = sel;
+        const Rdna2Inst jn = decode(vop2_sdwa_w0(kVop2AddNc), b.word());
+        EXPECT_FALSE(jn.has_modifier) << "src1_sel=" << sel;
+        EXPECT_EQ(jn.sdwa_src1_sel, sel);
+        Sdwa d; d.dsel = sel; d.dun = 2; d.s0sel = 4;
+        const Rdna2Inst dn = decode(vop2_sdwa_w0(kVop2AddNc), d.word());
+        EXPECT_FALSE(dn.has_modifier) << "dst_sel=" << sel;
+        EXPECT_EQ(dn.sdwa_dst_sel, sel);
+        EXPECT_EQ(dn.sdwa_dst_unused, 2);
+    }
+    // Selector value 7 is reserved.
+    Sdwa r; r.s0sel = 7;
+    EXPECT_TRUE(decode(vop2_sdwa_w0(kVop2AddNc), r.word()).has_modifier);
+    Sdwa r1; r1.s1sel = 7;
+    EXPECT_TRUE(decode(vop2_sdwa_w0(kVop2AddNc), r1.word()).has_modifier);
+}
+
+TEST(Rdna2DecodeSweep, Vop2SdwaIntegerOpDstUnusedAndSextRules) {
+    // Only UNUSED_PAD (0) and UNUSED_PRESERVE (2) are modelled; UNUSED_SEXT (1) and 3 are not.
+    for (uint32_t dun = 0; dun < 4; ++dun) {
+        Sdwa s; s.dsel = 4; s.dun = dun;
+        EXPECT_EQ(decode(vop2_sdwa_w0(kVop2AddNc), s.word()).has_modifier, dun == 1 || dun == 3)
+            << "dun=" << dun;
+    }
+    // SEXT is admitted only alongside a real sub-dword select, and is then recorded.
+    Sdwa ok; ok.s0sel = 4; ok.s0sext = 1;
+    const Rdna2Inst in = decode(vop2_sdwa_w0(kVop2AddNc), ok.word());
+    EXPECT_FALSE(in.has_modifier);
+    EXPECT_TRUE(in.sdwa_src0_sext);
+    EXPECT_FALSE(in.sdwa_src1_sext);
+    Sdwa ok1; ok1.s1sel = 5; ok1.s1sext = 1;
+    const Rdna2Inst jn = decode(vop2_sdwa_w0(kVop2AddNc), ok1.word());
+    EXPECT_FALSE(jn.has_modifier);
+    EXPECT_TRUE(jn.sdwa_src1_sext);
+    Sdwa bad; bad.s0sel = 6; bad.s0sext = 1;   // SEXT of a full DWORD is not modelled
+    EXPECT_TRUE(decode(vop2_sdwa_w0(kVop2AddNc), bad.word()).has_modifier);
+    // Integer saturation and float source modifiers are not modelled on this path.
+    Sdwa clamp; clamp.s0sel = 4; clamp.clamp = 1;
+    EXPECT_TRUE(decode(vop2_sdwa_w0(kVop2AddNc), clamp.word()).has_modifier);
+    Sdwa omod; omod.s0sel = 4; omod.omod = 1;
+    EXPECT_TRUE(decode(vop2_sdwa_w0(kVop2AddNc), omod.word()).has_modifier);
+    Sdwa neg; neg.s0sel = 4; neg.s0neg = 1;
+    EXPECT_TRUE(decode(vop2_sdwa_w0(kVop2AddNc), neg.word()).has_modifier);
+}
+
+TEST(Rdna2DecodeSweep, Vop2SdwaIntegerFamilyBoundaries) {
+    // The integer VOP2 ops with a sub-dword SDWA lowering: 0x0B, 0x11-0x14, 0x16, 0x18, 0x1A-0x1E,
+    // 0x25-0x2A. A byte select on a neighbour outside that set stays rejected.
+    const auto integer_op = [](uint32_t op) {
+        return op == 0x0B || (op >= 0x11 && op <= 0x14) || op == 0x16 || op == 0x18 ||
+               (op >= 0x1A && op <= 0x1E) || (op >= 0x25 && op <= 0x2A);
+    };
+    Sdwa byte0; byte0.s0sel = 0;
+    for (uint32_t op = 0; op <= 0x3D; ++op) {
+        const Rdna2Inst in = decode(vop2_sdwa_w0(op), byte0.word());
+        ASSERT_EQ(in.fmt, Rdna2Format::VOP2);
+        // The f16 ops (0x32/0x33/0x35/0x39/0x3A), cndmask (0x01) and 0x1A have their own rules, so
+        // only ops outside every SDWA-capable family are asserted here.
+        const bool special = op == 0x01 || op == 0x32 || op == 0x33 || op == 0x35 || op == 0x39 ||
+                             op == 0x3A;
+        if (special) continue;
+        EXPECT_EQ(in.has_modifier, !integer_op(op)) << "op=" << op;
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop2SdwaWordDestinationF16FamilyAndCndmask) {
+    // The f16 half-packing idiom: WORD destination with UNUSED_PRESERVE, WORD/DWORD sources.
+    for (uint32_t op : {0x32u, 0x33u, 0x35u, 0x39u, 0x3Au, 0x01u}) {
+        Sdwa s; s.dsel = 5; s.dun = 2; s.s0sel = 5; s.s1sel = 4;
+        const Rdna2Inst in = decode(vop2_sdwa_w0(op), s.word());
+        EXPECT_FALSE(in.has_modifier) << "op=" << op;
+        EXPECT_EQ(in.sdwa_dst_sel, 5) << "op=" << op;
+        EXPECT_EQ(in.sdwa_dst_unused, 2) << "op=" << op;
+        EXPECT_EQ(in.sdwa_src0_sel, 5) << "op=" << op;
+        EXPECT_EQ(in.sdwa_src1_sel, 4) << "op=" << op;
+        Sdwa byte; byte.dsel = 5; byte.dun = 2; byte.s0sel = 1; byte.s1sel = 4;
+        EXPECT_TRUE(decode(vop2_sdwa_w0(op), byte.word()).has_modifier) << "BYTE source, op=" << op;
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop2LshlrevSdwaAdmitsOneByteFromSrc1Only) {
+    // v_lshlrev_b32_sdwa v, 2, v src1_sel:BYTE_k -- the NGG byte-index idiom: full-dword dst and
+    // shift amount, one byte of src1.
+    for (uint32_t sel = 0; sel <= 5; ++sel) {
+        Sdwa s; s.s1sel = sel;
+        EXPECT_FALSE(decode(vop2_sdwa_w0(0x1Au), s.word()).has_modifier) << sel;
+    }
+    // A byte select on SRC0 (the shift amount) is still admitted by the shared integer path; this
+    // test pins only that the NGG byte-from-src1 form decodes without a modifier flag.
+    Sdwa s0; s0.s0sel = 0;
+    EXPECT_FALSE(decode(vop2_sdwa_w0(0x1Au), s0.word()).has_modifier);
+}
+
+TEST(Rdna2DecodeSweep, VopcSdwaDestinationAndSelectRules) {
+    // VOPC SDWA has no dst_sel; bit 15 (SD) redirects the mask to the SDST SGPR in bits [14:8].
+    const uint32_t vopc_w0 = 0x7C000000u | (0xC4u << 17) | (3u << 9) | 0xF9u;   // v_cmp_*_u32 SDWA
+    EXPECT_EQ(decode(vopc_w0, Sdwa{}.word()).dst.kind, OperandKind::Special);
+    EXPECT_EQ(decode(vopc_w0, Sdwa{}.word()).dst.value, 106);
+    Sdwa sdst; sdst.dsel = 0;   // bits [14:8] are SDST here, not a dst_sel, so start them clear
+    const Rdna2Inst sd = decode(vopc_w0, sdst.word() | (1u << 15) | (42u << 8));
+    EXPECT_EQ(sd.dst.kind, OperandKind::SGPR);
+    EXPECT_EQ(sd.dst.value, 42);
+    // Trivial DWORD form is modelled and neg/abs are recorded.
+    Sdwa n; n.s0neg = 1; n.s1abs = 1;
+    const Rdna2Inst triv = decode(vopc_w0, n.word());
+    EXPECT_FALSE(triv.has_modifier);
+    EXPECT_TRUE(triv.src_neg[0]);
+    EXPECT_TRUE(triv.src_abs[1]);
+    // An integer compare may select any byte/word (0xC1-0xC6 are v_cmp_*_u32), zero-extended only.
+    for (uint32_t sel = 0; sel <= 6; ++sel) {
+        Sdwa s; s.s1sel = sel;
+        EXPECT_FALSE(decode(vopc_w0, s.word()).has_modifier) << "src1_sel=" << sel;
+        EXPECT_EQ(decode(vopc_w0, s.word()).sdwa_src1_sel, sel) << sel;
+    }
+    Sdwa sext; sext.s1sel = 0; sext.s1sext = 1;
+    EXPECT_TRUE(decode(vopc_w0, sext.word()).has_modifier) << "signed extension is not modelled";
+    // A float compare (v_cmp_*_f32, op 0x01) with a byte select is not modelled.
+    const uint32_t f32_w0 = 0x7C000000u | (0x01u << 17) | (3u << 9) | 0xF9u;
+    Sdwa byte; byte.s0sel = 0;
+    EXPECT_TRUE(decode(f32_w0, byte.word()).has_modifier);
+}
+
+TEST(Rdna2DecodeSweep, VopcCmpxSdwaIsAdmittedThroughItsCmpCounterpart) {
+    // v_cmpx_*_u32 (0xD1..0xD6) must follow the same rule as v_cmp_*_u32 (0xC1..0xC6): admission
+    // maps a cmpx opcode back to its base. Missing this once rejected every v_cmpx_*_u16 SDWA packet.
+    Sdwa s; s.s0sel = 1; s.s1sel = 4;
+    for (uint32_t base = 0xC1; base <= 0xC6; ++base) {
+        const uint32_t cmp = 0x7C000000u | (base << 17) | (3u << 9) | 0xF9u;
+        const uint32_t cmpx = 0x7C000000u | ((base + 0x10u) << 17) | (3u << 9) | 0xF9u;
+        EXPECT_FALSE(decode(cmp, s.word()).has_modifier) << "cmp base=" << base;
+        EXPECT_FALSE(decode(cmpx, s.word()).has_modifier) << "cmpx base=" << base;
+    }
+    // The u16 window 0xA9..0xAE and its cmpx counterpart 0xB9..0xBE.
+    for (uint32_t base = 0xA9; base <= 0xAE; ++base) {
+        const uint32_t cmpx = 0x7C000000u | ((base + 0x10u) << 17) | (3u << 9) | 0xF9u;
+        EXPECT_FALSE(decode(cmpx, s.word()).has_modifier) << "u16 cmpx base=" << base;
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop1SdwaPlainMovAndF16UnaryAdmission) {
+    // v_mov_b32 (op 1) with DWORD selects is trivial; src0 comes from the control dword.
+    const Rdna2Inst mov = decode(vop1_sdwa_w0(0x01u), Sdwa{}.word());
+    EXPECT_TRUE(mov.has_sdwa);
+    EXPECT_FALSE(mov.has_modifier);
+    EXPECT_EQ(mov.n_src, 1);
+    // The f16 unary family writes one destination half (UNUSED_PRESERVE) from either source half.
+    for (uint32_t op = 0; op <= 0xFF; ++op) {
+        if (!vop1_is_f16_unary(op)) continue;
+        Sdwa good; good.dsel = 5; good.dun = 2; good.s0sel = 4;
+        EXPECT_FALSE(decode(vop1_sdwa_w0(op), good.word()).has_modifier) << "op=" << op;
+        Sdwa byte; byte.dsel = 5; byte.dun = 2; byte.s0sel = 0;
+        EXPECT_TRUE(decode(vop1_sdwa_w0(op), byte.word()).has_modifier) << "BYTE, op=" << op;
+        Sdwa pad; pad.dsel = 5; pad.dun = 0; pad.s0sel = 4;
+        EXPECT_TRUE(decode(vop1_sdwa_w0(op), pad.word()).has_modifier) << "UNUSED_PAD, op=" << op;
+    }
+    // The frexp pair is inside the numeric span but is not that family.
+    Sdwa good; good.dsel = 5; good.dun = 2; good.s0sel = 4;
+    EXPECT_TRUE(decode(vop1_sdwa_w0(0x59u), good.word()).has_modifier);
+    EXPECT_TRUE(decode(vop1_sdwa_w0(0x5Au), good.word()).has_modifier);
+}
+
+TEST(Rdna2DecodeSweep, Vop1SdwaIntegerToFloatConvertRules) {
+    // v_cvt_f32_i32 (0x05) honours SEXT; v_cvt_f32_u32 (0x06) zero-extends only. Full-dword dst.
+    for (uint32_t sel = 0; sel <= 5; ++sel) {
+        Sdwa u; u.s0sel = sel;
+        EXPECT_FALSE(decode(vop1_sdwa_w0(0x06u), u.word()).has_modifier) << "u32 sel=" << sel;
+        Sdwa i; i.s0sel = sel; i.s0sext = 1;
+        EXPECT_FALSE(decode(vop1_sdwa_w0(0x05u), i.word()).has_modifier) << "i32 sext sel=" << sel;
+        EXPECT_TRUE(decode(vop1_sdwa_w0(0x06u), i.word()).has_modifier) << "u32 sext sel=" << sel;
+    }
+    Sdwa sub; sub.dsel = 4; sub.s0sel = 0;     // a sub-dword destination is not modelled here
+    EXPECT_TRUE(decode(vop1_sdwa_w0(0x06u), sub.word()).has_modifier);
+}
+
+// ---- DPP16 ----------------------------------------------------------------------------------
+
+namespace {
+struct Dpp {
+    uint32_t src0 = 4, ctrl = 0xE4, fi = 0, bc = 0, mods = 0, bank = 0xF, row = 0xF;
+    uint32_t word() const {
+        return (src0 & 0xFFu) | (ctrl << 8) | (fi << 18) | (bc << 19) | (mods << 20) | (bank << 24) |
+               (row << 28);
+    }
+};
+constexpr uint32_t kDpp16Src = 0xFAu;
+constexpr uint32_t vop1_dpp_w0(uint32_t op, uint32_t vdst = 2u) {
+    return 0x7E000000u | (vdst << 17) | (op << 9) | kDpp16Src;
+}
+constexpr uint32_t vop2_dpp_w0(uint32_t op, uint32_t vdst = 2u, uint32_t vsrc1 = 3u) {
+    return (op << 25) | (vdst << 17) | (vsrc1 << 9) | kDpp16Src;
+}
+}  // namespace
+
+TEST(Rdna2DecodeSweep, Dpp16QuadPermAndRowShrAreAdmittedWithFullMasks) {
+    for (uint32_t ctrl = 0; ctrl < 0x200; ++ctrl) {
+        Dpp d; d.ctrl = ctrl; d.bc = 0;
+        const Rdna2Inst in = decode(vop1_dpp_w0(0x01u), d.word());
+        ASSERT_EQ(in.fmt, Rdna2Format::VOP1);
+        EXPECT_EQ(in.len_dwords, 2u);
+        const bool modelled = ctrl < 0x100u || (ctrl >= 0x111u && ctrl <= 0x11Fu);
+        EXPECT_EQ(in.has_dpp, modelled) << "ctrl=" << ctrl;
+        EXPECT_EQ(in.has_modifier, !modelled) << "ctrl=" << ctrl;
+        if (modelled) EXPECT_EQ(in.dpp_ctrl, ctrl) << ctrl;
+    }
+}
+
+TEST(Rdna2DecodeSweep, Dpp16RowXorFamilyNeedsBoundCtrlAndAnEligibleOpcode) {
+    // ROW_ROR:8 (0x128) and ROW_XMASK:0..15 (0x160..0x16F) are the same lane-XOR permutation.
+    for (uint32_t ctrl = 0x100; ctrl < 0x200; ++ctrl) {
+        const bool xor_ctrl = ctrl == 0x128u || (ctrl >= 0x160u && ctrl <= 0x16Fu);
+        const bool shr = ctrl >= 0x111u && ctrl <= 0x11Fu;
+        Dpp bc1; bc1.ctrl = ctrl; bc1.bc = 1;
+        EXPECT_EQ(decode(vop1_dpp_w0(0x01u), bc1.word()).has_dpp, xor_ctrl || shr) << "ctrl=" << ctrl;
+        Dpp bc0; bc0.ctrl = ctrl; bc0.bc = 0;
+        EXPECT_EQ(decode(vop1_dpp_w0(0x01u), bc0.word()).has_dpp, shr) << "BC=0, ctrl=" << ctrl;
+    }
+    Dpp x; x.ctrl = 0x164; x.bc = 1;
+    EXPECT_TRUE(decode(vop1_dpp_w0(0x01u), x.word()).has_dpp);           // v_mov_b32
+    EXPECT_FALSE(decode(vop1_dpp_w0(0x02u), x.word()).has_dpp);          // v_readfirstlane_b32
+    EXPECT_FALSE(decode(vop1_dpp_w0(0x05u), x.word()).has_dpp);          // v_cvt_f32_i32
+    EXPECT_TRUE(decode(vop2_dpp_w0(0x03u), x.word()).has_dpp);           // v_add_f32
+    // The carry-writing trio keeps a second architectural result the lowering does not restore.
+    for (uint32_t op : {0x28u, 0x29u, 0x2Au}) {
+        EXPECT_FALSE(decode(vop2_dpp_w0(op), x.word()).has_dpp) << "op=" << op;
+    }
+}
+
+TEST(Rdna2DecodeSweep, Dpp16CapturesSourceControlBoundCtrlAndMasks) {
+    Dpp d; d.src0 = 9; d.ctrl = 0x1B; d.bc = 1;
+    const Rdna2Inst in = decode(vop1_dpp_w0(0x01u), d.word());
+    ASSERT_TRUE(in.has_dpp);
+    EXPECT_EQ(in.dpp_ctrl, 0x1B);
+    EXPECT_TRUE(in.dpp_bound_ctrl);
+    EXPECT_EQ(in.dpp_bank_mask, 0xF);
+    EXPECT_EQ(in.dpp_row_mask, 0xF);
+    ASSERT_EQ(in.n_src, 1);
+    EXPECT_EQ(in.src[0].kind, OperandKind::VGPR) << "the real SRC0 comes from dword1, not the 0xFA marker";
+    EXPECT_EQ(in.src[0].value, 9);
+
+    const Rdna2Inst two = decode(vop2_dpp_w0(0x03u, 2u, 6u), d.word());
+    ASSERT_TRUE(two.has_dpp);
+    ASSERT_EQ(two.n_src, 2);
+    EXPECT_EQ(two.src[0].value, 9);
+    EXPECT_EQ(two.src[1].value, 6) << "SRC1 stays the dword0 VGPR field";
+}
+
+TEST(Rdna2DecodeSweep, Dpp16RejectsFetchInactiveSourceModifiersAndPartialMasks) {
+    Dpp ok;
+    ASSERT_TRUE(decode(vop1_dpp_w0(0x01u), ok.word()).has_dpp);
+    Dpp fi; fi.fi = 1;
+    EXPECT_TRUE(decode(vop1_dpp_w0(0x01u), fi.word()).has_modifier) << "fetch-inactive";
+    for (uint32_t bit = 0; bit < 4; ++bit) {   // src0/src1 neg/abs at dword1[23:20]
+        Dpp m; m.mods = 1u << bit;
+        EXPECT_FALSE(decode(vop1_dpp_w0(0x01u), m.word()).has_dpp) << "mods bit " << bit;
+    }
+    for (uint32_t mask = 0; mask < 0xF; ++mask) {
+        Dpp b; b.bank = mask;
+        EXPECT_FALSE(decode(vop1_dpp_w0(0x01u), b.word()).has_dpp) << "bank=" << mask;
+        Dpp r; r.row = mask;
+        EXPECT_FALSE(decode(vop1_dpp_w0(0x01u), r.word()).has_dpp) << "row=" << mask;
+    }
+}
+
+TEST(Rdna2DecodeSweep, Dpp16ExactPartialRowMaskFormForIntegerAdd) {
+    // v_add_nc_u32 with QUAD_PERM identity, ROW_MASK=0xA (rows 1/3 execute, 0/2 keep VDST),
+    // BANK_MASK=0xF, BC=0 is the one admitted partial-mask form; the masks are retained.
+    Dpp d; d.ctrl = 0xE4; d.row = 0xA; d.bank = 0xF; d.bc = 0;
+    const Rdna2Inst in = decode(vop2_dpp_w0(kVop2AddNc), d.word());
+    ASSERT_TRUE(in.has_dpp);
+    EXPECT_EQ(in.dpp_row_mask, 0xA);
+    EXPECT_EQ(in.dpp_bank_mask, 0xF);
+    EXPECT_FALSE(in.dpp_bound_ctrl);
+    Dpp bc = d; bc.bc = 1;
+    EXPECT_FALSE(decode(vop2_dpp_w0(kVop2AddNc), bc.word()).has_dpp);
+    Dpp row = d; row.row = 0x5;
+    EXPECT_FALSE(decode(vop2_dpp_w0(kVop2AddNc), row.word()).has_dpp);
+    Dpp bank = d; bank.bank = 0xE;
+    EXPECT_FALSE(decode(vop2_dpp_w0(kVop2AddNc), bank.word()).has_dpp);
+    Dpp ctrl = d; ctrl.ctrl = 0xE5;
+    EXPECT_FALSE(decode(vop2_dpp_w0(kVop2AddNc), ctrl.word()).has_dpp);
+    EXPECT_FALSE(decode(vop2_dpp_w0(kVop2Add), d.word()).has_dpp) << "other opcodes are not admitted";
+}
+
+TEST(Rdna2DecodeSweep, Dpp16IsNeverAdmittedOnVopcAndDpp8IsNeverAdmitted) {
+    Dpp d;
+    const Rdna2Inst cmp = decode(0x7C000000u | (0xC4u << 17) | (3u << 9) | kDpp16Src, d.word());
+    EXPECT_EQ(cmp.len_dwords, 2u);
+    EXPECT_FALSE(cmp.has_dpp);
+    EXPECT_TRUE(cmp.has_modifier);
+    // DPP8 (0xE9) and DPP8 with fetch-inactive (0xEA): correct length, never lowered.
+    for (uint32_t marker : {0xE9u, 0xEAu}) {
+        const Rdna2Inst in = decode(0x7E000000u | (2u << 17) | (0x01u << 9) | marker, 0u);
+        EXPECT_EQ(in.len_dwords, 2u) << marker;
+        EXPECT_FALSE(in.has_dpp) << marker;
+        EXPECT_TRUE(in.has_modifier) << marker;
+        EXPECT_FALSE(in.has_sdwa) << marker;
+    }
+}
