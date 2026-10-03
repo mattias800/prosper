@@ -5,6 +5,7 @@
 #include "hle/memory/guest_memory_topology.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
+#include "gpu/diagnostics/fence_build_journal.hpp"
 #include "gpu/execute/mb3_freelist.hpp"
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not switch a default-ON guard off
 #include "diagnostics/env_cache.hpp"   // cached PROSPER_* gates on per-draw/per-resource paths
@@ -401,24 +402,14 @@ std::atomic<uint32_t> g_fold_seq{0};                  // top-level fold counter 
 // build->exec distance expressible in FOLDS rather than only in milliseconds: a wall-clock age is
 // not comparable between a route that adds a fixed delay per submit and one that does not, because
 // the delay changes how many submits fit in a millisecond. See fold_margin_* below.
-struct FenceBuildRec { uint64_t pkt, addr, pre; uint64_t t_ms; uint32_t fold; };
-constexpr uint32_t kJournalSize = 65536;                // power of two
-FenceBuildRec g_fence_journal[kJournalSize];
-inline uint32_t journal_slot(uint64_t pkt) { return (uint32_t)((pkt >> 2) * 2654435761u) & (kJournalSize - 1); }
 }
 extern "C" void prosper_fence_journal_record(uint64_t pkt, uint64_t addr) {
-    if (!pkt) return;
-    uint64_t pre = 0;
-    if (addr >= 0x10000 && !(addr & 3)) memcpy(&pre, (const void*)(uintptr_t)addr, sizeof pre);
-    FenceBuildRec& r = g_fence_journal[journal_slot(pkt)];
-    r.pkt = pkt; r.addr = addr; r.pre = pre; r.t_ms = now_ms();
-    r.fold = g_fold_seq.load(std::memory_order_relaxed);
+    fence_build_journal_record(pkt, addr, now_ms(), g_fold_seq.load(std::memory_order_relaxed));
 }
 extern "C" int prosper_fence_journal_lookup(uint64_t pkt, uint64_t* addr, uint64_t* pre, uint64_t* t_ms,
                                             uint32_t* fold) {
-    if (!pkt) return 0;
-    const FenceBuildRec& r = g_fence_journal[journal_slot(pkt)];
-    if (r.pkt != pkt) return 0;
+    FenceBuildRecord r;
+    if (!fence_build_journal_lookup(pkt, r)) return 0;
     *addr = r.addr; *pre = r.pre; *t_ms = r.t_ms;
     if (fold) *fold = r.fold;
     return 1;
