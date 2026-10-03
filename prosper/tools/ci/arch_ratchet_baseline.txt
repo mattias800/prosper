@@ -147,7 +147,7 @@ getenv|prosper/src/host/symbols/il2cpp_symbols.cpp 1
 getenv|prosper/src/host/tls/guest_tls.cpp 6
 getenv|prosper/src/loader/linker.cpp 1
 getenv|prosper/src/self/module.cpp 5
-getenv|prosper/tests/fixtures/render_runner.h 100
+getenv|prosper/tests/fixtures/render_runner.h 96
 blocking-sync|prosper/frontends/prosper-app/fps_overlay.cpp|vkDeviceWaitIdle 1
 blocking-sync|prosper/frontends/prosper-app/library_media.cpp|vkDeviceWaitIdle 1
 blocking-sync|prosper/frontends/prosper-app/library_media.cpp|vkWaitForFences 1
@@ -187,7 +187,7 @@ file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8757
 # note #3951: eighteen net lines, including two scoped-format wraps, connect owned input/output
 # plans to the existing renderer companion.
 # Logical64 current READFIRST/raw-load results complete before normal guest attachment publication.
-file-size|prosper/tests/fixtures/render_runner.h 16776  # raised from 16700: grown by #4173 (GPU breadcrumbs) before this gate landed
+file-size|prosper/tests/fixtures/render_runner.h 16460  # Two mechanical same-TU moves preserve incoming hooks below accepted main's 16776 cap
 test-dep|prosper/frontends/shared/live/live_renderer.cpp 73
 test-dep|prosper/frontends/shared/live/live_renderer_internal.hpp 20
 test-dep|prosper/frontends/shared/live/submit_renderer/backend_draws.cpp 9
@@ -246,9 +246,9 @@ platform-ifdef|prosper/src/hle/libc/hle_libc.cpp 17
 platform-ifdef|prosper/src/hle/libc/libc_variadic_capture.cpp 4
 platform-ifdef|prosper/src/hle/libc/libc_variadic_capture.hpp 1
 platform-ifdef|prosper/src/hle/memory/heap_mutex.hpp 1
-# note #3951: Linux lazy-fault granules and Windows committed/readable narrowing supplement the
-# same HLE origin proof; the query never commits or repairs guest mappings.
-platform-ifdef|prosper/src/hle/memory/hle_kernel_mem.cpp 18
+# note #3951: Linux lazy-fault granules, Windows committed/readable and Darwin mach_vm_region narrowing
+# supplement the same HLE origin proof; the query never commits or repairs guest mappings.
+platform-ifdef|prosper/src/hle/memory/hle_kernel_mem.cpp 19
 platform-ifdef|prosper/src/hle/np/np.cpp 10
 platform-ifdef|prosper/src/hle/service/hle_service.cpp 7
 platform-ifdef|prosper/src/hle/service/service_trace.hpp 1

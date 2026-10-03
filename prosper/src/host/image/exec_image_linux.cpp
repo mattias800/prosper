@@ -4,6 +4,7 @@
 #include "host/image/module_start_params.hpp"
 #include "host/image/runtime_module_load.hpp"
 #include "host/image/stub_append_batch.hpp"
+#include "host/image/guest_fs_swap_stub.hpp"
 #include "host/abi/sysv_ms_bridge.hpp"
 #include "host/platform/immortal.hpp"   // #2613: registries a guest thread can reach after exit()
 #include "host/x86/sse4a.hpp"
@@ -3102,34 +3103,7 @@ namespace {
     // 8 mod 16; five qwords of storage make the call site 0 mod 16 and the handler entry 8 mod 16.
     // Keep offsets/magic in sync with guest_tls.cpp.
     size_t emit_swap_stub(uint8_t* p, uint32_t idx, uint64_t fn, bool unimpl) {
-        uint8_t* s = p;
-        // Keep the target in caller-saved r10 across the FS probe/swap. Loading it once avoids
-        // duplicating a movabs in both branches and leaves room for the fourth guest stack arg.
-        if (unimpl) { *p++ = 0xBF; memcpy(p, &idx, 4); p += 4; }             // mov edi, idx
-        *p++ = 0x49; *p++ = 0xBA; memcpy(p, &fn, 8); p += 8;                // movabs r10, fn
-        // rdfsbase r11 ; cmp dword [r11+0x108], MAGIC ; jne .host
-        *p++=0xF3; *p++=0x49; *p++=0x0F; *p++=0xAE; *p++=0xC3;
-        *p++=0x41; *p++=0x81; *p++=0xBB; uint32_t mo=0x108; memcpy(p,&mo,4); p+=4;
-        uint32_t magic=0x50524F53u; memcpy(p,&magic,4); p+=4;
-        *p++=0x75; uint8_t* jne_rel = p++;                                  // jne rel8 (patched below)
-        // .guest: save r11, then re-push original args 10/9/8/7. Each source remains at rsp+0x28
-        // as the stack moves. Five qwords put the handler call site at the required alignment.
-        *p++=0x41; *p++=0x53;                                               // push r11
-        *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg10
-        *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg9
-        *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg8
-        *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg7
-        *p++=0x49; *p++=0x8B; *p++=0x83; uint32_t ho=0x100; memcpy(p,&ho,4); p+=4;
-        *p++=0xF3; *p++=0x48; *p++=0x0F; *p++=0xAE; *p++=0xD0;              // wrfsbase host FS
-        *p++=0x41; *p++=0xFF; *p++=0xD2;                                    // call r10
-        *p++=0x48; *p++=0x83; *p++=0xC4; *p++=0x20;                         // discard arg copies
-        *p++=0x41; *p++=0x5B;                                               // pop r11
-        *p++=0xF3; *p++=0x49; *p++=0x0F; *p++=0xAE; *p++=0xD3;              // restore guest FS
-        *p++=0xC3;                                                          // ret
-        // .host: no FS swap is needed; tail-call the already loaded target.
-        *jne_rel = (uint8_t)(p - (jne_rel + 1));
-        *p++=0x41; *p++=0xFF; *p++=0xE2;                                    // jmp r10
-        return static_cast<size_t>(p - s);
+        return emit_guest_fs_swap_stub(p, idx, fn, unimpl);
     }
     size_t emit_impl_swap(uint8_t* p, uint64_t fn)                 { return emit_swap_stub(p, 0,   fn, false); }
     size_t emit_unimpl_swap(uint8_t* p, uint32_t idx, uint64_t fn) { return emit_swap_stub(p, idx, fn, true); }

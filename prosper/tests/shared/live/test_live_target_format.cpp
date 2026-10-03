@@ -293,3 +293,52 @@ TEST(LiveTargetFormat, Contract) {
 
     EXPECT_EQ(fails, 0);
 }
+
+// #4291: a CB_COLOR ALT (BGRA) target that the renderer keeps as canonical RGBA8.
+TEST(LiveTargetComponentOrder, OnlyBgraGuestOverRgbaHostIsSwapped) {
+    using namespace prosper::frontend;
+    EXPECT_TRUE(live_target_component_order_bgra(VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM));
+    EXPECT_TRUE(live_target_component_order_bgra(VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM));
+    EXPECT_FALSE(live_target_component_order_bgra(VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM));
+    EXPECT_FALSE(live_target_component_order_bgra(VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM))
+        << "a host image that kept BGRA needs no translation";
+    EXPECT_FALSE(live_target_component_order_bgra(VK_FORMAT_UNDEFINED, VK_FORMAT_R8G8B8A8_UNORM));
+}
+
+TEST(LiveTargetComponentOrder, HostSelectorSwapsOnlyXAndZ) {
+    using namespace prosper::frontend;
+    // A BGRA descriptor's usual (Z,Y,X,W) becomes identity over the canonical image.
+    EXPECT_EQ(live_target_host_selector(6, true), 4u);
+    EXPECT_EQ(live_target_host_selector(5, true), 5u);
+    EXPECT_EQ(live_target_host_selector(4, true), 6u);
+    EXPECT_EQ(live_target_host_selector(7, true), 7u);
+    EXPECT_EQ(live_target_host_selector(0, true), 0u);
+    EXPECT_EQ(live_target_host_selector(1, true), 1u);
+    for (uint32_t s = 0; s < 8; ++s) EXPECT_EQ(live_target_host_selector(s, false), s);
+}
+
+TEST(LiveTargetComponentOrder, SwapExchangesRedAndBlueOfEveryTexel) {
+    std::vector<uint8_t> pixels{1, 2, 3, 4, 5, 6, 7, 8, 9};
+    prosper::frontend::swap_rgba8_red_blue(pixels);
+    EXPECT_EQ(pixels, (std::vector<uint8_t>{3, 2, 1, 4, 7, 6, 5, 8, 9}))
+        << "G and A stay; a trailing partial texel is untouched";
+}
+
+// The graphics sampled path keeps its own copy of the composition. Pin the two to one answer, so
+// a change to either cannot leave compute and graphics reading a BGRA target differently.
+TEST(LiveTargetComponentOrder, GraphicsAndComputeCompositionsAgree) {
+    for (VkFormat guest : {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM}) {
+        for (uint32_t s = 0; s < 8; ++s) {
+            if (s == 2 || s == 3) continue;
+            prosper::test::FrameResource resource{};
+            resource.render_target_guest_format = guest;
+            resource.swizzle[0] = s; resource.swizzle[1] = 5; resource.swizzle[2] = 6;
+            resource.swizzle[3] = 7;
+            const auto graphics = prosper::test::backend_sampled_component_swizzle(resource);
+            const bool bgra = prosper::frontend::live_target_component_order_bgra(
+                guest, prosper::test::backend_color_format(guest));
+            EXPECT_EQ(graphics[0], prosper::frontend::live_target_host_selector(s, bgra))
+                << "guest format " << guest << " selector " << s;
+        }
+    }
+}

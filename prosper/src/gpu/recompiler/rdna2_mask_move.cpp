@@ -18,16 +18,34 @@ const char* packet_b64_mask_move_source_gap(const SpirvCompute& b, const Rdna2In
                                             const std::set<int>& masks,
                                             const std::set<int>& scalar_words,
                                             const std::set<int>& ambiguous) {
+    const bool saveexec = in.opcode == kSop1OpcodeAndSaveexecB64;
     if (!b.is_fragment_packet() || b.wave_size != 64 || in.fmt != Rdna2Format::SOP1 ||
-        in.opcode != 0x04 || (in.dst.value != 126 && in.dst.value != 106) ||
+        (!saveexec && (in.opcode != 0x04 || (in.dst.value != 126 && in.dst.value != 106))) ||
         in.src[0].kind != OperandKind::SGPR)
         return nullptr;
     const int source = in.src[0].value;
     const bool low = scalar_words.contains(source), high = scalar_words.contains(source + 1);
     if (low && high) return nullptr;
     if (!low && !high && masks.contains(source) && !ambiguous.contains(source)) return nullptr;
-    return in.dst.value == 126 ? "packet-exec-mask-source-words-unavailable"
-                               : "packet-vcc-mask-source-words-unavailable";
+    return saveexec              ? "packet-saveexec-mask-source-words-unavailable"
+           : in.dst.value == 126 ? "packet-exec-mask-source-words-unavailable"
+                                 : "packet-vcc-mask-source-words-unavailable";
+}
+
+// RDNA2 70648 section12.3/page117: AND_SAVEEXEC reads the complete source and OLD EXEC before
+// publishing either destination. Resolve a current numeric pair before any older Bool spelling;
+// the CFG guard above proves both words on every reaching path. Neither sreg_input nor a missing
+// physical half supplies current authority. A genuine zero pair still produces a predicate ID.
+// Passing the existing fallback preserves native lowering and its emission order unchanged.
+uint32_t packet_and_saveexec_source_mask(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in,
+                                         uint32_t fallback) {
+    if (!b.is_fragment_packet() || b.wave_size != 64 || in.fmt != Rdna2Format::SOP1 ||
+        in.opcode != kSop1OpcodeAndSaveexecB64 || in.src[0].kind != OperandKind::SGPR)
+        return fallback;
+    const auto low = rs.sreg.find(in.src[0].value), high = rs.sreg.find(in.src[0].value + 1);
+    if (low == rs.sreg.end() || high == rs.sreg.end()) return fallback;
+    return numeric_pair_mask_bit(b, low->second, high->second,
+                                 b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63)));
 }
 
 // A complete scalar move INTO VCC defines both physical words, independently of EXEC, and

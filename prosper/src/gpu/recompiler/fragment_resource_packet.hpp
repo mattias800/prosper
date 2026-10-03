@@ -82,7 +82,8 @@ struct FragmentResourcePacketProgram {
     std::vector<uint32_t> runtime_failure_pcs; // exact original service PCs, never caller guesses
 };
 struct FragmentResourcePacketResult {
-    std::vector<uint32_t> exports; // EMPTY on ANY malformed/failing worker or readback failure
+    std::vector<uint32_t> exports;   // EMPTY on ANY malformed/failing worker or readback failure
+    std::vector<FragmentPacketArchitecturalLane> architectural_exports;
     std::string rejection;
     uint32_t lane = UINT32_MAX, pc = UINT32_MAX;
     uint32_t vgpr = UINT32_MAX;

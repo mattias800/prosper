@@ -522,8 +522,9 @@ TEST(AprRegistry, Contract) {
             CHECK(error_guard[0] == 0x11111111u && error_guard[1] == 0 &&
                       error_guard[2] == 0x22222222u,
                   "id-only resolver writes only the scalar errorIndex");
-            CHECK(wait_cb(1, 0, 0, 0, 0, 0) == 0,
-                  "APR wait observes eagerly completed command buffers");
+            // The wait half of this arm moved below register_kernel_mem_hle(): since 5e1c2120e a
+            // wait names an ID a submit returned, and the submit NIDs are not registered yet here.
+            (void)wait_cb;
 
             // Sonic Origins keeps loose Hedgehog Engine assets below app0/raw, while CRI's ACB
             // metadata names an external AWB relative to that content root (sound/Foo.awb). APR
@@ -803,8 +804,7 @@ TEST(AprRegistry, Contract) {
         CHECK(Hle::lookup("Omr9X+YmT7I") == nullptr && Hle::lookup("0ers1N4C9CY") == nullptr,
               "#1629: the _TEST-suffixed submit NIDs are left unimplemented, not aliased");
 
-        // An unbound command buffer is the case that hands a token back through the out slots, so it
-        // is the one that can demonstrate the difference.
+        // Only AndGetResult has result slots; the plain form must leave its argument registers alone.
         alignas(8) uint64_t out1 = 0xdeadbeefcafef00dull;
         alignas(8) uint64_t out2 = 0xdeadbeefcafef00dull;
         constexpr uint64_t kResidue = 0xdeadbeefcafef00dull;
@@ -814,9 +814,18 @@ TEST(AprRegistry, Contract) {
 #ifndef _WIN32   // see #1657 — Windows publishes no token; remove with that fix
         if (submit_result_a) {
             out1 = out2 = kResidue;
+            if (HleFn reset_cb = Hle::lookup("baQO9ez2gL4")) reset_cb(cb, 0, 0, 0, 0, 0);
             submit_result_a(cb, 1, (uint64_t)(uintptr_t)&out1, (uint64_t)(uintptr_t)&out2, 0, 0);
-            CHECK(out1 != kResidue && out2 != kResidue && out1 == out2,
-                  "#1629: AndGetResult still publishes one completion token through both out slots");
+            // 5e1c2120e: slot 1 is the eight-byte status/offset result, slot 2 a four-byte submit ID.
+            CHECK(out1 == 0 && (uint32_t)out2 != (uint32_t)kResidue && (uint32_t)out2 != 0 &&
+                      (out2 >> 32) == (kResidue >> 32),
+                  "#1629: AndGetResult publishes a success result and a four-byte submit ID");
+            HleFn wait_submit = Hle::lookup("rqwFKI4PAiM");
+            CHECK(wait_submit && wait_submit((uint32_t)out2, 0, 0, 0, 0, 0) == 0,
+                  "APR wait observes the eagerly completed submit by the ID it returned");
+            CHECK(wait_submit && wait_submit(0, 0, 0, 0, 0, 0) != 0 &&
+                      wait_submit(0xffffffffu, 0, 0, 0, 0, 0) != 0,
+                  "APR wait refuses a submit ID it never issued");
         }
 #endif
         if (submit_plain) {
@@ -842,16 +851,14 @@ TEST(AprRegistry, Contract) {
     //     binding's equeue/id/tag, so its submit echoes the dead tag to the dead queue instead of
     //     handing the caller a fresh token through the result slots.
     //
-    // The observable for the second harm is the submit path's own branch: a BOUND cb (nonzero
-    // equeue) suppresses the result slots and posts the tag; an UNBOUND cb writes a fresh token
-    // into both slots and posts nothing. So "the slots were written" IS "no binding was found",
-    // which is exactly the property under test — no equeue, no worker thread, no timing.
+    // Since 5e1c2120e AndGetResult publishes its result and ID whether or not the cb is bound, so
+    // the result slots no longer reveal which branch submit took. The observable is the registry
+    // itself (prosper_apr_binding_count_for_test): a dead binding that survives its destructor is
+    // exactly what a reused address would inherit.
     //
-    // The equeue used here is a plain nonzero sentinel, never a real SceKernelEqueue: that keeps
-    // the binding on the `tag_echo` branch (which is what suppresses the slots) while
-    // prosper_eq_post_apr_token's identity guard rejects the post, so the test cannot deliver an
-    // event to anything. The point being tested is which BRANCH submit takes, not what the queue
-    // receives.
+    // The equeue used here is a plain nonzero sentinel, never a real SceKernelEqueue, so
+    // prosper_eq_post_apr_token's identity guard rejects any post and the test cannot deliver an
+    // event to anything.
     {
         HleFn bind_legacy  = Hle::lookup("H896Pt-yB4I");    // legacy: deduplicate_completion=false
         HleFn bind_320     = Hle::lookup("o67gODLFpls");    // PS5 3.20: deduplicate_completion=true
@@ -878,11 +885,11 @@ TEST(AprRegistry, Contract) {
             bind_legacy(cb_x, kFakeEq, /*id=*/0x7501, /*tag=*/0x10000000000003e8ull, 0, 0);
             CHECK(prosper_apr_binding_count_for_test(cb_x) == 1,
                   "#1674: a legacy H896Pt-yB4I bind records exactly one binding for the cb");
-            s1 = s2 = kResidue;
+            // Since 5e1c2120e AndGetResult publishes its result and ID whether or not the buffer is
+            // bound, so the slots no longer reveal the binding; the registry count is the observable.
             submit(cb_x, 1, p1, p2, 0, 0);
-            CHECK(s1 == kResidue && s2 == kResidue,
-                  "#1674 control: while the legacy binding is LIVE, submit suppresses both result "
-                  "slots (so a later write to them is a real state change, not a no-op)");
+            CHECK(prosper_apr_binding_count_for_test(cb_x) == 1,
+                  "#1674 control: submitting a bound cb leaves its binding in place");
 
             // --- the destructor must prune it. Before the fix this erased nothing.
             destruct_apr(cb_x, 0, 0, 0, 0, 0);
@@ -891,11 +898,10 @@ TEST(AprRegistry, Contract) {
 
             // --- the aliasing half: the address is reused by an unrelated buffer that never
             //     bound anything, and its submit must behave as unbound.
-            s1 = s2 = kResidue;
             submit(cb_x, 1, p1, p2, 0, 0);
-            CHECK(s1 != kResidue && s2 != kResidue && s1 == s2,
+            CHECK(prosper_apr_binding_count_for_test(cb_x) == 0,
                   "#1674: a cb reusing the destructed address does NOT inherit the dead binding -- "
-                  "submit hands it a fresh token instead of echoing the dead tag/equeue");
+                  "submit finds no binding to echo the dead tag/equeue through");
 
             // --- the 3.20 flavor keeps being pruned (the behaviour the old predicate did have),
             //     and the other destructor NID prunes too.
@@ -914,11 +920,9 @@ TEST(AprRegistry, Contract) {
             CHECK(prosper_apr_binding_count_for_test(cb_x) == 0 &&
                   prosper_apr_binding_count_for_test(cb_y) == 1,
                   "#1674: destroying one cb leaves an unrelated cb's binding intact");
-            s1 = s2 = kResidue;
             submit(cb_y, 1, p1, p2, 0, 0);
-            CHECK(s1 == kResidue && s2 == kResidue,
-                  "#1674: the surviving binding is still HONOURED -- cb_y's submit stays on the "
-                  "bound path and writes no result slots");
+            CHECK(prosper_apr_binding_count_for_test(cb_y) == 1,
+                  "#1674: the surviving binding is still recorded after cb_y's submit");
             destruct_apr(cb_y, 0, 0, 0, 0, 0);
             CHECK(prosper_apr_binding_count_for_test(cb_y) == 0,
                   "#1674: the registry is empty for both buffers once both are destructed");
