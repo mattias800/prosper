@@ -4,8 +4,6 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 
 - `rdna2_decode` — instruction decode: formats, opcodes, operands. Pure and side-effect free, which
   makes it the cheapest thing in the stack to unit-test.
-- `rdna2_packet_raw_masks` holds the existing synchronized saved-mask FFBH service outside the
-  CFG dispatcher. Its extracted status adapter preserves the caller's named refusal and order.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the
   translator: register state, control-flow structurization, and per-instruction lowering.
 - `rdna2_recompile_fragment_packet` — an owned 64-slot guest-fragment executor in a physical
@@ -61,9 +59,10 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   It grants no raster scheduling, system-entry derivation or shipping admission.
 - `rdna2_mask_move` supplies the shared S_MOV_B64-to-EXEC lowering. Owned Wave64 packets consume
   two genuine instruction-order MUST scalar words at their logical lane position, independently
-  of old EXEC, and preserve SCC. A partial numeric overwrite of a saved Bool mask remains a named
-  transitional refusal until the preserved raw half is genuinely materialized; scalar
-  initialization or the old complete Bool alias is not that proof. Native fragment lowering is
+  of old EXEC, and preserve SCC. `rdna2_packet_raw_masks` materializes selected complete ordinary
+  saved-SGPR masks through the uniform tagged workgroup phase before physical DATA reads/partial
+  replacements; either physical overwrite expires the old complete alias. Actual absent sources
+  remain named refusals; scalar initialization or the old complete Bool alias is not that proof. Native fragment lowering is
   separate and retains its existing exact-subgroup contract.
 - `spirv_builder` — small hand-built SPIR-V modules. **These include shipped shaders**:
   `frontends/shared/live/live_compute.cpp`'s `prepare_compare_pipeline()` feeds
