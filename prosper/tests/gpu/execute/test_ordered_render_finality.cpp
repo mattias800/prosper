@@ -100,7 +100,7 @@ protected:
             for (const auto& item : items) {
                 observed.draws.push_back(item.draw_index);
                 const auto* child =
-                    item.frt ? owned_nested_snapshot_at(*item.frt, 2u, 16u) : nullptr;
+                    item.prt ? owned_nested_snapshot_at(*item.prt, 2u, 16u) : nullptr;
                 EXPECT_NE(child, nullptr) << "the real registered child load must be admitted";
                 if (child && child->host_data && child->host_data_size == 16u) {
                     uint32_t word = 0;
@@ -135,12 +135,12 @@ protected:
         present_reset();
         if (guest_) {
             const auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
-            EXPECT_EQ(unmap(guest_, page_), 0u);
+            EXPECT_EQ(unmap(guest_, page_, 0, 0, 0, 0), 0u);
         }
         if (allocated_) {
             const auto release =
                 prosper::Hle::lookup(prosper::nid_hash("sceKernelReleaseDirectMemory"));
-            EXPECT_EQ(release(physical_, page_), 0u);
+            EXPECT_EQ(release(physical_, page_, 0, 0, 0, 0), 0u);
         }
         active_ = nullptr;
     }
