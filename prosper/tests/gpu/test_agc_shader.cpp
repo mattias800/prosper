@@ -1251,9 +1251,11 @@ TEST(AgcShader, Contract) {
     }
     prosper::gpu::clear_shader_recompile_cache();
     prosper::gpu::clear_shader_decode_cache();
+    prosper::gpu::clear_shader_analysis_cache();
     const auto serial_draws = prosper::gpu::realize_gpustate_draws(
         parallel_state, 0x10000, 1.0f, 1.0f, nullptr, false, false);
     const auto serial_decode = prosper::gpu::shader_decode_cache_stats();
+    const auto serial_analysis = prosper::gpu::shader_analysis_cache_stats();
     // Cold-start the address-local decode and analysis layers so parallel workers race their two
     // inserts while retaining warm compiled shaders. Entry bytes must remain exact under both races.
     prosper::gpu::clear_shader_decode_cache();
@@ -1294,8 +1296,8 @@ TEST(AgcShader, Contract) {
                   parallel_before.semantic_draws + parallel_state.draws.size() &&
               parallel_after.worker_threads > parallel_before.worker_threads,
           "dense draw realization records one multi-threaded batch");
-    CHECK(parallel_analysis.entries == 2 &&
-              parallel_analysis.bytes == sizeof(parallel_vs) + sizeof(parallel_ps),
+    CHECK(serial_analysis.entries == 2 && parallel_analysis.entries == serial_analysis.entries &&
+              parallel_analysis.bytes == serial_analysis.bytes,
           "parallel cold analysis keeps exact entry and byte accounting");
     CHECK(serial_decode.entries == 2 && parallel_decode.entries == serial_decode.entries &&
               parallel_decode.bytes == serial_decode.bytes,

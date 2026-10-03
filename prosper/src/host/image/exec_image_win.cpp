@@ -1236,8 +1236,28 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     // MEM_COMMIT is page-granular inside an existing reservation, so growth is committing, not
     // reserving. The aperture is the same [BOOT_STUB, BOOT_STUB_END) window guest_module_name
     // already labels STUB and callback_fs.hpp already treats as stubs-only.
-    if (!VirtualAlloc((void*)(uintptr_t)stub_base, kStubApertureBytes, MEM_RESERVE, PAGE_NOACCESS))
-        return fail("VirtualAlloc stub aperture reservation failed");
+    static std::vector<uint64_t> s_owned_apertures;
+    bool backend_owned_aperture = false;
+    if (std::find(s_owned_apertures.begin(), s_owned_apertures.end(), stub_base) != s_owned_apertures.end()) {
+        uint64_t cursor = stub_base;
+        const uint64_t end = stub_base + kStubApertureBytes;
+        backend_owned_aperture = true;
+        while (cursor < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery((void*)(uintptr_t)cursor, &mbi, sizeof(mbi)) ||
+                (uintptr_t)mbi.AllocationBase != (uintptr_t)stub_base ||
+                mbi.State == MEM_FREE || mbi.RegionSize == 0) {
+                backend_owned_aperture = false;
+                break;
+            }
+            cursor += mbi.RegionSize;
+        }
+    }
+    if (!backend_owned_aperture) {
+        if (!VirtualAlloc((void*)(uintptr_t)stub_base, kStubApertureBytes, MEM_RESERVE, PAGE_NOACCESS))
+            return fail("VirtualAlloc stub aperture reservation failed");
+        s_owned_apertures.push_back(stub_base);
+    }
     if (n == 0) { g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = 0; return true; }
     uint64_t region = page_up(n * stub_size);
     if (region > kStubApertureBytes) return fail("import stub table exceeds the stub aperture");

@@ -15,8 +15,8 @@ namespace prosper {
 uint32_t prosper_apr_register(const std::string&, uint64_t);
 }
 using namespace prosper;
-using GuestReadFile = uint64_t(PROSPER_SYSV_ABI *)(uint64_t,uint64_t,uint64_t,uint64_t,
-                                                 uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+using GuestReadFile = uint64_t(PROSPER_GUEST_ABI *)(uint64_t,uint64_t,uint64_t,uint64_t,
+                                                  uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 namespace {
 uint64_t ptr(const void* p) { return reinterpret_cast<uint64_t>(p); }
 class AprSubmission : public testing::Test {

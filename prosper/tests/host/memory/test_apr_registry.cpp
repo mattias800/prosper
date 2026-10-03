@@ -12,6 +12,8 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <chrono>
+#include <thread>
 #ifdef _WIN32
 #include <io.h>
 #else
@@ -522,8 +524,19 @@ TEST(AprRegistry, Contract) {
             CHECK(error_guard[0] == 0x11111111u && error_guard[1] == 0 &&
                       error_guard[2] == 0x22222222u,
                   "id-only resolver writes only the scalar errorIndex");
-            CHECK(wait_cb(1, 0, 0, 0, 0, 0) == 0,
+            // Waits are valid only for handles a completed eager submit actually issued.
+            register_kernel_mem_hle();
+            HleFn wait_submit = Hle::lookup("ASoW5WE-UPo");   // AndGetResult
+            alignas(64) uint8_t wait_cb_storage[256] = {};
+            uint32_t submitted_id = 0;
+            alignas(8) uint64_t wait_result = ~0ull;
+            const uint64_t submit_rc = wait_submit ? wait_submit((uint64_t)(uintptr_t)wait_cb_storage, 1,
+                                  (uint64_t)(uintptr_t)&wait_result, (uint64_t)(uintptr_t)&submitted_id, 0, 0) : ~0ull;
+            CHECK(wait_submit != nullptr && submit_rc == 0 && wait_result == 0 && submitted_id != 0 &&
+                      wait_cb(submitted_id, 0, 0, 0, 0, 0) == 0,
                   "APR wait observes eagerly completed command buffers");
+            CHECK(wait_cb(0xfffffff0u, 0, 0, 0, 0, 0) != 0,
+                  "APR wait refuses a handle that was never issued");
 
             // Sonic Origins keeps loose Hedgehog Engine assets below app0/raw, while CRI's ACB
             // metadata names an external AWB relative to that content root (sound/Foo.awb). APR
@@ -815,8 +828,10 @@ TEST(AprRegistry, Contract) {
         if (submit_result_a) {
             out1 = out2 = kResidue;
             submit_result_a(cb, 1, (uint64_t)(uintptr_t)&out1, (uint64_t)(uintptr_t)&out2, 0, 0);
-            CHECK(out1 != kResidue && out2 != kResidue && out1 == out2,
-                  "#1629: AndGetResult still publishes one completion token through both out slots");
+            CHECK(out1 == 0 && (uint32_t)out2 != (uint32_t)kResidue &&
+                      (out2 >> 32) == (kResidue >> 32),
+                  "#1629: AndGetResult publishes an 8-byte result in out1 and a separate 4-byte "
+                  "ID in out2 without touching its neighbouring bytes");
         }
 #endif
         if (submit_plain) {
@@ -842,31 +857,50 @@ TEST(AprRegistry, Contract) {
     //     binding's equeue/id/tag, so its submit echoes the dead tag to the dead queue instead of
     //     handing the caller a fresh token through the result slots.
     //
-    // The observable for the second harm is the submit path's own branch: a BOUND cb (nonzero
-    // equeue) suppresses the result slots and posts the tag; an UNBOUND cb writes a fresh token
-    // into both slots and posts nothing. So "the slots were written" IS "no binding was found",
-    // which is exactly the property under test — no equeue, no worker thread, no timing.
-    //
-    // The equeue used here is a plain nonzero sentinel, never a real SceKernelEqueue: that keeps
-    // the binding on the `tag_echo` branch (which is what suppresses the slots) while
-    // prosper_eq_post_apr_token's identity guard rejects the post, so the test cannot deliver an
-    // event to anything. The point being tested is which BRANCH submit takes, not what the queue
-    // receives.
+    // The observable for binding lifetime is event delivery to a real disposable SceKernelEqueue:
+    // a BOUND cb delivers its completion event to the bound queue, while an UNBOUND cb (or one
+    // reusing the address of a destructed cb) posts nothing. Submit writes its 8-byte status/offset
+    // result and 4-byte ID to the out slots on both paths without disturbing neighbouring caller
+    // residue.
     {
         HleFn bind_legacy  = Hle::lookup("H896Pt-yB4I");    // legacy: deduplicate_completion=false
         HleFn bind_320     = Hle::lookup("o67gODLFpls");    // PS5 3.20: deduplicate_completion=true
         HleFn destruct_apr = Hle::lookup("Qs1xtplKo0U");    // sceAmprAprCommandBufferDestructor
         HleFn destruct_cb  = Hle::lookup("GuchCTefuZw");    // sceAmprCommandBufferDestructor
         HleFn submit       = Hle::lookup("ASoW5WE-UPo");    // ...AndGetResult (writes result slots)
-        CHECK(bind_legacy && bind_320 && destruct_apr && destruct_cb && submit,
-              "#1674: both bind NIDs, both destructor NIDs and AndGetResult all resolve");
+        HleFn create_eq    = Hle::lookup(nid_hash("sceKernelCreateEqueue"));
+        HleFn delete_eq    = Hle::lookup(nid_hash("sceKernelDeleteEqueue"));
+        HleFn addampr      = Hle::lookup(nid_hash("sceKernelAddAmprEvent"));
+        HleFn getcount     = Hle::lookup(nid_hash("sceKernelGetEventCount"));
+        CHECK(bind_legacy && bind_320 && destruct_apr && destruct_cb && submit &&
+              create_eq && delete_eq && addampr && getcount,
+              "#1674: both bind NIDs, both destructor NIDs, AndGetResult and equeue API all resolve");
 
-        if (bind_legacy && bind_320 && destruct_apr && destruct_cb && submit) {
+        if (bind_legacy && bind_320 && destruct_apr && destruct_cb && submit &&
+            create_eq && delete_eq && addampr && getcount) {
+            uint64_t eq = 0;
+            create_eq((uint64_t)(uintptr_t)&eq, 0, 0, 0, 0, 0);
+            CHECK(eq != 0, "#1674: disposable equeue created");
+            constexpr int64_t kEventId = 0x7501;
+            addampr(eq, (uint64_t)kEventId, 0, 0, 0, 0);
+
+            auto poll_count = [&](uint64_t expected, int max_ms = 250) -> bool {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(max_ms);
+                while (std::chrono::steady_clock::now() < deadline) {
+                    if (getcount(eq, 0, 0, 0, 0, 0) == expected) return true;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                return getcount(eq, 0, 0, 0, 0, 0) == expected;
+            };
+
             constexpr uint64_t kResidue = 0xdeadbeefcafef00dull;
-            // Nonzero so the binding is "bound" (submit's test is the EQUEUE, not the tag), and
-            // deliberately not a live queue so prosper_eq_identity() answers 0 and the post is
-            // dropped by its own lifetime guard.
-            constexpr uint64_t kFakeEq  = 0x5ec0ffee0000ull;
+            // Submit writes an 8-byte status/offset result to out1 and a separate 4-byte ID to the
+            // low half of out2; the upper half of out2 must remain caller residue.
+            auto published_id = [&](uint64_t slot) {
+                return (uint32_t)slot != (uint32_t)kResidue &&
+                       (slot >> 32) == (kResidue >> 32);
+            };
+
             alignas(64) uint8_t cb_x_storage[256] = {};
             alignas(64) uint8_t cb_y_storage[256] = {};
             const uint64_t cb_x = (uint64_t)(uintptr_t)cb_x_storage;
@@ -874,15 +908,16 @@ TEST(AprRegistry, Contract) {
             alignas(8) uint64_t s1 = kResidue, s2 = kResidue;
             const uint64_t p1 = (uint64_t)(uintptr_t)&s1, p2 = (uint64_t)(uintptr_t)&s2;
 
-            // --- legacy binding: recorded, then honoured by submit (the discriminator's other pole)
-            bind_legacy(cb_x, kFakeEq, /*id=*/0x7501, /*tag=*/0x10000000000003e8ull, 0, 0);
+            // --- legacy binding: recorded, then honoured by submit with real event delivery
+            bind_legacy(cb_x, eq, kEventId, /*tag=*/0x10000000000003e8ull, 0, 0);
             CHECK(prosper_apr_binding_count_for_test(cb_x) == 1,
                   "#1674: a legacy H896Pt-yB4I bind records exactly one binding for the cb");
             s1 = s2 = kResidue;
-            submit(cb_x, 1, p1, p2, 0, 0);
-            CHECK(s1 == kResidue && s2 == kResidue,
-                  "#1674 control: while the legacy binding is LIVE, submit suppresses both result "
-                  "slots (so a later write to them is a real state change, not a no-op)");
+            uint64_t rc = submit(cb_x, 1, p1, p2, 0, 0);
+            CHECK(rc == 0 && s1 == 0 && published_id(s2),
+                  "#1674: submit publishes separate result and ID slots without touching canary residue");
+            CHECK(poll_count(1),
+                  "#1674: while the legacy binding is LIVE, submit delivers completion to the queue");
 
             // --- the destructor must prune it. Before the fix this erased nothing.
             destruct_apr(cb_x, 0, 0, 0, 0, 0);
@@ -890,16 +925,18 @@ TEST(AprRegistry, Contract) {
                   "#1674: sceAmprAprCommandBufferDestructor prunes a LEGACY binding");
 
             // --- the aliasing half: the address is reused by an unrelated buffer that never
-            //     bound anything, and its submit must behave as unbound.
+            //     bound anything, and its submit must not deliver stale events to the dead queue.
             s1 = s2 = kResidue;
-            submit(cb_x, 1, p1, p2, 0, 0);
-            CHECK(s1 != kResidue && s2 != kResidue && s1 == s2,
-                  "#1674: a cb reusing the destructed address does NOT inherit the dead binding -- "
-                  "submit hands it a fresh token instead of echoing the dead tag/equeue");
+            rc = submit(cb_x, 1, p1, p2, 0, 0);
+            CHECK(rc == 0 && s1 == 0 && published_id(s2),
+                  "#1674: a cb reusing the destructed address publishes fresh result and ID");
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            CHECK(getcount(eq, 0, 0, 0, 0, 0) == 1,
+                  "#1674: a cb reusing the destructed address does NOT deliver stale completion to the dead binding's queue");
 
             // --- the 3.20 flavor keeps being pruned (the behaviour the old predicate did have),
             //     and the other destructor NID prunes too.
-            bind_320(cb_x, kFakeEq, /*id=*/0x7501, /*tag=*/0x10000000000003e9ull, 0, 0);
+            bind_320(cb_x, eq, kEventId, /*tag=*/0x10000000000003e9ull, 0, 0);
             CHECK(prosper_apr_binding_count_for_test(cb_x) == 1,
                   "#1674: a PS5 3.20 o67gODLFpls bind records one binding for the cb");
             destruct_cb(cb_x, 0, 0, 0, 0, 0);
@@ -907,21 +944,23 @@ TEST(AprRegistry, Contract) {
                   "#1674: sceAmprCommandBufferDestructor prunes a 3.20 binding (unchanged)");
 
             // --- and it prunes ONLY the destructed buffer: a live binding on another address
-            //     must survive, or the fix would have traded a leak for a lost completion.
-            bind_legacy(cb_x, kFakeEq, 0x7501, 0x10000000000003eaull, 0, 0);
-            bind_legacy(cb_y, kFakeEq, 0x7501, 0x10000000000003ebull, 0, 0);
+            //     must survive and still deliver its completion event.
+            bind_legacy(cb_x, eq, kEventId, 0x10000000000003eaull, 0, 0);
+            bind_legacy(cb_y, eq, kEventId, 0x10000000000003ebull, 0, 0);
             destruct_apr(cb_x, 0, 0, 0, 0, 0);
             CHECK(prosper_apr_binding_count_for_test(cb_x) == 0 &&
                   prosper_apr_binding_count_for_test(cb_y) == 1,
                   "#1674: destroying one cb leaves an unrelated cb's binding intact");
             s1 = s2 = kResidue;
-            submit(cb_y, 1, p1, p2, 0, 0);
-            CHECK(s1 == kResidue && s2 == kResidue,
-                  "#1674: the surviving binding is still HONOURED -- cb_y's submit stays on the "
-                  "bound path and writes no result slots");
+            rc = submit(cb_y, 1, p1, p2, 0, 0);
+            CHECK(rc == 0 && s1 == 0 && published_id(s2),
+                  "#1674: surviving cb_y submit publishes its own result and ID");
+            CHECK(poll_count(2),
+                  "#1674: the surviving binding is still HONOURED -- cb_y's submit delivers to the queue");
             destruct_apr(cb_y, 0, 0, 0, 0, 0);
             CHECK(prosper_apr_binding_count_for_test(cb_y) == 0,
                   "#1674: the registry is empty for both buffers once both are destructed");
+            delete_eq(eq, 0, 0, 0, 0, 0);
         }
     }
 
