@@ -17,6 +17,7 @@
 #include "hle/kernel/guest_thread_handle.hpp"   // Windows: guest-readable ScePthread objects
 #include "hle/kernel/sce_errno.hpp"
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not remove the fairness yield
+#include "diagnostics/native_host_wait.hpp"
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "host/image/exec_image.hpp"      // describe_code_address (host frame naming)
 #include "host/platform/immortal.hpp"        // #2613: registries a guest thread can reach after exit()
@@ -4861,24 +4862,9 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
         // and nothing about WHY; the prosper frame below it is the answer, and without this the
         // reader is left inferring it from the guest frame, which is often several calls away.
         char host_returns[288] = "-";
-        size_t host_returns_used = 0;
-        unsigned host_return_count = 0;
-        for (size_t i = 0; i < stack_bytes / sizeof(uint64_t) && host_return_count < 6; ++i) {
-            const uint64_t candidate = stack_words[i];
-            if (candidate < 0x10000) continue;
-            if (!guest_trace_page_executable((uintptr_t)candidate)) continue;
-            const std::string described = describe_code_address(candidate);
-            if (described.rfind("prosper+", 0) != 0) continue;   // ours only; DLLs are noise here
-            bool duplicate = false;
-            for (size_t j = 0; j < i; ++j) duplicate |= stack_words[j] == candidate;
-            if (duplicate) continue;
-            const int appended = std::snprintf(
-                host_returns + host_returns_used, sizeof(host_returns) - host_returns_used,
-                host_return_count ? ",%s" : "%s", described.c_str());
-            if (appended <= 0 || (size_t)appended >= sizeof(host_returns) - host_returns_used) break;
-            host_returns_used += (size_t)appended;
-            ++host_return_count;
-        }
+        diagnostics::scan_host_stack_candidates(
+            std::span(stack_words.data(), stack_bytes / sizeof(uint64_t)), host_returns,
+            guest_trace_page_executable, describe_code_address);
         char wait_description[256] = "-";
         if (captured_wait_count) {
             wait_description[0] = 0;
