@@ -563,8 +563,10 @@ TEST(NestedWideDataAdmission, Contract) {
                                "unbounded, over-budget and DS originals cannot acquire legacy "
                                "stored replay authority");
                     }
+                    bool replay_framed = false;
                     const auto replay_stored = [&](const GpuCaptureFile& file, bool legacy,
                                                    GpuReplayFrame& result) {
+                        replay_framed = false;
                         GpuCaptureFile read;
                         std::vector<uint8_t> bytes;
                         if (!serialize_gpu_capture(file, bytes, refusal)) return false;
@@ -579,8 +581,9 @@ TEST(NestedWideDataAdmission, Contract) {
                             bytes[8] = 69u;
                             bytes[9] = bytes[10] = bytes[11] = 0u;
                         }
-                        return deserialize_gpu_capture(bytes, read, refusal) &&
-                               materialize_gpu_replay(read, result, refusal);
+                        if (!deserialize_gpu_capture(bytes, read, refusal)) return false;
+                        replay_framed = true;
+                        return materialize_gpu_replay(read, result, refusal);
                     };
                     // READFIRST is present but its dead result has no numeric load consumer.
                     // Both stored stages are real modules compiled from these complete originals.
@@ -662,15 +665,44 @@ TEST(NestedWideDataAdmission, Contract) {
                                               "owners stage=vs pc=5",
                                "numeric load in the second terminating arm cannot disappear behind "
                                "stored modules");
+                        // Retaining an unreferenced prolog is a malformed capture, rejected by
+                        // the codec before the semantic linked-stage proof can run.
+                        auto orphaned_prolog = healthy_chain;
+                        orphaned_prolog.draws[0].vs_raw_shader_index = UINT32_MAX;
+                        std::vector<uint8_t> orphaned_bytes;
+                        expect(
+                            !serialize_gpu_capture(orphaned_prolog, orphaned_bytes, refusal) &&
+                                orphaned_bytes.empty() && refusal == "raw shader is not referenced",
+                            "orphaned raw prolog is refused before any capture bytes are emitted");
                         for (uint32_t broken = 0; broken < 5u; ++broken) {
                             auto unproved_chain = healthy_chain;
                             if (broken == 0u)
                                 set_raw(unproved_chain, true, {0x7e000280u, 0xbe802008u});
-                            if (broken == 1u)
+                            if (broken == 1u) {
+                                // Remove only the newly appended prolog record, preserving a
+                                // well-framed main/FS capture with genuinely missing VS provenance.
+                                ASSERT_EQ(unproved_chain.draws[0].vs_raw_shader_index,
+                                          unproved_chain.raw_shader_versions.size() - 1u);
+                                ASSERT_LT(unproved_chain.draws[0].vs_chain_raw_shader_index,
+                                          unproved_chain.draws[0].vs_raw_shader_index);
+                                ASSERT_LT(unproved_chain.draws[0].fs_raw_shader_index,
+                                          unproved_chain.draws[0].vs_raw_shader_index);
+                                unproved_chain.raw_shader_versions.pop_back();
                                 unproved_chain.draws[0].vs_raw_shader_index = UINT32_MAX;
-                            if (broken == 2u)
+                            }
+                            if (broken == 2u) {
                                 unproved_chain.draws[0].vs_chain_raw_shader_index =
                                     uint32_t(unproved_chain.raw_shader_versions.size());
+                                std::vector<uint8_t> invalid_index_bytes;
+                                expect(
+                                    !serialize_gpu_capture(unproved_chain, invalid_index_bytes,
+                                                           refusal) &&
+                                        invalid_index_bytes.empty() &&
+                                        refusal == "realized draw references an invalid raw shader",
+                                    "out-of-range chain index is refused before any capture bytes "
+                                    "are emitted");
+                                continue;
+                            }
                             if (broken == 3u)
                                 set_raw(unproved_chain, true,
                                         {0xbf820001u, 0x7e0002ffu, 0u, 0xbe802006u});
@@ -678,7 +710,7 @@ TEST(NestedWideDataAdmission, Contract) {
                                 set_raw(unproved_chain, true, {0xbe802106u, 0xbe802006u});
                             GpuReplayFrame chain_refused;
                             expect(!replay_stored(unproved_chain, legacy, chain_refused) &&
-                                       chain_refused.items.empty() &&
+                                       replay_framed && chain_refused.items.empty() &&
                                        refusal == "logical-wave replay linked vertex provenance "
                                                   "unavailable stage=vs",
                                    "declared linkage without the exact s[6:7] prolog and present "
