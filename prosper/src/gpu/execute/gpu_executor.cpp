@@ -10,6 +10,7 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/compute_program_facts.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
+#include "gpu/execute/ordered_graphics_read_point_internal.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: skipped-dispatches, shader-compile alarms
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
@@ -7143,7 +7144,7 @@ std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
     return merged;
 }
 
-SharedShaderWords registered_graphics_original(uint64_t address) {
+GraphicsReadSource registered_graphics_read_source(uint64_t address) {
     const auto* header =
         static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(address));
     if (!header) return {};
@@ -7151,7 +7152,13 @@ SharedShaderWords registered_graphics_original(uint64_t address) {
     if (!count) return {};
     const auto analysis =
         decode_shader_cached(reinterpret_cast<const uint32_t*>(uintptr_t(address)), count);
-    return SharedShaderWords(analysis, &analysis->code);
+    return {SharedShaderWords(analysis, &analysis->code),
+            std::shared_ptr<const std::vector<RawNestedWideChain>>(
+                analysis, &analysis->owned_nested_wide_chains)};
+}
+
+SharedShaderWords registered_graphics_original(uint64_t address) {
+    return registered_graphics_read_source(address).words;
 }
 
 bool draw_requires_owned_nested_snapshot(const GpuState& state) {
@@ -7236,8 +7243,14 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                 stage_context.producers_complete = false; // unproved native DS/HTILE physical layout
                 stage_context.output_allocations.emplace_back(address, 0u);
             }
-        nested_reader = std::make_unique<GraphicsNestedWideReader>(
-            full_source->owned_nested_wide_chains, raw_context ? &stage_context : nullptr);
+        if (raw_context && raw_context->requires_ordered_read_point)
+            nested_reader = std::make_unique<GraphicsNestedWideReader>(
+                full_source->owned_nested_wide_chains, &stage_context, code_addr,
+                SharedShaderWords(full_source, &full_source->code), raw_context->source_submit,
+                draw_command_order);
+        else
+            nested_reader = std::make_unique<GraphicsNestedWideReader>(
+                full_source->owned_nested_wide_chains, raw_context ? &stage_context : nullptr);
         nested_reader->branch_exclusive_disabled =
             std::getenv("PROSPER_NO_BRANCH_EXCLUSIVE") != nullptr;
     }
@@ -9500,14 +9513,16 @@ static void omit_noop_dispatches(std::vector<SubmitOperation>& operations,
     });
 }
 
-static OrderedSubmitResult execute_ordered_gpustate(
-    const GpuState& st, uint32_t width, uint32_t height, uint64_t submit_no,
-    const LiveRenderFn& render, const LiveComputeFn& compute,
-    OrderedGpustateCaptureTrace* capture_trace = nullptr,
-    std::vector<DrawItem>* eager_draws = nullptr,
-    std::vector<MenuRealizedDrawIdentity>* menu_realized_draws = nullptr);
+static OrderedSubmitResult
+execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, uint64_t submit_no,
+                         const LiveRenderFn& render, const LiveComputeFn& compute,
+                         const GraphicsExecutionActivity& execution,
+                         OrderedGpustateCaptureTrace* capture_trace = nullptr,
+                         std::vector<DrawItem>* eager_draws = nullptr,
+                         std::vector<MenuRealizedDrawIdentity>* menu_realized_draws = nullptr);
 
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
+    const GraphicsExecutionActivity execution;
     if (st.dma_copies.empty() && (!g_compute || st.dispatches.empty())) return false;
     GuestReadableSubmitScope guest_readable_scope;
     notify_compute_authority_unknown(
@@ -9537,9 +9552,9 @@ bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
         pending_capture.get(), g_compute_gds.data(), g_compute_gds.size());
     OrderedGpustateCaptureTrace capture_trace;
     capture_trace.pending_capture = pending_capture.get();
-    const OrderedSubmitResult result = execute_ordered_gpustate(
-        st, 0, 0, submit_no, {}, g_compute,
-        pending_capture && can_defer_capture ? &capture_trace : nullptr);
+    const OrderedSubmitResult result =
+        execute_ordered_gpustate(st, 0, 0, submit_no, {}, g_compute, execution,
+                                 pending_capture && can_defer_capture ? &capture_trace : nullptr);
     if (pending_capture) {
         std::string error;
         notify_compute_authority_unknown(
@@ -9949,15 +9964,11 @@ std::vector<SubmitOperation> plan_submit_operations(const GpuState& st) {
 namespace {
 
 template <typename DmaCopyRecord, typename ExecuteDma>
-OrderedSubmitResult execute_ordered_items_impl(const std::vector<SubmitOperation>& operations,
-                                               const std::vector<DrawItem>& draws,
-                                               const std::vector<ComputeItem>& computes,
-                                               const std::vector<DmaCopyRecord>& dma_copies,
-                                               const LiveRenderFn& render,
-                                               const LiveComputeFn& compute,
-                                               uint32_t width, uint32_t height,
-                                               uint64_t source_submit,
-                                               ExecuteDma&& execute_dma) {
+OrderedSubmitResult execute_ordered_items_impl(
+    const std::vector<SubmitOperation>& operations, const std::vector<DrawItem>& draws,
+    const std::vector<ComputeItem>& computes, const std::vector<DmaCopyRecord>& dma_copies,
+    const LiveRenderFn& render, const LiveComputeFn& compute, uint32_t width, uint32_t height,
+    uint64_t source_submit, ExecuteDma&& execute_dma, const GraphicsExecutionActivity& execution) {
     GuestGpuWriteSubmitScope guest_gpu_write_scope;
     std::unordered_map<size_t, size_t> draw_by_index, compute_by_index;
     for (size_t i = 0; i < draws.size(); ++i) draw_by_index[draws[i].draw_index] = i;
@@ -9971,21 +9982,28 @@ OrderedSubmitResult execute_ordered_items_impl(const std::vector<SubmitOperation
         uint64_t command_order;
     };
     std::vector<ExecutableOperation> executable;
+    OrderedGraphicsReadPointIssuer read_points(graphics_producer_status(), execution);
     bool explicit_dma_operations = false;
     for (const auto& operation : operations) {
         if (operation.kind == SubmitOperationKind::Draw) {
             auto it = draw_by_index.find(operation.index);
             if (it != draw_by_index.end())
                 executable.push_back({ExecutableKind::Draw, it->second, operation.command_order});
+            else
+                read_points.dependencies_ok = false;
         } else if (operation.kind == SubmitOperationKind::Dispatch) {
             auto it = compute_by_index.find(operation.index);
             if (it != compute_by_index.end())
                 executable.push_back({ExecutableKind::Dispatch, it->second, operation.command_order});
+            else
+                read_points.dependencies_ok = false;
         } else {
             explicit_dma_operations = true;
             if (operation.index < dma_copies.size())
                 executable.push_back({ExecutableKind::DmaCopy, operation.index,
                                       operation.command_order});
+            else
+                read_points.dependencies_ok = false;
         }
     }
     // Compatibility for pre-v14 callers whose operation list predates the DMA kind.
@@ -10023,18 +10041,34 @@ OrderedSubmitResult execute_ordered_items_impl(const std::vector<SubmitOperation
     };
     for (const auto& operation : executable) {
         if (operation.kind == ExecutableKind::Draw) {
-            span.push_back(draws[operation.item]);
+            read_points.advance();
+            DrawItem item = draws[operation.item];
+            // Never retain a caller/replay ticket. Only this actual ordered operation may issue
+            // one, and an earlier unsubmitted draw in the span is not completed producer work.
+            item.ordered_read_point.reset();
+            if (item.command_order == operation.command_order)
+                item.ordered_read_point =
+                    read_points.issue(source_submit, operation.command_order, span,
+                                      item.vs_guest_addr, item.fs_guest_addr);
+            span.push_back(std::move(item));
         } else if (operation.kind == ExecutableKind::Dispatch) {
             flush_span();
+            read_points.advance();
             if (compute) {
                 const prosper::diagnostics::perf::BackendDispatchOutcome outcome;
                 const bool executed = compute({computes[operation.item]});
                 outcome.finish(executed);
                 result.compute_executed |= executed;
-            }
+                read_points.dependencies_ok &= executed;
+            } else
+                read_points.dependencies_ok = false;
         } else {
             flush_span(true);
+            read_points.advance();
             execute_dma(dma_copies[operation.item]);
+            // This legacy callback reports no completion outcome. Do not turn its return into
+            // successful ordered-source authority, while preserving its execution ABI.
+            read_points.dependencies_ok = false;
         }
     }
     flush_span();
@@ -10043,14 +10077,11 @@ OrderedSubmitResult execute_ordered_items_impl(const std::vector<SubmitOperation
 
 } // namespace
 
-OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
-                                          const std::vector<DrawItem>& draws,
-                                          const std::vector<ComputeItem>& computes,
-                                          const std::vector<GpuState::DmaCopy>& dma_copies,
-                                          const LiveRenderFn& render,
-                                          const LiveComputeFn& compute,
-                                          uint32_t width, uint32_t height,
-                                          uint64_t source_submit) {
+static OrderedSubmitResult execute_ordered_guest_items(
+    const std::vector<SubmitOperation>& operations, const std::vector<DrawItem>& draws,
+    const std::vector<ComputeItem>& computes, const std::vector<GpuState::DmaCopy>& dma_copies,
+    const LiveRenderFn& render, const LiveComputeFn& compute, uint32_t width, uint32_t height,
+    uint64_t source_submit, const GraphicsExecutionActivity& execution) {
     return execute_ordered_items_impl(
         operations, draws, computes, dma_copies, render, compute, width, height, source_submit,
         [](const GpuState::DmaCopy& copy) {
@@ -10068,7 +10099,19 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
             execute_ordered_dma_copy(
                 copy, source_result == LiveTargetByteReadResult::Success
                           ? current_source.data() : nullptr);
-        });
+        },
+        execution);
+}
+
+OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
+                                          const std::vector<DrawItem>& draws,
+                                          const std::vector<ComputeItem>& computes,
+                                          const std::vector<GpuState::DmaCopy>& dma_copies,
+                                          const LiveRenderFn& render, const LiveComputeFn& compute,
+                                          uint32_t width, uint32_t height, uint64_t source_submit) {
+    const GraphicsExecutionActivity execution;
+    return execute_ordered_guest_items(operations, draws, computes, dma_copies, render, compute,
+                                       width, height, source_submit, execution);
 }
 
 OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
@@ -10078,6 +10121,7 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
                                           const LiveRenderFn& render,
                                           const LiveComputeFn& compute,
                                           uint32_t width, uint32_t height) {
+    const GraphicsExecutionActivity execution;
     return execute_ordered_items_impl(
         operations, draws, computes, dma_copies, render, compute, width, height, 0,
         [](const ReplayDmaCopy& copy) {
@@ -10133,7 +10177,8 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
                 notify_guest_gpu_write(copy.dst, copy.bytes);
                 set_guest_gpu_write_origin(nullptr);
             }
-        });
+        },
+        execution);
 }
 
 OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
@@ -11396,13 +11441,13 @@ std::vector<ComputeAuthorityBoundary> compute_authority_draw_resource_boundaries
     return boundaries;
 }
 
-static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t width,
-                                                     uint32_t height, uint64_t submit_no,
-                                                     const LiveRenderFn& render,
-                                                     const LiveComputeFn& compute,
-                                                     OrderedGpustateCaptureTrace* capture_trace,
-                                                     std::vector<DrawItem>* eager_draws,
-                                                     std::vector<MenuRealizedDrawIdentity>* menu_realized_draws) {
+static OrderedSubmitResult
+execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, uint64_t submit_no,
+                         const LiveRenderFn& render, const LiveComputeFn& compute,
+                         const GraphicsExecutionActivity& execution,
+                         OrderedGpustateCaptureTrace* capture_trace,
+                         std::vector<DrawItem>* eager_draws,
+                         std::vector<MenuRealizedDrawIdentity>* menu_realized_draws) {
     GuestGpuWriteSubmitScope guest_gpu_write_scope;
     // The ordered path reaches build_stage_table through realize_retained_draw rather than through
     // realize_gpustate_draws, so it needs its own sampling window or its per-draw switches fall
@@ -11460,8 +11505,12 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     const float scale_y = full_height ? static_cast<float>(height) / full_height : 1.0f;
     OrderedSubmitResult result;
     bool producer_epoch_ok = true;
+    // The retained memory-effect ABI has no success result. Do not borrow the legacy epoch's
+    // reset at a parser stall as proof that an unknown prior effect completed successfully.
+    bool read_point_dependencies_ok = true;
     bool graphics_epoch_ok = true;
     const GraphicsProducerStatus graphics_epoch = graphics_producer_status();
+    OrderedGraphicsReadPointIssuer read_points(graphics_epoch, execution);
     // #3891: set for the rest of the submit once a DELIBERATE decline (selector, parent walk) broke
     // a producer epoch, so the indirect dispatches it strands are not counted as skipped-dispatches.
     bool epoch_broken_deliberately = false;
@@ -11500,6 +11549,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     };
 
     for (const auto& operation : executable) {
+        read_points.advance();
         switch (operation.kind) {
             case RetainedSubmitKind::Draw: {
                 // PROSPER_DRAW_CENSUS=1 — the most basic number about a missing world, and nothing
@@ -11740,6 +11790,19 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         graphics_epoch.known && completed.known && !completed.pending &&
                         graphics_epoch.failures == completed.failures;
                 }
+                const GpuState& read_state =
+                    use_per_draw_policy(st) ? st.state_at_draw(operation.index) : st;
+                const auto read_render = extract_render_state(read_state);
+                read_points.dependencies_ok = read_point_dependencies_ok && producer_epoch_ok &&
+                                              graphics_epoch_ok && indirect_dependencies_ok;
+                raw_context.source_submit = submit_no;
+                raw_context.requires_ordered_read_point = true;
+                raw_context.ordered_read_point =
+                    read_points.issue(submit_no, operation.command_order, span, read_render.es_addr,
+                                      read_render.ps_addr);
+                if (nested_inputs)
+                    raw_context.producers_complete =
+                        raw_context.producers_complete && bool(raw_context.ordered_read_point);
                 bool realized = false;
                 OperationRealizationFailure failure;
                 bool failure_known = false;
@@ -11776,6 +11839,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     }
                 }
                 if (realized) {
+                    item.ordered_read_point = raw_context.ordered_read_point;
                     notify_compute_authority_draw_resources(item, submit_no);
                     if (menu_realized_draws)
                         menu_realized_draws->push_back({item.draw_index, item.fs_guest_addr,
@@ -12343,6 +12407,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                             ComputeAuthorityBoundaryKind::OrderedMemoryEffect,
                             submit_no, operation.command_order);
                     execute_ordered_memory_effect(effect);
+                    read_point_dependencies_ok = false;
                 }
                 break;
         }
@@ -12748,11 +12813,13 @@ bool present_submit_in_progress()         { return g_present_submit_depth != 0; 
 
 std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
                                          uint32_t width, uint32_t height) {
+    const GraphicsExecutionActivity execution;
     if (!g_live) return {};
     RenderedFrame frame = g_live(items, width, height);
     return frame.storage ? *frame.storage : std::vector<uint8_t>{};
 }
 bool execute_compute_items(const std::vector<ComputeItem>& items) {
+    const GraphicsExecutionActivity execution;
     // Realization-time half of the paired read, taken at command-ordered execution rather than at
     // fold. Deliberately before the dispatch runs, so the comparison isolates what happened BETWEEN
     // resolution and execution and not what this dispatch itself wrote.
@@ -12763,6 +12830,7 @@ bool execute_compute_items(const std::vector<ComputeItem>& items) {
 
 bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
                                  uint64_t submit_no, bool publish) {
+    const GraphicsExecutionActivity execution;
     if ((!g_live && !g_compute && st.dma_copies.empty()) ||
         (st.draws.empty() && st.dispatches.empty() && st.dma_copies.empty())) return false;
     // Reuse positive page/VirtualQuery results only inside this synchronous execution window.
@@ -12855,14 +12923,15 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
         return path && *path;
     }();
     std::vector<MenuRealizedDrawIdentity> menu_realized_draws;
-    OrderedSubmitResult result = needs_ordered_realization
-        ? execute_ordered_gpustate(st, width, height, submit_no, g_live, g_compute,
-                                   pending_capture ? &capture_trace : nullptr,
-                                   can_eagerly_realize_draws ? &draws : nullptr,
-                                   menu_capture_requested ? &menu_realized_draws : nullptr)
-        : execute_ordered_items(operations, draws, computes,
-                                std::vector<GpuState::DmaCopy>{}, g_live, g_compute,
-                                width, height, submit_no);
+    OrderedSubmitResult result =
+        needs_ordered_realization
+            ? execute_ordered_gpustate(st, width, height, submit_no, g_live, g_compute, execution,
+                                       pending_capture ? &capture_trace : nullptr,
+                                       can_eagerly_realize_draws ? &draws : nullptr,
+                                       menu_capture_requested ? &menu_realized_draws : nullptr)
+            : execute_ordered_guest_items(operations, draws, computes,
+                                          std::vector<GpuState::DmaCopy>{}, g_live, g_compute,
+                                          width, height, submit_no, execution);
     if (menu_capture_requested && !needs_ordered_realization)
         for (const DrawItem& draw : draws)
             menu_realized_draws.push_back({draw.draw_index, draw.fs_guest_addr,
@@ -13051,6 +13120,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
 }
 
 bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height, bool publish) {
+    const GraphicsExecutionActivity execution;
     if (!g_live || st.draws.empty() || !width || !height) return false;
     // Same extent contract as the ordered path: this frame is checked against width*height*4 below
     // before it can be published (#1986).

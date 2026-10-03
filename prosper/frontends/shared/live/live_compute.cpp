@@ -43,6 +43,7 @@
 #include "gpu/diagnostics/gpu_labels_vk.hpp"         // PROSPER_GPU_LABELS: guest-meaningful command labels
 #include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only images prefer VRAM
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/execute/graphics_execution_activity.hpp"
 #include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
 #include "gpu/execute/float_controls_probe.hpp"  // #3479: the device gate on SignedZeroInfNanPreserve
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -15206,6 +15207,7 @@ struct ComputeItemsScope {
 }  // namespace
 
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {
+    const prosper::gpu::GraphicsExecutionActivity execution;
     const ComputeItemsScope compute_items_scope(items.size());
     const prosper::gpu::TileCensusScope tile_census_scope("compute");
     auto fail_closed_items = [&]() {

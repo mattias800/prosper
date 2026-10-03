@@ -580,6 +580,66 @@ extern "C" int prosper_thread_in_renderer_callback(unsigned long native_tid) {
     return prosper::frontend::tid_is_in_renderer_callback(native_tid) ? 1 : 0;
 }
 
+prosper::gpu::GraphicsProducerStatus live_graphics_producer_status() {
+    return prosper::gpu::GraphicsProducerStatus{
+        true,
+        prosper::test::backend_has_unproven_submission() ||
+            prosper::test::backend_pending_submission_batches().load(std::memory_order_acquire) !=
+                0,
+        prosper::test::backend_failed_publication_generation().load(std::memory_order_acquire)};
+}
+
+static RttCache& graphics_raw_source_rtt() {
+    static RttCache g_rtt;   // render-to-texture cache (#167)
+    return g_rtt;
+}
+
+bool live_graphics_raw_source_current(const prosper::GuestMappingLease& lease, uint64_t address,
+                                      uint32_t bytes) {
+    prosper::test::BackendPersistentResourceGuard guard;
+    if (prosper::test::backend_has_unproven_submission() ||
+        prosper::test::backend_pending_submission_batches().load(std::memory_order_acquire))
+        return false;
+    const auto disjoint = [&](const prosper::test::BackendGuestProducerOrigins& origins) {
+        return !origins.unknown && !origins.allocations.empty() &&
+               std::all_of(origins.allocations.begin(), origins.allocations.end(),
+                           [&](const auto& producer) {
+                               return prosper::guest_memory_retained_allocation_relation(
+                                          lease, address, bytes, producer) ==
+                                      prosper::GuestMemoryTopologyRelation::Disjoint;
+                           });
+    };
+    // A recorded, complete producer layout must fit inside its original physical
+    // allocation. Exclude that whole allocation, including padding and unselected bytes;
+    // same-allocation inputs refuse even when their VAs are disjoint. Missing layout or
+    // origin proof is Unknown, including unsupported DS/array/tail shapes. The allocator,
+    // never a readable VMA or today's resolution of an old target VA, supplies the bounds.
+    for (const auto& [base, surface] : graphics_raw_source_rtt()) {
+        (void)base;
+        if (!surface.rgba && !surface.has_uniform_color && !surface.gpu_valid &&
+            !surface.volume_guest_bytes)
+            continue;   // never-produced empty entry
+        if (!disjoint(surface.guest_origins)) return false;
+        if (surface.dcc_metadata_addr && !disjoint(surface.dcc_guest_origins)) return false;
+    }
+    for (const auto& [key, image] : prosper::test::persistent_color_target_cache()) {
+        (void)key;
+        if (image.guest_producer_seen && !disjoint(image.guest_origins)) return false;
+    }
+    for (const auto& [key, image] : prosper::test::persistent_ds_cache()) {
+        if (!image.guest_producer_seen) continue;
+        size_t index = 0;
+        for (uint64_t base : {key.dr, key.dw, key.sr, key.sw, key.htile}) {
+            if (base && prosper::guest_memory_retained_allocation_relation(
+                            lease, address, bytes, image.guest_allocations[index]) !=
+                            prosper::GuestMemoryTopologyRelation::Disjoint)
+                return false;
+            ++index;
+        }
+    }
+    return true;
+}
+
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested,
                             prosper::gpu::FragmentWavePolicy requested_wave_policy) {
     prosper::diagnostics::readback_refusal::initialize();
@@ -597,55 +657,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     // the two would never share. Only reached when the live renderer is registered, so headless
     // compute-only use (tests/gpu/recompiler/test_game_compute.cpp) still creates its own device.
     (void)prosper::test::render_vk_ctx();
-    static RttCache g_rtt;   // render-to-texture cache (#167)
-    prosper::gpu::set_graphics_producer_status_query([] {
-        return prosper::gpu::GraphicsProducerStatus{
-            true, prosper::test::backend_has_unproven_submission() ||
-                prosper::test::backend_pending_submission_batches().load(std::memory_order_acquire) != 0,
-            prosper::test::backend_failed_publication_generation().load(std::memory_order_acquire)};
-    });
-    prosper::gpu::set_graphics_raw_source_authority(
-        [](const prosper::GuestMappingLease& lease, uint64_t address, uint32_t bytes) {
-            prosper::test::BackendPersistentResourceGuard guard;
-            if (prosper::test::backend_has_unproven_submission() ||
-                prosper::test::backend_pending_submission_batches().load(std::memory_order_acquire))
-                return false;
-            const auto disjoint = [&](const prosper::test::BackendGuestProducerOrigins& origins) {
-                return !origins.unknown && !origins.allocations.empty() &&
-                    std::all_of(origins.allocations.begin(), origins.allocations.end(),
-                        [&](const auto& producer) {
-                            return prosper::guest_memory_retained_allocation_relation(lease, address,
-                                bytes, producer) == prosper::GuestMemoryTopologyRelation::Disjoint;
-                        });
-            };
-            // A recorded, complete producer layout must fit inside its original physical
-            // allocation. Exclude that whole allocation, including padding and unselected bytes;
-            // same-allocation inputs refuse even when their VAs are disjoint. Missing layout or
-            // origin proof is Unknown, including unsupported DS/array/tail shapes. The allocator,
-            // never a readable VMA or today's resolution of an old target VA, supplies the bounds.
-            for (const auto& [base, surface] : g_rtt) {
-                (void)base;
-                if (!surface.rgba && !surface.has_uniform_color && !surface.gpu_valid &&
-                    !surface.volume_guest_bytes) continue; // never-produced empty entry
-                if (!disjoint(surface.guest_origins)) return false;
-                if (surface.dcc_metadata_addr && !disjoint(surface.dcc_guest_origins)) return false;
-            }
-            for (const auto& [key, image] : prosper::test::persistent_color_target_cache()) {
-                (void)key;
-                if (image.guest_producer_seen && !disjoint(image.guest_origins)) return false;
-            }
-            for (const auto& [key, image] : prosper::test::persistent_ds_cache()) {
-                if (!image.guest_producer_seen) continue;
-                size_t index = 0;
-                for (uint64_t base : {key.dr, key.dw, key.sr, key.sw, key.htile}) {
-                    if (base && prosper::guest_memory_retained_allocation_relation(lease, address,
-                            bytes, image.guest_allocations[index]) !=
-                            prosper::GuestMemoryTopologyRelation::Disjoint) return false;
-                    ++index;
-                }
-            }
-            return true;
-        });
+    static RttCache& g_rtt = graphics_raw_source_rtt();   // same process-lifetime RTT owner (#167)
+    prosper::gpu::set_graphics_producer_status_query(live_graphics_producer_status);
+    prosper::gpu::set_graphics_raw_source_authority(live_graphics_raw_source_current);
     // PROSPER_FLIP_GUEST_SCANOUT=1 (default OFF): let a guest FLIP publish the guest's own scanout
     // buffer when the renderer has produced nothing at all.
     //

@@ -6270,6 +6270,16 @@ if(TARGET gpu_replay)
   add_dependencies(test_gpu_capture_observation_cli gpu_replay)
 endif()
 
+# CPU-only actual ordered-executor/backend-metadata contract, shared by Windows and UNIX. Links
+# the normal renderer but deliberately creates no device or GPU work and needs no game dump.
+if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
+  prosper_add_gtest(test_ordered_graphics_read_point
+    SOURCES tests/shared/live/test_ordered_graphics_read_point.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan
+    LABELS unit PROPERTIES TIMEOUT 30)
+endif()
+
 # ---------------------------------------------------------------------------
 # Per-case scratch directory for every registered test (#1613).
 #

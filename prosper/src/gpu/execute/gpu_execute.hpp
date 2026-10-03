@@ -9,6 +9,7 @@
 // renderer once the device is wired; tests call it with the offscreen renderer to verify the spine.
 #pragma once
 #include "gpu/execute/refused_shader_source.hpp"   // default original refused-shader evidence
+#include "gpu/execute/graphics_execution_activity.hpp"
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include <map>
 #include <atomic>
@@ -59,6 +60,12 @@ bool guest_readable(uint64_t address, uint32_t bytes);
 
 using SharedShaderWords = std::shared_ptr<const std::vector<uint32_t>>;
 
+struct GraphicsReadSource {
+    SharedShaderWords words;
+    std::shared_ptr<const std::vector<RawNestedWideChain>> chains;
+};
+GraphicsReadSource registered_graphics_read_source(uint64_t address);
+
 // One byte-validated immutable shader version. The live draw path acquires this after resource
 // realization and shares it only across the fragment metadata + compilation operation for that
 // draw. A later draw acquires again, so same-address guest shader rewrites remain visible.
@@ -80,6 +87,8 @@ struct DrawItem {
     // does not mark a draw ready or promote host raster observations to guest entry values.
     std::shared_ptr<const RasterQuadInputs> fragment_draw_inputs;
     std::shared_ptr<const GraphicsOwnedWaveDraw> owned_waves;
+    // Ordered source authority only. Never serialized or interpreted as ready resource backing.
+    std::shared_ptr<const OrderedGraphicsReadPoint> ordered_read_point;
     std::vector<uint32_t> vs, gs, fs;                 // recompiled/generated SPIR-V
     // The live path can retain warm-cache shader modules by shared ownership instead of copying the
     // same SPIR-V words twice per draw (cache -> DrawItem -> BackendDraw). Capture/replay and direct
@@ -3352,9 +3361,10 @@ inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
 inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn& render,
                                              uint32_t max_shader_dwords = 0x10000,
                                              float vp_scale_x = 1.0f, float vp_scale_y = 1.0f) {
+    const GraphicsExecutionActivity execution;
     if (!render) return {};
-    std::vector<DrawItem> items = realize_gpustate_draws(
-        st, max_shader_dwords, vp_scale_x, vp_scale_y);
+    std::vector<DrawItem> items =
+        realize_gpustate_draws(st, max_shader_dwords, vp_scale_x, vp_scale_y);
     if (items.empty()) return {};
     return render(items);
 }

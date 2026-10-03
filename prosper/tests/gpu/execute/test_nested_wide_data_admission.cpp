@@ -860,7 +860,7 @@ TEST(NestedWideDataAdmission, Contract) {
     expect(!admit_compute_nested_wide_data(nullptr, decoded, uses, table) &&
                table.owned_host_data.empty(),
            "offline realization cannot claim live mapping ownership");
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     {
         GuestMappingLease lease;
         expect(admit_compute_nested_wide_data(&lease, decoded, uses, table),
@@ -957,7 +957,7 @@ TEST(NestedWideDataAdmission, Contract) {
     if (wave_output) unmap(wave_output, page, 0, 0, 0, 0);
     if (wave_output_physical) release(wave_output_physical, page, 0, 0, 0, 0);
     unmap(parent, page, 0, 0, 0, 0);
-#if !defined(__linux__)
+#if !defined(__linux__) && !defined(_WIN32)
     unmap(child, page, 0, 0, 0, 0);
 #endif
     unmap(output, page, 0, 0, 0, 0);
