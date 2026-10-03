@@ -340,7 +340,10 @@ that thread waits on becomes the focus, so matching signals from other threads a
     read succeeds, and the crash lands on the *next* instruction at a nonsense address
     (`0xfffffffffffffff0` = `[rax-0x10]` with `rax` fabricated to 0), pointing at the guest rather than
     at us.
-- MinGW `longjmp` does an SEH unwind that can't cross guest/asm frames → use `__builtin_setjmp/longjmp`.
+- CRT `longjmp` does an SEH unwind that cannot cross guest/asm frames. Windows uses the explicit
+  `host/fault/win_recovery.*` no-unwind bridge, saving actual Microsoft-x64 host registers. Do not
+  substitute compiler `__builtin_setjmp/longjmp`: native Clang's saved frame address can differ from
+  its actual biased RBP, breaking the resumed caller's local accesses (#4265).
 - `boot_trace` on Windows is nondeterministic-crash-prone ONLY if a diagnostic reads raw stack words —
   the sync-caller scanner is `VirtualQuery`-guarded now; keep any new stack-walk guarded.
 - Windows file descriptors must use binary mode for guest assets. Text-mode reads can translate
