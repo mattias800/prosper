@@ -594,8 +594,8 @@ static RttCache& graphics_raw_source_rtt() {
     return g_rtt;
 }
 
-bool live_graphics_raw_source_current(const prosper::GuestMappingLease& lease, uint64_t address,
-                                      uint32_t bytes) {
+template <class DisjointAllocation>
+static bool live_graphics_source_current(DisjointAllocation&& disjoint_allocation) {
     prosper::test::BackendPersistentResourceGuard guard;
     if (prosper::test::backend_has_unproven_submission() ||
         prosper::test::backend_pending_submission_batches().load(std::memory_order_acquire))
@@ -604,9 +604,7 @@ bool live_graphics_raw_source_current(const prosper::GuestMappingLease& lease, u
         return !origins.unknown && !origins.allocations.empty() &&
                std::all_of(origins.allocations.begin(), origins.allocations.end(),
                            [&](const auto& producer) {
-                               return prosper::guest_memory_retained_allocation_relation(
-                                          lease, address, bytes, producer) ==
-                                      prosper::GuestMemoryTopologyRelation::Disjoint;
+                               return disjoint_allocation(producer);
                            });
     };
     // A recorded, complete producer layout must fit inside its original physical
@@ -630,14 +628,21 @@ bool live_graphics_raw_source_current(const prosper::GuestMappingLease& lease, u
         if (!image.guest_producer_seen) continue;
         size_t index = 0;
         for (uint64_t base : {key.dr, key.dw, key.sr, key.sw, key.htile}) {
-            if (base && prosper::guest_memory_retained_allocation_relation(
-                            lease, address, bytes, image.guest_allocations[index]) !=
-                            prosper::GuestMemoryTopologyRelation::Disjoint)
+            if (base && !disjoint_allocation(image.guest_allocations[index]))
                 return false;
             ++index;
         }
     }
     return true;
+}
+
+bool live_graphics_raw_source_current(const prosper::GuestMappingLease& lease, uint64_t address,
+                                      uint32_t bytes) {
+    return live_graphics_source_current([&](const auto& producer) {
+        return prosper::guest_memory_retained_allocation_relation(
+                   lease, address, bytes, producer) ==
+               prosper::GuestMemoryTopologyRelation::Disjoint;
+    });
 }
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps_requested,
