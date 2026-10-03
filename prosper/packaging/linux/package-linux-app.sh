@@ -114,7 +114,7 @@ echo "package: bundling the shared-library closure"
 # linuxdeploy owns everything under usr/; these three are the release's own additions and sit at the
 # AppDir root so they are visible both to someone who extracts the tarball and to
 # `--appimage-extract`.
-cp "$repo_root/prosper/docs/LINUX_RELEASE.md" "$appdir/README.md"
+cp "$repo_root/prosper/docs/platforms/LINUX_RELEASE.md" "$appdir/README.md"
 cp "$repo_root/prosper/scripts/start-prosper.sh" "$appdir/start-prosper.sh"
 chmod +x "$appdir/start-prosper.sh"
 # Computed into a variable first: inside `echo "... $(...)"` the substitution's failure is masked by

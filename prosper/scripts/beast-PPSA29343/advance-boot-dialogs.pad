@@ -16,7 +16,7 @@
 # NOTE: reaching the dialog at all currently needs PROSPER_CB_EFC_NO_COLOR=1 (the #1588 A/B lever).
 # On a default launch prosper's unmodeled ELIMINATE_FAST_CLEAR pass paints over the composite and
 # every frame is a flat clear, so this route has nothing to act on. See
-# prosper/docs/BEAST_OF_REINCARNATION_STATUS.md.
+# prosper/docs/games/BEAST_OF_REINCARNATION_STATUS.md.
 f400-520:cross
 f700-820:circle
 f1000-1120:options

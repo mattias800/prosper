@@ -2,7 +2,7 @@
 
 Everything here is the mechanical part: dependencies, configure/build/test commands per platform,
 and how to launch a dump. For what prosper is, see the [README](README.md); for the rules a change
-is held to, [`CLAUDE.md`](CLAUDE.md) and [`docs/VERIFICATION.md`](prosper/docs/VERIFICATION.md).
+is held to, [`CLAUDE.md`](CLAUDE.md) and [`docs/process/VERIFICATION.md`](prosper/docs/process/VERIFICATION.md).
 
 CI builds and tests Linux, Windows/MinGW and macOS on every push and pull request, and runs host
 ASan/UBSan and TSan jobs. Those are the supported configurations.
@@ -11,7 +11,7 @@ The live graphics backend, the standalone compute backend and the app require **
 and a 1.4 device; older loaders and devices are rejected with a diagnostic. Ubuntu 24.04's system
 headers and loader are 1.3, so Linux CI installs pinned Khronos 1.4.341 headers and loader through
 `.github/actions/setup-vulkan`. Capability policy and the measurements behind the floor are in
-[`docs/VULKAN_RUNTIME.md`](prosper/docs/VULKAN_RUNTIME.md).
+[`docs/gpu/VULKAN_RUNTIME.md`](prosper/docs/gpu/VULKAN_RUNTIME.md).
 
 ## Linux (primary)
 
@@ -109,7 +109,7 @@ $env:VK_DRIVER_FILES = "C:\Windows\System32\DriverStore\FileRepository\<driver p
 The durable fix is reinstalling the GPU driver (clean install) so it re-registers.
 
 The full native build, screenshot and diagnostic recipe is in
-[`WINDOWS_PORT_HANDOFF.md`](prosper/docs/WINDOWS_PORT_HANDOFF.md).
+[`WINDOWS_PORT_HANDOFF.md`](prosper/docs/platforms/WINDOWS_PORT_HANDOFF.md).
 
 On a Windows host, drive **git** from PowerShell and use WSL only for cmake and running: a worktree
 created from Windows stores a Windows-path gitdir link that WSL's git cannot resolve.
@@ -132,7 +132,7 @@ The SDL3 + MoltenVK app needs a universal driver (Homebrew's is arm64-only);
 `prosper/scripts/fetch-macos-vulkan.sh` fetches one, and `-DPROSPER_MACOS_MOLTENVK=<path>` points the
 build at it. The app's Vulkan 1.4 floor applies here too: a MoltenVK device exposing less than 1.4 is
 rejected. The CI job disables Vulkan and runs the headless core and substrate tests only. Details and
-current limits: [`docs/PORTING.md`](prosper/docs/PORTING.md).
+current limits: [`docs/platforms/PORTING.md`](prosper/docs/platforms/PORTING.md).
 
 ## Testing notes
 
@@ -194,8 +194,8 @@ GPU's Vulkan driver. `--list-games --games-dir ~/ps5` prints the titles it can s
 opening a window, which is the quickest way to confirm a download runs.
 
 There is no game picker or settings UI. Requirements, keyboard mapping, save-data selection,
-recordings and troubleshooting: [`LINUX_RELEASE.md`](prosper/docs/LINUX_RELEASE.md),
-[`WINDOWS_RELEASE.md`](prosper/docs/WINDOWS_RELEASE.md), and
+recordings and troubleshooting: [`LINUX_RELEASE.md`](prosper/docs/platforms/LINUX_RELEASE.md),
+[`WINDOWS_RELEASE.md`](prosper/docs/platforms/WINDOWS_RELEASE.md), and
 [`packaging/linux/`](prosper/packaging/linux/README.md) for how the archives are built.
 
 Expect the milestone recorded in [`COMPATIBILITY.md`](COMPATIBILITY.md) for a given title and

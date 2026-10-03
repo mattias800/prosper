@@ -445,7 +445,7 @@ TEST(BuildShaderResources, Contract) {
 
         // The discriminator, and the arm that says what the screen is actually about. It gates the
         // ENCODING, never the routing: a T# may name any permutation of the six DEFINED selectors,
-        // constants included, and `docs/RESOURCE_BINDING.md` § Ruled out records the falsification
+        // constants included, and `docs/gpu/RESOURCE_BINDING.md` § Ruled out records the falsification
         // (#2731) of the opposite claim -- a one-component surface declaring identity (R,G,B,A) is an
         // ordinary descriptor, and rejecting shapes on semantic grounds broke live video planes.
         // An implementation that refused "non-identity DST_SEL", or keyed on WORD3's low twelve bits

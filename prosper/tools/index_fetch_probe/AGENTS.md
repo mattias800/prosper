@@ -28,4 +28,4 @@ The standalone `tools/doctor` build can compile the same source as `renderdoc_co
 with `PROSPER_RENDERDOC_CONTROL`: an optional API capture bracket, not a change to the
 default probe. Its replay oracle is five draws and the exact final SSBO, including untouched
 sentinels. The DONT_CARE color attachment is deliberately **not** a pixel oracle.
-See [the capture/replay workflow](../../docs/DEBUGGING_WORKFLOWS.md#renderdoc-prove-capture-replay-and-data-inspection).
+See [the capture/replay workflow](../../docs/process/DEBUGGING_WORKFLOWS.md#renderdoc-prove-capture-replay-and-data-inspection).

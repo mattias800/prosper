@@ -330,7 +330,7 @@ TEST(Tile, Contract) {
     }
 
     // #379: golden within-tile order for the remaining element sizes 2/8/16 B — derived from the low
-    // (bx+by) bits of the authoritative kSw64kS pattern (docs/GFX10_SW_64KB_TILING.md: the 4KB order is
+    // (bx+by) bits of the authoritative kSw64kS pattern (docs/gpu/GFX10_SW_64KB_TILING.md: the 4KB order is
     // the low-bit truncation of the 64KB order). The old L-generator was correct only at 1 B / 4 B; at
     // 2/8/16 B it swapped the low X/Y pairs, scrambling every SW_4KB_S R16 / BC1/BC4 / BC2/3/5/6/7
     // surface into a coherent-looking weave. Each element stores x in byte0 and y in byte1, so a checked

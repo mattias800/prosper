@@ -39,7 +39,7 @@
 # matches your question does NOT leave you in silence. It says nothing about whether the remaining
 # single-gated diagnostic can print an unmeasured field -- that is SPLIT-LOCAL's question, and
 # SPLIT-LOCAL has its own blind spots (see the scanner docstring). The four mechanisms and the
-# hand-built control that proved the alias one are in docs/DIAGNOSTIC_GATE_AUDIT.md; #2628 then
+# hand-built control that proved the alias one are in docs/process/DIAGNOSTIC_GATE_AUDIT.md; #2628 then
 # sharpened the scanner so three of the four stop producing findings at all.
 #
 # #2628 SHARPENED THE SCANNER, so this file shrank from 93 keys to 54. That is the direction which

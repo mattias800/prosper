@@ -43,7 +43,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-DEFAULT_FILE = "prosper/docs/GAME_COMPAT_ORCHESTRATION.md"
+from table_paths import git_table_path
+
+DEFAULT_FILE = "prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md"
 DEFAULT_HEADER = "Instrument"
 CHECKER = Path(__file__).resolve().parent / "check_numbered_table.py"
 
@@ -162,13 +164,22 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as d:
         merged_copy = Path(d) / "merged.md"
         base_copy = Path(d) / "base.md"
-        show = git("show", f"{tree}:{args.file}", check=False)
+        try:
+            def reader(cmd: list[str]) -> str:
+                return git(*cmd[1:]).stdout
+
+            merged_path = git_table_path(tree, args.file, reader)
+            base_path = git_table_path(base, args.file, reader)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        show = git("show", f"{tree}:{merged_path}", check=False)
         if show.returncode != 0:
             print(f"error: {args.file} is not in the merge result: "
                   f"{(show.stderr or '').strip()}", file=sys.stderr)
             return 2
         merged_copy.write_text(show.stdout, encoding="utf-8")
-        base_copy.write_text(git("show", f"{base}:{args.file}").stdout, encoding="utf-8")
+        base_copy.write_text(git("show", f"{base}:{base_path}").stdout, encoding="utf-8")
 
         # encoding="utf-8" AND env=...PYTHONIOENCODING on the SAME call, deliberately: this is a
         # BOTH-SIDES fix, not two independent ones. `encoding="utf-8"` fixes how THIS process
@@ -206,7 +217,7 @@ def main() -> int:
     for stream, out in ((proc.stdout, sys.stdout), (proc.stderr, sys.stderr)):
         if stream:
             text = stream.replace(str(merged_copy), f"{args.file} (merged)")
-            print(text.replace(str(base_copy), f"{args.base}:{args.file}").rstrip(), file=out)
+            print(text.replace(str(base_copy), f"{args.base}:{base_path}").rstrip(), file=out)
 
     if proc.returncode == 0:
         print(f"\nclean merge, and the merge RESULT passes the gate against {args.base} as of now.")

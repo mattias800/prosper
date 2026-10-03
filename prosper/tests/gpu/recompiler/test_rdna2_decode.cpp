@@ -754,7 +754,7 @@ int main() {
     // where they require 1 or 0xf. Recognizing the packet does not by itself admit the guest
     // program: the live resource this addresses has six real mip levels and an unproven mip
     // register, so the emitter's zero-mip fast path still (correctly) declines it -- see
-    // docs/RECOMPILER_REMAINING.md and docs/STRAY_STATUS.md, both `## Ruled out`.
+    // docs/gpu/RECOMPILER_REMAINING.md and docs/games/STRAY_STATUS.md, both `## Ruled out`.
     const uint32_t stray_load_mip_2d_nsa_words[] = {0xf004070au, 0x00080500u, 0x0000052au};
     const Rdna2Inst stray_load_mip_2d_nsa =
         rdna2_decode_one(stray_load_mip_2d_nsa_words, 3);

@@ -1,4 +1,4 @@
-// gpu_execute.hpp — the stage-independent core of the GPU executor (Stage A of docs/GPU_EXECUTOR_DESIGN.md).
+// gpu_execute.hpp — the stage-independent core of the GPU executor (Stage A of docs/gpu/GPU_EXECUTOR_DESIGN.md).
 //
 // Turns a folded GpuState (exactly what agc_driver_submit_dcb produces via run_command_buffer) into a
 // rendered frame: extract the RDNA2 render-state, recompile the vertex+pixel shaders straight from their
@@ -3135,7 +3135,7 @@ std::vector<DrawItem> realize_gpustate_draws_parallel(
 // quad, which now renders through the real indexed path.) PROSPER_PERDRAW=1: ONE item per draw, each
 // realized from ITS OWN register snapshot (Draw::state), so per-draw masks/blends/shaders composite
 // correctly — the path for multi-geometry scenes (opt-in until the AGC context-log section semantics
-// that stage duplicate register writes are fully RE'd; see docs/REAL_FRAMES_FINDINGS.md).
+// that stage duplicate register writes are fully RE'd; see docs/games/messenger/REAL_FRAMES_FINDINGS.md).
 // `max_shader_dwords` bounds the recompiler's walk (it stops at S_ENDPGM).
 // vp_scale_{x,y}: scale each draw's guest viewport by this factor. The guest programs PA_CL_VPORT in
 // full present-resolution pixels; when we render into a reduced-resolution framebuffer (PROSPER_RENDER_SCALE)

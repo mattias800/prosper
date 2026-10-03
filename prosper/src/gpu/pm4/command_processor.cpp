@@ -1384,7 +1384,7 @@ static void liveptr_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t 
 // the faulting register: `dmaX(D)@7895/f37:0x41700f1e8` then `relX(D)@7895/f37:0x400000000` — our
 // 4-byte init zeroed the low dword of the vtable pointer `eboot+0x700f1e8`, our 4-byte fence then
 // set it to 1, and the guest's next `mov rax,[rdi]; call [rax+0x20]` at `eboot+0x32b61be` read
-// `0x400000001` and jumped to 0. See `docs/ARCRUNNER_STATUS.md`.
+// `0x400000001` and jumped to 0. See `docs/games/ARCRUNNER_STATUS.md`.
 //
 // Default OFF because it is an A/B arm, not yet a shipped contract: declining leaves that label
 // unwritten, and although no consumer of a reallocated block can legitimately be waiting on it, that
@@ -2057,7 +2057,7 @@ void dma_init_gen_trip(uint64_t dst, uint64_t pre, uint32_t value, uint32_t widt
 // of prosper's timing rather than of the guest. Acting on it declines two writes the guest asked
 // for and hardware performs, instead of performing them at the right time. This is a LEVER for
 // isolating the race, not a candidate fix, and it must not be made default-ON on the strength of
-// the progression it buys (see `docs/ARCRUNNER_STATUS.md`). CONFIDENCE: HIGH that it is a lever;
+// the progression it buys (see `docs/games/ARCRUNNER_STATUS.md`). CONFIDENCE: HIGH that it is a lever;
 // MED on the drift predicate's own soundness (see the journal-rebuild caveat in that document).
 // Levels, so the init decline and the paired-fence decline are SEPARABLE arms. They are not the
 // same experiment and the first head of this change conflated them: level 1 alone took a default

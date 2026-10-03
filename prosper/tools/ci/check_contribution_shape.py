@@ -181,7 +181,7 @@ def selftest():
         ("source plus a MODIFIED test", [("A", "prosper/src/foo.cpp"),
                                          ("M", "prosper/tests/gpu/capture/test_gpu_capture.cpp")]),
         ("modifying an existing source, no test", [("M", "prosper/src/gpu/capture/gpu_capture.cpp")]),
-        ("docs only", [("M", "prosper/docs/GAME_COMPAT_ORCHESTRATION.md")]),
+        ("docs only", [("M", "prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md")]),
         ("root-level markdown", [("A", "CONTRIBUTING.md")]),
         ("the root uv project (#4126)", [("A", "pyproject.toml"), ("A", "uv.lock")]),
         ("workflow change", [("M", ".github/workflows/ci.yml")]),

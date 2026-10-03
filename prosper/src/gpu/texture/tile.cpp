@@ -261,7 +261,7 @@ inline void sw4kb_dims(uint32_t bpe, uint32_t& bx, uint32_t& by) {
 }
 // GFX10 SW_4KB_S element order within the tile. The order is BYTES-PER-ELEMENT-DEPENDENT (AMD's
 // standard-swizzle SW_PATTERN genuinely differs per bpp). The 4KB order is exactly the LOW-BIT
-// TRUNCATION of the authoritative addrlib SW_64KB_S pattern (docs/GFX10_SW_64KB_TILING.md), so we
+// TRUNCATION of the authoritative addrlib SW_64KB_S pattern (docs/gpu/GFX10_SW_64KB_TILING.md), so we
 // derive it from the SAME in-file kSw64kS table used by the 64KB detiler rather than an ad-hoc
 // generator — one source of truth, correct at every element size.
 //
@@ -388,7 +388,7 @@ size_t sw4kb_tiled_bytes(uint32_t ew, uint32_t eh, uint32_t pitch, uint32_t bpe)
 // PIXEL-VERIFIED SW_4KB_S orders exactly (GFX10_SW_4K_S nibble expansion at 4 bpe ==
 // [x0 x1 y0 y1 y2 x2 y3 x3 y4 x4] == sw4kb_morton L=2; at 1 bpe == the verified L=4 font-atlas
 // order), and SW_64KB_S decodes a live-captured DOLL 1024x512 BC1 material texture into a coherent
-// sprite atlas (docs/GFX10_SW_64KB_TILING.md). CONFIDENCE: HIGH for SW_64KB_S (addrlib equation +
+// sprite atlas (docs/gpu/GFX10_SW_64KB_TILING.md). CONFIDENCE: HIGH for SW_64KB_S (addrlib equation +
 // live-texture validation). SW_64KB_R_X additionally XORs pipe bits into offset bits 8..8+log2(pipes)-1;
 // the pattern depends on the GPU's pipe count, which for PS5 is fixed hardware but not publicly
 // documented — see sw64kb_rx_pipes_log2 below. CONFIDENCE: MED for R_X (equation exact per addrlib,

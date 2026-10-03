@@ -23,12 +23,12 @@ usage, whether a PR is safe to merge.
   pays: title ids and title-named directories in shared code, raw `getenv` reads, blocking GPU syncs
   (`vkWaitForFences`, `*WaitIdle`, `ALL_COMMANDS` barriers), files over 5,000 lines, and
   `prosper::test::` in the shipping frontend; and four structural ones: host-platform `#if`s
-  outside `src/host` (`platform-ifdef`, seam: `docs/HOST_PLATFORM_SEAM.md`), includes against the
-  layer order (`layer-include`, `LAYER_ORDER` in the checker; `docs/ARCHITECTURE_TARGET_TREE.md`),
+  outside `src/host` (`platform-ifdef`, seam: `docs/architecture/HOST_PLATFORM_SEAM.md`), includes against the
+  layer order (`layer-include`, `LAYER_ORDER` in the checker; `docs/architecture/ARCHITECTURE_TARGET_TREE.md`),
   frontends including `tests/fixtures/` (`fixture-include`), and Vulkan object-creation call sites
   (`vk-object`). The practice -> rule table, including what is not mechanically checkable yet
   (giant functions: owned by the clang-tidy PR's `readability-function-size`), is in
-  `docs/ARCHITECTURE_TARGET_TREE.md` § Bad practices. Path arguments are resolved and must stay
+  `docs/architecture/ARCHITECTURE_TARGET_TREE.md` § Bad practices. Path arguments are resolved and must stay
   inside `--root`, and `--update` writes only `prosper/tools/ci/arch_ratchet_baseline.txt`. Per-file counts may go down, never up; a count that
   fell must have its row lowered (`--update` lowers and deletes, never raises). Raising a row is a
   reviewed baseline edit with a `# note` — for a new sync, naming the guest-visible result it

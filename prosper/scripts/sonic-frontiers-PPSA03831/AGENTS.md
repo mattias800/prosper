@@ -27,4 +27,4 @@ behaviour shifts.
   twelve pages on an isolated first-boot area. Pass `PROSPER_SAVE0=<private dir>` per run.
 
 Route findings, the measured A/Bs behind them and the `## Ruled out` table live in
-`prosper/docs/SONIC_FRONTIERS_STATUS.md`; the tracker is issue #1891.
+`prosper/docs/games/SONIC_FRONTIERS_STATUS.md`; the tracker is issue #1891.

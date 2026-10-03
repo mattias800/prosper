@@ -3,7 +3,7 @@
 //
 // The earlier claim that this dominates shipped rendering was withdrawn: the two harnesses used
 // for that comparison both lacked the app's active GPU-present path. See the correction in
-// docs/RENDERER_ARCHITECTURE_GAPS_2026_09_25.md. The reason census still distinguishes:
+// docs/gpu/RENDERER_ARCHITECTURE_GAPS_2026_09_25.md. The reason census still distinguishes:
 //
 //   no-color-target        the caller passed no target object -- a caller-shape question
 //   explicit-request       something downstream asked for bytes -- a consumer question

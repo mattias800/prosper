@@ -8,7 +8,7 @@
 // instrumented draw and dispatch, and after the loss the last marker that reached memory names the
 // window the GPU stopped inside.
 //
-// THIS FILE IS THE VULKAN-FREE HALF. It owns the identity of a site (D8 in docs/DIAGNOSTICS_ROADMAP.md:
+// THIS FILE IS THE VULKAN-FREE HALF. It owns the identity of a site (D8 in docs/process/DIAGNOSTICS_ROADMAP.md:
 // submit ordinal, pass, draw index, program, pipeline key), the ordered table that turns a marker value
 // back into that identity, and the arithmetic that turns "the last two markers the GPU wrote" into a
 // verdict. Everything the GPU writes is a 32-bit value, so none of this needs a device and all of it is
