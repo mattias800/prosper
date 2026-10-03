@@ -1330,6 +1330,10 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_libc_qsort_bsearch
     SOURCES tests/hle/test_libc_qsort_bsearch.cpp
     LIBRARIES prosper_core)
+  # sscanf is a host-convention variadic (not PROSPER_GUEST_ABI); the suite calls it as one.
+  prosper_add_gtest(test_libc_sscanf
+    SOURCES tests/hle/test_libc_sscanf.cpp
+    LIBRARIES prosper_core)
 
   # #2081 FALSE SUCCESS: an unregistered NID answers the dispatcher's 0, which for an SCE_OK
   # contract is a success report over an out-parameter nothing wrote. Pure, no game dump.
