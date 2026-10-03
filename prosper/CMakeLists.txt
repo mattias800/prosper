@@ -103,6 +103,11 @@ include(cmake/ProsperBuildRevision.cmake)
 prosper_add_build_revision_library(prosper_build_revision WORK_TREE "${CMAKE_SOURCE_DIR}/..")
 
 file(GLOB_RECURSE PROSPER_SRC CONFIGURE_DEPENDS src/*.cpp)
+if(WIN32)
+  list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/memory/committed_section_unavailable\\.cpp$")
+else()
+  list(FILTER PROSPER_SRC EXCLUDE REGEX "src/host/memory/committed_section_win\\.cpp$")
+endif()
 if(PROSPER_NATIVE_CLANG_TLS)
   list(FILTER PROSPER_SRC EXCLUDE REGEX "src/hle/libc/libc_variadic_capture\\.cpp$")
 endif()
@@ -2466,6 +2471,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_guest_mapping_lease PRIVATE prosper_core)
   add_test(NAME guest_mapping_lease COMMAND test_guest_mapping_lease)
   set_tests_properties(guest_mapping_lease PROPERTIES TIMEOUT 20)
+  if(WIN32)
+    prosper_add_gtest(test_windows_direct_fault_safety
+      SOURCES tests/hle/memory/test_windows_direct_fault_safety.cpp
+      LIBRARIES prosper_core)
+  endif()
   prosper_add_gtest(test_nested_wide_data_admission
     SOURCES tests/gpu/execute/test_nested_wide_data_admission.cpp
     LIBRARIES prosper_core)

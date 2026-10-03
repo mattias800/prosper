@@ -42,10 +42,15 @@ GuestMemoryTopologyRelation guest_memory_topology_relation(
 // Linux's guest fault handler may replace a whole 64 KiB reservation granule on first touch.
 // Admission under a GuestMappingLease must require each granule intersecting a source or writable
 // destination to be fully backed by committed direct mappings, or a fault in an adjacent reserved
-// slice could replace already leased bytes. Other platforms return false until their lazy/sparse
-// commitment paths have an equivalent proof. The caller still checks access and physical aliases.
-bool guest_memory_direct_range_fault_safe(const GuestMappingLease& lease,
-                                          uint64_t address, uint64_t size);
+// slice could replace already leased bytes. Windows authenticates one already committed, non-lazy
+// direct section view against its live original allocation, tracking and native commitment; private
+// fallback, legacy sparse views and COW/guarded access refuse. Other platforms still return false.
+// Windows backing identity assumes HLE-managed topology: arbitrary native remap/protection changes
+// are not authenticated by this observation (VirtualQuery is not a COW-history detector).
+// Neither proof excludes guest byte writers or grants ordering/currentness/physical alias isolation.
+// The caller still checks its required access and physical aliases.
+bool guest_memory_direct_range_fault_safe(const GuestMappingLease& lease, uint64_t address,
+                                          uint64_t size);
 
 // Compare an exact committed-direct source with the WHOLE allocated physical backing that
 // contains producer_address. Retained tiled/layered images must not use their linear pixel size

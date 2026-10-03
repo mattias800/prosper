@@ -26,6 +26,7 @@
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "hle/sync/sync_futex.hpp"   // shared futex wake + waiter registration (also used by the GPU's label wake)
 #include "host/memory/guest_memory_map.hpp"
+#include "host/memory/committed_section.hpp"
 #include "host/memory/guest_write_watch.hpp"
 #include <algorithm>
 #include <atomic>
@@ -8624,6 +8625,50 @@ bool guest_memory_direct_range_fault_safe(const GuestMappingLease&,
         ++mapping;
     }
     return true;
+#elif defined(_WIN32)
+    if (address < 0x1000 || !size || address > UINT64_MAX - size) return false;
+    const uint64_t end = address + size;
+    std::scoped_lock lock(g_mx, g_dmx, g_dview_mx);
+    const auto origin = direct_allocation_locked(address, 1u);
+    if (!origin.identity) return false;
+    const auto view = std::find_if(g_dviews.begin(), g_dviews.end(), [&](const DmemView& v) {
+        return !v.sparse && v.guest_base <= address && v.guest_size &&
+               v.guest_base <= UINT64_MAX - v.guest_size && end <= v.guest_base + v.guest_size;
+    });
+    if (view == g_dviews.end() || !view->view_base ||
+        view->phys > UINT64_MAX - (address - view->guest_base))
+        return false;
+    const uint64_t native_base = reinterpret_cast<uintptr_t>(view->view_base);
+    if (native_base > view->guest_base || !view->view_size ||
+        native_base > UINT64_MAX - view->view_size || end > native_base + view->view_size)
+        return false;
+    const uint64_t physical = view->phys + address - view->guest_base;
+    if (physical < origin.physical_begin || physical >= origin.physical_end ||
+        size > origin.physical_end - physical)
+        return false;
+    // The inherited nonfixed private fallback is tracked as direct too. Only an actual section
+    // view supplies this equation. Protection/retype ledger splits must preserve the SAME origin.
+    uint64_t cursor = address;
+    while (cursor < end) {
+        const auto mapping = std::find_if(g_maps.begin(), g_maps.end(), [&](const Mapping& m) {
+            return m.base <= cursor && cursor - m.base < m.size;
+        });
+        if (mapping == g_maps.end() || !(mapping->prot & 0x1) ||
+            mapping->base > UINT64_MAX - mapping->size)
+            return false;
+        const uint64_t bytes = std::min(end - cursor, mapping->size - (cursor - mapping->base));
+        const auto allocation = direct_allocation_locked(cursor, bytes);
+        if (allocation.identity != origin.identity ||
+            allocation.physical_begin != origin.physical_begin ||
+            allocation.physical_end != origin.physical_end ||
+            mapping->offset > UINT64_MAX - (cursor - mapping->base) ||
+            mapping->offset + (cursor - mapping->base) != physical + (cursor - address))
+            return false;
+        cursor += bytes;
+    }
+    // Windows' reserved-page VEH cannot replace a live mapped section. Legacy sparse direct
+    // views and their fault-time alias protection changes were explicitly excluded above.
+    return host::committed_section_range(address, size, native_base);
 #else
     (void)address;
     (void)size;
