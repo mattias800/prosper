@@ -22,7 +22,8 @@ Execution execute(uint32_t family, bool missing = false, uint32_t en = 15) {
         }
         std::vector<FragmentResourcePacket> waves;
         for (uint32_t wave = 0; wave < 3; ++wave) {
-            auto input = family == 16                  ? f::pending_image(true, wave)
+            auto input = family == 17                  ? f::numeric_saveexec(en, wave)
+                         : family == 16                ? f::pending_image(true, wave)
                          : family >= 8 && family <= 14 ? f::pending_write(family - 8, true, wave)
                          : family == 15                ? f::pending_join(true, en != 0, wave)
                          : family == 1                 ? f::scratch(wave, true)
@@ -169,6 +170,33 @@ TEST(FragmentPacketExportExecution, RealWaitProtectsOriginalPayloadAgainstEveryE
                 if (on)
                     EXPECT_EQ(*events[1].source_words[0],
                               family == 0 ? f::value(wave) : 0x87000000u + lane);
+            }
+        }
+    }
+}
+TEST(FragmentPacketExportExecution, NumericSaveexecPreservesOldWordsAndNewSccAcrossWorkgroups) {
+    for (uint32_t scenario = 0; scenario < f::numeric_saveexec_cases.size(); ++scenario) {
+        const auto actual = execute(17, false, scenario);
+        if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
+        ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
+        ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
+        for (uint32_t wave = 0; wave < 3; ++wave) {
+            const auto expected = f::numeric_saveexec_records(scenario, wave);
+            const auto offset = actual.batch.placements[wave].output_base + 128;
+            ASSERT_GE(actual.words.size(), offset + expected.size());
+            EXPECT_TRUE(
+                std::equal(expected.begin(), expected.end(), actual.words.begin() + offset));
+            for (uint32_t lane = 0; lane < 64; ++lane) {
+                const auto& output = actual.result.architectural_exports[wave][lane];
+                EXPECT_EQ(output.colors[0][0].has_value(), f::active(lane));
+                if (f::active(lane)) {
+                    EXPECT_EQ(output.colors[0][1]->bits, 0x80000001u);
+                    EXPECT_EQ(output.colors[0][2]->bits, 0x80000101u);
+                    EXPECT_EQ(output.colors[0][0]->bits,
+                              f::numeric_saveexec_cases[scenario].new_nonzero
+                                  ? f::value(wave)
+                                  : 0x6247f000u + wave * 0x100);
+                }
             }
         }
     }

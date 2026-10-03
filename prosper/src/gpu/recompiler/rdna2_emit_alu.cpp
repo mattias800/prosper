@@ -1108,7 +1108,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // a VCC source into OLD EXEC and silently compute a different operation.
                     const uint32_t old_exec = rs.exec;
                     const bool old_exec_narrowed = rs.exec_narrowed;
-                    uint32_t m = src_mask(in.src[0]);
+                    uint32_t m = packet_and_saveexec_source_mask(b, rs, in, src_mask(in.src[0]));
                     if (!m) { ok = false; return true; }
                     rs.sreg_bool[in.dst.value] = old_exec;  // D = OLD_EXEC
                     rs.sreg_bool_narrowed[in.dst.value] = old_exec_narrowed;

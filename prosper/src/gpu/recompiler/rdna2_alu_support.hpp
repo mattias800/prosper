@@ -38,6 +38,8 @@ namespace prosper::gpu {
 // Complete S_MOV_B64-to-EXEC transfer, including owned logical-Wave64 numeric scalar pairs.
 bool emit_s_mov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in);
 uint32_t packet_s_mov_b64_numeric_vcc_bit(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in);
+uint32_t packet_and_saveexec_source_mask(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in,
+                                         uint32_t fallback);
 const char* packet_b64_mask_move_source_gap(const SpirvCompute& b, const Rdna2Inst& in,
                                             const std::set<int>& masks,
                                             const std::set<int>& scalar_words,

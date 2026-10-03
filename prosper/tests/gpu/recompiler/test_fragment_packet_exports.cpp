@@ -269,6 +269,51 @@ TEST(FragmentPacketExports, EveryConditionalPathAndPackedPhysicalWordMustStaySta
         }
     }
 }
+TEST(FragmentPacketExports, NumericSaveexecKeepsCurrentWordsOldMaskAndNewSccDistinct) {
+    for (uint32_t scenario = 0; scenario < f::numeric_saveexec_cases.size(); ++scenario) {
+        const auto input = f::numeric_saveexec(scenario);
+        const auto p = compile(input.invocation, f::numeric_saveexec_cases[scenario].name);
+        ASSERT_FALSE(p.spirv.empty()) << p.rejection;
+        EXPECT_EQ(p.demanded_initial_masks, kPacketInitialExec);
+        const auto words = execute(p);
+        const auto expected = f::numeric_saveexec_records(scenario, 0);
+        ASSERT_GE(words.size(), expected.size());
+        EXPECT_TRUE(std::equal(expected.begin(), expected.end(), words.begin()));
+        const auto decoded = decode_fragment_packet(p, words, true);
+        ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+        ASSERT_EQ(decoded.architectural_exports.size(), 64u);
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            const auto& output = decoded.architectural_exports[lane];
+            EXPECT_EQ(output.colors[0][0].has_value(), f::active(lane));
+            if (f::active(lane)) {
+                EXPECT_EQ(output.colors[0][1]->bits, 0x80000001u);
+                EXPECT_EQ(output.colors[0][2]->bits, 0x80000101u);
+                EXPECT_EQ(output.colors[0][0]->bits, f::numeric_saveexec_cases[scenario].new_nonzero
+                                                         ? f::value(0)
+                                                         : 0x6247f000u);
+            }
+        }
+    }
+    for (uint32_t absent : {22u, 23u}) {
+        auto missing = f::numeric_saveexec(0);
+        std::erase_if(missing.invocation.sgprs,
+                      [=](const auto& word) { return word.first == absent; });
+        const auto p = recompile_fragment_packet(missing.invocation);
+        EXPECT_TRUE(p.spirv.empty());
+        EXPECT_EQ(p.rejection, "packet-sgpr-read-before-definition")
+            << "original numeric MOV at PC1 must not borrow its absent s" << absent
+            << " from old entry s20:21 or the saved Bool; this is not an AND-site guard fault";
+    }
+    for (uint32_t absent : {20u, 21u}) {
+        auto missing = f::pending_write(2, true);
+        std::erase_if(missing.invocation.sgprs,
+                      [=](const auto& word) { return word.first == absent; });
+        const auto p = recompile_fragment_packet(missing.invocation);
+        EXPECT_TRUE(p.spirv.empty());
+        EXPECT_EQ(p.rejection, "packet-sgpr-read-before-definition")
+            << "the original waited AND_SAVEEXEC at PC3 needs both real source words";
+    }
+}
 TEST(FragmentPacketExports, CompressedReadsTwoPhysicalWordsAndKeepsRaw16BitChannels) {
     for (uint32_t en : {0u, 3u, 12u, 15u}) {
         const auto input = f::compressed(en).invocation;

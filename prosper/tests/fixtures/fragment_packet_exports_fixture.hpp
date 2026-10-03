@@ -1,6 +1,7 @@
 #pragma once
 #include "fragment_resource_packet_fixture.hpp"
 #include "gpu/recompiler/fragment_packet_wave_data.hpp"
+#include <array>
 
 namespace prosper::test::fragment_packet_exports {
 using namespace prosper::gpu;
@@ -128,6 +129,71 @@ inline FragmentResourcePacket pending_join(bool both_wait, bool scc, uint32_t wa
     code.push_back(0xbf810000u);
     return p;
 }
+struct NumericSaveexecCase {
+    uint64_t source;
+    bool new_nonzero;
+    const char* name;
+};
+inline constexpr std::array<NumericSaveexecCase, 6> numeric_saveexec_cases{{
+    {0, false, "zero"},
+    {1ull << 31, true, "low31"},
+    {1ull << 32, true, "high32"},
+    {1ull << 40, true, "high40_source_destination_overlap"},
+    {1ull << 63, true, "high63"},
+    {1ull << 5, false, "nonintersecting"},
+}};
+inline FragmentResourcePacket numeric_saveexec(uint32_t scenario, uint32_t wave = 0) {
+    auto p = base(wave);
+    const auto& c = numeric_saveexec_cases.at(scenario);
+    p.invocation.scc = !c.new_nonzero; // supplied OLD SCC must never win over the NEW wave vote
+    p.invocation.sgprs.emplace_back(1, 0x6247f000u + wave * 0x100);
+    for (auto& [reg, bits] : p.invocation.sgprs) {
+        if (reg == 22) bits = uint32_t(c.source);
+        if (reg == 23) bits = uint32_t(c.source >> 32);
+    }
+    auto& code = p.invocation.guest_code;
+    const uint32_t saved = scenario == 3 ? 20u : 30u;
+    // The high40 rail also makes D overlap S0: both numeric words must be read before saving OLD.
+    code = {0xbe94047eu,   // PC0: save OLD EXEC in s20:21, competing with their genuine entry words
+            0xbe940416u,   // PC1: replace BOTH words with current numeric s22:23, not the old Bool
+            scenario == 3 ? 0xbe942414u
+                          : 0xbe9e2414u,   // PC2: D=OLD EXEC, NEW EXEC=current source&OLD
+            scenario == 3 ? 0xbefe0414u : 0xbefe041eu};   // PC3: restore OLD; MOV preserves NEW SCC
+    fp::vmov(code, 2, saved);   // PC4: actual saved low DATA word
+    fp::vmov(code, 3, saved + 1);   // PC5: actual saved high DATA word
+    code.push_back(0xbf840002u);   // PC6: SCC0 -> PC9
+    fp::vmov(code, 1, 0);   // PC7: NEW EXEC nonzero marker
+    code.push_back(0xbf820001u);   // PC8 -> PC10
+    fp::vmov(code, 1, 1);   // PC9: NEW EXEC zero marker, even with nonzero source outside OLD EXEC
+    exp(code, 0, 7, 0x00030201u, true, true);   // PC10: original three-word raw sink
+    code.push_back(0xbf810000u);
+    return p;
+}
+inline std::vector<uint32_t> numeric_saveexec_records(uint32_t scenario, uint32_t wave) {
+    // Independently specified OLD physical bits and expected NEW-result SCC. No production
+    // mask reconstruction, export decoder or compile-derived values form this oracle.
+    const bool nonzero = numeric_saveexec_cases.at(scenario).new_nonzero;
+    std::vector<uint32_t> words(64 * 14);
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        const bool on = active(lane);
+        const uint32_t row[]{1,
+                             uint32_t(on),
+                             uint32_t(lane != 40),
+                             0,
+                             7,
+                             0,
+                             1,
+                             1,
+                             on ? nonzero ? value(wave) : 0x6247f000u + wave * 0x100 : 0,
+                             on ? 0x80000001u : 0,
+                             on ? 0x80000101u : 0,
+                             0,
+                             10,
+                             on ? 7u : 0u};
+        std::copy(std::begin(row), std::end(row), words.begin() + lane * 14);
+    }
+    return words;
+}
 // Independent original-word oracle: full 14-word transport at BOTH sites and all64 lanes.
 // No production decoder, source-mask helper or decoded PCs enter these expectations.
 inline std::vector<uint32_t> pending_records(uint32_t family, uint32_t wave) {
@@ -183,16 +249,16 @@ inline FragmentResourcePacket pending_image(bool drain, uint32_t wave = 0) {
     auto p = base(wave);
     column(p, 10, 0);
     column(p, 11, 0);
-    p.invocation.vgprs[0].words.fill(0x3e000000u); // genuine exact 4x4 base-mip XY centers
+    p.invocation.vgprs[0].words.fill(0x3e000000u);   // genuine exact 4x4 base-mip XY centers
     p.invocation.vgprs[1].words.fill(0x3e000000u);
-    column(p, 23, value(wave)); // highest word of the FOUR-word image destination
+    column(p, 23, value(wave));   // highest word of the FOUR-word image destination
     auto image = fragment_resource_packet::chain().images[0];
     for (uint32_t word = 0; word < 8; ++word)
         p.invocation.sgprs.emplace_back(4 + word, image.descriptor[word]);
     for (uint32_t word = 0; word < 4; ++word)
         p.invocation.sgprs.emplace_back(12 + word, image.sampler[word]);
     auto& code = p.invocation.guest_code;
-    exp(code, 0, 1, 23, false, false); // original value before the wide MIMG destination write
+    exp(code, 0, 1, 23, false, false);   // original value before the wide MIMG destination write
     if (drain) code.push_back(0xbf8c0000u);
     image.pc = static_cast<uint32_t>(code.size());
     code.insert(code.end(), {0xf0000000u | (0x27u << 18) | 0xf00u | 8u,
