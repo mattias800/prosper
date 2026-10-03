@@ -9,6 +9,7 @@
 // renderer once the device is wired; tests call it with the offscreen renderer to verify the spine.
 #pragma once
 #include "gpu/execute/refused_shader_source.hpp"   // default original refused-shader evidence
+#include "gpu/execute/graphics_execution_activity.hpp"
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include <map>
 #include <atomic>
@@ -3360,9 +3361,10 @@ inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
 inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn& render,
                                              uint32_t max_shader_dwords = 0x10000,
                                              float vp_scale_x = 1.0f, float vp_scale_y = 1.0f) {
+    const GraphicsExecutionActivity execution;
     if (!render) return {};
-    std::vector<DrawItem> items = realize_gpustate_draws(
-        st, max_shader_dwords, vp_scale_x, vp_scale_y);
+    std::vector<DrawItem> items =
+        realize_gpustate_draws(st, max_shader_dwords, vp_scale_x, vp_scale_y);
     if (items.empty()) return {};
     return render(items);
 }

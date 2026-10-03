@@ -13116,6 +13116,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
 }
 
 bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height, bool publish) {
+    const GraphicsExecutionActivity execution;
     if (!g_live || st.draws.empty() || !width || !height) return false;
     // Same extent contract as the ordered path: this frame is checked against width*height*4 below
     // before it can be published (#1986).

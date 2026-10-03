@@ -510,4 +510,55 @@ TEST_F(OrderedGraphicsReadPointTest, PeerEntryRefusesBeforeProbeAndNeverRevivesO
     EXPECT_EQ(Backend::backend_failed_publication_generation().load(), generation_before);
 }
 
+TEST_F(OrderedGraphicsReadPointTest, DirectOrderedDmaExpiresOldPointAndFreshPointSeesBytes) {
+    std::memset(reinterpret_cast<void*>(output), 0, sizeof(Values));
+    inspect([&](const DrawItem& item) {
+        auto old = reader(context(item.ordered_read_point));
+        ASSERT_TRUE(old->probe(FoldProbe::Raw, 0, parent, 16));
+        GpuState::DmaCopy copy;
+        copy.src = output;
+        copy.dst = child + 16;
+        copy.bytes = sizeof(Values);
+        copy.sels = 1u | (3u << 8u) | kDmaDataAddressSource;
+        copy.command_order = Order + 1;
+        ASSERT_TRUE(execute_ordered_dma_copy(copy));
+        EXPECT_EQ(std::memcmp(reinterpret_cast<const void*>(child + 16),
+                              reinterpret_cast<const void*>(output), sizeof(Values)),
+                  0);
+        EXPECT_FALSE(old->probe(FoldProbe::Raw, 2, child + 16, 16));
+        ShaderResourceTable table;
+        EXPECT_FALSE(old->publish(table));
+    });
+    inspect([&](const DrawItem& item) {
+        auto fresh = reader(context(item.ordered_read_point));
+        ASSERT_TRUE(fresh->probe(FoldProbe::Raw, 0, parent, 16));
+        ASSERT_TRUE(fresh->probe(FoldProbe::Raw, 2, child + 16, 16));
+        EXPECT_EQ(fresh->word(2, child + 16), 0u);
+    });
+    EXPECT_EQ(Backend::backend_failed_publication_generation().load(), generation_before);
+}
+
+TEST_F(OrderedGraphicsReadPointTest, LegacyExecutionEntriesExpirePermissionBeforeEmptyReturn) {
+    for (unsigned entry = 0; entry < 3; ++entry) {
+        inspect([&](const DrawItem& item) {
+            auto old = reader(context(item.ordered_read_point));
+            ASSERT_TRUE(old->probe(FoldProbe::Raw, 0, parent, 16));
+            const GpuState empty;
+            if (entry == 0)
+                EXPECT_FALSE(execute_and_present(empty, 8, 8, false));
+            else if (entry == 1)
+                EXPECT_FALSE(execute_nonrender_submit_work(empty, Submit + 1));
+            else
+                EXPECT_TRUE(execute_gpustate(empty, RenderFn{}).empty());
+            EXPECT_FALSE(old->probe(FoldProbe::Raw, 2, child + 16, 16));
+        });
+        inspect([&](const DrawItem& item) {
+            auto fresh = reader(context(item.ordered_read_point));
+            ASSERT_TRUE(fresh->probe(FoldProbe::Raw, 0, parent, 16));
+            ASSERT_TRUE(fresh->probe(FoldProbe::Raw, 2, child + 16, 16));
+            EXPECT_EQ(fresh->word(2, child + 16), Values[0]);
+        });
+    }
+}
+
 }   // namespace

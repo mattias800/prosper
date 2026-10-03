@@ -7,6 +7,7 @@
 #include "gpu/diagnostics/diag_ratelimit.hpp"   // #1761: single-sourced ordinal + sparse-tail rule for capped logs
 #include "gpu/diagnostics/fence_build_journal.hpp"
 #include "gpu/execute/mb3_freelist.hpp"
+#include "gpu/execute/graphics_execution_activity.hpp"
 #include "diagnostics/env_numeric.hpp"   // #3267: a typo must not switch a default-ON guard off
 #include "diagnostics/env_cache.hpp"   // cached PROSPER_* gates on per-draw/per-resource paths
 #include "diagnostics/perf/perf_ledger.hpp"
@@ -2829,8 +2830,8 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
     return true;
 }
 
-bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
-                              const uint8_t* authoritative_source) {
+bool execute_ordered_dma_copy(const GpuState::DmaCopy& copy, const uint8_t* authoritative_source) {
+    const GraphicsExecutionActivity execution;
     Pm4Command c{};
     c.kind = Pm4Command::Kind::DmaData;
     c.dd_dst = copy.dst;
