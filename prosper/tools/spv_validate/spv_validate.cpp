@@ -34,6 +34,7 @@
 #include "../../tests/fixtures/spirv_fragment_neutral_fixtures.hpp"
 #include "../../tests/fixtures/portable_bpermute_fixture.hpp"
 #include "../../tests/fixtures/dpp_row_max.hpp"
+#include "../../tests/fixtures/dpp_row_fadd.hpp"
 #include "../../tests/fixtures/fragment_packet_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_wqm_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_mbcnt_fixture.hpp"
@@ -1593,6 +1594,24 @@ int main(int argc, char** argv) {
            recompile_ngg_exports_for_test(c, std::size(c), 1),
            "recompile_ngg_exports_for_test"); }
     // Unsigned row scans need both the ordinary uniform route and event-isolated CFG routes.
+    {
+        using prosper::test::DppRowFaddCase;
+        uint32_t index = 0;
+        for (const auto shape :
+             {DppRowFaddCase::Linear, DppRowFaddCase::DivergentSites,
+              DppRowFaddCase::LoopAndCompletedPeer, DppRowFaddCase::LaterBarrierPhase}) {
+            const auto c = prosper::test::dpp_row_fadd_program(shape);
+            for (bool native : {false, true}) {
+                const std::string id = std::string("compute_dpp_row_fadd_") +
+                                       std::to_string(index) + (native ? "_native64" : "_portable");
+                dump(dir, id.c_str(),
+                     recompile_ngg_exports_for_test(c.data(), c.size(), 10, 0, nullptr, 4, 0, {},
+                                                    true, true, native),
+                     "recompile_ngg_exports_for_test");
+            }
+            ++index;
+        }
+    }
     {
         const auto c = prosper::test::dpp_row_max_program({1, 2, 4, 8});
         dump(dir, "compute_dpp_row_max_linear", recompile_valu(c.data(), c.size(), 3, 1));

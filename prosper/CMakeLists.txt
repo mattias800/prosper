@@ -2706,7 +2706,16 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_compute_dpp_row_max.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_compute_dpp_row_fadd
+    SOURCES tests/gpu/recompiler/test_compute_dpp_row_fadd.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   if(Vulkan_FOUND)
+    prosper_add_gtest(test_compute_dpp_row_fadd_execution
+      SOURCES tests/gpu/execute/test_compute_dpp_row_fadd.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 60)
     prosper_add_gtest(test_compute_dpp_row_max_execution
       SOURCES tests/gpu/execute/test_compute_dpp_row_max.cpp
       INCLUDES tests

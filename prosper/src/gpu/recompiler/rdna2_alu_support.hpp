@@ -443,6 +443,7 @@ enum class DppRowRor8Op : uint32_t {
     MovB32 = 1,
     MinF32 = 2,
     MaxF32 = 3,
+    AddF32 = 4,
 };
 
 // The XOR stride a DPP control applies to the lane id, or 0 if the control is not in this family.
@@ -470,7 +471,7 @@ inline bool dpp_row_xor_ctrl(uint32_t dpp_ctrl, uint32_t* stride = nullptr) {
 // Exact bounded row-rotate family emitted by GTA V's screen-space compute passes. The decoder has
 // already proved FI=0/no source modifiers; repeat every retained control field here so the ordinary
 // emitter and CFG dispatcher share one fail-closed contract. VOP1 MOV has only the permuted SRC0;
-// the two VOP2 float operations combine that value with the destination lane's unpermuted SRC1.
+// VOP2 float operations combine that value with the destination lane's unpermuted SRC1.
 inline DppRowRor8Op dpp_row_ror8_op(const Rdna2Inst& in) {
     if (!in.has_dpp || !in.dpp_bound_ctrl || !dpp_row_xor_ctrl(in.dpp_ctrl) ||
         in.dpp_row_mask != 0xfu || in.dpp_bank_mask != 0xfu ||
@@ -482,6 +483,12 @@ inline DppRowRor8Op dpp_row_ror8_op(const Rdna2Inst& in) {
         return DppRowRor8Op::None;
     if (in.opcode == 0x0f) return DppRowRor8Op::MinF32;
     if (in.opcode == 0x10) return DppRowRor8Op::MaxF32;
+    // The portable service rotates by eight. Keep newly admitted ADD narrower than the older
+    // MOV/MIN/MAX row-XOR classifier; another XOR stride needs its own per-event lane address.
+    if (in.opcode == 0x03 && in.dpp_ctrl == 0x128u && in.n_src == 2 && !in.has_modifier &&
+        !in.has_sdwa && !in.clamp && !in.omod && !in.src_neg[0] && !in.src_neg[1] &&
+        !in.src_abs[0] && !in.src_abs[1])
+        return DppRowRor8Op::AddF32;
     return DppRowRor8Op::None;
 }
 
@@ -493,8 +500,8 @@ inline DppRowRor8Op dpp_row_ror8_op(const Rdna2Inst& in) {
 // only architectural result is VDST therefore lowers identically, and a per-opcode allow-list
 // silently drops every shader using any other one.
 //
-// `dpp_row_ror8_op` above stays exactly as it was: the CFG dispatcher needs to NAME the reduction
-// it re-implements, and only MIN/MAX/MOV are named. This predicate is for the ordinary emitter,
+// The CFG dispatcher needs to NAME the reduction it re-implements; its ADD service is narrowly
+// restricted to ROW_ROR:8. This predicate is for the ordinary emitter,
 // which needs no name because it does not re-implement anything -- it permutes SRC0 and then emits
 // the instruction it already emits.
 //
