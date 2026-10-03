@@ -533,7 +533,7 @@ TEST_F(OrderedGraphicsReadPointTest, DirectOrderedDmaExpiresOldPointAndFreshPoin
         copy.src = output;
         copy.dst = child + 16;
         copy.bytes = sizeof(Values);
-        copy.sels = 1u | (3u << 8u) | kDmaDataAddressSource;
+        copy.sels = 3u | (3u << 8u) | kDmaDataAddressSource;
         copy.command_order = Order + 1;
         ASSERT_TRUE(execute_ordered_dma_copy(copy));
         EXPECT_EQ(std::memcmp(reinterpret_cast<const void*>(child + 16),
