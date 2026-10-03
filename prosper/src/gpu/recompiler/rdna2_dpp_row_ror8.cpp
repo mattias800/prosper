@@ -1,8 +1,23 @@
 #include "gpu/recompiler/rdna2_dpp_row_ror8.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include <algorithm>
 
 namespace prosper::gpu {
+bool needs_compute_dpp_row_fadd_dispatcher(const std::vector<Rdna2Inst>& instructions,
+                                           uint32_t native_subgroup_size) {
+    if (!std::any_of(instructions.begin(), instructions.end(), [](const Rdna2Inst& in) {
+            return dpp_row_ror8_op(in) == DppRowRor8Op::AddF32;
+        }))
+        return false;
+    if (!native_subgroup_size) return true;
+    if (native_subgroup_size != 64) return false;
+    return std::any_of(instructions.begin(), instructions.end(), [](const Rdna2Inst& in) {
+        return in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
+               in.opcode != 0x03;
+    });
+}
+
 // All workers, including completed waves, publish event/EXEC metadata and reach both barriers.
 bool emit_portable_compute_dpp_row_ror8_phase(
     SpirvCompute& b, const ComputeDppRowRor8PhaseVariables& variables, uint32_t value_base,

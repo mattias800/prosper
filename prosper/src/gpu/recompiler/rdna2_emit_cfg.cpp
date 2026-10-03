@@ -6673,11 +6673,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::DS && in.opcode == kDsOpcodeBpermuteB32;
         });
-    const bool portable_compute_row_fadd =
-        b.is_compute && !b.native_subgroup_size &&
-        std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
-            return dpp_row_ror8_op(in) == DppRowRor8Op::AddF32;
-        });
+    const bool compute_cfg_row_fadd =
+        b.is_compute && needs_compute_dpp_row_fadd_dispatcher(ins, b.native_subgroup_size);
     const bool compute_cfg_row_maximum =
         b.is_compute && std::any_of(ins.begin(), ins.end(), is_inplace_vmax_u32_dpp_row_shr) &&
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
@@ -6707,7 +6704,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         if (phased.found &&
             (phased.guarded || initial_dispatch_active || force_barrier_phases ||
              portable_compute_mask_reduction || portable_compute_readfirstlane ||
-             portable_compute_bpermute || compute_cfg_row_maximum || portable_compute_row_fadd)) {
+             portable_compute_bpermute || compute_cfg_row_maximum || compute_cfg_row_fadd)) {
             // Every phase shares one immutable Workgroup OpTypeArray. Size it from the complete
             // phased stream before the first dispatcher: a later portable DPP operation needs a
             // second per-lane plane even when the earlier phase needed only votes/liveness.
@@ -6835,7 +6832,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             exp_fn, code, dwords, initial_dispatch_active, true);
     if (allow_cfg_dispatcher &&
         (portable_compute_mask_reduction || portable_compute_readfirstlane ||
-         portable_compute_bpermute || compute_cfg_row_maximum || portable_compute_row_fadd) &&
+         portable_compute_bpermute || compute_cfg_row_maximum || compute_cfg_row_fadd) &&
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) { return in.is_end; })) {
         // Do this before the counted-loop prefix can narrow EXEC: portable wave services need
         // a common host barrier site, not an invocation-local structured loop body.
