@@ -465,8 +465,8 @@ void test_apr_submit_and_get_id() {
           "sceKernelAprSubmitCommandBufferAndGetId is registered (unregistered, its id is 0)");
     if (!submit_id || !set_buffer || !get_offset || !append_320 || !construct) return;
 
-    // An unbound command buffer: no equeue, so the submit hands out prosper's own per-ring token
-    // rather than echoing a guest tag. Addresses are the same private shape the AMM test uses.
+    // An unbound command buffer publishes an opaque kernel submit handle through the caller's
+    // separate four-byte slot. The return value is SCE status. Addresses are the same private shape the AMM test uses.
     // CONSTRUCT before SetBuffer: the cursor is only tracked for a buffer that has been constructed
     // with a capacity, which is the guest's own order and is why an attach-only fixture reports a
     // cursor of 0 forever.
@@ -486,13 +486,17 @@ void test_apr_submit_and_get_id() {
           "positive control: the append MOVED the command-buffer cursor (without this the reset "
           "check below cannot fail)");
 
-    const uint64_t first = submit_id(kCb, /*ring_1based=*/6, 0, 0, 0, 0);
-    CHECK(first != 0, "the returned id is NOT zero -- zero is what the missing handler answered");
+    uint32_t first = 0;
+    CHECK(submit_id(kCb, 6, reinterpret_cast<uint64_t>(&first), 0, 0, 0) == 0,
+          "submit returns success and publishes the separate ID");
+    CHECK(first != 0, "the caller-provided ID slot was populated");
     CHECK(get_offset(kCb, 0, 0, 0, 0, 0) == 0,
           "the submit RESET the command-buffer cursor (the half that stalls an append loop)");
 
     append_320(kCb, 0, 0, 0, 0, 0);
-    const uint64_t second = submit_id(kCb, /*ring_1based=*/6, 0, 0, 0, 0);
+    uint32_t second = 0;
+    CHECK(submit_id(kCb, 6, reinterpret_cast<uint64_t>(&second), 0, 0, 0) == 0,
+          "second submit publishes its ID");
     CHECK(second != first, "a second submit gets a DIFFERENT id (ids name submits, not the buffer)");
 }
 

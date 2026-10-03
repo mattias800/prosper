@@ -1213,11 +1213,16 @@ if(TARGET prosper_core)
     INCLUDES src
     LIBRARIES prosper_core)
 
-  # The APR submit's result out-parameters are uint32_t*; an 8-byte store overran into the guest's
-  # stack canary and killed the title with __stack_chk_fail (#4138).
+  # APR status/offset uses 8 bytes and the separate submit ID uses 4; widening the ID
+  # overwrites the adjacent guest flag/canary (#4138, #4042).
   prosper_add_gtest(test_apr_result_slot_width
     SOURCES tests/hle/kernel/test_apr_result_slot_width.cpp
     INCLUDES src
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_apr_submission
+    SOURCES tests/hle/kernel/test_apr_submission.cpp
+    INCLUDES src tests
     LIBRARIES prosper_core)
 
   # lseek/fseek/ftell must address offsets >= 2 GiB. MinGW's long/off_t are 32 bits, so Black Flag's
