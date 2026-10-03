@@ -5,8 +5,9 @@ save data the platform layers on top of it.
 
 - `hle_file` — the POSIX and `sceKernel*` file surface, with `/app0` path translation. The largest
   thing here and still per-platform in one file; see the note below.
-- `guest_fopen_mode` — the guest's `fopen` mode grammar (FreeBSD's), re-spelled for the host C
-  library; on Windows a verbatim mode opened guest binary files in text mode.
+- `guest_fopen_mode` — the guest's `fopen` mode grammar (Dinkumware `_Foprep`, read from the
+  shipped libc.prx), re-spelled for the host C library; on Windows a verbatim mode opened guest
+  binary files in text mode. Only titles that ship no libc.prx reach it.
 - `guest_sync` — the POSIX descriptor-free durability barrier, bounded to retained guest
   storage filesystems. Private filesystem handles outlive guest closes and save unmounts;
   writable guest stdio is flushed first.

@@ -1104,8 +1104,9 @@ void to_sce_stat64(const struct _stat64& s, uint8_t* out) {
 #endif
 
 // --- stdio FILE* ---
-// The guest's mode string is FreeBSD's grammar, not the host's: parse it once and hand the host a
-// spelling it accepts (guest_fopen_mode.hpp — on Windows a verbatim "r" opened in TEXT mode).
+// The guest's mode string follows its libc's (Dinkumware `_Foprep`) grammar, not the host's: parse
+// it once and hand the host a spelling it accepts (guest_fopen_mode.hpp — on Windows a verbatim "r"
+// opened in TEXT mode). Reached only by titles that ship no libc.prx; see that header's scope note.
 HLE(f_fopen) {
     const char* mode = CS(a1);
     const GuestFopenMode m = parse_guest_fopen_mode(mode, kHostFopenDialect);

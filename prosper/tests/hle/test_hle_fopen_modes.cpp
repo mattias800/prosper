@@ -2,9 +2,13 @@
 //
 // Contract: C11 (N1570) §7.21.5.3 (fopen modes: truncate/create, append forcing writes to the end
 // regardless of fseek, update streams needing a positioning call between output and input,
-// exclusive "wx") and FreeBSD fopen(3) — the guest's libc — for the mode letters it adds ('e' close-on-
-// exec, 'b' ignored) and EINVAL for an invalid mode. Derived from those texts; no other suite's code
-// or vectors.
+// exclusive "wx"), and for everything the standard leaves open, the guest libc's own mode parser:
+// Dinkumware `_Foprep`, read from the disassembly of PPSA24651's shipped libc.prx (+0x562f0) and
+// named by the PS5 3.20 libSceLibcInternal exports. The grammar and its offsets are in
+// guest_fopen_mode.hpp. Derived from those; no other suite's code or vectors.
+//
+// Scope: a title that ships libc.prx (every local dump does) binds `fopen` to its own copy, so these
+// handlers serve only titles without one.
 //
 // What is prosper's here: `fopen` translates the guest path (/app0 → the title root) and the guest's
 // mode string, and every later operation is a registered handler too (`fread`, `fwrite`, `fseek`,
@@ -26,15 +30,6 @@
 #include <ios>
 #include <iterator>
 #include <string>
-#if defined(_WIN32)
-#include <io.h>
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#else
-#include <fcntl.h>
-#endif
 
 using namespace prosper;
 
@@ -218,7 +213,8 @@ TEST_F(FopenModes, ExclusiveCreate) {
     EXPECT_EQ(get("excl-new.bin"), "fresh");
 }
 
-// A mode that does not begin with 'r', 'w' or 'a' is EINVAL (fopen(3)) and opens nothing.
+// A mode that does not begin with 'r', 'w' or 'a' is EINVAL and opens nothing (`_Foprep` stores
+// EINVAL at libc.prx+0x5643a and returns NULL).
 TEST_F(FopenModes, InvalidLeadingCharacterIsEinval) {
     remove("invalid.bin");
     for (const char* mode : {"", "z", "+r", "br", "x", "W"}) {
@@ -231,7 +227,8 @@ TEST_F(FopenModes, InvalidLeadingCharacterIsEinval) {
 
 // --- the guest's mode grammar, which the host's is not (guest_fopen_mode.hpp) -------------------
 
-// A null mode is not a mode: EINVAL, not a host fopen dereferencing it.
+// A null mode is EINVAL. This is prosper's own lenient choice, not the guest's contract: `_Foprep`
+// reads mode[0] with no null check (libc.prx+0x563a5), so on hardware it would fault.
 TEST_F(FopenModes, NullModeIsEinval) {
     put("nullmode.bin", "x");
     const std::string path = guest("nullmode.bin");
@@ -240,7 +237,8 @@ TEST_F(FopenModes, NullModeIsEinval) {
     EXPECT_EQ(guest_errno(), EINVAL);
 }
 
-// FreeBSD has no text mode: "r" and "w" are byte-exact whether or not 'b' is given. A Windows host
+// The guest has no text mode: `_Foprep`'s 'b' sets a bit `_Fopen` never maps to an open flag, so
+// "r" and "w" are byte-exact whether or not 'b' is given. A Windows host
 // that opened them in text mode would collapse CR LF to LF on read, stop at 0x1A, and expand LF to
 // CR LF on write.
 TEST_F(FopenModes, NoTextModeTranslation) {
@@ -264,19 +262,65 @@ TEST_F(FopenModes, NoTextModeTranslation) {
     }
 }
 
-// 'x' only means something on a stream that may create. On a read-only stream the guest's libc
-// rejects it (fopen(3) documents 'x' only after 'w'; CONFIDENCE: MED, see the header) — even for a
-// file that exists, which a host that ignores the letter would simply open.
-TEST_F(FopenModes, ExclusiveOnAReadOnlyStreamIsEinval) {
+// 'x' on a read-only stream is NOT refused: `_Foprep` never rejects a mode for its 'x', and on 'r'
+// the guest's open carries O_EXCL without O_CREAT, which does not refuse an existing file. So "rx"
+// opens the existing file read-only, exactly like "r".
+TEST_F(FopenModes, ExclusiveOnAReadOnlyStreamOpensReadOnly) {
     put("rx.bin", "data");
     set_guest_errno(0);
-    EXPECT_EQ(open("rx.bin", "rx"), nullptr);
-    EXPECT_EQ(guest_errno(), EINVAL);
+    FILE* f = open("rx.bin", "rx");
+    ASSERT_NE(f, nullptr) << "the guest's libc opens \"rx\"";
+    EXPECT_EQ(read(f, 16), "data");
+    EXPECT_EQ(close(f), 0);
+    EXPECT_EQ(get("rx.bin"), "data");
 }
 
-// An unrecognised letter ENDS the guest's mode: what follows it is not read. So "wqx" is plain "w"
-// — it truncates an existing file instead of failing — where a host that skips unknown letters
-// would honour the 'x' and refuse.
+// Only the character that ENDS `_Foprep`'s loop can be 'x', and '+' and 'b' are each read once:
+//   "rx+"  — 'x' ends the mode before '+': read-only (a write fails), file untouched.
+//   "rbb+" — the second 'b' ends it: read-only.
+//   "wx+"  — 'x' ends it: write-only and exclusive (refuses an existing file; reading fails).
+//   "we+"  — 'e' is not a guest letter and ends it: plain write-only "w".
+//   "w++x" — the second '+' ends it, so the 'x' is never read: "w+", which truncates.
+TEST_F(FopenModes, OnlyTheTerminatingLetterCanBeExclusive) {
+    for (const char* mode : {"rx+", "rbb+"}) {
+        put("ro.bin", "data");
+        FILE* f = open("ro.bin", mode);
+        ASSERT_NE(f, nullptr) << mode;
+        EXPECT_EQ(write(f, "ZZ"), 0u) << mode << " is read-only in the guest";
+        EXPECT_EQ(close(f), 0);
+        EXPECT_EQ(get("ro.bin"), "data") << mode;
+    }
+
+    put("wxplus.bin", "keep");
+    set_guest_errno(0);
+    EXPECT_EQ(open("wxplus.bin", "wx+"), nullptr) << "\"wx+\" is exclusive";
+    EXPECT_EQ(guest_errno(), EEXIST);
+    EXPECT_EQ(get("wxplus.bin"), "keep");
+
+    for (const char* mode : {"wx+", "we+"}) {
+        remove("wo.bin");
+        FILE* f = open("wo.bin", mode);
+        ASSERT_NE(f, nullptr) << mode;
+        EXPECT_EQ(write(f, "abc"), 3u) << mode;
+        EXPECT_EQ(seek(f, 0, SEEK_SET), 0) << mode;
+        EXPECT_EQ(read(f, 16), "") << mode << " is write-only in the guest";
+        EXPECT_EQ(close(f), 0);
+        EXPECT_EQ(get("wo.bin"), "abc") << mode;
+    }
+
+    put("wpp.bin", "existing");
+    FILE* f = open("wpp.bin", "w++x");
+    ASSERT_NE(f, nullptr) << "the 'x' after a second '+' is not part of the mode";
+    EXPECT_EQ(write(f, "q"), 1u);
+    EXPECT_EQ(seek(f, 0, SEEK_SET), 0);
+    EXPECT_EQ(read(f, 16), "q") << "\"w++x\" is the update stream \"w+\"";
+    EXPECT_EQ(close(f), 0);
+    EXPECT_EQ(get("wpp.bin"), "q");
+}
+
+// An unrecognised letter ENDS the guest's mode: what follows it is not read (libc.prx+0x56462). So
+// "wqx" is plain "w" — it truncates an existing file instead of failing — where a host that skips
+// unknown letters would honour the 'x' and refuse.
 TEST_F(FopenModes, UnknownLetterEndsTheMode) {
     put("unknown.bin", "existing");
     FILE* f = open("unknown.bin", "wqx");
@@ -299,27 +343,6 @@ TEST_F(FopenModes, AppendExclusive) {
     EXPECT_EQ(get("ax.bin"), "keep");
 }
 
-// 'e' sets close-on-exec on the descriptor (fopen(3)); on Windows the equivalent is a
-// non-inheritable handle.
-TEST_F(FopenModes, CloseOnExecLetter) {
-    put("cloexec.bin", "x");
-    FILE* with = open("cloexec.bin", "re");
-    ASSERT_NE(with, nullptr);
-#if defined(_WIN32)
-    DWORD flags = 0;
-    const HANDLE h = (HANDLE)_get_osfhandle(_fileno(with));
-    ASSERT_TRUE(GetHandleInformation(h, &flags));
-    EXPECT_EQ(flags & HANDLE_FLAG_INHERIT, 0u) << "\"re\" must not be inherited";
-#else
-    EXPECT_NE(::fcntl(fileno(with), F_GETFD) & FD_CLOEXEC, 0) << "\"re\" sets FD_CLOEXEC";
-    FILE* without = open("cloexec.bin", "r");
-    ASSERT_NE(without, nullptr);
-    EXPECT_EQ(::fcntl(fileno(without), F_GETFD) & FD_CLOEXEC, 0) << "\"r\" leaves it clear";
-    EXPECT_EQ(close(without), 0);
-#endif
-    EXPECT_EQ(close(with), 0);
-}
-
 // The translation itself, for BOTH host dialects on every host — the Windows spelling is checked
 // here on Linux too, since only the Windows CI job would otherwise execute it.
 TEST(GuestFopenModeParse, SpellsEachHostDialect) {
@@ -333,11 +356,17 @@ TEST(GuestFopenModeParse, SpellsEachHostDialect) {
         {"a", "ab", "ab"},           {"r+", "r+b", "r+b"},       {"rb+", "r+b", "r+b"},
         {"r+b", "r+b", "r+b"},       {"w+", "w+b", "w+b"},       {"a+", "a+b", "a+b"},
         {"wx", "wbx", "wbx"},        {"w+x", "w+bx", "w+bx"},    {"wbx", "wbx", "wbx"},
-        {"re", "rbe", "rbN"},        {"w+xe", "w+bxe", "w+bxN"}, {"ae", "abe", "abN"},
+        {"w+bx", "w+bx", "w+bx"},    {"wb+x", "w+bx", "w+bx"},   {"a+x", "a+bx", nullptr},
+        {"ab+x", "a+bx", nullptr},   {"ax", "abx", nullptr},     {"r+x", "r+b", "r+b"},
+        {"rb+x", "r+b", "r+b"},      {"rx", "rb", "rb"},         {"rx+", "rb", "rb"},
+        {"rxb", "rb", "rb"},         {"wx+", "wbx", "wbx"},      {"rbb+", "rb", "rb"},
+        {"r++", "r+b", "r+b"},       {"r+b+", "r+b", "r+b"},     {"w++x", "w+b", "w+b"},
+        {"wbbx", "wb", "wb"},        {"r+bb", "r+b", "r+b"},     {"re", "rb", "rb"},
+        {"we+", "wb", "wb"},         {"w+xe", "w+bx", "w+bx"},   {"ae", "ab", "ab"},
         {"rt", "rb", "rb"},          {"rt+", "rb", "rb"},        {"wqx", "wb", "wb"},
-        {"r,ccs=UTF-8", "rb", "rb"}, {"r+x", "r+b", "r+b"},      {"ax", "abx", nullptr},
-        {"rx", nullptr, nullptr},    {"", nullptr, nullptr},     {"z", nullptr, nullptr},
+        {"r,ccs=UTF-8", "rb", "rb"}, {"", nullptr, nullptr},     {"z", nullptr, nullptr},
         {"+r", nullptr, nullptr},    {"b", nullptr, nullptr},    {"R", nullptr, nullptr},
+        {"x", nullptr, nullptr},     {"xw", nullptr, nullptr},
     };
     for (const Row& row : rows) {
         const GuestFopenMode p = parse_guest_fopen_mode(row.guest, FopenHostDialect::Posix);
@@ -353,6 +382,12 @@ TEST(GuestFopenModeParse, SpellsEachHostDialect) {
     EXPECT_TRUE(r.readable && !r.writable && !r.append);
     const GuestFopenMode a = parse_guest_fopen_mode("a+", FopenHostDialect::Posix);
     EXPECT_TRUE(a.readable && a.writable && a.append);
-    const GuestFopenMode w = parse_guest_fopen_mode("wbxe", FopenHostDialect::Posix);
-    EXPECT_TRUE(!w.readable && w.writable && w.exclusive && w.cloexec);
+    const GuestFopenMode w = parse_guest_fopen_mode("wbx", FopenHostDialect::Posix);
+    EXPECT_TRUE(!w.readable && w.writable && w.create && w.exclusive);
+    // "rx" carries the guest's exclusive flag (O_EXCL without O_CREAT) but no host 'x'.
+    const GuestFopenMode rx = parse_guest_fopen_mode("rx", FopenHostDialect::Posix);
+    EXPECT_TRUE(rx.readable && !rx.writable && !rx.create && rx.exclusive);
+    // A second '+' or 'b' ends the loop, so a later 'x' does not count.
+    EXPECT_FALSE(parse_guest_fopen_mode("w++x", FopenHostDialect::Posix).exclusive);
+    EXPECT_FALSE(parse_guest_fopen_mode("wbbx", FopenHostDialect::Posix).exclusive);
 }
