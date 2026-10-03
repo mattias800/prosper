@@ -13,6 +13,7 @@
 // appears only to build a fixture or to observe the bytes that reached the disk.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "hle/fs/guest_fopen_mode.hpp"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>
 
@@ -22,6 +23,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <iterator>
 #include <string>
 #if defined(_WIN32)
@@ -38,7 +40,9 @@ using namespace prosper;
 
 namespace {
 
-uint64_t ptr(const void* p) { return (uint64_t)(uintptr_t)p; }
+uint64_t ptr(const void* p) {
+    return (uint64_t)(uintptr_t)p;
+}
 
 uint64_t call(const char* name, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0, uint64_t d = 0) {
     HleFn fn = Hle::lookup(nid_hash(name));
@@ -103,7 +107,7 @@ protected:
     static inline std::string root_;
 };
 
-} // namespace
+}   // namespace
 
 // "r" opens an existing file at its start and fails on a missing one; "r+" never creates either.
 // The path is a GUEST path: it resolves only because the handler maps /app0 to the title root.
@@ -223,4 +227,132 @@ TEST_F(FopenModes, InvalidLeadingCharacterIsEinval) {
         EXPECT_EQ(guest_errno(), EINVAL) << "'" << mode << "'";
         EXPECT_FALSE(exists("invalid.bin")) << "'" << mode << "' must not create";
     }
+}
+
+// --- the guest's mode grammar, which the host's is not (guest_fopen_mode.hpp) -------------------
+
+// A null mode is not a mode: EINVAL, not a host fopen dereferencing it.
+TEST_F(FopenModes, NullModeIsEinval) {
+    put("nullmode.bin", "x");
+    const std::string path = guest("nullmode.bin");
+    set_guest_errno(0);
+    EXPECT_EQ(call("fopen", ptr(path.c_str()), 0), 0u);
+    EXPECT_EQ(guest_errno(), EINVAL);
+}
+
+// FreeBSD has no text mode: "r" and "w" are byte-exact whether or not 'b' is given. A Windows host
+// that opened them in text mode would collapse CR LF to LF on read, stop at 0x1A, and expand LF to
+// CR LF on write.
+TEST_F(FopenModes, NoTextModeTranslation) {
+    const std::string bytes("a\r\nb\x1a"
+                            "c\n\0d\r",
+                            9);
+    put("binary.bin", bytes);
+    for (const char* mode : {"r", "rb", "r+"}) {
+        FILE* f = open("binary.bin", mode);
+        ASSERT_NE(f, nullptr) << mode;
+        EXPECT_EQ(read(f, 64), bytes) << mode << " must read every byte unchanged";
+        EXPECT_EQ(close(f), 0);
+    }
+    for (const char* mode : {"w", "w+", "a"}) {
+        remove("written.bin");
+        FILE* f = open("written.bin", mode);
+        ASSERT_NE(f, nullptr) << mode;
+        EXPECT_EQ(write(f, bytes), bytes.size()) << mode;
+        EXPECT_EQ(close(f), 0);
+        EXPECT_EQ(get("written.bin"), bytes) << mode << " must write every byte unchanged";
+    }
+}
+
+// 'x' only means something on a stream that may create. On a read-only stream the guest's libc
+// rejects it (fopen(3) documents 'x' only after 'w'; CONFIDENCE: MED, see the header) — even for a
+// file that exists, which a host that ignores the letter would simply open.
+TEST_F(FopenModes, ExclusiveOnAReadOnlyStreamIsEinval) {
+    put("rx.bin", "data");
+    set_guest_errno(0);
+    EXPECT_EQ(open("rx.bin", "rx"), nullptr);
+    EXPECT_EQ(guest_errno(), EINVAL);
+}
+
+// An unrecognised letter ENDS the guest's mode: what follows it is not read. So "wqx" is plain "w"
+// — it truncates an existing file instead of failing — where a host that skips unknown letters
+// would honour the 'x' and refuse.
+TEST_F(FopenModes, UnknownLetterEndsTheMode) {
+    put("unknown.bin", "existing");
+    FILE* f = open("unknown.bin", "wqx");
+    ASSERT_NE(f, nullptr) << "the 'x' after an unknown letter is not part of the mode";
+    EXPECT_EQ(close(f), 0);
+    EXPECT_EQ(get("unknown.bin"), "") << "opened as plain \"w\", which truncates";
+}
+
+// "ax" fails on an existing file where the host can spell it; on Windows, whose CRT cannot, it is
+// refused with EINVAL rather than opened without the exclusivity the guest asked for.
+TEST_F(FopenModes, AppendExclusive) {
+    put("ax.bin", "keep");
+    set_guest_errno(0);
+    EXPECT_EQ(open("ax.bin", "ax"), nullptr);
+#if defined(_WIN32)
+    EXPECT_EQ(guest_errno(), EINVAL);
+#else
+    EXPECT_EQ(guest_errno(), EEXIST);
+#endif
+    EXPECT_EQ(get("ax.bin"), "keep");
+}
+
+// 'e' sets close-on-exec on the descriptor (fopen(3)); on Windows the equivalent is a
+// non-inheritable handle.
+TEST_F(FopenModes, CloseOnExecLetter) {
+    put("cloexec.bin", "x");
+    FILE* with = open("cloexec.bin", "re");
+    ASSERT_NE(with, nullptr);
+#if defined(_WIN32)
+    DWORD flags = 0;
+    const HANDLE h = (HANDLE)_get_osfhandle(_fileno(with));
+    ASSERT_TRUE(GetHandleInformation(h, &flags));
+    EXPECT_EQ(flags & HANDLE_FLAG_INHERIT, 0u) << "\"re\" must not be inherited";
+#else
+    EXPECT_NE(::fcntl(fileno(with), F_GETFD) & FD_CLOEXEC, 0) << "\"re\" sets FD_CLOEXEC";
+    FILE* without = open("cloexec.bin", "r");
+    ASSERT_NE(without, nullptr);
+    EXPECT_EQ(::fcntl(fileno(without), F_GETFD) & FD_CLOEXEC, 0) << "\"r\" leaves it clear";
+    EXPECT_EQ(close(without), 0);
+#endif
+    EXPECT_EQ(close(with), 0);
+}
+
+// The translation itself, for BOTH host dialects on every host — the Windows spelling is checked
+// here on Linux too, since only the Windows CI job would otherwise execute it.
+TEST(GuestFopenModeParse, SpellsEachHostDialect) {
+    struct Row {
+        const char* guest;
+        const char* posix;   // nullptr: EINVAL
+        const char* microsoft;
+    };
+    const Row rows[] = {
+        {"r", "rb", "rb"},           {"rb", "rb", "rb"},         {"w", "wb", "wb"},
+        {"a", "ab", "ab"},           {"r+", "r+b", "r+b"},       {"rb+", "r+b", "r+b"},
+        {"r+b", "r+b", "r+b"},       {"w+", "w+b", "w+b"},       {"a+", "a+b", "a+b"},
+        {"wx", "wbx", "wbx"},        {"w+x", "w+bx", "w+bx"},    {"wbx", "wbx", "wbx"},
+        {"re", "rbe", "rbN"},        {"w+xe", "w+bxe", "w+bxN"}, {"ae", "abe", "abN"},
+        {"rt", "rb", "rb"},          {"rt+", "rb", "rb"},        {"wqx", "wb", "wb"},
+        {"r,ccs=UTF-8", "rb", "rb"}, {"r+x", "r+b", "r+b"},      {"ax", "abx", nullptr},
+        {"rx", nullptr, nullptr},    {"", nullptr, nullptr},     {"z", nullptr, nullptr},
+        {"+r", nullptr, nullptr},    {"b", nullptr, nullptr},    {"R", nullptr, nullptr},
+    };
+    for (const Row& row : rows) {
+        const GuestFopenMode p = parse_guest_fopen_mode(row.guest, FopenHostDialect::Posix);
+        const GuestFopenMode m = parse_guest_fopen_mode(row.guest, FopenHostDialect::MicrosoftCrt);
+        EXPECT_EQ(p.valid, row.posix != nullptr) << "'" << row.guest << "'";
+        EXPECT_EQ(m.valid, row.microsoft != nullptr) << "'" << row.guest << "'";
+        if (row.posix) EXPECT_STREQ(p.host, row.posix) << "'" << row.guest << "'";
+        if (row.microsoft) EXPECT_STREQ(m.host, row.microsoft) << "'" << row.guest << "'";
+    }
+    EXPECT_FALSE(parse_guest_fopen_mode(nullptr, FopenHostDialect::Posix).valid);
+
+    const GuestFopenMode r = parse_guest_fopen_mode("r", FopenHostDialect::Posix);
+    EXPECT_TRUE(r.readable && !r.writable && !r.append);
+    const GuestFopenMode a = parse_guest_fopen_mode("a+", FopenHostDialect::Posix);
+    EXPECT_TRUE(a.readable && a.writable && a.append);
+    const GuestFopenMode w = parse_guest_fopen_mode("wbxe", FopenHostDialect::Posix);
+    EXPECT_TRUE(!w.readable && w.writable && w.exclusive && w.cloexec);
 }

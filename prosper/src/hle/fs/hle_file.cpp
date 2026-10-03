@@ -8,6 +8,7 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/fs/save_paths.hpp"
 #include "hle/fs/guest_sync.hpp"
+#include "hle/fs/guest_fopen_mode.hpp"
 #include "hle/service/hle_addcontent.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "host/memory/guest_write_watch.hpp"
@@ -1103,12 +1104,25 @@ void to_sce_stat64(const struct _stat64& s, uint8_t* out) {
 #endif
 
 // --- stdio FILE* ---
-HLE(f_fopen)   { std::string h = translate(CS(a0)); const char* mode = CS(a1);
-                  FILE* f = fopen(h.c_str(), mode);
-                  guest_sync_note_stream(f, mode && std::strpbrk(mode, "wa+"));
-                  if (filelog()) fprintf(stderr, "[file] fopen host='%s' mode='%s' -> %p error=%d\n",
-                                         h.c_str(), mode ? mode : "(null)", (void*)f, f ? 0 : errno);
-                  return (uint64_t)(uintptr_t)f; }
+// The guest's mode string is FreeBSD's grammar, not the host's: parse it once and hand the host a
+// spelling it accepts (guest_fopen_mode.hpp — on Windows a verbatim "r" opened in TEXT mode).
+HLE(f_fopen) {
+    const char* mode = CS(a1);
+    const GuestFopenMode m = parse_guest_fopen_mode(mode, kHostFopenDialect);
+    if (!m.valid) {
+        if (filelog())
+            fprintf(stderr, "[file] fopen mode='%s' -> EINVAL\n", mode ? mode : "(null)");
+        errno = EINVAL;
+        return 0;
+    }
+    std::string h = translate(CS(a0));
+    FILE* f = fopen(h.c_str(), m.host);
+    guest_sync_note_stream(f, m.writable);
+    if (filelog())
+        fprintf(stderr, "[file] fopen host='%s' mode='%s' (host '%s') -> %p error=%d\n", h.c_str(),
+                mode, m.host, (void*)f, f ? 0 : errno);
+    return (uint64_t)(uintptr_t)f;
+}
 HLE(f_fclose)  { return a0 ? (uint64_t)(int64_t)guest_sync_close_stream((FILE*)P(a0)) : 0; }
 HLE(f_fread)   { if (!a3) return 0;
                   FILE* f = (FILE*)P(a3); size_t n = fread(P(a0), a1, a2, f);
