@@ -9,6 +9,7 @@
 // are covered: NEAREST remains a single comparison, while LINEAR compare-before-filter PCF produces
 // a fractional 0.5 result at the boundary between passing and failing texels (#1394).
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include "fixtures/render_runner.h"
 #include <cstdio>
@@ -19,8 +20,7 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static bool has_spirv_opcode(const std::vector<uint32_t>& words, uint16_t opcode) {
     for (size_t i = 5; i < words.size();) {
@@ -32,7 +32,7 @@ static bool has_spirv_opcode(const std::vector<uint32_t>& words, uint16_t opcode
     return false;
 }
 
-int main() {
+TEST(ShadowCompareRender, Contract) {
     printf("== test_shadow_compare_render ==\n");
     const uint32_t W = 128, H = 128;
 
@@ -64,7 +64,7 @@ int main() {
     CHECK(!vert.empty() && vert[0] == 0x07230203u, "recompiled VS -> SPIR-V");
     CHECK(!frag.empty() && frag[0] == 0x07230203u,
           "recompiled PS with image_sample_c_lz dim:2D -> SPIR-V (rejects without the #1271 lowering)");
-    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); return 1; }
+    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // 8x8 "shadow map" sampled as a color texture: left half R=0 (depth 0.0), right half R=230
     // (depth ~0.9). dref 0.5 with GREATER -> left passes (1.0 -> R=255), right fails (0.0 -> R=0).
@@ -82,7 +82,7 @@ int main() {
     std::vector<uint8_t> px = prosper::test::render_triangle_rgba(
         vert, frag, W, H, nullptr, nullptr, nullptr, nullptr, &nearest_resources);
     CHECK(px.size() == (size_t)W * H * 4, "shadow-compare pipeline rendered a frame");
-    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: render failed ==\n"); return 1; }
+    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: render failed ==\n"); FAIL() << "legacy early exit"; }
 
     // Left half must be lit (compare passed -> R=255), right half shadow-failed (R=0). Sample
     // interior points away from the half boundary and the viewport edges.
@@ -962,7 +962,5 @@ int main() {
               "layer stride registry does not leak across bases");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

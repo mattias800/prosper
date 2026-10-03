@@ -9,10 +9,13 @@
 // == that × 4, so any drift fails here. Rewind has no builder (reserve-only); its GetSize is asserted
 // against the documented 2-dword contract that a future REWIND builder must honor.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
+#include <cstdarg>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 using namespace prosper;
 
@@ -23,8 +26,16 @@ struct Dcb {
 };
 
 static int fails = 0;
-#define CHECK(cond, ...) do { if (!(cond)) { std::printf("  [FAIL] "); std::printf(__VA_ARGS__); std::printf("\n"); ++fails; } \
-                              else { std::printf("  [ok]   "); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
+// GoogleTest streams the message; keep the original printf-style formats readable.
+static std::string check_message(const char* format, ...) {
+    char buffer[512];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(buffer, sizeof buffer, format, args);
+    va_end(args);
+    return buffer;
+}
+#define CHECK(cond, ...) EXPECT_TRUE(cond) << check_message(__VA_ARGS__)
 
 static uint32_t g_buf[256];
 static Dcb fresh() {
@@ -47,7 +58,7 @@ static uint64_t emitted(HleFn builder, uint64_t a1, uint64_t a2, uint64_t a3, ui
     return (uint64_t)(d.cursor_up - g_buf);
 }
 
-int main() {
+TEST(AgcGetsize, Contract) {
     std::printf("== test_agc_getsize (#1143 builder/GetSize drift guard) ==\n");
     register_builtin_hle();
 
@@ -138,6 +149,5 @@ int main() {
                   "RewindGetSize == 2 dwords * 4 (reserve-only; a future builder must emit <= 2 dw)");
     }
 
-    std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

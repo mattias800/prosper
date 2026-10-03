@@ -2,6 +2,7 @@
 // GC_get_stack_base rely on (and that the k_pthread_create trampoline populates). A regression
 // here reintroduces "Bad stack base in GC_register_my_thread" during the boot.
 #include "host/image/exec_image.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
@@ -18,9 +19,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else        { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 namespace {
 struct LateGuestEntryProbe {
@@ -65,7 +64,7 @@ void late_guest_init(uint64_t, uint64_t) {
 }
 }
 
-int main() {
+TEST(StackRegistry, Contract) {
     printf("== test_stack_registry ==\n");
 
     register_thread_stack(0x1111, (void*)0x40000000ull, 0x8000);
@@ -220,7 +219,4 @@ int main() {
           "distinct init and frontend threads each reach the primary HWBP boundary before guest code");
     g_late_guest_entry_probe = nullptr;
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

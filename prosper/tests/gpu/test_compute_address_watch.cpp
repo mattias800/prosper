@@ -10,6 +10,7 @@
 // an empty range, and arithmetic near the top of the address space, where a subtraction in the wrong
 // order wraps and reports a match for an address nowhere near the allocation.
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 
 #include <cstdint>
@@ -19,8 +20,7 @@
 using prosper::gpu::compute_address_range_contains;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // The windowed form exists because the address form asked a different question from the change
 // detection that consumed it. These arms pin the difference.
@@ -89,7 +89,7 @@ static void test_window_hits() {
           "and does not wrap with the arguments the other way round");
 }
 
-int main() {
+TEST(ComputeAddressWatch, Contract) {
     test_window_hits();
     printf("== test_compute_address_watch ==\n");
     constexpr uint64_t kBase = 0x20f848417cull;
@@ -201,6 +201,5 @@ int main() {
               "and an address in neither matches nothing");
     }
 
-    printf(fails ? "== FAILURES: %d ==\n" : "== all passed (%d failures) ==\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

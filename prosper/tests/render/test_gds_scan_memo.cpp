@@ -11,16 +11,13 @@
 // ever exercising it.
 
 #include "fixtures/render_runner.h"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 
-static int failures = 0;
-static void check(bool ok, const char* what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++failures; }
-    else std::fprintf(stderr, "ok: %s\n", what);
-}
+static void check(bool ok, const char* what) { EXPECT_TRUE(ok) << what; }
 
 // A minimal module the scanner can parse: 5-word header, then OpDecorate pairs.
 // The scanner reports true when some id carries DescriptorSet==1 AND Binding==0.
@@ -34,7 +31,7 @@ static std::vector<uint32_t> make_module(uint32_t descriptor_set) {
     };
 }
 
-int main() {
+TEST(GdsScanMemo, Contract) {
     const bool memo_disabled = getenv("PROSPER_NO_GDS_SCAN_MEMO") != nullptr;
     const std::vector<uint32_t> gds = make_module(1);      // set=1, binding=0 -> internal GDS
     const std::vector<uint32_t> plain = make_module(2);    // set=2            -> not internal GDS
@@ -72,7 +69,4 @@ int main() {
     check(!prosper::test::fragment_uses_internal_gds_memoized(0, plain), "identity 0 + plain -> false");
     check(prosper::test::fragment_uses_internal_gds_memoized(0, gds), "identity 0 + gds again -> true");
 
-    std::fprintf(stderr, "%s (%s)\n", failures ? "FAILURES" : "all arms passed",
-                 memo_disabled ? "memo disabled" : "memo enabled");
-    return failures ? 1 : 0;
 }

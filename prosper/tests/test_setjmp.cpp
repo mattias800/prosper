@@ -6,16 +6,16 @@
 // exactly like C setjmp/longjmp. This test verifies the return-twice semantics, the value
 // propagation, that longjmp never returns 0, and that callee-saved registers survive the jump.
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <cstdint>
 
 extern "C" uint64_t prosper_setjmp(void*);
 extern "C" void     prosper_longjmp(void*, uint64_t);
 
 static int failures = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); failures++; } \
-                              else        { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
-int main() {
+TEST(Setjmp, Contract) {
     printf("== test_setjmp ==\n");
 
     // 1) Basic return-twice: setjmp returns 0 first, then the longjmp value.
@@ -60,7 +60,6 @@ int main() {
         }
     }
 
-    if (failures) { printf("== FAIL: %d check(s) failed ==\n", failures); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    if (failures) { printf("== FAIL: %d check(s) failed ==\n", failures); FAIL() << "legacy early exit"; }
+    EXPECT_EQ(failures, 0);
 }

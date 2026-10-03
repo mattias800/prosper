@@ -1,3 +1,4 @@
+#include <gtest/gtest.h>
 #include "gpu/execute/gpu_execute.hpp"
 #include "hle/memory/renderer_tracked_mapping.hpp"
 #include "hle/dispatch/dispatch.hpp"
@@ -26,7 +27,6 @@ using namespace prosper;
 
 namespace {
 struct TestState {
-    int failures = 0;
     ProsperRendererTrackedMappingResult fake_tracked_result =
         ProsperRendererTrackedMappingResult::Untracked;
     int fake_reserved_result = 0;
@@ -54,12 +54,7 @@ bool tracked(uint64_t address) {
         ProsperRendererTrackedMappingResult::Untracked;
 }
 
-void check(bool condition, const char* message) {
-    if (!condition) {
-        std::printf("FAIL: %s\n", message);
-        ++state().failures;
-    }
-}
+void check(bool condition, const char* message) { EXPECT_TRUE(condition) << message; }
 
 std::byte* map_untracked_page(size_t size) {
 #ifdef _WIN32
@@ -82,15 +77,15 @@ void unmap_untracked_page(std::byte* page, size_t size) {
 }
 }
 
-int main() {
+TEST(RendererTrackedMappingCache, Contract) {
     register_builtin_hle();
     const auto reserve = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
     const auto flexible = Hle::lookup(nid_hash("sceKernelMapNamedFlexibleMemory"));
     const auto protect = Hle::lookup(nid_hash("sceKernelMprotect"));
     const auto unmap = Hle::lookup(nid_hash("sceKernelMunmap"));
     if (!reserve || !flexible || !protect || !unmap) {
-        std::puts("FAIL: memory HLE entry points are registered");
-        return 1;
+        ADD_FAILURE() << "memory HLE entry points are registered";
+        return;
     }
 
     constexpr uint64_t page = 0x4000;
@@ -356,10 +351,4 @@ int main() {
               "remove committed-source/empty-tail pair");
     }
 
-    if (test.failures) {
-        std::printf("FAIL: %d check(s)\n", test.failures);
-        return 1;
-    }
-    std::puts("PASS");
-    return 0;
 }
