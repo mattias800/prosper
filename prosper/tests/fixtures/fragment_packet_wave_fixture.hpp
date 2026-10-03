@@ -101,4 +101,16 @@ inline std::vector<FragmentPacketWavePlacement> placements(const FragmentPacketK
              11 + wave * (kernel.layout.output_words + kPacketWaveOutputPrefix + 17)});
     return places;
 }
+inline std::vector<FragmentPacketWavePlacement>
+padding_placements(const FragmentPacketKernel& kernel) {
+    auto places = placements(kernel, 3);
+    const auto span = kernel.layout.output_words + kPacketWaveOutputPrefix;
+    places[0].output_base = 11;
+    places[1].output_base = 11 + 2 * span + 17;
+    places[2].output_base = 11 + 3 * span + 34;
+    // One complete disjoint unowned output span [11+span,11+2*span), allocated by the normal
+    // packer. A routing-only fault may write here safely if the ownership guard is omitted;
+    // unlike an alias fault, that discriminator has no inter-workgroup overlapping writes.
+    return places;
+}
 }   // namespace prosper::test::fragment_packet_wave

@@ -45,8 +45,7 @@ std::vector<uint32_t> execute(const FragmentPacketWaveBatch& batch,
     // Sequential independent Workgroup storage scopes; NOT a model of GPU inter-workgroup order.
     for (uint32_t wave : {2u, 0u, 1u}) {
         if (only_wave != UINT32_MAX && only_wave != wave) continue;
-        bpermute_oracle::Interpreter vm;
-        vm.parse(batch.kernel->program.packet.spirv);
+        bpermute_oracle::Interpreter vm(batch.kernel->program.packet.spirv);
         for (uint32_t slot = 0; slot < batch.images.size(); ++slot)
             for (const auto& mip : batch.images[slot].mips)
                 vm.sampled_images[16 + slot].push_back({mip.width, mip.height, mip.texels});
@@ -244,6 +243,39 @@ TEST(FragmentPacketWaveData, MissingTruncatedOrMismatchedAuthorityNeverGrantsOwn
     EXPECT_EQ(decode_fragment_packet_waves(changed, good, true, waves[0].device.device_identity)
                   .rejection,
               "packet-wave-ownership-unproved");
+}
+TEST(FragmentPacketWaveData, UnownedInBoundsPaddingIsNotOutputAuthority) {
+    const auto code = kernel();
+    const auto waves = inputs();
+    auto batch = pack_fragment_packet_waves(code, waves, fixture::padding_placements(*code));
+    ASSERT_TRUE(batch.rejection.empty()) << batch.rejection;
+    const auto positive =
+        decode_fragment_packet_waves(batch, execute(batch), true, waves[0].device.device_identity);
+    ASSERT_EQ(positive.exports.size(), 3u) << positive.rejection;
+    for (uint32_t wave = 0; wave < 3; ++wave)
+        EXPECT_EQ(positive.exports[wave], fixture::expected(wave));
+    const auto span = code->layout.output_words + kPacketWaveOutputPrefix;
+    const auto padding = 11 + span;
+    ASSERT_LE(padding + span, batch.placements[1].output_base);
+    batch.input_words[9] = padding;   // mutable wave2 route; private authority/extents unchanged
+    EXPECT_EQ(execute(batch, nullptr, true, 2), batch.output_words)
+        << "isolated refused WG leaves the complete output, including safe padding, untouched";
+    const auto raw = execute(batch);
+    ASSERT_EQ(raw.size(), batch.output_words.size());
+    for (uint32_t base : {padding, batch.placements[2].output_base})
+        EXPECT_TRUE(std::equal(raw.begin() + base, raw.begin() + base + span,
+                               batch.output_words.begin() + base));
+    const auto refused =
+        decode_fragment_packet_waves(batch, raw, true, waves[0].device.device_identity);
+    EXPECT_TRUE(refused.exports.empty());
+    EXPECT_EQ(refused.wave, 2u);
+    EXPECT_EQ(refused.rejection, "packet-wave-metadata-or-completion-invalid");
+    for (uint32_t wave = 0; wave < 2; ++wave) {
+        const auto expected = fixture::expected(wave);
+        EXPECT_TRUE(
+            std::equal(expected.begin(), expected.end(),
+                       raw.begin() + batch.placements[wave].output_base + kPacketWaveOutputPrefix));
+    }
 }
 TEST(FragmentPacketWaveData, EveryWaveKnownnessProfileAndOriginalIdentity) {
     const auto code = kernel();

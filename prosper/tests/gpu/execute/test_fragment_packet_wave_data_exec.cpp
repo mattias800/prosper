@@ -42,7 +42,10 @@ Execution execute(uint32_t fault = 0, bool image = false) {
         if (fault == 1)
             for (auto& column : waves[2].invocation.vgprs)
                 if (column.reg == 8) column.available_mask &= ~(uint64_t{1} << 40);
-        result.batch = pack_fragment_packet_waves(kernel, waves, fixture::placements(*kernel, 3));
+        result.batch = pack_fragment_packet_waves(kernel, waves,
+                                                  fault == 7 || fault == 8
+                                                      ? fixture::padding_placements(*kernel)
+                                                      : fixture::placements(*kernel, 3));
         if (!result.batch.rejection.empty()) return false;
         if (fault == 2) result.batch.input_words[8] = result.batch.placements[0].input_base;
         if (fault == 4)
@@ -50,6 +53,9 @@ Execution execute(uint32_t fault = 0, bool image = false) {
                                      kernel->layout.scalar_available_offsets.back()] = 0;
         if (fault == 6)
             result.batch.input_words[5 + 2 * 2] = result.batch.placements[0].output_base;
+        if (fault == 7)
+            result.batch.input_words[9] =
+                11 + kernel->layout.output_words + kPacketWaveOutputPrefix;
         plan.spirv = kernel->program.packet.spirv;
         plan.input.resize(result.batch.input_words.size());
         std::memcpy(plan.input.data(), result.batch.input_words.data(), plan.input.size() * 4);
@@ -144,6 +150,42 @@ TEST(FragmentPacketWaveExecution, MissingScalarPresenceNeverLeavesBarrierPartici
     EXPECT_EQ(actual.result.rejection, "packet-wave-metadata-or-completion-invalid");
     EXPECT_EQ(actual.result.wave, 2u);
     EXPECT_TRUE(actual.result.exports.empty());
+}
+TEST(FragmentPacketWaveExecution, UnownedInBoundsPaddingNeverReceivesGuestWrites) {
+    // This is the ONLY malformed-output routing control safe under removal of the output-base
+    // equality check. Never run the overlapping alias control under that production fault.
+    const auto positive = execute(8);
+    if (positive.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
+    ASSERT_TRUE(positive.result.rejection.empty()) << positive.result.rejection;
+    ASSERT_EQ(positive.result.exports.size(), 3u);
+    for (uint32_t wave = 0; wave < 3; ++wave)
+        EXPECT_EQ(positive.result.exports[wave], fixture::expected(wave));
+    const auto actual = execute(7);
+    ASSERT_FALSE(actual.unsupported);
+    ASSERT_TRUE(actual.batch.rejection.empty()) << actual.batch.rejection;
+    ASSERT_EQ(actual.batch.placements.size(), 3u);
+    ASSERT_NE(actual.batch.kernel, nullptr);
+    EXPECT_EQ(actual.batch.kernel->program.packet.spirv,
+              positive.batch.kernel->program.packet.spirv)
+        << "same actual SOURCE, routing-only fault";
+    EXPECT_EQ(actual.result.rejection, "packet-wave-metadata-or-completion-invalid");
+    EXPECT_EQ(actual.result.wave, 2u);
+    EXPECT_TRUE(actual.result.exports.empty());
+    ASSERT_EQ(actual.raw.size(), actual.batch.output_words.size());
+    const auto span = actual.batch.kernel->layout.output_words + kPacketWaveOutputPrefix;
+    const auto padding = 11 + span;
+    ASSERT_LE(padding + span, actual.batch.placements[1].output_base);
+    for (uint32_t base : {padding, actual.batch.placements[2].output_base})
+        EXPECT_TRUE(std::equal(actual.raw.begin() + base, actual.raw.begin() + base + span,
+                               actual.batch.output_words.begin() + base))
+            << "neither disjoint padding nor real refused-wave output may be touched";
+    for (uint32_t wave = 0; wave < 2; ++wave) {
+        const auto expected = fixture::expected(wave);
+        EXPECT_TRUE(std::equal(expected.begin(), expected.end(),
+                               actual.raw.begin() + actual.batch.placements[wave].output_base +
+                                   kPacketWaveOutputPrefix))
+            << "good independent workgroup raw sinks";
+    }
 }
 TEST(FragmentPacketWaveExecution, SharedImagesDistinctBufferWords) {
     const auto actual = execute(0, true);

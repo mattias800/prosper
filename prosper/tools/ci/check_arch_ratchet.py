@@ -782,11 +782,19 @@ def _nul_split(raw: bytes) -> list[str]:
 def resolve_merge_base(root: Path, ref: str) -> str:
     """The merge base of HEAD and `ref`, or EvaluationError (exit 2) when there is none."""
     try:
-        sha = _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+        # Verify one object before walking: a range otherwise selects its newest commit and can
+        # hide committed changes. Do not append the MSYS-mangled `^{commit}` spelling.
+        oid = _git(root, "rev-parse", "--verify", "--end-of-options", ref).decode().strip()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+            raise EvaluationError("base does not resolve to exactly one object")
+        sha = _git(root, "rev-list", "-n", "1", oid, "--").decode().strip()
+        # rev-list succeeds with empty output for trees/blobs; only a commit can be a base.
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+            raise EvaluationError("base does not resolve to a commit")
     except EvaluationError as exc:
         raise EvaluationError(f"--base {ref!r} is not a commit in {root} (fetch it?)") from exc
     try:
-        return _git(root, "merge-base", "HEAD", sha.decode().strip()).decode().strip()
+        return _git(root, "merge-base", "HEAD", sha).decode().strip()
     except EvaluationError as exc:
         raise EvaluationError(f"HEAD and --base {ref!r} share no merge base") from exc
 

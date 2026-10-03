@@ -145,6 +145,31 @@ class Verdicts(unittest.TestCase):
         self.assertIn("origin/main", message)
         self.assertIsNone(self.checker_argv())
 
+    def test_base_probe_requires_one_commit_and_preserves_tags(self):
+        self.install_checker(0)
+        self.git("tag", "-a", "-m", "release", "release", "HEAD")
+        for ref in ("HEAD", hook.BASE_REF, "release"):
+            with self.subTest(ref=ref):
+                self.assertTrue(hook.has_base(self.tmp, ref))
+        subtree = subprocess.check_output(
+            ["git", "rev-parse", "HEAD:prosper"], cwd=self.tmp, text=True
+        ).strip()
+        tree = subprocess.check_output(
+            ["git", "show", "-s", "--format=%T", "HEAD"], cwd=self.tmp, text=True
+        ).strip()
+        for ref in (
+            tree,
+            subtree,
+            "HEAD:prosper",
+            "HEAD~1..HEAD",
+            "HEAD~1...HEAD",
+            "^HEAD",
+            "missing",
+            "--all",
+        ):
+            with self.subTest(ref=ref):
+                self.assertFalse(hook.has_base(self.tmp, ref))
+
     def test_violation_warns_but_does_not_block(self):
         self.assertFalse(hook.BLOCK_ON_VIOLATION, "the rollout is warn-only")
         self.install_checker(1, "INCREASE file-size|x 10 -> 11\n")
@@ -217,7 +242,7 @@ class Verdicts(unittest.TestCase):
         git("commit", "-q", "-m", "foreign checker")
         git("update-ref", "refs/remotes/origin/main", "HEAD")
         self.install_checker(0)
-        status, out, _ = self.run_hook(f"git -C {other} push")
+        status, out, _ = self.run_hook(f"git -C {Path(other).as_posix()} push")
         self.assertEqual(0, status)
         self.assertIn("not this project's repository", json.loads(out)["systemMessage"])
         self.assertFalse(marker.exists(), "a foreign repository's checker was executed")
