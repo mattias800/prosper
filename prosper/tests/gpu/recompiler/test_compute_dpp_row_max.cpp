@@ -185,8 +185,8 @@ TEST_P(ComputeDppRowMaxCfgSpill, RejectsScalarSpillBeforePublishingRowSource) {
 
 INSTANTIATE_TEST_SUITE_P(Profiles, ComputeDppRowMaxCfgSpill,
     testing::Combine(testing::Bool(), testing::Bool(), testing::Bool()),
-    [](const testing::TestParamInfo<ComputeDppRowMaxCfgSpill::ParamType>& test) {
+    ([](const testing::TestParamInfo<ComputeDppRowMaxCfgSpill::ParamType>& test) {
         const auto [mask, restored, native] = test.param;
         return std::string(mask ? "Mask" : "Numeric") + (restored ? "Restored" : "Adjacent") +
                (native ? "Native64" : "Portable");
-    });
+    }));
