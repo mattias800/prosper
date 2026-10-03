@@ -88,7 +88,7 @@ protected:
         const uint64_t child = guest_ + 0x1000u;
         std::memcpy(reinterpret_cast<void*>(guest_ + 4u), &child, sizeof(child));
         *child_word() =
-            0x3e800000u; // 0.25, copied into an immutable snapshot before each callback
+            0x3e800000u;   // 0.25, copied into an immutable snapshot before each callback
         set_graphics_producer_status_query(
             [&] { return GraphicsProducerStatus{true, pending_, 0}; });
         set_graphics_raw_source_authority(
@@ -222,7 +222,7 @@ TEST_F(OrderedRenderFinality, TrailingRefusedDrawUsesOneEmptyTerminalCallback) {
     auto missing_parent = std::make_shared<GpuState>(state);
     missing_parent->sh[P::SPI_SHADER_USER_DATA_PS_0] = 0;
     missing_parent->sh[P::SPI_SHADER_USER_DATA_PS_0 + 1u] = 0;
-    refused.state = missing_parent; // actual backing refusal, with a nonzero draw count
+    refused.state = missing_parent;   // actual backing refusal, with a nonzero draw count
     state.draws.push_back(refused);
     execute(state);
     ASSERT_EQ(observations_.size(), 3u);
@@ -237,7 +237,7 @@ TEST_F(OrderedRenderFinality, TrailingNoopDispatchDoesNotInventAnotherSpan) {
     auto state = two_draws();
     GpuState::Dispatch noop;
     noop.command_order = 300;
-    state.dispatches.push_back(noop); // zero group extent is a proven no-op
+    state.dispatches.push_back(noop);   // zero group extent is a proven no-op
     execute(state);
     ASSERT_EQ(observations_.size(), 2u);
     EXPECT_EQ(observations_.back().draws, std::vector<uint32_t>{1});
@@ -301,4 +301,4 @@ TEST_F(OrderedRenderFinality, NoSuccessfulDrawDoesNotPublishAnEmptyFinalCallback
     EXPECT_TRUE(observations_.empty());
     EXPECT_FALSE(present_has_frame());
 }
-} // namespace
+}   // namespace
