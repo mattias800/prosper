@@ -6,11 +6,11 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <atomic>
 #include <set>
-#include <tuple>
 #include <utility>
 
 namespace prosper::gpu {
@@ -21,10 +21,11 @@ struct DumpState {
     std::string root;            // empty: derive from PROSPER_CAPTURE_DIR on first use
     std::string directory;       // created lazily on the first refusal
     std::set<std::pair<std::string, uint64_t>> seen;   // (stage, code hash)
-    bool cap_announced = false;
     bool dir_failure_announced = false;
-    std::set<std::tuple<std::string, uint64_t, uint32_t>> quick;   // (stage, addr, first word)
     std::atomic<bool> full{false};
+    std::atomic<uint64_t> epoch{8};
+    std::atomic<uint64_t> hash_evaluations{0};
+    std::atomic<uint64_t> hashed_dwords{0};
 };
 
 DumpState& state() {
@@ -33,12 +34,22 @@ DumpState& state() {
 }
 
 uint64_t hash_code(const uint32_t* code, size_t dwords) {
+    state().hash_evaluations.fetch_add(1, std::memory_order_relaxed);
+    state().hashed_dwords.fetch_add(dwords, std::memory_order_relaxed);
     uint64_t h = 0xcbf29ce484222325ull;   // FNV-1a over the words
     for (size_t i = 0; i < dwords; ++i) {
         h ^= code[i];
         h *= 0x100000001b3ull;
     }
     return h;
+}
+
+uint64_t stage_bit(const char* stage) {
+    return !stage                      ? 0u
+           : !std::strcmp(stage, "vs") ? 1u
+           : !std::strcmp(stage, "ps") ? 2u
+           : !std::strcmp(stage, "cs") ? 4u
+                                       : 0u;
 }
 
 std::string make_directory(DumpState& s) {
@@ -79,26 +90,21 @@ std::string make_directory(DumpState& s) {
 
 bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* code, size_t dwords,
                          const std::string& detail) {
-    if (PROSPER_ENV_ON("PROSPER_NO_REFUSED_SHADER_DUMP")) return false;
+    if (refused_shader_dump_full()) return false;
     if (!stage || !code || !dwords) return false;
     const uint64_t hash = hash_code(code, dwords);
     DumpState& s = state();
     std::lock_guard lock(s.mutex);
-    // Record the address for the draw hook's quick skip even when the code is already known: the
-    // same program refused at a second address must not be re-scanned and re-hashed every draw.
-    s.quick.insert({stage, address, code[0]});
     if (s.seen.count({stage, hash})) return false;
-    if (s.seen.size() >= kRefusedShaderDumpMaxPrograms) {
-        if (!s.cap_announced) {
-            s.cap_announced = true;
-            std::fprintf(stderr, "[refused-shader] %zu distinct programs recorded; further refusals "
-                                 "are not dumped (set PROSPER_SHADER_DUMP for an unbounded dump)\n",
-                         kRefusedShaderDumpMaxPrograms);
-        }
-        return false;
-    }
+    if (s.seen.size() >= kRefusedShaderDumpMaxPrograms) return false;
     s.seen.insert({stage, hash});
-    if (s.seen.size() >= kRefusedShaderDumpMaxPrograms) s.full.store(true, std::memory_order_relaxed);
+    if (s.seen.size() >= kRefusedShaderDumpMaxPrograms) {
+        s.full.store(true, std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "[refused-shader] %zu distinct programs recorded; further refusals "
+                     "are not dumped (set PROSPER_SHADER_DUMP for an unbounded dump)\n",
+                     kRefusedShaderDumpMaxPrograms);
+    }
     const std::string dir = make_directory(s);
     if (dir.empty()) return false;
     char file[64];
@@ -126,12 +132,52 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
     return written;
 }
 
-bool refused_shader_already_noted(const char* stage, uint64_t address, uint32_t first_word) {
+bool note_refused_shader(const char* stage, uint64_t address, const RefusedShaderSource& source,
+                         const std::string& detail) {
+    if (refused_shader_dump_full() || !stage || !source.words || source.words->empty())
+        return false;
+    const uint64_t bit = stage_bit(stage);
+    if (source.memo && bit) {
+        const uint64_t epoch = state().epoch.load(std::memory_order_relaxed);
+        uint64_t previous = source.memo->epoch_stages.load(std::memory_order_relaxed);
+        for (;;) {
+            if ((previous & ~uint64_t(7)) == epoch && (previous & bit)) return false;
+            const uint64_t desired =
+                epoch | bit | (((previous & ~uint64_t(7)) == epoch) ? (previous & 7u) : 0u);
+            if (source.memo->epoch_stages.compare_exchange_weak(previous, desired,
+                                                                std::memory_order_relaxed))
+                break;
+        }
+    }
+    return note_refused_shader(stage, address, source.words->data(), source.words->size(), detail);
+}
+
+bool refused_shader_already_noted(const char* stage, const RefusedShaderSource& source) {
+    if (refused_shader_dump_full() || !stage || !source.words || source.words->empty()) return true;
+    if (!source.memo) return false;
+    const uint64_t observed = source.memo->epoch_stages.load(std::memory_order_relaxed);
+    return (observed & ~uint64_t(7)) == state().epoch.load(std::memory_order_relaxed) &&
+           (observed & stage_bit(stage));
+}
+
+bool note_refused_compute_shader(uint64_t address, const RefusedShaderSource& source,
+                                 uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) {
+    if (refused_shader_already_noted("cs", source)) return false;
+    char detail[96];
+    std::snprintf(detail, sizeof detail, "dispatch groups=%ux%ux%u", groups_x, groups_y, groups_z);
+    return note_refused_shader("cs", address, source, detail);
+}
+
+bool refused_shader_dump_full() {
     if (PROSPER_ENV_ON("PROSPER_NO_REFUSED_SHADER_DUMP")) return true;
+    return state().full.load(std::memory_order_relaxed);
+}
+
+RefusedShaderDumpStats refused_shader_dump_stats() {
     DumpState& s = state();
-    if (s.full.load(std::memory_order_relaxed)) return true;
     std::lock_guard lock(s.mutex);
-    return s.quick.count({stage, address, first_word}) != 0;
+    return {s.seen.size(), s.hash_evaluations.load(std::memory_order_relaxed),
+            s.hashed_dwords.load(std::memory_order_relaxed)};
 }
 
 std::string refused_shader_dump_directory() {
@@ -146,9 +192,10 @@ void reset_refused_shader_dump_for_test(const std::string& root) {
     s.root = root;
     s.directory.clear();
     s.seen.clear();
-    s.quick.clear();
     s.full.store(false);
-    s.cap_announced = false;
+    s.epoch.fetch_add(8, std::memory_order_relaxed);
+    s.hash_evaluations.store(0, std::memory_order_relaxed);
+    s.hashed_dwords.store(0, std::memory_order_relaxed);
     s.dir_failure_announced = false;
 }
 

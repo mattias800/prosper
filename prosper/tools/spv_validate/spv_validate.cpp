@@ -21,6 +21,8 @@
 // is a hard failure rather than a pass.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
+#include "gpu/recompiler/fragment_draw_capacity.hpp"
+#include "gpu/recompiler/fragment_draw_gpu.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "build_revision.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -31,6 +33,7 @@
 #include "../../tests/fixtures/spirv_fragment_vote_execution.hpp"
 #include "../../tests/fixtures/spirv_fragment_neutral_fixtures.hpp"
 #include "../../tests/fixtures/portable_bpermute_fixture.hpp"
+#include "../../tests/fixtures/dpp_row_max.hpp"
 #include "../../tests/fixtures/fragment_packet_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_wqm_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_mbcnt_fixture.hpp"
@@ -40,6 +43,7 @@
 #include "../../tests/fixtures/fragment_packet_mask_entry_fixture.hpp"
 #include "../../tests/fixtures/fragment_special_f32_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_wave_fixture.hpp"
+#include "../../tests/fixtures/fragment_packet_exports_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <algorithm>
 #include <bit>
@@ -771,6 +775,70 @@ int main(int argc, char** argv) {
             prosper::test::fragment_packet_wave::scalar_exec_packet(0));
         dump(dir, "fragment_packet_wave_scalar_exec_kernel",
              scalar_exec_kernel.program.packet.spirv, "recompile_fragment_packet_kernel");
+        // A separate original resource-free PS represents the first assembly recipe. The wave
+        // fixture above genuinely consumes SMEM/M0/P1/P2 and must not have its resources stripped
+        // to make this representative emit. Hand-owned user words remain distinct from WAT2
+        // placement authority; this factory does not establish shipping launch or attachment data.
+        auto draw_schema = resources::base();
+        auto& draw_invocation = draw_schema.invocation;
+        draw_invocation.export_observation = FragmentPacketExportObservation::Architectural;
+        draw_invocation.mask_state_available = false;
+        draw_invocation.vgprs.clear();
+        draw_invocation.sgprs = {{0, resources::bits(.25f)},
+                                 {1, resources::bits(.5f)},
+                                 {2, resources::bits(.75f)},
+                                 {3, resources::bits(1.0f)}};
+        // The original EXEC=-1 dominates every vector writer/export. No guest initial mask,
+        // system input, helper value, parameter coefficient or scratch VGPR is invented.
+        draw_invocation.guest_code = {0xbefe04c1u, 0x7e000200u, 0x7e020201u, 0x7e040202u,
+                                      0x7e060203u, 0xf800180fu, 0x03020100u, 0xbf810000u};
+        auto draw_kernel = std::make_shared<const FragmentPacketKernel>(
+            recompile_fragment_packet_capacity_kernel(draw_schema));
+        dump(dir, "fragment_draw_capacity_kernel", draw_kernel->program.packet.spirv,
+             "recompile_fragment_packet_capacity_kernel");
+        RasterQuadCollector draw_collector;
+        draw_collector.max_quads = 48;
+        draw_collector.lane_words = kRasterQuadLaneFixedWords;
+        draw_collector.record_words = 4 * draw_collector.lane_words;
+        std::string draw_rejection;
+        const auto draw_capacity =
+            fragment_draw_capacity(draw_kernel, draw_collector, draw_rejection);
+        if (!draw_capacity) {
+            printf("  [FAIL] fragment draw capacity: %s\n", draw_rejection.c_str());
+            ++fails;
+        } else {
+            dump(dir, "fragment_draw_count",
+                 build_fragment_draw_count(*draw_capacity, draw_collector),
+                 "build_fragment_draw_count");
+            dump(dir, "fragment_draw_assembly",
+                 build_fragment_draw_assembly(*draw_capacity, draw_collector),
+                 "build_fragment_draw_assembly");
+            dump(dir, "fragment_draw_validation",
+                 build_fragment_draw_validation(*draw_capacity, draw_collector),
+                 "build_fragment_draw_validation");
+            dump(dir, "fragment_draw_replay",
+                 build_fragment_draw_replay(*draw_capacity, draw_collector),
+                 "build_fragment_draw_replay");
+        }
+        namespace architectural = prosper::test::fragment_packet_exports;
+        for (const auto& [name, input] :
+             std::vector<std::pair<const char*, FragmentResourcePacket>>{
+                 {"scratch", architectural::scratch()},
+                 {"multiple", architectural::multiple()},
+                 {"compressed", architectural::compressed()},
+                 {"p2", architectural::previous_destination()},
+                 {"wait_cmpx", architectural::pending_write(3, true)},
+                 {"wait_join", architectural::pending_join(true, false)},
+                 {"numeric_saveexec", architectural::numeric_saveexec(3)},
+                 {"wait_image", architectural::pending_image(true)}}) {
+            const auto compiled = recompile_fragment_resource_packet(input);
+            dump(dir, (std::string("fragment_architectural_export_") + name).c_str(),
+                 compiled.packet.spirv, "recompile_fragment_resource_packet");
+        }
+        const auto architectural_kernel =
+            recompile_fragment_packet_kernel(architectural::scratch());
+        dump(dir, "fragment_architectural_export_cached", architectural_kernel.program.packet.spirv,
+             "recompile_fragment_packet_kernel");
         for (uint32_t op : {0x2au, 0x2eu, 0x33u}) {
             const auto p =
                 recompile_fragment_resource_packet(special::packet(op, special::rails(op)));
@@ -1524,6 +1592,30 @@ int main(int argc, char** argv) {
       dump(dir, "ngg_workgroup_bounded_row_shr",
            recompile_ngg_exports_for_test(c, std::size(c), 1),
            "recompile_ngg_exports_for_test"); }
+    // Unsigned row scans need both the ordinary uniform route and event-isolated CFG routes.
+    {
+        const auto c = prosper::test::dpp_row_max_program({1, 2, 4, 8});
+        dump(dir, "compute_dpp_row_max_linear", recompile_valu(c.data(), c.size(), 3, 1));
+    }
+    {
+        using prosper::test::DppRowCfgCase;
+        const std::pair<DppRowCfgCase, const char*> cases[] = {
+            {DppRowCfgCase::Mixed, "mixed"},
+            {DppRowCfgCase::DivergentSites, "sites"},
+            {DppRowCfgCase::LoopAndCompletedPeer, "loop"},
+            {DppRowCfgCase::LaterBarrierPhase, "later_phase"}};
+        for (const auto& [shape, name] : cases) {
+            const auto c = prosper::test::dpp_row_cfg_export_program(shape);
+            for (bool native : {false, true}) {
+                const std::string id = std::string("compute_dpp_row_max_") + name +
+                                       (native ? "_native64" : "_portable");
+                dump(dir, id.c_str(),
+                     recompile_ngg_exports_for_test(c.data(), c.size(), 10, 0, nullptr, 4, 0, {},
+                                                    true, true, native),
+                     "recompile_ngg_exports_for_test");
+            }
+        }
+    }
     // Generated interpolation geometry stage: AMD's explicit-parameter form publishes P0/P10/P20
     // plus perspective-center I/J from a synthesised Geometry entry point.
     { const uint32_t ps[] = {0xc80e0000u,0xc8120001u,0xc8160002u,

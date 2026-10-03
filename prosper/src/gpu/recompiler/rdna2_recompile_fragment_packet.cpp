@@ -3,6 +3,8 @@
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/fragment_packet_services.hpp"
 #include "gpu/recompiler/fragment_packet_definedness.hpp"
+#include "gpu/recompiler/fragment_packet_exports_internal.hpp"
+#include "gpu/recompiler/fragment_packet_export_timing.hpp"
 #include <bitset>
 
 namespace prosper::gpu {
@@ -491,6 +493,11 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         return reject("packet-stage-invalid");
     if (services && (packet.stage != GraphicsPacketStage::Fragment || !packet.raw_windows.empty()))
         return reject("packet-resource-raw-window-domain-unimplemented");
+    // EXP14 models the explicit PS export contract only. The separately admitted vertex/raw
+    // path retains its default ABI; PS target validation cannot authorize a vertex export.
+    if (packet.export_observation == FragmentPacketExportObservation::Architectural &&
+        packet.stage != GraphicsPacketStage::Fragment)
+        return reject("packet-architectural-export-stage-unimplemented");
     if (!std::all_of(packet.slots_available.begin(), packet.slots_available.end(),
                      [](bool available) { return available; }))
         return reject("packet-invocation-state-unavailable");
@@ -499,6 +506,8 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         return reject("packet-quad-topology-invalid");
     if (!packet.float_mode.canonical() || !packet.float_flags.canonical() ||
         !packet.float_transport.canonical() ||
+        (packet.export_observation != FragmentPacketExportObservation::LegacyRaw &&
+         packet.export_observation != FragmentPacketExportObservation::Architectural) ||
         std::any_of(packet.export_enabled.begin(), packet.export_enabled.end(),
                     [](uint8_t value) { return value > 1; }))
         return reject("packet-launch-state-invalid");
@@ -562,7 +571,9 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
             owned_vector_storage.set(reg);
         }
         for (uint32_t source = 0; source < in.n_src; ++source) {
-            if (in.fmt == Rdna2Format::EXP && !(in.exp_en & (1u << source))) continue;
+            if (in.fmt == Rdna2Format::EXP &&
+                !(fragment_packet_export_source_mask(in.exp_en, in.exp_compr) & (1u << source)))
+                continue;
             if (in.src[source].kind != OperandKind::VGPR) continue;
             for (uint32_t word = 0; word < rdna2_vgpr_source_span(in, source); ++word) {
                 const int reg = in.src[source].value + int(word);
@@ -574,6 +585,14 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     }
     for (const auto& in : ins) {
         const char* gap = packet_instruction_gap(in, packet.stage);
+        if (in.fmt == Rdna2Format::EXP &&
+            packet.export_observation == FragmentPacketExportObservation::Architectural)
+            gap = fragment_packet_architectural_export_gap({in.pc, in.exp_target, in.exp_en,
+                                                            in.exp_compr, (in.words[0] >> 11) & 1u,
+                                                            (in.words[0] >> 12) & 1u});
+        if (packet.export_observation == FragmentPacketExportObservation::Architectural &&
+            in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c)
+            gap = in.simm16 == 0 ? nullptr : "packet-export-waitcnt-nonzero-unimplemented";
         if (services && gap && !packet_resource_instruction_gap(in)) gap = nullptr;
         else if (services && in.fmt == Rdna2Format::SMEM)
             gap = packet_resource_instruction_gap(in);
@@ -624,7 +643,9 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
              in.opcode == kSop1OpcodeFf1I32B64 || in.opcode == 0x0a || in.opcode == 0x08 ||
              in.opcode == kSop1OpcodeAndSaveexecB64);
         for (uint32_t source = 0; source < in.n_src; ++source) {
-            if (in.fmt == Rdna2Format::EXP && !(in.exp_en & (1u << source))) continue;
+            if (in.fmt == Rdna2Format::EXP &&
+                !(fragment_packet_export_source_mask(in.exp_en, in.exp_compr) & (1u << source)))
+                continue;
             const auto& operand = in.src[source];
             if (operand.kind == OperandKind::SGPR) {
                 if (pair_source && ((operand.value & 1) || operand.value > 104))
@@ -674,7 +695,8 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     uint32_t scalar_failure_pc = UINT32_MAX;
     if (const auto* gap = packet_scalar_initialization_gap(ins, scalars, scalar_failure_pc, services != nullptr))
         return reject(gap, scalar_failure_pc);
-    auto requirements = fragment_packet_vgpr_requirements(packet.guest_code, ins);
+    auto requirements =
+        fragment_packet_vgpr_requirements(packet.guest_code, ins, packet.export_observation);
     // Keep code-owned mask facts separate: the broader stage proof below replaces only the
     // narrow VGPR inventory, never architectural entry-state availability or mask MUST facts.
     const auto mask_requirements = requirements.masks;
@@ -712,6 +734,9 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         requirements.storage = owned_vector_storage;
     } else if (!requirements.rejection.empty())
         return reject(requirements.rejection);
+    if (packet.export_observation == FragmentPacketExportObservation::Architectural)
+        if (const auto* gap = fragment_packet_export_timing_gap(ins, scalar_failure_pc))
+            return reject(gap, scalar_failure_pc);
     bool runtime_definedness = wave_data != nullptr;
     for (uint32_t reg = 0; reg < 256; ++reg)
         if (requirements.storage.test(reg)) {
@@ -722,13 +747,19 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     runtime_definedness &= !requirements.reads.empty();
 
     FragmentPacketProgram result;
+    result.export_observation = packet.export_observation;
+    if (packet.export_observation == FragmentPacketExportObservation::Architectural)
+        for (const auto& in : ins)
+            if (in.fmt == Rdna2Format::EXP)
+                result.export_sites.push_back({in.pc, in.exp_target, in.exp_en, in.exp_compr,
+                                               (in.words[0] >> 11) & 1u, (in.words[0] >> 12) & 1u});
     result.initial_mask_availability = mask_availability;
     result.demanded_initial_masks =
         mask_requirements.rejection.empty() ? mask_requirements.demanded : 7u;
     result.input_stride =
         static_cast<uint32_t>(columns.size()) * (runtime_definedness ? 2u : 1u) + 4;
     result.exports_per_lane = static_cast<uint32_t>(exports.size());
-    const uint32_t record_stride = result.exports_per_lane * kFragmentPacketExportWords;
+    const uint32_t record_stride = result.exports_per_lane * result.export_record_words();
     result.input_words.resize(kFragmentPacketLanes * result.input_stride);
     result.output_words.resize(kFragmentPacketLanes * record_stride, 0);
     for (uint32_t lane = 0; lane < kFragmentPacketLanes; ++lane) {
@@ -799,6 +830,11 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     std::vector<uint32_t> marker;
     b.pstr(marker, "Prosper.GuestFragmentPacket=64;NoRasterPackingAuthority");
     b.putv(b.debug, Op_ModuleProcessed, marker);
+    if (packet.export_observation == FragmentPacketExportObservation::Architectural) {
+        marker.clear();
+        b.pstr(marker, fragment_packet_export_schema_marker(result.export_sites).c_str());
+        b.putv(b.debug, Op_ModuleProcessed, marker);
+    }
     if (runtime_definedness) {
         marker.clear();
         b.pstr(marker, kPacketVgprValidityMarker);
@@ -831,9 +867,13 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     state.exec_narrowed = true;
     const uint32_t enabled = b.load_input(state_base + 3);
     if (services) services->begin(b);
-    PacketVgprDefinedness definedness{requirements};
+    PacketVgprDefinedness definedness{requirements, packet.export_observation};
     if (runtime_definedness) definedness.begin(b, columns);
     const auto export_record = [&](RegState& current, const Rdna2Inst& in) {
+        if (packet.export_observation == FragmentPacketExportObservation::Architectural)
+            return emit_packet_architectural_export(
+                b, current, in, exports.at(in.pc) * result.export_record_words(), record_stride,
+                enabled);
         const uint32_t base = exports.at(in.pc) * kFragmentPacketExportWords;
         const uint32_t fields[] = {b.uconst(1), b.sel(current.exec, b.uconst(1), b.uconst(0)),
             enabled, b.uconst(in.exp_target), b.uconst(in.exp_en), b.uconst(in.exp_compr),

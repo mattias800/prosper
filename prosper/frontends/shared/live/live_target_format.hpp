@@ -17,12 +17,40 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 #include <vulkan/vulkan.h>
 
 #include "gpu/execute/gpu_execute.hpp"
 
 namespace prosper::frontend {
+
+// #4291: a CB_COLOR ALT target holds BGRA guest bytes, and the renderer keeps it as canonical RGBA8.
+// True exactly when that translation is in effect for (guest format, host image format).
+constexpr bool live_target_component_order_bgra(VkFormat guest_format, VkFormat host_format) {
+    return (guest_format == VK_FORMAT_B8G8R8A8_UNORM || guest_format == VK_FORMAT_B8G8R8A8_SRGB) &&
+           host_format == VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+// A T# DST_SEL is expressed in the guest's component order; translate it into the canonical host
+// image's (SQ_SEL X <-> Z). Constants, G and A are unchanged. The graphics sampled path applies the
+// same composition (render_runner.h, backend_sampled_component_swizzle).
+constexpr uint32_t live_target_host_selector(uint32_t selector, bool component_order_bgra) {
+    if (!component_order_bgra) return selector;
+    return selector == 4u ? 6u : selector == 6u ? 4u : selector;
+}
+
+// A raw bit copy, the packed-10 conversion and a storage seed all move components in the order
+// they sit in, so a BGRA-as-RGBA target would arrive with R and B exchanged. Those decline and take
+// the CPU snapshot, which live compute swaps into guest order (below). Only a sampled view can
+// compose the swap into its selector (above).
+
+// Converts canonical RGBA8 texels to the guest's BGRA byte order (the swap is its own inverse). A
+// trailing partial texel is left alone; callers pass whole-image buffers.
+inline void swap_rgba8_red_blue(std::vector<uint8_t>& pixels) {
+    for (size_t i = 0; i + 3 < pixels.size(); i += 4) std::swap(pixels[i], pixels[i + 2]);
+}
 
 // How one texel of the renderer's CPU snapshot is laid out. Conversion loops that implement a
 // subset of the layouts branch on THIS rather than on "is it RGBA8, else assume FP16", so a new

@@ -30,6 +30,8 @@ struct PacketWaveDataLayout {
     uint32_t expected_m0 = 0, entry_m0 = 0, entry_m0_available_offset = 0;
     uint32_t input_words = 0, output_words = 0;
     bool entry_m0_available = false;
+    // Explicit alternate entry ABI. False preserves the owned WAT1 compiler and wire bytes.
+    bool gpu_capacity = false;
 };
 struct FragmentPacketKernel {
     FragmentResourcePacketProgram program; // cached SOURCE and per-wave status/read-site schema
@@ -74,6 +76,7 @@ struct FragmentPacketWaveBatch {
 };
 struct FragmentPacketWaveResult {
     std::vector<std::vector<uint32_t>> exports; // EMPTY if ANY wave fails
+    std::vector<std::vector<FragmentPacketArchitecturalLane>> architectural_exports;
     std::string rejection;
     uint32_t wave = UINT32_MAX, lane = UINT32_MAX, pc = UINT32_MAX;
 };

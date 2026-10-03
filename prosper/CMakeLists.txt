@@ -1316,27 +1316,14 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_reallocf.cpp
     LIBRARIES prosper_core)
 
-  # FreeBSD libc contracts, ported from freebsd-src lib/libc/tests (ATF) to
-  # gtest. prosper's libSceLibcInternal is FreeBSD-lineage, and hle_libc.cpp
-  # forwards these exact functions to the host — so the FreeBSD sign/span/
-  # return semantics are the guest-visible contract. Pure, no game dump.
-  prosper_add_gtest(test_freebsd_memcmp
-    SOURCES tests/hle/test_freebsd_memcmp.cpp
+  # Guest libc contracts prosper implements itself (not host forwarders), called through the
+  # registered handlers. strlcpy/strlcat are prosper's own code; qsort/bsearch own the guest
+  # comparator's calling convention, which differs from the host's on Windows. Pure, no game dump.
+  prosper_add_gtest(test_libc_strlcpy
+    SOURCES tests/hle/test_libc_strlcpy.cpp
     LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_strcmp
-    SOURCES tests/hle/test_freebsd_strcmp.cpp
-    LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_strspan
-    SOURCES tests/hle/test_freebsd_strspan.cpp
-    LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_strlcpy
-    SOURCES tests/hle/test_freebsd_strlcpy.cpp
-    LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_bsearch
-    SOURCES tests/hle/test_freebsd_bsearch.cpp
-    LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_qsort
-    SOURCES tests/hle/test_freebsd_qsort.cpp
+  prosper_add_gtest(test_libc_qsort_bsearch
+    SOURCES tests/hle/test_libc_qsort_bsearch.cpp
     LIBRARIES prosper_core)
 
   # Batch 2: strncmp/strnlen/strrchr/memset/sscanf FreeBSD contracts.
@@ -1445,6 +1432,12 @@ if(TARGET prosper_core)
   # printed offset round-trips back through PROSPER_BP. Header-only; no dump, no device.
   prosper_add_gtest(test_guest_module_label
     SOURCES tests/host/image/test_guest_module_label.cpp
+    LIBRARIES prosper_core)
+
+  # The guest-FS swap stub's saved-base slot is consumed by callback_fs.hpp. Inspect emitted bytes
+  # without executing FSGSBASE instructions, and pin both the handler offset and call alignment.
+  prosper_add_gtest(test_guest_fs_swap_stub
+    SOURCES tests/host/image/test_guest_fs_swap_stub.cpp
     LIBRARIES prosper_core)
 
   # The frame-pointer walk shared by the fault reporter and PROSPER_HWBP_STACK. It dereferences
@@ -2710,9 +2703,13 @@ if(TARGET prosper_core)
       LIBRARIES prosper_core Vulkan::Vulkan)
   endif()
 
-  add_executable(test_rdna2_decode tests/gpu/recompiler/test_rdna2_decode.cpp)
-  target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
-  add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
+  prosper_add_gtest(test_rdna2_decode
+    SOURCES tests/gpu/recompiler/test_rdna2_decode.cpp
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_rdna2_predicate_tables
+    SOURCES tests/gpu/recompiler/test_rdna2_predicate_tables.cpp
+    LIBRARIES prosper_core)
 
   # Exhaustive per-family opcode/length sweep of the walker (words built from the encoding layout).
   prosper_add_gtest(test_rdna2_decode_sweep
@@ -2723,6 +2720,18 @@ if(TARGET prosper_core)
   add_executable(test_rdna2_spirv_struct tests/gpu/test_rdna2_spirv_struct.cpp)
   target_link_libraries(test_rdna2_spirv_struct PRIVATE prosper_core)
   add_test(NAME rdna2_spirv_struct COMMAND test_rdna2_spirv_struct)
+
+  prosper_add_gtest(test_compute_dpp_row_max
+    SOURCES tests/gpu/recompiler/test_compute_dpp_row_max.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  if(Vulkan_FOUND)
+    prosper_add_gtest(test_compute_dpp_row_max_execution
+      SOURCES tests/gpu/execute/test_compute_dpp_row_max.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 60)
+  endif()
 
   # #4007: strict-valid, paired address/control counterexamples for the load-bearing width proof.
   add_executable(test_wave_width_independent tests/gpu/recompiler/test_wave_width_independent.cpp)
@@ -2884,6 +2893,9 @@ endif()
   prosper_add_gtest(test_fragment_packet_wave_data
     SOURCES tests/gpu/recompiler/test_fragment_packet_wave_data.cpp
     INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_packet_exports
+    SOURCES tests/gpu/recompiler/test_fragment_packet_exports.cpp
+    INCLUDES tests tests/gpu/recompiler LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
   add_executable(test_fragment_packet_wqm tests/gpu/recompiler/test_fragment_packet_wqm.cpp)
   target_include_directories(test_fragment_packet_wqm PRIVATE tests)
   target_link_libraries(test_fragment_packet_wqm PRIVATE prosper_core)
@@ -2904,6 +2916,11 @@ endif()
   # fires would otherwise pass the suite.
   prosper_add_gtest(test_scc_branch_uniformity
     SOURCES tests/gpu/recompiler/test_scc_branch_uniformity.cpp
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_fragment_draw_capacity
+    SOURCES tests/gpu/recompiler/test_fragment_draw_capacity.cpp
+    INCLUDES src tests
     LIBRARIES prosper_core)
 
   # #3573: the CFG dispatcher must lower a fragment exec/vcc branch as a wave vote.
@@ -3151,6 +3168,12 @@ endif()
   # side effects; needs prosper_core but no Vulkan device.
   prosper_add_gtest(test_compute_program_facts
     SOURCES tests/gpu/execute/test_compute_program_facts.cpp
+    LIBRARIES prosper_core)
+
+  # Actual CPU draw/dispatch refusal producers: original versions, warm observation and cap evidence.
+  prosper_add_gtest(test_refused_shader_producer
+    SOURCES tests/gpu/execute/test_refused_shader_producer.cpp
+    INCLUDES tests
     LIBRARIES prosper_core)
 
   # shader_histo: data-driven recompiler-coverage report over the game's real embedded RDNA2 shaders.
@@ -3810,6 +3833,7 @@ endif()
         ENVIRONMENT "PROSPER_NO_ROBUST_BUFFER_ACCESS2=1")
 
       add_executable(test_numeric_mbcnt tests/gpu/execute/test_numeric_mbcnt.cpp)
+
       target_include_directories(test_numeric_mbcnt PRIVATE tests)
       target_link_libraries(test_numeric_mbcnt PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME numeric_mbcnt COMMAND test_numeric_mbcnt)
@@ -4757,6 +4781,12 @@ endif()
       prosper_add_gtest(test_renderer_uint_copy
         SOURCES tests/gpu/execute/test_renderer_uint_copy.cpp
         INCLUDES tests frontends
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
+
+      # #4291: BGRA render targets reach compute in guest component order on every path.
+      prosper_add_gtest(test_live_compute_bgra_target
+        SOURCES tests/shared/live/test_live_compute_bgra_target.cpp
+        INCLUDES tests frontends src
         LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan)
 
       add_executable(test_storage_metadata_borrow tests/gpu/execute/test_storage_metadata_borrow.cpp)
@@ -5993,6 +6023,12 @@ endif()
 # physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
 # silent pass) where one does not.
 if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  prosper_add_gtest(test_fragment_draw_plan
+    SOURCES tests/gpu/execute/test_fragment_draw_plan.cpp
+    INCLUDES tests frontends LIBRARIES prosper_core Vulkan::Vulkan LABELS unit PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_draw_exec
+    SOURCES tests/gpu/execute/test_fragment_draw_exec.cpp
+    INCLUDES tests frontends LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_ps_pull_model_exec
     SOURCES tests/gpu/execute/test_ps_pull_model_exec.cpp
     INCLUDES tests frontends LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
@@ -6028,6 +6064,10 @@ if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
     PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
   prosper_add_gtest(test_fragment_packet_wave_data_exec
     SOURCES tests/gpu/execute/test_fragment_packet_wave_data_exec.cpp
+    INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
+    PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
+  prosper_add_gtest(test_fragment_packet_exports_exec
+    SOURCES tests/gpu/execute/test_fragment_packet_exports_exec.cpp
     INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
     PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
 

@@ -426,18 +426,23 @@ TEST(SavedataParam, SaveIconWritesThePngIntoTheMountedSave) {
     EXPECT_FALSE(fs::exists(icon_path)) << "no refused call may leave an icon behind";
 
     ASSERT_EQ(call(&mp, &good), 0u);
-    std::ifstream in(icon_path, std::ios::binary);
-    const std::vector<uint8_t> stored((std::istreambuf_iterator<char>(in)),
-                                      std::istreambuf_iterator<char>());
-    EXPECT_EQ(stored, png) << "the icon bytes are stored at sce_sys/icon0.png";
+    {
+        // #4293: release our reader before replacement; an open Windows handle can block rename.
+        std::ifstream in(icon_path, std::ios::binary);
+        const std::vector<uint8_t> stored((std::istreambuf_iterator<char>(in)),
+                                          std::istreambuf_iterator<char>());
+        EXPECT_EQ(stored, png) << "the icon bytes are stored at sce_sys/icon0.png";
+    }
 
     // A different icon replaces the first; a stub writing fixed bytes passes the arm above only.
     const std::vector<uint8_t> second = {0x89, 'P', 'N', 'G', 9, 9};
     const Icon replace{second.data(), second.size(), second.size(), {}};
     ASSERT_EQ(call(&mp, &replace), 0u);
-    std::ifstream again(icon_path, std::ios::binary);
-    const std::vector<uint8_t> restored((std::istreambuf_iterator<char>(again)),
-                                        std::istreambuf_iterator<char>());
-    EXPECT_EQ(restored, second);
+    {
+        std::ifstream again(icon_path, std::ios::binary);
+        const std::vector<uint8_t> restored((std::istreambuf_iterator<char>(again)),
+                                            std::istreambuf_iterator<char>());
+        EXPECT_EQ(restored, second);
+    }
     savedata0_umount();
 }
