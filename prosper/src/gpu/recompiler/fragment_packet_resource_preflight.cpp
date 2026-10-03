@@ -227,7 +227,9 @@ const char* packet_resource_preflight(const FragmentResourcePacket& packet,
             pending.scalar.reset(); pending.vector.reset();
         } else {
             for (uint32_t source = 0; source < in.n_src; ++source) {
-                if (in.fmt == Rdna2Format::EXP && !(in.exp_en & (1u << source))) continue;
+                if (in.fmt == Rdna2Format::EXP &&
+                    !(fragment_packet_export_source_mask(in.exp_en, in.exp_compr) & (1u << source)))
+                    continue;
                 const auto& op = in.src[source];
                 if (op.kind == OperandKind::SGPR) {
                     const auto count = scalar_width(in, source);

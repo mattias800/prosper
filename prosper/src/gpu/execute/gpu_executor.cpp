@@ -1170,7 +1170,8 @@ std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint3
                             sizeof(uint32_t) +
                         static_cast<uint64_t>(result->pcrel_dispatch.setup_pcs.size()) *
                             sizeof(uint32_t);
-        result->bytes += result->packet_vgpr_requirements.retained_bytes();
+        result->bytes +=
+            result->packet_vgpr_requirements.retained_bytes() + sizeof(result->refused_shader_memo);
         return result;
     };
 
@@ -1321,21 +1322,16 @@ PcrelDispatchSelection select_pcrel_dispatch(const uint32_t* code, size_t dwords
     return selection;
 }
 
-ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_t* code, size_t dwords,
-                                         const ShaderResourceTable* resources,
-                                         const PixelInputMapping* pixel_inputs,
-                                         const PixelSystemInputMapping* system_inputs,
-                                         const uint32_t* chain_code = nullptr,
-                                         size_t chain_dwords = 0,
-                                         uint32_t vertex_lds_dwords = 0,
-                                         const ComputeShaderConfig* compute_config = nullptr,
-                                         bool fragment_wave32 = false,
-                                         bool capture_position = false,
-                                         const SharedShaderAnalysis& captured_analysis = {},
-                                         FragmentFloatMode fragment_float_mode = {},
-                                         FloatTransportConfig float_transport = {},
-                                         FragmentFloatFlags fragment_float_flags = {},
-                                         FragmentLaunchRsrc1 fragment_launch_rsrc1 = {}) {
+ShaderCompileKey make_shader_compile_key(
+    ShaderProgramStage stage, const uint32_t* code, size_t dwords,
+    const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
+    const PixelSystemInputMapping* system_inputs, const uint32_t* chain_code = nullptr,
+    size_t chain_dwords = 0, uint32_t vertex_lds_dwords = 0,
+    const ComputeShaderConfig* compute_config = nullptr, bool fragment_wave32 = false,
+    bool capture_position = false, const SharedShaderAnalysis& captured_analysis = {},
+    FragmentFloatMode fragment_float_mode = {}, FloatTransportConfig float_transport = {},
+    FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
+    RefusedShaderSource* original_source = nullptr) {
     ShaderCompileKey key;
     key.resources = ShaderKeyResourceScratch::acquire();
     key.stage = stage;
@@ -1431,6 +1427,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
         // embedded lookup table after ENDPGM; retain that proven tail so cached recompilation sees the
         // same blob as the direct path and table contents participate in the cache identity.
         key.code = std::shared_ptr<const std::vector<uint32_t>>(analysis, &analysis->code);
+        if (original_source) *original_source = {key.code, &analysis->refused_shader_memo};
         key.code_hash = analysis->code_hash;
         key.code_analysis_identity = analysis->identity;
     }
@@ -2129,27 +2126,25 @@ SharedShaderWords shader_analysis_owned_words(const SharedShaderAnalysis& analys
 }
 
 SharedShaderWords recompile_graphics_shader_cached_shared(
-        ShaderProgramStage stage, const uint32_t* code, size_t dwords,
-        const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
-        const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
-        bool fragment_wave32, uint32_t vertex_lds_dwords,
-        bool vertex_capture_position,
-        const SharedShaderAnalysis& captured_analysis,
-        FragmentFloatMode fragment_float_mode, FloatTransportConfig float_transport,
-        FragmentFloatFlags fragment_float_flags, FragmentLaunchRsrc1 fragment_launch_rsrc1) {
+    ShaderProgramStage stage, const uint32_t* code, size_t dwords,
+    const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
+    const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity, bool fragment_wave32,
+    uint32_t vertex_lds_dwords, bool vertex_capture_position,
+    const SharedShaderAnalysis& captured_analysis, FragmentFloatMode fragment_float_mode,
+    FloatTransportConfig float_transport, FragmentFloatFlags fragment_float_flags,
+    FragmentLaunchRsrc1 fragment_launch_rsrc1, RefusedShaderSource* original_source) {
     if (cache_identity) *cache_identity = 0;
+    if (original_source) *original_source = {};
     if (!fragment_float_mode.canonical() || !float_transport.canonical() ||
         !fragment_float_flags.canonical() || !fragment_launch_rsrc1.canonical()) {
         if (stage == ShaderProgramStage::Fragment)
             observe_fragment_arithmetic({}, reinterpret_cast<uintptr_t>(code), false);
         return {};
     }
-    ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
-                                                   system_inputs, nullptr, 0,
-                                                   vertex_lds_dwords, nullptr,
-                                                   fragment_wave32, vertex_capture_position,
-                                                   captured_analysis, fragment_float_mode, float_transport,
-                                                   fragment_float_flags, fragment_launch_rsrc1);
+    ShaderCompileKey key = make_shader_compile_key(
+        stage, code, dwords, resources, pixel_inputs, system_inputs, nullptr, 0, vertex_lds_dwords,
+        nullptr, fragment_wave32, vertex_capture_position, captured_analysis, fragment_float_mode,
+        float_transport, fragment_float_flags, fragment_launch_rsrc1, original_source);
     // Guest memory is 1:1-mapped, so the caller's code pointer IS the guest program address; it must
     // be captured here because the key owns a copy of the words rather than pointing at them.
     const uint64_t program_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(code));
@@ -2172,12 +2167,12 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
 }
 
 SharedShaderWords recompile_vertex_chain_cached_shared(
-        const uint32_t* prolog, size_t prolog_dwords,
-        const uint32_t* main, size_t main_dwords,
-        const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
-        uint64_t* cache_identity, uint32_t vertex_lds_dwords,
-        bool capture_position, FloatTransportConfig float_transport) {
+    const uint32_t* prolog, size_t prolog_dwords, const uint32_t* main, size_t main_dwords,
+    const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
+    uint64_t* cache_identity, uint32_t vertex_lds_dwords, bool capture_position,
+    FloatTransportConfig float_transport, RefusedShaderSource* original_source) {
     if (cache_identity) *cache_identity = 0;
+    if (original_source) *original_source = {};
     if (!float_transport.canonical()) return {};
     // This must precede lookup: the direct-stage key cannot authenticate rebased main PCs or
     // recover owners discarded by the legacy chain table merge, including a warm entry.
@@ -2192,8 +2187,9 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
         return {};
     }
     ShaderCompileKey key = make_shader_compile_key(
-        ShaderProgramStage::Vertex, prolog, prolog_dwords, resources, pixel_inputs, nullptr,
-        main, main_dwords, vertex_lds_dwords, nullptr, false, capture_position, {}, {}, float_transport);
+        ShaderProgramStage::Vertex, prolog, prolog_dwords, resources, pixel_inputs, nullptr, main,
+        main_dwords, vertex_lds_dwords, nullptr, false, capture_position, {}, {}, float_transport,
+        {}, {}, original_source);
     if (!key.chain_code) {
         return {};
     }
@@ -2219,18 +2215,18 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
 }
 
 std::vector<uint32_t> recompile_graphics_shader_cached(
-        ShaderProgramStage stage, const uint32_t* code, size_t dwords,
-        const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
-        const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity,
-        bool fragment_wave32, uint32_t vertex_lds_dwords,
-        bool vertex_capture_position,
-        const SharedShaderAnalysis& captured_analysis,
-        FragmentFloatMode fragment_float_mode, FloatTransportConfig float_transport,
-        FragmentFloatFlags fragment_float_flags, FragmentLaunchRsrc1 fragment_launch_rsrc1) {
+    ShaderProgramStage stage, const uint32_t* code, size_t dwords,
+    const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
+    const PixelSystemInputMapping* system_inputs, uint64_t* cache_identity, bool fragment_wave32,
+    uint32_t vertex_lds_dwords, bool vertex_capture_position,
+    const SharedShaderAnalysis& captured_analysis, FragmentFloatMode fragment_float_mode,
+    FloatTransportConfig float_transport, FragmentFloatFlags fragment_float_flags,
+    FragmentLaunchRsrc1 fragment_launch_rsrc1, RefusedShaderSource* original_source) {
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
         stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity,
         fragment_wave32, vertex_lds_dwords, vertex_capture_position, captured_analysis,
-        fragment_float_mode, float_transport, fragment_float_flags, fragment_launch_rsrc1);
+        fragment_float_mode, float_transport, fragment_float_flags, fragment_launch_rsrc1,
+        original_source);
     return words ? *words : std::vector<uint32_t>{};
 }
 
@@ -8852,14 +8848,15 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
             }
         }
         bool native_multiwave_wave_work = false;
+        std::shared_ptr<const ComputeProgramFacts> facts;
         const RecompileDiagnosticContext recompile_diagnostic{
             RecompileDiagnosticStage::Compute, code_addr};
         {
             // Decode, the native-multiwave probe and the GDS scan depend only on the program's
             // bytes; compute_program_facts memoizes them per exact program (see its header).
-            const std::shared_ptr<const ComputeProgramFacts> facts = compute_program_facts(
-                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                shader_dwords, recompile_diagnostic);
+            facts = compute_program_facts(
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords,
+                recompile_diagnostic);
             // The fold already resolved each child's exact current pointer. Only the ordered
             // live path carries a mapping lease; offline realization remains fail-closed. The
             // admission helper freezes parent/child bytes and rejects any possible write alias.
@@ -9342,6 +9339,8 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
                     }
                 }
             }
+            note_refused_compute_program(facts, code_addr, launch.groups_x, launch.groups_y,
+                                         launch.groups_z);
             if (report_compute_recompile_skip_once(recompile_diagnostic)) {
                 // #2412: print the table this program was offered, next to the keys the shader looks
                 // up by. Every one of GTA V's 951 recompiler rejects is `mode=unresolved-operand`
@@ -9395,16 +9394,6 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
                 // (registered_shader_dwords is guest_readable-checked and capped at 0x4000 dwords ==
                 // 64 KiB), not a fixed 0x10000 — a short shader at the tail of its mapping would
                 // otherwise over-read past the mapped page into a SIGSEGV inside the dump (#1209).
-                // #4273: keep each distinct refused compute program by default, bounded.
-                if (shader_dwords) {
-                    char detail[96];
-                    snprintf(detail, sizeof detail, "dispatch groups=%ux%ux%u",
-                             launch.groups_x, launch.groups_y, launch.groups_z);
-                    note_refused_shader(
-                        "cs", code_addr,
-                        reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                        std::min(shader_dwords, size_t(0x4000)), detail);
-                }
                 if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
                     const size_t dump_bytes = std::min(shader_dwords * sizeof(uint32_t), size_t(0x10000));
                     char fn[512];

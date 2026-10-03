@@ -8494,10 +8494,12 @@ GuestDirectReadableWindow guest_memory_direct_readable_window(const GuestMapping
         !guest_memory_direct_range_fault_safe(lease, window.virtual_begin,
                                               window.virtual_end - window.virtual_begin))
         return {};
-#elif defined(_WIN32)
+#elif defined(_WIN32) || defined(__APPLE__)
     // SEC_RESERVE views are guest-committed before every physical page is host-committed. Native
     // metadata narrows an ALREADY authenticated direct allocation; it never establishes one.
+    (void)lease;
     const auto committed_region = [](uint64_t at, uint64_t& begin, uint64_t& end) {
+#if defined(_WIN32)
         MEMORY_BASIC_INFORMATION info{};
         constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
                                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
@@ -8511,6 +8513,24 @@ GuestDirectReadableWindow guest_memory_direct_readable_window(const GuestMapping
         if (!info.RegionSize || begin > UINT64_MAX - info.RegionSize) return false;
         end = begin + info.RegionSize;
         return begin <= at && at < end;
+#else
+        mach_vm_address_t region = (mach_vm_address_t)at;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        const kern_return_t result = mach_vm_region(
+            mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
+            reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+        if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+        if (result != KERN_SUCCESS || !(info.protection & VM_PROT_READ))
+            return false;
+        if (at < (uint64_t)region || size == 0 || (uint64_t)region > UINT64_MAX - (uint64_t)size)
+            return false;
+        begin = static_cast<uint64_t>(region);
+        end = static_cast<uint64_t>(region + size);
+        return begin <= at && at < end;
+#endif
     };
     uint64_t first = 0, last = 0;
     if (!committed_region(address, first, last)) return {};

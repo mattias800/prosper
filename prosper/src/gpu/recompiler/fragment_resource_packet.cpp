@@ -43,7 +43,8 @@ FragmentResourcePacketResult decode_fragment_resource_packet(const FragmentResou
     if (!definedness.rejection.empty() && (!definedness.kind || !definedness.vgpr_status_validated))
         return reject(definedness.rejection
                           .c_str()); // full64 validity validation, never partial publication
-    const uint64_t export_count = uint64_t(program.packet.exports_per_lane) * 64 * kFragmentPacketExportWords;
+    const uint64_t export_count =
+        uint64_t(program.packet.exports_per_lane) * 64 * program.packet.export_record_words();
     if (program.packet.spirv.empty() || !program.packet.rejection.empty() ||
         !program.packet.exports_per_lane || program.packet.exports_per_lane > 64 ||
         program.status_offset != export_count ||
@@ -103,6 +104,10 @@ FragmentResourcePacketResult decode_fragment_resource_packet(const FragmentResou
                 return reject("packet-runtime-vgpr-read-before-definition");
             default: return reject("packet-status-record-invalid");
         }
+    }
+    if (program.packet.export_observation == FragmentPacketExportObservation::Architectural) {
+        result.architectural_exports = definedness.architectural_exports;
+        return result;   // all resource AND validity statuses validated before typed publication
     }
     for (uint32_t offset = 0; offset < program.status_offset; offset += kFragmentPacketExportWords) {
         if (!words[offset]) {

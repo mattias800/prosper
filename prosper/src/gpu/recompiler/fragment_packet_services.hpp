@@ -47,5 +47,6 @@ struct PacketWaveEmission {
     uint32_t merge = 0, output_base = 0, outer_merge = 0;
 };
 PacketWaveEmission begin_packet_wave_data(SpirvCompute&, const PacketWaveDataLayout&);
+PacketWaveEmission begin_fragment_draw_capacity(SpirvCompute&, const PacketWaveDataLayout&);
 void finish_packet_wave_data(SpirvCompute&, PacketWaveEmission);
 } // namespace prosper::gpu

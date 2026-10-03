@@ -15,6 +15,7 @@ namespace prosper {
 uint32_t prosper_apr_register(const std::string&, uint64_t);
 }
 using namespace prosper;
+// The stub is a GUEST entry point, so on Windows the host must call it with the System V ABI.
 using GuestReadFile = uint64_t(PROSPER_GUEST_ABI *)(uint64_t,uint64_t,uint64_t,uint64_t,
                                                   uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 namespace {
@@ -34,8 +35,15 @@ protected:
         ASSERT_EQ(std::fwrite(expected.data(), 1, expected.size(), f), expected.size());
         ASSERT_EQ(std::fclose(f), 0);
         file_id = prosper_apr_register(path, expected.size());
-        std::string error;
-        ASSERT_TRUE(install_stubs({{"libSceAmpr","mQ16-QdKv7k"}}, 0x720000000ull, 96, &error)) << error;
+        // install_stubs claims a fixed aperture, and Windows refuses a second reservation of the
+        // same base (ERROR_INVALID_ADDRESS). Every case needs the same one slot, so install it once.
+        static const std::string install_error = [] {
+            std::string error;
+            if (install_stubs({{"libSceAmpr","mQ16-QdKv7k"}}, 0x720000000ull, 96, &error))
+                return std::string();
+            return error.empty() ? std::string("install_stubs failed") : error;
+        }();
+        ASSERT_TRUE(install_error.empty()) << install_error;
         read = reinterpret_cast<GuestReadFile>(stub_addr(0));
         reset(ptr(cb.data()), 0, 0, 0, 0, 0);
         output.fill(0xa5);
