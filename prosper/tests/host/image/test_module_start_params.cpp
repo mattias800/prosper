@@ -16,6 +16,7 @@
 // the entry ABI of every module prosper links.
 
 #include <cstdint>
+#include <cstring>
 #include <gtest/gtest.h>
 
 #include "host/image/boot_program.hpp"
@@ -30,6 +31,14 @@ using prosper::module_start_wants_param_descriptor;
 // PROSPER_INITLOG=1 across all ten of PPSA17952's modules), so a module's single init function is
 // its base + 0x10. Query that address rather than the bare base: it is what run_guest_inits sees.
 static constexpr uint64_t kInit = 0x10;
+
+TEST(ModuleStartParams, DescriptorMatchesIndependentWireBytes) {
+    // Literal original-consumer ABI oracle; deliberately not derived from the production fields
+    // or sizeof. The previous Windows three-qword shape has version=0 and callback=0x200 here.
+    const uint8_t expected[16] = {0x10, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    ASSERT_EQ(sizeof(prosper::kModuleStartDescriptor), sizeof(expected));
+    EXPECT_EQ(std::memcmp(&prosper::kModuleStartDescriptor, expected, sizeof(expected)), 0);
+}
 
 TEST(ModuleStartParams, RangesIncludeHandshakeModulesOnly) {
 
