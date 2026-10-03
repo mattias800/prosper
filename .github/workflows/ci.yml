@@ -117,6 +117,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # HEAD^1 is the PR's base for the C++ lint step
 
       # spirv-tools is what makes the `spv_validate` test a validation gate rather than a
       # recompile smoke test. It is on no GitHub runner image, and this workflow never installed
@@ -315,6 +317,38 @@ jobs:
         with:
           path: ${{ github.workspace }}/.ccache
           key: ccache-linux-${{ runner.os }}-${{ github.sha }}
+
+      # C++ lint (#4210): clang-format and clang-tidy on the lines a PR CHANGES only. Here because it
+      # needs this job's compile_commands.json; last, and gated on the build alone, so a lint finding
+      # never costs the test signal and a test failure never hides a lint finding. The clang tools
+      # are exact-pinned PyPI wheels in the `cpp-lint` uv group, the same binaries developers run.
+      # fetch-depth 2 on Checkout gives HEAD^1, the PR's base, without fetching history.
+      - name: Set up uv (C++ lint)
+        if: always() && steps.build.outcome == 'success'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.8.12"
+          python-version: "3.13"
+
+      - name: Install the locked cpp-lint group
+        if: always() && steps.build.outcome == 'success'
+        run: uv sync --locked --no-build --group cpp-lint
+
+      # The selftest holds hand-built violations, and --check-db proves clang can compile a real TU
+      # from this database: the gate SKIPS what clang cannot compile, so a database clang rejects
+      # would otherwise make every PR "clean" by skipping everything.
+      - name: Verify the C++ lint gate still discriminates
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          uv run --no-sync --no-build python prosper/tools/ci/check_cpp_lint.py --selftest
+          uv run --no-sync --no-build python prosper/tools/ci/check_cpp_lint.py --check-db \
+            --build prosper/build-ci
+
+      - name: C++ lint on changed lines
+        if: always() && steps.build.outcome == 'success' && github.event_name == 'pull_request'
+        run: |
+          uv run --no-sync --no-build python prosper/tools/ci/check_cpp_lint.py \
+            --base HEAD^1 --build prosper/build-ci
 
   contribution-shape:
     name: Contribution shape

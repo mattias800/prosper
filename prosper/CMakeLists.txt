@@ -515,7 +515,11 @@ if(Python3_Interpreter_FOUND)
   # loudly, when ruff is absent; the python-quality CI job installs it, so there they always run.
   add_test(NAME python_quality_gate
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_check_python_quality.py")
-  # check_arch_ratchet.py: per-file counts of six cross-title costs may go down, never up. The
+  # check_cpp_lint.py gates clang-format/clang-tidy on CHANGED lines only (#4210). The end-to-end
+  # arm skips, loudly, without the clang tools; the Linux CI job runs its --selftest directly.
+  add_test(NAME cpp_lint_gate
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_check_cpp_lint.py")
+  # check_arch_ratchet.py: per-file counts of ten measured costs may go down, never up. The
   # tests build one positive instance of every rule by hand, so a matcher that quietly stops
   # matching goes red here instead of reporting a clean tree. The real-tree arms need the checkout
   # (`git ls-files`): full mode must EVALUATE, and delta mode against origin/main (skipped when
@@ -795,6 +799,10 @@ ${GAME_DUMP_TITLE_ID}. Re-run cmake with -DGAME_DUMP=<dump root>/${title}-app0 t
 endfunction()
 
 if(TARGET prosper_core)
+  prosper_add_gtest(test_fragment_entry_prefix
+    SOURCES tests/gpu/execute/test_fragment_entry_prefix.cpp
+    INCLUDES tests LIBRARIES prosper_core)
+
   # nid_census: every guest import that falls to the dispatcher's return-0 default (#2081).
   # Links prosper_core because both of its inputs must be the real ones — `Module::load` for the
   # imports the loader will actually try to bind, `module_export_nids` for what a sibling module
@@ -1989,6 +1997,12 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_perf_alarms
     SOURCES tests/diagnostics/test_perf_alarms.cpp
     LIBRARIES prosper_core)
+  # The run-level frame-breakdown line of the exit summary: per-flip means, the sampled cost it must
+  # exclude, the "not a partition" wording, and accumulation through the engine. Its own executable so
+  # it needs none of test_perf_alarms' HLE-dispatcher fixtures.
+  prosper_add_gtest(test_frame_breakdown
+    SOURCES tests/diagnostics/test_frame_breakdown.cpp
+    LIBRARIES prosper_core)
   # The rules' detail strings go through a printf-attributed format() helper; the attribute only
   # checks anything under -Wformat, which prosper_core does not enable, so make a mismatch an ERROR
   # for this one translation unit (the gpu_replay precedent below: GCC diagnoses this at plain
@@ -2719,6 +2733,9 @@ endif()
   target_include_directories(test_fragment_packet PRIVATE tests)
   target_link_libraries(test_fragment_packet PRIVATE prosper_core)
   add_test(NAME fragment_packet_contract COMMAND test_fragment_packet)
+  prosper_add_gtest(test_fragment_resource_packet
+    SOURCES tests/gpu/recompiler/test_fragment_resource_packet.cpp
+    INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
   add_executable(test_fragment_packet_wqm tests/gpu/recompiler/test_fragment_packet_wqm.cpp)
   target_include_directories(test_fragment_packet_wqm PRIVATE tests)
   target_link_libraries(test_fragment_packet_wqm PRIVATE prosper_core)
@@ -3414,6 +3431,11 @@ endif()
 
   prosper_add_gtest(test_agc_submit
     SOURCES tests/gpu/pm4/test_agc_submit.cpp
+    LIBRARIES prosper_core)
+
+  # sceAgcDriverSubmitMultiDcbs: zero-length segments are skipped, not fatal.
+  prosper_add_gtest(test_agc_multi_dcb_empty_segment
+    SOURCES tests/gpu/pm4/test_agc_multi_dcb_empty_segment.cpp
     LIBRARIES prosper_core)
 
   add_executable(test_agc_submit_multi tests/hle/test_agc_submit_multi.cpp)
@@ -5812,11 +5834,23 @@ endif()
 # physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
 # silent pass) where one does not.
 if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  prosper_add_gtest(test_fragment_entry_prefix_exec
+    SOURCES tests/gpu/execute/test_fragment_entry_prefix_exec.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core Vulkan::Vulkan
+    LABELS gpu
+    PROPERTIES TIMEOUT 120)
+
   add_executable(test_fragment_packet_exec tests/gpu/execute/test_fragment_packet_exec.cpp)
   target_include_directories(test_fragment_packet_exec PRIVATE tests)
   target_link_libraries(test_fragment_packet_exec PRIVATE prosper_core Vulkan::Vulkan)
   add_test(NAME fragment_packet_exec COMMAND test_fragment_packet_exec)
   set_tests_properties(fragment_packet_exec PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+  prosper_add_gtest(test_fragment_resource_packet_exec
+    SOURCES tests/gpu/execute/test_fragment_resource_packet_exec.cpp
+    INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
+    PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION "[[]  SKIPPED []]")
 
   add_executable(test_float_transport_render tests/gpu/execute/test_float_transport_render.cpp)
   target_include_directories(test_float_transport_render PRIVATE tests frontends)

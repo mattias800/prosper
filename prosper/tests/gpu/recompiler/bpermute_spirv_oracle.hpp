@@ -5,6 +5,8 @@
 // barriers; unsupported operations, poison reads, invalid pointers and split
 // barriers fail.
 #include <array>
+#include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <map>
 #include <stdexcept>
@@ -55,6 +57,13 @@ struct Interpreter {
   uint32_t main = 0, storage = 0;
   size_t entry = 0;
   std::string error;
+  struct SampledMip {
+    uint32_t width = 0, height = 0;
+    std::vector<std::array<uint32_t, 4>> texels;
+  };
+  uint32_t glsl = 0;
+  // Independent fixture-owned texels for ONLY exact-center, integral-LOD nearest sampling.
+  std::map<uint32_t, std::vector<SampledMip>> sampled_images;
   [[noreturn]] void fail(const std::string &what) {
     throw std::runtime_error(what);
   }
@@ -70,6 +79,8 @@ struct Interpreter {
       return 1;
     if ((t.op == 21 || t.op == 22) && !t.a.empty() && t.a[0] == 32)
       return 1;
+    if (t.op == 21 && t.a == std::vector<uint32_t>{64, 0}) return 2;
+    if (t.op == 27 && t.a.size() == 1) return 1; // closed opaque sampled-image handle
     fail("not a 32-bit scalar");
   }
   uint32_t size(uint32_t id) {
@@ -123,6 +134,22 @@ struct Interpreter {
   bool uint_type(uint32_t id) {
     const auto &t = ty(id);
     return t.op == 21 && t.a == std::vector<uint32_t>{32, 0};
+  }
+  bool unsigned_type(uint32_t id) {
+    const auto &t = ty(id);
+    return t.op == 21 && (t.a == std::vector<uint32_t>{32, 0} ||
+                         t.a == std::vector<uint32_t>{64, 0});
+  }
+  uint64_t unsigned_value(const Value &v) {
+    if (!unsigned_type(v.type) || v.words.size() != size(v.type) || !v.defined)
+      fail("not defined unsigned integer");
+    return v.words[0] | (v.words.size() == 2 ? uint64_t(v.words[1]) << 32 : 0);
+  }
+  void set_unsigned(Lane &l, uint32_t id, uint32_t type, uint64_t value, bool defined = true) {
+    if (!unsigned_type(type)) fail("unsigned result type mismatch");
+    std::vector<uint32_t> words{static_cast<uint32_t>(value)};
+    if (size(type) == 2) words.push_back(static_cast<uint32_t>(value >> 32));
+    set(l, id, type, std::move(words), defined);
   }
   void set(Lane &l, uint32_t id, uint32_t type, std::vector<uint32_t> words,
            bool defined = true) {
@@ -188,6 +215,12 @@ struct Interpreter {
         Inst i{op, {module.begin() + pc + 1, module.begin() + pc + count}};
         pc += count;
         const auto &a = i.a;
+        if (op == 11) {
+          const std::vector<uint32_t> expected{0x4c534c47u, 0x6474732eu, 0x3035342eu, 0};
+          if (glsl || a.size() != 5 || std::vector<uint32_t>(a.begin() + 1, a.end()) != expected)
+            fail("unsupported extension import");
+          glsl = a[0];
+        }
         if (op == 15 && a.size() >= 2 && a[0] == 5)
           main = a[1];
         if (op >= 19 && op <= 33 && !a.empty())
@@ -371,6 +404,57 @@ struct Interpreter {
             ty(v.type).a[0] != a[0])
           fail("extract type/index mismatch");
         set(l, a[1], a[0], {v.words[a[3]]}, v.defined);
+      } else if (op == 113) {
+        if (a.size() != 3 || !unsigned_type(a[0])) fail("unsupported UConvert");
+        const auto v = value(l, a[2]);
+        if (!unsigned_type(v.type)) fail("UConvert source type mismatch");
+        set_unsigned(l, a[1], a[0], v.defined ? unsigned_value(v) : 0, v.defined);
+      } else if (op == 12) {
+        if (a.size() < 5 || !glsl || a[2] != glsl) fail("unsupported ExtInst set");
+        const auto x = value(l, a[4]);
+        if (!uint_type(x.type) || x.words.size() != 1) fail("ExtInst operand type");
+        if (a[3] == 38 || a[3] == 41) {
+          if (a.size() != 6 || a[0] != x.type) fail("min/max type mismatch");
+          const auto y = value(l, a[5]);
+          if (y.type != x.type || y.words.size() != 1) fail("min/max operand type");
+          set(l, a[1], a[0], {a[3] == 38 ? std::min(x.words[0], y.words[0]) :
+                             std::max(x.words[0], y.words[0])}, x.defined && y.defined);
+        } else if (a[3] == 75) {
+          if (a.size() != 5 || ty(a[0]).op != 21 || ty(a[0]).a != std::vector<uint32_t>{32, 1})
+            fail("FindUMsb result type mismatch");
+          uint32_t bit = UINT32_MAX;
+          for (uint32_t n = 0; n < 32; ++n) if (x.words[0] & (uint32_t{1} << n)) bit = n;
+          set(l, a[1], a[0], {bit}, x.defined && x.words[0] != 0);
+        } else fail("unsupported live ExtInst");
+      } else if (op == 88) {
+        if (a.size() != 6 || a[4] != 2 || ty(a[0]).op != 23 || ty(a[0]).a.size() != 2 ||
+            ty(a[0]).a[1] != 4 || ty(ty(a[0]).a[0]).op != 22 ||
+            ty(ty(a[0]).a[0]).a != std::vector<uint32_t>{32})
+          fail("unsupported sampled result/profile");
+        const auto handle = value(l, a[2]), coord = value(l, a[3]), lod = value(l, a[5]);
+        if (ty(handle.type).op != 27 || ty(handle.type).a.size() != 1 ||
+            ty(ty(handle.type).a[0]).op != 25 || ty(ty(handle.type).a[0]).a.empty() ||
+            ty(ty(handle.type).a[0]).a[0] != ty(a[0]).a[0] ||
+            handle.words.size() != 1 || !handle.defined ||
+            ty(coord.type).op != 23 || ty(coord.type).a != std::vector<uint32_t>{ty(a[0]).a[0], 2} ||
+            !coord.defined || lod.type != ty(a[0]).a[0] || lod.words.size() != 1 || !lod.defined)
+          fail("sample operand type/definition");
+        const auto found = sampled_images.find(handle.words[0]);
+        if (found == sampled_images.end()) fail("missing owned sampled image");
+        uint32_t level = UINT32_MAX;
+        for (uint32_t n = 0; n < found->second.size(); ++n)
+          if (lod.words[0] == std::bit_cast<uint32_t>(static_cast<float>(n))) level = n;
+        if (level == UINT32_MAX) fail("sample LOD outside closed oracle domain");
+        const auto &mip = found->second[level];
+        uint32_t px = UINT32_MAX, py = UINT32_MAX;
+        for (uint32_t x = 0; x < mip.width; ++x)
+          if (coord.words[0] == std::bit_cast<uint32_t>((float(x) + 0.5f) / float(mip.width))) px = x;
+        for (uint32_t y = 0; y < mip.height; ++y)
+          if (coord.words[1] == std::bit_cast<uint32_t>((float(y) + 0.5f) / float(mip.height))) py = y;
+        if (px == UINT32_MAX || py == UINT32_MAX || mip.texels.size() != mip.width * mip.height)
+          fail("sample coordinate outside closed oracle domain");
+        const auto &texel = mip.texels.at(py * mip.width + px);
+        set(l, a[1], a[0], {texel.begin(), texel.end()});
       } else if (op == 83 || op == 124) {
         if (a.size() != 3)
           fail("malformed copy/bitcast");
@@ -416,18 +500,18 @@ struct Interpreter {
         if (a.size() != 4)
           fail("malformed integer instruction");
         const auto x = value(l, a[2]), y = value(l, a[3]);
-        if (!uint_type(x.type) || x.type != y.type || x.words.size() != 1 ||
-            y.words.size() != 1)
+        if (!unsigned_type(x.type) || x.type != y.type || x.words.size() != size(x.type) ||
+            y.words.size() != size(y.type))
           fail("integer operand types");
         const bool comparison = op >= 170 && op <= 178;
         if (comparison ? ty(a[0]).op != 20 : a[0] != x.type)
           fail("integer result type");
         if (!x.defined || !y.defined) {
-          set(l, a[1], a[0], {0}, false);
+          set(l, a[1], a[0], std::vector<uint32_t>(size(a[0]), 0), false);
           continue;
         }
-        const uint32_t u = x.words[0], v = y.words[0];
-        uint32_t r = 0;
+        const uint64_t u = unsigned_value(x), v = unsigned_value(y);
+        uint64_t r = 0;
         if (op == 170)
           r = u == v;
         else if (op == 171)
@@ -451,7 +535,7 @@ struct Interpreter {
             fail("division by zero");
           r = op == 134 ? u / v : u % v;
         } else if (op == 194 || op == 196) {
-          if (v >= 32)
+          if (v >= 32 * size(x.type))
             fail("poison shift");
           r = op == 194 ? u >> v : u << v;
         } else if (op == 197)
@@ -460,7 +544,8 @@ struct Interpreter {
           r = u ^ v;
         else
           r = u & v;
-        set(l, a[1], a[0], {r});
+        if (comparison) set(l, a[1], a[0], {static_cast<uint32_t>(r)});
+        else set_unsigned(l, a[1], a[0], r);
       } else if (op == 250) {
         if (a.size() < 3)
           fail("malformed BranchConditional");
@@ -508,6 +593,7 @@ struct Interpreter {
       shared.clear();
       readonly_storage.clear();
       std::map<uint32_t, bool> seen_bindings;
+      std::map<uint32_t, bool> seen_sampled_bindings;
       std::vector<Lane> lanes(count);
       for (const auto &g : globals) {
         const auto &a = g.a;
@@ -552,6 +638,22 @@ struct Interpreter {
             // Give them no initialized bytes: any actual read/write fails.
             shared[a[1]] = {t, {}, {}};
           }
+        } else if (a[2] == 0) {
+          const auto binding = bindings.find(a[1]);
+          const auto set = decorations.find({a[1], 34});
+          const auto &sampled = ty(t);
+          if (binding == bindings.end() || !sampled_images.contains(binding->second) ||
+              set == decorations.end() || set->second != std::vector<uint32_t>{0} ||
+              ty(a[0]).a[0] != 0 || sampled.op != 27 || sampled.a.size() != 1)
+            fail("unsupported sampled image ABI");
+          if (!seen_sampled_bindings.emplace(binding->second, true).second)
+            fail("duplicate sampled image binding");
+          const auto &image = ty(sampled.a[0]);
+          if (image.op != 25 || image.a.size() != 7 || ty(image.a[0]).op != 22 ||
+              ty(image.a[0]).a != std::vector<uint32_t>{32} ||
+              std::vector<uint32_t>(image.a.begin() + 1, image.a.end()) !=
+                  std::vector<uint32_t>{1, 0, 0, 0, 1, 0}) fail("unsupported sampled image type");
+          shared[a[1]] = {t, {binding->second}, {true}};
         } else if (a[2] != 1)
           fail("unsupported global storage class");
         for (uint32_t lane = 0; lane < count; ++lane) {
@@ -580,6 +682,8 @@ struct Interpreter {
         fail("missing live storage sink");
       if (seen_bindings.size() != buffers.size())
         fail("missing supplied storage binding");
+      if (seen_sampled_bindings.size() != sampled_images.size())
+        fail("missing supplied sampled image binding");
       // The first function label is kept in the instruction stream, including
       // any Phi.
       for (auto &l : lanes)

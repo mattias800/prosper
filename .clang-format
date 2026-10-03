@@ -1,0 +1,33 @@
+# prosper C++ format. Enforced on CHANGED LINES ONLY (prosper/tools/ci/check_cpp_lint.py):
+# never reformat a file you are not otherwise changing, and never run clang-format over a whole file.
+#
+# Derived from the tree on 2026-10-02 (543 tracked .cpp/.hpp/.h under prosper/src and
+# prosper/frontends, 258,100 lines): 4-space indent, no tabs; `T* x` over `T *x` 5,572 to 88; braces
+# attached; `case` indented under `switch`; access specifiers at the class's own column; namespace
+# bodies not indented (502 of 510); 3 spaces before a trailing `//`; one-line `if` bodies (7,987).
+# The candidate that best matched rewrites ~30% of lines if applied to the whole tree, and no
+# setting gets that much lower: the dominant cost is hand-packed lines carrying several statements,
+# which clang-format by design splits. That is why the gate is changed-lines only.
+BasedOnStyle: LLVM
+IndentWidth: 4
+# 95% of lines fit in 100 and the overflow is mostly 101-105; 120 churned less but would let new
+# code drift wider than the tree's own convention.
+ColumnLimit: 100
+AccessModifierOffset: -4
+IndentCaseLabels: true
+PointerAlignment: Left
+NamespaceIndentation: None
+FixNamespaceComments: true
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortBlocksOnASingleLine: Always
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: Inline
+AlwaysBreakTemplateDeclarations: Yes
+SpacesBeforeTrailingComments: 3
+AlignTrailingComments:
+  Kind: Leave
+# Comments here are hand-wrapped prose with issue citations; reflowing them is pure churn.
+ReflowComments: false
+# Include order is often deliberate (platform shims before the headers they patch).
+SortIncludes: Never
