@@ -12,4 +12,4 @@ struct FenceBuildRecord {
 void fence_build_journal_record(uint64_t pkt, uint64_t addr, uint64_t t_ms, uint32_t fold);
 // False leaves out untouched, including on collisions and unavailable samples.
 bool fence_build_journal_lookup(uint64_t pkt, FenceBuildRecord& out);
-}
+}   // namespace prosper::gpu

@@ -23,7 +23,7 @@ Journal& journal() {
 Slot& slot_for(uint64_t pkt) {
     return journal()[static_cast<uint32_t>((pkt >> 2) * 2654435761u) & (journal_size - 1)];
 }
-}
+}   // namespace
 void fence_build_journal_record(uint64_t pkt, uint64_t addr, uint64_t t_ms, uint32_t fold) {
     if (!pkt) return;
     Slot& slot = slot_for(pkt);
@@ -45,4 +45,4 @@ bool fence_build_journal_lookup(uint64_t pkt, FenceBuildRecord& out) {
     out = slot.record;
     return true;
 }
-}
+}   // namespace prosper::gpu
