@@ -54,8 +54,16 @@ std::vector<std::vector<uint32_t>> recorded_words() {
     return result;
 }
 
-bool register_compute(const uint32_t* words, size_t dwords, AgcShaderHeader& header,
-                      ShaderReg (&registers)[2]) {
+// The constructor relocates small SDK pointers from the pointer field. A contiguous retained
+// blob works in low-address non-PIE executables as well as high-address hosts.
+struct ComputeShaderBlob {
+    AgcShaderHeader header;
+    ShaderReg registers[2];
+};
+
+bool register_compute(const uint32_t* words, size_t dwords, ComputeShaderBlob& blob) {
+    auto& header = blob.header;
+    auto& registers = blob.registers;
     prosper::register_agc_hle();
     const auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
     if (!create_shader) return false;
@@ -64,7 +72,8 @@ bool register_compute(const uint32_t* words, size_t dwords, AgcShaderHeader& hea
     header = {};
     header.file_header = 0x34333231u;
     header.version = 0x18;
-    header.sh_registers = registers;
+    header.sh_registers = reinterpret_cast<const void*>(
+        reinterpret_cast<uintptr_t>(registers) - reinterpret_cast<uintptr_t>(&header.sh_registers));
     header.shader_size = static_cast<uint32_t>(dwords * sizeof(uint32_t));
     header.num_sh_registers = 2;
     void* registered = nullptr;
@@ -130,11 +139,17 @@ TEST_F(RefusedShaderProducer, ComputeRewriteKeepsFullOriginalAndWarmWorkBounded)
         0xbf060000u, 0xbf840002u, 0xbf8a0000u, 0x7e040282u,
         0x7e040281u, 0xbf810000u, 0x11223344u, 0x55667788u,
     };
-    static AgcShaderHeader header;
-    static ShaderReg registers[2];
+    static ComputeShaderBlob blob;
     code[3] = 0x7e040282u;
-    ASSERT_TRUE(register_compute(code, std::size(code), header, registers));
-    const auto state = compute_state(registers, 65);
+    ASSERT_TRUE(register_compute(code, std::size(code), blob));
+    ASSERT_EQ(blob.header.sh_registers, blob.registers);
+    ASSERT_EQ(blob.header.code, code);
+    ASSERT_EQ(prosper_agc_shader_header_for_code(reinterpret_cast<uint64_t>(code)), &blob.header);
+    ASSERT_EQ(blob.registers[0].value,
+              static_cast<uint32_t>(reinterpret_cast<uint64_t>(code) >> 8));
+    ASSERT_EQ(blob.registers[1].value,
+              static_cast<uint32_t>((reinterpret_cast<uint64_t>(code) >> 40) & 0xffu));
+    const auto state = compute_state(blob.registers, 65);
     const auto address = reinterpret_cast<uint64_t>(code);
     const std::vector<uint32_t> before(std::begin(code), std::end(code));
     expect_compute_refusal(state, address);
@@ -160,11 +175,18 @@ TEST_F(RefusedShaderProducer, ComputeRewriteKeepsFullOriginalAndWarmWorkBounded)
 
 TEST_F(RefusedShaderProducer, SuccessfulComputeCreatesNoRefusalEvidence) {
     alignas(256) static const uint32_t code[] = {0x7e000280u, 0xbf810000u};
-    static AgcShaderHeader header;
-    static ShaderReg registers[2];
-    ASSERT_TRUE(register_compute(code, std::size(code), header, registers));
+    static ComputeShaderBlob blob;
+    ASSERT_TRUE(register_compute(code, std::size(code), blob));
+    ASSERT_EQ(blob.header.sh_registers, blob.registers);
+    ASSERT_EQ(blob.header.code, code);
+    ASSERT_EQ(prosper_agc_shader_header_for_code(reinterpret_cast<uint64_t>(code)), &blob.header);
+    ASSERT_EQ(blob.registers[0].value,
+              static_cast<uint32_t>(reinterpret_cast<uint64_t>(code) >> 8));
+    ASSERT_EQ(blob.registers[1].value,
+              static_cast<uint32_t>((reinterpret_cast<uint64_t>(code) >> 40) & 0xffu));
     std::vector<OperationRealizationFailure> failures;
-    const auto items = realize_compute_dispatches(compute_state(registers, 64), 4292, &failures);
+    const auto items =
+        realize_compute_dispatches(compute_state(blob.registers, 64), 4292, &failures);
     EXPECT_TRUE(failures.empty());
     ASSERT_EQ(items.size(), 1u);
     EXPECT_FALSE(items[0].spirv.empty());
