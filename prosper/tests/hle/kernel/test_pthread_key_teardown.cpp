@@ -9,11 +9,11 @@
 // reinstalled non-NULL value refires; exactly 4 passes). The cases are written
 // against prosper's scePthread* handlers, not taken from any test suite.
 //
-// WHY THIS PINS prosper: h_key_create hands the guest the raw host key and,
+// WHY THIS PINS prosper: k_key_create hands the guest the raw host key and,
 // on Windows, a generated thunk that discards winpthreads' spurious NULL
 // call and arms the scePthreadExit escape. So the guest-visible teardown is
-// the host's teardown plus the thunk — and the host's differs from FreeBSD
-// in two measured ways (below). A teardown change that drops a destructor
+// the host's teardown plus the thunk — and on Windows the host's differs
+// from FreeBSD in at least one confirmed way (M1 below). A teardown change that drops a destructor
 // leaks guest per-thread state; one that adds a call corrupts it.
 //
 // WINDOWS (MinGW winpthreads):
