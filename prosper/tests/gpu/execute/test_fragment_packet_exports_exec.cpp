@@ -190,6 +190,9 @@ TEST(FragmentPacketExportExecution, NumericSaveexecPreservesOldWordsAndNewSccAcr
                 const auto& output = actual.result.architectural_exports[wave][lane];
                 EXPECT_EQ(output.colors[0][0].has_value(), f::active(lane));
                 if (f::active(lane)) {
+                    ASSERT_TRUE(output.colors[0][0].has_value());
+                    ASSERT_TRUE(output.colors[0][1].has_value());
+                    ASSERT_TRUE(output.colors[0][2].has_value());
                     EXPECT_EQ(output.colors[0][1]->bits, 0x80000001u);
                     EXPECT_EQ(output.colors[0][2]->bits, 0x80000101u);
                     EXPECT_EQ(output.colors[0][0]->bits,
