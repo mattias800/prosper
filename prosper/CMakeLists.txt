@@ -3452,6 +3452,13 @@ endif()
   target_link_libraries(test_initfault_dump PRIVATE prosper_core)
   add_test(NAME initfault_dump_survives COMMAND test_initfault_dump)
 
+  if(WIN32)
+    prosper_add_gtest(test_win_recovery
+      SOURCES tests/host/image/test_win_recovery.cpp tests/host/image/win_recovery_witness.cpp
+      LIBRARIES prosper_core
+      PROPERTIES TIMEOUT 15)
+  endif()
+
   # Generated guest->host import boundary: preserve all register args, stack args 7-9, return value,
   # and ABI stack alignment. Windows exercises SysV->Microsoft-x64; Linux also drives the FS-swap path.
   add_executable(test_hle_stack_args tests/host/image/test_hle_stack_args.cpp)
