@@ -93,4 +93,9 @@ std::unordered_map<uint64_t, ReflectMemoEntry>& CallbackThreadState::reflect_mem
     return value;
 }
 
+SingleFramebufferSubmitFrame& CallbackThreadState::single_framebuffer_submit_frame() {
+    static thread_local auto& value = single_framebuffer_submit_frame_.emplace();
+    return value;
+}
+
 } // namespace prosper::frontend::submit_renderer

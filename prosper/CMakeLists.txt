@@ -2408,6 +2408,7 @@ if(TARGET prosper_core)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     prosper_add_gtest(test_ordered_render_finality
       SOURCES tests/gpu/execute/test_ordered_render_finality.cpp
+      INCLUDES frontends
       LIBRARIES prosper_core)
   endif()
 

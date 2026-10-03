@@ -6,6 +6,7 @@
 #include "gpu/present/videoout_present.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "shared/present/single_framebuffer_submit_policy.hpp"
 
 #include <gtest/gtest.h>
 
@@ -103,8 +104,9 @@ protected:
         });
         set_graphics_deferred_wait_for_test(0);
         present_reset();
-        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t w, uint32_t h) {
             Observation observed{live_render_phase(), {}, {}};
+            single_frame_.begin_span(observed.phase.first_span, observed.phase.source_submit, w, h);
             for (const auto& item : items) {
                 observed.draws.push_back(item.draw_index);
                 const auto* child =
@@ -121,15 +123,31 @@ protected:
             events_.push_back(observed.phase.final_span ? 'F' : 'R');
             observations_.push_back(std::move(observed));
             if (mutate_after_first_ && observations_.size() == 1u) *child_word() = 0x3f400000u;
-            return live_render_phase().final_span
-                       ? RenderedFrame(std::vector<uint8_t>{1, 2, 3, 255})
-                       : RenderedFrame{};
+            prosper::frontend::PixelSourceCandidate current;
+            if (!items.empty()) {
+                // Only an actual nonempty producer supplies pixels. The empty terminal cannot
+                // fabricate its own frame; it must recover this exact immutable owner and source.
+                const auto value = static_cast<uint8_t>(items.back().draw_index + 1u);
+                current = {std::make_shared<const std::vector<uint8_t>>(
+                               std::initializer_list<uint8_t>{value, 2, 3, 255}),
+                           live_render_phase().source_submit};
+                produced_pixels_.push_back(current.pixels);
+            }
+            auto selected = single_frame_.select(live_render_phase().final_span, !items.empty(),
+                                                 std::move(current));
+            if (selected.pixels) {
+                selected_pixels_ = selected.pixels;
+                selected_source_ = selected.source_submit;
+            }
+            RenderedFrame frame(std::move(selected.pixels));
+            frame.source_submit = selected.source_submit;
+            return frame;
         });
         set_submit_compute([&](const std::vector<ComputeItem>& items) {
             EXPECT_EQ(items.size(), 1u);
             ++compute_calls_;
             events_.push_back('C');
-            return true;
+            return compute_succeeds_;
         });
     }
 
@@ -184,6 +202,14 @@ protected:
         }
         EXPECT_FALSE(pending_);
         EXPECT_FALSE(live_render_phase().defer_batch_completion);
+        ASSERT_FALSE(produced_pixels_.empty());
+        EXPECT_EQ(selected_pixels_, produced_pixels_.back());
+        EXPECT_EQ(selected_source_, submit_);
+        EXPECT_EQ(present_frame_seq(), 1u) << "only the actual final callback publishes";
+        PresentFrameLease published;
+        ASSERT_TRUE(present_acquire_rendered_frame(published));
+        EXPECT_EQ(published.rgba, produced_pixels_.back());
+        EXPECT_EQ(*published.rgba, (std::vector<uint8_t>{2, 2, 3, 255}));
     }
 
     uint32_t* child_word() const { return reinterpret_cast<uint32_t*>(guest_ + 0x1000u + 28u); }
@@ -198,9 +224,14 @@ protected:
     static constexpr uint64_t submit_ = 4280u;
     uint64_t guest_ = 0, physical_ = 0;
     bool allocated_ = false, pending_ = false, mutate_after_first_ = false;
+    bool compute_succeeds_ = true;
     size_t compute_calls_ = 0;
     std::vector<Observation> observations_;
     std::vector<char> events_;
+    prosper::frontend::SingleFramebufferSubmitFrame single_frame_;
+    std::vector<std::shared_ptr<const std::vector<uint8_t>>> produced_pixels_;
+    std::shared_ptr<const std::vector<uint8_t>> selected_pixels_;
+    uint64_t selected_source_ = 0;
 };
 
 TEST_F(OrderedRenderFinality, AdjacentSnapshotDrawsFinalizeTheSecondDraw) {
@@ -281,6 +312,28 @@ TEST_F(OrderedRenderFinality, RefusedDispatchTailStillFinalizesEarlierDraws) {
     EXPECT_EQ(compute_calls_, 0u);
 }
 
+TEST_F(OrderedRenderFinality, DeclinedDeferredDispatchStillRetiresBeforeFinalPublication) {
+    auto state = two_draws();
+    GpuState::Dispatch dispatch;
+    dispatch.threads_x = dispatch.threads_y = dispatch.threads_z = 1;
+    dispatch.command_order = 300;
+    state.dispatches.push_back(dispatch);
+    compute_succeeds_ = false;
+    set_graphics_deferred_wait_for_test(1);
+    execute(state);
+    ASSERT_EQ(observations_.size(), 3u);
+    EXPECT_TRUE(observations_[1].phase.defer_batch_completion);
+    EXPECT_TRUE(observations_[2].draws.empty());
+    EXPECT_EQ(compute_calls_, 1u);
+    const auto compute = std::find(events_.begin(), events_.end(), 'C');
+    ASSERT_NE(compute, events_.end());
+    const auto retired = std::find(compute + 1, events_.end(), 'T');
+    const auto final = std::find(events_.begin(), events_.end(), 'F');
+    ASSERT_NE(retired, events_.end());
+    ASSERT_NE(final, events_.end());
+    EXPECT_LT(retired, final);
+}
+
 TEST_F(OrderedRenderFinality, DmaTailRetainsAuthoritativeReadbackBeforeFinalizing) {
     auto state = two_draws();
     uint32_t source = 0x4280u, destination = 0;
@@ -300,5 +353,51 @@ TEST_F(OrderedRenderFinality, NoSuccessfulDrawDoesNotPublishAnEmptyFinalCallback
     EXPECT_FALSE(execute_ordered_and_present(state, 1, 1, submit_, true));
     EXPECT_TRUE(observations_.empty());
     EXPECT_FALSE(present_has_frame());
+}
+
+TEST(SingleFramebufferSubmitFrame, FinalConsumesExactProducerOnce) {
+    prosper::frontend::SingleFramebufferSubmitFrame frame;
+    const auto pixels = std::make_shared<const std::vector<uint8_t>>(8u, 42u);
+    frame.begin_span(true, 4280u, 2u, 1u);
+    EXPECT_FALSE(frame.select(false, true, {pixels, 4280u}).pixels);
+    frame.begin_span(false, 4280u, 2u, 1u);
+    const auto selected = frame.select(true, false, {});
+    EXPECT_EQ(selected.pixels, pixels);
+    EXPECT_EQ(selected.source_submit, 4280u);
+    EXPECT_FALSE(frame.select(true, false, {}).pixels);
+}
+
+TEST(SingleFramebufferSubmitFrame, NewFirstDropsAbandonedPriorSubmit) {
+    prosper::frontend::SingleFramebufferSubmitFrame frame;
+    const auto pixels = std::make_shared<const std::vector<uint8_t>>(4u, 42u);
+    frame.begin_span(true, 4280u, 1u, 1u);
+    frame.select(false, true, {pixels, 4280u});
+    frame.begin_span(true, 4281u, 1u, 1u);   // also reached before render-window early returns
+    EXPECT_FALSE(frame.select(true, false, {}).pixels);
+}
+
+TEST(SingleFramebufferSubmitFrame, BufferedFinalOwnPixelsReplaceEarlierSpan) {
+    prosper::frontend::SingleFramebufferSubmitFrame frame;
+    const auto earlier = std::make_shared<const std::vector<uint8_t>>(4u, 42u);
+    const auto final = std::make_shared<const std::vector<uint8_t>>(4u, 43u);
+    frame.begin_span(true, 4280u, 1u, 1u);
+    frame.select(false, true, {earlier, 4280u});
+    frame.begin_span(false, 4280u, 1u, 1u);
+    EXPECT_EQ(frame.select(true, true, {final, 4280u}).pixels, final);
+}
+
+TEST(SingleFramebufferSubmitFrame, RefusesMismatchedExtentSourceAndEmptyProducer) {
+    prosper::frontend::SingleFramebufferSubmitFrame frame;
+    const auto pixels = std::make_shared<const std::vector<uint8_t>>(8u, 42u);
+    frame.begin_span(true, 4280u, 2u, 1u);
+    frame.select(false, true, {pixels, 4280u});
+    frame.begin_span(false, 4280u, 1u, 2u);   // equal byte count is not the same image extent
+    EXPECT_FALSE(frame.select(true, false, {}).pixels);
+    frame.begin_span(true, 4280u, 2u, 1u);
+    EXPECT_FALSE(frame.select(true, true, {pixels, 4281u}).pixels);
+    frame.begin_span(true, 4280u, 1u, 1u);
+    EXPECT_FALSE(frame.select(true, true, {pixels, 4280u}).pixels);
+    frame.begin_span(true, 4280u, 2u, 1u);
+    EXPECT_FALSE(frame.select(true, false, {pixels, 4280u}).pixels);
 }
 }   // namespace
