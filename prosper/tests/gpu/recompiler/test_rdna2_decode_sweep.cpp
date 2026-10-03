@@ -1516,3 +1516,268 @@ TEST(Rdna2DecodeSweep, Vop3pLiteralInAnySourceSlotAddsADword) {
     EXPECT_EQ(rdna2_decode_one(cut, 2).len_dwords, 2u);
     EXPECT_FALSE(rdna2_decode_one(cut, 2).has_literal);
 }
+
+// ---- Register-footprint helpers --------------------------------------------------------------
+// rdna2_vgpr_write_count / rdna2_vgpr_destination_span / rdna2_tfe_status_vgpr /
+// rdna2_vgpr_source_span feed control-flow analyses and register-file sizing. Under-reporting a
+// write is silent (a proof then reasons about a stale register), so these are checked against the
+// architectural result width of each opcode, taken from the gfx10 encoding tables.
+
+namespace {
+Rdna2Inst mubuf(uint32_t op, uint32_t vdata = 8u, uint32_t extra1 = 0u) {
+    return decode(kTop6Mubuf | (op << 18), (vdata << 8) | extra1);
+}
+Rdna2Inst flat(uint32_t op, uint32_t vdst = 8u) {
+    return decode(kTop6Flat | (op << 18), (vdst << 24) | (vdst << 8) | (125u << 16));
+}
+Rdna2Inst mtbuf(uint32_t op, uint32_t vdata = 8u, bool tfe = false) {
+    return decode(kTop6Mtbuf | ((op & 7u) << 16),
+                  (vdata << 8) | (((op >> 3) & 1u) << 21) | (tfe ? (1u << 23) : 0u));
+}
+Rdna2Inst mimg(uint32_t op, uint32_t dmask, uint32_t d1 = 0u, uint32_t extra0 = 0u) {
+    return decode(kMimg | ((op >> 7) & 1u) | ((op & 0x7Fu) << 18) | (dmask << 8) | extra0,
+                  (8u << 8) | d1);
+}
+}  // namespace
+
+TEST(Rdna2DecodeSweep, WriteCountIsZeroWhenTheDestinationIsNotAVgpr) {
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(0x80000000u | (4u << 16) | (2u << 8) | 1u)), 0u);  // SOP2
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(0xBE800000u | (4u << 16) | (3u << 8) | 1u)), 0u);  // SOP1
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(0x7C000000u | (0xC4u << 17) | (1u << 9) | 0x100u)), 0u);
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(kTop6Exp, 0x04030201u)), 0u);
+    EXPECT_EQ(rdna2_vgpr_write_count(Rdna2Inst{}), 0u);
+}
+
+TEST(Rdna2DecodeSweep, WriteCountForValuAndInterpolation) {
+    // v_readfirstlane_b32 (VOP1 0x02) writes an SGPR even though its decoded dst looks like a VGPR.
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(0x7E000000u | (3u << 17) | (0x02u << 9) | 0x100u)), 0u);
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(0x7E000000u | (3u << 17) | (0x01u << 9) | 0x100u)), 1u);
+    EXPECT_EQ(rdna2_vgpr_write_count(decode((0x03u << 25) | (3u << 17) | (1u << 9) | 0x100u)), 1u);
+    EXPECT_EQ(rdna2_vgpr_write_count(Vop3p{.op = 0x0F}.decoded()), 1u);
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(kTop6Vintrp | (5u << 18))), 1u);
+}
+
+TEST(Rdna2DecodeSweep, WriteCountForVop3WideAndScalarResults) {
+    const auto count = [](uint32_t op) {
+        return rdna2_vgpr_write_count(decode(vop3_w0(op, 4u), vop3_srcs(256, 257, 258)));
+    };
+    EXPECT_EQ(count(kVop3Fma), 1u);
+    EXPECT_EQ(count(0x360u), 0u) << "v_readlane_b32 writes an SGPR";
+    for (uint32_t op : {0x16Eu, 0x176u, 0x177u, kVop3OpcodeLshlrevB64, kVop3OpcodeLshrrevB64}) {
+        EXPECT_EQ(count(op), 2u) << "64-bit result pair, op=" << op;
+    }
+}
+
+TEST(Rdna2DecodeSweep, WriteCountForMubufMatchesTheArchitecturalResultWidth) {
+    // gfx10 numbering: format loads 0..3 (x..xyzw), format stores 4..7, ubyte..sshort 8..11, dword 12,
+    // dwordx2 13, dwordx4 14, dwordx3 15 (x3 FOLLOWS x4), raw stores 0x1C..0x1F.
+    for (uint32_t op = 0; op <= 3; ++op) EXPECT_EQ(rdna2_vgpr_write_count(mubuf(op)), op + 1) << op;
+    for (uint32_t op = 4; op <= 7; ++op) EXPECT_EQ(rdna2_vgpr_write_count(mubuf(op)), 0u) << op;
+    for (uint32_t op = 8; op <= 0xC; ++op) EXPECT_EQ(rdna2_vgpr_write_count(mubuf(op)), 1u) << op;
+    EXPECT_EQ(rdna2_vgpr_write_count(mubuf(0x0D)), 2u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mubuf(0x0E)), 4u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mubuf(0x0F)), 3u);
+    for (uint32_t op = 0x1C; op <= 0x1F; ++op) EXPECT_EQ(rdna2_vgpr_write_count(mubuf(op)), 0u) << op;
+    EXPECT_EQ(rdna2_vgpr_write_count(mubuf(kMubufOpcodeAtomicSwapX2)), 2u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mubuf(kMubufOpcodeAtomicOrX2)), 2u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mubuf(kMubufOpcodeAtomicAdd)), 1u);
+}
+
+TEST(Rdna2DecodeSweep, WriteCountForMubufD16FormatLoadsPacksHalves) {
+    // D16 format loads pack two 16-bit components per dword: x and xy fit one, xyz and xyzw need two.
+    // Opcodes 0x80..0x83 = buffer_load_format_d16_x / _xy / _xyz / _xyzw.
+    EXPECT_EQ(rdna2_vgpr_write_count(mubuf(0x80)), 1u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mubuf(0x81)), 1u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mubuf(0x82)), 2u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mubuf(0x83)), 2u);
+}
+
+TEST(Rdna2DecodeSweep, WriteCountForMubufD16FormatStoresIsZero) {
+    // buffer_store_format_d16_x .. _xyzw (0x84..0x87) read VDATA like the 0x04..0x07 format stores.
+    for (uint32_t op = 0x84; op <= 0x87; ++op) {
+        EXPECT_EQ(rdna2_vgpr_write_count(mubuf(op)), 0u) << op;
+    }
+    const uint32_t span[] = {1, 1, 2, 2};
+    for (uint32_t k = 0; k < 4; ++k) {
+        EXPECT_EQ(rdna2_vgpr_destination_span(mubuf(0x84 + k)), span[k]) << "op=" << (0x84 + k);
+    }
+}
+
+TEST(Rdna2DecodeSweep, WriteCountForMtbufLoadsAndPackedD16Loads) {
+    for (uint32_t op = 0; op <= 3; ++op) EXPECT_EQ(rdna2_vgpr_write_count(mtbuf(op)), op + 1) << op;
+    for (uint32_t op = 4; op <= 7; ++op) EXPECT_EQ(rdna2_vgpr_write_count(mtbuf(op)), 0u) << op;
+    // Packed D16 loads (8..11) hold two components per dword; D16 stores (12..15) read VDATA.
+    const uint32_t d16[] = {1, 1, 2, 2};
+    for (uint32_t k = 0; k < 4; ++k) {
+        EXPECT_EQ(rdna2_vgpr_write_count(mtbuf(8 + k)), d16[k]) << "op=" << (8 + k);
+        EXPECT_EQ(rdna2_vgpr_write_count(mtbuf(12 + k)), 0u) << "op=" << (12 + k);
+    }
+}
+
+TEST(Rdna2DecodeSweep, WriteCountForFlatLoadsAndStores) {
+    for (uint32_t op = 8; op <= 0xC; ++op) EXPECT_EQ(rdna2_vgpr_write_count(flat(op)), 1u) << op;
+    EXPECT_EQ(rdna2_vgpr_write_count(flat(0x0D)), 2u);
+    EXPECT_EQ(rdna2_vgpr_write_count(flat(0x0E)), 4u);
+    EXPECT_EQ(rdna2_vgpr_write_count(flat(0x0F)), 3u);
+    for (uint32_t op = 0x18; op <= 0x1F; ++op) EXPECT_EQ(rdna2_vgpr_write_count(flat(op)), 0u) << op;
+}
+
+TEST(Rdna2DecodeSweep, WriteCountForDsResultOpcodes) {
+    // The DS opcodes whose VDST is a result: (opcode, dwords). Everything else here is a store or a
+    // no-return atomic whose VDST field is a source.
+    struct Row { uint32_t op; uint32_t dwords; };
+    const Row rows[] = {
+        {0x20, 1}, {0x2D, 1}, {0x35, 1}, {0x36, 1}, {0x3D, 1}, {0x3E, 1}, {0xB1, 1}, {0xB3, 1},
+        {0x37, 2}, {0x38, 2}, {0x76, 2}, {0xFE, 3}, {0x77, 4}, {0xFF, 4},
+    };
+    for (const Row& r : rows) {
+        EXPECT_EQ(rdna2_vgpr_write_count(decode(kTop6Ds | (r.op << 18), 4u << 24)), r.dwords)
+            << "op=" << r.op;
+    }
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(kTop6Ds | (0x0Du << 18), 4u << 24)), 0u)
+        << "ds_write_b32 stores";
+}
+
+TEST(Rdna2DecodeSweep, WriteCountForMimgFollowsDmaskAndD16) {
+    EXPECT_EQ(rdna2_vgpr_write_count(mimg(0x00, 0x8)), 1u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mimg(0x00, 0x5)), 2u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mimg(0x00, 0x7)), 3u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mimg(0x00, 0xF)), 4u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mimg(0x00, 0x0)), 4u) << "an empty mask is accounted conservatively";
+    // D16 packs two components per dword, rounded up.
+    EXPECT_EQ(rdna2_vgpr_write_count(mimg(0x00, 0xF, 1u << 31)), 2u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mimg(0x00, 0x7, 1u << 31)), 2u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mimg(0x00, 0x1, 1u << 31)), 1u);
+    // IMAGE_STORE / IMAGE_STORE_MIP read VDATA.
+    EXPECT_EQ(rdna2_vgpr_write_count(mimg(0x08, 0xF)), 0u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mimg(0x09, 0xF)), 0u);
+}
+
+TEST(Rdna2DecodeSweep, WriteCountForMimgGather4IsAlwaysFourTexelsWhateverTheDmask) {
+    // IMAGE_GATHER4 selects ONE component through DMASK and returns that component of four texels, so
+    // the result is four dwords (v[64:67] under dmask:0x1 in the gfx10 assembler tables). The whole
+    // gather4 family occupies 0x40..0x5F: base, _cl, _l, _b, _b_cl, _lz, then each with _c and _o.
+    for (uint32_t op = 0x40; op <= 0x5F; ++op) {
+        for (uint32_t dmask : {0x1u, 0x2u, 0x4u, 0x8u}) {
+            EXPECT_EQ(rdna2_vgpr_write_count(mimg(op, dmask)), 4u) << "op=" << op << " dmask=" << dmask;
+        }
+    }
+    // D16 halves the footprint to two dwords.
+    EXPECT_EQ(rdna2_vgpr_write_count(mimg(0x47, 0x1, 1u << 31)), 2u);
+    // Neighbours of the family keep the dmask rule.
+    EXPECT_EQ(rdna2_vgpr_write_count(mimg(0x3F, 0x1)), 1u);
+    EXPECT_EQ(rdna2_vgpr_write_count(mimg(0x60, 0x1)), 1u);
+}
+
+TEST(Rdna2DecodeSweep, TfeStatusVgprFollowsTheDataRegisters) {
+    // With TFE the fault/status dword is appended after the data results.
+    EXPECT_EQ(rdna2_tfe_status_vgpr(mubuf(0x0C, 8u, 1u << 23)), 9);    // dword -> status at v9
+    EXPECT_EQ(rdna2_tfe_status_vgpr(mubuf(0x0E, 8u, 1u << 23)), 12);   // dwordx4 -> v12
+    EXPECT_EQ(rdna2_tfe_status_vgpr(mubuf(0x0C, 8u, 0u)), -1) << "no TFE, no status register";
+    EXPECT_EQ(rdna2_tfe_status_vgpr(mubuf(0x1C, 8u, 1u << 23)), -1) << "a store has no data result";
+    EXPECT_EQ(rdna2_tfe_status_vgpr(mimg(0x00, 0x7, 0u, 1u << 16)), 11);   // 3 comps from v8
+    EXPECT_EQ(rdna2_tfe_status_vgpr(mimg(0x00, 0x7, 0u, 0u)), -1);
+    EXPECT_EQ(rdna2_tfe_status_vgpr(mtbuf(1, 8u, true)), 10);          // x,y -> v10
+    EXPECT_EQ(rdna2_tfe_status_vgpr(mtbuf(1, 8u, false)), -1);
+    EXPECT_EQ(rdna2_tfe_status_vgpr(Rdna2Inst{}), -1);
+    EXPECT_EQ(rdna2_tfe_status_vgpr(decode(0x7E000000u | (3u << 17) | (1u << 9) | 0x100u)), -1);
+}
+
+TEST(Rdna2DecodeSweep, TfeStatusAfterAGather4CountsAllFourTexels) {
+    EXPECT_EQ(rdna2_tfe_status_vgpr(mimg(0x47, 0x1, 0u, 1u << 16)), 12);
+    EXPECT_EQ(rdna2_tfe_status_vgpr(mimg(0x48, 0x2, 0u, 1u << 16)), 12);
+}
+
+TEST(Rdna2DecodeSweep, DestinationSpanCoversStoreSourcesAndTfeStatus) {
+    // Loads: span = data width. Stores read VDATA, so their footprint is the data width too.
+    EXPECT_EQ(rdna2_vgpr_destination_span(mubuf(0x0E)), 4u);
+    EXPECT_EQ(rdna2_vgpr_destination_span(mubuf(0x1C)), 1u);
+    EXPECT_EQ(rdna2_vgpr_destination_span(mubuf(0x1D)), 2u);
+    EXPECT_EQ(rdna2_vgpr_destination_span(mubuf(0x1E)), 4u);
+    EXPECT_EQ(rdna2_vgpr_destination_span(mubuf(0x1F)), 3u);
+    for (uint32_t op = 4; op <= 7; ++op) EXPECT_EQ(rdna2_vgpr_destination_span(mubuf(op)), op - 3u) << op;
+    EXPECT_EQ(rdna2_vgpr_destination_span(flat(0x1C)), 1u);
+    EXPECT_EQ(rdna2_vgpr_destination_span(flat(0x1D)), 2u);
+    EXPECT_EQ(rdna2_vgpr_destination_span(flat(0x1E)), 4u);
+    EXPECT_EQ(rdna2_vgpr_destination_span(flat(0x1F)), 3u);
+    EXPECT_EQ(rdna2_vgpr_destination_span(mimg(0x08, 0x7)), 3u);
+    // TFE extends the span to include the status register.
+    EXPECT_EQ(rdna2_vgpr_destination_span(mubuf(0x0E, 8u, 1u << 23)), 5u);
+    EXPECT_EQ(rdna2_vgpr_destination_span(mimg(0x00, 0x3, 0u, 1u << 16)), 3u);
+    EXPECT_EQ(rdna2_vgpr_destination_span(mtbuf(2, 8u, true)), 4u);
+    EXPECT_EQ(rdna2_vgpr_destination_span(Rdna2Inst{}), 0u);
+}
+
+TEST(Rdna2DecodeSweep, SourceSpanIsOneDwordExceptTheWideCases) {
+    const Rdna2Inst add = decode((0x03u << 25) | (3u << 17) | (4u << 9) | (256u + 2u));
+    EXPECT_EQ(rdna2_vgpr_source_span(add, 0), 1u);
+    EXPECT_EQ(rdna2_vgpr_source_span(add, 1), 1u);
+    EXPECT_EQ(rdna2_vgpr_source_span(add, 2), 0u) << "past n_src";
+    EXPECT_EQ(rdna2_vgpr_source_span(add, 99), 0u);
+    // A source that is not a VGPR spans nothing.
+    const Rdna2Inst scalar = decode((0x03u << 25) | (3u << 17) | (4u << 9) | 5u);
+    EXPECT_EQ(rdna2_vgpr_source_span(scalar, 0), 0u);
+    EXPECT_EQ(rdna2_vgpr_source_span(scalar, 1), 1u);
+    // v_lshrrev_b64: the shift count is one dword, the value operand is a register PAIR.
+    const Rdna2Inst shr = decode(vop3_w0(kVop3OpcodeLshrrevB64, 4u), vop3_srcs(256, 258, 0xC0u));
+    EXPECT_EQ(rdna2_vgpr_source_span(shr, 0), 1u);
+    EXPECT_EQ(rdna2_vgpr_source_span(shr, 1), 2u);
+    // DS sources are a conservative four-dword range: read/write2 and wide packets encode a base only.
+    const Rdna2Inst ds = decode(kTop6Ds | (0x0Du << 18), 1u | (2u << 8));
+    EXPECT_EQ(rdna2_vgpr_source_span(ds, 0), 4u);
+    EXPECT_EQ(rdna2_vgpr_source_span(ds, 1), 4u);
+}
+
+// ---- rdna2_sload_required_bytes --------------------------------------------------------------
+// s_load_dword[xN] with a pointer-backed SBASE pair and an immediate offset (SOFFSET = NULL, 125).
+
+namespace {
+constexpr uint32_t smem_w0(uint32_t op, uint32_t sdata, uint32_t sbase_pair) {
+    return kTop6Smem | (op << 18) | (sdata << 6) | sbase_pair;
+}
+constexpr uint32_t smem_w1(uint32_t off, uint32_t soffset = 125u) { return off | (soffset << 25); }
+constexpr uint32_t kEnd = 0xBF810000u;
+}  // namespace
+
+TEST(Rdna2DecodeSweep, SloadRequiredBytesIsTheHighestImmediateReach) {
+    // SBASE pair index 2 = s[4:5]. dword (4 B), x2 (8), x4 (16), x8 (32), x16 (64).
+    const uint32_t widths[] = {4, 8, 16, 32, 64};
+    for (uint32_t op = 0; op <= 4; ++op) {
+        const uint32_t code[] = {smem_w0(op, 0, 2), smem_w1(0x20), kEnd};
+        EXPECT_EQ(rdna2_sload_required_bytes(code, 3, 4), 0x20u + widths[op]) << "op=" << op;
+    }
+}
+
+TEST(Rdna2DecodeSweep, SloadRequiredBytesTakesTheMaximumOverAllLoads) {
+    const uint32_t code[] = {
+        smem_w0(2, 0, 2), smem_w1(0x40),    // x4 at 0x40 -> reaches 0x50
+        smem_w0(0, 4, 2), smem_w1(0x100),   // dword at 0x100 -> reaches 0x104
+        smem_w0(1, 8, 2), smem_w1(0x10),    // x2 at 0x10 -> reaches 0x18
+        kEnd,
+    };
+    EXPECT_EQ(rdna2_sload_required_bytes(code, 7, 4), 0x104u);
+}
+
+TEST(Rdna2DecodeSweep, SloadRequiredBytesIgnoresLoadsThroughOtherBasesAndUnboundedForms) {
+    const uint32_t other_base[] = {smem_w0(0, 0, 3), smem_w1(0x80), kEnd};      // s[6:7]
+    EXPECT_EQ(rdna2_sload_required_bytes(other_base, 3, 4), 0u);
+    const uint32_t reg_offset[] = {smem_w0(0, 0, 2), smem_w1(0x80, 7u), kEnd};  // SOFFSET = s7
+    EXPECT_EQ(rdna2_sload_required_bytes(reg_offset, 3, 4), 0u) << "a register offset has no static reach";
+    const uint32_t negative[] = {smem_w0(0, 0, 2), smem_w1(0x1FFFF0u), kEnd};   // -16
+    EXPECT_EQ(rdna2_sload_required_bytes(negative, 3, 4), 0u);
+    const uint32_t buffer_load[] = {smem_w0(8, 0, 2), smem_w1(0x80), kEnd};     // s_buffer_load_dword
+    EXPECT_EQ(rdna2_sload_required_bytes(buffer_load, 3, 4), 0u) << "bounded by its V#, not a pointer";
+    EXPECT_EQ(rdna2_sload_required_bytes(other_base, 0, 4), 0u);
+}
+
+TEST(Rdna2DecodeSweep, SloadRequiredBytesStopsAtEndpgm) {
+    const uint32_t code[] = {smem_w0(0, 0, 2), smem_w1(0x10), kEnd, smem_w0(0, 0, 2), smem_w1(0x1000)};
+    EXPECT_EQ(rdna2_sload_required_bytes(code, 5, 4), 0x14u);
+}
+
+TEST(Rdna2DecodeSweep, SloadRequiredBytesSaturatesInsteadOfWrapping) {
+    // The largest 21-bit immediate plus a 64-byte load fits in 32 bits, so this documents the cap
+    // path's normal range rather than a wrap: the result must still equal offset + width exactly.
+    const uint32_t code[] = {smem_w0(4, 0, 2), smem_w1(0x0FFFFFu), kEnd};
+    EXPECT_EQ(rdna2_sload_required_bytes(code, 3, 4), 0x0FFFFFu + 64u);
+}
