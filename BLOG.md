@@ -21,6 +21,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-03
 
+### 007 First Light reaches its title screen
+
+007 First Light now reaches its full title screen, with Bond's artwork and the “Press X to play” prompt rendering correctly ([tracker #4021](https://github.com/mattias800/prosper/issues/4021#issuecomment-5968286196)).
+
+<p align="center"><img src="assets/screenshots/007-first-light-title-2026-10-03.webp" alt="007 First Light — complete title artwork and Press X to play prompt in the normal visible Linux prosper-app SDL/X11 window, captured near the end of a ten-minute run without input injection"></p>
+
+### Hollow Knight: Silksong reaches gameplay
+
+The owner has played Hollow Knight: Silksong and describes its gameplay visuals as nearly perfect, with some main-menu UI elements still missing ([tracker #4121](https://github.com/mattias800/prosper/issues/4121), [menu issue #4120](https://github.com/mattias800/prosper/issues/4120)).
+
 ### Silent Hill 2 renders its legal splash again
 
 The normal Linux `prosper-app` route gets past the startup read failure and renders the legal splash; the earlier scheduled frame is black, and a correct title screen remains unverified ([tracker #4024](https://github.com/mattias800/prosper/issues/4024)).
