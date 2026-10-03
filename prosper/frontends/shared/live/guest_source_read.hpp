@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hle/memory/renderer_tracked_mapping.hpp"
+#include "gpu/resources/buffer_source_read.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -43,12 +44,12 @@ size_t guest_source_readable_prefix(uint64_t address, size_t bytes,
 template <typename HostReadable>
 size_t copy_guest_source(uint8_t* destination, uint64_t address, size_t bytes,
                          HostReadable&& host_readable) {
-    const size_t readable = guest_source_readable_prefix(
-        address, bytes, std::forward<HostReadable>(host_readable));
-    if (readable) std::memcpy(destination, reinterpret_cast<const void*>(address), readable);
-    return readable;
+    return prosper::gpu::copy_buffer_source(destination, address, bytes,
+        [&](uint64_t source, size_t requested) {
+            return guest_source_readable_prefix(
+                source, requested, std::forward<HostReadable>(host_readable));
+        });
 }
-
 // Optional observations of the existing comparison, never an equality/admission authority.
 // Extent is the sum of memcmp argument lengths, not physical reads inside its implementation.
 enum class GuestSourceComparisonOutcome : uint8_t {
