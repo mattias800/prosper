@@ -36,8 +36,8 @@ uint32_t exact_center(SpirvCompute& b, uint32_t bits, uint32_t extent) {
             b.ucmp(Op_INotEqual, b.ibin(Op_BitwiseAnd, sig, bit), b.uconst(0))));
 }
 void write_vector(SpirvCompute& b, RegState& state, int reg, uint32_t bits) {
-    // The packet inventory REQUIRED the genuine old value, including inactive lanes. A service
-    // cannot manufacture backing for an EXEC-off write or a subsequent EXEC-ignoring READLANE.
+    // Preserve inactive storage. Separate packet validity decides whether that old word exists;
+    // a placeholder never grants authority to a later inactive export or selected READLANE peer.
     state.vreg[reg] = b.sel(state.exec, bits, state.vreg.at(reg));
 }
 template <size_t N>

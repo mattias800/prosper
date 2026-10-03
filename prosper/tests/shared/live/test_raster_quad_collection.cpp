@@ -166,6 +166,13 @@ static prosper::test::BackendDraw captured_backend_contract(const DrawItem& draw
 }
 static void entry_preparation_controls(const DrawItem& draw, GpuState state, Owners& owner) {
     const auto prepared = prepare(draw);
+    check(prepared && prepared->vgpr_requirements && prepared->inputs &&
+        prepared->vgpr_requirements == prepared->inputs->vgpr_requirements &&
+        prepared->vgpr_requirements->source_words == prepared->inputs->raw_code.get() &&
+        prepared->vgpr_requirements->storage.test(0) && prepared->vgpr_requirements->storage.test(4) &&
+        prepared->vgpr_requirements->possible_entry.test(0) && !prepared->vgpr_requirements->possible_entry.test(4) &&
+        has_gap(*prepared,"packet-entry-vgpr-values-unproved") && !prepared->ready,
+        "actual producing analysis/preparation distinguishes READLANE entry v0 from written scratch v4");
     check(prepared && prepared->inputs && prepared->inputs->entry.observed &&
         prepared->inputs->entry.user_data_available == 0x80000001u &&
         prepared->inputs->entry.user_data[0] == 0 && prepared->inputs->entry.user_data[1] == 0 &&
@@ -615,6 +622,10 @@ int main(int argc, char** argv) {
         const auto& inputs = *draw.raster_quads->inputs;
         check(!inputs.raw_code && !inputs.raw_matches_producing_source,
             "analysis reuse disabled never reacquires guest VA for a collector token");
+        const auto prepared = prepare(draw);
+        check(!inputs.vgpr_requirements && prepared && !prepared->vgpr_requirements &&
+            has_gap(*prepared,"packet-vgpr-program-requirements-unavailable"),
+            "no producing analysis means no cached program requirements or fabricated vector entry proof");
         RasterQuadCollector contract;
         check(build_raster_quad_collector(inputs,2,contract).empty() &&
             contract.rejection == "quad-collector-producing-source-unavailable",

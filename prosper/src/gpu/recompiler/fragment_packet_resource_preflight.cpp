@@ -164,8 +164,6 @@ const char* packet_resource_preflight(const FragmentResourcePacket& packet,
                 return "packet-parameter-tuple-invalid";
     }
     std::set<uint32_t> used_buffers, used_images;
-    std::set<int> vgprs;
-    for (const auto& column : guest.vgprs) vgprs.insert(static_cast<int>(column.reg));
     struct Pending { std::bitset<106> scalar; std::bitset<256> vector; bool m0 = false; };
     std::vector<Pending> entry(ins.size());
     std::vector<bool> reachable(ins.size());
@@ -194,9 +192,6 @@ const char* packet_resource_preflight(const FragmentResourcePacket& packet,
         if (in.fmt == Rdna2Format::MIMG) {
             if (!images.contains(in.pc)) return "packet-image-readpoint-unavailable";
             used_images.insert(in.pc);
-            const int coordinates = in.opcode == 0x24 ? 3 : 2;
-            for (int c = 0; c < coordinates; ++c)
-                if (!vgprs.contains(in.src[0].value + c)) return "packet-image-coordinate-input-unavailable";
         }
         if (!reachable[i]) continue;
         auto pending = entry[i];

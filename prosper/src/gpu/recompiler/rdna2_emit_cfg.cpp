@@ -2,6 +2,7 @@
 // rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/fragment_packet_definedness.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -1792,7 +1793,8 @@ bool emit_cfg_state_machine(
     const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
     const uint32_t* code, size_t dwords, uint32_t initial_active,
     bool synchronize_lds_fminmax,
-    const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction) {
+    const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction,
+    PacketVgprDefinedness* packet_definedness) {
     const bool graphics = !b.has_workgroup_execution() && (b.is_fragment || b.is_vertex);
     auto reject_cfg = [&](uint32_t pc, const char* reason) {
         log_recompile_diagnostic(b.diagnostic,
@@ -2425,8 +2427,9 @@ bool emit_cfg_state_machine(
           !portable_readfirstlane_event_for_pc.empty())
              ? padded_lanes : 0u);
     const uint32_t group_active_slot = wave_result_base + wave_count;
+    if (packet_definedness) packet_definedness->peer_scratch_base = group_active_slot + 1;
     if (b.has_workgroup_execution() && !direct_dispatch &&
-        !b.declare_cfg_scratch(group_active_slot + 1))
+        !b.declare_cfg_scratch(group_active_slot + 1 + (packet_definedness ? b.local_count : 0u)))
         return reject_cfg(ins.front().pc, "cfg-scratch-too-small");
     start_set.insert(end_pc);
     std::vector<uint32_t> starts(start_set.begin(), start_set.end());
@@ -4956,6 +4959,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_b64_mask_scc_vote = nullptr;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi) continue;
+                if (packet_definedness) packet_definedness->instruction(b, state, in);
                 if (cfg_terminator(in)) {
                     block_terminator = &in;
                     break;
@@ -6961,71 +6965,9 @@ bool emit_cfg_state_machine(
     }
 
     if (has_portable_readlane) {
-    // Every invocation publishes its ordinary VGPR value unconditionally; V_READLANE ignores EXEC.
-    // A pending wave then reads the selected lane from its own guest-wave slice. This common region
-    // is reached uniformly by every dispatcher invocation, so the workgroup barriers are exact even
-    // when the host subgroup is narrower than the guest Wave64.
-    const uint32_t readlane_pending = b.load_function(b.t_bool, readlane_pending_var);
-    const uint32_t readlane_source = b.load_function(b.t_u32, readlane_source_var);
-    b.cfg_scratch_store(b.linear_localid, readlane_source);
-    b.barrier();
-
-    const uint32_t readlane_shift = b.uconst(b.wave_size == 32 ? 5u : 6u);
-    const uint32_t readlane_wave_base = b.ibin(
-        Op_ShiftLeftLogical,
-        b.ibin(Op_ShiftRightLogical, b.linear_localid, readlane_shift),
-        readlane_shift);
-    const uint32_t readlane_lane = b.ibin(
-        Op_BitwiseAnd, b.load_function(b.t_u32, readlane_selector_var),
-        b.uconst(b.wave_size - 1u));
-    const uint32_t readlane_index = b.ibin(
-        Op_IAdd, readlane_wave_base, readlane_lane);
-    const uint32_t readlane_valid = b.ucmp(
-        Op_ULessThan, readlane_index, b.uconst(b.local_count));
-    const uint32_t readlane_result = b.sel(
-        readlane_valid,
-        b.cfg_scratch_load(b.sel(readlane_valid, readlane_index, zero)), zero);
-    const uint32_t readlane_dst = b.load_function(b.t_u32, readlane_dst_var);
-    for (int reg : portable_readlane_dsts) {
-        const auto destination = sv.find(reg);
-        if (destination == sv.end())
+        if (!emit_cfg_readlane_phase(b, packet_definedness, readlane_pending_var, readlane_source_var,
+            readlane_selector_var, readlane_dst_var, portable_readlane_dsts, sv, mv, mhv, vcc_var))
             return reject_cfg(0, "missing-portable-readlane-dst");
-        const uint32_t selected = b.land(
-            readlane_pending,
-            b.ucmp(Op_IEqual, readlane_dst,
-                   b.uconst(static_cast<uint32_t>(reg))));
-        const uint32_t old = b.load_function(b.t_u32, destination->second);
-        b.store_function(destination->second, b.sel(selected, readlane_result, old));
-    }
-    for (const auto& kv : mv) {
-        if (!portable_readlane_dsts.contains(kv.first)) continue;
-        const uint32_t selected = b.land(
-            readlane_pending,
-            b.ucmp(Op_IEqual, readlane_dst,
-                   b.uconst(static_cast<uint32_t>(kv.first))));
-        const uint32_t old = b.load_function(b.t_bool, kv.second);
-        b.store_function(kv.second, b.bsel(selected, no, old));
-    }
-    for (const auto& kv : mhv) {
-        if (!portable_readlane_dsts.contains(kv.first)) continue;
-        const uint32_t selected = b.land(
-            readlane_pending,
-            b.ucmp(Op_IEqual, readlane_dst,
-                   b.uconst(static_cast<uint32_t>(kv.first))));
-        const uint32_t old = b.load_function(b.t_bool, kv.second);
-        b.store_function(kv.second, b.bsel(selected, no, old));
-    }
-    if (portable_readlane_dsts.contains(106)) {
-        const uint32_t selected = b.land(
-            readlane_pending,
-            b.ucmp(Op_IEqual, readlane_dst, b.uconst(106u)));
-        const uint32_t bit = b.ucmp(
-            Op_INotEqual,
-            b.ibin(Op_BitwiseAnd, readlane_result, b.uconst(1u)), zero);
-        const uint32_t old = b.load_function(b.t_bool, vcc_var);
-        b.store_function(vcc_var, b.bsel(selected, bit, old));
-    }
-    b.barrier();
     }
 
     if (!mbcnt_event_for_pc.empty()) {

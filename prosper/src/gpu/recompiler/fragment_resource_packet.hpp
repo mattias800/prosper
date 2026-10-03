@@ -54,6 +54,7 @@ enum class FragmentPacketRuntimeFailure : uint32_t {
     None = 0, DescriptorMismatch = 1, M0Mismatch = 2, NonFinite = 3,
     FiniteOverflow = 4, InterpolationNotExact = 5,
     SampleCoordinateDomain = 6, SampleLodDomain = 7,
+    UndefinedVgpr = 9, // 8 reserved for the coordinated special-F32 service variant
 };
 // New resource variants append [magic, first-failing-PC, reason] for EACH logical worker after
 // the old raw EXP records. No worker exits early. Sticky failure is not a substituted guest value.
@@ -73,6 +74,7 @@ struct FragmentResourcePacketResult {
     std::vector<uint32_t> exports; // EMPTY on ANY malformed/failing worker or readback failure
     std::string rejection;
     uint32_t lane = UINT32_MAX, pc = UINT32_MAX;
+    uint32_t vgpr = UINT32_MAX;
     FragmentPacketRuntimeFailure failure = FragmentPacketRuntimeFailure::None;
 };
 

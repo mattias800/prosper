@@ -24,6 +24,12 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
 - `gpu_execute.hpp` — the shared contracts, including **`SrtUse`**: a descriptor use recovered by the
   const-fold, keyed by the `s_load` immediate byte offset. Read this before assuming prosper cannot
   see a descriptor channel.
+- `fragment_packet_analysis` aliases exact immutable ShaderCodeAnalysis-owned VGPR requirements
+  into the producing collector capsule. `fragment_packet_preparation` consumes those code facts
+  without warm per-draw reparse or added global lock: writer-only scratch is not an entry input,
+  and absent analysis/replaced raw source never grants program authority. Runtime per-lane read
+  validity is separate from real mask/helper/system/composition/commit inputs; preparation remains
+  refused until those obligations have actual evidence, not host-raster zero defaults.
 - `index_expand` — the guest's validated 16-bit index range widened to the 32-bit indices the
   backend uploads, and the maximum that sizes the vertex buffer. Two things about it are easy to
   get wrong and both are load-bearing. The maximum must be reduced from the **same** loaded values

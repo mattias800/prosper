@@ -376,7 +376,18 @@ int main(int argc, char** argv) {
     reject(missing, "packet-invocation-state-unavailable", "missing masks");
     missing = clean;
     missing.vgprs.erase(missing.vgprs.begin() + 5);
-    reject(missing, "packet-vgpr-input-unavailable", "missing READLANE source");
+    {
+        const auto compiled = prosper::gpu::recompile_fragment_packet(missing);
+        check(!compiled.spirv.empty(), "missing READLANE source retains runtime validity obligation");
+        if (!compiled.spirv.empty()) {
+            bpermute_oracle::Interpreter vm(compiled.spirv);
+            const auto words = vm.run_packet(compiled.input_words, compiled.output_words);
+            const auto result = prosper::gpu::decode_fragment_packet(compiled, words, vm.error.empty());
+            check(vm.error.empty(), "missing READLANE source completes actual SOURCE without split barriers");
+            check(result.exports.empty() && result.rejection == "packet-vgpr-selected-peer-unavailable" &&
+                result.reg == 8 && result.kind == 3, "missing selected source cannot publish fabricated zero");
+        }
+    }
     missing = s::packet({s::Kind::Readlane}); missing.sgprs.clear();
     reject(missing, "packet-sgpr-read-before-definition", "missing supplied scalar READLANE selector");
     missing = clean; missing.export_enabled[40] = 2;
