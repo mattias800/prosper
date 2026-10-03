@@ -1,5 +1,8 @@
 // #4265: native Windows recovery must resume the correct frame, preserve host state and continue
 // the real initializer loop after a foreign-frame fault. No game dump, GPU, or debugger is involved.
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
 #include "host/fault/win_recovery.hpp"
 #include "host/image/exec_image.hpp"
 #include <windows.h>
