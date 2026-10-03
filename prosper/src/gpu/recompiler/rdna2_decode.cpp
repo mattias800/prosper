@@ -160,7 +160,11 @@ static uint32_t mtbuf_vdata_dwords(const Rdna2Inst& in) {
 
 static uint32_t mimg_vdata_dwords(const Rdna2Inst& in) {
     uint32_t components = 0;
-    if (in.opcode == 0x47u || in.opcode == 0x57u) {
+    // The whole gather4 family (0x40..0x5F: base, _cl, _l, _b, _b_cl, _lz, each with _c and _o) selects
+    // ONE component through DMASK and returns it for four texels, so the result is four dwords
+    // whatever the mask says. Matching only 0x47/0x57 under-counted every other variant to the DMASK
+    // popcount (one dword for the usual dmask:0x1), which hides three written registers.
+    if (in.opcode >= 0x40u && in.opcode <= 0x5Fu) {
         components = 4u; // gather4
     } else {
         for (uint32_t component = 0; component < 4; ++component)
@@ -211,6 +215,11 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
             if (in.opcode == 0x0du) return 2;
             if (in.opcode == 0x0eu) return 4;
             if (in.opcode == 0x0fu) return 3;
+            // D16 format loads (0x80..0x83 = x, xy, xyz, xyzw) pack two components per dword, so xyz
+            // and xyzw write a pair. The matching stores (0x84..0x87, and the high-half x store 0x27)
+            // read VDATA like the 0x04..0x07 format stores.
+            if (in.opcode == 0x82u || in.opcode == 0x83u) return 2;
+            if ((in.opcode >= 0x84u && in.opcode <= 0x87u) || in.opcode == 0x27u) return 0;
             // The supported qword atomics can return a consecutive VGPR pair when GLC requests their
             // pre-op value, so conservatively count both words even when this packet has GLC clear.
             // Other supported return-value atomics are one dword. Unknown buffer operations remain
@@ -281,6 +290,8 @@ uint32_t rdna2_vgpr_destination_span(const Rdna2Inst& in) {
             else if (in.opcode == 0x1du) span = 2;
             else if (in.opcode == 0x1eu) span = 4;
             else if (in.opcode == 0x1fu) span = 3;
+            else if (in.opcode == 0x84u || in.opcode == 0x85u || in.opcode == 0x27u) span = 1;
+            else if (in.opcode == 0x86u || in.opcode == 0x87u) span = 2;
             break;
         case Rdna2Format::MTBUF:
             span = mtbuf_vdata_dwords(in);
