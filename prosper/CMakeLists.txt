@@ -2312,6 +2312,13 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/diagnostics/test_diag_ratelimit.cpp
     INCLUDES src)
 
+  # The build journal must not crash on an unreadable label or present a partial/old
+  # sample as an observed fence value. CPU-only: no command processor or Vulkan device.
+  prosper_add_gtest(test_fence_build_journal
+    SOURCES tests/gpu/diagnostics/test_fence_build_journal.cpp
+            src/gpu/diagnostics/fence_build_journal.cpp src/host/memory/guest_memory_copy.cpp
+    INCLUDES src)
+
   # Readback-reason policy: the verdict is expressed in terms of the reason, so a future edit
   # cannot change what is counted without changing what is decided.
   target_sources(test_cpu_rtt_snapshot_pool PRIVATE src/diagnostics/readback_reason_census.cpp)
