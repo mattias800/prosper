@@ -11,7 +11,9 @@
 // to the 64-bit register the guest reads. The conversions themselves run in whatever host C runtime
 // prosper is built against, and the guest's format string reaches it unchanged, so a host runtime
 // that parses differently from the guest's libc is prosper's bug (e.g. #4341). That is why these
-// cases cover conversions too, not only the handler's own code. Expectations come from the C standard (N1570 7.21.6.2):
+// cases cover conversions too, not only the handler's own code.
+//
+// Expectations come from the C standard (N1570 7.21.6.2):
 // the return value is the number of input items ASSIGNED, or EOF if an input failure occurs before
 // the first conversion; %n assigns the characters consumed so far and does not count; `*`
 // suppresses assignment and does not count; a matching failure stops the scan and leaves later
@@ -123,8 +125,8 @@ TEST_F(LibcSscanf, LengthModifiersSelectTheDestinationWidth) {
 TEST_F(LibcSscanf, LongModifierWritesTheGuestsSixtyFourBitLong) {
 #if defined(_WIN32)
     // The guest is LP64 and the Windows CRT is LLP64, and h_sscanf passes the guest's format to
-    // the host unchanged, so %ld stores 32 bits into the guest's 64-bit long (#4345).
-    GTEST_SKIP() << "guest %ld is 64-bit, the Windows CRT's is 32-bit (#4345)";
+    // the host unchanged, so %ld stores 32 bits into the guest's 64-bit long (#4341).
+    GTEST_SKIP() << "guest %ld is 64-bit, the Windows CRT's is 32-bit (#4341)";
 #endif
     int64_t l = 0x5555555555555555LL;
     uint64_t lu = 0x5555555555555555ULL, lx = 0x5555555555555555ULL;
