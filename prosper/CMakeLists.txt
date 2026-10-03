@@ -1954,14 +1954,10 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
-  # FreeBSD fopen mode contract, ported from freebsd-src
-  # lib/libc/tests/stdio/fopen_test.c (ATF) to gtest. f_fopen forwards the
-  # mode string verbatim after path translation, so the host's mode/access
-  # behaviour IS the guest-visible contract. Scratch files (never fixed
-  # paths); the fcntl/CLOEXEC half is POSIX-only and skips loudly on
-  # Windows, which has neither. Pure, no game dump.
-  prosper_add_gtest(test_freebsd_fopen
-    SOURCES tests/hle/test_freebsd_fopen.cpp
+  # The guest's fopen and stdio stream handlers, against N1570 7.21.5.3 and FreeBSD fopen(3):
+  # guest-path translation, mode semantics, EINVAL for a bad mode. Scratch files only, no dump.
+  prosper_add_gtest(test_hle_fopen_modes
+    SOURCES tests/hle/test_hle_fopen_modes.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
   if(UNIX)
