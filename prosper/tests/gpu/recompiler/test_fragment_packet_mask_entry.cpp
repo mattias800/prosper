@@ -181,7 +181,7 @@ TEST(FragmentPacketMaskEntry, LegacyBundledAndExplicitFullAvailabilityStayIdenti
     EXPECT_TRUE(complete_graphics_packet_locals(partial, refusal, false)) << refusal;
     partial.exec_available = false;
     EXPECT_FALSE(complete_graphics_packet_locals(partial, refusal));
-    EXPECT_EQ(refusal, "stage-input-original-unavailable")
+    EXPECT_EQ(refusal, "stage-input-original-unavailable:pc=4294967295")
         << "missing EXEC cannot become certain zero execution in the inherited stage proof";
 }
 TEST(FragmentPacketMaskEntry, CachedCodeConsumesDifferentSuppliedDataAndExactPresenceProfile) {
