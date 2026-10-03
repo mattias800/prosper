@@ -222,6 +222,10 @@ TEST(FragmentPacketExports, PendingWordsAndEveryExecWriterNeedActualCompletion) 
     done.guest_code[0] |= 1u << 11;   // DONE alone cannot protect the pending payload overwrite
     EXPECT_EQ(recompile_fragment_packet(done).rejection,
               "packet-export-source-overwrite-before-wait");
+    auto partial = f::pending_write(0, true).invocation;
+    partial.guest_code[2] = 0xbf8c0070u;   // EXPCNT7 cannot certify the pending request complete
+    EXPECT_EQ(recompile_fragment_packet(partial).rejection,
+              "packet-export-waitcnt-nonzero-unimplemented");
 }
 TEST(FragmentPacketExports, EveryConditionalPathAndPackedPhysicalWordMustStayStable) {
     for (bool scc : {false, true}) {

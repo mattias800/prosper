@@ -252,8 +252,8 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
                                                             in.exp_compr, (in.words[0] >> 11) & 1u,
                                                             (in.words[0] >> 12) & 1u});
         if (packet.export_observation == FragmentPacketExportObservation::Architectural &&
-            in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c && in.simm16 == 0)
-            gap = nullptr;   // real full WAIT completion for architectural pending exports
+            in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c)
+            gap = in.simm16 == 0 ? nullptr : "packet-export-waitcnt-nonzero-unimplemented";
         if (services && gap && !packet_resource_instruction_gap(in)) gap = nullptr;
         else if (services && in.fmt == Rdna2Format::SMEM)
             gap = packet_resource_instruction_gap(in);
