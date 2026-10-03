@@ -1367,3 +1367,152 @@ TEST(Rdna2DecodeSweep, Dpp16IsNeverAdmittedOnVopcAndDpp8IsNeverAdmitted) {
         EXPECT_FALSE(in.has_sdwa) << marker;
     }
 }
+
+// ---- VOP3P (packed / mixed-precision) --------------------------------------------------------
+// dword0: VDST[7:0], NEG_HI[10:8], OPSEL[13:11], OPSEL_HI[2][14], CLAMP[15], OP[22:16].
+// dword1: SRC0[8:0], SRC1[17:9], SRC2[26:18], OPSEL_HI[1:0][28:27], NEG[31:29].
+// Three families have modelled modifiers: packed f16 (0x0E-0x12), packed 16-bit integer (0x00-0x0D,
+// where CLAMP is unmodelled integer saturation) and the fma_mix trio (0x20-0x22, where NEG_HI is
+// ABS). Every other opcode must keep has_modifier on any modifier bit.
+
+namespace {
+struct Vop3p {
+    uint32_t op = 0, vdst = 0, neg_hi = 0, opsel = 0, opsel_hi = 0, clamp = 0, neg = 0;
+    uint32_t s0 = 0x100u, s1 = 0x101u, s2 = 0x102u;
+    uint32_t w0() const {
+        return 0xCC000000u | (op << 16) | vdst | (neg_hi << 8) | (opsel << 11) |
+               (((opsel_hi >> 2) & 1u) << 14) | (clamp << 15);
+    }
+    uint32_t w1() const {
+        return s0 | (s1 << 9) | (s2 << 18) | ((opsel_hi & 3u) << 27) | (neg << 29);
+    }
+    Rdna2Inst decoded() const { return decode(w0(), w1()); }
+};
+constexpr bool vop3p_is_packed_f16(uint32_t op) { return op >= 0x0E && op <= 0x12; }
+constexpr bool vop3p_is_packed_int(uint32_t op) { return op <= 0x0D; }
+constexpr bool vop3p_is_mix(uint32_t op) { return op >= 0x20 && op <= 0x22; }
+}  // namespace
+
+TEST(Rdna2DecodeSweep, Vop3pDecodesOpcodeDestinationAndThreeSources) {
+    for (uint32_t op = 0; op < 0x80; ++op) {
+        Vop3p v; v.op = op; v.vdst = 9; v.s0 = 256u + 1u; v.s1 = 6u; v.s2 = 0xF2u;
+        const Rdna2Inst in = v.decoded();
+        ASSERT_EQ(in.fmt, Rdna2Format::VOP3P) << "op=" << op;
+        EXPECT_EQ(in.opcode, op);
+        EXPECT_EQ(in.len_dwords, 2u);
+        EXPECT_EQ(in.dst.value, 9);
+        ASSERT_EQ(in.n_src, 3);
+        EXPECT_EQ(in.src[0].kind, OperandKind::VGPR);
+        EXPECT_EQ(in.src[0].value, 1);
+        EXPECT_EQ(in.src[1].kind, OperandKind::SGPR);
+        EXPECT_EQ(in.src[1].value, 6);
+        EXPECT_EQ(in.src[2].kind, OperandKind::InlineFloat);
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop3pPackedF16CapturesEveryModifierAndKeepsTheFormModelled) {
+    for (uint32_t op = 0x0E; op <= 0x12; ++op) {
+        for (uint32_t neg = 0; neg < 8; ++neg) {
+            for (uint32_t neg_hi = 0; neg_hi < 8; ++neg_hi) {
+                Vop3p v; v.op = op; v.neg = neg; v.neg_hi = neg_hi; v.opsel = (neg ^ neg_hi) & 7u;
+                v.opsel_hi = (neg + neg_hi) & 7u; v.clamp = (neg_hi >> 1) & 1u;
+                const Rdna2Inst in = v.decoded();
+                for (uint32_t k = 0; k < 3; ++k) {
+                    EXPECT_EQ(in.src_neg[k], ((neg >> k) & 1u) != 0) << "op=" << op;
+                }
+                EXPECT_EQ(in.vop3p_neg_hi, neg_hi) << "op=" << op;
+                EXPECT_EQ(in.vop3p_opsel, v.opsel) << "op=" << op;
+                EXPECT_EQ(in.vop3p_opsel_hi, v.opsel_hi) << "op=" << op;
+                EXPECT_EQ(in.clamp, v.clamp != 0) << "op=" << op;
+                EXPECT_FALSE(in.has_modifier) << "every f16 packed modifier is modelled, op=" << op;
+            }
+        }
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop3pOpselHiSpansDword1AndDword0Bit14) {
+    // OPSEL_HI is 3 bits: [1:0] in dword1[28:27], bit 2 in dword0 bit 14.
+    for (uint32_t hi = 0; hi < 8; ++hi) {
+        Vop3p v; v.op = 0x0F; v.opsel_hi = hi;
+        EXPECT_EQ(v.decoded().vop3p_opsel_hi, hi) << hi;
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop3pPackedIntegerSharesFieldsButRejectsSaturation) {
+    for (uint32_t op = 0; op <= 0x0D; ++op) {
+        Vop3p v; v.op = op; v.neg = 5; v.neg_hi = 3; v.opsel = 6; v.opsel_hi = 5;
+        const Rdna2Inst in = v.decoded();
+        EXPECT_EQ(in.src_neg[0], true) << op;
+        EXPECT_EQ(in.src_neg[1], false) << op;
+        EXPECT_EQ(in.src_neg[2], true) << op;
+        EXPECT_EQ(in.vop3p_neg_hi, 3) << op;
+        EXPECT_EQ(in.vop3p_opsel, 6) << op;
+        EXPECT_EQ(in.vop3p_opsel_hi, 5) << op;
+        // The plainest encoding sets the default op_sel_hi:[1,1] and must still be accepted.
+        EXPECT_FALSE(in.has_modifier) << "op=" << op;
+        Vop3p sat = v; sat.clamp = 1;
+        EXPECT_TRUE(sat.decoded().has_modifier) << "integer CLAMP is unmodelled saturation, op=" << op;
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop3pMixFamilyMapsNegHiToAbs) {
+    for (uint32_t op = 0x20; op <= 0x22; ++op) {
+        for (uint32_t m = 0; m < 8; ++m) {
+            Vop3p v; v.op = op; v.neg = m; v.neg_hi = (~m) & 7u; v.opsel = 5; v.opsel_hi = 6; v.clamp = 1;
+            const Rdna2Inst in = v.decoded();
+            for (uint32_t k = 0; k < 3; ++k) {
+                EXPECT_EQ(in.src_neg[k], ((m >> k) & 1u) != 0) << "op=" << op << " k=" << k;
+                EXPECT_EQ(in.src_abs[k], (((~m) >> k) & 1u) != 0) << "op=" << op << " k=" << k;
+            }
+            EXPECT_EQ(in.vop3p_opsel, 5) << op;
+            EXPECT_EQ(in.vop3p_opsel_hi, 6) << op;
+            EXPECT_TRUE(in.clamp) << op;
+            EXPECT_FALSE(in.has_modifier) << op;
+            EXPECT_EQ(in.vop3p_neg_hi, 0) << "NEG_HI is ABS for the mix family, not a packed neg_hi";
+        }
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop3pUnmodelledOpcodesRejectAnyModifierBit) {
+    for (uint32_t op = 0; op < 0x80; ++op) {
+        if (vop3p_is_packed_f16(op) || vop3p_is_packed_int(op) || vop3p_is_mix(op)) continue;
+        EXPECT_FALSE(Vop3p{.op = op}.decoded().has_modifier) << "plain, op=" << op;
+        const struct { const char* name; Vop3p v; } cases[] = {
+            {"neg_hi", Vop3p{.op = op, .neg_hi = 1}},
+            {"opsel", Vop3p{.op = op, .opsel = 1}},
+            {"opsel_hi bit2", Vop3p{.op = op, .opsel_hi = 4}},
+            {"clamp", Vop3p{.op = op, .clamp = 1}},
+            {"opsel_hi low", Vop3p{.op = op, .opsel_hi = 1}},
+            {"neg", Vop3p{.op = op, .neg = 1}},
+        };
+        for (const auto& c : cases) {
+            EXPECT_TRUE(c.v.decoded().has_modifier) << c.name << ", op=" << op;
+        }
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop3pFamilyBoundariesAreExact) {
+    // The neighbours of each modelled range must not inherit its modifier handling.
+    for (uint32_t op : {0x0Du, 0x0Eu, 0x12u, 0x13u, 0x1Fu, 0x20u, 0x22u, 0x23u}) {
+        Vop3p v; v.op = op; v.opsel = 1;
+        const bool modelled = vop3p_is_packed_f16(op) || vop3p_is_packed_int(op) || vop3p_is_mix(op);
+        EXPECT_EQ(v.decoded().has_modifier, !modelled) << "op=" << op;
+    }
+}
+
+TEST(Rdna2DecodeSweep, Vop3pLiteralInAnySourceSlotAddsADword) {
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        Vop3p v; v.op = 0x20;
+        (slot == 0 ? v.s0 : slot == 1 ? v.s1 : v.s2) = kLiteralSrc;
+        const uint32_t code[3] = {v.w0(), v.w1(), 0x3F000000u};
+        const Rdna2Inst in = rdna2_decode_one(code, 3);
+        EXPECT_EQ(in.len_dwords, 3u) << "slot=" << slot;
+        EXPECT_TRUE(in.has_literal) << slot;
+        EXPECT_EQ(in.literal, 0x3F000000u) << slot;
+    }
+    // Without room for the literal the length clamps rather than reading past the stream.
+    Vop3p v; v.op = 0x20; v.s1 = kLiteralSrc;
+    const uint32_t cut[2] = {v.w0(), v.w1()};
+    EXPECT_EQ(rdna2_decode_one(cut, 2).len_dwords, 2u);
+    EXPECT_FALSE(rdna2_decode_one(cut, 2).has_literal);
+}
