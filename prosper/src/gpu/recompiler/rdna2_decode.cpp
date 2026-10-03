@@ -2,6 +2,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 
 #include <algorithm>
+#include <unordered_set>
 
 namespace prosper::gpu {
 
@@ -1387,3 +1388,68 @@ uint32_t rdna2_sload_required_bytes(const uint32_t* code, size_t dwords, uint32_
 }
 
 } // namespace prosper::gpu
+
+namespace prosper::gpu {
+namespace {
+// Direct SOPP branches: s_branch (0x02) and the s_cbranch_* family (0x04..0x09).
+bool is_direct_branch(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOPP &&
+           (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
+}
+int64_t branch_target_pc(const Rdna2Inst& in) {
+    return static_cast<int64_t>(in.pc) + static_cast<int64_t>(in.len_dwords) +
+           static_cast<int64_t>(in.simm16);
+}
+bool ends_run(const Rdna2Inst& in) {
+    return in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode == 0x02);
+}
+}  // namespace
+
+bool rdna2_append_closed_tail_blocks(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& full) {
+    if (!code || full.empty() || !full.back().is_end) return false;
+    const uint32_t main_end = full.back().pc + full.back().len_dwords;
+    std::vector<uint32_t> pending;
+    std::unordered_set<uint32_t> queued;
+    auto note_target = [&](const Rdna2Inst& in) {
+        if (!is_direct_branch(in)) return true;
+        const int64_t target = branch_target_pc(in);
+        if (target < 0 || target >= static_cast<int64_t>(dwords)) return false;
+        if (target >= static_cast<int64_t>(main_end) &&
+            queued.insert(static_cast<uint32_t>(target)).second)
+            pending.push_back(static_cast<uint32_t>(target));
+        return true;
+    };
+    for (const auto& in : full)
+        if (!note_target(in)) return false;
+    std::vector<Rdna2Inst> tail;
+    std::unordered_set<uint32_t> decoded_pcs;
+    while (!pending.empty()) {
+        uint32_t pc = pending.back();
+        pending.pop_back();
+        for (;;) {
+            if (!decoded_pcs.insert(pc).second) break;   // joined an already decoded run
+            if (tail.size() > 256 || pc >= dwords) return false;
+            Rdna2Inst in = rdna2_decode_one(code + pc, dwords - pc);
+            if (in.fmt == Rdna2Format::Unknown || !in.len_dwords) return false;
+            in.pc = pc;
+            // A branch back into the body could run the tail before the consumer, or re-enter it.
+            if (is_direct_branch(in) && branch_target_pc(in) < static_cast<int64_t>(main_end))
+                return false;
+            if (!note_target(in)) return false;
+            tail.push_back(in);
+            if (ends_run(in)) break;
+            pc += in.len_dwords;
+        }
+    }
+    std::sort(tail.begin(), tail.end(),
+              [](const Rdna2Inst& l, const Rdna2Inst& r) { return l.pc < r.pc; });
+    for (size_t i = 0; i < tail.size(); ++i) {
+        // A fall-through must land on the next decoded instruction, or a consumer's edge is wrong.
+        if (!ends_run(tail[i]) &&
+            (i + 1 >= tail.size() || tail[i + 1].pc != tail[i].pc + tail[i].len_dwords))
+            return false;
+    }
+    full.insert(full.end(), tail.begin(), tail.end());
+    return true;
+}
+}  // namespace prosper::gpu

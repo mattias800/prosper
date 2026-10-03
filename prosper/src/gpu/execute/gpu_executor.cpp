@@ -3101,7 +3101,8 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         return false;
     std::vector<Rdna2Inst> full;
     rdna2_walk(code, dwords, full);
-    if (full.empty() || !full.back().is_end || has_indirect_control_flow(full)) return false;
+    if (full.empty() || !full.back().is_end || !rdna2_append_closed_tail_blocks(code, dwords, full) ||
+        has_indirect_control_flow(full)) return false;
     std::unordered_map<uint32_t, size_t> by_pc;
     for (size_t i = 0; i < full.size(); ++i) {
         if (full[i].fmt == Rdna2Format::Unknown || !full[i].len_dwords ||
@@ -5646,9 +5647,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             std::memcmp(code, decoded->code.data(),
                                         decoded->code.size() * sizeof(uint32_t)) == 0;
                         mapped_t8 = same_code && mapped_split_t8_reaches_use(
-                            decoded->code.data(), decoded->code.size(), in.pc, tbase,
-                            mapped_t8_pcs, mapped_t8_addrs,
-                            user_sgprs, nsgpr, user_sgpr_base);
+                            code, std::min<size_t>(rdna2_recompile_code_span(code, dwords), 2048u), in.pc, tbase,
+                            mapped_t8_pcs, mapped_t8_addrs, user_sgprs, nsgpr, user_sgpr_base);
                     }
                     const std::array<uint32_t, 8>* t8 =
                         live_t8_known && (!branchy_x16 || mapped_t8) &&

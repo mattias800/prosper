@@ -316,6 +316,15 @@ bool rdna2_instruction_may_change_exec(const Rdna2Inst& in);
 // 0x08-0x0f, SMEM loads below 0x10. Everything else, including the D16 and cache-invalidate forms,
 // is treated as a writer. Non-memory instructions return false.
 bool rdna2_instruction_may_write_memory(const Rdna2Inst& in);
+// `full` is a `rdna2_walk` prefix ending at its first s_endpgm. Compilers place a divergent early-out
+// (discard, kill) AFTER that end and branch to it from the body, so a branch target can name code the
+// walk never decoded. Decode every block reachable through such a target and append it to `full`.
+// Admitted only when the extra blocks are CLOSED: they decode cleanly, every branch inside them stays
+// past the body, and each run ends in s_endpgm or an unconditional branch. They can then end the wave
+// but can never run before, or re-enter, the body. Returns false (and leaves `full` untouched) for a
+// branch target outside `code[0, dwords)`, an unknown encoding, a back-edge into the body or a
+// fall-through that does not land on a decoded instruction. `code` is the live stream, not the prefix.
+bool rdna2_append_closed_tail_blocks(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& full);
 // Number of consecutive SGPRs an SOP2 instruction writes through its SDST: 1 for the opcodes
 // positively known to produce a 32-bit result (add/sub/min/max/cselect/bit-logic/shift/bfm/mul/bfe
 // in their b32/u32/i32 forms), 2 for everything else. FAIL-CLOSED: an opcode not listed here
