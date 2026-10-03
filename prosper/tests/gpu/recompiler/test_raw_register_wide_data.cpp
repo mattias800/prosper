@@ -274,12 +274,14 @@ int main(int argc, char** argv) {
     constexpr size_t mode_tail_bytes = 8u;
     constexpr size_t width_tail_bytes = 4u;
     constexpr size_t backing_tail_bytes = 5u;
-    CHECK(encoded.size() >= empty_draw_tail_bytes + flags_tail_bytes + transport_tail_bytes + 2u * owned_tail_bytes +
-                                mode_tail_bytes + width_tail_bytes + backing_tail_bytes &&
+    CHECK(encoded.size() >= empty_draw_tail_bytes + flags_tail_bytes + transport_tail_bytes +
+                                2u * owned_tail_bytes + mode_tail_bytes + width_tail_bytes +
+                                backing_tail_bytes &&
               encoded[8] == 70u,
           "legacy controls require the current versioned capture tail");
     if (encoded.size() >= empty_draw_tail_bytes + flags_tail_bytes + transport_tail_bytes +
-                              2u * owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes) {
+                              2u * owned_tail_bytes + mode_tail_bytes + width_tail_bytes +
+                              backing_tail_bytes) {
         auto v64 = encoded;
         v64.resize(v64.size() - empty_draw_tail_bytes - flags_tail_bytes - transport_tail_bytes -
                    2u * owned_tail_bytes);
