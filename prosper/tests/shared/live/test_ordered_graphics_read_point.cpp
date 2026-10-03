@@ -17,6 +17,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -32,6 +33,15 @@ constexpr std::array<uint32_t, 6> Nested{
     0xf4080b14u, 0xfa000010u,   // pc2 child x4 at parent pointer +16
     0x7e00022eu, 0xbf810000u};   // numeric observer, no writer
 constexpr std::array<uint32_t, 4> Values{0x12345678u, 0x89abcdefu, 0x10203040u, 0xfedcba98u};
+constexpr std::array<uint32_t, 15> ProceduralVertex{
+    0x36020081u, 0x2c040081u, 0x7e020d01u, 0x7e040d02u, 0x7e0a02f6u,
+    0x7e0c02f2u, 0x10020b01u, 0x08020d01u, 0x10040b02u, 0x08040d02u,
+    0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u};
+constexpr std::array<uint32_t, 11> NestedExport{0xf4080a00u, 0xfa000000u, 0xf4080b14u, 0xfa000010u,
+                                                0x7e00022fu, 0x7e0202f2u, 0x7e040280u, 0x7e0602f2u,
+                                                0xf800180fu, 0x03020100u, 0xbf810000u};
+constexpr std::array<uint32_t, 7> ResourceFreeExport{
+    0x7e000280u, 0x7e0202f2u, 0x7e040280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u};
 
 struct Program {
     alignas(256) std::array<uint32_t, 64> code{};
@@ -65,14 +75,17 @@ protected:
         if (physical_out) *physical_out = physical;
     }
 
-    void register_program(Program*& result, bool pixel) {
+    void register_program(Program*& result, bool pixel, std::span<const uint32_t> supplied = {}) {
         // AGC retains raw header/code pointers for process lifetime. Never leave stale fixture
         // pointers or reuse a low address interpreted as a blob-relative pointer.
         static std::vector<std::unique_ptr<Program>> owners;
         owners.push_back(std::make_unique<Program>());
         result = owners.back().get();
         ASSERT_GT(reinterpret_cast<uint64_t>(result), UINT32_MAX);
-        if (pixel)
+        if (!supplied.empty()) {
+            ASSERT_LE(supplied.size(), result->code.size());
+            std::copy(supplied.begin(), supplied.end(), result->code.begin());
+        } else if (pixel)
             std::copy(Nested.begin(), Nested.end(), result->code.begin());
         else
             result->code[0] = 0xbf810000u;
@@ -82,7 +95,8 @@ protected:
         result->header.version = 0x18u;
         result->header.user_data = &result->user;
         result->header.sh_registers = result->registers.data();
-        result->header.shader_size = (pixel ? Nested.size() : 1u) * sizeof(uint32_t);
+        result->header.shader_size =
+            (supplied.empty() ? (pixel ? Nested.size() : 1u) : supplied.size()) * sizeof(uint32_t);
         result->header.type = pixel ? 1u : 2u;
         result->header.num_sh_registers = 2u;
         const auto create = Hle::lookup("f3dg2CSgRKY");
@@ -590,6 +604,117 @@ TEST_F(OrderedGraphicsReadPointTest, RetainedWriteDataExpiresOldPointAndFreshPoi
         ASSERT_TRUE(fresh->probe(FoldProbe::Raw, 2, child + 16, 16));
         EXPECT_EQ(fresh->word(2, child + 16), replacement);
     });
+    EXPECT_EQ(Backend::backend_failed_publication_generation().load(), generation_before);
+}
+
+TEST_F(OrderedGraphicsReadPointTest, OrderedVoidEffectRemainsUnknownAfterParserStall) {
+    ASSERT_NO_FATAL_FAILURE(register_program(vertex, false, ProceduralVertex));
+    ASSERT_NO_FATAL_FAILURE(register_program(fragment, true, NestedExport));
+    Program* resource_free = nullptr;
+    ASSERT_NO_FATAL_FAILURE(register_program(resource_free, true, ResourceFreeExport));
+    GpuState clean;
+    for (const Program* program : {vertex, fragment})
+        for (const auto& reg : program->registers) clean.sh[reg.offset] = reg.value;
+    clean.uc[P::VGT_PRIMITIVE_TYPE] = 4;
+    clean.cx[P::CB_TARGET_MASK] = clean.cx[P::CB_SHADER_MASK] = 15;
+    clean.sh[P::SPI_SHADER_USER_DATA_PS_0] = uint32_t(parent);
+    clean.sh[P::SPI_SHADER_USER_DATA_PS_0 + 1] = uint32_t(parent >> 32u);
+    clean.sh[P::SPI_SHADER_PGM_RSRC2_PS] = 2u << P::SPI_SHADER_PGM_RSRC2_PS_USER_SGPR_SHIFT;
+    GpuState::Draw first;
+    first.index_count = 3;
+    first.instance_count = 1;
+    first.command_order = 100;
+    clean.draws.push_back(first);
+    ASSERT_TRUE(draw_requires_owned_nested_snapshot(clean))
+        << "The genuine nested PS selects checked ordered realization, not the eager route";
+
+    struct Observation {
+        uint64_t index;
+        bool has_point, live_point;
+        std::array<uint32_t, 4> words{};
+        bool has_snapshot = false;
+    };
+    std::vector<Observation> observations;
+    const auto observe = [&](const DrawItem& item) {
+        Observation observed{item.draw_index, bool(item.ordered_read_point), false};
+        if (item.ordered_read_point) {
+            const auto& point = item.ordered_read_point;
+            EXPECT_NE(point->identity(), 0u);
+            EXPECT_EQ(point->source(item.fs_guest_addr),
+                      registered_graphics_original(item.fs_guest_addr));
+            observed.live_point =
+                point->valid_for(live_render_phase().source_submit, item.command_order,
+                                 item.fs_guest_addr, point->source(item.fs_guest_addr));
+        }
+        if (item.fs_guest_addr == reinterpret_cast<uint64_t>(fragment->code.data())) {
+            EXPECT_TRUE(item.prt);
+            if (item.prt) {
+                const auto* snapshot = owned_nested_snapshot_at(*item.prt, 2, sizeof(Values));
+                EXPECT_NE(snapshot, nullptr)
+                    << "Normal checked materialization must own the actual child before rendering";
+                if (snapshot && snapshot->host_data && snapshot->host_data_size == sizeof(Values)) {
+                    std::memcpy(observed.words.data(), snapshot->host_data, sizeof(Values));
+                    observed.has_snapshot = true;
+                }
+            }
+        }
+        observations.push_back(observed);
+    };
+    set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+        for (const auto& item : items) observe(item);
+        return RenderedFrame{};
+    });
+    // No pixels are supplied or published: the positive is genuine realization and byte ownership.
+    EXPECT_FALSE(execute_ordered_and_present(clean, 8, 8, Submit + 1, false));
+    ASSERT_EQ(observations.size(), 1u);
+    EXPECT_TRUE(observations[0].has_point);
+    EXPECT_TRUE(observations[0].live_point);
+    ASSERT_TRUE(observations[0].has_snapshot);
+    EXPECT_EQ(observations[0].words, Values);
+
+    auto with_effect = clean;
+    auto later_state = std::make_shared<GpuState>(clean);
+    for (const auto& reg : resource_free->registers) later_state->sh[reg.offset] = reg.value;
+    ASSERT_FALSE(draw_requires_owned_nested_snapshot(*later_state));
+    auto second = first;
+    second.command_order = 200;
+    second.state = std::move(later_state);
+    with_effect.draws.push_back(std::move(second));
+    const uint32_t replacement = 0x55667788u;
+    Pm4Command write{};
+    write.kind = Pm4Command::Kind::WriteData;
+    write.wd_addr = child + 16;
+    write.wd_declared_num = write.wd_num = 1;
+    write.wd_data = &replacement;
+    write.wd_valid = true;
+    with_effect.ordered_memory_effects.emplace_back(write, 150);
+    with_effect.parser_stalls.push_back({175});
+    observations.clear();
+    EXPECT_FALSE(execute_ordered_and_present(with_effect, 8, 8, Submit + 2, false));
+    ASSERT_EQ(observations.size(), 2u) << "Legacy resource-free draw realization remains intact";
+    EXPECT_EQ(observations[0].index, 0u);
+    EXPECT_TRUE(observations[0].has_point);
+    EXPECT_FALSE(observations[0].live_point)
+        << "The next operation advances the local epoch before flushing the queued first draw";
+    ASSERT_TRUE(observations[0].has_snapshot);
+    EXPECT_EQ(observations[0].words, Values);
+    EXPECT_EQ(observations[1].index, 1u);
+    EXPECT_FALSE(observations[1].has_point)
+        << "A parser stall cannot turn the void retained effect outcome into completion proof";
+    uint32_t actual = 0;
+    std::memcpy(&actual, reinterpret_cast<const void*>(child + 16), sizeof(actual));
+    ASSERT_EQ(actual, replacement) << "The retained mapped WRITE_DATA actually executed";
+
+    observations.clear();
+    EXPECT_FALSE(execute_ordered_and_present(clean, 8, 8, Submit + 3, false));
+    ASSERT_EQ(observations.size(), 1u);
+    EXPECT_TRUE(observations[0].has_point);
+    EXPECT_TRUE(observations[0].live_point);
+    ASSERT_TRUE(observations[0].has_snapshot);
+    auto changed = Values;
+    changed[0] = replacement;
+    EXPECT_EQ(observations[0].words, changed)
+        << "Only a later independent clean submit can own the genuinely changed child";
     EXPECT_EQ(Backend::backend_failed_publication_generation().load(), generation_before);
 }
 

@@ -11505,6 +11505,9 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
     const float scale_y = full_height ? static_cast<float>(height) / full_height : 1.0f;
     OrderedSubmitResult result;
     bool producer_epoch_ok = true;
+    // The retained memory-effect ABI has no success result. Do not borrow the legacy epoch's
+    // reset at a parser stall as proof that an unknown prior effect completed successfully.
+    bool read_point_dependencies_ok = true;
     bool graphics_epoch_ok = true;
     const GraphicsProducerStatus graphics_epoch = graphics_producer_status();
     OrderedGraphicsReadPointIssuer read_points(graphics_epoch, execution);
@@ -11790,8 +11793,8 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                 const GpuState& read_state =
                     use_per_draw_policy(st) ? st.state_at_draw(operation.index) : st;
                 const auto read_render = extract_render_state(read_state);
-                read_points.dependencies_ok =
-                    producer_epoch_ok && graphics_epoch_ok && indirect_dependencies_ok;
+                read_points.dependencies_ok = read_point_dependencies_ok && producer_epoch_ok &&
+                                              graphics_epoch_ok && indirect_dependencies_ok;
                 raw_context.source_submit = submit_no;
                 raw_context.requires_ordered_read_point = true;
                 raw_context.ordered_read_point =
@@ -12404,6 +12407,7 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                             ComputeAuthorityBoundaryKind::OrderedMemoryEffect,
                             submit_no, operation.command_order);
                     execute_ordered_memory_effect(effect);
+                    read_point_dependencies_ok = false;
                 }
                 break;
         }

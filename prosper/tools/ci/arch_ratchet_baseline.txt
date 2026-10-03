@@ -171,7 +171,10 @@ blocking-sync|prosper/tests/fixtures/render_runner.h|vkWaitForFences 5
 file-size|prosper/frontends/shared/live/live_compute.cpp 15530  # raised from 15471: grown by #4173 (GPU breadcrumbs) before this gate landed
 file-size|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 5526
 # note: retain eleven upstream DST_SEL/refused-CS observation lines (#4290) alongside the finality reduction.
-file-size|prosper/src/gpu/execute/gpu_executor.cpp 13098
+# note #4328: 59 lines above that lowered cap connect real public-entry activity, borrowed private
+# helpers and checked draw/dependency boundaries; reusable issuance/version/consumer logic is in
+# companions. No wait or unrelated extraction; exact seam growth requires independent review.
+file-size|prosper/src/gpu/execute/gpu_executor.cpp 13157
 file-size|prosper/src/gpu/pm4/command_processor.cpp 5539
 # note #3951: one caller line delegates checked logical64 raw-window emission to its companion.
 file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9421
