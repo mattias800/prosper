@@ -548,16 +548,18 @@ struct FragmentPacketProgram {
     std::string rejection;
 };
 
-inline constexpr uint32_t kFragmentPacketVgprStatusMagic = 0x56475031u; // VGP1
+inline constexpr uint32_t kFragmentPacketVgprStatusMagic = 0x56475031u;   // VGP1
 inline constexpr uint32_t kFragmentPacketVgprStatusWords = 4;
 struct FragmentPacketResult {
-    std::vector<uint32_t> exports; // empty on ANY absent/malformed/failing worker
+    std::vector<uint32_t> exports;   // empty on ANY absent/malformed/failing worker
     std::string rejection;
-    bool vgpr_status_validated = false; // true only after EVERY present worker record is validated
+    bool vgpr_status_validated =
+        false;   // true only after EVERY present worker record is validated
     uint32_t lane = UINT32_MAX, pc = UINT32_MAX, reg = UINT32_MAX, kind = 0;
 };
 FragmentPacketResult decode_fragment_packet(const FragmentPacketProgram&,
-    std::span<const uint32_t> readback, bool completion_and_host_availability);
+                                            std::span<const uint32_t> readback,
+                                            bool completion_and_host_availability);
 
 // Actual guest instruction emission into a 64-worker logical-wave executor. No native subgroup64
 // requirement and no native fragment invocation pairing. This entry does not rasterize, interpolate,

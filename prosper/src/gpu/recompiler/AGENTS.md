@@ -39,6 +39,12 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   validate all64 records and the original-site whitelist before publishing any EXP. Fully supplied
   legacy packets keep their unextended wire format. This does not initialize inputs from host raster records,
   enable implicit/bias sampling, establish live resource epochs, or admit any real DrawItem.
+  `fragment_packet_special_f32` supplies integer-backed RCP/SQRT/direct RSQ, choosing correctly
+  rounded software results within the published approximation envelope, not AMD-unit bit identity.
+  Opcode-specific sign-preserving denormal flushing is separate from ordinary mode controls.
+  Retained producing PS RSRC2 must prove no handler, or disabled relevant floating exceptions and
+  DEBUG; MODE/STATUS observation remains unsupported. NaN payloads and negative roots remain
+  transactional named runtime failures, not guessed canonical values. This is not full special FP.
 - `fragment_packet_vgpr_requirements` inventories exact immutable raw program storage/read facts,
   pinned by the existing ShaderCodeAnalysis owner and consumed by shipping draw preparation.
   A structural writer is not proof of a value on EXEC-off lanes; runtime validity and real entry

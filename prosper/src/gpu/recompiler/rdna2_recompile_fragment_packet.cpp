@@ -305,14 +305,17 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     const auto requirements = fragment_packet_vgpr_requirements(packet.guest_code, ins);
     if (!requirements.rejection.empty()) return reject(requirements.rejection);
     bool runtime_definedness = false;
-    for (uint32_t reg = 0; reg < 256; ++reg) if (requirements.storage.test(reg)) {
-        const auto column = columns.find(reg);
-        runtime_definedness |= column == columns.end() || packet.vgprs[column->second].available_mask != UINT64_MAX;
-    }
+    for (uint32_t reg = 0; reg < 256; ++reg)
+        if (requirements.storage.test(reg)) {
+            const auto column = columns.find(reg);
+            runtime_definedness |= column == columns.end() ||
+                                   packet.vgprs[column->second].available_mask != UINT64_MAX;
+        }
     runtime_definedness &= !requirements.reads.empty();
 
     FragmentPacketProgram result;
-    result.input_stride = static_cast<uint32_t>(columns.size()) * (runtime_definedness ? 2u : 1u) + 4;
+    result.input_stride =
+        static_cast<uint32_t>(columns.size()) * (runtime_definedness ? 2u : 1u) + 4;
     result.exports_per_lane = static_cast<uint32_t>(exports.size());
     const uint32_t record_stride = result.exports_per_lane * kFragmentPacketExportWords;
     result.input_words.resize(kFragmentPacketLanes * result.input_stride);
@@ -321,8 +324,10 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         const uint32_t base = lane * result.input_stride;
         for (const auto& [reg, column] : columns)
             result.input_words[base + column] = packet.vgprs[column].words[lane];
-        if (runtime_definedness) for (const auto& [reg, column] : columns)
-            result.input_words[base + columns.size() + column] = (packet.vgprs[column].available_mask >> lane) & 1u;
+        if (runtime_definedness)
+            for (const auto& [reg, column] : columns)
+                result.input_words[base + columns.size() + column] =
+                    (packet.vgprs[column].available_mask >> lane) & 1u;
         const auto state_base = columns.size() * (runtime_definedness ? 2u : 1u);
         result.input_words[base + state_base] = (packet.exec_mask >> lane) & 1u;
         result.input_words[base + state_base + 1] = (packet.vcc_mask >> lane) & 1u;
@@ -353,10 +358,12 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     }
     if (runtime_definedness) {
         result.vgpr_status_offset = static_cast<uint32_t>(result.output_words.size());
-        result.output_words.resize(result.output_words.size() + 64 * kFragmentPacketVgprStatusWords, 0);
+        result.output_words.resize(result.output_words.size() + 64 * kFragmentPacketVgprStatusWords,
+                                   0);
         for (const auto& [pc, reads] : requirements.reads)
             for (const auto& read : reads)
-                result.vgpr_failure_sites.push_back({pc, read.reg, static_cast<uint32_t>(read.kind)});
+                result.vgpr_failure_sites.push_back(
+                    {pc, read.reg, static_cast<uint32_t>(read.kind)});
     }
     SpirvCompute b;
     b.diagnostic = diagnostic;
@@ -381,11 +388,13 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     // lane validity checks every actual read before transactional publication, including implicit
     // P2/wide resource ranges, EXEC-ignoring peer selection and the unchanged raw inactive EXP ABI.
     state.max_vgpr = columns.empty() ? 0 : columns.rbegin()->first;
-    for (uint32_t reg = 0; reg < 256; ++reg) if (requirements.storage.test(reg)) {
-        if (!state.vreg.contains(reg)) state.vreg.emplace(reg, b.uconst(0));
-        state.max_vgpr = std::max(state.max_vgpr, static_cast<int>(reg));
-    }
-    const uint32_t state_base = static_cast<uint32_t>(columns.size()) * (runtime_definedness ? 2u : 1u);
+    for (uint32_t reg = 0; reg < 256; ++reg)
+        if (requirements.storage.test(reg)) {
+            if (!state.vreg.contains(reg)) state.vreg.emplace(reg, b.uconst(0));
+            state.max_vgpr = std::max(state.max_vgpr, static_cast<int>(reg));
+        }
+    const uint32_t state_base =
+        static_cast<uint32_t>(columns.size()) * (runtime_definedness ? 2u : 1u);
     state.exec = b.ucmp(Op_INotEqual, b.load_input(state_base), b.uconst(0));
     state.vcc = b.ucmp(Op_INotEqual, b.load_input(state_base + 1), b.uconst(0));
     state.scc = b.ucmp(Op_INotEqual, b.load_input(state_base + 2), b.uconst(0));
@@ -418,8 +427,8 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
             return services->emit(b, current, in);
           }) : std::function<int(RegState&, const Rdna2Inst&)>{};
     if (!emit_cfg_state_machine(b, state, ins, {}, nullptr, true, false, export_record,
-                                packet.guest_code.data(), packet.guest_code.size(), 0, false, service_callback,
-                                runtime_definedness ? &definedness : nullptr)) {
+                                packet.guest_code.data(), packet.guest_code.size(), 0, false,
+                                service_callback, runtime_definedness ? &definedness : nullptr)) {
         const auto records = causes.take();
         return reject(records.empty() ? "packet-guest-emission-refused:no-cause-recorded"
             : "packet-guest-emission-refused:" + records.back().first + ":" +

@@ -7,6 +7,7 @@ FragmentResourcePacketProgram recompile_fragment_resource_packet(const FragmentR
     result.images = input.images;
     result.device = input.device;
     result.launch_rsrc1 = input.launch_rsrc1;
+    result.entry_facts = input.entry_facts;
     result.float_mode = input.invocation.float_mode;
     result.float_flags = input.invocation.float_flags;
     PacketResourceServices services{input, result};
@@ -18,7 +19,8 @@ FragmentResourcePacketProgram recompile_fragment_resource_packet(const FragmentR
         for (const auto& in : ins)
             if (in.fmt == Rdna2Format::SMEM || in.fmt == Rdna2Format::MIMG ||
                 in.fmt == Rdna2Format::VINTRP ||
-                (in.fmt == Rdna2Format::VOP2 && (in.opcode == 3 || in.opcode == 8)))
+                (in.fmt == Rdna2Format::VOP2 && (in.opcode == 3 || in.opcode == 8)) ||
+                (in.fmt == Rdna2Format::VOP1 && packet_special_f32_opcode(in.opcode)))
                 result.runtime_failure_pcs.push_back(in.pc);
     }
     return result;
@@ -39,30 +41,39 @@ FragmentResourcePacketResult decode_fragment_resource_packet(const FragmentResou
         return reject("packet-executing-enabled-device-mismatch");
     const auto definedness = decode_fragment_packet(program.packet, words, completed);
     if (!definedness.rejection.empty() && (!definedness.kind || !definedness.vgpr_status_validated))
-        return reject(definedness.rejection.c_str()); // full64 validity validation, never partial publication
+        return reject(definedness.rejection
+                          .c_str()); // full64 validity validation, never partial publication
     const uint64_t export_count = uint64_t(program.packet.exports_per_lane) * 64 * kFragmentPacketExportWords;
     if (program.packet.spirv.empty() || !program.packet.rejection.empty() ||
         !program.packet.exports_per_lane || program.packet.exports_per_lane > 64 ||
         program.status_offset != export_count ||
         words.size() != export_count + 64 * kFragmentResourceStatusWords +
-            (program.packet.vgpr_status_offset == UINT32_MAX ? 0u : 64 * kFragmentPacketVgprStatusWords) ||
+                            (program.packet.vgpr_status_offset == UINT32_MAX
+                                 ? 0u
+                                 : 64 * kFragmentPacketVgprStatusWords) ||
         (program.packet.vgpr_status_offset != UINT32_MAX &&
-            program.packet.vgpr_status_offset != export_count + 64 * kFragmentResourceStatusWords) ||
-        program.packet.output_words.size() != words.size()) return reject("packet-status-abi-invalid");
+         program.packet.vgpr_status_offset != export_count + 64 * kFragmentResourceStatusWords) ||
+        program.packet.output_words.size() != words.size())
+        return reject("packet-status-abi-invalid");
     // Validate the ENTIRE status array before returning even one record. Deterministic lowest
     // failing logical lane, then its sticky first guest-PC/reason. A later success cannot launder it.
     for (uint32_t lane = 0; lane < 64; ++lane) {
         const auto offset = program.status_offset + lane * kFragmentResourceStatusWords;
         const auto pc = words[offset + 1], reason = words[offset + 2];
         if (words[offset] != kFragmentResourceStatusMagic ||
-            reason > static_cast<uint32_t>(FragmentPacketRuntimeFailure::SampleLodDomain) ||
+            reason >
+                static_cast<uint32_t>(FragmentPacketRuntimeFailure::SpecialNanOrNegativeRoot) ||
             ((reason == 0) != (pc == UINT32_MAX)) ||
-            (reason && std::find(program.runtime_failure_pcs.begin(), program.runtime_failure_pcs.end(), pc)
-                == program.runtime_failure_pcs.end())) return reject("packet-status-record-invalid");
+            (reason &&
+             std::find(program.runtime_failure_pcs.begin(), program.runtime_failure_pcs.end(),
+                       pc) == program.runtime_failure_pcs.end()))
+            return reject("packet-status-record-invalid");
         uint32_t vgpr_pc = UINT32_MAX, vgpr_reg = UINT32_MAX, vgpr_kind = 0;
         if (program.packet.vgpr_status_offset != UINT32_MAX) {
-            const auto validity_offset = program.packet.vgpr_status_offset + lane * kFragmentPacketVgprStatusWords;
-            vgpr_pc = words[validity_offset + 1]; vgpr_reg = words[validity_offset + 2];
+            const auto validity_offset =
+                program.packet.vgpr_status_offset + lane * kFragmentPacketVgprStatusWords;
+            vgpr_pc = words[validity_offset + 1];
+            vgpr_reg = words[validity_offset + 2];
             vgpr_kind = words[validity_offset + 3];
         }
         if ((reason || vgpr_kind) && result.failure == FragmentPacketRuntimeFailure::None) {
@@ -70,10 +81,11 @@ FragmentResourcePacketResult decode_fragment_resource_packet(const FragmentResou
             // precede the resource instruction at equal PC; preserve first ACTUAL failure across
             // both sticky channels, then retain the deterministic lowest failing logical lane.
             const bool first_vgpr = vgpr_kind && (!reason || vgpr_pc <= pc);
-            result.lane = lane; result.pc = first_vgpr ? vgpr_pc : pc;
+            result.lane = lane;
+            result.pc = first_vgpr ? vgpr_pc : pc;
             result.vgpr = first_vgpr ? vgpr_reg : UINT32_MAX;
-            result.failure = first_vgpr ? FragmentPacketRuntimeFailure::UndefinedVgpr :
-                static_cast<FragmentPacketRuntimeFailure>(reason);
+            result.failure = first_vgpr ? FragmentPacketRuntimeFailure::UndefinedVgpr
+                                        : static_cast<FragmentPacketRuntimeFailure>(reason);
         }
     }
     if (result.failure != FragmentPacketRuntimeFailure::None) {
@@ -85,7 +97,10 @@ FragmentResourcePacketResult decode_fragment_resource_packet(const FragmentResou
             case FragmentPacketRuntimeFailure::InterpolationNotExact: return reject("packet-runtime-interpolation-exactness-unproved");
             case FragmentPacketRuntimeFailure::SampleCoordinateDomain: return reject("packet-runtime-sample-coordinate-domain-unimplemented");
             case FragmentPacketRuntimeFailure::SampleLodDomain: return reject("packet-runtime-sample-lod-domain-unimplemented");
-            case FragmentPacketRuntimeFailure::UndefinedVgpr: return reject("packet-runtime-vgpr-read-before-definition");
+            case FragmentPacketRuntimeFailure::SpecialNanOrNegativeRoot:
+                return reject("packet-runtime-special-f32-nan-or-negative-root-unimplemented");
+            case FragmentPacketRuntimeFailure::UndefinedVgpr:
+                return reject("packet-runtime-vgpr-read-before-definition");
             default: return reject("packet-status-record-invalid");
         }
     }

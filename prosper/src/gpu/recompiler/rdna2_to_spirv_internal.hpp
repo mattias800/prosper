@@ -3481,9 +3481,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 struct PacketVgprDefinedness;
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
-    const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
-    bool allow_exec_update, bool allow_smem,
-    const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
+    const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt, bool allow_exec_update,
+    bool allow_smem, const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
     const uint32_t* code, size_t dwords, uint32_t initial_active = 0,
     bool synchronize_lds_fminmax = false,
     const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction = {},

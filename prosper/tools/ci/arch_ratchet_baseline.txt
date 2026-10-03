@@ -177,7 +177,9 @@ file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9420
 # dispatcher boundary, preserving the empty native callback and scalar lifetime invalidation.
 file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 9009
 file-size|prosper/src/hle/kernel/hle_kernel.cpp 5566
-file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8625
+# note #4200: fourteen net lines retain the APR binding/submit/tail dialect and test observer,
+# including changed-line formatting; other memory behavior is unchanged.
+file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8639
 file-size|prosper/tests/fixtures/render_runner.h 16758  # raised from 16700: grown by #4173 (GPU breadcrumbs) before this gate landed
 test-dep|prosper/frontends/shared/live/live_renderer.cpp 73
 test-dep|prosper/frontends/shared/live/live_renderer_internal.hpp 20

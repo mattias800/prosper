@@ -7,7 +7,10 @@
 
 namespace prosper::gpu {
 enum class FragmentPacketVgprRead : uint32_t {
-    Direct = 1, InterpolationPrevious = 2, SelectedPeer = 3, RawExport = 4,
+    Direct = 1,
+    InterpolationPrevious = 2,
+    SelectedPeer = 3,
+    RawExport = 4,
 };
 struct FragmentPacketVgprAccess {
     uint32_t reg = 0;
@@ -22,7 +25,8 @@ struct FragmentPacketVgprRequirements {
     std::string rejection;
     uint64_t retained_bytes() const;
 };
-FragmentPacketVgprRequirements fragment_packet_vgpr_requirements(
-    const std::vector<uint32_t>& code, const std::vector<Rdna2Inst>& instructions);
+FragmentPacketVgprRequirements
+fragment_packet_vgpr_requirements(const std::vector<uint32_t>& code,
+                                  const std::vector<Rdna2Inst>& instructions);
 FragmentPacketVgprRequirements fragment_packet_vgpr_requirements(const std::vector<uint32_t>& code);
 } // namespace prosper::gpu

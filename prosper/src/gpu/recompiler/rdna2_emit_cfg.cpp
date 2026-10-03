@@ -1788,11 +1788,9 @@ void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& in
 
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
-    const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
-    bool allow_exec_update, bool allow_smem,
-    const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
-    const uint32_t* code, size_t dwords, uint32_t initial_active,
-    bool synchronize_lds_fminmax,
+    const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt, bool allow_exec_update,
+    bool allow_smem, const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
+    const uint32_t* code, size_t dwords, uint32_t initial_active, bool synchronize_lds_fminmax,
     const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction,
     PacketVgprDefinedness* packet_definedness) {
     const bool graphics = !b.has_workgroup_execution() && (b.is_fragment || b.is_vertex);
@@ -6965,8 +6963,9 @@ bool emit_cfg_state_machine(
     }
 
     if (has_portable_readlane) {
-        if (!emit_cfg_readlane_phase(b, packet_definedness, readlane_pending_var, readlane_source_var,
-            readlane_selector_var, readlane_dst_var, portable_readlane_dsts, sv, mv, mhv, vcc_var))
+        if (!emit_cfg_readlane_phase(b, packet_definedness, readlane_pending_var,
+                                     readlane_source_var, readlane_selector_var, readlane_dst_var,
+                                     portable_readlane_dsts, sv, mv, mhv, vcc_var))
             return reject_cfg(0, "missing-portable-readlane-dst");
     }
 
