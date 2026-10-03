@@ -9,6 +9,8 @@
 #include <windows.h>
 #include <atomic>
 #include <cstdint>
+#include <initializer_list>
+#include <memory>
 #include <thread>
 
 using namespace prosper;
@@ -19,15 +21,34 @@ alignas(64) volatile uint64_t g_watched[8];   // [0] is watched; the rest are ne
 
 struct WatchFixture : ::testing::Test {
     void SetUp() override {
+        win_data_watch_set_registration_hook_for_test(nullptr);
         win_data_watch_reset_for_test();
         g_watched[0] = 0;
         g_watched[1] = 0;
     }
-    void TearDown() override { win_data_watch_reset_for_test(); }
+    void TearDown() override {
+        win_data_watch_set_registration_hook_for_test(nullptr);
+        win_data_watch_reset_for_test();
+    }
 };
 
 uint64_t watched_addr() {
     return reinterpret_cast<uint64_t>(&g_watched[0]);
+}
+
+CONTEXT watched_context(uint64_t addr) {
+    CONTEXT result{};
+    result.Dr0 = addr;
+    result.Dr7 = win_data_watch_dr7(8);
+    result.Dr6 = 1;
+    return result;
+}
+
+long dispatch_watch(CONTEXT& context) {
+    EXCEPTION_RECORD record{};
+    record.ExceptionCode = EXCEPTION_SINGLE_STEP;
+    EXCEPTION_POINTERS ep{&record, &context};
+    return win_data_watch_handle_for_test(&ep);
 }
 
 }   // namespace
@@ -70,6 +91,7 @@ TEST_F(WatchFixture, ArmedThreadWriteIsCaughtWithValueAndThread) {
     ASSERT_TRUE(win_data_watch_last_hit(&hit));
     EXPECT_EQ(hit.addr, watched_addr());
     EXPECT_EQ(hit.value, 0x1122334455667788ull);
+    EXPECT_TRUE(hit.value_available);
     EXPECT_EQ(hit.tid, GetCurrentThreadId());
     EXPECT_NE(hit.rip, 0u);
 }
@@ -161,4 +183,122 @@ TEST_F(WatchFixture, EverySlotCatchesItsOwnWordAndReportsItsIndex) {
     g_watched[1] = 1;   // between watched words: must not fire
     g_watched[3] = 1;
     EXPECT_EQ(win_data_watch_hit_count(), 3u);
+}
+
+TEST(WinDataWatchSpec, SignsAndOverflowDoNotChooseAnotherAddress) {
+    uint64_t addr = 0;
+    unsigned len = 0;
+    // The negative magnitude is representable, but unsigned negation would turn it into 0x10000.
+    for (const char* spec : {"-18446744073709486080:1", " -18446744073709486080:1", "+65536:1",
+                             "18446744073709551616:1", "0x10000:-4294967295", "0x10000:+1",
+                             "0x10000:18446744073709551616"})
+        EXPECT_FALSE(win_data_watch_parse(spec, &addr, &len)) << spec;
+    EXPECT_TRUE(win_data_watch_parse("65536:1", &addr, &len));
+    EXPECT_EQ(addr, 0x10000ull);
+    EXPECT_EQ(len, 1u);
+    EXPECT_TRUE(win_data_watch_parse("0x10000:8", &addr, &len));
+    EXPECT_EQ(len, 8u);
+}
+
+TEST(WinDataWatchSpec, ContextRequiresEnabledOwnedAddressTypeAndLength) {
+    const WinDataWatchSpec owned[2] = {{0x10000, 8}, {0x10008, 8}};
+    const uint64_t addrs[4] = {0x10000, 0x10008, 0, 0};
+    const uint64_t control = win_data_watch_dr7_slot(0, 8) | win_data_watch_dr7_slot(1, 8);
+    EXPECT_EQ(win_data_watch_matching_slots(3, control, addrs, owned, 2), 3u);
+    EXPECT_EQ(win_data_watch_matching_slots(3, control & ~1ull, addrs, owned, 2), 2u);
+    EXPECT_EQ(win_data_watch_matching_slots(3, control, addrs, owned, 0), 0u);
+    EXPECT_EQ(win_data_watch_matching_slots(1, win_data_watch_dr7(4), addrs, owned, 2), 0u);
+    EXPECT_EQ(win_data_watch_matching_slots(1, control & ~(1ull << 16), addrs, owned, 2), 0u);
+    const uint64_t foreign[4] = {0x20000, 0x20008, 0, 0};
+    EXPECT_EQ(win_data_watch_matching_slots(3, control, foreign, owned, 2), 0u);
+    EXPECT_EQ(win_data_watch_matching_slots(4, control, addrs, owned, 2), 0u);
+}
+
+TEST(WinDataWatchSpec, RemainingSingleStepOrEnabledBreakpointIsNotConsumed) {
+    EXPECT_TRUE(win_data_watch_needs_other_handler(1ull << 14, 0, 0x100));
+    EXPECT_FALSE(win_data_watch_needs_other_handler(1ull << 14, 0, 0));   // stale BS
+    EXPECT_TRUE(win_data_watch_needs_other_handler(2, win_data_watch_dr7_slot(1, 8), 0));
+    EXPECT_FALSE(win_data_watch_needs_other_handler(2, 0, 0));   // disabled status is not a cause
+    EXPECT_TRUE(win_data_watch_needs_other_handler(1ull << 13, 0, 0));
+    EXPECT_FALSE(win_data_watch_needs_other_handler(0, 0, 0));
+}
+
+TEST_F(WatchFixture, RegistrationFailurePreventsConfigurationAndArming) {
+    win_data_watch_set_registration_hook_for_test(+[]() -> void* { return nullptr; });
+    EXPECT_FALSE(win_data_watch_configure(watched_addr(), 8));
+    win_data_watch_arm_current_thread();
+    g_watched[0] = 1;
+    EXPECT_EQ(win_data_watch_hit_count(), 0u);
+}
+
+TEST_F(WatchFixture, OneWriteRetainsEveryMatchingSlot) {
+    // Two registers watching the same word guarantee a multi-bit event from one scalar write.
+    // The same event shape occurs when a wide store covers adjacent watched words.
+    const WinDataWatchSpec owned[2] = {{watched_addr(), 8}, {watched_addr(), 8}};
+    ASSERT_TRUE(win_data_watch_configure_list(owned, 2));
+    win_data_watch_arm_current_thread();
+    g_watched[0] = 0x1234;
+    EXPECT_EQ(win_data_watch_hit_count(), 2u);
+    WinDataWatchHit hit{};
+    ASSERT_TRUE(win_data_watch_last_hit(&hit));
+    EXPECT_EQ(hit.slot, 1u);
+    EXPECT_EQ(hit.value, 0x1234ull);
+    EXPECT_TRUE(hit.value_available);
+}
+
+TEST_F(WatchFixture, UnarmedThreadContextIsNotAttributedToGlobalWatch) {
+    ASSERT_TRUE(win_data_watch_configure(watched_addr(), 8));
+    long action = 0;
+    uint64_t retained_status = 0;
+    std::thread other([&] {
+        CONTEXT context = watched_context(watched_addr());
+        action = dispatch_watch(context);   // this worker has never been armed by this observer
+        retained_status = context.Dr6;
+    });
+    other.join();
+    EXPECT_EQ(action, EXCEPTION_CONTINUE_SEARCH);
+    EXPECT_EQ(retained_status, 1u);
+    EXPECT_EQ(win_data_watch_hit_count(), 0u);
+}
+
+TEST_F(WatchFixture, MixedDataHitPreservesRequestedSingleStep) {
+    ASSERT_TRUE(win_data_watch_configure(watched_addr(), 8));
+    win_data_watch_arm_current_thread();
+    CONTEXT context = watched_context(watched_addr());
+    context.Dr6 |= 1ull << 14;
+    context.EFlags = 0x100;
+    EXPECT_EQ(dispatch_watch(context), EXCEPTION_CONTINUE_SEARCH);
+    EXPECT_EQ(context.Dr6, 1ull << 14);
+    EXPECT_EQ(context.EFlags & 0x100, 0x100u);
+    EXPECT_EQ(win_data_watch_hit_count(), 1u);
+}
+
+TEST_F(WatchFixture, UnavailableValueIsDistinctFromObservedZero) {
+    const auto release = [](void* p) {
+        if (p) VirtualFree(p, 0, MEM_RELEASE);
+    };
+    const std::unique_ptr<void, decltype(release)> page(
+        VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE), release);
+    ASSERT_NE(page.get(), nullptr);
+    *static_cast<volatile uint64_t*>(page.get()) = 0;
+    const uint64_t addr = reinterpret_cast<uint64_t>(page.get());
+    ASSERT_TRUE(win_data_watch_configure(addr, 8));
+    std::thread worker([&] {
+        win_data_watch_arm_current_thread();
+        DWORD old = 0;
+        ASSERT_TRUE(VirtualProtect(page.get(), 4096, PAGE_NOACCESS, &old));
+        CONTEXT context = watched_context(addr);
+        EXPECT_EQ(dispatch_watch(context), EXCEPTION_CONTINUE_EXECUTION);
+        WinDataWatchHit hit{};
+        ASSERT_TRUE(win_data_watch_last_hit(&hit));
+        EXPECT_FALSE(hit.value_available);
+        EXPECT_EQ(hit.value, 0u);
+        ASSERT_TRUE(VirtualProtect(page.get(), 4096, old, &old));
+        *static_cast<volatile uint64_t*>(page.get()) = 0;   // real hardware-hit positive control
+        ASSERT_TRUE(win_data_watch_last_hit(&hit));
+        EXPECT_TRUE(hit.value_available);
+        EXPECT_EQ(hit.value, 0u);
+        EXPECT_EQ(win_data_watch_hit_count(), 2u);
+    });
+    worker.join();
 }

@@ -22,6 +22,7 @@
 #include <cstdint>
 
 #ifdef _WIN32
+struct _EXCEPTION_POINTERS;
 namespace prosper {
 
 constexpr unsigned kWinDataWatchSlots = 4;
@@ -37,6 +38,15 @@ uint64_t win_data_watch_dr7_slot(unsigned slot, unsigned len);
 
 // Slot 0 only: the single-address form, kept for callers that watch one word.
 uint64_t win_data_watch_dr7(unsigned len);
+
+// Filter status to enabled local slots whose address, type and length match the owned snapshot.
+// A DR6 bit alone is not ownership: disabled-slot bits may also be set by the processor.
+unsigned win_data_watch_matching_slots(uint64_t status, uint64_t control,
+                                       const uint64_t addrs[kWinDataWatchSlots],
+                                       const WinDataWatchSpec* owned, unsigned count);
+
+// After consuming our slot bits, retain another enabled breakpoint or a requested single step.
+bool win_data_watch_needs_other_handler(uint64_t status, uint64_t control, uint64_t flags);
 
 // True when `addr` can be watched at `len` bytes (a supported length and naturally aligned).
 bool win_data_watch_addr_ok(uint64_t addr, unsigned len);
@@ -57,6 +67,9 @@ void win_data_watch_arm_current_thread();
 bool win_data_watch_configure(uint64_t addr, unsigned len);
 bool win_data_watch_configure_list(const WinDataWatchSpec* specs, unsigned count);
 void win_data_watch_reset_for_test();
+using WinDataWatchRegistrationHook = void* (*)();
+void win_data_watch_set_registration_hook_for_test(WinDataWatchRegistrationHook hook);
+long win_data_watch_handle_for_test(::_EXCEPTION_POINTERS* ep);
 
 struct WinDataWatchHit {
     uint64_t rip;
@@ -64,6 +77,7 @@ struct WinDataWatchHit {
     uint64_t value;
     unsigned long tid;
     unsigned slot;
+    bool value_available;
 };
 uint64_t win_data_watch_hit_count();
 bool win_data_watch_last_hit(WinDataWatchHit* out);
