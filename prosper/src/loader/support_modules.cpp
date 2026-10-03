@@ -3,6 +3,8 @@
 #include "loader/support_modules.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <filesystem>
 #include <unordered_set>
 
 namespace prosper {
@@ -45,6 +47,31 @@ std::vector<size_t> unimported_support_module_indices(
             drop.push_back(i);
     }
     return drop;
+}
+
+ModuleLinkFacts module_link_facts(const Module& module) {
+    ModuleLinkFacts facts;
+    for (const auto& imported : module.imports) {
+        facts.imported_libs.push_back(imported.lib_name);
+        facts.imported_nids.push_back(imported.nid);
+    }
+    facts.exported_nids = module_export_nids(module);
+    return facts;
+}
+
+bool has_deferred_module_init_contract(const std::string& dump_root, const std::string& path) {
+    if (dump_root.empty() || path.empty()) return false;
+    const auto normalized = [](std::string value) {
+        std::replace(value.begin(), value.end(), '\\', '/');
+        auto result = std::filesystem::path(value).lexically_normal();
+        if (!result.has_filename()) result = result.parent_path();
+        return result.empty() ? std::filesystem::path(".") : result;
+    };
+    const auto module = normalized(path);
+    if (normalized(module.parent_path().generic_string()) != normalized(dump_root)) return false;
+    std::string filename = module.filename().generic_string();
+    for (auto& c : filename) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return filename == "libaegir_f.prx";
 }
 
 std::vector<size_t> veto_imported_init_on_load(std::vector<LinkInput>& in,

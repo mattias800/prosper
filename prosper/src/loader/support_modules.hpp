@@ -77,10 +77,21 @@ struct ModuleLinkFacts {
     std::vector<std::string> exported_nids;   // NIDs this module defines
 };
 
+// Derive initialization dependencies with the same export predicate used by link_program.
+// A defined NID with a nonzero value remains an export when its section index is zero.
+ModuleLinkFacts module_link_facts(const Module& module);
+
+// A narrow, affirmative module-init contract, not the complement of the import graph. The
+// documented root-level libaegir_f runtime load follows guest setup of libmemorywrapper_f; the
+// other auto-linked modules retain eager initialization, including unimported Unity plugins.
+// Imported dependencies still veto this opt-in below. Pure lexical paths: no file or guest read.
+bool has_deferred_module_init_contract(const std::string& dump_root, const std::string& path);
+
 // Clears `init_on_load` on every input some OTHER module in `in` depends on, either by library name
 // (the importer names the candidate's filename stem) or, independently, because it imports a NID the
-// candidate exports. A module with a dependent must be initialised before that dependent runs, so only
-// a module nobody links against may wait for the guest's own sceKernelLoadStartModule. `facts` is
+// candidate exports. A module with a dependent must be initialised before that dependent runs.
+// Having no static dependent is necessary but does not prove the guest will load it: callers must
+// establish the affirmative init-on-load contract separately. `facts` is
 // parallel to `in`; a module's own imports never vouch for it. Returns the indices that were cleared.
 std::vector<size_t> veto_imported_init_on_load(std::vector<LinkInput>& in,
                                                const std::vector<ModuleLinkFacts>& facts);

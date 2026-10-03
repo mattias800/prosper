@@ -7,16 +7,23 @@
 // *Sniper Ghost Warrior Contracts 2* ships it, imports `libSceNpWebApi2` instead, and deadlocks in
 // that module's `module_start` 81 ms into the boot.
 //
-// The policy is a pure function so both directions are testable with no dump and no SELF parser.
+// Pure policy cases need no dump or SELF parser. The discovery case uses only synthetic modules
+// to exercise the real candidate list and parsed dependency veto without executing constructors.
 // Both directions matter and the KEEP arm is the load-bearing one: a filter that drops everything
 // would satisfy the drop arm perfectly and silently break Sonic Origins.
 
+#include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <gtest/gtest.h>
 #include <string>
 #include <vector>
 
 #include "loader/support_modules.hpp"
+#include "host/image/boot_program.hpp"
+#include "fixtures/handmade_prx.h"
+#include "fixtures/synth_prx.h"
+#include "fixtures/test_scratch.h"
 
 using prosper::LinkInput;
 using prosper::support_module_lib_name;
@@ -180,4 +187,134 @@ TEST(SupportModules, InitOnLoadKeptWhenNoNidOrNameDependency) {
     facts[1].exported_nids = {"nidC"};
     prosper::veto_imported_init_on_load(in, facts);
     EXPECT_TRUE(in[1].init_on_load);
+}
+
+TEST(SupportModules, InitOnLoadVetoUsesActualSectionZeroExport) {
+    prosper::Module provider;
+    prosper::Symbol actual;
+    actual.nid = "definedNid";
+    actual.value = 0x1000u;
+    actual.shndx = 0;
+    actual.is_import = false;
+    provider.symbols = {actual};
+    auto zero_value = actual;
+    zero_value.nid = "zeroNid";
+    zero_value.value = 0;
+    zero_value.shndx = 1;
+    provider.symbols.push_back(zero_value);
+    auto imported = actual;
+    imported.nid = "importedNid";
+    imported.is_import = true;
+    provider.symbols.push_back(imported);
+    auto unnamed = actual;
+    unnamed.nid.clear();
+    provider.symbols.push_back(unnamed);
+    const auto provider_facts = prosper::module_link_facts(provider);
+    EXPECT_EQ(provider_facts.exported_nids, std::vector<std::string>{"definedNid"});
+
+    LinkInput middleware = ordinary("/d/middleware.prx");
+    middleware.init_on_load = true;
+    std::vector<LinkInput> inputs = {ordinary("/d/eboot.bin"), middleware};
+    std::vector<ModuleLinkFacts> facts(2);
+    facts[0].imported_libs = {"RuntimeApi"};
+    facts[0].imported_nids = {"definedNid"};
+    facts[1] = provider_facts;
+    prosper::veto_imported_init_on_load(inputs, facts);
+    EXPECT_FALSE(inputs[1].init_on_load);
+
+    inputs[1].init_on_load = true;
+    facts[0].imported_nids = {"zeroNid", "importedNid"};
+    prosper::veto_imported_init_on_load(inputs, facts);
+    EXPECT_TRUE(inputs[1].init_on_load) << "non-exports do not manufacture a dependency";
+}
+
+TEST(SupportModules, DeferredInitRequiresAffirmativeRootModuleContract) {
+    EXPECT_TRUE(prosper::has_deferred_module_init_contract("/d", "/d/libaegir_f.prx"));
+    EXPECT_TRUE(prosper::has_deferred_module_init_contract("/d/", "/d/LIBAegir_F.PRX"));
+    EXPECT_TRUE(prosper::has_deferred_module_init_contract("C:\\d", "C:\\d\\libaegir_f.prx"));
+    EXPECT_TRUE(prosper::has_deferred_module_init_contract(".", "./libaegir_f.prx"));
+    EXPECT_FALSE(prosper::has_deferred_module_init_contract("/d", "/d/libmemorywrapper_f.prx"));
+    EXPECT_FALSE(prosper::has_deferred_module_init_contract("/d", "/d/unknown.prx"));
+    EXPECT_FALSE(
+        prosper::has_deferred_module_init_contract("/d", "/d/Media/Plugins/libaegir_f.prx"));
+    EXPECT_FALSE(prosper::has_deferred_module_init_contract("/d", "/d/Media/Plugins/PSN.prx"));
+    EXPECT_FALSE(prosper::has_deferred_module_init_contract("/d", "/d/Media/Plugins/libfmodL.prx"));
+    EXPECT_FALSE(prosper::has_deferred_module_init_contract("/d", "/other/libaegir_f.prx"));
+    EXPECT_FALSE(prosper::has_deferred_module_init_contract("/d", "/d/../other/libaegir_f.prx"));
+    EXPECT_FALSE(prosper::has_deferred_module_init_contract("", "libaegir_f.prx"));
+    EXPECT_FALSE(prosper::has_deferred_module_init_contract("/d", ""));
+}
+
+// Exercise the real discovery/candidate/veto path, not just the filename helper. Unknown root
+// modules and runtime plugins must retain eager constructors even without static importers.
+TEST(SupportModules, BootDiscoveryKeepsUnknownAndPluginInitEager) {
+    ASSERT_EQ(std::getenv("PROSPER_NO_PLUGIN_AUTOLINK"), nullptr);
+    namespace fs = std::filesystem;
+    const auto root = prosper_test::test_scratch_path("deferred-init-root");
+    fs::create_directories(root / "Media/Plugins");
+    std::string error;
+    const auto eboot = root / "eboot.bin";
+    ASSERT_TRUE(prosper_test::write_module_bytes(
+        eboot.string(), prosper_test::handmade_prx_bytes("entryA", "entryB", "unusedNid"), &error))
+        << error;
+    prosper_test::SynthModuleSpec engine;
+    engine.exports = {"engineEntry"};
+    const auto engine_path = root / "libaegir_f.prx";
+    ASSERT_TRUE(prosper_test::write_synth_prx(engine_path.string(), engine, &error)) << error;
+    ASSERT_TRUE(prosper_test::write_module_bytes(
+        (root / "unknown.prx").string(),
+        prosper_test::handmade_prx_bytes("unknownA", "unknownB", "unusedNid"), &error))
+        << error;
+    prosper_test::SynthModuleSpec plugin;
+    plugin.exports = {"pluginEntry"};
+    ASSERT_TRUE(prosper_test::write_synth_prx((root / "Media/Plugins/native_plugin.prx").string(),
+                                              plugin, &error))
+        << error;
+    prosper_test::SynthModuleSpec wrapper;
+    wrapper.exports = {"wrapperEntry"};
+    ASSERT_TRUE(
+        prosper_test::write_synth_prx((root / "libmemorywrapper_f.prx").string(), wrapper, &error))
+        << error;
+    const auto parsed_engine = prosper::Module::load(engine_path.string(), &error);
+    ASSERT_TRUE(parsed_engine.has_value()) << error;
+    ASSERT_NE(parsed_engine->init_va, 0u);
+
+    auto inputs = prosper::boot_link_inputs(root.string(), false);
+    auto find_input = [&](const fs::path& path) {
+        return std::find_if(inputs.begin(), inputs.end(),
+                            [&](const LinkInput& input) { return fs::path(input.path) == path; });
+    };
+    auto selected = find_input(engine_path);
+    ASSERT_NE(selected, inputs.end());
+    EXPECT_TRUE(selected->init_on_load);
+    for (const auto& path : {eboot, root / "unknown.prx", root / "libmemorywrapper_f.prx",
+                             root / "Media/Plugins/native_plugin.prx"}) {
+        const auto eager = find_input(path);
+        ASSERT_NE(eager, inputs.end()) << path.string();
+        EXPECT_FALSE(eager->init_on_load) << path.string();
+    }
+
+    // A genuine parsed NID dependency vetoes the known candidate even when the importer library
+    // name differs.
+    prosper_test::SynthModuleSpec importer;
+    importer.imports = {"engineEntry"};
+    ASSERT_TRUE(prosper_test::write_synth_prx(eboot.string(), importer, &error)) << error;
+    inputs = prosper::boot_link_inputs(root.string(), false);
+    selected = find_input(engine_path);
+    ASSERT_NE(selected, inputs.end());
+    EXPECT_FALSE(selected->init_on_load);
+
+    // An unreadable importer is unknown, not proof that no constructor depends on the engine.
+    ASSERT_TRUE(prosper_test::write_module_bytes(
+        eboot.string(), prosper_test::handmade_prx_bytes("entryA", "entryB", "unusedNid"), &error))
+        << error;
+    auto malformed = plugin;
+    malformed.e_machine = 0;
+    ASSERT_TRUE(prosper_test::write_synth_prx((root / "unknown.prx").string(), malformed, &error))
+        << error;
+    ASSERT_FALSE(prosper::Module::load((root / "unknown.prx").string(), &error).has_value());
+    inputs = prosper::boot_link_inputs(root.string(), false);
+    selected = find_input(engine_path);
+    ASSERT_NE(selected, inputs.end());
+    EXPECT_FALSE(selected->init_on_load);
 }

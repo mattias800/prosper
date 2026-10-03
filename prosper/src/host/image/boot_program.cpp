@@ -198,13 +198,7 @@ void veto_init_on_load_for_imported(std::vector<LinkInput>& in, const Say& say) 
     for (size_t i = 0; i < in.size(); ++i) {
         std::string perr;
         if (auto m = Module::load(in[i].path, &perr)) {
-            for (const auto& imp : m->imports) {
-                facts[i].imported_libs.push_back(imp.lib_name);
-                facts[i].imported_nids.push_back(imp.nid);
-            }
-            for (const auto& sym : m->symbols)
-                if (!sym.is_import && sym.shndx != 0 && !sym.nid.empty())
-                    facts[i].exported_nids.push_back(sym.nid);
+            facts[i] = module_link_facts(*m);
         } else {
             // Unknown importer: stay eager everywhere rather than risk starving a real dependency.
             say("init-on-load: cannot parse %s (%s); keeping all module init eager\n", in[i].path.c_str(), perr.c_str());
@@ -300,10 +294,10 @@ std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
             // module handle. Deduplicating on exports rather than on a filename suffix also degrades
             // correctly for a title that ships only the debug variant — nothing collides, so it links.
             LinkInput li{ path, base, true };
-            // A PRX beside the eboot that nothing imports is one the title loads itself, so its
-            // constructors belong to that sceKernelLoadStartModule call, not to boot. Imported ones
-            // are vetoed below once the link list is complete.
-            li.init_on_load = true;
+            // An absent static importer says nothing about runtime dlsym users. Defer only a
+            // module with an affirmative runtime-init contract; unknown/root/Unity plugins keep
+            // boot initialization. Imported dependencies are vetoed once the link list is complete.
+            li.init_on_load = has_deferred_module_init_contract(d, path);
             in.insert(in.begin() + (ptrdiff_t)(insert_at + slot), li);
             slot++;
         }

@@ -57,8 +57,8 @@ struct LinkInput {
     // Link and map the module, but do not run its init function / init_array at boot. They are
     // recorded in Program::deferred_inits and run when the guest itself calls
     // sceKernelLoadStartModule for this path -- the point at which a real loader runs them.
-    // Set only for a module nothing in the link list imports: a statically imported module is
-    // initialised before its importer, so it must stay eager (see `defer_unimported_module_init`).
+    // Set only for an affirmatively known runtime-loaded module, then veto every static dependency:
+    // an unimported module can still be reached through dlsym without any explicit load call.
     // Assassin's Creed Black Flag Resynced: libmemorywrapper_f must be prepared by the eboot before
     // libaegir_f's static constructors allocate; running them at boot faults on a NULL dispatch table.
     bool init_on_load = false;
