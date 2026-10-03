@@ -97,6 +97,8 @@ TEST(FragmentSpecialF32, KnownProducingTrapFieldsAndWholeProgramObservation) {
         // Unknown is not mode0, and a retained field is not proof of some different raw launch.
         missing = p;
         missing.invocation.float_mode.available = false;
+        reject(missing, "packet-launch-state-invalid");   // noncanonical unknown retains 0x30
+        missing.invocation.float_mode = {};   // genuine canonical absence, never a known mode0
         reject(missing, "packet-f32-launch-mode-or-flags-unavailable");
         missing = p;
         missing.launch_rsrc1.value ^= 1u << 12;
