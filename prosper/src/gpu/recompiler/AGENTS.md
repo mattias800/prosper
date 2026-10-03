@@ -7,7 +7,8 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the
   translator: register state, control-flow structurization, and per-instruction lowering.
 - `rdna2_cfg_registers` — shared register storage/effect inventory extracted from the capped CFG
-  file without changing the existing native register-effect domain.
+  file. Native effects remain unchanged; an explicit owned-packet caller includes genuine VINTRP
+  destinations for predicated preservation/P2. Storage reload never grants per-lane entry validity.
 - `rdna2_recompile_fragment_packet` — an owned 64-slot guest-fragment executor in a physical
   64-worker compute workgroup. It directly uses the synchronized CFG services for whole-wave
   votes, saved-mask reductions, canonical-half mask MBCNT, READLANE and explicit logical-quad B64 WQM,

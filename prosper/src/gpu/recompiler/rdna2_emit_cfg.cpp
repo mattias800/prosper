@@ -3,10 +3,10 @@
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/fragment_packet_definedness.hpp"
-#include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -2356,7 +2356,7 @@ bool emit_cfg_state_machine(
 
     // Persist only registers that the stream reads or writes, plus the caller's initialized inputs.
     std::set<int> vregs, sregs;
-    loop_written_regs(ins, 0, end_pc, vregs, sregs);
+    loop_written_regs(ins, 0, end_pc, vregs, sregs, b.is_fragment_packet());
     for (const auto& in : ins) {
         if (in.is_end) break;
         for (uint32_t k = 0; k < in.n_src; ++k) {
@@ -2450,7 +2450,8 @@ bool emit_cfg_state_machine(
         const uint32_t lo = starts[block];
         const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
         std::set<int> ignored_scalar_writes;
-        loop_written_regs(ins, lo, hi, vector_writes[block], ignored_scalar_writes);
+        loop_written_regs(ins, lo, hi, vector_writes[block], ignored_scalar_writes,
+                          b.is_fragment_packet());
         vector_reads[block] = vector_writes[block];
         bool reads_dynamic_vector_range = false;
         for (const auto& in : ins) {
