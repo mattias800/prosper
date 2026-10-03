@@ -1901,6 +1901,16 @@ if(TARGET prosper_core)
     SOURCES tests/hle/kernel/test_mutex_types.cpp
     LIBRARIES prosper_core)
 
+  # pthread key destructor teardown at thread exit, re-derived from FreeBSD
+  # libthr thr_spec.c + musl libc-test key cases against the Windows
+  # (winpthreads) path: single fire, reinstall refire/stop, iteration bound,
+  # deleted-key silence (skipped on Windows: measured divergence), all-keys
+  # fire with no order asserted, NULL destructor silence. Pure, no game dump.
+  prosper_add_gtest(test_pthread_key_teardown
+    SOURCES tests/hle/kernel/test_pthread_key_teardown.cpp
+    LIBRARIES prosper_core
+    PROPERTIES TIMEOUT 60)
+
   prosper_add_gtest(test_agc_shader
     SOURCES tests/gpu/test_agc_shader.cpp
     LIBRARIES prosper_core)
