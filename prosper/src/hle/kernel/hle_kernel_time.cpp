@@ -1151,6 +1151,7 @@ namespace {
     PROSPER_HEAP_MUTEX(g_eq_mx);   // #707: heap-backed on macOS (std::mutex would land in the corrupted __DATA cluster)
     std::unordered_map<uint64_t, std::shared_ptr<EqState>> g_eqs;   // guest eq handle -> state
     std::atomic<uint64_t> g_eq_next_identity{1};
+    void drop_apr_registrations(uint64_t eq);
     struct FlipReg { uint64_t eq; int64_t ident; uint64_t udata; };
     std::vector<FlipReg> g_flip_regs, g_vblank_regs;
     // GPU end-of-pipe (EOP) event sources registered via sceGnmAddEqEvent / GraphicsAddEqEvent
@@ -1609,6 +1610,7 @@ HLE(k_eq_delete) {
         drop_eq(g_flip_regs); drop_eq(g_vblank_regs); drop_eq(g_eop_regs);
         g_user_regs.erase(std::remove_if(g_user_regs.begin(), g_user_regs.end(),
                                          [&](const UserReg& r){ return r.eq == a0; }), g_user_regs.end());
+        drop_apr_registrations(a0);
         // Cancel this queue's pending one-shot timers.
         for (auto it2 = g_timers.begin(); it2 != g_timers.end(); ) {
             if (it2->first.first == a0) { it2->second.cancelled->store(true); it2 = g_timers.erase(it2); }
@@ -1787,6 +1789,7 @@ namespace {
     // eboot+0x28c319c), so dropping it is a null pointer handed to the guest (#3500).
     struct AprEqReg { uint64_t eq; int64_t id; uint64_t udata = 0; };
     // Own mutex (NOT g_eq_mx): the post path calls eq_post/eq_find, which lock g_eq_mx themselves.
+    // Registration/deletion take g_eq_mx first; producers release this mutex before queue operations.
     // Detached APR delivery threads can outlive main, so the mutex and every container they touch
     // are one intentionally immortal heap object. Heap placement also keeps the hot mutex out of
     // the macOS __DATA cluster affected by #707.
@@ -1799,6 +1802,12 @@ namespace {
     AprTokenState& apr_token_state() {
         static AprTokenState* state = new AprTokenState;
         return *state;
+    }
+    void drop_apr_registrations(uint64_t eq) {
+        // Caller holds g_eq_mx, matching the queue-to-APR order used by registration.
+        AprTokenState& state = apr_token_state();
+        std::lock_guard lk(state.mx);
+        std::erase_if(state.eq_regs, [eq](const AprEqReg& r) { return r.eq == eq; });
     }
     uint64_t apr_hwm_key(uint64_t eq_identity, unsigned ring) {
         return (eq_identity << 6) | (ring & 0x3f);
@@ -1975,8 +1984,11 @@ uint64_t prosper_apr_next_token(unsigned ring) {
 // ctor-seeded per-ring last-processed (see the block comment above; the pre-#208 replay was the
 // root cause of the #180 range-walk fault).
 void prosper_eq_add_apr(uint64_t eq, int64_t id, uint64_t udata) {
+    // Serialize with Delete's purge so a late registration cannot resurrect a dead queue.
+    std::lock_guard queue_lock(g_eq_mx);
+    if (!g_eqs.contains(eq)) return;
     AprTokenState& state = apr_token_state();
-    std::lock_guard lk(state.mx);
+    std::lock_guard apr_lock(state.mx);
     for (auto& r : state.eq_regs)
         if (r.eq == eq && r.id == id) {
             // Idempotent, but UPGRADING: several paths register the same (eq, id) and only
