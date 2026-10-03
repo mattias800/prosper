@@ -582,8 +582,10 @@ extern "C" int prosper_thread_in_renderer_callback(unsigned long native_tid) {
 
 prosper::gpu::GraphicsProducerStatus live_graphics_producer_status() {
     return prosper::gpu::GraphicsProducerStatus{
-        true, prosper::test::backend_has_unproven_submission() ||
-            prosper::test::backend_pending_submission_batches().load(std::memory_order_acquire) != 0,
+        true,
+        prosper::test::backend_has_unproven_submission() ||
+            prosper::test::backend_pending_submission_batches().load(std::memory_order_acquire) !=
+                0,
         prosper::test::backend_failed_publication_generation().load(std::memory_order_acquire)};
 }
 
@@ -600,11 +602,12 @@ bool live_graphics_raw_source_current(const prosper::GuestMappingLease& lease, u
         return false;
     const auto disjoint = [&](const prosper::test::BackendGuestProducerOrigins& origins) {
         return !origins.unknown && !origins.allocations.empty() &&
-            std::all_of(origins.allocations.begin(), origins.allocations.end(),
-                [&](const auto& producer) {
-                    return prosper::guest_memory_retained_allocation_relation(lease, address,
-                        bytes, producer) == prosper::GuestMemoryTopologyRelation::Disjoint;
-                });
+               std::all_of(origins.allocations.begin(), origins.allocations.end(),
+                           [&](const auto& producer) {
+                               return prosper::guest_memory_retained_allocation_relation(
+                                          lease, address, bytes, producer) ==
+                                      prosper::GuestMemoryTopologyRelation::Disjoint;
+                           });
     };
     // A recorded, complete producer layout must fit inside its original physical
     // allocation. Exclude that whole allocation, including padding and unselected bytes;
@@ -614,7 +617,8 @@ bool live_graphics_raw_source_current(const prosper::GuestMappingLease& lease, u
     for (const auto& [base, surface] : graphics_raw_source_rtt()) {
         (void)base;
         if (!surface.rgba && !surface.has_uniform_color && !surface.gpu_valid &&
-            !surface.volume_guest_bytes) continue; // never-produced empty entry
+            !surface.volume_guest_bytes)
+            continue;   // never-produced empty entry
         if (!disjoint(surface.guest_origins)) return false;
         if (surface.dcc_metadata_addr && !disjoint(surface.dcc_guest_origins)) return false;
     }
@@ -626,9 +630,10 @@ bool live_graphics_raw_source_current(const prosper::GuestMappingLease& lease, u
         if (!image.guest_producer_seen) continue;
         size_t index = 0;
         for (uint64_t base : {key.dr, key.dw, key.sr, key.sw, key.htile}) {
-            if (base && prosper::guest_memory_retained_allocation_relation(lease, address,
-                    bytes, image.guest_allocations[index]) !=
-                    prosper::GuestMemoryTopologyRelation::Disjoint) return false;
+            if (base && prosper::guest_memory_retained_allocation_relation(
+                            lease, address, bytes, image.guest_allocations[index]) !=
+                            prosper::GuestMemoryTopologyRelation::Disjoint)
+                return false;
             ++index;
         }
     }

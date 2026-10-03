@@ -16,6 +16,7 @@
 #include <utility>
 
 namespace prosper::gpu {
+
 namespace {
 struct Range { uint64_t address, bytes; };
 
@@ -747,13 +748,35 @@ GraphicsNestedWideReader::GraphicsNestedWideReader(std::vector<RawNestedWideChai
     }
 }
 
+GraphicsNestedWideReader::GraphicsNestedWideReader(
+    std::vector<RawNestedWideChain> chains, const GraphicsRawSnapshotContext* context,
+    uint64_t source_address, std::shared_ptr<const std::vector<uint32_t>> source,
+    uint64_t source_submit, uint64_t command_order, const GuestMappingLease* borrowed_lease)
+    : GraphicsNestedWideReader(std::move(chains), context, borrowed_lease) {
+    checked_order_ = true;
+    if (context) read_point_ = context->ordered_read_point;
+    source_ = std::move(source);
+    source_address_ = source_address;
+    source_submit_ = source_submit;
+    command_order_ = command_order;
+    allowed_ =
+        allowed_ && ordered_source_current() && read_point_->owns_chains(source_address_, chains_);
+}
+
+bool GraphicsNestedWideReader::ordered_source_current() const {
+    return !checked_order_ || (read_point_ && read_point_->valid_for(source_submit_, command_order_,
+                                                                     source_address_, source_));
+}
+
 bool GraphicsNestedWideReader::probe(FoldProbe kind, uint32_t pc, uint64_t address,
                                      uint32_t bytes) {
     const auto width = widths_.find(pc);
     if (width == widths_.end()) return guest_readable(address, bytes);
     // Raw pointers may not be repaired by Base48/Base40 fallback or a readable host VMA.
-    if (!allowed_ || !lease_ || kind != FoldProbe::Raw || bytes != width->second ||
-        address <= 0x10000u || (address & 3u) || address > UINT64_MAX - bytes) return false;
+    if (!allowed_ || !ordered_source_current() || !lease_ || kind != FoldProbe::Raw ||
+        bytes != width->second || address <= 0x10000u || (address & 3u) ||
+        address > UINT64_MAX - bytes)
+        return false;
     const auto prior = observations_.find(pc);
     if (prior != observations_.end())
         return prior->second.address == address && prior->second.bytes->size() == bytes;
@@ -774,7 +797,10 @@ bool GraphicsNestedWideReader::probe(FoldProbe kind, uint32_t pc, uint64_t addre
         if (output && guest_memory_direct_allocation_relation(*lease_, address, bytes,
                 output, physical_bytes) != GuestMemoryTopologyRelation::Disjoint) return false;
     auto owner = std::make_shared<std::vector<uint8_t>>(bytes);
+    // The pre/post permission checks detect stale publication, not overlapping byte writes.
+    // The existing submitted-input stability contract still applies to this actual copy.
     std::memcpy(owner->data(), reinterpret_cast<const void*>(uintptr_t(address)), bytes);
+    if (!ordered_source_current()) return false;
     observations_.emplace(pc, Observation{address, std::move(owner)});
     return true;
 }
@@ -782,7 +808,7 @@ bool GraphicsNestedWideReader::probe(FoldProbe kind, uint32_t pc, uint64_t addre
 uint32_t GraphicsNestedWideReader::word(uint32_t pc, uint64_t address) {
     if (!owns_raw_wide(pc)) return *reinterpret_cast<const uint32_t*>(uintptr_t(address));
     const auto it = observations_.find(pc);
-    if (it == observations_.end() || address < it->second.address ||
+    if (!ordered_source_current() || it == observations_.end() || address < it->second.address ||
         address - it->second.address > it->second.bytes->size() - sizeof(uint32_t))
         throw std::runtime_error("nested raw fold word lacks exact observation");
     uint32_t value = 0;
@@ -797,7 +823,7 @@ void GraphicsNestedWideReader::prefix(uint32_t pc, uint64_t address, void* desti
         return;
     }
     const auto it = observations_.find(pc);
-    if (it == observations_.end() || address != it->second.address ||
+    if (!ordered_source_current() || it == observations_.end() || address != it->second.address ||
         bytes != it->second.bytes->size())
         throw std::runtime_error("nested raw fold prefix lacks exact observation");
     std::memcpy(destination, it->second.bytes->data(), bytes);
@@ -805,7 +831,8 @@ void GraphicsNestedWideReader::prefix(uint32_t pc, uint64_t address, void* desti
 
 bool GraphicsNestedWideReader::publish(ShaderResourceTable& table) const {
     table.owned_nested_snapshot_requirements.assign(widths_.begin(), widths_.end());
-    if (!allowed_ || observations_.size() != widths_.size()) return false;
+    if (!allowed_ || !ordered_source_current() || observations_.size() != widths_.size())
+        return false;
     for (const auto& chain : chains_) {
         const auto& parent = observations_.at(chain.parent_pc);
         const auto& child = observations_.at(chain.child_pc);
