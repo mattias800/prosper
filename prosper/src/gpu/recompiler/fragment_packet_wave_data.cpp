@@ -1,5 +1,6 @@
 #include "gpu/recompiler/fragment_packet_services.hpp"
 #include "gpu/recompiler/fragment_packet_vgpr_requirements.hpp"
+#include "gpu/recompiler/fragment_draw_capacity.hpp"
 
 namespace prosper::gpu {
 namespace {
@@ -40,9 +41,11 @@ bool FragmentPacketWaveAuthority::matches(const std::shared_ptr<const FragmentPa
             return false;
     return true;
 }
-FragmentPacketKernel recompile_fragment_packet_kernel(const FragmentResourcePacket& prototype,
-                                                      RecompileDiagnosticContext diagnostic) {
+static FragmentPacketKernel compile_kernel(const FragmentResourcePacket& prototype,
+                                           RecompileDiagnosticContext diagnostic,
+                                           bool gpu_capacity) {
     FragmentPacketKernel result;
+    result.layout.gpu_capacity = gpu_capacity;
     const auto reject = [&](const std::string& reason) {
         result.program.packet.rejection = reason;
         log_recompile_diagnostic(diagnostic, "fragment-packet-wave-reject", "terminal", "reason=%s",
@@ -112,6 +115,15 @@ FragmentPacketKernel recompile_fragment_packet_kernel(const FragmentResourcePack
     }
     return result;
 }
+FragmentPacketKernel recompile_fragment_packet_kernel(const FragmentResourcePacket& prototype,
+                                                      RecompileDiagnosticContext diagnostic) {
+    return compile_kernel(prototype, diagnostic, false);
+}
+FragmentPacketKernel
+recompile_fragment_packet_capacity_kernel(const FragmentResourcePacket& prototype,
+                                          RecompileDiagnosticContext diagnostic) {
+    return compile_kernel(prototype, diagnostic, true);
+}
 FragmentPacketWaveBatch
 pack_fragment_packet_waves(std::shared_ptr<const FragmentPacketKernel> owner,
                            std::span<const FragmentResourcePacket> waves,
@@ -123,7 +135,8 @@ pack_fragment_packet_waves(std::shared_ptr<const FragmentPacketKernel> owner,
         std::fprintf(stderr, "[fragment-packet-wave-reject] reason=%s\n", reason);
         return refused;
     };
-    if (!owner || owner->program.packet.spirv.empty() || !owner->program.packet.rejection.empty())
+    if (!owner || owner->program.packet.spirv.empty() || !owner->program.packet.rejection.empty() ||
+        owner->layout.gpu_capacity)
         return reject("packet-wave-kernel-unavailable");
     const auto& kernel = *owner;
     const auto& layout = kernel.layout;

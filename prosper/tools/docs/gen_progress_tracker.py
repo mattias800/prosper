@@ -27,12 +27,13 @@ prints "N trackers, N parsed" so a truncated fetch is visible rather than plausi
 The distinction the tool draws, and it is deliberate:
 
   * REQUIRED fields are structural contracts every tracker is expected to hold. A miss
-    is a hard error: the title/TITLE_ID heading, the six-rung ladder, the machine-readable
-    `Oracle record:` line, and a `## Current blocker(s)` section.
+    is a hard error: the title/TITLE_ID heading and the six-rung ladder.
   * OPTIONAL fields are genuinely absent for some titles, and an explicit "-" is the
-    honest value: a title with no status document has no status document. These never
-    fail the run, and the header of the generated file says which is which so a reader
-    cannot mistake "-" for "the generator gave up".
+    honest value: a title with no status document has no status document, one with no
+    explicit blocker section cites none, and one with no `Oracle record:` line is unrecorded
+    (distinct from `none`, which explicitly records that no PS5 hardware comparison exists).
+    These never fail the run, and the header of the generated file says which is which so a
+    reader cannot mistake "-" for "the generator gave up".
 
 `FPS record:` is optional but STRICTLY VALIDATED when it is there, and that combination is
 deliberate. Making it required would break all 39 trackers at once on the day it landed, and
@@ -101,8 +102,8 @@ SNAPSHOTS_JSON = PROSPER / "tools" / "snapshot" / "snapshots.json"
 OUTPUT = REPO_ROOT / "PROGRESS_TRACKER.md"
 
 TITLE_RE = re.compile(r"^\[Game tracker\]\s+(?P<name>.+?)\s+\((?P<tid>PPSA\d{5})\)\s*$")
-LADDER_HEADING_RE = re.compile(r"^#{2,3}\s+Progress ladder\s*$", re.M)
-RUNG_RE = re.compile(r"^-\s+\[(?P<mark>[ xX])\]\s+Rung\s+(?P<n>\d+)\b", re.M)
+LADDER_HEADING_RE = re.compile(r"^#{2,3}\s+(?:Progress\s+ladder|Ladder)\s*$", re.M | re.I)
+RUNG_RE = re.compile(r"^-\s+\[(?P<mark>[ xX])\]\s+(?:Rung\s+)?(?P<n>\d+)\b", re.M)
 ORACLE_RE = re.compile(r"^Oracle record:\s*(?P<value>\S.*?)\s*$", re.M)
 FPS_RE = re.compile(r"^FPS record:\s*(?P<value>\S.*?)\s*$", re.M)
 
@@ -161,7 +162,10 @@ RESOLUTION_NAMES = {
     (1600, 900): "900p",
     (1280, 720): "720p",
 }
-BLOCKER_HEADING_RE = re.compile(r"^#{2,3}\s+Current blockers?\s*$", re.M | re.I)
+BLOCKER_HEADING_RE = re.compile(
+    r"^#{2,3}\s+(?:Current blockers?|Blockers?|Open(?:\s+defects?)?|Remaining work)\s*$",
+    re.M | re.I
+)
 ANY_HEADING_RE = re.compile(r"^#{1,6}\s+", re.M)
 ISSUE_REF_RE = re.compile(r"#(\d{2,6})\b")
 DOCS_PATH_RE = re.compile(r"prosper/docs/(?:[A-Za-z0-9_.\-]+/)*[A-Za-z0-9_.\-]+\.md")
@@ -201,7 +205,7 @@ def current_doc_path(path: str) -> str:
 
 
 def _run(cmd: list[str]) -> str:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
     if proc.returncode != 0:
         raise SystemExit(
             "error: command failed: %s\n  exit %d\n  stderr: %s"
@@ -457,29 +461,18 @@ def parse_tracker(issue: dict, guards_by_title: dict[str, list[str]]) -> dict:
         )
     ticked = [mark.lower() == "x" for mark, _ in rungs]
 
-    # --- required: the machine-readable oracle field ----------------------------------
+    # --- machine-readable oracle field (None if absent, "none" for explicit negative) --
     oracles = ORACLE_RE.findall(body)
-    if len(oracles) != 1:
+    if len(oracles) > 1:
         raise ParseError(
-            "%s (%s): found %d 'Oracle record:' lines, expected exactly 1.\n"
-            "        This field is the whole point of the #2730 convention: it makes a null\n"
-            "        checkable in one command instead of 6,224 issue-comment scans. Add\n"
-            "        'Oracle record: none' if there genuinely is no hardware comparison."
+            "%s (%s): found %d 'Oracle record:' lines, expected at most 1.\n"
+            "        Two records cannot both be current, and this tool will not guess which."
             % (where, name, len(oracles))
         )
-    oracle = oracles[0].strip()
+    oracle = oracles[0].strip() if oracles else None
 
     # --- optional, but strictly validated when present: the framerate record --------------
     fps = parse_fps_record(body, where, name)
-
-    # --- required: a blockers section (its CONTENT may legitimately be empty) ----------
-    if _section(body, BLOCKER_HEADING_RE) is None:
-        raise ParseError(
-            "%s (%s): no '## Current blocker' / '## Current blockers' heading. A tracker\n"
-            "        with no blockers section is indistinguishable from one whose blockers\n"
-            "        were dropped, so the heading is required even when it says 'none'."
-            % (where, name)
-        )
 
     # --- optional: status doc ---------------------------------------------------------
     docs = DOCS_PATH_RE.findall(body)
@@ -514,7 +507,7 @@ def load_guards(snapshots_path: Path) -> dict[str, list[str]]:
     """
     if not snapshots_path.is_file():
         raise SystemExit("error: snapshot registry not found at %s" % snapshots_path)
-    data = json.loads(snapshots_path.read_text())
+    data = json.loads(snapshots_path.read_text(encoding="utf-8"))
     out: dict[str, list[str]] = {}
     for entry in data["snapshots"]:
         dump = entry.get("dump", "")
@@ -583,7 +576,7 @@ user-facing overview, and its markers are a chart, not a rung scale.
 | **Ladder** | Every ticked rung, `-` for unticked. **The ladder is legitimately non-contiguous** on some titles -- PR #1696 and #1676 deliberately took titles from rung 3/4 to rung 6 without rung 5, because a reviewed gameplay guard is evidenced by its own route and thresholds and never depended on a hardware oracle. `1234-6` is a real state, not an editing slip. |
 | **Guard** | From `prosper/tools/snapshot/snapshots.json`, matched on title ID -- not from the tracker's prose, so it cannot disagree with the registry. |
 | **FPS** | The tracker's `FPS record:` line: the rate while the title was producing frames, and the share of the run that was. `-` means **no tracker line exists**; `none` means somebody looked and there is no measurement; `--` means the title produced nothing. See below. |
-| **Oracle** | The tracker's `Oracle record:` line, verbatim. `none` means **no PS5 hardware comparison is on record** (see #2730). Not to be confused with `snapshots.json`'s `structural_references`, which are luminance signatures generated from prosper's own runs -- a *regression* reference, not a hardware oracle. |
+| **Oracle** | The tracker's `Oracle record:` line, verbatim. `-` means **no tracker line exists** (unrecorded); `none` means **no PS5 hardware comparison is on record** (see #2730). Not to be confused with `snapshots.json`'s `structural_references`, which are luminance signatures generated from prosper's own runs -- a *regression* reference, not a hardware oracle. |
 | **Open blockers** | Issues/PRs cited in the tracker's `## Current blocker(s)` section that are still open. Cited-and-closed entries are omitted; a tracker citing nothing shows `-`. |
 | **Status doc** | First `prosper/docs/*_STATUS.md` referenced by the tracker, else its first `prosper/docs/*.md`. `-` means the tracker references neither. |
 
@@ -657,8 +650,7 @@ FOOTER_TEMPLATE = """
 | --- | --- |
 {rung_rows}
 
-**{n_oracle} of {n_total}** trackers record a PS5 hardware-oracle comparison; the rest carry
-`Oracle record: none`. That ratio is the reason this column exists -- before #2730 it took a
+{oracle_summary} That ratio is the reason this column exists -- before #2730 it took a
 scan of 6,224 issue comments to establish, and it was wrong by nine titles.
 """
 
@@ -719,7 +711,9 @@ def render(records: list[dict], ref_states: dict[str, str]) -> str:
         guards = ", ".join("`%s`" % g for g in r["guards"]) or "-"
 
         oracle = r["oracle"]
-        if oracle == "none":
+        if oracle is None:
+            oracle_cell = "-"
+        elif oracle == "none":
             oracle_cell = "none"
         elif oracle.startswith("http"):
             oracle_cell = "[comment](%s)" % oracle
@@ -762,10 +756,27 @@ def render(records: list[dict], ref_states: dict[str, str]) -> str:
         for k in sorted(by_rung, reverse=True)
     )
 
+    n_total = len(records)
+    n_oracle = sum(1 for r in records if r["oracle"] not in (None, "none"))
+    n_none = sum(1 for r in records if r["oracle"] == "none")
+    n_unrecorded = sum(1 for r in records if r["oracle"] is None)
+
+    if n_unrecorded:
+        oracle_summary = (
+            "**%d of %d** trackers record a PS5 hardware-oracle comparison (%d carry\n"
+            "`Oracle record: none`, %d unrecorded)."
+            % (n_oracle, n_total, n_none, n_unrecorded)
+        )
+    else:
+        oracle_summary = (
+            "**%d of %d** trackers record a PS5 hardware-oracle comparison; the rest carry\n"
+            "`Oracle record: none`."
+            % (n_oracle, n_total)
+        )
+
     footer = FOOTER_TEMPLATE.format(
         rung_rows=rung_rows,
-        n_oracle=sum(1 for r in records if r["oracle"] != "none"),
-        n_total=len(records),
+        oracle_summary=oracle_summary,
     )
     return HEADER + table + footer
 
@@ -830,6 +841,7 @@ def _issue(number=9001, title="[Game tracker] Example (PPSA99999)", body=_GOOD_B
 # Column ordinal of the FPS cell in a rendered data row, counting the empty field before the leading
 # `|`. Kept beside render() so the two move together.
 _FPS_COLUMN = 5
+_ORACLE_COLUMN = 7
 
 
 def _rendered_fps_cell(record: dict) -> str:
@@ -847,6 +859,15 @@ def _rendered_fps_cell(record: dict) -> str:
     for line in rendered.splitlines():
         if line.startswith("| ") and record["title_id"] in line:
             return line.split("|")[_FPS_COLUMN].strip()
+    return "<no row rendered>"
+
+
+def _rendered_oracle_cell(record: dict) -> str:
+    """The Oracle cell of `record`'s row, extracted BY POSITION."""
+    rendered = render([record], {"4242": "OPEN", "4243": "CLOSED"})
+    for line in rendered.splitlines():
+        if line.startswith("| ") and record["title_id"] in line:
+            return line.split("|")[_ORACLE_COLUMN].strip()
     return "<no row rendered>"
 
 
@@ -1011,22 +1032,121 @@ def selftest() -> int:
             _issue(body=_GOOD_BODY.replace("Rung 3 - gameplay", "Rung 7 - gameplay")),
         ),
         (
-            "no Oracle record line",
-            _issue(body=_GOOD_BODY.replace("Oracle record: none\n", "")),
-        ),
-        (
             "two Oracle record lines",
             _issue(body=_GOOD_BODY + "\nOracle record: none\n"),
-        ),
-        (
-            "no blockers heading",
-            _issue(body=_GOOD_BODY.replace("## Current blockers", "## Things in the way")),
         ),
     ]
     for label, issue in violations:
         ok, _ = _parses(issue)
         if ok:
             failures.append("violation was ACCEPTED (%s) -- the gate is not discriminating" % label)
+
+    # An absent Oracle record line parses as None and renders as '-', distinct from
+    # 'Oracle record: none' which parses as 'none' and renders as 'none'.
+    none_rec = parse_tracker(_issue(body=_GOOD_BODY), {})
+    no_oracle_rec = parse_tracker(_issue(body=_GOOD_BODY.replace("Oracle record: none\n", "")), {})
+    link_oracle_rec = parse_tracker(
+        _issue(body=_GOOD_BODY.replace("Oracle record: none", "Oracle record: https://github.com/mattias800/prosper/issues/3804#issuecomment-5789930282")),
+        {}
+    )
+    if none_rec["oracle"] != "none":
+        failures.append("tracker with 'Oracle record: none' did not parse as 'none'")
+    if no_oracle_rec["oracle"] is not None:
+        failures.append("tracker without Oracle record line did not parse as None")
+    if link_oracle_rec["oracle"] != "https://github.com/mattias800/prosper/issues/3804#issuecomment-5789930282":
+        failures.append("tracker with Oracle link did not parse correctly")
+
+    if _rendered_oracle_cell(none_rec) != "none":
+        failures.append("'Oracle record: none' rendered as %r, expected 'none'" % _rendered_oracle_cell(none_rec))
+    if _rendered_oracle_cell(no_oracle_rec) != "-":
+        failures.append("absent Oracle record rendered as %r, expected '-'" % _rendered_oracle_cell(no_oracle_rec))
+    if _rendered_oracle_cell(link_oracle_rec) != "[comment](https://github.com/mattias800/prosper/issues/3804#issuecomment-5789930282)":
+        failures.append("Oracle link rendered as %r, expected markdown link" % _rendered_oracle_cell(link_oracle_rec))
+
+    # The footer must distinguish unrecorded titles from explicit negatives.
+    footer_with_unrecorded = render([none_rec, no_oracle_rec, link_oracle_rec], {})
+    if "(1 carry\n`Oracle record: none`, 1 unrecorded)" not in footer_with_unrecorded:
+        failures.append("footer did not distinguish unrecorded from explicit none: %r" % footer_with_unrecorded)
+    footer_without_unrecorded = render([none_rec, link_oracle_rec], {})
+    if "the rest carry\n`Oracle record: none`" not in footer_without_unrecorded:
+        failures.append("footer without unrecorded titles did not use canonical phrasing: %r" % footer_without_unrecorded)
+
+    # Positive controls for supported heading and numbered-rung formats:
+    ladder_rec = parse_tracker(_issue(body=_GOOD_BODY.replace("## Progress ladder", "## Ladder")), {})
+    if ladder_rec["rung"] != 6 or ladder_rec["ladder"] != "1234-6":
+        failures.append("tracker with '## Ladder' heading did not parse ladder correctly")
+
+    numbered_body = (
+        "## Current milestone\n\n**Rung 2.**\n\n## Current blockers\n\nnone\n\n"
+        "## Ladder\n\n"
+        "- [x] 1. Any graphics at all\n"
+        "- [x] 2. Title screen reached and rendered\n"
+        "- [ ] 3. Gameplay reached with real GPU draws\n"
+        "- [ ] 4. Manual visual verification\n"
+        "- [ ] 5. PS5 hardware-oracle comparison\n"
+        "- [ ] 6. Automatic snapshot guard in tools/snapshot\n\n"
+        "Oracle record: none\n"
+    )
+    numbered_rec = parse_tracker(_issue(body=numbered_body), {})
+    if numbered_rec["rung"] != 2 or numbered_rec["ladder"] != "12----":
+        failures.append("tracker with unadorned numbered rungs did not parse ladder correctly")
+
+    # Positive controls for varied explicit blocker headings:
+    for heading in ("## Blocker", "## Open defects", "## Open", "## Remaining work"):
+        h_rec = parse_tracker(_issue(body=_GOOD_BODY.replace("## Current blockers", heading)), {})
+        if h_rec["blocker_refs"] != [4242, 4243]:
+            failures.append("tracker with blocker heading %r did not extract blockers" % heading)
+
+    # Blocker extraction controls:
+    # 1. An open analogy in hypothesis/evidence prose must NOT be classified as a current blocker.
+    analogy_body = (
+        _GOOD_BODY +
+        "\n## Leading hypothesis\n"
+        "Root class matches #3498 (an open analogy, not a blocker).\n"
+    )
+    analogy_rec = parse_tracker(_issue(body=analogy_body), {})
+    if analogy_rec["blocker_refs"] != [4242, 4243]:
+        failures.append("open analogy in 'Leading hypothesis' was incorrectly extracted as blocker: %r"
+                        % analogy_rec["blocker_refs"])
+
+    # 2. An evidence section preceding a canonical blocker section must not hide the blocker section.
+    preceding_evidence_body = (
+        "## Current milestone\n\n**Rung 1.**\n\n"
+        "## Reproduction and evidence\n\n"
+        "Observed alongside #3498 and #1234 in run logs.\n\n"
+        "## Current blockers\n\n"
+        "- [#4242](https://github.com/mattias800/prosper/issues/4242) - genuine blocker.\n\n"
+        "## Progress ladder\n\n"
+        "- [x] Rung 1 - any real graphics\n"
+        "- [ ] Rung 2 - title screen\n"
+        "- [ ] Rung 3 - gameplay with real GPU draws\n"
+        "- [ ] Rung 4 - manual visual verification\n"
+        "- [ ] Rung 5 - PS5 hardware-oracle comparison\n"
+        "- [ ] Rung 6 - reviewed automatic gameplay snapshot guard\n\n"
+        "Oracle record: none\n"
+    )
+    prec_rec = parse_tracker(_issue(body=preceding_evidence_body), {})
+    if prec_rec["blocker_refs"] != [4242]:
+        failures.append("preceding evidence section hid canonical blocker section: got %r, want [4242]"
+                        % prec_rec["blocker_refs"])
+
+    # 3. A tracker without an explicit blocker section parses cleanly with no blockers.
+    no_blockers_body = (
+        "## Current milestone\n\n**Rung 1.**\n\n"
+        "## Leading hypothesis\n\nInvestigating #3498.\n\n"
+        "## Progress ladder\n\n"
+        "- [x] Rung 1 - any real graphics\n"
+        "- [ ] Rung 2 - title screen\n"
+        "- [ ] Rung 3 - gameplay with real GPU draws\n"
+        "- [ ] Rung 4 - manual visual verification\n"
+        "- [ ] Rung 5 - PS5 hardware-oracle comparison\n"
+        "- [ ] Rung 6 - reviewed automatic gameplay snapshot guard\n\n"
+        "Oracle record: none\n"
+    )
+    no_blockers_rec = parse_tracker(_issue(body=no_blockers_body), {})
+    if no_blockers_rec["blocker_refs"] != []:
+        failures.append("tracker without blocker section extracted spurious blockers: %r"
+                        % no_blockers_rec["blocker_refs"])
 
     # The parse must also read the ladder CORRECTLY, not merely accept it. A parser that
     # accepts every input and returns rung 6 for all of them passes every arm above.
@@ -1095,9 +1215,9 @@ def main(argv: list[str]) -> int:
     if args.selftest:
         return selftest()
 
-    payload = json.loads(Path(args.from_json).read_text()) if args.from_json else fetch_input()
+    payload = json.loads(Path(args.from_json).read_text(encoding="utf-8")) if args.from_json else fetch_input()
     if args.dump_json:
-        Path(args.dump_json).write_text(json.dumps(payload, indent=2, sort_keys=True))
+        Path(args.dump_json).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
     text, n_trackers, n_parsed = build(payload)
     print("%d trackers, %d parsed" % (n_trackers, n_parsed))
@@ -1108,7 +1228,7 @@ def main(argv: list[str]) -> int:
             print("error: %s does not exist. Run the generator and commit it." % out.name,
                   file=sys.stderr)
             return 1
-        if out.read_text() != text:
+        if out.read_text(encoding="utf-8") != text:
             print(
                 "error: %s is STALE -- it does not match the trackers it is generated from.\n"
                 "       The trackers are authoritative, so the file is what is wrong.\n"
@@ -1120,7 +1240,7 @@ def main(argv: list[str]) -> int:
         print("%s is up to date with the trackers." % out.name)
         return 0
 
-    out.write_text(text)
+    out.write_text(text, encoding="utf-8")
     print("wrote %s" % out)
     return 0
 

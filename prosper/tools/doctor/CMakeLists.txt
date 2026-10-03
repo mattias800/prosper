@@ -29,6 +29,14 @@ endif()
 find_package(Threads REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 enable_testing()
+# GoogleTest for the migrated suites below, from the same vendored tree the main build uses
+# (cmake/ProsperGTest.cmake). This narrow build cannot reuse prosper targets, but the TEST
+# sources need gtest_main like everywhere else.
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+set(BUILD_GMOCK ON CACHE BOOL "" FORCE)
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+add_subdirectory("${PROSPER_ROOT}/third_party/googletest"
+                 "${CMAKE_BINARY_DIR}/_deps/googletest-build" EXCLUDE_FROM_ALL)
 function(host_test name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE host_checks Threads::Threads)
@@ -45,6 +53,7 @@ host_test(self_segment_key "${PROSPER_ROOT}/tests/test_self_segment_key.cpp"
                           "${PROSPER_ROOT}/src/self/module.cpp")
 host_test(rdna2_decode "${PROSPER_ROOT}/tests/gpu/recompiler/test_rdna2_decode.cpp"
                       "${PROSPER_ROOT}/src/gpu/recompiler/rdna2_decode.cpp")
+target_link_libraries(rdna2_decode PRIVATE GTest::gtest GTest::gtest_main)
 host_test(bc_decode "${PROSPER_ROOT}/tests/gpu/texture/test_bc_decode.cpp"
                    "${PROSPER_ROOT}/src/gpu/texture/bc_decode.cpp")
 host_test(gpu_submit_gate "${PROSPER_ROOT}/tests/host/platform/test_gpu_submit_gate.cpp"

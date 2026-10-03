@@ -971,6 +971,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             if (!prosper::frontend::live_target_pixel_format_from_vk(format, snapshot.format))
                 return false;
             snapshot.pixels = surface.rgba;
+            snapshot.component_order_bgra =
+                prosper::frontend::live_target_component_order_bgra(surface.guest_format, format);
             return true;
         });
     // Phase 2 of #1091 (#1095): with one shared device the compute backend can sample the renderer's
@@ -1083,6 +1085,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             import.layout = static_cast<uint32_t>(target->layout);
             import.transfer_dst = true;
             import.transfer_src = true;
+            import.component_order_bgra =
+                prosper::frontend::live_target_component_order_bgra(surface.guest_format, format);
             return true;
         },
         [](uint64_t addr) {

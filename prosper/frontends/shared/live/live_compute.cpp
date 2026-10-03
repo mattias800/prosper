@@ -14,6 +14,7 @@
 #include "shared/compute/storage_image_alias_plan.hpp"
 #include "shared/live/decode_scratch.hpp"  // pooled full-surface intermediates (#3309's mechanism)
 #include "shared/live/cpu_rtt_snapshot_pool.hpp"
+#include "shared/live/compute_view_swizzle.hpp"
 #include "shared/live/live_target_format.hpp"
 #include "shared/live/packed_rtt_conversion.hpp"
 #include "shared/live/indirect_dispatch.hpp"   // #3656
@@ -4195,6 +4196,7 @@ struct BoundImage {
     // renderer: it must not be destroyed here, its layout must be restored, and the pin taken at
     // import time must be released.
     bool imported = false;
+    bool imported_component_order_bgra = false;   // #4291: see LiveTargetImageImport
     bool imported_depth = false;        // borrowed persistent DS depth plane, not a color RTT
     // A one-component Uint32 T# can alias a renderer-owned D32 depth plane byte-for-byte. Vulkan
     // cannot create an R32_UINT view of a depth image, so keep the borrowed DS image as a transfer
@@ -8312,7 +8314,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                               format_float_sampling && unorm_rtt_value_reuse_enabled);
                     const bool compatible_device =
                         import.device == static_cast<void*>(ctx.device);
-                    const bool color_bits_copy = ordinary_2d_view && !depth_import &&
+                    // #4291: a raw copy keeps the renderer's canonical RGBA order, so a BGRA
+                    // target is usable here only through the swizzled in-place sampled view below.
+                    const bool color_bits_copy = !import.component_order_bgra && ordinary_2d_view && !depth_import &&
                         compatible_device && import.transfer_src &&
                         import.width == r->width && import.height == r->height &&
                         import.format == LiveTargetPixelFormat::Rgba8Unorm &&
@@ -8326,7 +8330,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // transfer below copies exact texels and deliberately performs no resampling.
                     const bool depth_bits_extent =
                         import.width == r->width && import.height == r->height;
-                    bool packed10_copy = ordinary_2d_view && !depth_import &&
+                    bool packed10_copy = !import.component_order_bgra &&
+                        ordinary_2d_view && !depth_import &&
                         compatible_device && import.transfer_src &&
                         shader_resource_compute_mip_chain_levels(*r) == 1 &&
                         import.width == r->width && import.height == r->height &&
@@ -8382,6 +8387,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                              static_cast<unsigned>(depth_format));
                         } else {
                             bi.imported = true;
+                            bi.imported_component_order_bgra = import.component_order_bgra;
                             bi.imported_depth = depth_import;
                             bi.imported_format = depth_import ? depth_format : VK_FORMAT_UNDEFINED;
                             bi.imported_pixel_format = import.format;
@@ -8421,6 +8427,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     const ShaderResource* p = source.resource;
                     if (!source.imported || source.imported_depth || source.storage || !p)
                         continue;
+                    // #4291: the seed is a raw copy, and the mirror writes the result back raw. A
+                    // BGRA-as-RGBA source is readable only through its swizzled sampled view.
+                    if (source.imported_component_order_bgra) continue;
                     if (p->gpu_addr != r->gpu_addr || p->width != r->width ||
                         p->height != r->height || p->depth != r->depth ||
                         p->format != r->format || p->num_components != r->num_components)
@@ -8507,6 +8516,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                       source.format == LiveTargetPixelFormat::R11G11B10Float &&
                                       source.native_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32))
                                     ? "format-mismatch"
+                                // A raw image copy keeps the renderer's canonical RGBA order; the
+                                // identity storage view would then read a BGRA target's R and B
+                                // exchanged (#4291).
+                                : source.component_order_bgra ? "component-order"
                                 : !source.transfer_src ? "no-transfer-src"
                                 : !rtt_gpu_seed_import_extent_compatible(
                                     r->width, r->height, source.width, source.height) ? "extent-mismatch"
@@ -8535,6 +8548,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (dim_3d || r->depth != 1 ||
                     !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
                     skip_image(r, "renderer-owned RTT has no readable snapshot"); break;
+                }
+                // #4291: the snapshot is canonical; compute decodes it as guest (BGRA) memory.
+                if (live_target.component_order_bgra &&
+                    live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
+                    auto guest_order = std::make_shared<std::vector<uint8_t>>(*live_target.pixels);
+                    prosper::frontend::swap_rgba8_red_blue(*guest_order);
+                    live_target.pixels = std::move(guest_order);
                 }
                 // A dimension mismatch is either (a) an exact PROSPER_RENDER_SCALE downscale (the renderer
                 // rendered this same target at 1/scale; a compute op sampling it at native res sees e.g.
@@ -10581,37 +10601,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                     : VK_IMAGE_VIEW_TYPE_2D);
             vci.format = ici.format;
             if (!bi.storage) {
-                // T# DST_SEL channel routing (SQ_SEL: 0=0, 1=1, 4=R, 5=G, 6=B, 7=A) — same mapping
-                // the renderer applies on its sampled views.
+                // T# DST_SEL routing. #4291: a BGRA-as-RGBA renderer image bound in place needs the
+                // selector in the host image's component order, as the graphics sampled path does.
+                const bool bgra = bi.imported && bi.imported_component_order_bgra;
                 auto sel = [&](uint32_t s) {
-                    switch (s) {
-                        case 0: return VK_COMPONENT_SWIZZLE_ZERO;
-                        case 1: return VK_COMPONENT_SWIZZLE_ONE;
-                        case 4: return VK_COMPONENT_SWIZZLE_R;
-                        case 5: return VK_COMPONENT_SWIZZLE_G;
-                        case 6: return VK_COMPONENT_SWIZZLE_B;
-                        case 7: return VK_COMPONENT_SWIZZLE_A;
-                        default: break;
-                    }
-                    // SQ_SEL 2 and 3 are RESERVED, and anything above 7 cannot come out of a
-                    // three-bit descriptor field at all. Both used to fall into a silent
-                    // `default: IDENTITY` -- the selector for whichever position the value sat in --
-                    // so an undecodable routing became a plausible wrong picture with no diagnostic
-                    // anywhere. The graphics path was made loud for that reason; this is its twin
-                    // and was missed (#3609).
-                    //
-                    // A reserved selector can no longer reach here FROM A DESCRIPTOR, because
-                    // `image_descriptor_reject_reason` now refuses such a T# before it becomes a
-                    // ShaderResource. It stays reachable from a capture deserialized verbatim and
-                    // from a directly-built resource, so this warns rather than dropping: reproducing
-                    // the frame that was recorded is replay's job, and the drop belongs upstream.
-                    static std::once_flag warned;
-                    std::call_once(warned, [&] {
-                        fprintf(stderr,
-                                "[compute] T# DST_SEL %u is reserved or unrepresentable; binding it "
-                                "as IDENTITY, which is a GUESS at the routing (#3609)\n", s);
-                    });
-                    return VK_COMPONENT_SWIZZLE_IDENTITY;
+                    return prosper::frontend::compute_view_component_swizzle(
+                        prosper::frontend::live_target_host_selector(s, bgra));
                 };
                 vci.components = {sel(r->swizzle[0]), sel(r->swizzle[1]),
                                   sel(r->swizzle[2]), sel(r->swizzle[3])};

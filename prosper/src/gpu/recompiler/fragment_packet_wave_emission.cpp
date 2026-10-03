@@ -50,6 +50,7 @@ void configure_packet_wave_data(const FragmentInvocationPacket& packet,
     services.wave_data = &layout;
 }
 PacketWaveEmission begin_packet_wave_data(SpirvCompute& b, const PacketWaveDataLayout& layout) {
+    if (layout.gpu_capacity) return begin_fragment_draw_capacity(b, layout);
     // All predicates use uniform shared wave metadata and WorkgroupId only. They are identical
     // for all64 workers. Malformed metadata skips the ENTIRE workgroup, never one participant.
     // No guest load/barrier/output is reached until actual descriptor extents and tags agree.
