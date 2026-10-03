@@ -134,6 +134,15 @@ inline std::vector<Case> cases() {
     std::erase_if(events.vgprs, [](const auto& c) { return c.reg != 0 && c.reg != 8; });
     out.push_back(
         {"distinct_readlane_event_after_source_change", events, fp::expected(later, events)});
+    auto two_reads = base();
+    fp::vmov(two_reads.guest_code, 1, 256); // actual absent v0 read at PC0
+    fp::vmov(two_reads.guest_code, 2, 259); // distinct absent v3 read at PC1
+    fp::exp(two_reads.guest_code, 1, 2);
+    two_reads.guest_code.push_back(0xbf810000u);
+    out.push_back({"two_bad_reads_keep_first_failure", two_reads, {}, 0, 0, 0, 1});
+    column(two_reads, 0, 0);
+    column(two_reads, 3, 0x73330003u);
+    out.push_back({"same_two_reads_genuine_inputs", two_reads, expected(UINT64_MAX, 0x73330003u)});
     return out;
 }
 inline FragmentResourcePacket resource_chain(bool lod, bool inactive) {

@@ -67,8 +67,8 @@ TEST(FragmentPacketDefinedness, ActualSourceMaskBranchPeerAndRawOutputRails) {
         } else
             EXPECT_TRUE(result.rejection.empty()) << result.rejection;
     }
-    EXPECT_EQ(attempts, 16u);
-    std::fprintf(stderr, "[vgpr-definedness-source] integer_evaluation_attempts=%u expected=16\n",
+    EXPECT_EQ(attempts, 18u);
+    std::fprintf(stderr, "[vgpr-definedness-source] integer_evaluation_attempts=%u expected=18\n",
                  attempts);
 }
 
