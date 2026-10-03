@@ -84,6 +84,22 @@ TEST(FragmentDrawCapacity, SeparateSourceDomainAndCheckedDisjointCapacity) {
     EXPECT_EQ(data.capacity_kernel->layout.input_words, data.owned.kernel->layout.input_words);
     EXPECT_EQ(data.capacity_kernel->layout.output_words, data.owned.kernel->layout.output_words);
     EXPECT_NE(data.capacity_kernel->program.packet.spirv, data.owned.kernel->program.packet.spirv);
+    const auto& source = data.capacity_kernel->program.packet.spirv;
+    uint32_t selections = 0;
+    for (size_t pc = 5; pc < source.size();) {
+        const auto count = source[pc] >> 16;
+        ASSERT_GT(count, 0u);
+        ASSERT_LE(count, source.size() - pc);
+        if ((source[pc] & 0xffffu) == 247u) { // OpSelectionMerge
+            ++selections;
+            ASSERT_LT(pc + count, source.size());
+            const auto next = source[pc + count] & 0xffffu;
+            EXPECT_TRUE(next == 250u || next == 251u)
+                << "predicate emission must precede SelectionMerge; word=" << pc;
+        }
+        pc += count;
+    }
+    EXPECT_GT(selections, 0u) << "the real outer uniform metadata guard must be present";
     EXPECT_EQ(pack_fragment_packet_waves(data.capacity_kernel,
                                          std::vector<FragmentResourcePacket>{fixture::packet()})
                   .rejection,

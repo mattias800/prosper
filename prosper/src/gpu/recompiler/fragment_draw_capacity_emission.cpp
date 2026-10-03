@@ -18,11 +18,11 @@ PacketWaveEmission begin_fragment_draw_capacity(SpirvCompute& b,
     };
     const auto outer_merge = b.id(), header = b.id();
     // Length gate precedes even the first header read. Every predicate is whole-WG uniform.
+    const auto header_available =
+        b.land(b.ucmp(Op_UGreaterThanEqual, input_length, b.uconst(kFragmentDrawHeaderWords)),
+               b.ucmp(Op_IEqual, authority_length, b.uconst(kFragmentDrawAuthorityWords)));
     b.put(b.code, Op_SelectionMerge, {outer_merge, 0});
-    b.put(b.code, Op_BranchConditional,
-          {b.land(b.ucmp(Op_UGreaterThanEqual, input_length, b.uconst(kFragmentDrawHeaderWords)),
-                  b.ucmp(Op_IEqual, authority_length, b.uconst(kFragmentDrawAuthorityWords))),
-           header, outer_merge});
+    b.put(b.code, Op_BranchConditional, {header_available, header, outer_merge});
     b.emit_label(header);
     const auto capacity = authority(1);
     const auto quads = b.load_packet_word(b.uconst(4));

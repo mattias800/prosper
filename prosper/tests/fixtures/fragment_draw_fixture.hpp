@@ -9,6 +9,7 @@ namespace prosper::test::fragment_draw {
 namespace g = prosper::gpu;
 namespace p = prosper::agc::Pm4;
 inline constexpr uint32_t width = 16, height = 12;
+inline constexpr uint32_t ieee_rsrc1 = 1u << p::SPI_SHADER_PGM_RSRC1_PS_IEEE_MODE_SHIFT;
 inline constexpr std::array<float, 4> color_a{.25f, .5f, .75f, .5f};
 inline constexpr std::array<float, 4> color_b{.75f, .25f, .5f, .5f};
 
@@ -37,7 +38,8 @@ struct Owners {
 };
 
 inline bool realize(g::DrawItem& draw, const std::array<float, 4>& color = color_a,
-                    const std::vector<uint32_t>& ps_words = fragment_words()) {
+                    const std::vector<uint32_t>& ps_words = fragment_words(),
+                    uint32_t ps_rsrc1 = ieee_rsrc1) {
     prosper::register_builtin_hle();
     const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
     uint64_t address = 0;
@@ -62,7 +64,9 @@ inline bool realize(g::DrawItem& draw, const std::array<float, 4>& color = color
     state.cx[p::SPI_PS_IN_CONTROL] = 0;   // actual Wave64
     state.cx[p::SPI_BARYC_CNTL] = 0;
     state.cx[p::SPI_PS_INPUT_ENA] = state.cx[p::SPI_PS_INPUT_ADDR] = 0;   // actual input-free ABI
-    state.sh[p::SPI_SHADER_PGM_RSRC1_PS] = 0;   // actual known mode/flag launch register
+    // Supply the actual launch register BEFORE realization. The packet compiler currently
+    // requires IEEE mode; a physically supplied mode0 peer remains a named negative.
+    state.sh[p::SPI_SHADER_PGM_RSRC1_PS] = ps_rsrc1;
     state.sh[p::SPI_SHADER_PGM_RSRC2_PS] = 4u << p::SPI_SHADER_PGM_RSRC2_PS_USER_SGPR_SHIFT;
     for (uint32_t word = 0; word < color.size(); ++word)
         state.sh[p::SPI_SHADER_USER_DATA_PS_0 + word] = std::bit_cast<uint32_t>(color[word]);

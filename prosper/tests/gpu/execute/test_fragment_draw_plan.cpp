@@ -33,6 +33,12 @@ TEST_F(FragmentDrawPlan, SameOriginalCachedCodeConsumesDistinctCurrentUserWords)
     const auto pa = f::prepare(a), pb = f::prepare(b);
     ASSERT_TRUE(pa && pb && a.fragment_draw_inputs && b.fragment_draw_inputs);
     ASSERT_EQ(*a.fragment_draw_inputs->raw_code, f::fragment_words());
+    for (const auto& input : {a.fragment_draw_inputs, b.fragment_draw_inputs}) {
+        ASSERT_TRUE(input->launch_rsrc1.available && input->float_flags.available);
+        EXPECT_EQ(input->launch_rsrc1.value, f::ieee_rsrc1);
+        EXPECT_TRUE(input->float_flags.ieee_mode);
+        EXPECT_EQ((input->launch_rsrc1.value >> 23) & 1u, uint32_t(input->float_flags.ieee_mode));
+    }
     EXPECT_FALSE(pa->ready) << "generic launch preparation still does not grant a transaction";
     const auto code_a =
         g::cached_fragment_draw_program(*a.fragment_draw_inputs, *pa, source_device, 48);
@@ -59,6 +65,25 @@ TEST_F(FragmentDrawPlan, SameOriginalCachedCodeConsumesDistinctCurrentUserWords)
     EXPECT_FALSE(code_a->replay_words().empty());
     EXPECT_EQ(ta.producing_inputs(), a.fragment_draw_inputs);
     EXPECT_EQ(tb.producing_inputs(), b.fragment_draw_inputs);
+
+    g::DrawItem mode0;
+    ASSERT_TRUE(f::realize(mode0, f::color_a, f::fragment_words(), 0u));
+    const auto mode0_prepared = f::prepare(mode0);
+    ASSERT_TRUE(mode0_prepared && mode0.fragment_draw_inputs);
+    ASSERT_EQ(*mode0.fragment_draw_inputs->raw_code, f::fragment_words());
+    ASSERT_TRUE(mode0.fragment_draw_inputs->launch_rsrc1.available &&
+                mode0.fragment_draw_inputs->float_flags.available);
+    EXPECT_EQ(mode0.fragment_draw_inputs->launch_rsrc1.value, 0u);
+    EXPECT_FALSE(mode0.fragment_draw_inputs->float_flags.ieee_mode);
+    EXPECT_EQ((mode0.fragment_draw_inputs->launch_rsrc1.value >> 23) & 1u,
+              uint32_t(mode0.fragment_draw_inputs->float_flags.ieee_mode));
+    const auto refused = g::compile_fragment_draw_program(*mode0.fragment_draw_inputs,
+                                                          *mode0_prepared, source_device, 48);
+    f::retain_source(refused.collect_words(), "non_ieee_collector");
+    EXPECT_EQ(refused.rejection_reason(), "packet-f32-non-ieee-mode-unimplemented");
+    EXPECT_FALSE(refused.capacity_owner());
+    EXPECT_TRUE(refused.validation_words().empty());
+    EXPECT_TRUE(refused.replay_words().empty());
 }
 TEST_F(FragmentDrawPlan, ForeignProducerDeviceAndDynamicPrefixCannotBorrowAuthority) {
     g::DrawItem draw;
