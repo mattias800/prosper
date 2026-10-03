@@ -872,6 +872,13 @@ if(TARGET prosper_core)
   # Runtime IL2CPP symbolication (#2551): name the C# method containing a live guest PC. The
   # fixture is committed and synthetic — no game dump, no Il2CppDumper — so this never degrades
   # into a silent skip. The binary doubles as the probe the agreement test drives.
+  # Tie reporting is a pure CPU resolver contract, independent of boot mappings or graphics.
+  prosper_add_gtest(test_il2cpp_ambiguity
+    SOURCES tests/host/symbols/test_il2cpp_ambiguity.cpp src/host/symbols/il2cpp_symbols.cpp
+    INCLUDES src tests
+    LIBRARIES Threads::Threads
+    PROPERTIES TIMEOUT 20)
+
   add_executable(test_il2cpp_symbols tests/host/symbols/test_il2cpp_symbols.cpp)
   target_include_directories(test_il2cpp_symbols PRIVATE tests)
   target_link_libraries(test_il2cpp_symbols PRIVATE prosper_core)
@@ -2059,11 +2066,17 @@ if(TARGET prosper_core)
   # PROSPER_BOOTPHASE. Deliberately registered outside the PROSPER_DIAGNOSTICS block: the property
   # under test is that the default build — the one everybody actually runs — can be made to say
   # where boot_program() stopped.
-  # Which bundled support PRXs are preloaded at all. Pure policy: no dump, no SELF parser, no
-  # filesystem — so both the DROP and the KEEP direction are checkable in ordinary CI.
+  # Bundled support PRX policy and actual candidate discovery over synthetic module files.
+  prosper_add_gtest(test_module_entry_abi
+    SOURCES tests/host/image/test_module_entry_abi.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_support_modules
-    SOURCES tests/loader/test_support_modules.cpp src/loader/support_modules.cpp
-    INCLUDES src)
+    SOURCES tests/loader/test_support_modules.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core
+    PROPERTIES ENVIRONMENT_MODIFICATION
+      "PROSPER_NO_PLUGIN_AUTOLINK=unset:")
 
   # Which preloaded modules are started with a real SCE module-param descriptor. Pure policy over
   # the fixed guest base map: no dump, no SELF parser, no filesystem — so both the inclusion and the
@@ -2799,6 +2812,9 @@ endif()
     INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_fragment_packet_definedness
     SOURCES tests/gpu/recompiler/test_fragment_packet_definedness.cpp
+    INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_packet_raw_masks
+    SOURCES tests/gpu/recompiler/test_fragment_packet_raw_masks.cpp
     INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_fragment_special_f32
     SOURCES tests/gpu/recompiler/test_fragment_special_f32.cpp
@@ -5908,6 +5924,9 @@ if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
     PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_fragment_packet_definedness_exec
     SOURCES tests/gpu/execute/test_fragment_packet_definedness_exec.cpp
+    INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_packet_raw_masks_exec
+    SOURCES tests/gpu/execute/test_fragment_packet_raw_masks_exec.cpp
     INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
 
   add_executable(test_fragment_packet_exec tests/gpu/execute/test_fragment_packet_exec.cpp)

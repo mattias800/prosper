@@ -61,10 +61,12 @@ inline FragmentInvocationPacket numeric_exec_pair(uint64_t mask) {
 inline FragmentInvocationPacket saved_mask_high_overwrite(bool boundary) {
     auto p = base();
     column(p, 1, 0xdeadbeefu);
-    p.guest_code.push_back(0xbe94047eu);   // S_MOV_B64 s[20:21],EXEC: Bool, not numeric halves
+    p.guest_code.push_back(
+        0xbe94047eu);   // S_MOV_B64 s[20:21],EXEC: materialize both current halves
     fp::smov(p.guest_code, 21, 0);   // legal high-only overwrite destroys the complete old mask
     if (boundary) p.guest_code.push_back(0xbf820000u);   // next-instruction dispatcher boundary
-    p.guest_code.push_back(0xbefe0414u);   // cannot reuse the stale complete Bool mask
+    p.guest_code.push_back(
+        0xbefe0414u);   // current preserved low + replaced high, never stale Bool
     fp::vmov(p.guest_code, 1, 0);
     fp::exp(p.guest_code, 1, 1);
     p.guest_code.push_back(0xbf810000u);

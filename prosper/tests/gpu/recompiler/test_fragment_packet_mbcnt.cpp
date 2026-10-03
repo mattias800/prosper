@@ -45,6 +45,24 @@ void refuse(const prosper::gpu::FragmentInvocationPacket& p, const std::string& 
     check(exact ? r.rejection == reason : r.rejection.find(reason) != std::string::npos,
           name + " precise cause: " + r.rejection);
 }
+// Only the first two EXPs read this first MBCNT pair; the later saved VCC lifetime resets it.
+// Derive physical-word prefixes from bit positions, independently of the emitted mask service.
+std::vector<uint32_t> first_pair_words(uint32_t low, uint32_t high,
+                                       bool saved_accumulator = false) {
+    namespace m = prosper::test::fragment_packet::mbcnt;
+    const m::Case c;
+    auto want = m::expected(c);
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        const uint32_t acc = saved_accumulator ? uint32_t(c.mask) : m::first_accumulator(c, lane);
+        const uint32_t lo = acc + m::prefix(low, lane, false);
+        const uint32_t hi = lo + m::prefix(high, lane, true);
+        for (uint32_t base : {8u, 20u}) {
+            want[lane * 36 + base] = lo;
+            want[lane * 36 + base + 1] = hi;
+        }
+    }
+    return want;
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -91,7 +109,7 @@ int main(int argc, char** argv) {
 
     // A supplied true SCC takes this conditional edge to S_ENDPGM at execution time, but
     // the CFG must still retain its fallthrough arm. Replace exactly one original S_MOV:
-    // a complete saved VCC definition is legal; a B32 DATA write expires the high mask half.
+    // a complete saved VCC definition and a B32 DATA write both preserve genuine physical words.
     auto conditional = m::packet({});
     conditional.guest_code.insert(conditional.guest_code.begin() + 2, 0xbe94046au);
     conditional.guest_code.insert(conditional.guest_code.begin(),
@@ -130,10 +148,17 @@ int main(int argc, char** argv) {
             check(word == 3, "conditional lifetime control changes only the saved-mask definition");
         }
     check(conditional_changes == 1, "conditional reachability pair changes one guest instruction word");
-    m::Case ended; ended.skip_all = true;
-    run(conditional, m::expected(ended), "conditional_reachable_saved_mask", directory);
-    refuse(conditional_expired, "mbcnt-unproven-saved-mask",
-           "runtime-taken SCC1 cannot hide its reachable expired-mask arm", false);
+    for (bool scc : {false, true}) {
+        conditional.scc = conditional_expired.scc = scc;
+        m::Case c;
+        c.skip_all = scc;
+        run(conditional, m::expected(c), "conditional_reachable_saved_mask_" + std::to_string(scc),
+            directory);
+        const auto want =
+            scc ? m::expected(c) : first_pair_words(uint32_t(c.scalar), uint32_t(c.mask >> 32));
+        run(conditional_expired, want, "conditional_saved_high_word_" + std::to_string(scc),
+            directory);
+    }
 
     // A legal original-instruction mutation changes the first numeric MBCNT from LO to HI.
     // Walk both actual instruction streams; changing the oracle's first_is_high flag alone is
@@ -275,29 +300,34 @@ int main(int argc, char** argv) {
     operand_control(107, false, "packet-mbcnt-mask-half-unimplemented", "LO cannot alias VCC_HI");
     operand_control(124, false, "packet-mbcnt-source-kind-unimplemented", "M0 is not owned MBCNT data");
     operand_control(126, true, "packet-mbcnt-accumulator-kind-unimplemented", "Bool EXEC is not a raw accumulator");
-    operand_control(20, true, "packet-mbcnt-accumulator-state-unavailable",
-                    "saved Bool is not a fabricated raw accumulator", false);
+    auto saved_accumulator = m::packet({});
+    saved_accumulator.guest_code[3] = (saved_accumulator.guest_code[3] & ~(511u << 9)) | (20u << 9);
+    const m::Case saved_words;
+    run(saved_accumulator,
+        first_pair_words(uint32_t(saved_words.mask), uint32_t(saved_words.mask >> 32), true),
+        "actual_saved_mask_accumulator", directory);
     auto modifiers = m::packet({}); modifiers.guest_code[2] |= 1u << 11;
     refuse(modifiers, "packet-mbcnt-modifier-unimplemented", "reserved OPSEL is not dropped");
     modifiers = m::packet({}); modifiers.guest_code[2] |= 1u << 8;
     refuse(modifiers, "packet-modifier-unimplemented", "ABS is not integer mask authority");
 
-    // Saving VCC destroys the packet's old raw s20:s21 words. A later definite B32 write
-    // replaces only its addressed word, never fabricates the untouched half or revives VCC.
+    // Saving VCC replaces initial poison with actual raw s20:s21 words. A later definite B32
+    // write replaces only its addressed word; the untouched high word retains the saved bits.
     auto expired = m::packet({});
     std::vector<uint32_t> overwrite;
     prosper::test::fragment_packet::smov(overwrite, 20, 0x40000081u);
     expired.guest_code.insert(expired.guest_code.begin() + 2, overwrite.begin(), overwrite.end());
-    refuse(expired, "mbcnt-unproven-saved-mask", "expired saved high half", false);
+    run(expired, first_pair_words(0x40000081u, uint32_t(saved_words.mask >> 32)),
+        "actual_saved_high_after_low_overwrite", directory);
     // Same overwrite, then an actual complete mask definition: the exact MBCNT pair is legal again.
     expired.guest_code.insert(expired.guest_code.begin() + 4, 0xbe94046au);
     run(expired, m::expected({}), "saved_mask_redefined", directory);
     auto opposite = m::packet({}); opposite.guest_code[3] = (opposite.guest_code[3] & ~511u) | 21u;
     refuse(opposite, "mbcnt-unproven-saved-mask", "saved high word cannot alias a low Bool root", false);
 
-    // One forward arm retains a Bool mask, the other definitely replaces both words with DATA.
-    // Neither path's representation is a MUST fact at their join. A same-shape control has
-    // definite DATA before the split and retains it on both arms.
+    // Both forward arms now have genuine physical DATA: one retains the saved mask words,
+    // the other overwrites both. Exercise BOTH runtime edges, not just the initially true SCC.
+    // The same-shape control still has numeric replacements before the split on both arms.
     const auto join = [&](bool defined_before_split) {
         m::Case c; c.numeric_replacement = defined_before_split;
         auto p = m::packet(c);
@@ -309,7 +339,14 @@ int main(int argc, char** argv) {
                             arms.begin(), arms.end());
         return p;
     };
-    refuse(join(false), "wave64-ambiguous-mask-read", "mask/DATA join cannot borrow either arm", false);
+    for (bool scc : {false, true}) {
+        auto joined = join(false);
+        joined.scc = scc;
+        const auto want = scc ? m::expected(saved_words)
+                              : first_pair_words(uint32_t(saved_words.scalar),
+                                                 uint32_t(saved_words.scalar >> 32));
+        run(joined, want, "actual_saved_numeric_join_" + std::to_string(scc), directory);
+    }
     m::Case replaced; replaced.numeric_replacement = true;
     run(join(true), m::expected(replaced), "definite_numeric_join", directory);
     std::printf("fragment_packet_mbcnt: cases=%u checks=%d failures=%d (owned packets, no raster claim)\n",

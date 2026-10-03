@@ -62,9 +62,10 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   It grants no raster scheduling, system-entry derivation or shipping admission.
 - `rdna2_mask_move` supplies the shared S_MOV_B64-to-EXEC lowering. Owned Wave64 packets consume
   two genuine instruction-order MUST scalar words at their logical lane position, independently
-  of old EXEC, and preserve SCC. A partial numeric overwrite of a saved Bool mask remains a named
-  transitional refusal until the preserved raw half is genuinely materialized; scalar
-  initialization or the old complete Bool alias is not that proof. Native fragment lowering is
+  of old EXEC, and preserve SCC. `rdna2_packet_raw_masks` materializes selected complete ordinary
+  saved-SGPR masks through the uniform tagged workgroup phase before physical DATA reads/partial
+  replacements; either physical overwrite expires the old complete alias. Actual absent sources
+  remain named refusals; scalar initialization or the old complete Bool alias is not that proof. Native fragment lowering is
   separate and retains its existing exact-subgroup contract.
 - `spirv_builder` — small hand-built SPIR-V modules. **These include shipped shaders**:
   `frontends/shared/live/live_compute.cpp`'s `prepare_compare_pipeline()` feeds

@@ -53,7 +53,17 @@ void runtime_module_loader_init(Program* p);
 uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64_t argp,
                                    uint64_t guest_fs, int32_t* out_res, uint64_t* out_handle);
 
+// Run, once, the init functions a LinkInput::init_on_load module had held back at boot. `guest_path` is matched by basename, case-insensitively. A module with nothing pending
+// (never deferred, or already started) is a no-op, so the guest's repeat loads stay idempotent.
+void run_deferred_module_init(const char* guest_path, uint64_t args, uint64_t argp,
+                              uint64_t guest_fs);
+
 // Test/diagnostic: how many modules the runtime loader has loaded so far.
+// Call one module entry as module_start(size_t argc, const void* argp) through the platform's guest
+// ABI bridge (System V arguments and register preservation on every host), with the guest's %fs
+// installed for the duration when `guest_fs` is nonzero. Plain init_array constructors ignore both.
+uint64_t call_guest_module_entry(uint64_t fn, uint64_t args, uint64_t argp, uint64_t guest_fs);
+
 size_t runtime_loaded_module_count();
 
 } // namespace prosper

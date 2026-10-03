@@ -134,10 +134,12 @@ TEST(FragmentPacketDefinedness, NumericExecMaskRequiresCompleteReachingWords) {
     for (bool boundary : {false, true}) {
         SCOPED_TRACE(boundary ? "dispatcher reload" : "same emitted case");
         const auto p = recompile_fragment_packet(f::saved_mask_high_overwrite(boundary));
-        EXPECT_TRUE(p.spirv.empty());
-        EXPECT_NE(p.rejection.find("packet-exec-mask-source-words-unavailable"), std::string::npos)
-            << p.rejection;
-        EXPECT_NE(p.rejection.find(boundary ? "pc=4" : "pc=3"), std::string::npos) << p.rejection;
+        ASSERT_FALSE(p.spirv.empty()) << p.rejection;
+        const auto words = evaluate(p, boundary ? "saved_high_overwrite_boundary"
+                                                : "saved_high_overwrite_same_case");
+        const auto result = decode_fragment_packet(p, words, true);
+        EXPECT_TRUE(result.rejection.empty()) << result.rejection;
+        EXPECT_EQ(result.exports, f::expected(UINT32_MAX, 0x42230011u));
     }
 }
 

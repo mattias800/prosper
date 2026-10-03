@@ -45,9 +45,11 @@ const char* packet_instruction_gap(const Rdna2Inst& in, GraphicsPacketStage stag
                 ? nullptr : "packet-control-unimplemented";
         case Rdna2Format::SOP1:
             return in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64 ||
-                in.opcode == kSop1OpcodeBcnt1I32B64 || in.opcode == kSop1OpcodeFf1I32B64 ||
-                in.opcode == 0x0a
-                ? nullptr : "packet-scalar-op-unimplemented";
+                           in.opcode == 0x08 || in.opcode == kSop1OpcodeAndSaveexecB64 ||
+                           in.opcode == kSop1OpcodeBcnt1I32B64 ||
+                           in.opcode == kSop1OpcodeFf1I32B64 || in.opcode == 0x0a
+                       ? nullptr
+                       : "packet-scalar-op-unimplemented";
         case Rdna2Format::SOP2:
             return in.opcode == kSop2OpcodeAddU32 || in.opcode == kSop2OpcodeAddcU32 ||
                            in.opcode == kSop2OpcodeCselectB32 || in.opcode == kSop2OpcodeAndB32 ||
@@ -615,9 +617,11 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
                 ) invalid_scalar_write = true;
         });
         if (invalid_scalar_write) return reject("packet-scalar-destination-unimplemented", in.pc);
-        const bool pair_source = in.fmt == Rdna2Format::SOP1 &&
+        const bool pair_source =
+            in.fmt == Rdna2Format::SOP1 &&
             (in.opcode == kSop1OpcodeMovB64 || in.opcode == kSop1OpcodeBcnt1I32B64 ||
-             in.opcode == kSop1OpcodeFf1I32B64 || in.opcode == 0x0a);
+             in.opcode == kSop1OpcodeFf1I32B64 || in.opcode == 0x0a || in.opcode == 0x08 ||
+             in.opcode == kSop1OpcodeAndSaveexecB64);
         for (uint32_t source = 0; source < in.n_src; ++source) {
             if (in.fmt == Rdna2Format::EXP && !(in.exp_en & (1u << source))) continue;
             const auto& operand = in.src[source];

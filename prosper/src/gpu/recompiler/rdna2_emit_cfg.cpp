@@ -3,6 +3,7 @@
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/fragment_packet_definedness.hpp"
+#include "gpu/recompiler/rdna2_packet_raw_masks.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -2035,7 +2036,11 @@ bool emit_cfg_state_machine(
         if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
             scalar_block_starts.insert(ins[i + 1].pc);
     }
+    PacketRawMasks packet_raw_masks(b, ins);
     std::unordered_set<uint32_t> b64_mask_scc_vote_pcs;
+    // Newly admitted packet SOP1 masks need real SCC even across a preserving MOV/dispatcher.
+    b64_mask_scc_vote_pcs.insert(packet_raw_masks.scc_sites.begin(),
+                                 packet_raw_masks.scc_sites.end());
     for (size_t i = 0; i < ins.size(); ++i) {
         const Rdna2Inst& consumer = ins[i];
         if (consumer.is_end) break;
@@ -2216,6 +2221,10 @@ bool emit_cfg_state_machine(
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
         }
+        if (packet_raw_masks.contains(in.pc)) {
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc) start_set.insert(ins[i + 1].pc);
+        }
         if (portable_mask_ffbh_candidate(in)) {
             portable_mask_ffbh_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_mask_ffbh_event_for_pc.size() + 1));
@@ -2336,9 +2345,11 @@ bool emit_cfg_state_machine(
           !portable_readfirstlane_event_for_pc.empty())
              ? padded_lanes : 0u);
     const uint32_t group_active_slot = wave_result_base + wave_count;
+    const uint32_t raw_mask_result_base =
+        group_active_slot + 1 + (packet_definedness ? b.local_count : 0u);
     if (packet_definedness) packet_definedness->peer_scratch_base = group_active_slot + 1;
     if (b.has_workgroup_execution() && !direct_dispatch &&
-        !b.declare_cfg_scratch(group_active_slot + 1 + (packet_definedness ? b.local_count : 0u)))
+        !b.declare_cfg_scratch(raw_mask_result_base + (packet_raw_masks.sites.empty() ? 0u : 2u)))
         return reject_cfg(ins.front().pc, "cfg-scratch-too-small");
     start_set.insert(end_pc);
     std::vector<uint32_t> starts(start_set.begin(), start_set.end());
@@ -3442,7 +3453,7 @@ bool emit_cfg_state_machine(
                 const bool dual_domain_scalar_write =
                     mov_dual_domain || cselect_scalar_branch || logical_native_ballot ||
                     quadmask_native_ballot || b32_vcc_complete_scalar_pair ||
-                    vcc_pack_scalar_pair;
+                    vcc_pack_scalar_pair || packet_raw_masks.contains(in.pc);
                 if (dual_domain_scalar_write && valid_scc_read) {
                     for (const auto& [base, width] : scalar_writes)
                         for (uint32_t word = 0; word < width; ++word)
@@ -3889,20 +3900,19 @@ bool emit_cfg_state_machine(
         const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
         for (const auto& in : ins) {
             if (in.pc < lo || in.pc >= hi) continue;
-            synchronized_block[block] = synchronized_block[block] ||
-                mbcnt_event_for_pc.contains(in.pc) || append_event_for_pc.contains(in.pc) ||
-                swizzle_pcs.contains(in.pc) || bpermute_event_for_pc.contains(in.pc) ||
+            synchronized_block[block] =
+                synchronized_block[block] || mbcnt_event_for_pc.contains(in.pc) ||
+                append_event_for_pc.contains(in.pc) || swizzle_pcs.contains(in.pc) ||
+                bpermute_event_for_pc.contains(in.pc) ||
                 fragment_dpp_min_row_shr_pcs.contains(in.pc) ||
                 compute_dpp_add_row_shr_pcs.contains(in.pc) ||
                 compute_dpp_row_ror8_pcs.contains(in.pc) ||
                 compute_dpp_add_row_mask_pcs.contains(in.pc) ||
-                packet_wqm_event_for_pc.contains(in.pc) ||
-                lds_fminmax_pcs.contains(in.pc) ||
-                mask_zero_compare_candidate_source(in) >= 0 ||
+                packet_wqm_event_for_pc.contains(in.pc) || packet_raw_masks.contains(in.pc) ||
+                lds_fminmax_pcs.contains(in.pc) || mask_zero_compare_candidate_source(in) >= 0 ||
                 exec_saved_mask_compare_source(in) >= 0 ||
                 saved_mask_pair_compare_sources(in)[0] >= 0 ||
-                vopc_mask_zero_compare_source(in) >= 0 ||
-                b64_mask_scc_vote_pcs.contains(in.pc);
+                vopc_mask_zero_compare_source(in) >= 0 || b64_mask_scc_vote_pcs.contains(in.pc);
             conditional_block[block] = conditional_block[block] ||
                 (!linearized_branch(in) && in.fmt == Rdna2Format::SOPP &&
                  in.opcode >= 0x04 && in.opcode <= 0x09 && in.opcode != 0x03);
@@ -4246,6 +4256,7 @@ bool emit_cfg_state_machine(
         ? b.function_var(b.t_u32, ptr_u32) : 0;
     const uint32_t dpp_ror8_event_var = has_portable_compute_dpp_ror8
         ? b.function_var(b.t_u32, ptr_u32) : 0;
+    packet_raw_masks.begin(b, raw_mask_result_base);
     const bool has_portable_mask_ffbh = !portable_mask_ffbh_event_for_pc.empty();
     const uint32_t mask_ffbh_pending_var = has_portable_mask_ffbh
         ? b.function_var(b.t_bool, ptr_bool) : 0;
@@ -4752,6 +4763,7 @@ bool emit_cfg_state_machine(
         b.store_function(dpp_ror8_active_var, no);
         b.store_function(dpp_ror8_event_var, zero);
     }
+    packet_raw_masks.reset(b);
     if (has_portable_mask_ffbh) {
         b.store_function(mask_ffbh_pending_var, no);
         b.store_function(mask_ffbh_mask_var, no);
@@ -5089,6 +5101,10 @@ bool emit_cfg_state_machine(
                     record_scalar_write(
                         state, in,
                         allows_compute_scalar_vcc_bridge(b), saved_masks);
+                if (handled && ok) {
+                    packet_raw_masks.expire(state, in);
+                    packet_raw_masks.stage(b, state, in);
+                }
                 if (handled && ok && in.pc == b.ngg_probe_trace_pc) {
                     const auto value = state.vreg.find(static_cast<int>(b.ngg_probe_trace_vgpr));
                     if (value == state.vreg.end())
@@ -5222,6 +5238,7 @@ bool emit_cfg_state_machine(
                 b.uconst(packet_wqm_event_for_pc.at(packet_wqm->pc)));
             const int dst = packet_wqm->dst.value;
             b.store_function(packet_wqm_dst_var, b.uconst(static_cast<uint32_t>(dst)));
+            packet_raw_masks.stage(b, state, *packet_wqm, true);
             for (int word : {dst, dst + 1}) {
                 state.sreg.erase(word);
                 state.sreg_input.erase(word);
@@ -5823,17 +5840,8 @@ bool emit_cfg_state_machine(
             }
         }
         if (b64_mask_scc_vote) {
-            uint32_t value = 0;
-            if (b64_mask_scc_vote->dst.value == 126 ||
-                b64_mask_scc_vote->dst.value == 127) {
-                value = state.exec;
-            } else if (b64_mask_scc_vote->dst.value == 106 ||
-                       b64_mask_scc_vote->dst.value == 107) {
-                value = state.vcc;
-            } else {
-                const auto saved = state.sreg_bool.find(b64_mask_scc_vote->dst.value);
-                if (saved != state.sreg_bool.end()) value = saved->second;
-            }
+            const uint32_t value =
+                cfg_b64_mask_scc_value(*b64_mask_scc_vote, state, b.is_fragment_packet());
             if (!value)
                 return reject_cfg(b64_mask_scc_vote->pc, "missing-b64-mask-scc-source");
             if (b.native_subgroup_size || b.is_fragment) {
@@ -6669,6 +6677,7 @@ bool emit_cfg_state_machine(
         }
     }
 
+    packet_raw_masks.phase(b, sv, mv);
     if (has_portable_mask_reduction) {
         // Scalar mask operations ignore EXEC for their destination write. All launched guest
         // lanes publish the physical source bit, including EXEC-off lanes. The static event tag
@@ -6719,95 +6728,12 @@ bool emit_cfg_state_machine(
         b.barrier();
     }
 
-    if (has_portable_mask_ffbh) {
-    // Portable Wave64 saved-mask FFBH phase. Each publishing lane contributes its one predicate bit
-    // with a static-event tag. Lane zero assembles the selected architectural 32-bit half in LDS,
-    // after which every lane applies the ordinary V_FFBH_U32 semantics and predicates the VGPR
-    // write by its own EXEC. This deliberately does not use a host subgroup ballot: the portable
-    // route has no exact-width contract, and a narrower ballot would silently lose guest lanes.
-    const uint32_t mask_ffbh_pending =
-        b.load_function(b.t_bool, mask_ffbh_pending_var);
-    const uint32_t mask_ffbh_mask = b.load_function(b.t_bool, mask_ffbh_mask_var);
-    const uint32_t mask_ffbh_tag = b.load_function(b.t_u32, mask_ffbh_event_var);
-    const uint32_t mask_ffbh_encoded = b.sel(
-        mask_ffbh_pending,
-        b.ibin(Op_BitwiseOr,
-               b.ibin(Op_ShiftLeftLogical, mask_ffbh_tag, b.uconst(1)),
-               b.sel(mask_ffbh_mask, b.uconst(1), zero)),
-        zero);
-    b.cfg_scratch_store(b.linear_localid, mask_ffbh_encoded);
-    b.barrier();
-
-    const uint32_t mask_ffbh_leader = b.id(), mask_ffbh_assembled = b.id();
-    const uint32_t mask_ffbh_is_leader = b.land(
-        mask_ffbh_pending, b.ucmp(Op_IEqual, mbcnt_lane, zero));
-    b.emit_selmerge(mask_ffbh_assembled);
-    b.emit_condbranch(mask_ffbh_is_leader, mask_ffbh_leader, mask_ffbh_assembled);
-    b.emit_label(mask_ffbh_leader);
-    const uint32_t mask_ffbh_wave_base = b.ibin(
-        Op_ShiftLeftLogical, mbcnt_wave_index, b.uconst(6));
-    const uint32_t mask_ffbh_half = b.load_function(b.t_u32, mask_ffbh_half_var);
-    uint32_t mask_ffbh_word = zero;
-    for (uint32_t bit = 0; bit < 32; ++bit) {
-        const uint32_t candidate_lane = b.ibin(
-            Op_IAdd, b.uconst(bit),
-            b.ibin(Op_ShiftLeftLogical, mask_ffbh_half, b.uconst(5)));
-        const uint32_t candidate_index = b.ibin(
-            Op_IAdd, mask_ffbh_wave_base, candidate_lane);
-        const uint32_t candidate = b.cfg_scratch_load(candidate_index);
-        const uint32_t candidate_tag = b.ibin(
-            Op_ShiftRightLogical, candidate, b.uconst(1));
-        uint32_t include = b.ucmp(Op_IEqual, candidate_tag, mask_ffbh_tag);
-        include = b.land(
-            include, b.ucmp(Op_ULessThan, candidate_index, b.uconst(b.local_count)));
-        const uint32_t candidate_bit = b.ibin(
-            Op_BitwiseAnd, candidate, b.uconst(1));
-        const uint32_t positioned = b.ibin(
-            Op_ShiftLeftLogical, candidate_bit, b.uconst(bit));
-        mask_ffbh_word = b.ibin(
-            Op_BitwiseOr, mask_ffbh_word, b.sel(include, positioned, zero));
-    }
-    b.cfg_scratch_store(
-        b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index),
-        mask_ffbh_word);
-    b.emit_branch(mask_ffbh_assembled);
-    b.emit_label(mask_ffbh_assembled);
-    b.barrier();
-
-    const uint32_t mask_ffbh_result = b.ffbh_u32(b.cfg_scratch_load(
-        b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index)));
-    const uint32_t mask_ffbh_dst = b.load_function(b.t_u32, mask_ffbh_dst_var);
-    const uint32_t mask_ffbh_write = b.land(
-        mask_ffbh_pending, b.load_function(b.t_bool, mask_ffbh_write_var));
-    for (int reg : portable_mask_ffbh_dsts) {
-        const auto destination = vv.find(reg);
-        if (destination == vv.end()) return reject_cfg(0, "missing-mask-ffbh-dst");
-        const uint32_t selected = b.land(
-            mask_ffbh_write,
-            b.ucmp(Op_IEqual, mask_ffbh_dst, b.uconst(static_cast<uint32_t>(reg))));
-        const uint32_t old = b.load_function(b.t_u32, destination->second);
-        b.store_function(destination->second, b.sel(selected, mask_ffbh_result, old));
-    }
-    // As for every ordinary VALU destination, the physical write ends scalar-spill aliases even
-    // where EXEC suppresses this lane's data update.
-    for (const auto& kv : lv) {
-        const uint32_t selected = b.land(
-            mask_ffbh_pending,
-            b.ucmp(Op_IEqual, mask_ffbh_dst,
-                   b.uconst(static_cast<uint32_t>(kv.first.first))));
-        const uint32_t old = b.load_function(b.t_u32, kv.second);
-        b.store_function(kv.second, b.sel(selected, zero, old));
-    }
-    for (const auto& kv : lmv) {
-        const uint32_t selected = b.land(
-            mask_ffbh_pending,
-            b.ucmp(Op_IEqual, mask_ffbh_dst,
-                   b.uconst(static_cast<uint32_t>(kv.first.first))));
-        const uint32_t old = b.load_function(b.t_bool, kv.second);
-        b.store_function(kv.second, b.bsel(selected, no, old));
-    }
-    b.barrier();
-    }
+    if (has_portable_mask_ffbh &&
+        !emit_cfg_mask_ffbh_phase(b, mask_ffbh_pending_var, mask_ffbh_mask_var, mask_ffbh_write_var,
+                                  mask_ffbh_event_var, mask_ffbh_half_var, mask_ffbh_dst_var,
+                                  mbcnt_lane, mbcnt_wave_index, wave_result_base,
+                                  portable_mask_ffbh_dsts, vv, lv, lmv))
+        return reject_cfg(0, "missing-mask-ffbh-dst");
 
     if (has_portable_readfirstlane) {
         // AMD RDNA2 ISA 70648 section 12.8: select the lowest EXEC bit; EXEC=0 selects lane 0.
