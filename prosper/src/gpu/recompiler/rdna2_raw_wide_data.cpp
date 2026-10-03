@@ -16,7 +16,7 @@ namespace prosper::gpu {
 // to that same guest allocation. Without an alias proof, keep potentially writing instructions
 // on the ordinary unresolved route. Read-only operations remain eligible.
 bool rdna2_may_write_guest_memory(const Rdna2Inst& in) {
-    if (in.fmt == Rdna2Format::FLAT) return true;
+    if (in.fmt == Rdna2Format::FLAT) return rdna2_instruction_may_write_memory(in);
     if (in.fmt == Rdna2Format::SMEM) return in.opcode >= 0x10u;
     if (in.fmt == Rdna2Format::MTBUF) return in.opcode > 0x03u;
     if (in.fmt == Rdna2Format::MUBUF)
