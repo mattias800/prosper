@@ -63,7 +63,7 @@ display-space render.
    texture is bound; its dump shows scrambled/partly-committed content), so the MVP is in **atlas space**,
    not display space. We render that draw straight to the display viewport → off-screen. This is the
    render-to-texture / render-target-management gap: execute the scene→atlas pass into a Vulkan image and
-   bind it as the composite's texture (historical context: `docs/gpu/NEXT_STEP_VERTEX_FETCH.md`; current
+   bind it as the composite's texture (historical context: `docs/archive/NEXT_STEP_VERTEX_FETCH.md`; current
    Messenger status: `docs/games/messenger/MESSENGER_BLACK_RENDER.md`).
 
 Also: our executor clears to a **debug blue** (BGR 255,0,0); switch to the game's clear color so the black
