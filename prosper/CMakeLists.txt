@@ -1325,22 +1325,9 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_libc_qsort_bsearch
     SOURCES tests/hle/test_libc_qsort_bsearch.cpp
     LIBRARIES prosper_core)
-
-  # Batch 2: strncmp/strnlen/strrchr/memset/sscanf FreeBSD contracts.
-  prosper_add_gtest(test_freebsd_strncmp
-    SOURCES tests/hle/test_freebsd_strncmp.cpp
-    LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_strnlen
-    SOURCES tests/hle/test_freebsd_strnlen.cpp
-    LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_strrchr
-    SOURCES tests/hle/test_freebsd_strrchr.cpp
-    LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_memset
-    SOURCES tests/hle/test_freebsd_memset.cpp
-    LIBRARIES prosper_core)
-  prosper_add_gtest(test_freebsd_sscanf
-    SOURCES tests/hle/test_freebsd_sscanf.cpp
+  # sscanf is a host-convention variadic (not PROSPER_GUEST_ABI); the suite calls it as one.
+  prosper_add_gtest(test_libc_sscanf
+    SOURCES tests/hle/test_libc_sscanf.cpp
     LIBRARIES prosper_core)
 
   # #2081 FALSE SUCCESS: an unregistered NID answers the dispatcher's 0, which for an SCE_OK
