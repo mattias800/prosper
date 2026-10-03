@@ -539,6 +539,15 @@ class Delta(unittest.TestCase):
         self.git("tag", "-a", "-m", "t", "reltag", "base")
         self.assertEqual(car.EXIT_OK, self.delta("reltag"))
         self.assertEqual(car.EXIT_UNEVALUATED, self.delta("base:prosper"))
+        self.assertEqual(car.EXIT_UNEVALUATED, self.delta("base:prosper/src/a.cpp"))
+
+    def test_revision_range_cannot_hide_committed_increase(self):
+        self.append("prosper/src/a.cpp", 'auto g = getenv("NEW");\n')
+        self.git("commit", "-qam", "grow")
+        self.assertEqual(car.EXIT_VIOLATION, self.delta("base"))
+        for ref in ("base..HEAD", "base...HEAD", "^base"):
+            with self.subTest(ref=ref):
+                self.assertEqual(car.EXIT_UNEVALUATED, self.delta(ref))
 
     def test_unreachable_base_is_two(self):
         self.assertEqual(car.EXIT_UNEVALUATED, self.delta("no-such-ref"))

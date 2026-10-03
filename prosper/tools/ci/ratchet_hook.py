@@ -169,16 +169,27 @@ def unverified(reason):
 def has_base(root, ref=BASE_REF):
     """Whether `ref` resolves to a commit in the checkout at `root`."""
     try:
+        # Resolve one object without the MSYS-mangled `^{commit}` suffix or a revision range.
+        resolved = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--verify", "--end-of-options", ref],
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_S,
+        )
+        oid = resolved.stdout.strip()
+        if resolved.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+            return False
         out = subprocess.run(
-            # not `<ref>^{commit}`: that spelling reaches git mangled on Windows/MSYS
-            ["git", "-C", root, "rev-list", "-n", "1", ref, "--"],
+            ["git", "-C", root, "rev-list", "-n", "1", oid, "--"],
             capture_output=True,
             text=True,
             timeout=GIT_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return out.returncode == 0
+    return out.returncode == 0 and bool(
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", out.stdout.strip())
+    )
 
 
 def _git_out(path, *args):
