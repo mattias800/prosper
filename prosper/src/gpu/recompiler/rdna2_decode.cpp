@@ -113,13 +113,32 @@ uint32_t rdna2_sop2_dest_dwords(uint32_t opcode) {
     }
 }
 
+static bool mimg_opcode_only_reads(uint32_t opcode) {
+    if (opcode <= 0x05u || opcode == 0x0eu || opcode == 0x80u || opcode == 0xe6u ||
+        opcode == 0xe7u)
+        return true;
+    if (opcode < 0x20u || opcode > 0x6fu) return false;
+    // Unassigned slots inside the sample/gather range.
+    switch (opcode) {
+        case 0x42u: case 0x43u: case 0x4au: case 0x4bu: case 0x52u: case 0x53u:
+        case 0x5au: case 0x5bu: case 0x62u: case 0x63u: case 0x64u: case 0x65u:
+        case 0x66u: case 0x67u:
+            return false;
+        default:
+            return true;
+    }
+}
+
 bool rdna2_instruction_may_write_memory(const Rdna2Inst& in) {
     switch (in.fmt) {
         case Rdna2Format::MIMG:
-            // image_store, image_store_pck and the integer image atomics; samples, gathers, loads
-            // and queries only read. The same set the consumer classifier treats as storage-only.
-            return in.opcode == 0x08u || in.opcode == 0x09u || in.opcode == 0x0fu ||
-                   (in.opcode >= 0x11u && in.opcode <= 0x1au && in.opcode != 0x13u);
+            // A READER list, so an unlisted opcode stays a writer. Every entry was disassembled
+            // with llvm-mc -mcpu=gfx1030: image_load* 0x00-0x05, image_get_resinfo 0x0e, the
+            // sample/gather/get_lod family in 0x20-0x6f (its invalid holes stay writers),
+            // image_msaa_load 0x80 and image_bvh[64]_intersect_ray 0xe6/0xe7. The stores
+            // 0x08-0x0b and every atomic 0x0f-0x1f, including cmpswap, inc/dec and the float
+            // atomics, are writers.
+            return !mimg_opcode_only_reads(in.opcode);
         case Rdna2Format::MUBUF:
             return !((in.opcode <= 0x03u) || (in.opcode >= 0x08u && in.opcode <= 0x0fu));
         case Rdna2Format::MTBUF:

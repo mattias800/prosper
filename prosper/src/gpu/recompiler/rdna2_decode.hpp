@@ -307,14 +307,16 @@ bool vopc_is_cmpx(uint32_t opcode);
 // turn a predicated VALU definition into a false all-lanes fact.
 bool rdna2_instruction_may_change_exec(const Rdna2Inst& in);
 // True when an instruction can WRITE guest memory (and so could rewrite a descriptor's backing):
-// image stores and integer image atomics, every buffer/flat operation that is not a plain load, and
-// scalar-memory operations above the load/buffer-load range. FAIL-CLOSED by construction: an opcode
-// this does not positively know to be a pure read is reported as a writer, so a new or unlisted
-// encoding can only cost an unresolved descriptor, never a stale binding. The read-only sets are
-// the ones the gfx1030 encodings establish (llvm-mc, `test_rdna2_decode`): MUBUF loads are
-// 0x00-0x03 (format) and 0x08-0x0f (ubyte..dwordx4), MTBUF loads 0x00-0x03, FLAT/global loads
-// 0x08-0x0f, SMEM loads below 0x10. Everything else, including the D16 and cache-invalidate forms,
-// is treated as a writer. Non-memory instructions return false.
+// every image operation that is not a load, sample, gather or query, every buffer/flat operation that
+// is not a plain load, and scalar-memory operations above the load/buffer-load range. FAIL-CLOSED by
+// construction: an opcode this does not positively know to be a pure read is reported as a writer,
+// so a new or unlisted encoding can only cost an unresolved descriptor, never a stale binding. The
+// read-only sets are the ones the gfx1030 encodings establish (llvm-mc, `test_rdna2_decode`): MIMG
+// loads 0x00-0x05, get_resinfo 0x0e, the assigned sample/gather/get_lod slots in 0x20-0x6f,
+// msaa_load 0x80 and the BVH intersects 0xe6/0xe7; MUBUF loads 0x00-0x03 (format) and 0x08-0x0f
+// (ubyte..dwordx4), MTBUF loads 0x00-0x03, FLAT/global loads 0x08-0x0f, SMEM loads below 0x10.
+// Everything else, including the D16 and cache-invalidate forms, is treated as a writer.
+// Non-memory instructions return false.
 bool rdna2_instruction_may_write_memory(const Rdna2Inst& in);
 // `full` is a `rdna2_walk` prefix ending at its first s_endpgm. Compilers place a divergent early-out
 // (discard, kill) AFTER that end and branch to it from the body, so a branch target can name code the

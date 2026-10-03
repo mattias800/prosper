@@ -3090,14 +3090,32 @@ bool straight_line_null_chain_dominates(const std::vector<Rdna2Inst>& instructio
 // particular, a conditional branch can skip one of two adjacent loads while the walk still sees
 // both. This deliberately admits only direct, entry-rooted scalar loads; computed pointers and
 // SOFFSETs remain on the existing unresolved path.
+//
+// The proof is a forward must-dataflow over the program's CFG, not a scan of index ranges. Every
+// SGPR carries a tag: the entry value of that register, word k of the scalar load at instruction i,
+// or unknown. A load from an entry-valued pointer tags its destination words, s_mov_b32 copies a
+// tag, any other possible write makes the register unknown, and a join keeps a tag only where
+// every incoming path agrees. The consumer is admitted only if, on EVERY path that reaches it
+// (including a later loop iteration), each descriptor word still carries the tag of the load word
+// the linear fold read. That one condition covers what interval scans kept missing: a path that
+// skips a load or a copy, a loop that replays a copy after its source changed, and a loop path
+// that leaves the lexical loop body to rewrite a register (#4203/#4214/#4218 reviews).
+//
+// The loaded BYTES must also be the ones the CPU snapshot read, so no instruction from which the
+// consumer is reachable may write guest memory. Two narrower contracts are kept from the interval
+// proof, because no title evidence needs them relaxed: a producer load inside a cycle is refused
+// outright, and only a pointer register that was never written counts as entry-rooted (a copy,
+// even of itself, drops that identity). A loop that re-runs a COPY is admitted when the copied
+// word still carries the same load tag, since a copy captures bits.
 bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t use_pc,
                                  int tbase, const std::array<uint32_t, 8>& source_pc,
                                  const std::array<uint64_t, 8>& source_addr,
                                  const uint32_t* user_sgprs, uint32_t nsgpr,
                                  uint32_t user_sgpr_base) {
-    // This rare fallback reparses the owned code. Keep its per-use CFG walk bounded; larger
-    // programs retain the ordinary unresolved path until they have a cached analysis.
-    if (!code || !user_sgprs || dwords > 2048 || tbase < 0 || tbase + 7 >= 106)
+    constexpr int kSgprs = 106;
+    // This rare fallback reparses the owned code. Keep its CFG analysis bounded; larger programs
+    // retain the ordinary unresolved path until they have a cached analysis.
+    if (!code || !user_sgprs || dwords > 2048 || tbase < 0 || tbase + 7 >= kSgprs)
         return false;
     std::vector<Rdna2Inst> full;
     rdna2_walk(code, dwords, full);
@@ -3111,10 +3129,8 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
     const auto use_it = by_pc.find(use_pc);
     if (use_it == by_pc.end()) return false;
     const size_t use = use_it->second;
-    std::vector<std::array<size_t, 2>> edges(full.size());
-    // Loops that re-enter the consumer: {first instruction index, branch instruction index}.
-    std::vector<std::array<size_t, 2>> backedges;
     constexpr size_t no_edge = SIZE_MAX;
+    std::vector<std::array<size_t, 2>> edges(full.size());
     for (size_t i = 0; i < full.size(); ++i) {
         edges[i] = {no_edge, no_edge};
         const auto& in = full[i];
@@ -3123,16 +3139,15 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         // has no statically enumerable successor. Decline rather than treating either as fallthrough.
         if (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x17 && in.opcode <= 0x1a)
             return false;
+        // s_subvector_loop_begin/end (SOPK 0x1b/0x1c) branch by their SIMM16, which this CFG does
+        // not model.
+        if (in.fmt == Rdna2Format::SOPK && (in.opcode == 0x1b || in.opcode == 0x1c))
+            return false;
         if (sopp_is_branch(in)) {
             const int64_t target = sopp_branch_target(in);
             if (target < 0 || target > UINT32_MAX) return false;
             const auto branch = by_pc.find(static_cast<uint32_t>(target));
             if (branch == by_pc.end()) return false;
-            // A later iteration may reach this same image instruction with different scalar
-            // values or descriptor backing. The linear fold publishes one binding per use PC, so
-            // such a loop is admitted only if its whole body provably preserves the descriptor
-            // (checked below once the descriptor's registers are known).
-            if (i > use && branch->second <= use) backedges.push_back({branch->second, i});
             edges[i][0] = branch->second;
             if (sopp_is_unconditional_branch(in)) continue;
             if (i + 1 >= full.size()) return false;
@@ -3141,25 +3156,6 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
             edges[i][0] = i + 1;
         }
     }
-    auto reaches_use = [&](size_t excluded) {
-        std::vector<uint8_t> seen(full.size());
-        std::vector<size_t> queue;
-        if (excluded == 0) return false;
-        queue.push_back(0);
-        seen[0] = 1;
-        for (size_t q = 0; q < queue.size(); ++q) {
-            const size_t at = queue[q];
-            if (at == use) return true;
-            for (size_t next : edges[at]) {
-                if (next != no_edge && next != excluded && !seen[next]) {
-                    seen[next] = 1;
-                    queue.push_back(next);
-                }
-            }
-        }
-        return false;
-    };
-    if (!reaches_use(no_edge)) return false;
     auto may_write = [&](const Rdna2Inst& in, int reg) {
         // Unknown relative SGPR destinations cannot be excluded by comparing the decoded base.
         if ((in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20) ||
@@ -3168,6 +3164,14 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         // clobbers the adjacent destination while assembling a T# one lane at a time.
         if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32 &&
             in.dst.kind == OperandKind::SGPR)
+            return in.dst.value == reg;
+        // v_readfirstlane_b32 (VOP1 0x02) and v_readlane_b32 (VOP3 0x360) write the SGPR their
+        // VDST field names, which the decoder carries as a VGPR operand. 0x182 is the VOP3 slot of
+        // v_readfirstlane; gfx1030 has no such encoding, so it is refused the same way rather than
+        // trusted to be absent.
+        if (((in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02u) ||
+             (in.fmt == Rdna2Format::VOP3 && (in.opcode == 0x360u || in.opcode == 0x182u))) &&
+            in.dst.kind == OperandKind::VGPR)
             return in.dst.value == reg;
         auto overlaps = [reg](const Operand& dst, uint32_t width) {
             return dst.kind == OperandKind::SGPR && reg >= dst.value &&
@@ -3190,25 +3194,21 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         }
         return overlaps(in.dst, width) || overlaps(in.sdst, 2);
     };
-    // A guest-visible write before the consumer could alter descriptor backing after the CPU
-    // snapshot. LDS writes are a separate address space; global/buffer and storage-image writes
-    // are left unresolved because proving non-aliasing would need resource ownership analysis.
-    for (size_t i = 0; i < use; ++i) {
-        const auto& in = full[i];
-        // A prior store or atomic could rewrite these descriptor bytes through an alias. Plain
-        // loads, samples and gathers only read, so they do not revoke the proof.
-        if (rdna2_instruction_may_write_memory(in)) return false;
-    }
-    // Registers whose value the consumer's descriptor depends on: the T# words themselves, and (per
-    // lane, below) the registers it was copied from and the pointer it was loaded through.
-    std::vector<int> preserved;
-    for (int lane = 0; lane < 8; ++lane) preserved.push_back(tbase + lane);
+
+    // Validate each lane's producer and name the tag its descriptor word must carry at the use.
+    // A tag is (instruction index << 8 | word) for a load word, and the two sentinels below.
+    constexpr uint64_t kUnknown = ~0ull;
+    constexpr uint64_t kEntryBit = 1ull << 63;
+    auto load_tag = [](size_t producer, uint32_t word) {
+        return (static_cast<uint64_t>(producer) << 8u) | word;
+    };
+    std::vector<uint8_t> is_producer(full.size());
+    std::array<uint64_t, 8> expected{};
     for (int lane = 0; lane < 8; ++lane) {
         const auto found = by_pc.find(source_pc[static_cast<size_t>(lane)]);
-        if (found == by_pc.end() || found->second >= use) return false;
+        if (found == by_pc.end()) return false;
         const size_t producer = found->second;
         const Rdna2Inst& load = full[producer];
-        const int reg = tbase + lane;
         if (load.fmt != Rdna2Format::SMEM || load.opcode > 4u ||
             load.opcode < 2u || load.dst.kind != OperandKind::SGPR ||
             load.src[0].kind != OperandKind::SGPR ||
@@ -3218,9 +3218,7 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         const int base_reg = load.src[0].value;
         if (base_reg < static_cast<int>(user_sgpr_base) ||
             base_reg + 1 >= static_cast<int>(user_sgpr_base + nsgpr) ||
-            base_reg + 1 >= 106) return false;
-        for (size_t i = 0; i < producer; ++i)
-            if (may_write(full[i], base_reg) || may_write(full[i], base_reg + 1)) return false;
+            base_reg + 1 >= kSgprs) return false;
         const size_t seed = static_cast<size_t>(base_reg - static_cast<int>(user_sgpr_base));
         const uint64_t base = static_cast<uint64_t>(user_sgprs[seed]) |
                               (static_cast<uint64_t>(user_sgprs[seed + 1]) << 32u);
@@ -3229,50 +3227,121 @@ bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t u
         const uint64_t addr = source_addr[static_cast<size_t>(lane)];
         if (addr < first_addr || addr - first_addr >= width * sizeof(uint32_t) ||
             ((addr - first_addr) & 3u)) return false;
-        const int original_reg = load.dst.value +
-            static_cast<int>((addr - first_addr) / sizeof(uint32_t));
-        if (original_reg < 0 || original_reg >= 106)
+        const uint32_t word = static_cast<uint32_t>((addr - first_addr) / sizeof(uint32_t));
+        if (load.dst.value < 0 || load.dst.value + static_cast<int>(word) >= kSgprs)
             return false;
-        if (reaches_use(producer)) return false; // a path bypasses this load
-        bool copied = original_reg == reg;
-        for (size_t i = producer + 1; i < use; ++i) {
-            const Rdna2Inst& step = full[i];
-            // A copied lane needs one unconditional scalar move. No branch between its load and
-            // that move may skip it; once the move has executed, a later branch cannot undo it (a
-            // branch back to before the load is still refused just below, and a write to either
-            // register is still refused by the overwrite checks). The producer-dominance check
-            // above handles entry edges.
-            if (!copied && original_reg != reg && sopp_is_branch(step)) return false;
-            if (sopp_is_branch(step) && sopp_branch_target(step) <=
-                                            static_cast<int64_t>(load.pc)) return false;
-            const bool exact_copy = original_reg != reg && !copied &&
-                step.fmt == Rdna2Format::SOP1 && step.opcode == kSop1OpcodeMovB32 &&
-                step.dst.kind == OperandKind::SGPR && step.dst.value == reg &&
-                step.src[0].kind == OperandKind::SGPR &&
-                step.src[0].value == original_reg;
-            if (!copied && may_write(step, original_reg)) return false;
-            if (copied && may_write(step, reg)) return false;
-            if (exact_copy) copied = true;
-        }
-        if (!copied) return false;
+        is_producer[producer] = 1;
+        expected[static_cast<size_t>(lane)] = load_tag(producer, word);
     }
-    // A loop that re-enters the consumer runs the same image instruction again, and the linear
-    // fold published one binding for it. That binding stays valid only if nothing in the loop can
-    // change what the consumer reads: no write to a descriptor word and no memory write that could
-    // alias the descriptor's backing (the same set the straight-line prefix is held to).
-    //
-    // The registers a word was copied from, and the pointer it was loaded through, need no
-    // protection of their own. A loop that re-runs the load or a copy necessarily writes the
-    // descriptor words again (and is refused here), while a loop that runs neither cannot be
-    // affected by what later happens to the sources: a copy captures bits.
-    for (const auto& loop : backedges) {
-        for (size_t i = loop[0]; i <= loop[1]; ++i) {
-            const auto& in = full[i];
-            if (rdna2_instruction_may_write_memory(in)) return false;
-            for (const int reg : preserved)
-                if (may_write(in, reg)) return false;
+
+    using State = std::array<uint64_t, kSgprs>;
+    auto transfer = [&](size_t i, State& s) {
+        const Rdna2Inst& in = full[i];
+        if (is_producer[i]) {
+            const int base_reg = in.src[0].value;
+            const uint32_t width = in.opcode == 2u ? 4u : in.opcode == 3u ? 8u : 16u;
+            const bool entry_pointer = s[static_cast<size_t>(base_reg)] ==
+                                           (kEntryBit | static_cast<uint64_t>(base_reg)) &&
+                                       s[static_cast<size_t>(base_reg + 1)] ==
+                                           (kEntryBit | static_cast<uint64_t>(base_reg + 1));
+            for (uint32_t k = 0; k < width; ++k) {
+                const int reg = in.dst.value + static_cast<int>(k);
+                if (reg >= kSgprs) break;
+                s[static_cast<size_t>(reg)] = entry_pointer ? load_tag(i, k) : kUnknown;
+            }
+            return;
+        }
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32 &&
+            in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 && in.dst.value < kSgprs) {
+            const bool from_sgpr = in.src[0].kind == OperandKind::SGPR &&
+                                   in.src[0].value >= 0 && in.src[0].value < kSgprs;
+            const uint64_t tag = from_sgpr ? s[static_cast<size_t>(in.src[0].value)] : kUnknown;
+            s[static_cast<size_t>(in.dst.value)] = (tag & kEntryBit) ? kUnknown : tag;
+            return;
+        }
+        for (int reg = 0; reg < kSgprs; ++reg)
+            if (may_write(in, reg)) s[static_cast<size_t>(reg)] = kUnknown;
+    };
+
+    // A producer that can reach itself is refused (see above).
+    for (size_t producer = 0; producer < full.size(); ++producer) {
+        if (!is_producer[producer]) continue;
+        std::vector<uint8_t> seen(full.size());
+        std::vector<size_t> queue;
+        for (size_t next : edges[producer])
+            if (next != no_edge) { seen[next] = 1; queue.push_back(next); }
+        for (size_t q = 0; q < queue.size(); ++q) {
+            if (queue[q] == producer) return false;
+            for (size_t next : edges[queue[q]])
+                if (next != no_edge && !seen[next]) { seen[next] = 1; queue.push_back(next); }
         }
     }
+
+    // in_state[i] is the meet over every path from entry to instruction i.
+    std::vector<State> in_state(full.size());
+    std::vector<uint8_t> reached(full.size());
+    for (int reg = 0; reg < kSgprs; ++reg)
+        in_state[0][static_cast<size_t>(reg)] = kEntryBit | static_cast<uint64_t>(reg);
+    reached[0] = 1;
+    std::vector<size_t> worklist{0};
+    std::vector<uint8_t> queued(full.size());
+    queued[0] = 1;
+    while (!worklist.empty()) {
+        const size_t at = worklist.back();
+        worklist.pop_back();
+        queued[at] = 0;
+        State out = in_state[at];
+        transfer(at, out);
+        for (size_t next : edges[at]) {
+            if (next == no_edge) continue;
+            bool changed = false;
+            if (!reached[next]) {
+                in_state[next] = out;
+                reached[next] = 1;
+                changed = true;
+            } else {
+                // Tags only ever fall to unknown, so the iteration terminates.
+                for (size_t reg = 0; reg < static_cast<size_t>(kSgprs); ++reg) {
+                    if (in_state[next][reg] != kUnknown && in_state[next][reg] != out[reg]) {
+                        in_state[next][reg] = kUnknown;
+                        changed = true;
+                    }
+                }
+            }
+            if (changed && !queued[next]) {
+                queued[next] = 1;
+                worklist.push_back(next);
+            }
+        }
+    }
+    if (!reached[use]) return false;
+    for (int lane = 0; lane < 8; ++lane)
+        if (in_state[use][static_cast<size_t>(tbase + lane)] != expected[static_cast<size_t>(lane)])
+            return false;
+
+    // A guest-visible write that can execute before the consumer could alter descriptor backing
+    // after the CPU snapshot. That is every reachable instruction from which the consumer can be
+    // reached, so a write after the consumer inside a loop counts too. LDS writes are a separate
+    // address space; global/buffer and storage-image writes are left unresolved because proving
+    // non-aliasing would need resource ownership analysis.
+    std::vector<std::vector<size_t>> preds(full.size());
+    for (size_t i = 0; i < full.size(); ++i)
+        for (size_t next : edges[i])
+            if (next != no_edge) preds[next].push_back(i);
+    std::vector<uint8_t> before_use(full.size());
+    std::vector<size_t> back{use};
+    while (!back.empty()) {
+        const size_t at = back.back();
+        back.pop_back();
+        for (size_t p : preds[at]) {
+            if (before_use[p]) continue;
+            before_use[p] = 1;
+            back.push_back(p);
+        }
+    }
+    for (size_t i = 0; i < full.size(); ++i)
+        if (before_use[i] && reached[i] && rdna2_instruction_may_write_memory(full[i]))
+            return false;
     return true;
 }
 
