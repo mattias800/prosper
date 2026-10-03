@@ -4,6 +4,7 @@
 // fill the destination.
 #include "hle/dispatch/dispatch.hpp"
 #include <gtest/gtest.h>
+#include "hle/kernel/kernel_event_filters.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "fixtures/test_scratch.h"
 #include <array>
@@ -76,7 +77,7 @@ static EventSequence wait_through_fence(HleFn wait_eq, uint64_t eq, uint64_t fen
 
 static bool is_exact_fence(const EventSequence& sequence, uint64_t fence_tag) {
     return sequence.reached_fence && sequence.size == 1 &&
-           sequence.events[0].ident == 0 && sequence.events[0].filter == -24 &&
+           sequence.events[0].ident == 0 && sequence.events[0].filter == EVFILT_AMPR &&
            (uint64_t)sequence.events[0].data == fence_tag;
 }
 
@@ -179,7 +180,7 @@ TEST(AmprMeasure, Contract) {
         append_equeue_320(tail_cb, eq, (uint64_t)event_id, tail_tag, 0, 0);
         KEvent tail_event{};
         const bool tail_received = wait_one(wait_eq, eq, tail_event);
-        CHECK(tail_received && tail_event.ident == event_id && tail_event.filter == -24 &&
+        CHECK(tail_received && tail_event.ident == event_id && tail_event.filter == EVFILT_AMPR &&
                   (uint64_t)tail_event.data == tail_tag,
               "unsent PS5 3.20 tail receives one deferred eager completion");
 
@@ -195,7 +196,7 @@ TEST(AmprMeasure, Contract) {
         KEvent exact_tail_event{};
         const bool exact_tail_received = wait_one(wait_eq, eq, exact_tail_event);
         CHECK(exact_tail_received && exact_tail_event.ident == 0 &&
-                  exact_tail_event.filter == -24 &&
+                  exact_tail_event.filter == EVFILT_AMPR &&
                   (uint64_t)exact_tail_event.data == exact_tail_tag,
               "deferred pointer-dialect completion arm delivered its distinct tag");
 
@@ -225,7 +226,7 @@ TEST(AmprMeasure, Contract) {
         KEvent submitted_event{};
         const bool submitted_received = wait_one(wait_eq, eq, submitted_event);
         CHECK(submitted_received && submitted_event.ident == 0 &&
-                  submitted_event.filter == -24 &&
+                  submitted_event.filter == EVFILT_AMPR &&
                   (uint64_t)submitted_event.data == submitted_tag,
               "explicit-submit completion arm delivered its distinct tag");
 
@@ -287,7 +288,7 @@ TEST(AmprMeasure, Contract) {
         KEvent replacement_event{};
         const bool replacement_received = wait_one(wait_eq, replacement_eq, replacement_event);
         CHECK(replacement_received && replacement_event.ident == event_id &&
-                  replacement_event.filter == -24 &&
+                  replacement_event.filter == EVFILT_AMPR &&
                   (uint64_t)replacement_event.data == replacement_tag,
               "stale equeue lifetime cannot poison a replacement completion token");
 
@@ -374,9 +375,9 @@ TEST(AmprMeasure, Contract) {
                 // `filter` is the load-bearing half of this assertion. KEvent is zero-initialised
                 // and the pointer-dialect case uses id 0, so `ident == c.id` degenerates to 0 == 0
                 // and would hold even if no event ever arrived — vacuous in exactly the branch CRI
-                // uses for 9 of its 20 bindings. EVFILT_AMPR_MODELED (-24) is nonzero and is set by
+                // uses for 9 of its 20 bindings. EVFILT_AMPR (-25) is nonzero and is set by
                 // both apr_post and the id-0 pointer worker, so a zeroed KEvent cannot fake it.
-                CHECK(cri_received && cri_event.ident == c.id && cri_event.filter == -24, c.what);
+                CHECK(cri_received && cri_event.ident == c.id && cri_event.filter == EVFILT_AMPR, c.what);
                 CHECK(get_count(cri_eq, 0, 0, 0, 0, 0) == 0,
                       "zero-tag completion is delivered exactly once");
                 delete_eq(cri_eq, 0, 0, 0, 0, 0);

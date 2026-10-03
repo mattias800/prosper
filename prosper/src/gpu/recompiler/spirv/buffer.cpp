@@ -6,11 +6,22 @@
 namespace prosper::gpu {
 
 uint32_t SpirvCompute::elem_ptr(uint32_t bufvar, uint32_t k) {
-        uint32_t idx = gidx;
-        if (stride != 1) { uint32_t m = id(); put(code, Op_IMul, {t_u32, m, gidx, uconst(stride)}); idx = m; }
-        if (k != 0) { uint32_t a = id(); put(code, Op_IAdd, {t_u32, a, idx, uconst(k)}); idx = a; }
-        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_f32, p, bufvar, uconst(0), idx}); return p;
+    uint32_t idx = gidx;
+    if (stride != 1) {
+        uint32_t m = id();
+        put(code, Op_IMul, {t_u32, m, gidx, uconst(stride)});
+        idx = m;
     }
+    if (k != 0) {
+        uint32_t a = id();
+        put(code, Op_IAdd, {t_u32, a, idx, uconst(k)});
+        idx = a;
+    }
+    if (packet_input_base) idx = ibin(Op_IAdd, packet_input_base, idx);
+    uint32_t p = id();
+    putv(code, Op_AccessChain, {t_ptr_sb_f32, p, bufvar, uconst(0), idx});
+    return p;
+}
 
 uint32_t SpirvCompute::buf_for_binding(uint32_t binding) {
         if (binding == 2) return v_cbuf;

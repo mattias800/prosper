@@ -8,7 +8,7 @@
 // them by declaration. Promoting a 177-line function into a header parsed by every includer is the
 // opposite of what this split is for.
 
-// gpu_executor.cpp — the live-submit half of the GPU executor (Stage A of docs/GPU_EXECUTOR_DESIGN.md).
+// gpu_executor.cpp — the live-submit half of the GPU executor (Stage A of docs/gpu/GPU_EXECUTOR_DESIGN.md).
 //
 // Holds the process-wide live render backend and drives it on each AGC submit. This is deliberately the
 // ONLY place the executor touches process-global state; execute_gpustate() itself (gpu_execute.hpp) stays
@@ -40,6 +40,7 @@
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"     // recompile_compute
+#include "gpu/recompiler/fragment_packet_vgpr_requirements.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "host/memory/guest_memory_map.hpp"
 #include "host/memory/guest_memory_query.hpp"
@@ -559,6 +560,7 @@ struct ShaderCodeAnalysis {
     uint64_t code_hash = 0;
     PcrelDispatchInfo pcrel_dispatch;
     uint32_t fragment_color_export_mask = 0;
+    FragmentPacketVgprRequirements packet_vgpr_requirements;
     uint64_t identity = 0;
     size_t source_dwords = 0;
     bool bounded_span = false;

@@ -483,7 +483,7 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs);
 // title that does this every frame, so the highest ordinal it printed is only a LOWER BOUND on the
 // total; this accessor is the exact count, so per-title exposure can be measured rather than
 // inferred from a deduped or capped log line (instruments #9/#13 in
-// docs/GAME_COMPAT_ORCHESTRATION.md). `mode` is masked to the 3-bit field.
+// docs/process/GAME_COMPAT_ORCHESTRATION.md). `mode` is masked to the 3-bit field.
 //
 // Measuring that exposure is the immediate use: #1706 established that prosper's decoded MODE is
 // not per-draw-trustworthy — a utility sequence's operation bits stay latched onto later ordinary

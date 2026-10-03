@@ -7,7 +7,7 @@
 // Ported/adapted from Kyty (../Kyty, MIT-licensed; source/emulator/src/Graphics/Graphics.cpp +
 // Pm4.h) — the Dcb struct layout, PM4 encoding, and per-function packet contents are Kyty's, which
 // reverse-engineered the real libSceAgc ABI. A later CommandProcessor will decode this PM4 stream to
-// Vulkan (see docs/AGC_IMPL_PLAN.md). Registered by raw NID (AGC lib is undocumented).
+// Vulkan (see docs/gpu/AGC_IMPL_PLAN.md). Registered by raw NID (AGC lib is undocumented).
 #include "hle/dispatch/dispatch.hpp"
 #include "host/image/boot_program.hpp"   // #1659: shared guest-module labelling
 #include "hle/kernel/hle_kernel_time.hpp"
@@ -113,7 +113,7 @@ constexpr uint32_t kDwDrawIndexIndirect  = 4;
 //     `DRAW_INDEX_INDIRECT`. So 4 is at or below the real library's reservation on the published
 //     layout, which is the only direction that matters: emitting FEWER than the real AGC function
 //     wastes reserved space, emitting MORE overruns a reservation the guest made in good faith
-//     (#1748). See docs/AGC_PACKET_SIZES.md.
+//     (#1748). See docs/gpu/AGC_PACKET_SIZES.md.
 // prosper also answers sceAgcDcbDrawIndirectGetSize (cxPZ4Wgvdj8) from this same constant, so a
 // guest that ASKS reserves exactly what is written here and is self-consistent regardless.
 // CONFIDENCE: MED — no local dump was observed inlining the real size, so the equality with the real
@@ -1217,7 +1217,7 @@ HLE(agc_dcb_set_flip) {  // (buf, video_out_handle, display_buffer_index, flip_m
 
 // --- sceAgcCreateShader (NID f3dg2CSgRKY) — the shader-object constructor. ---------------------
 //
-// THE boot blocker's root (docs/GRAPHICS.md "register source"): Unity registers its ~36 built-in
+// THE boot blocker's root (docs/gpu/GRAPHICS.md "register source"): Unity registers its ~36 built-in
 // shaders at graphics init via eboot+0x14e74c0, which parses shader ELFs embedded in eboot rodata
 // (e_machine=0xe0 EM_AMDGPU; sections .shader_header / .shader_text) and calls
 // sceAgcCreateShader(&slot->shader, header, code) per shader — through the arg-validating wrapper
@@ -1719,7 +1719,7 @@ HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
     // pipeline whose processed-flag [+0x1a0]==0, consults its GPU companion [+0x140] to decide keep-vs-
     // release — and ours is null. The companion is built eagerly on a normal PS5 path (writers in the
     // eboot 0xb3xxxx GfxDevice module); the fix is to make that companion get built (an AGC/GPU-resource
-    // gap), NOT to surface semantics. See docs/GFXDEVICE_BRINGUP_PROBLEM.md §"2026-07-05 correction".
+    // gap), NOT to surface semantics. See docs/archive/GFXDEVICE_BRINGUP_PROBLEM.md §"2026-07-05 correction".
     if (getenv("PROSPER_PIPETRACE")) {
         fprintf(stderr, "  [sem] type=%u num_in=%u num_out=%u in_sem=%p out_sem=%p\n",
                 h->type, h->num_input_semantics, h->num_output_semantics,

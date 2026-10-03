@@ -1,5 +1,6 @@
 #pragma once
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/fragment_packet_vgpr_requirements.hpp"
 #include "gpu/state/raster_launch_facts.hpp"
 #include "gpu/state/fragment_entry_facts.hpp"
 #include "gpu/execute/fragment_packet_preparation.hpp"
@@ -13,6 +14,7 @@ namespace prosper::gpu {
 // All selected modules are pinned; raw_code owns the same analysis version used by the PS compiler.
 struct RasterQuadInputs {
     std::shared_ptr<const std::vector<uint32_t>> source_vs, source_gs, source_fs, raw_code;
+    std::shared_ptr<const FragmentPacketVgprRequirements> vgpr_requirements;
     PixelInputMapping pixel_inputs{};
     PixelSystemInputMapping system_inputs{};
     FragmentInterpolationLayout interpolation{};

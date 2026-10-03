@@ -8,7 +8,7 @@
 #
 # This route keeps poll-safe Cross edges pulsing to read 12000 (~200 s at 61 reads/s) and
 # interleaves Options every tenth pulse, so an input-gated startup/legal screen cannot be missed
-# for lack of input. Used to falsify that hypothesis; see docs/GRIS_SONIC_COBRA_BRINGUP.md
+# for lack of input. Used to falsify that hypothesis; see docs/games/GRIS_SONIC_COBRA_BRINGUP.md
 # section 'Ruled out'. Do not use it to produce acceptance screenshots — it holds no stable
 # menu selection.
 f0-4:cross

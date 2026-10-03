@@ -24,7 +24,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TOOL = HERE / "check_merge_result.py"
-DOC = "prosper/docs/GAME_COMPAT_ORCHESTRATION.md"
+DOC = "prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md"
+LEGACY_DOC = "prosper/docs/GAME_COMPAT_ORCHESTRATION.md"
 
 sys.path.insert(0, str(HERE))
 
@@ -44,13 +45,13 @@ def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
 
 
-def write(repo: Path, text: str) -> None:
-    p = repo / DOC
+def write(repo: Path, text: str, path: str = DOC) -> None:
+    p = repo / path
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text, encoding="utf-8")
 
 
-def scenario(base: str, ours: str, theirs: str, d: str) -> Path:
+def scenario(base: str, ours: str, theirs: str, d: str, *, rename: bool = False) -> Path:
     """A repo whose `master` holds `ours` and whose `lane` holds `theirs`, both from `base`."""
     repo = Path(d) / "repo"
     repo.mkdir()
@@ -62,24 +63,30 @@ def scenario(base: str, ours: str, theirs: str, d: str) -> Path:
     # only surprise later -- this suite's harness has already had exactly one of those (the
     # line-number extractor that vanished on `C:\...` paths, green on Linux, red only on MinGW).
     git(repo, "config", "core.autocrlf", "false")
-    write(repo, base)
+    path = LEGACY_DOC if rename else DOC
+    write(repo, base, path)
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "base")
     git(repo, "branch", "lane")
-    write(repo, ours)
+    write(repo, ours, path)
     git(repo, "commit", "-qam", "master moves")
     git(repo, "checkout", "-q", "lane")
+    if rename:
+        (repo / DOC).parent.mkdir(parents=True, exist_ok=True)
+        git(repo, "mv", LEGACY_DOC, DOC)
     write(repo, theirs)
     git(repo, "commit", "-qam", "lane appends")
     return repo
 
 
 def case(name: str, base: str, ours: str, theirs: str, *, want_rc: int,
-         expect_text: str | None = None) -> None:
+         expect_text: str | None = None, rename: bool = False,
+         extra: list[str] | None = None) -> None:
     with tempfile.TemporaryDirectory() as d:
-        repo = scenario(base, ours, theirs, d)
+        repo = scenario(base, ours, theirs, d, rename=rename)
         proc = subprocess.run(
-            [sys.executable, str(TOOL), "--no-fetch", "--base", "master", "--head", "lane"],
+            [sys.executable, str(TOOL), "--no-fetch", "--base", "master", "--head", "lane",
+             *(extra or [])],
             cwd=repo, capture_output=True, text=True,
         )
     out = proc.stdout + proc.stderr
@@ -135,6 +142,47 @@ case("a row deleted by the merge is caught",
      table("1:a", "2:b", "3:c"),
      want_rc=1, expect_text="GONE from this table: 4")
 
+case("an old-base/new-head rename retains the real baseline",
+     BASE, BASE, table("1:a", "2:b", "3:c", "4:lane"),
+     want_rc=0, expect_text="the merge RESULT passes the gate", rename=True)
+case("a deleted tail still fails across the rename",
+     table("1:a", "2:b", "3:c", "4:d"), table("1:a", "2:b", "3:c", "4:d"), BASE,
+     want_rc=1, expect_text="GONE from this table: 4", rename=True)
+case("a clean rename merge still detects colliding rows",
+     BASE, table("1:a", "2:b", "3:c", "4:master"),
+     table("1:a", "4:lane", "2:b", "3:c"),
+     want_rc=1, expect_text="duplicate row number 4", rename=True)
+case("an unrelated missing file cannot borrow the orchestration baseline",
+     BASE, BASE, table("1:a", "2:b", "3:c", "4:lane"),
+     want_rc=2, expect_text="expected exactly one table path", extra=["--file", "missing.md"])
+
+with tempfile.TemporaryDirectory() as d:
+    repo = scenario(BASE, BASE, table("1:a", "2:b", "3:c", "4:lane"), d, rename=True)
+    proc = subprocess.run([sys.executable, str(HERE / "table_paths.py"), "master", DOC],
+                          cwd=repo, capture_output=True, text=True)
+    if proc.returncode != 0 or proc.stdout.strip() != LEGACY_DOC:
+        FAILURES.append("workflow baseline resolver did not select the actual old parent path")
+    else:
+        print("  ok  workflow baseline resolver selects the actual old parent path")
+
+with tempfile.TemporaryDirectory() as d:
+    repo = scenario(BASE, BASE, table("1:a", "2:b", "3:c", "4:lane"), d)
+    git(repo, "config", "core.quotePath", "true")
+    unicode_doc = "prosper/docs/δοκιμή.md"
+    write(repo, BASE, unicode_doc)
+    git(repo, "add", unicode_doc)
+    git(repo, "commit", "-qm", "custom Unicode path")
+    shown = git(repo, "show", f"HEAD:{unicode_doc}")
+    if shown.returncode != 0 or shown.stdout != BASE:
+        FAILURES.append("custom Unicode fixture is not readable by the original git-show contract")
+    proc = subprocess.run([sys.executable, str(HERE / "table_paths.py"), "HEAD", unicode_doc],
+                          cwd=repo, capture_output=True, text=True, encoding="utf-8",
+                          env={**os.environ, "PYTHONIOENCODING": "ascii"})
+    if proc.returncode != 0 or proc.stdout.strip() != unicode_doc:
+        FAILURES.append("CLI resolver did not preserve the exact custom Unicode path")
+    else:
+        print("  ok  CLI resolver preserves the exact custom Unicode path")
+
 # The checker-failure branch, reachable through the ENVIRONMENT rather than the arguments. My first
 # claim was that no arm was possible without a test-only injection point in production code; the
 # #2616 review rejected that and was right. Copy the tool ALONE into a tempdir and its sibling
@@ -149,6 +197,7 @@ def cli_missing_checker(name: str) -> None:
         lone = Path(d) / "lone"
         lone.mkdir()
         (lone / TOOL.name).write_text(TOOL.read_text(encoding="utf-8"), encoding="utf-8")
+        (lone / "table_paths.py").write_bytes((HERE / "table_paths.py").read_bytes())
         proc = subprocess.run(
             [sys.executable, str(lone / TOOL.name), "--no-fetch", "--base", "master",
              "--head", "lane"],
@@ -210,6 +259,7 @@ def checker_locale_mismatch(name: str, *, extra_env: dict[str, str] | None = Non
         lone = Path(d) / "lone"
         lone.mkdir()
         (lone / TOOL.name).write_text(TOOL.read_text(encoding="utf-8"), encoding="utf-8")
+        (lone / "table_paths.py").write_bytes((HERE / "table_paths.py").read_bytes())
         (lone / "check_numbered_table.py").write_text(FAKE_LOCALE_CHECKER, encoding="utf-8")
         env = dict(os.environ)
         env.pop("PYTHONIOENCODING", None)  # deterministic regardless of the invoking shell

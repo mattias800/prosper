@@ -773,7 +773,7 @@ endif()
 # `cmake -E echo` prints the reason and exits 0; SKIP_REGULAR_EXPRESSION is what turns that into a
 # `(Skipped)` result. The point is that the case still occupies a line in the ctest summary: a test
 # that silently disappears from the registered set costs coverage with no line to read and no count
-# to compare against (the failure mode `docs/VERIFICATION.md` § CI records for the Vulkan flag).
+# to compare against (the failure mode `docs/process/VERIFICATION.md` § CI records for the Vulkan flag).
 function(prosper_add_skipped_test name reason)
   add_test(NAME ${name} COMMAND ${CMAKE_COMMAND} -E echo "SKIPPED: ${reason}")
   set_tests_properties(${name} PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED: ")
@@ -1968,6 +1968,11 @@ if(TARGET prosper_core)
     add_executable(test_win_kernel_is_stack tests/host/image/test_win_kernel_is_stack.cpp)
     target_link_libraries(test_win_kernel_is_stack PRIVATE prosper_core)
     add_test(NAME win_kernel_is_stack COMMAND test_win_kernel_is_stack)
+
+    # PROSPER_HWWATCH_ABS: the Windows data write-watchpoint (debug registers, per guest thread).
+    prosper_add_gtest(test_win_data_watch
+      SOURCES tests/host/image/test_win_data_watch.cpp
+      LIBRARIES prosper_core)
   endif()
 
   # Boot preload path case correction (#1006): a module present with different casing than the
@@ -2757,6 +2762,15 @@ endif()
   prosper_add_gtest(test_fragment_resource_packet
     SOURCES tests/gpu/recompiler/test_fragment_resource_packet.cpp
     INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_packet_definedness
+    SOURCES tests/gpu/recompiler/test_fragment_packet_definedness.cpp
+    INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_special_f32
+    SOURCES tests/gpu/recompiler/test_fragment_special_f32.cpp
+    INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_packet_wave_data
+    SOURCES tests/gpu/recompiler/test_fragment_packet_wave_data.cpp
+    INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
   add_executable(test_fragment_packet_wqm tests/gpu/recompiler/test_fragment_packet_wqm.cpp)
   target_include_directories(test_fragment_packet_wqm PRIVATE tests)
   target_link_libraries(test_fragment_packet_wqm PRIVATE prosper_core)
@@ -2897,7 +2911,7 @@ endif()
   # POSIX-only: the test builds its own read-only / read-write / revoked mappings with mmap and
   # mprotect, which is the whole point -- it needs to CREATE a page whose permissions it controls,
   # not find one. The Windows equivalent is VirtualAlloc + VirtualProtect(PAGE_READONLY) and is
-  # deliberately left to the lane that can run it (docs/THREAD_WAIT_PROFILING.md records the same
+  # deliberately left to the lane that can run it (docs/performance/THREAD_WAIT_PROFILING.md records the same
   # split for the profiling tools). The cache itself is built and exercised on all platforms; only
   # this test's mapping setup is POSIX.
   if(NOT WIN32)
@@ -3144,7 +3158,7 @@ endif()
     LIBRARIES prosper_core)
 
   # Resource-binding contract (shader_resources.hpp): format sizing + the provenance/binding lookups
-  # the recompiler and pipeline share. Pure/cross-platform. See docs/RESOURCE_BINDING.md.
+  # the recompiler and pipeline share. Pure/cross-platform. See docs/gpu/RESOURCE_BINDING.md.
   # Spells a `shared/...` include, which resolves from `frontends`.
   prosper_add_gtest(test_shader_resources
     SOURCES tests/gpu/resources/test_shader_resources.cpp
@@ -3509,7 +3523,7 @@ endif()
 
   # Windows guest-execution substrate (exec_image_win.cpp): build boot_trace so the whole boot path
   # links (proves the substrate + SysV-ABI HLE boundary resolve). No evdev/Vulkan here. The guest boot
-  # itself is not yet verified on Windows — see docs/PORTING.md "Windows".
+  # itself is not yet verified on Windows — see docs/platforms/PORTING.md "Windows".
   if(WIN32)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp tools/boot_trace/first_frame_capture.cpp)
     # Includes a shared fixture, which resolves from the `tests` root.
@@ -3524,7 +3538,7 @@ endif()
     # since #2331: the F9/scheduled bundle grab already worked on Windows, so a Windows investigation
     # could produce a several-hundred-MiB .prgbundle and then have no way to open it -- the documented
     # "capture, then replay offline" loop was half-available, and the half that was missing was the
-    # half that answers the question. See docs/PORTING.md "Windows".
+    # half that answers the question. See docs/platforms/PORTING.md "Windows".
     if(NOT TARGET Vulkan::Vulkan)
       find_package(Vulkan QUIET)
     endif()
@@ -4282,10 +4296,9 @@ endif()
       # #3656: device-resolved indirect dispatch -- the executor half (recording backend) and the
       # Vulkan half (the production backend consuming the argument address with
       # vkCmdDispatchIndirect). The Windows block above registers the same two sources.
-      add_executable(test_indirect_dispatch_device_route
-                     tests/gpu/execute/test_indirect_dispatch_device_route.cpp)
-      target_link_libraries(test_indirect_dispatch_device_route PRIVATE prosper_core)
-      add_test(NAME indirect_dispatch_device_route COMMAND test_indirect_dispatch_device_route)
+      prosper_add_gtest(test_indirect_dispatch_device_route
+        SOURCES tests/gpu/execute/test_indirect_dispatch_device_route.cpp
+        LIBRARIES prosper_core)
       add_executable(test_live_compute_indirect_dispatch
                      tests/gpu/execute/test_live_compute_indirect_dispatch.cpp)
       target_include_directories(test_live_compute_indirect_dispatch PRIVATE tests frontends)
@@ -5685,7 +5698,7 @@ endif()
 
 # --- prosper-app: SDL3 window + Vulkan swapchain present frontend (issue #164 P0) -----------
 # Presents the frame prosper's renderer hands to the present layer (present_readback) in a real
-# window. A SEPARATE Vulkan context from the core's headless render device (docs/FRONTEND_APP.md);
+# window. A SEPARATE Vulkan context from the core's headless render device (docs/subsystems/FRONTEND_APP.md);
 # frames cross as CPU pixels. Entirely outside prosper_core. Default OFF; needs SDL3 (video) + Vulkan.
 if(PROSPER_APP AND TARGET SDL3::SDL3)
   if(NOT TARGET Vulkan::Vulkan)
@@ -5693,7 +5706,7 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
   endif()
   if(Vulkan_FOUND)
     # Dear ImGui for the game library view (#1471), vendored under third_party/imgui. FRONTEND ONLY:
-    # prosper_core neither links nor sees it, so the one-way dependency arrow in docs/FRONTEND_APP.md
+    # prosper_core neither links nor sees it, so the one-way dependency arrow in docs/subsystems/FRONTEND_APP.md
     # is unchanged. Built as its own static lib so the vendored sources compile with their own
     # warning expectations rather than prosper's.
     add_library(prosper_imgui STATIC
@@ -5861,6 +5874,9 @@ if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
     LIBRARIES prosper_core Vulkan::Vulkan
     LABELS gpu
     PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_packet_definedness_exec
+    SOURCES tests/gpu/execute/test_fragment_packet_definedness_exec.cpp
+    INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
 
   add_executable(test_fragment_packet_exec tests/gpu/execute/test_fragment_packet_exec.cpp)
   target_include_directories(test_fragment_packet_exec PRIVATE tests)
@@ -5870,6 +5886,14 @@ if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
 
   prosper_add_gtest(test_fragment_resource_packet_exec
     SOURCES tests/gpu/execute/test_fragment_resource_packet_exec.cpp
+    INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
+    PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
+  prosper_add_gtest(test_fragment_special_f32_exec
+    SOURCES tests/gpu/execute/test_fragment_special_f32_exec.cpp
+    INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
+    PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
+  prosper_add_gtest(test_fragment_packet_wave_data_exec
+    SOURCES tests/gpu/execute/test_fragment_packet_wave_data_exec.cpp
     INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
     PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
 

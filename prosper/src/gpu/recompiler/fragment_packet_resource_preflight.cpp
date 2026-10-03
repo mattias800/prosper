@@ -89,6 +89,14 @@ const char* packet_resource_instruction_gap(const Rdna2Inst& in) {
             ? nullptr : "packet-image-explicit-lod-form-unimplemented";
     if (in.fmt == Rdna2Format::VOP2 && (in.opcode == 3 || in.opcode == 8))
         return nullptr;
+    if (in.fmt == Rdna2Format::VOP1 && packet_special_f32_opcode(in.opcode)) {
+        const auto kind = in.src[0].kind;
+        return in.n_src == 1 && (kind == OperandKind::VGPR || kind == OperandKind::SGPR ||
+                                 kind == OperandKind::InlineInt ||
+                                 kind == OperandKind::InlineFloat || kind == OperandKind::Literal)
+                   ? nullptr
+                   : "packet-special-f32-source-form-unimplemented";
+    }
     if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32 && in.dst.value == 124)
         return in.src[0].kind == OperandKind::SGPR || in.src[0].kind == OperandKind::InlineInt ||
                in.src[0].kind == OperandKind::Literal ? nullptr : "packet-m0-writer-form-unimplemented";
@@ -113,6 +121,26 @@ const char* packet_resource_preflight(const FragmentResourcePacket& packet,
         return "packet-f32-launch-rsrc1-association-mismatch";
     if (!guest.float_flags.ieee_mode)
         return "packet-f32-non-ieee-mode-unimplemented";
+    const auto special = std::find_if(ins.begin(), ins.end(), [](const auto& in) {
+        return in.fmt == Rdna2Format::VOP1 && packet_special_f32_opcode(in.opcode);
+    });
+    if (special != ins.end()) {
+        failure_pc = special->pc;
+        const auto& entry = packet.entry_facts;
+        if (!entry.canonical() || !entry.observed || !entry.rsrc2_available)
+            return "packet-special-f32-producing-rsrc2-unavailable";
+        // AMD-owned PAL's SPI_SHADER_PGM_RSRC2_PS: TRAP_PRESENT bit6 and EXCP_EN bits24:16.
+        // RDNA2 70648 3.5/3.10: DEBUG and floating exceptions take a handler only with TRAP_EN.
+        // No handler means ignored traps, even with DEBUG/enables set. With a handler we can
+        // execute only when DEBUG and the six relevant floating exception enables are disabled.
+        // Accepted whole-program inventory rejects MODE/STATUS reads/writes and explicit traps;
+        // otherwise ignored flag gathering could become architecturally observable.
+        if (entry.rsrc2 & (1u << 6)) {
+            if (raw & (1u << 22)) return "packet-special-f32-debug-handler-unimplemented";
+            if ((entry.rsrc2 >> 16) & 0x3fu)
+                return "packet-special-f32-enabled-exception-handler-unimplemented";
+        }
+    }
     if (packet.buffers.size() > 64 || packet.images.size() > 16 ||
         packet.parameter_cache.parameters.size() > 16 * 32 * 4)
         return "packet-resource-input-budget";
@@ -164,8 +192,6 @@ const char* packet_resource_preflight(const FragmentResourcePacket& packet,
                 return "packet-parameter-tuple-invalid";
     }
     std::set<uint32_t> used_buffers, used_images;
-    std::set<int> vgprs;
-    for (const auto& column : guest.vgprs) vgprs.insert(static_cast<int>(column.reg));
     struct Pending { std::bitset<106> scalar; std::bitset<256> vector; bool m0 = false; };
     std::vector<Pending> entry(ins.size());
     std::vector<bool> reachable(ins.size());
@@ -194,9 +220,6 @@ const char* packet_resource_preflight(const FragmentResourcePacket& packet,
         if (in.fmt == Rdna2Format::MIMG) {
             if (!images.contains(in.pc)) return "packet-image-readpoint-unavailable";
             used_images.insert(in.pc);
-            const int coordinates = in.opcode == 0x24 ? 3 : 2;
-            for (int c = 0; c < coordinates; ++c)
-                if (!vgprs.contains(in.src[0].value + c)) return "packet-image-coordinate-input-unavailable";
         }
         if (!reachable[i]) continue;
         auto pending = entry[i];

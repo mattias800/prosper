@@ -102,7 +102,20 @@ std::shared_ptr<const FragmentPacketPreparation> prepare_fragment_packet_inputs(
     // User-prefix authority does not supply per-wave primitive/LDS/system values or M0. A true
     // user s16 when N>=17 still says nothing about parameter-cache ownership or interpolation.
     gap("packet-entry-system-sgprs-and-m0-unproved");
-    gap("packet-entry-vgpr-and-mask-abi-unproved");
+    if (!source_available || !in.vgpr_requirements ||
+        in.vgpr_requirements->source_words != in.raw_code.get()) {
+        gap("packet-vgpr-program-requirements-unavailable");
+        gap("packet-entry-vgpr-and-mask-abi-unproved");
+    } else if (!in.vgpr_requirements->rejection.empty()) {
+        result->unmet.push_back(in.vgpr_requirements->rejection);
+    } else {
+        result->vgpr_requirements = in.vgpr_requirements;
+        if (in.vgpr_requirements->possible_entry.any()) gap("packet-entry-vgpr-values-unproved");
+        // A structural writer is not a definition on EXEC-off lanes. This includes the existing
+        // raw EXP observation and selected inactive peers; don't demand ALL allocated scratch.
+        if (!in.vgpr_requirements->reads.empty()) gap("packet-vgpr-runtime-read-validity-unproved");
+        gap("packet-entry-mask-abi-unproved");
+    }
     gap("packet-guest-helper-and-coverage-unproved");
     gap("packet-logical64-composition-unproved");
     gap("packet-ordered-export-commit-unimplemented");

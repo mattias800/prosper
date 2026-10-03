@@ -72,7 +72,7 @@ State& state() {
             if (rate >= warn_mibps())
                 std::fprintf(stderr,
                              "  <- this much host copying is usually a residency or dirty-tracking "
-                             "gap, not real work; see docs/RENDERER_ARCHITECTURE_GAPS_2026_09_25.md");
+                             "gap, not real work; see docs/gpu/RENDERER_ARCHITECTURE_GAPS_2026_09_25.md");
             std::fprintf(stderr, "\n");
             std::fflush(stderr);
             return true;

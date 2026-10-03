@@ -1308,7 +1308,7 @@ bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr) {
         // `res->declared_mip_levels != 1u` / `!res->proven_zero_mip` gates; a faithful lowering
         // needs the guest's own per-level bytes materialized (same root cause as #2818's Sonic
         // Frontiers finding), which is out of scope here. See RECOMPILER_REMAINING.md and
-        // docs/STRAY_STATUS.md, both § Ruled out. This branch exists so (a) the CPU-side
+        // docs/games/STRAY_STATUS.md, both § Ruled out. This branch exists so (a) the CPU-side
         // `proven_zero_mip_at_use` dataflow proof (gpu_executor.cpp) reports an accurate answer
         // for this shape instead of silently skipping it, and (b) any OTHER draw that shares this
         // exact compiler-emitted encoding but addresses a genuinely single-mip resource with a

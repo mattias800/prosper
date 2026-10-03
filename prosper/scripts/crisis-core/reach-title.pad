@@ -28,7 +28,7 @@
 #
 # PROSPER_SUBMIT_STALL_US is a plain sleep in the guest's submit call and is a stopgap, not a fix.
 # It is named here rather than the deep PROSPER_MB3_POISON scan that first got past the fault,
-# because the measurement in docs/CRISIS_CORE_STATUS.md shows the scan works only through its
+# because the measurement in docs/games/CRISIS_CORE_STATUS.md shows the scan works only through its
 # DURATION — so a route that used it would be running a diagnostic as a throttle and would silently
 # change behaviour the day that scan gets cheaper. Both reach the title screen; only one says what
 # it is doing.

@@ -65,7 +65,7 @@ that records far more GPU commands per second could pay more.
 Syncval is not a general oracle for synchronization. It cannot observe a CPU read through a mapped
 pointer, so it does not see a missing host-availability barrier on a readback (#2944): measured with
 that defect deliberately live, it produced zero messages while demonstrably armed (the same setting
-over the whole suite produced 5 hazards at the time). `docs/GRAPHICS.md` § Ruled out carries both
+over the whole suite produced 5 hazards at the time). `docs/gpu/GRAPHICS.md` § Ruled out carries both
 halves of that measurement. Nor does it see a path no test executes — which is a second blind spot
 `--sync` does not fix on its own, and is why `render_diagnostic_paths` exists (below).
 
@@ -180,7 +180,7 @@ were bound with and reports a mismatch, without consulting the driver at all. So
 behaviour to differ, and "try it on another GPU" is wasted effort here.
 
 **So `ctest` green is not evidence about spec validity, on any platform.** This scan is the only check
-in the repo that sees this class. Instrument-trap 151 in `docs/GAME_COMPAT_ORCHESTRATION.md` records
+in the repo that sees this class. Instrument-trap 151 in `docs/process/GAME_COMPAT_ORCHESTRATION.md` records
 the whole case.
 
 ## The instrument trap this tool is built around

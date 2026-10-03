@@ -111,47 +111,47 @@ evidence; dated cross-title performance measurements live in their own ordinary 
   say rung 2. **Read the last comments before quoting a tracker's rung**, and prefer the status doc
   when the two disagree.
 
-**Concurrent game work starts with `prosper/docs/GAME_COMPAT_ORCHESTRATION.md`** — lane ownership,
+**Concurrent game work starts with `prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md`** — lane ownership,
 shared-GPU policy, the instrument-not-the-subject list, and the dated current handoff.
 
 ### Which doc to read next
 
 | Title / area | State | Read this next |
 | --- | --- | --- |
-| *The Messenger* `PPSA24651` | rung 6 — complete first level, checked against PS5 hardware; `messenger-scene` guard | `docs/MESSENGER_BLACK_RENDER.md` |
-| *Dead Cells* `PPSA15552` | rung 6 — full-colour Prisoners' Quarters; `dead-cells-gameplay` guard | `docs/DEAD_CELLS_STATUS.md` |
+| *The Messenger* `PPSA24651` | rung 6 — complete first level, checked against PS5 hardware; `messenger-scene` guard | `docs/games/messenger/MESSENGER_BLACK_RENDER.md` |
+| *Dead Cells* `PPSA15552` | rung 6 — full-colour Prisoners' Quarters; `dead-cells-gameplay` guard | `docs/games/DEAD_CELLS_STATUS.md` |
 | *Blasphemous 2* `PPSA13579` | rung 6 — first playable room; `blasphemous2-gameplay` guard | `scripts/blasphemous2/README.md` |
-| *Alex Kidd in Miracle World DX* `PPSA02664` | rung 6 — resolved by #1578 (generic 4 KiB mip-tail tiling); `alexkidd-gameplay` guard | `docs/PPSA02664_BLACK_WORLD.md` (historical) |
-| *Blue Prince* `PPSA25009` | rung 6 — sustained Day One gameplay and the Mount Holly entrance hall; reviewed automatic gameplay snapshot guard (tracker #1808) | `docs/BLUE_PRINCE_STATUS.md` |
-| *Syberia: Remastered* `PPSA30140` | rung 3 — gameplay renders; menu 3D layer and gameplay composite degraded (#1619 / #1627) | `docs/SYBERIA_STATUS.md` |
-| *Tales of Graces f Remastered* `PPSA19991` | rung 3 — the Lhant Hill prologue renders with real GPU draws on `scripts/talesgraces/reach-gameplay.pad`. What held it at rung 2 was input, not the renderer: two new-game screens bind their "go" action to the **OPTIONS button** and each raises a Yes/No dialog defaulting to **No**, so a Cross-only route loops forever. Its Unity progression oracle is **not** `Media/levelNN` (there is one level file) but an Addressables `togf_mapmodel`+`togf_maptexture` map pair | `docs/TALES_GRACES_STATUS.md` |
-| *Dragon Quest VII Reimagined* `PPSA17942` (a.k.a. DOLL) | rung 2 — title, name entry, onboarding; composition defect and gameplay open | `docs/DRAGON_QUEST_STATUS.md` |
-| *Nikoderiko* `PPSA23760` | rung 2 — 3D world dropped; the blocker is the user-data-window mismatch, not the recompiler. **#305 is closed and was never fixed** — it was closed on 2026-08-03 alongside #1794, whose own body says it *"does not fix #305"* — so read it as the record of the defect, not as an open blocker. #1607 (open) carries the title-specific impact; the tracker and status doc still cite #305 as open | `docs/NIKODERIKO_STATUS.md` |
-| *Asterix & Obelix: Babylon Mission* `PPSA30490` | rung 2 — logo movies, intro cutscene and title menu; the video-splash seek deadlock is fixed (#1949) | `docs/ASTERIX_BABYLON_STATUS.md` |
-| *R-Type Delta: HD Boosted* `PPSA26414` | rung 2 — logo, full-colour opening movie, title screen and attract mode. Launch needs `tools/dropcache.py` first: the title races its own 400 ms user-event delay against prosper's asset load (#1746, a product decision, not an open investigation) | `docs/R_TYPE_DELTA_STATUS.md` |
-| *The Oregon Trail* `PPSA19244` | rung 2 — title screen rendered on a default launch (60 s / 3,689 frames clean); the ordered-DMA stall is fixed (#1987) and **#1945 no longer reproduces here** (0 of 9 arms — use `PPSA21406` for that repro). The UI layer composites correctly since #1946 — its solid-block glyphs, black logo panel and flat sky were one defect: the RT0 blend state never reached the GPU | `docs/OREGON_TRAIL_STATUS.md` |
-| *Little Nightmares III* `PPSA05143` | rung 2 — title screen rendered on a default launch; the render-thread stall is fixed (#1987). Most title frames arrive with red and green forced to maximum, reading as a yellow background (#2014) | `docs/LITTLE_NIGHTMARES_3_STATUS.md` |
-| *ArcRunner* `PPSA21406` | rung 0 **on a default launch** — and the renderer is not the frontier. Under `PROSPER_SUBMIT_STALL_US=1500` the whole 4K intro cinematic renders and the title screen is reached and held; under `PROSPER_POST_SUBMIT_VISIBILITY=1` (new, default OFF) the default route survives with no throttle under **`boot_trace`**, 3 of 3, and a 260 s `boot_trace` run renders the title screen. **That survival claim is `boot_trace`-only, and on this title the frontend has been the variable:** `tools/screenshot` — the frontend the project uses for progression evidence — faulted **2 of 2** on the same lever and the same head, while a later 12-run replication at three code points, current master among them, did not reproduce those deaths. Neither result is withdrawn, so the lever's verdict under the evidence frontend is undecided; quote the frontend, not "the default route survives" (#2217, open; instrument trap 127). The race is named: prosper's post-submit completion-visibility contract is armed only for SDK ≥ 13 and this title requests 10, so its command-chunk recycler is released mid-fold (#2219; race #1226, dose-response #2084). Tracker #1817 deliberately holds the rung at 0 — a frame that needs a non-default switch is not default-route evidence. Removing the version gate is one line, but three rung-6 guarded titles are also pre-13 and the contract that rescues this title **regresses *Sonic Frontiers*** (#2223), so it waits on a cross-title snapshot pass (#2220) | `docs/ARCRUNNER_STATUS.md` |
-| *Crisis Core –Final Fantasy VII– Reunion* `PPSA07809` | rung 2 **on a throttled route** — title screen, main menu and the new-game settings flow render; a default run dies 5-12 s into the boot. Same SDK-10 submit race as *ArcRunner*, and the same lever answers it: `PROSPER_POST_SUBMIT_VISIBILITY=1` faults 0 of 3 **under `boot_trace`** (the rung-2 route above is `tools/screenshot`; name the frontend — instrument trap 127). The title screen's key art never draws | `docs/CRISIS_CORE_STATUS.md` |
-| *The House of the Dead 2: Remake* `PPSA24203` | rung 3 — a fresh-save route reaches Training 1 with real GPU draws through the normal full-cadence renderer; severe world-rendering defects remain (#1907) | `docs/HOUSE_OF_THE_DEAD_2_STATUS.md` |
-| *Sonic Frontiers* `PPSA03831` | **rung 2** — a route reaches Cyber Space gameplay and **the world renders**: measured 2026-09-20, 84% of the frame is lit with a correct HUD, ring counter and stage clock. It stays at rung 2 because 42% of the pixels are clipped to white in a saturated band across the middle — against a PS5 oracle that clips **none** and never exceeds p90 luminance 179 — so the scene is not yet one a person would recognise as the game. **This row said "the world is black" until 2026-09-20 and that is no longer true**; the older "16 of 32 compute programs never execute" is superseded too, since a live routed run now reports zero compute skips and admitting those programs left the frame byte-identical (#3740), which is what removed compute from the suspect list. The band enters at one submit in the post-process chain (#2790); 4K opening sequence, auto-save notice, title screen and main menu on a default launch. The four-session black-screen wall was one unregistered NID answering `SCE_OK`: `sceSaveDataTransferringMountPs4` (#2023). The menu heading draws the wrong string (#2206) | `docs/SONIC_FRONTIERS_STATUS.md` |
-| *Sonic Racing: CrossWorlds* `PPSA08804` | rung 2 — a pulsed pad route reaches the complete 4K title screen and profile menu; the profile panel is black and the sequence later holds on white (#2013 / #2358 / #2360) | `docs/SONIC_CROSSWORLDS_STATUS.md` |
-| *Grand Theft Auto V* `PPSA04263` | **rung 3** — the prologue bank heist renders in full colour with the HUD and radar over it, on a default launch. **The world renders only in the game's own Performance graphics mode**, chosen from the landing menu before the world loads; the default is Fidelity, where a run started straight into Story shows the HUD over a dark scene and looks exactly like a renderer regression — a route property, not a build property. Route: `scripts/gta5/reach-performance-story.pad`. **This row said "rung 2, the world does not render" for twelve days after #2996 made it render**, and on 2026-08-29 a user reporting a regression was told from a stale document that it had never worked — read `GTA5_STATUS.md`, which is authoritative for this title, before quoting this row. The frontier is now **framerate**, not the picture. The descriptor-array lift is complete, and the recompiler is **not** the frontier — 16 of 20 "unsupported" programs recompile cleanly | `docs/GTA5_STATUS.md` (read its `## Ruled out`, including the *void, not falsified* subsection), tracker #1873, issues #2542 / #2690 (#2481 is closed and superseded) |
-| *GRIS*, *Space Adventure Cobra*, *Sonic Origins* | rung 6 / rung 6 / rung 1 — GRIS and Cobra are guarded, not merely playable: reviewed `gris-gameplay` / `cobra-gameplay` entries in `tools/snapshot/snapshots.json` (trackers #1869 / #1870). Sonic's black startup loop is fixed (#1905: `sceSaveDataCreateTransactionResource` must return a positive resource id); it renders the 4K SEGA logo and then decoded 4K movie frames, with **no title screen observed** — the old "holds on white to the end" reading is falsified since #2571 made videodec2 decode by default. **#1871's issue *body* still says rung 0 — its 2026-08-17 comment corrects that to rung 1; read the comment thread, not the body** | `docs/GRIS_SONIC_COBRA_BRINGUP.md` |
-| Concurrent title work | the 2026-07-31 lane allocation is historical; use live issue claims for ownership and the dated checkpoint for the current cross-lane handoff | `docs/GAME_COMPAT_ORCHESTRATION.md` |
-| *Tactics Ogre: Reborn* `PPSA03839` | rung 3 — gameplay reached; HEVC movies render, sprite/HUD composition remains open | `docs/TACTICS_OGRE_STATUS.md` |
-| *Beneath* `PPSA27640` | rung 3 — the opening dive in `Science_Remake2`, reached by a Cross-only menu ladder with no code change. **Needs `PROSPER_NULL_PAGE=1` to boot at all**: the Unity player's frame-pointer unwinder reads the return-address slot of the terminal NULL frame pointer (`addr=0x8`, `eboot+0xe44346`), which is diagnosed rather than merely worked around | `docs/BENEATH_STATUS.md` |
-| *Earthion* `PPSA28061` | rung 2 — the wrapper's title/main menu and HOW TO PLAY page. **The recorded blocker was wrong**: it was not "the menu needs directional navigation" — that menu is the wrapper's and has no start item, and the title's own HOW TO PLAY page binds **Start to the TOUCHPAD**. Delivering it (13 presses read by the guest) still leaves the game picture black; it never leaves a ~60 s narration cycle. #1773 is fixed and was **not** the cause — the alias now recovers `ud_alias=s9` and the composite is 28/28 pixel-identical | `docs/EARTHION_STATUS.md` |
-| *Metaphor: ReFantazio* `PPSA20800` | rung 2 — the **title screen** and title menu, on `scripts/metaphor/reach-title-screen.pad`; with the first-boot setup saved, NEW GAME plays the storybook prologue to name entry. Four prosper defects, each prosper answering a question wrongly: the direct-memory pool outside its advertised budget (#2934), `sceFontRenderCharGlyphImage` unregistered (#2951) and then reporting a zero glyph advance (#3791), and libSceSigninDialog unregistered so the title waited forever for the PSN prompt to finish (#3784). **Its font path is a real rasterizer over the title's OWN TrueType file.** The network prompt's Retry defaults to Yes, so a Cross-only route loops; answer the first prompt No. Movies render as stripes (#3801) | `docs/METAPHOR_STATUS.md` |
-| *Uncharted: Legacy of Thieves Collection* `PPSA05684` | rung 0 — nothing renders, but the guest now survives its boot and mounts its content archives. A Naughty Dog **fiber** job system, which is the thing to know before touching it: fibers start on the main thread and are resumed by worker threads, so any prosper mechanism assuming "the host thread that enters an HLE call is the one that returns from it" is wrong here. Three defects of that exact shape so far (#3615 fixed, #3638, #3623) | `docs/UNCHARTED_STATUS.md` |
+| *Alex Kidd in Miracle World DX* `PPSA02664` | rung 6 — resolved by #1578 (generic 4 KiB mip-tail tiling); `alexkidd-gameplay` guard | `docs/games/PPSA02664_BLACK_WORLD.md` (historical) |
+| *Blue Prince* `PPSA25009` | rung 6 — sustained Day One gameplay and the Mount Holly entrance hall; reviewed automatic gameplay snapshot guard (tracker #1808) | `docs/games/BLUE_PRINCE_STATUS.md` |
+| *Syberia: Remastered* `PPSA30140` | rung 3 — gameplay renders; menu 3D layer and gameplay composite degraded (#1619 / #1627) | `docs/games/SYBERIA_STATUS.md` |
+| *Tales of Graces f Remastered* `PPSA19991` | rung 3 — the Lhant Hill prologue renders with real GPU draws on `scripts/talesgraces/reach-gameplay.pad`. What held it at rung 2 was input, not the renderer: two new-game screens bind their "go" action to the **OPTIONS button** and each raises a Yes/No dialog defaulting to **No**, so a Cross-only route loops forever. Its Unity progression oracle is **not** `Media/levelNN` (there is one level file) but an Addressables `togf_mapmodel`+`togf_maptexture` map pair | `docs/games/TALES_GRACES_STATUS.md` |
+| *Dragon Quest VII Reimagined* `PPSA17942` (a.k.a. DOLL) | rung 2 — title, name entry, onboarding; composition defect and gameplay open | `docs/games/DRAGON_QUEST_STATUS.md` |
+| *Nikoderiko* `PPSA23760` | rung 2 — 3D world dropped; the blocker is the user-data-window mismatch, not the recompiler. **#305 is closed and was never fixed** — it was closed on 2026-08-03 alongside #1794, whose own body says it *"does not fix #305"* — so read it as the record of the defect, not as an open blocker. #1607 (open) carries the title-specific impact; the tracker and status doc still cite #305 as open | `docs/games/NIKODERIKO_STATUS.md` |
+| *Asterix & Obelix: Babylon Mission* `PPSA30490` | rung 2 — logo movies, intro cutscene and title menu; the video-splash seek deadlock is fixed (#1949) | `docs/games/ASTERIX_BABYLON_STATUS.md` |
+| *R-Type Delta: HD Boosted* `PPSA26414` | rung 2 — logo, full-colour opening movie, title screen and attract mode. Launch needs `tools/dropcache.py` first: the title races its own 400 ms user-event delay against prosper's asset load (#1746, a product decision, not an open investigation) | `docs/games/R_TYPE_DELTA_STATUS.md` |
+| *The Oregon Trail* `PPSA19244` | rung 2 — title screen rendered on a default launch (60 s / 3,689 frames clean); the ordered-DMA stall is fixed (#1987) and **#1945 no longer reproduces here** (0 of 9 arms — use `PPSA21406` for that repro). The UI layer composites correctly since #1946 — its solid-block glyphs, black logo panel and flat sky were one defect: the RT0 blend state never reached the GPU | `docs/games/OREGON_TRAIL_STATUS.md` |
+| *Little Nightmares III* `PPSA05143` | rung 2 — title screen rendered on a default launch; the render-thread stall is fixed (#1987). Most title frames arrive with red and green forced to maximum, reading as a yellow background (#2014) | `docs/games/LITTLE_NIGHTMARES_3_STATUS.md` |
+| *ArcRunner* `PPSA21406` | rung 0 **on a default launch** — and the renderer is not the frontier. Under `PROSPER_SUBMIT_STALL_US=1500` the whole 4K intro cinematic renders and the title screen is reached and held; under `PROSPER_POST_SUBMIT_VISIBILITY=1` (new, default OFF) the default route survives with no throttle under **`boot_trace`**, 3 of 3, and a 260 s `boot_trace` run renders the title screen. **That survival claim is `boot_trace`-only, and on this title the frontend has been the variable:** `tools/screenshot` — the frontend the project uses for progression evidence — faulted **2 of 2** on the same lever and the same head, while a later 12-run replication at three code points, current master among them, did not reproduce those deaths. Neither result is withdrawn, so the lever's verdict under the evidence frontend is undecided; quote the frontend, not "the default route survives" (#2217, open; instrument trap 127). The race is named: prosper's post-submit completion-visibility contract is armed only for SDK ≥ 13 and this title requests 10, so its command-chunk recycler is released mid-fold (#2219; race #1226, dose-response #2084). Tracker #1817 deliberately holds the rung at 0 — a frame that needs a non-default switch is not default-route evidence. Removing the version gate is one line, but three rung-6 guarded titles are also pre-13 and the contract that rescues this title **regresses *Sonic Frontiers*** (#2223), so it waits on a cross-title snapshot pass (#2220) | `docs/games/ARCRUNNER_STATUS.md` |
+| *Crisis Core –Final Fantasy VII– Reunion* `PPSA07809` | rung 2 **on a throttled route** — title screen, main menu and the new-game settings flow render; a default run dies 5-12 s into the boot. Same SDK-10 submit race as *ArcRunner*, and the same lever answers it: `PROSPER_POST_SUBMIT_VISIBILITY=1` faults 0 of 3 **under `boot_trace`** (the rung-2 route above is `tools/screenshot`; name the frontend — instrument trap 127). The title screen's key art never draws | `docs/games/CRISIS_CORE_STATUS.md` |
+| *The House of the Dead 2: Remake* `PPSA24203` | rung 3 — a fresh-save route reaches Training 1 with real GPU draws through the normal full-cadence renderer; severe world-rendering defects remain (#1907) | `docs/games/HOUSE_OF_THE_DEAD_2_STATUS.md` |
+| *Sonic Frontiers* `PPSA03831` | **rung 2** — a route reaches Cyber Space gameplay and **the world renders**: measured 2026-09-20, 84% of the frame is lit with a correct HUD, ring counter and stage clock. It stays at rung 2 because 42% of the pixels are clipped to white in a saturated band across the middle — against a PS5 oracle that clips **none** and never exceeds p90 luminance 179 — so the scene is not yet one a person would recognise as the game. **This row said "the world is black" until 2026-09-20 and that is no longer true**; the older "16 of 32 compute programs never execute" is superseded too, since a live routed run now reports zero compute skips and admitting those programs left the frame byte-identical (#3740), which is what removed compute from the suspect list. The band enters at one submit in the post-process chain (#2790); 4K opening sequence, auto-save notice, title screen and main menu on a default launch. The four-session black-screen wall was one unregistered NID answering `SCE_OK`: `sceSaveDataTransferringMountPs4` (#2023). The menu heading draws the wrong string (#2206) | `docs/games/SONIC_FRONTIERS_STATUS.md` |
+| *Sonic Racing: CrossWorlds* `PPSA08804` | rung 2 — a pulsed pad route reaches the complete 4K title screen and profile menu; the profile panel is black and the sequence later holds on white (#2013 / #2358 / #2360) | `docs/games/SONIC_CROSSWORLDS_STATUS.md` |
+| *Grand Theft Auto V* `PPSA04263` | **rung 3** — the prologue bank heist renders in full colour with the HUD and radar over it, on a default launch. **The world renders only in the game's own Performance graphics mode**, chosen from the landing menu before the world loads; the default is Fidelity, where a run started straight into Story shows the HUD over a dark scene and looks exactly like a renderer regression — a route property, not a build property. Route: `scripts/gta5/reach-performance-story.pad`. **This row said "rung 2, the world does not render" for twelve days after #2996 made it render**, and on 2026-08-29 a user reporting a regression was told from a stale document that it had never worked — read `GTA5_STATUS.md`, which is authoritative for this title, before quoting this row. The frontier is now **framerate**, not the picture. The descriptor-array lift is complete, and the recompiler is **not** the frontier — 16 of 20 "unsupported" programs recompile cleanly | `docs/games/GTA5_STATUS.md` (read its `## Ruled out`, including the *void, not falsified* subsection), tracker #1873, issues #2542 / #2690 (#2481 is closed and superseded) |
+| *GRIS*, *Space Adventure Cobra*, *Sonic Origins* | rung 6 / rung 6 / rung 1 — GRIS and Cobra are guarded, not merely playable: reviewed `gris-gameplay` / `cobra-gameplay` entries in `tools/snapshot/snapshots.json` (trackers #1869 / #1870). Sonic's black startup loop is fixed (#1905: `sceSaveDataCreateTransactionResource` must return a positive resource id); it renders the 4K SEGA logo and then decoded 4K movie frames, with **no title screen observed** — the old "holds on white to the end" reading is falsified since #2571 made videodec2 decode by default. **#1871's issue *body* still says rung 0 — its 2026-08-17 comment corrects that to rung 1; read the comment thread, not the body** | `docs/games/GRIS_SONIC_COBRA_BRINGUP.md` |
+| Concurrent title work | the 2026-07-31 lane allocation is historical; use live issue claims for ownership and the dated checkpoint for the current cross-lane handoff | `docs/process/GAME_COMPAT_ORCHESTRATION.md` |
+| *Tactics Ogre: Reborn* `PPSA03839` | rung 3 — gameplay reached; HEVC movies render, sprite/HUD composition remains open | `docs/games/TACTICS_OGRE_STATUS.md` |
+| *Beneath* `PPSA27640` | rung 3 — the opening dive in `Science_Remake2`, reached by a Cross-only menu ladder with no code change. **Needs `PROSPER_NULL_PAGE=1` to boot at all**: the Unity player's frame-pointer unwinder reads the return-address slot of the terminal NULL frame pointer (`addr=0x8`, `eboot+0xe44346`), which is diagnosed rather than merely worked around | `docs/games/BENEATH_STATUS.md` |
+| *Earthion* `PPSA28061` | rung 2 — the wrapper's title/main menu and HOW TO PLAY page. **The recorded blocker was wrong**: it was not "the menu needs directional navigation" — that menu is the wrapper's and has no start item, and the title's own HOW TO PLAY page binds **Start to the TOUCHPAD**. Delivering it (13 presses read by the guest) still leaves the game picture black; it never leaves a ~60 s narration cycle. #1773 is fixed and was **not** the cause — the alias now recovers `ud_alias=s9` and the composite is 28/28 pixel-identical | `docs/games/EARTHION_STATUS.md` |
+| *Metaphor: ReFantazio* `PPSA20800` | rung 2 — the **title screen** and title menu, on `scripts/metaphor/reach-title-screen.pad`; with the first-boot setup saved, NEW GAME plays the storybook prologue to name entry. Four prosper defects, each prosper answering a question wrongly: the direct-memory pool outside its advertised budget (#2934), `sceFontRenderCharGlyphImage` unregistered (#2951) and then reporting a zero glyph advance (#3791), and libSceSigninDialog unregistered so the title waited forever for the PSN prompt to finish (#3784). **Its font path is a real rasterizer over the title's OWN TrueType file.** The network prompt's Retry defaults to Yes, so a Cross-only route loops; answer the first prompt No. Movies render as stripes (#3801) | `docs/games/METAPHOR_STATUS.md` |
+| *Uncharted: Legacy of Thieves Collection* `PPSA05684` | rung 0 — nothing renders, but the guest now survives its boot and mounts its content archives. A Naughty Dog **fiber** job system, which is the thing to know before touching it: fibers start on the main thread and are resumed by worker threads, so any prosper mechanism assuming "the host thread that enters an HLE call is the one that returns from it" is wrong here. Three defects of that exact shape so far (#3615 fixed, #3638, #3623) | `docs/games/UNCHARTED_STATUS.md` |
 | Every other title | — | `COMPATIBILITY.md` |
-| UE4 / IoStore bring-up (shared) | — | `docs/UE4_APR_IOSTORE_BRINGUP.md`, `docs/CROSS_ENGINE_UE4.md` |
-| Renderer performance | July pass complete; the stop decision is recorded | `docs/RENDERER_PERFORMANCE_2026_07.md` |
-| Windows port / release | native SDL3+Vulkan frontend, screenshots, release path | `docs/WINDOWS_PORT_HANDOFF.md`, `docs/WINDOWS_RELEASE.md` |
-| Linux desktop release (AppImage + tarball) | published on `v*` tags; packaging is built and verified on every PR | `docs/LINUX_RELEASE.md` (users), `packaging/linux/README.md` (how, and its `## Ruled out`) |
+| UE4 / IoStore bring-up (shared) | — | `docs/engines/UE4_APR_IOSTORE_BRINGUP.md`, `docs/engines/CROSS_ENGINE_UE4.md` |
+| Renderer performance | July pass complete; the stop decision is recorded | `docs/performance/RENDERER_PERFORMANCE_2026_07.md` |
+| Windows port / release | native SDL3+Vulkan frontend, screenshots, release path | `docs/platforms/WINDOWS_PORT_HANDOFF.md`, `docs/platforms/WINDOWS_RELEASE.md` |
+| Linux desktop release (AppImage + tarball) | published on `v*` tags; packaging is built and verified on every PR | `docs/platforms/LINUX_RELEASE.md` (users), `packaging/linux/README.md` (how, and its `## Ruled out`) |
 | GPU capture / replay / timeline tooling | F9 frame grab → offline `.prgbundle` / `.prgcap` workflow, and every `PROSPER_*` graphics diagnostic | `tools/gpu_replay/README.md`, `tools/gpu_timeline/README.md`, `tools/AGENTS.md` |
-| Graphics architecture, resource binding, recompiler | — | `docs/GRAPHICS.md`, `docs/RESOURCE_BINDING.md`, `docs/RECOMPILER_REMAINING.md` |
-| AGC command-packet sizes (a builder's dword count is an ABI contract with the guest's own reservations) | — | `docs/AGC_PACKET_SIZES.md` |
+| Graphics architecture, resource binding, recompiler | — | `docs/gpu/GRAPHICS.md`, `docs/gpu/RESOURCE_BINDING.md`, `docs/gpu/RECOMPILER_REMAINING.md` |
+| AGC command-packet sizes (a builder's dword count is an ABI contract with the guest's own reservations) | — | `docs/gpu/AGC_PACKET_SIZES.md` |
 
 ### Before you form a hypothesis, read the `## Ruled out` section
 
@@ -159,7 +159,7 @@ Every `docs/*_STATUS.md` in that table — and `PPSA02664_BLACK_WORLD.md`, `MESS
 and `GRIS_SONIC_COBRA_BRINGUP.md` — carries a **`## Ruled out`** section: one line per
 already-falsified hypothesis, the evidence that killed it, and the issue/PR link. (Blasphemous 2's
 row points at a route README, which has none.) Cross-title
-falsifications live in the area doc (`docs/RESOURCE_BINDING.md`, `docs/RECOMPILER_REMAINING.md`).
+falsifications live in the area doc (`docs/gpu/RESOURCE_BINDING.md`, `docs/gpu/RECOMPILER_REMAINING.md`).
 These exist so nobody re-derives a dead answer at full cost — they are the most expensive knowledge
 in the repository. Extend them; see the recording rule under *How to work here*.
 
@@ -167,12 +167,12 @@ The standing warnings that are **not** title-specific:
 
 - **Do not restart the superseded Messenger depth, vertex-fetch, geometry, palette, or tiling
   hypotheses without contradictory new evidence.** Each is falsified with evidence in
-  `docs/MESSENGER_BLACK_RENDER.md` § Ruled out. The real cause was a missing recompiler instruction
+  `docs/games/messenger/MESSENGER_BLACK_RENDER.md` § Ruled out. The real cause was a missing recompiler instruction
   plus loss of per-target dimensions (#526/#527, fixed by #528), with #534 and #541 behind it.
 - **Do not resume Messenger-specific renderer cache work toward 60 FPS.** The July pass deliberately
   stopped at roughly 12 → 24 FPS on the first level; the remaining synchronous graphics/compute
   boundaries must be evaluated against a **3D** workload first (*Summer Sports Games* `PPSA03416` is
-  the first clean candidate). `docs/RENDERER_PERFORMANCE_2026_07.md`.
+  the first clean candidate). `docs/performance/RENDERER_PERFORMANCE_2026_07.md`.
   **That 24 FPS is stale, and the reason matters more than the number.** It was measured correctly,
   with `prosper-app`, on 2026-07-14 — and #1270 changed the present architecture ten days later
   (2026-07-24), so it describes a renderer that no longer exists. Re-run windowed and uncapped
@@ -207,13 +207,13 @@ The standing warnings that are **not** title-specific:
     grab, not the title — and quoting it as the run's minimum is the same error as quoting a
     screenshot-harness rate as the renderer's. Drop the samples either side of a capture before
     taking a minimum.
-- **Start Windows work from `docs/WINDOWS_PORT_HANDOFF.md`**, not the solved pre-render fence
-  investigation; Windows *release* users start from `docs/WINDOWS_RELEASE.md`.
+- **Start Windows work from `docs/platforms/WINDOWS_PORT_HANDOFF.md`**, not the solved pre-render fence
+  investigation; Windows *release* users start from `docs/platforms/WINDOWS_RELEASE.md`.
 - **A historical capture hash is not a current renderer oracle**, and neither is a target extent or a
   raw draw count on its own. Addresses and operation ordinals are run-local. Re-derive the selector
   with `gpu_timeline --signatures` / `--select` before recording a new bundle.
 - **`PROSPER_UD_TAIL_ALIGN` must stay off.** It exists only so the A/B that falsified the
-  user-data-tail hypothesis stays reproducible (`docs/RESOURCE_BINDING.md` § Ruled out).
+  user-data-tail hypothesis stays reproducible (`docs/gpu/RESOURCE_BINDING.md` § Ruled out).
 - **Read `GAME_COMPAT_ORCHESTRATION.md`'s instrument-not-the-subject list before believing any
   surprising measurement** — every entry on it is a phantom defect that came from the apparatus
   rather than the subject, and several cost hours. (Deliberately no count here: the list is appended
@@ -242,15 +242,15 @@ The standing warnings that are **not** title-specific:
 
 ### Superseded documents
 
-`docs/NEXT_STEP_VERTEX_FETCH.md` (bindless-dynamic vertex fetch, superseded 2026-07-11) and
-`docs/RENDER_LOOP.md` (the render bring-up log) are historical records. Both frontiers are complete:
+`docs/archive/NEXT_STEP_VERTEX_FETCH.md` (bindless-dynamic vertex fetch, superseded 2026-07-11) and
+`docs/archive/RENDER_LOOP.md` (the render bring-up log) are historical records. Both frontiers are complete:
 both shader stages recompile and dynamic V#/T#/S# resources resolve on current `main`, and the
 render-loop frontier is complete. Each carries its own superseded banner — do not start work from
 either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
 
 ## How to work here
 
-- **Concurrent game work starts with `prosper/docs/GAME_COMPAT_ORCHESTRATION.md`.** It defines the orchestrator and
+- **Concurrent game work starts with `prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md`.** It defines the orchestrator and
   subagent contract, shared-GPU policy, evidence/PR cadence, and the dated current handoff for active title lanes.
   Update its current-state sections when ownership, evidence, or the exact frontier changes; keep detailed findings in
   GitHub issues so the document remains a discoverable map rather than the only record.
@@ -488,7 +488,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   not as failures** (#1573): `module_loads_eboot`, `boot_reaches_first_syscall` and
   `real_shader_render` assert against *The Messenger's* own bytes. CMake derives the dump's title id
   and names both ids in the skip. So a bring-up agent's first `ctest` on a new title is green with a
-  smaller executed set — read the skip count, not just the exit code. `docs/VERIFICATION.md` § CI.
+  smaller executed set — read the skip count, not just the exit code. `docs/process/VERIFICATION.md` § CI.
   - **Editor/LSP (clangd):** CMake exports `compile_commands.json` into the build dir
     (`CMAKE_EXPORT_COMPILE_COMMANDS ON`), and a symlink at the repo root points clangd at it —
     create both with one configure (`cmake -S prosper -B prosper/build-linux`) plus
@@ -548,7 +548,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   document mechanical scope and execution limits. New `.py` files need a purpose docstring;
   ruff is gated on changed files only (`pyproject.toml`, uv).
   `prosper/tools/ci/AGENTS.md` § Python rule.
-- **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth
+- **Verification is agentic-first / programmatic** (`docs/process/VERIFICATION.md`): ctest exit code is truth
   **only with `--no-tests=error`** — plain `ctest` on a build directory with nothing registered prints
   `No tests were found!!!` and **exits 0**, so "no tests ran" and "everything passed" are the same
   exit code (measured on ctest 4.4.0: plain → 0, `--no-tests=error` → 8). This is reachable without
@@ -633,7 +633,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     ~3.2 fps leaves the GPU at **4.17%** against a `vkcube` control at **56.31%** — so with #2215's
     30-45 ms/submit, its submits are long because they **wait**. That control is mandatory here: the
     tool prints "Unknown Radeon card" and its `ta`/`ee` counters are dead on this chip.
-  **`docs/GPU_PROFILING_EXTERNAL.md` has the recipes and the way each tool lies** — RGP writes to
+  **`docs/performance/GPU_PROFILING_EXTERNAL.md` has the recipes and the way each tool lies** — RGP writes to
   `/tmp`, a frame ordinal silently captures the wrong regime, and the Fedora RenderDoc package ships
   no Python bindings. Build a `PROSPER_*` switch only for something the guest-facing layer knows and
   the GPU vendor cannot see.
@@ -892,7 +892,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     **Run the docs gate locally first** — it is the one check that can actually fail on a docs diff, and
     it takes a second:
     ```bash
-    F=prosper/docs/GAME_COMPAT_ORCHESTRATION.md
+    F=prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md
     B=$(mktemp)                    # mktemp, not a fixed name: several agents run this concurrently
     git fetch origin -q && git show "origin/main:$F" > "$B"
     python3 prosper/tools/docs/check_numbered_table.py --ordered \
@@ -1157,7 +1157,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   - Larger planned work (frontier steps, refactors) also gets an issue when it will span
     sessions — issues are the durable queue; `docs/` files explain *how*, issues track *what
     remains*. The umbrella issue for the history-review backlog is #72
-    (full annotated list: `prosper/docs/BUG_HUNT_BACKLOG.md`).
+    (full annotated list: `prosper/docs/process/BUG_HUNT_BACKLOG.md`).
   - **Long-lived game trackers are progress indices, not bug reports.** Create one as
     `[Game tracker] <Title> (<TITLE_ID>)`, label it `tracker:game` plus the title's existing
     `game:<slug>` label, and keep it open through the compatibility ladder. Its compact body records

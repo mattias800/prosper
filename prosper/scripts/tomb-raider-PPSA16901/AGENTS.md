@@ -1,7 +1,7 @@
 # AGENTS.md — scripts/tomb-raider-PPSA16901
 
 Input routes for **Tomb Raider I-III Remastered** (`PPSA16901`). One `.pad` file per reached
-state, in the syntax `docs/INPUT_REPLAY.md` defines.
+state, in the syntax `docs/subsystems/INPUT_REPLAY.md` defines.
 
 The dump is a launcher plus three self-contained games under `1/`, `2/` and `3/`, so a route here
 has to say *which* game it drives as well as which screen. Everything below is Tomb Raider I unless

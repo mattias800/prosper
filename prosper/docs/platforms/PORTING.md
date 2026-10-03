@@ -1,0 +1,820 @@
+# Porting prosper to Windows, macOS, and Android
+
+*Investigation, 2026-07-13. Status: proposal — nothing here is implemented beyond the existing
+partial `_WIN32` compilation of the pure subsystems.*
+
+## TL;DR
+
+prosper has two independent porting problems, and they have different answers:
+
+1. **The OS problem** (POSIX/Linux → Win32 / Darwin / Bionic). Small and bounded: the Linux
+   coupling is concentrated in `src/host/image/exec_image_linux.cpp` plus a handful of HLE spots, and
+   the actually-used POSIX surface is ~15 primitives. Answer: a **thin per-OS substrate**
+   (`exec_image_<os>.cpp` + small shims), not Cygwin and not a full POSIX reimplementation.
+2. **The CPU problem** (x86-64 guest code on ARM hosts). prosper executes the guest's x86-64
+   machine code natively (`run_entry` ends in `jmp *%rax`), so on Apple Silicon and Android
+   *everything* depends on an existing translation layer (we will not write a JIT). Answer:
+   **pick the translator per platform, and let that choice decide how much OS porting is even
+   needed** — because the mature translators (Rosetta 2, FEX, Box64) translate *whole processes*,
+   running the **existing Linux x86-64 build under them** is often the entire port.
+
+Recommended shape: **one portable core, two native OS targets, translators for all ARM**.
+
+| Platform | CPU strategy | OS strategy | Effort | Confidence |
+|---|---|---|---|---|
+| Linux x86-64 | native | current code | — | exists |
+| Windows x86-64 | native | new Win32 substrate (`exec_image_win.cpp`) | moderate–large | HIGH it works; two hard sub-problems |
+| Windows (interim) | native | **WSL2 — works today** | zero | proven (it's the dev setup) |
+| macOS (Apple Silicon + Intel) | **Rosetta 2** (build the app as x86_64 Darwin) | Darwin substrate (small delta from Linux) | small–moderate | HIGH (shadPS4 + Apple GPTK use exactly this architecture) |
+| macOS post-Rosetta hedge | Rosetta-for-Linux or FEX inside a lightweight VM | **unmodified Linux build** | packaging only | MED (GPU path is the open question) |
+| Android arm64 | **Box64** (later maybe FEX) | **unmodified Linux x86-64 build** in an app-private rootfs (Winlator model) | moderate packaging, no core port | MED — most speculative target |
+| Windows on ARM | Prism (built-in, AVX2 since 24H2) | the Windows x64 build, unmodified | zero extra | MED |
+
+Recommended order: **macOS first** (smallest delta, developable on the M2 laptop, and it forces
+the platform-abstraction seams), **Windows native second** (biggest audience; WSL2 covers it
+meanwhile), **Android last** (packaging-heavy, performance-bound, no core changes).
+
+---
+
+## What is actually Linux-specific (inventory)
+
+A full sweep of the tree (2026-07-13) found the coupling is much narrower than "the core is POSIX"
+suggests:
+
+**The guest-execution substrate — the real port surface.** All of it in
+`src/host/image/exec_image_linux.cpp` (one 144 KB file, entirely `#ifdef __linux__`), plus
+`boot_program.cpp` and `guest_tls.cpp`:
+
+- `mmap` with `MAP_FIXED` / `MAP_FIXED_NOREPLACE` at fixed guest bases (eboot `0x400000000`,
+  modules up to `0x600000000` stubs; GPU-VA window `0x100000000`–`0x1000000000`; guest heap seen
+  up to ~`0x1730000000`), RWX for bring-up.
+- `sigaction`/`sigaltstack`/`ucontext` fault+trap handler (SIGSEGV/SIGBUS/SIGILL/SIGTRAP):
+  SSE4a (#UD) emulation, lazy page commit, software watchpoints via `mprotect`+single-step
+  (EFLAGS.TF), `sigsetjmp` recovery, raw `SYS_write` inside handlers.
+- `perf_event_open` hardware break/watchpoints (`PROSPER_HWBP`/`PROSPER_HWWATCH`),
+  `/proc/self/maps` classification.
+- Guest `%fs` TLS (on by default; opt out with `PROSPER_NO_GUEST_FS`): per-thread guest TCB, base
+  switched with `rdfsbase`/`wrfsbase`; import stubs are hand-emitted x86 that swap `%fs` per HLE call.
+- x86 machine-code emitters for import stubs; `int3` patching for `PROSPER_BP`.
+
+**HLE Linuxisms (small list):**
+- `hle_kernel_mem.cpp`: `memfd_create` + dual `MAP_SHARED` mappings for CPU/GPU-aliased dmem;
+  `SYS_futex` for `sceKernelWaitOnAddress` (also `sync_futex.cpp`, which already has a non-Linux
+  no-op fallback). Note the PS5 granularity default is already `0x4000` (16 KB) throughout.
+- `hle_kernel.cpp`: glibc-isms `pthread_getattr_np`, `pthread_sigqueue`; the guest-thread
+  trampoline is `#ifdef __linux__`.
+- `hle_file.cpp` / `hle_kernel_time.cpp`: already have `_WIN32` branches.
+
+**Already portable by design:**
+- `src/gpu/` is Vulkan-free data translation (PM4→draw state, RDNA2→SPIR-V). No OS calls.
+- The Vulkan edge (`tests/fixtures/render_runner.h`, `frontends/shared/live/live_renderer.cpp`) is **headless
+  Vulkan 1.1**, requiring only `robustBufferAccess` (+ optional `VK_EXT_image_robustness`,
+  `samplerAnisotropy`). No geometry shaders, no descriptorIndexing, no BDA. Extremely portable.
+- Presentation (`frontends/prosper-app`) is **SDL3** with a deliberately separate present device;
+  frames cross as CPU pixels. SDL3 covers Windows/macOS/Android.
+- Loader, SELF parsing, NID linking, most HLE, and the pure test suite already compile under
+  `_WIN32` (the current MinGW build).
+
+**What was *not* found (good news):** no epoll/eventfd/timerfd/shm_open/dlopen/ptrace/clone/
+seccomp/arch_prctl. The POSIX surface in real use is: mmap/mprotect, memfd, futex, signals +
+ucontext, perf_event (diagnostics only), pthreads, clock_gettime, open/read/dirent.
+
+---
+
+## Strategy question: cross-platform app, separate apps, Cygwin, or own POSIX?
+
+**Not Cygwin/MSYS2 runtime.** Cygwin supplies the POSIX *API*, not the semantics prosper needs:
+signal/`ucontext` fidelity inside a translation DLL, no `perf_event_open`, no `memfd`, emulated
+`fork`-era process model, and a runtime that itself occupies address space inside our carefully
+fixed guest layout. Every serious emulator on Windows (RPCS3, shadPS4, Dolphin) is native Win32.
+(MinGW, which the repo already uses, is unrelated to Cygwin — it *is* native Win32.)
+
+**Not a POSIX implementation.** We don't use POSIX; we use ~15 primitives. Reimplementing POSIX
+means reimplementing the 95% nobody calls.
+
+**Yes: one cross-platform core with a thin host-substrate layer.** `src/host/image/exec_image.hpp` is
+already the interface and the Linux file is already named `exec_image_linux.cpp` — the seam
+exists. Add `exec_image_darwin.cpp` and `exec_image_win.cpp`, and factor four tiny shims used by
+both substrate and HLE:
+
+- `host_mem`: reserve/commit/protect at fixed addresses; dual-mapped ("aliased") memory
+  (Linux `memfd` / Windows `CreateFileMapping`+`MapViewOfFile3` / Darwin `shm_open` or
+  `mach_make_memory_entry_64`+`mach_vm_map`).
+- `host_futex`: wait/wake on address (Linux `SYS_futex` / Windows `WaitOnAddress` —
+  a near-exact equivalent / Darwin `os_sync_wait_on_address`, macOS 14.4+).
+- `host_fault`: install fault/trap handler with a portable register-context view
+  (Linux `ucontext.gregs` / Windows VEH `CONTEXT` / Darwin `__darwin_mcontext64`).
+- `host_hwbp`: hardware break/watchpoints (Linux `perf_event_open` / Windows `Dr0–Dr3` via
+  `SetThreadContext` / Darwin: unavailable → fall back to the existing software-watch and `int3`
+  paths; HWBP is a diagnostic, not required to run games).
+
+The frontends stay one cross-platform SDL3 app; Android gets its own thin app shell (below).
+So: **cross-platform app, not separate apps** — with the Android distribution being a packaging
+of the Linux build rather than a port.
+
+---
+
+## Windows (x86-64): native port
+
+Guest code runs natively — no translator involved. The substrate port is well-trodden emulator
+territory (RPCS3/shadPS4 precedents): VEH for SIGSEGV/SIGILL/SIGTRAP equivalents (`CONTEXT` has
+full registers and works with EFLAGS.TF single-stepping), `VirtualAlloc2`/`MapViewOfFile3` for
+fixed-address reservation, placeholders and dual mappings (Win10 1803+), `WaitOnAddress` for
+futex, debug registers for HWBP/HWWATCH, `VirtualQuery` instead of `/proc/self/maps`.
+
+Two genuinely hard sub-problems:
+
+1. **SysV ⇄ MS-x64 ABI** at every guest↔host call boundary (already flagged in
+   `archive/ROADMAP_HISTORY.md:297`). With clang or MinGW-GCC this is mostly *free*: mark HLE entry points
+   `__attribute__((sysv_abi))` so guest code calls them directly; host→guest calls (init arrays,
+   `run_entry`, callbacks) get the inverse annotation on the function-pointer types. A handful of
+   variadic/trampoline cases need hand care. Full hand-written trampolines are the fallback, not
+   the plan.
+2. **Guest `%fs` TLS.** Windows gives user mode no reliable way to own FS base: there is no API,
+   `wrfsbase` availability/persistence across context switches is undocumented, and the kernel
+   validates/rewrites segment state (documented for GS/TEB; FS behavior must be assumed hostile).
+   shadPS4 — same FreeBSD-style x86-64 guests — solves this on Windows by **patching/trapping
+   guest FS-relative accesses** instead of owning FS. prosper already decodes instructions at
+   fault sites (SSE4a path), so trap-and-fix or patch-at-load is in-house technology. Spike this
+   FIRST (a 100-line probe: `wrfsbase` + spin loop + check for clobber) — if modern Win11
+   preserves user FS base, the existing swap-stub design ports directly; if not, plan the
+   patching route. CONFIDENCE: MED on mechanism choice, HIGH that one of them works.
+
+**Interim (works today):** WSL2 + WSLg runs the full Linux build including the SDL3 app — that is
+literally the current dev environment. "Available on Windows" can be true immediately with a
+packaged WSL2 distribution while the native port proceeds.
+
+**Windows on ARM** comes along for the ride: Prism (the built-in x86-64 emulator, AVX2 support
+since 24H2) runs the native Windows x64 build unmodified.
+
+---
+
+## macOS: x86_64 build under Rosetta 2 (primary), VM as hedge
+
+**Do not build arm64-native.** There is no in-process x86-64 translator on macOS (Rosetta is
+process-granular; FEX targets Linux only), so an arm64 prosper could never run guest code.
+Instead build the whole app **x86_64 Darwin** (`CMAKE_OSX_ARCHITECTURES=x86_64`) and let
+Rosetta 2 translate everything — host and guest alike. This is precisely the architecture of
+Apple's Game Porting Toolkit (x86-64 Wine under Rosetta) and of shadPS4's macOS builds, so the
+class of workload is proven.
+
+What Rosetta buys us on Apple Silicon:
+
+- x86-64 execution including **AVX2 (macOS 15+)**; TSO memory ordering in hardware.
+- **4 KB pages** inside the translated process — sidesteps the entire 16 KB Apple-Silicon page
+  problem that plagues Linux-side emulators.
+- Intel Macs run the same binary natively (bonus, while they last).
+
+Darwin substrate deltas (all small; `exec_image_darwin.cpp` will look ~85% like the Linux file):
+
+- `MAP_FIXED_NOREPLACE` → probe + `MAP_FIXED`, or `mach_vm_map` without overwrite.
+- `memfd_create` dual mapping → `shm_open` or `mach_make_memory_entry_64` + double `mach_vm_map`.
+- `SYS_futex` → `os_sync_wait_on_address` (14.4+); `sync_futex.cpp` already has the seam.
+- `ucontext.gregs[REG_RIP]` → `uc->uc_mcontext->__ss.__rip` etc.; signals/sigaltstack same shape.
+- `pthread_getattr_np` → `pthread_get_stackaddr_np`/`pthread_get_stacksize_np`;
+  `pthread_sigqueue` → `pthread_kill`.
+- `perf_event_open` HWBP → not available; keep software watch + `int3` paths.
+- Guest `%fs`: Darwin has no fsbase API either. **Spike first:** does Rosetta execute
+  `wrfsbase`/`rdfsbase`? (It plausibly does — Rosetta-for-Linux must support x86 TLS via
+  `arch_prctl`, so segment-base emulation exists inside the translator.) If yes, the existing
+  swap stubs work unchanged. If no, same patch/trap strategy as Windows.
+- **SSE4a risk:** guest code contains Zen2 `INSERTQ`/`EXTRQ`, which Rosetta (Intel feature set)
+  won't implement. Verify a SIGILL is delivered catchably; if Rosetta instead fails translation,
+  pre-patch those instruction sites at load (we already decode them — `sse4a.hpp`).
+
+GPU: **MoltenVK** (user-specified, and correct — ships universal, works in x86_64 slices, nearly
+conformant Vulkan 1.4, far beyond our Vulkan 1.1 needs). One caveat: MoltenVK *advertises*
+`robustBufferAccess` but does not enforce it (Metal has no equivalent), so device creation
+succeeds but out-of-bounds guest buffer reads are not clamped — if artifacts appear that Linux
+doesn't show, suspect this first; the recompiler can emit manual bounds checks if it ever
+matters. (Longer term, Mesa's KosmicKrisp offers conformant Vulkan on Apple Silicon, but arm64 /
+macOS 26+, so it only pairs with the VM path.)
+
+**The Rosetta clock is ticking:** full Rosetta support lasts through macOS 27 (fall 2026); from
+macOS 28 (fall 2027) Apple keeps only a subset "for older, unmaintained gaming titles." An
+emulator running games might even fit that carve-out, but don't bet the platform on it. Hedge,
+which is also the zero-port option: run the **unmodified Linux x86-64 build** in a lightweight
+Linux VM — either Virtualization.framework with **Rosetta-for-Linux** (Apple-supported, fast) or
+FEX/muvm in a 4 KB-page guest (fully open, slower). The open question there is GPU: Venus
+paravirtualized Vulkan over MoltenVK (the krunkit stack) exists but is young; prosper's
+CPU-pixel present model at least makes display trivial. Treat the VM route as the durable
+fallback, not the first deliverable.
+
+---
+
+## Android (arm64): package the Linux build, don't port
+
+Android is Linux under the hood, but Bionic/SELinux/app-model differences make a *native* Android
+port of the substrate both painful and pointless — because the only viable CPU translators here
+(**Box64**, community FEX builds) translate **Linux x86-64 processes** anyway. The proven model is
+Winlator: an APK bundling the translator, a minimal x86-64 rootfs, and (on Qualcomm) the Turnip
+Vulkan driver, running real Windows games via Wine+Box64 on stock unrooted phones. prosper's ask
+is strictly smaller than Winlator's — no Wine, no DXVK; just one Linux x86-64 binary that speaks
+Vulkan 1.1 and reads a game dump.
+
+- **Translator: Box64 first** — Android-proven (Winlator), ships an Android build flavor, and
+  supports 16 KB-page hosts (since 0.2.8, for Asahi). FEX is faster/more rigorous but officially
+  "Android is not and will never be a target"; only community ports (FEXDroid/Termux) exist, and
+  it hard-requires 4 KB pages. Revisit if the ecosystem shifts.
+- **GPU:** the translator thunks Vulkan to the native arm64 driver (Box64's wrapped-libs
+  mechanism — the same way Winlator feeds DXVK output to Turnip). Adreno+Turnip is the quality
+  path; Mali/Xclipse are weak. Our tiny feature footprint (Vulkan 1.1 + robustBufferAccess) is
+  about as mobile-friendly as a desktop workload gets.
+- **Page size:** new 16 KB-page devices are arriving (Play requires 16 KB *app* support for
+  Android 15+ targets since 2025-11; Android 16 adds a 4 KB-app compat mode). prosper is oddly
+  well-positioned: the PS5's own mapping granularity is 16 KB and the HLE already defaults
+  alignment to `0x4000`. Residual risk is 4 KB-grain `mprotect`/ELF-segment layout; Box64's 16 KB
+  support absorbs some of it. Prefer 4 KB devices for bring-up.
+- **App shell:** a thin Kotlin frontend (SurfaceView + storage access for the user's dump) that
+  launches the emulator in the app's private rootfs. SDL3's Android backend can replace the
+  desktop present path later.
+- **Expectations:** this is the most speculative target — flagship-Snapdragon-only at first, and
+  performance-bound (though the current titles are 2D indies, which is the plausible envelope
+  for Box64). Do it last; it requires *no core changes*, only packaging, so nothing is lost by
+  deferring.
+
+---
+
+## Tooling portability
+
+The debugging toolbox (`tools/`, see `tools/AGENTS.md`) splits cleanly:
+
+- **Pure file/Vulkan tools — portable now, no substrate needed:** `gpu_replay`, `gpu_timeline`,
+  `self_dump`, `shader_histo`, `imgdump`, `spv_validate`, `niddiag`, `il2cpp/`, `re/xref.py`.
+  None of them execute guest code. In particular **`gpu_replay` replays `.prgcap`/`.prgbundle`
+  capsules through the full Vulkan backend without booting the guest**, and exits non-zero on
+  output-hash mismatch — so an **arm64-native macOS build of `gpu_replay` against MoltenVK,
+  replaying captures made on Linux**, is the cheapest possible pathfinder for the entire GPU
+  stack on Apple (recompiled SPIR-V, descriptors, RTT, and the robustBufferAccess caveat),
+  before any Rosetta or substrate work. This should precede the Rosetta spike.
+- **Substrate-bound:** `boot_trace` (ports with `exec_image_<os>`), the `snapshot` golden-image
+  guard (boots a real title — once boot works on a platform, pixel-hash regression verification
+  comes along for free), and the `PROSPER_*` runtime diagnostics (all portable except the
+  `perf_event`-based `PROSPER_HWBP`/`HWWATCH`; the software-watch and `int3` paths cover other
+  OSes).
+- **Deliberately Linux-only:** `pad_evdev` (SDL3 pads elsewhere) and the gdb-based `tools/dbg/`
+  scripts.
+
+## macOS port status (2026-07-13) — landed, in progress on branch `port/macos-core`
+
+The macOS x86_64/Rosetta path is now real, not theoretical:
+
+- **Substrate ported.** `src/host/platform/posix_shim.hpp` supplies the Darwin equivalents of the ~15
+  Linux/glibc primitives the emulator uses (mach `process_vm_*`, `os_sync_wait_on_address` futex,
+  `shm_open` memfd, `MAP_FIXED_NOREPLACE` emulation, timed locks, real semaphore/barrier, an
+  indexable mcontext register view, Mach-O global-asm). `exec_image_linux.cpp`, `boot_program.cpp`,
+  `guest_tls.cpp`, `hle_kernel_mem.cpp`, and the thread/exception paths in `hle_kernel.cpp` compile
+  and run on Darwin.
+- **Everything green.** Full x86_64 build on an Apple M2; **67/67 ctest under Rosetta 2** (was a
+  55-test pure subset before; the substrate tests — trap/boot/setjmp/stack/AGC/videoout/prot_none —
+  now run too). The Rosetta spike confirmed MAP_FIXED at the guest bases, RWX self-modifying
+  execution, catchable SIGILL, `os_sync_wait_on_address`, and 4 KB pages. Two spike facts shaped the
+  port: **Rosetta does not implement `wrfsbase`/`rdfsbase` (SIGILL)**, and MAP_FIXED at
+  `0x100000000`/`0x1000000000` is refused (Rosetta reserves the 4 GiB and 64 GiB windows) — the
+  module bases (`0x4xx…`, `0x5xx…`, `0x6xx…`) map fine.
+- **A game boots into guest code.** `boot_trace PPSA13579-app0` (Blasphemous 2, Unity/IL2CPP) links
+  all 7 modules, resolves 3554 imports (408 cross-module), dispatches every `.init_array`, and
+  executes real guest x86-64 under Rosetta — reaching the C runtime's first constructor running libc
+  initialization.
+- One correctness fix fell out of the port (all platforms): the unannounced-32-bit index-buffer
+  fingerprint (#304) read the same bytes through `uint16_t*` and `uint32_t*` — strict-aliasing UB
+  that Apple Clang 21 compiled into `ud2`. Now `memcpy` loads.
+
+### The macOS frontier: guest `%fs` TLS — SOLVED (2026-07-14, trap-and-emulate)
+
+Was: boot died a few frames into libc init on guest initial-exec `%fs` TLS. Rosetta rejects
+`wrfsbase`/`rdfsbase` (SIGILL) and Darwin's `%fs` base is 0 (macOS uses `%gs`), so we can't give the
+CPU a real guest fs base the way Linux (`wrfsbase`) and Windows (FSGSBASE + VEH re-apply) do.
+
+Solved by **trap-and-emulate**, settled by a spike: under Rosetta a guest `%fs:disp` access faults at
+linear address == the raw offset (fs base is 0), so the real target is simply `guest_TP + fault_addr`
+— no addressing-mode decode needed. Implementation:
+- `guest_tls.cpp` macOS "trap mode" (opt-in, and the one platform where `PROSPER_GUEST_FS` is read —
+  Linux/Windows are on by default): build the per-thread Variant-II
+  guest TCB and store its thread pointer in host (`%gs`) TLS, but **do not** touch the CPU fs base.
+- `exec_image_linux.cpp` `try_emulate_fs_access`: in the SIGSEGV/SIGBUS handler, if the faulting
+  instruction carries an `%fs` prefix and trap-mode TLS is active, redirect the access to
+  `guest_TP + fault_addr`, emulate it (mov family — load/store all sizes, movzx/movsx, imm store),
+  advance RIP, and resume. Unknown instruction forms log and fall through (none seen so far).
+- The Linux `%fs` swap stubs are disabled on macOS (they use `wrfsbase`); handlers run on host `%gs`
+  TLS so no per-HLE-call swap is needed. TLS is activated before `.init_array` too (Apple-only).
+
+Result: Blasphemous 2 boots from the old libc-init death **all the way into Unity's PS5 GPU device
+init** (`GfxDevicePS5SharedData::CreateWorkload`), AGC command submission, and ~500 StreamingAssets
+bundles — 180k+ `%fs` accesses emulated with zero unhandled forms. The `prosper-app` window comes up
+and the live renderer begins creating real pipelines from the guest's draws.
+
+**MoltenVK build matters (2026-07-14):** the guest's shaders exposed a SPIRV-Cross bug in the
+**x86_64 Khronos-release MoltenVK 1.4.1** (`Cannot resolve expression type`) — proven build/arch
+specific: the *arm64* MoltenVK 1.4.1 and the **LunarG Vulkan SDK's** universal MoltenVK both convert
+the identical shaders fine. So for real rendering, use a good MoltenVK:
+`scripts/fetch-macos-vulkan.sh --lunarg` (headless-installs the LunarG SDK's universal MoltenVK into
+`.macos-vulkan/`). With it, most guest shaders compile and `prosper-app` presents frames (slowly —
+first-use Metal pipeline compilation under Rosetta is ~a few fps until warm). The plain
+`fetch-macos-vulkan.sh` (Khronos release) stays the light build/CI path. #701 fixed one SPIRV-Cross
+trigger (64-bit OpConstant); `draft/recompiler-int64-lowering` removes Int64 entirely (unmerged,
+helps weak drivers).
+
+**Remaining to on-screen gameplay (follow-on frontiers, not TLS):**
+- One guest vertex shader still fails MSL conversion *at runtime* even with the good MoltenVK, though
+  the SDK's standalone converter handles the same SPIR-V — a MoltenVK pipeline-config/SPIRV-Cross
+  interaction (tracked with #693). One missing draw.
+- GPU submit-completion: with real pipelines created, the guest waits on GPU work
+  (`sce::Agc::suspendPoint` / fence) — the completion/label-writeback handshake needs verifying on
+  macOS so the frame loop advances at speed (same class as the Windows "GPU EOP completion" step).
+- On-screen content not yet visually confirmed (headless dev context); the present path is proven by
+  `--test-pattern`.
+- MoltenVK pipeline compat: `primitiveRestartEnable=VK_FALSE` is rejected by Metal — fixed (force
+  `VK_TRUE` on Apple). Next: the guest **vertex shader fails MSL compilation** in MoltenVK
+  (`Vertex shader function could not be compiled into pipeline`) — a SPIR-V→Metal translation gap to
+  isolate (same class as the `v_cvt_i32_f32` issue #686).
+- A guest **worker-thread fault** (`ret` to `0x0` at a host address) during asset load — a separate
+  HLE issue to diagnose.
+
+### The macOS harness app (prosper-app) — WORKS (2026-07-14)
+
+The realtime window frontend (the Linux `prosper-app`: SDL3 window + Vulkan present, so you watch
+the game live instead of dumping screenshots) now **builds and runs on macOS** under Rosetta 2:
+
+- **Built x86_64** (links the guest-running core) against a **universal MoltenVK** (Homebrew's is
+  arm64-only; `scripts/fetch-macos-vulkan.sh` drops the universal Khronos release into
+  `.macos-vulkan/`). SDL3 is FetchContent-built for x86_64 (a system arm64 SDL3 is skipped on Apple);
+  SDL uses Cocoa (Wayland/X11 are Linux-only now). MoltenVK is linked **directly** (no Khronos
+  loader), so `SDL_Vulkan_LoadLibrary` points at it and the SDL-injected
+  `VK_KHR_portability_enumeration` instance extension is stripped (a loader-only extension MoltenVK
+  rejects in direct-link mode); the device enables the spec-mandated `VK_KHR_portability_subset`.
+- **Verified on an M2:** `prosper-app --test-pattern` opens a Cocoa window, creates the MoltenVK
+  swapchain, and presents animated frames (exit 0). Against the Blasphemous 2 dump the guest boots on
+  its worker thread, the window comes up and waits for guest frames, and the boot hits the **same
+  `%fs` TLS wall** as `boot_trace` — so the harness is complete and will show live gameplay the moment
+  that frontier is solved, exactly like the Linux app.
+- **MoltenVK renders correctly**, not just presents: with `PROSPER_MACOS_MOLTENVK` set, the offscreen
+  GPU tests run on macOS. The original bring-up passed **90/91**; its sole gap was
+  `v_cvt_i32_f32` saturation because Metal's signed float-to-int conversion is undefined near the
+  limits (#686). The recompiler now avoids that operation: it converts a bounded absolute magnitude
+  through the defined unsigned path, restores two's-complement sign, and selects the saturation
+  endpoints explicitly. `rdna2_to_spirv_exec` checks both the boundary results and the absence of
+  `OpConvertFToS` in this lowering.
+
+Build recipe (see the CMake `PROSPER_MACOS_MOLTENVK` override and `scripts/fetch-macos-vulkan.sh`):
+```bash
+bash prosper/scripts/fetch-macos-vulkan.sh
+cmake -S prosper -B prosper/build-mac-app -G Ninja -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+  -DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON \
+  -DPROSPER_MACOS_MOLTENVK="$PWD/.macos-vulkan/lib/libMoltenVK.dylib"
+cmake --build prosper/build-mac-app --target prosper-app
+PROSPER_VULKAN_LIB="$PWD/.macos-vulkan/lib/libMoltenVK.dylib" ./prosper/build-mac-app/prosper-app --test-pattern
+```
+
+## Windows port status (2026-07-14) — Messenger reaches the first level natively
+
+The native MinGW build links and initializes the live Vulkan renderer, boots The Messenger through
+Unity asset loading and IL2CPP initialization, completes repeated GC stop-the-world cycles, and presents
+real 1920x1080 frames. The SDL3 window, WASAPI audio, XInput/HIDAPI pad, keyboard overlay, and normal WIC
+PNG screenshot path now build and run under #683. The guest `%fs`, threading, positioned-I/O,
+WaitOnAddress, VEH, integer ABI, and targeted exception-delivery foundations below are runtime-verified.
+Fresh-save routing now reaches a fully lit first-level frame and exits cleanly. #688 fixed the final
+Windows-only crash found by that route: an always-true `guest_readable` stub let a null dynamic-fetch
+table reach a host dereference. The 360-second acceptance produced 36/36 compact sampled captures,
+36 distinct source frames, and 23 distinct pixel frames at 1920x1080.
+
+- **Direct/flexible-memory HLE ported to Win32** (`hle_kernel_mem.cpp` `#else` block). The pool
+  bookkeeping + VA tracker are copied verbatim from POSIX; mappings are backed by private
+  `VirtualAlloc`/`VirtualProtect`/`VirtualFree`. Phys-offset aliasing is NOT preserved (Win32 view
+  granularity is 64 KiB vs the guest's 16 KiB) — fine for Unity/IL2CPP (Messenger), a follow-up for
+  UE4 MallocBinned3. The guest now allocates + maps its pools.
+- **Host→guest SysV call trampoline** (`prosper_call_guest_sysv`). `run_guest_inits` called the guest
+  init fns with a plain C call, which on Windows uses the MS x64 ABI (args in rcx/rdx) while the guest
+  reads SysV (rdi/rsi) — the `module_start` got a garbage `argp` and jumped wild. The asm shim marshals
+  argc→rdi/argp→rsi and preserves the MS callee-saved regs the SysV callee may clobber (rsi/rdi/xmm6-15).
+- **VEH recovery uses `__builtin_setjmp`/`__builtin_longjmp`, not the CRT pair.** The CRT `longjmp`
+  does a full SEH unwind (`RtlUnwindEx`) from the fault site back to `setjmp`, which cannot traverse
+  the guest frame or the hand-written trampoline (no `.pdata`/`.xdata`) → `STATUS_STACK_OVERFLOW`
+  instead of recovery. The `__builtin_*` pair restores rsp/rbp/rip with no unwind (matching Linux).
+  Also: `run_entry` now points `NT_TIB.StackBase/StackLimit` at the switched guest stack during guest
+  execution so exception dispatch on that stack doesn't spuriously report stack exhaustion.
+
+### Guest `%fs` TLS — SOLVED (FSGSBASE + VEH re-apply)
+
+Was: boot stopped at `eboot+0x808f35` (`mov %fs:0x0,%rax` faulting at `addr=0x0`, zero Sony imports
+called) — uninitialized guest initial-exec TLS, guest `%fs` base 0 on Windows. An FS-base probe
+settled the strategy: **user-mode `rdfsbase`/`wrfsbase` work** (CR4.FSGSBASE, Win10 1709+), but
+**Windows resets the user FS base to 0 on every kernel transition** (a `Sleep()` zeroed it; it
+restores the thread's kernel-saved base and `wrfsbase` doesn't update that copy), so "set once" is
+impossible. Unlike Linux, the *host* uses `%gs` and only the *guest* uses `%fs`, so no per-HLE-call
+swap is needed.
+
+Implemented: a real Windows `guest_tls.cpp` TCB (Variant-II layout, `VirtualAlloc`-backed, self-ptr +
+magic + guest canary), `wrfsbase(TP)` on each guest entry/thread start, and a VEH hook that re-applies
+`wrfsbase(TP)` and retries whenever an `fs`-prefixed instruction faults with the base drifted (one
+fault per kernel-transition boundary, not per access; a loop guard only re-applies when the base
+actually changed). `PROSPER_NO_GUEST_FS=1` reverts to the old wall, confirming this is the enabler.
+Result: boot advances far past the wall into deep guest code.
+
+### Guest allocator + worker threads — SOLVED (lazy-commit + worker trampoline)
+
+The deep crash after `%fs` TLS was two more Linux-parity gaps (fixed on `port/windows-boot-2`, PR #628):
+- **Lazy-commit.** The guest's binned allocator writes into pages inside a range it RESERVED but never
+  explicitly committed. Linux's SIGSEGV handler lazily backs these on first touch; the Windows VEH did
+  not, so allocator init faulted at a reserved page (diagnosed with a `[memclass]` fault classifier that
+  showed the fault address as reserved-but-uncommitted). The VEH now `VirtualAlloc(MEM_COMMIT)`s the
+  64 KiB page on a tracked-reserved fault and retries.
+- **Worker-thread ABI + TLS.** The Windows `pthread_create` path called the guest entry directly via
+  winpthreads: MS-x64 ABI (arg in rcx, guest reads rdi) and no `guest_tls_activate_thread()`. The first
+  worker got a garbage arg and no guest TCB and crashed on a null-derived deref (`mov 0x38(%rbx)`,
+  rbx=0) on an unrecoverable thread. A `win_thread_trampoline` now marshals the SysV entry through
+  `prosper_call_guest_sysv` and activates the worker's guest `%fs` TCB.
+
+### Renderer, WaitOnAddress, positioned I/O, and GPU completion — SOLVED
+
+**SOLVED — the pre-render wedge was a lost wakeup in the Windows `sceKernelWaitOnAddress`.** It had been
+backed by ONE global `std::condition_variable` shared across every waited address, so a guest
+`WakeByAddress(n=1)` → `notify_one()` could wake a waiter parked on a DIFFERENT address (it re-checked its
+own word, found it unchanged, re-slept) while the intended waiter was never woken. That randomly lost
+Unity's job/thread startup handshakes → the boot nondeterministically wedged (2 vs ~45 threads, or a
+worker fault). Re-implemented on the **native Win32 futex** (`WaitOnAddress` / `WakeByAddressSingle` /
+`WakeByAddressAll`, needs `-lsynchronization`), a true per-address wait exactly like the Linux
+`FUTEX_WAIT` path — correct `n=1` semantics, no thundering herd. The boot is now **deterministic** and
+goes far deeper: it spawns the full Unity thread ecosystem (13 `AssetGarbageCollectorHelper`,
+`Job.Worker 0-12`, `Background Job.Worker 0-15`, `Loading.AsyncRead`, `BatchDeleteObjects`) and reaches
+**VideoOut display setup** — `RegisterBuffers2`, "display surface: 1920x1080, 3 buffers registered",
+`ConfigureOutput`, `GetOutputStatus`.
+
+**SOLVED #2 — asset streaming (positioned file IO).** After the WaitOnAddress fix the guest reached
+VideoOut setup then stalled again; root cause: Windows `sceKernelPread`/`Pwrite`/`readv`/`writev`/
+`preadv`/`pwritev` all returned -1 (MinGW has no POSIX `pread`, so they were stubbed). Unity's async
+asset streamer (FileCacher/CachedReader on `Loading.AsyncRead`) reads assets via **positioned reads**, so
+nothing loaded. Backed them with `ReadFile`/`WriteFile` + an `OVERLAPPED` offset (atomic positioned IO,
+thread-safe on a shared fd, full-read loop for the PS5 full-count contract) — #665. `f_read`/`f_write`
+also loop now. (`libSceSystemService::mPpPxv5CZt4` = `sceSystemServiceGetHdrToneMapLuminance` is a benign
+HDR stub returning 0, tracked in #664 — not a blocker.)
+
+### GPU stack-argument fence fields — SOLVED (#672)
+
+The EOP machinery was working; the Windows import trampoline dropped guest stack arguments 7-9. AGC's
+ReleaseMem/WaitRegMem handlers then decoded compiler shadow-space garbage as `data_sel`, `data`,
+`reference`, and `mask`, making the first fence impossible to satisfy. The trampoline now forwards those
+arguments into the standard Microsoft-x64 call slots, Linux's guest-FS stub forwards the same three args,
+and fixed-arity AGC handlers use explicit parameters instead of `__builtin_frame_address` offsets.
+
+Native validation now matches Linux exactly: `ReleaseMem data_sel=2 data=1`, followed by
+`WaitRegMem ref=1 mask=ffffffff`; the `NOT satisfied` message is gone and SubmitDcb #1 completes. Five
+Windows runs then fail consistently at `Il2cpp+0x17d64b` because `il2cpp_init` had already returned false
+and an Il2CppClass global at `Il2cpp+0x268c878` is null. That distinct initialization-parity problem was
+tracked and solved in #673; do not reopen the solved fence-field investigation.
+
+### IL2CPP metadata read — SOLVED (#673)
+
+Windows opened and fstat'd `Media/Metadata/global-metadata.dat` correctly, but the low-level guest fd
+path omitted `O_BINARY`. The Windows CRT consequently treated the first `0x1a` byte as text EOF: a
+10,743,608-byte read returned exactly 440 bytes, the real file's first `0x1a` offset, and
+`il2cpp_init` rejected the truncated metadata. Windows `host_open_flags` now always includes `O_BINARY`;
+a cross-platform HLE regression test reads through embedded `0x1a` and CRLF bytes. `PROSPER_FILELOG=1`
+now records host open results, fd-to-path associations, fstat sizes, and read/pread return counts, which
+made this failure visible without debugger stepping.
+
+Native validation reads all 10,743,608 bytes, no longer prints `unable to initialize il2cpp`, and shows
+the formerly-null global at `Il2cpp+0x268c878` initialized. That exposed the distinct #678 stop-the-world
+blocker described below.
+
+### GC target-thread exception delivery — SOLVED, cooperative on Windows (#678, #690)
+
+IL2CPP installs exception type `0x1e`, then raises it on each target thread to stop the world for GC.
+The first Windows implementation returned success without delivery. The next implementation used
+`SuspendThread`/`SetThreadContext`, but a target commonly stopped inside a native wait. Restoring the
+pre-wake Windows `CONTEXT` after the guest handler then resumed stale `ntdll` state, causing unrelated
+worker crashes and intermittent Blasphemous 2 stalls.
+
+Production Windows delivery is now cooperative. A raise publishes one pending stop for the requested
+winpthreads target and wakes its registered wait. The target accepts the stop at an HLE/wait safe point,
+captures a fresh context there, and calls the guest handler on a dedicated 256 KiB alternate stack. The
+handler returns normally to the wrapper, so no stale native syscall context is restored. Generated import
+stubs also check after every HLE return. `PROSPER_WIN_LEGACY_EXC=1` retains forced context injection only
+for compatibility testing.
+
+The Windows wait registry is nesting-safe. This is required because the guest GC handler itself waits on
+semaphores: its inner wait must not overwrite and unregister the interrupted outer wait. Each nesting level
+owns a separately published slot keyed by native Windows thread id, and condition interruption advances a
+sequence word before `WakeByAddressAll`, making the wake persistent if it lands immediately before
+`WaitOnAddress`. Mutex contention uses a try-lock/checkpoint loop because winpthreads timed locks were
+observed remaining in `WaitForSingleObject` after their deadline.
+
+The first live delivery exposed two more Windows success-no-ops: `sceKernelIsStack` always returned false,
+and `scePthreadAttrGet` never copied the registered worker-stack bounds. The latter made BDWGC abort with
+`Bad stack base in GC_register_my_thread`. Both now use the existing cross-platform stack registry.
+`win_exception_delivery` covers the legacy path, cooperative condition/mutex delivery, queue-before-wait,
+alternate-stack use, AVX/nonvolatile-register preservation, and the nested-wait registration regression.
+`win_kernel_is_stack` covers both direct and winpthreads-handle stack queries. On 2026-07-16 the focused
+suite passed 30 consecutive runs and Blasphemous 2 completed 12/12 ordinary 360-presented-frame Windows
+boots with no stalls or early exits (the separate tiled-compute limitation still blocks its main menu).
+
+(Historical, pre-fix diagnosis retained below for context.)
+
+The live Vulkan renderer builds + initializes on Windows (#655): the whole GPU/Vulkan translation
+layer + `prosper_live_renderer` compile under MinGW (the Vulkan SDK is found via `VULKAN_SDK`), and at
+runtime the live compute + submit renderers register cleanly. With the renderer wired and
+`PROSPER_RENDER=1`, the guest boots into Unity engine init (allocates its pools, spawns
+`AssetGarbageCollectorHelper` threads) and (before the fix above) **idle-waited** (0% CPU).
+
+Diagnosis (via `PROSPER_SYNCLOG` WaitOnAddress logging + `PROSPER_GUEST_ARGS=-force-gfx-direct
+PROSPER_RENDER=1` + gdb thread inventory). **A thread-inventory diff vs Linux localizes the stall
+precisely — it is NOT the later job-dispatch loop, it is the very first GC-helper init handshake:**
+
+- **Linux** (renders 330+ frames, ~37 000 WaitOnAddress wakes) spawns the whole Unity thread ecosystem:
+  13 `AssetGarbageCollectorHelper`, `Job.Worker 0..12` + `Background Job.Worker`, `Loading.PreloadManager`,
+  `Loading.AsyncRead`, `UnityEOPThread`, `GfxFlipThread`, FMOD threads, `BatchDeleteObjects`, ….
+- **Windows** creates only **2 `AssetGarbageCollectorHelper` threads and then deadlocks**: exactly 3
+  guest threads remain, ALL parked in `sceKernelWaitOnAddress` (`*addr==expected==0`, no timeout), ~13
+  total wakes then silence. None of `Job.Worker*`/`PreloadManager`/`AsyncRead`/`GfxFlipThread` is ever
+  created.
+
+**Update — the stall is a RACE, and it wedges on a custom semaphore.** With a validated guest-caller +
+thread-id sync log (the `[sync] T<tid> ... caller=0x...` fields), the stuck waits resolve to a
+Unity/Sony **custom counting semaphore**: `mov $-1,%eax; lock xadd %eax,0x8(%rdi); test %eax,%eax; jle
+<slow>` — decrement a job-count at `[obj+8]`, and if it went ≤0 take the `sceKernelWaitOnAddress` slow
+path (sites `eboot+0x18ab088` job-pool and `eboot+0xae1463`). So workers block acquiring jobs the
+producer never releases. Crucially the boot is **nondeterministic**: different runs reach very different
+depths — sometimes only 2 `AssetGarbageCollectorHelper` threads then wedge, sometimes ~45 guest threads
+(much of the Unity set) then wedge, and sometimes a worker hard-faults (exit 139). That variability
+means a **startup race** in the sync/thread path, not a fixed missing tick. The global-`std::condition_variable`
+`WaitOnAddress` is logically correct under its mutex (no lost wakeup even with the 45-thread thundering
+herd), so suspicion falls on thread-startup ordering / the guest's timing assumptions under our slower
+per-call sync. Linux (real per-address futex) never exhibits this and renders 330 frames.
+
+(Historical framing, still true of the early-wedge runs:) the `AssetGarbageCollectorHelper` thread
+(guest entry `eboot+0xbfbac0`) RUNS on Windows (the worker-thread ABI + `%fs` TLS fixes stopped it
+crashing at `mov 0x38(%rbx)`) but on an early-wedge run never signals main ready. Next step: trace what
+that helper does on Windows vs Linux — which
+`WaitOnAddress`/wake or HLE call it diverges on (its own TLS-derived state, or a wake it should send to
+main that never fires). The coarse Windows `WaitOnAddress` (one global `std::condition_variable`; any
+wake re-checks all waiters) is correct under its mutex (no lost-wakeup) but is a candidate to revisit.
+Diagnostics in place: `PROSPER_SYNCLOG` (`[sync]` WaitOnAddress + `[sync2]` cond/sema/EventFlag),
+`PROSPER_MEMLOG`, `PROSPER_VEHLOG`, boot_trace `[memclass]`.
+
+Windows first-seen unresolved-import messages also include the native thread id and the exact guest
+return address. Set `PROSPER_UNIMPL_STACK=1` to append up to eight executable guest return candidates
+from the call-time stack. This is a low-volume way to identify the managed or engine operation that
+reached a missing Sony API; unlike a later thread snapshot, it records the chain before a worker
+returns to its idle wait loop.
+
+Deferred, lower-priority items (some now done): ~~honor reserve alignment > 64 KiB~~ (done, #658);
+~~worker-thread stack registration for GC bounds~~ (done, #658); ~~preserve phys-offset aliasing in
+the ordinary Windows direct-memory path~~ (done, #691 with one sparse `CreateFileMapping` section and
+shared views); and `PROSPER_CRASHPEEK` guards. The remaining exact 16 KiB placement and partial-unmap
+edge cases are tracked separately in #697.
+
+**What is done (compiles + links, in CI):**
+- **`exec_image_win.cpp`** — the Win32 sibling of `exec_image_linux.cpp` implementing the full
+  `exec_image.hpp` contract: fixed-address guest mapping (`VirtualAlloc` at the guest bases), import
+  stub region, a **Vectored Exception Handler** (VEH) fault handler with SSE4a `INSERTQ`/`EXTRQ`
+  emulation over `CONTEXT.Xmm*`, lazy-ish recovery via a Rip-redirect to a `longjmp` trampoline,
+  `run_entry` (SysV crt0 stack + `jmp`), `run_guest_inits`, the thread-stack registry, and
+  `VirtualQuery`-based region classification. Linux-only diagnostics (perf_event HWBP/HWWATCH, int3
+  `PROSPER_BP`, PEEK/DUMPAT) are intentionally absent.
+- **The SysV⇄MS-x64 ABI boundary** is done in the emitted stub trampoline, NOT via
+  `__attribute__((sysv_abi))` on handlers. The attribute route was tried and **abandoned**: on MinGW
+  it conflicts with SEH-based C++ exception unwinding (`.seh_handlerdata used outside of .seh_proc
+  block`) and cannot be applied to 537 STL-using handlers. Instead `emit_impl` emits a trampoline that
+  converts guest SysV args 1-9 (`rdi rsi rdx rcx r8 r9` plus three guest-stack words) to MS x64
+  (`rcx rdx r8 r9`, stack args 5-9, +32B shadow, aligned call) before calling the handler, which stays a
+  plain MS-x64 C++ function. `test_hle_stack_args` executes the generated stub and verifies every arg,
+  the return value, and handler-entry alignment; `test_agc_submit` pins the real first-fence fields.
+- `guest_tls.cpp` Windows path (guest `%fs` TLS now IMPLEMENTED via FSGSBASE — see above),
+  `boot_program.cpp` enabled on Windows, and the Vulkan-backed `boot_trace` built and runtime-validated
+  on Windows. CI's `Windows MinGW` job builds the whole boot path.
+
+**What is left (runtime work, on a Windows host):**
+1. **Extend native scripted gameplay coverage beyond The Messenger (#683/#688).** The frontend,
+   controller composition, WIC screenshot path, and routed first-level acceptance now work. Add
+   checkpoint automation for more titles as the Windows substrate is exercised more broadly.
+2. **Complete the remaining 16 KiB section-view edge cases (#697).** Direct memory uses one sparse
+   paging-file section, so zero-hint and 64 KiB-congruent mappings alias correctly and Dead Cells no
+   longer corrupts the host heap during physical-range churn (#691). Large-alignment zero-hint maps now
+   reserve an explicitly aligned placeholder with `VirtualAlloc2`, replace it with the shared section via
+   `MapViewOfFile3`, and commit 16 KiB pages on first CPU/GPU access. Guest `VirtualQuery` still reports the
+   direct mapping as committed; untouched host pages carry no commit charge. Dead Cells' 3 GiB, 2 MiB-
+   aligned arena therefore remains physically aliased without one 3 GiB eager private allocation.
+   A per-view bitmap remembers which 16 KiB host pages have been materialized, so repeated renderer
+   reads do not issue `VirtualQuery` for every resource reference. Any tracked map, unmap, or protection
+   change invalidates the bitmap through the guest-mapping generation; set
+   `PROSPER_NO_SPARSE_DMEM_PAGE_CACHE=1` only for an A/B against the query-per-access path. The same
+   generation guards a thread-local positive HLE mapping lookup; disable it independently with
+   `PROSPER_NO_SPARSE_DMEM_ACCESS_CACHE=1`.
+   Exact fixed maps whose virtual and physical 64 KiB deltas differ still use the private fallback, and
+   partial unmap needs a section-aware implementation.
+3. ~~**Validate/repair the guest→HLE ABI trampoline for XMM/float args.**~~ Done (#2955). The bridge
+   is signature-driven: `src/host/abi/` carries the two placement tables and emits the trampoline
+   from the handler's own C++ declaration, which `Hle::register_typed` preserves. A handler with no
+   float still gets the historical fixed integer shuffle, byte for byte.
+   ~~The `printf` family is deliberately NOT converted.~~ Done too (#3246), by a different route,
+   because a `CallSignature` genuinely cannot describe a list the format string decides at run time.
+   Those handlers are now tagged `PROSPER_GUEST_ABI` — really `__attribute__((sysv_abi))` on Windows
+   — and their import stub is the same bare tail-jump Linux uses, so the compiler's own System V
+   variadic prologue captures the guest's frame. `src/host/abi/guest_varargs.cpp` then reads that
+   list by the System V rules and writes the flat 8-byte-slot array that IS a Microsoft `va_list`,
+   which sidesteps the FP-duplication rule rather than trying to satisfy it in registers.
+   The attribute route being "abandoned" (above) still holds for the 537 STL-using handlers: MinGW
+   cannot emit SEH unwind data for a `sysv_abi` frame, so it only works where the frame can be kept
+   free of unwind cleanups. Three tiny capture-and-delegate shims can be; a library of handlers
+   cannot.
+4. **VEH recovery hardening for genuine stack-overflow faults.** #633 added a tested assembly recovery
+   entry with valid Microsoft-x64 shadow space/alignment, but a truly exhausted guest stack still needs
+   a guard-page/dedicated-stack story (Linux uses `sigaltstack`).
+5. ~~**Audit the `(HleFn)`-cast handlers**~~ Done for the floating-point question (#2955): a sweep of
+   `src/hle` for a `float` or `double` in a registered handler's parameter or return list finds 78
+   NIDs — the `libSceFont` scale/slant/weight/render group and the whole libm bank plus
+   `strtod`/`strtof` in `hle_libc.cpp` — and those now register through `Hle::register_typed`. The
+   remaining cast targets pass and return integers and pointers, which both conventions place
+   identically.
+   ~~What is still unaudited is the *other* half of the original question: whether a cast target's
+   argument COUNT exceeds ten, which the fixed path silently truncates.~~ Audited for #3246, and the
+   answer is negative: no registered handler declares more than ten arguments. Handlers are written
+   through per-file `HLE`/`HLE7`/`HLE8`/`HLE9`/`HLE10` macros whose widest member is exactly ten (12
+   uses of `HLE10`; there is no `HLE11`), and the only hand-written wide declarations reach nine.
+   `abi::kLegacyForwardedArgs` records the prologue's capacity beside the emitter that implements it.
+   The audit is a source census, so it goes stale the day someone writes an `HLE11` — the surviving
+   truncation risk is that edit, not anything in the tree today.
+
+### Ruled out — the Windows import trampoline's floating-point arguments
+
+One line per falsified hypothesis, per `CLAUDE.md`. The mechanism and the fix are #2955, with the
+variadic half in #3246.
+
+- **"The `v*` forms take a `va_list` POINTER and are not affected — they copy the guest's list
+  wholesale."** False on Windows, and it was #3246's own opening claim. A Windows `va_list` is a bare
+  `char*`, so `memcpy(&ap, guest_ptr, sizeof(va_list))` copies **eight** bytes of a **twenty-four**
+  byte System V structure and then reads its `{gp_offset, fp_offset}` pair as a pointer. That is not
+  a wholesale copy, it is a type confusion, and it applied to `vsnprintf`, `vsprintf` and `vsscanf`
+  on every Windows boot. Fixed by the same repacking path as the real variadics; the Linux arms are
+  untouched, where the copy really is wholesale and correct.
+- **"`sscanf` is affected."** False, and it is the one row of #3246's affected table that does not
+  hold. Every variadic argument a scanf-family call passes is a POINTER, so the list is all-integer,
+  no floating-point duplication is required, and System V's integer registers map one-for-one onto
+  Microsoft's first ten argument positions — which is exactly what the historical shuffle already
+  delivers. `h_sscanf` is deliberately left on that path rather than converted for symmetry. The cap
+  that remains is the shuffle's ten arguments, recorded rather than fixed.
+- **"A variadic Microsoft x64 call needs each FP argument duplicated into the integer register, so
+  the fix must emit that duplication."** True of the rule and false of the fix. The duplication only
+  matters to code that FORWARDS a variadic call in registers; prosper does not have to. Reading the
+  guest's System V list and writing a Microsoft `va_list` image directly means no register ever
+  carries a variadic floating-point argument on the host side, and the rule never applies.
+- **"`__attribute__((sysv_abi))` cannot be used on a Windows handler at all."** Too strong, though
+  the shape it came from is real. Measured on MinGW GCC 16.1.1 (2026-09-02): a `sysv_abi` variadic
+  function assembles and runs correctly under wine — *unless* its frame needs an unwind cleanup, in
+  which case the assembler rejects `.seh_handlerdata used outside of .seh_proc block`. And that is an
+  **inlining** decision, so the same source compiled at `-O0` and `-O2` and failed at `-O1`, where a
+  throwing callee was inlined into the tagged frame. So the attribute is usable exactly where the
+  frame can be kept cleanup-free, which is why the variadic shims capture and delegate immediately.
+
+- **"Only four handlers are affected, all in `src/hle/util/hle_font.cpp`; nothing else in 700+
+  registered NIDs declares a float parameter."** False — that was #2955's own opening census, and it
+  missed an order of magnitude. `hle_libc.cpp` registers the entire libm bank (`sinf`, `pow`, `fmod`,
+  `ldexpf`, `frexp`, `sincosf`, `modf`, …) plus `strtod`/`strtof` through the same `Hle::register_fn`
+  and therefore the same trampoline: **78** registered NIDs declare a float or double, not four. The
+  census missed them because it grepped for handlers whose *parameter list* mentions `float` in the
+  files it expected to find them in, and the libm thunks are one-liners in a 900-line libc file.
+  Counted by the built binary in `tests/host/abi/test_sysv_ms_bridge.cpp`, which fails if the number
+  is zero rather than trusting a grep.
+- **"An all-float signature is safe, because both conventions place SSE arguments in xmm0.. in
+  order."** True of the ARGUMENTS and false of the call. The trampoline runs a host checkpoint call
+  AFTER the handler returns and saves only `rax` across it, so every float- or double-returning
+  handler — `sinf`, `pow`, `strtof`, all of them — handed the guest whatever that call happened to
+  leave in xmm0. Demonstrated by executing the emitted bytes with a checkpoint that clobbers xmm0:
+  the historical path returns the clobber pattern, the signature-driven path returns the value.
+- **"Adding xmm moves to the positional integer shuffle fixes it."** False by construction and pinned
+  by test: an SSE argument's xmm number under System V is its index among the SSE arguments, and
+  under Microsoft x64 it is its index among ALL arguments. `(handle, float, float)` must move
+  xmm0/xmm1 to xmm1/xmm2, and every integer argument behind a float shifts as well.
+
+### Ruled out — the guest timed-wait family, and its CI
+
+One line per falsified hypothesis, per `CLAUDE.md`. This is the cross-title home for the
+`#3013`/`#3022`/`#3044`/`#3056`/`#3067` family; the *per-primitive* measurements live in those
+issues. Most of it is Windows, because that is where the defects were — but the CI rows at the
+end are macOS/Rosetta, so do not read the section as Windows-only.
+
+- **"Every guest timed wait resolves on the winpthreads master tick."** True of the SLEEP family and
+  of `sem_timedwait`, which is what #3013 measured with a probe outside prosper — and NOT true of the
+  guest **condition** waits, which is where it kept being applied. `interruptible_cond_timedwait` and
+  `interruptible_cond_wait` have had a `#ifdef _WIN32` branch built on **`WaitOnAddress`** since the
+  #678/#690 cooperative-exception work described above; winpthreads' `pthread_cond_timedwait` is only
+  in the POSIX `#else`, which does not compile on Windows at all. So the ~15.6 ms winpthreads tick is
+  not what quantizes `scePthreadCondTimedwait`. #3056's own body says it "still delegates to
+  winpthreads' `pthread_cond_timedwait`"; it does not, and the correction is #3235.
+- **"...so #3056's 2.29x is an arithmetic defect."** It is not. `WaitOnAddress` takes a `DWORD`
+  **millisecond** timeout, and the conversion rounds UP because a condition wait may never report
+  `ETIMEDOUT` before its deadline. The censused 0.818 ms request therefore becomes a 1 ms wait by
+  design, and the remaining ~0.87 ms is the kernel wait's own tick quantization — the trap #3062
+  records, that a kernel wait *timeout* is quantized however precise the requested interval is. The
+  two terms account for the measured 1.870 ms without anything being wrong, so the residue is a
+  primitive choice (#3062) rather than a bug to find.
+- **A relative µs timeout is NOT clock-free.** `scePthreadCondTimedwait`'s interval is spent in the
+  condition variable's own registered clock — `SCE_KERNEL_CLOCK_VIRTUAL`/`_PROF` are process CPU time,
+  not wall time. The Sony spelling hardcoded `CLOCK_REALTIME` while its POSIX sibling resolved the
+  condvar's clock, so one object answered the same question two ways (#3056, fixed in #3235). Neither
+  a realtime nor a monotonic clock can discriminate that in a test, because the old path was
+  self-consistent for both; the virtual clock can, and does.
+- **"The `kernel_sem_timedwait` failure on the macOS/Rosetta job is unresolved between a flaky test
+  and a change to the runner image."** Neither, and it was never open: the FAILING JOB'S OWN LOG
+  names the arm and the number. `[FAIL] and returned inside one winpthreads tick of the request, not
+  after it` / `(timeout took 13.58 ms via none)` — the test's ARM 3 **12 ms wall-clock ceiling**,
+  against a 13.58 ms wait on the path #3044 deliberately left alone: `k_sem_timedwait`'s `#ifndef
+  _WIN32` branch, which on Darwin is `posix_shim.hpp`'s `prosper_sem_timedwait`, i.e. one
+  `pthread_cond_timedwait` against a `CLOCK_REALTIME` deadline (Darwin has no unnamed POSIX
+  semaphores at all). A 5 ms request served in 13.58 ms is that kernel wait's own latency under
+  binary translation on a shared runner, not a prosper defect and not something the branch under
+  test could reach. #3066 had already replaced that ceiling with a 500 ms stub/hang guard and made the
+  MECHANISM arm the discriminator; it merged 2026-08-27 at 08:22 UTC, **49 minutes after** #3067 was
+  filed at 07:33, and nobody joined the two up. Character: **timing-sensitive**, on a bound the
+  file's own header now argues cannot discriminate anything at all. Five consecutive `main` jobs on
+  2026-09-02 pass it. (#3067)
+- **"The 1.02 s and 1.22 s failure durations point at ARM 4 waiting out its one-second timeout."**
+  They point the other way, and the sign is inverted: on that runner EVERY test linking
+  `prosper_core` costs ~1.4 s in process start plus `register_builtin_hle()` — `kernel_nanosleep`
+  1.48 s, `hle_functions_registered` 1.48 s — so `kernel_sem_timedwait` passes in **1.08, 1.20,
+  1.35, 1.47 and 1.52 s** across five green `main` jobs on 2026-09-02. The reported 1.22 s failure
+  sits INSIDE that distribution and the 1.02 s one is below its minimum: the duration carries no
+  signal, and an ARM 4 that ran to its one-second timeout would have read ~2.4 s. Settled outright by
+  the macOS job on the fix's own PR (run `33667200036`), which passes `kernel_sem_timedwait` in
+  **1.02 sec** — the exact duration of one of the two failures the issue was filed on. A ctest
+  per-test duration under binary translation measures startup, not the wait inside it; the second,
+  warm-cache run in the same job reads 0.24 s for the same test. Instrument trap 249. (#3067)
+- **"A green CI job records the margin its timing tests cleared."** It did not, on any platform.
+  `test_kernel_sem_timedwait` prints `(timeout took %.2f ms via %s)` specifically so a margin can be
+  quoted from a log — and every job ran `ctest --output-on-failure`, which prints a test's output
+  only when it FAILS. So the figure existed exactly on the runs where something was already wrong,
+  and the headroom on the green runs either side of a near-miss was unrecoverable without reddening
+  the job first. Fixed by the `timing-margin` ctest label plus a verbose re-run step in the Linux,
+  Windows MinGW and macOS jobs (#3067); `-L <label>` with `--no-tests=error` fails the step if the
+  label is ever dropped, measured at exit 8 versus exit 0 without the flag. First green run carrying
+  the figures (`33667200036`): a 5 ms guest `sem_timedwait` served in 5.06 ms on Linux, **5.32 ms
+  via `win32-high-resolution-timer`** on Windows — #3044's fix observed on CI rather than on one
+  developer's box — and **45.73 ms** on Rosetta, 10.9x inside its 500 ms bound. The same run shows
+  `kernel_cond_timedwait_clock`'s 20 ms arm taking **156.18 ms** on Rosetta, a 7.8x overshoot that
+  leaves 12.8x against its 2 s bound: comfortable, much less comfortable than a 2 s bound reads, and
+  previously unmeasured anywhere.
+
+- **"`sleep_full` is on the winpthreads tick, and its `select`/`pselect` callers truncate the guest
+  timespec through a 32-bit host `long`."** BOTH halves held on `origin/main` at `637e65f9`, and
+  they are not the same kind of defect. The tick half was real and is fixed (#3038): `sleep_full`
+  was the last guest sleep still on a bare `nanosleep`, so an inter-pass sleep of a few
+  milliseconds through `select(0, NULL, NULL, NULL, &tv)` — the idiom #1660 caught live — was
+  served in ~15.6 ms on Windows. The truncation half is real *as written* and its practical
+  consequence is **smaller than it reads**: every LEGAL value fits in 32 bits of nanoseconds
+  (`tv_nsec < 1e9`, `tv_usec * 1000 < 1e9`), so no in-range guest value was ever mis-served by it
+  on any platform. What it actually produced was a platform DIVERGENCE on out-of-range input —
+  Windows re-mapped such a value back INTO range and slept a wrong short interval (a `tv_usec` of
+  4,294,968, i.e. 4.29 s, became 704 ns), where Linux refused it. Do not quote it as a live
+  wrong-duration defect for any observed title; the platform-independent consequence of the same
+  expression is the other one, that `tv_usec * 1000` was a signed multiply on a guest-controlled
+  `int64_t` with no prior range check.
+- **"Saturating a guest-supplied interval to `UINT64_MAX` is a safe upper clamp."** It was not, and
+  the guard handed back its own failure mode: `sleep_until_steady_ns` takes an unsigned nanosecond
+  deadline while its POSIX backend converts to `std::chrono::nanoseconds`, whose rep is **signed**,
+  so any deadline past `INT64_MAX` wrapped into the past and the sleep returned **instantly**.
+  Measured on Linux/glibc before the fix — `sleep_until_steady_ns(INT64_MAX + 1)` and
+  `sleep_until_steady_ns(UINT64_MAX)` both returned in 0 ms — so a 584-year request became a busy
+  spin, which is exactly the short sleep the saturation exists to prevent, and on the
+  `select`/`pselect` path it is #1660's defect verbatim. Windows was already correct here (its
+  backend's arithmetic is unsigned throughout and its millisecond safety net saturates to
+  `INFINITE`). Fixed in #3038 by clamping the deadline to `INT64_MAX` in the POSIX backend; the
+  same probe then blocks past a 20 s bound instead of returning at 0 ms.
+
+**Reproducing the local compile loop (macOS → Windows):** `brew install mingw-w64`, then
+`cmake -S prosper -B build-win -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc
+-DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ -DCMAKE_SYSTEM_NAME=Windows
+-DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE` and `cmake --build build-win`. A Windows agent builds
+natively under MSYS2/UCRT64 exactly as the CI `Windows MinGW` job does.
+
+## Proposed sequence
+
+1. **Spikes (hours each, no commitment):**
+   0. Build `gpu_replay` + `render_runner` arm64-native on macOS against MoltenVK and replay a
+      Linux-made `.prgcap` — validates the whole GPU stack on Apple with zero substrate work
+      (see *Tooling portability*).
+   a. On this M2 MacBook: a 100-line x86_64 Darwin probe under Rosetta — `MAP_FIXED` at
+      `0x400000000`, RWX anon map + self-modifying jump, `wrfsbase`/`rdfsbase`, catchable
+      SIGILL on `INSERTQ`, `os_sync_wait_on_address`. This answers every macOS unknown at once.
+   b. On Windows: the FS-base persistence probe (spin thread + `wrfsbase` + verify).
+2. **Refactor seams (no behavior change on Linux):** extract `host_mem`/`host_futex`/
+   `host_fault`/`host_hwbp`; replace `UNIX AND NOT APPLE` CMake gates with capability checks;
+   make `hle_kernel_mem.cpp`/`hle_kernel.cpp` use the shims.
+3. **macOS port:** `exec_image_darwin.cpp`, x86_64 preset, MoltenVK + SDL3 frontend. Exit
+   criterion: the pure test suite + a dump-gated boot test green under Rosetta on this laptop.
+4. **Windows native hardening:** keep extending gameplay coverage beyond the completed substrate,
+   then address physical-memory aliasing and remaining VEH edge cases. (XMM import arguments are
+   done — #2955.)
+5. **Android packaging:** Box64 + rootfs + Turnip APK, Kotlin shell. After macOS/Windows ship.
+6. **Hedge track (background):** validate the Linux-VM-on-macOS route (Rosetta-for-Linux or
+   FEX/muvm + Venus) before macOS 28 removes general Rosetta.
+
+## Sources
+
+- Rosetta deprecation: [Apple to Phase Out Rosetta 2 Starting With macOS 28](https://www.macrumors.com/2025/06/10/apple-to-phase-out-rosetta-2/), [AppleInsider timeline](https://appleinsider.com/articles/26/06/12/how-and-when-macos-will-finally-stop-support-for-intel-apps), [macOS 26.4 user notices](https://9to5mac.com/2026/02/16/macos-26-4-will-notify-users-of-rosetta-2-discontinuation/)
+- Rosetta AVX2 (macOS 15): [Apple docs](https://developer.apple.com/documentation/apple-silicon/about-the-rosetta-translation-environment), [Stockfish AVX2-under-Rosetta issue](https://github.com/official-stockfish/Stockfish/issues/5707), [rosetta2_avx_dive](https://github.com/carsongoodwin32/rosetta2_avx_dive)
+- Rosetta for Linux VMs: [Apple Virtualization docs](https://developer.apple.com/documentation/Virtualization/running-intel-binaries-in-linux-vms-with-rosetta), [implementation notes](https://blog.inoki.cc/2026/02/28/Apple-Rosetta-Linux-VM-Secret-en/)
+- FEX: [fex-emu.com](https://fex-emu.com/) (AVX2 supported), [4 KB-page requirement / muvm](https://fedoraproject.org/wiki/Changes/FEX), [Android is not a target (FAQ)](https://wiki.fex-emu.com/index.php/FAQ), [FEXDroid](https://github.com/gamextra4u/FEXDroid)
+- Box64: [16 KB page support in 0.2.8](https://www.phoronix.com/forums/forum/hardware/processors-memory/1466148-box64-0-2-8-released-with-support-for-16k-page-size-allowing-games-on-apple-silicon), [Winlator](https://github.com/brunodev85/winlator)
+- MoltenVK: [State of Vulkan on Apple, Jan 2026 (LunarG)](https://www.lunarg.com/the-state-of-vulkan-on-apple-jan-2026/), [robustBufferAccess not enforced](https://github.com/KhronosGroup/MoltenVK/issues/2447)
+- Android 16 KB pages: [Android developer guide](https://developer.android.com/guide/practices/page-sizes), [Play requirement](https://android-developers.googleblog.com/2025/05/prepare-play-apps-for-devices-with-16kb-page-size.html)
+- Segment registers per OS: [merryhime's fs/gs notes](https://gist.github.com/merryhime/f22e75d5128c07d77630ca01c4272937)
