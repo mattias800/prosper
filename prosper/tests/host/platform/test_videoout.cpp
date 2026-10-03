@@ -505,6 +505,39 @@ TEST(Videoout, Contract) {
     CHECK(prosper_vo_buffer_addr(0) == (uint64_t)(uintptr_t)fb0 &&
           prosper_vo_buffer_addr(2) == (uint64_t)(uintptr_t)fb2, "registry recorded each framebuffer address");
 
+    // #4275: SubmitChangeBufferAttribute2 re-describes an EXISTING set's buffers. Unregistered, it
+    // answered SCE_OK and applied nothing. Hollow Knight: Silksong re-submits set 0's attribute.
+    {
+        auto change = Hle::lookup("HuViW4HnrOw");   // SubmitChangeBufferAttribute2
+        CHECK(change != nullptr, "sceVideoOutSubmitChangeBufferAttribute2 is registered");
+        if (change) {
+            uint8_t changed[0x50];
+            memcpy(changed, attr, sizeof changed);
+            const uint64_t other_fmt = fmt ^ 0x1ull;
+            memcpy(changed + 0x20, &other_fmt, sizeof other_fmt);
+            CHECK(change(handle, 0, (uint64_t)(uintptr_t)changed, 0, 0, 0) == 0,
+                  "a format change for a registered set is accepted");
+            CHECK(prosper_vo_display_format() == other_fmt,
+                  "the display's pixel format follows the submitted attribute");
+            CHECK(change(handle, 0, (uint64_t)(uintptr_t)attr, 0, 0, 0) == 0 &&
+                      prosper_vo_display_format() == fmt,
+                  "re-submitting the registered attribute restores it");
+            uint8_t resized[0x50];
+            memcpy(resized, attr, sizeof resized);
+            const uint32_t other_width = 1280;
+            memcpy(resized + 0x0c, &other_width, sizeof other_width);
+            CHECK((uint32_t)change(handle, 0, (uint64_t)(uintptr_t)resized, 0, 0, 0) == 0x80290001u &&
+                      prosper_vo_display_width() == 1920,
+                  "a geometry change is refused and leaves the registration intact");
+            CHECK((uint32_t)change(handle, 2, (uint64_t)(uintptr_t)attr, 0, 0, 0) == 0x8029000au,
+                  "an unregistered set is refused");
+            CHECK((uint32_t)change(handle, 4, (uint64_t)(uintptr_t)attr, 0, 0, 0) == 0x8029000au,
+                  "a set outside 0..3 is refused");
+            CHECK((uint32_t)change(handle, 0, 0, 0, 0, 0) == kInvalidAddress,
+                  "a null attribute is refused");
+        }
+    }
+
     // A set identifier owns one registration until it is unregistered. Rejecting the duplicate
     // must happen before any slot is changed, even when the proposed range itself is free.
     uint8_t fb4a[16], fb5a[16];

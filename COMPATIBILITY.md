@@ -19,7 +19,7 @@ see [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md), which is **generated from the 
 and kept in step with them by CI. Neither file is authoritative over a tracker; when this page and
 a tracker disagree, the tracker wins.
 
-Last updated: 2026-10-01
+Last updated: 2026-10-03
 
 ## Summary
 
@@ -87,6 +87,7 @@ Last updated: 2026-10-01
 | *Onimusha: Way of the Sword* | `PPSA27836` | — | 🔬 Rung 0 — direct-memory batch mapping fails, then the main guest thread faults at address `0x10`; no frame is presented | [#4022](https://github.com/mattias800/prosper/issues/4022) |
 | *Hades II* | `PPSA36082` | — | 🔬 Rung 0 — startup requests an approximately 32 GiB guest allocation, which is rejected; the main guest thread then faults at a null address, before any frame | [#4023](https://github.com/mattias800/prosper/issues/4023) |
 | *SILENT HILL 2* | `PPSA08709` | Unreal Engine | 🚧 Rung 2 — the owner previously selected New Game. A fresh normal rerun renders first-boot setup through settings-saved Continue, then retains that image while host presents advance; correct title-background rendering remains unverified. The earlier later-sequence GPU timeout is separate ([#4025](https://github.com/mattias800/prosper/issues/4025)) | [#4024](https://github.com/mattias800/prosper/issues/4024) |
+| *Hollow Knight: Silksong* | `PPSA12544` | Unity 6 | 🚧 Opening Moss Grotto gameplay, played and confirmed by eye by the owner; every menu and in-game string renders since #4120 | [#4121](https://github.com/mattias800/prosper/issues/4121) |
 
 ## At a glance
 
@@ -100,12 +101,12 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 
 | Where the title stops | Titles |
 | --- | --- |
-| **Gameplay reached**, with the scene rendering (rung 3 or better) | 28 |
+| **Gameplay reached**, with the scene rendering (rung 3 or better) | 29 |
 | **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 19 |
 | **Below a title screen** — logo or splash only (rung 1) | 2 |
 | **Boots, but no frame with content** (rung 0) | 12 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
-| Total tracked | 61 |
+| Total tracked | 62 |
 
 Every figure above is re-derived from the rows each time this table is touched, and the buckets now
 sum to the total. They did not before: **rung 0 had no row at all**, so the titles that boot and
@@ -843,6 +844,17 @@ recorded in the [tracker update](https://github.com/mattias800/prosper/issues/40
 <p align="center"><img src="assets/screenshots/silent-hill-2-setup-gamma-preview-2026-10-01.webp" alt="Silent Hill 2 — supplied gamma preview images, not gameplay"></p>
 <p align="center"><img src="assets/screenshots/silent-hill-2-setup-settings-summary-2026-10-01.webp" alt="Silent Hill 2 — first-boot settings summary"></p>
 <p align="center"><img src="assets/screenshots/silent-hill-2-setup-settings-saved-2026-10-01.webp" alt="Silent Hill 2 — settings-saved Continue, the retained final image"></p>
+
+## Hollow Knight: Silksong — `PPSA12544`
+
+<p align="center"><img src="assets/screenshots/silksong-moss-grotto.webp" alt="Hollow Knight: Silksong — Hornet in Moss Grotto under the area title"></p>
+<p align="center"><img src="assets/screenshots/silksong-title-menu.webp" alt="Hollow Knight: Silksong — title menu with Start Game, Options and Extras"></p>
+<p align="center"><img src="assets/screenshots/silksong-inventory.webp" alt="Hollow Knight: Silksong — inventory with Hunter's Cloak"></p>
+
+The owner plays the opening in Moss Grotto and confirms it by eye; nine of the owner's snaps from
+that session replay as the `silksong` guard (`tools/snapshot/snaps.py check silksong`). See the
+[tracker](https://github.com/mattias800/prosper/issues/4121) and
+[`prosper/docs/games/SILKSONG_STATUS.md`](prosper/docs/games/SILKSONG_STATUS.md).
 
 ## Reproducible routes
 

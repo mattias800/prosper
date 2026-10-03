@@ -1,0 +1,115 @@
+{
+  "det_clock": "off",
+  "det_fps": 60,
+  "dump": "PPSA12544-app0",
+  "flip_window": 900,
+  "min_structural_similarity": 0.85,
+  "name": "silksong",
+  "route": "prosper/scripts/silksong/route.pad",
+  "savedata": "fresh",
+  "snaps": [
+    {
+      "distinct_colors": 11927,
+      "height": 1080,
+      "index": 0,
+      "luma16x9": "00000000010305080a080905040301000000000002125452535a200705060100000000011e74497158675f11060a0100000301031c81577b707b5a3d0d070100000102060c1234333336120d10050100030406090f1923363320160f2808010007080b111d23292c32251d16280602010e33221f29323a393630261c280a050221252c3740474a4a463d2f241f190f08",
+      "mode": "anchor",
+      "nonblack_ratio": 0.515725,
+      "pad_flip": 1002,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 9391,
+      "height": 1080,
+      "index": 1,
+      "luma16x9": "00000000010406081619070904040200000200020606192127250a080503010000293f370a2b0b0e250e0c121b03010000193330082a101214110e0a0704010000233835273b1d1a1726170c081c0200020c3c3a12251d341e1c150f0a050100060f3c413826274729241f2313071a000e14172029323737342e261b110b05021e2c2f363f474c4b473e34291c130d08",
+      "mode": "anchor",
+      "nonblack_ratio": 0.574043,
+      "pad_flip": 1296,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 6756,
+      "height": 1080,
+      "index": 2,
+      "luma16x9": "73240001020409080b080805040301010f0000010406090a0f0b0907070302010000000206080c0d0d0f0c08060402010000010408102225291a110a07060202000403070e1315151713130d080702000409100c121d2d291b19140f0a090600070a0d191b23242823211a130f0703010f141b23282f3242362b231c130b06071e262e383e444647433b35281e152164",
+      "mode": "anchor",
+      "nonblack_ratio": 0.523125,
+      "pad_flip": 1551,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 25130,
+      "height": 1080,
+      "index": 3,
+      "luma16x9": "0000000003060d111819161208020101070000020f27225b5d5a463816030100080200082c5262767c6d4b431f03010000000109496a7b827d653f421d04010000010207203c555d5a4432411c0401000203050a1218292a2c271d110b050100060912121a292e2f2c311e190e0907000f12172028313646382f251c110a05021f262c363f474949454036291d130d09",
+      "mode": "anchor",
+      "nonblack_ratio": 0.57527,
+      "pad_flip": 1767,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 45189,
+      "height": 1080,
+      "index": 4,
+      "luma16x9": "031805172a415c7b8d9171533e1c0600010804172d3e557681817b513b1f0a0100011614293950779e8766533a1c140a0b10141f2d3655798480885b3b2519150d181c2c342c4d809f76765f422d2c161b252b383f45657a755f5b4b3c16280d0a24332f4f5d7d7e817d6e55513d190a1c2035436984896d736756494c25150602030b183647382a1d16090f0f040000",
+      "mode": "anchor",
+      "nonblack_ratio": 0.803773,
+      "pad_flip": 5220,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 45146,
+      "height": 1080,
+      "index": 5,
+      "luma16x9": "0318151c2a415c7b8d9172533e1c060001080a1a2d3e557681817b513b1f0a0100011614293950779e8667533a1c140a0b10141e2d3654788480885b3b2519150e181c2b342e4c7f9f76775f422d2c161b272c393e45667978625b4b3b16290d0b24322f4f5d7d8d83796f56533b190a1c213643698488736069574c4c25150602030b183646362a1d160a0f0f040000",
+      "mode": "anchor",
+      "nonblack_ratio": 0.803171,
+      "pad_flip": 5774,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 38130,
+      "height": 1080,
+      "index": 6,
+      "luma16x9": "071e1a11110d13040f010100000000000710121012173e344e401b0f0a000000070c1121353e36444a37353f1b1405000c121826396277656463424b242e25121319232b346a798992825e3e1f292d26161d293041546979768b7a2d332c2a4018212f3f4a5877645366643b433b2f411e29393e4b593e402b212b161c280c072737373a4438361a120e070000000000",
+      "mode": "anchor",
+      "nonblack_ratio": 0.689113,
+      "pad_flip": 6707,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 3626,
+      "height": 1080,
+      "index": 7,
+      "luma16x9": "0105050303020300030000000000000001020303030404050704050201000000010203030305070b0e0607070203000002030405080e26343d26080a05080703030406080911121a21140e0c05070807040507090c101734382118080908080c0405090c0e1117131014130b0d0b090c05080b0b0e110b0c0806080808080201070a0a0b0d0b09050303010000000000",
+      "mode": "anchor",
+      "nonblack_ratio": 0.258719,
+      "pad_flip": 7420,
+      "verdict": "correct",
+      "width": 1920
+    },
+    {
+      "distinct_colors": 42383,
+      "height": 1080,
+      "index": 9,
+      "luma16x9": "061e1f100f161e24232a23111813080c061111111922222c363e3c331b1f1d100d111617232c394a5d655a493d3232151d2126292e3f505f797e6851413a2c28242725313b4e68727c816f5e5b3c3930222625223751707e5e6b6768633a2f292426282d365176905f584c644e3726131520282a37517d956161555820100400181f2d354b566a5942371c0900000000",
+      "mode": "anchor",
+      "nonblack_ratio": 0.849761,
+      "pad_flip": 9220,
+      "verdict": "correct",
+      "width": 1920
+    }
+  ],
+  "timeout": 3600,
+  "title_id": "PPSA12544",
+  "window_samples": 7,
+  "review": "2026-10-03: authored by the owner in one play session (10 F6 snaps, all correct) on the #4120/#4273/#4274/#4275 branch, Linux/RADV. Snap 8 (the inventory, flip 8678) was dropped: on replay the route reaches the pause menu with the cursor on Options instead of opening the inventory, so its best match sat at the edge of the +/-900-flip window. That is input-route drift, not a rendering difference; both frames render their text correctly. The other nine replay at SSIM 0.996-1.000."
+}

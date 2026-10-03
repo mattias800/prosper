@@ -90,3 +90,124 @@ TEST(StorageImageCopy, Contract) {
     }
 
 }
+
+// A storage image's T# DST_SEL routes image_store VDATA too: the stored channel c receives the
+// component whose selector names c. Hollow Knight: Silksong's dynamic-font glyph upload stores into
+// an Alpha8 atlas with DST_SEL = (0,0,0,X), so the glyph travels in .w; storing VDATA unrouted wrote
+// .x (zero) and left every menu string blank (#3549). Same kernel and harness as the copy above,
+// with only the destination descriptor's selector changed.
+namespace {
+
+const uint32_t kCopyKernel[] = {
+    0x7E080300u, 0xF0000F00u, 0x00000004u, 0xBF8C3F70u, 0xF0200F00u, 0x00020004u, 0xBF810000u,
+};
+
+std::vector<uint32_t> compile_copy(const uint32_t (&dst_sel)[4], uint32_t dst_components,
+                                   const uint32_t (&src_sel)[4] = {4, 5, 6, 7}) {
+    ShaderResourceTable rt;
+    ShaderResource src{};
+    src.cls = ResourceClass::StorageImage; src.img_dim = 0; src.binding = 4; src.sgpr_base = 0;
+    for (uint32_t k = 0; k < 4; ++k) src.swizzle[k] = src_sel[k];
+    rt.resources.push_back(src);
+    ShaderResource dst{};
+    dst.cls = ResourceClass::StorageImage; dst.img_dim = 0; dst.binding = 5; dst.sgpr_base = 8;
+    dst.num_components = dst_components;
+    for (uint32_t k = 0; k < 4; ++k) dst.swizzle[k] = dst_sel[k];
+    rt.resources.push_back(dst);
+    return recompile_valu(kCopyKernel, sizeof(kCopyKernel) / sizeof(kCopyKernel[0]), 1, 0, &rt);
+}
+
+std::vector<uint32_t> distinct_texels(uint32_t width) {
+    std::vector<uint32_t> texels(width * 4);
+    for (uint32_t i = 0; i < width; ++i) {
+        texels[i * 4 + 0] = 0xA0000000u + i;
+        texels[i * 4 + 1] = 0xB0000000u + i;
+        texels[i * 4 + 2] = 0xC0000000u + i;
+        texels[i * 4 + 3] = 0xD0000000u + i;
+    }
+    return texels;
+}
+
+}  // namespace
+
+TEST(StorageImageCopy, AlphaOnlySelectorStoresTheWComponent) {
+    const uint32_t sel[4] = {0, 0, 0, 4};   // SQ_SEL_0, 0, 0, X: Unity's Alpha8 descriptor
+    const std::vector<uint32_t> spv = compile_copy(sel, 1);
+    ASSERT_FALSE(spv.empty()) << "a one-channel destination named by .w must compile";
+    const uint32_t W = 64;
+    const std::vector<uint32_t> src = distinct_texels(W);
+    const std::vector<uint32_t> dst = prosper::test::run_image_copy(spv, W, src);
+    ASSERT_EQ(dst.size(), src.size());
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < W; ++i) bad += dst[i * 4 + 0] != src[i * 4 + 3];
+    EXPECT_EQ(bad, 0u) << "stored channel X must receive VDATA.w; texel0 X=0x" << std::hex
+                       << dst[0];
+}
+
+TEST(StorageImageCopy, PermutedSelectorStoresTheInverse) {
+    const uint32_t sel[4] = {6, 5, 4, 7};   // Z, Y, X, W: BGRA order
+    const std::vector<uint32_t> spv = compile_copy(sel, 4);
+    ASSERT_FALSE(spv.empty());
+    const uint32_t W = 64;
+    const std::vector<uint32_t> src = distinct_texels(W);
+    const std::vector<uint32_t> dst = prosper::test::run_image_copy(spv, W, src);
+    ASSERT_EQ(dst.size(), src.size());
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < W; ++i) {
+        bad += dst[i * 4 + 0] != src[i * 4 + 2];
+        bad += dst[i * 4 + 1] != src[i * 4 + 1];
+        bad += dst[i * 4 + 2] != src[i * 4 + 0];
+        bad += dst[i * 4 + 3] != src[i * 4 + 3];
+    }
+    EXPECT_EQ(bad, 0u) << "channel c receives the component whose selector names c";
+}
+
+TEST(StorageImageCopy, UnnamedStoredChannelIsRefused) {
+    // Every stored channel of a four-channel format must be named by some selector. W here is
+    // SQ_SEL_1, which supplies nothing on a store, so the store is refused rather than guessed.
+    const uint32_t constant_w[4] = {4, 5, 6, 1};
+    EXPECT_TRUE(compile_copy(constant_w, 4).empty());
+    // The same selector over a three-channel format names every stored channel.
+    EXPECT_FALSE(compile_copy(constant_w, 3).empty());
+    // Two selectors naming one channel, and the reserved SQ_SEL 2, are both undecodable.
+    const uint32_t duplicate[4] = {4, 4, 6, 7};
+    EXPECT_TRUE(compile_copy(duplicate, 4).empty());
+    const uint32_t reserved[4] = {4, 5, 2, 7};
+    EXPECT_TRUE(compile_copy(reserved, 4).empty());
+}
+
+// #4274: a storage image's DST_SEL routes image_load too, forward: returned channel k takes the
+// stored component its selector names, or the constant 0 / 1. With the store routing above, the
+// same descriptor on both sides of a copy round-trips.
+TEST(StorageImageCopy, LoadSelectorRoutesForwardWithConstants) {
+    const uint32_t identity[4] = {4, 5, 6, 7};
+    const uint32_t src_sel[4] = {1, 0, 5, 4};   // 1, 0, Y, X
+    const std::vector<uint32_t> spv = compile_copy(identity, 4, src_sel);
+    ASSERT_FALSE(spv.empty());
+    const uint32_t W = 64;
+    const std::vector<uint32_t> src = distinct_texels(W);
+    const std::vector<uint32_t> dst = prosper::test::run_image_copy(spv, W, src);
+    ASSERT_EQ(dst.size(), src.size());
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < W; ++i) {
+        bad += dst[i * 4 + 0] != 0x3f800000u;   // SQ_SEL_1 on a non-integer format: float 1.0
+        bad += dst[i * 4 + 1] != 0u;            // SQ_SEL_0
+        bad += dst[i * 4 + 2] != src[i * 4 + 1];
+        bad += dst[i * 4 + 3] != src[i * 4 + 0];
+    }
+    EXPECT_EQ(bad, 0u) << "texel0 = " << std::hex << dst[0] << " " << dst[1] << " " << dst[2]
+                       << " " << dst[3];
+}
+
+TEST(StorageImageCopy, AlphaOnlyDescriptorRoundTrips) {
+    const uint32_t alpha8[4] = {0, 0, 0, 4};
+    const std::vector<uint32_t> spv = compile_copy(alpha8, 1, alpha8);
+    ASSERT_FALSE(spv.empty());
+    const uint32_t W = 64;
+    const std::vector<uint32_t> src = distinct_texels(W);
+    const std::vector<uint32_t> dst = prosper::test::run_image_copy(spv, W, src);
+    ASSERT_EQ(dst.size(), src.size());
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < W; ++i) bad += dst[i * 4 + 0] != src[i * 4 + 0];
+    EXPECT_EQ(bad, 0u) << "stored X must survive an Alpha8 load -> store copy";
+}

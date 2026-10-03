@@ -531,7 +531,9 @@ uint64_t videoout_content_digest(uint64_t address, size_t bytes) {
 // mechanism must never fail in. It holds because both sides compute width*height*4 from the same
 // `DisplayConfig::SetConfig`: a set is whole-assigned only at register (guarded against an occupied
 // slot) and cleared at unregister, so the geometry is immutable for the life of a generation, and
-// SetBufferAttribute(2) writes the caller's struct rather than the registry. Anything that makes a
+// SetBufferAttribute(2) writes the caller's struct rather than the registry. The one registry
+// mutator, SubmitChangeBufferAttribute2, changes only format and tiling and refuses a geometry
+// change for exactly this reason. Anything that makes a
 // registered set's dimensions mutable breaks this and must re-seed the baseline.
 // #2071: the guest_readable() below is the authorship baseline's gate, and it runs for EVERY
 // registered buffer on EVERY sceVideoOutRegisterBuffers, while holding g_display_mx -- the lock
@@ -1377,6 +1379,50 @@ HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a
     return 0;
 }
 
+// sceVideoOutSubmitChangeBufferAttribute2 (HuViW4HnrOw): (handle, set_index, const
+// VideoOutBufferAttribute2*). Live shape (Hollow Knight: Silksong, PPSA12544): handle 0x1001, set 0,
+// and the same 0x50-byte attribute RegisterBuffers2 takes -- 1920x1080, format 0x8000000022000000,
+// tiling 0 -- re-submitted for its already-registered set. It changes how an EXISTING set's buffers
+// are interpreted: pixel format and tiling. The buffers' memory was sized for the registered
+// geometry, so a width/height change is refused rather than applied; that also keeps the
+// authorship-digest invariant above (geometry immutable for the life of a generation) true.
+//   invalid handle                 -> INVALID_HANDLE        null attribute -> INVALID_ADDRESS
+//   set outside 0..3 or unregistered -> INVALID_INDEX       geometry change -> INVALID_VALUE
+// It was unregistered, so the dispatcher answered SCE_OK and applied nothing. Applied immediately:
+// prosper reads the attributes when it presents, so "at the next flip" and "now" are the same moment.
+// CONFIDENCE: HIGH for the shape (live), MED for the refusal codes (the family RegisterBuffers2
+// already returns).
+HLE(g_vo_submit_change_buffer_attribute2) {
+    vo_argtrace("SubmitChangeBufferAttribute2", a0,a1,a2,a3,a4,a5);
+    VideoOutHandleGuard handle(a0);
+    if (!handle.valid()) return kVoErrorInvalidHandle;
+    const int set = (int)a1;
+    if (set < 0 || set > 3)
+        return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
+    if (!a2)
+        return (uint64_t)(int64_t)(int32_t)0x80290002;  // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    const uint8_t* attr = (const uint8_t*)(uintptr_t)a2;
+    const uint32_t width = *(const uint32_t*)(attr + 0x0c);
+    const uint32_t height = *(const uint32_t*)(attr + 0x10);
+    const uint64_t pixel_format = *(const uint64_t*)(attr + 0x20);
+    const uint32_t tiling_mode = *(const uint32_t*)(attr + 0x04);
+    std::lock_guard<std::mutex> lk(g_display_mx);
+    DisplayConfig::SetConfig& config = g_display.sets[set];
+    if (!config.registered)
+        return (uint64_t)(int64_t)(int32_t)0x8029000a;  // SCE_VIDEO_OUT_ERROR_INVALID_INDEX
+    if (width != config.width || height != config.height)
+        return (uint64_t)(int64_t)(int32_t)0x80290001;  // SCE_VIDEO_OUT_ERROR_INVALID_VALUE
+    config.pixel_format = pixel_format;
+    config.tiling_mode = tiling_mode;
+    // The display-wide description follows the most recent registration; a change to the set that
+    // registration described moves it too.
+    if (g_display.width == width && g_display.height == height) {
+        g_display.pixel_format = pixel_format;
+        g_display.tiling_mode = tiling_mode;
+    }
+    return 0;
+}
+
 // sceVideoOutUnregisterBuffers (N5KDtkIjjJ4): release every slot owned by one attribute set.
 // RegisterBuffers2 may place independent sets in disjoint ranges, so retain the other sets and
 // recompute the highest visible slot instead of clearing the entire display unconditionally.
@@ -1727,6 +1773,7 @@ void register_graphics_hle() {
     RN("Nv8c-Kb+DUM", g_vo_is_output_supported);   // sceVideoOutIsOutputSupported
     RN("PjS5uASwcV8", g_vo_set_buffer_attribute2);  // sceVideoOutSetBufferAttribute2
     RN("rKBUtgRrtbk", g_vo_register_buffers2);       // sceVideoOutRegisterBuffers2
+    RN("HuViW4HnrOw", g_vo_submit_change_buffer_attribute2); // sceVideoOutSubmitChangeBufferAttribute2
     RN("N5KDtkIjjJ4", g_vo_unregister_buffers);      // sceVideoOutUnregisterBuffers
     RN("OcQybQejHEY", g_vo_get_buffer_label_address); // sceVideoOutGetBufferLabelAddress (#394 F4)
     RN("utPrVdxio-8", g_vo_get_output_status);        // sceVideoOutGetOutputStatus

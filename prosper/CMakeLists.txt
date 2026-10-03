@@ -836,6 +836,11 @@ if(TARGET prosper_core)
   endif()
 
   # Split-T# provenance proof (#4197): pure decoder/fold cases, no dump.
+  # #4120/#4274: storage-image DST_SEL routing rules (pure).
+  prosper_add_gtest(test_storage_dst_sel
+    SOURCES tests/gpu/recompiler/test_storage_dst_sel.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_split_t8_dataflow
     SOURCES tests/gpu/recompiler/test_split_t8_dataflow.cpp
     INCLUDES src
@@ -1429,6 +1434,11 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_savedata_ime
     SOURCES tests/hle/test_savedata_ime.cpp
     INCLUDES tests
+    LIBRARIES prosper_core)
+
+  # #4275: NP Universal Data System property objects/arrays and SessionSignaling init.
+  prosper_add_gtest(test_np_uds_properties
+    SOURCES tests/hle/np/test_np_uds_properties.cpp
     LIBRARIES prosper_core)
 
   # The save's parameter block (#2786): sceSaveDataSetParam/GetParam were unregistered, so both
@@ -2608,6 +2618,12 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/diagnostics/test_link_list_census.cpp
     LIBRARIES prosper_core)
 
+  # #4273: each distinct refused shader is kept by default, bounded and deduplicated.
+  prosper_add_gtest(test_refused_shader_dump
+    SOURCES tests/gpu/diagnostics/test_refused_shader_dump.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_shader_dump_filter
     SOURCES tests/gpu/diagnostics/test_shader_dump_filter.cpp
     LIBRARIES prosper_core)
@@ -3243,6 +3259,11 @@ endif()
   add_executable(test_fragment_float_flags tests/gpu/state/test_fragment_float_flags.cpp)
   target_link_libraries(test_fragment_float_flags PRIVATE prosper_core)
   add_test(NAME fragment_float_flags COMMAND test_fragment_float_flags)
+  # #3549: a storage-image or format-fetch DST_SEL is part of the compiled-shader key.
+  prosper_add_gtest(test_shader_key_dst_sel
+    SOURCES tests/gpu/execute/test_shader_key_dst_sel.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
   add_executable(test_fragment_float_flags_key tests/gpu/execute/test_fragment_float_flags_key.cpp)
   target_link_libraries(test_fragment_float_flags_key PRIVATE prosper_core)
   add_test(NAME fragment_float_flags_key COMMAND test_fragment_float_flags_key)
