@@ -1166,17 +1166,17 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
-  # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
-  # against hand-built SPS bitstreams written by an independent bit-writer in the test.
-  # The fill layout asserts every offset the guest has been observed reading, and carries
-  # a mutation arm (absent-meta fill over a poisoned buffer) so removing the fill cannot
-  # pass vacuously.
   # AGC's colour-block utility pixel programs, recognised so a DCC_DECOMPRESS helper never runs as
   # colour (Silksong's variant exported 1.0 and painted its boot screens white). Pure decoding.
   prosper_add_gtest(test_dcc_helper_program
     SOURCES tests/gpu/execute/test_dcc_helper_program.cpp
     INCLUDES src)
 
+  # #2898. The SPS/VUI parser and the picture-info fill are pure host-side code exercised
+  # against hand-built SPS bitstreams written by an independent bit-writer in the test.
+  # The fill layout asserts every offset the guest has been observed reading, and carries
+  # a mutation arm (absent-meta fill over a poisoned buffer) so removing the fill cannot
+  # pass vacuously.
   prosper_add_gtest(test_h264_sps
     SOURCES tests/hle/video/test_h264_sps.cpp
     LIBRARIES prosper_core)

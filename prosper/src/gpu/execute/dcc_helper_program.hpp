@@ -4,10 +4,12 @@
 // hardware expands the bound target's DCC state and ignores the pixel shader's export. AGC binds a
 // tiny pixel program for it that exports a constant. Two such programs are observed:
 //
-//   7e000280 f8001803 00000000 bf810000   v_mov_b32 v0, 0 ; exp mrt0 v0, v0 (R,G) ; s_endpgm
+//   7e000280 f8001803 00000000 bf810000   v_mov_b32 v0, 0 ; exp mrt0 v0, v0 (R,G) done vm ;
+//                                          s_endpgm
 //   7e0002ff 3c003c00 f8001c0f 00000000 bf810000
 //                                          v_mov_b32 v0, 0x3c003c00 (two fp16 1.0) ;
-//                                          exp mrt0 v0, v0 compr (RGBA = 1,1,1,1) ; s_endpgm
+//                                          exp mrt0 v0, v0 compr (RGBA = 1,1,1,1) done vm ;
+//                                          s_endpgm
 //
 // The second is Hollow Knight: Silksong's (PPSA12544): it precedes every stencil-mask pass over the
 // title's scanout. It was not recognised, so it ran as an ordinary draw and exported its 1.0 --
@@ -36,14 +38,25 @@ inline constexpr uint32_t kAgcDccHelperFp16One[] = {
     0x7e0002ffu, 0x3c003c00u, 0xf8001c0fu, 0x00000000u, 0xbf810000u,
 };
 
+struct AgcDccHelperProgram {
+    const uint32_t* words;
+    size_t dwords;
+};
+// The table, for callers that compare against owned shader bytes rather than a raw pointer (the
+// executor's retained shader analysis -- see shader_analysis_has_prefix).
+inline constexpr AgcDccHelperProgram kAgcDccHelperPrograms[] = {
+    {kAgcDccHelperClearRg, std::size(kAgcDccHelperClearRg)},
+    {kAgcDccHelperFp16One, std::size(kAgcDccHelperFp16One)},
+};
+
 // True when `code` (at least `max_dwords` readable) begins with one of the observed AGC helpers.
 inline bool is_agc_dcc_helper_program(const uint32_t* code, size_t max_dwords) {
     if (!code) return false;
-    auto starts_with = [&](const uint32_t* program, size_t words) {
-        return max_dwords >= words && std::equal(program, program + words, code);
-    };
-    return starts_with(kAgcDccHelperClearRg, std::size(kAgcDccHelperClearRg)) ||
-           starts_with(kAgcDccHelperFp16One, std::size(kAgcDccHelperFp16One));
+    return std::any_of(std::begin(kAgcDccHelperPrograms), std::end(kAgcDccHelperPrograms),
+                       [&](const AgcDccHelperProgram& helper) {
+                           return max_dwords >= helper.dwords &&
+                                  std::equal(helper.words, helper.words + helper.dwords, code);
+                       });
 }
 
 } // namespace prosper::gpu

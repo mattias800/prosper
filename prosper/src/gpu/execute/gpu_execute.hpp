@@ -2519,9 +2519,15 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // Match AGC's descriptor-free constant-export helper as well (dcc_helper_program.hpp: program
     // content, not a title-specific address -- both observed variants, including Silksong's, which
     // exports 1.0 and painted its boot screens white when it ran as an ordinary draw), which keeps
-    // normal shaders fail-visible when stale operation bits leak.
-    const bool dcc_helper_program =
-        prosper::gpu::is_agc_dcc_helper_program(fragment_code, max_shader_dwords);
+    // normal shaders fail-visible when stale operation bits leak. With a retained analysis, compare
+    // its owned bytes -- the same version the fragment module was built from -- not a later raw read.
+    const bool dcc_helper_program = fragment_analysis
+        ? std::any_of(std::begin(prosper::gpu::kAgcDccHelperPrograms),
+                      std::end(prosper::gpu::kAgcDccHelperPrograms),
+                      [&](const prosper::gpu::AgcDccHelperProgram& helper) {
+                          return shader_analysis_has_prefix(fragment_analysis, helper.words, helper.dwords);
+                      })
+        : prosper::gpu::is_agc_dcc_helper_program(fragment_code, max_shader_dwords);
     const bool dcc_decompress = dcc_helper_program &&
         PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE) ==
             prosper::agc::Pm4::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS;

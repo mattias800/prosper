@@ -106,9 +106,10 @@ the scanout by address after each operation (`--output-target-after OP:ADDR`).
   data is zero". (#4120)
 - **The white boot screen is MoltenVK writing an undefined colour.** The hypothesis: the existing
   DCC path replaces the helper with a null-export fragment but leaves the colour write mask enabled,
-  which Vulkan leaves undefined. On MoltenVK that path preserves the target (`test_gpu_execute`'s
-  DCC checks pass there unmodified); the white came from the unrecognised second helper running as
-  an ordinary draw.
+  which Vulkan leaves undefined. Against it: on MoltenVK `test_gpu_execute`'s DCC checks (an RGBA8
+  and a native FP16 target) see that path preserve the target unmodified, and the replayed white
+  frame's DCC draw bound the unrecognised second helper -- recognising that program, with nothing
+  else changed, removed the white live. Not proven for every target format MoltenVK can be given.
 - **Reading a replay's colour target by extent.** `--draw-steps-target 1920x1080` attributed the
   white to a compute dispatch, because that dispatch writes a second 1920x1080 image; selecting the
   scanout by address (`--output-target-after OP:ADDR`) showed the DCC draw. When two targets share
