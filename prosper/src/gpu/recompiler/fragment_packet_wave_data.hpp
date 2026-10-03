@@ -1,5 +1,6 @@
 #pragma once
 #include "gpu/recompiler/fragment_resource_packet.hpp"
+#include "gpu/rdna2_decode.hpp"
 #include <memory>
 
 namespace prosper::gpu {

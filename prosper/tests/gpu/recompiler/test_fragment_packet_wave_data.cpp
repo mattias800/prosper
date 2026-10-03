@@ -45,8 +45,7 @@ std::vector<uint32_t> execute(const FragmentPacketWaveBatch& batch,
     // Sequential independent Workgroup storage scopes; NOT a model of GPU inter-workgroup order.
     for (uint32_t wave : {2u, 0u, 1u}) {
         if (only_wave != UINT32_MAX && only_wave != wave) continue;
-        bpermute_oracle::Interpreter vm;
-        vm.parse(batch.kernel->program.packet.spirv);
+        bpermute_oracle::Interpreter vm(batch.kernel->program.packet.spirv);
         for (uint32_t slot = 0; slot < batch.images.size(); ++slot)
             for (const auto& mip : batch.images[slot].mips)
                 vm.sampled_images[16 + slot].push_back({mip.width, mip.height, mip.texels});
