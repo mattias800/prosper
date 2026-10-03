@@ -237,6 +237,10 @@ struct RawNestedWideChain {
 };
 std::vector<RawNestedWideChain> rdna2_owned_nested_wide_chains(
     const std::vector<Rdna2Inst>& instructions);
+// One exact x2 pointer lifetime followed by a numeric x2 replacement. Runtime admission must
+// own both effective eight-byte observations, authenticate producers and exclude write aliases.
+std::vector<RawNestedWideChain>
+rdna2_owned_raw_x2_chains(const std::vector<Rdna2Inst>& instructions);
 // Refusal census only: numeric immediate x4/x8 loads whose pointer words may be written by
 // earlier code. This conservative set confers no reaching-definition or ownership authority.
 std::vector<uint32_t> rdna2_raw_nested_numeric_loads(const std::vector<Rdna2Inst>& ins);

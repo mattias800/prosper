@@ -3,7 +3,8 @@
 // Modes:
 //   (no args)                       self-checking unit test; exit code is truth
 //   --probe <symtab> <rva> [...]    print one machine-readable line per rva, for the cross-
-//                                   implementation agreement test (tools/il2cpp/test_symtab_agreement.py)
+//                                   implementation agreement test (tools/il2cpp/test_symtab_agreement.py),
+//                                   including raw candidate count and actual runtime annotation.
 //   --describe <guest-va> [...]     print describe_code_address() for each address, i.e. the REAL
 //                                   production label a fault backtrace prints. Honors
 //                                   PROSPER_IL2CPP_SYMBOLS, so this is how a live capture is checked
@@ -824,11 +825,14 @@ int probe_mode(int argc, char** argv) {
     for (int i = 3; i < argc; ++i) {
         const uint64_t rva = std::strtoull(argv[i], nullptr, 0);
         const Resolution r = resolve_rva(rva);
-        if (r.state == ResolveState::Resolved)
-            std::printf("%llx resolved %s +0x%llx\n", (unsigned long long)rva, r.name.c_str(),
-                        (unsigned long long)r.offset);
-        else
-            std::printf("%llx %s -\n", (unsigned long long)rva, resolve_state_token(r.state));
+        if (r.state == ResolveState::Resolved) {
+            const std::string annotation = annotation_for_guest_va(prosper::BOOT_IL2CPP + rva);
+            std::printf("%llx resolved %s +0x%llx candidates=%zu annotation=%s\n",
+                        (unsigned long long)rva, r.name.c_str(), (unsigned long long)r.offset,
+                        r.candidate_count, annotation.c_str());
+        } else
+            std::printf("%llx %s - candidates=%zu\n", (unsigned long long)rva,
+                        resolve_state_token(r.state), r.candidate_count);
     }
     return 0;
 }

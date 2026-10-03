@@ -77,8 +77,12 @@ inline Case cmpx_vcc(bool nonzero) {
             fd::expected(UINT64_MAX ^ (uint64_t(1) << 40),
                          nonzero ? fp::branch_true : fp::branch_false)};
 }
-inline Case scalar_vcc(uint64_t mask) {
+inline Case scalar_vcc(uint64_t mask, bool supplied_old = false) {
     auto p = base();
+    if (supplied_old) {
+        p.vcc_available = true;
+        p.vcc_mask = mask ? 0 : UINT64_MAX; // genuine opposite OLD value must be replaced
+    }
     for (auto& [reg, value] : p.sgprs)
         if (reg == 20 || reg == 21) value = uint32_t(mask >> (reg == 21 ? 32 : 0));
     fp::smov(p.guest_code, 6, fp::branch_false);
@@ -86,7 +90,7 @@ inline Case scalar_vcc(uint64_t mask) {
     p.guest_code.push_back(0xbf860002u);
     fp::smov(p.guest_code, 6, fp::branch_true);
     finish(p, 6);
-    return {"scalar_vcc_writer_" + std::to_string(mask), p,
+    return {"scalar_vcc_writer_" + std::to_string(mask) + (supplied_old ? "_opposite_old" : ""), p,
             fd::expected(UINT64_MAX, mask ? fp::branch_true : fp::branch_false)};
 }
 inline Case peer_before_exec() {
@@ -156,6 +160,8 @@ inline std::vector<Case> cases() {
     out.push_back(cmpx_vcc(true));
     out.push_back(scalar_vcc(0));
     out.push_back(scalar_vcc(fragment_raw_masks::asymmetric));
+    out.push_back(scalar_vcc(0, true));
+    out.push_back(scalar_vcc(fragment_raw_masks::asymmetric, true));
     out.push_back(peer_before_exec());
     out.push_back(wqm_numeric());
     out.push_back(joined_vcc(false));
@@ -164,7 +170,7 @@ inline std::vector<Case> cases() {
     out.push_back(bypass_vcc(true));
     return out;
 }
-inline constexpr uint32_t kCases = 22;
+inline constexpr uint32_t kCases = 24;
 inline FragmentResourcePacket wave_input(const Case& c) {
     return fragment_raw_masks::wave_input({c.name, c.packet, c.expected});
 }

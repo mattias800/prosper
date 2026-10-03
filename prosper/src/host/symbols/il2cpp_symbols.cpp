@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <string>
 #include <vector>
 
 namespace prosper {
@@ -25,6 +26,7 @@ constexpr const char* kEnvVar = "PROSPER_IL2CPP_SYMBOLS";
 struct Entry {
     uint64_t rva;
     std::string name;
+    size_t candidate_count = 1;
 };
 
 struct Table {
@@ -213,6 +215,18 @@ bool load_symbol_table_for_generation(const std::string& path, std::string* err,
             status.error = "header is valid but the table has no entries";
     }
 
+    if (status.error.empty()) {
+        // Count raw records once; identical duplicate rows are not deduplicated.
+        for (size_t first = 0; first < table->entries.size();) {
+            size_t end = first + 1;
+            while (end < table->entries.size() &&
+                   table->entries[end].rva == table->entries[first].rva)
+                ++end;
+            for (size_t i = first; i < end; ++i) table->entries[i].candidate_count = end - first;
+            first = end;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (generation != g_generation) {
@@ -274,6 +288,7 @@ Resolution resolve_snapshot_rva(const Snapshot& snapshot, uint64_t rva) {
     out.state = ResolveState::Resolved;
     out.name = it->name;
     out.offset = rva - it->rva;
+    out.candidate_count = it->candidate_count;
     return out;
 }
 
@@ -366,6 +381,9 @@ std::string annotation_for_guest_va(uint64_t va) {
                               (unsigned long long)resolution.offset);
                 text += suffix;
             }
+            if (resolution.candidate_count > 1)
+                text += " (+" + std::to_string(resolution.candidate_count - 1) +
+                        " more at this address)";
             return text;
         }
         case ResolveState::NoMatch:     return " <no-managed-method>";

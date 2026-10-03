@@ -3,6 +3,9 @@
 #include "loader/support_modules.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <filesystem>
+#include <unordered_set>
 
 namespace prosper {
 
@@ -44,6 +47,59 @@ std::vector<size_t> unimported_support_module_indices(
             drop.push_back(i);
     }
     return drop;
+}
+
+ModuleLinkFacts module_link_facts(const Module& module) {
+    ModuleLinkFacts facts;
+    for (const auto& imported : module.imports) {
+        facts.imported_libs.push_back(imported.lib_name);
+        facts.imported_nids.push_back(imported.nid);
+    }
+    facts.exported_nids = module_export_nids(module);
+    return facts;
+}
+
+bool has_deferred_module_init_contract(const std::string& dump_root, const std::string& path) {
+    if (dump_root.empty() || path.empty()) return false;
+    const auto normalized = [](std::string value) {
+        std::replace(value.begin(), value.end(), '\\', '/');
+        auto result = std::filesystem::path(value).lexically_normal();
+        if (!result.has_filename()) result = result.parent_path();
+        return result.empty() ? std::filesystem::path(".") : result;
+    };
+    const auto module = normalized(path);
+    if (normalized(module.parent_path().generic_string()) != normalized(dump_root)) return false;
+    std::string filename = module.filename().generic_string();
+    for (auto& c : filename) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return filename == "libaegir_f.prx";
+}
+
+std::vector<size_t> veto_imported_init_on_load(std::vector<LinkInput>& in,
+                                               const std::vector<ModuleLinkFacts>& facts) {
+    std::vector<size_t> cleared;
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (!in[i].init_on_load) continue;
+        const std::string lib = support_module_lib_name(in[i].path);
+        const std::unordered_set<std::string> exported =
+            i < facts.size() ? std::unordered_set<std::string>(facts[i].exported_nids.begin(),
+                                                               facts[i].exported_nids.end())
+                             : std::unordered_set<std::string>();
+        for (size_t j = 0; j < in.size() && j < facts.size(); ++j) {
+            if (j == i) continue;
+            const auto& f = facts[j];
+            const bool by_lib = std::find(f.imported_libs.begin(), f.imported_libs.end(), lib) !=
+                                f.imported_libs.end();
+            const bool by_nid =
+                std::any_of(f.imported_nids.begin(), f.imported_nids.end(),
+                            [&](const std::string& n) { return exported.count(n) != 0; });
+            if (by_lib || by_nid) {
+                in[i].init_on_load = false;
+                cleared.push_back(i);
+                break;
+            }
+        }
+    }
+    return cleared;
 }
 
 } // namespace prosper

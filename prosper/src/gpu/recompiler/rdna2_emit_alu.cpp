@@ -1026,7 +1026,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (is_exec(in.dst)) {   // set/restore EXEC
                         ok = emit_s_mov_b64_exec(b, rs, in);
                     } else {   // s_mov_b64 sDST, <mask-or-data> : save a mask / copy a pair
-                        uint32_t m = src_mask(in.src[0]);
+                        uint32_t m = packet_s_mov_b64_numeric_vcc_bit(b, rs, in);
+                        if (!m) m = src_mask(in.src[0]);
                         if (m) { rs.sreg_bool[in.dst.value] = m;
                                  rs.sreg_bool_narrowed[in.dst.value] = is_exec(in.src[0]) ? rs.exec_narrowed : saved_narrowed(in.src[0]);
                                  // A move INTO VCC is a VCC write (DOLL's scalar-indexed unroll does
@@ -5613,6 +5614,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
+            if (emit_owned_raw_x2(b, rs, in, rt, ok)) return true;
             // The whole-CFG proof established that this register-offset or aligned-immediate
             // S_LOAD_DWORDX2 feeds only a complete V# (possibly after an exact scalar carry-pair
             // relocation), never ordinary scalar/address or mask state. Every descriptor observation
@@ -5973,21 +5975,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t loaded = b.cbuf_load(safe_index, binding);
                 return b.sel(in_bounds, loaded, b.uconst(0u));
             };
-            auto end_vcc_mask_for_data_load = [&]() {
-                if (n != 2u || in.dst.value != 106 ||
-                    !rs.smem_raw_x2_data_loads.contains(in.pc)) return;
-                // This raw load writes physical VCC_LO/HI as scalar DATA. The preceding VCC
-                // predicate is no longer the register's mask, and keeping its Bool view would
-                // let an implicit cndmask/branch consume stale bits. Ordinary data reads use the
-                // two newly loaded rs.sreg words; an unproved mask use now fails visibly.
-                rs.vcc = 0;
-                rs.vcc_wave_uniform = 0;
-                for (int reg = 106; reg <= 107; ++reg) {
-                    rs.sreg_bool.erase(reg);
-                    rs.sreg_bool_b32.erase(reg);
-                    rs.sreg_bool_narrowed.erase(reg);
-                }
-            };
             // #2481: this exact instruction is the producer of a runtime-selected descriptor table.
             // Its SOFFSET is the byte offset of the chosen record, so the element index is
             // SOFFSET / record-stride. Publish it as the live selector for that array binding before
@@ -6021,7 +6008,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg[in.dst.value + (int)k] = bounded_cbuf_load(kidx);
                     rs.sreg_srt.erase(in.dst.value + (int)k);   // data load: drop any stale descriptor tag
                 }
-                end_vcc_mask_for_data_load();
+                end_smem_vcc_data_lifetime(rs, in, n);
                 return true;
             }
             for (uint32_t k = 0; k < n; k++)
@@ -6037,7 +6024,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Scalar data loads overwrite the destination; they do not carry descriptor identity.
                 for (uint32_t k = 0; k < n; k++) rs.sreg_srt.erase(in.dst.value + (int)k);
             }
-            end_vcc_mask_for_data_load();
+            end_smem_vcc_data_lifetime(rs, in, n);
             return true;
         }
         case Rdna2Format::FLAT: {

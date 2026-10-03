@@ -31,13 +31,13 @@ void evaluate(const f::Case& c) {
     SCOPED_TRACE(c.name);
     const auto program = recompile_fragment_packet(c.packet);
     ASSERT_FALSE(program.spirv.empty()) << program.rejection;
+    retain(program, c.name);   // retain produced SOURCE even if VM/consumer evaluation fails
     bpermute_oracle::Interpreter vm(program.spirv);
     const auto words = vm.run_packet(program.input_words, program.output_words);
     ASSERT_TRUE(vm.error.empty()) << vm.error;
     const auto result = decode_fragment_packet(program, words, true);
     ASSERT_TRUE(result.rejection.empty()) << result.rejection;
     EXPECT_EQ(result.exports, c.expected) << "all64 independent original raw EXP sinks";
-    retain(program, c.name);
 }
 bool gap(const FragmentPacketPreparation& prepared, const char* value) {
     return std::find(prepared.unmet.begin(), prepared.unmet.end(), value) != prepared.unmet.end();
@@ -77,6 +77,14 @@ TEST(FragmentPacketMaskEntry, AbsenceCannotBorrowZeroStorageOrPruneABypass) {
     EXPECT_EQ(bypass.first_read_pc[1], 6u);
     EXPECT_EQ(recompile_fragment_packet(p).rejection, "packet-entry-vcc-unavailable")
         << "supplied SCC1 cannot discard the structural SCC0 predecessor";
+    for (uint32_t missing_word : {20u, 21u}) {
+        p = f::scalar_vcc(0, true).packet;   // present zero is valid; an absent half is not
+        std::erase_if(p.sgprs, [&](const auto& value) { return value.first == missing_word; });
+        const auto refused = recompile_fragment_packet(p);
+        EXPECT_TRUE(refused.spirv.empty());
+        EXPECT_EQ(refused.rejection, "packet-sgpr-read-before-definition")
+            << "opposite supplied VCC cannot manufacture missing s" << missing_word;
+    }
     // Partial physical VCC definitions are still outside the executable packet DATA domain;
     // nevertheless the demanded-state proof must not count a low-only writer as a whole pair.
     p = f::base();

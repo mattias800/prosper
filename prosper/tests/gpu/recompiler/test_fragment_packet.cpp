@@ -367,7 +367,7 @@ int main(int argc, char** argv) {
     missing.slots_available[63] = false;
     reject(missing, "packet-invocation-state-unavailable", "missing high-half slot");
     missing = clean; missing.mask_state_available = false;
-    reject(missing, "packet-invocation-state-unavailable", "missing masks");
+    reject(missing, "packet-entry-exec-unavailable", "missing demanded initial EXEC");
     missing = clean;
     missing.vgprs.erase(missing.vgprs.begin() + 5);
     {

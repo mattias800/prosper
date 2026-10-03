@@ -64,6 +64,8 @@ struct Resolution {
     ResolveState state = ResolveState::NotConfigured;
     std::string name;      // only when state == Resolved
     uint64_t offset = 0;   // bytes past the method's first instruction; only when state == Resolved
+    // Raw records at the selected start RVA, including identical duplicates; zero unless Resolved.
+    size_t candidate_count = 0;
 };
 
 struct SymbolTableStatus {
@@ -117,7 +119,8 @@ Resolution resolve_rva(uint64_t rva);
 // lesson: a single wide range labelled every module in it "eboot+", i.e. wrong binary, wrong offset).
 Resolution resolve_guest_va(uint64_t va);
 
-// " Name+0x<offset>" / " <no-managed-method>" / " <il2cpp-symbols-unavailable>" / "" -- the suffix
+// " Name+0x<offset>" (with " (+N more at this address)" for tied starts) /
+// " <no-managed-method>" / " <il2cpp-symbols-unavailable>" / "" -- the suffix
 // describe_code_address appends to an `Il2cpp+0x…` label. Empty exactly when no claim can be made
 // (NotConfigured or OutsideModule), so an unconfigured run's diagnostics are byte-identical to
 // today's.
