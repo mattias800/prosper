@@ -16,6 +16,12 @@ usage, whether a PR is safe to merge.
   *changes*. Added files must be ruff-clean, ruff-format-clean and carry a module docstring; modified
   files may not gain ruff findings; an added tool under `prosper/tools/` needs a test in the same PR.
   Config lives in the root `pyproject.toml` (uv, `uv.lock`); see the Python rule below.
+- **`check_pytest_policy.py`** + `pytest_legacy_allowlist.txt` — enforces that new Python test files
+  (`test_*.py` under `prosper/`) use pytest conventions (functions/asserts/fixtures, not legacy
+  `unittest.TestCase` subclasses or script-only uncollected files). The allowlist baseline records
+  pre-existing files and only shrinks.
+- **`check_gtest_policy.py`** + `gtest_legacy_allowlist.txt` — enforces that new C++ tests use GoogleTest
+  rather than a hand-rolled `main()`. The allowlist baseline records pre-existing files and only shrinks.
 - **`check_cpp_lint.py`** — the C++ half of the same idea: root `.clang-format` and `.clang-tidy`,
   enforced on the lines a change **adds or modifies**, against the merge base. It runs last in the
   Linux CI job because clang-tidy needs that job's `compile_commands.json`. See *C++ lint* below.

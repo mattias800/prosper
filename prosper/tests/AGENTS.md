@@ -16,6 +16,16 @@ Older tests are standalone executables registered with `add_test` and a local `C
   stay on the allowlist. Since the list only shrinks, a new standalone test needs the owner's say-so.
 - Dump- or Vulkan-gated tests keep their gating in CMake, not inside gtest.
 
+## Python test policy
+
+- New Python tests must use pytest conventions (functions/asserts/fixtures), not legacy `unittest.TestCase`
+  subclasses or script-only files without test collection. The ctest `pytest_policy`
+  (`tools/ci/check_pytest_policy.py`) fails on violations.
+- Pre-existing non-pytest or unittest files are listed in `tools/ci/pytest_legacy_allowlist.txt`. When you
+  migrate or remove one, delete its line (the list only shrinks; the check fails if an allowlisted file is
+  migrated or gone but still listed).
+- When converting a test to collect via pytest, add it to `testpaths` in `pyproject.toml`.
+
 ## Rules
 
 1. **Behavioral fixes need a meaningful regression that fails without the fix.** Add or extend
