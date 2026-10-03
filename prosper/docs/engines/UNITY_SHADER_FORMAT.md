@@ -2,7 +2,7 @@
 
 Verified format from a multi-agent collaboration (Fable, cross-checked against AssetRipper 0.3.4.0
 `ShaderBlob/*` + TypeTreeDumps `2022.3.32f1.dump`). This is the reference for the render-loop
-deserialization fault (`docs/gpu/RENDER_LOOP.md`) — the game crashes deserializing the built-in shader
+deserialization fault (`docs/archive/RENDER_LOOP.md`) — the game crashes deserializing the built-in shader
 `Hidden/CubeBlur` on the `-force-gfx-direct`+`PROSPER_GUEST_FS` path.
 
 ## Two layers, both present in the ~37KB reader buffer

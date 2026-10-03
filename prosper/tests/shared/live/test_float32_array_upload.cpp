@@ -1,5 +1,6 @@
 // Guest-backed Float32 array layers must reach the real graphics sampler without half narrowing.
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/texture/tile.hpp"
 #include "hle/dispatch/dispatch.hpp"
@@ -10,12 +11,8 @@
 #include <memory>
 #include <vector>
 using namespace prosper::gpu;
-static int failures = 0;
-static void check(bool ok, const char* message) {
-    std::printf("[%s] %s\n", ok ? "ok" : "FAIL", message);
-    failures += !ok;
-}
-int main() {
+static void check(bool ok, const char* message) { EXPECT_TRUE(ok) << message; }
+TEST(Float32ArrayUpload, Contract) {
     prosper::register_builtin_hle();
     constexpr uint32_t W = 8, H = 8, Layers = 3;
     const uint32_t vs[]{0x36020081u, 0x2C040081u, 0x7E020D01u, 0x7E040D02u,
@@ -28,7 +25,7 @@ int main() {
     check(map && unmap && map(reinterpret_cast<uint64_t>(&guest), Backing, 2, 0,
                              reinterpret_cast<uint64_t>("float-array"), 0) == 0 && guest,
           "fixture maps real guest backing");
-    if (!guest) return 1;
+    if (!guest) FAIL() << "legacy early exit";
     prosper::frontend::register_live_renderer(".", false);
     auto table = std::make_shared<ShaderResourceTable>();
     ShaderResource source{};
@@ -131,6 +128,4 @@ int main() {
         }
     }
     unmap(guest, Backing, 0, 0, 0, 0);
-    std::printf("Float32 array upload: %d failures\n", failures);
-    return failures ? 1 : 0;
 }

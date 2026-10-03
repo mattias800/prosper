@@ -6,6 +6,7 @@
 // whether a real AMD or NV driver executes those writes before a hang: stock lavapipe exposes neither
 // marker extension, so no CI job can. That half is a local run on real hardware (see the PR).
 #include "gpu/diagnostics/gpu_breadcrumbs.hpp"
+#include <gtest/gtest.h>
 #include "gpu/diagnostics/gpu_breadcrumbs_vk.hpp"
 
 #include <cstdint>
@@ -15,9 +16,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -347,7 +346,7 @@ void support_selection() {
 
 } // namespace
 
-int main() {
+TEST(GpuBreadcrumbs, Contract) {
     std::printf("== ids and ring ==\n");               ids_and_ring();
     std::printf("== verdict arithmetic ==\n");         verdict_arithmetic();
     std::printf("== id wraparound ==\n");              wraparound();
@@ -356,7 +355,5 @@ int main() {
     std::printf("== inactive emitter ==\n");           inactive_emitter_does_nothing();
     std::printf("== AMD buffer marker path ==\n");     amd_path();
     std::printf("== NV checkpoint path ==\n");         nv_path();
-    std::printf("== extension selection ==\n");        support_selection();
-    std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
+    support_selection();
 }

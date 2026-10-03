@@ -2,6 +2,7 @@
 // assertions pin the one source of truth used by pool/layout/write sizing; the Vulkan execution arm
 // proves each concrete table entry reaches its descriptor slot instead of being collapsed to one.
 #include "shared/live/live_compute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 
@@ -14,16 +15,7 @@
 
 using namespace prosper::gpu;
 
-static int failures = 0;
-#define CHECK(condition, message)                                                   \
-    do {                                                                            \
-        if (!(condition)) {                                                         \
-            std::printf("  [FAIL] %s\n", message);                                \
-            ++failures;                                                             \
-        } else {                                                                    \
-            std::printf("  [ok]   %s\n", message);                                \
-        }                                                                           \
-    } while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
 static ShaderBufferTableEntry table_entry(std::array<uint32_t, 4>& words) {
     ShaderBufferTableEntry entry;
@@ -41,7 +33,7 @@ static ShaderBufferTableEntry table_entry(std::array<uint32_t, 4>& words) {
     return entry;
 }
 
-int main() {
+TEST(LiveComputeDescriptorArray, Contract) {
     std::printf("== test_live_compute_descriptor_array ==\n");
 
     std::array<uint32_t, 4> entry0{0x10203040u, 0, 0, 0};
@@ -91,7 +83,7 @@ int main() {
     const std::vector<uint32_t> spirv =
         recompile_compute(code, std::size(code), &resources, config);
     CHECK(!spirv.empty(), "indexed-buffer compute fixture recompiles");
-    if (spirv.empty()) return 1;
+    if (spirv.empty()) FAIL() << "legacy early exit";
 
     DescriptorValidationReport report = validate_spirv_descriptor_interface(
         spirv, &resources, 0, SpirvShaderStage::Compute, false);
@@ -198,6 +190,4 @@ int main() {
               scalar_plan.bindings[0].descriptor_count == 1,
           "ordinary scalar storage buffers retain the one-descriptor backend contract");
 
-    std::printf(failures ? "== FAIL ==\n" : "== PASS ==\n");
-    return failures ? 1 : 0;
 }

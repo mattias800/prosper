@@ -11,6 +11,7 @@
 // records 1..3 (record 0 is an off-screen decoy). A path that ignored the indices would draw records
 // 0..2 instead and leave the sampled corners blue.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/state/render_state.hpp"
 #include "fixtures/render_runner.h"
@@ -23,10 +24,9 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(IndexedRender, Contract) {
     printf("== test_indexed_render ==\n");
     const uint32_t W = 64, H = 64;
 
@@ -46,7 +46,7 @@ int main() {
     std::vector<uint32_t> vert = recompile_vertex(vs, sizeof(vs)/sizeof(vs[0]), &rt);
     std::vector<uint32_t> frag = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]));
     CHECK(!vert.empty() && !frag.empty(), "recompiled vertex-fetch VS + green PS");
-    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); return 1; }
+    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     auto f = [](float v) { union { float f; uint32_t u; } c; c.f = v; return c.u; };
     auto isGreen = [&](const std::vector<uint8_t>& px, uint32_t x, uint32_t y) {
@@ -80,7 +80,7 @@ int main() {
     std::vector<uint8_t> px_fan = prosper::test::render_draws_rgba(
         { draw_of(quad, &fan_ps, 4, {}) }, W, H);
     CHECK(px_idx.size() == (size_t)W*H*4 && px_fan.size() == (size_t)W*H*4, "both quad renders produced frames");
-    if (px_idx.size() != (size_t)W*H*4 || px_fan.size() != (size_t)W*H*4) { printf("== FAIL ==\n"); return 1; }
+    if (px_idx.size() != (size_t)W*H*4 || px_fan.size() != (size_t)W*H*4) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
     CHECK(greenAt9(px_idx), "indexed [0,1,2,2,3,0] TRIANGLE_LIST quad fills the viewport GREEN");
     CHECK(px_idx == px_fan, "indexed quad is byte-identical to the old perimeter-fan rendering");
 
@@ -90,7 +90,7 @@ int main() {
     std::vector<uint8_t> px_tri = prosper::test::render_draws_rgba(
         { draw_of(vbufB, &list_ps, 4, {1,2,3}) }, W, H);
     CHECK(px_tri.size() == (size_t)W*H*4, "indexed triangle rendered");
-    if (px_tri.size() != (size_t)W*H*4) { printf("== FAIL ==\n"); return 1; }
+    if (px_tri.size() != (size_t)W*H*4) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
     CHECK(greenAt9(px_tri), "indices [1,2,3] fetched records 1..3 (fullscreen GREEN triangle)");
     // Negative control: the same draw WITHOUT indices draws records 0..2 (decoy included) — a different
     // picture. Guards against a backend that silently ignores the index buffer.
@@ -163,7 +163,5 @@ int main() {
     CHECK(px_vertex_offset.size() == (size_t)W*H*4 && greenAt9(px_vertex_offset),
           "indexed vertexOffset selects records 1..3 from a shared vertex pool");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

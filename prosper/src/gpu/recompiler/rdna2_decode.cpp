@@ -2,6 +2,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 
 #include <algorithm>
+#include <unordered_set>
 
 namespace prosper::gpu {
 
@@ -95,6 +96,60 @@ bool rdna2_instruction_may_change_exec(const Rdna2Inst& in) {
                (operand.value == 126 || operand.value == 127);
     };
     return is_exec(in.dst) || is_exec(in.sdst);
+}
+
+uint32_t rdna2_sop2_dest_dwords(uint32_t opcode) {
+    // gfx1030 SOP2: 0x00-0x09 add/sub/addc/subb/min/max, 0x0a cselect_b32, 0x0e/0x10/0x12/0x14/0x16/
+    // 0x18/0x1a/0x1c the b32 logic family, 0x1e lshl_b32, 0x20 lshr_b32, 0x22 ashr_i32, 0x24 bfm_b32,
+    // 0x26 mul_i32, 0x27 bfe_u32, 0x28 bfe_i32. Each odd opcode in the logic and shift ranges is the
+    // b64 sibling (and 0x0b, 0x25, 0x29, 0x2a are b64 forms), which stay at two dwords.
+    if (opcode <= 0x0au) return 1;
+    switch (opcode) {
+        case 0x0e: case 0x10: case 0x12: case 0x14: case 0x16: case 0x18: case 0x1a: case 0x1c:
+        case 0x1e: case 0x20: case 0x22: case 0x24: case 0x26: case 0x27: case 0x28:
+            return 1;
+        default:
+            return 2;
+    }
+}
+
+static bool mimg_opcode_only_reads(uint32_t opcode) {
+    if (opcode <= 0x05u || opcode == 0x0eu || opcode == 0x80u || opcode == 0xe6u ||
+        opcode == 0xe7u)
+        return true;
+    if (opcode < 0x20u || opcode > 0x6fu) return false;
+    // Unassigned slots inside the sample/gather range.
+    switch (opcode) {
+        case 0x42u: case 0x43u: case 0x4au: case 0x4bu: case 0x52u: case 0x53u:
+        case 0x5au: case 0x5bu: case 0x62u: case 0x63u: case 0x64u: case 0x65u:
+        case 0x66u: case 0x67u:
+            return false;
+        default:
+            return true;
+    }
+}
+
+bool rdna2_instruction_may_write_memory(const Rdna2Inst& in) {
+    switch (in.fmt) {
+        case Rdna2Format::MIMG:
+            // A READER list, so an unlisted opcode stays a writer. Every entry was disassembled
+            // with llvm-mc -mcpu=gfx1030: image_load* 0x00-0x05, image_get_resinfo 0x0e, the
+            // sample/gather/get_lod family in 0x20-0x6f (its invalid holes stay writers),
+            // image_msaa_load 0x80 and image_bvh[64]_intersect_ray 0xe6/0xe7. The stores
+            // 0x08-0x0b and every atomic 0x0f-0x1f, including cmpswap, inc/dec and the float
+            // atomics, are writers.
+            return !mimg_opcode_only_reads(in.opcode);
+        case Rdna2Format::MUBUF:
+            return !((in.opcode <= 0x03u) || (in.opcode >= 0x08u && in.opcode <= 0x0fu));
+        case Rdna2Format::MTBUF:
+            return in.opcode > 0x03u;
+        case Rdna2Format::FLAT:
+            return !(in.opcode >= 0x08u && in.opcode <= 0x0fu);
+        case Rdna2Format::SMEM:
+            return in.opcode >= 0x10u;
+        default:
+            return false;
+    }
 }
 
 static uint32_t mtbuf_vdata_dwords(const Rdna2Inst& in) {
@@ -1352,3 +1407,68 @@ uint32_t rdna2_sload_required_bytes(const uint32_t* code, size_t dwords, uint32_
 }
 
 } // namespace prosper::gpu
+
+namespace prosper::gpu {
+namespace {
+// Direct SOPP branches: s_branch (0x02) and the s_cbranch_* family (0x04..0x09).
+bool is_direct_branch(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::SOPP &&
+           (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
+}
+int64_t branch_target_pc(const Rdna2Inst& in) {
+    return static_cast<int64_t>(in.pc) + static_cast<int64_t>(in.len_dwords) +
+           static_cast<int64_t>(in.simm16);
+}
+bool ends_run(const Rdna2Inst& in) {
+    return in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode == 0x02);
+}
+}  // namespace
+
+bool rdna2_append_closed_tail_blocks(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& full) {
+    if (!code || full.empty() || !full.back().is_end) return false;
+    const uint32_t main_end = full.back().pc + full.back().len_dwords;
+    std::vector<uint32_t> pending;
+    std::unordered_set<uint32_t> queued;
+    auto note_target = [&](const Rdna2Inst& in) {
+        if (!is_direct_branch(in)) return true;
+        const int64_t target = branch_target_pc(in);
+        if (target < 0 || target >= static_cast<int64_t>(dwords)) return false;
+        if (target >= static_cast<int64_t>(main_end) &&
+            queued.insert(static_cast<uint32_t>(target)).second)
+            pending.push_back(static_cast<uint32_t>(target));
+        return true;
+    };
+    for (const auto& in : full)
+        if (!note_target(in)) return false;
+    std::vector<Rdna2Inst> tail;
+    std::unordered_set<uint32_t> decoded_pcs;
+    while (!pending.empty()) {
+        uint32_t pc = pending.back();
+        pending.pop_back();
+        for (;;) {
+            if (!decoded_pcs.insert(pc).second) break;   // joined an already decoded run
+            if (tail.size() > 256 || pc >= dwords) return false;
+            Rdna2Inst in = rdna2_decode_one(code + pc, dwords - pc);
+            if (in.fmt == Rdna2Format::Unknown || !in.len_dwords) return false;
+            in.pc = pc;
+            // A branch back into the body could run the tail before the consumer, or re-enter it.
+            if (is_direct_branch(in) && branch_target_pc(in) < static_cast<int64_t>(main_end))
+                return false;
+            if (!note_target(in)) return false;
+            tail.push_back(in);
+            if (ends_run(in)) break;
+            pc += in.len_dwords;
+        }
+    }
+    std::sort(tail.begin(), tail.end(),
+              [](const Rdna2Inst& l, const Rdna2Inst& r) { return l.pc < r.pc; });
+    for (size_t i = 0; i < tail.size(); ++i) {
+        // A fall-through must land on the next decoded instruction, or a consumer's edge is wrong.
+        if (!ends_run(tail[i]) &&
+            (i + 1 >= tail.size() || tail[i + 1].pc != tail[i].pc + tail[i].len_dwords))
+            return false;
+    }
+    full.insert(full.end(), tail.begin(), tail.end());
+    return true;
+}
+}  // namespace prosper::gpu

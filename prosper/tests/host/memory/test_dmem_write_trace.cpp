@@ -1,4 +1,5 @@
 #include "host/memory/guest_write_watch.hpp"
+#include <gtest/gtest.h>
 
 #include <atomic>
 #include <cerrno>
@@ -15,10 +16,7 @@
 
 namespace {
 
-int failures = 0;
-#define CHECK(condition, message) do { \
-    if (!(condition)) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; } \
-} while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
 std::atomic<int64_t> writer_tid{0};
 std::atomic<bool> request_contention{false};
@@ -223,7 +221,7 @@ __attribute__((noinline)) void breakpoint_then_store_byte(
 
 } // namespace
 
-int main() {
+TEST(DmemWriteTrace, Contract) {
     constexpr uint64_t page = 0x1000;
     constexpr uint64_t allocation_size = page * 3;
     constexpr uint64_t physical = 0x740000;
@@ -333,7 +331,7 @@ int main() {
         mmap(nullptr, allocation_size, PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     CHECK(mapping != MAP_FAILED, "map canary direct-memory range");
-    if (mapping == MAP_FAILED) return 1;
+    if (mapping == MAP_FAILED) FAIL() << "legacy early exit";
     std::memset(mapping + offset, 0x11, bytes);
     prosper::host::guest_write_watch_notify_direct_mapping_added(
         reinterpret_cast<uint64_t>(mapping), allocation_size, physical, 0x3);
@@ -1110,7 +1108,4 @@ int main() {
 
     prosper::host::guest_write_watch_set_fault_onstack(false);
 
-    if (failures) return 1;
-    std::puts("== PASS ==");
-    return 0;
 }

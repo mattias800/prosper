@@ -99,7 +99,7 @@ Build `prosper-app`, `test_pipeline_render`, `test_multidraw_render`, `test_rend
 
 ```sh
 PROSPER_VK_VALIDATION=1 ctest --test-dir <BUILD> --no-tests=error -V \
-  -R '^(pipeline_render|multidraw_render|renderer_uint_copy|render_diagnostic_paths|game_compute_exec)$'
+  -R '^(PipelineRender\.Contract|MultidrawRender\.Contract|RendererUintCopy\.Contract|render_diagnostic_paths|game_compute_exec)$'
 
 python3 prosper/tools/vkval/vk_validation_scan.py --build-dir <BUILD> --sync
 

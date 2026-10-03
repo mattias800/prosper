@@ -8,6 +8,7 @@
 // no channels are written, so the triangle is invisible (center stays blue). Both masks are produced
 // by resolve_pipeline_state from a real register value — not hand-set — so this exercises the whole path.
 #include "gpu/state/render_state.hpp"
+#include <gtest/gtest.h>
 #include "gpu/pm4/pm4_registers.hpp"
 #include <vulkan/vulkan.h>
 
@@ -35,8 +36,7 @@ using namespace prosper::gpu;
 using prosper::test::render_triangle_rgba;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Build a minimal GpuState whose context registers describe a triangle-list draw with the given
 // per-MRT0 color write mask, then run it through the real extract -> resolve path.
@@ -49,7 +49,7 @@ static ResolvedPipelineState resolve_for(uint32_t target_mask) {
     return resolve_pipeline_state(extract_render_state(st));
 }
 
-int main() {
+TEST(PipelineRender, Contract) {
     printf("== test_pipeline_render ==\n");
     const uint32_t W = 64, H = 64;
     const size_t center = ((size_t)(H/2) * W + (W/2)) * 4;
@@ -278,7 +278,5 @@ int main() {
 
     CHECK(driver_cache_calls > 1 && !driver_cache_missing,
           "distinct graphics pipelines receive the device's driver compilation cache");
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }
