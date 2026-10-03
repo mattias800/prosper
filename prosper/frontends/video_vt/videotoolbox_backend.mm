@@ -425,9 +425,10 @@ bool make_decoder(Decoder& d, CMFormatDescriptionRef format, bool allow_software
                                                           (__bridge CFDictionaryRef)attrs, &callback,
                                                           &d.session);
     if (created != noErr || !d.session) {
-        if (avp_log())
-            std::fprintf(stderr, "[avp-vt] '%s': no %s decoder session (status %d)\n", name.c_str(),
-                         allow_software ? "" : "HARDWARE", static_cast<int>(created));
+        // Unconditional: the title's video will not play, and this is the reason.
+        std::fprintf(stderr, "[avp-vt] '%s': could not create a %s video decoder session (status %d)\n",
+                     name.c_str(), allow_software ? "hardware-or-software" : "HARDWARE",
+                     static_cast<int>(created));
         d.session = nullptr;
         return false;
     }
@@ -438,9 +439,8 @@ bool make_decoder(Decoder& d, CMFormatDescriptionRef format, bool allow_software
         CFRelease(using_hardware);
     }
     if (!d.hardware && !allow_software) {
-        if (avp_log())
-            std::fprintf(stderr, "[avp-vt] '%s': session reports a software decoder; refused "
-                                 "(PROSPER_AVP_ALLOW_SOFTWARE=1 to allow)\n", name.c_str());
+        std::fprintf(stderr, "[avp-vt] '%s': session reports a software decoder; refused "
+                             "(PROSPER_AVP_ALLOW_SOFTWARE=1 to allow)\n", name.c_str());
         d.reset();
         return false;
     }

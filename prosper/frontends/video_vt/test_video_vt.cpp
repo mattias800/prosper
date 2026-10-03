@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -38,6 +39,44 @@ const char* const kCropAsset = PROSPER_TEST_H264_CROP_ASSET;
 // hardware fails with kVTCouldNotFindVideoDecoderErr), only a software one -- so it discriminates
 // the hardware policy on every host, hardware-capable or not.
 const char* const kSoftwareOnlyAsset = PROSPER_TEST_MPEG4_ASSET;
+
+// Whether THIS host can actually create a hardware H.264 session for the clip's own parameter
+// sets (SPS/PPS copied from h264_aac_testpattern.mp4's avcC), observed independently of the
+// backend. VTIsHardwareDecodeSupported is a capability query and is not enough: a hosted
+// macos-26-arm64 runner answers yes for H.264 and then cannot open a hardware session.
+bool hardware_h264_session_available() {
+    static const uint8_t kSps[] = {0x67, 0x4d, 0x40, 0x0a, 0xec, 0xa1, 0x06, 0xd8, 0x08, 0x80, 0x00,
+                                   0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x1e, 0x07, 0x89, 0x12, 0xcb};
+    static const uint8_t kPps[] = {0x68, 0xeb, 0xe3, 0xcb, 0x20};
+    const uint8_t* sets[] = {kSps, kPps};
+    const size_t sizes[] = {sizeof(kSps), sizeof(kPps)};
+    CMFormatDescriptionRef format = nullptr;
+    if (CMVideoFormatDescriptionCreateFromH264ParameterSets(nullptr, 2, sets, sizes, 4, &format) != noErr)
+        return false;
+    const void* keys[] = {kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder};
+    const void* values[] = {kCFBooleanTrue};
+    CFDictionaryRef spec = CFDictionaryCreate(nullptr, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
+                                              &kCFTypeDictionaryValueCallBacks);
+    VTDecompressionSessionRef session = nullptr;
+    const OSStatus created = VTDecompressionSessionCreate(nullptr, format, spec, nullptr, nullptr, &session);
+    bool hardware = false;
+    if (created == noErr && session) {
+        CFBooleanRef using_hardware = nullptr;
+        if (VTSessionCopyProperty(session, kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                                  nullptr, &using_hardware) == noErr && using_hardware) {
+            hardware = CFBooleanGetValue(using_hardware);
+            CFRelease(using_hardware);
+        }
+        VTDecompressionSessionInvalidate(session);
+        CFRelease(session);
+    }
+    CFRelease(spec);
+    CFRelease(format);
+    std::fprintf(stderr, "[test] hardware H.264: capability query %s; a hardware session %s (status %d)\n",
+                 VTIsHardwareDecodeSupported(kCMVideoCodecType_H264) ? "yes" : "no",
+                 hardware ? "yes" : "no", static_cast<int>(created));
+    return hardware;
+}
 
 // This process's open_memory temporary copies (the backend's own prefix, which carries our pid,
 // so a concurrent run of this test in another process cannot change the count).
@@ -121,12 +160,12 @@ protected:
         ASSERT_TRUE(install_videotoolbox_backend());
         vb_ = backend();
         ASSERT_NE(vb_, nullptr);
-        // The hardware gate, exercised in whichever direction this host allows. A host with a
-        // hardware H.264 decoder (every Apple Silicon and recent Intel Mac) runs every case through
-        // it. A host without one -- a virtualised CI runner may expose none -- must REFUSE without
+        // The hardware gate, exercised in whichever direction this host allows. A host that can
+        // open a hardware H.264 session (every Apple Silicon and recent Intel Mac) runs every case
+        // through it. A host that cannot -- a virtualised CI runner -- must REFUSE without
         // the explicit override, which is asserted here, and only then runs the same checks in
         // software.
-        hardware_ = VTIsHardwareDecodeSupported(kCMVideoCodecType_H264);
+        hardware_ = hardware_h264_session_available();
         // This test binary owns PROSPER_AVP_ALLOW_SOFTWARE: every case starts with it unset and
         // TearDown unsets it again, so no case inherits another's software arm.
         unsetenv("PROSPER_AVP_ALLOW_SOFTWARE");
