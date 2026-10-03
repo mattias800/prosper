@@ -2309,8 +2309,7 @@ int main() {
         if (enabled) {
             const long first_render = at("Rd-");
             const long label_retire = at("X0");
-            CHECK(first_render == 0 && label_retire > first_render &&
-                      label_retire < final_callback,
+            CHECK(first_render == 0 && label_retire > first_render && label_retire < final_callback,
                   "a deferred batch is retired before the ordered label write lands");
             CHECK(at("X1") > label_retire && at("X1") < final_callback,
                   "post-label deferred work retires before final publication");
@@ -2651,15 +2650,14 @@ int main() {
                 ++empty_terminal_callbacks;
                 const auto phase = live_render_phase();
                 empty_terminal_shape &= phase.final_span && !phase.first_span &&
-                    phase.source_submit == 781 && !phase.defer_batch_completion;
+                                        phase.source_submit == 781 && !phase.defer_batch_completion;
                 return RenderedFrame{};
             }
             ++producer_callbacks;
             const auto phase = live_render_phase();
-            producer_shape &= phase.first_span && !phase.final_span &&
-                phase.source_submit == 781;
-            renderer_saw_resource = items.front().prt &&
-                items.front().prt->by_binding(32) != nullptr;
+            producer_shape &= phase.first_span && !phase.final_span && phase.source_submit == 781;
+            renderer_saw_resource =
+                items.front().prt && items.front().prt->by_binding(32) != nullptr;
             cbuffer = post_bytes;
             return RenderedFrame{};
         });
