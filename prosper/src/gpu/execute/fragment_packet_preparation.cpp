@@ -79,12 +79,53 @@ std::shared_ptr<const FragmentPacketPreparation> prepare_fragment_packet_inputs(
         gap("packet-entry-float-launch-unavailable");
     if (!in.float_transport.canonical() || !in.float_transport.explicit_nonfinite32())
         gap("packet-entry-float-transport-unavailable");
+    bool scalar_demand = false;
+    if (source_available && in.vgpr_requirements &&
+        in.vgpr_requirements->source_words == in.raw_code.get() &&
+        in.vgpr_requirements->scalar_reads.source_words == in.raw_code.get()) {
+        const auto& reads = in.vgpr_requirements->scalar_reads;
+        result->scalar_read_requirements =
+            std::shared_ptr<const FragmentPacketScalarReadRequirements>(in.vgpr_requirements,
+                                                                        &reads);
+        scalar_demand = reads.has_smem;
+        if (!reads.rejection.empty()) {
+            result->unmet.push_back(reads.rejection);
+        } else if (scalar_demand) {
+            bool complete = result->user_sgpr_count_available;
+            for (uint32_t index = 0; index < reads.sites.size() && complete; ++index) {
+                FragmentPacketPreparation::ScalarDescriptorObservation observed;
+                observed.site_index = index;
+                for (uint32_t word = 0; word < 4; ++word) {
+                    const uint32_t reg = reads.sites[index].entry_words[word];
+                    if (reg >= result->user_sgpr_count ||
+                        !(in.entry.user_data_available & (uint32_t(1) << reg))) {
+                        complete = false;
+                        result->unmet.push_back(
+                            "packet-scalar-descriptor-user-word-unavailable:pc=" +
+                            std::to_string(reads.sites[index].pc));
+                        break;
+                    }
+                    observed.descriptor[word] = in.entry.user_data[reg];
+                }
+                if (complete) result->scalar_descriptors.push_back(observed);
+            }
+            if (!complete) {
+                result->scalar_descriptors.clear();
+                if (!result->user_sgpr_count_available)
+                    gap("packet-scalar-descriptor-user-prefix-unavailable");
+            }
+        }
+        if (scalar_demand) gap("packet-scalar-live-read-lease-unimplemented");
+    } else {
+        gap("packet-scalar-program-requirements-unavailable");
+    }
     if (!in.ps_resources.observed || !in.ps_resources.table)
         gap("packet-resource-identity-unavailable");
     if (!in.ps_resources.rejection.empty()) result->unmet.push_back(in.ps_resources.rejection);
     if (in.ps_resources.table) {
         const auto& resources = in.ps_resources.table->resources;
-        if (!resources.empty()) gap("packet-resource-guest-fetch-and-read-point-unproved");
+        if (scalar_demand || !resources.empty())
+            gap("packet-resource-guest-fetch-and-read-point-unproved");
         for (const auto& resource : resources)
             if (resource.cls == ResourceClass::Texture || resource.cls == ResourceClass::StorageImage ||
                 resource.cls == ResourceClass::Sampler) {
