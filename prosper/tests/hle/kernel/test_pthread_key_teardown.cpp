@@ -132,6 +132,7 @@ extern "C" GUEST_ABI void* worker_forever(void*) {
 pthread_key_t g_k4{};
 std::atomic<unsigned> g_n4{0};
 std::atomic<bool> g_armed4{false};
+std::atomic<bool> g_release4{false};
 
 extern "C" GUEST_ABI void dtor_deleted(void*) {
     g_n4.fetch_add(1, std::memory_order_relaxed);
@@ -140,6 +141,13 @@ extern "C" GUEST_ABI void dtor_deleted(void*) {
 extern "C" GUEST_ABI void* worker_deleted(void*) {
     pthread_setspecific(g_k4, (void*)0x4444);
     g_armed4.store(true, std::memory_order_release);
+    // Stay alive until the main thread has deleted the key. Returning earlier would run
+    // teardown -- and a correct destructor call -- BEFORE the delete, which reads exactly like
+    // a deleted-key destructor firing. Bounded so a broken main thread cannot hang the test.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!g_release4.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
     return nullptr;
 }
 
@@ -225,6 +233,8 @@ TEST(PthreadKeyTeardown, DeletedKeyDropsValueSilently) {
 #ifdef _WIN32
     // M2 DIVERGENCE (measured): winpthreads fires the destructor once for a
     // deleted key; POSIX and FreeBSD (thr_spec.c:133-144) require silence.
+    // M2 was measured before the worker was held alive across the delete, so it
+    // may be the teardown race this case now excludes; re-measure before relying on it.
     // Skipped loudly rather than blessed: encoding `1` would pin a POSIX
     // violation as the contract, and asserting `0` would go red on every
     // Windows run. An HLE-side pre-clear would fix this for real.
@@ -234,6 +244,7 @@ TEST(PthreadKeyTeardown, DeletedKeyDropsValueSilently) {
     init_hle();
     g_n4.store(0);
     g_armed4.store(false);
+    g_release4.store(false);
     g_k4 = (pthread_key_t)make_key((void*)dtor_deleted);
     uint64_t thread = 0;
     ASSERT_EQ(g_thread_create((uint64_t)(uintptr_t)&thread, 0, (uint64_t)(uintptr_t)worker_deleted,
@@ -242,9 +253,15 @@ TEST(PthreadKeyTeardown, DeletedKeyDropsValueSilently) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!g_armed4.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
         std::this_thread::yield();
-    ASSERT_TRUE(g_armed4.load(std::memory_order_acquire)) << "worker armed its value";
-    EXPECT_EQ(g_key_delete((uint64_t)g_k4, 0, 0, 0, 0, 0), 0ull);
+    const bool armed = g_armed4.load(std::memory_order_acquire);
+    // The worker is still inside its entry point here, so its value is live while the key is
+    // deleted, and no destructor can have run yet.
+    EXPECT_EQ(g_n4.load(), 0u) << "control: the worker has not exited before the delete";
+    const uint64_t deleted = armed ? g_key_delete((uint64_t)g_k4, 0, 0, 0, 0, 0) : ~0ull;
+    g_release4.store(true, std::memory_order_release);  // release on every path, then join
     EXPECT_EQ(g_thread_join(thread, 0, 0, 0, 0, 0), 0ull);
+    ASSERT_TRUE(armed) << "worker armed its value";
+    EXPECT_EQ(deleted, 0ull);
     EXPECT_EQ(g_n4.load(), 0u) << "deleted key: value dropped, destructor silent";
 #endif
 }
