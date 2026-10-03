@@ -26,6 +26,7 @@ doc in the folder whose question it answers, not beside whatever you last opened
 | `process/` | How we work: verification, debugging workflows, diagnostics policy, bug-hunt backlog, multi-lane orchestration, session start |
 | `games/` | Per-title `*_STATUS.md` (each carries a `## Ruled out`), plus title handoffs and surveys |
 | `games/messenger/` | The Messenger bring-up history (reconnaissance, cutscene, deserialisation, black-render investigations) |
+| `archive/` | Superseded or fully resolved docs kept for the evidence trail. Each carries a banner; never start work from one |
 | `evidence/`, `screenshots/` | Raw measurement output and committed captures cited by the docs above |
 
 Cite docs by full path (`prosper/docs/gpu/GRAPHICS.md`); file names are unique repo-wide, so a bare

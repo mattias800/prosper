@@ -1,6 +1,7 @@
 // The shipped detile module runs on Vulkan and must match the established CPU
 // address walk and scalar half conversion, including padding and pipe XOR.
 #include "fixtures/compute_runner.h"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/texture/tile.hpp"
@@ -12,7 +13,7 @@
 #include <cstring>
 #include <vector>
 
-int main() {
+TEST(GpuDetile, Contract) {
   using namespace prosper::gpu;
   int failures = 0;
   auto check = [&](bool good, const char *message) {
@@ -146,5 +147,5 @@ int main() {
                  (i < expected.size() ? expected[i] : 0);
     check(correct, "GPU reads directly seeded independent address witnesses");
   }
-  return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }

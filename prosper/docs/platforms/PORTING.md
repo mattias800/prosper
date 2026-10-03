@@ -125,7 +125,7 @@ futex, debug registers for HWBP/HWWATCH, `VirtualQuery` instead of `/proc/self/m
 Two genuinely hard sub-problems:
 
 1. **SysV ⇄ MS-x64 ABI** at every guest↔host call boundary (already flagged in
-   `ROADMAP.md:297`). With clang or MinGW-GCC this is mostly *free*: mark HLE entry points
+   `archive/ROADMAP_HISTORY.md:297`). With clang or MinGW-GCC this is mostly *free*: mark HLE entry points
    `__attribute__((sysv_abi))` so guest code calls them directly; host→guest calls (init arrays,
    `run_entry`, callbacks) get the inverse annotation on the function-pointer types. A handful of
    variadic/trampoline cases need hand care. Full hand-written trampolines are the fallback, not

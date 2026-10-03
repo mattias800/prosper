@@ -242,8 +242,8 @@ The standing warnings that are **not** title-specific:
 
 ### Superseded documents
 
-`docs/gpu/NEXT_STEP_VERTEX_FETCH.md` (bindless-dynamic vertex fetch, superseded 2026-07-11) and
-`docs/gpu/RENDER_LOOP.md` (the render bring-up log) are historical records. Both frontiers are complete:
+`docs/archive/NEXT_STEP_VERTEX_FETCH.md` (bindless-dynamic vertex fetch, superseded 2026-07-11) and
+`docs/archive/RENDER_LOOP.md` (the render bring-up log) are historical records. Both frontiers are complete:
 both shader stages recompile and dynamic V#/T#/S# resources resolve on current `main`, and the
 render-loop frontier is complete. Each carries its own superseded banner — do not start work from
 either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.

@@ -1164,6 +1164,47 @@ int main() {
               "an empty or absent program is not a proof of anything");
     }
 
+    {
+        // rdna2_instruction_may_write_memory: fail-closed classification of memory writers.
+        // Encodings are the gfx1030 words these shaders compile to (buffer_load_dwordx4 is op 0xe,
+        // established above by llvm-mc).
+        const auto decode2 = [](uint32_t w0, uint32_t w1) {
+            const uint32_t words[2] = { w0, w1 };
+            return rdna2_decode_one(words, 2);
+        };
+        CHECK(!rdna2_instruction_may_write_memory(mb),
+              "buffer_load_dwordx4 does not write memory");
+        CHECK(rdna2_instruction_may_write_memory(decode2(0xE0782000u, 0x80020008u)),
+              "buffer_store (MUBUF op 0x1e) writes memory");
+        CHECK(!rdna2_instruction_may_write_memory(decode2(0xE030102Cu, 0x80030607u)),
+              "buffer_load_dword (MUBUF op 0xc) does not write memory");
+        CHECK(!rdna2_instruction_may_write_memory(decode2(0xF11C0108u, 0x00070103u)),
+              "an image sample (MIMG op 0x47) does not write memory");
+        CHECK(rdna2_instruction_may_write_memory(decode2(0xF0200108u, 0x00020009u)),
+              "image_store (MIMG op 0x8) writes memory");
+        CHECK(rdna2_instruction_may_write_memory(decode2(0xF4400400u, 0xFA000020u)),
+              "an SMEM operation above the load range is treated as a writer");
+        Rdna2Inst synthetic{};
+        synthetic.fmt = Rdna2Format::MUBUF;
+        synthetic.opcode = 0x32u;   // buffer_atomic_add
+        CHECK(rdna2_instruction_may_write_memory(synthetic), "a MUBUF atomic writes memory");
+        synthetic.opcode = 0x20u;   // an opcode the classification does not list as a read
+        CHECK(rdna2_instruction_may_write_memory(synthetic),
+              "an unlisted MUBUF opcode is reported as a writer (fail closed)");
+        synthetic.fmt = Rdna2Format::FLAT;
+        synthetic.opcode = 0x0cu;   // flat/global load dword
+        CHECK(!rdna2_instruction_may_write_memory(synthetic), "a FLAT load does not write memory");
+        synthetic.opcode = 0x1cu;   // flat/global store dword
+        CHECK(rdna2_instruction_may_write_memory(synthetic), "a FLAT store writes memory");
+        synthetic.fmt = Rdna2Format::MTBUF;
+        synthetic.opcode = 0x01u;
+        CHECK(!rdna2_instruction_may_write_memory(synthetic), "tbuffer_load_format does not write memory");
+        synthetic.opcode = 0x05u;
+        CHECK(rdna2_instruction_may_write_memory(synthetic), "tbuffer_store_format writes memory");
+        synthetic.fmt = Rdna2Format::VOP1;
+        CHECK(!rdna2_instruction_may_write_memory(synthetic), "a non-memory instruction is not a writer");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

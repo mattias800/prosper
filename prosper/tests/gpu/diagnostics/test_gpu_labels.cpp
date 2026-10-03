@@ -3,6 +3,7 @@
 // Proves WHAT is recorded: the label text, its colour class, and begin/end pairing. It cannot prove
 // how RenderDoc or RGP display the result; that is a local look at a real capture (see the PR).
 #include "gpu/diagnostics/gpu_breadcrumbs.hpp"
+#include <gtest/gtest.h>
 #include "gpu/diagnostics/gpu_labels_vk.hpp"
 
 #include <cstdint>
@@ -12,9 +13,7 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 
@@ -111,12 +110,10 @@ void null_device_resolves_to_nothing() {
 
 } // namespace
 
-int main() {
+TEST(GpuLabels, Contract) {
     std::printf("== label text and pairing ==\n");        label_text_and_pairing();
     std::printf("== shared identity with verdicts ==\n"); shared_identity_with_verdicts();
     std::printf("== draw vs dispatch colours ==\n");      colours_separate_draws_from_dispatches();
     std::printf("== unusable dispatch ==\n");             unusable_dispatch_is_a_no_op();
-    std::printf("== null device ==\n");                   null_device_resolves_to_nothing();
-    std::printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
+    null_device_resolves_to_nothing();
 }

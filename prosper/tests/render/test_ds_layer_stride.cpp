@@ -20,16 +20,13 @@
 // base-alone keying fails arms 1-3 outright, and collapsing the recorder/lookup identity fails arm 8; they are constructed by hand at this header's own production functions, which are
 // the ones the renderer calls.
 #include "fixtures/render_runner.h"
+#include <gtest/gtest.h>
 #include "hle/dispatch/dispatch.hpp"
 
 #include <cstdio>
 #include <cstdint>
 
-static int failures = 0;
-static void check(bool ok, const char* what) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++failures; }
-    else std::fprintf(stderr, "ok: %s\n", what);
-}
+static void check(bool ok, const char* what) { EXPECT_TRUE(ok) << what; }
 
 using prosper::test::ds_layer_stride_for;
 using prosper::test::ds_stride_identity_base;
@@ -37,7 +34,7 @@ using prosper::test::note_ds_layer_stride;
 using prosper::test::PersistentDsKey;
 using prosper::test::PersistentDsKeyHash;
 
-int main() {
+TEST(DsLayerStride, Contract) {
     // Invalidation now checks physical mapping topology. Give the end-to-end cases one
     // tracked guest allocation with disjoint subranges; synthetic VAs cannot prove that a
     // write did not alias a retained depth or stencil plane.
@@ -45,13 +42,13 @@ int main() {
     auto map_flexible = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
     auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
     check(map_flexible && unmap, "guest mapping APIs available for topology checks");
-    if (!map_flexible || !unmap) return 1;
+    if (!map_flexible || !unmap) FAIL() << "legacy early exit";
     uint64_t mapped_base = 0;
     constexpr uint64_t MappedBytes = 0x2000000;
     check(map_flexible(reinterpret_cast<uint64_t>(&mapped_base), MappedBytes, 2, 0,
                        reinterpret_cast<uint64_t>("ds-stride-topology"), 0) == 0 && mapped_base,
           "depth and stencil test planes have tracked guest backing");
-    if (!mapped_base) return 1;
+    if (!mapped_base) FAIL() << "legacy early exit";
     struct MappingGuard {
         prosper::HleFn unmap;
         uint64_t base, bytes;
@@ -362,7 +359,4 @@ int main() {
         check(sel.faces[5] == nullptr, "face 5 is null");
     }
 
-    if (failures) { std::fprintf(stderr, "== FAIL: %d ==\n", failures); return 1; }
-    std::fprintf(stderr, "== PASS ==\n");
-    return 0;
 }

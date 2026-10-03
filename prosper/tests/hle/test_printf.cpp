@@ -4,6 +4,7 @@
 // registered function pointer and calls it through its TRUE variadic signature (same SysV ABI the
 // guest uses via the tail-jump stub), exercising the register + XMM + stack capture end to end.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "host/abi/sysv_ms_bridge.hpp"
 #include "../fixtures/test_scratch.h"
@@ -20,10 +21,8 @@
 
 using namespace prosper;
 
-static int fails = 0;
-static int checks = 0;
-#define CHECK(c, m) do { ++checks; if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+static int checks = 0;   // the test asserts how many CHECKs ran, so the macro keeps counting
+#define CHECK(c, m) do { ++checks; EXPECT_TRUE(c) << (m); } while (0)
 
 // PROSPER_GUEST_ABI is what makes the comment above TRUE rather than aspirational. These handlers
 // are compiled in the GUEST's convention (#3246), which on Windows is not the host's -- so an
@@ -100,7 +99,7 @@ struct StdoutCapture {
     ~StdoutCapture() { restore(); if (file) fclose(file); }
 };
 
-int main() {
+TEST(Printf, Contract) {
     printf("== test_printf ==\n");
     register_builtin_hle();
 
@@ -111,7 +110,7 @@ int main() {
     auto spf  = Hle::lookup_guest_abi<int, char*, const char*>(nid_hash("sprintf"));
     auto snfs = Hle::lookup_guest_abi<int, char*, size_t, const char*>(nid_hash("snprintf_s"));
     CHECK(snf && spf && snfs, "printf-family fns registered");
-    if (!(snf && spf && snfs)) { printf("== FAIL ==\n"); return 1; }
+    if (!(snf && spf && snfs)) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     char buf[256];
 
@@ -148,13 +147,13 @@ int main() {
     // Ten GP and ten FP arguments spill past BOTH SysV register files for every variant.
     auto pf = Hle::lookup_guest_abi<int, const char*>(nid_hash("printf"));
     CHECK(pf != nullptr, "printf registered with the true guest signature");
-    if (!pf) return 1;
+    if (!pf) FAIL() << "legacy early exit";
     TailJumps jumps;
     auto stub_sn = jumps.add(0, snf);
     auto stub_sp = jumps.add(1, spf);
     auto stub_pf = jumps.add(2, pf);
     CHECK(stub_sn && stub_sp && stub_pf, "all three production tail-jump stubs installed");
-    if (!(stub_sn && stub_sp && stub_pf)) return 1;
+    if (!(stub_sn && stub_sp && stub_pf)) FAIL() << "legacy early exit";
     const char* fmt = "%d/%.1f|%d/%.1f|%d/%.1f|%d/%.1f|%d/%.1f|%d/%.1f|%d/%.1f|%d/%.1f|%d/%.1f|%d/%.1f";
     const char* expected = "1/0.5|2/1.5|3/2.5|4/3.5|5/4.5|6/5.5|7/6.5|8/7.5|9/8.5|10/9.5";
 #define MIXED_VALUES 1, 0.5, 2, 1.5, 3, 2.5, 4, 3.5, 5, 4.5, 6, 5.5, 7, 6.5, 8, 7.5, 9, 8.5, 10, 9.5
@@ -182,8 +181,4 @@ int main() {
     CHECK(r == (int)strlen(expected), "printf stub returns exact mixed-overflow length");
     CHECK(strcmp(observed, expected) == 0, "printf stub delivers GP and FP overflow");
     CHECK(checks == 18, "all direct and emitted-stub assertions executed");
-
-    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
-    printf("== PASS: %d checks ==\n", checks);
-    return 0;
 }

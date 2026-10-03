@@ -5,6 +5,7 @@
 // and run through a real Vulkan pipeline. The fullscreen triangle covers the whole viewport, so we
 // assert every sampled pixel is GREEN — proving RDNA2 vertex+pixel -> our SPIR-V -> rendered frame.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "fixtures/render_runner.h"
 #include <cstdio>
 #include <cstdint>
@@ -13,11 +14,9 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(RecompiledShaders, Contract) {
     printf("== test_recompiled_shaders ==\n");
     const uint32_t W = 64, H = 64;
 
@@ -33,11 +32,11 @@ int main() {
     std::vector<uint32_t> frag = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]));
     CHECK(!vert.empty() && vert[0] == 0x07230203u, "recompiled RDNA2 vertex shader -> SPIR-V");
     CHECK(!frag.empty() && frag[0] == 0x07230203u, "recompiled RDNA2 pixel shader  -> SPIR-V");
-    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); return 1; }
+    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vert, frag, W, H);
     CHECK(px.size() == (size_t)W * H * 4, "pipeline accepted both recompiled shaders + rendered");
-    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: render failed ==\n"); return 1; }
+    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: render failed ==\n"); FAIL() << "legacy early exit"; }
 
     // The fullscreen triangle covers the whole viewport -> every sampled pixel is green.
     auto isGreen = [&](uint32_t x, uint32_t y) {
@@ -382,7 +381,4 @@ int main() {
         vcc_data_prolog, std::size(vcc_data_prolog), nggvs, std::size(nggvs));
     CHECK(vcc_data_chain.empty(),
           "split-stage scalar mask plumbing does not bypass the NGG wave proof");
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

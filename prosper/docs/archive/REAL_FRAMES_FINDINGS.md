@@ -1,5 +1,7 @@
 # Real game frames — findings & fixes (2026-07-07 nuclear run)
 
+> **ARCHIVED (historical, 2026-07-07).** Both blockers listed here were resolved; The Messenger now renders its first level. Kept for the evidence trail.
+
 Goal: get *The Messenger* to render real frames in prosper. This documents where we got, the fixes made,
 and the two remaining blockers (with concrete next steps). Work done in the `ps5ys-frames` worktree.
 
