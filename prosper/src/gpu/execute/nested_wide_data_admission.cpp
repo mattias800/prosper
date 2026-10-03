@@ -540,6 +540,13 @@ bool validate_graphics_wave_outputs(const GraphicsWaveStagePlan& plan,
         const auto program = recompile_fragment_packet(packet);
         if (program.spirv.empty() || completed_records[wave].size() != program.output_words.size())
             return reject("graphics-wave-output-record-extent-invalid");
+        if (program.vgpr_status_offset != UINT32_MAX) {
+            const auto decoded = decode_fragment_packet(program, completed_records[wave], true);
+            if (!decoded.rejection.empty()) {
+                refusal = decoded.rejection;
+                return false;
+            }
+        }
         std::vector<Rdna2Inst> ins;
         if (rdna2_walk(packet.guest_code.data(), packet.guest_code.size(), ins) !=
             packet.guest_code.size())

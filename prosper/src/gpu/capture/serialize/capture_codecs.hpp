@@ -208,8 +208,9 @@ inline bool write_owned_wave_draw(Writer& w, const GpuCapturedDraw& draw, std::s
                 packet.raw_windows.size() != first.raw_windows.size() ||
                 packet.float_transport != draw.float_transport || packet.vgprs.size() != 2u ||
                 packet.vgprs[0].reg != 0u || packet.vgprs[1].reg != 3u ||
-                packet.exec_mask != UINT64_MAX || packet.vcc_mask || packet.scc ||
-                !packet.mask_state_available ||
+                packet.vgprs[0].available_mask != UINT64_MAX ||
+                packet.vgprs[1].available_mask != UINT64_MAX || packet.exec_mask != UINT64_MAX ||
+                packet.vcc_mask || packet.scc || !packet.mask_state_available ||
                 !std::all_of(packet.slots_available.begin(), packet.slots_available.end(),
                              [](bool b) { return b; }) ||
                 !std::all_of(packet.export_enabled.begin(), packet.export_enabled.end(),

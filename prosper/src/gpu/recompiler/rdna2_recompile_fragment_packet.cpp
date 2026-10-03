@@ -249,10 +249,12 @@ bool complete_graphics_packet_locals(const FragmentInvocationPacket& packet, std
         bool operator==(const Defined&) const = default;
     };
     Defined initial;
+    std::bitset<256> supplied_vectors;
     for (const auto& column : packet.vgprs) {
-        if (column.reg >= 256u || initial.vector[column.reg])
+        if (column.reg >= 256u || supplied_vectors[column.reg])
             return reject("stage-input-vector-duplicate");
-        initial.vector[column.reg] = UINT64_MAX;
+        supplied_vectors.set(column.reg);
+        initial.vector[column.reg] = column.available_mask;
     }
     for (const auto& [reg, value] : packet.sgprs) {
         (void)value;
@@ -429,7 +431,7 @@ bool complete_graphics_packet_locals(const FragmentInvocationPacket& packet, std
                     const bool first = in.fmt == Rdna2Format::VOP1 && in.opcode == 2u;
                     const bool lane = in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360u;
                     const uint64_t required =
-                        lane    ? UINT64_MAX
+                        in.fmt == Rdna2Format::EXP || lane ? UINT64_MAX
                         : first ? defined.possible_exec | (defined.certain_exec ? 0u : 1u)
                                 : defined.possible_exec;
                     if (reg < 0 || reg >= 256 || (defined.vector[reg] & required) != required)
@@ -547,14 +549,26 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
             return reject("packet-window-budget");   // refuse the whole domain, never clamp it
     }
     for (const auto& in : ins) pcs.insert(in.pc);
-    std::bitset<256> vector_writers;
-    for (const auto& in : ins)
+    // Storage inventory only: no value is supplied by allocating a destination or source slot.
+    std::bitset<256> owned_vector_storage;
+    for (const auto& in : ins) {
         for (uint32_t word = 0; word < rdna2_vgpr_write_count(in); ++word) {
             const int reg = in.dst.value + int(word);
             if (reg < 0 || reg >= 256)
                 return reject("packet-vector-destination-unimplemented", in.pc);
-            vector_writers.set(reg);
+            owned_vector_storage.set(reg);
         }
+        for (uint32_t source = 0; source < in.n_src; ++source) {
+            if (in.fmt == Rdna2Format::EXP && !(in.exp_en & (1u << source))) continue;
+            if (in.src[source].kind != OperandKind::VGPR) continue;
+            for (uint32_t word = 0; word < rdna2_vgpr_source_span(in, source); ++word) {
+                const int reg = in.src[source].value + int(word);
+                if (reg < 0 || reg >= 256)
+                    return reject("packet-vector-source-unimplemented", in.pc);
+                owned_vector_storage.set(reg);
+            }
+        }
+    }
     for (const auto& in : ins) {
         const char* gap = packet_instruction_gap(in, packet.stage);
         if (services && gap && !packet_resource_instruction_gap(in)) gap = nullptr;
@@ -654,17 +668,30 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     uint32_t scalar_failure_pc = UINT32_MAX;
     if (const auto* gap = packet_scalar_initialization_gap(ins, scalars, scalar_failure_pc, services != nullptr))
         return reject(gap, scalar_failure_pc);
+    auto requirements = fragment_packet_vgpr_requirements(packet.guest_code, ins);
+    // The independently published forward packet/resource domain owns VGP1 runtime validity.
+    // The live integer/raw-window domain also admits READFIRST and repeated events; its separate
+    // whole-original, per-slot MUST proof must succeed before emitting any module. A failed narrow
+    // resource inventory is never enough to admit a resource packet or a missing stage input.
+    const bool owned_input_proof =
+        !services && (packet.stage == GraphicsPacketStage::Vertex || !windows.empty() ||
+                      !requirements.rejection.empty());
     if (services) {
         if (const auto* gap = packet_resource_preflight(services->input, ins, scalar_failure_pc))
             return reject(gap, scalar_failure_pc);
-    } else {
+    } else if (owned_input_proof) {
         std::string input_failure;
         if (!complete_graphics_packet_locals(packet, input_failure))
             return reject("packet-input-definition-unproved:" + input_failure);
     }
 
-    const auto requirements = fragment_packet_vgpr_requirements(packet.guest_code, ins);
-    if (!requirements.rejection.empty()) return reject(requirements.rejection);
+    if (owned_input_proof) {
+        // This is NOT a resource read certificate. The strict stage proof above owns admission;
+        // the inventory below only allocates the original read/write slots for that proved path.
+        requirements = {};
+        requirements.storage = owned_vector_storage;
+    } else if (!requirements.rejection.empty())
+        return reject(requirements.rejection);
     bool runtime_definedness = wave_data != nullptr;
     for (uint32_t reg = 0; reg < 256; ++reg)
         if (requirements.storage.test(reg)) {

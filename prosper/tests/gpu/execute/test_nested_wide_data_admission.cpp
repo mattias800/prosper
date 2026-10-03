@@ -458,6 +458,17 @@ TEST(NestedWideDataAdmission, Contract) {
                                            "mode/flags/topology wave=1 pc=3",
                             "writer cannot discard compiler-observable VS mode, flags or topology");
                     }
+                    for (uint32_t column = 0; column < 2u; ++column) {
+                        auto partial = std::make_shared<GraphicsOwnedWaveDraw>(*captured_owner);
+                        partial->vertex.packets[1].vgprs[column].available_mask &=
+                            ~(uint64_t(1) << 63u);
+                        auto bad_subset = captured;
+                        bad_subset.draws[0].owned_waves = std::move(partial);
+                        std::vector<uint8_t> refused_bytes;
+                        expect(!serialize_gpu_capture(bad_subset, refused_bytes, refusal),
+                               "second-wave partial vertex/instance inputs cannot become full "
+                               "CAP70 replay authority");
+                    }
                     for (uint32_t i = 0; i < domain_bytes / 4u; ++i) words[i] ^= 0x02020202u;
                     std::vector<PacketRawWaveWindow> later;
                     expect(observe_graphics_raw_wave_windows(wave_code, scalars_for(base),

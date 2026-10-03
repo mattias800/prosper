@@ -411,6 +411,27 @@ int main(int argc, char** argv) {
                 entry.words[60];   // selected helper participates, never exports
         }
         sink_case(complete, want, "stage_quad_initialized_before_first", directory);
+        auto partial_entry = complete;
+        partial_entry.vgprs[0].available_mask = uint64_t(15u) << 60u;
+        check(prosper::gpu::complete_graphics_packet_locals(partial_entry, refusal),
+              "genuine quad input availability admits only its actual selected slots");
+        sink_case(partial_entry, want, "stage_quad_partial_genuine_inputs", directory);
+        partial_entry.vgprs[0].available_mask &= ~(uint64_t(1) << 61u);
+        check(!prosper::gpu::complete_graphics_packet_locals(partial_entry, refusal) &&
+                  refusal == "stage-input-vector-uninitialized:pc=1",
+              "zero storage cannot replace one absent WQM-active input lane");
+        auto raw_export = observed;
+        raw_export.guest_code = {0x7e100300u, 0x7e280508u, 0xf8001801u, 8u, 0xbf810000u};
+        check(!prosper::gpu::complete_graphics_packet_locals(raw_export, refusal) &&
+                  refusal == "stage-input-vector-uninitialized:pc=2" &&
+                  prosper::gpu::recompile_fragment_packet(raw_export).spirv.empty(),
+              "raw EXP observes inactive scratch payload before any module or publication");
+        auto genuine_inactive = entry;
+        genuine_inactive.reg = 8u;
+        raw_export.vgprs.push_back(genuine_inactive);
+        check(prosper::gpu::complete_graphics_packet_locals(raw_export, refusal) &&
+                  !prosper::gpu::recompile_fragment_packet(raw_export).spirv.empty(),
+              "same raw EXP accepts genuine old inactive payload beside its masked writer");
         auto absent_entry = observed;
         absent_entry.vgprs.clear();
         check(!prosper::gpu::complete_graphics_packet_locals(absent_entry, refusal) &&

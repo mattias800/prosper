@@ -203,6 +203,16 @@ TEST(FragmentPacketDefinedness, WholeStatusTailRequiredBeforeAnyExportPublicatio
     ASSERT_FALSE(p.spirv.empty()) << p.rejection;
     const auto good = evaluate(p, "status_wire_controls");
     ASSERT_FALSE(decode_fragment_packet(p, good, true).exports.empty());
+    GraphicsWaveStagePlan plan;
+    plan.assembly = GraphicsWaveAssembly::FragmentPrimitiveQuadOrder;
+    plan.packets = {input, input};
+    plan.invocations.resize(2);
+    GraphicsWaveOutputTransaction transaction;
+    std::string transaction_refusal;
+    ASSERT_TRUE(
+        validate_graphics_wave_outputs(plan, {good, good}, transaction, transaction_refusal))
+        << transaction_refusal;
+    EXPECT_EQ(transaction.records.size(), 2u);
     const auto refused = [&](const auto& program, const auto& words, bool completed = true) {
         const auto result = decode_fragment_packet(program, words, completed);
         EXPECT_TRUE(result.exports.empty());
@@ -240,6 +250,14 @@ TEST(FragmentPacketDefinedness, WholeStatusTailRequiredBeforeAnyExportPublicatio
     EXPECT_EQ(failed.pc, 1u);
     EXPECT_EQ(failed.reg, 1u);
     EXPECT_EQ(failed.kind, 4u);
+    EXPECT_FALSE(
+        validate_graphics_wave_outputs(plan, {good, bad}, transaction, transaction_refusal));
+    EXPECT_TRUE(transaction.records.empty()) << "failed last wave cannot publish the first";
+    EXPECT_EQ(transaction_refusal, "packet-vgpr-raw-export-unavailable");
+    ASSERT_TRUE(
+        validate_graphics_wave_outputs(plan, {good, good}, transaction, transaction_refusal))
+        << transaction_refusal;
+    EXPECT_EQ(transaction.records.size(), 2u) << "fresh complete status restores the transaction";
     bad[late + 1] = 4095;
     malformed_status(bad);   // plausible range != actual original read PC
     bad[late + 1] = 1;

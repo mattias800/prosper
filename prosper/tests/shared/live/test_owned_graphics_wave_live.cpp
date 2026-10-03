@@ -163,8 +163,12 @@ static std::vector<uint32_t> fragment_code(bool per_wave, bool wide8) {
          0xbf0a821eu});   // s_cmp_lt_u32 s30,2
     const int32_t displacement = int32_t(event) - int32_t(code.size() + 1u);
     code.push_back(0xbf850000u | uint16_t(displacement));
-    code.insert(code.end(), {0x7e0202ffu, 0x3f000000u, 0x7e0402ffu, 0x3f400000u, 0x7e0602f2u,
-                             0xf800180fu, 0x03020100u, 0xbf810000u});
+    // The raw packet ABI observes enabled EXP payload even in nonexporting helper slots. Restore
+    // full EXEC and write the final current SMEM colour in every lane; helper export eligibility
+    // remains independently false in the actual collected packet/attachment commit.
+    code.insert(code.end(),
+                {0xbefe04c1u, 0x7e000200u | (wide8 ? 31u : 27u), 0x7e0202ffu, 0x3f000000u,
+                 0x7e0402ffu, 0x3f400000u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u});
     return code;
 }
 
