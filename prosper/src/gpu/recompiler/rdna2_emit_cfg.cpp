@@ -3260,6 +3260,9 @@ bool emit_cfg_state_machine(
             if (packet_wqm && !packet_wqm_mask_source && !packet_wqm_scalar_source &&
                 !packet_wqm_constant_source)
                 return reject_cfg(in.pc, "packet-wqm-source-state-unavailable");
+            if (const char* gap =
+                    packet_exec_mask_source_gap(b, in, masks, scalar_words, ambiguous))
+                return reject_cfg(in.pc, gap);
             for (uint32_t source = 0; source < in.n_src; ++source) {
                 const Operand& operand = in.src[source];
                 if (operand.kind != OperandKind::SGPR &&
