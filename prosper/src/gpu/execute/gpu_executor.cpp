@@ -1045,6 +1045,13 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
             result->owned_raw_x2_write_plan =
                 raw_snapshot_write_plan(decoded, result->owned_raw_x2_chains);
         result->raw_nested_numeric_load_pcs = rdna2_raw_nested_numeric_loads(decoded);
+        if (!PROSPER_ENV_ON("PROSPER_NO_OWNED_WAVE_CLASSIFICATION_CACHE")) {
+            // Match the registered-original consumer exactly, including a truncated final
+            // instruction: it walks only the consumed prefix, not the unconsumed snapshot tail.
+            std::vector<Rdna2Inst> original;
+            rdna2_walk(result->code.data(), result->code.size(), original);
+            result->requires_owned_waves = !rdna2_raw_wave_wide_data_loads(original).empty();
+        }
         retain_fold_instructions(decoded, result->instructions);
         std::vector<Rdna2Inst> shader_constant_decoded = decoded;
         result->shader_constant_specialized =
@@ -7143,7 +7150,8 @@ std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
     return merged;
 }
 
-SharedShaderWords registered_graphics_original(uint64_t address) {
+SharedShaderWords registered_graphics_original(uint64_t address, bool* requires_owned_waves) {
+    if (requires_owned_waves) *requires_owned_waves = false;
     const auto* header =
         static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(address));
     if (!header) return {};
@@ -7151,6 +7159,7 @@ SharedShaderWords registered_graphics_original(uint64_t address) {
     if (!count) return {};
     const auto analysis =
         decode_shader_cached(reinterpret_cast<const uint32_t*>(uintptr_t(address)), count);
+    if (requires_owned_waves) *requires_owned_waves = analysis->requires_owned_waves;
     return SharedShaderWords(analysis, &analysis->code);
 }
 
