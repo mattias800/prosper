@@ -85,23 +85,16 @@ uint32_t capacity_matches(SpirvCompute& b, const DrawWords& authority,
 }
 
 // This first attachment recipe is deliberately single-MRT/uncompressed. This restriction belongs
-// to the replay recipe, not the logical64 compiler or full-support goal. The live admission owner
-// must additionally require the Architectural export policy once that dependency is accepted;
-// LegacyRaw is retained here solely for same-code CPU wire/fault controls.
-uint32_t export_recipe(const FragmentDrawCapacity& capacity, Rdna2Inst& site) {
+// to the replay recipe, not the logical64 compiler or full-support goal. LegacyRaw cannot build
+// an attachment consumer: immutable policy, original ISA inventory and emitted marker must agree.
+uint32_t export_recipe(const FragmentDrawCapacity& capacity, FragmentPacketExportSite& site) {
     const auto& kernel = *capacity.kernel();
-    uint32_t sites = 0;
-    for (const auto& instruction : kernel.instructions)
-        if (instruction.fmt == Rdna2Format::EXP) {
-            site = instruction;
-            ++sites;
-        }
-    if (sites != 1 || site.exp_target != 0 || site.exp_en != 15 || site.exp_compr ||
-        !(site.words[0] & (1u << 11)) || !(site.words[0] & (1u << 12)) ||
-        kernel.program.packet.exports_per_lane != 1 || kernel.program.status_offset % 64)
+    if (!fragment_draw_architectural_exports_match(kernel) || capacity.export_sites().size() != 1 ||
+        capacity.export_sites() != kernel.program.packet.export_sites)
         return 0;
-    const auto words = kernel.program.status_offset / 64;
-    if (words != kFragmentPacketExportWords && words != 14) return 0;
+    site = capacity.export_sites().front();
+    if (site.target != 0 || site.en != 15 || site.compr || !site.done || !site.vm) return 0;
+    constexpr auto words = kFragmentPacketArchitecturalExportWords;
     const auto validity_words = kernel.program.packet.vgpr_status_offset == UINT32_MAX
                                     ? 0u
                                     : 64 * kFragmentPacketVgprStatusWords;
@@ -157,7 +150,7 @@ PixelCoordinate pixel_center(SpirvCompute& b, uint32_t raw, uint32_t extent) {
 std::vector<uint32_t> build_fragment_draw_validation(const FragmentDrawCapacity& capacity,
                                                      const RasterQuadCollector& collector) {
     if (!capacity.matches_collector(collector)) return {};
-    Rdna2Inst export_site{};
+    FragmentPacketExportSite export_site{};
     const auto export_words = export_recipe(capacity, export_site);
     if (!export_words || collector.record_words != collector.lane_words * 4) return {};
     const auto& program = capacity.kernel()->program;
@@ -277,7 +270,7 @@ std::vector<uint32_t> build_fragment_draw_validation(const FragmentDrawCapacity&
                 matching = b.ucmp(
                     Op_IEqual, value(field),
                     b.sel(b.ucmp(Op_IEqual, value(1), b.uconst(1)), b.uconst(15), b.uconst(0)));
-            if (export_words == 14 && field < 12)
+            if (field < 12)
                 matching = b.lor(b.ucmp(Op_IEqual, value(1), b.uconst(1)),
                                  b.ucmp(Op_IEqual, value(field), b.uconst(0)));
             export_valid =
@@ -285,6 +278,13 @@ std::vector<uint32_t> build_fragment_draw_validation(const FragmentDrawCapacity&
                                            b.land(b.logical_not(reached),
                                                   b.ucmp(Op_IEqual, value(field), b.uconst(0)))));
         }
+        // The first recipe proves a dominating full EXEC writer. An occupied original raster
+        // pixel must therefore have an active complete EXP, including genuine zero payloads.
+        // Missing/inactive late pixels refuse the ENTIRE draw, never a partial replay/discard.
+        const auto occupied_export =
+            b.land(reached, b.land(b.ucmp(Op_IEqual, value(1), b.uconst(1)),
+                                   b.ucmp(Op_IEqual, value(13), b.uconst(15))));
+        export_valid = b.land(export_valid, b.lor(b.logical_not(occupied), occupied_export));
         note(b.logical_not(export_valid), FragmentDrawFailure::GuestExport);
         const auto active = begin_if(b, occupied);
         const auto coordinate = [&](uint32_t field) {
@@ -381,7 +381,7 @@ std::vector<uint32_t> build_fragment_draw_validation(const FragmentDrawCapacity&
 std::vector<uint32_t> build_fragment_draw_replay(const FragmentDrawCapacity& capacity,
                                                  const RasterQuadCollector& collector) {
     if (!capacity.matches_collector(collector)) return {};
-    Rdna2Inst export_site{};
+    FragmentPacketExportSite export_site{};
     const auto export_words = export_recipe(capacity, export_site);
     if (!export_words) return {};
     SpirvCompute b;

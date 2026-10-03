@@ -82,6 +82,15 @@ TEST_F(FragmentDrawExec, ThreeLogicalWavesCommitAllOriginalRawPixelComponents) {
     ASSERT_EQ(*draw.fragment_draw_inputs->raw_code, f::fragment_words());
     pixels(render({backend(draw)}), f::width, f::height, f::color_a);
 }
+TEST_F(FragmentDrawExec, OriginalObservedZeroIsDataNotMissingExportAuthority) {
+    g::DrawItem draw;
+    const std::array<float, 4> zero{};
+    ASSERT_NE(zero, seed);
+    ASSERT_TRUE(f::realize(draw, zero));
+    ASSERT_TRUE(draw.fragment_draw_inputs);
+    ASSERT_EQ(*draw.fragment_draw_inputs->raw_code, f::fragment_words());
+    pixels(render({backend(draw)}), f::width, f::height, zero);
+}
 TEST_F(FragmentDrawExec, OriginalOrderedReplayUsesNormalFixedFunctionBlend) {
     g::DrawItem a, b;
     ASSERT_TRUE(f::realize(a, f::color_a));
@@ -158,6 +167,7 @@ TEST_F(FragmentDrawExec, DeadSourceRetirementPreservesRetainedPipelinePayloads) 
     std::shared_ptr<const r::FragmentDrawComputeGpuProgram> compute;
     std::shared_ptr<const r::FragmentDrawCollectGpuProgram> collect;
     std::shared_ptr<const r::FragmentDrawCollectFramebuffer> framebuffer;
+    std::shared_ptr<const std::vector<uint32_t>> vertex_storage;
     std::weak_ptr<const std::vector<uint32_t>> source;
     VkPipeline original_compute = VK_NULL_HANDLE, original_collect = VK_NULL_HANDLE;
     VkFramebuffer original_framebuffer = VK_NULL_HANDLE;
@@ -167,13 +177,19 @@ TEST_F(FragmentDrawExec, DeadSourceRetirementPreservesRetainedPipelinePayloads) 
         const auto prepared = f::prepare(draw);
         ASSERT_TRUE(prepared && draw.fragment_draw_inputs && draw.vs_shared);
         source = draw.fragment_draw_inputs->raw_code;
+        // The VS view shares the PS generation's control block, while independent owned vertex
+        // storage stays valid through this case. An accidental cached strong VS view would keep
+        // the tracked PS analysis alive and defeat retirement; the generic ledger cannot catch it.
+        vertex_storage = draw.vs_shared;
+        const std::shared_ptr<const std::vector<uint32_t>> aliased_vertex(
+            draw.fragment_draw_inputs->raw_code, vertex_storage.get());
         const auto plan =
             g::cached_fragment_draw_program(*draw.fragment_draw_inputs, *prepared, device, 51);
         ASSERT_TRUE(plan && plan->rejection_reason().empty());
         std::string refusal;
         compute = r::FragmentDrawComputeGpuProgram::acquire(context, plan, refusal);
         ASSERT_TRUE(compute) << refusal;
-        collect = r::FragmentDrawCollectGpuProgram::acquire(context, plan, draw.vs_shared, {},
+        collect = r::FragmentDrawCollectGpuProgram::acquire(context, plan, aliased_vertex, {},
                                                             false, refusal);
         ASSERT_TRUE(collect) << refusal;
         framebuffer =

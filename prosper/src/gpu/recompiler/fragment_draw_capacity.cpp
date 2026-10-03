@@ -1,6 +1,55 @@
 #include "gpu/recompiler/fragment_draw_capacity.hpp"
+#include <cstring>
+#include <string_view>
 
 namespace prosper::gpu {
+bool fragment_draw_architectural_exports_match(const FragmentPacketKernel& kernel) {
+    const auto& packet = kernel.program.packet;
+    if (packet.export_observation != FragmentPacketExportObservation::Architectural ||
+        packet.export_sites.empty() || packet.export_sites.size() > 64 ||
+        packet.exports_per_lane != packet.export_sites.size() ||
+        kernel.program.status_offset !=
+            64 * packet.export_sites.size() * kFragmentPacketArchitecturalExportWords ||
+        packet.spirv.size() < 5 || packet.spirv[0] != 0x07230203u || kernel.guest_code.empty() ||
+        kernel.guest_code.size() > 4096)
+        return false;
+    std::vector<Rdna2Inst> original;
+    rdna2_walk(kernel.guest_code.data(), kernel.guest_code.size(), original);
+    std::vector<FragmentPacketExportSite> original_sites, retained_sites;
+    const auto inventory = [](const std::vector<Rdna2Inst>& instructions,
+                              std::vector<FragmentPacketExportSite>& sites) {
+        for (const auto& in : instructions)
+            if (in.fmt == Rdna2Format::EXP)
+                sites.push_back({in.pc, in.exp_target, in.exp_en, in.exp_compr,
+                                 (in.words[0] >> 11) & 1u, (in.words[0] >> 12) & 1u});
+    };
+    inventory(original, original_sites);
+    inventory(kernel.instructions, retained_sites);
+    if (original_sites != packet.export_sites || retained_sites != original_sites) return false;
+    for (size_t index = 0; index < original_sites.size(); ++index)
+        if ((index && original_sites[index].pc <= original_sites[index - 1].pc) ||
+            fragment_packet_architectural_export_gap(original_sites[index]))
+            return false;
+    const auto expected = fragment_packet_export_schema_marker(original_sites);
+    bool marked = false;
+    for (size_t pc = 5; pc < packet.spirv.size();) {
+        const auto count = packet.spirv[pc] >> 16;
+        if (!count || count > packet.spirv.size() - pc) return false;
+        if ((packet.spirv[pc] & 0xffffu) == 330 && count > 1) { // OpModuleProcessed
+            const auto* text = reinterpret_cast<const char*>(packet.spirv.data() + pc + 1);
+            const auto* end =
+                static_cast<const char*>(std::memchr(text, 0, (count - 1) * sizeof(uint32_t)));
+            if (!end) return false;
+            const std::string_view marker(text, static_cast<size_t>(end - text));
+            if (marker.starts_with("Prosper.GuestFragmentPacket.ExportObservation=")) {
+                if (marked || marker != expected) return false;
+                marked = true;
+            }
+        }
+        pc += count;
+    }
+    return marked;
+}
 bool FragmentDrawCapacity::matches_collector(const RasterQuadCollector& other) const {
     if (collector_.lane_words != other.lane_words ||
         collector_.record_words != other.record_words || collector_.max_quads != other.max_quads ||
@@ -26,6 +75,9 @@ fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel> kernel,
     if (!kernel || kernel->program.packet.spirv.empty() ||
         !kernel->program.packet.rejection.empty() || !kernel->layout.gpu_capacity)
         return refuse("fragment-draw-capacity-kernel-unavailable");
+    if (kernel->program.packet.export_observation != FragmentPacketExportObservation::LegacyRaw &&
+        !fragment_draw_architectural_exports_match(*kernel))
+        return refuse("fragment-draw-architectural-export-schema-mismatch");
     if (!collector.rejection.empty() || !collector.max_quads || collector.max_quads > 4096 ||
         collector.lane_words < kRasterQuadLaneFixedWords || collector.lane_words > 512 ||
         collector.record_words != collector.lane_words * 4)

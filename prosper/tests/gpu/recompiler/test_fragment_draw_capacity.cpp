@@ -6,6 +6,7 @@
 #include "gpu/recompiler/fragment_draw_gpu.hpp"
 #include "bpermute_spirv_oracle.hpp"
 #include <gtest/gtest.h>
+#include <algorithm>
 
 namespace {
 using namespace prosper::gpu;
@@ -138,6 +139,7 @@ TEST(FragmentDrawCapacity, SameOriginalSourceThreeIndependentWavesAndUniformRefu
 FragmentResourcePacket colors(uint32_t variant) {
     auto packet = prosper::test::fragment_resource_packet::base();
     auto& invocation = packet.invocation;
+    invocation.export_observation = FragmentPacketExportObservation::Architectural;
     invocation.vgprs.clear();
     invocation.sgprs.clear();
     for (uint32_t channel = 0; channel < 4; ++channel) {
@@ -258,7 +260,8 @@ TEST(FragmentDrawCapacity, AllWorkerAndPixelGateBeforeAnyAttachmentPublication) 
                     FragmentDrawFailure::GuestRuntime},
           std::pair{late + kPacketWaveOutputPrefix + program.packet.vgpr_status_offset + 40 * 4,
                     FragmentDrawFailure::GuestRuntime},
-          std::pair{late + kPacketWaveOutputPrefix + 40 * kFragmentPacketExportWords + 4,
+          std::pair{late + kPacketWaveOutputPrefix + 40 * kFragmentPacketArchitecturalExportWords +
+                        4,
                     FragmentDrawFailure::GuestExport}}) {
         auto broken = good;
         broken.output[fault.first] ^= 0x80000000u;
@@ -350,6 +353,104 @@ TEST(FragmentDrawCapacity, ImmutableCollectorShapeBeforeAnyShaderAddressGenerati
     EXPECT_EQ(rejection, "fragment-draw-capacity-collector-invalid");
     EXPECT_EQ(good.capacity->placement(UINT32_MAX).input_base, UINT32_MAX);
     EXPECT_EQ(good.capacity->placement(good.capacity->max_waves()).output_base, UINT32_MAX);
+}
+TEST(FragmentDrawCapacity, ArchitecturalPolicyOriginalSitesAndMarkerCannotBorrowFourteenWords) {
+    const auto good = transaction();
+    ASSERT_TRUE(good.capacity);
+    const auto& original = *good.capacity->kernel();
+    ASSERT_TRUE(fragment_draw_architectural_exports_match(original));
+    ASSERT_EQ(original.program.packet.export_observation,
+              FragmentPacketExportObservation::Architectural);
+    ASSERT_EQ(good.capacity->export_sites().size(), 1u);
+    EXPECT_EQ(good.capacity->export_sites(), original.program.packet.export_sites);
+    EXPECT_EQ(original.program.status_offset, 64 * kFragmentPacketArchitecturalExportWords);
+    std::string rejection;
+    auto legacy14 = std::make_shared<FragmentPacketKernel>(original);
+    legacy14->program.packet.export_observation = FragmentPacketExportObservation::LegacyRaw;
+    ASSERT_EQ(legacy14->program.status_offset, original.program.status_offset);
+    const auto legacy_capacity = fragment_draw_capacity(legacy14, collector(), rejection);
+    ASSERT_TRUE(legacy_capacity) << rejection;
+    EXPECT_FALSE(fragment_draw_architectural_exports_match(*legacy14));
+    EXPECT_TRUE(build_fragment_draw_validation(*legacy_capacity, collector()).empty());
+    EXPECT_TRUE(build_fragment_draw_replay(*legacy_capacity, collector()).empty());
+    // Both ordinary default domains stay compilable; neither can authorize attachments.
+    const auto default_raw = colors(0);
+    auto raw_schema = default_raw;
+    raw_schema.invocation.export_observation = FragmentPacketExportObservation::LegacyRaw;
+    const auto raw_kernel = recompile_fragment_packet_capacity_kernel(raw_schema);
+    prosper::test::fragment_draw::retain_source(raw_kernel.program.packet.spirv, "default_raw");
+    ASSERT_FALSE(raw_kernel.program.packet.spirv.empty());
+    EXPECT_EQ(raw_kernel.program.packet.export_observation,
+              FragmentPacketExportObservation::LegacyRaw);
+    EXPECT_EQ(raw_kernel.program.status_offset, 64 * kFragmentPacketExportWords);
+    auto policy_only = std::make_shared<FragmentPacketKernel>(original);
+    policy_only->program.packet.spirv = raw_kernel.program.packet.spirv;
+    EXPECT_FALSE(fragment_draw_capacity(policy_only, collector(), rejection));
+    EXPECT_EQ(rejection, "fragment-draw-architectural-export-schema-mismatch");
+    for (uint32_t field = 0; field < 6; ++field) {
+        auto altered = std::make_shared<FragmentPacketKernel>(original);
+        auto& site = altered->program.packet.export_sites.front();
+        uint32_t* fields[] = {&site.pc, &site.target, &site.en, &site.compr, &site.done, &site.vm};
+        *fields[field] ^= 1u;
+        EXPECT_FALSE(fragment_draw_capacity(altered, collector(), rejection)) << field;
+        EXPECT_EQ(rejection, "fragment-draw-architectural-export-schema-mismatch");
+    }
+    auto replaced_original = std::make_shared<FragmentPacketKernel>(original);
+    ASSERT_EQ(replaced_original->guest_code.size(), 7u);
+    replaced_original->guest_code[4] ^= 1u;   // original EXP EN, not caller metadata
+    EXPECT_FALSE(fragment_draw_capacity(replaced_original, collector(), rejection));
+    EXPECT_EQ(rejection, "fragment-draw-architectural-export-schema-mismatch");
+    auto replaced_inventory = std::make_shared<FragmentPacketKernel>(original);
+    auto found = std::find_if(replaced_inventory->instructions.begin(),
+                              replaced_inventory->instructions.end(),
+                              [](const auto& in) { return in.fmt == Rdna2Format::EXP; });
+    ASSERT_NE(found, replaced_inventory->instructions.end());
+    ++found->pc;
+    EXPECT_FALSE(fragment_draw_capacity(replaced_inventory, collector(), rejection));
+    EXPECT_EQ(rejection, "fragment-draw-architectural-export-schema-mismatch");
+    auto unknown_policy = std::make_shared<FragmentPacketKernel>(original);
+    unknown_policy->program.packet.export_observation =
+        static_cast<FragmentPacketExportObservation>(2);
+    EXPECT_FALSE(fragment_draw_capacity(unknown_policy, collector(), rejection));
+    EXPECT_EQ(rejection, "fragment-draw-architectural-export-schema-mismatch");
+}
+TEST(FragmentDrawCapacity, GenuineZeroAndInactiveOrMissingLatePixelsRemainDistinct) {
+    const auto good = transaction();
+    ASSERT_TRUE(good.capacity);
+    const auto source = build_fragment_draw_validation(*good.capacity, collector());
+    prosper::test::fragment_draw::retain_source(source, "validation");
+    ASSERT_FALSE(source.empty());
+    const auto late = good.capacity->placement(2).output_base + kPacketWaveOutputPrefix +
+                      40 * kFragmentPacketArchitecturalExportWords;
+    ASSERT_LE(late + kFragmentPacketArchitecturalExportWords, good.output.size());
+    ASSERT_EQ(good.output[late], 1u);
+    ASSERT_EQ(good.output[late + 1], 1u);
+    ASSERT_EQ(good.output[late + 13], 15u);
+    auto genuine_zero = good;
+    std::fill_n(genuine_zero.output.begin() + late + 8, 4, 0u);
+    const auto zero_accepted = validate(genuine_zero, source);
+    ASSERT_EQ(zero_accepted.size(), good.capacity->commit_words());
+    EXPECT_EQ(zero_accepted[0], 1u) << "active observed zero is genuine data, not absence";
+    EXPECT_EQ(zero_accepted[1], 0u);
+    auto inactive = genuine_zero;
+    inactive.output[late + 1] = inactive.output[late + 13] = 0;
+    auto unreached = good;
+    std::fill_n(unreached.output.begin() + late, kFragmentPacketArchitecturalExportWords, 0u);
+    for (const auto& malformed : {inactive, unreached}) {
+        const auto refused = validate(malformed, source);
+        ASSERT_EQ(refused.size(), good.capacity->commit_words());
+        EXPECT_EQ(refused[0], 0u)
+            << "wave2/lane40 cannot turn earlier good pixels into partial output";
+        EXPECT_EQ(refused[1], uint32_t(FragmentDrawFailure::GuestExport));
+    }
+    for (uint32_t field : {2u, 3u, 4u, 5u, 6u, 7u, 12u, 13u}) {
+        auto malformed = good;
+        malformed.output[late + field] ^= 1u;
+        const auto refused = validate(malformed, source);
+        ASSERT_EQ(refused.size(), good.capacity->commit_words());
+        EXPECT_EQ(refused[0], 0u) << "late original control/site/observed field=" << field;
+        EXPECT_EQ(refused[1], uint32_t(FragmentDrawFailure::GuestExport));
+    }
 }
 TEST(FragmentDrawCapacity, DeviceCountAndAssemblyKeepMaskAndScratchFactsAbsent) {
     const auto good = transaction();

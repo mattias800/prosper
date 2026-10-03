@@ -142,6 +142,7 @@ std::vector<uint32_t> profile_key(const RasterQuadInputs& in,
                               uint32_t(in.float_flags.ieee_mode),
                               uint32_t(in.float_flags.dx10_clamp),
                               uint32_t(in.float_transport.profile),
+                              uint32_t(FragmentPacketExportObservation::Architectural),
                               uint32_t(device.device_identity),
                               uint32_t(device.device_identity >> 32),
                               uint32_t(device.shader_int64_enabled),
@@ -189,6 +190,9 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
     FragmentResourcePacket schema;
     auto& invocation = schema.invocation;
     invocation.guest_code = *in.raw_code;
+    // This is the code-generation AND completed-consumer policy, selected before the original
+    // PS is compiled. A 14-word stride alone never upgrades a LegacyRaw observation to authority.
+    invocation.export_observation = FragmentPacketExportObservation::Architectural;
     invocation.slots_available.fill(true);   // owned execution storage, NOT guest initial EXEC
     invocation.quad_topology = FragmentPacketQuadTopology::ConsecutiveLogicalQuads;
     invocation.float_mode = in.float_mode;
@@ -204,15 +208,13 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
     schema.entry_facts.user_data = {};
     schema.entry_facts.user_data_available = 0;
     schema.device = device;
-    // Architectural EXP and demanded absent-state support must be accepted upstream. Until then
-    // this builder deliberately refuses; LegacyRaw output cannot authorize attachment publication.
     auto kernel = std::make_shared<const FragmentPacketKernel>(
         recompile_fragment_packet_capacity_kernel(schema, diagnostic));
     if (kernel->program.packet.spirv.empty()) {
         result.rejection = kernel->program.packet.rejection;
         return result;
     }
-    if (kernel->program.status_offset != 64 * 14)
+    if (!fragment_draw_architectural_exports_match(*kernel))
         return refuse("fragment-draw-architectural-exp-required");
     result.capacity = fragment_draw_capacity(kernel, result.collector, result.rejection);
     if (!result.capacity) return result;

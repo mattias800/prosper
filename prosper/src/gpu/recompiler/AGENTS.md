@@ -72,7 +72,10 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   `fragment_draw_gpu` emits count/indirect-dispatch and genuine-quad assembly; `_commit_gpu` checks
   every original worker status/site plus retained raster provenance and unique pixel indexing
   before publishing one device whole-draw gate. Replay writes through normal fixed-function
-  attachments only after that gate. Genuine helper/system/M0/coefficients/resources and observable
+  attachments only after that gate. Its immutable original EXP inventory and explicit Architectural
+  EXP14 policy must match emitted schema metadata; a raw12 or forged raw14 shape is not authority.
+  Missing/inactive occupied exports refuse the whole draw before attachment mutation. Genuine
+  helper/system/M0/coefficients/resources and observable
   cross-quad composition are separate future recipes, not padded values or waived requirements.
 - `fragment_packet_exports` owns explicit architectural EXP observation/schema and transactional
   typed accumulation; `fragment_packet_exports_emit` emits EXP14 only when that immutable policy

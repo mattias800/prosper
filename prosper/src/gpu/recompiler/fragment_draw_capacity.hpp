@@ -32,6 +32,7 @@ public:
     const std::shared_ptr<const FragmentPacketKernel>& kernel() const { return kernel_; }
     const std::array<uint32_t, kFragmentDrawAuthorityWords>& authority() const { return words_; }
     const RasterQuadCollector& collector() const { return collector_; }
+    const std::vector<FragmentPacketExportSite>& export_sites() const { return export_sites_; }
     bool matches_collector(const RasterQuadCollector&) const;
     uint32_t max_quads() const { return words_[6]; }
     uint32_t max_waves() const { return words_[1]; }
@@ -51,14 +52,21 @@ private:
     FragmentDrawCapacity(std::shared_ptr<const FragmentPacketKernel> kernel,
                          std::array<uint32_t, kFragmentDrawAuthorityWords> words,
                          RasterQuadCollector collector)
-        : kernel_(std::move(kernel)), words_(words), collector_(std::move(collector)) {}
+        : kernel_(std::move(kernel)), words_(words), collector_(std::move(collector)),
+          export_sites_(kernel_->program.packet.export_sites) {}
     friend std::shared_ptr<const FragmentDrawCapacity>
     fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel>, const RasterQuadCollector&,
                            std::string&);
     const std::shared_ptr<const FragmentPacketKernel> kernel_;
     const std::array<uint32_t, kFragmentDrawAuthorityWords> words_;
     const RasterQuadCollector collector_;
+    // Copied original-site inventory belongs to the immutable capacity/code owner, not GPU data.
+    const std::vector<FragmentPacketExportSite> export_sites_;
 };
+
+// Cold code/profile verification only. LegacyRaw is never attachment-authoritative, including
+// a forged 14-word output shape. Original ISA sites and the emitted policy marker must agree.
+bool fragment_draw_architectural_exports_match(const FragmentPacketKernel&);
 
 std::shared_ptr<const FragmentDrawCapacity>
 fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel>, const RasterQuadCollector&,
@@ -68,4 +76,4 @@ fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel>, const Raster
 FragmentPacketKernel recompile_fragment_packet_capacity_kernel(
     const FragmentResourcePacket&,
     RecompileDiagnosticContext = {RecompileDiagnosticStage::Fragment, 0});
-} // namespace prosper::gpu
+}   // namespace prosper::gpu

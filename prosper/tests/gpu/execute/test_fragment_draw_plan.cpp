@@ -50,6 +50,11 @@ TEST_F(FragmentDrawPlan, SameOriginalCachedCodeConsumesDistinctCurrentUserWords)
     ASSERT_TRUE(tb.rejection().empty()) << tb.rejection();
     EXPECT_NE(ta.entry_words(), tb.entry_words());
     EXPECT_EQ(code_a->capacity_owner()->kernel()->guest_code, f::fragment_words());
+    EXPECT_EQ(code_a->capacity_owner()->kernel()->program.packet.export_observation,
+              g::FragmentPacketExportObservation::Architectural);
+    ASSERT_EQ(code_a->capacity_owner()->export_sites().size(), 1u);
+    EXPECT_EQ(code_a->capacity_owner()->export_sites().front(),
+              (g::FragmentPacketExportSite{5, 0, 15, 0, 1, 1}));
     EXPECT_EQ(code_a->collector_shape().fields.size(), 0u);
     EXPECT_FALSE(code_a->replay_words().empty());
     EXPECT_EQ(ta.producing_inputs(), a.fragment_draw_inputs);
@@ -103,6 +108,8 @@ TEST_F(FragmentDrawPlan, SeventeenLiveOriginalProgramsNeverRecompileAfterWarmup)
         ASSERT_TRUE(plans[index]->rejection_reason().empty()) << plans[index]->rejection_reason();
         ASSERT_TRUE(plans[index]->capacity_owner() && plans[index]->capacity_owner()->kernel());
         ASSERT_TRUE(plans[index]->source_live());
+        EXPECT_EQ(plans[index]->capacity_owner()->kernel()->program.packet.export_observation,
+                  g::FragmentPacketExportObservation::Architectural);
         // Every actual emitted form is retained separately, not overwritten by the next key.
         const auto prefix = "warm17_" + std::to_string(index) + '_';
         f::retain_source(plans[index]->collect_words(), (prefix + "collector").c_str());

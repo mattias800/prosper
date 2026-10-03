@@ -776,9 +776,10 @@ int main(int argc, char** argv) {
              scalar_exec_kernel.program.packet.spirv, "recompile_fragment_packet_kernel");
         // Hand-owned fixture entry values remain distinct from the WAT2 GPU capacity authority.
         // These are actual producer representatives, not shipping launch or attachment evidence.
-        auto draw_kernel =
-            std::make_shared<const FragmentPacketKernel>(recompile_fragment_packet_capacity_kernel(
-                prosper::test::fragment_packet_wave::packet()));
+        auto draw_schema = prosper::test::fragment_packet_wave::packet();
+        draw_schema.invocation.export_observation = FragmentPacketExportObservation::Architectural;
+        auto draw_kernel = std::make_shared<const FragmentPacketKernel>(
+            recompile_fragment_packet_capacity_kernel(draw_schema));
         dump(dir, "fragment_draw_capacity_kernel", draw_kernel->program.packet.spirv,
              "recompile_fragment_packet_capacity_kernel");
         RasterQuadCollector draw_collector;
