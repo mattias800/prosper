@@ -3,6 +3,7 @@
 // and compare every raw sink, then use the production transactional decoder. No guest raster ABI.
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/fragment_resource_packet_fixture.hpp"
+#include "fixtures/fragment_special_f32_fixture.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <filesystem>
 #include <fstream>
@@ -307,6 +308,39 @@ TEST(FragmentResourcePacket, IntegerWaveExtensionsDoNotExpandResourceInputAuthor
         bad = fixture::arithmetic(opcode, fixture::bits(0.25f), fixture::bits(0.5f), 0x30u);
         reject(bad, "packet-valu-op-unimplemented",
                "integer live bridge opcode does not widen the closed resource packet slice");
+    }
+    // The independently published resource services retain their special-F32 support. These
+    // exact rails are hand-derived: reciprocal(4)=.25, sqrt(4)=2, reciprocal-sqrt(4)=.5.
+    const auto directory = dump_directory();
+    for (const auto [opcode, result] :
+         {std::pair{0x2au, 0x3e800000u}, std::pair{0x33u, 0x40000000u},
+          std::pair{0x2eu, 0x3f000000u}}) {
+        std::array<uint32_t, 64> inputs;
+        inputs.fill(0x40800000u);
+        auto special = prosper::test::fragment_special_f32::packet(opcode, inputs);
+        std::vector<uint32_t> wanted(64u * 24u, 0u);
+        for (uint32_t lane = 0; lane < 64u; ++lane)
+            for (uint32_t event = 0; event < 2u; ++event) {
+                const uint32_t header[]{1u, 1u, 1u, 0u, 1u, 0u, 1u, 1u};
+                const auto offset = lane * 24u + event * 12u;
+                std::copy(std::begin(header), std::end(header), wanted.begin() + offset);
+                wanted[offset + 8u] = result;
+            }
+        const auto words =
+            sink(special, wanted, "resource_special_" + std::to_string(opcode), directory);
+        ASSERT_EQ(words.size(), wanted.size() + 64u * kFragmentResourceStatusWords);
+        const auto integer = recompile_fragment_packet(special.invocation);
+        EXPECT_TRUE(integer.spirv.empty());
+        EXPECT_EQ(integer.rejection, "packet-valu-op-unimplemented")
+            << "resource-only special service does not grant generic Owned64 FP authority";
+        bad = special;
+        bad.entry_facts = {};
+        reject(bad, "packet-special-f32-producing-rsrc2-unavailable",
+               "new math support still needs the producing exception/trap observation");
+        bad = special;
+        bad.invocation.raw_windows.emplace_back();
+        reject(bad, "packet-resource-raw-window-domain-unimplemented",
+               "special math does not merge resource and live raw-window authority");
     }
 }
 TEST(FragmentResourcePacket, AlignedSmemWriterAndActualReachingP2Destination) {

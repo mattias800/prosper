@@ -562,9 +562,10 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
             gap = packet_resource_instruction_gap(in);
         else if (services && in.fmt == Rdna2Format::VINTRP && in.opcode == 0 &&
                  in.dst.value == in.src[0].value) gap = "packet-parameter-p1-alias-mode-unavailable";
-        // The independently published resource API retains its closed forward integer slice.
+        // The independently published resource API retains its closed forward instruction slice.
         // This live raw-window extension must not expand that API or mix its input authorities.
-        if (services && in.fmt == Rdna2Format::VOP1 && in.opcode != 1u)
+        if (services && in.fmt == Rdna2Format::VOP1 && in.opcode != 1u &&
+            !packet_special_f32_opcode(in.opcode))
             gap = "packet-valu-op-unimplemented";
         if (services && in.fmt == Rdna2Format::VOP2 && in.opcode != 3u && in.opcode != 8u)
             gap = "packet-valu-op-unimplemented";
