@@ -75,16 +75,23 @@ TEST(FragmentPacketExportExecution, DistinctScratchWavesHaveObservedZeroAndAbsen
     if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
     ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
     ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
+    ASSERT_EQ(actual.batch.placements.size(), 3u);
     EXPECT_TRUE(actual.result.exports.empty());
     for (uint32_t wave = 0; wave < 3; ++wave) {
+        ASSERT_EQ(actual.result.architectural_exports[wave].size(), 64u);
         const auto expected = f::scratch_records(wave);
         const auto offset = actual.batch.placements[wave].output_base + 128;
+        ASSERT_GE(actual.words.size(), offset + expected.size());
         EXPECT_TRUE(std::equal(expected.begin(), expected.end(), actual.words.begin() + offset));
         for (uint32_t lane = 0; lane < 64; ++lane) {
             const auto& output = actual.result.architectural_exports[wave][lane];
+            ASSERT_EQ(output.events.size(), 1u);
             EXPECT_EQ(output.events[0].source_words[0].has_value(), f::active(lane));
             EXPECT_EQ(output.commit_eligible, f::active(lane) && lane != 40);
-            if (f::active(lane)) EXPECT_EQ(output.colors[0][0]->bits, f::value(wave));
+            if (f::active(lane)) {
+                ASSERT_TRUE(output.colors[0][0].has_value());
+                EXPECT_EQ(output.colors[0][0]->bits, f::value(wave));
+            }
         }
     }
 }
@@ -93,12 +100,17 @@ TEST(FragmentPacketExportExecution, InactiveControlsStillCompleteAllWorkgroups) 
     if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
     ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
     ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
+    ASSERT_EQ(actual.batch.placements.size(), 3u);
     for (uint32_t wave = 0; wave < 3; ++wave) {
+        ASSERT_EQ(actual.result.architectural_exports[wave].size(), 64u);
         const auto expected = f::scratch_records(wave, true);
+        ASSERT_GE(actual.words.size(),
+                  actual.batch.placements[wave].output_base + 128 + expected.size());
         EXPECT_TRUE(
             std::equal(expected.begin(), expected.end(),
                        actual.words.begin() + actual.batch.placements[wave].output_base + 128));
         for (const auto& lane : actual.result.architectural_exports[wave]) {
+            ASSERT_EQ(lane.events.size(), 1u);
             EXPECT_FALSE(lane.commit_eligible);
             EXPECT_TRUE(lane.terminal_done);
             EXPECT_FALSE(lane.events[0].source_words[0].has_value());
@@ -110,19 +122,26 @@ TEST(FragmentPacketExportExecution, OriginalChannelsNullAndLastVmSurviveLaterExe
     if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
     ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
     ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
-    for (const auto& wave : actual.result.architectural_exports)
+    for (const auto& wave : actual.result.architectural_exports) {
+        ASSERT_EQ(wave.size(), 64u);
         for (uint32_t lane = 0; lane < 64; ++lane) {
             const auto& out = wave[lane];
             ASSERT_EQ(out.events.size(), 4u);
             EXPECT_TRUE(out.events.back().exec);
             EXPECT_EQ(out.valid_mask, f::active(lane));
             EXPECT_EQ(out.commit_eligible, f::active(lane) && lane != 40);
+            ASSERT_TRUE(out.colors[2][0].has_value());
             EXPECT_EQ(out.colors[2][0]->bits, 0x80010000u + lane);
+            ASSERT_TRUE(out.colors[2][1].has_value());
             EXPECT_EQ(out.colors[2][1]->bits, 0x80020000u + lane);
             EXPECT_EQ(out.colors[2][2].has_value(), f::active(lane));
-            if (f::active(lane)) EXPECT_EQ(out.colors[2][2]->bits, 0x80030000u + lane);
+            if (f::active(lane)) {
+                ASSERT_TRUE(out.colors[2][2].has_value());
+                EXPECT_EQ(out.colors[2][2]->bits, 0x80030000u + lane);
+            }
             EXPECT_FALSE(out.colors[2][3].has_value());
         }
+    }
 }
 TEST(FragmentPacketExportExecution, CompressedRgbaUsesOriginalPackedSourcePair) {
     for (uint32_t en : {3u, 12u, 15u}) {
@@ -130,18 +149,21 @@ TEST(FragmentPacketExportExecution, CompressedRgbaUsesOriginalPackedSourcePair) 
         if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
         ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
         ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
-        for (const auto& wave : actual.result.architectural_exports)
+        for (const auto& wave : actual.result.architectural_exports) {
+            ASSERT_EQ(wave.size(), 64u);
             for (uint32_t lane = 0; lane < 64; ++lane)
                 for (uint32_t channel = 0; channel < 4; ++channel) {
                     const auto& component = wave[lane].colors[3][channel];
                     const bool observed = f::active(lane) && (en & (1u << channel));
                     EXPECT_EQ(component.has_value(), observed);
                     if (observed) {
+                        ASSERT_TRUE(component.has_value());
                         const uint32_t packed = (channel < 2 ? 0x12348000u : 0x7fff0000u) + lane;
                         EXPECT_EQ(component->bits, (packed >> ((channel & 1u) * 16)) & 0xffffu);
                         EXPECT_EQ(component->width, 16u);
                     }
                 }
+        }
     }
 }
 TEST(FragmentPacketExportExecution, RealWaitProtectsOriginalPayloadAgainstEveryExecWriter) {
@@ -150,7 +172,9 @@ TEST(FragmentPacketExportExecution, RealWaitProtectsOriginalPayloadAgainstEveryE
         if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
         ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
         ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
+        ASSERT_EQ(actual.batch.placements.size(), 3u);
         for (uint32_t wave = 0; wave < 3; ++wave) {
+            ASSERT_EQ(actual.result.architectural_exports[wave].size(), 64u);
             const auto expected = f::pending_records(family, wave);
             const auto offset = actual.batch.placements[wave].output_base + 128;
             ASSERT_GE(actual.words.size(), offset + expected.size());
@@ -160,16 +184,21 @@ TEST(FragmentPacketExportExecution, RealWaitProtectsOriginalPayloadAgainstEveryE
                 const auto& events = actual.result.architectural_exports[wave][lane].events;
                 ASSERT_EQ(events.size(), 2u);
                 EXPECT_EQ(events[0].exec, f::active(lane));
-                if (f::active(lane)) EXPECT_EQ(*events[0].source_words[0], 0x87000000u + lane);
+                if (f::active(lane)) {
+                    ASSERT_TRUE(events[0].source_words[0].has_value());
+                    EXPECT_EQ(*events[0].source_words[0], 0x87000000u + lane);
+                }
                 const bool on = family == 3   ? f::active(lane) && lane != 40
                                 : family == 4 ? lane < 4 || (lane >= 28 && lane < 36) ||
                                                     (lane >= 40 && lane < 44) || lane >= 60
                                               : f::active(lane);
                 EXPECT_EQ(events[1].exec, on);
                 EXPECT_EQ(events[1].source_words[0].has_value(), on);
-                if (on)
+                if (on) {
+                    ASSERT_TRUE(events[1].source_words[0].has_value());
                     EXPECT_EQ(*events[1].source_words[0],
                               family == 0 ? f::value(wave) : 0x87000000u + lane);
+                }
             }
         }
     }
@@ -180,7 +209,9 @@ TEST(FragmentPacketExportExecution, NumericSaveexecPreservesOldWordsAndNewSccAcr
         if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
         ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
         ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
+        ASSERT_EQ(actual.batch.placements.size(), 3u);
         for (uint32_t wave = 0; wave < 3; ++wave) {
+            ASSERT_EQ(actual.result.architectural_exports[wave].size(), 64u);
             const auto expected = f::numeric_saveexec_records(scenario, wave);
             const auto offset = actual.batch.placements[wave].output_base + 128;
             ASSERT_GE(actual.words.size(), offset + expected.size());
@@ -210,16 +241,20 @@ TEST(FragmentPacketExportExecution, BothConditionalWaitPathsPreservePreOverwrite
         if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
         ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
         ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
-        for (uint32_t wave = 0; wave < 3; ++wave)
+        for (uint32_t wave = 0; wave < 3; ++wave) {
+            ASSERT_EQ(actual.result.architectural_exports[wave].size(), 64u);
             for (uint32_t lane = 0; lane < 64; ++lane) {
                 const auto& output = actual.result.architectural_exports[wave][lane];
                 ASSERT_EQ(output.events.size(), 2u);
                 EXPECT_EQ(output.events[0].exec, f::active(lane));
                 if (f::active(lane)) {
+                    ASSERT_TRUE(output.events[0].source_words[0].has_value());
                     EXPECT_EQ(*output.events[0].source_words[0], 0x87000000u + lane);
+                    ASSERT_TRUE(output.colors[0][0].has_value());
                     EXPECT_EQ(output.colors[0][0]->bits, f::value(wave));
                 }
             }
+        }
     }
 }
 TEST(FragmentPacketExportExecution, ActiveUnavailableLateWordCannotHideBehindVmOrHostMask) {
@@ -234,6 +269,9 @@ TEST(FragmentPacketExportExecution, ActiveUnavailableLateWordCannotHideBehindVmO
             EXPECT_TRUE(actual.result.architectural_exports.empty());
         } else {
             ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
+            ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
+            ASSERT_EQ(actual.result.architectural_exports[2].size(), 64u);
+            ASSERT_TRUE(actual.result.architectural_exports[2][40].colors[0][0].has_value());
             EXPECT_EQ(actual.result.architectural_exports[2][40].colors[0][0]->bits, 40u);
             EXPECT_FALSE(actual.result.architectural_exports[2][40].commit_eligible);
         }
@@ -245,17 +283,22 @@ TEST(FragmentPacketExportExecution, WideImageWritePreservesCompletedEarlierPhysi
     ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
     ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
     const uint32_t sampled[]{0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
-    for (uint32_t wave = 0; wave < 3; ++wave)
+    for (uint32_t wave = 0; wave < 3; ++wave) {
+        ASSERT_EQ(actual.result.architectural_exports[wave].size(), 64u);
         for (uint32_t lane = 0; lane < 64; ++lane) {
             const auto& out = actual.result.architectural_exports[wave][lane];
             ASSERT_EQ(out.events.size(), 2u);
             EXPECT_EQ(out.events[0].source_words[0].has_value(), f::active(lane));
             if (f::active(lane)) {
+                ASSERT_TRUE(out.events[0].source_words[0].has_value());
                 EXPECT_EQ(*out.events[0].source_words[0], f::value(wave) + lane);
-                for (uint32_t channel = 0; channel < 4; ++channel)
+                for (uint32_t channel = 0; channel < 4; ++channel) {
+                    ASSERT_TRUE(out.colors[0][channel].has_value());
                     EXPECT_EQ(out.colors[0][channel]->bits, sampled[channel]);
+                }
             }
         }
+    }
 }
 TEST(FragmentPacketExportExecution, InactivePeerAndReactivatedWordsRetainOriginalReadAuthority) {
     for (uint32_t family : {5u, 6u, 7u})
@@ -269,9 +312,12 @@ TEST(FragmentPacketExportExecution, InactivePeerAndReactivatedWordsRetainOrigina
                 EXPECT_TRUE(actual.result.architectural_exports.empty());
             } else {
                 ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
+                ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
+                ASSERT_EQ(actual.result.architectural_exports[2].size(), 64u);
                 const uint32_t expected = family == 5   ? 0x87000028u
                                           : family == 6 ? 0x7700003fu
                                                         : 0x3f800000u;
+                ASSERT_TRUE(actual.result.architectural_exports[2][63].colors[0][0].has_value());
                 EXPECT_EQ(actual.result.architectural_exports[2][63].colors[0][0]->bits, expected);
             }
         }

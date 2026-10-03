@@ -54,7 +54,10 @@ TEST(FragmentPacketExports, ScratchAbsentInactiveIsUnobservedNotZeroAndLegacyRem
             EXPECT_EQ(out.events[0].source_words[0].has_value(), f::active(lane));
             EXPECT_EQ(out.colors[0][0].has_value(), f::active(lane));
             EXPECT_EQ(out.commit_eligible, f::active(lane) && lane != 40);
-            if (f::active(lane)) EXPECT_EQ(out.colors[0][0]->bits, f::value(wave));
+            if (f::active(lane)) {
+                ASSERT_TRUE(out.colors[0][0].has_value());
+                EXPECT_EQ(out.colors[0][0]->bits, f::value(wave));
+            }
         }
         input.export_observation = FragmentPacketExportObservation::LegacyRaw;
         auto raw = compile(input, wave == 0 ? "legacy0" : wave == 1 ? "legacy1" : "legacy2");
@@ -69,10 +72,13 @@ TEST(FragmentPacketExports, EntirelyInactiveMayHaveNoPayloadButKeepsControl) {
     ASSERT_FALSE(p.spirv.empty());
     const auto words = execute(p);
     const auto expected = f::scratch_records(0, true);
+    ASSERT_GE(words.size(), expected.size());
     EXPECT_TRUE(std::equal(expected.begin(), expected.end(), words.begin()));
     const auto decoded = decode_fragment_packet(p, words, true);
     ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+    ASSERT_EQ(decoded.architectural_exports.size(), 64u);
     for (const auto& lane : decoded.architectural_exports) {
+        ASSERT_EQ(lane.events.size(), 1u);
         EXPECT_TRUE(lane.terminal_done);
         EXPECT_TRUE(lane.valid_mask_available);
         EXPECT_FALSE(lane.valid_mask);
@@ -114,6 +120,8 @@ TEST(FragmentPacketExports, OnlyDemandedInitialMasksSupplyArchitecturalAuthority
     EXPECT_TRUE(std::equal(expected.begin(), expected.end(), words.begin()));
     const auto decoded = decode_fragment_packet(writer, words, true);
     ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+    ASSERT_EQ(decoded.architectural_exports.size(), 64u);
+    ASSERT_TRUE(decoded.architectural_exports[63].colors[0][0].has_value());
     EXPECT_EQ(decoded.architectural_exports[63].colors[0][0]->bits, f::value(0));
 }
 TEST(FragmentPacketExports, ActiveReadIgnoresHostEligibilityAndLaterVm) {
@@ -129,6 +137,8 @@ TEST(FragmentPacketExports, ActiveReadIgnoresHostEligibilityAndLaterVm) {
             EXPECT_TRUE(decoded.architectural_exports.empty());
         } else {
             ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+            ASSERT_EQ(decoded.architectural_exports.size(), 64u);
+            ASSERT_TRUE(decoded.architectural_exports[40].colors[0][0].has_value());
             EXPECT_EQ(decoded.architectural_exports[40].colors[0][0]->bits, 40u);
             EXPECT_FALSE(decoded.architectural_exports[40].commit_eligible);
         }
@@ -150,6 +160,8 @@ TEST(FragmentPacketExports, InactiveSelectedPeerAndWqmReactivationStillDemandRea
                 EXPECT_TRUE(decoded.architectural_exports.empty());
             } else {
                 ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+                ASSERT_EQ(decoded.architectural_exports.size(), 64u);
+                ASSERT_TRUE(decoded.architectural_exports[63].colors[0][0].has_value());
                 EXPECT_EQ(decoded.architectural_exports[63].colors[0][0]->bits,
                           family ? 0x7700003fu : 0x87000028u);
                 EXPECT_EQ(decoded.architectural_exports[60].colors[0][0].has_value(), bool(family));
@@ -162,6 +174,7 @@ TEST(FragmentPacketExports, ChannelAccumulationNullAndLastVmAreNotFinalExec) {
     auto words = execute(p);
     const auto decoded = decode_fragment_packet(p, words, true);
     ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+    ASSERT_EQ(decoded.architectural_exports.size(), 64u);
     for (uint32_t lane = 0; lane < 64; ++lane) {
         const auto& out = decoded.architectural_exports[lane];
         ASSERT_EQ(out.events.size(), 4u);
@@ -172,13 +185,19 @@ TEST(FragmentPacketExports, ChannelAccumulationNullAndLastVmAreNotFinalExec) {
         EXPECT_TRUE(out.events[3].exec);
         EXPECT_EQ(out.valid_mask, f::active(lane));
         EXPECT_EQ(out.commit_eligible, f::active(lane) && lane != 40);
+        ASSERT_TRUE(out.colors[2][0].has_value());
         EXPECT_EQ(out.colors[2][0]->bits, 0x80010000u + lane);
+        ASSERT_TRUE(out.colors[2][1].has_value());
         EXPECT_EQ(out.colors[2][1]->bits, 0x80020000u + lane);
         EXPECT_EQ(out.colors[2][2].has_value(), f::active(lane));
-        if (f::active(lane)) EXPECT_EQ(out.colors[2][2]->bits, 0x80030000u + lane);
+        if (f::active(lane)) {
+            ASSERT_TRUE(out.colors[2][2].has_value());
+            EXPECT_EQ(out.colors[2][2]->bits, 0x80030000u + lane);
+        }
         EXPECT_FALSE(out.colors[2][3].has_value());
         for (const auto& source : out.events[2].source_words) EXPECT_FALSE(source.has_value());
     }
+    ASSERT_GE(words.size(), 64u * 56u);
     words[63 * 56 + 12] ^= 1;
     EXPECT_EQ(decode_fragment_packet(p, words, true).rejection,
               "packet-architectural-export-record-invalid");
@@ -212,16 +231,21 @@ TEST(FragmentPacketExports, PendingWordsAndEveryExecWriterNeedActualCompletion) 
             const auto& events = decoded.architectural_exports[lane].events;
             ASSERT_EQ(events.size(), 2u);
             EXPECT_EQ(events[0].exec, f::active(lane));
-            if (f::active(lane)) EXPECT_EQ(*events[0].source_words[0], 0x87000000u + lane);
+            if (f::active(lane)) {
+                ASSERT_TRUE(events[0].source_words[0].has_value());
+                EXPECT_EQ(*events[0].source_words[0], 0x87000000u + lane);
+            }
             const bool on = family == 3   ? f::active(lane) && lane != 40
                             : family == 4 ? lane < 4 || (lane >= 28 && lane < 36) ||
                                                 (lane >= 40 && lane < 44) || lane >= 60
                                           : f::active(lane);
             EXPECT_EQ(events[1].exec, on);
             EXPECT_EQ(events[1].source_words[0].has_value(), on);
-            if (on)
+            if (on) {
+                ASSERT_TRUE(events[1].source_words[0].has_value());
                 EXPECT_EQ(*events[1].source_words[0],
                           family == 0 ? f::value(0) : 0x87000000u + lane);
+            }
         }
     }
     auto done = f::pending_write(0, false).invocation;
@@ -242,10 +266,15 @@ TEST(FragmentPacketExports, EveryConditionalPathAndPackedPhysicalWordMustStaySta
         ASSERT_FALSE(good.spirv.empty()) << good.rejection;
         const auto decoded = decode_fragment_packet(good, execute(good), true);
         ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+        ASSERT_EQ(decoded.architectural_exports.size(), 64u);
         for (uint32_t lane = 0; lane < 64; ++lane)
             if (f::active(lane)) {
+                ASSERT_EQ(decoded.architectural_exports[lane].events.size(), 2u);
+                ASSERT_TRUE(
+                    decoded.architectural_exports[lane].events[0].source_words[0].has_value());
                 EXPECT_EQ(*decoded.architectural_exports[lane].events[0].source_words[0],
                           0x87000000u + lane);
+                ASSERT_TRUE(decoded.architectural_exports[lane].colors[0][0].has_value());
                 EXPECT_EQ(decoded.architectural_exports[lane].colors[0][0]->bits, f::value(0));
             }
     }
@@ -264,7 +293,10 @@ TEST(FragmentPacketExports, EveryConditionalPathAndPackedPhysicalWordMustStaySta
             ASSERT_FALSE(actual.spirv.empty()) << actual.rejection;
             const auto decoded = decode_fragment_packet(actual, execute(actual), true);
             ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+            ASSERT_EQ(decoded.architectural_exports.size(), 64u);
+            ASSERT_TRUE(decoded.architectural_exports[63].colors[3][2].has_value());
             EXPECT_EQ(decoded.architectural_exports[63].colors[3][2]->bits, 63u);
+            ASSERT_TRUE(decoded.architectural_exports[63].colors[3][3].has_value());
             EXPECT_EQ(decoded.architectural_exports[63].colors[3][3]->bits, 0x7fffu);
         }
     }
@@ -324,12 +356,14 @@ TEST(FragmentPacketExports, CompressedReadsTwoPhysicalWordsAndKeepsRaw16BitChann
         ASSERT_FALSE(p.spirv.empty()) << p.rejection;
         const auto decoded = decode_fragment_packet(p, execute(p), true);
         ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+        ASSERT_EQ(decoded.architectural_exports.size(), 64u);
         for (uint32_t lane = 0; lane < 64; ++lane)
             for (uint32_t channel = 0; channel < 4; ++channel) {
                 const auto& component = decoded.architectural_exports[lane].colors[3][channel];
                 const bool observed = f::active(lane) && (en & (1u << channel));
                 EXPECT_EQ(component.has_value(), observed);
                 if (observed) {
+                    ASSERT_TRUE(component.has_value());
                     const uint32_t packed = (channel < 2 ? 0x12348000u : 0x7fff0000u) + lane;
                     EXPECT_EQ(component->bits, (packed >> ((channel & 1u) * 16)) & 0xffffu);
                     EXPECT_EQ(component->width, 16u);
@@ -349,6 +383,8 @@ TEST(FragmentPacketExports, ObservationSchemaAndCompletedWholeWaveAreImmutable) 
     auto p = compile(f::scratch().invocation, "schema");
     ASSERT_FALSE(p.spirv.empty());
     auto words = execute(p);
+    ASSERT_GE(words.size(), 2u * 14u);
+    ASSERT_EQ(p.export_sites.size(), 1u);
     EXPECT_FALSE(decode_fragment_packet(p, words, true).architectural_exports.empty());
     EXPECT_TRUE(decode_fragment_packet(p, words, false).architectural_exports.empty());
     auto mutated = p;
@@ -359,6 +395,7 @@ TEST(FragmentPacketExports, ObservationSchemaAndCompletedWholeWaveAreImmutable) 
     EXPECT_EQ(decode_fragment_packet(p, words, true).rejection,
               "packet-export-observation-mask-invalid");
     words = execute(p);
+    ASSERT_GE(words.size(), 2u * 14u);
     words[1 * 14 + 8] = 1;
     EXPECT_EQ(decode_fragment_packet(p, words, true).rejection,
               "packet-unobserved-export-payload-invalid");
@@ -397,9 +434,12 @@ TEST(FragmentPacketExports, WideImageDestinationCannotOverwritePendingHighestPhy
         ASSERT_EQ(out.events.size(), 2u);
         EXPECT_EQ(out.events[0].source_words[0].has_value(), f::active(lane));
         if (f::active(lane)) {
+            ASSERT_TRUE(out.events[0].source_words[0].has_value());
             EXPECT_EQ(*out.events[0].source_words[0], f::value(0) + lane);
-            for (uint32_t channel = 0; channel < 4; ++channel)
+            for (uint32_t channel = 0; channel < 4; ++channel) {
+                ASSERT_TRUE(out.colors[0][channel].has_value());
                 EXPECT_EQ(out.colors[0][channel]->bits, sampled[channel]);
+            }
         }
     }
 }
@@ -422,6 +462,7 @@ TEST(FragmentPacketExports, CachedModeAndEveryLateWaveFailureBlockTypedPublicati
     };
     auto batch = pack_fragment_packet_waves(k, waves, f::placements(*k));
     ASSERT_TRUE(batch.rejection.empty()) << batch.rejection;
+    ASSERT_EQ(batch.placements.size(), 3u);
     auto words = run(batch);
     auto decoded =
         decode_fragment_packet_waves(batch, words, true, prototype.device.device_identity);
@@ -429,11 +470,16 @@ TEST(FragmentPacketExports, CachedModeAndEveryLateWaveFailureBlockTypedPublicati
     ASSERT_EQ(decoded.architectural_exports.size(), 3u);
     EXPECT_TRUE(decoded.exports.empty());
     for (uint32_t wave = 0; wave < 3; ++wave) {
+        ASSERT_EQ(decoded.architectural_exports[wave].size(), 64u);
         const auto start = batch.placements[wave].output_base + 128;
         const auto expected = f::scratch_records(wave);
+        ASSERT_GE(words.size(), start + expected.size());
         EXPECT_TRUE(std::equal(expected.begin(), expected.end(), words.begin() + start));
+        ASSERT_TRUE(decoded.architectural_exports[wave][63].colors[0][0].has_value());
         EXPECT_EQ(decoded.architectural_exports[wave][63].colors[0][0]->bits, f::value(wave));
     }
+    ASSERT_GE(words.size(), batch.placements[2].output_base + 128 +
+                                k->program.packet.vgpr_status_offset + 64 * 4);
     words[batch.placements[2].output_base + 128 + k->program.packet.vgpr_status_offset + 63 * 4 +
           1] = 1;
     words[batch.placements[2].output_base + 128 + k->program.packet.vgpr_status_offset + 63 * 4 +
@@ -466,10 +512,13 @@ TEST(FragmentPacketExports, ReactivatedP2OldDestinationRemainsAReadNotExportExem
             EXPECT_TRUE(decoded.architectural_exports.empty());
         } else {
             ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+            ASSERT_EQ(decoded.architectural_exports.size(), 64u);
             for (uint32_t lane = 0; lane < 64; ++lane) {
                 EXPECT_EQ(decoded.architectural_exports[lane].colors[0][0].has_value(), lane >= 60);
-                if (lane >= 60)
+                if (lane >= 60) {
+                    ASSERT_TRUE(decoded.architectural_exports[lane].colors[0][0].has_value());
                     EXPECT_EQ(decoded.architectural_exports[lane].colors[0][0]->bits, 0x3f800000u);
+                }
             }
         }
     }
