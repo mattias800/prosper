@@ -267,11 +267,46 @@ protected:
         GpuReplayFrame replay;
         std::vector<uint8_t> bytes;
         std::string error;
-        ASSERT_TRUE(capture_draw_items(
-            {draw}, metadata, [](uint64_t, uint8_t*, size_t) { return size_t(0); }, capture, error))
-            << error;
+        const auto vs_original = registered_graphics_original(draw.vs_guest_addr);
+        const auto fs_original = registered_graphics_original(draw.fs_guest_addr);
+        ASSERT_TRUE(vs_original && !vs_original->empty());
+        ASSERT_TRUE(fs_original && !fs_original->empty());
+        const std::array originals{std::pair{draw.vs_guest_addr, vs_original},
+                                   std::pair{draw.fs_guest_addr, fs_original}};
+        for (const auto& [address, original] : originals) {
+            ASSERT_NE(address, 0u);
+            ASSERT_LE(original->size(), UINT64_MAX / sizeof(uint32_t));
+            ASSERT_LE(address, UINT64_MAX - original->size() * sizeof(uint32_t));
+        }
+        // The reader's size is destination capacity. Return only the complete registered code
+        // owner at its exact start, never a guest read, an interior span or fabricated padding.
+        const CaptureMemoryReader original_reader = [originals](uint64_t address, uint8_t* dst,
+                                                                size_t capacity) {
+            for (const auto& [start, original] : originals) {
+                if (address != start) continue;
+                const size_t size = original->size() * sizeof(uint32_t);
+                if (!dst || capacity < size) return size_t(0);
+                std::memcpy(dst, original->data(), size);
+                return size;
+            }
+            return size_t(0);
+        };
+        std::array<uint8_t, sizeof(uint32_t)> refused_code{};
+        EXPECT_EQ(
+            original_reader(draw.vs_guest_addr + 1u, refused_code.data(), refused_code.size()), 0u);
+        EXPECT_EQ(original_reader(UINT64_MAX, refused_code.data(), refused_code.size()), 0u);
+        EXPECT_EQ(original_reader(draw.vs_guest_addr, refused_code.data(), refused_code.size()),
+                  0u);
+        ASSERT_TRUE(capture_draw_items({draw}, metadata, original_reader, capture, error)) << error;
         ASSERT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
         ASSERT_TRUE(deserialize_gpu_capture(bytes, decoded, error)) << error;
+        ASSERT_EQ(decoded.draws.size(), 1u);
+        ASSERT_LT(decoded.draws[0].vs_raw_shader_index, decoded.raw_shader_versions.size());
+        ASSERT_LT(decoded.draws[0].fs_raw_shader_index, decoded.raw_shader_versions.size());
+        EXPECT_EQ(decoded.raw_shader_versions[decoded.draws[0].vs_raw_shader_index].words,
+                  *vs_original);
+        EXPECT_EQ(decoded.raw_shader_versions[decoded.draws[0].fs_raw_shader_index].words,
+                  *fs_original);
         ASSERT_TRUE(materialize_gpu_replay(decoded, replay, error)) << error;
         ASSERT_EQ(replay.items.size(), 1u);
         ASSERT_TRUE(replay.items[0].owned_waves);
