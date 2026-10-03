@@ -112,3 +112,53 @@ TEST_F(WatchFixture, UnconfiguredArmIsANoOp) {
     g_watched[0] = 5;
     EXPECT_EQ(win_data_watch_hit_count(), 0u);
 }
+
+TEST(WinDataWatchSpec, Dr7EncodesEachSlot) {
+    // Slot n: Ln = bit 2n, RWn = 01 at bit 16+4n, LENn at bit 18+4n.
+    EXPECT_EQ(win_data_watch_dr7_slot(1, 4), (1ull << 2) | (1ull << 20) | (3ull << 22));
+    EXPECT_EQ(win_data_watch_dr7_slot(2, 8), (1ull << 4) | (1ull << 24) | (2ull << 26));
+    EXPECT_EQ(win_data_watch_dr7_slot(3, 1), (1ull << 6) | (1ull << 28) | (0ull << 30));
+    EXPECT_EQ(win_data_watch_dr7_slot(4, 8), 0u);   // only DR0-DR3 exist
+    EXPECT_EQ(win_data_watch_dr7_slot(0, 3), 0u);
+}
+
+TEST(WinDataWatchSpec, ParseListAcceptsUpToFourAndRefusesAnyBadEntry) {
+    WinDataWatchSpec s[kWinDataWatchSlots];
+    ASSERT_EQ(win_data_watch_parse_list("0x1000a0,0x1000b0:4", s), 2u);
+    EXPECT_EQ(s[0].addr, 0x1000a0ull);
+    EXPECT_EQ(s[0].len, 8u);
+    EXPECT_EQ(s[1].addr, 0x1000b0ull);
+    EXPECT_EQ(s[1].len, 4u);
+    EXPECT_EQ(win_data_watch_parse_list("0x10000,0x10008,0x10010,0x10018", s), 4u);
+    // Five entries, one bad entry, an empty entry and a trailing comma all disable the whole list:
+    // dropping or reinterpreting some of them would watch something the caller did not ask for.
+    EXPECT_EQ(win_data_watch_parse_list("0x10000,0x10008,0x10010,0x10018,0x10020", s), 0u);
+    EXPECT_EQ(win_data_watch_parse_list("0x10000,0x10009", s), 0u);
+    EXPECT_EQ(win_data_watch_parse_list("0x10000,,0x10008", s), 0u);
+    EXPECT_EQ(win_data_watch_parse_list("0x10000,", s), 0u);
+    EXPECT_EQ(win_data_watch_parse_list("", s), 0u);
+    EXPECT_EQ(win_data_watch_parse_list(nullptr, s), 0u);
+}
+
+TEST_F(WatchFixture, EverySlotCatchesItsOwnWordAndReportsItsIndex) {
+    const WinDataWatchSpec specs[3] = {{reinterpret_cast<uint64_t>(&g_watched[0]), 8},
+                                       {reinterpret_cast<uint64_t>(&g_watched[2]), 8},
+                                       {reinterpret_cast<uint64_t>(&g_watched[4]), 8}};
+    ASSERT_TRUE(win_data_watch_configure_list(specs, 3));
+    win_data_watch_arm_current_thread();
+    g_watched[2] = 0x22;
+    WinDataWatchHit hit{};
+    ASSERT_TRUE(win_data_watch_last_hit(&hit));
+    EXPECT_EQ(hit.slot, 1u);
+    EXPECT_EQ(hit.value, 0x22ull);
+    g_watched[4] = 0x44;
+    ASSERT_TRUE(win_data_watch_last_hit(&hit));
+    EXPECT_EQ(hit.slot, 2u);
+    g_watched[0] = 0x11;
+    ASSERT_TRUE(win_data_watch_last_hit(&hit));
+    EXPECT_EQ(hit.slot, 0u);
+    EXPECT_EQ(win_data_watch_hit_count(), 3u);
+    g_watched[1] = 1;   // between watched words: must not fire
+    g_watched[3] = 1;
+    EXPECT_EQ(win_data_watch_hit_count(), 3u);
+}
