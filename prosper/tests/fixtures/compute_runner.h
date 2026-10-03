@@ -298,6 +298,9 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
             !plan.wave_count || plan.wave_count > 4096 ||
             plan.wave_count > limits.maxComputeWorkGroupCount[0] ||
             (!plan.initial_output.empty() && plan.initial_output.size() != plan.output_words) ||
+            (plan.readonly_words &&
+             (plan.readonly_words->empty() || plan.readonly_words->size() > 2 * 1024 * 1024 ||
+              uint64_t(plan.readonly_words->size()) * 4 > limits.maxStorageBufferRange)) ||
             uint64_t(plan.output_words) * 4 > limits.maxStorageBufferRange ||
             uint64_t(plan.input.size()) * 4 > limits.maxStorageBufferRange ||
             (!plan.images.empty() && !sampled) || !feats.shaderInt64 ||
@@ -394,7 +397,10 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     };
     // Constant buffer (binding 2, always present since the shell declares it; >=1 dword). Holds the
     // scalar memory an SMEM load reads. Shaders without SMEM never read it.
-    const uint32_t CB_N  = cbuf.empty()  ? 1u : (uint32_t)cbuf.size();
+    const auto& selected_cbuf = owned_dispatch && owned_dispatch->plan.readonly_words
+                                    ? *owned_dispatch->plan.readonly_words
+                                    : cbuf;
+    const uint32_t CB_N = selected_cbuf.empty() ? 1u : (uint32_t)selected_cbuf.size();
     const uint32_t CB1_N = cbuf1.empty() ? 1u : (uint32_t)cbuf1.size();
     const VkDeviceSize cbBytes  = (VkDeviceSize)CB_N  * sizeof(uint32_t);
     const VkDeviceSize cbBytes1 = (VkDeviceSize)CB1_N * sizeof(uint32_t);
@@ -423,7 +429,8 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     vkUnmapMemory(dev, inMem);
     void* cp = nullptr;
     if (!map_buffer(cbMem, cbBytes, &cp)) return decline_setup("constant buffer mapping failed");
-    for (uint32_t i = 0; i < CB_N; i++) ((uint32_t*)cp)[i] = (i < cbuf.size()) ? cbuf[i] : 0u;
+    for (uint32_t i = 0; i < CB_N; i++)
+        ((uint32_t*)cp)[i] = (i < selected_cbuf.size()) ? selected_cbuf[i] : 0u;
     vkUnmapMemory(dev, cbMem);
     void* cp1 = nullptr;
     if (!map_buffer(cbMem1, cbBytes1, &cp1))

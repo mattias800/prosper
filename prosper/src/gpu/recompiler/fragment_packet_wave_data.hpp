@@ -9,6 +9,8 @@ inline constexpr uint32_t kPacketWaveInputMagic = 0x57494e31u; // WIN1
 inline constexpr uint32_t kPacketWaveOutputMagic = 0x574f5531u; // WOU1
 inline constexpr uint32_t kPacketWaveTableMagic = 0x57415631u; // WAV1
 inline constexpr uint32_t kPacketWaveHeaderWords = 4;
+inline constexpr uint32_t kPacketWaveAuthorityMagic = 0x57415431u; // WAT1
+inline constexpr uint32_t kPacketWaveAuthorityHeaderWords = 6;
 inline constexpr uint32_t kPacketWaveOutputPrefix = 64 * 2;
 struct FragmentPacketWavePlacement {
     uint32_t input_base = 0, output_base = 0; // DWORD offsets, not byte addresses
@@ -36,8 +38,31 @@ struct FragmentPacketKernel {
     FragmentPacketQuadTopology topology = FragmentPacketQuadTopology::Unknown;
     FloatTransportConfig transport{};
 };
+struct FragmentPacketWaveBatch;
+// Private validated dispatcher ownership, uploaded readonly at binding2 and retained through
+// completion. Binding0 routing/data may be faulted after packing; this plane may NOT be changed.
+// It is not guest wave-composition authority or a defense against a hostile host uploader.
+class FragmentPacketWaveAuthority {
+public:
+    const std::vector<uint32_t>& words() const { return words_; }
+    bool matches(const std::shared_ptr<const FragmentPacketKernel>&,
+                 std::span<const FragmentPacketWavePlacement>, size_t input_words,
+                 size_t output_words) const;
+
+private:
+    FragmentPacketWaveAuthority(std::shared_ptr<const FragmentPacketKernel> owner,
+                                std::vector<uint32_t> words)
+        : kernel_(std::move(owner)), words_(std::move(words)) {}
+    friend FragmentPacketWaveBatch
+        pack_fragment_packet_waves(std::shared_ptr<const FragmentPacketKernel>,
+                                   std::span<const FragmentResourcePacket>,
+                                   std::span<const FragmentPacketWavePlacement>);
+    const std::shared_ptr<const FragmentPacketKernel> kernel_;
+    const std::vector<uint32_t> words_;
+};
 struct FragmentPacketWaveBatch {
     std::shared_ptr<const FragmentPacketKernel> kernel; // retained cached-code owner
+    std::shared_ptr<const FragmentPacketWaveAuthority> authority;
     std::vector<uint32_t> input_words, output_words;
     std::vector<FragmentPacketWavePlacement> placements;
     // Complete immutable binding upload owner. Initial domain shares these views across waves;

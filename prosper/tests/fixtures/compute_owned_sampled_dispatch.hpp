@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace prosper::test {
@@ -27,6 +28,9 @@ struct ComputeOwnedPlan {
     uint32_t wave_count =
         1; // explicit owned logical64 batches, never inferred guest raster waves
     std::vector<uint32_t> initial_output; // optional complete raw guard/record initialization
+    // Optional binding2 raw-u32 immutable upload owner, retained through actual completion.
+    // A packet caller aliases its private validated authority, never a mutable transport copy.
+    std::shared_ptr<const std::vector<uint32_t>> readonly_words;
     std::vector<std::vector<ComputeSampledMip>> images; // fixed binding16+i, nearest/clamp-edge
 };
 struct ComputeOwnedDispatch {

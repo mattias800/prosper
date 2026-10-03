@@ -14,16 +14,22 @@ std::shared_ptr<const FragmentPacketKernel> kernel() {
 std::vector<FragmentResourcePacket> inputs() {
     return {fixture::packet(0), fixture::packet(1), fixture::packet(2)};
 }
-std::vector<uint32_t> execute(const FragmentPacketWaveBatch& batch) {
+std::vector<uint32_t> execute(const FragmentPacketWaveBatch& batch,
+                              const std::vector<uint32_t>* authority_override = nullptr,
+                              bool supply_authority = true, uint32_t only_wave = UINT32_MAX) {
     auto words = batch.output_words;
     // Sequential independent Workgroup storage scopes; NOT a model of GPU inter-workgroup order.
     for (uint32_t wave : {2u, 0u, 1u}) {
+        if (only_wave != UINT32_MAX && only_wave != wave) continue;
         bpermute_oracle::Interpreter vm;
         vm.parse(batch.kernel->program.packet.spirv);
         for (uint32_t slot = 0; slot < batch.images.size(); ++slot)
             for (const auto& mip : batch.images[slot].mips)
                 vm.sampled_images[16 + slot].push_back({mip.width, mip.height, mip.texels});
-        words = vm.run_packet(batch.input_words, words, wave);
+        std::map<uint32_t, std::vector<uint32_t>> buffers{{0, batch.input_words}, {1, words}};
+        if (supply_authority)
+            buffers.emplace(2, authority_override ? *authority_override : batch.authority->words());
+        words = vm.run_buffers(64, buffers, 1, wave);
         EXPECT_TRUE(vm.error.empty()) << vm.error;
         if (!vm.error.empty()) return {};
     }
@@ -125,6 +131,95 @@ TEST(FragmentPacketWaveData, GenuineDynamicEntryM0AndLateDescriptorMismatch) {
     EXPECT_TRUE(decoded.exports.empty());
     EXPECT_EQ(decoded.wave, 2u);
     EXPECT_EQ(decoded.rejection, "packet-wave-metadata-or-completion-invalid");
+}
+TEST(FragmentPacketWaveData, DynamicScalarPairRestoresExecInBothLogicalHalves) {
+    std::vector<FragmentResourcePacket> waves;
+    for (uint32_t wave = 0; wave < 3; ++wave) waves.push_back(fixture::scalar_exec_packet(wave));
+    const auto code =
+        std::make_shared<const FragmentPacketKernel>(recompile_fragment_packet_kernel(waves[0]));
+    ASSERT_FALSE(code->program.packet.spirv.empty());
+    const auto other = recompile_fragment_packet_kernel(waves[2]);
+    EXPECT_EQ(other.program.packet.spirv, code->program.packet.spirv);
+    const auto batch = pack_fragment_packet_waves(code, waves, fixture::placements(*code, 3));
+    ASSERT_TRUE(batch.rejection.empty()) << batch.rejection;
+    const auto decoded =
+        decode_fragment_packet_waves(batch, execute(batch), true, waves[0].device.device_identity);
+    ASSERT_EQ(decoded.exports.size(), 3u) << decoded.rejection;
+    for (uint32_t wave = 0; wave < 3; ++wave)
+        EXPECT_EQ(decoded.exports[wave], fixture::expected(wave));
+}
+TEST(FragmentPacketWaveData, CorruptedOutputRoutingCannotWriteAnotherOwnedRegion) {
+    const auto code = kernel();
+    const auto waves = inputs();
+    auto batch = pack_fragment_packet_waves(code, waves, fixture::placements(*code, 3));
+    ASSERT_TRUE(batch.rejection.empty());
+    const auto positive =
+        decode_fragment_packet_waves(batch, execute(batch), true, waves[0].device.device_identity);
+    ASSERT_EQ(positive.exports.size(), 3u) << positive.rejection;
+    for (uint32_t wave = 0; wave < 3; ++wave)
+        EXPECT_EQ(positive.exports[wave], fixture::expected(wave));
+    // Fault only mutable binding0. The private binding2 placement owner stays unchanged.
+    batch.input_words[5 + 2 * 2] = batch.placements[0].output_base;
+    EXPECT_EQ(execute(batch, nullptr, true, 2), batch.output_words)
+        << "rejected WG must leave the ENTIRE output unchanged, including the alias target";
+    const auto raw = execute(batch);
+    ASSERT_EQ(raw.size(), batch.output_words.size());
+    const auto base = batch.placements[2].output_base;
+    const auto span = code->layout.output_words + kPacketWaveOutputPrefix;
+    EXPECT_TRUE(std::equal(raw.begin() + base, raw.begin() + base + span,
+                           batch.output_words.begin() + base));
+    const auto refused =
+        decode_fragment_packet_waves(batch, raw, true, waves[0].device.device_identity);
+    EXPECT_TRUE(refused.exports.empty());
+    EXPECT_EQ(refused.wave, 2u);
+    EXPECT_EQ(refused.rejection, "packet-wave-metadata-or-completion-invalid");
+}
+TEST(FragmentPacketWaveData, MissingTruncatedOrMismatchedAuthorityNeverGrantsOwnership) {
+    const auto code = kernel();
+    const auto waves = inputs();
+    const auto batch = pack_fragment_packet_waves(code, waves, fixture::placements(*code, 3));
+    ASSERT_TRUE(batch.rejection.empty());
+    const auto assert_untouched = [&](const std::vector<uint32_t>& raw) {
+        EXPECT_EQ(raw, batch.output_words)
+            << "no guest output before authority extent and identity";
+        EXPECT_EQ(decode_fragment_packet_waves(batch, raw, true, waves[0].device.device_identity)
+                      .rejection,
+                  "packet-wave-metadata-or-completion-invalid");
+    };
+    assert_untouched(execute(batch, nullptr, false));   // actual binding2 absent, ArrayLength0
+    for (const auto length : {0u, 1u, 5u, 6u, 11u}) {
+        auto truncated = batch.authority->words();
+        truncated.resize(length);
+        assert_untouched(execute(batch, &truncated));
+    }
+    for (uint32_t word = 0; word < kPacketWaveAuthorityHeaderWords; ++word) {
+        auto mismatched = batch.authority->words();
+        mismatched[word] ^= 1;
+        assert_untouched(execute(batch, &mismatched));
+    }
+    // These are typed SOURCE transport-envelope controls, not mutable private authority APIs.
+    // Consumer separately requires the retained exact kernel/placements/extents, not public copies.
+    const auto good = execute(batch);
+    auto changed = batch;
+    changed.authority.reset();
+    EXPECT_EQ(decode_fragment_packet_waves(changed, good, true, waves[0].device.device_identity)
+                  .rejection,
+              "packet-wave-ownership-unproved");
+    changed = batch;
+    changed.placements[2].output_base = changed.placements[0].output_base;
+    EXPECT_EQ(decode_fragment_packet_waves(changed, good, true, waves[0].device.device_identity)
+                  .rejection,
+              "packet-wave-ownership-unproved");
+    changed = batch;
+    changed.kernel = std::make_shared<const FragmentPacketKernel>(*code);
+    EXPECT_EQ(decode_fragment_packet_waves(changed, good, true, waves[0].device.device_identity)
+                  .rejection,
+              "packet-wave-ownership-unproved");
+    changed = batch;
+    changed.input_words.push_back(0);
+    EXPECT_EQ(decode_fragment_packet_waves(changed, good, true, waves[0].device.device_identity)
+                  .rejection,
+              "packet-wave-ownership-unproved");
 }
 TEST(FragmentPacketWaveData, EveryWaveKnownnessProfileAndOriginalIdentity) {
     const auto code = kernel();

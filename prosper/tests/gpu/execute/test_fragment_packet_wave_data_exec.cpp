@@ -30,6 +30,7 @@ Execution execute(uint32_t fault = 0, bool image = false) {
         for (uint32_t wave = 0; wave < 3; ++wave) {
             auto input = image        ? fixture::resource::chain()
                          : fault == 3 ? fixture::entry_m0_packet(wave)
+                         : fault == 5 ? fixture::scalar_exec_packet(wave)
                                       : fixture::packet(wave);
             input.device = {enabled.device_identity, enabled.shader_int64_enabled,
                             enabled.rgba32_sfloat_sampled};
@@ -47,11 +48,15 @@ Execution execute(uint32_t fault = 0, bool image = false) {
         if (fault == 4)
             result.batch.input_words[result.batch.placements[2].input_base + 2 +
                                      kernel->layout.scalar_available_offsets.back()] = 0;
+        if (fault == 6)
+            result.batch.input_words[5 + 2 * 2] = result.batch.placements[0].output_base;
         plan.spirv = kernel->program.packet.spirv;
         plan.input.resize(result.batch.input_words.size());
         std::memcpy(plan.input.data(), result.batch.input_words.data(), plan.input.size() * 4);
         plan.output_words = static_cast<uint32_t>(result.batch.output_words.size());
         plan.initial_output = result.batch.output_words;
+        // Alias the immutable typed authority owner, not a mutable upload-vector reconstruction.
+        plan.readonly_words = {result.batch.authority, &result.batch.authority->words()};
         plan.wave_count = 3;
         for (const auto& binding : result.batch.images) {
             std::vector<prosper::test::ComputeSampledMip> mips;
@@ -105,6 +110,34 @@ TEST(FragmentPacketWaveExecution, SuppliedEntryM0IsPerWaveData) {
     for (uint32_t wave = 0; wave < 3; ++wave)
         EXPECT_EQ(actual.result.exports[wave], fixture::expected(wave));
 }
+TEST(FragmentPacketWaveExecution, DynamicScalarPairRestoresBothExecHalves) {
+    const auto actual = execute(5);
+    if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
+    ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
+    ASSERT_EQ(actual.result.exports.size(), 3u);
+    for (uint32_t wave = 0; wave < 3; ++wave)
+        EXPECT_EQ(actual.result.exports[wave], fixture::expected(wave));
+}
+TEST(FragmentPacketWaveExecution, CorruptedOutputRoutingNeverWritesAliasedWave) {
+    const auto actual = execute(6);
+    if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
+    EXPECT_EQ(actual.result.rejection, "packet-wave-metadata-or-completion-invalid");
+    EXPECT_EQ(actual.result.wave, 2u);
+    EXPECT_TRUE(actual.result.exports.empty());
+    ASSERT_EQ(actual.raw.size(), actual.batch.output_words.size());
+    const auto base = actual.batch.placements[2].output_base;
+    const auto span = actual.batch.kernel->layout.output_words + kPacketWaveOutputPrefix;
+    EXPECT_TRUE(std::equal(actual.raw.begin() + base, actual.raw.begin() + base + span,
+                           actual.batch.output_words.begin() + base))
+        << "invalid WG must not store any guest EXP/status/provenance word";
+    for (uint32_t wave = 0; wave < 2; ++wave) {
+        const auto expected = fixture::expected(wave);
+        EXPECT_TRUE(std::equal(expected.begin(), expected.end(),
+                               actual.raw.begin() + actual.batch.placements[wave].output_base +
+                                   kPacketWaveOutputPrefix))
+            << "safe valid WG retains its independent raw sinks";
+    }
+}
 TEST(FragmentPacketWaveExecution, MissingScalarPresenceNeverLeavesBarrierParticipants) {
     const auto actual = execute(4);
     if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
@@ -124,4 +157,4 @@ TEST(FragmentPacketWaveExecution, SharedImagesDistinctBufferWords) {
         wanted[lane * 36 + 11] = fixture::resource::bits(0.75f);
     EXPECT_EQ(actual.result.exports[1], wanted);
 }
-} // namespace
+}   // namespace

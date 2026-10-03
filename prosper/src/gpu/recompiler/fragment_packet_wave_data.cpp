@@ -25,6 +25,21 @@ bool nonoverlapping(std::vector<std::pair<uint32_t, uint32_t>> spans) {
     return true;
 }
 } // namespace
+bool FragmentPacketWaveAuthority::matches(const std::shared_ptr<const FragmentPacketKernel>& owner,
+                                          std::span<const FragmentPacketWavePlacement> placements,
+                                          size_t input_words, size_t output_words) const {
+    if (!owner || owner != kernel_ ||
+        words_.size() != kPacketWaveAuthorityHeaderWords + 2 * placements.size() ||
+        words_[0] != kPacketWaveAuthorityMagic || words_[1] != placements.size() ||
+        words_[2] != input_words || words_[3] != output_words ||
+        words_[4] != owner->layout.input_words || words_[5] != owner->layout.output_words)
+        return false;
+    for (size_t wave = 0; wave < placements.size(); ++wave)
+        if (words_[kPacketWaveAuthorityHeaderWords + 2 * wave] != placements[wave].input_base ||
+            words_[kPacketWaveAuthorityHeaderWords + 2 * wave + 1] != placements[wave].output_base)
+            return false;
+    return true;
+}
 FragmentPacketKernel recompile_fragment_packet_kernel(const FragmentResourcePacket& prototype,
                                                       RecompileDiagnosticContext diagnostic) {
     FragmentPacketKernel result;
@@ -276,6 +291,20 @@ pack_fragment_packet_waves(std::shared_ptr<const FragmentPacketKernel> owner,
     }
     result.device_identity = kernel.program.device.device_identity;
     result.kernel = std::move(owner);
+    // Construct only after EVERY wave's facts and nonoverlapping placements have been validated.
+    // GPU guards compare mutable binding0 routing to this separate immutable ownership plane.
+    std::vector<uint32_t> authority = {kPacketWaveAuthorityMagic,
+                                       static_cast<uint32_t>(waves.size()),
+                                       static_cast<uint32_t>(input_end),
+                                       static_cast<uint32_t>(output_end),
+                                       layout.input_words,
+                                       layout.output_words};
+    for (const auto& place : result.placements) {
+        authority.push_back(place.input_base);
+        authority.push_back(place.output_base);
+    }
+    result.authority = std::shared_ptr<const FragmentPacketWaveAuthority>(
+        new FragmentPacketWaveAuthority(result.kernel, std::move(authority)));
     return result;
 }
 FragmentPacketWaveResult decode_fragment_packet_waves(const FragmentPacketWaveBatch& batch,
@@ -292,6 +321,9 @@ FragmentPacketWaveResult decode_fragment_packet_waves(const FragmentPacketWaveBa
     if (!batch.kernel || !batch.rejection.empty() || batch.placements.empty() ||
         words.size() != batch.output_words.size())
         return reject("packet-wave-batch-abi-invalid");
+    if (!batch.authority || !batch.authority->matches(batch.kernel, batch.placements,
+                                                      batch.input_words.size(), words.size()))
+        return reject("packet-wave-ownership-unproved");
     if (!completed || device != batch.device_identity)
         return reject("packet-wave-completion-or-device-unproved");
     const auto& kernel = *batch.kernel;

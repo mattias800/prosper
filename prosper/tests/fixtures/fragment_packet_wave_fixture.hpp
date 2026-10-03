@@ -37,7 +37,8 @@ inline FragmentResourcePacket packet(uint32_t variant = 0) {
                 {primitive, 0, 0, resource::bits(float(1 + variant * 32 + quad / (variant + 1))),
                  resource::bits(2.0f), resource::bits(4.0f)});
     }
-    g.sgprs = {{16, cache.m0}, {17, 0xbc000000u + variant}};   // explicit owned system-word fixture
+    // Hand-owned scalar words, NOT a claim about hardware PS system-SGPR placement.
+    g.sgprs = {{16, cache.m0}, {17, 0xbc000000u + variant}};
     FragmentPacketBufferRead buffer;
     buffer.pc = 1;
     buffer.descriptor = {0x1000 + variant * 0x1000, 0, 16, 0};
@@ -79,6 +80,16 @@ inline FragmentResourcePacket entry_m0_packet(uint32_t variant) {
     --p.buffers[0].pc;
     p.parameter_cache.entry_m0_available = true;
     p.parameter_cache.entry_m0 = p.parameter_cache.m0;
+    return p;
+}
+inline FragmentResourcePacket scalar_exec_packet(uint32_t variant) {
+    auto p = packet(variant);
+    const auto mask = p.invocation.exec_mask;
+    p.invocation.sgprs.emplace_back(24, static_cast<uint32_t>(mask));
+    p.invocation.sgprs.emplace_back(25, static_cast<uint32_t>(mask >> 32));
+    p.invocation.exec_mask = 0;   // original S_MOV_B64 must restore both genuine dynamic halves
+    p.invocation.guest_code.insert(p.invocation.guest_code.begin(), 0xbefe0418u);   // EXEC=s24:25
+    ++p.buffers[0].pc;
     return p;
 }
 inline std::vector<FragmentPacketWavePlacement> placements(const FragmentPacketKernel& kernel,

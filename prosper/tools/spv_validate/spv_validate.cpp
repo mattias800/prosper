@@ -735,6 +735,10 @@ int main(int argc, char** argv) {
             prosper::test::fragment_packet_wave::entry_m0_packet(0));
         dump(dir, "fragment_packet_wave_entry_m0_kernel", entry_m0_kernel.program.packet.spirv,
              "recompile_fragment_packet_kernel");
+        const auto scalar_exec_kernel = recompile_fragment_packet_kernel(
+            prosper::test::fragment_packet_wave::scalar_exec_packet(0));
+        dump(dir, "fragment_packet_wave_scalar_exec_kernel",
+             scalar_exec_kernel.program.packet.spirv, "recompile_fragment_packet_kernel");
         for (uint32_t op : {0x2au, 0x2eu, 0x33u}) {
             const auto p =
                 recompile_fragment_resource_packet(special::packet(op, special::rails(op)));

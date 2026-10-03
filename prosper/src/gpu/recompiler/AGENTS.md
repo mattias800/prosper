@@ -54,7 +54,9 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 - `fragment_packet_wave_data` separates cached original-program SOURCE/profile from dynamic owned
   logical64 wave regions. Checked per-workgroup bases load genuine scalar/M0/resource/VGPR words;
   all-wave status validation precedes any publication. Shared image bindings remain a bounded
-  initial domain. It grants no raster scheduling, system-entry derivation or shipping admission.
+  initial domain. Private readonly binding2 placement ownership guards mutable binding0 routes
+  uniformly before guest/barriers/stores; that retained dispatcher authority is not a live P5 lease.
+  It grants no raster scheduling, system-entry derivation or shipping admission.
 - `rdna2_mask_move` supplies the shared S_MOV_B64-to-EXEC lowering. Owned Wave64 packets consume
   two genuine instruction-order MUST scalar words at their logical lane position, independently
   of old EXEC, and preserve SCC. A partial numeric overwrite of a saved Bool mask remains a named

@@ -50,12 +50,20 @@ void configure_packet_wave_data(const FragmentInvocationPacket& packet,
     services.wave_data = &layout;
 }
 PacketWaveEmission begin_packet_wave_data(SpirvCompute& b, const PacketWaveDataLayout& layout) {
-    // All predicates use immutable shared wave metadata and WorkgroupId only. They are identical
+    // All predicates use uniform shared wave metadata and WorkgroupId only. They are identical
     // for all64 workers. Malformed metadata skips the ENTIRE workgroup, never one participant.
     // No guest load/barrier/output is reached until actual descriptor extents and tags agree.
-    const auto input_length = b.id(), output_length = b.id();
+    const auto input_length = b.id(), output_length = b.id(), authority_length = b.id();
     b.put(b.code, 68, {b.t_u32, input_length, b.v_in, 0});   // OpArrayLength, raw-u32 Block member0
     b.put(b.code, 68, {b.t_u32, output_length, b.v_out, 0});
+    b.put(b.code, 68, {b.t_u32, authority_length, b.v_cbuf, 0});
+    b.put(b.deco, Op_Decorate, {b.v_cbuf, 24});   // NonWritable: separate dispatcher authority
+    const auto authority_word = [&](uint32_t index) {
+        const auto pointer = b.id(), value = b.id();
+        b.put(b.code, Op_AccessChain, {b.t_ptr_sb_u32, pointer, b.v_cbuf, b.uconst(0), index});
+        b.put(b.code, Op_Load, {b.t_u32, value, pointer});
+        return value;
+    };
     const auto merge = b.id();
     const auto enter = [&](uint32_t predicate) {
         const auto body = b.id();
@@ -65,7 +73,9 @@ PacketWaveEmission begin_packet_wave_data(SpirvCompute& b, const PacketWaveDataL
         b.cur_block = body;
     };
     // Separate nested selections have their own merge blocks, unwound after guest services.
-    enter(b.ucmp(Op_UGreaterThanEqual, input_length, b.uconst(kPacketWaveHeaderWords)));
+    enter(b.land(
+        b.ucmp(Op_UGreaterThanEqual, input_length, b.uconst(kPacketWaveHeaderWords)),
+        b.ucmp(Op_UGreaterThanEqual, authority_length, b.uconst(kPacketWaveAuthorityHeaderWords))));
     const auto magic = b.load_packet_word(b.uconst(0));
     const auto count = b.load_packet_word(b.uconst(1));
     const auto declared_input = b.load_packet_word(b.uconst(2));
@@ -74,10 +84,22 @@ PacketWaveEmission begin_packet_wave_data(SpirvCompute& b, const PacketWaveDataL
                                     b.ucmp(Op_ULessThanEqual, count, b.uconst(4096)));
     const auto safe_count = b.sel(valid_count, count, b.uconst(0));
     const auto table_end = b.ibin(Op_IAdd, b.uconst(4), b.ibin(Op_IMul, safe_count, b.uconst(2)));
+    const auto authority_end = b.ibin(Op_IAdd, b.uconst(kPacketWaveAuthorityHeaderWords),
+                                      b.ibin(Op_IMul, safe_count, b.uconst(2)));
     auto valid = b.land(b.ucmp(Op_IEqual, magic, b.uconst(kPacketWaveTableMagic)), valid_count);
     valid = b.land(valid, b.land(b.ucmp(Op_IEqual, input_length, declared_input),
                                  b.ucmp(Op_IEqual, output_length, declared_output)));
     valid = b.land(valid, b.ucmp(Op_ULessThanEqual, table_end, input_length));
+    valid = b.land(valid, b.ucmp(Op_IEqual, authority_length, authority_end));
+    valid = b.land(
+        valid, b.ucmp(Op_IEqual, authority_word(b.uconst(0)), b.uconst(kPacketWaveAuthorityMagic)));
+    valid = b.land(valid, b.ucmp(Op_IEqual, authority_word(b.uconst(1)), count));
+    valid = b.land(valid, b.ucmp(Op_IEqual, authority_word(b.uconst(2)), input_length));
+    valid = b.land(valid, b.ucmp(Op_IEqual, authority_word(b.uconst(3)), output_length));
+    valid =
+        b.land(valid, b.ucmp(Op_IEqual, authority_word(b.uconst(4)), b.uconst(layout.input_words)));
+    valid = b.land(valid,
+                   b.ucmp(Op_IEqual, authority_word(b.uconst(5)), b.uconst(layout.output_words)));
     valid = b.land(valid, b.land(b.ucmp(Op_ULessThan, b.groupid[0], safe_count),
                                  b.land(b.ucmp(Op_IEqual, b.groupid[1], b.uconst(0)),
                                         b.ucmp(Op_IEqual, b.groupid[2], b.uconst(0)))));
@@ -87,6 +109,15 @@ PacketWaveEmission begin_packet_wave_data(SpirvCompute& b, const PacketWaveDataL
               b.uconst(0));
     const auto input_base = b.load_packet_word(table_index);
     const auto output_base = b.load_packet_word(b.ibin(Op_IAdd, table_index, b.uconst(1)));
+    // Invalid metadata selects existing authority header words before eager record loads. Valid
+    // metadata has exact record extent. No quadratic scan or mutable completion-prefix authority.
+    const auto authority_index = b.sel(valid,
+                                       b.ibin(Op_IAdd, b.uconst(kPacketWaveAuthorityHeaderWords),
+                                              b.ibin(Op_IMul, b.groupid[0], b.uconst(2))),
+                                       b.uconst(0));
+    valid = b.land(valid, b.ucmp(Op_IEqual, input_base, authority_word(authority_index)));
+    valid = b.land(valid, b.ucmp(Op_IEqual, output_base,
+                                 authority_word(b.ibin(Op_IAdd, authority_index, b.uconst(1)))));
     const auto input_span = b.uconst(layout.input_words + 2);
     const auto output_span = b.uconst(layout.output_words + kPacketWaveOutputPrefix);
     auto input_valid =
