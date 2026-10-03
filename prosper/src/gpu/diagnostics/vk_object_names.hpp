@@ -5,7 +5,7 @@
 // Why this exists. prosper named NO Vulkan object, so every external tool identified a guest shader
 // by its `VkShaderModule` handle: a number that changes run to run and means nothing outside the
 // process that produced it. The project routes real investigation through exactly those tools --
-// `docs/GPU_PROFILING_EXTERNAL.md` is their recipe book, `tools/pixel_history/` walks a RenderDoc
+// `docs/performance/GPU_PROFILING_EXTERNAL.md` is their recipe book, `tools/pixel_history/` walks a RenderDoc
 // pixel history, and #3321 made captures schedulable so an AGENT takes them with nobody at the
 // keyboard to remember which handle was which. The identity to name them with already existed and was
 // already being used as a memo key (`fs_identity`, `compute_dispatch_code_addr`); it just never

@@ -70,7 +70,7 @@ inline MappedStagingCache& mapped_staging_cache() {
 
 // Reuse is off when EITHER switch is set. PROSPER_NO_MEMORY_POOL has to keep working here: before
 // this cache existed, staging came from allocate_transient_render_memory, so that flag disabled
-// staging pooling too. Several `## Ruled out` rows in docs/GRAPHICS.md exonerate "prosper's caches,
+// staging pooling too. Several `## Ruled out` rows in docs/gpu/GRAPHICS.md exonerate "prosper's caches,
 // pools or arenas" using exactly that arm; if this cache ignored it, those arms would silently test
 // less than they did when they were recorded.
 inline bool mapped_staging_reuse_enabled() {

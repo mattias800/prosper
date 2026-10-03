@@ -140,7 +140,7 @@ public:
     // The full report for a device loss: the verdict line, then the driver's own fault account when
     // VK_EXT_device_fault is enabled. When the emitter is inactive it says so and how to arm it, rather
     // than staying silent: an absent line reads as "nothing to report", which is the wrong conclusion
-    // about a run that simply was not instrumented (docs/DIAGNOSTIC_GATE_AUDIT.md, rule 1).
+    // about a run that simply was not instrumented (docs/process/DIAGNOSTIC_GATE_AUDIT.md, rule 1).
     std::string report_device_loss(VkDevice device, VkQueue queue) const {
         if (!active())
             return "[gpu-breadcrumb] not armed: re-run with PROSPER_GPU_BREADCRUMBS=1 to learn where "

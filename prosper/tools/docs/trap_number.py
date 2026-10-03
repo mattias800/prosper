@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Allocate the next free row number for a numbered doc table, against master AND every open PR.
 
-WHY THIS EXISTS. The instrument-trap table in `docs/GAME_COMPAT_ORCHESTRATION.md` is appended to by
+WHY THIS EXISTS. The instrument-trap table in `docs/process/GAME_COMPAT_ORCHESTRATION.md` is appended to by
 several lanes at once, and the obvious allocation -- read the highest row on `origin/main`, add
 one -- is wrong the moment another lane pushes. It is not wrong *rarely*: #1729 records four
 collisions in one day, and on 2026-08-17 #2574 and #2581 both read 181 and both wrote 182. Reading
@@ -44,7 +44,9 @@ import shutil
 import subprocess
 import sys
 
-DEFAULT_FILE = "prosper/docs/GAME_COMPAT_ORCHESTRATION.md"
+from table_paths import git_table_path, select_table_path, table_paths
+
+DEFAULT_FILE = "prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md"
 DEFAULT_HEADER = "Instrument"
 # `gh pr list --json files` caps the array at 100 entries and gives NO "there is more" signal.
 # CONFIRMED, and stated as fact rather than as a caveat (#2610 review). This repository's largest PR
@@ -182,19 +184,22 @@ def added_rows_from_patch(patch: str, path: str) -> list[int]:
     """
     added: set[int] = set()
     removed: set[int] = set()
-    in_file = False
+    paths = table_paths(path)
+    in_added_file = False
+    in_removed_file = False
     for line in patch.split("\n"):
+        if line.startswith("--- a/"):
+            in_removed_file = line[6:].strip() in paths
+            continue
         if line.startswith("+++ b/"):
-            in_file = line[6:].strip() == path
+            in_added_file = line[6:].strip() in paths
             continue
         if line.startswith("diff --git"):
-            in_file = False
+            in_added_file = in_removed_file = False
             continue
-        if not in_file:
-            continue
-        if m := re.match(r"^\+\s*\|\s*(\d+)\s*\|", line):
+        if in_added_file and (m := re.match(r"^\+\s*\|\s*(\d+)\s*\|", line)):
             added.add(int(m.group(1)))
-        elif m := re.match(r"^-\s*\|\s*(\d+)\s*\|", line):
+        elif in_removed_file and (m := re.match(r"^-\s*\|\s*(\d+)\s*\|", line)):
             removed.add(int(m.group(1)))
     return sorted(added - removed)
 
@@ -280,6 +285,24 @@ def file_at(repo: str, path: str, ref: str) -> str:
     ])
 
 
+def table_at(repo: str, path: str, ref: str) -> tuple[str, str]:
+    """Select the table actually present on this exact PR head, including legacy branches."""
+    candidates = table_paths(path)
+    if len(candidates) > 1:
+        predicate = " or ".join(".==" + json.dumps(p) for p in candidates)
+        query = "{truncated,paths:[.tree[] | select(.type==\"blob\") | .path | select(" + \
+                predicate + ")] }"
+        try:
+            tree = json.loads(run(["gh", "api", f"repos/{repo}/git/trees/{ref}?recursive=1",
+                                   "--jq", query]))
+            if tree["truncated"] is not False:
+                raise ScanError(f"{ref}: truncated tree cannot establish the table path")
+            path = select_table_path(path, tree["paths"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ScanError(f"{ref}: cannot select the actual table path: {exc}") from exc
+    return path, file_at(repo, path, ref)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--file", default=DEFAULT_FILE, help=f"path in the repo (default {DEFAULT_FILE})")
@@ -298,7 +321,11 @@ def main() -> int:
             run(["git", "fetch", "--quiet", "origin"])
 
         repo = run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]).strip()
-        base_text = run(["git", "show", f"{args.base}:{args.file}"])
+        try:
+            base_path = git_table_path(args.base, args.file, run)
+        except ValueError as exc:
+            raise ScanError(str(exc)) from exc
+        base_text = run(["git", "show", f"{args.base}:{base_path}"])
         base_max = highest(base_text, args.table_header)
         base_numbers = set(table_numbers(base_text, args.table_header))
         if base_max is None:
@@ -322,7 +349,7 @@ def main() -> int:
         touching = []
         for pr in prs:
             paths = [f.get("path") for f in pr.get("files") or []]
-            if args.file in paths:
+            if any(path in paths for path in table_paths(args.file)):
                 touching.append(pr)
             elif len(paths) >= FILES_CAP:
                 # `gh pr list --json files` pages at 100 entries, so on a PR at the cap the absence
@@ -330,10 +357,10 @@ def main() -> int:
                 # and the alternative is an invisible claim.
                 touching.append(pr)
         for pr in touching:
-            text = file_at(repo, args.file, pr["headRefOid"])
+            actual_path, text = table_at(repo, args.file, pr["headRefOid"])
             claims.append((pr["number"], pr["title"], highest(text, args.table_header),
                            pr["isDraft"], added_numbers(text, base_text, args.table_header),
-                           added_rows_from_diff(repo, pr["number"], args.file)))
+                           added_rows_from_diff(repo, pr["number"], actual_path)))
     except ScanError as exc:
         # Hard error. A fallback to "master alone" would answer the question this tool exists to
         # refuse to answer that way, and the caller could not tell the two apart.

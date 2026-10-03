@@ -727,7 +727,7 @@ static uint64_t apr_submit_common(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
     unsigned ring = a1 ? (unsigned)(a1 - 1) & 0x3f : 0;
     // Completion-token contract (issues #180/#208 — guest submit path eboot+0x22a02b0, handler
     // +0x229dcb0, listener +0x22740b0, listener-ctx ctor +0x22a0670; full write-up in
-    // hle_kernel_time.cpp and docs/UE4_APR_IOSTORE_BRINGUP.md):
+    // hle_kernel_time.cpp and docs/engines/UE4_APR_IOSTORE_BRINGUP.md):
     //   - H896-BOUND cb (the batched/streaming channel): the completion token IS the binding tag,
     //     (ring<<58)|counter with the counter drawn from the guest's own per-ring sequence seeded
     //     at 1000 ([ctx+0xc0+ring*0x28], ctor-initialized 0x3e8). The guest tracks it at
@@ -1095,7 +1095,7 @@ namespace {
     // [0, 0x400000000), then found the only free gap sitting at [0x40F400000, 0x410000000),
     // entirely above its window. It took the ENOMEM, built a GFS resource reader over a null
     // buffer, and its own read-with-endian-swap helper then byte-swapped `(uint32)-1` bytes in
-    // place, reversing every 32-bit word of ~4 GiB of live heap. See docs/METAPHOR_STATUS.md.
+    // place, reversing every 32-bit word of ~4 GiB of live heap. See docs/games/METAPHOR_STATUS.md.
     //
     // Three constraints fix the value, and only the first is about the guest:
     //
@@ -3150,7 +3150,7 @@ HLE(k_ampr_push_map) {
         // A refused mapping must give the physical pages BACK (#2908). map_phys_at answers null when
         // the no-clobber discipline declines the target, and that refusal is the CORRECT outcome for
         // the flavors that reach here carrying a buffer the guest already owns. WHY it is correct is
-        // argued in docs/KHAZAN_STATUS.md and docs/UE4_APR_IOSTORE_BRINGUP.md, deliberately not
+        // argued in docs/games/KHAZAN_STATUS.md and docs/engines/UE4_APR_IOSTORE_BRINGUP.md, deliberately not
         // here: two review rounds were spent on wrong one-line versions of that argument, and a
         // comment is the worst place to keep a claim that needs a case analysis to be true.
         //
@@ -4646,7 +4646,7 @@ namespace {
     // [0, 0x400000000), then found the only free gap sitting at [0x40F400000, 0x410000000),
     // entirely above its window. It took the ENOMEM, built a GFS resource reader over a null
     // buffer, and its own read-with-endian-swap helper then byte-swapped `(uint32)-1` bytes in
-    // place, reversing every 32-bit word of ~4 GiB of live heap. See docs/METAPHOR_STATUS.md.
+    // place, reversing every 32-bit word of ~4 GiB of live heap. See docs/games/METAPHOR_STATUS.md.
     //
     // Three constraints fix the value, and only the first is about the guest:
     //

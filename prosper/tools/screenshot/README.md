@@ -74,7 +74,7 @@ identity, guest flip count, rendered-frame sequence, dimensions, CRC32, distinct
 non-black pixel count, a 16x9 luminance signature, and standard 64-bit average/difference hashes,
 capture source, elapsed time, input route, and whether the source advanced or was stale. `source` is
 one of `composited` (prosper rendered it), `guest_scanout` (prosper rendered nothing for that flip
-and republished the guest's own display buffer — see `docs/GRAPHICS.md`), or `raw_scanout` (read
+and republished the guest's own display buffer — see `docs/gpu/GRAPHICS.md`), or `raw_scanout` (read
 straight out of guest memory before any renderer frame existed). The color
 count and signatures are computed from the visible presented RGBA result (including alpha) and support scene-collapse,
 coverage, and SSIM likeness guards without decoding the PNG again. The hashes and CRC32 remain useful

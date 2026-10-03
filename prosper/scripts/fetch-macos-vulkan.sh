@@ -6,7 +6,7 @@
 # into the x86_64 binary. This drops a universal MoltenVK into <repo>/.macos-vulkan/ (gitignored) and
 # points CMake at it with -DPROSPER_MACOS_MOLTENVK=.../.macos-vulkan/lib/libMoltenVK.dylib.
 #
-# TWO sources (see docs/PORTING.md "macOS harness app"):
+# TWO sources (see docs/platforms/PORTING.md "macOS harness app"):
 #   (default) Khronos prebuilt release — small, fast; FINE FOR BUILDING/CI (build-only), but its
 #             x86_64 build has a SPIRV-Cross bug (#693) that fails to convert some guest shaders to
 #             MSL, so it does NOT render real content.

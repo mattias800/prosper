@@ -40,7 +40,7 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
   The AVX2 kernel beside it is **not** an optimization and **nothing in the emulator calls it** —
   the portable loop is already auto-vectorized, and given the same ISA the compiler produces a
   wider loop than the intrinsics do. It survives only so that `test_index_expand --bench` keeps
-  the falsifying A/B executable; see `docs/OUTER_WILDS_STATUS.md` § Ruled out before spending any
+  the falsifying A/B executable; see `docs/games/OUTER_WILDS_STATUS.md` § Ruled out before spending any
   time here. `PROSPER_INDEX_EXPAND_STATS=1` reports the index volume that would have to be large
   for any of this to matter.
 - `compute_program_facts` — what a compute dispatch needs to know about its PROGRAM (decoded

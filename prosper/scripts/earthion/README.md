@@ -74,7 +74,7 @@ is indistinguishable, from the screenshots alone, from a title that reads them a
 
 **Rung 3.** This section previously said that starting a game "needs Up/Down navigation plus Cross"
 and was "a menu-navigation problem against a working frontend, not a graphics one". **Both halves are
-falsified** (2026-08-21, `docs/EARTHION_STATUS.md`):
+falsified** (2026-08-21, `docs/games/EARTHION_STATUS.md`):
 
 * The list above is the **wrapper's** menu and contains no start item — every row is a wrapper
   control (`Reset`, `Game Version`, `Audio`, `Visuals`, `Language`, `Extras`, `How to Play`). No
@@ -86,7 +86,7 @@ falsified** (2026-08-21, `docs/EARTHION_STATUS.md`):
   inside the bezel is black in every frame bar one narration line.
 
 The real frontier is that the game picture never leaves the narration sequence, which recurs on a
-**~60 s cycle**. Read `docs/EARTHION_STATUS.md` § Ruled out before forming a hypothesis.
+**~60 s cycle**. Read `docs/games/EARTHION_STATUS.md` § Ruled out before forming a hypothesis.
 
 ## Known-unrelated diagnostic noise
 
@@ -103,7 +103,7 @@ at that offset is dropped upstream by the guest defect above, and **the composit
 the route's three stable states (menu, HOW TO PLAY, black) are pixel-identical and no new content
 appears. Two runs of the same binary differ in 7 of 28 frames purely because the narration cycle's
 phase is not deterministic, so do not use a whole-run frame-identity count as a render oracle here.
-Both facts are in `docs/EARTHION_STATUS.md`.
+Both facts are in `docs/games/EARTHION_STATUS.md`.
 
 Those counts are for **this** route. A route that never opens the wrapper menu exercises a different
 program set: the touch-pad route produces exactly one `[mimg-unresolved]` line and zero

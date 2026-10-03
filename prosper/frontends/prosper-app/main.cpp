@@ -1,6 +1,6 @@
 // prosper-app (P0a) — the OS-integration frontend: an SDL3 window + Vulkan swapchain that presents
 // the frame prosper's renderer hands to the present layer. See
-// docs/FRONTEND_APP.md and issue #164.
+// docs/subsystems/FRONTEND_APP.md and issue #164.
 //
 // P0a scope (this file): the whole present half, decoupled from the guest boot. It pulls finished
 // frames from prosper_core's present layer and blits them to a real swapchain,
