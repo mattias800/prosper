@@ -45,6 +45,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -381,4 +382,62 @@ TEST(SavedataParam, Contract) {
 
     savedata0_umount();
     EXPECT_EQ(fails, 0);
+}
+
+// #4275: sceSaveDataSaveIcon (c88Yy54Mx0w) was unregistered, so the dispatcher answered SCE_OK and the
+// icon was discarded. The live call (Hollow Knight: Silksong) passes "/savedata0" and
+// SceSaveDataIcon { void* buf; size_t bufSize; size_t dataSize; reserved }, buf holding a PNG.
+TEST(SavedataParam, SaveIconWritesThePngIntoTheMountedSave) {
+    register_builtin_hle();
+    HleFn save_icon = Hle::lookup("c88Yy54Mx0w");
+    ASSERT_NE(save_icon, nullptr) << "sceSaveDataSaveIcon is registered";
+
+    const fs::path scratch = prosper_test::test_scratch_dir() / "savedata-icon";
+    std::error_code ec;
+    fs::remove_all(scratch, ec);
+    fs::create_directories(scratch / "save0", ec);
+    set_env("PROSPER_SAVE0", (scratch / "save0").string().c_str());
+    set_app0_root(make_app0(scratch, "title", "PPSA00043"));
+
+    struct Icon { const void* buf; uint64_t buf_size; uint64_t data_size; uint8_t reserved[32]; };
+    const std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4, 5};
+    const MountPoint mp = mount_point("/savedata0");
+    auto call = [&](const MountPoint* point, const Icon* icon) {
+        return save_icon((uint64_t)(uintptr_t)point, (uint64_t)(uintptr_t)icon, 0, 0, 0, 0);
+    };
+    const Icon good{png.data(), png.size(), png.size(), {}};
+
+    savedata0_umount();
+    EXPECT_EQ(call(&mp, &good), 0x809F0004ull) << "no save mounted -> NOT_MOUNTED";
+
+    ASSERT_EQ(savedata0_mount("IconSlot", SaveDataMountPolicy::OpenOrCreate),
+              SaveDataMountOutcome::Created);
+    const fs::path icon_path = fs::path(savedata0_dir()) / "IconSlot" / "sce_sys" / "icon0.png";
+
+    const MountPoint wrong = mount_point("/savedata9");
+    EXPECT_EQ(call(&wrong, &good), 0x809F0000ull) << "unserved mount point -> PARAMETER";
+    EXPECT_EQ(call(&mp, nullptr), 0x809F0000ull) << "null icon -> PARAMETER";
+    const Icon null_buf{nullptr, 16, 16, {}};
+    EXPECT_EQ(call(&mp, &null_buf), 0x809F0000ull) << "null buffer -> PARAMETER";
+    const Icon empty{png.data(), png.size(), 0, {}};
+    EXPECT_EQ(call(&mp, &empty), 0x809F0000ull) << "empty data -> PARAMETER";
+    const Icon overlong{png.data(), 4, png.size(), {}};
+    EXPECT_EQ(call(&mp, &overlong), 0x809F0000ull) << "dataSize > bufSize -> PARAMETER";
+    EXPECT_FALSE(fs::exists(icon_path)) << "no refused call may leave an icon behind";
+
+    ASSERT_EQ(call(&mp, &good), 0u);
+    std::ifstream in(icon_path, std::ios::binary);
+    const std::vector<uint8_t> stored((std::istreambuf_iterator<char>(in)),
+                                      std::istreambuf_iterator<char>());
+    EXPECT_EQ(stored, png) << "the icon bytes are stored at sce_sys/icon0.png";
+
+    // A different icon replaces the first; a stub writing fixed bytes passes the arm above only.
+    const std::vector<uint8_t> second = {0x89, 'P', 'N', 'G', 9, 9};
+    const Icon replace{second.data(), second.size(), second.size(), {}};
+    ASSERT_EQ(call(&mp, &replace), 0u);
+    std::ifstream again(icon_path, std::ios::binary);
+    const std::vector<uint8_t> restored((std::istreambuf_iterator<char>(again)),
+                                        std::istreambuf_iterator<char>());
+    EXPECT_EQ(restored, second);
+    savedata0_umount();
 }

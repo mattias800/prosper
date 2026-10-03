@@ -9,6 +9,7 @@ inline constexpr const char* kPacketVgprValidityMarker =
 // variables persist each physical worker's LOGICAL lane fact across dispatcher branches/services.
 struct PacketVgprDefinedness {
     const FragmentPacketVgprRequirements& requirements;
+    FragmentPacketExportObservation export_observation = FragmentPacketExportObservation::LegacyRaw;
     std::map<int, uint32_t> valid_vars;
     uint32_t failure_pc = 0, failure_reg = 0, failure_kind = 0;
     uint32_t peer_valid = 0, peer_pc = 0, peer_reg = 0, peer_scratch_base = 0;

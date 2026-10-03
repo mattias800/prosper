@@ -18,10 +18,13 @@
 #endif
 
 #include "host/image/exec_image.hpp"
+#include "host/image/module_start_params.hpp"
+#include "host/image/runtime_module_load.hpp"
 #include "host/image/stub_append_batch.hpp"
 #include "host/image/win_data_watch.hpp"
 #include "host/fault/rbp_chain.hpp"   // guest_frames_from_rbp: the shared frame-pointer walk
 #include "host/fault/guest_stack_scan.hpp"   // the scan-based sibling, shared by both platforms
+#include "host/fault/win_recovery.hpp"
 #include "host/platform/immortal.hpp"   // #2613: registries a guest thread can reach after exit()
 #include "host/memory/guest_write_watch.hpp"
 #include "host/x86/sse4a.hpp"
@@ -40,7 +43,6 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
-#include <csetjmp>
 #include <algorithm>
 #include <iterator>
 #include <map>
@@ -196,15 +198,14 @@ namespace {
     // faulting thread. Keyed implicitly by being thread_local (no tid needed, unlike the Linux path
     // which must dodge a guest %fs — Windows has no guest %fs swap).
     //
-    // We use __builtin_setjmp/__builtin_longjmp, NOT the CRT setjmp/longjmp. On Windows x64 the CRT
+    // We use an explicit native no-unwind recovery bridge, NOT the CRT setjmp/longjmp. The Windows CRT
     // longjmp performs a full SEH stack UNWIND (RtlUnwindEx) from the longjmp site back to the setjmp
     // frame. Our recovery longjmps ACROSS a guest frame and the hand-written prosper_call_guest_sysv
     // trampoline — neither has Windows .pdata/.xdata unwind info — so RtlUnwindEx walks into frames it
     // cannot describe and blows the stack (STATUS_STACK_OVERFLOW 0xC00000FD) instead of recovering.
-    // The __builtin_* pair restores only rsp/rbp/rip (no unwind), which is exactly right for crossing
-    // foreign frames — the same simple-register-restore behavior the Linux longjmp has. The buffer is
-    // GCC's fixed 5-word layout.
-    thread_local void*       t_jb[5];
+    // Compiler builtins are not a portable replacement: native Clang saves an unbiased frame address
+    // but restores it directly into the biased Windows RBP (#4265). Save actual host registers instead.
+    thread_local host::WinRecoveryState t_recovery;
     thread_local volatile int t_armed = 0;
 
     // Fault state latched by the VEH for the BootResult / init-fault report (single-threaded boot use).
@@ -297,7 +298,7 @@ namespace {
     thread_local InitThreadStackRegistration t_init_stack_registration;
 
     std::vector<std::pair<uint64_t, uint64_t>> g_modstart_param_ranges;
-    struct ModStartDesc { uint64_t a, b, c; } g_modstart_desc = { 0x10, 0x200, 0 };
+    ModuleStartDescriptor g_modstart_desc = kModuleStartDescriptor;
 
     inline uint64_t cur_tid() { return (uint64_t)GetCurrentThreadId(); }
     inline uint64_t page_up(uint64_t v) { return (v + 0xfffull) & ~0xfffull; }
@@ -898,7 +899,7 @@ namespace {
     // The VEH resumes at this assembly thunk instead of entering a compiled function directly. Its
     // entry contract is deliberately not a normal call frame: RSP is 16-byte aligned and there is no
     // return address. The thunk allocates the Microsoft-x64 32-byte home area, then makes a normal,
-    // aligned call into the compiled helper. __builtin_longjmp never returns across the foreign guest
+    // aligned call into the compiled helper. Native restore never returns across the foreign guest
     // frames, so the missing caller frame is immaterial. The recorded alignment makes the contract
     // regression-testable on Windows rather than relying on current compiler tolerance (#633).
     extern "C" {
@@ -909,7 +910,7 @@ namespace {
         void prosper_veh_recover_thunk();
     }
     extern "C" __attribute__((noinline, noreturn)) void prosper_veh_recover_longjmp() {
-        __builtin_longjmp(t_jb, 1);
+        host::prosper_win_recovery_restore(&t_recovery);
         __builtin_unreachable();
     }
     __asm__(
@@ -1598,7 +1599,10 @@ size_t run_guest_inits(const std::vector<uint64_t>& fns) {
         uint64_t argc = 0, argp = 0;
         for (auto& r : g_modstart_param_ranges)
             if (f >= r.first && f < r.second) { argc = 0x10; argp = (uint64_t)&g_modstart_desc; break; }
-        if (__builtin_setjmp(t_jb) == 0) { prosper_call_guest_sysv(f, argc, argp); ok++; }
+        if (host::prosper_win_recovery_save(&t_recovery) == 0) {
+            call_guest_module_entry(f, argc, argp, 0);
+            ok++;
+        }
         t_armed = 0;
         if (g_trap_kind) {
             fprintf(stderr, "[prosper] init fn 0x%llx faulted (%s); continuing\n",
@@ -1680,7 +1684,7 @@ BootResult run_entry(const LoadedImage& img) {
     void* teb_save_base = tib->StackBase, *teb_save_limit = tib->StackLimit;
 
     g_trap_kind = 0; g_fault_addr = 0; g_fault_rip = 0; t_armed = 1;
-    if (__builtin_setjmp(t_jb) == 0) {
+    if (host::prosper_win_recovery_save(&t_recovery) == 0) {
         tib->StackBase  = (void*)((uintptr_t)stk + STK);   // high end (grows down toward StackLimit)
         tib->StackLimit = stk;                             // low end of the committed guest stack
         guest_tls_activate_thread();   // (re-)apply this thread's guest %fs base immediately before entry
@@ -1701,7 +1705,7 @@ BootResult run_entry(const LoadedImage& img) {
         r.rbp = g_rbp; r.rsp = g_rsp; r.rax = g_rax; r.rdi = g_rdi;
         r.rsi = g_rsi; r.rdx = g_rdx; r.rbx = g_rbx;
         t_armed = 1;
-        if (__builtin_setjmp(t_jb) == 0) {
+        if (host::prosper_win_recovery_save(&t_recovery) == 0) {
             uint64_t bp = g_rbp;
             for (int i = 0; i < 24 && bp > 0x10000; i++) {
                 if (!addr_readable(bp) || !addr_readable(bp + 8)) break;

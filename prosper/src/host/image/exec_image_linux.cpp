@@ -1,6 +1,8 @@
 // exec_image_linux.cpp — Linux host backing + HLE stubs (M2/M3). Compiles to nothing
 // on non-Linux so the shared (mingw) build is unaffected.
 #include "host/image/exec_image.hpp"
+#include "host/image/module_start_params.hpp"
+#include "host/image/runtime_module_load.hpp"
 #include "host/image/stub_append_batch.hpp"
 #include "host/abi/sysv_ms_bridge.hpp"
 #include "host/platform/immortal.hpp"   // #2613: registries a guest thread can reach after exit()
@@ -3986,8 +3988,7 @@ std::vector<std::pair<uint64_t, uint64_t>> g_modstart_param_ranges;
 // (interface version the native plugin requires), [+8]=0 (optional callback-registration fn ptr;
 // NULL is honored — PSN_PrxInitialize skips the optional callbacks and still reports its real
 // native version). Static so it has a stable, guest-readable address for the whole run.
-static const struct __attribute__((packed)) { uint32_t size; uint32_t version; uint64_t cb; }
-    g_modstart_desc = { 0x10, 0x200, 0 };
+static constexpr auto g_modstart_desc = kModuleStartDescriptor;
 
 void set_module_start_param_ranges(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
     g_modstart_param_ranges = ranges;
@@ -4077,7 +4078,10 @@ size_t run_guest_inits(const std::vector<uint64_t>& fns) {
         uint64_t argc = 0, argp = 0;
         for (auto& r : g_modstart_param_ranges)
             if (f >= r.first && f < r.second) { argc = 0x10; argp = (uint64_t)&g_modstart_desc; break; }
-        if (sigsetjmp(g_jb, 1) == 0) { ((void (*)(uint64_t, uint64_t))(uintptr_t)f)(argc, argp); ok++; }
+        if (sigsetjmp(g_jb, 1) == 0) {
+            call_guest_module_entry(f, argc, argp, 0);
+            ok++;
+        }
         g_armed_tid = 0;
         if (g_trap_kind) {
             fprintf(stderr, "[prosper] init fn 0x%llx faulted (%s); continuing\n",

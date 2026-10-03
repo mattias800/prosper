@@ -23,8 +23,10 @@ That rules out more than the usual async-signal-safety list:
   (`walk_rbp_chain`) or is fed a snapshot the caller already validated — it never decides for itself
   that an address is probably fine.
 
-Header-only for the same reason: these are small enough to inline, and keeping them out of a
-translation unit that links platform state makes them trivially unit-testable.
+Most helpers are header-only: these are small enough to inline, and keeping them out of a
+translation unit that links platform state makes them trivially unit-testable. `win_recovery.*`
+is the exception: its explicit Microsoft-x64 assembly saves/restores the host continuation without
+unwinding foreign guest frames. It owns no thread or handler state; the image substrate owns that.
 
 ## What is here
 

@@ -836,6 +836,11 @@ if(TARGET prosper_core)
   endif()
 
   # Split-T# provenance proof (#4197): pure decoder/fold cases, no dump.
+  # #4120/#4274: storage-image DST_SEL routing rules (pure).
+  prosper_add_gtest(test_storage_dst_sel
+    SOURCES tests/gpu/recompiler/test_storage_dst_sel.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_split_t8_dataflow
     SOURCES tests/gpu/recompiler/test_split_t8_dataflow.cpp
     INCLUDES src
@@ -1429,6 +1434,11 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_savedata_ime
     SOURCES tests/hle/test_savedata_ime.cpp
     INCLUDES tests
+    LIBRARIES prosper_core)
+
+  # #4275: NP Universal Data System property objects/arrays and SessionSignaling init.
+  prosper_add_gtest(test_np_uds_properties
+    SOURCES tests/hle/np/test_np_uds_properties.cpp
     LIBRARIES prosper_core)
 
   # The save's parameter block (#2786): sceSaveDataSetParam/GetParam were unregistered, so both
@@ -2608,6 +2618,12 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/diagnostics/test_link_list_census.cpp
     LIBRARIES prosper_core)
 
+  # #4273: each distinct refused shader is kept by default, bounded and deduplicated.
+  prosper_add_gtest(test_refused_shader_dump
+    SOURCES tests/gpu/diagnostics/test_refused_shader_dump.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_shader_dump_filter
     SOURCES tests/gpu/diagnostics/test_shader_dump_filter.cpp
     LIBRARIES prosper_core)
@@ -2828,6 +2844,9 @@ endif()
   prosper_add_gtest(test_fragment_packet_wave_data
     SOURCES tests/gpu/recompiler/test_fragment_packet_wave_data.cpp
     INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_packet_exports
+    SOURCES tests/gpu/recompiler/test_fragment_packet_exports.cpp
+    INCLUDES tests tests/gpu/recompiler LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
   add_executable(test_fragment_packet_wqm tests/gpu/recompiler/test_fragment_packet_wqm.cpp)
   target_include_directories(test_fragment_packet_wqm PRIVATE tests)
   target_link_libraries(test_fragment_packet_wqm PRIVATE prosper_core)
@@ -3248,6 +3267,11 @@ endif()
   add_executable(test_fragment_float_flags tests/gpu/state/test_fragment_float_flags.cpp)
   target_link_libraries(test_fragment_float_flags PRIVATE prosper_core)
   add_test(NAME fragment_float_flags COMMAND test_fragment_float_flags)
+  # #3549: a storage-image or format-fetch DST_SEL is part of the compiled-shader key.
+  prosper_add_gtest(test_shader_key_dst_sel
+    SOURCES tests/gpu/execute/test_shader_key_dst_sel.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
   add_executable(test_fragment_float_flags_key tests/gpu/execute/test_fragment_float_flags_key.cpp)
   target_link_libraries(test_fragment_float_flags_key PRIVATE prosper_core)
   add_test(NAME fragment_float_flags_key COMMAND test_fragment_float_flags_key)
@@ -3463,6 +3487,13 @@ endif()
   add_executable(test_initfault_dump tests/host/image/test_initfault_dump.cpp)
   target_link_libraries(test_initfault_dump PRIVATE prosper_core)
   add_test(NAME initfault_dump_survives COMMAND test_initfault_dump)
+
+  if(WIN32)
+    prosper_add_gtest(test_win_recovery
+      SOURCES tests/host/image/test_win_recovery.cpp tests/host/image/win_recovery_witness.cpp
+      LIBRARIES prosper_core
+      PROPERTIES TIMEOUT 15)
+  endif()
 
   # Generated guest->host import boundary: preserve all register args, stack args 7-9, return value,
   # and ABI stack alignment. Windows exercises SysV->Microsoft-x64; Linux also drives the FS-swap path.
@@ -5971,6 +6002,10 @@ if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
     PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
   prosper_add_gtest(test_fragment_packet_wave_data_exec
     SOURCES tests/gpu/execute/test_fragment_packet_wave_data_exec.cpp
+    INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
+    PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
+  prosper_add_gtest(test_fragment_packet_exports_exec
+    SOURCES tests/gpu/execute/test_fragment_packet_exports_exec.cpp
     INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
     PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
 

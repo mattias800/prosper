@@ -8,6 +8,7 @@
 // device (the app/HLE, or tests via render_runner.h). agc_driver_submit_dcb calls this with the live
 // renderer once the device is wired; tests call it with the offscreen renderer to verify the spine.
 #pragma once
+#include "gpu/diagnostics/refused_shader_dump.hpp"   // #4273: default refused-shader evidence
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include <map>
 #include <atomic>
@@ -2677,6 +2678,23 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                     fclose(f);
                 }
             }
+        }
+        // #4273: keep each distinct refused stage's code by default, bounded, so a dropped draw
+        // leaves its evidence without a diagnostic rerun.
+        for (auto [tag, addr, failed] : {std::tuple{"vs", vs_program_addr, vs_words.empty()},
+                                         std::tuple{"ps", rs.ps_addr, fs_words.empty()}}) {
+            if (!failed || !addr || !guest_readable(addr, sizeof(uint32_t))) continue;
+            const uint32_t* program = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(addr));
+            if (refused_shader_already_noted(tag, addr, program[0])) continue;
+            const size_t span = rdna2_recompile_code_span(program, max_shader_dwords);
+            if (!span || !guest_readable(addr, static_cast<uint32_t>(span * sizeof(uint32_t))))
+                continue;
+            char detail[160];
+            snprintf(detail, sizeof detail, "draw-order=%llu vs=%zu gs=%zu fs=%zu es=0x%llx ps=0x%llx",
+                     (unsigned long long)(draw ? draw->command_order : 0), vs_words.size(),
+                     gs.size(), fs_words.size(), (unsigned long long)rs.es_addr,
+                     (unsigned long long)rs.ps_addr);
+            note_refused_shader(tag, addr, program, span, detail);
         }
         if (log) {
             fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu gs=%zu fs=%zu; order=%llu "

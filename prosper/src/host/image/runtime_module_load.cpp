@@ -78,7 +78,8 @@ struct GuestFsScope { explicit GuestFsScope(uint64_t) {} };
 #endif
 
 #ifdef _WIN32
-extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t a0, uint64_t a1);
+extern "C" uint64_t prosper_call_guest_sysv4(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2,
+                                             uint64_t a3);
 #endif
 
 } // namespace
@@ -86,15 +87,22 @@ extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t a0, uint64_t a
 // The entry is guest code compiled for System V. On Windows the host ABI is Microsoft x64, so a plain
 // function-pointer call would put the arguments in RCX/RDX and let the guest clobber registers the
 // host expects preserved; the platform bridge is the one place that translates both. Other hosts run
-// System V natively.
+// System V natively. DT_INIT stubs also consume RDX as an optional alternate module_start address;
+// no alternate is requested here. Leaving it unspecified lets Windows' argc become a jump target.
 uint64_t call_guest_module_entry(uint64_t fn, uint64_t args, uint64_t argp, uint64_t guest_fs) {
-    GuestFsScope fs(guest_fs);
+    const auto enter = [fn, args, argp]() -> uint64_t {
 #ifdef _WIN32
-    return prosper_call_guest_sysv(fn, args, argp);
+        return prosper_call_guest_sysv4(fn, args, argp, 0, 0);
 #else
-    return ((uint64_t (*)(uint64_t, uint64_t))(uintptr_t)fn)(
-        args, argp);   // host ABI is already System V
+        return ((uint64_t (*)(uint64_t, uint64_t, uint64_t))(uintptr_t)fn)(
+            args, argp, 0);   // host ABI is already System V
 #endif
+    };
+    // Preload recovery jumps across foreign frames; with no FS swap requested, do not introduce
+    // a nontrivial POSIX scope destructor on that path. Runtime calls still retain the real swap.
+    if (!guest_fs) return enter();
+    GuestFsScope fs(guest_fs);
+    return enter();
 }
 
 void runtime_module_loader_init(Program* p) {

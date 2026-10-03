@@ -157,9 +157,23 @@ struct ShaderResourceCompileKey {
     uint32_t addr_v = 0;
     uint32_t border_color_type = 0;
     bool normalize_unnormalized_coordinates = false;
+    // Packed T#/V# DST_SEL (3 bits per channel) for resources whose emission reads it: storage
+    // image stores route VDATA through it and MUBUF format loads route returned channels. 0 for
+    // every other class, so their modules stay shared.
+    uint32_t emitted_dst_sel = 0;
 
     bool operator==(const ShaderResourceCompileKey&) const = default;
 };
+
+// The DST_SEL word a resource contributes to its compile key: packed selectors for the classes whose
+// emitted SPIR-V reads them (storage-image stores, MUBUF format fetches), and 0 for every other
+// class so a texture's view-level swizzle never splits a module.
+inline uint32_t compile_key_dst_sel(const ShaderResource& resource) {
+    if (resource.cls != ResourceClass::StorageImage && resource.cls != ResourceClass::VertexBuffer)
+        return 0;
+    return (resource.swizzle[0] & 7u) | ((resource.swizzle[1] & 7u) << 3) |
+           ((resource.swizzle[2] & 7u) << 6) | ((resource.swizzle[3] & 7u) << 9);
+}
 
 struct ShaderCompileKey {
     ShaderProgramStage stage = ShaderProgramStage::Vertex;
@@ -437,6 +451,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, resource.addr_v);
             hash = hash_mix(hash, resource.border_color_type);
             hash = hash_mix(hash, resource.normalize_unnormalized_coordinates);
+            hash = hash_mix(hash, resource.emitted_dst_sel);
         }
         if constexpr (WordHash) {
             // Avalanche once after the field walk, including upper bits in bucket selection.

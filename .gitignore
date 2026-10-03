@@ -20,6 +20,8 @@ eboot.bin
 *.prgbundle
 *.prperf
 *.prgtl
+# A refused shader's raw guest code (#4273) is game-derived too, written beside the captures.
+refused_shaders_*/
 
 # ---- Build output ----
 # tests/test_scratch.h fallback root when a test binary is run by hand outside ctest.

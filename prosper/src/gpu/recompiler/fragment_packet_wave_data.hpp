@@ -76,6 +76,7 @@ struct FragmentPacketWaveBatch {
 };
 struct FragmentPacketWaveResult {
     std::vector<std::vector<uint32_t>> exports; // EMPTY if ANY wave fails
+    std::vector<std::vector<FragmentPacketArchitecturalLane>> architectural_exports;
     std::string rejection;
     uint32_t wave = UINT32_MAX, lane = UINT32_MAX, pc = UINT32_MAX;
 };
