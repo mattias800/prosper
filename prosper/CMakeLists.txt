@@ -2760,6 +2760,9 @@ endif()
   prosper_add_gtest(test_fragment_packet_wave_data
     SOURCES tests/gpu/recompiler/test_fragment_packet_wave_data.cpp
     INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_packet_exports
+    SOURCES tests/gpu/recompiler/test_fragment_packet_exports.cpp
+    INCLUDES tests tests/gpu/recompiler LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
   add_executable(test_fragment_packet_wqm tests/gpu/recompiler/test_fragment_packet_wqm.cpp)
   target_include_directories(test_fragment_packet_wqm PRIVATE tests)
   target_link_libraries(test_fragment_packet_wqm PRIVATE prosper_core)
@@ -5886,6 +5889,10 @@ if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
     PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
   prosper_add_gtest(test_fragment_packet_wave_data_exec
     SOURCES tests/gpu/execute/test_fragment_packet_wave_data_exec.cpp
+    INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
+    PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
+  prosper_add_gtest(test_fragment_packet_exports_exec
+    SOURCES tests/gpu/execute/test_fragment_packet_exports_exec.cpp
     INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
     PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
 

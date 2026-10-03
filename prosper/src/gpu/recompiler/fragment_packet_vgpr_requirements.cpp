@@ -20,7 +20,8 @@ uint64_t FragmentPacketVgprRequirements::retained_bytes() const {
 
 FragmentPacketVgprRequirements
 fragment_packet_vgpr_requirements(const std::vector<uint32_t>& code,
-                                  const std::vector<Rdna2Inst>& ins) {
+                                  const std::vector<Rdna2Inst>& ins,
+                                  FragmentPacketExportObservation observation) {
     FragmentPacketVgprRequirements result;
     result.source_words = &code;
     if (code.empty() || code.size() > 4096 || ins.empty() || !ins.back().is_end ||
@@ -74,10 +75,13 @@ fragment_packet_vgpr_requirements(const std::vector<uint32_t>& code,
             (in.fmt == Rdna2Format::VOPC && !((in.opcode >= 0xc0 && in.opcode <= 0xc7) ||
                                               (in.opcode >= 0xd0 && in.opcode <= 0xd7))) ||
             (in.fmt == Rdna2Format::VINTRP && in.opcode > 1) ||
-            (in.fmt == Rdna2Format::EXP && in.exp_compr))
+            (in.fmt == Rdna2Format::EXP && in.exp_compr &&
+             observation == FragmentPacketExportObservation::LegacyRaw))
             result.rejection = "packet-vgpr-read-form-unimplemented";
         for (uint32_t src = 0; src < in.n_src; ++src) {
-            if (in.fmt == Rdna2Format::EXP && !(in.exp_en & (1u << src))) continue;
+            if (in.fmt == Rdna2Format::EXP &&
+                !(fragment_packet_export_source_mask(in.exp_en, in.exp_compr) & (1u << src)))
+                continue;
             if (in.src[src].kind != OperandKind::VGPR) continue;
             const uint32_t width = in.fmt == Rdna2Format::MIMG && src == 0
                                        ? (in.opcode == 0x24   ? 3u

@@ -1,5 +1,6 @@
 #pragma once
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/fragment_packet_exports.hpp"
 #include <bitset>
 #include <map>
 #include <string>
@@ -25,8 +26,8 @@ struct FragmentPacketVgprRequirements {
     std::string rejection;
     uint64_t retained_bytes() const;
 };
-FragmentPacketVgprRequirements
-fragment_packet_vgpr_requirements(const std::vector<uint32_t>& code,
-                                  const std::vector<Rdna2Inst>& instructions);
+FragmentPacketVgprRequirements fragment_packet_vgpr_requirements(
+    const std::vector<uint32_t>& code, const std::vector<Rdna2Inst>& instructions,
+    FragmentPacketExportObservation = FragmentPacketExportObservation::LegacyRaw);
 FragmentPacketVgprRequirements fragment_packet_vgpr_requirements(const std::vector<uint32_t>& code);
 } // namespace prosper::gpu

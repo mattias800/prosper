@@ -65,8 +65,8 @@ FragmentPacketKernel recompile_fragment_packet_kernel(const FragmentResourcePack
     result.guest_code = prototype.invocation.guest_code;
     rdna2_walk(result.guest_code.data(), result.guest_code.size(), result.instructions);
     auto schema = prototype;
-    const auto requirements =
-        fragment_packet_vgpr_requirements(result.guest_code, result.instructions);
+    const auto requirements = fragment_packet_vgpr_requirements(
+        result.guest_code, result.instructions, prototype.invocation.export_observation);
     if (!requirements.rejection.empty()) return reject(requirements.rejection);
     // Storage schema only. Absence selects runtime instrumentation; none of these placeholders
     // is an executable entry value or a promise that a later wave supplies that word.
@@ -178,7 +178,8 @@ pack_fragment_packet_waves(std::shared_ptr<const FragmentPacketKernel> owner,
             std::any_of(invocation.export_enabled.begin(), invocation.export_enabled.end(),
                         [](uint8_t v) { return v > 1; }))
             return reject("packet-wave-invocation-state-unavailable");
-        if (invocation.float_mode != kernel.program.float_mode ||
+        if (invocation.export_observation != kernel.program.packet.export_observation ||
+            invocation.float_mode != kernel.program.float_mode ||
             invocation.float_flags != kernel.program.float_flags ||
             invocation.float_transport != kernel.transport ||
             invocation.quad_topology != kernel.topology ||
@@ -313,6 +314,7 @@ FragmentPacketWaveResult decode_fragment_packet_waves(const FragmentPacketWaveBa
     FragmentPacketWaveResult result;
     const auto reject = [&](const char* reason) {
         result.exports.clear();
+        result.architectural_exports.clear();
         result.rejection = reason;
         std::fprintf(stderr, "[fragment-packet-wave-reject] reason=%s wave=%u lane=%u pc=%u\n",
                      reason, result.wave, result.lane, result.pc);
@@ -329,6 +331,7 @@ FragmentPacketWaveResult decode_fragment_packet_waves(const FragmentPacketWaveBa
     const auto& kernel = *batch.kernel;
     std::vector<bool> owned(words.size());
     std::vector<std::vector<uint32_t>> validated;
+    std::vector<std::vector<FragmentPacketArchitecturalLane>> architectural_validated;
     for (uint32_t wave = 0; wave < batch.placements.size(); ++wave) {
         result.wave = wave;
         const auto base = batch.placements[wave].output_base;
@@ -351,7 +354,11 @@ FragmentPacketWaveResult decode_fragment_packet_waves(const FragmentPacketWaveBa
             result.pc = decoded.pc;
             return reject(decoded.rejection.c_str());
         }
-        validated.push_back(decoded.exports);
+        if (kernel.program.packet.export_observation ==
+            FragmentPacketExportObservation::Architectural)
+            architectural_validated.push_back(decoded.architectural_exports);
+        else
+            validated.push_back(decoded.exports);
     }
     for (size_t offset = 0; offset < words.size(); ++offset)
         if (!owned[offset] && words[offset] != batch.output_words[offset])
@@ -359,6 +366,7 @@ FragmentPacketWaveResult decode_fragment_packet_waves(const FragmentPacketWaveBa
     result.wave = UINT32_MAX;
     result.exports =
         std::move(validated);   // publish ONLY after all statuses and holes are validated
+    result.architectural_exports = std::move(architectural_validated);
     return result;
 }
 }   // namespace prosper::gpu

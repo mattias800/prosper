@@ -22,6 +22,7 @@
 #include "gpu/recompiler/fragment_float_flags.hpp"
 #include "gpu/recompiler/fragment_arithmetic_observation.hpp"
 #include "gpu/recompiler/float_transport_config.hpp"
+#include "gpu/recompiler/fragment_packet_exports.hpp"
 
 namespace prosper::gpu {
 
@@ -511,6 +512,7 @@ struct FragmentPacketVgpr {
 // for integer operations which do not consume quad semantics; a quad consumer must refuse it.
 enum class FragmentPacketQuadTopology : uint8_t { Unknown, ConsecutiveLogicalQuads };
 struct FragmentInvocationPacket {
+    FragmentPacketExportObservation export_observation = FragmentPacketExportObservation::LegacyRaw;
     std::vector<uint32_t> guest_code;
     std::vector<FragmentPacketVgpr> vgprs;
     std::vector<std::pair<uint32_t, uint32_t>> sgprs; // explicit wave-uniform scalar words
@@ -531,6 +533,13 @@ struct FragmentInvocationPacket {
 // with EXEC=0 retains a discard/export-mask observation without terminating its physical worker.
 inline constexpr uint32_t kFragmentPacketExportWords = 12;
 struct FragmentPacketProgram {
+    FragmentPacketExportObservation export_observation = FragmentPacketExportObservation::LegacyRaw;
+    std::vector<FragmentPacketExportSite> export_sites;   // populated ONLY for EXP14 mode
+    uint32_t export_record_words() const {
+        return export_observation == FragmentPacketExportObservation::Architectural
+                   ? kFragmentPacketArchitecturalExportWords
+                   : kFragmentPacketExportWords;
+    }
     std::vector<uint32_t> spirv;
     // Execute exactly ONE workgroup (LocalSize 64x1x1), with these complete Set0 binding0/1
     // owned buffers. They describe one logical packet, not an arbitrary guest dispatch grid.
@@ -552,6 +561,8 @@ inline constexpr uint32_t kFragmentPacketVgprStatusMagic = 0x56475031u;   // VGP
 inline constexpr uint32_t kFragmentPacketVgprStatusWords = 4;
 struct FragmentPacketResult {
     std::vector<uint32_t> exports;   // empty on ANY absent/malformed/failing worker
+    std::vector<FragmentPacketArchitecturalLane>
+        architectural_exports;   // EXP14 never publishes raw zeros
     std::string rejection;
     bool vgpr_status_validated =
         false;   // true only after EVERY present worker record is validated
