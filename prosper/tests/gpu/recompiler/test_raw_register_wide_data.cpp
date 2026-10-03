@@ -168,19 +168,22 @@ int main(int argc, char** argv) {
           std::memcmp(replay.computes[0].resources->resources[0].host_data,
                       blob.bytes.data(), blob.bytes.size()) == 0,
           "replay preserves the rebased range and its owned current bytes");
-    // One compute resource, no draw/failure records: flags F8, transport T13, owned U8, mode M8, width W4.
+    // One compute resource, no draw/failure records: flags F8, transport T13, owned U8, mode M8, width W4;
+    // the v68 nested-snapshot tail adds a second owned-width U8 and the v69 realized-draw fragment-entry tail is
+    // just its u32 count (4 bytes) because this capture has no draws.
     constexpr size_t flags_tail_bytes = 8u;
     constexpr size_t transport_tail_bytes = 13u;
     constexpr size_t owned_tail_bytes = 8u;
     constexpr size_t mode_tail_bytes = 8u;
     constexpr size_t width_tail_bytes = 4u;
+    constexpr size_t entry_tail_bytes = 4u;
     constexpr size_t backing_tail_bytes = 5u;
-    CHECK(encoded.size() >= flags_tail_bytes + transport_tail_bytes + 2u * owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes &&
-          encoded[8] == 68u,
+    CHECK(encoded.size() >= flags_tail_bytes + transport_tail_bytes + 2u * owned_tail_bytes + entry_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes &&
+          encoded[8] == 69u,
           "legacy controls require the current versioned capture tail");
-    if (encoded.size() >= flags_tail_bytes + transport_tail_bytes + 2u * owned_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes) {
+    if (encoded.size() >= flags_tail_bytes + transport_tail_bytes + 2u * owned_tail_bytes + entry_tail_bytes + mode_tail_bytes + width_tail_bytes + backing_tail_bytes) {
         auto v64 = encoded;
-        v64.resize(v64.size() - flags_tail_bytes - transport_tail_bytes - 2u * owned_tail_bytes);
+        v64.resize(v64.size() - flags_tail_bytes - transport_tail_bytes - 2u * owned_tail_bytes - entry_tail_bytes);
         v64[8] = 64u;
         CHECK(deserialize_gpu_capture(v64, decoded, error) &&
               decoded.computes[0].resources.resources[0].resource.raw_register_snapshot &&
