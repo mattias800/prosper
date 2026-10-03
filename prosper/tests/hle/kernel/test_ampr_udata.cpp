@@ -5,6 +5,7 @@
 // POSIX only: the legacy sizing call registers (eq,id,0) here; Windows only returns its size.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
+#include "hle/kernel/kernel_event_filters.hpp"
 
 #include <array>
 #include <chrono>
@@ -97,7 +98,7 @@ Event complete(const Api& api, const Channel& channel, uint64_t tag, const char*
     }
     if (!check(received && protocol, scope, "bounded polling consumes one actual completion"))
         undelivered();
-    if (!check(event.ident == channel.id && event.filter == -24 &&
+    if (!check(event.ident == channel.id && event.filter == EVFILT_AMPR &&
                static_cast<uint64_t>(event.data) == tag, scope,
                "the event carries the expected APR id, filter and completion tag")) undelivered();
     if (!check(api.count(channel.eq, 0, 0, 0, 0, 0) == 0, scope,

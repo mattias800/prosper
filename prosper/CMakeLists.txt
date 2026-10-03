@@ -1954,6 +1954,11 @@ if(TARGET prosper_core)
     add_executable(test_win_kernel_is_stack tests/host/image/test_win_kernel_is_stack.cpp)
     target_link_libraries(test_win_kernel_is_stack PRIVATE prosper_core)
     add_test(NAME win_kernel_is_stack COMMAND test_win_kernel_is_stack)
+
+    # PROSPER_HWWATCH_ABS: the Windows data write-watchpoint (debug registers, per guest thread).
+    prosper_add_gtest(test_win_data_watch
+      SOURCES tests/host/image/test_win_data_watch.cpp
+      LIBRARIES prosper_core)
   endif()
 
   # Boot preload path case correction (#1006): a module present with different casing than the
@@ -4277,10 +4282,9 @@ endif()
       # #3656: device-resolved indirect dispatch -- the executor half (recording backend) and the
       # Vulkan half (the production backend consuming the argument address with
       # vkCmdDispatchIndirect). The Windows block above registers the same two sources.
-      add_executable(test_indirect_dispatch_device_route
-                     tests/gpu/execute/test_indirect_dispatch_device_route.cpp)
-      target_link_libraries(test_indirect_dispatch_device_route PRIVATE prosper_core)
-      add_test(NAME indirect_dispatch_device_route COMMAND test_indirect_dispatch_device_route)
+      prosper_add_gtest(test_indirect_dispatch_device_route
+        SOURCES tests/gpu/execute/test_indirect_dispatch_device_route.cpp
+        LIBRARIES prosper_core)
       add_executable(test_live_compute_indirect_dispatch
                      tests/gpu/execute/test_live_compute_indirect_dispatch.cpp)
       target_include_directories(test_live_compute_indirect_dispatch PRIVATE tests frontends)
