@@ -217,7 +217,7 @@ class Verdicts(unittest.TestCase):
         git("commit", "-q", "-m", "foreign checker")
         git("update-ref", "refs/remotes/origin/main", "HEAD")
         self.install_checker(0)
-        status, out, _ = self.run_hook(f"git -C {other} push")
+        status, out, _ = self.run_hook(f"git -C {Path(other).as_posix()} push")
         self.assertEqual(0, status)
         self.assertIn("not this project's repository", json.loads(out)["systemMessage"])
         self.assertFalse(marker.exists(), "a foreign repository's checker was executed")

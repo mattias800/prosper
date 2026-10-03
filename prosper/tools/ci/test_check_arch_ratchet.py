@@ -532,6 +532,14 @@ class Delta(unittest.TestCase):
         self.git("commit", "-qam", "topic")
         self.assertEqual(car.EXIT_OK, self.delta("main2"))
 
+    def test_base_resolution_peels_tags_and_rejects_non_commits(self):
+        # Resolved without the `<ref>^{commit}` spelling, which reaches git mangled on the
+        # Windows/MSYS route (every --base then read as "not a commit"): an annotated tag must
+        # still peel to its commit, and a tree must still be refused.
+        self.git("tag", "-a", "-m", "t", "reltag", "base")
+        self.assertEqual(car.EXIT_OK, self.delta("reltag"))
+        self.assertEqual(car.EXIT_UNEVALUATED, self.delta("base:prosper"))
+
     def test_unreachable_base_is_two(self):
         self.assertEqual(car.EXIT_UNEVALUATED, self.delta("no-such-ref"))
         self.assertEqual(car.EXIT_UNEVALUATED, self.delta("0" * 40))
@@ -555,7 +563,7 @@ class RealTree(unittest.TestCase):
     def test_delta_mode_against_origin_main(self):
         root = HERE.parents[2]
         probe = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", "origin/main^{commit}"],
+            ["git", "rev-list", "-n", "1", "origin/main", "--"],
             cwd=root,
             capture_output=True,
         )

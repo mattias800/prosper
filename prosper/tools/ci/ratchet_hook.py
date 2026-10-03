@@ -170,7 +170,8 @@ def has_base(root, ref=BASE_REF):
     """Whether `ref` resolves to a commit in the checkout at `root`."""
     try:
         out = subprocess.run(
-            ["git", "-C", root, "rev-parse", "--verify", "--quiet", ref + "^{commit}"],
+            # not `<ref>^{commit}`: that spelling reaches git mangled on Windows/MSYS
+            ["git", "-C", root, "rev-list", "-n", "1", ref, "--"],
             capture_output=True,
             text=True,
             timeout=GIT_TIMEOUT_S,

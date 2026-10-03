@@ -782,7 +782,9 @@ def _nul_split(raw: bytes) -> list[str]:
 def resolve_merge_base(root: Path, ref: str) -> str:
     """The merge base of HEAD and `ref`, or EvaluationError (exit 2) when there is none."""
     try:
-        sha = _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+        # `rev-list -n 1` peels a tag to its commit and rejects non-commits, like `<ref>^{commit}`,
+        # but that spelling reaches git mangled on the Windows/MSYS route and resolves nothing.
+        sha = _git(root, "rev-list", "-n", "1", ref, "--")
     except EvaluationError as exc:
         raise EvaluationError(f"--base {ref!r} is not a commit in {root} (fetch it?)") from exc
     try:
