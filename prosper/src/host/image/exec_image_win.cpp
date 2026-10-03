@@ -19,6 +19,7 @@
 
 #include "host/image/exec_image.hpp"
 #include "host/image/stub_append_batch.hpp"
+#include "host/image/win_data_watch.hpp"
 #include "host/fault/rbp_chain.hpp"   // guest_frames_from_rbp: the shared frame-pointer walk
 #include "host/fault/guest_stack_scan.hpp"   // the scan-based sibling, shared by both platforms
 #include "host/platform/immortal.hpp"   // #2613: registries a guest thread can reach after exit()
@@ -1409,6 +1410,9 @@ void guest_execution_thread_enter(bool primary) {
     // function, and register_current_thread_handle is idempotent (it closes and replaces an existing
     // duplicate), so registering here is safe and complete.
     register_guest_execution_thread_handle();
+    // PROSPER_HWWATCH_ABS: a data write-watch is per thread, and this is the one boundary every
+    // guest thread passes through.
+    win_data_watch_arm_current_thread();
     // Windows has no perf_event HWBP backend. Keep that platform contract unchanged while exposing
     // the same guest-entry boundary to CPU-only tests and future Windows diagnostics.
     if (auto hook = g_guest_execution_enter_test_hook.load(std::memory_order_acquire))

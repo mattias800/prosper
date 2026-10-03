@@ -1950,6 +1950,11 @@ if(TARGET prosper_core)
     add_executable(test_win_kernel_is_stack tests/host/image/test_win_kernel_is_stack.cpp)
     target_link_libraries(test_win_kernel_is_stack PRIVATE prosper_core)
     add_test(NAME win_kernel_is_stack COMMAND test_win_kernel_is_stack)
+
+    # PROSPER_HWWATCH_ABS: the Windows data write-watchpoint (debug registers, per guest thread).
+    prosper_add_gtest(test_win_data_watch
+      SOURCES tests/host/image/test_win_data_watch.cpp
+      LIBRARIES prosper_core)
   endif()
 
   # Boot preload path case correction (#1006): a module present with different casing than the
