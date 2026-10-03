@@ -140,8 +140,8 @@ bool parse_first_sps(const uint8_t* au, size_t n, SpsPictureMeta* out) {
     bool high = false;
     for (uint32_t hp : kHighProfiles) high = high || profile_idc == hp;
 
+    uint32_t chroma_format_idc = 1;   // inferred 4:2:0 when the profile does not code it (7.4.2.1.1)
     if (high) {
-        uint32_t chroma_format_idc;
         if (!br.ue(&chroma_format_idc)) return false;
         if (chroma_format_idc == 3) {
             uint32_t separate;
@@ -197,6 +197,10 @@ bool parse_first_sps(const uint8_t* au, size_t n, SpsPictureMeta* out) {
     }
 
     SpsPictureMeta meta;
+    meta.chroma_format_idc = chroma_format_idc;
+    meta.frame_mbs_only = mbs_only != 0;
+    meta.coded_width = (w_mbs + 1u) * 16u;
+    meta.coded_height = (2u - (mbs_only ? 1u : 0u)) * (h_map + 1u) * 16u;
     uint32_t crop_flag;
     if (!br.u(1, &crop_flag)) return false;
     meta.crop_flag = crop_flag != 0;
@@ -307,6 +311,19 @@ bool fill_picture_info(const SpsPictureMeta& meta, void* record, void* pic_info,
             w32(0x5c, meta.time_scale);
         }
     }
+    return true;
+}
+
+bool frame_crop_rect(const SpsPictureMeta& m, CropRect* out) {
+    if (!out || !m.crop_flag || !m.coded_width || !m.coded_height) return false;
+    const uint32_t sub_w = (m.chroma_format_idc == 1 || m.chroma_format_idc == 2) ? 2u : 1u;
+    const uint32_t sub_h = m.chroma_format_idc == 1 ? 2u : 1u;
+    const uint64_t unit_x = sub_w, unit_y = uint64_t(sub_h) * (m.frame_mbs_only ? 1u : 2u);
+    const uint64_t left = m.crop[0] * unit_x, right = m.crop[1] * unit_x;
+    const uint64_t top = m.crop[2] * unit_y, bottom = m.crop[3] * unit_y;
+    if (left + right >= m.coded_width || top + bottom >= m.coded_height) return false;
+    *out = CropRect{uint32_t(left), uint32_t(top), uint32_t(m.coded_width - left - right),
+                    uint32_t(m.coded_height - top - bottom)};
     return true;
 }
 

@@ -44,7 +44,7 @@ getenv|prosper/frontends/audio_ffmpeg/ajm_ffmpeg.cpp 1
 getenv|prosper/frontends/audio_sdl3/audio_sink_sdl3.cpp 8
 getenv|prosper/frontends/audio_sdl3/test_audio_demand.cpp 2
 getenv|prosper/frontends/audio_sdl3/test_audio_sdl3.cpp 1
-getenv|prosper/frontends/prosper-app/main.cpp 43
+getenv|prosper/frontends/prosper-app/main.cpp 42
 getenv|prosper/frontends/shared/compute/compute_buffer_bytes.hpp 1
 getenv|prosper/frontends/shared/device/pipeline_cache_file.hpp 6
 getenv|prosper/frontends/shared/live/cpu_rtt_snapshot_pool.hpp 1
@@ -70,6 +70,7 @@ getenv|prosper/frontends/shared/tests/test_decode_scratch.cpp 2
 getenv|prosper/frontends/video_mf/media_foundation_backend.cpp 2
 getenv|prosper/frontends/video_mf/mf_access_unit_decoder.cpp 1
 getenv|prosper/frontends/video_vaapi/vaapi_backend.cpp 5
+getenv|prosper/frontends/video_vt/videotoolbox_backend.mm 1  # PROSPER_AVP_ALLOW_SOFTWARE, the same live hardware-gate override the MF and VA-API backends read; test_video_vt arms it at runtime, so it must not be PROSPER_ENV_ON-cached
 getenv|prosper/src/diagnostics/boot_phase_log.cpp 1
 getenv|prosper/src/diagnostics/env_cache.hpp 2
 getenv|prosper/src/diagnostics/env_submit.hpp 2

@@ -5864,6 +5864,41 @@ if(UNIX AND NOT APPLE AND PROSPER_VIDEO_VAAPI AND TARGET prosper_core)
   endif()
 endif()
 
+# macOS native AvPlayer backend: AVFoundation demuxes, VideoToolbox decodes in hardware. Outside
+# prosper_core for the same reasons as the Media Foundation and VA-API backends above: core-only and
+# headless builds carry no OS media dependency, and the app installs it explicitly.
+option(PROSPER_VIDEO_VT "Build the macOS AVFoundation/VideoToolbox AvPlayer backend" ON)
+if(APPLE AND PROSPER_VIDEO_VT AND TARGET prosper_core)
+  enable_language(OBJCXX)
+  add_library(prosper_video_vt STATIC frontends/video_vt/videotoolbox_backend.mm)
+  target_include_directories(prosper_video_vt PUBLIC frontends/video_vt PRIVATE src)
+  target_compile_options(prosper_video_vt PRIVATE -fobjc-arc)
+  # CMAKE_CXX_STANDARD does not apply to OBJCXX; pin it so the .mm does not ride the compiler default.
+  set_target_properties(prosper_video_vt PROPERTIES OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED ON)
+  target_link_libraries(prosper_video_vt PUBLIC prosper_core
+                        "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
+                        "-framework VideoToolbox" "-framework Foundation")
+
+  prosper_add_gtest(test_video_vt
+    SOURCES frontends/video_vt/test_video_vt.cpp
+    LIBRARIES prosper_video_vt)
+  # H.264 Main + AAC stereo, the codec pair of Silksong's cinematics; testpattern.mp4 is MPEG-4
+  # Part 2, which VideoToolbox has no hardware decoder for.
+  target_compile_definitions(test_video_vt PRIVATE
+    PROSPER_TEST_H264_AAC_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/h264_aac_testpattern.mp4"
+    PROSPER_TEST_H264_CROP_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/h264_crop_testpattern.mp4"
+    PROSPER_TEST_MPEG4_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/testpattern.mp4")
+
+  if(TARGET boot_trace)
+    target_link_libraries(boot_trace PRIVATE prosper_video_vt)
+    target_compile_definitions(boot_trace PRIVATE PROSPER_VIDEO_VT=1)
+  endif()
+  if(TARGET screenshot)
+    target_link_libraries(screenshot PRIVATE prosper_video_vt)
+    target_compile_definitions(screenshot PRIVATE PROSPER_VIDEO_VT=1)
+  endif()
+endif()
+
 # --- SDL3 frontends (optional; headless core stays dependency-free) --------------------------
 # The sceAudioOut sink (frontends/audio_sdl3) and the libScePad gamepad backend (frontends/pad_sdl3)
 # can both use SDL3. They must share ONE SDL3 build: if each fetched independently, the first fetch's
@@ -6103,6 +6138,12 @@ if(TARGET prosper-app AND TARGET prosper_video_mf)
   target_link_libraries(prosper-app PRIVATE prosper_video_mf)
   target_compile_definitions(prosper-app PRIVATE PROSPER_VIDEO_MF=1)
   message(STATUS "prosper-app: Media Foundation video enabled")
+endif()
+
+if(TARGET prosper-app AND TARGET prosper_video_vt)
+  target_link_libraries(prosper-app PRIVATE prosper_video_vt)
+  target_compile_definitions(prosper-app PRIVATE PROSPER_VIDEO_VT=1)
+  message(STATUS "prosper-app: AVFoundation/VideoToolbox video enabled")
 endif()
 
 if(TARGET prosper-app AND TARGET prosper_video_vaapi)
