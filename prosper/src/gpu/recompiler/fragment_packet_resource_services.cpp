@@ -115,6 +115,16 @@ int PacketResourceServices::emit(SpirvCompute& b, RegState& state, const Rdna2In
         write_vector(b, state, in.dst.value, value.bits);
         return 1;
     }
+    if (in.fmt == Rdna2Format::VOP1 && packet_special_f32_opcode(in.opcode)) {
+        bool available = true;
+        const auto source = operand_bits(b, state, in, in.src[0], &available);
+        if (!available) return -1;
+        const auto value = packet_f32_special(b, source, in.opcode, input.invocation.float_mode);
+        fail(b, consumed(value.nonfinite), in.pc,
+             FragmentPacketRuntimeFailure::SpecialNanOrNegativeRoot);
+        write_vector(b, state, in.dst.value, value.bits);
+        return 1;
+    }
     if (in.fmt == Rdna2Format::VINTRP) {
         const auto m0 = b.load_function(b.t_u32, m0_var);
         fail(b, consumed(b.ucmp(Op_INotEqual, m0, b.uconst(input.parameter_cache.m0))),

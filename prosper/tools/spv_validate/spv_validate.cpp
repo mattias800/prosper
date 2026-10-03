@@ -35,6 +35,7 @@
 #include "../../tests/fixtures/fragment_packet_wqm_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_mbcnt_fixture.hpp"
 #include "../../tests/fixtures/fragment_resource_packet_fixture.hpp"
+#include "../../tests/fixtures/fragment_special_f32_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <algorithm>
 #include <array>
@@ -705,6 +706,13 @@ int main(int argc, char** argv) {
         const auto rectangular = recompile_fragment_resource_packet(resources::rectangular_chain());
         dump(dir, "fragment_resource_packet_rectangular_l4", rectangular.packet.spirv,
              "recompile_fragment_resource_packet");
+        namespace special = prosper::test::fragment_special_f32;
+        for (uint32_t op : {0x2au, 0x2eu, 0x33u}) {
+            const auto p =
+                recompile_fragment_resource_packet(special::packet(op, special::rails(op)));
+            dump(dir, ("fragment_special_f32_" + std::to_string(op)).c_str(), p.packet.spirv,
+                 "recompile_fragment_resource_packet");
+        }
     }
     {
         namespace fp = prosper::test::fragment_packet;

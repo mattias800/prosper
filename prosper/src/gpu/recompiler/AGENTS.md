@@ -33,6 +33,12 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   publishing ANY raw EXP record. Integer packet ABI/native paths remain separate. Complete supplied
   VGPR backing is mandatory, and this does not initialize guest inputs from host raster records,
   enable implicit/bias sampling, establish live resource epochs, or admit any real DrawItem.
+  `fragment_packet_special_f32` supplies integer-backed RCP/SQRT/direct RSQ, choosing correctly
+  rounded software results within the published approximation envelope, not AMD-unit bit identity.
+  Opcode-specific sign-preserving denormal flushing is separate from ordinary mode controls.
+  Retained producing PS RSRC2 must prove no handler, or disabled relevant floating exceptions and
+  DEBUG; MODE/STATUS observation remains unsupported. NaN payloads and negative roots remain
+  transactional named runtime failures, not guessed canonical values. This is not full special FP.
 - `spirv_builder` — small hand-built SPIR-V modules. **These include shipped shaders**:
   `frontends/shared/live/live_compute.cpp`'s `prepare_compare_pipeline()` feeds
   `build_compute_compare_uvec4()` straight to `vkCreateShaderModule` on the live path. The GPU
