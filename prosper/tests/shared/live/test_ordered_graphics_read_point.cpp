@@ -340,6 +340,8 @@ TEST_F(OrderedGraphicsReadPointTest, SuccessfulLaterComputeExpiresEarlierReadPoi
          {SubmitOperationKind::Draw, 1, Order + 2}},
         {draw(), draw(1, Order + 2)}, {compute},
         [&](const auto&) {
+            EXPECT_FALSE(reader(context(earlier))->probe(FoldProbe::Raw, 0, parent, 16))
+                << "The earlier read point expires before the next actual compute callback";
             std::memset(reinterpret_cast<void*>(child + 16), 0, sizeof(Values));
             return true;
         },
