@@ -22,7 +22,7 @@ TEST(MapNoreplace, Contract) {
     auto reserve  = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
     auto flexible = Hle::lookup(nid_hash("sceKernelMapNamedFlexibleMemory"));
     CHECK(reserve && flexible, "map HLE functions registered");
-    if (fails) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
+    if (::testing::Test::HasFailure()) { printf("== FAIL ==\n"); FAIL() << "map HLE functions missing"; }
 
     auto U = [](const void* p) { return (uint64_t)(uintptr_t)p; };
     const uint64_t LEN = 0x10000;   // 64 KiB

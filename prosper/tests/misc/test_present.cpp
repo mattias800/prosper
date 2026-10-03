@@ -144,7 +144,7 @@ TEST(Present, Contract) {
     const uint64_t paused_count = gpu::present_count();
     auto paused_flip = std::async(std::launch::async, [&] {
         flip(handle, 1, 0, 0xCAFE, 0, 0);
-        return;
+        return true;
     });
     const auto publish_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     while (gpu::present_count() == paused_count &&

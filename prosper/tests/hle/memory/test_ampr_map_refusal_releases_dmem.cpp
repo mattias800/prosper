@@ -66,7 +66,7 @@ TEST(AmprMapRefusalReleasesDmem, Contract) {
     HleFn avail      = Hle::lookup(nid_hash("sceKernelAvailableDirectMemorySize"));
     CHECK(set_buffer != nullptr, "sceAmprCommandBufferSetBuffer is registered");
     CHECK(avail != nullptr,      "sceKernelAvailableDirectMemorySize is registered");
-    if (!set_buffer || !avail) { std::printf("%s\n", fails ? "FAILED" : "PASSED"); return; }
+    if (!set_buffer || !avail) { std::printf("FAILED\n"); return; }
 
     const uint64_t pool_at_start = largest_free(avail);
     CHECK(pool_at_start > (64ull << 20), "the pool query reports a usable free block to measure against");

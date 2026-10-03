@@ -132,7 +132,7 @@ void run_batch_case(ajm::Codec codec, const char* name) {
     CHECK(initialize && module_register && instance_create && batch_initialize &&
           job_decode && batch_start,
           "AJM lifecycle and batch-2 handlers are registered");
-    if (fails) return;
+    if (::testing::Test::HasFailure()) FAIL() << "AJM handlers missing";
 
     uint32_t context = 0;
     CHECK(initialize(0, addr(&context), 0, 0, 0, 0) == 0 && context != 0,

@@ -376,7 +376,7 @@ TEST(AgcDcb, Contract) {
         for (const auto& v : victim) victim_still_intact &= (v == 0xA5A5A5A5u);
         CHECK(victim_still_intact,
               "#1650 arm5: seventeen refused patches still wrote nothing");
-        if (fails) printf("  captured stderr:\n%s\n  ---- flood ----\n%s", log, log2);
+        if (::testing::Test::HasFailure()) printf("  captured stderr:\n%s\n  ---- flood ----\n%s", log, log2);
     }
 
     // #395 F5: all three single-register direct NIDs append the native packet opcode and preserve

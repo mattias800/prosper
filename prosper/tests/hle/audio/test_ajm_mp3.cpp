@@ -194,7 +194,7 @@ TEST(AjmMp3, Contract) {
     CHECK(initialize && module_register && instance_create && batch_initialize &&
           instance_destroy && batch_wait && job_decode && batch_start,
           "AJM lifecycle and batch-2 handlers are registered");
-    if (fails) FAIL() << "legacy early exit";
+    if (::testing::Test::HasFailure()) FAIL() << "AJM handlers missing";
 
     uint32_t context = 0;
     CHECK(initialize(0, addr(&context), 0, 0, 0, 0) == 0 && context != 0,

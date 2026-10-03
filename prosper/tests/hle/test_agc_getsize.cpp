@@ -12,8 +12,10 @@
 #include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
+#include <cstdarg>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 using namespace prosper;
 
@@ -24,7 +26,16 @@ struct Dcb {
 };
 
 static int fails = 0;
-#define CHECK(cond, ...) EXPECT_TRUE(cond) << (...)
+// GoogleTest streams the message; keep the original printf-style formats readable.
+static std::string check_message(const char* format, ...) {
+    char buffer[512];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(buffer, sizeof buffer, format, args);
+    va_end(args);
+    return buffer;
+}
+#define CHECK(cond, ...) EXPECT_TRUE(cond) << check_message(__VA_ARGS__)
 
 static uint32_t g_buf[256];
 static Dcb fresh() {

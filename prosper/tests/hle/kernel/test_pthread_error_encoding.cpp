@@ -757,7 +757,7 @@ TEST(PthreadErrorEncoding, Contract) {
         }
     }
 
-    if (fails) printf("== FAIL (%d) ==\n", fails);
+    if (::testing::Test::HasFailure()) printf("== FAIL ==\n");
     else       printf("== PASS ==\n");
     EXPECT_EQ(fails, 0);
 }
