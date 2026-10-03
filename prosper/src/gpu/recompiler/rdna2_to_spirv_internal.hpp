@@ -3518,4 +3518,6 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                bool force_barrier_phases = false,
                bool force_lds_fminmax_dispatcher = false);
 
+std::unordered_set<uint32_t> rdna2_proven_smem_pointer_loads(const std::vector<Rdna2Inst>&);
+
 }  // namespace prosper::gpu
