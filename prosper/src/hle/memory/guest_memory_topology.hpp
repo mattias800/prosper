@@ -49,8 +49,8 @@ GuestMemoryTopologyRelation guest_memory_topology_relation(
 // are not authenticated by this observation (VirtualQuery is not a COW-history detector).
 // Neither proof excludes guest byte writers or grants ordering/currentness/physical alias isolation.
 // The caller still checks its required access and physical aliases.
-bool guest_memory_direct_range_fault_safe(const GuestMappingLease& lease,
-                                          uint64_t address, uint64_t size);
+bool guest_memory_direct_range_fault_safe(const GuestMappingLease& lease, uint64_t address,
+                                          uint64_t size);
 
 // Compare an exact committed-direct source with the WHOLE allocated physical backing that
 // contains producer_address. Retained tiled/layered images must not use their linear pixel size
