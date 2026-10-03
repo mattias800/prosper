@@ -37,6 +37,7 @@
 #include "../../tests/fixtures/fragment_resource_packet_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_definedness_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_raw_masks_fixture.hpp"
+#include "../../tests/fixtures/fragment_packet_mask_entry_fixture.hpp"
 #include "../../tests/fixtures/fragment_special_f32_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_wave_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
@@ -742,6 +743,18 @@ int main(int argc, char** argv) {
             dump(dir, ("fragment_raw_masks_" + c.name).c_str(), packet.spirv,
                  "recompile_fragment_packet");
         }
+        namespace mask_entry = prosper::test::fragment_mask_entry;
+        for (const auto& c : {mask_entry::exec_writer(raw_masks::asymmetric, true),
+                              mask_entry::new_scc(), mask_entry::cmpx_vcc(false),
+                              mask_entry::peer_before_exec(), mask_entry::wqm_numeric()}) {
+            const auto packet = recompile_fragment_packet(c.packet);
+            dump(dir, ("fragment_mask_entry_" + c.name).c_str(), packet.spirv,
+                 "recompile_fragment_packet");
+        }
+        const auto mask_entry_kernel =
+            recompile_fragment_packet_kernel(mask_entry::wave_input(mask_entry::cases().front()));
+        dump(dir, "fragment_mask_entry_cached_kernel", mask_entry_kernel.program.packet.spirv,
+             "recompile_fragment_packet_kernel");
         const auto wave_kernel =
             recompile_fragment_packet_kernel(prosper::test::fragment_packet_wave::packet());
         dump(dir, "fragment_packet_wave_kernel", wave_kernel.program.packet.spirv,

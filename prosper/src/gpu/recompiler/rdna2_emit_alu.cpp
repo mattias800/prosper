@@ -1026,7 +1026,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (is_exec(in.dst)) {   // set/restore EXEC
                         ok = emit_s_mov_b64_exec(b, rs, in);
                     } else {   // s_mov_b64 sDST, <mask-or-data> : save a mask / copy a pair
-                        uint32_t m = src_mask(in.src[0]);
+                        uint32_t m = packet_s_mov_b64_numeric_vcc_bit(b, rs, in);
+                        if (!m) m = src_mask(in.src[0]);
                         if (m) { rs.sreg_bool[in.dst.value] = m;
                                  rs.sreg_bool_narrowed[in.dst.value] = is_exec(in.src[0]) ? rs.exec_narrowed : saved_narrowed(in.src[0]);
                                  // A move INTO VCC is a VCC write (DOLL's scalar-indexed unroll does

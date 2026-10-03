@@ -236,10 +236,11 @@ bool complete_graphics_packet_locals(const FragmentInvocationPacket& packet, std
         return false;
     };
     std::vector<Rdna2Inst> ins;
+    const uint8_t mask_availability = fragment_packet_initial_mask_availability(packet);
     if (packet.guest_code.empty() || packet.guest_code.size() > 4096u ||
         rdna2_walk(packet.guest_code.data(), packet.guest_code.size(), ins) !=
             packet.guest_code.size() ||
-        ins.empty() || !ins.back().is_end || !packet.mask_state_available)
+        ins.empty() || !ins.back().is_end || !(mask_availability & kPacketInitialExec))
         return reject("stage-input-original-unavailable");
     struct Defined {
         std::array<uint64_t, 256>
@@ -266,8 +267,9 @@ bool complete_graphics_packet_locals(const FragmentInvocationPacket& packet, std
     initial.possible_exec = initial.certain_exec = packet.exec_mask;
     // Offline packet callers explicitly supply these states. Live stage assembly observes only
     // launch EXEC; its default storage zeros are not SCC/VCC entry values.
-    initial.scc_defined = entry_flags_observed;
-    initial.vcc_defined = entry_flags_observed ? UINT64_MAX : 0;
+    initial.scc_defined = entry_flags_observed && (mask_availability & kPacketInitialScc);
+    initial.vcc_defined =
+        entry_flags_observed && (mask_availability & kPacketInitialVcc) ? UINT64_MAX : 0;
     std::map<uint32_t, size_t> indices;
     std::vector<std::vector<size_t>> edges(ins.size());
     for (size_t index = 0; index < ins.size(); ++index) {
@@ -489,8 +491,7 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         return reject("packet-stage-invalid");
     if (services && (packet.stage != GraphicsPacketStage::Fragment || !packet.raw_windows.empty()))
         return reject("packet-resource-raw-window-domain-unimplemented");
-    if (!packet.mask_state_available ||
-        !std::all_of(packet.slots_available.begin(), packet.slots_available.end(),
+    if (!std::all_of(packet.slots_available.begin(), packet.slots_available.end(),
                      [](bool available) { return available; }))
         return reject("packet-invocation-state-unavailable");
     if (packet.quad_topology != FragmentPacketQuadTopology::Unknown &&
@@ -674,6 +675,10 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     if (const auto* gap = packet_scalar_initialization_gap(ins, scalars, scalar_failure_pc, services != nullptr))
         return reject(gap, scalar_failure_pc);
     auto requirements = fragment_packet_vgpr_requirements(packet.guest_code, ins);
+    // Keep code-owned mask facts separate: the broader stage proof below replaces only the
+    // narrow VGPR inventory, never architectural entry-state availability or mask MUST facts.
+    const auto mask_requirements = requirements.masks;
+    const uint8_t mask_availability = fragment_packet_initial_mask_availability(packet);
     // The independently published forward packet/resource domain owns VGP1 runtime validity.
     // The live integer/raw-window domain also admits READFIRST and repeated events; its separate
     // whole-original, per-slot MUST proof must succeed before emitting any module. A failed narrow
@@ -681,6 +686,16 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     const bool owned_input_proof =
         !services && (packet.stage == GraphicsPacketStage::Vertex || !windows.empty() ||
                       !requirements.rejection.empty());
+    // Preserve the independently admitted wider stage domain only with its genuine full entry
+    // profile. READFIRST/repeated events are outside the forward mask inventory; an unavailable
+    // proof cannot certify that any absent initial field is unused. No zeros acquire authority.
+    if (!mask_requirements.rejection.empty() && (!owned_input_proof || mask_availability != 7u))
+        return reject(mask_requirements.rejection);
+    uint32_t mask_failure_pc = UINT32_MAX;
+    if (mask_requirements.rejection.empty())
+        if (const auto* gap = fragment_packet_missing_initial_mask(
+                mask_requirements, mask_availability, mask_failure_pc))
+            return reject(gap, mask_failure_pc);
     if (services) {
         if (const auto* gap = packet_resource_preflight(services->input, ins, scalar_failure_pc))
             return reject(gap, scalar_failure_pc);
@@ -707,6 +722,9 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     runtime_definedness &= !requirements.reads.empty();
 
     FragmentPacketProgram result;
+    result.initial_mask_availability = mask_availability;
+    result.demanded_initial_masks =
+        mask_requirements.rejection.empty() ? mask_requirements.demanded : 7u;
     result.input_stride =
         static_cast<uint32_t>(columns.size()) * (runtime_definedness ? 2u : 1u) + 4;
     result.exports_per_lane = static_cast<uint32_t>(exports.size());
@@ -804,10 +822,12 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         }
     const uint32_t state_base =
         static_cast<uint32_t>(columns.size()) * (runtime_definedness ? 2u : 1u);
-
-    state.exec = b.ucmp(Op_INotEqual, b.load_input(state_base), b.uconst(0));
-    state.vcc = b.ucmp(Op_INotEqual, b.load_input(state_base + 1), b.uconst(0));
-    state.scc = b.ucmp(Op_INotEqual, b.load_input(state_base + 2), b.uconst(0));
+    if (mask_availability & kPacketInitialExec)
+        state.exec = b.ucmp(Op_INotEqual, b.load_input(state_base), b.uconst(0));
+    if (mask_availability & kPacketInitialVcc)
+        state.vcc = b.ucmp(Op_INotEqual, b.load_input(state_base + 1), b.uconst(0));
+    if (mask_availability & kPacketInitialScc)
+        state.scc = b.ucmp(Op_INotEqual, b.load_input(state_base + 2), b.uconst(0));
     state.exec_narrowed = true;
     const uint32_t enabled = b.load_input(state_base + 3);
     if (services) services->begin(b);
@@ -838,12 +858,12 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
           }) : std::function<int(RegState&, const Rdna2Inst&)>{};
     if (!emit_cfg_state_machine(b, state, ins, {}, nullptr, true, !windows.empty(), export_record,
                                 packet.guest_code.data(), packet.guest_code.size(), 0, false,
-                                service_callback, runtime_definedness ? &definedness : nullptr)) {
-
+                                service_callback, runtime_definedness ? &definedness : nullptr,
+                                mask_availability == 7 ? nullptr : &mask_requirements)) {
         const auto records = causes.take();
         return reject(records.empty() ? "packet-guest-emission-refused:no-cause-recorded"
-            : "packet-guest-emission-refused:" + records.back().first + ":" +
-                records.back().second.substr(0, 1024));
+                                      : "packet-guest-emission-refused:" + records.back().first +
+                                            ":" + records.back().second.substr(0, 1024));
     }
     if (services) services->finish(b);
     if (runtime_definedness) definedness.finish(b, result.vgpr_status_offset);

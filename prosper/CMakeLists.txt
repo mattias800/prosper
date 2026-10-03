@@ -2819,6 +2819,9 @@ endif()
   prosper_add_gtest(test_fragment_packet_raw_masks
     SOURCES tests/gpu/recompiler/test_fragment_packet_raw_masks.cpp
     INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_packet_mask_entry
+    SOURCES tests/gpu/recompiler/test_fragment_packet_mask_entry.cpp
+    INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_fragment_special_f32
     SOURCES tests/gpu/recompiler/test_fragment_special_f32.cpp
     INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
@@ -4193,10 +4196,6 @@ endif()
         INCLUDES frontends src tests
         LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_executable(test_graphics_raw_wide_upload tests/shared/live/test_graphics_raw_wide_upload.cpp)
-      prosper_add_gtest(test_owned_graphics_wave_live
-        SOURCES tests/shared/live/test_owned_graphics_wave_live.cpp
-        INCLUDES frontends src tests
-        LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan)
       target_include_directories(test_graphics_raw_wide_upload PRIVATE frontends src tests)
       target_link_libraries(test_graphics_raw_wide_upload PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME graphics_raw_wide_upload COMMAND test_graphics_raw_wide_upload)
@@ -5328,6 +5327,12 @@ if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
 endif()
 
 if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
+  # #4272: the owned-wave transaction controls use portable HLE and the shared renderer.
+  # Register once after both platform frontend blocks, not only on UNIX.
+  prosper_add_gtest(test_owned_graphics_wave_live
+    SOURCES tests/shared/live/test_owned_graphics_wave_live.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan)
   # #4106: same shipping DrawItem caller, with an explicit device-free ownership arm.
   add_executable(test_raster_quad_collection tests/shared/live/test_raster_quad_collection.cpp)
   target_include_directories(test_raster_quad_collection PRIVATE src tests frontends)
@@ -5934,6 +5939,9 @@ if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
     INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_fragment_packet_raw_masks_exec
     SOURCES tests/gpu/execute/test_fragment_packet_raw_masks_exec.cpp
+    INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_packet_mask_entry_exec
+    SOURCES tests/gpu/execute/test_fragment_packet_mask_entry_exec.cpp
     INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
 
   add_executable(test_fragment_packet_exec tests/gpu/execute/test_fragment_packet_exec.cpp)

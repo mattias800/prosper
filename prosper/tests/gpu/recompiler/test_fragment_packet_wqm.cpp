@@ -120,7 +120,7 @@ int main(int argc, char** argv) {
     p = good; p.slots_available[62] = false;
     refuse(p, "packet-invocation-state-unavailable", "missing initially inactive quad neighbor");
     p = good; p.mask_state_available = false;
-    refuse(p, "packet-invocation-state-unavailable", "unknown EXEC/VCC/SCC state");
+    refuse(p, "packet-entry-exec-unavailable", "missing demanded initial EXEC before WQM");
     p = good; p.guest_code[2] = w::sop1(9, 126, 126);
     refuse(p, "packet-wqm-b32-unimplemented", "unsupported B32 ownership width");
     for (uint32_t src : {129u, 193u + 1u, 240u, 255u, 127u, 124u, 31u}) {

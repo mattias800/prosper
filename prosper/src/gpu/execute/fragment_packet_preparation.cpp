@@ -114,7 +114,21 @@ std::shared_ptr<const FragmentPacketPreparation> prepare_fragment_packet_inputs(
         // A structural writer is not a definition on EXEC-off lanes. This includes the existing
         // raw EXP observation and selected inactive peers; don't demand ALL allocated scratch.
         if (!in.vgpr_requirements->reads.empty()) gap("packet-vgpr-runtime-read-validity-unproved");
-        gap("packet-entry-mask-abi-unproved");
+        const auto& masks = in.vgpr_requirements->masks;
+        if (masks.source_words != in.raw_code.get()) {
+            gap("packet-mask-program-requirements-unavailable");
+        } else if (!masks.rejection.empty()) {
+            result->unmet.push_back(masks.rejection);
+        } else {
+            // Alias the exact producing ShaderCodeAnalysis owner, never reparse per draw or
+            // infer state from coverage/host helpers. Unused initial words need no launch value.
+            result->mask_requirements =
+                std::shared_ptr<const FragmentPacketMaskRequirements>(in.vgpr_requirements, &masks);
+            if (masks.demanded & kPacketInitialExec) gap("packet-entry-exec-value-unproved");
+            if (masks.demanded & kPacketInitialVcc) gap("packet-entry-vcc-value-unproved");
+            if (masks.demanded & kPacketInitialScc) gap("packet-entry-scc-value-unproved");
+            if (masks.demanded) gap("packet-entry-mask-abi-unproved");
+        }
     }
     gap("packet-guest-helper-and-coverage-unproved");
     gap("packet-logical64-composition-unproved");
