@@ -4195,6 +4195,7 @@ struct BoundImage {
     // renderer: it must not be destroyed here, its layout must be restored, and the pin taken at
     // import time must be released.
     bool imported = false;
+    bool imported_component_order_bgra = false;   // #4291: see LiveTargetImageImport
     bool imported_depth = false;        // borrowed persistent DS depth plane, not a color RTT
     // A one-component Uint32 T# can alias a renderer-owned D32 depth plane byte-for-byte. Vulkan
     // cannot create an R32_UINT view of a depth image, so keep the borrowed DS image as a transfer
@@ -8312,7 +8313,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                               format_float_sampling && unorm_rtt_value_reuse_enabled);
                     const bool compatible_device =
                         import.device == static_cast<void*>(ctx.device);
-                    const bool color_bits_copy = ordinary_2d_view && !depth_import &&
+                    // #4291: a raw copy keeps the renderer's canonical RGBA order, so a BGRA
+                    // target is usable here only through the swizzled in-place sampled view below.
+                    const bool color_bits_copy = !import.component_order_bgra && ordinary_2d_view && !depth_import &&
                         compatible_device && import.transfer_src &&
                         import.width == r->width && import.height == r->height &&
                         import.format == LiveTargetPixelFormat::Rgba8Unorm &&
@@ -8326,7 +8329,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     // transfer below copies exact texels and deliberately performs no resampling.
                     const bool depth_bits_extent =
                         import.width == r->width && import.height == r->height;
-                    bool packed10_copy = ordinary_2d_view && !depth_import &&
+                    bool packed10_copy = !import.component_order_bgra &&
+                        ordinary_2d_view && !depth_import &&
                         compatible_device && import.transfer_src &&
                         shader_resource_compute_mip_chain_levels(*r) == 1 &&
                         import.width == r->width && import.height == r->height &&
@@ -8382,6 +8386,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                              static_cast<unsigned>(depth_format));
                         } else {
                             bi.imported = true;
+                            bi.imported_component_order_bgra = import.component_order_bgra;
                             bi.imported_depth = depth_import;
                             bi.imported_format = depth_import ? depth_format : VK_FORMAT_UNDEFINED;
                             bi.imported_pixel_format = import.format;
@@ -8421,6 +8426,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     const ShaderResource* p = source.resource;
                     if (!source.imported || source.imported_depth || source.storage || !p)
                         continue;
+                    // #4291: the seed is a raw copy, and the mirror writes the result back raw. A
+                    // BGRA-as-RGBA source is readable only through its swizzled sampled view.
+                    if (source.imported_component_order_bgra) continue;
                     if (p->gpu_addr != r->gpu_addr || p->width != r->width ||
                         p->height != r->height || p->depth != r->depth ||
                         p->format != r->format || p->num_components != r->num_components)
@@ -8507,6 +8515,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                       source.format == LiveTargetPixelFormat::R11G11B10Float &&
                                       source.native_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32))
                                     ? "format-mismatch"
+                                // A raw image copy keeps the renderer's canonical RGBA order; the
+                                // identity storage view would then read a BGRA target's R and B
+                                // exchanged (#4291).
+                                : source.component_order_bgra ? "component-order"
                                 : !source.transfer_src ? "no-transfer-src"
                                 : !rtt_gpu_seed_import_extent_compatible(
                                     r->width, r->height, source.width, source.height) ? "extent-mismatch"
@@ -10613,8 +10625,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     });
                     return VK_COMPONENT_SWIZZLE_IDENTITY;
                 };
-                vci.components = {sel(r->swizzle[0]), sel(r->swizzle[1]),
-                                  sel(r->swizzle[2]), sel(r->swizzle[3])};
+                // #4291: a BGRA-as-RGBA renderer image bound in place needs the selector in the
+                // host image's component order, exactly as the graphics sampled path composes it.
+                const bool bgra = bi.imported && bi.imported_component_order_bgra;
+                auto host_sel = [&](uint32_t s) {
+                    return sel(prosper::frontend::live_target_host_selector(s, bgra));
+                };
+                vci.components = {host_sel(r->swizzle[0]), host_sel(r->swizzle[1]),
+                                  host_sel(r->swizzle[2]), host_sel(r->swizzle[3])};
             }
             const VkImageAspectFlags image_aspect = (sampled_depth || bi.imported_depth)
                 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;

@@ -970,6 +970,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             snapshot.height = surface.h;
             if (!prosper::frontend::live_target_pixel_format_from_vk(format, snapshot.format))
                 return false;
+            // A BGRA (CB_COLOR ALT) target is kept as canonical RGBA8. Compute decodes these bytes
+            // as guest memory, so hand it the guest's B,G,R,A order -- in a copy, because the cached
+            // surface stays canonical for graphics (#4291).
+            if (prosper::frontend::live_target_component_order_bgra(surface.guest_format, format)) {
+                auto guest_order = std::make_shared<std::vector<uint8_t>>(*surface.rgba);
+                prosper::frontend::swap_rgba8_red_blue(*guest_order);
+                snapshot.pixels = std::move(guest_order);
+                return true;
+            }
             snapshot.pixels = surface.rgba;
             return true;
         });
@@ -1083,6 +1092,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             import.layout = static_cast<uint32_t>(target->layout);
             import.transfer_dst = true;
             import.transfer_src = true;
+            import.component_order_bgra =
+                prosper::frontend::live_target_component_order_bgra(surface.guest_format, format);
             return true;
         },
         [](uint64_t addr) {

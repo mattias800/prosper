@@ -1341,6 +1341,8 @@ enum class LiveTargetPixelFormat : uint8_t {
     R16Float,
 };
 struct LiveTargetSnapshot {
+    // `pixels` are in the guest's component order: a BGRA target kept as canonical RGBA8 by the
+    // renderer arrives B,G,R,A (#4291).
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
     std::shared_ptr<const std::vector<uint8_t>> pixels;
@@ -1417,6 +1419,10 @@ struct LiveTargetImageImport {
     bool transfer_dst = false;
     // A typed color copy may borrow only images created with TRANSFER_SRC usage.
     bool transfer_src = false;
+    // The guest stores this target as BGRA (CB_COLOR ALT) while the renderer keeps it as canonical
+    // RGBA8, so the guest's X and Z components are the host image's B and R (#4291). A sampled
+    // view composes the swap into its selector; a raw copy or seed cannot and must decline.
+    bool component_order_bgra = false;
     bool valid() const { return image && device && width && height; }
 };
 
