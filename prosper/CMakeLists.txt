@@ -1197,6 +1197,25 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_printf.cpp
     LIBRARIES prosper_core)
 
+  # FreeBSD stdio contracts, ported from freebsd-src lib/libc/tests/stdio
+  # (ATF) to gtest. The guest formats floats/ints/positionals through the
+  # forwarded printf/scanf family, where C libraries diverge most. Pure,
+  # no game dump. The non-C locale arms are scoped out (no CI host provides
+  # those locales); LDBL extended-precision arms stay behind the ATF's own
+  # LDBL_MANT_DIG guards so Windows (long double == double) stays green.
+  prosper_add_gtest(test_freebsd_printbasic
+    SOURCES tests/hle/test_freebsd_printbasic.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_freebsd_printfloat
+    SOURCES tests/hle/test_freebsd_printfloat.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_freebsd_positional
+    SOURCES tests/hle/test_freebsd_positional.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_freebsd_scanfloat
+    SOURCES tests/hle/test_freebsd_scanfloat.cpp
+    LIBRARIES prosper_core)
+
   # Windows' aligned allocator family must remain paired end-to-end. Mixing _aligned_malloc with
   # plain free corrupts the heap under aligned game-buffer churn; ordinary and aligned guest
   # allocations intentionally share one compatible family on that host.
