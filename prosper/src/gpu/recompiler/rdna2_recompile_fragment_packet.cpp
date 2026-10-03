@@ -204,8 +204,7 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     if (packet.guest_code.empty() || packet.guest_code.size() > 4096 ||
         packet.vgprs.size() > 256 || packet.sgprs.size() > 106)
         return reject("packet-input-budget");
-    if (!packet.mask_state_available ||
-        !std::all_of(packet.slots_available.begin(), packet.slots_available.end(),
+    if (!std::all_of(packet.slots_available.begin(), packet.slots_available.end(),
                      [](bool available) { return available; }))
         return reject("packet-invocation-state-unavailable");
     if (packet.quad_topology != FragmentPacketQuadTopology::Unknown &&
@@ -319,6 +318,12 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     const auto requirements =
         fragment_packet_vgpr_requirements(packet.guest_code, ins, packet.export_observation);
     if (!requirements.rejection.empty()) return reject(requirements.rejection);
+    if (!requirements.masks.rejection.empty()) return reject(requirements.masks.rejection);
+    const uint8_t mask_availability = fragment_packet_initial_mask_availability(packet);
+    uint32_t mask_failure_pc = UINT32_MAX;
+    if (const auto* gap = fragment_packet_missing_initial_mask(requirements.masks,
+                                                               mask_availability, mask_failure_pc))
+        return reject(gap, mask_failure_pc);
     bool runtime_definedness = wave_data != nullptr;
     for (uint32_t reg = 0; reg < 256; ++reg)
         if (requirements.storage.test(reg)) {
@@ -335,6 +340,8 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
             if (in.fmt == Rdna2Format::EXP)
                 result.export_sites.push_back({in.pc, in.exp_target, in.exp_en, in.exp_compr,
                                                (in.words[0] >> 11) & 1u, (in.words[0] >> 12) & 1u});
+    result.initial_mask_availability = mask_availability;
+    result.demanded_initial_masks = requirements.masks.demanded;
     result.input_stride =
         static_cast<uint32_t>(columns.size()) * (runtime_definedness ? 2u : 1u) + 4;
     result.exports_per_lane = static_cast<uint32_t>(exports.size());
@@ -428,9 +435,12 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
         }
     const uint32_t state_base =
         static_cast<uint32_t>(columns.size()) * (runtime_definedness ? 2u : 1u);
-    state.exec = b.ucmp(Op_INotEqual, b.load_input(state_base), b.uconst(0));
-    state.vcc = b.ucmp(Op_INotEqual, b.load_input(state_base + 1), b.uconst(0));
-    state.scc = b.ucmp(Op_INotEqual, b.load_input(state_base + 2), b.uconst(0));
+    if (mask_availability & kPacketInitialExec)
+        state.exec = b.ucmp(Op_INotEqual, b.load_input(state_base), b.uconst(0));
+    if (mask_availability & kPacketInitialVcc)
+        state.vcc = b.ucmp(Op_INotEqual, b.load_input(state_base + 1), b.uconst(0));
+    if (mask_availability & kPacketInitialScc)
+        state.scc = b.ucmp(Op_INotEqual, b.load_input(state_base + 2), b.uconst(0));
     state.exec_narrowed = true;
     const uint32_t enabled = b.load_input(state_base + 3);
     if (services) services->begin(b);
@@ -465,7 +475,8 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
           }) : std::function<int(RegState&, const Rdna2Inst&)>{};
     if (!emit_cfg_state_machine(b, state, ins, {}, nullptr, true, false, export_record,
                                 packet.guest_code.data(), packet.guest_code.size(), 0, false,
-                                service_callback, runtime_definedness ? &definedness : nullptr)) {
+                                service_callback, runtime_definedness ? &definedness : nullptr,
+                                mask_availability == 7 ? nullptr : &requirements.masks)) {
         const auto records = causes.take();
         return reject(records.empty() ? "packet-guest-emission-refused:no-cause-recorded"
             : "packet-guest-emission-refused:" + records.back().first + ":" +

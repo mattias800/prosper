@@ -3481,6 +3481,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 // emit_body and the CFG state machine it drives live in rdna2_emit_cfg.cpp. As with emit_alu, the
 // default arguments are stated here and nowhere else.
 struct PacketVgprDefinedness;
+struct FragmentPacketMaskRequirements;
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt, bool allow_exec_update,
@@ -3488,7 +3489,8 @@ bool emit_cfg_state_machine(
     const uint32_t* code, size_t dwords, uint32_t initial_active = 0,
     bool synchronize_lds_fminmax = false,
     const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction = {},
-    PacketVgprDefinedness* packet_definedness = nullptr);
+    PacketVgprDefinedness* packet_definedness = nullptr,
+    const FragmentPacketMaskRequirements* packet_masks = nullptr);
 
 bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,

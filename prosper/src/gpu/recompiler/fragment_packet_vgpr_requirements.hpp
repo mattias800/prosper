@@ -1,6 +1,7 @@
 #pragma once
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/fragment_packet_exports.hpp"
+#include "gpu/recompiler/fragment_packet_mask_requirements.hpp"
 #include <bitset>
 #include <map>
 #include <string>
@@ -24,6 +25,7 @@ struct FragmentPacketVgprRequirements {
     std::bitset<256> storage, possible_entry;
     std::map<uint32_t, std::vector<FragmentPacketVgprAccess>> reads;
     std::string rejection;
+    FragmentPacketMaskRequirements masks;
     uint64_t retained_bytes() const;
 };
 FragmentPacketVgprRequirements fragment_packet_vgpr_requirements(

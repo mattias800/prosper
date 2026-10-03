@@ -172,12 +172,19 @@ pack_fragment_packet_waves(std::shared_ptr<const FragmentPacketKernel> owner,
         const auto& invocation = input.invocation;
         if (invocation.guest_code != kernel.guest_code)
             return reject("packet-wave-original-code-association-mismatch");
-        if (!invocation.mask_state_available ||
-            !std::all_of(invocation.slots_available.begin(), invocation.slots_available.end(),
+        if (!std::all_of(invocation.slots_available.begin(), invocation.slots_available.end(),
                          [](bool v) { return v; }) ||
             std::any_of(invocation.export_enabled.begin(), invocation.export_enabled.end(),
                         [](uint8_t v) { return v > 1; }))
             return reject("packet-wave-invocation-state-unavailable");
+        const uint8_t available_masks = fragment_packet_initial_mask_availability(invocation);
+        if ((available_masks & kernel.program.packet.demanded_initial_masks) !=
+            kernel.program.packet.demanded_initial_masks)
+            return reject("packet-wave-demanded-initial-mask-unavailable");
+        // Availability is a code-generation profile, never DATA specialization. An unused field
+        // that was absent during compilation must not acquire authority via a populated wire slot.
+        if (available_masks != kernel.program.packet.initial_mask_availability)
+            return reject("packet-wave-initial-mask-profile-mismatch");
         if (invocation.export_observation != kernel.program.packet.export_observation ||
             invocation.float_mode != kernel.program.float_mode ||
             invocation.float_flags != kernel.program.float_flags ||

@@ -519,6 +519,9 @@ struct FragmentInvocationPacket {
     std::array<bool, kFragmentPacketLanes> slots_available{};
     std::array<uint8_t, kFragmentPacketLanes> export_enabled{}; // 0/1, separate from EXEC
     bool mask_state_available = false;
+    // Separate architectural availability. The legacy bundled true means all three supplied;
+    // otherwise only explicitly available values may enter RegState. Raw zero is not presence.
+    bool exec_available = false, vcc_available = false, scc_available = false;
     uint64_t exec_mask = 0, vcc_mask = 0;
     bool scc = false;
     FragmentPacketQuadTopology quad_topology = FragmentPacketQuadTopology::Unknown;
@@ -554,6 +557,7 @@ struct FragmentPacketProgram {
         bool operator==(const VgprFailureSite&) const = default;
     };
     std::vector<VgprFailureSite> vgpr_failure_sites;
+    uint8_t initial_mask_availability = 0, demanded_initial_masks = 0;
     std::string rejection;
 };
 
