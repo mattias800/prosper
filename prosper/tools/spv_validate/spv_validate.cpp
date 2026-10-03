@@ -36,6 +36,7 @@
 #include "../../tests/fixtures/fragment_packet_mbcnt_fixture.hpp"
 #include "../../tests/fixtures/fragment_resource_packet_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_definedness_fixture.hpp"
+#include "../../tests/fixtures/fragment_packet_raw_masks_fixture.hpp"
 #include "../../tests/fixtures/fragment_special_f32_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_wave_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
@@ -723,6 +724,14 @@ int main(int argc, char** argv) {
         dump(dir, "fragment_resource_definedness_third_lod_absent", missing_lod.packet.spirv,
              "recompile_fragment_resource_packet");
         namespace special = prosper::test::fragment_special_f32;
+        namespace raw_masks = prosper::test::fragment_raw_masks;
+        for (const auto& c : {raw_masks::overwritten(raw_masks::asymmetric, false, false),
+                              raw_masks::overwritten(raw_masks::asymmetric, true, true),
+                              raw_masks::wqm_saved(), raw_masks::saveexec_scc(false)}) {
+            const auto packet = recompile_fragment_packet(c.packet);
+            dump(dir, ("fragment_raw_masks_" + c.name).c_str(), packet.spirv,
+                 "recompile_fragment_packet");
+        }
         const auto wave_kernel =
             recompile_fragment_packet_kernel(prosper::test::fragment_packet_wave::packet());
         dump(dir, "fragment_packet_wave_kernel", wave_kernel.program.packet.spirv,
