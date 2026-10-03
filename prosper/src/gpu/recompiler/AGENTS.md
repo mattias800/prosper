@@ -15,7 +15,7 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   alongside numeric source-word MBCNT at owned logical lane positions, then records raw EXP
   metadata/payload instead of killing physical workers or writing a framebuffer. It is NOT a
   raster fallback: missing
-  slot/mask/scalar state, unsupported interpolation, FP arithmetic, image/memory effects and repeated exports
+  slot/demanded-mask/scalar state, unsupported interpolation, FP arithmetic, image/memory effects and repeated exports
   refuse transactionally. `fragment_packet_contract` evaluates actual emitted uint sinks from
   project-owned packets; `spv_validate` emits this entry separately. No live DrawItem enters it.
   Quad consumers additionally require the supplied consecutive-logical-quad topology tag; it grants
@@ -54,6 +54,12 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   mask/helper/system/composition/commit authority remain separate obligations. The CPU-only
   `PROSPER_VGPR_DEFINEDNESS_SPV_DIRECTORY` diagnostic retains actual emitted SOURCE for validation;
   unset writes no files and never changes guest lowering or admission.
+- `fragment_packet_mask_requirements` is the same immutable analysis owner's instruction-order,
+  all-path inventory of demanded initial EXEC/VCC/SCC. Kernel compilation and cached wave packing
+  distinguish individual presence from raw storage; shipping preparation consumes the exact code
+  facts without per-draw parsing. Complete original writers may make initial values unnecessary,
+  never an actual supplied branch value or an internal zero placeholder. READLANE's selected peer,
+  WQM/partial writes and the existing inactive raw EXP contract remain separate obligations.
 - `fragment_packet_wave_data` separates cached original-program SOURCE/profile from dynamic owned
   logical64 wave regions. Checked per-workgroup bases load genuine scalar/M0/resource/VGPR words;
   all-wave status validation precedes any publication. Shared image bindings remain a bounded
@@ -70,9 +76,10 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   cross-quad composition are separate future recipes, not padded values or waived requirements.
 - `rdna2_mask_move` supplies the shared S_MOV_B64-to-EXEC lowering. Owned Wave64 packets consume
   two genuine instruction-order MUST scalar words at their logical lane position, independently
-  of old EXEC, and preserve SCC. A partial numeric overwrite of a saved Bool mask remains a named
-  transitional refusal until the preserved raw half is genuinely materialized; scalar
-  initialization or the old complete Bool alias is not that proof. Native fragment lowering is
+  of old EXEC, and preserve SCC. `rdna2_packet_raw_masks` materializes selected complete ordinary
+  saved-SGPR masks through the uniform tagged workgroup phase before physical DATA reads/partial
+  replacements; either physical overwrite expires the old complete alias. Actual absent sources
+  remain named refusals; scalar initialization or the old complete Bool alias is not that proof. Native fragment lowering is
   separate and retains its existing exact-subgroup contract.
 - `spirv_builder` — small hand-built SPIR-V modules. **These include shipped shaders**:
   `frontends/shared/live/live_compute.cpp`'s `prepare_compare_pipeline()` feeds

@@ -9,6 +9,7 @@
 namespace prosper::gpu {
 struct RasterQuadInputs;
 struct FragmentPacketVgprRequirements;
+struct FragmentPacketMaskRequirements;
 // A bounded immutable copy of the producing normalized binding contract. Only genuinely owned
 // buffer bytes are copied; live guest/image content never gains authority from nominal addresses.
 // Owned byte membership is not a fetch-PC/read-point, producer epoch or image/sampler witness.
@@ -33,6 +34,7 @@ struct FragmentPacketPreparation {
     // Code-only inventory from the producing immutable shader-analysis owner. Scratch allocation
     // never asks for launch values; actual masked/peer/raw-export reads need runtime validity.
     std::shared_ptr<const FragmentPacketVgprRequirements> vgpr_requirements;
+    std::shared_ptr<const FragmentPacketMaskRequirements> mask_requirements;
     // This provenance/preflight slice cannot grant kernel or graphics admission.
     bool ready = false;
 };

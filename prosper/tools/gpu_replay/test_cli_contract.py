@@ -223,6 +223,19 @@ with tempfile.TemporaryDirectory(prefix="gpu-replay-retry-") as scratch:
         if fixture.returncode != 0:
             print(fixture.stdout + fixture.stderr)
         else:
+            compiled_output = directory / "compiled-stage-dump.spv"
+            compiled_output.write_bytes(sentinel)
+            absent_stage = run_result(["--inspect-only", "--dump-shader", "19:fs",
+                                       str(compiled_output), str(directory / "unavailable-stage.prgcap")])
+            check(absent_stage.returncode == 2 and "has no available compiled module" in absent_stage.stderr and
+                  compiled_output.read_bytes() == sentinel,
+                  "unavailable compiled stage refuses before truncating an existing destination")
+            present_stage = run_result(["--inspect-only", "--dump-shader", "19:fs",
+                                        str(compiled_output), str(directory / "compiled-stage.prgcap")])
+            expected_stage = (directory / "compiled-stage.spv").read_bytes()
+            check(present_stage.returncode == 0 and len(expected_stage) > 20 and
+                  compiled_output.read_bytes() == expected_stage,
+                  "real nonempty compiled stage still exports its exact SPIR-V bytes")
             failed_input = directory / "failed-input-snapshot.prgcap"
             dumped_input = directory / "failed-input.bin"
             dumped_input.write_bytes(b"old output")

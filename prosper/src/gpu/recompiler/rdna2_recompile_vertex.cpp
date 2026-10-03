@@ -50,6 +50,58 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
     return std::min(required, dwords);
 }
 
+bool rdna2_recompile_executable_instructions(const uint32_t* code, size_t dwords,
+                                             std::vector<Rdna2Inst>& instructions,
+                                             uint32_t& unavailable_pc) {
+    instructions.clear();
+    unavailable_pc = UINT32_MAX;
+    if (!code || !dwords) return false;
+    std::vector<Rdna2Inst> decoded;
+    const size_t consumed = rdna2_walk(code, dwords, decoded);
+    if (!consumed || decoded.empty()) return false;
+    unavailable_pc = decoded.back().pc;
+    if (!decoded.back().is_end || std::any_of(decoded.begin(), decoded.end(), [](const auto& in) {
+            return in.fmt == Rdna2Format::Unknown || !in.len_dwords;
+        }))
+        return false;
+
+    // The byte-span helper alone is insufficient: it can retain a second executable arm without
+    // changing rdna2_walk's first-END prefix. Reuse the same proof and inventory both arms.
+    const auto prefix = decoded;
+    size_t executable_dwords = consumed;
+    (void)extend_terminating_if_else(code, dwords, decoded, &executable_dwords);
+    size_t required = executable_dwords;
+    (void)detect_pcrel_tables(decoded, code, dwords, &required);
+    const auto dispatch = detect_pcrel_dispatch(prefix, code, dwords, consumed);
+    if (dispatch.valid) required = std::max(required, dispatch.required_dwords);
+    if (required != dwords) return false;
+
+    std::unordered_set<uint32_t> pcs;
+    for (const auto& in : decoded) pcs.insert(in.pc);
+    for (const auto& in : decoded) {
+        unavailable_pc = in.pc;
+        if (in.fmt == Rdna2Format::SOPP) {
+            if (sopp_opcode_is_direct_branch(in.opcode) && !pcs.contains(scalar_branch_target(in)))
+                return false;
+            if (in.opcode == 0x11 || in.opcode == kSoppOpcodeTrap ||
+                (in.opcode >= kSoppOpcodeCbranchCdbgsys &&
+                 in.opcode <= kSoppOpcodeCbranchCdbgsysAndUser))
+                return false;
+        }
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode >= kSop1OpcodeSetpcB64 &&
+            in.opcode <= kSop1OpcodeRfeB64 &&
+            (in.opcode != kSop1OpcodeSetpcB64 || !dispatch.valid || dispatch.setpc_pc != in.pc))
+            return false;
+        if (in.fmt == Rdna2Format::SOPK &&
+            (in.opcode == kSopkOpcodeCallB64 || in.opcode == kSopkOpcodeSubvectorLoopBegin ||
+             in.opcode == kSopkOpcodeSubvectorLoopEnd))
+            return false;
+    }
+    instructions = std::move(decoded);
+    unavailable_pc = UINT32_MAX;
+    return true;
+}
+
 namespace {
 
 

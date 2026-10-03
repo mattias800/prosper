@@ -61,6 +61,25 @@ struct GuestDirectAllocation {
 // owners keep this observation even after the old VA is unmapped; no capture file supplies it.
 GuestDirectAllocation guest_memory_direct_allocation(const GuestMappingLease& lease,
                                                      uint64_t address, uint64_t minimum_bytes);
+
+// A contiguous, readable, already backed virtual window belonging to ONE live original direct
+// allocation. Physical bytes progress with virtual bytes; adjacent aliases or allocations cannot
+// extend it. Protection/retype splits may extend it only when those facts remain true. The window
+// is intersected with native fault/commit safety, never inferred from a VMA or allocation size.
+// This observation is valid only under the supplied lease. It does not grant current-byte or
+// producer authority: an observer must check the entire selected domain against retained origins
+// and attachments, then own its bytes under the submitted-input stability contract.
+struct GuestDirectReadableWindow {
+    uint64_t virtual_begin = 0, virtual_end = 0;
+    uint64_t physical_begin = 0, physical_end = 0;
+    GuestDirectAllocation allocation;
+    explicit operator bool() const {
+        return allocation.identity && virtual_begin < virtual_end && physical_begin < physical_end;
+    }
+};
+GuestDirectReadableWindow guest_memory_direct_readable_window(const GuestMappingLease& lease,
+                                                              uint64_t address);
+
 GuestMemoryTopologyRelation guest_memory_retained_allocation_relation(
     const GuestMappingLease& lease, uint64_t source_address, uint64_t source_bytes,
     const GuestDirectAllocation& producer);

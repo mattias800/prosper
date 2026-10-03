@@ -14,18 +14,43 @@ uint32_t numeric_pair_mask_bit(SpirvCompute& b, uint32_t lo, uint32_t hi, uint32
 // Consume the existing instruction-order CFG MUST domains, before a stale within-case Bool
 // spelling can bypass a physical high-word overwrite. Scalar initialization also counts saved
 // masks and is deliberately NOT this numeric-word proof.
-const char* packet_exec_mask_source_gap(const SpirvCompute& b, const Rdna2Inst& in,
-                                        const std::set<int>& masks,
-                                        const std::set<int>& scalar_words,
-                                        const std::set<int>& ambiguous) {
+const char* packet_b64_mask_move_source_gap(const SpirvCompute& b, const Rdna2Inst& in,
+                                            const std::set<int>& masks,
+                                            const std::set<int>& scalar_words,
+                                            const std::set<int>& ambiguous) {
     if (!b.is_fragment_packet() || b.wave_size != 64 || in.fmt != Rdna2Format::SOP1 ||
-        in.opcode != 0x04 || in.dst.value != 126 || in.src[0].kind != OperandKind::SGPR)
+        in.opcode != 0x04 || (in.dst.value != 126 && in.dst.value != 106) ||
+        in.src[0].kind != OperandKind::SGPR)
         return nullptr;
     const int source = in.src[0].value;
     const bool low = scalar_words.contains(source), high = scalar_words.contains(source + 1);
     if (low && high) return nullptr;
     if (!low && !high && masks.contains(source) && !ambiguous.contains(source)) return nullptr;
-    return "packet-exec-mask-source-words-unavailable";
+    return in.dst.value == 126 ? "packet-exec-mask-source-words-unavailable"
+                               : "packet-vcc-mask-source-words-unavailable";
+}
+
+// A complete scalar move INTO VCC defines both physical words, independently of EXEC, and
+// preserves SCC (AMD RDNA2 70648 sections 3.3/12.3). Publish the exact logical-lane bit as well
+// as emit_alu's unchanged DATA copy. An absent entry predicate cannot supply this new value;
+// nor may a supplied old predicate survive a genuine numeric replacement. Dispatcher reloads
+// have already removed words without current MUST authority. Never resurrect sreg_input here.
+uint32_t packet_s_mov_b64_numeric_vcc_bit(SpirvCompute& b, const RegState& rs,
+                                          const Rdna2Inst& in) {
+    if (!b.is_fragment_packet() || b.wave_size != 64 || in.fmt != Rdna2Format::SOP1 ||
+        in.opcode != kSop1OpcodeMovB64 || in.dst.value != 106)
+        return 0;
+    const auto& source = in.src[0];
+    uint32_t lo = 0, hi = 0;
+    if (source.kind == OperandKind::SGPR ||
+        (source.kind == OperandKind::Special && source.value >= 106 && source.value <= 123)) {
+        const auto low = rs.sreg.find(source.value), high = rs.sreg.find(source.value + 1);
+        if (low == rs.sreg.end() || high == rs.sreg.end()) return 0;
+        lo = low->second;
+        hi = high->second;
+    } else
+        return 0; // existing mask/inline lowering is unchanged
+    return numeric_pair_mask_bit(b, lo, hi, b.ibin(Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63)));
 }
 
 // AMD RDNA2 70648 sections 3.3/12.3: S_MOV_B64 copies the complete scalar pair into EXEC,
@@ -64,9 +89,9 @@ bool emit_s_mov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
             return true;
         }
         if (has_low || has_high || !src_mask()) {
-            // A saved Bool mask is not raw numeric halves. A legal partial overwrite needs the
-            // preserved genuine half materialized before this transfer; that service is still
-            // missing. Allocation/scalar-initialization alone cannot supply it.
+            // PacketRawMasks materializes admitted complete ordinary saved pairs BEFORE a half
+            // overwrite. A remaining partial source has no reaching complete producer/words;
+            // allocation, scalar initialization or a stale Bool cannot supply its absent half.
             b.stage_reject_pc = in.pc;
             b.stage_reject_reason = "packet-exec-mask-source-words-unavailable";
             return false;

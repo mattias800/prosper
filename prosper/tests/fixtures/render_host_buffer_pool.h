@@ -124,8 +124,8 @@ inline VkDeviceSize render_host_buffer_pool_limit_bytes(const char* override_mib
 inline VkDeviceSize render_host_buffer_pool_limit() {
     static const VkDeviceSize limit = []() -> VkDeviceSize {
         const uint64_t physical = render_host_physical_memory_bytes();
-        const VkDeviceSize bytes = render_host_buffer_pool_limit_bytes(
-            getenv("PROSPER_BACKEND_BUFFER_POOL_MB"), physical);
+        const VkDeviceSize bytes =
+            render_host_buffer_pool_limit_bytes(getenv("PROSPER_BACKEND_BUFFER_POOL_MB"), physical);
         fprintf(stderr,
                 "[render] backend host-buffer pool budget = %.1f MiB (host physical %.1f GiB)\n",
                 bytes / (1024.0 * 1024.0), physical / (1024.0 * 1024.0 * 1024.0));
@@ -159,8 +159,7 @@ inline VkDeviceSize render_host_buffer_capacity(VkDeviceSize bytes) {
     return capacity < bytes ? bytes : capacity;
 }
 
-inline RenderHostBuffer acquire_render_host_buffer(const RenderVkCtx& ctx,
-                                                   VkDeviceSize bytes) {
+inline RenderHostBuffer acquire_render_host_buffer(const RenderVkCtx& ctx, VkDeviceSize bytes) {
     if (!bytes) return {};
     const VkDeviceSize capacity = render_host_buffer_capacity(bytes);
     RenderHostBufferPool& pool = render_host_buffer_pool();
@@ -201,16 +200,15 @@ inline RenderHostBuffer acquire_render_host_buffer(const RenderVkCtx& ctx,
     // stay exactly as it is when the diagnostic is off.
     static const bool echo_usage = getenv("PROSPER_BUFFER_ECHO") != nullptr;
     if (echo_usage) info.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    if (vkCreateBuffer(ctx.dev, &info, nullptr, &buffer.buffer) != VK_SUCCESS)
-        return {};
+    if (vkCreateBuffer(ctx.dev, &info, nullptr, &buffer.buffer) != VK_SUCCESS) return {};
     VkMemoryRequirements requirements{};
     vkGetBufferMemoryRequirements(ctx.dev, buffer.buffer, &requirements);
     buffer.allocation_bytes = requirements.size;
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = requirements.size;
-    allocation.memoryTypeIndex = render_memory_type(
-        ctx.phys, requirements.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    allocation.memoryTypeIndex = render_memory_type(ctx.phys, requirements.memoryTypeBits,
+                                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (allocation.memoryTypeIndex == UINT32_MAX ||
         prosper::gpu::allocate_device_memory(ctx.dev, &allocation, &buffer.memory) != VK_SUCCESS ||
         vkBindBufferMemory(ctx.dev, buffer.buffer, buffer.memory, 0) != VK_SUCCESS ||

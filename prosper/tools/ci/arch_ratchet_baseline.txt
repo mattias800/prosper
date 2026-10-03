@@ -172,15 +172,22 @@ file-size|prosper/frontends/shared/live/live_compute.cpp 15530  # raised from 15
 file-size|prosper/frontends/shared/live/submit_renderer/image_resources.cpp 5526
 file-size|prosper/src/gpu/execute/gpu_executor.cpp 13258
 file-size|prosper/src/gpu/pm4/command_processor.cpp 5539
-file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9420
+# note #3951: one caller line delegates checked logical64 raw-window emission to its companion.
+file-size|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 9421
 # note #4192: seven net lines connect original owned packet instruction services at the existing
 # dispatcher boundary, preserving the empty native callback and scalar lifetime invalidation.
-file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 8873
+file-size|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 8512
 file-size|prosper/src/hle/kernel/hle_kernel.cpp 5566
 # note #4200: fourteen net lines retain the APR binding/submit/tail dialect and test observer,
 # including changed-line formatting; other memory behavior is unchanged.
-file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8639
-file-size|prosper/tests/fixtures/render_runner.h 16442  # Two mechanical same-TU moves fund bounded shipping hooks; no cap increase
+# note #3951: 118 additional lines, including ten scoped-format wraps, authenticate finite readable
+# same-origin mapping windows under
+# the private HLE ledger lock; neither VMA remainder nor physical allocation size grants bytes.
+file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8757
+# note #3951: eighteen net lines, including two scoped-format wraps, connect owned input/output
+# plans to the existing renderer companion.
+# Logical64 current READFIRST/raw-load results complete before normal guest attachment publication.
+file-size|prosper/tests/fixtures/render_runner.h 16460  # Two mechanical same-TU moves preserve incoming hooks below accepted main's 16776 cap
 test-dep|prosper/frontends/shared/live/live_renderer.cpp 73
 test-dep|prosper/frontends/shared/live/live_renderer_internal.hpp 20
 test-dep|prosper/frontends/shared/live/submit_renderer/backend_draws.cpp 9
@@ -239,7 +246,9 @@ platform-ifdef|prosper/src/hle/libc/hle_libc.cpp 17
 platform-ifdef|prosper/src/hle/libc/libc_variadic_capture.cpp 4
 platform-ifdef|prosper/src/hle/libc/libc_variadic_capture.hpp 1
 platform-ifdef|prosper/src/hle/memory/heap_mutex.hpp 1
-platform-ifdef|prosper/src/hle/memory/hle_kernel_mem.cpp 16
+# note #3951: Linux lazy-fault granules and Windows committed/readable narrowing supplement the
+# same HLE origin proof; the query never commits or repairs guest mappings.
+platform-ifdef|prosper/src/hle/memory/hle_kernel_mem.cpp 18
 platform-ifdef|prosper/src/hle/np/np.cpp 10
 platform-ifdef|prosper/src/hle/service/hle_service.cpp 7
 platform-ifdef|prosper/src/hle/service/service_trace.hpp 1
@@ -263,6 +272,9 @@ layer-include|prosper/src/gpu/capture/serialize/capture_serialize.cpp|hle 1
 layer-include|prosper/src/gpu/execute/gpu_executor.cpp|hle 1
 layer-include|prosper/src/gpu/execute/graphics_nested_wide_reader.hpp|hle 1
 layer-include|prosper/src/gpu/execute/nested_wide_data_admission.cpp|hle 1
+# note #3951: registered draw observation takes the existing HLE topology lease and readable
+# direct-window query before copying current input; this inversion grants no other layer precedent.
+layer-include|prosper/src/gpu/execute/owned_graphics_wave_draw.cpp|hle 1
 layer-include|prosper/src/gpu/pm4/command_processor.cpp|hle 3
 layer-include|prosper/src/host/image/boot_program.cpp|hle 1
 layer-include|prosper/src/host/image/exec_image.hpp|hle 1

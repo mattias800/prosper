@@ -89,9 +89,18 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
         launch=b"\x01\x00\x00\x01"+struct.pack("<I",16<<12)
         flags_tail=(struct.pack("<II",0,1)+launch if failed else
                     struct.pack("<I",1)+launch+struct.pack("<I",0))
-        check(struct.unpack_from("<I",data,8)[0]==68 and data.endswith(flags_tail+bytes(4)),
-              "exact official67 launch flags followed by resource-free nested68 count")
-        official67=bytearray(data[:-4]); struct.pack_into("<I",official67,8,67)
+        draw_count=0 if failed else 1
+        wave_tail=struct.pack("<I",draw_count)+bytes(draw_count)
+        check(struct.unpack_from("<I",data,8)[0]==70 and data.endswith(wave_tail),
+              "current ordinary capture has exact absent owned-wave records")
+        official69=bytearray(data[:-len(wave_tail)]); struct.pack_into("<I",official69,8,69)
+        entry_start=len(official69)-4-159*draw_count
+        check(struct.unpack_from("<I",official69,entry_start)[0]==draw_count,
+              "official69 entry count matches the original draw inventory")
+        official68=bytearray(official69[:entry_start]); struct.pack_into("<I",official68,8,68)
+        check(official68.endswith(flags_tail+bytes(4)),
+              "genuine official68 retains flags followed by resource-free nested count")
+        official67=bytearray(official68[:-4]); struct.pack_into("<I",official67,8,67)
         check(official67.endswith(flags_tail), "genuine independent official67 flags tail")
         official66=bytearray(official67[:-len(flags_tail)]); struct.pack_into("<I",official66,8,66)
         tail=(struct.pack("<III",0,0,1)+b"\x02"+struct.pack("<I",1)+b"\x00" if failed else
@@ -163,7 +172,7 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
             check(done.returncode==0 and stored.is_file(),state+" stored module remains usable offline")
             if stored.is_file(): check(facts(stored.read_bytes())[0] == (state!="explicit-nonfinite32"),
                                       state+" opposing stored capability is dormant producer authority")
-    original=(directory/"explicit-nonfinite32.prgcap").read_bytes(); start=len(original)-4-16-13
+    original=(directory/"explicit-nonfinite32.prgcap").read_bytes(); start=len(original)-5-(4+159)-4-16-13
     corrupt={"draw-count":original[:start]+struct.pack("<I",2)+original[start+4:],
              "draw-tag":original[:start+4]+b"\x03"+original[start+5:],
              "compute-count":original[:start+5]+struct.pack("<I",1)+original[start+9:],

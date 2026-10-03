@@ -120,7 +120,7 @@ int main(int argc, char** argv) {
     p = good; p.slots_available[62] = false;
     refuse(p, "packet-invocation-state-unavailable", "missing initially inactive quad neighbor");
     p = good; p.mask_state_available = false;
-    refuse(p, "packet-invocation-state-unavailable", "unknown EXEC/VCC/SCC state");
+    refuse(p, "packet-entry-exec-unavailable", "missing demanded initial EXEC before WQM");
     p = good; p.guest_code[2] = w::sop1(9, 126, 126);
     refuse(p, "packet-wqm-b32-unimplemented", "unsupported B32 ownership width");
     for (uint32_t src : {129u, 193u + 1u, 240u, 255u, 127u, 124u, 31u}) {
@@ -136,46 +136,48 @@ int main(int argc, char** argv) {
     p = w::packet(scalar);
     std::erase_if(p.sgprs, [](const auto& value) { return value.first == 31; });
     refuse(p, "packet-sgpr-read-before-definition", "no invented numeric high word");
-    // Initial scalar words must not reappear after the pair becomes a saved mask. A one-word
-    // overwrite destroys that complete mask without defining its untouched low data word.
-    // The matching NOP twin retains the saved VCC mask and must reach the same live raw sinks.
-    for (bool overwrite_high : {false, true}) {
-        p = w::packet(scalar);
-        p.guest_code.insert(p.guest_code.begin() + 2,
-            {w::sop1(4, 30, 106), overwrite_high
-                ? w::sop1(prosper::gpu::kSop1OpcodeMovB32, 31, 24) : 0xbf800000u});
-        const auto changed = prosper::gpu::rdna2_decode_one(
-            p.guest_code.data() + 3, p.guest_code.size() - 3);
-        check(overwrite_high
-            ? changed.fmt == prosper::gpu::Rdna2Format::SOP1 &&
-              changed.opcode == 3 && changed.dst.kind == prosper::gpu::OperandKind::SGPR &&
-              changed.dst.value == 31 && changed.src[0].kind == prosper::gpu::OperandKind::SGPR &&
-              changed.src[0].value == 24
-            : changed.fmt == prosper::gpu::Rdna2Format::SOPP && changed.opcode == 0,
-            "actual high-word overwrite / NOP encoding");
-        const auto r = prosper::gpu::recompile_fragment_packet(
-            p, {prosper::gpu::RecompileDiagnosticStage::Fragment, 0x4099});
-        if (overwrite_high) {
-            check(r.spirv.empty() && r.input_words.empty() && r.output_words.empty(),
-                  "expired saved-mask low word never becomes initial data or zero");
-            check(r.rejection.starts_with("packet-guest-emission-refused:") &&
-                  r.rejection.find("pc=4 reason=packet-wqm-source-state-unavailable") !=
-                    std::string::npos,
-                  "expired WQM source has a named emission cause: " + r.rejection);
-        } else {
-            check(!r.spirv.empty() && r.rejection.empty(), "live saved-mask NOP twin emits");
+    // Saving VCC now materializes both physical words. A high-only overwrite preserves the
+    // actual saved low word, never the initial scalar word. Nonzero bit31 prevents a fabricated
+    // zero from passing; the NOP twin retains both saved words and reaches the same raw sinks.
+    for (uint64_t vcc : {uint64_t(1) << 40, (uint64_t(1) << 40) | (uint64_t(1) << 31)})
+        for (bool overwrite_high : {false, true}) {
+            scalar.vcc = vcc;
+            p = w::packet(scalar);
+            p.guest_code.insert(
+                p.guest_code.begin() + 2,
+                {w::sop1(4, 30, 106),
+                 overwrite_high ? w::sop1(prosper::gpu::kSop1OpcodeMovB32, 31, 24) : 0xbf800000u});
+            const auto changed =
+                prosper::gpu::rdna2_decode_one(p.guest_code.data() + 3, p.guest_code.size() - 3);
+            check(overwrite_high
+                      ? changed.fmt == prosper::gpu::Rdna2Format::SOP1 && changed.opcode == 3 &&
+                            changed.dst.kind == prosper::gpu::OperandKind::SGPR &&
+                            changed.dst.value == 31 &&
+                            changed.src[0].kind == prosper::gpu::OperandKind::SGPR &&
+                            changed.src[0].value == 24
+                      : changed.fmt == prosper::gpu::Rdna2Format::SOPP && changed.opcode == 0,
+                  "actual high-word overwrite / NOP encoding");
+            const auto r = prosper::gpu::recompile_fragment_packet(
+                p, {prosper::gpu::RecompileDiagnosticStage::Fragment, 0x4099});
+            check(!r.spirv.empty() && r.rejection.empty(),
+                  "saved-mask physical words emit: " + r.rejection);
             if (!r.spirv.empty()) {
                 bpermute_oracle::Interpreter vm(r.spirv);
                 const auto actual = vm.run_packet(r.input_words, r.output_words);
-                auto saved = scalar; saved.source = w::Source::Vcc;
+                auto saved = scalar;
+                saved.source = overwrite_high ? w::Source::ScalarPair : w::Source::Vcc;
+                saved.scalar =
+                    uint32_t(vcc) | (uint64_t(prosper::test::fragment_packet::branch_true) << 32);
                 check(vm.error.empty() && actual == w::expected(saved),
-                      "live saved-mask NOP twin reaches actual WQM EXP sinks");
-                dump(directory, "live_saved_mask_nop_twin", r.spirv);
+                      "saved-mask / high overwrite reaches actual WQM EXP sinks");
+                dump(directory,
+                     "saved_mask_high_overwrite_" + std::to_string(vcc) + "_" +
+                         std::to_string(overwrite_high),
+                     r.spirv);
             }
         }
-    }
-    // Two genuine scalar definitions replace the whole expired mask lifetime and can be consumed
-    // numerically by WQM. Do not turn the one-word refusal into a permanent register allow/denylist.
+    scalar.vcc = uint64_t(1) << 40;
+    // Two genuine scalar definitions replace both materialized words and can be consumed by WQM.
     p = w::packet(scalar);
     p.guest_code.insert(p.guest_code.begin() + 2, {w::sop1(4, 30, 106),
         w::sop1(prosper::gpu::kSop1OpcodeMovB32, 30, 24),
@@ -192,41 +194,45 @@ int main(int argc, char** argv) {
               "replacement scalar pair reaches actual WQM EXP sinks");
         dump(directory, "replaced_scalar_pair", replaced.spirv);
     }
-    // A WQM result is a complete Bool-domain mask, not a materialized low SGPR word. Keep a later
-    // physical-word read live in EXP: the real count twin emits, but the mask word must still refuse.
-    for (uint32_t word : {12u, 30u}) {
-        w::Case saved; saved.destination = 30;
-        p = w::packet(saved);
-        const auto first_exp = std::find(p.guest_code.begin(), p.guest_code.end(), 0xf800180fu);
-        check(first_exp != p.guest_code.end(), "WQM physical-word control retains actual EXP");
-        if (first_exp == p.guest_code.end()) continue;
-        const size_t pc = size_t(first_exp - p.guest_code.begin());
-        p.guest_code.insert(p.guest_code.begin() + pc, 0x7e0a0200u | word); // V_MOV v5,sWORD
-        p.guest_code[pc + 2] = (p.guest_code[pc + 2] & ~0xffu) | 5u; // live channel0 consumes v5
-        const auto r = prosper::gpu::recompile_fragment_packet(
-            p, {prosper::gpu::RecompileDiagnosticStage::Fragment, 0x4099});
-        if (word == 30) {
-            check(r.spirv.empty() && r.input_words.empty() && r.output_words.empty(),
-                  "WQM mask word never becomes supplied initial data or zero");
-            check(r.rejection.starts_with("packet-guest-emission-refused:") &&
-                  r.rejection != "packet-guest-emission-refused:no-cause-recorded",
-                  "later physical WQM mask read keeps a named cause: " + r.rejection);
-        } else {
-            check(!r.spirv.empty() && r.rejection.empty(), "defined WQM count word twin emits");
+    // A WQM result also defines its actual physical words. Observe bit31's widened low quad,
+    // not only a zero low half, and retain the count twin and later register-lifetime sinks.
+    for (uint64_t exec : {uint64_t(1) << 63, (uint64_t(1) << 31) | (uint64_t(1) << 63)})
+        for (uint32_t word : {12u, 30u}) {
+            w::Case saved;
+            saved.destination = 30;
+            saved.exec = exec;
+            p = w::packet(saved);
+            const auto first_exp = std::find(p.guest_code.begin(), p.guest_code.end(), 0xf800180fu);
+            check(first_exp != p.guest_code.end(), "WQM physical-word control retains actual EXP");
+            if (first_exp == p.guest_code.end()) continue;
+            const size_t pc = size_t(first_exp - p.guest_code.begin());
+            p.guest_code.insert(p.guest_code.begin() + pc, 0x7e0a0200u | word);   // V_MOV v5,sWORD
+            p.guest_code[pc + 2] =
+                (p.guest_code[pc + 2] & ~0xffu) | 5u;   // live channel0 consumes v5
+            const auto r = prosper::gpu::recompile_fragment_packet(
+                p, {prosper::gpu::RecompileDiagnosticStage::Fragment, 0x4099});
+            check(!r.spirv.empty() && r.rejection.empty(),
+                  "defined WQM physical/count word emits: " + r.rejection);
             if (!r.spirv.empty()) {
                 bpermute_oracle::Interpreter vm(r.spirv);
                 const auto actual = vm.run_packet(r.input_words, r.output_words);
                 auto want = w::expected(saved);
                 const uint64_t wide = w::expand(w::source_mask(saved));
-                for (uint32_t lane = 0; lane < 64; ++lane)
+                const uint32_t value = word == 12 ? w::population(wide) : uint32_t(wide);
+                for (uint32_t lane = 0; lane < 64; ++lane) {
+                    if ((wide >> lane) & 1u) want[lane * 36 + 8] = value;
+                    // Restoring EXEC overwrites v5 only on originally active lanes. The third EXP
+                    // reads v1, so its old count remains unchanged even when this raw v5 differs.
                     if (((wide >> lane) & 1u) && !((saved.exec >> lane) & 1u))
-                        want[lane * 36 + 12 + 8] = w::population(wide);
+                        want[lane * 36 + 12 + 8] = value;
+                }
                 check(vm.error.empty() && actual == want,
-                      "defined count twin reaches actual live EXP channel");
-                dump(directory, "defined_count_word_twin", r.spirv);
+                      "defined physical/count word reaches all actual live EXP channels");
+                dump(directory,
+                     "wqm_physical_word_" + std::to_string(exec) + "_" + std::to_string(word),
+                     r.spirv);
             }
         }
-    }
     // Even branch-skipped WQM needs a declared topology. Its NOP twin with identical control
     // shape must emit without one; ordinary integer packets retain the Unknown/default contract.
     for (bool wqm : {false, true}) {

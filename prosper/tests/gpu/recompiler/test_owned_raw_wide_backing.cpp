@@ -324,14 +324,20 @@ int main(int argc, char** argv) {
                 ? combined_replay.items[0].prt->by_fetch_pc(0u) : nullptr;
             const auto* restored_child = combined_ok && combined_replay.items.size() == 1u && combined_replay.items[0].prt
                 ? combined_replay.items[0].prt->by_fetch_pc(7u) : nullptr;
-            check(combined_ok && combined_decoded.format_version == 69u &&
-                  combined_decoded.draws.front().ps_float_mode == mode && combined_replay.items[0].ps_float_mode == mode &&
-                  combined_replay.items[0].fragment_wave_config_available && !combined_replay.items[0].ps_wave32 &&
-                  restored_parent && restored_parent->host_data && restored_parent->owned_raw_snapshot_bytes == size &&
-                  restored_parent->host_data_size == size && std::memcmp(restored_parent->host_data, source->host_data, size) == 0 &&
-                  restored_child && restored_child->host_data && restored_child->host_data_size >= size &&
-                  std::memcmp(restored_child->host_data, child.data() + 8u, size) == 0,
-                  "current capture retains every owned parent/child byte, exact width and full producing mode");
+            check(combined_ok && combined_decoded.format_version == 70u &&
+                      combined_decoded.draws.front().ps_float_mode == mode &&
+                      combined_replay.items[0].ps_float_mode == mode &&
+                      combined_replay.items[0].fragment_wave_config_available &&
+                      !combined_replay.items[0].ps_wave32 && restored_parent &&
+                      restored_parent->host_data &&
+                      restored_parent->owned_raw_snapshot_bytes == size &&
+                      restored_parent->host_data_size == size &&
+                      std::memcmp(restored_parent->host_data, source->host_data, size) == 0 &&
+                      restored_child && restored_child->host_data &&
+                      restored_child->host_data_size >= size &&
+                      std::memcmp(restored_child->host_data, child.data() + 8u, size) == 0,
+                  "current capture retains every owned parent/child byte, exact width and full "
+                  "producing mode");
             auto combined_ownerless = combined_draw;
             combined_ownerless.prt = std::make_shared<ShaderResourceTable>(table);
             combined_ownerless.prt->owned_host_data.clear();
@@ -345,9 +351,20 @@ int main(int argc, char** argv) {
         const auto owned_tail_size = 4u + 4u * decoded.draws.front().vrt.resources.size();
         const auto transport_tail_size = 12u + decoded.draws.size();
         const auto flags_tail_size = 8u + 8u * decoded.draws.size();
+        const auto wave_tail_size = 4u + decoded.draws.size();
         auto v65_bytes = encoded;
-        v65_bytes.resize(v65_bytes.size() - 4u - kGpuCaptureFragmentEntryRecordBytes*decoded.draws.size() -
-            owned_tail_size - flags_tail_size - transport_tail_size); v65_bytes[8] = 65u;
+        check(std::all_of(decoded.draws.begin(), decoded.draws.end(),
+                          [](const auto& draw) { return !draw.owned_waves; }),
+              "legacy downgrade fixture has only absent CAP70 wave owners");
+        const auto newer_tail_size = wave_tail_size + 4u +
+                                     kGpuCaptureFragmentEntryRecordBytes * decoded.draws.size() +
+                                     owned_tail_size + flags_tail_size + transport_tail_size;
+        if (v65_bytes.size() <= newer_tail_size) {
+            check(false, "complete current capture must contain all newer tails before downgrade");
+            continue;
+        }
+        v65_bytes.resize(v65_bytes.size() - newer_tail_size);
+        v65_bytes[8] = 65u;
         GpuCaptureFile official65;
         check(deserialize_gpu_capture(v65_bytes, official65, error) && official65.format_version == 65u &&
               official65.draws.front().vrt.resources.front().resource.owned_raw_snapshot_bytes == size &&

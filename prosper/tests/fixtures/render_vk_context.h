@@ -38,10 +38,13 @@
 // but the window is not closed), and BorrowedComputeImageLease holds a raw VulkanComputeContext*.
 // Give compute an explicit release-before-teardown handshake before adding a destructor here.
 struct RenderVkCtx {
-    VkInstance inst = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
+    VkInstance inst = VK_NULL_HANDLE;
+    VkPhysicalDevice phys = VK_NULL_HANDLE;
     // Non-null only under PROSPER_VK_VALIDATION; without it the layer has no output sink.
     VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
-    VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
+    VkDevice dev = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    uint32_t qfi = UINT32_MAX;
     // Driver compilation data, distinct from the map retaining prosper's VkPipeline handles.
     // Retained with this process-lifetime device. Access uses graphics_driver_cache_mutex().
     VkPipelineCache driver_pipeline_cache = VK_NULL_HANDLE;
@@ -50,9 +53,11 @@ struct RenderVkCtx {
     VkDeviceSize storage_buffer_alignment = 1;
     double timestamp_period_ns = 0.0;
     uint32_t timestamp_valid_bits = 0;
-    bool aniso_enabled = false; float max_aniso_limit = 1.0f;
+    bool aniso_enabled = false;
+    float max_aniso_limit = 1.0f;
     bool depth_bias_clamp_enabled = false;   // VkPhysicalDeviceFeatures::depthBiasClamp (#1349)
-    bool logic_op_enabled = false; bool ok = false;
+    bool logic_op_enabled = false;
+    bool ok = false;
     bool geometry_shader_enabled = false;
     bool fragment_stores_atomics = false;
     bool shader_int64_enabled = false;   // successful vkCreateDevice feature, never advertised-only
@@ -115,8 +120,11 @@ struct RenderVkCtx {
     // only when advertised, so the headless test/screenshot path is byte-for-byte unchanged: on a
     // display-less target the surface instance-extensions and VK_KHR_swapchain are simply absent, these
     // stay false, and prosper-app falls back to its own separate present device + CPU pixels.
-    bool present_surface_capable = false;   // instance enabled VK_KHR_surface (+ a platform surface ext)
-    bool present_swapchain_capable = false; // device enabled VK_KHR_swapchain
-    VkQueue present_queue = VK_NULL_HANDLE; // dedicated 2nd queue when the family has >=2, else == queue
-    bool present_queue_shared = false;      // present_queue aliases the render queue -> submits need a mutex
+    bool present_surface_capable =
+        false;   // instance enabled VK_KHR_surface (+ a platform surface ext)
+    bool present_swapchain_capable = false;   // device enabled VK_KHR_swapchain
+    VkQueue present_queue =
+        VK_NULL_HANDLE;   // dedicated 2nd queue when the family has >=2, else == queue
+    bool present_queue_shared =
+        false;   // present_queue aliases the render queue -> submits need a mutex
 };

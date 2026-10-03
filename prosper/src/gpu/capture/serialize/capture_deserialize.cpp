@@ -1765,9 +1765,10 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 uint32_t width = 0;
                 if (!r.u32(width)) return false;
                 captured.resource.owned_nested_snapshot_bytes = width;
-                if (width && ((width != 16u && width != 32u) ||
+                if (width && ((width != 8u && width != 16u && width != 32u) ||
                               !valid_owned_raw_snapshot_shape(captured.resource, width) ||
-                              captured.captured_size < width)) return false;
+                              captured.captured_size < width))
+                    return false;
             }
             return true;
         };
@@ -1815,6 +1816,18 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 return false;
             }
         }
+    }
+    if (version >= 70u) {
+        uint32_t count = 0;
+        if (!r.u32(count) || count != c.draws.size()) {
+            error = "invalid owned logical-wave draw count";
+            return false;
+        }
+        for (auto& draw : c.draws)
+            if (!read_owned_wave_draw(r, draw)) {
+                error = "invalid owned logical-wave input state";
+                return false;
+            }
     }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one

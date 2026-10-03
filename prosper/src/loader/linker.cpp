@@ -1,6 +1,8 @@
 #include "linker.hpp"
 #include "tls_layout.hpp"
 #include <unordered_map>
+#include <unordered_set>
+#include <cctype>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -69,6 +71,7 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base, uint
     // first-definition-wins global export table built in the pass below, so an optional input can be
     // rejected BEFORE its image is built rather than silently aliasing an earlier module's exports.
     std::unordered_map<std::string, std::string> nid_owner;
+    std::unordered_set<std::string> defer_paths;
     for (auto& in : inputs) {
         std::string e;
         auto mo = Module::load(in.path, &e);
@@ -97,6 +100,7 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base, uint
         LoadedImage img;
         if (!build_image(*mod, in.base, img, &e))
             return fail("load " + in.path + ": " + e);
+        if (in.init_on_load) defer_paths.insert(in.path);
         out.mods.push_back(std::move(mod));
         out.imgs.push_back(std::move(img));
     }
@@ -237,7 +241,10 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base, uint
     for (size_t i = out.mods.size(); i-- > 1; ) {
         const Module& m = *out.mods[i];
         LoadedImage& img = out.imgs[i];
-        if (m.init_va) out.init_fns.push_back(img.base + m.init_va);
+        std::vector<uint64_t> deferred;
+        const bool defer = defer_paths.count(m.path) != 0;
+        auto& dst = defer ? deferred : out.init_fns;
+        if (m.init_va) dst.push_back(img.base + m.init_va);
         for (uint64_t off = 0; off + 8 <= m.init_array_sz; off += 8) {
             const uint8_t* p = img.at(img.base + m.init_array_va + off);
             // at() only checks the start va is in-image; guarantee all 8 bytes are too (the sibling
@@ -245,7 +252,12 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base, uint
             // final <8 bytes of a malformed image cannot read past mem.
             if (!p || p + 8 > img.mem.data() + img.mem.size()) break;
             uint64_t fn; memcpy(&fn, p, 8);
-            if (fn) out.init_fns.push_back(fn);
+            if (fn) dst.push_back(fn);
+        }
+        if (defer) {
+            std::string b = m.path.substr(m.path.find_last_of("/\\") + 1);
+            for (auto& c : b) c = (char)std::tolower((unsigned char)c);
+            out.deferred_inits.emplace_back(std::move(b), std::move(deferred));
         }
     }
     return true;

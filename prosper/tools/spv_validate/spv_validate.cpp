@@ -38,10 +38,13 @@
 #include "../../tests/fixtures/fragment_packet_mbcnt_fixture.hpp"
 #include "../../tests/fixtures/fragment_resource_packet_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_definedness_fixture.hpp"
+#include "../../tests/fixtures/fragment_packet_raw_masks_fixture.hpp"
+#include "../../tests/fixtures/fragment_packet_mask_entry_fixture.hpp"
 #include "../../tests/fixtures/fragment_special_f32_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_wave_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <cctype>
 #include <filesystem>
@@ -144,21 +147,26 @@ static const NotAnEmitter kNotEmitters[] = {
     {"shader_analysis_owned_words",
      "aliases the immutable owned RAW RDNA2 analysis bytes; it neither translates instructions "
      "nor assembles a SPIR-V module"},
+    {"registered_graphics_original",
+     "aliases the registered immutable RAW RDNA2 analysis bytes; consuming owned packet modules "
+     "are validated here, but the accessor neither translates instructions nor assembles SPIR-V"},
     // Two SpirvCompute members became visible to this scan when the recompiler's shared internals
     // moved into rdna2_to_spirv_internal.hpp so the emit functions could be split into their own
     // translation units. Neither is a new code path -- both were always reached through the entry
     // points validated below; they were simply inside a .cpp, and this gate reads headers.
     {"build_interpolation_geometry",
      "the body of recompile_interpolation_geometry, which IS validated here: that entry point is "
-     "`SpirvCompute builder; return builder.build_interpolation_geometry(layout, capture_position);` "
+     "`SpirvCompute builder; return builder.build_interpolation_geometry(layout, "
+     "capture_position);` "
      "and nothing else, so every word this gate validates for it is emitted by this member"},
     {"finish",
-     "SpirvCompute's module-assembly tail, not an entry point. It is the last call of every emitter "
+     "SpirvCompute's module-assembly tail, not an entry point. It is the last call of every "
+     "emitter "
      "validated here, so it is exercised by all of them; a module it broke would fail spirv-val "
      "under whichever emitter produced it"},
     {"safe_execz_branches_for_test", "returns a transformed RDNA2 instruction stream, not SPIR-V"},
     {"structured_execz_branches_for_test", "returns analyzed RDNA2 branch PCs, not SPIR-V"},
-    {"mask_test_branches_for_test",  "returns a transformed RDNA2 instruction stream, not SPIR-V"},
+    {"mask_test_branches_for_test", "returns a transformed RDNA2 instruction stream, not SPIR-V"},
     {"cselect_b64_low_only_pcs_for_test", "returns CFG-proven instruction PCs, not SPIR-V"},
     {"rdna2_proven_raw_x2_data_loads",
      "returns decoded instruction PCs, not SPIR-V; dynfetch_fold covers positive, branch, "
@@ -182,6 +190,9 @@ static const NotAnEmitter kNotEmitters[] = {
     {"rdna2_raw_wide_data_loads",
      "returns decoded instruction PCs, not SPIR-V; recompile_coverage covers numeric reads, "
      "overwrites, branches and no-effect instructions, and validates consuming modules"},
+    {"rdna2_raw_wave_wide_data_loads",
+     "returns original numeric-load PCs, not SPIR-V; raw-register-wide and capture tests retain "
+     "the obligation after bounded admission refuses; owned64 modules validate the consumer"},
     {"recompile_graphics_shader_cached",
      "caching wrapper; ctest shader_recompile_cache asserts its words are byte-identical to the "
      "direct emitter, which is validated here"},
@@ -725,6 +736,27 @@ int main(int argc, char** argv) {
         dump(dir, "fragment_resource_definedness_third_lod_absent", missing_lod.packet.spirv,
              "recompile_fragment_resource_packet");
         namespace special = prosper::test::fragment_special_f32;
+        namespace raw_masks = prosper::test::fragment_raw_masks;
+        for (const auto& c :
+             {raw_masks::overwritten(raw_masks::asymmetric, false, false),
+              raw_masks::overwritten(raw_masks::asymmetric, true, true), raw_masks::wqm_saved(),
+              raw_masks::saveexec_scc(false), raw_masks::not_scc(false)}) {
+            const auto packet = recompile_fragment_packet(c.packet);
+            dump(dir, ("fragment_raw_masks_" + c.name).c_str(), packet.spirv,
+                 "recompile_fragment_packet");
+        }
+        namespace mask_entry = prosper::test::fragment_mask_entry;
+        for (const auto& c : {mask_entry::exec_writer(raw_masks::asymmetric, true),
+                              mask_entry::new_scc(), mask_entry::cmpx_vcc(false),
+                              mask_entry::peer_before_exec(), mask_entry::wqm_numeric()}) {
+            const auto packet = recompile_fragment_packet(c.packet);
+            dump(dir, ("fragment_mask_entry_" + c.name).c_str(), packet.spirv,
+                 "recompile_fragment_packet");
+        }
+        const auto mask_entry_kernel =
+            recompile_fragment_packet_kernel(mask_entry::wave_input(mask_entry::cases().front()));
+        dump(dir, "fragment_mask_entry_cached_kernel", mask_entry_kernel.program.packet.spirv,
+             "recompile_fragment_packet_kernel");
         const auto wave_kernel =
             recompile_fragment_packet_kernel(prosper::test::fragment_packet_wave::packet());
         dump(dir, "fragment_packet_wave_kernel", wave_kernel.program.packet.spirv,
@@ -814,6 +846,78 @@ int main(int argc, char** argv) {
             const auto name = "fragment_packet_mbcnt_" + std::to_string(ordinal++);
             dump(dir, name.c_str(), compiled.spirv, "recompile_fragment_packet");
         }
+        for (bool width8 : {false, true})
+            for (uint32_t first : {63u, 64u}) {
+                FragmentInvocationPacket packet;
+                packet.slots_available.fill(true);
+                packet.export_enabled.fill(1);
+                packet.mask_state_available = true;
+                packet.exec_mask = first == 64u ? 0u : uint64_t(1) << first;
+                packet.sgprs = {{0u, 0x10000000u}, {1u, 0u}, {16u, UINT32_MAX}, {17u, UINT32_MAX}};
+                packet.guest_code = {0x7e280500u,
+                                     0x87148f14u,
+                                     0x8f148414u,
+                                     width8 ? 0xf40c0200u : 0xf4080200u,
+                                     0x28000010u,
+                                     0xbefe0410u,
+                                     width8 ? 0x7e02020fu : 0x7e02020bu,
+                                     0xf8001801u,
+                                     1u,
+                                     0xbf810000u};
+                FragmentPacketVgpr column;
+                column.reg = 0u;
+                for (uint32_t lane = 0; lane < 64u; ++lane) column.words[lane] = lane;
+                packet.vgprs.push_back(column);
+                PacketRawWaveWindow owner;
+                owner.load_pc = 3u;
+                owner.guest_base = 0x10000000u;
+                owner.guest_begin = owner.guest_base + 16u;
+                owner.words.resize((240u + (width8 ? 32u : 16u)) / 4u);
+                for (uint32_t word = 0; word < owner.words.size(); ++word)
+                    owner.words[word] = 0x41000000u + word;
+                packet.raw_windows.push_back(std::move(owner));
+                const auto compiled = recompile_fragment_packet(packet);
+                const auto name = "fragment_packet_owned_raw_x" + std::to_string(width8 ? 8u : 4u) +
+                                  "_first_" + std::to_string(first);
+                dump(dir, name.c_str(), compiled.spirv, "recompile_fragment_packet");
+            }
+        for (bool width8 : {false, true}) {
+            FragmentInvocationPacket packet;
+            packet.slots_available.fill(true);
+            packet.export_enabled.fill(1);
+            packet.mask_state_available = true;
+            packet.exec_mask = UINT64_MAX;
+            packet.sgprs = {{0u, 0x10000000u}, {1u, 0u}};
+            // Two visits to the SAME event/load PC with a changed current source. A cycle with
+            // no EXP is admitted; the final export is outside it. Validate this real CFG too.
+            // s40 is outside both SMEM destinations s[24:27] and s[24:31].
+            packet.guest_code = {0xbea80380u, 0x7e280501u,
+                                 0x90149714u, 0x87148314u,
+                                 0x8f148414u, width8 ? 0xf40c0600u : 0xf4080600u,
+                                 0x28000000u, 0x7e000200u | (width8 ? 31u : 27u),
+                                 0x80288128u, 0x060202ffu,
+                                 0x40800000u, 0xbf0a8228u,
+                                 0xbf85fff4u, 0xf8001801u,
+                                 0u,          0xbf810000u};
+            FragmentPacketVgpr column;
+            column.reg = 1u;
+            for (uint32_t lane = 0; lane < 64u; ++lane)
+                column.words[lane] = std::bit_cast<uint32_t>(float(lane / 8u) + 0.5f);
+            packet.vgprs.push_back(column);
+            PacketRawWaveWindow owner;
+            owner.load_pc = 5u;
+            owner.guest_base = owner.guest_begin = 0x10000000u;
+            owner.words.resize((48u + (width8 ? 32u : 16u)) / 4u, 0x3f400000u);
+            packet.raw_windows.push_back(std::move(owner));
+            const auto compiled = recompile_fragment_packet(packet);
+            const auto name =
+                "fragment_packet_owned_raw_repeated_x" + std::to_string(width8 ? 8u : 4u);
+            dump(dir, name.c_str(), compiled.spirv, "recompile_fragment_packet");
+        }
+        const auto commit = build_owned_vertex_export_commit({0u, 3u}, 64u, nullptr, {});
+        dump(dir, "owned_vertex_export_commit", commit, "build_owned_vertex_export_commit");
+        dump(dir, "owned_fragment_export_commit", build_owned_fragment_export_commit(64u, {}),
+             "build_owned_fragment_export_commit");
     }
     {
         namespace bp = prosper::test::bpermute;

@@ -223,6 +223,22 @@ std::vector<uint32_t> rdna2_owned_raw_wide_data_loads(
 std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
     const std::vector<Rdna2Inst>& instructions,
     std::vector<uint32_t>* scalar_source_pcs = nullptr);
+// A code-only certificate for a bounded wave-uniform register-offset raw numeric load.
+// It does NOT grant memory, input initialization, or guest-wave membership authority. Consumers
+// rederive this from the full original program, then require an owned logical-wave event service
+// and current immutable backing for the COMPLETE interval including the last x4/x8 component.
+struct RawWaveWideCertificate {
+    uint32_t load_pc = 0, base_sgpr = 0, offset_sgpr = 0, bytes = 0;
+    int32_t immediate = 0;
+    uint32_t offset_min = 0, offset_max = 0, alignment = 1;
+    std::vector<uint32_t> event_pcs, definition_pcs, control_pcs;
+    bool operator==(const RawWaveWideCertificate&) const = default;
+};
+std::vector<RawWaveWideCertificate>
+rdna2_raw_wave_wide_certificates(const std::vector<Rdna2Inst>& original);
+// Conservative original-code obligation, independent of bounded admission. A refused proof
+// cannot authorize stored native modules for a READFIRST-containing numeric-load program.
+std::vector<uint32_t> rdna2_raw_wave_wide_data_loads(const std::vector<Rdna2Inst>& original);
 // One-hop raw x4/x8 data loads through a pointer from an earlier proven immediate load.
 // A dispatch must additionally own the parent/child bytes and exclude writable aliases.
 std::vector<uint32_t> rdna2_proven_raw_nested_wide_data_loads(
@@ -237,6 +253,10 @@ struct RawNestedWideChain {
 };
 std::vector<RawNestedWideChain> rdna2_owned_nested_wide_chains(
     const std::vector<Rdna2Inst>& instructions);
+// One exact x2 pointer lifetime followed by a numeric x2 replacement. Runtime admission must
+// own both effective eight-byte observations, authenticate producers and exclude write aliases.
+std::vector<RawNestedWideChain>
+rdna2_owned_raw_x2_chains(const std::vector<Rdna2Inst>& instructions);
 // Refusal census only: numeric immediate x4/x8 loads whose pointer words may be written by
 // earlier code. This conservative set confers no reaching-definition or ownership authority.
 std::vector<uint32_t> rdna2_raw_nested_numeric_loads(const std::vector<Rdna2Inst>& ins);
@@ -368,6 +388,13 @@ size_t rdna2_specialize_zero_record_execz_paths(
 // S_ENDPGM, but compiler-generated PC-relative lookup tables may live immediately after the program and
 // must remain part of an owning/cache copy. The result never exceeds `dwords`.
 size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords);
+
+// Complete executable inventory for an owned original, using the compiler's proved terminating
+// arms and PC-relative data/dispatch shapes. Table bytes remain data. An unavailable decode or
+// control target refuses rather than presenting an empty ownership inventory; PCs stay original.
+bool rdna2_recompile_executable_instructions(const uint32_t* code, size_t dwords,
+                                             std::vector<Rdna2Inst>& instructions,
+                                             uint32_t& unavailable_pc);
 
 // Fixed-function PS interpolant wiring captured from SPI_PS_INPUT_CNTL_0..31. A valid entry's
 // OFFSET selects the vertex PARAM export feeding that logical PS input; OFFSET=0x20 selects the
@@ -510,13 +537,28 @@ struct FragmentPacketVgpr {
 // ConsecutiveLogicalQuads means mask nibbles [0..3], [4..7], ..., [60..63]. Unknown is valid
 // for integer operations which do not consume quad semantics; a quad consumer must refuse it.
 enum class FragmentPacketQuadTopology : uint8_t { Unknown, ConsecutiveLogicalQuads };
+// Independent exact-PC runtime window shape, never the short 4/16/32-byte snapshot marker. The
+// complete possible load interval is copied by the ordered live producer, or supplied as immutable
+// offline packet input. The compiler rederives bounds from original code and the entry base pair;
+// captured allocation identifiers/profile bits cannot authenticate this vector.
+struct PacketRawWaveWindow {
+    uint32_t load_pc = UINT32_MAX;
+    uint64_t guest_base = 0, guest_begin = 0;
+    std::vector<uint32_t> words;
+};
+enum class GraphicsPacketStage : uint8_t { Fragment, Vertex };
 struct FragmentInvocationPacket {
+    GraphicsPacketStage stage = GraphicsPacketStage::Fragment;
     std::vector<uint32_t> guest_code;
     std::vector<FragmentPacketVgpr> vgprs;
     std::vector<std::pair<uint32_t, uint32_t>> sgprs; // explicit wave-uniform scalar words
+    std::vector<PacketRawWaveWindow> raw_windows;
     std::array<bool, kFragmentPacketLanes> slots_available{};
     std::array<uint8_t, kFragmentPacketLanes> export_enabled{}; // 0/1, separate from EXEC
     bool mask_state_available = false;
+    // Separate architectural availability. The legacy bundled true means all three supplied;
+    // otherwise only explicitly available values may enter RegState. Raw zero is not presence.
+    bool exec_available = false, vcc_available = false, scc_available = false;
     uint64_t exec_mask = 0, vcc_mask = 0;
     bool scc = false;
     FragmentPacketQuadTopology quad_topology = FragmentPacketQuadTopology::Unknown;
@@ -525,8 +567,8 @@ struct FragmentInvocationPacket {
     FloatTransportConfig float_transport{};
 };
 
-// One record per static EXP, in guest-PC order, per lane. Forward-only control flow makes this
-// order unambiguous; looped/repeated exports currently refuse. Records are NOT framebuffer writes.
+// One record per static EXP, in guest-PC order, per lane. EXPs in control-flow cycles refuse;
+// repeated READFIRST/load events execute at each dynamic visit. Records are NOT framebuffer writes.
 // [reached, EXEC, export_enabled, target, EN, COMPR, DONE, VM, raw VSRC0..3]. A reached record
 // with EXEC=0 retains a discard/export-mask observation without terminating its physical worker.
 inline constexpr uint32_t kFragmentPacketExportWords = 12;
@@ -545,6 +587,7 @@ struct FragmentPacketProgram {
         bool operator==(const VgprFailureSite&) const = default;
     };
     std::vector<VgprFailureSite> vgpr_failure_sites;
+    uint8_t initial_mask_availability = 0, demanded_initial_masks = 0;
     std::string rejection;
 };
 
@@ -567,6 +610,28 @@ FragmentPacketResult decode_fragment_packet(const FragmentPacketProgram&,
 FragmentPacketProgram recompile_fragment_packet(
     const FragmentInvocationPacket& packet,
     RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Fragment, 0});
+
+// Prove every reachable architectural read has a definition for every selectable slot in the
+// original program. Neither this proof nor compiler scratch allocation changes the supplied
+// inputs: unobserved locals never become entry-value authority. The same proof runs at owned64
+// compilation as at live stage assembly. Inactive EXP payload storage is not an architectural
+// value and must never be committed; EXEC/eligibility remain independent fields.
+bool complete_graphics_packet_locals(const FragmentInvocationPacket& packet, std::string& refusal,
+                                     bool entry_flags_observed = true);
+
+// Native raster commit shell for already completed owned vertex exports. VertexIndex here names
+// a rewritten occurrence, never the guest lane/wave; guest ISA ran with its separately owned
+// original index/instance identity. Binding0 contains position followed by these complete PARAM
+// vec4s, per occurrence, then per instance. This builder grants no initialization/output authority.
+std::vector<uint32_t> build_owned_vertex_export_commit(const std::vector<uint32_t>& parameters,
+                                                       uint32_t vertices_per_instance,
+                                                       const PixelInputMapping* pixel_inputs,
+                                                       FloatTransportConfig float_transport);
+// Binding1/0 contains validated [PrimitiveId, raw FragCoord.xy, enabled, raw RGBA] records.
+// The native pass retains original raster/depth/blend order. Guest ISA has already executed;
+// lookup is commit-only and helpers never become attachment publishers.
+std::vector<uint32_t> build_owned_fragment_export_commit(uint32_t records,
+                                                         FloatTransportConfig float_transport);
 
 // Portable lowering contract for GFX10's explicit pixel-interpolation parameters. AMD hardware can
 // expose P0/P10/P20 directly to v_interp_mov; Vulkan only has an equivalent fragment extension on a

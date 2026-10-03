@@ -541,6 +541,8 @@ struct DecodedShader {
     std::vector<uint32_t> raw_owned_wide_data_load_pcs;
     std::vector<uint32_t> raw_nested_wide_data_load_pcs;
     std::vector<RawNestedWideChain> owned_nested_wide_chains;
+    std::vector<RawNestedWideChain> owned_raw_x2_chains;
+    RawSnapshotWritePlan owned_raw_x2_write_plan;
     std::vector<uint32_t> raw_nested_numeric_load_pcs;
     // Full-stream inventory: specialization may remove a spill but cannot introduce one.
     std::bitset<256> scalar_spill_written_vgprs;
