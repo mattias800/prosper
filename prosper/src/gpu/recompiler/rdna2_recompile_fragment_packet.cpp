@@ -628,13 +628,14 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
             if (pair_source && operand.kind != OperandKind::SGPR &&
                 !(operand.kind == OperandKind::Special &&
                   (operand.value == 106 || operand.value == 126)) &&
-                !(in.opcode == 0x0a && operand.kind == OperandKind::InlineInt &&
+                !((in.opcode == 0x0a || (in.opcode == kSop1OpcodeMovB64 && in.dst.value == 126)) &&
+                  operand.kind == OperandKind::InlineInt &&
                   (operand.value == 0 || operand.value == -1)))
                 return reject("packet-scalar-pair-input-invalid", in.pc);
             if (operand.kind == OperandKind::Special && operand.value != 106 &&
                 operand.value != 107 && operand.value != 126 && operand.value != 127 &&
-                operand.value != 253 && !(services && in.fmt == Rdna2Format::SMEM &&
-                    source == 1 && operand.value == 125))
+                operand.value != 253 &&
+                !(services && in.fmt == Rdna2Format::SMEM && source == 1 && operand.value == 125))
                 return reject("packet-special-input-unavailable", in.pc);
         }
     }

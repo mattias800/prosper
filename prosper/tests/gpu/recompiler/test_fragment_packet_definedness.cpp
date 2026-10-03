@@ -73,6 +73,43 @@ TEST(FragmentPacketDefinedness, ActualSourceMaskBranchPeerAndRawOutputRails) {
 }
 
 TEST(FragmentPacketDefinedness, NumericExecMaskRequiresCompleteReachingWords) {
+    // The live PS path restores all lanes before raw EXP. The shared lowering already copies
+    // these constant masks independently of old EXEC and preserves SCC; preflight must agree.
+    for (const uint32_t instruction : {0xbefe04c1u, 0xbefe0480u})
+        for (const uint64_t old_exec : {uint64_t(0), uint64_t(1) << 63})
+            for (const bool scc : {false, true}) {
+                SCOPED_TRACE(instruction);
+                SCOPED_TRACE(old_exec);
+                SCOPED_TRACE(scc);
+                auto input = f::base();
+                input.exec_mask = old_exec;
+                input.scc = scc;
+                input.export_enabled[63] = 0;
+                f::column(input, 1, 0xdeadbeefu);
+                input.guest_code = {instruction, 0xbf840001u};   // SCC0 skips the actual MOV
+                f::fp::vmov(input.guest_code, 1, 0);
+                f::fp::exp(input.guest_code, 1, 1);
+                input.guest_code.push_back(0xbf810000u);
+                const auto p = recompile_fragment_packet(input);
+                ASSERT_FALSE(p.spirv.empty()) << p.rejection;
+                const auto words =
+                    evaluate(p, "constant_exec_" + std::to_string(instruction) + "_" +
+                                    std::to_string(old_exec) + "_" + std::to_string(scc));
+                const auto result = decode_fragment_packet(p, words, true);
+                ASSERT_TRUE(result.rejection.empty()) << result.rejection;
+                const uint64_t exec = instruction == 0xbefe04c1u ? UINT64_MAX : 0;
+                auto want = f::expected(exec, scc ? 0x42230011u : 0xdeadbeefu);
+                want[63 * 12 + 2] = 0;   // full EXEC does not grant helper export eligibility
+                EXPECT_EQ(result.exports, want) << "all64 EXEC, actual vector writes and live SCC";
+            }
+    // This admits only canonical constant EXEC moves, not arbitrary pairs or pair reductions.
+    for (const uint32_t instruction : {0xbefe0481u, 0xbe9404c1u, 0xbe8c10c1u}) {
+        auto invalid = f::numeric_exec_pair(UINT64_MAX);
+        invalid.guest_code[1] = instruction;
+        const auto p = recompile_fragment_packet(invalid);
+        EXPECT_TRUE(p.spirv.empty());
+        EXPECT_EQ(p.rejection, "packet-scalar-pair-input-invalid");
+    }
     for (uint32_t absent : {20u, 21u}) {
         auto input = f::numeric_exec_pair(0);
         std::erase_if(input.sgprs, [&](const auto& word) { return word.first == absent; });
