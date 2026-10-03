@@ -1211,6 +1211,14 @@ if(TARGET prosper_core)
     SOURCES tests/hle/kernel/test_sync_delete.cpp
     LIBRARIES prosper_core)
 
+  # Deleted pthread keys drop held values silently (POSIX; FreeBSD _thread_cleanupspecific).
+  # winpthreads fired the destructor once more (#4319); k_key_delete disarms the thunk instead.
+  # DeletedKey arm discriminates on Windows, LiveKey arm is the hand-built positive control.
+  prosper_add_gtest(test_pthread_key_teardown
+    SOURCES tests/hle/kernel/test_pthread_key_teardown.cpp
+    LIBRARIES prosper_core
+    PROPERTIES TIMEOUT 60)
+
   # sceKernelGetOperationMode, the coredump-handler pair and the PRT aperture pair are registered and
   # honour their contracts (out-parameters written, slot range checked) rather than being logged-0
   # stubs.
