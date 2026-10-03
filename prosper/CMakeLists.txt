@@ -2383,6 +2383,12 @@ if(TARGET prosper_core)
   add_executable(test_guest_mapping_lease tests/hle/memory/test_guest_mapping_lease.cpp)
   target_link_libraries(test_guest_mapping_lease PRIVATE prosper_core)
   add_test(NAME guest_mapping_lease COMMAND test_guest_mapping_lease)
+
+  # MAP_FIXED direct-memory remap over an existing mapping replaces it (Windows used to refuse).
+  prosper_add_gtest(test_dmem_fixed_remap
+    SOURCES tests/hle/memory/test_dmem_fixed_remap.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
   set_tests_properties(guest_mapping_lease PROPERTIES TIMEOUT 20)
   prosper_add_gtest(test_nested_wide_data_admission
     SOURCES tests/gpu/execute/test_nested_wide_data_admission.cpp

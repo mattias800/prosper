@@ -7505,7 +7505,25 @@ static uint64_t map_dmem_impl(uint64_t addr_in_out, uint64_t len, uint64_t prot,
     uint64_t hint = addr_in_out ? *(uint64_t*)addr_in_out : 0;
     const bool fixed = (flags & 0x10) != 0;
     void* p = win_map_phys(hint, len, host_prot(prot), phys, align, fixed);
-    const DWORD map_error = p ? ERROR_SUCCESS : GetLastError();
+    DWORD map_error = p ? ERROR_SUCCESS : GetLastError();
+    // MAP_FIXED REPLACES whatever is mapped there: the kernel's mmap(MAP_FIXED) semantics (FreeBSD,
+    // which the PS5 kernel derives from) implicitly unmap the overlapped range, and the POSIX arm
+    // gets that from mmap itself. A Win32 view cannot be mapped over committed pages, so the fixed
+    // request failed with ERROR_INVALID_ADDRESS and the guest saw ENOMEM. Assassin's Creed Black
+    // Flag Resynced's allocator maps 0x630000 of direct memory, releases most of it and maps a
+    // smaller piece fixed at the same address, then aborts with "Out of memory". Only a failure
+    // over a COMMITTED tracked mapping takes this path, so reserved-range placeholders and every
+    // request that already succeeded behave exactly as before.
+    if (!p && fixed && hint && map_error == ERROR_INVALID_ADDRESS) {
+        const int state = prosper_reserved_range_state(hint);
+        if ((state == 2 || state == 3) && win_unmap(hint, len)) {
+            untrack(hint, len);
+            p = win_map_phys(hint, len, host_prot(prot), phys, align, fixed);
+            map_error = p ? ERROR_SUCCESS : GetLastError();
+            MLOG("map_dmem FIXED replace hint=0x%llx len=0x%llx -> %s\n", (unsigned long long)hint,
+                 (unsigned long long)len, p ? "ok" : "failed");
+        }
+    }
     if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx FAILED\n",
                    (unsigned long long)hint, (unsigned long long)len);
         if (fixed && hint) log_fixed_refusal(hint, map_error);
