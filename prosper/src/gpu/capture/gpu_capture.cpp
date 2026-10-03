@@ -515,20 +515,26 @@ public:
         return true;
     }
     bool restore_nested_inputs(const std::shared_ptr<ShaderResourceTable>& resources,
-                               const GpuCapturedTable& captured_table, uint32_t raw_index) {
+                               const GpuCapturedTable& captured_table, uint32_t raw_index,
+                               bool compute_x2 = false) {
         const bool marked = resources && std::any_of(resources->resources.begin(),
             resources->resources.end(), [](const auto& resource) {
                 return resource.owned_nested_snapshot_bytes != 0u;
             });
         if (raw_index >= c.raw_shader_versions.size()) {
-            if (marked) { error = "owned nested replay lacks exact raw shader provenance"; return false; }
+            if (marked) {
+                error = "owned nested replay lacks exact raw shader provenance";
+                return false;
+            }
             return true;
         }
         const auto& raw = c.raw_shader_versions[raw_index].words;
         std::vector<Rdna2Inst> decoded;
         const size_t consumed = rdna2_walk(raw.data(), raw.size(), decoded);
-        const auto chains = rdna2_owned_nested_wide_chains(decoded);
-        const auto numeric = rdna2_raw_nested_numeric_loads(decoded);
+        const auto chains = compute_x2 ? rdna2_owned_raw_x2_chains(decoded)
+                                       : rdna2_owned_nested_wide_chains(decoded);
+        const auto numeric =
+            compute_x2 ? std::vector<uint32_t>{} : rdna2_raw_nested_numeric_loads(decoded);
         if (std::any_of(numeric.begin(), numeric.end(), [&](uint32_t pc) {
                 return std::none_of(chains.begin(), chains.end(),
                     [pc](const auto& chain) { return chain.child_pc == pc; });
@@ -548,7 +554,8 @@ public:
                                           std::pair{chain.child_pc, chain.child_bytes}}) {
                 const auto [it, inserted] = widths.emplace(pc, width);
                 if (!inserted && it->second != width) {
-                    error = "owned nested replay has conflicting original widths"; return false;
+                    error = "owned nested replay has conflicting original widths";
+                    return false;
                 }
             }
         for (const auto& resource : resources->resources)
@@ -559,12 +566,16 @@ public:
             }
         for (const auto& [pc, width] : widths) {
             const auto* source = owned_nested_snapshot_at(*resources, pc, width);
-            if (!source) { error = "owned nested replay lacks exact-PC owned shape"; return false; }
+            if (!source) {
+                error = "owned nested replay lacks exact-PC owned shape";
+                return false;
+            }
             const size_t index = static_cast<size_t>(source - resources->resources.data());
             const auto& captured = captured_table.resources[index];
             if (captured.blob_index >= c.blobs.size() || captured.blob_offset != 0u ||
                 c.blobs[captured.blob_index].bytes_read < width) {
-                error = "owned nested replay exceeds actually observed bytes"; return false;
+                error = "owned nested replay exceeds actually observed bytes";
+                return false;
             }
         }
         for (const auto& chain : chains) {
@@ -574,14 +585,16 @@ public:
             std::memcpy(&pointer, parent->host_data, sizeof(pointer));
             if (child->gpu_addr < chain.child_offset ||
                 pointer != child->gpu_addr - chain.child_offset) {
-                error = "owned nested replay parent and child observations disagree"; return false;
+                error = "owned nested replay parent and child observations disagree";
+                return false;
             }
         }
         for (const auto& [pc, width] : widths) {
             auto* source = const_cast<ShaderResource*>(owned_nested_snapshot_at(*resources, pc, width));
             auto owner = std::make_shared<std::vector<uint8_t>>(source->host_data,
                                                                source->host_data + width);
-            source->host_data = owner->data(); source->host_data_size = owner->size();
+            source->host_data = owner->data();
+            source->host_data_size = owner->size();
             resources->owned_host_data.push_back(std::move(owner));
             resources->owned_nested_snapshot_requirements.emplace_back(pc, width);
         }
@@ -922,7 +935,9 @@ public:
             std::any_of(x.resources.resources.begin(), x.resources.resources.end(),
                         captured_resource_has_indirect_pointer_state);
         if (!table(x.resources, true, compute.resources)) return false;
-        if (!restore_owned_raw_inputs(compute.resources, x.resources, x.raw_shader_index)) return false;
+        if (!restore_owned_raw_inputs(compute.resources, x.resources, x.raw_shader_index) ||
+            !restore_nested_inputs(compute.resources, x.resources, x.raw_shader_index, true))
+            return false;
         const bool has_cf9200_no_backing =
             captured_compute_has_gta5_cf9200_no_backing(x);
         if (has_cf9200_no_backing &&

@@ -1252,7 +1252,7 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         for (const auto& captured : table.resources) {
             const auto& resource = captured.resource;
             const uint32_t width = resource.owned_nested_snapshot_bytes;
-            if (width && ((width != 16u && width != 32u) ||
+            if (width && ((width != 8u && width != 16u && width != 32u) ||
                           !valid_owned_raw_snapshot_shape(resource, width) ||
                           captured.captured_size < width)) {
                 error = "invalid owned nested snapshot obligation";

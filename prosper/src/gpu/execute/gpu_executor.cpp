@@ -9,6 +9,7 @@
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/compute_program_facts.hpp"
+#include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: skipped-dispatches, shader-compile alarms
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
@@ -55,6 +56,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -1038,6 +1040,10 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         result->raw_nested_wide_data_load_pcs =
             rdna2_proven_raw_nested_wide_data_loads(decoded);
         result->owned_nested_wide_chains = rdna2_owned_nested_wide_chains(decoded);
+        result->owned_raw_x2_chains = rdna2_owned_raw_x2_chains(decoded);
+        if (!result->owned_raw_x2_chains.empty())
+            result->owned_raw_x2_write_plan =
+                raw_snapshot_write_plan(decoded, result->owned_raw_x2_chains);
         result->raw_nested_numeric_load_pcs = rdna2_raw_nested_numeric_loads(decoded);
         retain_fold_instructions(decoded, result->instructions);
         std::vector<Rdna2Inst> shader_constant_decoded = decoded;
@@ -1052,20 +1058,25 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                 result->shader_constant_control_plan =
                     build_fold_control_plan(result->shader_constant_instructions);
         }
-        result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
-                        static_cast<uint64_t>(result->instructions.size() +
-                                              result->shader_constant_instructions.size()) *
-                            sizeof(Rdna2Inst) + sizeof(result->scalar_spill_written_vgprs) +
-                        result->control_plan.allocated_bytes() +
-                        result->shader_constant_control_plan.allocated_bytes() +
-                        (result->raw_x2_data_load_pcs.capacity() +
-                         result->raw_immediate_wide_data_load_pcs.capacity() +
-                         result->raw_register_wide_data_load_pcs.capacity() +
-                         result->raw_offset_scalar_source_pcs.capacity() +
-                         result->raw_owned_wide_data_load_pcs.capacity() +
-                         result->raw_nested_wide_data_load_pcs.capacity() +
-                         result->raw_nested_numeric_load_pcs.capacity()) * sizeof(uint32_t) +
-                        result->owned_nested_wide_chains.capacity() * sizeof(RawNestedWideChain);
+        result->bytes =
+            static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
+            static_cast<uint64_t>(result->instructions.size() +
+                                  result->shader_constant_instructions.size()) *
+                sizeof(Rdna2Inst) +
+            sizeof(result->scalar_spill_written_vgprs) + result->control_plan.allocated_bytes() +
+            result->shader_constant_control_plan.allocated_bytes() +
+            (result->raw_x2_data_load_pcs.capacity() +
+             result->raw_immediate_wide_data_load_pcs.capacity() +
+             result->raw_register_wide_data_load_pcs.capacity() +
+             result->raw_offset_scalar_source_pcs.capacity() +
+             result->raw_owned_wide_data_load_pcs.capacity() +
+             result->raw_nested_wide_data_load_pcs.capacity() +
+             result->raw_nested_numeric_load_pcs.capacity() +
+             result->owned_raw_x2_write_plan.descriptor_pcs.capacity() +
+             result->owned_raw_x2_write_plan.storage_write_pcs.capacity()) *
+                sizeof(uint32_t) +
+            (result->owned_nested_wide_chains.capacity() + result->owned_raw_x2_chains.capacity()) *
+                sizeof(RawNestedWideChain);
         return result;
     };
 
@@ -1529,6 +1540,17 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
                             : UINT32_MAX;
                     }
                 }
+                if (stage == ShaderProgramStage::Compute && scalar_source_proof)
+                    for (const auto& chain : scalar_source_proof->owned_raw_x2_chains) {
+                        if (resource.fetch_pc != chain.parent_pc &&
+                            resource.fetch_pc != chain.child_pc)
+                            continue;
+                        compiled.owned_nested_snapshot_bytes =
+                            owned_nested_snapshot_at(*resources, chain.parent_pc, 8u) &&
+                                    owned_nested_snapshot_at(*resources, chain.child_pc, 8u)
+                                ? 8u
+                                : UINT32_MAX;
+                    }
                 if (resource.owned_nested_snapshot_bytes && !compiled.owned_nested_snapshot_bytes)
                     compiled.owned_nested_snapshot_bytes = UINT32_MAX;
             }
@@ -6325,18 +6347,16 @@ bool shader_resource_allows_zero_mip_specialization(
         !descriptor.compression_enabled;
 }
 
-std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
-                                                 const uint32_t* code, size_t dwords,
-                                                 const uint32_t* user_sgprs, uint32_t nsgpr,
-                                                 uint32_t linear_local_x,
-                                                 uint32_t linear_threads_x,
-                                                 uint32_t tgid_x_sgpr,
-                                                 const ComputeResourceDispatchContext*
-                                                     dispatch_context) {
+// NOLINTNEXTLINE(readability-function-size): Existing resource realization body; adds a fold-reader seam.
+std::vector<SrtUse> add_compute_buffer_resources(
+    ShaderResourceTable& table, const uint32_t* code, size_t dwords, const uint32_t* user_sgprs,
+    uint32_t nsgpr, uint32_t linear_local_x, uint32_t linear_threads_x, uint32_t tgid_x_sgpr,
+    const ComputeResourceDispatchContext* dispatch_context, FoldReader* reader) {
     set_owned_raw_snapshot_requirements(table, code, dwords);
     std::vector<SrtUse> srt_uses;
-    const std::vector<DynFetch> direct_fetches = resolve_dynamic_fetch(
-        code, dwords, user_sgprs, nsgpr, /*user_sgpr_base*/0, &srt_uses);
+    const std::vector<DynFetch> direct_fetches =
+        resolve_dynamic_fetch(code, dwords, user_sgprs, nsgpr, /*user_sgpr_base*/ 0, &srt_uses,
+                              UINT32_MAX, nullptr, nullptr, 0u, reader);
 
     // A format-load resource has one identity: the descriptor live at its exact instruction pc.
     // Keep its original base because the compute ConstantBuffer address path applies the MUBUF
@@ -8446,10 +8466,12 @@ uint64_t compute_dispatch_code_addr(const GpuState& submit, const GpuState::Disp
            (static_cast<uint64_t>(reg(P::COMPUTE_PGM_HI) & 0xffu) << 40);
 }
 
-std::vector<ComputeItem> realize_compute_dispatches(
-    const GpuState& st, uint64_t submit_no,
-    std::vector<OperationRealizationFailure>* failures,
-    std::unique_ptr<GuestMappingLease>* mapping_lease) {
+std::vector<ComputeItem>
+// NOLINTNEXTLINE(readability-function-size): Existing dispatch realization body; adds owned readpoint context.
+realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
+                           std::vector<OperationRealizationFailure>* failures,
+                           std::unique_ptr<GuestMappingLease>* mapping_lease,
+                           const GraphicsRawSnapshotContext* raw_context) {
     if (failures) failures->clear();
     if (st.dispatches.empty()) return {};
     namespace P = prosper::agc::Pm4;
@@ -8521,15 +8543,16 @@ std::vector<ComputeItem> realize_compute_dispatches(
             continue;
         }
         const size_t shader_dwords = registered_shader_dwords(*header, code_addr);
-        if (mapping_lease && shader_dwords &&
-            !decode_shader_cached(reinterpret_cast<const uint32_t*>(
-                                      static_cast<uintptr_t>(code_addr)), shader_dwords)
-                 ->raw_nested_wide_data_load_pcs.empty()) {
-            // Decode is exact-byte validated and reused by the fold below. Ordinary compute
-            // dispatches do not hold a lease across their Vulkan wait. A newly nested fold
-            // after code mutation has no lease and therefore cannot gain admission.
+        const auto raw_source =
+            shader_dwords
+                ? decode_shader_cached(reinterpret_cast<const uint32_t*>(uintptr_t(code_addr)),
+                                       shader_dwords)
+                : nullptr;
+        if (mapping_lease && raw_source &&
+            (!raw_source->raw_nested_wide_data_load_pcs.empty() ||
+             !raw_source->owned_raw_x2_chains.empty()))
             *mapping_lease = std::make_unique<GuestMappingLease>();
-        }
+        std::unique_ptr<GraphicsNestedWideReader> raw_x2_reader;
 
         uint32_t range_start = 0;
         if (header->specials && guest_readable((uint64_t)(uintptr_t)header->specials,
@@ -8544,6 +8567,21 @@ std::vector<ComputeItem> realize_compute_dispatches(
         auto field = [&](uint32_t shift, uint32_t mask) { return (rsrc2 >> shift) & mask; };
         const uint32_t user_count = field(P::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT,
                                           P::COMPUTE_PGM_RSRC2_USER_SGPR_MASK);
+        // PM4 storage past the declared user block is not a hardware entry value. Keep exact-PC
+        // ownership on refusal, so padded/stale SH words cannot acquire a nested snapshot.
+        if (raw_source && !raw_source->owned_raw_x2_chains.empty()) {
+            raw_x2_reader = std::make_unique<GraphicsNestedWideReader>(
+                raw_source->owned_raw_x2_chains,
+                mapping_lease && *mapping_lease &&
+                        raw_source->owned_raw_x2_write_plan.required_user_words <=
+                            std::min(user_count, kUserSgprs)
+                    ? raw_context
+                    : nullptr,
+                mapping_lease ? mapping_lease->get() : nullptr);
+            raw_x2_reader->branch_exclusive_disabled =
+                // NOLINTNEXTLINE(concurrency-mt-unsafe): Existing helper samples per submit; environment arms occur between submissions.
+                PROSPER_ENV_ON_PER_SUBMIT("PROSPER_NO_BRANCH_EXCLUSIVE");
+        }
         const uint32_t compute_wave_size = ((dispatch.modifier >>
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) ? 32u : 64u;
@@ -8604,13 +8642,12 @@ std::vector<ComputeItem> realize_compute_dispatches(
                       P::COMPUTE_PGM_RSRC2_TIDIG_COMP_CNT_MASK),
             };
             compute_srt_uses = add_compute_buffer_resources(
-                *table, (const uint32_t*)(uintptr_t)code_addr, shader_dwords,
-                sgprs, fold_user_count,
-                launch.local_x, launch.threads_x,
+                *table, (const uint32_t*)(uintptr_t)code_addr, shader_dwords, sgprs,
+                fold_user_count, launch.local_x, launch.threads_x,
                 linear_store_proof_context ? user_count : UINT32_MAX,
                 // #3656: the nullable-output proof compares the launch extent with a guest-supplied
                 // record count. With the counts unresolved there is nothing to compare.
-                dispatch.indirect ? nullptr : &resource_dispatch_context);
+                dispatch.indirect ? nullptr : &resource_dispatch_context, raw_x2_reader.get());
             const auto& srt_uses = compute_srt_uses;
             std::set<uint64_t> srt_seen;
             for (const auto& u : srt_uses) {
@@ -8825,6 +8862,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
             // The fold already resolved each child's exact current pointer. Only the ordered
             // live path carries a mapping lease; offline realization remains fail-closed. The
             // admission helper freezes parent/child bytes and rejects any possible write alias.
+            if (raw_x2_reader)
+                (void)raw_x2_reader->publish_compute_x2(*table, raw_source->owned_raw_x2_write_plan,
+                                                        compute_srt_uses);
             (void)admit_compute_nested_wide_data(
                 mapping_lease ? mapping_lease->get() : nullptr,
                 facts->decoded, compute_srt_uses, *table);
@@ -10813,11 +10853,12 @@ bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, floa
 
 enum class RetainedComputeRealization : uint8_t { Realized, Failed };
 
-RetainedComputeRealization realize_retained_compute(
-        const GpuState& st, size_t index, const GpuState::Dispatch& resolved_dispatch,
-        uint64_t submit_no, ComputeItem& item,
-        OperationRealizationFailure* failure = nullptr,
-        std::unique_ptr<GuestMappingLease>* mapping_lease = nullptr) {
+RetainedComputeRealization
+realize_retained_compute(const GpuState& st, size_t index,
+                         const GpuState::Dispatch& resolved_dispatch, uint64_t submit_no,
+                         ComputeItem& item, OperationRealizationFailure* failure = nullptr,
+                         std::unique_ptr<GuestMappingLease>* mapping_lease = nullptr,
+                         const GraphicsRawSnapshotContext* raw_context = nullptr) {
     if (index >= st.dispatches.size()) return RetainedComputeRealization::Failed;
     // DMA-bearing submits are uncommon. A one-dispatch state keeps the mature realization path
     // intact while ensuring it runs only after every preceding ordered producer has landed.
@@ -10826,7 +10867,7 @@ RetainedComputeRealization realize_retained_compute(
     one.dispatches.push_back(resolved_dispatch);
     std::vector<OperationRealizationFailure> failures;
     std::vector<ComputeItem> realized = realize_compute_dispatches(
-        one, submit_no, failure ? &failures : nullptr, mapping_lease);
+        one, submit_no, failure ? &failures : nullptr, mapping_lease, raw_context);
     if (realized.empty()) {
         if (failure && !failures.empty()) {
             *failure = std::move(failures.front());
@@ -11844,6 +11885,12 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 // lease local to the ordered dispatch, so unrelated draws, DMA and presentation
                 // do not hold it. Byte stores and lazy faults have separate admission checks.
                 std::unique_ptr<GuestMappingLease> mapping_lease;
+                const auto completed = graphics_producer_status();
+                const GraphicsRawSnapshotContext raw_context{
+                    !defer_graphics_wait && producer_epoch_ok && graphics_epoch_ok &&
+                        indirect_dependencies_ok && graphics_epoch.known && completed.known &&
+                        !completed.pending && graphics_epoch.failures == completed.failures,
+                    {}};
                 RetainedComputeRealization realization = RetainedComputeRealization::Failed;
                 // #3656: try the device-resolved route first. Realization happens here, with the
                 // counts unknown, and is kept only if it proves launch-free; otherwise everything
@@ -11859,7 +11906,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                             interactive_capture_bundle_active())) {
                     realization = realize_retained_compute(
                         st, operation.index, st.dispatches[operation.index], submit_no, item,
-                        nullptr, defer_graphics_wait ? nullptr : &mapping_lease);
+                        nullptr, defer_graphics_wait ? nullptr : &mapping_lease, &raw_context);
                     if (realization == RetainedComputeRealization::Realized &&
                         gpu_indirect_dispatch_launch_free(item) &&
                         !gpu_indirect_dispatch_args_alias_resource(item)) {
@@ -11946,7 +11993,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         // bridge establishes backend ordering, but a CPU snapshot taken during
                         // realization bypasses that bridge. Keep this opt-in mode on the existing
                         // unresolved path until such a snapshot can await the precise producer.
-                        defer_graphics_wait ? nullptr : &mapping_lease);
+                        defer_graphics_wait ? nullptr : &mapping_lease, &raw_context);
                 if (realization == RetainedComputeRealization::Realized) {
                     // `resolved_dispatch.indirect` is false after its argument dwords were read.
                     // Preserve the source form beside the resolved dimensions for bounded F8

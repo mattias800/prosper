@@ -417,6 +417,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     const auto original_raw_nested_wide_data =
         rdna2_proven_raw_nested_wide_data_loads(ins);
     const auto original_owned_raw_wide_data = rdna2_owned_raw_wide_data_loads(ins);
+    const auto original_owned_raw_x2 = rdna2_owned_raw_x2_chains(ins);
     // This shell publishes register state after the structured region, so both terminal arms can
     // converge in the host SPIR-V without inventing further guest execution. Graphics exports keep
     // separate side-effect bookkeeping and remain on the conservative reject path for this shape.
@@ -445,6 +446,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     seed_smem_pointer_provenance(rs, ins);   // SRT pointer-load provenance (#3616)
+    if (!retain_original_owned_raw_x2_proof(rs, original_owned_raw_x2)) return {};
     if (!retain_original_owned_raw_wide_proof(rs, original_owned_raw_wide_data)) return {};
     rs.smem_raw_x2_data_loads.insert(original_raw_x2_data.begin(),
                                      original_raw_x2_data.end());
@@ -679,6 +681,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const auto original_raw_nested_wide_data =
         rdna2_proven_raw_nested_wide_data_loads(ins);
     const auto original_owned_raw_wide_data = rdna2_owned_raw_wide_data_loads(ins);
+    const auto original_owned_raw_x2 = rdna2_owned_raw_x2_chains(ins);
     // A dispatch-scoped proven-null BVH can collapse an exact no-hit exit and fully matched empty-stack
     // traversal cycle before generic shader-byte constant folding. Resource identity (including null
     // marker + fetch PC) is already part of the compute module cache key, so a later non-null dispatch
@@ -897,6 +900,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     rs.scc = b.bfalse();
     rs.exec = b.btrue();
     seed_smem_pointer_provenance(rs, ins);   // SRT pointer-load provenance (#3616)
+    if (!retain_original_owned_raw_x2_proof(rs, original_owned_raw_x2)) return {};
     if (!retain_original_owned_raw_wide_proof(rs, original_owned_raw_wide_data)) {
         log_recompile_diagnostic(diagnostic, "compute-recompile-reject", "terminal",
                                  "specialization lacks original owned raw wide source authority");

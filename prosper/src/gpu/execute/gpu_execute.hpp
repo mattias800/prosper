@@ -417,14 +417,11 @@ struct ComputeResourceDispatchContext {
     uint32_t tidig_comp_cnt = 0;
 };
 
-std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
-                                                 const uint32_t* code, size_t dwords,
-                                                 const uint32_t* user_sgprs, uint32_t nsgpr,
-                                                 uint32_t linear_local_x = 0,
-                                                 uint32_t linear_threads_x = 0,
-                                                 uint32_t tgid_x_sgpr = UINT32_MAX,
-                                                 const ComputeResourceDispatchContext*
-                                                     dispatch_context = nullptr);
+std::vector<SrtUse> add_compute_buffer_resources(
+    ShaderResourceTable& table, const uint32_t* code, size_t dwords, const uint32_t* user_sgprs,
+    uint32_t nsgpr, uint32_t linear_local_x = 0, uint32_t linear_threads_x = 0,
+    uint32_t tgid_x_sgpr = UINT32_MAX,
+    const ComputeResourceDispatchContext* dispatch_context = nullptr, FoldReader* reader = nullptr);
 
 // Called after a live dispatch's exact resources are built, under its HLE mapping lease. On
 // success, binds owned parent/child snapshots for structurally proven one-hop raw data loads.
@@ -1617,10 +1614,11 @@ using LiveTargetByteRangeReaderFn = std::function<LiveTargetByteReadResult(
 void set_live_target_byte_range_reader(LiveTargetByteRangeReaderFn fn);
 LiveTargetByteReadResult read_live_render_target_bytes(uint64_t gpu_addr, uint32_t bytes,
                                                        std::vector<uint8_t>& output);
-std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st,
-                                                     uint64_t submit_no = 0,
-                                                     std::vector<OperationRealizationFailure>* failures = nullptr,
-                                                     std::unique_ptr<prosper::GuestMappingLease>* mapping_lease = nullptr);
+std::vector<ComputeItem>
+realize_compute_dispatches(const GpuState& st, uint64_t submit_no = 0,
+                           std::vector<OperationRealizationFailure>* failures = nullptr,
+                           std::unique_ptr<prosper::GuestMappingLease>* mapping_lease = nullptr,
+                           const GraphicsRawSnapshotContext* raw_context = nullptr);
 // Execute retained dispatches and address-backed DMA copies in PM4 order when graphics rendering is
 // intentionally skipped or unavailable. Draw operations are omitted, but still delimit ordering.
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no = 0);

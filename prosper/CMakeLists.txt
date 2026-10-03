@@ -2750,6 +2750,9 @@ if(TARGET prosper_core)
     tests/gpu/recompiler/test_raw_wide_mask_lifetime.cpp)
   target_link_libraries(test_raw_wide_mask_lifetime PRIVATE prosper_core)
   add_test(NAME raw_wide_mask_lifetime COMMAND test_raw_wide_mask_lifetime)
+  prosper_add_gtest(test_owned_raw_x2
+    SOURCES tests/gpu/execute/test_owned_raw_x2.cpp
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_raw_wide_read_point
     SOURCES tests/gpu/recompiler/test_raw_wide_read_point.cpp
     LIBRARIES prosper_core)
@@ -4391,6 +4394,10 @@ endif()
       set_tests_properties(scalar_ff1_b32_exec PROPERTIES TIMEOUT 120)
       prosper_add_gtest(test_raw_register_wide_exec
         SOURCES tests/gpu/execute/test_raw_register_wide_exec.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+      prosper_add_gtest(test_owned_raw_x2_exec
+        SOURCES tests/gpu/execute/test_owned_raw_x2_exec.cpp
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
       prosper_add_gtest(test_memory_fed_raw_wide_exec

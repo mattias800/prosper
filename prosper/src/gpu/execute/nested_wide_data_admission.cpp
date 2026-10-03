@@ -13,27 +13,16 @@
 #include <memory>
 #include <set>
 #include <vector>
+#include <utility>
 
 namespace prosper::gpu {
 namespace {
 struct Range { uint64_t address, bytes; };
 
 bool exact_storage_write_range(const ShaderResource& r, Range& out) {
-    // One uncompressed, single-level 2D image. Its declared linear size can be smaller than
-    // tiled backing; use the same physical extent as the backend's image staging/writeback.
-    if (r.cls != ResourceClass::StorageImage || !r.gpu_addr || !r.width || !r.height ||
-        r.width > 16384 || r.height > 16384 || r.depth != 1 || r.img_dim != 1 ||
-        r.sample_count != 1 || r.declared_mip_levels != 1 || r.in_mip_tail ||
-        r.metadata_addr || r.compression_enabled || r.write_compress_enabled ||
-        !tile_mode_is_tiled(r.tile_mode)) return false;
-    const uint64_t bpe = static_cast<uint64_t>(data_format_bytes(r.format)) *
-                         r.num_components;
-    const uint64_t logical = static_cast<uint64_t>(r.width) * r.height * bpe;
-    if (!bpe || bpe > 16 || logical != r.size) return false;
-    const size_t physical = tiled_surface_bytes(r.width, r.height, r.tile_mode, 0,
-                                                static_cast<uint32_t>(bpe));
-    if (!physical || physical > UINT32_MAX || r.gpu_addr > UINT64_MAX - physical) return false;
-    out = {r.gpu_addr, physical};
+    uint64_t bytes = 0;
+    if (!raw_snapshot_storage_extent(r, bytes)) return false;
+    out = {r.gpu_addr, bytes};
     return true;
 }
 
@@ -740,7 +729,9 @@ bool prepare_owned_fragment_export_commit(const GraphicsWaveStagePlan& plan,
 }
 
 GraphicsNestedWideReader::GraphicsNestedWideReader(std::vector<RawNestedWideChain> chains,
-        const GraphicsRawSnapshotContext* context) : chains_(std::move(chains)) {
+                                                   const GraphicsRawSnapshotContext* context,
+                                                   const GuestMappingLease* borrowed_lease)
+    : chains_(std::move(chains)) {
     allowed_ = context && context->producers_complete && !chains_.empty();
     if (context) output_allocations_ = context->output_allocations;
     for (const auto& chain : chains_) {
@@ -750,7 +741,10 @@ GraphicsNestedWideReader::GraphicsNestedWideReader(std::vector<RawNestedWideChai
             if (!inserted && it->second != bytes) allowed_ = false;
         }
     }
-    if (allowed_) lease_ = std::make_unique<GuestMappingLease>();
+    if (allowed_) {
+        if (!borrowed_lease) owned_lease_ = std::make_unique<GuestMappingLease>();
+        lease_ = borrowed_lease ? borrowed_lease : owned_lease_.get();
+    }
 }
 
 bool GraphicsNestedWideReader::probe(FoldProbe kind, uint32_t pc, uint64_t address,
