@@ -2558,15 +2558,22 @@ if(TARGET prosper_core)
   # PROSPER_GPU_BREADCRUMBS core + emitter against recording Vulkan entry points. No device: stock
   # lavapipe exposes neither marker extension, so what this proves is the emitter/resolver contract,
   # not that a real driver executes the writes before a hang (a local run, recorded in the PR).
+  # Both tests include <vulkan/vulkan.h> through their headers, so they need Vulkan: MinGW and macOS
+  # runners have no Vulkan headers and failed to compile them when this was unconditional.
+  if(NOT TARGET Vulkan::Vulkan)
+    find_package(Vulkan QUIET)
+  endif()
+  if(TARGET Vulkan::Vulkan)
   add_executable(test_gpu_breadcrumbs tests/gpu/diagnostics/test_gpu_breadcrumbs.cpp)
-  target_link_libraries(test_gpu_breadcrumbs PRIVATE prosper_core)
+  target_link_libraries(test_gpu_breadcrumbs PRIVATE prosper_core Vulkan::Vulkan)
   add_test(NAME gpu_breadcrumbs COMMAND test_gpu_breadcrumbs)
 
   # PROSPER_GPU_LABELS: the label text, colour class and begin/end pairing, against recording
   # debug-utils entry points. What a capture tool DISPLAYS of them is a local look, not a ctest.
   add_executable(test_gpu_labels tests/gpu/diagnostics/test_gpu_labels.cpp)
-  target_link_libraries(test_gpu_labels PRIVATE prosper_core)
+  target_link_libraries(test_gpu_labels PRIVATE prosper_core Vulkan::Vulkan)
   add_test(NAME gpu_labels COMMAND test_gpu_labels)
+  endif()
 
   prosper_add_gtest(test_gpu_memory_budget
     SOURCES tests/gpu/diagnostics/test_gpu_memory_budget.cpp
@@ -4160,10 +4167,10 @@ endif()
       # Registered in BOTH the UNIX and WIN32 branches, like the compute-backend tests above:
       # live_target_format.hpp includes <vulkan/vulkan.h>, so it needs an if(Vulkan_FOUND) scope,
       # and this file has one per platform.
-      add_executable(test_live_target_format_match tests/gpu/test_live_target_format_match.cpp)
-      target_link_libraries(test_live_target_format_match PRIVATE prosper_core Vulkan::Vulkan)
-      target_include_directories(test_live_target_format_match PRIVATE frontends src)
-      add_test(NAME live_target_format_match COMMAND test_live_target_format_match)
+      prosper_add_gtest(test_live_target_format_match
+        SOURCES tests/gpu/test_live_target_format_match.cpp
+        INCLUDES frontends src
+        LIBRARIES prosper_core Vulkan::Vulkan)
       # Armed from the ENVIRONMENT rather than by a setenv inside the test. The persistent-target
       # opt-out is read through PROSPER_ENV_VALUE, which caches, so arming it from inside the process
       # is exactly the vacuous-arm defect cached_env_arming_logic exists to catch; and the selector
@@ -5853,7 +5860,7 @@ if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
   prosper_add_gtest(test_fragment_resource_packet_exec
     SOURCES tests/gpu/execute/test_fragment_resource_packet_exec.cpp
     INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
-    PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION "[[]  SKIPPED []]")
+    PROPERTIES TIMEOUT 120 SKIP_REGULAR_EXPRESSION ".  SKIPPED ")
   prosper_add_gtest(test_fragment_special_f32_exec
     SOURCES tests/gpu/execute/test_fragment_special_f32_exec.cpp
     INCLUDES tests LIBRARIES prosper_core Vulkan::Vulkan
