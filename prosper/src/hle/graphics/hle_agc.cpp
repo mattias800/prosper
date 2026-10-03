@@ -1719,7 +1719,7 @@ HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
     // pipeline whose processed-flag [+0x1a0]==0, consults its GPU companion [+0x140] to decide keep-vs-
     // release — and ours is null. The companion is built eagerly on a normal PS5 path (writers in the
     // eboot 0xb3xxxx GfxDevice module); the fix is to make that companion get built (an AGC/GPU-resource
-    // gap), NOT to surface semantics. See docs/games/messenger/GFXDEVICE_BRINGUP_PROBLEM.md §"2026-07-05 correction".
+    // gap), NOT to surface semantics. See docs/archive/GFXDEVICE_BRINGUP_PROBLEM.md §"2026-07-05 correction".
     if (getenv("PROSPER_PIPETRACE")) {
         fprintf(stderr, "  [sem] type=%u num_in=%u num_out=%u in_sem=%p out_sem=%p\n",
                 h->type, h->num_input_semantics, h->num_output_semantics,
