@@ -201,6 +201,22 @@ TEST_F(OrderedGraphicsReadPointTest, CleanOrderedSourceOwnsExactBytes) {
     inspect([&](const DrawItem& item) {
         ASSERT_TRUE(item.ordered_read_point);
         EXPECT_NE(item.ordered_read_point->identity(), 0u);
+        const auto ctx = context(item.ordered_read_point);
+        GpuState state;
+        state.sh[P::SPI_SHADER_USER_DATA_PS_0] = uint32_t(parent);
+        state.sh[P::SPI_SHADER_USER_DATA_PS_0 + 1] = uint32_t(parent >> 32u);
+        state.sh[P::SPI_SHADER_PGM_RSRC2_PS] = 2u << P::SPI_SHADER_PGM_RSRC2_PS_USER_SGPR_SHIFT;
+        const auto materialized =
+            build_stage_table(state, item.fs_guest_addr, true, 3, Order, &ctx);
+        ASSERT_TRUE(materialized);
+        ASSERT_EQ(materialized->owned_nested_snapshot_requirements,
+                  (std::vector<std::pair<uint32_t, uint32_t>>{{0, 16}, {2, 16}}));
+        const auto* numeric = materialized->by_fetch_pc(2);
+        ASSERT_TRUE(numeric);
+        ASSERT_NE(numeric->host_data, nullptr);
+        ASSERT_EQ(numeric->host_data_size, sizeof(Values));
+        EXPECT_EQ(std::memcmp(numeric->host_data, Values.data(), sizeof(Values)), 0)
+            << "The actual normal checked stage materializer consumed the issued source owner";
         auto checked = reader(context(item.ordered_read_point));
         ASSERT_TRUE(checked->probe(FoldProbe::Raw, 0, parent, 16));
         ASSERT_TRUE(checked->probe(FoldProbe::Raw, 2, child + 16, 16));
