@@ -61,41 +61,52 @@ const ShaderResource* unique_pc(const ShaderResourceTable& table, uint32_t pc) {
 bool GraphicsNestedWideReader::publish_compute_x2(ShaderResourceTable& table,
                                                   const RawSnapshotWritePlan& plan,
                                                   const std::vector<SrtUse>& uses) const {
-    table.owned_nested_snapshot_requirements.assign(widths_.begin(), widths_.end());
-    if (!allowed_ || !lease_ || observations_.size() != widths_.size() || !plan.complete)
+    if (diagnostic_) diagnostic_->published = false;
+    const auto reject = [&](RawSnapshotGate gate, uint32_t pc = UINT32_MAX, uint64_t address = 0,
+                            uint32_t bytes = 0, uint64_t other = 0) {
+        if (diagnostic_) diagnostic_->refuse(gate, pc, address, bytes, other);
         return false;
+    };
+    table.owned_nested_snapshot_requirements.assign(widths_.begin(), widths_.end());
+    if (!allowed_ || !lease_ || observations_.size() != widths_.size())
+        return reject(RawSnapshotGate::MissingObservation);
+    if (!plan.complete) return reject(RawSnapshotGate::WritePlanIncomplete);
     std::vector<std::pair<uint64_t, uint64_t>> writes;
     std::vector<std::pair<uint64_t, uint64_t>> sources;
     for (const auto& [pc, observation] : observations_) {
-        if (widths_.at(pc) != 8u) return false;
+        if (widths_.at(pc) != 8u) return reject(RawSnapshotGate::ProbeShape, pc);
         sources.emplace_back(observation.address, 8u);
     }
     for (uint32_t pc : plan.descriptor_pcs) {
         const SrtUse* descriptor = nullptr;
         for (const auto& u : uses)
             if (u.kind == 0 && u.use_pc == pc) {
-                if (descriptor) return false;
+                if (descriptor) return reject(RawSnapshotGate::DescriptorMissingOrAmbiguous, pc);
                 descriptor = &u;
             }
-        if (!descriptor || !descriptor->descriptor_source_addr ||
-            descriptor->descriptor_source_addr > UINT64_MAX - 32u ||
-            !guest_memory_direct_range_fault_safe(*lease_, descriptor->descriptor_source_addr,
-                                                  32u) ||
-            !guest_readable(descriptor->descriptor_source_addr, 32u) ||
-            !graphics_raw_source_is_guest_current(*lease_, descriptor->descriptor_source_addr,
-                                                  32u) ||
-            std::memcmp(
-                reinterpret_cast<const void*>(uintptr_t(descriptor->descriptor_source_addr)),
-                descriptor->t8.data(), 32u) != 0)
-            return false;
+        if (!descriptor) return reject(RawSnapshotGate::DescriptorMissingOrAmbiguous, pc);
+        const uint64_t address = descriptor->descriptor_source_addr;
+        if (!address || address > UINT64_MAX - 32u)
+            return reject(RawSnapshotGate::DescriptorSourceInvalid, pc, address, 32u);
+        if (!guest_memory_direct_range_fault_safe(*lease_, address, 32u))
+            return reject(RawSnapshotGate::DescriptorFaultUnsafe, pc, address, 32u);
+        if (!guest_readable(address, 32u))
+            return reject(RawSnapshotGate::DescriptorUnreadable, pc, address, 32u);
+        if (!graphics_raw_source_is_guest_current(*lease_, address, 32u))
+            return reject(RawSnapshotGate::DescriptorCurrentUnproved, pc, address, 32u);
+        if (std::memcmp(reinterpret_cast<const void*>(uintptr_t(address)), descriptor->t8.data(),
+                        32u) != 0)
+            return reject(RawSnapshotGate::DescriptorChanged, pc, address, 32u);
         sources.emplace_back(descriptor->descriptor_source_addr, 32u);
     }
     for (uint32_t pc : plan.storage_write_pcs) {
         const auto* output = unique_pc(table, pc);
         uint64_t extent = 0;
-        if (!output || !raw_snapshot_storage_extent(*output, extent) ||
-            !guest_memory_direct_range_fault_safe(*lease_, output->gpu_addr, extent))
-            return false;
+        if (!output) return reject(RawSnapshotGate::OutputMissing, pc);
+        if (!raw_snapshot_storage_extent(*output, extent))
+            return reject(RawSnapshotGate::OutputExtentUnproved, pc, output->gpu_addr);
+        if (!guest_memory_direct_range_fault_safe(*lease_, output->gpu_addr, extent))
+            return reject(RawSnapshotGate::OutputFaultUnsafe, pc, output->gpu_addr);
         writes.emplace_back(output->gpu_addr, extent);
     }
     for (const auto& source : sources)
@@ -103,7 +114,8 @@ bool GraphicsNestedWideReader::publish_compute_x2(ShaderResourceTable& table,
             if (guest_memory_topology_relation(source.first, source.second, write.first,
                                                write.second) !=
                 GuestMemoryTopologyRelation::Disjoint)
-                return false;
+                return reject(RawSnapshotGate::PhysicalNotDisjoint, UINT32_MAX, source.first,
+                              static_cast<uint32_t>(source.second), write.first);
     return publish(table); // exact parent equation and transactional same-owner publication
 }
 } // namespace prosper::gpu

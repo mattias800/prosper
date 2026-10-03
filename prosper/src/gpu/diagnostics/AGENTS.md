@@ -34,6 +34,9 @@ The fourth default-path entry is `fence_build_journal`: it samples a label at pa
 time and retains diagnostic metadata. It does not validate or complete a guest fence.
 
 - `diagnostic_selectors` — choosing what to observe.
+- `raw_snapshot_diagnostic` — opt-in, bounded first-refusal observations from the actual owned
+  reader and compute publisher. Its producer predicates and existing owner words are diagnostic
+  metadata, never source or admission authority. No fold replay or extra guest reads are performed.
 - `fence_build_journal` — default-on, bounded build-time label observations used by the command
   processor's diagnostics. It never rewrites a packet or completes a fence. Lookup requires a
   complete fault-safe eight-byte sample; unavailable and colliding replacements cannot expose
