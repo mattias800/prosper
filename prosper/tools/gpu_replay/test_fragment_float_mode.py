@@ -129,8 +129,16 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
         launch=b"\x01\x00\x00\x01"+struct.pack("<I",16<<12)
         flags_tail=(struct.pack("<I",1)+launch+struct.pack("<I",0) if name=="mode16" else
                     struct.pack("<II",0,1)+launch)
-        check(struct.unpack_from("<I",data,8)[0]==68 and data.endswith(flags_tail+bytes(4)),
-              name+" exact official67 flags followed by resource-free nested68 count")
+        draw_count=0 if name.endswith("failed") else 1
+        wave_tail=struct.pack("<I",draw_count)+bytes(draw_count)
+        check(struct.unpack_from("<I",data,8)[0]==70 and data.endswith(wave_tail),
+              name+" exact ordinary owned-wave absence in current capture")
+        data=bytearray(data[:-len(wave_tail)]); struct.pack_into("<I",data,8,69)
+        entry_start=len(data)-4-159*draw_count
+        check(struct.unpack_from("<I",data,entry_start)[0]==draw_count,
+              name+" official69 entry count matches the draw inventory")
+        data=bytearray(data[:entry_start]); struct.pack_into("<I",data,8,68)
+        check(data.endswith(flags_tail+bytes(4)),name+" genuine official68 nested suffix")
         data=bytearray(data[:-4]); struct.pack_into("<I",data,8,67)
         check(data.endswith(flags_tail),name+" genuine independent known-clear-flags v67 tail")
         data=bytearray(data[:-len(flags_tail)])
@@ -208,10 +216,10 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
                     except ValueError as error:
                         check(False,label+" fail-closed output oracle: "+str(error))
     original=(directory/"mode16.prgcap").read_bytes()
-    # MODE precedes v65 owners, v66 transport, v67 launch flags and zero nested68 count.
+    # MODE precedes v65 owners, v66 transport, v67 flags, nested68, entry69 and wave70.
     transport_tail_size=13
     flags_tail_size=16
-    flags_start=len(original)-4-flags_tail_size
+    flags_start=len(original)-5-(4+159)-4-flags_tail_size
     start=flags_start-transport_tail_size-4-10
     malformed={
         "count":original[:start]+struct.pack("<I",0)+original[start+4:],
@@ -221,8 +229,10 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
         "truncated-mode":original[:start+9],
         "truncated-owned":original[:flags_start-transport_tail_size-1],
         "truncated-transport":original[:flags_start-1],
-        "truncated-flags":original[:-5],
-        "truncated-nested":original[:-1],
+        "truncated-flags":original[:flags_start+flags_tail_size-1],
+        "truncated-nested":original[:flags_start+flags_tail_size+3],
+        "truncated-entry":original[:-6],
+        "truncated-wave":original[:-1],
         "flags-count":original[:flags_start]+struct.pack("<I",0)+original[flags_start+4:],
         "flags-tag":original[:flags_start+4]+b"\x02"+original[flags_start+5:],
         "flags-unknown-value":original[:flags_start+4]+b"\x00\x01\x00"+original[flags_start+7:],

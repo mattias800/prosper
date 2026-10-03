@@ -195,7 +195,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // actually observed byte owners independently authenticate the chain; no live proof is serialized.
 // v69: producing draw PS USER_DATA availability/raw RSRC2, raw raster-launch presence, and an
 // independent immutable raw/SOURCE association. Older captures retain explicit unavailable facts.
-constexpr uint32_t kVersion = 69;
+// v70: owned direct graphics logical-wave input plans and exact raw-window observations.
+// This is distinct from physical fragment entry facts and never restores captured guest VAs.
+constexpr uint32_t kVersion = 70;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;

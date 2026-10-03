@@ -560,14 +560,13 @@ int main() {
     GpuCaptureFile captured;
     GpuCaptureMetadata metadata;
     std::string capture_error;
-    CHECK(capture_submit_items(
-              {}, {captured_compute},
-              {{SubmitOperationKind::Dispatch, 0u, 1u}}, metadata,
-              capture_reader, captured, capture_error) &&
-              captured.format_version == 69u && captured.computes.size() == 1u &&
-              captured.computes[0].resources.resources[0].internal_bytes.size() ==
-                  compiled_source->host_data_size,
-          "capture stores the dispatch-owned relocation snapshot as current-version internal bytes");
+    CHECK(
+        capture_submit_items({}, {captured_compute}, {{SubmitOperationKind::Dispatch, 0u, 1u}},
+                             metadata, capture_reader, captured, capture_error) &&
+            captured.format_version == 70u && captured.computes.size() == 1u &&
+            captured.computes[0].resources.resources[0].internal_bytes.size() ==
+                compiled_source->host_data_size,
+        "capture stores the dispatch-owned relocation snapshot as current-version internal bytes");
     std::vector<uint8_t> capture_bytes;
     GpuCaptureFile loaded_capture;
     GpuReplayFrame replay_frame;

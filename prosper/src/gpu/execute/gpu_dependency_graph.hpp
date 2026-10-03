@@ -50,6 +50,10 @@ struct GpuDependencyGraph {
 bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
                                 GpuDependencyGraph& graph, std::string& error);
 
+// A dependency report never publishes the observation's normalized runtime items.
+bool build_gpu_capture_observation_graph(const GpuCaptureObservation& observation,
+                                         GpuDependencyGraph& graph, std::string& error);
+
 // A live RTT seed is a closed external image dependency only when it represents the exact sampled
 // view. Address-only matches are unsafe: the same allocation can be reinterpreted at another extent
 // or format, which would make a nominally complete bundle replay different pixels.

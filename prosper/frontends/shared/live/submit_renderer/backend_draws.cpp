@@ -220,6 +220,11 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
         bd.raster_quads = it.raster_quads;
         bd.raster_quad_contract_modified = refvs || fs_ov || nops ||
             (descriptor_validate_mode && !strcmp(descriptor_validate_mode, "poison"));
+        if (it.owned_waves && bd.raster_quad_contract_modified) {
+            prosper::diagnostics::perf::drop_draw(DropReason::ContractMismatch);
+            continue;
+        }
+        bd.owned_waves = it.owned_waves;
         // Five clock reads bounding four spans, only when timing is armed -- ~0.9% of
         // this bucket at 2,100 draws a submit. It inflates what it measures while
         // armed, as every timer here does; read the shares, not the totals.
@@ -238,12 +243,14 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
         // 5.77 ms/submit in the build_resources partition -- larger than the validation
         // it was declining to do.
         const bool contract_ok =
-            prosper::gpu::validate_runtime_descriptor_contract(
-                "VS/backend", bd.vs_words(), it.vrt.get(), 0,
-                prosper::gpu::SpirvShaderStage::Vertex, descriptor_validate_mode) &&
-            prosper::gpu::validate_runtime_descriptor_contract(
-                "PS/backend", bd.fs_words(), it.prt.get(), 1,
-                prosper::gpu::SpirvShaderStage::Fragment, descriptor_validate_mode);
+            (it.owned_waves && it.owned_waves->vertex_pending ||
+             prosper::gpu::validate_runtime_descriptor_contract(
+                 "VS/backend", bd.vs_words(), it.vrt.get(), 0,
+                 prosper::gpu::SpirvShaderStage::Vertex, descriptor_validate_mode)) &&
+            (it.owned_waves && it.owned_waves->fragment_pending ||
+             prosper::gpu::validate_runtime_descriptor_contract(
+                 "PS/backend", bd.fs_words(), it.prt.get(), 1,
+                 prosper::gpu::SpirvShaderStage::Fragment, descriptor_validate_mode));
         const auto bt2 = timing_enabled ? RenderClock::now() : RenderClock::time_point{};
         if (timing_enabled) {
             pending_timing.build_r_ms +=

@@ -228,6 +228,10 @@ struct GpuCapturedDraw {
     FragmentEntryFacts ps_entry{}; // v69: observed window, not launched/required SGPRs
     RasterLaunchFacts ps_raster_launch{};
     bool ps_entry_source_available = false; // immutable producing raw/SOURCE pair retained
+    // v70: exact chosen logical-wave inputs and immutable complete raw windows. No serialized
+    // proof grants admission: materialization/compiler independently rederive original-PC bounds
+    // and initialization; stored and raw rendering use the same owned execution transaction.
+    std::shared_ptr<const GraphicsOwnedWaveDraw> owned_waves;
 };
 
 struct GpuCapturedCompute {
@@ -485,6 +489,39 @@ struct GpuReplayFrame {
 };
 
 bool materialize_gpu_replay(const GpuCaptureFile& capture, GpuReplayFrame& replay, std::string& error);
+
+struct GpuDependencyGraph;
+class GpuCaptureObservationReports;
+
+// A normalized capture for read-only reports. Its backing allocations and runtime-shaped
+// metadata stay private: successful inspection cannot be promoted to executable replay.
+class GpuCaptureObservation final {
+public:
+    GpuCaptureObservation() = default;
+    GpuCaptureObservation(const GpuCaptureObservation&) = delete;
+    GpuCaptureObservation& operator=(const GpuCaptureObservation&) = delete;
+    GpuCaptureObservation(GpuCaptureObservation&&) noexcept;
+    GpuCaptureObservation& operator=(GpuCaptureObservation&&) noexcept;
+
+private:
+    struct PendingStages {
+        bool vertex = false;
+        bool fragment = false;
+    };
+    GpuReplayFrame normalized_;
+    std::vector<PendingStages> pending_stages_;
+    uint32_t format_version_ = 0;
+    bool available_ = false;
+
+    friend bool materialize_gpu_capture_observation(const GpuCaptureFile&, GpuCaptureObservation&,
+                                                    std::string&);
+    friend bool build_gpu_capture_observation_graph(const GpuCaptureObservation&,
+                                                    GpuDependencyGraph&, std::string&);
+    friend class GpuCaptureObservationReports;
+};
+
+bool materialize_gpu_capture_observation(const GpuCaptureFile& capture,
+                                         GpuCaptureObservation& observation, std::string& error);
 
 // Byte range the capture planner reserves for one descriptor. This includes decoded/tiled image
 // storage when it is larger than the descriptor's declared byte count.

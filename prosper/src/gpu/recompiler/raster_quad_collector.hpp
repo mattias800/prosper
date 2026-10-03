@@ -21,6 +21,9 @@ struct RasterQuadInputs {
     RasterLaunchFacts launch{};
     bool has_pixel_inputs = false, has_system_inputs = false;
     bool raw_matches_producing_source = false;
+    // Typed deferred owned-wave PS input collection: no native producing PS module exists yet.
+    // This grants neither initialized guest registers nor export/attachment authority.
+    bool owned_wave_pending = false;
     bool generated_interpolation_geometry = false;
     FloatTransportConfig float_transport{};
     FragmentEntryFacts entry{};

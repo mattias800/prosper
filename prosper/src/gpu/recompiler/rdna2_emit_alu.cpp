@@ -5506,6 +5506,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x4: case 0xC: n = 16; break;   // s_load_dwordx16  / s_buffer_load_dwordx16
                 default: ok = false; return true;    // stores / others not yet
             }
+            if (emit_owned_raw_window(b, rs, in, n, ok)) return true;
             // PC-relative scalar embedded table (#1054): this s_buffer_load consumes a descriptor
             // built from s_getpc_b64 and a bounded table carried by the shader blob. Resolve it before
             // the external-resource gate, exactly like the established MUBUF form. The byte offset is
