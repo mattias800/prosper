@@ -141,8 +141,10 @@ using prosper::ModuleLinkFacts;
 
 TEST(SupportModules, InitOnLoadVetoedWhenImported) {
     LinkInput eboot = ordinary("/d/eboot.bin");
-    LinkInput imported = ordinary("/d/libA.prx"); imported.init_on_load = true;
-    LinkInput lone = ordinary("/d/libB.prx");     lone.init_on_load = true;
+    LinkInput imported = ordinary("/d/libA.prx");
+    imported.init_on_load = true;
+    LinkInput lone = ordinary("/d/libB.prx");
+    lone.init_on_load = true;
     std::vector<LinkInput> in = {eboot, imported, lone};
     // eboot imports libA; libB's own import of itself must not vouch for it.
     std::vector<ModuleLinkFacts> facts(3);
@@ -155,8 +157,10 @@ TEST(SupportModules, InitOnLoadVetoedWhenImported) {
 }
 
 TEST(SupportModules, InitOnLoadVetoedByDeferredImporter) {
-    LinkInput a = ordinary("/d/libA.prx"); a.init_on_load = true;
-    LinkInput b = ordinary("/d/libB.prx"); b.init_on_load = true;
+    LinkInput a = ordinary("/d/libA.prx");
+    a.init_on_load = true;
+    LinkInput b = ordinary("/d/libB.prx");
+    b.init_on_load = true;
     std::vector<LinkInput> in = {ordinary("/d/eboot.bin"), a, b};
     std::vector<ModuleLinkFacts> facts(3);
     facts[1].imported_libs = {"libB"};
@@ -168,10 +172,11 @@ TEST(SupportModules, InitOnLoadVetoedByDeferredImporter) {
 // The linker binds an import to an export by NID, so the library name an importer uses need not
 // match the candidate's filename. `middleware.prx` exporting what `RuntimeApi` importers ask for.
 TEST(SupportModules, InitOnLoadVetoedByNidDependencyWithMismatchedLibraryName) {
-    LinkInput mw = ordinary("/d/middleware.prx"); mw.init_on_load = true;
+    LinkInput mw = ordinary("/d/middleware.prx");
+    mw.init_on_load = true;
     std::vector<LinkInput> in = {ordinary("/d/eboot.bin"), mw};
     std::vector<ModuleLinkFacts> facts(2);
-    facts[0].imported_libs = {"RuntimeApi"};          // does NOT match "middleware"
+    facts[0].imported_libs = {"RuntimeApi"};   // does NOT match "middleware"
     facts[0].imported_nids = {"nidA", "nidB"};
     facts[1].exported_nids = {"nidB", "nidC"};
     prosper::veto_imported_init_on_load(in, facts);
@@ -179,7 +184,8 @@ TEST(SupportModules, InitOnLoadVetoedByNidDependencyWithMismatchedLibraryName) {
 }
 
 TEST(SupportModules, InitOnLoadKeptWhenNoNidOrNameDependency) {
-    LinkInput mw = ordinary("/d/middleware.prx"); mw.init_on_load = true;
+    LinkInput mw = ordinary("/d/middleware.prx");
+    mw.init_on_load = true;
     std::vector<LinkInput> in = {ordinary("/d/eboot.bin"), mw};
     std::vector<ModuleLinkFacts> facts(2);
     facts[0].imported_libs = {"RuntimeApi"};

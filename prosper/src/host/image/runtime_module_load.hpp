@@ -55,7 +55,8 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
 
 // Run, once, the init functions a LinkInput::init_on_load module had held back at boot. `guest_path` is matched by basename, case-insensitively. A module with nothing pending
 // (never deferred, or already started) is a no-op, so the guest's repeat loads stay idempotent.
-void run_deferred_module_init(const char* guest_path, uint64_t args, uint64_t argp, uint64_t guest_fs);
+void run_deferred_module_init(const char* guest_path, uint64_t args, uint64_t argp,
+                              uint64_t guest_fs);
 
 // Test/diagnostic: how many modules the runtime loader has loaded so far.
 // Call one module entry as module_start(size_t argc, const void* argp) through the platform's guest

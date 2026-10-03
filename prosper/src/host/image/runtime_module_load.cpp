@@ -92,7 +92,8 @@ uint64_t call_guest_module_entry(uint64_t fn, uint64_t args, uint64_t argp, uint
 #ifdef _WIN32
     return prosper_call_guest_sysv(fn, args, argp);
 #else
-    return ((uint64_t (*)(uint64_t, uint64_t))(uintptr_t)fn)(args, argp);   // host ABI is already System V
+    return ((uint64_t (*)(uint64_t, uint64_t))(uintptr_t)fn)(
+        args, argp);   // host ABI is already System V
 #endif
 }
 
@@ -128,7 +129,8 @@ void runtime_module_loader_init(Program* p) {
     }
 }
 
-void run_deferred_module_init(const char* guest_path, uint64_t args, uint64_t argp, uint64_t guest_fs) {
+void run_deferred_module_init(const char* guest_path, uint64_t args, uint64_t argp,
+                              uint64_t guest_fs) {
     if (!guest_path || !*guest_path) return;
     std::vector<uint64_t> fns;
     {
@@ -137,9 +139,14 @@ void run_deferred_module_init(const char* guest_path, uint64_t args, uint64_t ar
         std::string b = basename_of(guest_path);
         for (auto& c : b) c = (char)std::tolower((unsigned char)c);
         for (auto& d : g_prog->deferred_inits)
-            if (d.first == b) { fns.swap(d.second); break; }   // taken exactly once
+            if (d.first == b) {
+                fns.swap(d.second);
+                break;
+            }   // taken exactly once
         if (fns.empty()) return;
-        if (modlog()) fprintf(stderr, "[loadmod] starting deferred init of '%s' (%zu fns)\n", b.c_str(), fns.size());
+        if (modlog())
+            fprintf(stderr, "[loadmod] starting deferred init of '%s' (%zu fns)\n", b.c_str(),
+                    fns.size());
         for (uint64_t f : fns) call_guest_module_entry(f, args, argp, guest_fs);
     }
 }

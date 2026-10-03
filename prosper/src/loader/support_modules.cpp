@@ -89,8 +89,9 @@ std::vector<size_t> veto_imported_init_on_load(std::vector<LinkInput>& in,
             const auto& f = facts[j];
             const bool by_lib = std::find(f.imported_libs.begin(), f.imported_libs.end(), lib) !=
                                 f.imported_libs.end();
-            const bool by_nid = std::any_of(f.imported_nids.begin(), f.imported_nids.end(),
-                                            [&](const std::string& n) { return exported.count(n) != 0; });
+            const bool by_nid =
+                std::any_of(f.imported_nids.begin(), f.imported_nids.end(),
+                            [&](const std::string& n) { return exported.count(n) != 0; });
             if (by_lib || by_nid) {
                 in[i].init_on_load = false;
                 cleared.push_back(i);

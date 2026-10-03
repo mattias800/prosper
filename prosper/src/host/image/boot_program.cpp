@@ -193,7 +193,8 @@ void drop_unimported_support_modules(std::vector<LinkInput>& in, const Say& say)
 
 template <typename Say>
 void veto_init_on_load_for_imported(std::vector<LinkInput>& in, const Say& say) {
-    if (std::none_of(in.begin(), in.end(), [](const LinkInput& e) { return e.init_on_load; })) return;
+    if (std::none_of(in.begin(), in.end(), [](const LinkInput& e) { return e.init_on_load; }))
+        return;
     std::vector<ModuleLinkFacts> facts(in.size());
     for (size_t i = 0; i < in.size(); ++i) {
         std::string perr;
@@ -201,7 +202,8 @@ void veto_init_on_load_for_imported(std::vector<LinkInput>& in, const Say& say) 
             facts[i] = module_link_facts(*m);
         } else {
             // Unknown importer: stay eager everywhere rather than risk starving a real dependency.
-            say("init-on-load: cannot parse %s (%s); keeping all module init eager\n", in[i].path.c_str(), perr.c_str());
+            say("init-on-load: cannot parse %s (%s); keeping all module init eager\n",
+                in[i].path.c_str(), perr.c_str());
             for (auto& e : in) e.init_on_load = false;
             return;
         }
@@ -293,7 +295,7 @@ std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
             // NIDs); linking both would run two init_arrays and make dlsym answer differently per
             // module handle. Deduplicating on exports rather than on a filename suffix also degrades
             // correctly for a title that ships only the debug variant — nothing collides, so it links.
-            LinkInput li{ path, base, true };
+            LinkInput li{path, base, true};
             // An absent static importer says nothing about runtime dlsym users. Defer only a
             // module with an affirmative runtime-init contract; unknown/root/Unity plugins keep
             // boot initialization. Imported dependencies are vetoed once the link list is complete.
