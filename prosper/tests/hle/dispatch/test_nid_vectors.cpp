@@ -3,6 +3,7 @@
 #include "hle/dispatch/nid.hpp"
 
 #include <array>
+#include <string>
 #include <string_view>
 
 #include <gtest/gtest.h>
