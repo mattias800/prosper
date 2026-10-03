@@ -2403,6 +2403,14 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_nested_wide_data_admission
     SOURCES tests/gpu/execute/test_nested_wide_data_admission.cpp
     LIBRARIES prosper_core)
+  # Registered nested snapshot admission uses the Linux direct-memory lazy-fault proof.
+  # Callback/compute stand-ins exercise ordered execution without creating a Vulkan device.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    prosper_add_gtest(test_ordered_render_finality
+      SOURCES tests/gpu/execute/test_ordered_render_finality.cpp
+      INCLUDES frontends
+      LIBRARIES prosper_core)
+  endif()
 
   # Hinted map must not clobber a live mapping (#137): MAP_FIXED_NOREPLACE unless the hint is our
   # own uncommitted reservation. Drives the real map HLE handlers. Linux-only (mmap semantics).
