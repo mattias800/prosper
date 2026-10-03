@@ -1,0 +1,27 @@
+name: PR body
+
+# Its own workflow, not a job in ci.yml: the body is edited after the PR opens, and `edited` would
+# re-run the whole build matrix on every typo fix, while ci.yml's plain `pull_request` trigger
+# would never re-check a body fixed after the first run. Checks structure only; see
+# prosper/tools/ci/check_pr_body.py.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-body:
+    name: PR body follows template
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify the checker still discriminates
+        run: python3 prosper/tools/ci/check_pr_body.py --selftest
+      - name: Check the PR body against the template
+        env:
+          # Through the environment, never interpolated into the script: the body is untrusted input.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: python3 prosper/tools/ci/check_pr_body.py

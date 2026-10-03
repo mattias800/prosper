@@ -44,6 +44,7 @@ usage, whether a PR is safe to merge.
   `print(__doc__)` prints the literal `None` and the caller is told nothing.
 - **`pr_merge_gate.py`** — is this PR safe to merge right now? Counts checks by bucket from
   `gh --json` and refuses when the PR's recorded head is no longer the branch tip.
+- **`check_pr_body.py`** � the `PR body` workflow (`.github/workflows/pr-body.yml`): a PR body must contain every `## Heading` of `.github/pull_request_template.md`, each with real content. Its own workflow so a body edit re-checks without re-running the build matrix.
 - **`pr_body.py`** — set a PR body and PROVE it took, or read one back and prove it matches a file.
   `gh pr edit --body-file` has been seen returning rc=1 on a GraphQL projects-deprecation error
   *without applying the edit* (#2918), so `set` writes over REST and then re-reads the live body;
