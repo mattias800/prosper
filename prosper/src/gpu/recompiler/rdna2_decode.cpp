@@ -248,7 +248,12 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
                 // FLAT/GLOBAL address forms stay fail-closed in the recompiler, so counting the
                 // loads is the only lowering-reachable fix; the atomic policy is decided when an
                 // atomic lowering lands.
-                case 0x20u: case 0x21u: case 0x22u: case 0x23u: case 0x24u: case 0x25u: return 1;
+                case 0x20u:
+                case 0x21u:
+                case 0x22u:
+                case 0x23u:
+                case 0x24u:
+                case 0x25u: return 1;
                 default: return 0; // audited store/deferred forms do not produce a VGPR result.
             }
         case Rdna2Format::MIMG: {
@@ -298,7 +303,8 @@ uint32_t rdna2_vgpr_destination_span(const Rdna2Inst& in) {
         case Rdna2Format::MUBUF:
             if (in.opcode >= 0x04u && in.opcode <= 0x07u) span = in.opcode - 3u;
             else if (in.opcode == 0x1cu) span = 1;
-            else if (in.opcode >= 0x18u && in.opcode <= 0x1bu) span = 1; // byte/short stores (#4243)
+            else if (in.opcode >= 0x18u && in.opcode <= 0x1bu)
+                span = 1;   // byte/short stores (#4243)
             else if (in.opcode == 0x1du) span = 2;
             else if (in.opcode == 0x1eu) span = 4;
             else if (in.opcode == 0x1fu) span = 3;
