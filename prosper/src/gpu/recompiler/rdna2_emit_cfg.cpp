@@ -33,6 +33,7 @@
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/fragment_loop_mask.hpp"
 #include "gpu/recompiler/rdna2_entry_vcc.hpp"
+#include "gpu/recompiler/fragment_packet_mask_requirements.hpp"
 
 namespace prosper::gpu {
 
@@ -1606,7 +1607,7 @@ bool emit_cfg_state_machine(
     bool allow_smem, const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
     const uint32_t* code, size_t dwords, uint32_t initial_active, bool synchronize_lds_fminmax,
     const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction,
-    PacketVgprDefinedness* packet_definedness) {
+    PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks) {
     const bool graphics = !b.has_workgroup_execution() && (b.is_fragment || b.is_vertex);
     auto reject_cfg = [&](uint32_t pc, const char* reason) {
         log_recompile_diagnostic(b.diagnostic,
@@ -1615,6 +1616,11 @@ bool emit_cfg_state_machine(
         return false;
     };
     if ((!b.has_workgroup_execution() && !graphics) || ins.empty()) return false;
+    if (packet_masks &&
+        (!b.is_fragment_packet() || initial_active || !packet_masks->rejection.empty() ||
+         !packet_masks->source_words || packet_masks->source_words->data() != code ||
+         packet_masks->source_words->size() != dwords))
+        return reject_cfg(ins.front().pc, "packet-mask-program-requirements-mismatch");
     if (b.ngg_workgroup_export_probe && b.is_compute && b.local_count == 64 &&
         std::all_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             if (in.is_end) return true;
@@ -4266,11 +4272,13 @@ bool emit_cfg_state_machine(
     // backstop but no live case, and every other stage has neither, so all of them keep the old
     // contract. A partial-workgroup extent is excluded as well: its padded invocations never
     // dispatch block 0, so they would keep the placeholder instead of the caller's value.
-    const bool entry_vcc_dead = !initial.vcc && !proven_wave32_masks &&
-        b.is_compute && b.wave_size == 64 && !initial_active &&
-        (entry_block_defines_vcc_before_any_read(
-             ins, starts.front(), starts.size() > 1 ? starts[1] : UINT32_MAX) ||
-         region_defines_vcc_before_any_read(ins));
+    const bool entry_vcc_dead =
+        !initial.vcc && !proven_wave32_masks && b.is_compute && b.wave_size == 64 &&
+        !initial_active &&
+        (entry_block_defines_vcc_before_any_read(ins, starts.front(),
+                                                 starts.size() > 1 ? starts[1] : UINT32_MAX) ||
+         region_defines_vcc_before_any_read(ins) ||
+         (packet_masks && !(packet_masks->demanded & kPacketInitialVcc)));
     if (!initial.vcc && !proven_wave32_masks && !entry_vcc_dead) {
         if (getenv("PROSPER_DBG"))
             std::fprintf(stderr,
@@ -4285,7 +4293,9 @@ bool emit_cfg_state_machine(
         return reject_cfg(ins.front().pc, "missing-entry-vcc");
     }
     b.store_function(vcc_var, initial.vcc ? initial.vcc : no);
-    b.store_function(exec_var, initial.exec);
+    // A missing initial EXEC may be unused until a genuine original writer. The internal slot
+    // still needs a valid SPIR-V initializer; load_state NEVER grants this placeholder authority.
+    b.store_function(exec_var, packet_masks && !initial.exec ? no : initial.exec);
     b.store_function(pc_var, b.uconst(0));
     b.store_function(active_var, initial_active ? initial_active : yes);
     if (has_synchronized_lds_store_event) {
@@ -4479,7 +4489,11 @@ bool emit_cfg_state_machine(
             ? entry_wave64_b64 && entry_wave64_b64->contains(106)
             : (!entry_b32 || entry_b32->contains(106));
         state.vcc = live_vcc ? b.load_function(b.t_bool, vcc_var) : 0;
-        state.exec = b.load_function(b.t_bool, exec_var);
+        const bool live_exec =
+            !packet_masks || initial.exec ||
+            (entry_block != UINT32_MAX &&
+             packet_masks->defined_before(starts[entry_block], kPacketInitialExec));
+        state.exec = live_exec ? b.load_function(b.t_bool, exec_var) : 0;
         // `sv` has a Function variable for every statically observed scalar lifetime, including
         // zero placeholders stored while the same physical pair carries only a Bool-domain mask.
         // Do not let those placeholders shadow the live mask after a dispatcher reload. A genuinely
@@ -4587,7 +4601,7 @@ bool emit_cfg_state_machine(
         // reject on the sentinel; cross-block staleness matches the pre-poison model.
         b.store_function(scc_var, state.scc ? state.scc : b.bfalse());
         b.store_function(vcc_var, state.vcc ? state.vcc : no);
-        b.store_function(exec_var, state.exec);
+        if (!packet_masks || state.exec) b.store_function(exec_var, state.exec);
     };
 
     const uint32_t loop_header = b.id(), switch_header = b.id(), switch_merge = b.id();

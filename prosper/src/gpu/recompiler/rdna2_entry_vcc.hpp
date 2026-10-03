@@ -1,43 +1,9 @@
 #pragma once
 
-// Lifted out of rdna2_emit_cfg.cpp's anonymous namespaces so the code that operates on them
-// can live in its own translation units. Declared in prosper/src/gpu/recompiler; who may include it is
-// a decision this banner does not make -- say so with --note if it is restricted.
-
-// rdna2_emit_cfg.cpp — the divergent-control-flow state machine and emit_body, split out of
-// rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
-#include <atomic>
-#include "gpu/recompiler/rdna2_to_spirv.hpp"
-#include "gpu/recompiler/fragment_packet_definedness.hpp"
-#include "gpu/recompiler/rdna2_packet_raw_masks.hpp"
-#include "gpu/diagnostics/diagnostic_selectors.hpp"
-#include "gpu/pm4/pm4_registers.hpp"
-#include "gpu/recompiler/rdna2_decode.hpp"
-#include "gpu/recompiler/rdna2_cfg_registers.hpp"
-#include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
-#include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
-#include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
-#include "gpu/recompiler/indirect/rdna2_indirect_buffer_shadow.hpp"
-#include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
-#include "gpu/resources/shader_resources.hpp"
-#include <algorithm>
-#include <bit>
-#include <cstdarg>
-#include <cstring>
-#include <cstdio>
-#include <cstdlib>
-#include <functional>
-#include <map>
-#include <mutex>
-#include <set>
-#include <tuple>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
-#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
-#include "gpu/recompiler/rdna2_alu_support.hpp"
+// INTERNAL recompiler companion. The two unchanged native entry-VCC proofs were promoted with
+// tools/refactor/promote_internal.py before demanded packet-state behavior was introduced.
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
-#include "gpu/recompiler/fragment_loop_mask.hpp"
+#include <vector>
 
 namespace prosper::gpu {
 

@@ -12,7 +12,7 @@ uint64_t FragmentPacketVgprRequirements::retained_bytes() const {
     constexpr uint64_t node_allowance = 8 * sizeof(void*);
     constexpr uint64_t node_estimate =
         ((sizeof(ReadMap::value_type) + node_allowance + alignment - 1) / alignment) * alignment;
-    uint64_t bytes = sizeof(*this) + rejection.capacity() + 1;
+    uint64_t bytes = sizeof(*this) + rejection.capacity() + 1 + masks.retained_bytes();
     for (const auto& [pc, accesses] : reads)
         bytes += node_estimate + accesses.capacity() * sizeof(FragmentPacketVgprAccess);
     return bytes;
@@ -23,6 +23,7 @@ fragment_packet_vgpr_requirements(const std::vector<uint32_t>& code,
                                   const std::vector<Rdna2Inst>& ins) {
     FragmentPacketVgprRequirements result;
     result.source_words = &code;
+    result.masks = fragment_packet_mask_requirements(code, ins);
     if (code.empty() || code.size() > 4096 || ins.empty() || !ins.back().is_end ||
         ins.back().pc + ins.back().len_dwords != code.size()) {
         result.rejection = "packet-vgpr-program-inventory-incomplete";
