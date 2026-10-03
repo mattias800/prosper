@@ -802,6 +802,9 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_fragment_entry_prefix
     SOURCES tests/gpu/execute/test_fragment_entry_prefix.cpp
     INCLUDES tests LIBRARIES prosper_core)
+  prosper_add_gtest(test_ps_pull_model
+    SOURCES tests/gpu/execute/test_ps_pull_model.cpp
+    INCLUDES tests LIBRARIES prosper_core)
 
   # nid_census: every guest import that falls to the dispatcher's return-0 default (#2081).
   # Links prosper_core because both of its inputs must be the real ones — `Module::load` for the
@@ -5851,6 +5854,9 @@ endif()
 # physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
 # silent pass) where one does not.
 if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  prosper_add_gtest(test_ps_pull_model_exec
+    SOURCES tests/gpu/execute/test_ps_pull_model_exec.cpp
+    INCLUDES tests frontends LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_fragment_entry_prefix_exec
     SOURCES tests/gpu/execute/test_fragment_entry_prefix_exec.cpp
     INCLUDES tests
