@@ -3745,6 +3745,7 @@ void apply_deferred_effect(const Pm4Command& c) {
 } // namespace
 
 void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect) {
+    const GraphicsExecutionActivity execution;
     apply_deferred_effect(effect.cmd);
 }
 

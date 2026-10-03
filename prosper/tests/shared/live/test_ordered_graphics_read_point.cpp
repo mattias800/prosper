@@ -561,4 +561,36 @@ TEST_F(OrderedGraphicsReadPointTest, LegacyExecutionEntriesExpirePermissionBefor
     }
 }
 
+TEST_F(OrderedGraphicsReadPointTest, RetainedWriteDataExpiresOldPointAndFreshPointSeesBytes) {
+    const uint32_t replacement = 0x55667788u;
+    Pm4Command write{};
+    write.kind = Pm4Command::Kind::WriteData;
+    write.wd_addr = child + 16;
+    write.wd_declared_num = write.wd_num = 1;
+    write.wd_data = &replacement;
+    write.wd_valid = true;
+    const GpuState::MemoryEffect effect(write, Order + 1);
+    ASSERT_NE(effect.cmd.wd_data, write.wd_data);
+    ASSERT_EQ(effect.write_data, (std::vector<uint32_t>{replacement}));
+    inspect([&](const DrawItem& item) {
+        auto old = reader(context(item.ordered_read_point));
+        ASSERT_TRUE(old->probe(FoldProbe::Raw, 0, parent, 16));
+        execute_ordered_memory_effect(effect);
+        uint32_t actual = 0;
+        std::memcpy(&actual, reinterpret_cast<const void*>(child + 16), sizeof(actual));
+        ASSERT_EQ(actual, replacement)
+            << "The actual mapped retained WRITE_DATA API changed the numeric source";
+        EXPECT_FALSE(old->probe(FoldProbe::Raw, 2, child + 16, 16));
+        ShaderResourceTable table;
+        EXPECT_FALSE(old->publish(table));
+    });
+    inspect([&](const DrawItem& item) {
+        auto fresh = reader(context(item.ordered_read_point));
+        ASSERT_TRUE(fresh->probe(FoldProbe::Raw, 0, parent, 16));
+        ASSERT_TRUE(fresh->probe(FoldProbe::Raw, 2, child + 16, 16));
+        EXPECT_EQ(fresh->word(2, child + 16), replacement);
+    });
+    EXPECT_EQ(Backend::backend_failed_publication_generation().load(), generation_before);
+}
+
 }   // namespace
