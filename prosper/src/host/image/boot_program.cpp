@@ -194,11 +194,17 @@ void drop_unimported_support_modules(std::vector<LinkInput>& in, const Say& say)
 template <typename Say>
 void veto_init_on_load_for_imported(std::vector<LinkInput>& in, const Say& say) {
     if (std::none_of(in.begin(), in.end(), [](const LinkInput& e) { return e.init_on_load; })) return;
-    std::vector<std::vector<std::string>> imports_by_index(in.size());
+    std::vector<ModuleLinkFacts> facts(in.size());
     for (size_t i = 0; i < in.size(); ++i) {
         std::string perr;
         if (auto m = Module::load(in[i].path, &perr)) {
-            for (const auto& imp : m->imports) imports_by_index[i].push_back(imp.lib_name);
+            for (const auto& imp : m->imports) {
+                facts[i].imported_libs.push_back(imp.lib_name);
+                facts[i].imported_nids.push_back(imp.nid);
+            }
+            for (const auto& sym : m->symbols)
+                if (!sym.is_import && sym.shndx != 0 && !sym.nid.empty())
+                    facts[i].exported_nids.push_back(sym.nid);
         } else {
             // Unknown importer: stay eager everywhere rather than risk starving a real dependency.
             say("init-on-load: cannot parse %s (%s); keeping all module init eager\n", in[i].path.c_str(), perr.c_str());
@@ -206,7 +212,7 @@ void veto_init_on_load_for_imported(std::vector<LinkInput>& in, const Say& say) 
             return;
         }
     }
-    veto_imported_init_on_load(in, imports_by_index);
+    veto_imported_init_on_load(in, facts);
     for (const auto& e : in)
         if (e.init_on_load) say("init DEFERRED until the guest loads it: %s\n", e.path.c_str());
 }

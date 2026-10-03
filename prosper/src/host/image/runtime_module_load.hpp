@@ -58,6 +58,11 @@ uint64_t runtime_load_start_module(const char* guest_path, uint64_t args, uint64
 void run_deferred_module_init(const char* guest_path, uint64_t args, uint64_t argp, uint64_t guest_fs);
 
 // Test/diagnostic: how many modules the runtime loader has loaded so far.
+// Call one module entry as module_start(size_t argc, const void* argp) through the platform's guest
+// ABI bridge (System V arguments and register preservation on every host), with the guest's %fs
+// installed for the duration when `guest_fs` is nonzero. Plain init_array constructors ignore both.
+uint64_t call_guest_module_entry(uint64_t fn, uint64_t args, uint64_t argp, uint64_t guest_fs);
+
 size_t runtime_loaded_module_count();
 
 } // namespace prosper

@@ -68,11 +68,21 @@ std::vector<size_t> unimported_support_module_indices(
     const std::vector<LinkInput>& in,
     const std::vector<std::vector<std::string>>& imports_by_index);
 
-// Clears `init_on_load` on every input some OTHER module in `in` imports by library name. A module
-// with an importer must be initialised before that importer runs, so only a module nobody links
-// against may wait for the guest's own sceKernelLoadStartModule. `imports_by_index` is parallel to
-// `in`; a module's own imports never vouch for it. Returns the indices that were cleared.
+// What one linked module imports and exports, as the linker resolves it. The linker binds an import
+// to an export by NID, so a module can be depended upon under a library name that has nothing to do
+// with its filename (`middleware.prx` exporting what `RuntimeApi` importers ask for).
+struct ModuleLinkFacts {
+    std::vector<std::string> imported_libs;   // library names this module imports from
+    std::vector<std::string> imported_nids;   // NIDs this module imports
+    std::vector<std::string> exported_nids;   // NIDs this module defines
+};
+
+// Clears `init_on_load` on every input some OTHER module in `in` depends on, either by library name
+// (the importer names the candidate's filename stem) or, independently, because it imports a NID the
+// candidate exports. A module with a dependent must be initialised before that dependent runs, so only
+// a module nobody links against may wait for the guest's own sceKernelLoadStartModule. `facts` is
+// parallel to `in`; a module's own imports never vouch for it. Returns the indices that were cleared.
 std::vector<size_t> veto_imported_init_on_load(std::vector<LinkInput>& in,
-    const std::vector<std::vector<std::string>>& imports_by_index);
+                                               const std::vector<ModuleLinkFacts>& facts);
 
 } // namespace prosper

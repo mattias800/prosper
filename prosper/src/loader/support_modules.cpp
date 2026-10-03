@@ -3,6 +3,7 @@
 #include "loader/support_modules.hpp"
 
 #include <algorithm>
+#include <unordered_set>
 
 namespace prosper {
 
@@ -47,15 +48,23 @@ std::vector<size_t> unimported_support_module_indices(
 }
 
 std::vector<size_t> veto_imported_init_on_load(std::vector<LinkInput>& in,
-    const std::vector<std::vector<std::string>>& imports_by_index) {
+                                               const std::vector<ModuleLinkFacts>& facts) {
     std::vector<size_t> cleared;
     for (size_t i = 0; i < in.size(); ++i) {
         if (!in[i].init_on_load) continue;
         const std::string lib = support_module_lib_name(in[i].path);
-        for (size_t j = 0; j < in.size() && j < imports_by_index.size(); ++j) {
+        const std::unordered_set<std::string> exported =
+            i < facts.size() ? std::unordered_set<std::string>(facts[i].exported_nids.begin(),
+                                                               facts[i].exported_nids.end())
+                             : std::unordered_set<std::string>();
+        for (size_t j = 0; j < in.size() && j < facts.size(); ++j) {
             if (j == i) continue;
-            const auto& v = imports_by_index[j];
-            if (std::find(v.begin(), v.end(), lib) != v.end()) {
+            const auto& f = facts[j];
+            const bool by_lib = std::find(f.imported_libs.begin(), f.imported_libs.end(), lib) !=
+                                f.imported_libs.end();
+            const bool by_nid = std::any_of(f.imported_nids.begin(), f.imported_nids.end(),
+                                            [&](const std::string& n) { return exported.count(n) != 0; });
+            if (by_lib || by_nid) {
                 in[i].init_on_load = false;
                 cleared.push_back(i);
                 break;
