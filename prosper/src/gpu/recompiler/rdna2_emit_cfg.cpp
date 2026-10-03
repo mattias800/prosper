@@ -5233,8 +5233,17 @@ bool emit_cfg_state_machine(
             const bool bounded = is_vadd_nc_u32_dpp_row_shr_bounded(*dpp_row_shr);
             const auto source = state.vreg.find(
                 bounded ? dpp_row_shr->src[0].value : dst);
-            const uint32_t source_value =
+            uint32_t source_value =
                 source == state.vreg.end() ? zero : source->second;
+            if (maximum) {
+                // WRITELANE spill slots are scalar state, not a per-lane VGPR value. Resolve
+                // the newly admitted MAX through the same source guard as ordinary ALU reads.
+                bool source_ok = true;
+                source_value = operand_bits(b, state, *dpp_row_shr,
+                                            dpp_row_shr->src[0], &source_ok);
+                if (!source_ok)
+                    return reject_cfg(dpp_row_shr->pc, "dpp-row-max-source-unresolved");
+            }
             const auto previous_destination = state.vreg.find(dst);
             const uint32_t old_destination = previous_destination == state.vreg.end()
                 ? zero : previous_destination->second;

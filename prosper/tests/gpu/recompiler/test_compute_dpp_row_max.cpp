@@ -4,6 +4,7 @@
 #include "fixtures/dpp_row_max.hpp"
 #include <gtest/gtest.h>
 #include <array>
+#include <tuple>
 
 using namespace prosper::gpu;
 
@@ -139,3 +140,53 @@ TEST(ComputeDppRowMax, ProductionComputeCompilesDefaultAndExactNativeProfiles) {
         EXPECT_EQ(count(module, Op_GroupNonUniformShuffle), 8u);
     }
 }
+
+namespace {
+// The matched positive writes a different physical VGPR. Both streams use genuine input v1;
+// only the negative replaces it with WRITELANE's scalar numeric/Bool spill representation.
+class ComputeDppRowMaxCfgSpill : public testing::TestWithParam<std::tuple<bool, bool, bool>> {};
+}
+
+TEST_P(ComputeDppRowMaxCfgSpill, RejectsScalarSpillBeforePublishingRowSource) {
+    const auto [mask, restored, native] = GetParam();
+    for (bool spill_source : {false, true}) {
+        std::vector<uint32_t> code{0xbf820000u}; // explicit CFG entry before WRITELANE
+        code.push_back(0xd7610000u | (spill_source ? 1u : 8u));
+        code.push_back(mask ? 0x0001007eu : 0x00010081u); // EXEC_LO or numeric 1, inline lane 0
+        const auto write = rdna2_decode_one(code.data() + 1, code.size() - 1);
+        ASSERT_EQ(write.opcode, 0x361u);
+        ASSERT_EQ(write.dst.value, spill_source ? 1 : 8);
+        ASSERT_EQ(write.src[1].kind, OperandKind::InlineInt);
+        ASSERT_EQ(write.src[1].value, 0);
+        if (restored) code.push_back(0xbf820000u); // save/load CFG state before the row event
+        const uint32_t max_pc = static_cast<uint32_t>(code.size());
+        const auto row = prosper::test::dpp_row_max_program({1});
+        code.insert(code.end(), row.begin(), row.end() - 1);
+        code.insert(code.end(), {0xf8000941u, 0x00000001u, 0xbf810000u}); // raw v1 sink
+        const uint64_t address = 0x42680000u + (mask << 8) + (restored << 6) +
+                                 (native << 4) + spill_source;
+        const auto module = recompile_ngg_exports_for_test(
+            code.data(), code.size(), 10, 0, nullptr, 4, 0,
+            {RecompileDiagnosticStage::Compute, address}, true, true, native);
+        if (spill_source) {
+            EXPECT_TRUE(module.empty());
+            const auto reason = last_terminal_reject_reason(address);
+            EXPECT_NE(reason.find("reason=dpp-row-max-source-unresolved"), std::string::npos)
+                << reason;
+            EXPECT_NE(reason.find("pc=" + std::to_string(max_pc)), std::string::npos)
+                << reason;
+        } else {
+            ASSERT_FALSE(module.empty()) << "unrelated spill must not erase genuine v1 input";
+            EXPECT_GT(count(module, Op_Switch), 0u);
+            EXPECT_GT(count(module, Op_ExtInst, Glsl_UMax), 0u);
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(Profiles, ComputeDppRowMaxCfgSpill,
+    testing::Combine(testing::Bool(), testing::Bool(), testing::Bool()),
+    [](const testing::TestParamInfo<ComputeDppRowMaxCfgSpill::ParamType>& test) {
+        const auto [mask, restored, native] = test.param;
+        return std::string(mask ? "Mask" : "Numeric") + (restored ? "Restored" : "Adjacent") +
+               (native ? "Native64" : "Portable");
+    });
