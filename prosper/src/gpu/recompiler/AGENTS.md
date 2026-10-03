@@ -6,6 +6,9 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   makes it the cheapest thing in the stack to unit-test.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the
   translator: register state, control-flow structurization, and per-instruction lowering.
+- `rdna2_cfg_registers` — shared register storage/effect inventory extracted from the capped CFG
+  file. Native effects remain unchanged; an explicit owned-packet caller includes genuine VINTRP
+  destinations for predicated preservation/P2. Storage reload never grants per-lane entry validity.
 - `rdna2_recompile_fragment_packet` — an owned 64-slot guest-fragment executor in a physical
   64-worker compute workgroup. It directly uses the synchronized CFG services for whole-wave
   votes, saved-mask reductions, canonical-half mask MBCNT, READLANE and explicit logical-quad B64 WQM,
@@ -51,6 +54,12 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   mask/helper/system/composition/commit authority remain separate obligations. The CPU-only
   `PROSPER_VGPR_DEFINEDNESS_SPV_DIRECTORY` diagnostic retains actual emitted SOURCE for validation;
   unset writes no files and never changes guest lowering or admission.
+- `fragment_packet_wave_data` separates cached original-program SOURCE/profile from dynamic owned
+  logical64 wave regions. Checked per-workgroup bases load genuine scalar/M0/resource/VGPR words;
+  all-wave status validation precedes any publication. Shared image bindings remain a bounded
+  initial domain. Private readonly binding2 placement ownership guards mutable binding0 routes
+  uniformly before guest/barriers/stores; that retained dispatcher authority is not a live P5 lease.
+  It grants no raster scheduling, system-entry derivation or shipping admission.
 - `rdna2_mask_move` supplies the shared S_MOV_B64-to-EXEC lowering. Owned Wave64 packets consume
   two genuine instruction-order MUST scalar words at their logical lane position, independently
   of old EXEC, and preserve SCC. A partial numeric overwrite of a saved Bool mask remains a named
