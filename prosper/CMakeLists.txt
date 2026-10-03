@@ -799,6 +799,9 @@ ${GAME_DUMP_TITLE_ID}. Re-run cmake with -DGAME_DUMP=<dump root>/${title}-app0 t
 endfunction()
 
 if(TARGET prosper_core)
+  prosper_add_gtest(test_fragment_scalar_reads
+    SOURCES tests/gpu/recompiler/test_fragment_scalar_reads.cpp
+    INCLUDES tests LIBRARIES prosper_core)
   prosper_add_gtest(test_fragment_entry_prefix
     SOURCES tests/gpu/execute/test_fragment_entry_prefix.cpp
     INCLUDES tests LIBRARIES prosper_core)
@@ -834,6 +837,11 @@ if(TARGET prosper_core)
     add_test(NAME nid_hash_matches_imports
              COMMAND test_nid "${GAME_DUMP}/eboot.bin")
   endif()
+
+  # Dump-independent golden vectors pin NID hashing in the default unit-test set.
+  prosper_add_gtest(test_nid_vectors
+    SOURCES tests/hle/dispatch/test_nid_vectors.cpp
+    LIBRARIES prosper_core)
 
   # Split-T# provenance proof (#4197): pure decoder/fold cases, no dump.
   # #4120/#4274: storage-image DST_SEL routing rules (pure).
@@ -1324,6 +1332,20 @@ if(TARGET prosper_core)
 
   prosper_add_gtest(test_reallocf
     SOURCES tests/hle/test_reallocf.cpp
+    LIBRARIES prosper_core)
+
+  # Guest libc contracts prosper implements itself (not host forwarders), called through the
+  # registered handlers. strlcpy/strlcat are prosper's own code; qsort/bsearch own the guest
+  # comparator's calling convention, which differs from the host's on Windows. Pure, no game dump.
+  prosper_add_gtest(test_libc_strlcpy
+    SOURCES tests/hle/test_libc_strlcpy.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_libc_qsort_bsearch
+    SOURCES tests/hle/test_libc_qsort_bsearch.cpp
+    LIBRARIES prosper_core)
+  # sscanf is a host-convention variadic (not PROSPER_GUEST_ABI); the suite calls it as one.
+  prosper_add_gtest(test_libc_sscanf
+    SOURCES tests/hle/test_libc_sscanf.cpp
     LIBRARIES prosper_core)
 
   # #2081 FALSE SUCCESS: an unregistered NID answers the dispatcher's 0, which for an SCE_OK
@@ -1917,6 +1939,15 @@ if(TARGET prosper_core)
     SOURCES tests/hle/kernel/test_mutex_types.cpp
     LIBRARIES prosper_core)
 
+  # pthread key destructor teardown at thread exit through the scePthread* HLE,
+  # including the Windows (winpthreads) path: single fire, reinstall
+  # refire/stop, iteration bound, deleted-key silence, all keys fire with no
+  # order asserted, NULL destructor silence. Pure, no game dump.
+  prosper_add_gtest(test_pthread_key_teardown
+    SOURCES tests/hle/kernel/test_pthread_key_teardown.cpp
+    LIBRARIES prosper_core
+    PROPERTIES TIMEOUT 60)
+
   prosper_add_gtest(test_agc_shader
     SOURCES tests/gpu/test_agc_shader.cpp
     LIBRARIES prosper_core)
@@ -2413,6 +2444,14 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_nested_wide_data_admission
     SOURCES tests/gpu/execute/test_nested_wide_data_admission.cpp
     LIBRARIES prosper_core)
+  # Registered nested snapshot admission uses the Linux direct-memory lazy-fault proof.
+  # Callback/compute stand-ins exercise ordered execution without creating a Vulkan device.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    prosper_add_gtest(test_ordered_render_finality
+      SOURCES tests/gpu/execute/test_ordered_render_finality.cpp
+      INCLUDES frontends
+      LIBRARIES prosper_core)
+  endif()
 
   # Hinted map must not clobber a live mapping (#137): MAP_FIXED_NOREPLACE unless the hint is our
   # own uncommitted reservation. Drives the real map HLE handlers. Linux-only (mmap semantics).
@@ -3436,6 +3475,14 @@ endif()
   # Compile-only synthetic reject-route guard for #2790; not an executable real-shader reproducer.
   prosper_add_gtest(test_undef_loop_accumulator
     SOURCES tests/gpu/recompiler/test_undef_loop_accumulator.cpp
+    LIBRARIES prosper_core)
+
+  # Fail-visible refusal pins for gap opcodes (v_perm_b32, v_mad_i64_i32,
+  # v_div_fixup_f32, v_sad_u8, s_movrels_b32, image_gather4): empty module,
+  # never a silent mistranslation. Compile-only, no device. Any later
+  # lowering replaces these arms with execution tests.
+  prosper_add_gtest(test_gap_opcode_refusals
+    SOURCES tests/gpu/recompiler/test_gap_opcode_refusals.cpp
     LIBRARIES prosper_core)
 
   add_executable(test_fragment_loop_mask tests/gpu/recompiler/test_fragment_loop_mask.cpp)

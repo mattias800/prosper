@@ -10,6 +10,7 @@
 
 #include "shared/live/live_renderer_internal.hpp"
 #include "shared/live/submit_renderer/callback_types.hpp"
+#include "shared/present/single_framebuffer_submit_policy.hpp"
 #include "shared/texture/write_watch_policy.hpp"
 
 #include <optional>
@@ -37,6 +38,7 @@ public:
     int& decode_scope_submit();
     std::vector<std::shared_ptr<const std::vector<uint8_t>>>& retired_submit_pixels();
     std::unordered_map<uint64_t, ReflectMemoEntry>& reflect_memo();
+    SingleFramebufferSubmitFrame& single_framebuffer_submit_frame();
 
     CallbackThreadState(const CallbackThreadState&) = delete;
     CallbackThreadState& operator=(const CallbackThreadState&) = delete;
@@ -62,6 +64,7 @@ private:
     std::optional<int> decode_scope_submit_;
     std::optional<std::vector<std::shared_ptr<const std::vector<uint8_t>>>> retired_submit_pixels_;
     std::optional<std::unordered_map<uint64_t, ReflectMemoEntry>> reflect_memo_;
+    std::optional<SingleFramebufferSubmitFrame> single_framebuffer_submit_frame_;
 };
 
 } // namespace prosper::frontend::submit_renderer

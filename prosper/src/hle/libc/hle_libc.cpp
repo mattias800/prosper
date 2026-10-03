@@ -422,9 +422,47 @@ HLE(h_delete)      { guest_free_portable(P(a0)); return 0; }
 // ABI, which the host shares) — we can forward it directly.
 // --- byte ops / search (integer/pointer args → plain HLE thunks) ---
 HLE(h_bcmp)    { return (uint64_t)(int64_t)memcmp(CP(a0), CP(a1), a2); }   // bcmp == memcmp for equality
-HLE(h_bsearch) { // (key, base, nmemb, size, compar) — compar is a guest fn ptr; SysV ABI matches host
-    return (uint64_t)(uintptr_t)bsearch(CP(a0), CP(a1), a2, a3,
-                                        (int (*)(const void*, const void*))(uintptr_t)a4); }
+// --- guest comparators (bsearch / qsort) ---------------------------------------------------------
+// The comparator is GUEST code, compiled in the System V convention. On Linux/macOS that is also the
+// host convention, so the pointer could be handed to the host bsearch/qsort as-is. On Windows it is
+// not: the host library calls its callback with the two pointers in rcx/rdx, the guest reads rdi/rsi,
+// and the guest may clobber rsi/rdi/xmm6-xmm15, which a Microsoft x64 caller expects preserved. A
+// MinGW build run under Wine faults inside the comparator with the pointer cast straight through,
+// and sorts correctly with the shim below.
+//
+// So the host library gets a host-ABI shim, and the shim calls the guest comparator through a
+// PROSPER_GUEST_ABI pointer type, which makes the compiler marshal the call and preserve what the
+// guest may clobber. Only the pointer TYPE carries the attribute -- no function here is defined in
+// the guest convention, so the SEH restriction in dispatch.hpp does not apply. bsearch/qsort have no
+// context argument, so the guest pointer travels in a thread_local; a guest comparator may itself call
+// bsearch or qsort, so each call saves and restores it. On Linux/macOS PROSPER_GUEST_ABI is empty and
+// the shim is one extra indirect call.
+namespace {
+using GuestComparator = PROSPER_GUEST_ABI int (*)(const void*, const void*);
+thread_local GuestComparator t_guest_comparator = nullptr;
+
+int call_guest_comparator(const void* a, const void* b) {
+    return t_guest_comparator(a, b);
+}
+
+class ScopedGuestComparator {
+public:
+    explicit ScopedGuestComparator(uint64_t guest_fn) : saved_(t_guest_comparator) {
+        t_guest_comparator = reinterpret_cast<GuestComparator>(static_cast<uintptr_t>(guest_fn));
+    }
+    ~ScopedGuestComparator() { t_guest_comparator = saved_; }
+    ScopedGuestComparator(const ScopedGuestComparator&) = delete;
+    ScopedGuestComparator& operator=(const ScopedGuestComparator&) = delete;
+
+private:
+    GuestComparator saved_;
+};
+}   // namespace
+
+HLE(h_bsearch) {   // (key, base, nmemb, size, compar) — compar is a guest fn ptr in the guest ABI
+    ScopedGuestComparator scope(a4);
+    return (uint64_t)(uintptr_t)bsearch(CP(a0), CP(a1), a2, a3, call_guest_comparator);
+}
 // --- integer conversion, sort, tokenize, wide/scan. All confirmed target imports that were MISSING
 // (routed to the return-0 stub) -> returned 0/garbage and left endptr/output args unwritten on parsing
 // paths (localization, save/config, gameplay data). Plain host thunks; guest pointers are identity-mapped
@@ -451,8 +489,12 @@ static int prosper_rand_r(unsigned* seed) {
     return result;
 }
 HLE(h_rand_r)   { return (uint64_t)(int64_t)prosper_rand_r((unsigned*)P(a0)); }
-// qsort: the comparator is a guest fn ptr; SysV ABI matches host, callable directly (cf. h_bsearch).
-HLE(h_qsort)    { qsort(P(a0), a1, a2, (int (*)(const void*, const void*))(uintptr_t)a3); return 0; }
+// qsort: the comparator is a guest fn ptr in the guest ABI; see the comparator shim above h_bsearch.
+HLE(h_qsort) {
+    ScopedGuestComparator scope(a3);
+    qsort(P(a0), a1, a2, call_guest_comparator);
+    return 0;
+}
 HLE(h_strdup)   { const char* s = CS(a0); size_t n = strlen(s) + 1; void* p = guest_malloc_portable(n); if (p) memcpy(p, s, n); return (uint64_t)(uintptr_t)p; }
 HLE(h_strtok)   { return (uint64_t)(uintptr_t)strtok((char*)P(a0), CS(a1)); }
 HLE(h_strspn)   { return (uint64_t)strspn(CS(a0), CS(a1)); }

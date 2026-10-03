@@ -11455,17 +11455,6 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     const bool copy_eager_draws = eager_copy_env &&
         !(eager_copy_env[0] == '0' && eager_copy_env[1] == '\0');
 
-    size_t total_spans = 0;
-    bool in_draw_span = false;
-    for (const auto& operation : executable) {
-        if (render && operation.kind == RetainedSubmitKind::Draw) {
-            if (!in_draw_span) ++total_spans;
-            in_draw_span = true;
-        } else {
-            in_draw_span = false;
-        }
-    }
-
     uint32_t full_width = present_width(), full_height = present_height();
     const float scale_x = full_width ? static_cast<float>(width) / full_width : 1.0f;
     const float scale_y = full_height ? static_cast<float>(height) / full_height : 1.0f;
@@ -11477,7 +11466,6 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     // a producer epoch, so the indirect dispatches it strands are not counted as skipped-dispatches.
     bool epoch_broken_deliberately = false;
     bool indirect_dependencies_ok = true;
-    bool final_callback_sent = false;
     uint64_t previous_compute_code = 0;
     bool previous_compute_realized = false;
     bool previous_compute_executed = false;
@@ -11489,10 +11477,11 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
         ~DeferredGraphicsRetireGuard() { retire_deferred_graphics(); }
     } deferred_graphics_retire_guard;
     const bool defer_graphics_wait = graphics_deferred_wait_enabled();
-    auto flush_span = [&](bool authoritative_readback = false, bool before_dispatch = false) {
-        if (span.empty() || !render) return;
+    auto flush_span = [&](bool authoritative_readback = false, bool before_dispatch = false,
+                          bool final_span = false) {
+        const bool has_draws = !span.empty();
+        if (!render || (!has_draws && (!final_span || !result.render_spans))) return;
         LiveRenderPhase saved = g_live_phase;
-        const bool final_span = result.render_spans + 1 == total_spans;
         g_live_phase = {result.render_spans == 0, final_span, authoritative_readback};
         g_live_phase.source_submit = submit_no;
         // Only a span whose NEXT operation is a dispatch: the dispatch reaches renderer state
@@ -11504,9 +11493,10 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
         if (!rendered.empty()) result.frame = std::move(rendered);
-        span.clear();
-        ++result.render_spans;
-        final_callback_sent |= final_span;
+        if (has_draws) {
+            span.clear();
+            ++result.render_spans;
+        }
     };
 
     for (const auto& operation : executable) {
@@ -12357,20 +12347,11 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                 break;
         }
     }
-    flush_span();
     retire_deferred_graphics();   // #3948 stage 2 (the guard above covers early exits)
-    // A semantic draw record can fail only when lazily realized at its ordered position. If that
-    // record was counted as a later span, the last successful callback was intentionally marked
-    // intermediate. Send an empty terminal callback so the frontend can recover cached scanout,
-    // close timing state, and publish exactly once without re-rendering any draw.
-    if (render && result.render_spans && !final_callback_sent) {
-        LiveRenderPhase saved = g_live_phase;
-        g_live_phase = {false, true, false};
-        g_live_phase.source_submit = submit_no;
-        RenderedFrame rendered = render({}, width, height);
-        g_live_phase = saved;
-        if (!rendered.empty()) result.frame = std::move(rendered);
-    }
+    // Snapshot observations can split adjacent semantic draws, and later draws/dispatches can
+    // refuse or do no work. Only the actual end of ordered execution is final. If the last producer
+    // was already flushed, this empty callback publishes cached scanout without rerendering it.
+    flush_span(false, false, /*final_span=*/true);
     return result;
 }
 
