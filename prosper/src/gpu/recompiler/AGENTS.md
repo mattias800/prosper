@@ -4,6 +4,8 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 
 - `rdna2_decode` — instruction decode: formats, opcodes, operands. Pure and side-effect free, which
   makes it the cheapest thing in the stack to unit-test.
+- `rdna2_packet_raw_masks` holds the existing synchronized saved-mask FFBH service outside the
+  CFG dispatcher. Its extracted status adapter preserves the caller's named refusal and order.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the
   translator: register state, control-flow structurization, and per-instruction lowering.
 - `rdna2_recompile_fragment_packet` — an owned 64-slot guest-fragment executor in a physical
