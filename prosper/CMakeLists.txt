@@ -2357,6 +2357,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/memory/test_dmem_map_failure_rollback.cpp
     LIBRARIES prosper_core)
 
+  # BatchMap is prefix-committing: a later refused mapping reports how many prior entries took
+  # effect. Keep the failure count and retained direct mapping contract independently executable.
+  prosper_add_gtest(test_batchmap_prefix_failure
+    SOURCES tests/hle/memory/test_batchmap_prefix_failure.cpp
+    LIBRARIES prosper_core)
+
   # MapDirectMemory2 changes physical-allocation type only when its mapping succeeds; exercise the
   # refused fixed-map path against a live host mapping and pair it with a successful type control.
   prosper_add_gtest(test_map_direct_memory2_failure

@@ -148,16 +148,13 @@ static void test_build_image_bounds() {
         std::string err;
         CHECK(!build_image(m, 0x100000000ull, img, &err),
               "wrapping filesz is refused, not silently skipped (no OOB memcpy either way)");
-        CHECK(err.find("does not fit the mapped image") != std::string::npos,
-              "wrapping filesz names the image it could not fit");
+        // #4344: ELF requires p_filesz <= p_memsz, and build_image now refuses that first, before
+        // sizing the image or reaching the copy. The wrapping copy check above still guards a
+        // segment whose filesz fits its memsz; this case pins that the earlier rule names it.
+        CHECK(err.find("filesz 0xffffffffffffffff exceeds memsz 0x4000") != std::string::npos,
+              "wrapping filesz is refused as larger than its memsz");
         CHECK(err.find("program header 0") != std::string::npos,
               "wrapping filesz names the offending program header");
-        // Restores what the pre-#2631 `img.mem.size() > 0` carried: the extent computation still
-        // sized the window correctly (vaddr 0x4001 + memsz 0x4000, aligned out to [0x4000, 0xc000))
-        // in the presence of the malformed filesz. The refusal message quotes those bounds, so
-        // asserting them here keeps the fact pinned without a second build_image call.
-        CHECK(err.find("[0x4000, 0xc000)") != std::string::npos,
-              "wrapping filesz still sized the image correctly before refusing");
     }
     {   // malformed huge memsz: vaddr+memsz does not overflow (passes the extent-skip guard) but
         // align_up(hi) wraps to 0, giving max_vaddr(0) < min_vaddr(0x8000). Unguarded,
