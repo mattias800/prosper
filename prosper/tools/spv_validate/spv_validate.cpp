@@ -771,7 +771,8 @@ int main(int argc, char** argv) {
                  {"compressed", architectural::compressed()},
                  {"p2", architectural::previous_destination()},
                  {"wait_cmpx", architectural::pending_write(3, true)},
-                 {"wait_join", architectural::pending_join(true, false)}}) {
+                 {"wait_join", architectural::pending_join(true, false)},
+                 {"wait_image", architectural::pending_image(true)}}) {
             const auto compiled = recompile_fragment_resource_packet(input);
             dump(dir, (std::string("fragment_architectural_export_") + name).c_str(),
                  compiled.packet.spirv, "recompile_fragment_resource_packet");

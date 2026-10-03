@@ -315,6 +315,36 @@ TEST(FragmentPacketExports, ObservationSchemaAndCompletedWholeWaveAreImmutable) 
     EXPECT_EQ(decode_fragment_packet(done, execute(done), true).rejection,
               "packet-export-terminal-or-valid-mask-unproved");
 }
+TEST(FragmentPacketExports, WideImageDestinationCannotOverwritePendingHighestPhysicalWord) {
+    const auto refused = recompile_fragment_resource_packet(f::pending_image(false));
+    EXPECT_EQ(refused.packet.rejection, "packet-export-source-overwrite-before-wait");
+    EXPECT_TRUE(refused.packet.spirv.empty());
+    const auto input = f::pending_image(true);
+    const auto good = recompile_fragment_resource_packet(input);
+    retain(good.packet.spirv, "highest_image_word_wait");
+    ASSERT_FALSE(good.packet.spirv.empty()) << good.packet.rejection;
+    bpermute_oracle::Interpreter vm(good.packet.spirv);
+    for (uint32_t image = 0; image < good.images.size(); ++image)
+        for (const auto& mip : good.images[image].mips)
+            vm.sampled_images[16 + image].push_back({mip.width, mip.height, mip.texels});
+    const auto words = vm.run_packet(good.packet.input_words, good.packet.output_words);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    const auto decoded =
+        decode_fragment_resource_packet(good, words, true, input.device.device_identity);
+    ASSERT_TRUE(decoded.rejection.empty()) << decoded.rejection;
+    ASSERT_EQ(decoded.architectural_exports.size(), 64u);
+    const uint32_t sampled[]{0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        const auto& out = decoded.architectural_exports[lane];
+        ASSERT_EQ(out.events.size(), 2u);
+        EXPECT_EQ(out.events[0].source_words[0].has_value(), f::active(lane));
+        if (f::active(lane)) {
+            EXPECT_EQ(*out.events[0].source_words[0], f::value(0) + lane);
+            for (uint32_t channel = 0; channel < 4; ++channel)
+                EXPECT_EQ(out.colors[0][channel]->bits, sampled[channel]);
+        }
+    }
+}
 TEST(FragmentPacketExports, CachedModeAndEveryLateWaveFailureBlockTypedPublication) {
     auto prototype = f::scratch();
     const auto k =

@@ -179,6 +179,30 @@ inline FragmentResourcePacket compressed(uint32_t en = 15) {
     p.invocation.guest_code.push_back(0xbf810000u);
     return p;
 }
+inline FragmentResourcePacket pending_image(bool drain, uint32_t wave = 0) {
+    auto p = base(wave);
+    column(p, 10, 0);
+    column(p, 11, 0);
+    p.invocation.vgprs[0].words.fill(0x3e000000u); // genuine exact 4x4 base-mip XY centers
+    p.invocation.vgprs[1].words.fill(0x3e000000u);
+    column(p, 23, value(wave)); // highest word of the FOUR-word image destination
+    auto image = fragment_resource_packet::chain().images[0];
+    for (uint32_t word = 0; word < 8; ++word)
+        p.invocation.sgprs.emplace_back(4 + word, image.descriptor[word]);
+    for (uint32_t word = 0; word < 4; ++word)
+        p.invocation.sgprs.emplace_back(12 + word, image.sampler[word]);
+    auto& code = p.invocation.guest_code;
+    exp(code, 0, 1, 23, false, false); // original value before the wide MIMG destination write
+    if (drain) code.push_back(0xbf8c0000u);
+    image.pc = static_cast<uint32_t>(code.size());
+    code.insert(code.end(), {0xf0000000u | (0x27u << 18) | 0xf00u | 8u,
+                             10u | (20u << 8) | (1u << 16) | (3u << 21)});
+    code.push_back(0xbf8c0000u);   // actual asynchronous MIMG completion before reading its values
+    exp(code, 0, 15, 0x17161514u, true, true);
+    code.push_back(0xbf810000u);
+    p.images.push_back(std::move(image));
+    return p;
+}
 inline std::vector<FragmentPacketWavePlacement> placements(const FragmentPacketKernel& k) {
     const uint32_t in = k.layout.input_words + 2, out = k.layout.output_words + 128;
     return {{19 + 2 * (in + 17), 11 + out + 29}, {19, 11 + 2 * (out + 29)}, {19 + in + 17, 11}};
@@ -186,7 +210,7 @@ inline std::vector<FragmentPacketWavePlacement> placements(const FragmentPacketK
 inline FragmentResourcePacket previous_destination(bool missing = false) {
     auto p = base();
     p.invocation.exec_mask = 1ull << 63;
-    p.invocation.sgprs.emplace_back(16, 0); // hand-owned original M0 writer, NOT hardware ABI
+    p.invocation.sgprs.emplace_back(16, 0);   // hand-owned original M0 writer, NOT hardware ABI
     column(p, 0, 0);
     column(p, 1, 0);
     for (auto& c : p.invocation.vgprs) c.words.fill(0);
@@ -197,9 +221,9 @@ inline FragmentResourcePacket previous_destination(bool missing = false) {
     p.parameter_cache.parameters = {{1, 0, 0, 0x3f800000u, 0x3f800000u, 0x40000000u}};
     auto& code = p.invocation.guest_code;
     code.push_back(0xbefc0310u);
-    fragment_resource_packet::interp(code, 0, 10, 0, 0); // PC1, only63 defines scratch
-    code.push_back(0xbefe0a7eu); // PC2, reactivate60..63
-    fragment_resource_packet::interp(code, 1, 10, 0, 1); // PC3, implicit OLD VDST read
+    fragment_resource_packet::interp(code, 0, 10, 0, 0);   // PC1, only63 defines scratch
+    code.push_back(0xbefe0a7eu);   // PC2, reactivate60..63
+    fragment_resource_packet::interp(code, 1, 10, 0, 1);   // PC3, implicit OLD VDST read
     exp(code, 0, 1, 10, true, true);
     code.push_back(0xbf810000u);
     return p;
@@ -217,4 +241,4 @@ inline std::vector<uint32_t> scratch_records(uint32_t wave, bool inactive = fals
     }
     return words;
 }
-} // namespace prosper::test::fragment_packet_exports
+}   // namespace prosper::test::fragment_packet_exports

@@ -16,22 +16,23 @@ Execution execute(uint32_t family, bool missing = false, uint32_t en = 15) {
     prosper::test::ComputeOwnedDispatch owner;
     owner.prepare = [&](const prosper::test::ComputeEnabledContract& enabled,
                         prosper::test::ComputeOwnedPlan& plan) {
-        if (!enabled.shader_int64_enabled) {
+        if (!enabled.shader_int64_enabled || (family == 16 && !enabled.rgba32_sfloat_sampled)) {
             result.unsupported = true;
             return false;
         }
         std::vector<FragmentResourcePacket> waves;
         for (uint32_t wave = 0; wave < 3; ++wave) {
-            auto input = family >= 8 && family <= 14 ? f::pending_write(family - 8, true, wave)
-                         : family == 15              ? f::pending_join(true, en != 0, wave)
-                         : family == 1               ? f::scratch(wave, true)
-                         : family == 2               ? f::multiple()
-                         : family == 3               ? f::compressed(en)
-                         : family == 4               ? f::missing_active(missing && wave == 2)
-                         : family == 5               ? f::peer(missing && wave == 2)
-                         : family == 6               ? f::wqm(missing && wave == 2)
-                         : family == 7               ? f::previous_destination(missing && wave == 2)
-                                                     : f::scratch(wave);
+            auto input = family == 16                  ? f::pending_image(true, wave)
+                         : family >= 8 && family <= 14 ? f::pending_write(family - 8, true, wave)
+                         : family == 15                ? f::pending_join(true, en != 0, wave)
+                         : family == 1                 ? f::scratch(wave, true)
+                         : family == 2                 ? f::multiple()
+                         : family == 3                 ? f::compressed(en)
+                         : family == 4                 ? f::missing_active(missing && wave == 2)
+                         : family == 5                 ? f::peer(missing && wave == 2)
+                         : family == 6                 ? f::wqm(missing && wave == 2)
+                         : family == 7 ? f::previous_destination(missing && wave == 2)
+                                       : f::scratch(wave);
             input.device = {enabled.device_identity, enabled.shader_int64_enabled,
                             enabled.rgba32_sfloat_sampled};
             waves.push_back(std::move(input));
@@ -47,6 +48,11 @@ Execution execute(uint32_t family, bool missing = false, uint32_t en = 15) {
         plan.initial_output = result.batch.output_words;
         plan.readonly_words = {result.batch.authority, &result.batch.authority->words()};
         plan.wave_count = 3;
+        for (const auto& image : result.batch.images) {
+            std::vector<prosper::test::ComputeSampledMip> mips;
+            for (const auto& mip : image.mips) mips.push_back({mip.width, mip.height, mip.texels});
+            plan.images.push_back(std::move(mips));
+        }
         return true;
     };
     const auto raw = prosper::test::run_compute({}, {}, 64, 0, {}, {}, nullptr, 64, nullptr,
@@ -201,6 +207,24 @@ TEST(FragmentPacketExportExecution, ActiveUnavailableLateWordCannotHideBehindVmO
             EXPECT_FALSE(actual.result.architectural_exports[2][40].commit_eligible);
         }
     }
+}
+TEST(FragmentPacketExportExecution, WideImageWritePreservesCompletedEarlierPhysicalWord) {
+    const auto actual = execute(16);
+    if (actual.unsupported) GTEST_SKIP() << "No queried+enabled Int64 owner";
+    ASSERT_TRUE(actual.result.rejection.empty()) << actual.result.rejection;
+    ASSERT_EQ(actual.result.architectural_exports.size(), 3u);
+    const uint32_t sampled[]{0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
+    for (uint32_t wave = 0; wave < 3; ++wave)
+        for (uint32_t lane = 0; lane < 64; ++lane) {
+            const auto& out = actual.result.architectural_exports[wave][lane];
+            ASSERT_EQ(out.events.size(), 2u);
+            EXPECT_EQ(out.events[0].source_words[0].has_value(), f::active(lane));
+            if (f::active(lane)) {
+                EXPECT_EQ(*out.events[0].source_words[0], f::value(wave) + lane);
+                for (uint32_t channel = 0; channel < 4; ++channel)
+                    EXPECT_EQ(out.colors[0][channel]->bits, sampled[channel]);
+            }
+        }
 }
 TEST(FragmentPacketExportExecution, InactivePeerAndReactivatedWordsRetainOriginalReadAuthority) {
     for (uint32_t family : {5u, 6u, 7u})
