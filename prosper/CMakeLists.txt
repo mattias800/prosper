@@ -537,6 +537,12 @@ if(Python3_Interpreter_FOUND)
   # every other arm in the file. Platform-independent: nothing here reads /proc or shells out.
   add_test(NAME pr_body_readback
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_body.py")
+  # check_pr_template.py enforces PR description structure against .github/pull_request_template.md.
+  # Hand-written compliant and violating fixtures ensure the parser cannot quietly pass empty or
+  # broken descriptions.
+  add_test(NAME pr_template_checker
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_pr_template.py"
+                   --selftest)
   # ratchet_hook.py is the PreToolUse hook that runs check_arch_ratchet.py before an agent's
   # `git commit` / `git push` (#4193), in delta mode against origin/main. The rollout is warn-only
   # (BLOCK_ON_VIOLATION): a violation exits 0 with a systemMessage, and everything that is not a

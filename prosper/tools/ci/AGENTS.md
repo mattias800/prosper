@@ -12,6 +12,8 @@ usage, whether a PR is safe to merge.
 ## What lives here
 
 - **`check_contribution_shape.py`** — the contribution-shape CI job.
+- **`check_pr_template.py`** — enforces PR description structure against `.github/pull_request_template.md`
+  in the contribution-shape CI job and ctest (`--selftest`), requiring all 7 template sections and verification answers.
 - **`check_python_quality.py`** — the `python-quality` CI job: a ratchet over the Python a PR
   *changes*. Added files must be ruff-clean, ruff-format-clean and carry a module docstring; modified
   files may not gain ruff findings; an added tool under `prosper/tools/` needs a test in the same PR.

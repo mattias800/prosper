@@ -44,6 +44,12 @@ Because of the glob, a new source file needs no build-system change — so it ca
 and completely unexercised, where "it compiles" is the only claim anyone can check. Modifying an
 existing file does not trip this; only adding a new one does.
 
+**3. PR descriptions must follow `.github/pull_request_template.md`.**
+
+The contribution-shape gate enforces the seven required sections (Context, Higher Goal, Acceptance
+Criteria, Out of Scope, Summary of Changes, Verification, Checklist), that placeholders are replaced
+with substantive answers, and that Verification prompts cite added tests and commands run.
+
 ## Judged by review
 
 **One change per pull request, and prefer the smallest version that works.** A 1,200-line header

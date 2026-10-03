@@ -538,9 +538,9 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   coverage for its established return codes and edge cases. Pure documentation and mechanical
   changes use relevant checks when there is no behavior to assert; state the scope and any
   verification limits in the PR. Never weaken an assertion to get green without explaining why.
-  Full rules: `prosper/tests/AGENTS.md`. PR descriptions may use
+  Full rules: `prosper/tests/AGENTS.md`. PR descriptions must follow
   `.github/pull_request_template.md` (Context, Higher Goal, Acceptance Criteria, Out of Scope,
-  Summary of Changes, Verification), scaled to the change.
+  Summary of Changes, Verification, Checklist), enforced by CI (`check_pr_template.py`), scaled to the change.
   Optional project skills in `.claude/skills/`: `start-task`, `implement-hle-function` and
   `perf-change`.
   They preserve the task's existing authorization, resource coordination and machine-local rules.

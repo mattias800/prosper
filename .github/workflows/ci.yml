@@ -396,6 +396,17 @@ jobs:
           python3 prosper/tools/ci/check_contribution_shape.py --github \
             --base "origin/${{ github.base_ref }}"
 
+      # PR description template enforcement: verify the PR description adheres to the required
+      # template structure (.github/pull_request_template.md). Runs offline from GITHUB_EVENT_PATH,
+      # with --selftest preceding it so a parser that stopped discriminating fails before gating PRs.
+      - name: Verify PR template checker still discriminates
+        run: python3 prosper/tools/ci/check_pr_template.py --selftest
+
+      - name: Verify PR description structure
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 prosper/tools/ci/check_pr_template.py --event-json "$GITHUB_EVENT_PATH" --github
+
   python-quality:
     name: Python quality
     runs-on: ubuntu-latest
