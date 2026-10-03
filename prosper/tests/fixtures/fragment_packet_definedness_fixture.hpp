@@ -2,7 +2,9 @@
 #include "fragment_packet_fixture.hpp"
 #include "fragment_resource_packet_fixture.hpp"
 #include "fragment_packet_mbcnt_fixture.hpp"
+#include <array>
 #include <string>
+#include <utility>
 
 namespace prosper::test::fragment_definedness {
 using namespace prosper::gpu;
@@ -14,6 +16,7 @@ struct Case {
     uint32_t failure_lane = UINT32_MAX, failure_pc = UINT32_MAX, failure_reg = UINT32_MAX;
     uint32_t failure_kind = 0;
 };
+inline constexpr uint32_t kIntegerRailCount = 30;
 inline FragmentInvocationPacket base() {
     FragmentInvocationPacket p;
     p.slots_available.fill(true);
@@ -40,6 +43,32 @@ inline std::vector<uint32_t> expected(uint64_t exec, uint32_t active,
         std::copy(std::begin(row), std::end(row), out.begin() + lane * 12);
     }
     return out;
+}
+inline FragmentInvocationPacket numeric_exec_pair(uint64_t mask) {
+    auto p = base();
+    p.sgprs.emplace_back(2, 0x73330042u);
+    for (auto& [reg, value] : p.sgprs) {
+        if (reg == 20) value = static_cast<uint32_t>(mask);
+        if (reg == 21) value = static_cast<uint32_t>(mask >> 32);
+    }
+    fp::vmov(p.guest_code, 2, 0);   // full-EXEC writer establishes absent scratch for all raw rows
+    p.guest_code.push_back(0xbefe0414u);   // original S_MOV_B64 EXEC,s[20:21] form
+    fp::vmov(p.guest_code, 2, 2);   // scalar transfer controls this actual masked vector write
+    fp::exp(p.guest_code, 1, 2);
+    p.guest_code.push_back(0xbf810000u);
+    return p;
+}
+inline FragmentInvocationPacket saved_mask_high_overwrite(bool boundary) {
+    auto p = base();
+    column(p, 1, 0xdeadbeefu);
+    p.guest_code.push_back(0xbe94047eu);   // S_MOV_B64 s[20:21],EXEC: Bool, not numeric halves
+    fp::smov(p.guest_code, 21, 0);   // legal high-only overwrite destroys the complete old mask
+    if (boundary) p.guest_code.push_back(0xbf820000u);   // next-instruction dispatcher boundary
+    p.guest_code.push_back(0xbefe0414u);   // cannot reuse the stale complete Bool mask
+    fp::vmov(p.guest_code, 1, 0);
+    fp::exp(p.guest_code, 1, 1);
+    p.guest_code.push_back(0xbf810000u);
+    return p;
 }
 inline std::vector<Case> cases() {
     std::vector<Case> out;
@@ -76,10 +105,10 @@ inline std::vector<Case> cases() {
     auto restore = p;
     restore.exec_mask &= ~(uint64_t(1) << 40);
     restore.guest_code.insert(restore.guest_code.begin() + 1,
-                              0xbefe0414u); // restore full EXEC from s20:21
+                              0xbefe0414u);   // restore full EXEC from s20:21
     out.push_back({"masked_writer_not_full_definition", restore, {}, 40, 2, 1, 4});
     auto branch = p;
-    branch.guest_code.insert(branch.guest_code.begin(), 0xbf840001u); // SCC0 skips actual MOV
+    branch.guest_code.insert(branch.guest_code.begin(), 0xbf840001u);   // SCC0 skips actual MOV
     branch.scc = true;
     out.push_back({"executed_forward_writer", branch, expected(UINT64_MAX, 0x42230011u)});
     branch.scc = false;
@@ -111,12 +140,12 @@ inline std::vector<Case> cases() {
     column(widened, 0, 0, 1);
     column(widened, 2, 0xdeadbeefu);
     fp::vmov(widened.guest_code, 1, 256);
-    widened.guest_code.push_back(0xbefe0a7eu); // S_WQM_B64 EXEC,EXEC
+    widened.guest_code.push_back(0xbefe0a7eu);   // S_WQM_B64 EXEC,EXEC
     fp::vmov(widened.guest_code, 2, 257);
     fp::exp(widened.guest_code, 1, 2);
     widened.guest_code.push_back(0xbf810000u);
     out.push_back({"wqm_newly_active_read_absent", widened, {}, 1, 2, 1, 1});
-    column(widened, 1, 0, ~uint64_t(1)); // old neighbors supplied, lane0 defined by actual MOV
+    column(widened, 1, 0, ~uint64_t(1));   // old neighbors supplied, lane0 defined by actual MOV
     out.push_back({"wqm_newly_active_read_owned", widened, expected(15, 0)});
     for (const auto source : {fp::mbcnt::Source::Exec, fp::mbcnt::Source::Vgpr}) {
         fp::mbcnt::Case c;
@@ -135,14 +164,64 @@ inline std::vector<Case> cases() {
     out.push_back(
         {"distinct_readlane_event_after_source_change", events, fp::expected(later, events)});
     auto two_reads = base();
-    fp::vmov(two_reads.guest_code, 1, 256); // actual absent v0 read at PC0
-    fp::vmov(two_reads.guest_code, 2, 259); // distinct absent v3 read at PC1
+    fp::vmov(two_reads.guest_code, 1, 256);   // actual absent v0 read at PC0
+    fp::vmov(two_reads.guest_code, 2, 259);   // distinct absent v3 read at PC1
     fp::exp(two_reads.guest_code, 1, 2);
     two_reads.guest_code.push_back(0xbf810000u);
     out.push_back({"two_bad_reads_keep_first_failure", two_reads, {}, 0, 0, 0, 1});
     column(two_reads, 0, 0);
     column(two_reads, 3, 0x73330003u);
     out.push_back({"same_two_reads_genuine_inputs", two_reads, expected(UINT64_MAX, 0x73330003u)});
+    constexpr uint64_t low_bits = 0x80000001u;   // independent positions0/31
+    constexpr uint64_t high_bits = uint64_t(0x80000101u) << 32;   // positions32/40/63
+    for (const auto& [name, mask] : std::array<std::pair<const char*, uint64_t>, 5>{
+             {{"numeric_exec_present_zero", 0},
+              {"numeric_exec_all_ones", UINT64_MAX},
+              {"numeric_exec_low_positions", low_bits},
+              {"numeric_exec_high_positions", high_bits},
+              {"numeric_exec_asymmetric_both_halves", low_bits | high_bits}}}) {
+        const auto input = numeric_exec_pair(mask);
+        out.push_back({name, input, expected(mask, 0x73330042u, 0x42230011u)});
+    }
+    auto overwrite = numeric_exec_pair(1 | (uint64_t(1) << 40));
+    std::vector<uint32_t> high_zero;
+    fp::smov(high_zero, 21, 0);
+    overwrite.guest_code.insert(overwrite.guest_code.begin() + 1, high_zero.begin(),
+                                high_zero.end());
+    out.push_back(
+        {"numeric_exec_current_high_overwrite", overwrite, expected(1, 0x73330042u, 0x42230011u)});
+    for (bool scc : {false, true}) {
+        auto join = overwrite;
+        join.guest_code.insert(join.guest_code.begin() + 1,
+                               0xbf840002u);   // SCC0 skips high writer
+        join.scc = scc;
+        const uint64_t mask = scc ? 1 : 1 | (uint64_t(1) << 40);
+        out.push_back({scc ? "numeric_exec_join_current_zero" : "numeric_exec_join_entry_high",
+                       join, expected(mask, 0x73330042u, 0x42230011u)});
+        auto preserved_scc = numeric_exec_pair(low_bits | high_bits);
+        preserved_scc.guest_code.insert(preserved_scc.guest_code.begin() + 2,
+                                        0xbf840001u);   // AFTER transfer: SCC0 skips masked MOV
+        preserved_scc.scc = scc;
+        out.push_back(
+            {scc ? "numeric_exec_preserves_scc_true" : "numeric_exec_preserves_scc_false",
+             preserved_scc,
+             expected(low_bits | high_bits, scc ? 0x73330042u : 0x42230011u, 0x42230011u)});
+    }
+    auto copy = numeric_exec_pair(low_bits | high_bits);
+    copy.guest_code.insert(copy.guest_code.begin() + 1, 0xbe960414u);   // copy numeric pair to22:23
+    copy.guest_code.insert(copy.guest_code.begin() + 2, high_zero.begin(), high_zero.end());
+    copy.guest_code[4] = 0xbefe0416u;   // consume owned copy after original high word changed
+    out.push_back({"numeric_exec_copied_pair_survives_source_change", copy,
+                   expected(low_bits | high_bits, 0x73330042u, 0x42230011u)});
+    auto disabled_entry = numeric_exec_pair(uint64_t(1) << 40);
+    disabled_entry.exec_mask = 0;
+    column(disabled_entry, 2, 0x42230011u);   // genuine old inactive raw payload, not scratch zero
+    std::vector<uint32_t> unused_writer;
+    fp::vmov(unused_writer, 3, 0);
+    disabled_entry.guest_code.insert(disabled_entry.guest_code.begin() + 1,
+                                     unused_writer.front());   // absent, unobserved scratch
+    out.push_back({"numeric_exec_move_ignores_old_exec", disabled_entry,
+                   expected(uint64_t(1) << 40, 0x73330042u, 0x42230011u)});
     return out;
 }
 inline FragmentResourcePacket resource_chain(bool lod, bool inactive) {

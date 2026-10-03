@@ -29,8 +29,8 @@ TEST(FragmentPacketDefinednessExec, ActualMaskBranchPeerAndInactiveRawOutput) {
     const auto queried = prosper::test::default_compute_subgroup_properties();
     std::fprintf(
         stderr,
-        "[vgpr-definedness-gpu] queried_physical_subgroup_size=%u expected_dispatch_attempts=18\n",
-        queried.size);
+        "[vgpr-definedness-gpu] queried_physical_subgroup_size=%u expected_dispatch_attempts=%u\n",
+        queried.size, f::kIntegerRailCount);
     ASSERT_GT(queried.size, 0u) << "no runtime cannot pass";
     reset_float_controls_support_for_test();
     uint32_t attempts = 0;
@@ -57,9 +57,9 @@ TEST(FragmentPacketDefinednessExec, ActualMaskBranchPeerAndInactiveRawOutput) {
         } else
             EXPECT_TRUE(result.rejection.empty()) << result.rejection;
     }
-    EXPECT_EQ(attempts, 18u);
-    std::fprintf(stderr, "[vgpr-definedness-gpu] integer_dispatch_attempts=%u expected=18\n",
-                 attempts);
+    EXPECT_EQ(attempts, f::kIntegerRailCount);
+    std::fprintf(stderr, "[vgpr-definedness-gpu] integer_dispatch_attempts=%u expected=%u\n",
+                 attempts, f::kIntegerRailCount);
 }
 
 TEST(FragmentPacketDefinednessExec, ActualOwnedResourceWriterAndPartialEntryChain) {

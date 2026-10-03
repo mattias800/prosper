@@ -67,9 +67,41 @@ TEST(FragmentPacketDefinedness, ActualSourceMaskBranchPeerAndRawOutputRails) {
         } else
             EXPECT_TRUE(result.rejection.empty()) << result.rejection;
     }
-    EXPECT_EQ(attempts, 18u);
-    std::fprintf(stderr, "[vgpr-definedness-source] integer_evaluation_attempts=%u expected=18\n",
-                 attempts);
+    EXPECT_EQ(attempts, f::kIntegerRailCount);
+    std::fprintf(stderr, "[vgpr-definedness-source] integer_evaluation_attempts=%u expected=%u\n",
+                 attempts, f::kIntegerRailCount);
+}
+
+TEST(FragmentPacketDefinedness, NumericExecMaskRequiresCompleteReachingWords) {
+    for (uint32_t absent : {20u, 21u}) {
+        auto input = f::numeric_exec_pair(0);
+        std::erase_if(input.sgprs, [&](const auto& word) { return word.first == absent; });
+        const auto p = recompile_fragment_packet(input);
+        EXPECT_TRUE(p.spirv.empty());
+        EXPECT_EQ(p.rejection, "packet-sgpr-read-before-definition");
+    }
+    // The same instruction stream with a genuine present-zero high word is executable above.
+    // One conditional writer cannot replace a missing entry word on its skipped predecessor.
+    auto join = f::numeric_exec_pair(1);
+    std::vector<uint32_t> high_zero;
+    f::fp::smov(high_zero, 21, 0);
+    join.guest_code.insert(join.guest_code.begin() + 1, high_zero.begin(), high_zero.end());
+    join.guest_code.insert(join.guest_code.begin() + 1, 0xbf840002u);
+    std::erase_if(join.sgprs, [](const auto& word) { return word.first == 21; });
+    for (bool scc : {false, true}) {
+        join.scc = scc;
+        const auto p = recompile_fragment_packet(join);
+        EXPECT_TRUE(p.spirv.empty());
+        EXPECT_EQ(p.rejection, "packet-sgpr-read-before-definition");
+    }
+    for (bool boundary : {false, true}) {
+        SCOPED_TRACE(boundary ? "dispatcher reload" : "same emitted case");
+        const auto p = recompile_fragment_packet(f::saved_mask_high_overwrite(boundary));
+        EXPECT_TRUE(p.spirv.empty());
+        EXPECT_NE(p.rejection.find("packet-exec-mask-source-words-unavailable"), std::string::npos)
+            << p.rejection;
+        EXPECT_NE(p.rejection.find(boundary ? "pc=4" : "pc=3"), std::string::npos) << p.rejection;
+    }
 }
 
 TEST(FragmentPacketDefinedness, OwnedResourceChainUsesWriterOnlyAndInactiveObservedWords) {

@@ -51,6 +51,12 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   mask/helper/system/composition/commit authority remain separate obligations. The CPU-only
   `PROSPER_VGPR_DEFINEDNESS_SPV_DIRECTORY` diagnostic retains actual emitted SOURCE for validation;
   unset writes no files and never changes guest lowering or admission.
+- `rdna2_mask_move` supplies the shared S_MOV_B64-to-EXEC lowering. Owned Wave64 packets consume
+  two genuine instruction-order MUST scalar words at their logical lane position, independently
+  of old EXEC, and preserve SCC. A partial numeric overwrite of a saved Bool mask remains a named
+  transitional refusal until the preserved raw half is genuinely materialized; scalar
+  initialization or the old complete Bool alias is not that proof. Native fragment lowering is
+  separate and retains its existing exact-subgroup contract.
 - `spirv_builder` — small hand-built SPIR-V modules. **These include shipped shaders**:
   `frontends/shared/live/live_compute.cpp`'s `prepare_compare_pipeline()` feeds
   `build_compute_compare_uvec4()` straight to `vkCreateShaderModule` on the live path. The GPU
