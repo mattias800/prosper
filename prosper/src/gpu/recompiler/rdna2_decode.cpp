@@ -86,10 +86,9 @@ bool vopc_is_cmpx(uint32_t opcode) {
 bool rdna2_instruction_may_change_exec(const Rdna2Inst& in) {
     if (in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)) return true;
     // saveexec writes EXEC implicitly while its explicit destination receives the previous mask.
+    // Both widths count: the B64 family (0x24-0x2B, 0x37-0x3A) and the B32 family (0x3C-0x47).
     if (in.fmt == Rdna2Format::SOP1 &&
-        ((in.opcode >= 0x24u && in.opcode <= 0x2bu) ||
-         in.opcode == 0x37u || in.opcode == 0x38u ||
-         sop1_opcode_writes_exec_b32(in.opcode)))
+        (sop1_opcode_writes_exec_b64(in.opcode) || sop1_opcode_writes_exec_b32(in.opcode)))
         return true;
     auto is_exec = [](const Operand& operand) {
         return (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
