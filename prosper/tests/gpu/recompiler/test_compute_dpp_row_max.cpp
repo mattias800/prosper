@@ -162,7 +162,9 @@ TEST_P(ComputeDppRowMaxCfgSpill, RejectsScalarSpillBeforePublishingRowSource) {
         const uint32_t max_pc = static_cast<uint32_t>(code.size());
         const auto row = prosper::test::dpp_row_max_program({1});
         code.insert(code.end(), row.begin(), row.end() - 1);
-        code.insert(code.end(), {0xf8000941u, 0x00000001u, 0xbf810000u}); // raw v1 sink
+        // Export independent genuine v2 so a later generic spill-source refusal cannot hide
+        // whether the row event itself admitted the unresolved v1 value.
+        code.insert(code.end(), {0xf8000941u, 0x00000002u, 0xbf810000u});
         const uint64_t address = 0x42680000u + (mask << 8) + (restored << 6) +
                                  (native << 4) + spill_source;
         const auto module = recompile_ngg_exports_for_test(
