@@ -35,11 +35,13 @@ protected:
         ASSERT_EQ(std::fwrite(expected.data(), 1, expected.size(), f), expected.size());
         ASSERT_EQ(std::fclose(f), 0);
         file_id = prosper_apr_register(path, expected.size());
-        // install_stubs claims a fixed aperture, and Windows refuses a second reservation of the
-        // same base (ERROR_INVALID_ADDRESS). Every case needs the same one slot, so install it once.
+        // install_stubs claims a fixed aperture, and every platform refuses a second claim of the
+        // same base, so a direct all-cases run failed from its second case. Every case needs the same
+        // one slot: install it once. The slot vector is static because dispatch keeps a pointer to it.
+        static const std::vector<ImportSlot> slots{{"libSceAmpr","mQ16-QdKv7k"}};
         static const std::string install_error = [] {
             std::string error;
-            if (install_stubs({{"libSceAmpr","mQ16-QdKv7k"}}, 0x720000000ull, 96, &error))
+            if (install_stubs(slots, 0x720000000ull, 96, &error))
                 return std::string();
             return error.empty() ? std::string("install_stubs failed") : error;
         }();
