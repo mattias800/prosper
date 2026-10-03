@@ -21,6 +21,25 @@ atlas.
 - **Refused shaders now leave their code behind by default** (#4273). #4120's dropped vertex shaders
   could not be examined, because the run that showed them kept nothing.
 
+## Known and explained: `Share.prx`'s start faults at boot
+
+`[prosper] init fn 0x5d0000010 faulted (SIGSEGV at addr=(nil) rip=… (plugin+0x19a)); continuing`
+appears on every boot. It is explained and does not affect the game:
+
+- **The fault.** `Media/Plugins/Share.prx`'s `module_start` (`+0x12a0`) passes its `argp` to
+  `+0x190`. That function reads `argp` before checking it, expecting Unity's plugin block
+  `{u32 0x10, u32 0x200, u64 …}` or a `{0x58, 0x103, …}` variant. prosper auto-links every
+  `Media/Plugins` module and starts it at boot with `argp = NULL`, so the first read faults.
+- **Why it is harmless.** Unity starts the plugins it uses itself, through
+  `sceKernelLoadStartModule(path, 0x34, &{0x10, 0x200, ptr…})`. A probe of the first 60 s of the
+  route shows that for `PSN.prx`, `SaveData.prx` and `CommonDialog.prx`, but **never for
+  `Share.prx`**. On hardware it is not started at all on this route. prosper's premature start is
+  the only one, and nothing the game uses depends on it.
+
+The general fix is prosper's start policy for auto-linked plugins. Deferring every unimported
+plugin to `sceKernelLoadStartModule` (PR #4221) regressed three guarded Unity titles, so it needs a
+narrower rule. This route is a test case for it.
+
 ## Route
 
 A human-authored snaps session (`prosper/tools/snapshot/snaps.py author --name silksong-menu`)
