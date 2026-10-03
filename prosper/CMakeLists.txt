@@ -3851,6 +3851,12 @@ endif()
       target_link_libraries(test_runtime_prx_load PRIVATE prosper_core)
       add_test(NAME runtime_prx_load COMMAND test_runtime_prx_load)
       if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # Initial installation must reject an oversized last-slot hook before touching live pages.
+        prosper_add_gtest(test_initial_stub_install
+          SOURCES tests/host/image/test_initial_stub_install.cpp
+          LIBRARIES prosper_core
+          PROPERTIES TIMEOUT 20)
+        target_link_options(test_initial_stub_install PRIVATE "-Wl,--wrap=mmap")
         target_link_options(test_runtime_prx_load PRIVATE "-Wl,--wrap=mmap")
         foreach(failure map image emission)
           add_test(NAME runtime_prx_append_${failure}_failure
