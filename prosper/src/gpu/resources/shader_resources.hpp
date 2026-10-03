@@ -566,18 +566,18 @@ inline bool valid_raw_register_snapshot_resource(const ShaderResource& resource)
 // realization. Code-side provenance identifies its PC; replay must supply a complete hosted word
 // at that PC instead of borrowing current guest memory or a legacy binding-2 buffer.
 inline bool valid_owned_raw_snapshot_shape(const ShaderResource& resource, uint32_t bytes) {
-    return resource.cls == ResourceClass::ConstantBuffer &&
-        resource.format == DataFormat::Uint32 && resource.num_components == 1u &&
-        (bytes == 4u || bytes == 16u || bytes == 32u) &&
-        resource.size == bytes && resource.stride == 0u &&
-        resource.fetch_pc != UINT32_MAX && resource.srt_offset == UINT32_MAX &&
-        resource.sgpr_base == UINT32_MAX && resource.table_index_count == 0u &&
-        resource.scalar_buffer_dword_count == 0u && !resource.nested_raw_snapshot_admitted &&
-        !resource.raw_register_snapshot && resource.gpu_addr > 0x10000u &&
-        (resource.gpu_addr & 3u) == 0u &&
-        resource.gpu_addr <= UINT64_MAX - bytes && resource.host_data_prefix_bytes == 0u &&
-        (bytes == 4u ? resource.owned_raw_snapshot_bytes == 0u :
-                      (!resource.owned_raw_snapshot_bytes || resource.owned_raw_snapshot_bytes == bytes));
+    return resource.cls == ResourceClass::ConstantBuffer && resource.format == DataFormat::Uint32 &&
+           resource.num_components == 1u &&
+           (bytes == 4u || bytes == 8u || bytes == 16u || bytes == 32u) && resource.size == bytes &&
+           resource.stride == 0u && resource.fetch_pc != UINT32_MAX &&
+           resource.srt_offset == UINT32_MAX && resource.sgpr_base == UINT32_MAX &&
+           resource.table_index_count == 0u && resource.scalar_buffer_dword_count == 0u &&
+           !resource.nested_raw_snapshot_admitted && !resource.raw_register_snapshot &&
+           resource.gpu_addr > 0x10000u && (resource.gpu_addr & 3u) == 0u &&
+           resource.gpu_addr <= UINT64_MAX - bytes && resource.host_data_prefix_bytes == 0u &&
+           (bytes == 4u ? resource.owned_raw_snapshot_bytes == 0u
+                        : (!resource.owned_raw_snapshot_bytes ||
+                           resource.owned_raw_snapshot_bytes == bytes));
 }
 
 inline bool valid_owned_raw_snapshot_resource(const ShaderResource& resource, uint32_t bytes,
@@ -970,10 +970,11 @@ inline const ShaderResource* owned_nested_snapshot_at(const ShaderResourceTable&
         if (selected) return nullptr;
         selected = &resource;
     }
-    return selected && (bytes == 16u || bytes == 32u) &&
-        selected->owned_nested_snapshot_bytes == bytes &&
-        valid_owned_raw_snapshot_resource(*selected, bytes, has_host_data(*selected))
-        ? selected : nullptr;
+    return selected && (bytes == 8u || bytes == 16u || bytes == 32u) &&
+                   selected->owned_nested_snapshot_bytes == bytes &&
+                   valid_owned_raw_snapshot_resource(*selected, bytes, has_host_data(*selected))
+               ? selected
+               : nullptr;
 }
 
 inline const ShaderResource* owned_nested_snapshot_at(const ShaderResourceTable& table,

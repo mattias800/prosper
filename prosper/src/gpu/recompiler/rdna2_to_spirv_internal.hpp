@@ -2918,6 +2918,7 @@ struct RegState {
     std::unordered_set<uint32_t> smem_raw_owned_wide_data_loads;
     std::unordered_set<uint32_t> smem_raw_nested_wide_data_loads;
     std::vector<RawNestedWideChain> smem_owned_nested_wide_chains;
+    std::vector<RawNestedWideChain> smem_owned_raw_x2_chains;
     std::unordered_set<uint32_t> smem_raw_wide_data_loads;
     bool smem_pointer_analysis_done = false;
     // Register-offset S_LOAD_DWORDX2 is likewise typeless. GTA V uses it to fetch the first two
@@ -2979,6 +2980,18 @@ inline bool retain_original_owned_nested_wide_proof(
     for (const auto& chain : rs.smem_owned_nested_wide_chains)
         if (std::find(original.begin(), original.end(), chain) == original.end()) return false;
     rs.smem_owned_nested_wide_chains = original;
+    return true;
+}
+
+inline bool retain_original_owned_raw_x2_proof(RegState& rs,
+                                               const std::vector<RawNestedWideChain>& original) {
+    for (const auto& chain : rs.smem_owned_raw_x2_chains)
+        if (std::find(original.begin(), original.end(), chain) == original.end()) return false;
+    rs.smem_owned_raw_x2_chains = original;
+    for (const auto& chain : original) {
+        rs.smem_raw_x2_data_loads.insert(chain.parent_pc);
+        rs.smem_raw_x2_data_loads.insert(chain.child_pc);
+    }
     return true;
 }
 
@@ -3518,4 +3531,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                bool force_barrier_phases = false,
                bool force_lds_fminmax_dispatcher = false);
 
+std::unordered_set<uint32_t> rdna2_proven_smem_pointer_loads(const std::vector<Rdna2Inst>&);
+bool emit_owned_raw_x2(SpirvCompute&, RegState&, const Rdna2Inst&, const ShaderResourceTable*,
+                       bool&);
+void end_smem_vcc_data_lifetime(RegState&, const Rdna2Inst&, uint32_t);
 }  // namespace prosper::gpu
