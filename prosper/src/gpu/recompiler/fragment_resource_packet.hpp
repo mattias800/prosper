@@ -1,5 +1,6 @@
 #pragma once
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/state/fragment_entry_facts.hpp"
 #include <span>
 
 namespace prosper::gpu {
@@ -44,6 +45,9 @@ struct FragmentPacketDeviceContract {
 struct FragmentResourcePacket {
     FragmentInvocationPacket invocation;
     FragmentLaunchRsrc1 launch_rsrc1{}; // complete ORIGINAL launch word, not a host mode verdict
+    // Original producing PS RSRC2, not an invented STATUS/MODE word. The shipping input bridge
+    // retains this carrier; copying it does not establish the still-missing guest register ABI.
+    FragmentEntryFacts entry_facts;
     FragmentPacketParameterCache parameter_cache;
     std::vector<FragmentPacketBufferRead> buffers;
     std::vector<FragmentPacketImageRead> images;
@@ -51,9 +55,15 @@ struct FragmentResourcePacket {
 };
 
 enum class FragmentPacketRuntimeFailure : uint32_t {
-    None = 0, DescriptorMismatch = 1, M0Mismatch = 2, NonFinite = 3,
-    FiniteOverflow = 4, InterpolationNotExact = 5,
-    SampleCoordinateDomain = 6, SampleLodDomain = 7,
+    None = 0,
+    DescriptorMismatch = 1,
+    M0Mismatch = 2,
+    NonFinite = 3,
+    FiniteOverflow = 4,
+    InterpolationNotExact = 5,
+    SampleCoordinateDomain = 6,
+    SampleLodDomain = 7,
+    SpecialNanOrNegativeRoot = 8,
 };
 // New resource variants append [magic, first-failing-PC, reason] for EACH logical worker after
 // the old raw EXP records. No worker exits early. Sticky failure is not a substituted guest value.
@@ -65,6 +75,7 @@ struct FragmentResourcePacketProgram {
     FragmentPacketDeviceContract device;
     uint32_t status_offset = 0;
     FragmentLaunchRsrc1 launch_rsrc1{};
+    FragmentEntryFacts entry_facts;
     FragmentFloatMode float_mode{};
     FragmentFloatFlags float_flags{};
     std::vector<uint32_t> runtime_failure_pcs; // exact original service PCs, never caller guesses

@@ -7,6 +7,7 @@ FragmentResourcePacketProgram recompile_fragment_resource_packet(const FragmentR
     result.images = input.images;
     result.device = input.device;
     result.launch_rsrc1 = input.launch_rsrc1;
+    result.entry_facts = input.entry_facts;
     result.float_mode = input.invocation.float_mode;
     result.float_flags = input.invocation.float_flags;
     PacketResourceServices services{input, result};
@@ -18,7 +19,8 @@ FragmentResourcePacketProgram recompile_fragment_resource_packet(const FragmentR
         for (const auto& in : ins)
             if (in.fmt == Rdna2Format::SMEM || in.fmt == Rdna2Format::MIMG ||
                 in.fmt == Rdna2Format::VINTRP ||
-                (in.fmt == Rdna2Format::VOP2 && (in.opcode == 3 || in.opcode == 8)))
+                (in.fmt == Rdna2Format::VOP2 && (in.opcode == 3 || in.opcode == 8)) ||
+                (in.fmt == Rdna2Format::VOP1 && packet_special_f32_opcode(in.opcode)))
                 result.runtime_failure_pcs.push_back(in.pc);
     }
     return result;
@@ -48,10 +50,13 @@ FragmentResourcePacketResult decode_fragment_resource_packet(const FragmentResou
         const auto offset = program.status_offset + lane * kFragmentResourceStatusWords;
         const auto pc = words[offset + 1], reason = words[offset + 2];
         if (words[offset] != kFragmentResourceStatusMagic ||
-            reason > static_cast<uint32_t>(FragmentPacketRuntimeFailure::SampleLodDomain) ||
+            reason >
+                static_cast<uint32_t>(FragmentPacketRuntimeFailure::SpecialNanOrNegativeRoot) ||
             ((reason == 0) != (pc == UINT32_MAX)) ||
-            (reason && std::find(program.runtime_failure_pcs.begin(), program.runtime_failure_pcs.end(), pc)
-                == program.runtime_failure_pcs.end())) return reject("packet-status-record-invalid");
+            (reason &&
+             std::find(program.runtime_failure_pcs.begin(), program.runtime_failure_pcs.end(),
+                       pc) == program.runtime_failure_pcs.end()))
+            return reject("packet-status-record-invalid");
         if (reason && result.failure == FragmentPacketRuntimeFailure::None) {
             result.lane = lane; result.pc = pc; result.failure = static_cast<FragmentPacketRuntimeFailure>(reason);
         }
@@ -65,6 +70,8 @@ FragmentResourcePacketResult decode_fragment_resource_packet(const FragmentResou
             case FragmentPacketRuntimeFailure::InterpolationNotExact: return reject("packet-runtime-interpolation-exactness-unproved");
             case FragmentPacketRuntimeFailure::SampleCoordinateDomain: return reject("packet-runtime-sample-coordinate-domain-unimplemented");
             case FragmentPacketRuntimeFailure::SampleLodDomain: return reject("packet-runtime-sample-lod-domain-unimplemented");
+            case FragmentPacketRuntimeFailure::SpecialNanOrNegativeRoot:
+                return reject("packet-runtime-special-f32-nan-or-negative-root-unimplemented");
             default: return reject("packet-status-record-invalid");
         }
     }
