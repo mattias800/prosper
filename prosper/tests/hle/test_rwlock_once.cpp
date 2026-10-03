@@ -4,6 +4,7 @@
 // asserts REAL semantics: a write-lock actually excludes (trywrlock fails while held), and once runs
 // its init exactly once.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -18,13 +19,12 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static int g_once_count = 0;
 static void once_init() { g_once_count++; }
 
-int main() {
+TEST(RwlockOnce, Contract) {
     printf("== test_rwlock_once ==\n");
     register_builtin_hle();
 
@@ -36,7 +36,7 @@ int main() {
     auto RWdes   = Hle::lookup(nid_hash("scePthreadRwlockDestroy"));
     auto ONCE    = Hle::lookup(nid_hash("scePthreadOnce"));
     CHECK(RWinit && RWrd && RWwr && RWun && RWtrywr && RWdes && ONCE, "rwlock + once registered");
-    if (!(RWinit && RWrd && RWwr && RWun && RWtrywr && RWdes && ONCE)) { printf("== FAIL ==\n"); return 1; }
+    if (!(RWinit && RWrd && RWwr && RWun && RWtrywr && RWdes && ONCE)) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     auto call1 = [](HleFn f, uint64_t a) { return f(a, 0, 0, 0, 0, 0); };
     auto call2 = [](HleFn f, uint64_t a, uint64_t b) { return f(a, b, 0, 0, 0, 0); };
@@ -449,7 +449,5 @@ int main() {
         if (x_returned.load()) xt.join(); else xt.detach();   // don't hang the test binary on failure
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

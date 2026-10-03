@@ -25,6 +25,7 @@
 //
 // Exit code is truth: 0 = pass.
 #include <cstdio>
+#include <gtest/gtest.h>
 #include <cstdint>
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -54,7 +55,7 @@ static void check_eq(const char* what, uint64_t got, uint64_t want) {
 static uint64_t g_poison_rip = 0xBAD0BAD0BAD0BAD0ull;
 static uint64_t g_poison_reg = 0xDEADDEADDEADDEADull;
 
-int main() {
+TEST(FaultContext, Contract) {
     printf("== test_fault_context ==\n");
 
     // Two distinct fault contexts, standing in for two threads faulting milliseconds apart.
@@ -227,9 +228,8 @@ int main() {
         check_eq("contended: every claimant told the true owner", (uint64_t)bad_reports.load(), 0u);
     }
 
-    printf(failures ? "FAILED (%d)\n" : "ok\n", failures);
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }
 #else
-int main() { printf("== test_fault_context == skipped (posix signal context only)\n"); return 0; }
+TEST(FaultContext, Contract) { GTEST_SKIP() << "posix signal context only"; }
 #endif

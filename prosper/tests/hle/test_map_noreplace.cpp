@@ -5,6 +5,7 @@
 // reservation. This drives the real HLE handlers and asserts a non-fixed collision relocates, a
 // fixed collision fails without clobbering, and committing an OWN reservation still works.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -13,16 +14,15 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(MapNoreplace, Contract) {
     printf("== test_map_noreplace ==\n");
     register_builtin_hle();
     auto reserve  = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
     auto flexible = Hle::lookup(nid_hash("sceKernelMapNamedFlexibleMemory"));
     CHECK(reserve && flexible, "map HLE functions registered");
-    if (fails) { printf("== FAIL ==\n"); return 1; }
+    if (::testing::Test::HasFailure()) { printf("== FAIL ==\n"); FAIL() << "map HLE functions missing"; }
 
     auto U = [](const void* p) { return (uint64_t)(uintptr_t)p; };
     const uint64_t LEN = 0x10000;   // 64 KiB
@@ -67,7 +67,5 @@ int main() {
     *(volatile uint32_t*)(uintptr_t)rbase = 0x1234u;   // writable now (was PROT_NONE reservation)
     CHECK(*(volatile uint32_t*)(uintptr_t)rbase == 0x1234u, "the committed reservation is writable");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

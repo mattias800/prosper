@@ -5,6 +5,7 @@
 // declared_mip_levels=1 keeps the historical single-level behavior (LOD clamps to 0) and level 0
 // stays byte-intact through the chain upload. Fails without the mip-chain generation.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include "fixtures/render_runner.h"
 #include <cstdio>
@@ -15,10 +16,9 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(TextureMipRender, Contract) {
     printf("== test_texture_mip_render ==\n");
     const uint32_t W = 64, H = 64;
 
@@ -244,7 +244,5 @@ int main() {
               asym_center[0] > 0xC0 && asym_center[1] < 0x20 && asym_center[2] < 0x40,
           "IMAGE_SAMPLE_D keeps asymmetric Dt/Dx in the T component of Grad X (#1400)");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

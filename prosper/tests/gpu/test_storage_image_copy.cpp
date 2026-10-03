@@ -7,6 +7,7 @@
 // vN, s[0:7] dim:1D ; image_store v[0:3], vN, s[8:15] dim:1D). Needs Vulkan, so CMake only builds it
 // when Vulkan is present.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include "fixtures/image_compute_runner.h"
 #include <cstdio>
@@ -16,11 +17,9 @@
 using namespace prosper;
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(StorageImageCopy, Contract) {
     printf("== test_storage_image_copy ==\n");
 
     // 1D image copy (assembled by llvm-mc gfx1010 — the PS5 shaders' target ISA):
@@ -48,7 +47,7 @@ int main() {
     // num_inputs=1: the shell loads v0 = input[gid] (the harness fills binding-0 with the linear index).
     std::vector<uint32_t> spv = recompile_valu(code, sizeof(code)/sizeof(code[0]), 1, 0, &rt);
     CHECK(!spv.empty() && spv[0] == 0x07230203u, "1D image-copy kernel recompiled to a SPIR-V module");
-    if (spv.empty()) { printf("== FAIL ==\n"); return 1; }
+    if (spv.empty()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // Source texels: 64 texels (a multiple of the 64-wide workgroup, so dispatch covers exactly the
     // image with no out-of-range invocations), each RGBA distinct so a mis-copy is unambiguous.
@@ -90,7 +89,4 @@ int main() {
         CHECK(bad2 == 0, "70-texel copy bit-exact with a 128-invocation dispatch (grid-tail OOB safe)");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

@@ -4,6 +4,7 @@
 // with a SIGSEGV handler: after prot 0 a read must fault; after prot RW it must be writable again (so
 // the common non-zero path is unbroken). Linux-only (mmap/mprotect/signals).
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -13,9 +14,7 @@
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static sigjmp_buf g_jmp;
 static volatile sig_atomic_t g_faulted;
@@ -35,14 +34,14 @@ static bool read_faults(const volatile uint32_t* p) {
     return g_faulted != 0;
 }
 
-int main() {
+TEST(ProtNone, Contract) {
     printf("== test_prot_none ==\n");
     register_builtin_hle();
     auto flexible = Hle::lookup(nid_hash("sceKernelMapFlexibleMemory"));
     auto flexible_internal = Hle::lookup("4h6F1LLbTiw");
     auto mprotect_fn = Hle::lookup(nid_hash("sceKernelMprotect"));
     CHECK(flexible && flexible_internal && mprotect_fn, "map/internal-map/mprotect HLE registered");
-    if (!(flexible && flexible_internal && mprotect_fn)) { printf("== FAIL ==\n"); return 1; }
+    if (!(flexible && flexible_internal && mprotect_fn)) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     auto U = [](const void* p) { return (uint64_t)(uintptr_t)p; };
     const uint64_t LEN = 0x10000;
@@ -54,7 +53,7 @@ int main() {
     // Commit a RW page and confirm it is writable.
     uint64_t va = 0;
     CHECK(flexible(U(&va), LEN, 0x2 /*RW*/, 0, U("prot-test"), 0) == 0 && va, "MapFlexible(RW) succeeds");
-    if (!va) { printf("== FAIL ==\n"); return 1; }
+    if (!va) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
     volatile uint32_t* cell = (volatile uint32_t*)(uintptr_t)va;
     *cell = 0xABCD1234u;
     CHECK(!read_faults(cell) && *cell == 0xABCD1234u, "RW page: readable + writable");
@@ -74,7 +73,4 @@ int main() {
     mprotect_fn(va, LEN, 0x1 /*READ*/, 0, 0, 0);
     CHECK(!read_faults(cell), "after mprotect(prot=READ): page is readable");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }
