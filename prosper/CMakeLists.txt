@@ -799,6 +799,9 @@ ${GAME_DUMP_TITLE_ID}. Re-run cmake with -DGAME_DUMP=<dump root>/${title}-app0 t
 endfunction()
 
 if(TARGET prosper_core)
+  prosper_add_gtest(test_fragment_scalar_reads
+    SOURCES tests/gpu/recompiler/test_fragment_scalar_reads.cpp
+    INCLUDES tests LIBRARIES prosper_core)
   prosper_add_gtest(test_fragment_entry_prefix
     SOURCES tests/gpu/execute/test_fragment_entry_prefix.cpp
     INCLUDES tests LIBRARIES prosper_core)
@@ -1202,6 +1205,16 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_printf.cpp
     LIBRARIES prosper_core)
 
+  # The guest's printf/scanf/strtod family through the REGISTERED handlers (guest-ABI variadic
+  # capture, guest va_list hand-off, declared xmm0 returns), against N1570 7.21.6 / 7.22.1.3.
+  # Pure, no game dump.
+  prosper_add_gtest(test_hle_printf_family
+    SOURCES tests/hle/test_hle_printf_family.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_hle_scanf_family
+    SOURCES tests/hle/test_hle_scanf_family.cpp
+    LIBRARIES prosper_core)
+
   # Windows' aligned allocator family must remain paired end-to-end. Mixing _aligned_malloc with
   # plain free corrupts the heap under aligned game-buffer churn; ordinary and aligned guest
   # allocations intentionally share one compatible family on that host.
@@ -1319,6 +1332,20 @@ if(TARGET prosper_core)
 
   prosper_add_gtest(test_reallocf
     SOURCES tests/hle/test_reallocf.cpp
+    LIBRARIES prosper_core)
+
+  # Guest libc contracts prosper implements itself (not host forwarders), called through the
+  # registered handlers. strlcpy/strlcat are prosper's own code; qsort/bsearch own the guest
+  # comparator's calling convention, which differs from the host's on Windows. Pure, no game dump.
+  prosper_add_gtest(test_libc_strlcpy
+    SOURCES tests/hle/test_libc_strlcpy.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_libc_qsort_bsearch
+    SOURCES tests/hle/test_libc_qsort_bsearch.cpp
+    LIBRARIES prosper_core)
+  # sscanf is a host-convention variadic (not PROSPER_GUEST_ABI); the suite calls it as one.
+  prosper_add_gtest(test_libc_sscanf
+    SOURCES tests/hle/test_libc_sscanf.cpp
     LIBRARIES prosper_core)
 
   # #2081 FALSE SUCCESS: an unregistered NID answers the dispatcher's 0, which for an SCE_OK
@@ -1967,6 +1994,14 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_file_binary.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+
+  # The guest's fopen and stdio stream handlers, against N1570 7.21.5.3 and the guest libc's own
+  # Dinkumware `_Foprep` mode loop (guest_fopen_mode.hpp):
+  # guest-path translation, mode semantics, EINVAL for a bad mode. Scratch files only, no dump.
+  prosper_add_gtest(test_hle_fopen_modes
+    SOURCES tests/hle/test_hle_fopen_modes.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   if(UNIX)
     # Intercepts both the old host-wide and new filesystem-wide barrier; no real writeback.
     add_executable(test_file_sync tests/hle/test_file_sync.cpp)
@@ -2317,6 +2352,11 @@ if(TARGET prosper_core)
     SOURCES tests/host/test_dmem.cpp
     LIBRARIES prosper_core)
 
+  # A refused fixed direct-memory map must preserve the allocation for a later retry.
+  prosper_add_gtest(test_dmem_map_failure_rollback
+    SOURCES tests/hle/memory/test_dmem_map_failure_rollback.cpp
+    LIBRARIES prosper_core)
+
   # PROSPER_DMEM_CALLER stack walk (issue #1755): the diagnostic scans up to 160 slots above its
   # frame and used to read straight off the top of a thread stack, dying with a SIGSEGV that reads
   # as a guest fault.
@@ -2532,11 +2572,11 @@ if(TARGET prosper_core)
   # Messenger recompile guard (#228): committed real Messenger VS/PS RDNA2 binaries must keep
   # recompiling — a recompiler change that re-rejects one of their instructions (the #199/#201
   # blue-screen class) fails here instead of shipping. Pure (no Vulkan); needs no game dump.
-  add_executable(test_messenger_recompile_guard tests/gpu/recompiler/test_messenger_recompile_guard.cpp)
-  target_link_libraries(test_messenger_recompile_guard PRIVATE prosper_core)
+  prosper_add_gtest(test_messenger_recompile_guard
+    SOURCES tests/gpu/recompiler/test_messenger_recompile_guard.cpp
+    LIBRARIES prosper_core)
   target_compile_definitions(test_messenger_recompile_guard PRIVATE
       PROSPER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
-  add_test(NAME messenger_recompile_guard COMMAND test_messenger_recompile_guard)
 
   # libkernel/libScePosix signal + time-conversion surface (#190): NID match, registration, and real
   # behavior (UTC<->localtime round-trip fills its out-param; pthread_setcancelstate old-state + EINVAL).
@@ -2749,9 +2789,9 @@ if(TARGET prosper_core)
   add_test(NAME fragment_neutral_selection COMMAND test_fragment_neutral_selection)
 
   # #4016: exact compare-mask SSA, CMPX VCC preservation, and strict scalar-AND controls.
-  add_executable(test_compare_exec_masking tests/gpu/recompiler/test_compare_exec_masking.cpp)
-  target_link_libraries(test_compare_exec_masking PRIVATE prosper_core)
-  add_test(NAME compare_exec_masking COMMAND test_compare_exec_masking)
+  prosper_add_gtest(test_compare_exec_masking
+    SOURCES tests/gpu/recompiler/test_compare_exec_masking.cpp
+    LIBRARIES prosper_core)
 
   add_executable(test_normal_magnitude_predicate tests/gpu/recompiler/test_normal_magnitude_predicate.cpp)
   target_link_libraries(test_normal_magnitude_predicate PRIVATE prosper_core)

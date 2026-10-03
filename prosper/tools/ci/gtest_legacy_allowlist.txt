@@ -92,7 +92,6 @@ tests/gpu/execute/test_volume_target_handoff.cpp
 tests/gpu/pm4/test_command_processor.cpp
 tests/gpu/pm4/test_command_provenance.cpp
 tests/gpu/pm4/test_pending_drain_gate.cpp
-tests/gpu/recompiler/test_compare_exec_masking.cpp
 tests/gpu/recompiler/test_dynfetch_fold.cpp
 tests/gpu/recompiler/test_folded_stride_zero.cpp
 tests/gpu/recompiler/test_fragment_arithmetic_diagnostics.cpp
@@ -110,7 +109,6 @@ tests/gpu/recompiler/test_game_compute_rtt_mirror.cpp
 tests/gpu/recompiler/test_indirect_pointer_descriptor_range.cpp
 tests/gpu/recompiler/test_indirect_pointer_static_footprint.cpp
 tests/gpu/recompiler/test_mesh_backend.cpp
-tests/gpu/recompiler/test_messenger_recompile_guard.cpp
 tests/gpu/recompiler/test_normal_magnitude_predicate.cpp
 tests/gpu/recompiler/test_owned_raw_wide_backing.cpp
 tests/gpu/recompiler/test_portable_bpermute.cpp

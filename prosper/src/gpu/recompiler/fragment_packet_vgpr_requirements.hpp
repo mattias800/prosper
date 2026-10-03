@@ -2,6 +2,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/fragment_packet_exports.hpp"
 #include "gpu/recompiler/fragment_packet_mask_requirements.hpp"
+#include "gpu/recompiler/fragment_packet_scalar_reads.hpp"
 #include <bitset>
 #include <map>
 #include <string>
@@ -26,6 +27,7 @@ struct FragmentPacketVgprRequirements {
     std::map<uint32_t, std::vector<FragmentPacketVgprAccess>> reads;
     std::string rejection;
     FragmentPacketMaskRequirements masks;
+    FragmentPacketScalarReadRequirements scalar_reads;
     uint64_t retained_bytes() const;
 };
 FragmentPacketVgprRequirements fragment_packet_vgpr_requirements(
