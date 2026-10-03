@@ -1552,10 +1552,8 @@ bool emit_cfg_state_machine(
     // than Wave64 and another guest wave can be parked at a different static instruction.
     auto compute_dpp_row_shr = [&](const Rdna2Inst& in) {
         return b.is_compute &&
-            (is_inplace_vadd_nc_u32_dpp_row_shr(in) ||
-             is_inplace_vmax_u32_dpp_row_shr(in) ||
-             (b.ngg_workgroup_export_probe &&
-              is_vadd_nc_u32_dpp_row_shr_bounded(in)));
+               (is_inplace_vadd_nc_u32_dpp_row_shr(in) || is_inplace_vmax_u32_dpp_row_shr(in) ||
+                (b.ngg_workgroup_export_probe && is_vadd_nc_u32_dpp_row_shr_bounded(in)));
     };
 
     // GTA V's MOV/MIN/MAX ROW_ROR:8 family has the same synchronization requirement as the add
@@ -1814,8 +1812,7 @@ bool emit_cfg_state_machine(
         if (compute_dpp_row_shr(in)) {
             has_compute_dpp_row_maximum |= is_inplace_vmax_u32_dpp_row_shr(in);
             compute_dpp_row_shr_pcs.insert(in.pc);
-            compute_dpp_row_shr_event_for_pc.emplace(
-                in.pc, next_compute_dpp_event++);
+            compute_dpp_row_shr_event_for_pc.emplace(in.pc, next_compute_dpp_event++);
             compute_dpp_row_shr_dsts.insert(in.dst.value);
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
@@ -3848,21 +3845,22 @@ bool emit_cfg_state_machine(
         ? b.function_var(b.t_u32, ptr_u32) : 0;
     const uint32_t dpp_min_event_var = has_dpp_min_row_shr
         ? b.function_var(b.t_u32, ptr_u32) : 0;
-    const uint32_t dpp_shr_pending_var = has_portable_compute_dpp_row_shr
-        ? b.function_var(b.t_bool, ptr_bool) : 0;
-    const uint32_t dpp_shr_active_var = has_portable_compute_dpp_row_shr
-        ? b.function_var(b.t_bool, ptr_bool) : 0;
-    const uint32_t dpp_shr_source_var = has_portable_compute_dpp_row_shr
-        ? b.function_var(b.t_u32, ptr_u32) : 0;
-    const uint32_t dpp_shr_amount_var = has_portable_compute_dpp_row_shr
-        ? b.function_var(b.t_u32, ptr_u32) : 0;
-    const uint32_t dpp_shr_dst_var = has_portable_compute_dpp_row_shr
-        ? b.function_var(b.t_u32, ptr_u32) : 0;
-    const uint32_t dpp_shr_event_var = has_portable_compute_dpp_row_shr
-        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t dpp_shr_pending_var =
+        has_portable_compute_dpp_row_shr ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t dpp_shr_active_var =
+        has_portable_compute_dpp_row_shr ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t dpp_shr_source_var =
+        has_portable_compute_dpp_row_shr ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t dpp_shr_amount_var =
+        has_portable_compute_dpp_row_shr ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t dpp_shr_dst_var =
+        has_portable_compute_dpp_row_shr ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t dpp_shr_event_var =
+        has_portable_compute_dpp_row_shr ? b.function_var(b.t_u32, ptr_u32) : 0;
     const uint32_t dpp_shr_maximum_var =
         has_portable_compute_dpp_row_shr && has_compute_dpp_row_maximum
-            ? b.function_var(b.t_bool, ptr_bool) : 0;
+            ? b.function_var(b.t_bool, ptr_bool)
+            : 0;
     const uint32_t dpp_ror8_pending_var = has_portable_compute_dpp_ror8
         ? b.function_var(b.t_bool, ptr_bool) : 0;
     const uint32_t dpp_ror8_active_var = has_portable_compute_dpp_ror8
@@ -4795,19 +4793,14 @@ bool emit_cfg_state_machine(
             if (!last) {
                 // Group construction admits only one-successor plain blocks before the tail.
                 if (block_mbcnt || block_append || block_synchronized_lds_store ||
-                    block_lds_fminmax ||
-                    block_swizzle || block_bpermute ||
-                    block_dpp_min_row_shr || block_dpp_row_shr ||
-                    block_dpp_row_ror8 ||
-                    block_dpp_add_row_mask || block_mask_ffbh || block_mask_reduction ||
-                    block_packet_wqm || block_readlane ||
-                    block_readfirstlane ||
-                    block_mask_compare ||
-                    block_exec_saved_mask_compare || block_saved_mask_pair_compare ||
-                    block_vopc_mask_compare ||
+                    block_lds_fminmax || block_swizzle || block_bpermute || block_dpp_min_row_shr ||
+                    block_dpp_row_shr || block_dpp_row_ror8 || block_dpp_add_row_mask ||
+                    block_mask_ffbh || block_mask_reduction || block_packet_wqm || block_readlane ||
+                    block_readfirstlane || block_mask_compare || block_exec_saved_mask_compare ||
+                    block_saved_mask_pair_compare || block_vopc_mask_compare ||
                     block_b64_mask_scc_vote ||
-                    (block_terminator && (block_terminator->is_end ||
-                                          block_terminator->opcode != 0x02)))
+                    (block_terminator &&
+                     (block_terminator->is_end || block_terminator->opcode != 0x02)))
                     return reject_cfg(starts[block], "invalid-fused-block");
                 continue; // consume an unconditional guest branch without a dispatcher round-trip
             }
@@ -5231,25 +5224,22 @@ bool emit_cfg_state_machine(
             const int dst = dpp_row_shr->dst.value;
             const bool maximum = is_inplace_vmax_u32_dpp_row_shr(*dpp_row_shr);
             const bool bounded = is_vadd_nc_u32_dpp_row_shr_bounded(*dpp_row_shr);
-            const auto source = state.vreg.find(
-                bounded ? dpp_row_shr->src[0].value : dst);
-            uint32_t source_value =
-                source == state.vreg.end() ? zero : source->second;
+            const auto source = state.vreg.find(bounded ? dpp_row_shr->src[0].value : dst);
+            uint32_t source_value = source == state.vreg.end() ? zero : source->second;
             if (maximum) {
                 // WRITELANE spill slots are scalar state, not a per-lane VGPR value. Resolve
                 // the newly admitted MAX through the same source guard as ordinary ALU reads.
                 bool source_ok = true;
-                source_value = operand_bits(b, state, *dpp_row_shr,
-                                            dpp_row_shr->src[0], &source_ok);
-                if (!source_ok)
-                    return reject_cfg(dpp_row_shr->pc, "dpp-row-max-source-unresolved");
+                source_value =
+                    operand_bits(b, state, *dpp_row_shr, dpp_row_shr->src[0], &source_ok);
+                if (!source_ok) return reject_cfg(dpp_row_shr->pc, "dpp-row-max-source-unresolved");
             }
             const auto previous_destination = state.vreg.find(dst);
             const uint32_t old_destination = previous_destination == state.vreg.end()
                 ? zero : previous_destination->second;
-            const uint32_t amount = b.uconst(bounded
-                ? 0x100u | static_cast<uint32_t>(dpp_row_shr->dpp_ctrl - 0x110u)
-                : static_cast<uint32_t>(dpp_row_shr->dpp_ctrl - 0x110u));
+            const uint32_t amount =
+                b.uconst(bounded ? 0x100u | static_cast<uint32_t>(dpp_row_shr->dpp_ctrl - 0x110u)
+                                 : static_cast<uint32_t>(dpp_row_shr->dpp_ctrl - 0x110u));
             if (b.native_subgroup_size) {
                 // One exact native subgroup is one guest wave, and the scalar dispatcher selector
                 // is subgroup-uniform. The source EXEC bit still matters: FI=0/BOUND_CTRL=0
@@ -5263,10 +5253,10 @@ bool emit_cfg_state_machine(
                 // The 0x100 bit is this emitter's BOUND_CTRL marker, not a shift amount.
                 // Bounded DPP adds zero for an unavailable source but still writes VDST;
                 // the ordinary unbounded path retains its existing validity rule.
-                const uint32_t result = maximum
-                    ? b.uext2(Glsl_UMax, source_value, shifted)
-                    : b.ibin(Op_IAdd, source_value,
-                             bounded ? b.sel(valid_source, shifted, zero) : shifted);
+                const uint32_t result =
+                    maximum ? b.uext2(Glsl_UMax, source_value, shifted)
+                            : b.ibin(Op_IAdd, source_value,
+                                     bounded ? b.sel(valid_source, shifted, zero) : shifted);
                 state.vreg[dst] = b.sel(
                     bounded ? state.exec : b.land(state.exec, valid_source),
                     result, old_destination);
@@ -5279,11 +5269,9 @@ bool emit_cfg_state_machine(
                 b.store_function(dpp_shr_active_var, state.exec);
                 b.store_function(dpp_shr_source_var, source_value);
                 b.store_function(dpp_shr_amount_var, amount);
-                b.store_function(dpp_shr_dst_var,
-                    b.uconst(static_cast<uint32_t>(dst)));
+                b.store_function(dpp_shr_dst_var, b.uconst(static_cast<uint32_t>(dst)));
                 b.store_function(dpp_shr_event_var, b.uconst(event->second));
-                if (dpp_shr_maximum_var)
-                    b.store_function(dpp_shr_maximum_var, maximum ? yes : no);
+                if (dpp_shr_maximum_var) b.store_function(dpp_shr_maximum_var, maximum ? yes : no);
             }
         }
         if (dpp_row_ror8) {
@@ -5541,8 +5529,7 @@ bool emit_cfg_state_machine(
                                   "dpp-min-row-shr-successor");
         } else if (dpp_row_shr) {
             if (!set_next(dpp_row_shr->pc + dpp_row_shr->len_dwords))
-                return reject_cfg(dpp_row_shr->pc,
-                                  "dpp-add-row-shr-successor");
+                return reject_cfg(dpp_row_shr->pc, "dpp-add-row-shr-successor");
         } else if (dpp_row_ror8) {
             if (!set_next(dpp_row_ror8->pc + dpp_row_ror8->len_dwords))
                 return reject_cfg(dpp_row_ror8->pc, "dpp-row-ror8-successor");
@@ -6088,8 +6075,9 @@ bool emit_cfg_state_machine(
     // Every invocation, including completed waves, reaches this event-isolated ROW_SHR phase.
     if (has_portable_compute_dpp_row_shr &&
         !emit_portable_compute_dpp_row_shr_phase(
-            b, {dpp_shr_pending_var, dpp_shr_active_var, dpp_shr_source_var,
-                dpp_shr_amount_var, dpp_shr_dst_var, dpp_shr_event_var, dpp_shr_maximum_var},
+            b,
+            {dpp_shr_pending_var, dpp_shr_active_var, dpp_shr_source_var, dpp_shr_amount_var,
+             dpp_shr_dst_var, dpp_shr_event_var, dpp_shr_maximum_var},
             dpp_value_base, dpp_metadata_base, compute_dpp_row_shr_dsts, vv, lv, lmv))
         return reject_cfg(0, "missing-dpp-row-shr-dst");
 
@@ -6754,11 +6742,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::DS && in.opcode == kDsOpcodeBpermuteB32;
         });
-    const bool compute_cfg_row_maximum = b.is_compute &&
-        std::any_of(ins.begin(), ins.end(), is_inplace_vmax_u32_dpp_row_shr) &&
+    const bool compute_cfg_row_maximum =
+        b.is_compute && std::any_of(ins.begin(), ins.end(), is_inplace_vmax_u32_dpp_row_shr) &&
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
-            return in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 &&
-                in.opcode <= 0x09 && in.opcode != 0x03;
+            return in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
+                   in.opcode != 0x03;
         });
     const auto append_emitter_only_end = [](std::vector<Rdna2Inst>& region, uint32_t pc) {
         Rdna2Inst end;
@@ -6780,10 +6768,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     // barrier remains uniform while the final phase can use the ordinary CFG dispatcher.
     if (b.is_compute) {
         const BarrierPhasedCompute phased = analyze_barrier_phased_compute(ins);
-        if (phased.found &&
-            (phased.guarded || initial_dispatch_active || force_barrier_phases ||
-             portable_compute_mask_reduction || portable_compute_readfirstlane ||
-             portable_compute_bpermute || compute_cfg_row_maximum)) {
+        if (phased.found && (phased.guarded || initial_dispatch_active || force_barrier_phases ||
+                             portable_compute_mask_reduction || portable_compute_readfirstlane ||
+                             portable_compute_bpermute || compute_cfg_row_maximum)) {
             // Every phase shares one immutable Workgroup OpTypeArray. Size it from the complete
             // phased stream before the first dispatcher: a later portable DPP operation needs a
             // second per-lane plane even when the earlier phase needed only votes/liveness.
@@ -6792,13 +6779,12 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     (b.local_count + b.wave_size - 1) / b.wave_size;
                 const uint32_t padded_lanes = wave_count * b.wave_size;
                 const bool has_portable_dpp = std::any_of(
-                    ins.begin(), ins.begin() + phased.end_index,
-                    [&b](const Rdna2Inst& in) {
+                    ins.begin(), ins.begin() + phased.end_index, [&b](const Rdna2Inst& in) {
                         return is_inplace_vadd_nc_u32_dpp_row_shr(in) ||
-                            is_inplace_vmax_u32_dpp_row_shr(in) ||
-                            (b.ngg_workgroup_export_probe &&
-                             is_vadd_nc_u32_dpp_row_shr_bounded(in)) ||
-                            dpp_row_ror8_op(in) != DppRowRor8Op::None;
+                               is_inplace_vmax_u32_dpp_row_shr(in) ||
+                               (b.ngg_workgroup_export_probe &&
+                                is_vadd_nc_u32_dpp_row_shr_bounded(in)) ||
+                               dpp_row_ror8_op(in) != DppRowRor8Op::None;
                     });
                 const uint32_t scratch_dwords = padded_lanes +
                     ((has_portable_dpp || portable_compute_readfirstlane ||

@@ -28,8 +28,8 @@ enum class DppRowCfgCase { Mixed, DivergentSites, LoopAndCompletedPeer, LaterBar
 inline std::vector<uint32_t> dpp_row_cfg_program(DppRowCfgCase shape, bool only_add = false) {
     std::vector<uint32_t> code;
     const auto row = [&](uint32_t shift, bool maximum) {
-        code.push_back(((maximum && !only_add ? 0x14u : 0x25u) << 25) |
-                       (1u << 17) | (1u << 9) | 0xfau);
+        code.push_back(((maximum && !only_add ? 0x14u : 0x25u) << 25) | (1u << 17) | (1u << 9) |
+                       0xfau);
         code.push_back(0xff000001u | ((0x110u + shift) << 8));
     };
     const auto branch = [&](uint32_t opcode) {
@@ -43,30 +43,38 @@ inline std::vector<uint32_t> dpp_row_cfg_program(DppRowCfgCase shape, bool only_
     };
     if (shape == DppRowCfgCase::Mixed) {
         branch(2); // s_branch to its actual next instruction: select the CFG service
-        row(1, false); row(2, true); row(4, false); row(8, true);
+        row(1, false);
+        row(2, true);
+        row(4, false);
+        row(8, true);
     } else if (shape == DppRowCfgCase::LoopAndCompletedPeer) {
-        code.push_back(0x7e000503u); // v_readfirstlane_b32 s0,v3: each wave's supplied trip count
-        code.push_back(0xbf068000u); // s_cmp_eq_u32 s0,0
-        const size_t finished = branch(5); // s_cbranch_scc1 end
-        code.push_back(0x7da40b04u); // v_cmpx_eq_u32 v4,v5
+        code.push_back(0x7e000503u);   // v_readfirstlane_b32 s0,v3: each wave's supplied trip count
+        code.push_back(0xbf068000u);   // s_cmp_eq_u32 s0,0
+        const size_t finished = branch(5);   // s_cbranch_scc1 end
+        code.push_back(0x7da40b04u);   // v_cmpx_eq_u32 v4,v5
         const size_t loop = code.size();
-        row(1, false); row(2, true);
-        code.push_back(0x80808100u); // s_sub_u32 s0,s0,1
-        code.push_back(0xbf068000u); // s_cmp_eq_u32 s0,0
+        row(1, false);
+        row(2, true);
+        code.push_back(0x80808100u);   // s_sub_u32 s0,s0,1
+        code.push_back(0xbf068000u);   // s_cmp_eq_u32 s0,0
         target(branch(4), loop);   // s_cbranch_scc0 loop
-        code.push_back(0xbefe04c1u); // s_mov_b64 exec,-1
+        code.push_back(0xbefe04c1u);   // s_mov_b64 exec,-1
         target(finished, code.size());
     } else {
         if (shape == DppRowCfgCase::LaterBarrierPhase) {
-            code.push_back(0x7e100291u); // v_mov_b32 v8,17: first phase needs no row scratch plane
-            code.push_back(0xbf8a0000u); // s_barrier
+            code.push_back(
+                0x7e100291u);   // v_mov_b32 v8,17: first phase needs no row scratch plane
+            code.push_back(0xbf8a0000u);   // s_barrier
         }
-        code.push_back(0x7d820500u); // v_cmp_lt_u32 v0,v2
-        const size_t alternate = branch(6); // s_cbranch_vccz else
-        row(1, true); row(2, true);
-        const size_t merge = branch(2); // s_branch end
+        code.push_back(0x7d820500u);   // v_cmp_lt_u32 v0,v2
+        const size_t alternate = branch(6);   // s_cbranch_vccz else
+        row(1, true);
+        row(2, true);
+        const size_t merge = branch(2);   // s_branch end
         target(alternate, code.size());
-        row(1, false); row(4, true); row(8, false);
+        row(1, false);
+        row(4, true);
+        row(8, false);
         target(merge, code.size());
     }
     code.push_back(0xbf810000u);
@@ -74,9 +82,9 @@ inline std::vector<uint32_t> dpp_row_cfg_program(DppRowCfgCase shape, bool only_
 }
 
 inline std::vector<uint32_t> dpp_row_cfg_export_program(DppRowCfgCase shape,
-                                                      bool only_add = false) {
+                                                        bool only_add = false) {
     auto code = dpp_row_cfg_program(shape, only_add);
-    code.insert(code.end() - 1, {0xf8000941u, 0x00000001u}); // EXP PRIM,v1: raw unsigned sink
+    code.insert(code.end() - 1, {0xf8000941u, 0x00000001u});   // EXP PRIM,v1: raw unsigned sink
     return code;
 }
-}  // namespace prosper::test
+}   // namespace prosper::test

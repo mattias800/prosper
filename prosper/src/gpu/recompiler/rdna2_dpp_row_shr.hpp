@@ -26,9 +26,8 @@ struct ComputeDppRowShrPhaseVariables {
 };
 
 bool emit_portable_compute_dpp_row_shr_phase(
-    SpirvCompute& builder, const ComputeDppRowShrPhaseVariables& variables,
-    uint32_t value_base, uint32_t metadata_base, const std::set<int>& destinations,
-    const std::map<int, uint32_t>& vgprs,
+    SpirvCompute& builder, const ComputeDppRowShrPhaseVariables& variables, uint32_t value_base,
+    uint32_t metadata_base, const std::set<int>& destinations, const std::map<int, uint32_t>& vgprs,
     const std::map<std::pair<int, int>, uint32_t>& numeric_lane_aliases,
     const std::map<std::pair<int, int>, uint32_t>& mask_lane_aliases);
 }  // namespace prosper::gpu

@@ -3523,8 +3523,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
             uint32_t dpp_active = 0;
             uint32_t row_result = 0;
-            if (ok && emit_compute_inplace_dpp_row_shr(
-                    b, rs, in, a, old_d, allow_wave, row_result)) {
+            if (ok &&
+                emit_compute_inplace_dpp_row_shr(b, rs, in, a, old_d, allow_wave, row_result)) {
                 vreg[in.dst.value] = row_result;
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;

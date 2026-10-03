@@ -51,11 +51,11 @@ void execute(std::initializer_list<uint32_t> shifts, bool masked) {
     const auto module = prosper::gpu::recompile_valu(code.data(), code.size(), 3, 1);
     ASSERT_FALSE(module.empty());
     const auto source = inputs();
-    std::vector<float> input(kLanes * 3);
+    std::vector<float> input(size_t(kLanes) * 3);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
-        input[lane * 3] = std::bit_cast<float>(masked && lane % 5 == 0 ? 0u : 1u);
-        input[lane * 3 + 1] = std::bit_cast<float>(source[lane]);
-        input[lane * 3 + 2] = std::bit_cast<float>(1u);
+        input[size_t(lane) * 3] = std::bit_cast<float>(masked && lane % 5 == 0 ? 0u : 1u);
+        input[size_t(lane) * 3 + 1] = std::bit_cast<float>(source[lane]);
+        input[size_t(lane) * 3 + 2] = std::bit_cast<float>(1u);
     }
     const auto output = prosper::test::run_compute(module, input, kLanes, kLanes, {}, {}, nullptr,
                                                    64, nullptr, nullptr, nullptr, required);
@@ -103,9 +103,10 @@ using CfgWords = std::array<uint32_t, kCfgLanes>;
 CfgWords cfg_inputs() {
     CfgWords words{};
     for (uint32_t lane = 0; lane < kCfgLanes; ++lane)
-        words[lane] = lane % 4 == 0 ? 0xff7fffffu - lane / 16
+        words[lane] = lane % 4 == 0   ? 0xff7fffffu - lane / 16
                       : lane % 4 == 1 ? 0x80000000u + lane
-                      : lane % 4 == 2 ? 0x7f7fffffu - lane : 17u + lane;
+                      : lane % 4 == 2 ? 0x7f7fffffu - lane
+                                      : 17u + lane;
     return words;
 }
 
@@ -124,16 +125,21 @@ CfgWords cfg_oracle(CfgWords words, DppRowCfgCase shape) {
     constexpr uint32_t trips[] = {0, 3, 1, 4};
     for (uint32_t wave = 0; wave < 4; ++wave) {
         if (shape == DppRowCfgCase::Mixed) {
-            row(wave, 1, false, false); row(wave, 2, true, false);
-            row(wave, 4, false, false); row(wave, 8, true, false);
+            row(wave, 1, false, false);
+            row(wave, 2, true, false);
+            row(wave, 4, false, false);
+            row(wave, 8, true, false);
         } else if (shape == DppRowCfgCase::LoopAndCompletedPeer) {
             for (uint32_t iteration = 0; iteration < trips[wave]; ++iteration) {
-                row(wave, 1, false, true); row(wave, 2, true, true);
+                row(wave, 1, false, true);
+                row(wave, 2, true, true);
             }
         } else if (wave % 2 == 0) {
-            row(wave, 1, true, false); row(wave, 2, true, false);
+            row(wave, 1, true, false);
+            row(wave, 2, true, false);
         } else {
-            row(wave, 1, false, false); row(wave, 4, true, false);
+            row(wave, 1, false, false);
+            row(wave, 4, true, false);
             row(wave, 8, false, false);
         }
     }
@@ -150,28 +156,29 @@ void execute_cfg(DppRowCfgCase shape, bool native) {
         code.data(), code.size(), 10, 0, nullptr, 4, 0, {}, true, true, native);
     ASSERT_FALSE(module.empty());
     const auto source = cfg_inputs();
-    std::vector<float> input(kCfgLanes * 10, 0.0f);
+    std::vector<float> input(size_t(kCfgLanes) * 10, 0.0f);
     constexpr uint32_t trips[] = {0, 3, 1, 4};
     for (uint32_t lane = 0; lane < kCfgLanes; ++lane) {
         const uint32_t wave = lane / 64;
-        input[lane * 10] = std::bit_cast<float>(wave % 2);
-        input[lane * 10 + 1] = std::bit_cast<float>(source[lane]);
-        input[lane * 10 + 2] = std::bit_cast<float>(1u);
-        input[lane * 10 + 3] = std::bit_cast<float>(trips[wave]);
-        input[lane * 10 + 4] = std::bit_cast<float>(lane % 5 == 0 ? 0u : 1u);
-        input[lane * 10 + 5] = std::bit_cast<float>(1u);
+        input[size_t(lane) * 10] = std::bit_cast<float>(wave % 2);
+        input[size_t(lane) * 10 + 1] = std::bit_cast<float>(source[lane]);
+        input[size_t(lane) * 10 + 2] = std::bit_cast<float>(1u);
+        input[size_t(lane) * 10 + 3] = std::bit_cast<float>(trips[wave]);
+        input[size_t(lane) * 10 + 4] = std::bit_cast<float>(lane % 5 == 0 ? 0u : 1u);
+        input[size_t(lane) * 10 + 5] = std::bit_cast<float>(1u);
     }
     constexpr uint32_t stride = prosper::gpu::kNggExportProbeWords;
-    const auto output = prosper::test::run_compute(
-        module, input, kCfgLanes, kCfgLanes * stride, {}, {}, nullptr, kCfgLanes,
-        nullptr, nullptr, nullptr, native ? 64u : 0u);
-    ASSERT_EQ(output.size(), kCfgLanes * stride) << "the whole synchronized dispatch must complete";
+    const auto output =
+        prosper::test::run_compute(module, input, kCfgLanes, kCfgLanes * stride, {}, {}, nullptr,
+                                   kCfgLanes, nullptr, nullptr, nullptr, native ? 64u : 0u);
+    ASSERT_EQ(output.size(), size_t(kCfgLanes) * stride)
+        << "the whole synchronized dispatch must complete";
     const auto expected = cfg_oracle(source, shape);
     for (uint32_t lane = 0; lane < kCfgLanes; ++lane)
-        EXPECT_EQ(std::bit_cast<uint32_t>(output[lane * stride]), expected[lane])
+        EXPECT_EQ(std::bit_cast<uint32_t>(output[size_t(lane) * stride]), expected[lane])
             << "lane " << lane << ", native " << native;
 }
-} // namespace
+}   // namespace
 
 TEST_P(ComputeDppRowMaxCfgExecution, MixedAddAndMaxPreserveUnsignedOrdering) {
     execute_cfg(DppRowCfgCase::Mixed, GetParam());
@@ -186,6 +193,6 @@ TEST_P(ComputeDppRowMaxCfgExecution, LaterBarrierPhaseHasBothScratchPlanes) {
     execute_cfg(DppRowCfgCase::LaterBarrierPhase, GetParam());
 }
 INSTANTIATE_TEST_SUITE_P(Profiles, ComputeDppRowMaxCfgExecution, testing::Values(false, true),
-    [](const testing::TestParamInfo<bool>& profile) {
-        return profile.param ? "Native64" : "Portable";
-    });
+                         [](const testing::TestParamInfo<bool>& profile) {
+                             return profile.param ? "Native64" : "Portable";
+                         });

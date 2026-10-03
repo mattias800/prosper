@@ -1526,23 +1526,28 @@ int main(int argc, char** argv) {
            recompile_ngg_exports_for_test(c, std::size(c), 1),
            "recompile_ngg_exports_for_test"); }
     // Unsigned row scans need both the ordinary uniform route and event-isolated CFG routes.
-    { const auto c = prosper::test::dpp_row_max_program({1, 2, 4, 8});
-      dump(dir, "compute_dpp_row_max_linear", recompile_valu(c.data(), c.size(), 3, 1)); }
-    { using prosper::test::DppRowCfgCase;
-      const std::pair<DppRowCfgCase, const char*> cases[] = {
-          {DppRowCfgCase::Mixed, "mixed"}, {DppRowCfgCase::DivergentSites, "sites"},
-          {DppRowCfgCase::LoopAndCompletedPeer, "loop"},
-          {DppRowCfgCase::LaterBarrierPhase, "later_phase"}};
-      for (const auto& [shape, name] : cases) {
-          const auto c = prosper::test::dpp_row_cfg_export_program(shape);
-          for (bool native : {false, true}) {
-              const std::string id = std::string("compute_dpp_row_max_") + name +
-                  (native ? "_native64" : "_portable");
-              dump(dir, id.c_str(), recompile_ngg_exports_for_test(
-                  c.data(), c.size(), 10, 0, nullptr, 4, 0, {}, true, true, native),
-                  "recompile_ngg_exports_for_test");
-          }
-      }
+    {
+        const auto c = prosper::test::dpp_row_max_program({1, 2, 4, 8});
+        dump(dir, "compute_dpp_row_max_linear", recompile_valu(c.data(), c.size(), 3, 1));
+    }
+    {
+        using prosper::test::DppRowCfgCase;
+        const std::pair<DppRowCfgCase, const char*> cases[] = {
+            {DppRowCfgCase::Mixed, "mixed"},
+            {DppRowCfgCase::DivergentSites, "sites"},
+            {DppRowCfgCase::LoopAndCompletedPeer, "loop"},
+            {DppRowCfgCase::LaterBarrierPhase, "later_phase"}};
+        for (const auto& [shape, name] : cases) {
+            const auto c = prosper::test::dpp_row_cfg_export_program(shape);
+            for (bool native : {false, true}) {
+                const std::string id = std::string("compute_dpp_row_max_") + name +
+                                       (native ? "_native64" : "_portable");
+                dump(dir, id.c_str(),
+                     recompile_ngg_exports_for_test(c.data(), c.size(), 10, 0, nullptr, 4, 0, {},
+                                                    true, true, native),
+                     "recompile_ngg_exports_for_test");
+            }
+        }
     }
     // Generated interpolation geometry stage: AMD's explicit-parameter form publishes P0/P10/P20
     // plus perspective-center I/J from a synthesised Geometry entry point.
