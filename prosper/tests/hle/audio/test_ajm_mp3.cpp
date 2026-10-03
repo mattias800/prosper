@@ -4,6 +4,7 @@
 // sine wave (FFmpeg lavfi + libmp3lame, 48 kHz mono, 80 kbps, no container/tag). Its dimensions
 // mirror GTA V's live jobs exactly: 960 compressed bytes -> 4 * 1152 mono S16 samples = 9216 bytes.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/audio/ajm_decoder.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "ajm_ffmpeg.hpp"
@@ -19,8 +20,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 using HleFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 using Hle10Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
@@ -176,7 +176,7 @@ static std::vector<uint8_t> stereo_mp3_frame() {
     return bytes_from_hex(hex);
 }
 
-int main() {
+TEST(AjmMp3, Contract) {
     std::puts("== test_ajm_mp3 ==");
     register_builtin_hle();
     CHECK(ajm::install_ffmpeg_decoder_backend(), "FFmpeg AJM decoder backend installs");
@@ -194,7 +194,7 @@ int main() {
     CHECK(initialize && module_register && instance_create && batch_initialize &&
           instance_destroy && batch_wait && job_decode && batch_start,
           "AJM lifecycle and batch-2 handlers are registered");
-    if (fails) return 1;
+    if (::testing::Test::HasFailure()) FAIL() << "AJM handlers missing";
 
     uint32_t context = 0;
     CHECK(initialize(0, addr(&context), 0, 0, 0, 0) == 0 && context != 0,
@@ -600,6 +600,5 @@ int main() {
           "unsupported MP3 instance destroys normally");
 
     ajm::uninstall_ffmpeg_decoder_backend();
-    std::printf(fails ? "test_ajm_mp3: %d FAILURE(S)\n" : "test_ajm_mp3: all ok\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

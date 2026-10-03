@@ -181,7 +181,7 @@ nobody re-read look freshly reviewed.
 - `worms-armageddon-gameplay`: reviewed fresh-save guard for a fixed-map Training
   level. It uses `reach-training-gameplay.pad` rather than the published Quickstart
   route because Quickstart regenerates its terrain every run; see that entry's
-  `_note` and trap 36 in `docs/GAME_COMPAT_ORCHESTRATION.md`.
+  `_note` and trap 36 in `docs/process/GAME_COMPAT_ORCHESTRATION.md`.
 
 ## Choosing A Window And Thresholds
 

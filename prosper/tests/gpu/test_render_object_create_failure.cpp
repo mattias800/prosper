@@ -32,6 +32,7 @@
 // render passes, framebuffers, 2D views, trilinear samplers and small SPIR-V modules at the test's
 // own 64x64 extent, so no real device can be made to refuse one on demand.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/state/render_state.hpp"
 #include "fixtures/render_runner.h"
@@ -46,8 +47,7 @@ using namespace prosper::gpu;
 using prosper::test::RenderVkObjectCreateSite;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static bool has(const std::string& haystack, const char* needle) {
     return haystack.find(needle) != std::string::npos;
@@ -89,7 +89,7 @@ static void set_env(const char* name, const char* value) {
 #endif
 }
 
-int main() {
+TEST(RenderObjectCreateFailure, Contract) {
     printf("== test_render_object_create_failure (#3210) ==\n");
 
     // The persistent GRAPHICS PIPELINE cache is process-wide and outlives a render, so a second
@@ -137,7 +137,7 @@ int main() {
 
     CHECK(!vert.empty() && !red_fs.empty() && !tex_fs.empty(),
           "fullscreen VS, solid-red PS and sampling PS all recompiled");
-    if (vert.empty() || red_fs.empty() || tex_fs.empty()) { printf("FAILED (%d)\n", fails); return 1; }
+    if (vert.empty() || red_fs.empty() || tex_fs.empty()) { printf("FAILED (%d)\n", fails); FAIL() << "legacy early exit"; }
 
     ResolvedPipelineState opaque{};
     opaque.topology = 3 /*VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST*/;
@@ -651,6 +651,5 @@ int main() {
         }
     }
 
-    printf(fails ? "FAILED (%d)\n" : "PASSED\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

@@ -11,7 +11,7 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
 
 For progression investigations, use
 [`progression-matrix.ps1`](progression-matrix.ps1) and read
-[`../../docs/DEAD_CELLS_PROGRESSION_MATRIX.md`](../../docs/DEAD_CELLS_PROGRESSION_MATRIX.md). It compares
+[`../../docs/games/DEAD_CELLS_PROGRESSION_MATRIX.md`](../../docs/games/DEAD_CELLS_PROGRESSION_MATRIX.md). It compares
 full-render headless and SDL-app runs against full-execution sparse publication, sampled graphics, and
 no-graphics diagnostics with isolated saves and the same semantic gameplay selector.
 

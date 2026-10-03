@@ -4,6 +4,7 @@
 // the indirect-register patch helpers modify a previously-returned packet. This validates the port
 // independently of the (locale-blocked) boot.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "gpu/pm4/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -17,8 +18,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Mirror of hle_agc.cpp's AgcDcb layout (game's own struct; must match byte-for-byte).
 struct Dcb {
@@ -94,7 +94,7 @@ static bool capture_stderr(F&& body, char* out, size_t out_size) {
     return restored;
 }
 
-int main() {
+TEST(AgcDcb, Contract) {
     printf("== test_agc_dcb ==\n");
     register_builtin_hle();
 
@@ -113,7 +113,7 @@ int main() {
           "AGC Dcb functions registered (override the glog stubs)");
     if (!(reset && setcx && p_add && p_addr && p_dma_src &&
           setcx_direct && setsh_direct && setuc_direct && type2 && interpolants)) {
-        printf("== FAIL ==\n"); return 1;
+        printf("== FAIL ==\n"); FAIL() << "legacy early exit";
     }
 
     uint32_t buffer[256];
@@ -210,7 +210,7 @@ int main() {
     // written over two dwords of unrelated command-buffer or heap memory, with no log and no
     // reject — corruption at a distance, attributed to whatever broke next. These are not cold
     // paths: Sonic CrossWorlds logs 128 AddRegisters calls in a single 400-tick `hle_calls` window
-    // (docs/SONIC_CROSSWORLDS_STATUS.md), and Blue Prince builds its register arrays this way per
+    // (docs/games/SONIC_CROSSWORLDS_STATUS.md), and Blue Prince builds its register arrays this way per
     // draw (command_processor.hpp, #1264).
     //
     // Four arms, each naming the mutation it kills. Arm 1 is the positive control, because a fix
@@ -376,7 +376,7 @@ int main() {
         for (const auto& v : victim) victim_still_intact &= (v == 0xA5A5A5A5u);
         CHECK(victim_still_intact,
               "#1650 arm5: seventeen refused patches still wrote nothing");
-        if (fails) printf("  captured stderr:\n%s\n  ---- flood ----\n%s", log, log2);
+        if (::testing::Test::HasFailure()) printf("  captured stderr:\n%s\n  ---- flood ----\n%s", log, log2);
     }
 
     // #395 F5: all three single-register direct NIDs append the native packet opcode and preserve
@@ -824,7 +824,7 @@ int main() {
     // DWORDS and on the cursor advance; "the call returned something" is exactly what the broken
     // version also did.
     //
-    // The dword count is an ABI contract with the guest's own reservation (docs/AGC_PACKET_SIZES.md):
+    // The dword count is an ABI contract with the guest's own reservation (docs/gpu/AGC_PACKET_SIZES.md):
     // the packet is 4 dwords, and sceAgcDcbDrawIndirectGetSize must answer 16 bytes for the same
     // reason -- a guest that asks reserves exactly this.
     {
@@ -868,7 +868,5 @@ int main() {
         }
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

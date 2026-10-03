@@ -17,6 +17,7 @@
 // the general path. No Vulkan device is required: the persistent-target cache is seeded directly,
 // exactly as tests/shared/live/test_shared_vulkan_device.cpp already does for the same restore contract.
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/capture/gpu_capture.hpp"
 #include "fixtures/render_runner.h"
 #include "shared/live/live_renderer.hpp"
@@ -29,8 +30,7 @@
 #include <vector>
 
 static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else         { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 namespace {
 
@@ -89,7 +89,7 @@ bool notifier_republishes(const FormatCase& c, uint64_t base, uint32_t width, ui
 }
 
 // setenv() does not exist in the MinGW UCRT headers, so this file failed to COMPILE on the
-// toolchain docs/WINDOWS_PORT_HANDOFF.md prescribes -- aborting `cmake --build all` and skipping
+// toolchain docs/platforms/WINDOWS_PORT_HANDOFF.md prescribes -- aborting `cmake --build all` and skipping
 // every target after it (#2142's second instance; CI's MSYS2 gcc has the same gap and the job
 // never reached this file because the SEH abort came first). Same shape as the helper
 // test_apr_registry.cpp:38 already uses; kept local rather than shared because a two-line
@@ -104,7 +104,7 @@ static bool set_test_env(const char* name, const char* value) {
 
 } // namespace
 
-int main() {
+TEST(LiveTargetFormat, Contract) {
     const size_t target_count_limit = prosper::test::persistent_color_target_count_limit();
     CHECK(prosper::test::persistent_color_target_count_ceiling(false) == target_count_limit &&
               prosper::test::persistent_color_target_count_ceiling(true) >= target_count_limit &&
@@ -291,7 +291,5 @@ int main() {
         cache.clear();
     }
 
-    printf(fails ? "test_live_target_format: %d FAILURE(S)\n"
-                 : "test_live_target_format: all ok\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

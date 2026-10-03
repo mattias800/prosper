@@ -754,7 +754,7 @@ int main() {
     // where they require 1 or 0xf. Recognizing the packet does not by itself admit the guest
     // program: the live resource this addresses has six real mip levels and an unproven mip
     // register, so the emitter's zero-mip fast path still (correctly) declines it -- see
-    // docs/RECOMPILER_REMAINING.md and docs/STRAY_STATUS.md, both `## Ruled out`.
+    // docs/gpu/RECOMPILER_REMAINING.md and docs/games/STRAY_STATUS.md, both `## Ruled out`.
     const uint32_t stray_load_mip_2d_nsa_words[] = {0xf004070au, 0x00080500u, 0x0000052au};
     const Rdna2Inst stray_load_mip_2d_nsa =
         rdna2_decode_one(stray_load_mip_2d_nsa_words, 3);
@@ -1162,6 +1162,47 @@ int main() {
         CHECK(!rdna2_program_is_terminator_only(nullptr, 0) &&
               !rdna2_program_is_terminator_only(endpgm_only, 0),
               "an empty or absent program is not a proof of anything");
+    }
+
+    {
+        // rdna2_instruction_may_write_memory: fail-closed classification of memory writers.
+        // Encodings are the gfx1030 words these shaders compile to (buffer_load_dwordx4 is op 0xe,
+        // established above by llvm-mc).
+        const auto decode2 = [](uint32_t w0, uint32_t w1) {
+            const uint32_t words[2] = { w0, w1 };
+            return rdna2_decode_one(words, 2);
+        };
+        CHECK(!rdna2_instruction_may_write_memory(mb),
+              "buffer_load_dwordx4 does not write memory");
+        CHECK(rdna2_instruction_may_write_memory(decode2(0xE0782000u, 0x80020008u)),
+              "buffer_store (MUBUF op 0x1e) writes memory");
+        CHECK(!rdna2_instruction_may_write_memory(decode2(0xE030102Cu, 0x80030607u)),
+              "buffer_load_dword (MUBUF op 0xc) does not write memory");
+        CHECK(!rdna2_instruction_may_write_memory(decode2(0xF11C0108u, 0x00070103u)),
+              "an image sample (MIMG op 0x47) does not write memory");
+        CHECK(rdna2_instruction_may_write_memory(decode2(0xF0200108u, 0x00020009u)),
+              "image_store (MIMG op 0x8) writes memory");
+        CHECK(rdna2_instruction_may_write_memory(decode2(0xF4400400u, 0xFA000020u)),
+              "an SMEM operation above the load range is treated as a writer");
+        Rdna2Inst synthetic{};
+        synthetic.fmt = Rdna2Format::MUBUF;
+        synthetic.opcode = 0x32u;   // buffer_atomic_add
+        CHECK(rdna2_instruction_may_write_memory(synthetic), "a MUBUF atomic writes memory");
+        synthetic.opcode = 0x20u;   // an opcode the classification does not list as a read
+        CHECK(rdna2_instruction_may_write_memory(synthetic),
+              "an unlisted MUBUF opcode is reported as a writer (fail closed)");
+        synthetic.fmt = Rdna2Format::FLAT;
+        synthetic.opcode = 0x0cu;   // flat/global load dword
+        CHECK(!rdna2_instruction_may_write_memory(synthetic), "a FLAT load does not write memory");
+        synthetic.opcode = 0x1cu;   // flat/global store dword
+        CHECK(rdna2_instruction_may_write_memory(synthetic), "a FLAT store writes memory");
+        synthetic.fmt = Rdna2Format::MTBUF;
+        synthetic.opcode = 0x01u;
+        CHECK(!rdna2_instruction_may_write_memory(synthetic), "tbuffer_load_format does not write memory");
+        synthetic.opcode = 0x05u;
+        CHECK(rdna2_instruction_may_write_memory(synthetic), "tbuffer_store_format writes memory");
+        synthetic.fmt = Rdna2Format::VOP1;
+        CHECK(!rdna2_instruction_may_write_memory(synthetic), "a non-memory instruction is not a writer");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

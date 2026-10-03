@@ -7,7 +7,7 @@
 // guest calls into the host ABI, and prosper_call_guest_sysv marshals host calls into the guest ABI.
 //
 // STATUS (2026-07-14): runtime-verified through repeated GC cycles and the native live Vulkan
-// renderer. Remaining work is tracked in docs/PORTING.md "Windows", including physical-memory
+// renderer. Remaining work is tracked in docs/platforms/PORTING.md "Windows", including physical-memory
 // alias fidelity, float/XMM import arguments, and deeper frontend/gameplay validation. Diagnostics
 // that depend on Linux perf_event / ptrace (PROSPER_HWBP/HWWATCH/PEEK/DUMPAT) remain absent. A small
 // one-shot int3 logger (`PROSPER_WIN_BP=off[,off...]`) is available for native branch-order probes.
@@ -19,6 +19,7 @@
 
 #include "host/image/exec_image.hpp"
 #include "host/image/stub_append_batch.hpp"
+#include "host/image/win_data_watch.hpp"
 #include "host/fault/rbp_chain.hpp"   // guest_frames_from_rbp: the shared frame-pointer walk
 #include "host/fault/guest_stack_scan.hpp"   // the scan-based sibling, shared by both platforms
 #include "host/platform/immortal.hpp"   // #2613: registries a guest thread can reach after exit()
@@ -1409,6 +1410,9 @@ void guest_execution_thread_enter(bool primary) {
     // function, and register_current_thread_handle is idempotent (it closes and replaces an existing
     // duplicate), so registering here is safe and complete.
     register_guest_execution_thread_handle();
+    // PROSPER_HWWATCH_ABS: a data write-watch is per thread, and this is the one boundary every
+    // guest thread passes through.
+    win_data_watch_arm_current_thread();
     // Windows has no perf_event HWBP backend. Keep that platform contract unchanged while exposing
     // the same guest-entry boundary to CPU-only tests and future Windows diagnostics.
     if (auto hook = g_guest_execution_enter_test_hook.load(std::memory_order_acquire))

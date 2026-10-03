@@ -3,7 +3,7 @@
 
 LINUX ONLY. It reads /proc/<pid>/task/*/syscall for the futex address and uses process_vm_readv
 to read the owner word, neither of which exists on Windows or macOS. See
-docs/THREAD_WAIT_PROFILING.md section 5c for what a port must preserve.
+docs/performance/THREAD_WAIT_PROFILING.md section 5c for what a port must preserve.
 
 This is the third question in a stall investigation, and the one that ends it:
 

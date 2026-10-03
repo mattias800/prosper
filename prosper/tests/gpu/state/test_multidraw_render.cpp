@@ -5,6 +5,7 @@
 // would leave only the last draw's green). This exercises the multi-draw spine independently of the
 // game's per-draw register-snapshot resolution.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/state/render_state.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "fixtures/render_runner.h"
@@ -19,8 +20,7 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 static void set_env(const char* name, const char* value) {
 #ifdef _WIN32
@@ -30,7 +30,7 @@ static void set_env(const char* name, const char* value) {
 #endif
 }
 
-int main() {
+TEST(MultidrawRender, Contract) {
     printf("== test_multidraw_render ==\n");
     CHECK(prosper::test::persistent_pipeline_cache_limit_value(nullptr) == 4096,
           "pipeline cache default covers modern deferred-renderer working sets");
@@ -1142,7 +1142,5 @@ int main() {
               "GPU-side persistent color copy succeeds at capacity limit by evicting older target");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

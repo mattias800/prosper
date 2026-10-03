@@ -1,6 +1,7 @@
 // #3407: a renderer-owned RGBA8 UNORM target sampled as UINT must preserve all byte values.
 // Exercise the live compute backend, including pin release, typed sampling and guest writeback.
 #include "fixtures/render_runner.h"
+#include <gtest/gtest.h>
 #include "fixtures/spirv_triangle.h"
 #include "shared/live/live_compute.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -9,16 +10,15 @@
 #include <algorithm>
 
 using namespace prosper::gpu;
-static int failures = 0;
-#define CHECK(c, m) do { if (!(c)) { std::fprintf(stderr, "FAIL: %s\n", m); ++failures; } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(RendererUintCopy, Contract) {
     constexpr uint32_t width = 256;
     std::vector<uint8_t> stale(width * 4, 0), output(width * 4, 0xee);
     auto expected = std::make_shared<std::vector<uint8_t>>(width * 4);
     const uint64_t address = reinterpret_cast<uint64_t>(stale.data());
     const auto& ctx = prosper::test::render_vk_ctx(); // publish before compute adopts a device
-    if (!ctx.ok) return 1;
+    if (!ctx.ok) FAIL() << "legacy early exit";
 
     ResolvedPipelineState state{};
     state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -329,6 +329,4 @@ int main() {
     set_live_target_image_importer({}, {});
     set_live_target_reader({});
     set_live_target_query({});
-    std::printf("renderer UINT/packed copy: %d failures\n", failures);
-    return failures ? 1 : 0;
 }

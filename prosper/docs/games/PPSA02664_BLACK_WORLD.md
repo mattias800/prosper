@@ -1,0 +1,193 @@
+# PPSA02664 black gameplay world — target validation & investigation plan
+
+> **RESOLVED 2026-07-31 — this document is a historical method/diagnostic record.** The black gameplay
+> world was a **generic tiling defect**, not a title-specific one: packed mip-tail levels in 4 KiB tile
+> modes resolved to an element origin four times too small, because the block-to-element multiplier was
+> derived from the macroblock rather than from the 256-byte block's element extent. Mipped 4x4 Unity
+> `SpriteMask` sprites then decoded as fully transparent foreign texels, every mask fragment failed its
+> alpha test, and the shader's legitimate "visible outside mask" fill covered the whole frame. **The
+> world was being rendered correctly the entire time and then painted over.** 53 of 130 packed-tail
+> levels violated the origin-agreement invariant before the fix, 0 after. Fixed in **#1578**, which also
+> added an origin-agreement invariant to the tile tests; the title now reaches the gameplay rung with a
+> reviewed `alexkidd-gameplay` content guard. Current status is in
+> [`../../COMPATIBILITY.md`](../../../COMPATIBILITY.md). Read `## Ruled out` below (after the frozen 2026-07-15 front matter) before reviving any
+> hypothesis from the plan that follows.
+
+> **A SECOND, UNRELATED black world was reported on 2026-09-08 and resolved on 2026-09-11 (#3479).**
+> It looked like this one and was not: on Windows/NVIDIA the world composited to black while the UI
+> stayed pixel-perfect, and the same build rendered the same frame correctly on Linux/AMD. The cause
+> is not in this title at all — recompiled SPIR-V modules did not declare `SignedZeroInfNanPreserve`,
+> so NVIDIA's compiler was free to assume no Inf; the guest's `sign()` idiom multiplies by a `+Inf`
+> constant it synthesises with integer shifts (`((1<<8)-1) << 23`), that multiply returned 0, and the
+> colour-grading LUT builder therefore wrote an all-black 1024x32 LUT that blacked out every graded
+> pixel. The UI is composited AFTER the grade, which is why it survived. See `## Ruled out` below for
+> everything that was falsified on the way, and note the shape: **four separate layers of this title
+> looked guilty and none of them were.** The declaration is DEVICE-GATED (#3561): a device that does
+> not report `shaderSignedZeroInfNanPreserveFloat32`, or cannot name the extension at all, still
+> renders this title's grade black, and prosper now says so in one log line instead of emitting a
+> module that device may not legally compile.
+
+**Status:** DRAFT for review (multiple agents). Tracks #755; investigates #320. No writer instrumentation
+is proposed as ready; the watchpoint material is a **conditional toolbox appendix** (§5), not an
+evidence-selected Phase 1. Revised after review by Mira Voss (2026-07-15), whose Phase-0A discipline
+falsified the original premise (below) before any tooling was built.
+
+> **Current status (2026-07-15) — this is a frozen METHOD/DIAGNOSTIC PR.** Phase −1 (target identity)
+> was subsequently completed: the actual Mt. Eternal gameplay scene is content-verified, and the world
+> IS rendered but is lost during final composition in offline replay. The **evolving diagnosis and all
+> results now live on issue #320**, not in this document (a durable doc must not become a moving
+> hypothesis log). This PR contains only two diagnostics — `PROSPER_FS_SPV_MATCH` (fail-closed
+> content-gated fragment override) and `PROSPER_DUMP_RTGROUPS_RGBA` (alpha-preserving raw-RGBA8
+> per-target dump; non-RGBA8 targets are skipped with an explicit format/size diagnostic).
+> **Neither constitutes a gameplay root-cause claim or a fix**; the current root cause is unresolved and
+> gated on a live/replay state comparison (see #320).
+
+## Ruled out
+
+One line per dead hypothesis, the evidence that killed it, and where that evidence lives.
+
+| Hypothesis | Verdict and evidence | Source |
+|---|---|---|
+| The world material shader `fs2949` premultiplies its output by a vertex-colour alpha of 0 | **Falsified**, and the capsule that appeared to prove it is the wrong scene. A content-gated alpha-only A/B (§1) rendered **overlapping intro narration text**, not Mt. Eternal: the captured submit is the narration crawl, where alpha 0 per faded-out page is *correct*. That capsule is now a **negative control** — any fix must preserve narration fading and must not make inactive pages overlap. Never use "this group renders `px_nonzero>0`" as a success gate. | §1, #320 |
+| A run-local submit ordinal, draw count, or shader hash identifies the gameplay scene | **Falsified by the same episode.** Those are run-local *selectors*, not scene identity; violating that is exactly how the narration capsule was mistaken for gameplay. Establish scene identity from rendered semantic content first (the governing invariant below). | §1 |
+| The world draws are missing, mis-transformed, or never submitted | **Falsified.** The world renders correctly and is then painted over by a full-frame mask fill. | #1578 |
+| A writer-tracing / empty-RTT-producer investigation is the next step | **Not needed.** The cause was upstream of composition entirely, in shared 4 KiB-tile mip-tail addressing. The watchpoint toolbox in §5 was never evidence-selected and was not required. | #1578 |
+| (#3479) The #3464 native-Wave32 fragment-vote allowance is what loses the world colour | **Falsified, and the issue's own clearing evidence was void — both halves are worth keeping.** The LUT builder that actually goes black (`draw[25]`) declares **no** subgroup requirement at all, so the allowance cannot reach it. The three modules that do require Wave64 take their vote from a `v_cmp` whose only operands are SGPRs and an inline constant (`shader_inspect --wave-reasons` reports `wave-width-independent=1`), so `Any()` is the identity at any subgroup width. Separately, the offline A/B quoted in #3479 could not have differed: `gpu_replay` passes no `title_id`, so the allowance never fires there — instrument trap 276. | #3479 |
+| (#3479) The world draws are missing, or the scene composite never runs | **Falsified.** `gpu_replay --draw-steps --draw-steps-every 1` paints the scene target through operations 30-55 and the composite (`draw[75]`) executes. Substituting a module that differs from the real one ONLY in its `Prosper.FragmentSubgroupSize` marker forces the composite to run offline; it still writes pure black over the whole frame (`--through-operation 78` → extrema (0,0,0)). | #3479 |
+| (#3479) The 128x1 R16 tone-curve textures the LUT builder samples are de-tiled wrongly | **Falsified.** `PROSPER_DUMP_ATLAS=1` writes prosper's decoded copies: the master curve comes out as the exact identity ramp `0, 2, 4, … 254` and the neutral curves as a flat 128, matching a hand de-tile of the captured bytes under the documented SW_4KB_S 2-byte order (x bits at element-index bits 0,1,2,6,8,10). **Note the near-miss:** overriding any one curve with a constant DOES light the LUT up, which reads as "the texture was the problem" — it is not a discriminator, because a constant texture also makes the (wrong, ~0) sample coordinate irrelevant. | #3479 |
+| (#3479) The LUT builder produces NaN, which writes as black | **Falsified.** An `OpIsNan` probe spliced into the module and substituted through `PROSPER_FS_SPV`/`PROSPER_FS_SPV_MATCH` reports **false for all 32,768 texels**. The output is a genuine zero. | #3479 |
+| (#3479) The LUT builder's input grid coordinate (its interpolant) is wrong | **Falsified.** Probing `_170.xy` straight to MRT0 shows a clean `0 → 1` u ramp across x and `1 → 0` v down y, and the linear RGB three quarters of the way down the shader still carries 32,768 distinct values. The collapse is at one instruction: the `Inf * abs(x)` multiply of the `sign()` idiom, which the `--through-operation` probe shows returning 0 instead of `+Inf`. | #3479 |
+
+## Governing invariant (adopt this first)
+
+**Scene identity must be established from rendered *semantic content* before any shader/resource
+evidence is attributed to the user-visible failure.** Submit ordinals, guest VAs, and draw-count /
+shader-hash "signatures" are **run-local selectors**, not scene identity. This doc exists partly because
+that invariant was violated once already (§1).
+
+---
+
+## 1. Phase 0A result — a *narration* false-positive (the original premise is FALSIFIED)
+
+An earlier localization claimed the black gameplay world was caused by the world material shader
+`fs2949` premultiplying its output by a vertex-color alpha of 0. A per-draw alpha-only A/B **disproved
+that capsule as evidence for the gameplay world**:
+
+**Experiment.** Retain the real `fs2949` + textures + constants + blend + geometry; substitute **only**
+the vertex-alpha multiplier (`fs2949` SPIR-V `%508 = vcolor.w` → constant `1.0`), applied **only** to
+draws whose recompiled fragment SPIR-V exactly matches `fs2949` (an exact-content match gate, so the
+composite/base draws are untouched).
+
+**Result.**
+- Baseline (real `fs2949`, alpha 0): the `ce610000` float-target group renders `px_nonzero=0` → black.
+- Alpha→1: the group renders `px_nonzero=842526 rgb_nonblack=336636` and composites through — but what
+  appears is **overlapping intro narration text** ("A young…", "Alex was not aware, but at the time the
+  Radaxian region was under threat from Janken the Great and his minions", "A long time ago, on the
+  distant planet Aries…"), **not** the Mt. Eternal world. The float target is text-only (no
+  sky/platforms/sprites).
+
+**Conclusion.** The captured capsule (submit 10000 of the run-local 78-draw signature) is the **intro
+narration crawl**. There, `fs2949` premultiplying by vertex alpha with alpha-0 is **correct**: each
+narration page fades in/out, so a page not currently shown legitimately has alpha 0. Forcing them all
+opaque overlaps every page. This **falsifies** using that capsule as evidence for the black gameplay
+world — it is not merely a weaker claim; there is now **no positive evidence** in this investigation
+that the gameplay-world failure involves vertex alpha, this draw group, or consumed-resource writer
+tracing at all.
+
+**Proof boundary.** The A/B verifies the *current emitted-SPIR-V* path and identifies the scene as
+narration. It does **not** establish raw-RDNA2 ↔ SPIR-V translation fidelity — but that question is
+moot for rejecting this capsule as gameplay-world evidence.
+
+**This capsule is now a negative / control case:** any eventual fix must **preserve narration fading**
+and must **not** make inactive narration pages overlap. Do **not** treat "this group renders
+`px_nonzero>0`" as a success gate — that would encode the incorrect overlapping-narration override.
+
+### Reproducibility of the A/B
+- Emulator revision: the diagnostic commit on branch `fix/issue-320-render-oom` (the
+  `PROSPER_FS_SPV_MATCH` commit), based on master `d51edb0`. The A/B was run from that committed
+  implementation (not uncommitted local state).
+- Title/build identity: `PPSA02664`. *(Exact game executable/build revision not separately recorded —
+  TODO if a future run needs byte-level title identity.)*
+- Capsule: `levelscene.prgcap`, size 14021048 bytes, content sha1[:16] `09ce839ff344d327`
+  (retained under the working scratch dir; not committed — game-derived). Native-speed `boot_trace`
+  timeline capture at submit floor 10000, MIN/MAX draws 77/79 → **12 realized draws**.
+- Selected/substituted draws: draw indices **2, 3, 4, 5** (the `fs2949`/`vs10004` group targeting the
+  `ce610000` B10G11R11 float target); fragment `fs=2949` hash `9166015cb3155d4f`, vertex `vs=10004`
+  hash `7130ae8c793a9804`. The gate logs `[fs-match] file override applied to draw#N` per substitution,
+  so the count (4) is derivable from the run log.
+- Output hashes (full-frame RGB, **sha1[:8]**): baseline `117df2e3`; alpha→1 `2a97a2a2`; alpha→1
+  `ce610000` group `3903ce98`. Fail-closed control (bad match path) reproduces the baseline `117df2e3`
+  (proves the gate applies **no** override on an invalid match, never a global fallback).
+- Retained artifacts (scratch, not committed — game imagery): `ab_a1_final.png` (overlapping narration
+  text), `ab_a1_ce610000.png` (float-target group, pre-composite).
+- Gate: `PROSPER_FS_SPV=<fs2949_alpha1.spv> PROSPER_FS_SPV_MATCH=<fs2949.spv>` — exact SPIR-V content
+  match; only the `fs2949` draws are substituted (composite `fs557` / base `fs496` untouched). The gate
+  is committed in this branch (see §5); it **fails closed** if the match file is missing/short/
+  unaligned/unreadable (no silent global fallback).
+
+---
+
+## 2. What is known / not known now
+
+- **Known:** in the *current translated* `fs2949` path, the consumed vertex-alpha multiplier controls
+  visibility for the narration group; the narration scene is identified; alpha 0 there is legitimate.
+- **Not known (re-opened):** the **black gameplay world** ("Well, that's fine for today…" Mt. Eternal,
+  observed only in a slow *live* run) is **uncharacterized**. It has not been captured or analyzed. Its
+  cause is unattributed — it could be a required world draw with zero alpha, the empty-RTT-producer
+  class, geometry/descriptor/dataflow, composition, or something else.
+- The native 200 s timeline (submit ≤24352) reached only the narration; the world scene is at a later
+  guest-time point (live reached it ~360 s of wall time).
+
+---
+
+## 3. Phase −1 — Target identity (the new leading gate; do this before anything else)
+
+Capture and *prove* the actual gameplay-world scene before attributing any evidence:
+
+1. Capture the frame that shows `"Well, that's fine for today…"` **and** the black gameplay world.
+2. Retain: a screenshot + output hash; exact title revision + executable/build identity; route state;
+   guest time; submit/capsule identity; and capture bounds.
+3. **Prove the capture is the gameplay world from its rendered composition** (expected world/UI
+   content), not from a familiar shader hash or draw-count signature.
+4. Identify which target/group is *expected* to contain the world geometry, and **demonstrate the
+   missing contribution there** (which draw(s), which target, what the composite samples).
+5. Only then inspect that failing draw's geometry, material inputs, producer graph, and resource
+   lifetime.
+
+---
+
+## 4. Investigation branches (selected by Phase −1 evidence, not pre-committed)
+
+After the correct scene is captured, branch from *its* evidence:
+- **Only if** that scene independently shows a zero-alpha input on a *required* world draw → an
+  alpha-only A/B (as in §1) and then producer/lifetime classification.
+- Otherwise the leading branch may be **empty-RTT producer provenance** (`gpu_replay --graph` /
+  timeline resource versions — phrased as "no producer within retained provenance scope," never "GPU
+  ruled out" from a selected-submit graph), **geometry**, **descriptor/dataflow**, or **composition**.
+
+Producer/lifetime tracing and any write-watch tooling are **downstream** of a defect being localized on
+the correct scene — they are not started against the narration range (its alpha is legitimate).
+
+---
+
+## 5. Conditional toolbox appendix (NOT an evidence-selected Phase 1)
+
+Two small pieces exist/were designed; both are conditional on a future defect actually calling for them:
+
+- **`PROSPER_FS_SPV_MATCH`** (committed in this branch): restrict `PROSPER_FS_SPV` to draws whose
+  recompiled fragment SPIR-V exactly matches a given file — a per-draw shader A/B substitution that
+  avoids hitting draws with different descriptor contracts. General-purpose; used for §1.
+- **Consumed-resource write-tracing design** (deferred): if a *future* correct-scene defect turns out to
+  be a consumed resource with a bad value, catching its writer needs care because Unity's dynamic VB
+  address is run-local and the existing watchpoint machinery (`exec_image_linux.cpp`) is
+  calling-thread-owned, single-global-fd, `LEN_8`, per-thread-DR-limited. Options: per-thread perf-watch
+  fd table (MB3 pattern) *or* page-protection write-log, chosen from measured lifetime/thread behavior;
+  capture-derived selector, not runtime semantic recognition. This is retained as a generic method, not
+  a committed plan for #320.
+
+---
+
+## 6. Reproduction & gotchas
+Native-speed `boot_trace` for captures (recipe in #755). `PROSPER_RENDER_SCALE` and
+`PROSPER_PUMP_USEREV` destabilize this title's early boot; `PROSPER_NO_BLEND` breaks the live composite;
+never `pkill` in this env; addresses/submit ordinals are run-local (see §Governing invariant).

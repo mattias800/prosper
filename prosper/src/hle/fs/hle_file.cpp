@@ -12,6 +12,7 @@
 #include "hle/dispatch/nid.hpp"
 #include "host/memory/guest_write_watch.hpp"
 #include "diagnostics/diag_clock.hpp"
+#include "hle/kernel/apr_submission.hpp"
 #include "hle/kernel/sce_errno.hpp"    // #1612: the guest reads FreeBSD errnos, not this host's
 #include "hle/memory/heap_mutex.hpp"   // #707: keep the APR mutex off macOS __DATA
 #include "gpu/timeline/gpu_timeline.hpp" // optional exact guest-stdout capture gate
@@ -626,7 +627,7 @@ namespace {
     std::mutex g_save0_mx;
     std::string g_save0;   // host dir for the CURRENT /savedata0 mount ("" = nothing mounted)
     // Never creates anything. A UE4 title probes open-mode several times before it ever creates a
-    // save (see docs/UE4_APR_IOSTORE_BRINGUP.md), and a probe that manufactures an empty directory
+    // save (see docs/engines/UE4_APR_IOSTORE_BRINGUP.md), and a probe that manufactures an empty directory
     // for the title makes a later "does this save exist?" answer depend on how often it was asked.
     std::string save0_base() { return savedata0_dir(); }
     // PROSPER_DENY_SUBSTR: comma-separated substrings; any guest path containing one is
@@ -2444,7 +2445,7 @@ extern "C" void prosper_apr_chain_reset(uint64_t cb) {
 // the described read and DMAs it into the guest destination, because DOLL's (PPSA17942) older SDK
 // wrapper consumes the destination from the measure call and never records a ReadFile command for
 // it, so the measure is prosper's only hook on those bytes. That is a real, live requirement; see
-// docs/UE4_APR_IOSTORE_BRINGUP.md.
+// docs/engines/UE4_APR_IOSTORE_BRINGUP.md.
 //
 // The problem (#3245) is that the gate was only "does the file id resolve", so the read fired for
 // EVERY APR title. On a title that also submits the read normally the same bytes are pread and
@@ -2935,7 +2936,7 @@ HLE(f_apr_resolve_ids) {
 // APR builders/read commands execute eagerly in prosper.  A later WaitCommandBuffer therefore has
 // no outstanding host work and succeeds synchronously, matching the completion observed by the
 // caller without inventing an asynchronous submission object.
-HLE(f_apr_wait_command_buffer) { return 0; }
+HLE(f_apr_wait_command_buffer) { return apr_wait_completed_submit(static_cast<uint32_t>(a0)); }
 // sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes(const char* prefix, const char** paths,
 //   int count, uint32_t* outIds, uint64_t* outSizes, uint32_t* errorIndex) — GTA V's RAGE resource
 // loader entry. ABI recovered from live guest disassembly (PPSA04263, [RAGE] Main Thr): rdi=prefix
@@ -3774,13 +3775,7 @@ static bool apr_write_guest_dst(uint64_t dst, void* src, uint64_t bytes) {
 }
 #endif
 
-// --- The APR read itself, shared by every read builder -------------------------------------------
-// `sceAmprAprCommandBufferReadFile` and `sceAmprAprCommandBufferReadFileGatherScatter` differ only
-// in how the FILE is named (an explicit id vs. the chain open on the command buffer). Everything
-// after that -- clamp to EOF, stage the bytes, DMA them into the guest's destination, complete the
-// command buffer's record, account for the encoded command -- is one contract, so it is one
-// function. A gather/scatter segment that behaved even slightly differently from the plain read of
-// the same range would be a bug the guest could only report as corrupt data.
+// The read/DMA core shared by the plain and gather/scatter builders.
 struct AprReadOutcome {
     bool ok = false;          // every requested byte (after the EOF clamp) was delivered
     bool in_dst = false;      // ...into the guest's own destination, rather than staging
@@ -3896,6 +3891,7 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
                                       uint64_t a6, uint64_t a7, uint64_t a8) {
     (void)a8;
 #endif
+    AprReadExecution execution(a0);
     uint8_t* req = (uint8_t*)P(a0);
     if (!req) return 0x80020016ull;
     if (filelog()) {
@@ -4040,10 +4036,12 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     {
 #ifdef _WIN32
         struct _stat64 st {};
-        if (::_stat64(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size;
+        if (::_stat64(host.c_str(), &st) != 0) return execution.finish(0x80020016ull);
+        fsize = (uint64_t)st.st_size;
 #else
         struct stat st {};
-        if (::stat(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size;
+        if (::stat(host.c_str(), &st) != 0) return execution.finish(0x80020016ull);
+        fsize = (uint64_t)st.st_size;
 #endif
     }
     // #3245: a submit for exactly the read a measure just delivered proves this container records
@@ -4171,7 +4169,7 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
     // …ReadFileGatherScatter segment on the same buffer reads from this file until a
     // sceAmprCommandBufferReset closes it.
     if (r.ok) apr_chain_open(a0, (uint32_t)id, fsize, host);
-    return r.ok ? 0 : 0x80020016ull;
+    return execution.finish(r.ok ? 0 : 0x80020016ull);
 #else
     (void)dest;
     // Windows host: the same shared core. The record-completion and DMA-destination model is not
@@ -4187,7 +4185,7 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
         (unsigned long long)r.size, (long long)r.got, r.ok ? "OK" : "SHORT", resolution_method,
         (unsigned long long)requested_size);
     if (r.ok) apr_chain_open(a0, (uint32_t)id, fsize, host);
-    return r.ok ? 0 : 0x80020016ull;
+    return execution.finish(r.ok ? 0 : 0x80020016ull);
 #endif
 }
 
@@ -4286,6 +4284,7 @@ extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
 // …ResetGatherScatterState export). LOW on chain lifetime — not MED, because no observation
 // discriminates: the width above is a deliberate fail-loud choice, not a derived contract.
 HLE(f_apr_read_gather_scatter) {
+    AprReadExecution execution(a0);
     const uint64_t cb = a0, record = a2, dst = a3, requested = a4, offset = a5;
     // Bounded: a title that issues gather/scatter with no chain would otherwise emit one line per
     // segment for the life of the process, and a diagnostic that drowns the log is one nobody reads.
@@ -4357,7 +4356,7 @@ HLE(f_apr_read_gather_scatter) {
                  (unsigned long long)dst, (unsigned long long)offset);
         log_refusal_in(refusals_undelivered, msg);
     }
-    return delivered ? 0 : 0x80020016ull;
+    return execution.finish(delivered ? 0 : 0x80020016ull);
 }
 
 // libSceAmpr mZSbNJVJpV8 / Jg-AgkdJHkk — sceAmprAprCommandBufferReadFileGather and
@@ -4434,12 +4433,14 @@ static uint64_t apr_read_builder_unimplemented(const char* nid, const char* name
     return 0x80020016ull;
 }
 HLE(f_apr_read_gather) {
+    AprReadExecution execution(a0);
     (void)a1; (void)a2;
     static std::atomic<uint64_t> seen{0};
     return apr_read_builder_unimplemented("mZSbNJVJpV8", "sceAmprAprCommandBufferReadFileGather",
                                           seen, a0, a3, a4, a5);
 }
 HLE(f_apr_read_scatter) {
+    AprReadExecution execution(a0);
     (void)a1; (void)a2;
     static std::atomic<uint64_t> seen{0};
     return apr_read_builder_unimplemented("Jg-AgkdJHkk", "sceAmprAprCommandBufferReadFileScatter",

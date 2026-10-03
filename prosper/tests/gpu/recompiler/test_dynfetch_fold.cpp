@@ -738,6 +738,105 @@ int main() {
                                               std::size(split_scalar_store));
     CHECK(find_split(scalar_store_uses, 6u) == scalar_store_uses.end(),
           "an SMEM write that may alias descriptor backing cannot authorize a split T#");
+    // A T# assembled from a COPIED half of one x8 load plus a second x4 load, consumed inside a
+    // loop behind a forward branch (the shape Assassin's Creed Black Flag Resynced compiles):
+    //   s_load_dwordx8 s[4:11], s[0:1], 0        ; table +0x00..0x1f
+    //   s_load_dwordx4 s[24:27], s[0:1], 0x20     ; table +0x20..0x2f
+    //   s_mov_b32 s20..s23, s8..s11               ; words 4..7 of the first load
+    //   s_cbranch_scc0 +2                          ; forward branch AFTER every copy executed
+    //   image_load ... s[20:27]                    ; pc 9
+    //   s_cbranch_scc1 -3                          ; loop back to the consumer
+    // The T# is table +0x10..0x2f: contiguous mapped dwords from two loads through a copy. Both a
+    // branch after the copies and a loop that preserves the descriptor must keep that proof.
+    const uint32_t loop_t8[] = {
+        0xF40C0100u, 0xFA000000u, // s_load_dwordx8 s[4:11], s[0:1], 0
+        0xF4080600u, 0xFA000020u, // s_load_dwordx4 s[24:27], s[0:1], 0x20
+        0xBE940308u,              // s_mov_b32 s20, s8
+        0xBE950309u,              // s_mov_b32 s21, s9
+        0xBE96030Au,              // s_mov_b32 s22, s10
+        0xBE97030Bu,              // s_mov_b32 s23, s11
+        0xBF840002u,              // s_cbranch_scc0 +2: skip the consumer
+        0xF0000308u, 0x00050409u, // image_load v[4:..], v9, s[20:27]
+        0xBF85FFFDu,              // s_cbranch_scc1 -3: back to the image_load
+        0xBF810000u,
+    };
+    const auto loop_ok = split_uses(loop_t8, std::size(loop_t8));
+    const auto loop_hit = find_split(loop_ok, 9u);
+    CHECK(loop_hit != loop_ok.end() && loop_hit->descriptor_source_addr == split_base + 16u &&
+              std::equal(loop_hit->t8.begin(), loop_hit->t8.end(), split_table + 4),
+          "a copied T# half plus a second load survives a later forward branch and a "
+          "descriptor-preserving loop around the consumer");
+    const uint32_t loop_clobber_code[] = {
+        loop_t8[0], loop_t8[1], loop_t8[2], loop_t8[3], loop_t8[4], loop_t8[5], loop_t8[6],
+        loop_t8[7], loop_t8[8], loop_t8[9], loop_t8[10],
+        0xBE950381u,             // s_mov_b32 s21, 1: clobbers a descriptor word inside the loop
+        0xBF85FFFCu,             // s_cbranch_scc1 -4: back to the image_load
+        0xBF810000u,
+    };
+    const auto clobber_uses = split_uses(loop_clobber_code, std::size(loop_clobber_code));
+    CHECK(find_split(clobber_uses, 9u) == clobber_uses.end(),
+          "a loop that rewrites a descriptor word cannot reuse the first binding");
+    const uint32_t loop_store_code[] = {
+        loop_t8[0], loop_t8[1], loop_t8[2], loop_t8[3], loop_t8[4], loop_t8[5], loop_t8[6],
+        loop_t8[7], loop_t8[8], loop_t8[9], loop_t8[10],
+        0xF4400400u, 0xFA000020u, // SMEM opcode 0x10: scalar store that may alias the table
+        0xBF85FFFBu,             // s_cbranch_scc1 -5: back to the image_load
+        0xBF810000u,
+    };
+    const auto loop_store_uses = split_uses(loop_store_code, std::size(loop_store_code));
+    CHECK(find_split(loop_store_uses, 9u) == loop_store_uses.end(),
+          "a loop containing a memory write cannot reuse the first binding");
+    const uint32_t copy_skipped_code[] = {
+        loop_t8[0], loop_t8[1], loop_t8[2], loop_t8[3],
+        0xBF840001u,             // s_cbranch_scc0 +1: may skip the first copy
+        loop_t8[4], loop_t8[5], loop_t8[6], loop_t8[7],
+        loop_t8[9], loop_t8[10],
+        0xBF810000u,
+    };
+    const auto copy_skipped_uses = split_uses(copy_skipped_code, std::size(copy_skipped_code));
+    CHECK(find_split(copy_skipped_uses, 9u) == copy_skipped_uses.end(),
+          "a branch that may skip a descriptor-word copy cannot publish the descriptor");
+    // Only MIMG operations that WRITE memory (image_store and the integer atomics) can rewrite a
+    // descriptor's backing. A sample or gather executed before the consumer cannot, and must not
+    // revoke a split T#'s proof (every sample flavour other than image_load/image_sample used to).
+    const uint32_t split_prior_sample[] = {
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        0xF11C0108u, 0x00070103u, // an image_sample variant (opcode 0x47) that only reads
+        0xF0200108u, 0x00020009u, // image_store v0, v[9:10], s[8:15] at pc 6
+        0xBF810000u,
+    };
+    const auto prior_sample_uses = split_uses(split_prior_sample, std::size(split_prior_sample));
+    CHECK(find_split(prior_sample_uses, 6u) != prior_sample_uses.end(),
+          "a read-only MIMG sample before the consumer preserves a split T#'s proof");
+    // A plain buffer load before the consumer only reads, so it cannot rewrite the descriptor's
+    // backing; a buffer store can, and revokes the proof.
+    const uint32_t split_prior_bufload[] = {
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        0xE030102Cu, 0x80030607u, // buffer_load_dword (MUBUF op 0xc)
+        0xF0200108u, 0x00020009u, // image_store through s[8:15] at pc 6
+        0xBF810000u,
+    };
+    const auto prior_bufload_uses = split_uses(split_prior_bufload, std::size(split_prior_bufload));
+    CHECK(find_split(prior_bufload_uses, 6u) != prior_bufload_uses.end(),
+          "a plain buffer load before the consumer preserves a split T#'s proof");
+    const uint32_t split_prior_bufstore[] = {
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        0xE0782000u, 0x80020008u, // buffer_store (MUBUF op 0x1e): may alias the backing
+        0xF0200108u, 0x00020009u, // image_store through s[8:15] at pc 6
+        0xBF810000u,
+    };
+    const auto prior_bufstore_uses = split_uses(split_prior_bufstore, std::size(split_prior_bufstore));
+    CHECK(find_split(prior_bufstore_uses, 6u) == prior_bufstore_uses.end(),
+          "a buffer store before the consumer still revokes a split T#'s proof");
+    const uint32_t split_prior_imgstore[] = {
+        split_t8[0], split_t8[1], split_t8[2], split_t8[3],
+        0xF0200108u, 0x00020009u, // image_store at pc 4: may alias the descriptor backing
+        0xF0200108u, 0x00020009u, // image_store at pc 6 through the same T#
+        0xBF810000u,
+    };
+    const auto prior_imgstore_uses = split_uses(split_prior_imgstore, std::size(split_prior_imgstore));
+    CHECK(find_split(prior_imgstore_uses, 6u) == prior_imgstore_uses.end(),
+          "an image store before the consumer still revokes a split T#'s proof");
     struct CodeRewriteReader final : FoldReader {
         uint32_t* code;
         bool rewrote = false;

@@ -6,7 +6,7 @@
 // frame debugger available to this project -- it answers "which draw wrote this pixel" and "what
 // is in this render target at draw N", which are exactly the questions a black-world bug asks and
 // exactly the ones prosper's own instruments answer worst. It was nevertheless unusable here,
-// for one mechanical reason recorded in docs/GPU_PROFILING_EXTERNAL.md: `renderdoccmd capture`
+// for one mechanical reason recorded in docs/performance/GPU_PROFILING_EXTERNAL.md: `renderdoccmd capture`
 // triggers on a KEYPRESS. Every agent on this project runs headless, so the best instrument in the
 // toolbox was again the one nobody could aim -- the same failure the F8/F9 schedulers fixed for
 // prosper's own captures (#2233), one tool over.

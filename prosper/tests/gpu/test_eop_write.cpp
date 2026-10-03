@@ -1,4 +1,4 @@
-// test_eop_write — Stage B of docs/GPU_EXECUTOR_DESIGN.md: the CommandProcessor honors the Dcb's
+// test_eop_write — Stage B of docs/gpu/GPU_EXECUTOR_DESIGN.md: the CommandProcessor honors the Dcb's
 // memory-side effects. RELEASE_MEM / EVENT_WRITE_EOP label writes ride a completion queue and a
 // WRITE_DATA is applied at the renderer/drain boundary — correct end-of-pipe semantics, not a shim.
 // This hand-builds the exact packet layout hle_agc.cpp's builders emit (the

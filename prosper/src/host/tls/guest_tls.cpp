@@ -56,7 +56,7 @@ void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count) {
     // the guest TCB, leave the hardware fs base at Rosetta's 0, and emulate each `%fs:`-prefixed
     // access in the SIGSEGV handler (the fault address is exactly the guest's offset, since base==0,
     // so the real target is guest_TP + fault_addr). Enabled by the same PROSPER_GUEST_FS gate.
-    // See exec_image_linux.cpp try_emulate_fs_access and docs/PORTING.md "macOS harness app".
+    // See exec_image_linux.cpp try_emulate_fs_access and docs/platforms/PORTING.md "macOS harness app".
     if (g_enabled) fprintf(stderr, "[guest-tls] macOS TRAP mode: %%fs accesses emulated (no wrfsbase)\n");
 #else
     // Initial-exec guest accesses must never alias glibc's host TCB. Astro Bot, for example, seeds
@@ -311,7 +311,7 @@ uint64_t guest_tls_total_below() { return g_total_below; }
 //       live register. So "set once and leave it" is impossible. We set the base on guest entry and
 //       the VEH (exec_image_win.cpp) re-applies it and retries whenever a guest %fs access faults
 //       because the base drifted (guest_fs_reapply). One fault per kernel-transition boundary, not
-//       per access. See docs/PORTING.md "The Windows frontier: guest %fs TLS".
+//       per access. See docs/platforms/PORTING.md "The Windows frontier: guest %fs TLS".
 // Because host-%fs aliasing (the Linux default fallback) cannot work here, guest-fs is enabled
 // whenever templates are configured (opt out with PROSPER_NO_GUEST_FS for bisection).
 #ifndef WIN32_LEAN_AND_MEAN

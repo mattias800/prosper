@@ -472,6 +472,8 @@ struct SpirvCompute {
     uint32_t stride = 1;
     bool raw_output_words = false;
     bool raw_input_words = false;
+    uint32_t packet_input_base = 0, packet_output_base = 0;   // optional dynamic wave ABI SSA ids
+    uint32_t load_packet_word(uint32_t index);
     // fixed ids (set in begin()):
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
     uint32_t v_gid=0, v_groupid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
@@ -2540,7 +2542,7 @@ struct SpirvCompute {
             const uint32_t variable = system_outputs[field];
             if (!variable) continue;
             put(deco, Op_Decorate, {variable, Dec_Location, layout.system_locations[field]});
-            if (field >= 4) put(deco, Op_Decorate, {variable, Dec_NoPerspective});
+            if (field == 3 || field >= 4) put(deco, Op_Decorate, {variable, Dec_NoPerspective});
             if (field == 0 || field == 4) put(deco, Op_Decorate, {variable, Dec_Sample});
             if (field == 2 || field == 6) put(deco, Op_Decorate, {variable, Dec_Centroid});
             iface.push_back(variable);
@@ -2761,8 +2763,25 @@ struct SpirvCompute {
                 const uint32_t barycentric = id();
                 putv(code, Op_CompositeConstruct,
                      {t_v4f, barycentric, bary_i, bary_j, fconstf(1.0f), fconstf(1.0f)});
-                for (uint32_t variable : system_outputs)
-                    if (variable) put(code, Op_Store, {variable, barycentric});
+                uint32_t pull_model = 0;
+                if (system_outputs[3]) {
+                    // AMD LLPC LowerInOut::visitEvalIjOffsetSmoothOp consumes I/W,J/W,1/W.
+                    // Linear interpolation of these vertex planes preserves their denominator;
+                    // perspective interpolation would divide it a second time. This transports
+                    // host raster values, not proof of PS5 initial-lane/precision authority.
+                    const uint32_t w = id(), reciprocal_w = id(), i_over_w = id(), j_over_w = id();
+                    put(code, Op_CompositeExtract, {t_f32, w, position, 3});
+                    put(code, Op_FDiv, {t_f32, reciprocal_w, fconstf(1.0f), w});
+                    put(code, Op_FMul, {t_f32, i_over_w, bary_i, reciprocal_w});
+                    put(code, Op_FMul, {t_f32, j_over_w, bary_j, reciprocal_w});
+                    pull_model = id();
+                    putv(code, Op_CompositeConstruct,
+                         {t_v4f, pull_model, i_over_w, j_over_w, reciprocal_w, fconstf(1.0f)});
+                }
+                for (uint32_t field = 0; field < system_outputs.size(); ++field)
+                    if (system_outputs[field])
+                        put(code, Op_Store,
+                            {system_outputs[field], field == 3 ? pull_model : barycentric});
             }
             put(code, Op_EmitVertex, {});
         }
@@ -3478,14 +3497,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 
 // emit_body and the CFG state machine it drives live in rdna2_emit_cfg.cpp. As with emit_alu, the
 // default arguments are stated here and nowhere else.
+struct PacketVgprDefinedness;
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
-    const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
-    bool allow_exec_update, bool allow_smem,
-    const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
+    const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt, bool allow_exec_update,
+    bool allow_smem, const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
     const uint32_t* code, size_t dwords, uint32_t initial_active = 0,
     bool synchronize_lds_fminmax = false,
-    const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction = {});
+    const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction = {},
+    PacketVgprDefinedness* packet_definedness = nullptr);
 
 bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,

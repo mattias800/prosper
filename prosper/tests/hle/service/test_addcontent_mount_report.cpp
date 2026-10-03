@@ -14,7 +14,7 @@
 // produce it. That argument is only as good as the guarantee that each label really does get its
 // own declared mount point. If prosper ever regressed to answering with, say, the first mountable
 // entry regardless of label, every mount would report `/app0/dlc1`, the ordering evidence would be
-// meaningless, and the falsification recorded in docs/GRIS_SONIC_COBRA_BRINGUP.md would quietly
+// meaningless, and the falsification recorded in docs/games/GRIS_SONIC_COBRA_BRINGUP.md would quietly
 // become wrong with nothing failing. test_addcontent_unmount.cpp cannot see this: it declares a
 // single entry, so label-keyed and label-ignoring lookups are indistinguishable there.
 //

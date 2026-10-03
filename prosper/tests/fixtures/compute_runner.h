@@ -189,11 +189,15 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     if (out_count == 0)   out_count = IN_N;
     std::vector<float> out;
     if (owned_dispatch) {
+        owned_dispatch->dispatch_attempts = 0;
         owned_dispatch->completion_and_host_availability = false;
-        owned_dispatch->enabled = {}; owned_dispatch->plan = {};
-        if (!owned_dispatch->prepare || required_subgroup_size || !cbuf.empty() || !cbuf1.empty() || extra_cbufs)
+        owned_dispatch->enabled = {};
+        owned_dispatch->plan = {};
+        if (!owned_dispatch->prepare || required_subgroup_size || !cbuf.empty() || !cbuf1.empty() ||
+            extra_cbufs)
             return out;
-    } else if (!IN_N || !out_count || !invocations || !local_size_x) return out;
+    } else if (!IN_N || !out_count || !invocations || !local_size_x)
+        return out;
 
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.apiVersion = required_subgroup_size ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;
@@ -290,12 +294,23 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
         VkPhysicalDeviceProperties properties{}; vkGetPhysicalDeviceProperties(phys, &properties);
         const auto& limits = properties.limits;
         if (plan.spirv.empty() || plan.input.empty() || plan.input.size() > 2 * 1024 * 1024 ||
-            !plan.output_words || plan.output_words > 64 * 64 * 12 + 64 * 3 || plan.images.size() > 16 ||
+            !plan.output_words || plan.output_words > 2 * 1024 * 1024 || plan.images.size() > 16 ||
+            !plan.wave_count || plan.wave_count > 4096 ||
+            plan.wave_count > limits.maxComputeWorkGroupCount[0] ||
+            (!plan.initial_output.empty() && plan.initial_output.size() != plan.output_words) ||
+            (plan.readonly_words &&
+             (plan.readonly_words->empty() || plan.readonly_words->size() > 2 * 1024 * 1024 ||
+              uint64_t(plan.readonly_words->size()) * 4 > limits.maxStorageBufferRange)) ||
+            uint64_t(plan.output_words) * 4 > limits.maxStorageBufferRange ||
+            uint64_t(plan.input.size()) * 4 > limits.maxStorageBufferRange ||
             (!plan.images.empty() && !sampled) || !feats.shaderInt64 ||
             64 > limits.maxComputeWorkGroupSize[0] || 64 > limits.maxComputeWorkGroupInvocations ||
-            5 > limits.maxPerStageDescriptorStorageBuffers || 5 > limits.maxDescriptorSetStorageBuffers ||
-            plan.images.size() > limits.maxPerStageDescriptorSamplers || plan.images.size() > limits.maxPerStageDescriptorSampledImages ||
-            plan.images.size() > limits.maxDescriptorSetSamplers || plan.images.size() > limits.maxDescriptorSetSampledImages ||
+            5 > limits.maxPerStageDescriptorStorageBuffers ||
+            5 > limits.maxDescriptorSetStorageBuffers ||
+            plan.images.size() > limits.maxPerStageDescriptorSamplers ||
+            plan.images.size() > limits.maxPerStageDescriptorSampledImages ||
+            plan.images.size() > limits.maxDescriptorSetSamplers ||
+            plan.images.size() > limits.maxDescriptorSetSampledImages ||
             5 + plan.images.size() > limits.maxPerStageResources) {
             std::fprintf(stderr, "compute_runner: owned packet/actual device limits unavailable\n");
             vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr); return {};
@@ -307,7 +322,8 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
             }
         selected_spirv = &plan.spirv; selected_input = &plan.input;
         IN_N = static_cast<uint32_t>(plan.input.size()); out_count = plan.output_words;
-        invocations = local_size_x = 64;
+        local_size_x = 64;
+        invocations = 64 * plan.wave_count;
     }
 
     VkPhysicalDeviceMemoryProperties memp; vkGetPhysicalDeviceMemoryProperties(phys, &memp);
@@ -381,7 +397,10 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     };
     // Constant buffer (binding 2, always present since the shell declares it; >=1 dword). Holds the
     // scalar memory an SMEM load reads. Shaders without SMEM never read it.
-    const uint32_t CB_N  = cbuf.empty()  ? 1u : (uint32_t)cbuf.size();
+    const auto& selected_cbuf = owned_dispatch && owned_dispatch->plan.readonly_words
+                                    ? *owned_dispatch->plan.readonly_words
+                                    : cbuf;
+    const uint32_t CB_N = selected_cbuf.empty() ? 1u : (uint32_t)selected_cbuf.size();
     const uint32_t CB1_N = cbuf1.empty() ? 1u : (uint32_t)cbuf1.size();
     const VkDeviceSize cbBytes  = (VkDeviceSize)CB_N  * sizeof(uint32_t);
     const VkDeviceSize cbBytes1 = (VkDeviceSize)CB1_N * sizeof(uint32_t);
@@ -410,7 +429,8 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     vkUnmapMemory(dev, inMem);
     void* cp = nullptr;
     if (!map_buffer(cbMem, cbBytes, &cp)) return decline_setup("constant buffer mapping failed");
-    for (uint32_t i = 0; i < CB_N; i++) ((uint32_t*)cp)[i] = (i < cbuf.size()) ? cbuf[i] : 0u;
+    for (uint32_t i = 0; i < CB_N; i++)
+        ((uint32_t*)cp)[i] = (i < selected_cbuf.size()) ? selected_cbuf[i] : 0u;
     vkUnmapMemory(dev, cbMem);
     void* cp1 = nullptr;
     if (!map_buffer(cbMem1, cbBytes1, &cp1))
@@ -422,6 +442,8 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     void* zp = nullptr;
     if (!map_buffer(outMem, outBytes, &zp)) return decline_setup("output mapping failed");
     for (uint32_t i = 0; i < out_count; i++) ((float*)zp)[i] = 0.0f;
+    if (owned_dispatch && !owned_dispatch->plan.initial_output.empty())
+        std::memcpy(zp, owned_dispatch->plan.initial_output.data(), outBytes);
     vkUnmapMemory(dev, outMem);
 
     if (!makeBuf(gdsBuf, gdsMem, kGdsBytes))
@@ -566,6 +588,7 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (vkCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS)
         return decline_setup("dispatch fence creation failed");
+    if (owned_dispatch) ++owned_dispatch->dispatch_attempts;
     if (vkQueueSubmit(queue, 1, &si, fence) != VK_SUCCESS ||
         vkWaitForFences(dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000) != VK_SUCCESS) {
         // The resources may still be in flight after a timeout. This test process exits after

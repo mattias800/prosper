@@ -3,7 +3,7 @@
 // The handler claims a physical range from the pool and then asks the host to place it at the
 // guest's VA. That placement is REFUSED whenever the no-clobber discipline (#137 / #88 / #107)
 // declines the target, and the refusal is the correct answer — why it is correct takes a case
-// analysis and lives in docs/KHAZAN_STATUS.md's `## Ruled out`, not in a comment here; two review
+// analysis and lives in docs/games/KHAZAN_STATUS.md's `## Ruled out`, not in a comment here; two review
 // rounds went on one-line versions of it that were wrong. What was wrong in the CODE is what
 // happened to the pool offset afterwards. It was
 // simply dropped: nothing referenced it, nothing could ever release it, and because the claim is
@@ -19,7 +19,7 @@
 // recorded here because the obvious story — "the pool runs dry, so the engine heap cannot commit" —
 // is wrong and was believed. With the leak fixed both titles still reach UE4's own out-of-memory
 // report, and at that moment prosper's pool holds a 230 MiB free block and has failed no call at
-// all (#2908, and docs/KHAZAN_STATUS.md's `## Ruled out`). So this test guards an allocator
+// all (#2908, and docs/games/KHAZAN_STATUS.md's `## Ruled out`). So this test guards an allocator
 // invariant that stands on its own: memory prosper did not use, prosper does not keep.
 //
 // The arms below are built so that a passing result cannot be a coincidence:
@@ -31,6 +31,7 @@
 // Deliberately NOT asserted: how much the lever arm consumes. That is an allocator-internal
 // quantity; the contract under test is only that a refused map costs nothing.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -40,8 +41,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 namespace {
 constexpr uint64_t kAmprSentinel = 0xffffffffull;   // the map flavor's a4 sentinel
@@ -58,7 +58,7 @@ uint64_t largest_free(HleFn avail) {
 }
 }  // namespace
 
-int main() {
+TEST(AmprMapRefusalReleasesDmem, Contract) {
     std::printf("== test_ampr_map_refusal_releases_dmem ==\n");
     register_builtin_hle();
 
@@ -66,7 +66,7 @@ int main() {
     HleFn avail      = Hle::lookup(nid_hash("sceKernelAvailableDirectMemorySize"));
     CHECK(set_buffer != nullptr, "sceAmprCommandBufferSetBuffer is registered");
     CHECK(avail != nullptr,      "sceKernelAvailableDirectMemorySize is registered");
-    if (!set_buffer || !avail) { std::printf("%s\n", fails ? "FAILED" : "PASSED"); return fails ? 1 : 0; }
+    if (!set_buffer || !avail) { std::printf("FAILED\n"); return; }
 
     const uint64_t pool_at_start = largest_free(avail);
     CHECK(pool_at_start > (64ull << 20), "the pool query reports a usable free block to measure against");
@@ -140,6 +140,5 @@ int main() {
         }
     }
 
-    std::printf("%s\n", fails ? "FAILED" : "PASSED");
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

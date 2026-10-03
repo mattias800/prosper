@@ -25,7 +25,7 @@ beyond the specific route documented for it.
   memory of previous sessions.
 - Progress is defined by a six-rung ladder per title. A game loop running over a black screen is not
   gameplay, and a build that compiles is not progress.
-- Verification is programmatic ([`docs/VERIFICATION.md`](prosper/docs/VERIFICATION.md)): Vulkan
+- Verification is programmatic ([`docs/process/VERIFICATION.md`](prosper/docs/process/VERIFICATION.md)): Vulkan
   tests that assert numeric and pixel results, a `spirv-val` gate on every SPIR-V emitter, and
   golden-image guards over real boots.
 - Falsified hypotheses are recorded in a `## Ruled out` section in the relevant status document.

@@ -4,6 +4,7 @@
 // fill the destination.
 #include "hle/dispatch/dispatch.hpp"
 #include <gtest/gtest.h>
+#include "hle/kernel/kernel_event_filters.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "fixtures/test_scratch.h"
 #include <array>
@@ -76,7 +77,7 @@ static EventSequence wait_through_fence(HleFn wait_eq, uint64_t eq, uint64_t fen
 
 static bool is_exact_fence(const EventSequence& sequence, uint64_t fence_tag) {
     return sequence.reached_fence && sequence.size == 1 &&
-           sequence.events[0].ident == 0 && sequence.events[0].filter == -24 &&
+           sequence.events[0].ident == 0 && sequence.events[0].filter == EVFILT_AMPR &&
            (uint64_t)sequence.events[0].data == fence_tag;
 }
 
@@ -179,7 +180,7 @@ TEST(AmprMeasure, Contract) {
         append_equeue_320(tail_cb, eq, (uint64_t)event_id, tail_tag, 0, 0);
         KEvent tail_event{};
         const bool tail_received = wait_one(wait_eq, eq, tail_event);
-        CHECK(tail_received && tail_event.ident == event_id && tail_event.filter == -24 &&
+        CHECK(tail_received && tail_event.ident == event_id && tail_event.filter == EVFILT_AMPR &&
                   (uint64_t)tail_event.data == tail_tag,
               "unsent PS5 3.20 tail receives one deferred eager completion");
 
@@ -195,7 +196,7 @@ TEST(AmprMeasure, Contract) {
         KEvent exact_tail_event{};
         const bool exact_tail_received = wait_one(wait_eq, eq, exact_tail_event);
         CHECK(exact_tail_received && exact_tail_event.ident == 0 &&
-                  exact_tail_event.filter == -24 &&
+                  exact_tail_event.filter == EVFILT_AMPR &&
                   (uint64_t)exact_tail_event.data == exact_tail_tag,
               "deferred pointer-dialect completion arm delivered its distinct tag");
 
@@ -225,7 +226,7 @@ TEST(AmprMeasure, Contract) {
         KEvent submitted_event{};
         const bool submitted_received = wait_one(wait_eq, eq, submitted_event);
         CHECK(submitted_received && submitted_event.ident == 0 &&
-                  submitted_event.filter == -24 &&
+                  submitted_event.filter == EVFILT_AMPR &&
                   (uint64_t)submitted_event.data == submitted_tag,
               "explicit-submit completion arm delivered its distinct tag");
 
@@ -287,7 +288,7 @@ TEST(AmprMeasure, Contract) {
         KEvent replacement_event{};
         const bool replacement_received = wait_one(wait_eq, replacement_eq, replacement_event);
         CHECK(replacement_received && replacement_event.ident == event_id &&
-                  replacement_event.filter == -24 &&
+                  replacement_event.filter == EVFILT_AMPR &&
                   (uint64_t)replacement_event.data == replacement_tag,
               "stale equeue lifetime cannot poison a replacement completion token");
 
@@ -310,12 +311,13 @@ TEST(AmprMeasure, Contract) {
                   get_count(replacement_eq, 0, 0, 0, 0, 0) == 0,
               "destroying a PS5 3.20 command buffer cancels its pending tail");
         construct(destroyed_cb, 0, 0, 0, 0, 0);
-        uint64_t unbound_out1 = 0, unbound_out2 = 0;
+        uint64_t unbound_out1 = UINT64_MAX;
+        uint32_t unbound_out2 = 0;
         submit(destroyed_cb, 1, (uint64_t)(uintptr_t)&unbound_out1,
                (uint64_t)(uintptr_t)&unbound_out2, 0, 0);
-        CHECK(unbound_out1 && unbound_out1 == unbound_out2,
+        CHECK(unbound_out1 == 0 && unbound_out2 != 0,
               "reconstructed command buffer is unbound after PS5 3.20 destruction");
-        // #180's rule: an UNBOUND submit hands its invented counter through the out slots and must
+        // #180's event rule: an UNBOUND submit publishes a separate kernel ID and must
         // post NO event, because an invented token would regress the UE4 listener's ctor-seeded
         // last-processed counter. Pin it directly — the out-slot check above does not.
         // Scope note: this pins "an unbound submit posts no event". It does NOT pin the *bound*
@@ -345,19 +347,18 @@ TEST(AmprMeasure, Contract) {
         // completed. Binding to a real equeue is the guest asking for completion delivery. Unbound
         // buffers still post nothing (issue #180's invented-counter regression), asserted above.
         //
-        // Cover BOTH delivery dialects, because a live PPSA19991 boot uses both on one equeue: of
-        // its 20 observed bindings, 9 pass id 0 and the rest ids 1..5. prosper_eq_post_apr_token
-        // branches on exactly that (hle_kernel_time.cpp): id 0 takes the #210 pointer dialect and
-        // delivers the exact token, while id != 0 takes the #208 counter dialect and delivers
-        // (ring << 58) | per-(eq,ring) high-water mark. So this asserts what is actually
-        // contractual for CRI — the event ARRIVES carrying its own ident — and deliberately does not
-        // assert a verbatim tag in the counter branch, where the delivered data is a counter and any
-        // zero would be an artifact of a fresh queue rather than an echo.
+        // Cover both zero-tag delivery dialects: id 0 selects RequestPointer, while a nonzero id
+        // selects ConstantZero. Both deliver distinct events. The contract asserted for CRI is
+        // that the event arrives carrying its own ident, independent of its completion tag.
         // CONFIDENCE: HIGH (guest disassembly + firmware NID database + live boot capture).
         if (submit_plain && add_ampr_event) {
-            const struct { int64_t id; const char* what; } cri_cases[] = {
-                { 0,      "zero-tag binding delivers its completion event (id 0, pointer dialect)" },
-                { 0x74fe, "zero-tag binding delivers its completion event (id != 0, counter dialect)" },
+            const struct {
+                int64_t id;
+                const char* what;
+            } cri_cases[] = {
+                {0, "zero-tag binding delivers its completion event (id 0, pointer dialect)"},
+                {0x74fe,
+                 "zero-tag binding delivers its completion event (id != 0, constant-zero dialect)"},
             };
             for (const auto& c : cri_cases) {
                 uint64_t cri_eq = 0;
@@ -374,9 +375,9 @@ TEST(AmprMeasure, Contract) {
                 // `filter` is the load-bearing half of this assertion. KEvent is zero-initialised
                 // and the pointer-dialect case uses id 0, so `ident == c.id` degenerates to 0 == 0
                 // and would hold even if no event ever arrived — vacuous in exactly the branch CRI
-                // uses for 9 of its 20 bindings. EVFILT_AMPR_MODELED (-24) is nonzero and is set by
+                // uses for 9 of its 20 bindings. EVFILT_AMPR (-25) is nonzero and is set by
                 // both apr_post and the id-0 pointer worker, so a zeroed KEvent cannot fake it.
-                CHECK(cri_received && cri_event.ident == c.id && cri_event.filter == -24, c.what);
+                CHECK(cri_received && cri_event.ident == c.id && cri_event.filter == EVFILT_AMPR, c.what);
                 CHECK(get_count(cri_eq, 0, 0, 0, 0, 0) == 0,
                       "zero-tag completion is delivered exactly once");
                 delete_eq(cri_eq, 0, 0, 0, 0, 0);

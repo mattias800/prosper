@@ -1,18 +1,6 @@
-// test_apr_result_slot_width — sceKernelAprSubmitCommandBufferAndGetResult writes 32-bit results.
-//
-// THE DEFECT. The call is (cb, ring, uint32_t* out1, uint32_t* out2). prosper stored an 8-byte token
-// through each pointer. A guest that keeps the two slots as adjacent 4-byte stack locals therefore
-// had the four bytes after each slot overwritten; for the slot sitting directly below its stack
-// canary that was the low half of the canary, and the function's epilogue called __stack_chk_fail
-// (Assassin's Creed Black Flag Resynced, host SIGILL right after an APR read; issue #4138).
-//
-// WHAT THE ARMS KILL:
-//   M1  apr_write_result_slot stores 8 bytes again              -> the guard bytes after each slot
-//   M2  the slot is not written at all                          -> the "result is delivered" arms
-//   M3  only the first slot is written                          -> the out2 arm
-//
-// The layout is the failing guest's: out1 at +4 and out2 at +12 of a 24-byte region (both 4 mod 8,
-// 8 bytes apart), every other byte pre-filled with a sentinel.
+// APR result is status32 + failing-offset32 (8 bytes); the separate submit ID is 4 bytes.
+// A token in status turns a successful read into a guest fatal. Widening the ID corrupts
+// the adjacent live flag/canary. Original callers establish both widths independently.
 #include "hle/dispatch/dispatch.hpp"
 #include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
@@ -42,7 +30,7 @@ TEST(AprResultSlotWidth, Contract) {
     if (!submit) FAIL() << "legacy early exit";
 
     // The command buffer is never bound to an event queue, so the submit takes the path that
-    // writes the result slots. Its contents are not read by that path.
+    // writes the result and ID. Its contents are not read by that path.
     alignas(16) static uint8_t cb[256] = {};
     alignas(16) uint8_t region[24];
     memset(region, 0xA5, sizeof region);
@@ -52,16 +40,19 @@ TEST(AprResultSlotWidth, Contract) {
                                0, 0);
     CHECK(rc == 0, "the submit succeeds");
 
-    uint32_t out1 = 0, out2 = 0;
+    uint32_t out1 = 0, offset = 0, out2 = 0;
     memcpy(&out1, region + 4, sizeof out1);
+    memcpy(&offset, region + 8, sizeof offset);
     memcpy(&out2, region + 12, sizeof out2);
 
     CHECK(out1 != 0xA5A5A5A5u, "out1 received a result (M2)");
     CHECK(out2 != 0xA5A5A5A5u, "out2 received a result (M2, M3)");
-    CHECK(out1 == out2, "both slots carry the same submission token");
+    CHECK(out1 == 0 && offset == 0, "successful execution writes both result words");
     CHECK(all_bytes(region, 4, 0xA5), "bytes before out1 are untouched");
-    CHECK(all_bytes(region + 8, 4, 0xA5),
-          "the four bytes after out1 (the pad before out2) are untouched (M1)");
+    HleFn wait = Hle::lookup("rqwFKI4PAiM");
+    ASSERT_NE(wait, nullptr);
+    EXPECT_EQ(wait(out2, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(wait(out2, 0, 0, 0, 0, 0), 0u) << "repeat waits retain the completed handle";
     CHECK(all_bytes(region + 16, 8, 0xA5),
           "the bytes after out2 (the stack canary's place in the failing guest) are untouched (M1)");
 

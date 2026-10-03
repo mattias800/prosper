@@ -6,13 +6,13 @@
 # (Both are spreads across several arms, not single readings -- see the budget note below.)
 #
 # Route shape, and why each step exists (every claim below is measured, see
-# docs/SONIC_FRONTIERS_STATUS.md):
+# docs/games/SONIC_FRONTIERS_STATUS.md):
 #
 # IF THIS ROUTE PARKS IN THE "EXTRAS" MENU, IT DESYNCED -- IT IS NOT A RENDER OR INPUT WALL.
 #
 # Measured 2026-08-27. One live-renderer arm sat in Extras for its whole length -- 24/24 frames with
 # content, `pixel-distinct=24`, guest healthy -- and never reached the stage. It looks exactly like a
-# wall. It is the end state docs/SONIC_FRONTIERS_STATUS.md already records for flip/wall-clock
+# wall. It is the end state docs/games/SONIC_FRONTIERS_STATUS.md already records for flip/wall-clock
 # desync under host load: a confirm activates "Extras", and every later input then navigates inside
 # that submenu. Check `uptime` and re-run before diagnosing anything.
 #
@@ -25,7 +25,7 @@
 # an empty PROSPER_SAVE0 root, but neither of those arms has a recorded arm count, and reaching that
 # marker is not the same as the authored route having run. Do not set an empty save root as a
 # precondition here; do not treat the save as established to be irrelevant either.
-# See docs/SONIC_FRONTIERS_STATUS.md for the 2x2 and both its limits.
+# See docs/games/SONIC_FRONTIERS_STATUS.md for the 2x2 and both its limits.
 #
 # USE boot_trace AS THE FAST LOOP -- 17-30 flips/s against 1.5-3.4 on a live 4K renderer arm, so
 # f2900 is ~100-200 s instead of 14-32 minutes:

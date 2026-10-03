@@ -6,6 +6,7 @@
 // host round trip it exists to remove. The published handles must also be the renderer's own, since
 // adopting a different device would be worse than not adopting at all.
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "fixtures/render_runner.h"
 #include "shared/live/live_renderer.hpp"
 #include <algorithm>
@@ -14,9 +15,7 @@
 #include <vector>
 #include <cstdio>
 
-static int fails = 0;
-#define CHECK(cond, msg) do { if (!(cond)) { printf("  [FAIL] %s\n", msg); fails++; } \
-                              else         { printf("  [ok]   %s\n", msg); } } while (0)
+#define CHECK(cond, msg) EXPECT_TRUE(cond) << (msg)
 
 static uint32_t loader_version = VK_API_VERSION_1_0;
 static VkResult loader_result = VK_SUCCESS;
@@ -33,7 +32,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fake_get_instance_proc(
         ? reinterpret_cast<PFN_vkVoidFunction>(fake_enumerate_version) : nullptr;
 }
 
-int main() {
+TEST(SharedVulkanDevice, Contract) {
     // A modern physical device cannot rescue an old loader. Exercise the query failure and
     // missing-entry-point cases without needing an old driver installed on the test machine.
     using prosper::frontend::require_vulkan_runtime_loader;
@@ -167,7 +166,7 @@ int main() {
     const prosper::test::RenderVkCtx& ctx = prosper::test::render_vk_ctx();
     if (!ctx.ok) {
         printf("test_shared_vulkan_device: no Vulkan device available, skipping\n");
-        return fails ? 1 : 0;           // No ICD skips GPU assertions, not the loader controls above.
+        return;           // No ICD skips GPU assertions, not the loader controls above.
     }
 
     const prosper::gpu::SharedVulkanContext shared = prosper::gpu::shared_vulkan_context();
@@ -289,7 +288,4 @@ int main() {
               "a non-present-capable context publishes no present queue (headless fallback path)");
     }
 
-    printf(fails ? "test_shared_vulkan_device: %d FAILURE(S)\n"
-                 : "test_shared_vulkan_device: all ok\n", fails);
-    return fails ? 1 : 0;
 }

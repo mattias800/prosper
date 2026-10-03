@@ -38,7 +38,7 @@ A THREAD IS ITS IDENTITY, NOT ITS NAME (#3400)
 WINDOWS, NOT AVERAGES
     Blue Prince has performance regimes differing ~50x and its phase boundary is sharp. An
     average across it is a fiction, so this reports per-window and refuses to print a grand mean
-    unless --windows 1 is asked for explicitly. See docs/BLUE_PRINCE_STATUS.md.
+    unless --windows 1 is asked for explicitly. See docs/games/BLUE_PRINCE_STATUS.md.
 
 USAGE
     wait_profile.py --pid <pid> [--seconds 30] [--hz 200] [--windows 6] [--top 12]

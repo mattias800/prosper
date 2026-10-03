@@ -24,7 +24,7 @@
 # the RIGHT-HAND option, so every cross answers it in the negative and returns
 # to the same page. Measured 2026-08-21 -- a 1168 s cross-only run cycled
 # through that loop for its whole length with the guest healthy throughout.
-# Same shape as the Tales of Graces f new-game dialogs (docs/TALES_GRACES_STATUS.md).
+# Same shape as the Tales of Graces f new-game dialogs (docs/games/TALES_GRACES_STATUS.md).
 
 15-18:cross
 22-25:left

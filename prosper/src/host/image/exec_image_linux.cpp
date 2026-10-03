@@ -3181,29 +3181,50 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
                    uint64_t stub_size, std::string* err) {
     auto fail = [&](const char* s){ if (err) *err = s; return false; };
     if (stub_size < 24) return fail("stub_size too small (need >= 24)");
-    if (!g_nid_db) g_nid_db = new NidDb();
-    dispatch_init(&slots, g_nid_db);
 
-    uint64_t n = slots.size();
+    const uint64_t n = slots.size();
     // Zero unresolved imports (e.g. a title whose every import resolved cross-module, or a dump whose
     // dynamic section yields none): nothing to emit — a 0-byte mmap would fail with EINVAL, so record
     // the empty table and succeed.
-    if (n == 0) { g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = 0; return true; }
-    uint64_t region = page_up(n * stub_size);
-    if (region > kStubApertureBytes) return fail("import stub table exceeds the stub aperture");
+    if (n == 0) {
+        if (!g_nid_db) g_nid_db = new NidDb();
+        dispatch_init(&slots, g_nid_db);
+        g_stub_base = stub_base;
+        g_stub_size = stub_size;
+        g_nstubs = 0;
+        return true;
+    }
+    const bool swap = stub_swap_mode();
+    if (swap && stub_size < 96)
+        return fail("stub_size too small for guest-%fs swap stub (need >= 96)");
+    if (n > kStubApertureBytes / stub_size)
+        return fail("import stub table exceeds the stub aperture");
+    const uint64_t region = page_up(n * stub_size);
+    if (stub_base > std::numeric_limits<uint64_t>::max() - region)
+        return fail("import stub table address overflows");
+
+    // Current POSIX emitters need at most 82 bytes. Validate every slot before mapping or writing
+    // live pages: a hook can exceed the accepted host stride even in the last slot of a full page.
+    std::vector<detail::StagedStub<96>> staged;
+    if (!detail::stage_stub_suffix(
+            staged, 0, slots.size(), stub_size,
+            [&slots, swap](auto& bytes, size_t i) {
+                return emit_one_stub(bytes.data(), slots[i], (uint32_t)i, swap);
+            },
+            "generated import stub exceeds staging capacity",
+            "generated import stub exceeds stub_size", err))
+        return false;
+    if (!g_nid_db) g_nid_db = new NidDb();
     void* want = (void*)stub_base;
     void* got = prosper_mmap_noreplace(want, region, PROT_READ | PROT_WRITE | PROT_EXEC,
                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (got == MAP_FAILED || got != want) return fail("mmap stub region failed");
 
-    const bool swap = stub_swap_mode();
-    if (swap && stub_size < 96) return fail("stub_size too small for guest-%fs swap stub (need >= 96)");
-    uint8_t* base = (uint8_t*)got;
-    for (uint64_t i = 0; i < n; i++) {
-        const size_t emitted = emit_one_stub(base + i * stub_size, slots[i], (uint32_t)i, swap);
-        if (emitted > stub_size) return fail("generated import stub exceeds stub_size");
-    }
-    g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = n;
+    detail::publish_stub_suffix(staged, stub_base, stub_size, 0);
+    dispatch_init(&slots, g_nid_db);
+    g_stub_base = stub_base;
+    g_stub_size = stub_size;
+    g_nstubs = n;
     // PROSPER_STUBDUMP: dump the stub table (index, guest offset from stub_base, lib::nid + resolved name).
     // Used to map a stub address seen on a stack (e.g. 0x600000000+off) back to the import it calls.
     if (getenv("PROSPER_STUBDUMP")) {

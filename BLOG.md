@@ -19,6 +19,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-03
+
+### Silent Hill 2 renders its legal splash again
+
+The normal Linux `prosper-app` route gets past the startup read failure and renders the legal splash; the earlier scheduled frame is black, and a correct title screen remains unverified ([tracker #4024](https://github.com/mattias800/prosper/issues/4024)).
+
+<p align="center"><img src="assets/screenshots/silent-hill-2-apr-restored-legal-2026-10-03.webp" alt="Silent Hill 2 — readable legal splash and Wwise logo in the normal visible Linux prosper-app SDL/X11 window, without input injection or an overlay"></p>
+<p align="center"><img src="assets/screenshots/silent-hill-2-apr-restored-early-black-2026-10-03.webp" alt="Silent Hill 2 — black scheduled prosper-app screenshot, armed at presentation 120 and written at 226, before the later legal-splash window capture; this is not title evidence"></p>
+
 ## 2026-10-01
 
 ### Silent Hill 2 renders its first-boot setup
@@ -70,7 +79,7 @@ Also a retraction, because it is the more useful half: an earlier finding here s
 68.5% of a backend call and forced half the flushes. That was measured on two harnesses that both
 had GPU present *inactive*, and their agreement was mistaken for independence. On the shipped path
 readback is 1 slot in 36,897.
-[`RENDERER_ARCHITECTURE_GAPS_2026_09_25.md`](prosper/docs/RENDERER_ARCHITECTURE_GAPS_2026_09_25.md).
+[`RENDERER_ARCHITECTURE_GAPS_2026_09_25.md`](prosper/docs/gpu/RENDERER_ARCHITECTURE_GAPS_2026_09_25.md).
 
 ## 2026-09-23
 
@@ -182,7 +191,7 @@ No picture — a measurement. `tests/fixtures/render_runner.h` is not a test fix
 offscreen Vulkan backend, 12,702 lines of it, and the shipping frontend calls into `prosper::test::`
 185 times. It is also 21.6% of everything this repository parses of its own source. Two more numbers
 from the same pass: three functions hold 11.8% of the emulator, and eighty-two hold 31.1% of it, out
-of 5,684. [The plan](prosper/docs/REFACTOR_PLAN_2026_09.md).
+of 5,684. [The plan](prosper/docs/architecture/REFACTOR_PLAN_2026_09.md).
 
 ## 2026-09-17
 
@@ -302,7 +311,7 @@ bytes backwards, and dereferenced the padding it had poisoned itself. Details in
 ### Cheaper preparation, more GPU comparisons
 
 GTA retains its lit bank, while Sonic still shows its HUD over a missing world; the
-[combined performance measurements](prosper/docs/SHADER_KEY_PREPARATION_2026_09.md) show cheaper
+[combined performance measurements](prosper/docs/gpu/SHADER_KEY_PREPARATION_2026_09.md) show cheaper
 preparation and higher observed Sonic presentation rates, with more memory retained.
 
 *Linux `prosper-app` with FPS overlay: Sonic gameplay route, then GTA Performance Story; legacy/new
@@ -320,7 +329,7 @@ keys, capacity controls and final defaults are identified below.*
 ### Making room for exact comparisons
 
 Sonic retains its known black world and HUD, while GTA retains the lit Performance Story bank;
-[the cache comparison saving repeats, without an established FPS gain](prosper/docs/COMPUTE_BUFFER_IDLE_RESIDENCY_2026_09.md).
+[the cache comparison saving repeats, without an established FPS gain](prosper/docs/gpu/COMPUTE_BUFFER_IDLE_RESIDENCY_2026_09.md).
 
 *Linux `prosper-app`, Sonic gameplay route: census, policy control/enabled, then former/new defaults.*
 
@@ -339,7 +348,7 @@ Sonic retains its known black world and HUD, while GTA retains the lit Performan
 
 An overlapping private output could make a later “unchanged” result skip a necessary write;
 new executed buffer/image guards expose the error and the shared planner now preserves the last
-writer. [Evidence and the unsuccessful comparison-policy trials](prosper/docs/COMPUTE_HOSTED_WRITEBACK_2026_09.md).
+writer. [Evidence and the unsuccessful comparison-policy trials](prosper/docs/gpu/COMPUTE_HOSTED_WRITEBACK_2026_09.md).
 Sonic before/after retains its known black world/HUD; GTA retains the lit Performance Story bank.
 No FPS or audio improvement is established.
 
@@ -350,7 +359,7 @@ No FPS or audio improvement is established.
 ### Less CPU work for shared mip tails
 
 Sonic's affected compute dispatch falls from 4.06 to 2.21 ms while its known black world remains;
-GTA retains the bank scene ([measurements and limits](prosper/docs/MIP_TAIL_LAYOUT_2026_09.md)).
+GTA retains the bank scene ([measurements and limits](prosper/docs/gpu/MIP_TAIL_LAYOUT_2026_09.md)).
 
 *Linux Sonic gameplay route, scalar then separable mip layout; the missing world is not fixed.*
 
@@ -367,7 +376,7 @@ GTA retains the bank scene ([measurements and limits](prosper/docs/MIP_TAIL_LAYO
 ### Keeping texture snapshots without another copy
 
 GTA retains its bank scene while a bounded ownership transfer removes most snapshot-copy work;
-Sonic retains its known black world and HUD ([measurements and limits](prosper/docs/TEXTURE_SOURCE_SNAPSHOT_2026_09.md)).
+Sonic retains its known black world and HUD ([measurements and limits](prosper/docs/gpu/TEXTURE_SOURCE_SNAPSHOT_2026_09.md)).
 
 *Linux `prosper-app`, GTA Performance Story route: snapshot transfer off, then on.*
 
@@ -383,7 +392,7 @@ Sonic retains its known black world and HUD ([measurements and limits](prosper/d
 ### GTA's bank scene survives another small texture-conversion saving
 
 GTA V shows the same bank scene before and after packed GPU retile; Sonic still shows its known
-black world with a visible HUD ([measurements and limits](prosper/docs/GPU_RETILE_PACKED_2026_09.md)).
+black world with a visible HUD ([measurements and limits](prosper/docs/gpu/GPU_RETILE_PACKED_2026_09.md)).
 
 *Linux `prosper-app`, GTA Performance Story gamepad route: extension off, then on.*
 
@@ -1398,7 +1407,7 @@ Eight tracked titles had never been booted. All eight now have: three reach a me
 one a logo sequence, four render nothing. *Unbound* is the best of them — that is its real title
 screen, on 9% of frames. The point was the comparison, not the eight runs: what they share is
 symptoms, and every rung-0 wall is its own.
-[`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/NEVER_BOOTED_SURVEY_2026_08.md).
+[`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md).
 
 ### Sonic Origins reaches its title screen, and the wall was a dialog box
 

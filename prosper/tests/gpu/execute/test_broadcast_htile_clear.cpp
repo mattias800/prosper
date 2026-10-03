@@ -1,6 +1,7 @@
 // A semantic zero fill must discard rendered depth even when guest HTILE was already zero.
 // The adjacent negative arm copies each destination value back unchanged through the Vulkan path.
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "shared/live/live_compute.hpp"
@@ -14,10 +15,7 @@
 #include <new>
 
 using namespace prosper::gpu;
-static int failures = 0;
-static void check(bool ok, const char* message) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; }
-}
+static void check(bool ok, const char* message) { EXPECT_TRUE(ok) << message; }
 
 // Hand-assembled bounded broadcast/copy, built from ISA fields rather than captured shader data.
 static std::array<uint32_t, 18> broadcast_program() {
@@ -47,7 +45,7 @@ static void descriptor(std::vector<uint32_t>& sgprs, unsigned slot,
     sgprs[slot + 3] = (format << 12) | 4u;
 }
 
-int main() {
+TEST(BroadcastHtileClear, Contract) {
     const auto code = broadcast_program();
     check(classify_compute_cpu_fast_path(code.data(), code.size()) ==
               ComputeCpuFastPath::BroadcastBufferU32, "complete bounded broadcast is recognized");
@@ -64,13 +62,13 @@ int main() {
     const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
     const auto unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
     check(map && unmap, "tracked guest mapping APIs serve metadata identity fixture");
-    if (!map || !unmap) return 1;
+    if (!map || !unmap) FAIL() << "legacy early exit";
     uint64_t mapped_base = 0;
     constexpr uint64_t mapped_bytes = 0x100000;
     check(map(reinterpret_cast<uint64_t>(&mapped_base), mapped_bytes, 2, 0,
               reinterpret_cast<uint64_t>("broadcast-htile"), 0) == 0 && mapped_base,
           "metadata and depth identities occupy tracked disjoint guest ranges");
-    if (!mapped_base) return 1;
+    if (!mapped_base) FAIL() << "legacy early exit";
     struct MappingGuard {
         prosper::HleFn unmap;
         uint64_t base, bytes;
@@ -119,7 +117,7 @@ int main() {
     item.resources = std::make_shared<ShaderResourceTable>(table);
     item.spirv = recompile_compute(code.data(), code.size(), item.resources.get(), item.recompile_config);
     check(!item.spirv.empty(), "broadcast shader independently recompiles for Vulkan control");
-    if (item.spirv.empty()) return 1;
+    if (item.spirv.empty()) FAIL() << "legacy early exit";
 
     auto run = [&](ComputeItem candidate, uint32_t expected_fills) {
         const uint64_t before = prosper::frontend::live_compute_cpu_fill_dispatches();
@@ -131,7 +129,7 @@ int main() {
     // Use the live renderer's device before compute initializes, matching the shared-device route.
     // Creating an independent compute device first also changes layer teardown ordering at exit.
     check(prosper::test::render_vk_ctx().ok, "shared renderer device initializes");
-    if (!prosper::test::render_vk_ctx().ok) return 1;
+    if (!prosper::test::render_vk_ctx().ok) FAIL() << "legacy early exit";
     constants[2] = 0x12345678;
     check(run(item, 1) && std::all_of(metadata.begin(), metadata.end(),
           [](uint32_t v) { return v == 0x12345678; }), "broadcast carries nonzero runtime source value");
@@ -154,7 +152,7 @@ int main() {
     const auto no_op_spirv = recompile_compute(no_op_code, std::size(no_op_code), nullptr,
                                               item.recompile_config);
     check(!no_op_spirv.empty(), "admission probes have a valid terminating fallback");
-    if (no_op_spirv.empty()) return 1;
+    if (no_op_spirv.empty()) FAIL() << "legacy early exit";
     auto reject = [&](ComputeItem candidate) {
         candidate.spirv = no_op_spirv;
         candidate.terminator_only_program_validated = true;
@@ -324,5 +322,4 @@ int main() {
               "capture validation refuses retained raw ISA without the required compute config");
     }
     set_guest_gpu_write_observer({});
-    return failures ? 1 : 0;
 }

@@ -10,7 +10,7 @@
 // DATA FORMAT (float32 vs unorm8 vs …) to emit the right conversion — and that format lives in the
 // V#/T# descriptor the game builds, which the FRONT-HALF can read from the shader's user_data / SRT
 // and the game's bound resources. So the recompiler is *parameterized* by a ShaderResourceTable the
-// front-half fills. See docs/RESOURCE_BINDING.md for the model, the descriptor-provenance mechanism,
+// front-half fills. See docs/gpu/RESOURCE_BINDING.md for the model, the descriptor-provenance mechanism,
 // and the staged implementation plan.
 #pragma once
 #include <algorithm>

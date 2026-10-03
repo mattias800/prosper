@@ -7,7 +7,7 @@ description: Make, measure and land a prosper performance change - a switch for 
 
 Preserve task authorization, resource coordination and `LOCAL.md`; this skill grants no additional
 authority. It does not authorize GPU runs, claiming a GPU lease, pushing or merging — follow the
-task and `prosper/docs/GAME_COMPAT_ORCHESTRATION.md` for those.
+task and `prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md` for those.
 
 1. **Read first.** `CLAUDE.md` § *Architecture and performance ratchets* (invariants P1-P6) and its
    FPS-harness warnings; `prosper/src/diagnostics/AGENTS.md` for the `[perf-alarm]` lines; the
@@ -19,10 +19,10 @@ task and `prosper/docs/GAME_COMPAT_ORCHESTRATION.md` for those.
 3. **Reference workloads** — one change is measured on all three, not on the title it was written
    for:
    - *Grand Theft Auto V* `PPSA04263`, `prosper/scripts/gta5/reach-performance-story.pad` (the world
-     renders only in the game's Performance mode; `prosper/docs/GTA5_STATUS.md`).
+     renders only in the game's Performance mode; `prosper/docs/games/GTA5_STATUS.md`).
    - A second 3D title, e.g. *Outer Wilds* `PPSA08102`,
      `prosper/scripts/outer-wilds-PPSA08102/reach-first-person.pad`
-     (`prosper/docs/OUTER_WILDS_STATUS.md`).
+     (`prosper/docs/games/OUTER_WILDS_STATUS.md`).
    - *The Messenger* `PPSA24651`, `prosper/scripts/messenger/reach-first-level.pad`, as the flat 2D
      control a change should not regress.
 4. **Measure the shipped path.** `prosper-app` (built with `-DPROSPER_APP=ON`) with GPU present —

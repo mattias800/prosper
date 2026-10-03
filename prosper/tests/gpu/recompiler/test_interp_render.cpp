@@ -8,6 +8,7 @@
 // produces a red GRADIENT (min != max across the viewport); a broken/flat path would be uniform. Green
 // and blue stay ~0, proving the output is the interpolated attribute, not garbage.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "fixtures/render_runner.h"
 #include <algorithm>
 #include <cstdio>
@@ -18,10 +19,9 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(InterpRender, Contract) {
     printf("== test_interp_render ==\n");
     const uint32_t W = 64, H = 64;
 
@@ -40,11 +40,11 @@ int main() {
     std::vector<uint32_t> frag = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]));
     CHECK(!vert.empty() && vert[0] == 0x07230203u, "recompiled VS with EXP PARAM0 -> SPIR-V");
     CHECK(!frag.empty() && frag[0] == 0x07230203u, "recompiled PS with v_interp -> SPIR-V");
-    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); return 1; }
+    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vert, frag, W, H);
     CHECK(px.size() == (size_t)W * H * 4, "pipeline linked VS PARAM0 -> PS interpolated input + rendered");
-    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: render failed ==\n"); return 1; }
+    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: render failed ==\n"); FAIL() << "legacy early exit"; }
 
     // Scan the viewport: the red channel must vary (gradient), green/blue must stay near 0.
     uint8_t rmin = 255, rmax = 0; uint32_t max_gb = 0;
@@ -248,7 +248,5 @@ int main() {
                  0x100006ffu, 0x42800000u }, // v0 = 64 * ddy
                "DPP ddy idiom reconstructs du/dy (red saturated)");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

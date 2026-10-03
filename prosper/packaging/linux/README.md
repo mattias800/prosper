@@ -7,7 +7,7 @@ Builds the two artifacts that tagged releases publish alongside the Windows zip:
 | `prosper-linux-x86_64.AppImage` | Single self-contained file, the desktop default |
 | `prosper-linux-x86_64.tar.gz` | The same AppDir as a plain tree |
 
-The user-facing instructions are `prosper/docs/LINUX_RELEASE.md`, which is copied into both archives
+The user-facing instructions are `prosper/docs/platforms/LINUX_RELEASE.md`, which is copied into both archives
 as `README.md`.
 
 ## Running it

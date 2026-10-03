@@ -1,4 +1,4 @@
-// gpu_executor.cpp — the live-submit half of the GPU executor (Stage A of docs/GPU_EXECUTOR_DESIGN.md).
+// gpu_executor.cpp — the live-submit half of the GPU executor (Stage A of docs/gpu/GPU_EXECUTOR_DESIGN.md).
 //
 // Holds the process-wide live render backend and drives it on each AGC submit. This is deliberately the
 // ONLY place the executor touches process-global state; execute_gpustate() itself (gpu_execute.hpp) stays
@@ -28,6 +28,8 @@
 #include "gpu/resources/mip_chain_plan.hpp"  // shader_resource_compute_mip_chain_levels (#3048)
 #include "gpu/pm4/pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
 #include "gpu/recompiler/rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
+#include "gpu/execute/sopp_cfg.hpp"            // direct-branch CFG helpers
+#include "gpu/execute/split_t8_proof.hpp"      // mapped_split_t8_reaches_use
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -1146,18 +1148,18 @@ std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint3
         result->bounded_span = span < dwords;
         if (code && span) result->code.assign(code, code + span);
         result->code_hash = hash_shader_code(result->code);
-        // Every property in an analysis must describe the same owned byte version. Reading the
-        // guest pointer again here allowed a concurrent rewrite to pair new dispatch metadata with
-        // the old code copy even though later users retained this object as one immutable version.
+        // All code facts describe this immutable byte version, never a second read from guest VA.
         const uint32_t* owned_code = result->code.empty() ? nullptr : result->code.data();
         result->pcrel_dispatch = rdna2_pcrel_dispatch_info(owned_code, result->code.size());
         result->fragment_color_export_mask =
             fragment_color_export_mask(owned_code, result->code.size());
+        result->packet_vgpr_requirements = fragment_packet_vgpr_requirements(result->code);
         result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
                         static_cast<uint64_t>(result->pcrel_dispatch.target_pcs.size()) *
                             sizeof(uint32_t) +
                         static_cast<uint64_t>(result->pcrel_dispatch.setup_pcs.size()) *
                             sizeof(uint32_t);
+        result->bytes += result->packet_vgpr_requirements.retained_bytes();
         return result;
     };
 
@@ -2986,38 +2988,6 @@ size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_add
 // external branch edge into the region. This is intentionally stronger than merely observing an
 // earlier forward branch: the prior no-hit experiment did not establish dominance and could hide an
 // unguarded missing descriptor.
-// SOPP direct branches: s_branch (0x02) and the s_cbranch_* family (0x04..0x09). Hoisted so the two
-// CFG proofs in this file share one definition of "is a branch" and one target computation — #2181
-// unified four private copies of the VOPC cmpx windows for the same reason, and #2120 is the
-// cautionary tale for a forked predicate.
-bool sopp_is_branch(const Rdna2Inst& in) {
-    return in.fmt == Rdna2Format::SOPP &&
-           (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
-}
-bool sopp_is_unconditional_branch(const Rdna2Inst& in) {
-    return in.fmt == Rdna2Format::SOPP && in.opcode == 0x02;
-}
-// GFX10 branch target: PC of the branch + its own length + the signed dword displacement. Direction
-// is deliberately NOT filtered here — a predecessor tally that only counts forward edges is not a
-// predecessor tally (#2202 review, B2).
-int64_t sopp_branch_target(const Rdna2Inst& in) {
-    return static_cast<int64_t>(in.pc) + static_cast<int64_t>(in.len_dwords) +
-           static_cast<int64_t>(in.simm16);
-}
-// Indirect control transfer: s_setpc_b64 / s_swappc_b64 / s_rfe_b64 (SOP1 0x20/0x21/0x22) and
-// s_call_b64 (SOPK 0x16). Encodings round-tripped through llvm-mc -mcpu=gfx1030, never read off a
-// table (see SONIC_CROSSWORLDS_STATUS.md § Ruled out, the 0x305 trap). A shader containing one has a
-// CFG no static scan over SOPP displacements can represent.
-bool has_indirect_control_flow(const std::vector<Rdna2Inst>& instructions) {
-    for (const Rdna2Inst& in : instructions) {
-        if (in.fmt == Rdna2Format::SOP1 &&
-            (in.opcode == 0x20 || in.opcode == 0x21 || in.opcode == 0x22))
-            return true;
-        if (in.fmt == Rdna2Format::SOPK && in.opcode == 0x16) return true;
-    }
-    return false;
-}
-
 bool guarded_bvh_use(const std::vector<Rdna2Inst>& instructions, uint32_t use_pc) {
     // An indirect target can enter the guarded interval after its EXECZ check, or leave and later
     // re-enter it. No scan over direct SOPP displacements can prove dominance in that program.
@@ -3084,167 +3054,6 @@ bool straight_line_null_chain_dominates(const std::vector<Rdna2Inst>& instructio
             return false;
     }
     return found_definition && found_use;
-}
-
-// A split image descriptor needs a stronger proof than the scalar fold's linear walk. In
-// particular, a conditional branch can skip one of two adjacent loads while the walk still sees
-// both. This deliberately admits only direct, entry-rooted scalar loads; computed pointers and
-// SOFFSETs remain on the existing unresolved path.
-bool mapped_split_t8_reaches_use(const uint32_t* code, size_t dwords, uint32_t use_pc,
-                                 int tbase, const std::array<uint32_t, 8>& source_pc,
-                                 const std::array<uint64_t, 8>& source_addr,
-                                 const uint32_t* user_sgprs, uint32_t nsgpr,
-                                 uint32_t user_sgpr_base) {
-    // This rare fallback reparses the owned code. Keep its per-use CFG walk bounded; larger
-    // programs retain the ordinary unresolved path until they have a cached analysis.
-    if (!code || !user_sgprs || dwords > 2048 || tbase < 0 || tbase + 7 >= 106)
-        return false;
-    std::vector<Rdna2Inst> full;
-    rdna2_walk(code, dwords, full);
-    if (full.empty() || !full.back().is_end || has_indirect_control_flow(full)) return false;
-    std::unordered_map<uint32_t, size_t> by_pc;
-    for (size_t i = 0; i < full.size(); ++i) {
-        if (full[i].fmt == Rdna2Format::Unknown || !full[i].len_dwords ||
-            !by_pc.emplace(full[i].pc, i).second) return false;
-    }
-    const auto use_it = by_pc.find(use_pc);
-    if (use_it == by_pc.end()) return false;
-    const size_t use = use_it->second;
-    std::vector<std::array<size_t, 2>> edges(full.size());
-    constexpr size_t no_edge = SIZE_MAX;
-    for (size_t i = 0; i < full.size(); ++i) {
-        edges[i] = {no_edge, no_edge};
-        const auto& in = full[i];
-        if (in.is_end) continue;
-        // The debug conditional branches have different predicates, and an indirect transfer
-        // has no statically enumerable successor. Decline rather than treating either as fallthrough.
-        if (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x17 && in.opcode <= 0x1a)
-            return false;
-        if (sopp_is_branch(in)) {
-            const int64_t target = sopp_branch_target(in);
-            if (target < 0 || target > UINT32_MAX) return false;
-            const auto branch = by_pc.find(static_cast<uint32_t>(target));
-            if (branch == by_pc.end()) return false;
-            // A later iteration may reach this same image instruction with different scalar
-            // values or descriptor backing. The linear fold publishes one binding per use PC.
-            if (i > use && branch->second <= use) return false;
-            edges[i][0] = branch->second;
-            if (sopp_is_unconditional_branch(in)) continue;
-            if (i + 1 >= full.size()) return false;
-            edges[i][1] = i + 1;
-        } else if (i + 1 < full.size()) {
-            edges[i][0] = i + 1;
-        }
-    }
-    auto reaches_use = [&](size_t excluded) {
-        std::vector<uint8_t> seen(full.size());
-        std::vector<size_t> queue;
-        if (excluded == 0) return false;
-        queue.push_back(0);
-        seen[0] = 1;
-        for (size_t q = 0; q < queue.size(); ++q) {
-            const size_t at = queue[q];
-            if (at == use) return true;
-            for (size_t next : edges[at]) {
-                if (next != no_edge && next != excluded && !seen[next]) {
-                    seen[next] = 1;
-                    queue.push_back(next);
-                }
-            }
-        }
-        return false;
-    };
-    if (!reaches_use(no_edge)) return false;
-    auto may_write = [&](const Rdna2Inst& in, int reg) {
-        // Unknown relative SGPR destinations cannot be excluded by comparing the decoded base.
-        if ((in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20) ||
-            (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCallB64)) return true;
-        // A plain B32 move writes only its named word. Treating it as a pair incorrectly
-        // clobbers the adjacent destination while assembling a T# one lane at a time.
-        if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32 &&
-            in.dst.kind == OperandKind::SGPR)
-            return in.dst.value == reg;
-        auto overlaps = [reg](const Operand& dst, uint32_t width) {
-            return dst.kind == OperandKind::SGPR && reg >= dst.value &&
-                   static_cast<uint32_t>(reg - dst.value) < width;
-        };
-        uint32_t width = 2; // conservative for ordinary scalar and vector-carry pair writes
-        if (in.fmt == Rdna2Format::SMEM) {
-            switch (in.opcode & 7u) {
-                case 0: width = 1; break;
-                case 1: width = 2; break;
-                case 2: width = 4; break;
-                case 3: width = 8; break;
-                case 4: width = 16; break;
-                default: return true;
-            }
-        }
-        return overlaps(in.dst, width) || overlaps(in.sdst, 2);
-    };
-    // A guest-visible write before the consumer could alter descriptor backing after the CPU
-    // snapshot. LDS writes are a separate address space; global/buffer and storage-image writes
-    // are left unresolved because proving non-aliasing would need resource ownership analysis.
-    for (size_t i = 0; i < use; ++i) {
-        const auto& in = full[i];
-        if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF ||
-            in.fmt == Rdna2Format::FLAT ||
-            // IMAGE_LOAD and the supported IMAGE_SAMPLE opcode only read their source image.
-            // A prior store/atomic could rewrite these descriptor bytes through an alias.
-            (in.fmt == Rdna2Format::MIMG && in.opcode != 0x00u &&
-             in.opcode != 0x27u) ||
-            (in.fmt == Rdna2Format::SMEM && in.opcode >= 0x10u)) return false;
-    }
-    for (int lane = 0; lane < 8; ++lane) {
-        const auto found = by_pc.find(source_pc[static_cast<size_t>(lane)]);
-        if (found == by_pc.end() || found->second >= use) return false;
-        const size_t producer = found->second;
-        const Rdna2Inst& load = full[producer];
-        const int reg = tbase + lane;
-        if (load.fmt != Rdna2Format::SMEM || load.opcode > 4u ||
-            load.opcode < 2u || load.dst.kind != OperandKind::SGPR ||
-            load.src[0].kind != OperandKind::SGPR ||
-            ((load.words[1] >> 25u) & 0x7fu) != 125u ||
-            static_cast<int32_t>(load.literal) < 0) return false;
-        const uint32_t width = load.opcode == 2u ? 4u : load.opcode == 3u ? 8u : 16u;
-        const int base_reg = load.src[0].value;
-        if (base_reg < static_cast<int>(user_sgpr_base) ||
-            base_reg + 1 >= static_cast<int>(user_sgpr_base + nsgpr) ||
-            base_reg + 1 >= 106) return false;
-        for (size_t i = 0; i < producer; ++i)
-            if (may_write(full[i], base_reg) || may_write(full[i], base_reg + 1)) return false;
-        const size_t seed = static_cast<size_t>(base_reg - static_cast<int>(user_sgpr_base));
-        const uint64_t base = static_cast<uint64_t>(user_sgprs[seed]) |
-                              (static_cast<uint64_t>(user_sgprs[seed + 1]) << 32u);
-        if (base > UINT64_MAX - load.literal) return false;
-        const uint64_t first_addr = base + load.literal;
-        const uint64_t addr = source_addr[static_cast<size_t>(lane)];
-        if (addr < first_addr || addr - first_addr >= width * sizeof(uint32_t) ||
-            ((addr - first_addr) & 3u)) return false;
-        const int original_reg = load.dst.value +
-            static_cast<int>((addr - first_addr) / sizeof(uint32_t));
-        if (original_reg < 0 || original_reg >= 106)
-            return false;
-        if (reaches_use(producer)) return false; // a path bypasses this load
-        bool copied = original_reg == reg;
-        for (size_t i = producer + 1; i < use; ++i) {
-            const Rdna2Inst& step = full[i];
-            // A copied lane needs one unconditional scalar move. No branch in this local span
-            // may skip or replay it; the earlier producer-dominance check handles entry edges.
-            if (original_reg != reg && sopp_is_branch(step)) return false;
-            if (sopp_is_branch(step) && sopp_branch_target(step) <=
-                                            static_cast<int64_t>(load.pc)) return false;
-            const bool exact_copy = original_reg != reg && !copied &&
-                step.fmt == Rdna2Format::SOP1 && step.opcode == kSop1OpcodeMovB32 &&
-                step.dst.kind == OperandKind::SGPR && step.dst.value == reg &&
-                step.src[0].kind == OperandKind::SGPR &&
-                step.src[0].value == original_reg;
-            if (!copied && may_write(step, original_reg)) return false;
-            if (copied && may_write(step, reg)) return false;
-            if (exact_copy) copied = true;
-        }
-        if (!copied) return false;
-    }
-    return true;
 }
 
 // --- Bindless-dynamic vertex-fetch resolution (const-fold the scalar setup) ---------------------------
@@ -5618,9 +5427,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             std::memcmp(code, decoded->code.data(),
                                         decoded->code.size() * sizeof(uint32_t)) == 0;
                         mapped_t8 = same_code && mapped_split_t8_reaches_use(
-                            decoded->code.data(), decoded->code.size(), in.pc, tbase,
-                            mapped_t8_pcs, mapped_t8_addrs,
-                            user_sgprs, nsgpr, user_sgpr_base);
+                            code, std::min<size_t>(rdna2_recompile_code_span(code, dwords), 2048u), in.pc, tbase,
+                            mapped_t8_pcs, mapped_t8_addrs, user_sgprs, nsgpr, user_sgpr_base);
                     }
                     const std::array<uint32_t, 8>* t8 =
                         live_t8_known && (!branchy_x16 || mapped_t8) &&
