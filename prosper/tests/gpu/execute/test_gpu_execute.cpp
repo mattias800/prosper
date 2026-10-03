@@ -2191,8 +2191,8 @@ int main() {
     }
 
     // Lazy realization can drop a semantic draw only after earlier spans have already executed.
-    // If the dropped record was counted as the final span, send an empty terminal callback so the
-    // renderer finalizes cached scanout rather than losing the successful work or hanging timing.
+    // Finality follows actual ordered execution: a successful terminal span finalizes directly;
+    // an earlier flushed span needs an empty terminal callback after the refused trailing draw.
     for (bool failed_first : {false, true}) {
         uint8_t source = 0x7A, target = 0;
         GpuState ordered = st;
@@ -2225,15 +2225,15 @@ int main() {
         });
         execute_ordered_and_present(ordered, 1, 1, 78 + failed_first, /*publish=*/false);
         set_submit_renderer({});
-        CHECK(realized_callbacks == 1 && terminal_callbacks == 1 && phases.size() == 2,
-              failed_first
-                  ? "failed leading span still finalizes the later successful span"
-                  : "failed trailing span still finalizes the earlier successful span");
-        CHECK(phases[0].first_span && !phases[0].final_span &&
-              !phases[1].first_span && phases[1].final_span,
+        CHECK(realized_callbacks == 1 && terminal_callbacks == (failed_first ? 0u : 1u) &&
+                  phases.size() == (failed_first ? 1u : 2u),
+              failed_first ? "failed leading span still finalizes the later successful span"
+                           : "failed trailing span still finalizes the earlier successful span");
+        CHECK(phases.front().first_span && phases.back().final_span &&
+                  (failed_first || (!phases.front().final_span && !phases.back().first_span)),
               "lazy-span terminal callback closes the submit exactly once");
-        CHECK(phases[0].allows_deferred_scanout_readback() == failed_first &&
-              !phases[1].allows_deferred_scanout_readback(),
+        CHECK(!phases.front().allows_deferred_scanout_readback() &&
+                  !phases.back().allows_deferred_scanout_readback(),
               "terminal finalization preserves the prior span's readback requirement");
     }
 
