@@ -4,6 +4,7 @@
 // framebuffer. This exercises VS param export + rasterizer interpolation + MIMG sampling together —
 // the shape of a real Unity textured draw. Also writes a PPM screenshot for human inspection.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include "fixtures/render_runner.h"
 #include <cstdio>
@@ -13,11 +14,9 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(TexturedInterpRender, Contract) {
     printf("== test_textured_interp_render ==\n");
     const uint32_t W = 128, H = 128;
 
@@ -41,7 +40,7 @@ int main() {
     std::vector<uint32_t> frag = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]), &rt);
     CHECK(!vert.empty() && vert[0] == 0x07230203u, "recompiled VS (position + UV param export) -> SPIR-V");
     CHECK(!frag.empty() && frag[0] == 0x07230203u, "recompiled PS (interp UV + image_sample) -> SPIR-V");
-    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); return 1; }
+    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // 8x8 texture: a 2-axis gradient (R rises with u, G rises with v, B constant 64) — clearly mapped
     // and distinguishable from the blue clear (whose B=255).
@@ -54,7 +53,7 @@ int main() {
 
     std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vert, frag, W, H, nullptr, nullptr, nullptr, &td);
     CHECK(px.size() == (size_t)W * H * 4, "textured+interpolated pipeline rendered a frame");
-    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: render failed ==\n"); return 1; }
+    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: render failed ==\n"); FAIL() << "legacy early exit"; }
 
     // Sample a grid: the frame must be a 2-axis gradient (R and G both vary), and NOT the blue clear
     // (interior B should be ~64 from the texture, not 255).
@@ -77,7 +76,4 @@ int main() {
       char path[1024]; snprintf(path, sizeof(path), "%s/textured_interp.bmp", dir ? dir : ".");
       if (prosper::test::dump_bmp(path, px, W, H)) printf("  wrote screenshot: %s (%ux%u)\n", path, W, H); }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

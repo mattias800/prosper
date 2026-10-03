@@ -31,6 +31,7 @@
 // asserted directly rather than inferred from a driver's behaviour.
 
 #include "fixtures/render_runner.h"
+#include <gtest/gtest.h>
 #include "fixtures/spirv_triangle.h"
 
 #include <cstdint>
@@ -40,11 +41,7 @@
 using prosper::test::BackendDraw;
 using prosper::test::FrameResource;
 
-static int failures = 0;
-#define CHECK(condition, message) do { \
-    if (!(condition)) { std::printf("  [FAIL] %s\n", message); ++failures; } \
-    else               { std::printf("  [ok]   %s\n", message); } \
-} while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
 namespace {
 
@@ -68,7 +65,7 @@ uint64_t barrier_count() {
 
 }  // namespace
 
-int main() {
+TEST(HostReadBarrier, Contract) {
     std::printf("== test_host_read_barrier ==\n");
 
     // --- Arm 1: the barrier descriptor itself (no device) --------------------------------------
@@ -136,6 +133,4 @@ int main() {
     CHECK(after_no_readback == before_no_readback,
           "a pass with no host read records no host-read barrier");
 
-    std::printf("== %s ==\n", failures ? "FAILED" : "PASSED");
-    return failures ? 1 : 0;
 }

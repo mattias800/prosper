@@ -1,4 +1,5 @@
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "fixtures/compute_runner.h"
@@ -8,11 +9,9 @@
 #include <vector>
 
 using namespace prosper::gpu;
-static int failures = 0;
-#define CHECK(c, text) do { if (!(c)) { std::printf("[FAIL] %s\n", text); ++failures; } \
-    else std::printf("[ok] %s\n", text); } while (0)
+#define CHECK(c, text) EXPECT_TRUE(c) << (text)
 
-int main() {
+TEST(MemoryFedRawWideExec, Contract) {
     alignas(16) std::array<uint32_t, 128> source{};
     for (size_t i = 0; i < source.size(); ++i) source[i] = 101u + 17u * static_cast<uint32_t>(i);
     uint32_t selector = 2u;
@@ -69,6 +68,4 @@ int main() {
         CHECK(shifted.size() == 1u && shifted[0] == static_cast<float>(source[index + 4u]),
               "changed memory-fed selector changes the real GPU result");
     }
-    std::printf("memory-fed raw wide GPU failures: %d\n", failures);
-    return failures != 0;
 }

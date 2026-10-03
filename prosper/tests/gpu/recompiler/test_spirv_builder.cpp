@@ -4,6 +4,7 @@
 // This is the code-generation foundation for the RDNA2->SPIR-V recompiler, verified end-to-end
 // (emit -> Vulkan accepts it -> numbers are right), and it validated structurally with spirv-val.
 #include "gpu/recompiler/spirv_builder.hpp"
+#include <gtest/gtest.h>
 #include "fixtures/compute_runner.h"
 #include <cstdio>
 #include <cmath>
@@ -11,11 +12,9 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(SpirvBuilder, Contract) {
     printf("== test_spirv_builder ==\n");
     const float scale = 2.0f, bias = 1.0f;
     std::vector<uint32_t> spv = build_compute_scale_bias(scale, bias);
@@ -27,14 +26,11 @@ int main() {
 
     std::vector<float> got = prosper::test::run_compute(spv, in);
     CHECK(got.size() == N, "our SPIR-V compiled + ran on Vulkan (shader module accepted)");
-    if (got.size() != N) { printf("== FAIL: shader did not run ==\n"); return 1; }
+    if (got.size() != N) { printf("== FAIL: shader did not run ==\n"); FAIL() << "legacy early exit"; }
 
     uint32_t bad = 0; float worst = 0;
     for (uint32_t i = 0; i < N; i++) { float d = std::fabs(got[i] - expect[i]); if (d > 1e-4f) { bad++; worst = d > worst ? d : worst; } }
     printf("  N=%u mismatches=%u worst=%g (out[100]=%g expect=%g)\n", N, bad, worst, got[100], expect[100]);
     CHECK(bad == 0, "our emitted shader computes b[i] = a[i]*2 + 1 correctly (execution-differential)");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

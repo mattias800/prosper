@@ -115,7 +115,12 @@ TEST(AprGatherScatter, Contract) {
 
     // Re-open the chain and clear the segment destination. Every arm below starts from here, so the
     // only difference between the control and a closer arm is the closer call itself.
+    HleFn reset_batch = Hle::lookup("baQO9ez2gL4");
+    ASSERT_NE(reset_batch, nullptr);
     const auto open_chain = [&]() -> bool {
+        // Each arm is a new batch. A refused segment belongs to the preceding batch and
+        // must not be silently erased merely by appending another successful read.
+        reset_batch(cb, 0, 0, 0, 0, 0);
         open_dst.fill(0);
         return read_file_guest(cb, 0, record, fixture_id, (uint64_t)(uintptr_t)open_dst.data(),
                                open_size, open_offset, 0, 0) == 0;

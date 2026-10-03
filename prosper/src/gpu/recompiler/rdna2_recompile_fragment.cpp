@@ -106,6 +106,10 @@ FragmentInterpolationLayout fragment_interpolation_layout(
         if ((selectors[attr] & 0x4u) && (layout.smooth_mask & (1u << attr)))
             layout.requires_geometry = true;
     }
+    // Pull-model input is a distinct three-word linear plane, even when the guest never reads
+    // explicit VINTRP parameters. Its producer cannot be replaced by ordinary smooth I/J.
+    if (system_inputs && (system_inputs->addr & system_inputs->ena & (1u << 3)))
+        layout.requires_geometry = true;
     if (!layout.requires_geometry) return layout;
 
     uint32_t location = has_attribute ? highest_attribute + 1 : 0;

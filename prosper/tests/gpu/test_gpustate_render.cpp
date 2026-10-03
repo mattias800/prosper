@@ -7,6 +7,7 @@
 // (the RDNA2 (lo<<8)|((hi&0xff)<<40) convention), and let the bridge read them straight back out —
 // the same path a real submitted command buffer will drive once the boot clears resource residency.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/state/render_state.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "fixtures/render_runner.h"
@@ -17,9 +18,7 @@
 using namespace prosper::gpu;
 namespace P = prosper::agc::Pm4;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Fullscreen-triangle vertex shader + solid-green pixel shader (llvm-mc gfx1030), 256-byte aligned
 // so their host addresses round-trip through the RDNA2 (lo<<8)|((hi&0xff)<<40) address encoding.
@@ -38,7 +37,7 @@ static void set_pgm(GpuState& st, uint32_t lo_off, uint32_t hi_off, const void* 
     st.sh[hi_off] = (uint32_t)((a >> 40) & 0xFFu);
 }
 
-int main() {
+TEST(GpustateRender, Contract) {
     printf("== test_gpustate_render ==\n");
     const uint32_t W = 64, H = 64;
 
@@ -54,7 +53,7 @@ int main() {
     CHECK(rs.es_addr == (uint64_t)(uintptr_t)kVs, "ES shader address round-trips through the register pair");
     CHECK(rs.ps_addr == (uint64_t)(uintptr_t)kPs, "PS shader address round-trips through the register pair");
     if (rs.es_addr != (uint64_t)(uintptr_t)kVs || rs.ps_addr != (uint64_t)(uintptr_t)kPs) {
-        printf("== FAIL: address encoding ==\n"); return 1;   // (would need >2^48 or misalignment to fail)
+        printf("== FAIL: address encoding ==\n"); FAIL() << "legacy early exit";   // (would need >2^48 or misalignment to fail)
     }
 
     // The bridge: recompile each stage from its address, resolve fixed-function state, render.
@@ -63,11 +62,11 @@ int main() {
     ResolvedPipelineState ps = resolve_pipeline_state(rs);
     CHECK(!vert.empty() && !frag.empty(), "recompiled both stages straight from the GpuState addresses");
     CHECK(ps.topology == 3 && ps.color_write_mask == 0xF, "resolved pipeline state from the GpuState registers");
-    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); return 1; }
+    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vert, frag, W, H, &ps);
     CHECK(px.size() == (size_t)W*H*4, "rendered a frame from the GpuState");
-    if (px.size() != (size_t)W*H*4) { printf("== FAIL: render failed ==\n"); return 1; }
+    if (px.size() != (size_t)W*H*4) { printf("== FAIL: render failed ==\n"); FAIL() << "legacy early exit"; }
 
     // Fullscreen triangle + green pixel shader -> every sampled pixel green.
     auto isGreen = [&](uint32_t x, uint32_t y){ const uint8_t* p=&px[((size_t)y*W+x)*4]; return p[1]>0x80 && p[0]<0x40 && p[2]<0x40; };
@@ -77,7 +76,4 @@ int main() {
     printf("  center=(%u,%u,%u,%u)  green %u/%u\n", c[0],c[1],c[2],c[3], green, total);
     CHECK(green==total, "GpuState -> recompiled shaders -> resolved pipeline -> GREEN frame (full spine)");
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

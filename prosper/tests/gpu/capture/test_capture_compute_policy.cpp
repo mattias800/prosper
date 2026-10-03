@@ -1,17 +1,14 @@
 #include "gpu/capture/capture_compute_policy.hpp"
 
-#include <cstdio>
+#include <gtest/gtest.h>
 
 using prosper::gpu::env_capture_requires_portable_compute;
 using prosper::gpu::EnvCaptureWindow;
 using prosper::gpu::timeline_capture_requires_portable_compute;
 
 namespace {
-bool env_window_policy_holds() {
-    int failures = 0;
-    auto check = [&](bool ok, const char* what) {
-        if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++failures; }
-    };
+void env_window_policy_holds() {
+    auto check = [&](bool ok, const char* what) { EXPECT_TRUE(ok) << what; };
     EnvCaptureWindow w;
     check(!env_capture_requires_portable_compute(w), "no capture requested: native compute");
     w.requested = true;
@@ -41,27 +38,18 @@ bool env_window_policy_holds() {
     legacy.requested = false;
     check(!env_capture_requires_portable_compute(legacy),
           "the legacy arm is inert without a capture");
-    return failures == 0;
 }
 }  // namespace
 
-int main() {
-    if (!env_window_policy_holds()) return 1;
-    if (timeline_capture_requires_portable_compute(false, false, false)) {
-        std::fprintf(stderr, "normal compute unexpectedly required portable capture storage\n");
-        return 1;
-    }
-    if (timeline_capture_requires_portable_compute(true, true, false)) {
-        std::fprintf(stderr, "dormant phase gate unexpectedly required portable capture storage\n");
-        return 1;
-    }
-    if (!timeline_capture_requires_portable_compute(true, true, true)) {
-        std::fprintf(stderr, "armed phase gate unexpectedly retained native storage formats\n");
-        return 1;
-    }
-    if (!timeline_capture_requires_portable_compute(true, false, false)) {
-        std::fprintf(stderr, "immediate capture unexpectedly retained native storage formats\n");
-        return 1;
-    }
-    return 0;
+TEST(CaptureComputePolicy, EnvWindowPolicyHolds) { env_window_policy_holds(); }
+
+TEST(CaptureComputePolicy, TimelineCaptureStorageFormats) {
+    EXPECT_FALSE(timeline_capture_requires_portable_compute(false, false, false))
+        << "normal compute unexpectedly required portable capture storage";
+    EXPECT_FALSE(timeline_capture_requires_portable_compute(true, true, false))
+        << "dormant phase gate unexpectedly required portable capture storage";
+    EXPECT_TRUE(timeline_capture_requires_portable_compute(true, true, true))
+        << "armed phase gate unexpectedly retained native storage formats";
+    EXPECT_TRUE(timeline_capture_requires_portable_compute(true, false, false))
+        << "immediate capture unexpectedly retained native storage formats";
 }

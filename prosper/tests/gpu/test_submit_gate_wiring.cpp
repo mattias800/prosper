@@ -11,6 +11,7 @@
 // The positive arm runs first and on a REAL queue, so "the wrapper always returns DEVICE_LOST"
 // cannot pass this test. It is skipped, loudly, when the host has no usable render device.
 #include "host/platform/gpu_submit_gate.hpp"
+#include <gtest/gtest.h>
 #include <vulkan/vulkan.h>
 
 #include <cstdio>
@@ -66,9 +67,7 @@ static bool origin_is_driver_called() {
 
 using namespace prosper;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // Capture the shipping failure line rather than testing a second formatter.
 class StderrCapture {
@@ -127,7 +126,7 @@ static std::string failure_line(const std::string& log) {
     return log.substr(at, log.find('\n', at) - at);
 }
 
-int main() {
+TEST(SubmitGateWiring, Contract) {
     using namespace prosper::test;
     printf("== test_submit_gate_wiring ==\n");
     gpu_submit_gate_reset();
@@ -283,7 +282,4 @@ int main() {
         }
     }
     gpu_submit_gate_reset();
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

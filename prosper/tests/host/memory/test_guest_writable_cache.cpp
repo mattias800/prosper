@@ -14,6 +14,7 @@
 // count pins that the cache is actually engaged.
 
 #include "gpu/execute/gpu_execute.hpp"
+#include <gtest/gtest.h>
 #include "host/memory/guest_memory_map.hpp"
 
 #include <cstdint>
@@ -21,13 +22,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-static int failures = 0;
-static void check(bool ok, const char* what) {
-    std::fprintf(stderr, "%s %s\n", ok ? "[ ok ]" : "[FAIL]", what);
-    if (!ok) ++failures;
-}
+static void check(bool ok, const char* what) { EXPECT_TRUE(ok) << what; }
 
-int main() {
+TEST(GuestWritableCache, Contract) {
     std::fprintf(stderr, "== test_guest_writable_cache ==\n");
     const size_t page = (size_t)sysconf(_SC_PAGESIZE);
 
@@ -116,6 +113,4 @@ int main() {
         }
     }
 
-    std::fprintf(stderr, failures ? "== FAIL ==\n" : "== PASS ==\n");
-    return failures ? 1 : 0;
 }

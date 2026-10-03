@@ -12,6 +12,7 @@
 // whole viewport -> every pixel green. A broken/empty fetch collapses the triangle to the origin ->
 // the frame stays blue (clear). Green-everywhere therefore proves the fetch delivered real data.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include "fixtures/render_runner.h"
 #include <cstdio>
@@ -20,11 +21,9 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(VertexFetchRender, Contract) {
     printf("== test_vertex_fetch_render ==\n");
     const uint32_t W = 64, H = 64;
 
@@ -46,7 +45,7 @@ int main() {
     std::vector<uint32_t> frag = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]));
     CHECK(!vert.empty() && vert[0] == 0x07230203u, "recompiled vertex-fetch VS -> SPIR-V (with resource table)");
     CHECK(!frag.empty() && frag[0] == 0x07230203u, "recompiled green pixel shader -> SPIR-V");
-    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); return 1; }
+    if (vert.empty() || frag.empty()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // The vertex buffer: 3 vertices x (float x, float y), a fullscreen triangle. stride 8 bytes.
     auto f = [](float v) { union { float f; uint32_t u; } c; c.f = v; return c.u; };
@@ -54,7 +53,7 @@ int main() {
 
     std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vert, frag, W, H, nullptr, &vbuf);
     CHECK(px.size() == (size_t)W * H * 4, "pipeline bound the vertex buffer + rendered");
-    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: render failed ==\n"); return 1; }
+    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: render failed ==\n"); FAIL() << "legacy early exit"; }
 
     auto isGreen = [&](uint32_t x, uint32_t y) {
         const uint8_t* p = &px[((size_t)y * W + x) * 4];
@@ -88,7 +87,4 @@ int main() {
         CHECK(g4 == t4, "#368: xyzw fetch of a 2-comp attribute defaults W=1.0 (not adjacent memory) -> green");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

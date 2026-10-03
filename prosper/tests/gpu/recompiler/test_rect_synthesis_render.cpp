@@ -15,6 +15,7 @@
 // so it passes either way and shows the harness itself works. Arms 1 and 2 are the discriminator --
 // under the old rule both synthesize an off-screen corner and lose most of the coverage.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "fixtures/render_runner.h"
 #include <algorithm>
 #include <cstdint>
@@ -26,8 +27,7 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 // A vertex shader selecting one of three rectangle corners by gl_VertexIndex, exporting the position
 // and one varying at Location 0 (the EXP PARAM0 slot prosper's recompiler uses, so the generated
@@ -90,7 +90,7 @@ static const uint32_t kRectCornerVs[] = {
         0x00010038u,
 };
 
-int main() {
+TEST(RectSynthesisRender, Contract) {
     printf("== test_rect_synthesis_render ==\n");
     const uint32_t W = 64, H = 64;
 
@@ -107,7 +107,7 @@ int main() {
           "the pixel shader's VINTRP read is seen as a smooth attribute 0");
     CHECK(!frag.empty() && !geom.empty() && geom[0] == 0x07230203u,
           "rect synthesis generates a geometry stage even though the PS needs no P0/P10/P20");
-    if (frag.empty() || geom.empty()) { printf("== FAIL ==\n"); return 1; }
+    if (frag.empty() || geom.empty()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     // Expected varying at each screen corner, from the three supplied values plus the derived one.
     struct Corner { const char* name; uint32_t x, y; double expect; };
@@ -240,6 +240,5 @@ int main() {
         }
     }
 
-    printf(fails ? "== FAIL ==\n" : "== PASS ==\n");
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }
