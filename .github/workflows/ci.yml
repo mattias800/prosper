@@ -500,8 +500,9 @@ jobs:
       - name: Verify the numbered doc tables are intact
         run: |
           set -o pipefail
-          F=prosper/docs/GAME_COMPAT_ORCHESTRATION.md
-          git show "HEAD^1:$F" > "$RUNNER_TEMP/orchestration-base.md"
+          F=prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md
+          BASE_FILE=$(python3 prosper/tools/docs/table_paths.py HEAD^1 "$F")
+          git show "HEAD^1:$BASE_FILE" > "$RUNNER_TEMP/orchestration-base.md"
           python3 prosper/tools/docs/check_numbered_table.py --github --ordered \
             --table-header Instrument --baseline "$RUNNER_TEMP/orchestration-base.md" "$F"
 
@@ -555,7 +556,7 @@ jobs:
       - name: Verify every by-number trap reference resolves
         run: |
           git ls-files -z | xargs -0 python3 prosper/tools/docs/check_trap_citations.py --github \
-            --table prosper/docs/GAME_COMPAT_ORCHESTRATION.md
+            --table prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md
 
       # Lives here, in the job that needs nothing built, for the same reason the checks above do:
       # it is a repository-wide text scan that finishes in a second. It gates the flag that keeps
@@ -1105,7 +1106,7 @@ jobs:
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
           Copy-Item 'prosper/build-windows-app/prosper-app.exe' $stage
           Copy-Item 'prosper/scripts/start-prosper.ps1' $stage
-          Copy-Item 'prosper/docs/WINDOWS_RELEASE.md' (Join-Path $stage 'README.md')
+          Copy-Item 'prosper/docs/platforms/WINDOWS_RELEASE.md' (Join-Path $stage 'README.md')
           @(
             'prosper Windows x64'
             "commit: $env:GITHUB_SHA"
@@ -1154,7 +1155,7 @@ jobs:
 
     # GitHub's macos-latest runners are Apple Silicon (arm64). prosper has no ARM CPU backend — it
     # runs the guest's x86-64 code natively — so the whole app is built x86_64 (CMAKE_OSX_ARCHITECTURES)
-    # and its tests run under Rosetta 2, exactly the supported macOS configuration (see docs/PORTING.md).
+    # and its tests run under Rosetta 2, exactly the supported macOS configuration (see docs/platforms/PORTING.md).
     # This exercises the Darwin guest-execution substrate (src/host/platform/posix_shim.hpp), not just a compile.
     steps:
       - name: Checkout
@@ -1230,7 +1231,7 @@ jobs:
     # SDL3-window/MoltenVK-present glue and the frontends stay compiling on a real macOS toolchain.
     # Build-only: the window needs a display and headless Metal is flaky on CI runners, so it isn't
     # run here (locally on an M2, --test-pattern presents fine and the offscreen GPU tests pass 90/91
-    # -- see docs/PORTING.md "The macOS harness app"). Mirrors the Linux App job.
+    # -- see docs/platforms/PORTING.md "The macOS harness app"). Mirrors the Linux App job.
     steps:
       - name: Checkout
         uses: actions/checkout@v4

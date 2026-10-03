@@ -3,7 +3,7 @@
 Developer/agent tooling. These are debugging and verification aids, not part of
 the shipped runtime. Build them from `build-linux/` like everything else.
 
-Start with [Debugging and profiling workflows](../docs/DEBUGGING_WORKFLOWS.md) for the
+Start with [Debugging and profiling workflows](../docs/process/DEBUGGING_WORKFLOWS.md) for the
 question-to-tool map. `doctor/` validates external instruments with bounded positive controls,
 provides a small standalone sanitizer build of existing host tests, and verifies RenderDoc
 capture/replay without requiring an importable system Python module.
@@ -13,7 +13,7 @@ capture/replay without requiring an importable system Python module.
   capture selection, mutation controls and the limits of offline timing/allocation reports.
 
 - **`session_start.py`** — read-only checkout/instruction freshness signal for #2710. See
-  [Session startup](../docs/SESSION_START.md). Its hook mode must deliver failures as visible
+  [Session startup](../docs/process/SESSION_START.md). Its hook mode must deliver failures as visible
   SessionStart context; an unavailable remote must never be reported as current, and a host that
   cannot start any of the interpreters the hook tries must say so rather than exit into silence.
   The regression executes the hook exactly as configured, in whichever form it is configured,
@@ -130,7 +130,7 @@ capture/replay without requiring an importable system Python module.
     (every repeated `avail>0` triple in the corpus carries `reserved=18`, with `avail` tracking each
     packet's own size). Under the full rule the corpus is clean, and re-introducing the #1748 defect
     makes it fire 256 times — it was checked in both directions. Full contract, the per-builder table
-    and the census: `docs/AGC_PACKET_SIZES.md`.
+    and the census: `docs/gpu/AGC_PACKET_SIZES.md`.
   - **Does a PM4 write path store *this value* into guest memory?**
     **`PROSPER_WRITE_TRAP=0xV[,0xV…]`** (up to 8 values) checks every guest-memory store the command
     processor performs — `RELEASE_MEM` data_sel 1/2/3, `EVENT_WRITE`, `WRITE_DATA`, and both
@@ -658,14 +658,14 @@ capture/replay without requiring an importable system Python module.
   (`PPSA07809`) arming `MB3_POISON` is the difference between the title dying in seconds and booting
   to its title screen, because the walk's *duration* changes the outcome — a measurement taken with
   it armed is taken on a title that would otherwise have died. `SUBMIT_STALL_US` is the honest lever
-  when a throttle is what you want. `prosper/docs/CRISIS_CORE_STATUS.md` has the dose-response.
+  when a throttle is what you want. `prosper/docs/games/CRISIS_CORE_STATUS.md` has the dose-response.
   **`PROSPER_SUBMIT_STALL_OUTSIDE=1`** pairs with it: the same sleep, same length, same thread, but
   after `g_agc_state_mu` is released instead of while it is held. The stall's call site is inside the
   submit mutex, so a rescued run has two candidate mechanisms — the delay, or the fact that prosper
   serialises the Dcb and Acb submit entry points for its duration — and this is the arm that
   separates them. It reports `NOT ARMED` when no stall duration is set, so a mis-typed arm cannot
   read as an armed null. Measured on ArcRunner: 0/3 faulted either way against a 3/3 unthrottled
-  control, i.e. the rescue is the delay (`prosper/docs/ARCRUNNER_STATUS.md`).
+  control, i.e. the rescue is the delay (`prosper/docs/games/ARCRUNNER_STATUS.md`).
 - **`PROSPER_FOLD_MARGIN`** — the **per-fold** account of that same family, and the instrument to
   reach for when a whole-run rate has stopped discriminating. Two halves arm together:
   a per-submit ledger (`hle_agc.cpp`) splitting each fold into `gap` (the guest's own time between
@@ -688,7 +688,7 @@ capture/replay without requiring an importable system Python module.
   private until the submit scope closes, so the guest cannot observe a half-retired frame. It is an
   A/B lever for whether that gate is right for a pre-13 title: ArcRunner requests version 10, and
   forcing the model on takes its default route from 3-of-3 faulting to 3-of-3 surviving
-  (`prosper/docs/ARCRUNNER_STATUS.md` § 2026-08-07).
+  (`prosper/docs/games/ARCRUNNER_STATUS.md` § 2026-08-07).
 - **`hostprof/hostprof.py`** — poor-man's **native sampling profiler**: attach to a running process
   (pid or name), sample its threads via repeated `gdb` backtraces, and rank the hot leaf functions —
   the HOST-side "which C++ function is burning CPU" first look (render/submit thread, readback copy,
@@ -702,7 +702,7 @@ capture/replay without requiring an importable system Python module.
   the first, so a title's asset load can be several times faster than the same bytes off storage —
   which is invisible for most work and decisive for a startup *race*: PPSA26414 reaches `DLLInit` in
   289–362 ms warm and 779–1158 ms evicted, and it faults in the first case and boots in the second
-  (`docs/R_TYPE_DELTA_STATUS.md`). `posix_fadvise(POSIX_FADV_DONTNEED)` on the named files only, so it
+  (`docs/games/R_TYPE_DELTA_STATUS.md`). `posix_fadvise(POSIX_FADV_DONTNEED)` on the named files only, so it
   needs no root and touches nothing outside them — but **the page cache is global**, so evicting a
   shared dump evicts it for every process on the box and will silently invalidate another lane's
   timing run. Say what you are evicting first. It prints `mincore(2)` residency **before and after**,
@@ -772,7 +772,7 @@ capture/replay without requiring an importable system Python module.
   measured *inside* `prepare_ms`, so the table prints storage cache as an included child plus the
   exclusive preparation remainder. It prints an `unattributed` row under every parent and warns on
   impossible nesting instead of publishing a negative residual. It excludes failed dispatches (their
-  sub-timers are meaningless, see trap 47 in `docs/GAME_COMPAT_ORCHESTRATION.md`), and warns if its
+  sub-timers are meaningless, see trap 47 in `docs/process/GAME_COMPAT_ORCHESTRATION.md`), and warns if its
   model of `execute_item` stops matching the emitter. Counts here cover backend-executed dispatches
   only — CPU-fast-path fills emit no record, so add
   `[render-timing] compute_cpu_fast fills=N` before quoting a rate.
@@ -796,7 +796,7 @@ capture/replay without requiring an importable system Python module.
   `mutate_compute_phase_report.sh` checks that suite at **per-check granularity** — each mutation must
   be killed by the check written for it, because a survivor masked by red siblings is invisible when
   you only watch the suite's colour (trap 48). It mutates a scratch copy, never the tracked file.
-  First result: `docs/RENDERER_PERFORMANCE_2026_07.md` § Astro Bot compute decomposition.
+  First result: `docs/performance/RENDERER_PERFORMANCE_2026_07.md` § Astro Bot compute decomposition.
 - **`perf/ab_compute.sh`** — A/B one `PROSPER_*` switch against a routed live run, refusing to
   measure while another `prosper-app` holds the GPU and stamping commit/route/reps onto the result.
 - **`perf/stack_profile.py`** — when a title is slow because threads are **waiting**, this names the
@@ -829,7 +829,7 @@ capture/replay without requiring an importable system Python module.
   so libc internals were reported as the application's blocking site — a wrong answer that looks
   entirely plausible, and was caught only because the control had known-correct answers to contradict.
 
-Verification here is agentic-first (see `docs/VERIFICATION.md`): prefer a
+Verification here is agentic-first (see `docs/process/VERIFICATION.md`): prefer a
 programmatic check (ctest exit code, `spirv-val`, a snapshot hash) over eyeballing.
 
 To drive any runner through a longer input route, set
@@ -837,7 +837,7 @@ To drive any runner through a longer input route, set
 seconds/flip/pad-read syntax as inline scripts (`3:`, `f300:`, or `p1200:`), accept one entry per
 line, `#` comments,
 and explicit ranges such as `f300-340:cross`. Full-deflection stick actions use names such as
-`left-stick-left` and can be combined with buttons using `+`. See `docs/INPUT_REPLAY.md`.
+`left-stick-left` and can be combined with buttons using `+`. See `docs/subsystems/INPUT_REPLAY.md`.
 Set `PROSPER_PAD_RECORD=<path>` on any runner, or use `prosper-app --record <path>`, to capture the
 final button stream in that format. Recording uses `fA-B:` flip ranges by default; set
 `PROSPER_PAD_RECORD_AXIS=pad-read`, or add `prosper-app --record-axis pad-read`, for `pA-B:` ranges

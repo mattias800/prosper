@@ -13,7 +13,7 @@ raw offsets into a multi-gigabyte blob and names nothing.
 This tool closes that gap for IoStore, giving Unreal titles the equivalent of Unity's
 `Media/levelNN` scene oracle: **which package the guest actually read, in order**. That is the one
 measurement that separates "the run reached gameplay" from "the run sat on an animating menu",
-which no aggregate frame metric can do (see `docs/GAME_COMPAT_ORCHESTRATION.md`).
+which no aggregate frame metric can do (see `docs/process/GAME_COMPAT_ORCHESTRATION.md`).
 
 It is self-checking in the same way the Unity oracle is: IoStore package paths are semantic
 (`.../Map/Product/Title/Title_PL.umap` vs `.../Map/Product/World/Field/F110/...`), so a

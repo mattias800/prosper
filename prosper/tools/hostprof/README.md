@@ -11,7 +11,7 @@ fraction of wall-time each function sits on top of the stack. More `-n` samples 
 
 - **Fallback when `perf` sampling is unavailable.** `kernel.perf_event_paranoid=2` excludes
   kernel sampling but does not universally forbid user-space events. Test actual recording with
-  the [capability controls](../../docs/DEBUGGING_WORKFLOWS.md) before falling back to stopped-stack
+  the [capability controls](../../docs/process/DEBUGGING_WORKFLOWS.md) before falling back to stopped-stack
   sampling: `doctor.py --probe perf` answers for user-space sampling alone, which is the arm that
   decides whether you need this tool at all. Debugger access has separate credential/namespace/security checks;
   `ptrace_scope=0` alone does not guarantee attach permission.

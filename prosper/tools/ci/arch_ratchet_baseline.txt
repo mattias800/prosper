@@ -28,7 +28,7 @@
 # with nothing fixed. The layer-include table (LAYER_ORDER in the checker) is, lowest first:
 #   self < loader < input < diagnostics < host < gpu < hle
 # A layer may include itself and anything to its LEFT; nothing in prosper/src may include
-# frontends/ or tests/. Evidence and the target tree: prosper/docs/ARCHITECTURE_TARGET_TREE.md.
+# frontends/ or tests/. Evidence and the target tree: prosper/docs/architecture/ARCHITECTURE_TARGET_TREE.md.
 
 title-id|prosper/frontends/prosper-app/test_frame_grab_match.cpp 1
 title-id|prosper/frontends/prosper-app/test_frame_grab_naming.cpp 29

@@ -14,7 +14,7 @@
 # empty, fresh save roots) on main + #3814 + #3817: menu ~80 s, difficulty ~160 s, brightness ~170-220 s,
 # loading ~240 s, intro narration ~270-330 s, "Press ... to Pulse" from ~410 s to the end of a
 # 540 s run. The world behind that prompt does NOT render on a 32-wide device (#2147), so this
-# route ends at rung 2, not rung 3. See prosper/docs/KENA_STATUS.md.
+# route ends at rung 2, not rung 3. See prosper/docs/games/KENA_STATUS.md.
 p54-55:cross
 p102-103:cross
 p160-161:cross

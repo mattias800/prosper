@@ -11,7 +11,7 @@ Immediate-mode GUI, vendored **verbatim** from **Dear ImGui** by Omar Cornut
   This is the charter's "vendoring permissively-licensed standalone libraries" exception, and the
   project owner chose ImGui explicitly over hand-rolling a software text renderer.
 - **Frontend only.** Only `prosper-app` links this. `prosper_core` does not, and must not: the
-  dependency arrow in `docs/FRONTEND_APP.md` points one way, so deleting `frontends/` still leaves CI
+  dependency arrow in `docs/subsystems/FRONTEND_APP.md` points one way, so deleting `frontends/` still leaves CI
   unaffected.
 
 ## What is here, and what is not

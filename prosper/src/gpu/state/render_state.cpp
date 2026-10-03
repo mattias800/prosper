@@ -179,7 +179,7 @@ void report_unmodeled_cb_color_mode(uint32_t mode) {
     // This line used to dedupe on a bitmask of modes already seen, so a whole run emitted exactly
     // one line per distinct value and "once" was indistinguishable from "hundreds of thousands".
     // #1588 therefore had to be sized from a separate PROSPER_COLORSTATETRACE run — the same
-    // under-reporting recorded as instruments #9 and #13 in docs/GAME_COMPAT_ORCHESTRATION.md.
+    // under-reporting recorded as instruments #9 and #13 in docs/process/GAME_COMPAT_ORCHESTRATION.md.
     // Print at powers of two so the volume stays bounded on a title that does this every frame, and
     // carry the count in EVERY line, so a printed number is that occurrence's exact ordinal rather
     // than an unreadable cap. It is NOT the total: the highest ordinal printed is a lower bound on

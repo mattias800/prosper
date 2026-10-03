@@ -5,7 +5,7 @@ transitions `boot_program()` records, the in-memory history of those events, and
 written from it. Nothing here participates in loading, linking, mapping or running the guest — if
 code in this folder can change what the guest sees, it is in the wrong folder.
 
-What exists, what is missing and the build order for new diagnostics: `docs/DIAGNOSTICS_ROADMAP.md`.
+What exists, what is missing and the build order for new diagnostics: `docs/process/DIAGNOSTICS_ROADMAP.md`.
 
 The split that matters:
 
