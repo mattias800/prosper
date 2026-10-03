@@ -2630,6 +2630,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
   add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
 
+  # Exhaustive per-family opcode/length sweep of the walker (words built from the encoding layout).
+  prosper_add_gtest(test_rdna2_decode_sweep
+    SOURCES tests/gpu/recompiler/test_rdna2_decode_sweep.cpp
+    LIBRARIES prosper_core)
+
   # Structural RDNA2->SPIR-V validation that does not require Vulkan runtime support.
   add_executable(test_rdna2_spirv_struct tests/gpu/test_rdna2_spirv_struct.cpp)
   target_link_libraries(test_rdna2_spirv_struct PRIVATE prosper_core)
