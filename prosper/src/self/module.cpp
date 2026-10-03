@@ -282,12 +282,24 @@ bool build_image(const Module& m, uint64_t base, LoadedImage& out, std::string* 
     }
     LoadedImage img; img.base = base;
     uint64_t lo = UINT64_MAX, hi = 0;
-    for (auto& s : m.segments)
+    for (size_t i = 0; i < m.segments.size(); i++) {
+        const auto& s = m.segments[i];
+        if (s.type == PT_LOAD && s.filesz > s.memsz) {
+            if (err) {
+                char msg[192];
+                snprintf(msg, sizeof msg,
+                         "PT_LOAD (program header %zu) filesz 0x%llx exceeds memsz 0x%llx",
+                         i, (unsigned long long)s.filesz, (unsigned long long)s.memsz);
+                *err = msg;
+            }
+            return false;
+        }
         // Skip a segment whose vaddr+memsz overflows (a malformed memsz): including it would wrap
         // `hi` and mis-size the image. Well-formed segments have small extents and are unaffected.
         if (s.type == PT_LOAD && s.memsz <= UINT64_MAX - s.vaddr) {
             lo = std::min(lo, s.vaddr); hi = std::max(hi, s.vaddr + s.memsz);
         }
+    }
     if (lo == UINT64_MAX) lo = 0;
     auto align_dn = [](uint64_t v, uint64_t a){ return v & ~(a-1); };
     auto align_up = [](uint64_t v, uint64_t a){ return (v + a - 1) & ~(a-1); };
