@@ -51,6 +51,10 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   mask/helper/system/composition/commit authority remain separate obligations. The CPU-only
   `PROSPER_VGPR_DEFINEDNESS_SPV_DIRECTORY` diagnostic retains actual emitted SOURCE for validation;
   unset writes no files and never changes guest lowering or admission.
+- `fragment_packet_wave_data` separates cached original-program SOURCE/profile from dynamic owned
+  logical64 wave regions. Checked per-workgroup bases load genuine scalar/M0/resource/VGPR words;
+  all-wave status validation precedes any publication. Shared image bindings remain a bounded
+  initial domain. It grants no raster scheduling, system-entry derivation or shipping admission.
 - `spirv_builder` — small hand-built SPIR-V modules. **These include shipped shaders**:
   `frontends/shared/live/live_compute.cpp`'s `prepare_compare_pipeline()` feeds
   `build_compute_compare_uvec4()` straight to `vkCreateShaderModule` on the live path. The GPU

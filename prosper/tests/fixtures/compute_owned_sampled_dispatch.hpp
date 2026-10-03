@@ -24,12 +24,16 @@ struct ComputeOwnedPlan {
     std::vector<uint32_t> spirv;
     std::vector<float> input;
     uint32_t output_words = 0;
+    uint32_t wave_count =
+        1; // explicit owned logical64 batches, never inferred guest raster waves
+    std::vector<uint32_t> initial_output; // optional complete raw guard/record initialization
     std::vector<std::vector<ComputeSampledMip>> images; // fixed binding16+i, nearest/clamp-edge
 };
 struct ComputeOwnedDispatch {
     std::function<bool(const ComputeEnabledContract&, ComputeOwnedPlan&)> prepare;
     ComputeEnabledContract enabled;
     ComputeOwnedPlan plan;
+    uint32_t dispatch_attempts = 0; // actual vkQueueSubmit attempts, not callback preparation
     bool completion_and_host_availability = false;
 };
 inline uint64_t next_compute_owner_identity() {

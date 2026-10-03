@@ -184,7 +184,9 @@ FragmentPacketProgram recompile_fragment_packet(const FragmentInvocationPacket& 
 }
 
 FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPacket& packet,
-    RecompileDiagnosticContext diagnostic, PacketResourceServices* services) {
+                                                     RecompileDiagnosticContext diagnostic,
+                                                     PacketResourceServices* services,
+                                                     PacketWaveDataLayout* wave_data) {
     const auto reject = [&](const std::string& reason, uint32_t pc = UINT32_MAX) {
         FragmentPacketProgram result;
         result.rejection = reason;
@@ -304,7 +306,7 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
 
     const auto requirements = fragment_packet_vgpr_requirements(packet.guest_code, ins);
     if (!requirements.rejection.empty()) return reject(requirements.rejection);
-    bool runtime_definedness = false;
+    bool runtime_definedness = wave_data != nullptr;
     for (uint32_t reg = 0; reg < 256; ++reg)
         if (requirements.storage.test(reg)) {
             const auto column = columns.find(reg);
@@ -365,12 +367,15 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
                 result.vgpr_failure_sites.push_back(
                     {pc, read.reg, static_cast<uint32_t>(read.kind)});
     }
+    if (wave_data) configure_packet_wave_data(packet, ins, result, *services, *wave_data);
     SpirvCompute b;
     b.diagnostic = diagnostic;
     b.fragment_float_mode = packet.float_mode;
     b.fragment_float_flags = packet.float_flags;
     b.float_transport = packet.float_transport;
     b.begin(result.input_stride, nullptr, 64, 1, 1, 64, 0, true, true);
+    const auto wave_emission =
+        wave_data ? begin_packet_wave_data(b, *wave_data) : PacketWaveEmission{};
     b.guest_stage = GuestShaderStage::Fragment; // physical GLCompute/workgroup remains independent
     b.packet_quad_topology = packet.quad_topology;
     std::vector<uint32_t> marker;
@@ -383,7 +388,11 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     }
     RegState state;
     for (const auto& [reg, column] : columns) state.vreg[reg] = b.load_input(column);
-    for (const auto& [reg, value] : scalars) state.sreg[reg] = b.uconst(value);
+    uint32_t scalar_column = 0;
+    for (const auto& [reg, value] : scalars)
+        state.sreg[reg] =
+            wave_data ? b.load_packet_word(b.uconst(wave_data->scalar_offsets.at(scalar_column++)))
+                      : b.uconst(value);
     // Allocated missing storage is an INTERNAL placeholder, never entry authority. Per-logical-
     // lane validity checks every actual read before transactional publication, including implicit
     // P2/wide resource ranges, EXEC-ignoring peer selection and the unchanged raw inactive EXP ABI.
@@ -436,6 +445,7 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     }
     if (services) services->finish(b);
     if (runtime_definedness) definedness.finish(b, result.vgpr_status_offset);
+    if (wave_data) finish_packet_wave_data(b, wave_emission);
     result.spirv = b.finish();
     if (result.spirv.empty()) return reject("packet-module-finalization-refused");
     return result;

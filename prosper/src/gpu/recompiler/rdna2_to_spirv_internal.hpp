@@ -472,6 +472,8 @@ struct SpirvCompute {
     uint32_t stride = 1;
     bool raw_output_words = false;
     bool raw_input_words = false;
+    uint32_t packet_input_base = 0, packet_output_base = 0;   // optional dynamic wave ABI SSA ids
+    uint32_t load_packet_word(uint32_t index);
     // fixed ids (set in begin()):
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
     uint32_t v_gid=0, v_groupid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;

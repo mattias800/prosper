@@ -1,6 +1,7 @@
 #pragma once
 #include "gpu/recompiler/fragment_resource_packet.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/fragment_packet_wave_data.hpp"
 
 namespace prosper::gpu {
 struct PacketF32Result {
@@ -25,6 +26,7 @@ struct PacketResourceServices {
     std::map<uint32_t, uint32_t> buffer_offsets;
     std::map<uint32_t, uint32_t> parameter_offsets;
     uint32_t failure_var = 0, failure_pc_var = 0, m0_var = 0;
+    PacketWaveDataLayout* wave_data = nullptr;
     void begin(SpirvCompute&);
     // 0 => existing integer emitter, 1 => handled, -1 => transactional emission refusal.
     int emit(SpirvCompute&, RegState&, const Rdna2Inst&);
@@ -35,5 +37,15 @@ const char* packet_resource_instruction_gap(const Rdna2Inst&);
 const char* packet_resource_preflight(const FragmentResourcePacket&, const std::vector<Rdna2Inst>&,
                                      uint32_t& failure_pc);
 FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPacket&,
-    RecompileDiagnosticContext, PacketResourceServices*);
+                                                     RecompileDiagnosticContext,
+                                                     PacketResourceServices*,
+                                                     PacketWaveDataLayout* = nullptr);
+void configure_packet_wave_data(const FragmentInvocationPacket&, const std::vector<Rdna2Inst>&,
+                                FragmentPacketProgram&, PacketResourceServices&,
+                                PacketWaveDataLayout&);
+struct PacketWaveEmission {
+    uint32_t merge = 0, output_base = 0, outer_merge = 0;
+};
+PacketWaveEmission begin_packet_wave_data(SpirvCompute&, const PacketWaveDataLayout&);
+void finish_packet_wave_data(SpirvCompute&, PacketWaveEmission);
 } // namespace prosper::gpu
