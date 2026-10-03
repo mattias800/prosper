@@ -358,6 +358,16 @@ long win_data_watch_handle_for_test(::_EXCEPTION_POINTERS* ep) {
 void win_data_watch_arm_current_thread() {
     static std::once_flag env_once;
     std::call_once(env_once, [] {
+        // Parsed before the ABS early return so the malformed-value warning depends on this
+        // one switch alone (it prints no field that ABS measured).
+        if (const char* m = PROSPER_ENV_VALUE("PROSPER_HWWATCH_MAX")) {
+            char* e = nullptr;
+            uint64_t v = 0;
+            if (unsigned_prefix(m, &e, &v) && !*e)
+                cfg().max_logged = v;
+            else
+                fprintf(stderr, "[hwwatch] malformed PROSPER_HWWATCH_MAX ignored\n");
+        }
         const char* spec = PROSPER_ENV_VALUE("PROSPER_HWWATCH_ABS");
         if (!spec) return;
         WinDataWatchSpec specs[kWinDataWatchSlots];
@@ -368,14 +378,6 @@ void win_data_watch_arm_current_thread() {
                     "0xADDR[:LEN] entries, LEN 1/2/4/8, each address aligned to its LEN\n",
                     spec, kWinDataWatchSlots);
             return;
-        }
-        if (const char* m = PROSPER_ENV_VALUE("PROSPER_HWWATCH_MAX")) {
-            char* e = nullptr;
-            uint64_t v = 0;
-            if (unsigned_prefix(m, &e, &v) && !*e)
-                cfg().max_logged = v;
-            else
-                fprintf(stderr, "[hwwatch] malformed PROSPER_HWWATCH_MAX ignored\n");
         }
         if (!win_data_watch_configure_list(specs, n)) return;
         for (unsigned i = 0; i < n; i++)
