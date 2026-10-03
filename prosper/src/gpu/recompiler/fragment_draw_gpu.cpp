@@ -54,8 +54,12 @@ void end_selection(SpirvCompute& b, uint32_t end) {
 // (zero-filled before the transaction, >= 8x max_quads entries, so the load factor is <= 1/8),
 // probing at most kFragmentDrawPixelProbeLimit slots per record; an exhausted probe refuses.
 // Every slot written is zeroed again before validation reuses the plane. A key names one
-// triangle only while each PrimitiveId does: the collector records one instance and admits no
-// geometry stage that emits several triangles per input (fragment_draw_plan.cpp).
+// triangle only while each PrimitiveId does. Two guards make that hold today: a draw with more
+// than one instance is refused (PrimitiveId restarts per instance;
+// tests/fixtures/fragment_draw_backend_transaction.h), and so is any interpolation layout that
+// requires a geometry stage, which could emit several triangles per input primitive
+// (input_free_layout in fragment_draw_plan.cpp). Lifting either needs the instance index or the
+// geometry stage's own primitive id in the key.
 // Returns a function variable holding 1 when the collection was refused.
 uint32_t reassemble_split_scopes(SpirvCompute& b, const Words& source, const Words& scratch,
                                  const FragmentDrawCapacity& capacity,
