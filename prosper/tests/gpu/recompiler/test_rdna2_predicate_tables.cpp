@@ -19,9 +19,6 @@
 //     pseudos' `Defs = [EXEC, SCC], Uses = [EXEC]`.
 //   [LLVM-VOP3] VOP3Instructions.td: the VOP3B carry family uses the `VOP3b_*` profiles (sdst
 //     scalar destination); the ISA manual sec 13.3.4 names the same ten opcodes the decoder lists.
-//   [KYTY] KytyPS5's independent decoder (ScalarAluOps.cpp SOP1 map) corroborates the SAVEEXEC
-//     numbers 0x24/0x28/0x37/0x3C/0x40/0x44. No third-party test text is reused; only opcode
-//     numbers and architectural facts are compared.
 //
 // What this deliberately does NOT do: force the conservative gaps closed. Several LLVM-clean SOP1
 // ops (BREV_B64, FF0 pair, FF1_B32, SEXT pair, BITSET_B64 pair, MOVRELS/D family) are absent from
@@ -146,7 +143,7 @@ TEST(Rdna2PredicateTables, Sop1GapsStayConservative) {
 TEST(Rdna2PredicateTables, Sop1SaveexecWrexecRangesMatchLlvm) {
     for (uint32_t op = 0; op <= 0xFF; ++op) {
         const bool saveexec_b64 =
-            (op >= 0x24u && op <= 0x2Bu) || op == 0x37u || op == 0x38u;  // [LLVM-SOP1]+[KYTY]
+            (op >= 0x24u && op <= 0x2Bu) || op == 0x37u || op == 0x38u;  // [LLVM-SOP1]
         const bool wrexec_b64 = op == 0x39u || op == 0x3Au;              // [LLVM-SOP1] gfx9+
         const bool saveexec_b32 = op >= 0x3Cu && op <= 0x45u;            // [LLVM-SOP1] gfx10
         const bool wrexec_b32 = op == 0x46u || op == 0x47u;             // [LLVM-SOP1] gfx10
