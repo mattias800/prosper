@@ -799,6 +799,10 @@ ${GAME_DUMP_TITLE_ID}. Re-run cmake with -DGAME_DUMP=<dump root>/${title}-app0 t
 endfunction()
 
 if(TARGET prosper_core)
+  prosper_add_gtest(test_fragment_entry_prefix
+    SOURCES tests/gpu/execute/test_fragment_entry_prefix.cpp
+    INCLUDES tests LIBRARIES prosper_core)
+
   # nid_census: every guest import that falls to the dispatcher's return-0 default (#2081).
   # Links prosper_core because both of its inputs must be the real ones — `Module::load` for the
   # imports the loader will actually try to bind, `module_export_nids` for what a sibling module
@@ -5830,6 +5834,13 @@ endif()
 # physical device but creates none, so it runs wherever an ICD exists and reports a skip (never a
 # silent pass) where one does not.
 if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
+  prosper_add_gtest(test_fragment_entry_prefix_exec
+    SOURCES tests/gpu/execute/test_fragment_entry_prefix_exec.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core Vulkan::Vulkan
+    LABELS gpu
+    PROPERTIES TIMEOUT 120)
+
   add_executable(test_fragment_packet_exec tests/gpu/execute/test_fragment_packet_exec.cpp)
   target_include_directories(test_fragment_packet_exec PRIVATE tests)
   target_link_libraries(test_fragment_packet_exec PRIVATE prosper_core Vulkan::Vulkan)
