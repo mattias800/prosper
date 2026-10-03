@@ -59,6 +59,12 @@ bool guest_readable(uint64_t address, uint32_t bytes);
 
 using SharedShaderWords = std::shared_ptr<const std::vector<uint32_t>>;
 
+struct GraphicsReadSource {
+    SharedShaderWords words;
+    std::shared_ptr<const std::vector<RawNestedWideChain>> chains;
+};
+GraphicsReadSource registered_graphics_read_source(uint64_t address);
+
 // One byte-validated immutable shader version. The live draw path acquires this after resource
 // realization and shares it only across the fragment metadata + compilation operation for that
 // draw. A later draw acquires again, so same-address guest shader rewrites remain visible.
@@ -77,6 +83,8 @@ struct DrawItem {
     // Development-activated real raster producer. No automatic fragment admission authority.
     std::shared_ptr<RasterQuadCollection> raster_quads;
     std::shared_ptr<const GraphicsOwnedWaveDraw> owned_waves;
+    // Ordered source authority only. Never serialized or interpreted as ready resource backing.
+    std::shared_ptr<const OrderedGraphicsReadPoint> ordered_read_point;
     std::vector<uint32_t> vs, gs, fs;                 // recompiled/generated SPIR-V
     // The live path can retain warm-cache shader modules by shared ownership instead of copying the
     // same SPIR-V words twice per draw (cache -> DrawItem -> BackendDraw). Capture/replay and direct

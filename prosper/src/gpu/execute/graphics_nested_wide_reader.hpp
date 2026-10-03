@@ -5,6 +5,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
 #include <map>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -26,6 +27,37 @@ struct RawSnapshotWritePlan {
 RawSnapshotWritePlan raw_snapshot_write_plan(const std::vector<Rdna2Inst>&,
                                              const std::vector<RawNestedWideChain>& = {});
 
+// Executor-issued ordering authority, not resource backing or shader admission. Only the ordered
+// executor can construct one; consumers supply their own expected operation/source association.
+class OrderedGraphicsReadPoint {
+    friend struct OrderedGraphicsReadPointIssuer;
+    struct Epoch {
+        std::atomic<uint64_t> sequence{0};
+        std::atomic<bool> active{true};
+    };
+    struct Source {
+        uint64_t address;
+        std::shared_ptr<const std::vector<uint32_t>> words;
+        std::shared_ptr<const std::vector<RawNestedWideChain>> chains;
+    };
+    const uint64_t identity_, submit_, order_, failure_generation_;
+    const std::vector<Source> sources_;
+    const std::shared_ptr<Epoch> epoch_;
+    const uint64_t sequence_;
+    OrderedGraphicsReadPoint(uint64_t identity, uint64_t submit, uint64_t order, uint64_t failures,
+                             std::vector<Source> sources, std::shared_ptr<Epoch> epoch,
+                             uint64_t sequence)
+        : identity_(identity), submit_(submit), order_(order), failure_generation_(failures),
+          sources_(std::move(sources)), epoch_(std::move(epoch)), sequence_(sequence) {}
+
+public:
+    uint64_t identity() const { return identity_; }
+    std::shared_ptr<const std::vector<uint32_t>> source(uint64_t address) const;
+    bool owns_chains(uint64_t address, const std::vector<RawNestedWideChain>& chains) const;
+    bool valid_for(uint64_t submit, uint64_t order, uint64_t source_address,
+                   const std::shared_ptr<const std::vector<uint32_t>>& source) const;
+};
+
 // Supplied only at an ordered draw or compute boundary, after successful synchronous producers and
 // retirement of deferred work. This excludes producer races, not unsynchronized guest CPU
 // stores; as with other draw inputs the guest must keep the submitted input alive and stable.
@@ -35,6 +67,9 @@ struct GraphicsRawSnapshotContext {
     // Even a shader with no explicit stores writes its framebuffer through exports; a same-
     // allocation scalar input cannot be a wave-invariant snapshot during that write.
     std::vector<std::pair<uint64_t, uint64_t>> output_allocations;
+    std::shared_ptr<const OrderedGraphicsReadPoint> ordered_read_point;
+    uint64_t source_submit = 0;
+    bool requires_ordered_read_point = false;
 };
 
 // The live renderer must prove that raw guest bytes are current, including physical aliases of
@@ -151,9 +186,22 @@ class GraphicsNestedWideReader final : public FoldReader {
     std::unique_ptr<prosper::GuestMappingLease> owned_lease_;
     const prosper::GuestMappingLease* lease_ = nullptr;
     bool allowed_ = false;
+    std::shared_ptr<const OrderedGraphicsReadPoint> read_point_;
+    std::shared_ptr<const std::vector<uint32_t>> source_;
+    uint64_t source_address_ = 0, source_submit_ = 0, command_order_ = 0;
+    bool checked_order_ = false;
+    bool ordered_source_current() const;
+
 public:
     GraphicsNestedWideReader(std::vector<RawNestedWideChain> chains,
                              const GraphicsRawSnapshotContext* context,
+                             const prosper::GuestMappingLease* borrowed_lease = nullptr);
+    // Live graphics uses this checked overload. The legacy overload remains for compute and
+    // existing explicit offline contexts; it cannot manufacture an executor-issued ticket.
+    GraphicsNestedWideReader(std::vector<RawNestedWideChain> chains,
+                             const GraphicsRawSnapshotContext* context, uint64_t source_address,
+                             std::shared_ptr<const std::vector<uint32_t>> source,
+                             uint64_t source_submit, uint64_t command_order,
                              const prosper::GuestMappingLease* borrowed_lease = nullptr);
     bool owns_raw_wide(uint32_t pc) const override { return widths_.contains(pc); }
     bool probe(FoldProbe kind, uint32_t pc, uint64_t address, uint32_t bytes) override;

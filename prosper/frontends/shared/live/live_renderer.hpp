@@ -25,6 +25,12 @@ namespace prosper::frontend {
 // are not time-bounded. Never initializes a renderer or destroys resources.
 bool flush_live_graphics_pipeline_cache();
 
+// Metadata-only production queries: no device initialization and no completion wait. The ordered
+// executor separately supplies prior-operation authority; an idle backend alone is insufficient.
+prosper::gpu::GraphicsProducerStatus live_graphics_producer_status();
+bool live_graphics_raw_source_current(const prosper::GuestMappingLease&, uint64_t address,
+                                      uint32_t bytes);
+
 // Opt-in cumulative work on the calling renderer thread. Disabled is unobserved, not zero work.
 // Footprints count actual CPU RTT extent calculations, excluding extra watched-address diagnostics.
 struct GuestWriteDrainWork {

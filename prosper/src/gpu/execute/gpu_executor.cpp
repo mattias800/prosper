@@ -10,6 +10,7 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/compute_program_facts.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
+#include "gpu/execute/ordered_graphics_read_point_internal.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: skipped-dispatches, shader-compile alarms
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
@@ -7143,7 +7144,7 @@ std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
     return merged;
 }
 
-SharedShaderWords registered_graphics_original(uint64_t address) {
+GraphicsReadSource registered_graphics_read_source(uint64_t address) {
     const auto* header =
         static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(address));
     if (!header) return {};
@@ -7151,7 +7152,13 @@ SharedShaderWords registered_graphics_original(uint64_t address) {
     if (!count) return {};
     const auto analysis =
         decode_shader_cached(reinterpret_cast<const uint32_t*>(uintptr_t(address)), count);
-    return SharedShaderWords(analysis, &analysis->code);
+    return {SharedShaderWords(analysis, &analysis->code),
+            std::shared_ptr<const std::vector<RawNestedWideChain>>(
+                analysis, &analysis->owned_nested_wide_chains)};
+}
+
+SharedShaderWords registered_graphics_original(uint64_t address) {
+    return registered_graphics_read_source(address).words;
 }
 
 bool draw_requires_owned_nested_snapshot(const GpuState& state) {
@@ -7236,8 +7243,14 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                 stage_context.producers_complete = false; // unproved native DS/HTILE physical layout
                 stage_context.output_allocations.emplace_back(address, 0u);
             }
-        nested_reader = std::make_unique<GraphicsNestedWideReader>(
-            full_source->owned_nested_wide_chains, raw_context ? &stage_context : nullptr);
+        if (raw_context && raw_context->requires_ordered_read_point)
+            nested_reader = std::make_unique<GraphicsNestedWideReader>(
+                full_source->owned_nested_wide_chains, &stage_context, code_addr,
+                SharedShaderWords(full_source, &full_source->code), raw_context->source_submit,
+                draw_command_order);
+        else
+            nested_reader = std::make_unique<GraphicsNestedWideReader>(
+                full_source->owned_nested_wide_chains, raw_context ? &stage_context : nullptr);
         nested_reader->branch_exclusive_disabled =
             std::getenv("PROSPER_NO_BRANCH_EXCLUSIVE") != nullptr;
     }
@@ -9971,21 +9984,28 @@ OrderedSubmitResult execute_ordered_items_impl(const std::vector<SubmitOperation
         uint64_t command_order;
     };
     std::vector<ExecutableOperation> executable;
+    OrderedGraphicsReadPointIssuer read_points(graphics_producer_status());
     bool explicit_dma_operations = false;
     for (const auto& operation : operations) {
         if (operation.kind == SubmitOperationKind::Draw) {
             auto it = draw_by_index.find(operation.index);
             if (it != draw_by_index.end())
                 executable.push_back({ExecutableKind::Draw, it->second, operation.command_order});
+            else
+                read_points.dependencies_ok = false;
         } else if (operation.kind == SubmitOperationKind::Dispatch) {
             auto it = compute_by_index.find(operation.index);
             if (it != compute_by_index.end())
                 executable.push_back({ExecutableKind::Dispatch, it->second, operation.command_order});
+            else
+                read_points.dependencies_ok = false;
         } else {
             explicit_dma_operations = true;
             if (operation.index < dma_copies.size())
                 executable.push_back({ExecutableKind::DmaCopy, operation.index,
                                       operation.command_order});
+            else
+                read_points.dependencies_ok = false;
         }
     }
     // Compatibility for pre-v14 callers whose operation list predates the DMA kind.
@@ -10023,18 +10043,34 @@ OrderedSubmitResult execute_ordered_items_impl(const std::vector<SubmitOperation
     };
     for (const auto& operation : executable) {
         if (operation.kind == ExecutableKind::Draw) {
-            span.push_back(draws[operation.item]);
+            read_points.advance();
+            DrawItem item = draws[operation.item];
+            // Never retain a caller/replay ticket. Only this actual ordered operation may issue
+            // one, and an earlier unsubmitted draw in the span is not completed producer work.
+            item.ordered_read_point.reset();
+            if (item.command_order == operation.command_order)
+                item.ordered_read_point =
+                    read_points.issue(source_submit, operation.command_order, span,
+                                      item.vs_guest_addr, item.fs_guest_addr);
+            span.push_back(std::move(item));
         } else if (operation.kind == ExecutableKind::Dispatch) {
             flush_span();
+            read_points.advance();
             if (compute) {
                 const prosper::diagnostics::perf::BackendDispatchOutcome outcome;
                 const bool executed = compute({computes[operation.item]});
                 outcome.finish(executed);
                 result.compute_executed |= executed;
-            }
+                read_points.dependencies_ok &= executed;
+            } else
+                read_points.dependencies_ok = false;
         } else {
             flush_span(true);
+            read_points.advance();
             execute_dma(dma_copies[operation.item]);
+            // This legacy callback reports no completion outcome. Do not turn its return into
+            // successful ordered-source authority, while preserving its execution ABI.
+            read_points.dependencies_ok = false;
         }
     }
     flush_span();
@@ -11473,6 +11509,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     bool producer_epoch_ok = true;
     bool graphics_epoch_ok = true;
     const GraphicsProducerStatus graphics_epoch = graphics_producer_status();
+    OrderedGraphicsReadPointIssuer read_points(graphics_epoch);
     // #3891: set for the rest of the submit once a DELIBERATE decline (selector, parent walk) broke
     // a producer epoch, so the indirect dispatches it strands are not counted as skipped-dispatches.
     bool epoch_broken_deliberately = false;
@@ -11510,6 +11547,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
     };
 
     for (const auto& operation : executable) {
+        read_points.advance();
         switch (operation.kind) {
             case RetainedSubmitKind::Draw: {
                 // PROSPER_DRAW_CENSUS=1 — the most basic number about a missing world, and nothing
@@ -11750,6 +11788,19 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                         graphics_epoch.known && completed.known && !completed.pending &&
                         graphics_epoch.failures == completed.failures;
                 }
+                const GpuState& read_state =
+                    use_per_draw_policy(st) ? st.state_at_draw(operation.index) : st;
+                const auto read_render = extract_render_state(read_state);
+                read_points.dependencies_ok =
+                    producer_epoch_ok && graphics_epoch_ok && indirect_dependencies_ok;
+                raw_context.source_submit = submit_no;
+                raw_context.requires_ordered_read_point = true;
+                raw_context.ordered_read_point =
+                    read_points.issue(submit_no, operation.command_order, span, read_render.es_addr,
+                                      read_render.ps_addr);
+                if (nested_inputs)
+                    raw_context.producers_complete =
+                        raw_context.producers_complete && bool(raw_context.ordered_read_point);
                 bool realized = false;
                 OperationRealizationFailure failure;
                 bool failure_known = false;
@@ -11786,6 +11837,7 @@ static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t
                     }
                 }
                 if (realized) {
+                    item.ordered_read_point = raw_context.ordered_read_point;
                     notify_compute_authority_draw_resources(item, submit_no);
                     if (menu_realized_draws)
                         menu_realized_draws->push_back({item.draw_index, item.fs_guest_addr,
