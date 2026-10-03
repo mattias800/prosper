@@ -8,31 +8,28 @@
 // A tagged cndmask reads the *actual destination*: finding an unrelated OpSelect cannot pass.
 // No GPU is created. Wave64 here names the requested guest contract, not a claim about native
 // fragment high-half execution or about a driver producing a particular value from poison.
+//
+// NOTE: the legacy --dump DIR artifact mode was dropped in the GTest migration (it was never
+// wired into ctest). Modules below are deterministic from the owned packets, so re-add a local
+// dump when a .spv artifact is needed for debugging.
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+
+#include <gtest/gtest.h>
 
 #include <array>
 #include <cstdint>
 #include <cstdio>
-#include <filesystem>
-#include <fstream>
 #include <iterator>
-#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 using namespace prosper::gpu;
 
-namespace {
-int failures = 0;
+#define check(condition, label) EXPECT_TRUE(condition) << (label)
 
-void check(bool condition, std::string_view label) {
-    if (!condition) {
-        std::printf("  [FAIL] %.*s\n", static_cast<int>(label.size()), label.data());
-        ++failures;
-    }
-}
+namespace {
 
 constexpr uint32_t kTypeBool = 20, kTypeInt = 21, kConstantTrue = 41, kConstantFalse = 42;
 constexpr uint32_t kConstant = 43, kBitcast = 124, kLogicalAnd = 167, kSelect = 169;
@@ -227,22 +224,12 @@ std::vector<uint32_t> compile(std::vector<uint32_t> program, Stage stage, uint32
                               nullptr, wave_size == 32);
 }
 
-void dump(const char* directory, const std::string& name, const std::vector<uint32_t>& words) {
-    if (!directory || words.empty()) return;
-    std::ofstream output(std::filesystem::path(directory) / (name + ".spv"), std::ios::binary);
-    const auto bytes = std::as_bytes(std::span(words));
-    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    output.close();
-    check(static_cast<bool>(output), name + " dump serialization");
-}
-
 std::string name_for(Stage stage, uint32_t wave_size, std::string_view arm) {
     return std::string(stage == Stage::Compute ? "compute" : "fragment") + "_wave" +
            std::to_string(wave_size) + "_" + std::string(arm);
 }
 
-void compare_control(const Case& test, Stage stage, uint32_t wave_size, bool narrowed,
-                     const char* directory) {
+void compare_control(const Case& test, Stage stage, uint32_t wave_size, bool narrowed) {
     const std::string name = name_for(stage, wave_size,
         std::string(test.name) + (narrowed ? "_narrowed" : "_full"));
     std::vector<uint32_t> program = {
@@ -259,7 +246,6 @@ void compare_control(const Case& test, Stage stage, uint32_t wave_size, bool nar
     const Module module(words);
     check(!words.empty() && module.valid, name + " module emitted");
     if (!module.valid) return;
-    dump(directory, name, words);
     const auto* compare = module.unique(kFOrdLessThan);
     const auto* old_vcc = module.unique(kINotEqual);
     const auto* bool_type = module.unique(kTypeBool);
@@ -295,7 +281,7 @@ void compare_control(const Case& test, Stage stage, uint32_t wave_size, bool nar
           name + (test.preserves_vcc ? " preserves distinct preexisting VCC" : " publishes new VCC"));
 }
 
-void scalar_and_control(Stage stage, uint32_t wave_size, const char* directory) {
+void scalar_and_control(Stage stage, uint32_t wave_size) {
     const std::string name = name_for(stage, wave_size, "scalar_and_b64_strict");
     std::vector<uint32_t> program = {
         0x7e0202f2u, // v_mov_b32 v1,1.0
@@ -313,7 +299,6 @@ void scalar_and_control(Stage stage, uint32_t wave_size, const char* directory) 
     const Module module(words);
     check(!words.empty() && module.valid, name + " module emitted");
     if (!module.valid) return;
-    dump(directory, name, words);
     const uint32_t condition = module.tagged_condition(7);
     const auto* actual = module.definition(condition);
     check(actual && actual->opcode == kLogicalAnd && actual->operands.size() == 4 &&
@@ -323,24 +308,34 @@ void scalar_and_control(Stage stage, uint32_t wave_size, const char* directory) 
 }
 } // namespace
 
-int main(int argc, char** argv) {
-    if (argc != 1 && !(argc == 3 && std::string_view(argv[1]) == "--dump")) return 2;
-    const char* directory = argc == 3 ? argv[2] : nullptr;
-    packet_controls();
-    size_t count = 0;
-    for (const auto stage : {Stage::Compute, Stage::Fragment}) {
-        for (const uint32_t wave_size : {32u, 64u}) {
-            for (const auto& test : cases) {
-                if (test.wave32_only && wave_size != 32) continue;
-                for (const bool narrowed : {false, true}) {
-                    compare_control(test, stage, wave_size, narrowed, directory);
-                    ++count;
-                }
-            }
-            scalar_and_control(stage, wave_size, directory);
-            ++count;
-        }
+TEST(CompareExecMasking, PacketControls) { packet_controls(); }
+
+TEST(CompareExecMasking, ComputeWave32) {
+    for (const auto& test : cases) {
+        for (const bool narrowed : {false, true}) compare_control(test, Stage::Compute, 32u, narrowed);
     }
-    std::printf("== compare_exec_masking: %zu modules, %d failures ==\n", count, failures);
-    return failures ? 1 : 0;
+    scalar_and_control(Stage::Compute, 32u);
+}
+
+TEST(CompareExecMasking, ComputeWave64) {
+    for (const auto& test : cases) {
+        if (test.wave32_only) continue;
+        for (const bool narrowed : {false, true}) compare_control(test, Stage::Compute, 64u, narrowed);
+    }
+    scalar_and_control(Stage::Compute, 64u);
+}
+
+TEST(CompareExecMasking, FragmentWave32) {
+    for (const auto& test : cases) {
+        for (const bool narrowed : {false, true}) compare_control(test, Stage::Fragment, 32u, narrowed);
+    }
+    scalar_and_control(Stage::Fragment, 32u);
+}
+
+TEST(CompareExecMasking, FragmentWave64) {
+    for (const auto& test : cases) {
+        if (test.wave32_only) continue;
+        for (const bool narrowed : {false, true}) compare_control(test, Stage::Fragment, 64u, narrowed);
+    }
+    scalar_and_control(Stage::Fragment, 64u);
 }
