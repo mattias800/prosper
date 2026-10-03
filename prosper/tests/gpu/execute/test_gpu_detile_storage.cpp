@@ -1,5 +1,6 @@
 // Exact GPU FP16 storage initialization must preserve subsequent graphics writes.
 #include "fixtures/render_runner.h"
+#include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "shared/live/live_renderer.hpp"
 #include <bit>
@@ -11,7 +12,7 @@ static void check(bool ok, const char *what) {
     std::printf("[%s] %s\n", ok ? "ok" : "FAIL", what);
     failures += !ok;
 }
-int main() {
+TEST(GpuDetileStorage, Contract) {
     prosper::frontend::register_live_renderer("", false);
     const bool unshared = std::getenv("PROSPER_NO_BACKEND_TEXTURE_SHARE") != nullptr;
     const uint32_t vs[]{0x36020081u, 0x2c040081u, 0x7e020d01u, 0x7e040d02u, 0x7e0a02f6u,
@@ -46,7 +47,7 @@ int main() {
                   : upload && upload->readback.mapped && upload->output_bytes == size_t(w) * h * 16,
               "writable FP16 preparation owns one mapped result or refuses unshared images");
         if (!unshared && !upload)
-            return 1;
+            FAIL() << "legacy early exit";
         ShaderResourceTable table;
         ShaderResource source{};
         source.cls = ResourceClass::StorageImage;
@@ -183,5 +184,5 @@ int main() {
         check(tiled == before_short && gpu_detile_recordings().load() == before_short_dispatches,
               "short storage backing refuses both GPU preparation and guest writes");
     }
-    return failures ? 1 : 0;
+    EXPECT_EQ(failures, 0);
 }

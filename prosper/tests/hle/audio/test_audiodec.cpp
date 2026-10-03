@@ -11,6 +11,7 @@
 // So the assertion that matters is not "decode returned 0"; it is **the guest's own divisor is
 // non-zero on every call that reported success**. That arithmetic is reproduced literally below.
 #include "hle/dispatch/dispatch.hpp"
+#include <gtest/gtest.h>
 #include "hle/dispatch/nid.hpp"
 #include "hle/audio/ajm_decoder.hpp"
 #include "ajm_ffmpeg.hpp"
@@ -23,8 +24,7 @@
 using namespace prosper;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
-                         else       { std::printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
 using HleFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 static uint64_t addr(const void* p) { return (uint64_t)(uintptr_t)p; }
@@ -161,7 +161,7 @@ struct Fixture {
     }
 };
 
-int main() {
+TEST(Audiodec, Contract) {
     std::printf("test_audiodec\n");
 
     CHECK(ajm::install_ffmpeg_decoder_backend(), "FFmpeg decoder backend installs");
@@ -188,7 +188,7 @@ int main() {
     if (!init_library || !create_decoder || !decode || !delete_decoder || !clear_context ||
         !term_library) {
         std::printf("test_audiodec: %d failure(s)\n", fails + 1);
-        return 1;
+        FAIL() << "legacy early exit";
     }
 
     CHECK(init_library(3, 0, 0, 0, 0, 0) == 0, "sceAudiodecInitLibrary(AAC) succeeds");
@@ -284,6 +284,5 @@ int main() {
 
     CHECK(term_library(3, 0, 0, 0, 0, 0) == 0, "sceAudiodecTermLibrary succeeds");
 
-    std::printf("test_audiodec: %d failure(s)\n", fails);
-    return fails ? 1 : 0;
+    EXPECT_EQ(fails, 0);
 }

@@ -306,6 +306,33 @@ bool vopc_is_cmpx(uint32_t opcode);
 // by control-flow analysis and instruction-scoped value proofs: overlooking a mask mutation can
 // turn a predicated VALU definition into a false all-lanes fact.
 bool rdna2_instruction_may_change_exec(const Rdna2Inst& in);
+// True when an instruction can WRITE guest memory (and so could rewrite a descriptor's backing):
+// every image operation that is not a load, sample, gather or query, every buffer/flat operation that
+// is not a plain load, and scalar-memory operations above the load/buffer-load range. FAIL-CLOSED by
+// construction: an opcode this does not positively know to be a pure read is reported as a writer,
+// so a new or unlisted encoding can only cost an unresolved descriptor, never a stale binding. The
+// read-only sets are the ones the gfx1030 encodings establish (llvm-mc, `test_rdna2_decode`): MIMG
+// loads 0x00-0x05, get_resinfo 0x0e, the assigned sample/gather/get_lod slots in 0x20-0x6f,
+// msaa_load 0x80 and the BVH intersects 0xe6/0xe7; MUBUF loads 0x00-0x03 (format) and 0x08-0x0f
+// (ubyte..dwordx4), MTBUF loads 0x00-0x03, FLAT/global loads 0x08-0x0f, SMEM loads below 0x10.
+// Everything else, including the D16 and cache-invalidate forms, is treated as a writer.
+// Non-memory instructions return false.
+bool rdna2_instruction_may_write_memory(const Rdna2Inst& in);
+// `full` is a `rdna2_walk` prefix ending at its first s_endpgm. Compilers place a divergent early-out
+// (discard, kill) AFTER that end and branch to it from the body, so a branch target can name code the
+// walk never decoded. Decode every block reachable through such a target and append it to `full`.
+// Admitted only when the extra blocks are CLOSED: they decode cleanly, every branch inside them stays
+// past the body, and each run ends in s_endpgm or an unconditional branch. They can then end the wave
+// but can never run before, or re-enter, the body. Returns false (and leaves `full` untouched) for a
+// branch target outside `code[0, dwords)`, an unknown encoding, a back-edge into the body or a
+// fall-through that does not land on a decoded instruction. `code` is the live stream, not the prefix.
+bool rdna2_append_closed_tail_blocks(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& full);
+// Number of consecutive SGPRs an SOP2 instruction writes through its SDST: 1 for the opcodes
+// positively known to produce a 32-bit result (add/sub/min/max/cselect/bit-logic/shift/bfm/mul/bfe
+// in their b32/u32/i32 forms), 2 for everything else. FAIL-CLOSED: an opcode not listed here
+// (every 64-bit form, and anything unknown) is treated as a pair write, so the result can only
+// over-approximate which registers an instruction may clobber. SCC is not an SGPR and is not counted.
+uint32_t rdna2_sop2_dest_dwords(uint32_t opcode);
 // Number of consecutive data VGPRs an instruction writes from its decoded destination. This
 // inventory is shared by control-flow analyses and instruction-scoped value proofs so scalar VALU
 // results are not mistaken for four-register memory payloads, while actual wide results still

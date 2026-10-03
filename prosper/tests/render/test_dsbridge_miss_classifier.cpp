@@ -21,15 +21,13 @@
 // bridge earlier in the process.
 
 #include "fixtures/render_runner.h"
+#include <gtest/gtest.h>
 
 #include <cstdio>
 #include <cstdint>
 #include <string>
 
-static int failures = 0;
-#define CHECK(condition, message) do { \
-    if (!(condition)) { std::fprintf(stderr, "FAIL: %s\n", message); ++failures; } \
-} while (0)
+#define CHECK(condition, message) EXPECT_TRUE(condition) << (message)
 
 namespace {
 
@@ -48,7 +46,7 @@ std::string reason_of(const prosper::test::DsBridgeMiss& miss) {
 
 }  // namespace
 
-int main() {
+TEST(DsbridgeMissClassifier, Contract) {
     auto& cache = prosper::test::persistent_ds_cache();
 
     // --- Arm 1: a right-sized entry failing for depth-invalid, beside a wrong-sized sibling ------
@@ -142,10 +140,4 @@ int main() {
               "no-entry prints no reason text: that bucket is unbounded and genuinely not ours");
     }
 
-    if (failures) {
-        std::fprintf(stderr, "test_dsbridge_miss_classifier: %d failure(s)\n", failures);
-        return 1;
-    }
-    std::printf("test_dsbridge_miss_classifier: all checks passed\n");
-    return 0;
 }

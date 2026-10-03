@@ -4,6 +4,7 @@
 // and assert the triangle is GREEN (not the placeholder's red), proving RDNA2->SPIR-V works for an
 // actual graphics-stage shader wired into a real pipeline.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <gtest/gtest.h>
 #include "fixtures/render_runner.h"
 #include "fixtures/spirv_triangle.h"     // kTriVertSpv: placeholder vertex shader (positions)
 #include <algorithm>
@@ -15,10 +16,9 @@
 using namespace prosper::gpu;
 
 static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
+TEST(RecompiledFragment, Contract) {
     printf("== test_recompiled_fragment ==\n");
     const uint32_t W = 64, H = 64;
 
@@ -27,12 +27,12 @@ int main() {
     const uint32_t ps[] = { 0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u };
     std::vector<uint32_t> frag = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]));
     CHECK(!frag.empty() && frag[0] == 0x07230203u, "recompiled RDNA2 pixel shader -> SPIR-V module");
-    if (frag.empty()) { printf("== FAIL ==\n"); return 1; }
+    if (frag.empty()) { printf("== FAIL ==\n"); FAIL() << "legacy early exit"; }
 
     std::vector<uint32_t> vert(kTriVertSpv, kTriVertSpv + sizeof(kTriVertSpv)/sizeof(kTriVertSpv[0]));
     std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vert, frag, W, H);
     CHECK(px.size() == (size_t)W * H * 4, "rendered with the recompiled fragment shader (pipeline accepted it)");
-    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: render failed ==\n"); return 1; }
+    if (px.size() != (size_t)W * H * 4) { printf("== FAIL: render failed ==\n"); FAIL() << "legacy early exit"; }
 
     auto at = [&](uint32_t x, uint32_t y) { return &px[((size_t)y * W + x) * 4]; };
     const uint8_t* c = at(W/2, H/2);   // triangle covers the center
@@ -1161,7 +1161,5 @@ int main() {
               "#3138: ABS applied AND the exponent honoured (green is 0.25, not 0 and not 1.0)");
     }
 
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
+    EXPECT_EQ(fails, 0);
 }

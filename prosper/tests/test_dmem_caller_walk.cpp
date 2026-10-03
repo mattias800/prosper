@@ -10,10 +10,11 @@
 // a failed test instead of taking the test binary down with it.
 
 #include <cstdint>
+#include <gtest/gtest.h>
 #include <cstdio>
 
 #if defined(_WIN32)
-int main() { printf("skip: POSIX-only (needs fork + mprotect)\nOK\n"); return 0; }
+TEST(DmemCallerWalk, Contract) { GTEST_SKIP() << "POSIX-only (needs fork + mprotect)"; }
 #else
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -23,11 +24,7 @@ namespace prosper {
 int dmem_caller_scan_slots_for_test(const volatile uint64_t* frame, int want);
 }
 
-static int failures = 0;
-static void check(bool ok, const char* name) {
-    printf("%s: %s\n", ok ? "PASS" : "FAIL", name);
-    if (!ok) failures++;
-}
+static void check(bool ok, const char* name) { EXPECT_TRUE(ok) << name; }
 
 constexpr int kScan = 160;   // the walk's own scan width
 
@@ -49,7 +46,7 @@ static int deep_scan(int depth, int want) {
     return prosper::dmem_caller_scan_slots_for_test(&here, want);
 }
 
-int main() {
+TEST(DmemCallerWalk, Contract) {
     // 1. A frame deep in the real thread stack permits the caller's full scan width.
     const int deep = deep_scan(32, kScan);     // ~16 KB below main's frame
     check(deep == kScan, "deep thread-stack frame permits the full 160-slot scan");
@@ -88,12 +85,5 @@ int main() {
     waitpid(pid, &st, 0);
     check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
           "walk beside a guard page clamps instead of faulting");
-    if (WIFSIGNALED(st))
-        printf("       child died by signal %d -- this is the #1755 crash\n", WTERMSIG(st));
-    else if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
-        printf("       child exit=%d (3=mmap 4=mprotect 5=clamp too wide)\n", WEXITSTATUS(st));
-
-    printf("%s\n", failures ? "FAILED" : "OK");
-    return failures ? 1 : 0;
 }
 #endif
