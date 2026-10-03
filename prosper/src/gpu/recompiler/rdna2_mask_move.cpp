@@ -64,9 +64,9 @@ bool emit_s_mov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
             return true;
         }
         if (has_low || has_high || !src_mask()) {
-            // A saved Bool mask is not raw numeric halves. A legal partial overwrite needs the
-            // preserved genuine half materialized before this transfer; that service is still
-            // missing. Allocation/scalar-initialization alone cannot supply it.
+            // PacketRawMasks materializes admitted complete ordinary saved pairs BEFORE a half
+            // overwrite. A remaining partial source has no reaching complete producer/words;
+            // allocation, scalar initialization or a stale Bool cannot supply its absent half.
             b.stage_reject_pc = in.pc;
             b.stage_reject_reason = "packet-exec-mask-source-words-unavailable";
             return false;
