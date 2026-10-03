@@ -12,6 +12,7 @@
 #define _WIN32_WINNT 0x0A00
 #endif
 #endif
+#include "hle/kernel/exc_pending.hpp"   // macOS raise payload table (#4324)
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/guest_thread_handle.hpp"   // Windows: guest-readable ScePthread objects
@@ -3976,33 +3977,24 @@ bool g_exc_log2 = false;
 volatile int* g_exc_counter = nullptr; // optional fork-safe raise counter (tests)
 #if defined(__linux__) || defined(__APPLE__)
 int  g_exc_sig = -1;
-#ifdef __APPLE__
-// Darwin has no pthread_sigqueue / RT-signal payload, so the exception TYPE travels through a
-// small async-signal-safe pending table keyed by the target pthread instead of si_value. A raise
-// claims a slot with CAS before pthread_kill; the handler (on the target thread) takes it back.
-// GC suspend/resume raises are sequential per target, so 16 slots is generous.
-struct ExcPending { std::atomic<uint64_t> tid{0}; std::atomic<int> type{0}; };
-ExcPending g_exc_pending[16];
-bool exc_pending_put(uint64_t tid, int type) {
-    for (auto& s : g_exc_pending) {
-        uint64_t z = 0;
-        if (s.tid.compare_exchange_strong(z, tid)) { s.type.store(type); return true; }
-    }
-    return false;
-}
-int exc_pending_take(uint64_t tid) {
-    for (auto& s : g_exc_pending)
-        if (s.tid.load() == tid) { int t = s.type.load(); s.tid.store(0); return t; }
-    return -1;
-}
-#endif
+// macOS carries the request type in exc_pending (hle/kernel/exc_pending.hpp, #4324).
+void exc_deliver(int type, void* uc_);
 void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
 #ifdef __APPLE__
     (void)si;
-    int type = exc_pending_take((uint64_t)pthread_self());   // pthread_self reads %gs TSD, never %fs
+    // pthread_self reads %gs TSD, never %fs. Plain signals COALESCE: two raises that reach this
+    // thread before it runs the handler arrive as ONE delivery, so drain every request pending for
+    // this thread rather than one -- otherwise the second stays in the table, undelivered and
+    // unacknowledged. A delivery with nothing pending is still reported (as dropped) once.
+    const uint64_t self = (uint64_t)pthread_self();
+    int type = exc_pending_take(self);
+    if (type < 0) { exc_deliver(type, uc_); return; }
+    do { exc_deliver(type, uc_); } while ((type = exc_pending_take(self)) >= 0);
 #else
-    int type = si->si_value.sival_int;
+    exc_deliver(si->si_value.sival_int, uc_);
 #endif
+}
+void exc_deliver(int type, void* uc_) {
     if (type < 0 || type >= 128 || !g_exc_handlers[type]) {
         if (g_exc_log2) {   // a suspend request that silently does NOTHING = an unstopped thread
             // %fs-safe: this handler can interrupt guest code running on the GUEST %fs, where host
@@ -5113,8 +5105,11 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
 #if defined(__linux__) || defined(__APPLE__)
     if (a0 && a1 < 128 && g_exc_handlers[a1]) {
 #ifdef __APPLE__
-        int qr = exc_pending_put((uint64_t)a0, (int)a1) ? pthread_kill((pthread_t)a0, g_exc_sig)
-                                                        : EAGAIN;   // pending table full
+        const size_t slot = exc_pending_put((uint64_t)a0, (int)a1);
+        int qr = slot ? pthread_kill((pthread_t)a0, g_exc_sig) : EAGAIN;   // pending table full
+        // A request whose signal was never sent must not keep its slot: a dead target (ESRCH)
+        // would otherwise leak one slot per raise until every later raise failed (#4324).
+        if (slot && qr != 0) exc_pending_release(slot, (uint64_t)a0);
 #else
         union sigval sv; sv.sival_int = (int)a1;
         int qr = pthread_sigqueue((pthread_t)a0, g_exc_sig, sv);

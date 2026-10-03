@@ -366,6 +366,50 @@ cmake --build prosper/build-mac-app --target prosper-app
 PROSPER_VULKAN_LIB="$PWD/.macos-vulkan/lib/libMoltenVK.dylib" ./prosper/build-mac-app/prosper-app --test-pattern
 ```
 
+### GC stop-the-world delivery on macOS — the pending-exception table (#4324)
+
+IL2CPP stops the world by calling `sceKernelRaiseException(thread, 0x1e)` on every attached thread
+back to back, then waits on one semaphore for one acknowledgement per raise. Darwin has no
+`pthread_sigqueue` payload, so the macOS path carries the request type in a pending table keyed by
+the target `pthread_t` and sends a plain `SIGUSR2`. That table held 16 entries. Under Rosetta the
+raiser outruns signal delivery: Hollow Knight: Silksong had 16 requests pending at once, the 17th
+raise returned `EAGAIN` (`0x80020023`), the guest still counted that thread, and
+`il2cpp_stop_gc_world` waited forever — an intermittent hang at a scene load, about 1 boot in 8
+unattended. Linux carries the type in the queued RT signal's payload, bounded only by
+`RLIMIT_SIGPENDING`, not by a 16-entry table.
+
+The table is now sized for a whole burst (1024 slots), a slot whose `pthread_kill` failed is
+released instead of leaked, and the handler drains every request pending for its thread, because
+plain signals coalesce and a second raise that lands before delivery was otherwise never run.
+`test_exc_raise_burst` forces both cases by blocking its targets' signals while raising.
+
+How it was found, for whoever debugs the next one: an I/O-free event ring (raise / take /
+handler-call / handler-return) read from the hung process with lldb. Three traps cost time:
+`PROSPER_EXCLOG` suppresses the hang (its `write()` in the signal handler slows the raiser enough
+for delivery to keep up — 0 hangs in 12 logged runs); an internal-linkage write-only array is
+eliminated by the optimizer (give a diagnostic ring external linkage); and `lldb --batch` stops
+executing its command file when the attach catches a thread mid-`%fs`-fault — use
+`lldb -p PID -s cmds -o quit < /dev/null`.
+
+### Ruled out — the macOS stop-the-world hang
+
+- **A lost wakeup in prosper's semaphore.** The stuck waiter's condvar sequence words showed no
+  broadcast since it began waiting, with `count = 22` already present: a legitimate wait for an
+  acknowledgement that never came. (#4324)
+- **Corrupted pthread objects (#707's class).** The stuck semaphore's mutex (`MUTZ`) and condvar
+  (`CONE`) signatures were valid. (#4324)
+- **The 16-slot table, judged from `PROSPER_EXCLOG` runs.** Those runs showed every raise
+  returning 0 — because the logging itself prevents the overflow. This entry was briefly recorded
+  as ruled out in #4324 and is retracted: the ring captured `EAGAIN` on exactly the threads that
+  never acknowledged. Do not judge timing defects from a logging run.
+- **`pthread_kill` succeeding against an exited thread on macOS.** A standalone x86_64 (Rosetta)
+  and arm64 probe: an exited, unjoined thread returns `ESRCH`. A probe result for this case, not
+  a guarantee for stale handles in general. (#4324)
+- **The GC signal nesting inside the `%fs` emulation handler.** Possible in principle (the SIGSEGV
+  handler's `sa_mask` is empty), but in 702 logged suspensions every interrupted context was a
+  thread parked in a libsystem wait. (#4324)
+- **The missing AJM decoder (FFmpeg disabled on macOS).** The title registers only ATRAC9. (#4324)
+
 ## Windows port status (2026-07-14) — Messenger reaches the first level natively
 
 The native MinGW build links and initializes the live Vulkan renderer, boots The Messenger through
