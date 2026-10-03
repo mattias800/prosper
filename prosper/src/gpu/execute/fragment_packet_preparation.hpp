@@ -1,5 +1,6 @@
 #pragma once
 #include "gpu/resources/shader_resources.hpp"
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -10,6 +11,7 @@ namespace prosper::gpu {
 struct RasterQuadInputs;
 struct FragmentPacketVgprRequirements;
 struct FragmentPacketMaskRequirements;
+struct FragmentPacketScalarReadRequirements;
 // A bounded immutable copy of the producing normalized binding contract. Only genuinely owned
 // buffer bytes are copied; live guest/image content never gains authority from nominal addresses.
 // Owned byte membership is not a fetch-PC/read-point, producer epoch or image/sampler witness.
@@ -35,6 +37,14 @@ struct FragmentPacketPreparation {
     // never asks for launch values; actual masked/peer/raw-export reads need runtime validity.
     std::shared_ptr<const FragmentPacketVgprRequirements> vgpr_requirements;
     std::shared_ptr<const FragmentPacketMaskRequirements> mask_requirements;
+    // Exact code demands plus observed descriptor words. These supply neither ordered byte reads
+    // nor source extent/alias/upload/completion authority; all live resource guards remain closed.
+    std::shared_ptr<const FragmentPacketScalarReadRequirements> scalar_read_requirements;
+    struct ScalarDescriptorObservation {
+        uint32_t site_index = 0;
+        std::array<uint32_t, 4> descriptor{};
+    };
+    std::vector<ScalarDescriptorObservation> scalar_descriptors;
     // This provenance/preflight slice cannot grant kernel or graphics admission.
     bool ready = false;
 };
@@ -42,4 +52,4 @@ struct FragmentPacketPreparation {
 // not establish host-subgroup pairing, guest coverage or attachment effects.
 std::shared_ptr<const FragmentPacketPreparation> prepare_fragment_packet_inputs(
     std::shared_ptr<const RasterQuadInputs>, bool producing_modules_match);
-} // namespace prosper::gpu
+}   // namespace prosper::gpu
