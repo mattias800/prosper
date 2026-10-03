@@ -135,6 +135,39 @@ class TestResolveEdgeCases(unittest.TestCase):
         result = resolve_one(addrs, keys, 0x1050)
         self.assertIn("OnlyMethod", result)
 
+    def test_large_utf8_tie_keeps_selection_and_reports_all_raw_candidates(self):
+        script_path = os.path.join(self.test_dir, "large-tie.json")
+        methods = [{'Address': 0x1000, 'Name': f'Tie.Method{i:04d}'}
+                   for i in range(2521)]
+        methods.extend([{'Address': 0x1000, 'Name': 'é.Type$$Method'},
+                        {'Address': 0x1000, 'Name': 'Ω.Type$$Method'},
+                        {'Address': 0x11000, 'Name': 'Unique.Next$$Run'}])
+        with open(script_path, 'w', encoding='utf-8') as stream:
+            json.dump({'ScriptMethod': list(reversed(methods))}, stream)
+        addrs, keys = load(script_path)
+        self.assertEqual(len(addrs), 2524)
+        self.assertEqual(addrs[2522], (0x1000, 'Ω.Type$$Method'))
+        for offset in (0, 7, 0x7fff):
+            with self.subTest(offset=offset):
+                self.assertEqual(resolve_one(addrs, keys, 0x1000 + offset),
+                                 f'Ω.Type$$Method  (+0x{offset:x}) (+2522 more at this address)')
+        self.assertEqual(resolve_one(addrs, keys, 0x9000),
+                         '<il2cpp runtime / no managed method at this offset>')
+        self.assertEqual(resolve_one(addrs, keys, 0x11000), 'Unique.Next$$Run  (+0x0)')
+
+    def test_identical_duplicate_rows_still_count_as_two_candidates(self):
+        script_path = os.path.join(self.test_dir, "duplicate-tie.json")
+        methods = [{'Address': 0x1000, 'Name': 'Duplicate$$Run'},
+                   {'Address': 0x1000, 'Name': 'Duplicate$$Run'},
+                   {'Address': 0x2000, 'Name': 'Unique$$Run'}]
+        with open(script_path, 'w', encoding='utf-8') as stream:
+            json.dump({'ScriptMethod': methods}, stream)
+        addrs, keys = load(script_path)
+        self.assertEqual(keys, [0x1000, 0x1000, 0x2000])
+        self.assertEqual(resolve_one(addrs, keys, 0x1001),
+                         'Duplicate$$Run  (+0x1) (+1 more at this address)')
+        self.assertEqual(resolve_one(addrs, keys, 0x2001), 'Unique$$Run  (+0x1)')
+
 
 class TestIntegration(unittest.TestCase):
     """Integration tests for complete workflow"""

@@ -872,6 +872,13 @@ if(TARGET prosper_core)
   # Runtime IL2CPP symbolication (#2551): name the C# method containing a live guest PC. The
   # fixture is committed and synthetic — no game dump, no Il2CppDumper — so this never degrades
   # into a silent skip. The binary doubles as the probe the agreement test drives.
+  # Tie reporting is a pure CPU resolver contract, independent of boot mappings or graphics.
+  prosper_add_gtest(test_il2cpp_ambiguity
+    SOURCES tests/host/symbols/test_il2cpp_ambiguity.cpp src/host/symbols/il2cpp_symbols.cpp
+    INCLUDES src tests
+    LIBRARIES Threads::Threads
+    PROPERTIES TIMEOUT 20)
+
   add_executable(test_il2cpp_symbols tests/host/symbols/test_il2cpp_symbols.cpp)
   target_include_directories(test_il2cpp_symbols PRIVATE tests)
   target_link_libraries(test_il2cpp_symbols PRIVATE prosper_core)

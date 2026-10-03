@@ -50,10 +50,13 @@ def load(path):
     return addrs, [a for a, _ in addrs]
 
 def resolve_one(addrs, keys, off):
+    """Select the last sorted record and report raw same-RVA records, including duplicates."""
     i = bisect.bisect_right(keys, off) - 1
     if i >= 0 and off - addrs[i][0] < NEAREST_WINDOW:
         a, name = addrs[i]
-        return f"{name}  (+0x{off - a:x})"
+        count = bisect.bisect_right(keys, a) - bisect.bisect_left(keys, a)
+        ambiguity = f" (+{count - 1} more at this address)" if count > 1 else ""
+        return f"{name}  (+0x{off - a:x}){ambiguity}"
     return "<il2cpp runtime / no managed method at this offset>"
 
 def emit_symtab(addrs, out_path, source):

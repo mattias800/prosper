@@ -38,8 +38,13 @@ WINDOW = 0x8000
 GENERIC_AT = 0x800000
 TIED_AT = 0x900000
 UTF8_AT = 0xd00000
+LARGE_TIED_AT = 0xe00000
+NEXT_AT = 0xe10000
+DUPLICATE_AT = 0xf00000
+LAST_TIED_NAME = 'Ω.Type$$Method'
 
-RESOLVED_RE = re.compile(r'^(.*)  \(\+0x([0-9a-f]+)\)$')
+RESOLVED_RE = re.compile(r'^(.*)  \(\+0x([0-9a-f]+)\)(?: \(\+([0-9]+) more at this address\))?$')
+RUNTIME_RE = re.compile(r'^(.*) \+0x([0-9a-f]+) candidates=([0-9]+) annotation=(.*)$')
 
 failures = 0
 
@@ -70,11 +75,20 @@ def synth_script_json(path):
     methods.append({'Address': TIED_AT, 'Name': 'Tied$$Method'})
     methods.append({'Address': TIED_AT, 'Name': 'Tied$$MethodZzz'})    # same address, later name
     methods.append({'Address': UTF8_AT, 'Name': 'Nämespace.Tÿpe$$Méthod'})
+    # Match the reported largest tied group with distinct synthetic records. ASCII names sort
+    # before both UTF-8 names, and Ω is the independently known last record in either ordering.
+    methods.extend({'Address': LARGE_TIED_AT, 'Name': f'Tie.Method{i:04d}'}
+                   for i in range(2521))
+    methods.extend([{'Address': LARGE_TIED_AT, 'Name': 'é.Type$$Method'},
+                    {'Address': LARGE_TIED_AT, 'Name': LAST_TIED_NAME},
+                    {'Address': NEXT_AT, 'Name': 'Unique.Next$$Run'},
+                    {'Address': DUPLICATE_AT, 'Name': 'Duplicate$$Run'},
+                    {'Address': DUPLICATE_AT, 'Name': 'Duplicate$$Run'}])
     # Entries without an Address are what resolve.py's load() filters out; include one so both
     # sides see the same post-filter record set rather than differing by it.
     methods.append({'Name': 'NoAddress$$Method'})
 
-    # The named checks below assert on WHICH method three specific addresses resolve to, so they
+    # The named checks below assert on WHICH method the anchor addresses resolve to, so they
     # are only meaningful while nothing else in the generated corpus sits at those addresses. The
     # generator's own arithmetic put a Sparse method on top of the UTF-8 one once already, and the
     # only symptom was one confusing failure naming a method the check had never heard of. Make
@@ -83,7 +97,8 @@ def synth_script_json(path):
     for m in methods:
         if 'Address' in m:
             counts[m['Address']] = counts.get(m['Address'], 0) + 1
-    expected = {GENERIC_AT: 1, TIED_AT: 2, UTF8_AT: 1}
+    expected = {GENERIC_AT: 1, TIED_AT: 2, UTF8_AT: 1, LARGE_TIED_AT: 2523,
+                NEXT_AT: 1, DUPLICATE_AT: 2}
     for addr, want in expected.items():
         if counts.get(addr, 0) != want:
             raise SystemExit('test_symtab_agreement: anchor 0x%x occurs %d time(s), expected %d — '
@@ -101,7 +116,7 @@ def probe_addresses(starts):
     probes = []
     for a in sorted(set(starts)):
         probes += [a, a + 1, a + WINDOW - 1, a + WINDOW]
-    probes += [0, 1, 0x1e3dff, UTF8_AT + WINDOW, 0xffffffff]
+    probes += [0, 1, 0x1e3dff, UTF8_AT + WINDOW, LARGE_TIED_AT + 7, 0xffffffff]
     return sorted(set(p for p in probes if p >= 0))
 
 
@@ -110,7 +125,8 @@ def run(args):
     from the locale: under LC_ALL=C a text-mode pipe decodes as ASCII and the run dies on the one
     record this test added to cover that case."""
     env = dict(os.environ, PYTHONIOENCODING='utf-8')
-    return subprocess.run(args, capture_output=True, encoding='utf-8', check=True, env=env).stdout
+    return subprocess.run(args, capture_output=True, encoding='utf-8', check=True,
+                          env=env, timeout=20).stdout
 
 
 def run_offline(script_path, probes):
@@ -118,20 +134,23 @@ def run_offline(script_path, probes):
     args = [sys.executable, RESOLVE, script_path] + ['0x%x' % p for p in probes]
     out = run(args)
     answers = {}
+    labels = {}
     for line in out.splitlines():
         if not line.strip():
             continue
         token, rest = line.split(None, 1)
         rva = int(token, 16)
         m = RESOLVED_RE.match(rest.strip())
-        answers[rva] = (m.group(1), int(m.group(2), 16)) if m else None
-    return answers
+        answers[rva] = (m.group(1), int(m.group(2), 16), int(m.group(3) or '0') + 1) if m else None
+        labels[rva] = rest.strip()
+    return answers, labels
 
 
 def run_runtime(binary, symtab, probes):
     args = [binary, '--probe', symtab] + ['0x%x' % p for p in probes]
     out = run(args)
     answers = {}
+    annotations = {}
     for line in out.splitlines():
         if not line.strip():
             continue
@@ -139,11 +158,16 @@ def run_runtime(binary, symtab, probes):
         rva = int(rva_text, 16)
         if rest.startswith('resolved '):
             body = rest[len('resolved '):]
-            name, _, off = body.rpartition(' +0x')
-            answers[rva] = (name, int(off, 16))
+            match = RUNTIME_RE.fullmatch(body)
+            if not match:
+                raise ValueError(f'malformed runtime probe record: {line!r}')
+            answers[rva] = (match.group(1), int(match.group(2), 16), int(match.group(3)))
+            annotations[rva] = match.group(4)
         else:
+            if not re.fullmatch(r'[a-z-]+ - candidates=0', rest):
+                raise ValueError(f'malformed unresolved runtime probe record: {line!r}')
             answers[rva] = None
-    return answers
+    return answers, annotations
 
 
 def compare(offline, runtime, probes):
@@ -202,8 +226,8 @@ def main(argv):
               'emitted header declares the window: %r' % header)
 
         probes = probe_addresses(starts)
-        offline = run_offline(script_path, probes)
-        runtime = run_runtime(binary, symtab, probes)
+        offline, labels = run_offline(script_path, probes)
+        runtime, annotations = run_runtime(binary, symtab, probes)
 
         check(len(offline) == len(probes) and len(runtime) == len(probes),
               'both sides answered all %d probes (offline=%d runtime=%d)'
@@ -224,7 +248,7 @@ def main(argv):
         # Named checks on the shapes, so a regression says WHICH rule broke rather than only that
         # some address disagreed.
         tie = runtime.get(TIED_AT)
-        check(tie is not None and tie[0] == 'Tied$$MethodZzz',
+        check(tie == ('Tied$$MethodZzz', 0, 2),
               'runtime takes the later name at a tied address: %r' % (tie,))
         check(offline.get(TIED_AT) == tie, '…and offline agrees: %r' % (offline.get(TIED_AT),))
         generic = runtime.get(GENERIC_AT)
@@ -234,14 +258,46 @@ def main(argv):
         check(utf8 is not None and utf8[0] == 'Nämespace.Tÿpe$$Méthod',
               'a non-ASCII name round-trips through the symtab: %r' % (utf8,))
         check(offline.get(UTF8_AT + WINDOW) is None and runtime.get(UTF8_AT + WINDOW) is None,
-              'both sides refuse an address one window past the last method')
+              'both sides refuse an address one window past the isolated UTF-8 method')
+
+        # Independent goldens prevent agreement from hiding the same omitted count or marker on
+        # both sides. Keep raw count/name/offset checks separate from their formatted labels.
+        for offset in (0, 7, WINDOW - 1):
+            address = LARGE_TIED_AT + offset
+            expected = (LAST_TIED_NAME, offset, 2523)
+            check(runtime.get(address) == expected,
+                  f'runtime reports all 2523 distinct UTF-8 candidates at +0x{offset:x}')
+            check(offline.get(address) == expected,
+                  f'offline reports all 2523 distinct UTF-8 candidates at +0x{offset:x}')
+            runtime_offset = f'+0x{offset:x}' if offset else ''
+            check(annotations.get(address) == ' ' + LAST_TIED_NAME + runtime_offset +
+                  ' (+2522 more at this address)',
+                  f'runtime annotation marks the 2523-way tie at +0x{offset:x}')
+            check(labels.get(address) == LAST_TIED_NAME + f'  (+0x{offset:x})' +
+                  ' (+2522 more at this address)',
+                  f'offline annotation marks the 2523-way tie at +0x{offset:x}')
+        check(runtime.get(LARGE_TIED_AT + WINDOW) is None and
+              offline.get(LARGE_TIED_AT + WINDOW) is None,
+              'both sides expire the large tied group at the exclusive window')
+        check(runtime.get(NEXT_AT) == ('Unique.Next$$Run', 0, 1) and
+              offline.get(NEXT_AT) == ('Unique.Next$$Run', 0, 1),
+              'the next distinct start resets the candidate count to one')
+        check(annotations.get(NEXT_AT) == ' Unique.Next$$Run' and
+              labels.get(NEXT_AT) == 'Unique.Next$$Run  (+0x0)',
+              'singleton labels retain their existing unmarked format')
+        check(runtime.get(DUPLICATE_AT) == ('Duplicate$$Run', 0, 2) and
+              offline.get(DUPLICATE_AT) == ('Duplicate$$Run', 0, 2),
+              'identical duplicate rows count as two raw candidates')
+        check(annotations.get(DUPLICATE_AT) == ' Duplicate$$Run (+1 more at this address)' and
+              labels.get(DUPLICATE_AT) == 'Duplicate$$Run  (+0x0) (+1 more at this address)',
+              'identical duplicate rows keep an explicit ambiguity marker')
 
         # MUTATION ARM 1 — the comparator can report a disagreement. Without this, a silently
         # broken compare() (or a parse that produced two empty dicts) would make every agreement
         # check above pass while proving nothing at all.
         salted = dict(runtime)
         victim = next(p for p in probes if runtime.get(p) is not None)
-        salted[victim] = ('DeliberatelyWrong$$Name', 0)
+        salted[victim] = ('DeliberatelyWrong$$Name', 0, 1)
         forced = compare(offline, salted, probes)
         check(len(forced) == 1 and forced[0][0] == victim,
               'the comparator DOES report a planted disagreement at 0x%x: %r' % (victim, forced))
