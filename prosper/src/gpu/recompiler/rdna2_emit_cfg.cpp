@@ -32,6 +32,7 @@
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
+#include "gpu/recompiler/rdna2_dpp_row_ror8.hpp"
 #include "gpu/recompiler/fragment_loop_mask.hpp"
 #include "gpu/recompiler/rdna2_entry_vcc.hpp"
 #include "gpu/recompiler/fragment_packet_mask_requirements.hpp"
@@ -1740,6 +1741,7 @@ bool emit_cfg_state_machine(
     std::unordered_set<uint32_t> compute_dpp_row_ror8_pcs;
     std::unordered_map<uint32_t, uint32_t> compute_dpp_ror8_event_for_pc;
     std::set<int> compute_dpp_row_ror8_dsts;
+    bool has_compute_dpp_row_fadd = false;
     uint32_t next_compute_dpp_event = 1;
     std::unordered_set<uint32_t> compute_dpp_add_row_mask_pcs;
     std::unordered_map<uint32_t, uint32_t> portable_mask_ffbh_event_for_pc;
@@ -1819,6 +1821,7 @@ bool emit_cfg_state_machine(
                 start_set.insert(ins[i + 1].pc);
         }
         if (compute_dpp_row_ror8(in)) {
+            has_compute_dpp_row_fadd |= dpp_row_ror8_op(in) == DppRowRor8Op::AddF32;
             compute_dpp_row_ror8_pcs.insert(in.pc);
             compute_dpp_ror8_event_for_pc.emplace(
                 in.pc, next_compute_dpp_event++);
@@ -5285,17 +5288,25 @@ bool emit_cfg_state_machine(
             const auto old = state.vreg.find(dst);
             const auto src0 = state.vreg.find(dpp_row_ror8->src[0].value);
             const uint32_t old_value = old == state.vreg.end() ? zero : old->second;
-            const uint32_t src0_value = src0 == state.vreg.end() ? zero : src0->second;
+            uint32_t src0_value = src0 == state.vreg.end() ? zero : src0->second;
             uint32_t src1_value = zero;
             if (dpp_row_ror8->n_src > 1) {
                 const auto src1 = state.vreg.find(dpp_row_ror8->src[1].value);
                 src1_value = src1 == state.vreg.end() ? zero : src1->second;
             }
+            if (operation == DppRowRor8Op::AddF32) {
+                bool source_ok = true;
+                src0_value =
+                    operand_bits(b, state, *dpp_row_ror8, dpp_row_ror8->src[0], &source_ok);
+                src1_value =
+                    operand_bits(b, state, *dpp_row_ror8, dpp_row_ror8->src[1], &source_ok);
+                if (!source_ok)
+                    return reject_cfg(dpp_row_ror8->pc, "dpp-row-fadd-source-unresolved");
+            }
             if (b.native_subgroup_size) {
                 // One exact native subgroup is one guest wave and this case is subgroup-uniform.
-                // FI=0 makes an EXEC-inactive permuted source read as zero. Every stride in this
-                // family XORs only bits 0..3, so the source is always an in-range lane of the same
-                // 16-lane row and BOUND_CTRL does not decide this case.
+                // Every stride stays inside its 16-lane row. Encoded BC1/FI0 supplies zero when
+                // the permuted source's EXEC bit is inactive; destination EXEC is independent.
                 uint32_t valid_source = 0;
                 const uint32_t rotated = b.subgroup_row_xor(
                     src0_value, state.exec,
@@ -5307,6 +5318,8 @@ bool emit_cfg_state_machine(
                     result = b.fext2(Glsl_NMin, bounded, src1_value);
                 else if (operation == DppRowRor8Op::MaxF32)
                     result = b.fext2(Glsl_NMax, bounded, src1_value);
+                else if (operation == DppRowRor8Op::AddF32)
+                    result = b.fbin(Op_FAdd, bounded, src1_value);
                 state.vreg[dst] = b.sel(state.exec, result, old_value);
                 for (auto& vg : state.vgpr_lane_slots)
                     if (vg.first == dst) for (auto& slot : vg.second) slot.second = zero;
@@ -6081,97 +6094,15 @@ bool emit_cfg_state_machine(
             dpp_value_base, dpp_metadata_base, compute_dpp_row_shr_dsts, vv, lv, lmv))
         return reject_cfg(0, "missing-dpp-row-shr-dst");
 
-    // Portable compute DPP ROW_ROR:8 common phase. This is deliberately separate from the ROW_SHR
-    // add phase above: each phase publishes its own pending state, consumes it between two workgroup
-    // barriers, and only then permits the other operation to reuse the scratch planes. Event IDs
-    // distinguish static sites; the operation tag distinguishes MOV/MIN/MAX semantics per invocation.
-    if (has_portable_compute_dpp_ror8) {
-    const uint32_t dpp_pending = b.load_function(b.t_bool, dpp_ror8_pending_var);
-    const uint32_t dpp_active = b.load_function(b.t_bool, dpp_ror8_active_var);
-    const uint32_t dpp_src0 = b.load_function(b.t_u32, dpp_ror8_src0_var);
-    const uint32_t dpp_src1 = b.load_function(b.t_u32, dpp_ror8_src1_var);
-    const uint32_t dpp_operation = b.load_function(b.t_u32, dpp_ror8_op_var);
-    const uint32_t dpp_event = b.load_function(b.t_u32, dpp_ror8_event_var);
-    b.cfg_scratch_store(
-        b.ibin(Op_IAdd, b.uconst(dpp_value_base), b.linear_localid), dpp_src0);
-    const uint32_t dpp_metadata = b.sel(
-        dpp_pending,
-        b.ibin(Op_BitwiseOr,
-               b.ibin(Op_ShiftLeftLogical, dpp_event, b.uconst(1)),
-               b.sel(dpp_active, b.uconst(1), zero)),
-        zero);
-    b.cfg_scratch_store(
-        b.ibin(Op_IAdd, b.uconst(dpp_metadata_base), b.linear_localid),
-        dpp_metadata);
-    b.barrier();
-
-    // XOR 8 exchanges the two eight-lane halves without crossing an architectural DPP16 row.
-    // This uses guest linear-local order, not the implementation-defined Vulkan subgroup lane ID.
-    const uint32_t dpp_rotated_index = b.ibin(
-        Op_BitwiseXor, b.linear_localid, b.uconst(8));
-    const uint32_t dpp_source_in_bounds = b.ucmp(
-        Op_ULessThan, dpp_rotated_index, b.uconst(b.local_count));
-    // A partial final DPP16 row has no invocation to initialize the rotated slot. Address this
-    // lane's initialized placeholder and let FI=0's validity gate supply zero for the missing peer.
-    const uint32_t dpp_source_index = b.sel(
-        dpp_source_in_bounds, dpp_rotated_index, b.linear_localid);
-    const uint32_t dpp_rotated = b.cfg_scratch_load(
-        b.ibin(Op_IAdd, b.uconst(dpp_value_base), dpp_source_index));
-    const uint32_t dpp_source_metadata = b.cfg_scratch_load(
-        b.ibin(Op_IAdd, b.uconst(dpp_metadata_base), dpp_source_index));
-    const uint32_t dpp_source_event = b.ibin(
-        Op_ShiftRightLogical, dpp_source_metadata, b.uconst(1));
-    const uint32_t dpp_source_active = b.ucmp(
-        Op_INotEqual,
-        b.ibin(Op_BitwiseAnd, dpp_source_metadata, b.uconst(1)), zero);
-    const uint32_t dpp_valid_source = b.land(
-        dpp_source_in_bounds,
-        b.land(dpp_source_active,
-               b.ucmp(Op_IEqual, dpp_source_event, dpp_event)));
-    // FI=0 requires an EXEC-active source. BOUND_CTRL=1 supplies zero when that source is invalid,
-    // but the active destination still writes the operation's result. MOV uses the bounded source;
-    // MIN/MAX combine it with the destination lane's unpermuted SRC1.
-    const uint32_t dpp_bounded = b.sel(dpp_valid_source, dpp_rotated, zero);
-    uint32_t dpp_result = dpp_bounded;
-    dpp_result = b.sel(
-        b.ucmp(Op_IEqual, dpp_operation,
-               b.uconst(static_cast<uint32_t>(DppRowRor8Op::MinF32))),
-        b.fext2(Glsl_NMin, dpp_bounded, dpp_src1), dpp_result);
-    dpp_result = b.sel(
-        b.ucmp(Op_IEqual, dpp_operation,
-               b.uconst(static_cast<uint32_t>(DppRowRor8Op::MaxF32))),
-        b.fext2(Glsl_NMax, dpp_bounded, dpp_src1), dpp_result);
-    const uint32_t dpp_write = b.land(dpp_pending, dpp_active);
-    const uint32_t dpp_dst = b.load_function(b.t_u32, dpp_ror8_dst_var);
-    for (int reg : compute_dpp_row_ror8_dsts) {
-        const auto kv = vv.find(reg);
-        if (kv == vv.end()) return reject_cfg(0, "missing-dpp-row-ror8-dst");
-        const uint32_t selected = b.land(
-            dpp_write, b.ucmp(Op_IEqual, dpp_dst,
-                              b.uconst(static_cast<uint32_t>(reg))));
-        const uint32_t old = b.load_function(b.t_u32, kv->second);
-        b.store_function(kv->second, b.sel(selected, dpp_result, old));
-    }
-    // A physical destination definition invalidates scalar lane aliases even when EXEC suppresses
-    // this invocation's data write, matching predicate_write and the existing DPP add phase.
-    for (const auto& kv : lv) {
-        if (!compute_dpp_row_ror8_dsts.contains(kv.first.first)) continue;
-        const uint32_t selected = b.land(
-            dpp_pending, b.ucmp(Op_IEqual, dpp_dst,
-                                b.uconst(static_cast<uint32_t>(kv.first.first))));
-        const uint32_t old = b.load_function(b.t_u32, kv.second);
-        b.store_function(kv.second, b.sel(selected, zero, old));
-    }
-    for (const auto& kv : lmv) {
-        if (!compute_dpp_row_ror8_dsts.contains(kv.first.first)) continue;
-        const uint32_t selected = b.land(
-            dpp_pending, b.ucmp(Op_IEqual, dpp_dst,
-                                b.uconst(static_cast<uint32_t>(kv.first.first))));
-        const uint32_t old = b.load_function(b.t_bool, kv.second);
-        b.store_function(kv.second, b.bsel(selected, no, old));
-    }
-    b.barrier();
-    }
+    // ROW_ROR has its own event-isolated phase before another service reuses these planes.
+    if (has_portable_compute_dpp_ror8 &&
+        !emit_portable_compute_dpp_row_ror8_phase(
+            b,
+            {dpp_ror8_pending_var, dpp_ror8_active_var, dpp_ror8_src0_var, dpp_ror8_src1_var,
+             dpp_ror8_op_var, dpp_ror8_dst_var, dpp_ror8_event_var},
+            dpp_value_base, dpp_metadata_base, compute_dpp_row_ror8_dsts, vv, lv, lmv,
+            has_compute_dpp_row_fadd))
+        return reject_cfg(0, "missing-dpp-row-ror8-dst");
 
     // MBCNT common phase. Cases publish an event-tagged mask bit and accumulator, but never emit a
     // barrier themselves. Every invocation—including ended waves and lanes currently at a different
@@ -6742,6 +6673,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::DS && in.opcode == kDsOpcodeBpermuteB32;
         });
+    const bool compute_cfg_row_fadd =
+        b.is_compute && needs_compute_dpp_row_fadd_dispatcher(ins, b.native_subgroup_size);
     const bool compute_cfg_row_maximum =
         b.is_compute && std::any_of(ins.begin(), ins.end(), is_inplace_vmax_u32_dpp_row_shr) &&
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
@@ -6768,9 +6701,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     // barrier remains uniform while the final phase can use the ordinary CFG dispatcher.
     if (b.is_compute) {
         const BarrierPhasedCompute phased = analyze_barrier_phased_compute(ins);
-        if (phased.found && (phased.guarded || initial_dispatch_active || force_barrier_phases ||
-                             portable_compute_mask_reduction || portable_compute_readfirstlane ||
-                             portable_compute_bpermute || compute_cfg_row_maximum)) {
+        if (phased.found &&
+            (phased.guarded || initial_dispatch_active || force_barrier_phases ||
+             portable_compute_mask_reduction || portable_compute_readfirstlane ||
+             portable_compute_bpermute || compute_cfg_row_maximum || compute_cfg_row_fadd)) {
             // Every phase shares one immutable Workgroup OpTypeArray. Size it from the complete
             // phased stream before the first dispatcher: a later portable DPP operation needs a
             // second per-lane plane even when the earlier phase needed only votes/liveness.
@@ -6898,7 +6832,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             exp_fn, code, dwords, initial_dispatch_active, true);
     if (allow_cfg_dispatcher &&
         (portable_compute_mask_reduction || portable_compute_readfirstlane ||
-         portable_compute_bpermute || compute_cfg_row_maximum) &&
+         portable_compute_bpermute || compute_cfg_row_maximum || compute_cfg_row_fadd) &&
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) { return in.is_end; })) {
         // Do this before the counted-loop prefix can narrow EXEC: portable wave services need
         // a common host barrier site, not an invocation-local structured loop body.
