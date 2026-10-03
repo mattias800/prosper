@@ -2059,11 +2059,17 @@ if(TARGET prosper_core)
   # PROSPER_BOOTPHASE. Deliberately registered outside the PROSPER_DIAGNOSTICS block: the property
   # under test is that the default build — the one everybody actually runs — can be made to say
   # where boot_program() stopped.
-  # Which bundled support PRXs are preloaded at all. Pure policy: no dump, no SELF parser, no
-  # filesystem — so both the DROP and the KEEP direction are checkable in ordinary CI.
+  # Bundled support PRX policy and actual candidate discovery over synthetic module files.
+  prosper_add_gtest(test_module_entry_abi
+    SOURCES tests/host/image/test_module_entry_abi.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_support_modules
-    SOURCES tests/loader/test_support_modules.cpp src/loader/support_modules.cpp
-    INCLUDES src)
+    SOURCES tests/loader/test_support_modules.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core
+    PROPERTIES ENVIRONMENT_MODIFICATION
+      "PROSPER_NO_PLUGIN_AUTOLINK=unset:")
 
   # Which preloaded modules are started with a real SCE module-param descriptor. Pure policy over
   # the fixed guest base map: no dump, no SELF parser, no filesystem — so both the inclusion and the
