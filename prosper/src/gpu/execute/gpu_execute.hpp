@@ -1343,7 +1343,11 @@ enum class LiveTargetPixelFormat : uint8_t {
 struct LiveTargetSnapshot {
     uint32_t width = 0, height = 0;
     LiveTargetPixelFormat format = LiveTargetPixelFormat::Rgba8Unorm;
-    std::shared_ptr<const std::vector<uint8_t>> pixels;
+    std::shared_ptr<const std::vector<uint8_t>> pixels;  // canonical host order, as rendered
+    // The guest stores this target as BGRA while `pixels` are canonical RGBA8 (#4291). A consumer
+    // that decodes the bytes as GUEST memory (live compute) must swap R and B; one that shows the
+    // rendered picture (replay dumps, hashes) must not.
+    bool component_order_bgra = false;
 };
 using LiveTargetReaderFn = std::function<bool(uint64_t gpu_addr, LiveTargetSnapshot& snapshot)>;
 void set_live_target_reader(LiveTargetReaderFn fn);
@@ -1417,6 +1421,10 @@ struct LiveTargetImageImport {
     bool transfer_dst = false;
     // A typed color copy may borrow only images created with TRANSFER_SRC usage.
     bool transfer_src = false;
+    // The guest stores this target as BGRA (CB_COLOR ALT) while the renderer keeps it as canonical
+    // RGBA8, so the guest's X and Z components are the host image's B and R (#4291). A sampled
+    // view composes the swap into its selector; a raw copy or seed cannot and must decline.
+    bool component_order_bgra = false;
     bool valid() const { return image && device && width && height; }
 };
 
