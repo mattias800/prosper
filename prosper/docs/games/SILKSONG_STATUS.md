@@ -70,6 +70,20 @@ PROSPER_GPU_CAPTURE_COMPUTE_ADDR=<copy program> PROSPER_GPU_CAPTURE_MIN_DRAWS=50
 `gpu_replay --recompile-raw --dump-post-compute-resource 0:6 out.bin <capture>`. Before the fix
 `out.bin` is all zero. After it, the rectangle the dispatch copies holds an anti-aliased glyph.
 
+## Why the boot sequence was a white screen
+
+The Team Cherry logo and the autosave notice rendered as a solid white screen for the first ~80 s
+(observed on macOS; nothing in the cause is platform-specific). Every stencil-mask pass over the
+scanout is preceded by a `CB_COLOR_CONTROL.MODE = DCC_DECOMPRESS` draw: a colour-block metadata
+operation whose pixel export the hardware ignores. AGC binds a constant-export helper program for
+it, and prosper recognised only one helper, as an exact word sequence (`v_mov_b32 v0, 0`; export
+R,G). Silksong's helper is a second variant — `v_mov_b32 v0, 0x3c003c00` (two fp16 1.0); compressed
+RGBA export — so it ran as an ordinary draw and wrote 1.0 over the whole scanout before every mask
+pass. `gpu/execute/dcc_helper_program.hpp` now lists both programs, exactly (a structural "constant
+export" rule would also match ordinary solid-colour fills, which must still draw under a stale
+MODE). Found with an offline replay of an F9-style bundle (`PROSPER_GRAB_BUNDLE_AT_FRAME`), reading
+the scanout by address after each operation (`--output-target-after OP:ADDR`).
+
 ## Ruled out
 
 - **The missing menu text is dropped vertex shaders.** #4120's lead was 6,850 vertex-recompile draw
@@ -90,3 +104,12 @@ PROSPER_GPU_CAPTURE_COMPUTE_ADDR=<copy program> PROSPER_GPU_CAPTURE_MIN_DRAWS=50
   make the destination non-arrayed, float, or both still wrote nothing. Forcing a constant store
   wrote exactly the dispatch's 22x33 glyph rectangle, which separated "the write lands" from "the
   data is zero". (#4120)
+- **The white boot screen is MoltenVK writing an undefined colour.** The hypothesis: the existing
+  DCC path replaces the helper with a null-export fragment but leaves the colour write mask enabled,
+  which Vulkan leaves undefined. On MoltenVK that path preserves the target (`test_gpu_execute`'s
+  DCC checks pass there unmodified); the white came from the unrecognised second helper running as
+  an ordinary draw.
+- **Reading a replay's colour target by extent.** `--draw-steps-target 1920x1080` attributed the
+  white to a compute dispatch, because that dispatch writes a second 1920x1080 image; selecting the
+  scanout by address (`--output-target-after OP:ADDR`) showed the DCC draw. When two targets share
+  an extent, select by address.
