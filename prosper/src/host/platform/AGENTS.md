@@ -2,8 +2,8 @@
 
 The small pieces of *host* behaviour that the core needs but that must not drag a window system, a
 graphics API, or a frontend into `prosper_core`: cooperative lifecycle signals, a precise sleep, the
-POSIX shims Windows lacks, a raw-syscall escape hatch, and `immortal.hpp` for objects that must
-outlive static destruction.
+POSIX shims Windows lacks, a raw-syscall escape hatch, `host_crt.hpp` (which C runtime's dialect
+to spell a request in), and `immortal.hpp` for objects that must outlive static destruction.
 
 The unifying constraint is the dependency arrow `FRONTEND_APP.md` describes: everything here is
 callable from `prosper_core`, from the offscreen backend, from `boot_trace`, from `tools/screenshot`

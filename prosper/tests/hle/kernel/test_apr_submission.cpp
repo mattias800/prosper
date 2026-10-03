@@ -15,8 +15,9 @@ namespace prosper {
 uint32_t prosper_apr_register(const std::string&, uint64_t);
 }
 using namespace prosper;
-using GuestReadFile = uint64_t(PROSPER_SYSV_ABI *)(uint64_t,uint64_t,uint64_t,uint64_t,
-                                                 uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+// The stub is a GUEST entry point, so on Windows the host must call it with the System V ABI.
+using GuestReadFile = uint64_t(PROSPER_GUEST_ABI *)(uint64_t,uint64_t,uint64_t,uint64_t,
+                                                  uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
 namespace {
 uint64_t ptr(const void* p) { return reinterpret_cast<uint64_t>(p); }
 class AprSubmission : public testing::Test {
@@ -34,8 +35,17 @@ protected:
         ASSERT_EQ(std::fwrite(expected.data(), 1, expected.size(), f), expected.size());
         ASSERT_EQ(std::fclose(f), 0);
         file_id = prosper_apr_register(path, expected.size());
-        std::string error;
-        ASSERT_TRUE(install_stubs({{"libSceAmpr","mQ16-QdKv7k"}}, 0x720000000ull, 96, &error)) << error;
+        // install_stubs claims a fixed aperture, and every platform refuses a second claim of the
+        // same base, so a direct all-cases run failed from its second case. Every case needs the same
+        // one slot: install it once. The slot vector is static because dispatch keeps a pointer to it.
+        static const std::vector<ImportSlot> slots{{"libSceAmpr","mQ16-QdKv7k"}};
+        static const std::string install_error = [] {
+            std::string error;
+            if (install_stubs(slots, 0x720000000ull, 96, &error))
+                return std::string();
+            return error.empty() ? std::string("install_stubs failed") : error;
+        }();
+        ASSERT_TRUE(install_error.empty()) << install_error;
         read = reinterpret_cast<GuestReadFile>(stub_addr(0));
         reset(ptr(cb.data()), 0, 0, 0, 0, 0);
         output.fill(0xa5);

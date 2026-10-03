@@ -1519,6 +1519,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             const prosper::gpu::LiveRenderPhase phase = prosper::gpu::live_render_phase();
             static const auto& write_watch_promotion_budget_bytes = callback_state->write_watch_promotion_budget_bytes();
             auto& callback_thread_state = CallbackThreadState::current();
+            auto* single_submit_frame =
+                pertarget ? nullptr : &callback_thread_state.single_framebuffer_submit_frame();
+            if (single_submit_frame)
+                single_submit_frame->begin_span(phase.first_span, phase.source_submit, w, h);
             static thread_local auto& write_watch_promotion_budget = callback_thread_state.write_watch_promotion_budget();
             if (phase.first_span)
                 write_watch_promotion_budget.reset(write_watch_promotion_budget_bytes);
@@ -1571,6 +1575,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 g_force_this_submit = false;
             }
             if (g_this_submit > g_render_last) {
+                if (single_submit_frame && phase.final_span) single_submit_frame->reset();
                 if (!items.empty())
                     prosper::test::backend_failed_publication_generation().fetch_add(
                         1, std::memory_order_release);
@@ -1674,6 +1679,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         (long long)elapsed_ms, g_this_submit);
             }
             if ((g_this_submit < g_render_first || before_delay) && !g_force_this_submit) {
+                if (single_submit_frame && phase.final_span) single_submit_frame->reset();
                 // The renderer deliberately omitted this producer. A later forced/delayed span
                 // must not consume its guest backing as a successfully published current epoch.
                 // Successful nonfinal callbacks may also return no pixels; only this explicit
@@ -2060,6 +2066,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         for (const auto& it : items) fprintf(stderr, " 0x%llx", (unsigned long long)it.color0_base);
                         fprintf(stderr, ") px_nonzero=%zu cache_size=%zu\n", nz, g_rtt.size()); }
                 }
+                auto selected = single_submit_frame->select(
+                    phase.final_span, !items.empty(), {selected_pixels, selected_source_submit});
+                selected_pixels = std::move(selected.pixels);
+                selected_source_submit = selected.source_submit;
             }
             if (timing_enabled)
                 pending_timing.pass_ms += std::chrono::duration<double, std::milli>(
