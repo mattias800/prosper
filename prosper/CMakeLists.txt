@@ -1339,6 +1339,23 @@ if(TARGET prosper_core)
     SOURCES tests/hle/test_freebsd_qsort.cpp
     LIBRARIES prosper_core)
 
+  # Batch 2: strncmp/strnlen/strrchr/memset/sscanf FreeBSD contracts.
+  prosper_add_gtest(test_freebsd_strncmp
+    SOURCES tests/hle/test_freebsd_strncmp.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_freebsd_strnlen
+    SOURCES tests/hle/test_freebsd_strnlen.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_freebsd_strrchr
+    SOURCES tests/hle/test_freebsd_strrchr.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_freebsd_memset
+    SOURCES tests/hle/test_freebsd_memset.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_freebsd_sscanf
+    SOURCES tests/hle/test_freebsd_sscanf.cpp
+    LIBRARIES prosper_core)
+
   # #2081 FALSE SUCCESS: an unregistered NID answers the dispatcher's 0, which for an SCE_OK
   # contract is a success report over an out-parameter nothing wrote. Pure, no game dump.
   prosper_add_gtest(test_false_success_nids
