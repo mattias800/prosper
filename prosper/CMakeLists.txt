@@ -835,6 +835,11 @@ if(TARGET prosper_core)
              COMMAND test_nid "${GAME_DUMP}/eboot.bin")
   endif()
 
+  # Dump-independent golden vectors pin NID hashing in the default unit-test set.
+  prosper_add_gtest(test_nid_vectors
+    SOURCES tests/hle/dispatch/test_nid_vectors.cpp
+    LIBRARIES prosper_core)
+
   # Split-T# provenance proof (#4197): pure decoder/fold cases, no dump.
   # #4120/#4274: storage-image DST_SEL routing rules (pure).
   prosper_add_gtest(test_storage_dst_sel
