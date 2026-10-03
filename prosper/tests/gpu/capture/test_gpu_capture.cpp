@@ -38,6 +38,18 @@ alignas(256) static const uint32_t kDiagnosticMainVs[] = {
 alignas(256) static const uint32_t kDiagnosticBadPs[] = {
     0x06000300u, 0xbf820005u, 0xBF810000u,
 };
+// Realized replay positives need genuine linked provenance and a complete fragment program.
+// Keep the ordinary diagnostic VS and out-of-range PS separately for refusal/failed-stage arms.
+alignas(256) static const uint32_t kReplayPrologVs[] = {
+    0xbf800000u,
+    0xbe802006u, // NOP; terminal SETPC s[6:7] to the retained main
+};
+alignas(256) static const uint32_t kReplayPs[] = {
+    0x7e000280u,
+    0xf8001801u,
+    0u,
+    0xbf810000u, // MOV v0,0; EXP MRT0; END
+};
 alignas(256) static const uint32_t kDiagnosticCompute[] = {
     0xbf810000u, // s_endpgm
 };
@@ -141,6 +153,8 @@ int main(int argc, char** argv) {
         if (const size_t read = read_shader(kDiagnosticVs, sizeof(kDiagnosticVs))) return read;
         if (const size_t read = read_shader(kDiagnosticMainVs, sizeof(kDiagnosticMainVs))) return read;
         if (const size_t read = read_shader(kDiagnosticBadPs, sizeof(kDiagnosticBadPs))) return read;
+        if (const size_t read = read_shader(kReplayPrologVs, sizeof(kReplayPrologVs))) return read;
+        if (const size_t read = read_shader(kReplayPs, sizeof(kReplayPs))) return read;
         if (const size_t read = read_shader(kDiagnosticCompute, sizeof(kDiagnosticCompute))) return read;
         if (const size_t read = read_shader(kDiagnosticPcrelVs, sizeof(kDiagnosticPcrelVs))) return read;
         if (addr < 0x1000 || addr >= 0x1000 + memory.size()) return 0;
@@ -169,9 +183,9 @@ int main(int argc, char** argv) {
     table->resources = {a, b, dcc};
 
     DrawItem draw; draw.vs = {0x07230203, 1, 2}; draw.fs = {0x07230203, 3}; draw.vrt = table;
-    draw.vs_guest_addr = reinterpret_cast<uint64_t>(kDiagnosticVs);
+    draw.vs_guest_addr = reinterpret_cast<uint64_t>(kReplayPrologVs);
     draw.vs_chain_guest_addr = reinterpret_cast<uint64_t>(kDiagnosticMainVs);
-    draw.fs_guest_addr = reinterpret_cast<uint64_t>(kDiagnosticBadPs);
+    draw.fs_guest_addr = reinterpret_cast<uint64_t>(kReplayPs);
     draw.vertex_lds_dwords = 2176;
     draw.has_pixel_inputs = true;
     draw.pixel_inputs.valid_mask = 3;
@@ -261,18 +275,40 @@ int main(int argc, char** argv) {
     CHECK(captured.draws[0].raw_draw_modifier == 0x1122334455667788ull &&
           captured.draws[0].vertex_offset == -37,
           "capture retains the draw modifier and GE_INDX_OFFSET draw parameter");
-    CHECK(captured.raw_shader_versions.size() == 3 &&
-          captured.draws[0].vs_raw_shader_index < captured.raw_shader_versions.size() &&
-          captured.draws[0].fs_raw_shader_index < captured.raw_shader_versions.size() &&
-          captured.draws[0].vs_chain_raw_shader_index < captured.raw_shader_versions.size() &&
-          captured.raw_shader_versions[captured.draws[0].vs_raw_shader_index].words ==
-              std::vector<uint32_t>(std::begin(kDiagnosticVs), std::end(kDiagnosticVs)) &&
-          captured.raw_shader_versions[captured.draws[0].fs_raw_shader_index].words ==
-              std::vector<uint32_t>(std::begin(kDiagnosticBadPs), std::end(kDiagnosticBadPs)) &&
-          captured.raw_shader_versions[captured.draws[0].vs_chain_raw_shader_index].words ==
-              std::vector<uint32_t>(std::begin(kDiagnosticMainVs), std::end(kDiagnosticMainVs)) &&
-          captured.draws[0].vertex_lds_dwords == 2176,
-          "realized draw captures exact bounded linked VS, FS, and graphics-LDS state");
+    CHECK(
+        captured.raw_shader_versions.size() == 3 &&
+            captured.draws[0].vs_raw_shader_index < captured.raw_shader_versions.size() &&
+            captured.draws[0].fs_raw_shader_index < captured.raw_shader_versions.size() &&
+            captured.draws[0].vs_chain_raw_shader_index < captured.raw_shader_versions.size() &&
+            captured.raw_shader_versions[captured.draws[0].vs_raw_shader_index].words ==
+                std::vector<uint32_t>(std::begin(kReplayPrologVs), std::end(kReplayPrologVs)) &&
+            captured.raw_shader_versions[captured.draws[0].fs_raw_shader_index].words ==
+                std::vector<uint32_t>(std::begin(kReplayPs), std::end(kReplayPs)) &&
+            captured.raw_shader_versions[captured.draws[0].vs_chain_raw_shader_index].words ==
+                std::vector<uint32_t>(std::begin(kDiagnosticMainVs), std::end(kDiagnosticMainVs)) &&
+            captured.draws[0].vertex_lds_dwords == 2176,
+        "realized draw captures exact bounded linked VS, FS, and graphics-LDS state");
+    for (bool malformed_chain : {true, false}) {
+        auto malformed_draw = draw;
+        if (malformed_chain)
+            malformed_draw.vs_guest_addr = reinterpret_cast<uint64_t>(kDiagnosticVs);
+        else
+            malformed_draw.fs_guest_addr = reinterpret_cast<uint64_t>(kDiagnosticBadPs);
+        GpuCaptureFile malformed_capture, malformed_decoded;
+        GpuReplayFrame malformed_replay;
+        std::vector<uint8_t> malformed_bytes;
+        CHECK(capture_draw_items({malformed_draw}, meta, reader, malformed_capture, error) &&
+                  serialize_gpu_capture(malformed_capture, malformed_bytes, error) &&
+                  deserialize_gpu_capture(malformed_bytes, malformed_decoded, error) &&
+                  !materialize_gpu_replay(malformed_decoded, malformed_replay, error) &&
+                  malformed_replay.items.empty() &&
+                  error ==
+                      (malformed_chain
+                           ? "logical-wave replay linked vertex provenance unavailable stage=vs"
+                           : "logical-wave replay original decode unavailable stage=fs pc=1"),
+              "stored replay cannot erase malformed linked provenance or an out-of-range original "
+              "branch");
+    }
     CHECK(captured.draws[0].has_pixel_inputs && captured.draws[0].has_system_inputs &&
           captured.draws[0].pixel_inputs == draw.pixel_inputs &&
           captured.draws[0].system_inputs == draw.system_inputs,
@@ -2465,7 +2501,16 @@ int main(int argc, char** argv) {
           "clear intent, DS identity/programming, and raw stencil-op provenance round-trip");
 
     GpuReplayFrame replay;
-    CHECK(materialize_gpu_replay(loaded, replay, error), "capture materializes owned replay draw items");
+    const bool replay_materialized = materialize_gpu_replay(loaded, replay, error);
+    CHECK(replay_materialized, "capture materializes owned replay draw items");
+    CHECK(replay_materialized && replay.items.size() == 1 && replay.items[0].vrt &&
+              replay.items[0].vrt->resources.size() >= 2,
+          "materialized replay owns the complete resource row before dependent access");
+    if (!replay_materialized || replay.items.size() != 1 || !replay.items[0].vrt ||
+        replay.items[0].vrt->resources.size() < 2) {
+        std::fprintf(stderr, "capture replay prerequisite failed: %s\n", error.c_str());
+        return 1;
+    }
     CHECK(replay.items.size() == 1 && replay.items[0].ps.cb_resolve,
           "materialized gpu_replay draw retains MODE=3 resolve intent");
     // #1459: gpu_replay --inspect reads the color-state line from the MATERIALIZED item, so assert

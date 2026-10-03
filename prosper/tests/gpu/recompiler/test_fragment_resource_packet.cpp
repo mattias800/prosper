@@ -302,8 +302,11 @@ TEST(FragmentResourcePacket, IntegerWaveExtensionsDoNotExpandResourceInputAuthor
            "raw-window authority does not mix with resource packet ownership");
     bad = good;
     std::erase_if(bad.invocation.vgprs, [](const auto& column) { return column.reg == 2u; });
-    reject(bad, "packet-vgpr-input-unavailable",
-           "resource packet still requires supplied destination storage despite a guest writer");
+    sink(bad, arithmetic_expected(fixture::bits(0.75f)),
+         "writer-only scratch is allocated without inventing an entry value", {});
+    std::erase_if(bad.invocation.vgprs, [](const auto& column) { return column.reg == 0u; });
+    runtime_reject(bad, FragmentPacketRuntimeFailure::UndefinedVgpr,
+                   "missing actual source cannot borrow allocated scratch zeros", {}, 0u);
     for (uint32_t opcode : {0x04u, 0x16u, 0x1bu}) {
         bad = fixture::arithmetic(opcode, fixture::bits(0.25f), fixture::bits(0.5f), 0x30u);
         reject(bad, "packet-valu-op-unimplemented",

@@ -215,15 +215,21 @@ TEST(NestedWideDataAdmission, Contract) {
     // The authority provider below models the renderer's retained physical-origin exclusion;
     // current-draw attachment exclusion is independently performed by the observer itself.
     uint64_t wave_physical = 0, wave_source = 0, wave_alias = 0;
-    expect(allocate(0, 0x200000000ull, page, page, 0, reinterpret_cast<uint64_t>(&wave_physical)) ==
-                   0 &&
-               map(reinterpret_cast<uint64_t>(&wave_source), page, 3, 0, wave_physical, page) ==
-                   0 &&
-               wave_source &&
-               map(reinterpret_cast<uint64_t>(&wave_alias), page, 3, 0, wave_physical, page) == 0 &&
-               wave_alias,
-           "map a real independently allocated runtime window and physical alias");
-    if (wave_source && wave_alias) {
+    uint64_t wave_output_physical = 0, wave_output = 0;
+    expect(
+        allocate(0, 0x200000000ull, page, page, 0, reinterpret_cast<uint64_t>(&wave_physical)) ==
+                0 &&
+            map(reinterpret_cast<uint64_t>(&wave_source), page, 3, 0, wave_physical, page) == 0 &&
+            wave_source &&
+            map(reinterpret_cast<uint64_t>(&wave_alias), page, 3, 0, wave_physical, page) == 0 &&
+            wave_alias &&
+            allocate(0, 0x200000000ull, page, page, 0,
+                     reinterpret_cast<uint64_t>(&wave_output_physical)) == 0 &&
+            map(reinterpret_cast<uint64_t>(&wave_output), page, 3, 0, wave_output_physical, page) ==
+                0 &&
+            wave_output,
+        "map a real runtime window, physical alias and independently allocated full-page output");
+    if (wave_source && wave_alias && wave_output) {
         // Explicitly fault/commit backing before asking the readable-window query. Querying a
         // lazy reservation is not permission for the observer to manufacture committed bytes.
         std::memset(reinterpret_cast<void*>(wave_source), 0x97, page);
@@ -262,18 +268,36 @@ TEST(NestedWideDataAdmission, Contract) {
             for (uint32_t i = 0; i < domain_bytes / 4u; ++i) words[i] = 0x97000000u + i;
             GraphicsRawSnapshotContext complete;
             complete.producers_complete = true;
-            complete.output_allocations.emplace_back(output, page);
+            complete.output_allocations.emplace_back(wave_output, page);
             std::vector<PacketRawWaveWindow> owners;
             std::string refusal;
+            ASSERT_TRUE(observe_graphics_raw_wave_windows(wave_code, scalars_for(base), &complete,
+                                                          owners, refusal))
+                << refusal;
+            ASSERT_EQ(owners.size(), 1u);
             expect(
-                observe_graphics_raw_wave_windows(wave_code, scalars_for(base), &complete, owners,
-                                                  refusal) &&
-                    owners.size() == 1u && owners[0].load_pc == 3u &&
-                    owners[0].guest_base == base && owners[0].guest_begin == base + 16u &&
+                owners[0].load_pc == 3u && owners[0].guest_base == base &&
+                    owners[0].guest_begin == base + 16u &&
                     owners[0].words.size() == domain_bytes / 4u &&
                     owners[0].words.back() == words[domain_bytes / 4u - 1u],
                 "ordered real backing owns every certified byte through the allocation endpoint");
             const auto original_owner = owners;
+            // The earlier retype split this output's tracked VA into multiple mappings. The
+            // producer query requires its complete minimum span in one mapping; a physical birth
+            // alone cannot substitute for that extent proof. Keep the conservative refusal.
+            auto fragmented_output = complete;
+            fragmented_output.output_allocations = {{output, page}};
+            {
+                GuestMappingLease lease;
+                expect(guest_memory_direct_allocation_relation(lease, base + 16u, domain_bytes,
+                                                               output, page) ==
+                           GuestMemoryTopologyRelation::Unknown,
+                       "fragmented producer mapping cannot prove a whole-page minimum extent");
+            }
+            expect(!observe_graphics_raw_wave_windows(wave_code, scalars_for(base),
+                                                      &fragmented_output, owners, refusal) &&
+                       owners.empty() && refusal == "wave-window-output-allocation-not-disjoint",
+                   "unknown fragmented producer extent refuses before copying any window");
             auto incomplete = complete;
             incomplete.producers_complete = false;
             const uint32_t calls_before = authority_calls;
@@ -887,6 +911,8 @@ TEST(NestedWideDataAdmission, Contract) {
     if (wave_alias) unmap(wave_alias, page, 0, 0, 0, 0);
     if (wave_source) unmap(wave_source, page, 0, 0, 0, 0);
     if (wave_physical) release(wave_physical, page, 0, 0, 0, 0);
+    if (wave_output) unmap(wave_output, page, 0, 0, 0, 0);
+    if (wave_output_physical) release(wave_output_physical, page, 0, 0, 0, 0);
     unmap(parent, page, 0, 0, 0, 0);
 #if !defined(__linux__)
     unmap(child, page, 0, 0, 0, 0);

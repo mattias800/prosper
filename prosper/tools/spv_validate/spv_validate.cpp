@@ -143,6 +143,9 @@ static const NotAnEmitter kNotEmitters[] = {
     {"shader_analysis_owned_words",
      "aliases the immutable owned RAW RDNA2 analysis bytes; it neither translates instructions "
      "nor assembles a SPIR-V module"},
+    {"registered_graphics_original",
+     "aliases the registered immutable RAW RDNA2 analysis bytes; consuming owned packet modules "
+     "are validated here, but the accessor neither translates instructions nor assembles SPIR-V"},
     // Two SpirvCompute members became visible to this scan when the recompiler's shared internals
     // moved into rdna2_to_spirv_internal.hpp so the emit functions could be split into their own
     // translation units. Neither is a new code path -- both were always reached through the entry
@@ -831,12 +834,13 @@ int main(int argc, char** argv) {
             packet.sgprs = {{0u, 0x10000000u}, {1u, 0u}};
             // Two visits to the SAME event/load PC with a changed current source. A cycle with
             // no EXP is admitted; the final export is outside it. Validate this real CFG too.
-            packet.guest_code = {0xbe9e0380u, 0x7e280501u,
+            // s40 is outside both SMEM destinations s[24:27] and s[24:31].
+            packet.guest_code = {0xbea80380u, 0x7e280501u,
                                  0x90149714u, 0x87148314u,
                                  0x8f148414u, width8 ? 0xf40c0600u : 0xf4080600u,
                                  0x28000000u, 0x7e000200u | (width8 ? 31u : 27u),
-                                 0x801e811eu, 0x060202ffu,
-                                 0x40800000u, 0xbf0a821eu,
+                                 0x80288128u, 0x060202ffu,
+                                 0x40800000u, 0xbf0a8228u,
                                  0xbf85fff4u, 0xf8001801u,
                                  0u,          0xbf810000u};
             FragmentPacketVgpr column;

@@ -150,7 +150,8 @@ static std::vector<uint32_t> fragment_code(bool per_wave, bool wide8) {
         return {0xc8000000u, 0xc8010001u,   // interpolate produced PARAM0.x
                 0x7e0202ffu, 0x3f000000u, 0x7e0402ffu, 0x3f400000u,
                 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u};
-    std::vector<uint32_t> code{0xbe9e0380u};   // genuine dominating s30=0
+    // The x8 load writes s[24:31]; its real loop counter must remain outside that destination.
+    std::vector<uint32_t> code{0xbea80380u};   // genuine dominating s40=0
     const uint32_t event = uint32_t(code.size());
     code.insert(
         code.end(),
@@ -158,9 +159,9 @@ static std::vector<uint32_t> fragment_code(bool per_wave, bool wide8) {
          0x28000000u,
          0x7e000200u |
              (wide8 ? 31u : 27u),   // current RF FragCoord.y exponent selects last component
-         0x801e811eu,   // s30 += 1, real SCC definition
+         0x80288128u,   // s40 += 1, real SCC definition
          0x060202ffu, 0x40800000u,   // v1 += 4.0: second RF must sample the CURRENT VGPR
-         0xbf0a821eu});   // s_cmp_lt_u32 s30,2
+         0xbf0a8228u});   // s_cmp_lt_u32 s40,2
     const int32_t displacement = int32_t(event) - int32_t(code.size() + 1u);
     code.push_back(0xbf850000u | uint16_t(displacement));
     // The raw packet ABI observes enabled EXP payload even in nonexporting helper slots. Restore
