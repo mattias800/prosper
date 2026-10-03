@@ -155,24 +155,14 @@ TEST(FreebsdFopen, FdFlagsAndCloexec) {
     struct Case {
         const char* mode;
         int access;  // O_RDONLY / O_WRONLY / O_RDWR, plus O_APPEND
-        bool cloexec;
+        bool cloexec = false;
     };
     const Case cases[] = {
-        {"r", O_RDONLY, false},                     //
-        {"w", O_WRONLY, false},                     //
-        {"a", O_WRONLY | O_APPEND, false},          //
-        {"r+", O_RDWR, false},                      //
-        {"w+", O_RDWR, false},                      //
-        {"a+", O_RDWR | O_APPEND, false},           //
-        {"re", O_RDONLY, true},                     //
-        {"we", O_WRONLY, true},                     //
-        {"ae", O_WRONLY | O_APPEND, true},          //
-        {"r+e", O_RDWR, true},                      //
-        {"w+e", O_RDWR, true},                      //
-        {"a+e", O_RDWR | O_APPEND, true},           //
-        {"re+", O_RDWR, true},                      //
-        {"we+", O_RDWR, true},                      //
-        {"ae+", O_RDWR | O_APPEND, true},           //
+        {"r", O_RDONLY},        {"w", O_WRONLY},        {"a", O_WRONLY | O_APPEND},
+        {"r+", O_RDWR},         {"w+", O_RDWR},         {"a+", O_RDWR | O_APPEND},
+        {"re", O_RDONLY, true}, {"we", O_WRONLY, true}, {"ae", O_WRONLY | O_APPEND, true},
+        {"r+e", O_RDWR, true},  {"w+e", O_RDWR, true},  {"a+e", O_RDWR | O_APPEND, true},
+        {"re+", O_RDWR, true},  {"we+", O_RDWR, true},  {"ae+", O_RDWR | O_APPEND, true},
     };
     for (const auto& c : cases) {
         FILE* f = fopen(p.c_str(), c.mode);
