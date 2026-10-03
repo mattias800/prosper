@@ -478,11 +478,14 @@ TEST(FragmentDrawCapacity, DeviceCountAndAssemblyKeepMaskAndScratchFactsAbsent) 
     ASSERT_FALSE(count_source.empty());
     ASSERT_FALSE(assembly_source.empty());
     bpermute_oracle::Interpreter counter(count_source);
+    counter.extra_writable_bindings = {0, 4};   // in-place reassembly + scratch table (#4277)
+    const std::vector<uint32_t> zero_commit(good.capacity->commit_words(), 0);
     auto input = counter.run_buffers(1,
                                      {{0, good.source},
                                       {1, std::vector<uint32_t>(good.capacity->input_words(), 0)},
                                       {2, good.authority},
-                                      {3, good.entry}},
+                                      {3, good.entry},
+                                      {4, zero_commit}},
                                      1);
     ASSERT_TRUE(counter.error.empty()) << counter.error;
     EXPECT_EQ(input[1], 3u);
@@ -522,11 +525,121 @@ TEST(FragmentDrawCapacity, DeviceCountAndAssemblyKeepMaskAndScratchFactsAbsent) 
     auto overflow = good.source;
     overflow[1] = 1;
     bpermute_oracle::Interpreter overflow_counter(count_source);
+    overflow_counter.extra_writable_bindings = {0, 4};
     const auto no_dispatch = overflow_counter.run_buffers(
-        1, {{0, overflow}, {1, input}, {2, good.authority}, {3, good.entry}}, 1);
+        1, {{0, overflow}, {1, input}, {2, good.authority}, {3, good.entry}, {4, zero_commit}}, 1);
     ASSERT_TRUE(overflow_counter.error.empty()) << overflow_counter.error;
     EXPECT_EQ(no_dispatch[1], 0u);
     EXPECT_EQ(no_dispatch[5], 0u);
     EXPECT_EQ(no_dispatch[8], uint32_t(FragmentDrawFailure::CollectionOverflow));
+}
+// #4277: llvmpipe runs one 2x2 quad as two helper-backed invocations with disjoint nonhelper
+// lanes. The count stage reassembles them in place, so assembly sees one complete quad.
+TEST(FragmentDrawCapacity, DeviceCountReassemblesSplitQuadScopesInPlace) {
+    const auto good = transaction();
+    ASSERT_TRUE(good.capacity);
+    const auto shape = collector();
+    const auto count_source = build_fragment_draw_count(*good.capacity, shape);
+    ASSERT_FALSE(count_source.empty());
+    const uint32_t lw = shape.lane_words, rw = shape.record_words;
+    const auto record = [&](const std::vector<uint32_t>& source, uint32_t index) {
+        const auto begin = source.begin() + 4 + index * rw;
+        return std::vector<uint32_t>(begin, begin + rw);
+    };
+    const auto as_helper = [&](std::vector<uint32_t>& source, uint32_t index, uint32_t lane) {
+        source[4 + index * rw + lane * lw + 0] = 1;   // HelperInvocation
+        source[4 + index * rw + lane * lw + 1] = 0;   // coverage unavailable for a helper
+    };
+    // Quad 10 runs as two scopes: lane 1, then lanes 0/2/3, the second occupying slot 20.
+    // Every later record shifts down one slot once the second scope is folded away.
+    const auto split = [&](uint32_t first_mask) {
+        auto source = good.source;
+        const auto original = record(good.source, 10);
+        std::copy(original.begin(), original.end(), source.begin() + 4 + 20 * rw);
+        for (uint32_t lane = 0; lane < 4; ++lane) {
+            if (!(first_mask & (1u << lane))) as_helper(source, 10, lane);
+            else as_helper(source, 20, lane);
+        }
+        return source;
+    };
+    const std::vector<uint32_t> zero_commit(good.capacity->commit_words(), 0);
+    const auto run = [&](const std::vector<uint32_t>& source, std::vector<uint32_t>& collected) {
+        bpermute_oracle::Interpreter counter(count_source);
+        counter.extra_writable_bindings = {0, 4};
+        auto header = counter.run_buffers(
+            1, {{0, source}, {1, std::vector<uint32_t>(good.capacity->input_words(), 0)},
+                {2, good.authority}, {3, good.entry}, {4, zero_commit}}, 1);
+        EXPECT_TRUE(counter.error.empty()) << counter.error;
+        collected = counter.writable_result(0);
+        EXPECT_EQ(counter.writable_result(4), zero_commit)
+            << "every borrowed scratch slot is returned to zero for validation";
+        return header;
+    };
+    std::vector<uint32_t> collected;
+    for (uint32_t first_mask : {0x2u, 0xdu}) {   // either scope may be appended first
+        const auto header = run(split(first_mask), collected);
+        ASSERT_EQ(collected.size(), good.source.size());
+        EXPECT_EQ(header[8], 0u) << "a disjoint split is accepted";
+        EXPECT_EQ(header[4], 47u) << "the folded scope no longer counts as a quad";
+        EXPECT_EQ(collected[0], 47u) << "the collector header holds the compacted count";
+        EXPECT_EQ(record(collected, 10), record(good.source, 10))
+            << "each lane is taken from the scope that ran it as a nonhelper";
+        for (uint32_t index = 20; index < 47; ++index)
+            EXPECT_EQ(record(collected, index), record(good.source, index + 1))
+                << "survivors keep first-occurrence order, index " << index;
+    }
+    // Unsplit input is unchanged.
+    auto header = run(good.source, collected);
+    EXPECT_EQ(header[4], 48u);
+    EXPECT_EQ(collected, good.source);
+    // A three-way split (lanes 0, 1 and 2/3 in separate scopes at slots 10, 20 and 30).
+    {
+        auto source = good.source;
+        const auto original = record(good.source, 10);
+        for (uint32_t slot : {20u, 30u})
+            std::copy(original.begin(), original.end(), source.begin() + 4 + slot * rw);
+        for (uint32_t lane = 0; lane < 4; ++lane) {
+            const uint32_t owner = lane == 0 ? 10 : lane == 1 ? 20 : 30;
+            for (uint32_t slot : {10u, 20u, 30u})
+                if (slot != owner) as_helper(source, slot, lane);
+        }
+        const auto three = run(source, collected);
+        EXPECT_EQ(three[8], 0u) << "a three-way disjoint split is accepted";
+        EXPECT_EQ(three[4], 46u);
+        EXPECT_EQ(record(collected, 10), record(good.source, 10));
+        EXPECT_EQ(record(collected, 20), record(good.source, 21)) << "first survivor after slot 20";
+        EXPECT_EQ(record(collected, 28), record(good.source, 29)) << "last survivor before slot 30";
+        EXPECT_EQ(record(collected, 29), record(good.source, 31)) << "first survivor after slot 30";
+    }
+    // Refusals, all published as a whole-collection CollectionRecord with no quads and a zero
+    // collector count, so no later stage reads a partially folded collection as records.
+    const auto refused = [&](std::vector<uint32_t> source, const char* why) {
+        const auto result = run(source, collected);
+        EXPECT_EQ(result[8], uint32_t(FragmentDrawFailure::CollectionRecord)) << why;
+        EXPECT_EQ(result[4], 0u) << why;
+        EXPECT_EQ(result[1], 0u) << why;
+        EXPECT_EQ(collected.empty() ? 1u : collected[0], 0u) << why;
+    };
+    auto duplicate = good.source;   // two complete records for one quad, no split at all
+    std::copy_n(good.source.begin() + 4 + 10 * rw, rw, duplicate.begin() + 4 + 20 * rw);
+    refused(duplicate, "a duplicated complete quad");
+    auto dropped = split(0x2u);      // record 10's helper lane 0 is dropped by the fold...
+    dropped[4 + 10 * rw + 0 * lw + 4] = 7;   // ...but still carries a different primitive
+    refused(dropped, "a malformed lane that the fold would drop");
+    auto overlap = split(0x2u);
+    overlap[4 + 20 * rw + 1 * lw + 0] = 0;   // lane 1 now nonhelper in both scopes
+    overlap[4 + 20 * rw + 1 * lw + 1] = 1;
+    refused(overlap, "overlapping nonhelper lanes");
+    auto disagree = split(0x2u);
+    as_helper(disagree, 10, 0);               // lane 0 is now a helper in both scopes...
+    as_helper(disagree, 20, 0);
+    disagree[4 + 20 * rw + 0 * lw + 7] ^= 1u;  // ...with different words
+    refused(disagree, "a lane that is a helper in both scopes disagrees");
+    auto helper_only = good.source;
+    for (uint32_t lane = 0; lane < 4; ++lane) as_helper(helper_only, 5, lane);
+    refused(helper_only, "a helper-only record");
+    auto malformed = good.source;
+    malformed[4 + 5 * rw + 2 * lw + 1] = 0;   // nonhelper lane without coverage
+    refused(malformed, "a coverage word that does not match the helper flag");
 }
 }   // namespace

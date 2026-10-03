@@ -1,5 +1,6 @@
 #include "gpu/recompiler/raster_quad_collector.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -206,12 +207,16 @@ std::string decode_raster_quad_records(const RasterQuadCollector& collector,
         return "quad-collector-output-header-malformed";
     if (words[1]) return "quad-collector-output-overflow";
     std::vector<std::vector<uint32_t>> pending;
-    // A geometric key is not a unique Vulkan quad scope: helper-backed scopes may revisit the
-    // same locations. Retain separate scopes whose nonhelper observations are disjoint; never
-    // merge their possibly different helper/input words into invented invocation state.
-    // Vulkan also permits repeated fragment invocations. Overlap is therefore a conservative
-    // supported-domain refusal here, not proof of a driver or publisher error.
-    struct Seen { uint32_t nonhelper_mask = 0, first_record = 0; };
+    // A geometric key is not a unique Vulkan quad scope: a driver may run one 2x2 quad of a
+    // primitive as several helper-backed invocations whose nonhelper lanes are disjoint (llvmpipe
+    // does; RADV does not, #4277). Such split scopes are reassembled into ONE record, each lane
+    // taken from the invocation that actually ran it as a nonhelper, so the downstream four-lane
+    // quad bridge sees the same complete quad domain on every driver. Nothing is invented: a lane
+    // that is a helper in every split observation must carry identical words in all of them, or
+    // the whole collection is refused. Vulkan also permits repeated fragment invocations, so an
+    // OVERLAPPING nonhelper lane stays a conservative supported-domain refusal, not proof of a
+    // driver or publisher error.
+    struct Seen { uint32_t nonhelper_mask = 0, first_record = 0; size_t pending_index = 0; };
     std::map<std::array<uint32_t, 3>, Seen> keys;
     for (uint32_t q = 0; q < words[0]; ++q) {
         const auto* row = words + kRasterQuadBufferHeaderWords + size_t(q) * collector.record_words;
@@ -250,7 +255,7 @@ std::string decode_raster_quad_records(const RasterQuadCollector& collector,
                 std::fprintf(stderr,
                     "[raster-quad-collision] primitive=%u origin_bits=%08x,%08x seen_mask=0x%x next_mask=0x%x first_record=%u record=%u decision=%s; host scopes, no guest packing/order authority\n",
                     row[4], row[5], row[6], seen_mask, nonhelper_mask,
-                    previous->second.first_record, q, overlap ? "refused-overlap-unproved" : "retained-disjoint");
+                    previous->second.first_record, q, overlap ? "refused-overlap-unproved" : "merged-disjoint");
                 if (report < 4) {
                     for (uint32_t record : {previous->second.first_record, q}) {
                         const auto* raw = words + kRasterQuadBufferHeaderWords + size_t(record) * collector.record_words;
@@ -264,8 +269,21 @@ std::string decode_raster_quad_records(const RasterQuadCollector& collector,
                 }
             }
             if (overlap) return "quad-collector-overlapping-nonhelper-scopes-unproved";
+            auto& merged = pending[previous->second.pending_index];
+            for (uint32_t lane = 0; lane < 4; ++lane) {
+                const uint32_t bit = 1u << lane;
+                const size_t at = size_t(lane) * collector.lane_words;
+                if (nonhelper_mask & bit) {
+                    std::copy(row + at, row + at + collector.lane_words, merged.begin() + at);
+                } else if (!(seen_mask & bit) &&
+                           !std::equal(row + at, row + at + collector.lane_words, merged.begin() + at)) {
+                    return "quad-collector-split-scope-helper-inputs-disagree";
+                }
+            }
             previous->second.nonhelper_mask |= nonhelper_mask;
+            continue;
         }
+        previous->second.pending_index = pending.size();
         pending.emplace_back(row, row + collector.record_words);
     }
     quads = std::move(pending);
