@@ -2593,6 +2593,33 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/execute/test_cached_shader_moves.cpp
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_owned_wave_classification_cache
+    SOURCES tests/gpu/execute/test_owned_wave_classification_cache.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_owned_wave_classification_cache_uncached
+    SOURCES tests/gpu/execute/test_owned_wave_classification_cache.cpp
+    LIBRARIES prosper_core
+    ENVIRONMENT "PROSPER_NO_SHADER_DECODE_CACHE=1")
+  target_compile_definitions(test_owned_wave_classification_cache_uncached PRIVATE
+    PROSPER_TEST_OWNED_WAVE_CACHE_BYPASS=1)
+  prosper_add_gtest(test_owned_wave_classification_only_uncached
+    SOURCES tests/gpu/execute/test_owned_wave_classification_cache.cpp
+    LIBRARIES prosper_core
+    ENVIRONMENT "PROSPER_NO_OWNED_WAVE_CLASSIFICATION_CACHE=1")
+  target_compile_definitions(test_owned_wave_classification_only_uncached PRIVATE
+    PROSPER_TEST_OWNED_WAVE_CLASSIFICATION_BYPASS=1)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Observe actual classifier calls without adding a production hot-path counter.
+    foreach(cache_target IN ITEMS test_owned_wave_classification_cache
+                                  test_owned_wave_classification_cache_uncached
+                                  test_owned_wave_classification_only_uncached)
+      target_compile_definitions(${cache_target} PRIVATE
+        PROSPER_TEST_WRAP_OWNED_WAVE_CLASSIFIER=1)
+      target_link_options(${cache_target} PRIVATE
+        "-Wl,--wrap=_ZN7prosper3gpu30rdna2_raw_wave_wide_data_loadsERKSt6vectorINS0_9Rdna2InstESaIS2_EE")
+    endforeach()
+  endif()
+
   add_executable(test_shader_recompile_cache tests/gpu/execute/test_shader_recompile_cache.cpp)
   add_executable(fragment_compile_replay tools/fragment_compile_replay/main.cpp)
   target_link_libraries(fragment_compile_replay PRIVATE prosper_core)

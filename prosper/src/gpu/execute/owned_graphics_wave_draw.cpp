@@ -30,14 +30,17 @@ size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_add
 }
 
 bool graphics_program_requires_owned_waves(uint64_t address) {
-    const auto* header =
-        static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(address));
-    if (!header) return false;
-    const auto source = registered_graphics_original(address);
+    bool requires_owned_waves = false;
+    const auto source = registered_graphics_original(address, &requires_owned_waves);
     if (!source) return false;
-    std::vector<Rdna2Inst> original;
-    rdna2_walk(source->data(), source->size(), original);
-    return !rdna2_raw_wave_wide_data_loads(original).empty();
+    // Diagnostic algorithm control: same immutable source/decision, no admission or input change.
+    // Only this MAY memo is bypassed; existing decode/fold caches retain their normal policy.
+    if (PROSPER_ENV_ON("PROSPER_NO_OWNED_WAVE_CLASSIFICATION_CACHE")) {
+        std::vector<Rdna2Inst> original;
+        rdna2_walk(source->data(), source->size(), original);
+        return !rdna2_raw_wave_wide_data_loads(original).empty();
+    }
+    return requires_owned_waves;
 }
 
 bool prepare_draw_owned_waves(const GpuState& state, const GpuState::Draw* draw,
