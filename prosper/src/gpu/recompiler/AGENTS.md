@@ -66,6 +66,19 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   initial domain. Private readonly binding2 placement ownership guards mutable binding0 routes
   uniformly before guest/barriers/stores; that retained dispatcher authority is not a live P5 lease.
   It grants no raster scheduling, system-entry derivation or shipping admission.
+- `fragment_packet_exports` owns explicit architectural EXP observation/schema and transactional
+  typed accumulation; `fragment_packet_exports_emit` emits EXP14 only when that immutable policy
+  is selected. Original current EXEC, not host eligibility/final VM, authorizes payload reads.
+  Unobserved sources remain optional/absent; compressed channels retain raw16 bits without guest
+  format conversion. Last executed VM controls validity; DONE/control/null events remain visible.
+  All existing default raw12 observations and inactive assertions remain unchanged. Completed
+  resource and cached-wave consumers stage typed events until every status/wave succeeds. This
+  is suitable input for a later ordered attachment transaction, NOT attachment/raster authority.
+  `fragment_packet_export_timing` proves current EXEC and every enabled physical payload word
+  stable through all forward paths until full WAIT or ordinary END's implicit drain. Unsafe
+  overwrites remain named gaps; DONE alone never drains. Eager private records do not claim bus
+  timing, externally visible attachment writes or live resource epochs. RDNA2 STATUS.SKIP_EXPORT
+  is VS-only; this PS contract does not invent a missing status input or infer a stored zero.
 - `rdna2_mask_move` supplies the shared S_MOV_B64-to-EXEC lowering. Owned Wave64 packets consume
   two genuine instruction-order MUST scalar words at their logical lane position, independently
   of old EXEC, and preserve SCC. `rdna2_packet_raw_masks` materializes selected complete ordinary

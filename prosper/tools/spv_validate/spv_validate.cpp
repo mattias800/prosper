@@ -40,6 +40,7 @@
 #include "../../tests/fixtures/fragment_packet_mask_entry_fixture.hpp"
 #include "../../tests/fixtures/fragment_special_f32_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_wave_fixture.hpp"
+#include "../../tests/fixtures/fragment_packet_exports_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include <algorithm>
 #include <bit>
@@ -771,6 +772,25 @@ int main(int argc, char** argv) {
             prosper::test::fragment_packet_wave::scalar_exec_packet(0));
         dump(dir, "fragment_packet_wave_scalar_exec_kernel",
              scalar_exec_kernel.program.packet.spirv, "recompile_fragment_packet_kernel");
+        namespace architectural = prosper::test::fragment_packet_exports;
+        for (const auto& [name, input] :
+             std::vector<std::pair<const char*, FragmentResourcePacket>>{
+                 {"scratch", architectural::scratch()},
+                 {"multiple", architectural::multiple()},
+                 {"compressed", architectural::compressed()},
+                 {"p2", architectural::previous_destination()},
+                 {"wait_cmpx", architectural::pending_write(3, true)},
+                 {"wait_join", architectural::pending_join(true, false)},
+                 {"numeric_saveexec", architectural::numeric_saveexec(3)},
+                 {"wait_image", architectural::pending_image(true)}}) {
+            const auto compiled = recompile_fragment_resource_packet(input);
+            dump(dir, (std::string("fragment_architectural_export_") + name).c_str(),
+                 compiled.packet.spirv, "recompile_fragment_resource_packet");
+        }
+        const auto architectural_kernel =
+            recompile_fragment_packet_kernel(architectural::scratch());
+        dump(dir, "fragment_architectural_export_cached", architectural_kernel.program.packet.spirv,
+             "recompile_fragment_packet_kernel");
         for (uint32_t op : {0x2au, 0x2eu, 0x33u}) {
             const auto p =
                 recompile_fragment_resource_packet(special::packet(op, special::rails(op)));
