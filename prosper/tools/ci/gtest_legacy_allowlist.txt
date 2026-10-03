@@ -117,7 +117,6 @@ tests/gpu/recompiler/test_portable_bpermute.cpp
 tests/gpu/recompiler/test_raster_quad_collector.cpp
 tests/gpu/recompiler/test_raw_register_wide_data.cpp
 tests/gpu/recompiler/test_raw_wide_mask_lifetime.cpp
-tests/gpu/recompiler/test_rdna2_decode.cpp
 tests/gpu/recompiler/test_rdna2_to_spirv.cpp
 tests/gpu/recompiler/test_replay_fragment_width.cpp
 tests/gpu/recompiler/test_shader_property_scans.cpp

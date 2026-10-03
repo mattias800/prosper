@@ -3,6 +3,7 @@
 // The stream mixes every major encoding class + inline literals + S_ENDPGM; the walker must classify
 // each instruction's format, compute its length (incl. literals), and terminate at S_ENDPGM.
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include <gtest/gtest.h>
 #include <array>
 #include <cstdio>
 #include <cstdint>
@@ -11,35 +12,62 @@
 
 using namespace prosper::gpu;
 
-static int fails = 0;
-#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
-                         else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK(c, m) EXPECT_TRUE(c) << (m)
 
-int main() {
-    printf("== test_rdna2_decode ==\n");
+namespace {
+bool isS(const Operand& o, int n) { return o.kind == OperandKind::SGPR && o.value == n; }
+bool isV(const Operand& o, int n) { return o.kind == OperandKind::VGPR && o.value == n; }
+
+// Packets shared by several TESTs below, decoded on demand so each TEST stays
+// self-contained. Words are the llvm-mc gfx1030 encodings established in the
+// walker TEST.
+Rdna2Inst shared_mubuf_dwordx4() {
+    const uint32_t mubuf[] = {0xe0381000u, 0x80020402u};
+    return rdna2_decode_one(mubuf, 2);
+}
+Rdna2Inst shared_mtbuf_tfe() {
+    const uint32_t mtbuf_tfe[] = {0xe8b02000u, 0x80820100u};
+    return rdna2_decode_one(mtbuf_tfe, 2);
+}
+Rdna2Inst shared_gta_store_mip_xyzw() {
+    const uint32_t words[] = {0xf0243f0au, 0x00030005u, 0x00000604u};
+    return rdna2_decode_one(words, 3);
+}
+
+// The canonical mixed-format walker stream (llvm-mc gfx1030 words): SOP1, SOP1+literal,
+// SOP2, VOP1, VOP1+literal, VOP2, VOP3, SMEM, EXP, SOPP end. Walked by the walker TEST for
+// format/length/pc assertions and re-walked by the operand TESTs below.
+constexpr uint32_t kWalkerStream[] = {
+    0xBE800301u,                    // SOP1  s_mov_b32 s0,s1
+    0xBE8203FFu, 0x12345678u,       // SOP1  s_mov_b32 s2,lit   (+literal)
+    0x80000201u,                    // SOP2  s_add_u32
+    0x7E000301u,                    // VOP1  v_mov_b32 v0,v1
+    0x7E0402FFu, 0x12345678u,       // VOP1  v_mov_b32 v2,lit   (+literal)
+    0x06000501u,                    // VOP2  v_add_f32
+    0xD54B0000u, 0x040E0501u,       // VOP3  v_fma_f32
+    0xF4080002u, 0xFA000000u,       // SMEM  s_load_dwordx4
+    0xF800000Fu, 0x03020100u,       // EXP   exp mrt0
+    0xBF810000u,                    // SOPP  s_endpgm
+};
+std::vector<Rdna2Inst> walker_stream() {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(kWalkerStream, std::size(kWalkerStream), ins);
+    return ins;
+}
+}  // namespace
+
+TEST(Rdna2Decode, WalkerClassifiesFormatsLengthsAndTerminatesAtEndpgm) {
     // Assembled with: llvm-mc -triple=amdgcn-amd-amdhsa -mcpu=gfx1030 --show-encoding
     //   s_mov_b32 s0,s1 | s_mov_b32 s2,0x12345678 | s_add_u32 s0,s1,s2 | v_mov_b32 v0,v1 |
     //   v_mov_b32 v2,0x12345678 | v_add_f32 v0,v1,v2 | v_fma_f32 v0,v1,v2,v3 |
     //   s_load_dwordx4 s[0:3],s[4:5],0x0 | exp mrt0 v0,v1,v2,v3 | s_endpgm
-    const uint32_t code[] = {
-        0xBE800301u,                     // SOP1  s_mov_b32 s0,s1
-        0xBE8203FFu, 0x12345678u,        // SOP1  s_mov_b32 s2,lit   (+literal)
-        0x80000201u,                     // SOP2  s_add_u32
-        0x7E000301u,                     // VOP1  v_mov_b32 v0,v1
-        0x7E0402FFu, 0x12345678u,        // VOP1  v_mov_b32 v2,lit   (+literal)
-        0x06000501u,                     // VOP2  v_add_f32
-        0xD54B0000u, 0x040E0501u,        // VOP3  v_fma_f32
-        0xF4080002u, 0xFA000000u,        // SMEM  s_load_dwordx4
-        0xF800000Fu, 0x03020100u,        // EXP   exp mrt0
-        0xBF810000u,                     // SOPP  s_endpgm
-    };
-    const size_t n = sizeof(code) / sizeof(code[0]);
+    // Words live in kWalkerStream above; the operand TESTs below re-walk the same stream.
+    const size_t n = std::size(kWalkerStream);
 
     std::vector<Rdna2Inst> ins;
-    size_t consumed = rdna2_walk(code, n, ins);
+    size_t consumed = rdna2_walk(kWalkerStream, n, ins);
     CHECK(consumed == n, "walker consumed the whole stream (15 dwords)");
-    CHECK(ins.size() == 10, "decoded 10 instructions");
-    if (ins.size() != 10) { printf("== FAIL: got %zu ==\n", ins.size()); return 1; }
+    ASSERT_EQ(ins.size(), 10u) << "decoded 10 instructions";
 
     struct Exp { Rdna2Format fmt; uint32_t pc; uint32_t len; bool lit; };
     const Exp exp[] = {
@@ -63,10 +91,9 @@ int main() {
     }
     CHECK(ins[1].literal == 0x12345678u && ins[4].literal == 0x12345678u, "inline literals captured");
     CHECK(ins[9].is_end, "S_ENDPGM flagged as end");
+}
 
-    auto isS = [](const Operand& o, int n){ return o.kind == OperandKind::SGPR && o.value == n; };
-    auto isV = [](const Operand& o, int n){ return o.kind == OperandKind::VGPR && o.value == n; };
-
+TEST(Rdna2Decode, ExpDecodesTargetEnableAndFourVgprSources) {
     // --- EXP decode (export target + enable + 4 VGPR sources) ---
     // Assembled: exp mrt0 v0,v1,v2,v3 | exp pos0 v4,v5,v6,v7 | exp param0 v8,v9,v10,v11
     const uint32_t mrt0[]  = {0xF800000Fu, 0x03020100u};
@@ -78,9 +105,12 @@ int main() {
     CHECK(e1.fmt == Rdna2Format::EXP && e1.exp_target == 12 &&
           isV(e1.src[0],4) && isV(e1.src[3],7), "EXP pos0 (target 12) v4..v7");
     CHECK(e2.fmt == Rdna2Format::EXP && e2.exp_target == 32 &&
-          isV(e2.src[0],8) && isV(e2.src[3],11), "EXP param0 (target 32) v8..v11");
+           isV(e2.src[0],8) && isV(e2.src[3],11), "EXP param0 (target 32) v8..v11");
+}
 
-    // --- operand decode (stage 2) ---
+TEST(Rdna2Decode, OperandDecodeWithTwoSourceVop3Arity) {
+    const std::vector<Rdna2Inst> ins = walker_stream();
+    ASSERT_EQ(ins.size(), 10u);
     // inst0: s_mov_b32 s0, s1  -> dst SGPR0, src0 SGPR1
     CHECK(isS(ins[0].dst, 0) && ins[0].n_src == 1 && isS(ins[0].src[0], 1), "s_mov_b32 s0,s1 operands");
     // inst2: s_add_u32 s0, s1, s2 -> dst SGPR0, src0 SGPR1, src1 SGPR2
@@ -200,8 +230,13 @@ int main() {
           gta_cvt_rpi.n_src == 1u && isV(gta_cvt_rpi.src[0], 1) &&
           !gta_cvt_rpi.has_literal && !gta_cvt_rpi.has_modifier &&
           !gta_cvt_rpi.has_sdwa && !gta_cvt_rpi.has_dpp,
-          "GTA V v_cvt_rpi_i32_f32 decodes exact plain VOP1 operands");
+           "GTA V v_cvt_rpi_i32_f32 decodes exact plain VOP1 operands");
+}
+
+TEST(Rdna2Decode, MemoryFormatsDecodeOperandsAndFlags) {
     // inst7: s_load_dwordx4 s[0:3], s[4:5], 0x0 (SMEM) -> op 0x2, SDATA s0, SBASE s4 (pair), offset 0
+    const std::vector<Rdna2Inst> ins = walker_stream();
+    ASSERT_EQ(ins.size(), 10u);
     CHECK(ins[7].fmt == Rdna2Format::SMEM && ins[7].opcode == 0x2u && isS(ins[7].dst, 0) &&
           isS(ins[7].src[0], 4) && ins[7].literal == 0x0u, "s_load_dwordx4 SMEM op/SDATA/SBASE/offset");
     // MUBUF decode: buffer_load_dwordx4 v[4:7], v2, s[8:11], 0 offen -> op 0xe, VDATA v4, VADDR v2,
@@ -317,10 +352,12 @@ int main() {
           isV(dr2s.src[0], 2) && isV(dr2s.dst, 4),
           "DS_READ2ST64_B32 decodes as DS opcode 0x38 with ADDR v2 and VDST v4");
     CHECK(rdna2_vgpr_write_count(dr2s) == 2u,
-          "DS_READ2ST64_B32 is counted as writing two VGPRs, like DS_READ2_B32");
+           "DS_READ2ST64_B32 is counted as writing two VGPRs, like DS_READ2_B32");
     CHECK(rdna2_vgpr_write_count(dr2a) == 2u,
           "control: DS_READ2_B32 is still counted as writing two VGPRs");
+}
 
+TEST(Rdna2Decode, SdwaAndDppControlWordsDecodeWithFailClosedAdmission) {
     // VOP SDWA/DPP forms carry a mandatory 2nd (control) dword — the decoder must count it, or the
     // whole downstream stream mis-aligns. Encodings from llvm-mc gfx1030: SDWA src0=0xf9,
     // DPP16 src0=0xfa, DPP8 src0=0xe9.
@@ -656,8 +693,10 @@ int main() {
     const uint32_t fmaak[] = { 0x5a000501u, 0xd4a0e43au };   // v_fmaak_f32 v0, v1, v2, K (mandatory literal)
     Rdna2Inst fk = rdna2_decode_one(fmaak, 2);
     CHECK(fk.fmt == Rdna2Format::VOP2 && fk.len_dwords == 2 && fk.has_literal && !fk.has_modifier &&
-          fk.literal == 0xd4a0e43au, "VOP2 v_fmaak_f32 carries its mandatory 32-bit literal");
+          fk.literal == 0xd4a0e43au,           "VOP2 v_fmaak_f32 carries its mandatory 32-bit literal");
+}
 
+TEST(Rdna2Decode, Vop3LiteralOpselAndE64CompareDecode) {
     // VOP3 length: 2 dwords, plus a trailing 32-bit literal when a src field is 0xFF. Encodings from
     // llvm-mc gfx1030: v_med3_f32 v0,v1,v2,0x40490fdb (src2=literal) vs v_mad_u32_u24 (no literal).
     const uint32_t vop3_lit[] = { 0xd5570000u, 0x03fe0501u, 0x40490fdbu };
@@ -687,7 +726,9 @@ int main() {
           isS(ce64.dst, 106) && ce64.n_src == 2 && ce64.src[0].value == 106 &&
           ce64.src[1].kind == OperandKind::InlineInt && ce64.src[1].value == 0,
           "Astro v_cmp_gt_u64_e64 decodes its explicit VCC destination and two sources");
+}
 
+TEST(Rdna2Decode, MimgLengthAndZeroOrDynamicMipShapes) {
     // MIMG length: non-NSA image op is 2 dwords; NSA form adds dword0[2:1] extra address dwords.
     // Encodings from llvm-mc gfx1030 (image_load 2D non-NSA; image_sample 2D NSA [v0,v1] = 1 extra).
     const uint32_t mimg_reg[] = { 0xf0000f08u, 0x00000000u };
@@ -855,8 +896,13 @@ int main() {
                       rdna2_decode_one(nsa_2d_array_dirty_byte3_words, 3)) &&
                   rdna2_decode_one(nsa_two_extra_words, 4).mimg_nsa == 2u &&
                   !rdna2_mimg_dynamic_mip_shape(rdna2_decode_one(nsa_two_extra_words, 4)),
-              "#3134: the NSA dynamic-mip shape rejects unaccounted address bytes and NSA>1");
+               "#3134: the NSA dynamic-mip shape rejects unaccounted address bytes and NSA>1");
     }
+}
+
+TEST(Rdna2Decode, VgprWriterInventoryAndZeroMipGateMutations) {
+    const Rdna2Inst mt_tfe = shared_mtbuf_tfe();
+    const Rdna2Inst gta_store_mip_2d_xyzw = shared_gta_store_mip_xyzw();
     const uint32_t gta_pc10_vop2_word[] = {0x4a000804u};
     const uint32_t wide_vop3_words[] = {0xd5761e01u, 0x040a0100u};
     const uint32_t wide_mimg_words[] = {0xf0003f08u, 0x00050000u};
@@ -925,6 +971,9 @@ int main() {
               !rdna2_mimg_zero_mip_shape(rdna2_decode_one(store_extra_address_words, 3)) &&
               !rdna2_mimg_zero_mip_shape(rdna2_decode_one(store_partial_mask_words, 3)),
           "zero-mip shape rejects opcode, control, and unused-address mutations at the packet gate");
+}
+
+TEST(Rdna2Decode, ImageBvhAtomicsAndGetLodControls) {
     // Astro Bot's world-map ray traversal uses the maximum three NSA dwords to name eleven input
     // VGPRs. Retaining dword4 is required for ray_inv_dir.y/z (v71/v72).
     const uint32_t mimg_bvh[] = {
@@ -992,7 +1041,9 @@ int main() {
         all_reserved_retained &= rdna2_decode_one(words.data(), words.size()).mimg_reserved;
     CHECK(all_reserved_retained,
           "all six reserved MIMG control bits are retained for fail-visible rejection");
+}
 
+TEST(Rdna2Decode, InlineConstantsSmemOffsetAndSloadRange) {
     // inline-constant field decode: SGPR106 special, field 129 -> +1, 193 -> -1, 242 -> 1.0f
     CHECK(decode_src_field(0).kind == OperandKind::SGPR && decode_src_field(0).value == 0, "field 0 -> SGPR0");
     CHECK(decode_src_field(257).kind == OperandKind::VGPR && decode_src_field(257).value == 1, "field 257 -> VGPR1");
@@ -1024,7 +1075,9 @@ int main() {
           "immediate s_load range inference includes offset plus x4 width");
     CHECK(rdna2_sload_required_bytes(sload_range, 3, 8) == 0u,
           "s_load range inference ignores a different SBASE pair");
+}
 
+TEST(Rdna2Decode, IsaAuditDecodeFixes) {
     // --- 2026-07 ISA-audit decode fixes (#878/#882) ---
     // MUBUF opcode is 8 bits [25:18]: buffer_load_format_d16_x (op 128) must NOT alias onto
     // buffer_load_format_x (op 0). llvm-mc gfx1030: 0xe2000000 0x80000000.
@@ -1116,7 +1169,9 @@ int main() {
     const uint32_t ds_gds[]   = { 0xd8020000u, 0x00000201u };
     CHECK(!rdna2_decode_one(ds_plain, 2).ds_gds && rdna2_decode_one(ds_gds, 2).ds_gds,
           "DS GDS flag (bit 17) decodes: ds_add_u32 vs ds_add_u32 gds");
+}
 
+TEST(Rdna2Decode, TerminatorOnlyProof) {
     // rdna2_program_is_terminator_only — the proof that a guest compute program does nothing at all.
     //
     // A dispatch of such a program has no memory effect whatever its resource table declares, so the
@@ -1161,9 +1216,12 @@ int main() {
               "an undecodable first word walks to one instruction and is still NOT proven");
         CHECK(!rdna2_program_is_terminator_only(nullptr, 0) &&
               !rdna2_program_is_terminator_only(endpgm_only, 0),
-              "an empty or absent program is not a proof of anything");
+               "an empty or absent program is not a proof of anything");
     }
+}
 
+TEST(Rdna2Decode, MayWriteMemoryIsFailClosed) {
+    const Rdna2Inst mb = shared_mubuf_dwordx4();
     {
         // rdna2_instruction_may_write_memory: fail-closed classification of memory writers.
         // Encodings are the gfx1030 words these shaders compile to (buffer_load_dwordx4 is op 0xe,
@@ -1204,8 +1262,4 @@ int main() {
         synthetic.fmt = Rdna2Format::VOP1;
         CHECK(!rdna2_instruction_may_write_memory(synthetic), "a non-memory instruction is not a writer");
     }
-
-    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
-    printf("== PASS ==\n");
-    return 0;
 }

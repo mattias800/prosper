@@ -30,6 +30,7 @@
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
+#include "gpu/execute/fragment_draw_plan.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "diagnostics/exit_census.hpp"       // one-line end-of-run reports
 #include "diagnostics/persistent_target_census.hpp"  // is the colour-target cache at its bound?
@@ -74,6 +75,7 @@
 #include <iterator>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -167,6 +169,7 @@ inline uint64_t hash_buffer_words(const uint32_t* words, size_t count) {
 // texture-capable object (currently 512 bytes) for every one only to leave all image state empty is
 // measurable resource-preparation work. Tests and replay inputs may continue putting buffers in
 // FrameResource; the backend accepts both representations through the same upload path.
+#include "fixtures/fragment_draw_buffer_binding.h"
 struct FrameBufferResource {
     uint32_t binding = 0;
     uint32_t set = 0;               // descriptor set: VS resources -> 0, PS resources -> 1 (they must not
@@ -193,6 +196,9 @@ struct FrameBufferResource {
     // state any producer creates today -- means an ordinary single descriptor and every path below
     // behaves exactly as before.
     std::vector<std::vector<uint32_t>> table_entries;
+    // Internal immutable device-local transaction plane. No host/guest payload is uploaded for
+    // this binding. Its private owner prevents pool reuse until the ordered replay completes.
+    std::shared_ptr<const FragmentDrawGpuBuffer> fragment_draw_buffer;
     const uint32_t* buffer_words_data() const {
         return dwords_view && dwords_view_count
             ? dwords_view : (dwords.empty() ? nullptr : dwords.data());
@@ -707,6 +713,7 @@ inline BackendColorTargetStats backend_color_target_stats() {
 // that requires an ordered pass boundary. render_triangle_rgba is a thin single-draw wrapper (below).
 struct BackendDraw {
     std::shared_ptr<prosper::gpu::RasterQuadCollection> raster_quads;
+    std::shared_ptr<const prosper::gpu::RasterQuadInputs> fragment_draw_inputs;
     std::shared_ptr<const prosper::gpu::GraphicsOwnedWaveDraw> owned_waves;
     bool raster_quad_contract_modified = false;
     std::vector<uint32_t> vs, gs, fs;
@@ -1517,124 +1524,7 @@ inline BackendRenderTimingStats& backend_render_timing_stats_storage() {
 inline BackendRenderTimingStats backend_render_timing_stats() {
     return backend_render_timing_stats_storage();
 }
-
-// `seed_rgba` (optional): native-format pixels to PRELOAD the color attachment with before the draws
-// run (loadOp LOAD instead of the blue clear). This is real render-target memory semantics: a game
-// pass that draws into a target it (or an earlier submit) already rendered composites OVER that
-// content — without it every pass starts from the diagnostic blue clear, so cross-submit
-// accumulation (UE4's UI-onto-backbuffer after a separate composite submit) is lost. Null (the
-// default) keeps the blue-clear behavior byte-identical for every existing caller.
-// `clear_rgba` (optional): 4 floats (RGBA, Vulkan order) to clear the color attachment to when no
-// seed is supplied. Null keeps the legacy diagnostic blue — every test harness caller passes null,
-// so their behavior is byte-identical. The live renderer passes the game's decoded fast-clear color
-// (or opaque black when none), so real frames no longer start from blue (#309). PROSPER_CLEAR_DEBUG
-// forces the blue back on regardless, so unrendered areas can still be spotted during development.
-// Persistent Vulkan context. Creating a fresh instance+device PER render_draws_rgba call dominated
-// wall-clock — every submit paid full device init — which made a many-draw frame (real gameplay is
-// hundreds of draws/submit) impossibly slow and blocked headless scene investigation (#320). Create the
-// instance/physical-device/device/queue ONCE (lazy, thread-safe static init) and reuse it across every
-// call. Per-call Vulkan resources are created independently and are retained until their direct call
-// or explicit ordered submission batch completes. The context intentionally leaks at process exit.
-// LIFETIME INVARIANT: this context is intentionally never destroyed (no destructor; the device and
-// instance leak at process exit). The compute backend BORROWS this device (#1091) and calls
-// vkDestroyPipeline/vkFreeMemory on it at exit. Adding a destructor here that destroys the device
-// would therefore create an immediate use-after-free in ~VulkanComputeContext. Do not add one
-// without first giving compute an explicit release-before-teardown handshake.
-//
-// The mechanism on the compute side changed in #1704: that teardown now runs from a std::atexit
-// handler registered after vkCreateInstance, not from a function-local static's destructor, so it is
-// sequenced before any enabled Vulkan layer's own statics. That also makes the ordering against THIS
-// context defined rather than unspecified — borrowing this device requires this context to already
-// exist, so compute's handler is always registered later and therefore always runs first.
-//
-// Which means the specific use-after-free warned about above is now ordered away: a destructor added
-// here would be registered earlier and would run after compute has released its objects. Do not read
-// that as permission. The reasons not to add one are now different, not gone: guest threads can still
-// be dispatching when exit() begins (execute_live_compute_items declines once the handler has run,
-// but the window is not closed), and BorrowedComputeImageLease holds a raw VulkanComputeContext*.
-// Give compute an explicit release-before-teardown handshake before adding a destructor here.
-struct RenderVkCtx {
-    VkInstance inst = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
-    // Non-null only under PROSPER_VK_VALIDATION; without it the layer has no output sink.
-    VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
-    VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
-    // Driver compilation data, distinct from the map retaining prosper's VkPipeline handles.
-    // Retained with this process-lifetime device. Access uses graphics_driver_cache_mutex().
-    VkPipelineCache driver_pipeline_cache = VK_NULL_HANDLE;
-    prosper::frontend::PipelineCacheFile driver_cache_file;
-    size_t driver_cache_loaded_bytes = 0;
-    VkDeviceSize storage_buffer_alignment = 1;
-    double timestamp_period_ns = 0.0;
-    uint32_t timestamp_valid_bits = 0;
-    bool aniso_enabled = false; float max_aniso_limit = 1.0f;
-    bool depth_bias_clamp_enabled = false;   // VkPhysicalDeviceFeatures::depthBiasClamp (#1349)
-    bool logic_op_enabled = false; bool ok = false;
-    bool geometry_shader_enabled = false;
-    bool fragment_stores_atomics = false;
-    // Enabled robust2 plus <=4-byte range rounding: word-buffer OOB reads deterministically zero.
-    bool deterministic_storage_reads = false;
-    prosper::gpu::FloatTransportConfig float_transport{};
-    // Per-draw "fragment funnel" diagnostic (PROSPER_DRAW_STATS): pipeline-statistics + precise
-    // occlusion queries. Enabled at device creation only when advertised; inert otherwise.
-    bool pipeline_stats_enabled = false;
-    bool occlusion_precise = false;
-    // Geometry-probe (PROSPER_GEOM_PROBE): transform feedback for final clip-space positions.
-    bool transform_feedback_enabled = false;
-    bool subgroup_size_control = false;
-    // Optional workgroup-based pre-rasterization path for merged NGG/GS programs. A native
-    // subgroup of 64 is not required: guest wave64 can span multiple host subgroups.
-    bool mesh_shader_enabled = false;
-    // A 3D image's 2D-array attachment view is core on ordinary Vulkan 1.1+ devices, but
-    // portability-subset implementations may decline this particular image-view operation.
-    bool image_view_2d_on_3d = true;
-    // VkPhysicalDeviceFeatures::textureCompressionBC, enabled when advertised. Native BCn sampled
-    // uploads additionally require per-format optimal-tiling support; see
-    // backend_native_bc_sampled_supported().
-    bool texture_compression_bc = false;
-    // VK_EXT_memory_budget, enabled when advertised (#3873): lets the texture-cache budget follow the
-    // driver's live heapBudget/heapUsage instead of a fixed fraction of the heap size. `unified_memory`
-    // is true for any device that is not a discrete GPU, whose device-local heap is system RAM.
-    bool memory_budget_enabled = false;
-    bool unified_memory = false;
-    VkPhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
-    PFN_vkCmdDrawMeshTasksEXT cmd_draw_mesh_tasks = nullptr;
-    // Runtime-selected storage buffers (#2412). Successful contracts are bounded fixed arrays, so the
-    // only descriptor-indexing feature they require is non-uniform storage-buffer array indexing.
-    //
-    // Measured available on both lanes' hardware: RADV STRIX_HALO and RTX 4090 report all of them true.
-    // The AMD device additionally reports `…NonUniformIndexingNative = false`, which is a performance
-    // note and not a correctness one here: our index is computed in scalar registers so it is
-    // wave-uniform, and a driver waterfall over the distinct values present converges in one iteration.
-    bool descriptor_indexing = false;
-    bool storage_buffer_int64_atomics = false;
-    // What this device offers the recompiled storage-image path (#3531): acquired by the same
-    // shared helper the compute backend's own device uses, and published to SharedVulkanContext so
-    // an adopting consumer inherits the verdict instead of assuming it.
-    prosper::frontend::StorageImageDeviceFeatures storage_image_features{};
-    bool compute_full_subgroups = false;
-    uint32_t min_subgroup_size = 0, max_subgroup_size = 0;
-    uint32_t max_compute_workgroup_subgroups = 0;
-    uint32_t max_compute_workgroup_size_x = 0;
-    uint32_t max_compute_workgroup_invocations = 0;
-    VkPhysicalDeviceLimits detile_limits{};
-    bool queue_supports_compute = false;
-    // Same intentional process lifetime as the device; creation is protected by
-    // BackendPersistentResourceGuard, including frontend preflight calls.
-    mutable std::array<GpuDetilePipeline*, 4> detile_pipelines{};
-    VkShaderStageFlags required_subgroup_size_stages = 0;
-    VkShaderStageFlags subgroup_stages = 0;
-    VkSubgroupFeatureFlags subgroup_operations = 0;
-    // Present unification (#1270): so prosper-app can adopt THIS device for its swapchain and blit the
-    // renderer's front-buffer image straight to the screen (no 4K CPU round-trip). All additive and
-    // only when advertised, so the headless test/screenshot path is byte-for-byte unchanged: on a
-    // display-less target the surface instance-extensions and VK_KHR_swapchain are simply absent, these
-    // stay false, and prosper-app falls back to its own separate present device + CPU pixels.
-    bool present_surface_capable = false;   // instance enabled VK_KHR_surface (+ a platform surface ext)
-    bool present_swapchain_capable = false; // device enabled VK_KHR_swapchain
-    VkQueue present_queue = VK_NULL_HANDLE; // dedicated 2nd queue when the family has >=2, else == queue
-    bool present_queue_shared = false;      // present_queue aliases the render queue -> submits need a mutex
-};
+#include "render_vk_context.h"
 inline std::atomic<const RenderVkCtx*>& published_render_cache_context() {
     static std::atomic<const RenderVkCtx*> context{nullptr};
     return context;
@@ -2183,6 +2073,7 @@ inline const RenderVkCtx& render_vk_ctx() {
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
+        r.shader_int64_enabled = feats.shaderInt64;
         if (prosper::gpu::breadcrumbs_requested())
             prosper::gpu::breadcrumb_arm_device(r.dev, r.phys, breadcrumb_support,
                                                 breadcrumb_fault_enabled, "render");
@@ -4907,267 +4798,7 @@ inline PersistentColorTargetImage* ensure_persistent_color_target_for_compute_ov
     persistent_color_target_bytes() += requirements.size;
     return &target;
 }
-
-// Storage-buffer contents are rewritten for every synchronous render call, but their Vulkan object
-// shapes repeat heavily. Keep capacity-class host-coherent buffers mapped between calls so the hot path
-// only copies bytes. The backend normally packs call-local logical uploads into aligned slices of a few
-// pooled arenas; the same pool also backs the per-upload fallback. A call or explicit submission batch
-// completes before returning buffers, so no in-flight GPU work can observe a later upload. Descriptors
-// retain exact logical offsets and ranges, so capacity padding and neighboring arena slices remain
-// shader-inaccessible.
-struct RenderHostBuffer {
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    void* mapped = nullptr;
-    VkDeviceSize bytes = 0;
-    VkDeviceSize allocation_bytes = 0;
-    // Release order, stamped when the buffer enters the cache. Only meaningful for cached entries;
-    // it is what makes eviction least-recently-used rather than arbitrary (#1284).
-    uint64_t last_use = 0;
-};
-
-struct RenderHostBufferPool {
-    // A deque per capacity class, ordered oldest-release at the front. Acquire takes the BACK (the
-    // most recently released buffer of that class, so the hottest pages come back first) and
-    // eviction takes the FRONT (the least recently released). A vector cannot do both in O(1).
-    std::unordered_map<VkDeviceSize, std::deque<RenderHostBuffer>> available;
-    VkDeviceSize cached_bytes = 0;
-    size_t cached_buffers = 0;
-    uint64_t hits = 0;
-    uint64_t misses = 0;
-    uint64_t evictions = 0;
-    // Monotonic release counter; see RenderHostBuffer::last_use.
-    uint64_t release_clock = 0;
-};
-
-struct RenderHostBufferPoolStats {
-    VkDeviceSize cached_bytes = 0;
-    size_t cached_buffers = 0;
-    uint64_t hits = 0;
-    uint64_t misses = 0;
-    uint64_t evictions = 0;
-};
-
-inline RenderHostBufferPool& render_host_buffer_pool() {
-    static thread_local RenderHostBufferPool pool;
-    return pool;
-}
-
-inline bool render_host_buffer_pool_enabled() {
-    return getenv("PROSPER_NO_BACKEND_BUFFER_POOL") == nullptr;
-}
-
-// Which capacity class holds the least-recently-released cached buffer.
-//
-// Eviction used to take `pool.available.begin()` — an arbitrary `unordered_map` bucket — so under
-// pressure the pool discarded whichever class the hash happened to order first, which is very often
-// the class about to be needed again. That is the failure mode that survives any budget smaller than
-// the working set, so it is fixed independently of the budget (#1284).
-//
-// Each deque is ordered oldest-release at the front, so only the fronts can be the global oldest and
-// the scan is over the number of capacity classes (~20-30 power-of-two sizes), not cached entries.
-// Pure over pool state so the policy is unit-testable without a Vulkan device.
-inline bool render_host_buffer_pool_lru_key(const RenderHostBufferPool& pool,
-                                            VkDeviceSize& key_out) {
-    bool found = false;
-    uint64_t oldest = 0;
-    for (const auto& [capacity, entries] : pool.available) {
-        if (entries.empty()) continue;
-        const uint64_t stamp = entries.front().last_use;
-        if (!found || stamp < oldest) {
-            found = true;
-            oldest = stamp;
-            key_out = capacity;
-        }
-    }
-    return found;
-}
-
-// Host physical memory, for the memory-aware pool budget below. Duplicated rather than shared with
-// the frontend's identical helper because this header is included BY the frontend, so taking the
-// dependency the other way would invert the include order.
-inline uint64_t render_host_physical_memory_bytes() {
-#if defined(_WIN32)
-    MEMORYSTATUSEX status{};
-    status.dwLength = sizeof(status);
-    return GlobalMemoryStatusEx(&status) ? status.ullTotalPhys : 0;
-#else
-    const long pages = sysconf(_SC_PHYS_PAGES);
-    const long page_size = sysconf(_SC_PAGE_SIZE);
-    if (pages <= 0 || page_size <= 0) return 0;
-    return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
-#endif
-}
-
-// Budget for retained host-visible staging buffers.
-//
-// This was a flat 256 MiB, which is not a cache for a 3D title: Blue Prince's per-submit staging
-// working set measures 974 MiB across 503 buffers, so the pool ran permanently at its ceiling with
-// evictions EXACTLY equal to misses (~216k of each) — one buffer destroyed for every one created.
-// Raising it to 2 GiB on that title took the backend submit from 203.06 to 125.98 ms, -34.8 %
-// normalised per draw, and dropped evictions to zero (#1284).
-//
-// Sized as a fraction of host RAM rather than a bigger constant, mirroring
-// `texture_decode_cache_limit_bytes`. The floor is the historical 256 MiB, so no host is given LESS
-// than before; the ceiling bounds the worst case. An explicit `PROSPER_BACKEND_BUFFER_POOL_MB` wins
-// outright, including values below the floor, because it is also the A/B lever and a constrained-host
-// escape hatch. Pure and separated from `getenv` so it can be unit-tested across host sizes.
-inline VkDeviceSize render_host_buffer_pool_limit_bytes(const char* override_mib,
-                                                        uint64_t physical_memory_bytes) {
-    constexpr uint64_t kMiB = 1024ull * 1024ull;
-    constexpr uint64_t kMinBytes = 256ull * kMiB;
-    constexpr uint64_t kMaxBytes = 2048ull * kMiB;
-    if (override_mib) {
-        const uint64_t mib = strtoull(override_mib, nullptr, 10);
-        if (mib > UINT64_MAX / kMiB) return VkDeviceSize{UINT64_MAX};
-        return static_cast<VkDeviceSize>(mib * kMiB);
-    }
-    if (!physical_memory_bytes) return static_cast<VkDeviceSize>(kMinBytes);
-    uint64_t bytes = std::clamp(physical_memory_bytes / 8u, kMinBytes, kMaxBytes);
-    bytes -= bytes % kMiB;
-    return static_cast<VkDeviceSize>(bytes);
-}
-
-inline VkDeviceSize render_host_buffer_pool_limit() {
-    static const VkDeviceSize limit = []() -> VkDeviceSize {
-        const uint64_t physical = render_host_physical_memory_bytes();
-        const VkDeviceSize bytes = render_host_buffer_pool_limit_bytes(
-            getenv("PROSPER_BACKEND_BUFFER_POOL_MB"), physical);
-        fprintf(stderr,
-                "[render] backend host-buffer pool budget = %.1f MiB (host physical %.1f GiB)\n",
-                bytes / (1024.0 * 1024.0), physical / (1024.0 * 1024.0 * 1024.0));
-        return bytes;
-    }();
-    return limit;
-}
-
-inline VkDeviceSize render_host_buffer_arena_size() {
-    static const VkDeviceSize bytes = []() -> VkDeviceSize {
-        // The max(4, ...) floor means a typo does not crash -- it silently builds a FOUR-BYTE
-        // arena, which is the worst kind of wrong setting: plausible, survivable, and slow (#3267).
-        const char* value = getenv("PROSPER_BACKEND_BUFFER_ARENA_KB");
-        const uint64_t kib = prosper::diag::env_u64_or_default_capped(
-            "PROSPER_BACKEND_BUFFER_ARENA_KB", value, 1024ull, UINT64_MAX / 1024ull, "KiB");
-        return std::max<VkDeviceSize>(4, static_cast<VkDeviceSize>(kib) * 1024ull);
-    }();
-    return bytes;
-}
-
-inline void destroy_render_host_buffer(VkDevice device, RenderHostBuffer& buffer) {
-    if (buffer.mapped) vkUnmapMemory(device, buffer.memory);
-    if (buffer.buffer) vkDestroyBuffer(device, buffer.buffer, nullptr);
-    if (buffer.memory) prosper::gpu::free_device_memory(device, buffer.memory);
-    buffer = {};
-}
-
-inline VkDeviceSize render_host_buffer_capacity(VkDeviceSize bytes) {
-    VkDeviceSize capacity = 4;
-    while (capacity < bytes && capacity <= UINT64_MAX / 2) capacity *= 2;
-    return capacity < bytes ? bytes : capacity;
-}
-
-inline RenderHostBuffer acquire_render_host_buffer(const RenderVkCtx& ctx,
-                                                   VkDeviceSize bytes) {
-    if (!bytes) return {};
-    const VkDeviceSize capacity = render_host_buffer_capacity(bytes);
-    RenderHostBufferPool& pool = render_host_buffer_pool();
-    auto found = pool.available.find(capacity);
-    if (found != pool.available.end() && !found->second.empty()) {
-        RenderHostBuffer buffer = found->second.back();
-        found->second.pop_back();
-        if (found->second.empty()) pool.available.erase(found);
-        pool.cached_bytes -= buffer.allocation_bytes;
-        --pool.cached_buffers;
-        ++pool.hits;
-        return buffer;
-    }
-    ++pool.misses;
-
-    RenderHostBuffer buffer;
-    buffer.bytes = capacity;
-    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    info.size = capacity;
-    // INDEX as well as STORAGE, so one pool serves both. Index data used to take a dedicated
-    // vkCreateBuffer + vkAllocateMemory per indexed draw -- 55% of setup_fixed_ms and ~9% of a Blue
-    // Prince gameplay frame (#2253, measured by #2252's partition).
-    //
-    // Widening the usage does not change how existing storage users BIND or WRITE these buffers; it
-    // only makes the same memory legal for vkCmdBindIndexBuffer. It is not entirely free of the
-    // storage path, though, and the honest statement is about ALLOCATION rather than binding: an
-    // added usage bit can only narrow memoryRequirements.memoryTypeBits, so on a hypothetical device
-    // with no HOST_VISIBLE type accepting INDEX usage the arena would fail to allocate and the
-    // STORAGE path would fall back with it. That is a performance regression rather than a
-    // correctness one -- the dedicated-buffer fallback covers both -- and no such device is known.
-    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-    // TRANSFER_SRC only when PROSPER_BUFFER_ECHO is armed. The echo reads these slices back with
-    // vkCmdCopyBuffer, and VUID-vkCmdCopyBuffer-srcBuffer-00118 requires the source to carry the
-    // bit -- without it the diagnostic is itself invalid Vulkan, which validation reports 10 times
-    // on one replay and which no amount of plausible-looking output would have revealed. Gated
-    // rather than unconditional for the reason the comment above gives about INDEX: an added usage
-    // bit can only narrow memoryRequirements.memoryTypeBits, and the default allocation path must
-    // stay exactly as it is when the diagnostic is off.
-    static const bool echo_usage = getenv("PROSPER_BUFFER_ECHO") != nullptr;
-    if (echo_usage) info.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    if (vkCreateBuffer(ctx.dev, &info, nullptr, &buffer.buffer) != VK_SUCCESS)
-        return {};
-    VkMemoryRequirements requirements{};
-    vkGetBufferMemoryRequirements(ctx.dev, buffer.buffer, &requirements);
-    buffer.allocation_bytes = requirements.size;
-    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocation.allocationSize = requirements.size;
-    allocation.memoryTypeIndex = render_memory_type(
-        ctx.phys, requirements.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (allocation.memoryTypeIndex == UINT32_MAX ||
-        prosper::gpu::allocate_device_memory(ctx.dev, &allocation, &buffer.memory) != VK_SUCCESS ||
-        vkBindBufferMemory(ctx.dev, buffer.buffer, buffer.memory, 0) != VK_SUCCESS ||
-        vkMapMemory(ctx.dev, buffer.memory, 0, VK_WHOLE_SIZE, 0, &buffer.mapped) != VK_SUCCESS) {
-        destroy_render_host_buffer(ctx.dev, buffer);
-        return {};
-    }
-    return buffer;
-}
-
-inline void release_render_host_buffer(VkDevice device, RenderHostBuffer buffer) {
-    if (!buffer.buffer || !buffer.memory || !buffer.mapped) {
-        destroy_render_host_buffer(device, buffer);
-        return;
-    }
-    constexpr size_t max_cached_buffers = 4096;
-    const VkDeviceSize limit = render_host_buffer_pool_limit();
-    if (!limit || buffer.allocation_bytes > limit) {
-        destroy_render_host_buffer(device, buffer);
-        return;
-    }
-
-    std::vector<RenderHostBuffer> evicted;
-    RenderHostBufferPool& pool = render_host_buffer_pool();
-    while ((pool.cached_buffers >= max_cached_buffers ||
-            pool.cached_bytes > limit - buffer.allocation_bytes) &&
-           !pool.available.empty()) {
-        VkDeviceSize victim_key = 0;
-        if (!render_host_buffer_pool_lru_key(pool, victim_key)) break;
-        auto victim = pool.available.find(victim_key);
-        if (victim == pool.available.end() || victim->second.empty()) break;
-        RenderHostBuffer old = victim->second.front();
-        victim->second.pop_front();
-        if (victim->second.empty()) pool.available.erase(victim);
-        pool.cached_bytes -= old.allocation_bytes;
-        --pool.cached_buffers;
-        ++pool.evictions;
-        evicted.push_back(old);
-    }
-    if (pool.cached_buffers < max_cached_buffers &&
-        pool.cached_bytes <= limit - buffer.allocation_bytes) {
-        buffer.last_use = ++pool.release_clock;
-        pool.available[buffer.bytes].push_back(buffer);
-        pool.cached_bytes += buffer.allocation_bytes;
-        ++pool.cached_buffers;
-        buffer = {};
-    }
-    for (RenderHostBuffer& old : evicted) destroy_render_host_buffer(device, old);
-    if (buffer.buffer) destroy_render_host_buffer(device, buffer);
-}
+#include "render_host_buffer_pool.h"
 
 // Immutable storage uploads are independent of the guest mapping after preparation. The cache
 // owns whole allocations, never arena slices. A submission's shared owner survives eviction and
@@ -8797,6 +8428,10 @@ inline uint64_t backend_pass_source_submit(std::span<const BackendDraw> draws) {
 // Shared live/test renderer owner; it deliberately uses the same device, buffer pool and ordered
 // completion machinery, not a second standalone Vulkan harness.
 #include "fixtures/raster_quad_collection_gpu.h"
+#include "fixtures/fragment_draw_storage_gpu.h"
+#include "fixtures/fragment_draw_compute_gpu.h"
+#include "fixtures/fragment_draw_collect_gpu.h"
+#include "fixtures/fragment_draw_backend_transaction.h"
 #include "fixtures/owned_graphics_wave_gpu.h"
 
 inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> draws,
@@ -8839,6 +8474,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     resource_reuse_stats = {};
     BackendTextureUploadStats& texture_stats = backend_texture_upload_stats_storage();
     texture_stats = {}; // An empty or failed pass must not report the previous call's uploads.
+    fragment_draw_backend_stats() =
+        {};   // recorded transaction counters never imply GPU completion
     maybe_report_hash_stats();   // gated cumulative hashing economics (#1268)
     std::vector<uint8_t> out;
     if (out_rgba1) out_rgba1->clear();
@@ -10769,6 +10406,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         return bits;
     };
     std::vector<DV> dv(draws.size());
+    std::shared_ptr<FragmentDrawBackendBatch> fragment_draw_batch;
+    if (std::any_of(draws.begin(), draws.end(),
+                    [](const BackendDraw& draw) { return bool(draw.fragment_draw_inputs); }))
+        fragment_draw_batch =
+            std::make_shared<FragmentDrawBackendBatch>(ctx, draws, W, H, color_count);
     // Preserve the frontend's exact descriptor order while borrowing either the complete resource or
     // its compact buffer-only carrier. The references are synchronous: every pointed-to vector belongs
     // to `draws`, which outlives this call. Synthetic GDS entries are owned alongside these views.
@@ -10781,7 +10423,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     std::vector<FrameBufferResource> synthetic_gds(draws.size());
     std::vector<std::vector<EffectiveResource>> effective_resources(draws.size());
     for (size_t i = 0; i < draws.size(); ++i) {
-        const BackendDraw& draw = draws[i];
+        const BackendDraw& draw =
+            fragment_draw_batch ? fragment_draw_batch->draw(i, draws[i]) : draws[i];
         auto& effective = effective_resources[i];
         effective.reserve(draw.R.size() + draw.B.size() + 1);
         if (draw.resource_order.empty()) {
@@ -10795,7 +10438,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 else effective.push_back({&draw.R[index], nullptr});
             }
         }
-        if (fragment_uses_internal_gds_memoized(draws[i].fs_identity, draws[i].fs_words())) {
+        if ((!fragment_draw_batch || !fragment_draw_batch->replay(i)) &&
+            fragment_uses_internal_gds_memoized(draw.fs_identity, draw.fs_words())) {
             FrameBufferResource& gds = synthetic_gds[i];
             gds.set = 1;
             gds.binding = 0;
@@ -11024,7 +10668,18 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         descriptor_sets += set_count;
     }
     VkDescriptorPool shared_descriptor_pool = VK_NULL_HANDLE;
-    if (descriptor_sets) {
+    if (fragment_draw_batch) {
+        descriptor_sets += fragment_draw_batch->additional_sets();
+        storage_buffers += fragment_draw_batch->additional_storage_descriptors();
+    }
+    const bool descriptor_pool_counts_fit =
+        descriptor_sets <= UINT32_MAX && storage_buffers <= UINT32_MAX &&
+        sampled_images <= UINT32_MAX && storage_images <= UINT32_MAX;
+    if (!descriptor_pool_counts_fit)
+        std::fprintf(
+            stderr,
+            "[render] descriptor pool count overflow; no descriptor-bearing draw admission\n");
+    if (descriptor_sets && descriptor_pool_counts_fit) {
         VkDescriptorPoolSize sizes[3] = {
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
              static_cast<uint32_t>(std::max<uint64_t>(storage_buffers, 1))},
@@ -11149,7 +10804,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         if (wave64_census) wave64_stats.note_draw(W, H);
         prosper::gpu::draw_disposition_census().note_seen();
         const auto setup_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-        const BackendDraw& bd = draws[di];
+        const BackendDraw& bd =
+            fragment_draw_batch ? fragment_draw_batch->draw(di, draws[di]) : draws[di];
         const std::vector<uint32_t>& bd_vs = bd.vs_words();
         const std::vector<uint32_t>& bd_gs = bd.gs_words();
         const std::vector<uint32_t>& bd_fs = bd.fs_words();
@@ -11229,7 +10885,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // ONE binary rather than a comparison of two builds. Kept as a permanent bisection lever for
         // the same reason PROSPER_NO_INDEX_ARENA (#2258) and the PROSPER_NO_BACKEND_* family exist.
         static const bool no_subgroup_scan_memo = getenv("PROSPER_NO_SUBGROUP_SCAN_MEMO") != nullptr;
-        bool subgroup_scan_memoized = false;
+        bool subgroup_scan_memoized = fragment_draw_batch && fragment_draw_batch->replay(di);
         if (bd.fs_identity && !no_subgroup_scan_memo) {
             const auto found = subgroup_scan_memo.find(bd.fs_identity);
             if (found != subgroup_scan_memo.end()) {
@@ -11267,8 +10923,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupShuffle;
         if (ctx.subgroup_operations & VK_SUBGROUP_FEATURE_BALLOT_BIT)
             available_fragment_subgroup_features |= prosper::gpu::kFragmentSubgroupBallot;
-        const bool uses_internal_gds =
-            fragment_uses_internal_gds_memoized(bd.fs_identity, bd_fs);
+        const bool uses_internal_gds = (!fragment_draw_batch || !fragment_draw_batch->replay(di)) &&
+                                       fragment_uses_internal_gds_memoized(bd.fs_identity, bd_fs);
         bool fragment_subgroup_skip = required_fragment_subgroup_size &&
             (!ctx.subgroup_size_control ||
              required_fragment_subgroup_size < ctx.min_subgroup_size ||
@@ -13256,6 +12912,23 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     draw_lb[i].stageFlags = (bd.mesh_draw ? VK_SHADER_STAGE_MESH_BIT_EXT
                                                          : VK_SHADER_STAGE_VERTEX_BIT) |
                                              VK_SHADER_STAGE_FRAGMENT_BIT;
+                    if (r.fragment_draw_buffer) {
+                        if (r.is_internal_gds || !r.table_entries.empty() ||
+                            r.buffer_words_data() || r.direct_guest_buffer_addr ||
+                            !r.fragment_draw_buffer->valid_for(
+                                dev, ctx.detile_limits.maxStorageBufferRange)) {
+                            buffer_resources_ready = false;
+                            break;
+                        }
+                        draw_dbi[draw_dbi_offset[i]] = {r.fragment_draw_buffer->buffer(), 0,
+                                                        r.fragment_draw_buffer->bytes()};
+                        draw_wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                        draw_wr[i].dstBinding = r.binding;
+                        draw_wr[i].descriptorCount = 1;
+                        draw_wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                        draw_wr[i].pBufferInfo = &draw_dbi[draw_dbi_offset[i]];
+                        continue;
+                    }
                     if (r.is_internal_gds) {
                         const RenderHostBuffer& gds = render_internal_gds_buffer();
                         draw_dbi[i] = {gds.buffer, 0, 64u * 1024u};
@@ -13427,6 +13100,12 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             for (size_t i = 0; i < R.size(); i++)
                 draw_wr[i].dstSet = v.dsets[R[i].common().set];
             vkUpdateDescriptorSets(dev, static_cast<uint32_t>(draw_wr.size()), draw_wr.data(), 0, nullptr);
+        }
+        if (fragment_draw_batch && !fragment_draw_batch->allocate(di, shared_descriptor_pool)) {
+            texture_path_census.skipped_draw();
+            prosper::gpu::draw_disposition_census().note_dropped(
+                prosper::gpu::DrawDrop::PipelineCreation);
+            continue;
         }
         const auto setup_resources_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) setup_resources_ms += setup_elapsed_ms(setup_fixed_ready, setup_resources_ready);
@@ -14712,10 +14391,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         record_stencil_dynamic_state(command, v);
         record_pipeline_dynamic_state(command, v);
     };
+    if (fragment_draw_batch) fragment_draw_batch->record(cmd, std::span<const DV>(dv));
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (size_t di = 0; di < dv.size(); di++) {
         auto& v = dv[di];
         const auto* ps = draws[di].ps;
+        // Failed whole-draw emulation may not execute unconditional DS clears before v.ok.
+        // Admitted first-recipe replays have all DS tests/writes/clears disabled independently.
+        if (fragment_draw_batch && fragment_draw_batch->attachment_guard(di) && !v.ok) continue;
         if (use_ds && ps &&
             (effective_depth_clear(ps) ||
              stencil_clear_effective(ps->stencil_clear_enable, ps->stencil_enable,
@@ -16015,18 +15698,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     command_pool_lease.dismiss();
     active_submission.add_cleanup(
         [dev, qfi, pool, cmd, dv = std::move(dv), shared_descriptor_pool,
+         fragment_draw_batch = std::move(fragment_draw_batch),
          shared_pipeline_layouts = std::move(shared_pipeline_layouts),
          shared_descriptor_set_layouts = std::move(shared_descriptor_set_layouts),
          shared_texture_bindings = std::move(shared_texture_bindings),
          shared_buffers = std::move(shared_buffers),
          shared_buffer_arenas = std::move(shared_buffer_arenas),
          texture_uploads = std::move(texture_uploads), seedbuf, seedmem, seedbuf1, seedmem1,
-         extra_seedbufs, extra_seedmems,
-         rb, bmem, fb, rp, transient_color, volume_color, view, img, imem,
-         transient_color1, view1, img1,
-         transient_extra,
-         imem1, color_count, extra_views, extra_images, extra_memories,
-         transient_ds, dview, dimg, dmem, ds_stats_pool, ds_occ_pool,
+         extra_seedbufs, extra_seedmems, rb, bmem, fb, rp, transient_color, volume_color, view, img,
+         imem, transient_color1, view1, img1, transient_extra, imem1, color_count, extra_views,
+         extra_images, extra_memories, transient_ds, dview, dimg, dmem, ds_stats_pool, ds_occ_pool,
          geom_buf, geom_mem, geom_counter, geom_counter_mem, ctx_ptr,
          color_target_generation]() mutable {
             release_render_command_pool(dev, qfi, RenderCommandPoolLease{pool, cmd});
@@ -16054,7 +15735,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 if (layout.handle && !layout.persistent)
                     vkDestroyPipelineLayout(dev, layout.handle, nullptr);
             for (const auto& [key, layout] : shared_descriptor_set_layouts)
-                if (layout.handle && !layout.persistent) vkDestroyDescriptorSetLayout(dev, layout.handle, nullptr);
+                if (layout.handle && !layout.persistent)
+                    vkDestroyDescriptorSetLayout(dev, layout.handle, nullptr);
             for (const SharedTextureBinding& binding : shared_texture_bindings) {
                 if (!binding.persistent) {
                     if (binding.sampler) vkDestroySampler(dev, binding.sampler, nullptr);
@@ -16081,8 +15763,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                     !upload.borrowed_compute && !upload.borrowed_ds)
                     vkDestroyImage(dev, upload.image, nullptr);
                 if (upload.memory) {
-                    if (upload.direct_memory) prosper::gpu::free_device_memory(dev, upload.memory);
-                    else release_transient_render_memory(dev, upload.memory);
+                    if (upload.direct_memory)
+                        prosper::gpu::free_device_memory(dev, upload.memory);
+                    else
+                        release_transient_render_memory(dev, upload.memory);
                 }
                 // #3405: the cache owns its blocks and answers true even for a duplicate
                 // release, so the generic teardown can never free an allocation it still maps.

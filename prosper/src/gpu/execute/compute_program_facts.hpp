@@ -30,15 +30,17 @@
 #include <vector>
 
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/diagnostics/refused_shader_dump.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 
 namespace prosper::gpu {
 
 struct ComputeProgramFacts {
-    std::vector<uint32_t> code;             // exact bytes the facts were derived from
+    std::vector<uint32_t> code;   // exact bytes the facts were derived from
+    RefusedShaderMemo refused_shader_memo;
     uint64_t address = 0;
-    std::vector<Rdna2Inst> decoded;         // rdna2_walk(code, dwords)
+    std::vector<Rdna2Inst> decoded;   // rdna2_walk(code, dwords)
     bool prefers_native_multiwave = false;  // compute_shader_prefers_native_multiwave(decoded, ...)
     bool uses_gds = false;                  // a DS GDS access the dispatch must bind a buffer for
     // Terminal reject reasons the probe recorded, replayed for the current address on every use.
