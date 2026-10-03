@@ -147,7 +147,7 @@ getenv|prosper/src/host/symbols/il2cpp_symbols.cpp 1
 getenv|prosper/src/host/tls/guest_tls.cpp 6
 getenv|prosper/src/loader/linker.cpp 1
 getenv|prosper/src/self/module.cpp 5
-getenv|prosper/tests/fixtures/render_runner.h 100
+getenv|prosper/tests/fixtures/render_runner.h 96
 blocking-sync|prosper/frontends/prosper-app/fps_overlay.cpp|vkDeviceWaitIdle 1
 blocking-sync|prosper/frontends/prosper-app/library_media.cpp|vkDeviceWaitIdle 1
 blocking-sync|prosper/frontends/prosper-app/library_media.cpp|vkWaitForFences 1
