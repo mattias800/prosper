@@ -2670,9 +2670,13 @@ if(TARGET prosper_core)
       LIBRARIES prosper_core Vulkan::Vulkan)
   endif()
 
-  add_executable(test_rdna2_decode tests/gpu/recompiler/test_rdna2_decode.cpp)
-  target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
-  add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
+  prosper_add_gtest(test_rdna2_decode
+    SOURCES tests/gpu/recompiler/test_rdna2_decode.cpp
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_rdna2_predicate_tables
+    SOURCES tests/gpu/recompiler/test_rdna2_predicate_tables.cpp
+    LIBRARIES prosper_core)
 
   # Exhaustive per-family opcode/length sweep of the walker (words built from the encoding layout).
   prosper_add_gtest(test_rdna2_decode_sweep
