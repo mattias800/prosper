@@ -47,6 +47,25 @@ is process-wide, so independently taken values in unrelated translation units co
 no anchor or registry. Anything that needs to be time-ordered against a diagnostic in another
 subsystem should stamp it rather than grow a private clock.
 
+`native_host_wait.{hpp,cpp}` is the Windows observation-only companion to the guest-thread dump
+(#4330). `PROSPER_HOST_WAIT_OBSERVE` is a process-start presence switch, default off. It records
+only the actual empty-equeue and contended-pthread-once native condition-wait CALL scopes,
+including their relock/return boundary, not kernel parking, mutex ownership or deadlock causality.
+It is deliberately separate from `sync_futex`: observing a native C++ wait grants no wake or
+interrupt authority. The 512 atomic slots support nested scopes and generation-checked retirement;
+a sampler never takes a publisher lock while its target is suspended. The cached gate is resolved
+before suspension; formatting is after resume. Disabled producers do not read TID/clock or publish.
+
+The report labels its narrow scope, unarmed fields as `n/a`, absence as unobserved rather than no
+host wait, global dropped registrations, unstable publications and per-thread output omissions
+(`found` versus `stored`). Independent totals are not a coherent partition or current loss count.
+Ordinary scope return and the existing normal thread-retirement notification withdraw observations;
+abrupt termination in the middle of publication can leave an unstable slot and is not cleared by
+guessing its owner. Raw host-stack output still retains at most six unique executable PROSPER
+candidates: it now names the examined copied-window prefix and whether it hit the bound. Neither
+an entire copied window nor these raw words certifies a CFI/backtrace chain or full thread coverage.
+Registered real equeue/once producer controls are distinct from the pure registry/report controls.
+
 `readback_refusal.{hpp,cpp}` observes selected early persistent-color readback refusals (#3891,
 #3948). `PROSPER_RTT_READBACK_TRACE_TARGETS=0xaddr[,0xaddr...]` uses the shared strict address
 parser and accepts at most eight unique nonzero addresses. Selection initializes at live-renderer

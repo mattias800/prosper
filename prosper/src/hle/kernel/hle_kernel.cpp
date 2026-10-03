@@ -1765,7 +1765,12 @@ HLE(k_pthread_once) {
         std::unique_lock<std::mutex> lk(om);
         int v = ctl->load(std::memory_order_acquire);
         if (v == 1) return 0;
-        if (v == 2) { ocv.wait(lk); continue; }   // another thread runs this control's init
+        if (v == 2) {   // observation ONLY; the same original wait/relock and retry
+            diagnostics::NativeHostWaitScope observation(
+                diagnostics::NativeHostWaitSite::PthreadOnce, (uintptr_t)ctl);
+            ocv.wait(lk);
+            continue;
+        }
         ctl->store(2, std::memory_order_relaxed);
         lk.unlock();
         init();
@@ -4748,6 +4753,7 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
     size_t condition_slots_used = 0;
     size_t condition_slots_capacity = 0;
     snapshot_guest_wait_registry(condition_slots_used, condition_slots_capacity);
+    const bool host_wait_armed = diagnostics::native_host_wait_observation_enabled();
     trace("[thread-trace] live guest threads=%u condition-slots=%zu/%zu\n", live,
           condition_slots_used, condition_slots_capacity);
     for (const WinGuestThreadSlot& slot : g_win_guest_threads) {
@@ -4812,6 +4818,11 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
         const size_t captured_wait_count = captured
             ? snapshot_guest_waits(native_id, captured_waits.data(), captured_waits.size())
             : 0;
+        std::array<diagnostics::NativeHostWaitRecord, 8> host_waits{};
+        const auto host_wait_snapshot =
+            captured && host_wait_armed
+                ? diagnostics::native_host_wait_registry().snapshot(native_id, host_waits)
+                : diagnostics::NativeHostWaitSnapshot{};
         if (prior_suspend != (DWORD)-1) ResumeThread(thread);
         CloseHandle(thread);
         if (!captured) {
@@ -4857,13 +4868,8 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
             guest_returns_used += (size_t)appended;
             ++guest_return_count;
         }
-        // Host-side companion to the guest scan above: name the PROSPER frames on the same stack.
-        // A sampled rip inside a system DLL (getenv, memcpy, a wait) says WHAT the thread is doing
-        // and nothing about WHY; the prosper frame below it is the answer, and without this the
-        // reader is left inferring it from the guest frame, which is often several calls away.
-        char host_returns[288] = "-";
-        diagnostics::scan_host_stack_candidates(
-            std::span(stack_words.data(), stack_bytes / sizeof(uint64_t)), host_returns,
+        const auto host_returns = diagnostics::scan_host_stack_candidates(
+            std::span(stack_words.data(), stack_bytes / sizeof(uint64_t)),
             guest_trace_page_executable, describe_code_address);
         char wait_description[256] = "-";
         if (captured_wait_count) {
@@ -4895,12 +4901,17 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
         }
         const int in_renderer_now = prosper_thread_in_renderer_callback(native_id) ? 1 : 0;
         trace("[thread-trace] tid=%lu pthread=0x%llx rip=%s "
-              "raw=0x%llx rsp=0x%llx suspend=%lu waits=%s in-renderer=%d guest-stack=%s host-stack=%s\n",
+              "raw=0x%llx rsp=0x%llx suspend=%lu waits=%s in-renderer=%d guest-stack=%s "
+              "host-stack=%s\n",
               (unsigned long)native_id, (unsigned long long)pthread_id,
               describe_code_address(rip).c_str(), (unsigned long long)rip,
-              (unsigned long long)context.Rsp, (unsigned long)prior_suspend,
-              wait_description, in_renderer_now,
-              guest_returns, host_returns);
+              (unsigned long long)context.Rsp, (unsigned long)prior_suspend, wait_description,
+              in_renderer_now, guest_returns, host_returns.text.data());
+        const auto host_wait_text = diagnostics::format_native_host_wait_trace(
+            native_id, host_returns, (size_t)stack_bytes / sizeof(uint64_t), host_wait_armed,
+            host_wait_snapshot, host_waits);
+        for (const auto& line : host_wait_text.lines)
+            if (line[0]) trace("%s", line.data());
     }
     // The instrument checks ITSELF, because its failure mode is silent and flattering.
     // prosper_thread_in_renderer_callback is weak in prosper_core and strongly overridden by the
@@ -5072,8 +5083,11 @@ void trace_guest_thread_lifecycle(bool starting, uint64_t pthread_id, uint64_t n
 #ifdef _WIN32
     if (starting)
         win_guest_thread_register(pthread_id, (uint32_t)native_id, stack_base, stack_size);
-    else
+    else {
         win_guest_thread_unregister((uint32_t)native_id);
+        if (diagnostics::native_host_wait_observation_enabled())
+            diagnostics::native_host_wait_registry().retire_thread((uint32_t)native_id);
+    }
     win_exc_trace(starting ? WinExcTraceKind::ThreadStart : WinExcTraceKind::ThreadExit,
                   pthread_id, (uint32_t)native_id, (uint64_t)(uintptr_t)stack_base,
                   (uint64_t)stack_size);
