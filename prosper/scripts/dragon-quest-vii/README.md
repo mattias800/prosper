@@ -99,7 +99,7 @@ early. Drive exploratory work with `PROSPER_PAD_SCRIPT_RELOAD=1` and watch the s
 trusting the timings, and re-anchor the route if you extend it.
 
 Two independent runs reach Estard, write `GameSaveData000.dat` and render the world. Neither
-demonstrates free player control — see `docs/DRAGON_QUEST_STATUS.md` for exactly what is and is not
+demonstrates free player control — see `docs/games/DRAGON_QUEST_STATUS.md` for exactly what is and is not
 established, and for the state of the composite in that phase.
 
 ## The field state — `reach-field-control.pad`

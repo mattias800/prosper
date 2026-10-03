@@ -5,7 +5,7 @@
 #
 # THIS TITLE NEEDS PROSPER_NULL_PAGE=1 TO BOOT AT ALL. Without it the guest's primary thread dies
 # 1.1 s in with SIGSEGV at addr=0x8, rip=eboot+0xe44346 -- a frame-pointer-chain unwinder reading
-# the return-address slot of a NULL frame pointer. See docs/BENEATH_STATUS.md; the underlying
+# the return-address slot of a NULL frame pointer. See docs/games/BENEATH_STATUS.md; the underlying
 # defect is tracked separately. Every window below is measured with that variable set.
 #
 # WHAT THE ROUTE HAS TO GET PAST, in the title's own words (strings from

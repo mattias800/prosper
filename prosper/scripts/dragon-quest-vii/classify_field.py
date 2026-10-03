@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """classify_field — every published number for PPSA17942's field state, from the captures.
 
-Committed because the alternative does not work: the figures in `docs/DRAGON_QUEST_STATUS.md` were
+Committed because the alternative does not work: the figures in `docs/games/DRAGON_QUEST_STATUS.md` were
 twice published from scratch analysis that nobody else could re-run, and twice they were wrong in
 ways a re-run would have caught. Everything this title claims is derived here, with the thresholds
 visible and a `--selftest` that pins them.

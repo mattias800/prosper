@@ -35,4 +35,4 @@ retiming. Cross is the title's own `UI_Select` *and* `Jump` (read out of its
 `InputSettingsKeyMappings` save), so surplus presses are harmless in gameplay.
 
 Prefer it over `reach-first-gameplay.pad` for anything past the menus. Background and the throughput
-wall it exists to survive: `prosper/docs/PLUCKY_SQUIRE_STATUS.md`, issues #2839 and #2837.
+wall it exists to survive: `prosper/docs/games/PLUCKY_SQUIRE_STATUS.md`, issues #2839 and #2837.

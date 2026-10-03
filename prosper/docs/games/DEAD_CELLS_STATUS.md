@@ -1,0 +1,254 @@
+# Dead Cells graphics status and regression workflow
+
+Last updated: 2026-07-15
+
+The operational route and selector reference is
+[`../scripts/dead-cells/README.md`](../../scripts/dead-cells/README.md). The gameplay-composition bug
+[#566](https://github.com/mattias800/ps5ys/issues/566) was fixed by #626; this document retains the exact
+checkpoint recipe as a regression and future-investigation workflow.
+The full-render progression investigation and its behavior-equivalence rows are documented in
+[`DEAD_CELLS_PROGRESSION_MATRIX.md`](DEAD_CELLS_PROGRESSION_MATRIX.md) and tracked by
+the now-closed [#723](https://github.com/mattias800/ps5ys/issues/723). The former native-Windows
+render-disabled divergence was tracked by the now-closed
+[#768](https://github.com/mattias800/ps5ys/issues/768).
+
+## Current state
+
+*Dead Cells* boots, passes the splash and menus, and loads `PrisonStart`. WSL/Linux native-speed and sampled-graphics
+routes reach the controllable Jump tutorial and have supplied full-color gameplay captures. Native Windows reaches
+the sustained 91-94 draw / 8-dispatch gameplay state both with rendering disabled and with every retained GPU submit
+fully executed and published. #768's former
+356-390-draw loop was not a renderer stall: `sceSaveDataDialogUpdateStatus` was unimplemented and returned `NONE`
+more than a thousand times while the game waited for `FINISHED`. After #766, a 240-second native-Windows full-render
+control completed `PARSEALL` in 22.94 seconds, first matched gameplay at 104.81 seconds, and accumulated 697 matches.
+This closes #723's progression bug; synchronous renderer throughput remains performance work. After renderer PRs
+#767 and #769, the native-Windows compute-enabled, render-disabled control also reaches the sustained gameplay
+signature; its earlier first-dispatch process exit is not reproducible on current `master`.
+
+The scene renders in full color, including geometry, lighting, smoke, silhouettes, the player, terrain, effects,
+the tutorial prompt, and the HUD. The final grayscale-world root cause was the fragment recompiler selecting the
+first color export from shaders that emit MRT3..MRT0; MRT0 now feeds the backend's single color attachment (#626).
+The same change set recovers a separately dropped format-copy dispatch by resolving its directly placed
+destination buffer descriptor at s4.
+
+Issue #773 exposed a later generic format gap as a giant translucent green/blue surface over gameplay. A
+deterministic operation-prefix replay localized the first bad composite to draw 23 sampling binding 36: a
+642x362 `Float16x4` lighting target produced by draws 17..22. The backend rendered and reuploaded that target as
+RGBA8, clamping HDR values before the composite. Renderer-owned RTTs now retain
+`VK_FORMAT_R16G16B16A16_SFLOAT` through attachment creation, readback/seed bytes, texture upload/views, and
+persistent target/texture/pipeline cache identities. Capture v13 records each RTT seed's native format while
+remaining able to read v1..v12 captures. The issue-773 pre-#780 77-submit source and its standalone v13 capsule
+were byte-identical at `9145002cabc36e97`; inspection shows one 642x362 `rgba16f` seed with 1,859,232 bytes.
+
+That native-format fix exposed a second temporal defect (#780): compute operation 19 writes the FP16 backing at
+`0x...50810000` with repeating half-float `(0,0,0,1)` before draws 17..22, resetting the lighting history. Guest
+GPU write notification invalidated the persistent Vulkan color target but left the frontend's older CPU RTT copy
+alive. Pass setup then uploaded that stale copy as `seed_rgba`, defeating the reset and feeding brightness back
+until the moving background became white/yellow. Guest GPU writes now discard every overlapping CPU RTT using
+the surface's native byte width. The corrected 77-submit bundle and regenerated standalone v13 capsule are
+byte-identical at `13b4ccdfa15b1f4d` (BMP SHA-256
+`6a4e88dbc163d6075b18b768b20d91cfb6467c76e61af6798e22ec6ea3d2c53c`). Live Windows validation found no
+remaining composition artifacts; localized banding in the window light is tracked separately in #781.
+
+The #781 investigation localized that remaining window-light pattern without finding a justified renderer
+change. In the deterministic `13b4ccdfa15b1f4d` capsule, compute operation 19 resets the FP16 lighting target,
+draws 17..22 build it, and draw 23 composites it with the base/history inputs. Draw 19 is the window light
+(pixel shader `35956264829da0c6`): a 69-vertex CPU-generated visibility polygon with additive blending. Its
+history input already contains the evolving rays, has uniform alpha, and builds progressively across
+producer-complete submit history. Disabling depth, forcing linear filtering on its history input, and changing
+its relevant varying to non-perspective interpolation did not change the output. Forcing linear filtering on
+draw 23's FP16 light input changed and softened the standalone image, but a matching live run retained the
+visible radial bands, so that override is not a fix. The successfully recompiled raw shader decodes to coherent
+radial-distance, visibility, and attenuation math, and its translated SPIR-V preserves that structure. Keep
+[#781](https://github.com/mattias800/ps5ys/issues/781) open, but do not spend more live-run time on it without a
+pixel-aligned hardware oracle or evidence of a generic error. The user judged the residual artifact low priority.
+
+Startup and progression are stable after implementing both AGC resource-registration output queries. The former
+success-only `QueryResourceRegistrationUserMemoryRequirements` stub left Dead Cells' stack value untouched and
+occasionally requested a multi-gigabyte texture-pool allocation (#660). A native-speed fresh-save matrix improved
+from 7/10 gameplay matches, two texture-memory crashes, and one timeout to 20/20 gameplay matches with no crash or
+timeout. The issue's 120-second live-render screenshot route also completes without the former lavapipe fault.
+
+The original mostly-white repeated-block image is not the current bug. It was caused by beginning diagnostic
+rendering after a required 642x362 temporal render-target producer had already run (#586). Do not use a
+35-second sparse-render screenshot as a color oracle.
+
+The important fixes already on `master` are:
+
+- mixed graphics/compute execution follows PM4 order (#584);
+- compute writes to a depth surface's HTILE allocation invalidate the detached Vulkan depth cache (#611);
+- four uniform VCCZ-exit fragment-lighting loops recompile through a narrowly proved structured form (#615);
+- failed operations retain bounded raw shaders and exact rejection diagnostics in capture v7 (#618);
+- capture v8 checkpoints complete color RTT state and persistent depth/stencil planes, including a source-output
+  hash oracle (#569);
+- directly placed compute buffer destinations resolve, so the current scene realizes all eight dispatches (#626);
+- MRT0, rather than the first-emitted non-color G-buffer plane, supplies the visible fragment output (#626);
+- AGC resource-registration memory requirements always initialize their output instead of leaking stack data into
+  the game's texture-pool allocation size (#660);
+- guest compute/DMA writes invalidate overlapping native-format CPU RTT snapshots as well as persistent Vulkan
+  targets, so a reset backing cannot be overwritten by stale temporal history (#780).
+
+The producer-complete post-#626 checkpoint realizes every semantic draw and all eight dispatches. Descriptor
+validation has not identified a missing or undersized binding in the exercised frame.
+
+## Bring-up history (relocated here from `CLAUDE.md`, 2026-08-01)
+
+Retained so the attribution is not lost. Current usage for every tool named here is in
+[`../tools/gpu_replay/README.md`](../../tools/gpu_replay/README.md),
+[`../tools/gpu_timeline/README.md`](../../tools/gpu_timeline/README.md) and
+[`../tools/AGENTS.md`](../../tools/AGENTS.md) — read those, not this section, for how to run anything.
+
+* Startup became reliable once **both** AGC resource-registration output queries were implemented
+  (#544, #660). The old success-only stubs left stack data in the max-name and required-memory
+  outputs, causing intermittent multi-gigabyte stack or texture-pool allocations.
+* The exercised **NGS2** audio lifecycle returns initialized sizes, handles and state, and silent
+  output (#554).
+* Version-4 `.prgcap` captures seeded temporal RTT inputs (#568) and historically isolated the earlier
+  warmup artifact at draw 18: one 642x362 input had no prior colour-target writer.
+* The kernel-derived dispatch thread/local/group contract (#580), `sceAgcCbSetShRegistersDirect`, and
+  compute direct type-1 V# binding (#574) let the real fill kernel execute against guest buffers
+  before submit completion (#576). Range provenance then proved draw 19 consumes one backing,
+  dispatch 5 fills it, and draw 31 consumes it again inside one submit — a future-read that #584 fixed
+  by executing graphics spans and compute in retained PM4 order.
+* Native-speed `.prgtl` indexes retain every submit/present boundary, and an exact-submit selector
+  materializes immutable, content-deduplicated graphics/compute state plus mixed PM4 order into a
+  `.prgcap` (#594/#569). `gpu_replay --graph` / `--graph-json` resolve in-submit versions and temporal
+  read-before-write leaves (#600). Ordered `.prgbundle` windows capture producer-time submits with
+  content-defined cross-submit deduplication and replay them through one persistent renderer (#603);
+  bundle v2 (#606) added fault-safe bulk guest reads plus an exact shared-resource chunk dictionary —
+  a fixed 1,200-submit full-state run folded 122.97 GiB into 301.1 MiB in 169.4 seconds. Semantic
+  endpoints, rolling windows, successful-only exit, final compaction and `--bundle-tail` prevent
+  timing drift and replay holes.
+* Capture v7 (#618) retains a failed stage fault-safely through `s_endpgm` or a 64 KiB cap; capture v8
+  (#569) closes the exact offline boundary and snapshots colour RTT state plus exact valid planes from
+  persistent Vulkan depth/stencil images; capture v13 (#773) tags RTT seeds `rgba8`/`rgba16f`; capture
+  v19 retains the exact bounded raw VS/FS source for every realized draw. Timeline v6 adds compact
+  per-draw target spans for offline scene selection. Standalone replay of the v8 capsule takes about
+  3.3 seconds instead of roughly 24 minutes.
+* `PROSPER_DESCRIPTOR_VALIDATE=strict|poison` and `gpu_replay --validate` are landed capabilities from
+  #515.
+
+## Ruled out
+
+One line per dead hypothesis, the evidence that killed it, and where that evidence lives. Do not
+re-derive these without contradictory new evidence.
+
+| Hypothesis | Verdict and evidence | Source |
+|---|---|---|
+| The title deadlocks in the guest before gameplay | **Falsified.** It is software-render throughput: synchronous 3840x2160 llvmpipe rendering stretches the ~13,000-submit startup into minutes. | #545 (closed) |
+| The overbright / mostly-white repeated-block image is the composition bug | **Falsified — it is a warmup artifact.** A 35-second render delay skipped a 642x362 RTT producer, then a replace-copy sampled a dispatch's raw all-`0xFF` backing and cached it indefinitely. **Do not use a sparse-render or late-started screenshot as a colour oracle.** | #586 |
+| The two unseeded 642x362 temporal leaves are simply uninitialized (zero) | **Falsified.** A transparent-zero boundary A/B yields the *exact* unseeded hash, so zero initialization is not the missing state. Full-run aggregation places their first observed graphics writers around submit 17,400, with roughly 1,200–1,350 writes before the selected submit. | #604, #606 |
+| The shared depth/stencil surface is missing a draw- or register-programmed clear | **Falsified.** `gpu_replay --bundle-find-ds ADDR` scans manifest-only DS use in seconds and proves the surface has no clear intent. The real boundary was a compute program filling that surface's exact 32 KiB HTILE allocation with `0xfffffff0` before scene drawing. | #611 |
+| A target's extent, or its total draw count, identifies the gameplay scene | **Falsified.** Either predicate alone also selects cinematic/transition frames. Use the semantic selector in `## Recreate the regression checkpoint`; the historical 738x420 / 90-draw predicate from the preserved #608 bundle no longer selects gameplay. | #608, #773 |
+| The residual window-light banding (#781) is depth, history alpha, sampler filtering, or perspective interpolation | **Each independently rejected.** Disabling depth, forcing linear filtering on draw 19's history input, and switching its varying to non-perspective interpolation all left the output unchanged. Forcing linear filtering on draw 23's FP16 light input *did* soften the standalone image, but a matching live run retained the visible radial bands — so that override is not a fix. | #781 (open, deprioritized) |
+| An exact-frame hash is a valid splash regression contract | **Falsified — it is animation-sensitive.** Unchanged builds select multiple valid animation states with 1,650–1,698 distinct colours, while observed partial transitions contain only about 325–339. The guard is therefore a run-level content check (`min_colors=1500`) rather than the historical exact-frame contract. | #573, #596 |
+| The pre-#611/#615 bundle hash `5759c125812154dc` is a renderer oracle | **No — historical only.** So is the preserved #608 bundle: it was captured before #615 and its final submit has five holes that capture-v8 migration represents explicitly as `Unknown`. Current #611-enabled output is `fac9ca4cbbba8196`; the corrected post-#780 source and capsule are `13b4ccdfa15b1f4d`. | see `## Evidence boundary` |
+
+## Evidence boundary
+
+The preserved #608 bundle is useful historical evidence, but it is not a current live-frame oracle. It contains
+883 submits (`18165..19047`), resolves all 1,764 temporal image dependencies, and was captured before #615. Its
+final submit has four unrealized draws and one unrealized dispatch. Capture-v8 migration represents those five
+holes explicitly as `Unknown`; it cannot recover work that was absent from the old artifact.
+
+On the current renderer, that bundle and its exported v8 capsule both produce `fac9ca4cbbba8196`. With depth
+invalidation deliberately disabled, both produce `535256588b67a536`. This exact source/capsule equality proves
+the checkpoint implementation, but the image still reflects the old capture's missing operations. Do not use it
+to conclude which pass is wrong in a post-#615 live submit.
+
+A fresh producer-complete current bundle is the required starting point for any new regression or deeper-scene
+investigation. Title-derived `.prgtl`,
+`.prgcap`, `.prgbundle`, shader, and image artifacts are local and gitignored; none belong in a commit.
+
+## Recreate the regression checkpoint
+
+Build in WSL from the repository root. Adjust the dump path if needed:
+
+```bash
+cd prosper
+cmake -S . -B build-linux \
+  -DGAME_DUMP=<DUMP_ROOT>/PPSA15552-app0
+cmake --build build-linux -j8 --target boot_trace gpu_timeline gpu_replay
+```
+
+Capture a rolling producer-time bundle. Let `boot_trace` exit through
+`PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE`; a wall-clock timeout can stop after level parsing but before the
+semantic endpoint is installed.
+
+```bash
+mkdir -p /tmp/dead-cells-current-save
+
+PROSPER_CAPTURE_TITLE=PPSA15552 \
+PROSPER_SAVEDATA_DIR=/tmp/dead-cells-current-save \
+PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay-capture.pad \
+PROSPER_GPU_TIMELINE=/tmp/dead-cells-current.prgtl \
+PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=1 \
+PROSPER_GPU_TIMELINE_CAPTURE=/tmp/dead-cells-current.prgcap \
+PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=/tmp/dead-cells-current.prgbundle \
+PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=1000 \
+PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=1024 \
+PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM=642x362 \
+PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=636x420 \
+PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=77:85 \
+PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=91 \
+PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS=94 \
+PROSPER_GPU_TIMELINE_CAPTURE_MIN_DISPATCHES=8 \
+PROSPER_GPU_TIMELINE_CAPTURE_MAX_DISPATCHES=8 \
+PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1 \
+  ./build-linux/boot_trace \
+  <DUMP_ROOT>/PPSA15552-app0 \
+  > /tmp/dead-cells-current.log 2>&1
+```
+
+Confirm the timeline selected the intended scene:
+
+```bash
+./build-linux/gpu_timeline /tmp/dead-cells-current.prgtl \
+  --select 636x420 77:85 91:94 8
+```
+
+Replay the complete source once and export the exact final checkpoint:
+
+```bash
+./build-linux/gpu_replay \
+  --bundle /tmp/dead-cells-current.prgbundle \
+  --bundle-final-capsule /tmp/dead-cells-current-v13.prgcap \
+  /tmp/dead-cells-current-source.bmp
+
+./build-linux/gpu_replay \
+  /tmp/dead-cells-current-v13.prgcap \
+  /tmp/dead-cells-current-standalone.bmp
+
+cmp /tmp/dead-cells-current-source.bmp \
+    /tmp/dead-cells-current-standalone.bmp
+```
+
+Do not use a checkpoint as an oracle until `cmp` succeeds and standalone replay reports that its embedded oracle
+passed. Also require `gpu_replay --inspect-only` to report zero failed operations for the current endpoint.
+
+## What remains
+
+1. Keep the deterministic gameplay route and source/capsule equality check green as shared GPU work lands.
+2. Extend routed playability and checkpoint coverage beyond the first tutorial scene and into later rooms.
+3. Obtain a pixel-aligned hardware capture when exact visual comparison is needed; the #566 reference is from the
+   preceding opening vignette and remains a qualitative rather than pixel-exact oracle.
+4. For any new visual regression, use semantic operation prefixes to name the first divergent pass before changing
+   the renderer. Record its draw/dispatch source, PM4 order, target, shader and resource hashes, and fixed-function
+   state, then add a synthetic contract test for the generic fix.
+
+There is no known remaining #566 composition defect in the exercised checkpoint. Generic GPU limitations and
+tooling follow-ups should be tracked as separate issues rather than reopening the completed grayscale investigation.
+
+## Tooling note
+
+`--bundle-final-capsule` is currently the strict path: it snapshots the complete live RTT and depth/stencil cache
+at final-submit entry and embeds the source output oracle. A standalone capsule selected directly by the timeline
+is useful for state inspection, but it does not by itself prove complete renderer history or source-image
+equality. Prefer improving the capture/replay diagnostics when an investigation would otherwise require repeated
+full-title runs.
+
+Capture v13 stores `rgba8` or `rgba16f` with every temporal RTT seed. `gpu_replay --inspect-only` prints the
+format, extent, byte count, and hash; use those together to catch a format/size mismatch before rendering.
+For consumer localization, `PROSPER_TESTTEX_DRAW=N PROSPER_TESTTEX_BINDING=B PROSPER_TESTTEX=zero` replaces only
+one draw's selected sampled resource. A non-`zero` value writes a format-correct checker. This is an A/B probe,
+not a renderer fix or a valid output oracle.

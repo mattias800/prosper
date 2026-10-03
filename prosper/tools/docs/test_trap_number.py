@@ -67,6 +67,7 @@ sys.path.insert(0, str(HERE))
 from check_numbered_table import Table, parse_tables  # noqa: E402
 from trap_number import (ScanError, added_rows_from_diff, added_rows_from_patch, highest, run,
                          table_numbers)  # noqa: E402
+from table_paths import CURRENT_FILE, LEGACY_FILE, select_table_path  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -142,6 +143,18 @@ case("another file's rows are not counted",
 case("a patch touching nothing relevant claims nothing",
      added_rows_from_patch(D + "@@\n+some prose\n", "doc.md"), [])
 
+RENAMED = (f"diff --git a/{LEGACY_FILE} b/{CURRENT_FILE}\n"
+           f"--- a/{LEGACY_FILE}\n+++ b/{CURRENT_FILE}\n@@\n")
+case("a renamed table still distinguishes amendments from new claims",
+     added_rows_from_patch(RENAMED + "-| 2 | old |\n+| 2 | amended |\n+| 3 | new |\n",
+                           CURRENT_FILE), [3])
+for paths in ([], [CURRENT_FILE, LEGACY_FILE]):
+    try:
+        select_table_path(CURRENT_FILE, paths)
+        FAILURES.append(f"missing/ambiguous table path was accepted: {paths}")
+    except ValueError:
+        print(f"  ok  missing/ambiguous table path refused: {paths}")
+
 print("main(), executed end to end against a stubbed gh:")
 
 # EVERY defect this tool has had lived in a path no arm reached, because importing three pure
@@ -156,7 +169,8 @@ print("main(), executed end to end against a stubbed gh:")
 GH_STUB = '''#!/usr/bin/env python3
 import json, sys
 a = sys.argv[1:]
-DOC = "prosper/docs/GAME_COMPAT_ORCHESTRATION.md"
+DOC = "prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md"
+OLD_DOC = "prosper/docs/GAME_COMPAT_ORCHESTRATION.md"
 HDR = "| # | Instrument | How it lied |\\n|---|---|---|\\n"
 def table(rows):
     return HDR + "".join("| %d | r%d | e |\\n" % (n, n) for n in rows) + "\\n### Next\\n"
@@ -193,6 +207,9 @@ elif a[:2] == ["pr", "list"]:
         ]))
         sys.exit(0)
     m = os.environ.get("STUB_MODE")
+    if m == "legacy":
+        print(json.dumps([pr(11, "old-path lane", "aaa", [OLD_DOC])]))
+        sys.exit(0)
     if m == "diffail":
         print(json.dumps([pr(66, "unreadable patch lane", "eee", [DOC])]))
         sys.exit(0)
@@ -219,6 +236,15 @@ elif a[:2] == ["pr", "list"]:
     ]))
 elif a[0] == "api":
     m = os.environ.get("STUB_MODE")
+    if "/git/trees/" in a[1]:
+        paths = [OLD_DOC] if m == "legacy" else [DOC]
+        if m == "ambiguous":
+            paths = [DOC, OLD_DOC]
+        print(json.dumps({"truncated": m == "tree-truncated", "paths": paths}))
+        sys.exit(0)
+    expected = OLD_DOC if m == "legacy" else DOC
+    if "/contents/" + expected + "?" not in a[1]:
+        sys.stderr.write("wrong actual-head table path" + chr(10)); sys.exit(5)
     if m == "wild":
         print(table([1, 2, 900]))
     elif m == "dupmaster":
@@ -233,6 +259,8 @@ elif a[0] == "api":
 elif a[:2] == ["pr", "diff"]:
     import os
     m = os.environ.get("STUB_MODE")
+    if m == "legacy":
+        print(patch(OLD_DOC, ["+| 3 | r3 | e |"])); sys.exit(0)
     if m == "diffail":
         sys.stderr.write("gh: could not read that pull request" + chr(10))
         sys.exit(3)
@@ -257,7 +285,7 @@ else:
     sys.exit(1)
 '''
 
-DOC_REL = Path("prosper/docs/GAME_COMPAT_ORCHESTRATION.md")
+DOC_REL = Path("prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md")
 
 
 def doc_text(rows: list[int]) -> str:
@@ -285,7 +313,8 @@ def git(repo: Path, *args: str) -> str:
 def run_main(name: str, *, want_rc: int, expect: str | None = None, absent: str | None = None,
              exact: str | None = None, extra: list[str] | None = None,
              stub_env: dict[str, str] | None = None, no_gh: bool = False,
-             origin_rows: list[int] | None = None, origin_missing: bool = False) -> None:
+             origin_rows: list[int] | None = None, origin_missing: bool = False,
+             legacy_base: bool = False) -> None:
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         bin_dir = root / "bin"
@@ -311,8 +340,9 @@ def run_main(name: str, *, want_rc: int, expect: str | None = None, absent: str 
             gh.chmod(gh.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
         repo = root / "repo"
-        (repo / DOC_REL.parent).mkdir(parents=True)
-        (repo / DOC_REL).write_text(SEED, encoding="utf-8")
+        seed_path = Path(LEGACY_FILE) if legacy_base else DOC_REL
+        (repo / seed_path.parent).mkdir(parents=True)
+        (repo / seed_path).write_text(SEED, encoding="utf-8")
         for cmd in (["init", "-q", "-b", "main"],
                     ["config", "user.email", "t@example.invalid"],
                     # A developer with commit.gpgsign on globally would otherwise get a fixture
@@ -407,6 +437,21 @@ run_main("...and suggests stepping clear rather than to the next free number",
 # caller. It must still be right, and it must not be the only path that works.
 run_main("--quiet prints just the number and nothing else", want_rc=0, exact="4",
          extra=["--quiet"])
+
+run_main("new main still scans an old-path PR's actual claim",
+         want_rc=0, expect="CLAIMS 3", stub_env={"STUB_MODE": "legacy"})
+run_main("legacy base and legacy open PR remain allocatable through the new default",
+         want_rc=0, exact="4", extra=["--quiet"], legacy_base=True,
+         stub_env={"STUB_MODE": "legacy"})
+run_main("a PR with both alias files is refused rather than selecting one silently",
+         want_rc=1, expect="expected exactly one table path", absent="next free number",
+         stub_env={"STUB_MODE": "ambiguous"})
+run_main("a truncated PR tree cannot prove an alias absent",
+         want_rc=1, expect="truncated tree", absent="next free number",
+         stub_env={"STUB_MODE": "tree-truncated"})
+run_main("a missing custom path cannot borrow the orchestration table",
+         want_rc=1, expect="expected exactly one table path", absent="next free number",
+         extra=["--file", "missing.md"])
 
 # THE arm that pins WHICH notion of "claim" the collision arithmetic uses. PR 22 here is STACKED:
 # its file holds row 3, inherited from the branch underneath, while its patch adds nothing to this
@@ -649,7 +694,7 @@ finally:
 
 
 
-DOC = HERE.parent.parent / "docs" / "GAME_COMPAT_ORCHESTRATION.md"
+DOC = HERE.parents[2] / CURRENT_FILE
 if not DOC.exists():  # fail closed: a moved document must not silently skip the only real-data arm
     FAILURES.append(f"the orchestration document is not at {DOC} -- this arm cannot run")
 else:

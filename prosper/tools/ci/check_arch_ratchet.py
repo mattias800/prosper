@@ -33,7 +33,7 @@ The rules (every count is per file, over tracked files only, with comments strip
                  platform macro (PLATFORM_MACROS: `_WIN32`, `_WIN64`, `__linux__`, `__APPLE__`,
                  `__MINGW32__`, `_MSC_VER`), one per directive, in prosper/src/{hle,loader,self,
                  gpu}. src/host is exempt: that is where host-platform code belongs. The seam this
-                 pushes code towards is prosper/docs/HOST_PLATFORM_SEAM.md.
+                 pushes code towards is prosper/docs/architecture/HOST_PLATFORM_SEAM.md.
   layer-include  an `#include` from one prosper/src top-level layer into a layer it may not depend
                  on, one row per (file, target layer), valued by the number of include lines.
                  LAYER_ORDER below is the table: a layer may include itself and any layer EARLIER
@@ -179,7 +179,7 @@ PLATFORM_ROOTS = tuple(f"{SRC}{layer}/" for layer in ("hle", "loader", "self", "
 
 # The include-direction table for layer-include, lowest layer first. A layer may include itself
 # and anything earlier; including a later layer is a violation. Keep in sync with
-# prosper/docs/ARCHITECTURE_TARGET_TREE.md ("Layer order"), which records the evidence:
+# prosper/docs/architecture/ARCHITECTURE_TARGET_TREE.md ("Layer order"), which records the evidence:
 #   self         SELF/ELF parsing into host-independent images; depends on nothing.
 #   loader       links parsed modules; "host-agnostic" (src/loader/AGENTS.md).
 #   input        platform-neutral pad state, fed by frontends.
@@ -194,7 +194,7 @@ LAYER_ORDER = ("self", "loader", "input", "diagnostics", "host", "gpu", "hle")
 FORBIDDEN_LAYERS = ("frontends", "tests")  # never includable from prosper/src
 
 # 5000 lines. On the head this gate was introduced against, the files above it are the ones
-# docs/REFACTOR_PLAN_2026_09.md already names as split candidates. A lower threshold baselines many
+# docs/architecture/REFACTOR_PLAN_2026_09.md already names as split candidates. A lower threshold baselines many
 # ordinary files and makes each a conflict surface; a higher one lets the next render_runner.h grow
 # unwatched for a year.
 FILE_SIZE_THRESHOLD = 5000
@@ -280,17 +280,17 @@ FIX_HINT = {
     ),
     "platform-ifdef": (
         "A host-platform #if in shared code. Call (or add) an interface under src/host/platform/ "
-        "with one backend per OS instead -- prosper/docs/HOST_PLATFORM_SEAM.md. Moving an "
+        "with one backend per OS instead -- prosper/docs/architecture/HOST_PLATFORM_SEAM.md. Moving an "
         "existing call site behind the seam is a behaviour-neutral change: commit it separately."
     ),
     "layer-include": (
         "An include against the layer order (LAYER_ORDER in check_arch_ratchet.py; "
-        "prosper/docs/ARCHITECTURE_TARGET_TREE.md). Move the shared type down to a layer both "
+        "prosper/docs/architecture/ARCHITECTURE_TARGET_TREE.md). Move the shared type down to a layer both "
         "sides may include, or invert the call (an interface owned by the lower layer)."
     ),
     "fixture-include": (
         "Shipping frontend code including prosper/tests/fixtures. The Vulkan backend is moving "
-        "out of the test tree (prosper/docs/ARCHITECTURE_TARGET_TREE.md); include it from its "
+        "out of the test tree (prosper/docs/architecture/ARCHITECTURE_TARGET_TREE.md); include it from its "
         "new home, or add what you need there, not under tests/."
     ),
     "vk-object": (

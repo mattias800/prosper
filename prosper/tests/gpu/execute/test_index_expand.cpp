@@ -3,7 +3,7 @@
 //
 // `copy_indices_u16_max` is the only path the emulator takes. `copy_indices_u16_max_avx2` has
 // no production caller at all (see `index_expand.hpp`): it survives so that the falsification
-// in `docs/OUTER_WILDS_STATUS.md` § Ruled out stays executable, which means this file is the
+// in `docs/games/OUTER_WILDS_STATUS.md` § Ruled out stays executable, which means this file is the
 // only thing keeping it honest. Both are therefore called by name here.
 
 #include "gpu/execute/index_expand.hpp"

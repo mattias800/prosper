@@ -4,7 +4,7 @@ r"""Validate Markdown tables that other documents cite by row number.
 (Raw string: this docstring quotes the `\|` escape it teaches, and in a normal string that is an
 invalid escape sequence -- a SyntaxWarning today and an error in a future Python.)
 
-Two defects landed in docs/GAME_COMPAT_ORCHESTRATION.md on 2026-08-01, and no other check
+Two defects landed in docs/process/GAME_COMPAT_ORCHESTRATION.md on 2026-08-01, and no other check
 in the pipeline could see either one:
 
   * A stray blank line between two rows. In Markdown a blank line TERMINATES a table, so the
@@ -178,7 +178,7 @@ reproduces the duplicate the checker warns about. That prohibition is not ceremo
 so a renumber breaks compiled files as well as documentation. Re-derive rather than trusting this
 figure, which goes stale on every append:
 
-    git grep -nE '(instrument[- ])?traps? [0-9]{1,3}' -- ':!prosper/docs/GAME_COMPAT_ORCHESTRATION.md'
+    git grep -nE '(instrument[- ])?traps? [0-9]{1,3}' -- ':!prosper/docs/process/GAME_COMPAT_ORCHESTRATION.md'
 
 (counting `s_trap`/`v_trap` in the shader tests as the false positives they are -- they are RDNA2
 mnemonics, not citations). So the gapless rule could only be satisfied by waiting, and the cost was real:

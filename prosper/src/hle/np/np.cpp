@@ -91,7 +91,7 @@ namespace {
 // The DOLL front-end boot flow stalls at UE4's InstallBundleManager PatchCheck because the Np
 // sign-in queries returned success-with-garbage-out: "success" from sceNpGetOnlineId told the
 // game a user IS signed in, pushing its patch/entitlement check onto online branches that then
-// wait forever on fake Http/WebApi handles (docs/DOLL_LOADING_PROGRESSION.md §3). A real console
+// wait forever on fake Http/WebApi handles (docs/games/DOLL_LOADING_PROGRESSION.md §3). A real console
 // with no PSN sign-in answers these with SCE_NP_ERROR_SIGNED_OUT so the flow resolves to its
 // offline path (UE4 PatchCheck -> NoLoggedInUser).
 // Error space verified against shadPS4 np_error.h (PS4-inherited; identical export names+NIDs in
@@ -275,7 +275,7 @@ HLE(s_npuds_object_set_string) {
 // ===== Issue #306: honest OFFLINE console for the online/update/entitlement boot chain. =========
 // DOLL's UE4 front-end runs a patch/entitlement check before the title screen; every subsystem in
 // that chain answered success-with-garbage, so the check could neither succeed nor FAIL — the flow
-// waited forever (docs/DOLL_LOADING_PROGRESSION.md). The blocks below give the chain the answers a
+// waited forever (docs/games/DOLL_LOADING_PROGRESSION.md). The blocks below give the chain the answers a
 // real, network-disconnected, signed-out console gives.
 
 // --- Guest-callback delivery discipline (shared by NetCtl + Np state callbacks). ----------------

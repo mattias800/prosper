@@ -695,7 +695,7 @@ HLE(s_videodec2_decode) {
     // Say so in the log itself: once a title actually feeds this path, "8 decodes in the log" reads
     // exactly like "the guest decoded 8 frames and stopped", which is a different and much more
     // alarming finding than "the cap was reached". (Instrument-trap 13 in
-    // docs/GAME_COMPAT_ORCHESTRATION.md — a print cap misread as a frequency. Nearly banked as a
+    // docs/process/GAME_COMPAT_ORCHESTRATION.md — a print cap misread as a frequency. Nearly banked as a
     // result on the very first boot that reached here, #1658.)
     if (svclog()) {
         static std::atomic<unsigned> n{0};
@@ -1663,7 +1663,7 @@ namespace {
 // ===== Issue #306: honest OFFLINE console for the online/update/entitlement boot chain. =========
 // DOLL's UE4 front-end runs a patch/entitlement check before the title screen; every subsystem in
 // that chain answered success-with-garbage, so the check could neither succeed nor FAIL — the flow
-// waited forever (docs/DOLL_LOADING_PROGRESSION.md). The blocks below give the chain the answers a
+// waited forever (docs/games/DOLL_LOADING_PROGRESSION.md). The blocks below give the chain the answers a
 // real, network-disconnected, signed-out console gives.
 
 // --- Guest-callback delivery discipline (shared by NetCtl + Np state callbacks). ----------------

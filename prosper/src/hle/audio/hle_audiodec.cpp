@@ -19,7 +19,7 @@
 //     eboot+0xec15f9  div  rsi                          ; #DE -> SIGFPE, kills the process
 //
 // The faulting function is identified by the string it logs, `AudioAACConvertOutput`
-// (eboot+0x7e81031). See `docs/GOLLUM_STATUS.md`.
+// (eboot+0x7e81031). See `docs/games/GOLLUM_STATUS.md`.
 //
 // ## The ABI, and where it comes from
 //

@@ -85,7 +85,7 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
     `spirv-val`-validated when measured, and, where a harness exists, execution-differential-tested
     on real Vulkan (`recompile_coverage`/`shader_histo`/`test_rdna2_to_spirv`). That was a measurement
     of those shaders, not a standing gate: the standing gate is `tools/spv_validate`, which validates
-    one representative module per emitter path (`docs/VERIFICATION.md` §4c). Remaining 11 shaders need deep
+    one representative module per emitter path (`docs/process/VERIFICATION.md` §4c). Remaining 11 shaders need deep
     features only: **structured control-flow reconstruction** (uniform branches + loops → SPIR-V
     if/else + `OpPhi`), **NGG** primitive-shader preambles (`s_sendmsg`/`exp prim`), and cube/MSAA
     image dims — none needed for the initial frame.
@@ -100,7 +100,7 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
   Autonomous probe-cycles return corrections, not a fix, at high cost — this needs a focused, likely
   reference-backed debugging session. The recompiler + pipeline are staged and verified: the moment this
   wall falls and real draws flow through `run_command_buffer`, the spine above renders them. Full brief:
-  `docs/GFXDEVICE_BRINGUP_PROBLEM.md`.
+  `docs/games/messenger/GFXDEVICE_BRINGUP_PROBLEM.md`.
 - 🔁 **Multi-agent + CI:** developed by parallel agents (recompiler/back-half, AGC/host front-half,
   infra/review) over a branch-protected `master`; GitHub Actions builds + `ctest` on Linux + Windows.
 
@@ -173,8 +173,8 @@ Turn the file into a resident, relocated guest image in host memory.
 - [x] The historical `eboot+0x3b5ea6` blocker was not a null `std::ctype` facet. It was inside the
       statically linked AGC DCB path; the authoritative symbol map identifies the nearby import
       `+kSrjIVxKFE` as `sceAgcDcbPushMarker`. The temporary context-init workaround was also wrong
-      and was removed by #641 after it was shown to clear live DCB state. See `docs/AGC_TRACE.md` and
-      the correction in `docs/GRAPHICS.md` rather than restarting the locale/context theory.
+      and was removed by #641 after it was shown to clear live DCB state. See `docs/gpu/AGC_TRACE.md` and
+      the correction in `docs/gpu/GRAPHICS.md` rather than restarting the locale/context theory.
 - [x] `sceHttpUriParse` implements its two-pass caller-pool contract and initializes the public URI
       element layout (#642). This removes Blasphemous 2's post-EULA stale-pointer crash and advances
       its route to the guest pthread exit boundary tracked by #644.
@@ -367,7 +367,7 @@ guest `%fs`/TLS (needed for real libc, and eventually for any real system module
 work is the prerequisite; the rest (thread wrappers, dropping libc HLE regs) is mechanical, guarded by
 `test_boot_linux`. High value, **medium-high risk (the `%fs` problem)**, several sessions.
 **libSceNpCppWebApi.prx is also present** (same opportunity, lower priority). libSceAgc/AgcDriver are
-NOT in the dump (system firmware) — those must be HLE'd/translated regardless (see `docs/AGC_TRACE.md`).
+NOT in the dump (system firmware) — those must be HLE'd/translated regardless (see `docs/gpu/AGC_TRACE.md`).
 
 ## Reality checkpoints
 - After **M2** we know exactly the call order the game needs — re-prioritize M3+.

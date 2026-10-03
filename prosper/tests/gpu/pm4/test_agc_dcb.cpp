@@ -210,7 +210,7 @@ int main() {
     // written over two dwords of unrelated command-buffer or heap memory, with no log and no
     // reject — corruption at a distance, attributed to whatever broke next. These are not cold
     // paths: Sonic CrossWorlds logs 128 AddRegisters calls in a single 400-tick `hle_calls` window
-    // (docs/SONIC_CROSSWORLDS_STATUS.md), and Blue Prince builds its register arrays this way per
+    // (docs/games/SONIC_CROSSWORLDS_STATUS.md), and Blue Prince builds its register arrays this way per
     // draw (command_processor.hpp, #1264).
     //
     // Four arms, each naming the mutation it kills. Arm 1 is the positive control, because a fix
@@ -824,7 +824,7 @@ int main() {
     // DWORDS and on the cursor advance; "the call returned something" is exactly what the broken
     // version also did.
     //
-    // The dword count is an ABI contract with the guest's own reservation (docs/AGC_PACKET_SIZES.md):
+    // The dword count is an ABI contract with the guest's own reservation (docs/gpu/AGC_PACKET_SIZES.md):
     // the packet is 4 dwords, and sceAgcDcbDrawIndirectGetSize must answer 16 bytes for the same
     // reason -- a guest that asks reserves exactly this.
     {

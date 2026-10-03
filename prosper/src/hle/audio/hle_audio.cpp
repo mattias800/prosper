@@ -217,7 +217,7 @@ AudioGrainVerdict audio_classify_stamped_grain(bool same_address, bool matches_s
 //
 // A stereo fold only needs each source channel's SIDE (left, right, or both) — the front/back and
 // height identity within a side does not change the result — and that is what prosper can measure
-// with PROSPER_AUDIO_LAYOUT (see the probe below and docs/AUDIO.md). Measured on Dragon Quest VII
+// with PROSPER_AUDIO_LAYOUT (see the probe below and docs/subsystems/AUDIO.md). Measured on Dragon Quest VII
 // Reimagined's 12-channel MAIN port over 19,962,368 frames (#1700):
 //   ch0/ch1  carry all of the content (rms 3.1e-2 / 4.3e-2, peak 0.407) and correlate +0.46 — a
 //            real decorrelated stereo pair, not a duplicated mono feed.

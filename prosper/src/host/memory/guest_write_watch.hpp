@@ -273,7 +273,7 @@ void guest_write_watch_invalidate_all();
 // targets were two virtual mappings of ONE physical allocation, which would have explained a missing
 // composite with no further defect. It exposes resolution the write-watch already performs -- it
 // models exactly this aliasing in `WatchedPage { phys; aliases; }` -- so the idea could be TESTED
-// before anything was built on it. It was FALSIFIED (`docs/STRAY_STATUS.md`, § Ruled out): nothing
+// before anything was built on it. It was FALSIFIED (`docs/games/STRAY_STATUS.md`, § Ruled out): nothing
 // is aliased, and the scanout buffers turn out to be ordinary render targets in their own right.
 //
 // Kept because the question recurs and the answer should cost one run, not a rediscovery. Do NOT

@@ -186,7 +186,7 @@ def main(argv):
               "  mean abs diff %.2f/255, %.2f%% of informative pixels within 8/255 "
               "(coverage %.2f%%).\n"
               "  NOT progression evidence -- displaying a stored image needs no world rendering.\n"
-              "  See instrument trap 230 in docs/GAME_COMPAT_ORCHESTRATION.md."
+              "  See instrument trap 230 in docs/process/GAME_COMPAT_ORCHESTRATION.md."
               % (exact[2], exact[0], exact[1], exact[3]))
         return 2
 
@@ -220,7 +220,7 @@ def main(argv):
               "  lifts the mean, which is why a mean-only test would have passed this).\n"
               "  The frame is mostly stored artwork. It is not progression evidence on its own:\n"
               "  say what prosper actually rendered here.\n"
-              "  See instrument trap 230 in docs/GAME_COMPAT_ORCHESTRATION.md."
+              "  See instrument trap 230 in docs/process/GAME_COMPAT_ORCHESTRATION.md."
               % (dominant[1], dominant[2], dominant[3], dominant[0]))
         return 2
 
