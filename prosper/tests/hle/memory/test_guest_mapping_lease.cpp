@@ -78,6 +78,14 @@ int main() {
         expect(!guest_memory_direct_range_fault_safe(query_lease, source, UINT64_MAX),
                "overflow cannot certify a fault granule");
     }
+#elif defined(_WIN32)
+    {
+        GuestMappingLease query_lease;
+        expect(guest_memory_direct_range_fault_safe(query_lease, source, page),
+               "already committed direct section has native fault safety");
+        expect(!guest_memory_direct_range_fault_safe(query_lease, reservation, page),
+               "reservation is not an authenticated committed direct section");
+    }
 #else
     {
         GuestMappingLease query_lease;
@@ -353,7 +361,7 @@ int main() {
         "unmap cannot finish under shared lease");
     expect(relation(source, destination) == GuestMemoryTopologyRelation::Unknown,
            "unmap removes source after lease release");
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     {
         GuestMappingLease query_lease;
         expect(!guest_memory_direct_range_fault_safe(query_lease, source, page),
