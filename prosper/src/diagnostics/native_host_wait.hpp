@@ -45,8 +45,11 @@ public:
                               void* opaque = nullptr) noexcept;
     void leave(NativeHostWaitToken token) noexcept;
     void retire_thread(uint32_t native_id) noexcept;
-    NativeHostWaitSnapshot snapshot(uint32_t native_id,
-                                    std::span<NativeHostWaitRecord> output) const noexcept;
+    // A fixture may recycle the actual slot after payload copy but before generation validation.
+    // Production passes null; this hook grants no guest/wait authority and is never installed.
+    NativeHostWaitSnapshot snapshot(uint32_t native_id, std::span<NativeHostWaitRecord> output,
+                                    PublicationHook before_validation_hook = nullptr,
+                                    void* opaque = nullptr) const noexcept;
 
 private:
     struct Slot {

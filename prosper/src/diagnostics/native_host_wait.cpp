@@ -33,12 +33,12 @@ NativeHostWaitToken NativeHostWaitRegistry::enter(const NativeHostWaitRecord& re
             slot.publication.store(0, std::memory_order_release);
             continue; // never wrap a generation into an earlier scope's token
         }
-        slot.native_id.store(record.native_id, std::memory_order_relaxed);
-        slot.site.store(static_cast<uint32_t>(record.site), std::memory_order_relaxed);
-        slot.object.store(record.object, std::memory_order_relaxed);
-        slot.mode.store(static_cast<uint32_t>(record.mode), std::memory_order_relaxed);
-        slot.timeout_us.store(record.timeout_us, std::memory_order_relaxed);
-        slot.entered_us.store(record.entered_us, std::memory_order_relaxed);
+        slot.native_id.store(record.native_id, std::memory_order_release);
+        slot.site.store(static_cast<uint32_t>(record.site), std::memory_order_release);
+        slot.object.store(record.object, std::memory_order_release);
+        slot.mode.store(static_cast<uint32_t>(record.mode), std::memory_order_release);
+        slot.timeout_us.store(record.timeout_us, std::memory_order_release);
+        slot.entered_us.store(record.entered_us, std::memory_order_release);
         const uint64_t generation = ++slot.next_generation;
         entered_run_.fetch_add(1, std::memory_order_relaxed);
         slot.publication.store(generation, std::memory_order_release);
@@ -60,15 +60,16 @@ void NativeHostWaitRegistry::retire_thread(uint32_t native_id) noexcept {
     for (Slot& slot : slots_) {
         const uint64_t generation = slot.publication.load(std::memory_order_acquire);
         if (generation && generation != publishing &&
-            slot.native_id.load(std::memory_order_relaxed) == native_id &&
+            slot.native_id.load(std::memory_order_acquire) == native_id &&
             slot.publication.load(std::memory_order_acquire) == generation)
             leave({static_cast<size_t>(&slot - slots_.data()), generation});
     }
 }
 
-NativeHostWaitSnapshot
-NativeHostWaitRegistry::snapshot(uint32_t native_id,
-                                 std::span<NativeHostWaitRecord> output) const noexcept {
+NativeHostWaitSnapshot NativeHostWaitRegistry::snapshot(uint32_t native_id,
+                                                        std::span<NativeHostWaitRecord> output,
+                                                        PublicationHook before_validation_hook,
+                                                        void* opaque) const noexcept {
     NativeHostWaitSnapshot result{};
     for (const Slot& slot : slots_) {
         const uint64_t generation = slot.publication.load(std::memory_order_acquire);
@@ -77,13 +78,21 @@ NativeHostWaitRegistry::snapshot(uint32_t native_id,
             ++result.unstable_slots;
             continue;
         }
+        // Initial acquire of G makes G's preceding payload stores happen-before these loads,
+        // so per-field write/read coherence excludes older payloads. If ANY acquire reads a
+        // later incarnation's release store, that writer's earlier exclusive sentinel happens-
+        // before our final publication load. Publication write/read coherence then forbids that
+        // load from returning G. Distinct nonwrapping generations reject it. This also applies
+        // when the later field has an identical value: reads-from, not value inequality, orders it.
+        // Two publication acquires with RELAXED payloads do not establish this cross-object edge.
         NativeHostWaitRecord record{
-            slot.native_id.load(std::memory_order_relaxed),
-            static_cast<NativeHostWaitSite>(slot.site.load(std::memory_order_relaxed)),
-            slot.object.load(std::memory_order_relaxed),
-            static_cast<NativeHostWaitMode>(slot.mode.load(std::memory_order_relaxed)),
-            slot.timeout_us.load(std::memory_order_relaxed),
-            slot.entered_us.load(std::memory_order_relaxed)};
+            slot.native_id.load(std::memory_order_acquire),
+            static_cast<NativeHostWaitSite>(slot.site.load(std::memory_order_acquire)),
+            slot.object.load(std::memory_order_acquire),
+            static_cast<NativeHostWaitMode>(slot.mode.load(std::memory_order_acquire)),
+            slot.timeout_us.load(std::memory_order_acquire),
+            slot.entered_us.load(std::memory_order_acquire)};
+        if (before_validation_hook) before_validation_hook(opaque);
         if (slot.publication.load(std::memory_order_acquire) != generation) {
             ++result.unstable_slots;
             continue;
@@ -94,7 +103,7 @@ NativeHostWaitRegistry::snapshot(uint32_t native_id,
     }
     result.entered_run = entered_run_.load(std::memory_order_relaxed);
     result.dropped_run = dropped_run_.load(std::memory_order_relaxed);
-    return result; // independent relaxed totals, not a coherent partition or completeness proof
+    return result;   // independent relaxed totals, not a coherent partition or completeness proof
 }
 
 NativeHostWaitRegistry& native_host_wait_registry() noexcept {

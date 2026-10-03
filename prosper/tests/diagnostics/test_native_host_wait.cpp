@@ -153,6 +153,57 @@ TEST(NativeHostWaitRegistry, ConcurrentReuseNeverPublishesMixedPayloads) {
     EXPECT_EQ(registry.snapshot(1, records).entered_run, 16004u);
 }
 
+TEST(NativeHostWaitRegistry, ActualRecyclingBetweenCopyAndValidationRejectsTheOldIncarnation) {
+    NativeHostWaitRegistry registry;
+    const auto old = registry.enter(
+        {41, NativeHostWaitSite::Equeue, 0xa11, NativeHostWaitMode::Infinite, 0, 91});
+    ASSERT_NE(old.generation, 0u);
+    struct Recycle {
+        NativeHostWaitToken replacement;
+        std::atomic<bool> copied{false}, changed{false}, missed{false};
+    } recycle;
+    std::thread writer([&] {
+        if (await([&] { return recycle.copied.load(std::memory_order_acquire); })) {
+            registry.leave(old);
+            recycle.replacement =
+                registry.enter({42, NativeHostWaitSite::PthreadOnce, 0xb22,
+                                NativeHostWaitMode::RelativeMicroseconds, 1234, 92});
+        } else {
+            recycle.missed.store(true);
+        }
+        recycle.changed.store(true, std::memory_order_release);
+    });
+    std::array<NativeHostWaitRecord, 1> output{{{99, NativeHostWaitSite::Equeue, 0xc33}}};
+    const auto sampled = registry.snapshot(
+        41, output,
+        +[](void* opaque) noexcept {
+            auto& state = *static_cast<Recycle*>(opaque);
+            state.copied.store(true, std::memory_order_release);
+            if (!await([&] { return state.changed.load(std::memory_order_acquire); }))
+                state.missed.store(true);
+        },
+        &recycle);
+    writer.join();
+    ASSERT_FALSE(recycle.missed.load()) << "the bounded real interleaving must have occurred";
+    ASSERT_EQ(recycle.replacement.slot, old.slot) << "the actual slot must have been recycled";
+    ASSERT_NE(recycle.replacement.generation, old.generation);
+    EXPECT_EQ(sampled.found, 0u) << "copied old payload must not survive a changed incarnation";
+    EXPECT_EQ(sampled.unstable_slots, 1u);
+    EXPECT_EQ(output[0].native_id, 99u) << "rejected payload must not write the output";
+    EXPECT_EQ(output[0].object, 0xc33u);
+    registry.leave(old);
+    EXPECT_EQ(registry.snapshot(42, output).found, 1u);
+    EXPECT_EQ(output[0].site, NativeHostWaitSite::PthreadOnce);
+    EXPECT_EQ(output[0].object, 0xb22u);
+    EXPECT_EQ(output[0].mode, NativeHostWaitMode::RelativeMicroseconds);
+    EXPECT_EQ(output[0].timeout_us, 1234u);
+    EXPECT_EQ(output[0].entered_us, 92u);
+    registry.leave(recycle.replacement);
+    EXPECT_EQ(registry.snapshot(42, output).found, 0u);
+    // This real interleaving kills missing final validation, NOT a relaxed-payload mutation on
+    // an x64 host. The cross-object C++ ordering argument is a separate source-review obligation.
+}
+
 TEST(NativeHostWaitReport, RawCandidatePrefixAndCopiedWindowAreNotABacktrace) {
     const std::array<uint64_t, 11> words{0,       0x10001, 0x10007, 0x10008, 0x10001, 0x10002,
                                          0x10003, 0x10004, 0x10005, 0x10006, 0x10009};

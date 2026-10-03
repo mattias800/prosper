@@ -52,8 +52,11 @@ subsystem should stamp it rather than grow a private clock.
 only the actual empty-equeue and contended-pthread-once native condition-wait CALL scopes,
 including their relock/return boundary, not kernel parking, mutex ownership or deadlock causality.
 It is deliberately separate from `sync_futex`: observing a native C++ wait grants no wake or
-interrupt authority. The 512 atomic slots support nested scopes and generation-checked retirement;
-a sampler never takes a publisher lock while its target is suspended. The cached gate is resolved
+interrupt authority. The 512 atomic slots support nested scopes and generation-checked retirement.
+Each payload store/load is release/acquire: observing any recycled field orders the later writer's
+sentinel before final generation validation. This is a portable per-field happens-before contract,
+not a claim proved by x64 stress. A sampler never takes a publisher lock while its target is
+suspended. The cached gate is resolved
 before suspension; formatting is after resume. Disabled producers do not read TID/clock or publish.
 
 The report labels its narrow scope, unarmed fields as `n/a`, absence as unobserved rather than no
