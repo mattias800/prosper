@@ -14,6 +14,7 @@
 #include "shared/compute/storage_image_alias_plan.hpp"
 #include "shared/live/decode_scratch.hpp"  // pooled full-surface intermediates (#3309's mechanism)
 #include "shared/live/cpu_rtt_snapshot_pool.hpp"
+#include "shared/live/compute_view_swizzle.hpp"
 #include "shared/live/live_target_format.hpp"
 #include "shared/live/packed_rtt_conversion.hpp"
 #include "shared/live/indirect_dispatch.hpp"   // #3656
@@ -10593,46 +10594,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                                     : VK_IMAGE_VIEW_TYPE_2D);
             vci.format = ici.format;
             if (!bi.storage) {
-                // T# DST_SEL channel routing (SQ_SEL: 0=0, 1=1, 4=R, 5=G, 6=B, 7=A) — same mapping
-                // the renderer applies on its sampled views.
-                auto sel = [&](uint32_t s) {
-                    switch (s) {
-                        case 0: return VK_COMPONENT_SWIZZLE_ZERO;
-                        case 1: return VK_COMPONENT_SWIZZLE_ONE;
-                        case 4: return VK_COMPONENT_SWIZZLE_R;
-                        case 5: return VK_COMPONENT_SWIZZLE_G;
-                        case 6: return VK_COMPONENT_SWIZZLE_B;
-                        case 7: return VK_COMPONENT_SWIZZLE_A;
-                        default: break;
-                    }
-                    // SQ_SEL 2 and 3 are RESERVED, and anything above 7 cannot come out of a
-                    // three-bit descriptor field at all. Both used to fall into a silent
-                    // `default: IDENTITY` -- the selector for whichever position the value sat in --
-                    // so an undecodable routing became a plausible wrong picture with no diagnostic
-                    // anywhere. The graphics path was made loud for that reason; this is its twin
-                    // and was missed (#3609).
-                    //
-                    // A reserved selector can no longer reach here FROM A DESCRIPTOR, because
-                    // `image_descriptor_reject_reason` now refuses such a T# before it becomes a
-                    // ShaderResource. It stays reachable from a capture deserialized verbatim and
-                    // from a directly-built resource, so this warns rather than dropping: reproducing
-                    // the frame that was recorded is replay's job, and the drop belongs upstream.
-                    static std::once_flag warned;
-                    std::call_once(warned, [&] {
-                        fprintf(stderr,
-                                "[compute] T# DST_SEL %u is reserved or unrepresentable; binding it "
-                                "as IDENTITY, which is a GUESS at the routing (#3609)\n", s);
-                    });
-                    return VK_COMPONENT_SWIZZLE_IDENTITY;
-                };
-                // #4291: a BGRA-as-RGBA renderer image bound in place needs the selector in the
-                // host image's component order, exactly as the graphics sampled path composes it.
+                // T# DST_SEL routing. #4291: a BGRA-as-RGBA renderer image bound in place needs the
+                // selector in the host image's component order, as the graphics sampled path does.
                 const bool bgra = bi.imported && bi.imported_component_order_bgra;
-                auto host_sel = [&](uint32_t s) {
-                    return sel(prosper::frontend::live_target_host_selector(s, bgra));
+                auto sel = [&](uint32_t s) {
+                    return prosper::frontend::compute_view_component_swizzle(
+                        prosper::frontend::live_target_host_selector(s, bgra));
                 };
-                vci.components = {host_sel(r->swizzle[0]), host_sel(r->swizzle[1]),
-                                  host_sel(r->swizzle[2]), host_sel(r->swizzle[3])};
+                vci.components = {sel(r->swizzle[0]), sel(r->swizzle[1]),
+                                  sel(r->swizzle[2]), sel(r->swizzle[3])};
             }
             const VkImageAspectFlags image_aspect = (sampled_depth || bi.imported_depth)
                 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
