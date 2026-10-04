@@ -578,6 +578,9 @@ struct DecodedShaderEntry {
     uint64_t last_use = 0;
 };
 
+// Internal cold decoder entry only; cache storage stays private in its companion.
+std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, size_t dwords);
+
 struct ShaderCodeAnalysis {
     std::vector<uint32_t> code;
     RefusedShaderMemo refused_shader_memo;
