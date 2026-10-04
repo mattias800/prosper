@@ -10874,11 +10874,11 @@ int main() {
         0x7e0202ffu, 0x00ff10f0u,   // v_mov_b32 v1, 0x00FF10F0
         0x7e0402ffu, 0xff000f0fu,   // v_mov_b32 v2, 0xFF000F0F
         0x7e060287u,   // v_mov_b32 v3, 7
-        0xd55a0004u, 0x040e0501u,   // v_sad_u8 v2, v1, v2, v3
+        0xd55a0004u, 0x040e0501u,   // v_sad_u8 v4, v1, v2, v3
         0xbf810000u,
     };
     std::vector<uint32_t> spvTsad3 =
-        recompile_valu(codeTsad3, std::size(codeTsad3), 0, /*out_vgpr*/ 2);
+        recompile_valu(codeTsad3, std::size(codeTsad3), 0, /*out_vgpr*/ 4);
     CHECK(!spvTsad3.empty(), "recompiled Tsad3 (v_sad_u8) -> SPIR-V");
     std::vector<float> gotTsad3 = prosper::test::run_compute(spvTsad3, inX, N, N);
     uint32_t badTsad3 = 0;
@@ -10894,11 +10894,11 @@ int main() {
         0x7e0202ffu, 0x00ff10f0u,   // v_mov_b32 v1, 0x00FF10F0
         0x7e0402ffu, 0xff000f0fu,   // v_mov_b32 v2, 0xFF000F0F
         0x7e060287u,   // v_mov_b32 v3, 7
-        0xd55b0004u, 0x040e0501u,   // v_sad_hi_u8 v2, v1, v2, v3
+        0xd55b0004u, 0x040e0501u,   // v_sad_hi_u8 v4, v1, v2, v3
         0xbf810000u,
     };
     std::vector<uint32_t> spvTsad4 =
-        recompile_valu(codeTsad4, std::size(codeTsad4), 0, /*out_vgpr*/ 2);
+        recompile_valu(codeTsad4, std::size(codeTsad4), 0, /*out_vgpr*/ 4);
     CHECK(!spvTsad4.empty(), "recompiled Tsad4 (v_sad_hi_u8) -> SPIR-V");
     std::vector<float> gotTsad4 = prosper::test::run_compute(spvTsad4, inX, N, N);
     uint32_t badTsad4 = 0;
@@ -10915,11 +10915,11 @@ int main() {
         0x7e0202ffu, 0x0001ffffu,   // v_mov_b32 v1, 0x0001FFFF
         0x7e0402ffu, 0xffff0001u,   // v_mov_b32 v2, 0xFFFF0001
         0x7e0602c1u,   // v_mov_b32 v3, -1 (0xFFFFFFFF)
-        0xd55c0004u, 0x040e0501u,   // v_sad_u16 v2, v1, v2, v3
+        0xd55c0004u, 0x040e0501u,   // v_sad_u16 v4, v1, v2, v3
         0xbf810000u,
     };
     std::vector<uint32_t> spvTsad5 =
-        recompile_valu(codeTsad5, std::size(codeTsad5), 0, /*out_vgpr*/ 2);
+        recompile_valu(codeTsad5, std::size(codeTsad5), 0, /*out_vgpr*/ 4);
     CHECK(!spvTsad5.empty(), "recompiled Tsad5 (v_sad_u16) -> SPIR-V");
     std::vector<float> gotTsad5 = prosper::test::run_compute(spvTsad5, inX, N, N);
     uint32_t badTsad5 = 0;
@@ -10939,11 +10939,11 @@ int main() {
         0x7e0202ffu, 0x003010f0u,   // v_mov_b32 v1, 0x003010F0
         0x7e0402ffu, 0x50000f0fu,   // v_mov_b32 v2, 0x50000F0F
         0x7e060287u,   // v_mov_b32 v3, 7
-        0xd5710004u, 0x040e0501u,   // v_msad_u8 v2, v1, v2, v3
+        0xd5710004u, 0x040e0501u,   // v_msad_u8 v4, v1, v2, v3
         0xbf810000u,
     };
     std::vector<uint32_t> spvTsad6 =
-        recompile_valu(codeTsad6, std::size(codeTsad6), 0, /*out_vgpr*/ 2);
+        recompile_valu(codeTsad6, std::size(codeTsad6), 0, /*out_vgpr*/ 4);
     CHECK(!spvTsad6.empty(), "recompiled Tsad6 (v_msad_u8) -> SPIR-V");
     std::vector<float> gotTsad6 = prosper::test::run_compute(spvTsad6, inX, N, N);
     uint32_t badTsad6 = 0;
