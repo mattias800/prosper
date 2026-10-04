@@ -78,6 +78,55 @@ class NativePath(unittest.TestCase):
 
 
 @NEEDS_GIT
+class RepoRoot(unittest.TestCase):
+    """repo_root feeds a subprocess cwd, so it must be a path the host itself can open."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="repo-root-")
+        self.top = os.path.join(self.tmp, "repo")
+        os.makedirs(os.path.join(self.top, "a", "b"))
+        subprocess.run(["git", "init", "-q", self.top], check=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_top_and_subdirectory_resolve_to_the_checkout(self):
+        for start in (self.top, os.path.join(self.top, "a", "b")):
+            root = hook.repo_root(start)
+            self.assertIsNotNone(root, start)
+            self.assertTrue(os.path.samefile(root, self.top), (start, root))
+
+    def test_outside_any_checkout_is_none(self):
+        self.assertIsNone(hook.repo_root(self.tmp))
+
+    @unittest.skipIf(os.name == "nt", "a #!/bin/sh stand-in for git cannot run on native Windows")
+    def test_absolute_toplevel_text_is_never_used(self):
+        # An MSYS2 git prints --show-toplevel through its own mount table (/tmp/... on the MinGW
+        # runner). A git that answers that way must not leak its absolute text into the result.
+        fake = os.path.join(self.tmp, "bin")
+        os.makedirs(fake)
+        script = os.path.join(fake, "git")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(
+                "#!/bin/sh\n"
+                'case "$*" in\n'
+                "  *--show-toplevel*) echo /tmp/msys-mounted/repo ;;\n"
+                "  *--show-cdup*) echo ../../ ;;\n"
+                "  *) exit 1 ;;\n"
+                "esac\n"
+            )
+        os.chmod(script, 0o755)
+        start = os.path.join(self.top, "a", "b")
+        path = os.environ.get("PATH", "")
+        os.environ["PATH"] = fake + os.pathsep + path
+        try:
+            root = hook.repo_root(start)
+        finally:
+            os.environ["PATH"] = path
+        self.assertEqual(os.path.normpath(self.top), root)
+
+
+@NEEDS_GIT
 class Verdicts(unittest.TestCase):
     """main() against a real git checkout with a stand-in checker."""
 
