@@ -4,6 +4,7 @@
 #include "fixtures/fragment_draw_source.hpp"
 #include "gpu/execute/derived_interpolation_geometry.hpp"
 #include <gtest/gtest.h>
+#include <thread>
 
 namespace {
 namespace g = prosper::gpu;
@@ -91,6 +92,33 @@ TEST_F(DerivedInterpolationGeometry, SeventeenRegisteredGeneratedGsObservationsS
     EXPECT_EQ(plan_after.program_hits - plan_before.program_hits, 16u);
     // Named-refused profiles must remain warm too, without turning cache residence into readiness.
     EXPECT_EQ(plans.back()->rejection_reason(), plans.front()->rejection_reason());
+}
+
+// Draws are realized on a worker pool while their helper plans and collector pipelines are cached
+// on the render thread keyed by the GS owner, so a second realizing thread must receive the SAME
+// generation for the same producing owners and profile, not a per-thread copy.
+TEST_F(DerivedInterpolationGeometry, OtherRealizingThreadSharesTheGeneration) {
+    const auto* programs = f::register_programs(original(4402));
+    ASSERT_NE(programs, nullptr);
+    const auto physical = context();
+    g::DrawItem here, there;
+    ASSERT_TRUE(f::realize_registered(here, *programs, f::color_a, f::ieee_rsrc1, 15, physical));
+    bool realized = false;
+    std::thread worker([&] {
+        publish(g::FloatTransportProfile::ExplicitNonFinite32);   // per-thread config, if any
+        realized = f::realize_registered(there, *programs, f::color_a, f::ieee_rsrc1, 15, physical);
+    });
+    worker.join();
+    ASSERT_TRUE(realized);
+    ASSERT_TRUE(here.fragment_draw_inputs && there.fragment_draw_inputs);
+    const auto& a = *here.fragment_draw_inputs;
+    const auto& b = *there.fragment_draw_inputs;
+    ASSERT_TRUE(a.source_gs && b.source_gs);
+    ASSERT_FALSE(a.source_gs->empty());
+    ASSERT_EQ(a.raw_code, b.raw_code) << "same registered original on both threads";
+    ASSERT_EQ(here.vs_shared, there.vs_shared) << "same selected VS generation on both threads";
+    EXPECT_EQ(a.source_gs, b.source_gs);
+    EXPECT_NE(a.launch_source, b.launch_source) << "private per-draw authority stays distinct";
 }
 
 TEST_F(DerivedInterpolationGeometry, ChangedOriginalLayoutAndTransportKeepDistinctGsGenerations) {

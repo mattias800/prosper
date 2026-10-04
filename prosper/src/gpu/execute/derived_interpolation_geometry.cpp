@@ -1,5 +1,6 @@
 #include "gpu/execute/derived_interpolation_geometry.hpp"
 #include <map>
+#include <mutex>
 #include <utility>
 
 namespace prosper::gpu {
@@ -22,12 +23,17 @@ struct GeometryKey {
         return profile < other.profile;
     }
 };
+// Process-wide: draws are realized on a worker pool, but their helper plans and collector
+// pipelines are compiled and cached on the render thread keyed by this GS owner. Per-worker
+// residence would give one identical profile up to configured_draw_realization_threads() cold
+// plans and collector pipelines. The lock covers only lookup/insert, never the GS compile.
 struct GeometryCache {
+    std::mutex lock;
     std::map<GeometryKey, std::shared_ptr<const std::vector<uint32_t>>> entries;
     DerivedInterpolationGeometryStats stats;
 };
 GeometryCache& geometry_cache() {
-    static thread_local GeometryCache cache;
+    static GeometryCache cache;
     return cache;
 }
 std::vector<uint32_t> geometry_profile(const FragmentInterpolationLayout& layout, bool capture,
@@ -56,7 +62,9 @@ std::vector<uint32_t> geometry_profile(const FragmentInterpolationLayout& layout
 } // namespace
 
 DerivedInterpolationGeometryStats derived_interpolation_geometry_stats() {
-    return geometry_cache().stats;
+    auto& cache = geometry_cache();
+    const std::lock_guard guard(cache.lock);
+    return cache.stats;
 }
 std::shared_ptr<const std::vector<uint32_t>>
 acquire_derived_interpolation_geometry(const std::shared_ptr<const ShaderCodeAnalysis>& fragment,
@@ -68,22 +76,32 @@ acquire_derived_interpolation_geometry(const std::shared_ptr<const ShaderCodeAna
                     geometry_profile(layout, capture, rect, transport)};
     // Missing immutable owners preserve ordinary uncached compilation. Same addresses/bytes,
     // public flags and unrelated draw entries cannot stand in for genuine producing versions.
-    if (fragment && vertex)
-        if (const auto found = cache.entries.find(key); found != cache.entries.end()) {
-            ++cache.stats.cache_hits;
-            return found->second;
-        }
-    for (auto item = cache.entries.begin(); item != cache.entries.end();)
-        if (item->first.fragment.expired() || item->first.vertex.expired()) {
-            item = cache.entries.erase(item);
-            ++cache.stats.retired;
-        } else {
-            ++item;
-        }
-    ++cache.stats.compile_calls; // Actual emitter calls, including an empty/refused module.
+    const bool cacheable = fragment && vertex;
+    {
+        const std::lock_guard guard(cache.lock);
+        if (cacheable)
+            if (const auto found = cache.entries.find(key); found != cache.entries.end()) {
+                ++cache.stats.cache_hits;
+                return found->second;
+            }
+        for (auto item = cache.entries.begin(); item != cache.entries.end();)
+            if (item->first.fragment.expired() || item->first.vertex.expired()) {
+                item = cache.entries.erase(item);
+                ++cache.stats.retired;
+            } else {
+                ++item;
+            }
+        ++cache.stats.compile_calls;   // Actual emitter calls, including an empty/refused module.
+    }
     auto result = std::make_shared<const std::vector<uint32_t>>(
         recompile_interpolation_geometry(layout, capture, rect, transport));
-    if (fragment && vertex) cache.entries.emplace(std::move(key), result);
-    return result;
+    // The compile re-reads the float-controls verdict the key captured. If a publish landed in
+    // between, the bytes may belong to either value: return them, but never file them.
+    if (!cacheable || geometry_profile(layout, capture, rect, transport) != key.profile)
+        return result;
+    const std::lock_guard guard(cache.lock);
+    // Another worker may have compiled the same key meanwhile; keep ONE owner so the render
+    // thread's plan/collector caches see a single generation.
+    return cache.entries.emplace(std::move(key), result).first->second;
 }
 } // namespace prosper::gpu

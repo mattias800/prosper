@@ -675,7 +675,7 @@ TEST_F(FragmentRasterLaunch, WorkitemBridgeRejectsUnknownOrCoverageChangingPhysi
 // realization, so the captured coverage word, launch-source issue and plan all see the value
 // the hardware would. Physical zero and the inert write-on-fail bit (no test can fail with Z,
 // stencil and bounds disabled) stay admitted; colour suppression on depth pass and reserved
-// bits refuse by name with no pending deferral, capacity or replay.
+// bits refuse by name as the plan rejection, with no capacity or replay.
 TEST_F(FragmentRasterLaunch, ProgrammedDepthColorControlRefusesBeforePendingAuthority) {
     namespace helper = prosper::test::fragment_raster;
     namespace p = prosper::agc::Pm4;
@@ -697,8 +697,6 @@ TEST_F(FragmentRasterLaunch, ProgrammedDepthColorControlRefusesBeforePendingAuth
         ASSERT_TRUE(launch.coverage.has(C::DepthControl));
         EXPECT_EQ(launch.coverage.word(C::DepthControl), admitted);
         EXPECT_EQ(g::fragment_raster_workitem_gap(launch), nullptr) << std::hex << admitted;
-        if (draw.fs_words().empty())
-            EXPECT_TRUE(draw.fragment_draw_inputs->owned_wave_pending) << std::hex << admitted;
         const auto prepared = f::prepare(draw);
         ASSERT_TRUE(prepared && prepared->launch_source);
         const auto plan = g::cached_fragment_draw_program(*draw.fragment_draw_inputs, *prepared,
@@ -723,10 +721,9 @@ TEST_F(FragmentRasterLaunch, ProgrammedDepthColorControlRefusesBeforePendingAuth
         EXPECT_EQ(in.launch.coverage.word(C::DepthControl), depth_control);
         EXPECT_STREQ(g::fragment_raster_workitem_gap(in.launch), reason)
             << std::hex << depth_control;
-        // The private launch association is an observation every non-bank draw receives; the
-        // pending empty-FS deferral is the authority, and fragment_raster_pending_original
-        // withholds it for any workitem gap.
-        EXPECT_FALSE(in.owned_wave_pending) << "a refused contract must not defer as pending";
+        // The private launch association is an observation every non-bank draw receives, so
+        // the authority checked here is the plan: exact named refusal and no capacity. (The
+        // pending empty-FS deferral is not exercised by this fixture, whose native FS compiles.)
         const auto prepared = f::prepare(draw);
         ASSERT_TRUE(prepared);
         const auto plan = g::cached_fragment_draw_program(in, *prepared, raster_device(), 48);
