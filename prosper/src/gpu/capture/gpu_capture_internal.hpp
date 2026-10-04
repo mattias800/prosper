@@ -197,7 +197,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // independent immutable raw/SOURCE association. Older captures retain explicit unavailable facts.
 // v70: owned direct graphics logical-wave input plans and exact raw-window observations.
 // This is distinct from physical fragment entry facts and never restores captured guest VAs.
-constexpr uint32_t kVersion = 70;
+// v71: producing SC shader/mode/AA and DB shader controls with independent per-word presence.
+// Older captures leave these raw launch facts unavailable, never infer them from pipeline defaults.
+constexpr uint32_t kVersion = 71;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;

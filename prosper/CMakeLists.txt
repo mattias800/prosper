@@ -2629,7 +2629,7 @@ if(TARGET prosper_core)
 
   # Render-state extraction: fold a stream into a GpuState, then interpret RDNA2 registers.
   prosper_add_gtest(test_render_state
-    SOURCES tests/gpu/state/test_render_state.cpp
+    SOURCES tests/gpu/state/test_render_state.cpp tests/gpu/state/test_raster_launch_facts.cpp
     LIBRARIES prosper_core)
 
   # Messenger recompile guard (#228): committed real Messenger VS/PS RDNA2 binaries must keep
@@ -3417,6 +3417,9 @@ endif()
   target_include_directories(test_gpu_capture PRIVATE tests)
   target_link_libraries(test_gpu_capture PRIVATE prosper_core)
   add_test(NAME gpu_capture_roundtrip COMMAND test_gpu_capture)
+  prosper_add_gtest(test_raster_launch_capture
+    SOURCES tests/gpu/capture/test_raster_launch_capture.cpp
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_gpu_capture_observation
     SOURCES tests/gpu/capture/test_gpu_capture_observation.cpp
     INCLUDES tests

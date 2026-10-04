@@ -458,7 +458,7 @@ TEST(NestedWideDataAdmission, Contract) {
                                         deserialize_gpu_capture(wire, decoded_capture, refusal) &&
                                         materialize_gpu_replay(decoded_capture, replay, refusal);
                 expect(capture_ok && unexpected_guest_reads == 0u &&
-                           decoded_capture.format_version == 70u && replay.items.size() == 1u &&
+                           decoded_capture.format_version == 71u && replay.items.size() == 1u &&
                            replay.items[0].owned_waves &&
                            replay.items[0].float_transport == explicit_profile &&
                            replay.items[0].ps_entry == capture_draw.ps_entry &&
@@ -582,6 +582,14 @@ TEST(NestedWideDataAdmission, Contract) {
                         std::vector<uint8_t> bytes;
                         if (!serialize_gpu_capture(file, bytes, refusal)) return false;
                         if (legacy) {
+                            // This ownerless fixture has one draw and no new observed controls.
+                            // Pin and remove v71 before checking the complete official v70 tail.
+                            const std::array<uint8_t, 29> launch_tail{1u};
+                            if (bytes.size() < 17u + launch_tail.size() ||
+                                !std::equal(launch_tail.begin(), launch_tail.end(),
+                                            bytes.end() - launch_tail.size()))
+                                return false;
+                            bytes.resize(bytes.size() - launch_tail.size());
                             // Genuine ownerless v69 prefix: remove the entire v70 count1/flags0
                             // tail before changing the version, rather than relabeling full bytes.
                             const std::array<uint8_t, 5> tail{1u, 0u, 0u, 0u, 0u};
@@ -822,8 +830,13 @@ TEST(NestedWideDataAdmission, Contract) {
                     expect(
                         refuses(bad, "owned vertex-wave replay invocation identity disagrees"),
                         "completed invocation plan cannot be replayed as a different indexed draw");
-                    for (size_t end : {wire.size() - 1u, wire.size() - 2u}) {
-                        auto truncated = wire;
+                    auto wave_bytes = wire;
+                    wave_bytes.resize(wave_bytes.size() - 4u - 25u * captured.draws.size());
+                    wave_bytes[8] = 70u;
+                    expect(deserialize_gpu_capture(wave_bytes, decoded_capture, refusal),
+                           "complete genuine v70 prefix retains the original owned-wave payload");
+                    for (size_t end : {wave_bytes.size() - 1u, wave_bytes.size() - 2u}) {
+                        auto truncated = wave_bytes;
                         truncated.resize(end);
                         expect(!deserialize_gpu_capture(truncated, decoded_capture, refusal),
                                "truncated v70 owned payload refuses without padding missing bytes");
