@@ -7,6 +7,10 @@ The canonical-EXEC correction improved this to50PASS/5FAIL and exposed two warm-
 The subsequent cache/fixture correction reached53PASS/2FAIL. Authentic shared-registration and
 physical-profile fixture corrections now reach **55/55 actual focused CPU cases PASS,
 CTest0/helper0**: the first passing four-PE focused baseline, NOT the full helper campaign.
+The newer integrated connected run reaches **96/99PASS:89/92 CPU,7/7 Vulkan; CTest8/helper1**.
+The original saved-live/WQM/DS helper-pixel oracle actually passes on the Windows RTX4090 at
+16->15->16 widths. Three CPU diagnostic-contract failures and three connected production review
+findings remain; no whole-source approval or passing full acceptance baseline.
 General Wave64 and Kena title-screen 3D are
 NOT complete. No current Kena drop census, FPS improvement or title-screen rendering result was
 measured in this checkpoint. The original work was frozen at the maintainer's checkpoint request;
@@ -430,6 +434,100 @@ script/receipts. The historical Kena original frontier is still0/32 under the ne
 assessment below, NOT a current dropped-shader measurement. General Wave64/Kena acceptance and
 registered whole-source APPROVED remain outstanding; draft #4384 must not merge on this result.
 
+## Integrated connected baseline: actual helper pixels PASS,96/99 overall
+
+Normal merge `aab7ac2db1f3c0ba7ae211fc8878a8e40e9ac48e`, parents
+`f7dc8ce43edf1eb423aec418b0a920fa9430dbb9` and
+`9b2f0681772ad70972233244868010db0ffc8af8`, tree
+`2fa2ca2fa0035b015558e57ae9cfb0c1eb91ba0f`, integrates main's #4386 decoder test/CMake
+delta without conflicts. Startup instructions match, ahead23/behind0. The standalone new decoder
+target is NOT in this cohort; no execution credit is assigned to its nine cases.
+
+ROOT independently matched current source declarations to the NEW99-name/ten-target apparatus:
+the earlier55 plus composition8, parameters5, quad-swizzle5, render-state9, capture9 and draw8.
+This is92 CPU and7 Vulkan cases; the draw target also contains one CPU-only limits case despite
+its CTest gpu label. Source inventory is distinct from the subsequent actual discovery/execution.
+
+Actual clean aab7 configure0/inspected graph0/build0/strict-dirty certification0 for ALL TEN
+explicit PEs; actual unique registration99 and JUnit execution99. **89CPU PASS/3ordinaryFAIL;
+7/7Vulkan PASS;96/99 overall; CTest8/helper1;4.83s real time**. No errors/skips/disabled/
+inverted/bad states/timeouts/missing bodies. ROOT independently joined all99 full JUnit bodies to
+LastTest with CRLF-to-LF only, one exact matching RUN and timed OK/FAILED per case, and checked
+all ten current PE hashes against observed.json. The complete three failed bodies, strict cert
+log and physical helper body were read. Genuine FAILED bodies now classify correctly:Wrong0.
+
+The actual helper test
+`FragmentDrawExec.SavedLiveWqmReadsActualUncoveredHelperPositionThenRestoresExportMask` reports
+NVIDIA GeForce RTX4090/discrete, successful enabled float-transport/device context, and three
+normal-backend original transactions at16x12,15x12,16x12. Every asserted channel passes, including
+live pixel14 selecting uncovered helper15's POS_X15.5 via the unchanged original saved-EXEC/WQM/
+DS alias/LGKM/restored-live export. Six actual draw/pixel cases PASS with14 retained transaction
+markers; the seventh Vulkan case checks object lifetime. No game/app launch or title image.
+This is physical GPU evidence for this proved class, NOT full Wave64 or a Kena milestone.
+
+The three CPU failures are tracked in [#4402](https://github.com/mattias800/prosper/issues/4402):
+`PacketQuadSwizzle.CounterSpecificCompletionCannotBeBorrowedFromVmOrExport`,
+`AllPathWaitAndOverwriteRemainSeparateLoadBearingGuards`, and
+`TopologyModesAndLegacyPolicyRemainExplicitNotBroadDsAdmission`. Their returned rejection
+strings contain the expected bare tags; the test wrongly expects appended`:pc=N`. The API
+separately logs terminal`pc=N reason=TAG`. Actual wait/overwrite/legacy refusals are at6/7/4/2;
+unknown topology refuses earlier at WQMpc1, not the assumed DSpc2. Preserve both reason and
+actual-site assertions by checking the terminal diagnostic with a nonzero observation-only
+identity, and retain empty artifacts/positive controls. Do not merely remove PC assertions or
+change the established public reason-string contract. These corrections are NOT implemented.
+
+NEW reviewed apparatus `.codex/issue-4235-helper-connected-native-20261004.ps1` SHA256
+`11c91d8f47ee35a924e40a4a65a57ca8352487072a4888e6410deb5aa58e9af9`, derived UTF8 source SHA256
+`28de1128a77f5b2b9326b3dacf2d49287c11795af2ebf91d5d8b6dd75d2d44bb`, pins immutable old0ab.
+It fixes genuine FAILED/zero-PASSED classification while refusing actual Running0/foreign/skip/
+status-mismatch bodies. Apparatus review found an initially overbroad GPU-success flag; before
+native execution it was corrected to require statusrun, no failure/error/skip nodes, matching
+RUN+timedOK and transaction marker. Actual hand-built discriminator controls and bounded source
+rereview passed. This is apparatus calibration, NOT production shader omission/restoration proof.
+
+Actual invocation from ROOT's owned worktree:
+
+```powershell
+& '<REPO_ROOT>/.codex/issue-4235-helper-connected-native-20261004.ps1' -SourceHead aab7ac2db1f3c0ba7ae211fc8878a8e40e9ac48e -SourceParent 'f7dc8ce43edf1eb423aec418b0a920fa9430dbb9 9b2f0681772ad70972233244868010db0ffc8af8' -SourceTree 2fa2ca2fa0035b015558e57ae9cfb0c1eb91ba0f -Cohort connected-baseline -ExecuteNativeProof
+```
+
+Raw cohort `.codex/issue-4235-native-20261004/aab7ac2d-connected-baseline/` retains graph,
+build/precertificate/certification, calibration, actual discovery, connected.log/JUnit/LastTest,
+all ten exact PE hashes and observed.json. Native handle terminal1/process census0; APP313/
+process0 unchanged before/after and no app/DLL target. No SPIR-V SDK validation or production-only
+controls/restorations; additional old capture/diagnostic/bank/default-factory neighbors remain.
+All earlier failed cohorts and8819's focused green receipt retain their own source identities.
+
+### Connected review: three production blockers, NOT CLEAR
+
+SAME reviewer completed the previously missing launch/GPU fixtures, eight bank-conflict contexts,
+uniform DS phases, validator/replay bounds, completion retention and factory/discovery wiring at
+exact aab7. It reports **SOURCE REVIEW NOT CLEAR**, with three concrete findings; ROOT checked the
+relevant actual producer/collection/plan/pipeline/guard fields. No wrong pixels, VUID, race or title
+FPS effect was measured for these untested variants:
+
+- [#4397](https://github.com/mattias800/prosper/issues/4397): physical DB_DEPTH_CONTROL bit31 is
+  admitted by the`&0xf` workitem guard but its color-suppression meaning is not implemented by
+  resolved attachment checks/replay. [AMD PAL's field mask](https://raw.githubusercontent.com/GPUOpen-Drivers/pal/dev/src/core/hw/gfxip/gfx9/chip/gfx9_plus_merged_mask.h)
+  identifies`DISABLE_COLOR_WRITES_ON_DEPTH_PASS=0x80000000`; a bit name alone is not a measured
+  pixel oracle. Program the genuine bit before realization, require honest named refusal until
+  supported, and ultimately implement the actual general color-write behavior.
+- [#4398](https://github.com/mattias800/prosper/issues/4398): center interpolation plus packed
+  POS_X can pass complete-original proof and require generated collector coefficient GS, but
+  shipping`FragmentDrawCollectGpuProgram::acquire` binds exactly VS+FS. Connect the actual retained
+  GS with same-device enabled feature/limits/interfaces/effects/lifetime checks and a genuinely
+  registered center-plus-position GPU discriminator. Passing position-only pixels cannot clear it.
+- [#4399](https://github.com/mattias800/prosper/issues/4399): the normal realizer creates a fresh
+  immutable generated-GS owner every draw, while profile/generation checks require that exact
+  identity. Repeated identical pull/linear draws, including refused plans, cannot remain warm.
+  Cache actual derived GS by producing source/layout/transport/device shape; preserve private
+  per-draw entry/launch authority. Add real repeated registrations with nonempty GS; canonical
+  empty-GS17-key warm tests do not discriminate this path.
+
+All three are in the UNMERGED helper slice, not newly verified main behavior. Full general
+input/system/M0/SMEM/resources/control/export scope and the historical0/32 original frontier still
+apply. Do not merge the draft on seven passing Vulkan cases or substitute a position-only goal.
+
 ## Objective and acceptance boundary
 
 Implement accurate, general guest Wave64 on hosts without native Wave64. Kena's title-screen 3D
@@ -448,8 +546,8 @@ input/audio and25% volume. A screenshot/pixel oracle must come from the normal W
 
 | State | Exact identity | Evidence/status |
 | --- | --- | --- |
-| Latest fetched main | `9b2f0681772ad70972233244868010db0ffc8af8` | #4386 adds decoder closed-tail tests/CMake registration only; complete incoming delta inspected, instructions unchanged. NOT integrated or executed in8819's cohort. |
-| Main integrated by current focused source | `ee9dcb1e1e2c695426acb25575e7c6c320971d1d` | #4382 changed two scalar-bank/ordered-producer fixture files; integrated at4b4a8ba6. Later8819 focused CPU evidence includes this source, not the full helper/GPU campaign. |
+| Latest fetched/integrated main | `9b2f0681772ad70972233244868010db0ffc8af8` | #4386 adds decoder tests/CMake only; integrated at aab7 and included as source in99-case cohort. Its standalone nine-case decoder target was NOT executed. |
+| Earlier main integrated by8819 | `ee9dcb1e1e2c695426acb25575e7c6c320971d1d` | #4382 changed two scalar-bank/ordered-producer fixture files; integrated at4b4a8ba6. The8819 focused CPU receipt belongs to this earlier source, not aab7. |
 | Accepted main integrated by helper | `3fe269ef0d035a46baee750af30b6a0004d4f7b0` | Includes merged #4374. |
 | Frozen helper CODE head | `3fcb2d181367505ebb5672e8d3cfe2b98396baed` | Parent `59995895857475b9971658ba7bacacd526b6c444`; tree `a75d5db570e7a47e597de52d77c343417273b4c6`. Source-only, partial review. Later checkpoint-document commits do not provide native credit. |
 | Frozen Windows artifact fix | `215ee6d29b29177c70a44ca6ae2abb11e0656d84` | Parent3fe; tree `e18dffd3803f551f20a3cd9079875205f0cb2da3`. Native baseline FAILED; [draft PR #4383](https://github.com/mattias800/prosper/pull/4383). |
@@ -560,17 +658,20 @@ findings and their required acceptance work; neither is an accepted fix yet.
    column count. Prove a real zero-position raster positive and retain old absent-mask negatives.
 
 The independent SAME reviewer was `/root/silksong_windows_boot`; author `/root/packet_entry_abi`.
-Only partial connected review exists, **no whole-source CLEAR or APPROVED**. Completed reads cover
+At the original freeze only partial connected review existed, **no whole-source CLEAR or APPROVED**.
+Those completed reads covered
 private launch/program/contract, collector quad/election body, composition/parameters/swizzle,
 resource/definedness/mask/scalar/VGPR changes, plan/cache/capacity/assembly/validator diffs and
 realizer/preparer/backend changed hunks, state/coverage/capture diffs and mechanical extraction.
 Relevant AMD EXEC/WQM/DS and Vulkan/SPIR-V helper contracts were actually read.
 
-Remaining review: remainder of launch tests/GPU producer fixtures; full connected backend
+Remaining review at that freeze: remainder of launch tests/GPU producer fixtures; full connected backend
 lifecycle and eight bank-conflict contexts; CFG/uniform barrier participation; full attachment
 validation/replay bounds; actual PAL fixed-function masks; factory/CMake emission/discovery;
 per-draw generated-geometry cache behavior; both future correction deltas and new tests. A new
 reviewer must independently establish these, not inherit the earlier partial reads as approval.
+The later aab7 connected review above completed these reads and found three additional blockers;
+it is NOT CLEAR or approval, and later corrections must be re-reviewed.
 
 ## Historical Kena originals: actual next frontier
 
@@ -626,15 +727,15 @@ run `python3 prosper/tools/session_start.py` at session start/after worktree cha
 machine the Store python3 alias may fail; real Python312 is available as `python`/`py -3.12`.
 Fetch in your own worktree, inspect current-main instructions/deltas and preserve others' trees.
 
-1. Continue from exact8819's passing55/4 focused CPU baseline, not a full helper acceptance.
-   Version/calibrate the zero-passes body checker against hand-built genuine FAILED/zero-PASS,
-   actual Running0, foreign/skip and valid bodies without altering old scripts or receipts.
-   Synchronize newer main in the owned tree and have the SAME reviewer check applicability;
-   preserve exact successor H/P/T and derive the expanded full-helper/native CPU/GPU registrations.
-   Complete both correction contracts, missing registered negatives, real SPIR-V SDK validation
-   and production-only controls/restorations on fresh exact-source binaries. SAME reviewer must
-   finish the connected review before registered whole-source approval. Do not borrow8819 or
-   accepted-bank native credit for a newer head or broader test domain.
+1. Continue from exact aab7's FAILED99/10 connected baseline with seven passing Vulkan cases.
+   Correct #4402 to preserve reason AND actual terminal-PC assertions, then implement the real
+   generated-GS producer/caching and color-control contracts in #4397/#4398/#4399 with genuine
+   programmed/register-owned controls. Do not weaken ownership, substitute zero/default words
+   or turn this temporary position-only proof frontier into permanent policy. SAME reviewer
+   rechecks corrections/newer main; preserve successor H/P/T, calibrated NEW apparatus and exact
+   discovery/certificates. Complete real SPIR-V SDK validation, old capture/bank/default neighbors
+   and production-only omission/restoration controls before acceptance. Do not borrow aab7 or
+   accepted-bank native credit for newer source or a broader test domain.
 2. In parallel only if useful, isolate/fix the recorded Windows UNC/enumeration/timeout failures.
    Do NOT repeat the unchanged hanging baseline or convert its timeouts to expected controls.
 3. ROOT alone owns heavy native Windows builds/4090 execution. Review agents remain SOURCE-ONLY.
@@ -665,13 +766,14 @@ committed or downloaded by a fresh clone, whereas source and this document are i
 | `.codex/issue-4235-native-20261004/802b4f80-canonical-exec/` | Actual new four-PE strict certificate and55 cases50PASS/5FAIL after canonical-EXEC correction; warm-cache negatives and malformed high-word fixture exposed, no GPU/SDK/production-control acceptance. |
 | `.codex/issue-4235-native-20261004/cae82d77-launch-authority/` | Actual four-PE strict certificate and55 cases53PASS/2FAIL after checked launch availability partitions both cache paths and real high-word fixture correction; remaining owner/profile failures, no GPU/SDK/production-control acceptance. |
 | `.codex/issue-4235-native-20261004/8819e5c4-fixture-owners-profile/` | First actual focused55/55 CPU PASS and four strict PE certificates after authentic shared-registration/physical-profile fixture corrections; full graph/discovery/bodies/hashes retained. NOT full helper/GPU/SDK/production-control or Kena acceptance. |
+| `.codex/issue-4235-native-20261004/aab7ac2d-connected-baseline/`, `.codex/issue-4235-helper-connected-native-20261004.ps1` | Actual99/10 strict native cohort96PASS/3FAIL;89/92CPU and7/7Vulkan with real4090 helper pixels. New classifier/cals source-reviewed; raw certs/hashes/full bodies/failures retained. No SDK/production-controls or full-source approval. |
 | `.codex/issue-4378-native-20261004/215ee6d2-baseline/` | Actual failed native configure/graph/build/certs/registration/JUnit/LastTest/observed.json. |
 | `.codex/issue-4378-cpu-native-20261004.ps1` | Reviewed ROOT-only70/12 helper, SHA256 `4df72940d6492ca983eb84996ada823686ce0f04c68fd1dc8196c5f765554695`; requires exact clean H/P/T and NEW cohort name. |
 | `.codex/issue-4378-source-freeze-215ee6d2-20261004.txt`, held-scope v1/v2 and handoff | Windows source-gate/history, not a passing native result. |
 | `.codex/issue-4322-native-20261004/9e595b11-final-tool/` | Accepted exact9e CPU60 receipts. |
 | `.codex/issue-4322-observation-native-20261004/9e595b11-final-tool/` | Accepted exact9e GPU17/observations receipts. |
 | `.codex/issue-4322-spv-native-20261004/9e595b11-final-corrected/` | Accepted exact9e585 actual modules/validator evidence. |
-| `.codex/worktrees/wave64-followthrough-20261002` | ROOT own central worktree; sole retained `prosper/build-flags-native-clang`. Latest four focused CPU PEs are linked/certified8819; other prior twelve-target-lane PEs remain215. Native receipts do not certify later documentation/source successors. |
+| `.codex/worktrees/wave64-followthrough-20261002` | ROOT own central worktree; sole retained `prosper/build-flags-native-clang`. Latest ten requested PEs are linked/certified aab7; unrelated retained binaries keep their older identities. Native receipts do not certify later documentation/source successors. |
 | `.codex/worktrees/fragment-launch-composition-20261004` | Source-only helper author tree, clean3fcb at freeze, no builds. |
 | `.codex/worktrees/refused-shader-paths-20261004` | Removed after clean/ignored-path census, author acknowledgement and exact remote215 verification; no build or raw receipts deleted. Recreate an owned tree from draft #4383 if resuming. |
 
@@ -680,5 +782,5 @@ finished owned source-only worktrees after clean/ignored-path census and author 
 using unforced `git worktree remove` on validated exact paths. Retain the one central build and
 failed evidence. Never delete shared/user trees or recursively erase the workspace. The Windows
 source-only tree was safely removed after the original freeze; the helper author tree remains.
-All subagents stopped. Both follow-ups now have bounded focused CPU evidence, not full accepted
-helper/GPU fixes or general Wave64/Kena rendering acceptance.
+Source-review agents perform no native builds. Both follow-ups now have focused CPU and bounded
+helper GPU evidence, not full accepted helper fixes or general Wave64/Kena rendering acceptance.
