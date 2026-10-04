@@ -209,10 +209,12 @@ bool packing_unobservable(const std::vector<Rdna2Inst>& instructions, uint32_t c
 std::vector<uint32_t> profile_key(const RasterQuadInputs& in,
                                   const FragmentPacketPreparation& prepared,
                                   FragmentPacketDeviceContract device, uint32_t max_quads) {
+    const bool raster_launch_available = device.raster && in.launch_source &&
+                                         prepared.launch_source == in.launch_source &&
+                                         in.launch_source->matches(in);
     if (!producing_owner(in, prepared) || !launch_owned(in, prepared) ||
         (!scalar_bank_program(in) && !resource_free(in)) ||
-        (!input_free_layout(in) && (!device.raster || prepared.launch_source != in.launch_source ||
-                                    !in.launch_source || !in.launch_source->matches(in))))
+        (!input_free_layout(in) && !raster_launch_available))
         return {};
     std::vector<uint32_t> key{max_quads,
                               prepared.user_sgpr_count,
@@ -232,6 +234,9 @@ std::vector<uint32_t> profile_key(const RasterQuadInputs& in,
                               uint32_t(!scalar_bank_program(in) && resource_free(in))};
     key.push_back(bool(device.raster));
     if (device.raster) {
+        // Even an input-free original can require the raster recipe. Its private launch proof
+        // must not be borrowed from a warm plan or let an invalid cold query poison valid reuse.
+        key.push_back(uint32_t(raster_launch_available));
         const auto& raster = *device.raster;
         key.insert(key.end(),
                    {uint32_t(raster.geometry_shader_enabled), raster.max_vertex_output_components,

@@ -326,7 +326,17 @@ TEST_F(FragmentRasterLaunch, SavedMaskNumericalExposureAndPartialAliasReplacemen
     EXPECT_EQ(helper_requirements(code, {1u << 8, 1u << 8}).rejection,
               "fragment-raster-vector-source-unproved:pc=2");
     code = helper_original();
-    code.insert(code.begin() + 5, 0xbe950080u); // genuine high-word replacement expires s20:21
+    code.insert(code.begin() + 5, 0xbe950380u);   // s_mov_b32 s21,0 expires the saved s20:21 pair
+    std::vector<g::Rdna2Inst> replacement;
+    g::rdna2_walk(code.data(), code.size(), replacement);
+    ASSERT_GT(replacement.size(), 4u);
+    EXPECT_EQ(replacement[4].pc, 5u);
+    EXPECT_EQ(replacement[4].fmt, g::Rdna2Format::SOP1);
+    EXPECT_EQ(replacement[4].opcode, g::kSop1OpcodeMovB32);
+    EXPECT_EQ(replacement[4].dst.kind, g::OperandKind::SGPR);
+    EXPECT_EQ(replacement[4].dst.value, 21);
+    EXPECT_EQ(replacement[4].src[0].kind, g::OperandKind::InlineInt);
+    EXPECT_EQ(replacement[4].src[0].value, 0);
     EXPECT_EQ(helper_requirements(code, {1u << 8, 1u << 8}).rejection,
               "fragment-raster-mask-source-unproved:pc=6");
     ASSERT_TRUE(helper_requirements(helper_original(), {1u << 8, 1u << 8}).rejection.empty());
@@ -652,6 +662,16 @@ TEST_F(FragmentRasterLaunch, PendingEmptyFsCannotBorrowWarmCodeOrAnotherDrawObse
     ASSERT_TRUE(draw.fragment_draw_inputs && draw.fragment_draw_inputs->launch_source);
     const auto prepared = f::prepare(draw);
     ASSERT_TRUE(prepared);
+    auto cold_missing = std::make_shared<g::RasterQuadInputs>(*draw.fragment_draw_inputs);
+    cold_missing->launch_source.reset();
+    const auto cold_prepared = g::prepare_fragment_packet_inputs(cold_missing, true);
+    ASSERT_TRUE(cold_prepared && !cold_prepared->launch_source);
+    const auto cold_refusal =
+        g::cached_fragment_draw_program(*cold_missing, *cold_prepared, raster_device(), 48);
+    ASSERT_TRUE(cold_refusal);
+    EXPECT_EQ(cold_refusal->rejection_reason(),
+              "fragment-draw-draw-bound-launch-source-unavailable");
+    EXPECT_FALSE(cold_refusal->capacity_owner());
     const auto warm =
         g::cached_fragment_draw_program(*draw.fragment_draw_inputs, *prepared, raster_device(), 48);
     ASSERT_TRUE(warm);
@@ -673,6 +693,14 @@ TEST_F(FragmentRasterLaunch, PendingEmptyFsCannotBorrowWarmCodeOrAnotherDrawObse
         EXPECT_NE(refusal, warm) << kind;
         EXPECT_FALSE(refusal->rejection_reason().empty()) << kind;
         EXPECT_FALSE(refusal->capacity_owner()) << kind;
+        if (kind == 0)
+            EXPECT_EQ(refusal->rejection_reason(),
+                      "fragment-draw-draw-bound-launch-source-unavailable");
+        const auto compile_calls = g::fragment_draw_cache_stats().program_compile_calls;
+        EXPECT_EQ(warm, g::cached_fragment_draw_program(*draw.fragment_draw_inputs, *prepared,
+                                                        raster_device(), 48));
+        EXPECT_EQ(g::fragment_draw_cache_stats().program_compile_calls, compile_calls)
+            << "invalid draw authority must neither poison nor recompile the valid warm plan";
     }
     const auto transaction = g::instantiate_fragment_draw_transaction(
         warm, draw.fragment_draw_inputs, *prepared, 15, 12, 1, 1);
