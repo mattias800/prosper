@@ -545,6 +545,8 @@ inline bool fold_control_cache_enabled() {
 }
 
 struct DecodedShader {
+    // Full ORIGINAL stream classification, derived cold before fold compaction.
+    std::vector<uint32_t> raw_wave_wide_data_load_pcs;
     FoldControlPlan control_plan;
     FoldControlPlan shader_constant_control_plan;
     std::vector<uint32_t> code;
@@ -598,6 +600,10 @@ struct ShaderCodeAnalysisEntry {
     std::shared_ptr<const ShaderCodeAnalysis> analysis;
     uint64_t last_use = 0;
 };
+
+// Cold derivation from an already owned immutable source. This never inserts an owned-copy
+// address into the guest-address analysis cache or retains its decoder control block.
+SharedShaderAnalysis derive_owned_shader_analysis(const std::vector<uint32_t>& words);
 
 struct PcrelDispatchSelection {
     PcrelDispatchInfo dispatch;

@@ -133,6 +133,7 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         // their original order and PCs. Prove shader-constant branches against the FULL decoded
         // stream first: the compact fold stream intentionally omits most VALU, including implicit
         // VCC writers that must invalidate a scalar-data proof through s106:s107.
+        result->raw_wave_wide_data_load_pcs = rdna2_raw_wave_wide_data_loads(decoded);
         result->raw_x2_data_load_pcs = rdna2_proven_raw_x2_data_loads(decoded);
         result->raw_immediate_wide_data_load_pcs =
             rdna2_proven_raw_immediate_wide_data_loads(decoded);
@@ -168,7 +169,8 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                 sizeof(Rdna2Inst) +
             sizeof(result->scalar_spill_written_vgprs) + result->control_plan.allocated_bytes() +
             result->shader_constant_control_plan.allocated_bytes() +
-            (result->raw_x2_data_load_pcs.capacity() +
+            (result->raw_wave_wide_data_load_pcs.capacity() +
+             result->raw_x2_data_load_pcs.capacity() +
              result->raw_immediate_wide_data_load_pcs.capacity() +
              result->raw_register_wide_data_load_pcs.capacity() +
              result->raw_offset_scalar_source_pcs.capacity() +

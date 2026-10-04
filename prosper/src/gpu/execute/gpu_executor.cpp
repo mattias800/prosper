@@ -922,8 +922,7 @@ uint64_t shader_analysis_cache_limit_bytes() {
     return std::min<uint64_t>(mib, 1024ull) * 1024 * 1024;
 }
 
-std::shared_ptr<ShaderCodeAnalysis> make_shader_code_analysis(const uint32_t* code,
-                                                             size_t dwords) {
+std::shared_ptr<ShaderCodeAnalysis> make_shader_code_analysis(const uint32_t* code, size_t dwords) {
     auto result = std::make_shared<ShaderCodeAnalysis>();
     result->identity = ++g_next_shader_analysis_identity;
     result->source_dwords = dwords;
@@ -937,11 +936,10 @@ std::shared_ptr<ShaderCodeAnalysis> make_shader_code_analysis(const uint32_t* co
     result->fragment_color_export_mask =
         fragment_color_export_mask(owned_code, result->code.size());
     result->packet_vgpr_requirements = fragment_packet_vgpr_requirements(result->code);
-    result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
-                    static_cast<uint64_t>(result->pcrel_dispatch.target_pcs.size()) *
-                        sizeof(uint32_t) +
-                    static_cast<uint64_t>(result->pcrel_dispatch.setup_pcs.size()) *
-                        sizeof(uint32_t);
+    result->bytes =
+        static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
+        static_cast<uint64_t>(result->pcrel_dispatch.target_pcs.size()) * sizeof(uint32_t) +
+        static_cast<uint64_t>(result->pcrel_dispatch.setup_pcs.size()) * sizeof(uint32_t);
     result->bytes +=
         result->packet_vgpr_requirements.retained_bytes() + sizeof(result->refused_shader_memo);
     return result;
@@ -1775,6 +1773,10 @@ void clear_shader_analysis_cache() {
 
 SharedShaderAnalysis acquire_shader_analysis(const uint32_t* code, size_t dwords) {
     return analyze_shader_code_cached(code, dwords);
+}
+
+SharedShaderAnalysis derive_owned_shader_analysis(const std::vector<uint32_t>& words) {
+    return make_shader_code_analysis(words.empty() ? nullptr : words.data(), words.size());
 }
 
 namespace {
@@ -6095,12 +6097,13 @@ static void add_owned_raw_wide_snapshot(ShaderResourceTable& table, const SrtUse
     table.resources.push_back(resource);
 }
 
-static void set_owned_raw_snapshot_requirements(ShaderResourceTable& table,
-                                                const uint32_t* code, size_t dwords) {
+static void
+set_owned_raw_snapshot_requirements(ShaderResourceTable& table, const uint32_t* code, size_t dwords,
+                                    const std::shared_ptr<const DecodedShader>& captured = {}) {
     table.owned_raw_snapshot_requirements.clear();
-    const auto decoded = decode_shader_cached(code, dwords);
+    const auto decoded = captured ? captured : decode_shader_cached(code, dwords);
     for (uint32_t pc : decoded->raw_owned_wide_data_load_pcs) {
-        const auto load = rdna2_decode_one(code + pc, dwords - pc);
+        const auto load = rdna2_decode_one(decoded->code.data() + pc, decoded->code.size() - pc);
         table.owned_raw_snapshot_requirements.emplace_back(pc, load.opcode == 0x2u ? 16u : 32u);
     }
 }
@@ -6952,8 +6955,20 @@ SharedShaderWords registered_graphics_original(uint64_t address) {
     return registered_graphics_read_source(address).words;
 }
 
-bool draw_requires_owned_nested_snapshot(const GpuState& state) {
+bool draw_requires_owned_nested_snapshot(const GpuState& state,
+                                         const OrderedScalarBankReadPoint* captured,
+                                         uint64_t command_order) {
     const auto render = extract_render_state(state);
+    if (captured && captured->belongs_to_draw(state, captured->source_submit(), command_order,
+                                              render.ps_addr)) {
+        for (const uint64_t address : {render.es_addr, render.ps_addr}) {
+            const auto decoded = captured->decoded_source(address);
+            if (!decoded || !decoded->raw_wave_wide_data_load_pcs.empty() ||
+                !decoded->owned_nested_wide_chains.empty())
+                return true;
+        }
+        return false;
+    }
     for (uint64_t address : {render.es_addr, render.ps_addr}) {
         if (graphics_program_requires_owned_waves(address)) return true;
         const auto* header = static_cast<const AgcShaderHeader*>(
@@ -7552,8 +7567,9 @@ build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t d
             read_user_sgprs(st.sh, base + range_start, sgprs);
             t = build_shader_resources(*hdr, sgprs, kUserSgprs, user_sgpr_base);
         }
-        set_owned_raw_snapshot_requirements(t,
-            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
+        set_owned_raw_snapshot_requirements(
+            t, reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords,
+            full_source);
         // Add the const-fold-resolved dynamic buffers, keyed by their SRSRC SGPR so the
         // recompiler's by_sgpr_base() resolves each buffer_load_format. The V#'s data format is patched
         // at runtime by the fetch shader (so the load-time snapshot reads Unknown) — default to Float32
@@ -11599,20 +11615,6 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                     ComputeAuthorityBoundaryKind::Draw,
                     submit_no, operation.command_order);
                 DrawItem item;
-                const bool nested_inputs = draw_requires_owned_nested_snapshot(
-                    use_per_draw_policy(st) ? st.state_at_draw(operation.index) : st);
-                GraphicsRawSnapshotContext raw_context;
-                if (nested_inputs) {
-                    // Prior render spans must publish before folding a pointer or child. Retained
-                    // images remain excluded by the physical-alias-aware raw authority provider.
-                    flush_span(true);
-                    retire_deferred_graphics();
-                    const auto completed = graphics_producer_status();
-                    raw_context.producers_complete = producer_epoch_ok && graphics_epoch_ok &&
-                        indirect_dependencies_ok &&
-                        graphics_epoch.known && completed.known && !completed.pending &&
-                        graphics_epoch.failures == completed.failures;
-                }
                 const GpuState& read_state =
                     use_per_draw_policy(st) ? st.state_at_draw(operation.index) : st;
                 const auto read_render = extract_render_state(read_state);
@@ -11623,11 +11625,47 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                         ? prepare_ordered_scalar_draw(read_points, submit_no,
                                                       operation.command_order, read_state, span)
                         : OrderedScalarDrawInputs{};
+                const bool nested_inputs = draw_requires_owned_nested_snapshot(
+                    read_state, scalar_inputs.point.get(), operation.command_order);
+                GraphicsRawSnapshotContext raw_context;
+                if (nested_inputs) {
+                    // Prior render spans must publish before folding a pointer or child. Retained
+                    // images remain excluded by the physical-alias-aware raw authority provider.
+                    // Expire and discard BOTH pre-flush permissions and owned copies before any
+                    // callback. submitted_span() alone resets effects, not the issuer's epoch.
+                    read_points.advance();
+                    scalar_inputs = {};
+                    flush_span(true);
+                    retire_deferred_graphics();
+                    const auto completed = graphics_producer_status();
+                    raw_context.producers_complete =
+                        producer_epoch_ok && graphics_epoch_ok && indirect_dependencies_ok &&
+                        graphics_epoch.known && completed.known && !completed.pending &&
+                        graphics_epoch.failures == completed.failures;
+                    read_points.dependencies_ok = read_point_dependencies_ok && producer_epoch_ok &&
+                                                  graphics_epoch_ok && indirect_dependencies_ok;
+                    scalar_inputs =
+                        scalar_ordering
+                            ? prepare_ordered_scalar_draw(read_points, submit_no,
+                                                          operation.command_order, read_state, span)
+                            : OrderedScalarDrawInputs{};
+                }
                 raw_context.source_submit = submit_no;
                 raw_context.requires_ordered_read_point = true;
-                raw_context.ordered_read_point =
-                    read_points.issue(submit_no, operation.command_order, span, read_render.es_addr,
-                                      read_render.ps_addr);
+                const auto scalar_requirements =
+                    scalar_inputs.point
+                        ? scalar_inputs.point->packet_requirements(read_render.ps_addr)
+                        : nullptr;
+                const bool current_scalar_source =
+                    scalar_inputs.point && scalar_requirements &&
+                    scalar_inputs.point->belongs_to_draw(
+                        read_state, submit_no, operation.command_order, read_render.ps_addr) &&
+                    (read_render.ps_wave32 || !scalar_requirements->scalar_reads.has_smem ||
+                     scalar_inputs.bank);
+                if (nested_inputs || !current_scalar_source)
+                    raw_context.ordered_read_point =
+                        read_points.issue(submit_no, operation.command_order, span,
+                                          read_render.es_addr, read_render.ps_addr);
                 if (nested_inputs)
                     raw_context.producers_complete =
                         raw_context.producers_complete && bool(raw_context.ordered_read_point);
@@ -12693,11 +12731,14 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                                          [](const auto& draw) { return draw.indirect; }) ||
                               std::any_of(st.dispatches.begin(), st.dispatches.end(),
                                          [](const auto& dispatch) { return dispatch.indirect; });
-    const bool has_nested_inputs = std::any_of(st.draws.begin(), st.draws.end(),
-        [&](const auto& draw) {
+    const bool has_nested_inputs =
+        std::any_of(st.draws.begin(), st.draws.end(), [&](const auto& draw) {
             const size_t index = static_cast<size_t>(&draw - st.draws.data());
-            return draw_requires_owned_nested_snapshot(
-                use_per_draw_policy(st) ? st.state_at_draw(index) : st);
+            const auto& source_state = use_per_draw_policy(st) ? st.state_at_draw(index) : st;
+            // The code-free hint already selects ordered realization. Actual nested effects
+            // are classified from the genuine source at that later Draw boundary, not here.
+            if (draw_requires_original_scalar_bank(source_state)) return false;
+            return draw_requires_owned_nested_snapshot(source_state);
         });
     const bool has_scalar_bank_inputs =
         std::any_of(st.draws.begin(), st.draws.end(), [&](const auto& draw) {

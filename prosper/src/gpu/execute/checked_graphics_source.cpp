@@ -9,6 +9,11 @@ SharedShaderAnalysis checked_graphics_source_analysis(const CheckedGraphicsSourc
 bool checked_graphics_source_current(const CheckedGraphicsSource* source) {
     return source && source->current();
 }
+bool checked_graphics_source_requires_owned_waves(const CheckedGraphicsSource* source) {
+    // Immutable classification only; this cannot mint permission or revive an expired point.
+    return source && source->source().decoded &&
+           !source->source().decoded->raw_wave_wide_data_load_pcs.empty();
+}
 GraphicsReadSource checked_graphics_source_observation(const CheckedGraphicsSource* source) {
     return source && source->current() ? source->source() : GraphicsReadSource{};
 }

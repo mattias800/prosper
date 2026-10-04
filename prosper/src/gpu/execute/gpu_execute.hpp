@@ -551,7 +551,9 @@ std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
 // indexed draws are grown to their decoded max-index range later in realize_draw_item. Implemented in
 // gpu_executor.cpp (needs the AGC registry + descriptor decode).
 struct GraphicsRawSnapshotContext;
-bool draw_requires_owned_nested_snapshot(const GpuState& state);
+bool draw_requires_owned_nested_snapshot(const GpuState& state,
+                                         const OrderedScalarBankReadPoint* captured = nullptr,
+                                         uint64_t command_order = 0);
 // Code-free physical launch hint. It chooses ordered realization, not a completion wait or
 // resource admission. The real issuer separately authenticates the current original version.
 bool draw_requires_original_scalar_bank(const GpuState& state);
@@ -679,6 +681,7 @@ checked_graphics_source(std::shared_ptr<const OrderedScalarBankReadPoint>, const
                         uint64_t address, uint64_t command_order, ShaderProgramStage);
 SharedShaderAnalysis checked_graphics_source_analysis(const CheckedGraphicsSource*);
 bool checked_graphics_source_current(const CheckedGraphicsSource*);
+bool checked_graphics_source_requires_owned_waves(const CheckedGraphicsSource*);
 GraphicsReadSource checked_graphics_source_observation(const CheckedGraphicsSource*);
 std::shared_ptr<const OriginalFragmentDrawProducer>
 seal_original_fragment_draw_producer(const OrderedScalarBankReadPoint&, const GpuState&,
@@ -2393,8 +2396,12 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                                    rs.cb_target_mask, rs.cb_shader_mask);
         return false;
     }
-    const bool owned_vertex = graphics_program_requires_owned_waves(vs_program_addr);
-    const bool owned_fragment = graphics_program_requires_owned_waves(rs.ps_addr);
+    const bool owned_vertex =
+        checked_vertex ? checked_graphics_source_requires_owned_waves(checked_vertex.get())
+                       : graphics_program_requires_owned_waves(vs_program_addr);
+    const bool owned_fragment =
+        checked_fragment ? checked_graphics_source_requires_owned_waves(checked_fragment.get())
+                         : graphics_program_requires_owned_waves(rs.ps_addr);
     std::shared_ptr<const GraphicsOwnedWaveDraw> owned_waves;
     std::vector<uint32_t> owned_indices;
     if (owned_vertex || owned_fragment) {

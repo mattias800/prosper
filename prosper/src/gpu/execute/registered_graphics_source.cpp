@@ -25,7 +25,7 @@ coupled_graphics_read_source(const std::shared_ptr<const DecodedShader>& decoded
                 item = native.erase(item);
             else
                 ++item;
-        auto derived = acquire_shader_analysis(decoded->code.data(), decoded->code.size());
+        auto derived = derive_owned_shader_analysis(decoded->code);
         analysis = std::shared_ptr<const RegisteredNativeGraphicsAnalysis>(
             new RegisteredNativeGraphicsAnalysis(decoded, std::move(derived)));
         if (!bypass) native.emplace(identity, analysis);
