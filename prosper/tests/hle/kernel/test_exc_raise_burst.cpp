@@ -165,8 +165,9 @@ TEST(ExcPendingTable, HoldsAFullBurstReleasesUnsentRequestsAndHandsEachOutOnce) 
     }
     EXPECT_EQ(prosper::exc_pending_put(kBase + 0xfff000, 0x1e), 0u) << "a full table refuses";
     // A raise whose signal was never sent gives its slot back.
-    prosper::exc_pending_release(handles[5], kBase + 5 * 0x1000);
-    EXPECT_EQ(prosper::exc_pending_take(kBase + 5 * 0x1000), -1) << "a released request is gone";
+    prosper::exc_pending_release(handles[5], kBase + uint64_t{5} * 0x1000);
+    EXPECT_EQ(prosper::exc_pending_take(kBase + uint64_t{5} * 0x1000), -1)
+        << "a released request is gone";
     const size_t reused = prosper::exc_pending_put(kBase + 0xfff000, 0x1f);
     EXPECT_NE(reused, 0u) << "and its slot is reusable";
     EXPECT_EQ(prosper::exc_pending_take(kBase + 0xfff000), 0x1f);
