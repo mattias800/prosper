@@ -219,6 +219,7 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
         bd.ps     = nops ? nullptr : &it.ps;
         bd.raster_quads = it.raster_quads;
         bd.fragment_draw_inputs = it.fragment_draw_inputs;
+        bd.original_graphics_effects = it.original_graphics_effects;
         bd.raster_quad_contract_modified = refvs || fs_ov || nops ||
             (descriptor_validate_mode && !strcmp(descriptor_validate_mode, "poison"));
         if (it.owned_waves && bd.raster_quad_contract_modified) {
@@ -249,6 +250,12 @@ std::vector<prosper::test::BackendDraw> build_backend_draws(BackendDrawContext& 
                  "VS/backend", bd.vs_words(), it.vrt.get(), 0,
                  prosper::gpu::SpirvShaderStage::Vertex, descriptor_validate_mode)) &&
             (it.owned_waves && it.owned_waves->fragment_pending ||
+             (!bd.raster_quad_contract_modified && bd.fragment_draw_inputs &&
+              bd.fragment_draw_inputs->original_fragment_producer &&
+              bd.fragment_draw_inputs->original_fragment_producer->matches(
+                  *bd.fragment_draw_inputs) &&
+              bd.fragment_draw_inputs->original_fragment_producer->matches_modules(
+                  bd.vs_shared, bd.gs_words(), bd.fs_words())) ||
              prosper::gpu::validate_runtime_descriptor_contract(
                  "PS/backend", bd.fs_words(), it.prt.get(), 1,
                  prosper::gpu::SpirvShaderStage::Fragment, descriptor_validate_mode));

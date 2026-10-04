@@ -30,6 +30,8 @@
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
+#include "gpu/recompiler/original_fragment_producer.hpp"
+#include "gpu/recompiler/original_graphics_draw_effects.hpp"
 #include "gpu/execute/fragment_draw_plan.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "diagnostics/exit_census.hpp"       // one-line end-of-run reports
@@ -707,82 +709,7 @@ inline BackendColorTargetStats backend_color_target_stats() {
 //
 // When `tex` is non-null, its RGBA8 texels are uploaded to a sampled VkImage and bound as a combined
 // image sampler at tex->binding — how a recompiled pixel shader's image_sample reaches a real texture.
-// One draw for the multi-draw backend: recompiled VS+PS SPIR-V, its resolved fixed-function state, its
-// set-tagged resources, vertex count, and instance count. render_draws_rgba preserves every draw in
-// order, normally in one render pass; an attached-depth write/sample transition is the narrow case
-// that requires an ordered pass boundary. render_triangle_rgba is a thin single-draw wrapper (below).
-struct BackendDraw {
-    std::shared_ptr<prosper::gpu::RasterQuadCollection> raster_quads;
-    std::shared_ptr<const prosper::gpu::RasterQuadInputs> fragment_draw_inputs;
-    std::shared_ptr<const prosper::gpu::GraphicsOwnedWaveDraw> owned_waves;
-    bool raster_quad_contract_modified = false;
-    std::vector<uint32_t> vs, gs, fs;
-    // For a mesh draw, `vs` carries a MeshEXT module instead of a vertex module. The group counts
-    // are draw-time state, not pipeline identity. The backend refuses this path unless the optional
-    // device feature and command entry point were both acquired.
-    bool mesh_draw = false;
-    std::array<uint32_t, 3> mesh_groups{1, 1, 1};
-    prosper::gpu::SharedShaderWords vs_shared, fs_shared;
-    uint64_t vs_identity = 0, fs_identity = 0;
-    uint64_t fs_guest_addr = 0; // diagnostic provenance only; zero for direct/override callers
-    // Explicit guest-semantic lowering. Strict replay/direct callers never transform captured
-    // words. Live frontends opt into per-vote certificates, independent of the game being run.
-    prosper::gpu::FragmentWavePolicy fragment_wave_policy = prosper::gpu::FragmentWavePolicy::Strict;
-    // Legacy diagnostic/test-only contracts. The live renderer never sets either flag: a reason
-    // bit or an output-width proof alone is NOT authority for the new semantic transformation.
-    bool allow_native_fragment_vote_width = false;
-    bool allow_partial_wave_fragment = false;
-    // Stable semantic draw ID from DrawItem::draw_index. Diagnostics must not use this backend
-    // vector's pass-local offset: target/compute splitting can make that offset differ per pass.
-    uint64_t draw_index = UINT64_MAX;
-    uint64_t source_submit = 0; // live architectural submit, zero for replay/direct callers
-    // Global PM4 ordinal. Unlike draw_index this is comparable with interleaved compute operations
-    // and therefore identifies which retained attachment layer is newer than a compute image.
-    uint64_t command_order = 0;
-    const prosper::gpu::ResolvedPipelineState* ps = nullptr;   // null -> triangle-list, write RGBA, no depth
-    std::vector<FrameResource> R;                              // textures plus compatibility/test buffers
-    std::vector<FrameBufferResource> B;                        // compact production storage buffers
-    // Original frontend binding order. High bit selects B; the remaining bits index R or B. Empty
-    // means every resource is in R, preserving the replay/test construction contract.
-    std::vector<uint32_t> resource_order;
-    uint32_t vcount = 3;
-    uint32_t instance_count = 1;
-    int32_t vertex_offset = 0;
-    // Indexed draw: 32-bit index data (the executor widens guest 16-bit indices). The live frontend
-    // lends the DrawItem's already-owned words for this synchronous backend call; replay and direct
-    // tests keep using the owned vector. The backend copies either form into its host-visible Vulkan
-    // upload before returning, so the borrowed span never crosses submission or GPU completion.
-    // Consumers must use index_words(): a borrowed value wins over `indices`, matching the shader
-    // accessors above and making a deliberately conflicting owned value a useful regression control.
-    std::vector<uint32_t> indices;
-    std::span<const uint32_t> borrowed_indices{};
-    bool has_borrowed_indices = false;
-
-    // Same precedence — and same trap — as DrawItem (#1434): a shared value WINS, so assigning
-    // `vs`/`fs` on a draw that already carries one silently keeps the ORIGINAL shader. Substitute
-    // through set_vs()/set_fs(), which also clear the cache identity so the persistent pipeline
-    // cache compares the new words instead of hitting the stale entry. `gs` has no shared form; if
-    // one is ever added it needs the same accessor/setter pair.
-    const std::vector<uint32_t>& vs_words() const { return vs_shared ? *vs_shared : vs; }
-    const std::vector<uint32_t>& gs_words() const { return gs; }
-    const std::vector<uint32_t>& fs_words() const { return fs_shared ? *fs_shared : fs; }
-    std::span<const uint32_t> index_words() const {
-        return has_borrowed_indices ? borrowed_indices : std::span<const uint32_t>(indices);
-    }
-    size_t index_count() const { return index_words().size(); }
-    void borrow_indices(const std::vector<uint32_t>& words) {
-        borrowed_indices = words;
-        has_borrowed_indices = true;
-    }
-    void borrow_indices(std::vector<uint32_t>&&) = delete;
-
-    void set_vs(std::vector<uint32_t> words) {
-        vs = std::move(words); vs_shared.reset(); vs_identity = 0;
-    }
-    void set_fs(std::vector<uint32_t> words) {
-        fs = std::move(words); fs_shared.reset(); fs_identity = 0;
-    }
-};
+#include "fixtures/backend_draw.h"
 
 struct BackendTextureUploadStats {
     size_t references = 0;
@@ -8429,6 +8356,7 @@ inline uint64_t backend_pass_source_submit(std::span<const BackendDraw> draws) {
 // completion machinery, not a second standalone Vulkan harness.
 #include "fixtures/raster_quad_collection_gpu.h"
 #include "fixtures/fragment_draw_storage_gpu.h"
+#include "fixtures/fragment_draw_observation_gpu.h"
 #include "fixtures/fragment_draw_compute_gpu.h"
 #include "fixtures/fragment_draw_collect_gpu.h"
 #include "fixtures/fragment_draw_backend_transaction.h"
@@ -13567,6 +13495,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         readback_requested || storage_writeback_requested;
     const bool flush_now = !submission_batch || synchronous_results_requested ||
                            flush_submission_batch;
+    if (fragment_draw_batch && flush_now)
+        fragment_draw_batch->prepare_completed_observations(std::span<const DV>(dv));
     // Attributed in the same order the condition above evaluates, so exactly one bucket is charged
     // per flush and their sum is the flush count -- the arithmetic a reader will check first.
     uint64_t flush_reason_no_batch = 0, flush_reason_readback = 0;
@@ -14529,6 +14459,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     vkCmdEndRenderPass(cmd);
+    if (fragment_draw_batch && flush_now)
+        fragment_draw_batch->record_observations_after_replay(cmd, std::span<const DV>(dv));
     // #2944: the geometry probe maps both transform-feedback buffers below. Transform feedback does
     // not write through the transfer stage, so this pair carries its own source scope -- the vertex
     // records and the counter the extension writes at vkCmdEndTransformFeedbackEXT. Recorded here
@@ -15282,6 +15214,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const auto timing_gpu_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const bool batch_completed = !flush_now ||
         (batch_result.submit_result == VK_SUCCESS && batch_result.wait_result == VK_SUCCESS);
+    if (fragment_draw_batch && flush_now && batch_completed)
+        fragment_draw_batch->report_completed_observations();
 
     // Fragment-funnel readback (PROSPER_DRAW_STATS): one line per realized draw showing where its
     // pixels vanished. ds_active implies flush_now (the pool-creation gate above uses the same flush

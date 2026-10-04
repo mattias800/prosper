@@ -1,4 +1,5 @@
 #include "gpu/recompiler/raster_quad_collector.hpp"
+#include "gpu/recompiler/original_fragment_producer.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <algorithm>
 #include <array>
@@ -13,7 +14,10 @@ std::vector<uint32_t> build_raster_quad_collector(const RasterQuadInputs& inputs
         uint32_t max_quads, RasterQuadCollector& out) {
     out = {};
     auto reject = [&](const char* reason) -> std::vector<uint32_t> { out.rejection = reason; return {}; };
-    if (!inputs.source_fs || (inputs.source_fs->empty() && !inputs.owned_wave_pending) ||
+    const bool original_bank_source =
+        inputs.original_fragment_producer && inputs.original_fragment_producer->matches(inputs);
+    if (!inputs.source_fs ||
+        (inputs.source_fs->empty() && !inputs.owned_wave_pending && !original_bank_source) ||
         !inputs.raw_code || inputs.raw_code->empty())
         return reject("quad-collector-producing-source-unavailable");
     if (inputs.owned_wave_pending) {

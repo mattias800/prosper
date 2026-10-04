@@ -11,6 +11,10 @@ FragmentResourcePacketProgram recompile_fragment_resource_packet(const FragmentR
     result.float_mode = input.invocation.float_mode;
     result.float_flags = input.invocation.float_flags;
     PacketResourceServices services{input, result};
+    if (!input.scalar_bank_sites.empty()) {
+        result.packet.rejection = "packet-scalar-bank-requires-distinct-capacity-abi";
+        return result; // unchanged standalone/WAT1 layout cannot carry the shared SBR2 plane
+    }
     result.packet = recompile_fragment_packet_impl(input.invocation, diagnostic, &services);
     if (result.packet.spirv.empty()) { result.images.clear(); result.status_offset = 0; }
     else {
@@ -63,7 +67,9 @@ FragmentResourcePacketResult decode_fragment_resource_packet(const FragmentResou
         const auto pc = words[offset + 1], reason = words[offset + 2];
         if (words[offset] != kFragmentResourceStatusMagic ||
             reason >
-                static_cast<uint32_t>(FragmentPacketRuntimeFailure::SpecialNanOrNegativeRoot) ||
+                static_cast<uint32_t>(program.scalar_bank_sites.empty()
+                                          ? FragmentPacketRuntimeFailure::SpecialNanOrNegativeRoot
+                                          : FragmentPacketRuntimeFailure::ScalarBankInvalid) ||
             ((reason == 0) != (pc == UINT32_MAX)) ||
             (reason &&
              std::find(program.runtime_failure_pcs.begin(), program.runtime_failure_pcs.end(),
@@ -102,6 +108,8 @@ FragmentResourcePacketResult decode_fragment_resource_packet(const FragmentResou
                 return reject("packet-runtime-special-f32-nan-or-negative-root-unimplemented");
             case FragmentPacketRuntimeFailure::UndefinedVgpr:
                 return reject("packet-runtime-vgpr-read-before-definition");
+            case FragmentPacketRuntimeFailure::ScalarBankInvalid:
+                return reject("packet-runtime-scalar-bank-site-or-extent-invalid");
             default: return reject("packet-status-record-invalid");
         }
     }

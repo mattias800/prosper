@@ -1,6 +1,7 @@
 #pragma once
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/state/fragment_entry_facts.hpp"
+#include "gpu/recompiler/fragment_packet_scalar_reads.hpp"
 #include <span>
 
 namespace prosper::gpu {
@@ -50,6 +51,9 @@ struct FragmentResourcePacket {
     FragmentEntryFacts entry_facts;
     FragmentPacketParameterCache parameter_cache;
     std::vector<FragmentPacketBufferRead> buffers;
+    // Original-code-only schema for the distinct shared SBR2 binding. No per-draw descriptor,
+    // declared extent, guest address or payload is a compiler input or specialization value.
+    std::vector<FragmentPacketScalarReadSite> scalar_bank_sites;
     std::vector<FragmentPacketImageRead> images;
     FragmentPacketDeviceContract device;
 };
@@ -65,6 +69,7 @@ enum class FragmentPacketRuntimeFailure : uint32_t {
     SampleLodDomain = 7,
     SpecialNanOrNegativeRoot = 8,
     UndefinedVgpr = 9,
+    ScalarBankInvalid = 10,
 };
 // New resource variants append [magic, first-failing-PC, reason] for EACH logical worker after
 // the old raw EXP records. No worker exits early. Sticky failure is not a substituted guest value.
@@ -80,6 +85,7 @@ struct FragmentResourcePacketProgram {
     FragmentFloatMode float_mode{};
     FragmentFloatFlags float_flags{};
     std::vector<uint32_t> runtime_failure_pcs; // exact original service PCs, never caller guesses
+    std::vector<FragmentPacketScalarReadSite> scalar_bank_sites;
 };
 struct FragmentResourcePacketResult {
     std::vector<uint32_t> exports;   // EMPTY on ANY malformed/failing worker or readback failure

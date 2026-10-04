@@ -42,6 +42,7 @@
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"     // recompile_compute
 #include "gpu/recompiler/fragment_packet_vgpr_requirements.hpp"
+#include "gpu/execute/original_graphics_stage_effects.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "host/memory/guest_memory_map.hpp"
 #include "host/memory/guest_memory_query.hpp"
@@ -544,9 +545,15 @@ inline bool fold_control_cache_enabled() {
 }
 
 struct DecodedShader {
+    // Full ORIGINAL stream classification, derived cold before fold compaction.
+    std::vector<uint32_t> raw_wave_wide_data_load_pcs;
     FoldControlPlan control_plan;
     FoldControlPlan shader_constant_control_plan;
     std::vector<uint32_t> code;
+    // Canonical original-packet facts belong to this SAME immutable byte version. They are
+    // derived cold from the full stream, never from compact/normalized native instructions.
+    FragmentPacketVgprRequirements packet_requirements;
+    std::array<OriginalGraphicsStageEffects, 2> original_effects;
     std::vector<Rdna2Inst> instructions;
     std::vector<Rdna2Inst> shader_constant_instructions;
     // Code-byte-only proof, computed on the full decoded stream before fold compaction.
@@ -573,6 +580,9 @@ struct DecodedShaderEntry {
     uint64_t last_use = 0;
 };
 
+// Internal cold decoder entry only; cache storage stays private in its companion.
+std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, size_t dwords);
+
 struct ShaderCodeAnalysis {
     std::vector<uint32_t> code;
     RefusedShaderMemo refused_shader_memo;
@@ -590,6 +600,10 @@ struct ShaderCodeAnalysisEntry {
     std::shared_ptr<const ShaderCodeAnalysis> analysis;
     uint64_t last_use = 0;
 };
+
+// Cold derivation from an already owned immutable source. This never inserts an owned-copy
+// address into the guest-address analysis cache or retains its decoder control block.
+SharedShaderAnalysis derive_owned_shader_analysis(const std::vector<uint32_t>& words);
 
 struct PcrelDispatchSelection {
     PcrelDispatchInfo dispatch;
