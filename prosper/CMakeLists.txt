@@ -2859,6 +2859,11 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_literal_capture.cpp src/gpu/recompiler/rdna2_decode.cpp
     INCLUDES src)
 
+  # Memory-writer classification is a decoder-only predicate checked against the ISA tables.
+  prosper_add_gtest(test_may_write_memory
+    SOURCES tests/gpu/recompiler/test_may_write_memory.cpp src/gpu/recompiler/rdna2_decode.cpp
+    INCLUDES src)
+
   # Structural RDNA2->SPIR-V validation that does not require Vulkan runtime support.
   add_executable(test_rdna2_spirv_struct tests/gpu/test_rdna2_spirv_struct.cpp)
   target_link_libraries(test_rdna2_spirv_struct PRIVATE prosper_core)

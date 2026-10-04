@@ -169,17 +169,3 @@ TEST(SplitT8Dataflow, MimgWritersAreFailClosed) {
         EXPECT_TRUE(has_use(image_op_before_use(op), 10u))
             << "control: image opcode 0x" << std::hex << op << " only reads";
 }
-
-TEST(SplitT8Dataflow, MemoryWritePredicateForMimg) {
-    Rdna2Inst in;
-    in.fmt = Rdna2Format::MIMG;
-    for (uint32_t op = 0; op < 0x100u; ++op) {
-        in.opcode = op;
-        const bool reader = op <= 0x05u || op == 0x0Eu || op == 0x80u || op == 0xE6u ||
-                            op == 0xE7u ||
-                            (op >= 0x20u && op <= 0x6Fu && op != 0x42u && op != 0x43u &&
-                             op != 0x4Au && op != 0x4Bu && op != 0x52u && op != 0x53u &&
-                             op != 0x5Au && op != 0x5Bu && (op < 0x62u || op > 0x67u));
-        EXPECT_EQ(rdna2_instruction_may_write_memory(in), !reader) << "opcode 0x" << std::hex << op;
-    }
-}
