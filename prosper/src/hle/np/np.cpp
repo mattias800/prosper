@@ -220,6 +220,80 @@ HLE(s_nptrophy2_createhandle) { svc_log("sceNpTrophy2CreateHandle", a0,a1,a2,a3,
 HLE(s_nptrophy2_regctx)       { svc_log("sceNpTrophy2RegisterContext", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_nptrophy2_ok)           { return 0; }
 
+// --- libSceNpTrophy (v1) — the PS4-era trophy API on the same honest console. ------------------
+// A title still on the v1 API asks the question NpTrophy2 already answers: no signed-in user, so
+// no trophy content. The lifecycle constructors hand back valid local ids so the bring-up
+// completes; every content/unlock/list query fails so a caller cannot consume unwritten out-
+// structs as trophy data (the #213 class). The v1 facility constant is ORBIS_NP_TROPHY_ERROR_
+// USER_NOT_LOGGED_IN (0x8055161D), verified against shadPS4 np_error.h — a PS4-inherited
+// facility whose export names and NIDs are identical on the PS5 3.20 stub table. CONFIDENCE: HIGH
+// that failure beats success+garbage-out; MED on the exact PS5 value (PS4 value, same 0x8055 Np
+// facility and API).
+static constexpr uint64_t NP_TROPHY_V1_USER_NOT_LOGGED_IN = 0x8055161Dull;
+HLE(s_nptrophy_v1_createctx) {
+    svc_log("sceNpTrophyCreateContext", a0, a1, a2, a3, a4, a5);
+    if (a0) *(int32_t*)PW(a0) = 1;
+    return 0;
+}
+HLE(s_nptrophy_v1_createhandle) {
+    svc_log("sceNpTrophyCreateHandle", a0, a1, a2, a3, a4, a5);
+    if (a0) *(int32_t*)PW(a0) = 1;
+    return 0;
+}
+HLE(s_nptrophy_v1_unavailable) {
+    return NP_TROPHY_V1_USER_NOT_LOGGED_IN;
+}
+
+// --- libSceNpTus / libSceNpScore — PSN data transport on a signed-out console. ----------------
+// TUS moves save data between devices; Score moves score-board data. Neither reaches the PSN
+// data path with no signed-in user, so every data operation answers the NP-core SIGNED_OUT that
+// NpManager gives for the same question — a title must not hear "signed out" from one library
+// and "data served" from another. The context/request constructors stay valid (small local ids,
+// no identity fabricated, the NpWebApi2/NpTrophy2 contract). The TUS/Score per-facility error
+// spaces are not in the 3.20 dump, so the verified NP-core value is used rather than an
+// invented facility value; out-params of the refused calls are left untouched. CONFIDENCE: HIGH
+// on the sign and the untouched out-params; MED on the exact constant.
+HLE(s_np_ctx) {
+    svc_log("np ctx/request create", a0, a1, a2, a3, a4, a5);
+    if (a0) *(int32_t*)PW(a0) = 1;
+    return 0;
+}
+HLE(s_np_offline) {
+    return NP_ERR_SIGNED_OUT;
+}
+
+// --- libSceNpCommerce — the PS Store dialog, headless lifecycle like the sign-in prompt (#3784).
+// Initialize -> INITIALIZED; Open auto-dismisses to FINISHED (no interactive UI headless, so the
+// game's "wait until dismissed" loop still exits); Close -> FINISHED; Terminate -> NONE;
+// GetStatus/UpdateStatus report the state. GetResult fails SIGNED_OUT: no signed-in user can
+// complete a store transaction, and success with an unwritten out-struct would be the #306
+// wedge. Status values follow the shared dialog convention (NONE=0, INITIALIZED=1, RUNNING=2,
+// FINISHED=3, see the sign-in dialog above). CONFIDENCE: MED.
+namespace {
+std::atomic<int32_t> g_commerce_dialog_status{0 /*NONE*/};
+}
+HLE(s_commerce_init) {
+    svc_log("sceNpCommerceDialogInitialize", a0, a1, a2, a3, a4, a5);
+    g_commerce_dialog_status.store(1 /*INITIALIZED*/);
+    return 0;
+}
+HLE(s_commerce_open) {
+    svc_log("sceNpCommerceDialogOpen", a0, a1, a2, a3, a4, a5);
+    g_commerce_dialog_status.store(3 /*FINISHED*/);
+    return 0;
+}
+HLE(s_commerce_status) {
+    return (uint64_t)(unsigned)g_commerce_dialog_status.load();
+}
+HLE(s_commerce_close) {
+    g_commerce_dialog_status.store(3 /*FINISHED*/);
+    return 0;
+}
+HLE(s_commerce_term) {
+    g_commerce_dialog_status.store(0 /*NONE*/);
+    return 0;
+}
+
 // --- libSceShare / libSceGameLiveStreaming: local lifecycle, features unavailable headless. -----
 // The PS5 3.20 import table supplies the exact NIDs. Kyty's matching SDK surface gives the call
 // shapes: ShareSetContentParam takes one required C string; GameLiveStreamingInitialize takes only
@@ -662,6 +736,221 @@ void register_np_hle() {
     Hle::register_fn("sysY2FHYff4", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2DestroyContext");
     Hle::register_fn("d8P11CI40KE", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2DestroyHandle");
     Hle::register_fn("fYapWA9xVmA", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2AbortHandle");
+    // libSceNpTrophy (v1) — PS4-era trophy API: valid lifecycle ids, no content (see block above).
+    // NIDs from the PS5 3.20 libSceNpTrophy stub table.
+    Hle::register_fn("HbkjbobZlCY", (HleFn)s_nptrophy_v1_createctx, "sceNpTrophyCreateContext");
+    Hle::register_fn("K7U6tEAQf7c", (HleFn)s_nptrophy_v1_createhandle, "sceNpTrophyCreateHandle");
+    Hle::register_fn("OdPIOFpEAvU", (HleFn)s_nptrophy_v1_createhandle,
+                     "sceNpTrophyIntCreateHandle");
+    Hle::register_fn("DJCAxto9SEU", (HleFn)s_nptrophy2_regctx, "sceNpTrophyRegisterContext");
+    Hle::register_fn("KTnHs7W-9Uk", (HleFn)s_nptrophy2_ok, "sceNpTrophyAbortHandle");
+    Hle::register_fn("O9plkqa2e0k", (HleFn)s_nptrophy2_ok, "sceNpTrophyIntAbortHandle");
+    Hle::register_fn("NV18n8OcheI", (HleFn)s_nptrophy2_ok, "sceNpTrophySystemRemoveAll");
+    Hle::register_fn("FiPpytPUPMA", (HleFn)s_nptrophy2_ok,
+                     "sceNpTrophySystemUnregisterTitleSyncedCallback");
+    Hle::register_fn("BBkBINKo6gw", (HleFn)s_nptrophy2_ok,
+                     "sceNpTrophySystemUnregisterTitleUpdateCallback");
+    Hle::register_fn("Hit5yM0Teo0", (HleFn)s_nptrophy2_ok, "sceNpTrophySystemWrapDebugLockTrophy");
+    Hle::register_fn("I5R5Ogfbk68", (HleFn)s_nptrophy2_ok,
+                     "sceNpTrophySystemWrapDebugUnlockTrophy");
+    Hle::register_fn("MNbxxwNdlHY", (HleFn)s_nptrophy2_ok, "sceNpTrophySystemWrapRemoveUserData");
+    Hle::register_fn("IYP3f2W09og", (HleFn)s_nptrophy_v1_unavailable, "sceNpTrophyGetGameInfo");
+    Hle::register_fn("ATUwGfspKic", (HleFn)s_nptrophy_v1_unavailable, "sceNpTrophyGetGroupInfo");
+    Hle::register_fn("KqUVGDgQBm0", (HleFn)s_nptrophy_v1_unavailable, "sceNpTrophyGetTrophyInfo");
+    Hle::register_fn("A4uMPmErD4I", (HleFn)s_nptrophy_v1_unavailable, "sceNpTrophyGetGroupIcon");
+    Hle::register_fn("OBL+l6HG9xk", (HleFn)s_nptrophy_v1_unavailable, "sceNpTrophyGetTrophyIcon");
+    Hle::register_fn("BvdThnVvwdY", (HleFn)s_nptrophy_v1_unavailable, "sceNpTrophyNumInfoGetTotal");
+    Hle::register_fn("G8xmRUFao68", (HleFn)s_nptrophy_v1_unavailable, "sceNpTrophyUnlockTrophy");
+    Hle::register_fn("N9jpdPz5f-8", (HleFn)s_nptrophy_v1_unavailable, "sceNpTrophyShowTrophyList");
+    Hle::register_fn("N3CQzag7-zs", (HleFn)s_nptrophy_v1_unavailable, "sceNpTrophyIntGetProgress");
+    Hle::register_fn("EF9zjnlAzIA", (HleFn)s_nptrophy_v1_unavailable, "sceNpTrophyIntNetSyncTitle");
+    Hle::register_fn("EXiyfabxFNQ", (HleFn)s_nptrophy_v1_unavailable,
+                     "sceNpTrophyIntNetSyncTitles");
+    Hle::register_fn("MaLlLHKP+No", (HleFn)s_nptrophy_v1_unavailable, "sceNpTrophySystemDbgCtl");
+    Hle::register_fn("GrV7Y4IhWkc", (HleFn)s_nptrophy_v1_unavailable,
+                     "sceNpTrophySystemWrapGetGroupDetails");
+    Hle::register_fn("AJD0VSnMfW0", (HleFn)s_nptrophy_v1_unavailable,
+                     "sceNpTrophySystemWrapGetPlayedTrophyTitles");
+    Hle::register_fn("CSh2GsVQTzs", (HleFn)s_nptrophy_v1_unavailable,
+                     "sceNpTrophySystemWrapGetTitleDetails");
+    Hle::register_fn("PtaF5aJl7k0", (HleFn)s_nptrophy_v1_unavailable,
+                     "sceNpTrophySystemWrapGetTrophyDetailsArray");
+    Hle::register_fn("BMmIU5R9IHY", (HleFn)s_nptrophy_v1_unavailable,
+                     "sceNpTrophySystemWrapGetTrophyTitleIdsByNpTitleId");
+    // libSceNpTus / libSceNpScore — valid local ids, no PSN data (SIGNED_OUT; see block above).
+    Hle::register_fn("Bhy8+oecGac", (HleFn)s_np_ctx, "sceNpTusCreateTitleCtx");
+    Hle::register_fn("Fn-dGukBgnY", (HleFn)s_np_ctx, "sceNpTusCreateNpTitleCtxA");
+    Hle::register_fn("MRVb2Cf0GHg", (HleFn)s_np_ctx, "sceNpTssCreateNpTitleCtx");
+    Hle::register_fn("FBtrk+7lk14", (HleFn)s_np_ctx, "sceNpTssCreateNpTitleCtxA");
+    Hle::register_fn("Hbh2aBvvmvM", (HleFn)s_np_ctx, "sceNpTusCreateRequest");
+    Hle::register_fn("KW9M0bQ-Zx0", (HleFn)s_np_ctx, "sceNpScoreCreateTitleCtx");
+    Hle::register_fn("AW8qyjYrUbk", (HleFn)s_np_ctx, "sceNpScoreCreateRequest");
+    Hle::register_fn("Geq1bMwgZYo", (HleFn)s_np_ok, "sceNpTusAbortRequest");
+    Hle::register_fn("KGKDdRCFx8c", (HleFn)s_np_ok, "sceNpTusSetThreadParam");
+    Hle::register_fn("Fi7kmKbX6hk", (HleFn)s_np_ok, "sceNpScoreAbortRequest");
+    Hle::register_fn("NK8-SgYf6r4", (HleFn)s_np_ok, "sceNpScoreDeleteRequest");
+    Hle::register_fn("CxK68584JAU", (HleFn)s_np_ok, "sceNpScoreSetThreadParam");
+    Hle::register_fn("C3xZj35v8Z8", (HleFn)s_np_ok, "sceNpScoreSetTimeout");
+    // The data path: TUS multi-slot/friends/multi-user variables and cross-save, TUS+TSS
+    // get/set/try/delete, Score record/get/ranking/censor, and the async completion calls that
+    // would deliver PSN data.
+    Hle::register_fn("MrVmNrJDbG8", (HleFn)s_np_offline, "sceNpTusAddAndGetVariable");
+    Hle::register_fn("APFah4-5Xec", (HleFn)s_np_offline, "sceNpTusAddAndGetVariableA");
+    Hle::register_fn("GdB427dT3Iw", (HleFn)s_np_offline, "sceNpTusAddAndGetVariableAAsync");
+    Hle::register_fn("A2UmHdK04c8", (HleFn)s_np_offline, "sceNpTusAddAndGetVariableAsync");
+    Hle::register_fn("Okr6FBSrkJw", (HleFn)s_np_offline, "sceNpTusAddAndGetVariableVUser");
+    Hle::register_fn("EDT5bP6YzBo", (HleFn)s_np_offline, "sceNpTusDeleteMultiSlotData");
+    Hle::register_fn("CXzUOM9sXU0", (HleFn)s_np_offline, "sceNpTusDeleteMultiSlotDataA");
+    Hle::register_fn("K-+Yqc-NppQ", (HleFn)s_np_offline, "sceNpTusDeleteMultiSlotDataAAsync");
+    Hle::register_fn("ButwCvsydkk", (HleFn)s_np_offline, "sceNpTusDeleteMultiSlotDataVUser");
+    Hle::register_fn("GYhbiRtkE1Y", (HleFn)s_np_offline, "sceNpTusDeleteMultiSlotVariable");
+    Hle::register_fn("JwnE9Oa1uF8", (HleFn)s_np_offline, "sceNpTusDeleteMultiSlotVariableA");
+    Hle::register_fn("HOzszO4ONWU", (HleFn)s_np_offline, "sceNpTusGetData");
+    Hle::register_fn("CWEHUFkY1qI", (HleFn)s_np_offline, "sceNpTusGetDataA");
+    Hle::register_fn("BzG8mG9YlKY", (HleFn)s_np_offline, "sceNpTusGetDataAAsync");
+    Hle::register_fn("CaH+Sxlw32k", (HleFn)s_np_offline, "sceNpTusGetDataAVUser");
+    Hle::register_fn("OoFvgzwawAY", (HleFn)s_np_offline, "sceNpTusGetDataAVUserAsync");
+    Hle::register_fn("OHtKS5V1T5k", (HleFn)s_np_offline, "sceNpTusGetDataAsync");
+    Hle::register_fn("FTE3OvH61qo", (HleFn)s_np_offline, "sceNpTusGetDataForCrossSave");
+    Hle::register_fn("PLxFGYCJwww", (HleFn)s_np_offline, "sceNpTusGetDataForCrossSaveVUser");
+    Hle::register_fn("JR6kI-8f+Hk", (HleFn)s_np_offline, "sceNpTusGetDataVUserAsync");
+    Hle::register_fn("Cixh7HDKWfk", (HleFn)s_np_offline, "sceNpTusGetFriendsDataStatusA");
+    Hle::register_fn("My+pAALkHp8", (HleFn)s_np_offline, "sceNpTusGetFriendsVariable");
+    Hle::register_fn("ArImtTqUSGM", (HleFn)s_np_offline, "sceNpTusGetFriendsVariableAAsync");
+    Hle::register_fn("IFYWOwYI6DY", (HleFn)s_np_offline, "sceNpTusGetFriendsVariableAsync");
+    Hle::register_fn("JgcNwFHoOL4", (HleFn)s_np_offline, "sceNpTusGetMultiSlotDataStatus");
+    Hle::register_fn("M33Y2TnyonE", (HleFn)s_np_offline, "sceNpTusGetMultiSlotDataStatusA");
+    Hle::register_fn("LcPB2rnhQqo", (HleFn)s_np_offline, "sceNpTusGetMultiSlotVariableAsync");
+    Hle::register_fn("OFxVYJEkcmc", (HleFn)s_np_offline, "sceNpTusGetMultiSlotVariableVUser");
+    Hle::register_fn("FxNDPDnWfMc", (HleFn)s_np_offline, "sceNpTusGetMultiUserDataStatusA");
+    Hle::register_fn("KG9+4eIb+cY", (HleFn)s_np_offline, "sceNpTusGetMultiUserVariable");
+    Hle::register_fn("IRje5yEXS0U", (HleFn)s_np_offline, "sceNpTusGetMultiUserVariableAsync");
+    Hle::register_fn("DB0vaHTzA6g", (HleFn)s_np_offline, "sceNpTusGetMultiUserVariableVUser");
+    Hle::register_fn("N7b6dmpQNiI", (HleFn)s_np_offline, "sceNpTusPollAsync");
+    Hle::register_fn("INrufkNCkiE", (HleFn)s_np_offline, "sceNpTusSetData");
+    Hle::register_fn("FzxN3tOouj8", (HleFn)s_np_offline, "sceNpTusSetDataA");
+    Hle::register_fn("Iu58d6g6uwU", (HleFn)s_np_offline, "sceNpTusSetDataAAsync");
+    Hle::register_fn("EbWqOt3QjKU", (HleFn)s_np_offline, "sceNpTusSetDataAVUser");
+    Hle::register_fn("ORhzSuuXwxo", (HleFn)s_np_offline, "sceNpTusSetDataVUser");
+    Hle::register_fn("M6aYoa47YgI", (HleFn)s_np_offline, "sceNpTusSetMultiSlotVariable");
+    Hle::register_fn("Mf-WMA0jYCc", (HleFn)s_np_offline, "sceNpTusSetMultiSlotVariableA");
+    Hle::register_fn("JJ9GGMludxY", (HleFn)s_np_offline, "sceNpTusSetMultiSlotVariableAsync");
+    Hle::register_fn("FCz0hTJFyh4", (HleFn)s_np_offline, "sceNpTusSetMultiSlotVariableVUser");
+    Hle::register_fn("OkC55HsotJ4", (HleFn)s_np_offline, "sceNpTusTryAndSetVariable");
+    Hle::register_fn("Eup4MP1wNtc", (HleFn)s_np_offline, "sceNpTusTryAndSetVariableA");
+    Hle::register_fn("LGTjTkHPHTE", (HleFn)s_np_offline, "sceNpTusTryAndSetVariableAAsync");
+    Hle::register_fn("IGIcxlUabSA", (HleFn)s_np_offline, "sceNpTusTryAndSetVariableAVUser");
+    Hle::register_fn("BQfR51i4kck", (HleFn)s_np_offline, "sceNpTusTryAndSetVariableAsync");
+    Hle::register_fn("JbitD262GhY", (HleFn)s_np_offline, "sceNpTusTryAndSetVariableVUser");
+    Hle::register_fn("BYPJFWzFPjA", (HleFn)s_np_offline, "sceNpTusWaitAsync");
+    Hle::register_fn("PSUR+UoLS6c", (HleFn)s_np_offline, "sceNpTssGetData");
+    Hle::register_fn("FL+Z3zCKNTs", (HleFn)s_np_offline, "sceNpTssGetSmallStorage");
+    Hle::register_fn("P2Pe4LGS2II", (HleFn)s_np_offline, "sceNpTssGetSmallStorageAsync");
+    Hle::register_fn("E5NZIzggbuk", (HleFn)s_np_offline, "sceNpTssGetStorageAsync");
+    Hle::register_fn("Gb3TI0mDYiI", (HleFn)s_np_offline, "sceNpScoreCensorComment");
+    Hle::register_fn("IeOvDyN-aZc", (HleFn)s_np_offline, "sceNpScoreCensorCommentAsync");
+    Hle::register_fn("A0Avi9kebsY", (HleFn)s_np_offline, "sceNpScoreGetBoardInfoAsync");
+    Hle::register_fn("MkuIzUw6utQ", (HleFn)s_np_offline, "sceNpScoreGetFriendsRanking");
+    Hle::register_fn("AMbOn+-6eXA", (HleFn)s_np_offline, "sceNpScoreGetFriendsRankingA");
+    Hle::register_fn("DkoVok6FFEI", (HleFn)s_np_offline, "sceNpScoreGetGameData");
+    Hle::register_fn("NmZEgoiEq6Y", (HleFn)s_np_offline, "sceNpScoreGetRankingByNpId");
+    Hle::register_fn("G1DfNRstkSQ", (HleFn)s_np_offline, "sceNpScorePollAsync");
+    Hle::register_fn("LcoVwcBjQ9E", (HleFn)s_np_offline, "sceNpScoreRecordGameData");
+    Hle::register_fn("FgL5PwYzrrw", (HleFn)s_np_offline, "sceNpScoreRecordGameDataAsync");
+    Hle::register_fn("DT0XBtgtOSI", (HleFn)s_np_offline, "sceNpScoreRecordScore");
+    Hle::register_fn("L4oAo9in0TA", (HleFn)s_np_offline, "sceNpScoreSanitizeComment");
+    Hle::register_fn("Pqk8SC63p1U", (HleFn)s_np_offline, "sceNpScoreWaitAsync");
+    // libSceNpCommerce — headless PS Store dialog + local icon controls (see block above).
+    Hle::register_fn("0aR2aWmQal4", (HleFn)s_commerce_init, "sceNpCommerceDialogInitialize");
+    Hle::register_fn("DfSCDRA3EjY", (HleFn)s_commerce_open, "sceNpCommerceDialogOpen");
+    Hle::register_fn("IXmfUaze9So", (HleFn)s_commerce_open, "sceNpCommerceDialogOpen2");
+    Hle::register_fn("CCbC+lqqvF0", (HleFn)s_commerce_status, "sceNpCommerceDialogGetStatus");
+    Hle::register_fn("LR5cwFMMCVE", (HleFn)s_commerce_status, "sceNpCommerceDialogUpdateStatus");
+    Hle::register_fn("r42bWcQbtZY", (HleFn)s_np_offline, "sceNpCommerceDialogGetResult");
+    Hle::register_fn("NU3ckGHMFXo", (HleFn)s_commerce_close, "sceNpCommerceDialogClose");
+    Hle::register_fn("m-I92Ab50W8", (HleFn)s_commerce_term, "sceNpCommerceDialogTerminate");
+    Hle::register_fn("DHmwsa6S8Tc", (HleFn)s_np_ok, "sceNpCommerceShowPsStoreIcon");
+    Hle::register_fn("dsqCVsNM0Zg", (HleFn)s_np_ok, "sceNpCommerceHidePsStoreIcon");
+    Hle::register_fn("uKTDW8hk-ts", (HleFn)s_np_ok, "sceNpCommerceSetPsStoreIconLayout");
+    // libSceNpAuth — OAuth request lifecycle: valid local request ids, no authorization codes
+    // (SIGNED_OUT; the PS4 facility in shadPS4 np_auth.cpp answers the getters exactly this way
+    // when no user is signed in). NIDs from the PS5 3.20 libSceNpAuth stub table.
+    Hle::register_fn("6bwFkosYRQg", (HleFn)s_np_ctx, "sceNpAuthCreateRequest");
+    Hle::register_fn("N+mr7GjTvr8", (HleFn)s_np_ctx, "sceNpAuthCreateAsyncRequest");
+    Hle::register_fn("cE7wIsqXdZ8", (HleFn)s_np_ok, "sceNpAuthAbortRequest");
+    Hle::register_fn("H8wG9Bk-nPc", (HleFn)s_np_ok, "sceNpAuthDeleteRequest");
+    Hle::register_fn("PM3IZCw-7m0", (HleFn)s_np_ok, "sceNpAuthSetTimeout");
+    Hle::register_fn("gjSyfzSsDcE", (HleFn)s_np_offline, "sceNpAuthPollAsync");
+    Hle::register_fn("SK-S7daqJSE", (HleFn)s_np_offline, "sceNpAuthWaitAsync");
+    Hle::register_fn("KAUXQ9GdWp8", (HleFn)s_np_offline, "sceNpAuthGetAuthorizationCodeA");
+    Hle::register_fn("KI4dHLlTNl0", (HleFn)s_np_offline, "sceNpAuthGetAuthorizationCodeV3");
+    Hle::register_fn("IDX0S5EsEh4", (HleFn)s_np_offline, "sceNpAuthGetAuthorizedAppCode");
+    Hle::register_fn("OaB-LoJqHis", (HleFn)s_np_offline, "sceNpAuthGetIdToken");
+    Hle::register_fn("RdsFVsgSpZY", (HleFn)s_np_offline, "sceNpAuthGetIdTokenV3");
+    // libSceNpUtility — init succeeds; the PSN-backed lookup/bandwidth/word-filter paths are
+    // SIGNED_OUT; the lookup request/title-ctx constructors keep their local ids.
+    Hle::register_fn("G6iWw8aUQtA", (HleFn)s_np_ok, "sceNpUtilityInit");
+    Hle::register_fn("F6Dl+2zlua0", (HleFn)s_np_ok, "sceNpAppInfoIntInitialize");
+    Hle::register_fn("M9+zoKE8cBA", (HleFn)s_np_ok, "sceNpAppInfoIntFinalize");
+    Hle::register_fn("pLr1fEQS1z8", (HleFn)s_np_ok, "sceNpBandwidthTestShutdown");
+    Hle::register_fn("kvdMF48mB3Y", (HleFn)s_np_ok, "sceNpBandwidthTestAbort");
+    Hle::register_fn("hqzi1IHdQQQ", (HleFn)s_np_offline, "sceNpBandwidthTestInitStartDownload");
+    Hle::register_fn("mA0zsbqm+kA", (HleFn)s_np_offline, "sceNpBandwidthTestInitStartUpload");
+    Hle::register_fn("BYIZGKm6bO4", (HleFn)s_np_offline, "sceNpBandwidthTestGetStatus");
+    Hle::register_fn("DVZE+fAhgFY", (HleFn)s_np_offline, "sceNpLookupNetInit");
+    Hle::register_fn("JXlTj9RRCFo", (HleFn)s_np_ok,
+                     "sceNpLookupNetIsInit");   // 0 = not initialized (honest: it is not)
+    Hle::register_fn("CQr9UxPHUFs", (HleFn)s_np_ctx, "sceNpLookupCreateRequest");
+    Hle::register_fn("M533Q+LU7EQ", (HleFn)s_np_ctx, "sceNpLookupCreateTitleCtx");
+    Hle::register_fn("ALaxchvEEnk", (HleFn)s_np_ok, "sceNpLookupDeleteRequest");
+    Hle::register_fn("GtqDK9zkoIE", (HleFn)s_np_ok, "sceNpLookupDeleteTitleCtx");
+    Hle::register_fn("OYz4v5Uek9U", (HleFn)s_np_ok, "sceNpLookupAbortRequest");
+    Hle::register_fn("EMV72WO7V34", (HleFn)s_np_ok, "sceNpLookupSetTimeout");
+    Hle::register_fn("GnEVmFiV6OI", (HleFn)s_np_offline, "sceNpLookupNetNpId");
+    Hle::register_fn("D6tnM1Uti4g", (HleFn)s_np_offline, "sceNpLookupNpId");
+    Hle::register_fn("F4EVrruHuy8", (HleFn)s_np_offline, "sceNpLookupPollAsync");
+    Hle::register_fn("IX9dAus6baE", (HleFn)s_np_offline, "sceNpLookupWaitAsync");
+    Hle::register_fn("Or5SShyG0dk", (HleFn)s_np_offline, "sceNpWordFilterPollAsync");
+    Hle::register_fn("M7ivWj5yKzg", (HleFn)s_np_offline, "sceNpWordFilterWaitAsync");
+    // libSceNpMatching2 — room/matching state is PSN-backed, so every state query and
+    // connection establishment is SIGNED_OUT; the pure local parameter setters succeed.
+    // CONFIDENCE: HIGH on the sign; the context out-width is unverified, so the constructor is
+    // refused rather than written (a wrong-width write would hand the guest a corrupt id).
+    Hle::register_fn("HHZpTF30wto", (HleFn)s_np_ok, "sceNpMatching2SetExtraInitParam");
+    Hle::register_fn("AupHEf8WOhM", (HleFn)s_np_ok, "sceNpMatching2SignalingSetPort");
+    Hle::register_fn("ODxEHb9f7B8", (HleFn)s_np_ok, "sceNpMatching2SignalingAbortConnection");
+    Hle::register_fn("Kxlf9+pa0GY", (HleFn)s_np_offline, "sceNpMatching2CreateContextInternal");
+    Hle::register_fn("Hddl5xnQQEY", (HleFn)s_np_offline,
+                     "sceNpMatching2GetRoomJoinedSlotMaskLocal");
+    Hle::register_fn("FagjVl+bHFI", (HleFn)s_np_offline,
+                     "sceNpMatching2GetWorldIdArrayForAllServers");
+    Hle::register_fn("DMxxNNLh6ms", (HleFn)s_np_offline, "sceNpMatching2SetRoomDataInternalExt");
+    Hle::register_fn("EcYuZkNhHI8", (HleFn)s_np_offline,
+                     "sceNpMatching2SignalingEstablishConnection");
+    Hle::register_fn("GkvclTMjNdI", (HleFn)s_np_offline, "sceNpMatching2SignalingGetPort");
+    // libSceNpSns — third-party link (Facebook/Twitch/YouTube) status and tokens are PSN-backed:
+    // SIGNED_OUT; the request lifecycle keeps its local ids.
+    Hle::register_fn("D+F4GKuY3oE", (HleFn)s_np_ctx, "sceNpSnsIntCreateRequest");
+    Hle::register_fn("E2nPI+P0g8o", (HleFn)s_np_ctx, "sceNpSnsTwitchCreateRequest");
+    Hle::register_fn("Ho3XDEydBjM", (HleFn)s_np_ctx, "sceNpSnsYouTubeCreateRequest");
+    Hle::register_fn("KLqzbBxATrU", (HleFn)s_np_ok, "sceNpSnsIntDeleteRequest");
+    Hle::register_fn("OPj-CXHNEFE", (HleFn)s_np_ok, "sceNpSnsIntAbortRequest");
+    Hle::register_fn("PLJbF9b-Who", (HleFn)s_np_ok, "sceNpSnsFacebookAbortRequest");
+    Hle::register_fn("JTvAKV1iQkE", (HleFn)s_np_ok, "sceNpSnsFacebookDeleteRequest");
+    Hle::register_fn("E-sppToVlnc", (HleFn)s_np_ok, "sceNpSnsTwitchAbortRequest");
+    Hle::register_fn("DXUeCRu7DLE", (HleFn)s_np_ok, "sceNpSnsYouTubeAbortRequest");
+    Hle::register_fn("GGfyLTvE+LI", (HleFn)s_np_ok, "sceNpSnsYouTubeDeleteRequest");
+    Hle::register_fn("FtyS8XLBqNE", (HleFn)s_np_offline, "sceNpSnsFacebookGetAccessToken");
+    Hle::register_fn("JzCW8dx4mKk", (HleFn)s_np_offline, "sceNpSnsIntFbGetGameAccessToken");
+    Hle::register_fn("OINq9QxFYqU", (HleFn)s_np_offline, "sceNpSnsIntFbGetGameAccessTokenAllowed");
+    Hle::register_fn("O6K3LE8qXsc", (HleFn)s_np_offline, "sceNpSnsIntFbGetSystemAccessToken");
+    Hle::register_fn("Gp+C91igTkE", (HleFn)s_np_offline, "sceNpSnsIntTwGetSystemAccessToken");
+    Hle::register_fn("ExrhvJ8QANU", (HleFn)s_np_offline, "sceNpSnsIntYtGetAccessToken");
+    Hle::register_fn("A+mSQ2U6wWY", (HleFn)s_np_offline, "sceNpSnsIntYtRefreshMasterToken");
+    Hle::register_fn("AW7NonbfeFk", (HleFn)s_np_offline, "sceNpSnsIntLinkedStatus");
+    Hle::register_fn("Pz-00XG-VNU", (HleFn)s_np_offline, "sceNpSnsIntUnlink");
+    Hle::register_fn("GHLVam6hZZ4", (HleFn)s_np_offline, "sceNpSnsTwitchGetAccessToken");
+    Hle::register_fn("FElwHkpLvmw", (HleFn)s_np_offline, "sceNpSnsYouTubeGetAccessToken");
     // libSceShare — succeed; sharing simply unavailable headless.
     Hle::register_fn("nBDD66kiFW8", (HleFn)s_share_ok, "sceShareInitialize");
     Hle::register_fn("0IL1keINExQ", (HleFn)s_share_ok, "sceShareTerminate");

@@ -288,6 +288,9 @@ void register_savedata_hle();
 void register_np_hle();
 // libSceHttp local URI helpers; called by register_builtin_hle().
 void register_http_hle();
+// libSceNet socket family: byte-order/inet helpers, a local socket-id table, and an honest
+// offline failure on the packet path; called by register_builtin_hle().
+void register_net_hle();
 // libSceHttp2: local id lifecycle, recorded settings, and an honest offline failure on the
 // request/response path; called by register_builtin_hle().
 void register_http2_hle();
