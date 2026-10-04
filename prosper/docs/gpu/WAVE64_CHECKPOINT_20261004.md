@@ -1,7 +1,8 @@
 # General Wave64 / Kena checkpoint — 2026-10-04
 
 This is a durable **partial-work handoff**, not acceptance evidence. The helper/launch code is
-unverified; both confirmed review findings now have source-only correction attempts.
+unverified; both confirmed review findings now have source-only correction attempts. The first
+focused native build subsequently FAILED before test discovery, as recorded below.
 General Wave64 and Kena title-screen 3D are
 NOT complete. No current Kena drop census, FPS improvement or title-screen rendering result was
 measured in this checkpoint. Work was frozen at the maintainer's checkpoint request.
@@ -105,6 +106,45 @@ changes. It is not a whole-source CLEAR, test result, registered approval or acc
 All new tests remain UNEXECUTED; the earlier unfinished connected review and native obligations
 below still apply. No source change or native activity occurred during the review. The reviewer
 stopped after the bounded report; the PR comment retains its exact source identity and limits.
+
+## First focused native attempt: FAILED before test discovery
+
+ROOT subsequently attempted a native Windows/Clang CPU baseline at exact source
+`154531e3ab6dcff5092b3b2bbcc8d06d0d102b3e`, parent
+`6c6235a4b986d688931e3f425f9106bcece5ef1e`, tree
+`10281ce5f1a004dbd9fa1a8ccc00c65992998a76`. Actual configure0 and inspected CPU-only Ninja
+graph0, then **build1/helper1**. No binary certification, configured test discovery, CTest,
+VM, SPIR-V validation, GPU or game execution followed. The intended population was55 CPU
+cases across four explicit targets, NOT55 registered or executed cases:
+`test_fragment_raster_launch`, `test_fragment_draw_plan`, `test_fragment_packet_exports`,
+`test_fragment_scalar_reads`.
+
+Clang rejects three private accesses in `gpu_execute.hpp`: `selected_empty_words` at3269/3272
+and `bind` at3299, observed while compiling both `agc_shader_layout.cpp` and
+`capture_collect.cpp`. The current source confirms the concrete signature mismatch:
+`fragment_raster_launch.hpp:29` befriends the ten-parameter `realize_draw_item`, while the
+actual definition at `gpu_execute.hpp:2060` additionally takes
+`shared_ptr<const OrderedScalarBankReadPoint>` and `shared_ptr<const FragmentScalarBank>`.
+Those defaulted parameters still belong to its function signature. Fix the friend declaration
+to match the actual private producing function; **do not make the authority methods public**.
+This is the first next action, not an observed successful repair. Preserve the failed cohort.
+
+The bounded SAME reviewer source-cleared only the repaired native apparatus, SHA256
+`0ab615e5efae194ab357b5e65cd54a824ff8104e9b554b84d5127ca34acc34db`.
+Before execution the reviewer found that a certified PE with a wrong filter could run zero
+GoogleTests yet satisfy outer CTest counts. ROOT repaired the exact suite-to-PE/three-argument
+filter join and matching per-case RUN/result body checks. Actual hand-built discriminator
+calibrations accepted the valid command/body and refused wrong filter/PE, zero tests, foreign
+body and skip markers. This calibrates the apparatus only, NOT production shader controls.
+The reviewer performed no execution and gave no whole-source or PR approval.
+
+Raw configure/graph/build logs, apparatus calibration and `build-precertificate.json` are in
+`.codex/issue-4235-native-20261004/154531e3-focused-baseline/`; the reviewed runner is
+`.codex/issue-4235-helper-cpu-native-20261004.ps1` (`-ExecuteNativeProof` was the actual invocation).
+APP SHA256 `313eb7fdfe7729c71bb6515a4bb10cf73e538518f2345da419240716c8d4e662` and
+process0 remained unchanged before/after; no app/DLL target was in the inspected build graph.
+The native handle finished with exit1 and the final native process census was empty. Source
+remained clean/exact154 throughout; the later documentation commit supplies no native credit.
 
 ## Objective and acceptance boundary
 
@@ -301,7 +341,9 @@ run `python3 prosper/tools/session_start.py` at session start/after worktree cha
 machine the Store python3 alias may fail; real Python312 is available as `python`/`py -3.12`.
 Fetch in your own worktree, inspect current-main instructions/deltas and preserve others' trees.
 
-1. Validate both source-only repair attempts and finish missing registered negatives; preserve
+1. First repair the verified private-friend signature build failure above, review it, then use
+   a new exact-revision cohort; do not reuse or overwrite the failed154 receipts. Validate both
+   source-only repair attempts and finish missing registered negatives; preserve
    immutable successor H/P/T, source inventory and exact gates. Same reviewer completes the
    connected review on that successor and checks newer main. Do not borrow older native credit.
 2. In parallel only if useful, isolate/fix the recorded Windows UNC/enumeration/timeout failures.
@@ -326,13 +368,15 @@ committed or downloaded by a fresh clone, whereas source and this document are i
 | `.codex/issue-4235-helper-durable-handoff-3fcb2d18-20261004.md` | Clean code freeze; both repairs unstarted. |
 | `.codex/issue-4235-launch-helper-source-3fcb2d18-20261004.md` | Full60paths/63names/source contract, factory/SOURCE names; UNEXECUTED. |
 | `.codex/issue-4235-kena32-helper-frontier-3fcb2d18-20261004.md` | Exact32 filenames/hashes/prefix PCs/historical body flags and remaining obligations. |
+| `.codex/issue-4235-native-20261004/154531e3-focused-baseline/` | Actual configure0/graph0/build1; private friend-signature failure, no certification or tests. |
+| `.codex/issue-4235-helper-cpu-native-20261004.ps1` | Reviewed ROOT-only55/4 apparatus and discriminator calibration; exact154 failure retained, not a passing test receipt. |
 | `.codex/issue-4378-native-20261004/215ee6d2-baseline/` | Actual failed native configure/graph/build/certs/registration/JUnit/LastTest/observed.json. |
 | `.codex/issue-4378-cpu-native-20261004.ps1` | Reviewed ROOT-only70/12 helper, SHA256 `4df72940d6492ca983eb84996ada823686ce0f04c68fd1dc8196c5f765554695`; requires exact clean H/P/T and NEW cohort name. |
 | `.codex/issue-4378-source-freeze-215ee6d2-20261004.txt`, held-scope v1/v2 and handoff | Windows source-gate/history, not a passing native result. |
 | `.codex/issue-4322-native-20261004/9e595b11-final-tool/` | Accepted exact9e CPU60 receipts. |
 | `.codex/issue-4322-observation-native-20261004/9e595b11-final-tool/` | Accepted exact9e GPU17/observations receipts. |
 | `.codex/issue-4322-spv-native-20261004/9e595b11-final-corrected/` | Accepted exact9e585 actual modules/validator evidence. |
-| `.codex/worktrees/wave64-followthrough-20261002` | ROOT own central worktree; sole retained `prosper/build-flags-native-clang`. Latest compiled twelve CPU PEs are215, NOT current helper/checkpoint HEAD. |
+| `.codex/worktrees/wave64-followthrough-20261002` | ROOT own central worktree; sole retained `prosper/build-flags-native-clang`. Latest fully linked/certified twelve CPU PEs are215; the focused154 incremental build failed before requested PE links. No current helper/checkpoint native certificate. |
 | `.codex/worktrees/fragment-launch-composition-20261004` | Source-only helper author tree, clean3fcb at freeze, no builds. |
 | `.codex/worktrees/refused-shader-paths-20261004` | Removed after clean/ignored-path census, author acknowledgement and exact remote215 verification; no build or raw receipts deleted. Recreate an owned tree from draft #4383 if resuming. |
 
