@@ -304,6 +304,48 @@ bool cb_eliminate_fast_clear_writes_no_color() {
     return enabled;
 }
 
+// #4397: DB_DEPTH_CONTROL bit30 ENABLE_COLOR_WRITES_ON_DEPTH_FAIL / bit31
+// DISABLE_COLOR_WRITES_ON_DEPTH_PASS are not applied to the shipping colour state. Changing every
+// title's colour writes on a field name alone repeats #1724's CB MODE=DISABLE lesson, so first make
+// exposure measurable: count every resolution carrying either bit, indexed by the two-bit value.
+static std::atomic<uint64_t> g_depth_color_control_counts[4];
+
+uint64_t unmodeled_depth_color_control_count(uint32_t state) {
+    return g_depth_color_control_counts[state & 3u].load();
+}
+
+bool unmodeled_depth_color_control_summary(char* out, size_t cap) {
+    if (!out || cap == 0) return false;
+    const uint64_t a = unmodeled_depth_color_control_count(1),
+                   b = unmodeled_depth_color_control_count(2),
+                   c = unmodeled_depth_color_control_count(3);
+    if (!(a | b | c)) { out[0] = '\0'; return false; }
+    std::snprintf(out, cap,
+                  "[gpu] DB_DEPTH_CONTROL colour-on-depth totals (EXACT): write-on-fail=%llu "
+                  "no-write-on-pass=%llu both=%llu",
+                  (unsigned long long)a, (unsigned long long)b, (unsigned long long)c);
+    return true;
+}
+
+static void report_unmodeled_depth_color_control(uint32_t db_depth_control) {
+    const uint32_t state = db_depth_control >> 30;
+    static const bool exit_dump_registered = [] {
+        prosper::diagnostics::register_exit_report([] {
+            char line[256];
+            if (unmodeled_depth_color_control_summary(line, sizeof line))
+                fprintf(stderr, "%s\n", line);
+        });
+        return true;
+    }();
+    (void)exit_dump_registered;
+    const uint64_t count = ++g_depth_color_control_counts[state];
+    if ((count & (count - 1u)) == 0u)
+        fprintf(stderr, "[gpu] resolve_pipeline_state: DB_DEPTH_CONTROL colour-on-depth bits=%u "
+                        "(bit30 write-on-fail, bit31 no-write-on-pass) are unmodeled -> colour "
+                        "still written as an ordinary draw (count=%llu, #4397)\n",
+                state, static_cast<unsigned long long>(count));
+}
+
 uint64_t unmodeled_cb_color_mode_count(uint32_t mode) {
     return g_unmodeled_cb_mode_counts[mode & P::CB_COLOR_CONTROL_MODE_MASK].load();
 }
@@ -1212,6 +1254,7 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     // #919's real contract is preserved: a colour-disabled pass that programs CB_TARGET_MASK=0 still
     // resolves to no colour write, via the derivation above, and still executes for its DS side
     // effect. That is the idiom the tests cover; it is not the only idiom hardware allows.
+    if (rs.db_depth_control >> 30) report_unmodeled_depth_color_control(rs.db_depth_control);
     const uint32_t cb_mode = PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE);
     if (rs.has_cb_color_control) {
         // Diagnostic-only escape hatch for the blast radius above: PROSPER_LEGACY_CB_DISABLE_MASK=1

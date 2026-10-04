@@ -498,6 +498,12 @@ uint64_t unmodeled_cb_color_mode_count(uint32_t mode);
 // atexit dump that calls it so the formatting is testable without a process exit.
 bool unmodeled_cb_color_mode_summary(char* out, size_t cap);
 
+// #4397: resolutions whose DB_DEPTH_CONTROL carries bit30 ENABLE_COLOR_WRITES_ON_DEPTH_FAIL and/or
+// bit31 DISABLE_COLOR_WRITES_ON_DEPTH_PASS, indexed by that two-bit value (1, 2, 3). Neither bit is
+// applied to the shipping colour state yet; this is the exposure measurement that must precede it.
+uint64_t unmodeled_depth_color_control_count(uint32_t state);
+bool unmodeled_depth_color_control_summary(char* out, size_t cap);
+
 // #1724 diagnostic-only: true when PROSPER_LEGACY_CB_DISABLE_MASK=1 restores #919's
 // `MODE == DISABLE -> zero every colour write mask` override, for A/B-ing a suspected regression
 // without a revert. Read once into a static; not a supported rendering mode.

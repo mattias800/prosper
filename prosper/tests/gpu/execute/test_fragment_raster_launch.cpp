@@ -671,6 +671,73 @@ TEST_F(FragmentRasterLaunch, WorkitemBridgeRejectsUnknownOrCoverageChangingPhysi
         << "only the separately proved quad-local program is insensitive to interquad packing";
 }
 
+// #4397: the guest's own DB_DEPTH_CONTROL word is programmed BEFORE normal registered
+// realization, so the captured coverage word, launch-source issue and plan all see the value
+// the hardware would. Physical zero and the inert write-on-fail bit (no test can fail with Z,
+// stencil and bounds disabled) stay admitted; colour suppression on depth pass and reserved
+// bits refuse by name with no pending deferral, capacity or replay.
+TEST_F(FragmentRasterLaunch, ProgrammedDepthColorControlRefusesBeforePendingAuthority) {
+    namespace helper = prosper::test::fragment_raster;
+    namespace p = prosper::agc::Pm4;
+    const auto realize_with = [](g::DrawItem& draw, uint32_t depth_control) {
+        auto words = helper::context();
+        bool programmed = false;
+        for (auto& [reg, value] : words)
+            if (reg == p::DB_DEPTH_CONTROL) value = depth_control, programmed = true;
+        EXPECT_TRUE(programmed);
+        return f::realize(draw, f::color_a, helper::original(), f::ieee_rsrc1, 15, words);
+    };
+    using C = g::RasterCoverageControl;
+    for (const uint32_t admitted : {0u, 0x40000000u}) {
+        g::DrawItem draw;
+        ASSERT_TRUE(realize_with(draw, admitted)) << std::hex << admitted;
+        ASSERT_TRUE(draw.fragment_draw_inputs && draw.fragment_draw_inputs->launch_source)
+            << std::hex << admitted;
+        const auto& launch = draw.fragment_draw_inputs->launch;
+        ASSERT_TRUE(launch.coverage.has(C::DepthControl));
+        EXPECT_EQ(launch.coverage.word(C::DepthControl), admitted);
+        EXPECT_EQ(g::fragment_raster_workitem_gap(launch), nullptr) << std::hex << admitted;
+        if (draw.fs_words().empty())
+            EXPECT_TRUE(draw.fragment_draw_inputs->owned_wave_pending) << std::hex << admitted;
+        const auto prepared = f::prepare(draw);
+        ASSERT_TRUE(prepared && prepared->launch_source);
+        const auto plan =
+            g::cached_fragment_draw_program(*draw.fragment_draw_inputs, *prepared, raster_device(), 48);
+        ASSERT_TRUE(plan);
+        EXPECT_TRUE(plan->rejection_reason().empty()) << plan->rejection_reason();
+        EXPECT_TRUE(plan->capacity_owner());
+    }
+    const std::pair<uint32_t, const char*> refused[]{
+        {0x80000000u, "fragment-draw-color-writes-disabled-on-depth-pass-unimplemented"},
+        {0xc0000000u, "fragment-draw-color-writes-disabled-on-depth-pass-unimplemented"},
+        {1u << 12, "fragment-draw-depth-control-reserved-bits-unimplemented"},
+        {1u << 29, "fragment-draw-depth-control-reserved-bits-unimplemented"},
+    };
+    for (const auto& [depth_control, reason] : refused) {
+        const uint64_t census_before = g::unmodeled_depth_color_control_count(depth_control >> 30);
+        g::DrawItem draw;
+        realize_with(draw, depth_control);
+        ASSERT_TRUE(draw.fragment_draw_inputs) << std::hex << depth_control;
+        const auto& in = *draw.fragment_draw_inputs;
+        ASSERT_TRUE(in.launch.coverage.has(C::DepthControl));
+        EXPECT_EQ(in.launch.coverage.word(C::DepthControl), depth_control);
+        EXPECT_STREQ(g::fragment_raster_workitem_gap(in.launch), reason) << std::hex << depth_control;
+        // The private launch association is an observation every non-bank draw receives; the
+        // pending empty-FS deferral is the authority, and fragment_raster_pending_original
+        // withholds it for any workitem gap.
+        EXPECT_FALSE(in.owned_wave_pending) << "a refused contract must not defer as pending";
+        const auto prepared = f::prepare(draw);
+        ASSERT_TRUE(prepared);
+        const auto plan = g::cached_fragment_draw_program(in, *prepared, raster_device(), 48);
+        ASSERT_TRUE(plan);
+        EXPECT_EQ(plan->rejection_reason(), reason) << std::hex << depth_control;
+        EXPECT_FALSE(plan->capacity_owner()) << std::hex << depth_control;
+        // The shipping colour state still writes for these bits; the census must say so.
+        if (depth_control >> 30)
+            EXPECT_GT(g::unmodeled_depth_color_control_count(depth_control >> 30), census_before);
+    }
+}
+
 TEST_F(FragmentRasterLaunch, PendingEmptyFsCannotBorrowWarmCodeOrAnotherDrawObservation) {
     namespace helper = prosper::test::fragment_raster;
     g::DrawItem draw;
