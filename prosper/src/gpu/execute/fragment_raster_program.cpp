@@ -51,8 +51,9 @@ FragmentRasterProgram fragment_raster_program(const std::vector<Rdna2Inst>& inst
                (!r || aliases[r - 1] == Mask::Absent);
     };
     const auto mask = [&](const Operand& operand) {
+        // Scalar sources decode EXEC as Special; ordinary saved pairs remain SGPR aliases.
+        if (operand.kind == OperandKind::Special && operand.value == 126) return exec;
         if (operand.kind != OperandKind::SGPR) return Mask::Absent;
-        if (operand.value == 126) return exec;
         return operand.value >= 0 && operand.value < 105 ? aliases[operand.value] : Mask::Absent;
     };
     const auto overwrite_scalar = [&](uint32_t first, uint32_t count) {

@@ -61,6 +61,14 @@ g::FragmentRasterProgram helper_requirements(const std::vector<uint32_t>& code,
 } // namespace
 
 TEST_F(FragmentRasterLaunch, OriginalSavedLiveHelperProgramDemandsRealPackedPositionWords) {
+    const auto code = helper_original();
+    std::vector<g::Rdna2Inst> decoded;
+    g::rdna2_walk(code.data(), code.size(), decoded);
+    ASSERT_GE(decoded.size(), 2u);
+    for (size_t index : {size_t(0), size_t(1)}) {
+        EXPECT_EQ(decoded[index].src[0].kind, g::OperandKind::Special);
+        EXPECT_EQ(decoded[index].src[0].value, 126);
+    }
     const auto direct = helper_requirements(helper_original(), {1u << 8, 1u << 8});
     ASSERT_TRUE(direct.rejection.empty()) << direct.rejection;
     ASSERT_EQ(direct.positions.size(), 1u);
@@ -295,6 +303,24 @@ TEST_F(FragmentRasterLaunch,
         f::retain_source(*forms[index], names[index]);
 }
 TEST_F(FragmentRasterLaunch, SavedMaskNumericalExposureAndPartialAliasReplacementStayUnproved) {
+    // Canonical EXEC alone carries the incoming mask: VCC, M0, unknown specials, numeric zero
+    // and ordinary pairs without a saved-mask definition cannot borrow that authority.
+    for (uint32_t source : {106u, 107u, 108u, 124u, 125u, 127u, 128u, 20u, 105u}) {
+        SCOPED_TRACE(source);
+        auto foreign = helper_original();
+        foreign[0] = (foreign[0] & ~0xffu) | source;
+        const auto refused = helper_requirements(foreign, {1u << 8, 1u << 8});
+        EXPECT_EQ(refused.rejection, "fragment-raster-mask-source-unproved:pc=0");
+        EXPECT_TRUE(refused.positions.empty());
+    }
+    const auto canonical = helper_original();
+    std::vector<g::Rdna2Inst> decoded;
+    g::rdna2_walk(canonical.data(), canonical.size(), decoded);
+    ASSERT_FALSE(decoded.empty());
+    decoded[0].src[0] = {g::OperandKind::SGPR, 126};   // noncanonical forged IR, not a source SGPR
+    EXPECT_EQ(g::fragment_raster_program(decoded, uint32_t(canonical.size()), {1u << 8, 1u << 8}, 0)
+                  .rejection,
+              "fragment-raster-mask-source-unproved:pc=0");
     auto code = helper_original();
     code.insert(code.begin() + 2, 0x7e020214u); // v_mov_b32 v1,s20 exposes actual mask bits
     EXPECT_EQ(helper_requirements(code, {1u << 8, 1u << 8}).rejection,
