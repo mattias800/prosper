@@ -215,21 +215,26 @@ static void validate_scalar_bank(const std::string& dir) {
         const std::vector<uint32_t>& words;
         SpirvShaderStage stage;
         uint32_t set;
+        uint32_t allowed_bindings;
         bool needs_bank;
     };
     // Six actual modules, not six statically-used bindings in every module. The normal compute
     // layout has bindings 0..5; only the original kernel reads SBR2 at 5. Collector uses set1/0,
-    // and replay's private set0/5 is the commit plane, NOT the scalar bank.
-    const std::array modules{
-        Module{"scalar_bank_original_kernel", capacity->kernel()->program.packet.spirv,
-               SpirvShaderStage::Compute, 0, true},
-        Module{"scalar_bank_collector", plan->collect_words(), SpirvShaderStage::Fragment, 1,
-               false},
-        Module{"scalar_bank_count", plan->count_words(), SpirvShaderStage::Compute, 0, false},
-        Module{"scalar_bank_assembly", plan->assembly_words(), SpirvShaderStage::Compute, 0, false},
-        Module{"scalar_bank_validation", plan->validation_words(), SpirvShaderStage::Compute, 0,
-               false},
-        Module{"scalar_bank_replay", plan->replay_words(), SpirvShaderStage::Fragment, 0, false}};
+    // and replay's private set1/1..5 exclude persistent GDS at 0; set1/5 is commit, NOT SBR2.
+    constexpr uint32_t compute_bindings = (1u << (kFragmentScalarBankBinding + 1u)) - 1u;
+    const std::array modules{Module{"scalar_bank_original_kernel",
+                                    capacity->kernel()->program.packet.spirv,
+                                    SpirvShaderStage::Compute, 0, compute_bindings, true},
+                             Module{"scalar_bank_collector", plan->collect_words(),
+                                    SpirvShaderStage::Fragment, 1, 1u, false},
+                             Module{"scalar_bank_count", plan->count_words(),
+                                    SpirvShaderStage::Compute, 0, compute_bindings, false},
+                             Module{"scalar_bank_assembly", plan->assembly_words(),
+                                    SpirvShaderStage::Compute, 0, compute_bindings, false},
+                             Module{"scalar_bank_validation", plan->validation_words(),
+                                    SpirvShaderStage::Compute, 0, compute_bindings, false},
+                             Module{"scalar_bank_replay", plan->replay_words(),
+                                    SpirvShaderStage::Fragment, 1, 0x3eu, false}};
     for (const auto& module : modules) {
         dump(dir, module.name, module.words);
         const auto report = validate_spirv_descriptor_interface(module.words, nullptr, module.set,
@@ -242,8 +247,8 @@ static void validate_scalar_bank(const std::string& dir) {
                    binding.readable, binding.writable);
             require(binding.set == module.set && binding.stage == module.stage &&
                         binding.kind == SpirvDescriptorKind::StorageBuffer &&
-                        binding.binding <= kFragmentScalarBankBinding &&
-                        (module.set != 1 || binding.binding == 0),
+                        binding.binding < 32u &&
+                        (module.allowed_bindings & (1u << binding.binding)) != 0,
                     "module binding outside the actual WAT2 interface");
         }
         if (module.needs_bank) {
@@ -289,6 +294,9 @@ static const NotAnEmitter kNotEmitters[] = {
     {"registered_graphics_original",
      "aliases the registered immutable RAW RDNA2 analysis bytes; consuming owned packet modules "
      "are validated here, but the accessor neither translates instructions nor assembles SPIR-V"},
+    {"shader_source_snapshot",
+     "copies bounded original RDNA2 words and checks complete encoded instruction prefixes; "
+     "it neither translates those instructions nor assembles a SPIR-V module"},
     // Two SpirvCompute members became visible to this scan when the recompiler's shared internals
     // moved into rdna2_to_spirv_internal.hpp so the emit functions could be split into their own
     // translation units. Neither is a new code path -- both were always reached through the entry
