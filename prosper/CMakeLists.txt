@@ -996,6 +996,17 @@ if(TARGET prosper_core)
   target_link_libraries(test_kernel_nanosleep PRIVATE prosper_core)
   add_test(NAME kernel_nanosleep COMMAND test_kernel_nanosleep)
 
+  # sceKernelRaiseException under a stop-the-world burst (#4324). POSIX only: Windows delivers
+  # through its own suspend/redirect path (test_win_exception_delivery). The macOS pending table
+  # was 16 slots and Silksong's ~24-thread IL2CPP burst overflowed it; the test blocks its targets'
+  # signals so the overflow is forced, not left to scheduling.
+  if(NOT WIN32)
+    prosper_add_gtest(test_exc_raise_burst
+      SOURCES tests/hle/kernel/test_exc_raise_burst.cpp
+      INCLUDES src
+      LIBRARIES prosper_core)
+  endif()
+
   # The guest semaphore timed wait (#3013). Platform-neutral like the nanosleep case above and for
   # the same reason: the fix is Windows-only, so gating on UNIX would build the test everywhere
   # except where the defect is.
