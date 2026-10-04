@@ -1,6 +1,7 @@
 #include "gpu/recompiler/fragment_packet_export_timing.hpp"
 #include "gpu/recompiler/fragment_packet_exports.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_waitcnt.hpp"
 #include <bitset>
 #include <map>
 
@@ -35,9 +36,12 @@ const char* fragment_packet_export_timing_gap(const std::vector<Rdna2Inst>& ins,
         const bool branch = in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode);
         if (branch && (branch_target(in) <= in.pc || !indices.contains(branch_target(in))))
             return "packet-export-timing-control-unimplemented";
-        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c && in.simm16 == 0) {
-            pending.words.reset();
-            pending.exec = false;
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c) {
+            if (const auto* gap = rdna2_waitcnt_execution_gap(uint16_t(in.simm16))) return gap;
+            if (decode_rdna2_waitcnt(uint16_t(in.simm16)).drains_exports()) {
+                pending.words.reset();
+                pending.exec = false;
+            }
         } else if (in.is_end) {
             if (in.fmt != Rdna2Format::SOPP || in.opcode != 1)
                 return "packet-export-timing-terminal-unimplemented";

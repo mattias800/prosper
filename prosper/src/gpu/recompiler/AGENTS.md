@@ -28,7 +28,7 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   unsupported domains. No framebuffer export, depth/blend commit or guest-wave packing is added.
 - `fragment_resource_packet` — a separate owned-input packet compiler/transactional EXP consumer.
   `fragment_packet_resource_preflight` checks original read-PC/descriptor/parameter/M0 ownership
-  and all-path full WAIT completion; `fragment_packet_resource_services` emits actual SMEM,
+  and all-path counter-specific WAIT completion; `fragment_packet_resource_services` emits actual SMEM,
   P1/P2, explicit-LZ/L nearest sampling and integer finite F32 operations from those inputs.
   `fragment_packet_f32` preserves explicit input/output denorm and rounding modes in integer
   arithmetic; nonfinite/overflow and non-exact interpolation remain named runtime failures.
@@ -60,6 +60,11 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   facts without per-draw parsing. Complete original writers may make initial values unnecessary,
   never an actual supplied branch value or an internal zero placeholder. READLANE's selected peer,
   WQM/partial writes and the existing inactive raw EXP contract remain separate obligations.
+- `rdna2_waitcnt` decodes the original RDNA2 split VM, EXP and six-bit LGKM fields. A zero
+  threshold drains only its own pending set; a maximum grants no completion. Effects-only
+  scalar-origin/mask inventory may preserve canonical partial WAITs without granting readiness,
+  while execution still refuses intermediate thresholds until a count/order proof exists.
+  Unmodeled bit7 is retained and named unsupported, not declared ISA-invalid.
 - `fragment_packet_wave_data` separates cached original-program SOURCE/profile from dynamic owned
   logical64 wave regions. Checked per-workgroup bases load genuine scalar/M0/resource/VGPR words;
   all-wave status validation precedes any publication. Shared image bindings remain a bounded
@@ -86,7 +91,7 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   resource and cached-wave consumers stage typed events until every status/wave succeeds. This
   is suitable input for a later ordered attachment transaction, NOT attachment/raster authority.
   `fragment_packet_export_timing` proves current EXEC and every enabled physical payload word
-  stable through all forward paths until full WAIT or ordinary END's implicit drain. Unsafe
+  stable through all forward paths until EXPCNT0 or ordinary END's implicit drain. Unsafe
   overwrites remain named gaps; DONE alone never drains. Eager private records do not claim bus
   timing, externally visible attachment writes or live resource epochs. RDNA2 STATUS.SKIP_EXPORT
   is VS-only; this PS contract does not invent a missing status input or infer a stored zero.
