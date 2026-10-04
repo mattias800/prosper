@@ -11,6 +11,7 @@
 #include "gpu/recompiler/rdna2_sad.hpp"
 #include "gpu/recompiler/rdna2_perm_b32.hpp"
 #include "gpu/recompiler/rdna2_div_fixup.hpp"
+#include "gpu/recompiler/rdna2_mad_64.hpp"
 #include "gpu/recompiler/rdna2_movrels.hpp"
 #include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#325)
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -4804,13 +4805,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // immaterial here. VERIFIED(round-trip llvm-mc gfx1010, both directions): VOP3 op 0x141.
                 uint32_t m = b.fbin(Op_FMul, fv(0), fv(1));
                 vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, m, fv(2)));
-            } else if (in.opcode == 0x176) {                          // v_mad_u64_u32
-                // AMD RDNA2: {carry,D.u64} = S0.u32*S1.u32 + S2.u64. A literal
-                // or positive inline constant used as the 64-bit addend is zero-extended;
-                // a negative integer inline constant is sign-extended. Register addends
-                // consume the consecutive high register.
+            } else if (in.opcode == 0x176 || in.opcode == 0x177) {   // v_mad_u64_u32 / v_mad_i64_i32
+                // {carry,D} = S0*S1 + S2 (rdna2_mad_64.cpp). A positive inline constant used as the
+                // 64-bit addend is zero-extended, a negative integer inline sign-extended; register
+                // addends consume the consecutive high register. A literal addend is zero-extended
+                // for 0x176 and refused for 0x177 until its extension is proved.
                 if (in.dst.value >= 255) { ok = false; }
                 else {
+                    const bool is_signed = (in.opcode == 0x177);
                     auto high_half = [&](const Operand& operand) -> uint32_t {
                         if (operand.kind == OperandKind::InlineInt)
                             return b.uconst(operand.value < 0 ? 0xFFFFFFFFu : 0u);
@@ -4819,8 +4821,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         // the previous {f32-bits, 0} model was wrong in both halves. No compiler
                         // emits a float inline as an integer-mad addend: reject, stay fail-visible.
                         if (operand.kind == OperandKind::InlineFloat) { ok = false; return b.uconst(0); }
-                        if (operand.kind == OperandKind::Literal)
-                            return b.uconst(0);
+                        if (operand.kind == OperandKind::Literal) { ok = ok && !is_signed; return b.uconst(0); }
                         if (operand.kind == OperandKind::Special && operand.value == 125)
                             return b.uconst(0);                       // null pair
                         if (operand.kind == OperandKind::VGPR ||
@@ -4837,16 +4838,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 
                     const uint32_t a = val(in.src[0]), c = val(in.src[1]);
                     const uint32_t add_lo = val(in.src[2]), add_hi = high_half(in.src[2]);
-                    const uint32_t mul_lo = b.ibin(Op_IMul, a, c);
-                    const uint32_t mul_hi = b.umul_hi(a, c);
-                    const uint32_t result_lo = b.ibin(Op_IAdd, mul_lo, add_lo);
-                    const uint32_t carry_lo = b.ucmp(Op_ULessThan, result_lo, mul_lo);
-                    const uint32_t high_sum = b.ibin(Op_IAdd, mul_hi, add_hi);
-                    const uint32_t carry_hi0 = b.ucmp(Op_ULessThan, high_sum, mul_hi);
-                    const uint32_t carry_word = b.sel(carry_lo, b.uconst(1), b.uconst(0));
-                    const uint32_t result_hi = b.ibin(Op_IAdd, high_sum, carry_word);
-                    const uint32_t carry_hi1 = b.ucmp(Op_ULessThan, result_hi, high_sum);
-                    const uint32_t carry_out = b.lor(carry_hi0, carry_hi1);
+                    const Mad64Result mad = emit_mad_64_32(b, a, c, add_lo, add_hi, is_signed);
+                    const uint32_t result_lo = mad.lo, result_hi = mad.hi, carry_out = mad.carry;
 
                     const int hi_dst = in.dst.value + 1;
                     const uint32_t old_hi = vreg_old(b, rs, hi_dst);

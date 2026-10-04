@@ -11313,6 +11313,79 @@ int main() {
     CHECK(gotT11f.size()==N && badT11f==0,
           "T11f: v_mad_u64_u32 writes exact low/high words and carry-out");
 
+    // T11f_signed: v_mad_i64_i32 (VOP3B 0x177):
+    //   {carry, D.i64} = 65'(S0.i32 * S1.i32) + 65'(S2.i64), carry = bit 64 of that sum.
+    // Inputs v0 = S0, v1 = S1, v[2:3] = S2; three programs read D.lo (v5), D.hi (v6) and the
+    // carry (v0 via cndmask). Expected values come from a host model of that definition.
+    // Each of these slips changes at least one case: zero-extending the product (cases 0, 4,
+    // 5), zero-extending the addend (1, 3), dropping S2's high dword (1, 2, 3, 5), and an
+    // unsigned carry out of bit 63 instead of bit 64 (0, 1, 3, 4, 5).
+    //   llvm-mc gfx1030: d5776a05 040a0300 = v_mad_i64_i32 v[5:6], vcc, v0, v1, v[2:3];
+    //   02000300 = v_cndmask_b32 v0, v0, v1, vcc.
+    const struct {
+        uint32_t s0, s1, s2_lo, s2_hi, d_lo, d_hi, carry;
+    } kMadI64Cases[] = {
+        {0xffffffffu, 0x00000001u, 0x00000000u, 0x00000000u, 0xffffffffu, 0xffffffffu, 1u},
+        {0x80000000u, 0x80000000u, 0x00000000u, 0x80000000u, 0x00000000u, 0xc0000000u, 1u},
+        {0x7fffffffu, 0x7fffffffu, 0xffffffffu, 0x7fffffffu, 0x00000000u, 0xbfffffffu, 0u},
+        {0x00000002u, 0x00000003u, 0xffffffffu, 0xffffffffu, 0x00000005u, 0x00000000u, 0u},
+        {0xfffffffbu, 0x00000007u, 0x00000010u, 0x00000000u, 0xffffffedu, 0xffffffffu, 1u},
+        {0x00003039u, 0xfffffffeu, 0x00000000u, 0x00000001u, 0xffff9f8eu, 0x00000000u, 0u},
+    };
+    std::vector<float> inMadI64(N * 4, 0.0f);
+    for (uint32_t i = 0; i < N; ++i) {
+        const auto& c = kMadI64Cases[i % std::size(kMadI64Cases)];
+        inMadI64[i * 4 + 0] = std::bit_cast<float>(c.s0);
+        inMadI64[i * 4 + 1] = std::bit_cast<float>(c.s1);
+        inMadI64[i * 4 + 2] = std::bit_cast<float>(c.s2_lo);
+        inMadI64[i * 4 + 3] = std::bit_cast<float>(c.s2_hi);
+    }
+    const uint32_t codeT11fSignedD[] = {
+        0xd5776a05u,
+        0x040a0300u,   // v_mad_i64_i32 v[5:6], vcc, v0, v1, v[2:3]
+        0xbf810000u,
+    };
+    const uint32_t codeT11fSignedCarry[] = {
+        0xd5776a05u, 0x040a0300u,   // v_mad_i64_i32 v[5:6], vcc, v0, v1, v[2:3]
+        0x7e000280u,   // v_mov_b32 v0, 0
+        0x7e020281u,   // v_mov_b32 v1, 1
+        0x02000300u,   // v_cndmask_b32 v0, v0, v1, vcc (v0 = carry)
+        0xbf810000u,
+    };
+    const struct {
+        const uint32_t* code;
+        size_t words;
+        int out_vgpr;
+        const char* what;
+    } kMadI64Outputs[] = {
+        {codeT11fSignedD, std::size(codeT11fSignedD), 5, "D.lo"},
+        {codeT11fSignedD, std::size(codeT11fSignedD), 6, "D.hi"},
+        {codeT11fSignedCarry, std::size(codeT11fSignedCarry), 0, "carry"},
+    };
+    for (int out = 0; out < 3; ++out) {
+        const auto& o = kMadI64Outputs[out];
+        std::vector<uint32_t> spv = recompile_valu(o.code, o.words, 4, o.out_vgpr);
+        CHECK(!spv.empty(), "recompiled T11f_signed (v_mad_i64_i32 VOP3B) -> SPIR-V");
+        std::vector<float> got = prosper::test::run_compute(spv, inMadI64, N, N);
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < N && got.size() == N; ++i) {
+            const auto& c = kMadI64Cases[i % std::size(kMadI64Cases)];
+            const uint32_t want = out == 0 ? c.d_lo : out == 1 ? c.d_hi : c.carry;
+            if (bits_of(got[i]) != want) ++bad;
+        }
+        printf("  T11f_signed %s mismatches=%u\n", o.what, bad);
+        CHECK(got.size() == N && bad == 0,
+              "T11f_signed: v_mad_i64_i32 writes exact D.lo, D.hi and bit-64 carry");
+    }
+    // A 32-bit literal 64-bit addend: 0x176 zero-extends it; 0x177 refuses until its extension
+    // is proved. llvm-mc gfx1030: v_mad_{i64_i32,u64_u32} v[5:6], vcc, v0, v1, 0x12345.
+    const uint32_t codeMadI64Literal[] = {0xd5776a05u, 0x03fe0300u, 0x00012345u, 0xbf810000u};
+    const uint32_t codeMadU64Literal[] = {0xd5766a05u, 0x03fe0300u, 0x00012345u, 0xbf810000u};
+    CHECK(recompile_valu(codeMadI64Literal, std::size(codeMadI64Literal), 4, 5).empty(),
+          "T11f_signed: v_mad_i64_i32 refuses a literal 64-bit addend");
+    CHECK(!recompile_valu(codeMadU64Literal, std::size(codeMadU64Literal), 4, 5).empty(),
+          "T11f: v_mad_u64_u32 still compiles a literal 64-bit addend");
+
     // Astro's SSAO pixel shader carries dead `s_and_b64 vcc,s[0:1],vcc` operations between
     // comparisons; s[0:1] is a T# descriptor, not a wave-mask value available to SPIR-V. Prove that
     // the dead write is removed while the following, observable comparison still controls cndmask.

@@ -1,7 +1,6 @@
-// test_gap_opcode_refusals — fail-visible refusal pins for opcodes the compute recompiler
-// decodes but does not lower (v_mad_i64_i32), plus the refusal guards of lowerings that stay
-// fail-visible for inputs they cannot represent (s_movrels_b32). The image_gather4 arm below
-// is no longer a refusal pin: it checks where 0x40 is admitted.
+// test_gap_opcode_refusals — fail-visible refusal guards of lowerings that stay fail-visible
+// for inputs they cannot represent (s_movrels_b32). Every opcode it once pinned as an unlowered
+// gap is now lowered. The image_gather4 arm below checks where 0x40 is admitted.
 //
 // Per the recompiler charter an unsupported op is a FATAL gap, and the loud refusal is only the
 // backstop. These arms pin that backstop: the guest word decodes to the right instruction, the
@@ -167,32 +166,6 @@ TEST(GapOpcodeRefusals, ControlVop3aSiblingCompiles) {
     expect_vop3a_v5_v1_v2_v3(kSadU32, 0x15du);
     expect_compiles(program(kVop3Prologue, {kSadU32[0], kSadU32[1]}), 0xA000ull,
                     "v_sad_u32 v5, v1, v2, v3 with the shared VOP3 prologue");
-}
-
-// V_MAD_I64_I32 v[5:6], s12, v1, v2, v[3:4] (VOP3B 0x177). dword0[14:8] is the SDST carry
-// destination (s12 in Wave32, s[12:13] in Wave64 -- the raw words are the same), not a source; the
-// decoder's VOP3B list includes 0x177, so the operands are asserted in full. Control: the lowered
-// unsigned sibling v_mad_u64_u32 (0x176) with the identical operand fields.
-TEST(GapOpcodeRefusals, MadI64I32) {
-    static const uint32_t w[2] = {0xd5770c05u, 0x040e0501u};
-    static const uint32_t control[2] = {0xd5760c05u, 0x040e0501u};
-    for (const uint32_t* words : {w, control}) {
-        const Rdna2Inst dec = rdna2_decode_one(words, 2);
-        EXPECT_EQ(dec.fmt, Rdna2Format::VOP3);
-        EXPECT_EQ(dec.opcode, words == w ? 0x177u : 0x176u);
-        EXPECT_EQ(dec.len_dwords, 2u);
-        EXPECT_TRUE(is_vgpr(dec.dst, 5));
-        EXPECT_TRUE(is_sgpr(dec.sdst, 12)) << "VOP3B SDST is s12";
-        EXPECT_EQ(dec.n_src, 3u);
-        EXPECT_TRUE(is_vgpr(dec.src[0], 1));
-        EXPECT_TRUE(is_vgpr(dec.src[1], 2));
-        EXPECT_TRUE(is_vgpr(dec.src[2], 3)) << "addend v[3:4] is named by its base v3";
-        for (int k = 0; k < 3; ++k) EXPECT_FALSE(dec.src_abs[k]) << "VOP3B clears the abs field";
-    }
-    expect_compiles(program(kVop3Prologue, {control[0], control[1]}), 0xA010ull,
-                    "control: v_mad_u64_u32 v[5:6], s12, v1, v2, v[3:4]");
-    expect_gap_refusal(program(kVop3Prologue, {w[0], w[1]}), 0xA011ull, 4, {w[0], w[1]},
-                       Rdna2Format::VOP3, 0x177u);
 }
 
 // S_MOVRELS_B32 s0, s1 (SOP1 0x2e) reads s[1 + M0] and is lowered (rdna2_movrels.cpp); these arms
