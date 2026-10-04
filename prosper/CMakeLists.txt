@@ -808,6 +808,9 @@ ${GAME_DUMP_TITLE_ID}. Re-run cmake with -DGAME_DUMP=<dump root>/${title}-app0 t
 endfunction()
 
 if(TARGET prosper_core)
+  prosper_add_gtest(test_original_graphics_stage_effects
+    SOURCES tests/gpu/execute/test_original_graphics_stage_effects.cpp
+    INCLUDES tests LIBRARIES prosper_core)
   prosper_add_gtest(test_fragment_scalar_reads
     SOURCES tests/gpu/recompiler/test_fragment_scalar_reads.cpp
     INCLUDES tests LIBRARIES prosper_core)
