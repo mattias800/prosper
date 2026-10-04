@@ -3019,7 +3019,7 @@ private:
                              "fence-wait=%d fence-waits=%llu idle-origin=%s\n",
                              static_cast<int>(result.submit_result),
                              static_cast<int>(result.wait_result),
-                             result.command_buffers, n + 1,
+                             static_cast<size_t>(result.command_buffers), n + 1,
                              backend_queue_call_origin_name(result.submit_origin),
                              static_cast<int>(result.fence_wait_result),
                              static_cast<unsigned long long>(result.fence_waits),
