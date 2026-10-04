@@ -5076,16 +5076,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                   b.uconst(0)));
                     }
                 }
-            } else if (in.opcode == 0x344) {                          // v_perm_b32
+            } else if (in.opcode == 0x344) {   // v_perm_b32
                 const bool modified = in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
-                                      in.src_neg[0] || in.src_neg[1] || in.src_neg[2] ||
-                                      in.clamp || in.omod;
+                                      in.src_neg[0] || in.src_neg[1] || in.src_neg[2] || in.clamp ||
+                                      in.omod;
                 if (modified) {
                     ok = false;
                 } else {
-                    vreg[in.dst.value] = emit_v_perm_b32(b, val(in.src[0]), val(in.src[1]), val(in.src[2]));
+                    vreg[in.dst.value] =
+                        emit_v_perm_b32(b, val(in.src[0]), val(in.src[1]), val(in.src[2]));
                 }
-            } else if (in.opcode == kVop3OpcodeLshlrevB64) {         // v_lshlrev_b64
+            } else if (in.opcode == kVop3OpcodeLshlrevB64) {   // v_lshlrev_b64
                 // GTA V constructs a per-lane bit as `1ull << lane` immediately after MBCNT. This
                 // bounded admission keeps SRC1 at the exact inline integer 1; general register-pair
                 // and floating-inline sources need wider source-span/provenance handling.
@@ -5109,7 +5110,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     vreg[hi_dst] = b.u64_hi(result);
                     predicate_write(b, rs, hi_dst, old_hi);
                 }
-            } else if (in.opcode == kVop3OpcodeLshrrevB64) {         // v_lshrrev_b64
+            } else if (in.opcode == kVop3OpcodeLshrrevB64) {   // v_lshrrev_b64
                 // GTA V's compact-BVH kernels shift a VGPR pair by either a scalar scratch word or
                 // a VGPR lane value. RDNA masks the count to six bits. Keep the pair and modifier
                 // admission exact: SRC1 must be an addressable consecutive register pair, and this
@@ -5136,7 +5137,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     vreg[hi_dst] = b.u64_hi(result);
                     predicate_write(b, rs, hi_dst, old_hi);
                 }
-            } else if (in.opcode == 0x363) {                          // v_bfm_b32
+            } else if (in.opcode == 0x363) {   // v_bfm_b32
                 // RDNA2: D.u32 = ((1 << S0[4:0]) - 1) << S1[4:0]. Mask both shift
                 // amounts before emitting SPIR-V so neither can reach the undefined >=32 range;
                 // in particular, an input width of 32 wraps to zero rather than producing all ones.
@@ -5158,32 +5159,32 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         b.uconst(1));
                     vreg[in.dst.value] = b.ibin(Op_ShiftLeftLogical, mask, offset);
                 }
-            } else if (in.opcode == 0x364) {                          // v_bcnt_u32_b32
+            } else if (in.opcode == 0x364) {   // v_bcnt_u32_b32
                 // AMD RDNA2: D = popcount(S0) + S1. The third VOP3 source field is unused.
                 vreg[in.dst.value] = b.ibin(Op_IAdd,
                                              b.iun(Op_BitCount, val(in.src[0])),
                                              val(in.src[1]));
-            } else if (in.opcode == kVop3OpcodeAdd3U32) {             // v_add3_u32 = s0+s1+s2
+            } else if (in.opcode == kVop3OpcodeAdd3U32) {   // v_add3_u32 = s0+s1+s2
                 vreg[in.dst.value] = b.ibin(Op_IAdd, b.ibin(Op_IAdd, val(in.src[0]), val(in.src[1])), val(in.src[2]));
-            } else if (in.opcode == 0x346) {                          // v_lshl_add_u32 = (s0<<(s1&31))+s2
+            } else if (in.opcode == 0x346) {   // v_lshl_add_u32 = (s0<<(s1&31))+s2
                 uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, b.ibin(Op_ShiftLeftLogical, val(in.src[0]), sh), val(in.src[2]));
-            } else if (in.opcode == kVop3OpcodeAndOrB32) {           // v_and_or_b32 = (s0&s1)|s2
+            } else if (in.opcode == kVop3OpcodeAndOrB32) {   // v_and_or_b32 = (s0&s1)|s2
                 uint32_t t = b.ibin(Op_BitwiseAnd, val(in.src[0]), val(in.src[1]));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t, val(in.src[2]));
-            } else if (in.opcode == 0x372) {                          // v_or3_b32 = s0|s1|s2
+            } else if (in.opcode == 0x372) {   // v_or3_b32 = s0|s1|s2
                 uint32_t t = b.ibin(Op_BitwiseOr, val(in.src[0]), val(in.src[1]));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t, val(in.src[2]));
-            } else if (in.opcode == 0x178) {                          // v_xor3_b32 = s0^s1^s2
+            } else if (in.opcode == 0x178) {   // v_xor3_b32 = s0^s1^s2
                 uint32_t t = b.ibin(Op_BitwiseXor, val(in.src[0]), val(in.src[1]));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseXor, t, val(in.src[2]));
-            } else if (in.opcode == 0x36F) {                          // v_lshl_or_b32 = (s0<<(s1&31))|s2
+            } else if (in.opcode == 0x36F) {   // v_lshl_or_b32 = (s0<<(s1&31))|s2
                 uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, b.ibin(Op_ShiftLeftLogical, val(in.src[0]), sh), val(in.src[2]));
-            } else if (in.opcode == 0x345) {                          // v_xad_u32 = (s0^s1)+s2
+            } else if (in.opcode == 0x345) {   // v_xad_u32 = (s0^s1)+s2
                 uint32_t t = b.ibin(Op_BitwiseXor, val(in.src[0]), val(in.src[1]));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, t, val(in.src[2]));
-            } else if (in.opcode == 0x347) {                          // v_add_lshl_u32 = (s0+s1)<<(s2&31)
+            } else if (in.opcode == 0x347) {   // v_add_lshl_u32 = (s0+s1)<<(s2&31)
                 uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
                 vreg[in.dst.value] = b.ibin(Op_ShiftLeftLogical, b.ibin(Op_IAdd, val(in.src[0]), val(in.src[1])), sh);
             } else if (in.opcode == 0x128 || in.opcode == 0x129 || in.opcode == 0x12A) {
@@ -5361,30 +5362,30 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 b.stage_reject_pc = in.pc;
                 b.stage_reject_reason = reason;
                 ok = false;
-            } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
+            } else if (in.opcode == 0x12F) {   // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16_rtz(fv(0), fv(1)); // v_cvt_pkrtz VOP3: RTZ clamp (#452)
-            } else if (in.opcode == 0x103) {                          // v_add_f32 (VOP3 form)
+            } else if (in.opcode == 0x103) {   // v_add_f32 (VOP3 form)
                 b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Add);
                 vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, fv(0), fv(1)));
-            } else if (in.opcode == 0x104) {                          // v_sub_f32 (VOP3 form) = s0 - s1
+            } else if (in.opcode == 0x104) {   // v_sub_f32 (VOP3 form) = s0 - s1
                 vreg[in.dst.value] = fresult(b.fbin(Op_FSub, fv(0), fv(1)));
-            } else if (in.opcode == 0x105) {                          // v_subrev_f32 (VOP3 form) = s1 - s0
+            } else if (in.opcode == 0x105) {   // v_subrev_f32 (VOP3 form) = s1 - s0
                 vreg[in.dst.value] = fresult(b.fbin(Op_FSub, fv(1), fv(0)));
-            } else if (in.opcode == 0x108) {                          // v_mul_f32 (VOP3 form)
+            } else if (in.opcode == 0x108) {   // v_mul_f32 (VOP3 form)
                 b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Mul);
                 vreg[in.dst.value] = fresult(b.fbin(Op_FMul, fv(0), fv(1)));
-            } else if (in.opcode == 0x10F) {                          // v_min_f32 (VOP3 form; NaN -> other operand)
+            } else if (in.opcode == 0x10F) {   // v_min_f32 (VOP3 form; NaN -> other operand)
                 vreg[in.dst.value] = fresult(b.fext2(Glsl_NMin, fv(0), fv(1)));
-            } else if (in.opcode == 0x110) {                          // v_max_f32 (VOP3 form; NaN -> other operand)
+            } else if (in.opcode == 0x110) {   // v_max_f32 (VOP3 form; NaN -> other operand)
                 vreg[in.dst.value] = fresult(b.fext2(Glsl_NMax, fv(0), fv(1)));
-            } else if (in.opcode == 0x107) {                          // v_mul_legacy_f32: DX9 multiply —
+            } else if (in.opcode == 0x107) {   // v_mul_legacy_f32: DX9 multiply —
                 // 0 * x == 0 for ALL x including ±Inf/NaN (that guarantee is WHY compilers emit it,
                 // e.g. attenuation=0 times 1/dist). Plain IEEE FMul gives NaN for 0*Inf, so emit
                 // select(s0==0 || s1==0, 0, s0*s1). ±0.0 both compare equal to 0.0 under FOrdEqual.
                 uint32_t s0b = fv(0), s1b = fv(1), zb = b.uconst(0);
                 uint32_t anyz = b.lor(b.fcmp(Op_FOrdEqual, s0b, zb), b.fcmp(Op_FOrdEqual, s1b, zb));
                 vreg[in.dst.value] = fresult(b.sel(anyz, zb, b.fbin(Op_FMul, s0b, s1b)));
-            } else if (in.opcode == 0x101) {                          // v_cndmask_b32_e64: src2_mask ? src1 : src0
+            } else if (in.opcode == 0x101) {   // v_cndmask_b32_e64: src2_mask ? src1 : src0
                 const Operand& s2 = in.src[2]; uint32_t m = 0;        // src2 is an SGPR-pair (or VCC) wave mask
                 if (s2.value == 106 || s2.value == 107) {
                     // Wave32 e64/SDWA forms may explicitly select either physical VCC word as an
@@ -5419,12 +5420,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // recompiled "successfully" and computed the un-negated value. fv == val when no
                 // modifier bits are set.
                 if (!m) ok = false; else vreg[in.dst.value] = b.sel(m, fv(1), fv(0));
-            } else if (in.opcode == 0x11F) {                          // v_mac_f32_e64 (VOP3 form of VOP2 0x1f)
+            } else if (in.opcode == 0x11F) {   // v_mac_f32_e64 (VOP3 form of VOP2 0x1f)
                 // dst = src0*src1 + dst, with the VOP3 float source modifiers (neg/abs via fv) and output
                 // modifiers (omod/clamp via fresult). The scene VS emits this e64 form with a `-|v10|`
                 // modifier (round-trip: `llvm-mc -mcpu=gfx1010` of 0xd51f020a → v_mac_f32_e64 v10,v28,-|v10|).
                 vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, b.fbin(Op_FMul, fv(0), fv(1)), old_d));
-            } else ok = false;
+            } else
+                ok = false;
             // A set CLAMP bit on an opcode that does not route through fresult means unmodeled
             // INTEGER saturation (ISA 6.5: "for integer operations, it clamps the result to the
             // largest and smallest representable value") or an unhandled pack/select combination

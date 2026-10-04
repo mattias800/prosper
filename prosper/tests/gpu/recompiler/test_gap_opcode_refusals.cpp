@@ -1,5 +1,5 @@
-// test_gap_opcode_refusals — fail-visible refusal pins for six opcodes the compute recompiler
-// decodes but does not lower: v_perm_b32, v_mad_i64_i32, v_div_fixup_f32, v_sad_u8, s_movrels_b32
+// test_gap_opcode_refusals — fail-visible refusal pins for five opcodes the compute recompiler
+// decodes but does not lower: v_mad_i64_i32, v_div_fixup_f32, v_sad_u8, s_movrels_b32
 // and image_gather4 (implicit LOD).
 //
 // Per the recompiler charter an unsupported op is a FATAL gap, and the loud refusal is only the
@@ -166,14 +166,6 @@ TEST(GapOpcodeRefusals, ControlVop3aSiblingCompiles) {
     expect_vop3a_v5_v1_v2_v3(kSadU32, 0x15du);
     expect_compiles(program(kVop3Prologue, {kSadU32[0], kSadU32[1]}), 0xA000ull,
                     "v_sad_u32 v5, v1, v2, v3 with the shared VOP3 prologue");
-}
-
-// V_PERM_B32 v5, v1, v2, v3 (VOP3 0x344).
-TEST(GapOpcodeRefusals, PermB32) {
-    static const uint32_t w[2] = {0xd7440005u, 0x040e0501u};
-    expect_vop3a_v5_v1_v2_v3(w, 0x344u);
-    expect_compiles(program(kVop3Prologue, {w[0], w[1]}), 0xA001ull,
-                    "v_perm_b32 v5, v1, v2, v3");
 }
 
 // V_DIV_FIXUP_F32 v5, v1, v2, v3 (VOP3 0x15f).
