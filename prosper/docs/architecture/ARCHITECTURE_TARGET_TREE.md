@@ -190,15 +190,6 @@ Not settled by this document, and each needs the project owner before it becomes
   guard is a differential test that feeds the same recorded command-buffer stream to both hosts and
   compares what the guest can observe. `CONFIDENCE: LOW` that this is practical, and it has not been
   tried.
-- **Possible consequence of the stub-arm row above, observed and not diagnosed:** on a recent `main`
-  the Windows build of *Dragon Quest VII Reimagined* (`PPSA17942`) ends in a guest fault within about
-  3 s in 3 of 3 `tools/screenshot` runs (two at `libc.prx+0x4270`, the title's fatal-error path, one at
-  `rip=0`), and a `boot_trace` run printed `Apr read failure 1 at CB offset 40` just before the same
-  fault. Its status doc (`docs/games/DRAGON_QUEST_STATUS.md`) records Windows runs of the same title
-  that rendered in 3 of 6 attempts on 2026-08-10 and Linux at rung 3. Whether the difference is a
-  regression since then, this dump or build, or the stubbed arms is **not established**; one
-  experiment that filled the stubbed constructor's output slots with a staging buffer, as the Linux
-  arm does, changed nothing.
 
 ## Tracking
 
