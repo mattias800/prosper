@@ -153,6 +153,7 @@ int main(int argc, char** argv) {
     std::string input_path;
     bool mimg_sites = false;
     bool wave_reasons = false;
+    bool raw_wide_proof = false;
     bool bad_usage = false;
     for (int i = 1; i < argc && !bad_usage; ++i) {
         const std::string arg = argv[i];
@@ -163,6 +164,8 @@ int main(int argc, char** argv) {
             mimg_sites = true;
         } else if (arg == "--wave-reasons") {
             wave_reasons = true;
+        } else if (arg == "--raw-wide-proof") {
+            raw_wide_proof = true;
         } else if (!arg.empty() && arg[0] == '-') {
             bad_usage = true;
         } else if (input_path.empty()) {
@@ -173,6 +176,7 @@ int main(int argc, char** argv) {
     }
     if (input_path.empty() || bad_usage || (mimg_sites && !stage.empty()) ||
         (wave_reasons && !stage.empty()) || (wave_reasons && mimg_sites) ||
+        (raw_wide_proof && (!stage.empty() || mimg_sites || wave_reasons)) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --mimg-sites\n", argv[0]);
@@ -261,6 +265,39 @@ int main(int argc, char** argv) {
         }
         std::printf("mimg-sites-end dwords=%zu consumed=%zu instructions=%zu sites=%zu endpgm=%d\n",
                     words.size(), consumed, instructions.size(), sites, walk_ended ? 1 : 0);
+        return 0;
+    }
+
+    // --raw-wide-proof: the code-only raw-wide SMEM proofs, and nothing else (#4422).
+    //
+    // A numeric reader of an x4/x8 scalar load ("raw wide data") is admitted only when its
+    // source is proven stable and, for a register SOFFSET, the offset's reaching scalar
+    // definition is authenticated against the full stream. Those proofs depend on code alone,
+    // so unlike a stage recompile they are exact over a raw dump. The rows name which of the
+    // three stages a load passes: needs-backing, entry-proven (the same load with SOFFSET
+    // nulled, as the register proof itself evaluates it) and register-proven.
+    if (raw_wide_proof) {
+        const auto needs = rdna2_raw_wide_data_loads(instructions);
+        auto nulled = instructions;
+        for (auto& in : nulled)
+            if (in.fmt == Rdna2Format::SMEM && (in.opcode == 0x2u || in.opcode == 0x3u))
+                in.src[1] = {OperandKind::Special, 125};
+        const auto entry = rdna2_proven_raw_immediate_wide_data_loads(nulled);
+        const auto registered = rdna2_proven_raw_register_wide_data_loads(instructions);
+        const auto has = [](const std::vector<uint32_t>& set, uint32_t pc) {
+            return std::find(set.begin(), set.end(), pc) != set.end();
+        };
+        size_t loads = 0;
+        for (const Rdna2Inst& in : instructions) {
+            if (in.fmt != Rdna2Format::SMEM || (in.opcode != 0x2u && in.opcode != 0x3u)) continue;
+            ++loads;
+            std::printf("raw-wide-load pc=%u op=0x%x sbase=s%d soffset-kind=%d soffset=%d "
+                        "imm=0x%x needs-backing=%d entry-proven=%d register-proven=%d\n",
+                        in.pc, in.opcode, in.src[0].value, static_cast<int>(in.src[1].kind),
+                        in.src[1].value, in.literal, has(needs, in.pc) ? 1 : 0,
+                        has(entry, in.pc) ? 1 : 0, has(registered, in.pc) ? 1 : 0);
+        }
+        std::printf("raw-wide-proof-end instructions=%zu loads=%zu\n", instructions.size(), loads);
         return 0;
     }
 

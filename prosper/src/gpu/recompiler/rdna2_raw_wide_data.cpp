@@ -15,16 +15,15 @@ namespace prosper::gpu {
 // A raw wide load backed by a dispatch-time CPU snapshot cannot observe an earlier shader write
 // to that same guest allocation. Without an alias proof, keep potentially writing instructions
 // on the ordinary unresolved route. Read-only operations remain eligible.
+//
+// One answer for "may this instruction write guest memory": the ISA-table-pinned classifier
+// (rdna2_decode.cpp, exhaustively checked by test_may_write_memory). This used to keep its own
+// MIMG reader list (0x00/0x0e/0x27/0x2f), grown one opcode at a time, so a pure read such as
+// image_sample_l (0x24) counted as a writer here alone. Kena's NGG vertex programs sample after a
+// register-offset descriptor load, and that phantom write forced the load to need backing it
+// could never prove (#4422). MUBUF/MTBUF/SMEM/FLAT already agreed; unlisted opcodes stay writers.
 bool rdna2_may_write_guest_memory(const Rdna2Inst& in) {
-    if (in.fmt == Rdna2Format::FLAT) return rdna2_instruction_may_write_memory(in);
-    if (in.fmt == Rdna2Format::SMEM) return in.opcode >= 0x10u;
-    if (in.fmt == Rdna2Format::MTBUF) return in.opcode > 0x03u;
-    if (in.fmt == Rdna2Format::MUBUF)
-        return !(in.opcode <= 0x03u ||
-                 (in.opcode >= 0x08u && in.opcode <= 0x0fu));
-    if (in.fmt == Rdna2Format::MIMG)
-        return in.opcode != 0x00u && in.opcode != 0x0eu && in.opcode != 0x27u && in.opcode != 0x2fu;
-    return false;
+    return rdna2_instruction_may_write_memory(in);
 }
 
 namespace {
@@ -667,9 +666,14 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                               writer.fmt == Rdna2Format::VOP2 ||
                               writer.fmt == Rdna2Format::VOP3 ||
                               writer.fmt == Rdna2Format::VOPC;
-            // Conservative for implicit writers too: no VALU may intervene in a live VCC
-            // dependency. An earlier VALU before its scalar replacement has no such dependency.
-            if (valu && (needed.test(106) || needed.test(107))) {
+            // Conservative for implicit writers too: no VALU that MAY write VCC may intervene in a
+            // live VCC dependency. cannot_write_vcc admits only encodings that provably leave
+            // VCC alone (VOP1, non-carry VOP2, VOP3A without a mask SDST); VOPC's implicit dst,
+            // the VOP2 carry chain and a VOP3 mask SDST still stop the walk. Kena's NGG vertex
+            // programs schedule a VOP3 v_cndmask_b32 with an explicit SGPR mask between
+            // `s_and_b32 vcc_lo, ...` and `s_load_dwordx4 ..., vcc_lo` (#4422). An earlier VALU
+            // before its scalar replacement has no such dependency.
+            if (valu && (needed.test(106) || needed.test(107)) && !cannot_write_vcc(writer)) {
                 scalar_prefix = false;
                 break;
             }

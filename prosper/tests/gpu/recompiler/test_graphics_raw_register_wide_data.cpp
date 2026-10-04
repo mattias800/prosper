@@ -378,6 +378,58 @@ TEST(GraphicsRawRegisterWideData, Contract) {
                   rdna2_proven_raw_register_wide_data_loads(clobber_decoded).empty() &&
                   compile(stage, clobber, clobber_table).empty(), name,
                   "implicit non-EXEC VCC compare cannot borrow a marked graphics range");
+
+            // #4422: a VALU that provably cannot write VCC may sit between the scalar VCC
+            // definition and the raw load (Kena's NGG vertex programs schedule a VOP3
+            // v_cndmask_b32 with an explicit SGPR mask there). Only VCC writers stop the proof.
+            const auto between = [&](uint32_t w0, uint32_t w1) {
+                auto shaped = prepared_vcc;
+                shaped.insert(shaped.begin() + 2, w0);
+                if (w1) shaped.insert(shaped.begin() + 3, w1);
+                return shaped;
+            };
+            const auto decoded_between = [&](const std::vector<uint32_t>& shaped) {
+                const auto decoded = decode(shaped);
+                const auto& in = decoded.at(2u);
+                std::printf("[decode-control] %s x%u word=0x%08x pc=%u fmt=%d opcode=0x%x "
+                            "dst=%d sdst=%d len=%u\n",
+                            name, wide8 ? 8u : 4u, shaped[2], in.pc, static_cast<int>(in.fmt),
+                            in.opcode, in.dst.value, in.sdst.value, in.len_dwords);
+                return decoded;
+            };
+            const auto mov = between(0x7e020300u, 0u);   // v_mov_b32 v1, v0
+            const auto mov_decoded = decoded_between(mov);
+            auto mov_table = prepared_vcc_table;
+            mov_table.resources.front().fetch_pc = 3u;
+            check(mov_decoded.at(2u).fmt == Rdna2Format::VOP1 && mov_decoded.at(2u).opcode == 1u &&
+                      mov_decoded.at(2u).dst.kind == OperandKind::VGPR &&
+                      mov_decoded.at(2u).dst.value == 1 &&
+                      rdna2_proven_raw_register_wide_data_loads(mov_decoded) ==
+                          std::vector<uint32_t>{3u} &&
+                      !compile(stage, mov, mov_table).empty(),
+                  name, "a VCC-transparent VOP1 between scalar VCC and the load keeps admission");
+            // v_cndmask_b32 v1, v0, v0, s[0:1] (VOP3A, explicit mask source, no SDST).
+            const auto cndmask_decoded = decoded_between(between(0xd5010001u, 0x00020100u));
+            check(cndmask_decoded.at(2u).fmt == Rdna2Format::VOP3 &&
+                      cndmask_decoded.at(2u).opcode == 0x101u &&
+                      cndmask_decoded.at(2u).dst.kind == OperandKind::VGPR &&
+                      cndmask_decoded.at(2u).len_dwords == 2u &&
+                      rdna2_proven_raw_register_wide_data_loads(cndmask_decoded) ==
+                          std::vector<uint32_t>{4u},
+                  name, "a VOP3 cndmask with an explicit mask keeps the scalar VCC proof");
+            // v_add_co_ci_u32 v1, vcc, v0, v0, vcc: VOP2 carry chain writes VCC implicitly.
+            const auto carry_decoded = decoded_between(between(0x50020100u, 0u));
+            check(carry_decoded.at(2u).fmt == Rdna2Format::VOP2 &&
+                      carry_decoded.at(2u).opcode == 0x28u &&
+                      rdna2_proven_raw_register_wide_data_loads(carry_decoded).empty(),
+                  name, "an implicit VOP2 carry-out still clobbers scalar VCC");
+            // v_add_co_u32 v1, vcc_lo, v0, v0: VOP3B with VCC as its explicit carry SDST.
+            const auto sdst_decoded = decoded_between(between(0xd70f6a01u, 0x00020100u));
+            check(sdst_decoded.at(2u).fmt == Rdna2Format::VOP3 &&
+                      sdst_decoded.at(2u).opcode == 0x30fu &&
+                      sdst_decoded.at(2u).sdst.value == 106 &&
+                      rdna2_proven_raw_register_wide_data_loads(sdst_decoded).empty(),
+                  name, "a VOP3B carry SDST naming VCC still clobbers scalar VCC");
         }
 
         // A raw descriptor bundle may be patched before its exact-PC consumer. Its words never
