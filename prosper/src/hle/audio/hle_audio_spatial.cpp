@@ -33,12 +33,15 @@
 
 namespace prosper {
 
-#define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
-                                                        uint64_t a3, uint64_t a4, uint64_t a5)
+#define HLE(name)                                                                                  \
+    static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,      \
+                                          uint64_t a4, uint64_t a5)
 
 namespace {
 
-constexpr uint64_t sext32(uint32_t v) { return (uint64_t)(int64_t)(int32_t)v; }
+constexpr uint64_t sext32(uint32_t v) {
+    return (uint64_t)(int64_t)(int32_t)v;
+}
 
 // libSceAudio3d facility (0x80EA): the module's own error-to-string table (+0x1040) names
 // 0x80EA0002 "port does not exist", 0x80EA0004 "invalid parameter", 0x80EA0006 "out of
@@ -97,7 +100,9 @@ uint32_t g_a3_depth = kA3DefaultQueueDepth;
 uint32_t g_a3_buffer_mode = kA3DefaultBufferMode;
 
 // Caller holds g_a3_mx. The module maps only id 0, and only while the port is open.
-bool a3_port_live(uint64_t id) { return (uint32_t)id == kA3Port && g_a3_port_open; }
+bool a3_port_live(uint64_t id) {
+    return (uint32_t)id == kA3Port && g_a3_port_open;
+}
 
 std::mutex g_acm_mx;
 std::array<bool, 8> g_acm_used{};
@@ -160,18 +165,13 @@ HLE(audio3d_port_open) {
     // The parser accepts these four sizes exactly (no masking) and fills the missing fields:
     // 0x10 -> buffer_mode 0; 0x18 -> buffer_mode 1; beds default to 2 below 0x28.
     switch (size_this) {
-        case 0x10:
-            buffer_mode = 0;
-            break;
-        case 0x18:
-            buffer_mode = 1;
-            break;
+        case 0x10: buffer_mode = 0; break;
+        case 0x18: buffer_mode = 1; break;
         case 0x20:
         case 0x28:
             if (!load_u32(a1 + 0x18, &buffer_mode)) return kA3ErrInvalidParam;
             break;
-        default:
-            return kA3ErrInvalidParam;
+        default: return kA3ErrInvalidParam;
     }
     if (size_this >= 0x18 &&
         (!load_u32(a1 + 0x10, &max_objects) || !load_u32(a1 + 0x14, &queue_depth)))
@@ -294,7 +294,7 @@ HLE(acm_batch_wait) {
 }
 
 void register_audio_spatial_hle() {
-    #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+#define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     // libSceAudio3d: one local port, module-evidenced 0x80EA00xx errors.
     R("sceAudio3dInitialize", audio3d_initialize);
     R("sceAudio3dTerminate", audio3d_terminate);
@@ -311,8 +311,8 @@ void register_audio_spatial_hle() {
     R("sceAcmBatchStartBuffer", acm_batch_start_buffer);
     R("sceAcmBatchStartBuffers", acm_batch_start_buffers);
     R("sceAcmBatchWait", acm_batch_wait);
-    // libSceAudioPropagation is deliberately left unregistered (see the file header).
-    #undef R
+// libSceAudioPropagation is deliberately left unregistered (see the file header).
+#undef R
 }
 
-}  // namespace prosper
+}   // namespace prosper

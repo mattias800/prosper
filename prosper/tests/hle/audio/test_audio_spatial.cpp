@@ -16,9 +16,13 @@
 using namespace prosper;
 
 using HleFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-static uint64_t addr(const void* p) { return (uint64_t)(uintptr_t)p; }
+static uint64_t addr(const void* p) {
+    return (uint64_t)(uintptr_t)p;
+}
 
-static constexpr uint64_t sx(uint32_t v) { return (uint64_t)(int64_t)(int32_t)v; }
+static constexpr uint64_t sx(uint32_t v) {
+    return (uint64_t)(int64_t)(int32_t)v;
+}
 static constexpr uint64_t kInvalidPort = sx(0x80EA0002u);
 static constexpr uint64_t kInvalidParam = sx(0x80EA0004u);
 static constexpr uint64_t kNoResources = sx(0x80EA0006u);
@@ -82,11 +86,20 @@ TEST(AudioSpatial, RegisteredNidsBound) {
     // The 14 functions this file registers (the three libraries export 31/10/28 in 3.20; the rest
     // stay unregistered). libSceAudioPropagation is deliberately absent.
     static const char* registered[] = {
-        "sceAudio3dInitialize", "sceAudio3dTerminate", "sceAudio3dGetDefaultOpenParameters",
-        "sceAudio3dPortOpen", "sceAudio3dPortClose", "sceAudio3dPortSetAttribute",
-        "sceAudio3dPortGetQueueLevel", "sceAudio3dPortAdvance", "sceAudio3dPortPush",
-        "sceAcmContextCreate", "sceAcmContextDestroy", "sceAcmBatchStartBuffer",
-        "sceAcmBatchStartBuffers", "sceAcmBatchWait",
+        "sceAudio3dInitialize",
+        "sceAudio3dTerminate",
+        "sceAudio3dGetDefaultOpenParameters",
+        "sceAudio3dPortOpen",
+        "sceAudio3dPortClose",
+        "sceAudio3dPortSetAttribute",
+        "sceAudio3dPortGetQueueLevel",
+        "sceAudio3dPortAdvance",
+        "sceAudio3dPortPush",
+        "sceAcmContextCreate",
+        "sceAcmContextDestroy",
+        "sceAcmBatchStartBuffer",
+        "sceAcmBatchStartBuffers",
+        "sceAcmBatchWait",
     };
     for (const char* name : registered)
         EXPECT_NE(Hle::lookup(nid_hash(name)), nullptr) << name << " is not registered";
@@ -129,7 +142,8 @@ TEST(Audio3d, InitializeAndTerminate) {
     Params p(0x20);
     uint32_t id = kSentinel;
     ASSERT_EQ(a.open(kUser, p.ptr(), addr(&id), 0, 0, 0), 0u);
-    EXPECT_EQ(a.terminate(0, 0, 0, 0, 0, 0), kNotReady) << "terminate refuses while the port is open";
+    EXPECT_EQ(a.terminate(0, 0, 0, 0, 0, 0), kNotReady)
+        << "terminate refuses while the port is open";
     ASSERT_EQ(a.close(id, 0, 0, 0, 0, 0), 0u);
     EXPECT_EQ(a.terminate(0, 0, 0, 0, 0, 0), 0u);
     EXPECT_EQ(a.open(kUser, p.ptr(), addr(&id), 0, 0, 0), kNotReady) << "terminated again";
