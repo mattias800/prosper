@@ -16,6 +16,10 @@ runs and an ON counterpart, with matching recorded input intervals. Its shader-r
 HOLD remains visible. Dead Cells' unchanged scripted OFF/ON pair reached its menu and two
 gameplay/HUD captures per arm, with no counted draw/dispatch losses. Three of fourteen original
 phase comparisons are documented, eleven remain.
+After those game runs, test-only contributor PR #4386 merged as
+**9b2f0681772ad70972233244868010db0ffc8af8**. This draft is based on that latest remote main.
+The retained app and game observations remain the actual **ee9dcb1e** cohort; refresh its embedded
+revision and inspect the new test registration before the next latest-main run.
 Performance measurements must use a verified scripted route and matching admitted scenes;
 explicitly selected splash/title populations must stay separate from in-level gameplay.
 
@@ -666,6 +670,16 @@ historical sky seam/HUD/partial-model rendering HOLD remains a hold until curren
   review. Latest read-only checks show #4331 closed without merge, #4189 open at its previously
   rejected unchanged head, and #4323 still draft. Do not duplicate unchanged reviews/pings.
   #4189's author said revisions are planned; leave it open.
+- Solo follow-up: #4386 received registered exact-head APPROVED review5406442176 and merged
+  as9b2f0681772ad70972233244868010db0ffc8af8. Its synthetic decoder tests do not change shipping
+  rendering. The unmodified merge gate returned2 for an empty check list; the owner CI waiver
+  was applied with independently verified published status, fork tip and expected merge head.
+  No author test/build was duplicated or unrun full-suite result claimed. #4388 received registered
+  REJECTED review5406475111 at unchangedea727b704fb7c0fe772b2c2086933c9da3e7d877: numeric
+  execution coverage is missing for the four new lowerings, and the nested recompiler instructions
+  require factoring the new work out of the already oversized emitter. It remains open for author
+  revision; no fix job was started. #4387 is draft and was skipped. Both review worktrees were
+  removed, private reviewed diffs/receipts retained, and this draft rebased onto current main.
 - The incoming author, independent reviewer and builder completed #4382 and are parked. Other
   CPU/Outer-Wilds lanes were already parked; Silent Hill was asked to finish its existing historical
   result handoff and park. Subsequent owner authorization allowed the app qualification and small
