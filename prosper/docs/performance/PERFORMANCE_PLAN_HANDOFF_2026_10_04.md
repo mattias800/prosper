@@ -97,8 +97,48 @@ the actual commands, closure, installed inputs, immutable app and linked revisio
 **99846a02b86bcfdca380556dba429c88b3ca6071e685e7fa788f7108647a2125**.
 It supplements the original quota capsule without rewriting that historical snapshot.
 
-The next action is a fresh visible Messenger OFF/ON using the exact reviewed icon-query helper.
-No current-cohort game guard or performance arm has run at this checkpoint.
+The next step was fresh visible Messenger OFF/ON using the exact reviewed icon-query helper.
+The OFF follow-up below has now run; no current-cohort performance arm has run.
+
+## Follow-up checkpoint: Messenger OFF visual arm complete, ON pending
+
+The actual ee9dcb1e normal app ran for **320.351 s** with deferred waits OFF, fresh isolated
+save/cache/run state, texture cap 1024 MiB, simulated heap 8192 MiB, target budget 2048 MiB and
+count 256. This was a visible compatibility run; concurrent workloads were allowed and no
+performance population was admitted. No owner input was requested; input beyond the script was
+not instrumented. The previous e291 partial run was not reused or relabeled.
+
+Root inspected all four native captures: title at requested/actual 500, selectable Play/Options
+at 2000, first-level dock/player/world/health/flame HUD at 15000, and a second complete gameplay
+HUD frame requested at 18000 and actually captured at **18001**. Ordinals are identified from the
+actual capture files; phase admission comes from inspecting their pixels.
+
+Actual app, runner and launcher exits were **0**. There were **31 owned normal-window samples**,
+one initial not-yet-viewable startup sample, and an owned before-cutoff sample. Both owned births
+drained; the post-run process census found no prosper-app. Samples do not prove uninterrupted
+visibility or scanout. The corrected icon-query helper completed this run without the historical
+output-bound failure.
+
+All emitted alarms and the exit summary were read. The F32 arithmetic rule fired in **63/63**
+completed windows, with 512108 known-launch-mode requests retained; RTT-colorless-publication
+remains **NO_DATA**. Summed raw completed-window counters were 18844 flips, 18635 presents,
+**0 dropped frontend/contract/backend draws**, **0 skipped dispatches**, **0 deferred submissions**
+and **0 target evictions**. Graphics device timestamps covered 61876/61876 waits. This OFF arm
+does not prove ON-path exercise or fresh delivered-frame FPS. The shutdown `submit=-4` record
+has `submit-origin=shutdown-gate-refused`, a pre-driver sentinel; it does not establish hardware
+device loss. Draw-disposition quiescence remains explicitly unverified.
+
+A separate private OFF supplement preserves all native frames, save/cache state, metadata,
+alarms, raw ledger, grant and root judgments: **37,642,240 bytes**, **294 regular members verified**,
+no mismatch; archive SHA256
+**ecc20f3105dbb46cb445043c194ee0c4d8a8caf02f5f8007e8062dd43a3d5552**.
+The first data-only summary incorrectly demanded an owned window even during startup; actual
+startup evidence showed one expected not-yet-viewable sample. Admission was corrected to require
+first owned within 120 s, all later samples owned, and owned before cutoff. No game/test was rerun.
+
+**One of the original 28 OFF/ON arms is complete; no title pair is complete yet.** Next: Messenger
+ON with the same immutable app and fresh state, inspect all native images, check actual deferred
+and blocked counts, retain every alarm and exit record, then checkpoint the pair.
 
 ## Retained app/source cohorts
 
