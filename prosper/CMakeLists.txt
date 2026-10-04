@@ -2696,6 +2696,22 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/execute/test_cached_shader_moves.cpp
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_shader_source_window
+    SOURCES tests/gpu/execute/test_shader_source_window.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  # Cache switches are process-cached. These distinct processes exercise the actual bypass paths.
+  foreach(source_policy IN ITEMS analysis_off decode_off both_off)
+    add_test(NAME shader_source_window_${source_policy}
+      COMMAND test_shader_source_window --gtest_filter=ShaderSourceWindow.*)
+  endforeach()
+  set_tests_properties(shader_source_window_analysis_off PROPERTIES
+    ENVIRONMENT "PROSPER_NO_SHADER_ANALYSIS_CACHE=1")
+  set_tests_properties(shader_source_window_decode_off PROPERTIES
+    ENVIRONMENT "PROSPER_NO_SHADER_DECODE_CACHE=1")
+  set_tests_properties(shader_source_window_both_off PROPERTIES
+    ENVIRONMENT "PROSPER_NO_SHADER_ANALYSIS_CACHE=1;PROSPER_NO_SHADER_DECODE_CACHE=1;PROSPER_NO_SHADER_CACHE=1")
+
   add_executable(test_shader_recompile_cache tests/gpu/execute/test_shader_recompile_cache.cpp)
   add_executable(fragment_compile_replay tools/fragment_compile_replay/main.cpp)
   target_link_libraries(fragment_compile_replay PRIVATE prosper_core)

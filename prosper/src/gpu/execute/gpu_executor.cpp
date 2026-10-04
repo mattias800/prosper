@@ -932,14 +932,13 @@ uint64_t shader_decode_cache_limit_bytes() {
 }
 
 std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, size_t dwords) {
+    dwords = shader_source_dwords(uint64_t(uintptr_t(code)), dwords);
     auto decode = [&] {
         auto result = std::make_shared<DecodedShader>();
         result->source_dwords = dwords;
         if (!code || !dwords) return result;
-        // Folded instructions and the code-only control proof must describe one byte version.
-        // Reading the guest stream during decode and copying it afterward can pair two versions
-        // when a shader is rewritten at the same address.
-        const std::vector<uint32_t> snapshot(code, code + dwords);
+        // Fold/proof share one bounded byte version; truncated encoded operands are not zeros.
+        const std::vector<uint32_t> snapshot = shader_source_snapshot(code, dwords);
         std::vector<Rdna2Inst> decoded;
         const size_t consumed = rdna2_walk(snapshot.data(), snapshot.size(), decoded);
         result->code.assign(snapshot.begin(), snapshot.begin() + consumed);
@@ -1132,7 +1131,7 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         cache.entries.erase(oldest);
         ++cache.stats.evictions;
     }
-    if (decoded->bytes <= limit && max_entries != 0) {
+    if (!decoded->code.empty() && decoded->bytes <= limit && max_entries != 0) {
         cache.entries[address] = {decoded, ++cache.use_counter};
         cache.stats.bytes += decoded->bytes;
     }
@@ -1152,11 +1151,12 @@ uint64_t shader_analysis_cache_limit_bytes() {
 
 std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint32_t* code,
                                                                       size_t dwords) {
+    dwords = shader_source_dwords(uint64_t(uintptr_t(code)), dwords);
     auto analyze = [&] {
         auto result = std::make_shared<ShaderCodeAnalysis>();
         result->identity = ++g_next_shader_analysis_identity;
         result->source_dwords = dwords;
-        const size_t span = rdna2_recompile_code_span(code, dwords);
+        const size_t span = shader_source_code_span(code, dwords);
         result->bounded_span = span < dwords;
         if (code && span) result->code.assign(code, code + span);
         result->code_hash = hash_shader_code(result->code);
@@ -1178,11 +1178,8 @@ std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint3
 
     if (!code || !dwords) return analyze();
     auto& cache = shader_analysis_cache();
-    // #2395: was a getenv PER LOOKUP -- 1,697,925 of them in one Blue Prince gameplay run,
-    // and `getenv` showed at 1.34% of total CPU in a profile of that run. The environment
-    // cannot change under a running process, so reading it once is not merely an
-    // optimisation, it is the correct semantics. Same hoist as #2214 did for the live
-    // renderer's per-resource reads.
+    // Process-lifetime bypass preserves the stable environment contract (#2395/#2214).
+    // Per-lookup getenv previously cost 1,697,925 calls / 1.34% CPU in a Blue Prince window.
     static const bool bypass_analysis_cache = getenv("PROSPER_NO_SHADER_ANALYSIS_CACHE") != nullptr;
     if (bypass_analysis_cache) {
         std::lock_guard lock(cache.mutex);
@@ -1251,7 +1248,7 @@ std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint3
         cache.entries.erase(oldest);
         ++cache.stats.evictions;
     }
-    if (analysis->bytes <= limit && max_entries != 0) {
+    if (!analysis->code.empty() && analysis->bytes <= limit && max_entries != 0) {
         cache.entries[address] = {analysis, ++cache.use_counter};
         cache.stats.bytes += analysis->bytes;
     }
@@ -1383,9 +1380,7 @@ ShaderCompileKey make_shader_compile_key(
             compute_config->storage_buffer_int64_atomics;
         key.compute_packed_r11_storage = compute_config->packed_r11_storage;
     }
-    // A live fragment draw may already own the exact byte-validated version used for its
-    // interpolation and export metadata. Reuse only that draw-local ownership; ordinary callers
-    // still validate by address here, and every later draw acquires afresh.
+    // Reuse only the draw-local byte version; ordinary cold callers authenticate their range.
     const SharedShaderAnalysis analysis =
         stage == ShaderProgramStage::Fragment && captured_analysis ? captured_analysis
         : code && dwords ? analyze_shader_code_cached(code, dwords) : nullptr;
@@ -2103,7 +2098,9 @@ FragmentInterpolationLayout fragment_interpolation_layout_cached(
 uint32_t fragment_consumed_attribute_mask_cached(const uint32_t* code, size_t dwords) {
     static const bool no_cache = getenv("PROSPER_NO_SHADER_ANALYSIS_CACHE") != nullptr;
     const auto analysis = no_cache ? nullptr : analyze_shader_code_cached(code, dwords);
-    if (!analysis) return fragment_consumed_attribute_mask(code, dwords);
+    if (!analysis)
+        return fragment_consumed_attribute_mask(
+            code, shader_source_dwords(uint64_t(uintptr_t(code)), dwords));
     return fragment_consumed_attribute_mask_for_analysis(analysis);
 }
 
@@ -2235,6 +2232,7 @@ std::vector<uint32_t> recompile_compute_shader_cached(
         const uint32_t* code, size_t dwords, const ShaderResourceTable* resources,
         const ComputeShaderConfig& config, uint64_t* cache_identity,
         RecompileDiagnosticContext diagnostic, bool* writes_trip_witness) {
+    dwords = shader_source_dwords(uint64_t(uintptr_t(code)), dwords);
     if (cache_identity) *cache_identity = 0;
     if (writes_trip_witness) *writes_trip_witness = false;
     const bool has_null_guarded_raw_store = resources &&
@@ -3227,6 +3225,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                       uint32_t pcrel_dispatch_target,
                       const PcrelDispatchInfo* pcrel_dispatch,
                       const uint32_t* system_sgprs, uint32_t nsystem_sgprs, FoldReader* reader) {
+    dwords = shader_source_dwords(uint64_t(uintptr_t(code)), dwords);
     static const bool capture_enabled = std::getenv("PROSPER_FOLD_CAPTURE_DIR") != nullptr;
     if (!reader && capture_enabled) {
         std::vector<DynFetch> captured;
