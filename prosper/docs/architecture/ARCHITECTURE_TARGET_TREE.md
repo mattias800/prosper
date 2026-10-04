@@ -169,28 +169,30 @@ Every structural cost identified in the ratchet work is either a rule in
 | giant functions | **not checkable here**: needs a parser to find function extents. Owned by the separate clang-tidy PR as `readability-function-size`. | -- |
 | per-draw object creation proven at run time | **not checkable statically**; the steady-state performance invariants in #4193 own it | -- |
 
-## Open questions
+## Standards
 
-Not settled by this document beyond what is stated below, and each needs the project owner before it becomes a move.
+Rules for new and moved code under this target tree. They take effect as the layers they name are
+approved (the `guest/` layer is moves 4 and 5 above); where a ratchet rule enforces one it is named,
+and where none does the standard is a review rule until one exists.
 
-- **Where does a cross-cutting HLE area live? Placement, as proposed here (planned move 12).** The
-  target tree places layers, not functional areas, and APR (`sceAmpr*`, and the file reads and
-  event-queue completions behind it) spans `hle/memory`, `hle/fs` and `hle/kernel` today. Keep `hle/` as
-  the API surface only (NID handlers, argument decoding, return codes) and put the engine behind it in
-  `guest/`: the command buffer model, the executor and the completion dialects, written once and
-  platform-neutral, reaching the OS only through `src/host/platform/` interfaces (`vm`, `file`,
-  `clock`). The engine implements guest-visible coprocessor semantics rather than a Sony API, which is
-  what the proposed `guest/` layer is for, and the split is the established one in compatibility layers
-  (Wine's per-platform backend behind a portable service; HLE service handlers over a shared
-  emulated-hardware core in console emulators). The handlers then have no platform arm to fall behind.
-  This follows the document's own layering and the seam's one-interface-per-service rule. It is a
-  proposal like the rest of the target tree, so it waits on the owner approving the `guest/` layer
-  (moves 4 and 5); no APR code has been moved to test it. `CONFIDENCE: MED`.
-- **What keeps two platform arms in step?** `HOST_PLATFORM_SEAM.md` asks for a test per interface
-  that runs on both hosts, but nothing detects a platform arm that was never ported. One possible
-  guard is a differential test that feeds the same recorded command-buffer stream to both hosts and
-  compares what the guest can observe. `CONFIDENCE: LOW` that this is practical, and it has not been
-  tried.
+1. **`hle/` is the API surface; engines live in `guest/`.** A cross-cutting HLE area such as APR
+   (`sceAmpr*`, and the file reads and event-queue completions behind it, spread today over `hle/memory`,
+   `hle/fs` and `hle/kernel`) keeps only its NID handlers, argument decoding and return codes in `hle/`.
+   Its engine (command buffer model, executor, completion dialects) lives once in `src/guest/`, because
+   it implements guest-visible coprocessor semantics rather than a Sony API. This is the established
+   split in compatibility layers: Wine's per-platform backend behind a portable service, and HLE service
+   handlers over a shared emulated-hardware core in console emulators. Planned move 12.
+2. **Portable logic is written once; a platform arm holds primitives only.** An engine reaches the OS
+   through the `src/host/platform/` interfaces (`vm`, `file`, `clock`, ...) and nothing else, so no
+   platform arm can be a stub or reduced copy of another arm's logic. Enforced today only in part: the
+   `platform-ifdef` and `layer-include` rules catch directives and includes, not a divergent arm (see
+   the stub-arm row in "Bad practices").
+3. **Each engine ships a replay test that runs on both hosts.** A recorded command-buffer stream from a
+   real title is fed to the engine, and the test asserts what the guest can observe (memory contents
+   and delivered events). It extends the seam's one-test-per-interface rule from the OS services to
+   the engines above them, and it is how a platform arm that was never ported becomes a red test
+   instead of a title-by-title discovery. `CONFIDENCE: LOW` on how practical this is for large streams:
+   it has not been tried.
 
 ## Tracking
 
