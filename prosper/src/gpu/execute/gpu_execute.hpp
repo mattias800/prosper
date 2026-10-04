@@ -64,6 +64,8 @@ using SharedShaderWords = std::shared_ptr<const std::vector<uint32_t>>;
 struct GraphicsReadSource {
     SharedShaderWords words;
     std::shared_ptr<const std::vector<RawNestedWideChain>> chains;
+    // MAY metadata from this same immutable version; never ordered-read authority.
+    bool requires_owned_waves = false;
 };
 GraphicsReadSource registered_graphics_read_source(uint64_t address);
 
@@ -527,8 +529,12 @@ std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
 struct GraphicsRawSnapshotContext;
 bool draw_requires_owned_nested_snapshot(const GpuState& state);
 bool graphics_program_requires_owned_waves(uint64_t address);
+// Pure MAY inventory of the immutable consumed prefix; no input or read-point authority.
+bool graphics_original_requires_owned_waves(const std::vector<uint32_t>& source);
 // Aliasing immutable analysis owner for the complete registered stream; no caller rereads code.
-SharedShaderWords registered_graphics_original(uint64_t address);
+// Optional MAY fact is false on refusal and never replaces live-input/admission proofs.
+SharedShaderWords registered_graphics_original(uint64_t address,
+                                               bool* requires_owned_waves = nullptr);
 bool prepare_draw_owned_waves(const GpuState& state, const GpuState::Draw* draw,
                               uint64_t vertex_address, uint64_t fragment_address,
                               uint32_t vertex_count, FloatTransportConfig profile,

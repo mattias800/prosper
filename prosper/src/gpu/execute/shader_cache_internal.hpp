@@ -560,6 +560,8 @@ struct DecodedShader {
     std::vector<RawNestedWideChain> owned_raw_x2_chains;
     RawSnapshotWritePlan owned_raw_x2_write_plan;
     std::vector<uint32_t> raw_nested_numeric_load_pcs;
+    // MAY classification of the consumed original prefix, never a live-input/admission proof.
+    bool requires_owned_waves = false;
     // Full-stream inventory: specialization may remove a spill but cannot introduce one.
     std::bitset<256> scalar_spill_written_vgprs;
     size_t source_dwords = 0;

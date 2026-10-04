@@ -29,15 +29,30 @@ size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_add
     return dwords;
 }
 
-bool graphics_program_requires_owned_waves(uint64_t address) {
-    const auto* header =
-        static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(address));
-    if (!header) return false;
-    const auto source = registered_graphics_original(address);
-    if (!source) return false;
+bool graphics_original_requires_owned_waves(const std::vector<uint32_t>& source) {
+    // Match the registered-original consumer exactly, including a truncated final instruction:
+    // walk only its owned consumed prefix, not the unconsumed snapshot tail.
     std::vector<Rdna2Inst> original;
-    rdna2_walk(source->data(), source->size(), original);
+    rdna2_walk(source.data(), source.size(), original);
     return !rdna2_raw_wave_wide_data_loads(original).empty();
+}
+
+SharedShaderWords registered_graphics_original(uint64_t address, bool* requires_owned_waves) {
+    if (requires_owned_waves) *requires_owned_waves = false;
+    const auto source = registered_graphics_read_source(address);
+    if (requires_owned_waves) *requires_owned_waves = source.requires_owned_waves;
+    return source.words;
+}
+
+bool graphics_program_requires_owned_waves(uint64_t address) {
+    bool requires_owned_waves = false;
+    const auto source = registered_graphics_original(address, &requires_owned_waves);
+    if (!source) return false;
+    // Diagnostic algorithm control: same immutable source/decision, no admission or input change.
+    // Only this MAY memo is bypassed; existing decode/fold caches retain their normal policy.
+    return PROSPER_ENV_ON("PROSPER_NO_OWNED_WAVE_CLASSIFICATION_CACHE")
+               ? graphics_original_requires_owned_waves(*source)
+               : requires_owned_waves;
 }
 
 bool prepare_draw_owned_waves(const GpuState& state, const GpuState::Draw* draw,
