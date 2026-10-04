@@ -6,7 +6,11 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/storage_dst_sel.hpp"
+#include "gpu/recompiler/rdna2_dot.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
+#include "gpu/recompiler/rdna2_sad.hpp"
+#include "gpu/recompiler/rdna2_perm_b32.hpp"
+#include "gpu/recompiler/rdna2_div_fixup.hpp"
 #include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#325)
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -35,9 +39,7 @@
 
 namespace prosper::gpu {
 
-
 namespace {
-
 
 // The f16 bit pattern an inline float constant supplies in a 16-bit operand position (ISA Table 10
 // lists per-width encodings: "0.5 ... half: 0x3800" etc.). Only 1/(2*pi) (code 248, 0x3118) differs
@@ -2776,6 +2778,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
+            if (in.opcode >= 0x14u && in.opcode <= 0x19u) {
+                const uint32_t old_d = vreg_old(b, rs, in.dst.value);
+                rs.vreg[in.dst.value] = emit_v_dot(b, rs, in, ok);
+                if (ok) predicate_write(b, rs, in.dst.value, old_d);
+                return true;
+            }
             // Mixed-precision FMA family, trivial form only (all sources full f32 — the decoder set
             // has_modifier for any opsel/neg/clamp bits, rejected above). v_fma_mix_f32 (0x20):
             // d = s0*s1+s2. v_fma_mixlo/hi_f16 (0x21/0x22): the f32 result converts to f16 into the
@@ -4894,29 +4902,42 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                          b.lor(b.fcmp(Op_FUnordNotEqual, s1, s1),
                                                b.fcmp(Op_FUnordNotEqual, s2, s2)));
                 vreg[in.dst.value] = fresult(b.sel(nan_any, min3, med));
-            } else if (in.opcode == 0x159) {                          // v_med3_u32
-                // Unsigned median of three values: max(min(a,b), min(max(a,b),c)).
-                // Astro Bot uses this to clamp a material index into [0,31] before its world-map
-                // depth prepass. VERIFIED(llvm-mc gfx1030: VOP3 0x159 = v_med3_u32).
+            } else if (in.opcode == 0x158 || in.opcode == 0x159) {   // v_med3_i32 / v_med3_u32
+                // Median of three values: max(min(a,b), min(max(a,b),c)).
+                // Astro Bot uses v_med3_u32 to clamp a material index into [0,31] before its world-map
+                // depth prepass. VERIFIED(llvm-mc gfx1030: VOP3 0x158 = v_med3_i32, 0x159 = v_med3_u32).
                 const uint32_t s0 = val(in.src[0]), s1 = val(in.src[1]), s2 = val(in.src[2]);
-                const uint32_t mn = b.uext2(Glsl_UMin, s0, s1);
-                const uint32_t mx = b.uext2(Glsl_UMax, s0, s1);
-                vreg[in.dst.value] = b.uext2(Glsl_UMax, mn, b.uext2(Glsl_UMin, mx, s2));
-            } else if (in.opcode == 0x153 || in.opcode == 0x156) {    // v_min3_u32 / v_max3_u32
-                // Unsigned min/max of three values. Sonic Racing: CrossWorlds' post chain rejects on
-                // v_max3_u32 four times per boot (#2013); v_min3_u32 is its neighbour in the same
-                // ISA family and the same lowering. VERIFIED(round-trip llvm-mc gfx1030: VOP3
-                // 0x153 = v_min3_u32, 0x156 = v_max3_u32). CONFIDENCE: HIGH.
-                const uint32_t op = in.opcode == 0x153 ? (uint32_t)Glsl_UMin : (uint32_t)Glsl_UMax;
+                const bool is_signed = (in.opcode == 0x158);
+                const uint32_t min_op = is_signed ? (uint32_t)Glsl_SMin : (uint32_t)Glsl_UMin;
+                const uint32_t max_op = is_signed ? (uint32_t)Glsl_SMax : (uint32_t)Glsl_UMax;
+                auto ext2 = [&](uint32_t op, uint32_t a, uint32_t b_val) {
+                    return is_signed ? b.sext2(op, a, b_val) : b.uext2(op, a, b_val);
+                };
+                const uint32_t mn = ext2(min_op, s0, s1);
+                const uint32_t mx = ext2(max_op, s0, s1);
+                vreg[in.dst.value] = ext2(max_op, mn, ext2(min_op, mx, s2));
+            } else if (in.opcode == 0x152 || in.opcode == 0x153 || in.opcode == 0x155 ||
+                       in.opcode == 0x156) {   // v_min3_{i32,u32} / v_max3_{i32,u32}
+                // Signed/unsigned min/max of three values. Sonic Racing: CrossWorlds' post chain rejects on
+                // v_max3_u32 four times per boot (#2013); signed forms round out the 32-bit triple-min/max family.
+                // VERIFIED(round-trip llvm-mc gfx1030: VOP3 0x152 = v_min3_i32, 0x153 = v_min3_u32,
+                // 0x155 = v_max3_i32, 0x156 = v_max3_u32). CONFIDENCE: HIGH.
+                const bool is_min = (in.opcode == 0x152 || in.opcode == 0x153);
+                const bool is_signed = (in.opcode == 0x152 || in.opcode == 0x155);
+                const uint32_t op = is_min
+                                        ? (is_signed ? (uint32_t)Glsl_SMin : (uint32_t)Glsl_UMin)
+                                        : (is_signed ? (uint32_t)Glsl_SMax : (uint32_t)Glsl_UMax);
                 vreg[in.dst.value] =
-                    b.uext2(op, b.uext2(op, val(in.src[0]), val(in.src[1])), val(in.src[2]));
-            } else if (in.opcode == 0x151 || in.opcode == 0x154) {    // v_min3_f32 / v_max3_f32
+                    is_signed
+                        ? b.sext2(op, b.sext2(op, val(in.src[0]), val(in.src[1])), val(in.src[2]))
+                        : b.uext2(op, b.uext2(op, val(in.src[0]), val(in.src[1])), val(in.src[2]));
+            } else if (in.opcode == 0x151 || in.opcode == 0x154) {   // v_min3_f32 / v_max3_f32
                 // min/max of three floats (DOLL's AA-clamp PS). VERIFIED(round-trip llvm-mc gfx1010:
                 // VOP3 0x151 = v_min3_f32, 0x154 = v_max3_f32 — 0xd551…/0xd554…). NaN-aware NMin/
                 // NMax per the ISA one-NaN rule. CONFIDENCE: HIGH.
                 uint32_t op = in.opcode == 0x151 ? (uint32_t)Glsl_NMin : (uint32_t)Glsl_NMax;
                 vreg[in.dst.value] = fresult(b.fext2(op, b.fext2(op, fv(0), fv(1)), fv(2)));
-            } else if (in.opcode == 0x368 || in.opcode == 0x369) {    // v_cvt_pknorm_{i16,u16}_f32
+            } else if (in.opcode == 0x368 || in.opcode == 0x369) {   // v_cvt_pknorm_{i16,u16}_f32
                 // Clamp and normalize two f32 values, then pack src0 in bits[15:0] and src1 in
                 // bits[31:16]. Astro's title ship VS uses the unsigned form (exact first word
                 // d7690002). AMD specifies round-to-nearest-even for the normalized conversion.
@@ -4926,14 +4947,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t hi = b.pack_norm(fv(1), 16, is_signed, scale);
                 vreg[in.dst.value] = b.ibin(
                     Op_BitwiseOr, lo, b.ibin(Op_ShiftLeftLogical, hi, b.uconst(16)));
-            } else if (in.opcode == 0x36A) {                          // v_cvt_pk_u16_u32
+            } else if (in.opcode == 0x36A) {   // v_cvt_pk_u16_u32
                 // Pack two u32 into u16 halves with UNSIGNED SATURATION: lo = min(s0,0xFFFF),
                 // hi = min(s1,0xFFFF); dst = lo | hi<<16. VERIFIED(round-trip llvm-mc gfx1010:
                 // VOP3 0x36a — 0xd76a…). CONFIDENCE: HIGH.
                 uint32_t lo = b.uext2(Glsl_UMin, val(in.src[0]), b.uconst(0xFFFFu));
                 uint32_t hi = b.uext2(Glsl_UMin, val(in.src[1]), b.uconst(0xFFFFu));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, lo, b.ibin(Op_ShiftLeftLogical, hi, b.uconst(16)));
-            } else if (in.opcode == 0x362) {                          // v_ldexp_f32
+            } else if (in.opcode == 0x362) {   // v_ldexp_f32
                 // AMD opcode 866: D.f = S0.f * 2**S1.i. The exact GTA V production packet is
                 // d7620000,0002030d (`v_ldexp_f32 v0,v13,v1`) with no modifiers. Admit that proven
                 // shape only for now: ABS/NEG on the integer exponent and output-modifier denormal
@@ -5001,12 +5022,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                 }
                 vreg[in.dst.value] = fresult(r2);
-            } else if (in.opcode == 0x143) {                          // v_mad_u32_u24 = (s0&0xFFFFFF)*(s1&0xFFFFFF)+s2
+            } else if (in.opcode == 0x143) {   // v_mad_u32_u24 = (s0&0xFFFFFF)*(s1&0xFFFFFF)+s2
                 uint32_t m24 = b.uconst(0xFFFFFF);
                 uint32_t p = b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, val(in.src[0]), m24),
                                               b.ibin(Op_BitwiseAnd, val(in.src[1]), m24));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, p, val(in.src[2]));
-            } else if (in.opcode == 0x15D) {                          // v_sad_u32 = |s0-s1| (unsigned) + s2
+            } else if (in.opcode == 0x15A || in.opcode == 0x15B || in.opcode == 0x15C ||
+                       in.opcode == 0x171) {   // v_sad_u8 / v_sad_hi_u8 / v_sad_u16 / v_msad_u8
+                vreg[in.dst.value] = emit_v_sad_subword(b, rs, in, ok);
+            } else if (in.opcode == 0x15D) {   // v_sad_u32 = |s0-s1| (unsigned) + s2
                 // RDNA2 ISA (document 70648), V_SAD_U32: D.u32 = abs(S0.u32 - S1.u32) + S2.u32.
                 // The absolute difference is the UNSIGNED magnitude, so max-min is exact and cannot
                 // wrap (a signed abs would be wrong for operands straddling 0x80000000). Worms
@@ -5018,12 +5042,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t diff = b.ibin(Op_ISub, b.uext2(Glsl_UMax, s0, s1),
                                                        b.uext2(Glsl_UMin, s0, s1));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, diff, val(in.src[2]));
-            } else if (in.opcode == 0x148 || in.opcode == 0x149) {    // v_bfe_u32 / v_bfe_i32
+            } else if (in.opcode == 0x15F) {   // v_div_fixup_f32
+                vreg[in.dst.value] = fresult(emit_v_div_fixup_f32(b, fv(0), fv(1), fv(2)));
+            } else if (in.opcode == 0x148 || in.opcode == 0x149) {   // v_bfe_u32 / v_bfe_i32
                 uint32_t off = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
                 uint32_t cnt = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
                 vreg[in.dst.value] = (in.opcode == 0x148) ? b.bfe_u(val(in.src[0]), off, cnt)
                                                           : b.bfe_s(val(in.src[0]), off, cnt);
-            } else if (in.opcode == 0x14A) {                          // v_bfi_b32 = (s0&s1)|(~s0&s2)
+            } else if (in.opcode == 0x14A) {   // v_bfi_b32 = (s0&s1)|(~s0&s2)
                 uint32_t s0 = val(in.src[0]);
                 uint32_t t1 = b.ibin(Op_BitwiseAnd, s0, val(in.src[1]));
                 uint32_t t2 = b.ibin(Op_BitwiseAnd, b.iun(Op_Not, s0), val(in.src[2]));
@@ -5075,7 +5101,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                   b.uconst(0)));
                     }
                 }
-            } else if (in.opcode == kVop3OpcodeLshlrevB64) {         // v_lshlrev_b64
+            } else if (in.opcode == 0x344) {   // v_perm_b32
+                const bool modified = in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
+                                      in.src_neg[0] || in.src_neg[1] || in.src_neg[2] || in.clamp ||
+                                      in.omod;
+                if (modified) {
+                    ok = false;
+                } else {
+                    vreg[in.dst.value] =
+                        emit_v_perm_b32(b, val(in.src[0]), val(in.src[1]), val(in.src[2]));
+                }
+            } else if (in.opcode == kVop3OpcodeLshlrevB64) {   // v_lshlrev_b64
                 // GTA V constructs a per-lane bit as `1ull << lane` immediately after MBCNT. This
                 // bounded admission keeps SRC1 at the exact inline integer 1; general register-pair
                 // and floating-inline sources need wider source-span/provenance handling.
@@ -5099,7 +5135,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     vreg[hi_dst] = b.u64_hi(result);
                     predicate_write(b, rs, hi_dst, old_hi);
                 }
-            } else if (in.opcode == kVop3OpcodeLshrrevB64) {         // v_lshrrev_b64
+            } else if (in.opcode == kVop3OpcodeLshrrevB64) {   // v_lshrrev_b64
                 // GTA V's compact-BVH kernels shift a VGPR pair by either a scalar scratch word or
                 // a VGPR lane value. RDNA masks the count to six bits. Keep the pair and modifier
                 // admission exact: SRC1 must be an addressable consecutive register pair, and this
@@ -5126,7 +5162,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     vreg[hi_dst] = b.u64_hi(result);
                     predicate_write(b, rs, hi_dst, old_hi);
                 }
-            } else if (in.opcode == 0x363) {                          // v_bfm_b32
+            } else if (in.opcode == 0x363) {   // v_bfm_b32
                 // RDNA2: D.u32 = ((1 << S0[4:0]) - 1) << S1[4:0]. Mask both shift
                 // amounts before emitting SPIR-V so neither can reach the undefined >=32 range;
                 // in particular, an input width of 32 wraps to zero rather than producing all ones.
@@ -5148,32 +5184,32 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         b.uconst(1));
                     vreg[in.dst.value] = b.ibin(Op_ShiftLeftLogical, mask, offset);
                 }
-            } else if (in.opcode == 0x364) {                          // v_bcnt_u32_b32
+            } else if (in.opcode == 0x364) {   // v_bcnt_u32_b32
                 // AMD RDNA2: D = popcount(S0) + S1. The third VOP3 source field is unused.
                 vreg[in.dst.value] = b.ibin(Op_IAdd,
                                              b.iun(Op_BitCount, val(in.src[0])),
                                              val(in.src[1]));
-            } else if (in.opcode == kVop3OpcodeAdd3U32) {             // v_add3_u32 = s0+s1+s2
+            } else if (in.opcode == kVop3OpcodeAdd3U32) {   // v_add3_u32 = s0+s1+s2
                 vreg[in.dst.value] = b.ibin(Op_IAdd, b.ibin(Op_IAdd, val(in.src[0]), val(in.src[1])), val(in.src[2]));
-            } else if (in.opcode == 0x346) {                          // v_lshl_add_u32 = (s0<<(s1&31))+s2
+            } else if (in.opcode == 0x346) {   // v_lshl_add_u32 = (s0<<(s1&31))+s2
                 uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, b.ibin(Op_ShiftLeftLogical, val(in.src[0]), sh), val(in.src[2]));
-            } else if (in.opcode == kVop3OpcodeAndOrB32) {           // v_and_or_b32 = (s0&s1)|s2
+            } else if (in.opcode == kVop3OpcodeAndOrB32) {   // v_and_or_b32 = (s0&s1)|s2
                 uint32_t t = b.ibin(Op_BitwiseAnd, val(in.src[0]), val(in.src[1]));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t, val(in.src[2]));
-            } else if (in.opcode == 0x372) {                          // v_or3_b32 = s0|s1|s2
+            } else if (in.opcode == 0x372) {   // v_or3_b32 = s0|s1|s2
                 uint32_t t = b.ibin(Op_BitwiseOr, val(in.src[0]), val(in.src[1]));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t, val(in.src[2]));
-            } else if (in.opcode == 0x178) {                          // v_xor3_b32 = s0^s1^s2
+            } else if (in.opcode == 0x178) {   // v_xor3_b32 = s0^s1^s2
                 uint32_t t = b.ibin(Op_BitwiseXor, val(in.src[0]), val(in.src[1]));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseXor, t, val(in.src[2]));
-            } else if (in.opcode == 0x36F) {                          // v_lshl_or_b32 = (s0<<(s1&31))|s2
+            } else if (in.opcode == 0x36F) {   // v_lshl_or_b32 = (s0<<(s1&31))|s2
                 uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, b.ibin(Op_ShiftLeftLogical, val(in.src[0]), sh), val(in.src[2]));
-            } else if (in.opcode == 0x345) {                          // v_xad_u32 = (s0^s1)+s2
+            } else if (in.opcode == 0x345) {   // v_xad_u32 = (s0^s1)+s2
                 uint32_t t = b.ibin(Op_BitwiseXor, val(in.src[0]), val(in.src[1]));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, t, val(in.src[2]));
-            } else if (in.opcode == 0x347) {                          // v_add_lshl_u32 = (s0+s1)<<(s2&31)
+            } else if (in.opcode == 0x347) {   // v_add_lshl_u32 = (s0+s1)<<(s2&31)
                 uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
                 vreg[in.dst.value] = b.ibin(Op_ShiftLeftLogical, b.ibin(Op_IAdd, val(in.src[0]), val(in.src[1])), sh);
             } else if (in.opcode == 0x128 || in.opcode == 0x129 || in.opcode == 0x12A) {
@@ -5351,30 +5387,30 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 b.stage_reject_pc = in.pc;
                 b.stage_reject_reason = reason;
                 ok = false;
-            } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
+            } else if (in.opcode == 0x12F) {   // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16_rtz(fv(0), fv(1)); // v_cvt_pkrtz VOP3: RTZ clamp (#452)
-            } else if (in.opcode == 0x103) {                          // v_add_f32 (VOP3 form)
+            } else if (in.opcode == 0x103) {   // v_add_f32 (VOP3 form)
                 b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Add);
                 vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, fv(0), fv(1)));
-            } else if (in.opcode == 0x104) {                          // v_sub_f32 (VOP3 form) = s0 - s1
+            } else if (in.opcode == 0x104) {   // v_sub_f32 (VOP3 form) = s0 - s1
                 vreg[in.dst.value] = fresult(b.fbin(Op_FSub, fv(0), fv(1)));
-            } else if (in.opcode == 0x105) {                          // v_subrev_f32 (VOP3 form) = s1 - s0
+            } else if (in.opcode == 0x105) {   // v_subrev_f32 (VOP3 form) = s1 - s0
                 vreg[in.dst.value] = fresult(b.fbin(Op_FSub, fv(1), fv(0)));
-            } else if (in.opcode == 0x108) {                          // v_mul_f32 (VOP3 form)
+            } else if (in.opcode == 0x108) {   // v_mul_f32 (VOP3 form)
                 b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Mul);
                 vreg[in.dst.value] = fresult(b.fbin(Op_FMul, fv(0), fv(1)));
-            } else if (in.opcode == 0x10F) {                          // v_min_f32 (VOP3 form; NaN -> other operand)
+            } else if (in.opcode == 0x10F) {   // v_min_f32 (VOP3 form; NaN -> other operand)
                 vreg[in.dst.value] = fresult(b.fext2(Glsl_NMin, fv(0), fv(1)));
-            } else if (in.opcode == 0x110) {                          // v_max_f32 (VOP3 form; NaN -> other operand)
+            } else if (in.opcode == 0x110) {   // v_max_f32 (VOP3 form; NaN -> other operand)
                 vreg[in.dst.value] = fresult(b.fext2(Glsl_NMax, fv(0), fv(1)));
-            } else if (in.opcode == 0x107) {                          // v_mul_legacy_f32: DX9 multiply —
+            } else if (in.opcode == 0x107) {   // v_mul_legacy_f32: DX9 multiply —
                 // 0 * x == 0 for ALL x including ±Inf/NaN (that guarantee is WHY compilers emit it,
                 // e.g. attenuation=0 times 1/dist). Plain IEEE FMul gives NaN for 0*Inf, so emit
                 // select(s0==0 || s1==0, 0, s0*s1). ±0.0 both compare equal to 0.0 under FOrdEqual.
                 uint32_t s0b = fv(0), s1b = fv(1), zb = b.uconst(0);
                 uint32_t anyz = b.lor(b.fcmp(Op_FOrdEqual, s0b, zb), b.fcmp(Op_FOrdEqual, s1b, zb));
                 vreg[in.dst.value] = fresult(b.sel(anyz, zb, b.fbin(Op_FMul, s0b, s1b)));
-            } else if (in.opcode == 0x101) {                          // v_cndmask_b32_e64: src2_mask ? src1 : src0
+            } else if (in.opcode == 0x101) {   // v_cndmask_b32_e64: src2_mask ? src1 : src0
                 const Operand& s2 = in.src[2]; uint32_t m = 0;        // src2 is an SGPR-pair (or VCC) wave mask
                 if (s2.value == 106 || s2.value == 107) {
                     // Wave32 e64/SDWA forms may explicitly select either physical VCC word as an
@@ -5409,12 +5445,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // recompiled "successfully" and computed the un-negated value. fv == val when no
                 // modifier bits are set.
                 if (!m) ok = false; else vreg[in.dst.value] = b.sel(m, fv(1), fv(0));
-            } else if (in.opcode == 0x11F) {                          // v_mac_f32_e64 (VOP3 form of VOP2 0x1f)
+            } else if (in.opcode == 0x11F) {   // v_mac_f32_e64 (VOP3 form of VOP2 0x1f)
                 // dst = src0*src1 + dst, with the VOP3 float source modifiers (neg/abs via fv) and output
                 // modifiers (omod/clamp via fresult). The scene VS emits this e64 form with a `-|v10|`
                 // modifier (round-trip: `llvm-mc -mcpu=gfx1010` of 0xd51f020a → v_mac_f32_e64 v10,v28,-|v10|).
                 vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, b.fbin(Op_FMul, fv(0), fv(1)), old_d));
-            } else ok = false;
+            } else
+                ok = false;
             // A set CLAMP bit on an opcode that does not route through fresult means unmodeled
             // INTEGER saturation (ISA 6.5: "for integer operations, it clamps the result to the
             // largest and smallest representable value") or an unhandled pack/select combination
@@ -8369,6 +8406,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
 
             // --- Sampled-texture path: image_sample* (0x20/0x24/0x25/0x27) / image_gather4_lz (0x47) /
+            // image_gather4 (0x40, admitted only where LOD 0 is exact -- see the gather arm) /
             // image_load (0x00). 2D (any LOD variant) or 3D (implicit-LOD or LOD-0 sample); NSA allowed
             // (coords gathered below). image_sample = 0x20 (implicit-LOD), image_sample_l = 0x24
             // (explicit LOD in last coord), image_sample_b = 0x25 (implicit-LOD + BIAS in FIRST vaddr),
@@ -8389,6 +8427,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool is_load = in.opcode == 0x00 || is_zero_mip_load;
             const bool is_sample_l = (in.opcode == 0x24), is_sample_lz = (in.opcode == 0x27);
             const bool is_sample_b = (in.opcode == 0x25), is_gather_lz = (in.opcode == 0x47);
+            // image_gather4 = 0x40: gather with implicit LOD. Core SPIR-V OpImageGather only samples
+            // base level (LOD 0, identical to _lz). This lowering is exact when the resource has only
+            // one mip level (res->declared_mip_levels == 1u, CONFIDENCE: HIGH). In compute shaders,
+            // prosper resolves implicit LOD to base level (CONFIDENCE: MED). Multi-level textures
+            // in fragment shaders are refused fail-visibly to prevent shimmering/aliasing.
+            const bool is_gather = (in.opcode == 0x40);
             const bool is_sample_c_lz = (in.opcode == 0x2f);
             // image_gather4_lz_o = 0x57 (gather at base level with the _o packed-offset operand in the
             // FIRST vaddr — llvm-mc gfx1030 round-trip on live DOLL bytes: 0xf15c0808 "image_gather4_lz_o
@@ -8412,14 +8456,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // bias/gradient/sample-offset helpers default arrays to layer zero, so do not admit
             // those forms for the newly supported Float32 graphics representation.
             if (graphics_float_array && in.mimg_dim == 5u &&
-                (in.mimg_a16 || (!is_load && !is_sample && !is_sample_l &&
-                                 !is_sample_lz && !is_sample_c_lz &&
-                                 !is_gather_lz && !is_gather_lz_o))) {
+                (in.mimg_a16 ||
+                 (!is_load && !is_sample && !is_sample_l && !is_sample_lz && !is_sample_c_lz &&
+                  !is_gather_lz && !is_gather && !is_gather_lz_o))) {
                 ok = false;
                 return true;
             }
-            const bool float_array_gather = graphics_float_array &&
-                in.mimg_dim == 5u && (is_gather_lz || is_gather_lz_o);
+            const bool float_array_gather = graphics_float_array && in.mimg_dim == 5u &&
+                                            (is_gather_lz || is_gather || is_gather_lz_o);
             // Only full-width coordinates and results are admitted here. Cache/status and
             // reserved controls cannot be admitted by widening the array opcode list alone.
             if (float_array_gather && (in.mimg_a16 || in.mimg_d16 || in.mimg_r128 || in.mimg_tfe ||
@@ -8439,7 +8483,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 fprintf(stderr, "[recompile] 2D_ARRAY image op: resource %s an uploaded array (#325)\n",
                         res_arrayed ? "IS" : "is NOT");
             if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b &&
-                 !is_sample_c_lz && !is_gather_lz &&
+                 !is_sample_c_lz && !is_gather_lz && !is_gather &&
                  !is_gather_lz_o && !is_sample_lz_o && !is_sample_d) ||
                 (!dim2d && !dim3d && !dimcube && !dim_msaa)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
@@ -8768,7 +8812,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         res->mag_filter != 0u, res->addr_uvw[0],
                         res->addr_uvw[1], res->border_color_type, out);
                 } else { ok = false; return true; }
-            } else if (is_gather_lz || is_gather_lz_o) {
+            } else if (is_gather_lz || is_gather || is_gather_lz_o) {
+                if (is_gather && !(res->declared_mip_levels == 1u || !b.is_fragment)) {
+                    ok = false;
+                    return true;
+                }
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
                 // four texels of that channel, with gather order preserved. D16 changes only the
                 // physical VDATA layout: the four fp16 results occupy two consecutive VGPRs. GTA V's

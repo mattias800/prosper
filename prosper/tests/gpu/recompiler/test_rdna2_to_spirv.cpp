@@ -497,6 +497,76 @@ int main() {
     printf("  kernel4d mismatches=%u (out[60]=%g)\n", bad4d, got4d.size()==N ? got4d[60] : -1);
     CHECK(got4d.size()==N && bad4d==0, "recompiled kernel 4d computes unsigned min-of-three correctly");
 
+    // Kernel 4e: signed median-of-three (v_med3_i32, 0x158).
+    // Tests signed ordering with negative and positive inputs. Unlike kernels 4-4d these convert
+    // through the SIGNED forms -- v_cvt_i32_f32 (VOP1 0x08) in, v_cvt_f32_i32 (0x05) out -- since
+    // v_cvt_u32_f32 would clamp every negative input to 0 and never exercise a signed compare.
+    const uint32_t code4e[] = {
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0xD5580003u, 0x040A0300u, 0x7E000B03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4e = recompile_valu(code4e, std::size(code4e), 3, 0);
+    CHECK(!spv4e.empty(), "recompiled kernel 4e (v_med3_i32) -> SPIR-V");
+
+    // Kernel 4f: signed max-of-three (v_max3_i32, 0x155).
+    const uint32_t code4f[] = {
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0xD5550003u, 0x040A0300u, 0x7E000B03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4f = recompile_valu(code4f, std::size(code4f), 3, 0);
+    CHECK(!spv4f.empty(), "recompiled kernel 4f (v_max3_i32) -> SPIR-V");
+
+    // Kernel 4g: signed min-of-three (v_min3_i32, 0x152).
+    const uint32_t code4g[] = {
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0xD5520003u, 0x040A0300u, 0x7E000B03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4g = recompile_valu(code4g, std::size(code4g), 3, 0);
+    CHECK(!spv4g.empty(), "recompiled kernel 4g (v_min3_i32) -> SPIR-V");
+
+    std::vector<float> in4_signed(N * 3);
+    for (uint32_t i = 0; i < N; i++) {
+        const int32_t s0 = (int32_t)((i * 37u) % 211u) - 100;
+        const int32_t s1 = (int32_t)((i * 83u + 17u) % 211u) - 100;
+        const int32_t s2 = (int32_t)((i * 19u + 101u) % 211u) - 100;
+        in4_signed[i * 3 + 0] = (float)s0;
+        in4_signed[i * 3 + 1] = (float)s1;
+        in4_signed[i * 3 + 2] = (float)s2;
+    }
+
+    std::vector<float> got4e = prosper::test::run_compute(spv4e, in4_signed, N, N);
+    uint32_t bad4e = 0;
+    for (uint32_t i = 0; i < N && got4e.size() == N; i++) {
+        const int32_t s0 = (int32_t)((i * 37u) % 211u) - 100;
+        const int32_t s1 = (int32_t)((i * 83u + 17u) % 211u) - 100;
+        const int32_t s2 = (int32_t)((i * 19u + 101u) % 211u) - 100;
+        const int32_t mn = std::min(s0, s1), mx = std::max(s0, s1);
+        const int32_t exp = std::max(mn, std::min(mx, s2));
+        if (got4e[i] != (float)exp) bad4e++;
+    }
+    CHECK(got4e.size() == N && bad4e == 0, "recompiled kernel 4e computes signed median correctly");
+
+    std::vector<float> got4f = prosper::test::run_compute(spv4f, in4_signed, N, N);
+    uint32_t bad4f = 0;
+    for (uint32_t i = 0; i < N && got4f.size() == N; i++) {
+        const int32_t s0 = (int32_t)((i * 37u) % 211u) - 100;
+        const int32_t s1 = (int32_t)((i * 83u + 17u) % 211u) - 100;
+        const int32_t s2 = (int32_t)((i * 19u + 101u) % 211u) - 100;
+        const int32_t exp = std::max(s0, std::max(s1, s2));
+        if (got4f[i] != (float)exp) bad4f++;
+    }
+    CHECK(got4f.size() == N && bad4f == 0,
+          "recompiled kernel 4f computes signed max-of-three correctly");
+
+    std::vector<float> got4g = prosper::test::run_compute(spv4g, in4_signed, N, N);
+    uint32_t bad4g = 0;
+    for (uint32_t i = 0; i < N && got4g.size() == N; i++) {
+        const int32_t s0 = (int32_t)((i * 37u) % 211u) - 100;
+        const int32_t s1 = (int32_t)((i * 83u + 17u) % 211u) - 100;
+        const int32_t s2 = (int32_t)((i * 19u + 101u) % 211u) - 100;
+        const int32_t exp = std::min(s0, std::min(s1, s2));
+        if (got4g[i] != (float)exp) bad4g++;
+    }
+    CHECK(got4g.size() == N && bad4g == 0,
+          "recompiled kernel 4g computes signed min-of-three correctly");
+
     // Kernel 5: unsigned min/max/sub/not/and. u=(uint)a; d=(max-min) & ~u0. out=(float)d.
     const uint32_t code5[] = {
         0x7E000F00u, 0x7E020F01u, 0x26040300u, 0x28060300u, 0x4C040503u, 0x7E066F00u, 0x36040702u, 0x7E000D02u, 0xBF810000u,
@@ -7859,6 +7929,150 @@ int main() {
     CHECK(recompile_valu(code32r23b, std::size(code32r23b), 0, 4).empty(),
           "kernel 32r23b keeps SEXT on a DWORD source select fail-visible");
 
+    // Kernel 32r24: VOP3P integer dot product family (0x14..0x19). Encodings are llvm-mc gfx1030.
+    // Inputs are chosen so that each plausible lowering slip changes the result: zero- instead of
+    // sign-extending either source (or the converse for the unsigned ops), extracting one bit too
+    // few per element (so -32768 / -128 / -8 are used), reversing src1's element order, dropping
+    // the src2 accumulator, and saturating instead of wrapping at 32 bits (the signed cases
+    // overflow past 2^31, the unsigned ones past 2^32). Expected values come from a host model.
+    const uint32_t code32r24a[] = {
+        0x7e0002ffu, 0x80008001u,   // v0
+        0x7e0202ffu, 0x8000ffffu,   // v1
+        0x7e0402ffu, 0x40000000u,   // v2 (accumulator)
+        0xcc144003u, 0x1c0a0300u,   // v_dot2_i32_i16 v3, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24a = recompile_valu(code32r24a, std::size(code32r24a), 0, 3);
+    CHECK(!spv32r24a.empty(), "recompiled kernel 32r24a (v_dot2_i32_i16) -> SPIR-V");
+    std::vector<float> got32r24a =
+        prosper::test::run_compute(spv32r24a, std::vector<float>(1), 1, 1);
+    CHECK(got32r24a.size() == 1 && bits_of(got32r24a[0]) == 0x80007fffu,
+          "kernel 32r24a: v_dot2_i32_i16: (-32767)*(-1) + (-32768)*(-32768) + 2^30 wraps to "
+          "0x80007fff");
+
+    const uint32_t code32r24b[] = {
+        0x7e0002ffu, 0x8000ffffu,   // v0
+        0x7e0202ffu, 0xffff8001u,   // v1
+        0x7e0402ffu, 0x00000010u,   // v2 (accumulator)
+        0xcc154003u, 0x1c0a0300u,   // v_dot2_u32_u16 v3, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24b = recompile_valu(code32r24b, std::size(code32r24b), 0, 3);
+    CHECK(!spv32r24b.empty(), "recompiled kernel 32r24b (v_dot2_u32_u16) -> SPIR-V");
+    std::vector<float> got32r24b =
+        prosper::test::run_compute(spv32r24b, std::vector<float>(1), 1, 1);
+    CHECK(got32r24b.size() == 1 && bits_of(got32r24b[0]) == 0x0000000fu,
+          "kernel 32r24b: v_dot2_u32_u16: 65535*32769 + 32768*65535 + 16 wraps mod 2^32 to 15");
+
+    const uint32_t code32r24c[] = {
+        0x7e0002ffu, 0x407f8140u,   // v0
+        0x7e0202ffu, 0x807f80ffu,   // v1
+        0x7e0402ffu, 0x7fffff00u,   // v2 (accumulator)
+        0xcc164003u, 0x1c0a0300u,   // v_dot4_i32_i8 v3, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24c = recompile_valu(code32r24c, std::size(code32r24c), 0, 3);
+    CHECK(!spv32r24c.empty(), "recompiled kernel 32r24c (v_dot4_i32_i8) -> SPIR-V");
+    std::vector<float> got32r24c =
+        prosper::test::run_compute(spv32r24c, std::vector<float>(1), 1, 1);
+    CHECK(got32r24c.size() == 1 && bits_of(got32r24c[0]) == 0x80005d41u,
+          "kernel 32r24c: v_dot4_i32_i8 sign-extends all bytes (-128, -127, -1) and wraps past "
+          "2^31 to 0x80005d41");
+
+    const uint32_t code32r24d[] = {
+        0x7e0002ffu, 0x01817f01u,   // v0
+        0x7e0202ffu, 0x7f7f8180u,   // v1
+        0x7e0402ffu, 0xffffff00u,   // v2 (accumulator)
+        0xcc174003u, 0x1c0a0300u,   // v_dot4_u32_u8 v3, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24d = recompile_valu(code32r24d, std::size(code32r24d), 0, 3);
+    CHECK(!spv32r24d.empty(), "recompiled kernel 32r24d (v_dot4_u32_u8) -> SPIR-V");
+    std::vector<float> got32r24d =
+        prosper::test::run_compute(spv32r24d, std::vector<float>(1), 1, 1);
+    CHECK(got32r24d.size() == 1 && bits_of(got32r24d[0]) == 0x00007ffdu,
+          "kernel 32r24d: v_dot4_u32_u8 zero-extends all bytes and wraps mod 2^32 to 0x7ffd");
+
+    const uint32_t code32r24e[] = {
+        0x7e0002ffu, 0x87f18f17u,   // v0
+        0x7e0202ffu, 0x8f7187f1u,   // v1
+        0x7e0402ffu, 0x7ffffff0u,   // v2 (accumulator)
+        0xcc184003u, 0x1c0a0300u,   // v_dot8_i32_i4 v3, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24e = recompile_valu(code32r24e, std::size(code32r24e), 0, 3);
+    CHECK(!spv32r24e.empty(), "recompiled kernel 32r24e (v_dot8_i32_i4) -> SPIR-V");
+    std::vector<float> got32r24e =
+        prosper::test::run_compute(spv32r24e, std::vector<float>(1), 1, 1);
+    CHECK(got32r24e.size() == 1 && bits_of(got32r24e[0]) == 0x80000062u,
+          "kernel 32r24e: v_dot8_i32_i4 sign-extends all nibbles (-8, -1, 7) and wraps past 2^31 "
+          "to 0x80000062");
+
+    const uint32_t code32r24f[] = {
+        0x7e0002ffu, 0xf8f18f17u,   // v0
+        0x7e0202ffu, 0x8f7187f9u,   // v1
+        0x7e0402ffu, 0xffffff00u,   // v2 (accumulator)
+        0xcc194003u, 0x1c0a0300u,   // v_dot8_u32_u4 v3, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24f = recompile_valu(code32r24f, std::size(code32r24f), 0, 3);
+    CHECK(!spv32r24f.empty(), "recompiled kernel 32r24f (v_dot8_u32_u4) -> SPIR-V");
+    std::vector<float> got32r24f =
+        prosper::test::run_compute(spv32r24f, std::vector<float>(1), 1, 1);
+    CHECK(got32r24f.size() == 1 && bits_of(got32r24f[0]) == 0x00000151u,
+          "kernel 32r24f: v_dot8_u32_u4 zero-extends all nibbles and wraps mod 2^32 to 0x151");
+
+    const uint32_t code32r24g[] = {
+        0x7e0002ffu, 0x0002fffeu,   // v0 = {hi=2, lo=-2}
+        0x7e0202ffu, 0x00030004u,   // v1 = {hi=3, lo=4}
+        0x7e04028au,   // v2 = 10
+        0xcc144803u, 0x140a0300u,   // v_dot2_i32_i16 v3, v0, v1, v2 op_sel:[1,0] op_sel_hi:[0,1]
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24g = recompile_valu(code32r24g, std::size(code32r24g), 0, 3);
+    CHECK(!spv32r24g.empty(), "recompiled kernel 32r24g (v_dot2_i32_i16 swapped halves) -> SPIR-V");
+    std::vector<float> got32r24g =
+        prosper::test::run_compute(spv32r24g, std::vector<float>(1), 1, 1);
+    CHECK(got32r24g.size() == 1 && bits_of(got32r24g[0]) == 12u,
+          "kernel 32r24g: v_dot2_i32_i16 with swapped halves computes 2*4 + (-2)*3 + 10 = 12");
+
+    const uint32_t code32r24h[] = {
+        0x7e0002ffu,
+        0x0002fffeu,   // v0 = {hi=2, lo=0xfffe}
+        0x7e0202ffu,
+        0x00030004u,   // v1 = {hi=3, lo=4}
+        0x7e04028au,   // v2 = 10
+        0xcc145003u,
+        0x0c0a0300u,   // v_dot2_i32_i16 v3, v0, v1, v2 op_sel:[0,1,0] op_sel_hi:[1,0,1]
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24h = recompile_valu(code32r24h, std::size(code32r24h), 0, 3);
+    CHECK(!spv32r24h.empty(),
+          "recompiled kernel 32r24h (v_dot2_i32_i16 swapped src1 halves) -> SPIR-V");
+    std::vector<float> got32r24h =
+        prosper::test::run_compute(spv32r24h, std::vector<float>(1), 1, 1);
+    CHECK(got32r24h.size() == 1 && bits_of(got32r24h[0]) == 12u,
+          "kernel 32r24h: v_dot2_i32_i16 with src1 halves swapped computes (-2)*3 + 2*4 + 10 = 12");
+
+    const uint32_t code32r24i[] = {
+        0x7e0002ffu,
+        0x0002fffeu,   // v0 = {hi=2, lo=0xfffe}
+        0x7e0202ffu,
+        0x00030004u,   // v1 = {hi=3, lo=4}
+        0x7e04028au,   // v2 = 10
+        0xcc155003u,
+        0x0c0a0300u,   // v_dot2_u32_u16 v3, v0, v1, v2 op_sel:[0,1,0] op_sel_hi:[1,0,1]
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24i = recompile_valu(code32r24i, std::size(code32r24i), 0, 3);
+    CHECK(!spv32r24i.empty(),
+          "recompiled kernel 32r24i (v_dot2_u32_u16 swapped src1 halves) -> SPIR-V");
+    std::vector<float> got32r24i =
+        prosper::test::run_compute(spv32r24i, std::vector<float>(1), 1, 1);
+    CHECK(got32r24i.size() == 1 && bits_of(got32r24i[0]) == 196620u,
+          "kernel 32r24i: v_dot2_u32_u16 with src1 halves swapped computes 65534*3 + 2*4 + 10 = "
+          "196620");
+
     // Kernel 32p: exact live v_cndmask_b32_sdwa selects src1 WORD_0 through VCC, writes WORD_1,
     // and preserves the destination's low half.
     const uint32_t code32p[] = {
@@ -10824,6 +11038,127 @@ int main() {
     CHECK(gotT11e.size()==N && badT11e==0,
           "T11e: v_bcnt_u32_b32 adds the exact 32-bit population count");
 
+    // Tperm: v_perm_b32 byte permutation execution coverage.
+    // Inputs: S0 = 0x7F448022 (high), S1 = 0x80337F11 (low).
+    // Tests exact selector categories (0..7 direct byte picks, 8..11 sign bit replicates of bytes 1,3,5,7,
+    // 12 -> 0x00, 13..255 -> 0xFF), plus dynamic per-lane selector.
+    const uint32_t codeTperm[] = {
+        0x7e0202ffu, 0x7f448022u,   // v_mov_b32 v1, 0x7F448022 (S0)
+        0x7e0402ffu, 0x80337f11u,   // v_mov_b32 v2, 0x80337F11 (S1)
+        0xd7440003u, 0x04020501u,   // v_perm_b32 v3, v1, v2, v0 (S2 from v0 input)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTperm =
+        recompile_valu(codeTperm, std::size(codeTperm), 1, /*out_vgpr*/ 3);
+    CHECK(!spvTperm.empty(), "recompiled Tperm (v_perm_b32 dynamic selector) -> SPIR-V");
+
+    // Form inputs for 64 lanes testing specific vectors:
+    // lane 0: 0x03020100 -> 0x80337F11
+    // lane 1: 0x07060504 -> 0x7F448022
+    // lane 2: 0x0B0A0908 -> 0x00FFFF00
+    // lane 3: 0x0D0C0E0F -> 0xFF00FFFF
+    // lane 4: 0x10FF0C01 -> 0xFFFF007F
+    // lane 5: 0x04000703 -> 0x22117F80
+    std::vector<float> inPerm(N, 0.0f);
+    std::vector<uint32_t> expPerm(N, 0);
+    const struct {
+        uint32_t sel;
+        uint32_t exp;
+    } kPermCases[] = {
+        {0x03020100u, 0x80337F11u}, {0x07060504u, 0x7F448022u}, {0x0B0A0908u, 0x00FFFF00u},
+        {0x0D0C0E0Fu, 0xFF00FFFFu}, {0x10FF0C01u, 0xFFFF007Fu}, {0x04000703u, 0x22117F80u},
+    };
+    for (uint32_t i = 0; i < N; ++i) {
+        const auto& c = kPermCases[i % std::size(kPermCases)];
+        inPerm[i] = std::bit_cast<float>(c.sel);
+        expPerm[i] = c.exp;
+    }
+    std::vector<float> gotTperm = prosper::test::run_compute(spvTperm, inPerm, N, N);
+    uint32_t badTperm = 0;
+    for (uint32_t i = 0; i < N && gotTperm.size() == N; ++i) {
+        if (bits_of(gotTperm[i]) != expPerm[i]) ++badTperm;
+    }
+    CHECK(gotTperm.size() == N && badTperm == 0,
+          "Tperm: v_perm_b32 correctly handles all selector categories (0..7, 8..11, 12, 13..255)");
+
+    // Tdiv_fixup: v_div_fixup_f32 IEEE 754 division corner case execution coverage.
+    // S0 = quotient, S1 = denominator, S2 = numerator.
+    // Tests bit-exact outputs across:
+    //   - pass-through: (2.0, 1.0, 2.0) -> 2.0; (2.0, -1.0, 2.0) -> -2.0; (-2.0, 1.0, 2.0) -> 2.0
+    //   - 0/0 -> 0xffc00000; inf/inf -> 0xffc00000
+    //   - x/0 -> signed inf; inf/y -> signed inf
+    //   - x/inf -> signed zero; 0/y -> signed zero
+    //   - NaN priority: S2 quieted NaN wins over S1 quieted NaN
+    //   - Exponent underflow: (exp(S2) - exp(S1)) < -150 -> signed zero
+    // Dynamic execution drives inputs via v0, v1, v2.
+    // llvm-mc gfx1030: v_div_fixup_f32 v3, v0, v1, v2 is [0x03,0x00,0x5f,0xd5,0x00,0x03,0x0a,0x04]
+    const uint32_t codeTdivFixup[] = {
+        0xd55f0003u,
+        0x040a0300u,   // v_div_fixup_f32 v3, v0, v1, v2 (src0=v0, src1=v1, src2=v2)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTdivFixup =
+        recompile_valu(codeTdivFixup, std::size(codeTdivFixup), 3, /*out_vgpr*/ 3);
+    CHECK(!spvTdivFixup.empty(), "recompiled TdivFixup (v_div_fixup_f32) -> SPIR-V");
+
+    const struct {
+        uint32_t s0;
+        uint32_t s1;
+        uint32_t s2;
+        uint32_t exp;
+    } kDivFixupCases[] = {
+        // pass-through: abs(s0) with sign(s1)^sign(s2)
+        {0x40000000u, 0x3f800000u, 0x40000000u, 0x40000000u},   // (2.0, 1.0, 2.0) -> 2.0
+        {0x40000000u, 0xbf800000u, 0x40000000u, 0xc0000000u},   // (2.0, -1.0, 2.0) -> -2.0
+        {0xc0000000u, 0x3f800000u, 0x40000000u, 0x40000000u},   // (-2.0, 1.0, 2.0) -> 2.0
+        // 0/0 and inf/inf -> 0xffc00000 (indeterminate NaN)
+        {0x3f800000u, 0x00000000u, 0x80000000u, 0xffc00000u},   // (1.0, +0, -0) -> 0xffc00000
+        {0x3f800000u, 0xff800000u, 0x7f800000u, 0xffc00000u},   // (1.0, -inf, +inf) -> 0xffc00000
+        // x/0 and inf/y -> signed inf
+        {0x3f800000u, 0x80000000u, 0x3f800000u, 0xff800000u},   // (1.0, -0.0, 1.0) -> -inf
+        {0x3f800000u, 0x40000000u, 0x7f800000u, 0x7f800000u},   // (1.0, 2.0, +inf) -> +inf
+        // x/inf and 0/y -> signed zero
+        {0x3f800000u, 0xff800000u, 0x3f800000u,
+         0x80000000u},   // (1.0, -inf, 1.0) -> -0.0 (0x80000000)
+        {0x3f800000u, 0x40400000u, 0x80000000u,
+         0x80000000u},   // (1.0, 3.0, -0.0) -> -0.0 (0x80000000)
+        // NaN priority: quiet(S2) wins over quiet(S1)
+        {0x3f800000u, 0x3f800000u, 0x7f800001u,
+         0x7fc00001u},   // S2=0x7f800001 -> quiet(S2)=0x7fc00001
+        {0x3f800000u, 0xff800005u, 0x3f800000u,
+         0xffc00005u},   // S1=0xff800005 -> quiet(S1)=0xffc00005
+        {0x3f800000u, 0xff800005u, 0x7f800001u, 0x7fc00001u},   // both NaN -> quiet(S2)
+        // NaN numerator over a zero denominator: (1.0, +0.0, 0x7f800001) -> 0x7fc00001
+        {0x3f800000u, 0x00000000u, 0x7f800001u, 0x7fc00001u},
+        // Exponent underflow exact boundary pair:
+        // S1=0x4b800000 (exp 151), S2=0x00800000 (exp 1) -> diff = -150: passes S0 through (1.0)
+        {0x3f800000u, 0x4b800000u, 0x00800000u, 0x3f800000u},
+        // S1=0x4c000000 (exp 152), S2=0x00800000 (exp 1) -> diff = -151: underflow -> signed zero (+0.0)
+        {0x3f800000u, 0x4c000000u, 0x00800000u, 0x00000000u},
+        // Negative-sign underflow: S1=0xcc000000 (-exp 152), S2=0x00800000 (+exp 1) -> diff = -151 -> -0.0 (0x80000000)
+        {0x3f800000u, 0xcc000000u, 0x00800000u, 0x80000000u},
+        // S2=2^-126 (0x00800000, exp=1), S1=2^126 (0x7e800000, exp=253) -> diff = -252 < -150
+        {0x00000001u, 0x7e800000u, 0x00800000u, 0x00000000u},   // underflow -> signed zero (+0.0)
+    };
+
+    std::vector<float> inDivFixup(N * 3, 0.0f);
+    std::vector<uint32_t> expDivFixup(N, 0);
+    for (uint32_t i = 0; i < N; ++i) {
+        const auto& c = kDivFixupCases[i % std::size(kDivFixupCases)];
+        inDivFixup[i * 3 + 0] = std::bit_cast<float>(c.s0);
+        inDivFixup[i * 3 + 1] = std::bit_cast<float>(c.s1);
+        inDivFixup[i * 3 + 2] = std::bit_cast<float>(c.s2);
+        expDivFixup[i] = c.exp;
+    }
+    std::vector<float> gotTdivFixup = prosper::test::run_compute(spvTdivFixup, inDivFixup, N, N);
+    uint32_t badTdivFixup = 0;
+    for (uint32_t i = 0; i < N && gotTdivFixup.size() == N; ++i) {
+        if (bits_of(gotTdivFixup[i]) != expDivFixup[i]) ++badTdivFixup;
+    }
+    CHECK(gotTdivFixup.size() == N && badTdivFixup == 0,
+          "TdivFixup: v_div_fixup_f32 correctly computes IEEE 754 division corner cases and "
+          "underflow");
+
     // Worms Armageddon (PPSA20052) rejects every one of its vertex shaders at pc=7 on VOP3 0x15d
     // (v_sad_u32). Its shipped .ags shader assets carry the identical word, so the encoding is
     // independently attested. D.u32 = abs(S0.u32 - S1.u32) + S2.u32 — an UNSIGNED magnitude, which
@@ -10865,6 +11200,92 @@ int main() {
         if (bits_of(gotTsad2[i]) != bits_of(inX[i]) + 5u) ++badTsad2;
     CHECK(gotTsad2.size()==N && badTsad2==0,
           "Tsad2: v_sad_u32 with src1=0 adds S0 to the S2 accumulator");
+
+    // Tsad3: v_sad_u8 (0x15a). Four-byte unsigned absolute differences plus accumulator.
+    // Inputs: S0=0x00FF10F0, S1=0xFF000F0F, S2=7.
+    // Byte diffs: |0x00-0xFF|=255, |0xFF-0x00|=255, |0x10-0x0F|=1, |0xF0-0x0F|=225.
+    // Sum = 255 + 255 + 1 + 225 + 7 = 743 = 0x2E7.
+    const uint32_t codeTsad3[] = {
+        0x7e0202ffu, 0x00ff10f0u,   // v_mov_b32 v1, 0x00FF10F0
+        0x7e0402ffu, 0xff000f0fu,   // v_mov_b32 v2, 0xFF000F0F
+        0x7e060287u,   // v_mov_b32 v3, 7
+        0xd55a0004u, 0x040e0501u,   // v_sad_u8 v4, v1, v2, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad3 =
+        recompile_valu(codeTsad3, std::size(codeTsad3), 0, /*out_vgpr*/ 4);
+    CHECK(!spvTsad3.empty(), "recompiled Tsad3 (v_sad_u8) -> SPIR-V");
+    std::vector<float> gotTsad3 = prosper::test::run_compute(spvTsad3, inX, N, N);
+    uint32_t badTsad3 = 0;
+    for (uint32_t i = 0; i < N && gotTsad3.size() == N; ++i)
+        if (bits_of(gotTsad3[i]) != 0x2E7u) ++badTsad3;
+    CHECK(gotTsad3.size() == N && badTsad3 == 0,
+          "Tsad3: v_sad_u8 computes sum of four byte absolute differences plus accumulator");
+
+    // Tsad4: v_sad_hi_u8 (0x15b). (sum of byte |a-b| << 16) + accumulator.
+    // Inputs: S0=0x00FF10F0, S1=0xFF000F0F, S2=7.
+    // Sum = (736 << 16) + 7 = 0x02E00007.
+    const uint32_t codeTsad4[] = {
+        0x7e0202ffu, 0x00ff10f0u,   // v_mov_b32 v1, 0x00FF10F0
+        0x7e0402ffu, 0xff000f0fu,   // v_mov_b32 v2, 0xFF000F0F
+        0x7e060287u,   // v_mov_b32 v3, 7
+        0xd55b0004u, 0x040e0501u,   // v_sad_hi_u8 v4, v1, v2, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad4 =
+        recompile_valu(codeTsad4, std::size(codeTsad4), 0, /*out_vgpr*/ 4);
+    CHECK(!spvTsad4.empty(), "recompiled Tsad4 (v_sad_hi_u8) -> SPIR-V");
+    std::vector<float> gotTsad4 = prosper::test::run_compute(spvTsad4, inX, N, N);
+    uint32_t badTsad4 = 0;
+    for (uint32_t i = 0; i < N && gotTsad4.size() == N; ++i)
+        if (bits_of(gotTsad4[i]) != 0x02E00007u) ++badTsad4;
+    CHECK(gotTsad4.size() == N && badTsad4 == 0,
+          "Tsad4: v_sad_hi_u8 shifts byte sum by 16 before adding accumulator");
+
+    // Tsad5: v_sad_u16 (0x15c). Two 16-bit unsigned absolute differences plus accumulator with 32-bit wrap.
+    // Inputs: S0=0x0001FFFF, S1=0xFFFF0001, S2=0xFFFFFFFF.
+    // Halfword diffs: |0xFFFF-0x0001|=65534, |0x0001-0xFFFF|=65534.
+    // Sum = 65534 + 65534 + 0xFFFFFFFF = 131068 - 1 = 131067 = 0x0001FFFB.
+    const uint32_t codeTsad5[] = {
+        0x7e0202ffu, 0x0001ffffu,   // v_mov_b32 v1, 0x0001FFFF
+        0x7e0402ffu, 0xffff0001u,   // v_mov_b32 v2, 0xFFFF0001
+        0x7e0602c1u,   // v_mov_b32 v3, -1 (0xFFFFFFFF)
+        0xd55c0004u, 0x040e0501u,   // v_sad_u16 v4, v1, v2, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad5 =
+        recompile_valu(codeTsad5, std::size(codeTsad5), 0, /*out_vgpr*/ 4);
+    CHECK(!spvTsad5.empty(), "recompiled Tsad5 (v_sad_u16) -> SPIR-V");
+    std::vector<float> gotTsad5 = prosper::test::run_compute(spvTsad5, inX, N, N);
+    uint32_t badTsad5 = 0;
+    for (uint32_t i = 0; i < N && gotTsad5.size() == N; ++i)
+        if (bits_of(gotTsad5[i]) != 0x0001FFFBu) ++badTsad5;
+    CHECK(gotTsad5.size() == N && badTsad5 == 0,
+          "Tsad5: v_sad_u16 wraps accumulator mod 2^32 across 16-bit halfword diffs");
+
+    // Tsad6: v_msad_u8 (0x171). Masked byte SAD, skipping byte when S1[k] == 0.
+    // Inputs: S0=0x003010F0, S1=0x50000F0F, S2=7.
+    // k=0: S0=0xF0, S1=0x0F != 0 => diff = 225.
+    // k=1: S0=0x10, S1=0x0F != 0 => diff = 1.
+    // k=2: S0=0x30, S1=0x00 == 0 => diff = 0 (skipped).
+    // k=3: S0=0x00, S1=0x50 != 0 => diff = 80.
+    // Sum = 225 + 1 + 0 + 80 + 7 = 313 = 0x139.
+    const uint32_t codeTsad6[] = {
+        0x7e0202ffu, 0x003010f0u,   // v_mov_b32 v1, 0x003010F0
+        0x7e0402ffu, 0x50000f0fu,   // v_mov_b32 v2, 0x50000F0F
+        0x7e060287u,   // v_mov_b32 v3, 7
+        0xd5710004u, 0x040e0501u,   // v_msad_u8 v4, v1, v2, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad6 =
+        recompile_valu(codeTsad6, std::size(codeTsad6), 0, /*out_vgpr*/ 4);
+    CHECK(!spvTsad6.empty(), "recompiled Tsad6 (v_msad_u8) -> SPIR-V");
+    std::vector<float> gotTsad6 = prosper::test::run_compute(spvTsad6, inX, N, N);
+    uint32_t badTsad6 = 0;
+    for (uint32_t i = 0; i < N && gotTsad6.size() == N; ++i)
+        if (bits_of(gotTsad6[i]) != 0x139u) ++badTsad6;
+    CHECK(gotTsad6.size() == N && badTsad6 == 0,
+          "Tsad6: v_msad_u8 skips byte when S1 byte is zero");
 
     // Astro's next blocker is VOP3B v_mad_u64_u32. Exercise all three architectural
     // outputs with an overflowing case:

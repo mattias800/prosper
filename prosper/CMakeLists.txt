@@ -2833,6 +2833,16 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_decode_sweep.cpp
     LIBRARIES prosper_core)
 
+  # The scalar opcode predicates are header-only facts checked against ISA/LLVM tables.
+  prosper_add_gtest(test_scalar_predicates
+    SOURCES tests/gpu/recompiler/test_scalar_predicates.cpp
+    INCLUDES src)
+
+  # The SOPP branch predicate is a header-only fact checked against the ISA table.
+  prosper_add_gtest(test_sopp_direct_branch
+    SOURCES tests/gpu/recompiler/test_sopp_direct_branch.cpp
+    INCLUDES src)
+
   # Closed-tail block admission is decoder-only, so this compiles rdna2_decode.cpp directly
   # (same pattern as test_workgroup_uniformity above).
   prosper_add_gtest(test_rdna2_closed_tail
@@ -2842,6 +2852,16 @@ if(TARGET prosper_core)
   # SOP2 destination widths are decoder-only facts checked against LLVM's SOP2 classes.
   prosper_add_gtest(test_sop2_dest_width
     SOURCES tests/gpu/recompiler/test_sop2_dest_width.cpp src/gpu/recompiler/rdna2_decode.cpp
+    INCLUDES src)
+
+  # Mandatory-literal capture is a decoder-only fact: K/data must be captured, not just counted.
+  prosper_add_gtest(test_rdna2_literal_capture
+    SOURCES tests/gpu/recompiler/test_rdna2_literal_capture.cpp src/gpu/recompiler/rdna2_decode.cpp
+    INCLUDES src)
+
+  # Memory-writer classification is a decoder-only predicate checked against the ISA tables.
+  prosper_add_gtest(test_may_write_memory
+    SOURCES tests/gpu/recompiler/test_may_write_memory.cpp src/gpu/recompiler/rdna2_decode.cpp
     INCLUDES src)
 
   # Structural RDNA2->SPIR-V validation that does not require Vulkan runtime support.
@@ -3598,9 +3618,8 @@ endif()
     SOURCES tests/gpu/recompiler/test_undef_loop_accumulator.cpp
     LIBRARIES prosper_core)
 
-  # Fail-visible refusal pins for gap opcodes (v_perm_b32, v_mad_i64_i32,
-  # v_div_fixup_f32, v_sad_u8, s_movrels_b32, image_gather4): empty module,
-  # never a silent mistranslation. Compile-only, no device. Any later
+  # Fail-visible refusal pins for gap opcodes (the file header lists the current
+  # set): empty module, never a silent mistranslation. Compile-only, no device. Any later
   # lowering replaces these arms with execution tests.
   prosper_add_gtest(test_gap_opcode_refusals
     SOURCES tests/gpu/recompiler/test_gap_opcode_refusals.cpp
