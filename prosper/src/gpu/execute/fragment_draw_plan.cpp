@@ -1,6 +1,7 @@
 #include "gpu/execute/fragment_draw_plan.hpp"
 #include "gpu/execute/fragment_scalar_bank.hpp"
 #include "gpu/recompiler/original_fragment_producer.hpp"
+#include "gpu/recompiler/rdna2_waitcnt.hpp"
 #include <array>
 #include <bit>
 #include <map>
@@ -173,8 +174,11 @@ bool packing_unobservable(const std::vector<Rdna2Inst>& instructions, uint32_t c
                 scalar_defined[reg] = true;
                 scalar_ready[reg] = false;
             }
-        } else if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c && in.simm16 == 0) {
-            scalar_ready = scalar_defined;
+        } else if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c) {
+            const auto immediate = uint16_t(in.simm16);
+            if (rdna2_waitcnt_execution_gap(immediate)) return false;
+            if (decode_rdna2_waitcnt(immediate).drains_scalar_reads())
+                scalar_ready = scalar_defined;
         } else if (in.fmt == Rdna2Format::VOP1 && in.opcode == 1 &&
                    in.dst.kind == OperandKind::VGPR && in.dst.value >= 0 && in.dst.value < 256) {
             if (!word(in.src[0], in, true) || !require_full_exec(in.pc)) return false;
@@ -190,8 +194,7 @@ bool packing_unobservable(const std::vector<Rdna2Inst>& instructions, uint32_t c
         } else if (in.fmt == Rdna2Format::SOPP && in.is_end && in.opcode == 1) {
             ended = in.pc + in.len_dwords == code_words;
             if (!ended) return false;
-        } else if (!(in.fmt == Rdna2Format::SOPP &&
-                     (in.opcode == 0 || (in.opcode == 0x0c && in.simm16 == 0))))
+        } else if (!(in.fmt == Rdna2Format::SOPP && in.opcode == 0))
             return false;
     }
     return ended && exports == 1 && !full_masks.empty();

@@ -68,6 +68,63 @@ protected:
     }
 };
 
+class FragmentScalarBankPlan : public FragmentScalarBank {
+protected:
+    void SetUp() override {
+        // Explicit offline compiler inputs, NOT evidence of actual enabled device features.
+        // Publish before realization so the real producing capsule carries the same profile.
+        g::reset_float_transport_config_for_test();
+        g::publish_float_transport_config({g::FloatTransportProfile::ExplicitNonFinite32});
+        g::publish_float_controls_support(true, true);
+        FragmentScalarBank::SetUp();
+    }
+    void TearDown() override {
+        FragmentScalarBank::TearDown();
+        g::reset_float_transport_config_for_test();
+    }
+};
+
+TEST_F(FragmentScalarBankPlan, CounterSpecificWaitSeparatesSealedBytesFromPlanReadiness) {
+    const g::FragmentPacketDeviceContract source_device{0x1234, true, false};
+    for (const uint16_t immediate : {0u, 0xc07fu, 0x3f70u, 0xff7fu, 0x0100u}) {
+        SCOPED_TRACE(immediate);
+        auto words = f::fragment_words();
+        ASSERT_EQ(words[3], 0xbf8c0000u);
+        words[3] |= immediate;
+        const auto source = f::register_original(false, words);
+        ASSERT_TRUE(source);
+        auto state = scene.state();
+        for (const auto& reg : source->registers) state.sh[reg.offset] = reg.value;
+        run(state);
+        ASSERT_EQ(observed.size(), 1u);
+        const auto value = bank(observed[0]);
+        ASSERT_TRUE(value) << "checked byte ownership is not ISA memory-result readiness";
+        EXPECT_EQ(rgba(*value), r::fragment_draw::color_a);
+        const auto& input = observed[0].fragment_draw_inputs;
+        ASSERT_TRUE(input);
+        ASSERT_EQ(*input->raw_code, words);
+        const auto prepared = r::fragment_draw::prepare(observed[0]);
+        ASSERT_TRUE(prepared);
+        const auto plan = g::cached_fragment_draw_program(*input, *prepared, source_device, 48);
+        ASSERT_TRUE(plan);
+        if (immediate == 0 || immediate == 0xc07f) {
+            ASSERT_TRUE(plan->rejection_reason().empty()) << plan->rejection_reason();
+            ASSERT_TRUE(plan->requires_scalar_bank());
+            const auto transaction = g::instantiate_fragment_draw_transaction(
+                plan, input, *prepared, r::fragment_draw::width, r::fragment_draw::height, 1,
+                source_device.device_identity);
+            ASSERT_TRUE(transaction.rejection().empty()) << transaction.rejection();
+            EXPECT_EQ(transaction.scalar_bank(), value)
+                << "the actual consumer retains the sealed bytes after permission expiry";
+        } else {
+            EXPECT_EQ(plan->rejection_reason(),
+                      "fragment-draw-entry-and-composition-recipe-unproved")
+                << "VM-only/no-drain/partial threshold cannot complete pending scalar results";
+            EXPECT_FALSE(plan->capacity_owner());
+        }
+    }
+}
+
 TEST_F(FragmentScalarBank, CodeFreeHintObservesOnlyPhysicalLaunchAndCannotMintAuthority) {
     auto state = scene.state();
     const auto before = g::shader_decode_cache_stats();
