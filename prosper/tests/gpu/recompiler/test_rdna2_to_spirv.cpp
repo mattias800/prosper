@@ -10856,7 +10856,7 @@ int main() {
     };
     for (uint32_t i = 0; i < N; ++i) {
         const auto& c = kPermCases[i % std::size(kPermCases)];
-        inPerm[i] = float_of(c.sel);
+        inPerm[i] = std::bit_cast<float>(c.sel);
         expPerm[i] = c.exp;
     }
     std::vector<float> gotTperm = prosper::test::run_compute(spvTperm, inPerm, N, N);
