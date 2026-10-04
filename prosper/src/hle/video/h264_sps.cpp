@@ -140,7 +140,8 @@ bool parse_first_sps(const uint8_t* au, size_t n, SpsPictureMeta* out) {
     bool high = false;
     for (uint32_t hp : kHighProfiles) high = high || profile_idc == hp;
 
-    uint32_t chroma_format_idc = 1;   // inferred 4:2:0 when the profile does not code it (7.4.2.1.1)
+    uint32_t chroma_format_idc =
+        1;   // inferred 4:2:0 when the profile does not code it (7.4.2.1.1)
     if (high) {
         if (!br.ue(&chroma_format_idc)) return false;
         if (chroma_format_idc == 3) {

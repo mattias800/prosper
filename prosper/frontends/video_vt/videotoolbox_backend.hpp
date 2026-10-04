@@ -68,4 +68,4 @@ bool videotoolbox_pack_for_test(CVPixelBufferRef image, const uint32_t rect[4],
 // process's.
 std::string videotoolbox_temp_prefix();
 
-} // namespace prosper::video
+}   // namespace prosper::video

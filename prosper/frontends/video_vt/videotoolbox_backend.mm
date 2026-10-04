@@ -52,10 +52,14 @@ constexpr size_t kAudioQueueCapacity = 32;
 // two read positions within this window and alternates between them.
 constexpr uint64_t kAudioLeadUs = 500000;
 
-bool avp_log() { return PROSPER_ENV_ON("PROSPER_AVPLOG"); }
+bool avp_log() {
+    return PROSPER_ENV_ON("PROSPER_AVPLOG");
+}
 // Deliberately a LIVE read, not PROSPER_ENV_ON: test_video_vt arms it at runtime to exercise the
 // software arm on a host without a hardware decoder, and a cached read would make that arm vacuous.
-bool software_decode_allowed() { return std::getenv("PROSPER_AVP_ALLOW_SOFTWARE") != nullptr; }
+bool software_decode_allowed() {
+    return std::getenv("PROSPER_AVP_ALLOW_SOFTWARE") != nullptr;
+}
 
 uint64_t cmtime_us(CMTime time) {
     if (!CMTIME_IS_NUMERIC(time)) return 0;
@@ -76,12 +80,14 @@ struct AudioPacket {
 };
 
 // The displayed rectangle inside the decoder's buffer, fixed by the first picture.
-struct Crop { uint32_t x = 0, y = 0, width = 0, height = 0; };
+struct Crop {
+    uint32_t x = 0, y = 0, width = 0, height = 0;
+};
 
 struct Session {
-    std::string path;          // what AVFoundation opens
-    std::string display_name;  // what the log says (the guest path for open_memory)
-    bool owns_path = false;    // open_memory's temporary copy, unlinked when the worker exits
+    std::string path;   // what AVFoundation opens
+    std::string display_name;   // what the log says (the guest path for open_memory)
+    bool owns_path = false;   // open_memory's temporary copy, unlinked when the worker exits
     bool allow_software = false;
 
     std::mutex mutex;
@@ -145,8 +151,8 @@ bool make_reader_unguarded(AVAsset* asset, AVAssetTrack* video_track, AVAssetTra
     // Video is read COMPRESSED (nil output settings = passthrough) and decoded by this backend's own
     // VTDecompressionSession, because AVAssetReader neither lets a caller require hardware decoding
     // nor reports which decoder it chose. See Decoder below.
-    AVAssetReaderTrackOutput* video =
-        [[AVAssetReaderTrackOutput alloc] initWithTrack:video_track outputSettings:nil];
+    AVAssetReaderTrackOutput* video = [[AVAssetReaderTrackOutput alloc] initWithTrack:video_track
+                                                                       outputSettings:nil];
     video.alwaysCopiesSampleData = NO;
     if (![reader canAddOutput:video]) return false;
     [reader addOutput:video];
@@ -173,7 +179,8 @@ bool make_reader_unguarded(AVAsset* asset, AVAssetTrack* video_track, AVAssetTra
     if (![reader startReading]) {
         if (avp_log())
             std::fprintf(stderr, "[avp-vt] startReading failed: %s\n",
-                         reader.error ? reader.error.localizedDescription.UTF8String : "(no error)");
+                         reader.error ? reader.error.localizedDescription.UTF8String
+                                      : "(no error)");
         return false;
     }
     out.reader = reader;
@@ -188,12 +195,12 @@ bool make_reader_unguarded(AVAsset* asset, AVAssetTrack* video_track, AVAssetTra
 bool make_reader(AVAsset* asset, AVAssetTrack* video_track, AVAssetTrack* audio_track,
                  const StreamInfo& info, NSData* channel_layout, CMTime start, Reader& out) {
     @try {
-        return make_reader_unguarded(asset, video_track, audio_track, info, channel_layout,
-                                     start, out);
+        return make_reader_unguarded(asset, video_track, audio_track, info, channel_layout, start,
+                                     out);
     } @catch (NSException* e) {
         if (avp_log())
-            std::fprintf(stderr, "[avp-vt] reader construction raised %s: %s\n",
-                         e.name.UTF8String, e.reason ? e.reason.UTF8String : "");
+            std::fprintf(stderr, "[avp-vt] reader construction raised %s: %s\n", e.name.UTF8String,
+                         e.reason ? e.reason.UTF8String : "");
         return false;
     }
 }
@@ -248,8 +255,9 @@ Crop picture_crop(CVImageBufferRef image, CMFormatDescriptionRef format,
     if (sps && sps->coded_width == plane_w && sps->coded_height == plane_h)
         if (auto c = sps_crop(*sps)) return *c;
     if (format) {
-        if (auto c = crop_from_rect(CMVideoFormatDescriptionGetCleanAperture(format, /*originIsAtTopLeft=*/true),
-                                    plane_w, plane_h))
+        if (auto c = crop_from_rect(
+                CMVideoFormatDescriptionGetCleanAperture(format, /*originIsAtTopLeft=*/true),
+                plane_w, plane_h))
             return *c;
     }
     return Crop{0, 0, plane_w, plane_h};
@@ -258,7 +266,8 @@ Crop picture_crop(CVImageBufferRef image, CMFormatDescriptionRef format,
 // The stream's first SPS, from the avcC the format description carries, through the same parser
 // sceVideodec2GetPictureInfo uses (#2898). Nothing for non-H.264 tracks or an unparseable SPS.
 std::optional<h264::SpsPictureMeta> track_sps(CMFormatDescriptionRef format) {
-    if (!format || CMFormatDescriptionGetMediaSubType(format) != kCMVideoCodecType_H264) return std::nullopt;
+    if (!format || CMFormatDescriptionGetMediaSubType(format) != kCMVideoCodecType_H264)
+        return std::nullopt;
     const uint8_t* sps = nullptr;
     size_t sps_size = 0, count = 0;
     int nal_header_length = 0;
@@ -278,15 +287,19 @@ std::optional<h264::SpsPictureMeta> track_sps(CMFormatDescriptionRef format) {
 // nv12_bytes(width, height) exactly when width is even; an odd width carries one pad byte per luma
 // row (the stride), which consumers address through y_stride.
 bool copy_picture(CVImageBufferRef image, CMTime pts, const Crop& crop, VideoPacket& packet) {
-    if (!image || CVPixelBufferGetPixelFormatType(image) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
-        CVPixelBufferGetPlaneCount(image) != 2) return false;
+    if (!image ||
+        CVPixelBufferGetPixelFormatType(image) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+        CVPixelBufferGetPlaneCount(image) != 2)
+        return false;
     const uint32_t width = crop.width, height = crop.height;
     const uint32_t uv_rows = (height + 1u) / 2u;
     const uint32_t uv_row_bytes = 2u * ((width + 1u) / 2u);
     if (CVPixelBufferGetWidthOfPlane(image, 0) < crop.x + width ||
         CVPixelBufferGetHeightOfPlane(image, 0) < crop.y + height ||
-        CVPixelBufferGetHeightOfPlane(image, 1) < crop.y / 2u + uv_rows) return false;
-    if (CVPixelBufferLockBaseAddress(image, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return false;
+        CVPixelBufferGetHeightOfPlane(image, 1) < crop.y / 2u + uv_rows)
+        return false;
+    if (CVPixelBufferLockBaseAddress(image, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
+        return false;
     const auto* y = static_cast<const uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(image, 0));
     const auto* uv = static_cast<const uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(image, 1));
     const size_t y_pitch = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
@@ -301,7 +314,8 @@ bool copy_picture(CVImageBufferRef image, CMTime pts, const Crop& crop, VideoPac
         uint8_t* dst_uv = packet.bytes.data() + static_cast<size_t>(stride) * height;
         for (uint32_t row = 0; row < uv_rows; ++row)
             std::memcpy(dst_uv + static_cast<size_t>(row) * stride,
-                        uv + static_cast<size_t>(crop.y / 2u + row) * uv_pitch + crop.x, uv_row_bytes);
+                        uv + static_cast<size_t>(crop.y / 2u + row) * uv_pitch + crop.x,
+                        uv_row_bytes);
         packet.width = width;
         packet.height = height;
         packet.stride = stride;
@@ -328,15 +342,19 @@ bool copy_picture(CVImageBufferRef image, CMTime pts, const Crop& crop, VideoPac
 // sample's own presentation time on the MEDIA timeline -- the timeline its decode timestamps live
 // on. They differ by the container's edit list (measured: the test clip's I-frame is sample PTS
 // 0.0667 s, delivered at 0), so ordering must compare `order` with DTS, never `pts`.
-struct DecodedPicture { CVImageBufferRef image = nullptr; CMTime pts = kCMTimeInvalid; CMTime order = kCMTimeInvalid; };
+struct DecodedPicture {
+    CVImageBufferRef image = nullptr;
+    CMTime pts = kCMTimeInvalid;
+    CMTime order = kCMTimeInvalid;
+};
 
 struct Decoder {
     VTDecompressionSessionRef session = nullptr;
     CMFormatDescriptionRef format = nullptr;   // retained
     bool hardware = false;
-    std::mutex out_mutex;                      // the output callback may run on a VT thread
+    std::mutex out_mutex;   // the output callback may run on a VT thread
     std::vector<DecodedPicture> out;
-    std::vector<DecodedPicture> pending;       // decoded, not yet released; ordered by PTS
+    std::vector<DecodedPicture> pending;   // decoded, not yet released; ordered by PTS
     // Each DecodeFrame call's source-sample PTS, keyed by a serial passed as sourceFrameRefCon.
     // A map rather than a heap pointer the callback frees: whether VT invokes the callback for a
     // frame whose DecodeFrame call FAILED is not something this code has to know -- an unmatched
@@ -359,7 +377,10 @@ struct Decoder {
             std::lock_guard<std::mutex> lock(out_mutex);
             order_by_serial.clear();
         }
-        if (format) { CFRelease(format); format = nullptr; }
+        if (format) {
+            CFRelease(format);
+            format = nullptr;
+        }
         hardware = false;
     }
     std::vector<DecodedPicture> take() {
@@ -377,15 +398,17 @@ struct Decoder {
 std::vector<DecodedPicture> release_ready(Decoder& d, CMTime limit) {
     std::vector<DecodedPicture> fresh = d.take();
     d.pending.insert(d.pending.end(), fresh.begin(), fresh.end());
-    std::stable_sort(d.pending.begin(), d.pending.end(), [](const DecodedPicture& a, const DecodedPicture& b) {
-        return CMTimeCompare(a.order, b.order) < 0;
-    });
+    std::stable_sort(d.pending.begin(), d.pending.end(),
+                     [](const DecodedPicture& a, const DecodedPicture& b) {
+                         return CMTimeCompare(a.order, b.order) < 0;
+                     });
     size_t n = d.pending.size();
     if (CMTIME_IS_NUMERIC(limit)) {
         n = 0;
         while (n < d.pending.size() && CMTimeCompare(d.pending[n].order, limit) <= 0) ++n;
     }
-    std::vector<DecodedPicture> ready(d.pending.begin(), d.pending.begin() + static_cast<ptrdiff_t>(n));
+    std::vector<DecodedPicture> ready(d.pending.begin(),
+                                      d.pending.begin() + static_cast<ptrdiff_t>(n));
     d.pending.erase(d.pending.begin(), d.pending.begin() + static_cast<ptrdiff_t>(n));
     return ready;
 }
@@ -398,7 +421,10 @@ void decoder_output(void* refcon, void* frame_refcon, OSStatus status, VTDecodeI
     {
         std::lock_guard<std::mutex> lock(d->out_mutex);
         auto it = d->order_by_serial.find(reinterpret_cast<uintptr_t>(frame_refcon));
-        if (it != d->order_by_serial.end()) { order = it->second; d->order_by_serial.erase(it); }
+        if (it != d->order_by_serial.end()) {
+            order = it->second;
+            d->order_by_serial.erase(it);
+        }
     }
     if (status != noErr || !image || (flags & kVTDecodeInfo_FrameDropped)) {
         if (status != noErr && avp_log())
@@ -410,37 +436,44 @@ void decoder_output(void* refcon, void* frame_refcon, OSStatus status, VTDecodeI
     d->out.push_back({image, pts, order ? *order : pts});
 }
 
-bool make_decoder(Decoder& d, CMFormatDescriptionRef format, bool allow_software, const std::string& name) {
+bool make_decoder(Decoder& d, CMFormatDescriptionRef format, bool allow_software,
+                  const std::string& name) {
     d.reset();
     if (!format) return false;
-    NSDictionary* spec = allow_software
-        ? @{(id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder : @YES}
-        : @{(id)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder : @YES};
+    NSDictionary* spec =
+        allow_software
+            ? @{(id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder : @YES}
+            : @{(id)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder : @YES};
     // 420v: bi-planar 4:2:0, luma plane + interleaved CbCr plane, video range -- NV12.
     NSDictionary* attrs = @{
         (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
     };
     VTDecompressionOutputCallbackRecord callback{decoder_output, &d};
-    const OSStatus created = VTDecompressionSessionCreate(nullptr, format, (__bridge CFDictionaryRef)spec,
-                                                          (__bridge CFDictionaryRef)attrs, &callback,
-                                                          &d.session);
+    const OSStatus created =
+        VTDecompressionSessionCreate(nullptr, format, (__bridge CFDictionaryRef)spec,
+                                     (__bridge CFDictionaryRef)attrs, &callback, &d.session);
     if (created != noErr || !d.session) {
         // Unconditional: the title's video will not play, and this is the reason.
-        std::fprintf(stderr, "[avp-vt] '%s': could not create a %s video decoder session (status %d)\n",
+        std::fprintf(stderr,
+                     "[avp-vt] '%s': could not create a %s video decoder session (status %d)\n",
                      name.c_str(), allow_software ? "hardware-or-software" : "HARDWARE",
                      static_cast<int>(created));
         d.session = nullptr;
         return false;
     }
     CFBooleanRef using_hardware = nullptr;
-    if (VTSessionCopyProperty(d.session, kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
-                              nullptr, &using_hardware) == noErr && using_hardware) {
+    if (VTSessionCopyProperty(d.session,
+                              kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                              nullptr, &using_hardware) == noErr &&
+        using_hardware) {
         d.hardware = CFBooleanGetValue(using_hardware);
         CFRelease(using_hardware);
     }
     if (!d.hardware && !allow_software) {
-        std::fprintf(stderr, "[avp-vt] '%s': session reports a software decoder; refused "
-                             "(PROSPER_AVP_ALLOW_SOFTWARE=1 to allow)\n", name.c_str());
+        std::fprintf(stderr,
+                     "[avp-vt] '%s': session reports a software decoder; refused "
+                     "(PROSPER_AVP_ALLOW_SOFTWARE=1 to allow)\n",
+                     name.c_str());
         d.reset();
         return false;
     }
@@ -451,7 +484,8 @@ bool make_decoder(Decoder& d, CMFormatDescriptionRef format, bool allow_software
 
 // Feed one compressed sample. A mid-stream format change the session cannot take recreates it
 // under the same hardware policy.
-bool decode_sample(Decoder& d, CMSampleBufferRef sample, bool allow_software, const std::string& name) {
+bool decode_sample(Decoder& d, CMSampleBufferRef sample, bool allow_software,
+                   const std::string& name) {
     CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sample);
     if (format && d.format && !CMFormatDescriptionEqual(format, d.format) &&
         !VTDecompressionSessionCanAcceptFormatDescription(d.session, format)) {
@@ -471,10 +505,9 @@ bool decode_sample(Decoder& d, CMSampleBufferRef sample, bool allow_software, co
         std::lock_guard<std::mutex> lock(d.out_mutex);
         d.order_by_serial[serial] = CMSampleBufferGetPresentationTimeStamp(sample);
     }
-    const OSStatus st = VTDecompressionSessionDecodeFrame(d.session, sample,
-                                                          0 /* synchronous, no temporal delay */,
-                                                          reinterpret_cast<void*>(static_cast<uintptr_t>(serial)),
-                                                          &info);
+    const OSStatus st = VTDecompressionSessionDecodeFrame(
+        d.session, sample, 0 /* synchronous, no temporal delay */,
+        reinterpret_cast<void*>(static_cast<uintptr_t>(serial)), &info);
     if (st != noErr) {   // whether or not VT called back for it, its key must not linger
         std::lock_guard<std::mutex> lock(d.out_mutex);
         d.order_by_serial.erase(serial);
@@ -533,13 +566,19 @@ void decode_loop(Session& session, AVAsset* asset, AVAssetTrack* video_track,
     auto deliver = [&](std::vector<DecodedPicture> pictures) -> bool {
         bool ok = true;
         for (auto& picture : pictures) {
-            if (!ok) { CVBufferRelease(picture.image); continue; }
+            if (!ok) {
+                CVBufferRelease(picture.image);
+                continue;
+            }
             if (!session.initialized) crop = picture_crop(picture.image, video_format, sps);
             VideoPacket packet;
             const bool copied = copy_picture(picture.image, picture.pts, crop, packet);
             CVBufferRelease(picture.image);
             if (!copied) {
-                if (!session.initialized) { ok = false; continue; }
+                if (!session.initialized) {
+                    ok = false;
+                    continue;
+                }
                 video_eof = audio_eof = true;
                 mark_video_done(session, "unexpected decoded picture layout");
                 ok = false;
@@ -555,13 +594,13 @@ void decode_loop(Session& session, AVAsset* asset, AVAssetTrack* video_track,
                     session.stream_info = info;
                 }
                 if (avp_log())
-                    std::fprintf(stderr,
-                                 "[avp-vt] opened '%s': %ux%u (crop at %u,%u) %.3f fps, "
-                                 "audio=%u/%u, duration=%.3fs, decoder=%s (observed)\n",
-                                 session.display_name.c_str(), info.width, info.height, crop.x,
-                                 crop.y, info.fps, info.audio_channels, info.audio_rate,
-                                 info.duration_us / 1e6,
-                                 decoder->hardware ? "hardware VideoToolbox" : "software (explicit)");
+                    std::fprintf(
+                        stderr,
+                        "[avp-vt] opened '%s': %ux%u (crop at %u,%u) %.3f fps, "
+                        "audio=%u/%u, duration=%.3fs, decoder=%s (observed)\n",
+                        session.display_name.c_str(), info.width, info.height, crop.x, crop.y,
+                        info.fps, info.audio_channels, info.audio_rate, info.duration_us / 1e6,
+                        decoder->hardware ? "hardware VideoToolbox" : "software (explicit)");
                 finish_initialization(session, true);
             }
             std::lock_guard<std::mutex> lock(session.mutex);
@@ -586,12 +625,15 @@ void decode_loop(Session& session, AVAsset* asset, AVAssetTrack* video_track,
                     // While video runs, audio keeps pace with it (and a full audio queue drops its
                     // oldest, so an unconsumed audio stream cannot stall video). After video has
                     // ended, the tail is read only into free room: nothing can be dropped any more.
-                    read_audio = !audio_eof &&
-                                 (video_eof ? audio_room : audio_pos_us <= video_pos_us + kAudioLeadUs);
+                    read_audio =
+                        !audio_eof &&
+                        (video_eof ? audio_room : audio_pos_us <= video_pos_us + kAudioLeadUs);
                     if (read_audio && read_video) {
                         // Alternate by position so neither output starves the other.
-                        if (audio_pos_us <= video_pos_us) read_video = false;
-                        else read_audio = false;
+                        if (audio_pos_us <= video_pos_us)
+                            read_video = false;
+                        else
+                            read_audio = false;
                     }
                     if (read_audio || read_video) break;
                     // Queue full, or finished: wait for a pull, a seek, or close.
@@ -610,7 +652,8 @@ void decode_loop(Session& session, AVAsset* asset, AVAssetTrack* video_track,
                     // A seek beyond the stream lands nowhere: report it rather than "succeed" into
                     // an immediate end of stream. CONFIDENCE: MED (VA-API's equivalent is the
                     // container seek's own result).
-                    const bool in_range = info.duration_us == 0 || skip_before_us <= info.duration_us;
+                    const bool in_range =
+                        info.duration_us == 0 || skip_before_us <= info.duration_us;
                     // The pictures between the decodable start and the target are decoded and dropped
                     // (skip_before_us), so the first one delivered is the requested one. Measured: a
                     // passthrough AVAssetReader whose timeRange starts at 0.2 s delivers from the
@@ -618,9 +661,12 @@ void decode_loop(Session& session, AVAsset* asset, AVAssetTrack* video_track,
                     // decodable start; the mid-stream seek test pins the pixels this produces. The
                     // decoder is rebuilt under the same hardware policy.
                     const CMTime target = CMTimeMake(static_cast<int64_t>(skip_before_us), 1000000);
-                    const bool rebuilt = in_range &&
-                        make_decoder(*decoder, video_format, session.allow_software, session.display_name) &&
-                        make_reader(asset, video_track, audio_track, info, channel_layout, target, reader);
+                    const bool rebuilt =
+                        in_range &&
+                        make_decoder(*decoder, video_format, session.allow_software,
+                                     session.display_name) &&
+                        make_reader(asset, video_track, audio_track, info, channel_layout, target,
+                                    reader);
                     video_eof = !rebuilt;
                     audio_eof = !rebuilt || !audio_track;
                     video_pos_us = audio_pos_us = skip_before_us;
@@ -654,8 +700,8 @@ void decode_loop(Session& session, AVAsset* asset, AVAssetTrack* video_track,
                     mark_video_done(session, failed ? "video stream failed" : nullptr);
                     continue;
                 }
-                const bool has_data = CMSampleBufferGetNumSamples(sample) > 0 &&
-                                      CMSampleBufferGetDataBuffer(sample);
+                const bool has_data =
+                    CMSampleBufferGetNumSamples(sample) > 0 && CMSampleBufferGetDataBuffer(sample);
                 // Everything presented no later than this sample's decode time is final now.
                 CMTime dts = CMSampleBufferGetDecodeTimeStamp(sample);
                 if (!CMTIME_IS_NUMERIC(dts)) dts = CMSampleBufferGetPresentationTimeStamp(sample);
@@ -664,11 +710,15 @@ void decode_loop(Session& session, AVAsset* asset, AVAssetTrack* video_track,
                     finish_initialization(session, false);
                     break;
                 }
-                const bool decoded = !has_data ||
+                const bool decoded =
+                    !has_data ||
                     decode_sample(*decoder, sample, session.allow_software, session.display_name);
                 CFRelease(sample);
                 if (!decoded) {
-                    if (!session.initialized) { finish_initialization(session, false); break; }
+                    if (!session.initialized) {
+                        finish_initialization(session, false);
+                        break;
+                    }
                     video_eof = audio_eof = true;
                     mark_video_done(session, "decoder rejected a sample");
                     continue;
@@ -691,7 +741,8 @@ void decode_loop(Session& session, AVAsset* asset, AVAssetTrack* video_track,
                 if (session.seek_generation != generation) continue;
                 // A title may render video while routing or disabling audio elsewhere. While video
                 // runs, an unconsumed audio queue must not stall the reader before the next frame.
-                if (session.audio_queue.size() == kAudioQueueCapacity) session.audio_queue.pop_front();
+                if (session.audio_queue.size() == kAudioQueueCapacity)
+                    session.audio_queue.pop_front();
                 session.audio_queue.push_back(std::move(packet));
                 session.cv.notify_all();
             }
@@ -715,11 +766,13 @@ void decode_session(Session& session) {
             NSString* path = [NSString stringWithUTF8String:session.path.c_str()];
             NSURL* url = path ? [NSURL fileURLWithPath:path] : nil;
             AVURLAsset* asset = url ? [AVURLAsset URLAssetWithURL:url options:nil] : nil;
-            NSArray<AVAssetTrack*>* video_tracks = asset ? [asset tracksWithMediaType:AVMediaTypeVideo] : nil;
+            NSArray<AVAssetTrack*>* video_tracks =
+                asset ? [asset tracksWithMediaType:AVMediaTypeVideo] : nil;
             AVAssetTrack* video_track = video_tracks.count ? video_tracks.firstObject : nil;
             if (!video_track) {
                 if (avp_log())
-                    std::fprintf(stderr, "[avp-vt] open '%s': no video track\n", session.display_name.c_str());
+                    std::fprintf(stderr, "[avp-vt] open '%s': no video track\n",
+                                 session.display_name.c_str());
                 finish_initialization(session, false);
                 return;
             }
@@ -736,12 +789,14 @@ void decode_session(Session& session) {
             info.duration_us = cmtime_us(asset.duration);
             CMFormatDescriptionRef video_format =
                 video_track.formatDescriptions.count
-                    ? (__bridge CMFormatDescriptionRef)video_track.formatDescriptions.firstObject : nullptr;
-            const FourCharCode codec = video_format ? CMFormatDescriptionGetMediaSubType(video_format) : 0;
+                    ? (__bridge CMFormatDescriptionRef)video_track.formatDescriptions.firstObject
+                    : nullptr;
+            const FourCharCode codec =
+                video_format ? CMFormatDescriptionGetMediaSubType(video_format) : 0;
             NSData* channel_layout = nil;
             if (audio_track && audio_track.formatDescriptions.count) {
-                const auto audio_format =
-                    (__bridge CMAudioFormatDescriptionRef)audio_track.formatDescriptions.firstObject;
+                const auto audio_format = (__bridge CMAudioFormatDescriptionRef)
+                                              audio_track.formatDescriptions.firstObject;
                 const AudioStreamBasicDescription* asbd =
                     CMAudioFormatDescriptionGetStreamBasicDescription(audio_format);
                 if (asbd && asbd->mChannelsPerFrame > 0 && asbd->mSampleRate > 0) {
@@ -768,15 +823,20 @@ void decode_session(Session& session) {
                 std::lock_guard<std::mutex> lock(session.mutex);
                 session.stream_info = info;
             }
-            decode_loop(session, asset, video_track, audio_track, info, channel_layout, video_format);
+            decode_loop(session, asset, video_track, audio_track, info, channel_layout,
+                        video_format);
         } @catch (NSException* e) {
             if (avp_log())
                 std::fprintf(stderr, "[avp-vt] '%s' raised %s: %s\n", session.display_name.c_str(),
                              e.name.UTF8String, e.reason ? e.reason.UTF8String : "");
-            if (!session.initialized) finish_initialization(session, false);
-            else mark_video_done(session, "decode worker stopped by an exception");
+            if (!session.initialized)
+                finish_initialization(session, false);
+            else
+                mark_video_done(session, "decode worker stopped by an exception");
         }
-        if (avp_log()) std::fprintf(stderr, "[avp-vt] decode worker exiting '%s'\n", session.display_name.c_str());
+        if (avp_log())
+            std::fprintf(stderr, "[avp-vt] decode worker exiting '%s'\n",
+                         session.display_name.c_str());
     }
 }
 
@@ -791,12 +851,15 @@ void stop_session(const std::shared_ptr<Session>& session) {
     if (session->owns_path) ::unlink(session->path.c_str());
 }
 
-} // namespace
+}   // namespace
 
 bool videotoolbox_display_rect_for_test(CVPixelBufferRef image, uint32_t rect[4]) {
     if (!image || !rect) return false;
     const Crop c = picture_crop(image, nullptr, std::nullopt);
-    rect[0] = c.x; rect[1] = c.y; rect[2] = c.width; rect[3] = c.height;
+    rect[0] = c.x;
+    rect[1] = c.y;
+    rect[2] = c.width;
+    rect[3] = c.height;
     return true;
 }
 
@@ -804,7 +867,8 @@ bool videotoolbox_pack_for_test(CVPixelBufferRef image, const uint32_t rect[4],
                                 std::vector<uint8_t>* nv12, uint32_t* stride) {
     if (!image || !rect || !nv12 || !stride) return false;
     VideoPacket packet;
-    if (!copy_picture(image, kCMTimeZero, Crop{rect[0], rect[1], rect[2], rect[3]}, packet)) return false;
+    if (!copy_picture(image, kCMTimeZero, Crop{rect[0], rect[1], rect[2], rect[3]}, packet))
+        return false;
     *nv12 = std::move(packet.bytes);
     *stride = packet.stride;
     return true;
@@ -863,11 +927,14 @@ struct VideoToolboxBackend::Impl {
 VideoToolboxBackend::VideoToolboxBackend() : impl_(std::make_unique<Impl>()) {}
 VideoToolboxBackend::~VideoToolboxBackend() = default;
 
-bool VideoToolboxBackend::available() const { return impl_ != nullptr; }
+bool VideoToolboxBackend::available() const {
+    return impl_ != nullptr;
+}
 
 int VideoToolboxBackend::open(const std::string& host_path) {
     if (host_path.empty() || ::access(host_path.c_str(), R_OK) != 0) {
-        if (avp_log()) std::fprintf(stderr, "[avp-vt] open '%s': not readable\n", host_path.c_str());
+        if (avp_log())
+            std::fprintf(stderr, "[avp-vt] open '%s': not readable\n", host_path.c_str());
         return -1;
     }
     auto session = std::make_shared<Session>();
@@ -876,7 +943,8 @@ int VideoToolboxBackend::open(const std::string& host_path) {
     return impl_->start(std::move(session));
 }
 
-int VideoToolboxBackend::open_memory(const std::string& debug_name, const uint8_t* data, size_t bytes) {
+int VideoToolboxBackend::open_memory(const std::string& debug_name, const uint8_t* data,
+                                     size_t bytes) {
     if (!data || bytes == 0) return -1;
     // AVURLAsset reads from a URL. A private temporary file is the plain way to hand it caller bytes;
     // the backend takes its copy here, as the contract requires, and unlinks it when the session ends.
@@ -895,7 +963,10 @@ int VideoToolboxBackend::open_memory(const std::string& debug_name, const uint8_
         written += static_cast<size_t>(n);
     }
     ::close(fd);
-    if (written != bytes) { ::unlink(name.data()); return -1; }
+    if (written != bytes) {
+        ::unlink(name.data());
+        return -1;
+    }
     auto session = std::make_shared<Session>();
     session->path = name.data();
     session->display_name = debug_name;
@@ -955,7 +1026,8 @@ bool VideoToolboxBackend::next_audio(int id, AudioFrame& out) {
     session->cv.notify_all();
     out.pcm = session->last_audio.pcm.data();
     out.channels = session->last_audio.channels;
-    out.samples = static_cast<uint32_t>(session->last_audio.pcm.size() / session->last_audio.channels);
+    out.samples =
+        static_cast<uint32_t>(session->last_audio.pcm.size() / session->last_audio.channels);
     out.sample_rate = session->last_audio.sample_rate;
     out.pts_us = session->last_audio.pts_us;
     return true;
@@ -1033,4 +1105,4 @@ void uninstall_videotoolbox_backend() {
     if (backend() == &shared_videotoolbox_backend()) set_backend(nullptr);
 }
 
-} // namespace prosper::video
+}   // namespace prosper::video

@@ -35,7 +35,7 @@ extern "C" int prosper_reserved_range_state(uint64_t);   // memory-HLE mapping c
 #include "media_foundation_backend.hpp"   // native Windows AvPlayer demux + hardware decode
 #endif
 #ifdef PROSPER_VIDEO_VT
-#include "videotoolbox_backend.hpp"       // native macOS AVFoundation demux + VideoToolbox hardware decode
+#include "videotoolbox_backend.hpp"   // native macOS AVFoundation demux + VideoToolbox hardware decode
 #endif
 #ifdef PROSPER_VIDEO_VAAPI
 #include "vaapi_backend.hpp"              // native Linux FFmpeg demux + VA-API hardware decode

@@ -169,7 +169,8 @@ static void test_baseline_parses_with_all_flags_absent() {
     CHECK(prosper::h264::parse_first_sps(au.data(), au.size(), &m),
           "baseline SPS should parse");
     CHECK(!m.crop_flag, "no crop flag expected");
-    CHECK(m.chroma_format_idc == 1, "a Baseline SPS does not code chroma_format_idc: 4:2:0 is inferred");
+    CHECK(m.chroma_format_idc == 1,
+          "a Baseline SPS does not code chroma_format_idc: 4:2:0 is inferred");
     CHECK(m.frame_mbs_only, "frame_mbs_only_flag expected");
     CHECK(m.coded_width == 640 && m.coded_height == 368, "coded size is (40 x 23) macroblocks");
     CHECK(!m.ar_flag, "no AR flag expected");
@@ -459,33 +460,52 @@ TEST(H264Sps, Contract) {
 TEST(H264Sps, FrameCropRectFollowsCropUnitsForEveryChromaFormatAndFieldCoding) {
     using prosper::h264::CropRect;
     using prosper::h264::frame_crop_rect;
-    auto meta = [](uint32_t chroma, bool frame_mbs_only, uint32_t l, uint32_t r, uint32_t t, uint32_t b) {
+    auto meta = [](uint32_t chroma, bool frame_mbs_only, uint32_t l, uint32_t r, uint32_t t,
+                   uint32_t b) {
         SpsPictureMeta m;
         m.chroma_format_idc = chroma;
         m.frame_mbs_only = frame_mbs_only;
         m.coded_width = 1920;
         m.coded_height = 1088;
         m.crop_flag = true;
-        m.crop[0] = l; m.crop[1] = r; m.crop[2] = t; m.crop[3] = b;
+        m.crop[0] = l;
+        m.crop[1] = r;
+        m.crop[2] = t;
+        m.crop[3] = b;
         return m;
     };
     CropRect c;
     // 4:2:0 progressive -- the common 1920x1088 -> 1920x1080 case: units (2, 2).
     ASSERT_TRUE(frame_crop_rect(meta(1, true, 0, 0, 0, 4), &c));
-    EXPECT_EQ(c.x, 0u); EXPECT_EQ(c.y, 0u); EXPECT_EQ(c.width, 1920u); EXPECT_EQ(c.height, 1080u);
+    EXPECT_EQ(c.x, 0u);
+    EXPECT_EQ(c.y, 0u);
+    EXPECT_EQ(c.width, 1920u);
+    EXPECT_EQ(c.height, 1080u);
     // 4:2:0 interlaced (frame_mbs_only = 0): CropUnitY doubles to 4.
     ASSERT_TRUE(frame_crop_rect(meta(1, false, 1, 1, 1, 1), &c));
-    EXPECT_EQ(c.x, 2u); EXPECT_EQ(c.y, 4u); EXPECT_EQ(c.width, 1916u); EXPECT_EQ(c.height, 1080u);
+    EXPECT_EQ(c.x, 2u);
+    EXPECT_EQ(c.y, 4u);
+    EXPECT_EQ(c.width, 1916u);
+    EXPECT_EQ(c.height, 1080u);
     // 4:2:2: SubWidthC 2, SubHeightC 1 -> units (2, 1); interlaced (2, 2).
     ASSERT_TRUE(frame_crop_rect(meta(2, true, 1, 0, 3, 5), &c));
-    EXPECT_EQ(c.x, 2u); EXPECT_EQ(c.y, 3u); EXPECT_EQ(c.width, 1918u); EXPECT_EQ(c.height, 1080u);
+    EXPECT_EQ(c.x, 2u);
+    EXPECT_EQ(c.y, 3u);
+    EXPECT_EQ(c.width, 1918u);
+    EXPECT_EQ(c.height, 1080u);
     ASSERT_TRUE(frame_crop_rect(meta(2, false, 0, 0, 1, 1), &c));
-    EXPECT_EQ(c.y, 2u); EXPECT_EQ(c.height, 1084u);
+    EXPECT_EQ(c.y, 2u);
+    EXPECT_EQ(c.height, 1084u);
     // 4:4:4 and monochrome: units (1, 1); interlaced (1, 2).
     ASSERT_TRUE(frame_crop_rect(meta(3, true, 3, 1, 0, 8), &c));
-    EXPECT_EQ(c.x, 3u); EXPECT_EQ(c.width, 1916u); EXPECT_EQ(c.height, 1080u);
+    EXPECT_EQ(c.x, 3u);
+    EXPECT_EQ(c.width, 1916u);
+    EXPECT_EQ(c.height, 1080u);
     ASSERT_TRUE(frame_crop_rect(meta(0, false, 1, 0, 1, 0), &c));
-    EXPECT_EQ(c.x, 1u); EXPECT_EQ(c.y, 2u); EXPECT_EQ(c.width, 1919u); EXPECT_EQ(c.height, 1086u);
+    EXPECT_EQ(c.x, 1u);
+    EXPECT_EQ(c.y, 2u);
+    EXPECT_EQ(c.width, 1919u);
+    EXPECT_EQ(c.height, 1086u);
     // Refusals: no crop flag, no coded size, or offsets that consume the whole picture
     // (including values that would wrap a 32-bit product).
     SpsPictureMeta none = meta(1, true, 0, 0, 0, 4);
@@ -494,7 +514,8 @@ TEST(H264Sps, FrameCropRectFollowsCropUnitsForEveryChromaFormatAndFieldCoding) {
     SpsPictureMeta unsized = meta(1, true, 0, 0, 0, 4);
     unsized.coded_width = 0;
     EXPECT_FALSE(frame_crop_rect(unsized, &c));
-    EXPECT_FALSE(frame_crop_rect(meta(1, true, 480, 480, 0, 0), &c)) << "960+960 crops all 1920 columns";
+    EXPECT_FALSE(frame_crop_rect(meta(1, true, 480, 480, 0, 0), &c))
+        << "960+960 crops all 1920 columns";
     EXPECT_FALSE(frame_crop_rect(meta(1, true, 0x80000000u, 0, 0, 0), &c)) << "must not wrap";
     EXPECT_FALSE(frame_crop_rect(meta(1, true, 0, 0, 0, 0), nullptr));
 }

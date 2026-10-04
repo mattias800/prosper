@@ -45,25 +45,30 @@ const char* const kSoftwareOnlyAsset = PROSPER_TEST_MPEG4_ASSET;
 // backend. VTIsHardwareDecodeSupported is a capability query and is not enough: a hosted
 // macos-26-arm64 runner answers yes for H.264 and then cannot open a hardware session.
 bool hardware_h264_session_available() {
-    static const uint8_t kSps[] = {0x67, 0x4d, 0x40, 0x0a, 0xec, 0xa1, 0x06, 0xd8, 0x08, 0x80, 0x00,
-                                   0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x1e, 0x07, 0x89, 0x12, 0xcb};
+    static const uint8_t kSps[] = {0x67, 0x4d, 0x40, 0x0a, 0xec, 0xa1, 0x06, 0xd8,
+                                   0x08, 0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00,
+                                   0x00, 0x1e, 0x07, 0x89, 0x12, 0xcb};
     static const uint8_t kPps[] = {0x68, 0xeb, 0xe3, 0xcb, 0x20};
     const uint8_t* sets[] = {kSps, kPps};
     const size_t sizes[] = {sizeof(kSps), sizeof(kPps)};
     CMFormatDescriptionRef format = nullptr;
-    if (CMVideoFormatDescriptionCreateFromH264ParameterSets(nullptr, 2, sets, sizes, 4, &format) != noErr)
+    if (CMVideoFormatDescriptionCreateFromH264ParameterSets(nullptr, 2, sets, sizes, 4, &format) !=
+        noErr)
         return false;
     const void* keys[] = {kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder};
     const void* values[] = {kCFBooleanTrue};
-    CFDictionaryRef spec = CFDictionaryCreate(nullptr, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
-                                              &kCFTypeDictionaryValueCallBacks);
+    CFDictionaryRef spec = CFDictionaryCreate(
+        nullptr, keys, values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     VTDecompressionSessionRef session = nullptr;
-    const OSStatus created = VTDecompressionSessionCreate(nullptr, format, spec, nullptr, nullptr, &session);
+    const OSStatus created =
+        VTDecompressionSessionCreate(nullptr, format, spec, nullptr, nullptr, &session);
     bool hardware = false;
     if (created == noErr && session) {
         CFBooleanRef using_hardware = nullptr;
-        if (VTSessionCopyProperty(session, kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
-                                  nullptr, &using_hardware) == noErr && using_hardware) {
+        if (VTSessionCopyProperty(session,
+                                  kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                                  nullptr, &using_hardware) == noErr &&
+            using_hardware) {
             hardware = CFBooleanGetValue(using_hardware);
             CFRelease(using_hardware);
         }
@@ -72,7 +77,8 @@ bool hardware_h264_session_available() {
     }
     CFRelease(spec);
     CFRelease(format);
-    std::fprintf(stderr, "[test] hardware H.264: capability query %s; a hardware session %s (status %d)\n",
+    std::fprintf(stderr,
+                 "[test] hardware H.264: capability query %s; a hardware session %s (status %d)\n",
                  VTIsHardwareDecodeSupported(kCMVideoCodecType_H264) ? "yes" : "no",
                  hardware ? "yes" : "no", static_cast<int>(created));
     return hardware;
@@ -126,13 +132,15 @@ Drained drain(VideoBackend& vb, int id, const StreamInfo& stream) {
         }
         if (video.y) {
             progressed = true;
-            d.planes_ok &= video.uv && video.width == stream.width && video.height == stream.height &&
-                           video.y_stride >= video.width && video.uv_stride >= video.width;
+            d.planes_ok &= video.uv && video.width == stream.width &&
+                           video.height == stream.height && video.y_stride >= video.width &&
+                           video.uv_stride >= video.width;
             if (d.planes_ok) {
                 for (uint32_t r = 0; r < video.height; ++r)
                     d.nv12_fnv = fnv(d.nv12_fnv, video.y + size_t(r) * video.y_stride, video.width);
                 for (uint32_t r = 0; r < (video.height + 1) / 2; ++r)
-                    d.nv12_fnv = fnv(d.nv12_fnv, video.uv + size_t(r) * video.uv_stride, video.width);
+                    d.nv12_fnv =
+                        fnv(d.nv12_fnv, video.uv + size_t(r) * video.uv_stride, video.width);
             }
             d.monotonic &= d.video == 0 || video.pts_us > previous;
             if (d.video == 0) d.first_pts = video.pts_us;
@@ -142,11 +150,15 @@ Drained drain(VideoBackend& vb, int id, const StreamInfo& stream) {
         AudioFrame audio{};
         if (vb.next_audio(id, audio)) {
             progressed = true;
-            d.audio_ok &= audio.pcm && audio.channels == 2 && audio.sample_rate == 48000 && audio.samples > 0;
+            d.audio_ok &=
+                audio.pcm && audio.channels == 2 && audio.sample_rate == 48000 && audio.samples > 0;
             ++d.audio;
         }
         if (!progressed) {
-            if (vb.eof(id)) { d.reached_eof = true; break; }
+            if (vb.eof(id)) {
+                d.reached_eof = true;
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
@@ -171,8 +183,9 @@ protected:
         unsetenv("PROSPER_AVP_ALLOW_SOFTWARE");
         if (!hardware_) {
             const int refused = vb_->open(kAsset);
-            EXPECT_LT(refused, 0) << "without a hardware decoder, open must refuse unless software is "
-                                     "explicitly allowed";
+            EXPECT_LT(refused, 0)
+                << "without a hardware decoder, open must refuse unless software is "
+                   "explicitly allowed";
             if (refused >= 0) vb_->close(refused);
             setenv("PROSPER_AVP_ALLOW_SOFTWARE", "1", 1);
         }
@@ -213,7 +226,8 @@ TEST_F(VideoToolboxBackendTest, DecodesEveryPictureBitExactWithAudio) {
     EXPECT_EQ(d.video, kExpectedFrames) << "every picture is delivered exactly once";
     EXPECT_TRUE(d.planes_ok) << "NV12 planes at the stream size; peek matches next";
     EXPECT_TRUE(d.monotonic) << "video timestamps strictly increase";
-    EXPECT_EQ(d.nv12_fnv, kExpectedNv12Fnv) << "NV12 pixels must match an independent bit-exact decode";
+    EXPECT_EQ(d.nv12_fnv, kExpectedNv12Fnv)
+        << "NV12 pixels must match an independent bit-exact decode";
     EXPECT_GT(d.audio, 0u);
     EXPECT_TRUE(d.audio_ok) << "audio is interleaved 16-bit stereo at 48 kHz";
     vb_->close(id);
@@ -264,7 +278,8 @@ TEST_F(VideoToolboxBackendTest, CropsToTheDisplayedRectangleBitExact) {
     EXPECT_TRUE(d.reached_eof);
     EXPECT_EQ(d.video, 15u);
     EXPECT_TRUE(d.planes_ok);
-    EXPECT_EQ(d.nv12_fnv, kCropNv12Fnv) << "cropped NV12 must match an independent bit-exact decode";
+    EXPECT_EQ(d.nv12_fnv, kCropNv12Fnv)
+        << "cropped NV12 must match an independent bit-exact decode";
     vb_->close(id);
 }
 
@@ -296,7 +311,8 @@ TEST(VideoToolboxCrop, AnAsymmetricVerticalCleanApertureIsCopiedFromTheRightRows
     constexpr int kW = 128, kH = 96;
     CVPixelBufferRef image = nullptr;
     ASSERT_EQ(CVPixelBufferCreate(nullptr, kW, kH, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                                  nullptr, &image), kCVReturnSuccess);
+                                  nullptr, &image),
+              kCVReturnSuccess);
     auto luma = [](int r, int c) { return static_cast<uint8_t>((r * 7 + c * 3) & 0xff); };
     auto chroma = [](int r, int c) { return static_cast<uint8_t>((r * 11 + c + 128) & 0xff); };
     ASSERT_EQ(CVPixelBufferLockBaseAddress(image, 0), kCVReturnSuccess);
@@ -304,28 +320,30 @@ TEST(VideoToolboxCrop, AnAsymmetricVerticalCleanApertureIsCopiedFromTheRightRows
     auto* uv = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(image, 1));
     const size_t y_pitch = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
     const size_t uv_pitch = CVPixelBufferGetBytesPerRowOfPlane(image, 1);
-    for (int r = 0; r < kH; ++r) for (int c = 0; c < kW; ++c) y[r * y_pitch + c] = luma(r, c);
-    for (int r = 0; r < kH / 2; ++r) for (int c = 0; c < kW; ++c) uv[r * uv_pitch + c] = chroma(r, c);
+    for (int r = 0; r < kH; ++r)
+        for (int c = 0; c < kW; ++c) y[r * y_pitch + c] = luma(r, c);
+    for (int r = 0; r < kH / 2; ++r)
+        for (int c = 0; c < kW; ++c) uv[r * uv_pitch + c] = chroma(r, c);
     CVPixelBufferUnlockBaseAddress(image, 0);
 
-    auto number = [](double v) {
-        return CFNumberCreate(nullptr, kCFNumberDoubleType, &v);
-    };
+    auto number = [](double v) { return CFNumberCreate(nullptr, kCFNumberDoubleType, &v); };
     const void* keys[] = {kCVImageBufferCleanApertureWidthKey, kCVImageBufferCleanApertureHeightKey,
                           kCVImageBufferCleanApertureHorizontalOffsetKey,
                           kCVImageBufferCleanApertureVerticalOffsetKey};
     CFNumberRef values[] = {number(120), number(92), number(-2), number(2)};
-    CFDictionaryRef aperture = CFDictionaryCreate(nullptr, keys, reinterpret_cast<const void**>(values), 4,
-                                                  &kCFTypeDictionaryKeyCallBacks,
-                                                  &kCFTypeDictionaryValueCallBacks);
-    CVBufferSetAttachment(image, kCVImageBufferCleanApertureKey, aperture, kCVAttachmentMode_ShouldPropagate);
+    CFDictionaryRef aperture =
+        CFDictionaryCreate(nullptr, keys, reinterpret_cast<const void**>(values), 4,
+                           &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CVBufferSetAttachment(image, kCVImageBufferCleanApertureKey, aperture,
+                          kCVAttachmentMode_ShouldPropagate);
     CFRelease(aperture);
     for (CFNumberRef v : values) CFRelease(v);
 
     uint32_t rect[4] = {};
     ASSERT_TRUE(videotoolbox_display_rect_for_test(image, rect));
     EXPECT_EQ(rect[0], 2u);
-    EXPECT_EQ(rect[1], 4u) << "4 rows are cut from the TOP: the lower-left clean rect must be flipped";
+    EXPECT_EQ(rect[1], 4u)
+        << "4 rows are cut from the TOP: the lower-left clean rect must be flipped";
     EXPECT_EQ(rect[2], 120u);
     EXPECT_EQ(rect[3], 92u);
 
@@ -338,7 +356,8 @@ TEST(VideoToolboxCrop, AnAsymmetricVerticalCleanApertureIsCopiedFromTheRightRows
     for (int r = 0; r < 92; ++r)
         for (int c = 0; c < 120; ++c) luma_ok &= nv12[r * stride + c] == luma(r + 4, c + 2);
     for (int r = 0; r < 46; ++r)
-        for (int c = 0; c < 120; ++c) chroma_ok &= nv12[(92 + r) * stride + c] == chroma(r + 2, c + 2);
+        for (int c = 0; c < 120; ++c)
+            chroma_ok &= nv12[(92 + r) * stride + c] == chroma(r + 2, c + 2);
     EXPECT_TRUE(luma_ok) << "every displayed luma sample comes from (row + 4, column + 2)";
     EXPECT_TRUE(chroma_ok) << "every chroma pair comes from (row + 2, byte + 2)";
     CVPixelBufferRelease(image);
@@ -434,4 +453,4 @@ TEST(VideoToolboxBackendInstall, UninstallClearsOnlyItsOwnRegistration) {
     set_backend(nullptr);
 }
 
-} // namespace
+}   // namespace
