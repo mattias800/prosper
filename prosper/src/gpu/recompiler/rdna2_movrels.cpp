@@ -10,11 +10,17 @@ bool emit_s_movrels_b32(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool
     // RDNA2 ISA Doc 70648: "addr = SRC0 address; addr += M0; D = SGPR[addr]".
     //
     // Both src0 and dst must be SGPRs (kind == SGPR, 0..105). Non-SGPR sources/destinations refuse.
-    // Untracked M0 refuses fail-visibly (matches v_movrels_b32).
+    // Untracked M0 refuses fail-visibly (matches v_movrels_b32). A candidate SGPR the shader never
+    // wrote reads as 0 -- operand_bits' placeholder for an unwritten SGPR, the same convention the
+    // v_movrels_b32 lowering uses for unwritten VGPRs (whose hardware value is undefined). A
+    // candidate that is not representable (an entry-M0 token, a saved mask half) refuses the whole
+    // instruction instead.
     //
-    // CONFIDENCE: HIGH (ISA pseudocode: "addr = SRC0 address; addr += M0; D = SGPR[addr]").
-    // Indices outside the physical SGPR range (105) are undefined on hardware; capping candidates at
-    // SGPR 105 aligns with the v_movrels_b32 precedent, refusing unreachable out-of-bounds constants.
+    // CONFIDENCE: HIGH for the indexed read itself (ISA pseudocode: "addr = SRC0 address;
+    // addr += M0; D = SGPR[addr]").
+    // CONFIDENCE: LOW for indices past s105: the ISA text quoted above does not say what such an
+    // index reads, so the constant fold refuses them and the dynamic select only spans s[base..105]
+    // rather than inventing a value.
     if (in.src[0].kind != OperandKind::SGPR || in.dst.kind != OperandKind::SGPR ||
         in.src[0].value > 105 || in.dst.value > 105) {
         ok = false;

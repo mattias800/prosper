@@ -1,5 +1,6 @@
 // test_gap_opcode_refusals — fail-visible refusal pins for opcodes the compute recompiler
-// decodes but does not lower: v_mad_i64_i32 and s_movrels_b32. The image_gather4 arm below
+// decodes but does not lower (v_mad_i64_i32), plus the refusal guards of lowerings that stay
+// fail-visible for inputs they cannot represent (s_movrels_b32). The image_gather4 arm below
 // is no longer a refusal pin: it checks where 0x40 is admitted.
 //
 // Per the recompiler charter an unsupported op is a FATAL gap, and the loud refusal is only the
@@ -10,8 +11,8 @@
 //
 // Each arm is paired with a control built from the SAME program with ONLY the gap instruction
 // swapped for a lowered sibling with identical operand fields (v_sad_u32 for the VOP3A arms,
-// v_mad_u64_u32 for the VOP3B arm, s_mov_b32 for s_movrels_b32, image_gather4_lz for
-// image_gather4). The control compiling is what makes the refusal about the opcode rather than the
+// v_mad_u64_u32 for the VOP3B arm, image_gather4_lz for image_gather4; each s_movrels_b32 guard
+// arm instead changes the program in one place so the lowering admits it). The control compiling is what makes the refusal about the opcode rather than the
 // operands, the resource table or the program shape.
 //
 // Why the reject `mode` is `unresolved-operand` and not `unknown-encoding`: `emit_alu` returns
@@ -194,8 +195,13 @@ TEST(GapOpcodeRefusals, MadI64I32) {
                        Rdna2Format::VOP3, 0x177u);
 }
 
-// S_MOVRELS_B32 s0, s1 (SOP1 0x2e): reads s[1 + M0]. When M0 is untracked, it must refuse fail-visibly.
-// Control: s_mov_b32 s0, s1 (SOP1 0x03) in the same slot compiles without M0.
+// S_MOVRELS_B32 s0, s1 (SOP1 0x2e) reads s[1 + M0] and is lowered (rdna2_movrels.cpp); these arms
+// pin its fail-visible guards. Each refusal is paired with a control that differs in one place and
+// compiles, so the refusal is about that guard rather than the program shape. Execution coverage
+// of the admitted paths is tests/gpu/execute/test_compute_s_movrels.cpp.
+//
+// Untracked M0: with M0 never written the index is unknown, so it must refuse rather than read
+// s1. Control: s_mov_b32 s0, s1 (SOP1 0x03) in the same slot compiles without M0.
 TEST(GapOpcodeRefusals, MovrelsB32) {
     static const uint32_t w = 0xbe802e01u;
     static const uint32_t control = 0xbe800301u;
@@ -212,6 +218,47 @@ TEST(GapOpcodeRefusals, MovrelsB32) {
     }
     expect_compiles(program(prologue, {control}), 0xA040ull, "control: s_mov_b32 s0, s1");
     expect_gap_refusal(program(prologue, {w}), 0xA041ull, 1, {w}, Rdna2Format::SOP1, 0x2eu);
+}
+
+// Non-SGPR base: s_movrels_b32 s0, vcc_lo (0xbe802e6a) names a special register, not an indexable
+// SGPR. Control: the same program with base s1 (0xbe802e01) and the same constant M0 compiles.
+TEST(GapOpcodeRefusals, MovrelsB32NonSgprBase) {
+    static const uint32_t w = 0xbe802e6au;
+    static const uint32_t control = 0xbe802e01u;
+    const std::vector<uint32_t> prologue = {
+        0xbefc0382u,   // s_mov_b32 m0, 2
+    };
+    const Rdna2Inst dec = rdna2_decode_one(&w, 1);
+    EXPECT_EQ(dec.fmt, Rdna2Format::SOP1);
+    EXPECT_EQ(dec.opcode, 0x2eu);
+    EXPECT_NE(dec.src[0].kind, OperandKind::SGPR) << "vcc_lo must not decode as an ordinary SGPR";
+    expect_compiles(program(prologue, {control}), 0xA042ull, "control: s_movrels_b32 s0, s1");
+    expect_gap_refusal(program(prologue, {w}), 0xA043ull, 1, {w}, Rdna2Format::SOP1, 0x2eu);
+}
+
+// Constant M0 past s105: m0 = 0xc8 makes s1 + 200 = s201, outside the SGPR file the fold may
+// read. Control: the identical s_movrels_b32 with m0 = 2 (s3) compiles.
+TEST(GapOpcodeRefusals, MovrelsB32ConstantIndexPastS105) {
+    static const uint32_t w = 0xbe802e01u;                            // s_movrels_b32 s0, s1
+    const std::vector<uint32_t> far = {0xbefc03ffu, 0x000000c8u};   // s_mov_b32 m0, 0xc8
+    const std::vector<uint32_t> near = {0xbefc0382u};                // s_mov_b32 m0, 2
+    expect_compiles(program(near, {w}), 0xA044ull, "control: m0 = 2 folds to s3");
+    expect_gap_refusal(program(far, {w}), 0xA045ull, 2, {w}, Rdna2Format::SOP1, 0x2eu);
+}
+
+// Dynamic M0 reaching an unrepresentable register: s5 saves the ENTRY value of M0 (an opaque
+// token, #3133) before M0 is given a runtime value, so the select over s4..s105 would have to
+// read the token. Control: the same program reading from base s6, past the token, compiles.
+TEST(GapOpcodeRefusals, MovrelsB32DynamicReachesSavedEntryM0) {
+    static const uint32_t w = 0xbe802e04u;         // s_movrels_b32 s0, s4
+    static const uint32_t control = 0xbe802e06u;   // s_movrels_b32 s0, s6
+    const std::vector<uint32_t> prologue = {
+        0xbe85037cu,   // s_mov_b32 s5, m0 (entry M0 saved as a token)
+        0x7e000500u,   // v_readfirstlane_b32 s0, v0
+        0xbefc0300u,   // s_mov_b32 m0, s0 (M0 now a runtime value)
+    };
+    expect_compiles(program(prologue, {control}), 0xA046ull, "control: base s6 skips the token");
+    expect_gap_refusal(program(prologue, {w}), 0xA047ull, 3, {w}, Rdna2Format::SOP1, 0x2eu);
 }
 
 // IMAGE_GATHER4 v[0:3], v[0:1], s[12:19], s[20:23] dmask:0x1 dim:SQ_RSRC_IMG_2D (MIMG 0x40). A
