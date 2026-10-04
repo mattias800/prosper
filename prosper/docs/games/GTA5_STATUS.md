@@ -5316,6 +5316,22 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **The immutable owned-wave MAY memo alone restores the earlier 9–10 guest flips/s** — ruled
+  out for the frozen `003bbf08` Linux native-Wayland normal app (2026-10-04). Same-binary
+  A/B/B/A on `scripts/gta5/reach-performance-story.pad`, with immediate presentation and
+  deferred waits OFF, compared the isolated original-classifier bypass (A) with the memo (B).
+  In the capture-free closed windows within 600–780 s, A1/B1/B2/A2 yielded
+  **2.61644 / 2.41891 / 2.56811 / 2.58923 guest flips/s**; B/A changes were **−7.55% / −0.82%**.
+  All four arms exited 0, and menu/bank-player HUD images were manually checked. Each arm
+  retained **three fragment drops and one compute skip per flip**, with zero target evictions
+  in these windows. No named compiler/build was sampled; host I/O `some` stall percentages
+  were **1.49 / 2.82 / 2.63 / 1.18**, without causal attribution. No throughput benefit is
+  established. Production has no MAY-classifier timing or hit counter, and known fresh-render
+  lineage was zero, so freshly rendered FPS remains **NO_DATA**. This result neither identifies
+  the current cliff's cause nor rules out memo benefits in another workload. Later main's
+  WAITCNT support was absent from the measured app. Evidence: [#4279](https://github.com/mattias800/prosper/issues/4279),
+  [draft PR #4287](https://github.com/mattias800/prosper/pull/4287).
+
 - **The startup guest-store fault requires #3987's shader changes** — falsified by a native
   MEMLOG boot on main `4e86ed4d4` without those changes (2026-10-01): the app exited 90 before
   a frame, after fixed BatchMap refusals, with the same HDD-streaming store fault at
