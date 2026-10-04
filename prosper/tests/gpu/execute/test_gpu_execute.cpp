@@ -219,7 +219,7 @@ int main() {
             std::vector<std::pair<long, long>> shader_refs;
             std::vector<char> schedule;
         };
-        auto observe = [&](const char* copy_control) {
+        auto observe = [&](const GpuState& state, const char* copy_control) {
             set_test_env("PROSPER_EAGER_DRAW_COPY", copy_control);
             OrderedWitness seen;
             set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
@@ -236,17 +236,26 @@ int main() {
                 if (items.size() == 1) seen.schedule.push_back('C');
                 return items.size() == 1;
             });
-            execute_ordered_and_present(mixed, W, H, 77, /*publish=*/false);
+            execute_ordered_and_present(state, W, H, 77, /*publish=*/false);
             set_submit_renderer({});
             set_submit_compute({});
             return seen;
         };
+        // Eager realization is reachable only for a fragment launch with observed Wave32
+        // metadata: since #4374 a draw whose SPI_PS_IN_CONTROL is unwritten or Wave64 is routed
+        // to ordered realization for the original scalar bank, which never consults the eager
+        // vector or its copy control.
+        GpuState wave32 = mixed;
+        wave32.cx[P::SPI_PS_IN_CONTROL] = 1u << P::SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT;
         // Warm the shared-shader cache so reference counts compare the handoff rather than cache
         // admission. A copy leaves one extra shared owner in the eager vector during rendering.
-        (void)observe(nullptr);
-        const auto copied = observe("1");
-        const auto moved = observe("0");
-        const auto defaulted = observe(nullptr);
+        (void)observe(wave32, nullptr);
+        const auto copied = observe(wave32, "1");
+        const auto moved = observe(wave32, "0");
+        const auto defaulted = observe(wave32, nullptr);
+        (void)observe(mixed, nullptr);
+        const auto ordered_copied = observe(mixed, "1");
+        const auto ordered_moved = observe(mixed, "0");
         set_test_env("PROSPER_EAGER_DRAW_COPY", nullptr);
         CHECK(copied.draws.size() == 2 && moved.draws == copied.draws &&
                   defaulted.draws == copied.draws &&
@@ -264,6 +273,11 @@ int main() {
                   moved.shader_refs == defaulted.shader_refs &&
                   moved.shader_refs[0].first > 0,
               "production ordered handoff moves shared shader ownership by default");
+        CHECK(ordered_copied.draws == copied.draws && ordered_moved.draws == copied.draws &&
+                  ordered_copied.schedule == copied.schedule &&
+                  ordered_copied.shader_refs.size() == 2 &&
+                  ordered_copied.shader_refs == ordered_moved.shader_refs,
+              "unobserved Wave32 launch realizes in order, outside the eager copy control");
     }
 
     // The executor core, with the offscreen Vulkan renderer supplied as the backend (as the HLE will

@@ -91,9 +91,15 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
                     struct.pack("<I",1)+launch+struct.pack("<I",0))
         draw_count=0 if failed else 1
         wave_tail=struct.pack("<I",draw_count)+bytes(draw_count)
-        check(struct.unpack_from("<I",data,8)[0]==70 and data.endswith(wave_tail),
-              "current ordinary capture has exact absent owned-wave records")
-        official69=bytearray(data[:-len(wave_tail)]); struct.pack_into("<I",official69,8,69)
+        # v71: per draw, five (presence u8, raw u32) SC/DB launch-control words. The fixture
+        # programs none of them, so each record is canonical-unavailable: 25 zero bytes.
+        launch_controls_tail=struct.pack("<I",draw_count)+bytes(25*draw_count)
+        check(struct.unpack_from("<I",data,8)[0]==71 and data.endswith(launch_controls_tail),
+              "current ordinary capture has exact unavailable raster-launch controls")
+        official70=bytearray(data[:-len(launch_controls_tail)]); struct.pack_into("<I",official70,8,70)
+        check(official70.endswith(wave_tail),
+              "genuine official70 has exact absent owned-wave records")
+        official69=bytearray(official70[:-len(wave_tail)]); struct.pack_into("<I",official69,8,69)
         entry_start=len(official69)-4-159*draw_count
         check(struct.unpack_from("<I",official69,entry_start)[0]==draw_count,
               "official69 entry count matches the original draw inventory")
@@ -172,12 +178,20 @@ with tempfile.TemporaryDirectory(prefix="float-transport-",dir=scratch) as direc
             check(done.returncode==0 and stored.is_file(),state+" stored module remains usable offline")
             if stored.is_file(): check(facts(stored.read_bytes())[0] == (state!="explicit-nonfinite32"),
                                       state+" opposing stored capability is dormant producer authority")
-    original=(directory/"explicit-nonfinite32.prgcap").read_bytes(); start=len(original)-5-(4+159)-4-16-13
+    original=(directory/"explicit-nonfinite32.prgcap").read_bytes()
+    # Transport precedes v67 flags, nested68, entry69, wave70 and the v71 launch controls.
+    launch_start=len(original)-(4+25)
+    start=launch_start-5-(4+159)-4-16-13
     corrupt={"draw-count":original[:start]+struct.pack("<I",2)+original[start+4:],
              "draw-tag":original[:start+4]+b"\x03"+original[start+5:],
              "compute-count":original[:start+5]+struct.pack("<I",1)+original[start+9:],
              "failure-count":original[:start+9]+struct.pack("<I",1)+original[start+13:],
              "truncated":original[:start+12],"trailing":original+b"\x00",
+             "launch-count":original[:launch_start]+struct.pack("<I",2)+original[launch_start+4:],
+             "launch-presence":original[:launch_start+4]+b"\x02"+original[launch_start+5:],
+             "launch-unavailable-value":original[:launch_start+5]+struct.pack("<I",1)+original[launch_start+9:],
+             "truncated-launch":original[:-1],
+             "version-only70":original[:8]+struct.pack("<I",70)+original[12:],
              "version-only65":original[:8]+struct.pack("<I",65)+original[12:]}
     for name,data in corrupt.items():
         check(data != original,name+" corruption changes the actual capture")
