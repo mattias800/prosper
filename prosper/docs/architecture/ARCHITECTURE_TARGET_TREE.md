@@ -184,9 +184,11 @@ and where none does the standard is a review rule until one exists.
    handlers over a shared emulated-hardware core in console emulators. Planned move 12.
 2. **Portable logic is written once; a platform arm holds primitives only.** An engine reaches the OS
    through the `src/host/platform/` interfaces (`vm`, `file`, `clock`, ...) and nothing else, so no
-   platform arm can be a stub or reduced copy of another arm's logic. Enforced today only in part: the
-   `platform-ifdef` and `layer-include` rules catch directives and includes, not a divergent arm (see
-   the stub-arm row in "Bad practices").
+   platform arm can be a stub or reduced copy of another arm's logic. Enforced today only in part:
+   `platform-ifdef` and `layer-include` catch directives and includes, and `platform-stub` (a
+   name-based proxy added separately from this document) catches handlers named `HLE(*_stub)`; a
+   reduced copy that is not named as a stub is a review rule (see the stub-arm row in "Bad
+   practices").
 3. **Each engine ships a replay test that runs on both hosts.** A recorded command-buffer stream from a
    real title is fed to the engine, and the test asserts what the guest can observe (memory contents
    and delivered events). It extends the seam's one-test-per-interface rule from the OS services to
