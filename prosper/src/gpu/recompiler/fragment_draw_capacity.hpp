@@ -27,6 +27,13 @@ enum class FragmentDrawFailure : uint32_t {
     PixelIndexCapacity = 9,
     OccupiedExportUnavailable = 10,
 };
+// Cold register-to-observation shape for the separate draw-bound live/helper recipe. A row
+// describes actual packed PS position input, not a value or public launch permission. The plan
+// independently proves its original program and producing raster contract before using it.
+struct FragmentDrawRasterInput {
+    uint32_t reg = 0, collector_word = 0;
+    bool operator==(const FragmentDrawRasterInput&) const = default;
+};
 
 class FragmentDrawCapacity {
 public:
@@ -34,6 +41,7 @@ public:
     const std::array<uint32_t, kFragmentDrawAuthorityWords>& authority() const { return words_; }
     const RasterQuadCollector& collector() const { return collector_; }
     const std::vector<FragmentPacketExportSite>& export_sites() const { return export_sites_; }
+    const std::vector<FragmentDrawRasterInput>& raster_inputs() const { return raster_inputs_; }
     bool matches_collector(const RasterQuadCollector&) const;
     uint32_t max_quads() const { return words_[6]; }
     uint32_t max_waves() const { return words_[1]; }
@@ -52,17 +60,20 @@ public:
 private:
     FragmentDrawCapacity(std::shared_ptr<const FragmentPacketKernel> kernel,
                          std::array<uint32_t, kFragmentDrawAuthorityWords> words,
-                         RasterQuadCollector collector)
+                         RasterQuadCollector collector,
+                         std::vector<FragmentDrawRasterInput> raster_inputs)
         : kernel_(std::move(kernel)), words_(words), collector_(std::move(collector)),
-          export_sites_(kernel_->program.packet.export_sites) {}
+          export_sites_(kernel_->program.packet.export_sites),
+          raster_inputs_(std::move(raster_inputs)) {}
     friend std::shared_ptr<const FragmentDrawCapacity>
     fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel>, const RasterQuadCollector&,
-                           std::string&);
+                           std::string&, std::vector<FragmentDrawRasterInput>);
     const std::shared_ptr<const FragmentPacketKernel> kernel_;
     const std::array<uint32_t, kFragmentDrawAuthorityWords> words_;
     const RasterQuadCollector collector_;
     // Copied original-site inventory belongs to the immutable capacity/code owner, not GPU data.
     const std::vector<FragmentPacketExportSite> export_sites_;
+    const std::vector<FragmentDrawRasterInput> raster_inputs_;
 };
 
 // Cold code/profile verification only. LegacyRaw is never attachment-authoritative, including
@@ -71,7 +82,7 @@ bool fragment_draw_architectural_exports_match(const FragmentPacketKernel&);
 
 std::shared_ptr<const FragmentDrawCapacity>
 fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel>, const RasterQuadCollector&,
-                       std::string& rejection);
+                       std::string& rejection, std::vector<FragmentDrawRasterInput> = {});
 // Cached original PS, with the distinct uniformly guarded GPU-capacity entry. Default WAT1
 // compilation and its public owned-wave pack/decode API remain unchanged.
 FragmentPacketKernel recompile_fragment_packet_capacity_kernel(

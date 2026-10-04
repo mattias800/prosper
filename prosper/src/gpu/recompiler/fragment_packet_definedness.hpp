@@ -16,7 +16,8 @@ struct PacketVgprDefinedness {
     void begin(SpirvCompute&, const std::map<int, uint32_t>& columns);
     void instruction(SpirvCompute&, const RegState&, const Rdna2Inst&);
     void publish_peer(SpirvCompute&, uint32_t pending);
-    void consume_peer(SpirvCompute&, uint32_t pending, uint32_t index);
+    void consume_peer(SpirvCompute&, uint32_t pending, uint32_t index,
+                      FragmentPacketVgprRead = FragmentPacketVgprRead::SelectedPeer);
     void finish(SpirvCompute&, uint32_t status_offset);
     void fail(SpirvCompute&, uint32_t condition, uint32_t pc, uint32_t reg, uint32_t kind);
 };

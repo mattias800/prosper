@@ -1,4 +1,7 @@
 #include "gpu/recompiler/fragment_draw_capacity.hpp"
+#include "gpu/recompiler/fragment_packet_mask_requirements.hpp"
+#include <algorithm>
+#include <bitset>
 #include <cstring>
 #include <string_view>
 
@@ -66,7 +69,8 @@ bool FragmentDrawCapacity::matches_collector(const RasterQuadCollector& other) c
 }
 std::shared_ptr<const FragmentDrawCapacity>
 fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel> kernel,
-                       const RasterQuadCollector& collector, std::string& rejection) {
+                       const RasterQuadCollector& collector, std::string& rejection,
+                       std::vector<FragmentDrawRasterInput> raster_inputs) {
     rejection.clear();
     const auto refuse = [&](const char* reason) -> std::shared_ptr<const FragmentDrawCapacity> {
         rejection = reason;
@@ -94,6 +98,23 @@ fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel> kernel,
     const auto& layout = kernel->layout;
     if (!layout.input_words || layout.output_words != kernel->program.packet.output_words.size())
         return refuse("fragment-draw-capacity-layout-invalid");
+    if (!raster_inputs.empty()) {
+        const auto& packet = kernel->program.packet;
+        if (raster_inputs.size() > 2 ||
+            packet.export_observation != FragmentPacketExportObservation::Architectural ||
+            packet.initial_mask_availability != kPacketInitialExec ||
+            packet.input_stride != 2 * layout.vgprs.size() + 4 ||
+            kernel->topology != FragmentPacketQuadTopology::ConsecutiveLogicalQuads)
+            return refuse("fragment-draw-raster-entry-schema-invalid");
+        std::bitset<256> registers;
+        for (const auto& row : raster_inputs) {
+            if (row.reg >= 256 || row.collector_word < 5 || row.collector_word > 6 ||
+                registers.test(row.reg) ||
+                std::find(layout.vgprs.begin(), layout.vgprs.end(), row.reg) == layout.vgprs.end())
+                return refuse("fragment-draw-raster-entry-schema-invalid");
+            registers.set(row.reg);
+        }
+    }
     const uint64_t waves = (uint64_t(collector.max_quads) + 15) / 16;
     const uint64_t input_span = uint64_t(layout.input_words) + 2;
     const uint64_t output_span = uint64_t(layout.output_words) + kPacketWaveOutputPrefix;
@@ -120,6 +141,6 @@ fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel> kernel,
                                                             kFragmentDrawCommitHeaderWords +
                                                                 pixel_slots};
     return std::shared_ptr<const FragmentDrawCapacity>(
-        new FragmentDrawCapacity(std::move(kernel), words, collector));
+        new FragmentDrawCapacity(std::move(kernel), words, collector, std::move(raster_inputs)));
 }
 }   // namespace prosper::gpu

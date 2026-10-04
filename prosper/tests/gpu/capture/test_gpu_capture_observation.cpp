@@ -74,7 +74,8 @@ std::vector<uint8_t> common69_bytes(const GpuCaptureFile& capture) {
     EXPECT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
     if (bytes.size() < 16) return {};
     // v71 raw launch controls: count + five (presence, raw word) pairs per draw.
-    EXPECT_EQ(bytes[8], 71);
+    EXPECT_EQ(bytes[8], 72);
+    bytes.resize(bytes.size() - 4 - 112 * capture.draws.size()); // v72 coverage observations
     bytes.resize(bytes.size() - 4 - 25 * capture.draws.size());
     // No owned stages: v70's extension is count + one absent-owner byte per draw.
     for (const auto& draw : capture.draws) EXPECT_FALSE(draw.owned_waves);
@@ -457,7 +458,7 @@ TEST(GpuCaptureObservationCli, MissingAndCapturedPendingFragmentStagesStayUnavai
     ASSERT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
     GpuCaptureFile decoded;
     ASSERT_TRUE(deserialize_gpu_capture(bytes, decoded, error)) << error;
-    ASSERT_EQ(decoded.format_version, 71);
+    ASSERT_EQ(decoded.format_version, 72);
     ASSERT_TRUE(decoded.draws[0].owned_waves);
     ASSERT_TRUE(decoded.draws[0].owned_waves->fragment_pending);
     ASSERT_TRUE(decoded.draws[0].fs.empty());

@@ -1,6 +1,7 @@
 #include "gpu/recompiler/fragment_draw_gpu.hpp"
 #include "gpu/recompiler/fragment_draw_spirv_flow.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include <algorithm>
 
 namespace prosper::gpu {
 namespace {
@@ -327,6 +328,7 @@ std::vector<uint32_t> build_fragment_draw_assembly(const FragmentDrawCapacity& c
     if (!capacity.matches_collector(collector)) return {};
     const auto& kernel = *capacity.kernel();
     const auto& layout = kernel.layout;
+    const bool raster_entry = !capacity.raster_inputs().empty();
     // This first recipe has no external read-PC or guest parameter coefficients. Adding those
     // needs producer/epoch ownership, not copying observed host varyings into presumed registers.
     if (!layout.buffers.empty() || !layout.parameters.empty() || !kernel.program.images.empty() ||
@@ -395,33 +397,80 @@ std::vector<uint32_t> build_fragment_draw_assembly(const FragmentDrawCapacity& c
     auto record_valid = b.land(b.ucmp(Op_ULessThan, primitive, entry.load(b.uconst(0))),
                                b.ucmp(Op_ULessThanEqual, facing, b.uconst(1)));
     auto helpers_absent = b.btrue();
+    auto any_live = b.bfalse();
     for (uint32_t lane = 0; lane < 4; ++lane) {
         record_valid = b.land(record_valid, b.land(b.ucmp(Op_IEqual, read(lane, 4), primitive),
                                                    b.ucmp(Op_IEqual, read(lane, 3), facing)));
-        record_valid = b.land(record_valid, b.land(b.ucmp(Op_IEqual, read(lane, 1), b.uconst(1)),
-                                                   b.ucmp(Op_IEqual, read(lane, 2), b.uconst(1))));
+        if (raster_entry) {
+            const auto helper = read(lane, 0);
+            const auto live = b.ucmp(Op_IEqual, helper, b.uconst(0));
+            any_live = b.lor(any_live, live);
+            record_valid = b.land(record_valid, b.ucmp(Op_ULessThanEqual, helper, b.uconst(1)));
+            record_valid = b.land(record_valid, b.ucmp(Op_IEqual, read(lane, 1),
+                                                       b.sel(live, b.uconst(1), b.uconst(0))));
+            record_valid =
+                b.land(record_valid,
+                       b.lor(b.logical_not(live), b.ucmp(Op_IEqual, read(lane, 2), b.uconst(1))));
+        } else {
+            record_valid =
+                b.land(record_valid, b.land(b.ucmp(Op_IEqual, read(lane, 1), b.uconst(1)),
+                                            b.ucmp(Op_IEqual, read(lane, 2), b.uconst(1))));
+        }
         helpers_absent = b.land(helpers_absent, b.ucmp(Op_IEqual, read(lane, 0), b.uconst(0)));
     }
-    const auto bad =
-        selection(b, b.land(occupied, b.logical_not(b.land(record_valid, helpers_absent))));
+    if (raster_entry) record_valid = b.land(record_valid, any_live);
+    const auto bad = selection(
+        b, b.land(occupied, b.logical_not(raster_entry ? record_valid
+                                                       : b.land(record_valid, helpers_absent))));
     const auto ignored = b.id();
     const auto reason =
-        b.sel(helpers_absent, b.uconst(uint32_t(FragmentDrawFailure::CollectionRecord)),
-              b.uconst(uint32_t(FragmentDrawFailure::HelperEntryUnavailable)));
+        raster_entry
+            ? b.uconst(uint32_t(FragmentDrawFailure::CollectionRecord))
+            : b.sel(helpers_absent, b.uconst(uint32_t(FragmentDrawFailure::CollectionRecord)),
+                    b.uconst(uint32_t(FragmentDrawFailure::HelperEntryUnavailable)));
     b.put(b.code, Op_AtomicCompareExchange,
           {b.t_u32, ignored, packet.address(b.uconst(8)), b.uconst(Scope_Device), b.uconst(0),
            b.uconst(0), reason, b.uconst(0)});
     end_selection(b, bad);
     // Raw storage is cleared on-device before assembly. Zero scratch is NEVER made available.
     // Post-PS export eligibility is separate from guest EXEC and only granted by this recipe's
-    // disabled-DS, single-sample, genuine nonhelper contract. Initial mask values remain absent.
+    // disabled-DS, single-sample, genuine nonhelper contract. The old recipe keeps initial
+    // masks absent; the distinct raster recipe supplies its independently certified live mask.
     const auto n = static_cast<uint32_t>(layout.vgprs.size());
     const bool validity = kernel.program.packet.input_stride == 2 * n + 4;
     const auto lane_base =
         b.ibin(Op_IAdd, data_base,
                b.ibin(Op_IMul, b.linear_localid, b.uconst(kernel.program.packet.input_stride)));
-    packet.store(b.ibin(Op_IAdd, lane_base, b.uconst(n * (validity ? 2u : 1u) + 3)),
-                 b.sel(occupied, b.uconst(1), b.uconst(0)));
+    if (raster_entry) {
+        const auto quad_lane = b.ibin(Op_UMod, b.linear_localid, b.uconst(4));
+        const auto lane_address =
+            b.ibin(Op_IAdd, origin, b.ibin(Op_IMul, quad_lane, b.uconst(collector.lane_words)));
+        const auto live =
+            b.land(occupied, b.ucmp(Op_IEqual, source.load(lane_address), b.uconst(0)));
+        for (uint32_t column = 0; column < n; ++column) {
+            const auto found =
+                std::find_if(capacity.raster_inputs().begin(), capacity.raster_inputs().end(),
+                             [&](const auto& row) { return row.reg == layout.vgprs[column]; });
+            if (found == capacity.raster_inputs().end()) continue;
+            // QuadBroadcast retained this exact helper invocation's actual FragCoord BEFORE
+            // the nonhelper store/election. Helpers do not publish their own SSBO stores.
+            const auto value =
+                source.load(b.ibin(Op_IAdd, lane_address, b.uconst(found->collector_word)));
+            packet.store(b.ibin(Op_IAdd, lane_base, b.uconst(column)), value);
+            packet.store(b.ibin(Op_IAdd, lane_base, b.uconst(n + column)),
+                         b.sel(occupied, b.uconst(1), b.uconst(0)));
+        }
+        // Independent facts: storage/backing includes all four genuine lanes; initial EXEC
+        // and final attachment eligibility include only the recipe-certified live pixels.
+        // WQM may expand EXEC, but cannot expand this final eligibility field.
+        packet.store(b.ibin(Op_IAdd, lane_base, b.uconst(2 * n)),
+                     b.sel(live, b.uconst(1), b.uconst(0)));
+        packet.store(b.ibin(Op_IAdd, lane_base, b.uconst(2 * n + 3)),
+                     b.sel(live, b.uconst(1), b.uconst(0)));
+    } else {
+        packet.store(b.ibin(Op_IAdd, lane_base, b.uconst(n * (validity ? 2u : 1u) + 3)),
+                     b.sel(occupied, b.uconst(1), b.uconst(0)));
+    }
     end_selection(b, inner);
     end_selection(b, outer);
     return b.finish();

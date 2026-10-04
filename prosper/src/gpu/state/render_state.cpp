@@ -375,6 +375,24 @@ RenderState extract_render_state(const GpuState& st) {
     observe_launch(P::PA_SC_AA_CONFIG, launch.sc_aa_config_available, launch.sc_aa_config);
     observe_launch(P::DB_SHADER_CONTROL, launch.db_shader_control_available,
                    launch.db_shader_control);
+    const uint32_t coverage_registers[]{
+        P::DB_DEPTH_CONTROL,        P::DB_RENDER_OVERRIDE,
+        P::DB_RENDER_OVERRIDE2,     P::DB_EQAA,
+        P::PA_SU_VTX_CNTL,          P::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL,
+        P::PA_SC_AA_MASK_X0Y0_X1Y0, P::PA_SC_AA_MASK_X0Y1_X1Y1};
+    const auto observe_coverage = [&](uint32_t index, uint32_t reg) {
+        if (const auto value = st.cx.find(reg); value != st.cx.end()) {
+            launch.coverage.available |= uint32_t{1} << index;
+            launch.coverage.words[index] = value->second;
+        }
+    };
+    for (uint32_t index = 0; index < std::size(coverage_registers); ++index)
+        observe_coverage(index, coverage_registers[index]);
+    for (uint32_t index = 0; index < 16; ++index)
+        observe_coverage(8 + index, P::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0 + index);
+    observe_coverage(24, P::PA_SC_CENTROID_PRIORITY_0);
+    observe_coverage(25, P::PA_SC_CENTROID_PRIORITY_1);
+    observe_coverage(26, P::DB_RENDER_CONTROL);
     rs.ps_wave32 = PM4_FIELD(rd(st.cx, P::SPI_PS_IN_CONTROL),
                              SPI_PS_IN_CONTROL, PS_W32_EN) != 0;
     if (const auto rsrc1 = st.sh.find(P::SPI_SHADER_PGM_RSRC1_PS); rsrc1 != st.sh.end()) {

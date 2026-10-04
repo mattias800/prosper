@@ -5,13 +5,20 @@
 #include <span>
 
 namespace prosper::gpu {
+struct FragmentRasterLaunchCollection;
 // An explicit emulator scheduling contract, not a reconstruction of AMD's undisclosed hardware
 // append order. Complete genuine Vulkan quads remain consecutive and retain primitive identity.
 // The first recipe additionally proves the original program insensitive to inter-quad placement
 // and to private unexportable scratch workers in the last workgroup. Future recipes may support
 // observable guest composition only with the additional authority they actually require.
-enum class FragmentDrawScheduling : uint8_t { PackingUnobservableCompleteQuads };
-enum class FragmentDrawEntryRecipe : uint8_t { OwnedUserPrefixAndShaderDefinedMasks };
+enum class FragmentDrawScheduling : uint8_t {
+    PackingUnobservableCompleteQuads,
+    QuadLocalObservationalEquivalence
+};
+enum class FragmentDrawEntryRecipe : uint8_t {
+    OwnedUserPrefixAndShaderDefinedMasks,
+    DrawBoundRasterSystemAndQuadMasks
+};
 struct FragmentDrawMaskWord {
     bool user_word = false;
     uint32_t word = 0; // owned prefix index, or original inline/literal word
@@ -38,7 +45,14 @@ public:
     const auto& replay_owner() const { return replay_shared; }
     const auto& rejection_reason() const { return rejection; }
     const auto& device_contract() const { return device; }
-    bool source_live() const { return source_generations->live(); }
+    const auto& raster_launch_collection() const { return raster_collection; }
+    bool source_live() const {
+        if (!source_generations->live()) return false;
+        if (device.raster)
+            for (const auto& generation : raster_module_generations)
+                if (generation.expired()) return false;
+        return true;
+    }
 
 private:
     friend FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs&,
@@ -75,6 +89,12 @@ private:
     FragmentLaunchRsrc1 launch_rsrc1{};
     FloatTransportConfig transport{};
     FragmentPacketDeviceContract device{};
+    RasterLaunchFacts raster_profile{};
+    // Cold copied collector/coefficient code only, never the draw's strong launch/source owner.
+    // Until the distinct workitem and scheduling obligations are proved this plan still refuses
+    // before any device allocation/attachment change; structural code is not an admission token.
+    std::shared_ptr<const FragmentRasterLaunchCollection> raster_collection;
+    std::array<std::weak_ptr<const std::vector<uint32_t>>, 3> raster_module_generations;
     std::vector<FragmentDrawFullMask> full_masks;
     std::string rejection;
 };

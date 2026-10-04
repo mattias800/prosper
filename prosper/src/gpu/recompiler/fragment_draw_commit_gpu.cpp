@@ -99,6 +99,7 @@ std::vector<uint32_t> build_fragment_draw_validation(const FragmentDrawCapacity&
     const auto export_words = export_recipe(capacity, export_site);
     if (!export_words || collector.record_words != collector.lane_words * 4) return {};
     const auto& program = capacity.kernel()->program;
+    const bool raster_entry = !capacity.raster_inputs().empty();
     SpirvCompute b;
     // One device invocation owns the entire bounded transaction/index. O(workers * 32) maximum,
     // no all-wave quadratic scan, no cross-workgroup publication race, no CPU synchronization.
@@ -196,13 +197,21 @@ std::vector<uint32_t> build_fragment_draw_validation(const FragmentDrawCapacity&
         };
         const auto reached = b.ucmp(Op_IEqual, value(0), b.uconst(1));
         const auto occupied = b.ucmp(Op_ULessThan, worker, pixels);
+        auto export_eligible = occupied;
+        if (raster_entry) {
+            const auto safe_worker = b.sel(occupied, worker, b.uconst(0));
+            const auto helper = source.load(collector_address(b, collector, safe_worker, 0));
+            export_eligible = b.land(occupied, b.ucmp(Op_IEqual, helper, b.uconst(0)));
+        }
         auto export_valid = b.ucmp(Op_ULessThanEqual, value(0), b.uconst(1));
         const uint32_t fields[] = {0, 0, 0, 0, 15, 0, 1, 1};
         for (uint32_t field = 1; field < 8; ++field) {
-            const auto expected =
-                field == 2 ? b.sel(occupied, b.uconst(1), b.uconst(0)) : b.uconst(fields[field]);
-            const auto matching = field == 1 ? b.ucmp(Op_ULessThanEqual, value(field), b.uconst(1))
-                                             : b.ucmp(Op_IEqual, value(field), expected);
+            const auto expected = (field == 2 || (raster_entry && field == 1))
+                                      ? b.sel(export_eligible, b.uconst(1), b.uconst(0))
+                                      : b.uconst(fields[field]);
+            const auto matching = field == 1 && !raster_entry
+                                      ? b.ucmp(Op_ULessThanEqual, value(field), b.uconst(1))
+                                      : b.ucmp(Op_IEqual, value(field), expected);
             export_valid =
                 b.land(export_valid, b.lor(b.land(reached, matching),
                                            b.land(b.logical_not(reached),
@@ -223,21 +232,25 @@ std::vector<uint32_t> build_fragment_draw_validation(const FragmentDrawCapacity&
                                            b.land(b.logical_not(reached),
                                                   b.ucmp(Op_IEqual, value(field), b.uconst(0)))));
         }
-        // The first recipe proves a dominating full EXEC writer. An occupied original raster
-        // pixel must therefore have an active complete EXP, including genuine zero payloads.
+        // The old recipe proves a dominating full EXEC writer. The distinct helper recipe
+        // proves restoration of incoming live EXEC. Each eligible original raster pixel must
+        // therefore have an active complete EXP, including genuine zero payloads.
         // Missing/inactive late pixels refuse the ENTIRE draw, never a partial replay/discard.
         const auto occupied_export =
             b.land(reached, b.land(b.ucmp(Op_IEqual, value(1), b.uconst(1)),
                                    b.ucmp(Op_IEqual, value(13), b.uconst(15))));
         note(b.logical_not(export_valid), FragmentDrawFailure::GuestExport);
-        note(b.land(occupied, b.logical_not(occupied_export)),
+        if (raster_entry)
+            note(b.land(occupied, b.logical_not(reached)), FragmentDrawFailure::GuestExport);
+        note(b.land(export_eligible, b.logical_not(occupied_export)),
              FragmentDrawFailure::OccupiedExportUnavailable);
         const auto active = begin_if(b, occupied);
         const auto coordinate = [&](uint32_t field) {
             return source.load(collector_address(b, collector, worker, field));
         };
         const auto x = coordinate(5), y = coordinate(6), primitive = coordinate(4);
-        const auto px = pixel_center(b, x, width), py = pixel_center(b, y, height);
+        const auto px = pixel_center(b, x, raster_entry ? b.uconst(8192) : width),
+                   py = pixel_center(b, y, raster_entry ? b.uconst(8192) : height);
         auto topology = b.land(px.valid, py.valid);
         topology = b.land(topology, b.ucmp(Op_ULessThan, primitive, primitives));
         const auto quad_start = b.ibin(Op_IMul, b.ibin(Op_UDiv, worker, b.uconst(4)), b.uconst(4));
@@ -247,10 +260,28 @@ std::vector<uint32_t> build_fragment_draw_validation(const FragmentDrawCapacity&
         // collector scope whose primitive/facing identity changed before the whole-draw gate.
         const auto helper = coordinate(0), coverage_available = coordinate(1),
                    coverage = coordinate(2), facing = coordinate(3);
-        const auto backed = b.land(b.ucmp(Op_IEqual, helper, b.uconst(0)),
-                                   b.ucmp(Op_IEqual, coverage_available, b.uconst(1)));
+        auto backed = b.land(b.ucmp(Op_IEqual, helper, b.uconst(0)),
+                             b.ucmp(Op_IEqual, coverage_available, b.uconst(1)));
+        if (raster_entry) {
+            const auto live = b.ucmp(Op_IEqual, helper, b.uconst(0));
+            auto any_live = b.bfalse();
+            for (uint32_t lane = 0; lane < 4; ++lane)
+                any_live =
+                    b.lor(any_live,
+                          b.ucmp(Op_IEqual,
+                                 source.load(collector_address(
+                                     b, collector, b.ibin(Op_IAdd, quad_start, b.uconst(lane)), 0)),
+                                 b.uconst(0)));
+            backed = b.land(
+                b.ucmp(Op_ULessThanEqual, helper, b.uconst(1)),
+                b.ucmp(Op_IEqual, coverage_available, b.sel(live, b.uconst(1), b.uconst(0))));
+            backed = b.land(backed, any_live);
+        }
         note(b.logical_not(backed), FragmentDrawFailure::HelperEntryUnavailable);
-        auto provenance = b.land(backed, b.ucmp(Op_IEqual, coverage, b.uconst(1)));
+        auto provenance =
+            b.land(backed, raster_entry ? b.lor(b.logical_not(export_eligible),
+                                                b.ucmp(Op_IEqual, coverage, b.uconst(1)))
+                                        : b.ucmp(Op_IEqual, coverage, b.uconst(1)));
         provenance = b.land(provenance, b.ucmp(Op_ULessThanEqual, facing, b.uconst(1)));
         provenance =
             b.land(provenance, b.ucmp(Op_IEqual, facing,
@@ -264,6 +295,13 @@ std::vector<uint32_t> build_fragment_draw_validation(const FragmentDrawCapacity&
         const auto origin_y =
             pixel_center(b, source.load(collector_address(b, collector, quad_start, 6)), height);
         topology = b.land(topology, b.land(origin_x.valid, origin_y.valid));
+        if (raster_entry)
+            topology =
+                b.land(topology, b.ucmp(Op_IEqual,
+                                        b.ibin(Op_BitwiseAnd,
+                                               b.ibin(Op_BitwiseOr, origin_x.pixel, origin_y.pixel),
+                                               b.uconst(1)),
+                                        b.uconst(0)));
         topology = b.land(topology, b.ucmp(Op_IEqual, px.pixel,
                                            b.ibin(Op_IAdd, origin_x.pixel,
                                                   b.ibin(Op_BitwiseAnd, quad_lane, b.uconst(1)))));
@@ -271,8 +309,14 @@ std::vector<uint32_t> build_fragment_draw_validation(const FragmentDrawCapacity&
             b.land(topology, b.ucmp(Op_IEqual, py.pixel,
                                     b.ibin(Op_IAdd, origin_y.pixel,
                                            b.ibin(Op_ShiftRightLogical, quad_lane, b.uconst(1)))));
+        if (raster_entry) {
+            topology = b.land(topology, b.lor(b.logical_not(export_eligible),
+                                              b.land(b.ucmp(Op_ULessThan, px.pixel, width),
+                                                     b.ucmp(Op_ULessThan, py.pixel, height))));
+        }
         note(b.logical_not(topology), FragmentDrawFailure::CollectionRecord);
-        const auto indexable = begin_if(b, topology);
+        const auto indexable =
+            begin_if(b, raster_entry ? b.land(topology, export_eligible) : topology);
         uint32_t slot_type = 0;
         const auto slot_var = b.function_var(b.t_u32, slot_type);
         const auto found_var = b.function_var(b.t_u32, slot_type);

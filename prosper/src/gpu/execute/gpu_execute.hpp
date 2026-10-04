@@ -10,6 +10,7 @@
 #pragma once
 #include "gpu/execute/refused_shader_source.hpp"   // default original refused-shader evidence
 #include "gpu/execute/shader_source_window.hpp"
+#include "gpu/execute/fragment_raster_launch.hpp"
 #include "gpu/execute/graphics_execution_activity.hpp"
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include <map>
@@ -2575,6 +2576,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     const std::vector<uint32_t>& vs_words = vs_shared ? *vs_shared : vs;
     const std::vector<uint32_t>& fs_words = fs_shared ? *fs_shared : fs;
+    // A separately proved original register-only helper program can defer to the draw-bound
+    // logical64 transaction. Empty native FS alone, captures, or owned-wave flags grant nothing.
+    const bool raster_fragment_pending =
+        !owned_vertex && !owned_fragment && fs_words.empty() && !rs.ps_wave32 && !dcc_decompress &&
+        fragment_raster_pending_original(ds, rs.ps_raster_launch, fragment_analysis, system_inputs);
     if (rs.ps_addr)
         prosper::diagnostics::perf::observe_wave64_shader(rs.ps_wave32 ? 32u : 64u, false);
     std::vector<uint32_t> gs;
@@ -2623,7 +2629,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             nd++;
         }
     }
-    if ((vs_words.empty() && !owned_vertex) || (fs_words.empty() && !owned_fragment) ||
+    if ((vs_words.empty() && !owned_vertex) ||
+        (fs_words.empty() && !owned_fragment && !raster_fragment_pending) ||
         ((interpolation.requires_geometry || rect_list_synthesis) && gs.empty())) {
         if (PROSPER_ENV_ON("PROSPER_PROLOGLOG")) {
             // #3126: name the FAILING program by the same content hash the prolog recogniser uses,
@@ -2753,7 +2760,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     if ((!owned_vertex &&
          !validate_runtime_descriptor_contract("VS", vs_words, vrt.get(), 0,
                                                SpirvShaderStage::Vertex, validate_mode)) ||
-        (!owned_fragment &&
+        (!owned_fragment && !raster_fragment_pending &&
          !validate_runtime_descriptor_contract("PS", fs_words, prt.get(), 1,
                                                SpirvShaderStage::Fragment, validate_mode))) {
         report_dropped_draw_target(rs.color0_base, "descriptor-contract", rs.cb_target_mask,
@@ -3185,22 +3192,24 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         auto inputs = std::make_shared<RasterQuadInputs>();
         inputs->source_vs = out.vs_shared ? out.vs_shared :
             std::make_shared<const std::vector<uint32_t>>(out.vs);
-        inputs->source_gs = std::make_shared<const std::vector<uint32_t>>(out.gs);
-        inputs->source_fs = out.fs_shared ? out.fs_shared :
-            std::make_shared<const std::vector<uint32_t>>(out.fs);
-        inputs->raw_code = shader_analysis_owned_words(fragment_analysis);
-        inputs->vgpr_requirements = shader_analysis_packet_vgpr_requirements(fragment_analysis);
+        inputs->source_gs = out.gs.empty() ? FragmentRasterLaunchSource::selected_empty_words()
+                                           : std::make_shared<const std::vector<uint32_t>>(out.gs);
+        inputs->source_fs = out.fs_words().empty()
+                                ? FragmentRasterLaunchSource::selected_empty_words()
+                            : out.fs_shared ? out.fs_shared
+                                            : std::make_shared<const std::vector<uint32_t>>(out.fs);
+        inputs->owned_wave_pending = raster_fragment_pending;
         inputs->raw_matches_producing_source = bool(fragment_analysis) && !dcc_decompress;
         inputs->has_pixel_inputs = out.has_pixel_inputs; inputs->pixel_inputs = out.pixel_inputs;
         inputs->has_system_inputs = out.has_system_inputs; inputs->system_inputs = out.system_inputs;
-        inputs->interpolation = interpolation; inputs->launch = rs.ps_raster_launch;
+        inputs->interpolation = interpolation;
         inputs->generated_interpolation_geometry = !out.gs.empty() &&
             interpolation.requires_geometry && !rect_list_synthesis;
         inputs->float_transport = float_transport;
-        inputs->entry = out.ps_entry;
         inputs->float_mode = out.ps_float_mode;
         inputs->float_flags = out.ps_float_flags;
         inputs->launch_rsrc1 = out.ps_launch_rsrc1;
+        FragmentRasterLaunchSource::bind(ds, rs.ps_raster_launch, fragment_analysis, *inputs);
         if (diagnostic_quad_collection) {
             inputs->ps_resources = own_fragment_packet_resources(prt.get());
         } else {

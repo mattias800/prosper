@@ -14,6 +14,8 @@ enum class FragmentPacketVgprRead : uint32_t {
     InterpolationPrevious = 2,
     SelectedPeer = 3,
     RawExport = 4,
+    // Current EXEC and genuine selected source availability, not inactive-source zero synthesis.
+    QuadPeer = 5,
 };
 struct FragmentPacketVgprAccess {
     uint32_t reg = 0;

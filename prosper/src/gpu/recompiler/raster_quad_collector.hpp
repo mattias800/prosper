@@ -10,11 +10,13 @@
 #include <vector>
 
 namespace prosper::gpu {
+class FragmentRasterLaunchSource;
 // An owned real draw's input contract, not initialized guest registers or a logical Wave64.
 // All selected modules are pinned; raw_code owns the same analysis version used by the PS compiler.
 struct RasterQuadInputs {
     std::shared_ptr<const std::vector<uint32_t>> source_vs, source_gs, source_fs, raw_code;
     std::shared_ptr<const FragmentPacketVgprRequirements> vgpr_requirements;
+    std::shared_ptr<const FragmentRasterLaunchSource> launch_source;
     PixelInputMapping pixel_inputs{};
     PixelSystemInputMapping system_inputs{};
     FragmentInterpolationLayout interpolation{};

@@ -1,6 +1,7 @@
 #pragma once
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/state/fragment_entry_facts.hpp"
+#include <optional>
 #include <span>
 
 namespace prosper::gpu {
@@ -35,12 +36,28 @@ struct FragmentPacketImageRead {
     std::array<uint32_t, 4> sampler{};
     std::vector<FragmentPacketImageMip> mips;
 };
+struct FragmentPacketRasterDeviceContract {
+    // Observed from this same enabled device, not an advertised physical feature or a portable
+    // minimum. The enclosing optional distinguishes unobserved from genuinely disabled/zero.
+    bool geometry_shader_enabled = false;
+    uint32_t max_vertex_output_components = 0;
+    uint32_t max_geometry_input_components = 0;
+    uint32_t max_geometry_output_components = 0;
+    uint32_t max_geometry_total_output_components = 0;
+    uint32_t max_geometry_output_vertices = 0;
+    uint32_t max_geometry_shader_invocations = 0;
+    uint32_t max_fragment_input_components = 0;
+    bool operator==(const FragmentPacketRasterDeviceContract&) const = default;
+};
 struct FragmentPacketDeviceContract {
     // Supplied by the executing device owner AFTER feature enablement. A compiler's host device
     // name, ambient FloatControls verdict, or copied host bytes cannot establish these facts.
     uint64_t device_identity = 0;
     bool shader_int64_enabled = false;
     bool rgba32_sfloat_sampled = false;
+    // Existing three-field callers intentionally leave the connected raster recipe unavailable.
+    // This does not change legacy resource-packet or input-free draw feature admission.
+    std::optional<FragmentPacketRasterDeviceContract> raster;
 };
 struct FragmentResourcePacket {
     FragmentInvocationPacket invocation;

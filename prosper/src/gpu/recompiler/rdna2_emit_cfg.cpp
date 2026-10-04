@@ -4,6 +4,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/fragment_packet_definedness.hpp"
 #include "gpu/recompiler/rdna2_cfg_swizzle.hpp"
+#include "gpu/recompiler/fragment_packet_quad_swizzle.hpp"
 #include "gpu/recompiler/rdna2_packet_raw_masks.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
@@ -5171,7 +5172,11 @@ bool emit_cfg_state_machine(
         if (swizzle) {
             if (!swizzle_pcs.contains(swizzle->pc)) return false;
             uint32_t source_lane = 0;
-            if (!b.ds_swizzle_source_lane(swizzle->literal, &source_lane)) return false;
+            if (b.is_fragment_packet())
+                source_lane = packet_quad_swizzle_source_lane(b, *swizzle);
+            else if (!b.ds_swizzle_source_lane(swizzle->literal, &source_lane))
+                return false;
+            if (!source_lane) return reject_cfg(swizzle->pc, "packet-quad-swizzle-contract");
             const auto source = state.vreg.find(swizzle->src[0].value);
             b.store_function(swizzle_pending_var, yes);
             b.store_function(swizzle_active_var, state.exec);
@@ -5750,9 +5755,10 @@ bool emit_cfg_state_machine(
     b.emit_branch(loop_continue);
     b.emit_label(loop_continue);
 
-    emit_cfg_swizzle_phase(b, swizzle_pcs, swizzle_pending_var, swizzle_active_var,
-                           swizzle_source_var, swizzle_source_lane_var, swizzle_dst_var,
-                           zero, no, vv, lv, lmv);
+    if (!emit_cfg_swizzle_phase(b, swizzle_pcs, swizzle_pending_var, swizzle_active_var,
+                                swizzle_source_var, swizzle_source_lane_var, swizzle_dst_var, zero,
+                                no, vv, lv, lmv, packet_definedness))
+        return reject_cfg(0, "packet-quad-swizzle-phase-contract");
 
     // DS_BPERMUTE common phase. Even the exact native dispatcher publishes operands in its switch
     // case and performs subgroup gathers here: keeping all lanes at one structurally uniform merge

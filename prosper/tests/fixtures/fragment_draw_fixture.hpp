@@ -39,7 +39,8 @@ struct Owners {
 
 inline bool realize(g::DrawItem& draw, const std::array<float, 4>& color = color_a,
                     const std::vector<uint32_t>& ps_words = fragment_words(),
-                    uint32_t ps_rsrc1 = ieee_rsrc1, uint32_t color_masks = 15u) {
+                    uint32_t ps_rsrc1 = ieee_rsrc1, uint32_t color_masks = 15u,
+                    std::span<const std::pair<uint32_t, uint32_t>> context_words = {}) {
     prosper::register_builtin_hle();
     const auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
     uint64_t address = 0;
@@ -72,6 +73,9 @@ inline bool realize(g::DrawItem& draw, const std::array<float, 4>& color = color
     state.sh[p::SPI_SHADER_PGM_RSRC2_PS] = 4u << p::SPI_SHADER_PGM_RSRC2_PS_USER_SGPR_SHIFT;
     for (uint32_t word = 0; word < color.size(); ++word)
         state.sh[p::SPI_SHADER_USER_DATA_PS_0 + word] = std::bit_cast<uint32_t>(color[word]);
+    // Distinct launch fixtures supply authentic physical context writes before the same normal
+    // realizer. Existing input-free callers retain their original register observations.
+    for (const auto [reg, value] : context_words) state.cx[reg] = value;
     g::GpuState::Draw packet;
     packet.index_count = 3;
     packet.instance_count = 1;

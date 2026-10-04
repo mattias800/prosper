@@ -2,6 +2,7 @@
 #include "gpu/recompiler/fragment_packet_services.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_waitcnt.hpp"
+#include "gpu/recompiler/fragment_packet_quad_swizzle.hpp"
 #include <algorithm>
 
 namespace prosper::gpu {
@@ -39,6 +40,7 @@ bool known_effects(const Rdna2Inst& in) {
         case Rdna2Format::VINTRP: return in.opcode <= 1;
         case Rdna2Format::MIMG: return in.opcode == 0x24 || in.opcode == 0x27;
         case Rdna2Format::EXP: return true;
+        case Rdna2Format::DS: return !packet_quad_swizzle_gap(in);
         default: return false;
     }
 }

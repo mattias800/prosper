@@ -1,5 +1,6 @@
 #include "gpu/recompiler/fragment_packet_vgpr_requirements.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/fragment_packet_quad_swizzle.hpp"
 #include <algorithm>
 
 namespace prosper::gpu {
@@ -60,7 +61,8 @@ fragment_packet_vgpr_requirements(const std::vector<uint32_t>& code,
         const bool vector = in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 ||
                             in.fmt == Rdna2Format::VOP3 || in.fmt == Rdna2Format::VOPC ||
                             in.fmt == Rdna2Format::VINTRP || in.fmt == Rdna2Format::MIMG ||
-                            in.fmt == Rdna2Format::EXP;
+                            in.fmt == Rdna2Format::EXP ||
+                            (in.fmt == Rdna2Format::DS && !packet_quad_swizzle_gap(in));
         if (in.has_modifier || in.has_sdwa || in.has_dpp || in.clamp || in.omod ||
             std::any_of(std::begin(in.src_abs), std::end(in.src_abs), [](bool v) { return v; }) ||
             std::any_of(std::begin(in.src_neg), std::end(in.src_neg), [](bool v) { return v; }) ||
@@ -82,6 +84,7 @@ fragment_packet_vgpr_requirements(const std::vector<uint32_t>& code,
              observation == FragmentPacketExportObservation::LegacyRaw))
             result.rejection = "packet-vgpr-read-form-unimplemented";
         for (uint32_t src = 0; src < in.n_src; ++src) {
+            if (in.fmt == Rdna2Format::DS && src) continue;
             if (in.fmt == Rdna2Format::EXP &&
                 !(fragment_packet_export_source_mask(in.exp_en, in.exp_compr) & (1u << src)))
                 continue;
@@ -92,7 +95,8 @@ fragment_packet_vgpr_requirements(const std::vector<uint32_t>& code,
                                                               : 0u)
                                        : 1u;
             if (!width) result.rejection = "packet-vgpr-read-form-unimplemented";
-            const auto kind = in.fmt == Rdna2Format::EXP ? FragmentPacketVgprRead::RawExport
+            const auto kind = in.fmt == Rdna2Format::DS    ? FragmentPacketVgprRead::QuadPeer
+                              : in.fmt == Rdna2Format::EXP ? FragmentPacketVgprRead::RawExport
                               : in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360
                                   ? FragmentPacketVgprRead::SelectedPeer
                                   : FragmentPacketVgprRead::Direct;

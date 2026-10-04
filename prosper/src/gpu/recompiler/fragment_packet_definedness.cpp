@@ -43,10 +43,13 @@ void PacketVgprDefinedness::instruction(SpirvCompute& b, const RegState& state,
     if (const auto found = requirements.reads.find(in.pc); found != requirements.reads.end())
         for (const auto& read : found->second) {
             const auto valid = b.load_function(b.t_bool, valid_vars.at(read.reg));
-            if (read.kind == FragmentPacketVgprRead::SelectedPeer) {
-                // This source is NOT read in each EXEC-active lane. The existing uniformly reached
-                // READLANE phase must test the SELECTED peer, including EXEC-off peer lanes.
-                b.store_function(peer_valid, valid);
+            if (read.kind == FragmentPacketVgprRead::SelectedPeer ||
+                read.kind == FragmentPacketVgprRead::QuadPeer) {
+                // Peer services test the selected OLD value, not each lane's own value. READLANE
+                // ignores EXEC; the initial quad-swizzle domain additionally requires peer EXEC.
+                b.store_function(peer_valid, read.kind == FragmentPacketVgprRead::QuadPeer
+                                                 ? b.land(valid, state.exec)
+                                                 : valid);
                 b.store_function(peer_pc, b.uconst(in.pc));
                 b.store_function(peer_reg, b.uconst(read.reg));
                 continue;
@@ -80,15 +83,15 @@ void PacketVgprDefinedness::publish_peer(SpirvCompute& b, uint32_t pending) {
     b.cfg_scratch_store(b.ibin(Op_IAdd, b.uconst(peer_scratch_base), b.linear_localid),
                         b.sel(pending, metadata, b.uconst(0)));
 }
-void PacketVgprDefinedness::consume_peer(SpirvCompute& b, uint32_t pending, uint32_t index) {
+void PacketVgprDefinedness::consume_peer(SpirvCompute& b, uint32_t pending, uint32_t index,
+                                         FragmentPacketVgprRead kind) {
     const auto metadata = b.cfg_scratch_load(b.ibin(Op_IAdd, b.uconst(peer_scratch_base), index));
     const auto pc = b.load_function(b.t_u32, peer_pc);
     const auto expected = b.ibin(
         Op_BitwiseOr, b.ibin(Op_ShiftLeftLogical, b.ibin(Op_IAdd, pc, b.uconst(1)), b.uconst(1)),
         b.uconst(1));
     fail(b, b.land(pending, b.ucmp(Op_INotEqual, metadata, expected)), pc,
-         b.load_function(b.t_u32, peer_reg),
-         b.uconst(static_cast<uint32_t>(FragmentPacketVgprRead::SelectedPeer)));
+         b.load_function(b.t_u32, peer_reg), b.uconst(static_cast<uint32_t>(kind)));
 }
 void PacketVgprDefinedness::finish(SpirvCompute& b, uint32_t offset) {
     b.store_output_word(b.uconst(kFragmentPacketVgprStatusMagic), kFragmentPacketVgprStatusWords,
@@ -231,14 +234,16 @@ FragmentPacketResult decode_fragment_packet(const FragmentPacketProgram& program
         }
         result.vgpr_status_validated = true;
         if (result.kind)
-            return reject(result.kind == static_cast<uint32_t>(FragmentPacketVgprRead::SelectedPeer)
-                              ? "packet-vgpr-selected-peer-unavailable"
-                          : result.kind == static_cast<uint32_t>(FragmentPacketVgprRead::RawExport)
-                              ? program.export_observation ==
-                                        FragmentPacketExportObservation::Architectural
-                                    ? "packet-vgpr-architectural-export-unavailable"
-                                    : "packet-vgpr-raw-export-unavailable"
-                              : "packet-vgpr-read-before-definition");
+            return reject(
+                result.kind == static_cast<uint32_t>(FragmentPacketVgprRead::QuadPeer)
+                    ? "packet-quad-selected-source-exec-or-value-unavailable"
+                : result.kind == static_cast<uint32_t>(FragmentPacketVgprRead::SelectedPeer)
+                    ? "packet-vgpr-selected-peer-unavailable"
+                : result.kind == static_cast<uint32_t>(FragmentPacketVgprRead::RawExport)
+                    ? program.export_observation == FragmentPacketExportObservation::Architectural
+                          ? "packet-vgpr-architectural-export-unavailable"
+                          : "packet-vgpr-raw-export-unavailable"
+                    : "packet-vgpr-read-before-definition");
     }
     if (architectural_marked) {
         auto decoded = decode_fragment_packet_architectural_exports(

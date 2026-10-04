@@ -3048,6 +3048,20 @@ endif()
     SOURCES tests/gpu/recompiler/test_fragment_draw_capacity.cpp
     INCLUDES src tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_quad_composition
+    SOURCES tests/gpu/recompiler/test_fragment_quad_composition.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_quad_parameters
+    SOURCES tests/gpu/recompiler/test_fragment_quad_parameters.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_packet_quad_swizzle
+    SOURCES tests/gpu/recompiler/test_fragment_packet_quad_swizzle.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_raster_launch
+    SOURCES tests/gpu/execute/test_fragment_raster_launch.cpp
+    INCLUDES tests tests/gpu/recompiler LIBRARIES prosper_core LABELS unit PROPERTIES TIMEOUT 120)
 
   # #3573: the CFG dispatcher must lower a fragment exec/vcc branch as a wave vote.
   prosper_add_gtest(test_dispatcher_wave_vote

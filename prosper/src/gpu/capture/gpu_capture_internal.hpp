@@ -199,7 +199,8 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // This is distinct from physical fragment entry facts and never restores captured guest VAs.
 // v71: producing SC shader/mode/AA and DB shader controls with independent per-word presence.
 // Older captures leave these raw launch facts unavailable, never infer them from pipeline defaults.
-constexpr uint32_t kVersion = 71;
+// v72: complete observed DB/sample/coverage controls; absent legacy words remain unavailable.
+constexpr uint32_t kVersion = 72;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobDefaultBytes = 1ull << 30;
