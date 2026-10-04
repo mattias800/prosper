@@ -18,6 +18,7 @@
 #include "diagnostics/env_cache.hpp"         // PROSPER_ENV_ON / _VALUE: process-lifetime reads
 #include "diagnostics/env_submit.hpp"        // PROSPER_ENV_ON_PER_SUBMIT: re-sampled each submit
 #include "gpu/pm4/command_processor.hpp"   // GpuState
+#include "gpu/state/fragment_entry_observation.hpp"
 #include "gpu/execute/index_expand.hpp"    // validated 16-bit index copy and maximum
 #include "gpu/state/render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "gpu/pm4/pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
@@ -3131,21 +3132,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.float_transport = float_transport;
     out.ps_entry = {};
     out.ps_raster_launch = rs.ps_addr ? rs.ps_raster_launch : RasterLaunchFacts{};
-    if (rs.ps_addr) {
-        out.ps_entry.observed = true;
-        for (uint32_t i = 0; i < out.ps_entry.user_data.size(); ++i) {
-            const auto word = ds.sh.find(prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + i);
-            if (word != ds.sh.end()) {
-                out.ps_entry.user_data_available |= uint32_t(1) << i;
-                out.ps_entry.user_data[i] = word->second;
-            }
-        }
-        const auto rsrc2 = ds.sh.find(prosper::agc::Pm4::SPI_SHADER_PGM_RSRC2_PS);
-        if (rsrc2 != ds.sh.end()) {
-            out.ps_entry.rsrc2_available = true;
-            out.ps_entry.rsrc2 = rsrc2->second;
-        }
-    }
+    observe_fragment_entry(ds, rs.ps_addr != 0, out.ps_entry);
     if (out.owned_waves) {
         auto pinned = std::make_shared<GraphicsOwnedWaveDraw>(*out.owned_waves);
         pinned->has_pixel_inputs = out.has_pixel_inputs;
