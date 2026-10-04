@@ -453,7 +453,7 @@ TEST(GpuCaptureObservationCli, MissingAndCapturedPendingFragmentStagesStayUnavai
     ASSERT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
     GpuCaptureFile decoded;
     ASSERT_TRUE(deserialize_gpu_capture(bytes, decoded, error)) << error;
-    ASSERT_EQ(decoded.format_version, 70);
+    ASSERT_EQ(decoded.format_version, 71);
     ASSERT_TRUE(decoded.draws[0].owned_waves);
     ASSERT_TRUE(decoded.draws[0].owned_waves->fragment_pending);
     ASSERT_TRUE(decoded.draws[0].fs.empty());

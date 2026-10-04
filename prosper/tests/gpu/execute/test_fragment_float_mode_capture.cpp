@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> bytes;
     CHECK(capture_draw_items(realized, metadata, reader, capture, error) &&
               serialize_gpu_capture(capture, bytes, error) &&
-              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 70 &&
+              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 71 &&
               loaded.draws.size() == realized.size(),
           "actual collector and current production codecs round trip realized mode");
     GpuReplayFrame replay;
@@ -223,8 +223,9 @@ int main(int argc, char** argv) {
               "bundle paths preserve unknown, explicitly programmed zero and full-byte values");
     const size_t entry_tail=4u+kGpuCaptureFragmentEntryRecordBytes*capture.draws.size();
     const size_t wave_tail = 4u + capture.draws.size();
+    const size_t launch_tail = 4u + 25u * capture.draws.size();
     const size_t flags_tail =
-        bytes.size() - wave_tail - entry_tail - 4u - 8u - 8u * capture.draws.size();
+        bytes.size() - launch_tail - wave_tail - entry_tail - 4u - 8u - 8u * capture.draws.size();
     auto v66_bytes=bytes; v66_bytes.resize(flags_tail); set32(v66_bytes,8,66);
     CHECK(deserialize_gpu_capture(v66_bytes,loaded,error) && loaded.format_version==66,
           "genuine v66 prefix retains MODE/profile without inventing independent flags");
@@ -236,7 +237,7 @@ int main(int argc, char** argv) {
     for (const auto& draw : loaded.draws) CHECK(draw.ps_float_flags==FragmentFloatFlags{} &&
           draw.ps_launch_rsrc1==FragmentLaunchRsrc1{},"rewritten flags/raw evidence stay unknown");
     CHECK(serialize_gpu_capture(capture,bytes,error),"restore exact producing flag bytes for hostile controls");
-    for (size_t field : {flags_tail, bytes.size() - wave_tail - entry_tail - 8u}) {
+    for (size_t field : {flags_tail, bytes.size() - launch_tail - wave_tail - entry_tail - 8u}) {
         auto corrupt=bytes; set32(corrupt,field,UINT32_MAX);
         CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"hostile v67 counts refuse before second allocations");
     }
@@ -261,7 +262,7 @@ int main(int argc, char** argv) {
           "mode controls require the resource-free combined fixture");
     if (!no_resources || bytes.size() < 32u+6u*capture.draws.size()) return 1;
     auto mode_bytes = bytes;
-    mode_bytes.resize(mode_bytes.size() - wave_tail - entry_tail - 4u - 8u -
+    mode_bytes.resize(mode_bytes.size() - launch_tail - wave_tail - entry_tail - 4u - 8u -
                       8u * capture.draws.size() - 12u - capture.draws.size() - 4u);
     set32(mode_bytes,8,64);
     GpuCaptureFile official64;

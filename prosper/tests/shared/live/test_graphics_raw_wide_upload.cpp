@@ -376,7 +376,7 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
             return std::pair{std::move(raw_vs), std::move(raw_fs)};
         };
         const auto [raw_vs, raw_fs] = recompile_pair(item);
-        check(decoded.format_version == 70u && !raw_vs.empty() && !raw_fs.empty() &&
+        check(decoded.format_version == 71u && !raw_vs.empty() && !raw_fs.empty() &&
                   raw_vs == item.vs_words() && raw_fs == item.fs_words() &&
                   owned_nested_snapshot_at(*table, parent_pc, size) &&
                   owned_nested_snapshot_at(*table, child_pc, size),
@@ -424,7 +424,7 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
             ? (vertex ? combined_replay.items[0].vrt : combined_replay.items[0].prt) : nullptr;
         const auto* combined_parent = combined_table ? owned_nested_snapshot_at(*combined_table, parent_pc, size) : nullptr;
         const auto* combined_child = combined_table ? owned_nested_snapshot_at(*combined_table, child_pc, size) : nullptr;
-        check(combined_ok && combined_loaded.format_version == 70u && combined_parent &&
+        check(combined_ok && combined_loaded.format_version == 71u && combined_parent &&
                   combined_child &&
                   combined_loaded.draws[0].float_transport == explicit_item.float_transport &&
                   combined_replay.items[0].float_transport == explicit_item.float_transport &&
@@ -458,8 +458,15 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
         const size_t resource_count = decoded.draws[0].vrt.resources.size() +
                                       decoded.draws[0].prt.resources.size();
         const size_t entry_bytes = 4u + kGpuCaptureFragmentEntryRecordBytes*decoded.draws.size();
-        const size_t tail_bytes = entry_bytes + 4u * (1u + resource_count);
-        if (serialize_gpu_capture(decoded, wire, error) && wire.size() > tail_bytes) {
+        const size_t wave_bytes = 4u + decoded.draws.size();
+        const size_t launch_bytes = 4u + 25u * decoded.draws.size();
+        const bool absent_waves = std::all_of(decoded.draws.begin(), decoded.draws.end(),
+                                              [](const auto& draw) { return !draw.owned_waves; });
+        check(absent_waves, arm, "legacy nested fixture requires genuinely absent wave owners");
+        const size_t tail_bytes =
+            launch_bytes + wave_bytes + entry_bytes + 4u * (1u + resource_count);
+        if (absent_waves && serialize_gpu_capture(decoded, wire, error) &&
+            wire.size() > tail_bytes) {
             auto legacy = wire;
             legacy.resize(legacy.size() - tail_bytes); legacy[8] = 67u;
             GpuCaptureFile previous;
@@ -489,10 +496,12 @@ static void emit_owned_replay_fixture(const std::filesystem::path& directory, Dr
             check(!deserialize_gpu_capture(wrong_count, previous, error), arm,
                   "v68 nested count must match every already bounded resource");
             auto truncated = wire;
-            truncated.resize(truncated.size() - entry_bytes - 1u); truncated[8] = 68u;
+            truncated.resize(truncated.size() - launch_bytes - wave_bytes - entry_bytes - 1u);
+            truncated[8] = 68u;
             check(!deserialize_gpu_capture(truncated, previous, error), arm,
                   "truncated v68 nested tail refuses before replay");
-        } else check(false, arm, "serialize complete nested capture for independent prefix controls");
+        } else
+            check(false, arm, "serialize complete nested capture for independent prefix controls");
         const auto rejects = [&](const GpuCaptureFile& bad, const char* reason) {
             GpuReplayFrame refused;
             check(!materialize_gpu_replay(bad, refused, error), arm, reason);
