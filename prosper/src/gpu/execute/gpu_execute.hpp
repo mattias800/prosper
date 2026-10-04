@@ -3091,7 +3091,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 if (FILE* f = fopen(fn, "wb")) {
                     fwrite((const void*)(uintptr_t)rs.es_addr, sizeof(uint32_t),
                            native_shader_source_dwords(rs.es_addr,
-                                                       std::min(max_shader_dwords, size_t(2048))),
+                                                       std::min<size_t>(max_shader_dwords, 2048)),
                            f);
                     fclose(f);
                 }
