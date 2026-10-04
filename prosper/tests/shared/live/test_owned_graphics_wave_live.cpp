@@ -6,6 +6,8 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
@@ -39,7 +41,7 @@ struct Program {
     AgcShaderHeader header{};
 };
 struct Owners {
-    std::array<Program, 16> programs;
+    std::array<Program, 24> programs;
 };
 static Owners* owners;
 static size_t next_program;
@@ -524,6 +526,41 @@ TEST_P(OwnedGraphicsWaveLive, UnavailableSecondWaveRefusesBeforeAttachmentPublic
                             reinterpret_cast<const uint8_t*>(output) + Page,
                             [](uint8_t b) { return b == 0; }))
         << "refusal preserves the original guest backing";
+}
+// graphics_program_requires_owned_waves is asked several times per draw, so it answers from the
+// decode cache's once-per-byte-version classification instead of re-walking the stream (#4270
+// made the re-derivation GTA V's dominant render-thread cost). The answer must still equal a
+// from-scratch derivation, and a rewrite of the registered bytes must not be answered stale.
+TEST_P(OwnedGraphicsWaveLive, OwnedWaveClassificationMatchesFullStreamDerivation) {
+    const auto derived = [](const std::vector<uint32_t>& code) {
+        std::vector<Rdna2Inst> walked;
+        rdna2_walk(code.data(), code.size(), walked);
+        return !rdna2_raw_wave_wide_data_loads(walked).empty();
+    };
+    for (const bool vertex : {true, false})
+        for (const bool per_wave : {false, true}) {
+            const auto code = vertex ? vertex_code(per_wave, GetParam())
+                                     : fragment_code(per_wave, GetParam());
+            auto* program = register_program(vertex, code);
+            ASSERT_NE(program, nullptr);
+            const uint64_t address = reinterpret_cast<uint64_t>(program->code.data());
+            ASSERT_EQ(derived(code), per_wave) << "fixture must exercise both classifications";
+            for (int query = 0; query < 3; ++query)
+                EXPECT_EQ(graphics_program_requires_owned_waves(address), per_wave)
+                    << (vertex ? "vertex" : "fragment") << " query " << query;
+        }
+    // Counter-arm: the same registered address rewritten from plain to per-wave code. A
+    // classification keyed on the address alone would keep answering false here.
+    const auto plain = fragment_code(false, GetParam());
+    const auto owned = fragment_code(true, GetParam());
+    auto* program = register_program(false, plain);
+    ASSERT_NE(program, nullptr);
+    const uint64_t address = reinterpret_cast<uint64_t>(program->code.data());
+    EXPECT_FALSE(graphics_program_requires_owned_waves(address));
+    std::copy(owned.begin(), owned.end(), program->code.begin());
+    program->header.shader_size = uint32_t(owned.size() * 4u);
+    EXPECT_TRUE(graphics_program_requires_owned_waves(address))
+        << "rewritten registered bytes must be reclassified, not answered from a stale entry";
 }
 INSTANTIATE_TEST_SUITE_P(RawWidths, OwnedGraphicsWaveLive, ::testing::Values(false, true));
 
