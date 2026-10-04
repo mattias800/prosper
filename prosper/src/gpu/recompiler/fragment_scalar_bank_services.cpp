@@ -1,4 +1,5 @@
 #include "gpu/recompiler/fragment_packet_services.hpp"
+#include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/fragment_scalar_bank_wire.hpp"
 
 namespace prosper::gpu {
