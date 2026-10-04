@@ -24,11 +24,15 @@ protected:
                     0xbf800000u | hint); // Genuine original S_NOP, not specialization.
         return code;
     }
-    static std::vector<std::pair<uint32_t, uint32_t>> context(uint32_t barycentric = 1) {
+    // PERSP_PULL_MODEL (ENA/ADDR bit3) is what makes the normal realizer derive interpolation
+    // geometry: fragment_interpolation_layout sets requires_geometry for an enabled pull plane
+    // even when the program reads no VINTRP parameter. Center/POS words alone do not, so an
+    // earlier center-only fixture never reached the derived-GS path it claimed to test.
+    static std::vector<std::pair<uint32_t, uint32_t>> context(uint32_t extra = 0) {
         auto words = helper::context();
         for (auto& [reg, value] : words)
             if (reg == p::SPI_PS_INPUT_ENA || reg == p::SPI_PS_INPUT_ADDR)
-                value = (1u << barycentric) | (1u << 8); // Actual center and POS_X/Y words.
+                value = (1u << 3) | extra | (1u << 8); // Actual pull plane and POS_X/Y words.
         return words;
     }
     static g::FragmentPacketDeviceContract source_device() {
@@ -93,17 +97,18 @@ TEST_F(DerivedInterpolationGeometry, ChangedOriginalLayoutAndTransportKeepDistin
     ASSERT_NE(first_programs, nullptr);
     ASSERT_NE(changed_programs, nullptr);
     std::array<g::DrawItem, 4> draws;
-    const auto center = context(), linear_center = context(4);
+    // Adding PERSP_CENTER moves the pull plane's system location: a genuinely different layout.
+    const auto pull = context(), pull_center = context(1u << 1);
     const auto before = g::derived_interpolation_geometry_stats();
     ASSERT_TRUE(
-        f::realize_registered(draws[0], *first_programs, f::color_a, f::ieee_rsrc1, 15, center));
+        f::realize_registered(draws[0], *first_programs, f::color_a, f::ieee_rsrc1, 15, pull));
     ASSERT_TRUE(
-        f::realize_registered(draws[1], *changed_programs, f::color_a, f::ieee_rsrc1, 15, center));
+        f::realize_registered(draws[1], *changed_programs, f::color_a, f::ieee_rsrc1, 15, pull));
     ASSERT_TRUE(f::realize_registered(draws[2], *first_programs, f::color_a, f::ieee_rsrc1, 15,
-                                      linear_center));
+                                      pull_center));
     publish(g::FloatTransportProfile::Implicit);
     ASSERT_TRUE(
-        f::realize_registered(draws[3], *first_programs, f::color_a, f::ieee_rsrc1, 15, center));
+        f::realize_registered(draws[3], *first_programs, f::color_a, f::ieee_rsrc1, 15, pull));
     for (uint32_t index = 0; index < draws.size(); ++index) {
         const auto& inputs = draws[index].fragment_draw_inputs;
         ASSERT_TRUE(inputs && inputs->launch_source && inputs->source_gs);
@@ -153,10 +158,15 @@ TEST_F(DerivedInterpolationGeometry, ChangedOriginalLayoutAndTransportKeepDistin
     EXPECT_NE(diagnostic, same);
     EXPECT_NE(rect, same);
     EXPECT_NE(diagnostic, rect);
+    // draws[2] is the same registration and selected VS observed with b's layout, so that exact
+    // key is already resident: the changed-layout query must return draws[2]'s own generation,
+    // not recompile. Transport, diagnostic and rect profiles were never observed and compile.
+    ASSERT_EQ(draws[2].vs_shared, draws[0].vs_shared);
+    EXPECT_EQ(changed_layout, b.source_gs);
     EXPECT_EQ(g::derived_interpolation_geometry_stats().compile_calls -
                   isolated_before.compile_calls,
-              4u);
+              3u);
     EXPECT_EQ(g::derived_interpolation_geometry_stats().cache_hits - isolated_before.cache_hits,
-              1u);
+              2u);
 }
 }   // namespace

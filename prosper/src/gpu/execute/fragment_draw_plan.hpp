@@ -43,7 +43,7 @@ public:
     const auto& rejection_reason() const { return rejection; }
     const auto& device_contract() const { return device; }
     const auto& raster_launch_collection() const { return raster_collection; }
-    bool matches_raster_vertex(const SharedShaderWords& vertex) const {
+    bool matches_raster_vertex(const std::shared_ptr<const std::vector<uint32_t>>& vertex) const {
         if (!raster_collection) return true;   // legacy input-free plans have no raster association
         const auto& selected = raster_module_generations[0];
         return vertex && selected.lock().get() == vertex.get() && !selected.owner_before(vertex) &&
