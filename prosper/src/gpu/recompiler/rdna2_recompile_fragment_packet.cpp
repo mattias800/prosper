@@ -596,7 +596,8 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
             in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c)
             gap = rdna2_waitcnt_execution_gap(uint16_t(in.simm16));
         // Only the architectural original-program route consumes the canonical I-cache hint.
-        // LegacyRaw/resource admission policy and unproved clause scheduling remain unchanged.
+        // This includes Architectural resource callers. It grants no additional resource/input
+        // authority; LegacyRaw admission and unproved clause scheduling remain unchanged.
         if (packet.export_observation == FragmentPacketExportObservation::Architectural &&
             in.fmt == Rdna2Format::SOPP && in.opcode == 0x20)
             gap = rdna2_is_valid_instruction_prefetch(in) ? nullptr

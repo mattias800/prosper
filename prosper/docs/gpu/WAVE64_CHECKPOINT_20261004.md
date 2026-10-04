@@ -11,8 +11,9 @@ measured in this checkpoint. Work was frozen at the maintainer's checkpoint requ
 The original3fcb/2775280b checkpoint and its registered REJECTED review remain historical.
 A protected successor attempts the PREFETCH correction: a shared canonical encoding predicate
 now connects cold proof, complete effects, mask/scalar-origin inventories and Architectural final
-packet admission. Reserved modes and unproved CLAUSE have named refusals. LegacyRaw and the
-separate resource API are not expanded. The underlying synchronous emitter already treats the
+packet admission. Reserved modes and unproved CLAUSE have named refusals. LegacyRaw is not
+expanded; Architectural resource callers share the hint admission, without new resource/input
+authority. The underlying synchronous emitter already treats the
 I-cache hint as a no-op; it is no longer accepted by only the early launch proof.
 
 Three new source-declared regressions (UNEXECUTED):
@@ -50,6 +51,23 @@ check this main delta against the helper changes; inspection is not independent 
 
 The exact published head and post-merge source-gate outcomes are recorded in the PR integration
 comment. Keep the original freeze and its review as historical evidence, not current acceptance.
+
+A subsequent source-only coverage pass adds three UNEXECUTED `FragmentPacketExports` cases:
+
+- `CanonicalPrefetchPreservesArchitecturalPacketAndResourceSinks`: actual compiled module/VM
+  and full logical64 raw/typed export oracles for modes1..3, nonzero and genuinely present zero,
+  both Architectural routes, shifted original export PC and unchanged commit eligibility.
+- `ReservedPrefetchAndClauseRefuseAtTheActualArchitecturalDispatcher`: same-original canonical
+  positive control plus named transactional refusals with no SPIR-V/input/output on both routes.
+- `ArchitecturalPrefetchDoesNotExpandLegacyRawPacketOrResourcePolicy`: same-original NOP
+  positive control and retained LegacyRaw hint/CLAUSE refusals on both routes.
+
+Source inspection corrected the original claim that the separate resource API was wholly
+unchanged: its Architectural mode shares the final hint override; its LegacyRaw mode does not.
+No functional production change was made in this coverage pass. The source comment and this
+handoff now state the actual boundary. No build, configured test discovery, VM execution,
+validator, GPU or game run occurred. These three cases are additional to the earlier three;
+registered/private-owner negative coverage and independent successor review remain outstanding.
 
 ## Objective and acceptance boundary
 
