@@ -146,6 +146,7 @@ separate PRs afterwards.
 | 9 | `hle` -> `gpu`: a narrow AGC submission interface | hand design, then moves | `layer-include` (future: an `hle`/`gpu` row once the interface exists) |
 | 10 | `src/gpu/recompiler/gta5/` contracts generalized into properties of the shader/data | hand work | `title-dir` (cap 1,832 lines) |
 | 11 | `diagnostics` -> `gpu`/`frontends` helpers moved down into `diagnostics/` | `move_module.py` | `layer-include` |
+| 12 | extract the APR engine (command buffer model, executor, completion dialects) out of `hle/memory`, `hle/fs` and `hle/kernel` into a platform-neutral component in `src/guest/`, leaving `hle/` the NID handlers; it reaches the OS only through `src/host/platform/` interfaces. Needs moves 4, 5 and 7 first and owner approval of the proposed extraction. `CONFIDENCE: MED`: placement follows the proposed layering; no APR extraction has tested it. | `move_module.py` for the moves, then hand splitting for the shared state | `platform-ifdef`, `layer-include` |
 
 ## Bad practices and who owns each
 
@@ -168,37 +169,41 @@ Every structural cost identified in the ratchet work is either a rule in
 | giant functions | **not checkable here**: needs a parser to find function extents. Owned by the separate clang-tidy PR as `readability-function-size`. | -- |
 | per-draw object creation proven at run time | **not checkable statically**; the steady-state performance invariants in #4193 own it | -- |
 
-## Open questions
+## Standards
 
-Not settled by this document, and each needs the project owner before it becomes a move.
+The platform-arm rule in item 2 is current charter policy, with the partial mechanical guards
+named there. The guest placement and engine replay requirements in items 1 and 3 describe the
+**proposed** target tree and await owner approval; creating the `guest/` layer requires moves 4
+and 5 above. This section does not authorize an extraction or claim that those engines or replay
+tests already exist.
 
-- **Where does a cross-cutting HLE area live?** The target tree places layers, not functional areas.
-  APR (`sceAmpr*`, and the file reads and event-queue completions behind it) spans `hle/memory`,
-  `hle/fs` and `hle/kernel` today. Before any of it is extracted, decide which layer it belongs to
-  and which interface it uses to reach `gpu/`, since `hle` is the top of the include order.
-  **Recommendation, for the owner to accept or reject:** keep `hle/` as the API surface only (NID
-  handlers, argument decoding, return codes) and put the engine behind it in `guest/`: the command
-  buffer model, the executor and the completion dialects, written once and platform-neutral, reaching
-  the OS only through `src/host/platform/` interfaces (`vm`, `file`, `clock`). It implements guest-visible
-  coprocessor semantics rather than a Sony API, which is what the proposed `guest/` layer is for, and it
-  is the usual split in compatibility layers (Wine's per-platform backend behind a portable service,
-  HLE service handlers over a shared emulated-hardware core in console emulators). The handlers then
-  have no platform arm to fall behind. `CONFIDENCE: MED`: this follows the document's own layering and
-  the seam's one-interface-per-service rule, but no APR code has been moved to test it.
-- **What keeps two platform arms in step?** `HOST_PLATFORM_SEAM.md` asks for a test per interface
-  that runs on both hosts, but nothing detects a platform arm that was never ported. One possible
-  guard is a differential test that feeds the same recorded command-buffer stream to both hosts and
-  compares what the guest can observe. `CONFIDENCE: LOW` that this is practical, and it has not been
-  tried.
-- **Possible consequence of the stub-arm row above, observed and not diagnosed:** on a recent `main`
-  the Windows build of *Dragon Quest VII Reimagined* (`PPSA17942`) ends in a guest fault within about
-  3 s in 3 of 3 `tools/screenshot` runs (two at `libc.prx+0x4270`, the title's fatal-error path, one at
-  `rip=0`), and a `boot_trace` run printed `Apr read failure 1 at CB offset 40` just before the same
-  fault. Its status doc (`docs/games/DRAGON_QUEST_STATUS.md`) records Windows runs of the same title
-  that rendered in 3 of 6 attempts on 2026-08-10 and Linux at rung 3. Whether the difference is a
-  regression since then, this dump or build, or the stubbed arms is **not established**; one
-  experiment that filled the stubbed constructor's output slots with a staging buffer, as the Linux
-  arm does, changed nothing.
+1. **`hle/` is the API surface; engines live in `guest/`.** A cross-cutting HLE area such as APR
+   (`sceAmpr*`, and the file reads and event-queue completions behind it, spread today over `hle/memory`,
+   `hle/fs` and `hle/kernel`) would keep only its NID handlers, argument decoding and return codes in
+   `hle/`. Its engine (command buffer model, executor, completion dialects) would live once in
+   `src/guest/`, because it implements guest-visible coprocessor semantics rather than API decoding.
+   This is the placement proposed in move 12, contingent on moves 4, 5 and 7 and owner approval.
+2. **Portable logic is written once; a platform arm holds primitives only.** An engine reaches the OS
+   through the `src/host/platform/` interfaces (`vm`, `file`, `clock`, ...) and nothing else, so no
+   platform arm can be a stub or reduced copy of another arm's logic. Enforced today only in part:
+   `platform-ifdef` and `layer-include` catch directives and includes, and `platform-stub` (a
+   name-based proxy landed in #4366) catches handlers named `HLE(*_stub)`; a
+   reduced copy that is not named as a stub is a review rule (see the stub-arm row in "Bad
+   practices").
+3. **Each engine ships a replay test that runs on both hosts.** A recorded command-buffer stream from a
+   real title is fed to the engine, and the test asserts what the guest can observe (memory contents
+   and delivered events). It extends the seam's one-test-per-interface rule from the OS services to
+   the engines above them. The aim is to detect an unported platform arm in a test rather than
+   discover it title by title. `CONFIDENCE: LOW` on how practical this is for large streams:
+   it has not been tried.
+
+## Historical title observations
+
+The earlier Windows APR fault report is preserved in
+[`DRAGON_QUEST_STATUS.md`](../games/DRAGON_QUEST_STATUS.md#historical-windows-apr-observation-preserved-2026-10-04)
+and [the title tracker](https://github.com/mattias800/prosper/issues/1874#issuecomment-5976105083).
+Its tested source, binary and configuration were unpinned; it establishes neither a current-main
+failure nor APR as the cause. Removing it from this architecture proposal does not falsify it.
 
 ## Tracking
 
