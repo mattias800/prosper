@@ -1371,9 +1371,10 @@ TEST(Rdna2DecodeSweep, Dpp16IsNeverAdmittedOnVopcAndDpp8IsNeverAdmitted) {
 // ---- VOP3P (packed / mixed-precision) --------------------------------------------------------
 // dword0: VDST[7:0], NEG_HI[10:8], OPSEL[13:11], OPSEL_HI[2][14], CLAMP[15], OP[22:16].
 // dword1: SRC0[8:0], SRC1[17:9], SRC2[26:18], OPSEL_HI[1:0][28:27], NEG[31:29].
-// Three families have modelled modifiers: packed f16 (0x0E-0x12), packed 16-bit integer (0x00-0x0D,
-// where CLAMP is unmodelled integer saturation) and the fma_mix trio (0x20-0x22, where NEG_HI is
-// ABS). Every other opcode must keep has_modifier on any modifier bit.
+// Four families have modelled modifiers: packed f16 (0x0E-0x12), packed 16-bit integer (0x00-0x0D,
+// where CLAMP is unmodelled integer saturation), the fma_mix trio (0x20-0x22, where NEG_HI is
+// ABS) and the integer dot family (0x14-0x19, where only the dot2 source selectors are modelled).
+// Every other opcode must keep has_modifier on any modifier bit.
 
 namespace {
 struct Vop3p {
