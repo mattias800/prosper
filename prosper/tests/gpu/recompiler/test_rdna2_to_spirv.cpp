@@ -11038,6 +11038,49 @@ int main() {
     CHECK(gotT11e.size()==N && badT11e==0,
           "T11e: v_bcnt_u32_b32 adds the exact 32-bit population count");
 
+    // Tperm: v_perm_b32 byte permutation execution coverage.
+    // Inputs: S0 = 0x7F448022 (high), S1 = 0x80337F11 (low).
+    // Tests exact selector categories (0..7 direct byte picks, 8..11 sign bit replicates of bytes 1,3,5,7,
+    // 12 -> 0x00, 13..255 -> 0xFF), plus dynamic per-lane selector.
+    const uint32_t codeTperm[] = {
+        0x7e0202ffu, 0x7f448022u,   // v_mov_b32 v1, 0x7F448022 (S0)
+        0x7e0402ffu, 0x80337f11u,   // v_mov_b32 v2, 0x80337F11 (S1)
+        0xd7440003u, 0x04020501u,   // v_perm_b32 v3, v1, v2, v0 (S2 from v0 input)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTperm =
+        recompile_valu(codeTperm, std::size(codeTperm), 1, /*out_vgpr*/ 3);
+    CHECK(!spvTperm.empty(), "recompiled Tperm (v_perm_b32 dynamic selector) -> SPIR-V");
+
+    // Form inputs for 64 lanes testing specific vectors:
+    // lane 0: 0x03020100 -> 0x80337F11
+    // lane 1: 0x07060504 -> 0x7F448022
+    // lane 2: 0x0B0A0908 -> 0x00FFFF00
+    // lane 3: 0x0D0C0E0F -> 0xFF00FFFF
+    // lane 4: 0x10FF0C01 -> 0xFFFF007F
+    // lane 5: 0x04000703 -> 0x22117F80
+    std::vector<float> inPerm(N, 0.0f);
+    std::vector<uint32_t> expPerm(N, 0);
+    const struct {
+        uint32_t sel;
+        uint32_t exp;
+    } kPermCases[] = {
+        {0x03020100u, 0x80337F11u}, {0x07060504u, 0x7F448022u}, {0x0B0A0908u, 0x00FFFF00u},
+        {0x0D0C0E0Fu, 0xFF00FFFFu}, {0x10FF0C01u, 0xFFFF007Fu}, {0x04000703u, 0x22117F80u},
+    };
+    for (uint32_t i = 0; i < N; ++i) {
+        const auto& c = kPermCases[i % std::size(kPermCases)];
+        inPerm[i] = std::bit_cast<float>(c.sel);
+        expPerm[i] = c.exp;
+    }
+    std::vector<float> gotTperm = prosper::test::run_compute(spvTperm, inPerm, N, N);
+    uint32_t badTperm = 0;
+    for (uint32_t i = 0; i < N && gotTperm.size() == N; ++i) {
+        if (bits_of(gotTperm[i]) != expPerm[i]) ++badTperm;
+    }
+    CHECK(gotTperm.size() == N && badTperm == 0,
+          "Tperm: v_perm_b32 correctly handles all selector categories (0..7, 8..11, 12, 13..255)");
+
     // Worms Armageddon (PPSA20052) rejects every one of its vertex shaders at pc=7 on VOP3 0x15d
     // (v_sad_u32). Its shipped .ags shader assets carry the identical word, so the encoding is
     // independently attested. D.u32 = abs(S0.u32 - S1.u32) + S2.u32 — an UNSIGNED magnitude, which

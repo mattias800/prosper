@@ -9,6 +9,7 @@
 #include "gpu/recompiler/rdna2_dot.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
 #include "gpu/recompiler/rdna2_sad.hpp"
+#include "gpu/recompiler/rdna2_perm_b32.hpp"
 #include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#325)
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -5098,6 +5099,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             b.sel(b.ucmp(Op_ULessThan, count, b.uconst(8)), upper,
                                   b.uconst(0)));
                     }
+                }
+            } else if (in.opcode == 0x344) {   // v_perm_b32
+                const bool modified = in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
+                                      in.src_neg[0] || in.src_neg[1] || in.src_neg[2] || in.clamp ||
+                                      in.omod;
+                if (modified) {
+                    ok = false;
+                } else {
+                    vreg[in.dst.value] =
+                        emit_v_perm_b32(b, val(in.src[0]), val(in.src[1]), val(in.src[2]));
                 }
             } else if (in.opcode == kVop3OpcodeLshlrevB64) {   // v_lshlrev_b64
                 // GTA V constructs a per-lane bit as `1ull << lane` immediately after MBCNT. This
