@@ -40,7 +40,15 @@ std::vector<uint32_t> geometry_profile(const FragmentInterpolationLayout& layout
                                   uint32_t(layout.valid),
                                   uint32_t(capture),
                                   uint32_t(rect),
-                                  uint32_t(transport.profile)};
+                                  uint32_t(transport.profile),
+                                  // A nonexplicit transport's module also depends on the process
+                                  // float-controls verdict (SpirvCompute::declare_float_controls),
+                                  // which a later publish can change. Explicit profiles never read
+                                  // it. GS generation runs outside any CompilerChoiceScope, so this
+                                  // is the same live value the compile consumes.
+                                  transport.explicit_nonfinite32()
+                                      ? 2u
+                                      : uint32_t(signed_zero_inf_nan_preserve_declared())};
     for (const auto& locations : layout.parameter_locations)
         profile.insert(profile.end(), locations.begin(), locations.end());
     profile.insert(profile.end(), layout.system_locations.begin(), layout.system_locations.end());

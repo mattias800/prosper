@@ -168,5 +168,22 @@ TEST_F(DerivedInterpolationGeometry, ChangedOriginalLayoutAndTransportKeepDistin
               3u);
     EXPECT_EQ(g::derived_interpolation_geometry_stats().cache_hits - isolated_before.cache_hits,
               2u);
+
+    // A nonexplicit transport's module embeds the process float-controls verdict, which a later
+    // publish can withdraw. The same producing owners and layout must not return the bytes that
+    // were compiled under the earlier verdict.
+    const auto implicit = draws[3].fragment_draw_inputs->float_transport;
+    ASSERT_FALSE(implicit.explicit_nonfinite32());
+    ASSERT_TRUE(g::signed_zero_inf_nan_preserve_declared());
+    const auto with_controls = g::acquire_derived_interpolation_geometry(
+        analysis, draws[0].vs_shared, a.interpolation, false, false, implicit);
+    g::publish_float_controls_support(false, false);
+    ASSERT_FALSE(g::signed_zero_inf_nan_preserve_declared());
+    const auto without_controls = g::acquire_derived_interpolation_geometry(
+        analysis, draws[0].vs_shared, a.interpolation, false, false, implicit);
+    g::reset_float_controls_support_for_test();
+    ASSERT_TRUE(with_controls && without_controls);
+    EXPECT_NE(with_controls, without_controls);
+    EXPECT_NE(*with_controls, *without_controls);
 }
 }   // namespace
