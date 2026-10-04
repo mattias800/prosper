@@ -4729,35 +4729,6 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 
-      # #3248: PROSPER_GEOM_PROBE and PROSPER_DRAW_ISO record Vulkan commands that no test executed,
-      # so tools/vkval could not see them however it was configured. This case runs both once. Its
-      # own assertions pin the arming decisions; the SPEC misuse they used to commit is caught by
-      # running the suite under the validation layer, which is only possible because this exists.
-      add_executable(test_render_diagnostic_paths tests/render/test_render_diagnostic_paths.cpp)
-      # Includes a shared fixture, which resolves from the `tests` root.
-      target_include_directories(test_render_diagnostic_paths PRIVATE tests)
-      # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
-      target_include_directories(test_render_diagnostic_paths PRIVATE frontends)
-      target_link_libraries(test_render_diagnostic_paths PRIVATE prosper_core Vulkan::Vulkan)
-      add_test(NAME render_diagnostic_paths COMMAND test_render_diagnostic_paths)
-      # Armed HERE rather than with setenv() inside the test. PROSPER_GEOM_PROBE is a cached
-      # one-shot read (PROSPER_ENV_VALUE), so a test that sets it after something has read it arms
-      # nothing while still passing -- which `cached_env_arming_logic` refuses by name. The test
-      # ENVIRONMENT is in place before the process starts, so read order cannot make it vacuous, and
-      # the test fails loudly when run without it. PROSPER_ISO_AT must name a pixel inside the
-      # 32x32 frame the test renders.
-      set_tests_properties(render_diagnostic_paths PROPERTIES ENVIRONMENT
-                           "PROSPER_GEOM_PROBE=0;PROSPER_DRAW_ISO=1;PROSPER_ISO_AT=16,16;PROSPER_FRAME_DIR=render_diagnostic_paths_frames;PROSPER_FRAGMENT_DRAW_OBSERVE=1")
-
-      # Exercise every opt-in depth-clear policy under Vulkan validation. The test asserts that
-      # the selected draw reached its path, so a clean layer log cannot be a vacuous pass.
-      foreach(clear_probe_mode IN ITEMS 1 2 3 4 5)
-        add_test(NAME render_diagnostic_paths_clear_${clear_probe_mode}
-                 COMMAND test_render_diagnostic_paths ${clear_probe_mode})
-        set_tests_properties(render_diagnostic_paths_clear_${clear_probe_mode} PROPERTIES ENVIRONMENT
-                             "PROSPER_GEOM_PROBE=0;PROSPER_DRAW_ISO=1;PROSPER_ISO_AT=16,16;PROSPER_FRAME_DIR=render_diagnostic_paths_frames_${clear_probe_mode};PROSPER_DIAG_CLEAR_OVERWRITE=${clear_probe_mode};PROSPER_FRAGMENT_DRAW_OBSERVE=1")
-      endforeach()
-
       # The address-watch matcher's edge cases (exclusive end, empty range, UINT64_MAX wrap).
       prosper_add_gtest(test_compute_address_watch
         SOURCES tests/gpu/test_compute_address_watch.cpp
@@ -5314,6 +5285,35 @@ endif()
 endif()
 
 if(TARGET prosper_core AND TARGET Vulkan::Vulkan)
+  # #3248: PROSPER_GEOM_PROBE and PROSPER_DRAW_ISO record Vulkan commands that no test executed,
+  # so tools/vkval could not see them however it was configured. This case runs both once. Its
+  # own assertions pin the arming decisions; the SPEC misuse they used to commit is caught by
+  # running the suite under the validation layer, which is only possible because this exists.
+  add_executable(test_render_diagnostic_paths tests/render/test_render_diagnostic_paths.cpp)
+  # Includes a shared fixture, which resolves from the `tests` root.
+  target_include_directories(test_render_diagnostic_paths PRIVATE tests)
+  # Reaches `shared/...` through render_runner.h, which resolves from `frontends`.
+  target_include_directories(test_render_diagnostic_paths PRIVATE frontends)
+  target_link_libraries(test_render_diagnostic_paths PRIVATE prosper_core Vulkan::Vulkan)
+  add_test(NAME render_diagnostic_paths COMMAND test_render_diagnostic_paths)
+  # Armed HERE rather than with setenv() inside the test. PROSPER_GEOM_PROBE is a cached
+  # one-shot read (PROSPER_ENV_VALUE), so a test that sets it after something has read it arms
+  # nothing while still passing -- which `cached_env_arming_logic` refuses by name. The test
+  # ENVIRONMENT is in place before the process starts, so read order cannot make it vacuous, and
+  # the test fails loudly when run without it. PROSPER_ISO_AT must name a pixel inside the
+  # 32x32 frame the test renders.
+  set_tests_properties(render_diagnostic_paths PROPERTIES ENVIRONMENT
+                       "PROSPER_GEOM_PROBE=0;PROSPER_DRAW_ISO=1;PROSPER_ISO_AT=16,16;PROSPER_FRAME_DIR=render_diagnostic_paths_frames;PROSPER_FRAGMENT_DRAW_OBSERVE=1")
+
+  # Exercise every opt-in depth-clear policy under Vulkan validation. The test asserts that
+  # the selected draw reached its path, so a clean layer log cannot be a vacuous pass.
+  foreach(clear_probe_mode IN ITEMS 1 2 3 4 5)
+    add_test(NAME render_diagnostic_paths_clear_${clear_probe_mode}
+             COMMAND test_render_diagnostic_paths ${clear_probe_mode})
+    set_tests_properties(render_diagnostic_paths_clear_${clear_probe_mode} PROPERTIES ENVIRONMENT
+                         "PROSPER_GEOM_PROBE=0;PROSPER_DRAW_ISO=1;PROSPER_ISO_AT=16,16;PROSPER_FRAME_DIR=render_diagnostic_paths_frames_${clear_probe_mode};PROSPER_DIAG_CLEAR_OVERWRITE=${clear_probe_mode};PROSPER_FRAGMENT_DRAW_OBSERVE=1")
+  endforeach()
+
   # vkval_sync_probe (#3248): the positive control for `vk_validation_scan.py --sync`. It
   # commits one deliberate write-after-write so the scanner can prove SYNCHRONIZATION validation
   # is armed before reporting a sync verdict -- loading the layer proves only that CORE checks
