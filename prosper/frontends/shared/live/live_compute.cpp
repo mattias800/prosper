@@ -1734,7 +1734,8 @@ struct VulkanComputeContext {
         indirect_validator.destroy();
         if (indirect_scratch) vkDestroyBuffer(device, indirect_scratch, nullptr);
         if (indirect_scratch_memory) release_memory(indirect_scratch_memory);
-        // Before the pool is emptied: release_memory() would otherwise re-park it there.
+        // Before the pool is emptied: release_cached_memory() frees every ACTIVE allocation too,
+        // so releasing the scratch afterwards misses in the pool and frees it a second time.
         bgra_seed_scratch.destroy(device, [&](VkDeviceMemory m) { release_memory(m); });
         release_cached_buffers();
         release_cached_images();
