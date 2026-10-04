@@ -74,6 +74,11 @@ alignas(256) static uint32_t kResourceNoopCs[] = {0xBF810000u};
 alignas(256) static const uint32_t kDccPs[] = {
     0x7E000280u, 0xF8001803u, 0x00000000u, 0xBF810000u,
 };
+// The second observed AGC helper (Hollow Knight: Silksong): exports compressed fp16 1.0 to all four
+// channels. Run as an ordinary draw it paints the target WHITE, which was the title's boot screen.
+alignas(256) static const uint32_t kDccFp16OnePs[] = {
+    0x7E0002FFu, 0x3C003C00u, 0xF8001C0Fu, 0x00000000u, 0xBF810000u,
+};
 alignas(256) static const uint32_t kNoopCs[] = {0xBF810000u};
 // Distinct code identity: a later fixture registers kNoopCs with its own header. Mutable storage
 // prevents link-time merging of two byte-identical const shader arrays.
@@ -410,6 +415,33 @@ int main() {
     }
     CHECK(!dcc_has_output_variable,
           "DCC decompress replacement exposes no ordinary fragment-color output");
+
+    // Silksong's helper variant under the same mode. Unrecognised, it ran as an ordinary draw and
+    // exported 1.0 -- the centre would read white (all channels > 0x80) instead of the clear colour.
+    GpuState dcc_one = dcc;
+    set_pgm(dcc_one, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS, kDccFp16OnePs);
+    const std::vector<uint8_t> dcc_one_px = execute_gpustate(dcc_one, backend);
+    bool dcc_one_preserved = dcc_one_px.size() == static_cast<size_t>(W) * H * 4;
+    if (dcc_one_preserved) {
+        const uint8_t* center = &dcc_one_px[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
+        dcc_one_preserved = center[2] > 0x80 && center[0] < 0x40 && center[1] < 0x40;
+    }
+    CHECK(dcc_one_preserved, "DCC decompress with the fp16-1.0 AGC helper keeps the attachment "
+                             "instead of painting it white");
+    // Positive control for the check above: the same program in NORMAL mode really paints white, so
+    // the preserved centre there is the recognition at work, not a dropped or empty draw.
+    GpuState one_normal = dcc_one;
+    one_normal.cx[P::CB_COLOR_CONTROL] =
+        (P::CB_COLOR_CONTROL_MODE_NORMAL << P::CB_COLOR_CONTROL_MODE_SHIFT) |
+        (0xCCu << P::CB_COLOR_CONTROL_ROP3_SHIFT);
+    const std::vector<uint8_t> one_normal_px = execute_gpustate(one_normal, backend);
+    bool one_normal_white = one_normal_px.size() == static_cast<size_t>(W) * H * 4;
+    if (one_normal_white) {
+        const uint8_t* center = &one_normal_px[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
+        one_normal_white = center[0] > 0xf0 && center[1] > 0xf0 && center[2] > 0xf0;
+    }
+    CHECK(one_normal_white,
+          "the fp16-1.0 helper program outside DCC_DECOMPRESS draws white (control)");
 
     // A folded submit can retain MODE=6 after the guest has restored normal mode. Do not classify a
     // real shader from the following post-process pass as the helper merely because of that residue.

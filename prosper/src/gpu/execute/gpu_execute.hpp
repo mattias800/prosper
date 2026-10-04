@@ -24,6 +24,7 @@
 #include "diagnostics/perf/perf_ledger.hpp"   // #3951: shader-recompile draw drops
 #include "gpu/recompiler/rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
 #include "gpu/recompiler/raster_quad_collector.hpp"
+#include "gpu/execute/dcc_helper_program.hpp"   // AGC colour-block utility program
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/resources/shader_resources.hpp"    // ShaderResourceTable
 #include "gpu/resources/compressed_source_authority.hpp"  // CompressionMetadataKind
@@ -2524,18 +2525,20 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // ordinary fragment-color export. The operation bits can remain folded into a later graphics
     // submit even though the guest's utility sequence has restored normal mode by then, so MODE alone
     // is not a sufficient discriminator: doing that replaced Astro's post-process and scanout shaders.
-    // Match the descriptor-free clear-RG helper program emitted by AGC as well. This is program content,
-    // not a title-specific address, and keeps normal shaders fail-visible when stale operation bits leak.
-    static constexpr uint32_t kDccDecompressHelperProgram[] = {
-        0x7e000280u, 0xf8001803u, 0x00000000u, 0xbf810000u,
-    };
-    const auto* raw_fragment = fragment_code;
-    const bool dcc_helper_program = fragment_analysis
-        ? shader_analysis_has_prefix(fragment_analysis, kDccDecompressHelperProgram,
-                                     std::size(kDccDecompressHelperProgram))
-        : raw_fragment && max_shader_dwords >= std::size(kDccDecompressHelperProgram) &&
-              std::equal(std::begin(kDccDecompressHelperProgram),
-                         std::end(kDccDecompressHelperProgram), raw_fragment);
+    // Match AGC's descriptor-free constant-export helper as well (dcc_helper_program.hpp: program
+    // content, not a title-specific address -- both observed variants, including Silksong's, which
+    // exports 1.0 and painted its boot screens white when it ran as an ordinary draw), which keeps
+    // normal shaders fail-visible when stale operation bits leak. With a retained analysis, compare
+    // its owned bytes -- the same version the fragment module was built from -- not a later raw read.
+    const bool dcc_helper_program =
+        fragment_analysis
+            ? std::any_of(std::begin(prosper::gpu::kAgcDccHelperPrograms),
+                          std::end(prosper::gpu::kAgcDccHelperPrograms),
+                          [&](const prosper::gpu::AgcDccHelperProgram& helper) {
+                              return shader_analysis_has_prefix(fragment_analysis, helper.words,
+                                                                helper.dwords);
+                          })
+            : prosper::gpu::is_agc_dcc_helper_program(fragment_code, max_shader_dwords);
     const bool dcc_decompress = dcc_helper_program &&
         PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE) ==
             prosper::agc::Pm4::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS;
