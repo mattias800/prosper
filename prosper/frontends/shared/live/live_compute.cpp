@@ -16,6 +16,7 @@
 #include "shared/live/cpu_rtt_snapshot_pool.hpp"
 #include "shared/live/compute_view_swizzle.hpp"
 #include "shared/live/live_target_format.hpp"
+#include "shared/live/bgra_seed_scratch.hpp"
 #include "shared/live/packed_rtt_conversion.hpp"
 #include "shared/live/indirect_dispatch.hpp"   // #3656
 #include "shared/live/gpu_retile.hpp"
@@ -572,11 +573,11 @@ inline RefusalCensus& destination_refusal_census() {
 
 struct RttDestinationCensus {
     RttMirrorCounter candidates, borrowed, recorded, published, failed;
-    RttMirrorCounter r11_source_seed_recorded, rgba16_source_seed_recorded;
+    RttMirrorCounter r11_source_seed_recorded, rgba16_source_seed_recorded, bgra_source_seed_recorded;
     LiveComputeRttDestinationMirrorCounters snapshot() const {
         return {candidates.value(), borrowed.value(), recorded.value(), published.value(),
                 failed.value(), r11_source_seed_recorded.value(),
-                rgba16_source_seed_recorded.value()};
+                rgba16_source_seed_recorded.value(), bgra_source_seed_recorded.value()};
     }
 };
 RttDestinationCensus& rtt_destination_census() {
@@ -1590,6 +1591,7 @@ struct VulkanComputeContext {
     VkPipelineLayout compare_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline compare_pipeline = VK_NULL_HANDLE;
     PackedRttConversion packed_rtt_conversion;
+    BgraSeedScratch bgra_seed_scratch;
     // #3656: device-side bounding of a device-resolved indirect dispatch's argument record.
     IndirectDispatchValidator indirect_validator;
     VkBuffer indirect_scratch = VK_NULL_HANDLE;
@@ -1742,6 +1744,7 @@ struct VulkanComputeContext {
         if (descriptor_pool) vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
         if (compare_pool) vkDestroyDescriptorPool(device, compare_pool, nullptr);
         packed_rtt_conversion.destroy();
+        bgra_seed_scratch.destroy(device, [&](VkDeviceMemory m) { release_memory(m); });
         retile_pipeline.destroy();
         volume_retile_pipeline.destroy();
         packed_retile_pipeline.destroy();
@@ -3779,6 +3782,24 @@ struct VulkanComputeContext {
         return true;
     }
 
+    bool prepare_bgra_seed(uint32_t width, uint32_t height) {
+        return bgra_seed_scratch.prepare(
+            physical, device, PROSPER_ENV_ON("PROSPER_NO_BGRA_STANDALONE_SEED"), width, height,
+            [&](const VkMemoryRequirements& req) {
+                VkDeviceMemory out = VK_NULL_HANDLE;
+                prosper::gpu::allocate_gpu_only(
+                    prosper::gpu::GpuOnlyMemoryClass::ComputeImage, memory, req.memoryTypeBits,
+                    req.size, [&](uint32_t type) {
+                        VkResult status = VK_SUCCESS;
+                        out = allocate_memory(req.size, type, false, nullptr, &status);
+                        return status;
+                    },
+                    prosper::gpu::force_gpu_only_oom(prosper::gpu::GpuOnlyMemoryClass::ComputeImage));
+                return out;
+            },
+            [&](VkDeviceMemory m) { release_memory(m); });
+    }
+
     uint32_t host_memory_type(uint32_t bits) const {
         const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -4052,6 +4073,7 @@ struct BoundImage {
     // Standalone source-only pin: no sampled sibling is needed to preserve current RTT inputs.
     // The private storage image still owns writes and publishes the ordinary guest mirror.
     prosper::gpu::LiveTargetImageImport standalone_seed{};
+    bool standalone_seed_swap_rb = false;   // BGRA source: seeded through BgraSeedScratch
     const char* standalone_seed_decision = "not-requested";
     // Separate write-only pin. It may refer to an invalid renderer image, so it must never seed a
     // compute input; only a completed full staging result may replace that allocation's pixels.
@@ -7861,8 +7883,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                     ? "format-mismatch"
                                 // A raw image copy keeps the renderer's canonical RGBA order; the
                                 // identity storage view would then read a BGRA target's R and B
-                                // exchanged (#4291).
-                                : source.component_order_bgra ? "component-order"
+                                // exchanged (#4291); an RGBA8 one is seeded via BgraSeedScratch.
+                                : source.component_order_bgra && !(exact_rgba8 && source.transfer_src &&
+                                    ctx.prepare_bgra_seed(r->width, r->height)) ? "component-order"
                                 : !source.transfer_src ? "no-transfer-src"
                                 : !rtt_gpu_seed_import_extent_compatible(
                                     r->width, r->height, source.width, source.height) ? "extent-mismatch"
@@ -7870,10 +7893,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                   source.layout == VK_IMAGE_LAYOUT_PREINITIALIZED ? "invalid-layout"
                                 : "admitted";
                             bi.standalone_seed_decision = reason;
-                            if (std::strcmp(reason, "admitted") == 0)
+                            if (std::strcmp(reason, "admitted") == 0) {
                                 bi.standalone_seed = source;
-                            else
+                                bi.standalone_seed_swap_rb = source.component_order_bgra;
+                            } else {
                                 release_live_render_target_image(r->gpu_addr);
+                            }
                         }
                     }
                 }
@@ -10969,14 +10994,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 std::fprintf(stderr,
                     "[compute-rtt-destination-census] candidates=%llu borrowed=%llu "
                     "recorded=%llu published=%llu failed=%llu r11-source-seed=%llu "
-                    "rgba16-source-seed=%llu\n",
+                    "rgba16-source-seed=%llu bgra-source-seed=%llu\n",
                     (unsigned long long)candidates,
                     (unsigned long long)totals.borrowed,
                     (unsigned long long)totals.recorded,
                     (unsigned long long)totals.published,
                     (unsigned long long)totals.failed,
                     (unsigned long long)totals.r11_source_seed_recorded,
-                    (unsigned long long)totals.rgba16_source_seed_recorded);
+                    (unsigned long long)totals.rgba16_source_seed_recorded,
+                    (unsigned long long)totals.bgra_source_seed_recorded);
             }
             const prosper::gpu::LiveTargetImageDestinationRequest request{
                 r->width, r->height, *format, destination_creation_enabled,
@@ -11559,6 +11585,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                                              VK_PIPELINE_STAGE_TRANSFER_BIT,
                                          0, 0, nullptr, 1, &staging_reuse, 0, nullptr);
+                } else if (standalone && bi.standalone_seed_swap_rb) {
+                    ctx.bgra_seed_scratch.record(command, source_image, bi.image, r->width, r->height);
+                    rtt_destination_census().bgra_source_seed_recorded.add();
                 } else {
                     VkImageCopy copy{};
                     copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};

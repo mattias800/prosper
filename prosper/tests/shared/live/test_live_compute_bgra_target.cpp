@@ -170,6 +170,61 @@ TEST(LiveComputeBgraTarget, ComputeObservesGuestComponentOrder) {
                          << floats[0] << "," << floats[1] << "," << floats[2] << "," << floats[3];
     }
 
+    // Native RGBA8 storage READ of the whole target: the exact-view standalone seed. The identity
+    // storage view cannot be swizzled, so the seed goes through the BGRA blit scratch on the
+    // device instead of a CPU snapshot plus swap. Requires both the guest order AND that the
+    // device path recorded the seed -- the CPU fallback would also produce guest order.
+    {
+        produce();
+        ShaderResourceTable table;
+        ShaderResource buffer{};
+        buffer.cls = ResourceClass::ConstantBuffer;
+        buffer.binding = 2;
+        buffer.format = DataFormat::Uint32; buffer.num_components = 1;
+        buffer.stride = 4; buffer.size = 16;
+        buffer.gpu_addr = reinterpret_cast<uint64_t>(dummy.data());
+        std::vector<uint8_t> output(size_t(Width) * 4, 0xee);
+        ShaderResource source{}, destination{};
+        for (ShaderResource* image : {&source, &destination}) {
+            image->cls = ResourceClass::StorageImage;
+            image->img_dim = 1; image->width = Width; image->height = image->depth = 1;
+            image->format = DataFormat::Unorm8; image->num_components = 4;
+            image->size = Width * 4;
+            for (uint32_t c = 0; c < 4; ++c) image->swizzle[c] = 4 + c;
+        }
+        source.binding = 4; source.sgpr_base = 0; source.gpu_addr = color;
+        destination.binding = 5; destination.sgpr_base = 8;
+        destination.gpu_addr = reinterpret_cast<uint64_t>(output.data());
+        table.resources = {buffer, source, destination};
+        const uint32_t copy_words[] = {
+            0x7e080300u, 0x7e0a0280u,               // v4 = thread x, v5 = 0
+            0xf0000f08u, 0x00000004u, 0xbf8c3f70u,  // image_load v[0:3] from s[0:7]
+            0xf0200f08u, 0x00020004u,               // image_store v[0:3] to s[8:15]
+            0xbf810000u,
+        };
+        ComputeShaderConfig native;
+        native.user_sgprs.resize(24);
+        native.local_x = Width; native.local_y = native.local_z = 1;
+        native.native_storage_format_support =
+            native_storage_format_support_bit(DataFormat::Unorm8, 4);
+        ComputeItem reader;
+        reader.spirv = recompile_compute(copy_words, std::size(copy_words), &table, native);
+        ASSERT_FALSE(reader.spirv.empty());
+        reader.resources = std::make_shared<ShaderResourceTable>(table);
+        reader.user_sgprs = native.user_sgprs;
+        reader.code_addr = 0x42912;
+        reader.launch.threads_x = reader.launch.local_x = Width;
+        reader.launch.threads_y = reader.launch.threads_z = 1;
+        reader.launch.local_y = reader.launch.local_z = 1;
+        reader.launch.groups_x = reader.launch.groups_y = reader.launch.groups_z = 1;
+        const auto before = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        ASSERT_TRUE(prosper::frontend::execute_live_compute_items({reader}));
+        const auto after = prosper::frontend::live_compute_rtt_destination_mirror_counters();
+        EXPECT_EQ(output, guest_order) << "native storage read observes the guest's BGRA order";
+        EXPECT_EQ(after.bgra_source_seed_recorded, before.bgra_source_seed_recorded + 1)
+            << "the BGRA target must seed the storage binding on the device, not via a snapshot";
+    }
+
     // Partial native-float storage write: EXEC limits the store to texels 0..63, so the rest of
     // the result must come from the old target contents. The renderer image cannot seed it by a
     // raw copy (canonical order); the guest-order snapshot must.
