@@ -77,6 +77,14 @@ jobs:
           cmake -S prosper/tools/doctor -B prosper/build-sanitizers -G Ninja \
             -DPROSPER_SANITIZER=address-undefined
           cmake --build prosper/build-sanitizers -j2
+      - name: Verify synthetic loader tests are registered
+        run: |
+          for t in loader_synth_link loader_synth_reject; do
+            if ! ctest --test-dir prosper/build-sanitizers -N -R "^${t}$" | grep -q "Test *#"; then
+              echo "::error::${t} is not registered in the ASan/UBSan suite"
+              exit 1
+            fi
+          done
       - name: Verify host code and sanitizer positive controls
         run: ctest --test-dir prosper/build-sanitizers --no-tests=error --output-on-failure
 

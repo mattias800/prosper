@@ -59,6 +59,23 @@ host_test(self_bounds "${PROSPER_ROOT}/tests/test_self_bounds.cpp"
                       "${PROSPER_ROOT}/src/self/module.cpp")
 host_test(va2foff "${PROSPER_ROOT}/tests/test_va2foff.cpp"
                   "${PROSPER_ROOT}/src/self/module.cpp")
+# Run the synthetic link and rejection contracts through the production linker, SELF/ELF parser,
+# relocation applier, and NID hash implementation under ASan + UBSan. The fixtures are generated
+# from synthetic ELF bytes and exercise import/export resolution and malformed relocation targets;
+# no game dump or Vulkan is required. Keep the two contracts separate so a healthy link control and
+# malformed-input refusal each remain visible in CTest.
+host_test(loader_synth_link "${PROSPER_ROOT}/tests/misc/test_loader_synth_link.cpp"
+                            "${PROSPER_ROOT}/src/self/module.cpp"
+                            "${PROSPER_ROOT}/src/loader/linker.cpp"
+                            "${PROSPER_ROOT}/src/hle/dispatch/nid.cpp")
+target_include_directories(loader_synth_link PRIVATE "${PROSPER_ROOT}/tests")
+target_link_libraries(loader_synth_link PRIVATE GTest::gtest GTest::gtest_main)
+host_test(loader_synth_reject "${PROSPER_ROOT}/tests/misc/test_loader_synth_reject.cpp"
+                              "${PROSPER_ROOT}/src/self/module.cpp"
+                              "${PROSPER_ROOT}/src/loader/linker.cpp"
+                              "${PROSPER_ROOT}/src/hle/dispatch/nid.cpp")
+target_include_directories(loader_synth_reject PRIVATE "${PROSPER_ROOT}/tests")
+target_link_libraries(loader_synth_reject PRIVATE GTest::gtest GTest::gtest_main)
 host_test(rdna2_decode "${PROSPER_ROOT}/tests/gpu/recompiler/test_rdna2_decode.cpp"
                       "${PROSPER_ROOT}/src/gpu/recompiler/rdna2_decode.cpp")
 target_link_libraries(rdna2_decode PRIVATE GTest::gtest GTest::gtest_main)
