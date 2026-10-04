@@ -3081,6 +3081,9 @@ endif()
   prosper_add_gtest(test_fragment_raster_launch
     SOURCES tests/gpu/execute/test_fragment_raster_launch.cpp
     INCLUDES tests tests/gpu/recompiler LIBRARIES prosper_core LABELS unit PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_derived_interpolation_geometry
+    SOURCES tests/gpu/execute/test_derived_interpolation_geometry.cpp
+    INCLUDES tests LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
 
   # #3573: the CFG dispatcher must lower a fragment exec/vcc branch as a wave vote.
   prosper_add_gtest(test_dispatcher_wave_vote

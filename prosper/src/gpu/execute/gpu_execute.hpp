@@ -11,6 +11,7 @@
 #include "gpu/execute/refused_shader_source.hpp"   // default original refused-shader evidence
 #include "gpu/execute/shader_source_window.hpp"
 #include "gpu/execute/fragment_raster_launch.hpp"
+#include "gpu/execute/derived_interpolation_geometry.hpp"
 #include "gpu/execute/graphics_execution_activity.hpp"
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include <map>
@@ -2672,15 +2673,18 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     if (rs.ps_addr)
         prosper::diagnostics::perf::observe_wave64_shader(rs.ps_wave32 ? 32u : 64u, false);
     std::vector<uint32_t> gs;
+    SharedShaderWords gs_shared;
     if ((interpolation.requires_geometry || rect_list_synthesis) && interpolation.valid) {
         // Geometry `Triangles` accepts list, strip, and fan input assembly. Points/lines cannot
         // provide the three AMD vertex parameters and remain fail-visible.
         const bool triangle_topology = resolved_pipeline.topology >= 3u &&
                                        resolved_pipeline.topology <= 5u;
-        if (triangle_topology)
-            gs = recompile_interpolation_geometry(
-                interpolation, PROSPER_ENV_ON("PROSPER_GEOM_PROBE"),
+        if (triangle_topology) {
+            gs_shared = acquire_derived_interpolation_geometry(
+                fragment_analysis, vs_shared, interpolation, PROSPER_ENV_ON("PROSPER_GEOM_PROBE"),
                 rect_list_synthesis, float_transport);
+            gs = *gs_shared;   // Preserve the existing native/capture owned-vector contract.
+        }
     }
     if (phase_timing) {
         const auto shader_done = std::chrono::steady_clock::now();
@@ -3236,7 +3240,8 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         if (pinned->fragment_pending) {
             auto inputs = std::make_shared<RasterQuadInputs>();
             inputs->source_vs = std::make_shared<const std::vector<uint32_t>>(out.vs_words());
-            inputs->source_gs = std::make_shared<const std::vector<uint32_t>>(out.gs);
+            inputs->source_gs =
+                gs_shared ? gs_shared : std::make_shared<const std::vector<uint32_t>>(out.gs);
             inputs->source_fs = std::make_shared<const std::vector<uint32_t>>();
             inputs->raw_code = pinned->fragment_code;
             inputs->raw_matches_producing_source = true;
@@ -3266,8 +3271,10 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         auto inputs = std::make_shared<RasterQuadInputs>();
         inputs->source_vs = out.vs_shared ? out.vs_shared :
             std::make_shared<const std::vector<uint32_t>>(out.vs);
-        inputs->source_gs = out.gs.empty() ? FragmentRasterLaunchSource::selected_empty_words()
-                                           : std::make_shared<const std::vector<uint32_t>>(out.gs);
+        inputs->source_gs = gs_shared ? gs_shared
+                            : out.gs.empty()
+                                ? FragmentRasterLaunchSource::selected_empty_words()
+                                : std::make_shared<const std::vector<uint32_t>>(out.gs);
         inputs->source_fs = out.fs_words().empty()
                                 ? FragmentRasterLaunchSource::selected_empty_words()
                             : out.fs_shared ? out.fs_shared
