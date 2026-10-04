@@ -1,7 +1,7 @@
 # General Wave64 / Kena checkpoint — 2026-10-04
 
 This is a durable **partial-work handoff**, not acceptance evidence. The helper/launch code is
-unverified; one confirmed review finding has a source-only correction attempt and one is unstarted.
+unverified; both confirmed review findings now have source-only correction attempts.
 General Wave64 and Kena title-screen 3D are
 NOT complete. No current Kena drop census, FPS improvement or title-screen rendering result was
 measured in this checkpoint. Work was frozen at the maintainer's checkpoint request.
@@ -28,8 +28,8 @@ Three new source-declared regressions (UNEXECUTED):
 This is an authored source attempt, not a verified repair or review approval. The future campaign
 must include these cases in addition to the frozen inventory below, and independently check the
 final dispatcher negative and LegacyRaw/resource neighbors. No native build/test/SPIR-V/GPU or
-game was run for this follow-up. The position-independent entry-schema repair remains unstarted;
-the rest of the incomplete review and full-original frontier are unchanged. Source/gate identities
+game was run for this follow-up. The position-independent entry-schema attempt is described below;
+the incomplete connected review and full-original frontier remain. Source/gate identities
 and outcomes are recorded in the PR follow-up comment, not borrowed from the frozen3fcb receipt.
 
 ## Latest integration checkpoint
@@ -68,6 +68,33 @@ No functional production change was made in this coverage pass. The source comme
 handoff now state the actual boundary. No build, configured test discovery, VM execution,
 validator, GPU or game run occurred. These three cases are additional to the earlier three;
 registered/private-owner negative coverage and independent successor review remain outstanding.
+
+The next source-only attempt addresses the position-free entry-schema finding. The existing
+`FragmentDrawEntryRecipe` is now shared with and retained immutably by capacity, instead of
+reconstructing live/helper-mask authority from a nonempty position-row vector. Original kernel
+entry-mask availability, capacity schema checks, GPU assembly and whole-draw validation select
+the explicit recipe, including when ENA=ADDR0. Transaction instantiation checks plan/capacity
+recipe agreement. Unknown recipes and rows supplied to the default old recipe refuse. The
+private original/launch association is still required; selecting a public enum grants no draw
+permission. Existing code/profile/module cache inputs and WAT2 wire layout are unchanged.
+The validator factory's helper capacity now also passes the explicit schema; its five existing
+helper SOURCE forms remain required, in addition to the position-free retained test forms below.
+
+Two new source-declared `FragmentRasterLaunch` cases are UNEXECUTED:
+
+- `PositionFreeOriginalRetainsItsRegisteredRasterEntrySchema`: real registration, exact raw
+  owner/private launch, empty position inputs, actual initial-EXEC schema, complete emitted
+  plan, warm reuse, instantiated transaction, unavailable/extra masks and unknown-recipe negatives.
+- `PositionFreeLiveMaskSurvivesAssemblyOriginalExecutionAndWholeDrawValidation`: authored
+  count/assembly/original-VM/whole-draw validation chain with genuine inline guest writer, nine
+  hand-owned offline quads, live/helper separation, upper32 and padding, eighteen expected replay
+  indexes, and an upper32 original-site corruption preventing all replay. Six SOURCE forms retain
+  distinct `position_free_*` names through the existing opt-in retention path.
+
+The existing raster-row negatives now pass the explicit schema; an old input-free plan neighbor
+also asserts its old schema and absent initial mask authority. No native build/discovery/test/VM,
+SPIR-V validation, GPU or app/game execution was performed for this attempt. Both repair deltas
+still require independent review, calibrated controls and exact-head execution before acceptance.
 
 ## Objective and acceptance boundary
 
@@ -177,8 +204,8 @@ forms and six connected emitted names; none has a fresh validation result.
 
 ## Two confirmed helper findings at the original freeze
 
-The first now has the UNVERIFIED source-only attempt described above. The second repair remains
-unstarted. The following records the original findings and their required acceptance work.
+Both now have UNVERIFIED source-only attempts described above. The following records the original
+findings and their required acceptance work; neither is an accepted fix yet.
 
 1. **Cold proof and actual PREFETCH/CLAUSE dispatch disagree.**
    `fragment_raster_program.cpp:127` treats every SOPP0x20/0x21 as ignorable. Canonical PREFETCH
@@ -264,8 +291,9 @@ run `python3 prosper/tools/session_start.py` at session start/after worktree cha
 machine the Store python3 alias may fail; real Python312 is available as `python`/`py -3.12`.
 Fetch in your own worktree, inspect current-main instructions/deltas and preserve others' trees.
 
-1. Start with the two helper repairs; immutable successor commit, updated H/P/T, source inventory
-   and exact gates. Same reviewer completes review on that successor and checks newer main.
+1. Validate both source-only repair attempts and finish missing registered negatives; preserve
+   immutable successor H/P/T, source inventory and exact gates. Same reviewer completes the
+   connected review on that successor and checks newer main. Do not borrow older native credit.
 2. In parallel only if useful, isolate/fix the recorded Windows UNC/enumeration/timeout failures.
    Do NOT repeat the unchanged hanging baseline or convert its timeouts to expected controls.
 3. ROOT alone owns heavy native Windows builds/4090 execution. Review agents remain SOURCE-ONLY.
@@ -303,4 +331,4 @@ finished owned source-only worktrees after clean/ignored-path census and author 
 using unforced `git worktree remove` on validated exact paths. Retain the one central build and
 failed evidence. Never delete shared/user trees or recursively erase the workspace. The Windows
 source-only tree was safely removed after the original freeze; the helper author tree remains.
-All subagents stopped. The PREFETCH follow-up is committed; the entry-schema repair is unstarted.
+All subagents stopped. Both follow-ups are committed source attempts, not accepted native fixes.

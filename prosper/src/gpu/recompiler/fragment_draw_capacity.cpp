@@ -70,12 +70,19 @@ bool FragmentDrawCapacity::matches_collector(const RasterQuadCollector& other) c
 std::shared_ptr<const FragmentDrawCapacity>
 fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel> kernel,
                        const RasterQuadCollector& collector, std::string& rejection,
+                       FragmentDrawEntryRecipe entry_recipe,
                        std::vector<FragmentDrawRasterInput> raster_inputs) {
     rejection.clear();
     const auto refuse = [&](const char* reason) -> std::shared_ptr<const FragmentDrawCapacity> {
         rejection = reason;
         return {};
     };
+    if (entry_recipe != FragmentDrawEntryRecipe::OwnedUserPrefixAndShaderDefinedMasks &&
+        entry_recipe != FragmentDrawEntryRecipe::DrawBoundRasterSystemAndQuadMasks)
+        return refuse("fragment-draw-entry-recipe-invalid");
+    if (entry_recipe == FragmentDrawEntryRecipe::OwnedUserPrefixAndShaderDefinedMasks &&
+        !raster_inputs.empty())
+        return refuse("fragment-draw-raster-entry-schema-invalid");
     if (!kernel || kernel->program.packet.spirv.empty() ||
         !kernel->program.packet.rejection.empty() || !kernel->layout.gpu_capacity)
         return refuse("fragment-draw-capacity-kernel-unavailable");
@@ -98,7 +105,7 @@ fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel> kernel,
     const auto& layout = kernel->layout;
     if (!layout.input_words || layout.output_words != kernel->program.packet.output_words.size())
         return refuse("fragment-draw-capacity-layout-invalid");
-    if (!raster_inputs.empty()) {
+    if (entry_recipe == FragmentDrawEntryRecipe::DrawBoundRasterSystemAndQuadMasks) {
         const auto& packet = kernel->program.packet;
         if (raster_inputs.size() > 2 ||
             packet.export_observation != FragmentPacketExportObservation::Architectural ||
@@ -140,7 +147,7 @@ fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel> kernel,
                                                             pixel_slots,
                                                             kFragmentDrawCommitHeaderWords +
                                                                 pixel_slots};
-    return std::shared_ptr<const FragmentDrawCapacity>(
-        new FragmentDrawCapacity(std::move(kernel), words, collector, std::move(raster_inputs)));
+    return std::shared_ptr<const FragmentDrawCapacity>(new FragmentDrawCapacity(
+        std::move(kernel), words, collector, entry_recipe, std::move(raster_inputs)));
 }
 }   // namespace prosper::gpu

@@ -99,7 +99,8 @@ std::vector<uint32_t> build_fragment_draw_validation(const FragmentDrawCapacity&
     const auto export_words = export_recipe(capacity, export_site);
     if (!export_words || collector.record_words != collector.lane_words * 4) return {};
     const auto& program = capacity.kernel()->program;
-    const bool raster_entry = !capacity.raster_inputs().empty();
+    const bool raster_entry =
+        capacity.entry_recipe() == FragmentDrawEntryRecipe::DrawBoundRasterSystemAndQuadMasks;
     SpirvCompute b;
     // One device invocation owns the entire bounded transaction/index. O(workers * 32) maximum,
     // no all-wave quadratic scan, no cross-workgroup publication race, no CPU synchronization.

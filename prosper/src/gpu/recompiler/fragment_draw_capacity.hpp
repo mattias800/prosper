@@ -34,6 +34,12 @@ struct FragmentDrawRasterInput {
     uint32_t reg = 0, collector_word = 0;
     bool operator==(const FragmentDrawRasterInput&) const = default;
 };
+// Immutable code-generation schema, independent of how many position columns are demanded.
+// Selecting a schema never mints a producing draw/launch association or input authority.
+enum class FragmentDrawEntryRecipe : uint8_t {
+    OwnedUserPrefixAndShaderDefinedMasks,
+    DrawBoundRasterSystemAndQuadMasks
+};
 
 class FragmentDrawCapacity {
 public:
@@ -42,6 +48,7 @@ public:
     const RasterQuadCollector& collector() const { return collector_; }
     const std::vector<FragmentPacketExportSite>& export_sites() const { return export_sites_; }
     const std::vector<FragmentDrawRasterInput>& raster_inputs() const { return raster_inputs_; }
+    FragmentDrawEntryRecipe entry_recipe() const { return entry_recipe_; }
     bool matches_collector(const RasterQuadCollector&) const;
     uint32_t max_quads() const { return words_[6]; }
     uint32_t max_waves() const { return words_[1]; }
@@ -60,29 +67,32 @@ public:
 private:
     FragmentDrawCapacity(std::shared_ptr<const FragmentPacketKernel> kernel,
                          std::array<uint32_t, kFragmentDrawAuthorityWords> words,
-                         RasterQuadCollector collector,
+                         RasterQuadCollector collector, FragmentDrawEntryRecipe entry_recipe,
                          std::vector<FragmentDrawRasterInput> raster_inputs)
         : kernel_(std::move(kernel)), words_(words), collector_(std::move(collector)),
           export_sites_(kernel_->program.packet.export_sites),
-          raster_inputs_(std::move(raster_inputs)) {}
+          raster_inputs_(std::move(raster_inputs)), entry_recipe_(entry_recipe) {}
     friend std::shared_ptr<const FragmentDrawCapacity>
     fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel>, const RasterQuadCollector&,
-                           std::string&, std::vector<FragmentDrawRasterInput>);
+                           std::string&, FragmentDrawEntryRecipe,
+                           std::vector<FragmentDrawRasterInput>);
     const std::shared_ptr<const FragmentPacketKernel> kernel_;
     const std::array<uint32_t, kFragmentDrawAuthorityWords> words_;
     const RasterQuadCollector collector_;
     // Copied original-site inventory belongs to the immutable capacity/code owner, not GPU data.
     const std::vector<FragmentPacketExportSite> export_sites_;
     const std::vector<FragmentDrawRasterInput> raster_inputs_;
+    const FragmentDrawEntryRecipe entry_recipe_;
 };
 
 // Cold code/profile verification only. LegacyRaw is never attachment-authoritative, including
 // a forged 14-word output shape. Original ISA sites and the emitted policy marker must agree.
 bool fragment_draw_architectural_exports_match(const FragmentPacketKernel&);
 
-std::shared_ptr<const FragmentDrawCapacity>
-fragment_draw_capacity(std::shared_ptr<const FragmentPacketKernel>, const RasterQuadCollector&,
-                       std::string& rejection, std::vector<FragmentDrawRasterInput> = {});
+std::shared_ptr<const FragmentDrawCapacity> fragment_draw_capacity(
+    std::shared_ptr<const FragmentPacketKernel>, const RasterQuadCollector&, std::string& rejection,
+    FragmentDrawEntryRecipe = FragmentDrawEntryRecipe::OwnedUserPrefixAndShaderDefinedMasks,
+    std::vector<FragmentDrawRasterInput> = {});
 // Cached original PS, with the distinct uniformly guarded GPU-capacity entry. Default WAT1
 // compilation and its public owned-wave pack/decode API remain unchanged.
 FragmentPacketKernel recompile_fragment_packet_capacity_kernel(

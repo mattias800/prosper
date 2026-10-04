@@ -39,6 +39,19 @@ std::vector<uint32_t> helper_original(uint32_t position = 0) {
             0xbf8cc07fu, 0xbefe0414u, 0xf800180fu, position * 0x01010101u,
             0xbf810000u};
 }
+std::vector<uint32_t> position_free_original() {
+    // Genuine WQM literal writer defines the selected peer before aliasing DS; no entry VGPR.
+    return {0xbe94047eu, 0xbefe0a7eu, 0x7e0002ffu, 0x3f000000u, 0xd8d480ffu, 0u,
+            0xbf8cc07fu, 0xbefe0414u, 0xf800180fu, 0u,          0xbf810000u};
+}
+std::vector<std::pair<uint32_t, uint32_t>> position_free_context() {
+    auto context = prosper::test::fragment_raster::context();
+    for (auto& [reg, value] : context)
+        if (reg == prosper::agc::Pm4::SPI_PS_INPUT_ENA ||
+            reg == prosper::agc::Pm4::SPI_PS_INPUT_ADDR)
+            value = 0;
+    return context;
+}
 g::FragmentRasterProgram helper_requirements(const std::vector<uint32_t>& code,
                                              g::PixelSystemInputMapping mapping) {
     std::vector<g::Rdna2Inst> instructions;
@@ -113,6 +126,174 @@ TEST_F(FragmentRasterLaunch, ReservedPrefetchAndUnprovedClauseDoNotMintPendingOr
     EXPECT_TRUE(refused.positions.empty());
 }
 
+TEST_F(FragmentRasterLaunch, PositionFreeOriginalRetainsItsRegisteredRasterEntrySchema) {
+    const auto code = position_free_original();
+    const auto proof = helper_requirements(code, {0, 0});
+    ASSERT_TRUE(proof.rejection.empty()) << proof.rejection;
+    ASSERT_TRUE(proof.positions.empty());
+    g::DrawItem draw;
+    const auto context = position_free_context();
+    ASSERT_TRUE(f::realize(draw, f::color_a, code, f::ieee_rsrc1, 15, context));
+    ASSERT_TRUE(draw.fragment_draw_inputs && draw.fragment_draw_inputs->launch_source);
+    const auto& original = *draw.fragment_draw_inputs;
+    EXPECT_EQ(*original.raw_code, code);
+    ASSERT_TRUE(original.launch_source->matches(original));
+    const auto prepared = f::prepare(draw);
+    ASSERT_TRUE(prepared && prepared->launch_source == original.launch_source);
+    const auto plan = g::cached_fragment_draw_program(original, *prepared, raster_device(), 16);
+    ASSERT_TRUE(plan);
+    ASSERT_TRUE(plan->rejection_reason().empty()) << plan->rejection_reason();
+    ASSERT_TRUE(plan->capacity_owner());
+    const auto& capacity = *plan->capacity_owner();
+    EXPECT_EQ(plan->entry_schema(), g::FragmentDrawEntryRecipe::DrawBoundRasterSystemAndQuadMasks);
+    EXPECT_EQ(capacity.entry_recipe(), plan->entry_schema());
+    EXPECT_TRUE(capacity.raster_inputs().empty());
+    EXPECT_EQ(capacity.kernel()->guest_code, code);
+    EXPECT_EQ(capacity.kernel()->program.packet.initial_mask_availability, g::kPacketInitialExec);
+    EXPECT_FALSE(plan->assembly_words().empty());
+    EXPECT_FALSE(plan->validation_words().empty());
+    EXPECT_FALSE(plan->replay_words().empty());
+    EXPECT_EQ(plan, g::cached_fragment_draw_program(original, *prepared, raster_device(), 16));
+    const auto transaction = g::instantiate_fragment_draw_transaction(
+        plan, draw.fragment_draw_inputs, *prepared, 18, 2, 1, 1);
+    ASSERT_TRUE(transaction.rejection().empty()) << transaction.rejection();
+    for (uint8_t availability :
+         {uint8_t(0), uint8_t(g::kPacketInitialExec | g::kPacketInitialVcc)}) {
+        auto kernel = std::make_shared<g::FragmentPacketKernel>(*capacity.kernel());
+        kernel->program.packet.initial_mask_availability = availability;
+        std::string rejection;
+        EXPECT_FALSE(g::fragment_draw_capacity(kernel, capacity.collector(), rejection,
+                                               capacity.entry_recipe()));
+        EXPECT_EQ(rejection, "fragment-draw-raster-entry-schema-invalid");
+    }
+    std::string rejection;
+    EXPECT_FALSE(g::fragment_draw_capacity(capacity.kernel(), capacity.collector(), rejection,
+                                           static_cast<g::FragmentDrawEntryRecipe>(255)));
+    EXPECT_EQ(rejection, "fragment-draw-entry-recipe-invalid");
+}
+TEST_F(FragmentRasterLaunch,
+       PositionFreeLiveMaskSurvivesAssemblyOriginalExecutionAndWholeDrawValidation) {
+    g::DrawItem draw;
+    const auto code = position_free_original();
+    const auto context = position_free_context();
+    ASSERT_TRUE(f::realize(draw, f::color_a, code, f::ieee_rsrc1, 15, context));
+    ASSERT_TRUE(draw.fragment_draw_inputs);
+    const auto prepared = f::prepare(draw);
+    ASSERT_TRUE(prepared);
+    const auto plan =
+        g::cached_fragment_draw_program(*draw.fragment_draw_inputs, *prepared, raster_device(), 16);
+    ASSERT_TRUE(plan);
+    ASSERT_TRUE(plan->rejection_reason().empty()) << plan->rejection_reason();
+    ASSERT_TRUE(plan->capacity_owner());
+    const auto& capacity = *plan->capacity_owner();
+    const auto& kernel = *capacity.kernel();
+    ASSERT_TRUE(capacity.raster_inputs().empty());
+    ASSERT_EQ(kernel.layout.vgprs.size(), 1u); // writer-only v0, not an incoming position
+    const auto transaction = g::instantiate_fragment_draw_transaction(
+        plan, draw.fragment_draw_inputs, *prepared, 18, 2, 1, 1);
+    ASSERT_TRUE(transaction.rejection().empty()) << transaction.rejection();
+    const auto& shape = plan->collector_shape();
+    std::vector<uint32_t> source(capacity.collector_words(), 0);
+    const uint32_t header[]{9, 0, shape.record_words, g::kRasterQuadMagic};
+    std::copy(std::begin(header), std::end(header), source.begin());
+    // Hand-owned offline observation, NOT a device witness: upper32, helpers, and padding.
+    for (uint32_t quad = 0; quad < 9; ++quad)
+        for (uint32_t lane = 0; lane < 4; ++lane) {
+            const bool live = !(lane & 1u);
+            const uint32_t words[]{uint32_t(!live),
+                                   uint32_t(live),
+                                   uint32_t(live),
+                                   1,
+                                   0,
+                                   std::bit_cast<uint32_t>(float(2 * quad + (lane & 1u)) + .5f),
+                                   std::bit_cast<uint32_t>(float(lane >> 1u) + .5f),
+                                   0,
+                                   std::bit_cast<uint32_t>(1.f)};
+            std::copy(std::begin(words), std::end(words),
+                      source.begin() + 4 + (4 * quad + lane) * shape.lane_words);
+        }
+    const std::vector<uint32_t> authority(capacity.authority().begin(), capacity.authority().end());
+    const std::vector<uint32_t> zero_commit(capacity.commit_words(), 0);
+    bpermute_oracle::Interpreter count(plan->count_words());
+    count.extra_writable_bindings = {0, 4};
+    auto input = count.run_buffers(1,
+                                   {{0, source},
+                                    {1, std::vector<uint32_t>(capacity.input_words(), 0)},
+                                    {2, authority},
+                                    {3, transaction.entry_words()},
+                                    {4, zero_commit}},
+                                   1);
+    ASSERT_TRUE(count.error.empty()) << count.error;
+    source = count.writable_result(0);
+    ASSERT_EQ(input.size(), capacity.input_words());
+    ASSERT_EQ(input[1], 1u);
+    ASSERT_EQ(input[4], 9u);
+    ASSERT_EQ(input[8], 0u);
+    bpermute_oracle::Interpreter assemble(plan->assembly_words());
+    input = assemble.run_buffers(
+        64, {{0, source}, {1, input}, {2, authority}, {3, transaction.entry_words()}}, 1);
+    ASSERT_TRUE(assemble.error.empty()) << assemble.error;
+    for (uint32_t worker = 0; worker < 64; ++worker) {
+        const bool live = worker < 36 && !(worker & 1u);
+        const auto row =
+            capacity.placement(0).input_base + 2 + worker * kernel.program.packet.input_stride;
+        ASSERT_LT(row + 5, input.size());
+        EXPECT_EQ(input[row + 1], 0u) << "writer-only storage is initially unavailable";
+        EXPECT_EQ(input[row + 2], uint32_t(live)) << "live mask without any position rows";
+        EXPECT_EQ(input[row + 3], 0u);
+        EXPECT_EQ(input[row + 4], 0u);
+        EXPECT_EQ(input[row + 5], uint32_t(live));
+    }
+    bpermute_oracle::Interpreter original(kernel.program.packet.spirv);
+    const auto output = original.run_buffers(
+        64, {{0, input}, {1, std::vector<uint32_t>(capacity.output_words(), 0)}, {2, authority}},
+        1);
+    ASSERT_TRUE(original.error.empty()) << original.error;
+    ASSERT_EQ(output.size(), capacity.output_words());
+    for (uint32_t worker = 0; worker < 64; ++worker) {
+        const bool live = worker < 36 && !(worker & 1u);
+        const auto record =
+            g::kPacketWaveOutputPrefix + worker * g::kFragmentPacketArchitecturalExportWords;
+        EXPECT_EQ(output[record + 1], uint32_t(live));
+        EXPECT_EQ(output[record + 2], uint32_t(live));
+        EXPECT_EQ(output[record + 13], live ? 15u : 0u);
+        for (uint32_t channel = 0; channel < 4; ++channel)
+            EXPECT_EQ(output[record + 8 + channel], live ? 0x3f000000u : 0u);
+    }
+    const auto validate = [&](const std::vector<uint32_t>& words) {
+        bpermute_oracle::Interpreter validator(plan->validation_words());
+        auto commit = validator.run_buffers(
+            1, {{0, input}, {1, zero_commit}, {2, authority}, {3, words}, {4, source}}, 1);
+        EXPECT_TRUE(validator.error.empty()) << validator.error;
+        return commit;
+    };
+    const auto accepted = validate(output);
+    ASSERT_EQ(accepted.size(), capacity.commit_words());
+    EXPECT_EQ(accepted[0], 1u);
+    EXPECT_EQ(accepted[1], 0u);
+    uint32_t indexed = 0;
+    for (size_t slot = g::kFragmentDrawCommitHeaderWords; slot < accepted.size(); ++slot)
+        if (accepted[slot]) {
+            ++indexed;
+            EXPECT_LT(accepted[slot] - 1, 36u);
+            EXPECT_EQ((accepted[slot] - 1) & 1u, 0u);
+        }
+    EXPECT_EQ(indexed, 18u);
+    auto late = output;
+    late[g::kPacketWaveOutputPrefix + 32 * g::kFragmentPacketArchitecturalExportWords + 12] ^= 1;
+    const auto denied = validate(late);
+    ASSERT_EQ(denied.size(), capacity.commit_words());
+    EXPECT_EQ(denied[0], 0u) << "upper32 original-site failure prevents all replay";
+    EXPECT_EQ(denied[1], uint32_t(g::FragmentDrawFailure::GuestExport));
+    const std::array<const std::vector<uint32_t>*, 6> forms{
+        &plan->collect_words(),       &plan->count_words(),      &plan->assembly_words(),
+        &kernel.program.packet.spirv, &plan->validation_words(), &plan->replay_words()};
+    const char* names[]{"position_free_collector",  "position_free_count",
+                        "position_free_assembly",   "position_free_original_ps",
+                        "position_free_validation", "position_free_replay"};
+    for (size_t index = 0; index < forms.size(); ++index)
+        f::retain_source(*forms[index], names[index]);
+}
 TEST_F(FragmentRasterLaunch, SavedMaskNumericalExposureAndPartialAliasReplacementStayUnproved) {
     auto code = helper_original();
     code.insert(code.begin() + 2, 0x7e020214u); // v_mov_b32 v1,s20 exposes actual mask bits
@@ -615,8 +796,8 @@ TEST_F(FragmentRasterLaunch, RasterRowsCannotForgeMaskAvailabilityOrPhysicalEntr
         if (kind == 5) rows.push_back(rows[0]);
         if (kind == 6) rows[0].reg = 256;
         std::string rejection;
-        const auto refused =
-            g::fragment_draw_capacity(kernel, capacity.collector(), rejection, std::move(rows));
+        const auto refused = g::fragment_draw_capacity(kernel, capacity.collector(), rejection,
+                                                       capacity.entry_recipe(), std::move(rows));
         EXPECT_FALSE(refused) << kind;
         EXPECT_EQ(rejection, "fragment-draw-raster-entry-schema-invalid") << kind;
     }

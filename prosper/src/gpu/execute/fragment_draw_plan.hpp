@@ -16,10 +16,6 @@ enum class FragmentDrawScheduling : uint8_t {
     PackingUnobservableCompleteQuads,
     QuadLocalObservationalEquivalence
 };
-enum class FragmentDrawEntryRecipe : uint8_t {
-    OwnedUserPrefixAndShaderDefinedMasks,
-    DrawBoundRasterSystemAndQuadMasks
-};
 struct FragmentDrawMaskWord {
     bool user_word = false;
     uint32_t word = 0; // owned prefix index, or original inline/literal word
@@ -47,6 +43,7 @@ public:
     const auto& rejection_reason() const { return rejection; }
     const auto& device_contract() const { return device; }
     const auto& raster_launch_collection() const { return raster_collection; }
+    FragmentDrawEntryRecipe entry_schema() const { return entry_recipe; }
     bool requires_scalar_bank() const {
         return capacity && !capacity->kernel()->program.scalar_bank_sites.empty();
     }

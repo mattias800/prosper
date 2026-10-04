@@ -1007,8 +1007,9 @@ int main(int argc, char** argv) {
         dump(dir, "fragment_draw_helper_capacity_kernel", helper_kernel->program.packet.spirv,
              "recompile_fragment_packet_capacity_kernel");
         std::string helper_rejection;
-        const auto helper_capacity =
-            fragment_draw_capacity(helper_kernel, draw_collector, helper_rejection, {{0, 5}});
+        const auto helper_capacity = fragment_draw_capacity(
+            helper_kernel, draw_collector, helper_rejection,
+            FragmentDrawEntryRecipe::DrawBoundRasterSystemAndQuadMasks, {{0, 5}});
         if (!helper_capacity) {
             printf("  [FAIL] fragment draw helper capacity: %s\n", helper_rejection.c_str());
             ++fails;

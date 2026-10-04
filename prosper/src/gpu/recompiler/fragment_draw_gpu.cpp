@@ -328,7 +328,8 @@ std::vector<uint32_t> build_fragment_draw_assembly(const FragmentDrawCapacity& c
     if (!capacity.matches_collector(collector)) return {};
     const auto& kernel = *capacity.kernel();
     const auto& layout = kernel.layout;
-    const bool raster_entry = !capacity.raster_inputs().empty();
+    const bool raster_entry =
+        capacity.entry_recipe() == FragmentDrawEntryRecipe::DrawBoundRasterSystemAndQuadMasks;
     // Old full-buffer/parameter payloads are not per-wave packing authority. The distinct scalar
     // bank stays outside this input plane; only its genuine user descriptor words travel here.
     if (!layout.buffers.empty() || !layout.parameters.empty() || !kernel.program.images.empty() ||

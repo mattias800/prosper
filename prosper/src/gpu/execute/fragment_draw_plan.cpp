@@ -393,7 +393,7 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
     invocation.float_mode = in.float_mode;
     invocation.float_flags = in.float_flags;
     invocation.float_transport = in.float_transport;
-    if (!raster_inputs.empty()) {
+    if (result.entry_recipe == FragmentDrawEntryRecipe::DrawBoundRasterSystemAndQuadMasks) {
         invocation.exec_available = true;   // values supplied only by the draw-bound GPU assembler
         for (const auto& row : raster_inputs) {
             FragmentPacketVgpr column;
@@ -421,7 +421,7 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
     if (!fragment_draw_architectural_exports_match(*kernel))
         return refuse("fragment-draw-architectural-exp-required");
     result.capacity = fragment_draw_capacity(kernel, result.collector, result.rejection,
-                                             std::move(raster_inputs));
+                                             result.entry_recipe, std::move(raster_inputs));
     if (!result.capacity) return result;
     result.count = build_fragment_draw_count(*result.capacity, result.collector);
     result.assemble = build_fragment_draw_assembly(*result.capacity, result.collector);
@@ -514,6 +514,8 @@ FragmentDrawTransaction instantiate_fragment_draw_transaction(
     const auto refuse = [&](const char* reason) { return FragmentDrawTransaction(reason); };
     if (!program || !program->rejection.empty() || !program->capacity)
         return refuse("fragment-draw-program-unavailable");
+    if (program->entry_recipe != program->capacity->entry_recipe())
+        return refuse("fragment-draw-entry-recipe-mismatch");
     if (program->entry_recipe == FragmentDrawEntryRecipe::DrawBoundRasterSystemAndQuadMasks && in) {
         const std::array<std::shared_ptr<const std::vector<uint32_t>>, 3> modules{
             in->source_vs, in->source_gs, in->source_fs};
