@@ -103,11 +103,20 @@ void observe_original_fragment_planes() {
     CHECK(!std::getenv("PROSPER_GEOM_PROBE") && !std::getenv("PROSPER_DRAW_ISO"),
           "the dedicated process preserves the real collector's no-XFB/no-isolation recipe");
     if (failures) return;
+    // Realization snapshots the published enabled-device float contract, so create the normal
+    // context first, as the working FragmentDrawExec fixture does. Never fill that witness later.
+    const auto& context = prosper::test::render_vk_ctx();
+    CHECK(context.ok && context.shader_int64_enabled &&
+              context.float_transport.explicit_nonfinite32(),
+          "the actual device enabled the original kernel's int64 and raw float transport");
+    if (failures) return;
     prosper::gpu::DrawItem original;
     const bool realized = prosper::test::fragment_draw::realize(original);
     CHECK(realized && original.fragment_draw_inputs,
           "the real registered original PS owns a complete WAT2 producer");
     if (realized && original.fragment_draw_inputs) {
+        CHECK(original.fragment_draw_inputs->float_transport == context.float_transport,
+              "the producer captured the same genuine enabled-device float profile");
         BackendDraw draw;
         draw.vs_shared = original.vs_shared;
         draw.fs_shared = original.fs_shared;
