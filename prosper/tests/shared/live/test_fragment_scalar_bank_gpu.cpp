@@ -95,7 +95,19 @@ TEST_F(FragmentScalarBankGpu, ThreeLogicalWavesUseOneRealBufferUploadAndAllRawCo
     static_assert(r::fragment_draw::width * r::fragment_draw::height == 3 * 64);
     ASSERT_NE(scene.descriptor[3], 0u)
         << "raw SMEM ignores format fields; identity still includes them";
-    pixels(render(state()), r::fragment_draw::color_a);
+    const auto observation = r::fragment_draw_observation_stats();
+    const auto barriers = r::backend_host_read_barrier_count().load();
+    const auto raw = render(state());
+    if (r::fragment_draw_observation_enabled()) {
+        const auto after = r::fragment_draw_observation_stats();
+        EXPECT_EQ(after.recorded - observation.recorded, 1u);
+        EXPECT_EQ(after.reported - observation.reported, 1u)
+            << "actual private planes read only after the normal successful fence";
+        EXPECT_EQ(after.unavailable, observation.unavailable);
+        EXPECT_GE(r::backend_host_read_barrier_count().load() - barriers, 2u)
+            << "ordinary color readback plus actual private-plane HOST_READ availability";
+    }
+    pixels(raw, r::fragment_draw::color_a);
 }
 TEST_F(FragmentScalarBankGpu, ObservedZeroScalarMemoryIsDataRatherThanAbsentBacking) {
     const std::array<float, 4> zero{};

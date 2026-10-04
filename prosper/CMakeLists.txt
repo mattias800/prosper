@@ -4747,7 +4747,7 @@ endif()
       # the test fails loudly when run without it. PROSPER_ISO_AT must name a pixel inside the
       # 32x32 frame the test renders.
       set_tests_properties(render_diagnostic_paths PROPERTIES ENVIRONMENT
-                           "PROSPER_GEOM_PROBE=0;PROSPER_DRAW_ISO=1;PROSPER_ISO_AT=16,16;PROSPER_FRAME_DIR=render_diagnostic_paths_frames")
+                           "PROSPER_GEOM_PROBE=0;PROSPER_DRAW_ISO=1;PROSPER_ISO_AT=16,16;PROSPER_FRAME_DIR=render_diagnostic_paths_frames;PROSPER_FRAGMENT_DRAW_OBSERVE=1")
 
       # Exercise every opt-in depth-clear policy under Vulkan validation. The test asserts that
       # the selected draw reached its path, so a clean layer log cannot be a vacuous pass.
@@ -4755,7 +4755,7 @@ endif()
         add_test(NAME render_diagnostic_paths_clear_${clear_probe_mode}
                  COMMAND test_render_diagnostic_paths ${clear_probe_mode})
         set_tests_properties(render_diagnostic_paths_clear_${clear_probe_mode} PROPERTIES ENVIRONMENT
-                             "PROSPER_GEOM_PROBE=0;PROSPER_DRAW_ISO=1;PROSPER_ISO_AT=16,16;PROSPER_FRAME_DIR=render_diagnostic_paths_frames_${clear_probe_mode};PROSPER_DIAG_CLEAR_OVERWRITE=${clear_probe_mode}")
+                             "PROSPER_GEOM_PROBE=0;PROSPER_DRAW_ISO=1;PROSPER_ISO_AT=16,16;PROSPER_FRAME_DIR=render_diagnostic_paths_frames_${clear_probe_mode};PROSPER_DIAG_CLEAR_OVERWRITE=${clear_probe_mode};PROSPER_FRAGMENT_DRAW_OBSERVE=1")
       endforeach()
 
       # The address-watch matcher's edge cases (exclusive end, empty range, UINT64_MAX wrap).
@@ -6427,6 +6427,9 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
     SOURCES tests/shared/live/test_fragment_scalar_bank_gpu.cpp
     INCLUDES frontends src tests
     LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan
+    # Arm the real transaction diagnostic before process start, not a mock or setenv after a
+    # cached environment read. Its unchanged pixel oracles remain independent of observations.
+    ENVIRONMENT PROSPER_FRAGMENT_DRAW_OBSERVE=1
     LABELS gpu PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_ordered_graphics_read_point
     SOURCES tests/shared/live/test_ordered_graphics_read_point.cpp

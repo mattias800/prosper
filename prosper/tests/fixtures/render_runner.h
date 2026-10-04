@@ -8356,6 +8356,7 @@ inline uint64_t backend_pass_source_submit(std::span<const BackendDraw> draws) {
 // completion machinery, not a second standalone Vulkan harness.
 #include "fixtures/raster_quad_collection_gpu.h"
 #include "fixtures/fragment_draw_storage_gpu.h"
+#include "fixtures/fragment_draw_observation_gpu.h"
 #include "fixtures/fragment_draw_compute_gpu.h"
 #include "fixtures/fragment_draw_collect_gpu.h"
 #include "fixtures/fragment_draw_backend_transaction.h"
@@ -10337,7 +10338,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (std::any_of(draws.begin(), draws.end(),
                     [](const BackendDraw& draw) { return bool(draw.fragment_draw_inputs); }))
         fragment_draw_batch =
-            std::make_shared<FragmentDrawBackendBatch>(ctx, draws, W, H, color_count);
+            std::make_shared<FragmentDrawBackendBatch>(ctx, draws, W, H, color_count, flush_now);
     // Preserve the frontend's exact descriptor order while borrowing either the complete resource or
     // its compact buffer-only carrier. The references are synchronous: every pointed-to vector belongs
     // to `draws`, which outlives this call. Synthetic GDS entries are owned alongside these views.
@@ -14456,6 +14457,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         }
     }
     vkCmdEndRenderPass(cmd);
+    if (fragment_draw_batch && flush_now)
+        fragment_draw_batch->record_observations_after_replay(cmd, std::span<const DV>(dv));
     // #2944: the geometry probe maps both transform-feedback buffers below. Transform feedback does
     // not write through the transfer stage, so this pair carries its own source scope -- the vertex
     // records and the counter the extension writes at vkCmdEndTransformFeedbackEXT. Recorded here
@@ -15209,6 +15212,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     const auto timing_gpu_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const bool batch_completed = !flush_now ||
         (batch_result.submit_result == VK_SUCCESS && batch_result.wait_result == VK_SUCCESS);
+    if (fragment_draw_batch && flush_now && batch_completed)
+        fragment_draw_batch->report_completed_observations();
 
     // Fragment-funnel readback (PROSPER_DRAW_STATS): one line per realized draw showing where its
     // pixels vanished. ds_active implies flush_now (the pool-creation gate above uses the same flush

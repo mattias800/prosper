@@ -14,7 +14,8 @@ inline FragmentDrawBackendStats& fragment_draw_backend_stats() {
 class FragmentDrawBackendBatch {
 public:
     FragmentDrawBackendBatch(const RenderVkCtx& context, std::span<const BackendDraw> draws,
-                             uint32_t width, uint32_t height, uint32_t colors)
+                             uint32_t width, uint32_t height, uint32_t colors,
+                             bool completed_observation = false)
         : context_(&context), width_(width), height_(height), states_(draws.size()) {
         bool readonly_pass_checked = false, readonly_pass = false;
         for (size_t index = 0; index < draws.size(); ++index) {
@@ -146,7 +147,10 @@ public:
                 refuse(state, draw, transaction.rejection());
                 continue;
             }
-            state.owner = FragmentDrawGpuOwner::create(context, std::move(transaction), rejection);
+            const bool observe =
+                completed_observation && fragment_draw_observation_enabled() && index < 8;
+            state.owner =
+                FragmentDrawGpuOwner::create(context, std::move(transaction), rejection, observe);
             state.compute = FragmentDrawComputeGpuProgram::acquire(context, program, rejection);
             state.target =
                 FragmentDrawCollectFramebuffer::acquire(context, state.collect, width, height);
@@ -156,6 +160,8 @@ public:
                                          : rejection);
                 continue;
             }
+            if (observe)
+                state.observation = FragmentDrawGpuObservation::create(context, state.owner, index);
             state.replay = std::make_unique<BackendDraw>(draw);
             auto& replay = *state.replay;
             replay.fs.clear();
@@ -223,12 +229,24 @@ public:
                   .recorded;   // recording, NOT completion/publication proof
         }
     }
+    template <class Draw>
+    void record_observations_after_replay(VkCommandBuffer command,
+                                          std::span<const Draw> draws) const {
+        for (size_t index = 0; index < states_.size(); ++index)
+            if (states_[index].observation && draws[index].ok)
+                states_[index].observation->record_after_replay(command);
+    }
+    void report_completed_observations() const {
+        for (const auto& state : states_)
+            if (state.observation) state.observation->report_completed();
+    }
 
 private:
     struct State {
         bool attachment_guard = false;
         std::unique_ptr<BackendDraw> replay;
         std::shared_ptr<FragmentDrawGpuOwner> owner;
+        std::unique_ptr<FragmentDrawGpuObservation> observation;
         std::shared_ptr<const FragmentDrawComputeGpuProgram> compute;
         std::shared_ptr<const FragmentDrawCollectGpuProgram> collect;
         std::shared_ptr<const FragmentDrawCollectFramebuffer> target;

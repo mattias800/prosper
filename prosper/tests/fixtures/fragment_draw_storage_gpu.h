@@ -1,6 +1,6 @@
 // Shipping same-TU companion of render_runner.h, inside prosper::test. Device-local private
 // transaction storage shares the renderer's device/queue and completion lifetime. It is never
-// mapped or CPU-read, never serialized as guest authority, and never reused before completion.
+// mapped in the default path, never serialized as guest authority, and never reused before completion.
 #pragma once
 
 // Private bank-wire calibration only, on the including test's thread. Normally null; it cannot
@@ -45,9 +45,12 @@ struct FragmentDrawDeviceStorage {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize capacity = 0, allocation_bytes = 0;
+    VkBufferUsageFlags usage = 0;
 };
 struct FragmentDrawDeviceStoragePool {
-    std::map<std::pair<VkDevice, VkDeviceSize>, std::vector<FragmentDrawDeviceStorage>> free;
+    std::map<std::tuple<VkDevice, VkDeviceSize, VkBufferUsageFlags>,
+             std::vector<FragmentDrawDeviceStorage>>
+        free;
     VkDeviceSize bytes = 0;
 };
 inline FragmentDrawDeviceStoragePool& fragment_draw_device_storage_pool() {
@@ -59,12 +62,16 @@ inline void destroy_fragment_draw_device_storage(VkDevice device, FragmentDrawDe
     if (value.memory) prosper::gpu::free_device_memory(device, value.memory);
 }
 inline FragmentDrawDeviceStorage acquire_fragment_draw_device_storage(const RenderVkCtx& context,
-                                                                      VkDeviceSize bytes) {
+                                                                      VkDeviceSize bytes,
+                                                                      bool observe = false) {
     if (!bytes || bytes > (64u << 20)) return {};
     VkDeviceSize capacity = 256;
     while (capacity < bytes) capacity *= 2;
     auto& pool = fragment_draw_device_storage_pool();
-    const auto key = std::pair{context.dev, capacity};
+    const VkBufferUsageFlags usage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | (observe ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT : 0);
+    const auto key = std::tuple{context.dev, capacity, usage};
     const auto found = pool.free.find(key);
     if (found != pool.free.end() && !found->second.empty()) {
         const auto result = found->second.back();
@@ -75,10 +82,10 @@ inline FragmentDrawDeviceStorage acquire_fragment_draw_device_storage(const Rend
     }
     FragmentDrawDeviceStorage result;
     result.capacity = capacity;
+    result.usage = usage;
     VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     buffer.size = capacity;
-    buffer.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                   VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    buffer.usage = usage;
     if (vkCreateBuffer(context.dev, &buffer, nullptr, &result.buffer) != VK_SUCCESS) return {};
     VkMemoryRequirements requirements{};
     vkGetBufferMemoryRequirements(context.dev, result.buffer, &requirements);
@@ -104,7 +111,7 @@ inline void release_fragment_draw_device_storage(VkDevice device, FragmentDrawDe
         destroy_fragment_draw_device_storage(device, value);
         return;
     }
-    pool.free[{device, value.capacity}].push_back(value);
+    pool.free[{device, value.capacity, value.usage}].push_back(value);
     pool.bytes += value.allocation_bytes;
 }
 
@@ -116,7 +123,7 @@ public:
     enum Plane : uint32_t { Collector, Input, Output, Commit, Planes };
     static std::shared_ptr<FragmentDrawGpuOwner>
     create(const RenderVkCtx& context, prosper::gpu::FragmentDrawTransaction transaction,
-           std::string& refusal) {
+           std::string& refusal, bool observe = false) {
         refusal.clear();
         if (!context.ok || !transaction.rejection().empty() || !transaction.program() ||
             !transaction.program()->capacity_owner() ||
@@ -135,7 +142,7 @@ public:
                 refusal = "fragment-draw-device-storage-extent-unavailable";
                 return {};
             }
-            result->storage_[plane] = acquire_fragment_draw_device_storage(context, bytes);
+            result->storage_[plane] = acquire_fragment_draw_device_storage(context, bytes, observe);
             result->bytes_[plane] = bytes;
             if (!result->storage_[plane].buffer) {
                 refusal = "fragment-draw-device-storage-allocation-failed";
@@ -213,6 +220,13 @@ public:
     VkDescriptorBufferInfo upload(uint32_t index) const {
         if (index >= upload_.size()) return {};
         return {upload_[index].buffer, 0, upload_bytes_[index]};
+    }
+    // Diagnostic-only host observation of the actual immutable coherent upload, not a guest read
+    // or a shader/admission input. The transaction owner pins the mapping through completion.
+    std::span<const uint32_t> diagnostic_uploaded_bank_words() const {
+        if (!upload_[2].mapped) return {};
+        return {static_cast<const uint32_t*>(upload_[2].mapped),
+                size_t(std::min<VkDeviceSize>(upload_bytes_[2] / 4, 256))};
     }
     std::shared_ptr<const FragmentDrawGpuBuffer> view(Plane plane) const {
         if (uint32_t(plane) >= Planes) return {};
