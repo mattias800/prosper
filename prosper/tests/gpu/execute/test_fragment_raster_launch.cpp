@@ -383,9 +383,11 @@ TEST_F(FragmentRasterLaunch, NormalOriginalRealizerRetainsItsPhysicalEntryAndSel
 }
 
 TEST_F(FragmentRasterLaunch, SameOriginalProgramCannotBorrowAnotherDrawsEntryObservation) {
+    const auto* programs = f::register_programs();
+    ASSERT_NE(programs, nullptr);
     g::DrawItem first, second;
-    ASSERT_TRUE(f::realize(first, f::color_a));
-    ASSERT_TRUE(f::realize(second, f::color_b));
+    ASSERT_TRUE(f::realize_registered(first, *programs, f::color_a));
+    ASSERT_TRUE(f::realize_registered(second, *programs, f::color_b));
     ASSERT_TRUE(first.fragment_draw_inputs && second.fragment_draw_inputs);
     const auto& a = *first.fragment_draw_inputs;
     const auto& b = *second.fragment_draw_inputs;
@@ -532,9 +534,23 @@ TEST_F(FragmentRasterLaunch, SameEnabledDeviceOwnsEveryPreRasterAndFragmentBudge
 
 TEST_F(FragmentRasterLaunch, WiderParameterProgramStillNeedsItsCompleteEntryAndExecutionRecipe) {
     namespace pull = prosper::test::ps_pull;
+    g::DrawItem unavailable;
+    ASSERT_TRUE(pull::realize(pull::cases[1], unavailable));
+    ASSERT_TRUE(unavailable.fragment_draw_inputs);
+    EXPECT_FALSE(unavailable.fragment_draw_inputs->float_mode.available);
+    const auto unavailable_prepared =
+        g::prepare_fragment_packet_inputs(unavailable.fragment_draw_inputs, true);
+    ASSERT_TRUE(unavailable_prepared);
+    const auto unavailable_plan = g::cached_fragment_draw_program(
+        *unavailable.fragment_draw_inputs, *unavailable_prepared, raster_device(), 16);
+    ASSERT_TRUE(unavailable_plan);
+    EXPECT_EQ(unavailable_plan->rejection_reason(),
+              "fragment-draw-original-float-mode-unavailable");
+    EXPECT_FALSE(unavailable_plan->capacity_owner());
     g::DrawItem draw;
-    ASSERT_TRUE(pull::realize(pull::cases[1], draw));
+    ASSERT_TRUE(pull::realize(pull::cases[1], draw, f::ieee_rsrc1));
     ASSERT_TRUE(draw.fragment_draw_inputs && draw.fragment_draw_inputs->launch_source);
+    EXPECT_TRUE(draw.fragment_draw_inputs->float_mode.available);
     const auto prepared = g::prepare_fragment_packet_inputs(draw.fragment_draw_inputs, true);
     ASSERT_TRUE(prepared && prepared->launch_source);
     const auto first =
