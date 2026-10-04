@@ -1123,7 +1123,9 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords,
                     if (i.opcode == 0x22u) return i.mimg_dim == 1u || i.mimg_dim == 5u;
                     if (i.opcode == 0x2fu)
                         return i.mimg_dim == 1u || i.mimg_dim == 3u || i.mimg_dim == 5u;
-                    if (i.opcode == 0x24u || i.opcode == 0x25u || i.opcode == 0x47u) return i.mimg_dim == 1u || i.mimg_dim == 5u;
+                    if (i.opcode == 0x24u || i.opcode == 0x25u || i.opcode == 0x40u ||
+                        i.opcode == 0x47u || i.opcode == 0x57u)
+                        return i.mimg_dim == 1u || i.mimg_dim == 5u;
                     return false;
                 }
                 case Rdna2Format::MUBUF:  return i.opcode <= 0x07u ||                    // load/store_format_*
