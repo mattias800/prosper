@@ -2833,6 +2833,12 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_decode_sweep.cpp
     LIBRARIES prosper_core)
 
+  # Closed-tail block admission is decoder-only, so this compiles rdna2_decode.cpp directly
+  # (same pattern as test_workgroup_uniformity above).
+  prosper_add_gtest(test_rdna2_closed_tail
+    SOURCES tests/gpu/recompiler/test_rdna2_closed_tail.cpp src/gpu/recompiler/rdna2_decode.cpp
+    INCLUDES src)
+
   # SOP2 destination widths are decoder-only facts checked against LLVM's SOP2 classes.
   prosper_add_gtest(test_sop2_dest_width
     SOURCES tests/gpu/recompiler/test_sop2_dest_width.cpp src/gpu/recompiler/rdna2_decode.cpp
