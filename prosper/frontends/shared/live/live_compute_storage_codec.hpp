@@ -6,107 +6,20 @@
 // include it only from shared/live compute code.
 
 #include "shared/live/live_compute.hpp"
-#include "diagnostics/perf/perf_ledger.hpp"   // #3891: shader-compile alarm
-#include "diagnostics/perf/wave64_refusal.hpp"
-#include "shared/compute/storage_write_mask_spirv.hpp"
-#include "shared/diagnostics/trip_bound_witness.hpp"
-#include "shared/compute/compute_authority_live_census.hpp"
-#include "shared/compute/compute_image_borrow_census.hpp"
-#include "shared/compute/compute_timing_selector.hpp"
-#include "diagnostics/exit_census.hpp"
-#include "diagnostics/transfer_pressure.hpp"
-#include "shared/compute/compute_phase_attribution.hpp"
-#include "shared/compute/compute_buffer_timing.hpp"
-#include "shared/compute/compute_transfer_gate_census.hpp"
-#include "shared/compute/storage_image_alias_plan.hpp"
-#include "shared/live/decode_scratch.hpp"  // pooled full-surface intermediates (#3309's mechanism)
-#include "shared/live/cpu_rtt_snapshot_pool.hpp"
-#include "shared/live/compute_view_swizzle.hpp"
-#include "shared/live/live_target_format.hpp"
-#include "shared/live/packed_rtt_conversion.hpp"
-#include "shared/live/indirect_dispatch.hpp"   // #3656
-#include "shared/live/gpu_retile.hpp"
-#include "shared/present/compute_scanout.hpp"   // #3915: GPU-present mirror of a compute-written display buffer
-#include "shared/rtt/rtt_scale.hpp"
-#include "shared/rtt/rtt_authority.hpp"
-#include "shared/device/pipeline_cache_file.hpp"  // #3425: one checked envelope for both stages
-#include "shared/device/vulkan_device_select.hpp"
-#include "shared/device/float_transport.hpp"
-#include "shared/device/image_robustness.hpp"  // #3531: the recompiler's OOB image-read contract
-#include "shared/texture/write_watch_census.hpp"
-#include "shared/texture/write_watch_policy.hpp"
-#include "diagnostics/env_numeric.hpp"   // #3253: a typo must not select a different setting
-#include "diagnostics/env_cache.hpp"     // process-lifetime opt-out for direct storage detile
-#include "shared/perf/performance_capture.hpp"      // bounded F8 post-trigger compute timing
-#include "shared/perf/performance_timing_policy.hpp" // F8 measures without enabling verbose timing logs
-
-#include "gpu/texture/bc_decode.hpp"
-#include "gpu/diagnostics/vk_object_names.hpp"   // #3578
-#include "gpu/diagnostics/watch_list.hpp"        // strict opt-in address trace
-#include "gpu/diagnostics/diag_ratelimit.hpp"
-#include "gpu/capture/gpu_capture.hpp"
-#include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: how much of the heap does prosper hold?
-#include "gpu/diagnostics/gpu_breadcrumbs_vk.hpp"    // PROSPER_GPU_BREADCRUMBS: where did the GPU stop?
-#include "gpu/diagnostics/gpu_labels_vk.hpp"         // PROSPER_GPU_LABELS: guest-meaningful command labels
-#include "gpu/diagnostics/memory_placement_log.hpp"  // #3888: GPU-only images prefer VRAM
-#include "gpu/execute/gpu_execute.hpp"
-#include "gpu/execute/graphics_execution_activity.hpp"
-#include "gpu/execute/host_read_barrier.hpp"  // #3249: a host read of a dispatch result needs an availability op
-#include "gpu/execute/float_controls_probe.hpp"  // #3479: the device gate on SignedZeroInfNanPreserve
-#include "gpu/recompiler/rdna2_decode.hpp"
-#include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
-#include "gpu/resources/shader_resources.hpp"
-#include "gpu/recompiler/spirv_builder.hpp"
-#include "gpu/resources/mip_chain_plan.hpp"
-#include "gpu/resources/atomic_image_staging.hpp"  // #3195: the LOGICAL/PHYSICAL atomic-image extent split
-#include "gpu/resources/image_identity.hpp"
-#include "gpu/resources/compressed_source_authority.hpp"
-#include "gpu/resources/spirv_storage_match.hpp"  // #3204: SPIR-V/guest storage agreement  // #3204: named image-identity predicates
-#include "gpu/texture/tile.hpp"
-#include "gpu/capture/writer_provenance.hpp"
-#include "host/memory/guest_write_watch.hpp"
-#include "hle/memory/guest_memory_topology.hpp"
-#include "host/platform/gpu_submit_gate.hpp"  // #3225: refuse submits once the frontend shuts down
-
-#include <vulkan/vulkan.h>
-
+#include "shared/compute/compute_buffer_bytes.hpp"   // parallel_compute_texels
+#include "gpu/resources/shader_resources.hpp"        // DataFormat, f10/f11/half conversions
 #include <algorithm>
-#include <atomic>
 #include <array>
-#include <cerrno>
-#include <chrono>
 #include <cmath>
-#include <cstdlib>
-#include <cstdio>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
-#include <functional>
-#include <filesystem>
-#include <fstream>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <thread>
-#include <tuple>
-#include <unordered_map>
-#include <set>
-#include <unordered_set>
-#include <vector>
 
 #if (defined(__x86_64__) || defined(__i386__)) && \
     (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
 #define PROSPER_HAVE_TARGET_F16C 1
 #endif
-#include "shared/compute/compute_buffer_bytes.hpp"
-
-
-// The VideoOut buffer registry (hle_graphics.cpp). #3915 asks whether a storage result is a display buffer.
-extern "C" int prosper_vo_buffer_count();
-extern "C" uint64_t prosper_vo_buffer_addr(int i);
 
 namespace prosper::frontend {
 

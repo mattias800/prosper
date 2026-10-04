@@ -58,6 +58,9 @@ found Vulkan.
 - `packed_rtt_conversion.hpp` — device-owned RGBA8→packed-10-bit sampled conversion.
   Records transfers and conversion into the guest compute submission; setup failures retain their
   `VkResult` so optional fallback cannot hide device loss.
+- `live_compute_storage_codec.hpp` — live compute's storage texel codec: guest storage-image texels
+  to and from the RGBA32 words a dispatch operates on, with the AVX2/F16C fast paths. Lifted out
+  of `live_compute.cpp`'s anonymous namespace; only live compute includes it.
 - `live_target_format.hpp` — the guest↔Vulkan pixel-format mapping. Compiled with `-Werror=switch`
   on purpose: a silent RGBA8 fallback has cost two titles a whole render layer.
 - `decode_scratch.hpp` — the pooled full-surface intermediates that both the texture decode branches
