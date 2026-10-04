@@ -325,6 +325,15 @@ with tempfile.TemporaryDirectory(prefix="prosper-fragment-width-", dir=scratch_r
         flags_tail = struct.pack("<I", 1) + bytes(8) + struct.pack("<I", 0)
         transport_tail = struct.pack("<I", 1) + b"\x00" + struct.pack("<II", 0, 0)
         wave_tail = struct.pack("<I", 1) + b"\x00"
+        # v71: one draw's five unprogrammed (presence u8, raw u32) SC/DB launch-control words.
+        launch_controls_tail = struct.pack("<I", 1) + bytes(25)
+        genuine71 = (len(original) > 4+159+5+29 and struct.unpack_from("<I", original, 8)[0] == 71 and
+                     original.endswith(launch_controls_tail))
+        check(genuine71, "ordinary width fixture retains exact unavailable v71 launch controls")
+        if genuine71:
+            original = bytearray(original[:-len(launch_controls_tail)])
+            struct.pack_into("<I", original, 8, 70)
+            original = bytes(original)
         genuine70 = (len(original) > 4+159+5 and struct.unpack_from("<I", original, 8)[0] == 70 and
                      original.endswith(wave_tail))
         check(genuine70, "ordinary width fixture retains exact absent wave70 record")
