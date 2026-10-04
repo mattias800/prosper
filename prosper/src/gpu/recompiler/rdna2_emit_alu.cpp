@@ -39,9 +39,7 @@
 
 namespace prosper::gpu {
 
-
 namespace {
-
 
 // The f16 bit pattern an inline float constant supplies in a 16-bit operand position (ISA Table 10
 // lists per-width encodings: "0.5 ... half: 0x3800" etc.). Only 1/(2*pi) (code 248, 0x3118) differs
