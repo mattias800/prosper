@@ -811,8 +811,9 @@ void decode_operands(Rdna2Inst& i) {
             // Packed f16 fma/add/mul/min/max (0x0e-0x12), the packed 16-bit integer family
             // (0x00-0x0d) and v_fma_mix_f32/mixlo/mixhi (0x20-0x22): every modifier bit is MODELED
             // (#273/#2013). The integer dot family (0x14-0x19) models only the source selectors
-            // (see its branch below; encodings checked with llvm-mc gfx1030). For packed ops OPSEL/NEG select and negate each source independently
-            // for the low result; OPSEL_HI/NEG_HI do the same for the high result.
+            // (see its branch below; encodings checked with llvm-mc gfx1030). For packed ops
+            // OPSEL/NEG select and negate each source independently for the low result;
+            // OPSEL_HI/NEG_HI do the same for the high result.
             // For the mix family:
             // OPSEL_HI[k] selects an f16-half read (which half via OPSEL[k]), NEG negates, NEG_HI
             // is ABS for the mix family, CLAMP saturates. (llvm-mc gfx1030 round-trip on the live
@@ -853,7 +854,8 @@ void decode_operands(Rdna2Inst& i) {
                 // 0x18 v_dot8_i32_i4,  0x19 v_dot8_u32_u4.
                 // In assemblers (llvm-mc), default op_sel is [0,0,0] and op_sel_hi is [1,1,1]
                 // (setting dword0[14] and dword1[28:27]).
-                // For v_dot2, op_sel[1:0] and op_sel_hi[1:0] select the half-words for src0 and src1.
+                // For v_dot2, op_sel[1:0] and op_sel_hi[1:0] select the half-words for src0 and
+                // src1.
                 // Clamp, neg, and neg_hi are unmodeled and set has_modifier. op_sel[2] (which
                 // llvm-mc accepts on dot2) is refused deliberately: src2 is a full 32-bit
                 // accumulator and no half-select of it is modelled.
