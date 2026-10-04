@@ -307,10 +307,13 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   says everything, does not need one. If you cannot write a sentence the reader would not have
   guessed, skip it.
 
-- **Architecture and performance ratchets.** `prosper/tools/ci/check_arch_ratchet.py` holds six
+- **Architecture and performance ratchets.** `prosper/tools/ci/check_arch_ratchet.py` holds eleven
   per-file counts to "down, never up": title ids and title-named directories in shared code, raw
-  `getenv` reads, blocking GPU syncs, files over 5,000 lines, and `prosper::test::` in the
-  frontends. **Check your change with delta mode:**
+  `getenv` reads, blocking GPU syncs, files over 5,000 lines, `prosper::test::` in the frontends,
+  host-platform `#if` directives and `HLE(*_stub)` platform-arm handlers outside `src/host`,
+  includes against the layer order, frontends including `tests/fixtures/`, and Vulkan
+  object-creation call sites (the checker's docstring lists every rule). **Check your change with
+  delta mode:**
   `python3 prosper/tools/ci/check_arch_ratchet.py --root . --base origin/main`. It judges only the
   files changed since your merge base with `origin/main` (working tree included) and fails only on
   a count *your change* raised past its row, so a stale row elsewhere on `main` is not your
@@ -321,6 +324,15 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   right, raise its row in `prosper/tools/ci/arch_ratchet_baseline.txt` **in the same PR** with a
   `# note` a reviewer reads (a new sync names the guest-visible result it delivers). Record a drop
   with `--update`, which only lowers. Exit 2 means "could not evaluate", never clean.
+  - **Platform arms hold primitives only.** Do not add a platform arm that is a stub or reduced copy
+    of another arm's logic: a new `HLE(*_stub)` handler raises `platform-stub` (a name-based proxy,
+    so a stub named otherwise is not seen and is still not allowed). Put the logic once in a
+    portable component that reaches the OS through `src/host/platform/`
+    (`prosper/docs/architecture/HOST_PLATFORM_SEAM.md`, Decision and Migration order). The
+    `guest/` extraction proposed in `prosper/docs/architecture/ARCHITECTURE_TARGET_TREE.md`
+    still requires owner approval; this rule does not authorize that move. The two existing
+    stubs are the Windows APR arms in
+    `src/hle/memory/hle_kernel_mem.cpp` (#2384).
   - **Steady-state invariants** — a direction and a review rule, not a description of today. After
     warm-up: **P1** no CPU wait on, or readback from, the GPU inside a frame unless the guest
     observes that result; **P2** no Vulkan object creation per draw or dispatch; **P3** no shader or
