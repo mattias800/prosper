@@ -3,8 +3,9 @@
 This is a durable **partial-work handoff**, not acceptance evidence. The helper/launch code is
 not accepted. Both confirmed review findings have correction attempts. After two recorded build
 failures and reviewed compile corrections, the focused baseline built and ran41PASS/14FAIL.
-The canonical-EXEC correction below improves this to **50PASS/5FAIL of55 actual CPU cases,
-CTest8/helper1**, exposing two warm-cache authority negatives. No passing helper baseline.
+The canonical-EXEC correction improved this to50PASS/5FAIL and exposed two warm-cache negatives.
+The subsequent cache/fixture correction below now reaches **53PASS/2FAIL of55 actual CPU cases,
+CTest8/helper1**. No passing helper baseline.
 General Wave64 and Kena title-screen 3D are
 NOT complete. No current Kena drop census, FPS improvement or title-screen rendering result was
 measured in this checkpoint. The original work was frozen at the maintainer's checkpoint request;
@@ -318,6 +319,49 @@ cohort. APP313/process0 stayed unchanged before/after; no app/DLL/game/device/qu
 Do not transfer this failed cohort to a later documentation/source head or overwrite de203's
 41PASS/14FAIL receipts. No whole-source APPROVED; draft #4384 remains unmerged.
 
+## Cache-authority correction: 53PASS/2FAIL, still not acceptance
+
+Commit `cae82d776749c8a9ad8cf02281e39ea896fb7a01`, parent
+`78f4b6daa43ceaed45c6d5908654e6b610cada79`, tree
+`e48185acc1c96b21231f186bb063a54d7163ef94`, changes two files (+36/-3). Raster-enabled profile
+keys now include the actual checked private launch availability: a matching retained source and
+prepared source, plus `matches(in)`. Both weak source aliases and copied-code cache keys use this
+same profile. Missing/foreign authority cannot borrow a good warm helper plan or poison a later
+valid cold query. No per-draw owner ID was added to the copied-code key; valid different draw
+observations still reuse compiled SOURCE. Non-input-free early refusal and input-free/nonraster
+cold recipe rules are preserved. Cold helper and independent transaction checks are unchanged.
+
+The PendingEmpty regression now queries missing authority before the good compile, retains all
+five forged variants, and restores the valid warm lookup after each one without extra compile
+calls. The genuine high-word write is corrected to `0xbe950380`; the test explicitly checks its
+actual decoded pc5/SOP1/op03/s21/inline-zero before the existing pc6 alias-expiry refusal.
+SAME bounded source review reported **SCOPED SOURCE-CLEAR**, not whole-PR approval. Initial
+changed-line formatting failed, then scoped formatting and exact-head source gates all exited0.
+
+ROOT actual clean cae82 native cohort: configure0/graph0/build0/strict four-PE certificates0,
+55 unique registrations and executions, **53PASS/2ordinaryFAIL**, CTest8/helper1,1.92s real time.
+The two warm-cache negatives and corrected partial-mask test now PASS, including cold poisoning,
+all forged variants and restored genuine warm/no-recompile checks. FragmentRasterLaunch21PASS/
+2FAIL; the other32 focused cases all PASS. The remaining two failures are exactly the earlier
+`SameOriginalProgramCannotBorrowAnotherDrawsEntryObservation` raw-owner inequality and
+`WiderParameterProgramStillNeedsItsCompleteEntryAndExecutionRecipe` float-mode-unavailable/
+warm-plan inequality. Their causes remain unisolated; retain assertions and authentic fixture
+registration/profile authority while investigating, rather than changing return expectations.
+
+Full evidence is in `.codex/issue-4235-native-20261004/cae82d77-launch-authority/`.
+Actual rebind invocation used full cae82 H/P/T above and
+`-Cohort launch-authority -ExecuteNativeProof`; derived UTF8 source SHA256
+`a483ef2bb284cdf8fee30001836dcff0dfc82e98933dee55869ee0eaf5174278`.
+ROOT independently checked all55 matching RUN/timed-result/full-LastTest body joins, with no
+Running0, skips, timeouts, disabled/inverted cases, errors or bad states. Preserved
+`WrongGtestBodies=2` remains the old runner's zero-passes false positive; the two genuine
+failures independently keep the cohort red. Both complete failed bodies and three newly passing
+bodies were read. Final native handle exit1/process census0; APP313/process0 unchanged.
+No production-only controls/restorations, SPIR-V SDK validation, Vulkan device/queue/helper
+pixels or game run. This is a verified bounded CPU correction, not general Wave64 acceptance;
+the full-original Kena frontier, missing connected review and whole-PR approval still remain.
+Historical41/14 and50/5 receipts are preserved, not replaced or relabeled.
+
 ## Objective and acceptance boundary
 
 Implement accurate, general guest Wave64 on hosts without native Wave64. Kena's title-screen 3D
@@ -513,10 +557,10 @@ run `python3 prosper/tools/session_start.py` at session start/after worktree cha
 machine the Store python3 alias may fail; real Python312 is available as `python`/`py -3.12`.
 Fetch in your own worktree, inspect current-main instructions/deltas and preserve others' trees.
 
-1. Continue from exact802's failed55-case baseline. Repair the two newly exposed warm-cache
-   launch-authority negatives, correct/assert the high-word replacement fixture's real opcode,
-   and version/calibrate the body checker without altering old receipts. Review corrections and
-   execute a NEW exact-head cohort. Isolate other fixture/cache failures without weakening authority.
+1. Continue from exact cae82's failed55-case baseline. Isolate the remaining raw-owner and
+   float-profile/warm-plan fixture failures, and version/calibrate the body checker without altering
+   old receipts. Review corrections and execute a NEW exact-head cohort. Preserve authentic
+   registration/generation/profile authority, rather than weakening the failing assertions.
    The focused linking/discovery ran, but passing runtime acceptance is still pending. Validate both
    source-only repair attempts and finish missing registered negatives; preserve
    immutable successor H/P/T, source inventory and exact gates. Same reviewer completes the
@@ -549,13 +593,14 @@ committed or downloaded by a fresh clone, whereas source and this document are i
 | `.codex/issue-4235-native-20261004/392f3c3a-focused-baseline/`, `.codex/issue-4235-helper-cpu-392f3c3a-20261004.ps1` | Actual second build1 on nonexistent RegisterFile API; no certificate/tests. |
 | `.codex/issue-4235-native-20261004/de2037b2-focused-baseline/`, `.codex/issue-4235-helper-cpu-rebind-20261004.ps1` | Actual four-PE strict certificate and55 complete cases41PASS/14FAIL; original body-classifier false positive preserved and separately explained above. |
 | `.codex/issue-4235-native-20261004/802b4f80-canonical-exec/` | Actual new four-PE strict certificate and55 cases50PASS/5FAIL after canonical-EXEC correction; warm-cache negatives and malformed high-word fixture exposed, no GPU/SDK/production-control acceptance. |
+| `.codex/issue-4235-native-20261004/cae82d77-launch-authority/` | Actual four-PE strict certificate and55 cases53PASS/2FAIL after checked launch availability partitions both cache paths and real high-word fixture correction; remaining owner/profile failures, no GPU/SDK/production-control acceptance. |
 | `.codex/issue-4378-native-20261004/215ee6d2-baseline/` | Actual failed native configure/graph/build/certs/registration/JUnit/LastTest/observed.json. |
 | `.codex/issue-4378-cpu-native-20261004.ps1` | Reviewed ROOT-only70/12 helper, SHA256 `4df72940d6492ca983eb84996ada823686ce0f04c68fd1dc8196c5f765554695`; requires exact clean H/P/T and NEW cohort name. |
 | `.codex/issue-4378-source-freeze-215ee6d2-20261004.txt`, held-scope v1/v2 and handoff | Windows source-gate/history, not a passing native result. |
 | `.codex/issue-4322-native-20261004/9e595b11-final-tool/` | Accepted exact9e CPU60 receipts. |
 | `.codex/issue-4322-observation-native-20261004/9e595b11-final-tool/` | Accepted exact9e GPU17/observations receipts. |
 | `.codex/issue-4322-spv-native-20261004/9e595b11-final-corrected/` | Accepted exact9e585 actual modules/validator evidence. |
-| `.codex/worktrees/wave64-followthrough-20261002` | ROOT own central worktree; sole retained `prosper/build-flags-native-clang`. Latest four focused CPU PEs are linked/certified802; other prior twelve-target-lane PEs remain215. Native receipts do not certify later documentation/source successors. |
+| `.codex/worktrees/wave64-followthrough-20261002` | ROOT own central worktree; sole retained `prosper/build-flags-native-clang`. Latest four focused CPU PEs are linked/certified cae82; other prior twelve-target-lane PEs remain215. Native receipts do not certify later documentation/source successors. |
 | `.codex/worktrees/fragment-launch-composition-20261004` | Source-only helper author tree, clean3fcb at freeze, no builds. |
 | `.codex/worktrees/refused-shader-paths-20261004` | Removed after clean/ignored-path census, author acknowledgement and exact remote215 verification; no build or raw receipts deleted. Recreate an owned tree from draft #4383 if resuming. |
 
