@@ -2,11 +2,13 @@
 // Missing launch/entry/producer/allocation authority refuses; cached native modules are irrelevant.
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
+#include "gpu/execute/shader_cache_internal.hpp"
 #include "gpu/agc/agc_shader_layout.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
+#include "diagnostics/env_cache.hpp"
 extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr);
 namespace prosper::gpu {
 static constexpr uint32_t kUserSgprs = 32;
@@ -29,15 +31,24 @@ size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_add
     return dwords;
 }
 
+// Asked several times per draw by realization, snapshot selection and owned-wave preparation.
+// The answer is a property of one immutable registered byte version, which the decode cache
+// already classified from the same full walk (DecodedShader::raw_wave_wide_data_load_pcs, the
+// field checked_graphics_source_requires_owned_waves reads). Re-walking and re-running the
+// dataflow here on every call cost GTA V ~70% of its bank-scene frame rate (9.0 -> 3.0 flips/s
+// at #4270). PROSPER_OWNED_WAVE_CLASSIFY_RECOMPUTE=1 restores the re-derivation as the A/B control.
 bool graphics_program_requires_owned_waves(uint64_t address) {
     const auto* header =
         static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(address));
     if (!header) return false;
-    const auto source = registered_graphics_original(address);
-    if (!source) return false;
-    std::vector<Rdna2Inst> original;
-    rdna2_walk(source->data(), source->size(), original);
-    return !rdna2_raw_wave_wide_data_loads(original).empty();
+    const auto source = registered_graphics_read_source(address);
+    if (!source.words || !source.decoded) return false;
+    if (PROSPER_ENV_ON("PROSPER_OWNED_WAVE_CLASSIFY_RECOMPUTE")) {
+        std::vector<Rdna2Inst> original;
+        rdna2_walk(source.words->data(), source.words->size(), original);
+        return !rdna2_raw_wave_wide_data_loads(original).empty();
+    }
+    return !source.decoded->raw_wave_wide_data_load_pcs.empty();
 }
 
 bool prepare_draw_owned_waves(const GpuState& state, const GpuState::Draw* draw,
