@@ -701,8 +701,8 @@ TEST_F(FragmentRasterLaunch, ProgrammedDepthColorControlRefusesBeforePendingAuth
             EXPECT_TRUE(draw.fragment_draw_inputs->owned_wave_pending) << std::hex << admitted;
         const auto prepared = f::prepare(draw);
         ASSERT_TRUE(prepared && prepared->launch_source);
-        const auto plan =
-            g::cached_fragment_draw_program(*draw.fragment_draw_inputs, *prepared, raster_device(), 48);
+        const auto plan = g::cached_fragment_draw_program(*draw.fragment_draw_inputs, *prepared,
+                                                          raster_device(), 48);
         ASSERT_TRUE(plan);
         EXPECT_TRUE(plan->rejection_reason().empty()) << plan->rejection_reason();
         EXPECT_TRUE(plan->capacity_owner());
@@ -721,7 +721,8 @@ TEST_F(FragmentRasterLaunch, ProgrammedDepthColorControlRefusesBeforePendingAuth
         const auto& in = *draw.fragment_draw_inputs;
         ASSERT_TRUE(in.launch.coverage.has(C::DepthControl));
         EXPECT_EQ(in.launch.coverage.word(C::DepthControl), depth_control);
-        EXPECT_STREQ(g::fragment_raster_workitem_gap(in.launch), reason) << std::hex << depth_control;
+        EXPECT_STREQ(g::fragment_raster_workitem_gap(in.launch), reason)
+            << std::hex << depth_control;
         // The private launch association is an observation every non-bank draw receives; the
         // pending empty-FS deferral is the authority, and fragment_raster_pending_original
         // withholds it for any workitem gap.

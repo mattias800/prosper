@@ -319,7 +319,10 @@ bool unmodeled_depth_color_control_summary(char* out, size_t cap) {
     const uint64_t a = unmodeled_depth_color_control_count(1),
                    b = unmodeled_depth_color_control_count(2),
                    c = unmodeled_depth_color_control_count(3);
-    if (!(a | b | c)) { out[0] = '\0'; return false; }
+    if (!(a | b | c)) {
+        out[0] = '\0';
+        return false;
+    }
     std::snprintf(out, cap,
                   "[gpu] DB_DEPTH_CONTROL colour-on-depth totals (EXACT): write-on-fail=%llu "
                   "no-write-on-pass=%llu both=%llu",
@@ -340,9 +343,10 @@ static void report_unmodeled_depth_color_control(uint32_t db_depth_control) {
     (void)exit_dump_registered;
     const uint64_t count = ++g_depth_color_control_counts[state];
     if ((count & (count - 1u)) == 0u)
-        fprintf(stderr, "[gpu] resolve_pipeline_state: DB_DEPTH_CONTROL colour-on-depth bits=%u "
-                        "(bit30 write-on-fail, bit31 no-write-on-pass) are unmodeled -> colour "
-                        "still written as an ordinary draw (count=%llu, #4397)\n",
+        fprintf(stderr,
+                "[gpu] resolve_pipeline_state: DB_DEPTH_CONTROL colour-on-depth bits=%u "
+                "(bit30 write-on-fail, bit31 no-write-on-pass) are unmodeled -> colour "
+                "still written as an ordinary draw (count=%llu, #4397)\n",
                 state, static_cast<unsigned long long>(count));
 }
 

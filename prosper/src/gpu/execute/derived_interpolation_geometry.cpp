@@ -32,6 +32,12 @@ GeometryCache& geometry_cache() {
 }
 std::vector<uint32_t> geometry_profile(const FragmentInterpolationLayout& layout, bool capture,
                                        bool rect, FloatTransportConfig transport) {
+    // A nonexplicit transport's module also depends on the process float-controls verdict
+    // (SpirvCompute::declare_float_controls), which a later publish can change. Explicit profiles
+    // never read it. GS generation runs outside any CompilerChoiceScope, so this is the same live
+    // value the compile consumes.
+    const uint32_t float_controls =
+        transport.explicit_nonfinite32() ? 2u : uint32_t(signed_zero_inf_nan_preserve_declared());
     std::vector<uint32_t> profile{layout.attribute_mask,
                                   layout.smooth_mask,
                                   layout.passthrough_mask,
@@ -41,14 +47,7 @@ std::vector<uint32_t> geometry_profile(const FragmentInterpolationLayout& layout
                                   uint32_t(capture),
                                   uint32_t(rect),
                                   uint32_t(transport.profile),
-                                  // A nonexplicit transport's module also depends on the process
-                                  // float-controls verdict (SpirvCompute::declare_float_controls),
-                                  // which a later publish can change. Explicit profiles never read
-                                  // it. GS generation runs outside any CompilerChoiceScope, so this
-                                  // is the same live value the compile consumes.
-                                  transport.explicit_nonfinite32()
-                                      ? 2u
-                                      : uint32_t(signed_zero_inf_nan_preserve_declared())};
+                                  float_controls};
     for (const auto& locations : layout.parameter_locations)
         profile.insert(profile.end(), locations.begin(), locations.end());
     profile.insert(profile.end(), layout.system_locations.begin(), layout.system_locations.end());

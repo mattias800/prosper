@@ -42,7 +42,8 @@ const char* fragment_raster_workitem_gap(const RasterLaunchFacts& launch) {
     // enables 0..3, ZFUNC 4..6, BACKFACE_ENABLE 7, STENCILFUNC 8..10, STENCILFUNC_BF 20..22,
     // ENABLE_COLOR_WRITES_ON_DEPTH_FAIL 30, DISABLE_COLOR_WRITES_ON_DEPTH_PASS 31. A set bit
     // outside those has no proved meaning here and is refused rather than assumed inert.
-    if (depth_control & 0x3f8ff800u) return "fragment-draw-depth-control-reserved-bits-unimplemented";
+    if (depth_control & 0x3f8ff800u)
+        return "fragment-draw-depth-control-reserved-bits-unimplemented";
     // With Z, stencil and bounds tests all disabled (checked above) no fragment can fail the depth
     // stage, so DISABLE_COLOR_WRITES_ON_DEPTH_PASS means this draw writes no colour at all. The
     // shipping colour state (resolve_pipeline_state) does not yet apply that, so the replay would
