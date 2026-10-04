@@ -342,6 +342,9 @@ void register_audio_hle();
 // libSceAudiodec (hle/audio/hle_audiodec.cpp) — the direct create/decode/delete decoder library
 // Unreal's Electra media player uses for movie audio. Separate from libSceAjm's batched surface.
 void register_audiodec_hle();
+// libSceAudio3d / libSceAudioPropagation / libSceAcm (hle/audio/hle_audio_spatial.cpp):
+// local 3D-port and Acm-context lifecycles, honest no-backend refusals elsewhere.
+void register_audio_spatial_hle();
 // libSceAgc "Gen5" Draw Command Buffer HLE (real PM4-building Dcb functions); see hle_agc.cpp.
 // Call AFTER register_graphics_hle so these override the observe-only glog stubs.
 void register_agc_hle();

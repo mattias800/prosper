@@ -1059,6 +1059,7 @@ void register_builtin_hle() {
     register_pad_hle();      // libScePad: real game-controller input (input/pad.cpp)
     register_audio_hle();    // libSceAudioOut backed by a headless/pluggable AudioSink
     register_audiodec_hle(); // libSceAudiodec: UE Electra movie-audio decode (AAC)
+    register_audio_spatial_hle(); // libSceAudio3d (one port) / libSceAcm (contexts; no batch engine)
     register_graphics_hle(); // headless libSceAgc/libSceVideoOut placeholders (bring-up)
     register_agc_hle();      // real AGC Dcb functions (override the glog stubs for Dcb NIDs)
     register_kernel_hle();   // libkernel primitives (pthread/sync/...)
