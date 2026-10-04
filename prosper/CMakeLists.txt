@@ -2833,6 +2833,11 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_decode_sweep.cpp
     LIBRARIES prosper_core)
 
+  # The SOPP branch predicate is a header-only fact checked against the ISA table.
+  prosper_add_gtest(test_sopp_direct_branch
+    SOURCES tests/gpu/recompiler/test_sopp_direct_branch.cpp
+    INCLUDES src)
+
   # Closed-tail block admission is decoder-only, so this compiles rdna2_decode.cpp directly
   # (same pattern as test_workgroup_uniformity above).
   prosper_add_gtest(test_rdna2_closed_tail
