@@ -843,6 +843,11 @@ if(TARGET prosper_core)
              COMMAND test_nid "${GAME_DUMP}/eboot.bin")
   endif()
 
+  # test_scratch.h: scratch creation survives a peer removing the shared root (ctest -j race).
+  prosper_add_gtest(test_scratch_root_race
+    SOURCES tests/misc/test_scratch_root_race.cpp
+    INCLUDES tests)
+
   # Dump-independent golden vectors pin NID hashing in the default unit-test set.
   prosper_add_gtest(test_nid_vectors
     SOURCES tests/hle/dispatch/test_nid_vectors.cpp
@@ -6326,11 +6331,13 @@ endif()
 # header for why that matters on this machine.
 #
 # This must stay at the very end of the file: it snapshots the DIRECTORY TESTS
-# property, so any add_test() below it would not be covered. A test that did get
-# missed still fails safe rather than silently — test_scratch.h falls back to
+# property, so any add_test() below it would not be covered -- and neither is any
+# GoogleTest case, because prosper_add_gtest discovers those at ctest time. A test
+# that is missed still fails safe rather than silently — test_scratch.h falls back to
 # <cwd>/prosper-test-scratch/, and ctest's working directory is this same build
-# directory, so it lands off the tmpfs either way; it merely loses the per-case
-# split (the pid component still separates concurrent processes).
+# directory, so it lands off the tmpfs either way. It loses the per-case split: the
+# pid component still separates concurrent processes, but they share one root, so
+# test_scratch.h retries creation when a peer removes that root under it.
 get_property(prosper_registered_tests DIRECTORY PROPERTY TESTS)
 foreach(prosper_test_case IN LISTS prosper_registered_tests)
   set_property(TEST ${prosper_test_case} APPEND PROPERTY ENVIRONMENT
