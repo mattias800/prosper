@@ -5316,6 +5316,29 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **Ongoing persistent-target eviction churn explains the low rate in the measured warm bank
+  population** — falsified by the 2026-10-04 same-app count matrix on frozen shipping main
+  `525cb71c0c7d`: **256 → 512 → 1024 → 1024 → 512 → 256**, 840 s per arm, deferred wait OFF.
+  The visible native-Wayland normal app used immediate presentation, full cadence, render scale 1
+  and `scripts/gta5/reach-performance-story.pad`; texture/heap/target budgets were
+  **1024/8192/2048 MiB**. Complete capture-free windows certainly inside the fixed **600–780 s**
+  bounds yielded **2.404111 / 2.533779 / 2.051207 / 2.363218 / 2.578634 / 2.511207 guest flips/s**
+  (33/34/33/34/34/33 windows), with matching host presentation counts and **zero target evictions
+  in every selected population**. A larger count did not restore the earlier 9–10 rate here;
+  cold-start and other-title cache benefits remain open. Count 1024 reached the byte ceiling
+  before its entry ceiling; `persistent_color_target_count_ceiling` permits 64 extra entries
+  while eviction is deferred, so whole-run peaks 320/576 at counts 256/512 are within that policy.
+  Two observations per count, unequal host I/O stalls (1.36–6.25% `some`) and unproved equal guest
+  state establish **no causal win or regression**. All six app/runner exits were 0 and owned
+  processes drained. The campaign's visual review checked all 18 native menu/close-up/bank
+  captures: bank player/world/radar/health HUD appeared in every arm, while the intermediate
+  4100 HUD alternated present/absent at every count; continuous correctness is unproved.
+  Each selected window retained **three frontend fragment drops and one compute skip per flip**,
+  with no backend/contract drops. Fresh-render FPS remains **NO_DATA** without producer/delivery
+  lineage. Shutdown-tail refusals remain recorded; `shutdown-gate-refused` returns the `-4`
+  sentinel without a driver call, not a hardware device-loss finding. Count 256 and Stage 2
+  default OFF remain unchanged. Evidence: [#3873 count checkpoint](https://github.com/mattias800/prosper/issues/3873#issuecomment-5978333004).
+
 - **Stage 2 alone restores the earlier 9–10 guest flips/s in the current normal-route bank
   cohort** — falsified by the 2026-10-04 same-app OFF/ON → ON/OFF on frozen shipping main
   `986174464`, using the visible native-Wayland normal app, immediate presentation and
