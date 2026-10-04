@@ -2838,6 +2838,11 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_scalar_predicates.cpp
     INCLUDES src)
 
+  # The SOPP branch predicate is a header-only fact checked against the ISA table.
+  prosper_add_gtest(test_sopp_direct_branch
+    SOURCES tests/gpu/recompiler/test_sopp_direct_branch.cpp
+    INCLUDES src)
+
   # Closed-tail block admission is decoder-only, so this compiles rdna2_decode.cpp directly
   # (same pattern as test_workgroup_uniformity above).
   prosper_add_gtest(test_rdna2_closed_tail
@@ -2847,6 +2852,11 @@ if(TARGET prosper_core)
   # SOP2 destination widths are decoder-only facts checked against LLVM's SOP2 classes.
   prosper_add_gtest(test_sop2_dest_width
     SOURCES tests/gpu/recompiler/test_sop2_dest_width.cpp src/gpu/recompiler/rdna2_decode.cpp
+    INCLUDES src)
+
+  # Mandatory-literal capture is a decoder-only fact: K/data must be captured, not just counted.
+  prosper_add_gtest(test_rdna2_literal_capture
+    SOURCES tests/gpu/recompiler/test_rdna2_literal_capture.cpp src/gpu/recompiler/rdna2_decode.cpp
     INCLUDES src)
 
   # Structural RDNA2->SPIR-V validation that does not require Vulkan runtime support.
