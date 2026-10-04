@@ -46,6 +46,11 @@
 #include "../../tests/fixtures/fragment_packet_wave_fixture.hpp"
 #include "../../tests/fixtures/fragment_packet_exports_fixture.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
+#if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
+#include "../../tests/fixtures/fragment_scalar_bank_fixture.hpp"
+#include "gpu/recompiler/fragment_scalar_bank_wire.hpp"
+#include "shared/live/live_renderer.hpp"
+#endif
 #include <algorithm>
 #include <bit>
 #include <array>
@@ -119,6 +124,137 @@ static void dump(const std::string& dir, const char* name, const std::vector<uin
     }
     printf("  [ok]   %-26s (%zu words) valid\n", name, spv.size());
 }
+
+#if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
+// The bank representative is issued by the same registered original-source/ordered producer
+// as the CPU and GPU fixtures. These are real metadata-only backend queries, not fabricated
+// completion booleans. The submit callback captures the actual draw; it does not create a device,
+// submit GPU commands, wait for completion or publish pixels.
+static void validate_scalar_bank(const std::string& dir) {
+    namespace fixture = prosper::test::scalar_bank;
+    namespace draw_fixture = prosper::test::fragment_draw;
+    namespace live = prosper::frontend;
+    const auto require = [](bool condition, const char* reason) {
+        if (!condition) {
+            printf("  [FAIL] scalar-bank: %s\n", reason);
+            ++fails;
+        }
+        return condition;
+    };
+    fixture::Scene scene;
+    if (!require(scene.create(), "genuine AGC/direct-memory scene unavailable")) return;
+    const auto backend = live::live_graphics_producer_status();
+    if (!require(backend.known && !backend.pending, "live backend baseline unknown/pending"))
+        return;
+    struct Queries {
+        explicit Queries(std::vector<DrawItem>& draws) {
+            set_graphics_producer_status_query(live::live_graphics_producer_status);
+            set_graphics_raw_source_authority(live::live_graphics_raw_source_current);
+            set_graphics_raw_allocation_authority(live::live_graphics_raw_allocation_current);
+            set_submit_renderer([&draws](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+                draws.insert(draws.end(), items.begin(), items.end());
+                return RenderedFrame{};
+            });
+        }
+        ~Queries() {
+            set_submit_renderer({});
+            set_graphics_raw_allocation_authority({});
+            set_graphics_raw_source_authority({});
+            set_graphics_producer_status_query({});
+        }
+    };
+    // Offline declared compiler inputs, NOT evidence of enabled Vulkan device features. Publish
+    // before actual realization so its original producing capsule captures this same profile.
+    publish_float_transport_config({FloatTransportProfile::ExplicitNonFinite32});
+    std::vector<DrawItem> draws;
+    Queries queries(draws);
+    const bool presented = execute_ordered_and_present(scene.state(), draw_fixture::width,
+                                                       draw_fixture::height, 4801, false);
+    if (!require(!presented && draws.size() == 1, "ordered producer did not capture one draw"))
+        return;
+    const auto& inputs = draws[0].fragment_draw_inputs;
+    if (!require(inputs && inputs->scalar_bank, "ordered producer did not seal a genuine bank"))
+        return;
+    const auto& bank = inputs->scalar_bank;
+    if (!require(bank->matches(inputs->raw_code, inputs->vgpr_requirements, inputs->entry) &&
+                     bank->original_words() &&
+                     *bank->original_words() == fixture::fragment_words() && bank->requirements() &&
+                     bank->read_point_identity() != 0 && bank->sites().size() == 1 &&
+                     bank->sources().size() == 1 && bank->intervals().size() == 1 &&
+                     bank->sites()[0].pc == 1 && bank->sites()[0].words == 4 &&
+                     bank->sources()[0].descriptor == scene.descriptor &&
+                     bank->payload_bytes() == sizeof(draw_fixture::color_a) &&
+                     bank->intervals()[0].bytes &&
+                     bank->intervals()[0].bytes->size() == sizeof(draw_fixture::color_a) &&
+                     std::memcmp(bank->intervals()[0].bytes->data(), draw_fixture::color_a.data(),
+                                 sizeof(draw_fixture::color_a)) == 0,
+                 "complete original-PC/entry/descriptor/payload association missing"))
+        return;
+    const auto prepared = draw_fixture::prepare(draws[0]);
+    if (!require(bool(prepared), "actual producing native modules failed preparation")) return;
+    const FragmentPacketDeviceContract declared_device{0x1234, true, false};
+    const auto plan = cached_fragment_draw_program(*inputs, *prepared, declared_device, 48);
+    if (!require(bool(plan), "no bank program plan")) return;
+    if (!require(plan->rejection_reason().empty(), plan->rejection_reason().c_str())) return;
+    if (!require(plan->requires_scalar_bank(), "program plan omitted the scalar-bank schema"))
+        return;
+    const auto& capacity = plan->capacity_owner();
+    if (!require(capacity && capacity->kernel()->layout.gpu_capacity &&
+                     capacity->kernel()->guest_code == *bank->original_words() &&
+                     capacity->kernel()->program.scalar_bank_sites == bank->requirements()->sites,
+                 "capacity kernel does not retain the complete original bank schema"))
+        return;
+    const auto transaction = instantiate_fragment_draw_transaction(
+        plan, inputs, *prepared, draw_fixture::width, draw_fixture::height, 1,
+        declared_device.device_identity);
+    if (!require(transaction.rejection().empty() && transaction.scalar_bank() == bank,
+                 "actual transaction consumer did not retain the sealed bank"))
+        return;
+    struct Module {
+        const char* name;
+        const std::vector<uint32_t>& words;
+        SpirvShaderStage stage;
+        uint32_t set;
+        bool needs_bank;
+    };
+    // Six actual modules, not six statically-used bindings in every module. The normal compute
+    // layout has bindings 0..5; only the original kernel reads SBR2 at 5. Collector uses set1/0,
+    // and replay's private set0/5 is the commit plane, NOT the scalar bank.
+    const std::array modules{
+        Module{"scalar_bank_original_kernel", capacity->kernel()->program.packet.spirv,
+               SpirvShaderStage::Compute, 0, true},
+        Module{"scalar_bank_collector", plan->collect_words(), SpirvShaderStage::Fragment, 1,
+               false},
+        Module{"scalar_bank_count", plan->count_words(), SpirvShaderStage::Compute, 0, false},
+        Module{"scalar_bank_assembly", plan->assembly_words(), SpirvShaderStage::Compute, 0, false},
+        Module{"scalar_bank_validation", plan->validation_words(), SpirvShaderStage::Compute, 0,
+               false},
+        Module{"scalar_bank_replay", plan->replay_words(), SpirvShaderStage::Fragment, 0, false}};
+    for (const auto& module : modules) {
+        dump(dir, module.name, module.words);
+        const auto report = validate_spirv_descriptor_interface(module.words, nullptr, module.set,
+                                                                module.stage, false);
+        if (!require(spirv_descriptor_reflection_complete(report), "incomplete module reflection"))
+            continue;
+        for (const auto& binding : report.descriptors) {
+            printf("  [binding] %s set=%u binding=%u storage=%d read=%d write=%d\n", module.name,
+                   binding.set, binding.binding, binding.kind == SpirvDescriptorKind::StorageBuffer,
+                   binding.readable, binding.writable);
+            require(binding.set == module.set && binding.stage == module.stage &&
+                        binding.kind == SpirvDescriptorKind::StorageBuffer &&
+                        binding.binding <= kFragmentScalarBankBinding &&
+                        (module.set != 1 || binding.binding == 0),
+                    "module binding outside the actual WAT2 interface");
+        }
+        if (module.needs_bank) {
+            const auto binding =
+                find_spirv_descriptor_binding(report, 0, kFragmentScalarBankBinding);
+            require(binding && binding->readable && !binding->writable,
+                    "original kernel did not declare/read readonly SBR2 binding5");
+        }
+    }
+}
+#endif
 
 // --- Emitter coverage -------------------------------------------------------------------------
 // An entry point that emits SPIR-V but has no module here is invisible to this gate, and nothing
@@ -440,12 +576,19 @@ int main(int argc, char** argv) {
     // The source root is required, not optional: the coverage check is the half of this gate that
     // survives the next emitter being added, and a check that silently skips itself is the defect
     // this tool exists to stop.
-    if (argc <= 2) {
-        printf("== FAIL: usage: spv_validate <output-dir> <source-root> ==\n"
+    if (argc <= 2 || argc > 4 || (argc == 4 && std::strcmp(argv[3], "--scalar-bank") != 0)) {
+        printf("== FAIL: usage: spv_validate <output-dir> <source-root> [--scalar-bank] ==\n"
                "  <source-root> is prosper/ -- the emitter-coverage check reads its headers.\n");
         return 1;
     }
     const std::string src_root = argv[2];
+    const bool scalar_bank_only = argc == 4;
+    if (scalar_bank_only) {
+#if !defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
+        printf("== FAIL: --scalar-bank requires the compiled normal live producer ==\n");
+        return 1;
+#endif
+    }
 
     // Validate the DECLARED form of every module (#3479/#3561). The SignedZeroInfNanPreserve
     // declaration is device-gated, and this tool owns no Vulkan device, so without this line it
@@ -484,6 +627,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (scalar_bank_only) {
+#if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
+        validate_scalar_bank(dir);
+        if (fails) {
+            printf("== FAIL: %d scalar-bank emission/validation/contract failure(s) ==\n", fails);
+            return 1;
+        }
+        printf("== PASS (six actual scalar-bank modules pass spirv-val; offline compiler inputs; "
+               "no GPU or full-emitter coverage claim) ==\n");
+        return 0;
+#endif
+    }
 
     // Compute ALU (float chain).
     { const uint32_t c[] = {0x8f148402u, 0xf4080200u, 0x28000010u,

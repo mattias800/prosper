@@ -6425,6 +6425,16 @@ endif()
 # CPU-only actual ordered-executor/backend-metadata contract, shared by Windows and UNIX. Links
 # the normal renderer but deliberately creates no device or GPU work and needs no game dump.
 if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
+  # The explicit SBR2 validator arm uses the real metadata-only backend authority and normal
+  # ordered producer, without a device/renderer initialization. Keep the core-only default tool
+  # available on other configurations; an unavailable requested arm is a runtime hard failure.
+  if(TARGET spv_validate)
+    target_link_libraries(spv_validate PRIVATE prosper_live_renderer)
+    target_include_directories(spv_validate PRIVATE frontends tests)
+    target_compile_definitions(spv_validate PRIVATE PROSPER_SPV_VALIDATE_SCALAR_BANK=1)
+    add_test(NAME spv_validate_scalar_bank
+      COMMAND spv_validate ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR} --scalar-bank)
+  endif()
   prosper_add_gtest(test_fragment_scalar_bank
     SOURCES tests/shared/live/test_fragment_scalar_bank.cpp
     INCLUDES frontends src tests
