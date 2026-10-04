@@ -2839,6 +2839,16 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_closed_tail.cpp src/gpu/recompiler/rdna2_decode.cpp
     INCLUDES src)
 
+  # SOP2 destination widths are decoder-only facts checked against LLVM's SOP2 classes.
+  prosper_add_gtest(test_sop2_dest_width
+    SOURCES tests/gpu/recompiler/test_sop2_dest_width.cpp src/gpu/recompiler/rdna2_decode.cpp
+    INCLUDES src)
+
+  # Mandatory-literal capture is a decoder-only fact: K/data must be captured, not just counted.
+  prosper_add_gtest(test_rdna2_literal_capture
+    SOURCES tests/gpu/recompiler/test_rdna2_literal_capture.cpp src/gpu/recompiler/rdna2_decode.cpp
+    INCLUDES src)
+
   # Structural RDNA2->SPIR-V validation that does not require Vulkan runtime support.
   add_executable(test_rdna2_spirv_struct tests/gpu/test_rdna2_spirv_struct.cpp)
   target_link_libraries(test_rdna2_spirv_struct PRIVATE prosper_core)

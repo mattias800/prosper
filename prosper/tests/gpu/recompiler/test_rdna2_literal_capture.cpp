@@ -1,0 +1,79 @@
+// test_rdna2_literal_capture — the mandatory literal K of the VOP2 mul-adds and the SOPK
+// setreg data dword must be CAPTURED, not just counted.
+//
+// Length alone is not the contract: the walker sweep pins that the six K-carrying VOP2 mul-adds
+// (v_madmk/madak_f32, v_fmamk/fmaak_f32, v_fmamk/fmaak_f16) and SOPK s_setreg_imm32_b32 are 2
+// dwords, but a length fix that stopped capturing K (or captured the wrong dword) would keep
+// every length green while the emitter folds a phantom constant. These arms assert has_literal
+// and the exact captured value for each of the seven opcodes, plus that an ordinary VOP2 with
+// plain sources captures nothing.
+//
+// Oracle: AMD RDNA2 ISA 70648 VOP2 K-table (v_fmamk_f32 0x2C, v_fmaak_f32 0x2D, v_fmamk_f16 0x37,
+// v_fmaak_f16 0x38 — the f16 pair are Table 75 ops 55/56) and SOPK Table 66 (only op 21,
+// s_setreg_imm32_b32, carries trailing data). v_madmk_f32 0x20 / v_madak_f32 0x21 are RDNA1
+// encodings (llvm-mc accepts them for gfx1010/gfx1013, not gfx1030) that the decoder keeps for
+// PS5 guest code, the same note the emitter records for v_mac_f32. Pure decode.
+//
+// Every "captures nothing" arm decodes from a padded buffer: the decoder only captures a
+// literal when a second dword is available, so a one-dword input would stay literal-free even
+// if the opcode were wrongly treated as K-carrying.
+#include "gpu/recompiler/rdna2_decode.hpp"
+
+#include <gtest/gtest.h>
+
+#include <cstddef>
+#include <cstdint>
+
+using namespace prosper::gpu;
+
+namespace {
+
+// VOP2 word: bit31=0, OP[30:25], VDST[24:17], VSRC1[16:9], SRC0[8:0]. Plain VGPR sources, so any
+// literal comes only from the opcode's mandatory K slot.
+uint32_t vop2_w0(uint32_t op) { return (op << 25) | (0u << 17) | (1u << 9) | 0x100u; }
+
+}  // namespace
+
+TEST(Rdna2LiteralCapture, Vop2MandatoryKIsCapturedForAllSixMulAdds) {
+    const uint32_t ops[] = {0x20u, 0x21u, 0x2Cu, 0x2Du, 0x37u, 0x38u};
+    for (uint32_t op : ops) {
+        // A distinct K per opcode with non-zero low bits (the f16 pair read the low half).
+        const uint32_t k = 0x3C00A55Au ^ (op << 16) ^ op;
+        const uint32_t code[] = {vop2_w0(op), k};
+        const Rdna2Inst in = rdna2_decode_one(code, std::size(code));
+        EXPECT_EQ(in.fmt, Rdna2Format::VOP2) << "op=" << op;
+        EXPECT_EQ(in.opcode, op) << "op=" << op;
+        EXPECT_EQ(in.len_dwords, 2u) << "op=" << op;
+        EXPECT_TRUE(in.has_literal) << "K must be captured, op=" << op;
+        EXPECT_EQ(in.literal, k) << "K value must survive, op=" << op;
+    }
+}
+
+TEST(Rdna2LiteralCapture, OrdinaryVop2WithPlainSourcesCapturesNothing) {
+    // v_add_f32 (0x03) with VGPR sources: one dword, no literal. Guards K-capture leaking onto
+    // ordinary ops (the converse miscompile of the arms above).
+    const uint32_t code[] = {vop2_w0(0x03u), 0xDEADBEEFu};
+    const Rdna2Inst in = rdna2_decode_one(code, std::size(code));
+    EXPECT_EQ(in.len_dwords, 1u);
+    EXPECT_FALSE(in.has_literal);
+}
+
+TEST(Rdna2LiteralCapture, SopkSetregImm32CapturesItsDataDword) {
+    // Exact llvm-mc gfx1030 words: s_setreg_imm32_b32 with trailing data 0x12345678.
+    const uint32_t setreg[] = {0xBA80F801u, 0x12345678u};
+    const Rdna2Inst keep = rdna2_decode_one(setreg, std::size(setreg));
+    EXPECT_EQ(keep.fmt, Rdna2Format::SOPK);
+    EXPECT_EQ(keep.opcode, 21u);
+    EXPECT_EQ(keep.len_dwords, 2u);
+    EXPECT_TRUE(keep.has_literal);
+    EXPECT_EQ(keep.literal, 0x12345678u);
+    // Neighbouring SOPK opcodes carry no literal: s_setreg_b32 (19, the register-sourced form)
+    // and s_call_b64 (22) stay one dword even with a dword available after them.
+    for (uint32_t op : {19u, 22u}) {
+        const uint32_t code[] = {0xB0000000u | (op << 23) | 0x1234u, 0xDEADBEEFu};
+        const Rdna2Inst in = rdna2_decode_one(code, std::size(code));
+        EXPECT_EQ(in.fmt, Rdna2Format::SOPK) << "op=" << op;
+        EXPECT_EQ(in.len_dwords, 1u) << "op=" << op;
+        EXPECT_FALSE(in.has_literal) << "op=" << op;
+    }
+}
