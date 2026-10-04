@@ -107,8 +107,9 @@ struct Scene {
               p::CB_COLOR0_FMASK, p::CB_COLOR0_FMASK_BASE_EXT, p::CB_COLOR0_DCC_BASE,
               p::CB_COLOR0_DCC_BASE_EXT})
             result.cx[reg] = 0;   // actual physical observations, never absent => hardware default
-        result.cx[p::CB_COLOR_CONTROL] = p::CB_COLOR_CONTROL_MODE_NORMAL
-                                         << p::CB_COLOR_CONTROL_MODE_SHIFT;
+        result.cx[p::CB_COLOR_CONTROL] =
+            (p::CB_COLOR_CONTROL_MODE_NORMAL << p::CB_COLOR_CONTROL_MODE_SHIFT) |
+            (0xccu << p::CB_COLOR_CONTROL_ROP3_SHIFT);   // actual COPY, not present ROP3=0 CLEAR
         result.cx[p::CB_TARGET_MASK] = result.cx[p::CB_SHADER_MASK] = 15;
         result.cx[p::CB_COLOR0_BASE] = uint32_t(color.address >> 8u);
         result.cx[p::CB_COLOR0_BASE_EXT] = uint32_t(color.address >> 40u);

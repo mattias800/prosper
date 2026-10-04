@@ -100,6 +100,9 @@ void observe_original_fragment_planes() {
     // color readback already completes the same batch. Source/header/user values are real fixtures.
     CHECK(prosper::test::fragment_draw_observation_enabled(),
           "private-plane observation is armed before process start by CTest");
+    CHECK(!std::getenv("PROSPER_GEOM_PROBE") && !std::getenv("PROSPER_DRAW_ISO"),
+          "the dedicated process preserves the real collector's no-XFB/no-isolation recipe");
+    if (failures) return;
     prosper::gpu::DrawItem original;
     const bool realized = prosper::test::fragment_draw::realize(original);
     CHECK(realized && original.fragment_draw_inputs,
@@ -148,6 +151,11 @@ void observe_original_fragment_planes() {
 
 int main(int argc, char** argv) {
     std::printf("== test_render_diagnostic_paths ==\n");
+    if (argc == 2 && std::strcmp(argv[1], "--fragment-planes") == 0) {
+        observe_original_fragment_planes();
+        std::printf("== %s ==\n", failures ? "FAILED" : "PASSED");
+        return failures ? 1 : 0;
+    }
 
     // --- Arm 1: the arming predicate itself (no device, no render) ------------------------------
     CHECK(prosper::gpu::spirv_declares_xfb_capture(kXfbModule,
@@ -254,8 +262,6 @@ int main(int argc, char** argv) {
         CHECK(prosper::test::backend_depth_clear_probe_armed_count().load() > before_probe,
               "depth-clear diagnostic state was recorded for a draw");
     }
-
-    observe_original_fragment_planes();
 
     std::filesystem::remove_all(frame_dir, frame_dir_error);
     std::printf("== %s ==\n", failures ? "FAILED" : "PASSED");

@@ -95,9 +95,29 @@ TEST_F(FragmentScalarBankGpu, ThreeLogicalWavesUseOneRealBufferUploadAndAllRawCo
     static_assert(r::fragment_draw::width * r::fragment_draw::height == 3 * 64);
     ASSERT_NE(scene.descriptor[3], 0u)
         << "raw SMEM ignores format fields; identity still includes them";
+    const auto copy = state();
+    const auto copy_state = g::extract_render_state(copy);
+    ASSERT_TRUE(copy_state.has_cb_color_control);
+    ASSERT_EQ(copy_state.cb_color_control,
+              (p::CB_COLOR_CONTROL_MODE_NORMAL << p::CB_COLOR_CONTROL_MODE_SHIFT) |
+                  (0xccu << p::CB_COLOR_CONTROL_ROP3_SHIFT));
+    const auto copy_pipeline = g::resolve_pipeline_state(copy_state);
+    ASSERT_FALSE(copy_pipeline.logic_op_enable)
+        << "genuine COPY preserves ordinary blend and original nonzero pixel oracles";
+    ASSERT_EQ(copy_pipeline.color_write_mask, 15u);
+    auto clear = copy;
+    clear.cx[p::CB_COLOR_CONTROL] = p::CB_COLOR_CONTROL_MODE_NORMAL
+                                    << p::CB_COLOR_CONTROL_MODE_SHIFT;
+    const auto clear_state = g::extract_render_state(clear);
+    ASSERT_TRUE(clear_state.has_cb_color_control);
+    const auto clear_pipeline = g::resolve_pipeline_state(clear_state);
+    ASSERT_TRUE(clear_pipeline.logic_op_enable)
+        << "present ROP3=0 is genuine CLEAR, not an absent/default COPY control";
+    ASSERT_EQ(clear_pipeline.logic_op, uint32_t(VK_LOGIC_OP_CLEAR));
+    ASSERT_EQ(clear_pipeline.color_write_mask, copy_pipeline.color_write_mask);
     const auto observation = r::fragment_draw_observation_stats();
     const auto barriers = r::backend_host_read_barrier_count().load();
-    const auto raw = render(state());
+    const auto raw = render(copy);
     if (r::fragment_draw_observation_enabled()) {
         const auto after = r::fragment_draw_observation_stats();
         EXPECT_EQ(after.recorded - observation.recorded, 1u);
