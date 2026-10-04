@@ -9,6 +9,7 @@
 // renderer once the device is wired; tests call it with the offscreen renderer to verify the spine.
 #pragma once
 #include "gpu/execute/refused_shader_source.hpp"   // default original refused-shader evidence
+#include "gpu/execute/shader_source_window.hpp"
 #include "gpu/execute/graphics_execution_activity.hpp"
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include <map>
@@ -2274,12 +2275,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
     }
     auto bounded_shader_dwords = [&](uint64_t address, const AgcShaderHeader* header) -> size_t {
-        if (!address || !header || !header->shader_size) return 0;
-        const size_t dwords = std::min<size_t>(max_shader_dwords, header->shader_size / sizeof(uint32_t));
-        if (!dwords || dwords > UINT32_MAX / sizeof(uint32_t) ||
-            !guest_readable(address, static_cast<uint32_t>(dwords * sizeof(uint32_t))))
-            return 0;
-        return dwords;
+        return header ? shader_source_dwords(address, max_shader_dwords, header) : 0;
     };
     const size_t vertex_dwords = bounded_shader_dwords(rs.es_addr, vertex_header);
     const VertexPrologInfo vertex_prolog = rdna2_vertex_prolog_info(
@@ -2306,6 +2302,23 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fused_back->code))
         : rs.es_addr;
     const uint64_t vs_program_addr = vertex_chain ? rs.es_addr : fused_back_addr;
+    const auto* producer_header = vs_program_addr == rs.es_addr ? vertex_header : fused_back;
+    const auto* pixel_header =
+        static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(rs.ps_addr));
+    const size_t vs_program_dwords =
+        shader_source_dwords(vs_program_addr, max_shader_dwords, producer_header);
+    const size_t fragment_dwords =
+        shader_source_dwords(rs.ps_addr, max_shader_dwords, pixel_header);
+    if (!vs_program_dwords || !fragment_dwords) {
+        if (failure) {
+            failure->reason = RealizationFailureReason::MissingProgram;
+            add_stage_diagnostic(ShaderProgramStage::Vertex, vs_program_addr, {}, {});
+            add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, {}, {});
+        }
+        report_dropped_draw_target(rs.color0_base, "shader-source-window-unavailable",
+                                   rs.cb_target_mask, rs.cb_shader_mask);
+        return false;
+    }
     const bool owned_vertex = graphics_program_requires_owned_waves(vs_program_addr);
     const bool owned_fragment = graphics_program_requires_owned_waves(rs.ps_addr);
     std::shared_ptr<const GraphicsOwnedWaveDraw> owned_waves;
@@ -2394,11 +2407,9 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     pixel_inputs.valid_mask = rs.ps_input_cntl_valid_mask;
     bool interpolants_from_metadata = false;
     if (!pixel_inputs.valid_mask || pixel_inputs.ambiguous_passthrough_mask()) {
-        const auto* producer = vertex_chain ? chain_header : static_cast<const AgcShaderHeader*>(
-            prosper_agc_shader_header_for_code(vs_program_addr));
-        const auto* pixel = static_cast<const AgcShaderHeader*>(
-            prosper_agc_shader_header_for_code(rs.ps_addr));
-        const AgcPixelInputControls derived = derive_agc_pixel_input_controls(producer, pixel);
+        const auto* producer = vertex_chain ? chain_header : producer_header;
+        const AgcPixelInputControls derived =
+            derive_agc_pixel_input_controls(producer, pixel_header);
         PixelInputMapping metadata_inputs;
         metadata_inputs.controls = derived.controls;
         metadata_inputs.valid_mask = derived.valid_mask;
@@ -2438,24 +2449,25 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // address validation and the export mask retains its direct scan.
     static const bool reuse_fragment_analysis =
         !PROSPER_ENV_ON("PROSPER_NO_FRAGMENT_ANALYSIS_REUSE");
-    const SharedShaderAnalysis fragment_analysis = reuse_fragment_analysis && rs.ps_addr
-        ? acquire_shader_analysis(fragment_code, max_shader_dwords)
-        : SharedShaderAnalysis{};
+    const SharedShaderAnalysis fragment_analysis =
+        reuse_fragment_analysis && rs.ps_addr
+            ? acquire_shader_analysis(fragment_code, fragment_dwords)
+            : SharedShaderAnalysis{};
     if (rs.ps_addr) {
         if (fragment_analysis)
             apply_fragment_consumption_cached(pixel_inputs, fragment_analysis);
         else
-            apply_fragment_consumption_cached(pixel_inputs, fragment_code, max_shader_dwords);
+            apply_fragment_consumption_cached(pixel_inputs, fragment_code, fragment_dwords);
     }
     const PixelInputMapping* pixel_input_ptr = pixel_inputs.valid_mask ? &pixel_inputs : nullptr;
     PixelSystemInputMapping system_inputs{rs.ps_input_ena, rs.ps_input_addr};
     const PixelSystemInputMapping* system_input_ptr =
         (system_inputs.ena || system_inputs.addr) ? &system_inputs : nullptr;
-    const FragmentInterpolationLayout interpolation = fragment_analysis
-        ? fragment_interpolation_layout_cached(
-              fragment_analysis, system_input_ptr, pixel_input_ptr)
-        : fragment_interpolation_layout_cached(
-              fragment_code, max_shader_dwords, system_input_ptr, pixel_input_ptr);
+    const FragmentInterpolationLayout interpolation =
+        fragment_analysis ? fragment_interpolation_layout_cached(fragment_analysis,
+                                                                 system_input_ptr, pixel_input_ptr)
+                          : fragment_interpolation_layout_cached(fragment_code, fragment_dwords,
+                                                                 system_input_ptr, pixel_input_ptr);
     const bool capture_vertex_position = PROSPER_ENV_ON("PROSPER_GEOM_PROBE") &&
                                          !interpolation.requires_geometry &&
                                          !rect_list_synthesis;
@@ -2487,13 +2499,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         else
             vs_shared = recompile_graphics_shader_cached_shared(
                 ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
-                max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity, false,
+                vs_program_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity, false,
                 vertex_lds_dwords, capture_vertex_position, {}, {}, float_transport, {}, {},
                 &vs_original);
         if (!owned_fragment)
             fs_shared = recompile_graphics_shader_cached_shared(
                 ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-                max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
+                fragment_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
                 rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode, float_transport,
                 rs.ps_float_flags, rs.ps_launch_rsrc1, &fs_original);
     } else {
@@ -2510,14 +2522,14 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         } else {
             vs = recompile_graphics_shader_cached(
                 ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
-                max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity, false,
+                vs_program_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity, false,
                 vertex_lds_dwords, capture_vertex_position, {}, {}, float_transport, {}, {},
                 &vs_original);
         }
         if (!owned_fragment)
             fs = recompile_graphics_shader_cached(
                 ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-                max_shader_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
+                fragment_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
                 rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode, float_transport,
                 rs.ps_float_flags, rs.ps_launch_rsrc1, &fs_original);
     }
@@ -2538,7 +2550,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                               return shader_analysis_has_prefix(fragment_analysis, helper.words,
                                                                 helper.dwords);
                           })
-            : prosper::gpu::is_agc_dcc_helper_program(fragment_code, max_shader_dwords);
+            : prosper::gpu::is_agc_dcc_helper_program(fragment_code, fragment_dwords);
     const bool dcc_decompress = dcc_helper_program &&
         PM4_FIELD(rs.cb_color_control, CB_COLOR_CONTROL, MODE) ==
             prosper::agc::Pm4::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS;
@@ -2596,10 +2608,18 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             snprintf(fn, sizeof fn, "%s/vs_%d_%llx.spv", dd, nd, (unsigned long long)vs_program_addr);
             if (FILE* f = fopen(fn, "wb")) { fwrite(vs_words.data(), 4, vs_words.size(), f); fclose(f); }
             snprintf(fn, sizeof fn, "%s/vs_%d_%llx.bin", dd, nd, (unsigned long long)vs_program_addr);
-            if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)vs_program_addr, 1, 4096, f); fclose(f); }
+            if (FILE* f = fopen(fn, "wb")) {
+                fwrite((const void*)(uintptr_t)vs_program_addr, sizeof(uint32_t),
+                       std::min(vs_program_dwords, size_t(1024)), f);
+                fclose(f);
+            }
             // Also dump the paired PS raw RDNA2 (the recompile-guard fixture needs both stages, #228).
             snprintf(fn, sizeof fn, "%s/ps_%d_%llx.bin", dd, nd, (unsigned long long)rs.ps_addr);
-            if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)rs.ps_addr, 1, 4096, f); fclose(f); }
+            if (FILE* f = fopen(fn, "wb")) {
+                fwrite((const void*)(uintptr_t)rs.ps_addr, sizeof(uint32_t),
+                       std::min(fragment_dwords, size_t(1024)), f);
+                fclose(f);
+            }
             nd++;
         }
     }
@@ -2676,10 +2696,10 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                     (unsigned long long)reject_occurrence);
         if (const char* dd = PROSPER_ENV_VALUE("PROSPER_SHADER_DUMP")) {
             for (auto [tag, addr] : {std::pair{"vs", vs_program_addr}, std::pair{"ps", rs.ps_addr}}) {
-                if (!addr || !guest_readable(addr, sizeof(uint32_t))) continue;
+                const size_t source_dwords = native_shader_source_dwords(addr, max_shader_dwords);
+                if (!source_dwords) continue;
                 const size_t dump_dwords = rdna2_recompile_code_span(
-                    reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(addr)),
-                    max_shader_dwords);
+                    reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(addr)), source_dwords);
                 const size_t dump_bytes = dump_dwords * sizeof(uint32_t);
                 if (!dump_bytes || !guest_readable(addr, static_cast<uint32_t>(dump_bytes))) continue;
                 char fn[512];
@@ -2713,7 +2733,9 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                     (unsigned long long)rs.stencil_read_base,
                     (unsigned long long)rs.stencil_write_base);
             for (auto [tag, addr] : {std::pair{"vs", vs_program_addr}, std::pair{"ps", rs.ps_addr}}) {
-                RecompileCoverage c = recompile_coverage((const uint32_t*)(uintptr_t)addr, max_shader_dwords);
+                RecompileCoverage c =
+                    recompile_coverage((const uint32_t*)(uintptr_t)addr,
+                                       native_shader_source_dwords(addr, max_shader_dwords));
                 fprintf(stderr, "[exec]   %s coverage: total=%u alu=%u exp=%u tabledep=%u unsupported=%u "
                                 "first_bad fmt=%d op=0x%x\n", tag, c.total, c.alu, c.exports,
                         c.table_dependent, c.unsupported, c.first_bad_fmt, c.first_bad_op);
@@ -2755,8 +2777,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     static_assert(kFragmentColorOutputs == kColorTargetCount,
                   "fragment colour outputs must cover every render-state colour target");
     const uint32_t exp_mask = fragment_analysis
-        ? fragment_color_export_mask_cached(fragment_analysis)
-        : fragment_color_export_mask(fragment_code, max_shader_dwords);
+                                  ? fragment_color_export_mask_cached(fragment_analysis)
+                                  : fragment_color_export_mask(fragment_code, fragment_dwords);
     for (uint32_t slot = 0; slot < ps.color_targets.size(); ++slot)
         ps.color_targets[slot].write_mask &= (exp_mask >> (slot * 4u)) & 0xFu;
     ps.color_write_mask = ps.color_targets[0].write_mask;
@@ -3066,7 +3088,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             fflush(stderr);
             if (const char* dd = getenv("PROSPER_FRAME_DIR")) {
                 char fn[512]; snprintf(fn, sizeof fn, "%s/caption_vs_%llx.bin", dd, (unsigned long long)rs.es_addr);
-                if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)rs.es_addr, 1, 8192, f); fclose(f); }
+                if (FILE* f = fopen(fn, "wb")) {
+                    fwrite((const void*)(uintptr_t)rs.es_addr, sizeof(uint32_t),
+                           native_shader_source_dwords(rs.es_addr,
+                                                       std::min(max_shader_dwords, size_t(2048))),
+                           f);
+                    fclose(f);
+                }
                 // The RECOMPILED VS SPIR-V — disassemble offline (spirv-dis) to trace the gl_Position export
                 // op-by-op against the RDNA2 source and find the mis-modeled op / bad matrix input. #257.
                 snprintf(fn, sizeof fn, "%s/caption_recompiled_%llx.spv", dd, (unsigned long long)rs.es_addr);
@@ -3076,7 +3104,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 snprintf(fn, sizeof fn, "%s/caption_ps_%llx.spv", dd, (unsigned long long)rs.ps_addr);
                 if (FILE* f = fopen(fn, "wb")) { fwrite(fs_words.data(), 4, fs_words.size(), f); fclose(f); }
                 snprintf(fn, sizeof fn, "%s/caption_ps_raw_%llx.bin", dd, (unsigned long long)rs.ps_addr);
-                if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)rs.ps_addr, 1, 8192, f); fclose(f); }
+                if (FILE* f = fopen(fn, "wb")) {
+                    fwrite((const void*)(uintptr_t)rs.ps_addr, sizeof(uint32_t),
+                           std::min(fragment_dwords, size_t(2048)), f);
+                    fclose(f);
+                }
             }
         }
     }

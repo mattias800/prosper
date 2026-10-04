@@ -1,6 +1,7 @@
 #include "gpu/execute/shader_cache_internal.hpp"
 #include "gpu/execute/refused_shader_source.hpp"
 #include "gpu/execute/compute_program_facts.hpp"
+#include "gpu/execute/shader_source_window.hpp"
 
 #include <cstdio>
 #include <tuple>
@@ -26,13 +27,14 @@ void note_refused_draw_shaders(const RefusedDrawShaders& shaders) {
         // Pre-key guards have no compile-key owner. Observe their original readable program
         // through the same existing bounded analysis cache, not a guessed address generation.
         if (!original.words) {
-            if (!shaders.max_dwords || !guest_readable(address, sizeof(uint32_t))) continue;
+            const size_t source_dwords = native_shader_source_dwords(address, shaders.max_dwords);
+            if (!source_dwords) continue;
             original = shader_analysis_refused_source(
                 tag[0] == 'p' && shaders.ps_analysis
                     ? shaders.ps_analysis
                     : acquire_shader_analysis(
                           reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(address)),
-                          shaders.max_dwords));
+                          source_dwords));
         }
         if (refused_shader_already_noted(tag, original)) continue;
         char detail[160];
