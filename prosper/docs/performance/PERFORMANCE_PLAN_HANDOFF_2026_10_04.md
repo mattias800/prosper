@@ -12,13 +12,14 @@ again before resuming, because this document deliberately records a dated state.
 **Latest steering:** the owner confirms manual Cross input in Evergate OFF and Messenger earlier.
 Messenger's exact earlier run/source/arm is unbound. Retained native images and visual judgments
 remain useful. Evergate's logged route now reached its menu and real tutorial in two fresh OFF
-runs; the replay captured two tutorial frames and matching composed-input intervals. ON is pending.
+runs and an ON counterpart, with matching recorded input intervals. Its shader-refusal rendering
+HOLD remains visible. Two of fourteen original phase comparisons are documented, twelve remain.
 Performance measurements must use a verified scripted route and matching admitted scenes;
 explicitly selected splash/title populations must stay separate from in-level gameplay.
 
 | Original item | Checkpoint | Work remaining |
 | --- | --- | --- |
-| [#3948 async submission](https://github.com/mattias800/prosper/issues/3948) | Measurement/Stage 0 and opt-in Stage 2 are merged. **Default remains OFF.** Historical GTA collapse investigation, normal-app A/B observations and apparatus limitations are documented. The ee9dcb1e normal app is qualified; Messenger's OFF/ON visual pair is complete. | Finish the remaining thirteen original title pairs and the larger repeated current-cohort GTA/Sonic A/B. Preserve rendering holds and refuse unsupported default claims. |
+| [#3948 async submission](https://github.com/mattias800/prosper/issues/3948) | Measurement/Stage 0 and opt-in Stage 2 are merged. **Default remains OFF.** Historical GTA collapse investigation, normal-app A/B observations and apparatus limitations are documented. The ee9dcb1e normal app is qualified; Messenger's visual pair and Evergate's scripted menu/tutorial pair are documented. Evergate retains a fragment-rendering HOLD. | Finish the remaining twelve original phase comparisons, resolve or retain rendering holds, and run the larger repeated current-cohort GTA/Sonic A/B with verified scripted controls. Refuse unsupported default claims. |
 | [#3951 raw x4/x8 scalar backing](https://github.com/mattias800/prosper/issues/3951) | Original backing work landed through #3987, #4104 and #4270. Broader original scalar-buffer/Wave64 integration #4374 also merged on October 4. | Do not restart the completed original backing task. Normal-game effects of the newly merged integration still need current-app evidence; Windows/Kena work is a separate lane. |
 | [#3892 renderer state/image-branch work](https://github.com/mattias800/prosper/issues/3892) | Original registration-owned state and image-branch work completed. | No unfinished original unit is claimed here. Consult later issue comments for separate follow-ups. |
 | [#3891 performance alarms](https://github.com/mattias800/prosper/issues/3891) | Original accepted alarm proposals and review nits completed. | Read raw alarms and exit summaries on every new run; propose a new rule only for an actual uncovered engine problem. |
@@ -276,28 +277,64 @@ same route and 230 s ceiling, requesting 7000 and 7300 instead of the unreached 
 ON. Inspect the actual menu, two Ki/tutorial frames and final input records in each arm. This is
 compatibility calibration, not a performance population or grounds for changing defaults.
 
-## Evergate unchanged OFF replay: two tutorial frames, ON pending
+## Evergate unchanged OFF/ON replay: progression checked, rendering HOLD
 
 A fresh OFF replay used the same route/app/source, isolated state, 230 s ceiling and budgets,
 with the corrected nearby gameplay selector. Actual duration was **230.550 s**; root inspected
-title500/500, Begin/Options900/901, publisher ident1800/1800, and Ki/tutorial/HOLD X TO JUMP HIGHER
-at7000/7000 and7300/7300. All twelve Cross press/release pairs completed and the final successful-
+title 500/500, Begin/Options 900/901, publisher ident 1800/1800, and Ki/tutorial/HOLD X TO JUMP HIGHER
+at 7000/7000 and 7300/7300. All twelve Cross press/release pairs completed and the final successful-
 pad-read intervals exactly matched their logged read endpoints, with no extra nonneutral interval.
 This repeats scripted menu/tutorial progression; it does not establish equal internal state or
 controlled movement. Earlier manually assisted runs remain separate.
 
 Actual app/runner/launcher exits were **0**, all owned births drained, and the post-run prosper-app
 census was empty. Every emitted alarm and exit summary was read: **5990 frontend fragment drops**
-and matching Wave64 refusal uses across37/45 windows, F32 arithmetic45/45, one new unimplemented
-HLE at25s, and RTT-colorless NO_DATA. Backend/contract losses, skipped dispatches and target
+and matching Wave64 refusal uses across 37/45 windows, F32 arithmetic 45/45, one new unimplemented
+HLE at 25 s, and RTT-colorless NO_DATA. Backend/contract losses, skipped dispatches and target
 evictions were zero. Two actual graphics submission-failure records are explicit
 `submit-origin=shutdown-gate-refused` sentinels; neither establishes driver device loss.
 
 The private OFF replay archive was verified and fsynced: **70,369,280 bytes**, **1772 regular
 members**, zero mismatches; SHA256
 **728bd0ebe5dc33bc3a86ae2d58a31f4270580e4f05766d47201c5bce2b979d31**.
-There are now three inspected visual arms and one complete original title pair. Evergate ON is
-the next bounded step; baseline shader losses remain a rendering HOLD. No performance is admitted.
+At that checkpoint there were three inspected visual arms and one complete original title pair.
+
+The fresh ON counterpart then completed in **230.613 s**, with the same exact route, app/source,
+helper family, native rendering, budgets and 230 s ceiling. Its five actual native captures were
+500, 900, 1800, 7000 and 7300: title, selectable menu, publisher ident and two real Ki/tutorial
+frames, all root-inspected. All twelve Cross press/release pairs completed and the final composed
+successful-pad-read record exactly matched their logged endpoints. After normalizing only isolated
+run-root and input-record output paths, the actual PROSPER environment differs solely in deferred
+waits 0/1. Different animation/camera framing remains visible; equal internal state is not proved.
+
+| Completed-window observation | OFF | ON |
+| --- | --- | --- |
+| Ledger windows | 45 | 45 |
+| Frontend fragment drops / Wave64 refusal uses | 5990 / 5990 | 6152 / 6152 |
+| Deferred submissions / blocked deferrals | 0 / 0 | 31013 / 11145 |
+| Graphics device-time pairs / waits | 38093 / 38093 | 38906 / 38906 |
+| Contract/backend losses, skipped dispatches, target evictions | All zero | All zero |
+
+These are unfiltered diagnostic totals, not a performance comparison. ON app/runner/launcher
+exited **0**, 23 owned window samples plus one startup sample and an owned before-cutoff sample
+were retained, and both owned births drained. The post-run prosper-app census was empty. All
+emitted alarms and exit summaries were read: F32 arithmetic 45/45, dropped-draw/Wave64 rules
+37/45, one new unimplemented HLE at 30 s, RTT-colorless NO_DATA. ON emitted no graphics submission
+failure. Backend-disposition's separate zero-drop snapshot remains unverified and does not cancel
+frontend losses.
+
+Both arms retained the **same refused original fragment bytes**, SHA256
+**68876b99f93a8ae3d86e069b0885d4bf6287eb6fd31ffbc867eaaf21f8c7f9a4**.
+The refusal was observed with deferred waits OFF as well as ON; this is not a healthy-rendering
+approval or grounds to bypass the shader path. The completed pair supplement was verified and
+fsynced: **128,296,960 bytes**, **3490 regular members**, zero mismatches; SHA256
+**a09a8c1f2f5c4ac93b5f169cd8ba667288d8be4b3d0f9e0ab19d4c39293b88c0**.
+
+**Four phase-observed arms / two of fourteen title pairs** are now documented: Messenger's visual
+pair and Evergate's scripted phase comparison with a rendering HOLD. Twelve phase pairs remain,
+with only Messenger currently free of counted draw/dispatch losses in these observations. Next:
+Dead Cells route calibration using script-edge logs and composed-input recording. Messenger still
+needs a scripted replay before timed performance use. The repeated GTA/Sonic campaign is pending.
 
 ## Input control required for performance admission
 
@@ -312,6 +349,8 @@ needs manual rescue disqualifies an arm from a controlled A/B; preserve its arti
 the affected arm with calibrated controls. A missing or unmatched phase remains NO_DATA, never a
 title-screen substitute for gameplay. Manual GRIS and candidates with no verified gamepad sequence
 can contribute visual observations; timed comparisons require a reproducible scripted route first.
+The existing recorder flushes completed intervals; a button still held at process termination can
+be absent from its tail. Matching recorded intervals do not prove complete physical-input exclusion.
 
 ## Retained app/source cohorts
 
@@ -424,10 +463,11 @@ Preserve the original helper and failed run unchanged. Fresh complete OFF and ON
 same reviewed successor, distinct unused output directories, fresh saves/caches, and a fresh
 native desktop binding. Do not rerun the known-overflow original helper.
 
-## Original fourteen-title visual inventory: one current pair complete
+## Original fourteen-title visual inventory: two phase pairs documented
 
-The ee9dcb1e app is qualified and Messenger's OFF/ON pair is complete as recorded above. The other
-thirteen pairs remain pending. The table retains the original candidate controls for all titles;
+The ee9dcb1e app is qualified; Messenger's visual pair and Evergate's scripted phase pair are
+recorded above. Evergate retains its fragment/Wave64 rendering HOLD. The other twelve pairs remain
+pending. The table retains the original candidate controls for all titles;
 it is not a claim that every candidate ordinal reached its proposed phase.
 
 Exactly thirteen automatic gameplay profiles plus manual GRIS belong to this original inventory.
@@ -488,9 +528,9 @@ historical sky seam/HUD/partial-model rendering HOLD remains a hold until curren
    result into a passing manifest. Preserve the initial failed 70-case cohort and old apps.
 5. Messenger OFF/ON visual evidence is complete on ee9dcb1e; scripted progression still needs
    verification before performance use. Evergate's first new route calibration reached the menu
-   and one Ki/tutorial frame, then fresh OFF replay captured both 7000/7300. Run corresponding ON,
-   checking the final
-   input record and two actual gameplay frames. Qualify fresh native desktop/env/window
+   and one Ki/tutorial frame, then fresh OFF and ON captured both 7000/7300 with matching recorded
+   input. Keep the fragment-rendering HOLD; continue with Dead Cells route calibration and the other
+   twelve phase comparisons. Qualify fresh native desktop/env/window
    binding and bind the exact reviewed helper hashes and actual app/source. The 3fe preparation contains inert
    candidate data only: no app qualification, executable grant or completed current guard.
 6. Continue the fourteen-title pairs above, recording native menu/gameplay/HUD judgments,
