@@ -154,8 +154,8 @@ inline std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2I
             // covers VGPRs) — on hardware the skipped block would have preserved VCC/the SGPR:
             //   VOP1 0x02 v_readfirstlane_b32 (writes an SGPR), VOP2 0x28-0x2A carry ops (write VCC),
             //   VOP3B 0x128-0x12A and 0x30F/0x310/0x319 (write the carry-out SGPR pair/VCC), and
-            //   VOP3B v_mad_u64_u32 0x176 (its 65th-bit carry mask also lands in VCC/an SGPR pair
-            //   unpredicated).
+            //   VOP3B v_mad_u64_u32 0x176 / v_mad_i64_i32 0x177 (the 65th-bit carry mask also lands
+            //   in VCC/an SGPR pair unpredicated).
             const bool scalar_side_effect =
                 (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02) ||
                 (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28 && in.opcode <= 0x2A) ||

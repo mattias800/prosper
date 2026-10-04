@@ -11038,6 +11038,127 @@ int main() {
     CHECK(gotT11e.size()==N && badT11e==0,
           "T11e: v_bcnt_u32_b32 adds the exact 32-bit population count");
 
+    // Tperm: v_perm_b32 byte permutation execution coverage.
+    // Inputs: S0 = 0x7F448022 (high), S1 = 0x80337F11 (low).
+    // Tests exact selector categories (0..7 direct byte picks, 8..11 sign bit replicates of bytes 1,3,5,7,
+    // 12 -> 0x00, 13..255 -> 0xFF), plus dynamic per-lane selector.
+    const uint32_t codeTperm[] = {
+        0x7e0202ffu, 0x7f448022u,   // v_mov_b32 v1, 0x7F448022 (S0)
+        0x7e0402ffu, 0x80337f11u,   // v_mov_b32 v2, 0x80337F11 (S1)
+        0xd7440003u, 0x04020501u,   // v_perm_b32 v3, v1, v2, v0 (S2 from v0 input)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTperm =
+        recompile_valu(codeTperm, std::size(codeTperm), 1, /*out_vgpr*/ 3);
+    CHECK(!spvTperm.empty(), "recompiled Tperm (v_perm_b32 dynamic selector) -> SPIR-V");
+
+    // Form inputs for 64 lanes testing specific vectors:
+    // lane 0: 0x03020100 -> 0x80337F11
+    // lane 1: 0x07060504 -> 0x7F448022
+    // lane 2: 0x0B0A0908 -> 0x00FFFF00
+    // lane 3: 0x0D0C0E0F -> 0xFF00FFFF
+    // lane 4: 0x10FF0C01 -> 0xFFFF007F
+    // lane 5: 0x04000703 -> 0x22117F80
+    std::vector<float> inPerm(N, 0.0f);
+    std::vector<uint32_t> expPerm(N, 0);
+    const struct {
+        uint32_t sel;
+        uint32_t exp;
+    } kPermCases[] = {
+        {0x03020100u, 0x80337F11u}, {0x07060504u, 0x7F448022u}, {0x0B0A0908u, 0x00FFFF00u},
+        {0x0D0C0E0Fu, 0xFF00FFFFu}, {0x10FF0C01u, 0xFFFF007Fu}, {0x04000703u, 0x22117F80u},
+    };
+    for (uint32_t i = 0; i < N; ++i) {
+        const auto& c = kPermCases[i % std::size(kPermCases)];
+        inPerm[i] = std::bit_cast<float>(c.sel);
+        expPerm[i] = c.exp;
+    }
+    std::vector<float> gotTperm = prosper::test::run_compute(spvTperm, inPerm, N, N);
+    uint32_t badTperm = 0;
+    for (uint32_t i = 0; i < N && gotTperm.size() == N; ++i) {
+        if (bits_of(gotTperm[i]) != expPerm[i]) ++badTperm;
+    }
+    CHECK(gotTperm.size() == N && badTperm == 0,
+          "Tperm: v_perm_b32 correctly handles all selector categories (0..7, 8..11, 12, 13..255)");
+
+    // Tdiv_fixup: v_div_fixup_f32 IEEE 754 division corner case execution coverage.
+    // S0 = quotient, S1 = denominator, S2 = numerator.
+    // Tests bit-exact outputs across:
+    //   - pass-through: (2.0, 1.0, 2.0) -> 2.0; (2.0, -1.0, 2.0) -> -2.0; (-2.0, 1.0, 2.0) -> 2.0
+    //   - 0/0 -> 0xffc00000; inf/inf -> 0xffc00000
+    //   - x/0 -> signed inf; inf/y -> signed inf
+    //   - x/inf -> signed zero; 0/y -> signed zero
+    //   - NaN priority: S2 quieted NaN wins over S1 quieted NaN
+    //   - Exponent underflow: (exp(S2) - exp(S1)) < -150 -> signed zero
+    // Dynamic execution drives inputs via v0, v1, v2.
+    // llvm-mc gfx1030: v_div_fixup_f32 v3, v0, v1, v2 is [0x03,0x00,0x5f,0xd5,0x00,0x03,0x0a,0x04]
+    const uint32_t codeTdivFixup[] = {
+        0xd55f0003u,
+        0x040a0300u,   // v_div_fixup_f32 v3, v0, v1, v2 (src0=v0, src1=v1, src2=v2)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTdivFixup =
+        recompile_valu(codeTdivFixup, std::size(codeTdivFixup), 3, /*out_vgpr*/ 3);
+    CHECK(!spvTdivFixup.empty(), "recompiled TdivFixup (v_div_fixup_f32) -> SPIR-V");
+
+    const struct {
+        uint32_t s0;
+        uint32_t s1;
+        uint32_t s2;
+        uint32_t exp;
+    } kDivFixupCases[] = {
+        // pass-through: abs(s0) with sign(s1)^sign(s2)
+        {0x40000000u, 0x3f800000u, 0x40000000u, 0x40000000u},   // (2.0, 1.0, 2.0) -> 2.0
+        {0x40000000u, 0xbf800000u, 0x40000000u, 0xc0000000u},   // (2.0, -1.0, 2.0) -> -2.0
+        {0xc0000000u, 0x3f800000u, 0x40000000u, 0x40000000u},   // (-2.0, 1.0, 2.0) -> 2.0
+        // 0/0 and inf/inf -> 0xffc00000 (indeterminate NaN)
+        {0x3f800000u, 0x00000000u, 0x80000000u, 0xffc00000u},   // (1.0, +0, -0) -> 0xffc00000
+        {0x3f800000u, 0xff800000u, 0x7f800000u, 0xffc00000u},   // (1.0, -inf, +inf) -> 0xffc00000
+        // x/0 and inf/y -> signed inf
+        {0x3f800000u, 0x80000000u, 0x3f800000u, 0xff800000u},   // (1.0, -0.0, 1.0) -> -inf
+        {0x3f800000u, 0x40000000u, 0x7f800000u, 0x7f800000u},   // (1.0, 2.0, +inf) -> +inf
+        // x/inf and 0/y -> signed zero
+        {0x3f800000u, 0xff800000u, 0x3f800000u,
+         0x80000000u},   // (1.0, -inf, 1.0) -> -0.0 (0x80000000)
+        {0x3f800000u, 0x40400000u, 0x80000000u,
+         0x80000000u},   // (1.0, 3.0, -0.0) -> -0.0 (0x80000000)
+        // NaN priority: quiet(S2) wins over quiet(S1)
+        {0x3f800000u, 0x3f800000u, 0x7f800001u,
+         0x7fc00001u},   // S2=0x7f800001 -> quiet(S2)=0x7fc00001
+        {0x3f800000u, 0xff800005u, 0x3f800000u,
+         0xffc00005u},   // S1=0xff800005 -> quiet(S1)=0xffc00005
+        {0x3f800000u, 0xff800005u, 0x7f800001u, 0x7fc00001u},   // both NaN -> quiet(S2)
+        // NaN numerator over a zero denominator: (1.0, +0.0, 0x7f800001) -> 0x7fc00001
+        {0x3f800000u, 0x00000000u, 0x7f800001u, 0x7fc00001u},
+        // Exponent underflow exact boundary pair:
+        // S1=0x4b800000 (exp 151), S2=0x00800000 (exp 1) -> diff = -150: passes S0 through (1.0)
+        {0x3f800000u, 0x4b800000u, 0x00800000u, 0x3f800000u},
+        // S1=0x4c000000 (exp 152), S2=0x00800000 (exp 1) -> diff = -151: underflow -> signed zero (+0.0)
+        {0x3f800000u, 0x4c000000u, 0x00800000u, 0x00000000u},
+        // Negative-sign underflow: S1=0xcc000000 (-exp 152), S2=0x00800000 (+exp 1) -> diff = -151 -> -0.0 (0x80000000)
+        {0x3f800000u, 0xcc000000u, 0x00800000u, 0x80000000u},
+        // S2=2^-126 (0x00800000, exp=1), S1=2^126 (0x7e800000, exp=253) -> diff = -252 < -150
+        {0x00000001u, 0x7e800000u, 0x00800000u, 0x00000000u},   // underflow -> signed zero (+0.0)
+    };
+
+    std::vector<float> inDivFixup(N * 3, 0.0f);
+    std::vector<uint32_t> expDivFixup(N, 0);
+    for (uint32_t i = 0; i < N; ++i) {
+        const auto& c = kDivFixupCases[i % std::size(kDivFixupCases)];
+        inDivFixup[i * 3 + 0] = std::bit_cast<float>(c.s0);
+        inDivFixup[i * 3 + 1] = std::bit_cast<float>(c.s1);
+        inDivFixup[i * 3 + 2] = std::bit_cast<float>(c.s2);
+        expDivFixup[i] = c.exp;
+    }
+    std::vector<float> gotTdivFixup = prosper::test::run_compute(spvTdivFixup, inDivFixup, N, N);
+    uint32_t badTdivFixup = 0;
+    for (uint32_t i = 0; i < N && gotTdivFixup.size() == N; ++i) {
+        if (bits_of(gotTdivFixup[i]) != expDivFixup[i]) ++badTdivFixup;
+    }
+    CHECK(gotTdivFixup.size() == N && badTdivFixup == 0,
+          "TdivFixup: v_div_fixup_f32 correctly computes IEEE 754 division corner cases and "
+          "underflow");
+
     // Worms Armageddon (PPSA20052) rejects every one of its vertex shaders at pc=7 on VOP3 0x15d
     // (v_sad_u32). Its shipped .ags shader assets carry the identical word, so the encoding is
     // independently attested. D.u32 = abs(S0.u32 - S1.u32) + S2.u32 — an UNSIGNED magnitude, which
@@ -11192,52 +11313,70 @@ int main() {
     CHECK(gotT11f.size()==N && badT11f==0,
           "T11f: v_mad_u64_u32 writes exact low/high words and carry-out");
 
-    // T11f_signed: v_mad_i64_i32 (0x177). Exercise signed 64-bit multiply-accumulate and bit-64 carry.
-    // Case 1: -1 * 1 + 0 -> D = 0xffffffff_ffffffff, carry 1 (bit 64 of signed 65-bit sum).
-    //   Low: 0xffffffff, High: 0xffffffff, Carry: 1.
-    // Case 2: 0x80000000 * 0x80000000 + 0x80000000_00000000 -> D = 0xc0000000_00000000, carry 1.
-    // Case 3: 0x7fffffff * 0x7fffffff + 0x7fffffff_ffffffff -> D = 0xbfffffff_00000000, carry 0.
-    // Case 4: 2 * 3 + (-1 as inline i64) -> D = 5, carry 0.
-    const uint32_t codeT11f_signed[] = {
-        0xd5776a05u, 0x04080300u,   // v_mad_i64_i32 v[5:6], vcc, v0, v1, v[2:3]
-        0x7e000280u,   // v_mov_b32 v0, 0
-        0x7e020281u,   // v_mov_b32 v1, 1
-        0x02000001u,   // v_cndmask_b32 v0, v0, v1, vcc (v0 = carry)
+    // T11f_signed: v_mad_i64_i32 (VOP3B 0x177):
+    //   {carry, D.i64} = 65'(S0.i32 * S1.i32) + 65'(S2.i64), carry = bit 64 of that sum.
+    // Inputs v0 = S0, v1 = S1, v[2:3] = S2; three programs read D.lo (v5), D.hi (v6) and the
+    // carry (v0 via cndmask). Expected values come from a host model of that definition.
+    // Each of these slips changes at least one case: zero-extending the product (cases 0, 4,
+    // 5), zero-extending the addend (1, 3), dropping S2's high dword (1, 2, 3, 5), and an
+    // unsigned carry out of bit 63 instead of bit 64 (0, 1, 3, 4, 5).
+    //   llvm-mc gfx1030: d5776a05 040a0300 = v_mad_i64_i32 v[5:6], vcc, v0, v1, v[2:3];
+    //   02000300 = v_cndmask_b32 v0, v0, v1, vcc.
+    const struct {
+        uint32_t s0, s1, s2_lo, s2_hi, d_lo, d_hi, carry;
+    } kMadI64Cases[] = {
+        {0xffffffffu, 0x00000001u, 0x00000000u, 0x00000000u, 0xffffffffu, 0xffffffffu, 1u},
+        {0x80000000u, 0x80000000u, 0x00000000u, 0x80000000u, 0x00000000u, 0xc0000000u, 1u},
+        {0x7fffffffu, 0x7fffffffu, 0xffffffffu, 0x7fffffffu, 0x00000000u, 0xbfffffffu, 0u},
+        {0x00000002u, 0x00000003u, 0xffffffffu, 0xffffffffu, 0x00000005u, 0x00000000u, 0u},
+        {0xfffffffbu, 0x00000007u, 0x00000010u, 0x00000000u, 0xffffffedu, 0xffffffffu, 1u},
+        {0x00003039u, 0xfffffffeu, 0x00000000u, 0x00000001u, 0xffff9f8eu, 0x00000000u, 0u},
+    };
+    std::vector<float> inMadI64(N * 4, 0.0f);
+    for (uint32_t i = 0; i < N; ++i) {
+        const auto& c = kMadI64Cases[i % std::size(kMadI64Cases)];
+        inMadI64[i * 4 + 0] = std::bit_cast<float>(c.s0);
+        inMadI64[i * 4 + 1] = std::bit_cast<float>(c.s1);
+        inMadI64[i * 4 + 2] = std::bit_cast<float>(c.s2_lo);
+        inMadI64[i * 4 + 3] = std::bit_cast<float>(c.s2_hi);
+    }
+    const uint32_t codeT11fSignedD[] = {
+        0xd5776a05u,
+        0x040a0300u,   // v_mad_i64_i32 v[5:6], vcc, v0, v1, v[2:3]
         0xbf810000u,
     };
-    std::vector<uint32_t> spvT11f_signed =
-        recompile_valu(codeT11f_signed, std::size(codeT11f_signed), 4, /*out_vgpr*/ 0);
-    CHECK(!spvT11f_signed.empty(), "recompiled T11f_signed (v_mad_i64_i32 VOP3B) -> SPIR-V");
-
-    const struct {
-        int32_t s0;
-        int32_t s1;
-        uint32_t s2_lo;
-        uint32_t s2_hi;
-        uint32_t exp_carry;
-    } kMadCases[] = {
-        {-1, 1, 0x00000000u, 0x00000000u, 1u},
-        {(int32_t)0x80000000u, (int32_t)0x80000000u, 0x00000000u, 0x80000000u, 1u},
-        {0x7fffffff, 0x7fffffff, 0xffffffffu, 0x7fffffffu, 0u},
-        {2, 3, 0xffffffffu, 0xffffffffu, 0u},
+    const uint32_t codeT11fSignedCarry[] = {
+        0xd5776a05u, 0x040a0300u,   // v_mad_i64_i32 v[5:6], vcc, v0, v1, v[2:3]
+        0x7e000280u,   // v_mov_b32 v0, 0
+        0x7e020281u,   // v_mov_b32 v1, 1
+        0x02000300u,   // v_cndmask_b32 v0, v0, v1, vcc (v0 = carry)
+        0xbf810000u,
     };
-    std::vector<float> inMad(N * 4, 0.0f);
-    std::vector<uint32_t> expCarry(N, 0);
-    for (uint32_t i = 0; i < N; ++i) {
-        const auto& c = kMadCases[i % std::size(kMadCases)];
-        inMad[i * 4 + 0] = float_of((uint32_t)c.s0);
-        inMad[i * 4 + 1] = float_of((uint32_t)c.s1);
-        inMad[i * 4 + 2] = float_of(c.s2_lo);
-        inMad[i * 4 + 3] = float_of(c.s2_hi);
-        expCarry[i] = c.exp_carry;
+    const struct {
+        const uint32_t* code;
+        size_t words;
+        int out_vgpr;
+        const char* what;
+    } kMadI64Outputs[] = {
+        {codeT11fSignedD, std::size(codeT11fSignedD), 5, "D.lo"},
+        {codeT11fSignedD, std::size(codeT11fSignedD), 6, "D.hi"},
+        {codeT11fSignedCarry, std::size(codeT11fSignedCarry), 0, "carry"},
+    };
+    for (int out = 0; out < 3; ++out) {
+        const auto& o = kMadI64Outputs[out];
+        std::vector<uint32_t> spv = recompile_valu(o.code, o.words, 4, o.out_vgpr);
+        CHECK(!spv.empty(), "recompiled T11f_signed (v_mad_i64_i32 VOP3B) -> SPIR-V");
+        std::vector<float> got = prosper::test::run_compute(spv, inMadI64, N, N);
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < N && got.size() == N; ++i) {
+            const auto& c = kMadI64Cases[i % std::size(kMadI64Cases)];
+            const uint32_t want = out == 0 ? c.d_lo : out == 1 ? c.d_hi : c.carry;
+            if (bits_of(got[i]) != want) ++bad;
+        }
+        printf("  T11f_signed %s mismatches=%u\n", o.what, bad);
+        CHECK(got.size() == N && bad == 0,
+              "T11f_signed: v_mad_i64_i32 writes exact D.lo, D.hi and bit-64 carry");
     }
-    std::vector<float> gotT11f_signed = prosper::test::run_compute(spvT11f_signed, inMad, N, N);
-    uint32_t badT11f_signed = 0;
-    for (uint32_t i = 0; i < N && gotT11f_signed.size() == N; ++i) {
-        if (bits_of(gotT11f_signed[i]) != expCarry[i]) ++badT11f_signed;
-    }
-    CHECK(gotT11f_signed.size() == N && badT11f_signed == 0,
-          "T11f_signed: v_mad_i64_i32 computes exact 65-bit signed carry (bit 64)");
 
     // Astro's SSAO pixel shader carries dead `s_and_b64 vcc,s[0:1],vcc` operations between
     // comparisons; s[0:1] is a T# descriptor, not a wave-mask value available to SPIR-V. Prove that

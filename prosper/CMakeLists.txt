@@ -2859,6 +2859,11 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_literal_capture.cpp src/gpu/recompiler/rdna2_decode.cpp
     INCLUDES src)
 
+  # Memory-writer classification is a decoder-only predicate checked against the ISA tables.
+  prosper_add_gtest(test_may_write_memory
+    SOURCES tests/gpu/recompiler/test_may_write_memory.cpp src/gpu/recompiler/rdna2_decode.cpp
+    INCLUDES src)
+
   # Structural RDNA2->SPIR-V validation that does not require Vulkan runtime support.
   add_executable(test_rdna2_spirv_struct tests/gpu/test_rdna2_spirv_struct.cpp)
   target_link_libraries(test_rdna2_spirv_struct PRIVATE prosper_core)
@@ -3613,9 +3618,8 @@ endif()
     SOURCES tests/gpu/recompiler/test_undef_loop_accumulator.cpp
     LIBRARIES prosper_core)
 
-  # Fail-visible refusal pins for gap opcodes (v_perm_b32, v_mad_i64_i32,
-  # v_div_fixup_f32, v_sad_u8, s_movrels_b32, image_gather4): empty module,
-  # never a silent mistranslation. Compile-only, no device. Any later
+  # Fail-visible refusal pins for gap opcodes (the file header lists the current
+  # set): empty module, never a silent mistranslation. Compile-only, no device. Any later
   # lowering replaces these arms with execution tests.
   prosper_add_gtest(test_gap_opcode_refusals
     SOURCES tests/gpu/recompiler/test_gap_opcode_refusals.cpp
