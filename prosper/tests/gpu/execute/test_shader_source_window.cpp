@@ -328,8 +328,7 @@ TEST_F(ShaderSourceWindow, RefusalEvidenceRetainsOnlyTheAuthenticReadablePrefix)
     auto* code = pages.tail(2);
     code[0] = code[1] = 0xbf800000u;
     ASSERT_TRUE(pages.guard_middle());
-    reset_refused_shader_dump_for_test(
-        (prosper_test::test_scratch_dir() / "shader-source-window").string());
+    reset_refused_shader_dump_for_test(prosper_test::test_scratch_dir().string());
     RefusedDrawShaders source{};
     source.ps_address = source.es_address = uint64_t(uintptr_t(code));
     source.ps_failed = true;
