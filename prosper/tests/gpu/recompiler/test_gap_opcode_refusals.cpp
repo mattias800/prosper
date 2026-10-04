@@ -9,7 +9,7 @@
 // arm with an execution test of the new lowering rather than deleting the assertion.
 //
 // Each arm is paired with a control built from the SAME program with ONLY the gap instruction
-// swapped for a lowered sibling with identical operand fields (v_sad_u32 for the three VOP3A arms,
+// swapped for a lowered sibling with identical operand fields (v_sad_u32 for the VOP3A arms,
 // v_mad_u64_u32 for the VOP3B arm, s_mov_b32 for s_movrels_b32, image_gather4_lz for
 // image_gather4). The control compiling is what makes the refusal about the opcode rather than the
 // operands, the resource table or the program shape.
@@ -134,7 +134,7 @@ void expect_compiles(const std::vector<uint32_t>& code, uint64_t addr, const cha
     if (!spv.empty()) { EXPECT_EQ(spv[0], 0x07230203u) << what << ": not a SPIR-V module"; }
 }
 
-// Decode check shared by the three VOP3A arms: vdst v5, sources v1, v2, v3, no modifiers.
+// Decode check shared by the VOP3A arms: vdst v5, sources v1, v2, v3, no modifiers.
 void expect_vop3a_v5_v1_v2_v3(const uint32_t (&w)[2], uint32_t opcode) {
     const Rdna2Inst dec = rdna2_decode_one(w, 2);
     EXPECT_EQ(dec.fmt, Rdna2Format::VOP3);
@@ -160,7 +160,7 @@ constexpr uint32_t kSadU32[2] = {0xd55d0005u, 0x040e0501u};
 
 }   // namespace
 
-// CONTROL for the three VOP3A arms: the identical program with the lowered v_sad_u32 in the gap
+// CONTROL for the VOP3A arms: the identical program with the lowered v_sad_u32 in the gap
 // slot. Same prologue, same vdst/src fields; only the opcode differs.
 TEST(GapOpcodeRefusals, ControlVop3aSiblingCompiles) {
     expect_vop3a_v5_v1_v2_v3(kSadU32, 0x15du);

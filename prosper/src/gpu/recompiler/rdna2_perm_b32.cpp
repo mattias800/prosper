@@ -10,7 +10,7 @@ uint32_t emit_v_perm_b32(SpirvCompute& b, uint32_t high, uint32_t low, uint32_t 
     //   sel 8..11: replicates bit 7 of bytes 1, 3, 5, 7 of {src0, src1} (S1.b1, S1.b3, S0.b1, S0.b3)
     //   sel 12: constant 0x00
     //   sel 13..255: constant 0xFF
-    // VERIFIED(llvm-mc gfx1030: VOP3 0x144 = v_perm_b32). CONFIDENCE: HIGH.
+    // VERIFIED(llvm-mc gfx1030: VOP3 0x344 = v_perm_b32). CONFIDENCE: HIGH.
     uint32_t result = b.uconst(0);
     for (uint32_t byte = 0; byte < 4u; ++byte) {
         const uint32_t selector = b.bfe_u(sel_dword, b.uconst(byte * 8u), b.uconst(8));

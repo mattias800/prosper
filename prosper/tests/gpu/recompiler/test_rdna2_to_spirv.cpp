@@ -10831,7 +10831,7 @@ int main() {
     const uint32_t codeTperm[] = {
         0x7e0202ffu, 0x7f448022u,   // v_mov_b32 v1, 0x7F448022 (S0)
         0x7e0402ffu, 0x80337f11u,   // v_mov_b32 v2, 0x80337F11 (S1)
-        0xd7440003u, 0x04000501u,   // v_perm_b32 v3, v1, v2, v0 (S2 from v0 input)
+        0xd7440003u, 0x04020501u,   // v_perm_b32 v3, v1, v2, v0 (S2 from v0 input)
         0xbf810000u,
     };
     std::vector<uint32_t> spvTperm =
