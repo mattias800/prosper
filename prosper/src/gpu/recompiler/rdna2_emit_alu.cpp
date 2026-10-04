@@ -9,6 +9,7 @@
 #include "gpu/recompiler/rdna2_dot.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
 #include "gpu/recompiler/rdna2_sad.hpp"
+#include "gpu/recompiler/rdna2_mad_64.hpp"
 #include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#325)
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -4803,63 +4804,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // immaterial here. VERIFIED(round-trip llvm-mc gfx1010, both directions): VOP3 op 0x141.
                 uint32_t m = b.fbin(Op_FMul, fv(0), fv(1));
                 vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, m, fv(2)));
-            } else if (in.opcode == 0x176) {                          // v_mad_u64_u32
-                // AMD RDNA2: {carry,D.u64} = S0.u32*S1.u32 + S2.u64. A literal
-                // or positive inline constant used as the 64-bit addend is zero-extended;
-                // a negative integer inline constant is sign-extended. Register addends
-                // consume the consecutive high register.
-                if (in.dst.value >= 255) { ok = false; }
-                else {
-                    auto high_half = [&](const Operand& operand) -> uint32_t {
-                        if (operand.kind == OperandKind::InlineInt)
-                            return b.uconst(operand.value < 0 ? 0xFFFFFFFFu : 0u);
-                        // An inline FLOAT 64-bit addend supplies the DOUBLE bit pattern (high dword
-                        // carries the exponent/mantissa; 1/(2*pi) has a nonzero LOW dword too) —
-                        // the previous {f32-bits, 0} model was wrong in both halves. No compiler
-                        // emits a float inline as an integer-mad addend: reject, stay fail-visible.
-                        if (operand.kind == OperandKind::InlineFloat) { ok = false; return b.uconst(0); }
-                        if (operand.kind == OperandKind::Literal)
-                            return b.uconst(0);
-                        if (operand.kind == OperandKind::Special && operand.value == 125)
-                            return b.uconst(0);                       // null pair
-                        if (operand.kind == OperandKind::VGPR ||
-                            operand.kind == OperandKind::SGPR ||
-                            (operand.kind == OperandKind::Special &&
-                             operand.value >= 106 && operand.value < 124)) {
-                            Operand next = operand;
-                            ++next.value;
-                            return val(next);
-                        }
-                        ok = false;
-                        return b.uconst(0);
-                    };
-
-                    const uint32_t a = val(in.src[0]), c = val(in.src[1]);
-                    const uint32_t add_lo = val(in.src[2]), add_hi = high_half(in.src[2]);
-                    const uint32_t mul_lo = b.ibin(Op_IMul, a, c);
-                    const uint32_t mul_hi = b.umul_hi(a, c);
-                    const uint32_t result_lo = b.ibin(Op_IAdd, mul_lo, add_lo);
-                    const uint32_t carry_lo = b.ucmp(Op_ULessThan, result_lo, mul_lo);
-                    const uint32_t high_sum = b.ibin(Op_IAdd, mul_hi, add_hi);
-                    const uint32_t carry_hi0 = b.ucmp(Op_ULessThan, high_sum, mul_hi);
-                    const uint32_t carry_word = b.sel(carry_lo, b.uconst(1), b.uconst(0));
-                    const uint32_t result_hi = b.ibin(Op_IAdd, high_sum, carry_word);
-                    const uint32_t carry_hi1 = b.ucmp(Op_ULessThan, result_hi, high_sum);
-                    const uint32_t carry_out = b.lor(carry_hi0, carry_hi1);
-
-                    const int hi_dst = in.dst.value + 1;
-                    const uint32_t old_hi = vreg_old(b, rs, hi_dst);
-                    vreg[in.dst.value] = result_lo;
-                    vreg[hi_dst] = result_hi;
-                    predicate_write(b, rs, hi_dst, old_hi);
-                    // ISA 3.9 carry-mask rule: an EXEC-inactive lane's bit is written 0, never the
-                    // raw carry (wave votes/spills must not see phantom bits from inactive lanes).
-                    const uint32_t carry_masked =
-                        rs.exec_narrowed ? b.land(rs.exec, carry_out) : carry_out;
-                    if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = carry_masked;
-                    else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = carry_masked;
-                    else ok = false;
-                }
+            } else if (in.opcode == 0x176 ||
+                       in.opcode == 0x177) {   // v_mad_u64_u32 / v_mad_i64_i32
+                emit_v_mad_64_32(b, rs, in, ok);
             } else if (in.opcode == 0x30F || in.opcode == 0x310 || in.opcode == 0x319) {
                 // v_add_co_u32 (0x30F) / v_sub_co_u32 (0x310) / v_subrev_co_u32 (0x319): 32-bit add/
                 // subtract that writes a carry/borrow-out to the VOP3B sdst mask (VCC or an SGPR pair).
@@ -4883,13 +4830,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // ISA 3.9 carry-mask rule: an EXEC-inactive lane's bit is written 0, not its raw carry.
                 const uint32_t carry_masked = rs.exec_narrowed ? b.land(rs.exec, carry) : carry;
                 write_vop3b_carry_output(carry_masked);
-            } else if (in.opcode == 0x169) {                          // v_mul_lo_u32
+            } else if (in.opcode == 0x169) {   // v_mul_lo_u32
                 vreg[in.dst.value] = b.ibin(Op_IMul, val(in.src[0]), val(in.src[1]));
-            } else if (in.opcode == 0x16a) {                          // v_mul_hi_u32 (high 32 bits)
+            } else if (in.opcode == 0x16a) {   // v_mul_hi_u32 (high 32 bits)
                 vreg[in.dst.value] = b.umul_hi(val(in.src[0]), val(in.src[1]));
-            } else if (in.opcode == 0x16c) {                          // v_mul_hi_i32 (high 32 bits, signed)
+            } else if (in.opcode == 0x16c) {   // v_mul_hi_i32 (high 32 bits, signed)
                 vreg[in.dst.value] = b.smul_hi(val(in.src[0]), val(in.src[1]));
-            } else if (in.opcode == 0x157) {                          // v_med3_f32 = median(s0,s1,s2)
+            } else if (in.opcode == 0x157) {   // v_med3_f32 = median(s0,s1,s2)
                 // ISA op 343: "if (isNan(S0) || isNan(S1) || isNan(S2)) D = V_MIN3_F32(S0,S1,S2)".
                 // The min/max legs use the NaN-aware NMin/NMax (return-the-other-operand), and the
                 // any-NaN case selects min3 explicitly — the plain max(min(...)) formula does not
@@ -4902,6 +4849,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                          b.lor(b.fcmp(Op_FUnordNotEqual, s1, s1),
                                                b.fcmp(Op_FUnordNotEqual, s2, s2)));
                 vreg[in.dst.value] = fresult(b.sel(nan_any, min3, med));
+<<<<<<< HEAD
             } else if (in.opcode == 0x158 || in.opcode == 0x159) {   // v_med3_i32 / v_med3_u32
                 // Median of three values: max(min(a,b), min(max(a,b),c)).
                 // Astro Bot uses v_med3_u32 to clamp a material index into [0,31] before its world-map
@@ -4931,6 +4879,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     is_signed
                         ? b.sext2(op, b.sext2(op, val(in.src[0]), val(in.src[1])), val(in.src[2]))
                         : b.uext2(op, b.uext2(op, val(in.src[0]), val(in.src[1])), val(in.src[2]));
+                == == == =
+            } else if (in.opcode == 0x159) {   // v_med3_u32
+                // Unsigned median of three values: max(min(a,b), min(max(a,b),c)).
+                // Astro Bot uses this to clamp a material index into [0,31] before its world-map
+                // depth prepass. VERIFIED(llvm-mc gfx1030: VOP3 0x159 = v_med3_u32).
+                const uint32_t s0 = val(in.src[0]), s1 = val(in.src[1]), s2 = val(in.src[2]);
+                const uint32_t mn = b.uext2(Glsl_UMin, s0, s1);
+                const uint32_t mx = b.uext2(Glsl_UMax, s0, s1);
+                vreg[in.dst.value] = b.uext2(Glsl_UMax, mn, b.uext2(Glsl_UMin, mx, s2));
+            } else if (in.opcode == 0x153 || in.opcode == 0x156) {   // v_min3_u32 / v_max3_u32
+                // Unsigned min/max of three values. Sonic Racing: CrossWorlds' post chain rejects on
+                // v_max3_u32 four times per boot (#2013); v_min3_u32 is its neighbour in the same
+                // ISA family and the same lowering. VERIFIED(round-trip llvm-mc gfx1030: VOP3
+                // 0x153 = v_min3_u32, 0x156 = v_max3_u32). CONFIDENCE: HIGH.
+                const uint32_t op = in.opcode == 0x153 ? (uint32_t)Glsl_UMin : (uint32_t)Glsl_UMax;
+                vreg[in.dst.value] =
+                    b.uext2(op, b.uext2(op, val(in.src[0]), val(in.src[1])), val(in.src[2]));
+>>>>>>> c3fcfdc5 (feat(gpu): implement v_mad_i64_i32 lowering)
             } else if (in.opcode == 0x151 || in.opcode == 0x154) {   // v_min3_f32 / v_max3_f32
                 // min/max of three floats (DOLL's AA-clamp PS). VERIFIED(round-trip llvm-mc gfx1010:
                 // VOP3 0x151 = v_min3_f32, 0x154 = v_max3_f32 — 0xd551…/0xd554…). NaN-aware NMin/
@@ -5027,9 +4993,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t p = b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, val(in.src[0]), m24),
                                               b.ibin(Op_BitwiseAnd, val(in.src[1]), m24));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, p, val(in.src[2]));
+<<<<<<< HEAD
             } else if (in.opcode == 0x15A || in.opcode == 0x15B || in.opcode == 0x15C ||
                        in.opcode == 0x171) {   // v_sad_u8 / v_sad_hi_u8 / v_sad_u16 / v_msad_u8
                 vreg[in.dst.value] = emit_v_sad_subword(b, rs, in, ok);
+                == == == =
+>>>>>>> c3fcfdc5 (feat(gpu): implement v_mad_i64_i32 lowering)
             } else if (in.opcode == 0x15D) {   // v_sad_u32 = |s0-s1| (unsigned) + s2
                 // RDNA2 ISA (document 70648), V_SAD_U32: D.u32 = abs(S0.u32 - S1.u32) + S2.u32.
                 // The absolute difference is the UNSIGNED magnitude, so max-min is exact and cannot

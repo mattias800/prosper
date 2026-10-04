@@ -160,8 +160,8 @@ inline std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2I
                 (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02) ||
                 (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28 && in.opcode <= 0x2A) ||
                 vop3b_fresh_carry_output(in) ||
-                (in.fmt == Rdna2Format::VOP3 &&
-                 ((in.opcode >= 0x128 && in.opcode <= 0x12A) || in.opcode == 0x176));
+                (in.fmt == Rdna2Format::VOP3 && ((in.opcode >= 0x128 && in.opcode <= 0x12A) ||
+                                                 in.opcode == 0x176 || in.opcode == 0x177));
             if (!scalar_side_effect &&
                 (in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOP3 ||
                  in.fmt == Rdna2Format::MIMG || in.fmt == Rdna2Format::MUBUF ||

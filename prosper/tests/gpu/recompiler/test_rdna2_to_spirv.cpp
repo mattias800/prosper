@@ -11192,6 +11192,53 @@ int main() {
     CHECK(gotT11f.size()==N && badT11f==0,
           "T11f: v_mad_u64_u32 writes exact low/high words and carry-out");
 
+    // T11f_signed: v_mad_i64_i32 (0x177). Exercise signed 64-bit multiply-accumulate and bit-64 carry.
+    // Case 1: -1 * 1 + 0 -> D = 0xffffffff_ffffffff, carry 1 (bit 64 of signed 65-bit sum).
+    //   Low: 0xffffffff, High: 0xffffffff, Carry: 1.
+    // Case 2: 0x80000000 * 0x80000000 + 0x80000000_00000000 -> D = 0xc0000000_00000000, carry 1.
+    // Case 3: 0x7fffffff * 0x7fffffff + 0x7fffffff_ffffffff -> D = 0xbfffffff_00000000, carry 0.
+    // Case 4: 2 * 3 + (-1 as inline i64) -> D = 5, carry 0.
+    const uint32_t codeT11f_signed[] = {
+        0xd5776a05u, 0x04080300u,   // v_mad_i64_i32 v[5:6], vcc, v0, v1, v[2:3]
+        0x7e000280u,   // v_mov_b32 v0, 0
+        0x7e020281u,   // v_mov_b32 v1, 1
+        0x02000001u,   // v_cndmask_b32 v0, v0, v1, vcc (v0 = carry)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT11f_signed =
+        recompile_valu(codeT11f_signed, std::size(codeT11f_signed), 4, /*out_vgpr*/ 0);
+    CHECK(!spvT11f_signed.empty(), "recompiled T11f_signed (v_mad_i64_i32 VOP3B) -> SPIR-V");
+
+    const struct {
+        int32_t s0;
+        int32_t s1;
+        uint32_t s2_lo;
+        uint32_t s2_hi;
+        uint32_t exp_carry;
+    } kMadCases[] = {
+        {-1, 1, 0x00000000u, 0x00000000u, 1u},
+        {(int32_t)0x80000000u, (int32_t)0x80000000u, 0x00000000u, 0x80000000u, 1u},
+        {0x7fffffff, 0x7fffffff, 0xffffffffu, 0x7fffffffu, 0u},
+        {2, 3, 0xffffffffu, 0xffffffffu, 0u},
+    };
+    std::vector<float> inMad(N * 4, 0.0f);
+    std::vector<uint32_t> expCarry(N, 0);
+    for (uint32_t i = 0; i < N; ++i) {
+        const auto& c = kMadCases[i % std::size(kMadCases)];
+        inMad[i * 4 + 0] = float_of((uint32_t)c.s0);
+        inMad[i * 4 + 1] = float_of((uint32_t)c.s1);
+        inMad[i * 4 + 2] = float_of(c.s2_lo);
+        inMad[i * 4 + 3] = float_of(c.s2_hi);
+        expCarry[i] = c.exp_carry;
+    }
+    std::vector<float> gotT11f_signed = prosper::test::run_compute(spvT11f_signed, inMad, N, N);
+    uint32_t badT11f_signed = 0;
+    for (uint32_t i = 0; i < N && gotT11f_signed.size() == N; ++i) {
+        if (bits_of(gotT11f_signed[i]) != expCarry[i]) ++badT11f_signed;
+    }
+    CHECK(gotT11f_signed.size() == N && badT11f_signed == 0,
+          "T11f_signed: v_mad_i64_i32 computes exact 65-bit signed carry (bit 64)");
+
     // Astro's SSAO pixel shader carries dead `s_and_b64 vcc,s[0:1],vcc` operations between
     // comparisons; s[0:1] is a T# descriptor, not a wave-mask value available to SPIR-V. Prove that
     // the dead write is removed while the following, observable comparison still controls cndmask.

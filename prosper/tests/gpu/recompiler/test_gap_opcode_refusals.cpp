@@ -1,5 +1,10 @@
+<<<<<<< HEAD
 // test_gap_opcode_refusals — fail-visible refusal pins for five opcodes the compute recompiler
 // decodes but does not lower: v_perm_b32, v_mad_i64_i32, v_div_fixup_f32, s_movrels_b32
+=======
+// test_gap_opcode_refusals — fail-visible refusal pins for opcodes the compute recompiler
+// decodes but does not lower: v_perm_b32, v_div_fixup_f32, v_sad_u8, s_movrels_b32
+>>>>>>> c3fcfdc5 (feat(gpu): implement v_mad_i64_i32 lowering)
 // and image_gather4 (implicit LOD).
 //
 // Per the recompiler charter an unsupported op is a FATAL gap, and the loud refusal is only the
@@ -184,31 +189,7 @@ TEST(GapOpcodeRefusals, DivFixupF32) {
                        Rdna2Format::VOP3, 0x15fu);
 }
 
-// V_MAD_I64_I32 v[5:6], s12, v1, v2, v[3:4] (VOP3B 0x177). dword0[14:8] is the SDST carry
-// destination (s12 in Wave32, s[12:13] in Wave64 -- the raw words are the same), not a source; the
-// decoder's VOP3B list includes 0x177, so the operands are asserted in full. Control: the lowered
-// unsigned sibling v_mad_u64_u32 (0x176) with the identical operand fields.
-TEST(GapOpcodeRefusals, MadI64I32) {
-    static const uint32_t w[2] = {0xd5770c05u, 0x040e0501u};
-    static const uint32_t control[2] = {0xd5760c05u, 0x040e0501u};
-    for (const uint32_t* words : {w, control}) {
-        const Rdna2Inst dec = rdna2_decode_one(words, 2);
-        EXPECT_EQ(dec.fmt, Rdna2Format::VOP3);
-        EXPECT_EQ(dec.opcode, words == w ? 0x177u : 0x176u);
-        EXPECT_EQ(dec.len_dwords, 2u);
-        EXPECT_TRUE(is_vgpr(dec.dst, 5));
-        EXPECT_TRUE(is_sgpr(dec.sdst, 12)) << "VOP3B SDST is s12";
-        EXPECT_EQ(dec.n_src, 3u);
-        EXPECT_TRUE(is_vgpr(dec.src[0], 1));
-        EXPECT_TRUE(is_vgpr(dec.src[1], 2));
-        EXPECT_TRUE(is_vgpr(dec.src[2], 3)) << "addend v[3:4] is named by its base v3";
-        for (int k = 0; k < 3; ++k) EXPECT_FALSE(dec.src_abs[k]) << "VOP3B clears the abs field";
-    }
-    expect_compiles(program(kVop3Prologue, {control[0], control[1]}), 0xA010ull,
-                    "control: v_mad_u64_u32 v[5:6], s12, v1, v2, v[3:4]");
-    expect_gap_refusal(program(kVop3Prologue, {w[0], w[1]}), 0xA011ull, 4, {w[0], w[1]},
-                       Rdna2Format::VOP3, 0x177u);
-}
+
 
 // S_MOVRELS_B32 s0, s1 (SOP1 0x2e): reads s[1 + M0]. M0 and s1 are defined explicitly, so the
 // relative source is s1 = 7. Control: s_mov_b32 s0, s1 (SOP1 0x03) in the same slot.
