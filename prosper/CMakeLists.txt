@@ -1513,6 +1513,14 @@ if(TARGET prosper_core)
     SOURCES tests/hle/np/test_np_uds_properties.cpp
     LIBRARIES prosper_core)
 
+  # libSceAudio3d / libSceAudioPropagation / libSceAcm (spatial + batch audio): local 3D-port
+  # and Acm-context lifecycles with evidenced errors, honest no-backend refusals elsewhere.
+  # Previously unregistered, the dispatcher answered 0 while writing nothing — audio outputs
+  # are divisors, so titles died in their own arithmetic far from the cause.
+  prosper_add_gtest(test_audio_spatial
+    SOURCES tests/hle/audio/test_audio_spatial.cpp
+    LIBRARIES prosper_core)
+
   # The save's parameter block (#2786): sceSaveDataSetParam/GetParam were unregistered, so both
   # answered SCE_OK while storing and reading nothing. Drives the real NIDs, including a mutation arm
   # (a different block must read back differently) and a persistence arm (it must come off disk).
