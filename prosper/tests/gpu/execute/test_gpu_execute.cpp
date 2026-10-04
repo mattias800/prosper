@@ -426,8 +426,8 @@ int main() {
         const uint8_t* center = &dcc_one_px[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
         dcc_one_preserved = center[2] > 0x80 && center[0] < 0x40 && center[1] < 0x40;
     }
-    CHECK(dcc_one_preserved,
-          "DCC decompress with the fp16-1.0 AGC helper keeps the attachment instead of painting it white");
+    CHECK(dcc_one_preserved, "DCC decompress with the fp16-1.0 AGC helper keeps the attachment "
+                             "instead of painting it white");
     // Positive control for the check above: the same program in NORMAL mode really paints white, so
     // the preserved centre there is the recognition at work, not a dropped or empty draw.
     GpuState one_normal = dcc_one;
@@ -440,7 +440,8 @@ int main() {
         const uint8_t* center = &one_normal_px[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
         one_normal_white = center[0] > 0xf0 && center[1] > 0xf0 && center[2] > 0xf0;
     }
-    CHECK(one_normal_white, "the fp16-1.0 helper program outside DCC_DECOMPRESS draws white (control)");
+    CHECK(one_normal_white,
+          "the fp16-1.0 helper program outside DCC_DECOMPRESS draws white (control)");
 
     // A folded submit can retain MODE=6 after the guest has restored normal mode. Do not classify a
     // real shader from the following post-process pass as the helper merely because of that residue.

@@ -14,7 +14,7 @@ namespace {
 bool helper(const std::vector<uint32_t>& code) {
     return is_agc_dcc_helper_program(code.data(), code.size());
 }
-} // namespace
+}   // namespace
 
 TEST(DccHelperProgram, RecognisesBothObservedAgcHelpers) {
     // v_mov_b32 v0, 0 ; exp mrt0 v0, v0 (R,G) done vm ; s_endpgm -- the clear-RG helper.
@@ -39,9 +39,11 @@ TEST(DccHelperProgram, AnOrdinaryConstantColourShaderIsNotAHelper) {
 }
 
 TEST(DccHelperProgram, NeverReadsPastTheBoundOrANullProgram) {
-    const std::vector<uint32_t> full = {0x7e0002ffu, 0x3c003c00u, 0xf8001c0fu, 0x00000000u, 0xbf810000u};
+    const std::vector<uint32_t> full = {0x7e0002ffu, 0x3c003c00u, 0xf8001c0fu, 0x00000000u,
+                                        0xbf810000u};
     for (size_t n = 0; n < full.size(); ++n)
-        EXPECT_FALSE(is_agc_dcc_helper_program(full.data(), n)) << "truncated to " << n << " dwords";
+        EXPECT_FALSE(is_agc_dcc_helper_program(full.data(), n))
+            << "truncated to " << n << " dwords";
     EXPECT_TRUE(is_agc_dcc_helper_program(full.data(), full.size()));
     EXPECT_FALSE(is_agc_dcc_helper_program(nullptr, 16));
 }

@@ -32,7 +32,10 @@
 namespace prosper::gpu {
 
 inline constexpr uint32_t kAgcDccHelperClearRg[] = {
-    0x7e000280u, 0xf8001803u, 0x00000000u, 0xbf810000u,
+    0x7e000280u,
+    0xf8001803u,
+    0x00000000u,
+    0xbf810000u,
 };
 inline constexpr uint32_t kAgcDccHelperFp16One[] = {
     0x7e0002ffu, 0x3c003c00u, 0xf8001c0fu, 0x00000000u, 0xbf810000u,
@@ -59,4 +62,4 @@ inline bool is_agc_dcc_helper_program(const uint32_t* code, size_t max_dwords) {
                        });
 }
 
-} // namespace prosper::gpu
+}   // namespace prosper::gpu
