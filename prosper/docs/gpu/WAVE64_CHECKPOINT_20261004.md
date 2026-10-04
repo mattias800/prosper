@@ -1,12 +1,14 @@
 # General Wave64 / Kena checkpoint — 2026-10-04
 
 This is a durable **partial-work handoff**, not acceptance evidence. The helper/launch code is
-unverified; both confirmed review findings now have source-only correction attempts. The first
-focused native build subsequently FAILED before test discovery; a reviewed friend-signature
-correction now compiles its two failed consumers, as recorded below. No complete test build passed.
+not accepted. Both confirmed review findings have correction attempts. After two recorded build
+failures and reviewed compile corrections, the current focused native baseline builds and runs:
+**41PASS/14FAIL of55 actual CPU cases, CTest8/helper1**, recorded below. No passing helper baseline.
 General Wave64 and Kena title-screen 3D are
 NOT complete. No current Kena drop census, FPS improvement or title-screen rendering result was
 measured in this checkpoint. Work was frozen at the maintainer's checkpoint request.
+The earlier source-only sections describe their own historical freezes, not the later execution
+status. Do not retroactively assign the new native result to those older source identities.
 
 ## Source-only follow-up after the frozen checkpoint
 
@@ -177,6 +179,76 @@ source formatting, architecture, GTest-policy, contribution-shape and diff gates
 The next native action is a newly bound/reviewed successor of the four-PE/55-intended-case
 baseline, with fresh strict certificates and actual discovery; preserve the original154 runner
 and failed receipts rather than changing their identities or borrowing the two-object result.
+
+## Current focused CPU result: 41PASS/14FAIL, not acceptance
+
+The successor at exact392f3c3a/Pf3773be0/Tf551f5fa configured0/graph0, but build1/helper1:
+`fragment_raster_launch.cpp` called nonexistent `RegisterFile::contains`. No certificate,
+discovery or tests followed in that cohort. Its raw receipts remain in
+`.codex/issue-4235-native-20261004/392f3c3a-focused-baseline/`.
+
+Reviewed correction `de2037b2800dc17731bbe8411a4ef785fa353d21`, parent
+`392f3c3aca46d94dd3a36b83ebc675091b6fe320`, tree
+`a3c29943d55255775d4c2341cc2e9f0582b36f88`, changes only that query (+2/-1) to const
+`find()!=end()`. The actual `RegisterFile` implementation checks keys, preserves present-zero
+versus absent, and inserts nothing. SAME scoped source review found no defect; exact source
+formatting/architecture/GTest-policy/contribution/diff gates exited0. No whole-PR approval.
+
+ROOT then completed exact clean de203 configure0/graph0/build0 and strict-dirty revision
+certification0 for all four requested PEs. Actual unique discovery and execution both55:
+
+| Actual case family | PASS | Ordinary FAIL |
+| --- | ---: | ---: |
+| FragmentRasterLaunch | 9 | 14 |
+| FragmentDrawPlan / FragmentDrawResidency | 6 | 0 |
+| FragmentPacketExports | 17 | 0 |
+| FragmentScalarReads | 9 | 0 |
+
+CTest8/helper1,1.58s real test time; no timeout, XML error, skip, disabled/inverted case or
+missing full body. Every JUnit system-out occurs in retained LastTest. Four PE names, strict
+certificate rows and hashes are retained in `cert.log` and `observed.json`; actual registration
+joins each name to its correct certified PE and exact filter arguments. Five of the eight new
+follow-up cases PASS: the reserved cold-proof negative, scalar-origin case and all three
+packet/resource/LegacyRaw PREFETCH cases. The registered helper PREFETCH positive and both
+position-free cases FAIL early; their later assertions/VM chain did NOT execute.
+
+Confirmed next actions, independently checked by SAME against actual bodies and source:
+
+1. **Canonical incoming EXEC is rejected by the helper proof.** Eleven failure bodies print
+   `fragment-raster-mask-source-unproved:pc=0` or `:pc=1`. The `mask` lambda in
+   `fragment_raster_program` requires SGPR before its value126 branch, but
+   `decode_src_field(126)` returns `OperandKind::Special` with value126, and SOP1 sources use
+   that decoder. Thus that incoming-EXEC branch is unreachable for canonical decoded EXEC.
+   Fix the exact canonical mask representation, preserving ordinary saved-mask aliases and
+   VCC/M0/numeric/unknown-special refusals; do NOT accept all special registers or invent masks.
+   Retain the real red cases and require their positive/negative restored results on a new head.
+2. **Two other fixture/cache failures remain unisolated.**
+   `SameOriginalProgramCannotBorrowAnotherDrawsEntryObservation` sees different raw-code owners
+   where it expects the same one. `WiderParameterProgramStillNeedsItsCompleteEntryAndExecutionRecipe`
+   gets `fragment-draw-original-float-mode-unavailable` before its expected vector refusal and
+   sees distinct warm plans. Check the actual registered source/profile fixtures and lifecycle;
+   do not collapse foreign-owner identity or fabricate float availability to satisfy assertions.
+   The helper PREFETCH positive also fails its early cold-proof assertion without printing its
+   rejection tag; do not claim a measured tag for that case from inference alone.
+3. **The body checker confuses zero passes with zero executions.** Preserved `observed.json`
+   reports `WrongGtestBodies=14`: original runner0ab rejects `[  PASSED  ] 0 tests`, which is
+   present in each genuine failing one-test run. All55 real bodies have exactly one matching
+   RUN and timed OK/FAILED result, and none reports Running0/skip. ROOT's hand-built failed-body
+   control is accepted only when that aggregate zero-pass summary is removed; SAME independently
+   confirmed the discrepancy. Correct/calibrate a NEW runner version to accept genuine failed
+   bodies while rejecting actual zero execution. Do not edit the old receipt or call this green.
+
+Raw full evidence: `.codex/issue-4235-native-20261004/de2037b2-focused-baseline/`.
+Actual invocation used `.codex/issue-4235-helper-cpu-rebind-20261004.ps1` with the full de203
+H/P/T above, `-Cohort focused-baseline -ExecuteNativeProof`. SAME source-cleared wrapper SHA256
+`fad217554c5e63ec4693a2efc0df3e8cdc2deaabc7fe503e483ed0beee64e72a` pins original runner0ab
+and changes only four identity/evidence assignments; derived UTF8 source SHA256
+`80bb83d6ab3ad267f0d805e81b4bed7d2dcad6a73100062ddcf8769e8222effb`.
+The earlier392 wrapper/derived-source hashes remain in its retained invocation/history.
+APP313/process0 were unchanged before/after, final native handle exit1/process census empty.
+No app/game, Vulkan device/queue, SPIR-V SDK validation or production counterfactuals were run.
+The passing packet cases include CPU VM execution; this is not GPU or full-helper validation.
+The historical32 Kena-original frontier and unfinished whole-source review still apply.
 
 ## Objective and acceptance boundary
 
@@ -373,9 +445,10 @@ run `python3 prosper/tools/session_start.py` at session start/after worktree cha
 machine the Store python3 alias may fail; real Python312 is available as `python`/`py -3.12`.
 Fetch in your own worktree, inspect current-main instructions/deltas and preserve others' trees.
 
-1. Continue from the reviewed friend-signature correction and its limited two-object compile
-   result, using a new exact-revision four-PE baseline; do not reuse or overwrite failed154
-   receipts. Full linking/certification/discovery/test execution remain pending. Validate both
+1. Continue from exact de203's failed55-case baseline and the confirmed canonical-EXEC/body-checker
+   findings above. Review corrections and execute a NEW exact-head cohort; preserve all failed
+   receipts. Isolate the other fixture/cache failures without weakening source/profile authority.
+   The focused linking/discovery ran, but passing runtime acceptance is still pending. Validate both
    source-only repair attempts and finish missing registered negatives; preserve
    immutable successor H/P/T, source inventory and exact gates. Same reviewer completes the
    connected review on that successor and checks newer main. Do not borrow older native credit.
@@ -404,13 +477,15 @@ committed or downloaded by a fresh clone, whereas source and this document are i
 | `.codex/issue-4235-native-20261004/154531e3-focused-baseline/` | Actual configure0/graph0/build1; private friend-signature failure, no certification or tests. |
 | `.codex/issue-4235-helper-cpu-native-20261004.ps1` | Reviewed ROOT-only55/4 apparatus and discriminator calibration; exact154 failure retained, not a passing test receipt. |
 | `.codex/issue-4235-native-20261004/f3773be0-private-friend-objects/`, `.codex/issue-4235-private-friend-objects-20261004.ps1` | Actual two requested translation units compile after private-friend fix; source/app/graph/exit receipts, no PE/test/SPIR-V/device credit. |
+| `.codex/issue-4235-native-20261004/392f3c3a-focused-baseline/`, `.codex/issue-4235-helper-cpu-392f3c3a-20261004.ps1` | Actual second build1 on nonexistent RegisterFile API; no certificate/tests. |
+| `.codex/issue-4235-native-20261004/de2037b2-focused-baseline/`, `.codex/issue-4235-helper-cpu-rebind-20261004.ps1` | Actual four-PE strict certificate and55 complete cases41PASS/14FAIL; original body-classifier false positive preserved and separately explained above. |
 | `.codex/issue-4378-native-20261004/215ee6d2-baseline/` | Actual failed native configure/graph/build/certs/registration/JUnit/LastTest/observed.json. |
 | `.codex/issue-4378-cpu-native-20261004.ps1` | Reviewed ROOT-only70/12 helper, SHA256 `4df72940d6492ca983eb84996ada823686ce0f04c68fd1dc8196c5f765554695`; requires exact clean H/P/T and NEW cohort name. |
 | `.codex/issue-4378-source-freeze-215ee6d2-20261004.txt`, held-scope v1/v2 and handoff | Windows source-gate/history, not a passing native result. |
 | `.codex/issue-4322-native-20261004/9e595b11-final-tool/` | Accepted exact9e CPU60 receipts. |
 | `.codex/issue-4322-observation-native-20261004/9e595b11-final-tool/` | Accepted exact9e GPU17/observations receipts. |
 | `.codex/issue-4322-spv-native-20261004/9e595b11-final-corrected/` | Accepted exact9e585 actual modules/validator evidence. |
-| `.codex/worktrees/wave64-followthrough-20261002` | ROOT own central worktree; sole retained `prosper/build-flags-native-clang`. Latest fully linked/certified twelve CPU PEs are215; the focused154 incremental build failed before requested PE links. No current helper/checkpoint native certificate. |
+| `.codex/worktrees/wave64-followthrough-20261002` | ROOT own central worktree; sole retained `prosper/build-flags-native-clang`. Latest four focused CPU PEs are linked/certified de203; other prior twelve-target-lane PEs remain215. Native receipts do not certify later documentation/source successors. |
 | `.codex/worktrees/fragment-launch-composition-20261004` | Source-only helper author tree, clean3fcb at freeze, no builds. |
 | `.codex/worktrees/refused-shader-paths-20261004` | Removed after clean/ignored-path census, author acknowledgement and exact remote215 verification; no build or raw receipts deleted. Recreate an owned tree from draft #4383 if resuming. |
 
