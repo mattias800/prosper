@@ -318,6 +318,9 @@ Operand decode_src_field(uint32_t field);
 // The float value an InlineFloat operand encodes (0.5, 1.0, ... , 1/(2*pi)); 0 for non-float codes.
 float inline_float_value(uint32_t code);
 struct Rdna2Inst;
+// ISA Table72: S_INST_PREFETCH has SIMM16 exactly1..3; zero and all higher bits are reserved.
+// Pure encoding knowledge, not permission to admit a shader or ignore a memory clause.
+bool rdna2_is_valid_instruction_prefetch(const Rdna2Inst& in);
 // True when a VOPC opcode is the `v_cmpx_*` form, which writes EXEC instead of a VCC/SGPR mask.
 // Every one sits at its `v_cmp_*` counterpart + 0x10, so `opcode - 0x10` recovers the base compare.
 // The six windows and the two invalid holes are enumerated (and sourced) at the definition in

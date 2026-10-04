@@ -52,6 +52,31 @@ TEST(FragmentScalarReads, OriginalPcWidthsAndImmediateDemands) {
         EXPECT_EQ(plan.sites[index].entry_words, (std::array<uint32_t, 4>{0, 1, 2, 3}));
     }
 }
+TEST(FragmentScalarReads, CanonicalPrefetchPreservesOriginsButReservedHintsAndClausesRefuse) {
+    for (uint32_t mode : {1u, 2u, 3u}) {
+        SCOPED_TRACE(mode);
+        auto code = ThreeReads;
+        code.insert(code.begin(), 0xbfa00000u | mode);
+        const auto plan = facts(code);
+        ASSERT_TRUE(plan.has_smem);
+        ASSERT_TRUE(plan.rejection.empty()) << plan.rejection;
+        ASSERT_EQ(plan.sites.size(), 3u);
+        for (uint32_t index = 0; index < plan.sites.size(); ++index) {
+            EXPECT_EQ(plan.sites[index].pc, 1u + 2u * index);
+            EXPECT_EQ(plan.sites[index].entry_words, (std::array<uint32_t, 4>{0, 1, 2, 3}));
+        }
+    }
+    for (uint32_t hint : {0xbfa00000u, 0xbfa00004u, 0xbfa00103u, 0xbfa08003u, 0xbfa10001u}) {
+        SCOPED_TRACE(hint);
+        auto code = ThreeReads;
+        code.insert(code.begin(), hint);
+        const auto refused = facts(code);
+        EXPECT_TRUE(refused.has_smem);
+        EXPECT_EQ(refused.rejection, "packet-scalar-instruction-effects-unimplemented:pc=0");
+        EXPECT_TRUE(refused.sites.empty());
+    }
+}
+
 TEST(FragmentScalarReads, GenuineMovOriginsAndReadBeforeOverwrite) {
     // s_mov_b64 s[8:9],s[0:1]; s_mov_b32 s10,s2; s_mov_b32 s11,s3; two loads via s[8:11].
     const std::vector<uint32_t> moved{0xbe880400u, 0xbe8a0302u, 0xbe8b0303u, 0xf4200504u,

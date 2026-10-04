@@ -123,6 +123,7 @@ fragment_packet_mask_requirements(const std::vector<uint32_t>& code,
         const bool branch = in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode);
         if ((branch && (branch_target(in) <= in.pc || !indices.contains(branch_target(in)))) ||
             (in.fmt == Rdna2Format::SOPP && !branch && !in.is_end && in.opcode != 0 &&
+             !rdna2_is_valid_instruction_prefetch(in) &&
              !(in.opcode == 0x0c && rdna2_waitcnt_effects_known(uint16_t(in.simm16)))) ||
             (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20 && in.opcode <= 0x22) ||
             (in.fmt == Rdna2Format::SOPK &&

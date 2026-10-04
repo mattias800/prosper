@@ -62,6 +62,57 @@ TEST_F(FragmentRasterLaunch, OriginalSavedLiveHelperProgramDemandsRealPackedPosi
     EXPECT_TRUE(disabled.positions.empty());
 }
 
+TEST_F(FragmentRasterLaunch, CanonicalPrefetchRetainsTheRegisteredOriginalThroughFinalCompilation) {
+    namespace helper = prosper::test::fragment_raster;
+    for (uint32_t mode : {1u, 2u, 3u}) {
+        SCOPED_TRACE(mode);
+        auto code = helper::original();
+        code.insert(code.begin(), 0xbfa00000u | mode);
+        ASSERT_TRUE(helper_requirements(code, {1u << 8, 1u << 8}).rejection.empty());
+        std::vector<g::Rdna2Inst> decoded;
+        g::rdna2_walk(code.data(), code.size(), decoded);
+        const auto masks = g::fragment_packet_mask_requirements(code, decoded);
+        ASSERT_TRUE(masks.rejection.empty()) << masks.rejection;
+        EXPECT_EQ(masks.demanded, g::kPacketInitialExec);
+        g::DrawItem draw;
+        const auto context = helper::context();
+        ASSERT_TRUE(f::realize(draw, f::color_a, code, f::ieee_rsrc1, 15, context));
+        ASSERT_TRUE(draw.fragment_draw_inputs && draw.fragment_draw_inputs->launch_source);
+        const auto& original = *draw.fragment_draw_inputs;
+        EXPECT_EQ(*original.raw_code, code);
+        EXPECT_TRUE(original.launch_source->matches(original));
+        const auto prepared = f::prepare(draw);
+        ASSERT_TRUE(prepared && prepared->launch_source);
+        const auto plan = g::cached_fragment_draw_program(original, *prepared, raster_device(), 48);
+        ASSERT_TRUE(plan);
+        ASSERT_TRUE(plan->rejection_reason().empty()) << plan->rejection_reason();
+        ASSERT_TRUE(plan->capacity_owner() && plan->capacity_owner()->kernel());
+        const auto& kernel = *plan->capacity_owner()->kernel();
+        EXPECT_EQ(kernel.guest_code, code);
+        EXPECT_EQ(kernel.program.packet.initial_mask_availability, g::kPacketInitialExec);
+        EXPECT_EQ(kernel.program.packet.export_observation,
+                  g::FragmentPacketExportObservation::Architectural);
+        EXPECT_FALSE(kernel.program.packet.spirv.empty());
+        EXPECT_EQ(plan, g::cached_fragment_draw_program(original, *prepared, raster_device(), 48));
+    }
+}
+
+TEST_F(FragmentRasterLaunch, ReservedPrefetchAndUnprovedClauseDoNotMintPendingOriginalPermission) {
+    for (uint32_t mode : {0u, 4u, 0x103u, 0x8003u}) {
+        SCOPED_TRACE(mode);
+        auto code = helper_original();
+        code.insert(code.begin(), 0xbfa00000u | mode);
+        const auto refused = helper_requirements(code, {1u << 8, 1u << 8});
+        EXPECT_EQ(refused.rejection, "fragment-raster-prefetch-mode-unimplemented:pc=0");
+        EXPECT_TRUE(refused.positions.empty());
+    }
+    auto clause = helper_original();
+    clause.insert(clause.begin(), 0xbfa10001u);
+    const auto refused = helper_requirements(clause, {1u << 8, 1u << 8});
+    EXPECT_EQ(refused.rejection, "fragment-raster-clause-unimplemented:pc=0");
+    EXPECT_TRUE(refused.positions.empty());
+}
+
 TEST_F(FragmentRasterLaunch, SavedMaskNumericalExposureAndPartialAliasReplacementStayUnproved) {
     auto code = helper_original();
     code.insert(code.begin() + 2, 0x7e020214u); // v_mov_b32 v1,s20 exposes actual mask bits

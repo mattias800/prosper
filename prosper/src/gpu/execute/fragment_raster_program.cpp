@@ -123,8 +123,13 @@ FragmentRasterProgram fragment_raster_program(const std::vector<Rdna2Inst>& inst
         } else if (in.fmt == Rdna2Format::SOPP && in.opcode == 1 && in.is_end) {
             ended = in.pc + in.len_dwords == original_words;
             if (!ended) return fail("fragment-raster-original-end-unproved");
+        } else if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x20 &&
+                   !rdna2_is_valid_instruction_prefetch(in)) {
+            return fail("fragment-raster-prefetch-mode-unimplemented");
+        } else if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x21) {
+            return fail("fragment-raster-clause-unimplemented");
         } else if (!(in.fmt == Rdna2Format::SOPP &&
-                     (in.opcode == 0 || in.opcode == 0x20 || in.opcode == 0x21 ||
+                     (in.opcode == 0 || rdna2_is_valid_instruction_prefetch(in) ||
                       (in.opcode == 0x0c && !rdna2_waitcnt_execution_gap(uint16_t(in.simm16))))))
             return fail("fragment-raster-quad-local-program-unimplemented");
     }

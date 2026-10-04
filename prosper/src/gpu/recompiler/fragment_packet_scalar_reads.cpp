@@ -27,6 +27,7 @@ bool known_effects(const Rdna2Inst& in) {
         case Rdna2Format::SOPC: return in.opcode <= 0x13;
         case Rdna2Format::SOPP:
             return in.opcode == 0 || (in.opcode == 1 && in.is_end) ||
+                   rdna2_is_valid_instruction_prefetch(in) ||
                    (in.opcode == 0x0c && rdna2_waitcnt_effects_known(uint16_t(in.simm16)));
         case Rdna2Format::VOP1:
             return in.opcode == 1 || in.opcode == 2 || in.opcode == 0x2a || in.opcode == 0x2e ||

@@ -5,6 +5,31 @@ unverified and has two confirmed review findings. General Wave64 and Kena title-
 NOT complete. No current Kena drop census, FPS improvement or title-screen rendering result was
 measured in this checkpoint. Work was frozen at the maintainer's checkpoint request.
 
+## Source-only follow-up after the frozen checkpoint
+
+The original3fcb/2775280b checkpoint and its registered REJECTED review remain historical.
+A protected successor attempts the PREFETCH correction: a shared canonical encoding predicate
+now connects cold proof, complete effects, mask/scalar-origin inventories and Architectural final
+packet admission. Reserved modes and unproved CLAUSE have named refusals. LegacyRaw and the
+separate resource API are not expanded. The underlying synchronous emitter already treats the
+I-cache hint as a no-op; it is no longer accepted by only the early launch proof.
+
+Three new source-declared regressions (UNEXECUTED):
+
+- `FragmentRasterLaunch.CanonicalPrefetchRetainsTheRegisteredOriginalThroughFinalCompilation`
+  covers valid modes1..3, real registration/private association, masks, final kernel and warm reuse.
+- `FragmentRasterLaunch.ReservedPrefetchAndUnprovedClauseDoNotMintPendingOriginalPermission`
+  covers reserved0/4/high-bit modes and CLAUSE named cold-proof refusals.
+- `FragmentScalarReads.CanonicalPrefetchPreservesOriginsButReservedHintsAndClausesRefuse`
+  covers original descriptor origins/shifted PCs and atomic manifest refusal.
+
+This is an authored source attempt, not a verified repair or review approval. The future campaign
+must include these cases in addition to the frozen inventory below, and independently check the
+final dispatcher negative and LegacyRaw/resource neighbors. No native build/test/SPIR-V/GPU or
+game was run for this follow-up. The position-independent entry-schema repair remains unstarted;
+the rest of the incomplete review and full-original frontier are unchanged. Source/gate identities
+and outcomes are recorded in the PR follow-up comment, not borrowed from the frozen3fcb receipt.
+
 ## Objective and acceptance boundary
 
 Implement accurate, general guest Wave64 on hosts without native Wave64. Kena's title-screen 3D
