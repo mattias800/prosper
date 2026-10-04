@@ -13,15 +13,15 @@ again before resuming, because this document deliberately records a dated state.
 Messenger's exact earlier run/source/arm is unbound. Retained native images and visual judgments
 remain useful. Evergate's logged route now reached its menu and real tutorial in two fresh OFF
 runs and an ON counterpart, with matching recorded input intervals. Its shader-refusal rendering
-HOLD remains visible. Two of fourteen original phase comparisons are documented, twelve remain.
-Dead Cells' scripted OFF arm additionally reached its menu and two gameplay/HUD captures;
-its matching ON arm is the next bounded run.
+HOLD remains visible. Dead Cells' unchanged scripted OFF/ON pair reached its menu and two
+gameplay/HUD captures per arm, with no counted draw/dispatch losses. Three of fourteen original
+phase comparisons are documented, eleven remain.
 Performance measurements must use a verified scripted route and matching admitted scenes;
 explicitly selected splash/title populations must stay separate from in-level gameplay.
 
 | Original item | Checkpoint | Work remaining |
 | --- | --- | --- |
-| [#3948 async submission](https://github.com/mattias800/prosper/issues/3948) | Measurement/Stage 0 and opt-in Stage 2 are merged. **Default remains OFF.** Historical GTA collapse investigation, normal-app A/B observations and apparatus limitations are documented. The ee9dcb1e normal app is qualified; Messenger's visual pair and Evergate's scripted menu/tutorial pair are documented. Evergate retains a fragment-rendering HOLD. | Finish the remaining twelve original phase comparisons, resolve or retain rendering holds, and run the larger repeated current-cohort GTA/Sonic A/B with verified scripted controls. Refuse unsupported default claims. |
+| [#3948 async submission](https://github.com/mattias800/prosper/issues/3948) | Measurement/Stage 0 and opt-in Stage 2 are merged. **Default remains OFF.** Historical GTA collapse investigation, normal-app A/B observations and apparatus limitations are documented. The ee9dcb1e normal app is qualified; Messenger, Evergate and Dead Cells phase pairs are documented. Evergate retains a fragment-rendering HOLD. | Finish the remaining eleven original phase comparisons, resolve or retain rendering holds, and run the larger repeated current-cohort GTA/Sonic A/B with verified scripted controls. Refuse unsupported default claims. |
 | [#3951 raw x4/x8 scalar backing](https://github.com/mattias800/prosper/issues/3951) | Original backing work landed through #3987, #4104 and #4270. Broader original scalar-buffer/Wave64 integration #4374 also merged on October 4. | Do not restart the completed original backing task. Normal-game effects of the newly merged integration still need current-app evidence; Windows/Kena work is a separate lane. |
 | [#3892 renderer state/image-branch work](https://github.com/mattias800/prosper/issues/3892) | Original registration-owned state and image-branch work completed. | No unfinished original unit is claimed here. Consult later issue comments for separate follow-ups. |
 | [#3891 performance alarms](https://github.com/mattias800/prosper/issues/3891) | Original accepted alarm proposals and review nits completed. | Read raw alarms and exit summaries on every new run; propose a new rule only for an actual uncovered engine problem. |
@@ -384,6 +384,48 @@ then an isolated ON arm with the same route, seven requests, app/settings and or
 Read actual deferred-path counters, every native frame and all diagnostics before completing
 the pair. No async default change or quiet-performance result is claimed.
 
+## Dead Cells OFF/ON pair: matching scripted phases, no counted rendering losses
+
+The matching visible ON arm completed in **321.042 s**, using the same freshly checked ee9dcb1e
+normal app, unchanged route, seven requests, native full rendering, original320-second cap and
+fresh isolated save/cache/Mesa state. Root inspected all seven ON native frames:500/1000/2000
+are the same selectable menu,2500 and actual3001 show the update pop-up,12000/15000 show the
+same Primary weapon/player/world/HUD area as OFF with animation variation. All29 logged states
+again match20 composed successful-pad-read intervals. Actual PROSPER environment differences,
+after normalizing isolated output/save/cache roots and recorder paths, consist only of deferred
+wait0 versus1. Equality of the initial internal game state is not proved.
+
+The63 completed ON windows retain **73456 deferred submissions** and **24764 blocked deferrals**;
+graphics wait/device timestamp counts were92111/92111. Frontend/contract/backend dropped draws,
+skipped dispatches, Wave64 refusals and target evictions were0 in both arms. Each arm's emitted
+alarm lines and exit reports were read: ON F32-unverified63/63,1933044 known-launch-mode compiler
+requests and555672 site-inventory-truncated requests; one new first-window unimplemented HLE
+NID; RTT-colorless publication NO_DATA. These observations retain their compiler-request limits.
+
+ON emitted one GRAPHICS failure with **submit-origin=shutdown-gate-refused**, no fence wait and
+no driver-submit origin. This synthetic shutdown refusal does not establish a hardware device
+loss. Its unverified final draw snapshot was1969320 seen,1969315 recorded,0 dropped, delta5;
+do not rewrite that incomplete snapshot as quiescent. App/runner/launcher exited0;31 owned
+normal-window samples and before-cutoff ownership passed, both owned births drained, and the
+post-run prosper-app census was empty. OFF emitted no GRAPHICS failure.
+
+The separate immutable pair supplement was verified and fsynced: **407521280 bytes**,
+**1623 regular members**, zero mismatches; SHA256
+**a3efdc0a0431d7e7cf618176cd4b5d62505d61d5da0a3dca18841219540adbf1**.
+The earlier OFF archive remains intact. Latest public/state sidecars may postdate archive creation.
+
+**Six phase-observed arms / three of fourteen pairs** are documented; two pairs have no counted
+draw/dispatch losses, while Evergate remains HOLD. Eleven phase pairs and the larger repeated
+GTA/Sonic campaign remain pending. No quiet-performance, fresh delivered-FPS, pixel-oracle or
+async-default claim follows from this compatibility pair.
+
+Next original title is **Blasphemous 2**. Its fresh-save exploratory route must be calibrated
+against actual delivered inputs and moving gameplay; the original540-second cap is retained.
+Its README recommends `load-save-first-station.pad` and an existing first-station save for
+reliable gameplay measurements. Bind the same seed bytes for both timed arms and treat that
+seeded route as a separate cohort from the original fresh-save snapshot guard. No seed was
+restored and no next-title game was launched at this checkpoint.
+
 ## Input control required for performance admission
 
 Every timed arm must carry the exact scripted route bytes/hash and input trace, source/app identity,
@@ -511,10 +553,11 @@ Preserve the original helper and failed run unchanged. Fresh complete OFF and ON
 same reviewed successor, distinct unused output directories, fresh saves/caches, and a fresh
 native desktop binding. Do not rerun the known-overflow original helper.
 
-## Original fourteen-title visual inventory: two phase pairs documented
+## Original fourteen-title visual inventory: three phase pairs documented
 
-The ee9dcb1e app is qualified; Messenger's visual pair and Evergate's scripted phase pair are
-recorded above. Evergate retains its fragment/Wave64 rendering HOLD. The other twelve pairs remain
+The ee9dcb1e app is qualified; Messenger's visual pair, Evergate's scripted phase pair and
+Dead Cells' scripted menu/gameplay pair are recorded above. Evergate retains its fragment/Wave64
+rendering HOLD. The other eleven pairs remain
 pending. The table retains the original candidate controls for all titles;
 it is not a claim that every candidate ordinal reached its proposed phase.
 
@@ -577,8 +620,8 @@ historical sky seam/HUD/partial-model rendering HOLD remains a hold until curren
 5. Messenger OFF/ON visual evidence is complete on ee9dcb1e; scripted progression still needs
    verification before performance use. Evergate's first new route calibration reached the menu
    and one Ki/tutorial frame, then fresh OFF and ON captured both 7000/7300 with matching recorded
-   input. Keep the fragment-rendering HOLD; Dead Cells OFF now reached its menu and two gameplay/HUD
-   frames on its unchanged route. Complete its matching ON arm, then the other eleven phase comparisons.
+   input. Keep the fragment-rendering HOLD; Dead Cells OFF/ON reached its menu and two gameplay/HUD
+   frames per arm on its unchanged route. Continue with Blasphemous 2 and the other eleven pending pairs.
    Qualify fresh native desktop/env/window
    binding and bind the exact reviewed helper hashes and actual app/source. The 3fe preparation contains inert
    candidate data only: no app qualification, executable grant or completed current guard.
