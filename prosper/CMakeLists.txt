@@ -2833,6 +2833,11 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_decode_sweep.cpp
     LIBRARIES prosper_core)
 
+  # The scalar opcode predicates are header-only facts checked against ISA/LLVM tables.
+  prosper_add_gtest(test_scalar_predicates
+    SOURCES tests/gpu/recompiler/test_scalar_predicates.cpp
+    INCLUDES src)
+
   # The SOPP branch predicate is a header-only fact checked against the ISA table.
   prosper_add_gtest(test_sopp_direct_branch
     SOURCES tests/gpu/recompiler/test_sopp_direct_branch.cpp
@@ -3608,9 +3613,8 @@ endif()
     SOURCES tests/gpu/recompiler/test_undef_loop_accumulator.cpp
     LIBRARIES prosper_core)
 
-  # Fail-visible refusal pins for gap opcodes (v_perm_b32, v_mad_i64_i32,
-  # v_div_fixup_f32, v_sad_u8, s_movrels_b32, image_gather4): empty module,
-  # never a silent mistranslation. Compile-only, no device. Any later
+  # Fail-visible refusal pins for gap opcodes (the file header lists the current
+  # set): empty module, never a silent mistranslation. Compile-only, no device. Any later
   # lowering replaces these arms with execution tests.
   prosper_add_gtest(test_gap_opcode_refusals
     SOURCES tests/gpu/recompiler/test_gap_opcode_refusals.cpp

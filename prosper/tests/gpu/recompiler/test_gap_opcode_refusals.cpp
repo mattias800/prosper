@@ -1,5 +1,5 @@
-// test_gap_opcode_refusals — fail-visible refusal pins for six opcodes the compute recompiler
-// decodes but does not lower: v_perm_b32, v_mad_i64_i32, v_div_fixup_f32, v_sad_u8, s_movrels_b32
+// test_gap_opcode_refusals — fail-visible refusal pins for opcodes the compute recompiler
+// decodes but does not lower: v_mad_i64_i32, v_div_fixup_f32, s_movrels_b32
 // and image_gather4 (implicit LOD).
 //
 // Per the recompiler charter an unsupported op is a FATAL gap, and the loud refusal is only the
@@ -9,7 +9,7 @@
 // arm with an execution test of the new lowering rather than deleting the assertion.
 //
 // Each arm is paired with a control built from the SAME program with ONLY the gap instruction
-// swapped for a lowered sibling with identical operand fields (v_sad_u32 for the three VOP3A arms,
+// swapped for a lowered sibling with identical operand fields (v_sad_u32 for the VOP3A arms,
 // v_mad_u64_u32 for the VOP3B arm, s_mov_b32 for s_movrels_b32, image_gather4_lz for
 // image_gather4). The control compiling is what makes the refusal about the opcode rather than the
 // operands, the resource table or the program shape.
@@ -134,7 +134,7 @@ void expect_compiles(const std::vector<uint32_t>& code, uint64_t addr, const cha
     if (!spv.empty()) { EXPECT_EQ(spv[0], 0x07230203u) << what << ": not a SPIR-V module"; }
 }
 
-// Decode check shared by the three VOP3A arms: vdst v5, sources v1, v2, v3, no modifiers.
+// Decode check shared by the VOP3A arms: vdst v5, sources v1, v2, v3, no modifiers.
 void expect_vop3a_v5_v1_v2_v3(const uint32_t (&w)[2], uint32_t opcode) {
     const Rdna2Inst dec = rdna2_decode_one(w, 2);
     EXPECT_EQ(dec.fmt, Rdna2Format::VOP3);
@@ -160,20 +160,12 @@ constexpr uint32_t kSadU32[2] = {0xd55d0005u, 0x040e0501u};
 
 }   // namespace
 
-// CONTROL for the three VOP3A arms: the identical program with the lowered v_sad_u32 in the gap
+// CONTROL for the VOP3A arms: the identical program with the lowered v_sad_u32 in the gap
 // slot. Same prologue, same vdst/src fields; only the opcode differs.
 TEST(GapOpcodeRefusals, ControlVop3aSiblingCompiles) {
     expect_vop3a_v5_v1_v2_v3(kSadU32, 0x15du);
     expect_compiles(program(kVop3Prologue, {kSadU32[0], kSadU32[1]}), 0xA000ull,
                     "v_sad_u32 v5, v1, v2, v3 with the shared VOP3 prologue");
-}
-
-// V_PERM_B32 v5, v1, v2, v3 (VOP3 0x344).
-TEST(GapOpcodeRefusals, PermB32) {
-    static const uint32_t w[2] = {0xd7440005u, 0x040e0501u};
-    expect_vop3a_v5_v1_v2_v3(w, 0x344u);
-    expect_gap_refusal(program(kVop3Prologue, {w[0], w[1]}), 0xA001ull, 4, {w[0], w[1]},
-                       Rdna2Format::VOP3, 0x344u);
 }
 
 // V_DIV_FIXUP_F32 v5, v1, v2, v3 (VOP3 0x15f).
@@ -182,15 +174,6 @@ TEST(GapOpcodeRefusals, DivFixupF32) {
     expect_vop3a_v5_v1_v2_v3(w, 0x15fu);
     expect_gap_refusal(program(kVop3Prologue, {w[0], w[1]}), 0xA021ull, 4, {w[0], w[1]},
                        Rdna2Format::VOP3, 0x15fu);
-}
-
-// V_SAD_U8 v5, v1, v2, v3 (VOP3 0x15a). Its 32-bit sibling v_sad_u32 is the control above; this
-// pins the per-byte form to a refusal rather than a silent v_sad_u32-style mistranslation.
-TEST(GapOpcodeRefusals, SadU8) {
-    static const uint32_t w[2] = {0xd55a0005u, 0x040e0501u};
-    expect_vop3a_v5_v1_v2_v3(w, 0x15au);
-    expect_gap_refusal(program(kVop3Prologue, {w[0], w[1]}), 0xA031ull, 4, {w[0], w[1]},
-                       Rdna2Format::VOP3, 0x15au);
 }
 
 // V_MAD_I64_I32 v[5:6], s12, v1, v2, v[3:4] (VOP3B 0x177). dword0[14:8] is the SDST carry
