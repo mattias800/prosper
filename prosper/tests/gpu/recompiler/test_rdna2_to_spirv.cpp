@@ -498,23 +498,25 @@ int main() {
     CHECK(got4d.size()==N && bad4d==0, "recompiled kernel 4d computes unsigned min-of-three correctly");
 
     // Kernel 4e: signed median-of-three (v_med3_i32, 0x158).
-    // Tests signed ordering with negative and positive inputs.
+    // Tests signed ordering with negative and positive inputs. Unlike kernels 4-4d these convert
+    // through the SIGNED forms -- v_cvt_i32_f32 (VOP1 0x08) in, v_cvt_f32_i32 (0x05) out -- since
+    // v_cvt_u32_f32 would clamp every negative input to 0 and never exercise a signed compare.
     const uint32_t code4e[] = {
-        0x7E000F00u, 0x7E020F01u, 0x7E040F02u, 0xD5580003u, 0x040A0300u, 0x7E000D03u, 0xBF810000u,
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0xD5580003u, 0x040A0300u, 0x7E000B03u, 0xBF810000u,
     };
     std::vector<uint32_t> spv4e = recompile_valu(code4e, std::size(code4e), 3, 0);
     CHECK(!spv4e.empty(), "recompiled kernel 4e (v_med3_i32) -> SPIR-V");
 
     // Kernel 4f: signed max-of-three (v_max3_i32, 0x155).
     const uint32_t code4f[] = {
-        0x7E000F00u, 0x7E020F01u, 0x7E040F02u, 0xD5550003u, 0x040A0300u, 0x7E000D03u, 0xBF810000u,
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0xD5550003u, 0x040A0300u, 0x7E000B03u, 0xBF810000u,
     };
     std::vector<uint32_t> spv4f = recompile_valu(code4f, std::size(code4f), 3, 0);
     CHECK(!spv4f.empty(), "recompiled kernel 4f (v_max3_i32) -> SPIR-V");
 
     // Kernel 4g: signed min-of-three (v_min3_i32, 0x152).
     const uint32_t code4g[] = {
-        0x7E000F00u, 0x7E020F01u, 0x7E040F02u, 0xD5520003u, 0x040A0300u, 0x7E000D03u, 0xBF810000u,
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0xD5520003u, 0x040A0300u, 0x7E000B03u, 0xBF810000u,
     };
     std::vector<uint32_t> spv4g = recompile_valu(code4g, std::size(code4g), 3, 0);
     CHECK(!spv4g.empty(), "recompiled kernel 4g (v_min3_i32) -> SPIR-V");
