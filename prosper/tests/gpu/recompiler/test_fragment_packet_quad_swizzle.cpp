@@ -4,8 +4,10 @@
 #include "bpermute_spirv_oracle.hpp"
 #include <gtest/gtest.h>
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <string>
 
 namespace {
 using namespace prosper::gpu;
@@ -83,6 +85,27 @@ void evaluate(const FragmentInvocationPacket& input, const char* name, bool abse
         }
     }
 }
+void expect_terminal_reject(const FragmentInvocationPacket& input, const char* reason,
+                            uint32_t pc) {
+    // This is observation-only attribution, not a registered shader or launch authority.
+    const RecompileDiagnosticContext diagnostic{
+        RecompileDiagnosticStage::Fragment,
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(input.guest_code.data()))};
+    ASSERT_NE(diagnostic.program_address, 0u);
+    TerminalRejectCapture capture;
+    const auto refused = recompile_fragment_packet(input, diagnostic);
+    EXPECT_TRUE(refused.spirv.empty());
+    EXPECT_TRUE(refused.input_words.empty());
+    EXPECT_TRUE(refused.output_words.empty());
+    EXPECT_EQ(refused.rejection, reason) << "public rejection is the bare reason, not its site";
+    const auto records = capture.take();
+    ASSERT_EQ(records.size(), 1u) << "a fresh compile must actually announce its terminal site";
+    EXPECT_EQ(records[0].first, "fragment-packet-reject");
+    const std::string payload = "pc=" + std::to_string(pc) + " reason=" + reason;
+    EXPECT_EQ(records[0].second, payload);
+    EXPECT_EQ(last_terminal_reject_reason(diagnostic.program_address),
+              "fragment-packet-reject " + payload);
+}
 }   // namespace
 
 TEST(PacketQuadSwizzle, SavedExecWqmGenuineHelpersAliasAndUpper32ProduceOriginalWords) {
@@ -100,9 +123,7 @@ TEST(PacketQuadSwizzle, CounterSpecificCompletionCannotBeBorrowedFromVmOrExport)
     const auto safe = recompile_fragment_packet(packet());
     ASSERT_FALSE(safe.spirv.empty()) << safe.rejection;
     for (uint32_t wait : {0xbf8c3f70u, 0xbf8cff0fu, 0xbf8cff7fu}) {
-        const auto refused = recompile_fragment_packet(packet(wait));
-        EXPECT_TRUE(refused.spirv.empty());
-        EXPECT_EQ(refused.rejection, "packet-quad-swizzle-result-read-before-lgkm-wait:pc=6");
+        expect_terminal_reject(packet(wait), "packet-quad-swizzle-result-read-before-lgkm-wait", 6);
     }
 }
 TEST(PacketQuadSwizzle, AllPathWaitAndOverwriteRemainSeparateLoadBearingGuards) {
@@ -112,23 +133,29 @@ TEST(PacketQuadSwizzle, AllPathWaitAndOverwriteRemainSeparateLoadBearingGuards) 
     input.scc_available = true;
     input.scc = true;
     input.guest_code.insert(input.guest_code.begin() + 4, 0xbf840001u);
-    const auto bypass = recompile_fragment_packet(input);
-    EXPECT_TRUE(bypass.spirv.empty());
-    EXPECT_EQ(bypass.rejection, "packet-quad-swizzle-result-read-before-lgkm-wait:pc=7");
+    expect_terminal_reject(input, "packet-quad-swizzle-result-read-before-lgkm-wait", 7);
+    input.guest_code[4] = 0xbf840000u;   // both branch arms now execute the same LGKM wait
+    const auto waited = recompile_fragment_packet(input);
+    ASSERT_FALSE(waited.spirv.empty()) << waited.rejection;
     input = packet();
     input.guest_code.insert(input.guest_code.begin() + 4,
                             0x7e000280u);   // overwrite v0 before wait
-    const auto overwrite = recompile_fragment_packet(input);
-    EXPECT_TRUE(overwrite.spirv.empty());
-    EXPECT_EQ(overwrite.rejection, "packet-quad-swizzle-result-overwrite-before-lgkm-wait:pc=4");
+    expect_terminal_reject(input, "packet-quad-swizzle-result-overwrite-before-lgkm-wait", 4);
+    input = packet();
+    input.guest_code.insert(input.guest_code.begin() + 5, 0x7e000280u);
+    const auto completed_overwrite = recompile_fragment_packet(input);
+    ASSERT_FALSE(completed_overwrite.spirv.empty()) << completed_overwrite.rejection;
 }
 TEST(PacketQuadSwizzle, TopologyModesAndLegacyPolicyRemainExplicitNotBroadDsAdmission) {
     auto input = packet();
+    const auto safe = recompile_fragment_packet(input);
+    ASSERT_FALSE(safe.spirv.empty()) << safe.rejection;
     input.quad_topology = FragmentPacketQuadTopology::Unknown;
-    EXPECT_EQ(recompile_fragment_packet(input).rejection, "packet-quad-topology-unavailable:pc=2");
+    // The original WQM at PC1 needs the topology before the DS instruction at PC2 does.
+    expect_terminal_reject(input, "packet-quad-topology-unavailable", 1);
     input = packet();
     input.export_observation = FragmentPacketExportObservation::LegacyRaw;
-    EXPECT_EQ(recompile_fragment_packet(input).rejection, "packet-ds-op-unimplemented:pc=2");
+    expect_terminal_reject(input, "packet-ds-op-unimplemented", 2);
     for (uint32_t bits : {0u, 0x10000u, 0x20000u, 0x4000u, 0x6000u}) {
         input = packet();
         input.guest_code[2] = 0xd8d40000u | bits;
