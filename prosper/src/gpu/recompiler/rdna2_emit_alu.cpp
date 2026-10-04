@@ -12,6 +12,7 @@
 #include "gpu/recompiler/rdna2_perm_b32.hpp"
 #include "gpu/recompiler/rdna2_div_fixup.hpp"
 #include "gpu/recompiler/rdna2_mad_64.hpp"
+#include "gpu/recompiler/rdna2_movrels.hpp"
 #include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#325)
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -180,7 +181,6 @@ namespace {
 }
 
 namespace {
-
 
 // Number of consecutive scalar dwords consumed by one explicit ALU source. Operand decode names
 // only the first physical register, so every CFG/liveness user must share this opcode-aware width
@@ -1477,6 +1477,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_entry_m0.erase(124);
                 return true;
             }
+            if (in.opcode == 0x2E) return emit_s_movrels_b32(b, rs, in, ok);   // s_movrels_b32
             // A write of anything else ends this register's entry-M0 lifetime.
             rs.sreg_entry_m0.erase(in.dst.value);
             uint32_t a = val(in.src[0]); uint32_t& d = rs.sreg[in.dst.value];
@@ -9395,7 +9396,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 }
 
 namespace {
-
 
 } // namespace
 
