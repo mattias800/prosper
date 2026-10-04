@@ -430,6 +430,29 @@ TEST(GraphicsRawRegisterWideData, Contract) {
                       sdst_decoded.at(2u).sdst.value == 106 &&
                       rdna2_proven_raw_register_wide_data_loads(sdst_decoded).empty(),
                   name, "a VOP3B carry SDST naming VCC still clobbers scalar VCC");
+            // Lane reads into VCC: the decoder files their destination as a VGPR operand, so
+            // they must be judged by register number (#4425 review). This fixture's SOFFSET is
+            // VCC_HI. A lane read into VCC_LO leaves that half intact, but the walk deliberately
+            // stops at ANY possible VCC writer while VCC is live; a lane read into VCC_HI writes
+            // the needed half itself and is also reported by for_each_scalar_write.
+            const auto firstlane_decoded = decoded_between(between(0x7ed40500u, 0u));
+            check(firstlane_decoded.at(2u).fmt == Rdna2Format::VOP1 &&
+                      firstlane_decoded.at(2u).opcode == 0x02u &&
+                      firstlane_decoded.at(2u).dst.value == 106 &&
+                      rdna2_proven_raw_register_wide_data_loads(firstlane_decoded).empty(),
+                  name, "v_readfirstlane_b32 vcc_lo stops the walk while VCC is live");
+            const auto readlane_decoded = decoded_between(between(0xd760006au, 0x00010100u));
+            check(readlane_decoded.at(2u).fmt == Rdna2Format::VOP3 &&
+                      readlane_decoded.at(2u).opcode == 0x360u &&
+                      readlane_decoded.at(2u).dst.value == 106 &&
+                      rdna2_proven_raw_register_wide_data_loads(readlane_decoded).empty(),
+                  name, "v_readlane_b32 vcc_lo stops the walk while VCC is live");
+            const auto firstlane_hi_decoded = decoded_between(between(0x7ed60500u, 0u));
+            check(firstlane_hi_decoded.at(2u).fmt == Rdna2Format::VOP1 &&
+                      firstlane_hi_decoded.at(2u).opcode == 0x02u &&
+                      firstlane_hi_decoded.at(2u).dst.value == 107 &&
+                      rdna2_proven_raw_register_wide_data_loads(firstlane_hi_decoded).empty(),
+                  name, "v_readfirstlane_b32 vcc_hi overwrites the live SOFFSET half");
         }
 
         // A raw descriptor bundle may be patched before its exact-PC consumer. Its words never

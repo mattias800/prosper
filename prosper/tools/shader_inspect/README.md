@@ -225,7 +225,8 @@ decide whether its loaded words may be used as numeric data:
 
 A `raw-wide-proof-end` line terminates the output. Unlike `--stage`, these proofs read code
 only, so a raw dump answers them exactly. A row with `needs-backing=1 entry-proven=0` is a
-load the recompiler will refuse with `[smem-reject] reason=raw-wide-data-requires-backing`.
+load the recompiler is expected to refuse with `[smem-reject] reason=raw-wide-data-requires-backing`
+unless another admission route applies (the tool has no resource table to evaluate those).
 
 ## `--stage` cannot prove a shader is unsupported (#1571)
 

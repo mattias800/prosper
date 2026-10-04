@@ -2,6 +2,7 @@
 // Actual scalar observers still need backing, and uncertain memory effects still block snapshots.
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include <gtest/gtest.h>
 #include <cstdint>
 #include <vector>
@@ -159,4 +160,35 @@ TEST(RawWideFlatReadEffects, LaterImageSampleDoesNotForceRegisterOffsetDescripto
     EXPECT_TRUE(rdna2_raw_wide_data_loads(sample).empty());
     EXPECT_EQ(rdna2_raw_wide_data_loads(store), std::vector<uint32_t>{1u})
         << "a genuine writer still keeps a register-offset descriptor patch fail-visible";
+}
+
+// #4425 review: the lane reads write an SGPR whose decoded operand kind is VGPR. cannot_write_vcc
+// is shared by the raw-wide VCC walk and the #590 uniform-VCCZ walk, which has no other backstop.
+TEST(RawWideFlatReadEffects, LaneReadsIntoVccAreVccWriters) {
+    const auto one = [](std::vector<uint32_t> words) {
+        std::vector<Rdna2Inst> out;
+        rdna2_walk(words.data(), words.size(), out);
+        return out.at(0);
+    };
+    const auto firstlane_vcc = one({0x7ed40500u});           // v_readfirstlane_b32 vcc_lo, v0
+    const auto firstlane_vcc_hi = one({0x7ed60500u});        // v_readfirstlane_b32 vcc_hi, v0
+    const auto firstlane_s5 = one({0x7e0a0500u});            // v_readfirstlane_b32 s5, v0
+    const auto readlane_vcc = one({0xd760006au, 0x00010100u});   // v_readlane_b32 vcc_lo, v0, 0
+    const auto readlane_s5 = one({0xd7600005u, 0x00010100u});    // v_readlane_b32 s5, v0, 0
+    const auto mov = one({0x7e020300u});                     // v_mov_b32 v1, v0
+    ASSERT_EQ(firstlane_vcc.fmt, Rdna2Format::VOP1);
+    ASSERT_EQ(firstlane_vcc.opcode, 0x02u);
+    ASSERT_EQ(firstlane_vcc.dst.value, 106);
+    ASSERT_EQ(firstlane_vcc_hi.dst.value, 107);
+    ASSERT_EQ(firstlane_s5.dst.value, 5);
+    ASSERT_EQ(readlane_vcc.fmt, Rdna2Format::VOP3);
+    ASSERT_EQ(readlane_vcc.opcode, 0x360u);
+    ASSERT_EQ(readlane_vcc.dst.value, 106);
+    ASSERT_EQ(readlane_s5.dst.value, 5);
+    EXPECT_FALSE(cannot_write_vcc(firstlane_vcc));
+    EXPECT_FALSE(cannot_write_vcc(firstlane_vcc_hi));
+    EXPECT_FALSE(cannot_write_vcc(readlane_vcc));
+    EXPECT_TRUE(cannot_write_vcc(firstlane_s5));
+    EXPECT_TRUE(cannot_write_vcc(readlane_s5));
+    EXPECT_TRUE(cannot_write_vcc(mov));
 }

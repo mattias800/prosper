@@ -667,12 +667,14 @@ std::vector<uint32_t> rdna2_proven_raw_register_wide_data_loads(
                               writer.fmt == Rdna2Format::VOP3 ||
                               writer.fmt == Rdna2Format::VOPC;
             // Conservative for implicit writers too: no VALU that MAY write VCC may intervene in a
-            // live VCC dependency. cannot_write_vcc admits only encodings that provably leave
-            // VCC alone (VOP1, non-carry VOP2, VOP3A without a mask SDST); VOPC's implicit dst,
-            // the VOP2 carry chain and a VOP3 mask SDST still stop the walk. Kena's NGG vertex
-            // programs schedule a VOP3 v_cndmask_b32 with an explicit SGPR mask between
-            // `s_and_b32 vcc_lo, ...` and `s_load_dwordx4 ..., vcc_lo` (#4422). An earlier VALU
-            // before its scalar replacement has no such dependency.
+            // live VCC dependency. cannot_write_vcc admits only encodings it can show leave VCC
+            // alone: VOP1/VOP2 other than the carry chain and v_readfirstlane into VCC, and VOP3A
+            // without a mask SDST other than v_readlane into VCC. VOPC's implicit dst, the VOP2
+            // carry chain, a VOP3 mask SDST naming VCC and a lane read into VCC still stop the
+            // walk. Kena's NGG vertex programs schedule a VOP3 v_cndmask_b32 with an explicit SGPR
+            // mask between `s_and_b32 vcc_lo, ...` and `s_load_dwordx4 ..., vcc_lo` (#4422). Any
+            // other scalar write of a needed register is still reported by for_each_scalar_write
+            // below. An earlier VALU before its scalar replacement has no such dependency.
             if (valu && (needed.test(106) || needed.test(107)) && !cannot_write_vcc(writer)) {
                 scalar_prefix = false;
                 break;

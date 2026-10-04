@@ -528,8 +528,14 @@ inline bool cannot_write_vcc(const Rdna2Inst& in) {
         const int lo = in.dst.value, hi = in.dst.value + (int)n_dwords - 1;
         return hi < 106 || lo > 107;
     };
+    // The two lane reads write an SGPR although the decoder files their destination as a VGPR
+    // operand (scalar_write_width knows them by opcode). Judge them by register number, or a
+    // `v_readfirstlane_b32 vcc_lo` / `v_readlane_b32 vcc_lo` would pass as VCC-preserving (#4425).
+    const auto lane_read_misses_vcc = [&] { return in.dst.value != 106 && in.dst.value != 107; };
     switch (in.fmt) {
         case Rdna2Format::VOP1:
+            if (in.opcode == 0x02) return lane_read_misses_vcc();   // v_readfirstlane_b32
+            return true;
         case Rdna2Format::VINTRP:
         case Rdna2Format::MUBUF: case Rdna2Format::MTBUF: case Rdna2Format::MIMG:
         case Rdna2Format::DS:    case Rdna2Format::FLAT:
@@ -544,7 +550,7 @@ inline bool cannot_write_vcc(const Rdna2Inst& in) {
             // long as that destination does not overlap s106:s107. UE4 schedules long scalar-spill
             // sequences of these two ops between a uniform VOPC and its s_cbranch_vccz.
             if (in.opcode == 0x361) return true;
-            if (in.opcode == 0x360) return sgpr_dst_misses_vcc(1);
+            if (in.opcode == 0x360) return lane_read_misses_vcc();   // v_readlane_b32
             // Decoder storage has an SDST-shaped field for every VOP3 packet, but only VOP3B
             // operations architecturally write it. Treat ordinary VOP3A VALU as VCC-transparent;
             // otherwise a MAC between a uniform compare and VCCZ creates a false Wave64 vote.

@@ -181,6 +181,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --mimg-sites\n", argv[0]);
     std::fprintf(stderr, "       %s <raw-rdna2.bin> --wave-reasons\n", argv[0]);
+    std::fprintf(stderr, "       %s <raw-rdna2.bin> --raw-wide-proof\n", argv[0]);
         std::fprintf(stderr,
             "\n"
             "Decodes a raw RDNA2 shader dump. With --stage it also attempts a stage recompile.\n"
@@ -193,6 +194,9 @@ int main(int argc, char** argv) {
             "and pass input authority are not evaluated here. No title allowlist controls admission.\n"
             "Every row states these limits. Same sentinel discipline as\n"
             "--mimg-sites.\n"
+            "--raw-wide-proof prints ONLY the code-side proofs that gate numeric use of an x4/x8\n"
+            "scalar load: needs-backing, entry-proven and register-proven per load, then a\n"
+            "`raw-wide-proof-end` sentinel. These proofs read code only, so a raw dump answers them.\n"
             "It accepts EITHER a raw RDNA2 stream or a SPIR-V module (detected by the magic). A\n"
             "raw dump has no descriptors, so a texture-sampling shader cannot be lowered here and\n"
             "yields no reason data; pass the module from `gpu_replay --dump-shader DRAW:fs`, which\n"
