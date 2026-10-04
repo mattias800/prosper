@@ -50,7 +50,7 @@ project owner on a routed `reach-performance-story.pad` run with the bank interi
 `ab80a2d69`. That is the number to quote.
 
 > **2026-10-04: #4270 (merged 2026-10-03) cut the bank scene from ~9 to ~2.9 presented fps**, and
-> every GTA V performance cohort from 2026-10-03 onward measured that regression. PR GTAREG_PR
+> every GTA V performance cohort from 2026-10-03 onward measured that regression. PR #4421
 > recovers most of it; the remaining gap to #4270's parent is open. Details and numbers are in
 > `## Ruled out`, first entry.
 
@@ -5328,7 +5328,7 @@ falsification.
   through `measure.sh`, with the Performance menu and bank/HUD frames inspected in every arm.
   Bank-regime presented rate: 366f0854 **9.56**, #4270's parent 25b16b58 **8.89**, #4270
   (3650263d) **3.03**, main 54d63d38 **2.90**. The cause is #4270, in two parts, both fixed in
-  PR GTAREG_PR. (1) `graphics_program_requires_owned_waves()` re-walked the shader and re-ran the
+  PR #4421. (1) `graphics_program_requires_owned_waves()` re-walked the shader and re-ran the
   raw wave-wide dataflow several times per draw; reading the decode cache's classification gives
   ABBA **5.30 / 5.09 vs 2.93 / 2.90**. (2) Every owned-wave draw triggered an authoritative
   flush, reading back ~22 MiB of prior targets (66–147 GB per 300 s run), even though register
