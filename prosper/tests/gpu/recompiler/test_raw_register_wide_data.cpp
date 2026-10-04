@@ -266,8 +266,8 @@ int main(int argc, char** argv) {
           std::memcmp(replay.computes[0].resources->resources[0].host_data,
                       blob.bytes.data(), blob.bytes.size()) == 0,
           "replay preserves the rebased range and its owned current bytes");
-    // No draws: entry69 and wave70 each append only their independently framed zero count.
-    constexpr size_t empty_draw_tail_bytes = 8u;
+    // No draws: entry69, wave70 and launch71 each append their independently framed zero count.
+    constexpr size_t empty_draw_tail_bytes = 12u;
     constexpr size_t flags_tail_bytes = 8u;
     constexpr size_t transport_tail_bytes = 13u;
     constexpr size_t owned_tail_bytes = 8u;
@@ -277,7 +277,7 @@ int main(int argc, char** argv) {
     CHECK(encoded.size() >= empty_draw_tail_bytes + flags_tail_bytes + transport_tail_bytes +
                                 2u * owned_tail_bytes + mode_tail_bytes + width_tail_bytes +
                                 backing_tail_bytes &&
-              encoded[8] == 70u,
+              encoded[8] == 71u,
           "legacy controls require the current versioned capture tail");
     if (encoded.size() >= empty_draw_tail_bytes + flags_tail_bytes + transport_tail_bytes +
                               2u * owned_tail_bytes + mode_tail_bytes + width_tail_bytes +

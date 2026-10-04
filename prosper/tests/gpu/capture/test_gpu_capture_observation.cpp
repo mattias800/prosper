@@ -73,8 +73,10 @@ std::vector<uint8_t> common69_bytes(const GpuCaptureFile& capture) {
     std::string error;
     EXPECT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
     if (bytes.size() < 16) return {};
-    // No owned stages: v70's final extension is count + one absent-owner byte per draw.
-    EXPECT_EQ(bytes[8], 70);
+    // v71 raw launch controls: count + five (presence, raw word) pairs per draw.
+    EXPECT_EQ(bytes[8], 71);
+    bytes.resize(bytes.size() - 4 - 25 * capture.draws.size());
+    // No owned stages: v70's extension is count + one absent-owner byte per draw.
     for (const auto& draw : capture.draws) EXPECT_FALSE(draw.owned_waves);
     bytes.resize(bytes.size() - 4 - capture.draws.size());
     bytes[8] = 69;
@@ -115,8 +117,12 @@ CliResult cli(const std::filesystem::path& input, const std::string& arguments,
     }
     const auto command = quote(executable) + " " + arguments + " " + quote(input.string()) + " > " +
                          quote(log.string()) + " 2>&1";
+#ifdef _WIN32
+    // cmd /c removes the command's first/last quotes. Keep the individually quoted executable,
+    // capture and redirection paths inside a separate outer pair, including paths with spaces.
+    const int status = std::system(quote(command).c_str());
+#else
     int status = std::system(command.c_str());
-#ifndef _WIN32
     status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 #endif
     return {status, read_text(log)};
@@ -451,7 +457,7 @@ TEST(GpuCaptureObservationCli, MissingAndCapturedPendingFragmentStagesStayUnavai
     ASSERT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
     GpuCaptureFile decoded;
     ASSERT_TRUE(deserialize_gpu_capture(bytes, decoded, error)) << error;
-    ASSERT_EQ(decoded.format_version, 70);
+    ASSERT_EQ(decoded.format_version, 71);
     ASSERT_TRUE(decoded.draws[0].owned_waves);
     ASSERT_TRUE(decoded.draws[0].owned_waves->fragment_pending);
     ASSERT_TRUE(decoded.draws[0].fs.empty());

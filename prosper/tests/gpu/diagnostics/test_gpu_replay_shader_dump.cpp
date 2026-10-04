@@ -593,18 +593,23 @@ int main(int argc, char** argv) {
             0u,
             0u,
             0u,
+            // v71: no producing raster-launch-control records.
+            0u,
+            0u,
+            0u,
+            0u,
         };
         constexpr size_t legacy_fragment_tail_bytes = sizeof(legacy_fragment_tail);
-        static_assert(legacy_fragment_tail_bytes == 78u);
+        static_assert(legacy_fragment_tail_bytes == 82u);
         const bool exact_legacy_fragment_tail =
             gpu::serialize_gpu_capture(legacy_fragment_fixture, legacy_fragment_bytes, error) &&
             legacy_fragment_bytes.size() > 12u + legacy_fragment_tail_bytes &&
-            legacy_fragment_bytes[8] == 70u && legacy_fragment_bytes[9] == 0u &&
+            legacy_fragment_bytes[8] == 71u && legacy_fragment_bytes[9] == 0u &&
             legacy_fragment_bytes[10] == 0u && legacy_fragment_bytes[11] == 0u &&
             std::equal(std::begin(legacy_fragment_tail), std::end(legacy_fragment_tail),
                        legacy_fragment_bytes.end() - legacy_fragment_tail_bytes);
         CHECK(exact_legacy_fragment_tail,
-              "CLI fixture pins the exact current v61-v70 suffix before a legacy downgrade");
+              "CLI fixture pins the exact current v61-v71 suffix before a legacy downgrade");
         if (exact_legacy_fragment_tail) {
             auto relabeled_fragment_bytes = legacy_fragment_bytes;
             relabeled_fragment_bytes[8] = 60u;
@@ -613,7 +618,7 @@ int main(int argc, char** argv) {
                                                relabeled_fragment_capture, error) &&
                   error == "capture has trailing data",
                   "CLI fixture rejects a version-only relabel instead of a genuine v60 prefix");
-            // Remove the independently pinned v61-v70 fields, retaining all v60 retry state.
+            // Remove the independently pinned v61-v71 fields, retaining all v60 retry state.
             legacy_fragment_bytes.resize(legacy_fragment_bytes.size() - legacy_fragment_tail_bytes);
             legacy_fragment_bytes[8] = 60u;
             gpu::GpuCaptureFile legacy_fragment_capture;

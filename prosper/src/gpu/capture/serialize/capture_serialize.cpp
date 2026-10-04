@@ -1296,6 +1296,21 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
             if (error.empty()) error = "invalid owned logical-wave input state";
             return false;
         }
+    // v71: append raw producing raster execution/scheduling controls without changing v69/v70.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) {
+        const auto& launch = draw.ps_raster_launch;
+        w.u8(launch.sc_shader_control_available ? 1u : 0u);
+        w.u32(launch.sc_shader_control);
+        w.u8(launch.sc_mode_cntl_0_available ? 1u : 0u);
+        w.u32(launch.sc_mode_cntl_0);
+        w.u8(launch.sc_mode_cntl_1_available ? 1u : 0u);
+        w.u32(launch.sc_mode_cntl_1);
+        w.u8(launch.sc_aa_config_available ? 1u : 0u);
+        w.u32(launch.sc_aa_config);
+        w.u8(launch.db_shader_control_available ? 1u : 0u);
+        w.u32(launch.db_shader_control);
+    }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

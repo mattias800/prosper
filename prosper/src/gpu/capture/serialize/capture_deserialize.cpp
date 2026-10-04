@@ -1829,6 +1829,30 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 return false;
             }
     }
+    if (version >= 71u) {
+        uint32_t count = 0;
+        if (!r.u32(count) || count != c.draws.size()) {
+            error = "invalid realized-draw raster launch controls count";
+            return false;
+        }
+        const auto word = [&](bool& available, uint32_t& value) {
+            uint8_t flag = 0;
+            if (!r.u8(flag) || flag > 1u || !r.u32(value)) return false;
+            available = flag != 0u;
+            return available || value == 0u;
+        };
+        for (auto& draw : c.draws) {
+            auto& launch = draw.ps_raster_launch;
+            if (!word(launch.sc_shader_control_available, launch.sc_shader_control) ||
+                !word(launch.sc_mode_cntl_0_available, launch.sc_mode_cntl_0) ||
+                !word(launch.sc_mode_cntl_1_available, launch.sc_mode_cntl_1) ||
+                !word(launch.sc_aa_config_available, launch.sc_aa_config) ||
+                !word(launch.db_shader_control_available, launch.db_shader_control)) {
+                error = "invalid realized-draw raster launch controls";
+                return false;
+            }
+        }
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.

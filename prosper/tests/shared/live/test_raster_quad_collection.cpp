@@ -328,7 +328,8 @@ static void capture_entry_controls(const DrawItem& draw, Owners& owner) {
     check(!serialize_gpu_capture(invalid,refused_bytes,error),
         "producing association requires retained raw words, not merely SOURCE or an entry marker");
     auto entry_bytes = bytes;
-    entry_bytes.resize(entry_bytes.size() - 5u);   // one absent v70 wave record
+    entry_bytes.resize(entry_bytes.size() - (4u + 25u * captured.draws.size()) - 5u);
+    // Strip new launch controls and the one absent v70 wave record before testing v69 entry bytes.
     entry_bytes[8] = 69;
     entry_bytes[9] = entry_bytes[10] = entry_bytes[11] = 0;
     const size_t entry_start = entry_bytes.size() - (4u + kGpuCaptureFragmentEntryRecordBytes);
