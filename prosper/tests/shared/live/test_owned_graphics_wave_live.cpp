@@ -6,6 +6,8 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
@@ -39,7 +41,7 @@ struct Program {
     AgcShaderHeader header{};
 };
 struct Owners {
-    std::array<Program, 16> programs;
+    std::array<Program, 32> programs;
 };
 static Owners* owners;
 static size_t next_program;
@@ -524,6 +526,108 @@ TEST_P(OwnedGraphicsWaveLive, UnavailableSecondWaveRefusesBeforeAttachmentPublic
                             reinterpret_cast<const uint8_t*>(output) + Page,
                             [](uint8_t b) { return b == 0; }))
         << "refusal preserves the original guest backing";
+}
+// graphics_program_requires_owned_waves is asked several times per draw, so it answers from the
+// decode cache's once-per-byte-version classification instead of re-walking the stream (#4270
+// made the re-derivation GTA V's dominant render-thread cost). The answer must still equal a
+// from-scratch derivation, and a rewrite of the registered bytes must not be answered stale.
+TEST_P(OwnedGraphicsWaveLive, OwnedWaveClassificationMatchesFullStreamDerivation) {
+    const auto derived = [](const std::vector<uint32_t>& code) {
+        std::vector<Rdna2Inst> walked;
+        rdna2_walk(code.data(), code.size(), walked);
+        return !rdna2_raw_wave_wide_data_loads(walked).empty();
+    };
+    for (const bool vertex : {true, false})
+        for (const bool per_wave : {false, true}) {
+            const auto code = vertex ? vertex_code(per_wave, GetParam())
+                                     : fragment_code(per_wave, GetParam());
+            auto* program = register_program(vertex, code);
+            ASSERT_NE(program, nullptr);
+            const uint64_t address = reinterpret_cast<uint64_t>(program->code.data());
+            ASSERT_EQ(derived(code), per_wave) << "fixture must exercise both classifications";
+            for (int query = 0; query < 3; ++query)
+                EXPECT_EQ(graphics_program_requires_owned_waves(address), per_wave)
+                    << (vertex ? "vertex" : "fragment") << " query " << query;
+        }
+    // Counter-arm: the same registered address rewritten from plain to per-wave code, padded to
+    // the same size. A classification keyed on the address -- or on address plus size -- would
+    // keep answering false here; only the byte comparison sees the rewrite.
+    auto plain = fragment_code(false, GetParam());
+    const auto owned = fragment_code(true, GetParam());
+    ASSERT_LT(plain.size(), owned.size());
+    plain.resize(owned.size(), 0u);   // dead words after s_endpgm
+    auto* program = register_program(false, plain);
+    ASSERT_NE(program, nullptr);
+    const uint64_t address = reinterpret_cast<uint64_t>(program->code.data());
+    EXPECT_FALSE(graphics_program_requires_owned_waves(address));
+    std::copy(owned.begin(), owned.end(), program->code.begin());
+    program->header.shader_size = uint32_t(owned.size() * 4u);
+    EXPECT_TRUE(graphics_program_requires_owned_waves(address))
+        << "rewritten registered bytes must be reclassified, not answered from a stale entry";
+}
+// An owned-wave draw refused by register state alone gains nothing from the executor's
+// authoritative flush, so the executor skips it (on GTA V's bank scene ~22 MiB of readback per
+// such draw). The predicate must name exactly that case, and preparation must report the state
+// refusal even when producers were never published -- the order the skip relies on.
+TEST_P(OwnedGraphicsWaveLive, StateRefusedOwnedWavesSkipThePublication) {
+    auto* vs = register_program(true, vertex_code(false, GetParam()));
+    auto* ps = register_program(false, fragment_code(true, GetParam()));
+    ASSERT_NE(vs, nullptr);
+    ASSERT_NE(ps, nullptr);
+    const uint64_t vs_address = reinterpret_cast<uint64_t>(vs->code.data());
+    const uint64_t ps_address = reinterpret_cast<uint64_t>(ps->code.data());
+    const GraphicsRawSnapshotContext unpublished{false};
+    const auto refusal = [&](const GpuState& s) {
+        std::shared_ptr<const GraphicsOwnedWaveDraw> owned;
+        std::vector<uint32_t> indices;
+        std::string reason;
+        EXPECT_FALSE(prepare_draw_owned_waves(s, &s.draws[0], vs_address, ps_address, 3u, {},
+                                              &unpublished, owned, indices, reason));
+        EXPECT_EQ(owned, nullptr);
+        return reason;
+    };
+
+    auto admitted = state(*vs, *ps, false);
+    ASSERT_TRUE(draw_requires_owned_nested_snapshot(admitted));
+    EXPECT_EQ(owned_wave_draw_state_refusal(admitted, true), nullptr);
+    EXPECT_FALSE(owned_nested_snapshot_is_futile(admitted, nullptr, 0))
+        << "a draw that may still be admitted must keep its publication";
+    EXPECT_EQ(refusal(admitted), "draw-wave-prior-producers-incomplete");
+
+    auto metadata = state(*vs, *ps, false);
+    metadata.cx[P::CB_COLOR0_CMASK] = 0x1234u;
+    ASSERT_TRUE(draw_requires_owned_nested_snapshot(metadata));
+    ASSERT_NE(owned_wave_draw_state_refusal(metadata, true), nullptr);
+    EXPECT_STREQ(owned_wave_draw_state_refusal(metadata, true),
+                 "draw-wave-output-metadata-extent-unavailable");
+    EXPECT_TRUE(owned_nested_snapshot_is_futile(metadata, nullptr, 0));
+    EXPECT_EQ(refusal(metadata), "draw-wave-output-metadata-extent-unavailable")
+        << "the state refusal must win over the unpublished-producer refusal";
+
+    // Only an owned FRAGMENT stage is refused by the fragment launch. An owned vertex stage with
+    // a plain PS whose launch word is missing must keep its publication: it may be admitted.
+    auto* owned_vs = register_program(true, vertex_code(true, GetParam()));
+    auto* plain_fs = register_program(false, fragment_code(false, GetParam()));
+    ASSERT_NE(owned_vs, nullptr);
+    ASSERT_NE(plain_fs, nullptr);
+    auto vertex_only = state(*owned_vs, *plain_fs, true);
+    vertex_only.sh.erase(P::SPI_SHADER_PGM_RSRC1_PS);
+    ASSERT_TRUE(draw_requires_owned_nested_snapshot(vertex_only));
+    ASSERT_NE(owned_wave_draw_state_refusal(vertex_only, true), nullptr)
+        << "fixture: the fragment launch refusal must be armed for this arm to discriminate";
+    EXPECT_EQ(owned_wave_draw_state_refusal(vertex_only, false), nullptr);
+    EXPECT_FALSE(owned_nested_snapshot_is_futile(vertex_only, nullptr, 0))
+        << "a vertex-only owned draw is not refused by the fragment launch";
+
+    // A plain pair needs no snapshot at all, so there is nothing to call futile.
+    auto* plain_vs = register_program(true, vertex_code(false, GetParam()));
+    auto* plain_ps = register_program(false, fragment_code(false, GetParam()));
+    ASSERT_NE(plain_vs, nullptr);
+    ASSERT_NE(plain_ps, nullptr);
+    auto plain = state(*plain_vs, *plain_ps, false);
+    plain.cx[P::CB_COLOR0_CMASK] = 0x1234u;
+    EXPECT_FALSE(draw_requires_owned_nested_snapshot(plain));
+    EXPECT_FALSE(owned_nested_snapshot_is_futile(plain, nullptr, 0));
 }
 INSTANTIATE_TEST_SUITE_P(RawWidths, OwnedGraphicsWaveLive, ::testing::Values(false, true));
 

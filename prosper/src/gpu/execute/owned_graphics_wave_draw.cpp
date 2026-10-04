@@ -2,11 +2,13 @@
 // Missing launch/entry/producer/allocation authority refuses; cached native modules are irrelevant.
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
+#include "gpu/execute/shader_cache_internal.hpp"
 #include "gpu/agc/agc_shader_layout.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "hle/memory/guest_memory_topology.hpp"
+#include "diagnostics/env_cache.hpp"
 extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr);
 namespace prosper::gpu {
 static constexpr uint32_t kUserSgprs = 32;
@@ -29,15 +31,51 @@ size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_add
     return dwords;
 }
 
+// Asked several times per draw by realization, snapshot selection and owned-wave preparation.
+// The answer is a property of one immutable registered byte version, which the decode cache
+// already classified from the same full walk (DecodedShader::raw_wave_wide_data_load_pcs, the
+// field checked_graphics_source_requires_owned_waves reads). Re-walking and re-running the
+// dataflow here on every call cost GTA V ~70% of its bank-scene frame rate (9.0 -> 3.0 flips/s
+// at #4270). PROSPER_OWNED_WAVE_CLASSIFY_RECOMPUTE=1 restores the re-derivation as the A/B control.
 bool graphics_program_requires_owned_waves(uint64_t address) {
     const auto* header =
         static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(address));
     if (!header) return false;
-    const auto source = registered_graphics_original(address);
-    if (!source) return false;
-    std::vector<Rdna2Inst> original;
-    rdna2_walk(source->data(), source->size(), original);
-    return !rdna2_raw_wave_wide_data_loads(original).empty();
+    const auto source = registered_graphics_read_source(address);
+    if (!source.words || !source.decoded) return false;
+    if (PROSPER_ENV_ON("PROSPER_OWNED_WAVE_CLASSIFY_RECOMPUTE")) {
+        std::vector<Rdna2Inst> original;
+        rdna2_walk(source.words->data(), source.words->size(), original);
+        return !rdna2_raw_wave_wide_data_loads(original).empty();
+    }
+    return !source.decoded->raw_wave_wide_data_load_pcs.empty();
+}
+
+const char* owned_wave_draw_state_refusal(const GpuState& state, bool fragment) {
+    const auto render = extract_render_state(state);
+    if (fragment && (render.ps_wave32 || !render.ps_launch_rsrc1.available))
+        return "draw-wave-known-fragment64-launch-unavailable";
+    namespace P = prosper::agc::Pm4;
+    const auto cx = [&](uint32_t reg) {
+        auto it = state.cx.find(reg);
+        return it == state.cx.end() ? 0u : it->second;
+    };
+    for (uint32_t slot = 0; slot < render.color_targets.size(); ++slot) {
+        const auto& target = render.color_targets[slot];
+        if (!target.base) continue;
+        if (!color_target_physical_bytes(target))
+            return "draw-wave-output-physical-extent-unavailable";
+        for (const auto [lo, hi] :
+             {std::pair{P::CB_COLOR0_CMASK + slot * 0xfu, P::CB_COLOR0_CMASK_BASE_EXT + slot},
+              std::pair{P::CB_COLOR0_FMASK + slot * 0xfu, P::CB_COLOR0_FMASK_BASE_EXT + slot},
+              std::pair{P::CB_COLOR0_DCC_BASE + slot * 0xfu, P::CB_COLOR0_DCC_BASE_EXT + slot}})
+            if ((uint64_t(cx(lo)) << 8u) | (uint64_t(cx(hi) & 0xffu) << 40u))
+                return "draw-wave-output-metadata-extent-unavailable";
+    }
+    if (render.depth_read_base || render.depth_write_base || render.stencil_read_base ||
+        render.stencil_write_base || render.htile_data_base)
+        return "draw-wave-depth-physical-extent-unavailable";
+    return nullptr;
 }
 
 bool prepare_draw_owned_waves(const GpuState& state, const GpuState::Draw* draw,
@@ -56,33 +94,18 @@ bool prepare_draw_owned_waves(const GpuState& state, const GpuState::Draw* draw,
     const bool vertex = graphics_program_requires_owned_waves(vertex_address);
     const bool fragment = graphics_program_requires_owned_waves(fragment_address);
     if (!vertex && !fragment) return true;
+    // Register-state refusals first: no producer publication can change them, and the executor
+    // relies on that order to skip a futile authoritative flush (gpu_executor.cpp).
+    if (const char* reason = owned_wave_draw_state_refusal(state, fragment)) return reject(reason);
     if (!context || !context->producers_complete)
         return reject("draw-wave-prior-producers-incomplete");
     const auto render = extract_render_state(state);
-    if (fragment && (render.ps_wave32 || !render.ps_launch_rsrc1.available))
-        return reject("draw-wave-known-fragment64-launch-unavailable");
     GraphicsRawSnapshotContext isolated = *context;
     namespace P = prosper::agc::Pm4;
-    const auto cx = [&](uint32_t reg) {
-        auto it = state.cx.find(reg);
-        return it == state.cx.end() ? 0u : it->second;
-    };
-    for (uint32_t slot = 0; slot < render.color_targets.size(); ++slot) {
-        const auto& target = render.color_targets[slot];
-        if (!target.base) continue;
-        const uint64_t extent = color_target_physical_bytes(target);
-        if (!extent) return reject("draw-wave-output-physical-extent-unavailable");
-        isolated.output_allocations.emplace_back(target.base, extent);
-        for (const auto [lo, hi] :
-             {std::pair{P::CB_COLOR0_CMASK + slot * 0xfu, P::CB_COLOR0_CMASK_BASE_EXT + slot},
-              std::pair{P::CB_COLOR0_FMASK + slot * 0xfu, P::CB_COLOR0_FMASK_BASE_EXT + slot},
-              std::pair{P::CB_COLOR0_DCC_BASE + slot * 0xfu, P::CB_COLOR0_DCC_BASE_EXT + slot}})
-            if ((uint64_t(cx(lo)) << 8u) | (uint64_t(cx(hi) & 0xffu) << 40u))
-                return reject("draw-wave-output-metadata-extent-unavailable");
-    }
-    if (render.depth_read_base || render.depth_write_base || render.stencil_read_base ||
-        render.stencil_write_base || render.htile_data_base)
-        return reject("draw-wave-depth-physical-extent-unavailable");
+    for (const auto& target : render.color_targets)
+        if (target.base)
+            isolated.output_allocations.emplace_back(target.base,
+                                                     color_target_physical_bytes(target));
     // Reuse only the established PS0 / merged-VS8 ABI with a known loaded USER_SGPR prefix.
     // Physical USER_DATA presence alone is not a launched entry value. Nonzero range starts,
     // missing launch metadata, and unobserved required words remain explicit refusals.
