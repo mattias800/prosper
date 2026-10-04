@@ -2920,9 +2920,9 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_compare_exec_masking.cpp
     LIBRARIES prosper_core)
 
-  add_executable(test_normal_magnitude_predicate tests/gpu/recompiler/test_normal_magnitude_predicate.cpp)
-  target_link_libraries(test_normal_magnitude_predicate PRIVATE prosper_core)
-  add_test(NAME normal_magnitude_predicate COMMAND test_normal_magnitude_predicate)
+  prosper_add_gtest(test_normal_magnitude_predicate
+    SOURCES tests/gpu/recompiler/test_normal_magnitude_predicate.cpp
+    LIBRARIES prosper_core)
   add_executable(test_raster_quad_collector tests/gpu/recompiler/test_raster_quad_collector.cpp)
   target_link_libraries(test_raster_quad_collector PRIVATE prosper_core)
   add_test(NAME raster_quad_collector_contract COMMAND test_raster_quad_collector)
