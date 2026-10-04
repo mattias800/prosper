@@ -788,6 +788,26 @@ against constructed frames, because a frame lands *beside* the value it names â€
 pixel positions with the expected value **hardcoded**; deriving it from the box under test is what
 made three earlier versions of this selftest incapable of failing.
 
+## Historical Windows APR observation (preserved 2026-10-04)
+
+This is the earlier report preserved in #4363's merged documentation (`e88a9e1b`), not a new run
+or a current-main compatibility verdict. The measurement date, tested source revision, binary,
+route and configuration were not pinned. The documentation revision identifies the report,
+not the binary that produced it. [Tracker record](https://github.com/mattias800/prosper/issues/1874#issuecomment-5976105083).
+
+Three Windows `tools/screenshot` runs reportedly ended in guest faults within about 3 s: two at
+`libc.prx+0x4270`, described as the title's fatal-error path, and one at `rip=0`. A `boot_trace`
+run printed `Apr read failure 1 at CB offset 40` just before a similar fault. An experiment that
+filled the stubbed constructor's output slots with a staging buffer, as the Linux arm did,
+changed nothing in that experiment. The comparison cited the separate historical Windows
+baseline (3 of 6 attempts rendered on 2026-08-10) and the Linux rung-3 record.
+
+A regression, dump/build difference or connection to the Windows APR stub arms was explicitly
+unestablished. The constructor experiment does not rule APR out, and the report does not
+establish APR as the cause or platform parity. A fresh Windows verdict needs its source/binary,
+route, settings and observed checkpoint; a run with opt-in `PROSPER_NULL_PAGE=1` remains qualified
+by that setting. No new runtime result or rung change is claimed here.
+
 ## Ruled out â€” eliminated, do not re-run these
 - **"The opening chapter script is a wall."** **Falsified 2026-08-28.** It is long, not closed:
   raising the confirm rate from one per 15 s to one per 2 s takes the run from 0 field-HUD frames to
