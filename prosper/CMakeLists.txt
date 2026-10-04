@@ -6288,6 +6288,10 @@ if(TARGET Vulkan::Vulkan AND TARGET prosper_core)
   prosper_add_gtest(test_fragment_draw_exec
     SOURCES tests/gpu/execute/test_fragment_draw_exec.cpp
     INCLUDES tests frontends LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_collector_geometry
+    SOURCES tests/gpu/execute/test_fragment_collector_geometry.cpp
+    INCLUDES tests frontends LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120
+    ENVIRONMENT PROSPER_FRAGMENT_DRAW_OBSERVE=1)
   prosper_add_gtest(test_ps_pull_model_exec
     SOURCES tests/gpu/execute/test_ps_pull_model_exec.cpp
     INCLUDES tests frontends LIBRARIES prosper_core Vulkan::Vulkan LABELS gpu PROPERTIES TIMEOUT 120)

@@ -35,6 +35,32 @@ public:
             refusal = "fragment-draw-collector-enabled-profile-unavailable";
             return {};
         }
+        if (program->device_contract().device_identity !=
+            reinterpret_cast<uintptr_t>(context.dev)) {
+            refusal = "fragment-draw-collector-producing-device-mismatch";
+            return {};
+        }
+        if (!program->matches_raster_vertex(vertex) || !program->source_live()) {
+            refusal = "fragment-draw-collector-producing-vertex-unavailable";
+            return {};
+        }
+        const auto& collection = program->raster_launch_collection();
+        if (collection) {
+            const prosper::gpu::FragmentPacketRasterDeviceContract raster{
+                context.geometry_shader_enabled,
+                context.detile_limits.maxVertexOutputComponents,
+                context.detile_limits.maxGeometryInputComponents,
+                context.detile_limits.maxGeometryOutputComponents,
+                context.detile_limits.maxGeometryTotalOutputComponents,
+                context.detile_limits.maxGeometryOutputVertices,
+                context.detile_limits.maxGeometryShaderInvocations,
+                context.detile_limits.maxFragmentInputComponents};
+            if (!program->device_contract().raster ||
+                *program->device_contract().raster != raster) {
+                refusal = "fragment-draw-collector-enabled-raster-budget-mismatch";
+                return {};
+            }
+        }
         std::sort(bindings.begin(), bindings.end());
         if (std::adjacent_find(bindings.begin(), bindings.end()) != bindings.end()) {
             refusal = "fragment-draw-collector-duplicate-vertex-binding";
@@ -69,6 +95,35 @@ public:
         if (!raster_quad_pre_raster_readonly(*vertex)) {
             refusal = "fragment-draw-collector-pre-raster-effects-unproved";
             return {};
+        }
+        if (collection) {
+            // This cold plan owns the actual generated coefficient/PrimitiveId GS, not the
+            // original draw's possibly empty native GS. Its immutable payload is retained by
+            // the same pipeline/completion owner; it has no guest descriptor access or effects.
+            const auto& geometry = collection->geometry;
+            if (!geometry.empty()) {
+                const auto reflected = prosper::gpu::validate_spirv_descriptor_interface(
+                    geometry, nullptr, 0, prosper::gpu::SpirvShaderStage::Unknown, false);
+                if (!raster_quad_pre_raster_readonly(geometry) ||
+                    !prosper::gpu::spirv_descriptor_reflection_complete(reflected) ||
+                    !reflected.descriptors.empty()) {
+                    refusal = "fragment-draw-collector-coefficient-geometry-effects-unproved";
+                    return {};
+                }
+            }
+            prosper::gpu::RasterQuadInputs interfaces;
+            interfaces.interpolation = collection->parameters;
+            prosper::gpu::RasterQuadCollector attributes;
+            for (uint32_t attribute = 0; attribute < 32; ++attribute)
+                if (collection->parameters.attribute_mask & (1u << attribute))
+                    attributes.fields.push_back(
+                        {prosper::gpu::RasterQuadFieldKind::Interpolant, attribute, 0, 4});
+            if (!raster_quad_varying_interface(*vertex, interfaces, attributes) ||
+                !raster_quad_varying_interface(geometry.empty() ? *vertex : geometry, interfaces,
+                                               collection->shape)) {
+                refusal = "fragment-draw-collector-coefficient-varying-interface-unavailable";
+                return {};
+            }
         }
         auto result = std::shared_ptr<FragmentDrawCollectGpuProgram>(
             new FragmentDrawCollectGpuProgram(context, std::move(program), std::move(vertex)));
@@ -124,12 +179,17 @@ public:
             refusal = "fragment-draw-collector-render-pass-failed";
             return {};
         }
-        std::array<VkShaderModule, 2> modules{};
-        std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
-        const std::array<const std::vector<uint32_t>*, 2> sources{
-            result->vertex_.get(), &result->program_->collect_words()};
+        std::array<VkShaderModule, 3> modules{};
+        std::array<VkPipelineShaderStageCreateInfo, 3> stages{};
+        const auto* geometry =
+            collection && !collection->geometry.empty() ? &collection->geometry : nullptr;
+        const std::array<const std::vector<uint32_t>*, 3> sources{
+            result->vertex_.get(), &result->program_->collect_words(), geometry};
+        const VkShaderStageFlagBits stage_kinds[]{
+            VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_GEOMETRY_BIT};
+        const uint32_t stage_count = geometry ? 3u : 2u;
         bool modules_ready = true;
-        for (uint32_t index = 0; index < sources.size(); ++index) {
+        for (uint32_t index = 0; index < stage_count; ++index) {
             VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             module.codeSize = sources[index]->size() * 4;
             module.pCode = sources[index]->data();
@@ -140,7 +200,7 @@ public:
                 break;
             }
             stages[index] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-            stages[index].stage = index ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+            stages[index].stage = stage_kinds[index];
             stages[index].module = modules[index];
             stages[index].pName = "main";
         }
@@ -174,7 +234,7 @@ public:
             dynamic.dynamicStateCount = uint32_t(std::size(states));
             dynamic.pDynamicStates = states;
             VkGraphicsPipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-            pipeline.stageCount = uint32_t(stages.size());
+            pipeline.stageCount = stage_count;
             pipeline.pStages = stages.data();
             pipeline.pVertexInputState = &vertex_input;
             pipeline.pInputAssemblyState = &assembly;

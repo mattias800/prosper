@@ -22,7 +22,11 @@ public:
         auto result = std::unique_ptr<FragmentDrawGpuObservation>(
             new FragmentDrawGpuObservation(context, std::move(owner), draw));
         const auto& capacity = *result->owner_->transaction().program()->capacity_owner();
-        result->append(O::Collector, UINT32_MAX, 0, 32);
+        // Observe one complete small quad, including genuine coefficient/system fields. Keep
+        // a fixed 256-word ceiling so wider schemas cannot exceed the existing staging budget.
+        result->append(O::Collector, UINT32_MAX, 0,
+                       std::min(256u, prosper::gpu::kRasterQuadBufferHeaderWords +
+                                          capacity.collector().record_words));
         result->append(O::Input, UINT32_MAX, 0, prosper::gpu::kFragmentDrawHeaderWords);
         result->append(O::Commit, UINT32_MAX, 0, prosper::gpu::kFragmentDrawCommitHeaderWords);
         // This is capacity-bounded sampling, not a CPU count of GPU-produced work. A zero/unrun
