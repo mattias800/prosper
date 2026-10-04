@@ -11377,6 +11377,14 @@ int main() {
         CHECK(got.size() == N && bad == 0,
               "T11f_signed: v_mad_i64_i32 writes exact D.lo, D.hi and bit-64 carry");
     }
+    // A 32-bit literal 64-bit addend: 0x176 zero-extends it; 0x177 refuses until its extension
+    // is proved. llvm-mc gfx1030: v_mad_{i64_i32,u64_u32} v[5:6], vcc, v0, v1, 0x12345.
+    const uint32_t codeMadI64Literal[] = {0xd5776a05u, 0x03fe0300u, 0x00012345u, 0xbf810000u};
+    const uint32_t codeMadU64Literal[] = {0xd5766a05u, 0x03fe0300u, 0x00012345u, 0xbf810000u};
+    CHECK(recompile_valu(codeMadI64Literal, std::size(codeMadI64Literal), 4, 5).empty(),
+          "T11f_signed: v_mad_i64_i32 refuses a literal 64-bit addend");
+    CHECK(!recompile_valu(codeMadU64Literal, std::size(codeMadU64Literal), 4, 5).empty(),
+          "T11f: v_mad_u64_u32 still compiles a literal 64-bit addend");
 
     // Astro's SSAO pixel shader carries dead `s_and_b64 vcc,s[0:1],vcc` operations between
     // comparisons; s[0:1] is a T# descriptor, not a wave-mask value available to SPIR-V. Prove that
