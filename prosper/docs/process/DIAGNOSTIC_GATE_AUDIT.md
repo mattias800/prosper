@@ -47,6 +47,21 @@ A fourth rule earned by the instance fixed in this document's own PR:
 
 ## The audit
 
+### Windows native HLE host-wait observation (#4330)
+
+`PROSPER_HOST_WAIT_OBSERVE` arms only native empty-equeue and contended-pthread-once wait-call
+provenance. It is a process-start presence switch sampled once, with separate armed and unarmed
+CTest processes; changing it later is not supported. The ordinary guest-thread dump prints its
+armed state even when no producer fired, labels unarmed counts `n/a`, and always states that no
+record means unobserved, not no host wait. The observer is not the exception-interrupt registry.
+
+The fixed 512-slot registry exposes global dropped registrations and unstable publishing/retiring
+slots. Matching stable records beyond the dump's eight-record output cap remain counted by `found`
+versus `stored`. These are independently sampled observations, not a coherent partition, proof of
+kernel parking, absence of uninstrumented native waits, lock ownership or healthy progress. The
+separate six-candidate raw host-stack scan reports its copied-window prefix limit and explicitly
+disclaims CFI. Reading every copied word still does not read the whole stack or establish frames.
+
 `prosper/tools/env/check_diag_gates.py` is a re-runnable scanner, registered as **two** ctest
 cases -- `diag_gate_selftest`, and `diag_gate_selftest_hostile_tmpdir` which repeats it with
 `$TMPDIR` pointed inside a build tree -- and run over the tree in CI's `Docs` job. It checks three lexical signatures,

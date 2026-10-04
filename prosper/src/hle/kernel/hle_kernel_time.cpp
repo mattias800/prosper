@@ -1,6 +1,7 @@
 // hle_kernel_time.cpp — time/clock sources, C11 thread primitives, and assorted
 // libkernel stubs the engine needs during init. Cross-platform (chrono + pthread).
 #include "diagnostics/exit_reports.hpp"
+#include "diagnostics/native_host_wait.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/hle_kernel_time.hpp"
@@ -1708,9 +1709,14 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
             }();
             if (cap && us > cap) us = cap;
             if (evlog()) fprintf(stderr, "[ev]   WAIT.empty req=%lluus\n", (unsigned long long)us);
+            prosper::diagnostics::NativeHostWaitScope observation(
+                prosper::diagnostics::NativeHostWaitSite::Equeue, a0,
+                prosper::diagnostics::NativeHostWaitMode::RelativeMicroseconds, us);
             s->cv.wait_for(lk, std::chrono::microseconds(us), pred);
         } else {
             if (evlog()) fprintf(stderr, "[ev]   WAIT.empty (infinite)\n");
+            prosper::diagnostics::NativeHostWaitScope observation(
+                prosper::diagnostics::NativeHostWaitSite::Equeue, a0);
             s->cv.wait(lk, pred);
         }
     }

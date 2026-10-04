@@ -2052,6 +2052,12 @@ if(TARGET prosper_core)
 
   if(WIN32)
     add_executable(test_win_exception_delivery tests/misc/test_win_exception_delivery.cpp)
+    prosper_add_gtest(test_native_host_wait_producers
+      SOURCES tests/hle/kernel/test_native_host_wait_producers.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core
+      ENVIRONMENT PROSPER_HOST_WAIT_OBSERVE=1
+      PROPERTIES TIMEOUT 15 ENVIRONMENT_MODIFICATION "PROSPER_WAITCAP=unset:")
     # Includes a shared fixture, which resolves from the `tests` root.
     target_include_directories(test_win_exception_delivery PRIVATE tests)
     target_link_libraries(test_win_exception_delivery PRIVATE prosper_core)
@@ -2166,6 +2172,15 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_env_cache
     SOURCES tests/diagnostics/test_env_cache.cpp
     INCLUDES src)
+
+  prosper_add_gtest(test_native_host_wait
+    SOURCES tests/diagnostics/test_native_host_wait.cpp
+    LIBRARIES prosper_core
+    PROPERTIES TIMEOUT 15)
+  prosper_add_gtest(test_native_host_wait_disabled
+    SOURCES tests/diagnostics/test_native_host_wait_disabled.cpp
+    LIBRARIES prosper_core
+    PROPERTIES TIMEOUT 15 ENVIRONMENT_MODIFICATION "PROSPER_HOST_WAIT_OBSERVE=unset:")
 
   # The per-submit sampling contract (diagnostics/env_submit.hpp). Two-sided by construction: it
   # asserts a value is frozen INSIDE one SubmitEnvScope -- which a live getenv cannot do -- and that
