@@ -40,15 +40,45 @@ const char* const kCropAsset = PROSPER_TEST_H264_CROP_ASSET;
 // the hardware policy on every host, hardware-capable or not.
 const char* const kSoftwareOnlyAsset = PROSPER_TEST_MPEG4_ASSET;
 
-// Whether THIS host can actually create a hardware H.264 session for the clip's own parameter
-// sets (SPS/PPS copied from h264_aac_testpattern.mp4's avcC), observed independently of the
-// backend. VTIsHardwareDecodeSupported is a capability query and is not enough: a hosted
-// macos-26-arm64 runner answers yes for H.264 and then cannot open a hardware session.
-bool hardware_h264_session_available() {
+struct ProbeOutput {
+    OSStatus status = -1;
+    bool image = false;
+};
+
+void probe_output(void* refcon, void*, OSStatus status, VTDecodeInfoFlags, CVImageBufferRef image,
+                  CMTime, CMTime) {
+    auto* out = static_cast<ProbeOutput*>(refcon);
+    out->status = status;
+    out->image = image != nullptr;
+}
+
+// Whether THIS host can actually DECODE the clip on a hardware H.264 session, observed
+// independently of the backend: the clip's own parameter sets (SPS/PPS copied from
+// h264_aac_testpattern.mp4's avcC) and its first sample, read straight from the committed file.
+// Neither a capability query nor session creation is enough. The hosted macos-26-arm64 runner
+// answers VTIsHardwareDecodeSupported(H.264) = yes AND creates a session that requires hardware
+// (status 0, reporting hardware) -- and then the backend's open fails there, so the decode itself
+// is what has to be observed.
+bool hardware_h264_decode_available() {
     static const uint8_t kSps[] = {0x67, 0x4d, 0x40, 0x0a, 0xec, 0xa1, 0x06, 0xd8,
                                    0x08, 0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00,
                                    0x00, 0x1e, 0x07, 0x89, 0x12, 0xcb};
     static const uint8_t kPps[] = {0x68, 0xeb, 0xe3, 0xcb, 0x20};
+    // The first video sample (AVCC, 4-byte lengths): an SEI of 684 bytes, then the IDR slice.
+    constexpr std::streamoff kFirstSampleOffset = 2463;
+    constexpr size_t kFirstSampleBytes = 2691;
+    std::vector<uint8_t> first(kFirstSampleBytes);
+    {
+        std::ifstream f(kAsset, std::ios::binary);
+        f.seekg(kFirstSampleOffset);
+        f.read(reinterpret_cast<char*>(first.data()), static_cast<std::streamsize>(first.size()));
+        if (!f) return false;
+    }
+    // Guard the hard-coded location: SEI length 684 (type 6), then an IDR NAL (type 5).
+    if (first[3] != 0xac || first[2] != 0x02 || (first[4] & 0x1f) != 6 ||
+        (first[4 + 684 + 4] & 0x1f) != 5)
+        return false;
+
     const uint8_t* sets[] = {kSps, kPps};
     const size_t sizes[] = {sizeof(kSps), sizeof(kPps)};
     CMFormatDescriptionRef format = nullptr;
@@ -59,10 +89,22 @@ bool hardware_h264_session_available() {
     const void* values[] = {kCFBooleanTrue};
     CFDictionaryRef spec = CFDictionaryCreate(
         nullptr, keys, values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    // The same destination the backend asks for: NV12, video range.
+    const int32_t nv12 = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    CFNumberRef nv12_number = CFNumberCreate(nullptr, kCFNumberSInt32Type, &nv12);
+    const void* attr_keys[] = {kCVPixelBufferPixelFormatTypeKey};
+    const void* attr_values[] = {nv12_number};
+    CFDictionaryRef attrs =
+        CFDictionaryCreate(nullptr, attr_keys, attr_values, 1, &kCFTypeDictionaryKeyCallBacks,
+                           &kCFTypeDictionaryValueCallBacks);
+    CFRelease(nv12_number);
+    ProbeOutput out;
+    VTDecompressionOutputCallbackRecord callback{probe_output, &out};
     VTDecompressionSessionRef session = nullptr;
     const OSStatus created =
-        VTDecompressionSessionCreate(nullptr, format, spec, nullptr, nullptr, &session);
+        VTDecompressionSessionCreate(nullptr, format, spec, attrs, &callback, &session);
     bool hardware = false;
+    OSStatus decoded = -1;
     if (created == noErr && session) {
         CFBooleanRef using_hardware = nullptr;
         if (VTSessionCopyProperty(session,
@@ -72,16 +114,34 @@ bool hardware_h264_session_available() {
             hardware = CFBooleanGetValue(using_hardware);
             CFRelease(using_hardware);
         }
+        CMBlockBufferRef block = nullptr;
+        CMSampleBufferRef sample = nullptr;
+        const size_t sample_size = first.size();
+        if (CMBlockBufferCreateWithMemoryBlock(nullptr, first.data(), first.size(),
+                                               kCFAllocatorNull, nullptr, 0, first.size(), 0,
+                                               &block) == noErr &&
+            CMSampleBufferCreateReady(nullptr, block, format, 1, 0, nullptr, 1, &sample_size,
+                                      &sample) == noErr) {
+            VTDecodeInfoFlags info = 0;
+            decoded = VTDecompressionSessionDecodeFrame(session, sample, 0, nullptr, &info);
+            VTDecompressionSessionWaitForAsynchronousFrames(session);
+        }
+        if (sample) CFRelease(sample);
+        if (block) CFRelease(block);
         VTDecompressionSessionInvalidate(session);
         CFRelease(session);
     }
+    CFRelease(attrs);
     CFRelease(spec);
     CFRelease(format);
+    const bool works = hardware && decoded == noErr && out.status == noErr && out.image;
     std::fprintf(stderr,
-                 "[test] hardware H.264: capability query %s; a hardware session %s (status %d)\n",
+                 "[test] hardware H.264: capability query %s; hardware session %s (status %d); "
+                 "first picture decoded %s (call %d, output %d)\n",
                  VTIsHardwareDecodeSupported(kCMVideoCodecType_H264) ? "yes" : "no",
-                 hardware ? "yes" : "no", static_cast<int>(created));
-    return hardware;
+                 hardware ? "yes" : "no", static_cast<int>(created), works ? "yes" : "no",
+                 static_cast<int>(decoded), static_cast<int>(out.status));
+    return works;
 }
 
 // This process's open_memory temporary copies (the backend's own prefix, which carries our pid,
@@ -173,11 +233,11 @@ protected:
         vb_ = backend();
         ASSERT_NE(vb_, nullptr);
         // The hardware gate, exercised in whichever direction this host allows. A host that can
-        // open a hardware H.264 session (every Apple Silicon and recent Intel Mac) runs every case
-        // through it. A host that cannot -- a virtualised CI runner -- must REFUSE without
+        // decode on a hardware H.264 session (every Apple Silicon and recent Intel Mac) runs every
+        // case through it. A host that cannot -- a virtualised CI runner -- must REFUSE without
         // the explicit override, which is asserted here, and only then runs the same checks in
         // software.
-        hardware_ = hardware_h264_session_available();
+        hardware_ = hardware_h264_decode_available();
         // This test binary owns PROSPER_AVP_ALLOW_SOFTWARE: every case starts with it unset and
         // TearDown unsets it again, so no case inherits another's software arm.
         unsetenv("PROSPER_AVP_ALLOW_SOFTWARE");

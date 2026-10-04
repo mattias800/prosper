@@ -361,6 +361,9 @@ struct Decoder {
     // entry is simply erased, and nothing can be freed twice.
     uint64_t next_serial = 1;
     std::unordered_map<uint64_t, CMTime> order_by_serial;   // guarded by out_mutex
+    // The first failed picture is reported unconditionally: a session that is created and then
+    // decodes nothing (measured on a hosted macos-26-arm64 runner) otherwise fails silently.
+    std::atomic<bool> error_reported{false};
 
     ~Decoder() { reset(); }
     void reset() {
@@ -427,8 +430,9 @@ void decoder_output(void* refcon, void* frame_refcon, OSStatus status, VTDecodeI
         }
     }
     if (status != noErr || !image || (flags & kVTDecodeInfo_FrameDropped)) {
-        if (status != noErr && avp_log())
-            std::fprintf(stderr, "[avp-vt] decode error %d\n", static_cast<int>(status));
+        if (status != noErr && (!d->error_reported.exchange(true) || avp_log()))
+            std::fprintf(stderr, "[avp-vt] decode error %d (%s decoder)\n", static_cast<int>(status),
+                         d->hardware ? "hardware" : "software");
         return;
     }
     CVBufferRetain(image);
@@ -693,6 +697,11 @@ void decode_loop(Session& session, AVAsset* asset, AVAssetTrack* video_track,
                                          : "(no error object)");
                     flush_decoder(*decoder);
                     if (!deliver(release_ready(*decoder, kCMTimeInvalid)) || !session.initialized) {
+                        if (!session.initialized)
+                            std::fprintf(stderr,
+                                         "[avp-vt] open '%s': the stream ended before the decoder "
+                                         "produced a picture\n",
+                                         session.display_name.c_str());
                         finish_initialization(session, false);
                         break;
                     }
