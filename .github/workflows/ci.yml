@@ -435,9 +435,18 @@ jobs:
         run: uv run --no-sync --no-build --group dev python prosper/tools/ci/check_python_quality.py --selftest
 
       - name: Verify pytest policy checker discriminates and complies
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           uv run --no-sync --no-build --group dev python prosper/tools/ci/check_pytest_policy.py --selftest
-          uv run --no-sync --no-build --group dev python prosper/tools/ci/check_pytest_policy.py
+          if [ "$EVENT" = "pull_request" ]; then
+            git fetch --no-tags origin "$BASE_REF"
+            uv run --no-sync --no-build --group dev python prosper/tools/ci/check_pytest_policy.py \
+              --base "origin/$BASE_REF"
+          else
+            uv run --no-sync --no-build --group dev python prosper/tools/ci/check_pytest_policy.py
+          fi
 
       - name: Test the checker (pytest)
         run: uv run --no-sync --no-build --group dev pytest

@@ -1,5 +1,7 @@
 """Unit tests for check_pytest_policy.py."""
 
+from __future__ import annotations
+
 import sys
 from pathlib import Path
 
@@ -23,11 +25,58 @@ def test_compliant_async_function():
     assert reason == ""
 
 
-def test_compliant_class():
+def test_compliant_class_with_methods():
     code = "class TestExample:\n    def test_one(self):\n        assert True\n"
     violates, reason = cpp.is_non_compliant(code)
     assert not violates
     assert reason == ""
+
+
+def test_compliant_class_with_unrelated_base():
+    code = (
+        "class NotATestCase:\n"
+        "    pass\n"
+        "class TestValid(NotATestCase):\n"
+        "    def test_ok(self):\n"
+        "        pass\n"
+    )
+    violates, reason = cpp.is_non_compliant(code)
+    assert not violates
+    assert reason == ""
+
+
+def test_violating_empty_test_class():
+    code = "class TestEmpty:\n    pass\n"
+    violates, reason = cpp.is_non_compliant(code)
+    assert violates
+    assert "no eligible test_* functions" in reason
+
+
+def test_violating_nested_test_function():
+    code = "def helper():\n    def test_hidden():\n        pass\n"
+    violates, reason = cpp.is_non_compliant(code)
+    assert violates
+    assert "no eligible test_* functions" in reason
+
+
+def test_violating_test_method_in_non_test_class():
+    code = "class Helper:\n    def test_in_helper(self):\n        pass\n"
+    violates, reason = cpp.is_non_compliant(code)
+    assert violates
+    assert "no eligible test_* functions" in reason
+
+
+def test_violating_test_class_with_init():
+    code = (
+        "class TestIgnoredByPytest:\n"
+        "    def __init__(self):\n"
+        "        pass\n"
+        "    def test_m(self):\n"
+        "        pass\n"
+    )
+    violates, reason = cpp.is_non_compliant(code)
+    assert violates
+    assert "no eligible test_* functions" in reason
 
 
 def test_violating_unittest_subclass_attribute():
@@ -53,11 +102,48 @@ def test_violating_unittest_subclass_name():
     assert "subclasses unittest.TestCase" in reason
 
 
+def test_violating_unittest_subclass_aliased_import():
+    code = (
+        "from unittest import TestCase as Base\n"
+        "class TestLegacy(Base):\n"
+        "    def test_m(self):\n        pass\n"
+    )
+    violates, reason = cpp.is_non_compliant(code)
+    assert violates
+    assert "subclasses unittest.TestCase" in reason
+    assert "TestLegacy" in reason
+
+
+def test_violating_unittest_subclass_aliased_module():
+    code = (
+        "import unittest as ut\n"
+        "class TestLegacy(ut.TestCase):\n"
+        "    def test_m(self):\n        pass\n"
+    )
+    violates, reason = cpp.is_non_compliant(code)
+    assert violates
+    assert "subclasses unittest.TestCase" in reason
+
+
+def test_violating_unittest_subclass_hierarchy():
+    code = (
+        "import unittest\n"
+        "class BaseFixture(unittest.TestCase):\n"
+        "    pass\n"
+        "class DerivedTests(BaseFixture):\n"
+        "    def test_m(self):\n        pass\n"
+    )
+    violates, reason = cpp.is_non_compliant(code)
+    assert violates
+    assert "subclasses unittest.TestCase" in reason
+    assert "BaseFixture" in reason or "DerivedTests" in reason
+
+
 def test_violating_script_only():
     code = "import os\nx = 10\nassert x == 10\n"
     violates, reason = cpp.is_non_compliant(code)
     assert violates
-    assert "no test_* functions or Test* classes" in reason
+    assert "no eligible test_* functions" in reason
 
 
 def test_syntax_error_reported():
@@ -92,7 +178,27 @@ def test_check_compliant_with_allowlist():
     assert errs == []
 
 
-def test_scan_tree_and_ignore_dirs(tmp_path):
+def test_check_shrink_only_baseline_rejects_addition():
+    baseline = {"prosper/tests/old_legacy.py"}
+    candidate = {"prosper/tests/old_legacy.py", "prosper/tests/new_bad.py"}
+    found = {
+        "prosper/tests/old_legacy.py": "subclasses unittest.TestCase",
+        "prosper/tests/new_bad.py": "subclasses unittest.TestCase",
+    }
+    errs = cpp.check(found, candidate, baseline_allow=baseline)
+    assert any("newly added to pytest_legacy_allowlist.txt" in e for e in errs)
+    assert any("new_bad.py" in e for e in errs)
+
+
+def test_check_shrink_only_baseline_accepts_removal():
+    baseline = {"prosper/tests/old_legacy.py"}
+    candidate = set()
+    found = set()
+    errs = cpp.check(found, candidate, baseline_allow=baseline)
+    assert errs == []
+
+
+def test_scan_tree_and_ignore_dirs(tmp_path: Path):
     # Compliant file
     (tmp_path / "test_good.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
     # Violating file
