@@ -19,6 +19,10 @@ title may use several at once:
   one Unreal Engine's **Electra** media player uses for movie audio. Do not confuse it with AJM:
   AJM is a batched job queue with a sideband result block, `libSceAudiodec` is four arguments and a
   control struct. They share a codec backend and nothing else.
+- **`hle_audio_spatial.cpp`** — `libSceAudio3d` (one object-audio port, a headless sink) and
+  `libSceAcm` (batch-command contexts; prosper has no batch engine, so batches fail). Contracts are
+  read from the system modules themselves. `libSceAudioPropagation` is deliberately left
+  unregistered: its one known importer asserts on a failure and then carries on regardless.
 - **`atrac9_decode.cpp`** — glue for the vendored `third_party/libatrac9`. ATRAC9 is the one codec
   the core decodes itself, because it is a Sony format with no host implementation to defer to.
 
