@@ -82,6 +82,24 @@ inline int scratch_process_id() {
 
 // Creates the directory on construction and removes it (and everything under it) on destruction.
 // Held by a function-local static so the removal runs during normal process exit.
+// Creates `leaf` and its parents, retrying when a concurrent process removes an empty shared root
+// between create_directories' existence check and its mkdir of `leaf`. ~ScratchDirectory below
+// drops the root with a non-recursive remove, which succeeds whenever no pid directory sits under
+// it at that instant -- so the root can vanish under a peer that is mid-create, and that peer's
+// mkdir then fails with ENOENT. GoogleTest cases discovered at ctest time do not get the per-case
+// PROSPER_TEST_SCRATCH_DIR, so they all share <cwd>/prosper-test-scratch and race on it under
+// `ctest -j` (Windows CI aborted on this). Each retry recreates the root; the bound only stops a
+// genuinely unwritable root from spinning.
+inline bool create_scratch_leaf(const std::filesystem::path& leaf, std::error_code& error,
+                                int attempts = 64) {
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        error.clear();
+        std::filesystem::create_directories(leaf, error);
+        if (!error && std::filesystem::is_directory(leaf)) return true;
+    }
+    return false;
+}
+
 struct ScratchDirectory {
     std::filesystem::path path;
 
@@ -100,13 +118,11 @@ struct ScratchDirectory {
         path = root / ("pid-" + std::to_string(scratch_process_id()));
         std::error_code error;
         std::filesystem::remove_all(path, error);   // debris from a recycled pid
-        error.clear();
-        std::filesystem::create_directories(path, error);
         // Fail LOUDLY and immediately. If the directory does not exist, every test below writes to a
         // path that cannot be opened and then fails on a *content* assertion — which is precisely the
         // mystifying failure class this header exists to remove (#1613). A read-only or full build
         // directory must not masquerade as a capture defect.
-        if (error || !std::filesystem::is_directory(path)) {
+        if (!create_scratch_leaf(path, error)) {
             std::fprintf(stderr,
                          "FATAL: cannot create the test scratch directory '%s': %s\n"
                          "       (root came from %s)\n",

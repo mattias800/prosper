@@ -844,6 +844,11 @@ if(TARGET prosper_core)
   endif()
 
   # Dump-independent golden vectors pin NID hashing in the default unit-test set.
+  # test_scratch.h: scratch creation survives a peer removing the shared root (ctest -j race).
+  prosper_add_gtest(test_scratch_root_race
+    SOURCES tests/misc/test_scratch_root_race.cpp
+    INCLUDES tests)
+
   prosper_add_gtest(test_nid_vectors
     SOURCES tests/hle/dispatch/test_nid_vectors.cpp
     LIBRARIES prosper_core)
