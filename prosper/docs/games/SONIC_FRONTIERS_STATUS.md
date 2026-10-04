@@ -864,6 +864,21 @@ being closed; the rest are this document's own. **Do not restate the row count i
 a stated total is stale as soon as the next lane appends, and every lane that adds a row would have
 to remember to update it. The last one did not (review of #2820).
 
+- **Switching Stage 2 deferred waits ON alone repairs the current missing-world state** —
+  falsified by the 2026-10-04 single OFF→ON pair: 1600 s per arm, same shipping `525cb71c0`
+  normal app, visible native Wayland/full cadence. Eight native 3840×2160 images were manually
+  inspected: both flip-2000 menus show readable New Game, and flip-4000/4600/5200 HUD clocks
+  advance 00:29→00:59→01:29 with rings 000/999, five stars and boost. Both still lack recognizable
+  Sonic or terrain: black upper field, tan lower gradient and sparse glowing line fragments;
+  world qualification remains **HOLD**. All exits were 0 and owned cleanup was empty.
+  Capture-free stationary OFF/ON rates **1.618456 / 1.601637**, and moving-common rates
+  **1.509879 / 1.533889 guest flips/s**, are diagnostic only. Stationary-bound host I/O `some`
+  context was **1.29% / 2.38%**, including capture/excluded periods, with no named build/compiler
+  samples. Equal guest state, causality, an async-only regression and a performance benefit are
+  unestablished; freshly rendered FPS is **NO_DATA** without complete producer/delivery lineage.
+  Stage 2 remains **default OFF**; three-pair replication and the original 14 current visible
+  guards remain incomplete. [Current qualification evidence](https://github.com/mattias800/prosper/issues/3948#issuecomment-5977560549).
+
 - **"In retained D14, binding 6 is pink, or the normalized colour fetch contradicts the
   retained attribute specifications and stored programs."** False within the retained capture
   (2026-10-03, [#3948](https://github.com/mattias800/prosper/issues/3948)). In submit 184554,
