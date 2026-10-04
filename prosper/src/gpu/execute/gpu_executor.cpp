@@ -1046,6 +1046,8 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
             result->owned_raw_x2_write_plan =
                 raw_snapshot_write_plan(decoded, result->owned_raw_x2_chains);
         result->raw_nested_numeric_load_pcs = rdna2_raw_nested_numeric_loads(decoded);
+        if (!PROSPER_ENV_ON("PROSPER_NO_OWNED_WAVE_CLASSIFICATION_CACHE"))
+            result->requires_owned_waves = graphics_original_requires_owned_waves(result->code);
         retain_fold_instructions(decoded, result->instructions);
         std::vector<Rdna2Inst> shader_constant_decoded = decoded;
         result->shader_constant_specialized =
@@ -7154,11 +7156,8 @@ GraphicsReadSource registered_graphics_read_source(uint64_t address) {
         decode_shader_cached(reinterpret_cast<const uint32_t*>(uintptr_t(address)), count);
     return {SharedShaderWords(analysis, &analysis->code),
             std::shared_ptr<const std::vector<RawNestedWideChain>>(
-                analysis, &analysis->owned_nested_wide_chains)};
-}
-
-SharedShaderWords registered_graphics_original(uint64_t address) {
-    return registered_graphics_read_source(address).words;
+                analysis, &analysis->owned_nested_wide_chains),
+            analysis->requires_owned_waves};
 }
 
 bool draw_requires_owned_nested_snapshot(const GpuState& state) {
