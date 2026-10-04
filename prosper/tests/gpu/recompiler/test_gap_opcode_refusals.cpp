@@ -217,6 +217,9 @@ TEST(GapOpcodeRefusals, MovrelsB32ConstantIndexPastS105) {
     const std::vector<uint32_t> near = {0xbefc0382u};                // s_mov_b32 m0, 2
     expect_compiles(program(near, {w}), 0xA044ull, "control: m0 = 2 folds to s3");
     expect_gap_refusal(program(far, {w}), 0xA045ull, 2, {w}, Rdna2Format::SOP1, 0x2eu);
+    // m0 = 0x7fffffff: base + M0 must be bounded before it is added, not after (signed overflow).
+    const std::vector<uint32_t> huge = {0xbefc03ffu, 0x7fffffffu};   // s_mov_b32 m0, 0x7fffffff
+    expect_gap_refusal(program(huge, {w}), 0xA048ull, 2, {w}, Rdna2Format::SOP1, 0x2eu);
 }
 
 // Dynamic M0 reaching an unrepresentable register: s5 saves the ENTRY value of M0 (an opaque

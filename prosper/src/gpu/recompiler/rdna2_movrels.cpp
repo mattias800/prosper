@@ -38,11 +38,13 @@ bool emit_s_movrels_b32(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool
     // Optimization: If M0 is a compile-time constant literal, fold directly to single register read.
     uint32_t const_m0 = 0;
     if (b.uconst_literal(m0it->second, &const_m0)) {
-        const int target_reg = base + static_cast<int>(const_m0);
-        if (target_reg < 0 || target_reg > 105) {
+        // Bound M0 before adding: it is a guest-controlled 32-bit value, and base + M0 near
+        // INT_MAX would overflow a signed int. base is already confined to 0..105 above.
+        if (const_m0 > static_cast<uint32_t>(105 - base)) {
             ok = false;
             return true;
         }
+        const int target_reg = base + static_cast<int>(const_m0);
         bool cand_ok = true;
         const uint32_t val =
             operand_bits(b, rs, in, Operand{OperandKind::SGPR, target_reg}, &cand_ok);
