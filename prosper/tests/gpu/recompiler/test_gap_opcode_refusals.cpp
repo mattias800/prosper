@@ -249,6 +249,9 @@ TEST(GapOpcodeRefusals, MovrelsB32ConstantIndexPastS105) {
 // Dynamic M0 reaching an unrepresentable register: s5 saves the ENTRY value of M0 (an opaque
 // token, #3133) before M0 is given a runtime value, so the select over s4..s105 would have to
 // read the token. Control: the same program reading from base s6, past the token, compiles.
+// v_readfirstlane routes this program through the CFG recompiler, whose terminal record is tagged
+// `cfg-recompile-reject` and carries no `sh` field, so the record is checked field by field here
+// instead of through expect_gap_refusal's straight-line contract.
 TEST(GapOpcodeRefusals, MovrelsB32DynamicReachesSavedEntryM0) {
     static const uint32_t w = 0xbe802e04u;         // s_movrels_b32 s0, s4
     static const uint32_t control = 0xbe802e06u;   // s_movrels_b32 s0, s6
@@ -258,7 +261,15 @@ TEST(GapOpcodeRefusals, MovrelsB32DynamicReachesSavedEntryM0) {
         0xbefc0300u,   // s_mov_b32 m0, s0 (M0 now a runtime value)
     };
     expect_compiles(program(prologue, {control}), 0xA046ull, "control: base s6 skips the token");
-    expect_gap_refusal(program(prologue, {w}), 0xA047ull, 3, {w}, Rdna2Format::SOP1, 0x2eu);
+    EXPECT_TRUE(compile(program(prologue, {w}), 0xA047ull).empty())
+        << "a candidate holding the entry-M0 token must refuse the whole compile";
+    const std::string reason = last_terminal_reject_reason(0xA047ull);
+    RejectRecord r = parse_reject(reason);
+    EXPECT_EQ(r.tag, "cfg-recompile-reject") << reason;
+    EXPECT_EQ(r.fields["pc"], "3") << "the reject must name the s_movrels_b32 pc";
+    EXPECT_EQ(r.fields["words"], hex(w, false)) << reason;
+    EXPECT_EQ(r.fields["op"], "0x2e") << reason;
+    EXPECT_EQ(r.fields["fmt"], std::to_string(static_cast<int>(Rdna2Format::SOP1))) << reason;
 }
 
 // IMAGE_GATHER4 v[0:3], v[0:1], s[12:19], s[20:23] dmask:0x1 dim:SQ_RSRC_IMG_2D (MIMG 0x40). A
