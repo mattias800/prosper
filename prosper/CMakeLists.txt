@@ -2833,6 +2833,11 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_decode_sweep.cpp
     LIBRARIES prosper_core)
 
+  # The scalar opcode predicates are header-only facts checked against ISA/LLVM tables.
+  prosper_add_gtest(test_scalar_predicates
+    SOURCES tests/gpu/recompiler/test_scalar_predicates.cpp
+    INCLUDES src)
+
   # The SOPP branch predicate is a header-only fact checked against the ISA table.
   prosper_add_gtest(test_sopp_direct_branch
     SOURCES tests/gpu/recompiler/test_sopp_direct_branch.cpp
