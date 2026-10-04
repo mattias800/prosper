@@ -497,6 +497,76 @@ int main() {
     printf("  kernel4d mismatches=%u (out[60]=%g)\n", bad4d, got4d.size()==N ? got4d[60] : -1);
     CHECK(got4d.size()==N && bad4d==0, "recompiled kernel 4d computes unsigned min-of-three correctly");
 
+    // Kernel 4e: signed median-of-three (v_med3_i32, 0x158).
+    // Tests signed ordering with negative and positive inputs. Unlike kernels 4-4d these convert
+    // through the SIGNED forms -- v_cvt_i32_f32 (VOP1 0x08) in, v_cvt_f32_i32 (0x05) out -- since
+    // v_cvt_u32_f32 would clamp every negative input to 0 and never exercise a signed compare.
+    const uint32_t code4e[] = {
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0xD5580003u, 0x040A0300u, 0x7E000B03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4e = recompile_valu(code4e, std::size(code4e), 3, 0);
+    CHECK(!spv4e.empty(), "recompiled kernel 4e (v_med3_i32) -> SPIR-V");
+
+    // Kernel 4f: signed max-of-three (v_max3_i32, 0x155).
+    const uint32_t code4f[] = {
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0xD5550003u, 0x040A0300u, 0x7E000B03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4f = recompile_valu(code4f, std::size(code4f), 3, 0);
+    CHECK(!spv4f.empty(), "recompiled kernel 4f (v_max3_i32) -> SPIR-V");
+
+    // Kernel 4g: signed min-of-three (v_min3_i32, 0x152).
+    const uint32_t code4g[] = {
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0xD5520003u, 0x040A0300u, 0x7E000B03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4g = recompile_valu(code4g, std::size(code4g), 3, 0);
+    CHECK(!spv4g.empty(), "recompiled kernel 4g (v_min3_i32) -> SPIR-V");
+
+    std::vector<float> in4_signed(N * 3);
+    for (uint32_t i = 0; i < N; i++) {
+        const int32_t s0 = (int32_t)((i * 37u) % 211u) - 100;
+        const int32_t s1 = (int32_t)((i * 83u + 17u) % 211u) - 100;
+        const int32_t s2 = (int32_t)((i * 19u + 101u) % 211u) - 100;
+        in4_signed[i * 3 + 0] = (float)s0;
+        in4_signed[i * 3 + 1] = (float)s1;
+        in4_signed[i * 3 + 2] = (float)s2;
+    }
+
+    std::vector<float> got4e = prosper::test::run_compute(spv4e, in4_signed, N, N);
+    uint32_t bad4e = 0;
+    for (uint32_t i = 0; i < N && got4e.size() == N; i++) {
+        const int32_t s0 = (int32_t)((i * 37u) % 211u) - 100;
+        const int32_t s1 = (int32_t)((i * 83u + 17u) % 211u) - 100;
+        const int32_t s2 = (int32_t)((i * 19u + 101u) % 211u) - 100;
+        const int32_t mn = std::min(s0, s1), mx = std::max(s0, s1);
+        const int32_t exp = std::max(mn, std::min(mx, s2));
+        if (got4e[i] != (float)exp) bad4e++;
+    }
+    CHECK(got4e.size() == N && bad4e == 0, "recompiled kernel 4e computes signed median correctly");
+
+    std::vector<float> got4f = prosper::test::run_compute(spv4f, in4_signed, N, N);
+    uint32_t bad4f = 0;
+    for (uint32_t i = 0; i < N && got4f.size() == N; i++) {
+        const int32_t s0 = (int32_t)((i * 37u) % 211u) - 100;
+        const int32_t s1 = (int32_t)((i * 83u + 17u) % 211u) - 100;
+        const int32_t s2 = (int32_t)((i * 19u + 101u) % 211u) - 100;
+        const int32_t exp = std::max(s0, std::max(s1, s2));
+        if (got4f[i] != (float)exp) bad4f++;
+    }
+    CHECK(got4f.size() == N && bad4f == 0,
+          "recompiled kernel 4f computes signed max-of-three correctly");
+
+    std::vector<float> got4g = prosper::test::run_compute(spv4g, in4_signed, N, N);
+    uint32_t bad4g = 0;
+    for (uint32_t i = 0; i < N && got4g.size() == N; i++) {
+        const int32_t s0 = (int32_t)((i * 37u) % 211u) - 100;
+        const int32_t s1 = (int32_t)((i * 83u + 17u) % 211u) - 100;
+        const int32_t s2 = (int32_t)((i * 19u + 101u) % 211u) - 100;
+        const int32_t exp = std::min(s0, std::min(s1, s2));
+        if (got4g[i] != (float)exp) bad4g++;
+    }
+    CHECK(got4g.size() == N && bad4g == 0,
+          "recompiled kernel 4g computes signed min-of-three correctly");
+
     // Kernel 5: unsigned min/max/sub/not/and. u=(uint)a; d=(max-min) & ~u0. out=(float)d.
     const uint32_t code5[] = {
         0x7E000F00u, 0x7E020F01u, 0x26040300u, 0x28060300u, 0x4C040503u, 0x7E066F00u, 0x36040702u, 0x7E000D02u, 0xBF810000u,
@@ -11052,6 +11122,92 @@ int main() {
         if (bits_of(gotTsad2[i]) != bits_of(inX[i]) + 5u) ++badTsad2;
     CHECK(gotTsad2.size()==N && badTsad2==0,
           "Tsad2: v_sad_u32 with src1=0 adds S0 to the S2 accumulator");
+
+    // Tsad3: v_sad_u8 (0x15a). Four-byte unsigned absolute differences plus accumulator.
+    // Inputs: S0=0x00FF10F0, S1=0xFF000F0F, S2=7.
+    // Byte diffs: |0x00-0xFF|=255, |0xFF-0x00|=255, |0x10-0x0F|=1, |0xF0-0x0F|=225.
+    // Sum = 255 + 255 + 1 + 225 + 7 = 743 = 0x2E7.
+    const uint32_t codeTsad3[] = {
+        0x7e0202ffu, 0x00ff10f0u,   // v_mov_b32 v1, 0x00FF10F0
+        0x7e0402ffu, 0xff000f0fu,   // v_mov_b32 v2, 0xFF000F0F
+        0x7e060287u,   // v_mov_b32 v3, 7
+        0xd55a0004u, 0x040e0501u,   // v_sad_u8 v4, v1, v2, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad3 =
+        recompile_valu(codeTsad3, std::size(codeTsad3), 0, /*out_vgpr*/ 4);
+    CHECK(!spvTsad3.empty(), "recompiled Tsad3 (v_sad_u8) -> SPIR-V");
+    std::vector<float> gotTsad3 = prosper::test::run_compute(spvTsad3, inX, N, N);
+    uint32_t badTsad3 = 0;
+    for (uint32_t i = 0; i < N && gotTsad3.size() == N; ++i)
+        if (bits_of(gotTsad3[i]) != 0x2E7u) ++badTsad3;
+    CHECK(gotTsad3.size() == N && badTsad3 == 0,
+          "Tsad3: v_sad_u8 computes sum of four byte absolute differences plus accumulator");
+
+    // Tsad4: v_sad_hi_u8 (0x15b). (sum of byte |a-b| << 16) + accumulator.
+    // Inputs: S0=0x00FF10F0, S1=0xFF000F0F, S2=7.
+    // Sum = (736 << 16) + 7 = 0x02E00007.
+    const uint32_t codeTsad4[] = {
+        0x7e0202ffu, 0x00ff10f0u,   // v_mov_b32 v1, 0x00FF10F0
+        0x7e0402ffu, 0xff000f0fu,   // v_mov_b32 v2, 0xFF000F0F
+        0x7e060287u,   // v_mov_b32 v3, 7
+        0xd55b0004u, 0x040e0501u,   // v_sad_hi_u8 v4, v1, v2, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad4 =
+        recompile_valu(codeTsad4, std::size(codeTsad4), 0, /*out_vgpr*/ 4);
+    CHECK(!spvTsad4.empty(), "recompiled Tsad4 (v_sad_hi_u8) -> SPIR-V");
+    std::vector<float> gotTsad4 = prosper::test::run_compute(spvTsad4, inX, N, N);
+    uint32_t badTsad4 = 0;
+    for (uint32_t i = 0; i < N && gotTsad4.size() == N; ++i)
+        if (bits_of(gotTsad4[i]) != 0x02E00007u) ++badTsad4;
+    CHECK(gotTsad4.size() == N && badTsad4 == 0,
+          "Tsad4: v_sad_hi_u8 shifts byte sum by 16 before adding accumulator");
+
+    // Tsad5: v_sad_u16 (0x15c). Two 16-bit unsigned absolute differences plus accumulator with 32-bit wrap.
+    // Inputs: S0=0x0001FFFF, S1=0xFFFF0001, S2=0xFFFFFFFF.
+    // Halfword diffs: |0xFFFF-0x0001|=65534, |0x0001-0xFFFF|=65534.
+    // Sum = 65534 + 65534 + 0xFFFFFFFF = 131068 - 1 = 131067 = 0x0001FFFB.
+    const uint32_t codeTsad5[] = {
+        0x7e0202ffu, 0x0001ffffu,   // v_mov_b32 v1, 0x0001FFFF
+        0x7e0402ffu, 0xffff0001u,   // v_mov_b32 v2, 0xFFFF0001
+        0x7e0602c1u,   // v_mov_b32 v3, -1 (0xFFFFFFFF)
+        0xd55c0004u, 0x040e0501u,   // v_sad_u16 v4, v1, v2, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad5 =
+        recompile_valu(codeTsad5, std::size(codeTsad5), 0, /*out_vgpr*/ 4);
+    CHECK(!spvTsad5.empty(), "recompiled Tsad5 (v_sad_u16) -> SPIR-V");
+    std::vector<float> gotTsad5 = prosper::test::run_compute(spvTsad5, inX, N, N);
+    uint32_t badTsad5 = 0;
+    for (uint32_t i = 0; i < N && gotTsad5.size() == N; ++i)
+        if (bits_of(gotTsad5[i]) != 0x0001FFFBu) ++badTsad5;
+    CHECK(gotTsad5.size() == N && badTsad5 == 0,
+          "Tsad5: v_sad_u16 wraps accumulator mod 2^32 across 16-bit halfword diffs");
+
+    // Tsad6: v_msad_u8 (0x171). Masked byte SAD, skipping byte when S1[k] == 0.
+    // Inputs: S0=0x003010F0, S1=0x50000F0F, S2=7.
+    // k=0: S0=0xF0, S1=0x0F != 0 => diff = 225.
+    // k=1: S0=0x10, S1=0x0F != 0 => diff = 1.
+    // k=2: S0=0x30, S1=0x00 == 0 => diff = 0 (skipped).
+    // k=3: S0=0x00, S1=0x50 != 0 => diff = 80.
+    // Sum = 225 + 1 + 0 + 80 + 7 = 313 = 0x139.
+    const uint32_t codeTsad6[] = {
+        0x7e0202ffu, 0x003010f0u,   // v_mov_b32 v1, 0x003010F0
+        0x7e0402ffu, 0x50000f0fu,   // v_mov_b32 v2, 0x50000F0F
+        0x7e060287u,   // v_mov_b32 v3, 7
+        0xd5710004u, 0x040e0501u,   // v_msad_u8 v4, v1, v2, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad6 =
+        recompile_valu(codeTsad6, std::size(codeTsad6), 0, /*out_vgpr*/ 4);
+    CHECK(!spvTsad6.empty(), "recompiled Tsad6 (v_msad_u8) -> SPIR-V");
+    std::vector<float> gotTsad6 = prosper::test::run_compute(spvTsad6, inX, N, N);
+    uint32_t badTsad6 = 0;
+    for (uint32_t i = 0; i < N && gotTsad6.size() == N; ++i)
+        if (bits_of(gotTsad6[i]) != 0x139u) ++badTsad6;
+    CHECK(gotTsad6.size() == N && badTsad6 == 0,
+          "Tsad6: v_msad_u8 skips byte when S1 byte is zero");
 
     // Astro's next blocker is VOP3B v_mad_u64_u32. Exercise all three architectural
     // outputs with an overflowing case:
