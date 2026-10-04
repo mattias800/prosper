@@ -35,4 +35,4 @@ void exc_pending_release(size_t handle, uint64_t tid);
 // published (exc_pending_put is two-phase).
 int exc_pending_take(uint64_t tid);
 
-} // namespace prosper
+}   // namespace prosper

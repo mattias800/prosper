@@ -13,7 +13,10 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free && std::atomic<int>::is
 // is two-phase -- claim, store the type, THEN publish the tid -- so a take can never match a slot
 // whose type is not yet written (it would otherwise hand out the slot's previous type).
 constexpr uint64_t kClaiming = ~0ull;
-struct Slot { std::atomic<uint64_t> tid{0}; std::atomic<int> type{0}; };
+struct Slot {
+    std::atomic<uint64_t> tid{0};
+    std::atomic<int> type{0};
+};
 Slot g_slots[kExcPendingSlots];
 
 } // namespace

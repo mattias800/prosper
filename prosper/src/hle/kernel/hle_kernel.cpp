@@ -3988,7 +3988,10 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
     // unacknowledged. A delivery with nothing pending is still reported (as dropped) once.
     const uint64_t self = (uint64_t)pthread_self();
     int type = exc_pending_take(self);
-    if (type < 0) { exc_deliver(type, uc_); return; }
+    if (type < 0) {
+        exc_deliver(type, uc_);
+        return;
+    }
     do { exc_deliver(type, uc_); } while ((type = exc_pending_take(self)) >= 0);
 #else
     exc_deliver(si->si_value.sival_int, uc_);

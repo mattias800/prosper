@@ -88,16 +88,20 @@ protected:
         raise_ = Hle::lookup(nid_hash("sceKernelRaiseException"));
         ASSERT_NE(install_, nullptr);
         ASSERT_NE(raise_, nullptr);
-        ASSERT_EQ(install_(kGcSuspendType, reinterpret_cast<uint64_t>(&suspend_handler), 0, 0, 0, 0), 0u);
+        ASSERT_EQ(
+            install_(kGcSuspendType, reinterpret_cast<uint64_t>(&suspend_handler), 0, 0, 0, 0), 0u);
         g_release = false;
         g_exit = false;
     }
     void start(std::vector<Target>& targets) {
         for (auto& t : targets) ASSERT_EQ(pthread_create(&t.thread, nullptr, target_main, &t), 0);
-        ASSERT_TRUE(wait_until([&] {
-            for (auto& t : targets) if (!t.ready) return false;
-            return true;
-        }, std::chrono::seconds(10)));
+        ASSERT_TRUE(wait_until(
+            [&] {
+                for (auto& t : targets)
+                    if (!t.ready) return false;
+                return true;
+            },
+            std::chrono::seconds(10)));
     }
     void finish(std::vector<Target>& targets) {
         g_exit = true;
@@ -117,10 +121,14 @@ TEST_F(ExcRaiseBurst, EveryThreadOfABurstLargerThanTheOldTableIsRaisedAndDeliver
     for (size_t i = 0; i < targets.size(); ++i)
         EXPECT_EQ(raise(targets[i]), 0u) << "raise " << i << " of a pending burst must succeed";
     g_release = true;
-    EXPECT_TRUE(wait_until([&] {
-        for (auto& t : targets) if (t.handled.load() < 1) return false;
-        return true;
-    }, std::chrono::seconds(20))) << "every raised thread must run its handler";
+    EXPECT_TRUE(wait_until(
+        [&] {
+            for (auto& t : targets)
+                if (t.handled.load() < 1) return false;
+            return true;
+        },
+        std::chrono::seconds(20)))
+        << "every raised thread must run its handler";
     for (size_t i = 0; i < targets.size(); ++i) {
         EXPECT_EQ(targets[i].handled.load(), 1) << "thread " << i << " handled its request once";
         EXPECT_TRUE(targets[i].handled_on_self.load()) << "on its own thread";
@@ -134,7 +142,8 @@ TEST_F(ExcRaiseBurst, TwoRequestsThatCoalesceIntoOneSignalBothRun) {
     EXPECT_EQ(raise(targets[0]), 0u);
     EXPECT_EQ(raise(targets[0]), 0u);
     g_release = true;
-    EXPECT_TRUE(wait_until([&] { return targets[0].handled.load() >= 2; }, std::chrono::seconds(10)))
+    EXPECT_TRUE(
+        wait_until([&] { return targets[0].handled.load() >= 2; }, std::chrono::seconds(10)))
         << "a plain signal delivers once for both raises; both requests must still run";
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     EXPECT_EQ(targets[0].handled.load(), 2);
@@ -172,7 +181,8 @@ TEST(ExcPendingTable, HoldsAFullBurstReleasesUnsentRequestsAndHandsEachOutOnce) 
     EXPECT_EQ(prosper::exc_pending_take(kBase), 0x1e);
     const size_t other = prosper::exc_pending_put(kBase + 0x1000, 0x1e);
     prosper::exc_pending_release(h, kBase);
-    EXPECT_EQ(prosper::exc_pending_take(kBase + 0x1000), 0x1e) << "the stale release left this alone";
+    EXPECT_EQ(prosper::exc_pending_take(kBase + 0x1000), 0x1e)
+        << "the stale release left this alone";
     (void)other;
     // Leave the process-global table empty even if an assertion above failed part-way, so this
     // case cannot poison a --gtest_repeat run or a later case in the same process.
@@ -180,4 +190,4 @@ TEST(ExcPendingTable, HoldsAFullBurstReleasesUnsentRequestsAndHandsEachOutOnce) 
         while (prosper::exc_pending_take(kBase + i * 0x1000) >= 0) {}
     while (prosper::exc_pending_take(kBase + 0xfff000) >= 0) {}
 }
-} // namespace
+}   // namespace
