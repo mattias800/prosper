@@ -1,6 +1,6 @@
 // test_gap_opcode_refusals — fail-visible refusal pins for opcodes the compute recompiler
-// decodes but does not lower: v_mad_i64_i32, v_div_fixup_f32, s_movrels_b32
-// and image_gather4 (implicit LOD).
+// decodes but does not lower: v_mad_i64_i32, v_div_fixup_f32 and s_movrels_b32. The
+// image_gather4 arm below is no longer a refusal pin: it checks where 0x40 is admitted.
 //
 // Per the recompiler charter an unsupported op is a FATAL gap, and the loud refusal is only the
 // backstop. These arms pin that backstop: the guest word decodes to the right instruction, the
