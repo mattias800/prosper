@@ -1,6 +1,6 @@
 // test_gap_opcode_refusals — fail-visible refusal pins for opcodes the compute recompiler
-// decodes but does not lower: v_mad_i64_i32, v_div_fixup_f32, s_movrels_b32
-// and image_gather4 (implicit LOD).
+// decodes but does not lower: v_mad_i64_i32, v_div_fixup_f32 and s_movrels_b32. The
+// image_gather4 arm below is no longer a refusal pin: it checks where 0x40 is admitted.
 //
 // Per the recompiler charter an unsupported op is a FATAL gap, and the loud refusal is only the
 // backstop. These arms pin that backstop: the guest word decodes to the right instruction, the
@@ -225,10 +225,12 @@ TEST(GapOpcodeRefusals, MovrelsB32) {
 
 // IMAGE_GATHER4 v[0:3], v[0:1], s[12:19], s[20:23] dmask:0x1 dim:SQ_RSRC_IMG_2D (MIMG 0x40). A
 // gather selects ONE channel, so dmask must be 1, 2, 4 or 8 (llvm-mc rejects 0xf). A direct T# at
-// s12 and S# at s20 are supplied, with defined coordinates, so the MIMG emitter's resource gate is
-// passed and the refusal is the opcode gate. Control: image_gather4_lz (0x47) -- the same word with
-// only the opcode field changed -- compiles with that table, and refuses without it, which shows
-// the table is what the shared setup needs.
+// s12 and S# at s20 are supplied, with defined coordinates. image_gather4 is no longer a gap: it
+// is admitted where reading LOD 0 is exact (a single-level resource, or a non-fragment stage with
+// no derivatives), and then must compile to the SAME module as image_gather4_lz (0x47, the same
+// word with only the opcode field changed), so the _lz execution coverage applies to it. In a
+// fragment shader a multi-level resource must refuse; the single-level twin of that program
+// compiling is what shows the refusal comes from the mip gate.
 TEST(GapOpcodeRefusals, ImageGather4) {
     static const uint32_t w[2] = {0xf1000108u, 0x00a30000u};
     static const uint32_t control[2] = {0xf11c0108u, 0x00a30000u};
@@ -263,11 +265,34 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         0x7e0202f0u,   // v_mov_b32 v1, 0.5
     };
 
-    expect_compiles(program(prologue, {control[0], control[1]}), 0xA050ull,
-                    "control: image_gather4_lz with the texture table", &rt, config);
+    const auto spv_control =
+        compile(program(prologue, {control[0], control[1]}), 0xA050ull, &rt, config);
+    EXPECT_FALSE(spv_control.empty()) << "control: image_gather4_lz with the texture table";
+    const auto spv_gather = compile(program(prologue, {w[0], w[1]}), 0xA051ull, &rt, config);
+    EXPECT_FALSE(spv_gather.empty()) << "image_gather4 with the texture table";
+    EXPECT_EQ(spv_gather, spv_control) << "image_gather4 on single-level resource must produce "
+                                          "word-for-word identical module to image_gather4_lz";
+
     EXPECT_TRUE(
         compile(program(prologue, {control[0], control[1]}), 0xA052ull, nullptr, config).empty())
         << "control without a resource table must refuse, or the table is not load-bearing";
-    expect_gap_refusal(program(prologue, {w[0], w[1]}), 0xA051ull, 2, {w[0], w[1]},
-                       Rdna2Format::MIMG, 0x40u, &rt, config);
+    EXPECT_TRUE(compile(program(prologue, {w[0], w[1]}), 0xA053ull, nullptr, config).empty())
+        << "image_gather4 without a resource table must refuse, or the table is not load-bearing";
+
+    // Gate checks in fragment stage: multi-level texture (declared_mip_levels == 2) must refuse;
+    // single-level texture (declared_mip_levels == 1) must compile.
+    // A fragment program must export, or recompile_fragment refuses it for that reason alone.
+    const auto fragment_prog =
+        program(prologue, {w[0], w[1], 0xf800180fu, 0x03020100u});   // exp mrt0 v0-v3 done vm
+    ShaderResourceTable frag_rt_single = rt;
+    frag_rt_single.resources[0].declared_mip_levels = 1u;
+    EXPECT_FALSE(
+        recompile_fragment(fragment_prog.data(), fragment_prog.size(), &frag_rt_single).empty())
+        << "image_gather4 in fragment stage must compile for single-level resource";
+
+    ShaderResourceTable frag_rt_multi = rt;
+    frag_rt_multi.resources[0].declared_mip_levels = 2u;
+    EXPECT_TRUE(
+        recompile_fragment(fragment_prog.data(), fragment_prog.size(), &frag_rt_multi).empty())
+        << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
