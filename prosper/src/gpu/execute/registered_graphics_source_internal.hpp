@@ -7,13 +7,13 @@ namespace prosper::gpu {
 // It retains only a WEAK original owner, so a resident native payload cannot keep that owner
 // alive merely by retaining its compile-analysis words.
 class RegisteredNativeGraphicsAnalysis {
-    friend GraphicsReadSource coupled_graphics_read_source(
-        const std::shared_ptr<const DecodedShader>&);
+    friend GraphicsReadSource
+    coupled_graphics_read_source(const std::shared_ptr<const DecodedShader>&);
     std::weak_ptr<const DecodedShader> original_;
     const DecodedShader* original_address_ = nullptr;
     SharedShaderAnalysis analysis_;
     RegisteredNativeGraphicsAnalysis(const std::shared_ptr<const DecodedShader>& original,
-                                    SharedShaderAnalysis analysis)
+                                     SharedShaderAnalysis analysis)
         : original_(original), original_address_(original.get()), analysis_(std::move(analysis)) {}
 
 public:

@@ -1,0 +1,310 @@
+// Actual AGC registration -> ordered issuer/pre-fold seal -> immutable bank/native lineage.
+// Uses the normal live backend's real pending/failure/allocation queries without registering a
+// renderer or creating a device. No fabricated manifests, reflection or complete=true authority.
+// These CPU observations prove ownership/refusal, not GPU execution or CPU-writer exclusion.
+#include "fixtures/fragment_scalar_bank_fixture.hpp"
+#include "fixtures/render_runner.h"
+#include "gpu/execute/ordered_graphics_read_point_internal.hpp"
+#include "gpu/recompiler/original_fragment_producer.hpp"
+#include "gpu/recompiler/original_graphics_draw_effects.hpp"
+#include "shared/live/live_renderer.hpp"
+#include <gtest/gtest.h>
+
+namespace {
+namespace g = prosper::gpu;
+namespace f = prosper::test::scalar_bank;
+namespace r = prosper::test;
+namespace p = prosper::agc::Pm4;
+namespace live = prosper::frontend;
+class FragmentScalarBank : public testing::Test {
+protected:
+    f::Scene scene;
+    std::vector<g::DrawItem> observed;
+    uint32_t render_calls = 0;
+    void SetUp() override {
+        ASSERT_TRUE(scene.create());
+        ASSERT_EQ(r::backend_pending_submission_batches().load(), 0);
+        ASSERT_FALSE(r::backend_has_unproven_submission());
+        g::set_graphics_producer_status_query(live::live_graphics_producer_status);
+        g::set_graphics_raw_source_authority(live::live_graphics_raw_source_current);
+        g::set_graphics_raw_allocation_authority(live::live_graphics_raw_allocation_current);
+        g::set_submit_renderer([&](const std::vector<g::DrawItem>& items, uint32_t, uint32_t) {
+            ++render_calls;
+            observed.insert(observed.end(), items.begin(), items.end());
+            return g::RenderedFrame{}; // no pixel publication or GPU work is claimed
+        });
+    }
+    void TearDown() override {
+        g::set_submit_renderer({});
+        g::set_submit_compute({});
+        g::set_graphics_raw_allocation_authority({});
+        g::set_graphics_raw_source_authority({});
+        g::set_graphics_producer_status_query({});
+        EXPECT_EQ(r::backend_pending_submission_batches().load(), 0);
+        EXPECT_TRUE(scene.data.close());
+        EXPECT_TRUE(scene.color.close());
+    }
+    void run(const g::GpuState& state, uint64_t submit = 4801) {
+        observed.clear();
+        render_calls = 0;
+        EXPECT_FALSE(g::execute_ordered_and_present(state, r::fragment_draw::width,
+                                                    r::fragment_draw::height, submit, false));
+    }
+    static std::shared_ptr<const g::FragmentScalarBank> bank(const g::DrawItem& draw) {
+        return draw.fragment_draw_inputs ? draw.fragment_draw_inputs->scalar_bank : nullptr;
+    }
+    static std::array<float, 4> rgba(const g::FragmentScalarBank& value) {
+        std::array<float, 4> result{};
+        if (value.intervals().size() == 1 && value.intervals()[0].bytes &&
+            value.intervals()[0].bytes->size() == sizeof(result))
+            std::memcpy(result.data(), value.intervals()[0].bytes->data(), sizeof(result));
+        return result;
+    }
+    static void add_draw(g::GpuState& state, const g::GpuState& actual, uint64_t order) {
+        auto draw = state.draws[0];
+        draw.command_order = order;
+        draw.state = std::make_shared<g::GpuState>(actual);
+        state.draws.push_back(std::move(draw));
+    }
+};
+
+TEST_F(FragmentScalarBank, CodeFreeHintObservesOnlyPhysicalLaunchAndCannotMintAuthority) {
+    auto state = scene.state();
+    const auto before = g::shader_decode_cache_stats();
+    ASSERT_TRUE(g::draw_requires_original_scalar_bank(state));
+    state.cx.erase(p::SPI_PS_IN_CONTROL);
+    EXPECT_TRUE(g::draw_requires_original_scalar_bank(state));
+    state.cx[p::SPI_PS_IN_CONTROL] = 1u << p::SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT;
+    EXPECT_FALSE(g::draw_requires_original_scalar_bank(state));
+    state.cx[p::SPI_PS_IN_CONTROL] = 0;
+    state.sh[p::SPI_SHADER_PGM_LO_PS] = 0xdeadbe00u;
+    state.sh[p::SPI_SHADER_PGM_HI_PS] = 1;
+    EXPECT_TRUE(g::draw_requires_original_scalar_bank(state))
+        << "missing code is routing, not permission";
+    const auto after = g::shader_decode_cache_stats();
+    EXPECT_EQ(after.hits, before.hits);
+    EXPECT_EQ(after.misses, before.misses);
+    EXPECT_EQ(after.bypasses, before.bypasses);
+    run(state);
+    for (const auto& draw : observed) EXPECT_FALSE(bank(draw));
+}
+TEST_F(FragmentScalarBank, TwoAdjacentOriginalReadsSealOncePerDrawWithoutAnExtraRenderBoundary) {
+    auto state = scene.state();
+    add_draw(state, state, 200);
+    run(state);
+    ASSERT_EQ(observed.size(), 2u);
+    EXPECT_EQ(render_calls, 1u) << "a pending unsubmitted disjoint span is not a nested-read flush";
+    for (const auto& draw : observed) {
+        const auto value = bank(draw);
+        ASSERT_TRUE(value);
+        EXPECT_EQ(value->payload_bytes(), sizeof(r::fragment_draw::color_a));
+        EXPECT_EQ(rgba(*value), r::fragment_draw::color_a);
+        ASSERT_EQ(value->sources().size(), 1u);
+        EXPECT_EQ(value->sources()[0].descriptor, scene.descriptor);
+        EXPECT_EQ(value->sources()[0].allocation.physical_end -
+                      value->sources()[0].allocation.physical_begin,
+                  f::page)
+            << "the certified read is small but output exclusion retains the full allocation";
+        EXPECT_NE(value->sources()[0].allocation.identity, 0u);
+        ASSERT_TRUE(draw.original_graphics_effects);
+        EXPECT_TRUE(draw.original_graphics_effects->matches_draw(
+            4801, draw.command_order, draw.vs_shared, draw.fs_shared, draw.gs, draw.fs_words()));
+        ASSERT_TRUE(draw.fragment_draw_inputs->original_fragment_producer);
+        EXPECT_TRUE(draw.fragment_draw_inputs->original_fragment_producer->matches(
+            *draw.fragment_draw_inputs));
+        EXPECT_TRUE(draw.fs_words().empty()) << "no fake normalized FS module/reflection";
+        EXPECT_FALSE(
+            draw.ordered_read_point &&
+            draw.ordered_read_point->valid_for(4801, draw.command_order, draw.fs_guest_addr,
+                                               draw.ordered_read_point->source(draw.fs_guest_addr)))
+            << "legacy RAW remains separate/expired";
+    }
+}
+TEST_F(FragmentScalarBank,
+       WarmRealizationReusesOneCanonicalObservationPerStageAndOwnsChangedBytes) {
+    const auto state = scene.state();
+    run(state);
+    ASSERT_EQ(observed.size(), 1u);
+    const auto old = bank(observed[0]);
+    ASSERT_TRUE(old);
+    const auto code = old->original_words();
+    scene.write(r::fragment_draw::color_b);
+    const auto before = g::shader_decode_cache_stats();
+    run(state, 4802);
+    const auto after = g::shader_decode_cache_stats();
+    ASSERT_EQ(observed.size(), 1u);
+    const auto fresh = bank(observed[0]);
+    ASSERT_TRUE(fresh);
+    EXPECT_EQ(after.hits - before.hits, 2u)
+        << "one existing validation each for original VS/PS; no repair relookup";
+    EXPECT_EQ(after.misses, before.misses);
+    EXPECT_EQ(fresh->original_words(), code);
+    EXPECT_NE(fresh, old);
+    EXPECT_EQ(rgba(*old), r::fragment_draw::color_a);
+    EXPECT_EQ(rgba(*fresh), r::fragment_draw::color_b);
+    ASSERT_TRUE(scene.data.close());
+    EXPECT_EQ(rgba(*old), r::fragment_draw::color_a)
+        << "sealed bytes survive expired point and guest unmap";
+    EXPECT_EQ(rgba(*fresh), r::fragment_draw::color_b);
+}
+TEST_F(FragmentScalarBank, GenuineLargeDeclaredExtentCopiesOnlyTheCertifiedSmallDemand) {
+    auto state = scene.state();
+    state.sh[p::SPI_SHADER_USER_DATA_PS_0 + 1] |= 16u << 16u;
+    state.sh[p::SPI_SHADER_USER_DATA_PS_0 + 2] = UINT32_MAX;
+    run(state);
+    ASSERT_EQ(observed.size(), 1u);
+    const auto value = bank(observed[0]);
+    ASSERT_TRUE(value);
+    ASSERT_EQ(value->sources().size(), 1u);
+    EXPECT_EQ(value->sources()[0].declared_bytes, uint64_t(16) * UINT32_MAX);
+    EXPECT_GT(value->sources()[0].declared_bytes, f::page);
+    EXPECT_EQ(value->payload_bytes(), 16u);
+    EXPECT_EQ(rgba(*value), r::fragment_draw::color_a);
+}
+TEST_F(FragmentScalarBank, MissingEntryWordAndPartialOobNeverBorrowPaddedBacking) {
+    auto state = scene.state();
+    state.sh.erase(p::SPI_SHADER_USER_DATA_PS_0 + 3);
+    run(state);
+    for (const auto& draw : observed) EXPECT_FALSE(bank(draw));
+    state = scene.state();
+    state.sh[p::SPI_SHADER_USER_DATA_PS_0 + 2] = 12;
+    run(state, 4802);
+    for (const auto& draw : observed) EXPECT_FALSE(bank(draw));
+    state = scene.state();
+    state.sh[p::SPI_SHADER_USER_DATA_PS_0 + 1] |= 0x80000000u;
+    run(state, 4803);
+    for (const auto& draw : observed) EXPECT_FALSE(bank(draw));
+    run(scene.state(), 4804);
+    ASSERT_EQ(observed.size(), 1u);
+    ASSERT_TRUE(bank(observed[0])) << "matched genuine in-bounds positive is not optional";
+}
+TEST_F(FragmentScalarBank, CurrentAndPriorFullAllocationAliasesRefuseEvenDisjointByteWindows) {
+    auto alias = scene.state();
+    alias.cx[p::CB_COLOR0_BASE] = uint32_t((scene.data.address + 0x1000) >> 8u);
+    alias.cx[p::CB_COLOR0_BASE_EXT] = uint32_t(scene.data.address >> 40u);
+    run(alias);
+    for (const auto& draw : observed) EXPECT_FALSE(bank(draw));
+    const auto native = f::register_original(false, r::fragment_draw::fragment_words());
+    ASSERT_TRUE(native);
+    auto first = alias;
+    for (const auto& reg : native->registers) first.sh[reg.offset] = reg.value;
+    first.cx[p::SPI_PS_IN_CONTROL] = 1u << p::SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT;
+    add_draw(first, scene.state(), 200);
+    run(first, 4802);
+    ASSERT_EQ(observed.size(), 2u);
+    ASSERT_TRUE(observed[0].original_graphics_effects)
+        << "real preceding native draw effects were retained";
+    EXPECT_FALSE(bank(observed[1]))
+        << "prior unsubmitted output excludes the FULL original allocation";
+    run(scene.state(), 4803);
+    ASSERT_EQ(observed.size(), 1u);
+    ASSERT_TRUE(bank(observed[0]));
+}
+TEST_F(FragmentScalarBank, MissingOrActiveStagesStreamoutAndMetadataRefuseWithoutInventedDefaults) {
+    for (const auto reg :
+         {p::VGT_SHADER_STAGES_EN, p::VGT_STRMOUT_CONFIG, p::VGT_STRMOUT_BUFFER_CONFIG,
+          p::DB_DEPTH_CONTROL, p::CB_COLOR0_CMASK, p::CB_COLOR0_FMASK, p::CB_COLOR0_DCC_BASE_EXT}) {
+        SCOPED_TRACE(reg);
+        auto state = scene.state();
+        state.cx.erase(reg);
+        run(state);
+        for (const auto& draw : observed) EXPECT_FALSE(bank(draw));
+        state = scene.state();
+        state.cx[reg] = 1;
+        run(state, 4802);
+        for (const auto& draw : observed) EXPECT_FALSE(bank(draw));
+    }
+    run(scene.state(), 4803);
+    ASSERT_EQ(observed.size(), 1u);
+    ASSERT_TRUE(bank(observed[0]));
+}
+TEST_F(FragmentScalarBank, RegisteredPostEndPaddingAndMeaningfulBranchTailAreNotSilentlyTrimmed) {
+    for (const auto tail : {std::vector<uint32_t>{0xbf800000u},
+                            std::vector<uint32_t>{0xbf820000u, 0xe0700000u, 0x80000000u}}) {
+        auto words = f::fragment_words();
+        words.insert(words.end(), tail.begin(), tail.end());
+        const auto source = f::register_original(false, words);
+        ASSERT_TRUE(source);
+        auto state = scene.state();
+        for (const auto& reg : source->registers) state.sh[reg.offset] = reg.value;
+        run(state);
+        for (const auto& draw : observed) EXPECT_FALSE(bank(draw));
+    }
+    run(scene.state(), 4803);
+    ASSERT_EQ(observed.size(), 1u);
+    ASSERT_TRUE(bank(observed[0]));
+}
+TEST_F(FragmentScalarBank, MixedNativeAndBankDrawsRetainExactOriginalModuleAndOrderLineage) {
+    const auto native = f::register_original(false, r::fragment_draw::fragment_words());
+    ASSERT_TRUE(native);
+    auto state = scene.state();
+    auto native_state = state;
+    for (const auto& reg : native->registers) native_state.sh[reg.offset] = reg.value;
+    native_state.cx[p::SPI_PS_IN_CONTROL] = 1u << p::SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT;
+    add_draw(state, native_state, 200);
+    add_draw(state, scene.state(), 300);
+    run(state);
+    ASSERT_EQ(observed.size(), 3u);
+    EXPECT_EQ(render_calls, 1u);
+    EXPECT_TRUE(bank(observed[0]));
+    EXPECT_FALSE(bank(observed[1]));
+    EXPECT_FALSE(observed[1].fs_words().empty());
+    EXPECT_TRUE(bank(observed[2]));
+    for (const auto& draw : observed) {
+        const auto& effects = draw.original_graphics_effects;
+        ASSERT_TRUE(effects);
+        EXPECT_TRUE(effects->matches_draw(4801, draw.command_order, draw.vs_shared, draw.fs_shared,
+                                          draw.gs, draw.fs_words()));
+        EXPECT_FALSE(effects->matches_draw(4802, draw.command_order, draw.vs_shared, draw.fs_shared,
+                                           draw.gs, draw.fs_words()));
+        EXPECT_FALSE(effects->matches_draw(4801, draw.command_order + 1, draw.vs_shared,
+                                           draw.fs_shared, draw.gs, draw.fs_words()));
+        const auto equal_but_foreign =
+            std::make_shared<const std::vector<uint32_t>>(draw.vs_words());
+        EXPECT_FALSE(effects->matches_draw(4801, draw.command_order, equal_but_foreign,
+                                           draw.fs_shared, draw.gs, draw.fs_words()));
+    }
+}
+TEST_F(FragmentScalarBank, ActualFailureGenerationDuringFinalPublicationRevokesTheCopy) {
+    uint32_t source_checks = 0;
+    const auto before = r::backend_failed_publication_generation().load();
+    g::set_graphics_raw_allocation_authority(
+        [&](const prosper::GuestMappingLease& lease, const prosper::GuestDirectAllocation& source) {
+            const bool current = live::live_graphics_raw_allocation_current(lease, source);
+            if (++source_checks == 2) { const r::BackendProducerAttempt actual_failed_publication; }
+            return current;
+        });
+    run(scene.state());
+    ASSERT_EQ(source_checks, 2u)
+        << "final source-current validation is actually reached after copying";
+    EXPECT_EQ(r::backend_failed_publication_generation().load(), before + 1);
+    for (const auto& draw : observed) EXPECT_FALSE(bank(draw));
+    g::set_graphics_raw_allocation_authority(live::live_graphics_raw_allocation_current);
+    run(scene.state(), 4802);
+    ASSERT_EQ(observed.size(), 1u);
+    ASSERT_TRUE(bank(observed[0]))
+        << "a new clean baseline is distinct from reviving an old ticket";
+}
+TEST_F(FragmentScalarBank, SuccessfulPublicProducerEntryCannotReuseAnEarlierCopyPermission) {
+    uint32_t source_checks = 0;
+    const auto before = r::backend_failed_publication_generation().load();
+    g::set_graphics_raw_allocation_authority(
+        [&](const prosper::GuestMappingLease& lease, const prosper::GuestDirectAllocation& source) {
+            const bool current = live::live_graphics_raw_allocation_current(lease, source);
+            if (++source_checks == 2) {
+                // A real publicly callable successful executor entry participates even when it
+                // has no draws. It changes shared order/version, not the failure generation.
+                EXPECT_TRUE(g::render_submit_items({}, 0, 0).empty());
+            }
+            return current;
+        });
+    run(scene.state());
+    ASSERT_EQ(source_checks, 2u);
+    EXPECT_EQ(r::backend_failed_publication_generation().load(), before);
+    for (const auto& draw : observed) EXPECT_FALSE(bank(draw));
+    g::set_graphics_raw_allocation_authority(live::live_graphics_raw_allocation_current);
+    run(scene.state(), 4802);
+    ASSERT_EQ(observed.size(), 1u);
+    ASSERT_TRUE(bank(observed[0]));
+}
+}   // namespace

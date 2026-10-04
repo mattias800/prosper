@@ -97,7 +97,10 @@ getenv|prosper/src/gpu/diagnostics/memory_placement_log.hpp 2
 getenv|prosper/src/gpu/diagnostics/shader_dump_filter.cpp 1
 getenv|prosper/src/gpu/execute/compute_program_facts.cpp 1
 getenv|prosper/src/gpu/execute/gpu_execute.hpp 11
-getenv|prosper/src/gpu/execute/gpu_executor.cpp 90
+# #4322: unchanged decode-cache opt-out moved mechanically to its sole cache-owning companion.
+# This renames one existing site; no new raw environment read or switch was introduced.
+getenv|prosper/src/gpu/execute/gpu_executor.cpp 89
+getenv|prosper/src/gpu/execute/shader_decode_cache.cpp 1
 getenv|prosper/src/gpu/execute/index_expand.hpp 1
 getenv|prosper/src/gpu/execute/mb3_freelist.cpp 3
 getenv|prosper/src/gpu/execute/shader_cache_internal.hpp 3

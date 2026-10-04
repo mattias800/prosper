@@ -4,11 +4,13 @@
 #include <map>
 
 namespace prosper::gpu {
-GraphicsReadSource coupled_graphics_read_source(const std::shared_ptr<const DecodedShader>& decoded) {
+GraphicsReadSource
+coupled_graphics_read_source(const std::shared_ptr<const DecodedShader>& decoded) {
     if (!decoded || decoded->code.empty()) return {};
     using Source = std::weak_ptr<const DecodedShader>;
     static thread_local std::map<Source, std::shared_ptr<const RegisteredNativeGraphicsAnalysis>,
-                                 std::owner_less<Source>> native;
+                                 std::owner_less<Source>>
+        native;
     const Source identity = decoded;
     static const bool bypass = PROSPER_ENV_ON("PROSPER_NO_SHADER_ANALYSIS_CACHE");
     std::shared_ptr<const RegisteredNativeGraphicsAnalysis> analysis;
@@ -34,10 +36,10 @@ GraphicsReadSource coupled_graphics_read_source(const std::shared_ptr<const Deco
         decoded, &decoded->owned_nested_wide_chains);
     result.packet_requirements = std::shared_ptr<const FragmentPacketVgprRequirements>(
         decoded, &decoded->packet_requirements);
-    result.vertex_effects = std::shared_ptr<const OriginalGraphicsStageEffects>(
-        decoded, &decoded->original_effects[0]);
-    result.fragment_effects = std::shared_ptr<const OriginalGraphicsStageEffects>(
-        decoded, &decoded->original_effects[1]);
+    result.vertex_effects =
+        std::shared_ptr<const OriginalGraphicsStageEffects>(decoded, &decoded->original_effects[0]);
+    result.fragment_effects =
+        std::shared_ptr<const OriginalGraphicsStageEffects>(decoded, &decoded->original_effects[1]);
     result.decoded = decoded;
     result.native_analysis = std::move(analysis);
     return result;

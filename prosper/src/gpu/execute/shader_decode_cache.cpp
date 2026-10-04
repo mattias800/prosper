@@ -50,8 +50,8 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         }
         if (!decoded.empty()) {
             const Rdna2Inst& last = decoded.back();
-            result->terminated = last.is_end || last.fmt == Rdna2Format::Unknown ||
-                                 last.len_dwords == 0;
+            result->terminated =
+                last.is_end || last.fmt == Rdna2Format::Unknown || last.len_dwords == 0;
         }
         // The fold ignores most vector/control/export instructions unless the decoder reports an SGPR
         // destination (the conservative unknown-value invalidation). Scalar lane spills are the exception:
@@ -62,10 +62,8 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         for (const Rdna2Inst& instruction : decoded) {
             if (instruction.fmt == Rdna2Format::VOP3 && instruction.opcode == 0x361 &&
                 instruction.dst.value >= 0 && instruction.dst.value < 256)
-                result->scalar_spill_written_vgprs.set(
-                    static_cast<size_t>(instruction.dst.value));
-            if ((instruction.fmt == Rdna2Format::MUBUF ||
-                 instruction.fmt == Rdna2Format::MTBUF) &&
+                result->scalar_spill_written_vgprs.set(static_cast<size_t>(instruction.dst.value));
+            if ((instruction.fmt == Rdna2Format::MUBUF || instruction.fmt == Rdna2Format::MTBUF) &&
                 instruction.src[0].kind == OperandKind::VGPR)
                 fetch_vaddr_vgprs.insert(instruction.src[0].value);
             uint32_t mip_vgpr = 0;
@@ -73,9 +71,10 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                 zero_mip_vgprs.insert(static_cast<int>(mip_vgpr));
             if (instruction.fmt == Rdna2Format::VOP3) {
                 if (instruction.opcode == 0x361 && instruction.dst.kind == OperandKind::VGPR)
-                    scalar_spill_vgprs.insert(instruction.dst.value);       // v_writelane_b32
-                else if (instruction.opcode == 0x360 && instruction.src[0].kind == OperandKind::VGPR)
-                    scalar_spill_vgprs.insert(instruction.src[0].value);    // v_readlane_b32
+                    scalar_spill_vgprs.insert(instruction.dst.value);   // v_writelane_b32
+                else if (instruction.opcode == 0x360 &&
+                         instruction.src[0].kind == OperandKind::VGPR)
+                    scalar_spill_vgprs.insert(instruction.src[0].value);   // v_readlane_b32
             }
         }
         auto retain_fold_instructions = [&](const std::vector<Rdna2Inst>& source,
@@ -83,8 +82,9 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
             retained.reserve(source.size());
             for (const Rdna2Inst& instruction : source) {
                 if (instruction.is_end) break;
-                const bool scalar_spill = instruction.fmt == Rdna2Format::VOP3 &&
-                                          (instruction.opcode == 0x360 || instruction.opcode == 0x361);
+                const bool scalar_spill =
+                    instruction.fmt == Rdna2Format::VOP3 &&
+                    (instruction.opcode == 0x360 || instruction.opcode == 0x361);
                 const bool vector_index_select =
                     ((instruction.fmt == Rdna2Format::VOP3 && instruction.opcode == 0x101) ||
                      (instruction.fmt == Rdna2Format::VOP2 && instruction.opcode == 0x01)) &&
@@ -97,8 +97,9 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                 // from its later v5=3*vertex_id+1 packed-attribute fetch.
                 const bool fetch_vaddr_write = instruction.dst.kind == OperandKind::VGPR &&
                                                fetch_vaddr_vgprs.contains(instruction.dst.value);
-                const bool scalar_spill_invalidation = instruction.dst.kind == OperandKind::VGPR &&
-                                                       scalar_spill_vgprs.contains(instruction.dst.value);
+                const bool scalar_spill_invalidation =
+                    instruction.dst.kind == OperandKind::VGPR &&
+                    scalar_spill_vgprs.contains(instruction.dst.value);
                 // The zero-mip proof needs the unambiguous reaching definition of one exact address
                 // VGPR. Retain every possible writer whose (at most four-dword) result overlaps it;
                 // false-positive retention is cheap, while dropping one would accept a stale v_mov.
@@ -110,25 +111,20 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                             break;
                         }
                 }
-                const bool zero_mip_definition = zero_mip_write &&
-                    instruction.fmt == Rdna2Format::VOP1 && instruction.opcode == 0x01u &&
-                    instruction.len_dwords == 1u && !instruction.has_modifier &&
-                    instruction.src[0].kind == OperandKind::SGPR;
-                const bool zero_mip_intervening_write =
-                    zero_mip_write && !zero_mip_definition;
-                const bool fold_format = instruction.fmt == Rdna2Format::SOP1 ||
-                                         instruction.fmt == Rdna2Format::SOP2 ||
-                                         instruction.fmt == Rdna2Format::SOPC ||
-                                         instruction.fmt == Rdna2Format::SOPK ||
-                                         instruction.fmt == Rdna2Format::SOPP ||
-                                         instruction.fmt == Rdna2Format::SMEM ||
-                                         instruction.fmt == Rdna2Format::MIMG ||
-                                         instruction.fmt == Rdna2Format::MUBUF ||
-                                         instruction.fmt == Rdna2Format::MTBUF;
-                if (fold_format || rdna2_instruction_may_change_exec(instruction) ||
-                    scalar_spill || vector_index_select || fetch_vaddr_write ||
-                    scalar_spill_invalidation || zero_mip_definition ||
-                    zero_mip_intervening_write ||
+                const bool zero_mip_definition =
+                    zero_mip_write && instruction.fmt == Rdna2Format::VOP1 &&
+                    instruction.opcode == 0x01u && instruction.len_dwords == 1u &&
+                    !instruction.has_modifier && instruction.src[0].kind == OperandKind::SGPR;
+                const bool zero_mip_intervening_write = zero_mip_write && !zero_mip_definition;
+                const bool fold_format =
+                    instruction.fmt == Rdna2Format::SOP1 || instruction.fmt == Rdna2Format::SOP2 ||
+                    instruction.fmt == Rdna2Format::SOPC || instruction.fmt == Rdna2Format::SOPK ||
+                    instruction.fmt == Rdna2Format::SOPP || instruction.fmt == Rdna2Format::SMEM ||
+                    instruction.fmt == Rdna2Format::MIMG || instruction.fmt == Rdna2Format::MUBUF ||
+                    instruction.fmt == Rdna2Format::MTBUF;
+                if (fold_format || rdna2_instruction_may_change_exec(instruction) || scalar_spill ||
+                    vector_index_select || fetch_vaddr_write || scalar_spill_invalidation ||
+                    zero_mip_definition || zero_mip_intervening_write ||
                     instruction.dst.kind == OperandKind::SGPR)
                     retained.push_back(instruction);
             }
@@ -140,11 +136,10 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         result->raw_x2_data_load_pcs = rdna2_proven_raw_x2_data_loads(decoded);
         result->raw_immediate_wide_data_load_pcs =
             rdna2_proven_raw_immediate_wide_data_loads(decoded);
-        result->raw_register_wide_data_load_pcs =
-            rdna2_proven_raw_register_wide_data_loads(decoded, &result->raw_offset_scalar_source_pcs);
+        result->raw_register_wide_data_load_pcs = rdna2_proven_raw_register_wide_data_loads(
+            decoded, &result->raw_offset_scalar_source_pcs);
         result->raw_owned_wide_data_load_pcs = rdna2_owned_raw_wide_data_loads(decoded);
-        result->raw_nested_wide_data_load_pcs =
-            rdna2_proven_raw_nested_wide_data_loads(decoded);
+        result->raw_nested_wide_data_load_pcs = rdna2_proven_raw_nested_wide_data_loads(decoded);
         result->owned_nested_wide_chains = rdna2_owned_nested_wide_chains(decoded);
         result->owned_raw_x2_chains = rdna2_owned_raw_x2_chains(decoded);
         if (!result->owned_raw_x2_chains.empty())
@@ -156,8 +151,7 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         result->shader_constant_specialized =
             rdna2_specialize_shader_constant_branches(shader_constant_decoded) != 0;
         if (result->shader_constant_specialized)
-            retain_fold_instructions(shader_constant_decoded,
-                                     result->shader_constant_instructions);
+            retain_fold_instructions(shader_constant_decoded, result->shader_constant_instructions);
         if (fold_control_cache_enabled()) {
             result->control_plan = build_fold_control_plan(result->instructions);
             if (result->shader_constant_specialized)
@@ -204,9 +198,11 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         if (found != cache.entries.end()) {
             const auto& cached = found->second.shader;
             const bool compatible_length = cached->terminated || cached->source_dwords == dwords;
-            const uint64_t code_bytes = static_cast<uint64_t>(cached->code.size()) * sizeof(uint32_t);
-            const bool readable = code_bytes == 0 ||
-                                  (code_bytes <= UINT32_MAX && guest_readable(address, (uint32_t)code_bytes));
+            const uint64_t code_bytes =
+                static_cast<uint64_t>(cached->code.size()) * sizeof(uint32_t);
+            const bool readable =
+                code_bytes == 0 ||
+                (code_bytes <= UINT32_MAX && guest_readable(address, (uint32_t)code_bytes));
             if (compatible_length && cached->code.size() <= dwords && readable &&
                 (code_bytes == 0 || memcmp(code, cached->code.data(), (size_t)code_bytes) == 0)) {
                 ++cache.stats.hits;
@@ -264,4 +260,4 @@ void clear_shader_decode_cache() {
     cache.use_counter = 0;
 }
 
-} // namespace prosper::gpu
+}   // namespace prosper::gpu

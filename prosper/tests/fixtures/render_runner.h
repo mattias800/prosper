@@ -30,6 +30,8 @@
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
+#include "gpu/recompiler/original_fragment_producer.hpp"
+#include "gpu/recompiler/original_graphics_draw_effects.hpp"
 #include "gpu/execute/fragment_draw_plan.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "diagnostics/exit_census.hpp"       // one-line end-of-run reports

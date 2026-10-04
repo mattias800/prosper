@@ -24,6 +24,7 @@ class OrderedScalarBankReadPoint {
         std::shared_ptr<const DecodedShader> decoded;
         std::shared_ptr<const RegisteredNativeGraphicsAnalysis> native_analysis;
         const AgcShaderHeader* registered_header = nullptr;
+        std::shared_ptr<const AgcShaderHeader> header_snapshot;
         bool fragment = false;
     };
     struct PendingDraw {
@@ -59,12 +60,12 @@ public:
     uint64_t fragment_address() const;
     std::shared_ptr<const std::vector<uint32_t>> original_source(uint64_t address) const;
     const AgcShaderHeader* registered_header(uint64_t address) const;
+    std::shared_ptr<const AgcShaderHeader> header_snapshot(uint64_t address) const;
     std::shared_ptr<const std::vector<uint32_t>> packet_source(uint64_t address) const;
     std::shared_ptr<const FragmentPacketVgprRequirements>
     packet_requirements(uint64_t address) const;
     std::shared_ptr<const DecodedShader> decoded_source(uint64_t address) const;
-    std::shared_ptr<const RegisteredNativeGraphicsAnalysis>
-    native_analysis(uint64_t address) const;
+    std::shared_ptr<const RegisteredNativeGraphicsAnalysis> native_analysis(uint64_t address) const;
     bool belongs_to_draw(const GpuState&, uint64_t submit, uint64_t order,
                          uint64_t fragment_address) const;
     bool valid_for_packet(uint64_t submit, uint64_t order, uint64_t fragment_address,

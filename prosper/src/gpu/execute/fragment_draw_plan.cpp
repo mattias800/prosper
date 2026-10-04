@@ -1,5 +1,6 @@
 #include "gpu/execute/fragment_draw_plan.hpp"
 #include "gpu/execute/fragment_scalar_bank.hpp"
+#include "gpu/recompiler/original_fragment_producer.hpp"
 #include <array>
 #include <bit>
 #include <map>
@@ -8,6 +9,11 @@
 namespace prosper::gpu {
 namespace {
 bool producing_owner(const RasterQuadInputs& in, const FragmentPacketPreparation& prepared) {
+    if (prepared.inputs.get() == &in && in.original_fragment_producer &&
+        in.original_fragment_producer->matches(in))
+        return prepared.vgpr_requirements && prepared.vgpr_requirements == in.vgpr_requirements &&
+               in.vgpr_requirements->source_words == in.raw_code.get() &&
+               in.vgpr_requirements->rejection.empty();
     return prepared.inputs.get() == &in && in.raw_matches_producing_source && in.raw_code &&
            !in.raw_code->empty() && in.raw_code->size() <= 4096 && in.source_vs &&
            !in.source_vs->empty() && in.source_fs && !in.source_fs->empty() &&
@@ -52,8 +58,7 @@ bool scalar_bank_program(const RasterQuadInputs& in) {
     return in.vgpr_requirements && in.vgpr_requirements->scalar_reads.has_smem;
 }
 bool canonical_packet_owner(const RasterQuadInputs& in) {
-    return in.raw_code && in.vgpr_requirements &&
-           !in.raw_code.owner_before(in.vgpr_requirements) &&
+    return in.raw_code && in.vgpr_requirements && !in.raw_code.owner_before(in.vgpr_requirements) &&
            !in.vgpr_requirements.owner_before(in.raw_code) &&
            in.vgpr_requirements->source_words == in.raw_code.get() &&
            in.vgpr_requirements->masks.source_words == in.raw_code.get() &&

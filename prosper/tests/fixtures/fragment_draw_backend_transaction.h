@@ -24,9 +24,15 @@ public:
             state.attachment_guard = true;
             const auto& inputs = draw.fragment_draw_inputs;
             const bool producing_match =
-                !draw.raster_quad_contract_modified && inputs->source_vs && inputs->source_gs &&
-                inputs->source_fs && *inputs->source_vs == draw.vs_words() &&
-                *inputs->source_gs == draw.gs_words() && *inputs->source_fs == draw.fs_words();
+                !draw.raster_quad_contract_modified &&
+                (inputs->original_fragment_producer
+                     ? inputs->original_fragment_producer->matches(*inputs) &&
+                           inputs->original_fragment_producer->matches_modules(
+                               draw.vs_shared, draw.gs_words(), draw.fs_words())
+                     : inputs->source_vs && inputs->source_gs && inputs->source_fs &&
+                           *inputs->source_vs == draw.vs_words() &&
+                           *inputs->source_gs == draw.gs_words() &&
+                           *inputs->source_fs == draw.fs_words());
             const auto prepared =
                 prosper::gpu::prepare_fragment_packet_inputs(inputs, producing_match);
             const prosper::gpu::FragmentPacketDeviceContract device{
@@ -63,12 +69,31 @@ public:
             // not a residency budget or a guess from the absence of a visible store in the VS.
             if (!readonly_pass_checked) {
                 readonly_pass_checked = true;
+                const bool original_effects_required =
+                    std::any_of(draws.begin(), draws.end(), [](const BackendDraw& value) {
+                        return value.fragment_draw_inputs &&
+                               value.fragment_draw_inputs->original_fragment_producer;
+                    });
                 readonly_pass =
-                    std::all_of(draws.begin(), draws.end(), [](const BackendDraw& value) {
+                    std::all_of(draws.begin(), draws.end(), [&](const BackendDraw& value) {
+                        if (original_effects_required &&
+                            (value.raster_quad_contract_modified || value.mesh_draw ||
+                             !value.original_graphics_effects ||
+                             !value.original_graphics_effects->matches_draw(
+                                 value.source_submit, value.command_order, value.vs_shared,
+                                 value.fs_shared, value.gs_words(), value.fs_words())))
+                            return false;
+                        const bool original_bank_fragment =
+                            value.fragment_draw_inputs &&
+                            value.fragment_draw_inputs->original_fragment_producer &&
+                            value.fragment_draw_inputs->original_fragment_producer->matches(
+                                *value.fragment_draw_inputs) &&
+                            value.fragment_draw_inputs->original_fragment_producer->matches_modules(
+                                value.vs_shared, value.gs_words(), value.fs_words());
                         return backend_module_has_readonly_buffers(value.vs_words(),
                                                                    value.vs_shared) &&
-                               backend_module_has_readonly_buffers(value.fs_words(),
-                                                                   value.fs_shared) &&
+                               (original_bank_fragment || backend_module_has_readonly_buffers(
+                                                              value.fs_words(), value.fs_shared)) &&
                                (value.gs_words().empty() ||
                                 backend_module_has_readonly_buffers(value.gs_words()));
                     });

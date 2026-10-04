@@ -1,6 +1,7 @@
 #include "gpu/execute/fragment_packet_preparation.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
+#include "gpu/recompiler/original_fragment_producer.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include <exception>
 
@@ -40,8 +41,12 @@ std::shared_ptr<const FragmentPacketPreparation> prepare_fragment_packet_inputs(
         return result;
     }
     const auto& in = *result->inputs;
-    const bool source_available = producing_modules_match && in.raw_matches_producing_source &&
-        in.raw_code && !in.raw_code->empty() && in.source_fs && !in.source_fs->empty();
+    const bool original_bank_source = producing_modules_match && in.original_fragment_producer &&
+                                      in.original_fragment_producer->matches(in);
+    const bool source_available =
+        original_bank_source ||
+        (producing_modules_match && in.raw_matches_producing_source && in.raw_code &&
+         !in.raw_code->empty() && in.source_fs && !in.source_fs->empty());
     const bool entry_available = in.entry.observed && in.entry.canonical();
     if (!source_available) gap("packet-producing-source-unavailable");
     if (!entry_available) gap("packet-entry-register-observation-unavailable");
@@ -115,11 +120,12 @@ std::shared_ptr<const FragmentPacketPreparation> prepare_fragment_packet_inputs(
                     gap("packet-scalar-descriptor-user-prefix-unavailable");
             }
         }
-        if (scalar_demand) gap("packet-scalar-live-read-lease-unimplemented");
+        if (scalar_demand && !original_bank_source)
+            gap("packet-scalar-live-read-lease-unimplemented");
     } else {
         gap("packet-scalar-program-requirements-unavailable");
     }
-    if (!in.ps_resources.observed || !in.ps_resources.table)
+    if (!original_bank_source && (!in.ps_resources.observed || !in.ps_resources.table))
         gap("packet-resource-identity-unavailable");
     if (!in.ps_resources.rejection.empty()) result->unmet.push_back(in.ps_resources.rejection);
     if (in.ps_resources.table) {

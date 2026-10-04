@@ -19,6 +19,12 @@ const AgcShaderHeader* OrderedScalarBankReadPoint::registered_header(uint64_t ad
         if (source.address == address) return source.registered_header;
     return nullptr;
 }
+std::shared_ptr<const AgcShaderHeader>
+OrderedScalarBankReadPoint::header_snapshot(uint64_t address) const {
+    for (const auto& source : sources_)
+        if (source.address == address) return source.header_snapshot;
+    return {};
+}
 std::shared_ptr<const std::vector<uint32_t>>
 OrderedScalarBankReadPoint::packet_source(uint64_t address) const {
     for (const auto& source : sources_)

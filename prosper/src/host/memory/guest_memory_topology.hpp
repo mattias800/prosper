@@ -31,9 +31,10 @@ private:
     std::shared_lock<std::shared_mutex> lock_;
 };
 
-GuestMemoryTopologyRelation guest_memory_topology_relation(
-    uint64_t first_address, uint64_t first_size,
-    uint64_t second_address, uint64_t second_size);
+GuestMemoryTopologyRelation guest_memory_topology_relation(uint64_t first_address,
+                                                           uint64_t first_size,
+                                                           uint64_t second_address,
+                                                           uint64_t second_size);
 
 // Linux's guest fault handler may replace a whole 64 KiB reservation granule on first touch.
 // Admission under a GuestMappingLease must require each granule intersecting a source or writable
@@ -77,11 +78,13 @@ struct GuestDirectReadableWindow {
 GuestDirectReadableWindow guest_memory_direct_readable_window(const GuestMappingLease& lease,
                                                               uint64_t address);
 
-GuestMemoryTopologyRelation guest_memory_retained_allocation_relation(
-    const GuestMappingLease& lease, uint64_t source_address, uint64_t source_bytes,
-    const GuestDirectAllocation& producer);
-GuestMemoryTopologyRelation guest_memory_direct_allocation_relation(
-    const GuestMappingLease& lease, uint64_t source_address, uint64_t source_bytes,
-    uint64_t producer_address, uint64_t minimum_producer_bytes);
+GuestMemoryTopologyRelation
+guest_memory_retained_allocation_relation(const GuestMappingLease& lease, uint64_t source_address,
+                                          uint64_t source_bytes,
+                                          const GuestDirectAllocation& producer);
+GuestMemoryTopologyRelation
+guest_memory_direct_allocation_relation(const GuestMappingLease& lease, uint64_t source_address,
+                                        uint64_t source_bytes, uint64_t producer_address,
+                                        uint64_t minimum_producer_bytes);
 
-} // namespace prosper
+}   // namespace prosper

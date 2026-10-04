@@ -3,6 +3,10 @@
 #include "gpu/execute/original_graphics_stage_effects.hpp"
 #include "gpu/execute/shader_cache_internal.hpp"
 #include "gpu/execute/registered_graphics_source_internal.hpp"
+#include "gpu/execute/native_graphics_source_lineage.hpp"
+#include "gpu/execute/fragment_scalar_bank.hpp"
+#include "gpu/recompiler/original_fragment_producer.hpp"
+#include "gpu/recompiler/original_graphics_draw_effects.hpp"
 #include "gpu/state/fragment_entry_observation.hpp"
 #include "host/memory/guest_memory_topology.hpp"
 
@@ -12,10 +16,20 @@
 
 namespace prosper::gpu {
 namespace {
-bool coupled_read_only(const GraphicsReadSource& source, ShaderProgramStage stage) {
+bool coupled_read_only(const GraphicsReadSource& source, uint64_t address,
+                       ShaderProgramStage stage) {
     const auto& effects =
         stage == ShaderProgramStage::Fragment ? source.fragment_effects : source.vertex_effects;
+    const auto* header = source.header_snapshot.get();
+    const uint32_t type = stage == ShaderProgramStage::Fragment ? 1u : 2u;
     if (!source.words || !source.decoded || !effects || !source.native_analysis ||
+        !source.registered_header || !header || header->type != type ||
+        reinterpret_cast<uint64_t>(header->code) != address || !header->shader_size ||
+        (header->shader_size & 3u) ||
+        source.decoded->source_dwords != header->shader_size / sizeof(uint32_t) ||
+        source.words->size() != source.decoded->source_dwords ||
+        prosper_agc_shader_continuation_for_code(address) ||
+        prosper_agc_fused_back_header_for_front(address) ||
         !source.native_analysis->belongs_to(source.decoded) ||
         source.words.get() != &source.decoded->code || source.words.owner_before(source.decoded) ||
         source.decoded.owner_before(source.words) || source.words.owner_before(effects) ||
@@ -28,36 +42,44 @@ bool coupled_read_only(const GraphicsReadSource& source, ShaderProgramStage stag
 }
 bool ordinary_draw(const GpuState& state, const RenderState& render) {
     if (!render.es_addr || !render.ps_addr || render.gs_addr || render.hs_addr) return false;
-    for (const auto [address, type] :
-         {std::pair{render.es_addr, 2u}, std::pair{render.ps_addr, 1u}}) {
-        const auto* header =
-            static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(address));
-        if (!header || header->type != type || prosper_agc_shader_continuation_for_code(address) ||
-            prosper_agc_fused_back_header_for_front(address))
-            return false;
+    namespace P = prosper::agc::Pm4;
+    // AMD gc_10_3_0 context fields: all-zero STAGES_EN proves ordinary VS_REAL, with
+    // LS/HS/ES/GS, dynamic/dispatched draw, NGG and wave-ID modes off. Other known settings
+    // remain a named initial-domain refusal, not an assertion they write memory. Presence is
+    // required: a missing register is not an observed zero or a hardware reset observation.
+    for (uint32_t offset : {P::VGT_SHADER_STAGES_EN, P::VGT_STRMOUT_CONFIG,
+                            P::VGT_STRMOUT_BUFFER_CONFIG, P::DB_DEPTH_CONTROL, P::DB_RENDER_CONTROL,
+                            P::DB_RENDER_OVERRIDE, P::DB_RENDER_OVERRIDE2}) {
+        const auto observed = state.cx.find(offset);
+        if (observed == state.cx.end() || observed->second) return false;
     }
-    // Additional fixed-function stage/streamout enable controls need explicit authority before
-    // this capture can issue. Source addresses alone do not prove they are disabled.
-    (void)state;
-    return false; // closed until the actual retained enable-state domain is implemented
+    const auto color_control = state.cx.find(P::CB_COLOR_CONTROL);
+    return color_control != state.cx.end() && PM4_FIELD(color_control->second, CB_COLOR_CONTROL,
+                                                        MODE) == P::CB_COLOR_CONTROL_MODE_NORMAL;
 }
 bool capture_outputs(const GpuState& state, const RenderState& render,
                      const prosper::GuestMappingLease& lease,
                      std::vector<prosper::GuestDirectAllocation>& outputs) {
     namespace P = prosper::agc::Pm4;
-    const auto reg = [&](uint32_t offset) {
-        const auto found = state.cx.find(offset);
-        return found == state.cx.end() ? 0u : found->second;
-    };
+    if (!state.cx.contains(P::CB_TARGET_MASK) || !state.cx.contains(P::CB_SHADER_MASK))
+        return false;
     for (uint32_t slot = 0; slot < render.color_targets.size(); ++slot) {
         const auto& target = render.color_targets[slot];
+        const bool enabled =
+            ((render.cb_target_mask & render.cb_shader_mask) >> (slot * 4u)) & 0xfu;
+        if (!target.base) {
+            if (enabled) return false;
+            continue;
+        }
         for (const auto [low, high] :
              {std::pair{P::CB_COLOR0_CMASK + slot * 0xfu, P::CB_COLOR0_CMASK_BASE_EXT + slot},
               std::pair{P::CB_COLOR0_FMASK + slot * 0xfu, P::CB_COLOR0_FMASK_BASE_EXT + slot},
-              std::pair{P::CB_COLOR0_DCC_BASE + slot * 0xfu, P::CB_COLOR0_DCC_BASE_EXT + slot}})
-            if ((uint64_t(reg(low)) << 8u) | (uint64_t(reg(high) & 0xffu) << 40u))
+              std::pair{P::CB_COLOR0_DCC_BASE + slot * 0xfu, P::CB_COLOR0_DCC_BASE_EXT + slot}}) {
+            const auto lo = state.cx.find(low), hi = state.cx.find(high);
+            if (lo == state.cx.end() || hi == state.cx.end()) return false;
+            if ((uint64_t(lo->second) << 8u) | (uint64_t(hi->second & 0xffu) << 40u))
                 return false; // full independent metadata write layouts are not proved here
-        if (!target.base) continue;
+        }
         const auto extent = color_target_physical_bytes(target);
         if (!extent) return false;
         const auto origin = prosper::guest_memory_direct_allocation(lease, target.base, extent);
@@ -91,15 +113,35 @@ merge_outputs(const std::shared_ptr<const std::vector<prosper::GuestDirectAlloca
 }
 }   // namespace
 
-void OrderedGraphicsReadPointIssuer::record_queued_draw(const GpuState& state,
-                                                        const DrawItem& draw) {
+bool draw_requires_original_scalar_bank(const GpuState& state) {
+    const auto render = extract_render_state(state);
+    // Scheduling hint ONLY: do not inspect shader bytes before their ordered operation or add
+    // another warm cache validation. Missing physical Wave32 metadata conservatively routes
+    // ordered. The actual issuer/manifest/seal remains the sole bank admission observation.
+    return render.ps_addr &&
+           (!render.ps_raster_launch.ps_in_control_available || !render.ps_wave32);
+}
+
+void OrderedGraphicsReadPointIssuer::record_queued_draw(const GpuState& state, const DrawItem& draw,
+                                                        uint64_t submit) {
     ++scalar_covered_draws_;
     if (!scalar_effects_known_) return;
     const auto render = extract_render_state(state);
     if (!ordinary_draw(state, render) || draw.vs_guest_addr != render.es_addr ||
         draw.fs_guest_addr != render.ps_addr || draw.vs_chain_guest_addr || !draw.gs.empty() ||
-        !coupled_read_only(draw.original_vs_source, ShaderProgramStage::Vertex) ||
-        !coupled_read_only(draw.original_ps_source, ShaderProgramStage::Fragment)) {
+        !coupled_read_only(draw.original_vs_source, render.es_addr, ShaderProgramStage::Vertex) ||
+        !coupled_read_only(draw.original_ps_source, render.ps_addr, ShaderProgramStage::Fragment) ||
+        !draw.original_graphics_effects ||
+        !draw.original_graphics_effects->matches_draw(submit, draw.command_order, draw.vs_shared,
+                                                      draw.fs_shared, draw.gs, draw.fs_words()) ||
+        !draw.native_vs_source || draw.native_vs_source->stage() != ShaderProgramStage::Vertex ||
+        !draw.native_vs_source->matches(draw.original_vs_source, draw.vs_shared) ||
+        (draw.fragment_draw_inputs && draw.fragment_draw_inputs->original_fragment_producer
+             ? !draw.fragment_draw_inputs->original_fragment_producer->matches(
+                   *draw.fragment_draw_inputs)
+             : !draw.native_ps_source ||
+                   draw.native_ps_source->stage() != ShaderProgramStage::Fragment ||
+                   !draw.native_ps_source->matches(draw.original_ps_source, draw.fs_shared))) {
         scalar_effects_known_ = false;
         return;
     }
@@ -117,10 +159,10 @@ void OrderedGraphicsReadPointIssuer::record_queued_draw(const GpuState& state,
     for (const auto [source, address, fragment] :
          {std::tuple{&draw.original_vs_source, render.es_addr, false},
           std::tuple{&draw.original_ps_source, render.ps_addr, true}})
-        retained->sources.push_back({address, source->words,
-                                     fragment ? source->fragment_effects : source->vertex_effects,
-                                     source->packet_requirements, source->decoded,
-                                     source->native_analysis, source->registered_header, fragment});
+        retained->sources.push_back(
+            {address, source->words, fragment ? source->fragment_effects : source->vertex_effects,
+             source->packet_requirements, source->decoded, source->native_analysis,
+             source->registered_header, source->header_snapshot, fragment});
     scalar_effects_ = std::move(retained);
 }
 
@@ -150,8 +192,8 @@ OrderedGraphicsReadPointIssuer::issue_scalar(uint64_t submit, uint64_t order, co
         return reject("scalar-bank-current-stage-or-enable-domain-unproved");
     auto vertex = registered_graphics_read_source(render.es_addr);
     auto fragment = registered_graphics_read_source(render.ps_addr);
-    if (!coupled_read_only(vertex, ShaderProgramStage::Vertex) ||
-        !coupled_read_only(fragment, ShaderProgramStage::Fragment))
+    if (!coupled_read_only(vertex, render.es_addr, ShaderProgramStage::Vertex) ||
+        !coupled_read_only(fragment, render.ps_addr, ShaderProgramStage::Fragment))
         return reject("scalar-bank-complete-original-effects-unproved");
     prosper::GuestMappingLease lease;
     std::vector<prosper::GuestDirectAllocation> current_outputs;
@@ -171,8 +213,8 @@ OrderedGraphicsReadPointIssuer::issue_scalar(uint64_t submit, uint64_t order, co
          {std::tuple{&vertex, render.es_addr, false}, std::tuple{&fragment, render.ps_addr, true}})
         sources.push_back({address, source->words,
                            pixel ? source->fragment_effects : source->vertex_effects,
-                           source->packet_requirements, source->decoded,
-                           source->native_analysis, source->registered_header, pixel});
+                           source->packet_requirements, source->decoded, source->native_analysis,
+                           source->registered_header, source->header_snapshot, pixel});
     static std::atomic<uint64_t> next_identity{1};
     const uint64_t identity = next_identity.fetch_add(1, std::memory_order_relaxed);
     if (!identity) return reject("scalar-bank-identity-exhausted");
@@ -180,5 +222,34 @@ OrderedGraphicsReadPointIssuer::issue_scalar(uint64_t submit, uint64_t order, co
         identity, submit, order, baseline.failures, state, std::move(entry), std::move(sources),
         outputs, scalar_effects_, epoch_, epoch_->sequence.load(std::memory_order_acquire),
         version));
+}
+OrderedScalarDrawInputs prepare_ordered_scalar_draw(OrderedGraphicsReadPointIssuer& issuer,
+                                                    uint64_t submit, uint64_t order,
+                                                    const GpuState& state,
+                                                    const std::vector<DrawItem>& pending) {
+    OrderedScalarDrawInputs result;
+    std::string refusal;
+    result.point = issuer.issue_scalar(submit, order, state, pending, refusal);
+    const auto render = extract_render_state(state);
+    if (result.point) {
+        const auto requirements = result.point->packet_requirements(render.ps_addr);
+        if (!render.ps_wave32 && requirements && requirements->scalar_reads.has_smem) {
+            prosper::GuestMappingLease lease;
+            result.bank =
+                seal_fragment_scalar_bank(*result.point, render.ps_addr, order, lease, refusal);
+        }
+    }
+    if (!refusal.empty()) {
+        static std::atomic<uint64_t> refusals{0};
+        const auto count = refusals.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((count & (count - 1)) == 0)
+            std::fprintf(
+                stderr,
+                "[scalar-bank-refusal] count=%llu submit=%llu order=%llu ps=0x%llx reason=%s\n",
+                static_cast<unsigned long long>(count), static_cast<unsigned long long>(submit),
+                static_cast<unsigned long long>(order),
+                static_cast<unsigned long long>(render.ps_addr), refusal.c_str());
+    }
+    return result;
 }
 }   // namespace prosper::gpu

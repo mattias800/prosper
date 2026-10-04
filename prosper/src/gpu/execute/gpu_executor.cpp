@@ -12,6 +12,7 @@
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/execute/ordered_graphics_read_point_internal.hpp"
 #include "gpu/execute/checked_graphics_source.hpp"
+#include "gpu/execute/native_graphics_source_lineage.hpp"
 #include "gpu/execute/registered_graphics_source_internal.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: skipped-dispatches, shader-compile alarms
@@ -1154,8 +1155,10 @@ ShaderCompileKey make_shader_compile_key(
     }
     // Reuse only the draw-local byte version; ordinary cold callers authenticate their range.
     const SharedShaderAnalysis analysis =
-        (stage == ShaderProgramStage::Fragment || checked_graphics_source) && captured_analysis ? captured_analysis
-        : code && dwords ? analyze_shader_code_cached(code, dwords) : nullptr;
+        (stage == ShaderProgramStage::Fragment || checked_graphics_source) && captured_analysis
+            ? captured_analysis
+        : code && dwords ? analyze_shader_code_cached(code, dwords)
+                         : nullptr;
     if (stage == ShaderProgramStage::Fragment && code && dwords && resources) {
         const PcrelDispatchSelection selection =
             select_pcrel_dispatch(code, dwords, resources, analysis.get());
@@ -1887,9 +1890,11 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     const SharedShaderAnalysis& captured_analysis, FragmentFloatMode fragment_float_mode,
     FloatTransportConfig float_transport, FragmentFloatFlags fragment_float_flags,
     FragmentLaunchRsrc1 fragment_launch_rsrc1, RefusedShaderSource* original_source,
-    const CheckedGraphicsSource* checked_source) {
+    const CheckedGraphicsSource* checked_source,
+    std::shared_ptr<const NativeGraphicsStageCompilation>* checked_compilation) {
     if (cache_identity) *cache_identity = 0;
     if (original_source) *original_source = {};
+    if (checked_compilation) *checked_compilation = {};
     if (checked_source && (!checked_source->current() || checked_source->stage() != stage ||
                            checked_source->address() != reinterpret_cast<uint64_t>(code)))
         return {};
@@ -1923,12 +1928,16 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     if (key.trip_bound.bound) key.trip_bound_program_address = program_address;
     key.cached_hash = ShaderCompileKeyHash::compute(key);
     auto result = cache_compiled_graphics_shader(stage, std::move(key), resources, cache_identity,
-                                                program_address, /*chain_address=*/0);
+                                                 program_address, /*chain_address=*/0);
     if (checked_source && !checked_source->current()) {
         if (cache_identity) *cache_identity = 0;
         if (original_source) *original_source = {};
         return {};
     }
+    if (checked_compilation && checked_source && result && !result->empty())
+        *checked_compilation = std::shared_ptr<const NativeGraphicsStageCompilation>(
+            new NativeGraphicsStageCompilation(checked_source->source(), result, stage,
+                                               checked_source->read_point_identity()));
     return result;
 }
 
@@ -2988,14 +2997,18 @@ static bool gta_nullable_output_descriptor_shape(
 }
 
 std::vector<DynFetch>
-resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
-                      uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
-                      uint32_t pcrel_dispatch_target,
-                      const PcrelDispatchInfo* pcrel_dispatch,
-                      const uint32_t* system_sgprs, uint32_t nsystem_sgprs, FoldReader* reader) {
+resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs,
+                      uint32_t nsgpr, uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses,
+                      uint32_t pcrel_dispatch_target, const PcrelDispatchInfo* pcrel_dispatch,
+                      const uint32_t* system_sgprs, uint32_t nsystem_sgprs, FoldReader* reader,
+                      const CheckedGraphicsSource* checked_source) {
     dwords = shader_source_dwords(uint64_t(uintptr_t(code)), dwords);
+    if (checked_source && (!checked_source->current() ||
+                           checked_source->address() != reinterpret_cast<uint64_t>(code) ||
+                           checked_source->source().decoded->source_dwords != dwords))
+        return {};
     static const bool capture_enabled = std::getenv("PROSPER_FOLD_CAPTURE_DIR") != nullptr;
-    if (!reader && capture_enabled) {
+    if (!reader && !checked_source && capture_enabled) {
         std::vector<DynFetch> captured;
         if (try_capture_live_fold(code, dwords, user_sgprs, nsgpr, user_sgpr_base,
                 srt_uses, pcrel_dispatch_target, pcrel_dispatch, system_sgprs,
@@ -3010,7 +3023,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     uint64_t guest_probe_calls = 0;
     double guest_probe_ms = 0.0;
     std::vector<DynFetch> out;
-    const auto decoded = decode_shader_cached(code, dwords);
+    const auto decoded =
+        checked_source ? checked_source->source().decoded : decode_shader_cached(code, dwords);
     if (reader) reader->decoded_dwords = static_cast<uint32_t>(decoded->code.size());
     const auto decode_done = profile_fold ? FoldClock::now() : FoldClock::time_point{};
     double pcrel_copy_ms = 0.0;
@@ -5840,6 +5854,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // The fold visits the retained stream linearly, stopping before an end marker.
     // Count once at completion instead of testing instrumentation at every instruction.
     if (reader) reader->evaluated_instructions += instruction_index;
+    if (checked_source && !checked_source->current()) {
+        if (srt_uses) srt_uses->resize(srt_before);
+        return {};
+    }
     if (profile_fold)
         record_stage_fold_profile(
             reader ? reader->logical_code_address : (uint64_t)(uintptr_t)code,
@@ -6914,13 +6932,16 @@ std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
 GraphicsReadSource registered_graphics_read_source(uint64_t address) {
     const auto* header =
         static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(address));
-    if (!header) return {};
-    const auto count = registered_shader_dwords(*header, address);
+    GuestMappingLease lease;
+    if (!header || !guest_readable(reinterpret_cast<uint64_t>(header), sizeof(*header))) return {};
+    const auto snapshot = std::make_shared<const AgcShaderHeader>(*header);
+    const auto count = registered_shader_dwords(*snapshot, address);
     if (!count) return {};
     const auto analysis =
         decode_shader_cached(reinterpret_cast<const uint32_t*>(uintptr_t(address)), count);
     auto result = coupled_graphics_read_source(analysis);
     result.registered_header = header;
+    result.header_snapshot = snapshot;
     return result;
 }
 
@@ -6942,12 +6963,19 @@ bool draw_requires_owned_nested_snapshot(const GpuState& state) {
     return false;
 }
 
-std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr,
-                                                       bool is_ps, uint32_t draw_vertex_count,
-                                                       uint64_t draw_command_order,
-                                                       const GraphicsRawSnapshotContext* raw_context) {
+std::shared_ptr<ShaderResourceTable>
+build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps, uint32_t draw_vertex_count,
+                  uint64_t draw_command_order, const GraphicsRawSnapshotContext* raw_context,
+                  const CheckedGraphicsSource* checked_source,
+                  GraphicsReadSource* original_source) {
+    if (original_source) *original_source = {};
     if (!code_addr) return nullptr;
-    const auto* hdr = (const AgcShaderHeader*)prosper_agc_shader_header_for_code(code_addr);
+    const auto stage = is_ps ? ShaderProgramStage::Fragment : ShaderProgramStage::Vertex;
+    if (checked_source && !checked_source->belongs_to(st, code_addr, draw_command_order, stage))
+        return std::make_shared<ShaderResourceTable>();
+    const auto* hdr = checked_source
+                          ? checked_source->source().header_snapshot.get()
+                          : (const AgcShaderHeader*)prosper_agc_shader_header_for_code(code_addr);
     if (!hdr) return nullptr;
     using StageClock = std::chrono::steady_clock;
     // Read once per draw per stage, and the two largest remaining `getenv` names on a routed
@@ -6959,9 +6987,18 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     const auto metadata_start = phase_timing ? StageClock::now() : StageClock::time_point{};
     namespace P = prosper::agc::Pm4;
     const bool log = PROSPER_ENV_ON_PER_SUBMIT("PROSPER_GFXLOG");
-    const size_t shader_dwords = registered_shader_dwords(*hdr, code_addr);
-    const auto full_source = decode_shader_cached(
-        reinterpret_cast<const uint32_t*>(uintptr_t(code_addr)), shader_dwords);
+    const size_t shader_dwords = checked_source ? checked_source->source().decoded->source_dwords
+                                                : registered_shader_dwords(*hdr, code_addr);
+    const auto full_source =
+        checked_source
+            ? checked_source->source().decoded
+            : decode_shader_cached(reinterpret_cast<const uint32_t*>(uintptr_t(code_addr)),
+                                   shader_dwords);
+    if (original_source) {
+        *original_source =
+            checked_source ? checked_source->source() : coupled_graphics_read_source(full_source);
+        if (!checked_source) original_source->registered_header = hdr;
+    }
     if (std::any_of(full_source->raw_nested_numeric_load_pcs.begin(),
                     full_source->raw_nested_numeric_load_pcs.end(), [&](uint32_t pc) {
             return std::none_of(full_source->owned_nested_wide_chains.begin(),
@@ -7433,8 +7470,11 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     PcrelDispatchSelection dispatch_selection;
     std::shared_ptr<const ShaderCodeAnalysis> shader_analysis;
     if (is_ps) {
-        shader_analysis = analyze_shader_code_cached(
-            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)), shader_dwords);
+        shader_analysis = checked_source
+                              ? checked_source->analysis()
+                              : analyze_shader_code_cached(reinterpret_cast<const uint32_t*>(
+                                                               static_cast<uintptr_t>(code_addr)),
+                                                           shader_dwords);
         dispatch_selection = select_pcrel_dispatch(
             (const uint32_t*)(uintptr_t)code_addr, shader_dwords, &primary_resources,
             shader_analysis.get());
@@ -7444,7 +7484,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
                                        primary_sgprs, kUserSgprs, 0, &srt_uses,
                                        dispatch_selection.target, &dispatch_selection.dispatch,
-                                       nullptr, 0, nested_reader.get());
+                                       nullptr, 0, nested_reader.get(), checked_source);
     } else {
         // NGG merged VS/GS: s0..s7 are system SGPRs, user data starts at s8 (confirmed by matching the
         // shader's s[8:11]/s[24:25] descriptor pointers to the register file at GS_0+offset).
@@ -7459,9 +7499,10 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             system_sgprs[1] = sh_value(P::SPI_SHADER_USER_DATA_ADDR_HI_GS);
             system_count = (system_sgprs[0] || system_sgprs[1]) ? 2u : 0u;
         }
-        dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
-                                       primary_sgprs, kUserSgprs, 8, &srt_uses,
-                                       UINT32_MAX, nullptr, system_sgprs, system_count, nested_reader.get());
+        dyn_vb =
+            resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
+                                  primary_sgprs, kUserSgprs, 8, &srt_uses, UINT32_MAX, nullptr,
+                                  system_sgprs, system_count, nested_reader.get(), checked_source);
         if (log || PROSPER_ENV_ON("PROSPER_RESDUMP")) {
             fprintf(stderr, "[dynvb] VS resolved %zu dynamic vertex-fetch descriptor(s):\n", dyn_vb.size());
             for (auto& kv : dyn_vb) {
@@ -7964,6 +8005,10 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         }
         auto result = std::make_shared<ShaderResourceTable>(std::move(t));
         record_phases();
+        if (checked_source && !checked_source->current()) {
+            if (original_source) *original_source = {};
+            return {};
+        }
         return result;
     }
     if (log) fprintf(stderr, "[restab] %s code=0x%llx -> no resources in any user-data base\n",
@@ -10605,7 +10650,8 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
 // (#1636). Callers that do not want a diagnostic keep passing nothing.
 bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, float scale_y,
                            DrawItem& item, OperationRealizationFailure* failure = nullptr,
-                           const GraphicsRawSnapshotContext* raw_context = nullptr) {
+                           const GraphicsRawSnapshotContext* raw_context = nullptr,
+                           OrderedScalarDrawInputs scalar = {}) {
     if (dropped_draw_census_enabled())
         retained_draw_attempts().fetch_add(1, std::memory_order_relaxed);
     const auto note = [&](RealizationFailureReason reason) {
@@ -10643,8 +10689,8 @@ bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, floa
     if (!resolve_indirect_draw_arguments(st, st.draws[index], draw))
         return note(RealizationFailureReason::IndirectArguments);
     const bool log = getenv("PROSPER_GFXLOG") != nullptr || PROSPER_ENV_ON("PROSPER_EXECLOG");
-    if (!realize_draw_item(draw_state, &draw, draw.index_count, 0x10000, log, item,
-                           failure, true, nullptr, raw_context)) {
+    if (!realize_draw_item(draw_state, &draw, draw.index_count, 0x10000, log, item, failure, true,
+                           nullptr, raw_context, std::move(scalar.point), std::move(scalar.bank))) {
         // realize_draw_item resets and fills the record, including pipeline/targets/extent, but has
         // no notion of which retained operation it belongs to.
         if (failure) {
@@ -11216,6 +11262,12 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                          std::vector<DrawItem>* eager_draws,
                          std::vector<MenuRealizedDrawIdentity>* menu_realized_draws) {
     GuestGpuWriteSubmitScope guest_gpu_write_scope;
+    const bool scalar_ordering =
+        std::any_of(st.draws.begin(), st.draws.end(), [&](const auto& draw) {
+            const size_t index = static_cast<size_t>(&draw - st.draws.data());
+            return draw_requires_original_scalar_bank(
+                use_per_draw_policy(st) ? st.state_at_draw(index) : st);
+        });
     // The ordered path reaches build_stage_table through realize_retained_draw rather than through
     // realize_gpustate_draws, so it needs its own sampling window or its per-draw switches fall
     // back to a live getenv. See diagnostics/env_submit.hpp.
@@ -11311,6 +11363,7 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
         if (!rendered.empty()) result.frame = std::move(rendered);
         if (has_draws) {
             span.clear();
+            read_points.submitted_span();
             ++result.render_spans;
         }
     };
@@ -11562,6 +11615,11 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                 const auto read_render = extract_render_state(read_state);
                 read_points.dependencies_ok = read_point_dependencies_ok && producer_epoch_ok &&
                                               graphics_epoch_ok && indirect_dependencies_ok;
+                auto scalar_inputs =
+                    scalar_ordering
+                        ? prepare_ordered_scalar_draw(read_points, submit_no,
+                                                      operation.command_order, read_state, span)
+                        : OrderedScalarDrawInputs{};
                 raw_context.source_submit = submit_no;
                 raw_context.requires_ordered_read_point = true;
                 raw_context.ordered_read_point =
@@ -11588,8 +11646,8 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                     static const bool want_reason = PROSPER_ENV_ON("PROSPER_PRESENT_WHY");
                     const bool collect = capture_trace != nullptr || want_reason;
                     realized = realize_retained_draw(
-                        st, operation.index, scale_x, scale_y, item,
-                        collect ? &failure : nullptr, nested_inputs ? &raw_context : nullptr);
+                        st, operation.index, scale_x, scale_y, item, collect ? &failure : nullptr,
+                        nested_inputs ? &raw_context : nullptr, std::move(scalar_inputs));
                     failure_known = collect;
                     if (!realized && want_reason) {
                         static std::atomic<uint64_t> n{0};
@@ -11617,6 +11675,8 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                             capture_trace->pending_capture, item, {}, &st);
                         capture_trace->draws.push_back(item);
                     }
+                    if (scalar_ordering)
+                        read_points.record_queued_draw(read_state, item, submit_no);
                     span.push_back(std::move(item));
                 } else {
                     // A missing graphics producer in this submit cannot publish current inputs
@@ -12636,13 +12696,21 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
             return draw_requires_owned_nested_snapshot(
                 use_per_draw_policy(st) ? st.state_at_draw(index) : st);
         });
+    const bool has_scalar_bank_inputs =
+        std::any_of(st.draws.begin(), st.draws.end(), [&](const auto& draw) {
+            const size_t index = static_cast<size_t>(&draw - st.draws.data());
+            return draw_requires_original_scalar_bank(
+                use_per_draw_policy(st) ? st.state_at_draw(index) : st);
+        });
     const bool needs_ordered_realization = has_ordered_dma || has_indirect ||
-        !st.dispatches.empty() || has_nested_inputs;
+                                           !st.dispatches.empty() || has_nested_inputs ||
+                                           has_scalar_bank_inputs;
     // Draws without DMA/indirect arguments remain safe to prepare in parallel. Compute resources,
     // however, are always realized at their ordered position: a preceding dispatch in the same
     // submit can write a pointer or descriptor consumed by the next dispatch (Astro Bot's BVH root
     // is one such dependency). Pre-realizing every compute snapshots stale guest bytes.
-    const bool can_eagerly_realize_draws = !has_ordered_dma && !has_indirect && !has_nested_inputs;
+    const bool can_eagerly_realize_draws =
+        !has_ordered_dma && !has_indirect && !has_nested_inputs && !has_scalar_bank_inputs;
     // The normal AGC path is serialized, but execute_ordered_and_present is public and tests may
     // call it concurrently. The active collection generation is process-global because eager draw
     // workers need to see it, so serialize armed executions only; the default path never locks.

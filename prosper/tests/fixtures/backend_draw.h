@@ -11,6 +11,7 @@
 struct BackendDraw {
     std::shared_ptr<prosper::gpu::RasterQuadCollection> raster_quads;
     std::shared_ptr<const prosper::gpu::RasterQuadInputs> fragment_draw_inputs;
+    std::shared_ptr<const prosper::gpu::OriginalGraphicsDrawEffects> original_graphics_effects;
     std::shared_ptr<const prosper::gpu::GraphicsOwnedWaveDraw> owned_waves;
     bool raster_quad_contract_modified = false;
     std::vector<uint32_t> vs, gs, fs;
@@ -21,10 +22,11 @@ struct BackendDraw {
     std::array<uint32_t, 3> mesh_groups{1, 1, 1};
     prosper::gpu::SharedShaderWords vs_shared, fs_shared;
     uint64_t vs_identity = 0, fs_identity = 0;
-    uint64_t fs_guest_addr = 0; // diagnostic provenance only; zero for direct/override callers
+    uint64_t fs_guest_addr = 0;   // diagnostic provenance only; zero for direct/override callers
     // Explicit guest-semantic lowering. Strict replay/direct callers never transform captured
     // words. Live frontends opt into per-vote certificates, independent of the game being run.
-    prosper::gpu::FragmentWavePolicy fragment_wave_policy = prosper::gpu::FragmentWavePolicy::Strict;
+    prosper::gpu::FragmentWavePolicy fragment_wave_policy =
+        prosper::gpu::FragmentWavePolicy::Strict;
     // Legacy diagnostic/test-only contracts. The live renderer never sets either flag: a reason
     // bit or an output-width proof alone is NOT authority for the new semantic transformation.
     bool allow_native_fragment_vote_width = false;
@@ -32,13 +34,14 @@ struct BackendDraw {
     // Stable semantic draw ID from DrawItem::draw_index. Diagnostics must not use this backend
     // vector's pass-local offset: target/compute splitting can make that offset differ per pass.
     uint64_t draw_index = UINT64_MAX;
-    uint64_t source_submit = 0; // live architectural submit, zero for replay/direct callers
+    uint64_t source_submit = 0;   // live architectural submit, zero for replay/direct callers
     // Global PM4 ordinal. Unlike draw_index this is comparable with interleaved compute operations
     // and therefore identifies which retained attachment layer is newer than a compute image.
     uint64_t command_order = 0;
-    const prosper::gpu::ResolvedPipelineState* ps = nullptr;   // null -> triangle-list, write RGBA, no depth
-    std::vector<FrameResource> R;                              // textures plus compatibility/test buffers
-    std::vector<FrameBufferResource> B;                        // compact production storage buffers
+    const prosper::gpu::ResolvedPipelineState* ps =
+        nullptr;   // null -> triangle-list, write RGBA, no depth
+    std::vector<FrameResource> R;   // textures plus compatibility/test buffers
+    std::vector<FrameBufferResource> B;   // compact production storage buffers
     // Original frontend binding order. High bit selects B; the remaining bits index R or B. Empty
     // means every resource is in R, preserving the replay/test construction contract.
     std::vector<uint32_t> resource_order;
@@ -74,9 +77,13 @@ struct BackendDraw {
     void borrow_indices(std::vector<uint32_t>&&) = delete;
 
     void set_vs(std::vector<uint32_t> words) {
-        vs = std::move(words); vs_shared.reset(); vs_identity = 0;
+        vs = std::move(words);
+        vs_shared.reset();
+        vs_identity = 0;
     }
     void set_fs(std::vector<uint32_t> words) {
-        fs = std::move(words); fs_shared.reset(); fs_identity = 0;
+        fs = std::move(words);
+        fs_shared.reset();
+        fs_identity = 0;
     }
 };

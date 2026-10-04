@@ -6418,6 +6418,16 @@ endif()
 # CPU-only actual ordered-executor/backend-metadata contract, shared by Windows and UNIX. Links
 # the normal renderer but deliberately creates no device or GPU work and needs no game dump.
 if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
+  prosper_add_gtest(test_fragment_scalar_bank
+    SOURCES tests/shared/live/test_fragment_scalar_bank.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan
+    LABELS unit PROPERTIES TIMEOUT 60)
+  prosper_add_gtest(test_fragment_scalar_bank_gpu
+    SOURCES tests/shared/live/test_fragment_scalar_bank_gpu.cpp
+    INCLUDES frontends src tests
+    LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan
+    LABELS gpu PROPERTIES TIMEOUT 120)
   prosper_add_gtest(test_ordered_graphics_read_point
     SOURCES tests/shared/live/test_ordered_graphics_read_point.cpp
     INCLUDES frontends src tests
