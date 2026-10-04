@@ -62,10 +62,22 @@ struct Rdna2Inst;
 bool guest_readable(uint64_t address, uint32_t bytes);
 
 using SharedShaderWords = std::shared_ptr<const std::vector<uint32_t>>;
+struct FragmentPacketVgprRequirements;
+struct OriginalGraphicsStageEffects;
+struct DecodedShader;
+class RegisteredNativeGraphicsAnalysis;
+class CheckedGraphicsSource;
 
 struct GraphicsReadSource {
     SharedShaderWords words;
     std::shared_ptr<const std::vector<RawNestedWideChain>> chains;
+    // Full-original packet facts alias the registered decoded version, not native-module
+    // ShaderCodeAnalysis or another VA lookup. The issuer retains this exact association.
+    std::shared_ptr<const FragmentPacketVgprRequirements> packet_requirements;
+    std::shared_ptr<const OriginalGraphicsStageEffects> vertex_effects, fragment_effects;
+    std::shared_ptr<const DecodedShader> decoded;
+    std::shared_ptr<const RegisteredNativeGraphicsAnalysis> native_analysis;
+    const AgcShaderHeader* registered_header = nullptr;
 };
 GraphicsReadSource registered_graphics_read_source(uint64_t address);
 
@@ -103,6 +115,10 @@ struct DrawItem {
     // separately allocated NGG main program. Capture retains that raw continuation as well so
     // diagnostic replay can recompile the same complete architectural program.
     uint64_t vs_chain_guest_addr = 0;
+    // Coupled full-original versions already observed by the real stage-table producer. These
+    // are not native module analyses or address-only guesses; queued scalar effect accounting
+    // reuses them without another full guest-code validation after folding.
+    GraphicsReadSource original_vs_source, original_ps_source;
     // Content-addressed raw RDNA2 versions owned by a materialized capture. Live draw items leave
     // these unset; capture assigns them from the guest addresses above and replay restores them.
     uint32_t vs_raw_shader_index = 0xFFFFFFFFu;
@@ -678,7 +694,8 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     bool vertex_capture_position = false, const SharedShaderAnalysis& captured_analysis = {},
     FragmentFloatMode fragment_float_mode = {}, FloatTransportConfig float_transport = {},
     FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
-    RefusedShaderSource* original_source = nullptr);
+    RefusedShaderSource* original_source = nullptr,
+    const CheckedGraphicsSource* checked_source = nullptr);
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; ordinary per-dispatch push-constant values do not.
 // Conditional marker lowerings validate their value-dependent dispatch proof before cache lookup.

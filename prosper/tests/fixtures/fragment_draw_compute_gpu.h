@@ -10,13 +10,14 @@ public:
             std::shared_ptr<const prosper::gpu::FragmentDrawProgramPlan> program,
             std::string& refusal) {
         refusal.clear();
+        const uint32_t storage_bindings = program && program->requires_scalar_bank() ? 6u : 5u;
         if (!context.ok || !context.queue_supports_compute || !context.shader_int64_enabled ||
             context.max_compute_workgroup_size_x < 64 ||
             context.max_compute_workgroup_invocations < 64 ||
             context.detile_limits.maxBoundDescriptorSets < 1 ||
-            context.detile_limits.maxPerStageDescriptorStorageBuffers < 5 ||
-            context.detile_limits.maxDescriptorSetStorageBuffers < 5 ||
-            context.detile_limits.maxPerStageResources < 5 || !program ||
+            context.detile_limits.maxPerStageDescriptorStorageBuffers < storage_bindings ||
+            context.detile_limits.maxDescriptorSetStorageBuffers < storage_bindings ||
+            context.detile_limits.maxPerStageResources < storage_bindings || !program ||
             !program->rejection_reason().empty() || !program->capacity_owner() ||
             program->device_contract().device_identity !=
                 reinterpret_cast<uintptr_t>(context.dev)) {
@@ -33,13 +34,13 @@ public:
         ++stats.compute_cold_builds;
         auto result = std::shared_ptr<FragmentDrawComputeGpuProgram>(
             new FragmentDrawComputeGpuProgram(context, std::move(program)));
-        std::array<VkDescriptorSetLayoutBinding, 5> bindings{};
-        for (uint32_t binding = 0; binding < bindings.size(); ++binding)
+        std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
+        for (uint32_t binding = 0; binding < storage_bindings; ++binding)
             bindings[binding] = {binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                                  VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo descriptors{
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        descriptors.bindingCount = uint32_t(bindings.size());
+        descriptors.bindingCount = storage_bindings;
         descriptors.pBindings = bindings.data();
         ++stats.vk_object_create_calls;
         if (vkCreateDescriptorSetLayout(context.dev, &descriptors, nullptr,
@@ -107,6 +108,7 @@ public:
     VkDescriptorSetLayout descriptors() const { return descriptors_; }
     VkPipelineLayout layout() const { return layout_; }
     VkPipeline pipeline(Stage stage) const { return pipelines_[stage]; }
+    uint32_t storage_bindings() const { return program_->requires_scalar_bank() ? 6u : 5u; }
     bool source_live() const { return program_->source_live(); }
 
 private:
@@ -139,17 +141,19 @@ inline bool allocate_fragment_draw_compute_sets(
     using O = FragmentDrawGpuOwner;
     const auto collector = owner.plane(O::Collector), input = owner.plane(O::Input),
                output = owner.plane(O::Output), commit = owner.plane(O::Commit),
-               authority = owner.upload(0), entry = owner.upload(1);
-    const std::array<std::array<VkDescriptorBufferInfo, 5>, 4> bindings{{
-        {collector, input, authority, entry, commit},
-        {collector, input, authority, entry, commit},
-        {input, output, authority, entry, commit},
-        {input, commit, authority, output, collector},
+               authority = owner.upload(0), entry = owner.upload(1), bank = owner.upload(2);
+    const std::array<std::array<VkDescriptorBufferInfo, 6>, 4> bindings{{
+        {collector, input, authority, entry, commit, bank},
+        {collector, input, authority, entry, commit, bank},
+        {input, output, authority, entry, commit, bank},
+        {input, commit, authority, output, collector, bank},
     }};
-    std::array<VkWriteDescriptorSet, 20> writes{};
+    const uint32_t storage_bindings = program.storage_bindings();
+    if (storage_bindings == 6 && (!bank.buffer || !bank.range)) return false;
+    std::array<VkWriteDescriptorSet, 24> writes{};
     for (uint32_t stage = 0; stage < bindings.size(); ++stage)
-        for (uint32_t binding = 0; binding < bindings[stage].size(); ++binding) {
-            auto& write = writes[stage * 5 + binding];
+        for (uint32_t binding = 0; binding < storage_bindings; ++binding) {
+            auto& write = writes[stage * storage_bindings + binding];
             write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             write.dstSet = sets[stage];
             write.dstBinding = binding;
@@ -157,7 +161,8 @@ inline bool allocate_fragment_draw_compute_sets(
             write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             write.pBufferInfo = &bindings[stage][binding];
         }
-    vkUpdateDescriptorSets(device, uint32_t(writes.size()), writes.data(), 0, nullptr);
+    vkUpdateDescriptorSets(device, uint32_t(bindings.size()) * storage_bindings, writes.data(), 0,
+                           nullptr);
     return true;
 }
 

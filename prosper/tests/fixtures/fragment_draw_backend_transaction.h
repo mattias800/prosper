@@ -170,7 +170,12 @@ public:
                                       [](const State& state) { return bool(state.replay); })) *
                5;
     }
-    uint64_t additional_storage_descriptors() const { return additional_sets() / 5 * 21; }
+    uint64_t additional_storage_descriptors() const {
+        uint64_t result = 0;
+        for (const auto& state : states_)
+            if (state.replay) result += uint64_t(state.compute->storage_bindings()) * 4 + 1;
+        return result;
+    }
     bool allocate(size_t index, VkDescriptorPool pool) {
         auto& state = states_[index];
         if (!state.replay) return true;

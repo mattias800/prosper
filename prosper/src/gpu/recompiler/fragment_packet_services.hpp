@@ -26,12 +26,16 @@ struct PacketResourceServices {
     std::map<uint32_t, uint32_t> buffer_offsets;
     std::map<uint32_t, uint32_t> parameter_offsets;
     uint32_t failure_var = 0, failure_pc_var = 0, m0_var = 0;
+    uint32_t scalar_bank_variable = 0, scalar_bank_length = 0, scalar_bank_merge = 0;
     PacketWaveDataLayout* wave_data = nullptr;
     void begin(SpirvCompute&);
     // 0 => existing integer emitter, 1 => handled, -1 => transactional emission refusal.
     int emit(SpirvCompute&, RegState&, const Rdna2Inst&);
     void finish(SpirvCompute&);
     void fail(SpirvCompute&, uint32_t condition, uint32_t pc, FragmentPacketRuntimeFailure);
+    void begin_scalar_bank(SpirvCompute&);
+    void finish_scalar_bank(SpirvCompute&);
+    int emit_scalar_bank_load(SpirvCompute&, RegState&, const Rdna2Inst&);
 };
 const char* packet_resource_instruction_gap(const Rdna2Inst&);
 const char* packet_resource_preflight(const FragmentResourcePacket&, const std::vector<Rdna2Inst>&,

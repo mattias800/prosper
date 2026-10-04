@@ -44,10 +44,10 @@ size_t guest_source_readable_prefix(uint64_t address, size_t bytes,
 template <typename HostReadable>
 size_t copy_guest_source(uint8_t* destination, uint64_t address, size_t bytes,
                          HostReadable&& host_readable) {
-    return prosper::gpu::copy_buffer_source(destination, address, bytes,
-        [&](uint64_t source, size_t requested) {
-            return guest_source_readable_prefix(
-                source, requested, std::forward<HostReadable>(host_readable));
+    return prosper::gpu::copy_buffer_source(
+        destination, address, bytes, [&](uint64_t source, size_t requested) {
+            return guest_source_readable_prefix(source, requested,
+                                                std::forward<HostReadable>(host_readable));
         });
 }
 // Optional observations of the existing comparison, never an equality/admission authority.

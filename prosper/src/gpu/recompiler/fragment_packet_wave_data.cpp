@@ -53,6 +53,8 @@ static FragmentPacketKernel compile_kernel(const FragmentResourcePacket& prototy
         std::fprintf(stderr, "[fragment-packet-wave-reject] reason=%s\n", reason.c_str());
         return result;
     };
+    if (!gpu_capacity && !prototype.scalar_bank_sites.empty())
+        return reject("packet-scalar-bank-requires-distinct-capacity-abi");
     if (prototype.invocation.guest_code.empty() || prototype.invocation.guest_code.size() > 4096 ||
         prototype.invocation.vgprs.size() > 256 || prototype.invocation.sgprs.size() > 106 ||
         prototype.buffers.size() > 64 || prototype.images.size() > 16 ||
@@ -92,6 +94,7 @@ static FragmentPacketKernel compile_kernel(const FragmentResourcePacket& prototy
     program.entry_facts = schema.entry_facts;
     program.float_mode = schema.invocation.float_mode;
     program.float_flags = schema.invocation.float_flags;
+    program.scalar_bank_sites = schema.scalar_bank_sites;
     result.transport = schema.invocation.float_transport;
     result.topology = schema.invocation.quad_topology;
     PacketResourceServices services{schema, program};

@@ -42,6 +42,7 @@
 #include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"     // recompile_compute
 #include "gpu/recompiler/fragment_packet_vgpr_requirements.hpp"
+#include "gpu/execute/original_graphics_stage_effects.hpp"
 #include "gpu/capture/writer_provenance.hpp"
 #include "host/memory/guest_memory_map.hpp"
 #include "host/memory/guest_memory_query.hpp"
@@ -547,6 +548,10 @@ struct DecodedShader {
     FoldControlPlan control_plan;
     FoldControlPlan shader_constant_control_plan;
     std::vector<uint32_t> code;
+    // Canonical original-packet facts belong to this SAME immutable byte version. They are
+    // derived cold from the full stream, never from compact/normalized native instructions.
+    FragmentPacketVgprRequirements packet_requirements;
+    std::array<OriginalGraphicsStageEffects, 2> original_effects;
     std::vector<Rdna2Inst> instructions;
     std::vector<Rdna2Inst> shader_constant_instructions;
     // Code-byte-only proof, computed on the full decoded stream before fold compaction.

@@ -327,8 +327,8 @@ std::vector<uint32_t> build_fragment_draw_assembly(const FragmentDrawCapacity& c
     if (!capacity.matches_collector(collector)) return {};
     const auto& kernel = *capacity.kernel();
     const auto& layout = kernel.layout;
-    // This first recipe has no external read-PC or guest parameter coefficients. Adding those
-    // needs producer/epoch ownership, not copying observed host varyings into presumed registers.
+    // Old full-buffer/parameter payloads are not per-wave packing authority. The distinct scalar
+    // bank stays outside this input plane; only its genuine user descriptor words travel here.
     if (!layout.buffers.empty() || !layout.parameters.empty() || !kernel.program.images.empty() ||
         layout.entry_m0_available)
         return {};

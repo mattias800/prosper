@@ -909,6 +909,7 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
     }
     if (services) services->finish(b);
     if (runtime_definedness) definedness.finish(b, result.vgpr_status_offset);
+    if (services) services->finish_scalar_bank(b);
     if (wave_data) finish_packet_wave_data(b, wave_emission);
     result.spirv = b.finish();
     if (result.spirv.empty()) return reject("packet-module-finalization-refused");

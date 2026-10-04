@@ -1,5 +1,6 @@
 #include "gpu/execute/ordered_graphics_read_point_internal.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/recompiler/fragment_packet_vgpr_requirements.hpp"
 
 #include <atomic>
 
@@ -43,7 +44,7 @@ OrderedGraphicsReadPointIssuer::issue(uint64_t submit, uint64_t order,
     const auto current = graphics_producer_status();
     if (!current.known || current.pending || current.failures != baseline.failures) return {};
     std::vector<OrderedGraphicsReadPoint::Source> sources;
-    for (uint64_t address : {vertex, fragment}) {
+    for (const auto [address, pixel] : {std::pair{vertex, false}, std::pair{fragment, true}}) {
         // Complete ordinary registered programs only. A separately allocated continuation or
         // fused body needs its own association contract, not a guessed front-only identity.
         if (!address || prosper_agc_shader_continuation_for_code(address) ||
@@ -51,7 +52,8 @@ OrderedGraphicsReadPointIssuer::issue(uint64_t submit, uint64_t order,
             return {};
         auto original = registered_graphics_read_source(address);
         if (!original.words || original.words->empty() || !original.chains) return {};
-        sources.push_back({address, std::move(original.words), std::move(original.chains)});
+        sources.push_back({address, std::move(original.words), std::move(original.chains),
+                           std::move(original.packet_requirements), pixel});
     }
     const auto after = graphics_producer_status();
     if (!after.known || after.pending || after.failures != baseline.failures ||
@@ -70,6 +72,40 @@ OrderedGraphicsReadPoint::source(uint64_t address) const {
     for (const auto& candidate : sources_)
         if (candidate.address == address) return candidate.words;
     return {};
+}
+
+std::shared_ptr<const FragmentPacketVgprRequirements>
+OrderedGraphicsReadPoint::packet_requirements(uint64_t address) const {
+    for (const auto& candidate : sources_)
+        if (candidate.fragment && candidate.address == address)
+            return candidate.packet_requirements;
+    return {};
+}
+
+std::shared_ptr<const std::vector<uint32_t>>
+OrderedGraphicsReadPoint::packet_source(uint64_t address) const {
+    for (const auto& candidate : sources_)
+        if (candidate.fragment && candidate.address == address) return candidate.words;
+    return {};
+}
+
+bool OrderedGraphicsReadPoint::valid_for_packet(
+    uint64_t submit, uint64_t order, uint64_t address,
+    const std::shared_ptr<const std::vector<uint32_t>>& words,
+    const std::shared_ptr<const FragmentPacketVgprRequirements>& requirements) const {
+    const auto expected = packet_requirements(address);
+    const auto original = packet_source(address);
+    if (!words || !requirements || !expected || !original || original.get() != words.get() ||
+        original.owner_before(words) || words.owner_before(original) ||
+        expected.get() != requirements.get() || expected.owner_before(requirements) ||
+        requirements.owner_before(expected) || words.owner_before(requirements) ||
+        requirements.owner_before(words) || requirements->source_words != words.get() ||
+        requirements->masks.source_words != words.get() ||
+        requirements->scalar_reads.source_words != words.get())
+        return false;
+    // The original RAW contract remains exact and unchanged. Packet authority additionally
+    // requires the issuer's coupled full-stream manifest, not a guessed equal byte vector.
+    return valid_for(submit, order, address, words);
 }
 
 bool OrderedGraphicsReadPoint::owns_chains(uint64_t address,

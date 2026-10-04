@@ -10,11 +10,15 @@
 #include <vector>
 
 namespace prosper::gpu {
+class FragmentScalarBank;
 // An owned real draw's input contract, not initialized guest registers or a logical Wave64.
 // All selected modules are pinned; raw_code owns the same analysis version used by the PS compiler.
 struct RasterQuadInputs {
     std::shared_ptr<const std::vector<uint32_t>> source_vs, source_gs, source_fs, raw_code;
     std::shared_ptr<const FragmentPacketVgprRequirements> vgpr_requirements;
+    // A completed original-PC checked snapshot is distinct from the normalized native FS table.
+    // It owns exact demand bytes after its ordered permission expires; it cannot authorize a reread.
+    std::shared_ptr<const FragmentScalarBank> scalar_bank;
     PixelInputMapping pixel_inputs{};
     PixelSystemInputMapping system_inputs{};
     FragmentInterpolationLayout interpolation{};

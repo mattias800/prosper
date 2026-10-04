@@ -121,6 +121,43 @@ public:
             }
             std::memcpy(result->upload_[upload].mapped, data, bytes);
         }
+        const auto& bank = result->transaction_.scalar_bank();
+        if (bool(bank) != result->transaction_.program()->requires_scalar_bank()) {
+            refusal = "fragment-draw-scalar-bank-upload-owner-unavailable";
+            return {};
+        }
+        if (bank) {
+            const uint64_t bytes = uint64_t(bank->wire_words()) * 4;
+            if (!bytes || bytes > context.detile_limits.maxStorageBufferRange ||
+                bank->wire_metadata().size() > bank->wire_words() ||
+                bank->wire_interval_words().size() != bank->intervals().size()) {
+                refusal = "fragment-draw-scalar-bank-upload-extent-unavailable";
+                return {};
+            }
+            result->upload_[2] = acquire_render_host_buffer(context, bytes);
+            result->upload_bytes_[2] = bytes;
+            auto* destination = static_cast<uint8_t*>(result->upload_[2].mapped);
+            if (!destination) {
+                refusal = "fragment-draw-scalar-bank-upload-allocation-failed";
+                return {};
+            }
+            std::memcpy(destination, bank->wire_metadata().data(),
+                        bank->wire_metadata().size() * 4);
+            for (uint32_t index = 0; index < bank->intervals().size(); ++index) {
+                const auto& interval = bank->intervals()[index];
+                const uint64_t offset = uint64_t(bank->wire_interval_words()[index]) * 4;
+                if (!interval.bytes || offset > bytes || interval.bytes->size() > bytes - offset) {
+                    refusal = "fragment-draw-scalar-bank-upload-interval-invalid";
+                    return {};
+                }
+                // Exact immutable checked source segments, copied once into the normal pooled
+                // coherent upload. No guest VA reread, full-buffer concatenation or per-wave copy.
+                std::memcpy(destination + offset, interval.bytes->data(), interval.bytes->size());
+            }
+            auto& stats = prosper::gpu::fragment_draw_cache_stats();
+            ++stats.scalar_bank_uploads;
+            stats.scalar_bank_payload_bytes += bank->payload_bytes();
+        }
         return result;
     }
     ~FragmentDrawGpuOwner() {
@@ -148,7 +185,8 @@ public:
     // Called exactly once on a newly leased transaction BEFORE collector/indirect/validation use.
     // Missing/outer-refused stages leave gate0, never a previous pool user's accepted gate1.
     void record_zero_and_upload_visibility(VkCommandBuffer command) const {
-        std::array<VkBufferMemoryBarrier, Planes + 2> barriers{};
+        std::array<VkBufferMemoryBarrier, Planes + 3> barriers{};
+        const uint32_t barrier_count = Planes + (transaction_.scalar_bank() ? 3u : 2u);
         std::array<VkBufferMemoryBarrier, Planes> recycle{};
         for (uint32_t index = 0; index < Planes; ++index) {
             recycle[index] = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
@@ -162,7 +200,7 @@ public:
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
                              uint32_t(recycle.size()), recycle.data(), 0, nullptr);
-        for (uint32_t index = 0; index < barriers.size(); ++index) {
+        for (uint32_t index = 0; index < barrier_count; ++index) {
             auto& barrier = barriers[index];
             barrier = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
             barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -177,7 +215,8 @@ public:
             if (device_plane) vkCmdFillBuffer(command, info.buffer, start, info.range - start, 0);
             barrier.srcAccessMask =
                 device_plane ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_HOST_WRITE_BIT;
-            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                    (device_plane ? VK_ACCESS_SHADER_WRITE_BIT : 0) |
                                     (index == Input ? VK_ACCESS_INDIRECT_COMMAND_READ_BIT : 0);
         }
         const uint32_t header[]{0, 0, transaction_.program()->collector_shape().record_words,
@@ -187,7 +226,7 @@ public:
             command, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-            0, 0, nullptr, uint32_t(barriers.size()), barriers.data(), 0, nullptr);
+            0, 0, nullptr, barrier_count, barriers.data(), 0, nullptr);
     }
 
 private:
@@ -198,6 +237,6 @@ private:
     const prosper::gpu::FragmentDrawTransaction transaction_;
     std::array<FragmentDrawDeviceStorage, Planes> storage_{};
     std::array<VkDeviceSize, Planes> bytes_{};
-    std::array<RenderHostBuffer, 2> upload_{};
-    std::array<VkDeviceSize, 2> upload_bytes_{};
+    std::array<RenderHostBuffer, 3> upload_{};
+    std::array<VkDeviceSize, 3> upload_bytes_{};
 };

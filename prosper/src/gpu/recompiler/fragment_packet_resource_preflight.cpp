@@ -145,6 +145,14 @@ const char* packet_resource_preflight(const FragmentResourcePacket& packet,
     if (packet.buffers.size() > 64 || packet.images.size() > 16 ||
         packet.parameter_cache.parameters.size() > 16 * 32 * 4)
         return "packet-resource-input-budget";
+    if (!packet.scalar_bank_sites.empty()) {
+        const auto original = fragment_packet_scalar_read_requirements(guest.guest_code, ins);
+        if (!packet.buffers.empty() || !packet.images.empty() ||
+            !packet.parameter_cache.parameters.empty() || packet.scalar_bank_sites.size() > 64 ||
+            !original.has_smem || !original.rejection.empty() ||
+            original.sites != packet.scalar_bank_sites)
+            return "packet-scalar-bank-original-site-schema-unproved";
+    }
     std::map<uint32_t, const FragmentPacketBufferRead*> buffers;
     std::map<uint32_t, const FragmentPacketImageRead*> images;
     uint64_t total_words = 0;
@@ -212,11 +220,14 @@ const char* packet_resource_preflight(const FragmentResourcePacket& packet,
         // Association is WHOLE-program, even for a dead instruction; completion is all structurally
         // reachable paths. No actual entry EXEC/SCC mask specializes away a hazardous arm.
         if (in.fmt == Rdna2Format::SMEM) {
-            const auto found = buffers.find(in.pc);
-            if (found == buffers.end()) return "packet-buffer-readpoint-unavailable";
-            const auto count = 1u << (in.opcode - 8);
-            if (in.literal / 4u + count > found->second->words.size()) return "packet-smem-range-unavailable";
-            used_buffers.insert(in.pc);
+            if (packet.scalar_bank_sites.empty()) {
+                const auto found = buffers.find(in.pc);
+                if (found == buffers.end()) return "packet-buffer-readpoint-unavailable";
+                const auto count = 1u << (in.opcode - 8);
+                if (in.literal / 4u + count > found->second->words.size())
+                    return "packet-smem-range-unavailable";
+                used_buffers.insert(in.pc);
+            }
         }
         if (in.fmt == Rdna2Format::MIMG) {
             if (!images.contains(in.pc)) return "packet-image-readpoint-unavailable";

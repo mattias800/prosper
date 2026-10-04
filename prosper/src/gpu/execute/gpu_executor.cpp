@@ -11,6 +11,8 @@
 #include "gpu/execute/compute_program_facts.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/execute/ordered_graphics_read_point_internal.hpp"
+#include "gpu/execute/checked_graphics_source.hpp"
+#include "gpu/execute/registered_graphics_source_internal.hpp"
 #include "diagnostics/env_submit.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: skipped-dispatches, shader-compile alarms
 #include "gpu/diagnostics/watch_list.hpp"   // strict 0x-only watch parsing (shared with the RTT watch)
@@ -942,6 +944,16 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         std::vector<Rdna2Inst> decoded;
         const size_t consumed = rdna2_walk(snapshot.data(), snapshot.size(), decoded);
         result->code.assign(snapshot.begin(), snapshot.begin() + consumed);
+        result->packet_requirements = fragment_packet_vgpr_requirements(
+            result->code, decoded, FragmentPacketExportObservation::Architectural);
+        for (const auto [index, stage] : {std::pair{0u, ShaderProgramStage::Vertex},
+                                          std::pair{1u, ShaderProgramStage::Fragment}}) {
+            result->original_effects[index] =
+                original_graphics_stage_effects(result->code, decoded, stage);
+            if (consumed != snapshot.size())
+                result->original_effects[index].rejection =
+                    "original-stage-registered-tail-unproved";
+        }
         if (!decoded.empty()) {
             const Rdna2Inst& last = decoded.back();
             result->terminated = last.is_end || last.fmt == Rdna2Format::Unknown ||
@@ -1060,6 +1072,9 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
         }
         result->bytes =
             static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
+            result->packet_requirements.retained_bytes() +
+            result->original_effects[0].retained_bytes() +
+            result->original_effects[1].retained_bytes() +
             static_cast<uint64_t>(result->instructions.size() +
                                   result->shader_constant_instructions.size()) *
                 sizeof(Rdna2Inst) +
@@ -1329,7 +1344,7 @@ ShaderCompileKey make_shader_compile_key(
     bool capture_position = false, const SharedShaderAnalysis& captured_analysis = {},
     FragmentFloatMode fragment_float_mode = {}, FloatTransportConfig float_transport = {},
     FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
-    RefusedShaderSource* original_source = nullptr) {
+    RefusedShaderSource* original_source = nullptr, bool checked_graphics_source = false) {
     ShaderCompileKey key;
     key.resources = ShaderKeyResourceScratch::acquire();
     key.stage = stage;
@@ -1382,7 +1397,7 @@ ShaderCompileKey make_shader_compile_key(
     }
     // Reuse only the draw-local byte version; ordinary cold callers authenticate their range.
     const SharedShaderAnalysis analysis =
-        stage == ShaderProgramStage::Fragment && captured_analysis ? captured_analysis
+        (stage == ShaderProgramStage::Fragment || checked_graphics_source) && captured_analysis ? captured_analysis
         : code && dwords ? analyze_shader_code_cached(code, dwords) : nullptr;
     if (stage == ShaderProgramStage::Fragment && code && dwords && resources) {
         const PcrelDispatchSelection selection =
@@ -2130,9 +2145,13 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     uint32_t vertex_lds_dwords, bool vertex_capture_position,
     const SharedShaderAnalysis& captured_analysis, FragmentFloatMode fragment_float_mode,
     FloatTransportConfig float_transport, FragmentFloatFlags fragment_float_flags,
-    FragmentLaunchRsrc1 fragment_launch_rsrc1, RefusedShaderSource* original_source) {
+    FragmentLaunchRsrc1 fragment_launch_rsrc1, RefusedShaderSource* original_source,
+    const CheckedGraphicsSource* checked_source) {
     if (cache_identity) *cache_identity = 0;
     if (original_source) *original_source = {};
+    if (checked_source && (!checked_source->current() || checked_source->stage() != stage ||
+                           checked_source->address() != reinterpret_cast<uint64_t>(code)))
+        return {};
     if (!fragment_float_mode.canonical() || !float_transport.canonical() ||
         !fragment_float_flags.canonical() || !fragment_launch_rsrc1.canonical()) {
         if (stage == ShaderProgramStage::Fragment)
@@ -2141,8 +2160,10 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     }
     ShaderCompileKey key = make_shader_compile_key(
         stage, code, dwords, resources, pixel_inputs, system_inputs, nullptr, 0, vertex_lds_dwords,
-        nullptr, fragment_wave32, vertex_capture_position, captured_analysis, fragment_float_mode,
-        float_transport, fragment_float_flags, fragment_launch_rsrc1, original_source);
+        nullptr, fragment_wave32, vertex_capture_position,
+        checked_source ? checked_source->analysis() : captured_analysis, fragment_float_mode,
+        float_transport, fragment_float_flags, fragment_launch_rsrc1, original_source,
+        checked_source != nullptr);
     // Guest memory is 1:1-mapped, so the caller's code pointer IS the guest program address; it must
     // be captured here because the key owns a copy of the words rather than pointing at them.
     const uint64_t program_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(code));
@@ -2160,8 +2181,14 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     key.trip_bound = trip_bound_op.settings();
     if (key.trip_bound.bound) key.trip_bound_program_address = program_address;
     key.cached_hash = ShaderCompileKeyHash::compute(key);
-    return cache_compiled_graphics_shader(stage, std::move(key), resources, cache_identity,
-                                          program_address, /*chain_address=*/0);
+    auto result = cache_compiled_graphics_shader(stage, std::move(key), resources, cache_identity,
+                                                program_address, /*chain_address=*/0);
+    if (checked_source && !checked_source->current()) {
+        if (cache_identity) *cache_identity = 0;
+        if (original_source) *original_source = {};
+        return {};
+    }
+    return result;
 }
 
 SharedShaderWords recompile_vertex_chain_cached_shared(
@@ -7151,9 +7178,9 @@ GraphicsReadSource registered_graphics_read_source(uint64_t address) {
     if (!count) return {};
     const auto analysis =
         decode_shader_cached(reinterpret_cast<const uint32_t*>(uintptr_t(address)), count);
-    return {SharedShaderWords(analysis, &analysis->code),
-            std::shared_ptr<const std::vector<RawNestedWideChain>>(
-                analysis, &analysis->owned_nested_wide_chains)};
+    auto result = coupled_graphics_read_source(analysis);
+    result.registered_header = header;
+    return result;
 }
 
 SharedShaderWords registered_graphics_original(uint64_t address) {

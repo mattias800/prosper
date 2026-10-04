@@ -603,9 +603,7 @@ static bool live_graphics_source_current(DisjointAllocation&& disjoint_allocatio
     const auto disjoint = [&](const prosper::test::BackendGuestProducerOrigins& origins) {
         return !origins.unknown && !origins.allocations.empty() &&
                std::all_of(origins.allocations.begin(), origins.allocations.end(),
-                           [&](const auto& producer) {
-                               return disjoint_allocation(producer);
-                           });
+                           [&](const auto& producer) { return disjoint_allocation(producer); });
     };
     // A recorded, complete producer layout must fit inside its original physical
     // allocation. Exclude that whole allocation, including padding and unselected bytes;
@@ -628,8 +626,7 @@ static bool live_graphics_source_current(DisjointAllocation&& disjoint_allocatio
         if (!image.guest_producer_seen) continue;
         size_t index = 0;
         for (uint64_t base : {key.dr, key.dw, key.sr, key.sw, key.htile}) {
-            if (base && !disjoint_allocation(image.guest_allocations[index]))
-                return false;
+            if (base && !disjoint_allocation(image.guest_allocations[index])) return false;
             ++index;
         }
     }
@@ -639,9 +636,25 @@ static bool live_graphics_source_current(DisjointAllocation&& disjoint_allocatio
 bool live_graphics_raw_source_current(const prosper::GuestMappingLease& lease, uint64_t address,
                                       uint32_t bytes) {
     return live_graphics_source_current([&](const auto& producer) {
-        return prosper::guest_memory_retained_allocation_relation(
-                   lease, address, bytes, producer) ==
+        return prosper::guest_memory_retained_allocation_relation(lease, address, bytes,
+                                                                  producer) ==
                prosper::GuestMemoryTopologyRelation::Disjoint;
+    });
+}
+
+bool live_graphics_raw_allocation_current(const prosper::GuestMappingLease& lease,
+                                          const prosper::GuestDirectAllocation& source) {
+    const auto current =
+        prosper::guest_memory_direct_allocation(lease, source.address, source.minimum_bytes);
+    if (!source.identity || current.identity != source.identity ||
+        current.physical_begin != source.physical_begin ||
+        current.physical_end != source.physical_end || source.physical_begin >= source.physical_end)
+        return false;
+    return live_graphics_source_current([&](const auto& producer) {
+        // Both are original allocation origins, not today's VA resolution or copied intervals.
+        return producer.identity && producer.physical_begin < producer.physical_end &&
+               (source.physical_end <= producer.physical_begin ||
+                producer.physical_end <= source.physical_begin);
     });
 }
 
@@ -665,6 +678,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
     static RttCache& g_rtt = graphics_raw_source_rtt();   // same process-lifetime RTT owner (#167)
     prosper::gpu::set_graphics_producer_status_query(live_graphics_producer_status);
     prosper::gpu::set_graphics_raw_source_authority(live_graphics_raw_source_current);
+    prosper::gpu::set_graphics_raw_allocation_authority(live_graphics_raw_allocation_current);
     // PROSPER_FLIP_GUEST_SCANOUT=1 (default OFF): let a guest FLIP publish the guest's own scanout
     // buffer when the renderer has produced nothing at all.
     //

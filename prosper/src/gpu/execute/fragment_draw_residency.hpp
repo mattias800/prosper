@@ -32,6 +32,15 @@ public:
         return false;
     }
     bool indeterminate() const { return indeterminate_; }
+    bool owns(const std::shared_ptr<const void>& source) const {
+        if (!source) return false;
+        for (const auto& owner : owners_)
+            if (!owner.owner_before(source) && !source.owner_before(owner)) {
+                const auto retained = owner.lock();
+                if (retained && retained.get() == source.get()) return true;
+            }
+        return false;
+    }
 
 private:
     std::array<std::weak_ptr<const void>, 64> owners_{};
@@ -46,6 +55,8 @@ struct FragmentDrawCacheStats {
     // separately counted checked-module entry point may refuse before invoking the driver.
     uint64_t vk_object_create_calls = 0, vk_pipeline_create_calls = 0;
     uint64_t checked_shader_module_calls = 0;
+    // Actual once-per-draw shared resource uploads, not wave count or planned byte estimates.
+    uint64_t scalar_bank_uploads = 0, scalar_bank_payload_bytes = 0;
 };
 inline FragmentDrawCacheStats& fragment_draw_cache_stats() {
     static thread_local FragmentDrawCacheStats stats;

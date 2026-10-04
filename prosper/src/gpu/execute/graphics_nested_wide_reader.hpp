@@ -15,6 +15,7 @@
 
 namespace prosper::gpu {
 struct SrtUse;
+struct FragmentPacketVgprRequirements;
 bool raw_snapshot_storage_extent(const ShaderResource&, uint64_t& bytes);
 // Immutable facts of the full original program, cached alongside its proven x2 chains.
 // Dispatch admission below validates real descriptors, allocations and source authority.
@@ -33,6 +34,7 @@ RawSnapshotWritePlan raw_snapshot_write_plan(const std::vector<Rdna2Inst>&,
 // stability remains required, including normal HLE submit serialization.
 class OrderedGraphicsReadPoint {
     friend struct OrderedGraphicsReadPointIssuer;
+    friend class OrderedScalarBankReadPoint;
     struct Epoch {
         std::atomic<uint64_t> sequence{0};
         std::atomic<bool> active{true};
@@ -41,6 +43,8 @@ class OrderedGraphicsReadPoint {
         uint64_t address;
         std::shared_ptr<const std::vector<uint32_t>> words;
         std::shared_ptr<const std::vector<RawNestedWideChain>> chains;
+        std::shared_ptr<const FragmentPacketVgprRequirements> packet_requirements;
+        bool fragment = false;
     };
     const uint64_t identity_, submit_, order_, failure_generation_;
     const std::vector<Source> sources_;
@@ -56,9 +60,15 @@ class OrderedGraphicsReadPoint {
 public:
     uint64_t identity() const { return identity_; }
     std::shared_ptr<const std::vector<uint32_t>> source(uint64_t address) const;
+    std::shared_ptr<const std::vector<uint32_t>> packet_source(uint64_t address) const;
+    std::shared_ptr<const FragmentPacketVgprRequirements>
+    packet_requirements(uint64_t address) const;
     bool owns_chains(uint64_t address, const std::vector<RawNestedWideChain>& chains) const;
     bool valid_for(uint64_t submit, uint64_t order, uint64_t source_address,
                    const std::shared_ptr<const std::vector<uint32_t>>& source) const;
+    bool valid_for_packet(uint64_t submit, uint64_t order, uint64_t source_address,
+                          const std::shared_ptr<const std::vector<uint32_t>>& source,
+                          const std::shared_ptr<const FragmentPacketVgprRequirements>&) const;
 };
 
 // Supplied only at an ordered draw or compute boundary, after successful synchronous producers and
@@ -82,6 +92,13 @@ using GraphicsRawSourceAuthorityFn = std::function<bool(const prosper::GuestMapp
 void set_graphics_raw_source_authority(GraphicsRawSourceAuthorityFn fn);
 bool graphics_raw_source_is_guest_current(const prosper::GuestMappingLease& lease,
                                           uint64_t address, uint32_t bytes);
+// The bank copies demanded intervals but excludes retained writers over the source's complete
+// original physical allocation, including unmapped/unused tails. This is not a byte-read extent.
+using GraphicsRawAllocationAuthorityFn =
+    std::function<bool(const prosper::GuestMappingLease&, const prosper::GuestDirectAllocation&)>;
+void set_graphics_raw_allocation_authority(GraphicsRawAllocationAuthorityFn fn);
+bool graphics_raw_allocation_is_guest_current(const prosper::GuestMappingLease&,
+                                              const prosper::GuestDirectAllocation&);
 struct GraphicsProducerStatus {
     bool known = false;
     bool pending = true;

@@ -1,4 +1,5 @@
 #include "gpu/execute/fragment_draw_plan.hpp"
+#include "gpu/execute/fragment_scalar_bank.hpp"
 #include <array>
 #include <bit>
 #include <map>
@@ -47,6 +48,17 @@ bool resource_free(const RasterQuadInputs& in) {
     return in.ps_resources.observed && in.ps_resources.table && in.ps_resources.rejection.empty() &&
            in.ps_resources.table->resources.empty() && in.ps_resources.host_backing_owned.empty();
 }
+bool scalar_bank_program(const RasterQuadInputs& in) {
+    return in.vgpr_requirements && in.vgpr_requirements->scalar_reads.has_smem;
+}
+bool canonical_packet_owner(const RasterQuadInputs& in) {
+    return in.raw_code && in.vgpr_requirements &&
+           !in.raw_code.owner_before(in.vgpr_requirements) &&
+           !in.vgpr_requirements.owner_before(in.raw_code) &&
+           in.vgpr_requirements->source_words == in.raw_code.get() &&
+           in.vgpr_requirements->masks.source_words == in.raw_code.get() &&
+           in.vgpr_requirements->scalar_reads.source_words == in.raw_code.get();
+}
 // Replay currently has one complete uncompressed color event. Other genuine EXP controls are
 // recipe gaps, not corrupt output or a general Architectural EXP restriction. Name the original
 // site BEFORE the broader packing proof can hide the reason behind an entry/composition gap.
@@ -67,15 +79,24 @@ std::optional<uint32_t> attachment_export_recipe_gap(const std::vector<Rdna2Inst
 // full Wave64. Full masks may come from actual dynamic user words; their values are checked at
 // instantiation, never baked into code or inferred from full observed host coverage.
 bool packing_unobservable(const std::vector<Rdna2Inst>& instructions, uint32_t code_words,
-                          uint32_t presence, std::vector<FragmentDrawFullMask>& full_masks) {
+                          uint32_t presence, std::vector<FragmentDrawFullMask>& full_masks,
+                          std::span<const FragmentPacketScalarReadSite> scalar_sites = {}) {
     std::array<std::optional<FragmentDrawMaskWord>, 106> scalars;
+    std::array<bool, 106> scalar_defined{}, scalar_ready{};
     std::array<bool, 256> vectors{};
     for (uint32_t reg = 0; reg < 32; ++reg)
-        if (presence & (uint32_t(1) << reg)) scalars[reg] = FragmentDrawMaskWord{true, reg};
+        if (presence & (uint32_t(1) << reg)) {
+            scalars[reg] = FragmentDrawMaskWord{true, reg};
+            scalar_defined[reg] = scalar_ready[reg] = true;
+        }
     auto word = [&](const Operand& source, const Rdna2Inst& in,
                     bool vector_source) -> std::optional<FragmentDrawMaskWord> {
-        if (source.kind == OperandKind::SGPR && source.value >= 0 && source.value < 106)
-            return scalars[source.value];
+        if (source.kind == OperandKind::SGPR && source.value >= 0 && source.value < 106) {
+            if (!scalar_defined[source.value] || !scalar_ready[source.value]) return {};
+            if (scalars[source.value]) return scalars[source.value];
+            // A completed scalar read defines a value, but not a known full EXEC mask.
+            return vector_source ? std::optional{FragmentDrawMaskWord{}} : std::nullopt;
+        }
         if (source.kind == OperandKind::InlineInt)
             return FragmentDrawMaskWord{false, static_cast<uint32_t>(source.value)};
         if (source.kind == OperandKind::Literal && in.has_literal)
@@ -88,7 +109,13 @@ bool packing_unobservable(const std::vector<Rdna2Inst>& instructions, uint32_t c
             return FragmentDrawMaskWord{};   // definition proof only; never used as a scalar value
         return {};
     };
-    bool exec_defined = false, ended = false;
+    std::optional<std::pair<FragmentDrawMaskWord, FragmentDrawMaskWord>> exec_mask;
+    const auto require_full_exec = [&](uint32_t pc) {
+        if (!exec_mask) return false;
+        full_masks.push_back({pc, exec_mask->first, exec_mask->second});
+        return true;
+    };
+    bool ended = false;
     uint32_t exports = 0;
     for (const auto& in : instructions) {
         if (ended || in.synthetic_terminator || in.has_modifier || in.has_sdwa || in.has_dpp ||
@@ -98,36 +125,59 @@ bool packing_unobservable(const std::vector<Rdna2Inst>& instructions, uint32_t c
             std::optional<FragmentDrawMaskWord> lo, hi;
             if (in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 0 &&
                 in.src[0].value < 105) {
+                if (!scalar_defined[in.src[0].value] || !scalar_defined[in.src[0].value + 1] ||
+                    !scalar_ready[in.src[0].value] || !scalar_ready[in.src[0].value + 1])
+                    return false;
                 lo = scalars[in.src[0].value];
                 hi = scalars[in.src[0].value + 1];
             } else if (in.src[0].kind == OperandKind::InlineInt) {
                 lo = FragmentDrawMaskWord{false, static_cast<uint32_t>(in.src[0].value)};
                 hi = FragmentDrawMaskWord{false, in.src[0].value < 0 ? UINT32_MAX : 0};
-            }
-            if (!lo || !hi) return false;
+            } else
+                return false;
             if (in.dst.kind == OperandKind::SGPR && in.dst.value == 126) {
-                full_masks.push_back({in.pc, *lo, *hi});
-                exec_defined = true;
+                exec_mask = lo && hi ? std::optional{std::pair{*lo, *hi}} : std::nullopt;
             } else if (in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 &&
                        in.dst.value < 105) {
                 scalars[in.dst.value] = lo;
                 scalars[in.dst.value + 1] = hi;
+                scalar_defined[in.dst.value] = scalar_defined[in.dst.value + 1] = true;
+                scalar_ready[in.dst.value] = scalar_ready[in.dst.value + 1] = true;
             } else
                 return false;
         } else if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32 &&
                    in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 && in.dst.value < 106) {
             const auto value = word(in.src[0], in, false);
-            if (!value) return false;
+            if (!value && !(in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 0 &&
+                            in.src[0].value < 106 && scalar_defined[in.src[0].value] &&
+                            scalar_ready[in.src[0].value]))
+                return false;
             scalars[in.dst.value] = value;
-        } else if (in.fmt == Rdna2Format::VOP1 && in.opcode == 1 && exec_defined &&
+            scalar_defined[in.dst.value] = scalar_ready[in.dst.value] = true;
+        } else if (in.fmt == Rdna2Format::SMEM) {
+            const auto site = std::find_if(scalar_sites.begin(), scalar_sites.end(),
+                                           [&](const auto& value) { return value.pc == in.pc; });
+            if (site == scalar_sites.end() || site->opcode != in.opcode ||
+                site->byte_offset != in.literal || in.dst.kind != OperandKind::SGPR ||
+                (site->words != 1 && site->words != 2 && site->words != 4) || in.dst.value < 0 ||
+                uint32_t(in.dst.value) > scalars.size() - site->words)
+                return false;
+            for (uint32_t word = 0; word < site->words; ++word) {
+                const auto reg = in.dst.value + word;
+                scalars[reg].reset();
+                scalar_defined[reg] = true;
+                scalar_ready[reg] = false;
+            }
+        } else if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c && in.simm16 == 0) {
+            scalar_ready = scalar_defined;
+        } else if (in.fmt == Rdna2Format::VOP1 && in.opcode == 1 &&
                    in.dst.kind == OperandKind::VGPR && in.dst.value >= 0 && in.dst.value < 256) {
-            if (!word(in.src[0], in, true)) return false;
+            if (!word(in.src[0], in, true) || !require_full_exec(in.pc)) return false;
             vectors[in.dst.value] =
                 true;   // the retained full-mask requirements cover ALL64 writers
-        } else if (in.fmt == Rdna2Format::EXP && exec_defined && in.exp_target == 0 &&
-                   in.exp_en == 15 && !in.exp_compr && (in.words[0] & (1u << 11)) &&
-                   (in.words[0] & (1u << 12))) {
-            if (++exports != 1) return false;
+        } else if (in.fmt == Rdna2Format::EXP && in.exp_target == 0 && in.exp_en == 15 &&
+                   !in.exp_compr && (in.words[0] & (1u << 11)) && (in.words[0] & (1u << 12))) {
+            if (++exports != 1 || !require_full_exec(in.pc)) return false;
             for (const auto& source : in.src)
                 if (source.kind != OperandKind::VGPR || source.value < 0 || source.value >= 256 ||
                     !vectors[source.value])
@@ -144,8 +194,7 @@ bool packing_unobservable(const std::vector<Rdna2Inst>& instructions, uint32_t c
 std::vector<uint32_t> profile_key(const RasterQuadInputs& in,
                                   const FragmentPacketPreparation& prepared,
                                   FragmentPacketDeviceContract device, uint32_t max_quads) {
-    if (!producing_owner(in, prepared) || !launch_owned(in, prepared) || !resource_free(in) ||
-        !input_free_layout(in))
+    if (!producing_owner(in, prepared) || !launch_owned(in, prepared) || !input_free_layout(in))
         return {};
     std::vector<uint32_t> key{max_quads,
                               prepared.user_sgpr_count,
@@ -160,10 +209,23 @@ std::vector<uint32_t> profile_key(const RasterQuadInputs& in,
                               uint32_t(device.device_identity),
                               uint32_t(device.device_identity >> 32),
                               uint32_t(device.shader_int64_enabled),
-                              uint32_t(device.rgba32_sfloat_sampled)};
-    key.insert(key.end(), in.raw_code->begin(), in.raw_code->end());
+                              uint32_t(device.rgba32_sfloat_sampled),
+                              uint32_t(scalar_bank_program(in)),
+                              uint32_t(!scalar_bank_program(in) && resource_free(in))};
     return key;
 }
+struct SourceProfileKey {
+    std::weak_ptr<const std::vector<uint32_t>> source;
+    const std::vector<uint32_t>* words = nullptr;
+    std::vector<uint32_t> profile;
+    bool operator<(const SourceProfileKey& other) const {
+        if (source.owner_before(other.source)) return true;
+        if (other.source.owner_before(source)) return false;
+        if (words != other.words)
+            return std::less<const std::vector<uint32_t>*>{}(words, other.words);
+        return profile < other.profile;
+    }
+};
 }   // namespace
 
 FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in,
@@ -184,7 +246,14 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
     if (!launch_owned(in, prepared)) return refuse("fragment-draw-original-launch-unavailable");
     if (!device.device_identity || !device.shader_int64_enabled)
         return refuse("fragment-draw-enabled-device-unavailable");
-    if (!resource_free(in)) return refuse("fragment-draw-resource-lease-unimplemented");
+    const bool scalar_bank = scalar_bank_program(in);
+    if (!scalar_bank && !resource_free(in))
+        return refuse("fragment-draw-resource-lease-unimplemented");
+    const auto& scalar_reads = in.vgpr_requirements->scalar_reads;
+    if (scalar_bank &&
+        (scalar_reads.source_words != in.raw_code.get() || !scalar_reads.rejection.empty() ||
+         scalar_reads.sites.empty() || scalar_reads.sites.size() > 64))
+        return refuse("fragment-draw-scalar-bank-original-site-schema-unproved");
     if (!input_free_layout(in))
         return refuse("fragment-draw-parameter-system-entry-recipe-unimplemented");
     result.user_prefix_count = prepared.user_sgpr_count;
@@ -195,7 +264,9 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
         return refuse("fragment-draw-attachment-export-recipe-unimplemented:pc=" +
                       std::to_string(*pc));
     if (!packing_unobservable(instructions, static_cast<uint32_t>(in.raw_code->size()),
-                              result.user_prefix_presence, result.full_masks))
+                              result.user_prefix_presence, result.full_masks,
+                              scalar_bank ? std::span{scalar_reads.sites}
+                                          : std::span<const FragmentPacketScalarReadSite>{}))
         return refuse("fragment-draw-entry-and-composition-recipe-unproved");
     result.collect = build_raster_quad_collector(in, max_quads, result.collector);
     if (result.collect.empty()) {
@@ -205,6 +276,7 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
     if (!result.collector.fields.empty())
         return refuse("fragment-draw-parameter-system-entry-recipe-unimplemented");
     FragmentResourcePacket schema;
+    if (scalar_bank) schema.scalar_bank_sites = scalar_reads.sites;
     auto& invocation = schema.invocation;
     invocation.guest_code = *in.raw_code;
     // This is the code-generation AND completed-consumer policy, selected before the original
@@ -259,16 +331,37 @@ cached_fragment_draw_program(const RasterQuadInputs& in, const FragmentPacketPre
     static thread_local std::map<std::vector<uint32_t>,
                                  std::shared_ptr<const FragmentDrawProgramPlan>>
         cache;
-    auto key = profile_key(in, prepared, device, max_quads);
+    // The canonical immutable owner/profile alias avoids copying or comparing original code on
+    // warm hits. Cold/new generations still join the copied code-only cache; no V#/VA/payload
+    // belongs in either key. Weak aliases cannot keep their own retired generation alive.
+    static thread_local std::map<SourceProfileKey, std::weak_ptr<const FragmentDrawProgramPlan>>
+        aliases;
+    auto profile = profile_key(in, prepared, device, max_quads);
+    const bool canonical = canonical_packet_owner(in);
+    SourceProfileKey alias{in.raw_code, in.raw_code.get(), profile};
+    if (canonical && !profile.empty())
+        if (const auto found = aliases.find(alias); found != aliases.end())
+            if (auto resident = found->second.lock()) {
+                ++fragment_draw_cache_stats().program_hits;
+                return resident;
+            }
+    auto key = std::move(profile);
+    if (!key.empty()) key.insert(key.end(), in.raw_code->begin(), in.raw_code->end());
     if (!key.empty()) {
         const auto found = cache.find(key);
         if (found != cache.end()) {
             found->second->source_generations->remember(in.raw_code);
+            if (canonical) aliases.insert_or_assign(std::move(alias), found->second);
             ++fragment_draw_cache_stats().program_hits;
             return found->second;
         }
     }
     retire_dead_fragment_draw_entries(cache, fragment_draw_cache_stats().program_retired);
+    for (auto item = aliases.begin(); item != aliases.end();)
+        if (item->first.source.expired() || item->second.expired())
+            item = aliases.erase(item);
+        else
+            ++item;
     auto compiled = compile_fragment_draw_program(in, prepared, device, max_quads, diagnostic);
     auto result = std::make_shared<const FragmentDrawProgramPlan>(std::move(compiled));
     if (!key.empty()) {
@@ -276,6 +369,7 @@ cached_fragment_draw_program(const RasterQuadInputs& in, const FragmentPacketPre
         // No cached payload retains its own weakly tracked source owner. Completion leases
         // may outlive retirement without causing recompilation of another live generation.
         cache.emplace(std::move(key), result);
+        if (canonical) aliases.insert_or_assign(std::move(alias), result);
     }
     return result;
 }
@@ -288,8 +382,9 @@ FragmentDrawTransaction instantiate_fragment_draw_transaction(
     if (!program || !program->rejection.empty() || !program->capacity)
         return refuse("fragment-draw-program-unavailable");
     if (!in || !producing_owner(*in, prepared) || !launch_owned(*in, prepared) ||
-        !resource_free(*in) || !input_free_layout(*in) ||
-        *in->raw_code != program->capacity->kernel()->guest_code ||
+        (!program->requires_scalar_bank() && !resource_free(*in)) || !input_free_layout(*in) ||
+        (!(canonical_packet_owner(*in) && program->source_generations->owns(in->raw_code)) &&
+         *in->raw_code != program->capacity->kernel()->guest_code) ||
         prepared.user_sgpr_count != program->user_prefix_count ||
         user_presence(prepared) != program->user_prefix_presence ||
         in->entry.rsrc2 != program->rsrc2 || in->float_mode != program->float_mode ||
@@ -298,6 +393,10 @@ FragmentDrawTransaction instantiate_fragment_draw_transaction(
         return refuse("fragment-draw-producing-profile-mismatch");
     if (!executing_device_identity || executing_device_identity != program->device.device_identity)
         return refuse("fragment-draw-executing-device-mismatch");
+    if (program->requires_scalar_bank() &&
+        (!in->scalar_bank ||
+         !in->scalar_bank->matches(in->raw_code, in->vgpr_requirements, in->entry)))
+        return refuse("fragment-draw-scalar-bank-producing-owner-mismatch");
     if (!width || !height || width > 8192 || height > 8192 || !primitive_count)
         return refuse("fragment-draw-raster-extent-invalid");
     std::array<std::optional<uint32_t>, 32> words;
@@ -331,7 +430,9 @@ FragmentDrawTransaction instantiate_fragment_draw_transaction(
         entry_words[4 + layout.scalar_offsets[index]] = *words[reg];
         entry_words[4 + layout.scalar_available_offsets[index]] = 1;
     }
+    auto bank = program->requires_scalar_bank() ? in->scalar_bank : nullptr;
     return FragmentDrawTransaction(std::move(program), std::move(in), std::move(entry_words), width,
-                                   height, primitive_count, executing_device_identity);
+                                   height, primitive_count, executing_device_identity,
+                                   std::move(bank));
 }
 }   // namespace prosper::gpu

@@ -68,6 +68,7 @@ void PacketResourceServices::begin(SpirvCompute& b) {
                                                 : 0));   // MUST proof protects every read
     for (uint32_t image = 0; image < input.images.size(); ++image)
         b.declare_texture(16 + image, Dim_2D, false, false, false);
+    if (!input.scalar_bank_sites.empty()) begin_scalar_bank(b);
 }
 
 void PacketResourceServices::fail(SpirvCompute& b, uint32_t condition, uint32_t pc,
@@ -94,6 +95,7 @@ int PacketResourceServices::emit(SpirvCompute& b, RegState& state, const Rdna2In
     }
     if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c) return 1;
     if (in.fmt == Rdna2Format::SMEM) {
+        if (!input.scalar_bank_sites.empty()) return emit_scalar_bank_load(b, state, in);
         const auto found = std::find_if(input.buffers.begin(), input.buffers.end(),
             [&](const auto& resource) { return resource.pc == in.pc; });
         if (found == input.buffers.end()) return -1;
