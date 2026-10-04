@@ -1,4 +1,5 @@
 #include "gpu/recompiler/fragment_packet_services.hpp"
+#include "gpu/recompiler/rdna2_waitcnt.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include <bitset>
 #include <tuple>
@@ -101,7 +102,7 @@ const char* packet_resource_instruction_gap(const Rdna2Inst& in) {
         return in.src[0].kind == OperandKind::SGPR || in.src[0].kind == OperandKind::InlineInt ||
                in.src[0].kind == OperandKind::Literal ? nullptr : "packet-m0-writer-form-unimplemented";
     if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c)
-        return in.simm16 == 0 ? nullptr : "packet-waitcnt-nonzero-unimplemented";
+        return rdna2_waitcnt_execution_gap(uint16_t(in.simm16));
     return "packet-resource-instruction-unimplemented";
 }
 
@@ -224,7 +225,9 @@ const char* packet_resource_preflight(const FragmentResourcePacket& packet,
         if (!reachable[i]) continue;
         auto pending = entry[i];
         if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c) {
-            pending.scalar.reset(); pending.vector.reset();
+            const auto wait = decode_rdna2_waitcnt(uint16_t(in.simm16));
+            if (wait.drains_scalar_reads()) pending.scalar.reset();
+            if (wait.drains_vector_reads()) pending.vector.reset();
         } else {
             for (uint32_t source = 0; source < in.n_src; ++source) {
                 if (in.fmt == Rdna2Format::EXP &&

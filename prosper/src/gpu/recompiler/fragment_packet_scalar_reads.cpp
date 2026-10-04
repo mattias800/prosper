@@ -1,6 +1,7 @@
 #include "gpu/recompiler/fragment_packet_scalar_reads.hpp"
 #include "gpu/recompiler/fragment_packet_services.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_waitcnt.hpp"
 #include <algorithm>
 
 namespace prosper::gpu {
@@ -25,7 +26,7 @@ bool known_effects(const Rdna2Inst& in) {
         case Rdna2Format::SOPC: return in.opcode <= 0x13;
         case Rdna2Format::SOPP:
             return in.opcode == 0 || (in.opcode == 1 && in.is_end) ||
-                   (in.opcode == 0x0c && in.simm16 == 0);
+                   (in.opcode == 0x0c && rdna2_waitcnt_effects_known(uint16_t(in.simm16)));
         case Rdna2Format::VOP1:
             return in.opcode == 1 || in.opcode == 2 || in.opcode == 0x2a || in.opcode == 0x2e ||
                    in.opcode == 0x33;
