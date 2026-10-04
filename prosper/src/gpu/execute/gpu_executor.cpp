@@ -6994,6 +6994,12 @@ OwnedSnapshotNeeds owned_snapshot_needs(const GpuState& state,
     }
     return needs;
 }
+
+bool owned_snapshot_futile(const GpuState& state, const OwnedSnapshotNeeds& needs) {
+    if (PROSPER_ENV_ON("PROSPER_OWNED_WAVE_ALWAYS_FLUSH")) return false;   // A/B control arm
+    return !needs.other && (needs.vertex_waves || needs.fragment_waves) &&
+           owned_wave_draw_state_refusal(state, needs.fragment_waves) != nullptr;
+}
 }   // namespace
 
 bool draw_requires_owned_nested_snapshot(const GpuState& state,
@@ -7005,10 +7011,7 @@ bool draw_requires_owned_nested_snapshot(const GpuState& state,
 bool owned_nested_snapshot_is_futile(const GpuState& state,
                                      const OrderedScalarBankReadPoint* captured,
                                      uint64_t command_order) {
-    if (PROSPER_ENV_ON("PROSPER_OWNED_WAVE_ALWAYS_FLUSH")) return false;   // A/B control arm
-    const auto needs = owned_snapshot_needs(state, captured, command_order);
-    return !needs.other && (needs.vertex_waves || needs.fragment_waves) &&
-           owned_wave_draw_state_refusal(state, needs.fragment_waves) != nullptr;
+    return owned_snapshot_futile(state, owned_snapshot_needs(state, captured, command_order));
 }
 
 std::shared_ptr<ShaderResourceTable>
@@ -11655,17 +11658,18 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                         ? prepare_ordered_scalar_draw(read_points, submit_no,
                                                       operation.command_order, read_state, span)
                         : OrderedScalarDrawInputs{};
-                const bool nested_inputs = draw_requires_owned_nested_snapshot(
+                const OwnedSnapshotNeeds snapshot_needs = owned_snapshot_needs(
                     read_state, scalar_inputs.point.get(), operation.command_order);
+                const bool nested_inputs = snapshot_needs.any();
                 GraphicsRawSnapshotContext raw_context;
-                // A draw whose owned waves are already refused by register state cannot use the
-                // publication, so it keeps producers_complete=false and skips the authoritative
+                // A draw whose owned waves register state already refuses gains nothing from the
+                // publication: it keeps producers_complete=false and skips the authoritative
                 // readback of every prior target -- on GTA V's bank scene ~22 MiB per such draw.
-                // Realization still runs and refuses with the same state reason (#4270 follow-up).
+                // Realization runs as before. The stage check reads es_addr like the predicate
+                // above; for a fused front realization compiles another program, but issue()
+                // refuses fused fronts, so producers_complete was false on that path already.
                 const bool futile_snapshot =
-                    nested_inputs && owned_nested_snapshot_is_futile(
-                                         read_state, scalar_inputs.point.get(),
-                                         operation.command_order);
+                    nested_inputs && owned_snapshot_futile(read_state, snapshot_needs);
                 if (nested_inputs && !futile_snapshot) {
                     // Prior render spans must publish before folding a pointer or child. Retained
                     // images remain excluded by the physical-alias-aware raw authority provider.

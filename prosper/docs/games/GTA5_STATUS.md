@@ -5325,7 +5325,8 @@ falsification.
   2026-10-03/04 cohorts came from host conditions or unmatched windows, not code** — falsified on
   2026-10-04 by matched rebuilds: same route bytes, visible `prosper-app` window,
   `--present-mode immediate`, async OFF, 1024/8192/2048 MiB × 256, fresh state, one arm at a time
-  through `measure.sh`, with the Performance menu and bank/HUD frames inspected in every arm.
+  under the shared GPU measurement lock, with the Performance menu and bank/HUD frames inspected
+  in every arm.
   Bank-regime presented rate: 366f0854 **9.56**, #4270's parent 25b16b58 **8.89**, #4270
   (3650263d) **3.03**, main 54d63d38 **2.90**. The cause is #4270, in two parts, both fixed in
   PR #4421. (1) `graphics_program_requires_owned_waves()` re-walked the shader and re-ran the

@@ -549,10 +549,13 @@ TEST_P(OwnedGraphicsWaveLive, OwnedWaveClassificationMatchesFullStreamDerivation
                 EXPECT_EQ(graphics_program_requires_owned_waves(address), per_wave)
                     << (vertex ? "vertex" : "fragment") << " query " << query;
         }
-    // Counter-arm: the same registered address rewritten from plain to per-wave code. A
-    // classification keyed on the address alone would keep answering false here.
-    const auto plain = fragment_code(false, GetParam());
+    // Counter-arm: the same registered address rewritten from plain to per-wave code, padded to
+    // the same size. A classification keyed on the address -- or on address plus size -- would
+    // keep answering false here; only the byte comparison sees the rewrite.
+    auto plain = fragment_code(false, GetParam());
     const auto owned = fragment_code(true, GetParam());
+    ASSERT_LT(plain.size(), owned.size());
+    plain.resize(owned.size(), 0u);   // dead words after s_endpgm
     auto* program = register_program(false, plain);
     ASSERT_NE(program, nullptr);
     const uint64_t address = reinterpret_cast<uint64_t>(program->code.data());
@@ -600,6 +603,21 @@ TEST_P(OwnedGraphicsWaveLive, StateRefusedOwnedWavesSkipThePublication) {
     EXPECT_TRUE(owned_nested_snapshot_is_futile(metadata, nullptr, 0));
     EXPECT_EQ(refusal(metadata), "draw-wave-output-metadata-extent-unavailable")
         << "the state refusal must win over the unpublished-producer refusal";
+
+    // Only an owned FRAGMENT stage is refused by the fragment launch. An owned vertex stage with
+    // a plain PS whose launch word is missing must keep its publication: it may be admitted.
+    auto* owned_vs = register_program(true, vertex_code(true, GetParam()));
+    auto* plain_fs = register_program(false, fragment_code(false, GetParam()));
+    ASSERT_NE(owned_vs, nullptr);
+    ASSERT_NE(plain_fs, nullptr);
+    auto vertex_only = state(*owned_vs, *plain_fs, true);
+    vertex_only.sh.erase(P::SPI_SHADER_PGM_RSRC1_PS);
+    ASSERT_TRUE(draw_requires_owned_nested_snapshot(vertex_only));
+    ASSERT_NE(owned_wave_draw_state_refusal(vertex_only, true), nullptr)
+        << "fixture: the fragment launch refusal must be armed for this arm to discriminate";
+    EXPECT_EQ(owned_wave_draw_state_refusal(vertex_only, false), nullptr);
+    EXPECT_FALSE(owned_nested_snapshot_is_futile(vertex_only, nullptr, 0))
+        << "a vertex-only owned draw is not refused by the fragment launch";
 
     // A plain pair needs no snapshot at all, so there is nothing to call futile.
     auto* plain_vs = register_program(true, vertex_code(false, GetParam()));
