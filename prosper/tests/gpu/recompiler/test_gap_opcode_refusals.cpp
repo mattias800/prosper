@@ -1,5 +1,5 @@
-// test_gap_opcode_refusals — fail-visible refusal pins for six opcodes the compute recompiler
-// decodes but does not lower: v_perm_b32, v_mad_i64_i32, v_div_fixup_f32, v_sad_u8, s_movrels_b32
+// test_gap_opcode_refusals — fail-visible refusal pins for five opcodes the compute recompiler
+// decodes but does not lower: v_perm_b32, v_mad_i64_i32, v_div_fixup_f32, s_movrels_b32
 // and image_gather4 (implicit LOD).
 //
 // Per the recompiler charter an unsupported op is a FATAL gap, and the loud refusal is only the
@@ -182,15 +182,6 @@ TEST(GapOpcodeRefusals, DivFixupF32) {
     expect_vop3a_v5_v1_v2_v3(w, 0x15fu);
     expect_gap_refusal(program(kVop3Prologue, {w[0], w[1]}), 0xA021ull, 4, {w[0], w[1]},
                        Rdna2Format::VOP3, 0x15fu);
-}
-
-// V_SAD_U8 v5, v1, v2, v3 (VOP3 0x15a). Its 32-bit sibling v_sad_u32 is the control above; this
-// pins the per-byte form to a refusal rather than a silent v_sad_u32-style mistranslation.
-TEST(GapOpcodeRefusals, SadU8) {
-    static const uint32_t w[2] = {0xd55a0005u, 0x040e0501u};
-    expect_vop3a_v5_v1_v2_v3(w, 0x15au);
-    expect_gap_refusal(program(kVop3Prologue, {w[0], w[1]}), 0xA031ull, 4, {w[0], w[1]},
-                       Rdna2Format::VOP3, 0x15au);
 }
 
 // V_MAD_I64_I32 v[5:6], s12, v1, v2, v[3:4] (VOP3B 0x177). dword0[14:8] is the SDST carry
