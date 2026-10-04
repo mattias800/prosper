@@ -11,7 +11,8 @@ again before resuming, because this document deliberately records a dated state.
 
 **Latest steering:** the owner confirms manual Cross input in Evergate OFF and Messenger earlier.
 Messenger's exact earlier run/source/arm is unbound. Retained native images and visual judgments
-remain useful, but no Messenger/Evergate run is claimed as proof of autonomous route progression.
+remain useful. The first logged Evergate calibration below reached a real tutorial checkpoint;
+fresh replay remains pending, so reproducible autonomous progression is not yet established.
 Performance measurements must use a verified scripted route and matching admitted scenes;
 explicitly selected splash/title populations must stay separate from in-level gameplay.
 
@@ -205,10 +206,10 @@ The private OFF archive was actually verified and fsynced: **38,318,080 bytes**,
 members**, zero mismatches; SHA256
 **c1b1d7a6921630cf0622f7b9d983f298ddc30828ac022361ffa3184742008cc8**.
 The later manual-input disclosure is retained as a separate supplement to that dated snapshot.
-The next step is **input-route calibration**, before an Evergate OFF/ON comparison: log scripted
+The next step was **input-route calibration**, before an Evergate OFF/ON comparison: log scripted
 presses and record the resulting successful-pad-read input stream. The proposed current-title
-route below is unrun at this commit; it holds each Cross for 0.5s and starts after the actually
-observed title-prompt ordinal. It is experimental data, not a committed shipping route or a
+route below was unrun at the preceding checkpoint and has now run as recorded below. It holds
+each Cross for 0.5 s and starts after the actually observed title-prompt ordinal. It is experimental data, not a committed shipping route or a
 qualified performance control. The owned producing checkout and actual app remain unchanged.
 
 ```text
@@ -235,6 +236,59 @@ Proposed bounded controls are230s, requested snapshots500/900/1800/7000/9500,
 `PROSPER_PAD_SCRIPT_LOG=1` and `PROSPER_PAD_RECORD_AXIS=pad-read`. Record the actual route/record
 bytes, all input transitions, native phases and missing observations before admitting this route.
 Do not merely extend the deadline or count the initial Evergate calibration as a completed pair.
+
+## Evergate scripted calibration: menu and actual tutorial reached, replay pending
+
+The unchanged route above ran on the same qualified ee9dcb1e app for **230.548 s**, deferred waits
+OFF. Root inspected all four retained native captures: title prompt at 500, selectable Begin/Options
+at 900, Stone Lantern publisher ident at 1800, and **Ki in the white-terrain/crimson first tutorial
+room with HOLD X TO JUMP HIGHER at 7000**. The latter matches the first-gameplay checkpoint in
+`prosper/scripts/evergate/README.md`; the publisher ident is not gameplay. Requested 9500 was
+unreached. Only one actual gameplay image exists, so the required second image and Evergate's
+complete visual OFF/ON pair remain **NO_DATA**. No controlled movement was demonstrated.
+
+The script log contains neutral initialization and all twelve Cross press/release pairs. The
+first press occurred at pad-relative flip 700, successful read 698, elapsed 15.111 s; the final release
+was at flip 4015/read 4013, elapsed 106.411 s. Successful-pad-read recording of the **final composed
+SDL plus scripted input** contains exactly twelve Cross intervals whose endpoints match those
+logged transitions, with no extra recorded nonneutral interval. Its SHA256 is
+**8a778e7b2138bbe9124fa4d36ead7a989b16567ff4bf411500ba5229178fba0b**.
+This supports the scripted progression observed in this run, but cannot distinguish a human
+holding the same Cross during an already scripted Cross interval. A fresh replay remains necessary
+before using the route as a reproducible measurement control. Earlier manually assisted runs
+retain their original labels; their navigation is not retrospectively attributed to this route.
+
+App, runner and launcher exited **0** and all owned births drained; the post-run prosper-app census
+was empty. There were 23 owned normal-window samples, one startup not-yet-viewable sample and an
+owned before-cutoff sample. Every emitted alarm and exit record was read. The 45 completed windows
+recorded **5930 frontend-unresolved fragment draws**, also 5930 Wave64 refusal uses across 37/45
+windows beginning 45 s; F32 arithmetic 45/45 and one new unimplemented HLE NID at 30 s. Contract/backend
+draw losses, skipped dispatches, deferred submissions and target evictions were zero. Graphics
+device timestamps covered 37714/37714 waits; RTT-colorless-publication remains **NO_DATA**. The
+separate backend draw snapshot has unverified quiescence and does not cancel frontend losses.
+No graphics submission-failure record was emitted. Raw refused fragment bytes remain private.
+
+The completed private supplement `root-ee9d-Evergate-input-calibration-checkpoint-20261004-v1`
+was verified and fsynced: **53,186,560 bytes**, **1712 regular members**, zero mismatches;
+archive SHA256 **877516e18989820801ed96f919d238a818e21b8ef2b4afbf8abd3f88c73a2e4c**.
+The original manually assisted OFF archive remains intact. Next: repeat fresh OFF with the exact
+same route and 230 s ceiling, requesting 7000 and 7300 instead of the unreached 9500, then corresponding
+ON. Inspect the actual menu, two Ki/tutorial frames and final input records in each arm. This is
+compatibility calibration, not a performance population or grounds for changing defaults.
+
+## Input control required for performance admission
+
+Every timed arm must carry the exact scripted route bytes/hash and input trace, source/app identity,
+fresh save/cache policy, declared scene and interval, native phase checks, and alarms/loss counters.
+Use the same verified sequence and scene definition in both arms; equal requested ordinals alone
+do not prove equal state. Check actual gameplay before admitting in-level populations, and retain
+explicit splash/title measurements separately when those are the intended performance problem.
+
+Owner play is useful interactive compatibility evidence. Unexpected manual input or a route that
+needs manual rescue disqualifies an arm from a controlled A/B; preserve its artifacts and repeat
+the affected arm with calibrated controls. A missing or unmatched phase remains NO_DATA, never a
+title-screen substitute for gameplay. Manual GRIS and candidates with no verified gamepad sequence
+can contribute visual observations; timed comparisons require a reproducible scripted route first.
 
 ## Retained app/source cohorts
 
@@ -383,9 +437,10 @@ documented manual normal route; do not substitute the old automated gris-gamepla
 Compatibility captures disable automatic F8. Performance capture runs have a separate protocol.
 
 For each arm, inspect a real selectable menu and at least two actual gameplay images, with HUD
-where the game has one. GRIS has no conventional HUD. Logos, narration, movies, results, game-over
-screens and tutorial-only images do not establish the intended playable phase. Retain a wrong or
-unreached checkpoint as NO_DATA/HOLD and calibrate the smallest needed selector/route adjustment;
+where the game has one. GRIS has no conventional HUD. Evergate's Ki/tutorial room is the documented
+first-gameplay checkpoint; a standalone tutorial card or publisher ident is not that room. Logos,
+narration, movies, results and game-over screens do not establish the intended playable phase.
+Retain a wrong or unreached checkpoint as NO_DATA/HOLD and calibrate the smallest needed selector/route adjustment;
 do not silently extend a deadline or treat a historical ordinal as a current oracle. Cobra's
 historical sky seam/HUD/partial-model rendering HOLD remains a hold until current images resolve it.
 
@@ -408,7 +463,10 @@ historical sky seam/HUD/partial-model rendering HOLD remains a hold until curren
 4. Keep normal GCC Release, real SDL audio/pad, FFmpeg/VAAPI and diagnostics-OFF settings. Do not
    disable the newly merged scalar-bank route, use a synthetic backend, or turn a failed/pending
    result into a passing manifest. Preserve the initial failed 70-case cohort and old apps.
-5. Messenger OFF/ON is complete on ee9dcb1e. For Evergate next, qualify fresh native desktop/env/window
+5. Messenger OFF/ON visual evidence is complete on ee9dcb1e; scripted progression still needs
+   verification before performance use. Evergate's first new route calibration reached the menu
+   and one Ki/tutorial frame. Replay unchanged OFF for 230 s at 7000/7300, then ON, checking the final
+   input record and two actual gameplay frames. Qualify fresh native desktop/env/window
    binding and bind the exact reviewed helper hashes and actual app/source. The 3fe preparation contains inert
    candidate data only: no app qualification, executable grant or completed current guard.
 6. Continue the fourteen-title pairs above, recording native menu/gameplay/HUD judgments,
@@ -454,8 +512,9 @@ historical sky seam/HUD/partial-model rendering HOLD remains a hold until curren
   planned; #4331 already received one inactivity check-in. Leave them open.
 - The incoming author, independent reviewer and builder completed #4382 and are parked. Other
   CPU/Outer-Wilds lanes were already parked; Silent Hill was asked to finish its existing historical
-  result handoff and park. No new large jobs, game arms or app qualification were started after
-  the owner's quota-checkpoint request.
+  result handoff and park. Subsequent owner authorization allowed the app qualification and small
+  visible compatibility follow-ups recorded above. No new subagent or large implementation job
+  was started during those follow-ups.
 - Keep builds on the RAM drive while working, monitor available RAM, temporary storage and container quota, and
   remove only owned obsolete builds/worktrees **after verified durable recovery**. Shared SDL
   build/source dependencies have protected consumers; never delete them as blanket tmp cleanup.
