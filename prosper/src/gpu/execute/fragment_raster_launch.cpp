@@ -92,7 +92,8 @@ bool fragment_raster_pending_original(const GpuState& state, const RasterLaunchF
     if (count > 32) return false;
     uint32_t presence = 0;
     for (uint32_t reg = 0; reg < count; ++reg)
-        if (state.sh.contains(P::SPI_SHADER_USER_DATA_PS_0 + reg)) presence |= 1u << reg;
+        if (state.sh.find(P::SPI_SHADER_USER_DATA_PS_0 + reg) != state.sh.end())
+            presence |= 1u << reg;
     const auto raw = shader_analysis_owned_words(analysis);
     if (!raw || raw->empty() || raw->size() > 4096) return false;
     using Key = std::tuple<const std::vector<uint32_t>*, uint32_t, uint32_t, uint32_t>;
