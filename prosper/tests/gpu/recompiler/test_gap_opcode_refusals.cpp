@@ -285,6 +285,8 @@ TEST(GapOpcodeRefusals, ImageGather4) {
     EXPECT_TRUE(
         compile(program(prologue, {control[0], control[1]}), 0xA052ull, nullptr, config).empty())
         << "control without a resource table must refuse, or the table is not load-bearing";
-    expect_gap_refusal(program(prologue, {w[0], w[1]}), 0xA051ull, 2, {w[0], w[1]},
-                       Rdna2Format::MIMG, 0x40u, &rt, config);
+    expect_compiles(program(prologue, {w[0], w[1]}), 0xA051ull,
+                    "image_gather4 with the texture table", &rt, config);
+    EXPECT_TRUE(compile(program(prologue, {w[0], w[1]}), 0xA053ull, nullptr, config).empty())
+        << "image_gather4 without a resource table must refuse, or the table is not load-bearing";
 }

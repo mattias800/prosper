@@ -8395,7 +8395,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool is_zero_mip_load = in.opcode == 0x01;
             const bool is_load = in.opcode == 0x00 || is_zero_mip_load;
             const bool is_sample_l = (in.opcode == 0x24), is_sample_lz = (in.opcode == 0x27);
-            const bool is_sample_b = (in.opcode == 0x25), is_gather_lz = (in.opcode == 0x47);
+            const bool is_sample_b = (in.opcode == 0x25),
+                       is_gather_lz = (in.opcode == 0x47 || in.opcode == 0x40);
             const bool is_sample_c_lz = (in.opcode == 0x2f);
             // image_gather4_lz_o = 0x57 (gather at base level with the _o packed-offset operand in the
             // FIRST vaddr — llvm-mc gfx1030 round-trip on live DOLL bytes: 0xf15c0808 "image_gather4_lz_o
