@@ -97,7 +97,15 @@ TEST_F(FenceBuildJournal, ReadableZeroIsAvailable) {
 }
 TEST_F(FenceBuildJournal, UnmappedLabelDoesNotFault) {
     const auto unmapped = address(base);
+#ifdef _WIN32
+    // Releasing would let the next allocation in this process (the CRT heap, a lazily initialised
+    // lock) be placed at this address, which then reads as zero-filled live memory: the Windows CI
+    // runner read pre=0 here after MEM_RELEASE. Decommitting leaves the range reserved, so it has no
+    // backing AND cannot be handed out again; TearDown still releases the reservation.
+    ASSERT_TRUE(VirtualFree(base, 2 * page, MEM_DECOMMIT));
+#else
     release();
+#endif
     fence_build_journal_record(packet, unmapped, 12, 3);
     expect_missing(packet);
 }
