@@ -558,6 +558,7 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
   They preserve the task's existing authorization, resource coordination and machine-local rules.
 - **Python:** behavior changes need meaningful regression coverage, reusing applicable tests;
   document mechanical scope and execution limits. New `.py` files need a purpose docstring;
+  new Python tests must use pytest (CI enforces the policy; ctest `pytest_policy` checks its selftests; legacy tests are allowlisted);
   ruff is gated on changed files only (`pyproject.toml`, uv).
   `prosper/tools/ci/AGENTS.md` § Python rule.
 - **Verification is agentic-first / programmatic** (`docs/process/VERIFICATION.md`): ctest exit code is truth

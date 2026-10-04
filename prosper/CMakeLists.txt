@@ -492,6 +492,10 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME gtest_policy
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_gtest_policy.py"
                    --selftest)
+  # New Python tests must use pytest conventions; legacy tests are allowlisted.
+  add_test(NAME pytest_policy
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_pytest_policy.py"
+                   --selftest)
   add_test(NAME ctest_gate_checker
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/check_ctest_gate.py"
                    --selftest)
