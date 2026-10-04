@@ -6,6 +6,7 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/storage_dst_sel.hpp"
+#include "gpu/recompiler/rdna2_dot.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
 #include "gpu/recompiler/rdna2_sad.hpp"
 #include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#325)
@@ -2775,6 +2776,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t hi = b.ibin(Op_ShiftLeftLogical, b.pack_half_lo(operation(true)), b.uconst(16));
                 rs.vreg[in.dst.value] = b.ibin(Op_BitwiseOr, lo, hi);
                 predicate_write(b, rs, in.dst.value, old_d);
+                return true;
+            }
+            if (in.opcode >= 0x14u && in.opcode <= 0x19u) {
+                const uint32_t old_d = vreg_old(b, rs, in.dst.value);
+                rs.vreg[in.dst.value] = emit_v_dot(b, rs, in, ok);
+                if (ok) predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
             // Mixed-precision FMA family, trivial form only (all sources full f32 — the decoder set
