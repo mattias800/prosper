@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include <gtest/gtest.h>
 
@@ -53,7 +54,8 @@ uint64_t open_socket() {
     HleFn fn = Hle::lookup(kSocket);
     EXPECT_NE(fn, nullptr) << "sceNetSocket registered (kills: unregistered NID -> dispatch 0)";
     if (!fn) return 0;
-    const uint64_t fd = fn(2, 1, 0, 0, 0, 0);  // AF_INET, SOCK_STREAM
+    // sceNetSocket(name, family, type, protocol): the first argument is a debug-name string.
+    const uint64_t fd = fn((uint64_t)"prosper-test", 2, 1, 0, 0, 0);   // AF_INET, SOCK_STREAM
     EXPECT_GT((int64_t)fd, 0) << "socket id is positive, never the dispatcher 0";
     return fd;
 }
@@ -109,10 +111,28 @@ TEST(NetSocket, Lifecycle) {
     EXPECT_EQ(Hle::lookup(kSocketClose)(0, 0, 0, 0, 0, 0), kBadF)
         << "close(0) is EBADF: 0 was never a socket (kills: success-on-garbage)";
     // Kills: an id-returning error that is zero-extended -- reads as a handle in int64.
-    const uint64_t bad = Hle::lookup(kSocket)(99, 1, 0, 0, 0, 0);
+    const uint64_t bad = Hle::lookup(kSocket)((uint64_t)"t", 99, 1, 0, 0, 0);
     EXPECT_LT((int64_t)bad, 0) << "bad-domain socket answers negative in int64 too";
-    EXPECT_EQ((uint32_t)bad, net::kNetErrorOpNotSupp) << "bad domain is EOPNOTSUPP";
+    EXPECT_EQ((uint32_t)bad, net::kNetErrorAfNoSupport) << "bad family is EAFNOSUPPORT";
     EXPECT_NE(bad, 0u) << "an id-returning failure is never the dispatcher 0";
+    EXPECT_EQ((uint32_t)Hle::lookup(kSocket)((uint64_t)"t", 2, 5, 0, 0, 0),
+              net::kNetErrorOpNotSupp)
+        << "unmodelled socket type is refused";
+}
+
+TEST(NetSocket, SocketTakesANameFirst) {
+    // sceNetSocket(const char* name, int family, int type, int protocol) -- module entry 0x7330
+    // keeps rdi as a pointer and esi/edx/ecx as the triple. Kills: reading the family from arg0.
+    register_builtin_hle();
+    HleFn fn = Hle::lookup(kSocket);
+    ASSERT_NE(fn, nullptr);
+    static const char kName[] = "unity-player-connection";
+    const uint64_t fd = fn((uint64_t)kName, 2, 1, 6, 0, 0);   // AF_INET, SOCK_STREAM, TCP
+    EXPECT_GT((int64_t)fd, 0) << "a real name pointer in arg0 still yields a socket id";
+    close_socket(fd);
+    // The old (family, type, protocol) layout puts AF_INET's 2 where the type goes: refused.
+    EXPECT_LT((int64_t)fn(2, 1, 0, 0, 0, 0), 0)
+        << "(family, type, protocol) without a name is not the contract";
 }
 
 TEST(NetSocket, OfflineFailure) {
@@ -184,10 +204,12 @@ TEST(NetSocket, ErrnoLocTracksFailures) {
     ASSERT_NE(loc, nullptr) << "sceNetErrnoLoc registered";
     const uint64_t p = loc(0, 0, 0, 0, 0, 0);
     EXPECT_NE(p, 0u) << "errno location is never NULL (kills: zero-extended failure)";
+    // A successful call never writes errno (module: the success paths skip the store).
+    *reinterpret_cast<int32_t*>(p) = 77;
     const uint64_t fd = open_socket();
     ASSERT_GT((int64_t)fd, 0);
-    EXPECT_EQ(*reinterpret_cast<int32_t*>(p), 0)
-        << "fresh socket leaves errno clear (kills: stale errno slot)";
+    EXPECT_EQ(*reinterpret_cast<int32_t*>(p), 77)
+        << "a successful socket() leaves errno as it was (kills: clearing errno on success)";
     Hle::lookup(kConnect)(fd, 0, 0, 0, 0, 0);
     EXPECT_EQ(*reinterpret_cast<int32_t*>(p), 51)
         << "failed connect records ENETUNREACH (51) where the guest reads errno";
@@ -196,26 +218,83 @@ TEST(NetSocket, ErrnoLocTracksFailures) {
 
 TEST(NetSocket, InetConvert) {
     register_builtin_hle();
+    HleFn pton = Hle::lookup(kInetPton), ntop = Hle::lookup(kInetNtop);
+    const auto err = [] {
+        return *reinterpret_cast<int32_t*>(Hle::lookup(kErrnoLoc)(0, 0, 0, 0, 0, 0));
+    };
     uint8_t addr[4] = {0};
-    EXPECT_EQ(Hle::lookup(kInetPton)(2, (uint64_t)"192.168.1.1", (uint64_t)addr, 0, 0, 0), 1u)
+    EXPECT_EQ(pton(2, (uint64_t)"192.168.1.1", (uint64_t)addr, 0, 0, 0), 1u)
         << "AF_INET dotted-decimal parses (kills: unimplemented helper)";
     EXPECT_EQ(addr[0], 192) << "pton writes network-order bytes";
     EXPECT_EQ(addr[1], 168) << "pton writes network-order bytes";
     EXPECT_EQ(addr[2], 1) << "pton writes network-order bytes";
     EXPECT_EQ(addr[3], 1) << "pton writes network-order bytes";
-    EXPECT_EQ(Hle::lookup(kInetPton)(2, (uint64_t)"999.1.1.1", (uint64_t)addr, 0, 0, 0), 0u)
+    EXPECT_EQ(pton(2, (uint64_t)"999.1.1.1", (uint64_t)addr, 0, 0, 0), 0u)
         << "out-of-range part is bad text, not a fill (kills: blind success)";
-    EXPECT_EQ(Hle::lookup(kInetPton)(2, (uint64_t)"1.2.3", (uint64_t)addr, 0, 0, 0), 0u)
-        << "three parts is bad text";
-    char text[16] = {0};
+    EXPECT_EQ(pton(2, (uint64_t)"1.2.3", (uint64_t)addr, 0, 0, 0), 0u) << "three parts is bad text";
+    EXPECT_EQ((uint32_t)pton(99, (uint64_t)"1.2.3.4", (uint64_t)addr, 0, 0, 0),
+              net::kNetErrorAfNoSupport)
+        << "unknown family is EAFNOSUPPORT, not EINVAL (module 0x6aa0)";
+    EXPECT_EQ(err(), 47) << "pton records EAFNOSUPPORT (47)";
+
+    char text[16];
     const uint8_t src[4] = {10, 0, 0, 1};
-    EXPECT_EQ(Hle::lookup(kInetNtop)(2, (uint64_t)src, (uint64_t)text, 16, 0, 0), (uint64_t)text)
+    EXPECT_EQ(ntop(2, (uint64_t)src, (uint64_t)text, 16, 0, 0), (uint64_t)text)
         << "ntop returns dst on success";
     EXPECT_STREQ(text, "10.0.0.1") << "ntop emits dotted-decimal";
-    EXPECT_EQ(Hle::lookup(kInetNtop)(2, (uint64_t)src, (uint64_t)text, 8, 0, 0), 0u)
-        << "short buffer is NULL, not a truncation (kills: silent truncation)";
-    EXPECT_EQ(*reinterpret_cast<int32_t*>(Hle::lookup(kErrnoLoc)(0, 0, 0, 0, 0, 0)), 28)
-        << "short buffer records ENOSPC (28) where the guest reads errno";
-    EXPECT_EQ(Hle::lookup(kInetNtop)(28, (uint64_t)src, (uint64_t)text, 64, 0, 0), 0u)
-        << "AF_INET6 is refused, not fabricated (kills: false v6 rendering)";
+    // Fails only when the text does not fit: "1.2.3.4" + NUL is 8 bytes.
+    const uint8_t small[4] = {1, 2, 3, 4};
+    char eight[8];
+    EXPECT_EQ(ntop(2, (uint64_t)small, (uint64_t)eight, 8, 0, 0), (uint64_t)eight)
+        << "a buffer that holds the text succeeds (kills: a blanket size < 16 refusal)";
+    EXPECT_STREQ(eight, "1.2.3.4");
+    memset(text, 0x5A, sizeof(text));
+    EXPECT_EQ(ntop(2, (uint64_t)src, (uint64_t)text, 8, 0, 0), 0u)
+        << "\"10.0.0.1\" needs 9 bytes: NULL, not a truncation (kills: silent truncation)";
+    EXPECT_EQ(err(), 28) << "short buffer records ENOSPC (28) where the guest reads errno";
+    EXPECT_EQ((unsigned char)text[0], 0x5Au) << "a refused ntop writes nothing";
+    // size is a 32-bit socklen_t: garbage above it must not widen it.
+    EXPECT_EQ(ntop(2, (uint64_t)src, (uint64_t)text, 0xFFFFFFFF00000004ull, 0, 0), 0u)
+        << "upper register bits are ignored (kills: comparing the full 64-bit size)";
+    EXPECT_EQ((unsigned char)text[0], 0x5Au) << "and nothing was written";
+    EXPECT_EQ(ntop(2, (uint64_t)src, 0, 16, 0, 0), 0u) << "null dst is refused";
+    EXPECT_EQ(err(), 28) << "null dst records ENOSPC (module 0x63c0), not EINVAL";
+    EXPECT_EQ(ntop(99, (uint64_t)src, (uint64_t)text, 16, 0, 0), 0u) << "unknown family refused";
+    EXPECT_EQ(err(), 47) << "ntop unknown family records EAFNOSUPPORT (47)";
+}
+
+TEST(NetSocket, Inet6Convert) {
+    // The module supports AF_INET6 (28) both ways; it is offline-computable, so it is implemented.
+    register_builtin_hle();
+    HleFn pton = Hle::lookup(kInetPton), ntop = Hle::lookup(kInetNtop);
+    const auto round_trip = [&](const char* in) {
+        uint8_t a[16];
+        memset(a, 0xEE, sizeof(a));
+        if (pton(28, (uint64_t)in, (uint64_t)a, 0, 0, 0) != 1u) return std::string("<pton failed>");
+        char out[46];
+        if (ntop(28, (uint64_t)a, (uint64_t)out, sizeof(out), 0, 0) != (uint64_t)out)
+            return std::string("<ntop failed>");
+        return std::string(out);
+    };
+    uint8_t a[16];
+    ASSERT_EQ(pton(28, (uint64_t)"2001:db8::1", (uint64_t)a, 0, 0, 0), 1u);
+    const uint8_t want[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    EXPECT_EQ(memcmp(a, want, 16), 0) << "\"::\" expands to the missing zero groups";
+    EXPECT_EQ(round_trip("2001:db8::1"), "2001:db8::1");
+    EXPECT_EQ(round_trip("::"), "::") << "all zeros";
+    EXPECT_EQ(round_trip("::1"), "::1") << "loopback";
+    EXPECT_EQ(round_trip("FE80:0:0:0:0:0:0:1"), "fe80::1") << "lowercase, longest zero run";
+    EXPECT_EQ(round_trip("1:0:0:2:0:0:3:4"), "1::2:0:0:3:4") << "tie: the first run compresses";
+    EXPECT_EQ(round_trip("1:0:2:3:4:5:6:7"), "1:0:2:3:4:5:6:7") << "a single zero group stays";
+    EXPECT_EQ(round_trip("::ffff:1.2.3.4"), "::ffff:1.2.3.4") << "IPv4-mapped keeps dotted tail";
+    EXPECT_EQ(pton(28, (uint64_t)"1::2::3", (uint64_t)a, 0, 0, 0), 0u) << "two \"::\" is bad text";
+    EXPECT_EQ(pton(28, (uint64_t)"12345::1", (uint64_t)a, 0, 0, 0), 0u) << "5-digit group is bad";
+    EXPECT_EQ(pton(28, (uint64_t)"1:2:3:4:5:6:7:8:9", (uint64_t)a, 0, 0, 0), 0u)
+        << "nine groups is bad text";
+    char tiny[4];
+    const uint8_t lo[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    EXPECT_EQ(ntop(28, (uint64_t)lo, (uint64_t)tiny, 3, 0, 0), 0u)
+        << "\"::1\" needs 4 bytes: size 3 is refused";
+    EXPECT_EQ(ntop(28, (uint64_t)lo, (uint64_t)tiny, 4, 0, 0), (uint64_t)tiny) << "size 4 fits";
+    EXPECT_STREQ(tiny, "::1");
 }

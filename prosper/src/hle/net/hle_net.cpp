@@ -10,9 +10,12 @@
 // The split, mirroring hle_http.cpp:
 // - Offline-computable is implemented for real: htonl/htons/ntohl/ntohs/htonll/ntohll are pure
 //   byte swaps (portable shifts, no host headers, so no platform seam is touched), and
-//   sceNetInetPton/sceNetInetNtop compute AF_INET dotted-decimal both ways.
+//   sceNetInetPton/sceNetInetNtop convert AF_INET dotted-decimal and AF_INET6 text both ways
+//   (the shipped module supports both families: pton 0x6aa0, ntop 0x63c0 / v6 at 0x6457).
 // - Socket ids are a real local table (1-based; slot 0 is never handed out, exactly like the HTTP
-//   object table): sceNetSocket allocates, sceNetSocketClose releases. An id-returning entry
+//   object table): sceNetSocket(name, family, type, protocol) allocates -- the first argument is a
+//   debug-name string, as in sceNetPoolCreate (module entry 0x7330 keeps rdi as a pointer and
+//   esi/edx/ecx as the 32-bit triple) -- and sceNetSocketClose releases. An id-returning entry
 //   point sign-extends its error, so a guest reading the answer as int32 OR int64 sees it as
 //   negative and never as a handle.
 // - Everything that would move a packet -- connect, send, recv, bind, listen, accept, socket
@@ -20,15 +23,18 @@
 //   network (net::kNetErrorNetUnreach, the same answer the HTTP send paths give) and leaves every
 //   out-parameter untouched. A bad socket id answers EBADF instead, so use-after-close is also
 //   loud. CONFIDENCE: HIGH on the facility encoding (sce_net_errors.hpp); LOW on each exact errno
-//   choice, which is why every arm names the errno it encodes.
+//   choice, which is why every arm names the errno it encodes. In particular ENETUNREACH is not an
+//   errno a real FreeBSD bind/listen produces (a bind to INADDR_ANY succeeds on an offline
+//   console): it is chosen so the guest takes its error path, not observed.
 // - sceNetErrnoLoc returns the address of a thread-local FreeBSD errno slot that the failing arms
 //   above keep current, so a guest that reads errno after a failed call sees the failure prosper
-//   reported. CONFIDENCE: MED -- per-host-thread is the closest this in-process design gets to the
+//   reported. A successful call never writes it, matching the module (sceNetSocket's success path
+//   skips the store at 0x73da; ntop's at 0x6455). CONFIDENCE: MED -- per-host-thread is the closest this in-process design gets to the
 //   console's per-guest-thread slot (cf. the fiber caveat in docs/games/UNCHARTED_STATUS.md).
 //
-// Behaviour is re-derived for prosper's own table design; KytyPS5 (src/libs/network.cpp), shadPS4
-// (src/core/libraries/network/) and sharpemu (SharpEmu.Libs/Network/) were read as hypotheses
-// only, never copied (CONTRIBUTING.md).
+// Contracts are read off the shipped libSceNet module (offsets above are image-relative into it).
+// KytyPS5 (src/libs/network.cpp), shadPS4 (src/core/libraries/network/) and sharpemu
+// (SharpEmu.Libs/Network/) were also read as hypotheses; no code was copied (CONTRIBUTING.md).
 #include "hle/net/hle_net.hpp"
 #include "hle/net/sce_net_errors.hpp"
 #include "hle/dispatch/dispatch.hpp"
@@ -113,7 +119,7 @@ HLE(n_socket_htonll) {
     return out;
 }
 
-// --- AF_INET text/numeric conversion: computed locally ------------------------------------------
+// --- AF_INET / AF_INET6 text/numeric conversion: computed locally -------------------------------
 // Strict dotted-decimal: exactly four 1-3 digit parts, each 0-255, no empty parts, nothing else.
 
 bool pton_v4(const char* text, uint8_t out[4]) {
@@ -141,78 +147,208 @@ bool pton_v4(const char* text, uint8_t out[4]) {
     return true;
 }
 
-HLE(n_socket_inet_pton) {  // (af, src, dst) -> 1 ok, 0 bad text, -1 bad af (errno recorded)
+int hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// RFC 4291 text form: up to eight 1-4 digit hex groups, at most one "::", and an optional
+// dotted-decimal tail filling the last 32 bits.
+bool pton_v6(const char* text, uint8_t out[16]) {
+    uint8_t tmp[16] = {};
+    int tp = 0, colonp = -1, digits = 0;
+    unsigned val = 0;
+    bool saw_xdigit = false;
+    const char* p = text;
+    if (*p == ':' && *++p != ':') return false;   // a leading ':' must be "::"
+    const char* curtok = p;
+    for (char ch; (ch = *p++) != '\0';) {
+        const int d = hex_digit(ch);
+        if (d >= 0) {
+            if (++digits > 4) return false;
+            val = (val << 4) | (unsigned)d;
+            saw_xdigit = true;
+            continue;
+        }
+        if (ch == ':') {
+            curtok = p;
+            if (!saw_xdigit) {
+                if (colonp >= 0) return false;   // a second "::"
+                colonp = tp;
+                continue;
+            }
+            if (*p == '\0' || tp + 2 > 16) return false;
+            tmp[tp++] = (uint8_t)(val >> 8);
+            tmp[tp++] = (uint8_t)val;
+            saw_xdigit = false;
+            val = 0;
+            digits = 0;
+            continue;
+        }
+        if (ch == '.' && tp + 4 <= 16 && pton_v4(curtok, tmp + tp)) {
+            tp += 4;
+            saw_xdigit = false;
+            break;
+        }
+        return false;
+    }
+    if (saw_xdigit) {
+        if (tp + 2 > 16) return false;
+        tmp[tp++] = (uint8_t)(val >> 8);
+        tmp[tp++] = (uint8_t)val;
+    }
+    if (colonp >= 0) {
+        if (tp == 16) return false;   // "::" must stand for at least one group
+        const int moved = tp - colonp;
+        for (int i = 1; i <= moved; i++) {
+            tmp[16 - i] = tmp[colonp + moved - i];
+            tmp[colonp + moved - i] = 0;
+        }
+        tp = 16;
+    }
+    if (tp != 16) return false;
+    memcpy(out, tmp, 16);
+    return true;
+}
+
+// Formats into `out` (at least 16 bytes); returns the length without the terminator.
+int ntop_v4(const uint8_t addr[4], char* out) {
+    int len = 0;
+    for (int i = 0; i < 4; i++) {
+        const unsigned v = addr[i];
+        if (v >= 100) out[len++] = (char)('0' + v / 100);
+        if (v >= 10) out[len++] = (char)('0' + (v / 10) % 10);
+        out[len++] = (char)('0' + v % 10);
+        if (i < 3) out[len++] = '.';
+    }
+    out[len] = '\0';
+    return len;
+}
+
+// RFC 5952 / FreeBSD inet_ntop6 form: lowercase hex, no leading zeros, the longest run of two or
+// more zero groups (the first, on a tie) as "::", and an IPv4-compatible or IPv4-mapped address
+// with its last 32 bits in dotted decimal. Formats into `out` (at least 46 bytes).
+int ntop_v6(const uint8_t addr[16], char* out) {
+    uint16_t words[8];
+    for (int i = 0; i < 8; i++) words[i] = (uint16_t)((addr[2 * i] << 8) | addr[2 * i + 1]);
+    int best_base = -1, best_len = 0, cur_base = -1, cur_len = 0;
+    for (int i = 0; i < 8; i++) {
+        if (words[i] == 0) {
+            if (cur_base < 0) cur_base = i, cur_len = 1;
+            else cur_len++;
+        } else if (cur_base >= 0) {
+            if (best_base < 0 || cur_len > best_len) best_base = cur_base, best_len = cur_len;
+            cur_base = -1;
+        }
+    }
+    if (cur_base >= 0 && (best_base < 0 || cur_len > best_len)) best_base = cur_base, best_len = cur_len;
+    if (best_base >= 0 && best_len < 2) best_base = -1;
+    int len = 0;
+    for (int i = 0; i < 8; i++) {
+        if (best_base >= 0 && i >= best_base && i < best_base + best_len) {
+            if (i == best_base) out[len++] = ':';
+            continue;
+        }
+        if (i != 0) out[len++] = ':';
+        if (i == 6 && best_base == 0 &&
+            (best_len == 6 || (best_len == 5 && words[5] == 0xffff))) {
+            len += ntop_v4(addr + 12, out + len);
+            return len;
+        }
+        static const char kHex[] = "0123456789abcdef";
+        bool started = false;
+        for (int shift = 12; shift >= 0; shift -= 4) {
+            const unsigned nib = (words[i] >> shift) & 0xfu;
+            if (nib == 0 && !started && shift != 0) continue;
+            started = true;
+            out[len++] = kHex[nib];
+        }
+    }
+    if (best_base >= 0 && best_base + best_len == 8) out[len++] = ':';
+    out[len] = '\0';
+    return len;
+}
+
+constexpr size_t kInet6AddrStrLen = 46;   // "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255\0"
+
+// (af, src, dst) -> 1 converted, 0 bad text (dst untouched, errno untouched), or the facility code
+// for a bad family / null pointer with errno recorded (module 0x6aa0: unknown family is
+// EAFNOSUPPORT; a null src is EINVAL).
+HLE(n_socket_inet_pton) {
     (void)a3;
     (void)a4;
     (void)a5;
-    if ((int32_t)a0 != net::kAfInet) return net_id_fail(FreeBsdErrno::EInval);
+    const int32_t af = (int32_t)a0;
+    if (af != net::kAfInet && af != net::kAfInet6) return net_id_fail(FreeBsdErrno::EAfNoSupport);
     if (!a1 || !a2) return net_id_fail(FreeBsdErrno::EInval);
     const char* text = reinterpret_cast<const char*>(a1);
-    char buf[16];
+    char buf[kInet6AddrStrLen];
     size_t n = 0;
     while (n < sizeof(buf) && text[n]) n++;
-    if (n == sizeof(buf)) return net_err(0);   // unterminated within 16 bytes: bad text, no errno
+    if (n == sizeof(buf)) return net_err(0);   // longer than any valid address: bad text
     memcpy(buf, text, n + 1);
-    uint8_t addr[4];
-    if (!pton_v4(buf, addr)) return net_err(0);
-    memcpy(reinterpret_cast<void*>(a2), addr, 4);
-    g_net_errno = 0;
+    if (af == net::kAfInet) {
+        uint8_t addr[4];
+        if (!pton_v4(buf, addr)) return net_err(0);
+        memcpy(reinterpret_cast<void*>(a2), addr, sizeof(addr));
+    } else {
+        uint8_t addr[16];
+        if (!pton_v6(buf, addr)) return net_err(0);
+        memcpy(reinterpret_cast<void*>(a2), addr, sizeof(addr));
+    }
     return net_err(1);
 }
 
-HLE(n_socket_inet_ntop) {   // (af, src, dst, size) -> dst on ok, NULL on failure
+// (af, src, dst, size) -> dst on success, NULL on failure with errno recorded. Module 0x63c0:
+// an unknown family is EAFNOSUPPORT; a null src or dst is ENOSPC; the text is formatted into a
+// local buffer and copied only when it fits, so a short buffer that still holds the text (e.g.
+// "1.2.3.4" in 8 bytes) succeeds. size is a 32-bit socklen_t: its upper register bits are ignored.
+HLE(n_socket_inet_ntop) {
     (void)a4;
     (void)a5;
-    if ((int32_t)a0 != net::kAfInet) {
-        g_net_errno = static_cast<int32_t>(FreeBsdErrno::EInval);
+    const int32_t af = (int32_t)a0;
+    if (af != net::kAfInet && af != net::kAfInet6) {
+        g_net_errno = static_cast<int32_t>(FreeBsdErrno::EAfNoSupport);
         return net_err(0);
     }
     if (!a1 || !a2) {
-        g_net_errno = static_cast<int32_t>(FreeBsdErrno::EInval);
+        g_net_errno = static_cast<int32_t>(FreeBsdErrno::ENoSpc);
         return net_err(0);
     }
-    if (a3 < 16) {   // INET_ADDRSTRLEN: "255.255.255.255\0"
+    const uint32_t size = (uint32_t)a3;
+    char text[kInet6AddrStrLen];
+    const int len = af == net::kAfInet ? ntop_v4(reinterpret_cast<const uint8_t*>(a1), text)
+                                       : ntop_v6(reinterpret_cast<const uint8_t*>(a1), text);
+    if ((uint32_t)len + 1u > size) {
         g_net_errno = static_cast<int32_t>(FreeBsdErrno::ENoSpc);
         return net_err(0);   // NULL: the errno slot above carries the reason
     }
-    const uint8_t* addr = reinterpret_cast<const uint8_t*>(a1);
-    char* dst = reinterpret_cast<char*>(a2);
-    // snprintf-free: the longest part is 3 digits, the format is fixed.
-    int len = 0;
-    for (int i = 0; i < 4; i++) {
-        unsigned v = addr[i];
-        char part[4];
-        int plen = 0;
-        if (v >= 100) part[plen++] = (char)('0' + v / 100);
-        if (v >= 10) part[plen++] = (char)('0' + (v / 10) % 10);
-        part[plen++] = (char)('0' + v % 10);
-        if (len + plen + (i < 3 ? 1 : 1) > 16) {
-            g_net_errno = static_cast<int32_t>(FreeBsdErrno::ENoSpc);
-            return net_err(0);   // NULL: the errno slot above carries the reason
-        }
-        memcpy(dst + len, part, (size_t)plen);
-        len += plen;
-        dst[len++] = (i < 3) ? '.' : '\0';
-    }
-    g_net_errno = 0;
+    memcpy(reinterpret_cast<void*>(a2), text, (size_t)len + 1);
     return a2;
 }
 
 // --- socket id lifecycle -----------------------------------------------------------------------
 
-HLE(n_socket_create) {   // (domain, type, protocol) -> socket id (>0), never 0
+// (name, family, type, protocol) -> socket id (>0), never 0. `name` is a debug label only.
+// An unknown family is EAFNOSUPPORT, as FreeBSD's socreate answers; an unmodelled type keeps
+// EOPNOTSUPP (CONFIDENCE: LOW -- FreeBSD would say EPROTOTYPE/EPROTONOSUPPORT; any of them is a
+// refusal, never a handle).
+HLE(n_socket_create) {
+    (void)a0;
     (void)a3;
     (void)a4;
     (void)a5;
-    const int32_t domain = (int32_t)a0, type = (int32_t)a1;
-    const bool dom_ok = domain == net::kAfUnix || domain == net::kAfInet || domain == net::kAfInet6;
-    const bool type_ok = type == net::kSockStream || type == net::kSockDgram;
-    if (!dom_ok || !type_ok) return net_id_fail(FreeBsdErrno::EOpNotSupp);
+    const int32_t domain = (int32_t)a1, type = (int32_t)a2;
+    if (domain != net::kAfUnix && domain != net::kAfInet && domain != net::kAfInet6)
+        return net_id_fail(FreeBsdErrno::EAfNoSupport);
+    if (type != net::kSockStream && type != net::kSockDgram)
+        return net_id_fail(FreeBsdErrno::EOpNotSupp);
     std::lock_guard<std::mutex> lk(g_net_mx);
     for (int i = 1; i <= kMaxNetSockets; i++) {
         if (g_net_live[i]) continue;
         g_net_live[i] = true;
-        g_net_errno = 0;
         return (uint64_t)i;
     }
     return net_id_fail(FreeBsdErrno::EMFile);
@@ -227,7 +363,6 @@ HLE(n_socket_close) {   // (fd) -> SCE_OK, releasing the id
     std::lock_guard<std::mutex> lk(g_net_mx);
     if (!net_known_locked((int32_t)a0)) return net_fail(FreeBsdErrno::EBadF);
     g_net_live[(int32_t)a0] = false;
-    g_net_errno = 0;
     return net_err(0);
 }
 
@@ -235,7 +370,9 @@ HLE(n_socket_close) {   // (fd) -> SCE_OK, releasing the id
 // None of these writes to a guest buffer even on the failure path: a recv that answered failure
 // while scribbling the caller's buffer would hand it content nobody sent.
 
-HLE(n_socket_offline) {   // connect/send/sendto/recv/recvfrom/sendmsg/bind/listen
+// connect/send/sendto/recv/recvfrom/sendmsg/bind/listen. ENETUNREACH is chosen for every arm,
+// including bind/listen where FreeBSD would succeed offline -- CONFIDENCE: LOW on that errno.
+HLE(n_socket_offline) {
     (void)a1;
     (void)a2;
     (void)a3;
