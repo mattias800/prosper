@@ -2833,6 +2833,11 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_decode_sweep.cpp
     LIBRARIES prosper_core)
 
+  # The scalar opcode predicates are header-only facts checked against ISA/LLVM tables.
+  prosper_add_gtest(test_scalar_predicates
+    SOURCES tests/gpu/recompiler/test_scalar_predicates.cpp
+    INCLUDES src)
+
   # Closed-tail block admission is decoder-only, so this compiles rdna2_decode.cpp directly
   # (same pattern as test_workgroup_uniformity above).
   prosper_add_gtest(test_rdna2_closed_tail
