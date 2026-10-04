@@ -262,6 +262,10 @@ TEST_F(FragmentScalarBankGpu, PrivateThirdWaveInputFaultRollsBackTheEntireDraw) 
         callback = [&](const r::FragmentScalarWaveWireCalibration& wire) {
             ASSERT_EQ(wire.wave_index(), 2u);
             ASSERT_EQ(wire.scalar_register(), 3u);
+            // The actual transfer must target the scalar body AFTER WIN1 and wave ID. A wrong
+            // nearby descriptor word can also keep the pixels black, masking bad calibration.
+            ASSERT_EQ(wire.target_word(),
+                      uint64_t(wire.wave_input_base()) + 2u + wire.scalar_relative_word());
             ASSERT_TRUE(wire.replace_word3(scene.descriptor[3] ^ 1u));
             ++corruptions;
         };

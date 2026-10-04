@@ -174,6 +174,9 @@ class FragmentScalarWaveWireCalibration {
 public:
     uint32_t wave_index() const { return 2; }
     uint32_t scalar_register() const { return 3; }
+    uint64_t target_word() const { return offset_ / sizeof(uint32_t); }
+    uint32_t wave_input_base() const { return input_base_; }
+    uint32_t scalar_relative_word() const { return scalar_offset_; }
     bool replace_word3(uint32_t value) const {
         if (!input_.buffer || offset_ > input_.range || input_.range - offset_ < 4) return false;
         VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
@@ -201,14 +204,17 @@ public:
 
 private:
     FragmentScalarWaveWireCalibration(VkCommandBuffer command, VkDescriptorBufferInfo input,
-                                      VkDeviceSize offset)
-        : command_(command), input_(input), offset_(offset) {}
+                                      VkDeviceSize offset, uint32_t input_base,
+                                      uint32_t scalar_offset)
+        : command_(command), input_(input), offset_(offset), input_base_(input_base),
+          scalar_offset_(scalar_offset) {}
     friend void record_fragment_draw_compute_transaction(
         VkCommandBuffer, const FragmentDrawComputeGpuProgram&, const FragmentDrawGpuOwner&,
         const std::array<VkDescriptorSet, FragmentDrawComputeGpuProgram::Stages>&);
     const VkCommandBuffer command_;
     const VkDescriptorBufferInfo input_;
     const VkDeviceSize offset_;
+    const uint32_t input_base_, scalar_offset_;
 };
 using FragmentScalarWaveWireCallback =
     std::function<void(const FragmentScalarWaveWireCalibration&)>;
@@ -278,11 +284,13 @@ inline void record_fragment_draw_compute_transaction(
             const auto index = size_t(scalar - layout.sgprs.begin());
             if (index < layout.scalar_offsets.size()) {
                 const uint64_t word =
-                    uint64_t(capacity.placement(2).input_base) + layout.scalar_offsets[index];
+                    uint64_t(capacity.placement(2).input_base) + 2u + layout.scalar_offsets[index];
                 const auto input = owner.plane(O::Input);
                 const VkDeviceSize offset = word * sizeof(uint32_t);
                 if (offset <= input.range && input.range - offset >= sizeof(uint32_t))
-                    callback(FragmentScalarWaveWireCalibration(command, input, offset));
+                    callback(FragmentScalarWaveWireCalibration(command, input, offset,
+                                                               capacity.placement(2).input_base,
+                                                               layout.scalar_offsets[index]));
             }
         }
     }
