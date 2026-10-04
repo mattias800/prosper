@@ -61,8 +61,7 @@ bool capture_outputs(const GpuState& state, const RenderState& render,
                      const prosper::GuestMappingLease& lease,
                      std::vector<prosper::GuestDirectAllocation>& outputs) {
     namespace P = prosper::agc::Pm4;
-    if (!state.cx.count(P::CB_TARGET_MASK) || !state.cx.count(P::CB_SHADER_MASK))
-        return false;
+    if (!state.cx.count(P::CB_TARGET_MASK) || !state.cx.count(P::CB_SHADER_MASK)) return false;
     for (uint32_t slot = 0; slot < render.color_targets.size(); ++slot) {
         const auto& target = render.color_targets[slot];
         const bool enabled =
