@@ -52,8 +52,8 @@ project owner on a routed `reach-performance-story.pad` run with the bank interi
 > **2026-10-04: #4270 (merged 2026-10-03) cut the bank scene from ~9 to ~2.9 presented fps**, and
 > every GTA V performance cohort from 2026-10-03 onward measured that regression. PR #4421
 > recovers most of it (2.9 -> ~6.5). PR #4428 seeds BGRA compute inputs on the device
-> instead of #4291's CPU round trip, +0.45..0.64 fps in three clean same-binary pairs (7.10 vs
-> 6.49 in the quietest). The rest of the gap to #4270's parent is open. Details and numbers are
+> instead of #4291's CPU round trip: +0.45..0.64 presented fps (+8.4..11.7%) in three
+> same-binary pairs, 7.10 vs 6.49 in the one run inside a verified quiet window. The rest of the gap to #4270's parent is open. Details and numbers are
 > in `## Ruled out`, first entry.
 
 > **The "21.0–21.3 FPS / ~34x speedup" this line used to claim was never a measurement of the

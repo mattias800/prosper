@@ -11,6 +11,7 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "shared/live/live_compute.hpp"
 #include "shared/live/live_renderer.hpp"
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -74,6 +75,15 @@ ComputeItem copy_item(uint64_t source, ResourceClass source_class, DataFormat so
 } // namespace
 
 TEST(LiveComputeBgraTarget, ComputeObservesGuestComponentOrder) {
+    // Both switches are read once and cached; an exported developer opt-out would turn the
+    // device-seed assertion below into a false failure.
+    for (const char* name : {"PROSPER_NO_BGRA_STANDALONE_SEED", "PROSPER_NO_STANDALONE_RTT_SEED"}) {
+#ifdef _WIN32
+        _putenv_s(name, "");   // an empty value removes the variable
+#else
+        unsetenv(name);
+#endif
+    }
     prosper::register_builtin_hle();
     auto map = prosper::Hle::lookup(prosper::nid_hash("sceKernelMapNamedFlexibleMemory"));
     ASSERT_TRUE(map);
@@ -227,7 +237,8 @@ TEST(LiveComputeBgraTarget, ComputeObservesGuestComponentOrder) {
 
     // Partial native-float storage write: EXEC limits the store to texels 0..63, so the rest of
     // the result must come from the old target contents. The renderer image cannot seed it by a
-    // raw copy (canonical order); the guest-order snapshot must.
+    // raw copy (canonical order); the device seed through BgraSeedScratch must, as the snapshot
+    // did before #4428.
     produce();
     ShaderResourceTable storage_table;
     {

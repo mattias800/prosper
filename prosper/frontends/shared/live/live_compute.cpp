@@ -101,7 +101,7 @@
 // The VideoOut buffer registry (hle_graphics.cpp). #3915 asks whether a storage result is a display buffer.
 extern "C" int prosper_vo_buffer_count();
 extern "C" uint64_t prosper_vo_buffer_addr(int i);
-#include "live_compute_storage_codec.hpp"
+#include "shared/live/live_compute_storage_codec.hpp"
 
 namespace prosper::frontend {
 
@@ -1734,6 +1734,8 @@ struct VulkanComputeContext {
         indirect_validator.destroy();
         if (indirect_scratch) vkDestroyBuffer(device, indirect_scratch, nullptr);
         if (indirect_scratch_memory) release_memory(indirect_scratch_memory);
+        // Before the pool is emptied: release_memory() would otherwise re-park it there.
+        bgra_seed_scratch.destroy(device, [&](VkDeviceMemory m) { release_memory(m); });
         release_cached_buffers();
         release_cached_images();
         release_cached_memory();
@@ -1744,7 +1746,6 @@ struct VulkanComputeContext {
         if (descriptor_pool) vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
         if (compare_pool) vkDestroyDescriptorPool(device, compare_pool, nullptr);
         packed_rtt_conversion.destroy();
-        bgra_seed_scratch.destroy(device, [&](VkDeviceMemory m) { release_memory(m); });
         retile_pipeline.destroy();
         volume_retile_pipeline.destroy();
         packed_retile_pipeline.destroy();
@@ -3784,7 +3785,8 @@ struct VulkanComputeContext {
 
     bool prepare_bgra_seed(uint32_t width, uint32_t height) {
         return bgra_seed_scratch.prepare(
-            physical, device, PROSPER_ENV_ON("PROSPER_NO_BGRA_STANDALONE_SEED"), width, height,
+            physical, device, queue_family, PROSPER_ENV_ON("PROSPER_NO_BGRA_STANDALONE_SEED"),
+            width, height,
             [&](const VkMemoryRequirements& req) {
                 VkDeviceMemory out = VK_NULL_HANDLE;
                 prosper::gpu::allocate_gpu_only(
@@ -7881,16 +7883,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                       source.format == LiveTargetPixelFormat::R11G11B10Float &&
                                       source.native_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32))
                                     ? "format-mismatch"
-                                // A raw image copy keeps the renderer's canonical RGBA order; the
-                                // identity storage view would then read a BGRA target's R and B
-                                // exchanged (#4291); an RGBA8 one is seeded via BgraSeedScratch.
-                                : source.component_order_bgra && !(exact_rgba8 && source.transfer_src &&
-                                    ctx.prepare_bgra_seed(r->width, r->height)) ? "component-order"
                                 : !source.transfer_src ? "no-transfer-src"
                                 : !rtt_gpu_seed_import_extent_compatible(
                                     r->width, r->height, source.width, source.height) ? "extent-mismatch"
                                 : source.layout == VK_IMAGE_LAYOUT_UNDEFINED ||
                                   source.layout == VK_IMAGE_LAYOUT_PREINITIALIZED ? "invalid-layout"
+                                // A raw image copy keeps the renderer's canonical RGBA order; the
+                                // identity storage view would then read a BGRA target's R and B
+                                // exchanged (#4291); an RGBA8 one is seeded via BgraSeedScratch.
+                                // Last, so the scratch grows only for an otherwise admitted seed.
+                                : source.component_order_bgra &&
+                                  !(exact_rgba8 && ctx.prepare_bgra_seed(r->width, r->height))
+                                    ? "component-order"
                                 : "admitted";
                             bi.standalone_seed_decision = reason;
                             if (std::strcmp(reason, "admitted") == 0) {

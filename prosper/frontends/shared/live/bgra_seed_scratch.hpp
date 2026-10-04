@@ -4,14 +4,18 @@
 // Compute must read such a target in guest (BGRA) byte order, and the identity storage view cannot
 // be swizzled. #4291 therefore declined the raw seed and fell back to a CPU snapshot plus an R<->B
 // swap of the whole surface -- on GTA V's bank scene a 31.6 MiB round trip per binding. Instead,
-// blit the canonical image into this B8G8R8A8 scratch -- a per-channel conversion, exact for
-// UNORM8 -- and copy its bytes raw into the RGBA8 binding, whose identity view then reads byte 0
-// (B) as R: guest order. One image, regrown on demand. Every live compute item waits on its fence,
-// so no use outlives the item that recorded it; within an item each use starts with a barrier.
+// blit the canonical image into this B8G8R8A8 scratch -- a per-channel conversion -- and copy its
+// bytes raw into the RGBA8 binding, whose identity view then reads byte 0 (B) as R: guest order.
+// The UNORM8 -> float -> UNORM8 round trip is exact where the driver rounds to nearest (RADV,
+// NVIDIA and lavapipe do); Vulkan only says it SHOULD, so a truncating driver would be one LSB low
+// on some values (#4428 review). One image, regrown on demand; it is never shrunk. Every live
+// compute item waits on its fence, so no use outlives the item that recorded it; within an item
+// each use starts with a barrier.
 #pragma once
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <cstdint>
+#include <vector>
 
 namespace prosper::frontend {
 // Owned by the compute context, which releases it before its device.
@@ -25,16 +29,25 @@ struct BgraSeedScratch {
     // old one is released, so a failure leaves earlier admissions in the same item valid.
     // `allocate(requirements)` returns bound-ready device memory or null; `release(memory)` frees it.
     template <class Allocate, class Release>
-    bool prepare(VkPhysicalDevice physical, VkDevice device, bool disabled, uint32_t w, uint32_t h,
-                 Allocate&& allocate, Release&& release) {
+    bool prepare(VkPhysicalDevice physical, VkDevice device, uint32_t queue_family, bool disabled,
+                 uint32_t w, uint32_t h, Allocate&& allocate, Release&& release) {
         if (blit_supported < 0) {
             blit_supported = 0;
-            if (physical && !disabled) {
+            // vkCmdBlitImage needs a graphics-capable queue; the compute context normally adopts
+            // the renderer's graphics family, but a private compute-only device would not.
+            uint32_t families = 0;
+            if (physical) vkGetPhysicalDeviceQueueFamilyProperties(physical, &families, nullptr);
+            std::vector<VkQueueFamilyProperties> properties(families);
+            if (families)
+                vkGetPhysicalDeviceQueueFamilyProperties(physical, &families, properties.data());
+            const bool graphics_queue = queue_family < families &&
+                (properties[queue_family].queueFlags & VK_QUEUE_GRAPHICS_BIT);
+            if (physical && graphics_queue && !disabled) {
                 VkFormatProperties canonical{}, swapped{};
                 vkGetPhysicalDeviceFormatProperties(physical, VK_FORMAT_R8G8B8A8_UNORM, &canonical);
                 vkGetPhysicalDeviceFormatProperties(physical, VK_FORMAT_B8G8R8A8_UNORM, &swapped);
-                const VkFormatFeatureFlags needed =
-                    VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+                const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                    VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
                 blit_supported =
                     (canonical.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) &&
                     (swapped.optimalTilingFeatures & needed) == needed;
