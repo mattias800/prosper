@@ -11915,8 +11915,9 @@ int main() {
     }
 
     // #4315 admits exactly the full-mask BC1/FI0 unmodified ROW_ROR:8 floating ADD, so this exact
-    // packet left the refusal table below (#4355). Its numeric semantics are executed by
-    // test_compute_dpp_row_fadd; here it only pins that the admission is deliberate.
+    // packet left the refusal table below (#4355). Here it only pins that the admission is
+    // deliberate; test_compute_dpp_row_fadd executes the family (with distinct registers) and
+    // pins its admission limits field by field.
     {
         const uint32_t admittedAdd[] = {0x060000fau, 0xff092800u, 0xbf810000u};
         CHECK(!recompile_valu(admittedAdd, std::size(admittedAdd), 1, 0).empty(),

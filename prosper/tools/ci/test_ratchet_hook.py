@@ -57,7 +57,6 @@ class Parsing(unittest.TestCase):
         self.assertEqual([("push", "C:\\w\\tree")], found)
 
 
-@NEEDS_GIT
 class NativePath(unittest.TestCase):
     """MSYS2 git on the MinGW runner prints `/d/a/...`; a native Windows Python needs `D:/a/...`
     or every checker launch fails with WinError 267 (the directory name is invalid)."""
@@ -78,6 +77,7 @@ class NativePath(unittest.TestCase):
         self.assertEqual("/d/a/prosper", hook.native_path("/d/a/prosper", windows=False))
 
 
+@NEEDS_GIT
 class Verdicts(unittest.TestCase):
     """main() against a real git checkout with a stand-in checker."""
 

@@ -144,7 +144,7 @@ def gated_git_invocations(command, posix=True):
     return found
 
 
-_MSYS_DRIVE_PATH = re.compile(r"^/(?:cygdrive/)?([A-Za-z])(/.*)?$")
+_MSYS_DRIVE_PATH = re.compile(r"/(?:cygdrive/)?([A-Za-z])(/.*)?")
 
 
 def native_path(path, windows=None):
@@ -159,7 +159,7 @@ def native_path(path, windows=None):
         windows = os.name == "nt"
     if not windows or not path:
         return path
-    match = _MSYS_DRIVE_PATH.match(path)
+    match = _MSYS_DRIVE_PATH.fullmatch(path)
     if not match:
         return path
     return f"{match.group(1).upper()}:{match.group(2) or '/'}"
