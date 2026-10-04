@@ -17,9 +17,11 @@ HOLD remains visible. Dead Cells' unchanged scripted OFF/ON pair reached its men
 gameplay/HUD captures per arm, with no counted draw/dispatch losses. Three of fourteen original
 phase comparisons are documented, eleven remain.
 After those game runs, test-only contributor PR #4386 merged as
-**9b2f0681772ad70972233244868010db0ffc8af8**. This draft is based on that latest remote main.
-The retained app and game observations remain the actual **ee9dcb1e** cohort; refresh its embedded
-revision and inspect the new test registration before the next latest-main run.
+**9b2f0681772ad70972233244868010db0ffc8af8**. Remote main subsequently advanced through new
+runtime opcode lowerings; **a53158e58bc20257472764bff8442ad033dc659c** was observed during the
+GTA historical-regression triage below. This draft follows freshly fetched main; all named run
+cohorts stay dated. The retained app/game observations remain actual **ee9dcb1e** evidence.
+Inspect the full newer runtime delta and refresh app qualification before another latest-main run.
 Performance measurements must use a verified scripted route and matching admitted scenes;
 explicitly selected splash/title populations must stay separate from in-level gameplay.
 
@@ -520,6 +522,44 @@ is not automatically wrong; preserve the real defect and distinguish correctness
 bug exposure, and a demonstrated new regression. Stage 1 pipelined compute remains deferred:
 the old measured ceiling was at most about 5% of wall time for a large implementation cost.
 
+## GTA slowdown: historical baseline candidate, matched comparison pending
+
+The owner reports GTA ran substantially faster about a week earlier. Retained September30 evidence
+provides a useful candidate baseline: **c60535b0365bba0a2de67690030c437642a9a718**, immutable app
+SHA256 **29ac597b999dede42db531a5f0eb5cb7dd09e3f48a1c4f108e230fdce84a33d4**.
+Its `gta-matrix-pair3-off` capture-free200–300s population recorded **9.152 guest flips/s** across
+12 complete selected windows spanning60.751s. Frontend/contract/backend dropped draws were0
+in that historical summary. This is not a proven fresh-delivered-frame rate.
+
+Root inspected its retained **lossy WEBP previews**, not a new native capture: actual3001 shows
+the Display menu explicitly selecting Performance mode;5000 shows the rendered bank player/world
+with radar and status bars. Its route bytes exactly match the route at observed maina53158e5:
+SHA256 **683994c1b5e6fb14b07e90e7d07390d52a1ffb7ebbf1cc496d2b92489c81ed7a**.
+The old build receipt records a successful build, but the app at its original build path is gone;
+no usable historical binary or current dependency/driver qualification is claimed.
+
+The later low-rate **986174464a8d45ebde19dbce2291ce5ef7a23398** ABBA cohort above is a descendant
+ofc60535b and an ancestor of the #4374 scalar-bank integration3fe269ef. Therefore #4374, or the
+still later external opcode lowerings, cannot alone explain the earlier low rate already observed
+on986. A candidate first-parent source range exists. The old and new historical populations use
+different elapsed windows and were not run under matching current host conditions; scene/internal
+state equivalence is unproved. Do not label either endpoint a verified code-regression boundary.
+Changed rendering work, necessary correctness and host pressure remain possible explanations.
+
+**Next focused GTA step:** rebuild/qualify the candidate historical app in its own RAM-drive
+worktree and qualify actual latest main. Use the canonical measurement wrapper and an announced
+quiet interval, matching current desktop/driver/title/settings, asyncOFF, texture1024/heap8192/
+target2048MiB/count256, the identical recorded input route and actual matching admitted bank
+scenes. Inspect menu and gameplay/HUD for both builds. If the historical control reproduces its
+higher rate while latest main stays slow, bisect that verified source range and profile the first
+slower step. A correctness fix that costs time or exposes an existing bug is not thereby wrong;
+preserve its contract and address the cost or newly exposed defect. Do not revert based only on FPS.
+
+This triage launched **no game, build or subagent**. Metadata, selected summaries, old build receipt,
+exact route, commit range and explicit limits/next steps were copied and fsynced into the private
+`root-GTA-regression-triage-checkpoint-20261004-v1` packet. It provides input to the pending repeated
+GTA comparisons; three of fourteen phase pairs and the rest of the original plan remain unchanged.
+
 ## Messenger partial run and reviewed visibility-helper successor
 
 The first e291 Messenger OFF compatibility arm stopped at **265.881 s** when a KWin Match
@@ -680,6 +720,10 @@ historical sky seam/HUD/partial-model rendering HOLD remains a hold until curren
   require factoring the new work out of the already oversized emitter. It remains open for author
   revision; no fix job was started. #4387 is draft and was skipped. Both review worktrees were
   removed, private reviewed diffs/receipts retained, and this draft rebased onto current main.
+- Subsequent remote check: #4388 has since merged asab3be86ac9df570d6820562e03b5c3b751de1150
+  after its author head changed to395d30d010ab23680b09971cef1bacb53042ea2b. The original registered
+  rejection remains a dated review ofea727b704; root does not claim an additional review of the
+  newer head. Do not repeat the obsolete open-PR state on resume.
 - The incoming author, independent reviewer and builder completed #4382 and are parked. Other
   CPU/Outer-Wilds lanes were already parked; Silent Hill was asked to finish its existing historical
   result handoff and park. Subsequent owner authorization allowed the app qualification and small
