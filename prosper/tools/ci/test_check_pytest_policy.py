@@ -291,10 +291,11 @@ def test_real_git_baseline_rejects_allowlist_growth(tmp_path: Path):
 
 def test_invalid_baseline_cannot_report_policy_success(tmp_path: Path):
     repo, checker, _ = _isolated_repo(tmp_path)
-    result = _checker(repo, checker, "--base", "refs/heads/missing-policy-control")
-    assert result.returncode == 2
-    assert "could not evaluate baseline" in result.stderr
-    assert "pytest policy ok" not in result.stdout
+    for invalid in ("refs/heads/missing-policy-control", "", " "):
+        result = _checker(repo, checker, "--base", invalid)
+        assert result.returncode == 2
+        assert "could not evaluate baseline" in result.stderr
+        assert "pytest policy ok" not in result.stdout
 
 
 def test_option_shaped_base_cannot_write_git_output(tmp_path: Path):
@@ -346,3 +347,6 @@ def test_explicit_external_baseline_is_a_read_only_input(tmp_path: Path):
     assert baseline.read_bytes() == original
     conflicting = _checker(repo, checker, "--baseline-file", str(baseline), "--base", "missing")
     assert conflicting.returncode == 2
+    empty = _checker(repo, checker, "--baseline-file", "")
+    assert empty.returncode == 2
+    assert "could not evaluate baseline" in empty.stderr

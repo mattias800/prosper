@@ -237,8 +237,10 @@ def load_baseline_allowlist(
     repo_root: Path, base_ref: str | None = None, *, bootstrap: bool = False
 ) -> set[str] | None:
     """Read a resolved commit's allowlist, or explicitly bootstrap from its legacy sources."""
-    if not base_ref:
+    if base_ref is None:
         return None
+    if not base_ref.strip():
+        raise ValueError("baseline ref must not be empty")
     if base_ref.startswith("-"):
         raise ValueError("baseline ref must be a revision, not a Git option")
     commit = _git_text(
@@ -417,7 +419,7 @@ def main() -> int:
     if args.selftest:
         selftest()
         return 0
-    if args.bootstrap_allowlist and not args.base:
+    if args.bootstrap_allowlist and args.base is None:
         parser.error("--bootstrap-allowlist requires --base")
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -430,9 +432,9 @@ def main() -> int:
 
     try:
         baseline_allow = None
-        if args.baseline_file:
+        if args.baseline_file is not None:
             baseline_allow = parse_allowlist(Path(args.baseline_file).read_text(encoding="utf-8"))
-        elif args.base:
+        elif args.base is not None:
             baseline_allow = load_baseline_allowlist(
                 repo_root, args.base, bootstrap=args.bootstrap_allowlist
             )
