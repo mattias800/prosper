@@ -8376,6 +8376,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
 
             // --- Sampled-texture path: image_sample* (0x20/0x24/0x25/0x27) / image_gather4_lz (0x47) /
+            // image_gather4 (0x40, admitted only where LOD 0 is exact -- see the gather arm) /
             // image_load (0x00). 2D (any LOD variant) or 3D (implicit-LOD or LOD-0 sample); NSA allowed
             // (coords gathered below). image_sample = 0x20 (implicit-LOD), image_sample_l = 0x24
             // (explicit LOD in last coord), image_sample_b = 0x25 (implicit-LOD + BIAS in FIRST vaddr),
@@ -8452,7 +8453,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 fprintf(stderr, "[recompile] 2D_ARRAY image op: resource %s an uploaded array (#325)\n",
                         res_arrayed ? "IS" : "is NOT");
             if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b &&
-                 !is_sample_c_lz && !is_gather_lz &&
+                 !is_sample_c_lz && !is_gather_lz && !is_gather &&
                  !is_gather_lz_o && !is_sample_lz_o && !is_sample_d) ||
                 (!dim2d && !dim3d && !dimcube && !dim_msaa)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }

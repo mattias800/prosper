@@ -242,10 +242,12 @@ TEST(GapOpcodeRefusals, MovrelsB32) {
 
 // IMAGE_GATHER4 v[0:3], v[0:1], s[12:19], s[20:23] dmask:0x1 dim:SQ_RSRC_IMG_2D (MIMG 0x40). A
 // gather selects ONE channel, so dmask must be 1, 2, 4 or 8 (llvm-mc rejects 0xf). A direct T# at
-// s12 and S# at s20 are supplied, with defined coordinates, so the MIMG emitter's resource gate is
-// passed and the refusal is the opcode gate. Control: image_gather4_lz (0x47) -- the same word with
-// only the opcode field changed -- compiles with that table, and refuses without it, which shows
-// the table is what the shared setup needs.
+// s12 and S# at s20 are supplied, with defined coordinates. image_gather4 is no longer a gap: it
+// is admitted where reading LOD 0 is exact (a single-level resource, or a non-fragment stage with
+// no derivatives), and then must compile to the SAME module as image_gather4_lz (0x47, the same
+// word with only the opcode field changed), so the _lz execution coverage applies to it. In a
+// fragment shader a multi-level resource must refuse; the single-level twin of that program
+// compiling is what shows the refusal comes from the mip gate.
 TEST(GapOpcodeRefusals, ImageGather4) {
     static const uint32_t w[2] = {0xf1000108u, 0x00a30000u};
     static const uint32_t control[2] = {0xf11c0108u, 0x00a30000u};
@@ -296,7 +298,9 @@ TEST(GapOpcodeRefusals, ImageGather4) {
 
     // Gate checks in fragment stage: multi-level texture (declared_mip_levels == 2) must refuse;
     // single-level texture (declared_mip_levels == 1) must compile.
-    const auto fragment_prog = program(prologue, {w[0], w[1]});
+    // A fragment program must export, or recompile_fragment refuses it for that reason alone.
+    const auto fragment_prog =
+        program(prologue, {w[0], w[1], 0xf800180fu, 0x03020100u});   // exp mrt0 v0-v3 done vm
     ShaderResourceTable frag_rt_single = rt;
     frag_rt_single.resources[0].declared_mip_levels = 1u;
     EXPECT_FALSE(
