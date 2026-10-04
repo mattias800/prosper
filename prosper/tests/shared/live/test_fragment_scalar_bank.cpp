@@ -86,7 +86,7 @@ protected:
 
 TEST_F(FragmentScalarBankPlan, CounterSpecificWaitSeparatesSealedBytesFromPlanReadiness) {
     const g::FragmentPacketDeviceContract source_device{0x1234, true, false};
-    for (const uint16_t immediate : {0u, 0xc07fu, 0x3f70u, 0xff7fu, 0x0100u}) {
+    for (const uint16_t immediate : {0u, 0xc07fu, 0x3f70u, 0xff7fu, 0x0100u, 0x0001u}) {
         SCOPED_TRACE(immediate);
         auto words = f::fragment_words();
         ASSERT_EQ(words[3], 0xbf8c0000u);
@@ -117,6 +117,8 @@ TEST_F(FragmentScalarBankPlan, CounterSpecificWaitSeparatesSealedBytesFromPlanRe
             EXPECT_EQ(transaction.scalar_bank(), value)
                 << "the actual consumer retains the sealed bytes after permission expiry";
         } else {
+            // VM1/LGKM0 also reaches the scalar drain if the execution-domain guard is
+            // deleted: the exact packing refusal must precede later compiler guards.
             EXPECT_EQ(plan->rejection_reason(),
                       "fragment-draw-entry-and-composition-recipe-unproved")
                 << "VM-only/no-drain/partial threshold cannot complete pending scalar results";
