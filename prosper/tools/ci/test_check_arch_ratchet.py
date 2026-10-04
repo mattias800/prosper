@@ -85,6 +85,11 @@ class OnePositivePerRule(unittest.TestCase):
             "platform-ifdef|prosper/src/hle/sync/a.cpp",
             1,
         ),
+        "platform-stub": (
+            {"prosper/src/hle/memory/a.cpp": "HLE(k_a_stub) {\n    return 0;\n}\n"},
+            "platform-stub|prosper/src/hle/memory/a.cpp",
+            1,
+        ),
         "layer-include": (
             {"prosper/src/host/image/a.cpp": '#include "hle/dispatch/dispatch.hpp"\n'},
             "layer-include|prosper/src/host/image/a.cpp|hle",

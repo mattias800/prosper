@@ -34,6 +34,11 @@ The rules (every count is per file, over tracked files only, with comments strip
                  `__MINGW32__`, `_MSC_VER`), one per directive, in prosper/src/{hle,loader,self,
                  gpu}. src/host is exempt: that is where host-platform code belongs. The seam this
                  pushes code towards is prosper/docs/architecture/HOST_PLATFORM_SEAM.md.
+  platform-stub  a handler defined as `HLE(<name>_stub)` in the same roots: the project's name
+                 for a platform arm that answers a call without doing its work. It is a NAME-BASED
+                 PROXY for a shape the preprocessor-directive count cannot see (a reduced copy of
+                 another platform's logic), so a stub that is not named `_stub` is not counted;
+                 the standard it serves is in ARCHITECTURE_TARGET_TREE.md, section Standards.
   layer-include  an `#include` from one prosper/src top-level layer into a layer it may not depend
                  on, one row per (file, target layer), valued by the number of include lines.
                  LAYER_ORDER below is the table: a layer may include itself and any layer EARLIER
@@ -214,6 +219,7 @@ SYNC_TOKENS = (
 )
 SYNC_RES = {token: re.compile(rf"\b{token}\b") for token in SYNC_TOKENS}
 TEST_DEP_RE = re.compile(r"\bprosper\s*::\s*test\s*::")
+PLATFORM_STUB_RE = re.compile(r"\bHLE\s*\(\s*[A-Za-z0-9_]*_stub\s*\)")
 PLATFORM_MACROS = ("_WIN32", "_WIN64", "__linux__", "__APPLE__", "__MINGW32__", "_MSC_VER")
 PLATFORM_IF_RE = re.compile(
     r"^[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif|elifdef|elifndef)\b[^\n]*\b(?:"
@@ -234,6 +240,7 @@ RULES = (
     "file-size",
     "test-dep",
     "platform-ifdef",
+    "platform-stub",
     "layer-include",
     "fixture-include",
     "vk-object",
@@ -282,6 +289,13 @@ FIX_HINT = {
         "A host-platform #if in shared code. Call (or add) an interface under src/host/platform/ "
         "with one backend per OS instead -- prosper/docs/architecture/HOST_PLATFORM_SEAM.md. Moving an "
         "existing call site behind the seam is a behaviour-neutral change: commit it separately."
+    ),
+    "platform-stub": (
+        "A new HLE handler named *_stub. A platform arm must hold primitives only; port the logic "
+        "once into a portable component and call the host interface "
+        "(prosper/docs/architecture/ARCHITECTURE_TARGET_TREE.md, Standards 1 and 2). If this stub "
+        "is genuinely temporary, raise the row in the same PR with a # note naming the issue "
+        "that removes it."
     ),
     "layer-include": (
         "An include against the layer order (LAYER_ORDER in check_arch_ratchet.py; "
@@ -533,6 +547,7 @@ def scan(files: dict[str, str], slugs: set[str]) -> dict[str, Finding]:
                 add(f"fixture-include|{path}", _hits(FIXTURE_INCLUDE_RE, code))
             if under(path, PLATFORM_ROOTS):
                 add(f"platform-ifdef|{path}", _hits(PLATFORM_IF_RE, bare))
+                add(f"platform-stub|{path}", _hits(PLATFORM_STUB_RE, bare))
             if path.startswith(SRC):
                 for target, lines in sorted(layer_violations(path, code).items()):
                     add(f"layer-include|{path}|{target}", lines)
@@ -920,6 +935,7 @@ POSITIVE_TREE = {
     "prosper/tests/fixtures/big.h": BIG,
     RENDER_RUNNER: "vkQueueWaitIdle(q);\n",
     "prosper/src/hle/p.cpp": "#ifdef _WIN32\nint w;\n#elif defined(__linux__)\nint l;\n#endif\n",
+    "prosper/src/hle/s.cpp": "HLE(k_demo_stub) {\n    return 0;\n}\n",
     "prosper/src/host/l.cpp": '#include "hle/dispatch/dispatch.hpp"\n#include "self/module.hpp"\n',
     "prosper/src/gpu/v.cpp": "vkCreateFence(d, &i, nullptr, &f);\n",
     "prosper/frontends/k.cpp": '#include "fixtures/render_runner.h"\n',
@@ -934,6 +950,7 @@ POSITIVE_KEYS = {
     "file-size|prosper/tests/fixtures/big.h": FILE_SIZE_THRESHOLD + 1,
     f"blocking-sync|{RENDER_RUNNER}|vkQueueWaitIdle": 1,
     "platform-ifdef|prosper/src/hle/p.cpp": 2,
+    "platform-stub|prosper/src/hle/s.cpp": 1,
     "layer-include|prosper/src/host/l.cpp|hle": 1,
     "vk-object|prosper/src/gpu/v.cpp|vkCreateFence": 1,
     "fixture-include|prosper/frontends/k.cpp": 1,
@@ -956,6 +973,8 @@ NEGATIVE_TREE = {
     "prosper/frontends/s.cpp": 'puts("prosper::test::x");\n',
     "prosper/src/host/h.cpp": '#ifdef _WIN32\n#endif\n#include "self/module.hpp"\n',
     "prosper/src/hle/c.cpp": '// #ifdef _WIN32\n#include "host/platform/lifecycle.hpp"\n',
+    "prosper/src/hle/t.cpp": "// HLE(k_x_stub)\nHLE(k_real) {\n    return 0;\n}\nHLE(k_stub_helper) {\n    return 0;\n}\n",
+    "prosper/src/host/hs.cpp": "HLE(k_host_stub) {\n    return 0;\n}\n",
     "prosper/frontends/j.cpp": '// #include "fixtures/x.h"\n#include "shared/x.h"\n',
     "prosper/src/gpu/q.cpp": "#if PROSPER_WIN32_LIKE\n#endif\nPFN_vkCreateFence p;\n",
 }
