@@ -14,6 +14,8 @@ Messenger's exact earlier run/source/arm is unbound. Retained native images and 
 remain useful. Evergate's logged route now reached its menu and real tutorial in two fresh OFF
 runs and an ON counterpart, with matching recorded input intervals. Its shader-refusal rendering
 HOLD remains visible. Two of fourteen original phase comparisons are documented, twelve remain.
+Dead Cells' scripted OFF arm additionally reached its menu and two gameplay/HUD captures;
+its matching ON arm is the next bounded run.
 Performance measurements must use a verified scripted route and matching admitted scenes;
 explicitly selected splash/title populations must stay separate from in-level gameplay.
 
@@ -336,6 +338,52 @@ with only Messenger currently free of counted draw/dispatch losses in these obse
 Dead Cells route calibration using script-edge logs and composed-input recording. Messenger still
 needs a scripted replay before timed performance use. The repeated GTA/Sonic campaign is pending.
 
+## Dead Cells OFF: unchanged scripted route reaches menu and gameplay
+
+Freshly fetched remote main remained **ee9dcb1e1e2c695426acb25575e7c6c320971d1d**.
+The qualified immutable normal app was reused without another build or CPU-test run. The visible
+OFF arm completed in **321.022 s** under the original320-second cap; app, runner and launcher
+exited0,31 owned normal-window samples included before-cutoff, and both owned PID/births drained.
+The post-run prosper-app process census was empty. This was compatibility work without a quiet
+measurement interval, so none of its timing is admitted as a performance benefit.
+
+The shipping full-render route `dead-cells/reach-first-gameplay-full-render.pad` was unchanged:
+SHA256 **c3068304e8dbc966ae4fa2e5dabcf53fcb81fc2f335b6b02f3aa71805d5a16c3**.
+All29 logged state transitions arrived, including12 long Cross holds, the Circle124–300 hold,
+their compound states, and left-stick-left188–240. The successful-pad-read recorder retained
+20 nonneutral intervals with exact logged read endpoints and states. Same simultaneous physical
+input remains indistinguishable from an already matching scripted state; no manual rescue is
+documented for this arm. Pad-read ordinals and flip ordinals are separate clocks.
+
+Root inspected all seven **3840×2160** native frames. Requests500/1000/2000, actual500/1001/2000,
+show the selectable Play/Options/Save Slot1 menu. Requests2500/3000, actual2501/3000, show the
+Clean Cut update pop-up over mode selection; those are not gameplay. Actual12000 and15000 show
+the player/world/fog at the Primary weapon tutorial, weapon slots,100/100 health, counters and
+minimap, with animation differences between the frames. Their paused0s timer does not establish
+an active-play timed population. Three early menu calibration requests were added to the original
+four requests; native scale, full render cadence and320-second ceiling stayed unchanged.
+
+All emitted alarm lines and exit reports were read. Across63 completed windows, frontend,
+contract and backend dropped draws, skipped dispatches, Wave64 refusals and target evictions were
+all0. OFF deferred counters were0; graphics wait/device timestamp observations were92052/92052.
+The F32-unverified alarm fired63/63, with1928080 known-launch-mode compiler requests and558579
+requests whose site inventories were truncated; these are requests, not wrong-pixel counts.
+One new unimplemented HLE NID was observed in the first window. RTT-colorless publication was
+NO_DATA. Exit draw disposition reported1963998 seen/recorded and0 dropped with quiescence still
+unverified. Target peak was17/256 entries and110.5/2048MiB; no graphics submission failure line
+was emitted. Native phase inspection and zero counted losses do not certify every pixel.
+
+The private supplement `root-ee9d-DeadCells-checkpoint-20261004-v1` contains a separately
+verified and fsynced OFF archive: **204072960 bytes**, **816 regular members**, zero mismatches;
+SHA256 **640ba07f54f18932c94e3f6c789fa27c76bacb65229f81e225c0b29e3e0c1985**.
+It retains native images, full raw reports, composed input, grant/window/cleanup receipts and
+source/app bindings. Later state/public sidecars can postdate its immutable creation snapshot.
+
+**Five phase-observed arms, still two of fourteen phase pairs.** Next: freshly check remote main,
+then an isolated ON arm with the same route, seven requests, app/settings and original cap.
+Read actual deferred-path counters, every native frame and all diagnostics before completing
+the pair. No async default change or quiet-performance result is claimed.
+
 ## Input control required for performance admission
 
 Every timed arm must carry the exact scripted route bytes/hash and input trace, source/app identity,
@@ -529,8 +577,9 @@ historical sky seam/HUD/partial-model rendering HOLD remains a hold until curren
 5. Messenger OFF/ON visual evidence is complete on ee9dcb1e; scripted progression still needs
    verification before performance use. Evergate's first new route calibration reached the menu
    and one Ki/tutorial frame, then fresh OFF and ON captured both 7000/7300 with matching recorded
-   input. Keep the fragment-rendering HOLD; continue with Dead Cells route calibration and the other
-   twelve phase comparisons. Qualify fresh native desktop/env/window
+   input. Keep the fragment-rendering HOLD; Dead Cells OFF now reached its menu and two gameplay/HUD
+   frames on its unchanged route. Complete its matching ON arm, then the other eleven phase comparisons.
+   Qualify fresh native desktop/env/window
    binding and bind the exact reviewed helper hashes and actual app/source. The 3fe preparation contains inert
    candidate data only: no app qualification, executable grant or completed current guard.
 6. Continue the fourteen-title pairs above, recording native menu/gameplay/HUD judgments,
