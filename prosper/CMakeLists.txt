@@ -2999,6 +2999,9 @@ endif()
   prosper_add_gtest(test_fragment_packet_exports
     SOURCES tests/gpu/recompiler/test_fragment_packet_exports.cpp
     INCLUDES tests tests/gpu/recompiler LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
+  prosper_add_gtest(test_fragment_packet_waitcnt
+    SOURCES tests/gpu/recompiler/test_fragment_packet_waitcnt.cpp
+    INCLUDES tests tests/gpu/recompiler LIBRARIES prosper_core PROPERTIES TIMEOUT 120)
   add_executable(test_fragment_packet_wqm tests/gpu/recompiler/test_fragment_packet_wqm.cpp)
   target_include_directories(test_fragment_packet_wqm PRIVATE tests)
   target_link_libraries(test_fragment_packet_wqm PRIVATE prosper_core)

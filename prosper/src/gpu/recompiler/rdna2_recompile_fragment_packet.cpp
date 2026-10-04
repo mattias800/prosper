@@ -5,6 +5,7 @@
 #include "gpu/recompiler/fragment_packet_definedness.hpp"
 #include "gpu/recompiler/fragment_packet_exports_internal.hpp"
 #include "gpu/recompiler/fragment_packet_export_timing.hpp"
+#include "gpu/recompiler/rdna2_waitcnt.hpp"
 #include <bitset>
 
 namespace prosper::gpu {
@@ -592,9 +593,10 @@ FragmentPacketProgram recompile_fragment_packet_impl(const FragmentInvocationPac
                                                             (in.words[0] >> 12) & 1u});
         if (packet.export_observation == FragmentPacketExportObservation::Architectural &&
             in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c)
-            gap = in.simm16 == 0 ? nullptr : "packet-export-waitcnt-nonzero-unimplemented";
+            gap = rdna2_waitcnt_execution_gap(uint16_t(in.simm16));
         if (services && gap && !packet_resource_instruction_gap(in)) gap = nullptr;
-        else if (services && in.fmt == Rdna2Format::SMEM)
+        else if (services && (in.fmt == Rdna2Format::SMEM ||
+                              (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0c)))
             gap = packet_resource_instruction_gap(in);
         else if (services && in.fmt == Rdna2Format::VINTRP && in.opcode == 0 &&
                  in.dst.value == in.src[0].value) gap = "packet-parameter-p1-alias-mode-unavailable";
