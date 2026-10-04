@@ -172,8 +172,8 @@ TEST(GapOpcodeRefusals, ControlVop3aSiblingCompiles) {
 TEST(GapOpcodeRefusals, PermB32) {
     static const uint32_t w[2] = {0xd7440005u, 0x040e0501u};
     expect_vop3a_v5_v1_v2_v3(w, 0x344u);
-    expect_gap_refusal(program(kVop3Prologue, {w[0], w[1]}), 0xA001ull, 4, {w[0], w[1]},
-                       Rdna2Format::VOP3, 0x344u);
+    expect_compiles(program(kVop3Prologue, {w[0], w[1]}), 0xA001ull,
+                    "v_perm_b32 v5, v1, v2, v3");
 }
 
 // V_DIV_FIXUP_F32 v5, v1, v2, v3 (VOP3 0x15f).
