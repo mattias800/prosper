@@ -164,8 +164,41 @@ Every structural cost identified in the ratchet work is either a rule in
 | host-platform `#if` outside `src/host` | `platform-ifdef` | 355 in 44 files |
 | reverse layer includes | `layer-include` | 29 in 22 rows |
 | Vulkan object creation on hot paths | `vk-object` (call-site count of `vkCreateDescriptorPool`, `vkAllocateMemory`, `vkCreateFence`) -- a static proxy only: it cannot tell per-draw from one-time | 22 in 15 rows |
+| a platform arm that is a stub or reduced copy of the other arm's logic | **not checkable yet**: a `platform-ifdef` count cannot see it, because the divergent code sits in a few large arms rather than in many directives. Owned by the `src/hle/memory/hle_kernel_mem.cpp` migration in `HOST_PLATFORM_SEAM.md` (move 7 in the table above). | 1 measured case: the Windows arm of `hle_kernel_mem.cpp` stubs `sceAmprAprCommandBufferConstructor` and `sceAmprCommandBufferSetBuffer`, and leaves the AMM handlers unregistered (#2384) |
 | giant functions | **not checkable here**: needs a parser to find function extents. Owned by the separate clang-tidy PR as `readability-function-size`. | -- |
 | per-draw object creation proven at run time | **not checkable statically**; the steady-state performance invariants in #4193 own it | -- |
+
+## Open questions
+
+Not settled by this document, and each needs the project owner before it becomes a move.
+
+- **Where does a cross-cutting HLE area live?** The target tree places layers, not functional areas.
+  APR (`sceAmpr*`, and the file reads and event-queue completions behind it) spans `hle/memory`,
+  `hle/fs` and `hle/kernel` today. Before any of it is extracted, decide which layer it belongs to
+  and which interface it uses to reach `gpu/`, since `hle` is the top of the include order.
+  **Recommendation, for the owner to accept or reject:** keep `hle/` as the API surface only (NID
+  handlers, argument decoding, return codes) and put the engine behind it in `guest/`: the command
+  buffer model, the executor and the completion dialects, written once and platform-neutral, reaching
+  the OS only through `src/host/platform/` interfaces (`vm`, `file`, `clock`). It implements guest-visible
+  coprocessor semantics rather than a Sony API, which is what the proposed `guest/` layer is for, and it
+  is the usual split in compatibility layers (Wine's per-platform backend behind a portable service,
+  HLE service handlers over a shared emulated-hardware core in console emulators). The handlers then
+  have no platform arm to fall behind. `CONFIDENCE: MED`: this follows the document's own layering and
+  the seam's one-interface-per-service rule, but no APR code has been moved to test it.
+- **What keeps two platform arms in step?** `HOST_PLATFORM_SEAM.md` asks for a test per interface
+  that runs on both hosts, but nothing detects a platform arm that was never ported. One possible
+  guard is a differential test that feeds the same recorded command-buffer stream to both hosts and
+  compares what the guest can observe. `CONFIDENCE: LOW` that this is practical, and it has not been
+  tried.
+- **Possible consequence of the stub-arm row above, observed and not diagnosed:** on a recent `main`
+  the Windows build of *Dragon Quest VII Reimagined* (`PPSA17942`) ends in a guest fault within about
+  3 s in 3 of 3 `tools/screenshot` runs (two at `libc.prx+0x4270`, the title's fatal-error path, one at
+  `rip=0`), and a `boot_trace` run printed `Apr read failure 1 at CB offset 40` just before the same
+  fault. Its status doc (`docs/games/DRAGON_QUEST_STATUS.md`) records Windows runs of the same title
+  that rendered in 3 of 6 attempts on 2026-08-10 and Linux at rung 3. Whether the difference is a
+  regression since then, this dump or build, or the stubbed arms is **not established**; one
+  experiment that filled the stubbed constructor's output slots with a staging buffer, as the Linux
+  arm does, changed nothing.
 
 ## Tracking
 
