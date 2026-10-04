@@ -11081,6 +11081,84 @@ int main() {
     CHECK(gotTperm.size() == N && badTperm == 0,
           "Tperm: v_perm_b32 correctly handles all selector categories (0..7, 8..11, 12, 13..255)");
 
+    // Tdiv_fixup: v_div_fixup_f32 IEEE 754 division corner case execution coverage.
+    // S0 = quotient, S1 = denominator, S2 = numerator.
+    // Tests bit-exact outputs across:
+    //   - pass-through: (2.0, 1.0, 2.0) -> 2.0; (2.0, -1.0, 2.0) -> -2.0; (-2.0, 1.0, 2.0) -> 2.0
+    //   - 0/0 -> 0xffc00000; inf/inf -> 0xffc00000
+    //   - x/0 -> signed inf; inf/y -> signed inf
+    //   - x/inf -> signed zero; 0/y -> signed zero
+    //   - NaN priority: S2 quieted NaN wins over S1 quieted NaN
+    //   - Exponent underflow: (exp(S2) - exp(S1)) < -150 -> signed zero
+    // Dynamic execution drives inputs via v0, v1, v2.
+    // llvm-mc gfx1030: v_div_fixup_f32 v3, v0, v1, v2 is [0x03,0x00,0x5f,0xd5,0x00,0x03,0x0a,0x04]
+    const uint32_t codeTdivFixup[] = {
+        0xd55f0003u,
+        0x040a0300u,   // v_div_fixup_f32 v3, v0, v1, v2 (src0=v0, src1=v1, src2=v2)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTdivFixup =
+        recompile_valu(codeTdivFixup, std::size(codeTdivFixup), 3, /*out_vgpr*/ 3);
+    CHECK(!spvTdivFixup.empty(), "recompiled TdivFixup (v_div_fixup_f32) -> SPIR-V");
+
+    const struct {
+        uint32_t s0;
+        uint32_t s1;
+        uint32_t s2;
+        uint32_t exp;
+    } kDivFixupCases[] = {
+        // pass-through: abs(s0) with sign(s1)^sign(s2)
+        {0x40000000u, 0x3f800000u, 0x40000000u, 0x40000000u},   // (2.0, 1.0, 2.0) -> 2.0
+        {0x40000000u, 0xbf800000u, 0x40000000u, 0xc0000000u},   // (2.0, -1.0, 2.0) -> -2.0
+        {0xc0000000u, 0x3f800000u, 0x40000000u, 0x40000000u},   // (-2.0, 1.0, 2.0) -> 2.0
+        // 0/0 and inf/inf -> 0xffc00000 (indeterminate NaN)
+        {0x3f800000u, 0x00000000u, 0x80000000u, 0xffc00000u},   // (1.0, +0, -0) -> 0xffc00000
+        {0x3f800000u, 0xff800000u, 0x7f800000u, 0xffc00000u},   // (1.0, -inf, +inf) -> 0xffc00000
+        // x/0 and inf/y -> signed inf
+        {0x3f800000u, 0x80000000u, 0x3f800000u, 0xff800000u},   // (1.0, -0.0, 1.0) -> -inf
+        {0x3f800000u, 0x40000000u, 0x7f800000u, 0x7f800000u},   // (1.0, 2.0, +inf) -> +inf
+        // x/inf and 0/y -> signed zero
+        {0x3f800000u, 0xff800000u, 0x3f800000u,
+         0x80000000u},   // (1.0, -inf, 1.0) -> -0.0 (0x80000000)
+        {0x3f800000u, 0x40400000u, 0x80000000u,
+         0x80000000u},   // (1.0, 3.0, -0.0) -> -0.0 (0x80000000)
+        // NaN priority: quiet(S2) wins over quiet(S1)
+        {0x3f800000u, 0x3f800000u, 0x7f800001u,
+         0x7fc00001u},   // S2=0x7f800001 -> quiet(S2)=0x7fc00001
+        {0x3f800000u, 0xff800005u, 0x3f800000u,
+         0xffc00005u},   // S1=0xff800005 -> quiet(S1)=0xffc00005
+        {0x3f800000u, 0xff800005u, 0x7f800001u, 0x7fc00001u},   // both NaN -> quiet(S2)
+        // NaN numerator over a zero denominator: (1.0, +0.0, 0x7f800001) -> 0x7fc00001
+        {0x3f800000u, 0x00000000u, 0x7f800001u, 0x7fc00001u},
+        // Exponent underflow exact boundary pair:
+        // S1=0x4b800000 (exp 151), S2=0x00800000 (exp 1) -> diff = -150: passes S0 through (1.0)
+        {0x3f800000u, 0x4b800000u, 0x00800000u, 0x3f800000u},
+        // S1=0x4c000000 (exp 152), S2=0x00800000 (exp 1) -> diff = -151: underflow -> signed zero (+0.0)
+        {0x3f800000u, 0x4c000000u, 0x00800000u, 0x00000000u},
+        // Negative-sign underflow: S1=0xcc000000 (-exp 152), S2=0x00800000 (+exp 1) -> diff = -151 -> -0.0 (0x80000000)
+        {0x3f800000u, 0xcc000000u, 0x00800000u, 0x80000000u},
+        // S2=2^-126 (0x00800000, exp=1), S1=2^126 (0x7e800000, exp=253) -> diff = -252 < -150
+        {0x00000001u, 0x7e800000u, 0x00800000u, 0x00000000u},   // underflow -> signed zero (+0.0)
+    };
+
+    std::vector<float> inDivFixup(N * 3, 0.0f);
+    std::vector<uint32_t> expDivFixup(N, 0);
+    for (uint32_t i = 0; i < N; ++i) {
+        const auto& c = kDivFixupCases[i % std::size(kDivFixupCases)];
+        inDivFixup[i * 3 + 0] = std::bit_cast<float>(c.s0);
+        inDivFixup[i * 3 + 1] = std::bit_cast<float>(c.s1);
+        inDivFixup[i * 3 + 2] = std::bit_cast<float>(c.s2);
+        expDivFixup[i] = c.exp;
+    }
+    std::vector<float> gotTdivFixup = prosper::test::run_compute(spvTdivFixup, inDivFixup, N, N);
+    uint32_t badTdivFixup = 0;
+    for (uint32_t i = 0; i < N && gotTdivFixup.size() == N; ++i) {
+        if (bits_of(gotTdivFixup[i]) != expDivFixup[i]) ++badTdivFixup;
+    }
+    CHECK(gotTdivFixup.size() == N && badTdivFixup == 0,
+          "TdivFixup: v_div_fixup_f32 correctly computes IEEE 754 division corner cases and "
+          "underflow");
+
     // Worms Armageddon (PPSA20052) rejects every one of its vertex shaders at pc=7 on VOP3 0x15d
     // (v_sad_u32). Its shipped .ags shader assets carry the identical word, so the encoding is
     // independently attested. D.u32 = abs(S0.u32 - S1.u32) + S2.u32 — an UNSIGNED magnitude, which
