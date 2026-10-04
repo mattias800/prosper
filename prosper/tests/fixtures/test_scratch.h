@@ -43,7 +43,9 @@
 // Invalid SPIR-V magic number` against correct emitters (#2632).
 //
 // The root comes from `PROSPER_TEST_SCRATCH_DIR`, which `prosper/CMakeLists.txt` sets per ctest
-// case to `<build-dir>/test-scratch/<ctest case name>`; running a test binary by hand instead uses
+// case to `<build-dir>/test-scratch/<ctest case name>` -- for tests registered with add_test only:
+// GoogleTest cases discovered at ctest time do not get it and share `<cwd>/prosper-test-scratch`
+// (the pid component still separates processes). Running a test binary by hand also uses
 // `<cwd>/prosper-test-scratch` — with **no** binary or case name under it, so the whole hand-run
 // path is `<cwd>/prosper-test-scratch/pid-<n>/<fixture>` (see the two assignments below). That
 // exact shape is what arm C above has to be aimed at, and getting it wrong inverts the arm without
@@ -55,6 +57,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -80,19 +85,22 @@ inline int scratch_process_id() {
 #endif
 }
 
-// Creates the directory on construction and removes it (and everything under it) on destruction.
-// Held by a function-local static so the removal runs during normal process exit.
 // Creates `leaf` and its parents, retrying when a concurrent process removes an empty shared root
 // between create_directories' existence check and its mkdir of `leaf`. ~ScratchDirectory below
 // drops the root with a non-recursive remove, which succeeds whenever no pid directory sits under
 // it at that instant -- so the root can vanish under a peer that is mid-create, and that peer's
 // mkdir then fails with ENOENT. GoogleTest cases discovered at ctest time do not get the per-case
 // PROSPER_TEST_SCRATCH_DIR, so they all share <cwd>/prosper-test-scratch and race on it under
-// `ctest -j` (Windows CI aborted on this). Each retry recreates the root; the bound only stops a
-// genuinely unwritable root from spinning.
+// `ctest -j` (Windows CI aborted on this). Each retry recreates the root. The retries back off
+// exponentially (50 us doubling, capped at 3.2 ms): immediate retries can fall into lockstep with a
+// peer under CPU contention, and the delay also outlasts transient Windows states such as a
+// delete-pending directory. The bound (about 0.2 s in all) only stops a genuinely unwritable root
+// from spinning; the caller then aborts with the last error.
 inline bool create_scratch_leaf(const std::filesystem::path& leaf, std::error_code& error,
                                 int attempts = 64) {
     for (int attempt = 0; attempt < attempts; ++attempt) {
+        if (attempt)
+            std::this_thread::sleep_for(std::chrono::microseconds(50L << std::min(attempt - 1, 6)));
         error.clear();
         std::filesystem::create_directories(leaf, error);
         if (!error && std::filesystem::is_directory(leaf)) return true;
@@ -100,6 +108,8 @@ inline bool create_scratch_leaf(const std::filesystem::path& leaf, std::error_co
     return false;
 }
 
+// Creates the directory on construction and removes it (and everything under it) on destruction.
+// Held by a function-local static so the removal runs during normal process exit.
 struct ScratchDirectory {
     std::filesystem::path path;
 
