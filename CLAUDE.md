@@ -328,9 +328,10 @@ either, and do not read `RENDER_LOOP.md`'s "Status: open" as current.
     of another arm's logic: a new `HLE(*_stub)` handler raises `platform-stub` (a name-based proxy,
     so a stub named otherwise is not seen and is still not allowed). Put the logic once in a
     portable component that reaches the OS through `src/host/platform/`
-    (`prosper/docs/architecture/HOST_PLATFORM_SEAM.md`), and see Standards 1-3 in
-    `prosper/docs/architecture/ARCHITECTURE_TARGET_TREE.md`, which take effect as that document's
-    `guest/` layer is approved. The two existing stubs are the Windows APR arms in
+    (`prosper/docs/architecture/HOST_PLATFORM_SEAM.md`, Decision and Migration order). The
+    `guest/` extraction proposed in `prosper/docs/architecture/ARCHITECTURE_TARGET_TREE.md`
+    still requires owner approval; this rule does not authorize that move. The two existing
+    stubs are the Windows APR arms in
     `src/hle/memory/hle_kernel_mem.cpp` (#2384).
   - **Steady-state invariants** — a direction and a review rule, not a description of today. After
     warm-up: **P1** no CPU wait on, or readback from, the GPU inside a frame unless the guest
