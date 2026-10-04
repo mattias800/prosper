@@ -210,14 +210,13 @@ TEST(GapOpcodeRefusals, MadI64I32) {
                        Rdna2Format::VOP3, 0x177u);
 }
 
-// S_MOVRELS_B32 s0, s1 (SOP1 0x2e): reads s[1 + M0]. M0 and s1 are defined explicitly, so the
-// relative source is s1 = 7. Control: s_mov_b32 s0, s1 (SOP1 0x03) in the same slot.
+// S_MOVRELS_B32 s0, s1 (SOP1 0x2e): reads s[1 + M0]. When M0 is untracked, it must refuse fail-visibly.
+// Control: s_mov_b32 s0, s1 (SOP1 0x03) in the same slot compiles without M0.
 TEST(GapOpcodeRefusals, MovrelsB32) {
     static const uint32_t w = 0xbe802e01u;
     static const uint32_t control = 0xbe800301u;
     const std::vector<uint32_t> prologue = {
-        0xbefc0380u,   // s_mov_b32 m0, 0
-        0xbe810387u,   // s_mov_b32 s1, 7
+        0xbe810387u,   // s_mov_b32 s1, 7 (M0 untracked!)
     };
     for (uint32_t word : {w, control}) {
         const Rdna2Inst dec = rdna2_decode_one(&word, 1);
@@ -228,7 +227,7 @@ TEST(GapOpcodeRefusals, MovrelsB32) {
         EXPECT_TRUE(is_sgpr(dec.src[0], 1));
     }
     expect_compiles(program(prologue, {control}), 0xA040ull, "control: s_mov_b32 s0, s1");
-    expect_gap_refusal(program(prologue, {w}), 0xA041ull, 2, {w}, Rdna2Format::SOP1, 0x2eu);
+    expect_gap_refusal(program(prologue, {w}), 0xA041ull, 1, {w}, Rdna2Format::SOP1, 0x2eu);
 }
 
 // IMAGE_GATHER4 v[0:3], v[0:1], s[12:19], s[20:23] dmask:0x1 dim:SQ_RSRC_IMG_2D (MIMG 0x40). A

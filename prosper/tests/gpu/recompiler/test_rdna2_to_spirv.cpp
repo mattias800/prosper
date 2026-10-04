@@ -11038,6 +11038,33 @@ int main() {
     CHECK(gotT11e.size()==N && badT11e==0,
           "T11e: v_bcnt_u32_b32 adds the exact 32-bit population count");
 
+    // T_movrels: s_movrels_b32 (SOP1 0x2e). Relative-indexed SGPR read: dst = SGPR[base + M0].
+    // Tests:
+    //   1. Constant M0 fold (M0 = 2, base = s4): s4=100, s5=200, s6=300. Reads s[4+2]=s6 -> 300.
+    //   2. Dynamic M0 read from v0 lane 0 via v_readfirstlane_b32: base = s4, M0 dynamic in {0, 1, 2}.
+    const uint32_t codeTmovrels[] = {
+        0xbe840380u + 100u,   // s_mov_b32 s4, 100
+        0xbe850380u + 200u,   // s_mov_b32 s5, 200
+        0xbe8603ffu,        0x0000012cu,   // s_mov_b32 s6, 300
+        0xd10000fcu,        0x00010000u,   // v_readfirstlane_b32 m0, v0
+        0xbe802e04u,   // s_movrels_b32 s0, s4 (reads s[4 + M0])
+        0x7e000200u,   // v_mov_b32 v0, s0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTmovrels =
+        recompile_valu(codeTmovrels, std::size(codeTmovrels), 1, /*out_vgpr*/ 0);
+    CHECK(!spvTmovrels.empty(), "recompiled T_movrels (s_movrels_b32 dynamic M0) -> SPIR-V");
+
+    // Run compute with lane 0 = 2 -> M0 = 2 -> s0 = s[4+2] = s6 = 300
+    std::vector<float> inMovrels(N, 2.0f);
+    std::vector<float> gotTmovrels = prosper::test::run_compute(spvTmovrels, inMovrels, N, N);
+    uint32_t badTmovrels = 0;
+    for (uint32_t i = 0; i < N && gotTmovrels.size() == N; ++i) {
+        if (gotTmovrels[i] != 300.0f) ++badTmovrels;
+    }
+    CHECK(gotTmovrels.size() == N && badTmovrels == 0,
+          "T_movrels: s_movrels_b32 dynamic M0 read index resolves correct SGPR value");
+
     // Worms Armageddon (PPSA20052) rejects every one of its vertex shaders at pc=7 on VOP3 0x15d
     // (v_sad_u32). Its shipped .ags shader assets carry the identical word, so the encoding is
     // independently attested. D.u32 = abs(S0.u32 - S1.u32) + S2.u32 — an UNSIGNED magnitude, which

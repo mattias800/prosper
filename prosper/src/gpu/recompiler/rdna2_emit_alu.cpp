@@ -33,6 +33,7 @@
 #include <unordered_set>
 #include <vector>
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_movrels.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 
 namespace prosper::gpu {
@@ -1475,6 +1476,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg.erase(124);                 // M0 is untracked again, as it was at entry
                 rs.sreg_entry_m0.erase(124);
                 return true;
+            }
+            if (in.opcode == 0x2E) {
+                // s_movrels_b32: relative SGPR read indexed by M0
+                return emit_s_movrels_b32(b, rs, in, ok);
             }
             // A write of anything else ends this register's entry-M0 lifetime.
             rs.sreg_entry_m0.erase(in.dst.value);
