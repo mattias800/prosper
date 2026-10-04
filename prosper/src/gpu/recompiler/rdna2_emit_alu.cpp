@@ -4902,29 +4902,42 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                          b.lor(b.fcmp(Op_FUnordNotEqual, s1, s1),
                                                b.fcmp(Op_FUnordNotEqual, s2, s2)));
                 vreg[in.dst.value] = fresult(b.sel(nan_any, min3, med));
-            } else if (in.opcode == 0x159) {                          // v_med3_u32
-                // Unsigned median of three values: max(min(a,b), min(max(a,b),c)).
-                // Astro Bot uses this to clamp a material index into [0,31] before its world-map
-                // depth prepass. VERIFIED(llvm-mc gfx1030: VOP3 0x159 = v_med3_u32).
+            } else if (in.opcode == 0x158 || in.opcode == 0x159) {   // v_med3_i32 / v_med3_u32
+                // Median of three values: max(min(a,b), min(max(a,b),c)).
+                // Astro Bot uses v_med3_u32 to clamp a material index into [0,31] before its world-map
+                // depth prepass. VERIFIED(llvm-mc gfx1030: VOP3 0x158 = v_med3_i32, 0x159 = v_med3_u32).
                 const uint32_t s0 = val(in.src[0]), s1 = val(in.src[1]), s2 = val(in.src[2]);
-                const uint32_t mn = b.uext2(Glsl_UMin, s0, s1);
-                const uint32_t mx = b.uext2(Glsl_UMax, s0, s1);
-                vreg[in.dst.value] = b.uext2(Glsl_UMax, mn, b.uext2(Glsl_UMin, mx, s2));
-            } else if (in.opcode == 0x153 || in.opcode == 0x156) {    // v_min3_u32 / v_max3_u32
-                // Unsigned min/max of three values. Sonic Racing: CrossWorlds' post chain rejects on
-                // v_max3_u32 four times per boot (#2013); v_min3_u32 is its neighbour in the same
-                // ISA family and the same lowering. VERIFIED(round-trip llvm-mc gfx1030: VOP3
-                // 0x153 = v_min3_u32, 0x156 = v_max3_u32). CONFIDENCE: HIGH.
-                const uint32_t op = in.opcode == 0x153 ? (uint32_t)Glsl_UMin : (uint32_t)Glsl_UMax;
+                const bool is_signed = (in.opcode == 0x158);
+                const uint32_t min_op = is_signed ? (uint32_t)Glsl_SMin : (uint32_t)Glsl_UMin;
+                const uint32_t max_op = is_signed ? (uint32_t)Glsl_SMax : (uint32_t)Glsl_UMax;
+                auto ext2 = [&](uint32_t op, uint32_t a, uint32_t b_val) {
+                    return is_signed ? b.sext2(op, a, b_val) : b.uext2(op, a, b_val);
+                };
+                const uint32_t mn = ext2(min_op, s0, s1);
+                const uint32_t mx = ext2(max_op, s0, s1);
+                vreg[in.dst.value] = ext2(max_op, mn, ext2(min_op, mx, s2));
+            } else if (in.opcode == 0x152 || in.opcode == 0x153 || in.opcode == 0x155 ||
+                       in.opcode == 0x156) {   // v_min3_{i32,u32} / v_max3_{i32,u32}
+                // Signed/unsigned min/max of three values. Sonic Racing: CrossWorlds' post chain rejects on
+                // v_max3_u32 four times per boot (#2013); signed forms round out the 32-bit triple-min/max family.
+                // VERIFIED(round-trip llvm-mc gfx1030: VOP3 0x152 = v_min3_i32, 0x153 = v_min3_u32,
+                // 0x155 = v_max3_i32, 0x156 = v_max3_u32). CONFIDENCE: HIGH.
+                const bool is_min = (in.opcode == 0x152 || in.opcode == 0x153);
+                const bool is_signed = (in.opcode == 0x152 || in.opcode == 0x155);
+                const uint32_t op = is_min
+                                        ? (is_signed ? (uint32_t)Glsl_SMin : (uint32_t)Glsl_UMin)
+                                        : (is_signed ? (uint32_t)Glsl_SMax : (uint32_t)Glsl_UMax);
                 vreg[in.dst.value] =
-                    b.uext2(op, b.uext2(op, val(in.src[0]), val(in.src[1])), val(in.src[2]));
-            } else if (in.opcode == 0x151 || in.opcode == 0x154) {    // v_min3_f32 / v_max3_f32
+                    is_signed
+                        ? b.sext2(op, b.sext2(op, val(in.src[0]), val(in.src[1])), val(in.src[2]))
+                        : b.uext2(op, b.uext2(op, val(in.src[0]), val(in.src[1])), val(in.src[2]));
+            } else if (in.opcode == 0x151 || in.opcode == 0x154) {   // v_min3_f32 / v_max3_f32
                 // min/max of three floats (DOLL's AA-clamp PS). VERIFIED(round-trip llvm-mc gfx1010:
                 // VOP3 0x151 = v_min3_f32, 0x154 = v_max3_f32 — 0xd551…/0xd554…). NaN-aware NMin/
                 // NMax per the ISA one-NaN rule. CONFIDENCE: HIGH.
                 uint32_t op = in.opcode == 0x151 ? (uint32_t)Glsl_NMin : (uint32_t)Glsl_NMax;
                 vreg[in.dst.value] = fresult(b.fext2(op, b.fext2(op, fv(0), fv(1)), fv(2)));
-            } else if (in.opcode == 0x368 || in.opcode == 0x369) {    // v_cvt_pknorm_{i16,u16}_f32
+            } else if (in.opcode == 0x368 || in.opcode == 0x369) {   // v_cvt_pknorm_{i16,u16}_f32
                 // Clamp and normalize two f32 values, then pack src0 in bits[15:0] and src1 in
                 // bits[31:16]. Astro's title ship VS uses the unsigned form (exact first word
                 // d7690002). AMD specifies round-to-nearest-even for the normalized conversion.
@@ -4934,14 +4947,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t hi = b.pack_norm(fv(1), 16, is_signed, scale);
                 vreg[in.dst.value] = b.ibin(
                     Op_BitwiseOr, lo, b.ibin(Op_ShiftLeftLogical, hi, b.uconst(16)));
-            } else if (in.opcode == 0x36A) {                          // v_cvt_pk_u16_u32
+            } else if (in.opcode == 0x36A) {   // v_cvt_pk_u16_u32
                 // Pack two u32 into u16 halves with UNSIGNED SATURATION: lo = min(s0,0xFFFF),
                 // hi = min(s1,0xFFFF); dst = lo | hi<<16. VERIFIED(round-trip llvm-mc gfx1010:
                 // VOP3 0x36a — 0xd76a…). CONFIDENCE: HIGH.
                 uint32_t lo = b.uext2(Glsl_UMin, val(in.src[0]), b.uconst(0xFFFFu));
                 uint32_t hi = b.uext2(Glsl_UMin, val(in.src[1]), b.uconst(0xFFFFu));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, lo, b.ibin(Op_ShiftLeftLogical, hi, b.uconst(16)));
-            } else if (in.opcode == 0x362) {                          // v_ldexp_f32
+            } else if (in.opcode == 0x362) {   // v_ldexp_f32
                 // AMD opcode 866: D.f = S0.f * 2**S1.i. The exact GTA V production packet is
                 // d7620000,0002030d (`v_ldexp_f32 v0,v13,v1`) with no modifiers. Admit that proven
                 // shape only for now: ABS/NEG on the integer exponent and output-modifier denormal
@@ -5009,7 +5022,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                 }
                 vreg[in.dst.value] = fresult(r2);
-            } else if (in.opcode == 0x143) {                          // v_mad_u32_u24 = (s0&0xFFFFFF)*(s1&0xFFFFFF)+s2
+            } else if (in.opcode == 0x143) {   // v_mad_u32_u24 = (s0&0xFFFFFF)*(s1&0xFFFFFF)+s2
                 uint32_t m24 = b.uconst(0xFFFFFF);
                 uint32_t p = b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, val(in.src[0]), m24),
                                               b.ibin(Op_BitwiseAnd, val(in.src[1]), m24));

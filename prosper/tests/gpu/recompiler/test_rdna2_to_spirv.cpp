@@ -497,6 +497,76 @@ int main() {
     printf("  kernel4d mismatches=%u (out[60]=%g)\n", bad4d, got4d.size()==N ? got4d[60] : -1);
     CHECK(got4d.size()==N && bad4d==0, "recompiled kernel 4d computes unsigned min-of-three correctly");
 
+    // Kernel 4e: signed median-of-three (v_med3_i32, 0x158).
+    // Tests signed ordering with negative and positive inputs. Unlike kernels 4-4d these convert
+    // through the SIGNED forms -- v_cvt_i32_f32 (VOP1 0x08) in, v_cvt_f32_i32 (0x05) out -- since
+    // v_cvt_u32_f32 would clamp every negative input to 0 and never exercise a signed compare.
+    const uint32_t code4e[] = {
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0xD5580003u, 0x040A0300u, 0x7E000B03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4e = recompile_valu(code4e, std::size(code4e), 3, 0);
+    CHECK(!spv4e.empty(), "recompiled kernel 4e (v_med3_i32) -> SPIR-V");
+
+    // Kernel 4f: signed max-of-three (v_max3_i32, 0x155).
+    const uint32_t code4f[] = {
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0xD5550003u, 0x040A0300u, 0x7E000B03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4f = recompile_valu(code4f, std::size(code4f), 3, 0);
+    CHECK(!spv4f.empty(), "recompiled kernel 4f (v_max3_i32) -> SPIR-V");
+
+    // Kernel 4g: signed min-of-three (v_min3_i32, 0x152).
+    const uint32_t code4g[] = {
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0xD5520003u, 0x040A0300u, 0x7E000B03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv4g = recompile_valu(code4g, std::size(code4g), 3, 0);
+    CHECK(!spv4g.empty(), "recompiled kernel 4g (v_min3_i32) -> SPIR-V");
+
+    std::vector<float> in4_signed(N * 3);
+    for (uint32_t i = 0; i < N; i++) {
+        const int32_t s0 = (int32_t)((i * 37u) % 211u) - 100;
+        const int32_t s1 = (int32_t)((i * 83u + 17u) % 211u) - 100;
+        const int32_t s2 = (int32_t)((i * 19u + 101u) % 211u) - 100;
+        in4_signed[i * 3 + 0] = (float)s0;
+        in4_signed[i * 3 + 1] = (float)s1;
+        in4_signed[i * 3 + 2] = (float)s2;
+    }
+
+    std::vector<float> got4e = prosper::test::run_compute(spv4e, in4_signed, N, N);
+    uint32_t bad4e = 0;
+    for (uint32_t i = 0; i < N && got4e.size() == N; i++) {
+        const int32_t s0 = (int32_t)((i * 37u) % 211u) - 100;
+        const int32_t s1 = (int32_t)((i * 83u + 17u) % 211u) - 100;
+        const int32_t s2 = (int32_t)((i * 19u + 101u) % 211u) - 100;
+        const int32_t mn = std::min(s0, s1), mx = std::max(s0, s1);
+        const int32_t exp = std::max(mn, std::min(mx, s2));
+        if (got4e[i] != (float)exp) bad4e++;
+    }
+    CHECK(got4e.size() == N && bad4e == 0, "recompiled kernel 4e computes signed median correctly");
+
+    std::vector<float> got4f = prosper::test::run_compute(spv4f, in4_signed, N, N);
+    uint32_t bad4f = 0;
+    for (uint32_t i = 0; i < N && got4f.size() == N; i++) {
+        const int32_t s0 = (int32_t)((i * 37u) % 211u) - 100;
+        const int32_t s1 = (int32_t)((i * 83u + 17u) % 211u) - 100;
+        const int32_t s2 = (int32_t)((i * 19u + 101u) % 211u) - 100;
+        const int32_t exp = std::max(s0, std::max(s1, s2));
+        if (got4f[i] != (float)exp) bad4f++;
+    }
+    CHECK(got4f.size() == N && bad4f == 0,
+          "recompiled kernel 4f computes signed max-of-three correctly");
+
+    std::vector<float> got4g = prosper::test::run_compute(spv4g, in4_signed, N, N);
+    uint32_t bad4g = 0;
+    for (uint32_t i = 0; i < N && got4g.size() == N; i++) {
+        const int32_t s0 = (int32_t)((i * 37u) % 211u) - 100;
+        const int32_t s1 = (int32_t)((i * 83u + 17u) % 211u) - 100;
+        const int32_t s2 = (int32_t)((i * 19u + 101u) % 211u) - 100;
+        const int32_t exp = std::min(s0, std::min(s1, s2));
+        if (got4g[i] != (float)exp) bad4g++;
+    }
+    CHECK(got4g.size() == N && bad4g == 0,
+          "recompiled kernel 4g computes signed min-of-three correctly");
+
     // Kernel 5: unsigned min/max/sub/not/and. u=(uint)a; d=(max-min) & ~u0. out=(float)d.
     const uint32_t code5[] = {
         0x7E000F00u, 0x7E020F01u, 0x26040300u, 0x28060300u, 0x4C040503u, 0x7E066F00u, 0x36040702u, 0x7E000D02u, 0xBF810000u,
