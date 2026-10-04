@@ -89,7 +89,7 @@ static std::vector<uint8_t> sps_baseline(uint8_t sps_id) {
     w.ue(2);         // max_num_ref_frames
     w.u(1, 0);       // gaps_in_frame_num_value_allowed_flag
     w.ue(39);        // pic_width_in_mbs_minus1 -> 640
-    w.ue(22);        // pic_height_in_map_units_minus1 -> 352
+    w.ue(22);        // pic_height_in_map_units_minus1 -> 368 ((22+1)*16)
     w.u(1, 1);       // frame_mbs_only_flag
     w.u(1, 1);       // direct_8x8_inference_flag
     w.u(1, 0);       // frame_cropping_flag
@@ -169,6 +169,10 @@ static void test_baseline_parses_with_all_flags_absent() {
     CHECK(prosper::h264::parse_first_sps(au.data(), au.size(), &m),
           "baseline SPS should parse");
     CHECK(!m.crop_flag, "no crop flag expected");
+    CHECK(m.chroma_format_idc == 1,
+          "a Baseline SPS does not code chroma_format_idc: 4:2:0 is inferred");
+    CHECK(m.frame_mbs_only, "frame_mbs_only_flag expected");
+    CHECK(m.coded_width == 640 && m.coded_height == 368, "coded size is (40 x 23) macroblocks");
     CHECK(!m.ar_flag, "no AR flag expected");
     CHECK(!m.timing_flag, "no timing flag expected");
 }
@@ -181,6 +185,9 @@ static void test_high_profile_scaling_skip_and_vui() {
     CHECK(m.crop_flag, "crop flag expected");
     CHECK(m.crop[0] == 0 && m.crop[1] == 8 && m.crop[2] == 2 && m.crop[3] == 6,
           "crop quad values must match exactly");
+    CHECK(m.chroma_format_idc == 1 && m.frame_mbs_only, "4:2:0 progressive, as coded");
+    CHECK(m.coded_width == 1920 && m.coded_height == 1088,
+          "coded size read past the scaling-matrix skip");
     CHECK(m.ar_flag && m.ar_idc == 255, "extended SAR idc expected");
     CHECK(m.sar_w == 40 && m.sar_h == 33, "SAR must resolve to the explicit 40/33");
     CHECK(m.timing_flag && m.num_units_in_tick == 1001 && m.time_scale == 60000,
@@ -445,4 +452,70 @@ TEST(H264Sps, Contract) {
         FAIL() << "legacy early exit";
     }
     EXPECT_EQ(fails, 0);
+}
+
+// The frame-cropping rectangle in luma samples (7.4.2.1.1): offsets are in CropUnitX = SubWidthC
+// and CropUnitY = SubHeightC * (2 - frame_mbs_only_flag). The macOS AvPlayer backend applies it
+// when AVFoundation hands back the coded picture, so a wrong unit is a wrong picture there.
+TEST(H264Sps, FrameCropRectFollowsCropUnitsForEveryChromaFormatAndFieldCoding) {
+    using prosper::h264::CropRect;
+    using prosper::h264::frame_crop_rect;
+    auto meta = [](uint32_t chroma, bool frame_mbs_only, uint32_t l, uint32_t r, uint32_t t,
+                   uint32_t b) {
+        SpsPictureMeta m;
+        m.chroma_format_idc = chroma;
+        m.frame_mbs_only = frame_mbs_only;
+        m.coded_width = 1920;
+        m.coded_height = 1088;
+        m.crop_flag = true;
+        m.crop[0] = l;
+        m.crop[1] = r;
+        m.crop[2] = t;
+        m.crop[3] = b;
+        return m;
+    };
+    CropRect c;
+    // 4:2:0 progressive -- the common 1920x1088 -> 1920x1080 case: units (2, 2).
+    ASSERT_TRUE(frame_crop_rect(meta(1, true, 0, 0, 0, 4), &c));
+    EXPECT_EQ(c.x, 0u);
+    EXPECT_EQ(c.y, 0u);
+    EXPECT_EQ(c.width, 1920u);
+    EXPECT_EQ(c.height, 1080u);
+    // 4:2:0 interlaced (frame_mbs_only = 0): CropUnitY doubles to 4.
+    ASSERT_TRUE(frame_crop_rect(meta(1, false, 1, 1, 1, 1), &c));
+    EXPECT_EQ(c.x, 2u);
+    EXPECT_EQ(c.y, 4u);
+    EXPECT_EQ(c.width, 1916u);
+    EXPECT_EQ(c.height, 1080u);
+    // 4:2:2: SubWidthC 2, SubHeightC 1 -> units (2, 1); interlaced (2, 2).
+    ASSERT_TRUE(frame_crop_rect(meta(2, true, 1, 0, 3, 5), &c));
+    EXPECT_EQ(c.x, 2u);
+    EXPECT_EQ(c.y, 3u);
+    EXPECT_EQ(c.width, 1918u);
+    EXPECT_EQ(c.height, 1080u);
+    ASSERT_TRUE(frame_crop_rect(meta(2, false, 0, 0, 1, 1), &c));
+    EXPECT_EQ(c.y, 2u);
+    EXPECT_EQ(c.height, 1084u);
+    // 4:4:4 and monochrome: units (1, 1); interlaced (1, 2).
+    ASSERT_TRUE(frame_crop_rect(meta(3, true, 3, 1, 0, 8), &c));
+    EXPECT_EQ(c.x, 3u);
+    EXPECT_EQ(c.width, 1916u);
+    EXPECT_EQ(c.height, 1080u);
+    ASSERT_TRUE(frame_crop_rect(meta(0, false, 1, 0, 1, 0), &c));
+    EXPECT_EQ(c.x, 1u);
+    EXPECT_EQ(c.y, 2u);
+    EXPECT_EQ(c.width, 1919u);
+    EXPECT_EQ(c.height, 1086u);
+    // Refusals: no crop flag, no coded size, or offsets that consume the whole picture
+    // (including values that would wrap a 32-bit product).
+    SpsPictureMeta none = meta(1, true, 0, 0, 0, 4);
+    none.crop_flag = false;
+    EXPECT_FALSE(frame_crop_rect(none, &c));
+    SpsPictureMeta unsized = meta(1, true, 0, 0, 0, 4);
+    unsized.coded_width = 0;
+    EXPECT_FALSE(frame_crop_rect(unsized, &c));
+    EXPECT_FALSE(frame_crop_rect(meta(1, true, 480, 480, 0, 0), &c))
+        << "960+960 crops all 1920 columns";
+    EXPECT_FALSE(frame_crop_rect(meta(1, true, 0x80000000u, 0, 0, 0), &c)) << "must not wrap";
+    EXPECT_FALSE(frame_crop_rect(meta(1, true, 0, 0, 0, 0), nullptr));
 }

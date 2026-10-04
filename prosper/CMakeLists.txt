@@ -5746,6 +5746,42 @@ if(UNIX AND PROSPER_AUDIO_FFMPEG AND TARGET prosper_core)
     pkg_check_modules(PROSPER_AJM_FFMPEG QUIET IMPORTED_TARGET
                       libavcodec libavutil libswresample)
   endif()
+  # On Apple Silicon the macOS build is x86_64 (Rosetta), while Homebrew's FFmpeg is arm64-only:
+  # pkg-config finds it, and the build then fails at the final link with undefined _swr_init and
+  # friends. Ask the linker before adopting it, so a mismatched FFmpeg is reported here and skipped
+  # rather than breaking every executable that links the backend.
+  set(_prosper_ffmpeg_wrong_arch FALSE)
+  if(PROSPER_AJM_FFMPEG_FOUND AND APPLE)
+    include(CheckCXXSourceCompiles)
+    # Re-probe on every configure: the verdict depends on CMAKE_OSX_ARCHITECTURES and on which FFmpeg
+    # is installed, and a cached result would survive a change to either.
+    unset(PROSPER_AJM_FFMPEG_LINKS_FOR_TARGET_ARCH CACHE)
+    set(_prosper_saved_required_includes "${CMAKE_REQUIRED_INCLUDES}")
+    set(_prosper_saved_required_libraries "${CMAKE_REQUIRED_LIBRARIES}")
+    set(CMAKE_REQUIRED_INCLUDES ${PROSPER_AJM_FFMPEG_INCLUDE_DIRS})
+    set(CMAKE_REQUIRED_LIBRARIES ${PROSPER_AJM_FFMPEG_LINK_LIBRARIES})
+    check_cxx_source_compiles([=[
+      extern "C" {
+      #include <libavcodec/avcodec.h>
+      #include <libswresample/swresample.h>
+      }
+      int main() { return avcodec_version() != 0 && swr_alloc() != nullptr ? 0 : 1; }
+    ]=] PROSPER_AJM_FFMPEG_LINKS_FOR_TARGET_ARCH)
+    set(CMAKE_REQUIRED_INCLUDES "${_prosper_saved_required_includes}")
+    set(CMAKE_REQUIRED_LIBRARIES "${_prosper_saved_required_libraries}")
+    if(NOT PROSPER_AJM_FFMPEG_LINKS_FOR_TARGET_ARCH)
+      set(_prosper_ffmpeg_arch "${CMAKE_OSX_ARCHITECTURES}")
+      if(NOT _prosper_ffmpeg_arch)
+        set(_prosper_ffmpeg_arch "${CMAKE_SYSTEM_PROCESSOR}")
+      endif()
+      list(GET PROSPER_AJM_FFMPEG_LINK_LIBRARIES 0 _prosper_ffmpeg_first_lib)
+      message(WARNING "FFmpeg (${_prosper_ffmpeg_first_lib}) does not link for "
+                      "${_prosper_ffmpeg_arch} (an arm64-only Homebrew FFmpeg cannot serve the "
+                      "x86_64 Rosetta build) - AJM MP3/Opus decoding disabled")
+      set(PROSPER_AJM_FFMPEG_FOUND FALSE)
+      set(_prosper_ffmpeg_wrong_arch TRUE)
+    endif()
+  endif()
   if(PROSPER_AJM_FFMPEG_FOUND)
     add_library(prosper_ajm_ffmpeg STATIC
                 frontends/audio_ffmpeg/ajm_ffmpeg.cpp)
@@ -5779,7 +5815,9 @@ if(UNIX AND PROSPER_AUDIO_FFMPEG AND TARGET prosper_core)
       target_compile_definitions(screenshot PRIVATE PROSPER_AUDIO_FFMPEG=1)
     endif()
   else()
-    message(WARNING "FFmpeg audio development packages not found - AJM MP3 decoding disabled")
+    if(NOT _prosper_ffmpeg_wrong_arch)   # the probe above already explained a wrong-arch skip
+      message(WARNING "FFmpeg audio development packages not found - AJM MP3 decoding disabled")
+    endif()
   endif()
 endif()
 
@@ -5877,6 +5915,41 @@ if(UNIX AND NOT APPLE AND PROSPER_VIDEO_VAAPI AND TARGET prosper_core)
     endif()
   else()
     message(WARNING "FFmpeg/libva development packages not found - Linux AvPlayer video disabled")
+  endif()
+endif()
+
+# macOS native AvPlayer backend: AVFoundation demuxes, VideoToolbox decodes in hardware. Outside
+# prosper_core for the same reasons as the Media Foundation and VA-API backends above: core-only and
+# headless builds carry no OS media dependency, and the app installs it explicitly.
+option(PROSPER_VIDEO_VT "Build the macOS AVFoundation/VideoToolbox AvPlayer backend" ON)
+if(APPLE AND PROSPER_VIDEO_VT AND TARGET prosper_core)
+  enable_language(OBJCXX)
+  add_library(prosper_video_vt STATIC frontends/video_vt/videotoolbox_backend.mm)
+  target_include_directories(prosper_video_vt PUBLIC frontends/video_vt PRIVATE src)
+  target_compile_options(prosper_video_vt PRIVATE -fobjc-arc)
+  # CMAKE_CXX_STANDARD does not apply to OBJCXX; pin it so the .mm does not ride the compiler default.
+  set_target_properties(prosper_video_vt PROPERTIES OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED ON)
+  target_link_libraries(prosper_video_vt PUBLIC prosper_core
+                        "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
+                        "-framework VideoToolbox" "-framework Foundation")
+
+  prosper_add_gtest(test_video_vt
+    SOURCES frontends/video_vt/test_video_vt.cpp
+    LIBRARIES prosper_video_vt)
+  # H.264 Main + AAC stereo, the codec pair of Silksong's cinematics; testpattern.mp4 is MPEG-4
+  # Part 2, which VideoToolbox has no hardware decoder for.
+  target_compile_definitions(test_video_vt PRIVATE
+    PROSPER_TEST_H264_AAC_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/h264_aac_testpattern.mp4"
+    PROSPER_TEST_H264_CROP_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/h264_crop_testpattern.mp4"
+    PROSPER_TEST_MPEG4_ASSET="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/testpattern.mp4")
+
+  if(TARGET boot_trace)
+    target_link_libraries(boot_trace PRIVATE prosper_video_vt)
+    target_compile_definitions(boot_trace PRIVATE PROSPER_VIDEO_VT=1)
+  endif()
+  if(TARGET screenshot)
+    target_link_libraries(screenshot PRIVATE prosper_video_vt)
+    target_compile_definitions(screenshot PRIVATE PROSPER_VIDEO_VT=1)
   endif()
 endif()
 
@@ -6119,6 +6192,12 @@ if(TARGET prosper-app AND TARGET prosper_video_mf)
   target_link_libraries(prosper-app PRIVATE prosper_video_mf)
   target_compile_definitions(prosper-app PRIVATE PROSPER_VIDEO_MF=1)
   message(STATUS "prosper-app: Media Foundation video enabled")
+endif()
+
+if(TARGET prosper-app AND TARGET prosper_video_vt)
+  target_link_libraries(prosper-app PRIVATE prosper_video_vt)
+  target_compile_definitions(prosper-app PRIVATE PROSPER_VIDEO_VT=1)
+  message(STATUS "prosper-app: AVFoundation/VideoToolbox video enabled")
 endif()
 
 if(TARGET prosper-app AND TARGET prosper_video_vaapi)

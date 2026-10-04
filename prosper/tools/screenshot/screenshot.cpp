@@ -72,6 +72,9 @@
 #ifdef PROSPER_VIDEO_MF
 #include "media_foundation_backend.hpp" // native Windows AvPlayer demux + hardware decode
 #endif
+#ifdef PROSPER_VIDEO_VT
+#include "videotoolbox_backend.hpp"   // native macOS AVFoundation demux + VideoToolbox hardware decode
+#endif
 #ifdef PROSPER_VIDEO_VAAPI
 #include "vaapi_backend.hpp"             // native Linux FFmpeg demux + VA-API hardware decode
 #endif
@@ -617,6 +620,10 @@ int main(int argc, char** argv) {
 #ifdef PROSPER_VIDEO_MF
         if (!prosper::video::install_media_foundation_backend())
             fprintf(stderr, "[avp] Media Foundation backend unavailable\n");
+#endif
+#ifdef PROSPER_VIDEO_VT
+        if (!prosper::video::install_videotoolbox_backend())
+            fprintf(stderr, "[avp] VideoToolbox backend unavailable\n");
 #endif
 #ifdef PROSPER_VIDEO_VAAPI
         if (!prosper::video::install_vaapi_backend())

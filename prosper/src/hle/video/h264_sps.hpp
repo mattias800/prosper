@@ -19,6 +19,11 @@ namespace prosper::h264 {
 // SPS. Field names follow the H.264 spec grammar; the mapping to guest offsets lives in
 // fill_picture_info() where the offset evidence is cited.
 struct SpsPictureMeta {
+    // What the crop offsets are measured against (7.4.2.1.1): the coded size in luma samples and
+    // the two fields that fix CropUnitX/CropUnitY.
+    uint32_t chroma_format_idc = 1;   // 1 (4:2:0) unless a High-family profile says otherwise
+    bool frame_mbs_only = true;
+    uint32_t coded_width = 0, coded_height = 0;   // PicWidthInMbs*16, FrameHeightInMbs*16
     bool crop_flag = false;
     uint32_t crop[4] = {0, 0, 0, 0};   // left, right, top, bottom (frame_crop_*_offset)
     bool ar_flag = false;
@@ -66,5 +71,15 @@ void resolve_sar(uint8_t idc, uint32_t ext_w, uint32_t ext_h, uint32_t* w, uint3
 // the caller must not write anything.
 bool fill_picture_info(const SpsPictureMeta& meta, void* record, void* pic_info,
                        size_t size);
+
+// The frame-cropping rectangle in LUMA samples of the coded picture (7.4.2.1.1): the four
+// frame_crop_*_offset values are in CropUnitX = SubWidthC and CropUnitY = SubHeightC *
+// (2 - frame_mbs_only_flag), where 4:2:0 is (2,2), 4:2:2 is (2,1), and 4:4:4 / monochrome are
+// (1,1). False when there is no crop, no coded size, or the offsets consume the whole picture.
+// Exact: no rounding -- a consumer that needs an even origin (NV12 chroma pairs) rounds itself.
+struct CropRect {
+    uint32_t x = 0, y = 0, width = 0, height = 0;
+};
+bool frame_crop_rect(const SpsPictureMeta& meta, CropRect* out);
 
 }  // namespace prosper::h264

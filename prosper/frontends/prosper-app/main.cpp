@@ -94,6 +94,9 @@ static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before
 #ifdef PROSPER_VIDEO_MF
 #include "media_foundation_backend.hpp" // native Windows AvPlayer demux + hardware decode
 #endif
+#ifdef PROSPER_VIDEO_VT
+#include "videotoolbox_backend.hpp"   // native macOS AVFoundation demux + VideoToolbox hardware decode
+#endif
 #ifdef PROSPER_VIDEO_VAAPI
 #include "vaapi_backend.hpp"            // native Linux FFmpeg demux + VA-API hardware decode
 #endif
@@ -1249,6 +1252,9 @@ bool g_boot_attempted = false;
 // right after the built-in HLE is registered, before the guest runs. Each is built in only when its
 // SDL3 frontend is enabled; a window app wants them all on by default.
 static void install_host_backends() {
+    // One read for every native video backend below (Media Foundation / VideoToolbox / VA-API);
+    // at most one of them is compiled in, and each honours the same switch.
+    [[maybe_unused]] const bool video_disabled = getenv("PROSPER_APP_DISABLE_VIDEO") != nullptr;
 #ifdef PROSPER_AUDIO_FFMPEG
     if (prosper::ajm::install_ffmpeg_decoder_backend())
         fprintf(stderr, "[app] FFmpeg AJM audio decoder installed.\n");
@@ -1256,7 +1262,7 @@ static void install_host_backends() {
         fprintf(stderr, "[app] FFmpeg AJM audio decoder unavailable.\n");
 #endif
 #ifdef PROSPER_VIDEO_MF
-    if (!getenv("PROSPER_APP_DISABLE_VIDEO")) {
+    if (!video_disabled) {
         if (prosper::video::install_media_foundation_backend())
             fprintf(stderr, "[app] Media Foundation video backend installed.\n");
         else
@@ -1265,8 +1271,18 @@ static void install_host_backends() {
         fprintf(stderr, "[app] native video backend disabled.\n");
     }
 #endif
+#ifdef PROSPER_VIDEO_VT
+    if (!video_disabled) {
+        if (prosper::video::install_videotoolbox_backend())
+            fprintf(stderr, "[app] AVFoundation/VideoToolbox video backend installed.\n");
+        else
+            fprintf(stderr, "[app] AVFoundation/VideoToolbox video backend unavailable.\n");
+    } else {
+        fprintf(stderr, "[app] native video backend disabled.\n");
+    }
+#endif
 #ifdef PROSPER_VIDEO_VAAPI
-    if (!getenv("PROSPER_APP_DISABLE_VIDEO")) {
+    if (!video_disabled) {
         if (prosper::video::install_vaapi_backend())
             fprintf(stderr, "[app] FFmpeg/VA-API video backend installed.\n");
         else
