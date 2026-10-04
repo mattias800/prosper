@@ -44,6 +44,26 @@ constexpr uint32_t kNetErrorNetUnreach = net_error(FreeBsdErrno::ENetUnreach);  
 // answers here -- the constant is named for what it encodes, not asserted to be the library's choice.
 constexpr uint32_t kNetErrorMFile = net_error(FreeBsdErrno::EMFile);   // 0x80410118
 
+// libSceNet socket family (hle_net.cpp). These answer the same offline question, so they share
+// the facility rule above rather than repeating the literal:
+// - BadF: an operation naming a socket id prosper never handed out (EBADF, 9).
+// - Inval: a null source pointer to sceNetInetPton (EINVAL, 22; module 0x6aa0).
+// - NoSpc: sceNetInetNtop with a null pointer or a buffer too small for the text (ENOSPC, 28;
+//   module 0x63c0).
+// - OpNotSupp: setsockopt/getsockopt for an option prosper models none of, and a socket type
+//   outside {STREAM, DGRAM} (EOPNOTSUPP, 45).
+// - AfNoSupport: an address family outside what sceNetSocket / InetPton / InetNtop accept
+//   (EAFNOSUPPORT, 47; module 0x6aa0 and 0x63c0).
+// - NotConn: shutdown of a socket that never connected (ENOTCONN, 57).
+// CONFIDENCE: HIGH on the facility encoding and on the pton/ntop errnos (read off the module); LOW
+// on the remaining exact errno choices.
+constexpr uint32_t kNetErrorBadF = net_error(FreeBsdErrno::EBadF);   // 0x80410109
+constexpr uint32_t kNetErrorInval = net_error(FreeBsdErrno::EInval);   // 0x80410116
+constexpr uint32_t kNetErrorNoSpc = net_error(FreeBsdErrno::ENoSpc);   // 0x8041011c
+constexpr uint32_t kNetErrorOpNotSupp = net_error(FreeBsdErrno::EOpNotSupp);   // 0x8041012d
+constexpr uint32_t kNetErrorAfNoSupport = net_error(FreeBsdErrno::EAfNoSupport);   // 0x8041012f
+constexpr uint32_t kNetErrorNotConn = net_error(FreeBsdErrno::ENotConn);   // 0x80410139
+
 // The encoding pinned against the values the evidence above names, so a change to the rule reddens
 // the build rather than quietly re-numbering every caller.
 static_assert(net_error(FreeBsdErrno::EInProgress) == 0x80410124u, "EINPROGRESS (libSceHttp2)");
@@ -51,5 +71,11 @@ static_assert(net_error(FreeBsdErrno::EConnRefused) == 0x8041013du, "ECONNREFUSE
 static_assert(net_error(FreeBsdErrno::EHostDown) == 0x80410140u, "EHOSTDOWN (title classifier)");
 static_assert(kNetErrorNetUnreach == 0x80410133u, "ENETUNREACH");
 static_assert(kNetErrorMFile == 0x80410118u, "EMFILE, sceNetPoolCreate's historic value");
+static_assert(kNetErrorBadF == 0x80410109u, "EBADF");
+static_assert(kNetErrorInval == 0x80410116u, "EINVAL");
+static_assert(kNetErrorNoSpc == 0x8041011cu, "ENOSPC");
+static_assert(kNetErrorOpNotSupp == 0x8041012du, "EOPNOTSUPP");
+static_assert(kNetErrorAfNoSupport == 0x8041012fu, "EAFNOSUPPORT (module 0x6aa0)");
+static_assert(kNetErrorNotConn == 0x80410139u, "ENOTCONN");
 
 }  // namespace prosper::net

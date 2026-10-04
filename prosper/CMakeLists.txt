@@ -1425,6 +1425,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/net/test_http2.cpp
     LIBRARIES prosper_core)
 
+  # libSceNet socket family: byte-order/inet helpers computed offline, real socket ids from a
+  # local table, and an honest ENETUNREACH on the packet path instead of the dispatcher 0.
+  prosper_add_gtest(test_net_socket
+    SOURCES tests/hle/net/test_net_socket.cpp
+    LIBRARIES prosper_core)
+
   add_executable(test_guard_recursion tests/hle/test_guard_recursion.cpp)
   target_link_libraries(test_guard_recursion PRIVATE prosper_core Threads::Threads)
   add_test(NAME guard_recursion COMMAND test_guard_recursion)
@@ -1511,6 +1517,12 @@ if(TARGET prosper_core)
   # #4275: NP Universal Data System property objects/arrays and SessionSignaling init.
   prosper_add_gtest(test_np_uds_properties
     SOURCES tests/hle/np/test_np_uds_properties.cpp
+    LIBRARIES prosper_core)
+
+  # NP sub-libraries on the honest signed-out console: libSceNpTrophy (v1), libSceNpTus,
+  # libSceNpScore and libSceNpCommerce — valid local ids, no PSN data, headless store dialog.
+  prosper_add_gtest(test_np_sublibs
+    SOURCES tests/hle/np/test_np_sublibs.cpp
     LIBRARIES prosper_core)
 
   # libSceAudio3d / libSceAudioPropagation / libSceAcm (spatial + batch audio): local 3D-port

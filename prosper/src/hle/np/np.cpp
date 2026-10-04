@@ -220,6 +220,112 @@ HLE(s_nptrophy2_createhandle) { svc_log("sceNpTrophy2CreateHandle", a0,a1,a2,a3,
 HLE(s_nptrophy2_regctx)       { svc_log("sceNpTrophy2RegisterContext", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_nptrophy2_ok)           { return 0; }
 
+// --- libSceNpTrophy (v1) — the PS4-era trophy API on the same honest console. ------------------
+// A title still on the v1 API asks the question NpTrophy2 already answers, so it gets the same
+// answer: the lifecycle constructors hand back valid local ids so the bring-up completes, and
+// every content/unlock/list query fails with the value s_nptrophy2_unavailable returns, so a
+// caller cannot consume unwritten out-structs as trophy data (the #213 class). Trophies are a
+// local feature and UserService reports user 1 logged in, so a "user not logged in" answer here
+// would contradict that library. The PS4 v1 headers in other emulators (shadPS4 np_error.h) list
+// USER_NOT_LOGGED_IN = 0x8055161D; that is a hypothesis about the PS4 facility, not a PS5
+// observation, and is deliberately not used. CONFIDENCE: HIGH that failure beats
+// success+garbage-out; LOW on the specific constant (same as Trophy2).
+//
+// CreateContext/CreateHandle keep the PS4 ABI the Trophy2 handlers use (small s32 id written
+// through arg0), but only through a plausible guest pointer.
+HLE(s_nptrophy_v1_createctx) {
+    svc_log("sceNpTrophyCreateContext", a0, a1, a2, a3, a4, a5);
+    if (svc_ptrish(a0)) *(int32_t*)PW(a0) = 1;
+    return 0;
+}
+HLE(s_nptrophy_v1_createhandle) {
+    svc_log("sceNpTrophyCreateHandle", a0, a1, a2, a3, a4, a5);
+    if (svc_ptrish(a0)) *(int32_t*)PW(a0) = 1;
+    return 0;
+}
+
+// --- libSceNpTus / libSceNpScore — PSN data transport on a signed-out console. ----------------
+// TUS moves save data between devices; Score moves score-board data. Neither reaches the PSN
+// data path with no signed-in user, so every data operation answers the NP-core SIGNED_OUT that
+// NpManager gives for the same question — a title must not hear "signed out" from one library
+// and "data served" from another. The context/request constructors stay valid (small local ids,
+// no identity fabricated, the NpWebApi2/NpTrophy2 contract). The TUS/Score per-facility error
+// spaces are not in the 3.20 dump, so the verified NP-core value is used rather than an
+// invented facility value; out-params of the refused calls are left untouched. CONFIDENCE: HIGH
+// on the sign and the untouched out-params; MED on the exact constant.
+//
+// The constructors RETURN the new id in eax; arg0 is not an out-pointer. Guest call sites pin
+// this: Uncharted calls the argument-less sceNpAuthCreateRequest with rdi still pointing at a
+// live object and keeps eax (test/js); PPSA25258 and GTA V keep CreateAsyncRequest's return as
+// the request id and pass it on. TUS/Score/Lookup take values (serviceLabel, titleCtxId) in arg0,
+// so arg0 is never dereferenced here. CONFIDENCE: HIGH.
+namespace {
+std::atomic<int32_t> g_np_next_ctx_id{1};
+}
+HLE(s_np_ctx) {
+    svc_log("np ctx/request create", a0, a1, a2, a3, a4, a5);
+    int32_t id = g_np_next_ctx_id.fetch_add(1);
+    if (id <= 0) {   // wrapped: restart the sequence rather than hand out a non-positive id
+        g_np_next_ctx_id.store(2);
+        id = 1;
+    }
+    return (uint64_t)(uint32_t)id;
+}
+HLE(s_np_offline) {
+    return NP_ERR_SIGNED_OUT;
+}
+// The lifecycle calls of the batch-2 sub-libraries (Tus/Score/Auth/Utility/Matching2/Sns) that
+// succeed locally: abort/delete/timeout/thread-param setters and the like. A handler of its own
+// rather than a reuse of s_np_ok, so the NpManager registrations s_np_ok serves stay countable
+// (tools/re/test_hle_handler_map.py pins them).
+HLE(s_np_sublib_ok) {
+    return 0;
+}
+
+// --- libSceNpCommerce — the PS Store dialog, headless lifecycle like the sign-in prompt (#3784).
+// Initialize -> INITIALIZED; Open auto-dismisses to FINISHED (no interactive UI headless, so the
+// game's "wait until dismissed" loop still exits — Dead Cells polls UpdateStatus for 3);
+// Close -> FINISHED; Terminate -> NONE; GetStatus/UpdateStatus report the state. Status values
+// follow the shared dialog convention (NONE=0, INITIALIZED=1, RUNNING=2, FINISHED=3, see the
+// sign-in dialog above). CONFIDENCE: MED.
+//
+// GetResult(result*): titles read the result without checking the return (PPSA20052 reads
+// byte [result+4], the `authorized` flag, after ignoring the call's return), so the struct is
+// written rather than left as caller stack. No store transaction or authorization happened, which
+// is derivable locally: result = USER_CANCELED (1, the dialog closed without completing anything)
+// and authorized = 0. This answers no ownership question. CONFIDENCE: MED on the layout (offset 4
+// pinned by that call site), LOW on result = 1 versus 0.
+namespace {
+std::atomic<int32_t> g_commerce_dialog_status{0 /*NONE*/};
+}
+HLE(s_commerce_init) {
+    svc_log("sceNpCommerceDialogInitialize", a0, a1, a2, a3, a4, a5);
+    g_commerce_dialog_status.store(1 /*INITIALIZED*/);
+    return 0;
+}
+HLE(s_commerce_open) {
+    svc_log("sceNpCommerceDialogOpen", a0, a1, a2, a3, a4, a5);
+    g_commerce_dialog_status.store(3 /*FINISHED*/);
+    return 0;
+}
+HLE(s_commerce_status) {
+    return (uint64_t)(unsigned)g_commerce_dialog_status.load();
+}
+HLE(s_commerce_close) {
+    g_commerce_dialog_status.store(3 /*FINISHED*/);
+    return 0;
+}
+HLE(s_commerce_term) {
+    g_commerce_dialog_status.store(0 /*NONE*/);
+    return 0;
+}
+HLE(s_commerce_result) {
+    if (!svc_ptrish(a0)) return 0x80550003ull;   // SCE_NP_ERROR_INVALID_ARGUMENT
+    *(int32_t*)PW(a0) = 1;               // result: USER_CANCELED — nothing was completed
+    *((uint8_t*)PW(a0) + 4) = 0;          // authorized: no
+    return 0;
+}
+
 // --- libSceShare / libSceGameLiveStreaming: local lifecycle, features unavailable headless. -----
 // The PS5 3.20 import table supplies the exact NIDs. Kyty's matching SDK surface gives the call
 // shapes: ShareSetContentParam takes one required C string; GameLiveStreamingInitialize takes only
@@ -662,6 +768,209 @@ void register_np_hle() {
     Hle::register_fn("sysY2FHYff4", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2DestroyContext");
     Hle::register_fn("d8P11CI40KE", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2DestroyHandle");
     Hle::register_fn("fYapWA9xVmA", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2AbortHandle");
+    // libSceNpTrophy (v1) — PS4-era trophy API: valid lifecycle ids, no content (see block above).
+    // Every NID is computed from its name by R(), so it cannot drift from the export it names.
+    R("sceNpTrophyCreateContext", s_nptrophy_v1_createctx);
+    R("sceNpTrophyCreateHandle", s_nptrophy_v1_createhandle);
+    R("sceNpTrophyIntCreateHandle", s_nptrophy_v1_createhandle);
+    R("sceNpTrophyRegisterContext", s_nptrophy2_regctx);
+    R("sceNpTrophyDestroyContext", s_nptrophy2_ok);
+    R("sceNpTrophyDestroyHandle", s_nptrophy2_ok);
+    R("sceNpTrophyAbortHandle", s_nptrophy2_ok);
+    R("sceNpTrophyIntAbortHandle", s_nptrophy2_ok);
+    R("sceNpTrophySystemRemoveAll", s_nptrophy2_ok);
+    R("sceNpTrophySystemUnregisterTitleSyncedCallback", s_nptrophy2_ok);
+    R("sceNpTrophySystemUnregisterTitleUpdateCallback", s_nptrophy2_ok);
+    R("sceNpTrophySystemWrapDebugLockTrophy", s_nptrophy2_ok);
+    R("sceNpTrophySystemWrapDebugUnlockTrophy", s_nptrophy2_ok);
+    R("sceNpTrophySystemWrapRemoveUserData", s_nptrophy2_ok);
+    R("sceNpTrophyGetGameInfo", s_nptrophy2_unavailable);
+    R("sceNpTrophyGetTrophyUnlockState", s_nptrophy2_unavailable);
+    R("sceNpTrophyGetGroupInfo", s_nptrophy2_unavailable);
+    R("sceNpTrophyGetTrophyInfo", s_nptrophy2_unavailable);
+    R("sceNpTrophyGetGroupIcon", s_nptrophy2_unavailable);
+    R("sceNpTrophyGetTrophyIcon", s_nptrophy2_unavailable);
+    R("sceNpTrophyNumInfoGetTotal", s_nptrophy2_unavailable);
+    R("sceNpTrophyUnlockTrophy", s_nptrophy2_unavailable);
+    R("sceNpTrophyShowTrophyList", s_nptrophy2_unavailable);
+    R("sceNpTrophyIntGetProgress", s_nptrophy2_unavailable);
+    R("sceNpTrophyIntNetSyncTitle", s_nptrophy2_unavailable);
+    R("sceNpTrophyIntNetSyncTitles", s_nptrophy2_unavailable);
+    R("sceNpTrophySystemDbgCtl", s_nptrophy2_unavailable);
+    R("sceNpTrophySystemWrapGetGroupDetails", s_nptrophy2_unavailable);
+    R("sceNpTrophySystemWrapGetPlayedTrophyTitles", s_nptrophy2_unavailable);
+    R("sceNpTrophySystemWrapGetTitleDetails", s_nptrophy2_unavailable);
+    R("sceNpTrophySystemWrapGetTrophyDetailsArray", s_nptrophy2_unavailable);
+    R("sceNpTrophySystemWrapGetTrophyTitleIdsByNpTitleId", s_nptrophy2_unavailable);
+    // libSceNpTus / libSceNpScore — valid local ids, no PSN data (SIGNED_OUT; see block above).
+    R("sceNpTusCreateTitleCtx", s_np_ctx);
+    R("sceNpTusCreateNpTitleCtxA", s_np_ctx);
+    R("sceNpTssCreateNpTitleCtx", s_np_ctx);
+    R("sceNpTssCreateNpTitleCtxA", s_np_ctx);
+    R("sceNpTusCreateRequest", s_np_ctx);
+    R("sceNpScoreCreateTitleCtx", s_np_ctx);
+    R("sceNpScoreCreateRequest", s_np_ctx);
+    R("sceNpTusAbortRequest", s_np_sublib_ok);
+    R("sceNpTusSetThreadParam", s_np_sublib_ok);
+    R("sceNpScoreAbortRequest", s_np_sublib_ok);
+    R("sceNpScoreDeleteRequest", s_np_sublib_ok);
+    R("sceNpScoreSetThreadParam", s_np_sublib_ok);
+    R("sceNpScoreSetTimeout", s_np_sublib_ok);
+    // The data path: TUS multi-slot/friends/multi-user variables and cross-save, TUS+TSS
+    // get/set/try/delete, Score record/get/ranking/censor, and the async completion calls that
+    // would deliver PSN data.
+    R("sceNpTusAddAndGetVariable", s_np_offline);
+    R("sceNpTusAddAndGetVariableA", s_np_offline);
+    R("sceNpTusAddAndGetVariableAAsync", s_np_offline);
+    R("sceNpTusAddAndGetVariableAsync", s_np_offline);
+    R("sceNpTusAddAndGetVariableVUser", s_np_offline);
+    R("sceNpTusDeleteMultiSlotData", s_np_offline);
+    R("sceNpTusDeleteMultiSlotDataA", s_np_offline);
+    R("sceNpTusDeleteMultiSlotDataAAsync", s_np_offline);
+    R("sceNpTusDeleteMultiSlotDataVUser", s_np_offline);
+    R("sceNpTusDeleteMultiSlotVariable", s_np_offline);
+    R("sceNpTusDeleteMultiSlotVariableA", s_np_offline);
+    R("sceNpTusGetData", s_np_offline);
+    R("sceNpTusGetDataA", s_np_offline);
+    R("sceNpTusGetDataAAsync", s_np_offline);
+    R("sceNpTusGetDataAVUser", s_np_offline);
+    R("sceNpTusGetDataAVUserAsync", s_np_offline);
+    R("sceNpTusGetDataAsync", s_np_offline);
+    R("sceNpTusGetDataForCrossSave", s_np_offline);
+    R("sceNpTusGetDataForCrossSaveVUser", s_np_offline);
+    R("sceNpTusGetDataVUserAsync", s_np_offline);
+    R("sceNpTusGetFriendsDataStatusA", s_np_offline);
+    R("sceNpTusGetFriendsVariable", s_np_offline);
+    R("sceNpTusGetFriendsVariableAAsync", s_np_offline);
+    R("sceNpTusGetFriendsVariableAsync", s_np_offline);
+    R("sceNpTusGetMultiSlotDataStatus", s_np_offline);
+    R("sceNpTusGetMultiSlotDataStatusA", s_np_offline);
+    R("sceNpTusGetMultiSlotVariableAsync", s_np_offline);
+    R("sceNpTusGetMultiSlotVariableVUser", s_np_offline);
+    R("sceNpTusGetMultiUserDataStatusA", s_np_offline);
+    R("sceNpTusGetMultiUserVariable", s_np_offline);
+    R("sceNpTusGetMultiUserVariableAsync", s_np_offline);
+    R("sceNpTusGetMultiUserVariableVUser", s_np_offline);
+    R("sceNpTusPollAsync", s_np_offline);
+    R("sceNpTusSetData", s_np_offline);
+    R("sceNpTusSetDataA", s_np_offline);
+    R("sceNpTusSetDataAAsync", s_np_offline);
+    R("sceNpTusSetDataAVUser", s_np_offline);
+    R("sceNpTusSetDataVUser", s_np_offline);
+    R("sceNpTusSetMultiSlotVariable", s_np_offline);
+    R("sceNpTusSetMultiSlotVariableA", s_np_offline);
+    R("sceNpTusSetMultiSlotVariableAsync", s_np_offline);
+    R("sceNpTusSetMultiSlotVariableVUser", s_np_offline);
+    R("sceNpTusTryAndSetVariable", s_np_offline);
+    R("sceNpTusTryAndSetVariableA", s_np_offline);
+    R("sceNpTusTryAndSetVariableAAsync", s_np_offline);
+    R("sceNpTusTryAndSetVariableAVUser", s_np_offline);
+    R("sceNpTusTryAndSetVariableAsync", s_np_offline);
+    R("sceNpTusTryAndSetVariableVUser", s_np_offline);
+    R("sceNpTusWaitAsync", s_np_offline);
+    R("sceNpTssGetData", s_np_offline);
+    R("sceNpTssGetSmallStorage", s_np_offline);
+    R("sceNpTssGetSmallStorageAsync", s_np_offline);
+    R("sceNpTssGetStorageAsync", s_np_offline);
+    R("sceNpScoreCensorComment", s_np_offline);
+    R("sceNpScoreCensorCommentAsync", s_np_offline);
+    R("sceNpScoreGetBoardInfoAsync", s_np_offline);
+    R("sceNpScoreGetFriendsRanking", s_np_offline);
+    R("sceNpScoreGetFriendsRankingA", s_np_offline);
+    R("sceNpScoreGetGameData", s_np_offline);
+    R("sceNpScoreGetRankingByNpId", s_np_offline);
+    R("sceNpScorePollAsync", s_np_offline);
+    R("sceNpScoreRecordGameData", s_np_offline);
+    R("sceNpScoreRecordGameDataAsync", s_np_offline);
+    R("sceNpScoreRecordScore", s_np_offline);
+    R("sceNpScoreSanitizeComment", s_np_offline);
+    R("sceNpScoreWaitAsync", s_np_offline);
+    // libSceNpCommerce — headless PS Store dialog + local icon controls (see block above).
+    R("sceNpCommerceDialogInitialize", s_commerce_init);
+    R("sceNpCommerceDialogOpen", s_commerce_open);
+    R("sceNpCommerceDialogOpen2", s_commerce_open);   // not in the 3.20 table; imported by 5 local dumps
+    R("sceNpCommerceDialogGetStatus", s_commerce_status);
+    R("sceNpCommerceDialogUpdateStatus", s_commerce_status);
+    R("sceNpCommerceDialogGetResult", s_commerce_result);
+    R("sceNpCommerceDialogClose", s_commerce_close);
+    R("sceNpCommerceDialogTerminate", s_commerce_term);
+    R("sceNpCommerceShowPsStoreIcon", s_np_sublib_ok);
+    R("sceNpCommerceHidePsStoreIcon", s_np_sublib_ok);
+    R("sceNpCommerceSetPsStoreIconLayout", s_np_sublib_ok);
+    // libSceNpAuth — OAuth request lifecycle: valid local request ids, no authorization codes
+    // (SIGNED_OUT, the answer NpManager gives; shadPS4's np_auth.cpp answers the getters the same
+    // way when no user is signed in).
+    R("sceNpAuthCreateRequest", s_np_ctx);
+    R("sceNpAuthCreateAsyncRequest", s_np_ctx);
+    R("sceNpAuthAbortRequest", s_np_sublib_ok);
+    R("sceNpAuthDeleteRequest", s_np_sublib_ok);
+    R("sceNpAuthSetTimeout", s_np_sublib_ok);
+    R("sceNpAuthPollAsync", s_np_offline);
+    R("sceNpAuthWaitAsync", s_np_offline);
+    R("sceNpAuthGetAuthorizationCodeA", s_np_offline);
+    R("sceNpAuthGetAuthorizationCodeV3", s_np_offline);
+    R("sceNpAuthGetIdToken", s_np_offline);
+    R("sceNpAuthGetIdTokenV3", s_np_offline);
+    // libSceNpUtility — init succeeds; the PSN-backed lookup/bandwidth/word-filter paths are
+    // SIGNED_OUT; the lookup request/title-ctx constructors keep their local ids.
+    R("sceNpUtilityInit", s_np_sublib_ok);
+    R("sceNpAppInfoIntInitialize", s_np_sublib_ok);
+    R("sceNpAppInfoIntFinalize", s_np_sublib_ok);
+    R("sceNpBandwidthTestShutdown", s_np_sublib_ok);
+    R("sceNpBandwidthTestAbort", s_np_sublib_ok);
+    R("sceNpBandwidthTestInitStartDownload", s_np_offline);
+    R("sceNpBandwidthTestInitStartUpload", s_np_offline);
+    R("sceNpBandwidthTestGetStatus", s_np_offline);
+    R("sceNpLookupNetInit", s_np_offline);
+    R("sceNpLookupNetIsInit", s_np_sublib_ok);   // 0 = not initialized (honest: it is not)
+    R("sceNpLookupCreateRequest", s_np_ctx);
+    R("sceNpLookupCreateTitleCtx", s_np_ctx);
+    R("sceNpLookupDeleteRequest", s_np_sublib_ok);
+    R("sceNpLookupDeleteTitleCtx", s_np_sublib_ok);
+    R("sceNpLookupAbortRequest", s_np_sublib_ok);
+    R("sceNpLookupSetTimeout", s_np_sublib_ok);
+    R("sceNpLookupNetNpId", s_np_offline);
+    R("sceNpLookupNpId", s_np_offline);
+    R("sceNpLookupPollAsync", s_np_offline);
+    R("sceNpLookupWaitAsync", s_np_offline);
+    R("sceNpWordFilterPollAsync", s_np_offline);
+    R("sceNpWordFilterWaitAsync", s_np_offline);
+    // libSceNpMatching2 — room/matching state is PSN-backed, so every state query and
+    // connection establishment is SIGNED_OUT; the pure local parameter setters succeed.
+    // CONFIDENCE: HIGH on the sign; the context out-width is unverified, so the constructor is
+    // refused rather than written (a wrong-width write would hand the guest a corrupt id).
+    R("sceNpMatching2SetExtraInitParam", s_np_sublib_ok);
+    R("sceNpMatching2SignalingSetPort", s_np_sublib_ok);
+    R("sceNpMatching2SignalingAbortConnection", s_np_sublib_ok);
+    R("sceNpMatching2CreateContextInternal", s_np_offline);
+    R("sceNpMatching2GetRoomJoinedSlotMaskLocal", s_np_offline);
+    R("sceNpMatching2GetWorldIdArrayForAllServers", s_np_offline);
+    R("sceNpMatching2SetRoomDataInternalExt", s_np_offline);
+    R("sceNpMatching2SignalingEstablishConnection", s_np_offline);
+    R("sceNpMatching2SignalingGetPort", s_np_offline);
+    // libSceNpSns — third-party link (Facebook/Twitch/YouTube) status and tokens are PSN-backed:
+    // SIGNED_OUT; the request lifecycle keeps its local ids.
+    R("sceNpSnsIntCreateRequest", s_np_ctx);
+    R("sceNpSnsTwitchCreateRequest", s_np_ctx);
+    R("sceNpSnsYouTubeCreateRequest", s_np_ctx);
+    R("sceNpSnsIntDeleteRequest", s_np_sublib_ok);
+    R("sceNpSnsIntAbortRequest", s_np_sublib_ok);
+    R("sceNpSnsFacebookAbortRequest", s_np_sublib_ok);
+    R("sceNpSnsFacebookDeleteRequest", s_np_sublib_ok);
+    R("sceNpSnsTwitchAbortRequest", s_np_sublib_ok);
+    R("sceNpSnsYouTubeAbortRequest", s_np_sublib_ok);
+    R("sceNpSnsYouTubeDeleteRequest", s_np_sublib_ok);
+    R("sceNpSnsFacebookGetAccessToken", s_np_offline);
+    R("sceNpSnsIntFbGetGameAccessToken", s_np_offline);
+    R("sceNpSnsIntFbGetGameAccessTokenAllowed", s_np_offline);
+    R("sceNpSnsIntFbGetSystemAccessToken", s_np_offline);
+    R("sceNpSnsIntTwGetSystemAccessToken", s_np_offline);
+    R("sceNpSnsIntYtGetAccessToken", s_np_offline);
+    R("sceNpSnsIntYtRefreshMasterToken", s_np_offline);
+    R("sceNpSnsIntLinkedStatus", s_np_offline);
+    R("sceNpSnsIntUnlink", s_np_offline);
+    R("sceNpSnsTwitchGetAccessToken", s_np_offline);
+    R("sceNpSnsYouTubeGetAccessToken", s_np_offline);
     // libSceShare — succeed; sharing simply unavailable headless.
     Hle::register_fn("nBDD66kiFW8", (HleFn)s_share_ok, "sceShareInitialize");
     Hle::register_fn("0IL1keINExQ", (HleFn)s_share_ok, "sceShareTerminate");

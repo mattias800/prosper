@@ -1051,6 +1051,7 @@ void register_builtin_hle() {
     register_savedata_hle();  // libSceSaveData + libSceSaveDataDialog (#3735)
     register_np_hle();        // the NP / online family incl. NetCtl (#3735)
     register_http_hle();     // libSceHttp local URI parsing
+    register_net_hle();   // libSceNet socket ids + honest offline packet failure
     register_http2_hle();    // libSceHttp2 local ids + honest offline request failure
     register_font_hle();     // libSceFont opaque handles + deterministic text/metric fallback
     register_fiber_hle();    // libSceFiber cooperative guest-stack execution
