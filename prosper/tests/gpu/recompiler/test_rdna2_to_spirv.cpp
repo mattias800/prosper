@@ -7859,6 +7859,109 @@ int main() {
     CHECK(recompile_valu(code32r23b, std::size(code32r23b), 0, 4).empty(),
           "kernel 32r23b keeps SEXT on a DWORD source select fail-visible");
 
+    // Kernel 32r24: VOP3P integer dot product family (0x14..0x19).
+    const uint32_t code32r24a[] = {
+        0x7e0002ffu, 0x0002fffeu,   // v0 = {hi=2, lo=-2}
+        0x7e0202ffu, 0x00030004u,   // v1 = {hi=3, lo=4}
+        0x7e04028au,   // v2 = 10
+        0xcc144003u, 0x1c0a0300u,   // v_dot2_i32_i16 v3, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24a = recompile_valu(code32r24a, std::size(code32r24a), 0, 3);
+    CHECK(!spv32r24a.empty(), "recompiled kernel 32r24a (v_dot2_i32_i16) -> SPIR-V");
+    std::vector<float> got32r24a =
+        prosper::test::run_compute(spv32r24a, std::vector<float>(1), 1, 1);
+    CHECK(got32r24a.size() == 1 && bits_of(got32r24a[0]) == 8u,
+          "kernel 32r24a: v_dot2_i32_i16 computes signed dot product: (-2)*4 + 2*3 + 10 = 8");
+
+    const uint32_t code32r24b[] = {
+        0x7e0002ffu, 0x0002fffeu,   // v0 = {hi=2, lo=65534}
+        0x7e0202ffu, 0x00030004u,   // v1 = {hi=3, lo=4}
+        0x7e04028au,   // v2 = 10
+        0xcc154003u, 0x1c0a0300u,   // v_dot2_u32_u16 v3, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24b = recompile_valu(code32r24b, std::size(code32r24b), 0, 3);
+    CHECK(!spv32r24b.empty(), "recompiled kernel 32r24b (v_dot2_u32_u16) -> SPIR-V");
+    std::vector<float> got32r24b =
+        prosper::test::run_compute(spv32r24b, std::vector<float>(1), 1, 1);
+    CHECK(
+        got32r24b.size() == 1 && bits_of(got32r24b[0]) == 262152u,
+        "kernel 32r24b: v_dot2_u32_u16 computes unsigned dot product: 65534*4 + 2*3 + 10 = 262152");
+
+    const uint32_t code32r24c[] = {
+        0x7e0002ffu, 0x0002fffeu,   // v0 = bytes {0, 2, -1, -2}
+        0x7e0202ffu, 0x00030004u,   // v1 = bytes {0, 3, 0, 4}
+        0x7e04028au,   // v2 = 10
+        0xcc164003u, 0x1c0a0300u,   // v_dot4_i32_i8 v3, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24c = recompile_valu(code32r24c, std::size(code32r24c), 0, 3);
+    CHECK(!spv32r24c.empty(), "recompiled kernel 32r24c (v_dot4_i32_i8) -> SPIR-V");
+    std::vector<float> got32r24c =
+        prosper::test::run_compute(spv32r24c, std::vector<float>(1), 1, 1);
+    CHECK(got32r24c.size() == 1 && bits_of(got32r24c[0]) == 8u,
+          "kernel 32r24c: v_dot4_i32_i8 computes signed 4-byte dot product: (-2)*4 + 2*3 + 10 = 8");
+
+    const uint32_t code32r24d[] = {
+        0x7e0002ffu, 0x0002fffeu,   // v0 = bytes {0, 2, 255, 254}
+        0x7e0202ffu, 0x00030004u,   // v1 = bytes {0, 3, 0, 4}
+        0x7e04028au,   // v2 = 10
+        0xcc174003u, 0x1c0a0300u,   // v_dot4_u32_u8 v3, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24d = recompile_valu(code32r24d, std::size(code32r24d), 0, 3);
+    CHECK(!spv32r24d.empty(), "recompiled kernel 32r24d (v_dot4_u32_u8) -> SPIR-V");
+    std::vector<float> got32r24d =
+        prosper::test::run_compute(spv32r24d, std::vector<float>(1), 1, 1);
+    CHECK(got32r24d.size() == 1 && bits_of(got32r24d[0]) == 1032u,
+          "kernel 32r24d: v_dot4_u32_u8 computes unsigned 4-byte dot product: 254*4 + 2*3 + 10 = "
+          "1032");
+
+    const uint32_t code32r24e[] = {
+        0x7e0002ffu, 0x0002fffeu,   // v0
+        0x7e0202ffu, 0x00030004u,   // v1
+        0x7e04028au,   // v2 = 10
+        0xcc184003u, 0x1c0a0300u,   // v_dot8_i32_i4 v3, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24e = recompile_valu(code32r24e, std::size(code32r24e), 0, 3);
+    CHECK(!spv32r24e.empty(), "recompiled kernel 32r24e (v_dot8_i32_i4) -> SPIR-V");
+    std::vector<float> got32r24e =
+        prosper::test::run_compute(spv32r24e, std::vector<float>(1), 1, 1);
+    CHECK(
+        got32r24e.size() == 1 && bits_of(got32r24e[0]) == 8u,
+        "kernel 32r24e: v_dot8_i32_i4 computes signed 8-nibble dot product: (-2)*4 + 2*3 + 10 = 8");
+
+    const uint32_t code32r24f[] = {
+        0x7e0002ffu, 0x0002fffeu,   // v0
+        0x7e0202ffu, 0x00030004u,   // v1
+        0x7e04028au,   // v2 = 10
+        0xcc194003u, 0x1c0a0300u,   // v_dot8_u32_u4 v3, v0, v1, v2
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24f = recompile_valu(code32r24f, std::size(code32r24f), 0, 3);
+    CHECK(!spv32r24f.empty(), "recompiled kernel 32r24f (v_dot8_u32_u4) -> SPIR-V");
+    std::vector<float> got32r24f =
+        prosper::test::run_compute(spv32r24f, std::vector<float>(1), 1, 1);
+    CHECK(got32r24f.size() == 1 && bits_of(got32r24f[0]) == 72u,
+          "kernel 32r24f: v_dot8_u32_u4 computes unsigned 8-nibble dot product: 14*4 + 2*3 + 10 = "
+          "72");
+
+    const uint32_t code32r24g[] = {
+        0x7e0002ffu, 0x0002fffeu,   // v0 = {hi=2, lo=-2}
+        0x7e0202ffu, 0x00030004u,   // v1 = {hi=3, lo=4}
+        0x7e04028au,   // v2 = 10
+        0xcc144803u, 0x140a0300u,   // v_dot2_i32_i16 v3, v0, v1, v2 op_sel:[1,0] op_sel_hi:[0,1]
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32r24g = recompile_valu(code32r24g, std::size(code32r24g), 0, 3);
+    CHECK(!spv32r24g.empty(), "recompiled kernel 32r24g (v_dot2_i32_i16 swapped halves) -> SPIR-V");
+    std::vector<float> got32r24g =
+        prosper::test::run_compute(spv32r24g, std::vector<float>(1), 1, 1);
+    CHECK(got32r24g.size() == 1 && bits_of(got32r24g[0]) == 12u,
+          "kernel 32r24g: v_dot2_i32_i16 with swapped halves computes 2*4 + (-2)*3 + 10 = 12");
+
     // Kernel 32p: exact live v_cndmask_b32_sdwa selects src1 WORD_0 through VCC, writes WORD_1,
     // and preserves the destination's low half.
     const uint32_t code32p[] = {
