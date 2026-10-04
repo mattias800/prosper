@@ -72,7 +72,30 @@ AlarmEngine::RuleState& AlarmEngine::state_for(const char* rule) {
     return rules_.back().second;
 }
 
-void AlarmEngine::write_frame_sample(uint64_t now_ns, Ledger& ledger) {
+void AlarmEngine::write_frame_schema() {
+    if (!jsonl_) return;
+    // Per-run constants of the frame records, written once at the baseline flip rather than on
+    // every frame line (a frame record is written per guest flip, so its size is the log's growth).
+    std::fputs("{\"type\":\"frame_schema\",\"timing_model\":\"scope-completion-interval\","
+               "\"excluded_stages\":[\"texture-ref-sample\"],\"interpretation\":"
+               "\"stage times are summed thread time; scopes are charged when completed; "
+               "categories may overlap and are not a frame-time partition; texture-ref-sample is "
+               "timed 1 in kTextureRefSamplePeriod and is reported by its own rule\"}\n",
+               jsonl_);
+    flush_jsonl_or_disable();
+}
+
+void AlarmEngine::flush_jsonl_or_disable() {
+    if (std::fflush(jsonl_) == 0) return;
+    if (config_.log)
+        std::fprintf(config_.log,
+                     "[perf-alarm] JSONL write failed; no further JSONL records (alarm, window "
+                     "or frame) are written\n");
+    std::fclose(jsonl_);
+    jsonl_ = nullptr;
+}
+
+void AlarmEngine::write_frame_sample(uint64_t now_ns, const Ledger& ledger) {
     if (!jsonl_ || !started_) return;
 
     const uint64_t interval_ns = now_ns >= prev_frame_ns_ ? now_ns - prev_frame_ns_ : 0;
@@ -80,20 +103,23 @@ void AlarmEngine::write_frame_sample(uint64_t now_ns, Ledger& ledger) {
     const double t_seconds = static_cast<double>(now_ns - origin_ns_) / 1e9;
     std::fprintf(jsonl_,
                  "{\"type\":\"frame\",\"sequence\":%llu,\"t\":%.6f,"
-                 "\"flip_interval_ms\":%.3f,\"texture_ref_sample_period\":%llu,"
-                 "\"timing_model\":"
-                 "\"scope-completion-interval\",\"stage_thread_time\":{",
-                 static_cast<unsigned long long>(sequence), t_seconds, interval_ns / 1e6,
-                 static_cast<unsigned long long>(kTextureRefSamplePeriod));
+                 "\"flip_interval_ms\":%.3f,\"stage_thread_time\":{",
+                 static_cast<unsigned long long>(sequence), t_seconds, interval_ns / 1e6);
 
+    // texture-ref-sample is timed 1 in kTextureRefSamplePeriod: a per-flip figure of it would
+    // understate the real cost by that factor, so -- as in the exit summary -- it is left out.
+    constexpr size_t kSampled = static_cast<size_t>(Cost::TextureRefSample);
+    bool first = true;
     for (size_t i = 0; i < kCostCount; ++i) {
+        if (i == kSampled) continue;
         const uint64_t total_ns = ledger.cost_ns[i].load(std::memory_order_relaxed);
         const uint64_t total_events = ledger.cost_events[i].load(std::memory_order_relaxed);
         const uint64_t delta_ns = total_ns >= prev_frame_cost_ns_[i]
             ? total_ns - prev_frame_cost_ns_[i] : 0;
         const uint64_t delta_events = total_events >= prev_frame_cost_events_[i]
             ? total_events - prev_frame_cost_events_[i] : 0;
-        if (i) std::fputc(',', jsonl_);
+        if (!first) std::fputc(',', jsonl_);
+        first = false;
         json_string(jsonl_, kCostNames[i]);
         std::fprintf(jsonl_, ":{\"ms\":%.3f,\"events\":%llu}", delta_ns / 1e6,
                      static_cast<unsigned long long>(delta_events));
@@ -118,19 +144,14 @@ void AlarmEngine::write_frame_sample(uint64_t now_ns, Ledger& ledger) {
     std::fprintf(jsonl_,
                  "},\"gpu_device_time\":{\"compute_ms\":%.3f,"
                  "\"compute_timestamp_pairs\":%llu,\"graphics_ms\":%.3f,"
-                 "\"graphics_timestamp_pairs\":%llu},\"interpretation\":"
-                 "\"stage times are summed thread time; scopes are charged when completed; "
-                 "categories may overlap and are not a frame-time partition\"}\n",
+                 "\"graphics_timestamp_pairs\":%llu}}\n",
                  compute_ns / 1e6, static_cast<unsigned long long>(compute_samples),
                  graphics_ns / 1e6, static_cast<unsigned long long>(graphics_samples));
-    if (std::fflush(jsonl_) != 0) {
-        if (config_.log)
-            std::fprintf(config_.log,
-                         "[perf-alarm] JSONL write failed; disabling detailed JSONL output\n");
-        std::fclose(jsonl_);
-        jsonl_ = nullptr;
-    }
-    prev_frame_ns_ = now_ns;
+    flush_jsonl_or_disable();
+    // The two flip sources run on different threads and read the clock before taking mutex_, so a
+    // later-locked caller can carry an earlier timestamp. Never move the baseline backwards, or the
+    // next interval would be overstated by the same amount.
+    if (now_ns > prev_frame_ns_) prev_frame_ns_ = now_ns;
 }
 
 std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
@@ -186,6 +207,7 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
             prev_transfer_bytes_[i] = ext.transfer_bytes[i];
             prev_transfer_calls_[i] = ext.transfer_calls[i];
         }
+        write_frame_schema();
         return {};
     }
     write_frame_sample(now_ns, ledger);

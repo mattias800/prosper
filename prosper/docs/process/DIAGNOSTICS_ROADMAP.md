@@ -56,7 +56,7 @@ These are the contract. An item that cannot meet them is redesigned, not waived.
 | Frame grab + offline replay | F9 `.prgbundle`, `tools/gpu_replay` (schedulable headless via `PROSPER_GRAB_BUNDLE_*`) | Captures rendered-frame bugs only; not CPU, logic or audio. |
 | RenderDoc in-app capture | `frontends/shared/diagnostics/renderdoc_capture.hpp`, `PROSPER_RENDERDOC_AFTER_MS` / `_AT_FRAME` / `_AT_PAD_FLIP` (#3321) | Needs RenderDoc already injected; nothing bundled. |
 | Bounded perf capture | F8 `.prperf`, `tools/perf/performance_capture_report.py` | Reports by time; six timestamp brackets per **compute** dispatch. |
-| Always-on alarms | `[perf-alarm]`, `src/diagnostics/perf/` | Default-on alarms name costs per window. With `PROSPER_PERF_ALARM_LOG`, JSONL also carries per-flip deltas from the existing cost/GPU counters; scopes are charged on completion and stage thread times overlap, so these are not a frame-budget partition. The exit summary prints run-level totals too. |
+| Always-on alarms | `[perf-alarm]`, `src/diagnostics/perf/` | Default-on alarms name costs per window. With `PROSPER_PERF_ALARM_LOG`, JSONL also carries per-flip deltas from the existing cost/GPU counters; scopes are charged on completion and stage thread times overlap, so these are not a frame-budget partition. The exit summary prints run-level totals too, as an `observer=frame-breakdown` line. |
 | Stage buckets | `PROSPER_RENDER_TIMING` | Setup/resource breakdown; not a per-frame guest/driver/GPU/wait/present split. |
 | GPU submit index | `PROSPER_GPU_TIMELINE`, `tools/gpu_timeline` | Guest-submit index, **not** GPU pass timing. |
 | Guest frame pacing | `tools/perf/flip_pacing_report.py` | Interval distribution of guest flips from `PROSPER_EVLOG`; names the limiter class. |
@@ -202,8 +202,8 @@ pass-local offset (graphics), the guest program address and a pipeline hash. D5 
 - **Evidence:** `present_frame_rate` has a log-bucket interval histogram, median, active fraction,
   p90/p95/p99 and `1% low`. `tools/screenshot` prints the tail in its summary and writes
   `interval_p90_ms`, `interval_p95_ms`, `interval_p99_ms` and `low_1pct_fps` in its manifest;
-  `tools/perf/compare_runs.py` compares p95, p99 and `1% low`. The p99-derived fields remain absent
-  until at least 100 distinct-frame intervals resolve the tail. `flip_pacing_report.py` separately
+  `tools/perf/compare_runs.py` compares p95, p99 and `1% low`. The p99-derived fields are written as
+  `null` until at least 100 distinct-frame intervals resolve the tail. `flip_pacing_report.py` separately
   reports the guest-flip interval distribution.
 - **Design:** read p90/p95/p99 from the **existing** histogram (same estimator, same documented error)
   over `distinct` frames; report `1% low`; refuse a tail the population cannot resolve (p99 needs 100
@@ -235,12 +235,14 @@ pass-local offset (graphics), the guest program address and a pipeline hash. D5 
 - **Acceptance:** conversion and schema unit-tested with a synthetic clock; a software-device test that
   a submit yields a `gpu_ms`; harness-forced readback is flagged in the record (rule 7).
 - **Out of scope here:** per-pass timelines (M4).
-- **First per-flip slice in this change:** when JSONL is enabled, each guest-flip callback writes
-  its interval, deltas for the existing cost scopes and event counts, plus GPU device-time deltas and
+- **First per-flip slice (landed, #4406):** when JSONL is enabled, each guest-flip callback after
+  the first writes its interval, deltas for the existing cost scopes and event counts, plus GPU device-time deltas and
   timestamp-pair counts. A scope is charged to the flip interval in which it completes; snapshots
   use independent relaxed loads. Stage times are summed thread time and can overlap, so the record
   is an attribution aid, not an additive budget partition. It adds no new clock reads or file I/O
-  when JSONL is disabled. Each opt-in record is flushed and may perturb the diagnostic run. The exit
+  when JSONL is disabled. Per-run constants are written once as a `frame_schema` record, and the
+  sampled `texture-ref-sample` cost is left out. Each record (~600 bytes per flip) is flushed and may
+  perturb the diagnostic run. The exit
   summary still prints run-level totals. **Still missing:** complete
   guest CPU and driver-recording coverage, a common CPU/GPU timeline, calibrated timestamp
   correlation, and a full record whose fields are proven to describe the same frame population.

@@ -12,13 +12,17 @@
 //     lower bound on how many windows fired, and the line count never is.
 //   * PROSPER_PERF_ALARM_LOG=<path>: JSONL, flushed as written, so a run killed by SIGTERM -- which
 //     skips the exit report -- still leaves its record. `"type":"alarm"` for every firing (no rate
-//     limit), `"type":"window"` for every window with the raw quantities the rules read, and
-//     `"type":"frame"` at every guest-flip boundary. A frame record carries the interval since
-//     the previous guest flip plus deltas from the existing timed scopes and GPU timestamp counters.
-//     Scope time is summed thread time, attributed when the scope completes; the categories overlap
-//     and are not a partition of the frame. No frame-record sampling or file I/O happens without the
-//     JSONL path configured. With it enabled, each record is flushed at the flip boundary, so these
-//     are diagnostic runs and the file I/O may perturb performance.
+//     limit), `"type":"window"` for every window with the raw quantities the rules read, one
+//     `"type":"frame_schema"` record at the first guest flip, and `"type":"frame"` at every guest
+//     flip after the first. A frame record carries the interval since the previous guest flip plus
+//     deltas from the existing timed scopes (texture-ref-sample excluded: it is sampled) and GPU
+//     timestamp counters. Scope time is summed thread time, attributed when the scope completes; the
+//     categories overlap and are not a partition of the frame. Frame records are not separately
+//     opted into: whoever sets the log gets one line per guest flip (~600 bytes), i.e. roughly
+//     130 MiB/hour at 60 flips/s and ~390 MiB/hour at 180, against one window line per 5 s, and
+//     each line is flushed on the flipping thread -- these are diagnostic runs, and the file I/O
+//     may perturb performance. Without the JSONL path no frame-record sampling or file I/O
+//     happens. A failed flush closes the whole JSONL log (alarm, window and frame records).
 //   * a rule is reported only once its condition has held for sustain_windows() consecutive
 //     windows (two for performance rules, three for texture-reference-cost, more for
 //     shader-compile, one for correctness), so a load spike does not read as a steady-state cost.
@@ -138,7 +142,9 @@ private:
         std::vector<std::pair<const char*, uint64_t>> breakdown_total;
     };
     RuleState& state_for(const char* rule);
-    void write_frame_sample(uint64_t now_ns, Ledger& ledger);
+    void write_frame_schema();
+    void write_frame_sample(uint64_t now_ns, const Ledger& ledger);
+    void flush_jsonl_or_disable();
 
     EngineConfig config_;
     mutable std::mutex mutex_;
