@@ -2,7 +2,8 @@
 
 This is a durable **partial-work handoff**, not acceptance evidence. The helper/launch code is
 unverified; both confirmed review findings now have source-only correction attempts. The first
-focused native build subsequently FAILED before test discovery, as recorded below.
+focused native build subsequently FAILED before test discovery; a reviewed friend-signature
+correction now compiles its two failed consumers, as recorded below. No complete test build passed.
 General Wave64 and Kena title-screen 3D are
 NOT complete. No current Kena drop census, FPS improvement or title-screen rendering result was
 measured in this checkpoint. Work was frozen at the maintainer's checkpoint request.
@@ -127,7 +128,8 @@ actual definition at `gpu_execute.hpp:2060` additionally takes
 `shared_ptr<const OrderedScalarBankReadPoint>` and `shared_ptr<const FragmentScalarBank>`.
 Those defaulted parameters still belong to its function signature. Fix the friend declaration
 to match the actual private producing function; **do not make the authority methods public**.
-This is the first next action, not an observed successful repair. Preserve the failed cohort.
+That was the first next action at the failed freeze. The limited correction result below does
+not change or replace the failed cohort.
 
 The bounded SAME reviewer source-cleared only the repaired native apparatus, SHA256
 `0ab615e5efae194ab357b5e65cd54a824ff8104e9b554b84d5127ca34acc34db`.
@@ -145,6 +147,36 @@ APP SHA256 `313eb7fdfe7729c71bb6515a4bb10cf73e538518f2345da419240716c8d4e662` an
 process0 remained unchanged before/after; no app/DLL target was in the inspected build graph.
 The native handle finished with exit1 and the final native process census was empty. Source
 remained clean/exact154 throughout; the later documentation commit supplies no native credit.
+
+## Friend-signature correction: two failed consumers compile
+
+Commit `f3773be0cfcd7daeb79c001374773ae6716c9b27`, parent
+`1c26cbbae1ed962df472586fbdc102b208b838c6`, tree
+`9acca561183751d10d17f070300ec506a45285d9`, changes only
+`fragment_raster_launch.hpp` (+5/-1). It adds matching class forward declarations and replaces
+the obsolete ten-parameter private friend with the actual twelve-parameter realizer signature.
+The authority methods and constructor remain private; no runtime body or public permission changed.
+The SAME reviewer independently inspected the complete header delta, realizer signature and
+class definitions: **SCOPED NO-FINDINGS**, not whole-source CLEAR or PR approval.
+
+ROOT then actually compiled both previously failing native translation units,
+`agc_shader_layout.cpp` and `capture_collect.cpp`, under exact clean f377. Configure0, inspected
+two-object graph0, build0/helper0, two fresh requested compiler commands and object outputs.
+The build also regenerated/compiled its revision object and static revision archive; no PE was
+linked or certified. **Zero tests executed**, no SPIR-V validation, GPU or app/game execution.
+APP313/process0 were unchanged before/after; final handle exit0 and native process census empty.
+This demonstrates correction of the observed private-access compilation errors in these two
+consumers, NOT a successful full core/test build or runtime acceptance of either helper repair.
+
+Raw receipts: `.codex/issue-4235-native-20261004/f3773be0-private-friend-objects/`.
+Actual invocation: `.codex/issue-4235-private-friend-objects-20261004.ps1 -ExecuteNativeCompile`;
+SAME source-cleared compile-only apparatus SHA256
+`546603ad309c2a83fb2a8c5f99cf52605563490245aff77571e57c214eb128e6`.
+Changed-line formatting initially failed and was corrected by scoped formatting; final exact
+source formatting, architecture, GTest-policy, contribution-shape and diff gates all exited0.
+The next native action is a newly bound/reviewed successor of the four-PE/55-intended-case
+baseline, with fresh strict certificates and actual discovery; preserve the original154 runner
+and failed receipts rather than changing their identities or borrowing the two-object result.
 
 ## Objective and acceptance boundary
 
@@ -341,8 +373,9 @@ run `python3 prosper/tools/session_start.py` at session start/after worktree cha
 machine the Store python3 alias may fail; real Python312 is available as `python`/`py -3.12`.
 Fetch in your own worktree, inspect current-main instructions/deltas and preserve others' trees.
 
-1. First repair the verified private-friend signature build failure above, review it, then use
-   a new exact-revision cohort; do not reuse or overwrite the failed154 receipts. Validate both
+1. Continue from the reviewed friend-signature correction and its limited two-object compile
+   result, using a new exact-revision four-PE baseline; do not reuse or overwrite failed154
+   receipts. Full linking/certification/discovery/test execution remain pending. Validate both
    source-only repair attempts and finish missing registered negatives; preserve
    immutable successor H/P/T, source inventory and exact gates. Same reviewer completes the
    connected review on that successor and checks newer main. Do not borrow older native credit.
@@ -370,6 +403,7 @@ committed or downloaded by a fresh clone, whereas source and this document are i
 | `.codex/issue-4235-kena32-helper-frontier-3fcb2d18-20261004.md` | Exact32 filenames/hashes/prefix PCs/historical body flags and remaining obligations. |
 | `.codex/issue-4235-native-20261004/154531e3-focused-baseline/` | Actual configure0/graph0/build1; private friend-signature failure, no certification or tests. |
 | `.codex/issue-4235-helper-cpu-native-20261004.ps1` | Reviewed ROOT-only55/4 apparatus and discriminator calibration; exact154 failure retained, not a passing test receipt. |
+| `.codex/issue-4235-native-20261004/f3773be0-private-friend-objects/`, `.codex/issue-4235-private-friend-objects-20261004.ps1` | Actual two requested translation units compile after private-friend fix; source/app/graph/exit receipts, no PE/test/SPIR-V/device credit. |
 | `.codex/issue-4378-native-20261004/215ee6d2-baseline/` | Actual failed native configure/graph/build/certs/registration/JUnit/LastTest/observed.json. |
 | `.codex/issue-4378-cpu-native-20261004.ps1` | Reviewed ROOT-only70/12 helper, SHA256 `4df72940d6492ca983eb84996ada823686ce0f04c68fd1dc8196c5f765554695`; requires exact clean H/P/T and NEW cohort name. |
 | `.codex/issue-4378-source-freeze-215ee6d2-20261004.txt`, held-scope v1/v2 and handoff | Windows source-gate/history, not a passing native result. |
