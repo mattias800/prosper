@@ -9,6 +9,7 @@
 #include "gpu/recompiler/rdna2_dot.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
 #include "gpu/recompiler/rdna2_sad.hpp"
+#include "gpu/recompiler/rdna2_div_fixup.hpp"
 #include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#325)
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -5042,6 +5043,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t diff = b.ibin(Op_ISub, b.uext2(Glsl_UMax, s0, s1),
                                                        b.uext2(Glsl_UMin, s0, s1));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, diff, val(in.src[2]));
+            } else if (in.opcode == 0x15F) {   // v_div_fixup_f32
+                vreg[in.dst.value] = fresult(emit_v_div_fixup_f32(b, fv(0), fv(1), fv(2)));
             } else if (in.opcode == 0x148 || in.opcode == 0x149) {   // v_bfe_u32 / v_bfe_i32
                 uint32_t off = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
                 uint32_t cnt = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
