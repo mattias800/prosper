@@ -57,6 +57,26 @@ class Parsing(unittest.TestCase):
         self.assertEqual([("push", "C:\\w\\tree")], found)
 
 
+class NativePath(unittest.TestCase):
+    """MSYS2 git on the MinGW runner prints `/d/a/...`; a native Windows Python needs `D:/a/...`
+    or every checker launch fails with WinError 267 (the directory name is invalid)."""
+
+    def test_msys_and_cygwin_drive_paths_become_native_on_windows(self):
+        self.assertEqual(
+            "D:/a/prosper/prosper", hook.native_path("/d/a/prosper/prosper", windows=True)
+        )
+        self.assertEqual("C:/Users/x/Temp/t", hook.native_path("/c/Users/x/Temp/t", windows=True))
+        self.assertEqual("D:/a", hook.native_path("/cygdrive/d/a", windows=True))
+        self.assertEqual("D:/", hook.native_path("/d", windows=True))
+
+    def test_native_and_non_drive_spellings_are_untouched(self):
+        # Multi-letter top-level directories are not drives, even on Windows.
+        for path in ("D:/a/prosper", "D:\\a\\prosper", "/home/u/repo", "/tmp/x", "", None):
+            self.assertEqual(path, hook.native_path(path, windows=True))
+        # A POSIX host keeps its own absolute paths, including single-letter top-level dirs.
+        self.assertEqual("/d/a/prosper", hook.native_path("/d/a/prosper", windows=False))
+
+
 @NEEDS_GIT
 class Verdicts(unittest.TestCase):
     """main() against a real git checkout with a stand-in checker."""

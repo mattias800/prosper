@@ -144,6 +144,27 @@ def gated_git_invocations(command, posix=True):
     return found
 
 
+_MSYS_DRIVE_PATH = re.compile(r"/(?:cygdrive/)?([A-Za-z])(/.*)?")
+
+
+def native_path(path, windows=None):
+    """`path` as the host's own filesystem API spells it.
+
+    An MSYS2 or Cygwin git (the MinGW CI runner's) prints POSIX drive paths such as `/d/a/x`.
+    A native Windows Python cannot use those: as a subprocess `cwd` CreateProcess rejects them
+    with WinError 267, and os.path.realpath turns them into `D:\\d\\a\\x`. Map the drive form
+    back to `D:/a/x` on Windows; everywhere else, and for any other spelling, return it unchanged.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows or not path:
+        return path
+    match = _MSYS_DRIVE_PATH.fullmatch(path)
+    if not match:
+        return path
+    return f"{match.group(1).upper()}:{match.group(2) or '/'}"
+
+
 def repo_root(start):
     """Top level of the git checkout containing `start`, or None."""
     try:
@@ -157,7 +178,7 @@ def repo_root(start):
         return None
     if out.returncode != 0:
         return None
-    return out.stdout.strip() or None
+    return native_path(out.stdout.strip()) or None
 
 
 def unverified(reason):
@@ -206,7 +227,7 @@ def _git_out(path, *args):
 def common_dir(path):
     """The shared .git directory of the checkout at `path` (equal across its worktrees), or None."""
     out = _git_out(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    return os.path.realpath(out.strip()) if out and out.strip() else None
+    return os.path.realpath(native_path(out.strip())) if out and out.strip() else None
 
 
 def trusted_checker_source(project):

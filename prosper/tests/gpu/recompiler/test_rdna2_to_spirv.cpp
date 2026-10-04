@@ -11914,12 +11914,21 @@ int main() {
         std::printf("  [skip] T25b-ror8-family native CFG execution: host contract unavailable\n");
     }
 
+    // #4315 admits exactly the full-mask BC1/FI0 unmodified ROW_ROR:8 floating ADD, so this exact
+    // packet left the refusal table below (#4355). Here it only pins that the admission is
+    // deliberate; test_compute_dpp_row_fadd executes the family (with distinct registers) and
+    // pins its admission limits field by field.
+    {
+        const uint32_t admittedAdd[] = {0x060000fau, 0xff092800u, 0xbf810000u};
+        CHECK(!recompile_valu(admittedAdd, std::size(admittedAdd), 1, 0).empty(),
+              "T25b-ror8: the admitted full-mask ROW_ROR:8 V_ADD_F32 recompiles");
+    }
     const uint32_t unsupportedRor8[][2] = {
         {0x1e0000fau, 0xff012800u},           // V_MIN_F32 BOUND_CTRL=0
         {0x1e0000fau, 0xff092900u},           // V_MIN_F32 ROW_ROR:9
         {0x1e0000fau, 0xef092800u},           // partial ROW_MASK
         {0x1e0000fau, 0xff192800u},           // source modifier
-        {0x060000fau, 0xff092800u},           // V_ADD_F32 is outside the live family
+        {0x080000fau, 0xff092800u},           // V_SUB_F32 is outside the admitted family
     };
     for (const auto& unsupported : unsupportedRor8) {
         const uint32_t code[] = {unsupported[0], unsupported[1], 0xbf810000u};
