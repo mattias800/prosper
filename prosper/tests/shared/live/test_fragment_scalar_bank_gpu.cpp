@@ -3,6 +3,7 @@
 // not a fabricated reflection or standalone bank. These finite input-free recipes are not Kena.
 #include "fixtures/fragment_scalar_bank_fixture.hpp"
 #include "fixtures/render_runner.h"
+#include "gpu/recompiler/fragment_scalar_bank_wire.hpp"
 #include "shared/live/live_renderer.hpp"
 #include <gtest/gtest.h>
 #include <cmath>
@@ -64,6 +65,9 @@ protected:
         EXPECT_EQ(stats.refused, 0u);
         const auto after = g::fragment_draw_cache_stats();
         EXPECT_EQ(after.scalar_bank_uploads - before.scalar_bank_uploads, bank_draws);
+        EXPECT_EQ(after.scalar_bank_visibility_barriers - before.scalar_bank_visibility_barriers,
+                  bank_draws)
+            << "actual HOST_WRITE -> COMPUTE SHADER_READ bank recording";
         EXPECT_EQ(after.scalar_bank_payload_bytes - before.scalar_bank_payload_bytes,
                   bank_draws * 16u)
             << "one small bank payload per draw, shared by every wave";
@@ -138,5 +142,104 @@ TEST_F(FragmentScalarBankGpu, AdjacentMixedNativeAndBankDrawsCommitThroughOneNor
     append(value, native, 200);
     append(value, state(), 300);
     pixels(render(value, 2), r::fragment_draw::color_a);
+}
+TEST_F(FragmentScalarBankGpu, PrivatePostSealFourthWordCorruptionRejectsTheActualGpuBankService) {
+    pixels(render(state()), r::fragment_draw::color_a);
+    f::DirectRegion isolated_output;
+    ASSERT_TRUE(isolated_output.create());
+    auto fault = state();
+    fault.cx[p::CB_COLOR0_BASE] = uint32_t(isolated_output.address >> 8u);
+    fault.cx[p::CB_COLOR0_BASE_EXT] = uint32_t(isolated_output.address >> 40u);
+    uint32_t corruptions = 0;
+    {
+        auto& callback = r::fragment_scalar_bank_wire_calibration_for_test();
+        struct Restore {
+            r::FragmentScalarBankWireCalibration& callback;
+            r::FragmentScalarBankWireCalibration previous;
+            ~Restore() { callback = std::move(previous); }
+        } restore{callback, std::move(callback)};
+        callback = [&](std::span<uint32_t> wire,
+                       std::span<const g::FragmentPacketScalarReadSite> sites) {
+            ASSERT_EQ(sites.size(), 1u);
+            ASSERT_EQ(sites[0].pc, 1u);
+            const uint32_t index = g::kFragmentScalarBankHeaderWords + g::ScalarBankDescriptor0 + 3;
+            ASSERT_LT(index, wire.size());
+            wire[index] ^= 1u;   // expected fourth word only; genuine entry V# is unchanged
+            ++corruptions;
+        };
+        // A private host-wire fault, NOT a guest mutation/currentness claim. Original EXEC=0
+        // still executes SMEM and detects it. The uniform descriptor mismatch affects every
+        // wave; Gate0 leaves this fresh target opaque black, without original color_a.
+        pixels(render(fault), {0.f, 0.f, 0.f, 1.f});
+    }
+    EXPECT_EQ(corruptions, 1u) << "one real pooled upload reached the private calibration";
+    pixels(render(state()), r::fragment_draw::color_a);
+    EXPECT_TRUE(isolated_output.close());
+}
+TEST_F(FragmentScalarBankGpu, GenuineAdjacentBankDrawsPreserveNoncommutativeFixedFunctionBlend) {
+    scene.write(r::fragment_draw::color_b, 0x100);
+    auto a = state(), b = state();
+    const uint64_t second_address = scene.data.address + 0x100;
+    b.sh[p::SPI_SHADER_USER_DATA_PS_0] = uint32_t(second_address);
+    b.sh[p::SPI_SHADER_USER_DATA_PS_0 + 1] = uint32_t(second_address >> 32u);
+    // Actual AMD blend fields already decoded by the normal renderer: color SrcAlpha /
+    // OneMinusSrcAlpha/Add, separate alpha One / OneMinusSrcAlpha/Add.
+    for (auto* draw : {&a, &b})
+        draw->cx[p::CB_BLEND0_CONTROL] =
+            (1u << 30) | (1u << 29) | 4u | (5u << 8) | (1u << 16) | (5u << 24);
+    auto ab = a;
+    append(ab, b, 200);
+    const auto expected = [](const auto& first, const auto& second) {
+        std::array<float, 4> rgba{};
+        for (uint32_t channel = 0; channel < 3; ++channel)
+            rgba[channel] = second[channel] * .5f + first[channel] * .25f;
+        rgba[3] = 1;
+        return rgba;
+    };
+    const auto color_ab = expected(r::fragment_draw::color_a, r::fragment_draw::color_b);
+    const auto color_ba = expected(r::fragment_draw::color_b, r::fragment_draw::color_a);
+    ASSERT_NE(color_ab, color_ba);
+    pixels(render(ab, 2), color_ab);
+    f::DirectRegion other_output;
+    ASSERT_TRUE(other_output.create());
+    for (auto* draw : {&a, &b}) {
+        draw->cx[p::CB_COLOR0_BASE] = uint32_t(other_output.address >> 8u);
+        draw->cx[p::CB_COLOR0_BASE_EXT] = uint32_t(other_output.address >> 40u);
+    }
+    auto ba = b;
+    append(ba, a, 200);
+    pixels(render(ba, 2), color_ba);
+    EXPECT_TRUE(other_output.close());
+}
+TEST_F(FragmentScalarBankGpu, PrivateThirdWaveInputFaultRollsBackTheEntireDraw) {
+    static_assert(r::fragment_draw::width * r::fragment_draw::height == 3 * 64);
+    pixels(render(state()), r::fragment_draw::color_a);
+    f::DirectRegion isolated_output;
+    ASSERT_TRUE(isolated_output.create());
+    auto fault = state();
+    fault.cx[p::CB_COLOR0_BASE] = uint32_t(isolated_output.address >> 8u);
+    fault.cx[p::CB_COLOR0_BASE_EXT] = uint32_t(isolated_output.address >> 40u);
+    uint32_t corruptions = 0;
+    {
+        auto& callback = r::fragment_scalar_wave_wire_calibration_for_test();
+        struct Restore {
+            r::FragmentScalarWaveWireCallback& callback;
+            r::FragmentScalarWaveWireCallback previous;
+            ~Restore() { callback = std::move(previous); }
+        } restore{callback, std::move(callback)};
+        callback = [&](const r::FragmentScalarWaveWireCalibration& wire) {
+            ASSERT_EQ(wire.wave_index(), 2u);
+            ASSERT_EQ(wire.scalar_register(), 3u);
+            ASSERT_TRUE(wire.replace_word3(scene.descriptor[3] ^ 1u));
+            ++corruptions;
+        };
+        // Only wave-index2 input differs; the shared bank and other assembled waves stay genuine.
+        // This is private wire calibration, not guest mutation or temporal GPU wave order. The
+        // black oracle proves no attachment commit; earlier execution is not inferred from it.
+        pixels(render(fault), {0.f, 0.f, 0.f, 1.f});
+    }
+    EXPECT_EQ(corruptions, 1u);
+    pixels(render(state()), r::fragment_draw::color_a);
+    EXPECT_TRUE(isolated_output.close());
 }
 }   // namespace

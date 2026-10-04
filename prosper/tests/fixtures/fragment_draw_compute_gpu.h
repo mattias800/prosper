@@ -124,7 +124,8 @@ private:
 };
 
 // Allocations come from the normal backend call's one descriptor pool. Caller budgets these
-// four sets/twenty descriptors before constructing that pool and retains it through completion.
+// four sets/twenty descriptors (twenty-four with the shared bank) before constructing that pool
+// and retains it through completion.
 inline bool allocate_fragment_draw_compute_sets(
     VkDevice device, VkDescriptorPool pool, const FragmentDrawComputeGpuProgram& program,
     const FragmentDrawGpuOwner& owner,
@@ -164,6 +165,56 @@ inline bool allocate_fragment_draw_compute_sets(
     vkUpdateDescriptorSets(device, uint32_t(bindings.size()) * storage_bindings, writes.data(), 0,
                            nullptr);
     return true;
+}
+
+// PRIVATE input-wire calibration, not a guest read/entry authority. Its only mutation is one
+// actual scalar word in logical wave-index2 after assembly. It cannot access count/status/header
+// words or replace the retained code/capacity/guest bank. Normally null, scoped by test callers.
+class FragmentScalarWaveWireCalibration {
+public:
+    uint32_t wave_index() const { return 2; }
+    uint32_t scalar_register() const { return 3; }
+    bool replace_word3(uint32_t value) const {
+        if (!input_.buffer || offset_ > input_.range || input_.range - offset_ < 4) return false;
+        VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        barrier.buffer = input_.buffer;
+        barrier.offset = input_.offset;
+        barrier.size = input_.range;
+        barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        // Assembly writes and reads of the unchanged indirect header finish before the private
+        // transfer. This also orders the retained input plane's read/write hazards explicitly.
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(
+            command_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+        vkCmdUpdateBuffer(command_, input_.buffer, input_.offset + offset_, sizeof(value), &value);
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+        vkCmdPipelineBarrier(command_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                             0, 0, nullptr, 1, &barrier, 0, nullptr);
+        return true;
+    }
+
+private:
+    FragmentScalarWaveWireCalibration(VkCommandBuffer command, VkDescriptorBufferInfo input,
+                                      VkDeviceSize offset)
+        : command_(command), input_(input), offset_(offset) {}
+    friend void record_fragment_draw_compute_transaction(
+        VkCommandBuffer, const FragmentDrawComputeGpuProgram&, const FragmentDrawGpuOwner&,
+        const std::array<VkDescriptorSet, FragmentDrawComputeGpuProgram::Stages>&);
+    const VkCommandBuffer command_;
+    const VkDescriptorBufferInfo input_;
+    const VkDeviceSize offset_;
+};
+using FragmentScalarWaveWireCallback =
+    std::function<void(const FragmentScalarWaveWireCalibration&)>;
+inline FragmentScalarWaveWireCallback& fragment_scalar_wave_wire_calibration_for_test() {
+    static thread_local FragmentScalarWaveWireCallback callback;
+    return callback;
 }
 
 // Collector writes precede this recorder. Every phase uses independent retained private planes;
@@ -218,6 +269,23 @@ inline void record_fragment_draw_compute_transaction(
     barrier(O::Input, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    if (const auto& callback = fragment_scalar_wave_wire_calibration_for_test()) {
+        const auto& capacity = *owner.transaction().program()->capacity_owner();
+        const auto& layout = capacity.kernel()->layout;
+        const auto scalar = std::find(layout.sgprs.begin(), layout.sgprs.end(), 3u);
+        if (owner.transaction().scalar_bank() && capacity.max_waves() > 2 &&
+            scalar != layout.sgprs.end()) {
+            const auto index = size_t(scalar - layout.sgprs.begin());
+            if (index < layout.scalar_offsets.size()) {
+                const uint64_t word =
+                    uint64_t(capacity.placement(2).input_base) + layout.scalar_offsets[index];
+                const auto input = owner.plane(O::Input);
+                const VkDeviceSize offset = word * sizeof(uint32_t);
+                if (offset <= input.range && input.range - offset >= sizeof(uint32_t))
+                    callback(FragmentScalarWaveWireCalibration(command, input, offset));
+            }
+        }
+    }
     dispatch(FragmentDrawComputeGpuProgram::OriginalPs, true);
     barrier(O::Output, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);

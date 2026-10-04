@@ -307,4 +307,43 @@ TEST_F(FragmentScalarBank, SuccessfulPublicProducerEntryCannotReuseAnEarlierCopy
     ASSERT_EQ(observed.size(), 1u);
     ASSERT_TRUE(bank(observed[0]));
 }
+TEST(FragmentScalarBankVisibility, ExactRecordedBankRangeAccessAndStagesAreRequired) {
+    // Pure inspection of the exact Vulkan-call argument shape, not a device/visibility claim.
+    // Actual frontend GPU cases additionally require the recording observer to increment.
+    const VkDescriptorBufferInfo bank{reinterpret_cast<VkBuffer>(uintptr_t(1)), 0, 104};
+    VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    barrier.buffer = bank.buffer;
+    barrier.offset = bank.offset;
+    barrier.size = bank.range;
+    barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    const auto source = VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    const auto destination = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    const auto matches = [&](const auto& value,
+                             VkPipelineStageFlags src =
+                                 VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VkPipelineStageFlags dst = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) {
+        return r::fragment_scalar_bank_visibility_matches(src, dst, std::span(&value, 1), bank);
+    };
+    ASSERT_TRUE(matches(barrier));
+    EXPECT_FALSE(matches(barrier, VK_PIPELINE_STAGE_TRANSFER_BIT));
+    EXPECT_FALSE(matches(barrier, source, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT));
+    for (uint32_t change = 0; change < 7; ++change) {
+        auto wrong = barrier;
+        switch (change) {
+            case 0: wrong.buffer = reinterpret_cast<VkBuffer>(uintptr_t(2)); break;
+            case 1: wrong.offset = 4; break;
+            case 2: wrong.size -= 4; break;
+            case 3: wrong.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; break;
+            case 4: wrong.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT; break;
+            case 5: wrong.srcQueueFamilyIndex = 0; break;
+            case 6: wrong.dstQueueFamilyIndex = 0; break;
+        }
+        EXPECT_FALSE(matches(wrong)) << "wrong actual recorded property=" << change;
+    }
+    EXPECT_FALSE(r::fragment_scalar_bank_visibility_matches(source, destination, {}, bank));
+    EXPECT_FALSE(r::fragment_scalar_bank_visibility_matches(source, destination,
+                                                            std::span(&barrier, 1), {}));
+}
 }   // namespace

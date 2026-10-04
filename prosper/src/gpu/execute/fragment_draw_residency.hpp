@@ -57,6 +57,8 @@ struct FragmentDrawCacheStats {
     uint64_t checked_shader_module_calls = 0;
     // Actual once-per-draw shared resource uploads, not wave count or planned byte estimates.
     uint64_t scalar_bank_uploads = 0, scalar_bank_payload_bytes = 0;
+    // Actual command-recording arguments, not a completion or coherent-memory pixel oracle.
+    uint64_t scalar_bank_visibility_barriers = 0;
 };
 inline FragmentDrawCacheStats& fragment_draw_cache_stats() {
     static thread_local FragmentDrawCacheStats stats;

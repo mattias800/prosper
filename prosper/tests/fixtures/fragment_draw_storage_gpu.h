@@ -3,6 +3,44 @@
 // mapped or CPU-read, never serialized as guest authority, and never reused before completion.
 #pragma once
 
+// Private bank-wire calibration only, on the including test's thread. Normally null; it cannot
+// mint/replace a guest source, sealed bank, read permission, stage module or admission decision.
+// Test callers restore it with a scoped owner. A mutation here is NOT genuine guest state.
+using FragmentScalarBankWireCalibration = std::function<void(
+    std::span<uint32_t>, std::span<const prosper::gpu::FragmentPacketScalarReadSite>)>;
+inline FragmentScalarBankWireCalibration& fragment_scalar_bank_wire_calibration_for_test() {
+    static thread_local FragmentScalarBankWireCalibration callback;
+    return callback;
+}
+
+inline bool fragment_scalar_bank_visibility_matches(VkPipelineStageFlags source,
+                                                    VkPipelineStageFlags destination,
+                                                    std::span<const VkBufferMemoryBarrier> recorded,
+                                                    VkDescriptorBufferInfo bank) {
+    if (!bank.buffer || !bank.range || !(source & VK_PIPELINE_STAGE_HOST_BIT) ||
+        !(destination & VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT))
+        return false;
+    return std::any_of(recorded.begin(), recorded.end(), [&](const auto& barrier) {
+        return barrier.buffer == bank.buffer && barrier.offset == bank.offset &&
+               barrier.size == bank.range && (barrier.srcAccessMask & VK_ACCESS_HOST_WRITE_BIT) &&
+               (barrier.dstAccessMask & VK_ACCESS_SHADER_READ_BIT) &&
+               barrier.srcQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED &&
+               barrier.dstQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED;
+    });
+}
+inline void record_fragment_draw_upload_visibility(VkCommandBuffer command,
+                                                   VkPipelineStageFlags source,
+                                                   VkPipelineStageFlags destination,
+                                                   std::span<const VkBufferMemoryBarrier> recorded,
+                                                   VkDescriptorBufferInfo bank) {
+    // This very array/stage pair reaches the actual Vulkan recorder. The observer reads those
+    // arguments after recording, not a second expected barrier or a shadow success flag.
+    vkCmdPipelineBarrier(command, source, destination, 0, 0, nullptr, uint32_t(recorded.size()),
+                         recorded.data(), 0, nullptr);
+    if (fragment_scalar_bank_visibility_matches(source, destination, recorded, bank))
+        ++prosper::gpu::fragment_draw_cache_stats().scalar_bank_visibility_barriers;
+}
+
 struct FragmentDrawDeviceStorage {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -154,6 +192,9 @@ public:
                 // coherent upload. No guest VA reread, full-buffer concatenation or per-wave copy.
                 std::memcpy(destination + offset, interval.bytes->data(), interval.bytes->size());
             }
+            if (const auto& callback = fragment_scalar_bank_wire_calibration_for_test())
+                callback(std::span(reinterpret_cast<uint32_t*>(destination), bank->wire_words()),
+                         bank->packet_requirements()->scalar_reads.sites);
             auto& stats = prosper::gpu::fragment_draw_cache_stats();
             ++stats.scalar_bank_uploads;
             stats.scalar_bank_payload_bytes += bank->payload_bytes();
@@ -222,11 +263,12 @@ public:
         const uint32_t header[]{0, 0, transaction_.program()->collector_shape().record_words,
                                 prosper::gpu::kRasterQuadMagic};
         vkCmdUpdateBuffer(command, storage_[Collector].buffer, 0, sizeof(header), header);
-        vkCmdPipelineBarrier(
+        record_fragment_draw_upload_visibility(
             command, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-            0, 0, nullptr, barrier_count, barriers.data(), 0, nullptr);
+            std::span(barriers.data(), barrier_count),
+            transaction_.scalar_bank() ? upload(2) : VkDescriptorBufferInfo{});
     }
 
 private:
