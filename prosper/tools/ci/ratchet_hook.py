@@ -166,10 +166,17 @@ def native_path(path, windows=None):
 
 
 def repo_root(start):
-    """Top level of the git checkout containing `start`, or None."""
+    """Top level of the git checkout containing `start`, or None.
+
+    Built from `start` plus git's RELATIVE `--show-cdup`, never from `--show-toplevel`'s absolute
+    text: an MSYS2 git prints that through its own mount table (the Windows temp directory as
+    `/tmp/...`, not only drive paths like `/d/a/...`), which no fixed mapping can undo, and the
+    result is used as a subprocess `cwd` (WinError 267 on the MinGW runner). A relative step
+    joined to the caller's own native path needs no translation at all.
+    """
     try:
         out = subprocess.run(
-            ["git", "-C", start, "rev-parse", "--show-toplevel"],
+            ["git", "-C", start, "rev-parse", "--show-cdup"],
             capture_output=True,
             text=True,
             timeout=GIT_TIMEOUT_S,
@@ -178,7 +185,10 @@ def repo_root(start):
         return None
     if out.returncode != 0:
         return None
-    return native_path(out.stdout.strip()) or None
+    cdup = out.stdout.strip()
+    if os.path.isabs(cdup) or cdup.startswith("/"):
+        return None  # not a relative step; refuse rather than guess
+    return os.path.normpath(os.path.join(os.path.abspath(start), cdup))
 
 
 def unverified(reason):
@@ -273,7 +283,7 @@ def run_checker(root, project, timeout_s=CHECKER_TIMEOUT_S):
         except subprocess.TimeoutExpired:
             return None, f"the checker did not finish within {timeout_s} s"
         except OSError as error:
-            return None, f"the checker could not be started ({error})"
+            return None, f"the checker could not be started in {root!r} ({error})"
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
