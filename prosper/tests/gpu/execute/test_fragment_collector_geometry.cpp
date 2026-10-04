@@ -3,6 +3,7 @@
 // quad's numerical IJ after normal completion AND all attachment pixels; native fallback or
 // an unmatched/unwritten varying cannot satisfy both rails. No fabricated guest coefficient.
 #include "fixtures/fragment_raster_fixture.hpp"
+#include "fixtures/fragment_draw_source.hpp"
 #include "fixtures/render_runner.h"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>
@@ -190,6 +191,9 @@ TEST(FragmentCollectorGeometry, ActualCenterIjProducerSurvivesHelperPackingAndOr
     ASSERT_EQ(collection.shape.fields[0].words, 2u);
     ASSERT_EQ(collection.shape.lane_words, 11u);
     ASSERT_EQ(collection.shape.record_words, 44u);
+    // Opt-in retention of the actual emitted modules for SDK validation (no effect otherwise).
+    f::retain_source(collection.geometry, "coefficient_gs");
+    f::retain_source(plan->collect_words(), "collector_fs");
 
     // Same immutable plan cannot execute against another observed device profile or VS generation.
     std::string refusal;

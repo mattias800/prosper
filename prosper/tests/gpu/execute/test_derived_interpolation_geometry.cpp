@@ -1,6 +1,7 @@
 // Normal registered generated-GS observations must keep code identity without sharing draw entry.
 // Empty-GS warm tests cannot constrain this recurring geometry/helper-plan compilation defect.
 #include "fixtures/fragment_raster_fixture.hpp"
+#include "fixtures/fragment_draw_source.hpp"
 #include "gpu/execute/derived_interpolation_geometry.hpp"
 #include <gtest/gtest.h>
 
@@ -62,6 +63,7 @@ TEST_F(DerivedInterpolationGeometry, SeventeenRegisteredGeneratedGsObservationsS
         EXPECT_EQ(*inputs->source_gs, draws[observation].gs);
         EXPECT_EQ(*inputs->raw_code, code);
         EXPECT_TRUE(inputs->generated_interpolation_geometry);
+        if (!observation) f::retain_source(*inputs->source_gs, "derived_pull_gs");
         EXPECT_TRUE(inputs->launch_source->matches(*inputs));
         const auto prepared = g::prepare_fragment_packet_inputs(inputs, true);
         ASSERT_TRUE(prepared && prepared->launch_source);
