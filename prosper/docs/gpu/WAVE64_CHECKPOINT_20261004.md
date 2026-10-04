@@ -1,7 +1,8 @@
 # General Wave64 / Kena checkpoint — 2026-10-04
 
 This is a durable **partial-work handoff**, not acceptance evidence. The helper/launch code is
-unverified and has two confirmed review findings. General Wave64 and Kena title-screen 3D are
+unverified; one confirmed review finding has a source-only correction attempt and one is unstarted.
+General Wave64 and Kena title-screen 3D are
 NOT complete. No current Kena drop census, FPS improvement or title-screen rendering result was
 measured in this checkpoint. Work was frozen at the maintainer's checkpoint request.
 
@@ -30,6 +31,26 @@ game was run for this follow-up. The position-independent entry-schema repair re
 the rest of the incomplete review and full-original frontier are unchanged. Source/gate identities
 and outcomes are recorded in the PR follow-up comment, not borrowed from the frozen3fcb receipt.
 
+## Latest integration checkpoint
+
+The PREFETCH source attempt is commit `f657f651816b9727c71debc353f8407245ee236a`, parent
+`2775280b4d26cb5ed44bb1f44ee7a499fc9f9bae`, tree
+`ea3d5834c2b1facf282810af05ac81ccbaabed44`. Its scoped formatting, architecture, GTest-policy,
+contribution-shape and diff gates passed. These are source gates only; the three new cases remain
+UNEXECUTED and the successor has no independent approval.
+
+Latest fetched main `ee9dcb1e1e2c695426acb25575e7c6c320971d1d` was then integrated by normal
+merge `4b4a8ba696a9f055b461dce9442f2eb6bdc9af72`, parents f657f651 and ee9dcb1e, tree
+`ea309c0b6e2b23d5e5a50b54a08f1cd827ee58cc`. The complete incoming #4382 diff was inspected:
+only `fragment_scalar_bank_fixture.hpp` and `test_ordered_graphics_read_point.cpp` changed,
+replacing allocator-location-dependent fixture layouts with owned contiguous programs and
+SDK-relative offsets. The merge had no conflicts and session startup reported matching current
+instructions. No native build/test was run for the integration. The reviewer still needs to
+check this main delta against the helper changes; inspection is not independent approval.
+
+The exact published head and post-merge source-gate outcomes are recorded in the PR integration
+comment. Keep the original freeze and its review as historical evidence, not current acceptance.
+
 ## Objective and acceptance boundary
 
 Implement accurate, general guest Wave64 on hosts without native Wave64. Kena's title-screen 3D
@@ -48,7 +69,7 @@ input/audio and25% volume. A screenshot/pixel oracle must come from the normal W
 
 | State | Exact identity | Evidence/status |
 | --- | --- | --- |
-| Latest fetched main | `ee9dcb1e1e2c695426acb25575e7c6c320971d1d` | #4382 changed two scalar-bank/ordered-producer fixture files after the code freezes below; instructions match. Not integrated or tested here. |
+| Latest fetched main | `ee9dcb1e1e2c695426acb25575e7c6c320971d1d` | #4382 changed two scalar-bank/ordered-producer fixture files after the code freezes below; integrated at4b4a8ba6, instructions match. No native integration test. |
 | Accepted main integrated by helper | `3fe269ef0d035a46baee750af30b6a0004d4f7b0` | Includes merged #4374. |
 | Frozen helper CODE head | `3fcb2d181367505ebb5672e8d3cfe2b98396baed` | Parent `59995895857475b9971658ba7bacacd526b6c444`; tree `a75d5db570e7a47e597de52d77c343417273b4c6`. Source-only, partial review. Later checkpoint-document commits do not provide native credit. |
 | Frozen Windows artifact fix | `215ee6d29b29177c70a44ca6ae2abb11e0656d84` | Parent3fe; tree `e18dffd3803f551f20a3cd9079875205f0cb2da3`. Native baseline FAILED; [draft PR #4383](https://github.com/mattias800/prosper/pull/4383). |
@@ -136,7 +157,10 @@ not silently pass. This oracle is authored, NOT executed. Optional retained swiz
 `PROSPER_FRAGMENT_DRAW_SPV_DIRECTORY`. The exact source receipt lists five real helper factory
 forms and six connected emitted names; none has a fresh validation result.
 
-## Two confirmed helper findings — repairs NOT started
+## Two confirmed helper findings at the original freeze
+
+The first now has the UNVERIFIED source-only attempt described above. The second repair remains
+unstarted. The following records the original findings and their required acceptance work.
 
 1. **Cold proof and actual PREFETCH/CLAUSE dispatch disagree.**
    `fragment_raster_program.cpp:127` treats every SOPP0x20/0x21 as ignorable. Canonical PREFETCH
@@ -254,10 +278,11 @@ committed or downloaded by a fresh clone, whereas source and this document are i
 | `.codex/issue-4322-spv-native-20261004/9e595b11-final-corrected/` | Accepted exact9e585 actual modules/validator evidence. |
 | `.codex/worktrees/wave64-followthrough-20261002` | ROOT own central worktree; sole retained `prosper/build-flags-native-clang`. Latest compiled twelve CPU PEs are215, NOT current helper/checkpoint HEAD. |
 | `.codex/worktrees/fragment-launch-composition-20261004` | Source-only helper author tree, clean3fcb at freeze, no builds. |
-| `.codex/worktrees/refused-shader-paths-20261004` | Source-only Windows author tree, clean215 at freeze, no builds. |
+| `.codex/worktrees/refused-shader-paths-20261004` | Removed after clean/ignored-path census, author acknowledgement and exact remote215 verification; no build or raw receipts deleted. Recreate an owned tree from draft #4383 if resuming. |
 
 Safe cleanup: after draft remote refs and protected local refs/artifacts are verified, remove only
 finished owned source-only worktrees after clean/ignored-path census and author acknowledgement,
 using unforced `git worktree remove` on validated exact paths. Retain the one central build and
-failed evidence. Never delete shared/user trees or recursively erase the workspace. No cleanup
-had occurred at this checkpoint. All subagents stopped; no uncommitted follow-up repair exists.
+failed evidence. Never delete shared/user trees or recursively erase the workspace. The Windows
+source-only tree was safely removed after the original freeze; the helper author tree remains.
+All subagents stopped. The PREFETCH follow-up is committed; the entry-schema repair is unstarted.
