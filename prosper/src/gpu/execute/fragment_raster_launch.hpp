@@ -12,6 +12,8 @@ struct GraphicsRawSnapshotContext;
 struct ShaderCodeAnalysis;
 struct RasterQuadInputs;
 struct FragmentPacketVgprRequirements;
+class OrderedScalarBankReadPoint;
+class FragmentScalarBank;
 
 // The actual realizer retains this observation beside its selected modules. It is NOT incoming
 // EXEC, a helper/coverage conversion, an LDS allocation, a virtual scheduling permission or a
@@ -28,7 +30,9 @@ public:
 private:
     friend bool realize_draw_item(const GpuState&, const GpuState::Draw*, uint32_t, uint32_t, bool,
                                   DrawItem&, OperationRealizationFailure*, bool, const char* const*,
-                                  const GraphicsRawSnapshotContext*);
+                                  const GraphicsRawSnapshotContext*,
+                                  std::shared_ptr<const OrderedScalarBankReadPoint>,
+                                  std::shared_ptr<const FragmentScalarBank>);
     // Only the actual realizer may associate its selected analysis and modules with this draw.
     // A public inputs flag, a caller-provided analysis or a necessary memoized predicate cannot
     // mint this owner. The immutable observation is retained through normal draw completion.
