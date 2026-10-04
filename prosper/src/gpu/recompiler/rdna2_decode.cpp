@@ -814,8 +814,10 @@ void decode_operands(Rdna2Inst& i) {
             i.src[2] = decode_src_field((d1 >> 18) & 0x1FFu); i.n_src = 3;
             // Packed f16 fma/add/mul/min/max (0x0e-0x12), the packed 16-bit integer family
             // (0x00-0x0d) and v_fma_mix_f32/mixlo/mixhi (0x20-0x22): every modifier bit is MODELED
-            // (#273/#2013). For packed ops OPSEL/NEG select and negate each source independently
-            // for the low result; OPSEL_HI/NEG_HI do the same for the high result.
+            // (#273/#2013). The integer dot family (0x14-0x19) models only the source selectors
+            // (see its branch below; encodings checked with llvm-mc gfx1030). For packed ops
+            // OPSEL/NEG select and negate each source independently for the low result;
+            // OPSEL_HI/NEG_HI do the same for the high result.
             // For the mix family:
             // OPSEL_HI[k] selects an f16-half read (which half via OPSEL[k]), NEG negates, NEG_HI
             // is ABS for the mix family, CLAMP saturates. (llvm-mc gfx1030 round-trip on the live
@@ -849,6 +851,27 @@ void decode_operands(Rdna2Inst& i) {
                 i.vop3p_opsel    = static_cast<uint8_t>((w >> 11) & 7u);
                 i.vop3p_opsel_hi = static_cast<uint8_t>(((d1 >> 27) & 3u) | (((w >> 14) & 1u) << 2));
                 if (((w >> 15) & 1u) != 0u) i.has_modifier = true;
+            } else if (i.opcode >= 0x14u && i.opcode <= 0x19u) {
+                // Integer dot product family (0x14..0x19):
+                // 0x14 v_dot2_i32_i16, 0x15 v_dot2_u32_u16,
+                // 0x16 v_dot4_i32_i8,  0x17 v_dot4_u32_u8,
+                // 0x18 v_dot8_i32_i4,  0x19 v_dot8_u32_u4.
+                // In assemblers (llvm-mc), default op_sel is [0,0,0] and op_sel_hi is [1,1,1]
+                // (setting dword0[14] and dword1[28:27]).
+                // For v_dot2, op_sel[1:0] and op_sel_hi[1:0] select the half-words for src0 and
+                // src1.
+                // Clamp, neg, and neg_hi are unmodeled and set has_modifier. op_sel[2] (which
+                // llvm-mc accepts on dot2) is refused deliberately: src2 is a full 32-bit
+                // accumulator and no half-select of it is modelled.
+                const uint32_t neg = (d1 >> 29) & 7u;
+                const uint32_t neg_hi = (w >> 8) & 7u;
+                i.vop3p_opsel = static_cast<uint8_t>((w >> 11) & 7u);
+                i.vop3p_opsel_hi =
+                    static_cast<uint8_t>(((d1 >> 27) & 3u) | (((w >> 14) & 1u) << 2));
+                const bool clamp = ((w >> 15) & 1u) != 0u;
+                if (neg != 0u || neg_hi != 0u || clamp) { i.has_modifier = true; }
+                const uint32_t packed_sources = (i.opcode == 0x14u || i.opcode == 0x15u) ? 3u : 0u;
+                if ((i.vop3p_opsel & ~packed_sources) != 0u) { i.has_modifier = true; }
             } else if (i.opcode >= 0x20 && i.opcode <= 0x22) {
                 const uint32_t neg = (d1 >> 29) & 7u, neg_hi = (w >> 8) & 7u;
                 for (int k = 0; k < 3; k++) {
@@ -858,7 +881,8 @@ void decode_operands(Rdna2Inst& i) {
                 i.vop3p_opsel    = (uint8_t)((w >> 11) & 7u);
                 i.vop3p_opsel_hi = (uint8_t)((((d1 >> 27) & 3u)) | (((w >> 14) & 1u) << 2));
                 i.clamp = ((w >> 15) & 1u) != 0;
-            } else if (((w >> 8) & 0xFFu) != 0u || ((d1 >> 27) & 0x1Fu) != 0u) i.has_modifier = true;
+            } else if (((w >> 8) & 0xFFu) != 0u || ((d1 >> 27) & 0x1Fu) != 0u)
+                i.has_modifier = true;
             break;
         }
         case Rdna2Format::SOP1:

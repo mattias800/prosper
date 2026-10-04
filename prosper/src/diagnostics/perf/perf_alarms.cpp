@@ -72,6 +72,88 @@ AlarmEngine::RuleState& AlarmEngine::state_for(const char* rule) {
     return rules_.back().second;
 }
 
+void AlarmEngine::write_frame_schema() {
+    if (!jsonl_) return;
+    // Per-run constants of the frame records, written once at the baseline flip rather than on
+    // every frame line (a frame record is written per guest flip, so its size is the log's growth).
+    std::fputs("{\"type\":\"frame_schema\",\"timing_model\":\"scope-completion-interval\","
+               "\"excluded_stages\":[\"texture-ref-sample\"],\"interpretation\":"
+               "\"stage times are summed thread time; scopes are charged when completed; "
+               "categories may overlap and are not a frame-time partition; texture-ref-sample is "
+               "timed 1 in kTextureRefSamplePeriod and is reported by its own rule\"}\n",
+               jsonl_);
+    flush_jsonl_or_disable();
+}
+
+void AlarmEngine::flush_jsonl_or_disable() {
+    if (std::fflush(jsonl_) == 0) return;
+    if (config_.log)
+        std::fprintf(config_.log,
+                     "[perf-alarm] JSONL write failed; no further JSONL records (alarm, window "
+                     "or frame) are written\n");
+    std::fclose(jsonl_);
+    jsonl_ = nullptr;
+}
+
+void AlarmEngine::write_frame_sample(uint64_t now_ns, const Ledger& ledger) {
+    if (!jsonl_ || !started_) return;
+
+    const uint64_t interval_ns = now_ns >= prev_frame_ns_ ? now_ns - prev_frame_ns_ : 0;
+    const uint64_t sequence = ++frame_samples_;
+    const double t_seconds = static_cast<double>(now_ns - origin_ns_) / 1e9;
+    std::fprintf(jsonl_,
+                 "{\"type\":\"frame\",\"sequence\":%llu,\"t\":%.6f,"
+                 "\"flip_interval_ms\":%.3f,\"stage_thread_time\":{",
+                 static_cast<unsigned long long>(sequence), t_seconds, interval_ns / 1e6);
+
+    // texture-ref-sample is timed 1 in kTextureRefSamplePeriod: a per-flip figure of it would
+    // understate the real cost by that factor, so -- as in the exit summary -- it is left out.
+    constexpr size_t kSampled = static_cast<size_t>(Cost::TextureRefSample);
+    bool first = true;
+    for (size_t i = 0; i < kCostCount; ++i) {
+        if (i == kSampled) continue;
+        const uint64_t total_ns = ledger.cost_ns[i].load(std::memory_order_relaxed);
+        const uint64_t total_events = ledger.cost_events[i].load(std::memory_order_relaxed);
+        const uint64_t delta_ns = total_ns >= prev_frame_cost_ns_[i]
+            ? total_ns - prev_frame_cost_ns_[i] : 0;
+        const uint64_t delta_events = total_events >= prev_frame_cost_events_[i]
+            ? total_events - prev_frame_cost_events_[i] : 0;
+        if (!first) std::fputc(',', jsonl_);
+        first = false;
+        json_string(jsonl_, kCostNames[i]);
+        std::fprintf(jsonl_, ":{\"ms\":%.3f,\"events\":%llu}", delta_ns / 1e6,
+                     static_cast<unsigned long long>(delta_events));
+        prev_frame_cost_ns_[i] = total_ns;
+        prev_frame_cost_events_[i] = total_events;
+    }
+
+    const auto gpu_delta = [&](Counter counter, uint64_t& previous) {
+        const uint64_t total = ledger.counters[static_cast<size_t>(counter)].load(
+            std::memory_order_relaxed);
+        const uint64_t delta = total >= previous ? total - previous : 0;
+        previous = total;
+        return delta;
+    };
+    const uint64_t compute_ns = gpu_delta(Counter::GpuDeviceNsCompute, prev_frame_gpu_compute_ns_);
+    const uint64_t compute_samples = gpu_delta(Counter::GpuDeviceSamplesCompute,
+                                               prev_frame_gpu_compute_samples_);
+    const uint64_t graphics_ns = gpu_delta(Counter::GpuDeviceNsGraphics,
+                                           prev_frame_gpu_graphics_ns_);
+    const uint64_t graphics_samples = gpu_delta(Counter::GpuDeviceSamplesGraphics,
+                                                prev_frame_gpu_graphics_samples_);
+    std::fprintf(jsonl_,
+                 "},\"gpu_device_time\":{\"compute_ms\":%.3f,"
+                 "\"compute_timestamp_pairs\":%llu,\"graphics_ms\":%.3f,"
+                 "\"graphics_timestamp_pairs\":%llu}}\n",
+                 compute_ns / 1e6, static_cast<unsigned long long>(compute_samples),
+                 graphics_ns / 1e6, static_cast<unsigned long long>(graphics_samples));
+    flush_jsonl_or_disable();
+    // The two flip sources run on different threads and read the clock before taking mutex_, so a
+    // later-locked caller can carry an earlier timestamp. Never move the baseline backwards, or the
+    // next interval would be overstated by the same amount.
+    if (now_ns > prev_frame_ns_) prev_frame_ns_ = now_ns;
+}
+
 std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
                                               uint32_t target_hz,
                                               const ExternalTotals* external) {
@@ -83,13 +165,25 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
         // charged to the first window, which would otherwise be a window of unbounded length.
         started_ = true;
         origin_ns_ = window_start_ns_ = now_ns;
+        prev_frame_ns_ = now_ns;
         for (size_t i = 0; i < kCostCount; ++i) {
             prev_cost_ns_[i] = ledger.cost_ns[i].load(std::memory_order_relaxed);
             prev_cost_events_[i] = ledger.cost_events[i].load(std::memory_order_relaxed);
+            prev_frame_cost_ns_[i] = prev_cost_ns_[i];
+            prev_frame_cost_events_[i] = prev_cost_events_[i];
             ledger.cost_max_ns[i].store(0, std::memory_order_relaxed);
         }
-        for (size_t i = 0; i < kCounterCount; ++i)
+        for (size_t i = 0; i < kCounterCount; ++i) {
             prev_counters_[i] = ledger.counters[i].load(std::memory_order_relaxed);
+        }
+        prev_frame_gpu_compute_ns_ =
+            prev_counters_[static_cast<size_t>(Counter::GpuDeviceNsCompute)];
+        prev_frame_gpu_compute_samples_ =
+            prev_counters_[static_cast<size_t>(Counter::GpuDeviceSamplesCompute)];
+        prev_frame_gpu_graphics_ns_ =
+            prev_counters_[static_cast<size_t>(Counter::GpuDeviceNsGraphics)];
+        prev_frame_gpu_graphics_samples_ =
+            prev_counters_[static_cast<size_t>(Counter::GpuDeviceSamplesGraphics)];
         for (size_t i = 0; i < kDropReasonCount; ++i)
             prev_drop_reasons_[i] = ledger.drop_reasons[i].load(std::memory_order_relaxed);
         for (size_t i = 0; i < kDispatchSkipCount; ++i)
@@ -113,8 +207,10 @@ std::vector<AlarmFiring> AlarmEngine::on_flip(uint64_t now_ns, Ledger& ledger,
             prev_transfer_bytes_[i] = ext.transfer_bytes[i];
             prev_transfer_calls_[i] = ext.transfer_calls[i];
         }
+        write_frame_schema();
         return {};
     }
+    write_frame_sample(now_ns, ledger);
     ++flips_in_window_;
     if (now_ns - window_start_ns_ < config_.window_ns) return {};
 

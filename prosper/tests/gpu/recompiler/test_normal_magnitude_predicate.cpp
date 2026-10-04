@@ -3,28 +3,28 @@
 // and CLAMP-clear non-signaling comparisons. ABS precedes NEG. A positive NORMAL bound
 // makes ABS(U)<=K invariant under input flushing; EQ(U,+/-0) is not invariant alone.
 // Reference: https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture
+//
+// NOTE: the legacy --dump DIR artifact mode was dropped in the GTest migration (it was never
+// wired into ctest). Modules below are deterministic from the owned packets, so re-add a local
+// dump when a .spv artifact is needed for debugging.
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include "gpu/resources/shader_resources.hpp"
 
+#include <gtest/gtest.h>
+
 #include <array>
 #include <cstdint>
-#include <cstdio>
-#include <filesystem>
-#include <fstream>
-#include <span>
 #include <string>
-#include <string_view>
 #include <vector>
 
 using namespace prosper::gpu;
 namespace {
-int failures = 0;
-size_t assertions = 0, modules = 0, values = 0;
+// Non-fatal: records into the calling TEST like any other EXPECT, so helpers can keep calling
+// it with message strings that contain commas (a function-like macro would split on those).
 void check(bool condition, const std::string& name) {
-    ++assertions;
-    if (!condition) { ++failures; std::printf("[FAIL] %s\n", name.c_str()); }
+    EXPECT_TRUE(condition) << name;
 }
 constexpr uint32_t type_bool = 20, type_int = 21, type_float = 22, type_vector = 23;
 constexpr uint32_t type_runtime_array = 29, type_struct = 30, type_pointer = 32;
@@ -319,15 +319,7 @@ std::vector<uint32_t> translate(const Options& o, bool branch, uint32_t wave) {
     rt.resources.push_back(r);
     PixelSystemInputMapping input;
     input.ena = input.addr = 1u<<8;
-    ++modules;
     return recompile_fragment(p.data(),p.size(),&rt,&input,UINT32_MAX,nullptr,wave==32);
-}
-void dump(const char* directory, const std::string& name, const std::vector<uint32_t>& words) {
-    if (!directory || words.empty()) return;
-    std::ofstream out(std::filesystem::path(directory)/(name+".spv"),std::ios::binary);
-    const auto bytes = std::as_bytes(std::span(words));
-    out.write(reinterpret_cast<const char*>(bytes.data()),static_cast<std::streamsize>(bytes.size()));
-    out.close(); check(bool(out),name+" dump written");
 }
 std::vector<uint32_t> samples(uint32_t bound) {
     std::vector<uint32_t> v{0,0x80000000u,1,0x80000001u,0x007fffffu,0x807fffffu,
@@ -336,12 +328,11 @@ std::vector<uint32_t> samples(uint32_t bound) {
         0x7f800000u,0xff800000u,0x7f800001u,0xff800001u,0x7fc00000u,0xffc01234u};
     return v;
 }
-void positive(const Options& o, uint32_t wave, const std::string& name, const char* directory) {
+void positive(const Options& o, uint32_t wave, const std::string& name) {
     const auto source = translate(o,true,wave);
     const Module m(source);
     check(m.valid && !source.empty(),name+" real fragment translator emitted SOURCE");
     if (!m.valid) return;
-    dump(directory,name+"_source",source);
     const uint32_t predicate = m.exported_predicate();
     const auto* p = m.def(predicate);
     check(predicate && p && p->op == unsigned_le,name+" actual MRT0.x consumes integer magnitude predicate");
@@ -361,7 +352,6 @@ void positive(const Options& o, uint32_t wave, const std::string& name, const ch
         for (const bool flush : {false,true}) {
             const bool expected = guest_range(word,o.bound,flush) || guest_zero(word,flush);
             check(actual==expected,name+" typed live predicate matches independent guest class reference");
-            ++values;
         }
     }
     const auto unchanged = source;
@@ -388,7 +378,6 @@ void positive(const Options& o, uint32_t wave, const std::string& name, const ch
                   fragment_spirv_required_subgroup_size(result.words)==0 &&
                   fragment_spirv_required_subgroup_reasons(result.words)==0,
                   name+" effective admission erases only proved complete-wave requirement");
-            dump(directory,name+"_effective",result.words);
             Oracle oracle{effective,{o.bound+1,0}};
             check(effective.exported_predicate()==predicate &&
                   !oracle.bool_value(predicate) && oracle.good && oracle.leaves==1,
@@ -396,13 +385,12 @@ void positive(const Options& o, uint32_t wave, const std::string& name, const ch
         }
     }
 }
-void negative(const Options& o, const std::string& name, const char* directory, bool reject=false) {
+void negative(const Options& o, const std::string& name, bool reject=false) {
     const auto source = translate(o,false,64);
     if (reject) { check(source.empty(),name+" unsupported packet still rejects beside DWORD positive control"); return; }
     const Module m(source);
     check(m.valid && !source.empty(),name+" negative control still translates");
     if (!m.valid) return;
-    dump(directory,name+"_source",source);
     const auto* p = m.def(m.exported_predicate());
     check(p && p->op==(o.use_and?logical_and:logical_or),
           name+" actual exported mask is not absorbed / strict AND unchanged");
@@ -410,7 +398,7 @@ void negative(const Options& o, const std::string& name, const char* directory, 
     oracle.bool_value(m.exported_predicate());
     check(!oracle.good,name+" oracle refuses unproved FP/unsupported live dependencies");
 }
-void undefined_control(const char* directory) {
+void undefined_control() {
     // This is an explicit SPIR-V obligation control, NOT a guest-regeneration claim. Replacing
     // the one live word load by Undef must not borrow the buffer's definedness certificate.
     Options o;
@@ -437,59 +425,72 @@ void undefined_control(const char* directory) {
     check(source==unchanged && lowered.refusal==FragmentVoteRefusal::UnprovedVote &&
           lowered.words.empty() && lowered.uniform_votes==0 && lowered.dead_votes==0 &&
           lowered.neutral_votes==0,"same-SSA Undef cannot borrow immutable/robust2 uniformity");
-    dump(directory,"undef_obligation_source",source);
 }
 } // namespace
 
-int main(int argc, char** argv) {
-    if (argc!=1 && !(argc==3 && std::string_view(argv[1])=="--dump")) return 2;
-    const char* directory = argc==3?argv[2]:nullptr;
-    undefined_control(directory);
-    for (const auto encoding : {Encoding::Sdwa,Encoding::E64}) {
-        const std::string enc = encoding==Encoding::Sdwa?"sdwa":"e64";
-        for (const bool mirror : {false,true}) for (const bool reverse : {false,true})
-            for (const bool zero_rhs : {false,true}) for (const uint32_t wave : {32u,64u})
-                for (const uint32_t bound : {0x00800000u,0x3a83126fu,0x7f7fffffu}) {
-                    Options o; o.encoding=encoding; o.mirror=mirror; o.reverse_or=reverse;
-                    o.zero_rhs=zero_rhs; o.negative_zero=zero_rhs; o.bound=bound;
-                    positive(o,wave,enc+"_"+(mirror?"ge":"le")+"_or"+std::to_string(reverse)+
-                        "_zero"+std::to_string(zero_rhs)+"_wave"+std::to_string(wave)+
-                        "_bound"+std::to_string(bound),directory);
-                }
-        const auto arm = [&](const char* name, auto modify, bool reject=false) {
-            Options o; o.encoding=encoding; modify(o); negative(o,enc+"_"+name,directory,reject);
-        };
-        arm("narrow_both",[](auto& o){o.narrow_both=true;});
-        arm("narrow_eq_only",[](auto& o){o.narrow_eq=true;});
-        arm("narrow_range_only",[](auto& o){o.narrow_range=true;});
-        arm("cmpx_destination",[](auto& o){o.cmpx=true;});
-        arm("neg_after_abs",[](auto& o){o.neg_word=true;});
-        arm("abs_threshold",[](auto& o){o.abs_bound=true;});
-        arm("eq_abs_modifier",[](auto& o){o.eq_abs=true;});
-        arm("different_word",[](auto& o){o.mismatch=true;});
-        arm("same_register_new_ssa",[](auto& o){o.overwrite=true;});
-        arm("unknown_bound",[](auto& o){o.unknown_bound=true;});
-        arm("unordered",[](auto& o){o.unordered=true;});
-        arm("strict_scalar_and",[](auto& o){o.use_and=true;});
-        for (const auto bound : {0u,0x80000000u,0x007fffffu,0x80000001u,0xbf800000u,
-                                0x7f800000u,0x7fc00000u})
-            arm(("non_normal_bound"+std::to_string(bound)).c_str(),[&](auto& o){o.bound=bound;});
-        if (encoding==Encoding::Sdwa) arm("word_select",[](auto& o){o.bad_sdwa=true;},true);
-        else arm("signaling_clamp",[](auto& o){o.clamp=true;});
-        Options varying; varying.encoding=encoding; varying.varying=true;
-        const auto source=translate(varying,true,64);
-        const Module m(source);
-        const auto lowered=lower_fragment_votes(source,true,true);
-        check(m.valid && m.count(any)==1 && m.def(m.exported_predicate()) &&
-              m.def(m.exported_predicate())->op==unsigned_le &&
-              lowered.refusal==FragmentVoteRefusal::UnprovedVote && lowered.words.empty(),
-              enc+" exact local integer semantics do NOT certify varying Input as wave-uniform");
-        Oracle oracle{m,{0,0}};
-        oracle.bool_value(m.exported_predicate());
-        check(!oracle.good,enc+" unsupported Input dependency cannot get an oracle placeholder");
-        dump(directory,enc+"_varying_source",source);
-    }
-    std::printf("== normal_magnitude_predicate: %zu translator modules, %zu values, %zu assertions, %d failures ==\n",
-                modules,values,assertions,failures);
-    return failures?1:0;
+TEST(NormalMagnitude, UndefinedControl) { undefined_control(); }
+
+TEST(NormalMagnitude, SdwaPositives) {
+    for (const bool mirror : {false,true}) for (const bool reverse : {false,true})
+        for (const bool zero_rhs : {false,true}) for (const uint32_t wave : {32u,64u})
+            for (const uint32_t bound : {0x00800000u,0x3a83126fu,0x7f7fffffu}) {
+                Options o; o.encoding=Encoding::Sdwa; o.mirror=mirror; o.reverse_or=reverse;
+                o.zero_rhs=zero_rhs; o.negative_zero=zero_rhs; o.bound=bound;
+                positive(o,wave,std::string("sdwa_")+(mirror?"ge":"le")+"_or"+std::to_string(reverse)+
+                    "_zero"+std::to_string(zero_rhs)+"_wave"+std::to_string(wave)+
+                    "_bound"+std::to_string(bound));
+            }
 }
+
+TEST(NormalMagnitude, E64Positives) {
+    for (const bool mirror : {false,true}) for (const bool reverse : {false,true})
+        for (const bool zero_rhs : {false,true}) for (const uint32_t wave : {32u,64u})
+            for (const uint32_t bound : {0x00800000u,0x3a83126fu,0x7f7fffffu}) {
+                Options o; o.encoding=Encoding::E64; o.mirror=mirror; o.reverse_or=reverse;
+                o.zero_rhs=zero_rhs; o.negative_zero=zero_rhs; o.bound=bound;
+                positive(o,wave,std::string("e64_")+(mirror?"ge":"le")+"_or"+std::to_string(reverse)+
+                    "_zero"+std::to_string(zero_rhs)+"_wave"+std::to_string(wave)+
+                    "_bound"+std::to_string(bound));
+            }
+}
+
+namespace {
+void negatives(Encoding encoding) {
+    const std::string enc = encoding==Encoding::Sdwa?"sdwa":"e64";
+    const auto arm = [&](const char* name, auto modify, bool reject=false) {
+        Options o; o.encoding=encoding; modify(o); negative(o,enc+"_"+name,reject);
+    };
+    arm("narrow_both",[](auto& o){o.narrow_both=true;});
+    arm("narrow_eq_only",[](auto& o){o.narrow_eq=true;});
+    arm("narrow_range_only",[](auto& o){o.narrow_range=true;});
+    arm("cmpx_destination",[](auto& o){o.cmpx=true;});
+    arm("neg_after_abs",[](auto& o){o.neg_word=true;});
+    arm("abs_threshold",[](auto& o){o.abs_bound=true;});
+    arm("eq_abs_modifier",[](auto& o){o.eq_abs=true;});
+    arm("different_word",[](auto& o){o.mismatch=true;});
+    arm("same_register_new_ssa",[](auto& o){o.overwrite=true;});
+    arm("unknown_bound",[](auto& o){o.unknown_bound=true;});
+    arm("unordered",[](auto& o){o.unordered=true;});
+    arm("strict_scalar_and",[](auto& o){o.use_and=true;});
+    for (const auto bound : {0u,0x80000000u,0x007fffffu,0x80000001u,0xbf800000u,
+                            0x7f800000u,0x7fc00000u})
+        arm(("non_normal_bound"+std::to_string(bound)).c_str(),[&](auto& o){o.bound=bound;});
+    if (encoding==Encoding::Sdwa) arm("word_select",[](auto& o){o.bad_sdwa=true;},true);
+    else arm("signaling_clamp",[](auto& o){o.clamp=true;});
+    Options varying; varying.encoding=encoding; varying.varying=true;
+    const auto source=translate(varying,true,64);
+    const Module m(source);
+    const auto lowered=lower_fragment_votes(source,true,true);
+    check(m.valid && m.count(any)==1 && m.def(m.exported_predicate()) &&
+          m.def(m.exported_predicate())->op==unsigned_le &&
+          lowered.refusal==FragmentVoteRefusal::UnprovedVote && lowered.words.empty(),
+          enc+" exact local integer semantics do NOT certify varying Input as wave-uniform");
+    Oracle oracle{m,{0,0}};
+    oracle.bool_value(m.exported_predicate());
+    check(!oracle.good,enc+" unsupported Input dependency cannot get an oracle placeholder");
+}
+}  // namespace
+
+TEST(NormalMagnitude, SdwaNegatives) { negatives(Encoding::Sdwa); }
+
+TEST(NormalMagnitude, E64Negatives) { negatives(Encoding::E64); }

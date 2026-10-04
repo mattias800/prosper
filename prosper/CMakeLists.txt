@@ -2833,6 +2833,16 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_decode_sweep.cpp
     LIBRARIES prosper_core)
 
+  # The scalar opcode predicates are header-only facts checked against ISA/LLVM tables.
+  prosper_add_gtest(test_scalar_predicates
+    SOURCES tests/gpu/recompiler/test_scalar_predicates.cpp
+    INCLUDES src)
+
+  # The SOPP branch predicate is a header-only fact checked against the ISA table.
+  prosper_add_gtest(test_sopp_direct_branch
+    SOURCES tests/gpu/recompiler/test_sopp_direct_branch.cpp
+    INCLUDES src)
+
   # Closed-tail block admission is decoder-only, so this compiles rdna2_decode.cpp directly
   # (same pattern as test_workgroup_uniformity above).
   prosper_add_gtest(test_rdna2_closed_tail
@@ -2847,6 +2857,11 @@ if(TARGET prosper_core)
   # Mandatory-literal capture is a decoder-only fact: K/data must be captured, not just counted.
   prosper_add_gtest(test_rdna2_literal_capture
     SOURCES tests/gpu/recompiler/test_rdna2_literal_capture.cpp src/gpu/recompiler/rdna2_decode.cpp
+    INCLUDES src)
+
+  # Memory-writer classification is a decoder-only predicate checked against the ISA tables.
+  prosper_add_gtest(test_may_write_memory
+    SOURCES tests/gpu/recompiler/test_may_write_memory.cpp src/gpu/recompiler/rdna2_decode.cpp
     INCLUDES src)
 
   # Structural RDNA2->SPIR-V validation that does not require Vulkan runtime support.
@@ -2870,6 +2885,11 @@ if(TARGET prosper_core)
       PROPERTIES TIMEOUT 60)
     prosper_add_gtest(test_compute_dpp_row_max_execution
       SOURCES tests/gpu/execute/test_compute_dpp_row_max.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_compute_s_movrels_execution
+      SOURCES tests/gpu/execute/test_compute_s_movrels.cpp
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 60)
@@ -2900,9 +2920,9 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_compare_exec_masking.cpp
     LIBRARIES prosper_core)
 
-  add_executable(test_normal_magnitude_predicate tests/gpu/recompiler/test_normal_magnitude_predicate.cpp)
-  target_link_libraries(test_normal_magnitude_predicate PRIVATE prosper_core)
-  add_test(NAME normal_magnitude_predicate COMMAND test_normal_magnitude_predicate)
+  prosper_add_gtest(test_normal_magnitude_predicate
+    SOURCES tests/gpu/recompiler/test_normal_magnitude_predicate.cpp
+    LIBRARIES prosper_core)
   add_executable(test_raster_quad_collector tests/gpu/recompiler/test_raster_quad_collector.cpp)
   target_link_libraries(test_raster_quad_collector PRIVATE prosper_core)
   add_test(NAME raster_quad_collector_contract COMMAND test_raster_quad_collector)
@@ -3620,9 +3640,8 @@ endif()
     SOURCES tests/gpu/recompiler/test_undef_loop_accumulator.cpp
     LIBRARIES prosper_core)
 
-  # Fail-visible refusal pins for gap opcodes (v_perm_b32, v_mad_i64_i32,
-  # v_div_fixup_f32, v_sad_u8, s_movrels_b32, image_gather4): empty module,
-  # never a silent mistranslation. Compile-only, no device. Any later
+  # Fail-visible refusal pins for gap opcodes (the file header lists the current
+  # set): empty module, never a silent mistranslation. Compile-only, no device. Any later
   # lowering replaces these arms with execution tests.
   prosper_add_gtest(test_gap_opcode_refusals
     SOURCES tests/gpu/recompiler/test_gap_opcode_refusals.cpp
@@ -4646,7 +4665,8 @@ endif()
 
       # End-to-end: recompile real RDNA2 (llvm-mc) -> SPIR-V -> run -> assert numeric result.
       add_executable(test_rdna2_to_spirv tests/gpu/recompiler/test_rdna2_to_spirv.cpp
-                 tests/gpu/recompiler/test_rdna2_bvh.cpp)
+                 tests/gpu/recompiler/test_rdna2_bvh.cpp
+                 tests/gpu/recompiler/test_rdna2_minmax3.cpp)
       # Includes a shared fixture, which resolves from the `tests` root.
       target_include_directories(test_rdna2_to_spirv PRIVATE tests)
       target_link_libraries(test_rdna2_to_spirv PRIVATE prosper_core Vulkan::Vulkan)

@@ -378,6 +378,24 @@ int main() {
                                              std::size(live_vcc_hi_guard)), 1u),
           "a real VCC_HI vector read keeps the guarded scalar write non-linearizable");
 
+    // IF/ENDIF rejoining live code: v_mad_i64_i32's SDST carry write is unpredicated, so the execz
+    // must not be linearized. Control: the same block with plain VGPR moves is. (llvm-mc gfx1030.)
+    const uint32_t mad_i64_if[] = {
+        0xbf880002u,                // 0: s_cbranch_execz -> pc=3 (live code, not s_endpgm)
+        0xd5770c05u, 0x040a0300u,   // 1: v_mad_i64_i32 v[5:6], s[12:13], v0, v1, v[2:3]
+        0x7e000301u,                // 3: v_mov_b32 v0, v1
+        0xbf810000u,                // 4: s_endpgm
+    };
+    CHECK(!has(safe_execz_branches_for_test(mad_i64_if, std::size(mad_i64_if)), 0u),
+          "v_mad_i64_i32's unpredicated SDST keeps a rejoining execz non-linearizable");
+    const uint32_t mad_i64_if_control[] = {
+        0xbf880002u,
+        0x7e0a0300u, 0x7e0c0301u,   // v_mov_b32 v5, v0 ; v_mov_b32 v6, v1
+        0x7e000301u, 0xbf810000u,
+    };
+    CHECK(has(safe_execz_branches_for_test(mad_i64_if_control, std::size(mad_i64_if_control)), 0u),
+          "control: the same rejoining block with VGPR-only writes is linearizable");
+
     // GTA V uses a scalar load into VCC_LO as temporary data inside an EXECZ guard, then crosses an
     // image access before the temporary dies. MIMG's decoded T# and S# ranges are the complete scalar
     // read set, so an unrelated resource must not stop the merge-liveness proof. Exercise the actual
