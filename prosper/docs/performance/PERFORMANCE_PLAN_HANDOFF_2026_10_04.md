@@ -9,6 +9,12 @@ again before resuming, because this document deliberately records a dated state.
 
 ## Where the original plan stands
 
+**Latest steering:** the owner confirms manual Cross input in Evergate OFF and Messenger earlier.
+Messenger's exact earlier run/source/arm is unbound. Retained native images and visual judgments
+remain useful, but no Messenger/Evergate run is claimed as proof of autonomous route progression.
+Performance measurements must use a verified scripted route and matching admitted scenes;
+explicitly selected splash/title populations must stay separate from in-level gameplay.
+
 | Original item | Checkpoint | Work remaining |
 | --- | --- | --- |
 | [#3948 async submission](https://github.com/mattias800/prosper/issues/3948) | Measurement/Stage 0 and opt-in Stage 2 are merged. **Default remains OFF.** Historical GTA collapse investigation, normal-app A/B observations and apparatus limitations are documented. The ee9dcb1e normal app is qualified; Messenger's OFF/ON visual pair is complete. | Finish the remaining thirteen original title pairs and the larger repeated current-cohort GTA/Sonic A/B. Preserve rendering holds and refuse unsupported default claims. |
@@ -175,6 +181,60 @@ archive SHA256 **9f84eb10a4bfaa3c9002545bf78b0fe37034fc313827401e5dad74605ea1ce8
 It and its manifest/receipt were fsynced on persistent storage. Earlier capsules remain intact.
 **Two of 28 arms, one of 14 original title pairs are complete.** The next pair is Evergate after
 checking fresh remote main and retaining or refreshing the actual app/source qualification.
+
+## Evergate OFF calibration: clean launch, missing gameplay evidence
+
+On the same qualified ee9dcb1e app, the initial Evergate OFF calibration ran **230.610 s** and
+app/runner/launcher all exited **0**. Root inspected title-prompt captures requested500/actual501
+and6000, then an opening crimson-landscape transition at9000. Requested12000 was unreached;
+Begin/Options and two player/tutorial-HUD captures remain **NO_DATA**. All owned births drained,
+23 owned samples plus one not-yet-viewable startup sample and the owned before-cutoff sample were
+retained. The owner subsequently confirmed pressing Cross and reported the rendering looked good.
+This is script plus manual input, not a failed proof that the exact script alone progressed.
+
+The12-entry route loaded, but individual input edges were not recorded. Completed-window alarms
+and exit records were read: **2184 frontend-unresolved draws**, all `shader-recompile/fragment`,
+also **2184 unsupported Wave64 uses** across14/45windows; one new unimplemented HLE NID at145s;
+F32 arithmetic45/45windows. The refused original fragment program was retained privately
+(2036dwords, first unsupported format1/op0x1f). Backend draw-disposition's separate unverified
+snapshot reported zero backend drops; it does not cancel frontend losses. ON has not run, so
+these baseline observations cannot be attributed to deferred submission. No performance is
+admitted and no rendering implementation is reverted or bypassed.
+
+The private OFF archive was actually verified and fsynced: **38,318,080 bytes**, **1789 regular
+members**, zero mismatches; SHA256
+**c1b1d7a6921630cf0622f7b9d983f298ddc30828ac022361ffa3184742008cc8**.
+The later manual-input disclosure is retained as a separate supplement to that dated snapshot.
+The next step is **input-route calibration**, before an Evergate OFF/ON comparison: log scripted
+presses and record the resulting successful-pad-read input stream. The proposed current-title
+route below is unrun at this commit; it holds each Cross for 0.5s and starts after the actually
+observed title-prompt ordinal. It is experimental data, not a committed shipping route or a
+qualified performance control. The owned producing checkout and actual app remain unchanged.
+
+```text
+# Experimental current-main Evergate input calibration, not a qualified performance route.
+# Title prompt was actually seen at pad-relative flip501. Start after that phase.
+# Twelve Cross presses hold for 0.5 seconds, with neutral gaps between flip anchors.
+f700+0.5:cross
+f1000+0.5:cross
+f1300+0.5:cross
+f1600+0.5:cross
+f1900+0.5:cross
+f2200+0.5:cross
+f2500+0.5:cross
+f2800+0.5:cross
+f3100+0.5:cross
+f3400+0.5:cross
+f3700+0.5:cross
+f4000+0.5:cross
+```
+
+Exact full-file proposal SHA256:
+**6de033206e6d5b64096be8ab2e597f64a8eec185da210f82d93063bffc1b7318**.
+Proposed bounded controls are230s, requested snapshots500/900/1800/7000/9500,
+`PROSPER_PAD_SCRIPT_LOG=1` and `PROSPER_PAD_RECORD_AXIS=pad-read`. Record the actual route/record
+bytes, all input transitions, native phases and missing observations before admitting this route.
+Do not merely extend the deadline or count the initial Evergate calibration as a completed pair.
 
 ## Retained app/source cohorts
 
