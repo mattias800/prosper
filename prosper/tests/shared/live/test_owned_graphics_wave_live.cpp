@@ -41,7 +41,7 @@ struct Program {
     AgcShaderHeader header{};
 };
 struct Owners {
-    std::array<Program, 24> programs;
+    std::array<Program, 32> programs;
 };
 static Owners* owners;
 static size_t next_program;
@@ -561,6 +561,55 @@ TEST_P(OwnedGraphicsWaveLive, OwnedWaveClassificationMatchesFullStreamDerivation
     program->header.shader_size = uint32_t(owned.size() * 4u);
     EXPECT_TRUE(graphics_program_requires_owned_waves(address))
         << "rewritten registered bytes must be reclassified, not answered from a stale entry";
+}
+// An owned-wave draw refused by register state alone gains nothing from the executor's
+// authoritative flush, so the executor skips it (on GTA V's bank scene ~22 MiB of readback per
+// such draw). The predicate must name exactly that case, and preparation must report the state
+// refusal even when producers were never published -- the order the skip relies on.
+TEST_P(OwnedGraphicsWaveLive, StateRefusedOwnedWavesSkipThePublication) {
+    auto* vs = register_program(true, vertex_code(false, GetParam()));
+    auto* ps = register_program(false, fragment_code(true, GetParam()));
+    ASSERT_NE(vs, nullptr);
+    ASSERT_NE(ps, nullptr);
+    const uint64_t vs_address = reinterpret_cast<uint64_t>(vs->code.data());
+    const uint64_t ps_address = reinterpret_cast<uint64_t>(ps->code.data());
+    const GraphicsRawSnapshotContext unpublished{false};
+    const auto refusal = [&](const GpuState& s) {
+        std::shared_ptr<const GraphicsOwnedWaveDraw> owned;
+        std::vector<uint32_t> indices;
+        std::string reason;
+        EXPECT_FALSE(prepare_draw_owned_waves(s, &s.draws[0], vs_address, ps_address, 3u, {},
+                                              &unpublished, owned, indices, reason));
+        EXPECT_EQ(owned, nullptr);
+        return reason;
+    };
+
+    auto admitted = state(*vs, *ps, false);
+    ASSERT_TRUE(draw_requires_owned_nested_snapshot(admitted));
+    EXPECT_EQ(owned_wave_draw_state_refusal(admitted, true), nullptr);
+    EXPECT_FALSE(owned_nested_snapshot_is_futile(admitted, nullptr, 0))
+        << "a draw that may still be admitted must keep its publication";
+    EXPECT_EQ(refusal(admitted), "draw-wave-prior-producers-incomplete");
+
+    auto metadata = state(*vs, *ps, false);
+    metadata.cx[P::CB_COLOR0_CMASK] = 0x1234u;
+    ASSERT_TRUE(draw_requires_owned_nested_snapshot(metadata));
+    ASSERT_NE(owned_wave_draw_state_refusal(metadata, true), nullptr);
+    EXPECT_STREQ(owned_wave_draw_state_refusal(metadata, true),
+                 "draw-wave-output-metadata-extent-unavailable");
+    EXPECT_TRUE(owned_nested_snapshot_is_futile(metadata, nullptr, 0));
+    EXPECT_EQ(refusal(metadata), "draw-wave-output-metadata-extent-unavailable")
+        << "the state refusal must win over the unpublished-producer refusal";
+
+    // A plain pair needs no snapshot at all, so there is nothing to call futile.
+    auto* plain_vs = register_program(true, vertex_code(false, GetParam()));
+    auto* plain_ps = register_program(false, fragment_code(false, GetParam()));
+    ASSERT_NE(plain_vs, nullptr);
+    ASSERT_NE(plain_ps, nullptr);
+    auto plain = state(*plain_vs, *plain_ps, false);
+    plain.cx[P::CB_COLOR0_CMASK] = 0x1234u;
+    EXPECT_FALSE(draw_requires_owned_nested_snapshot(plain));
+    EXPECT_FALSE(owned_nested_snapshot_is_futile(plain, nullptr, 0));
 }
 INSTANTIATE_TEST_SUITE_P(RawWidths, OwnedGraphicsWaveLive, ::testing::Values(false, true));
 
