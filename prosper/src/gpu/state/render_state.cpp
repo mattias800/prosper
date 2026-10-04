@@ -359,6 +359,22 @@ RenderState extract_render_state(const GpuState& st) {
         rs.ps_raster_launch.baryc_cntl_available = true;
         rs.ps_raster_launch.baryc_cntl = value->second;
     }
+    // Preserve actual producing words independently of legacy semantic fields/defaults. The
+    // draw/capture owners copy this carrier; later register writes cannot change its launch facts.
+    const auto observe_launch = [&](uint32_t reg, bool& available, uint32_t& word) {
+        if (const auto value = st.cx.find(reg); value != st.cx.end()) {
+            available = true;
+            word = value->second;
+        }
+    };
+    auto& launch = rs.ps_raster_launch;
+    observe_launch(P::PA_SC_SHADER_CONTROL, launch.sc_shader_control_available,
+                   launch.sc_shader_control);
+    observe_launch(P::PA_SC_MODE_CNTL_0, launch.sc_mode_cntl_0_available, launch.sc_mode_cntl_0);
+    observe_launch(P::PA_SC_MODE_CNTL_1, launch.sc_mode_cntl_1_available, launch.sc_mode_cntl_1);
+    observe_launch(P::PA_SC_AA_CONFIG, launch.sc_aa_config_available, launch.sc_aa_config);
+    observe_launch(P::DB_SHADER_CONTROL, launch.db_shader_control_available,
+                   launch.db_shader_control);
     rs.ps_wave32 = PM4_FIELD(rd(st.cx, P::SPI_PS_IN_CONTROL),
                              SPI_PS_IN_CONTROL, PS_W32_EN) != 0;
     if (const auto rsrc1 = st.sh.find(P::SPI_SHADER_PGM_RSRC1_PS); rsrc1 != st.sh.end()) {

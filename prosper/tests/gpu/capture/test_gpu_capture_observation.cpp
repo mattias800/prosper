@@ -73,8 +73,10 @@ std::vector<uint8_t> common69_bytes(const GpuCaptureFile& capture) {
     std::string error;
     EXPECT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
     if (bytes.size() < 16) return {};
-    // No owned stages: v70's final extension is count + one absent-owner byte per draw.
-    EXPECT_EQ(bytes[8], 70);
+    // v71 raw launch controls: count + five (presence, raw word) pairs per draw.
+    EXPECT_EQ(bytes[8], 71);
+    bytes.resize(bytes.size() - 4 - 25 * capture.draws.size());
+    // No owned stages: v70's extension is count + one absent-owner byte per draw.
     for (const auto& draw : capture.draws) EXPECT_FALSE(draw.owned_waves);
     bytes.resize(bytes.size() - 4 - capture.draws.size());
     bytes[8] = 69;
