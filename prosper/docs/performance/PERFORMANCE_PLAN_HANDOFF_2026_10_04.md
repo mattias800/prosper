@@ -2,8 +2,8 @@
 
 This is a **draft recovery handoff**, prepared at the owner's request with approximately 4% of
 Codex usage remaining. It preserves the original [#3873 plan](https://github.com/mattias800/prosper/issues/3873)
-and the smallest next steps. It does not enable async submission, increase a cache default, qualify
-a new app, or claim the remaining tests ran. Read the issue comments chronologically; later
+and the smallest next steps. Follow-up checkpoints below record work after the initial capsule.
+Async submission remains default OFF and target-cache count remains 256. Read issue comments chronologically; later
 wrap-up comments supersede earlier proposals. Check current remote main and tracker comments
 again before resuming, because this document deliberately records a dated state.
 
@@ -11,7 +11,7 @@ again before resuming, because this document deliberately records a dated state.
 
 | Original item | Checkpoint | Work remaining |
 | --- | --- | --- |
-| [#3948 async submission](https://github.com/mattias800/prosper/issues/3948) | Measurement/Stage 0 and opt-in Stage 2 are merged. **Default remains OFF.** Historical GTA collapse investigation, normal-app A/B observations and apparatus limitations are documented. | Qualify an actual latest-main normal app; finish the original fourteen-title OFF/ON visual inventory and the larger repeated current-cohort GTA/Sonic A/B. Preserve rendering holds and refuse unsupported default claims. |
+| [#3948 async submission](https://github.com/mattias800/prosper/issues/3948) | Measurement/Stage 0 and opt-in Stage 2 are merged. **Default remains OFF.** Historical GTA collapse investigation, normal-app A/B observations and apparatus limitations are documented. An actual ee9dcb1e normal app is now qualified. | Finish the original fourteen-title OFF/ON visual inventory and the larger repeated current-cohort GTA/Sonic A/B. Preserve rendering holds and refuse unsupported default claims. |
 | [#3951 raw x4/x8 scalar backing](https://github.com/mattias800/prosper/issues/3951) | Original backing work landed through #3987, #4104 and #4270. Broader original scalar-buffer/Wave64 integration #4374 also merged on October 4. | Do not restart the completed original backing task. Normal-game effects of the newly merged integration still need current-app evidence; Windows/Kena work is a separate lane. |
 | [#3892 renderer state/image-branch work](https://github.com/mattias800/prosper/issues/3892) | Original registration-owned state and image-branch work completed. | No unfinished original unit is claimed here. Consult later issue comments for separate follow-ups. |
 | [#3891 performance alarms](https://github.com/mattias800/prosper/issues/3891) | Original accepted alarm proposals and review nits completed. | Read raw alarms and exit summaries on every new run; propose a new rule only for an actual uncovered engine problem. |
@@ -60,15 +60,51 @@ merge; those pending checks were not reported green. Squash **ee9dcb1e** has the
 the reviewed author head: **de71ee71735dfcfa29565622c0d82b3904776ec2**. Landed fixture bytes were
 independently checked and the author/reviewer worktrees were removed.
 
-**This does not qualify a current app.** The retained new app still embeds 3fe269ef, while the
-producing worktree/build was last frozen at author head 49d6d687. The latter build contains
+**Fixture validation alone did not qualify a current app.** At the initial quota checkpoint,
+the retained new app still embedded 3fe269ef, while the producing worktree/build was frozen at
+author head 49d6d687. That build contained
 corrected test binaries and a refreshed revision archive, but its app was deliberately not relinked
-during fixture validation. Never label it ee9dcb1e or launch a mismatched source/app pair.
+during fixture validation. Its archived app remains historical.
+
+## Follow-up checkpoint: actual ee9dcb1e app qualified
+
+The owner authorized continued work without new subagents. Remote main was freshly fetched and
+still ee9dcb1e. The root-owned producing worktree advanced from 49d6d687 to this main commit after
+an actual clean-tree check and exact Git-tree comparison. All tree bytes matched, so the already
+reviewed **70 PASS / 0 FAIL / 0 SKIP** evidence was carried explicitly; those cases were not rerun.
+
+The actual normal app was refreshed at **-j1** in 3.12 s. App build, exact one-case CTest discovery,
+`build_revision_refresh`, and explicit-repository strict revision certification all exited **0**.
+The new CPU case was **1 PASS / 0 FAIL / 0 SKIP**. Full ELF getters independently bind revision
+**ee9dcb1e1e2c695426acb25575e7c6c320971d1d** and source identity
+**12c688a6d0fc7aa7b80d9368a08d3d439c4ea7994ded61618b3fa28a211bc84a**.
+
+Qualification rehashed **1,670** actual target inputs, including **650** checkout inputs equal
+to HEAD, with **256** compiled units and **257 VALID** Ninja dependency rows. Real SDL audio/pad,
+FFmpeg and VAAPI remain enabled, GCC Release remains active, and diagnostics remain OFF. All
+878 retained source pins and protected SDL inputs were unchanged across the commands. The
+239-file installed-provider/runtime inventory was rehashed inside ps5ys; ldd resolved the actual
+new app. Owned launchers drained and no producing-build worker remained. This qualification
+performed no game or Vulkan initialization, so it does not prove which driver a game loads.
+
+The immutable app SHA256 is
+**ab795543f759694a96d4a01932bfe045cba0605d1e21545a877877e96fe31414**;
+the final qualification receipt SHA256 is
+**49d5b1c61be0a150c11150e420c91c0998887a91c60a9217f1652c1125028231**.
+A separate durable supplement, `root-ee9d-app-qualification-checkpoint-20261004-v1`, preserves
+the actual commands, closure, installed inputs, immutable app and linked revision recovery bytes:
+**24,371,200 bytes**, **26 regular members verified**, no mismatch; archive SHA256
+**99846a02b86bcfdca380556dba429c88b3ca6071e685e7fa788f7108647a2125**.
+It supplements the original quota capsule without rewriting that historical snapshot.
+
+The next action is a fresh visible Messenger OFF/ON using the exact reviewed icon-query helper.
+No current-cohort game guard or performance arm has run at this checkpoint.
 
 ## Retained app/source cohorts
 
 | Actual app revision | Immutable app SHA256 | Interpretation |
 | --- | --- | --- |
+| ee9dcb1e1e2c695426acb25575e7c6c320971d1d | ab795543f759694a96d4a01932bfe045cba0605d1e21545a877877e96fe31414 | Actual normal app qualification completed; one revision test passed and the corrected 70-case evidence was carried on an identical Git tree. Current-cohort game checks remain pending. |
 | e291f7060042d4b5b36f8eed52ea228f6dbf9081 | d43a39b78d9282072482847247fb3b15d1251d2d1493eda5093111453dd95528 | Independently qualified normal app used for the partial Messenger OFF run and another lane's historical Silent Hill compatibility observations. Historical after #4374. |
 | 3fe269ef0d035a46baee750af30b6a0004d4f7b0 | 058abdfe6a6c539c75386c0815e97c29f5790e59794f40c4b402eb6c23631df1 | Built normal app retained after the failed initial 70-case qualification. Full ELF source identity is 12c688a6d0fc7aa7b80d9368a08d3d439c4ea7994ded61618b3fa28a211bc84a. **Not accepted as a completed app qualification.** |
 | 525cb71c0c7dda1d7404184b1c1a093d14641a28 | d6823e50040a29a8997cf3e6848190c2ca481abd4a46e0fb4e32812408d314ef | Qualified normal app for the completed Sonic pair and GTA count matrix. Its CPU correctness cohort was 26 PASS / 0 SKIP. Historical and not pooled with 3fe. |
@@ -222,8 +258,8 @@ historical sky seam/HUD/partial-model rendering HOLD remains a hold until curren
    active worktree. Its local recovery guide supplies exact paths, archive hashes, manifests,
    command plans, grant schemas and owned PID/birth receipts. Git/source snapshots and app bytes
    are historical; their original absolute paths are not proof of current identity.
-3. Finish **one actual latest-main normal app qualification**. The producing tree was frozen at
-   49d6; the last remote main ee9d has identical tree bytes. If the only newer changes are this
+3. The **ee9dcb1e normal app qualification is complete**, as recorded above. Reuse its immutable
+   app and exact source binding only after inspecting freshly fetched main. If the only newer changes are
    fixture correction/documentation, inspect that delta and carry the exact 70-case evidence;
    do not blindly rerun it. Refresh the real app's embedded revision, run meaningful revision
    verification/certification, and independently verify full ELF revision/source identity,
