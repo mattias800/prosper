@@ -11,7 +11,7 @@ again before resuming, because this document deliberately records a dated state.
 
 | Original item | Checkpoint | Work remaining |
 | --- | --- | --- |
-| [#3948 async submission](https://github.com/mattias800/prosper/issues/3948) | Measurement/Stage 0 and opt-in Stage 2 are merged. **Default remains OFF.** Historical GTA collapse investigation, normal-app A/B observations and apparatus limitations are documented. An actual ee9dcb1e normal app is now qualified. | Finish the original fourteen-title OFF/ON visual inventory and the larger repeated current-cohort GTA/Sonic A/B. Preserve rendering holds and refuse unsupported default claims. |
+| [#3948 async submission](https://github.com/mattias800/prosper/issues/3948) | Measurement/Stage 0 and opt-in Stage 2 are merged. **Default remains OFF.** Historical GTA collapse investigation, normal-app A/B observations and apparatus limitations are documented. The ee9dcb1e normal app is qualified; Messenger's OFF/ON visual pair is complete. | Finish the remaining thirteen original title pairs and the larger repeated current-cohort GTA/Sonic A/B. Preserve rendering holds and refuse unsupported default claims. |
 | [#3951 raw x4/x8 scalar backing](https://github.com/mattias800/prosper/issues/3951) | Original backing work landed through #3987, #4104 and #4270. Broader original scalar-buffer/Wave64 integration #4374 also merged on October 4. | Do not restart the completed original backing task. Normal-game effects of the newly merged integration still need current-app evidence; Windows/Kena work is a separate lane. |
 | [#3892 renderer state/image-branch work](https://github.com/mattias800/prosper/issues/3892) | Original registration-owned state and image-branch work completed. | No unfinished original unit is claimed here. Consult later issue comments for separate follow-ups. |
 | [#3891 performance alarms](https://github.com/mattias800/prosper/issues/3891) | Original accepted alarm proposals and review nits completed. | Read raw alarms and exit summaries on every new run; propose a new rule only for an actual uncovered engine problem. |
@@ -140,6 +140,42 @@ first owned within 120 s, all later samples owned, and owned before cutoff. No g
 ON with the same immutable app and fresh state, inspect all native images, check actual deferred
 and blocked counts, retain every alarm and exit record, then checkpoint the pair.
 
+## Follow-up checkpoint: Messenger OFF/ON pair complete
+
+Messenger ON completed in **320.656 s**. The actual immutable app, source, helper hashes and
+budgets were the same as OFF. The actual PROSPER environment differed only in
+`PROSPER_GRAPHICS_DEFERRED_WAIT=0/1` after normalizing the fresh per-arm run-root paths. Root
+inspected all four ON native images and all eight images across the pair. ON requested/actual
+500 already shows selectable Play/Options, and 2000 shows the name-confirmation/save-slot UI;
+neither is relabeled as OFF's same-ordinal phase. Both ON gameplay captures at actual 15000 and
+18000 show the complete first-level dock, player, world and health/flame HUD, with visibly
+different water animation. Save names differ A/AA, so equal guest input state is not established.
+
+ON app/runner/launcher exits were **0**; 31 owned samples plus one initial not-yet-viewable sample
+and an owned before-cutoff sample were retained. All owned births drained, and the post-run
+prosper-app census was empty. Both arms' 63 completed ledger windows have **zero** dropped
+frontend/contract/backend draws, skipped dispatches and target evictions. ON actually exercised
+the path: **52278 deferred submissions**, **29065 blocked deferrals**, with graphics device-time
+coverage on **71131/71131** waits. These are raw completed-window totals, not performance gains.
+
+Every emitted ON alarm and exit record was read. F32 arithmetic again fired in **63/63** windows
+(595623 known-launch-mode requests); RTT-colorless-publication remains **NO_DATA**. The ON raw
+log emitted **no GRAPHICS submission-failure record**. A first data-summary template included a
+generic shutdown-refusal interpretation without checking whether the record existed; corrected
+summaries retain the exact emitted failure list, empty for ON and one shutdown-gate-refused
+record for OFF. Original game artifacts were unchanged and neither arm was repeated.
+
+The pair is **qualified visual compatibility evidence for Messenger**, with actual ON-path
+exercise. It is not quiet performance evidence, an exact guest-state comparison, a floating-point
+correctness oracle, or proven fresh delivered-frame FPS. Defaults remain OFF/256.
+
+The completed private pair supplement contains all frames, state, grants, metadata, alarms,
+ledgers and root judgments: **75,100,160 bytes**, **579 regular members verified**, zero mismatches;
+archive SHA256 **9f84eb10a4bfaa3c9002545bf78b0fe37034fc313827401e5dad74605ea1ce8d**.
+It and its manifest/receipt were fsynced on persistent storage. Earlier capsules remain intact.
+**Two of 28 arms, one of 14 original title pairs are complete.** The next pair is Evergate after
+checking fresh remote main and retaining or refreshing the actual app/source qualification.
+
 ## Retained app/source cohorts
 
 | Actual app revision | Immutable app SHA256 | Interpretation |
@@ -251,7 +287,11 @@ Preserve the original helper and failed run unchanged. Fresh complete OFF and ON
 same reviewed successor, distinct unused output directories, fresh saves/caches, and a fresh
 native desktop binding. Do not rerun the known-overflow original helper.
 
-## Original fourteen-title visual inventory: pending current-app qualification
+## Original fourteen-title visual inventory: one current pair complete
+
+The ee9dcb1e app is qualified and Messenger's OFF/ON pair is complete as recorded above. The other
+thirteen pairs remain pending. The table retains the original candidate controls for all titles;
+it is not a claim that every candidate ordinal reached its proposed phase.
 
 Exactly thirteen automatic gameplay profiles plus manual GRIS belong to this original inventory.
 Do not add duplicate Evergate-title/Blue-Prince-title companion profiles or Terminator's boot-only
@@ -308,8 +348,8 @@ historical sky seam/HUD/partial-model rendering HOLD remains a hold until curren
 4. Keep normal GCC Release, real SDL audio/pad, FFmpeg/VAAPI and diagnostics-OFF settings. Do not
    disable the newly merged scalar-bank route, use a synthetic backend, or turn a failed/pending
    result into a passing manifest. Preserve the initial failed 70-case cohort and old apps.
-5. Qualify fresh native desktop/env/window binding, bind the exact reviewed helper hashes and
-   actual app/source, and start fresh Messenger OFF/ON. The 3fe preparation contains inert
+5. Messenger OFF/ON is complete on ee9dcb1e. For Evergate next, qualify fresh native desktop/env/window
+   binding and bind the exact reviewed helper hashes and actual app/source. The 3fe preparation contains inert
    candidate data only: no app qualification, executable grant or completed current guard.
 6. Continue the fourteen-title pairs above, recording native menu/gameplay/HUD judgments,
    unsupported draws/dispatches, deferred-path exercise, actual alarms, missing phases and owned
