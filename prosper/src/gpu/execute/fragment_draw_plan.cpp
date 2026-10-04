@@ -365,8 +365,7 @@ FragmentDrawProgramPlan compile_fragment_draw_program(const RasterQuadInputs& in
                                          : std::span<const FragmentPacketScalarReadSite>{});
     if (!old_recipe) {
         result.full_masks.clear();
-        if (scalar_bank)
-            return refuse("fragment-draw-entry-and-composition-recipe-unproved");
+        if (scalar_bank) return refuse("fragment-draw-entry-and-composition-recipe-unproved");
         if (!device.raster)
             return refuse(input_free_layout(in)
                               ? "fragment-draw-entry-and-composition-recipe-unproved"
