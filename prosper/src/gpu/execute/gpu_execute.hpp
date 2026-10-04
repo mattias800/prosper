@@ -558,6 +558,15 @@ bool draw_requires_owned_nested_snapshot(const GpuState& state,
 // resource admission. The real issuer separately authenticates the current original version.
 bool draw_requires_original_scalar_bank(const GpuState& state);
 bool graphics_program_requires_owned_waves(uint64_t address);
+// The owned-wave refusal decided by register state alone (fragment launch, output and depth
+// extents), or null. No producer publication can change it, so prepare_draw_owned_waves asks it
+// before the producer check and the executor asks it before an authoritative flush.
+const char* owned_wave_draw_state_refusal(const GpuState& state, bool fragment);
+// True when the owned snapshot this draw asks for exists only for owned waves AND
+// owned_wave_draw_state_refusal already refuses them: the authoritative flush buys nothing.
+bool owned_nested_snapshot_is_futile(const GpuState& state,
+                                     const OrderedScalarBankReadPoint* captured,
+                                     uint64_t command_order);
 // Aliasing immutable analysis owner for the complete registered stream; no caller rereads code.
 SharedShaderWords registered_graphics_original(uint64_t address);
 bool prepare_draw_owned_waves(const GpuState& state, const GpuState::Draw* draw,
