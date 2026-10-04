@@ -11,8 +11,8 @@ again before resuming, because this document deliberately records a dated state.
 
 **Latest steering:** the owner confirms manual Cross input in Evergate OFF and Messenger earlier.
 Messenger's exact earlier run/source/arm is unbound. Retained native images and visual judgments
-remain useful. The first logged Evergate calibration below reached a real tutorial checkpoint;
-fresh replay remains pending, so reproducible autonomous progression is not yet established.
+remain useful. Evergate's logged route now reached its menu and real tutorial in two fresh OFF
+runs; the replay captured two tutorial frames and matching composed-input intervals. ON is pending.
 Performance measurements must use a verified scripted route and matching admitted scenes;
 explicitly selected splash/title populations must stay separate from in-level gameplay.
 
@@ -276,6 +276,29 @@ same route and 230 s ceiling, requesting 7000 and 7300 instead of the unreached 
 ON. Inspect the actual menu, two Ki/tutorial frames and final input records in each arm. This is
 compatibility calibration, not a performance population or grounds for changing defaults.
 
+## Evergate unchanged OFF replay: two tutorial frames, ON pending
+
+A fresh OFF replay used the same route/app/source, isolated state, 230 s ceiling and budgets,
+with the corrected nearby gameplay selector. Actual duration was **230.550 s**; root inspected
+title500/500, Begin/Options900/901, publisher ident1800/1800, and Ki/tutorial/HOLD X TO JUMP HIGHER
+at7000/7000 and7300/7300. All twelve Cross press/release pairs completed and the final successful-
+pad-read intervals exactly matched their logged read endpoints, with no extra nonneutral interval.
+This repeats scripted menu/tutorial progression; it does not establish equal internal state or
+controlled movement. Earlier manually assisted runs remain separate.
+
+Actual app/runner/launcher exits were **0**, all owned births drained, and the post-run prosper-app
+census was empty. Every emitted alarm and exit summary was read: **5990 frontend fragment drops**
+and matching Wave64 refusal uses across37/45 windows, F32 arithmetic45/45, one new unimplemented
+HLE at25s, and RTT-colorless NO_DATA. Backend/contract losses, skipped dispatches and target
+evictions were zero. Two actual graphics submission-failure records are explicit
+`submit-origin=shutdown-gate-refused` sentinels; neither establishes driver device loss.
+
+The private OFF replay archive was verified and fsynced: **70,369,280 bytes**, **1772 regular
+members**, zero mismatches; SHA256
+**728bd0ebe5dc33bc3a86ae2d58a31f4270580e4f05766d47201c5bce2b979d31**.
+There are now three inspected visual arms and one complete original title pair. Evergate ON is
+the next bounded step; baseline shader losses remain a rendering HOLD. No performance is admitted.
+
 ## Input control required for performance admission
 
 Every timed arm must carry the exact scripted route bytes/hash and input trace, source/app identity,
@@ -465,7 +488,8 @@ historical sky seam/HUD/partial-model rendering HOLD remains a hold until curren
    result into a passing manifest. Preserve the initial failed 70-case cohort and old apps.
 5. Messenger OFF/ON visual evidence is complete on ee9dcb1e; scripted progression still needs
    verification before performance use. Evergate's first new route calibration reached the menu
-   and one Ki/tutorial frame. Replay unchanged OFF for 230 s at 7000/7300, then ON, checking the final
+   and one Ki/tutorial frame, then fresh OFF replay captured both 7000/7300. Run corresponding ON,
+   checking the final
    input record and two actual gameplay frames. Qualify fresh native desktop/env/window
    binding and bind the exact reviewed helper hashes and actual app/source. The 3fe preparation contains inert
    candidate data only: no app qualification, executable grant or completed current guard.
@@ -507,9 +531,9 @@ historical sky seam/HUD/partial-model rendering HOLD remains a hold until curren
   head. Never report waived failures/pending checks green. Never merge any draft; external authors
   must publish their own drafts. No Claude-Session trailers or badges.
 - Watch published yuriolive PRs for a new head and assign one independent security/correctness
-  review. At the checkpoint #4331 and #4189 still have their previously rejected unchanged heads;
-  #4323 is a draft. Do not duplicate unchanged reviews/pings. #4189's author said revisions are
-  planned; #4331 already received one inactivity check-in. Leave them open.
+  review. Latest read-only checks show #4331 closed without merge, #4189 open at its previously
+  rejected unchanged head, and #4323 still draft. Do not duplicate unchanged reviews/pings.
+  #4189's author said revisions are planned; leave it open.
 - The incoming author, independent reviewer and builder completed #4382 and are parked. Other
   CPU/Outer-Wilds lanes were already parked; Silent Hill was asked to finish its existing historical
   result handoff and park. Subsequent owner authorization allowed the app qualification and small
