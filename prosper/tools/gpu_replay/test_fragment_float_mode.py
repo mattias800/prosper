@@ -131,8 +131,12 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
                     struct.pack("<II",0,1)+launch)
         draw_count=0 if name.endswith("failed") else 1
         wave_tail=struct.pack("<I",draw_count)+bytes(draw_count)
-        check(struct.unpack_from("<I",data,8)[0]==70 and data.endswith(wave_tail),
-              name+" exact ordinary owned-wave absence in current capture")
+        # v71: five unprogrammed (presence u8, raw u32) SC/DB launch-control words per draw.
+        launch_controls_tail=struct.pack("<I",draw_count)+bytes(25*draw_count)
+        check(struct.unpack_from("<I",data,8)[0]==71 and data.endswith(launch_controls_tail),
+              name+" exact unavailable raster-launch controls in current capture")
+        data=bytearray(data[:-len(launch_controls_tail)]); struct.pack_into("<I",data,8,70)
+        check(data.endswith(wave_tail),name+" genuine official70 exact ordinary owned-wave absence")
         data=bytearray(data[:-len(wave_tail)]); struct.pack_into("<I",data,8,69)
         entry_start=len(data)-4-159*draw_count
         check(struct.unpack_from("<I",data,entry_start)[0]==draw_count,
@@ -216,10 +220,13 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
                     except ValueError as error:
                         check(False,label+" fail-closed output oracle: "+str(error))
     original=(directory/"mode16.prgcap").read_bytes()
-    # MODE precedes v65 owners, v66 transport, v67 flags, nested68, entry69 and wave70.
+    # MODE precedes v65 owners, v66 transport, v67 flags, nested68, entry69, wave70 and the v71
+    # launch controls.
     transport_tail_size=13
     flags_tail_size=16
-    flags_start=len(original)-5-(4+159)-4-flags_tail_size
+    launch_tail_size=4+25
+    launch_start=len(original)-launch_tail_size
+    flags_start=launch_start-5-(4+159)-4-flags_tail_size
     start=flags_start-transport_tail_size-4-10
     malformed={
         "count":original[:start]+struct.pack("<I",0)+original[start+4:],
@@ -231,14 +238,19 @@ with tempfile.TemporaryDirectory(prefix="fragment-mode-",dir=scratch) as directo
         "truncated-transport":original[:flags_start-1],
         "truncated-flags":original[:flags_start+flags_tail_size-1],
         "truncated-nested":original[:flags_start+flags_tail_size+3],
-        "truncated-entry":original[:-6],
-        "truncated-wave":original[:-1],
+        "truncated-entry":original[:-launch_tail_size-6],
+        "truncated-wave":original[:-launch_tail_size-1],
+        "truncated-launch":original[:-1],
+        "launch-count":original[:launch_start]+struct.pack("<I",0)+original[launch_start+4:],
+        "launch-presence":original[:launch_start+4]+b"\x02"+original[launch_start+5:],
+        "launch-unavailable-value":original[:launch_start+5]+struct.pack("<I",1)+original[launch_start+9:],
         "flags-count":original[:flags_start]+struct.pack("<I",0)+original[flags_start+4:],
         "flags-tag":original[:flags_start+4]+b"\x02"+original[flags_start+5:],
         "flags-unknown-value":original[:flags_start+4]+b"\x00\x01\x00"+original[flags_start+7:],
         "raw-tag":original[:flags_start+7]+b"\x02"+original[flags_start+8:],
         "raw-unknown-value":original[:flags_start+7]+b"\x00"+struct.pack("<I",1)+original[flags_start+12:],
         "trailing":original+b"\x00",
+        "relabel-only70":original[:8]+struct.pack("<I",70)+original[12:],
         "relabel-only63":original[:8]+struct.pack("<I",63)+original[12:],
     }
     for name,data in malformed.items():
