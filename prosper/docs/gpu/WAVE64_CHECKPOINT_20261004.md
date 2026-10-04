@@ -20,6 +20,32 @@ subsequent bounded goal follow-ups are explicitly recorded below.
 The earlier source-only sections describe their own historical freezes, not the later execution
 status. Do not retroactively assign the new native result to those older source identities.
 
+## Latest: companions integrated, all three blockers corrected (2026-10-04, later session)
+
+**Read this section first; the sections below it are history.** A new owner (Claude Code)
+adopted the retained worktree and its sole native build after verifying it clean, at
+`0b2ff27b`, with no live build/test process. Merges on the PR branch, all conflict-free:
+#4399 `ef87c026`, #4398 `8e0f2064`, then main `a524d233`; merge result `884c8780`.
+
+| Commit | What |
+| --- | --- |
+| `30e478bb` | #4398 did not compile (`SharedShaderWords` is not visible in `fragment_draw_plan.hpp`). #4399's regression never reached its own path: center+POS ENA does not make the realizer derive GS. Only P10/P20, mixed P0+smooth or an enabled **pull-model plane (ENA bit3)** do. Both cases failed their "realizer must generate GS" precondition. The fixture now uses the pull plane; isolated-key expectations are corrected to 3 compiles/2 hits, and the changed-layout query must return `draws[2]`'s own GS. |
+| `a50e022b` | **#4397.** `fragment_raster_workitem_gap` refuses `DISABLE_COLOR_WRITES_ON_DEPTH_PASS` (bit31) by name, and refuses bits outside the defined gfx10.3 field map (`0x3f8ff800`). Bit30 is admitted as inert, because Z/stencil/bounds are already required off (CONFIDENCE: MED). The general renderer does **not** apply either bit yet; changing every title on a field name repeats the #1724 MODE=DISABLE lesson. `resolve_pipeline_state` now counts resolutions carrying them (exit summary `DB_DEPTH_CONTROL colour-on-depth totals`) so exposure can be measured first. |
+| `32d41578` | Review finding on #4399: the derived-GS key now includes the float-controls verdict for nonexplicit transports. |
+| following | Opt-in SOURCE retention of coefficient GS, collector FS and derived pull GS; clang-format. |
+| `14ea1abe` | Review REJECTED `e2e378f6` because my per-thread rationale was false. Draws realize on a worker pool, but the only `cached_fragment_draw_program` caller is the render-thread backend, so a `thread_local` GS gave up to N cold plans and N collector pipelines per profile. Residence is now process-wide: the lock covers lookup/insert, the compile runs outside it, and nothing is filed if the verdict changed mid-compile. New `OtherRealizingThreadSharesTheGeneration` (`std::thread`) fails under `thread_local`. The #4397 test's vacuous pending assertions were dropped. The input-free packet recipe and the shipping colour state also ignore bits 30/31: filed as #4419 (on `main`, outside this draft). |
+
+Native evidence, Windows/Clang Release, RTX 4090. The full cohort ran at `32d41578` plus test-only retention, with cases run directly, not via CTest, because this build dir registers nothing for `ctest -N`. Each later commit rebuilt and reran its affected executables: `e2e378f6` four executables; `14ea1abe` derived-geometry 3/3 and raster launch 24/24, plus a `thread_local` omission control.
+
+- **103/103 cases pass** in 12 executables: the 99 baseline, plus 2 `DerivedInterpolationGeometry`, 1 `FragmentCollectorGeometry` (Vulkan) and 1 new `FragmentRasterLaunch.ProgrammedDepthColorControlRefusesBeforePendingAuthority`.
+- **Omission controls, each restored green:** (A) per-draw fresh GS compile fails derived lines 74/76/77, with a distinct GS and a cold plan per observation. (B) a 2-stage collector fails the 3-module count and the **numerical centre-IJ oracle on the 4090** (I read 0 where the independent vertex oracle expects 0.2656 and similar). (C) without the bit31 check, exactly the two bit31 arms fail at gap, plan reason and capacity; without the reserved check, exactly the two reserved arms fail.
+- **SDK validation:** `spirv-val --target-env vulkan1.3` accepts all **151/151** retained modules. A corrupted copy is rejected (control).
+- Not run: app/game/Kena, Vulkan validation layers, and the broader old capture/bank/default-emitter neighbour population.
+
+Raw receipts are under `.codex/claude-wave64-20261004/` (local, not committed). The same reviewer reviews every correction; see the PR's registered reviews for the verdict on the current head.
+
+**Kena is `PPSA01802`.** The build dir's `GAME_DUMP` points at `PPSA12544`, which is a different title. The 2026-09-30 Windows Kena run (`.codex/kena-title-20260930/`) gives the real drop mix to aim at. Over the run: `fragment/subgroup-contract` 37,118 draw uses, `shader-recompile/vertex` 9,639, `shader-recompile/fragment` 2,819, compute recompile 305. The helper recipe admits 0/32 retained originals, with first unmet classes SMEM 18 and M0 12. So the next general step is composing the accepted scalar-bank (SMEM) authority from #4374 with the raster helper launch, rather than another Kena run. A Kena run is only worth doing once some original can actually be admitted.
+
 ## Source-only follow-up after the frozen checkpoint
 
 The original3fcb/2775280b checkpoint and its registered REJECTED review remain historical.
