@@ -54,23 +54,59 @@ struct DirectRegion {
     }
 };
 
-inline ps_pull::Program* register_original(bool vertex, const std::vector<uint32_t>& words) {
-    // AGC retains registered pointers until process exit. Heap owners survive the fixture and
-    // sit above the SDK relative-pointer domain; source rewrite tests mutate them explicitly.
-    static std::vector<std::unique_ptr<ps_pull::Program>> owners;
-    auto owner = std::make_unique<ps_pull::Program>();
-    if (reinterpret_cast<uint64_t>(owner.get()) <= UINT32_MAX ||
-        !ps_pull::register_program(*owner, vertex, words))
-        return nullptr;
-    const auto result = owner.get();
+struct Program {
+    g::AgcShaderHeader header{};
+    g::AgcShaderUserData user{};
+    std::array<g::ShaderReg, 2> registers{};
+    alignas(256) std::array<uint32_t, 64> code{};
+};
+
+inline Program* register_original(bool vertex, const std::vector<uint32_t>& words) {
+    // Heap owners can be below 4 GiB. Encode genuine forward SDK offsets from each pointer
+    // field, then require exact relocation rather than assuming the allocator's address domain.
+    // AGC retains the owner for process lifetime, including a failed post-registration check.
+    static std::vector<std::unique_ptr<Program>> owners;
+    auto owner = std::make_unique<Program>();
+    if (words.size() > owner->code.size()) return nullptr;
+    auto* result = owner.get();
     owners.push_back(std::move(owner));
+    const auto user_offset = reinterpret_cast<uintptr_t>(&result->user) -
+                             reinterpret_cast<uintptr_t>(&result->header.user_data);
+    const auto register_offset = reinterpret_cast<uintptr_t>(result->registers.data()) -
+                                 reinterpret_cast<uintptr_t>(&result->header.sh_registers);
+    if (!user_offset || user_offset > UINT32_MAX || !register_offset ||
+        register_offset > UINT32_MAX)
+        return nullptr;
+    std::copy(words.begin(), words.end(), result->code.begin());
+    result->registers[0].offset = vertex ? p::SPI_SHADER_PGM_LO_ES : p::SPI_SHADER_PGM_LO_PS;
+    result->registers[1].offset = vertex ? p::SPI_SHADER_PGM_HI_ES : p::SPI_SHADER_PGM_HI_PS;
+    result->header.file_header = 0x34333231u;
+    result->header.version = 0x18u;
+    result->header.user_data = reinterpret_cast<g::AgcShaderUserData*>(user_offset);
+    result->header.sh_registers = reinterpret_cast<const void*>(register_offset);
+    result->header.shader_size = static_cast<uint32_t>(words.size() * sizeof(uint32_t));
+    result->header.type = vertex ? 2u : 1u;
+    result->header.num_sh_registers = 2;
+    const auto create = prosper::Hle::lookup("f3dg2CSgRKY");
+    void* registered = nullptr;
+    const uint64_t address = reinterpret_cast<uint64_t>(result->code.data());
+    if (!create ||
+        create(reinterpret_cast<uint64_t>(&registered), reinterpret_cast<uint64_t>(&result->header),
+               address, 0, 0, 0) != 0 ||
+        registered != &result->header || result->header.code != result->code.data() ||
+        result->header.user_data != &result->user ||
+        result->header.sh_registers != result->registers.data() ||
+        result->registers[0].value != uint32_t(address >> 8u) ||
+        result->registers[1].value != uint32_t((address >> 40u) & 0xffu) ||
+        prosper_agc_shader_header_for_code(address) != &result->header)
+        return nullptr;
     return result;
 }
 
 struct Scene {
     DirectRegion data, color;
-    ps_pull::Program* vertex = nullptr;
-    ps_pull::Program* fragment = nullptr;
+    Program* vertex = nullptr;
+    Program* fragment = nullptr;
     std::array<uint32_t, 4> descriptor{};
     bool create(const std::array<float, 4>& rgba = fragment_draw::color_a,
                 const std::vector<uint32_t>& ps_words = fragment_words()) {
