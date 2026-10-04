@@ -8395,8 +8395,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool is_zero_mip_load = in.opcode == 0x01;
             const bool is_load = in.opcode == 0x00 || is_zero_mip_load;
             const bool is_sample_l = (in.opcode == 0x24), is_sample_lz = (in.opcode == 0x27);
-            const bool is_sample_b = (in.opcode == 0x25),
-                       is_gather_lz = (in.opcode == 0x47 || in.opcode == 0x40);
+            const bool is_sample_b = (in.opcode == 0x25), is_gather_lz = (in.opcode == 0x47);
+            // image_gather4 = 0x40: gather with implicit LOD. Core SPIR-V OpImageGather only samples
+            // base level (LOD 0, identical to _lz). This lowering is exact when the resource has only
+            // one mip level (res->declared_mip_levels == 1u, CONFIDENCE: HIGH). In compute shaders,
+            // prosper resolves implicit LOD to base level (CONFIDENCE: MED). Multi-level textures
+            // in fragment shaders are refused fail-visibly to prevent shimmering/aliasing.
+            const bool is_gather = (in.opcode == 0x40);
             const bool is_sample_c_lz = (in.opcode == 0x2f);
             // image_gather4_lz_o = 0x57 (gather at base level with the _o packed-offset operand in the
             // FIRST vaddr — llvm-mc gfx1030 round-trip on live DOLL bytes: 0xf15c0808 "image_gather4_lz_o
@@ -8420,14 +8425,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // bias/gradient/sample-offset helpers default arrays to layer zero, so do not admit
             // those forms for the newly supported Float32 graphics representation.
             if (graphics_float_array && in.mimg_dim == 5u &&
-                (in.mimg_a16 || (!is_load && !is_sample && !is_sample_l &&
-                                 !is_sample_lz && !is_sample_c_lz &&
-                                 !is_gather_lz && !is_gather_lz_o))) {
+                (in.mimg_a16 ||
+                 (!is_load && !is_sample && !is_sample_l && !is_sample_lz && !is_sample_c_lz &&
+                  !is_gather_lz && !is_gather && !is_gather_lz_o))) {
                 ok = false;
                 return true;
             }
-            const bool float_array_gather = graphics_float_array &&
-                in.mimg_dim == 5u && (is_gather_lz || is_gather_lz_o);
+            const bool float_array_gather = graphics_float_array && in.mimg_dim == 5u &&
+                                            (is_gather_lz || is_gather || is_gather_lz_o);
             // Only full-width coordinates and results are admitted here. Cache/status and
             // reserved controls cannot be admitted by widening the array opcode list alone.
             if (float_array_gather && (in.mimg_a16 || in.mimg_d16 || in.mimg_r128 || in.mimg_tfe ||
@@ -8776,7 +8781,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         res->mag_filter != 0u, res->addr_uvw[0],
                         res->addr_uvw[1], res->border_color_type, out);
                 } else { ok = false; return true; }
-            } else if (is_gather_lz || is_gather_lz_o) {
+            } else if (is_gather_lz || is_gather || is_gather_lz_o) {
+                if (is_gather && !(res->declared_mip_levels == 1u || !b.is_fragment)) {
+                    ok = false;
+                    return true;
+                }
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
                 // four texels of that channel, with gather order preserved. D16 changes only the
                 // physical VDATA layout: the four fp16 results occupy two consecutive VGPRs. GTA V's

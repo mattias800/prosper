@@ -280,13 +280,32 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         0x7e0202f0u,   // v_mov_b32 v1, 0.5
     };
 
-    expect_compiles(program(prologue, {control[0], control[1]}), 0xA050ull,
-                    "control: image_gather4_lz with the texture table", &rt, config);
+    const auto spv_control =
+        compile(program(prologue, {control[0], control[1]}), 0xA050ull, &rt, config);
+    EXPECT_FALSE(spv_control.empty()) << "control: image_gather4_lz with the texture table";
+    const auto spv_gather = compile(program(prologue, {w[0], w[1]}), 0xA051ull, &rt, config);
+    EXPECT_FALSE(spv_gather.empty()) << "image_gather4 with the texture table";
+    EXPECT_EQ(spv_gather, spv_control) << "image_gather4 on single-level resource must produce "
+                                          "word-for-word identical module to image_gather4_lz";
+
     EXPECT_TRUE(
         compile(program(prologue, {control[0], control[1]}), 0xA052ull, nullptr, config).empty())
         << "control without a resource table must refuse, or the table is not load-bearing";
-    expect_compiles(program(prologue, {w[0], w[1]}), 0xA051ull,
-                    "image_gather4 with the texture table", &rt, config);
     EXPECT_TRUE(compile(program(prologue, {w[0], w[1]}), 0xA053ull, nullptr, config).empty())
         << "image_gather4 without a resource table must refuse, or the table is not load-bearing";
+
+    // Gate checks in fragment stage: multi-level texture (declared_mip_levels == 2) must refuse;
+    // single-level texture (declared_mip_levels == 1) must compile.
+    const auto fragment_prog = program(prologue, {w[0], w[1]});
+    ShaderResourceTable frag_rt_single = rt;
+    frag_rt_single.resources[0].declared_mip_levels = 1u;
+    EXPECT_FALSE(
+        recompile_fragment(fragment_prog.data(), fragment_prog.size(), &frag_rt_single).empty())
+        << "image_gather4 in fragment stage must compile for single-level resource";
+
+    ShaderResourceTable frag_rt_multi = rt;
+    frag_rt_multi.resources[0].declared_mip_levels = 2u;
+    EXPECT_TRUE(
+        recompile_fragment(fragment_prog.data(), fragment_prog.size(), &frag_rt_multi).empty())
+        << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
