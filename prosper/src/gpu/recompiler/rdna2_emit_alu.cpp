@@ -8,6 +8,7 @@
 #include "gpu/recompiler/storage_dst_sel.hpp"
 #include "gpu/recompiler/rdna2_dot.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
+#include "gpu/recompiler/rdna2_sad.hpp"
 #include "gpu/texture/bc_decode.hpp"   // guest_texture_is_uploaded_array (#325)
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -5026,6 +5027,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t p = b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, val(in.src[0]), m24),
                                               b.ibin(Op_BitwiseAnd, val(in.src[1]), m24));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, p, val(in.src[2]));
+            } else if (in.opcode == 0x15A || in.opcode == 0x15B || in.opcode == 0x15C ||
+                       in.opcode == 0x171) {   // v_sad_u8 / v_sad_hi_u8 / v_sad_u16 / v_msad_u8
+                vreg[in.dst.value] = emit_v_sad_subword(b, rs, in, ok);
             } else if (in.opcode == 0x15D) {   // v_sad_u32 = |s0-s1| (unsigned) + s2
                 // RDNA2 ISA (document 70648), V_SAD_U32: D.u32 = abs(S0.u32 - S1.u32) + S2.u32.
                 // The absolute difference is the UNSIGNED magnitude, so max-min is exact and cannot

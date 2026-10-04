@@ -11080,6 +11080,92 @@ int main() {
     CHECK(gotTsad2.size()==N && badTsad2==0,
           "Tsad2: v_sad_u32 with src1=0 adds S0 to the S2 accumulator");
 
+    // Tsad3: v_sad_u8 (0x15a). Four-byte unsigned absolute differences plus accumulator.
+    // Inputs: S0=0x00FF10F0, S1=0xFF000F0F, S2=7.
+    // Byte diffs: |0x00-0xFF|=255, |0xFF-0x00|=255, |0x10-0x0F|=1, |0xF0-0x0F|=225.
+    // Sum = 255 + 255 + 1 + 225 + 7 = 743 = 0x2E7.
+    const uint32_t codeTsad3[] = {
+        0x7e0202ffu, 0x00ff10f0u,   // v_mov_b32 v1, 0x00FF10F0
+        0x7e0402ffu, 0xff000f0fu,   // v_mov_b32 v2, 0xFF000F0F
+        0x7e060287u,   // v_mov_b32 v3, 7
+        0xd55a0004u, 0x040e0501u,   // v_sad_u8 v4, v1, v2, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad3 =
+        recompile_valu(codeTsad3, std::size(codeTsad3), 0, /*out_vgpr*/ 4);
+    CHECK(!spvTsad3.empty(), "recompiled Tsad3 (v_sad_u8) -> SPIR-V");
+    std::vector<float> gotTsad3 = prosper::test::run_compute(spvTsad3, inX, N, N);
+    uint32_t badTsad3 = 0;
+    for (uint32_t i = 0; i < N && gotTsad3.size() == N; ++i)
+        if (bits_of(gotTsad3[i]) != 0x2E7u) ++badTsad3;
+    CHECK(gotTsad3.size() == N && badTsad3 == 0,
+          "Tsad3: v_sad_u8 computes sum of four byte absolute differences plus accumulator");
+
+    // Tsad4: v_sad_hi_u8 (0x15b). (sum of byte |a-b| << 16) + accumulator.
+    // Inputs: S0=0x00FF10F0, S1=0xFF000F0F, S2=7.
+    // Sum = (736 << 16) + 7 = 0x02E00007.
+    const uint32_t codeTsad4[] = {
+        0x7e0202ffu, 0x00ff10f0u,   // v_mov_b32 v1, 0x00FF10F0
+        0x7e0402ffu, 0xff000f0fu,   // v_mov_b32 v2, 0xFF000F0F
+        0x7e060287u,   // v_mov_b32 v3, 7
+        0xd55b0004u, 0x040e0501u,   // v_sad_hi_u8 v4, v1, v2, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad4 =
+        recompile_valu(codeTsad4, std::size(codeTsad4), 0, /*out_vgpr*/ 4);
+    CHECK(!spvTsad4.empty(), "recompiled Tsad4 (v_sad_hi_u8) -> SPIR-V");
+    std::vector<float> gotTsad4 = prosper::test::run_compute(spvTsad4, inX, N, N);
+    uint32_t badTsad4 = 0;
+    for (uint32_t i = 0; i < N && gotTsad4.size() == N; ++i)
+        if (bits_of(gotTsad4[i]) != 0x02E00007u) ++badTsad4;
+    CHECK(gotTsad4.size() == N && badTsad4 == 0,
+          "Tsad4: v_sad_hi_u8 shifts byte sum by 16 before adding accumulator");
+
+    // Tsad5: v_sad_u16 (0x15c). Two 16-bit unsigned absolute differences plus accumulator with 32-bit wrap.
+    // Inputs: S0=0x0001FFFF, S1=0xFFFF0001, S2=0xFFFFFFFF.
+    // Halfword diffs: |0xFFFF-0x0001|=65534, |0x0001-0xFFFF|=65534.
+    // Sum = 65534 + 65534 + 0xFFFFFFFF = 131068 - 1 = 131067 = 0x0001FFFB.
+    const uint32_t codeTsad5[] = {
+        0x7e0202ffu, 0x0001ffffu,   // v_mov_b32 v1, 0x0001FFFF
+        0x7e0402ffu, 0xffff0001u,   // v_mov_b32 v2, 0xFFFF0001
+        0x7e0602c1u,   // v_mov_b32 v3, -1 (0xFFFFFFFF)
+        0xd55c0004u, 0x040e0501u,   // v_sad_u16 v4, v1, v2, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad5 =
+        recompile_valu(codeTsad5, std::size(codeTsad5), 0, /*out_vgpr*/ 4);
+    CHECK(!spvTsad5.empty(), "recompiled Tsad5 (v_sad_u16) -> SPIR-V");
+    std::vector<float> gotTsad5 = prosper::test::run_compute(spvTsad5, inX, N, N);
+    uint32_t badTsad5 = 0;
+    for (uint32_t i = 0; i < N && gotTsad5.size() == N; ++i)
+        if (bits_of(gotTsad5[i]) != 0x0001FFFBu) ++badTsad5;
+    CHECK(gotTsad5.size() == N && badTsad5 == 0,
+          "Tsad5: v_sad_u16 wraps accumulator mod 2^32 across 16-bit halfword diffs");
+
+    // Tsad6: v_msad_u8 (0x171). Masked byte SAD, skipping byte when S1[k] == 0.
+    // Inputs: S0=0x003010F0, S1=0x50000F0F, S2=7.
+    // k=0: S0=0xF0, S1=0x0F != 0 => diff = 225.
+    // k=1: S0=0x10, S1=0x0F != 0 => diff = 1.
+    // k=2: S0=0x30, S1=0x00 == 0 => diff = 0 (skipped).
+    // k=3: S0=0x00, S1=0x50 != 0 => diff = 80.
+    // Sum = 225 + 1 + 0 + 80 + 7 = 313 = 0x139.
+    const uint32_t codeTsad6[] = {
+        0x7e0202ffu, 0x003010f0u,   // v_mov_b32 v1, 0x003010F0
+        0x7e0402ffu, 0x50000f0fu,   // v_mov_b32 v2, 0x50000F0F
+        0x7e060287u,   // v_mov_b32 v3, 7
+        0xd5710004u, 0x040e0501u,   // v_msad_u8 v4, v1, v2, v3
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvTsad6 =
+        recompile_valu(codeTsad6, std::size(codeTsad6), 0, /*out_vgpr*/ 4);
+    CHECK(!spvTsad6.empty(), "recompiled Tsad6 (v_msad_u8) -> SPIR-V");
+    std::vector<float> gotTsad6 = prosper::test::run_compute(spvTsad6, inX, N, N);
+    uint32_t badTsad6 = 0;
+    for (uint32_t i = 0; i < N && gotTsad6.size() == N; ++i)
+        if (bits_of(gotTsad6[i]) != 0x139u) ++badTsad6;
+    CHECK(gotTsad6.size() == N && badTsad6 == 0,
+          "Tsad6: v_msad_u8 skips byte when S1 byte is zero");
+
     // Astro's next blocker is VOP3B v_mad_u64_u32. Exercise all three architectural
     // outputs with an overflowing case:
     //   0xffffffff*2 + 0xffffffffffffffff = carry:1, hi:1, lo:0xfffffffd.
