@@ -44,10 +44,10 @@ constexpr std::array<uint32_t, 7> ResourceFreeExport{
     0x7e000280u, 0x7e0202f2u, 0x7e040280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u};
 
 struct Program {
-    alignas(256) std::array<uint32_t, 64> code{};
+    AgcShaderHeader header{};
     AgcShaderUserData user{};
     std::array<ShaderReg, 2> registers{};
-    AgcShaderHeader header{};
+    alignas(256) std::array<uint32_t, 64> code{};
 };
 
 class OrderedGraphicsReadPointTest : public ::testing::Test {
@@ -76,12 +76,19 @@ protected:
     }
 
     void register_program(Program*& result, bool pixel, std::span<const uint32_t> supplied = {}) {
-        // AGC retains raw header/code pointers for process lifetime. Never leave stale fixture
-        // pointers or reuse a low address interpreted as a blob-relative pointer.
+        // AGC retains raw header/code pointers for process lifetime. Encode genuine forward
+        // SDK offsets, valid on both low non-PIE heaps and ordinary high-address allocations.
         static std::vector<std::unique_ptr<Program>> owners;
         owners.push_back(std::make_unique<Program>());
         result = owners.back().get();
-        ASSERT_GT(reinterpret_cast<uint64_t>(result), UINT32_MAX);
+        const auto user_offset = reinterpret_cast<uintptr_t>(&result->user) -
+                                 reinterpret_cast<uintptr_t>(&result->header.user_data);
+        const auto register_offset = reinterpret_cast<uintptr_t>(result->registers.data()) -
+                                     reinterpret_cast<uintptr_t>(&result->header.sh_registers);
+        ASSERT_GT(user_offset, 0u);
+        ASSERT_LE(user_offset, UINT32_MAX);
+        ASSERT_GT(register_offset, 0u);
+        ASSERT_LE(register_offset, UINT32_MAX);
         if (!supplied.empty()) {
             ASSERT_LE(supplied.size(), result->code.size());
             std::copy(supplied.begin(), supplied.end(), result->code.begin());
@@ -93,8 +100,8 @@ protected:
         result->registers[1].offset = pixel ? P::SPI_SHADER_PGM_HI_PS : P::SPI_SHADER_PGM_HI_ES;
         result->header.file_header = 0x34333231u;
         result->header.version = 0x18u;
-        result->header.user_data = &result->user;
-        result->header.sh_registers = result->registers.data();
+        result->header.user_data = reinterpret_cast<AgcShaderUserData*>(user_offset);
+        result->header.sh_registers = reinterpret_cast<const void*>(register_offset);
         result->header.shader_size =
             (supplied.empty() ? (pixel ? Nested.size() : 1u) : supplied.size()) * sizeof(uint32_t);
         result->header.type = pixel ? 1u : 2u;
@@ -107,9 +114,16 @@ protected:
                          reinterpret_cast<uint64_t>(result->code.data()), 0, 0, 0),
                   0u);
         ASSERT_EQ(registered, &result->header);
+        EXPECT_EQ(result->header.code, result->code.data());
+        EXPECT_EQ(result->header.user_data, &result->user);
         EXPECT_EQ(result->header.sh_registers, result->registers.data());
         EXPECT_EQ(result->registers[0].value,
                   uint32_t(reinterpret_cast<uint64_t>(result->code.data()) >> 8u));
+        EXPECT_EQ(result->registers[1].value,
+                  uint32_t((reinterpret_cast<uint64_t>(result->code.data()) >> 40u) & 0xffu));
+        EXPECT_EQ(
+            prosper_agc_shader_header_for_code(reinterpret_cast<uint64_t>(result->code.data())),
+            &result->header);
     }
 
     void SetUp() override {
