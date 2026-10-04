@@ -1371,9 +1371,10 @@ TEST(Rdna2DecodeSweep, Dpp16IsNeverAdmittedOnVopcAndDpp8IsNeverAdmitted) {
 // ---- VOP3P (packed / mixed-precision) --------------------------------------------------------
 // dword0: VDST[7:0], NEG_HI[10:8], OPSEL[13:11], OPSEL_HI[2][14], CLAMP[15], OP[22:16].
 // dword1: SRC0[8:0], SRC1[17:9], SRC2[26:18], OPSEL_HI[1:0][28:27], NEG[31:29].
-// Three families have modelled modifiers: packed f16 (0x0E-0x12), packed 16-bit integer (0x00-0x0D,
-// where CLAMP is unmodelled integer saturation) and the fma_mix trio (0x20-0x22, where NEG_HI is
-// ABS). Every other opcode must keep has_modifier on any modifier bit.
+// Four families have modelled modifiers: packed f16 (0x0E-0x12), packed 16-bit integer (0x00-0x0D,
+// where CLAMP is unmodelled integer saturation), the fma_mix trio (0x20-0x22, where NEG_HI is
+// ABS) and the integer dot family (0x14-0x19, where only the dot2 source selectors are modelled).
+// Every other opcode must keep has_modifier on any modifier bit.
 
 namespace {
 struct Vop3p {
@@ -1391,6 +1392,9 @@ struct Vop3p {
 constexpr bool vop3p_is_packed_f16(uint32_t op) { return op >= 0x0E && op <= 0x12; }
 constexpr bool vop3p_is_packed_int(uint32_t op) { return op <= 0x0D; }
 constexpr bool vop3p_is_mix(uint32_t op) { return op >= 0x20 && op <= 0x22; }
+constexpr bool vop3p_is_dot(uint32_t op) {
+    return op >= 0x14 && op <= 0x19;
+}
 }  // namespace
 
 TEST(Rdna2DecodeSweep, Vop3pDecodesOpcodeDestinationAndThreeSources) {
@@ -1473,9 +1477,51 @@ TEST(Rdna2DecodeSweep, Vop3pMixFamilyMapsNegHiToAbs) {
     }
 }
 
+TEST(Rdna2DecodeSweep, Vop3pIntegerDotModifiers) {
+    for (uint32_t op = 0x14; op <= 0x19; ++op) {
+        // Plain default encoding: opsel=0, opsel_hi=7 (or 0)
+        Vop3p v;
+        v.op = op;
+        v.opsel = 0;
+        v.opsel_hi = 7;
+        EXPECT_FALSE(v.decoded().has_modifier) << "plain default, op=" << op;
+
+        Vop3p clamp = v;
+        clamp.clamp = 1;
+        EXPECT_TRUE(clamp.decoded().has_modifier) << "clamp, op=" << op;
+
+        Vop3p neg = v;
+        neg.neg = 1;
+        EXPECT_TRUE(neg.decoded().has_modifier) << "neg, op=" << op;
+
+        Vop3p neg_hi = v;
+        neg_hi.neg_hi = 1;
+        EXPECT_TRUE(neg_hi.decoded().has_modifier) << "neg_hi, op=" << op;
+
+        if (op == 0x14 || op == 0x15) {
+            // v_dot2 allows opsel[1:0] to select halfwords
+            Vop3p sel = v;
+            sel.opsel = 3;
+            EXPECT_FALSE(sel.decoded().has_modifier) << "opsel[1:0] valid for v_dot2, op=" << op;
+
+            Vop3p bad_sel = v;
+            bad_sel.opsel = 4;
+            EXPECT_TRUE(bad_sel.decoded().has_modifier)
+                << "opsel bit 2 invalid for v_dot2, op=" << op;
+        } else {
+            // v_dot4 and v_dot8 reject any opsel
+            Vop3p sel = v;
+            sel.opsel = 1;
+            EXPECT_TRUE(sel.decoded().has_modifier) << "opsel invalid for dot4/dot8, op=" << op;
+        }
+    }
+}
+
 TEST(Rdna2DecodeSweep, Vop3pUnmodelledOpcodesRejectAnyModifierBit) {
     for (uint32_t op = 0; op < 0x80; ++op) {
-        if (vop3p_is_packed_f16(op) || vop3p_is_packed_int(op) || vop3p_is_mix(op)) continue;
+        if (vop3p_is_packed_f16(op) || vop3p_is_packed_int(op) || vop3p_is_mix(op) ||
+            vop3p_is_dot(op))
+            continue;
         EXPECT_FALSE(Vop3p{.op = op}.decoded().has_modifier) << "plain, op=" << op;
         const struct { const char* name; Vop3p v; } cases[] = {
             {"neg_hi", Vop3p{.op = op, .neg_hi = 1}},
