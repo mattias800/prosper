@@ -8,9 +8,9 @@
 // block that failed to arrive fails the test instead of quietly shrinking the suite. Verified
 // by mutation: an empty run_minmax3_checks() exits 1 with "contributed 0 checks, expected 14".
 //
-// The declarations below this comment are the original file's preamble, replicated so this
-// translation unit compiles. Most of it is unused here and is kept identical rather than pruned,
-// so the two files' shared prologue stays comparable.
+// Below this comment is only what the moved block needs: the includes, `extern` declarations of
+// main()'s `fails` and `checks` counters, and the same `CHECK` macro text main() uses. The original
+// file's static helpers are not copied.
 
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
