@@ -28,13 +28,16 @@
 // the only spelling that is correct regardless of read order. Running the binary directly therefore
 // arms nothing, and the check below fails loudly rather than passing on an unexercised path.
 
+#include "fixtures/fragment_draw_fixture.hpp"
 #include "fixtures/render_runner.h"
 #include "fixtures/spirv_triangle.h"
 #include "gpu/diagnostics/geometry_probe_arming.hpp"
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -90,10 +93,78 @@ const uint32_t kPlainModule[] = {
     0x00030010u, 0x00000004u, kExecutionModeOriginUpperLeft,
 };
 
+void observe_original_fragment_planes() {
+    // --- Arm 4: actual original-PS WAT2 planes, not the native triangle's empty observer -------
+    // The existing registered non-SMEM recipe independently exercises this diagnostic on the
+    // normal collector/kernel/replay backend. It adds no diagnostic wait: the ordinary synchronous
+    // color readback already completes the same batch. Source/header/user values are real fixtures.
+    CHECK(prosper::test::fragment_draw_observation_enabled(),
+          "private-plane observation is armed before process start by CTest");
+    CHECK(!std::getenv("PROSPER_GEOM_PROBE") && !std::getenv("PROSPER_DRAW_ISO"),
+          "the dedicated process preserves the real collector's no-XFB/no-isolation recipe");
+    if (failures) return;
+    // Realization snapshots the published enabled-device float contract, so create the normal
+    // context first, as the working FragmentDrawExec fixture does. Never fill that witness later.
+    const auto& context = prosper::test::render_vk_ctx();
+    CHECK(context.ok && context.shader_int64_enabled &&
+              context.float_transport.explicit_nonfinite32(),
+          "the actual device enabled the original kernel's int64 and raw float transport");
+    if (failures) return;
+    prosper::gpu::DrawItem original;
+    const bool realized = prosper::test::fragment_draw::realize(original);
+    CHECK(realized && original.fragment_draw_inputs,
+          "the real registered original PS owns a complete WAT2 producer");
+    if (realized && original.fragment_draw_inputs) {
+        CHECK(original.fragment_draw_inputs->float_transport == context.float_transport,
+              "the producer captured the same genuine enabled-device float profile");
+        BackendDraw draw;
+        draw.vs_shared = original.vs_shared;
+        draw.fs_shared = original.fs_shared;
+        draw.vs = original.vs;
+        draw.fs = original.fs;
+        draw.fragment_draw_inputs = original.fragment_draw_inputs;
+        draw.vcount = original.vertex_count;
+        draw.vertex_offset = original.vertex_offset;
+        draw.instance_count = 1;
+        draw.ps = &original.ps;
+        prosper::test::BackendColorTarget target;
+        target.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        const auto before = prosper::test::fragment_draw_observation_stats();
+        const uint64_t before_host = prosper::test::backend_host_read_barrier_count().load();
+        constexpr auto width = prosper::test::fragment_draw::width;
+        constexpr auto height = prosper::test::fragment_draw::height;
+        const auto observed = prosper::test::render_draws_rgba({draw}, width, height, nullptr,
+                                                               nullptr, false, &target);
+        const auto after = prosper::test::fragment_draw_observation_stats();
+        CHECK(after.recorded == before.recorded + 1 && after.reported == before.reported + 1 &&
+                  after.unavailable == before.unavailable,
+              "actual private planes were copied and reported after successful normal completion");
+        CHECK(prosper::test::backend_host_read_barrier_count().load() >= before_host + 2,
+              "both ordinary color and private-plane HOST_READ availability were recorded");
+        const auto stats = prosper::test::fragment_draw_backend_stats();
+        CHECK(stats.planned == 1 && stats.recorded == 1 && stats.refused == 0,
+              "the observed draw used the actual collector/original kernel/attachment replay");
+        bool correct = observed.size() == size_t(width) * height * 16;
+        if (correct)
+            for (size_t pixel = 0; pixel < size_t(width) * height; ++pixel) {
+                std::array<float, 4> actual{};
+                std::memcpy(actual.data(), observed.data() + pixel * sizeof(actual),
+                            sizeof(actual));
+                correct &= actual == prosper::test::fragment_draw::color_a;
+            }
+        CHECK(correct, "diagnostic recording preserves every genuine original raw RGBA32F pixel");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::printf("== test_render_diagnostic_paths ==\n");
+    if (argc == 2 && std::strcmp(argv[1], "--fragment-planes") == 0) {
+        observe_original_fragment_planes();
+        std::printf("== %s ==\n", failures ? "FAILED" : "PASSED");
+        return failures ? 1 : 0;
+    }
 
     // --- Arm 1: the arming predicate itself (no device, no render) ------------------------------
     CHECK(prosper::gpu::spirv_declares_xfb_capture(kXfbModule,

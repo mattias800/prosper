@@ -19,6 +19,7 @@
 #include "diagnostics/env_cache.hpp"         // PROSPER_ENV_ON / _VALUE: process-lifetime reads
 #include "diagnostics/env_submit.hpp"        // PROSPER_ENV_ON_PER_SUBMIT: re-sampled each submit
 #include "gpu/pm4/command_processor.hpp"   // GpuState
+#include "gpu/state/fragment_entry_observation.hpp"
 #include "gpu/execute/index_expand.hpp"    // validated 16-bit index copy and maximum
 #include "gpu/state/render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "gpu/pm4/pm4_registers.hpp"        // CB_COLOR_CONTROL operation decode
@@ -28,6 +29,7 @@
 #include "gpu/recompiler/raster_quad_collector.hpp"
 #include "gpu/execute/dcc_helper_program.hpp"   // AGC colour-block utility program
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
+#include "gpu/execute/fragment_scalar_bank.hpp"
 #include "gpu/resources/shader_resources.hpp"    // ShaderResourceTable
 #include "gpu/resources/compressed_source_authority.hpp"  // CompressionMetadataKind
 #include "gpu/agc/agc_shader_layout.hpp"   // DecodedBufferDescriptor (DynFetch)
@@ -62,10 +64,28 @@ struct Rdna2Inst;
 bool guest_readable(uint64_t address, uint32_t bytes);
 
 using SharedShaderWords = std::shared_ptr<const std::vector<uint32_t>>;
+struct FragmentPacketVgprRequirements;
+struct OriginalGraphicsStageEffects;
+struct DecodedShader;
+class RegisteredNativeGraphicsAnalysis;
+class CheckedGraphicsSource;
+class NativeGraphicsStageCompilation;
+class OrderedScalarBankReadPoint;
+class OriginalGraphicsDrawEffects;
 
 struct GraphicsReadSource {
     SharedShaderWords words;
     std::shared_ptr<const std::vector<RawNestedWideChain>> chains;
+    // Full-original packet facts alias the registered decoded version, not native-module
+    // ShaderCodeAnalysis or another VA lookup. The issuer retains this exact association.
+    std::shared_ptr<const FragmentPacketVgprRequirements> packet_requirements;
+    std::shared_ptr<const OriginalGraphicsStageEffects> vertex_effects, fragment_effects;
+    std::shared_ptr<const DecodedShader> decoded;
+    std::shared_ptr<const RegisteredNativeGraphicsAnalysis> native_analysis;
+    const AgcShaderHeader* registered_header = nullptr;
+    // Same registered observation's small header snapshot. Referenced guest metadata retains
+    // the existing submitted-input stability contract; this is not a byte-writer lock.
+    std::shared_ptr<const AgcShaderHeader> header_snapshot;
 };
 GraphicsReadSource registered_graphics_read_source(uint64_t address);
 
@@ -103,6 +123,14 @@ struct DrawItem {
     // separately allocated NGG main program. Capture retains that raw continuation as well so
     // diagnostic replay can recompile the same complete architectural program.
     uint64_t vs_chain_guest_addr = 0;
+    // Coupled full-original versions already observed by the real stage-table producer. These
+    // are not native module analyses or address-only guesses; queued scalar effect accounting
+    // reuses them without another full guest-code validation after folding.
+    GraphicsReadSource original_vs_source, original_ps_source;
+    // Only the actual checked native compiler mints this lineage. Resident code caches never
+    // retain the original source generation through these per-draw ownership records.
+    std::shared_ptr<const NativeGraphicsStageCompilation> native_vs_source, native_ps_source;
+    std::shared_ptr<const OriginalGraphicsDrawEffects> original_graphics_effects;
     // Content-addressed raw RDNA2 versions owned by a materialized capture. Live draw items leave
     // these unset; capture assigns them from the guest addresses above and replay restores them.
     uint32_t vs_raw_shader_index = 0xFFFFFFFFu;
@@ -410,15 +438,12 @@ struct SrtUse {
 bool shader_resource_allows_zero_mip_specialization(
     const SrtUse& use, const DecodedImageDescriptor& descriptor,
     const DecodedImageView& view);
-std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
-                                            const uint32_t* user_sgprs, uint32_t nsgpr,
-                                            uint32_t user_sgpr_base,
-                                            std::vector<SrtUse>* srt_uses = nullptr,
-                                            uint32_t pcrel_dispatch_target = UINT32_MAX,
-                                            const PcrelDispatchInfo* pcrel_dispatch = nullptr,
-                                            const uint32_t* system_sgprs = nullptr,
-                                            uint32_t nsystem_sgprs = 0,
-                                            FoldReader* reader = nullptr);
+std::vector<DynFetch> resolve_dynamic_fetch(
+    const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
+    uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses = nullptr,
+    uint32_t pcrel_dispatch_target = UINT32_MAX, const PcrelDispatchInfo* pcrel_dispatch = nullptr,
+    const uint32_t* system_sgprs = nullptr, uint32_t nsystem_sgprs = 0,
+    FoldReader* reader = nullptr, const CheckedGraphicsSource* checked_source = nullptr);
 
 // Add instruction-provenance compute buffer resources to a metadata-built table. This is the exact
 // buffer-discovery path used by realize_compute_dispatches; it is exposed so tests can assert the
@@ -527,7 +552,12 @@ std::shared_ptr<ShaderResourceTable> merge_vertex_chain_resource_tables(
 // indexed draws are grown to their decoded max-index range later in realize_draw_item. Implemented in
 // gpu_executor.cpp (needs the AGC registry + descriptor decode).
 struct GraphicsRawSnapshotContext;
-bool draw_requires_owned_nested_snapshot(const GpuState& state);
+bool draw_requires_owned_nested_snapshot(const GpuState& state,
+                                         const OrderedScalarBankReadPoint* captured = nullptr,
+                                         uint64_t command_order = 0);
+// Code-free physical launch hint. It chooses ordered realization, not a completion wait or
+// resource admission. The real issuer separately authenticates the current original version.
+bool draw_requires_original_scalar_bank(const GpuState& state);
 bool graphics_program_requires_owned_waves(uint64_t address);
 // Aliasing immutable analysis owner for the complete registered stream; no caller rereads code.
 SharedShaderWords registered_graphics_original(uint64_t address);
@@ -537,10 +567,12 @@ bool prepare_draw_owned_waves(const GpuState& state, const GpuState::Draw* draw,
                               const GraphicsRawSnapshotContext* context,
                               std::shared_ptr<const GraphicsOwnedWaveDraw>& owned,
                               std::vector<uint32_t>& indices, std::string& refusal);
-std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr,
-                                                       bool is_ps, uint32_t draw_vertex_count = 0,
-                                                       uint64_t draw_command_order = 0,
-                                                       const GraphicsRawSnapshotContext* raw_context = nullptr);
+std::shared_ptr<ShaderResourceTable>
+build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps,
+                  uint32_t draw_vertex_count = 0, uint64_t draw_command_order = 0,
+                  const GraphicsRawSnapshotContext* raw_context = nullptr,
+                  const CheckedGraphicsSource* checked_source = nullptr,
+                  GraphicsReadSource* original_source = nullptr);
 
 // PROSPER_COMPUTELOG diagnostic: resolve every skipped DispatchDirect packet's compute shader and
 // AGC resource table from its retained register snapshot. PROSPER_COMPUTELOG_DIM=WxH restricts output
@@ -645,6 +677,24 @@ struct ReplayDmaCopy {
 };
 
 enum class ShaderProgramStage : uint8_t { Vertex, Fragment, Compute };
+std::shared_ptr<const CheckedGraphicsSource>
+checked_graphics_source(std::shared_ptr<const OrderedScalarBankReadPoint>, const GpuState&,
+                        uint64_t address, uint64_t command_order, ShaderProgramStage);
+SharedShaderAnalysis checked_graphics_source_analysis(const CheckedGraphicsSource*);
+bool checked_graphics_source_current(const CheckedGraphicsSource*);
+bool checked_graphics_source_requires_owned_waves(const CheckedGraphicsSource*);
+GraphicsReadSource checked_graphics_source_observation(const CheckedGraphicsSource*);
+std::shared_ptr<const OriginalFragmentDrawProducer>
+seal_original_fragment_draw_producer(const OrderedScalarBankReadPoint&, const GpuState&,
+                                     uint64_t command_order,
+                                     std::shared_ptr<const NativeGraphicsStageCompilation>,
+                                     std::shared_ptr<const FragmentScalarBank>);
+std::shared_ptr<const OriginalGraphicsDrawEffects>
+seal_original_graphics_draw_effects(const OrderedScalarBankReadPoint&, const GpuState&,
+                                    uint64_t command_order,
+                                    std::shared_ptr<const NativeGraphicsStageCompilation>,
+                                    std::shared_ptr<const NativeGraphicsStageCompilation>,
+                                    std::shared_ptr<const OriginalFragmentDrawProducer>);
 
 // Graphics shaders are commonly submitted dozens of times per frame with different guest backing
 // addresses but the same code and descriptor interface. Cache the deterministic RDNA2 -> SPIR-V
@@ -678,7 +728,9 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     bool vertex_capture_position = false, const SharedShaderAnalysis& captured_analysis = {},
     FragmentFloatMode fragment_float_mode = {}, FloatTransportConfig float_transport = {},
     FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
-    RefusedShaderSource* original_source = nullptr);
+    RefusedShaderSource* original_source = nullptr,
+    const CheckedGraphicsSource* checked_source = nullptr,
+    std::shared_ptr<const NativeGraphicsStageCompilation>* checked_compilation = nullptr);
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; ordinary per-dispatch push-constant values do not.
 // Conditional marker lowerings validate their value-dependent dispatch proof before cache lookup.
@@ -2004,13 +2056,38 @@ inline void trace_color_state_if_requested(const RenderState& rs,
 // gets worse with more workers, which is the opposite of what parallelising the loop is for.
 // #2285 removed the equivalent pair from the serial build_bds path and measured the unit at
 // 1.26 us/call, 5.49 ms/submit at the 2,179 draws/submit this title reaches in the FMV phase.
-inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcount_hint,
-                              uint32_t max_shader_dwords, bool log, DrawItem& out,
-                              OperationRealizationFailure* failure = nullptr,
-                              bool retain_shared_shader_words = false,
-                              const char* const* hoisted_validate_mode = nullptr,
-                              const GraphicsRawSnapshotContext* raw_context = nullptr) {
+inline bool
+realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcount_hint,
+                  uint32_t max_shader_dwords, bool log, DrawItem& out,
+                  OperationRealizationFailure* failure = nullptr,
+                  bool retain_shared_shader_words = false,
+                  const char* const* hoisted_validate_mode = nullptr,
+                  const GraphicsRawSnapshotContext* raw_context = nullptr,
+                  std::shared_ptr<const OrderedScalarBankReadPoint> scalar_read_point = {},
+                  std::shared_ptr<const FragmentScalarBank> scalar_bank = {}) {
     RenderState rs = extract_render_state(ds);
+    out.original_vs_source = {};
+    out.original_ps_source = {};
+    out.native_vs_source.reset();
+    out.native_ps_source.reset();
+    out.original_graphics_effects.reset();
+    const uint64_t scalar_order = draw ? draw->command_order : 0;
+    const auto checked_vertex =
+        scalar_read_point ? checked_graphics_source(scalar_read_point, ds, rs.es_addr, scalar_order,
+                                                    ShaderProgramStage::Vertex)
+                          : nullptr;
+    const auto checked_fragment =
+        scalar_read_point ? checked_graphics_source(scalar_read_point, ds, rs.ps_addr, scalar_order,
+                                                    ShaderProgramStage::Fragment)
+                          : nullptr;
+    if ((scalar_read_point && (!checked_vertex || !checked_fragment)) ||
+        (scalar_bank && !scalar_read_point)) {
+        if (failure) {
+            *failure = {};
+            failure->reason = RealizationFailureReason::ShaderRecompile;
+        }
+        return false;
+    }
     // A volume color target alone does not tell the mesh translator which ancillary POS export
     // selects the destination layer. Keep this opt-in register witness at the draw snapshot, not
     // at end-of-submit state, where a later pipeline can replace all three selectors.
@@ -2320,8 +2397,12 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                                    rs.cb_target_mask, rs.cb_shader_mask);
         return false;
     }
-    const bool owned_vertex = graphics_program_requires_owned_waves(vs_program_addr);
-    const bool owned_fragment = graphics_program_requires_owned_waves(rs.ps_addr);
+    const bool owned_vertex =
+        checked_vertex ? checked_graphics_source_requires_owned_waves(checked_vertex.get())
+                       : graphics_program_requires_owned_waves(vs_program_addr);
+    const bool owned_fragment =
+        checked_fragment ? checked_graphics_source_requires_owned_waves(checked_fragment.get())
+                         : graphics_program_requires_owned_waves(rs.ps_addr);
     std::shared_ptr<const GraphicsOwnedWaveDraw> owned_waves;
     std::vector<uint32_t> owned_indices;
     if (owned_vertex || owned_fragment) {
@@ -2344,7 +2425,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         owned_vertex ? nullptr
                      : build_stage_table(ds, vertex_chain ? rs.es_addr : vs_program_addr, false,
                                          vcount_hint, draw ? draw->command_order : 0,
-                                         vertex_chain ? nullptr : raw_context);
+                                         vertex_chain ? nullptr : raw_context, checked_vertex.get(),
+                                         checked_vertex ? &out.original_vs_source : nullptr);
     std::shared_ptr<ShaderResourceTable> chain_vrt;
     if (vertex_chain) {
         const size_t prolog_resource_count = vrt ? vrt->resources.size() : 0;
@@ -2366,9 +2448,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             }
     }
     std::shared_ptr<ShaderResourceTable> prt =
-        owned_fragment ? nullptr
-                       : build_stage_table(ds, rs.ps_addr, true, vcount_hint,
-                                           draw ? draw->command_order : 0, raw_context);
+        owned_fragment || scalar_bank
+            ? nullptr
+            : build_stage_table(ds, rs.ps_addr, true, vcount_hint, draw ? draw->command_order : 0,
+                                raw_context, checked_fragment.get(),
+                                checked_fragment ? &out.original_ps_source : nullptr);
+    if (scalar_bank)
+        out.original_ps_source = checked_graphics_source_observation(checked_fragment.get());
     const bool rect_list = rs.prim_type == 7u || rs.prim_type == 17u;
     const bool rect_list_synthesis = needs_rect_list_synthesis(
         rs.prim_type, draw && draw->indexed, vcount_hint, vrt.get());
@@ -2451,7 +2537,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     static const bool reuse_fragment_analysis =
         !PROSPER_ENV_ON("PROSPER_NO_FRAGMENT_ANALYSIS_REUSE");
     const SharedShaderAnalysis fragment_analysis =
-        reuse_fragment_analysis && rs.ps_addr
+        checked_fragment ? checked_graphics_source_analysis(checked_fragment.get())
+        : reuse_fragment_analysis && rs.ps_addr
             ? acquire_shader_analysis(fragment_code, fragment_dwords)
             : SharedShaderAnalysis{};
     if (rs.ps_addr) {
@@ -2487,7 +2574,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     RefusedShaderSource vs_original, fs_original;
     SharedShaderWords vs_shared, fs_shared;
     std::vector<uint32_t> vs, fs;
-    if (retain_shared_shader_words) {
+    if (retain_shared_shader_words || checked_vertex) {
         if (owned_vertex) {
         }   // typed deferred stage; no native placeholder or module-cache admission
         else if (vertex_chain)
@@ -2502,13 +2589,14 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
                 vs_program_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity, false,
                 vertex_lds_dwords, capture_vertex_position, {}, {}, float_transport, {}, {},
-                &vs_original);
-        if (!owned_fragment)
+                &vs_original, checked_vertex.get(), &out.native_vs_source);
+        if (!owned_fragment && !scalar_bank)
             fs_shared = recompile_graphics_shader_cached_shared(
                 ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
                 fragment_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
                 rs.ps_wave32, 0, false, fragment_analysis, rs.ps_float_mode, float_transport,
-                rs.ps_float_flags, rs.ps_launch_rsrc1, &fs_original);
+                rs.ps_float_flags, rs.ps_launch_rsrc1, &fs_original, checked_fragment.get(),
+                &out.native_ps_source);
     } else {
         if (owned_vertex) {
         }   // execution and native export commit happen at the actual device owner
@@ -2527,7 +2615,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 vertex_lds_dwords, capture_vertex_position, {}, {}, float_transport, {}, {},
                 &vs_original);
         }
-        if (!owned_fragment)
+        if (!owned_fragment && !scalar_bank)
             fs = recompile_graphics_shader_cached(
                 ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
                 fragment_dwords, prt.get(), pixel_input_ptr, system_input_ptr, &fs_identity,
@@ -2630,7 +2718,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
     }
     if ((vs_words.empty() && !owned_vertex) ||
-        (fs_words.empty() && !owned_fragment && !raster_fragment_pending) ||
+        (fs_words.empty() && !owned_fragment && !raster_fragment_pending && !scalar_bank) ||
         ((interpolation.requires_geometry || rect_list_synthesis) && gs.empty())) {
         if (PROSPER_ENV_ON("PROSPER_PROLOGLOG")) {
             // #3126: name the FAILING program by the same content hash the prolog recogniser uses,
@@ -2760,7 +2848,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     if ((!owned_vertex &&
          !validate_runtime_descriptor_contract("VS", vs_words, vrt.get(), 0,
                                                SpirvShaderStage::Vertex, validate_mode)) ||
-        (!owned_fragment && !raster_fragment_pending &&
+        (!owned_fragment && !raster_fragment_pending && !scalar_bank &&
          !validate_runtime_descriptor_contract("PS", fs_words, prt.get(), 1,
                                                SpirvShaderStage::Fragment, validate_mode))) {
         report_dropped_draw_target(rs.color0_base, "descriptor-contract", rs.cb_target_mask,
@@ -3138,21 +3226,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.float_transport = float_transport;
     out.ps_entry = {};
     out.ps_raster_launch = rs.ps_addr ? rs.ps_raster_launch : RasterLaunchFacts{};
-    if (rs.ps_addr) {
-        out.ps_entry.observed = true;
-        for (uint32_t i = 0; i < out.ps_entry.user_data.size(); ++i) {
-            const auto word = ds.sh.find(prosper::agc::Pm4::SPI_SHADER_USER_DATA_PS_0 + i);
-            if (word != ds.sh.end()) {
-                out.ps_entry.user_data_available |= uint32_t(1) << i;
-                out.ps_entry.user_data[i] = word->second;
-            }
-        }
-        const auto rsrc2 = ds.sh.find(prosper::agc::Pm4::SPI_SHADER_PGM_RSRC2_PS);
-        if (rsrc2 != ds.sh.end()) {
-            out.ps_entry.rsrc2_available = true;
-            out.ps_entry.rsrc2 = rsrc2->second;
-        }
-    }
+    observe_fragment_entry(ds, rs.ps_addr != 0, out.ps_entry);
     if (out.owned_waves) {
         auto pinned = std::make_shared<GraphicsOwnedWaveDraw>(*out.owned_waves);
         pinned->has_pixel_inputs = out.has_pixel_inputs;
@@ -3200,17 +3274,39 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                                             : std::make_shared<const std::vector<uint32_t>>(out.fs);
         inputs->owned_wave_pending = raster_fragment_pending;
         inputs->raw_matches_producing_source = bool(fragment_analysis) && !dcc_decompress;
+        if (scalar_bank) {
+            // The original packet manifest is coupled to the registered pre-fold version, not
+            // to a fabricated native FS analysis or the normalization selected for that module.
+            inputs->scalar_bank = scalar_bank;
+            inputs->raw_code = scalar_bank->original_words();
+            inputs->vgpr_requirements = scalar_bank->packet_requirements();
+            inputs->entry = scalar_bank->entry();
+        }
         inputs->has_pixel_inputs = out.has_pixel_inputs; inputs->pixel_inputs = out.pixel_inputs;
         inputs->has_system_inputs = out.has_system_inputs; inputs->system_inputs = out.system_inputs;
         inputs->interpolation = interpolation;
+        inputs->launch = rs.ps_raster_launch;
         inputs->generated_interpolation_geometry = !out.gs.empty() &&
             interpolation.requires_geometry && !rect_list_synthesis;
         inputs->float_transport = float_transport;
+        if (!scalar_bank) inputs->entry = out.ps_entry;
         inputs->float_mode = out.ps_float_mode;
         inputs->float_flags = out.ps_float_flags;
         inputs->launch_rsrc1 = out.ps_launch_rsrc1;
-        FragmentRasterLaunchSource::bind(ds, rs.ps_raster_launch, fragment_analysis, *inputs);
-        if (diagnostic_quad_collection) {
+        // Distinct private authorities: a scalar snapshot cannot mint raster helper entry, and
+        // the raster source cannot authorize a read bank or replace its pre-fold lineage.
+        if (!scalar_bank)
+            FragmentRasterLaunchSource::bind(ds, rs.ps_raster_launch, fragment_analysis, *inputs);
+        if (scalar_bank) {
+            inputs->original_fragment_producer = seal_original_fragment_draw_producer(
+                *scalar_read_point, ds, scalar_order, out.native_vs_source, scalar_bank);
+            if (!inputs->original_fragment_producer) {
+                if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
+                return false;
+            }
+            // This typed route has no normalized PS resource table. The private producer and
+            // complete original inventory, not an observed-empty reflection, carry authority.
+        } else if (diagnostic_quad_collection) {
             inputs->ps_resources = own_fragment_packet_resources(prt.get());
         } else {
             // No new whole-resource host copy on the shipping hot path. This first transaction
@@ -3229,6 +3325,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             out.raster_quads->inputs = std::move(inputs);
         }
     }
+    if (scalar_read_point && out.gs.empty())
+        out.original_graphics_effects = seal_original_graphics_draw_effects(
+            *scalar_read_point, ds, scalar_order, out.native_vs_source, out.native_ps_source,
+            out.fragment_draw_inputs ? out.fragment_draw_inputs->original_fragment_producer
+                                     : nullptr);
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     // #1256: record the raw draw-packet state (pre-realization) so a capture can be checked offline for

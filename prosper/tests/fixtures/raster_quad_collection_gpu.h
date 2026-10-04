@@ -114,6 +114,11 @@ inline bool raster_quad_varying_interface(const std::vector<uint32_t>& producer,
 
 inline bool raster_quad_producing_modules_match(const BackendDraw& draw) {
     const auto& owner = draw.raster_quads;
+    if (!draw.raster_quad_contract_modified && owner && owner->inputs &&
+        owner->inputs->original_fragment_producer)
+        return owner->inputs->original_fragment_producer->matches(*owner->inputs) &&
+               owner->inputs->original_fragment_producer->matches_modules(
+                   draw.vs_shared, draw.gs_words(), draw.fs_words());
     return !draw.raster_quad_contract_modified && owner && owner->inputs &&
         owner->inputs->source_vs && owner->inputs->source_gs && owner->inputs->source_fs &&
         *owner->inputs->source_vs == draw.vs_words() &&

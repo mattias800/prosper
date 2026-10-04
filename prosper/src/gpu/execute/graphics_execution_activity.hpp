@@ -12,6 +12,7 @@ namespace prosper::gpu {
 class GraphicsExecutionActivity {
     friend struct OrderedGraphicsReadPointIssuer;
     friend class OrderedGraphicsReadPoint;
+    friend class OrderedScalarBankReadPoint;
     static uint64_t current_version();
 
 public:

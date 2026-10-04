@@ -24,9 +24,15 @@ public:
             state.attachment_guard = true;
             const auto& inputs = draw.fragment_draw_inputs;
             const bool producing_match =
-                !draw.raster_quad_contract_modified && inputs->source_vs && inputs->source_gs &&
-                inputs->source_fs && *inputs->source_vs == draw.vs_words() &&
-                *inputs->source_gs == draw.gs_words() && *inputs->source_fs == draw.fs_words();
+                !draw.raster_quad_contract_modified &&
+                (inputs->original_fragment_producer
+                     ? inputs->original_fragment_producer->matches(*inputs) &&
+                           inputs->original_fragment_producer->matches_modules(
+                               draw.vs_shared, draw.gs_words(), draw.fs_words())
+                     : inputs->source_vs && inputs->source_gs && inputs->source_fs &&
+                           *inputs->source_vs == draw.vs_words() &&
+                           *inputs->source_gs == draw.gs_words() &&
+                           *inputs->source_fs == draw.fs_words());
             const auto prepared =
                 prosper::gpu::prepare_fragment_packet_inputs(inputs, producing_match);
             prosper::gpu::FragmentPacketDeviceContract device{
@@ -72,8 +78,27 @@ public:
             // not a residency budget or a guess from the absence of a visible store in the VS.
             if (!readonly_pass_checked) {
                 readonly_pass_checked = true;
+                const bool original_effects_required =
+                    std::any_of(draws.begin(), draws.end(), [](const BackendDraw& value) {
+                        return value.fragment_draw_inputs &&
+                               value.fragment_draw_inputs->original_fragment_producer;
+                    });
                 readonly_pass =
-                    std::all_of(draws.begin(), draws.end(), [](const BackendDraw& value) {
+                    std::all_of(draws.begin(), draws.end(), [&](const BackendDraw& value) {
+                        if (original_effects_required &&
+                            (value.raster_quad_contract_modified || value.mesh_draw ||
+                             !value.original_graphics_effects ||
+                             !value.original_graphics_effects->matches_draw(
+                                 value.source_submit, value.command_order, value.vs_shared,
+                                 value.fs_shared, value.gs_words(), value.fs_words())))
+                            return false;
+                        const bool original_bank_fragment =
+                            value.fragment_draw_inputs &&
+                            value.fragment_draw_inputs->original_fragment_producer &&
+                            value.fragment_draw_inputs->original_fragment_producer->matches(
+                                *value.fragment_draw_inputs) &&
+                            value.fragment_draw_inputs->original_fragment_producer->matches_modules(
+                                value.vs_shared, value.gs_words(), value.fs_words());
                         const auto& input = value.fragment_draw_inputs;
                         const bool proved_pending_fs =
                             value.fs_words().empty() && input && input->launch_source &&
@@ -85,8 +110,9 @@ public:
                             input->launch_source->pending_original_has_no_external_effects();
                         return backend_module_has_readonly_buffers(value.vs_words(),
                                                                    value.vs_shared) &&
-                               (proved_pending_fs || backend_module_has_readonly_buffers(
-                                                         value.fs_words(), value.fs_shared)) &&
+                               (original_bank_fragment || proved_pending_fs ||
+                                backend_module_has_readonly_buffers(value.fs_words(),
+                                                                    value.fs_shared)) &&
                                (value.gs_words().empty() ||
                                 backend_module_has_readonly_buffers(value.gs_words()));
                     });
@@ -139,7 +165,11 @@ public:
                 refuse(state, draw, transaction.rejection());
                 continue;
             }
-            state.owner = FragmentDrawGpuOwner::create(context, std::move(transaction), rejection);
+            // The normal flush decision is made only after resource realization. Prelease the
+            // opt-in usage here; staging/copy/readback remain absent until that decision is true.
+            const bool observe = fragment_draw_observation_enabled() && index < 8;
+            state.owner =
+                FragmentDrawGpuOwner::create(context, std::move(transaction), rejection, observe);
             state.compute = FragmentDrawComputeGpuProgram::acquire(context, program, rejection);
             state.target =
                 FragmentDrawCollectFramebuffer::acquire(context, state.collect, width, height);
@@ -188,7 +218,12 @@ public:
                                       [](const State& state) { return bool(state.replay); })) *
                5;
     }
-    uint64_t additional_storage_descriptors() const { return additional_sets() / 5 * 21; }
+    uint64_t additional_storage_descriptors() const {
+        uint64_t result = 0;
+        for (const auto& state : states_)
+            if (state.replay) result += uint64_t(state.compute->storage_bindings()) * 4 + 1;
+        return result;
+    }
     bool allocate(size_t index, VkDescriptorPool pool) {
         auto& state = states_[index];
         if (!state.replay) return true;
@@ -196,6 +231,18 @@ public:
                                                    *state.owner, state.sets) &&
                allocate_fragment_draw_collect_set(context_->dev, pool, *state.collect, *state.owner,
                                                   state.collector_set);
+    }
+    // Called only after the existing real flush_now decision, before command recording. Deferred
+    // batches never allocate observation staging, record a copy, read a plane or add a wait.
+    template <class Draw>
+    void prepare_completed_observations(std::span<const Draw> draws) {
+        if (!fragment_draw_observation_enabled()) return;
+        for (size_t index = 0; index < std::min(states_.size(), size_t(8)); ++index) {
+            auto& state = states_[index];
+            if (state.replay && state.owner && draws[index].ok && !state.observation)
+                state.observation =
+                    FragmentDrawGpuObservation::create(*context_, state.owner, index);
+        }
     }
     template <class Draw>
     void record(VkCommandBuffer command, std::span<const Draw> draws) const {
@@ -211,12 +258,24 @@ public:
                   .recorded;   // recording, NOT completion/publication proof
         }
     }
+    template <class Draw>
+    void record_observations_after_replay(VkCommandBuffer command,
+                                          std::span<const Draw> draws) const {
+        for (size_t index = 0; index < states_.size(); ++index)
+            if (states_[index].observation && draws[index].ok)
+                states_[index].observation->record_after_replay(command);
+    }
+    void report_completed_observations() const {
+        for (const auto& state : states_)
+            if (state.observation) state.observation->report_completed();
+    }
 
 private:
     struct State {
         bool attachment_guard = false;
         std::unique_ptr<BackendDraw> replay;
         std::shared_ptr<FragmentDrawGpuOwner> owner;
+        std::unique_ptr<FragmentDrawGpuObservation> observation;
         std::shared_ptr<const FragmentDrawComputeGpuProgram> compute;
         std::shared_ptr<const FragmentDrawCollectGpuProgram> collect;
         std::shared_ptr<const FragmentDrawCollectFramebuffer> target;

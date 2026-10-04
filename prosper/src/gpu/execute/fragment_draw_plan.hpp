@@ -1,6 +1,7 @@
 #pragma once
 #include "gpu/recompiler/fragment_draw_gpu.hpp"
 #include "gpu/execute/fragment_draw_residency.hpp"
+#include "gpu/execute/fragment_scalar_bank.hpp"
 #include <memory>
 #include <span>
 
@@ -46,6 +47,9 @@ public:
     const auto& rejection_reason() const { return rejection; }
     const auto& device_contract() const { return device; }
     const auto& raster_launch_collection() const { return raster_collection; }
+    bool requires_scalar_bank() const {
+        return capacity && !capacity->kernel()->program.scalar_bank_sites.empty();
+    }
     bool source_live() const {
         if (!source_generations->live()) return false;
         if (device.raster)
@@ -107,6 +111,7 @@ public:
         return producing_inputs_;
     }
     const std::vector<uint32_t>& entry_words() const { return entry_words_; }
+    const auto& scalar_bank() const { return scalar_bank_; }
     uint32_t width() const { return width_; }
     uint32_t height() const { return height_; }
     uint32_t primitive_count() const { return primitive_count_; }
@@ -121,15 +126,17 @@ private:
     FragmentDrawTransaction(std::shared_ptr<const FragmentDrawProgramPlan> program,
                             std::shared_ptr<const RasterQuadInputs> inputs,
                             std::vector<uint32_t> words, uint32_t width, uint32_t height,
-                            uint32_t primitives, uint64_t device)
+                            uint32_t primitives, uint64_t device,
+                            std::shared_ptr<const FragmentScalarBank> scalar_bank)
         : program_(std::move(program)), producing_inputs_(std::move(inputs)),
-          entry_words_(std::move(words)), width_(width), height_(height),
-          primitive_count_(primitives), executing_device_identity_(device) {}
+          entry_words_(std::move(words)), scalar_bank_(std::move(scalar_bank)), width_(width),
+          height_(height), primitive_count_(primitives), executing_device_identity_(device) {}
     // The submitting API has no mutable metadata/upload copy. After instantiation neither
     // profile, full-mask conditions nor dynamic words can change before the private GPU upload.
     std::shared_ptr<const FragmentDrawProgramPlan> program_;
     std::shared_ptr<const RasterQuadInputs> producing_inputs_;
     std::vector<uint32_t> entry_words_;
+    std::shared_ptr<const FragmentScalarBank> scalar_bank_;
     uint32_t width_ = 0, height_ = 0, primitive_count_ = 0;
     uint64_t executing_device_identity_ = 0;
     std::string rejection_;

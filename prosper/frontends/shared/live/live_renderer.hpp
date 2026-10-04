@@ -29,6 +29,8 @@ bool flush_live_graphics_pipeline_cache();
 prosper::gpu::GraphicsProducerStatus live_graphics_producer_status();
 bool live_graphics_raw_source_current(const prosper::GuestMappingLease&, uint64_t address,
                                       uint32_t bytes);
+bool live_graphics_raw_allocation_current(const prosper::GuestMappingLease&,
+                                          const prosper::GuestDirectAllocation&);
 
 // Opt-in cumulative work on the calling renderer thread. Disabled is unobserved, not zero work.
 // Footprints count actual CPU RTT extent calculations, excluding extra watched-address diagnostics.

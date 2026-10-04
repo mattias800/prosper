@@ -11,6 +11,7 @@ namespace prosper::gpu {
 struct FragmentPacketScalarReadSite {
     uint32_t pc = 0, opcode = 0, words = 0, byte_offset = 0;
     std::array<uint32_t, 4> entry_words{};
+    bool operator==(const FragmentPacketScalarReadSite&) const = default;
 };
 struct FragmentPacketScalarReadRequirements {
     const std::vector<uint32_t>* source_words = nullptr;
