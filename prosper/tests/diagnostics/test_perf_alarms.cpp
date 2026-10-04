@@ -1170,6 +1170,94 @@ void test_engine() {
 // The engine half of phase 3: per-window deltas of the reason arrays and of the external
 // transfer totals, the JSONL breakdowns, the run-total breakdown in the summary, and the active
 // set the --fps marker reads.
+// Per-flip `frame` records (#4406). Boot residue before the baseline flip must never appear in a
+// frame record, the baseline flip writes only the one `frame_schema` record, each later flip
+// writes exactly one frame record with that flip's deltas, the sampled texture-ref cost is left
+// out, and without a JSONL path nothing is written at all.
+void test_engine_frame_records() {
+    std::puts("engine frame records");
+    const std::string dir = std::getenv("TMPDIR") ? std::getenv("TMPDIR") : ".";
+    const std::string tag = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
+        std::to_string(reinterpret_cast<uintptr_t>(&dir) & 0xffffff);
+    const std::string jsonl = dir + "/test_perf_alarms_frames_" + tag + ".jsonl";
+    const auto cost = [](Cost c) { return static_cast<size_t>(c); };
+    const auto counter = [](Counter c) { return static_cast<size_t>(c); };
+    // Drive one engine through the scripted flips; returns the firings of every flip.
+    const auto drive = [&](AlarmEngine& engine) {
+        Ledger l;
+        // Residue from before the first flip (boot, shader warm-up).
+        l.cost_ns[cost(Cost::PresentCpu)] = 5'000'000'000ull;
+        l.cost_events[cost(Cost::PresentCpu)] = 9;
+        l.cost_ns[cost(Cost::TextureRefSample)] = 4'000'000'000ull;
+        l.cost_events[cost(Cost::TextureRefSample)] = 3;
+        l.counters[counter(Counter::GpuDeviceNsGraphics)] = 7'000'000'000ull;
+        l.counters[counter(Counter::GpuDeviceSamplesGraphics)] = 11;
+        std::vector<size_t> fired;
+        uint64_t t = 20'000'000'000ull;
+        fired.push_back(engine.on_flip(t, l, 60).size());
+        l.cost_ns[cost(Cost::PresentCpu)] += 2'000'000;
+        l.cost_events[cost(Cost::PresentCpu)] += 1;
+        l.cost_ns[cost(Cost::TextureRefSample)] += 1'000'000;
+        l.cost_events[cost(Cost::TextureRefSample)] += 1;
+        l.counters[counter(Counter::GpuDeviceNsGraphics)] += 3'000'000;
+        l.counters[counter(Counter::GpuDeviceSamplesGraphics)] += 1;
+        t += 16'666'667;
+        fired.push_back(engine.on_flip(t, l, 60).size());
+        t += 16'666'667;
+        fired.push_back(engine.on_flip(t, l, 60).size());
+        // A flip that arrives with an earlier timestamp than the last one (two flip sources, the
+        // clock read before the lock) must not move the baseline back and inflate the next one.
+        fired.push_back(engine.on_flip(t - 1'000'000, l, 60).size());
+        t += 16'666'667;
+        fired.push_back(engine.on_flip(t, l, 60).size());
+        return fired;
+    };
+    std::vector<size_t> with_log;
+    {
+        EngineConfig config;
+        config.window_ns = 10'000'000'000ull;   // no window closes: only frame records under test
+        config.jsonl_path = jsonl;
+        AlarmEngine engine(std::move(config));
+        with_log = drive(engine);
+    }
+    const std::string j = slurp(jsonl);
+    check("the baseline flip writes one frame_schema record and no frame record",
+          count_of(j, "{\"type\":\"frame_schema\"") == 1 &&
+              j.find("{\"type\":\"frame_schema\"") == 0);
+    check("each later flip writes exactly one frame record",
+          count_of(j, "{\"type\":\"frame\"") == 4);
+    check("the first frame record carries only that flip's deltas",
+          j.find("\"sequence\":1,") != std::string::npos &&
+              j.find("\"flip_interval_ms\":16.667") != std::string::npos &&
+              j.find("\"present-cpu\":{\"ms\":2.000,\"events\":1}") != std::string::npos &&
+              j.find("\"graphics_ms\":3.000,\"graphics_timestamp_pairs\":1") != std::string::npos);
+    check("an idle flip records zero deltas",
+          count_of(j, "\"present-cpu\":{\"ms\":0.000,\"events\":0}") == 3);
+    check("boot residue never appears in a frame record",
+          j.find("\"ms\":500") == std::string::npos &&
+              j.find("\"graphics_ms\":700") == std::string::npos &&
+              j.find("\"events\":10}") == std::string::npos);
+    check("the sampled texture-ref cost is not reported as a per-flip figure",
+          j.find("\"texture-ref-sample\":{") == std::string::npos);
+    check("a late-arriving flip does not move the interval baseline backwards",
+          count_of(j, "\"flip_interval_ms\":16.667") == 3 &&
+              count_of(j, "\"flip_interval_ms\":0.000") == 1);
+    check("per-run constants live in the schema record, not on every frame line",
+          count_of(j, "\"timing_model\"") == 1 && count_of(j, "\"interpretation\"") == 1);
+    std::remove(jsonl.c_str());
+
+    std::vector<size_t> without_log;
+    {
+        EngineConfig config;
+        config.window_ns = 10'000'000'000ull;
+        AlarmEngine engine(std::move(config));
+        without_log = drive(engine);
+    }
+    check("without a JSONL path the same flips fire the same rules and write no file",
+          without_log == with_log && slurp(jsonl).empty());
+}
+
 void test_engine_breakdowns() {
     std::puts("engine breakdowns");
     const std::string dir = std::getenv("TMPDIR") ? std::getenv("TMPDIR") : ".";
@@ -1998,6 +2086,7 @@ TEST(PerfAlarms, Contract) {
     test_cost_scope_nesting();
     test_texture_reference_sample();
     test_engine();
+    test_engine_frame_records();
     test_engine_breakdowns();
     test_engine_host_copy_per_flip();
     test_engine_host_copy_alternating();
