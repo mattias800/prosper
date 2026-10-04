@@ -1,12 +1,12 @@
 #pragma once
 #include "gpu/recompiler/fragment_draw_gpu.hpp"
 #include "gpu/execute/fragment_draw_residency.hpp"
+#include "gpu/execute/fragment_raster_launch_collection.hpp"
 #include "gpu/execute/fragment_scalar_bank.hpp"
 #include <memory>
 #include <span>
 
 namespace prosper::gpu {
-struct FragmentRasterLaunchCollection;
 // An explicit emulator scheduling contract, not a reconstruction of AMD's undisclosed hardware
 // append order. Complete genuine Vulkan quads remain consecutive and retain primitive identity.
 // The first recipe additionally proves the original program insensitive to inter-quad placement
@@ -43,6 +43,12 @@ public:
     const auto& rejection_reason() const { return rejection; }
     const auto& device_contract() const { return device; }
     const auto& raster_launch_collection() const { return raster_collection; }
+    bool matches_raster_vertex(const SharedShaderWords& vertex) const {
+        if (!raster_collection) return true;   // legacy input-free plans have no raster association
+        const auto& selected = raster_module_generations[0];
+        return vertex && selected.lock().get() == vertex.get() && !selected.owner_before(vertex) &&
+               !vertex.owner_before(selected);
+    }
     FragmentDrawEntryRecipe entry_schema() const { return entry_recipe; }
     bool requires_scalar_bank() const {
         return capacity && !capacity->kernel()->program.scalar_bank_sites.empty();
