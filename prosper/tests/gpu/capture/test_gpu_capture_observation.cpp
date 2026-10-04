@@ -117,8 +117,12 @@ CliResult cli(const std::filesystem::path& input, const std::string& arguments,
     }
     const auto command = quote(executable) + " " + arguments + " " + quote(input.string()) + " > " +
                          quote(log.string()) + " 2>&1";
+#ifdef _WIN32
+    // cmd /c removes the command's first/last quotes. Keep the individually quoted executable,
+    // capture and redirection paths inside a separate outer pair, including paths with spaces.
+    const int status = std::system(quote(command).c_str());
+#else
     int status = std::system(command.c_str());
-#ifndef _WIN32
     status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 #endif
     return {status, read_text(log)};
