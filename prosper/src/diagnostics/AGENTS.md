@@ -210,7 +210,13 @@ count, says how many windows fired), then `[perf-alarm] summary` lines at exit: 
 worst window, and for a correctness rule the per-reason breakdown summed over the run. A summary's
 `NO DATA` list names rules that could not have fired, which is not the same as quiet. A run killed
 with SIGTERM skips the summary, so `PROSPER_PERF_ALARM_LOG=<path>` (JSONL: every firing plus every
-window's raw quantities, flushed as written) is the record to keep for anything scripted. Under
+window's raw quantities and, once per guest flip, a `frame` record of existing cost/GPU-counter
+deltas, flushed as written) is the record to keep for anything scripted. The per-flip record is an
+opt-in sample: the flip interval is wall time, cost durations are summed thread time charged when a
+scope completes, and the fields are independent relaxed-counter deltas. They can overlap and are
+not an additive frame-budget partition; the GPU fields are durations from the existing timestamp
+pairs and include their pair counts. Each flip record is flushed, so file I/O can perturb a
+diagnostic run. Under
 `prosper-app --fps` the HUD adds one `! alarm: <rules>` line while a rule is active in the latest
 window.
 

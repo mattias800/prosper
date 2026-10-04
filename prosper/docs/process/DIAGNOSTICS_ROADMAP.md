@@ -8,8 +8,8 @@
   refusal when the run conditions differ, instead of a figure quoted from whichever harness was open.
 
 It is a plan, not a status report. The "exists" and "missing" claims were checked against the tree on
-2026-10-02 (grep over `src/`, `frontends/`, `tools/`, three corrected in review); the evidence is
-stated per item. Re-verify before
+2026-10-04 (grep over `src/`, `frontends/`, `tools/`, with the M1 report consumers rechecked); the
+evidence is stated per item. Re-verify before
 building: this tree moves fast, and a stale gap list is the failure this document is written to avoid.
 
 Companion docs: `GPU_PROFILING_EXTERNAL.md` (vendor tools that need no prosper change),
@@ -56,7 +56,7 @@ These are the contract. An item that cannot meet them is redesigned, not waived.
 | Frame grab + offline replay | F9 `.prgbundle`, `tools/gpu_replay` (schedulable headless via `PROSPER_GRAB_BUNDLE_*`) | Captures rendered-frame bugs only; not CPU, logic or audio. |
 | RenderDoc in-app capture | `frontends/shared/diagnostics/renderdoc_capture.hpp`, `PROSPER_RENDERDOC_AFTER_MS` / `_AT_FRAME` / `_AT_PAD_FLIP` (#3321) | Needs RenderDoc already injected; nothing bundled. |
 | Bounded perf capture | F8 `.prperf`, `tools/perf/performance_capture_report.py` | Reports by time; six timestamp brackets per **compute** dispatch. |
-| Always-on alarms | `[perf-alarm]`, `src/diagnostics/perf/` | Names a cost per window; no per-frame cause code. Its exit summary also prints a run-level `observer=frame-breakdown` line (per-flip summed thread time by stage; not a partition). |
+| Always-on alarms | `[perf-alarm]`, `src/diagnostics/perf/` | Default-on alarms name costs per window. With `PROSPER_PERF_ALARM_LOG`, JSONL also carries per-flip deltas from the existing cost/GPU counters; scopes are charged on completion and stage thread times overlap, so these are not a frame-budget partition. The exit summary prints run-level totals too. |
 | Stage buckets | `PROSPER_RENDER_TIMING` | Setup/resource breakdown; not a per-frame guest/driver/GPU/wait/present split. |
 | GPU submit index | `PROSPER_GPU_TIMELINE`, `tools/gpu_timeline` | Guest-submit index, **not** GPU pass timing. |
 | Guest frame pacing | `tools/perf/flip_pacing_report.py` | Interval distribution of guest flips from `PROSPER_EVLOG`; names the limiter class. |
@@ -199,26 +199,34 @@ pass-local offset (graphics), the guest program address and a pipeline hash. D5 
 
 ### M1. Frame-time percentiles and `1% low`
 
-- **Evidence:** `present_frame_rate` has a log-bucket interval histogram, median and active fraction;
-  0 hits for `1% low`. `flip_pacing_report.py` reports the guest-flip interval distribution.
+- **Evidence:** `present_frame_rate` has a log-bucket interval histogram, median, active fraction,
+  p90/p95/p99 and `1% low`. `tools/screenshot` prints the tail in its summary and writes
+  `interval_p90_ms`, `interval_p95_ms`, `interval_p99_ms` and `low_1pct_fps` in its manifest;
+  `tools/perf/compare_runs.py` compares p95, p99 and `1% low`. The p99-derived fields remain absent
+  until at least 100 distinct-frame intervals resolve the tail. `flip_pacing_report.py` separately
+  reports the guest-flip interval distribution.
 - **Design:** read p90/p95/p99 from the **existing** histogram (same estimator, same documented error)
   over `distinct` frames; report `1% low`; refuse a tail the population cannot resolve (p99 needs 100
   intervals) rather than print the maximum under a percentile's name; never fill it for a differenced
   window (the histogram is cumulative).
-- **Decision to make explicitly:** two `1% low` conventions are in common use:
-  `1000 / mean(slowest 1% of frame times)`, and the cheapest histogram-native form, `1 / p99`. Pick one,
-  state it wherever printed, and say which in every figure. They differ whenever the tail is skewed.
-- **Surfaces:** `tools/screenshot` summary and manifest; later `prosper-app` exit summary.
-- **Status:** in progress as a separate PR.
+- **Decision:** this project uses the histogram-native `1 / p99` convention, not
+  `1000 / mean(slowest 1% of frame times)`. The manifest and comparison output label the convention;
+  it differs from the mean-slowest-1% measure when the tail is skewed.
+- **Surfaces:** `tools/screenshot` summary and manifest — landed. `prosper-app`'s `--fps` HUD and
+  periodic stderr output remain rolling-window measurements and do not report percentiles; the app
+  does not yet write a comparable run manifest. The available histogram is cumulative for the run,
+  so it must not be printed beside a rolling-window rate as though both describe the same population.
+- **Status:** the screenshot summary, manifest and comparison path are complete. A whole-run
+  percentile summary for `prosper-app` remains open; it needs a clearly identified run boundary and
+  the same population/conditions metadata before its numbers can be compared with screenshot runs.
 
 ### M2. Per-frame breakdown: guest CPU, driver, GPU, wait, present
 
-- **Evidence (corrected 2026-10-02):** the always-on `[perf-alarm]` ledger already measures most of
-  these stages as per-window totals (`GpuWaitGraphics`/`GpuWaitCompute` fence waits, GPU device time
-  from a timestamp pair inside them, `PresentCpu`, `FrontendBuild`, `ShaderCompile`, `PipelineCreate`,
-  `SurfaceReadback`, `HleBlockingWait`), and `PROSPER_PERF_ALARM_LOG` writes them per window. What was
-  missing was one run-level answer to "where does the frame budget go". An earlier version of this
-  item said the stages were not measured; that was wrong.
+- **Evidence (rechecked 2026-10-04):** the always-on `[perf-alarm]` ledger measures selected costs
+  (`GpuWaitGraphics`/`GpuWaitCompute` fence waits, GPU device time from timestamp pairs inside them,
+  `PresentCpu`, `FrontendBuild`, `ShaderCompile`, `PipelineCreate`, `SurfaceReadback`,
+  `HleBlockingWait`). `PROSPER_PERF_ALARM_LOG` now includes both per-window aggregates and opt-in
+  per-flip deltas from those existing counters. It does not cover all CPU work or all GPU work.
 - **Design:** per frame, numeric `cpu_ms` (guest until submit), `rec_ms` (driver record/submit),
   `gpu_ms` (timestamp queries around the frame's submits, converted with `timestampPeriod`; omitted when
   the queue lacks timestamp support), `wait_ms` (blocked on a fence), `present_ms`; plus per-frame
@@ -227,15 +235,15 @@ pass-local offset (graphics), the guest program address and a pipeline hash. D5 
 - **Acceptance:** conversion and schema unit-tested with a synthetic clock; a software-device test that
   a submit yields a `gpu_ms`; harness-forced readback is flagged in the record (rule 7).
 - **Out of scope here:** per-pass timelines (M4).
-- **Status (run-level slice landed):** the exit summary now prints an `observer=frame-breakdown` line:
-  achieved flip interval against the budget, then per flip the summed thread time of each cost with
-  events, largest first, GPU device time against how many waits carried a timestamp pair, and the costs
-  that recorded nothing. **It is not the per-frame partition the design above asks for, and cannot be
-  built from the ledger:** the render, executor and present threads run concurrently and each cost is
-  summed thread time, so the figures can exceed the frame together. A true per-frame record
-  (`cpu_ms`/`rec_ms`/`gpu_ms`/`wait_ms`/`present_ms` that add up) needs per-frame timestamps taken on
-  one timeline, which does not exist yet. `VK_EXT_calibrated_timestamps` correlation and the per-frame
-  series are **not done**.
+- **First per-flip slice in this change:** when JSONL is enabled, each guest-flip callback writes
+  its interval, deltas for the existing cost scopes and event counts, plus GPU device-time deltas and
+  timestamp-pair counts. A scope is charged to the flip interval in which it completes; snapshots
+  use independent relaxed loads. Stage times are summed thread time and can overlap, so the record
+  is an attribution aid, not an additive budget partition. It adds no new clock reads or file I/O
+  when JSONL is disabled. Each opt-in record is flushed and may perturb the diagnostic run. The exit
+  summary still prints run-level totals. **Still missing:** complete
+  guest CPU and driver-recording coverage, a common CPU/GPU timeline, calibrated timestamp
+  correlation, and a full record whose fields are proven to describe the same frame population.
 
 ### M3. Run metadata and baseline compare with refusal
 
