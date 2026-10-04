@@ -7,10 +7,12 @@ The canonical-EXEC correction improved this to50PASS/5FAIL and exposed two warm-
 The subsequent cache/fixture correction reached53PASS/2FAIL. Authentic shared-registration and
 physical-profile fixture corrections now reach **55/55 actual focused CPU cases PASS,
 CTest0/helper0**: the first passing four-PE focused baseline, NOT the full helper campaign.
-The newer integrated connected run reaches **96/99PASS:89/92 CPU,7/7 Vulkan; CTest8/helper1**.
+The first integrated connected run reached **96/99PASS:89/92 CPU,7/7 Vulkan; CTest8/helper1**.
+The diagnostic-contract correction now reaches **99/99PASS:92/92 CPU,7/7 Vulkan;
+CTest0/helper0** at exact997243e7. It has scoped independent source clearance, not whole-PR approval.
 The original saved-live/WQM/DS helper-pixel oracle actually passes on the Windows RTX4090 at
-16->15->16 widths. Three CPU diagnostic-contract failures and three connected production review
-findings remain; no whole-source approval or passing full acceptance baseline.
+16->15->16 widths. Three connected production review findings remain; two separate SOURCE-ONLY
+correction branches are retained below. No whole-source approval or passing full acceptance baseline.
 General Wave64 and Kena title-screen 3D are
 NOT complete. No current Kena drop census, FPS improvement or title-screen rendering result was
 measured in this checkpoint. The original work was frozen at the maintainer's checkpoint request;
@@ -474,7 +476,8 @@ separately logs terminal`pc=N reason=TAG`. Actual wait/overwrite/legacy refusals
 unknown topology refuses earlier at WQMpc1, not the assumed DSpc2. Preserve both reason and
 actual-site assertions by checking the terminal diagnostic with a nonzero observation-only
 identity, and retain empty artifacts/positive controls. Do not merely remove PC assertions or
-change the established public reason-string contract. These corrections are NOT implemented.
+change the established public reason-string contract. These corrections were NOT implemented in
+this aab7 cohort; the subsequent exact9972 correction and new receipts are recorded below.
 
 NEW reviewed apparatus `.codex/issue-4235-helper-connected-native-20261004.ps1` SHA256
 `11c91d8f47ee35a924e40a4a65a57ca8352487072a4888e6410deb5aa58e9af9`, derived UTF8 source SHA256
@@ -528,6 +531,59 @@ All three are in the UNMERGED helper slice, not newly verified main behavior. Fu
 input/system/M0/SMEM/resources/control/export scope and the historical0/32 original frontier still
 apply. Do not merge the draft on seven passing Vulkan cases or substitute a position-only goal.
 
+## Latest verified correction and parked source branches
+
+Exact executed source `997243e7800c4c1c059f64c2e0fae65638ca11a5`, parent
+`8db1cb7fdd8387b360db01d5513011d71945442c`, tree
+`cb3625611582f266d0a2e14f69d0c8a7a8e466b8`, changes only the quad-swizzle test (+38/-11).
+It asserts bare reasons, freshly captured terminal tag/PC/payload, nonzero observation-only
+identity and all three empty output artifacts. Genuine branch-through-wait and overwrite-after-
+wait peers also compile. SAME reviewer reports scoped SOURCE-CLEAR/no findings; actual incoming
+9b2f->0cf seven-path test/CMake range is applicability-clear, not executed neighbor coverage.
+
+Normal merge8db integrates `0cf6760452106caac973e71cadeecdc316dfce7b`: #4390/#4396/#4401
+test/CMake corrections, no conflicts,
+instructions match. The exact source above subsequently configured/built/certified all ten PEs
+and executed all99 unique names: **92CPU PASS +7Vulkan PASS; CTest0/helper0;4.65s**. ROOT independently
+joined99 full UTF8 bodies to LastTest with CRLF-to-LF only, checked all ten current PE hashes,
+and read the three corrected bodies plus actual16x12->15x12->16x12 helper transaction body.
+No failures/errors/skips/timeouts/wrong bodies. APP313/process0 unchanged; no app/DLL/game build.
+SDK legality and production omission/restoration campaigns remain UNEXECUTED.
+
+```powershell
+& '<REPO_ROOT>/.codex/issue-4235-helper-connected-native-20261004.ps1' -SourceHead 997243e7800c4c1c059f64c2e0fae65638ca11a5 -SourceParent 8db1cb7fdd8387b360db01d5513011d71945442c -SourceTree cb3625611582f266d0a2e14f69d0c8a7a8e466b8 -Cohort diagnostic-contracts -ExecuteNativeProof
+```
+
+Raw receipts: `.codex/issue-4235-native-20261004/997243e7-diagnostic-contracts/`.
+Unchanged reviewed runner SHA11c91d8f above; exact derived UTF8 source SHA256
+`9333d4846849ab3799fa0a8ddb477bc3b8f0a32e012b04d2c740f67f0fe96b39`.
+Native handle is terminal0; no live process or pending native work. #4402 is corrected in the
+unmerged draft, not closed on main. Documentation successors receive no new executable credit.
+
+Two source agents committed separate public correction checkpoints at the maintainer's latest
+quota checkpoint request. **Neither is integrated into this draft's executed source, independently
+reviewed, compiled, discovered or executed.** Source gates alone are not acceptance:
+
+- #4398: [8e0f2064](https://github.com/mattias800/prosper/commit/8e0f2064dcf21ab948d3a78cee32df15c09ded16),
+  branch `fix/issue-4398-collector-geometry`, parent8db, tree
+  `9b085eeadf699e67fa5c2e241e5a4dcfed749951`; six paths +374/-10. Attempts retained actual GS
+  stage/device/limit/interface/effect/lifetime wiring plus separate
+  `FragmentCollectorGeometry.ActualCenterIjProducerSurvivesHelperPackingAndOrderedReplay`
+  in `test_fragment_collector_geometry`. Existing bounded diagnostic supplies a numerical
+  center-IJ/POS witness, with normal16/15/16 attachment pixel assertions; no callback seam.
+- #4399: [ef87c026](https://github.com/mattias800/prosper/commit/ef87c026a96666dc680eeea1845f82e9fae2f900),
+  branch `fix/issue-4399-derived-geometry`, parent9972, tree
+  `f3e976027391a331954c825caa76b67e34945ede`; five paths +279/-6. Attempts weak immutable
+  producer/profile-keyed GS residence while keeping fresh per-draw launch authority. Two new
+  `DerivedInterpolationGeometry` cases in `test_derived_interpolation_geometry` cover17 real
+  nonempty-GS observations and changed source/layout/transport. All these cases are UNEXECUTED.
+
+Latest ROOT-fetched main is `a524d233f9d8522add93dc7ead21e95509339a23`, NOT integrated;
+the intervening15 commits include real decoder/ALU changes. Do not call9972 current-main evidence.
+Resume by inspecting/integrating those deltas, independently reviewing both source attempts,
+then extending actual registration/certification and running new numerical/production controls.
+#4397 still has no correction. All three production issues remain open; CI remains waived, not green.
+
 ## Objective and acceptance boundary
 
 Implement accurate, general guest Wave64 on hosts without native Wave64. Kena's title-screen 3D
@@ -546,7 +602,9 @@ input/audio and25% volume. A screenshot/pixel oracle must come from the normal W
 
 | State | Exact identity | Evidence/status |
 | --- | --- | --- |
-| Latest fetched/integrated main | `9b2f0681772ad70972233244868010db0ffc8af8` | #4386 adds decoder tests/CMake only; integrated at aab7 and included as source in99-case cohort. Its standalone nine-case decoder target was NOT executed. |
+| Latest fetched main, NOT integrated | `a524d233f9d8522add93dc7ead21e95509339a23` | Fifteen commits after the executed source's integrated0cf; decoder/ALU/diagnostic deltas require fresh applicability review and execution. |
+| Latest integrated main | `0cf6760452106caac973e71cadeecdc316dfce7b` | #4390/#4396/#4401 test/CMake range, integrated at8db before9972's99/99. Additional standalone decoder targets are NOT in that cohort. |
+| Earlier connected main | `9b2f0681772ad70972233244868010db0ffc8af8` | #4386 decoder tests/CMake only; integrated at aab7's96/99. Its standalone nine-case decoder target was NOT executed. |
 | Earlier main integrated by8819 | `ee9dcb1e1e2c695426acb25575e7c6c320971d1d` | #4382 changed two scalar-bank/ordered-producer fixture files; integrated at4b4a8ba6. The8819 focused CPU receipt belongs to this earlier source, not aab7. |
 | Accepted main integrated by helper | `3fe269ef0d035a46baee750af30b6a0004d4f7b0` | Includes merged #4374. |
 | Frozen helper CODE head | `3fcb2d181367505ebb5672e8d3cfe2b98396baed` | Parent `59995895857475b9971658ba7bacacd526b6c444`; tree `a75d5db570e7a47e597de52d77c343417273b4c6`. Source-only, partial review. Later checkpoint-document commits do not provide native credit. |
@@ -727,8 +785,8 @@ run `python3 prosper/tools/session_start.py` at session start/after worktree cha
 machine the Store python3 alias may fail; real Python312 is available as `python`/`py -3.12`.
 Fetch in your own worktree, inspect current-main instructions/deltas and preserve others' trees.
 
-1. Continue from exact aab7's FAILED99/10 connected baseline with seven passing Vulkan cases.
-   Correct #4402 to preserve reason AND actual terminal-PC assertions, then implement the real
+1. Continue from exact9972's passing99/10 baseline, retaining aab7's failures. #4402 is corrected;
+   integrate/review the parked #4398/#4399 SOURCE-ONLY branches and newer main, then implement the real
    generated-GS producer/caching and color-control contracts in #4397/#4398/#4399 with genuine
    programmed/register-owned controls. Do not weaken ownership, substitute zero/default words
    or turn this temporary position-only proof frontier into permanent policy. SAME reviewer
@@ -767,13 +825,14 @@ committed or downloaded by a fresh clone, whereas source and this document are i
 | `.codex/issue-4235-native-20261004/cae82d77-launch-authority/` | Actual four-PE strict certificate and55 cases53PASS/2FAIL after checked launch availability partitions both cache paths and real high-word fixture correction; remaining owner/profile failures, no GPU/SDK/production-control acceptance. |
 | `.codex/issue-4235-native-20261004/8819e5c4-fixture-owners-profile/` | First actual focused55/55 CPU PASS and four strict PE certificates after authentic shared-registration/physical-profile fixture corrections; full graph/discovery/bodies/hashes retained. NOT full helper/GPU/SDK/production-control or Kena acceptance. |
 | `.codex/issue-4235-native-20261004/aab7ac2d-connected-baseline/`, `.codex/issue-4235-helper-connected-native-20261004.ps1` | Actual99/10 strict native cohort96PASS/3FAIL;89/92CPU and7/7Vulkan with real4090 helper pixels. New classifier/cals source-reviewed; raw certs/hashes/full bodies/failures retained. No SDK/production-controls or full-source approval. |
+| `.codex/issue-4235-native-20261004/997243e7-diagnostic-contracts/` | Actual99/99 PASS,92CPU+7Vulkan, ten strict certificates; corrected reason/site tests. New companion source branches and later documentation are NOT certified by it. |
 | `.codex/issue-4378-native-20261004/215ee6d2-baseline/` | Actual failed native configure/graph/build/certs/registration/JUnit/LastTest/observed.json. |
 | `.codex/issue-4378-cpu-native-20261004.ps1` | Reviewed ROOT-only70/12 helper, SHA256 `4df72940d6492ca983eb84996ada823686ce0f04c68fd1dc8196c5f765554695`; requires exact clean H/P/T and NEW cohort name. |
 | `.codex/issue-4378-source-freeze-215ee6d2-20261004.txt`, held-scope v1/v2 and handoff | Windows source-gate/history, not a passing native result. |
 | `.codex/issue-4322-native-20261004/9e595b11-final-tool/` | Accepted exact9e CPU60 receipts. |
 | `.codex/issue-4322-observation-native-20261004/9e595b11-final-tool/` | Accepted exact9e GPU17/observations receipts. |
 | `.codex/issue-4322-spv-native-20261004/9e595b11-final-corrected/` | Accepted exact9e585 actual modules/validator evidence. |
-| `.codex/worktrees/wave64-followthrough-20261002` | ROOT own central worktree; sole retained `prosper/build-flags-native-clang`. Latest ten requested PEs are linked/certified aab7; unrelated retained binaries keep their older identities. Native receipts do not certify later documentation/source successors. |
+| `.codex/worktrees/wave64-followthrough-20261002` | ROOT own central worktree; sole retained `prosper/build-flags-native-clang`. Latest ten requested PEs are linked/certified9972; unrelated retained binaries keep their older identities. Native receipts do not certify later documentation/source successors. |
 | `.codex/worktrees/fragment-launch-composition-20261004` | Source-only helper author tree, clean3fcb at freeze, no builds. |
 | `.codex/worktrees/refused-shader-paths-20261004` | Removed after clean/ignored-path census, author acknowledgement and exact remote215 verification; no build or raw receipts deleted. Recreate an owned tree from draft #4383 if resuming. |
 
@@ -782,5 +841,6 @@ finished owned source-only worktrees after clean/ignored-path census and author 
 using unforced `git worktree remove` on validated exact paths. Retain the one central build and
 failed evidence. Never delete shared/user trees or recursively erase the workspace. The Windows
 source-only tree was safely removed after the original freeze; the helper author tree remains.
-Source-review agents perform no native builds. Both follow-ups now have focused CPU and bounded
-helper GPU evidence, not full accepted helper fixes or general Wave64/Kena rendering acceptance.
+Source-review agents perform no native builds. The helper follow-up has focused CPU and bounded
+GPU evidence; the Windows-path follow-up has a failed CPU baseline and NO GPU evidence. Neither
+establishes full accepted fixes or general Wave64/Kena rendering acceptance.
