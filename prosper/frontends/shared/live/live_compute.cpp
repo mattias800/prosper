@@ -962,16 +962,6 @@ bool backend_uses_2d_array(const prosper::gpu::ShaderResource& resource) {
            (resource.depth_compare || resource.depth > 1 || resource.layer_stride_bytes != 0);
 }
 
-uint16_t storage_pack_unorm16(uint32_t float_bits) {
-    float value;
-    std::memcpy(&value, &float_bits, sizeof(value));
-    if (!(value > 0.0f)) return 0; // Includes negative values and NaN.
-    if (value >= 1.0f) return UINT16_MAX;
-    const float scaled = value * 65535.0f;
-    const uint32_t whole = static_cast<uint32_t>(scaled);
-    return static_cast<uint16_t>(whole + (scaled - static_cast<float>(whole) >= 0.5f));
-}
-
 template <typename T>
 T storage_pack_snorm(uint32_t float_bits, int32_t positive_max) {
     float value;
