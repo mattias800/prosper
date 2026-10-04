@@ -10338,7 +10338,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     if (std::any_of(draws.begin(), draws.end(),
                     [](const BackendDraw& draw) { return bool(draw.fragment_draw_inputs); }))
         fragment_draw_batch =
-            std::make_shared<FragmentDrawBackendBatch>(ctx, draws, W, H, color_count, flush_now);
+            std::make_shared<FragmentDrawBackendBatch>(ctx, draws, W, H, color_count);
     // Preserve the frontend's exact descriptor order while borrowing either the complete resource or
     // its compact buffer-only carrier. The references are synchronous: every pointed-to vector belongs
     // to `draws`, which outlives this call. Synthetic GDS entries are owned alongside these views.
@@ -13495,6 +13495,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         readback_requested || storage_writeback_requested;
     const bool flush_now = !submission_batch || synchronous_results_requested ||
                            flush_submission_batch;
+    if (fragment_draw_batch && flush_now)
+        fragment_draw_batch->prepare_completed_observations(std::span<const DV>(dv));
     // Attributed in the same order the condition above evaluates, so exactly one bucket is charged
     // per flush and their sum is the flush count -- the arithmetic a reader will check first.
     uint64_t flush_reason_no_batch = 0, flush_reason_readback = 0;

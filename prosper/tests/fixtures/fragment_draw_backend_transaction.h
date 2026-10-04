@@ -14,8 +14,7 @@ inline FragmentDrawBackendStats& fragment_draw_backend_stats() {
 class FragmentDrawBackendBatch {
 public:
     FragmentDrawBackendBatch(const RenderVkCtx& context, std::span<const BackendDraw> draws,
-                             uint32_t width, uint32_t height, uint32_t colors,
-                             bool completed_observation = false)
+                             uint32_t width, uint32_t height, uint32_t colors)
         : context_(&context), width_(width), height_(height), states_(draws.size()) {
         bool readonly_pass_checked = false, readonly_pass = false;
         for (size_t index = 0; index < draws.size(); ++index) {
@@ -147,8 +146,9 @@ public:
                 refuse(state, draw, transaction.rejection());
                 continue;
             }
-            const bool observe =
-                completed_observation && fragment_draw_observation_enabled() && index < 8;
+            // The normal flush decision is made only after resource realization. Prelease the
+            // opt-in usage here; staging/copy/readback remain absent until that decision is true.
+            const bool observe = fragment_draw_observation_enabled() && index < 8;
             state.owner =
                 FragmentDrawGpuOwner::create(context, std::move(transaction), rejection, observe);
             state.compute = FragmentDrawComputeGpuProgram::acquire(context, program, rejection);
@@ -160,8 +160,6 @@ public:
                                          : rejection);
                 continue;
             }
-            if (observe)
-                state.observation = FragmentDrawGpuObservation::create(context, state.owner, index);
             state.replay = std::make_unique<BackendDraw>(draw);
             auto& replay = *state.replay;
             replay.fs.clear();
@@ -214,6 +212,18 @@ public:
                                                    *state.owner, state.sets) &&
                allocate_fragment_draw_collect_set(context_->dev, pool, *state.collect, *state.owner,
                                                   state.collector_set);
+    }
+    // Called only after the existing real flush_now decision, before command recording. Deferred
+    // batches never allocate observation staging, record a copy, read a plane or add a wait.
+    template <class Draw>
+    void prepare_completed_observations(std::span<const Draw> draws) {
+        if (!fragment_draw_observation_enabled()) return;
+        for (size_t index = 0; index < std::min(states_.size(), size_t(8)); ++index) {
+            auto& state = states_[index];
+            if (state.replay && state.owner && draws[index].ok && !state.observation)
+                state.observation =
+                    FragmentDrawGpuObservation::create(*context_, state.owner, index);
+        }
     }
     template <class Draw>
     void record(VkCommandBuffer command, std::span<const Draw> draws) const {
