@@ -1266,6 +1266,15 @@ jobs:
       - name: Build prosper-app
         run: cmake --build prosper/build-app --target prosper-app
 
+      # Separate step, for the same reason as the Windows job's Vulkan-tools step: this is the only
+      # macOS job with Vulkan (MoltenVK) enabled, so it is the only one that compiles Vulkan-gated
+      # tools at all -- the `macos` job passes -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE. gpu_replay
+      # (the offline frame-replay tool) stopped compiling on macOS for days unnoticed: a `%zu` given
+      # a uint64_t in tests/fixtures/render_runner.h is an error under its -Werror=format on Darwin,
+      # where uint64_t is unsigned long long and size_t is unsigned long.
+      - name: Build macOS tools that only compile with Vulkan enabled
+        run: cmake --build prosper/build-app --target gpu_replay
+
       - name: ccache statistics
         if: always()
         run: ccache -s
