@@ -146,6 +146,7 @@ separate PRs afterwards.
 | 9 | `hle` -> `gpu`: a narrow AGC submission interface | hand design, then moves | `layer-include` (future: an `hle`/`gpu` row once the interface exists) |
 | 10 | `src/gpu/recompiler/gta5/` contracts generalized into properties of the shader/data | hand work | `title-dir` (cap 1,832 lines) |
 | 11 | `diagnostics` -> `gpu`/`frontends` helpers moved down into `diagnostics/` | `move_module.py` | `layer-include` |
+| 12 | extract the APR engine (command buffer model, executor, completion dialects) out of `hle/memory`, `hle/fs` and `hle/kernel` into a platform-neutral component in `src/guest/`, leaving `hle/` the NID handlers; it reaches the OS only through `src/host/platform/` interfaces. Needs moves 4 and 7 first. | `move_module.py` for the moves, then hand splitting for the shared state | `platform-ifdef`, `layer-include` |
 
 ## Bad practices and who owns each
 
@@ -170,21 +171,21 @@ Every structural cost identified in the ratchet work is either a rule in
 
 ## Open questions
 
-Not settled by this document, and each needs the project owner before it becomes a move.
+Not settled by this document beyond what is stated below, and each needs the project owner before it becomes a move.
 
-- **Where does a cross-cutting HLE area live?** The target tree places layers, not functional areas.
-  APR (`sceAmpr*`, and the file reads and event-queue completions behind it) spans `hle/memory`,
-  `hle/fs` and `hle/kernel` today. Before any of it is extracted, decide which layer it belongs to
-  and which interface it uses to reach `gpu/`, since `hle` is the top of the include order.
-  **Recommendation, for the owner to accept or reject:** keep `hle/` as the API surface only (NID
-  handlers, argument decoding, return codes) and put the engine behind it in `guest/`: the command
-  buffer model, the executor and the completion dialects, written once and platform-neutral, reaching
-  the OS only through `src/host/platform/` interfaces (`vm`, `file`, `clock`). It implements guest-visible
-  coprocessor semantics rather than a Sony API, which is what the proposed `guest/` layer is for, and it
-  is the usual split in compatibility layers (Wine's per-platform backend behind a portable service,
-  HLE service handlers over a shared emulated-hardware core in console emulators). The handlers then
-  have no platform arm to fall behind. `CONFIDENCE: MED`: this follows the document's own layering and
-  the seam's one-interface-per-service rule, but no APR code has been moved to test it.
+- **Where does a cross-cutting HLE area live? Placement, as proposed here (planned move 12).** The
+  target tree places layers, not functional areas, and APR (`sceAmpr*`, and the file reads and
+  event-queue completions behind it) spans `hle/memory`, `hle/fs` and `hle/kernel` today. Keep `hle/` as
+  the API surface only (NID handlers, argument decoding, return codes) and put the engine behind it in
+  `guest/`: the command buffer model, the executor and the completion dialects, written once and
+  platform-neutral, reaching the OS only through `src/host/platform/` interfaces (`vm`, `file`,
+  `clock`). The engine implements guest-visible coprocessor semantics rather than a Sony API, which is
+  what the proposed `guest/` layer is for, and the split is the established one in compatibility layers
+  (Wine's per-platform backend behind a portable service; HLE service handlers over a shared
+  emulated-hardware core in console emulators). The handlers then have no platform arm to fall behind.
+  This follows the document's own layering and the seam's one-interface-per-service rule. It is a
+  proposal like the rest of the target tree, so it waits on the owner approving the `guest/` layer
+  (moves 4 and 5); no APR code has been moved to test it. `CONFIDENCE: MED`.
 - **What keeps two platform arms in step?** `HOST_PLATFORM_SEAM.md` asks for a test per interface
   that runs on both hosts, but nothing detects a platform arm that was never ported. One possible
   guard is a differential test that feeds the same recorded command-buffer stream to both hosts and
