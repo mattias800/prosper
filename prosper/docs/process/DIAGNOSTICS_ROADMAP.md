@@ -241,7 +241,7 @@ pass-local offset (graphics), the guest program address and a pipeline hash. D5 
   use independent relaxed loads. Stage times are summed thread time and can overlap, so the record
   is an attribution aid, not an additive budget partition. It adds no new clock reads or file I/O
   when JSONL is disabled. Per-run constants are written once as a `frame_schema` record, and the
-  sampled `texture-ref-sample` cost is left out. Each record (~600 bytes per flip) is flushed and may
+  sampled `texture-ref-sample` cost is left out. Each record (~560 bytes per flip) is flushed and may
   perturb the diagnostic run. The exit
   summary still prints run-level totals. **Still missing:** complete
   guest CPU and driver-recording coverage, a common CPU/GPU timeline, calibrated timestamp

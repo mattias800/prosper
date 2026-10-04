@@ -19,7 +19,7 @@
 //     timestamp counters. Scope time is summed thread time, attributed when the scope completes; the
 //     categories overlap and are not a partition of the frame. Frame records are not separately
 //     opted into: whoever sets the log gets one line per guest flip (~560 bytes), i.e. roughly
-//     130 MiB/hour at 60 flips/s and ~390 MiB/hour at 180, against one window line per 5 s, and
+//     115 MiB/hour at 60 flips/s and ~345 MiB/hour at 180, against one window line per 5 s, and
 //     each line is flushed on the flipping thread -- these are diagnostic runs, and the file I/O
 //     may perturb performance. Without the JSONL path no frame-record sampling or file I/O
 //     happens. A failed flush closes the whole JSONL log (alarm, window and frame records).

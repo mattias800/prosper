@@ -217,8 +217,8 @@ summed thread time charged when a scope completes, and the fields are independen
 deltas. They can overlap and are not an additive frame-budget partition; the GPU fields are
 durations from the existing timestamp pairs and include their pair counts. `texture-ref-sample` is
 left out of the frame record (it is timed 1 in 32), as it is from the exit summary. Frame records
-are not separately opted into: setting the log turns them on, at one ~600-byte line per guest flip
-(roughly 130 MiB/hour at 60 flips/s, ~390 MiB/hour at 180), each flushed on the flipping thread, so
+are not separately opted into: setting the log turns them on, at one ~560-byte line per guest flip
+(roughly 115 MiB/hour at 60 flips/s, ~345 MiB/hour at 180), each flushed on the flipping thread, so
 file I/O can perturb the run and the file belongs on real disk. A failed flush closes the whole
 JSONL log, alarm and window records included. Under
 `prosper-app --fps` the HUD adds one `! alarm: <rules>` line while a rule is active in the latest
