@@ -922,32 +922,35 @@ uint64_t shader_analysis_cache_limit_bytes() {
     return std::min<uint64_t>(mib, 1024ull) * 1024 * 1024;
 }
 
+std::shared_ptr<ShaderCodeAnalysis> make_shader_code_analysis(const uint32_t* code,
+                                                             size_t dwords) {
+    auto result = std::make_shared<ShaderCodeAnalysis>();
+    result->identity = ++g_next_shader_analysis_identity;
+    result->source_dwords = dwords;
+    const size_t span = shader_source_code_span(code, dwords);
+    result->bounded_span = span < dwords;
+    if (code && span) result->code.assign(code, code + span);
+    result->code_hash = hash_shader_code(result->code);
+    // All code facts describe this immutable byte version, never a second read from guest VA.
+    const uint32_t* owned_code = result->code.empty() ? nullptr : result->code.data();
+    result->pcrel_dispatch = rdna2_pcrel_dispatch_info(owned_code, result->code.size());
+    result->fragment_color_export_mask =
+        fragment_color_export_mask(owned_code, result->code.size());
+    result->packet_vgpr_requirements = fragment_packet_vgpr_requirements(result->code);
+    result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
+                    static_cast<uint64_t>(result->pcrel_dispatch.target_pcs.size()) *
+                        sizeof(uint32_t) +
+                    static_cast<uint64_t>(result->pcrel_dispatch.setup_pcs.size()) *
+                        sizeof(uint32_t);
+    result->bytes +=
+        result->packet_vgpr_requirements.retained_bytes() + sizeof(result->refused_shader_memo);
+    return result;
+}
+
 std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint32_t* code,
                                                                       size_t dwords) {
     dwords = shader_source_dwords(uint64_t(uintptr_t(code)), dwords);
-    auto analyze = [&] {
-        auto result = std::make_shared<ShaderCodeAnalysis>();
-        result->identity = ++g_next_shader_analysis_identity;
-        result->source_dwords = dwords;
-        const size_t span = shader_source_code_span(code, dwords);
-        result->bounded_span = span < dwords;
-        if (code && span) result->code.assign(code, code + span);
-        result->code_hash = hash_shader_code(result->code);
-        // All code facts describe this immutable byte version, never a second read from guest VA.
-        const uint32_t* owned_code = result->code.empty() ? nullptr : result->code.data();
-        result->pcrel_dispatch = rdna2_pcrel_dispatch_info(owned_code, result->code.size());
-        result->fragment_color_export_mask =
-            fragment_color_export_mask(owned_code, result->code.size());
-        result->packet_vgpr_requirements = fragment_packet_vgpr_requirements(result->code);
-        result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
-                        static_cast<uint64_t>(result->pcrel_dispatch.target_pcs.size()) *
-                            sizeof(uint32_t) +
-                        static_cast<uint64_t>(result->pcrel_dispatch.setup_pcs.size()) *
-                            sizeof(uint32_t);
-        result->bytes +=
-            result->packet_vgpr_requirements.retained_bytes() + sizeof(result->refused_shader_memo);
-        return result;
-    };
+    auto analyze = [&] { return make_shader_code_analysis(code, dwords); };
 
     if (!code || !dwords) return analyze();
     auto& cache = shader_analysis_cache();
