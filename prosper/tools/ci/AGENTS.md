@@ -22,8 +22,9 @@ usage, whether a PR is safe to merge.
 - **`check_arch_ratchet.py`** + `arch_ratchet_baseline.txt` — a ratchet over costs every title
   pays: title ids and title-named directories in shared code, raw `getenv` reads, blocking GPU syncs
   (`vkWaitForFences`, `*WaitIdle`, `ALL_COMMANDS` barriers), files over 5,000 lines, and
-  `prosper::test::` in the shipping frontend; and four structural ones: host-platform `#if`s
-  outside `src/host` (`platform-ifdef`, seam: `docs/architecture/HOST_PLATFORM_SEAM.md`), includes against the
+  `prosper::test::` in the shipping frontend; and five structural ones: host-platform `#if`s
+  outside `src/host` (`platform-ifdef`, seam: `docs/architecture/HOST_PLATFORM_SEAM.md`), `HLE(*_stub)` platform-arm
+  handlers (`platform-stub`, a name-based proxy), includes against the
   layer order (`layer-include`, `LAYER_ORDER` in the checker; `docs/architecture/ARCHITECTURE_TARGET_TREE.md`),
   frontends including `tests/fixtures/` (`fixture-include`), and Vulkan object-creation call sites
   (`vk-object`). The practice -> rule table, including what is not mechanically checkable yet
