@@ -16,29 +16,42 @@
 
 namespace prosper::gpu {
 namespace {
-bool coupled_read_only(const GraphicsReadSource& source, uint64_t address,
-                       ShaderProgramStage stage) {
+const char* coupled_read_only_gap(const GraphicsReadSource& source, uint64_t address,
+                                  ShaderProgramStage stage) {
     const auto& effects =
         stage == ShaderProgramStage::Fragment ? source.fragment_effects : source.vertex_effects;
     const auto* header = source.header_snapshot.get();
     const uint32_t type = stage == ShaderProgramStage::Fragment ? 1u : 2u;
-    if (!source.words || !source.decoded || !effects || !source.native_analysis ||
-        !source.registered_header || !header || header->type != type ||
-        reinterpret_cast<uint64_t>(header->code) != address || !header->shader_size ||
-        (header->shader_size & 3u) ||
+    if (!source.words || !source.decoded) return "original-source-unavailable";
+    if (!source.registered_header || !header) return "registered-header-unavailable";
+    if (header->type != type) return "registered-stage-mismatch";
+    if (reinterpret_cast<uint64_t>(header->code) != address)
+        return "registered-code-address-mismatch";
+    if (!header->shader_size || (header->shader_size & 3u) ||
         source.decoded->source_dwords != header->shader_size / sizeof(uint32_t) ||
-        source.words->size() != source.decoded->source_dwords ||
-        prosper_agc_shader_continuation_for_code(address) ||
-        prosper_agc_fused_back_header_for_front(address) ||
-        !source.native_analysis->belongs_to(source.decoded) ||
-        source.words.get() != &source.decoded->code || source.words.owner_before(source.decoded) ||
-        source.decoded.owner_before(source.words) || source.words.owner_before(effects) ||
-        effects.owner_before(source.words))
-        return false;
+        source.words->size() != source.decoded->source_dwords)
+        return "registered-complete-code-extent-unproved";
+    if (prosper_agc_shader_continuation_for_code(address) ||
+        prosper_agc_fused_back_header_for_front(address))
+        return "registered-continuation-or-fused-stage-unproved";
+    if (!source.native_analysis || !source.native_analysis->belongs_to(source.decoded))
+        return "original-native-analysis-association-unproved";
+    if (!effects || source.words.get() != &source.decoded->code ||
+        source.words.owner_before(source.decoded) || source.decoded.owner_before(source.words) ||
+        source.words.owner_before(effects) || effects.owner_before(source.words))
+        return "original-effects-owner-association-unproved";
     const uint32_t index = stage == ShaderProgramStage::Fragment ? 1u : 0u;
-    return effects.get() == &source.decoded->original_effects[index] &&
-           effects->source_words == source.words.get() && effects->stage == stage &&
-           effects->known_read_only();
+    if (effects.get() != &source.decoded->original_effects[index] ||
+        effects->source_words != source.words.get() || effects->stage != stage)
+        return "original-effects-stage-association-unproved";
+    if (!effects->known_read_only())
+        return effects->rejection.empty() ? "original-effects-architectural-end-unproved"
+                                          : effects->rejection.c_str();
+    return nullptr;
+}
+bool coupled_read_only(const GraphicsReadSource& source, uint64_t address,
+                       ShaderProgramStage stage) {
+    return !coupled_read_only_gap(source, address, stage);
 }
 bool ordinary_draw(const GpuState& state, const RenderState& render) {
     if (!render.es_addr || !render.ps_addr || render.gs_addr || render.hs_addr) return false;
@@ -191,9 +204,14 @@ OrderedGraphicsReadPointIssuer::issue_scalar(uint64_t submit, uint64_t order, co
         return reject("scalar-bank-current-stage-or-enable-domain-unproved");
     auto vertex = registered_graphics_read_source(render.es_addr);
     auto fragment = registered_graphics_read_source(render.ps_addr);
-    if (!coupled_read_only(vertex, render.es_addr, ShaderProgramStage::Vertex) ||
-        !coupled_read_only(fragment, render.ps_addr, ShaderProgramStage::Fragment))
-        return reject("scalar-bank-complete-original-effects-unproved");
+    for (const auto [source, address, stage, name] :
+         {std::tuple{&vertex, render.es_addr, ShaderProgramStage::Vertex, "vs"},
+          std::tuple{&fragment, render.ps_addr, ShaderProgramStage::Fragment, "ps"}})
+        if (const char* gap = coupled_read_only_gap(*source, address, stage)) {
+            // Cached code facts name the ORIGINAL stage/PC gap without rescanning warm code.
+            refusal = std::string("scalar-bank-") + name + ":" + gap;
+            return {};
+        }
     prosper::GuestMappingLease lease;
     std::vector<prosper::GuestDirectAllocation> current_outputs;
     if (!capture_outputs(state, render, lease, current_outputs))

@@ -4,6 +4,7 @@
 #include "gpu/execute/original_graphics_stage_effects.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "fixtures/fragment_scalar_bank_fixture.hpp"
 #include <gtest/gtest.h>
 
 namespace prosper::gpu {
@@ -53,6 +54,29 @@ TEST(OriginalGraphicsStageEffects, VertexBufferAndCorrectStageExportsRemainReadO
     EXPECT_FALSE(effects(fragment, ShaderProgramStage::Vertex).known_read_only());
     const std::vector<uint32_t> position{exp(12), 0x03020100, end};
     EXPECT_FALSE(effects(position).known_read_only());
+}
+
+TEST(OriginalGraphicsStageEffects, RegisteredProceduralVertexArithmeticKeepsCompleteReadOnlyFacts) {
+    prosper::register_builtin_hle();
+    const auto words = prosper::test::fragment_draw::vertex_words();
+    const auto* program = prosper::test::scalar_bank::register_original(true, words);
+    ASSERT_TRUE(program);
+    const auto address = reinterpret_cast<uint64_t>(program->code.data());
+    const auto source = registered_graphics_read_source(address);
+    ASSERT_TRUE(source.words);
+    ASSERT_TRUE(source.decoded);
+    ASSERT_TRUE(source.vertex_effects);
+    ASSERT_TRUE(source.header_snapshot);
+    EXPECT_EQ(*source.words, words) << "the complete unchanged registered original, not a utility";
+    EXPECT_EQ(source.header_snapshot->shader_size, words.size() * sizeof(uint32_t));
+    EXPECT_EQ(source.vertex_effects->source_words, source.words.get());
+    EXPECT_FALSE(source.words.owner_before(source.vertex_effects));
+    EXPECT_FALSE(source.vertex_effects.owner_before(source.words));
+    EXPECT_TRUE(source.vertex_effects->known_read_only()) << source.vertex_effects->rejection;
+    EXPECT_TRUE(source.vertex_effects->architectural_end);
+    EXPECT_EQ(source.vertex_effects->consumed_dwords, words.size());
+    EXPECT_FALSE(source.vertex_effects->guest_memory_reads);
+    EXPECT_FALSE(source.vertex_effects->attachment_exports);
 }
 
 TEST(OriginalGraphicsStageEffects, OriginalWriterCannotDisappearBehindReadOnlyMetadata) {

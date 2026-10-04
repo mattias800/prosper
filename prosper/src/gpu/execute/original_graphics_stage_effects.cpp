@@ -29,9 +29,14 @@ bool known_register_effects(const Rdna2Inst& in) {
             return in.opcode == kSopkOpcodeMovkI32 || in.opcode == kSopkOpcodeCmovkI32;
         case Rdna2Format::SOPC: return in.opcode <= 0x0f || in.opcode == 0x12 || in.opcode == 0x13;
         case Rdna2Format::VOP1:
-            return in.opcode == 1 || in.opcode == 2 || in.opcode == 0x2a || in.opcode == 0x2e ||
-                   in.opcode == 0x33;
-        case Rdna2Format::VOP2: return in.opcode == 3 || in.opcode == 8;
+            // CVT_F32_U32 (gfx10 opcode6) changes only the destination register/FP state.
+            return in.opcode == 1 || in.opcode == 2 || in.opcode == 6 || in.opcode == 0x2a ||
+                   in.opcode == 0x2e || in.opcode == 0x33;
+        case Rdna2Format::VOP2:
+            // ADD/MUL/SUB_F32, LSHRREV_B32 and AND_B32 are explicit register-only effects.
+            // Opcode identity is checked against the canonical ORIGINAL instruction below.
+            return in.opcode == 3 || in.opcode == 4 || in.opcode == 8 || in.opcode == 0x16 ||
+                   in.opcode == 0x1b;
         case Rdna2Format::VOP3:
             return in.opcode == 0x360 || in.opcode == 0x365 || in.opcode == 0x366;
         case Rdna2Format::VOPC:
