@@ -5316,6 +5316,22 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **Stage 2 alone restores the earlier 9–10 guest flips/s in the current normal-route bank
+  cohort** — falsified by the 2026-10-04 same-app OFF/ON → ON/OFF on frozen shipping main
+  `986174464`, using the visible native-Wayland normal app, immediate presentation and
+  `scripts/gta5/reach-performance-story.pad`. Capture-free closed windows certainly inside
+  600–780 s yielded OFF1/ON1/ON2/OFF2 **2.519318 / 2.580901 / 2.445593 / 2.591568 guest flips/s**
+  (34/33/32/33 windows). Ordered ON/OFF differences were **+2.44% / −5.63%**; host I/O `some`
+  stalls were **5.36 / 1.61 / 1.19 / 1.61%**, with no causal benefit or regression established.
+  The lever actually moved: ON1/ON2 recorded **6,201 / 5,823 deferred graphics waits**, versus
+  zero for OFF. All four arms exited 0; every Performance menu and bank/player/radar/status-bar
+  witness was manually inspected. Both settings retained **three fragment drops and one
+  compute/Wave64 skip per flip**. These are guest flips/s; freshly rendered FPS remains
+  **NO_DATA** without producer/delivery lineage. This result does not show that correctness
+  changes are wrong or that async submission caused the earlier slowdown. Stage 2 remains
+  **default OFF**, with cross-title qualification pending. Evidence: [#3948 actual ABBA](https://github.com/mattias800/prosper/issues/3948#issuecomment-5976895616),
+  [#3873 checkpoint](https://github.com/mattias800/prosper/issues/3873#issuecomment-5976895695).
+
 - **The startup guest-store fault requires #3987's shader changes** — falsified by a native
   MEMLOG boot on main `4e86ed4d4` without those changes (2026-10-01): the app exited 90 before
   a frame, after fixed BatchMap refusals, with the same HDD-streaming store fault at
