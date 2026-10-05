@@ -795,3 +795,14 @@ TEST(Pad, Contract) {
     }
 
 }
+
+TEST(Pad, VibrationQuirkAcknowledged) {
+    register_builtin_hle();
+    HleFn quirk = Hle::lookup(nid_hash("scePadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse"));
+    ASSERT_NE(quirk, nullptr) << "the quirk must be registered";
+    EXPECT_EQ(nid_hash("scePadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse"), "Yq0zOH7YNOM")
+        << "the registered NID is the export's hash";
+    // Output-only effector, same accept-but-don't-drive class as SetVibrationMode: acknowledged.
+    EXPECT_EQ(quirk(1, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(quirk(0, 0, 0, 0, 0, 0), 0u);
+}
