@@ -385,3 +385,49 @@ TEST(GapOpcodeRefusals, ImageLoadMipMultiLevelRefuses) {
                     "control: plain IMAGE_LOAD with identical fields", &multi_rt,
                     config);
 }
+
+// Fragment-stage twin of the arm above: the same multi-level IMAGE_LOAD_MIP
+// packet inside a fragment program (exporting its dst) must refuse, while the
+// plain IMAGE_LOAD sibling against the same multi-level table compiles. The
+// Stray live case is a fragment shader, so the pin has to exist for this
+// stage too rather than only where the compute shell exercises it.
+TEST(GapOpcodeRefusals, ImageLoadMipMultiLevelRefusesFragment) {
+    static const uint32_t w[2] = {0xf0043108u, 0x00050000u};
+    static const uint32_t plain[2] = {0xf0003108u, 0x00050000u};
+    static const uint32_t exp_mrt0[2] = {0xf800180fu, 0x03020100u};   // exp mrt0 v0-v3 done vm
+
+    auto table = [](uint32_t levels) {
+        ShaderResourceTable rt;
+        ShaderResource texture{};
+        texture.cls = ResourceClass::Texture;
+        texture.binding = 4;
+        texture.img_dim = 1;
+        texture.width = texture.height = 8;
+        texture.sgpr_base = 20;
+        texture.declared_mip_levels = levels;
+        rt.resources.push_back(texture);
+        return rt;
+    };
+    const std::vector<uint32_t> prologue = {
+        0x7e0002f0u,   // v_mov_b32 v0, 0.5
+        0x7e0202f0u,   // v_mov_b32 v1, 0.5
+        0x7e040281u,   // v_mov_b32 v2, 1 (nonzero mip)
+        0x7e0602f0u,   // v_mov_b32 v3, 0.5
+    };
+    const ShaderResourceTable multi_rt = table(2u);
+
+    auto with_export = [&](const uint32_t pkg[2]) {
+        std::vector<uint32_t> code = prologue;
+        code.push_back(pkg[0]);
+        code.push_back(pkg[1]);
+        code.push_back(exp_mrt0[0]);
+        code.push_back(exp_mrt0[1]);
+        code.push_back(kEndpgm);
+        return code;
+    };
+    EXPECT_TRUE(recompile_fragment(with_export(w).data(), prologue.size() + 5u, &multi_rt).empty())
+        << "fragment IMAGE_LOAD_MIP on a multi-level resource must refuse";
+    EXPECT_FALSE(
+        recompile_fragment(with_export(plain).data(), prologue.size() + 5u, &multi_rt).empty())
+        << "control: fragment plain IMAGE_LOAD with identical fields";
+}
