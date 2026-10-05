@@ -1363,10 +1363,30 @@ HLE(s_npent_skuflag) {
 // (0x...ff307), so the flag is a single byte (bool), NOT an int32 — a 4-byte write would clobber
 // 3 adjacent stack bytes. 0 = "no skip" is the inert default a retail console with no
 // notice-screen state reports. CONFIDENCE: MED (byte-sized out pinned live; value semantics LOW).
+// The Set/DisableAutoSet siblings below store into the same flag so a title round-trips what
+// it set instead of reading a hardwired 0 after asking for skip (read-your-writes).
+namespace {
+std::atomic<bool> g_noticeskip{false};
+std::atomic<bool> g_noticeskip_autoset{true};
+}   // namespace
 HLE(s_syss_noticeskip) {
     svc_log("sceSystemServiceGetNoticeScreenSkipFlag", a0,a1,a2,a3,a4,a5);
-    if (svc_ptrish(a0)) *(uint8_t*)PW(a0) = 0;
+    if (svc_ptrish(a0)) *(uint8_t*)PW(a0) = g_noticeskip.load() ? 1 : 0;
     return 0;
+}
+HLE(s_syss_set_noticeskip) {
+    svc_log("sceSystemServiceSetNoticeScreenSkipFlag", a0, a1, a2, a3, a4, a5);
+    g_noticeskip.store(true);
+    return 0;
+}
+HLE(s_syss_noticeskip_noautoset) {
+    svc_log("sceSystemServiceDisableNoticeScreenSkipFlagAutoSet", a0, a1, a2, a3, a4, a5);
+    g_noticeskip_autoset.store(false);
+    return 0;
+}
+HLE(s_syss_powertick) {
+    svc_log("sceSystemServicePowerTick", a0, a1, a2, a3, a4, a5);
+    return 0;   // keep-awake hint; nothing sleeps headless
 }
 
 // ===== libSceRandom ============================================================================
@@ -1505,7 +1525,11 @@ void register_service_hle() {
     R("sceWebBrowserDialogInitialize", s_ok);
     R("sceWebBrowserDialogTerminate", s_ok);
     R("sceUserServiceInitialize", s_ok);
+    R("sceUserServiceInitialize2", s_ok);
+    // PlatformPrivacyWs1 (userId, int* out): same deterministic-default family as the
+    // accessibility getters above — the caller reads a value instead of stack garbage.
     R("sceUserServiceTerminate", s_ok);
+    Hle::register_fn("D-CzAxQL0XI", (HleFn)s_user_int_out, "sceUserServiceGetPlatformPrivacyWs1");
     // pad -> hle_pad.cpp (register_pad_hle). mouse:
     R("sceMouseInit", s_ok);
     R("sceMouseOpen", s_open);
@@ -1578,6 +1602,11 @@ void register_service_hle() {
     Hle::register_fn("t2FvHRXzgqk", (HleFn)s_errdialog_status, "sceErrorDialogGetStatus");
     Hle::register_fn("WWiGuh9XfgQ", (HleFn)s_errdialog_status, "sceErrorDialogUpdateStatus");
     Hle::register_fn("3RQ5aQfnstU", (HleFn)s_syss_noticeskip, "sceSystemServiceGetNoticeScreenSkipFlag");
+    Hle::register_fn("Q3utJvma4Mo", (HleFn)s_syss_set_noticeskip,
+                     "sceSystemServiceSetNoticeScreenSkipFlag");
+    Hle::register_fn("8Lo6Zv94aho", (HleFn)s_syss_noticeskip_noautoset,
+                     "sceSystemServiceDisableNoticeScreenSkipFlagAutoSet");
+    Hle::register_fn("XbbJC3E+L5M", (HleFn)s_syss_powertick, "sceSystemServicePowerTick");
     Hle::register_fn("kvYEw2lBndk", (HleFn)s_live_streaming_init, "sceGameLiveStreamingInitialize");
     // libSceNpEntitlementAccess / libSceGameUpdate — observability (svc_log) with the real-console
     // "local init succeeds offline" return; follow-ups deliberately left unimplemented (see above).
