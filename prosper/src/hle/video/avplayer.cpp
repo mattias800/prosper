@@ -924,10 +924,11 @@ HLE(s_avp_stream_ok) { svc_log("sceAvPlayerStreamControl", a0,a1,a2,a3,a4,a5); r
 // Contracts from the shipped libSceAvPlayer sprx (testdata/sprx), not from a secondary table.
 // s32 sceAvPlayerSetTrickSpeed(handle, int32 speed) -- libSceAvPlayer export av8Z++94rs0: a NULL handle
 // answers 0x806a0001; speed 0, and any speed in -399..-1 or 1..399 other than 100, answers 0x806a0004;
-// any other speed is handed to the player. No trick-play backend exists (the media clock runs at wall
-// rate), so a valid speed other than 100 is accepted but NOT honoured -- logged once so the gap stays
-// visible. CONFIDENCE: HIGH on the refusals; MED on accepting every other speed (the inner setter's own
-// failure cases, answered 0x806a0002, are not modelled).
+// any other speed (100 included) is handed to an inner setter whose failure answers 0x806a0002, and
+// which fails unless the player has a ready source in a playable state. Modelled here as "no source ->
+// 0x806a0002"; the play-state half of that gate is not. No trick-play backend exists (the media clock
+// runs at wall rate), so a valid speed other than 100 is accepted but NOT honoured -- logged once so the
+// gap stays visible. CONFIDENCE: HIGH on the refusals and the source gate; MED on the state gate.
 HLE(s_avp_trickspeed) {
     svc_log("sceAvPlayerSetTrickSpeed", a0, a1, a2, a3, a4, a5);
     const int32_t speed = (int32_t)a1;
@@ -935,6 +936,7 @@ HLE(s_avp_trickspeed) {
     if (!a0 || g_avp.find(a0) == g_avp.end()) return 0x806a0001ull;
     if (speed == 0) return 0x806a0004ull;
     if (speed != 100 && speed > -400 && speed < 400) return 0x806a0004ull;
+    if (!g_avp.find(a0)->second.have_source) return 0x806a0002ull;
     if (speed != 100) {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true))

@@ -30,13 +30,20 @@ TEST(AvPlayerMisc, TrickSpeedRefusesTheSlowBand) {
     register_builtin_hle();
     HleFn init = Hle::lookup(nid_hash("sceAvPlayerInit"));
     HleFn trick = Hle::lookup(nid_hash("sceAvPlayerSetTrickSpeed"));
+    HleFn add = Hle::lookup(nid_hash("sceAvPlayerAddSource"));
     ASSERT_NE(init, nullptr);
     ASSERT_NE(trick, nullptr);
+    ASSERT_NE(add, nullptr);
     const uint64_t player = init(0, 0, 0, 0, 0, 0);
     ASSERT_NE(player, 0u);
 
     EXPECT_EQ(trick(0, 100, 0, 0, 0, 0), kInvalidParams) << "NULL handle";
     EXPECT_EQ(trick(0xDEADu, 100, 0, 0, 0, 0), kInvalidParams) << "foreign handle";
+    // Without a source the player's own setter fails, after the speed checks.
+    EXPECT_EQ(trick(player, 100, 0, 0, 0, 0), kOperationFailed) << "no source yet";
+    EXPECT_EQ(trick(player, 50, 0, 0, 0, 0), kInvalidSpeed) << "the speed is checked first";
+    static const char source[] = "/app0/does-not-exist-avplayer-trick.mp4";
+    ASSERT_EQ(add(player, addr(source), 0, 0, 0, 0), 0u);
     EXPECT_EQ(trick(player, 100, 0, 0, 0, 0), 0u) << "normal speed";
     EXPECT_EQ(trick(player, 0, 0, 0, 0, 0), kInvalidSpeed) << "speed 0";
     // Unity passes playbackSpeed * 100, so 0.5x and 2x arrive as 50 and 200: both refused.
