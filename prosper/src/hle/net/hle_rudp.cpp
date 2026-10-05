@@ -1,16 +1,19 @@
 // libSceRudp — reliable-UDP setup calls (sceRudpEnableInternalIOThread,
 // sceRudpSetEventHandler).
 //
-// Both were unregistered, so the dispatcher answered `0`. They are fire-and-forget setup with
-// no out-parameters: enabling an IO thread nobody schedules and registering a handler nothing
-// ever calls. prosper runs no network IO thread and delivers no RUDP events, so both are
-// acknowledged and nothing is stored. Signatures from the stub interface; NIDs via nid_hash
-// (no firmware entries for this library). The Init entry point keeps its portps5-internal
-// placeholder name and stays out: its Sony name is not evidenced anywhere.
-// CONFIDENCE: MED on the arities (single secondary source), HIGH that acknowledgement is safe
-// here (no outputs exist to lie about).
+// Both were unregistered, so the dispatcher answered `0`. They are setup calls with no
+// out-parameters: enabling an IO thread nobody schedules and registering a handler nothing ever
+// calls. prosper runs no network IO thread and delivers no RUDP events, so both are acknowledged
+// and nothing is stored. Both NIDs are in the 3.20 libSceRudp export set, and the contracts below
+// follow the shipped libSceRudp module.
+//
+// sceRudpInit (amuBfI-AQc4, also in the 3.20 set; ASTRO BOT imports it) stays unregistered for
+// now: its dispatcher answer of 0 already reads as "initialized", and a real Init needs the
+// memory-pool contract modelled. Known gap: on hardware both setup calls return 0x80770001 when
+// sceRudpInit has not run (+0x60f7, +0x620d); that is not modelled while Init is unregistered.
+// CONFIDENCE: HIGH on the NULL-handler refusal (+0x61f2 -> +0x6214), HIGH that acknowledgement
+// is safe here (no outputs exist to lie about).
 #include "hle/dispatch/dispatch.hpp"
-#include "hle/dispatch/nid.hpp"
 
 #include <cstdint>
 
@@ -31,12 +34,12 @@ HLE(rudp_enable_io_thread) {  // (stack_size, priority) -> SCE_OK, no thread sta
 }
 
 HLE(rudp_set_event_handler) {  // (handler, arg) -> SCE_OK, stored nowhere, never called
-    (void)a0;
     (void)a1;
     (void)a2;
     (void)a3;
     (void)a4;
     (void)a5;
+    if (!a0) return 0x80770022u;   // a NULL handler is refused (+0x61f2 -> +0x6214)
     return 0;
 }
 

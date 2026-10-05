@@ -9,6 +9,7 @@
 #include "hle/net/hle_net.hpp"
 #include "hle/net/sce_net_errors.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -314,6 +315,7 @@ constexpr const char* kGetSockInfo = "hLuXdjHnhiI";
 constexpr const char* kPoolDestroy = "K7RlrTkI-mw";
 constexpr const char* kResolverCreate = "C4UgDHHPvdw";
 constexpr const char* kResolverStartNtoa = "Nd91WaWmG2w";
+constexpr const char* kResolverDestroy = "kJlYH5uMAWI";
 constexpr const char* kRudpEnable = "6PBNpsgyaxw";
 constexpr const char* kRudpSetHandler = "SUEVes8gvmw";
 
@@ -322,6 +324,13 @@ constexpr uint64_t kOpNotSupp = net::kNetErrorOpNotSupp;  // 0x8041012d
 // Id-returning contracts sign-extend their errors (never a handle); status contracts keep
 // the zero-extended 32-bit form. Both conventions live in hle_net.cpp.
 constexpr uint64_t kIdInval = (uint64_t)(int64_t)(int32_t)net::kNetErrorInval;
+constexpr uint64_t kIdBadF = (uint64_t)(int64_t)(int32_t)net::kNetErrorBadF;
+constexpr uint64_t kIdOpNotSupp = (uint64_t)(int64_t)(int32_t)net::kNetErrorOpNotSupp;
+
+int32_t net_errno() {
+    HleFn loc = Hle::lookup(kErrnoLoc);
+    return loc ? *reinterpret_cast<const int32_t*>(loc(0, 0, 0, 0, 0, 0)) : -1;
+}
 
 }  // namespace
 
@@ -332,23 +341,36 @@ TEST(NetSocket, EpollLifecycle) {
     HleFn control = Hle::lookup(kEpollControl);
     HleFn wait = Hle::lookup(kEpollWait);
     for (HleFn f : {create, destroy, control, wait}) ASSERT_NE(f, nullptr);
-    uint64_t eid = 0;
-    EXPECT_EQ(create(0, 0, 0, 0, 0, 0), kIdInval) << "null name is refused, writes nothing";
-    EXPECT_EQ(eid, 0u);
-    ASSERT_GT((int64_t)(eid = create((uint64_t)"test", 0, 0, 0, 0, 0)), 0)
-        << "epoll id is positive, never the dispatcher 0";
+    EXPECT_EQ(create(0, 0, 0, 0, 0, 0), kIdInval) << "null name is refused";
+    EXPECT_EQ(create((uint64_t)"test", 1, 0, 0, 0, 0), kIdInval) << "non-zero flags are refused";
+    const uint64_t eid = create((uint64_t)"test", 0, 0, 0, 0, 0);
+    ASSERT_GT((int64_t)eid, 0) << "epoll id is positive, never the dispatcher 0";
     const uint64_t fd = open_socket();
     ASSERT_GT((int64_t)fd, 0);
-    EXPECT_EQ(control(9999, 1, fd, 0, 0, 0), kBadF) << "unknown epoll id is refused";
-    EXPECT_EQ(control(eid, 1, 9999, 0, 0, 0), kBadF) << "unknown socket id is refused";
-    EXPECT_EQ(control(eid, 1, fd, 0, 0, 0), 0u);
-    EXPECT_EQ(wait(9999, 0, 0, 0, 0, 0), kBadF);
-    EXPECT_EQ(wait(eid, 0, 1, 0, 0, 0), kInval) << "null event buffer is refused";
+    uint32_t ev[4] = {1u, 0, 0, 0};   // events mask in the leading word
+    uint32_t no_ev[4] = {0, 0, 0, 0};
+    EXPECT_EQ(control(eid, 0, fd, (uint64_t)ev, 0, 0), kInval) << "op 0 is not ADD/MOD/DEL";
+    EXPECT_EQ(control(eid, 4, fd, (uint64_t)ev, 0, 0), kInval) << "op 4 is not ADD/MOD/DEL";
+    EXPECT_EQ(control(eid, 1, fd, 0, 0, 0), kInval) << "ADD needs an event";
+    EXPECT_EQ(control(eid, 2, fd, (uint64_t)no_ev, 0, 0), kInval) << "MOD needs a non-empty mask";
+    EXPECT_EQ(control(9999, 1, fd, (uint64_t)ev, 0, 0), kBadF) << "unknown epoll id is refused";
+    EXPECT_EQ(control(eid, 1, 9999, (uint64_t)ev, 0, 0), kBadF) << "unknown socket id is refused";
+    EXPECT_EQ(control(eid, 1, fd, (uint64_t)ev, 0, 0), 0u);
+    EXPECT_EQ(control(eid, 3, fd, 0, 0, 0), 0u) << "DEL needs no event";
     uint8_t events[64]{};
-    EXPECT_EQ(wait(eid, (uint64_t)events, 4, 0, 0, 0), 0u) << "no events can be ready offline";
+    // The buffer and count are checked before the id, and a count's error is sign-extended.
+    EXPECT_EQ(wait(9999, 0, 0, 0, 0, 0), kIdInval) << "null buffer is refused before the id";
+    EXPECT_EQ(wait(eid, (uint64_t)events, 0, 0, 0, 0), kIdInval) << "maxevents 0 is refused";
+    EXPECT_EQ(wait(9999, (uint64_t)events, 4, 0, 0, 0), kIdBadF) << "unknown epoll id";
+    EXPECT_EQ(wait(eid, (uint64_t)events, 4, 0, 0, 0), 0u) << "zero timeout: no events, at once";
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(wait(eid, (uint64_t)events, 4, (uint64_t)(uint32_t)-1, 0, 0), 0u)
+        << "a blocking wait answers 0 events after a bounded sleep";
+    EXPECT_GE(std::chrono::steady_clock::now() - t0, std::chrono::milliseconds(20))
+        << "a blocking (negative-timeout) wait must sleep, or a guest loop busy-spins";
     EXPECT_EQ(destroy(eid, 0, 0, 0, 0, 0), 0u);
     EXPECT_EQ(destroy(eid, 0, 0, 0, 0, 0), kBadF) << "destroy frees exactly once";
-    EXPECT_EQ(wait(eid, (uint64_t)events, 4, 0, 0, 0), kBadF) << "wait on dead id fails";
+    EXPECT_EQ(wait(eid, (uint64_t)events, 4, 0, 0, 0), kIdBadF) << "wait on dead id fails";
     HleFn close = Hle::lookup(kSocketClose);
     ASSERT_NE(close, nullptr);
     EXPECT_EQ(close(fd, 0, 0, 0, 0, 0), 0u);
@@ -359,14 +381,19 @@ TEST(NetSocket, EtherFormatting) {
     HleFn ntostr = Hle::lookup(kEtherNtostr);
     ASSERT_NE(ntostr, nullptr);
     const uint8_t mac[6] = {0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e};
-    char str[18]{};
-    EXPECT_EQ(ntostr((uint64_t)mac, (uint64_t)str, sizeof str, 0, 0, 0), (uint64_t)str);
-    EXPECT_STREQ(str, "0:1a:2b:3c:4d:5e") << "unpadded lowercase, FreeBSD ether_ntoa style";
-    EXPECT_EQ(ntostr(0, (uint64_t)str, sizeof str, 0, 0, 0), 0u) << "null ether is refused";
-    EXPECT_EQ(ntostr((uint64_t)mac, 0, sizeof str, 0, 0, 0), 0u) << "null out is refused";
-    char tiny[4]{};
-    EXPECT_EQ(ntostr((uint64_t)mac, (uint64_t)tiny, sizeof tiny, 0, 0, 0), 0u)
-        << "a 4-byte buffer cannot hold even the shortest rendering";
+    char str[32];
+    std::memset(str, 'x', sizeof str);
+    EXPECT_EQ(ntostr((uint64_t)mac, (uint64_t)str, 18, 0, 0, 0), 0u)
+        << "an int status, 0 on success";
+    EXPECT_STREQ(str, "00:1a:2b:3c:4d:5e") << "zero-padded %02x, as the module formats it";
+    char seventeen[17];
+    std::memset(seventeen, 'x', sizeof seventeen);
+    EXPECT_EQ(ntostr((uint64_t)mac, (uint64_t)seventeen, 17, 0, 0, 0), kInval)
+        << "len < 18 fails even though the text would not need it all";
+    EXPECT_EQ(seventeen[0], 'x') << "a refused call writes nothing";
+    EXPECT_EQ(net_errno(), 22) << "the module sets errno EINVAL";
+    EXPECT_EQ(ntostr(0, (uint64_t)str, 18, 0, 0, 0), kInval) << "null ether is refused";
+    EXPECT_EQ(ntostr((uint64_t)mac, 0, 18, 0, 0, 0), kInval) << "null out is refused";
 }
 
 TEST(NetSocket, HardwareIntrospectionRefused) {
@@ -377,15 +404,18 @@ TEST(NetSocket, HardwareIntrospectionRefused) {
     ASSERT_NE(info, nullptr);
     uint8_t out[32];
     std::memset(out, 0xAA, sizeof out);
+    EXPECT_EQ(mac(0, 0, 0, 0, 0, 0), kInval) << "null addr is refused first";
+    EXPECT_EQ(mac((uint64_t)out, 1, 0, 0, 0, 0), kInval) << "non-zero flags are refused first";
     // No interface to report: a zeroed MAC would be a manufactured hardware identity.
     EXPECT_EQ(mac((uint64_t)out, 0, 0, 0, 0, 0), kOpNotSupp);
     EXPECT_EQ(out[0], 0xAA) << "refused query writes no address";
     const uint64_t fd = open_socket();
     ASSERT_GT((int64_t)fd, 0);
-    EXPECT_EQ(info(9999, (uint64_t)out, 1, 0, 0, 0), kBadF) << "unknown socket is refused";
+    EXPECT_EQ(info(fd, (uint64_t)out, 1, 0x1000, 0, 0), kIdInval) << "flags & 0x31000 refused";
+    EXPECT_EQ(info(9999, (uint64_t)out, 1, 0, 0, 0), kIdBadF) << "unknown socket is refused";
     std::memset(out, 0xAA, sizeof out);
-    EXPECT_EQ(info(fd, (uint64_t)out, 1, 0, 0, 0), kOpNotSupp)
-        << "unknown struct: fail, don't scribble";
+    EXPECT_EQ(info(fd, (uint64_t)out, 1, 0, 0, 0), kIdOpNotSupp)
+        << "unknown struct: fail, don't scribble (a count contract: sign-extended)";
     EXPECT_EQ(out[0], 0xAA);
     HleFn close = Hle::lookup(kSocketClose);
     ASSERT_NE(close, nullptr);
@@ -397,20 +427,44 @@ TEST(NetSocket, PoolDestroyAndResolver) {
     HleFn pool_destroy = Hle::lookup(kPoolDestroy);
     HleFn resolver_create = Hle::lookup(kResolverCreate);
     HleFn start_ntoa = Hle::lookup(kResolverStartNtoa);
-    for (HleFn f : {pool_destroy, resolver_create, start_ntoa}) ASSERT_NE(f, nullptr);
+    HleFn resolver_destroy = Hle::lookup(kResolverDestroy);
+    for (HleFn f : {pool_destroy, resolver_create, start_ntoa, resolver_destroy})
+        ASSERT_NE(f, nullptr);
     // Pools are untracked counter ids (see PoolCreate): nothing to free, always succeeds.
     EXPECT_EQ(pool_destroy(1, 0, 0, 0, 0, 0), 0u);
-    uint64_t rid = 0;
     EXPECT_EQ(resolver_create(0, 0, 0, 0, 0, 0), kIdInval) << "null name is refused";
-    ASSERT_GT((int64_t)(rid = resolver_create((uint64_t)"test", 0, 0, 0, 0, 0)), 0)
-        << "resolver id is positive, never the dispatcher 0";
+    EXPECT_EQ(resolver_create((uint64_t)"test", 0, 1, 0, 0, 0), kIdInval) << "flags refused";
+    const uint64_t rid = resolver_create((uint64_t)"test", 0, 0, 0, 0, 0);
+    ASSERT_GT((int64_t)rid, 0) << "resolver id is positive, never the dispatcher 0";
     uint8_t addr[16];
     std::memset(addr, 0xAA, sizeof addr);
-    EXPECT_EQ(start_ntoa(9999, (uint64_t)"example.com", (uint64_t)addr, 0, 0, 0), kBadF);
+    const uint64_t host = (uint64_t)"example.com";
+    EXPECT_EQ(start_ntoa(rid, host, (uint64_t)addr, (uint64_t)(uint32_t)-1, 0, 0), kInval)
+        << "negative timeout is refused";
+    EXPECT_EQ(start_ntoa(rid, host, (uint64_t)addr, 0, (uint64_t)(uint32_t)-1, 0), kInval)
+        << "negative retry is refused";
+    EXPECT_EQ(start_ntoa(rid, host, (uint64_t)addr, 0, 0, 2), kInval) << "flags outside 0x10001";
+    EXPECT_EQ(start_ntoa(9999, host, (uint64_t)addr, 0, 0, 0), kBadF);
     EXPECT_EQ(start_ntoa(rid, 0, (uint64_t)addr, 0, 0, 0), kInval) << "null hostname refused";
-    EXPECT_EQ(start_ntoa(rid, (uint64_t)"example.com", (uint64_t)addr, 0, 0, 0), kUnreach)
-        << "no DNS offline";
+    EXPECT_EQ(start_ntoa(rid, host, (uint64_t)addr, 0, 0, 0), kUnreach) << "no DNS offline";
     EXPECT_EQ(addr[0], 0xAA) << "failed resolve writes no address";
+    EXPECT_EQ(resolver_destroy(rid, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(resolver_destroy(rid, 0, 0, 0, 0, 0), kBadF) << "destroy frees exactly once";
+    EXPECT_EQ(start_ntoa(rid, host, (uint64_t)addr, 0, 0, 0), kBadF) << "dead id is refused";
+}
+
+TEST(NetSocket, ResolverSlotsAreReusedAfterDestroy) {
+    // 32 slots: a create/destroy cycle that leaked would fail the 33rd create.
+    register_builtin_hle();
+    HleFn resolver_create = Hle::lookup(kResolverCreate);
+    HleFn resolver_destroy = Hle::lookup(kResolverDestroy);
+    ASSERT_NE(resolver_create, nullptr);
+    ASSERT_NE(resolver_destroy, nullptr);
+    for (int i = 0; i < 33; i++) {
+        const uint64_t rid = resolver_create((uint64_t)"cycle", 0, 0, 0, 0, 0);
+        ASSERT_GT((int64_t)rid, 0) << "cycle " << i << ": a destroyed slot is reusable";
+        ASSERT_EQ(resolver_destroy(rid, 0, 0, 0, 0, 0), 0u) << "cycle " << i;
+    }
 }
 
 TEST(Rudp, SetupAcknowledged) {
@@ -419,7 +473,9 @@ TEST(Rudp, SetupAcknowledged) {
     HleFn set_handler = Hle::lookup(kRudpSetHandler);
     ASSERT_NE(enable, nullptr);
     ASSERT_NE(set_handler, nullptr);
-    // Fire-and-forget setup with no out-parameters: no IO thread starts, no handler is stored.
+    // Setup with no out-parameters: no IO thread starts, no handler is stored.
     EXPECT_EQ(enable(0x10000, 100, 0, 0, 0, 0), 0u);
-    EXPECT_EQ(set_handler(0, 0, 0, 0, 0, 0), 0u);
+    int marker = 0;
+    EXPECT_EQ(set_handler((uint64_t)&marker, 0, 0, 0, 0, 0), 0u) << "a handler is accepted";
+    EXPECT_EQ(set_handler(0, 0, 0, 0, 0, 0), 0x80770022u) << "a NULL handler is refused";
 }
