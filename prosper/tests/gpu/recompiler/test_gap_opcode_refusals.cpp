@@ -325,13 +325,16 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
 
-// Unlowered SOPP halt/kill terminators must refuse fail-visibly. s_sethalt
-// (debug halt), s_setkill (kill the wave) and s_sendmsghalt (message + halt)
-// have no lowering in the per-invocation model -- accepting any of them as a
-// no-op would silently execute past a guest-visible termination. The control
-// is s_nop in the same slot, which is a documented no-op and compiles. WHEN a
-// lowering lands for any of the three, ITS CASE GOES RED; replace it with an
-// execution test of the new lowering.
+// Unlowered SOPP halt/kill terminators must refuse fail-visibly. s_sethalt 1
+// (debug halt), s_setkill 1 (kill the wave) and s_sendmsghalt (message + halt,
+// regardless of its immediate) have no lowering in the per-invocation model --
+// accepting any of them as a no-op would silently execute past a guest-visible
+// termination. The imm-0 forms of s_sethalt/s_setkill (resume / do not kill)
+// ARE hardware no-ops, so the terminating imm-1 forms are pinned instead
+// (llvm-mc gfx1030: 0xbf8d0001 = s_sethalt 1, 0xbf8b0001 = s_setkill 1). The
+// control is s_nop in the same slot, which is a documented no-op and compiles.
+// WHEN a lowering lands for any of the three, ITS CASE GOES RED; replace it
+// with an execution test of the new lowering.
 TEST(GapOpcodeRefusals, SoppHaltKillRefuse) {
     static const uint32_t kNop = 0xbf800000u;
     {
@@ -342,8 +345,8 @@ TEST(GapOpcodeRefusals, SoppHaltKillRefuse) {
     expect_compiles(program(kVop3Prologue, {kNop}), 0xA080ull,
                     "control: s_nop in the halt slot");
     for (const auto [word, opcode, addr] :
-         {std::tuple<uint32_t, uint32_t, uint64_t>{0xbf8d0000u, 0x0du, 0xA081ull},
-          {0xbf8b0000u, 0x0bu, 0xA082ull},
+         {std::tuple<uint32_t, uint32_t, uint64_t>{0xbf8d0001u, 0x0du, 0xA081ull},
+          {0xbf8b0001u, 0x0bu, 0xA082ull},
           {0xbf910000u, 0x11u, 0xA083ull}}) {
         const Rdna2Inst dec = rdna2_decode_one(&word, 1);
         EXPECT_EQ(dec.fmt, Rdna2Format::SOPP);
