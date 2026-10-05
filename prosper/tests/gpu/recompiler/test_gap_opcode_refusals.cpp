@@ -397,6 +397,79 @@ TEST(GapOpcodeRefusals, ImageAtomicFloatRefuse) {
                        {fmax[0], fmax[1]}, Rdna2Format::MIMG, 0x1fu, &float_rt, config);
 }
 
+// Unlowered float compare-swap MIMG atomic must refuse fail-visibly.
+// image_atomic_fcmpswap (0x1d) needs a float compare-and-swap lowering, which
+// does not exist: the lowered image atomics are integer swap, add, sub,
+// min/max and and/or/xor over R32_UINT. Accepting it as one of those would
+// silently drop the comparison. The word is the canonical llvm-mc gfx1030
+// encoding; a compare-swap carries a data pair (v9 data, v10 compare), so it
+// requires dmask 0x3. The control is image_atomic_add (the byte-exact Astro
+// Bot packet); lowered image atomics require dmask 0x1, so the control
+// differs from the refused word in the opcode AND the dmask field. Both refuse
+// against the control's own Uint32 StorageImage entry, plus the realistic
+// R32_FLOAT storage target: today fcmpswap is classified sampled-only, so a
+// storage entry does not resolve and the arm refuses; a real lowering must make
+// it a storage op (#4211), at which point this arm goes red. A Texture entry
+// would keep refusing at the sampled-op allowlist and could never go red.
+// fmin/fmax are pinned in ImageAtomicFloatRefuse. Integer image_atomic_dec
+// (0x1c) is also unlowered and is pinned on the same Uint32 storage entry; its
+// word differs from the add control only in the opcode field. WHEN a fcmpswap
+// or dec lowering lands, ITS CASE GOES RED; replace it with an execution test.
+TEST(GapOpcodeRefusals, ImageAtomicFCmpswapRefuse) {
+    // image_atomic_fcmpswap v[9:10], v[0:1], s[0:7] dmask:0x3 dim:SQ_RSRC_IMG_2D glc
+    static const uint32_t fcs[2] = {0xf0742308u, 0x00000900u};
+    // image_atomic_dec v9, v[0:1], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D glc
+    static const uint32_t dcr[2] = {0xf0702108u, 0x00000900u};
+    // image_atomic_add v9, v[0:1], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D glc
+    static const uint32_t add[2] = {0xf0442108u, 0x00000900u};
+    for (const uint32_t* words : {fcs, dcr, add}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(fcs, 2).opcode, 0x1du);
+    EXPECT_EQ(rdna2_decode_one(dcr, 2).opcode, 0x1cu);
+    EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x11u);
+
+    std::vector<uint8_t> backing(8u * 8u * 4u, 0);
+    auto table = [&](DataFormat format) {
+        ShaderResourceTable rt;
+        ShaderResource image{};
+        image.cls = ResourceClass::StorageImage;
+        image.format = format;
+        image.num_components = 1;
+        image.binding = 4;
+        image.img_dim = 1;
+        image.width = image.height = 8;
+        image.depth = 1;
+        image.sample_count = 1;
+        image.sgpr_base = 0;
+        image.gpu_addr = reinterpret_cast<uint64_t>(backing.data());
+        image.size = static_cast<uint32_t>(backing.size());
+        rt.resources.push_back(image);
+        return rt;
+    };
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(8);   // s0..s7 T# are entry-time user data
+    const std::vector<uint32_t> prologue = {
+        0x7e000280u,   // v_mov_b32 v0, 0 (coord)
+        0x7e020280u,   // v_mov_b32 v1, 0 (coord)
+        0x7e120281u,   // v_mov_b32 v9, 1 (data/dst)
+        0x7e140281u,   // v_mov_b32 v10, 1 (fcmpswap compare value)
+    };
+    const ShaderResourceTable uint_rt = table(DataFormat::Uint32);
+    const ShaderResourceTable float_rt = table(DataFormat::Float32);
+    expect_compiles(program(prologue, {add[0], add[1]}), 0xA018ull,
+                    "control: image_atomic_add over the Uint32 storage entry", &uint_rt,
+                    config);
+    expect_gap_refusal(program(prologue, {fcs[0], fcs[1]}), 0xA019ull, 4,
+                       {fcs[0], fcs[1]}, Rdna2Format::MIMG, 0x1du, &uint_rt, config);
+    expect_gap_refusal(program(prologue, {fcs[0], fcs[1]}), 0xA01Aull, 4,
+                       {fcs[0], fcs[1]}, Rdna2Format::MIMG, 0x1du, &float_rt, config);
+    expect_gap_refusal(program(prologue, {dcr[0], dcr[1]}), 0xA01Bull, 4,
+                       {dcr[0], dcr[1]}, Rdna2Format::MIMG, 0x1cu, &uint_rt, config);
+}
+
 // Unlowered arithmetic x2 MUBUF atomics must refuse fail-visibly. sub/inc/
 // dec_x2 need a true qword RMW like the add/and_x2 family pinned in
 // BufferAtomicX2Refuse. All words below are llvm-mc gfx1030 round-tripped in
