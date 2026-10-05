@@ -1,12 +1,7 @@
-// test_gameupdate — the libSceGameUpdate request lifecycle: create/check/abort/delete and
-// the addcont-latest-version query.
-//
-// These five exports were unregistered, so the dispatcher answered `0`: a create that minted
-// no id, a check that reported over an untouched result buffer, deletes that deleted nothing.
-// Every TEST drives the real NIDs: uninitialized use fails, foreign ids fail, and a check
-// fills its caller-sized result with the offline answer (nothing available) while echoing the
-// size field back. A no-op acknowledgement would succeed everywhere below, which is exactly
-// what the error arms forbid.
+// test_gameupdate — the libSceGameUpdate request lifecycle: init/term, create/check/abort/delete
+// and the addcont-latest-version query, pinned to the shipped libSceGameUpdate.sprx: its
+// argument-check order, the 0x30-byte param/result structs, the 8 request slots and ids from
+// 0x20000000, and a result write-back that touches only `found` (+8) and the byte at +9.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 
@@ -24,6 +19,32 @@ static constexpr uint64_t kNotInitialized = 0x80412801ull;
 static constexpr uint64_t kInvalidArg = 0x80412803ull;
 static constexpr uint64_t kInvalidSize = 0x80412804ull;
 static constexpr uint64_t kRequestNotFound = 0x80412805ull;
+static constexpr uint64_t kAlreadyInitialized = 0x80412802ull;
+static constexpr uint64_t kTooManyRequests = 0x80412806ull;
+static constexpr uint64_t kAborted = 0x80412807ull;
+
+// Each TEST starts from "not initialized"; the library state is process-global.
+static void reset() {
+    register_builtin_hle();
+    call_nid("sceGameUpdateTerminate");
+}
+
+// The 0x30-byte param/result structs: a u64 size, then fields. Param +8 is the check type.
+struct alignas(8) GuStruct { uint8_t b[0x30]; };
+static GuStruct make_param(uint32_t check_type = 0) {
+    GuStruct p{};
+    const uint64_t size = 0x30;
+    std::memcpy(p.b, &size, 8);
+    std::memcpy(p.b + 8, &check_type, 4);
+    return p;
+}
+static GuStruct make_result() {
+    GuStruct r;
+    std::memset(r.b, 0xAB, sizeof(r.b));
+    const uint64_t size = 0x30;
+    std::memcpy(r.b, &size, 8);
+    return r;
+}
 
 static uint64_t call_nid(const char* nid, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0,
                          uint64_t a3 = 0, uint64_t a4 = 0, uint64_t a5 = 0) {
@@ -56,95 +77,108 @@ TEST(GameUpdate, NidsResolveToStubValues) {
         << "positive control: the discriminator rejects a wrong NID";
 }
 
-TEST(GameUpdate, CreateCheckDeleteLifecycle) {
-    register_builtin_hle();
-    EXPECT_NE(Hle::lookup(nid_hash("sceGameUpdateInitialize")), nullptr);
-    EXPECT_NE(Hle::lookup(nid_hash("sceGameUpdateTerminate")), nullptr);
-
-    // Forced-uninitialized first: terminate clears any state so this arm depends on nothing.
-    EXPECT_EQ(call_nid("sceGameUpdateTerminate"), 0u);
-    EXPECT_EQ(call_nid("sceGameUpdateCreateRequest"), kNotInitialized)
-        << "create before init fails instead of minting an id";
+TEST(GameUpdate, InitializeAndTerminateAreStateful) {
+    reset();
+    EXPECT_EQ(call_nid("sceGameUpdateTerminate"), kNotInitialized);
     EXPECT_EQ(call_nid("sceGameUpdateInitialize"), 0u);
-
-    const uint64_t id = call_nid("sceGameUpdateCreateRequest");
-    EXPECT_GT(id, 0u) << "create mints a positive request id";
-    EXPECT_NE(call_nid("sceGameUpdateCheck", 0xDEADu, 0, 0), 0u)
-        << "check on a foreign id fails";
-    EXPECT_EQ(call_nid("sceGameUpdateCheck", 0xDEADu, 0, 0), kRequestNotFound)
-        << "check on a foreign id reports request-not-found";
-
-    EXPECT_EQ(call_nid("sceGameUpdateAbortRequest", id), 0u) << "abort on a live id succeeds";
-    EXPECT_EQ(call_nid("sceGameUpdateAbortRequest", 0xDEADu), kRequestNotFound)
-        << "abort on a foreign id fails";
-    EXPECT_EQ(call_nid("sceGameUpdateDeleteRequest", id), 0u) << "delete frees the id";
-    EXPECT_EQ(call_nid("sceGameUpdateDeleteRequest", id), kRequestNotFound)
-        << "delete frees exactly once";
-    EXPECT_EQ(call_nid("sceGameUpdateCheck", id, 0, 0), kRequestNotFound)
-        << "a deleted id stays deleted";
+    EXPECT_EQ(call_nid("sceGameUpdateInitialize"), kAlreadyInitialized);
     EXPECT_EQ(call_nid("sceGameUpdateTerminate"), 0u);
 }
 
-TEST(GameUpdate, CheckReportsNoUpdateOverCallerSizedResult) {
-    register_builtin_hle();
-    EXPECT_EQ(call_nid("sceGameUpdateInitialize"), 0u);
-    const uint64_t id = call_nid("sceGameUpdateCreateRequest");
-    ASSERT_GT(id, 0u);
-
-    // Caller-led size with a sentinel tail: the offline answer zeroes the body and echoes
-    // the size back. Untouched tail bytes would mean "update found" wherever `found` lives.
-    uint8_t result[128];
-    std::memset(result, 0xAB, sizeof(result));
-    uint32_t size = sizeof(result);
-    std::memcpy(result, &size, sizeof(size));
-    uint8_t param[48]{};
-    uint32_t param_size = sizeof(param);
-    std::memcpy(param, &param_size, sizeof(param_size));
-    EXPECT_EQ(call_nid("sceGameUpdateCheck", id, addr(param), addr(result)), 0u);
-    uint32_t echoed = 0;
-    std::memcpy(&echoed, result, sizeof(echoed));
-    EXPECT_EQ(echoed, (uint32_t)sizeof(result)) << "the size field is echoed back";
-    for (size_t i = sizeof(echoed); i < sizeof(result); ++i) {
-        EXPECT_EQ(result[i], 0u) << "result body is zeroed (nothing available) at byte " << i;
+TEST(GameUpdate, CreateMintsFromTheFirmwareRangeIntoEightSlots) {
+    reset();
+    EXPECT_EQ(call_nid("sceGameUpdateCreateRequest"), kNotInitialized);
+    ASSERT_EQ(call_nid("sceGameUpdateInitialize"), 0u);
+    int32_t ids[8];
+    for (int32_t& id : ids) {
+        id = (int32_t)call_nid("sceGameUpdateCreateRequest");
+        EXPECT_GE(id, 0x20000000);
+        EXPECT_LE(id, 0x2ffffffe);
     }
+    EXPECT_NE(ids[0], ids[1]);
+    EXPECT_EQ(call_nid("sceGameUpdateCreateRequest"), kTooManyRequests) << "only 8 slots";
+    EXPECT_EQ(call_nid("sceGameUpdateDeleteRequest", (uint64_t)ids[3]), 0u);
+    EXPECT_EQ(call_nid("sceGameUpdateDeleteRequest", (uint64_t)ids[3]), kRequestNotFound);
+    EXPECT_GE((int32_t)call_nid("sceGameUpdateCreateRequest"), 0x20000000) << "a freed slot is reused";
+    EXPECT_EQ(call_nid("sceGameUpdateTerminate"), 0u);
+}
 
-    EXPECT_EQ(call_nid("sceGameUpdateCheck", id, 0, addr(result)), kInvalidArg)
-        << "null param is refused";
-    EXPECT_EQ(call_nid("sceGameUpdateCheck", id, addr(param), 0), kInvalidArg)
-        << "null result is refused";
+TEST(GameUpdate, DeleteAndAbortCheckTheIdBeforeInit) {
+    reset();
+    EXPECT_EQ(call_nid("sceGameUpdateDeleteRequest", 0), kRequestNotFound);
+    EXPECT_EQ(call_nid("sceGameUpdateAbortRequest", (uint64_t)(uint32_t)-1), kRequestNotFound);
+    EXPECT_EQ(call_nid("sceGameUpdateDeleteRequest", 0x20000000), kNotInitialized);
+    EXPECT_EQ(call_nid("sceGameUpdateAbortRequest", 0x20000000), kNotInitialized);
+}
 
-    // A garbage size must fail BEFORE writing, not memset the world: sentinel proves it.
-    uint8_t small[16];
-    std::memset(small, 0xCD, sizeof(small));
-    uint32_t huge = 1024u * 1024u;
-    std::memcpy(small, &huge, sizeof(huge));
-    EXPECT_EQ(call_nid("sceGameUpdateCheck", id, addr(param), addr(small)), kInvalidSize)
-        << "garbage sizes fail instead of zeroing a megabyte";
-    for (size_t i = sizeof(huge); i < sizeof(small); ++i) {
-        EXPECT_EQ(small[i], 0xCDu) << "refused check leaves the buffer untouched at byte " << i;
+TEST(GameUpdate, CheckValidatesInTheFirmwareOrder) {
+    reset();
+    GuStruct param = make_param(), result = make_result();
+    // Argument checks come before the init check.
+    EXPECT_EQ(call_nid("sceGameUpdateCheck", 0, addr(&param), addr(&result)), kRequestNotFound);
+    EXPECT_EQ(call_nid("sceGameUpdateCheck", 0x20000000, 0, addr(&result)), kInvalidArg);
+    EXPECT_EQ(call_nid("sceGameUpdateCheck", 0x20000000, addr(&param), 0), kInvalidArg);
+    for (uint64_t bad : {0x28ull, 0x80ull, 0ull}) {
+        GuStruct sized = make_param();
+        std::memcpy(sized.b, &bad, 8);
+        EXPECT_EQ(call_nid("sceGameUpdateCheck", 0x20000000, addr(&sized), addr(&result)),
+                  kInvalidSize)
+            << "param size " << bad;
+        GuStruct rsized = make_result();
+        std::memcpy(rsized.b, &bad, 8);
+        EXPECT_EQ(call_nid("sceGameUpdateCheck", 0x20000000, addr(&param), addr(&rsized)),
+                  kInvalidSize)
+            << "result size " << bad;
     }
-    EXPECT_EQ(call_nid("sceGameUpdateDeleteRequest", id), 0u);
+    GuStruct type2 = make_param(2);
+    EXPECT_EQ(call_nid("sceGameUpdateCheck", 0x20000000, addr(&type2), addr(&result)), kInvalidArg);
+    GuStruct reserved = make_param();
+    reserved.b[0x2c] = 1;
+    EXPECT_EQ(call_nid("sceGameUpdateCheck", 0x20000000, addr(&reserved), addr(&result)),
+              kInvalidArg);
+    EXPECT_EQ(call_nid("sceGameUpdateCheck", 0x20000000, addr(&param), addr(&result)),
+              kNotInitialized);
+    ASSERT_EQ(call_nid("sceGameUpdateInitialize"), 0u);
+    EXPECT_EQ(call_nid("sceGameUpdateCheck", 0x2fffffff, addr(&param), addr(&result)),
+              kRequestNotFound);
+    EXPECT_EQ(call_nid("sceGameUpdateTerminate"), 0u);
+}
+
+TEST(GameUpdate, CheckReportsNoUpdateAndTouchesOnlyFound) {
+    reset();
+    ASSERT_EQ(call_nid("sceGameUpdateInitialize"), 0u);
+    const int32_t id = (int32_t)call_nid("sceGameUpdateCreateRequest");
+    for (uint32_t type : {0u, 1u}) {
+        GuStruct param = make_param(type), result = make_result();
+        ASSERT_EQ(call_nid("sceGameUpdateCheck", (uint64_t)id, addr(&param), addr(&result)), 0u);
+        uint64_t size = 0;
+        std::memcpy(&size, result.b, 8);
+        EXPECT_EQ(size, 0x30u) << "the size field is left alone";
+        EXPECT_EQ(result.b[8], 0u) << "found = false";
+        EXPECT_EQ(result.b[9], 0u);
+        for (size_t i = 10; i < sizeof(result.b); ++i)
+            EXPECT_EQ(result.b[i], 0xABu) << "byte " << i << " is not written when nothing is found";
+    }
+    EXPECT_EQ(call_nid("sceGameUpdateAbortRequest", (uint64_t)id), 0u);
+    GuStruct param = make_param(), result = make_result();
+    EXPECT_EQ(call_nid("sceGameUpdateCheck", (uint64_t)id, addr(&param), addr(&result)), kAborted);
+    EXPECT_EQ(call_nid("sceGameUpdateDeleteRequest", (uint64_t)id), 0u);
     EXPECT_EQ(call_nid("sceGameUpdateTerminate"), 0u);
 }
 
 TEST(GameUpdate, AddcontLatestVersionReportsNone) {
-    register_builtin_hle();
-    EXPECT_EQ(call_nid("sceGameUpdateInitialize"), 0u);
-
-    uint8_t info[48];
+    reset();
+    uint8_t label[16] = {};
+    uint8_t info[0x20];
     std::memset(info, 0xAB, sizeof(info));
-    uint32_t size = sizeof(info);
-    std::memcpy(info, &size, sizeof(size));
-    EXPECT_EQ(call_nid("sceGameUpdateGetAddcontLatestVersion", 0, 0, addr(info)), 0u);
-    uint32_t echoed = 0;
-    std::memcpy(&echoed, info, sizeof(echoed));
-    EXPECT_EQ(echoed, (uint32_t)sizeof(info)) << "the size field is echoed back";
-    for (size_t i = sizeof(echoed); i < sizeof(info); ++i) {
-        EXPECT_EQ(info[i], 0u) << "no update known, so the version block is zeroed at byte " << i;
-    }
-    EXPECT_EQ(call_nid("sceGameUpdateGetAddcontLatestVersion", 0, 0, 0), kInvalidArg)
-        << "null info is refused";
+    EXPECT_EQ(call_nid("sceGameUpdateGetAddcontLatestVersion", 0, 0, addr(info)), kInvalidArg);
+    EXPECT_EQ(call_nid("sceGameUpdateGetAddcontLatestVersion", 0, addr(label), 0), kInvalidArg);
+    EXPECT_EQ(call_nid("sceGameUpdateGetAddcontLatestVersion", 0, addr(label), addr(info)),
+              kNotInitialized);
+    ASSERT_EQ(call_nid("sceGameUpdateInitialize"), 0u);
+    EXPECT_EQ(call_nid("sceGameUpdateGetAddcontLatestVersion", 0, addr(label), addr(info)), 0u);
+    EXPECT_EQ(info[8], 0u) << "found = false";
+    for (size_t i = 0; i < sizeof(info); ++i)
+        if (i != 8) EXPECT_EQ(info[i], 0xABu) << "byte " << i << " is not written";
     EXPECT_EQ(call_nid("sceGameUpdateTerminate"), 0u);
-    EXPECT_EQ(call_nid("sceGameUpdateGetAddcontLatestVersion", 0, 0, addr(info)), kNotInitialized)
-        << "terminated state fails instead of answering";
 }
