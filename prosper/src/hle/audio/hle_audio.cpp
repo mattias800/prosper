@@ -4295,6 +4295,24 @@ void register_audio_hle() {
     // standard and HQ init entry points get the same "unavailable" answer.
     R("sceVoiceInit", voice_init_unavailable);
     R("sceVoiceInitHQ", voice_init_unavailable);
+    // The port surface answers the same unavailable: Init reports voice off, so handing out
+    // working port handles afterwards would contradict it — and any title that proceeds past a
+    // failed Init anyway lands on error branches here instead of dividing by unwritten voice
+    // parameters. No handles, no state, no out-param writes; arity-independent by construction.
+    R("sceVoiceCreatePort", voice_init_unavailable);
+    R("sceVoiceDeletePort", voice_init_unavailable);
+    R("sceVoiceStart", voice_init_unavailable);
+    R("sceVoiceStop", voice_init_unavailable);
+    R("sceVoiceConnectIPortToOPort", voice_init_unavailable);
+    R("sceVoiceDisconnectIPortFromOPort", voice_init_unavailable);
+    R("sceVoiceGetBitRate", voice_init_unavailable);
+    R("sceVoiceGetPortAttr", voice_init_unavailable);
+    R("sceVoiceGetPortInfo", voice_init_unavailable);
+    R("sceVoiceGetVolume", voice_init_unavailable);
+    R("sceVoiceSetVolume", voice_init_unavailable);
+    R("sceVoiceSetThreadsParams", voice_init_unavailable);
+    R("sceVoiceReadFromOPort", voice_init_unavailable);
+    R("sceVoiceWriteToIPort", voice_init_unavailable);
     R("sceAudioOutOutput", audio_output);
     R("sceAudioOutOutputs", audio_outputs);
     R("sceAudioOutSetVolume", audio_set_volume);
