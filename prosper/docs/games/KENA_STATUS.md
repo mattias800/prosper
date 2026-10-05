@@ -149,7 +149,10 @@ PROSPER_PAD_SCRIPT=@scripts/kena/reach-first-gameplay-prompt.pad PROSPER_PAD_SCR
 anchors are pad reads — see `prosper/scripts/kena/README.md`. `tools/dump_hygiene.py` on the dump is clean; its
 `_original_files/` (the untouched encrypted originals) is retained and never read.
 
-About 2 in 12 launches hang before their first frame (no raw scanout either). Not yet investigated; relaunch.
+The launch hang before the first frame (no raw scanout either; recorded here as "about 2 in 12", measured
+6 of 28 on 2026-10-05) is fixed on Windows — see item 4 below. A separate boot-time crash remains: about 1 launch
+in 5 dies 5-10 s in with `0xC0000005` and nothing in stderr
+([#4504](https://github.com/mattias800/prosper/issues/4504)); relaunch.
 
 ## What was fixed to get here
 
@@ -167,6 +170,17 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
    ([#3816](https://github.com/mattias800/prosper/issues/3816), PR [#3817](https://github.com/mattias800/prosper/pull/3817)).
    Its lane test used `linear_localid`, which is id 0 in a fragment module; NVIDIA's driver dereferenced it while
    compiling the pipeline and the process died inside `nvoglv64.dll` on the first level load, 4 of 4 runs.
+4. **The launch hang: the host's own allocations sat inside the guest's address window**
+   ([#4426](https://github.com/mattias800/prosper/issues/4426), Windows only). Every prosper executable was
+   linked with `HIGH_ENTROPY_VA`, under which Windows draws the base of the process's bottom-up allocations
+   (stacks, heaps, every later `VirtualAlloc(NULL)`) from the low terabyte — the guest's window. UE4's 512 GiB
+   MallocBinned3 arena has to cover `[0x7c00000000, 0xa000000000)` wherever it lands, so a host allocation there
+   got it refused with ENOMEM; the title then re-entered `FMemory::GCreateMalloc` with `GMalloc` null and
+   blocked forever on that function's own `__cxa_guard`, before its first print. 6 of 28 launches as built,
+   0 of 12 with only that header bit cleared in the same binary. Executables that boot a guest are now linked
+   without the flag and steer their later allocations into `[4 GiB, 16 GiB)`, best effort
+   (`docs/platforms/WINDOWS_PORT_HANDOFF.md` § Gotchas); the refusal is reported (`[memhle] reserve FAILED …`)
+   instead of silent. This applies to every UE4 title, not this one.
 
 ## Ruled out
 
@@ -183,6 +197,13 @@ About 2 in 12 launches hang before their first frame (no raw scanout either). No
   modules created in a crashing run, `spirv-val` rejects exactly one — the last one created — and its only
   defect is an operand naming id 0 emitted by prosper's `s_bfm_b64` lowering (#3816). The driver crashing on
   invalid SPIR-V rather than rejecting it is a driver robustness gap, not the cause.
+- **`PROSPER_DBG=1` stalls this title at startup** — false. In an interleaved series the stall and the crash
+  both occur without it (control 1 stall + 1 crash of 8; `PROSPER_DBG=1` 2 + 2 of 8), and the stall happens
+  before any code that reads the variable runs. The three consecutive stalls that prompted #4426 were a small
+  sample of two unrelated intermittent defects (item 4 above, and #4504).
+- **The UE4 arena landing at `0x2000000000` instead of `0x7c00000000` is caused by `PROSPER_DBG`** — false.
+  Control runs land at both. It is the reservation's whole-window fallback, taken when a host allocation
+  occupies the top band; the same cause as the launch hang, one notch less severe (#4426).
 - **Seconds-anchored pad pulses are enough for this title's menus** — false. An 11-press seconds-based route
   delivered 2 presses, because the guest reads the pad about once a second there and a 300 ms pulse mostly falls
   between reads; pad-read anchors (`pN`) deliver every press.
