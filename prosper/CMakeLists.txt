@@ -4676,7 +4676,8 @@ endif()
       # End-to-end: recompile real RDNA2 (llvm-mc) -> SPIR-V -> run -> assert numeric result.
       add_executable(test_rdna2_to_spirv tests/gpu/recompiler/test_rdna2_to_spirv.cpp
                  tests/gpu/recompiler/test_rdna2_bvh.cpp
-                 tests/gpu/recompiler/test_rdna2_minmax3.cpp)
+                 tests/gpu/recompiler/test_rdna2_minmax3.cpp
+                 tests/gpu/recompiler/test_rdna2_scalar_alu.cpp)
       # Includes a shared fixture, which resolves from the `tests` root.
       target_include_directories(test_rdna2_to_spirv PRIVATE tests)
       target_link_libraries(test_rdna2_to_spirv PRIVATE prosper_core Vulkan::Vulkan)
