@@ -587,6 +587,59 @@ TEST(GapOpcodeRefusals, EndpgmVariantRefuse) {
                        Rdna2Format::SOPP, 0x1eu);
 }
 
+// Unlowered SOPK immediate-hardware-register write must refuse fail-visibly.
+// s_setreg_imm32_b32 (SOPK 0x15) has no lowering: the SOPK switch admits only
+// the s_setreg_b32 full flat-scratch-base form (0x13). Accepting it would
+// silently drop a hardware-register write. The refused word names the same
+// hwreg as the control (HW_REG_FLAT_SCR_LO, offset 0, width 32), so only the
+// opcode differs -- plus the data dword 0x15 requires -- and a lowering that
+// extends the flat-scratch admission to 0x15 turns this arm red. The record's
+// words field prints the trailing literal as 00000000 (#4483), so only its
+// first word is asserted. WHEN a lowering lands, THIS ARM GOES RED; replace
+// it with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, SetregImm32Refuse) {
+    // s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 1
+    static const uint32_t setimm[2] = {0xba80f814u, 0x00000001u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(setimm, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPK);
+        EXPECT_EQ(dec.opcode, 0x15u);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    // s_setreg_b32 s0, hwreg(20,0,31): full FLAT_SCRATCH_LO base write,
+    // the exact form sopk_sets_full_flat_scratch_base admits (id 20,
+    // offset 0, width-1 31 -> simm 0xF814).
+    static const uint32_t setreg[1] = {0xb980f814u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(setreg, 1);
+        EXPECT_EQ(dec.fmt, Rdna2Format::SOPK);
+        EXPECT_EQ(dec.opcode, 0x13u);
+    }
+
+    const std::vector<uint32_t> sprologue = {
+        0xbe810387u,   // s_mov_b32 s1, 7
+        0xbe800301u,   // s_mov_b32 s0, s1
+    };
+    expect_compiles(program(sprologue, {setreg[0]}), 0xA130ull,
+                    "control: s_setreg_b32 full flat-scratch base");
+    const std::vector<uint32_t> refused_code = program(sprologue, {setimm[0], setimm[1]});
+    const std::vector<uint32_t> refused = compile(refused_code, 0xA131ull);
+    EXPECT_TRUE(refused.empty()) << "s_setreg_imm32_b32 must refuse";
+    {
+        RejectRecord r = parse_reject(last_terminal_reject_reason(0xA131ull));
+        EXPECT_EQ(r.tag, "recompile-reject");
+        EXPECT_EQ(r.fields["mode"], "unresolved-operand");
+        EXPECT_EQ(r.fields["pc"], "2") << "the reject must name the gap pc";
+        EXPECT_EQ(r.fields["fmt"], std::to_string(static_cast<int>(Rdna2Format::SOPK)));
+        EXPECT_EQ(r.fields["op"], "0x15");
+        EXPECT_EQ(r.fields["len"], "2");
+        EXPECT_EQ(r.fields["words"].substr(0, 8), hex(setimm[0], false))
+            << "the record names the refused word (its literal prints as 0, #4483)";
+        EXPECT_EQ(r.fields["sh"],
+                  hex(refused_code[0], false) + "/" + std::to_string(refused_code.size()));
+    }
+}
+
 // Unlowered f64 transcendental VOP1 must refuse fail-visibly. v_rcp_f64,
 // v_rsq_f64 and v_sqrt_f64 need f64 reciprocal/root lowering, which does not
 // exist (f16/f32 siblings are lowered); accepting them would silently compute
