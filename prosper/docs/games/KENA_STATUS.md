@@ -4,6 +4,26 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## Handoff to Linux/AMD (2026-10-05)
+
+**Read this first; the sections below predate it.** Measured on Windows/RTX 4090 with the normal
+`prosper-app` at 25% volume, one 150 s title-screen run per arm (needs `PROSPER_NULL_PAGE=1`). The
+title menu still renders over a black world.
+
+- **The largest dropped-draw cause is now vertex recompile, not Wave64.** After #4010's proven-vote
+  lowering, fragment `subgroup-contract` refusals fell from 37,118 to 11,636 uses over comparable runs.
+  `shader-recompile/vertex` became the top reason, at 26,211 draws on the pre-#4425 run.
+- **#4425 (main `0ebb929b`) removed two phantom raw-wide refusals.** One counted image reads as guest
+  writes; the other stopped the VCC walk at any VALU. Distinct refused NGG vertex programs went from
+  45 to 23. The world is still black.
+- **The remaining 23 are tracked in #4427.** 10 are blocked by the forward-only raw-wide proof (loops);
+  13 pass every code-side proof but are refused live for an untraced reason. Triage with
+  `shader_inspect <refused vs .bin> --raw-wide-proof`.
+- **Linux/AMD goes first** (maintainer decision), because native Wave64 removes the NVIDIA emulation
+  confound. The Windows-only Wave64 draft (#4384) is parked at `d23d963e`.
+- **Open alongside:** #4426 (`PROSPER_DBG=1` stalls Kena at startup on Windows) and #4419
+  (`DB_DEPTH_CONTROL` colour-on-depth bits are not applied).
+
 ## Current state — rung 2, gameplay reached with the world absent (2026-09-23)
 
 On `main` (which has both crash fixes, [#3817](https://github.com/mattias800/prosper/pull/3817) and
