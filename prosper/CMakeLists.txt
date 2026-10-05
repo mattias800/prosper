@@ -2342,6 +2342,11 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_frame_breakdown
     SOURCES tests/diagnostics/test_frame_breakdown.cpp
     LIBRARIES prosper_core)
+  # The wording of the Wave64 host line and of a refusal line: a recompile refusal must not read
+  # as a GPU limitation, and a narrow-subgroup device must be told what it will be missing.
+  prosper_add_gtest(test_wave64_host_line
+    SOURCES tests/diagnostics/test_wave64_host_line.cpp
+    LIBRARIES prosper_core)
   # The rules' detail strings go through a printf-attributed format() helper; the attribute only
   # checks anything under -Wformat, which prosper_core does not enable, so make a mismatch an ERROR
   # for this one translation unit (the gpu_replay precedent below: GCC diagnoses this at plain
@@ -5024,6 +5029,12 @@ endif()
       # Space Adventure Cobra's per-pixel light loop).
       prosper_add_gtest(test_fragment_loop_vcc_scratch
         SOURCES tests/gpu/recompiler/test_fragment_loop_vcc_scratch.cpp
+        INCLUDES tests frontends
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      # The renderer's start-up Wave64 host line, on whatever device runs the test.
+      prosper_add_gtest(test_wave64_host_announcement
+        SOURCES tests/gpu/execute/test_wave64_host_announcement.cpp
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
 

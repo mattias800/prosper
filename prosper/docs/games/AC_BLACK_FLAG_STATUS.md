@@ -68,7 +68,9 @@ as destination (`pc=20`), an `SMEM` load, and one `s_branch` the structured emit
 This is the same recompiler/resource-binding frontier recorded for other titles (`docs/gpu/RECOMPILER_REMAINING.md`,
 `docs/gpu/RESOURCE_BINDING.md`); it is not specific to this title. Not yet established: whether the host's
 32-lane subgroups (against the guest's wave64) are what blocks the two `subgroup-contract` fragment
-draws, since the compute refusals print `host-subgroups=unavailable`.
+draws, since the compute refusals print `host-subgroups=unavailable`. (That field never described the
+host on a `…/recompile` refusal: it had no host fields to print. Since #4530 those lines print
+`not-consulted`; only the two `subgroup-contract` lines carry the host range.)
 
 ## Current frontier
 
