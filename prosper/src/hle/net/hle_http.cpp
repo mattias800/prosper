@@ -946,8 +946,8 @@ HLE(h_http_unset_epoll) {   // (id) -> SCE_OK, binding cleared
 // sceHttpSendRequest fails synchronously, so nothing is in flight to complete. So this answers 0
 // events and writes nothing -- after sleeping for the requested timeout, bounded, outside the
 // lock, so a caller polling in a loop cannot busy-spin. CONFIDENCE: LOW on the timeout's units
-// (treated as microseconds) and on non-positive timeouts (unverified; treated as a short bounded
-// wait rather than blocking forever). A handle prosper never handed out is refused like a null one.
+// (treated as microseconds) and on negative timeouts (unverified; treated as a short bounded wait
+// rather than blocking forever). A zero timeout returns at once. A handle prosper never handed out is refused like a null one.
 HLE(h_http_wait_epoll) {
     (void)a4;
     (void)a5;
@@ -958,6 +958,9 @@ HLE(h_http_wait_epoll) {
     }
     constexpr int64_t kMaxWaitUs = 50'000;
     const int64_t timeout = (int32_t)a3;
+    // The module hands the timeout straight to the libSceNet epoll wait, where 0 means "check and
+    // return": a title polling with 0 every frame must not pay the bounded sleep.
+    if (timeout == 0) return 0;
     const int64_t wait_us = timeout > 0 ? std::min(timeout, kMaxWaitUs) : kMaxWaitUs;
     std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
     return 0;
