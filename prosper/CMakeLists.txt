@@ -2550,6 +2550,10 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_nested_wide_data_admission
     SOURCES tests/gpu/execute/test_nested_wide_data_admission.cpp
     LIBRARIES prosper_core)
+  # #4439: which ordered DMA copies need the pending span's authoritative readback.
+  prosper_add_gtest(test_dma_span_authority
+    SOURCES tests/gpu/execute/test_dma_span_authority.cpp
+    LIBRARIES prosper_core)
   # Registered nested snapshot admission uses the Linux direct-memory lazy-fault proof.
   # Callback/compute stand-ins exercise ordered execution without creating a Vulkan device.
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
