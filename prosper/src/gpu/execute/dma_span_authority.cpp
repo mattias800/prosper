@@ -1,5 +1,6 @@
 #include "gpu/execute/dma_span_authority.hpp"
 #include "diagnostics/exit_census.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -24,8 +25,9 @@ enum class Reason { Plain, SourceOverlap, DestinationOverlap, UnprovedExtent, Na
 // `plain` means "no readback requested", which includes copies with no pending span at all.
 struct Census {
     std::atomic<uint64_t> counts[static_cast<size_t>(Reason::Count)]{};
-    // The unproved-extent copies, by the first target's refusal (#4457), and by tile mode for the
-    // tile-mode refusals. A binding mirrored from a named alias alone carries None.
+    // The copies with no bound on a target's extent, by that target's exact-extent refusal (#4457),
+    // and by tile mode for the tile-mode refusals. A binding mirrored from a named alias alone
+    // carries None.
     std::array<std::atomic<uint64_t>, static_cast<size_t>(ColorExtentRefusal::Count)> unproved{};
     std::array<std::atomic<uint64_t>, 32> unproved_tile_mode{};
 };
@@ -87,13 +89,21 @@ Reason count_unproved(const DrawItem::ColorTargetBinding& target) {
 
 Reason classify(const std::vector<DrawItem>& span, uint64_t dst, uint64_t src, uint32_t bytes,
                 uint32_t sels) {
+    // PROSPER_DMA_EXACT_EXTENT_ONLY: the #4457 A/B control. It ignores the conservative bound, so
+    // every target without a proved exact extent counts as touched, as before.
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): one process-lifetime read; nothing sets it mid-run.
+    static const bool exact_only = PROSPER_ENV_ON("PROSPER_DMA_EXACT_EXTENT_ONLY");
     const bool source_gds = ((sels >> 8u) & 0xffu) == 1u;
     const bool destination_gds = (sels & 0xffu) == 1u;
     for (const DrawItem& draw : span) {
         for (uint32_t slot = 0; slot < draw.color_targets.size(); ++slot) {
             const auto& target = draw.color_targets[slot];
             if (!target.base) continue;
-            const uint64_t extent = target.raw_snapshot_footprint_bytes;
+            // The bound is never below the exact extent; taking both keeps a binding that carries
+            // only the exact one (a hand-built DrawItem) proved.
+            const uint64_t extent = exact_only ? target.raw_snapshot_footprint_bytes
+                                               : std::max(target.footprint_bound_bytes,
+                                                          target.raw_snapshot_footprint_bytes);
             if (!extent) return count_unproved(target);
             if (!source_gds && ranges_overlap(src, bytes, target.base, extent))
                 return Reason::SourceOverlap;

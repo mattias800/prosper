@@ -16,15 +16,19 @@ namespace prosper::gpu {
 //
 // So keep it, conservatively, only for a copy that touches a colour target the span renders --
 // there the old ordering is preserved exactly -- and skip it for every other copy (#4439: ~48 MB
-// per flip on Alex Kidd for copies that touch none). An unproved target extent, or a named
-// color0/color1 base its slot binding does not prove, counts as touched. A GDS operand (selector
-// 1) is an offset, not guest memory, and is ignored.
+// per flip on Alex Kidd for copies that touch none). A target's extent is its conservative upper
+// bound (DrawItem::ColorTargetBinding::footprint_bound_bytes, #4457), so an MSAA or unusual-swizzle
+// target still has one; a target with no bound, or a named color0/color1 base its slot binding does
+// not prove, counts as touched. A GDS operand (selector 1) is an offset, not guest memory, and is
+// ignored.
 bool dma_needs_authoritative_span(const std::vector<DrawItem>& span, uint64_t dst, uint64_t src,
                                   uint32_t bytes, uint32_t sels);
 
 // The executor's decision. PROSPER_DMA_ALWAYS_AUTHORITATIVE (set, any value) restores the
-// unconditional readback as the same-binary A/B control. It is a guest-behaviour selector because
-// authoritative mode declines volume producer passes in the span, which changes what renders.
+// unconditional readback as the same-binary A/B control; PROSPER_DMA_EXACT_EXTENT_ONLY (set, any
+// value) keeps the scoped rule but drops the #4457 bound, so only proved exact extents count as
+// untouched. Both are guest-behaviour selectors because authoritative mode declines volume producer
+// passes in the span, which changes what renders.
 // Any copy record with dst/src/bytes/sels (the live GpuState::DmaCopy and the replay copy).
 template <class Copy>
 bool dma_flush_authoritative(const std::vector<DrawItem>& span, const Copy& copy) {
