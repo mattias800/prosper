@@ -66,6 +66,7 @@ testpaths = [
     "prosper/tools/re/test_hle_handler_map.py",
     "prosper/tools/snapshot/test_snapshot.py",
     "prosper/tools/test_worktree_reclaim.py",
+    "prosper/tools/progress/test_progress.py",
 ]
 # --import-mode=importlib does not put a test's folder on sys.path, and these tests import their
 # sibling tool by bare name.
@@ -73,5 +74,6 @@ pythonpath = [
     "prosper/tools/doctor",
     "prosper/tools/perf",
     "prosper/tools/pixel_history",
+    "prosper/tools/progress",
 ]
 addopts = ["-p", "no:cacheprovider", "--import-mode=importlib"]
