@@ -50,7 +50,8 @@ static uint16_t f32_to_f16_exact(float f) {
     uint32_t m = (x & 0x7fffffu) >> 13;
     return (uint16_t)(sign | ((uint32_t)e << 10) | m);
 }
-static uint32_t bits_of(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+// Not static: test_rdna2_scalar_alu.cpp declares and shares it.
+uint32_t bits_of(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 static uint32_t bitrev32(uint32_t v) { uint32_t r = 0; for (int i = 0; i < 32; i++) { r = (r << 1) | (v & 1u); v >>= 1; } return r; }
 static size_t count_spirv_opcode(const std::vector<uint32_t>& spv, uint16_t opcode) {
     size_t matches = 0;

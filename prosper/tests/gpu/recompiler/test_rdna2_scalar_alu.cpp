@@ -1,17 +1,18 @@
 // test_rdna2_scalar_alu.cpp -- the scalar-ALU kernel assertions (kernels 5-9 plus the SOP2
-// complement/SUBB contract arms), moved VERBATIM out of test_rdna2_to_spirv.cpp's main(). The
-// block was self-contained: it referenced no declaration from main's scope except the harness
-// size N (replicated below), which is what made it movable without a rewrite.
+// complement/SUBB contract arms), moved VERBATIM out of test_rdna2_to_spirv.cpp's main(). From
+// main's scope the block uses only the harness size N (replicated below) and bits_of (declared
+// below, defined in test_rdna2_to_spirv.cpp). One variable it defined, in6, was read later by
+// main's T11g kernel; main now rebuilds in6 there with the same formula.
 //
 // The invariant that makes the move checkable is the executed-assertion count. main() records
 // the count before calling run_scalar_alu_checks() and requires the delta to be exactly 22, so
-// a block that failed to arrive fails the test instead of quietly shrinking the suite. Verified
-// by mutation: an empty run_scalar_alu_checks() exits 1 with "contributed 0 checks, expected
+// a block that failed to arrive fails the test instead of quietly shrinking the suite: linked
+// against an empty run_scalar_alu_checks(), main() exits 1 with "contributed 0 checks, expected
 // 22". (21 CHECK statements; the VCC half-merge arm runs twice, so 22 executions.)
 //
-// The declarations below this comment are the original file's preamble, replicated so this
-// translation unit compiles. Most of it is unused here and is kept identical rather than pruned,
-// so the two files' shared prologue stays comparable.
+// Below this comment is only what the moved block needs: the includes, `extern` declarations of
+// main()'s `fails` and `checks` counters, and the same `CHECK` macro text main() uses. The original
+// file's static helpers are not copied.
 
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -40,7 +41,7 @@ extern int checks;
                          if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
-static uint32_t bits_of(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+uint32_t bits_of(float f);   // defined in test_rdna2_to_spirv.cpp
 
 // Harness size, mirroring main's `const uint32_t N = 128;`.
 const uint32_t N = 128;
