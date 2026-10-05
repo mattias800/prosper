@@ -354,7 +354,8 @@ def check_rules(
                             f"{rule_id}: runtime:{arg} is not a perf-alarm rule in {ALARM_RULES.name}",
                         )
                     )
-                elif kind in ("ctest", "ci", "runtime") and not arg:
+                # An enforcement KIND named "ctest", not a ctest command line.
+                elif kind in ("ctest", "ci", "runtime") and not arg:  # ctest-gate: listing
                     findings.append(Finding("enforcement", rel, f"{rule_id}: {kind}: needs a name"))
                 elif kind == "review" and not re.search(r"review:\S*\s*\(\S", enf.group(1)):
                     findings.append(
