@@ -34,6 +34,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace prosper::gpu;
