@@ -5335,7 +5335,7 @@ falsification.
   PR #4421. (1) `graphics_program_requires_owned_waves()` re-walked the shader and re-ran the
   raw wave-wide dataflow several times per draw; reading the decode cache's classification gives
   ABBA **5.30 / 5.09 vs 2.93 / 2.90**. (2) Every owned-wave draw triggered an authoritative
-  flush, reading back ~22 MiB of prior targets (66–147 GB per 300 s run), even though register
+  flush, reading back ~22 MiB of prior targets (65,882–148,049 MiB per 300 s run), even though register
   state (CMASK/FMASK/DCC metadata on the colour target) already refused the draw. Skipping that
   flush gives, same binary and interleaved, **6.45 / 6.53 / 6.53 vs 5.24 / 5.45 / 5.51** (one skip arm under a
   foreign build at load ~7 read 4.78 and was rerun). Together: **2.90 → ~6.5**. The rest of the
