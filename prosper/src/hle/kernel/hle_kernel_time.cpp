@@ -438,7 +438,7 @@ constexpr uint64_t kRtcErrBadParse = (uint64_t)(int64_t)(int32_t)0x80B50007u;
 // Win32 FILETIME epoch (1601-01-01) in RTC ticks. Pinned against shadPS4's
 // WIN32_FILETIME_EPOCH_TICKS rather than derived silently.
 constexpr uint64_t kRtcWin32EpochOffsetUs = (62135596800ull - 11644473600ull) * 1000000ull;
-static_assert(kRtcWin32EpochOffsetUs == 0xb36168b6a58000ull, "Win32 FILETIME epoch in µs");
+static_assert(kRtcWin32EpochOffsetUs == 0xb36168b6a58000ull, "Win32 FILETIME epoch in microseconds");
 
 bool rtc_is_leap(int y) {
     return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
