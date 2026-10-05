@@ -72,8 +72,9 @@ public:
             const uint64_t key = (static_cast<uint64_t>(state.index) << 8u) | state.live;
             if (!visited.insert(key).second) continue;
             const Rdna2Inst& in = ins[state.index];
+            // s_movrels_b32 is not in this set: reads_data below sees its source range.
             if (in.fmt == Rdna2Format::Unknown || !in.len_dwords ||
-                rdna2_escapes_decoded_effects(in))
+                rdna2_may_write_unnamed_register_or_leave_cfg(in))
                 return blocked(in.pc, "unknown-or-indirect-control");
             if (in.is_end) continue;
             if (reads_data(in, state.live)) return blocked(in.pc, "data-read");
@@ -126,22 +127,39 @@ public:
                  (op >= 0xa9u && op <= 0xaeu) || (op >= 0xc1u && op <= 0xc6u) ||
                  (op >= 0xc9u && op <= 0xceu) || (op >= 0xe1u && op <= 0xe6u));
         };
-        auto writes_scc = [](const Rdna2Inst& in) {
-            if (in.fmt == Rdna2Format::SOPC) return true;
-            if (in.fmt == Rdna2Format::SOP1)
-                return !sop1_opcode_leaves_scc_unmodified(in.opcode);
+        // What an instruction does to a derived SCC. Replaces: SCC is rewritten, so it is derived
+        // exactly when this instruction read something derived. Keeps: SCC is untouched. Unknown:
+        // it may be either, and a taint has to survive that -- a write is assumed for what it
+        // adds and not for what it would clear. The old rule cleared on "not known to keep",
+        // which ended a compare-on-a-loaded-word at s_ff1_i32_b32, at the relative moves and at
+        // two of the three SOP2 packs, all of which leave SCC alone.
+        enum class SccEffect { Keeps, Replaces, Unknown };
+        auto scc_effect = [](const Rdna2Inst& in) {
+            if (in.fmt == Rdna2Format::SOPC) return SccEffect::Replaces;
+            if (in.fmt == Rdna2Format::SOP1) {
+                if (sop1_opcode_writes_scc(in.opcode)) return SccEffect::Replaces;
+                return sop1_opcode_leaves_scc_unmodified(in.opcode) ? SccEffect::Keeps
+                                                                    : SccEffect::Unknown;
+            }
             if (in.fmt == Rdna2Format::SOPK)
-                return (in.opcode >= kSopkOpcodeCmpkFirst &&
-                        in.opcode <= kSopkOpcodeCmpkLast) ||
-                       in.opcode == kSopkOpcodeAddkI32;
-            if (in.fmt == Rdna2Format::SOP2)
-                return in.opcode != 0x0au && in.opcode != 0x0bu &&
-                       in.opcode != kSop2OpcodeBfmB32 &&
-                       in.opcode != kSop2OpcodeBfmB64 &&
-                       in.opcode != 0x26u &&
-                       in.opcode != kSop2OpcodePackLlB32B16 &&
-                       in.opcode != 0x35u && in.opcode != 0x36u;
-            return false;
+                return (in.opcode >= kSopkOpcodeCmpkFirst && in.opcode <= kSopkOpcodeCmpkLast) ||
+                               in.opcode == kSopkOpcodeAddkI32
+                           ? SccEffect::Replaces
+                           : SccEffect::Keeps;
+            if (in.fmt == Rdna2Format::SOP2) {
+                // gfx10 SOP2: cselect reads SCC; BFM, MUL, the three packs and MUL_HI leave it.
+                if (in.opcode == 0x0au || in.opcode == 0x0bu || in.opcode == kSop2OpcodeBfmB32 ||
+                    in.opcode == kSop2OpcodeBfmB64 || in.opcode == 0x26u ||
+                    (in.opcode >= 0x32u && in.opcode <= 0x36u))
+                    return SccEffect::Keeps;
+                // add/sub/min/max, the logicals and shifts, BFE, ABSDIFF, LSHLn_ADD.
+                if (in.opcode <= 0x09u || (in.opcode >= 0x0eu && in.opcode <= 0x23u) ||
+                    (in.opcode >= 0x27u && in.opcode <= 0x2au) || in.opcode == 0x2cu ||
+                    (in.opcode >= 0x2eu && in.opcode <= 0x31u))
+                    return SccEffect::Replaces;
+                return SccEffect::Unknown;
+            }
+            return SccEffect::Keeps;
         };
         size_t processed = 0;
         while (!pending.empty()) {
@@ -174,7 +192,13 @@ public:
             // Indirect control, a subvector loop, or an M0-relative move. The range this used
             // to test for the last of those, 0x28..0x2a, is three B64 saveexec forms: they were
             // refused here for nothing, and the real relative moves were not refused at all.
-            if (rdna2_escapes_decoded_effects(in))
+            // s_movrels_b32 is not in this set either. It is an ordinary scalar derivation here:
+            // source_width() gives it every register from its base up to s105, so a loaded word
+            // in that range taints the destination, and a later numeric reader of the
+            // destination stops the walk. It cannot end a derived SCC (scc_effect above), and its
+            // index, M0, is never a derived word when control gets here: see
+            // derived-value-enters-m0.
+            if (rdna2_may_write_unnamed_register_or_leave_cfg(in))
                 return blocked(in.pc, "unmodelled-control-or-relative-sgpr");
 
             if (state.scc && in.fmt == Rdna2Format::SOPP &&
@@ -354,7 +378,16 @@ public:
                     if (copied[k] && in.dst.value >= 0 &&
                         in.dst.value + static_cast<int>(k) < 128)
                         state.regs.set(static_cast<size_t>(in.dst.value + k));
-            if (writes_scc(in)) state.scc = derived_read;
+            // M0 is read by instructions that never name it: the relative moves (s_movrels_b32
+            // is walked through above, and v_movrels_b32 gets no special treatment here), the
+            // LDS and append/consume forms, and s_sendmsg. A loaded word that reaches M0 is
+            // consumed as a number by whichever of them runs next, and no operand scan can see
+            // that, so it is counted here, where the word goes in.
+            if (state.regs.test(124)) return blocked(in.pc, "derived-value-enters-m0");
+            if (const SccEffect effect = scc_effect(in); effect == SccEffect::Replaces)
+                state.scc = derived_read;
+            else if (effect == SccEffect::Unknown)
+                state.scc = state.scc || derived_read;
             if (!state.regs.any() && !state.scc) continue;
 
             auto enqueue = [&](size_t next) {
@@ -433,9 +466,9 @@ private:
     // "No instruction ever writes" is only as good as the writer inventory, so everything that
     // inventory is known not to see through refuses outright, wherever it sits in the program:
     // rdna2_may_write_unnamed_register_or_leave_cfg (calls, indirect transfers, subvector loops,
-    // M0-relative DESTINATION moves) and any SMEM instruction other than a plain load. A
-    // source-relative move reads through M0 and cannot change the base pair, so it is not on
-    // this list; the walks stop at it instead. That is the known list, not a
+    // M0-relative moves other than s_movrels_b32) and any SMEM instruction other than a plain
+    // load. s_movrels_b32 reads through M0 and cannot change the base pair, so it is not on this
+    // list; the walks see its read range instead. That is the known list, not a
     // proof of completeness; an instruction for_each_scalar_write misreports and this does not
     // name would be a hole here.
     bool replay_observes_same_bytes() const {

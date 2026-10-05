@@ -68,6 +68,20 @@ inline constexpr bool sop1_opcode_leaves_scc_unmodified(uint32_t opcode) {
            opcode == kSop1OpcodeBitset1B32 || opcode == kSop1OpcodeGetpcB64 ||
            opcode == kSop1OpcodeBitreplicateB64B32;
 }
+// SOP1 opcodes that DEFINITELY write SCC: the gfx10 pseudos that carry `Defs = [SCC]`, directly or
+// through the SAVEEXEC/WREXEC `Defs = [EXEC, SCC]` group. This is not the complement of the list
+// above. An opcode on neither list is one nothing may assume either way, and which way is safe
+// depends on the question: a proof that SCC is unmodified must treat it as written, and a taint
+// that a write clears must treat it as not written. The raw-wide walk asked the first question's
+// list the second question, so s_ff1_i32_b32 and the relative moves ended a compare's lifetime.
+inline constexpr bool sop1_opcode_writes_scc(uint32_t opcode) {
+    return (opcode >= 0x07u && opcode <= 0x0au) ||   // S_NOT_B32/B64, S_WQM_B32/B64
+           (opcode >= 0x0du && opcode <= 0x10u) ||   // S_BCNT0/BCNT1_I32_B32/B64
+           (opcode >= 0x24u && opcode <= 0x2du) ||   // SAVEEXEC_B64 x8, S_QUADMASK_B32/B64
+           opcode == 0x34u ||   // S_ABS_I32
+           (opcode >= 0x37u && opcode <= 0x3au) ||   // ANDN1/ORN1_SAVEEXEC, ANDN1/ANDN2_WREXEC B64
+           (opcode >= 0x3cu && opcode <= 0x47u);   // SAVEEXEC_B32 x10, ANDN1/ANDN2_WREXEC_B32
+}
 inline constexpr uint32_t kSop1OpcodeSetpcB64 = 0x20;
 inline constexpr uint32_t kSop1OpcodeSwappcB64 = 0x21;
 inline constexpr uint32_t kSop1OpcodeRfeB64 = 0x22;
@@ -546,16 +560,19 @@ inline bool rdna2_escapes_decoded_effects(const Rdna2Inst& in) {
     return false;
 }
 
-// The subset that can CHANGE a register its operands do not name, or run code off the direct CFG:
-// everything above except the source-relative moves. s_movrels_b32/b64 read SGPR[src + M0] and
-// write the destination they name, so a proof about "nothing writes register R" or "control stays
-// on the decoded edges" is unaffected by one -- only a walk that tracks who READS a register has
-// to stop at it. The distinction is not academic: s_movrels_b32 is lowered (rdna2_movrels.cpp),
-// so refusing on its mere presence would take a proof away from a shader that compiles.
+// The subset an analysis cannot model through its operands alone: everything above except
+// s_movrels_b32. That one reads SGPR[src + M0] and writes the destination it names. Its write is
+// ordinary, and its read is modelled where reads matter: scalar_alu_source_words() charges it
+// every register from its source up to s105 (#4538). So a proof about "nothing writes register
+// R" or "control stays on the decoded edges" is unaffected by one, and a walk that tracks who
+// READS a register sees the range instead of stopping. The distinction is not academic:
+// s_movrels_b32 is lowered (rdna2_movrels.cpp), so refusing on its mere presence would take a
+// proof away from a shader that compiles.
+// s_movrels_b64 stays in. Its read range and its pair write are inventoried the same way, but it
+// is not lowered, so no shader containing one compiles and admitting it would buy nothing.
 inline bool rdna2_may_write_unnamed_register_or_leave_cfg(const Rdna2Inst& in) {
     return rdna2_escapes_decoded_effects(in) &&
-           !(in.fmt == Rdna2Format::SOP1 &&
-             (in.opcode == kSop1OpcodeMovrelsB32 || in.opcode == kSop1OpcodeMovrelsB64));
+           !(in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovrelsB32);
 }
 
 // Decode the single instruction at code[0..]; `max_dwords` bounds the read. On a truncated/unknown
