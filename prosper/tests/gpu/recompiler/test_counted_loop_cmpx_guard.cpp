@@ -26,12 +26,16 @@
 // The positives that can run are executed: lanes the compare switches off must keep their prior
 // value, and a buffer read inside the region must deliver its data to the lanes that stay on.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include <gtest/gtest.h>
 #include "gpu/resources/shader_resources.hpp"
 #include "fixtures/compute_runner.h"
 
 #include <cmath>
 #include <cstdint>
+#include <unordered_set>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -71,7 +75,8 @@ const uint32_t kBoundedReadInRegion[] = {
     0xBF8C3F70u, 0xB0020005u, 0xBE800380u, 0x7E020280u, 0xBF090200u, 0xBF850003u, 0x4A020200u,
     0x80008100u, 0xBF82FFFBu, 0x4A020304u, 0x7E060D01u, 0xBEFE0404u, 0xBF810000u,
 };
-// N_store. As P3, but the region holds buffer_store_dword v0, v0, s[8:11], 0 idxen instead.
+// N_store. As P3, but the region holds buffer_store_dword v0, v0, s[8:11], 0 idxen instead of the
+// load, and the v_add that consumed the loaded value is dropped with it.
 const uint32_t kStoreInRegion[] = {
     0x7E000F00u, 0x7E060280u, 0xBE84047Eu, 0x7DA800A0u, 0xBF88000Cu, 0xE0702000u, 0x80020000u,
     0xBF8C3F70u, 0xB0020005u, 0xBE800380u, 0x7E020280u, 0xBF090200u, 0xBF850003u, 0x4A020200u,
@@ -83,6 +88,46 @@ const uint32_t kStoreAfterRestore[] = {
     0x7E020280u, 0xBF090200u, 0xBF850003u, 0x4A020200u, 0x80008100u, 0xBF82FFFBu, 0x7E060D01u,
     0xBEFE0404u, 0xE0702000u, 0x80020000u, 0xBF810000u,
 };
+
+// P1r. As P1, plus v_add_f32 v3, 1.0, v3 after the restore: every lane must be live again there.
+const uint32_t kGuardThenWriteAfterRestore[] = {
+    0x7E000F00u, 0x7E060280u, 0xBE84047Eu, 0x7DA800A0u, 0xBF880009u, 0xB0020005u, 0xBE800380u,
+    0x7E020280u, 0xBF090200u, 0xBF850003u, 0x4A020200u, 0x80008100u, 0xBF82FFFBu, 0x7E060D01u,
+    0xBEFE0404u, 0x060606F2u, 0xBF810000u,
+};
+// Direct tests of mark_counted_loop_exec_guards. In a compute stage the emitter refuses these
+// shapes anyway, so recompiling them cannot show which check fired; the proof is asked directly.
+// D_window. As P2, plus `s_cmp_eq_u32 s1, 0; s_cbranch_scc1` jumping onto the restore (inside the
+// window after the branch target). The guarded execz is at pc 6.
+const uint32_t kBranchIntoRestoreWindow[] = {
+    0x7E000F00u, 0xBF068001u, 0xBF85000Eu, 0x7E060280u, 0xBE84047Eu, 0x7DA800A0u, 0xBF880009u,
+    0xB0020005u, 0xBE800380u, 0x7E020280u, 0xBF090200u, 0xBF850003u, 0x4A020200u, 0x80008100u,
+    0xBF82FFFBu, 0x7E060D01u, 0xBF8CC07Fu, 0xBEFE0404u, 0xBF810000u,
+};
+// D_save. As P1, plus a branch onto the v_cmpx (between the save and the guarded execz at pc 6).
+const uint32_t kBranchBetweenSaveAndNarrow[] = {
+    0x7E000F00u, 0xBF068001u, 0xBF850002u, 0x7E060280u, 0xBE84047Eu, 0x7DA800A0u, 0xBF880009u,
+    0xB0020005u, 0xBE800380u, 0x7E020280u, 0xBF090200u, 0xBF850003u, 0x4A020200u, 0x80008100u,
+    0xBF82FFFBu, 0x7E060D01u, 0xBEFE0404u, 0xBF810000u,
+};
+// D_smem. As P1, plus s_dcache_inv (SMEM 0x20, a memory writer to the classifier) in the region.
+const uint32_t kScalarMemoryWriterInRegion[] = {
+    0x7E000F00u, 0x7E060280u, 0xBE84047Eu, 0x7DA800A0u, 0xBF88000Bu, 0xF4800000u, 0x00000000u,
+    0xB0020005u, 0xBE800380u, 0x7E020280u, 0xBF090200u, 0xBF850003u, 0x4A020200u, 0x80008100u,
+    0xBF82FFFBu, 0x7E060D01u, 0xBEFE0404u, 0xBF810000u,
+};
+
+// Decode `code`, find its counted loop and report whether the guard branch at `execz_pc` was proven.
+template <size_t N>
+bool guard_proven(const uint32_t (&code)[N], uint32_t execz_pc) {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, N, ins);
+    const CountedLoop loop = detect_counted_loop(ins);
+    EXPECT_TRUE(loop.found) << "fixture must contain a counted loop";
+    std::unordered_set<uint32_t> safe;
+    mark_counted_loop_exec_guards(ins, loop, safe);
+    return safe.count(execz_pc) != 0;
+}
 
 // The buffer at s[8:11] is the runner's `cbuf` (binding 2), one dword per lane.
 ShaderResourceTable buffer_table() {
@@ -134,13 +179,25 @@ TEST(CountedLoopCmpxGuard, RefusesWhatTheGuardCannotProve) {
         << "a store inside the skipped region would run for a wave the guest skipped";
 }
 
-TEST(CountedLoopCmpxGuard, SwitchedOffLanesKeepTheirValue) {
-    const std::vector<uint32_t> spv = compile(kGuardAtTarget);
+TEST(CountedLoopCmpxGuard, SwitchedOffLanesKeepTheirValueAndReturnAtTheRestore) {
+    const std::vector<uint32_t> spv = compile(kGuardThenWriteAfterRestore);
     ASSERT_FALSE(spv.empty());
     const std::vector<float> got = prosper::test::run_compute(spv, lane_indices(), kLanes, kLanes);
     if (got.empty()) GTEST_SKIP() << "no Vulkan compute device";
+    // Inside the guard only x < 32 add the loop's sum (10); after the restore every lane adds 1.
     for (uint32_t lane = 0; lane < kLanes; ++lane)
-        EXPECT_FLOAT_EQ(got[lane], lane < 32 ? 10.0f : 0.0f) << "lane " << lane;
+        EXPECT_FLOAT_EQ(got[lane], lane < 32 ? 11.0f : 1.0f) << "lane " << lane;
+}
+
+TEST(CountedLoopCmpxGuard, ProofRefusesEntryIntoTheGuardAndScalarMemoryWriters) {
+    ASSERT_TRUE(guard_proven(kGuardAtTarget, 4)) << "control: the plain form is proven";
+    ASSERT_TRUE(guard_proven(kRestoreAfterTarget, 4)) << "control: a restore after the target";
+    EXPECT_FALSE(guard_proven(kBranchIntoRestoreWindow, 6))
+        << "a branch landing between the target and the restore skips part of the window";
+    EXPECT_FALSE(guard_proven(kBranchBetweenSaveAndNarrow, 6))
+        << "a branch landing between the save and the branch reaches the narrow without the save";
+    EXPECT_FALSE(guard_proven(kScalarMemoryWriterInRegion, 4))
+        << "a scalar memory writer in the region would run for a wave the guest skipped";
 }
 
 TEST(CountedLoopCmpxGuard, ReadInsideTheRegionReachesTheActiveLanes) {
