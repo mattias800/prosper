@@ -489,3 +489,55 @@ TEST(GapOpcodeRefusals, Dot2F32Refuse) {
     expect_gap_refusal(program(kVop3Prologue, {dotf[0], dotf[1]}), 0xA0E1ull, 4,
                        {dotf[0], dotf[1]}, Rdna2Format::VOP3P, 0x13u);
 }
+
+// Unlowered 64-bit (x2) MUBUF atomics must refuse fail-visibly.
+// buffer_atomic_add_x2/and_x2 need a true qword RMW, which does not exist
+// (only swap_x2/or_x2 have separately guarded lowerings, and widening a
+// 32-bit atomic in place would be a different operation). All words below
+// are llvm-mc gfx1030 round-tripped with the idxen form. The control is the
+// 32-bit buffer_atomic_add with the x2 words' operand fields (idxen, VADDR v2,
+// data v0) over the same table entry -- only the opcode differs -- and it is
+// lowered.
+// WHEN an x2 lowering lands, ITS CASE GOES RED; replace it with an execution
+// test of the new lowering.
+TEST(GapOpcodeRefusals, BufferAtomicX2Refuse) {
+    static const uint32_t addx2[2] = {0xe1482000u, 0x80020002u};
+    static const uint32_t andx2[2] = {0xe1642000u, 0x80020002u};
+    static const uint32_t add[2] = {0xe0c82000u, 0x80020002u};   // add v0, v2, idxen
+    for (const uint32_t* words : {addx2, andx2, add}) {
+        const Rdna2Inst dec = rdna2_decode_one(words, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MUBUF);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    EXPECT_EQ(rdna2_decode_one(addx2, 2).opcode, 0x52u);
+    EXPECT_EQ(rdna2_decode_one(andx2, 2).opcode, 0x59u);
+    EXPECT_EQ(rdna2_decode_one(add, 2).opcode, 0x32u);
+
+    ShaderResourceTable rt;
+    {
+        ShaderResource buf{};
+        buf.cls = ResourceClass::ConstantBuffer;
+        buf.format = DataFormat::Uint32;
+        buf.num_components = 1;
+        buf.binding = 3;
+        buf.stride = 4;
+        buf.sgpr_base = 8;
+        rt.resources.push_back(buf);
+    }
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(12);   // s8..s11 V# are entry-time user data
+    const std::vector<uint32_t> prologue = {
+        0x7e000280u,   // v_mov_b32 v0, 0 (data, low dword)
+        0x7e020283u,   // v_mov_b32 v1, 3 (data, high dword of the x2 forms)
+        0x7e040280u,   // v_mov_b32 v2, 0 (idxen element index)
+    };
+    expect_compiles(program(prologue, {add[0], add[1]}), 0xA0F0ull,
+                    "control: 32-bit buffer_atomic_add over the same entry",
+                    &rt, config);
+    expect_gap_refusal(program(prologue, {addx2[0], addx2[1]}), 0xA0F1ull, 3,
+                       {addx2[0], addx2[1]}, Rdna2Format::MUBUF, 0x52u, &rt,
+                       config);
+    expect_gap_refusal(program(prologue, {andx2[0], andx2[1]}), 0xA0F2ull, 3,
+                       {andx2[0], andx2[1]}, Rdna2Format::MUBUF, 0x59u, &rt,
+                       config);
+}
