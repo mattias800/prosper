@@ -2483,6 +2483,12 @@ if(TARGET prosper_core)
     SOURCES tests/host/test_dmem.cpp
     LIBRARIES prosper_core)
 
+  # A fixed direct map replaces tracked direct memory; flexible memory and untracked ranges stay refused.
+  prosper_add_gtest(test_dmem_fixed_remap
+    SOURCES tests/hle/memory/test_dmem_fixed_remap.cpp
+    INCLUDES src
+    LIBRARIES prosper_core)
+
   # A refused fixed direct-memory map must preserve the allocation for a later retry.
   prosper_add_gtest(test_dmem_map_failure_rollback
     SOURCES tests/hle/memory/test_dmem_map_failure_rollback.cpp
