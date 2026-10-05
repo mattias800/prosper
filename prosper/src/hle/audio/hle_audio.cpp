@@ -3570,6 +3570,202 @@ HLE10(ajm_batch_job_set_resample_ex) { return 0; } // resample params: the host 
 // CONFIDENCE: LOW that returning success-without-writes is safe beyond GRIS.
 HLE10(ajm_batch_job_get_resample_info) { return 0; }
 HLE10(ajm_batch_job_get_statistics) { return 0; }
+
+// --- AJM direct-job shapes: queue onto the batch like the builders above ----------------------
+// These take raw/single buffers (not Ra builders) but the same (info, instance, ...) prefix,
+// so each queues one AjmDecJob onto g_ajm2_jobs[batchInfo] for BatchStart to execute through the
+// real decode pipeline — the uniform model of this file, not a parallel implementation. A job
+// the executor cannot decode (unknown instance, undecodable bytes, PCM fed as compressed input
+// by Encode) fails loudly in its result sideband instead of writing silence. Validation mirrors
+// DecodeSplit: nulls, over-long sizes and fragment-count caps are INVALID_PARAMETER.
+// CONFIDENCE: HIGH on the queueing model (in-file); MED on each arity (single stub-interface
+// source); LOW on Encode ever succeeding (no encoder backend exists anywhere in prosper).
+HLE10(ajm_batch_job_decode_single) {
+    // (info, instance, in, inSize, out, outSize, result, ...): one-fragment decode job.
+    if (!a2 || !a4 || !a3 || !a5 || a3 > AJM_MAX_BUILDER_BYTES || a5 > AJM_MAX_BUILDER_BYTES)
+        return AJM_ERR_INVALID_PARAMETER;
+    AjmDecJob job;
+    job.instance = (uint32_t)a1;
+    job.result_addr = a6;
+    job.out_addr = a4;
+    job.out_size = (uint32_t)a5;
+    job.num_in = 1;
+    job.in_addr[0] = a2;
+    job.in_size[0] = (uint32_t)a3;
+    std::lock_guard<std::mutex> lk(g_ajm2_mx);
+    g_ajm2_jobs[a0].push_back(std::move(job));
+    return 0;
+}
+HLE10(ajm_batch_job_run) {
+    // (info, instance, flags, data_in, in_size, data_out, out_size, sideband_out, sideband_size):
+    // same single-job shape; flags are not recorded (no batch buffer to carry them — LOW).
+    if (!a3 || !a5 || !a4 || !a6 || a4 > AJM_MAX_BUILDER_BYTES || a6 > AJM_MAX_BUILDER_BYTES)
+        return AJM_ERR_INVALID_PARAMETER;
+    AjmDecJob job;
+    job.instance = (uint32_t)a1;
+    job.result_addr = a7;
+    job.out_addr = a5;
+    job.out_size = (uint32_t)a6;
+    job.num_in = 1;
+    job.in_addr[0] = a3;
+    job.in_size[0] = (uint32_t)a4;
+    std::lock_guard<std::mutex> lk(g_ajm2_mx);
+    g_ajm2_jobs[a0].push_back(std::move(job));
+    return 0;
+}
+HLE10(ajm_batch_job_run_split) {
+    // (info, instance, flags, in_bufs, in_num, out_bufs, out_num, sideband_out, sideband_size):
+    // multi-fragment variant; caps mirror DecodeSplit's structural 4-in/2-out job limits.
+    if (!a3 || !a5 || !a4 || !a6 || a4 < 1 || a4 > 4 || a6 < 1 || a6 > 2)
+        return AJM_ERR_INVALID_PARAMETER;
+    AjmDecJob job;
+    job.instance = (uint32_t)a1;
+    job.result_addr = a7;
+    uint64_t in_desc[2 * 4] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (audio_read_bytes_partial(a3, in_desc, sizeof(uint64_t) * 2 * (size_t)a4) !=
+        sizeof(uint64_t) * 2 * (size_t)a4)
+        return AJM_ERR_INVALID_PARAMETER;
+    job.num_in = (uint32_t)a4;
+    for (uint32_t f = 0; f < job.num_in; ++f) {
+        job.in_addr[f] = in_desc[2 * f];
+        const uint64_t sz = in_desc[2 * f + 1];
+        if (!job.in_addr[f] || sz > AJM_MAX_BUILDER_BYTES) return AJM_ERR_INVALID_PARAMETER;
+        job.in_size[f] = (uint32_t)sz;
+    }
+    uint64_t out_desc[2 * 2] = {0, 0, 0, 0};
+    if (audio_read_bytes_partial(a5, out_desc, sizeof(uint64_t) * 2 * (size_t)a6) !=
+        sizeof(uint64_t) * 2 * (size_t)a6)
+        return AJM_ERR_INVALID_PARAMETER;
+    job.out_addr = out_desc[0];
+    job.out_size = (uint32_t)std::min<uint64_t>(out_desc[1], AJM_MAX_BUILDER_BYTES);
+    if (!job.out_addr || !job.out_size) return AJM_ERR_INVALID_PARAMETER;
+    if (a6 > 1) {
+        job.out2_addr = out_desc[2];
+        job.out2_size = (uint32_t)std::min<uint64_t>(out_desc[3], AJM_MAX_BUILDER_BYTES);
+        if (!job.out2_addr || !job.out2_size) return AJM_ERR_INVALID_PARAMETER;
+    }
+    std::lock_guard<std::mutex> lk(g_ajm2_mx);
+    g_ajm2_jobs[a0].push_back(std::move(job));
+    return 0;
+}
+HLE10(ajm_batch_job_encode) {
+    // No encoder backend exists anywhere in prosper, so an encode job can never succeed — but
+    // leaving it unregistered answers success with an untouched sideband, which is worse. Queue
+    // it like every other job: the executor fails it loudly in its result sideband when the
+    // bytes do not decode. Validation mirrors DecodeSingle (same buffer contract).
+    if (!a2 || !a4 || !a3 || !a5 || a3 > AJM_MAX_BUILDER_BYTES || a5 > AJM_MAX_BUILDER_BYTES)
+        return AJM_ERR_INVALID_PARAMETER;
+    AjmDecJob job;
+    job.instance = (uint32_t)a1;
+    job.result_addr = a6;
+    job.out_addr = a4;
+    job.out_size = (uint32_t)a5;
+    job.num_in = 1;
+    job.in_addr[0] = a2;
+    job.in_size[0] = (uint32_t)a3;
+    // NOTE the swapped roles: Encode's PCM input decodes as nothing, so execution reports the
+    // decode error in the sideband rather than writing silence. a2/a3 select the input, a4/a5
+    // the output exactly as passed.
+    std::lock_guard<std::mutex> lk(g_ajm2_mx);
+    g_ajm2_jobs[a0].push_back(std::move(job));
+    return 0;
+}
+HLE10(ajm_batch_job_control) {
+    // (info, instance, flags, sideband_in, in_size, sideband_out, out_size): control commands
+    // take effect nowhere headless (no config state is modeled — cf. SetResampleParametersEx
+    // below, which is likewise a bare acknowledgement). Sidebands are optional, so there is
+    // nothing to validate: acknowledged unconditionally. LOW.
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    (void)a6;
+    (void)a7;
+    (void)a8;
+    (void)a9;
+    return 0;
+}
+HLE10(ajm_batch_job_get_codec_info) {
+    return 0;
+}   // result layout unpinned: see below
+HLE10(ajm_batch_job_get_gapless_decode) {
+    return 0;
+}
+HLE10(ajm_batch_job_get_info) {
+    return 0;
+}
+// GetCodecInfo/GetGaplessDecode/GetInfo answer SCE_OK without writing their out-parameters,
+// exactly like GetResampleInfo/GetStatistics above (same LOW-confidence note applies: GRIS
+// runs with those, and these three share the shape). Zero-filling needs the out-argument
+// layouts, which no live traffic has pinned yet.
+HLE10(ajm_batch_job_set_resample) {
+    return 0;
+}   // like SetResampleParametersEx: ack only
+HLE(ajm_memory_register) {   // (context, ptr, pages): the reference acknowledges unconditionally
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    return 0;
+}
+HLE(ajm_memory_unregister) {   // (context, ptr): likewise acknowledged
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    return 0;
+}
+// sceAjmDecAt9ParseConfigData(config_data*, info*) -> 0; info is five u32s:
+// {channels, sample_rate, frame_samples, superframe_samples, superframe_bytes}.
+// Parsed for real through the vendored ATRAC9 decoder (same init path the B2 decode path
+// drives); a bad config fails INVALID_PARAMETER rather than filling plausible numbers.
+HLE(ajm_dec_at9_parse_config) {
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    if (!a0 || !a1) return AJM_ERR_INVALID_PARAMETER;
+    uint8_t config[4]{};
+    if (!audio_read_bytes(a0, config, sizeof config)) return AJM_ERR_INVALID_PARAMETER;
+    Atrac9Decoder dec;
+    if (!dec.init(config)) return AJM_ERR_INVALID_PARAMETER;
+    uint32_t info[5]{};
+    info[0] = (uint32_t)dec.channels();
+    info[1] = (uint32_t)dec.sample_rate();
+    info[2] = (uint32_t)dec.frame_samples();
+    info[3] = (uint32_t)dec.superframe_samples();
+    info[4] = (uint32_t)dec.superframe_bytes();
+    if (!audio_store_bytes(a1, info, sizeof info)) return AJM_ERR_INVALID_PARAMETER;
+    return 0;
+}
+HLE(ajm_dec_mp3_parse_frame) {   // () -> 0; nothing to parse into headless
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    return 0;
+}
+// sceAjmStrError(error) -> a readable string. The per-code messages are not evidenced
+// anywhere, so this answers one static string for every input (log-only use) rather than a
+// fabricated table — and never null, which a %s formatter may not survive.
+HLE(ajm_str_error) {
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    static const char kMsg[] = "unknown AJM error";
+    return (uint64_t)(uintptr_t)kMsg;
+}
 HLE10(ajm_batch_start2) {
     // Run every decode job queued on this batchInfo (a1), in order, then clear it. Synchronous:
     // BatchWait then just returns success. GTA V passes its u32 batch-id output in a4 and immediately
@@ -4356,6 +4552,22 @@ void register_audio_hle() {
     R("sceAjmBatchJobGetResampleInfo", ajm_batch_job_get_resample_info);
     R("sceAjmBatchJobGetStatistics", ajm_batch_job_get_statistics);
     R("sceAjmBatchJobSetGaplessDecode", ajm_batch_job_gapless);
+    // Direct-job shapes: queue onto the batch like the builders above for BatchStart to
+    // execute; info getters answer without writes (same LOW note as their siblings above).
+    R("sceAjmBatchJobDecodeSingle", ajm_batch_job_decode_single);
+    R("sceAjmBatchJobRun", ajm_batch_job_run);
+    R("sceAjmBatchJobRunSplit", ajm_batch_job_run_split);
+    R("sceAjmBatchJobEncode", ajm_batch_job_encode);
+    R("sceAjmBatchJobControl", ajm_batch_job_control);
+    R("sceAjmBatchJobGetCodecInfo", ajm_batch_job_get_codec_info);
+    R("sceAjmBatchJobGetGaplessDecode", ajm_batch_job_get_gapless_decode);
+    R("sceAjmBatchJobGetInfo", ajm_batch_job_get_info);
+    R("sceAjmBatchJobSetResampleParameters", ajm_batch_job_set_resample);
+    R("sceAjmMemoryRegister", ajm_memory_register);
+    R("sceAjmMemoryUnregister", ajm_memory_unregister);
+    R("sceAjmDecAt9ParseConfigData", ajm_dec_at9_parse_config);
+    R("sceAjmDecMp3ParseFrame", ajm_dec_mp3_parse_frame);
+    R("sceAjmStrError", ajm_str_error);
     R("sceAjmBatchStart", ajm_batch_start2);
     Hle::register_fn("pgFAiLR5qT4", ngs2_system_query_buffer, "sceNgs2SystemQueryBufferSize");
     Hle::register_fn("koBbCMvOKWw", ngs2_system_create, "sceNgs2SystemCreate");
