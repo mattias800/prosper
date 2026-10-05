@@ -324,3 +324,87 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         recompile_fragment(fragment_prog.data(), fragment_prog.size(), &frag_rt_multi).empty())
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
+
+// IMAGE_STORE_MIP on a genuinely multi-level resource must refuse fail-visibly.
+// Words below are the live GTA V NSA 2D packet (test_dynfetch_fold.cpp): the
+// mip VGPR is v5 (word2 byte1), T# s[12:19]. NSA packets (len > 2) record
+// their terminal reason on the MIMG-address line rather than the straight-line
+// one (rdna2_emit_cfg.cpp), so the pin asserts that record shape. The control
+// is the proven consecutive IMAGE_STORE form (test_game_compute.cpp GTA V
+// chain: `0xf0200108, 0x00020004`, coords [v4,v5], T# s[8:15]) against a fully
+// backed storage entry in the same table -- it compiling proves the harness,
+// the table and the storage path work, so the NSA refusal is about the mip
+// path. WHEN the multi-level guest upload infra (#2818) lands, THIS ARM GOES
+// RED; replace it with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, ImageStoreMipMultiLevelRefuses) {
+    static const uint32_t w[3] = {0xf024310au, 0x00030004u, 0x00000503u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(w, 3);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
+        EXPECT_EQ(dec.opcode, 0x09u);
+        EXPECT_EQ(dec.len_dwords, 3u);
+    }
+    static const uint32_t plain[2] = {0xf0200108u, 0x00020004u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(plain, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
+        EXPECT_EQ(dec.opcode, 0x08u);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+
+    std::vector<uint8_t> backing(8u * 8u * 4u, 0);
+    ShaderResourceTable rt;
+    {
+        ShaderResource image{};
+        image.cls = ResourceClass::StorageImage;
+        image.binding = 4;
+        image.format = DataFormat::Uint32;
+        image.num_components = 1;
+        image.img_dim = 1;
+        image.width = image.height = 8;
+        image.depth = 1;
+        image.sample_count = 1;
+        image.sgpr_base = 12;   // STORE_MIP word1 names s12 as the T# base
+        image.declared_mip_levels = 2u;
+        image.gpu_addr = reinterpret_cast<uint64_t>(backing.data());
+        image.size = static_cast<uint32_t>(backing.size());
+        rt.resources.push_back(image);
+    }
+    {
+        ShaderResource image{};
+        image.cls = ResourceClass::StorageImage;
+        image.binding = 5;
+        image.format = DataFormat::Uint32;
+        image.num_components = 1;
+        image.img_dim = 1;
+        image.width = image.height = 8;
+        image.depth = 1;
+        image.sample_count = 1;
+        image.sgpr_base = 8;    // plain-STORE word1 names s8 as the T# base
+        image.gpu_addr = reinterpret_cast<uint64_t>(backing.data());
+        image.size = static_cast<uint32_t>(backing.size());
+        rt.resources.push_back(image);
+    }
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(20);   // s8..s19 T#s are entry-time user data
+    const std::vector<uint32_t> prologue = {
+        0x7e0002f0u,   // v_mov_b32 v0, 0.5 (store data)
+        0x7e080281u,   // v_mov_b32 v4, 1 (store x)
+        0x7e0a0280u,   // v_mov_b32 v5, 0 (store y; STORE_MIP nonzero mip lives in v5 too)
+        0x7e0202f0u,   // v_mov_b32 v1, 0.5
+        0x7e040280u,   // v_mov_b32 v2, 0
+        0x7e0602f0u,   // v_mov_b32 v3, 0.5
+    };
+    const std::vector<uint32_t> refused =
+        compile(program(prologue, {w[0], w[1], w[2]}), 0xA070ull, &rt, config);
+    EXPECT_TRUE(refused.empty()) << "NSA IMAGE_STORE_MIP on multi-level must refuse";
+    {
+        RejectRecord r = parse_reject(last_terminal_reject_reason(0xA070ull));
+        EXPECT_EQ(r.tag, "recompile-reject-mimg-address") << "NSA terminal record shape";
+        EXPECT_EQ(r.fields["pc"], "6") << "the reject must name the gap pc";
+        EXPECT_EQ(r.fields["extra"], "1") << "one extra address dword";
+    }
+    expect_compiles(program(prologue, {plain[0], plain[1]}), 0xA071ull,
+                    "control: consecutive IMAGE_STORE with backed storage entry",
+                    &rt, config);
+}
