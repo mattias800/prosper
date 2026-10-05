@@ -90,6 +90,9 @@ struct FontFace {
     float weight_x = 1.0f;
     float weight_y = 1.0f;
     void* renderer = nullptr;
+    // The library this face was opened from, for sceFontGetLibrary. Round-tripped, never
+    // interpreted: prosper keeps one global library, so this is identity, not state.
+    void* library = nullptr;
     // Non-null only for a face opened from the title's own font FILE. A system-font-set face
     // leaves this null and keeps the placeholder metrics -- see the file header.
     std::shared_ptr<FontData> data;
@@ -423,10 +426,11 @@ int32_t font_memory_term(FontMemory* mem) {
     return 0;
 }
 
-int32_t font_open(void*, uint64_t, uint64_t, const void*, void** out) {
+int32_t font_open(void* library, uint64_t, uint64_t, const void*, void** out) {
     if (!out) return static_cast<int32_t>(0x80540002u);
     auto* f = new (std::nothrow) FontFace;
     if (!f) return static_cast<int32_t>(0x80540001u);
+    f->library = library;
     *out = f;
     return 0;
 }
@@ -860,6 +864,41 @@ uint32_t font_character_whitespace(TextCharacter* ch) {
     return ch->code == ' ' || ch->code == '\t' || ch->code == '\n' || ch->code == '\r';
 }
 TextCharacter* font_character_next(TextCharacter* ch) { return ch ? ch->next : nullptr; }
+TextCharacter* font_character_back(TextCharacter* ch) {
+    return ch ? ch->prev : nullptr;
+}
+
+// --- Font R2: kerning, source rewind, library round-trip -------------------------------------
+// sceFontGetKerning(handle, preCode, code, out{offsetX, offsetY, positionX, positionY}): the
+// x-advance correction between two code points, in pixels. stbtt_GetCodepointKernAdvance gives
+// font units; the face's own x scale converts. Only offsetX carries a value (the other three
+// are zero by contract); a face with no font behind it reports zeros, like the metrics path.
+// Layout (4 floats, 16 bytes) and the zeros convention agree with the reference surface.
+// CONFIDENCE: HIGH on the struct/scale; MED that no caller-observed pair deviates.
+int32_t font_get_kerning(void* handle, uint32_t pre, uint32_t code, float* out) {
+    if (!out) return static_cast<int32_t>(0x80540002u);
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    const auto* f = face(handle);
+    float sx = 0.0f, sy = 0.0f;
+    if (f && f->data && face_scale(f, &sx, &sy)) {
+        out[0] = (float)stbtt_GetCodepointKernAdvance(&f->data->info, (int)pre, (int)code) * sx;
+    }
+    return 0;
+}
+// sceFontTextSourceRewind(source*): restart iteration from the start of the text.
+int32_t font_text_source_rewind(TextSource* source) {
+    if (!source) return static_cast<int32_t>(0x80540002u);
+    source->current = source->start;
+    return 0;
+}
+// sceFontGetLibrary(handle, out*): the library this face was opened from.
+int32_t font_get_library(void* handle, void** out) {
+    if (!out) return static_cast<int32_t>(0x80540002u);
+    const auto* f = face(handle);
+    if (!f) return static_cast<int32_t>(0x80540002u);
+    *out = f->library;
+    return 0;
+}
 
 uint64_t font_ok(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) { return 0; }
 
@@ -901,6 +940,10 @@ void register_font_hle() {
     R("Gqa5Pp7y4MU", (HleFn)font_get_slant, "sceFontGetRenderEffectSlant");
     R("d7dDgRY+Bzw", (HleFn)font_get_weight, "sceFontGetEffectWeight");
     R("woOjHrkjIYg", (HleFn)font_get_weight, "sceFontGetRenderEffectWeight");
+    R("sDuhHGNhHvE", (HleFn)font_get_kerning, "sceFontGetKerning");
+    R("LzmHDnlcwfQ", (HleFn)font_get_library, "sceFontGetLibrary");
+    R("VRFd3diReec", (HleFn)font_text_source_rewind, "sceFontTextSourceRewind");
+    R("6Gqlv5KdTbU", (HleFn)font_character_back, "sceFontCharacterRefersTextBack");
     Hle::register_typed("N1EBMeGhf7E", font_set_scale, "sceFontSetScalePixel");
     Hle::register_typed("6vGCkkQJOcI", font_set_scale, "sceFontSetupRenderScalePixel");
     Hle::register_typed("TMtqoFQjjbA", font_set_slant, "sceFontSetEffectSlant");

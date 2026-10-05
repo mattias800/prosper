@@ -288,6 +288,99 @@ TEST(Font, VerticalRenderMatchesHorizontalOnPlaceholderFace) {
     EXPECT_EQ(astro.close_font(addr(handle), 0, 0, 0, 0, 0), 0u);
 }
 
+TEST(Font, TextSessionSurfaceIsRegistered) {
+    register_builtin_hle();
+    static const char* table[] = {
+        "sDuhHGNhHvE",
+        "LzmHDnlcwfQ",
+        "VRFd3diReec",
+        "6Gqlv5KdTbU",
+    };
+    static_assert(sizeof(table) / sizeof(table[0]) == 4, "the 4 text-session exports");
+    for (const char* nid : table) {
+        EXPECT_NE(Hle::lookup(nid), nullptr) << nid << " is not registered";
+    }
+}
+
+TEST(Font, TextSessionNidsResolveToStubValues) {
+    EXPECT_EQ(nid_hash("sceFontGetKerning"), "sDuhHGNhHvE");
+    EXPECT_EQ(nid_hash("sceFontGetLibrary"), "LzmHDnlcwfQ");
+    EXPECT_EQ(nid_hash("sceFontTextSourceRewind"), "VRFd3diReec");
+    EXPECT_EQ(nid_hash("sceFontCharacterRefersTextBack"), "6Gqlv5KdTbU");
+    EXPECT_NE(nid_hash("sceFontGetKerning"), "AAAAAAAAAAA")
+        << "positive control: the discriminator rejects a wrong NID";
+}
+
+TEST(Font, KerningReportsZerosWithoutAFont) {
+    const AstroFont font = astro_font();
+    ASSERT_TRUE(font.registered());
+    HleFn kerning = Hle::lookup("sDuhHGNhHvE");
+    ASSERT_NE(kerning, nullptr);
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(font.create_library(addr(mem), 0, 0, addr(&library), 0, 0), 0u);
+    void* handle = nullptr;
+    ASSERT_EQ(font.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
+    float kern[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    EXPECT_EQ(kerning(addr(handle), 'A', 'V', addr(kern), 0, 0), 0u);
+    EXPECT_EQ(kern[0], 0.0f) << "no font behind the face, so no kern advance";
+    EXPECT_EQ(kern[1], 0.0f);
+    EXPECT_EQ(kern[2], 0.0f);
+    EXPECT_EQ(kern[3], 0.0f);
+    EXPECT_NE(kerning(addr(handle), 'A', 'V', 0, 0, 0), 0u) << "null out is refused";
+    EXPECT_EQ(font.close_font(addr(handle), 0, 0, 0, 0, 0), 0u);
+}
+
+TEST(Font, LibraryRoundTripsThroughTheFace) {
+    const AstroFont font = astro_font();
+    ASSERT_TRUE(font.registered());
+    HleFn get_library = Hle::lookup("LzmHDnlcwfQ");
+    ASSERT_NE(get_library, nullptr);
+    uint8_t mem[64]{};
+    void* library = nullptr;
+    ASSERT_EQ(font.create_library(addr(mem), 0, 0, addr(&library), 0, 0), 0u);
+    void* handle = nullptr;
+    ASSERT_EQ(font.open_font_set(addr(library), 0, 0, 0, addr(&handle), 0), 0u);
+    void* back = nullptr;
+    EXPECT_EQ(get_library(addr(handle), addr(&back), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(back, library) << "GetLibrary reports the opening library";
+    EXPECT_NE(get_library(addr(handle), 0, 0, 0, 0, 0), 0u) << "null out is refused";
+    uint8_t decoy[64]{};
+    EXPECT_NE(get_library(addr(decoy), addr(&back), 0, 0, 0, 0), 0u)
+        << "a foreign face is refused (valid memory, wrong magic)";
+    EXPECT_EQ(font.close_font(addr(handle), 0, 0, 0, 0, 0), 0u);
+}
+
+TEST(Font, TextSourceRewindRestartsIteration) {
+    const AstroFont font = astro_font();
+    ASSERT_TRUE(font.registered());
+    HleFn rewind = Hle::lookup("VRFd3diReec");
+    ASSERT_NE(rewind, nullptr);
+    EXPECT_NE(rewind(0, 0, 0, 0, 0, 0), 0u) << "null source is refused";
+    uint8_t source[0x60]{};
+    const char text[] = "ASTRO";
+    ASSERT_EQ(font.text_init(addr(source), addr(text), sizeof(text), 0, 0, 0), 0u);
+    // Advance the cursor the way a consumer would, then rewind: current lives at +24
+    // (system@0, start@8, end@16), start at +8.
+    uint64_t start = 0, current = 0;
+    std::memcpy(&start, source + 8, 8);
+    std::memcpy(source + 24, source + 16, 8);
+    std::memcpy(&current, source + 24, 8);
+    EXPECT_NE(current, start) << "precondition: the cursor actually moved";
+    EXPECT_EQ(rewind(addr(source), 0, 0, 0, 0, 0), 0u);
+    std::memcpy(&current, source + 24, 8);
+    EXPECT_EQ(current, start) << "rewind restores the start";
+}
+
+TEST(Font, RefersTextBackIsNullSafe) {
+    register_builtin_hle();
+    HleFn back = Hle::lookup("6Gqlv5KdTbU");
+    ASSERT_NE(back, nullptr);
+    // No live character chains exist (strings build none), so null is the only
+    // callable arm: it must answer null, not fault.
+    EXPECT_EQ(back(0, 0, 0, 0, 0, 0), 0u);
+}
+
 TEST(Font, StringHandleIsOpaqueWrittenAndClearedOnDestroy) {
     const AstroFont font = astro_font();
     ASSERT_TRUE(font.registered());
