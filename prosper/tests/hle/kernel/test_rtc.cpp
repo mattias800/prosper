@@ -15,7 +15,9 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 
 using namespace prosper;
@@ -123,6 +125,10 @@ TEST(Rtc, WeekdayMonthLeapKnownAnswers) {
     EXPECT_EQ(dow(2024, 1, 1, 0, 0, 0), 1u) << "2024-01-01 was a Monday";
     EXPECT_EQ(dow(2000, 1, 1, 0, 0, 0), 6u) << "2000-01-01 was a Saturday";
     EXPECT_EQ(dow(1970, 1, 1, 0, 0, 0), 4u) << "1970-01-01 was a Thursday";
+    // Off January, so the Jan/Feb year shift in the civil-day conversion is exercised.
+    EXPECT_EQ(dow(2024, 3, 1, 0, 0, 0), 5u) << "2024-03-01 was a Friday";
+    EXPECT_EQ(dow(1999, 12, 31, 0, 0, 0), 5u) << "1999-12-31 was a Friday";
+    EXPECT_EQ(dow(2024, 2, 29, 0, 0, 0), 4u) << "2024-02-29 was a Thursday";
     EXPECT_TRUE((int64_t)dow(2024, 13, 1, 0, 0, 0) < 0) << "month 13 is an error, not a weekday";
     EXPECT_EQ(dim(2000, 2, 0, 0, 0, 0), 29u);
     EXPECT_EQ(dim(1900, 2, 0, 0, 0, 0), 28u) << "1900 is not a leap year";
@@ -163,6 +169,27 @@ TEST(Rtc, TimeTAndWin32FileTimeRoundTrip) {
     EXPECT_EQ(get_tt(0, addr(&tt), 0, 0, 0, 0), sx(0x80B50002u)) << "null datetime";
     EXPECT_EQ(set_tt(addr(&back), (uint64_t)(int64_t)-1, 0, 0, 0, 0), sx(0x80B50003u))
         << "negative time_t refused (new-SDK behavior)";
+}
+
+TEST(Rtc, TimeTAndWin32FileTimeBeforeTheirEpochsAreInvalidYearAndZeroed) {
+    register_builtin_hle();
+    HleFn get_tt = Hle::lookup(nid_hash("sceRtcGetTime_t"));
+    HleFn get_wft = Hle::lookup(nid_hash("sceRtcGetWin32FileTime"));
+    ASSERT_NE(get_tt, nullptr);
+    ASSERT_NE(get_wft, nullptr);
+    DateTime before_unix = ymd(1969, 12, 31, 23, 59, 59);
+    int64_t tt = 12345;
+    EXPECT_EQ(get_tt(addr(&before_unix), addr(&tt), 0, 0, 0, 0), sx(0x80B50008u))
+        << "a valid date before 1970 is INVALID_YEAR";
+    EXPECT_EQ(tt, 0) << "and the output is zeroed";
+    DateTime at_unix = ymd(1970, 1, 1);
+    ASSERT_EQ(get_tt(addr(&at_unix), addr(&tt), 0, 0, 0, 0), 0u) << "the epoch itself is fine";
+    EXPECT_EQ(tt, 0);
+    DateTime before_win32 = ymd(1600, 12, 31);
+    uint64_t wft = 12345;
+    EXPECT_EQ(get_wft(addr(&before_win32), addr(&wft), 0, 0, 0, 0), sx(0x80B50008u))
+        << "a valid date before 1601 is INVALID_YEAR";
+    EXPECT_EQ(wft, 0u) << "and the output is zeroed";
 }
 
 TEST(Rtc, TickAddFixedUnits) {
@@ -225,6 +252,47 @@ TEST(Rtc, TickAddCalendarClamps) {
     EXPECT_EQ(months(addr(&out), addr(&in), 0, 0, 0, 0), 0u);
     EXPECT_EQ(out, in) << "add 0 copies";
     EXPECT_EQ(months(0, addr(&in), 1, 0, 0, 0), sx(0x80B50002u));
+
+    // Year clamp on the leap day: 2024-02-29 + 1 year = 2025-02-28; + 4 years = 2028-02-29.
+    DateTime leap_day = ymd(2024, 2, 29);
+    uint64_t leap_tick = 0;
+    ASSERT_EQ(get_tick(addr(&leap_day), addr(&leap_tick), 0, 0, 0, 0), 0u);
+    ASSERT_EQ(years(addr(&out), addr(&leap_tick), 1, 0, 0, 0), 0u);
+    ASSERT_EQ(set_tick(addr(&back), addr(&out), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(back.year, 2025u);
+    EXPECT_EQ(back.month, 2u);
+    EXPECT_EQ(back.day, 28u) << "Feb 29 + 1 year clamps to Feb 28";
+    ASSERT_EQ(years(addr(&out), addr(&leap_tick), 4, 0, 0, 0), 0u);
+    ASSERT_EQ(set_tick(addr(&back), addr(&out), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(back.year, 2028u);
+    EXPECT_EQ(back.day, 29u) << "Feb 29 + 4 years stays on Feb 29";
+}
+
+TEST(Rtc, TickAddCalendarOutOfRangeIsSuccessWithoutAWrite) {
+    // The module zeroes eax before its range checks: an out-of-range result returns SCE_OK and
+    // leaves the output untouched. INVALID_POINTER is the only error either function returns.
+    register_builtin_hle();
+    HleFn months = Hle::lookup(nid_hash("sceRtcTickAddMonths"));
+    HleFn years = Hle::lookup(nid_hash("sceRtcTickAddYears"));
+    HleFn get_tick = Hle::lookup(nid_hash("sceRtcGetTick"));
+    for (HleFn f : {months, years, get_tick}) ASSERT_NE(f, nullptr);
+    DateTime last = ymd(9999, 12, 15);
+    DateTime first = ymd(1, 1, 15);
+    uint64_t last_tick = 0, first_tick = 0;
+    ASSERT_EQ(get_tick(addr(&last), addr(&last_tick), 0, 0, 0, 0), 0u);
+    ASSERT_EQ(get_tick(addr(&first), addr(&first_tick), 0, 0, 0, 0), 0u);
+    constexpr uint64_t kSentinel = 0x5A5A5A5A5A5A5A5Aull;
+    uint64_t out = kSentinel;
+    EXPECT_EQ(years(addr(&out), addr(&last_tick), 1, 0, 0, 0), 0u) << "year 10000: SCE_OK";
+    EXPECT_EQ(out, kSentinel) << "and no write";
+    EXPECT_EQ(years(addr(&out), addr(&first_tick), (uint64_t)(int32_t)-1, 0, 0, 0), 0u)
+        << "year 0: SCE_OK";
+    EXPECT_EQ(out, kSentinel) << "and no write";
+    EXPECT_EQ(months(addr(&out), addr(&last_tick), 1, 0, 0, 0), 0u) << "10000-01: SCE_OK";
+    EXPECT_EQ(out, kSentinel) << "and no write";
+    EXPECT_EQ(months(addr(&out), addr(&first_tick), (uint64_t)(int32_t)-1, 0, 0, 0), 0u)
+        << "0000-12: SCE_OK";
+    EXPECT_EQ(out, kSentinel) << "and no write";
 }
 
 TEST(Rtc, FormatParseRoundTrip) {
@@ -242,6 +310,41 @@ TEST(Rtc, FormatParseRoundTrip) {
     std::memset(buf, 0, sizeof buf);
     ASSERT_EQ(format(addr(buf), addr(&base), 60, 0, 0, 0), 0u);
     EXPECT_STREQ(buf, "2024-01-01T01:00:00.00+01:00");
+    // Two zero-padded fraction digits: usec / 10000.
+    const struct {
+        uint64_t usec;
+        const char* text;
+    } kFractions[] = {
+        {50000, "2024-01-01T00:00:00.05Z"},
+        {5000, "2024-01-01T00:00:00.00Z"},
+        {990000, "2024-01-01T00:00:00.99Z"},
+        {123456, "2024-01-01T00:00:00.12Z"},
+        {1, "2024-01-01T00:00:00.00Z"},
+    };
+    for (const auto& f : kFractions) {
+        const uint64_t t = base + f.usec;
+        std::memset(buf, 0, sizeof buf);
+        ASSERT_EQ(format(addr(buf), addr(&t), 0, 0, 0, 0), 0u) << f.usec;
+        EXPECT_STREQ(buf, f.text) << "usec " << f.usec;
+    }
+    // The zone must be within +/-1439 minutes, and the shifted date must be valid; both refuse
+    // before writing anything.
+    std::memset(buf, 0xAA, sizeof buf);
+    EXPECT_EQ(format(addr(buf), addr(&base), 1440, 0, 0, 0), sx(0x80B50003u)) << "tz +1440";
+    EXPECT_EQ(format(addr(buf), addr(&base), (uint64_t)(int64_t)-1440, 0, 0, 0), sx(0x80B50003u))
+        << "tz -1440";
+    EXPECT_EQ((unsigned char)buf[0], 0xAAu) << "nothing written on refusal";
+    ASSERT_EQ(format(addr(buf), addr(&base), 1439, 0, 0, 0), 0u) << "tz +1439 is the edge";
+    EXPECT_STREQ(buf, "2024-01-01T23:59:00.00+23:59");
+    DateTime eve = ymd(9999, 12, 31, 23, 30);
+    HleFn get_tick = Hle::lookup(nid_hash("sceRtcGetTick"));
+    ASSERT_NE(get_tick, nullptr);
+    uint64_t eve_tick = 0;
+    ASSERT_EQ(get_tick(addr(&eve), addr(&eve_tick), 0, 0, 0, 0), 0u);
+    std::memset(buf, 0xAA, sizeof buf);
+    EXPECT_EQ(format(addr(buf), addr(&eve_tick), 60, 0, 0, 0), sx(0x80B50008u))
+        << "shifted into year 10000: the CheckValid error";
+    EXPECT_EQ((unsigned char)buf[0], 0xAAu) << "nothing written on refusal";
     uint64_t tick = 0;
     ASSERT_EQ(parse(addr(&tick), addr("2024-01-01T00:00:00.00Z"), 0, 0, 0, 0), 0u);
     EXPECT_EQ(tick, kTick20240101);
@@ -250,6 +353,24 @@ TEST(Rtc, FormatParseRoundTrip) {
     EXPECT_EQ(tick, kTick20240101);
     EXPECT_EQ(parse(addr(&tick), addr("not a date"), 0, 0, 0, 0), sx(0x80B50007u))
         << "garbage is BAD_PARSE, not an exception";
+    // Module conventions (+0x12f0): lowercase 't'/'z' accepted, a missing zone refused, '.'
+    // with no digits accepted, digits past the sixth consumed with no weight.
+    tick = 0;
+    ASSERT_EQ(parse(addr(&tick), addr("2024-01-01t00:00:00z"), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(tick, kTick20240101);
+    EXPECT_EQ(parse(addr(&tick), addr("2024-01-01T00:00:00"), 0, 0, 0, 0), sx(0x80B50007u))
+        << "a missing zone designator is BAD_PARSE";
+    ASSERT_EQ(parse(addr(&tick), addr("2024-01-01T00:00:00.Z"), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(tick, kTick20240101);
+    ASSERT_EQ(parse(addr(&tick), addr("2024-01-01T00:00:00.1234567Z"), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(tick, kTick20240101 + 123456u);
+    // Truncated strings refuse. The parse checks each field in order and stops at the first
+    // mismatch, so it never reads past the terminator (a return code cannot show an over-read;
+    // these arms pin the refusal, and the sanitizer job would catch a read past the NUL).
+    const char truncated[] = "2024-\0" "1-01T00:00:00Z";
+    EXPECT_EQ(parse(addr(&tick), addr(truncated), 0, 0, 0, 0), sx(0x80B50007u));
+    EXPECT_EQ(parse(addr(&tick), addr("2024-01-01T00:00:00+05"), 0, 0, 0, 0), sx(0x80B50007u))
+        << "a zone offset without its minutes";
     EXPECT_EQ(parse(0, addr("2024-01-01T00:00:00.00Z"), 0, 0, 0, 0), sx(0x80B50002u));
     EXPECT_EQ(parse(addr(&tick), 0, 0, 0, 0, 0), sx(0x80B50002u));
 }
@@ -269,3 +390,31 @@ TEST(Rtc, ConvertRoundTripIsIdentity) {
     EXPECT_EQ(to_local(0, addr(&local), 0, 0, 0, 0), sx(0x80B50002u));
     EXPECT_EQ(to_utc(addr(&local), 0, 0, 0, 0, 0), sx(0x80B50002u));
 }
+
+#ifndef _WIN32
+TEST(Rtc, ConvertUtcToLocalAppliesTheHostZoneOffset) {
+    // The identity round trip above also passes if neither convert applies any offset, which is
+    // what a UTC host (most CI runners) would show. Pin a fixed non-zero zone (POSIX "UTC-3" is
+    // three hours EAST of UTC, no DST) so the offset has to be observed.
+    register_builtin_hle();
+    HleFn to_local = Hle::lookup(nid_hash("sceRtcConvertUtcToLocalTime"));
+    HleFn to_utc = Hle::lookup(nid_hash("sceRtcConvertLocalTimeToUtc"));
+    ASSERT_NE(to_local, nullptr);
+    ASSERT_NE(to_utc, nullptr);
+    const char* old_tz = std::getenv("TZ");
+    const std::string saved = old_tz ? old_tz : "";
+    setenv("TZ", "UTC-3", 1);
+    tzset();
+    const uint64_t base = kTick20240101;
+    uint64_t local = 0, back = 0;
+    const uint64_t to_local_rc = to_local(addr(&base), addr(&local), 0, 0, 0, 0);
+    const uint64_t to_utc_rc = to_utc(addr(&local), addr(&back), 0, 0, 0, 0);
+    if (old_tz) setenv("TZ", saved.c_str(), 1);
+    else unsetenv("TZ");
+    tzset();
+    ASSERT_EQ(to_local_rc, 0u);
+    ASSERT_EQ(to_utc_rc, 0u);
+    EXPECT_EQ(local, base + 3ull * 3600000000ull) << "UTC+3 local is three hours ahead";
+    EXPECT_EQ(back, base);
+}
+#endif
