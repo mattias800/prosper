@@ -920,6 +920,45 @@ HLE(s_avp_getstreaminfoex) { // s32 sceAvPlayerGetStreamInfoEx(handle, stream_id
     return 0;
 }
 HLE(s_avp_stream_ok) { svc_log("sceAvPlayerStreamControl", a0,a1,a2,a3,a4,a5); return 0; }
+// --- AvPlayer remainder: trick speed, bandwidth window, player printf ---------------------------
+// s32 sceAvPlayerSetTrickSpeed(handle, int32 speed): no trick-play backend exists (the media
+// clock runs at wall rate), so any speed is acknowledged once the handle validates; the
+// guest-visible effect is none. Positions agree between Kyty and PS5PCEM. CONFIDENCE: MED.
+HLE(s_avp_trickspeed) {
+    svc_log("sceAvPlayerSetTrickSpeed", a0, a1, a2, a3, a4, a5);
+    std::lock_guard<std::mutex> lk(g_avp_mx);
+    return g_avp.find(a0) != g_avp.end() ? 0 : 0x806a0001ull;
+}
+// s32 sceAvPlayerSetAvailableBandwidth(handle, start, min, max): adaptive streaming does not
+// exist here (local sources only), so a coherent window is acknowledged and stored nowhere.
+// A min/max pair that is both nonzero with min > max is invalid. CONFIDENCE: MED on the shape
+// (Kyty agrees); LOW on mid-stream behavior, which has no backend to observe.
+HLE(s_avp_bandwidth) {
+    svc_log("sceAvPlayerSetAvailableBandwidth", a0, a1, a2, a3, a4, a5);
+    if (a2 != 0 && a3 != 0 && a2 > a3) return 0x806a0001ull;
+    std::lock_guard<std::mutex> lk(g_avp_mx);
+    return g_avp.find(a0) != g_avp.end() ? 0 : 0x806a0001ull;
+}
+// Log-forwarding for the player's own printf surface. Only the format string is observable:
+// guest varargs/va_list cannot be expanded without their layout, so the args are not expanded
+// and no character count is reported (return 0, not a count). A null format is invalid params.
+// NIDs from the stub table; no secondary implements these, so positions rest on the
+// (fmt, ...) name shape alone. CONFIDENCE: LOW.
+static uint64_t avp_log_forward(const char* tag, uint64_t fmt_addr) {
+    const char* fmt = (const char*)PW(fmt_addr);
+    if (!fmt) return 0x806a0001ull;
+    const size_t n = strnlen(fmt, 512);
+    fprintf(stderr, "[avp] %s: %.*s\n", tag, (int)n, fmt);
+    return 0;
+}
+HLE(s_avp_printf) {
+    svc_log("sceAvPlayerPrintf", a0, a1, a2, a3, a4, a5);
+    return avp_log_forward("player", a0);
+}
+HLE(s_avp_vprintf) {
+    svc_log("sceAvPlayerVprintf", a0, a1, a2, a3, a4, a5);
+    return avp_log_forward("player", a0);
+}
 // Begin a source: resolve/open it, fire READY, and (auto_start) begin playback with PLAY.
 static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
     if (!guest_path || !*guest_path) return 0x806a0001ull;
@@ -1827,15 +1866,20 @@ void register_avplayer_hle() {
     Hle::register_fn("XC9wM+xULz8", (HleFn)s_avp_jumptotime, "sceAvPlayerJumpToTime");
     Hle::register_fn("k-q+xOxdc3E", (HleFn)s_avp_stream_ok, "sceAvPlayerSetAvSyncMode");
     Hle::register_fn("OVths0xGfho", (HleFn)s_avp_stream_ok, "sceAvPlayerSetLooping");
-    #undef R
+    // AvPlayer remainder: NIDs from the stub table (SetTrickSpeed/SetAvailableBandwidth
+    // positions cross-checked against Kyty and PS5PCEM).
+    Hle::register_fn("av8Z++94rs0", (HleFn)s_avp_trickspeed, "sceAvPlayerSetTrickSpeed");
+    Hle::register_fn("N6Oy-EjduiY", (HleFn)s_avp_bandwidth, "sceAvPlayerSetAvailableBandwidth");
+    Hle::register_fn("agig-iDRrTE", (HleFn)s_avp_printf, "sceAvPlayerPrintf");
+    Hle::register_fn("yN7Jhuv8g24", (HleFn)s_avp_vprintf, "sceAvPlayerVprintf");
+#undef R
 }
 // The local network libraries allocate opaque contexts even on a disconnected console; connection
 // state is reported separately through NetCtl/NP. Returning generic success (0) from these ID-returning
 // constructors instead creates an invalid context and makes their owner's initialization fail. The
 // signatures and positive-return contract agree with the PS5 3.20 symbol table and the independently
 // implemented SDK surface; no online identity or connectivity is fabricated here.
-namespace {
-}
+namespace {}
 
 // --- libSceIme keyboard API (#186) ---
 // PPSA02664 polls this every frame in its input loop. We have no physical PS5 keyboard, so we report a
