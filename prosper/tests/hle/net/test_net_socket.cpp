@@ -298,3 +298,128 @@ TEST(NetSocket, Inet6Convert) {
     EXPECT_EQ(ntop(28, (uint64_t)lo, (uint64_t)tiny, 4, 0, 0), (uint64_t)tiny) << "size 4 fits";
     EXPECT_STREQ(tiny, "::1");
 }
+
+// Epoll, introspection, pools, resolver: local lifecycle where allocation is local (never the
+// dispatcher's 0 from an id contract), loud failure where an answer needs hardware or a
+// network. Every arm drives the real NIDs; the mutation each arm kills is named on the arm.
+namespace {
+
+constexpr const char* kEpollCreate = "SF47kB2MNTo";
+constexpr const char* kEpollDestroy = "Inp1lfL+Jdw";
+constexpr const char* kEpollControl = "ZVw46bsasAk";
+constexpr const char* kEpollWait = "drjIbDbA7UQ";
+constexpr const char* kEtherNtostr = "v6M4txecCuo";
+constexpr const char* kGetMacAddress = "6Oc0bLsIYe0";
+constexpr const char* kGetSockInfo = "hLuXdjHnhiI";
+constexpr const char* kPoolDestroy = "K7RlrTkI-mw";
+constexpr const char* kResolverCreate = "C4UgDHHPvdw";
+constexpr const char* kResolverStartNtoa = "Nd91WaWmG2w";
+constexpr const char* kRudpEnable = "6PBNpsgyaxw";
+constexpr const char* kRudpSetHandler = "SUEVes8gvmw";
+
+constexpr uint64_t kInval = net::kNetErrorInval;          // 0x80410116
+constexpr uint64_t kOpNotSupp = net::kNetErrorOpNotSupp;  // 0x8041012d
+// Id-returning contracts sign-extend their errors (never a handle); status contracts keep
+// the zero-extended 32-bit form. Both conventions live in hle_net.cpp.
+constexpr uint64_t kIdInval = (uint64_t)(int64_t)(int32_t)net::kNetErrorInval;
+
+}  // namespace
+
+TEST(NetSocket, EpollLifecycle) {
+    register_builtin_hle();
+    HleFn create = Hle::lookup(kEpollCreate);
+    HleFn destroy = Hle::lookup(kEpollDestroy);
+    HleFn control = Hle::lookup(kEpollControl);
+    HleFn wait = Hle::lookup(kEpollWait);
+    for (HleFn f : {create, destroy, control, wait}) ASSERT_NE(f, nullptr);
+    uint64_t eid = 0;
+    EXPECT_EQ(create(0, 0, 0, 0, 0, 0), kIdInval) << "null name is refused, writes nothing";
+    EXPECT_EQ(eid, 0u);
+    ASSERT_GT((int64_t)(eid = create((uint64_t)"test", 0, 0, 0, 0, 0)), 0)
+        << "epoll id is positive, never the dispatcher 0";
+    const uint64_t fd = open_socket();
+    ASSERT_GT((int64_t)fd, 0);
+    EXPECT_EQ(control(9999, 1, fd, 0, 0, 0), kBadF) << "unknown epoll id is refused";
+    EXPECT_EQ(control(eid, 1, 9999, 0, 0, 0), kBadF) << "unknown socket id is refused";
+    EXPECT_EQ(control(eid, 1, fd, 0, 0, 0), 0u);
+    EXPECT_EQ(wait(9999, 0, 0, 0, 0, 0), kBadF);
+    EXPECT_EQ(wait(eid, 0, 1, 0, 0, 0), kInval) << "null event buffer is refused";
+    uint8_t events[64]{};
+    EXPECT_EQ(wait(eid, (uint64_t)events, 4, 0, 0, 0), 0u) << "no events can be ready offline";
+    EXPECT_EQ(destroy(eid, 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(destroy(eid, 0, 0, 0, 0, 0), kBadF) << "destroy frees exactly once";
+    EXPECT_EQ(wait(eid, (uint64_t)events, 4, 0, 0, 0), kBadF) << "wait on dead id fails";
+    HleFn close = Hle::lookup(kSocketClose);
+    ASSERT_NE(close, nullptr);
+    EXPECT_EQ(close(fd, 0, 0, 0, 0, 0), 0u);
+}
+
+TEST(NetSocket, EtherFormatting) {
+    register_builtin_hle();
+    HleFn ntostr = Hle::lookup(kEtherNtostr);
+    ASSERT_NE(ntostr, nullptr);
+    const uint8_t mac[6] = {0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e};
+    char str[18]{};
+    EXPECT_EQ(ntostr((uint64_t)mac, (uint64_t)str, sizeof str, 0, 0, 0), (uint64_t)str);
+    EXPECT_STREQ(str, "0:1a:2b:3c:4d:5e") << "unpadded lowercase, FreeBSD ether_ntoa style";
+    EXPECT_EQ(ntostr(0, (uint64_t)str, sizeof str, 0, 0, 0), 0u) << "null ether is refused";
+    EXPECT_EQ(ntostr((uint64_t)mac, 0, sizeof str, 0, 0, 0), 0u) << "null out is refused";
+    char tiny[4]{};
+    EXPECT_EQ(ntostr((uint64_t)mac, (uint64_t)tiny, sizeof tiny, 0, 0, 0), 0u)
+        << "a 4-byte buffer cannot hold even the shortest rendering";
+}
+
+TEST(NetSocket, HardwareIntrospectionRefused) {
+    register_builtin_hle();
+    HleFn mac = Hle::lookup(kGetMacAddress);
+    HleFn info = Hle::lookup(kGetSockInfo);
+    ASSERT_NE(mac, nullptr);
+    ASSERT_NE(info, nullptr);
+    uint8_t out[32];
+    std::memset(out, 0xAA, sizeof out);
+    // No interface to report: a zeroed MAC would be a manufactured hardware identity.
+    EXPECT_EQ(mac((uint64_t)out, 0, 0, 0, 0, 0), kOpNotSupp);
+    EXPECT_EQ(out[0], 0xAA) << "refused query writes no address";
+    const uint64_t fd = open_socket();
+    ASSERT_GT((int64_t)fd, 0);
+    EXPECT_EQ(info(9999, (uint64_t)out, 1, 0, 0, 0), kBadF) << "unknown socket is refused";
+    std::memset(out, 0xAA, sizeof out);
+    EXPECT_EQ(info(fd, (uint64_t)out, 1, 0, 0, 0), kOpNotSupp)
+        << "unknown struct: fail, don't scribble";
+    EXPECT_EQ(out[0], 0xAA);
+    HleFn close = Hle::lookup(kSocketClose);
+    ASSERT_NE(close, nullptr);
+    EXPECT_EQ(close(fd, 0, 0, 0, 0, 0), 0u);
+}
+
+TEST(NetSocket, PoolDestroyAndResolver) {
+    register_builtin_hle();
+    HleFn pool_destroy = Hle::lookup(kPoolDestroy);
+    HleFn resolver_create = Hle::lookup(kResolverCreate);
+    HleFn start_ntoa = Hle::lookup(kResolverStartNtoa);
+    for (HleFn f : {pool_destroy, resolver_create, start_ntoa}) ASSERT_NE(f, nullptr);
+    // Pools are untracked counter ids (see PoolCreate): nothing to free, always succeeds.
+    EXPECT_EQ(pool_destroy(1, 0, 0, 0, 0, 0), 0u);
+    uint64_t rid = 0;
+    EXPECT_EQ(resolver_create(0, 0, 0, 0, 0, 0), kIdInval) << "null name is refused";
+    ASSERT_GT((int64_t)(rid = resolver_create((uint64_t)"test", 0, 0, 0, 0, 0)), 0)
+        << "resolver id is positive, never the dispatcher 0";
+    uint8_t addr[16];
+    std::memset(addr, 0xAA, sizeof addr);
+    EXPECT_EQ(start_ntoa(9999, (uint64_t)"example.com", (uint64_t)addr, 0, 0, 0), kBadF);
+    EXPECT_EQ(start_ntoa(rid, 0, (uint64_t)addr, 0, 0, 0), kInval) << "null hostname refused";
+    EXPECT_EQ(start_ntoa(rid, (uint64_t)"example.com", (uint64_t)addr, 0, 0, 0), kUnreach)
+        << "no DNS offline";
+    EXPECT_EQ(addr[0], 0xAA) << "failed resolve writes no address";
+}
+
+TEST(Rudp, SetupAcknowledged) {
+    register_builtin_hle();
+    HleFn enable = Hle::lookup(kRudpEnable);
+    HleFn set_handler = Hle::lookup(kRudpSetHandler);
+    ASSERT_NE(enable, nullptr);
+    ASSERT_NE(set_handler, nullptr);
+    // Fire-and-forget setup with no out-parameters: no IO thread starts, no handler is stored.
+    EXPECT_EQ(enable(0x10000, 100, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(set_handler(0, 0, 0, 0, 0, 0), 0u);
+}

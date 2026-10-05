@@ -426,6 +426,154 @@ HLE(n_socket_errno_loc) {   // () -> &errno; the slot the failing arms above kee
     return (uint64_t)(uintptr_t)&g_net_errno;
 }
 
+// --- epoll, introspection, pools, resolver: local lifecycle where allocation is local ---------
+// Epoll and resolver ids live in their own small tables: an epoll id must never validate as a
+// socket and vice versa, so sharing g_net_live would let a stale socket id arm an epoll wait.
+// NIDs from the firmware set where present (EtherNtostr, GetMacAddress), otherwise via
+// nid_hash over the stub interface names; arities from that interface (MED).
+constexpr int kMaxNetEpoll = 32;
+constexpr int kMaxNetResolver = 32;
+bool g_net_epoll_live[kMaxNetEpoll + 1];   // 1-based; caller holds g_net_mx
+bool g_net_resolver_live[kMaxNetResolver + 1];   // 1-based; caller holds g_net_mx
+
+HLE(n_epoll_create) {   // (name, flags) -> epoll id (>0), never 0
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    // A null debug label is an invalid argument (EINVAL, not EMFILE: PoolCreate answers a
+    // different question with 24 and its meaning here would be actively misleading). LOW.
+    if (!a0) return net_id_fail(FreeBsdErrno::EInval);
+    std::lock_guard<std::mutex> lk(g_net_mx);
+    for (int i = 1; i <= kMaxNetEpoll; i++) {
+        if (g_net_epoll_live[i]) continue;
+        g_net_epoll_live[i] = true;
+        return (uint64_t)i;
+    }
+    return net_id_fail(FreeBsdErrno::EMFile);
+}
+HLE(n_epoll_destroy) {   // (eid) -> SCE_OK, releasing the id
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_net_mx);
+    const int32_t eid = (int32_t)a0;
+    if (eid < 1 || eid > kMaxNetEpoll || !g_net_epoll_live[eid])
+        return net_fail(FreeBsdErrno::EBadF);
+    g_net_epoll_live[eid] = false;
+    return net_err(0);
+}
+HLE(n_epoll_control) {   // (eid, op, id, event*) -> SCE_OK; op/event uninterpreted headless
+    (void)a1;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_net_mx);
+    const int32_t eid = (int32_t)a0;
+    if (eid < 1 || eid > kMaxNetEpoll || !g_net_epoll_live[eid])
+        return net_fail(FreeBsdErrno::EBadF);
+    if (!net_known_locked((int32_t)a2)) return net_fail(FreeBsdErrno::EBadF);
+    return net_err(0);
+}
+HLE(n_epoll_wait) {   // (eid, events*, maxevents, timeout) -> 0 events: nothing can become
+    (void)a3;   // ready offline, so this returns immediately instead of sleeping
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_net_mx);
+    const int32_t eid = (int32_t)a0;
+    if (eid < 1 || eid > kMaxNetEpoll || !g_net_epoll_live[eid])
+        return net_fail(FreeBsdErrno::EBadF);
+    if (!a1 || (int32_t)a2 <= 0) return net_fail(FreeBsdErrno::EInval);
+    return net_err(0);
+}
+HLE(n_ether_ntostr) {   // (ether*, str*, len) -> str; pure formatting, like InetNtop
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    if (!a0 || !a1) {
+        g_net_errno = static_cast<int32_t>(FreeBsdErrno::ENoSpc);
+        return net_err(0);
+    }
+    const uint8_t* m = reinterpret_cast<const uint8_t*>(a0);
+    char text[18];
+    int len = 0;
+    for (int i = 0; i < 6; i++) {
+        // Unpadded lowercase hex (FreeBSD ether_ntoa convention, which this ABI descends
+        // from): "0:1a:2b:3c:4d:5e". MED on the padding choice.
+        const char* hex = "0123456789abcdef";
+        if (i) text[len++] = ':';
+        if (m[i] >= 0x10) text[len++] = hex[m[i] >> 4];
+        text[len++] = hex[m[i] & 0x0f];
+    }
+    text[len] = '\0';
+    if ((uint32_t)len + 1u > (uint32_t)a2) {
+        g_net_errno = static_cast<int32_t>(FreeBsdErrno::ENoSpc);
+        return net_err(0);
+    }
+    memcpy(reinterpret_cast<void*>(a1), text, (size_t)len + 1);
+    return a1;
+}
+HLE(n_get_mac_address) {   // (addr*, flags): no interface to report; fail, don't fabricate
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    // A zeroed MAC would be a manufactured hardware identity (and LanDiscovery-shaped code
+    // would then proceed to a connect that cannot work); EOPNOTSUPP keeps it on error paths.
+    // CONFIDENCE: LOW on the errno; HIGH that failing beats a fabricated address.
+    return net_fail(FreeBsdErrno::EOpNotSupp);
+}
+HLE(n_get_sock_info) {   // (s, info*, n, flags): unknown struct; fail, don't scribble
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_net_mx);
+    if (!net_known_locked((int32_t)a0)) return net_fail(FreeBsdErrno::EBadF);
+    return net_fail(FreeBsdErrno::EOpNotSupp);
+}
+HLE(n_pool_destroy) {   // (memid): pools are untracked counter ids (see PoolCreate) -> SCE_OK
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    return net_err(0);
+}
+HLE(n_resolver_create) {   // (name, memid, flags) -> resolver id (>0), never 0
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    if (!a0) return net_id_fail(FreeBsdErrno::EInval);
+    std::lock_guard<std::mutex> lk(g_net_mx);
+    for (int i = 1; i <= kMaxNetResolver; i++) {
+        if (g_net_resolver_live[i]) continue;
+        g_net_resolver_live[i] = true;
+        return (uint64_t)i;
+    }
+    return net_id_fail(FreeBsdErrno::EMFile);
+}
+HLE(n_resolver_start_ntoa) {   // (rid, hostname*, addr*, ...) -> NetUnreach: no DNS offline
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    std::lock_guard<std::mutex> lk(g_net_mx);
+    const int32_t rid = (int32_t)a0;
+    if (rid < 1 || rid > kMaxNetResolver || !g_net_resolver_live[rid])
+        return net_fail(FreeBsdErrno::EBadF);
+    if (!a1) return net_fail(FreeBsdErrno::EInval);
+    return net_fail(FreeBsdErrno::ENetUnreach);
+}
+
 }   // namespace
 
 void register_net_hle() {
@@ -459,6 +607,18 @@ void register_net_hle() {
     Hle::register_fn("TCkRD0DWNLg", (HleFn)n_socket_not_conn, "sceNetGetpeername");
     Hle::register_fn("hoOAofhhRvE", (HleFn)n_socket_not_conn, "sceNetGetsockname");
     Hle::register_fn("TSM6whtekok", (HleFn)n_socket_not_conn, "sceNetShutdown");
+    // Epoll, introspection, pools, resolver: local lifecycle where allocation is local (never
+    // 0 from an id contract), loud failure where an answer needs hardware or a network.
+    Hle::register_fn("SF47kB2MNTo", (HleFn)n_epoll_create, "sceNetEpollCreate");
+    Hle::register_fn("Inp1lfL+Jdw", (HleFn)n_epoll_destroy, "sceNetEpollDestroy");
+    Hle::register_fn("ZVw46bsasAk", (HleFn)n_epoll_control, "sceNetEpollControl");
+    Hle::register_fn("drjIbDbA7UQ", (HleFn)n_epoll_wait, "sceNetEpollWait");
+    Hle::register_fn("v6M4txecCuo", (HleFn)n_ether_ntostr, "sceNetEtherNtostr");
+    Hle::register_fn("6Oc0bLsIYe0", (HleFn)n_get_mac_address, "sceNetGetMacAddress");
+    Hle::register_fn("hLuXdjHnhiI", (HleFn)n_get_sock_info, "sceNetGetSockInfo");
+    Hle::register_fn("K7RlrTkI-mw", (HleFn)n_pool_destroy, "sceNetPoolDestroy");
+    Hle::register_fn("C4UgDHHPvdw", (HleFn)n_resolver_create, "sceNetResolverCreate");
+    Hle::register_fn("Nd91WaWmG2w", (HleFn)n_resolver_start_ntoa, "sceNetResolverStartNtoa");
 }
 
 }   // namespace prosper
