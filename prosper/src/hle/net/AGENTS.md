@@ -6,7 +6,9 @@ templates, connections, requests) and the request path -- split between what is 
 and what has to fail honestly, per the policy below. **libSceHttp2** (`hle_http2.cpp`): the whole
 v2 library, split the same way, between a local object graph (contexts, templates, requests, cookie
 boxes, and the settings recorded on them) and an honest offline failure on everything from
-`sceHttp2SendRequest` onwards.
+`sceHttp2SendRequest` onwards. **libSceNet** (`hle_net.cpp`): the socket layer underneath both,
+split the same way -- byte-order helpers and AF_INET/AF_INET6 text conversion computed for real, a
+local socket-id table, and an honest offline failure on every operation that would move a packet.
 
 ## The policy this folder exists to hold
 

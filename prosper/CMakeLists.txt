@@ -1425,6 +1425,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/net/test_http2.cpp
     LIBRARIES prosper_core)
 
+  # libSceNet socket family: byte-order/inet helpers computed offline, real socket ids from a
+  # local table, and an honest ENETUNREACH on the packet path instead of the dispatcher 0.
+  prosper_add_gtest(test_net_socket
+    SOURCES tests/hle/net/test_net_socket.cpp
+    LIBRARIES prosper_core)
+
   add_executable(test_guard_recursion tests/hle/test_guard_recursion.cpp)
   target_link_libraries(test_guard_recursion PRIVATE prosper_core Threads::Threads)
   add_test(NAME guard_recursion COMMAND test_guard_recursion)
@@ -1511,6 +1517,20 @@ if(TARGET prosper_core)
   # #4275: NP Universal Data System property objects/arrays and SessionSignaling init.
   prosper_add_gtest(test_np_uds_properties
     SOURCES tests/hle/np/test_np_uds_properties.cpp
+    LIBRARIES prosper_core)
+
+  # NP sub-libraries on the honest signed-out console: libSceNpTrophy (v1), libSceNpTus,
+  # libSceNpScore and libSceNpCommerce — valid local ids, no PSN data, headless store dialog.
+  prosper_add_gtest(test_np_sublibs
+    SOURCES tests/hle/np/test_np_sublibs.cpp
+    LIBRARIES prosper_core)
+
+  # libSceAudio3d / libSceAudioPropagation / libSceAcm (spatial + batch audio): local 3D-port
+  # and Acm-context lifecycles with evidenced errors, honest no-backend refusals elsewhere.
+  # Previously unregistered, the dispatcher answered 0 while writing nothing — audio outputs
+  # are divisors, so titles died in their own arithmetic far from the cause.
+  prosper_add_gtest(test_audio_spatial
+    SOURCES tests/hle/audio/test_audio_spatial.cpp
     LIBRARIES prosper_core)
 
   # The save's parameter block (#2786): sceSaveDataSetParam/GetParam were unregistered, so both
@@ -2522,6 +2542,10 @@ if(TARGET prosper_core)
   endif()
   prosper_add_gtest(test_nested_wide_data_admission
     SOURCES tests/gpu/execute/test_nested_wide_data_admission.cpp
+    LIBRARIES prosper_core)
+  # #4439: which ordered DMA copies need the pending span's authoritative readback.
+  prosper_add_gtest(test_dma_span_authority
+    SOURCES tests/gpu/execute/test_dma_span_authority.cpp
     LIBRARIES prosper_core)
   # Registered nested snapshot admission uses the Linux direct-memory lazy-fault proof.
   # Callback/compute stand-ins exercise ordered execution without creating a Vulkan device.
@@ -4649,6 +4673,7 @@ endif()
       # End-to-end: recompile real RDNA2 (llvm-mc) -> SPIR-V -> run -> assert numeric result.
       add_executable(test_rdna2_to_spirv tests/gpu/recompiler/test_rdna2_to_spirv.cpp
                  tests/gpu/recompiler/test_rdna2_bvh.cpp
+                 tests/gpu/recompiler/test_rdna2_minmax3.cpp
                  tests/gpu/recompiler/test_rdna2_scalar_alu.cpp)
       # Includes a shared fixture, which resolves from the `tests` root.
       target_include_directories(test_rdna2_to_spirv PRIVATE tests)

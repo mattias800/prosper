@@ -1051,6 +1051,7 @@ void register_builtin_hle() {
     register_savedata_hle();  // libSceSaveData + libSceSaveDataDialog (#3735)
     register_np_hle();        // the NP / online family incl. NetCtl (#3735)
     register_http_hle();     // libSceHttp local URI parsing
+    register_net_hle();   // libSceNet socket ids + honest offline packet failure
     register_http2_hle();    // libSceHttp2 local ids + honest offline request failure
     register_font_hle();     // libSceFont opaque handles + deterministic text/metric fallback
     register_fiber_hle();    // libSceFiber cooperative guest-stack execution
@@ -1058,6 +1059,7 @@ void register_builtin_hle() {
     register_pad_hle();      // libScePad: real game-controller input (input/pad.cpp)
     register_audio_hle();    // libSceAudioOut backed by a headless/pluggable AudioSink
     register_audiodec_hle(); // libSceAudiodec: UE Electra movie-audio decode (AAC)
+    register_audio_spatial_hle(); // libSceAudio3d (one port) / libSceAcm (contexts; no batch engine)
     register_graphics_hle(); // headless libSceAgc/libSceVideoOut placeholders (bring-up)
     register_agc_hle();      // real AGC Dcb functions (override the glog stubs for Dcb NIDs)
     register_kernel_hle();   // libkernel primitives (pthread/sync/...)

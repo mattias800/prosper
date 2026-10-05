@@ -207,6 +207,27 @@ formats them. A SPIR-V input reports `input=spirv` in the sentinel and leaves `t
 and `endpgm` at zero -- those describe an RDNA2 walk that did not happen.
 
 
+## `--raw-wide-proof`: why a wide scalar load needs backing (#4422)
+
+```
+shader_inspect <raw-rdna2.bin> --raw-wide-proof
+```
+
+Prints one `raw-wide-load` row per `s_load_dwordx4/x8` with the three code-side proofs that
+decide whether its loaded words may be used as numeric data:
+
+- `needs-backing` — the load has a numeric reader, or it has a register SOFFSET in a program
+  that may write guest memory, so it needs a current-byte backing snapshot.
+- `entry-proven` — the entry-pointer and lifetime proof, evaluated on the same load with
+  SOFFSET nulled, which is how the register proof evaluates it.
+- `register-proven` — the register SOFFSET's reaching scalar definition is authenticated
+  against the full stream.
+
+A `raw-wide-proof-end` line terminates the output. Unlike `--stage`, these proofs read code
+only, so a raw dump answers them exactly. A row with `needs-backing=1 entry-proven=0` is a
+load the recompiler is expected to refuse with `[smem-reject] reason=raw-wide-data-requires-backing`
+unless another admission route applies (the tool has no resource table to evaluate those).
+
 ## `--stage` cannot prove a shader is unsupported (#1571)
 
 **`shader_inspect` has no resource table, and a table-less stage rejection is NOT evidence of a shader

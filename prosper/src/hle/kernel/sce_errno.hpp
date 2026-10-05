@@ -88,6 +88,7 @@ enum class FreeBsdErrno : uint32_t {
     EDestAddrReq    = 39,
     EMsgSize        = 40,
     EOpNotSupp      = 45,
+    EAfNoSupport    = 47,
     EAddrInUse      = 48,
     ENetDown        = 50,
     ENetUnreach     = 51,
@@ -284,6 +285,9 @@ inline FreeBsdErrno freebsd_errno_from_host(int host_errno,
 #endif
 #ifdef EOPNOTSUPP
     case EOPNOTSUPP: return FreeBsdErrno::EOpNotSupp;
+#endif
+#ifdef EAFNOSUPPORT
+    case EAFNOSUPPORT: return FreeBsdErrno::EAfNoSupport;
 #endif
 #ifdef EADDRINUSE
     case EADDRINUSE: return FreeBsdErrno::EAddrInUse;
@@ -506,6 +510,9 @@ inline int host_errno_from_freebsd(FreeBsdErrno e) {
 #endif
 #ifdef EOPNOTSUPP
     case FreeBsdErrno::EOpNotSupp: return EOPNOTSUPP;
+#endif
+#ifdef EAFNOSUPPORT
+    case FreeBsdErrno::EAfNoSupport: return EAFNOSUPPORT;
 #endif
 #ifdef EADDRINUSE
     case FreeBsdErrno::EAddrInUse: return EADDRINUSE;

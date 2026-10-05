@@ -19,6 +19,18 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-05
+
+### Alex Kidd holds 60 fps
+
+Alex Kidd in Miracle World DX used to settle at a random rate between 30 and 60 fps each time you played. Every frame, prosper was copying ~51 MB of finished images back from the GPU for a data copy that never needed them. It now holds the game's 60 fps cap, and Greak skips the same waste ([#4459](https://github.com/mattias800/prosper/pull/4459)). Summer Sports Games still pays most of it; that is next ([#4457](https://github.com/mattias800/prosper/issues/4457)).
+
+## 2026-10-04
+
+### GTA V's bank heist is fast again — mostly
+
+A change on October 3 made GTA V's opening bank scene three times slower (about 9 → 3 fps): for every draw it re-analysed the whole shader from scratch, and for the few draws it was about to refuse anyway it first copied every render target back to the CPU, about 22 MB each time. Both are fixed; the scene now runs at about 6.5 fps, and the rest of the gap is being chased ([#3873](https://github.com/mattias800/prosper/issues/3873)).
+
 ## 2026-10-03
 
 ### Hollow Knight: Silksong's menu text is back

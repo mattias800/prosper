@@ -8,6 +8,7 @@
 #include "build_revision.hpp"
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/execute/dma_span_authority.hpp"
 #include "gpu/execute/compute_program_facts.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/execute/ordered_graphics_read_point_internal.hpp"
@@ -6955,30 +6956,63 @@ SharedShaderWords registered_graphics_original(uint64_t address) {
     return registered_graphics_read_source(address).words;
 }
 
+namespace {
+// Why a draw asks for the owned nested snapshot: per-stage owned waves (#4270), or anything else
+// (owned nested-wide chains, or a captured point that cannot name the source -- conservative).
+struct OwnedSnapshotNeeds {
+    bool vertex_waves = false, fragment_waves = false, other = false;
+    bool any() const { return vertex_waves || fragment_waves || other; }
+};
+OwnedSnapshotNeeds owned_snapshot_needs(const GpuState& state,
+                                        const OrderedScalarBankReadPoint* captured,
+                                        uint64_t command_order) {
+    OwnedSnapshotNeeds needs;
+    const auto render = extract_render_state(state);
+    const bool captured_draw =
+        captured && captured->belongs_to_draw(state, captured->source_submit(), command_order,
+                                              render.ps_addr);
+    for (const auto [address, fragment] :
+         {std::pair{render.es_addr, false}, std::pair{render.ps_addr, true}}) {
+        bool waves = false;
+        if (captured_draw) {
+            const auto decoded = captured->decoded_source(address);
+            if (!decoded) {
+                needs.other = true;
+                continue;
+            }
+            waves = !decoded->raw_wave_wide_data_load_pcs.empty();
+            needs.other |= !decoded->owned_nested_wide_chains.empty();
+        } else {
+            waves = graphics_program_requires_owned_waves(address);
+            const auto* header = static_cast<const AgcShaderHeader*>(
+                prosper_agc_shader_header_for_code(address));
+            const auto words = header ? registered_shader_dwords(*header, address) : 0;
+            needs.other |= words && !decode_shader_cached(
+                                         reinterpret_cast<const uint32_t*>(uintptr_t(address)),
+                                         words)->owned_nested_wide_chains.empty();
+        }
+        (fragment ? needs.fragment_waves : needs.vertex_waves) |= waves;
+    }
+    return needs;
+}
+
+bool owned_snapshot_futile(const GpuState& state, const OwnedSnapshotNeeds& needs) {
+    if (PROSPER_ENV_ON("PROSPER_OWNED_WAVE_ALWAYS_FLUSH")) return false;   // A/B control arm
+    return !needs.other && (needs.vertex_waves || needs.fragment_waves) &&
+           owned_wave_draw_state_refusal(state, needs.fragment_waves) != nullptr;
+}
+}   // namespace
+
 bool draw_requires_owned_nested_snapshot(const GpuState& state,
                                          const OrderedScalarBankReadPoint* captured,
                                          uint64_t command_order) {
-    const auto render = extract_render_state(state);
-    if (captured && captured->belongs_to_draw(state, captured->source_submit(), command_order,
-                                              render.ps_addr)) {
-        for (const uint64_t address : {render.es_addr, render.ps_addr}) {
-            const auto decoded = captured->decoded_source(address);
-            if (!decoded || !decoded->raw_wave_wide_data_load_pcs.empty() ||
-                !decoded->owned_nested_wide_chains.empty())
-                return true;
-        }
-        return false;
-    }
-    for (uint64_t address : {render.es_addr, render.ps_addr}) {
-        if (graphics_program_requires_owned_waves(address)) return true;
-        const auto* header = static_cast<const AgcShaderHeader*>(
-            prosper_agc_shader_header_for_code(address));
-        if (!header) continue;
-        const auto words = registered_shader_dwords(*header, address);
-        if (words && !decode_shader_cached(reinterpret_cast<const uint32_t*>(uintptr_t(address)),
-                                           words)->owned_nested_wide_chains.empty()) return true;
-    }
-    return false;
+    return owned_snapshot_needs(state, captured, command_order).any();
+}
+
+bool owned_nested_snapshot_is_futile(const GpuState& state,
+                                     const OrderedScalarBankReadPoint* captured,
+                                     uint64_t command_order) {
+    return owned_snapshot_futile(state, owned_snapshot_needs(state, captured, command_order));
 }
 
 std::shared_ptr<ShaderResourceTable>
@@ -9894,7 +9928,7 @@ OrderedSubmitResult execute_ordered_items_impl(
             } else
                 read_points.dependencies_ok = false;
         } else {
-            flush_span(true);
+            flush_span(dma_flush_authoritative(span, dma_copies[operation.item]));
             read_points.advance();
             execute_dma(dma_copies[operation.item]);
             // This legacy callback reports no completion outcome. Do not turn its return into
@@ -11625,10 +11659,19 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                         ? prepare_ordered_scalar_draw(read_points, submit_no,
                                                       operation.command_order, read_state, span)
                         : OrderedScalarDrawInputs{};
-                const bool nested_inputs = draw_requires_owned_nested_snapshot(
+                const OwnedSnapshotNeeds snapshot_needs = owned_snapshot_needs(
                     read_state, scalar_inputs.point.get(), operation.command_order);
+                const bool nested_inputs = snapshot_needs.any();
                 GraphicsRawSnapshotContext raw_context;
-                if (nested_inputs) {
+                // A draw whose owned waves register state already refuses gains nothing from the
+                // publication: it keeps producers_complete=false and skips the authoritative
+                // readback of every prior target -- on GTA V's bank scene ~22 MiB per such draw.
+                // Realization runs as before. The stage check reads es_addr like the predicate
+                // above; for a fused front realization compiles another program, but issue()
+                // refuses fused fronts, so producers_complete was false on that path already.
+                const bool futile_snapshot =
+                    nested_inputs && owned_snapshot_futile(read_state, snapshot_needs);
+                if (nested_inputs && !futile_snapshot) {
                     // Prior render spans must publish before folding a pointer or child. Retained
                     // images remain excluded by the physical-alias-aware raw authority provider.
                     // Expire and discard BOTH pre-flush permissions and owned copies before any
@@ -12156,9 +12199,9 @@ execute_ordered_gpustate(const GpuState& st, uint32_t width, uint32_t height, ui
                 break;
             }
             case RetainedSubmitKind::DmaCopy: {
-                flush_span(true);
-                retire_deferred_graphics();   // #3948 stage 2: CPU reads of target bytes follow
                 const GpuState::DmaCopy& copy = st.dma_copies[operation.index];
+                flush_span(dma_flush_authoritative(span, copy));
+                retire_deferred_graphics();   // #3948 stage 2: CPU reads of target bytes follow
                 // Source and destination are distinct ordered consumers: a disjoint source must not
                 // hide an overlapping destination (or vice versa).
                 const bool source_gds = ((copy.sels >> 8u) & 0xffu) == 1u;

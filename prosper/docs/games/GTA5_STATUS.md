@@ -49,6 +49,14 @@ presses for a reason).
 project owner on a routed `reach-performance-story.pad` run with the bank interior rendering, at
 `ab80a2d69`. That is the number to quote.
 
+> **2026-10-04: #4270 (merged 2026-10-03) cut the bank scene from ~9 to ~2.9 presented fps**, and
+> every GTA V performance cohort from 2026-10-03 onward measured that regression. PR #4421
+> recovers most of it (2.9 -> ~6.5). PR #4428 seeds BGRA compute inputs on the device
+> instead of #4291's CPU round trip: +0.45..0.64 presented fps (+8.2..11.7%) in three
+> same-binary pairs, 7.10 vs 6.49 in the one run inside a verified quiet window; the distinct
+> rate agrees in two of the three. The rest of the gap to #4270's parent is open. Details and
+> numbers are in `## Ruled out`, first entry.
+
 > **The "21.0–21.3 FPS / ~34x speedup" this line used to claim was never a measurement of the
 > rendered world** (#3446). The three captures behind it contain **zero compute groups** and
 > `compute=0.0 ms`; a GTA V world frame runs dozens of compute programs, so those captures are a
@@ -5315,6 +5323,27 @@ not the domain. Do not cite that zero as evidence about the nine.
 One line per falsified hypothesis, the evidence that killed it, and where. **Read this before forming
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
+
+- **The drop from ~9 to ~2.5 guest flips/s in the bank scene between the 2026-09-30/10-02 and the
+  2026-10-03/04 cohorts came from host conditions or unmatched windows, not code** — falsified on
+  2026-10-04 by matched rebuilds: same route bytes, visible `prosper-app` window,
+  `--present-mode immediate`, async OFF, 1024/8192/2048 MiB × 256, fresh state, one arm at a time
+  under the shared GPU measurement lock, with the Performance menu and bank/HUD frames inspected
+  in every arm.
+  Bank-regime presented rate: 366f0854 **9.56**, #4270's parent 25b16b58 **8.89**, #4270
+  (3650263d) **3.03**, main 54d63d38 **2.90**. The cause is #4270, in two parts, both fixed in
+  PR #4421. (1) `graphics_program_requires_owned_waves()` re-walked the shader and re-ran the
+  raw wave-wide dataflow several times per draw; reading the decode cache's classification gives
+  ABBA **5.30 / 5.09 vs 2.93 / 2.90**. (2) Every owned-wave draw triggered an authoritative
+  flush, reading back ~22 MiB of prior targets (65,882–148,049 MiB per 300 s run), even though register
+  state (CMASK/FMASK/DCC metadata on the colour target) already refused the draw. Skipping that
+  flush gives, same binary and interleaved, **6.45 / 6.53 / 6.53 vs 5.24 / 5.45 / 5.51** (one skip arm under a
+  foreign build at load ~7 read 4.78 and was rerun). Together: **2.90 → ~6.5**. The rest of the
+  gap to the parent (~26 render-thread samples/flip at 999 Hz, frame-aligned profile) is not
+  #4270's: it is mostly #4291's CPU round trip for BGRA compute inputs
+  (`component-order`), plus #4281's fragment-draw batch. This also explains why neither Stage 2 nor a larger target count could
+  restore the earlier rate (entries below): every cohort they measured postdates #4270. Evidence:
+  [#3873 checkpoint](https://github.com/mattias800/prosper/issues/3873#issuecomment-5983529252).
 
 - **Ongoing persistent-target eviction churn explains the low rate in the measured warm bank
   population** — falsified by the 2026-10-04 same-app count matrix on frozen shipping main

@@ -58,6 +58,13 @@ found Vulkan.
 - `packed_rtt_conversion.hpp` — device-owned RGBA8→packed-10-bit sampled conversion.
   Records transfers and conversion into the guest compute submission; setup failures retain their
   `VkResult` so optional fallback cannot hide device loss.
+- `bgra_seed_scratch.hpp` — device seed of a storage binding from a BGRA render target the renderer
+  holds as canonical RGBA8: blit into a B8G8R8A8 scratch, copy its bytes raw, so compute reads
+  guest order without a CPU snapshot (#4291's contract). `PROSPER_NO_BGRA_STANDALONE_SEED=1`
+  restores the CPU path for A/B runs.
+- `live_compute_storage_codec.hpp` — live compute's storage texel codec: guest storage-image texels
+  to and from the RGBA32 words a dispatch operates on, with the AVX2/F16C fast paths. Lifted out
+  of `live_compute.cpp`'s anonymous namespace; only live compute includes it.
 - `live_target_format.hpp` — the guest↔Vulkan pixel-format mapping. Compiled with `-Werror=switch`
   on purpose: a silent RGBA8 fallback has cost two titles a whole render layer.
 - `decode_scratch.hpp` — the pooled full-surface intermediates that both the texture decode branches
