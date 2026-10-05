@@ -1521,6 +1521,12 @@ if(TARGET prosper_core)
     SOURCES tests/hle/np/test_np_uds_properties.cpp
     LIBRARIES prosper_core)
 
+  # libSceNpManager remainder: local request ids, SIGNED_OUT account/premium answers,
+  # acknowledged callbacks/setters. PollAsync/CreateAsyncRequest stay deliberately out.
+  prosper_add_gtest(test_np_manager
+    SOURCES tests/hle/np/test_np_manager.cpp
+    LIBRARIES prosper_core)
+
   # libSceNpWebApi2 (24 of the library's 39 exports): handles are created locally, every call
   # that would reach PSN answers SIGNED_OUT instead of blocking. Unregistered, the dispatcher
   # answered SCE_OK while writing nothing — request ids and response buffers the guest sizes by.
