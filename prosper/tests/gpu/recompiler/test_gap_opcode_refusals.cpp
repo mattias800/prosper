@@ -324,3 +324,64 @@ TEST(GapOpcodeRefusals, ImageGather4) {
         recompile_fragment(fragment_prog.data(), fragment_prog.size(), &frag_rt_multi).empty())
         << "image_gather4 in fragment stage must refuse for multi-level resource";
 }
+
+// IMAGE_LOAD_MIP on a genuinely multi-level resource must refuse fail-visibly.
+// Live shapes: Stray's fragment 0x30be800000 (6 real levels, mip not provably
+// zero) and Sonic Frontiers' compute 12-mip 2D_ARRAY (RECOMPILER_REMAINING.md
+// "Stray's rejected IMAGE_LOAD_MIP" / #2818). The words below are the live
+// GTA V 2D packet (test_dynfetch_fold.cpp): mip address VGPR v2, T# s[20:27].
+// The same words against a single-level resource with a same-block zero mip
+// (the GTA V zero-mip shape) compile -- that control is what makes the refusal
+// about the mip-level gate rather than the packet, the table or the shape.
+// WHEN the multi-level guest upload infra (#2818) lands, THESE ARMS GO RED;
+// replace them with an execution test of the new lowering.
+TEST(GapOpcodeRefusals, ImageLoadMipMultiLevelRefuses) {
+    static const uint32_t w[2] = {0xf0043108u, 0x00050000u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(w, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
+        EXPECT_EQ(dec.opcode, 0x01u);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+
+    auto table = [](uint32_t levels) {
+        ShaderResourceTable rt;
+        ShaderResource texture{};
+        texture.cls = ResourceClass::Texture;
+        texture.binding = 4;
+        texture.img_dim = 1;
+        texture.width = texture.height = 8;
+        texture.sgpr_base = 20;
+        texture.declared_mip_levels = levels;
+        rt.resources.push_back(texture);
+        return rt;
+    };
+    ComputeShaderConfig config;
+    config.user_sgprs.resize(28);   // s20..s27 T# are entry-time user data
+
+    // Refusal: multi-level resource, mip VGPR provably nonzero in-shader.
+    const std::vector<uint32_t> nonzero_mip = {
+        0x7e0002f0u,   // v_mov_b32 v0, 0.5
+        0x7e0202f0u,   // v_mov_b32 v1, 0.5
+        0x7e040281u,   // v_mov_b32 v2, 1
+    };
+    const ShaderResourceTable multi_rt = table(2u);
+    expect_gap_refusal(program(nonzero_mip, {w[0], w[1]}), 0xA060ull, 3, {w[0], w[1]},
+                       Rdna2Format::MIMG, 0x01u, &multi_rt, config);
+
+    // Control: the identical program with the plain IMAGE_LOAD sibling (0x00,
+    // same operand fields, only the opcode field changed -- no mip operand at
+    // all) against the same multi-level table. It compiling is what makes the
+    // refusal about the mip path rather than the packet, the table or the
+    // program shape.
+    static const uint32_t plain[2] = {0xf0003108u, 0x00050000u};
+    {
+        const Rdna2Inst dec = rdna2_decode_one(plain, 2);
+        EXPECT_EQ(dec.fmt, Rdna2Format::MIMG);
+        EXPECT_EQ(dec.opcode, 0x00u);
+        EXPECT_EQ(dec.len_dwords, 2u);
+    }
+    expect_compiles(program(nonzero_mip, {plain[0], plain[1]}), 0xA061ull,
+                    "control: plain IMAGE_LOAD with identical fields", &multi_rt,
+                    config);
+}
