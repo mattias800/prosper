@@ -367,7 +367,8 @@ TEST(AprEqueueCompletion, CounterPostsNeverRegress) {
     // After the release both posts are free to land. The first and last steps below wait on a
     // condition (both posts past the seam; the final level read), so a slow machine costs time
     // and not a false failure, and their bounds only stop a real hang. The 150 ms between them is
-    // the one fixed wait: it is where a late LOWER counter, if one exists, shows itself.
+    // a fixed wait, like the parked window above: it is where a late LOWER counter, if one
+    // exists, shows itself.
     g_release_first_post = true;
     for (int i = 0; i < 100 && g_counter_hook_calls.load() < 2; i++) collect_for(50);
     collect_for(150);

@@ -2411,8 +2411,9 @@ void post_apr_constant_zero(uint64_t eq, uint64_t eq_identity, int64_t id, uint6
 // read-then-post makes the posted sequence non-decreasing for every (queue, ring).
 //
 // What that does NOT cover: the mark is keyed by (queue, ring) but a pending event is keyed by
-// ident = id + ring, so two DIFFERENT counter ids bound to one ring would own two pending events,
-// and an in-place refresh of the older one could still be read after a higher value in the newer.
+// ident = id + ring, so two DIFFERENT counter ids bound to one ring would own two pending events.
+// The queue is read in order, so if the OLDER event is refreshed in place to a higher value it is
+// read first, and the newer event's lower value after it (7, then 6).
 // UE4 registers exactly one id per ring (0x74fe + ring), which is what delivery order relies on.
 // CONFIDENCE: HIGH (both ends live-captured and disassembled; see the block comment above).
 void post_apr_counter(uint64_t eq, uint64_t eq_identity, int64_t id, uint64_t token) {

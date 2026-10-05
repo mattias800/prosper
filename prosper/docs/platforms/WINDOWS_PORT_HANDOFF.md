@@ -440,8 +440,9 @@ that thread waits on becomes the focus, so matching signals from other threads a
     reservation. No title is known to ask for any of these.
   - **Host-placed guest memory is now always low.** The few guest-visible allocations prosper
     places with an unconstrained host call (the primary guest stack, `win_commit(0, …)`, the legacy
-    reserve fallback) land in `[4, 16)` GiB on every launch instead of at a random point of the low
-    terabyte. Two consumers have address floors above that and would ignore such a pointer:
+    reserve fallback) land low on every launch — in `[4, 16)` GiB, or in a hole below 4 GiB that
+    the best-effort reservation left — instead of at a random point of the low terabyte. Two
+    consumers have address floors above that and would ignore such a pointer:
     `hle_audio.cpp` drops a waveform block pointer below 8 GiB, and `agc_shader_layout.cpp` skips a
     buffer descriptor whose base is below 64 GiB. Neither is known to be handed such memory.
   - **The host has `[4, 16)` GiB, 12 GiB, to itself.** prosper's own SSE4a chain cache is a fixed
